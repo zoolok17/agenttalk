@@ -139,11 +139,28 @@ UNSUPPORTED_INVOKE_SHAPES = ("constructor_call",)
 #: ``_filter_class_by_name``/``parse_web_xml`` below), at the exact same
 #: fidelity ``<servlet>``/``<servlet-mapping>`` already models with -
 #: consistent, not a special case.
+#: FIX ROUND 22 (eighteenth cold read, F3 MAJOR, wrong-data): four legal,
+#: common JEE entry-point declarations vanished SILENTLY into the
+#: confident no_entry_point negative - a complete run, zero problems -
+#: because each shape's own OWNER (a class or a servlet-name) is real
+#: and well-formed, but carries no representable URL-pattern route this
+#: producer could compose: (a) a ``<filter-mapping>``/``@WebFilter``
+#: scoped to named SERVLETS (``<servlet-name>``/``servletNames``)
+#: instead of a URL pattern (a real, DTD-valid dispatch alternative);
+#: (b) a ``<servlet>``/``@WebServlet`` registered for STARTUP ONLY
+#: (``<load-on-startup>``/``loadOnStartup``), never mapped to any URL at
+#: all - the standard startup-servlet idiom. Neither servlet-name filter
+#: chains nor startup semantics are MODELED this slice (declared, not a
+#: silent gap) - enrolled via the SAME class-closer mechanism as every
+#: other recognized-but-unmodeled shape above. ``servlet_name_scoped_
+#: filter``/``startup_only_servlet`` each name BOTH the XML and
+#: annotation spelling of their own shape - the same "one name, two
+#: mechanisms" precedent ``web_xml_listener`` already established.
 UNSUPPORTED_ENTRY_POINT_SHAPES = (
     "jax_ws_web_method", "jax_rs_verb_only_method",
     "spring_scheduled", "kafka_listener", "jms_message_driven",
     "ejb_remote_component", "websocket_server_endpoint",
-    "web_xml_listener",
+    "web_xml_listener", "servlet_name_scoped_filter", "startup_only_servlet",
 )
 
 #: FIX ROUND 21c (reviewer-3's re-delta, THE ASK - second instance, closing
@@ -2339,6 +2356,29 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                 qualified_name=target_type,
             ))
             continue
+        # FIX ROUND 22 (eighteenth cold read, F3 MAJOR, wrong-data): a
+        # genuinely EMPTY paths list (`_route_paths`'s own "no value/
+        # urlPatterns attribute at all" case) means Spring's own "serves
+        # the prefix alone" semantics for a COMPOSABLE annotation - but
+        # @WebServlet is not composable (checked above: no method-level
+        # counterpart, no class-level prefix), so an empty list here
+        # means the standard startup-only servlet idiom
+        # (`@WebServlet(name=..., loadOnStartup=1)`, no URL attribute at
+        # all) - a real, common shape this producer does not model
+        # (startup semantics, out of scope this slice), enrolled the
+        # same class-closer way <listener> already is, never silently
+        # falling through the loop below to zero iterations and zero
+        # problems.
+        if not paths:
+            problems.append(JavaAdapterProblem(
+                reason_code="unsupported_entry_point_shape",
+                detail=f"a @WebServlet annotation at line {line} declares no value/"
+                       "urlPatterns attribute at all (startup_only_servlet - a startup-only "
+                       "registration, e.g. name/loadOnStartup) - no entry point published, "
+                       "but not confidently absent either",
+                qualified_name=target_type,
+            ))
+            continue
         for path in paths:
             classes_with_route_entry_points.add(target_type)
             edges.append(JavaEdgeClaim(
@@ -2395,6 +2435,24 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                 detail=f"a @WebFilter annotation at line {line} has a value/urlPatterns "
                        "that could not be recovered as a literal - suppressed rather than "
                        "published with a guessed or partial value",
+                qualified_name=target_type,
+            ))
+            continue
+        # FIX ROUND 22 (eighteenth cold read, F3 MAJOR, wrong-data): a
+        # genuinely EMPTY paths list means this @WebFilter carries no
+        # value/urlPatterns attribute at all - the standard servlet-
+        # name-scoped filter idiom (`@WebFilter(servletNames={...})`,
+        # applying to named servlets rather than a URL pattern), a real,
+        # DTD-valid alternative this producer does not model (servlet-
+        # name filter chains, out of scope this slice). Enrolled, never
+        # silently falling through to zero iterations and zero problems.
+        if not paths:
+            problems.append(JavaAdapterProblem(
+                reason_code="unsupported_entry_point_shape",
+                detail=f"a @WebFilter annotation at line {line} declares no value/"
+                       "urlPatterns attribute at all (servlet_name_scoped_filter - e.g. "
+                       "servletNames only) - no entry point published, but not confidently "
+                       "absent either",
                 qualified_name=target_type,
             ))
             continue
@@ -3097,6 +3155,16 @@ _SERVLET_MAPPING_URL_PATTERN_RE = re.compile(r"<url-pattern>([^<]+)</url-pattern
 #: <servlet-mapping>, a different closing tag entirely).
 _SERVLET_BLOCK_RE = re.compile(r"<servlet>(.*?)</servlet>", re.DOTALL)
 _SERVLET_CLASS_RE = re.compile(r"<servlet-class>\s*([^<]+?)\s*</servlet-class>")
+#: FIX ROUND 22 (eighteenth cold read, F3 MAJOR, wrong-data): a
+#: ``<servlet>`` carrying ``<load-on-startup>`` but no ``<servlet-
+#: mapping>`` at all is the standard startup-only servlet idiom (a
+#: management/initialization servlet with no URL of its own) - a real,
+#: DTD-valid shape, distinct from the existing, already-accepted
+#: "orphaned servlet" carry (an UNMAPPED servlet with no ``<load-on-
+#: startup>`` either is not this shape; that residual carry is
+#: unchanged). Presence alone matters, never the priority VALUE - this
+#: producer does not model startup ORDER semantics.
+_LOAD_ON_STARTUP_RE = re.compile(r"<load-on-startup>")
 
 
 def _servlet_class_by_name(sanitized: str) -> dict[str, str]:
@@ -3224,12 +3292,14 @@ def parse_web_xml(
     sanitized = _strip_xml_comments(text)
     newline_offsets = _newline_offsets(sanitized)
     servlet_class_by_name = _servlet_class_by_name(sanitized)
+    mapped_servlet_names: set[str] = set()
     for block_match in _SERVLET_MAPPING_BLOCK_RE.finditer(sanitized):
         block = block_match.group(1)
         name_match = _SERVLET_MAPPING_NAME_RE.search(block)
         if name_match is None:
             continue
         servlet_name = name_match.group(1).strip()
+        mapped_servlet_names.add(servlet_name)
         owner_qualified_name = servlet_class_by_name.get(
             servlet_name, f"{relative_path}#{servlet_name}")
         for pattern_match in _SERVLET_MAPPING_URL_PATTERN_RE.finditer(block):
@@ -3243,6 +3313,34 @@ def parse_web_xml(
                 name=url_pattern, line=_line_at(newline_offsets, absolute_offset),
                 evidence_class="declared",
             ))
+    # FIX ROUND 22 (eighteenth cold read, F3 MAJOR, wrong-data): a
+    # <servlet> carrying <load-on-startup> but NEVER named by any
+    # <servlet-mapping> above is the standard startup-only servlet
+    # idiom - real, common, and previously silent (no entry point, no
+    # problem, on a complete run). Startup semantics are not modeled
+    # this slice (declared, not a silent gap) - enrolled the same
+    # class-closer way <listener> already is. An unmapped servlet with
+    # NO <load-on-startup> either is the existing, separately-accepted
+    # "orphaned servlet" carry - unchanged, not this shape.
+    for block_match in _SERVLET_BLOCK_RE.finditer(sanitized):
+        block = block_match.group(1)
+        name_match = _SERVLET_MAPPING_NAME_RE.search(block)
+        if name_match is None or name_match.group(1).strip() in mapped_servlet_names:
+            continue
+        if _LOAD_ON_STARTUP_RE.search(block) is None:
+            continue
+        class_match = _SERVLET_CLASS_RE.search(block)
+        qualified_name = (
+            _bounded_route_target(class_match.group(1).strip())
+            if class_match is not None else None)
+        problems.append(JavaAdapterProblem(
+            reason_code="unsupported_entry_point_shape",
+            detail=f"a <servlet> declared at line {_line_at(newline_offsets, block_match.start())} "
+                   "carries <load-on-startup> but no <servlet-mapping> at all "
+                   "(startup_only_servlet) - no entry point published, but not confidently "
+                   "absent either",
+            qualified_name=qualified_name,
+        ))
     filter_class_by_name = _filter_class_by_name(sanitized)
     for block_match in _FILTER_MAPPING_BLOCK_RE.finditer(sanitized):
         block = block_match.group(1)
@@ -3254,13 +3352,30 @@ def parse_web_xml(
         filter_name = name_match.group(1).strip()
         owner_qualified_name = filter_class_by_name.get(
             filter_name, f"{relative_path}#{filter_name}")
-        # NAMED LIMIT: a <filter-mapping> may target a <servlet-name>
-        # instead of a <url-pattern> (dispatch "apply to whichever URLs
-        # this named servlet handles") - a real, DTD-valid alternative
-        # shape this producer does not compose a target from; such a
-        # mapping publishes no entry point, silently, the same accepted
-        # asymmetry as an unmatched filter/servlet-mapping pair above.
-        for pattern_match in _SERVLET_MAPPING_URL_PATTERN_RE.finditer(block):
+        # FIX ROUND 22 (eighteenth cold read, F3 MAJOR, wrong-data): a
+        # <filter-mapping> may target a <servlet-name> instead of a
+        # <url-pattern> (dispatch "apply to whichever URLs this named
+        # servlet handles") - a real, DTD-valid alternative shape this
+        # producer does not compose a target from (servlet-name filter
+        # chains, out of scope this slice). Was a NAMED LIMIT that
+        # published nothing at all - a "limit" that publishes a
+        # confident false no_entry_point negative is the same defect
+        # class already closed for <listener>/@WebListener; now enrolled
+        # the same way, never silently falling through to zero
+        # iterations and zero problems.
+        url_pattern_matches = list(_SERVLET_MAPPING_URL_PATTERN_RE.finditer(block))
+        if not url_pattern_matches:
+            problems.append(JavaAdapterProblem(
+                reason_code="unsupported_entry_point_shape",
+                detail=f"a <filter-mapping> declared at line "
+                       f"{_line_at(newline_offsets, block_match.start())} names a "
+                       "<servlet-name> rather than a <url-pattern> (servlet_name_scoped_"
+                       "filter) - no entry point published, but not confidently absent "
+                       "either",
+                qualified_name=owner_qualified_name,
+            ))
+            continue
+        for pattern_match in url_pattern_matches:
             url_pattern = _bounded_route_target(pattern_match.group(1).strip())
             absolute_offset = block_match.start(1) + pattern_match.start()
             entry_points.append(JavaEntryPointClaim(

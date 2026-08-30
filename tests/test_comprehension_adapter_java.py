@@ -2474,6 +2474,121 @@ def test_web_xml_filter_with_no_filter_class_falls_back_to_the_synthetic_owner()
     assert filter_entry_points[0].name == "/*"
 
 
+def test_web_xml_filter_mapping_by_servlet_name_is_enrolled_not_silent():
+    """FIX ROUND 22 (eighteenth cold read, F3 MAJOR, wrong-data): a
+    <filter-mapping> naming a <servlet-name> instead of a <url-pattern>
+    (a real, DTD-valid dispatch alternative) used to publish nothing at
+    all - a NAMED LIMIT comment that was itself the defect. Now enrolled
+    as unsupported_entry_point_shape (servlet_name_scoped_filter),
+    attributed to the filter's own resolved class."""
+    web_xml = """<web-app>
+  <filter>
+    <filter-name>auth</filter-name>
+    <filter-class>com.acme.web.AuthFilter</filter-class>
+  </filter>
+  <filter-mapping>
+    <filter-name>auth</filter-name>
+    <servlet-name>orders</servlet-name>
+  </filter-mapping>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert entry_points == []
+    matching = [
+        p for p in problems
+        if p.reason_code == "unsupported_entry_point_shape"
+        and p.qualified_name == "com.acme.web.AuthFilter"
+    ]
+    assert len(matching) == 1
+    assert "servlet_name_scoped_filter" in matching[0].detail
+
+
+def test_web_xml_startup_only_servlet_with_no_mapping_is_enrolled_not_silent():
+    """FIX ROUND 22 (F3 MAJOR, wrong-data): a <servlet> carrying
+    <load-on-startup> but never named by any <servlet-mapping> (the
+    standard startup-only servlet idiom) used to publish nothing at
+    all. Now enrolled, attributed to its own <servlet-class>. An
+    unrelated MAPPED servlet in the same file is unaffected."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>init</servlet-name>
+    <servlet-class>com.acme.web.InitServlet</servlet-class>
+    <load-on-startup>1</load-on-startup>
+  </servlet>
+  <servlet>
+    <servlet-name>orders</servlet-name>
+    <servlet-class>com.acme.web.OrdersServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>orders</servlet-name>
+    <url-pattern>/orders</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert len(entry_points) == 1
+    assert entry_points[0].qualified_name == "com.acme.web.OrdersServlet"
+    matching = [
+        p for p in problems
+        if p.reason_code == "unsupported_entry_point_shape"
+        and p.qualified_name == "com.acme.web.InitServlet"
+    ]
+    assert len(matching) == 1
+    assert "startup_only_servlet" in matching[0].detail
+
+
+def test_web_servlet_annotation_startup_only_no_url_is_enrolled_not_silent():
+    """FIX ROUND 22 (F3 MAJOR, wrong-data): @WebServlet(name=...,
+    loadOnStartup=1) with no value/urlPatterns attribute at all (the
+    annotation-form startup-only idiom) used to fall through the paths
+    loop zero times - no entry point, no problem. Now enrolled. A
+    normal @WebServlet with a real URL in the same run is unaffected."""
+    src = """
+package p;
+
+@WebServlet(name = "init", loadOnStartup = 1)
+public class InitServlet extends HttpServlet {
+}
+
+@WebServlet("/orders")
+public class OrdersServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("Servlets.java", src)
+    http_routes = [e for e in result.entry_points if e.kind == "http_route"]
+    assert len(http_routes) == 1
+    assert http_routes[0].qualified_name == "p.OrdersServlet"
+    matching = [
+        p for p in result.problems
+        if p.reason_code == "unsupported_entry_point_shape" and p.qualified_name == "p.InitServlet"
+    ]
+    assert len(matching) == 1
+    assert "startup_only_servlet" in matching[0].detail
+
+
+def test_web_filter_annotation_servlet_names_only_is_enrolled_not_silent():
+    """FIX ROUND 22 (F3 MAJOR, wrong-data): @WebFilter(servletNames=
+    {...}) with no value/urlPatterns attribute at all used to fall
+    through the paths loop zero times - no entry point, no problem.
+    Now enrolled."""
+    src = """
+package p;
+
+@WebFilter(servletNames = {"orders"})
+public class OrdersAuthFilter implements Filter {
+}
+"""
+    result = java.parse_java_source("OrdersAuthFilter.java", src)
+    assert result.entry_points == []
+    matching = [
+        p for p in result.problems
+        if p.reason_code == "unsupported_entry_point_shape"
+        and p.qualified_name == "p.OrdersAuthFilter"
+    ]
+    assert len(matching) == 1
+    assert "servlet_name_scoped_filter" in matching[0].detail
+
+
 def test_jax_rs_path_composes_class_and_method_level_like_spring_request_mapping():
     """FIX ROUND 17 (CR13-3 MAJOR, part (a)): JAX-RS's own @Path composes
     EXACTLY like a plain @RequestMapping already does - a class-level
