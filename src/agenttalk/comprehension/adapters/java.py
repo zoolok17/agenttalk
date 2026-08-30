@@ -1547,7 +1547,38 @@ def _route_literal_list_at(original: str, anchor: int) -> list[str] | None:
     return [_bounded_route_target(content)]
 
 
+#: FIX ROUND 20 (sixteenth cold read, P1 JUDGE, taken): a route literal's
+#: escapes are decoded per Java's own semantics (Minor 6, round 7) - a
+#: `\n`/`\r`/`\t` (or any other C0 control character/DEL, including one
+#: sitting raw inside a text block) decodes to the ACTUAL control
+#: character, not the two-character escape spelling. A published route
+#: name/target flows straight into problems.json/dependencies.json/
+#: features.json, a CLI table, and eventually a UI - every one of those
+#: consumers assumes a route name is safe, single-line, printable text;
+#: a raw control character is hostile to all of them (breaks single-line
+#: JSON-Lines-style logging, corrupts a terminal table, ...). Escaped
+#: back to a visible, printable representation here - the ONE choke
+#: point every recovered literal (single value or array element) already
+#: passes through - never rejected or dropped: the route itself is still
+#: real, only its rendering changes.
+_ROUTE_NAME_CONTROL_CHAR_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
+def _sanitize_route_name_control_chars(value: str) -> str:
+    out = []
+    for ch in value:
+        escape = _ROUTE_NAME_CONTROL_CHAR_ESCAPES.get(ch)
+        if escape is not None:
+            out.append(escape)
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\x{ord(ch):02x}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def _bounded_route_target(value: str) -> str:
+    value = _sanitize_route_name_control_chars(value)
     if len(value) <= _MAX_ROUTE_TARGET_LENGTH:
         return value
     return value[:_MAX_ROUTE_TARGET_LENGTH] + "...(truncated)"
