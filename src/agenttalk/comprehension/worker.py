@@ -161,6 +161,23 @@ _DEGRADING_CODE_EXTENSIONS = frozenset({
 #: exact-case by construction; ``<BEANS>`` never matches this lowercase
 #: literal and correctly falls through to record-only.
 _SPRING_BEAN_XML_ROOT_ELEMENT = "beans"
+#: FIX ROUND 23 (nineteenth cold read, F12, JUDGE - taken): Struts 1.x's
+#: own `struts-config.xml` is the SAME class of gap CR13-1 already
+#: measured for Spring bean XML - a closed, recognized, code-bearing
+#: action-mapping configuration shape (form beans, action mappings,
+#: forwards - real routing estate, not tooling) this producer has no
+#: adapter for, previously falling into tier 3's silent-unless-recorded
+#: default alongside genuinely inert config XML. Same exact-case,
+#: root-element-name recognition as `_SPRING_BEAN_XML_ROOT_ELEMENT`.
+_STRUTS_CONFIG_XML_ROOT_ELEMENT = "struts-config"
+#: The closed set of XML root elements this producer recognizes as
+#: code-bearing (tier 2), each paired with the human-readable language
+#: name its own detail message names - grown alongside the root-element
+#: set itself rather than duplicating a parallel if/elif chain.
+_TIER_2_XML_ROOT_ELEMENT_LABELS = {
+    _SPRING_BEAN_XML_ROOT_ELEMENT: "Spring bean XML",
+    _STRUTS_CONFIG_XML_ROOT_ELEMENT: "Struts action-mapping XML",
+}
 #: MAJOR 2 (sixth cold read, fix round 9): both are real, common
 #: declarations this adapter's class/interface/enum/record extractor
 #: does not recognize at all (package-info.java carries only a package
@@ -617,11 +634,12 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                         "this XML file's root element could not be determined - failing "
                         "toward record-only rather than guessing a code-bearing shape"
                     )
-                elif root_element == _SPRING_BEAN_XML_ROOT_ELEMENT:
+                elif root_element in _TIER_2_XML_ROOT_ELEMENT_LABELS:
                     degrades_run = True
                     detail = (
-                        "no bundled adapter recognizes this file's language - Spring bean "
-                        f"XML (root element <{root_element}>) is a code-bearing "
+                        "no bundled adapter recognizes this file's language - "
+                        f"{_TIER_2_XML_ROOT_ELEMENT_LABELS[root_element]} "
+                        f"(root element <{root_element}>) is a code-bearing "
                         "configuration shape, so this run degrades"
                     )
                 else:

@@ -400,6 +400,22 @@ def test_process_paths_flags_a_spring_bean_xml_file_as_degrading(tmp_path: Path)
     assert result.problems[0].degrades_run is True
 
 
+def test_process_paths_flags_a_struts_config_xml_file_as_degrading(tmp_path: Path) -> None:
+    """FIX ROUND 23 (nineteenth cold read, F12, JUDGE - taken): a Struts
+    1.x ``struts-config.xml`` file (root element ``<struts-config>``) is
+    the SAME class of gap CR13-1 already measured for Spring bean XML -
+    real action-mapping/routing estate, not tooling XML - so it now
+    degrades the run the same way, rather than silently falling into
+    tier 3's record-only default alongside genuinely inert config XML."""
+    (tmp_path / "struts-config.xml").write_text(
+        "<struts-config><action-mappings/></struts-config>", encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["struts-config.xml"])
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "unsupported_language"
+    assert result.problems[0].relative_path == "struts-config.xml"
+    assert result.problems[0].degrades_run is True
+
+
 def test_process_paths_flags_logback_and_checkstyle_xml_as_record_only(tmp_path: Path) -> None:
     """FIX ROUND 14b: reviewer-3's own measurement - logback.xml
     (root ``<configuration>``) and checkstyle.xml (root ``<module>``)
