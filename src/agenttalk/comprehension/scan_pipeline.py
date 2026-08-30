@@ -56,7 +56,7 @@ from .envelope import (
     validate_envelope,
     validate_scan_id,
 )
-from .errors import ComprehensionError, EnvelopeError, bounded_detail
+from .errors import ComprehensionError, EnvelopeError, bounded_detail, bounded_os_error_detail
 from .privacy import PrivacyPreflightResult, VcsPrivacyRefused
 
 GENERATOR_VERSION = 1
@@ -1072,7 +1072,14 @@ def _scan_json_anchor_state(
     try:
         actual_byte_sha256 = digests.sha256_file(run_dir / "scan.json")
     except OSError as exc:
-        raise ComprehensionError(f"scan.json's bytes could not be read for verification: {exc}") from exc
+        # FIX ROUND 21 (seventeenth cold read, CR17-8 MINOR, the class-
+        # closer): an OSError embeds the FULL absolute local path via its
+        # own str(exc) (exc.filename) - bounded_os_error_detail is the
+        # same machine-local-path-leak-safe helper worker.py's own M-3
+        # fix already established.
+        raise ComprehensionError(
+            bounded_os_error_detail("scan.json's bytes could not be read for verification", exc)
+        ) from exc
     if actual_byte_sha256 != recorded_byte_sha256:
         raise ComprehensionError(
             "scan.json's byte_sha256 does not match its anchor recorded in index.json")
@@ -1396,7 +1403,12 @@ def _verify_artifact_digests(
         try:
             actual_byte_sha256 = digests.sha256_file(run_dir / name)
         except OSError as exc:
-            raise ComprehensionError(f"{name}'s bytes could not be read for verification: {exc}") from exc
+            # FIX ROUND 21 (seventeenth cold read, CR17-8 MINOR, the
+            # class-closer): same fix as scan.json's own verification
+            # above.
+            raise ComprehensionError(
+                bounded_os_error_detail(f"{name}'s bytes could not be read for verification", exc)
+            ) from exc
         if actual_byte_sha256 != require_field(entry, "byte_sha256", doc_name=entry_label):
             raise ComprehensionError(
                 f"{name}'s byte_sha256 does not match its declared value in scan.json")

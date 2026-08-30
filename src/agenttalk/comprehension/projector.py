@@ -86,7 +86,22 @@ def _bounded(records: list[Any], cap: int | None = None) -> tuple[list[Any], int
 
 
 def _dependency_summary(dependencies: list[DependencyRecord]) -> dict[str, int]:
-    summary = {"internal": 0, "external": 0, "unresolved": 0, "ambiguous": 0}
+    # FIX ROUND 21 (seventeenth cold read, CR17-6 MINOR): round 20c's own
+    # per-edge externality_suppressed marker distinguishes "this producer
+    # ABSTAINED from a positive external claim because this run's own
+    # external surface is unknown" from "this producer found a real,
+    # unresolved dependency" - but this summary folded both into the
+    # SAME bare `unresolved` count, so a #208 consumer could not tell
+    # four abstentions apart from four genuine dependency problems.
+    # `unresolved` itself is UNCHANGED (still the full superset count,
+    # never renamed or split, so nothing reading it today silently sees
+    # a different number) - `externality_suppressed` is a NEW, separate
+    # subset count a caller can subtract out for a "real problems only"
+    # view.
+    summary = {
+        "internal": 0, "external": 0, "unresolved": 0, "ambiguous": 0,
+        "externality_suppressed": 0,
+    }
     for edge in dependencies:
         if edge.resolution_state == "resolved" and edge.target_unit_id is not None:
             summary["internal"] += 1
@@ -96,6 +111,8 @@ def _dependency_summary(dependencies: list[DependencyRecord]) -> dict[str, int]:
             summary["ambiguous"] += 1
         else:
             summary["unresolved"] += 1
+            if edge.externality_suppressed:
+                summary["externality_suppressed"] += 1
     return summary
 
 

@@ -2129,6 +2129,25 @@ def test_get_status_for_an_unknown_root_never_leaks_the_absolute_root(tmp_path: 
     assert tmp_path.name in str(exc_info.value)
 
 
+def test_get_report_for_a_missing_run_id_never_leaks_the_absolute_root(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 21 (seventeenth cold read, CR17-8 MINOR, the class-
+    closer): a DIFFERENT shape from the existing NotScanned leak fix
+    above - this repo HAS a real published run (index.json exists,
+    NotScanned never fires), but ``--run`` names a syntactically valid
+    scan_id that was never actually published. Resolving that path
+    succeeds (only a later existence check fails), reaching
+    envelope.read_json_document's own OSError/EnvelopeError path - which
+    used to embed the FULL absolute run_dir path (twice: once in its own
+    message, once again via the OSError's own str(exc))."""
+    scan_pipeline.run_scan(java_repo)
+    with pytest.raises(scan_pipeline.ComprehensionError) as exc_info:
+        scan_pipeline.get_report(java_repo, run_id="20260101T000000Z-abcd1234")
+    assert str(java_repo) not in str(exc_info.value)
+    assert "scan.json" in str(exc_info.value)
+
+
 def test_run_scan_reclaims_an_abandoned_staging_dir_from_a_prior_crash(
     java_repo: Path, monkeypatch,
 ) -> None:

@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .errors import EnvelopeError
+from .errors import EnvelopeError, bounded_os_error_detail
 
 _UTF8_BOM = b"\xef\xbb\xbf"
 _RFC3339_UTC = re.compile(
@@ -91,17 +91,28 @@ def strict_json_loads(text: str) -> Any:
 def read_json_document(path: Path) -> Any:
     """Strictly read one JSON document from disk: UTF-8, no BOM, no
     duplicate keys. Raises :class:`EnvelopeError` on any I/O or format
-    failure — a caller never needs to catch ``OSError`` separately."""
+    failure — a caller never needs to catch ``OSError`` separately.
+
+    FIX ROUND 21 (seventeenth cold read, CR17-8 MINOR, the class-closer):
+    all three failure messages here used to embed ``path`` - the FULL
+    absolute local path - directly; an ``OSError`` embeds it a SECOND
+    time via its own ``str(exc)`` (``exc.filename``). Every message now
+    names only the file's own basename (enough to identify WHICH
+    artifact failed) plus, for the OS-error case, ``bounded_os_error_
+    detail`` (the same machine-local-path-leak-safe helper worker.py's
+    own M-3 fix already established) rather than the raw exception
+    text."""
     try:
         raw = path.read_bytes()
     except OSError as exc:
-        raise EnvelopeError(f"could not read {path}: {exc}") from exc
+        raise EnvelopeError(
+            bounded_os_error_detail(f"could not read {path.name}", exc)) from exc
     if raw.startswith(_UTF8_BOM):
-        raise EnvelopeError(f"{path}: UTF-8 byte-order mark is not permitted")
+        raise EnvelopeError(f"{path.name}: UTF-8 byte-order mark is not permitted")
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise EnvelopeError(f"{path}: not valid UTF-8: {exc}") from exc
+        raise EnvelopeError(f"{path.name}: not valid UTF-8: {exc}") from exc
     return strict_json_loads(text)
 
 

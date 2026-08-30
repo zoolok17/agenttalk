@@ -25,11 +25,15 @@ def _unit(unit_id: str) -> ModuleRecord:
     )
 
 
-def _edge(edge_id: str, from_unit_id: str, *, resolution_state: str, target_unit_id=None, target_external=None):
+def _edge(
+    edge_id: str, from_unit_id: str, *, resolution_state: str, target_unit_id=None,
+    target_external=None, externality_suppressed: bool = False,
+):
     return DependencyRecord(
         edge_id=edge_id, from_unit_id=from_unit_id, relation="invoke", phase="runtime",
         optional=False, evidence_class="extracted", resolution_state=resolution_state,
         target_unit_id=target_unit_id, target_external=target_external,
+        externality_suppressed=externality_suppressed,
     )
 
 
@@ -445,7 +449,31 @@ def test_dependency_summary_categorizes_every_edge():
     payload = pr.project_comprehension(**_base_kwargs(dependencies=edges))
     assert payload["dependency_summary"] == {
         "internal": 1, "external": 1, "unresolved": 1, "ambiguous": 1,
+        "externality_suppressed": 0,
     }
+
+
+def test_dependency_summary_carries_a_separate_externality_suppressed_count():
+    """FIX ROUND 21 (seventeenth cold read, CR17-6 MINOR): round 20c's
+    own per-edge externality_suppressed marker distinguishes an
+    ABSTENTION (this run's own external surface is unknown) from a
+    genuine unresolved dependency problem - folding both into the same
+    bare `unresolved` count let four abstentions render as four
+    dependency problems in a #208 consumer. `unresolved` itself stays
+    the full superset count (unchanged); `externality_suppressed` is
+    the new, separate subset a caller can subtract out."""
+    edges = [
+        _edge(
+            "e1", "u1", resolution_state="unresolved", target_unit_id=None,
+            externality_suppressed=True),
+        _edge(
+            "e2", "u1", resolution_state="unresolved", target_unit_id=None,
+            externality_suppressed=True),
+        _edge("e3", "u1", resolution_state="unresolved", target_unit_id=None),
+    ]
+    payload = pr.project_comprehension(**_base_kwargs(dependencies=edges))
+    assert payload["dependency_summary"]["unresolved"] == 3
+    assert payload["dependency_summary"]["externality_suppressed"] == 2
 
 
 def test_high_fan_out_and_fan_in_units_are_reported():
