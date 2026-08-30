@@ -164,6 +164,23 @@ def test_dependencies_resolved_and_entry_points_mapped_also_unknown_when_parse_f
     assert summaries[0].stored_assessment_state == "needs_evidence"
 
 
+def test_dependencies_resolved_and_entry_points_mapped_spell_the_same_propagated_reason():
+    """FIX ROUND 16c (reviewer-3's LOW on round 16b): the "adapter_"
+    prefix rule used to live in TWO separately-maintained formulations
+    (dependencies_resolved prefixed unconditionally, entry_points_mapped
+    tested map membership) that agreed today only by coincidence of the
+    current reason set - nothing enforced that they always would. Both
+    now route through the ONE shared `_propagated_reason_spelling`
+    predicate; this pins the parity directly (not just incidentally, via
+    one specific reason code) so a future reason feeding both checks
+    cannot make them disagree again."""
+    signal_a = ra._check_dependencies_resolved(_unit(
+        "u1", adapter_problem_reasons=["parse_failed"]), [])
+    signal_b = ra._check_entry_points_mapped(_unit(
+        "u1", adapter_problem_reasons=["parse_failed"]), False)
+    assert signal_a.reason_code == signal_b.reason_code == "adapter_parse_failed"
+
+
 def test_file_unit_dependencies_resolved_unknown_not_not_applicable_when_parse_failed():
     """FIX ROUND 16 (M2 MAJOR): the FILE-kind path
     (_check_dependencies_resolved_for_file) has its OWN early return for

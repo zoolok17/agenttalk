@@ -501,6 +501,49 @@ def test_wildcard_import_edge_still_resolves_external_when_its_package_is_not_in
     assert import_edge.target_external == "java.util.*"
 
 
+def test_wildcard_import_edge_into_an_excluded_region_stays_unresolved_too():
+    """FIX ROUND 16c (reviewer-3's approval-conditioned minor on round
+    16b - "the last door"): the wildcard branch consulted ONLY
+    in_scan_packages, never the excluded-region check every OTHER
+    registry-miss caller already goes through - ``import target.gen.*``
+    with ``target/`` excluded published resolved/external while
+    ``import target.Stub`` in the SAME file (the non-wildcard twin)
+    correctly published unresolved: two different answers about one
+    excluded tree, in the same run. Both must now agree."""
+    results = {
+        "r/Report.java": _parse(
+            "r/Report.java",
+            "package r;\n"
+            "import target.gen.*;\n"
+            "import target.Stub;\n"
+            "class Report {}\n"),
+    }
+    records = da.build_dependencies(results, excluded_root_paths=frozenset({"target"}))
+    wildcard_edge = next(
+        r for r in records if r.relation == "import" and r.target_unresolved == "target.gen.*")
+    plain_edge = next(
+        r for r in records if r.relation == "import" and r.target_unresolved == "target.Stub")
+    assert wildcard_edge.resolution_state == "unresolved"
+    assert wildcard_edge.target_external is None
+    assert plain_edge.resolution_state == "unresolved"
+    assert plain_edge.target_external is None
+
+
+def test_wildcard_import_edge_into_an_unexcluded_package_still_resolves_external():
+    """Companion negative case: a wildcard import whose package sits
+    OUTSIDE any excluded root still resolves external as before - the
+    fix only closes the specific excluded-tree gap."""
+    results = {
+        "r/Report.java": _parse(
+            "r/Report.java",
+            "package r;\nimport java.util.*;\nclass Report {}\n"),
+    }
+    records = da.build_dependencies(results, excluded_root_paths=frozenset({"target"}))
+    import_edge = next(r for r in records if r.relation == "import")
+    assert import_edge.resolution_state == "resolved"
+    assert import_edge.target_external == "java.util.*"
+
+
 # ----------------------------------------------------------- test relation (cross-file)
 
 def test_test_edge_resolves_to_the_unit_under_test_in_another_file():

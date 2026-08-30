@@ -239,6 +239,39 @@ def _reasons_feeding(check: str, reasons: list[str]) -> list[str]:
     return sorted(r for r in reasons if check in _READINESS_CHECKS_BY_REASON_CODE[r])
 
 
+#: FIX ROUND 16c (reviewer-3's LOW on round 16b - "take it, it names the
+#: exact silent-divergence defect just fixed"): the "adapter_" prefix
+#: rule used to live in TWO separately-maintained formulations -
+#: ``_check_source_understood``/``_check_dependencies_resolved`` (and its
+#: file-kind sibling) prefixed UNCONDITIONALLY (every reason reaching
+#: them, by construction, already feeds source_understood too), while
+#: ``_check_entry_points_mapped`` tested map membership explicitly (since
+#: it can ALSO receive a narrowly-scoped reason - ``cli_main_unrecognized``
+#: - that must stay bare). The two formulations agreed today only by
+#: coincidence of the CURRENT reason set; nothing enforced that a future
+#: reason feeding both dependencies_resolved and entry_points_mapped
+#: (without also feeding source_understood) would get the SAME spelling
+#: from both. One shared predicate now, called by every check that might
+#: report a propagated whole-file evidence gap - source_understood always
+#: qualifies by construction (a reason reaches it only because it feeds
+#: source_understood in the first place), so this is a safe drop-in for
+#: its own unconditional prefix too, not just entry_points_mapped's
+#: guarded one.
+def _propagated_reason_spelling(reason: str) -> str:
+    """A reason that ALSO feeds source_understood is a PROPAGATED
+    whole-file evidence gap - the identical fact about the identical
+    unit, spelled the SAME way on every check it reaches
+    (``adapter_X``). A reason that does not (``cli_main_unrecognized``,
+    ``route_annotation_unassociated``, ...) is NATIVE to whichever
+    narrower check it feeds and stays bare - the same spelling
+    ``problems.json``'s own ``reason_code`` already uses for it, an
+    existing join key a reader relies on to correlate a signal with its
+    concrete problem row."""
+    if "source_understood" in _READINESS_CHECKS_BY_REASON_CODE[reason]:
+        return f"adapter_{reason}"
+    return reason
+
+
 def _check_source_understood(unit: ModuleRecord) -> ReadinessSignal:
     """M-2 (second cold read, fix round 4; CLOSED as a class, third cold
     read, fix round 5): a file with no adapter at all reports ``unknown``,
@@ -263,7 +296,7 @@ def _check_source_understood(unit: ModuleRecord) -> ReadinessSignal:
     if understanding_reasons:
         return _signal(
             unit.unit_id, "source_understood", "unknown", "detected",
-            f"adapter_{understanding_reasons[0]}",
+            _propagated_reason_spelling(understanding_reasons[0]),
         )
     if unit.language != "unknown":
         return _signal(unit.unit_id, "source_understood", "satisfied", "detected", "adapter_understood")
@@ -321,7 +354,7 @@ def _check_dependencies_resolved(unit: ModuleRecord, outgoing: list[DependencyRe
     if understanding_reasons:
         return _signal(
             unit.unit_id, "dependencies_resolved", "unknown", "detected",
-            f"adapter_{understanding_reasons[0]}",
+            _propagated_reason_spelling(understanding_reasons[0]),
         )
     relevant = [edge for edge in outgoing if edge.relation in _DEPENDENCY_RESOLUTION_RELATIONS]
     any_ambiguous = any(
@@ -418,7 +451,7 @@ def _check_dependencies_resolved_for_file(
     if understanding_reasons:
         return _signal(
             unit.unit_id, "dependencies_resolved", "unknown", "detected",
-            f"adapter_{understanding_reasons[0]}",
+            _propagated_reason_spelling(understanding_reasons[0]),
         )
     if not contained_unit_ids and not direct_outgoing:
         return _signal(
@@ -446,23 +479,14 @@ def _check_entry_points_mapped(unit: ModuleRecord, has_entry_point: bool) -> Rea
     # CONFIDENCE of the negative changes.
     entry_point_reasons = _reasons_feeding("entry_points_mapped", unit.adapter_problem_reasons)
     if entry_point_reasons:
-        reason = entry_point_reasons[0]
-        # FIX ROUND 16b (reviewer-3's rejection of round 16, LOW - unify
-        # the two spellings): M2's widening (this round) made a
-        # whole-file evidence-gap reason (parse_failed, ...) feed THIS
-        # check too, alongside source_understood/dependencies_resolved -
-        # but only THOSE two ever prefixed it "adapter_X"; this check
-        # kept publishing the bare reason for the identical fact about
-        # the identical unit, two spellings for one thing. A reason that
-        # ALSO feeds source_understood now gets the SAME "adapter_X"
-        # spelling here. cli_main_unrecognized (narrowly scoped - a fact
-        # about ONE already-understood construct, never a whole-file
-        # gap) stays bare, unchanged - it is problems.json's own
-        # reason_code verbatim, the existing join key a reader uses to
-        # correlate this signal with its concrete problem row.
-        if "source_understood" in _READINESS_CHECKS_BY_REASON_CODE[reason]:
-            reason = f"adapter_{reason}"
-        return _signal(unit.unit_id, "entry_points_mapped", "unknown", "detected", reason)
+        # FIX ROUND 16c (reviewer-3's LOW on round 16b): routed through
+        # the shared `_propagated_reason_spelling` predicate - see its
+        # own docstring for why this must never be a second, separately-
+        # maintained formulation of the identical rule.
+        return _signal(
+            unit.unit_id, "entry_points_mapped", "unknown", "detected",
+            _propagated_reason_spelling(entry_point_reasons[0]),
+        )
     return _signal(
         unit.unit_id, "entry_points_mapped", "not_applicable", "detected", "no_entry_point")
 

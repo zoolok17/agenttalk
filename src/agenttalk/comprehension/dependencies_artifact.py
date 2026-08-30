@@ -443,6 +443,25 @@ def _excluded_region_match(qualified_name: str, excluded_root_paths: frozenset[s
     return any(suffix == root or suffix.startswith(root + "/") for root in excluded_root_paths)
 
 
+def _excluded_region_package_match(
+    package_prefix: str, excluded_root_paths: frozenset[str],
+) -> bool:
+    """FIX ROUND 16c (reviewer-3's approval-conditioned minor on round
+    16b): the package-prefix sibling of :func:`_excluded_region_match`,
+    for a wildcard import - a wildcard names a PACKAGE, never a type, so
+    there is no ``.java`` suffix to append the way a plain/static
+    import's own qualified spelling gets one. Matches when the
+    package's OWN hypothetical directory lives inside (or IS) a region
+    THIS run excluded outright - the same "never a confident external
+    claim over a directory that was simply never walked" reasoning
+    ``_excluded_region_match`` already applies to a single type."""
+    package_path = package_prefix.replace(".", "/")
+    return any(
+        package_path == root or package_path.startswith(root + "/")
+        for root in excluded_root_paths
+    )
+
+
 def _classify_registry_miss(
     qualified_name: str, *, duplicate_qualified_names: set[str],
     unit_ids_by_qualified_name: dict[str, list[str]], degraded_paths: frozenset[str],
@@ -816,8 +835,22 @@ def _edge_claim_to_record(
         # honest "cannot tell, but not third-party either" rather than
         # a confident external claim that undercounts this package's
         # own fan-in.
+        #
+        # FIX ROUND 16c (reviewer-3's approval-conditioned minor on
+        # round 16b - "the LAST door"): this branch consulted ONLY
+        # in_scan_packages, never the excluded-region check every OTHER
+        # registry-miss caller already goes through - `import target.
+        # gen.*` with `target/` excluded published resolved/external
+        # while `import target.Stub` in the SAME file (the non-wildcard
+        # twin) correctly published unresolved: two different answers
+        # about one excluded tree, in the same run. Checked here too,
+        # via the package-prefix sibling of `_excluded_region_match`
+        # (a wildcard names a package, not a type - no `.java` suffix
+        # to append).
         package_prefix = edge.target[:-2]
         if package_prefix in in_scan_packages:
+            resolution_state, target_unresolved = "unresolved", edge.target
+        elif _excluded_region_package_match(package_prefix, excluded_root_paths):
             resolution_state, target_unresolved = "unresolved", edge.target
         else:
             resolution_state, target_external = "resolved", edge.target
