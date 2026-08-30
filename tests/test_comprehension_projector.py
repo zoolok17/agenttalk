@@ -27,10 +27,10 @@ def _unit(unit_id: str) -> ModuleRecord:
 
 def _edge(
     edge_id: str, from_unit_id: str, *, resolution_state: str, target_unit_id=None,
-    target_external=None, externality_suppressed: bool = False,
+    target_external=None, externality_suppressed: bool = False, relation: str = "invoke",
 ):
     return DependencyRecord(
-        edge_id=edge_id, from_unit_id=from_unit_id, relation="invoke", phase="runtime",
+        edge_id=edge_id, from_unit_id=from_unit_id, relation=relation, phase="runtime",
         optional=False, evidence_class="extracted", resolution_state=resolution_state,
         target_unit_id=target_unit_id, target_external=target_external,
         externality_suppressed=externality_suppressed,
@@ -473,8 +473,49 @@ def test_dependency_summary_categorizes_every_edge():
     payload = pr.project_comprehension(**_base_kwargs(dependencies=edges))
     assert payload["dependency_summary"] == {
         "internal": 1, "external": 1, "unresolved": 1, "ambiguous": 1,
-        "externality_suppressed": 0,
+        "externality_suppressed": 0, "routes": 0,
     }
+
+
+def test_dependency_summary_never_counts_route_edges_as_external_dependencies():
+    """FIX ROUND 22 (eighteenth cold read, F2 MAJOR, wrong-data): the
+    reader's own .cr18-fanout shape - a route edge's own target_external
+    is a URL PATTERN, not the design's own "normalized external package/
+    system name" - a dependency-free 7-route controller used to publish
+    external:7, indistinguishable from 7 genuine external library
+    dependencies. Routes now get their own separate, visible count
+    instead of silently inflating (or vanishing from) external."""
+    edges = [
+        _edge(f"route-{i}", "u1", resolution_state="resolved",
+              target_external=f"/api/{i}", relation="route")
+        for i in range(7)
+    ]
+    payload = pr.project_comprehension(**_base_kwargs(dependencies=edges))
+    assert payload["dependency_summary"] == {
+        "internal": 0, "external": 0, "unresolved": 0, "ambiguous": 0,
+        "externality_suppressed": 0, "routes": 7,
+    }
+    assert payload["high_fan_out_units"] == []
+
+
+def test_dependency_summary_still_counts_a_real_external_import_alongside_routes():
+    """A genuine external import in the SAME unit as several routes must
+    still be counted - routes are excluded specifically, not every edge
+    from a unit that happens to also have routes."""
+    edges = [
+        _edge("route-1", "u1", resolution_state="resolved",
+              target_external="/api/orders", relation="route"),
+        _edge("import-1", "u1", resolution_state="resolved",
+              target_external="org.springframework.web.bind.annotation.RestController",
+              relation="import"),
+    ]
+    payload = pr.project_comprehension(**_base_kwargs(dependencies=edges))
+    assert payload["dependency_summary"]["external"] == 1
+    assert payload["dependency_summary"]["routes"] == 1
+    # Below the >5 high-fan-out threshold either way - just confirms the
+    # route edge was excluded from fan_out without silently dropping the
+    # real import edge too.
+    assert payload["high_fan_out_units"] == []
 
 
 def test_dependency_summary_carries_a_separate_externality_suppressed_count():

@@ -388,6 +388,42 @@ def test_a_genuinely_entry_point_free_file_keeps_its_honest_negative(java_repo: 
     assert feature_signal["stored_status"] == "unsatisfied"
 
 
+def test_a_dependency_free_multi_route_controller_publishes_zero_external_end_to_end(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 22 (eighteenth cold read, F2 MAJOR, wrong-data,
+    end-to-end): the reader's own measured shape - a dependency-free
+    controller with several routes used to publish external:N and a
+    high_fan_out_units entry naming it, purely from its own route
+    edges. Now routes are visible under their own dedicated count, and
+    a real external import in a DIFFERENT class still counts normally."""
+    pkg_dir = java_repo / "src" / "main" / "java" / "p"
+    routes = "\n".join(f'  @GetMapping("/wide/{i}")\n  public void h{i}() {{}}' for i in range(7))
+    (pkg_dir / "WideController.java").write_text(
+        f"package p;\npublic class WideController {{\n{routes}\n}}\n", encoding="utf-8")
+    (pkg_dir / "UsesExternal.java").write_text(
+        "package p;\nimport java.util.List;\nclass UsesExternal {\n"
+        "  List<String> items;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    scan_pipeline.run_scan(java_repo)
+    report = scan_pipeline.get_report(java_repo)
+
+    assert report["dependency_summary"]["routes"] == 7
+    assert report["dependency_summary"]["external"] >= 1
+    assert not any(
+        row["unit_id"] == _component_unit_id(report, "WideController")
+        for row in report["high_fan_out_units"])
+
+
+def _component_unit_id(report, display_name):
+    return next(
+        u["unit_id"] for u in report["units"]
+        if u["kind"] == "component" and u["display_name"] == display_name)
+
+
 def test_run_scan_web_servlet_and_jax_rs_routes_publish_end_to_end_cr13_c(
     java_repo: Path,
 ) -> None:

@@ -85,6 +85,28 @@ def _bounded(records: list[Any], cap: int | None = None) -> tuple[list[Any], int
     return records[:effective_cap], len(records) - effective_cap
 
 
+#: FIX ROUND 22 (eighteenth cold read, F2 MAJOR, wrong-data): a "route"
+#: edge's own ``target_external`` is a URL PATTERN (``java.py`` publishes
+#: it unconditionally ``resolved`` via the generic fallback branch every
+#: OTHER unrecognized ``target_kind`` also falls through to) - the
+#: design's own field contract names ``target_external`` as "a
+#: normalized external package/system name" (Artifact 2); a URL pattern
+#: is categorically never one, the identical bare-superset argument
+#: round 21b already accepted for ``entry_points_by_kind``. A
+#: dependency-free 7-route controller published external:7 plus a
+#: high_fan_out_units entry - route edges are entry-point SURFACE,
+#: already fully counted there (features.json/entry_points_by_kind);
+#: publishing them AGAIN as if they were structural dependencies double-
+#: counts the identical fact under the wrong heading. Every OTHER
+#: relation's own external resolution genuinely fits "package/system
+#: name" (import/inherit/invoke/build/test all resolve to a real type
+#: or coordinate name, even when unrecognized) - "route" is excluded
+#: BY NAME, not via a narrower inclusion list, so a future relation
+#: this producer might add is counted here by default unless it is
+#: PROVEN to share route's own not-a-package-name defect.
+_NON_DEPENDENCY_RELATIONS = frozenset({"route"})
+
+
 def _dependency_summary(dependencies: list[DependencyRecord]) -> dict[str, int]:
     # FIX ROUND 21 (seventeenth cold read, CR17-6 MINOR): round 20c's own
     # per-edge externality_suppressed marker distinguishes "this producer
@@ -101,8 +123,20 @@ def _dependency_summary(dependencies: list[DependencyRecord]) -> dict[str, int]:
     summary = {
         "internal": 0, "external": 0, "unresolved": 0, "ambiguous": 0,
         "externality_suppressed": 0,
+        # FIX ROUND 22 (F2 MAJOR): a route's own count, visible on its
+        # own rather than silently vanishing from a previously-nonzero
+        # external count - DECIDED (reviewer-3 ratifies): kept as its
+        # own separate field here rather than moving the URL pattern off
+        # target_external entirely, which would need sweeping every
+        # existing consumer of that field for a fix this narrow does not
+        # need - the actual defect (mis-bucketing) is fully closed
+        # without it.
+        "routes": 0,
     }
     for edge in dependencies:
+        if edge.relation in _NON_DEPENDENCY_RELATIONS:
+            summary["routes"] += 1
+            continue
         if edge.resolution_state == "resolved" and edge.target_unit_id is not None:
             summary["internal"] += 1
         elif edge.resolution_state == "resolved" and edge.target_external is not None:
@@ -166,9 +200,17 @@ def _feature_unit_ids_including_owning_files(
 
 
 def _fan_counts(dependencies: list[DependencyRecord]) -> tuple[dict[str, int], dict[str, int]]:
+    # FIX ROUND 22 (eighteenth cold read, F2 MAJOR, wrong-data): a route
+    # edge is entry-point surface, not a structural dependency - see
+    # _NON_DEPENDENCY_RELATIONS's own docstring above. A dependency-free
+    # controller with N routes published high_fan_out_units naming it,
+    # over N facts already fully visible in features.json/entry_point_
+    # kinds.
     fan_out: dict[str, int] = {}
     fan_in: dict[str, int] = {}
     for edge in dependencies:
+        if edge.relation in _NON_DEPENDENCY_RELATIONS:
+            continue
         fan_out[edge.from_unit_id] = fan_out.get(edge.from_unit_id, 0) + 1
         if edge.target_unit_id is not None:
             fan_in[edge.target_unit_id] = fan_in.get(edge.target_unit_id, 0) + 1
