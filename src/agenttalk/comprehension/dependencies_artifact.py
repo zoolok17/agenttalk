@@ -854,6 +854,37 @@ def _edge_claim_to_record(
             resolution_state, target_unresolved = "unresolved", edge.target
         else:
             resolution_state, target_external = "resolved", edge.target
+    elif edge.target_kind == "internal_pom_coordinate_or_external":
+        # FIX ROUND 17 (thirteenth cold read, CR13-4 MAJOR, wrong-data):
+        # a pom <dependency>'s groupId:artifactId used to publish
+        # resolved/external UNCONDITIONALLY - a multi-module reactor's
+        # module-to-module dependency (the single most migration-
+        # relevant internal edge a pom can declare) published external
+        # even when the SIBLING pom declaring that exact coordinate sits
+        # in the same scan, because nothing ever registered a pom's own
+        # coordinate as a resolvable unit. Exact-matched against the
+        # SAME registry every other producer's units already build
+        # through (parse_maven_pom now publishes a pom's own coordinate
+        # as a real unit claim) - a miss falls through to the SAME
+        # shared predicate every other import-shaped edge in this file
+        # already uses, consistent with B1 (a duplicate pom coordinate
+        # is ambiguous+candidates, never a silent pick).
+        exact_unit_id = _exact_qualified_lookup(edge.target, by_qualified_name)
+        if exact_unit_id is not None:
+            resolution_state, target_unit_id, confidence = "resolved", exact_unit_id, "high"
+        else:
+            outcome, candidates = _classify_registry_miss(
+                edge.target, duplicate_qualified_names=duplicate_qualified_names,
+                unit_ids_by_qualified_name=unit_ids_by_qualified_name,
+                degraded_paths=degraded_paths, excluded_root_paths=excluded_root_paths,
+            )
+            if outcome == "ambiguous":
+                resolution_state, target_unresolved, candidate_unit_ids = (
+                    "ambiguous", edge.target, candidates)
+            elif outcome == "unresolved":
+                resolution_state, target_unresolved = "unresolved", edge.target
+            else:
+                resolution_state, target_external = "resolved", edge.target
     else:
         resolution_state = "resolved"
         target_external = edge.target

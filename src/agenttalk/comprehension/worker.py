@@ -393,14 +393,22 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
             # points of its own.
             try:
                 text = data.decode("utf-8", errors="replace")
-                build_edges, profile_scoped_dependency_count = java_adapter.parse_maven_pom(rel, text)
+                pom_units, build_edges, profile_scoped_dependency_count = (
+                    java_adapter.parse_maven_pom(rel, text))
             except Exception as exc:  # noqa: BLE001 - a producer bug must degrade, never abort the scan
                 problems.append(WorkerProblem(
                     reason_code="parse_failed", relative_path=rel,
                     detail=bounded_detail(f"{java_adapter.ADAPTER_NAME} adapter failed: {exc}")))
             else:
+                # FIX ROUND 17 (thirteenth cold read, CR13-4 MAJOR): this
+                # pom's own groupId:artifactId coordinate (when declared
+                # at this level - see parse_maven_pom's own named limit)
+                # is now a real unit claim, not just build edges - the
+                # SAME registry every other producer's units already
+                # build through, so a sibling pom's dependency on it can
+                # resolve internal instead of a hardcoded external guess.
                 java_results[rel] = java_adapter.file_result_to_json(
-                    java_adapter.JavaFileResult(edges=build_edges))
+                    java_adapter.JavaFileResult(units=pom_units, edges=build_edges))
                 # Round 11c (reviewer-3 delta on round 11b, vehicle
                 # change): a profile-scoped dependency this adapter
                 # excludes (a profile may be active by default) is a

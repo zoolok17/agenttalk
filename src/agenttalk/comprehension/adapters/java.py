@@ -446,15 +446,19 @@ class JavaEdgeClaim:
     target: str
     # "internal_candidate" | "internal_exact_or_external" |
     # "internal_static_import_exact_or_external" | "external_wildcard_import"
-    # | "external" | "external_route" - see
-    # dependencies_artifact._edge_claim_to_record for how each is
-    # resolved. FIX ROUND 14 (CR10-2): retired
+    # | "internal_pom_coordinate_or_external" | "external" |
+    # "external_route" - see dependencies_artifact._edge_claim_to_record
+    # for how each is resolved. FIX ROUND 14 (CR10-2): retired
     # "internal_unqualified_call_candidate" - invoke's bare/dotted
     # qualifier now shares "internal_candidate"'s own ladder with
     # inherit/test, never a narrower, separately-maintained kind.
     # FIX ROUND 16 (twelfth cold read, B3 BLOCKER): added
     # "external_wildcard_import" - a plain wildcard import's own package
     # prefix may still be in-scan, unlike every other "external" kind.
+    # FIX ROUND 17 (thirteenth cold read, CR13-4 MAJOR): added
+    # "internal_pom_coordinate_or_external" - a pom <dependency>'s
+    # groupId:artifactId may name another in-scan pom's own coordinate,
+    # unlike every prior "external" kind, which never checked.
     target_kind: str
     evidence_class: str
     line: int | None
@@ -2156,15 +2160,47 @@ def _count_profile_scoped_dependencies(sanitized: str) -> int:
     return count
 
 
+def _project_own_coordinate(sanitized: str) -> tuple[str, str] | None:
+    """FIX ROUND 17 (thirteenth cold read, CR13-4 MAJOR, wrong-data):
+    this pom's OWN ``groupId:artifactId`` identity - a direct child of
+    ``<project>``, never one nested inside ``<parent>``/``<dependency>``/
+    ``<plugin>``/a ``<profile>`` (the same element-context scoping
+    ``_module_own_dependency_blocks`` already uses for the mirror-image
+    problem: distinguishing a module's OWN facts from a nested block's).
+
+    NAMED LIMIT: a child module that inherits its ``groupId`` from
+    ``<parent>`` (omitting its own - a legal, common Maven shape) has no
+    ``groupId`` at this level; this returns ``None`` rather than
+    resolving parent inheritance (a real XML-tree walk this adapter's
+    flat-regex approach does not attempt - the same "declare, don't
+    silently invent" discipline every other named limit in this adapter
+    follows). Such a module's own identity then stays unregistered, so a
+    sibling depending on it via that inherited groupId still resolves
+    external - a safe, honest under-claim, never a false internal
+    claim."""
+    group_id = artifact_id = None
+    for match in _DEPENDENCY_GROUP_ID_RE.finditer(sanitized):
+        if _enclosing_tag_stack(sanitized, match.start()) == ["project"]:
+            group_id = _bounded_route_target(match.group(1).strip())
+            break
+    for match in _DEPENDENCY_ARTIFACT_ID_RE.finditer(sanitized):
+        if _enclosing_tag_stack(sanitized, match.start()) == ["project"]:
+            artifact_id = _bounded_route_target(match.group(1).strip())
+            break
+    if group_id is None or artifact_id is None:
+        return None
+    return group_id, artifact_id
+
+
 def parse_maven_pom(
     relative_path: str, text: str,
-) -> tuple[list[JavaEdgeClaim], int]:
+) -> tuple[list[JavaUnitClaim], list[JavaEdgeClaim], int]:
     """Direct-dependency ``build`` edges from a ``pom.xml``'s module-own,
     top-level ``<dependency>`` blocks (see ``_module_own_dependency_
     blocks`` for the M1/round-11 scoping fix and its named plugin/
     profile decision). Plain regex over a small, well-known XML shape -
     no XML parser (and its entity-expansion surface) needed for a
-    handful of flat child elements. Returns ``(edges,
+    handful of flat child elements. Returns ``(units, edges,
     profile_scoped_dependency_count)`` - see
     ``_count_profile_scoped_dependencies`` for round 11c's exclusion-
     count vehicle (managed/plugin scoping needs no count at all: judged
@@ -2176,10 +2212,38 @@ def parse_maven_pom(
     pom actually declared. Both are now parsed from the evidence already
     in the file: an explicit ``<optional>true</optional>`` sets
     ``optional``; ``<scope>test</scope>`` sets ``phase: test`` rather
-    than the default ``build``."""
+    than the default ``build``.
+
+    FIX ROUND 17 (thirteenth cold read, CR13-4 MAJOR, wrong-data): every
+    ``<dependency>`` published ``target_kind="external"`` UNCONDITIONALLY
+    - a multi-module reactor's module-to-module dependency (the single
+    most migration-relevant internal edge a pom can declare) published
+    resolved/EXTERNAL even when the sibling pom declaring that EXACT
+    ``groupId:artifactId`` sits in the same scan, because nothing ever
+    registered a pom's own coordinate as a resolvable unit - the round-16
+    "registry miss becomes external" discipline never reached this
+    producer. Now ALSO returns this pom's own coordinate as a
+    ``JavaUnitClaim`` (``qualified_name`` = the identical
+    ``groupId:artifactId`` string a dependency's own ``target`` already
+    uses - the SAME registry ``dependencies_artifact._build_registry``
+    already builds from every producer's units, generically) when
+    declared at this level (see ``_project_own_coordinate``'s own named
+    limit); every ``<dependency>`` edge now publishes
+    ``target_kind="internal_pom_coordinate_or_external"`` so
+    ``_edge_claim_to_record`` gives it the exact same
+    resolve-internal-or-classify-the-miss treatment a Java import
+    already gets, never a hardcoded external guess."""
     from_name = relative_path
     sanitized = _strip_xml_comments(text)
     newline_offsets = _newline_offsets(sanitized)
+    units: list[JavaUnitClaim] = []
+    own_coordinate = _project_own_coordinate(sanitized)
+    if own_coordinate is not None:
+        own_group_id, own_artifact_id = own_coordinate
+        units.append(JavaUnitClaim(
+            relative_path=relative_path, qualified_name=f"{own_group_id}:{own_artifact_id}",
+            simple_name=own_artifact_id, line=1, classification="production",
+        ))
     edges = []
     for match in _module_own_dependency_blocks(sanitized):
         block = match.group(1)
@@ -2201,11 +2265,12 @@ def parse_maven_pom(
         phase = "test" if scope == "test" else "build"
         edges.append(JavaEdgeClaim(
             from_qualified_name=from_name, relation="build",
-            target=f"{group_id}:{artifact_id}", target_kind="external",
+            target=f"{group_id}:{artifact_id}",
+            target_kind="internal_pom_coordinate_or_external",
             evidence_class="declared", line=_line_at(newline_offsets, match.start()), phase=phase,
             optional=optional,
         ))
-    return edges, _count_profile_scoped_dependencies(sanitized)
+    return units, edges, _count_profile_scoped_dependencies(sanitized)
 
 
 #: FIX ROUND 15 (eleventh cold read, F1 MAJOR, wrong-data): a single

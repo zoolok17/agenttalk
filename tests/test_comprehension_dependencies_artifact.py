@@ -1207,7 +1207,7 @@ def test_build_edges_from_pom_xml_are_attributed_to_the_pom_file():
     java_results channel every other adapter claim uses, wrapped as a
     JavaFileResult with only edges populated), this test now exercises
     that exact production shape instead of a bespoke parameter."""
-    pom_edges, _profile_scoped_count = java_adapter.parse_maven_pom(
+    _pom_units, pom_edges, _profile_scoped_count = java_adapter.parse_maven_pom(
         "pom.xml",
         "<project><dependencies><dependency>"
         "<groupId>org.springframework</groupId><artifactId>spring-core</artifactId>"
@@ -1227,7 +1227,7 @@ def test_optional_and_scope_test_thread_through_to_the_dependency_record():
     hardcoded False in _edge_claim_to_record regardless of what the
     adapter's own claim said - the field existed and was in the published
     schema, but nothing ever set it from real evidence."""
-    pom_edges, _profile_scoped_count = java_adapter.parse_maven_pom(
+    _pom_units, pom_edges, _profile_scoped_count = java_adapter.parse_maven_pom(
         "pom.xml",
         "<project><dependencies><dependency>"
         "<groupId>org.mockito</groupId><artifactId>mockito-core</artifactId>"
@@ -1239,6 +1239,93 @@ def test_optional_and_scope_test_thread_through_to_the_dependency_record():
     assert len(records) == 1
     assert records[0].optional is True
     assert records[0].phase == "test"
+
+
+def test_a_reactor_module_dependency_resolves_internal_to_the_sibling_pom():
+    """FIX ROUND 17 (thirteenth cold read, CR13-4 MAJOR, wrong-data): a
+    multi-module Maven reactor's module-to-module dependency (the single
+    most migration-relevant internal edge a pom can declare) used to
+    publish resolved/EXTERNAL unconditionally, even when the SIBLING pom
+    declaring that exact groupId:artifactId sits in the same scan -
+    nothing ever registered a pom's own coordinate as a resolvable unit.
+    Mirrors the reader's own reactor shape: app/pom.xml depends on
+    com.acme:shared-lib, and shared-lib/pom.xml declares exactly that
+    coordinate."""
+    _app_units, app_edges, _c1 = java_adapter.parse_maven_pom(
+        "app/pom.xml",
+        "<project><groupId>com.acme</groupId><artifactId>app</artifactId>"
+        "<dependencies><dependency>"
+        "<groupId>com.acme</groupId><artifactId>shared-lib</artifactId>"
+        "</dependency></dependencies></project>",
+    )
+    shared_units, shared_edges, _c2 = java_adapter.parse_maven_pom(
+        "shared-lib/pom.xml",
+        "<project><groupId>com.acme</groupId><artifactId>shared-lib</artifactId></project>",
+    )
+    results = {
+        "app/pom.xml": java_adapter.JavaFileResult(edges=app_edges),
+        "shared-lib/pom.xml": java_adapter.JavaFileResult(units=shared_units, edges=shared_edges),
+    }
+    records = da.build_dependencies(results)
+    build_edge = next(r for r in records if r.relation == "build")
+    assert build_edge.resolution_state == "resolved"
+    assert build_edge.target_external is None
+    assert build_edge.target_unit_id == da._java_component_unit_id(
+        "shared-lib/pom.xml", "com.acme:shared-lib")
+
+
+def test_a_genuinely_external_pom_dependency_still_resolves_external():
+    """Companion negative case: a dependency naming NO in-scan pom's own
+    coordinate still resolves external as before - the fix only closes
+    the specific reactor-internal-miscounted-as-external gap."""
+    _app_units, app_edges, _c1 = java_adapter.parse_maven_pom(
+        "app/pom.xml",
+        "<project><groupId>com.acme</groupId><artifactId>app</artifactId>"
+        "<dependencies><dependency>"
+        "<groupId>org.springframework</groupId><artifactId>spring-core</artifactId>"
+        "</dependency></dependencies></project>",
+    )
+    results = {"app/pom.xml": java_adapter.JavaFileResult(edges=app_edges)}
+    records = da.build_dependencies(results)
+    build_edge = next(r for r in records if r.relation == "build")
+    assert build_edge.resolution_state == "resolved"
+    assert build_edge.target_external == "org.springframework:spring-core"
+
+
+def test_two_poms_declaring_the_same_coordinate_make_the_dependency_ambiguous():
+    """FIX ROUND 17 (CR13-4): consistency with B1 - a duplicate pom
+    coordinate (two modules both declaring com.acme:shared-lib) must
+    never resolve confidently to either claimant; the dependency
+    publishes ambiguous with both candidates, the same shape a duplicate
+    Java qualified name already gets."""
+    _app_units, app_edges, _c1 = java_adapter.parse_maven_pom(
+        "app/pom.xml",
+        "<project><groupId>com.acme</groupId><artifactId>app</artifactId>"
+        "<dependencies><dependency>"
+        "<groupId>com.acme</groupId><artifactId>shared-lib</artifactId>"
+        "</dependency></dependencies></project>",
+    )
+    a_units, a_edges, _c2 = java_adapter.parse_maven_pom(
+        "a/pom.xml",
+        "<project><groupId>com.acme</groupId><artifactId>shared-lib</artifactId></project>",
+    )
+    b_units, b_edges, _c3 = java_adapter.parse_maven_pom(
+        "b/pom.xml",
+        "<project><groupId>com.acme</groupId><artifactId>shared-lib</artifactId></project>",
+    )
+    results = {
+        "app/pom.xml": java_adapter.JavaFileResult(edges=app_edges),
+        "a/pom.xml": java_adapter.JavaFileResult(units=a_units, edges=a_edges),
+        "b/pom.xml": java_adapter.JavaFileResult(units=b_units, edges=b_edges),
+    }
+    records = da.build_dependencies(results)
+    build_edge = next(r for r in records if r.relation == "build")
+    assert build_edge.resolution_state == "ambiguous"
+    assert build_edge.target_external is None
+    assert sorted(build_edge.candidate_unit_ids) == sorted([
+        da._java_component_unit_id("a/pom.xml", "com.acme:shared-lib"),
+        da._java_component_unit_id("b/pom.xml", "com.acme:shared-lib"),
+    ])
 
 
 # ----------------------------------------------------------- determinism / integrity

@@ -2022,7 +2022,7 @@ def test_parse_maven_pom_extracts_dependency_build_edges():
   </dependencies>
 </project>
 """
-    edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    _units, edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
     assert {e.target for e in edges} == {"org.springframework:spring-core", "junit:junit"}
     assert profile_scoped_count == 0
     assert all(e.relation == "build" for e in edges)
@@ -2051,7 +2051,7 @@ def test_parse_maven_pom_reads_optional_and_test_scope_instead_of_asserting_defa
   </dependencies>
 </project>
 """
-    edges = {e.target: e for e in java.parse_maven_pom("pom.xml", pom)[0]}
+    edges = {e.target: e for e in java.parse_maven_pom("pom.xml", pom)[1]}
     mockito = edges["org.mockito:mockito-core"]
     assert mockito.optional is True
     assert mockito.phase == "test"
@@ -2079,7 +2079,7 @@ def test_parse_maven_pom_ignores_a_commented_out_dependency():
   </dependencies>
 </project>
 """
-    edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    _units, edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
     assert {e.target for e in edges} == {"org.springframework:spring-core"}
     assert profile_scoped_count == 0
 
@@ -2106,7 +2106,7 @@ def test_parse_maven_pom_excludes_dependency_management_entries():
   </dependencies>
 </project>
 """
-    edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    _units, edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
     assert {e.target for e in edges} == {"com.acme:real-dep"}
     # M1 (round 11b): managed-scoped exclusion is cost-free (never the
     # module's own graph) - never counted.
@@ -2145,7 +2145,7 @@ def test_parse_maven_pom_counts_profile_scoped_dependencies():
   </profiles>
 </project>
 """
-    edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    _units, edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
     assert {e.target for e in edges} == {"com.acme:real-dep"}
     assert profile_scoped_count == 1
 
@@ -2178,7 +2178,7 @@ def test_parse_maven_pom_with_only_managed_and_plugin_scoped_dependencies_is_sil
   </build>
 </project>
 """
-    edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    _units, edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
     assert edges == []
     assert profile_scoped_count == 0
 
@@ -2208,7 +2208,7 @@ def test_parse_maven_pom_excludes_plugin_scoped_dependencies():
   </build>
 </project>
 """
-    edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    _units, edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
     assert {e.target for e in edges} == {"com.acme:real-dep"}
     # M1 (round 11b): plugin-scoped exclusion is cost-free (the build
     # tool's own dependency, never the module's) - never counted.
@@ -2305,7 +2305,7 @@ def test_parse_maven_pom_group_and_artifact_id_are_length_bounded():
         f"<groupId>{oversized_group}</groupId><artifactId>spring-core</artifactId>"
         "</dependency></dependencies></project>"
     )
-    edges, _profile_count = java.parse_maven_pom("pom.xml", pom)
+    _units, edges, _profile_count = java.parse_maven_pom("pom.xml", pom)
     assert len(edges) == 1
     assert len(edges[0].target) <= 2 * (_MAX_ROUTE_TARGET_LENGTH + len("...(truncated)")) + 1
     assert oversized_group not in edges[0].target
