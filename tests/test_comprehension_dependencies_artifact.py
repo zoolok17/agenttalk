@@ -1079,6 +1079,65 @@ def test_inherit_edge_through_an_import_of_a_same_run_degraded_file_stays_unreso
     assert inherit.target_unresolved == "com.acme.legacy.BaseServlet"
 
 
+def test_inherit_edge_through_an_import_of_a_duplicate_qualified_name_is_ambiguous_too():
+    """FIX ROUND 16b (reviewer-3's rejection of round 16, BLOCKER 2 -
+    "the predicate bypass"): the M8 inherit-through-import rule still
+    called ``_degraded_java_suffix_match`` INLINE, missing the
+    duplicate-FQN and excluded-region checks ``_classify_registry_miss``
+    centralizes everywhere else. Reproduced: two in-scan ``p.Base`` +
+    ``import p.Base;`` + ``extends Base`` published the IMPORT edge
+    ambiguous (2 candidates) while the INHERIT edge for the IDENTICAL
+    qualified name published resolved/external - round 16's own
+    headline mechanism (a registry miss silently becoming a confident
+    external claim) still live on this one caller. Both edges must now
+    agree: ambiguous, with the same candidates."""
+    results = {
+        "a/p/Base.java": _parse("a/p/Base.java", "package p;\nclass Base {}\n"),
+        "b/p/Base.java": _parse("b/p/Base.java", "package p;\nclass Base {}\n"),
+        "r/MyServlet.java": _parse(
+            "r/MyServlet.java",
+            "package r;\n"
+            "import p.Base;\n"
+            "class MyServlet extends Base {\n"
+            "}\n"),
+    }
+    records = da.build_dependencies(results)
+    inherit = next(r for r in records if r.relation == "inherit")
+    import_edge = next(r for r in records if r.relation == "import")
+    assert inherit.resolution_state == "ambiguous"
+    assert inherit.target_external is None
+    assert import_edge.resolution_state == "ambiguous"
+    assert sorted(inherit.candidate_unit_ids) == sorted(import_edge.candidate_unit_ids)
+    assert sorted(inherit.candidate_unit_ids) == sorted([
+        da._java_component_unit_id("a/p/Base.java", "p.Base"),
+        da._java_component_unit_id("b/p/Base.java", "p.Base"),
+    ])
+
+
+def test_inherit_edge_through_an_import_into_an_excluded_region_stays_unresolved_too():
+    """FIX ROUND 16b (BLOCKER 2, the excluded-region variant of the same
+    shape): mirrors the duplicate-FQN reproduction above, for B2's
+    excluded-region check instead - an inherit edge through an import
+    whose hypothetical file lives under a still-excluded region must
+    stay unresolved, matching the import edge, never a confident
+    external claim over a directory this run never walked."""
+    results = {
+        "r/OrderService.java": _parse(
+            "r/OrderService.java",
+            "package r;\n"
+            "import p.out.PaymentGateway;\n"
+            "class OrderService extends PaymentGateway {\n"
+            "}\n"),
+    }
+    records = da.build_dependencies(results, excluded_root_paths=frozenset({"p/out"}))
+    inherit = next(r for r in records if r.relation == "inherit")
+    import_edge = next(r for r in records if r.relation == "import")
+    assert inherit.resolution_state == "unresolved"
+    assert inherit.target_external is None
+    assert inherit.target_unresolved == "p.out.PaymentGateway"
+    assert import_edge.resolution_state == "unresolved"
+
+
 # ----------------------------------------------------------- route (external)
 
 def test_route_edge_resolves_as_external_with_declared_evidence():

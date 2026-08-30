@@ -419,7 +419,26 @@ def _excluded_region_match(qualified_name: str, excluded_root_paths: frozenset[s
     ``_is_inside_a_recognized_source_root``) must never become a
     confident EXTERNAL claim either: the registry has no entry for it
     because the file was never even walked, not because the type is
-    genuinely third-party."""
+    genuinely third-party.
+
+    NAMED LIMIT (round 16b, reviewer-3's own finding - declared, NOT
+    claimed closed, the same discipline round 12b's wildcard limit
+    already follows): this matches only when the TARGET'S OWN qualified
+    name, reinterpreted as a path, starts with the excluded directory
+    name - it has no way to know a code generator placed the file under
+    an ADDITIONAL root the qualified name never mentions (a Maven/Gradle
+    annotation-processor shape: ``target/generated-sources/annotations/
+    com/acme/MapperImpl.java`` declares ``com.acme.MapperImpl`` - a
+    qualified name with no "target/generated-sources/annotations/"
+    segment anywhere in it). A MapStruct/QueryDSL/protobuf-generated type
+    under such a root still publishes ``resolved``/``external`` - the
+    registry genuinely has no entry, discovery genuinely pruned the
+    whole `target/` tree, and nothing observable here distinguishes this
+    shape from a genuinely third-party dependency. Undetectable BY
+    CONSTRUCTION this slice (fixing it would need discovery to instead
+    walk generated-source roots and let the registry see what they
+    actually declare, a design change wider than this predicate) - never
+    silently assumed correct."""
     suffix = qualified_name.replace(".", "/") + ".java"
     return any(suffix == root or suffix.startswith(root + "/") for root in excluded_root_paths)
 
@@ -685,20 +704,41 @@ def _edge_claim_to_record(
             # coincidental same-spelling miss from a DIFFERENT ladder
             # rung - e.g. a dotted target - is never mistaken for this
             # one) - consult it the same way the import edge itself
-            # does: a same-run degraded file (F2 MAJOR) never becomes a
-            # confident external claim over evidence that is merely
-            # missing, everything else genuinely is external. Scoped to
-            # inherit/invoke ONLY - a "test" relation edge is a
-            # CONVENTION GUESS (F4), never a real reference the source
-            # actually makes; confidently resolving a guessed name
-            # external would be exactly the overclaim F4 exists to
+            # does. Scoped to inherit/invoke ONLY - a "test" relation
+            # edge is a CONVENTION GUESS (F4), never a real reference the
+            # source actually makes; confidently resolving a guessed
+            # name external would be exactly the overclaim F4 exists to
             # prevent.
+            #
+            # FIX ROUND 16b (reviewer-3's rejection of round 16, BLOCKER
+            # 2 - "the predicate bypass"): this used to call
+            # `_degraded_java_suffix_match` INLINE - the exact same
+            # narrower check the round-16 dispatch's own headline
+            # mechanism (_classify_registry_miss) replaced everywhere
+            # else, missing the duplicate-FQN and excluded-region
+            # checks this bypassed entirely. Reproduced: two in-scan
+            # `p.Base` + `import p.Base;` + `extends Base` published the
+            # IMPORT edge ambiguous (2 candidates) while the INHERIT
+            # edge for the identical qualified name published resolved/
+            # external - two contradictory facts about one dependency in
+            # the same run, this round's own class reopened on the one
+            # inline caller `_classify_registry_miss` was meant to
+            # replace. Now calls the shared predicate and honors EVERY
+            # outcome, not just the degraded one.
             imported = import_qualified_by_simple[edge.target]
-            if imported == target_unresolved and not _degraded_java_suffix_match(
-                imported, degraded_paths,
-            ):
-                resolution_state, target_unresolved = "resolved", None
-                target_external = imported
+            if imported == target_unresolved:
+                outcome, candidates = _classify_registry_miss(
+                    imported, duplicate_qualified_names=duplicate_qualified_names,
+                    unit_ids_by_qualified_name=unit_ids_by_qualified_name,
+                    degraded_paths=degraded_paths, excluded_root_paths=excluded_root_paths,
+                )
+                if outcome == "ambiguous":
+                    resolution_state, candidate_unit_ids = "ambiguous", candidates
+                elif outcome == "external":
+                    resolution_state, target_unresolved = "resolved", None
+                    target_external = imported
+                # outcome == "unresolved": already unresolved with
+                # target_unresolved == imported - nothing to change.
     elif edge.target_kind == "internal_exact_or_external":
         # D-1 (reviewer-3, PR-B delta review round 2): an import's target
         # is already fully qualified - an EXACT registry hit means it
