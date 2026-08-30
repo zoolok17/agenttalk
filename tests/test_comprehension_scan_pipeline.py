@@ -2720,6 +2720,98 @@ def test_run_scan_a_duplicate_qualified_name_publishes_ambiguous_import_and_a_pr
     assert outcome.status == "degraded"
 
 
+def test_run_scan_an_import_of_a_binary_sniffed_excluded_file_is_unresolved_not_external(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 19 (fifteenth cold read, F1 BLOCKER, wrong-data): mirrors
+    the reader's own ``.cr15-d`` UTF-16-import shape - a UTF-16-encoded
+    ``.java`` file trips discovery's binary sniff (round 18's own F6)
+    and is excluded outright, recorded as a full FILE path (WITH its own
+    ``src/main/java/...`` scaffolding) in ``excluded_roots``. An import
+    of the type it would have declared has no scaffolding of its own
+    (``p.Legacy``) - the old ``_excluded_region_match`` only matched
+    when an excluded root's path started with the SAME string as the
+    scaffolding-free qualified name, which never happens once the
+    excluded root carries real scaffolding. Must resolve unresolved,
+    never a confident external claim, and this run's dependency_summary
+    must not silently count it third-party."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "p" / "Legacy.java").write_bytes(
+        "package p;\nclass Legacy {}\n".encode("utf-16"))
+    (java_repo / "src" / "main" / "java" / "p" / "Consumer.java").write_text(
+        "package p;\nimport p.Legacy;\nclass Consumer {}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+
+    import_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "import" and r.get("target_unresolved") == "p.Legacy")
+    assert import_edge["resolution_state"] == "unresolved"
+    assert import_edge.get("target_external") is None
+
+
+def test_run_scan_an_import_of_an_ant_style_excluded_vendor_package_is_unresolved_not_external(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 19 (fifteenth cold read, F1 BLOCKER, wrong-data): mirrors
+    the reader's own ``.cr15-c`` Ant/Eclipse shape - a bare ``src/``
+    source root (never ``src/main/java``, so round 18's own F1
+    recognition does not apply here) has a domain package literally
+    named ``vendor`` excluded as ``generated_or_vendor`` at
+    ``src/vendor`` - a directory path carrying the ``src/`` scaffolding
+    a wildcard-free qualified name never spells. Same bug, same fix,
+    different excluded-root shape (a DIRECTORY, not a single file)."""
+    import json
+
+    (java_repo / "src" / "vendor" / "Helper.java").parent.mkdir(parents=True, exist_ok=True)
+    (java_repo / "src" / "vendor" / "Helper.java").write_text(
+        "package vendor;\nclass Helper {}\n", encoding="utf-8")
+    (java_repo / "src" / "main" / "java" / "p" / "Consumer.java").write_text(
+        "package p;\nimport vendor.Helper;\nclass Consumer {}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+
+    assert any(
+        e["path"] == "src/vendor" and e["category"] == "generated_or_vendor"
+        for e in scan_doc["excluded_roots"]
+    )
+    import_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "import" and r.get("target_unresolved") == "vendor.Helper")
+    assert import_edge["resolution_state"] == "unresolved"
+    assert import_edge.get("target_external") is None
+
+
+def test_run_scan_a_wildcard_import_of_an_ant_style_excluded_vendor_package_is_unresolved(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 19 (fifteenth cold read, F1 BLOCKER sweep): mirrors the
+    same Ant/Eclipse shape as the plain-import companion test above, but
+    through the wildcard-import sibling predicate
+    (_excluded_region_package_match), which had the identical repo-root
+    anchoring bug."""
+    import json
+
+    (java_repo / "src" / "vendor").mkdir(parents=True, exist_ok=True)
+    (java_repo / "src" / "vendor" / "Helper.java").write_text(
+        "package vendor;\nclass Helper {}\n", encoding="utf-8")
+    (java_repo / "src" / "main" / "java" / "p" / "Consumer.java").write_text(
+        "package p;\nimport vendor.*;\nclass Consumer {}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+
+    import_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "import" and r.get("target_unresolved") == "vendor.*")
+    assert import_edge["resolution_state"] == "unresolved"
+    assert import_edge.get("target_external") is None
+
+
 def test_run_scan_an_import_into_an_excluded_generated_dir_is_unresolved_not_deleted(
     java_repo: Path,
 ) -> None:

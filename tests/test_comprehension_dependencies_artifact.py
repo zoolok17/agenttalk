@@ -1324,6 +1324,61 @@ def test_a_genuinely_external_pom_dependency_still_resolves_external():
     assert build_edge.target_external == "org.springframework:spring-core"
 
 
+def test_a_project_groupid_property_dependency_expands_and_resolves_internal():
+    """FIX ROUND 19 (fifteenth cold read, F2 MAJOR, wrong-data): mirrors
+    the reader's own ``.cr15-b`` shape - ``${project.groupId}:billing-
+    core``, Maven's own documented sibling-dependency idiom (avoiding
+    repeating a reactor's shared groupId in every module's own pom).
+    billing-core IS registered (round 18's own F3 fix works); the miss
+    was purely the unexpanded property in the published target. Now
+    expands to the SAME-FILE project's own effective groupId before
+    the edge is even constructed, resolving internal."""
+    _app_units, app_edges, _c1 = java_adapter.parse_maven_pom(
+        "app/pom.xml",
+        "<project><groupId>com.acme</groupId><artifactId>app</artifactId>"
+        "<dependencies><dependency>"
+        "<groupId>${project.groupId}</groupId><artifactId>billing-core</artifactId>"
+        "</dependency></dependencies></project>",
+    )
+    billing_units, billing_edges, _c2 = java_adapter.parse_maven_pom(
+        "billing-core/pom.xml",
+        "<project><groupId>com.acme</groupId><artifactId>billing-core</artifactId></project>",
+    )
+    results = {
+        "app/pom.xml": java_adapter.JavaFileResult(edges=app_edges),
+        "billing-core/pom.xml": java_adapter.JavaFileResult(units=billing_units, edges=billing_edges),
+    }
+    records = da.build_dependencies(results)
+    build_edge = next(r for r in records if r.relation == "build")
+    assert build_edge.resolution_state == "resolved"
+    assert build_edge.target_external is None
+    assert build_edge.target_unit_id == da._java_component_unit_id(
+        "billing-core/pom.xml", "com.acme:billing-core")
+
+
+def test_an_unexpandable_pom_property_dependency_stays_unresolved_spelling_retained():
+    """FIX ROUND 19 (fifteenth cold read, F2 MAJOR, wrong-data, HARD
+    RULE): a coordinate containing ANY property this adapter cannot
+    expand from the same file (${custom.prop} - not one of the two
+    self-referential properties parse_maven_pom knows how to resolve)
+    must never satisfy the positive-grounds external test - unresolved,
+    with the property spelling retained verbatim, never silently
+    dropped or guessed at."""
+    _app_units, app_edges, _c1 = java_adapter.parse_maven_pom(
+        "app/pom.xml",
+        "<project><groupId>com.acme</groupId><artifactId>app</artifactId>"
+        "<dependencies><dependency>"
+        "<groupId>${custom.prop}</groupId><artifactId>widget</artifactId>"
+        "</dependency></dependencies></project>",
+    )
+    results = {"app/pom.xml": java_adapter.JavaFileResult(edges=app_edges)}
+    records = da.build_dependencies(results)
+    build_edge = next(r for r in records if r.relation == "build")
+    assert build_edge.resolution_state == "unresolved"
+    assert build_edge.target_external is None
+    assert build_edge.target_unresolved == "${custom.prop}:widget"
+
+
 def test_two_poms_declaring_the_same_coordinate_make_the_dependency_ambiguous():
     """FIX ROUND 17 (CR13-4): consistency with B1 - a duplicate pom
     coordinate (two modules both declaring com.acme:shared-lib) must

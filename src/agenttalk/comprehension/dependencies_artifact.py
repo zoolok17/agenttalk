@@ -421,26 +421,55 @@ def _excluded_region_match(qualified_name: str, excluded_root_paths: frozenset[s
     because the file was never even walked, not because the type is
     genuinely third-party.
 
+    FIX ROUND 19 (fifteenth cold read, F1 BLOCKER, wrong-data): this used
+    to test ONLY ``suffix.startswith(root + "/")`` - correct for the case
+    an excluded root truly IS a bare, no-scaffolding ancestor of the
+    qualified name's own path (e.g. ``target`` excluding ``target/gen/
+    Stub.java``, package ``target.gen`` - the excluded root and the
+    package structure share the SAME coordinate space because there is
+    no source-root prefix in between). It missed the mirror-image shape:
+    an excluded root that instead carries EXTRA source-root scaffolding
+    the qualified name never spells (``src/main/java/...``, ``core/src/
+    main/java/...``, a bare Ant ``src/...``) - the exact same repo-root
+    anchoring round 18's own F1 fixed in ``discovery.py``, standing
+    unfixed here. Its own sibling, :func:`_degraded_java_suffix_match`,
+    already uses the correct technique for that second shape (checking
+    whether the REAL, scaffolded path ENDS WITH the qualified name's own
+    scaffolding-free suffix) - added here ALONGSIDE the original prefix
+    check, not instead of it, since real repos exhibit both
+    relationships depending on where the excluded region actually sits.
+    Checks, for each excluded root: (1) the ORIGINAL prefix relationship
+    (the qualified path starts with the root, unscaffolded case); (2) a
+    single excluded FILE (the binary-sniff case F6 of round 18
+    introduced) whose own path ends with the type's full ``.java``
+    suffix; (3) an excluded DIRECTORY whose own path ends with the
+    type's PACKAGE path (the type's hypothetical file would live one
+    level deeper than the directory itself).
+
     NAMED LIMIT (round 16b, reviewer-3's own finding - declared, NOT
     claimed closed, the same discipline round 12b's wildcard limit
-    already follows): this matches only when the TARGET'S OWN qualified
-    name, reinterpreted as a path, starts with the excluded directory
-    name - it has no way to know a code generator placed the file under
-    an ADDITIONAL root the qualified name never mentions (a Maven/Gradle
-    annotation-processor shape: ``target/generated-sources/annotations/
-    com/acme/MapperImpl.java`` declares ``com.acme.MapperImpl`` - a
-    qualified name with no "target/generated-sources/annotations/"
-    segment anywhere in it). A MapStruct/QueryDSL/protobuf-generated type
-    under such a root still publishes ``resolved``/``external`` - the
-    registry genuinely has no entry, discovery genuinely pruned the
-    whole `target/` tree, and nothing observable here distinguishes this
-    shape from a genuinely third-party dependency. Undetectable BY
-    CONSTRUCTION this slice (fixing it would need discovery to instead
-    walk generated-source roots and let the registry see what they
-    actually declare, a design change wider than this predicate) - never
-    silently assumed correct."""
+    already follows, UNCHANGED by this round's fix): this still has no
+    way to know a code generator placed the file under an ADDITIONAL
+    root the qualified name never mentions (a Maven/Gradle annotation-
+    processor shape: ``target/generated-sources/annotations/com/acme/
+    MapperImpl.java`` declares ``com.acme.MapperImpl`` - a qualified name
+    with no "target/generated-sources/annotations/" segment anywhere in
+    it). A MapStruct/QueryDSL/protobuf-generated type under such a root
+    still publishes ``resolved``/``external`` - the registry genuinely
+    has no entry, discovery genuinely pruned the whole `target/` tree,
+    and nothing observable here distinguishes this shape from a
+    genuinely third-party dependency. Undetectable BY CONSTRUCTION this
+    slice - never silently assumed correct."""
     suffix = qualified_name.replace(".", "/") + ".java"
-    return any(suffix == root or suffix.startswith(root + "/") for root in excluded_root_paths)
+    package_path = qualified_name.rsplit(".", 1)[0].replace(".", "/") if "." in qualified_name else None
+    for root in excluded_root_paths:
+        if root == suffix or suffix.startswith(root + "/"):
+            return True
+        if root.endswith("/" + suffix):
+            return True
+        if package_path is not None and (root == package_path or root.endswith("/" + package_path)):
+            return True
+    return False
 
 
 def _excluded_region_package_match(
@@ -454,10 +483,20 @@ def _excluded_region_package_match(
     package's OWN hypothetical directory lives inside (or IS) a region
     THIS run excluded outright - the same "never a confident external
     claim over a directory that was simply never walked" reasoning
-    ``_excluded_region_match`` already applies to a single type."""
+    ``_excluded_region_match`` already applies to a single type.
+
+    FIX ROUND 19 (fifteenth cold read, F1 BLOCKER sweep - same asymmetry
+    class): this had the IDENTICAL gap ``_excluded_region_match`` did -
+    only checking ``package_path.startswith(root + "/")`` (correct for a
+    bare, no-scaffolding excluded ancestor) missed the mirror-image
+    shape, an excluded root carrying scaffolding the package path never
+    spells. Checks both directions the same way its sibling now does:
+    the original prefix relationship, and the excluded root's own path
+    ENDING WITH the package path."""
     package_path = package_prefix.replace(".", "/")
     return any(
         package_path == root or package_path.startswith(root + "/")
+        or root.endswith("/" + package_path)
         for root in excluded_root_paths
     )
 
@@ -480,7 +519,25 @@ def _classify_registry_miss(
     ``unresolved`` (or ``ambiguous`` with candidates), spelling retained,
     never a confident external claim over an absent registry entry that
     is actually just a naming collision or a directory this run never
-    walked."""
+    walked.
+
+    FIX ROUND 19 (fifteenth cold read, F2 MAJOR, wrong-data, HARD RULE):
+    a target still carrying an UNEXPANDED Maven property placeholder
+    (``${...}``, e.g. ``${project.groupId}:billing-core`` - Maven's own
+    documented sibling-dependency idiom) can never satisfy the positive-
+    grounds test, regardless of what the rest of this function would
+    otherwise conclude - it is not a real, resolvable coordinate at all,
+    a fabricated string this producer has no evidence describes any
+    actual in-scan or third-party artifact. Checked FIRST,
+    unconditionally: ``unresolved``, spelling retained verbatim (never
+    silently rewritten or guessed at), even ahead of the duplicate-name
+    check (a qualified name containing ``${`` can never legitimately
+    collide with a real one either). ``parse_maven_pom`` (java.py)
+    already expands the two self-referential properties resolvable from
+    the SAME file before constructing the edge; any OTHER property
+    reaches this rule."""
+    if "${" in qualified_name:
+        return "unresolved", None
     if qualified_name in duplicate_qualified_names:
         return "ambiguous", sorted(unit_ids_by_qualified_name.get(qualified_name, []))
     if _degraded_java_suffix_match(qualified_name, degraded_paths):

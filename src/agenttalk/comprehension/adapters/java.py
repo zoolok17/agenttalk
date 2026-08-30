@@ -2445,6 +2445,24 @@ def _count_profile_scoped_dependencies(sanitized: str) -> int:
     return count
 
 
+def _own_and_parent_group_ids(sanitized: str) -> tuple[str | None, str | None]:
+    """FIX ROUND 19 (fifteenth cold read, F2 MAJOR): the project-level and
+    ``<parent>``-block groupId scan :func:`_project_own_coordinate`
+    already performs, factored out so ``parse_maven_pom``'s own
+    ``${project.groupId}``/``${project.parent.groupId}`` self-referential
+    property expansion (see its own docstring) can reuse the identical
+    parse without a second, separately-maintained walk."""
+    group_id = parent_group_id = None
+    for match in _DEPENDENCY_GROUP_ID_RE.finditer(sanitized):
+        stack = _enclosing_tag_stack(sanitized, match.start())
+        if stack == ["project"]:
+            group_id = _bounded_route_target(match.group(1).strip())
+            break
+        if stack == ["project", "parent"] and parent_group_id is None:
+            parent_group_id = _bounded_route_target(match.group(1).strip())
+    return group_id, parent_group_id
+
+
 def _project_own_coordinate(sanitized: str) -> tuple[str, str] | None:
     """FIX ROUND 17 (thirteenth cold read, CR13-4 MAJOR, wrong-data):
     this pom's OWN ``groupId:artifactId`` identity - a direct child of
@@ -2484,16 +2502,10 @@ def _project_own_coordinate(sanitized: str) -> tuple[str, str] | None:
     unregistered, so a sibling depending on it via that (further)
     inherited groupId still resolves ``unresolved`` - never a false
     internal claim, but not resolved either."""
-    group_id = artifact_id = parent_group_id = None
-    for match in _DEPENDENCY_GROUP_ID_RE.finditer(sanitized):
-        stack = _enclosing_tag_stack(sanitized, match.start())
-        if stack == ["project"]:
-            group_id = _bounded_route_target(match.group(1).strip())
-            break
-        if stack == ["project", "parent"] and parent_group_id is None:
-            parent_group_id = _bounded_route_target(match.group(1).strip())
+    group_id, parent_group_id = _own_and_parent_group_ids(sanitized)
     if group_id is None:
         group_id = parent_group_id
+    artifact_id = None
     for match in _DEPENDENCY_ARTIFACT_ID_RE.finditer(sanitized):
         if _enclosing_tag_stack(sanitized, match.start()) == ["project"]:
             artifact_id = _bounded_route_target(match.group(1).strip())
@@ -2555,6 +2567,37 @@ def parse_maven_pom(
             relative_path=relative_path, qualified_name=f"{own_group_id}:{own_artifact_id}",
             simple_name=own_artifact_id, line=1, classification="production",
         ))
+    # FIX ROUND 19 (fifteenth cold read, F2 MAJOR, wrong-data):
+    # ${project.groupId}:artifactId - Maven's own documented sibling-
+    # dependency idiom, avoiding the need to repeat a reactor's shared
+    # groupId in every module's own pom - published resolved/EXTERNAL
+    # with the property left UNEXPANDED in the target string (a
+    # fabricated coordinate no registry lookup could ever match). The
+    # two SELF-REFERENTIAL properties resolvable from THIS SAME FILE'S
+    # own already-parsed groupId/parent-groupId are expanded before the
+    # edge is even constructed - ${project.groupId} to the EFFECTIVE
+    # (own, falling back to parent-inherited) groupId a sibling's
+    # `${project.groupId}:some-artifact` dependency on THIS pom would
+    # itself resolve to; ${project.parent.groupId} to the parent
+    # block's own, never-merged groupId specifically. Any OTHER
+    # property (${custom.prop}, ${project.version}, ...) is not
+    # resolvable without a full properties/profile-activation
+    # evaluator this adapter does not have - left unexpanded, and the
+    # HARD RULE below (dependencies_artifact._classify_registry_miss)
+    # ensures an unexpanded ``${`` can never satisfy the positive-
+    # grounds external test regardless.
+    own_project_group_id, parent_group_id = _own_and_parent_group_ids(sanitized)
+    effective_own_group_id = (
+        own_project_group_id if own_project_group_id is not None else parent_group_id
+    )
+
+    def _expand_self_referential_property(value: str) -> str:
+        if value == "${project.groupId}" and effective_own_group_id is not None:
+            return effective_own_group_id
+        if value == "${project.parent.groupId}" and parent_group_id is not None:
+            return parent_group_id
+        return value
+
     edges = []
     for match in _module_own_dependency_blocks(sanitized):
         block = match.group(1)
@@ -2567,7 +2610,8 @@ def parse_maven_pom(
         # merely enormous pom - a 5000-char fixture - published whole),
         # while every Java route target is already length-bounded
         # (invariant 3) - routed through the same per-field discipline.
-        group_id = _bounded_route_target(group_match.group(1).strip())
+        group_id = _expand_self_referential_property(
+            _bounded_route_target(group_match.group(1).strip()))
         artifact_id = _bounded_route_target(artifact_match.group(1).strip())
         optional_match = _DEPENDENCY_OPTIONAL_RE.search(block)
         optional = optional_match is not None and optional_match.group(1).lower() == "true"
