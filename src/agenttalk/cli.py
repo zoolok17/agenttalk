@@ -14111,9 +14111,18 @@ def build_parser() -> argparse.ArgumentParser:
     gwaive.set_defaults(func=cmd_gate)
 
     # ----- comprehension (task #55 slice-1: local static inventory) -----
+    # FIX ROUND 23 (nineteenth cold read, F9, completeness): the design's
+    # own CLI command table names SIX comprehension commands; this
+    # slice implements five (scan/status/report/validate/prune) - `pack`
+    # is a LATER increment (the design's own increment 3) with nothing
+    # declaring its absence anywhere a `--help` reader would see it.
     pcomp = sub.add_parser(
         "comprehension",
         help="Local, offline static comprehension inventory for one legacy repository (task #55).",
+        description="Local, offline static comprehension inventory for one legacy repository "
+                    "(task #55 slice-1). This slice implements scan/status/report/validate/"
+                    "prune - `pack` (bounded evidence-pack construction) is a later increment, "
+                    "not yet implemented.",
     )
     pcomp.set_defaults(func=cmd_comprehension, comprehension_cmd=None)
     compsub = pcomp.add_subparsers(dest="comprehension_cmd")

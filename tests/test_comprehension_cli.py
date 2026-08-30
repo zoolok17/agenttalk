@@ -262,6 +262,20 @@ def test_recover_stale_lock_help_text_states_the_true_refuse_then_confirm_semant
     assert "provably" in help_text
 
 
+def test_comprehension_help_declares_pack_as_a_later_increment(capsys) -> None:
+    """FIX ROUND 23 (nineteenth cold read, F9, completeness): the
+    design's own CLI command table lists six comprehension commands;
+    --help shows five (scan/status/report/validate/prune) with nothing
+    declaring pack's absence anywhere a --help reader would see it -
+    pack is the design's own increment 3, not yet implemented."""
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["comprehension", "--help"])
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "pack" in help_text
+    assert "later increment" in help_text
+
+
 def test_status_before_any_scan(tmp_path: Path, capsys) -> None:
     exit_code = _run(["comprehension", "status", "--json"], tmp_path)
     assert exit_code == 0
