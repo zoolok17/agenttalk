@@ -83,6 +83,12 @@ def test_counts_and_freshness_stub():
     assert payload["freshness"] == {
         "state": "not_evaluated", "reason_code": "freshness_not_implemented_this_slice",
     }
+    # FIX ROUND 23 (nineteenth cold read, F7, completeness): the SAME
+    # declared-absence shape as freshness - cycle detection is not
+    # implemented this slice, declared rather than silently omitted.
+    assert payload["cycles"] == {
+        "state": "not_evaluated", "reason_code": "cycles_not_implemented_this_slice",
+    }
     assert payload["schema_version"] == pr.PROJECTION_SCHEMA_VERSION
 
 

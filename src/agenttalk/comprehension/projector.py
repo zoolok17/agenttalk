@@ -475,6 +475,20 @@ def project_comprehension(
             "state": "not_evaluated",
             "reason_code": "freshness_not_implemented_this_slice",
         },
+        # FIX ROUND 23 (nineteenth cold read, F7, completeness): report
+        # --json had no `cycles` field at all and no declared absence -
+        # freshness/external-revalidation/assessment-states/features
+        # all declare theirs (the design names cycles/hotspots/impact
+        # summaries as report/UI-derived, "Artifact 2"'s own text) - a
+        # caller had no way to tell "not computed this slice" apart from
+        # "computed and genuinely empty." The SAME declared-absence
+        # shape `freshness` already uses (CR13-6 discipline) - cycle
+        # detection is NOT implemented this slice, declared rather than
+        # silently omitted.
+        "cycles": {
+            "state": "not_evaluated",
+            "reason_code": "cycles_not_implemented_this_slice",
+        },
         "whole_run_sections": list(WHOLE_RUN_SECTIONS),
         # FIX ROUND 17 (thirteenth cold read, CR13-9 MINOR): the applied
         # filters, echoed verbatim - a caller getting zero rows back
