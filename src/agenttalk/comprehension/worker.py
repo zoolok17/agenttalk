@@ -535,14 +535,25 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
             # / same java_results channel as pom.xml's build edges.
             try:
                 text = data.decode("utf-8-sig", errors="replace")
-                web_entry_points = java_adapter.parse_web_xml(rel, text)
+                web_entry_points, web_problems = java_adapter.parse_web_xml(rel, text)
             except Exception as exc:  # noqa: BLE001 - a producer bug must degrade, never abort the scan
                 problems.append(WorkerProblem(
                     reason_code="parse_failed", relative_path=rel,
                     detail=bounded_detail(f"{java_adapter.ADAPTER_NAME} adapter failed: {exc}")))
             else:
+                # FIX ROUND 21 (seventeenth cold read, CR17-3 MAJOR):
+                # <filter>/<listener> elements now record their own
+                # unsupported_entry_point_shape problems - surfaced the
+                # same way every other adapter problem already is.
+                for adapter_problem in web_problems:
+                    problems.append(WorkerProblem(
+                        reason_code=adapter_problem.reason_code, relative_path=rel,
+                        detail=adapter_problem.detail,
+                        qualified_name=adapter_problem.qualified_name,
+                    ))
                 java_results[rel] = java_adapter.file_result_to_json(
-                    java_adapter.JavaFileResult(entry_points=web_entry_points))
+                    java_adapter.JavaFileResult(
+                        entry_points=web_entry_points, problems=web_problems))
         elif not (
             rel_lower.endswith(tuple(_BENIGN_NON_CODE_EXTENSIONS))
             or rel_name_lower in _BENIGN_NON_CODE_BASENAMES

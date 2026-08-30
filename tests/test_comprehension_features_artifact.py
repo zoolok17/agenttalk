@@ -56,7 +56,7 @@ def test_web_xml_entry_point_gets_a_clean_label_not_the_file_extension():
     Java type name - splitting on "." landed in the middle of the file
     path's own ".xml" extension, producing a garbage label like
     "xml#legacy" instead of the actual servlet name."""
-    entry_points = java_adapter.parse_web_xml(
+    entry_points, _web_problems = java_adapter.parse_web_xml(
         "WEB-INF/web.xml",
         "<web-app>\n"
         "  <servlet-mapping>\n"
@@ -92,7 +92,7 @@ def test_web_xml_entry_point_owner_is_the_real_servlet_class_when_declared():
   </servlet-mapping>
 </web-app>
 """
-    entry_points = java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, _web_problems = java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml)
     servlet_source = (
         "package com.acme.web;\nclass DispatcherServlet {\n}\n"
     )
@@ -130,7 +130,7 @@ def test_web_xml_entry_point_still_owned_by_the_file_when_the_class_is_out_of_sc
   </servlet-mapping>
 </web-app>
 """
-    entry_points = java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, _web_problems = java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml)
     results = {
         "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
     }
@@ -151,7 +151,7 @@ def test_two_servlet_mappings_in_one_web_xml_produce_two_features_not_one():
     labelled after whichever servlet happened to be first, silently
     folding the second servlet's identity under the wrong name. Each
     independent file-fallback claim must get its own feature."""
-    entry_points = java_adapter.parse_web_xml(
+    entry_points, _web_problems = java_adapter.parse_web_xml(
         "WEB-INF/web.xml",
         "<web-app>\n"
         "  <servlet-mapping>\n"

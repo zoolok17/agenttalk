@@ -121,10 +121,24 @@ UNSUPPORTED_INVOKE_SHAPES = ("constructor_call",)
 #: @Stateless alongside it. A future round may find a real repo whose
 #: shape needs a different member added or this reasoning revisited;
 #: reviewer-3 ratifies.
+#: FIX ROUND 21 (seventeenth cold read, CR17-3 MAJOR, wrong-data): a
+#: servlet ``<listener>``/``@WebListener`` (a lifecycle callback, no URL
+#: pattern of its own to model as a route) and a servlet ``<filter>``/
+#: ``<filter-mapping>`` declared via plain web.xml XML (as opposed to
+#: the ``@WebFilter`` annotation, contained enough to actually MODEL as
+#: a route below - see the loop beside ``_WEB_FILTER_ANNOTATION_RE``) -
+#: the direct twins of the already-modeled servlet-mapping/@WebServlet
+#: shapes, previously unrecognized entirely: zero entry points AND the
+#: confident negative, on a complete run, for a real, common JEE idiom.
+#: ``web_xml_listener`` names BOTH the XML ``<listener>`` element and
+#: the ``@WebListener`` annotation - same underlying gap (a lifecycle
+#: callback with no route to model) regardless of which mechanism
+#: declares it.
 UNSUPPORTED_ENTRY_POINT_SHAPES = (
     "jax_ws_web_method", "jax_rs_verb_only_method",
     "spring_scheduled", "kafka_listener", "jms_message_driven",
     "ejb_remote_component", "websocket_server_endpoint",
+    "web_xml_listener", "web_xml_filter",
 )
 
 #: FIX ROUND 15 (eleventh cold read, F3 MAJOR, wrong-data): the ORIGINAL
@@ -504,6 +518,15 @@ _REQUEST_METHOD_VOCABULARY = frozenset({
 #: prefix with no invocable route", the composable family's own
 #: legitimate no-method-level-mapping case).
 _WEB_SERVLET_ANNOTATION_RE = re.compile(r"@(?:[A-Za-z_$][\w$]*\.)*WebServlet\b")
+#: FIX ROUND 21 (seventeenth cold read, CR17-3 MAJOR, wrong-data - JUDGE,
+#: taken): @WebFilter shares the EXACT same shape as @WebServlet
+#: (class-level, not composable, a value()/urlPatterns() attribute names
+#: the served pattern(s) directly) - contained enough to actually MODEL
+#: as a real route rather than merely enrolling it as unsupported (the
+#: treatment @WebListener gets instead, below - a lifecycle callback
+#: with no URL pattern of its own). Reuses the identical class-
+#: association and value-recovery fail-safes.
+_WEB_FILTER_ANNOTATION_RE = re.compile(r"@(?:[A-Za-z_$][\w$]*\.)*WebFilter\b")
 #: FIX ROUND 17 (CR13-3 MAJOR, part (b) - THE CLASS-CLOSER): a route-like
 #: annotation family this adapter recognizes AS a routing/endpoint
 #: mechanism but has never modeled (JAX-WS's own SOAP endpoint idiom -
@@ -560,6 +583,21 @@ _UNENROLLED_ENTRY_POINT_FAMILIES: tuple[tuple[str, re.Pattern[str], str, bool], 
         "websocket_server_endpoint",
         re.compile(r"@(?:[A-Za-z_$][\w$]*\.)*ServerEndpoint\b"),
         "a @ServerEndpoint annotation",
+        True,
+    ),
+    # FIX ROUND 21 (seventeenth cold read, CR17-3 MAJOR, wrong-data): a
+    # @WebListener has no URL pattern of its own to model as a route (a
+    # lifecycle callback, not a routable request handler) - unlike
+    # @WebFilter (see _WEB_FILTER_ANNOTATION_RE below, MODELED as a real
+    # route, the same machinery @WebServlet already established), this
+    # stays a class-closer the same way @MessageDriven/@Remote/
+    # @ServerEndpoint already do. Shares its shape name with the XML
+    # <listener> element (worker.py's own web.xml producer) - same
+    # underlying gap regardless of which mechanism declares it.
+    (
+        "web_xml_listener",
+        re.compile(r"@(?:[A-Za-z_$][\w$]*\.)*WebListener\b"),
+        "a @WebListener annotation",
         True,
     ),
 )
@@ -2272,6 +2310,43 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                 name=path, line=line, evidence_class="declared",
             ))
 
+    # FIX ROUND 21 (seventeenth cold read, CR17-3 MAJOR, wrong-data -
+    # JUDGE, taken): @WebFilter shares @WebServlet's own shape exactly -
+    # same fail-safes, same composition semantics (none - a filter's own
+    # value/urlPatterns IS the complete served pattern).
+    for match in _WEB_FILTER_ANNOTATION_RE.finditer(sanitized):
+        line = _line_at(newline_offsets, match.start())
+        target_type = _class_level_route_target(match.start(), class_header_associations)
+        if target_type is None:
+            problems.append(JavaAdapterProblem(
+                reason_code="route_annotation_unassociated",
+                detail=f"a @WebFilter annotation at line {line} could not be confidently "
+                       "associated with any declared type - suppressed rather than "
+                       "published as a route",
+            ))
+            continue
+        _span_end, paths, _explicit_methods = _route_annotation_span(match)
+        if paths is None:
+            problems.append(JavaAdapterProblem(
+                reason_code="route_value_unrecoverable",
+                detail=f"a @WebFilter annotation at line {line} has a value/urlPatterns "
+                       "that could not be recovered as a literal - suppressed rather than "
+                       "published with a guessed or partial value",
+                qualified_name=target_type,
+            ))
+            continue
+        for path in paths:
+            classes_with_route_entry_points.add(target_type)
+            edges.append(JavaEdgeClaim(
+                from_qualified_name=target_type, relation="route", target=path,
+                target_kind="external_route", evidence_class="declared",
+                line=line, phase="runtime",
+            ))
+            entry_points.append(JavaEntryPointClaim(
+                qualified_name=target_type, kind="http_route",
+                name=path, line=line, evidence_class="declared",
+            ))
+
     # FIX ROUND 17b (reviewer-3's rejection of round 17, THE MAJOR): a
     # class carrying a recognized @Path from which NO route ever
     # composed (JAX-RS's own verb-only method idiom - @GET/@POST with no
@@ -2987,7 +3062,27 @@ def _servlet_class_by_name(sanitized: str) -> dict[str, str]:
     return mapping
 
 
-def parse_web_xml(relative_path: str, text: str) -> list[JavaEntryPointClaim]:
+#: FIX ROUND 21 (seventeenth cold read, CR17-3 MAJOR, wrong-data): a
+#: web.xml ``<filter>``/``<filter-mapping>`` pair - the direct XML twin
+#: of ``<servlet>``/``<servlet-mapping>``, but NOT modeled as a route
+#: here the way a servlet mapping is (unlike ``@WebFilter``, contained
+#: enough to model above, the XML form's own url-pattern is enrolled as
+#: an unsupported shape instead - see UNSUPPORTED_ENTRY_POINT_SHAPES's
+#: own docstring for the reasoning). ``<filter>`` alone (no separate
+#: mapping needed) already names its own implementing class directly.
+_FILTER_BLOCK_RE = re.compile(r"<filter>(.*?)</filter>", re.DOTALL)
+_FILTER_NAME_RE = re.compile(r"<filter-name>([^<]+)</filter-name>")
+_FILTER_CLASS_RE = re.compile(r"<filter-class>\s*([^<]+?)\s*</filter-class>")
+#: A ``<listener>`` element names its own implementing class directly -
+#: no separate mapping/name indirection at all (a listener has no URL
+#: pattern of its own; it is a lifecycle callback, registered wholesale).
+_LISTENER_BLOCK_RE = re.compile(r"<listener>(.*?)</listener>", re.DOTALL)
+_LISTENER_CLASS_RE = re.compile(r"<listener-class>\s*([^<]+?)\s*</listener-class>")
+
+
+def parse_web_xml(
+    relative_path: str, text: str,
+) -> tuple[list[JavaEntryPointClaim], list[JavaAdapterProblem]]:
     """``route`` entry points declared as plain ``<servlet-mapping>``/
     ``<url-pattern>`` pairs in a ``web.xml`` - the same "trivially present,
     named, no inference" bar as the annotation-based routes above.
@@ -3005,8 +3100,20 @@ def parse_web_xml(relative_path: str, text: str) -> list[JavaEntryPointClaim]:
     mapping names, via the feature's own label, rather than only the
     servlet-name string. Only a mapping with NO matching ``<servlet>``
     block at all keeps the old synthetic ``{relative_path}#{servlet_
-    name}`` placeholder."""
+    name}`` placeholder.
+
+    FIX ROUND 21 (seventeenth cold read, CR17-3 MAJOR, wrong-data): a
+    ``<filter>``/``<filter-mapping>`` or ``<listener>`` element - direct
+    twins of the already-modeled servlet shapes - used to publish
+    nothing at all, on a complete run, for a real and common JEE idiom.
+    Each declared ``<filter>``/``<listener>`` now records a named
+    ``unsupported_entry_point_shape`` problem, attributed to its own
+    implementing class when the element is well-formed enough to name
+    one (never a guessed or fabricated entry point - this producer does
+    not model these shapes' own request-handling semantics, only
+    acknowledges that a recognized mechanism exists)."""
     entry_points = []
+    problems = []
     sanitized = _strip_xml_comments(text)
     newline_offsets = _newline_offsets(sanitized)
     servlet_class_by_name = _servlet_class_by_name(sanitized)
@@ -3029,7 +3136,35 @@ def parse_web_xml(relative_path: str, text: str) -> list[JavaEntryPointClaim]:
                 name=url_pattern, line=_line_at(newline_offsets, absolute_offset),
                 evidence_class="declared",
             ))
-    return entry_points
+    for block_match in _FILTER_BLOCK_RE.finditer(sanitized):
+        block = block_match.group(1)
+        class_match = _FILTER_CLASS_RE.search(block)
+        qualified_name = (
+            _bounded_route_target(class_match.group(1).strip())
+            if class_match is not None else None)
+        problems.append(JavaAdapterProblem(
+            reason_code="unsupported_entry_point_shape",
+            detail=f"a <filter> declared at line {_line_at(newline_offsets, block_match.start())} "
+                   "names a recognized entry-point mechanism (web_xml_filter) this adapter "
+                   "does not model - no entry point published, but not confidently absent "
+                   "either",
+            qualified_name=qualified_name,
+        ))
+    for block_match in _LISTENER_BLOCK_RE.finditer(sanitized):
+        block = block_match.group(1)
+        class_match = _LISTENER_CLASS_RE.search(block)
+        qualified_name = (
+            _bounded_route_target(class_match.group(1).strip())
+            if class_match is not None else None)
+        problems.append(JavaAdapterProblem(
+            reason_code="unsupported_entry_point_shape",
+            detail=f"a <listener> declared at line {_line_at(newline_offsets, block_match.start())} "
+                   "names a recognized entry-point mechanism (web_xml_listener) this adapter "
+                   "does not model - no entry point published, but not confidently absent "
+                   "either",
+            qualified_name=qualified_name,
+        ))
+    return entry_points, problems
 
 
 def file_result_to_json(result: JavaFileResult) -> dict[str, Any]:

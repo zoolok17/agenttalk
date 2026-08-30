@@ -2341,6 +2341,110 @@ public class DispatcherServlet extends HttpServlet {
     assert [r.target for r in routes] == ["/api/*"]
 
 
+def test_web_filter_annotation_publishes_its_own_url_patterns_as_routes():
+    """FIX ROUND 21 (seventeenth cold read, CR17-3 MAJOR, wrong-data -
+    JUDGE, taken): @WebFilter shares @WebServlet's own shape exactly
+    (class-level, not composable, urlPatterns IS the complete served
+    pattern) - contained enough to MODEL as a real route, unlike
+    @WebListener (a lifecycle callback, enrolled as unsupported
+    instead, see the companion test below)."""
+    src = """
+package p;
+
+@WebFilter(urlPatterns = {"/api/*", "/secure/*"})
+public class AuthFilter implements Filter {
+}
+"""
+    result = java.parse_java_source("AuthFilter.java", src)
+    routes = _edges(result, "route")
+    assert sorted(r.target for r in routes) == ["/api/*", "/secure/*"]
+    http_entry_points = [e for e in result.entry_points if e.kind == "http_route"]
+    assert sorted(e.name for e in http_entry_points) == ["/api/*", "/secure/*"]
+    assert all(e.qualified_name == "p.AuthFilter" for e in http_entry_points)
+
+
+def test_web_listener_annotation_is_enrolled_not_confidently_absent():
+    """FIX ROUND 21 (CR17-3 MAJOR, wrong-data): @WebListener has no URL
+    pattern of its own to model - a lifecycle callback, not a routable
+    request handler - so it gets the class-closer treatment
+    (unsupported_entry_point_shape), never a confident negative."""
+    src = """
+package p;
+
+@WebListener
+public class AppLifecycleListener implements ServletContextListener {
+}
+"""
+    result = java.parse_java_source("AppLifecycleListener.java", src)
+    assert any(
+        p.reason_code == "unsupported_entry_point_shape"
+        and p.qualified_name == "p.AppLifecycleListener"
+        for p in result.problems
+    )
+    assert not any(e.kind == "http_route" for e in result.entry_points)
+
+
+def test_web_xml_filter_is_enrolled_attributed_to_its_own_filter_class():
+    """FIX ROUND 21 (CR17-3 MAJOR, wrong-data): a web.xml <filter> - the
+    direct XML twin of <servlet> - used to publish nothing at all. Now
+    enrolled as unsupported_entry_point_shape, attributed to its own
+    <filter-class> when declared."""
+    web_xml = """<web-app>
+  <filter>
+    <filter-name>auth</filter-name>
+    <filter-class>com.acme.web.AuthFilter</filter-class>
+  </filter>
+  <filter-mapping>
+    <filter-name>auth</filter-name>
+    <url-pattern>/*</url-pattern>
+  </filter-mapping>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert any(
+        p.reason_code == "unsupported_entry_point_shape"
+        and p.qualified_name == "com.acme.web.AuthFilter"
+        for p in problems
+    )
+    assert not any(e.kind == "http_route" for e in entry_points)
+
+
+def test_web_xml_listener_is_enrolled_attributed_to_its_own_listener_class():
+    """FIX ROUND 21 (CR17-3 MAJOR, wrong-data): a web.xml <listener> -
+    the direct XML twin of @WebListener - used to publish nothing at
+    all. Now enrolled as unsupported_entry_point_shape, attributed to
+    its own <listener-class>."""
+    web_xml = """<web-app>
+  <listener>
+    <listener-class>com.acme.web.AppLifecycleListener</listener-class>
+  </listener>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert any(
+        p.reason_code == "unsupported_entry_point_shape"
+        and p.qualified_name == "com.acme.web.AppLifecycleListener"
+        for p in problems
+    )
+    assert entry_points == []
+
+
+def test_web_xml_filter_with_no_filter_class_is_still_enrolled_with_no_qualified_name():
+    """Companion negative case: a malformed/incomplete <filter> (no
+    <filter-class>) still records the gap - never confidently absent -
+    just with no owner to attribute it to."""
+    web_xml = """<web-app>
+  <filter>
+    <filter-name>auth</filter-name>
+  </filter>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    matching = [p for p in problems if p.reason_code == "unsupported_entry_point_shape"]
+    assert len(matching) == 1
+    assert matching[0].qualified_name is None
+
+
 def test_jax_rs_path_composes_class_and_method_level_like_spring_request_mapping():
     """FIX ROUND 17 (CR13-3 MAJOR, part (a)): JAX-RS's own @Path composes
     EXACTLY like a plain @RequestMapping already does - a class-level
@@ -2723,7 +2827,7 @@ def test_parse_web_xml_extracts_servlet_mapping_routes():
   </servlet-mapping>
 </web-app>
 """
-    entry_points = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, _web_problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert len(entry_points) == 1
     assert entry_points[0].name == "/api/*"
     assert entry_points[0].kind == "http_route"
@@ -2746,7 +2850,7 @@ def test_parse_web_xml_ignores_a_commented_out_servlet_mapping():
   </servlet-mapping>
 </web-app>
 """
-    entry_points = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, _web_problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert [e.name for e in entry_points] == ["/api/*"]
 
 
@@ -2765,7 +2869,7 @@ def test_parse_web_xml_captures_every_url_pattern_in_one_servlet_mapping():
   </servlet-mapping>
 </web-app>
 """
-    entry_points = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, _web_problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert sorted(e.name for e in entry_points) == ["*.do", "/legacy/*", "/old/*"]
     assert len({e.qualified_name for e in entry_points}) == 1
     assert all(e.kind == "http_route" and e.evidence_class == "declared" for e in entry_points)
@@ -2793,7 +2897,7 @@ def test_parse_web_xml_links_a_mapping_to_its_declared_servlet_class():
   </servlet-mapping>
 </web-app>
 """
-    entry_points = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, _web_problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert len(entry_points) == 1
     assert entry_points[0].qualified_name == "com.acme.web.DispatcherServlet"
 
@@ -2811,7 +2915,7 @@ def test_parse_web_xml_falls_back_to_the_synthetic_owner_with_no_matching_servle
   </servlet-mapping>
 </web-app>
 """
-    entry_points = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, _web_problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert entry_points[0].qualified_name == "WEB-INF/web.xml#legacy"
 
 
@@ -2830,7 +2934,7 @@ def test_parse_web_xml_url_pattern_is_length_bounded():
   </servlet-mapping>
 </web-app>
 """
-    entry_points = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, _web_problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert len(entry_points[0].name) <= _MAX_ROUTE_TARGET_LENGTH + len("...(truncated)")
     assert entry_points[0].name != oversized
 
