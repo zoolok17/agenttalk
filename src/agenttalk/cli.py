@@ -14130,7 +14130,14 @@ def build_parser() -> argparse.ArgumentParser:
              "terminal, explicit confirmation, and --work-id.")
     cscan.add_argument(
         "--recover-stale-lock", action="store_true",
-        help="Attended override: unconditionally clear an existing scan.lock before scanning.")
+        # FIX ROUND 21b (reviewer-3's re-delta, MINOR 2, wrong-data): this
+        # text still described CR17-1's own overturned unconditional-
+        # clear behavior after the fix - stale documentation advertising
+        # the exact unsafe semantics that were just removed.
+        help="Attended override: refuses if the existing scan.lock's recorded owner is "
+             "provably still alive on this host; otherwise clears a dead or unverifiable "
+             "owner's lock (with an attended confirmation prompt for the unverifiable case) "
+             "before scanning.")
     cscan.add_argument("--json", action="store_true", help="Emit the scan outcome as JSON.")
     cscan.set_defaults(func=cmd_comprehension)
 

@@ -397,10 +397,23 @@ def recover_stale_lock(comprehension_dir: Path) -> dict | None:
     CLI's own job (PR-B's ``--recover-stale-lock`` flag). Returns the
     previous lock record (so the caller can record a forced-recovery
     trace - CR17-1's own part 3) or ``None`` when there was no lock to
-    clear at all (a no-op recovery attempt is not itself notable)."""
+    clear at all (a no-op recovery attempt is not itself notable).
+
+    FIX ROUND 21b (reviewer-3's re-delta, MINOR 1, wrong-data): a forced
+    recovery over a MALFORMED/unreadable record used to return ``None``
+    - identical to the genuine "no lock file at all" no-op - so the
+    caller's own forced-recovery trace (CR17-1's part 3, above) silently
+    recorded NOTHING for the one case that is MORE safety-relevant than
+    an ordinary dead-owner reclaim, not less: this run could not verify
+    who (if anyone) held the lock, or when, before clearing it anyway.
+    Now returns a sentinel record (``pid``/``acquired_at`` both ``None``,
+    ``record_unreadable`` ``True``) instead, so the caller can still
+    build a trace - naming the pid as unknown rather than fabricating
+    one - and distinguish this case from an ordinary dead-owner clear."""
     path = _lock_path(comprehension_dir)
     if not path.exists():
         return None
+    record_unreadable = False
     try:
         record = _read_lock_record(path)
     except ScanLockUnrecoverable:
@@ -410,6 +423,7 @@ def recover_stale_lock(comprehension_dir: Path) -> dict | None:
         # already covers. No liveness record to check against, so no
         # further evidence is available to refuse on.
         record = None
+        record_unreadable = True
     if record is not None and record["host_identity"] == host_identity():
         status, observed = process_observation(record["pid"])
         if status == "alive":
@@ -422,4 +436,6 @@ def recover_stale_lock(comprehension_dir: Path) -> dict | None:
                 raise ScanLockContended(record)
     with contextlib.suppress(FileNotFoundError):
         os.remove(path)
+    if record_unreadable:
+        return {"pid": None, "acquired_at": None, "record_unreadable": True}
     return record

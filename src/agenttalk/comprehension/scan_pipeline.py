@@ -677,9 +677,24 @@ def run_scan(
         # FIX ROUND 21 (seventeenth cold read, CR17-1 BLOCKER, part 3): a
         # forced --recover-stale-lock recovery is a safety-relevant event
         # this run's own provenance must not stay silent about.
+        #
+        # FIX ROUND 21b (reviewer-3's re-delta, MINOR 1, wrong-data): a
+        # forced clear over a MALFORMED/unreadable record (``lock.
+        # recover_stale_lock``'s own ``record_unreadable`` sentinel) is
+        # MORE safety-relevant than an ordinary dead-owner reclaim, not
+        # less - this run could not verify who (if anyone) held the lock,
+        # or when, before clearing it. Named as its own distinct detail
+        # rather than silently reusing the pid/acquired_at wording with
+        # fabricated-looking ``None`` values.
         forced_lock_recovery_problems = [
             _problem_record(
                 "scan_lock_forcibly_recovered", None,
+                "an attended --recover-stale-lock action cleared an existing scan.lock "
+                "whose own record could not be parsed (pid unknown, acquisition time "
+                "unknown) before this run began - a forced clear over an unreadable "
+                "record could not verify who, if anyone, held the lock beforehand"
+                if forced_lock_recovery_record.get("record_unreadable")
+                else
                 f"an attended --recover-stale-lock action cleared an existing scan.lock "
                 f"(previously recorded pid {forced_lock_recovery_record.get('pid')!r}, "
                 f"acquired {forced_lock_recovery_record.get('acquired_at')!r}) before this "

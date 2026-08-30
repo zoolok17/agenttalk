@@ -208,7 +208,59 @@ def test_scan_recover_stale_lock_unverifiable_owner_attended_confirmation_recove
         p["reason_code"] == "scan_lock_forcibly_recovered" for p in problems_doc["problems"])
 
 
-# ----------------------------------------------------------- status
+def test_scan_recover_stale_lock_malformed_record_still_traces_with_pid_unknown(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 21b (reviewer-3's re-delta, MINOR 1, wrong-data): a
+    forced recovery over a MALFORMED/unreadable scan.lock record used
+    to return None from lock.recover_stale_lock - indistinguishable
+    from the genuine "no lock file at all" no-op - so the caller's own
+    forced-recovery trace (CR17-1's own part 3) silently recorded
+    NOTHING for the one case that is MORE safety-relevant than an
+    ordinary dead-owner reclaim, not less: this run could not verify
+    who, if anyone, held the lock before clearing it. Now records
+    scan_lock_forcibly_recovered with pid/acquisition time both named
+    unknown, never a fabricated value."""
+    import json
+
+    from agenttalk.comprehension import paths as pathsmod
+
+    comp_dir = pathsmod.comprehension_dir(java_repo / ".agenttalk")
+    comp_dir.mkdir(parents=True, exist_ok=True)
+    lock_file = pathsmod.lock_path(comp_dir)
+    lock_file.write_text("{not valid json", encoding="utf-8")
+
+    monkeypatch.setattr(cli, "_comprehension_confirm_attended", lambda prompt_lines: True)
+    exit_code = _run(["comprehension", "scan", "--recover-stale-lock"], java_repo)
+    assert exit_code == 0
+    assert not lock_file.exists()
+
+    status = scan_pipeline.get_status(java_repo)
+    run_dir = pathsmod.run_dir(comp_dir, status["latest_scan_id"])
+    problems_doc = json.loads((run_dir / "problems.json").read_text(encoding="utf-8"))
+    forced_recovery = [
+        p for p in problems_doc["problems"] if p["reason_code"] == "scan_lock_forcibly_recovered"]
+    assert len(forced_recovery) == 1
+    assert "could not be parsed" in forced_recovery[0]["detail"]
+    assert "pid unknown" in forced_recovery[0]["detail"]
+
+
+def test_recover_stale_lock_help_text_states_the_true_refuse_then_confirm_semantics(
+    capsys,
+) -> None:
+    """FIX ROUND 21b (reviewer-3's re-delta, MINOR 2, wrong-data): the
+    flag's own --help text still said "unconditionally clear" after
+    CR17-1 overturned exactly that behavior - stale documentation
+    advertising the removed unsafe semantics to an operator deciding
+    whether to pass this flag."""
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["comprehension", "scan", "--help"])
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "unconditionally clear" not in help_text
+    assert "refuses" in help_text
+    assert "provably" in help_text
+
 
 def test_status_before_any_scan(tmp_path: Path, capsys) -> None:
     exit_code = _run(["comprehension", "status", "--json"], tmp_path)
