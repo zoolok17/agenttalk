@@ -670,6 +670,75 @@ def test_run_scan_a_real_junit_test_calling_the_target_reports_test_evidence_loc
     assert test_evidence["stored_status"] == "satisfied"
 
 
+def test_run_scan_an_import_only_test_reference_reports_test_evidence_located_satisfied(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 15c (reviewer-3's approval-conditioned MINOR): the
+    import arm of F4 leg 3's fix (an extracted IMPORT edge, not just
+    invoke, from a test-classified unit to a production unit counting as
+    test evidence) was untested and load-bearing - mutation E (narrowing
+    the relation tuple from (invoke, import) to (invoke,) alone) left
+    every then-existing test green. The reviewer's own measurement: the
+    MOST COMMON Java test shape - import + construct + instance call -
+    produces NO invoke edge at all (a constructor call is a declared,
+    named coverage gap; an instance call on a local variable is not a
+    TYPE-qualified call the adapter recognizes) - so the import edge is
+    the ONLY extracted evidence available; drop it and the majority
+    real-world shape reopens this round's own defect.
+
+    OrderTest imports p.model.Order, constructs one, and calls an
+    instance method on it - asserted FIRST that no invoke edge from the
+    test to Order exists at all, so the satisfied verdict below can only
+    be coming from the import arm, never invoke."""
+    (java_repo / "src" / "main" / "java" / "p" / "model" / "Order.java").parent.mkdir(
+        parents=True, exist_ok=True)
+    (java_repo / "src" / "main" / "java" / "p" / "model" / "Order.java").write_text(
+        "package p.model;\nclass Order {\n  void confirm() {}\n}\n", encoding="utf-8")
+    test_dir = java_repo / "src" / "test" / "java" / "p"
+    test_dir.mkdir(parents=True, exist_ok=True)
+    (test_dir / "OrderTest.java").write_text(
+        "package p;\n"
+        "import p.model.Order;\n"
+        "import org.junit.Test;\n"
+        "class OrderTest {\n"
+        "  @Test void confirmWorks() {\n"
+        "    Order order = new Order();\n"
+        "    order.confirm();\n"
+        "  }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    import json
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+
+    order_unit = next(u for u in modules_doc["units"] if u["display_name"] == "Order")
+
+    # Structure note (reviewer's own ask): prove the import arm ALONE
+    # carries this, not invoke - no invoke edge targets Order at all.
+    assert not any(
+        r["relation"] == "invoke" and r.get("target_unit_id") == order_unit["unit_id"]
+        for r in dependencies_doc["edges"]
+    )
+
+    import_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "import" and r.get("evidence_class") == "extracted"
+        and r["resolution_state"] == "resolved" and r["target_unit_id"] == order_unit["unit_id"]
+    )
+    assert import_edge["target_unit_id"] == order_unit["unit_id"]
+
+    test_evidence = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == order_unit["unit_id"] and s["check"] == "test_evidence_located"
+    )
+    assert test_evidence["stored_status"] == "satisfied"
+
+
 def test_run_scan_unrecognized_main_like_shape_reports_entry_points_mapped_unknown(
     java_repo: Path,
 ) -> None:
