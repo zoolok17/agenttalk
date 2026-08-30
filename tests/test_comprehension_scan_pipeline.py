@@ -191,6 +191,45 @@ def test_run_scan_a_web_method_class_reports_entry_points_mapped_unknown(
         p["reason_code"] == "unsupported_entry_point_shape" for p in problems_doc["problems"])
 
 
+def test_run_scan_a_jax_rs_verb_only_resource_reports_entry_points_mapped_unknown(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 17b (reviewer-3's rejection of round 17, THE MAJOR):
+    the DOMINANT real-world JAX-RS idiom (a class-level @Path with
+    verb-only methods, no method-level @Path of their own) used to
+    report the confident negative not_applicable/no_entry_point, while
+    @WebMethod (built the exact same round) correctly reported unknown -
+    the class-closer mechanism built but applied to only one family
+    member. End to end, must now agree."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "p" / "OrderResource.java").write_text(
+        "package p;\n"
+        "\n"
+        "@Path(\"/orders\")\n"
+        "public class OrderResource {\n"
+        "  @GET\n"
+        "  public void list() {}\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+
+    resource_unit = next(u for u in modules_doc["units"] if u["display_name"] == "OrderResource")
+    entry_points_mapped = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == resource_unit["unit_id"] and s["check"] == "entry_points_mapped"
+    )
+    assert entry_points_mapped["stored_status"] == "unknown"
+    assert entry_points_mapped["reason_code"] == "unsupported_entry_point_shape"
+    assert any(
+        p["reason_code"] == "unsupported_entry_point_shape" for p in problems_doc["problems"])
+
+
 def test_report_carries_the_real_manifest_digest_f7(java_repo: Path) -> None:
     """FIX ROUND 12 (eighth cold read, F7): get_report passed
     manifest_digest=None to the projector unconditionally, even though a

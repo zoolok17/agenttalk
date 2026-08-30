@@ -2276,6 +2276,54 @@ public class OrderResource {
     assert [r.target for r in routes] == ["/orders/list"]
 
 
+def test_jax_rs_verb_only_methods_get_the_class_closer_not_a_silent_negative():
+    """FIX ROUND 17b (reviewer-3's rejection of round 17, THE MAJOR):
+    the DOMINANT real-world JAX-RS idiom - a class-level @Path with
+    verb-only methods (@GET/@POST, no method-level @Path of their own) -
+    used to silently produce ZERO entry points AND zero problems, the
+    class landing on the confident negative entry_points_mapped=
+    not_applicable/no_entry_point, while @WebMethod (built the exact
+    same round) correctly reported unknown/unsupported_entry_point_shape.
+    The reviewer's own OrderResource shape: no route composes (verb-only
+    methods are not recognized - the named limit), so the class must now
+    get the SAME class-closer treatment."""
+    src = """
+package p;
+
+@Path("/orders")
+public class OrderResource {
+    @GET
+    public void list() {}
+
+    @POST
+    public void create() {}
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    assert not any(e.kind == "http_route" for e in result.entry_points)
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.OrderResource"
+
+
+def test_jax_rs_path_with_a_real_method_level_route_is_not_flagged_the_class_closer():
+    """Companion negative case - the reviewer's own ItemResource row: a
+    class-level @Path with a REAL method-level @Path composing against
+    it must stay satisfied, never get the class-closer treatment
+    reserved for a class where nothing ever composed."""
+    src = """
+package p;
+
+@Path("/items")
+public class ItemResource {
+    @Path("/list")
+    public void list() {}
+}
+"""
+    result = java.parse_java_source("ItemResource.java", src)
+    assert any(e.kind == "http_route" for e in result.entry_points)
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+
+
 def test_web_method_annotation_is_the_named_class_closer_not_a_silent_negative():
     """FIX ROUND 17 (CR13-3 MAJOR, part (b) - THE CLASS-CLOSER): a route-
     like annotation family this adapter recognizes as a routing

@@ -73,7 +73,17 @@ UNSUPPORTED_INVOKE_SHAPES = ("constructor_call",)
 #: (``unsupported_entry_point_shape``, attributed to its own enclosing
 #: type - see ``_WEB_METHOD_ANNOTATION_RE``) rather than a silent
 #: confident negative on the class it decorates.
-UNSUPPORTED_ENTRY_POINT_SHAPES = ("jax_ws_web_method",)
+#: FIX ROUND 17b (reviewer-3's rejection of round 17, THE MAJOR): a
+#: second member - a class-level @Path from which NO route ever
+#: composes (JAX-RS's own verb-only method idiom, @GET/@POST with no
+#: method-level @Path of its own - the DOMINANT real-world JAX-RS shape,
+#: not an edge case) is the identical enumerated-recognizer gap
+#: @WebMethod already closes, simply never applied to this family
+#: member the first time. Both share the SAME ``unsupported_entry_point_
+#: shape`` reason_code (readiness routes on the code, not this list);
+#: this tuple exists to publish WHICH named shapes the code recognizes,
+#: never to drive dispatch.
+UNSUPPORTED_ENTRY_POINT_SHAPES = ("jax_ws_web_method", "jax_rs_verb_only_method")
 
 #: FIX ROUND 15 (eleventh cold read, F3 MAJOR, wrong-data): the ORIGINAL
 #: combined pattern classified a bare ``/test/`` package segment with NO
@@ -1768,6 +1778,16 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     # some OTHER class-level annotation on the same type also happened
     # to register a real prefix.
     class_route_prefix_unrecoverable: set[str] = set()
+    # FIX ROUND 17b (reviewer-3's rejection of round 17, THE MAJOR): a
+    # class-level @Path with only verb-only methods inside (@GET/@POST,
+    # no method-level @Path of its own - the DOMINANT JAX-RS idiom) used
+    # to silently produce ZERO entry points and ZERO problems - the SAME
+    # class-closer mechanism built for @WebMethod, simply never applied
+    # to this family member. Tracked here (JAX-RS's own @Path
+    # specifically, never Spring's @RequestMapping) so the second pass
+    # can tell, after composition, whether ANY route actually came out
+    # the other end.
+    jax_rs_path_classes: set[str] = set()
     for match in _ROUTE_ANNOTATION_RE.finditer(sanitized):
         _span_end, paths, _explicit_methods = _route_annotation_span(match)
         target_type = _class_level_route_target(match.start(), class_header_associations)
@@ -1777,7 +1797,15 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             class_route_prefix_unrecoverable.add(target_type)
         elif paths:
             class_route_prefix[target_type] = paths
+            if match.group(1) == "Path":
+                jax_rs_path_classes.add(target_type)
 
+    # FIX ROUND 17b (THE MAJOR): every class that actually got AT LEAST
+    # one route entry point published, from ANY family (Spring/JAX-RS
+    # composition below, or @WebServlet's own dedicated pass further
+    # down) - checked against jax_rs_path_classes afterward to find a
+    # @Path-carrying class that composed to nothing at all.
+    classes_with_route_entry_points: set[str] = set()
     for match in _ROUTE_ANNOTATION_RE.finditer(sanitized):
         line = _line_at(newline_offsets, match.start())
         enclosing = _enclosing_qualified_name(match.start(), types, primary_qualified)
@@ -1893,6 +1921,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         else:
             targets = [f"{enclosing}#{match.group(1)}"]
         for target in targets:
+            classes_with_route_entry_points.add(enclosing)
             edges.append(JavaEdgeClaim(
                 from_qualified_name=enclosing, relation="route", target=target,
                 target_kind="external_route", evidence_class="declared",
@@ -1933,6 +1962,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             ))
             continue
         for path in paths:
+            classes_with_route_entry_points.add(target_type)
             edges.append(JavaEdgeClaim(
                 from_qualified_name=target_type, relation="route", target=path,
                 target_kind="external_route", evidence_class="declared",
@@ -1942,6 +1972,25 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                 qualified_name=target_type, kind="http_route",
                 name=path, line=line, evidence_class="declared",
             ))
+
+    # FIX ROUND 17b (reviewer-3's rejection of round 17, THE MAJOR): a
+    # class carrying a recognized @Path from which NO route ever
+    # composed (JAX-RS's own verb-only method idiom - @GET/@POST with no
+    # method-level @Path of its own, the DOMINANT real-world JAX-RS
+    # shape - is not recognized, the named limit beside
+    # _ROUTE_ANNOTATIONS) gets the SAME class-closer treatment @WebMethod
+    # already gets below - honest unknown, never the confident negative
+    # a class that genuinely serves no route at all correctly gets.
+    for jax_rs_class in sorted(jax_rs_path_classes - classes_with_route_entry_points):
+        problems.append(JavaAdapterProblem(
+            reason_code="unsupported_entry_point_shape",
+            detail="a class-level @Path is declared, but no route ever composed against it - "
+                   "JAX-RS's own verb-only method idiom (@GET/@POST with no method-level "
+                   "@Path of its own) is not recognized (see the named limit beside "
+                   "_ROUTE_ANNOTATIONS) - no entry point published, but not confidently "
+                   "absent either",
+            qualified_name=jax_rs_class,
+        ))
 
     # FIX ROUND 17 (CR13-3 MAJOR, part (b) - THE CLASS-CLOSER): a route-
     # like annotation family this adapter recognizes but has not modeled
