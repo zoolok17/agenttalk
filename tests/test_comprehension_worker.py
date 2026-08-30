@@ -186,6 +186,28 @@ def test_process_paths_flags_js_ts_py_as_tier3_record_only(
     assert result.problems[0].degrades_run is False
 
 
+@pytest.mark.parametrize("relative_path", ["Legacy.java", "widget.jsp", "src/Main.kt"])
+def test_is_a_code_bearing_extension_worth_degrading_true_for_adapter_and_tier2(
+    relative_path: str,
+) -> None:
+    """FIX ROUND 18 (fourteenth cold read, F6 JUDGE, taken): an adapter-
+    handled extension (.java) or a tier-2 code-bearing extension (.jsp,
+    .kt, ...) is worth degrading a run over if discovery's own binary
+    sniff silently excludes it."""
+    assert worker.is_a_code_bearing_extension_worth_degrading_when_silently_excluded(
+        relative_path)
+
+
+@pytest.mark.parametrize("relative_path", ["photo.png", "archive.bin", "notes.md"])
+def test_is_a_code_bearing_extension_worth_degrading_false_for_genuinely_binary(
+    relative_path: str,
+) -> None:
+    """Companion negative case - a genuinely binary or benign non-code
+    extension must stay exactly as silent as it is today."""
+    assert not worker.is_a_code_bearing_extension_worth_degrading_when_silently_excluded(
+        relative_path)
+
+
 def test_process_paths_a_polyglot_legacy_web_app_now_degrades_cr13_b(tmp_path: Path) -> None:
     """FIX ROUND 17 (thirteenth cold read, CR13-1 MAJOR, wrong-data):
     mirrors the reader's own .cr13-b shape - a legacy web app whose real

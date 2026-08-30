@@ -184,6 +184,11 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     # (JAX-WS's own @WebMethod) - under-claimed evidence, the same
     # "warning" bucket every other missing-evidence reason already gets.
     "unsupported_entry_point_shape": "warning",
+    # FIX ROUND 18 (fourteenth cold read, F6 JUDGE, taken): a binary-
+    # sniffed-and-excluded file whose own extension is code-bearing -
+    # the same "warning" bucket every other missing-evidence reason
+    # already gets.
+    "binary_excluded_code_bearing_file": "warning",
 }
 _DEFAULT_PROBLEM_SEVERITY = "warning"
 
@@ -483,6 +488,34 @@ def run_scan(
             for group in modules_by_conflict_id.values()
         ]
 
+        # FIX ROUND 18 (fourteenth cold read, F6 JUDGE, taken): a file
+        # discovery excluded outright as binary content (a NUL byte in
+        # its sniffed prefix) records ONLY a bare exclusion count/
+        # excluded_roots entry, never a problem - correct for a genuine
+        # binary blob, but silently identical for a UTF-16-encoded
+        # .java file (a legal javac input) or a tier-2 code-bearing
+        # file (.jsp, .kt, ...) that happened to trip the same
+        # heuristic: the run still reports complete/zero problems even
+        # though real code went unread. Named and degrading here,
+        # exactly the same severity tier 2 already gets - a genuinely
+        # binary extension (absent from both the adapter-handled and
+        # tier-2 sets) stays exactly as silent as it is today.
+        binary_excluded_code_bearing_problems = [
+            _problem_record(
+                "binary_excluded_code_bearing_file",
+                entry["path"],
+                "a file whose extension this run would otherwise have tried to understand "
+                "as code was excluded outright as binary content (a NUL byte in its sniffed "
+                "prefix) - a UTF-16-encoded source file is a legal compiler input that trips "
+                "this heuristic; recorded as a genuine unread-code gap, never silently "
+                "vanished the way a genuinely binary file correctly still is",
+            )
+            for entry in discovery_result.excluded_roots
+            if entry["category"] == "binary"
+            and worker.is_a_code_bearing_extension_worth_degrading_when_silently_excluded(
+                entry["path"])
+        ]
+
         problems = [
             _problem_record(p["reason_code"], p.get("path"), p["detail"])
             for p in discovery_result.problems
@@ -494,7 +527,7 @@ def run_scan(
             _problem_record(
                 "case_collision", second, bounded_detail(f"case-folds identically to {first!r}"))
             for first, second in case_collisions
-        ] + duplicate_qualified_name_problems
+        ] + duplicate_qualified_name_problems + binary_excluded_code_bearing_problems
         # FIX ROUND 14b (reviewer-3's ratified CR10-5 split): a worker
         # problem's own `degrades_run` (worker.py) distinguishes
         # "recorded, visible" from "the run's status also degrades over
@@ -507,6 +540,7 @@ def run_scan(
         status = "degraded" if (
             discovery_result.degraded or discovery_result.problems or case_collisions
             or degrading_worker_problems or duplicate_qualified_name_problems
+            or binary_excluded_code_bearing_problems
         ) else "complete"
 
         modules_doc = {

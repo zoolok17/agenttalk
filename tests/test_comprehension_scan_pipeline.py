@@ -1264,6 +1264,53 @@ def test_run_scan_over_a_jsp_estate_degrades_with_a_named_unsupported_language_p
     assert jsp_problems[0]["severity"] == "warning"
 
 
+def test_run_scan_a_utf16_java_file_degrades_instead_of_silently_vanishing(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 18 (fourteenth cold read, F6 JUDGE, taken): mirrors the
+    reader's own .cr14-enc shape - a UTF-16-encoded .java file (a legal
+    javac input, genuinely present in legacy Windows-authored codebases)
+    trips discovery's own NUL-byte binary sniff and used to be silently
+    excluded (recorded only under excluded_roots's "binary" category),
+    the run still reporting complete/zero problems even though real
+    code went unread. Now degrades with a named problem, exactly like a
+    tier-2 code-bearing file already does."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "p" / "Legacy.java").write_bytes(
+        "package p;\nclass Legacy {}\n".encode("utf-16"))
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert any(
+        e["category"] == "binary" and e["path"].endswith("Legacy.java")
+        for e in scan_doc["excluded_roots"]
+    )
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    legacy_problems = [p for p in problems_doc["problems"] if p["path"].endswith("Legacy.java")]
+    assert len(legacy_problems) == 1
+    assert legacy_problems[0]["reason_code"] == "binary_excluded_code_bearing_file"
+
+
+def test_run_scan_a_genuinely_binary_file_still_stays_silent(java_repo: Path) -> None:
+    """Companion negative case - a genuinely binary file (an extension
+    on neither the adapter-handled nor the tier-2 code-bearing list)
+    must stay exactly as silent as it is today: excluded, recorded as
+    a bare exclusion count, never a problem, never a degraded run."""
+    (java_repo / "photo.png").write_bytes(b"\x00\x01\x02binarydata")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+
+    import json
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    assert problems_doc["problems"] == []
+
+
 #: FIX ROUND 14b (reviewer-3's ratified CR10-5 split): the reviewer's own
 #: seven-single-file-repo battery - an otherwise entirely healthy
 #: java+pom repo plus exactly one more file of each named kind. Before
