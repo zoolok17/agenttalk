@@ -102,6 +102,94 @@ def test_agenttalk_dir_itself_is_hard_excluded(tmp_path: Path) -> None:
     assert result.exclusions.get("hard_excluded") == 1
 
 
+# ------------------------------------------ FIX ROUND 18 F1: any-depth source roots
+
+
+@pytest.mark.parametrize("source_root_dir,marker_name", [
+    # a multi-module Maven/Gradle reactor - the source root is one
+    # directory DEEPER than repo root, not repo root itself.
+    ("core/src/main/java", "out"),
+    # Kotlin/Groovy/Scala source roots, same standard-layout convention,
+    # different language directory name.
+    ("src/main/kotlin", "out"),
+    ("src/main/groovy", "out"),
+    ("src/main/scala", "out"),
+    # a webapp tree.
+    ("src/main/webapp", "build"),
+])
+def test_enumerate_scope_recognizes_a_source_root_at_any_depth(
+    tmp_path: Path, source_root_dir: str, marker_name: str,
+) -> None:
+    """FIX ROUND 18 (fourteenth cold read, F1 BLOCKER, wrong-data): mirrors
+    the reader's own ``.cr14-hex``/``.cr14-hex2`` shapes (source only -
+    their published RUN artifact is deliberately tampered, never treated
+    as ground truth here). The round-16 B2 source-root carve-out was
+    repo-root-anchored and missed every one of these standard layouts -
+    a generated/vendor-NAMED directory nested under a source root that
+    is not itself repo root must still be recognized as in-scope, not
+    silently excluded."""
+    marker_dir = tmp_path / source_root_dir / "com" / "acme" / "port" / marker_name
+    marker_dir.mkdir(parents=True)
+    (marker_dir / "Inner.java").write_bytes(b"class Inner {}\n")
+    comp_dir = _comprehension_dir(tmp_path)
+
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+
+    assert any(f.relative_path.endswith("Inner.java") for f in result.files)
+    assert not any(
+        e["category"] == "generated_or_vendor" and e["path"].endswith(marker_name)
+        for e in result.excluded_roots
+    )
+
+
+def test_enumerate_scope_still_excludes_a_real_module_root_build_directory(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 18 (fourteenth cold read, F1 BLOCKER, wrong-data): the
+    any-depth source-root pattern match must NOT become "anything nested
+    inside a module is exempt" - a module-root build-output directory
+    with no ``src/main/...``-style segment anywhere in its own path
+    (``core/build/``) is a genuine build artifact and must stay
+    excluded, even though ``core/`` also happens to contain a real
+    source root elsewhere in the same module."""
+    (tmp_path / "core" / "src" / "main" / "java").mkdir(parents=True)
+    build_dir = tmp_path / "core" / "build"
+    build_dir.mkdir()
+    (build_dir / "Generated.class").write_bytes(b"\x00\x01binary")
+    comp_dir = _comprehension_dir(tmp_path)
+
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+
+    assert not any(f.relative_path.endswith("Generated.class") for f in result.files)
+    assert any(
+        e["category"] == "generated_or_vendor" and e["path"] == "core/build"
+        for e in result.excluded_roots
+    )
+
+
+def test_enumerate_scope_does_not_recognize_a_bare_ant_style_java_root(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 18 (fourteenth cold read, F1 BLOCKER, JUDGE): a bare
+    Ant-style ``java/`` root (no ``src/main``/``src/test`` scaffolding)
+    is deliberately NOT recognized - see the named-limit comment beside
+    ``_RECOGNIZED_SOURCE_ROOT_SEGMENT_RE``. A generated/vendor-named
+    directory nested under it stays excluded, same as before this
+    round."""
+    marker_dir = tmp_path / "java" / "com" / "acme" / "port" / "out"
+    marker_dir.mkdir(parents=True)
+    (marker_dir / "Inner.java").write_bytes(b"class Inner {}\n")
+    comp_dir = _comprehension_dir(tmp_path)
+
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+
+    assert not any(f.relative_path.endswith("Inner.java") for f in result.files)
+    assert any(
+        e["category"] == "generated_or_vendor" and e["path"].endswith("java/com/acme/port/out")
+        for e in result.excluded_roots
+    )
+
+
 def test_git_as_a_regular_file_is_hard_excluded_not_enumerated(tmp_path: Path) -> None:
     """M2 (sixth cold read, fix round 10): a git WORKTREE or submodule
     checkout stores `.git` as a REGULAR FILE (a `gitdir: ...` pointer),

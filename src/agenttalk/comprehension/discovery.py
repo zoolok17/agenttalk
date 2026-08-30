@@ -48,6 +48,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat as stat_module
 from dataclasses import dataclass, field
@@ -111,13 +112,40 @@ _GENERATED_VENDOR_DIR_NAMES = frozenset({"target", "build", "dist", "vendor", "o
 #: impossible) would now walk into it instead of excluding it - judged
 #: the correct trade given a real, standard package name silently
 #: vanishing is the worse failure mode.
-_RECOGNIZED_SOURCE_ROOT_PREFIXES = (
-    "src/main/java/", "src/test/java/", "src/main/resources/", "src/test/resources/",
+#:
+#: FIX ROUND 18 (fourteenth cold read, F1 BLOCKER, wrong-data): the
+#: prefix match above was anchored to REPO ROOT (``str.startswith``
+#: from position 0) - it only ever recognized a source root that WAS
+#: the whole repo. A multi-module reactor (``core/src/main/java/...``),
+#: a Kotlin/Groovy/Scala root (``src/main/kotlin/...``), a webapp tree
+#: (``src/main/webapp/...``), or any source root one directory deeper
+#: than repo root defeated it silently: the SAME hexagonal ``port/out``
+#: package this fix was originally written for goes right back to being
+#: deleted, and worse, a tier-2 code-bearing file (``.kt``, ``.jsp``)
+#: sitting under an excluded directory vanishes along with it, with the
+#: run still reporting complete/zero problems. Recognition now keys on
+#: the SOURCE-ROOT SEGMENT PATTERN appearing ANYWHERE in the ancestor
+#: chain (``src/(main|test)/(java|kotlin|groovy|scala|resources|
+#: webapp)``, at any depth), not a repo-root anchor - this still
+#: requires the LITERAL Maven/Gradle segment sequence somewhere in the
+#: path, so a genuine module-root output directory with no such
+#: segment anywhere (``core/build/``) is unaffected and stays excluded.
+#: JUDGED NOT to also recognize a bare Ant-style ``java/`` root with no
+#: ``src/main`` or ``src/test`` prefix: unlike the Maven/Gradle segment
+#: sequence, a lone ``java`` (or ``test``) directory name is common
+#: enough to appear in unrelated contexts (a vendored dependency's own
+#: internal layout, a documentation-sample directory, ...) that
+#: recognizing it unconditionally would reopen a broader false-
+#: exemption risk than this fix is closing - the qualifying segment
+#: must include the ``src/main/`` or ``src/test/`` scaffolding that
+#: makes the convention unambiguous.
+_RECOGNIZED_SOURCE_ROOT_SEGMENT_RE = re.compile(
+    r"(?:^|/)src/(?:main|test)/(?:java|kotlin|groovy|scala|resources|webapp)(?:/|$)",
 )
 
 
 def _is_inside_a_recognized_source_root(relative_path: str) -> bool:
-    return any(relative_path.startswith(prefix) for prefix in _RECOGNIZED_SOURCE_ROOT_PREFIXES)
+    return bool(_RECOGNIZED_SOURCE_ROOT_SEGMENT_RE.search(relative_path))
 
 
 _SECRET_FILE_PATTERNS = (
