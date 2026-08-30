@@ -41,14 +41,17 @@ class Foo {
     # at exact resolution, but its TYPE PREFIX is - java.util.Collections
     # (not itself in-scan here) still classifies external once resolved.
     # A wildcard NON-static import names a package, never a single type,
-    # so it alone stays plain external unconditionally.
+    # so it gets its own target_kind (FIX ROUND 16, twelfth cold read,
+    # B3 BLOCKER) rather than plain "external" - dependencies_artifact.py
+    # still checks whether the package itself is in-scan before ever
+    # publishing a confident external claim.
     by_target = {e.target: e for e in imports}
     assert by_target["java.util.List"].target_kind == "internal_exact_or_external"
     assert (
         by_target["java.util.Collections.emptyList"].target_kind
         == "internal_static_import_exact_or_external"
     )
-    assert by_target["com.example.other.*"].target_kind == "external"
+    assert by_target["com.example.other.*"].target_kind == "external_wildcard_import"
 
 
 def test_import_edge_is_file_scoped_not_attributed_to_the_first_declared_type():

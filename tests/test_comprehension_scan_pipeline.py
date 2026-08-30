@@ -2202,3 +2202,141 @@ def test_run_scan_refuses_and_publishes_no_run_when_a_ceiling_is_exceeded(
     comp_dir = scan_pipeline.paths.comprehension_dir(java_repo / ".agenttalk")
     doc, _digest = publish.read_current_index(comp_dir)
     assert doc is None  # no run published
+
+
+# ----------------------------------------------------------- FIX ROUND 16 (twelfth cold read)
+
+def test_run_scan_a_duplicate_qualified_name_publishes_ambiguous_import_and_a_problem(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 16 (twelfth cold read, B1 BLOCKER, wrong-data): mirrors
+    reviewer-3's own ``.cr12-dup`` fixture - two modules each declaring
+    ``com.acme.Config``, imported by a third file. End-to-end: the
+    import edge must publish ambiguous (never a confident external
+    claim over a real naming collision), the two colliding components
+    must share a conflict_id, and problems.json must name the collision
+    exactly once (never once per colliding side)."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "app").mkdir(parents=True)
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "app" / "Boot.java").write_text(
+        "package com.acme.app;\nimport com.acme.Config;\nclass Boot {}\n", encoding="utf-8")
+    (java_repo / "modA" / "src" / "main" / "java" / "com" / "acme").mkdir(parents=True)
+    (java_repo / "modA" / "src" / "main" / "java" / "com" / "acme" / "Config.java").write_text(
+        "package com.acme;\nclass Config {}\n", encoding="utf-8")
+    (java_repo / "modB" / "src" / "main" / "java" / "com" / "acme").mkdir(parents=True)
+    (java_repo / "modB" / "src" / "main" / "java" / "com" / "acme" / "Config.java").write_text(
+        "package com.acme;\nclass Config {}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+
+    import_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "import" and r.get("target_unresolved") == "com.acme.Config")
+    assert import_edge["resolution_state"] == "ambiguous"
+    assert len(import_edge["candidate_unit_ids"]) == 2
+
+    config_units = [u for u in modules_doc["units"] if u.get("qualified_name") == "com.acme.Config"]
+    assert len(config_units) == 2
+    assert config_units[0]["conflict_id"] is not None
+    assert config_units[0]["conflict_id"] == config_units[1]["conflict_id"]
+
+    dup_problems = [
+        p for p in problems_doc["problems"] if p["reason_code"] == "duplicate_qualified_name"]
+    assert len(dup_problems) == 1
+    assert dup_problems[0]["qualified_name"] == "com.acme.Config"
+    assert outcome.status == "degraded"
+
+
+def test_run_scan_an_import_into_an_excluded_generated_dir_is_unresolved_not_deleted(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 16 (twelfth cold read, B2 BLOCKER, wrong-data): a bare
+    generated/vendor directory name (``out/``) at repo ROOT (never inside
+    a recognized source root, so the source-root exemption never fires)
+    is genuinely excluded outright - never walked. An import naming a
+    type whose hypothetical file lives under it must resolve unresolved,
+    not a confident external claim, and scan.json's own excluded_roots
+    list must record the exclusion an operator can actually read."""
+    import json
+
+    (java_repo / "out").mkdir(parents=True)
+    (java_repo / "out" / "PaymentGateway.java").write_text(
+        "package out;\nclass PaymentGateway {}\n", encoding="utf-8")
+    (java_repo / "src" / "main" / "java" / "p" / "OrderService.java").write_text(
+        "package p;\nimport out.PaymentGateway;\nclass OrderService {}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+
+    import_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "import" and r.get("target_unresolved") == "out.PaymentGateway")
+    assert import_edge["resolution_state"] == "unresolved"
+    assert import_edge.get("target_external") is None
+
+    assert any(
+        e["path"] == "out" and e["category"] == "generated_or_vendor"
+        for e in scan_doc["excluded_roots"]
+    )
+
+
+def test_run_scan_a_hexagonal_out_package_inside_a_source_root_is_not_excluded(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 16 (twelfth cold read, B2 BLOCKER part 1, wrong-data):
+    mirrors reviewer-3's own ``.cr12-hex`` fixture - ``out`` is a routine
+    Java package segment inside ``src/main/java/.../port/out/...`` (a
+    standard hexagonal-architecture layout), never a build-output
+    directory at that depth. It must stay in-scan, never silently
+    deleted from the inventory."""
+    import json
+
+    port_out = java_repo / "src" / "main" / "java" / "com" / "acme" / "order" / "port" / "out"
+    port_out.mkdir(parents=True)
+    (port_out / "PaymentGateway.java").write_text(
+        "package com.acme.order.port.out;\nclass PaymentGateway {}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+
+    assert any(
+        u.get("qualified_name") == "com.acme.order.port.out.PaymentGateway"
+        for u in modules_doc["units"]
+    )
+    assert not any(
+        e["path"].endswith("/port/out") or e["path"] == "port/out"
+        for e in scan_doc["excluded_roots"]
+    )
+
+
+def test_run_scan_a_wildcard_import_of_an_in_scan_package_is_unresolved_not_external(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 16 (twelfth cold read, B3 BLOCKER, wrong-data): mirrors
+    reviewer-3's own ``.cr12-wildcard`` fixture - Report.java wildcard-
+    imports ``com.acme.util.*``, and ``com.acme.util.DateHelper`` is
+    genuinely in-scan. Must not be miscounted as a confident external
+    (third-party) dependency."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "app").mkdir(parents=True)
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "app" / "Report.java").write_text(
+        "package com.acme.app;\nimport com.acme.util.*;\nclass Report {}\n", encoding="utf-8")
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "util").mkdir(parents=True)
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "util" / "DateHelper.java").write_text(
+        "package com.acme.util;\nclass DateHelper {}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+
+    import_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "import" and r.get("target_unresolved") == "com.acme.util.*")
+    assert import_edge["resolution_state"] == "unresolved"
+    assert import_edge.get("target_external") is None

@@ -354,6 +354,153 @@ def test_inherit_edge_is_unresolved_when_no_candidate_exists():
     assert inherit.target_unresolved == "NoSuchClass"
 
 
+def test_import_edge_is_ambiguous_on_a_genuine_registry_collision():
+    """FIX ROUND 16 (twelfth cold read, B1 BLOCKER, wrong-data): the
+    plain-import branch (``internal_exact_or_external``) used to fall
+    straight to ``resolved``/``target_external`` on an exact-lookup MISS,
+    never consulting ``duplicate_qualified_names`` the way the inherit/
+    test ladder already does (see
+    test_inherit_edge_is_ambiguous_with_candidates_on_a_genuine_registry_
+    collision above) - two units genuinely declaring the identical
+    fully-qualified name published as a confident, wrong EXTERNAL
+    dependency for any FILE that imported that name, rather than the
+    honest ambiguous-with-candidates the design's own text requires
+    ("Ambiguous resolution creates an unresolved edge with candidates.").
+    Mirrors reviewer-3's own ``.cr12-dup`` fixture: two modules each
+    declaring ``com.acme.Config``, imported by a third."""
+    results = {
+        "app/src/main/java/com/acme/app/Boot.java": _parse(
+            "app/src/main/java/com/acme/app/Boot.java",
+            "package com.acme.app;\n"
+            "import com.acme.Config;\n"
+            "class Boot {}\n"),
+        "modA/src/main/java/com/acme/Config.java": _parse(
+            "modA/src/main/java/com/acme/Config.java", "package com.acme;\nclass Config {}\n"),
+        "modB/src/main/java/com/acme/Config.java": _parse(
+            "modB/src/main/java/com/acme/Config.java", "package com.acme;\nclass Config {}\n"),
+    }
+    records = da.build_dependencies(results)
+    import_edge = next(
+        r for r in records
+        if r.relation == "import" and r.target_unresolved == "com.acme.Config")
+    assert import_edge.resolution_state == "ambiguous"
+    assert import_edge.target_unit_id is None
+    assert import_edge.target_unresolved == "com.acme.Config"
+    assert sorted(import_edge.candidate_unit_ids) == sorted([
+        da._java_component_unit_id("modA/src/main/java/com/acme/Config.java", "com.acme.Config"),
+        da._java_component_unit_id("modB/src/main/java/com/acme/Config.java", "com.acme.Config"),
+    ])
+
+
+def test_static_import_edge_is_ambiguous_on_a_genuine_registry_collision():
+    """FIX ROUND 16 (B1 BLOCKER): the SAME class, via the static-import
+    branch - keyed on the type prefix, not the full member path, exactly
+    like the branch's own existing degraded-path check already is."""
+    results = {
+        "app/Boot.java": _parse(
+            "app/Boot.java",
+            "package com.acme.app;\n"
+            "import static com.acme.Config.VALUE;\n"
+            "class Boot {}\n"),
+        "modA/Config.java": _parse("modA/Config.java", "package com.acme;\nclass Config {}\n"),
+        "modB/Config.java": _parse("modB/Config.java", "package com.acme;\nclass Config {}\n"),
+    }
+    records = da.build_dependencies(results)
+    import_edge = next(r for r in records if r.relation == "import")
+    assert import_edge.resolution_state == "ambiguous"
+    assert import_edge.target_unresolved == "com.acme.Config.VALUE"
+    assert sorted(import_edge.candidate_unit_ids) == sorted([
+        da._java_component_unit_id("modA/Config.java", "com.acme.Config"),
+        da._java_component_unit_id("modB/Config.java", "com.acme.Config"),
+    ])
+
+
+def test_import_edge_is_unresolved_not_external_into_an_excluded_region():
+    """FIX ROUND 16 (twelfth cold read, B2 BLOCKER, wrong-data): mirrors
+    ``_degraded_java_suffix_match``'s own reasoning for the mirror-image
+    relationship - a target whose hypothetical file lives inside a
+    directory THIS run excluded outright (never walked, so it can never
+    have a registry entry) is not "genuinely external" just because the
+    registry has no entry for it. Reviewer-3's own ``.cr12-hex`` shape:
+    a PaymentGateway type that lives under an excluded ``out/`` region
+    at repo root (not inside a recognized source root, so the exclusion
+    genuinely fires) must not silently become a confident external
+    claim - and must not be silently deleted from the inventory either."""
+    results = {
+        "p/OrderService.java": _parse(
+            "p/OrderService.java",
+            "package p;\n"
+            "import p.out.PaymentGateway;\n"
+            "class OrderService {}\n"),
+    }
+    records = da.build_dependencies(
+        results, excluded_root_paths=frozenset({"p/out"}))
+    import_edge = next(r for r in records if r.relation == "import")
+    assert import_edge.resolution_state == "unresolved"
+    assert import_edge.target_unresolved == "p.out.PaymentGateway"
+    assert import_edge.target_external is None
+
+
+def test_import_edge_still_resolves_external_when_not_excluded():
+    """Companion negative case: the SAME shape with no excluded_root_paths
+    entry still resolves external as before - the fix only closes the
+    specific excluded-region gap, never turns every registry miss into
+    unresolved."""
+    results = {
+        "p/OrderService.java": _parse(
+            "p/OrderService.java",
+            "package p;\n"
+            "import p.out.PaymentGateway;\n"
+            "class OrderService {}\n"),
+    }
+    records = da.build_dependencies(results)
+    import_edge = next(r for r in records if r.relation == "import")
+    assert import_edge.resolution_state == "resolved"
+    assert import_edge.target_external == "p.out.PaymentGateway"
+
+
+def test_wildcard_import_edge_is_unresolved_when_its_package_is_in_scan():
+    """FIX ROUND 16 (twelfth cold read, B3 BLOCKER, wrong-data): a plain
+    wildcard import (``import com.acme.util.*;``) used to publish
+    ``resolved``/``target_external`` UNCONDITIONALLY (java.py hardcoded
+    ``target_kind = "external"``) - even when the wildcard's own package
+    prefix genuinely IS declared in-scan, silently miscounting a real
+    in-scan package import as third-party. Mirrors reviewer-3's own
+    ``.cr12-wildcard`` fixture: Report.java wildcard-imports
+    ``com.acme.util.*``, and ``com.acme.util.DateHelper`` is in-scan."""
+    results = {
+        "app/Report.java": _parse(
+            "app/Report.java",
+            "package com.acme.app;\n"
+            "import com.acme.util.*;\n"
+            "class Report {}\n"),
+        "util/DateHelper.java": _parse(
+            "util/DateHelper.java", "package com.acme.util;\nclass DateHelper {}\n"),
+    }
+    records = da.build_dependencies(results)
+    import_edge = next(r for r in records if r.relation == "import")
+    assert import_edge.resolution_state == "unresolved"
+    assert import_edge.target_unresolved == "com.acme.util.*"
+    assert import_edge.target_external is None
+
+
+def test_wildcard_import_edge_still_resolves_external_when_its_package_is_not_in_scan():
+    """Companion negative case: a wildcard import whose package matches
+    NOTHING in-scan still resolves external as before - the fix only
+    closes the specific in-scan-package-miscounted-as-external gap."""
+    results = {
+        "app/Report.java": _parse(
+            "app/Report.java",
+            "package com.acme.app;\n"
+            "import java.util.*;\n"
+            "class Report {}\n"),
+    }
+    records = da.build_dependencies(results)
+    import_edge = next(r for r in records if r.relation == "import")
+    assert import_edge.resolution_state == "resolved"
+    assert import_edge.target_external == "java.util.*"
+
+
 # ----------------------------------------------------------- test relation (cross-file)
 
 def test_test_edge_resolves_to_the_unit_under_test_in_another_file():

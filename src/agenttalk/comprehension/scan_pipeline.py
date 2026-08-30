@@ -173,6 +173,12 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     # under-claimed evidence, the same "warning" bucket every other
     # missing-evidence reason in this table already gets.
     "unsupported_language": "warning",
+    # FIX ROUND 16 (twelfth cold read, B1 BLOCKER): two units DECLARING
+    # the identical fully-qualified name - a real collision modules_
+    # artifact.py's _populate_duplicate_qualified_name_conflicts already
+    # detects and tags (conflict_id), but never surfaced anywhere an
+    # operator actually reads until now.
+    "duplicate_qualified_name": "warning",
 }
 _DEFAULT_PROBLEM_SEVERITY = "warning"
 
@@ -426,8 +432,16 @@ def run_scan(
         # false-positive external claim over evidence that is merely
         # missing, not genuinely third-party.
         degraded_paths = frozenset(worker_problem_reasons_by_path)
+        # FIX ROUND 16 (twelfth cold read, B2 BLOCKER, part 3): every
+        # relative path discovery excluded outright this run - queryable
+        # here for the identical reason ``degraded_paths`` is: an import
+        # naming a type whose hypothetical file lives under one of these
+        # never-walked regions must never resolve a confident external
+        # claim either.
+        excluded_root_paths = frozenset(r["path"] for r in discovery_result.excluded_roots)
         dependencies = dependencies_artifact.build_dependencies(
-            java_results, file_digests=file_digests, degraded_paths=degraded_paths)
+            java_results, file_digests=file_digests, degraded_paths=degraded_paths,
+            excluded_root_paths=excluded_root_paths)
         entry_points, features = features_artifact.build_features(
             java_results, file_digests=file_digests)
         readiness_signals, readiness_summaries = readiness_artifact.build_readiness(
@@ -442,6 +456,28 @@ def run_scan(
         # actually emitted anywhere in the pipeline.
         case_collisions = find_case_fold_collisions(relative_paths)
 
+        # FIX ROUND 16 (twelfth cold read, B1 BLOCKER, part 3): one
+        # problem per DISTINCT conflict_id (never per colliding unit -
+        # that would publish the same collision twice, once per side),
+        # grouping modules_artifact.py's own conflict_id tagging by the
+        # id itself since that is the one value both colliding units
+        # share.
+        modules_by_conflict_id: dict[str, list[modules_artifact.ModuleRecord]] = {}
+        for m in modules:
+            if m.conflict_id is not None:
+                modules_by_conflict_id.setdefault(m.conflict_id, []).append(m)
+        duplicate_qualified_name_problems = [
+            _problem_record(
+                "duplicate_qualified_name",
+                None,
+                bounded_detail(
+                    f"{group[0].qualified_name!r} declared in "
+                    f"{sorted(p for m in group for p in m.paths)}"),
+                qualified_name=group[0].qualified_name,
+            )
+            for group in modules_by_conflict_id.values()
+        ]
+
         problems = [
             _problem_record(p["reason_code"], p.get("path"), p["detail"])
             for p in discovery_result.problems
@@ -453,7 +489,7 @@ def run_scan(
             _problem_record(
                 "case_collision", second, bounded_detail(f"case-folds identically to {first!r}"))
             for first, second in case_collisions
-        ]
+        ] + duplicate_qualified_name_problems
         # FIX ROUND 14b (reviewer-3's ratified CR10-5 split): a worker
         # problem's own `degrades_run` (worker.py) distinguishes
         # "recorded, visible" from "the run's status also degrades over
@@ -465,7 +501,7 @@ def run_scan(
         degrading_worker_problems = any(p.degrades_run for p in worker_result.problems)
         status = "degraded" if (
             discovery_result.degraded or discovery_result.problems or case_collisions
-            or degrading_worker_problems
+            or degrading_worker_problems or duplicate_qualified_name_problems
         ) else "complete"
 
         modules_doc = {
@@ -582,6 +618,13 @@ def run_scan(
             {"path": b.relative_path, "kind": b.boundary_kind}
             for b in discovery_result.boundaries
         ])
+        # FIX ROUND 16 (twelfth cold read, B2 BLOCKER, part 2): a bare
+        # category -> count record (`exclusions`) hid WHICH path was
+        # excluded and WHY - the same "excluded roots with an explicit
+        # boundary reason" scan.json field the design already names.
+        # Bounded the same way `boundaries` already is.
+        excluded_root_rows, excluded_roots_omitted = _bounded_boundaries(
+            discovery_result.excluded_roots)
 
         scan_doc = {
             **_envelope(
@@ -658,6 +701,8 @@ def run_scan(
             # projector.py, which only bounds the separate REPORT payload.
             "boundaries": boundary_rows,
             "boundaries_omitted_count": boundaries_omitted,
+            "excluded_roots": excluded_root_rows,
+            "excluded_roots_omitted_count": excluded_roots_omitted,
             "unsupported_relations": list(java_adapter.UNSUPPORTED_RELATIONS),
             "unsupported_invoke_shapes": list(java_adapter.UNSUPPORTED_INVOKE_SHAPES),
             "record_counts": record_counts,

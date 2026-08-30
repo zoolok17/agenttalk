@@ -95,6 +95,31 @@ _DEPENDENCY_CACHE_DIR_NAMES = frozenset({
     ".mypy_cache", ".pytest_cache",
 })
 _GENERATED_VENDOR_DIR_NAMES = frozenset({"target", "build", "dist", "vendor", "out", ".next"})
+#: FIX ROUND 16 (twelfth cold read, B2 BLOCKER, wrong-data): the ANY-
+#: DEPTH name exclusion silently deleted a real, standard hexagonal-
+#: architecture package (``.../port/out/PaymentGateway.java``) from the
+#: whole inventory - ``out`` is a routine Java package name at that
+#: depth, never a build-output directory the way it is at repo/module
+#: root level. A generated/vendor NAME match only fires OUTSIDE a
+#: recognized source root - inside one (``src/main/java/...`` and its
+#: siblings), the same name is a PACKAGE segment, not a build artifact.
+#: PROVISIONAL, the same Maven/Gradle standard-layout convention this
+#: whole package already keys test classification off (``modules_
+#: artifact._TEST_SOURCE_ROOT_SEGMENT``). Explicit SEMANTICS CHANGE,
+#: flagged for reviewer-3: a repo whose build tooling genuinely places
+#: OUTPUT under ``src/main/java/.../build/`` (unusual, but not
+#: impossible) would now walk into it instead of excluding it - judged
+#: the correct trade given a real, standard package name silently
+#: vanishing is the worse failure mode.
+_RECOGNIZED_SOURCE_ROOT_PREFIXES = (
+    "src/main/java/", "src/test/java/", "src/main/resources/", "src/test/resources/",
+)
+
+
+def _is_inside_a_recognized_source_root(relative_path: str) -> bool:
+    return any(relative_path.startswith(prefix) for prefix in _RECOGNIZED_SOURCE_ROOT_PREFIXES)
+
+
 _SECRET_FILE_PATTERNS = (
     ".env", ".env.*", "*.pem", "*.pfx", "*.p12", "*.ppk",
     "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
@@ -182,6 +207,13 @@ class DiscoveryResult:
     files: list[EnumeratedFile] = field(default_factory=list)
     boundaries: list[BoundaryEntry] = field(default_factory=list)
     exclusions: dict[str, int] = field(default_factory=dict)
+    #: FIX ROUND 16 (twelfth cold read, B2 BLOCKER, part 2): `exclusions`
+    #: is a bare category -> count map - it names WHAT was excluded, never
+    #: WHERE. The design's own scan.json fields name "excluded roots with
+    #: an explicit boundary reason" - this is that list, one entry per
+    #: excluded root path (bounded + omitted-count at publish time in
+    #: scan_pipeline.py, the same discipline `boundaries` already follows).
+    excluded_roots: list[dict[str, str]] = field(default_factory=list)
     problems: list[dict[str, str]] = field(default_factory=list)
     whole_scope_fingerprint: str | None = None
     fingerprint_complete: bool = True
@@ -351,7 +383,7 @@ def _looks_binary(data: bytes) -> bool:
     return b"\x00" in data[:_BINARY_SNIFF_BYTES]
 
 
-def _exclusion_category(name: str, *, is_dir: bool) -> str | None:
+def _exclusion_category(name: str, relative_path: str, *, is_dir: bool) -> str | None:
     if name in _HARD_EXCLUDE_DIR_NAMES:
         # M2 (sixth cold read, fix round 10): `.git` as a REGULAR FILE (a
         # git worktree or submodule checkout stores a `gitdir: ...`
@@ -369,7 +401,9 @@ def _exclusion_category(name: str, *, is_dir: bool) -> str | None:
             return "vcs"
         if name in _DEPENDENCY_CACHE_DIR_NAMES:
             return "dependency_cache"
-        if name in _GENERATED_VENDOR_DIR_NAMES:
+        if name in _GENERATED_VENDOR_DIR_NAMES and not _is_inside_a_recognized_source_root(
+            relative_path,
+        ):
             return "generated_or_vendor"
         return None
     if any(fnmatch.fnmatch(name, pattern) for pattern in _SECRET_FILE_PATTERNS):
@@ -439,6 +473,7 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
     files: list[EnumeratedFile] = []
     boundaries: list[BoundaryEntry] = []
     exclusions: dict[str, int] = {}
+    excluded_roots: list[dict[str, str]] = []
     problems: list[dict[str, str]] = []
     degraded = False
     entry_count = 0
@@ -454,8 +489,15 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
         degraded = True
         problems.append(submodule_problem)
 
-    def _record_exclusion(category: str) -> None:
+    def _record_exclusion(category: str, relative_path: str) -> None:
         exclusions[category] = exclusions.get(category, 0) + 1
+        # FIX ROUND 16 (twelfth cold read, B2 BLOCKER, part 2): a bare
+        # count-only record hid WHICH path was excluded and WHY - the
+        # same "excluded roots with an explicit boundary reason" gap the
+        # design's own scan.json fields already name, and the same
+        # discipline `boundaries` already follows. Bounded at publish
+        # time (scan_pipeline.py), the same way `boundaries` already is.
+        excluded_roots.append({"path": relative_path, "category": category})
 
     def _walk(directory: Path, depth: int = 0) -> None:
         nonlocal entry_count, hashed_total, degraded, entry_cap_hit
@@ -519,9 +561,9 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                 boundaries.append(BoundaryEntry(relative_path=relative, boundary_kind=boundary_kind))
                 continue
             if entry.is_dir():
-                category = _exclusion_category(entry.name, is_dir=True)
+                category = _exclusion_category(entry.name, relative, is_dir=True)
                 if category is not None:
-                    _record_exclusion(category)
+                    _record_exclusion(category, relative)
                     continue
                 if relative in submodule_boundaries:
                     boundaries.append(
@@ -530,9 +572,9 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                 _walk(entry, depth + 1)
                 continue
             # A regular file.
-            category = _exclusion_category(entry.name, is_dir=False)
+            category = _exclusion_category(entry.name, relative, is_dir=False)
             if category is not None:
-                _record_exclusion(category)
+                _record_exclusion(category, relative)
                 continue
             entry_count += 1
             if entry_count > MAX_FILESYSTEM_ENTRIES:
@@ -557,7 +599,7 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
             # silently removed by a later binary-sniff exclusion first.
             if size > MAX_PER_FILE_BYTES:
                 degraded = True
-                _record_exclusion("resource_limit_oversized")
+                _record_exclusion("resource_limit_oversized", relative)
                 problems.append({
                     "reason_code": "resource_limit",
                     "path": relative,
@@ -573,11 +615,11 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                 })
                 continue
             if _looks_binary(data):
-                _record_exclusion("binary")
+                _record_exclusion("binary", relative)
                 continue
             if hashed_total + len(data) > MAX_HASHED_TOTAL_BYTES:
                 degraded = True
-                _record_exclusion("resource_limit_total_bytes")
+                _record_exclusion("resource_limit_total_bytes", relative)
                 problems.append({
                     "reason_code": "resource_limit",
                     "path": relative,
@@ -631,6 +673,7 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
         files=files,
         boundaries=boundaries,
         exclusions=exclusions,
+        excluded_roots=excluded_roots,
         problems=problems,
         whole_scope_fingerprint=fingerprint,
         fingerprint_complete=fingerprint_complete,

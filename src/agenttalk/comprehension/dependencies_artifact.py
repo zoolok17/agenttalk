@@ -110,7 +110,10 @@ def _java_file_unit_id(relative_path: str) -> str:
 
 def _build_registry(
     java_results: dict[str, java_adapter.JavaFileResult],
-) -> tuple[dict[str, str], dict[str, list[str]], dict[str, str], set[str], dict[str, list[str]]]:
+) -> tuple[
+    dict[str, str], dict[str, list[str]], dict[str, str], set[str], dict[str, list[str]],
+    set[str],
+]:
     """M12 (cold-read, PR-B fix round 3): two units DECLARING the same
     fully-qualified name (a real collision, not merely a same-SIMPLE-name
     coincidence) used to last-wins into ``by_qualified_name`` with no
@@ -138,6 +141,13 @@ def _build_registry(
     # the exact candidate set an `ambiguous` registry-collision record
     # needs to publish.
     unit_ids_by_qualified_name: dict[str, list[str]] = {}
+    # FIX ROUND 16 (twelfth cold read, B3 BLOCKER): every package with at
+    # least one in-scan component, keyed by the qualified name's own
+    # dotted prefix - the one place that can answer "does a wildcard
+    # import's package actually name part of this scan" without
+    # reopening the per-member ambiguity round 12b's named limit
+    # deliberately left closed.
+    in_scan_packages: set[str] = set()
     for path, result in java_results.items():
         file_unit_id_by_path[path] = _java_file_unit_id(path)
         for unit_claim in result.units:
@@ -148,11 +158,13 @@ def _build_registry(
                 by_qualified_name[unit_claim.qualified_name] = uid
             by_simple_name.setdefault(unit_claim.simple_name, []).append(uid)
             unit_ids_by_qualified_name.setdefault(unit_claim.qualified_name, []).append(uid)
+            if "." in unit_claim.qualified_name:
+                in_scan_packages.add(unit_claim.qualified_name.rsplit(".", 1)[0])
     for name in duplicate_qualified_names:
         by_qualified_name.pop(name, None)
     return (
         by_qualified_name, by_simple_name, file_unit_id_by_path, duplicate_qualified_names,
-        unit_ids_by_qualified_name,
+        unit_ids_by_qualified_name, in_scan_packages,
     )
 
 
@@ -396,10 +408,55 @@ def _degraded_java_suffix_match(qualified_name: str, degraded_paths: frozenset[s
     return any(path == suffix or path.endswith("/" + suffix) for path in degraded_paths)
 
 
+def _excluded_region_match(qualified_name: str, excluded_root_paths: frozenset[str]) -> bool:
+    """FIX ROUND 16 (twelfth cold read, B2 BLOCKER, part 3): mirrors
+    :func:`_degraded_java_suffix_match`'s own reasoning, for the mirror-
+    image relationship - a target whose hypothetical file lives INSIDE a
+    directory THIS run excluded outright (a bare generated/vendor
+    directory name at repo/module root - ``out/``, ``build/``, ``dist/``,
+    never one merely nested inside a recognized source root, which never
+    reaches ``excluded_root_paths`` at all - see ``discovery.py``'s
+    ``_is_inside_a_recognized_source_root``) must never become a
+    confident EXTERNAL claim either: the registry has no entry for it
+    because the file was never even walked, not because the type is
+    genuinely third-party."""
+    suffix = qualified_name.replace(".", "/") + ".java"
+    return any(suffix == root or suffix.startswith(root + "/") for root in excluded_root_paths)
+
+
+def _classify_registry_miss(
+    qualified_name: str, *, duplicate_qualified_names: set[str],
+    unit_ids_by_qualified_name: dict[str, list[str]], degraded_paths: frozenset[str],
+    excluded_root_paths: frozenset[str],
+) -> tuple[str, list[str] | None]:
+    """FIX ROUND 16 (twelfth cold read, B1+B2 BLOCKERS - the shared
+    class): called ONLY once an exact registry lookup for
+    ``qualified_name`` has already MISSED. Never itself performs the
+    exact-match check - callers keep that (it needs their own
+    type-prefix-vs-full-target distinction). Returns
+    ``(outcome, candidate_unit_ids)`` where ``outcome`` is one of
+    ``"ambiguous"`` / ``"unresolved"`` / ``"external"`` - the class the
+    round-16 dispatch itself names: an import target may publish
+    EXTERNAL only on POSITIVE grounds (not in-scan AND not a duplicate
+    qualified name AND not under an excluded region) - any other miss is
+    ``unresolved`` (or ``ambiguous`` with candidates), spelling retained,
+    never a confident external claim over an absent registry entry that
+    is actually just a naming collision or a directory this run never
+    walked."""
+    if qualified_name in duplicate_qualified_names:
+        return "ambiguous", sorted(unit_ids_by_qualified_name.get(qualified_name, []))
+    if _degraded_java_suffix_match(qualified_name, degraded_paths):
+        return "unresolved", None
+    if _excluded_region_match(qualified_name, excluded_root_paths):
+        return "unresolved", None
+    return "external", None
+
+
 def build_dependencies(
     java_results: dict[str, java_adapter.JavaFileResult],
     *, file_digests: dict[str, str] | None = None,
     degraded_paths: frozenset[str] = frozenset(),
+    excluded_root_paths: frozenset[str] = frozenset(),
 ) -> list[DependencyRecord]:
     """``java_results`` carries every producer's claims uniformly, keyed
     by relative path - including a ``pom.xml``'s ``build`` edges (B-3,
@@ -431,11 +488,19 @@ def build_dependencies(
     anything") - queryable here so an import naming one of those files'
     declared types resolves ``unresolved``, never a false-positive
     ``resolved``/``target_external``.
+
+    ``excluded_root_paths`` (FIX ROUND 16, twelfth cold read, B2 BLOCKER)
+    names every relative path discovery excluded outright this run (a
+    bare generated/vendor directory name at repo/module root, or a
+    resource-cap/binary exclusion) - queryable here for the identical
+    reason ``degraded_paths`` is: an import naming a type whose
+    hypothetical file lives under one of these never walked regions must
+    never be stamped a confident external claim either.
     """
     file_digests = file_digests or {}
     (
         by_qualified_name, by_simple_name, file_unit_id_by_path, duplicate_qualified_names,
-        unit_ids_by_qualified_name,
+        unit_ids_by_qualified_name, in_scan_packages,
     ) = _build_registry(java_results)
     records: list[DependencyRecord] = []
 
@@ -470,6 +535,7 @@ def build_dependencies(
                 import_qualified_by_simple=import_qualified_by_simple,
                 package=package, degraded_paths=degraded_paths,
                 unit_ids_by_qualified_name=unit_ids_by_qualified_name,
+                excluded_root_paths=excluded_root_paths, in_scan_packages=in_scan_packages,
             )
             records.append(record)
 
@@ -568,6 +634,8 @@ def _edge_claim_to_record(
     duplicate_qualified_names: set[str], local_qualified_by_simple: dict[str, str],
     import_qualified_by_simple: dict[str, str], package: str | None,
     degraded_paths: frozenset[str], unit_ids_by_qualified_name: dict[str, list[str]],
+    excluded_root_paths: frozenset[str] = frozenset(),
+    in_scan_packages: set[str] = frozenset(),
 ) -> DependencyRecord:
     target_unit_id = target_external = target_unresolved = confidence = None
     candidate_unit_ids: list[str] = []
@@ -640,44 +708,79 @@ def _edge_claim_to_record(
         exact_unit_id = _exact_qualified_lookup(edge.target, by_qualified_name)
         if exact_unit_id is not None:
             resolution_state, target_unit_id, confidence = "resolved", exact_unit_id, "high"
-        elif _degraded_java_suffix_match(edge.target, degraded_paths):
-            # F2 MAJOR (eighth cold read): this SAME run could not fully
-            # read/parse the file that would have declared this type -
-            # never a confident external claim over an absent registry
-            # entry that is actually just missing evidence.
-            resolution_state, target_unresolved = "unresolved", edge.target
         else:
-            resolution_state, target_external = "resolved", edge.target
+            outcome, candidates = _classify_registry_miss(
+                edge.target, duplicate_qualified_names=duplicate_qualified_names,
+                unit_ids_by_qualified_name=unit_ids_by_qualified_name,
+                degraded_paths=degraded_paths, excluded_root_paths=excluded_root_paths,
+            )
+            if outcome == "ambiguous":
+                resolution_state, target_unresolved, candidate_unit_ids = (
+                    "ambiguous", edge.target, candidates)
+            elif outcome == "unresolved":
+                resolution_state, target_unresolved = "unresolved", edge.target
+            else:
+                resolution_state, target_external = "resolved", edge.target
     elif edge.target_kind == "internal_static_import_exact_or_external":
         # N5 (fourth cold read, fix round 6): a static import's target is
         # a member path (Type.MEMBER) or a static-member wildcard
         # (Type.*) - the TYPE PREFIX (everything but the last segment) is
         # what might be in-scan, exact-matched the same way D-1 already
         # does for a plain import; the member itself is never resolved
-        # (out of scope). The UNRESOLVED path keeps the full original
-        # spelling, for evidence (the reader can see exactly which
-        # member was meant, even though nothing in-scan answers for the
-        # type) - only the LOOKUP key strips the trailing member/
-        # wildcard segment.
+        # (out of scope). The UNRESOLVED/ambiguous path keeps the full
+        # original spelling, for evidence (the reader can see exactly
+        # which member was meant, even though nothing in-scan answers
+        # for the type) - only the LOOKUP key strips the trailing
+        # member/wildcard segment.
         type_prefix = edge.target[:-2] if edge.target.endswith(".*") else edge.target.rsplit(".", 1)[0]
         exact_unit_id = _exact_qualified_lookup(type_prefix, by_qualified_name)
         if exact_unit_id is not None:
             resolution_state, target_unit_id, confidence = "resolved", exact_unit_id, "high"
-        elif _degraded_java_suffix_match(type_prefix, degraded_paths):
-            # F2 MAJOR (eighth cold read): same reasoning as the plain
-            # import above, keyed on the type prefix, not the full
-            # member-path spelling.
+        else:
+            outcome, candidates = _classify_registry_miss(
+                type_prefix, duplicate_qualified_names=duplicate_qualified_names,
+                unit_ids_by_qualified_name=unit_ids_by_qualified_name,
+                degraded_paths=degraded_paths, excluded_root_paths=excluded_root_paths,
+            )
+            if outcome == "ambiguous":
+                resolution_state, target_unresolved, candidate_unit_ids = (
+                    "ambiguous", edge.target, candidates)
+            elif outcome == "unresolved":
+                resolution_state, target_unresolved = "unresolved", edge.target
+            else:
+                # FIX ROUND 15 (eleventh cold read, N1 MINOR): a
+                # genuinely EXTERNAL static import used to publish the
+                # full member path (e.g. "org.junit.Assert.
+                # assertEquals") as target_external - the member was
+                # already stripped for the RESOLUTION lookup key above;
+                # the published external name now matches it, naming
+                # the TYPE the dependency actually is
+                # (org.junit.Assert), never a member path masquerading
+                # as one.
+                resolution_state, target_external = "resolved", type_prefix
+    elif edge.target_kind == "external_wildcard_import":
+        # FIX ROUND 16 (twelfth cold read, B3 BLOCKER, wrong-data): a
+        # plain wildcard import (`import com.acme.util.*;`) names a
+        # PACKAGE, not a type - it cannot be exact-matched against the
+        # unit registry the way a plain/static import's own type
+        # spelling can (the named limit round 12b documented). But a
+        # wildcard whose OWN package prefix matches a package this run
+        # actually scanned is not "genuinely external" either - it is
+        # importing THIS repo's own package, wholesale, and the
+        # publisher has no way to know which specific in-scan member(s)
+        # it actually uses (the documented bare-name-via-wildcard
+        # under-claim limit - resolving that would require checking
+        # every wildcard-imported package's real membership, reopening
+        # the same cross-package ambiguity round 12's F1 closed).
+        # Published unresolved/wildcard-scoped instead - a named,
+        # honest "cannot tell, but not third-party either" rather than
+        # a confident external claim that undercounts this package's
+        # own fan-in.
+        package_prefix = edge.target[:-2]
+        if package_prefix in in_scan_packages:
             resolution_state, target_unresolved = "unresolved", edge.target
         else:
-            # FIX ROUND 15 (eleventh cold read, N1 MINOR): a genuinely
-            # EXTERNAL static import used to publish the full member
-            # path (e.g. "org.junit.Assert.assertEquals") as
-            # target_external - the member was already stripped for the
-            # RESOLUTION lookup key above; the published external name
-            # now matches it, naming the TYPE the dependency actually is
-            # (org.junit.Assert), never a member path masquerading as
-            # one.
-            resolution_state, target_external = "resolved", type_prefix
+            resolution_state, target_external = "resolved", edge.target
     else:
         resolution_state = "resolved"
         target_external = edge.target

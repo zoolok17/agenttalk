@@ -194,6 +194,40 @@ def test_a_component_publishes_its_own_fully_qualified_name():
     assert file_record.qualified_name is None
 
 
+def test_two_components_declaring_the_same_qualified_name_share_a_conflict_id():
+    """FIX ROUND 16 (twelfth cold read, B1 BLOCKER, wrong-data): two units
+    genuinely declaring the identical fully-qualified name (a real
+    collision, e.g. two Maven modules both under ``com.acme``) used to
+    publish ``conflict_id=None`` on both - the field existed
+    (ModuleRecord.conflict_id) but nothing ever populated it. Mirrors
+    reviewer-3's own ``.cr12-dup`` fixture shape: two modules each
+    declaring ``com.acme.Config``. Unrelated components (a third,
+    uniquely-named class) must stay conflict_id=None."""
+    source_a = "package com.acme;\nclass Config {\n}\n"
+    source_b = "package com.acme;\nclass Config {\n}\n"
+    source_c = "package com.acme;\nclass Other {\n}\n"
+    discovery = _discovery([
+        EnumeratedFile(
+            relative_path="modA/Config.java", byte_count=len(source_a), content_digest="a"),
+        EnumeratedFile(
+            relative_path="modB/Config.java", byte_count=len(source_b), content_digest="b"),
+        EnumeratedFile(
+            relative_path="modC/Other.java", byte_count=len(source_c), content_digest="c"),
+    ])
+    java_results = {
+        "modA/Config.java": _java_result("modA/Config.java", source_a),
+        "modB/Config.java": _java_result("modB/Config.java", source_b),
+        "modC/Other.java": _java_result("modC/Other.java", source_c),
+    }
+    records = ma.build_modules(discovery, java_results)
+    components = {r.paths[0]: r for r in records if r.kind == "component"}
+    assert components["modA/Config.java"].conflict_id is not None
+    assert (
+        components["modA/Config.java"].conflict_id == components["modB/Config.java"].conflict_id
+    )
+    assert components["modC/Other.java"].conflict_id is None
+
+
 def test_a_nested_class_is_contained_by_its_outer_class():
     source = "package p;\nclass Outer {\n  class Inner {\n  }\n}\n"
     discovery = _discovery([

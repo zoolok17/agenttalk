@@ -18,7 +18,7 @@ changing this module's shape.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from . import digests
@@ -340,4 +340,44 @@ def build_modules(
             adapter_problem_reasons=list(reasons),
         ))
 
-    return records
+    return _populate_duplicate_qualified_name_conflicts(records)
+
+
+def _populate_duplicate_qualified_name_conflicts(records: list[ModuleRecord]) -> list[ModuleRecord]:
+    """FIX ROUND 16 (twelfth cold read, B1 BLOCKER, wrong-data): two
+    in-scan classes declaring the IDENTICAL fully-qualified name (routine
+    in legacy repos - multi-module copies, shaded relocations) is a real
+    registry COLLISION (M12's own class) - both units used to carry
+    ``conflict_id: null``, the design's own visible-grouping mechanism
+    (``digests.conflict_id()``) existing with no caller anywhere in this
+    artifact. Groups "component"-kind records by their own qualified_name
+    and stamps every unit in a 2+ group with the SAME conflict_id (a
+    stable hash over the conflict kind, the qualified name itself as the
+    anchor, and the SORTED unit ids as the colliding claim digests - the
+    design's own "sorted canonical claim digests" wording, this slice's
+    stand-in for a full claim digest since a component's own unit_id is
+    already a stable, deterministic identity). A qualified_name with
+    exactly one claimant is never touched."""
+    unit_ids_by_qualified_name: dict[str, list[str]] = {}
+    for record in records:
+        if record.kind == "component" and record.qualified_name is not None:
+            unit_ids_by_qualified_name.setdefault(record.qualified_name, []).append(record.unit_id)
+
+    conflict_id_by_unit_id: dict[str, str] = {}
+    for qualified_name, unit_ids in unit_ids_by_qualified_name.items():
+        if len(unit_ids) < 2:
+            continue
+        conflict_id = digests.conflict_id(
+            conflict_kind="duplicate_qualified_name", anchor=qualified_name,
+            claim_digests=sorted(unit_ids),
+        )
+        for unit_id in unit_ids:
+            conflict_id_by_unit_id[unit_id] = conflict_id
+
+    if not conflict_id_by_unit_id:
+        return records
+    return [
+        replace(record, conflict_id=conflict_id_by_unit_id[record.unit_id])
+        if record.unit_id in conflict_id_by_unit_id else record
+        for record in records
+    ]

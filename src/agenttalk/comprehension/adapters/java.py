@@ -445,12 +445,16 @@ class JavaEdgeClaim:
     relation: str
     target: str
     # "internal_candidate" | "internal_exact_or_external" |
-    # "internal_static_import_exact_or_external" | "external" |
-    # "external_route" - see dependencies_artifact._edge_claim_to_record
-    # for how each is resolved. FIX ROUND 14 (CR10-2): retired
+    # "internal_static_import_exact_or_external" | "external_wildcard_import"
+    # | "external" | "external_route" - see
+    # dependencies_artifact._edge_claim_to_record for how each is
+    # resolved. FIX ROUND 14 (CR10-2): retired
     # "internal_unqualified_call_candidate" - invoke's bare/dotted
     # qualifier now shares "internal_candidate"'s own ladder with
     # inherit/test, never a narrower, separately-maintained kind.
+    # FIX ROUND 16 (twelfth cold read, B3 BLOCKER): added
+    # "external_wildcard_import" - a plain wildcard import's own package
+    # prefix may still be in-scan, unlike every other "external" kind.
     target_kind: str
     evidence_class: str
     line: int | None
@@ -1491,7 +1495,13 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         # already get, via the exact same registry, never a guess. A
         # wildcard NON-static import names a package, not a type - the
         # part before ".*" can never be exact-matched against the unit
-        # registry, so it stays plain external.
+        # registry (round 12b's own named limit), but it gets its own
+        # ``external_wildcard_import`` target_kind (FIX ROUND 16, twelfth
+        # cold read, B3 BLOCKER) rather than plain ``external`` - the
+        # producer cannot exact-match a type here, but the CONSUMER
+        # (dependencies_artifact.py) can still tell whether the package
+        # itself is in-scan, and must not stamp a confident external
+        # claim when it is.
         #
         # N5 (fourth cold read, fix round 6): a STATIC import's target is
         # a member path (Type.MEMBER) or a static-member wildcard
@@ -1509,7 +1519,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         if is_static:
             target_kind = "internal_static_import_exact_or_external"
         elif target.endswith(".*"):
-            target_kind = "external"
+            target_kind = "external_wildcard_import"
         else:
             target_kind = "internal_exact_or_external"
         edges.append(JavaEdgeClaim(
