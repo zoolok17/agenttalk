@@ -1516,6 +1516,53 @@ def test_run_scan_a_latin1_java_file_degrades_and_its_importer_stays_unresolved(
     assert import_edge.get("target_external") is None
 
 
+def test_run_scan_a_discovery_excluded_oversized_java_file_lets_its_importer_stay_unresolved(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 21 (seventeenth cold read, the reader's own LOW-
+    CONFIDENCE flag, wrong-data): a file discovery excludes OUTRIGHT at
+    its own layer (the per-file byte cap here; an unreadable file's
+    stat()/read() failure and the entry-count cap are the same shape)
+    never reaches the worker at all - no unit, no worker-level problem
+    either. Before this fix ``degraded_paths`` consulted ONLY worker-
+    level problems, so an importer of this file's declared type fell
+    through to a false confident external claim over what is genuinely
+    in-repo (merely oversized) source. Now: the run degrades, the
+    oversized file's own path is named in a ``resource_limit`` problem,
+    no component unit exists for it, and the importer correctly stays
+    unresolved rather than a false confident external claim."""
+    import json
+
+    from agenttalk.comprehension import discovery as discoverymod
+
+    monkeypatch.setattr(discoverymod, "MAX_PER_FILE_BYTES", 500)
+    padding = "// padding to exceed the per-file byte cap\n" * 20
+    (java_repo / "src" / "main" / "java" / "p" / "Big.java").write_text(
+        f"package p;\n{padding}public class Big {{}}\n", encoding="utf-8")
+    (java_repo / "src" / "main" / "java" / "p" / "other").mkdir(parents=True)
+    (java_repo / "src" / "main" / "java" / "p" / "other" / "Consumer.java").write_text(
+        "package p.other;\nimport p.Big;\nclass Consumer {}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    big_problems = [p for p in problems_doc["problems"] if p["path"].endswith("Big.java")]
+    assert big_problems
+    assert any(p["reason_code"] == "resource_limit" for p in big_problems)
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    assert not any(u["kind"] == "component" and "Big" in (u.get("paths") or [""])[0]
+                   for u in modules_doc["units"])
+
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    import_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "import" and (r.get("target_unresolved") or "").endswith("Big"))
+    assert import_edge["resolution_state"] == "unresolved"
+    assert import_edge.get("target_external") is None
+
+
 def test_run_scan_a_bom_prefixed_java_file_lets_an_importer_resolve_internal(
     java_repo: Path,
 ) -> None:
