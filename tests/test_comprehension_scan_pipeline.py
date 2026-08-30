@@ -388,6 +388,75 @@ def test_a_genuinely_entry_point_free_file_keeps_its_honest_negative(java_repo: 
     assert feature_signal["stored_status"] == "unsatisfied"
 
 
+def test_a_files_own_signal_rolls_up_through_a_nested_entry_point_class(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 22b (reviewer-3's delta on round 22, R1, wrong-data -
+    SCOPE overturned): the reviewer's own repro verbatim - a statically
+    NESTED @WebListener class is never a DIRECT child of the FILE unit
+    (a nested type's own container is its outer type, never the file
+    directly - N6/round 6) - round 22's own F1 fix consulted direct
+    children only, so Host.java still published the confident
+    no_entry_point negative while p.Host.Inner correctly reported
+    unknown in the SAME run. Now walks the full containment chain (the
+    same _transitive_descendants helper round 15b already uses for
+    this identical unit/file relationship) - Host.java correctly
+    mirrors its nested descendant's own unknown."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "p" / "Host.java").write_text(
+        "package p;\npublic class Host {\n"
+        "  @WebListener\n"
+        "  static class Inner {}\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+
+    inner_signal = _readiness_signal(
+        readiness_doc, modules_doc, display_name="Inner", kind="component",
+        check="entry_points_mapped")
+    file_signal = _readiness_signal(
+        readiness_doc, modules_doc, display_name="Host.java", kind="file",
+        check="entry_points_mapped")
+    assert inner_signal["stored_status"] == "unknown"
+    assert inner_signal["reason_code"] == "unsupported_entry_point_shape"
+    assert file_signal["stored_status"] == "unknown"
+    assert file_signal["reason_code"] == "unsupported_entry_point_shape"
+
+
+def test_a_files_own_signal_rolls_up_through_double_nested_entry_point_class(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 22b (R1): deep double-nesting - the entry-point-
+    carrying class is TWO levels of static nesting below the file's own
+    top-level type, still reached by the full containment-chain walk."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "p" / "Outer.java").write_text(
+        "package p;\npublic class Outer {\n"
+        "  static class Middle {\n"
+        "    @WebListener\n"
+        "    static class Deep {}\n"
+        "  }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+
+    file_signal = _readiness_signal(
+        readiness_doc, modules_doc, display_name="Outer.java", kind="file",
+        check="entry_points_mapped")
+    assert file_signal["stored_status"] == "unknown"
+    assert file_signal["reason_code"] == "unsupported_entry_point_shape"
+
+
 def test_a_dependency_free_multi_route_controller_publishes_zero_external_end_to_end(
     java_repo: Path,
 ) -> None:

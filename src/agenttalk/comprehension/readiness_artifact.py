@@ -912,8 +912,25 @@ def build_readiness(
     for unit in modules:
         if unit.kind != "file":
             continue
+        # FIX ROUND 22b (reviewer-3's delta on round 22, R1, wrong-data -
+        # SCOPE overturned by one step): round 22's own F1 fix consulted
+        # DIRECT top-level children only - a statically NESTED entry-
+        # point-carrying class (e.g. `class Host { @WebListener static
+        # class Inner {} }`) is never a direct child of the FILE unit at
+        # all (N6/round 6: a nested type's own container is its OUTER
+        # type, never the file directly) - so `Host.java` still
+        # published the confident `no_entry_point` negative while
+        # `p.Host.Inner` correctly reported `unknown` in the SAME run.
+        # Walks the FULL containment chain via the existing
+        # `_transitive_descendants` helper instead - the exact same one
+        # round 15b already uses to roll tested-status up to the owning
+        # file for this identical unit/file relationship. The ratified
+        # ranking semantics (attributed unknown > real satisfied >
+        # honest absence; a single descendant mirrors exactly) are
+        # UNCHANGED - only which units are gathered as "this file's own
+        # descendants" changes.
         component_children = [
-            module_by_id[child_id] for child_id in children_by_container.get(unit.unit_id, [])
+            module_by_id[child_id] for child_id in _transitive_descendants(unit.unit_id)
             if module_by_id.get(child_id) is not None and module_by_id[child_id].kind == "component"
         ]
         if not component_children:

@@ -461,8 +461,10 @@ derived by report/UI code so they cannot drift from the edge set.
 Each edge contains:
 
 - a deterministic `edge_id` and `from_unit_id`;
-- a target union: internal `unit_id`, normalized external package/system name,
-  or an explicit unresolved identifier;
+- a target union: internal `unit_id`; normalized external package/system name,
+  or - when `relation == "route"` - the route pattern (`relation` is the
+  discriminator a consumer dispatches on); or an explicit unresolved
+  identifier;
 - a closed relation from the coarse slice-1 vocabulary: `import`, `include`,
   `inherit`, `invoke`, `route`, `data`, `configuration`, `build`, or `test`;
 - phase (`runtime`, `build`, `test`, or `migration`) and optionality;

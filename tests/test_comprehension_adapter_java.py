@@ -1022,6 +1022,27 @@ def test_route_value_with_a_bidi_override_or_line_separator_is_escaped_not_raw()
     assert line_separator not in routes[0].target
 
 
+def test_route_value_with_an_arabic_letter_mark_is_escaped_not_raw():
+    """FIX ROUND 22b (reviewer-3's delta on round 22, R5, wrong-data):
+    U+061C ARABIC LETTER MARK is the THIRD implicit directional mark by
+    the escape set's own stated criterion (Unicode 6.3 added ALM
+    alongside the isolate controls already in the set) - previously
+    missing, passed through RAW."""
+    alm = chr(0x061C)
+    src = (
+        "package p;\n"
+        "class Controller {\n"
+        f'  @GetMapping("/api{alm}end")\n'
+        "  void list() {}\n"
+        "}\n"
+    )
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /api\\u061cend"
+    assert alm not in routes[0].target
+
+
 # ----------------------------------------------------------- malformed java (round 15 F5)
 
 def test_an_unterminated_char_literal_is_detected_as_malformed_not_silently_truncated():

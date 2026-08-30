@@ -1670,11 +1670,21 @@ _ROUTE_NAME_CONTROL_CHAR_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
 #: many renderers/parsers) passed through RAW. A CLOSED, named set -
 #: like the C0 rule beside it, deliberately NOT chasing full Unicode
 #: exhaustiveness: every BIDI embedding/override/isolate control
-#: (U+202A-U+202E, U+2066-U+2069), the two implicit directional marks
-#: (U+200E/U+200F), and the two Unicode line separators (U+2028/
-#: U+2029).
+#: (U+202A-U+202E, U+2066-U+2069), the three implicit directional marks
+#: (U+200E/U+200F/U+061C), and the two Unicode line separators
+#: (U+2028/U+2029).
+#:
+#: FIX ROUND 22b (reviewer-3's delta on round 22, R5, wrong-data): added
+#: U+061C ARABIC LETTER MARK - the set's OWN stated criterion names
+#: "the two implicit directional marks," but Unicode 6.3 added ALM
+#: alongside the very isolate controls (U+2066-U+2069) already in this
+#: set, making it a THIRD implicit directional mark this set was
+#: silently missing, not a new criterion. U+FEFF (BOM) and U+00A0
+#: (NBSP) deliberately stay OUT - neither is a bidi control, and pulling
+#: either in starts the Unicode-exhaustiveness chase this set's own
+#: docstring already declines.
 _UNICODE_DIRECTIONAL_AND_LINE_CONTROL_CHARS = frozenset(
-    "\u200e\u200f"  # LRM, RLM
+    "\u200e\u200f\u061c"  # LRM, RLM, ALM
     "\u202a\u202b\u202c\u202d\u202e"  # LRE, RLE, PDF, LRO, RLO
     "\u2066\u2067\u2068\u2069"  # LRI, RLI, FSI, PDI
     "\u2028\u2029"  # LINE SEPARATOR, PARAGRAPH SEPARATOR
