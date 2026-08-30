@@ -208,6 +208,11 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     # source. Same "warning" bucket every other missing-evidence reason
     # already gets.
     "module_directory_excluded": "warning",
+    # FIX ROUND 20b (seventeenth-round dispatch, THE MAJOR - poison-rule
+    # VISIBILITY): one per triggering root/pom, naming why externality
+    # was suppressed run-wide. Same bucket as every other named-gap
+    # reason code above.
+    "externality_suppressed": "warning",
 }
 _DEFAULT_PROBLEM_SEVERITY = "warning"
 
@@ -551,6 +556,52 @@ def run_scan(
             or bool(binary_excluded_code_bearing_problems)
             or bool(reactor_rule_problems)
         )
+        # FIX ROUND 20b (seventeenth-round dispatch, THE MAJOR - poison-
+        # rule VISIBILITY): reviewer-3 measured the poison rule firing
+        # SILENTLY in exactly the mainstream shapes round 20 widened it
+        # for - a vendored-module repo and a truncated-peek build/ repo
+        # both published every third-party dependency as unresolved on a
+        # complete/problem_count-0 run, with NO reason on any surface
+        # (dependency records indistinguishable from an ordinary
+        # unresolved miss; no scan.json flag; problems.json empty). One
+        # NEW, uniform `externality_suppressed` problem per triggering
+        # root/pom - ADDITIVE to whatever reason-specific problem that
+        # root already carries (`excluded_region_peek_truncated`/
+        # `binary_excluded_code_bearing_file`/`module_directory_
+        # excluded` each answer "what is wrong with THIS root"; this one
+        # answers "this root is why EVERY unresolved external miss in
+        # this run stayed unresolved instead of a confident external
+        # claim" - a materially different fact worth its own record even
+        # when it co-occurs with an existing one).
+        externality_suppressed_problems = [
+            _problem_record(
+                "externality_suppressed", entry["path"],
+                "this excluded region "
+                + ("contains at least one adapter-handled or tier-2 code-bearing file"
+                   if entry["trigger"] == "peek_positive" else
+                   "could not be fully peeked before its entry cap - unknown whether it "
+                   "holds code")
+                + " - every external-registry-miss import in this run resolves unresolved "
+                  "rather than a confident external claim because of this root",
+            )
+            for entry in discovery_result.poisoning_excluded_roots
+        ] + [
+            _problem_record(
+                "externality_suppressed", p["path"],
+                "this file was excluded outright as binary content but is code-bearing - "
+                "every external-registry-miss import in this run resolves unresolved rather "
+                "than a confident external claim because of it",
+            )
+            for p in binary_excluded_code_bearing_problems
+        ] + [
+            _problem_record(
+                "externality_suppressed", p["path"],
+                "this pom's own declared <module> resolves into an excluded region - every "
+                "external-registry-miss import in this run resolves unresolved rather than a "
+                "confident external claim because of it",
+            )
+            for p in reactor_rule_problems
+        ]
         dependencies = dependencies_artifact.build_dependencies(
             java_results, file_digests=file_digests, degraded_paths=degraded_paths,
             externality_poisoned=externality_poisoned)
@@ -602,7 +653,7 @@ def run_scan(
                 "case_collision", second, bounded_detail(f"case-folds identically to {first!r}"))
             for first, second in case_collisions
         ] + duplicate_qualified_name_problems + binary_excluded_code_bearing_problems + (
-            reactor_rule_problems)
+            reactor_rule_problems) + externality_suppressed_problems
         # FIX ROUND 14b (reviewer-3's ratified CR10-5 split): a worker
         # problem's own `degrades_run` (worker.py) distinguishes
         # "recorded, visible" from "the run's status also degrades over
@@ -612,10 +663,23 @@ def run_scan(
         # Every OTHER problem source here (discovery, case collisions)
         # still always degrades, unchanged.
         degrading_worker_problems = any(p.degrades_run for p in worker_result.problems)
+        # FIX ROUND 20b (THE MAJOR - poison-rule VISIBILITY, part 2): a
+        # poisoned run's own external surface is unknown for its
+        # ENTIRE remaining lifetime (every future registry miss resolves
+        # unresolved, not just the ones already recorded above) - "not
+        # complete in any useful sense," the reviewer's own ruling,
+        # consistent with F4/19b's own "visible absence over silent
+        # claims" precedent. This is a NEW degradation source distinct
+        # from F4's own deliberately narrower src-ancestry-gated
+        # degradation (unchanged) - a run poisoned by an ordinary
+        # generated-sources peek hit now also degrades, correctly: its
+        # dependency resolution really is incomplete, unlike round 16b's
+        # own dilution case (where nothing was actually wrong).
         status = "degraded" if (
             discovery_result.degraded or discovery_result.problems or case_collisions
             or degrading_worker_problems or duplicate_qualified_name_problems
             or binary_excluded_code_bearing_problems or reactor_rule_problems
+            or externality_poisoned
         ) else "complete"
 
         modules_doc = {
@@ -743,6 +807,23 @@ def run_scan(
         # Bounded the same way `boundaries` already is.
         excluded_root_rows, excluded_roots_omitted = _bounded_boundaries(
             discovery_result.excluded_roots)
+        # FIX ROUND 20b (seventeenth-round dispatch, THE MAJOR - poison-
+        # rule VISIBILITY, part 3): a run-level flag beside `excluded_
+        # roots` so a machine consumer can distinguish "this dependency
+        # is unresolved because the resolver genuinely could not place
+        # it" from "this run declined to claim externality run-wide" -
+        # without this, the two are indistinguishable from dependencies.
+        # json alone. Bounded the same way every other list here is.
+        externality_suppressed_roots, externality_suppressed_roots_omitted = _bounded_boundaries([
+            {"path": entry["path"], "trigger": entry["trigger"]}
+            for entry in discovery_result.poisoning_excluded_roots
+        ] + [
+            {"path": p["path"], "trigger": "binary_exclusion"}
+            for p in binary_excluded_code_bearing_problems
+        ] + [
+            {"path": p["path"], "trigger": "reactor"}
+            for p in reactor_rule_problems
+        ])
 
         scan_doc = {
             **_envelope(
@@ -821,6 +902,9 @@ def run_scan(
             "boundaries_omitted_count": boundaries_omitted,
             "excluded_roots": excluded_root_rows,
             "excluded_roots_omitted_count": excluded_roots_omitted,
+            "externality_suppressed": externality_poisoned,
+            "externality_suppressed_roots": externality_suppressed_roots,
+            "externality_suppressed_roots_omitted_count": externality_suppressed_roots_omitted,
             "unsupported_relations": list(java_adapter.UNSUPPORTED_RELATIONS),
             "unsupported_invoke_shapes": list(java_adapter.UNSUPPORTED_INVOKE_SHAPES),
             # FIX ROUND 17 (thirteenth cold read, CR13-3 MAJOR, part (b) -

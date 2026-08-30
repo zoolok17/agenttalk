@@ -373,6 +373,20 @@ class DiscoveryResult:
     #: ``vendor/<module>/src/main/java/<pkg>/...`` - with no string
     #: relationship the qualified name alone could ever recover).
     excluded_region_may_contain_target: bool = False
+    #: FIX ROUND 20b (seventeenth-round dispatch, THE MAJOR - poison-rule
+    #: VISIBILITY): the same condition ``excluded_region_may_contain_
+    #: target`` folds into one run-wide boolean, WITH per-root attribution
+    #: - one entry per generated/vendor exclusion whose peek found code
+    #: or was truncated before it could rule code out, each ``{"path":
+    #: <root's own relative path>, "trigger": "peek_positive" or
+    #: "peek_truncated"}``. Reviewer-3's own measured finding: the poison
+    #: rule (round 20's M1+M2) fires SILENTLY - a run whose registry
+    #: misses all resolve unresolved because of this had no record
+    #: anywhere naming which root did it or why. scan_pipeline.py turns
+    #: each entry here into its own ``externality_suppressed`` problem;
+    #: never used for containment/matching itself (that question is the
+    #: poison rule's own job) - purely an attribution list for visibility.
+    poisoning_excluded_roots: list[dict[str, str]] = field(default_factory=list)
 
 
 def _windows_architecture() -> str:
@@ -632,6 +646,7 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
     problems: list[dict[str, str]] = []
     degraded = False
     excluded_region_may_contain_target = False
+    poisoning_excluded_roots: list[dict[str, str]] = []
     entry_count = 0
     hashed_total = 0
     entry_cap_hit = False
@@ -755,6 +770,10 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                         )
                         if contains_code or peek_truncated:
                             excluded_region_may_contain_target = True
+                            poisoning_excluded_roots.append({
+                                "path": relative,
+                                "trigger": "peek_positive" if contains_code else "peek_truncated",
+                            })
                         if _sits_under_an_uncarved_src_segment(relative):
                             if contains_code:
                                 degraded = True
@@ -904,4 +923,5 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
         fingerprint_complete=fingerprint_complete,
         degraded=degraded,
         excluded_region_may_contain_target=excluded_region_may_contain_target,
+        poisoning_excluded_roots=poisoning_excluded_roots,
     )

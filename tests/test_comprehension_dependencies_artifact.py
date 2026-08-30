@@ -463,6 +463,32 @@ def test_import_edge_still_resolves_external_when_not_poisoned():
     assert import_edge.target_external == "p.out.PaymentGateway"
 
 
+def test_import_edge_under_poison_still_resolves_external_for_a_reserved_namespace():
+    """FIX ROUND 20b (seventeenth-round dispatch, THE ASK - taken): the
+    platform reserves java.*/javax.*/jakarta.* - a vendored/excluded
+    region this run swallowed structurally CANNOT contain a legitimate
+    declaration under any of them, so a poisoned run still resolves one
+    of these as a confident EXTERNAL claim, unlike an ordinary
+    third-party package (org.slf4j, tested in the same fixture) which
+    correctly stays unresolved under the same poison."""
+    results = {
+        "p/OrderService.java": _parse(
+            "p/OrderService.java",
+            "package p;\n"
+            "import java.util.List;\n"
+            "import org.slf4j.Logger;\n"
+            "class OrderService {}\n"),
+    }
+    records = da.build_dependencies(results, externality_poisoned=True)
+    java_util_edge = next(
+        r for r in records if r.relation == "import" and r.target_external == "java.util.List")
+    assert java_util_edge.resolution_state == "resolved"
+    slf4j_edge = next(
+        r for r in records if r.relation == "import" and r.target_unresolved == "org.slf4j.Logger")
+    assert slf4j_edge.resolution_state == "unresolved"
+    assert slf4j_edge.target_external is None
+
+
 def test_wildcard_import_edge_is_unresolved_when_its_package_is_in_scan():
     """FIX ROUND 16 (twelfth cold read, B3 BLOCKER, wrong-data): a plain
     wildcard import (``import com.acme.util.*;``) used to publish
@@ -533,6 +559,29 @@ def test_wildcard_import_edge_when_externality_poisoned_stays_unresolved_too():
     assert wildcard_edge.target_external is None
     assert plain_edge.resolution_state == "unresolved"
     assert plain_edge.target_external is None
+
+
+def test_wildcard_import_edge_under_poison_still_resolves_external_for_a_reserved_namespace():
+    """FIX ROUND 20b (THE ASK - taken): same reserved-namespace exemption
+    on the wildcard branch - ``import java.util.*`` still resolves
+    external under poison, while ``import org.slf4j.*`` in the same file
+    correctly stays unresolved."""
+    results = {
+        "r/Report.java": _parse(
+            "r/Report.java",
+            "package r;\n"
+            "import java.util.*;\n"
+            "import org.slf4j.*;\n"
+            "class Report {}\n"),
+    }
+    records = da.build_dependencies(results, externality_poisoned=True)
+    java_util_edge = next(
+        r for r in records if r.relation == "import" and r.target_external == "java.util.*")
+    slf4j_edge = next(
+        r for r in records if r.relation == "import" and r.target_unresolved == "org.slf4j.*")
+    assert java_util_edge.resolution_state == "resolved"
+    assert slf4j_edge.resolution_state == "unresolved"
+    assert slf4j_edge.target_external is None
 
 
 def test_wildcard_import_edge_still_resolves_external_when_not_poisoned():

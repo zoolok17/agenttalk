@@ -1461,8 +1461,15 @@ def test_run_scan_a_utf16_java_file_degrades_instead_of_silently_vanishing(
 
     problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
     legacy_problems = [p for p in problems_doc["problems"] if p["path"].endswith("Legacy.java")]
-    assert len(legacy_problems) == 1
-    assert legacy_problems[0]["reason_code"] == "binary_excluded_code_bearing_file"
+    # FIX ROUND 20b (seventeenth-round dispatch, THE MAJOR - poison-rule
+    # VISIBILITY): a code-bearing binary-excluded file now ALSO poisons
+    # externality run-wide (round 20's own M1+M2) - this file's own
+    # binary_excluded_code_bearing_file problem is joined by a SECOND,
+    # additive externality_suppressed record naming the same path as one
+    # of the poison rule's own triggers, not replaced by it.
+    assert len(legacy_problems) == 2
+    reason_codes = {p["reason_code"] for p in legacy_problems}
+    assert reason_codes == {"binary_excluded_code_bearing_file", "externality_suppressed"}
 
 
 def test_run_scan_a_bom_prefixed_java_file_lets_an_importer_resolve_internal(
@@ -3050,6 +3057,18 @@ def test_run_scan_a_vendored_reactor_module_reports_unresolved_via_the_reactor_r
     assert len(reactor_problems) == 1
     assert reactor_problems[0]["path"] == "pom.xml"
 
+    # FIX ROUND 20b (seventeenth-round dispatch, THE MAJOR - poison-rule
+    # VISIBILITY): the reactor rule's own problem is JOINED, not
+    # replaced, by the new run-wide poison-visibility record naming this
+    # SAME pom as one of the poison rule's own triggers.
+    poison_problems = [
+        p for p in problems_doc["problems"] if p["reason_code"] == "externality_suppressed"]
+    assert any(p["path"] == "pom.xml" for p in poison_problems)
+
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["externality_suppressed"] is True
+    assert any(r["path"] == "pom.xml" for r in scan_doc["externality_suppressed_roots"])
+
     dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
     build_edge = next(
         r for r in dependencies_doc["edges"]
@@ -3109,6 +3128,156 @@ def test_run_scan_a_pom_declared_module_named_build_reports_unresolved_via_the_r
         p for p in problems_doc["problems"] if p["reason_code"] == "module_directory_excluded"]
     assert len(reactor_problems) == 1
 
+    # FIX ROUND 20b (THE MAJOR - poison-rule VISIBILITY): same additive
+    # poison record as the vendored-reactor-module test above.
+    poison_problems = [
+        p for p in problems_doc["problems"] if p["reason_code"] == "externality_suppressed"]
+    assert any(p["path"] == "pom.xml" for p in poison_problems)
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["externality_suppressed"] is True
+
+
+def test_run_scan_an_undeclared_vendored_module_silently_poisoned_now_degrades_visibly(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 20b (seventeenth-round dispatch, THE MAJOR - poison-rule
+    VISIBILITY): reviewer-3's own measured silent-poison repro - a
+    vendored module with real code sits under an EXCLUDED "vendor" dir
+    that NO pom declares as a <module> (so the reactor rule never fires)
+    and that has no src-segment ancestry of its own (so F4's own
+    narrower degradation never fires either) - only discovery's generic
+    peek finds the code. Before this round: every third-party import
+    (org.slf4j here) silently resolved unresolved on a complete/
+    problem_count-0 run, with NO record anywhere naming why. Now: the
+    run degrades, a named `externality_suppressed` problem records the
+    triggering root, scan.json's own flag is set, and the import
+    correctly stays unresolved throughout (never a false confident
+    external claim over the swallowed vendor code either)."""
+    import json
+
+    (java_repo / "pom.xml").write_text(
+        "<project><groupId>com.acme</groupId><artifactId>root</artifactId>"
+        "<dependencies><dependency>"
+        "<groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId>"
+        "</dependency></dependencies></project>",
+        encoding="utf-8",
+    )
+    (java_repo / "vendor" / "src" / "main" / "java" / "com" / "acme" / "vendor").mkdir(
+        parents=True)
+    (java_repo / "vendor" / "src" / "main" / "java" / "com" / "acme" / "vendor" / "Widget.java"
+     ).write_text("package com.acme.vendor;\nclass Widget {}\n", encoding="utf-8")
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "app").mkdir(parents=True)
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "app" / "Consumer.java").write_text(
+        "package com.acme.app;\n"
+        "import com.acme.vendor.Widget;\n"
+        "import org.slf4j.Logger;\n"
+        "class Consumer {}\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    poison_problems = [
+        p for p in problems_doc["problems"] if p["reason_code"] == "externality_suppressed"]
+    assert any(p["path"] == "vendor" for p in poison_problems)
+    assert not any(p["reason_code"] == "module_directory_excluded" for p in problems_doc["problems"])
+
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["externality_suppressed"] is True
+    assert any(
+        r["path"] == "vendor" and r["trigger"] == "peek_positive"
+        for r in scan_doc["externality_suppressed_roots"]
+    )
+
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    vendor_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "import" and r.get("target_unresolved") == "com.acme.vendor.Widget")
+    assert vendor_edge["resolution_state"] == "unresolved"
+    slf4j_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "import" and r.get("target_unresolved") == "org.slf4j.Logger")
+    assert slf4j_edge["resolution_state"] == "unresolved"
+    assert slf4j_edge.get("target_external") is None
+
+
+def test_run_scan_a_truncated_peek_build_dir_silently_poisoned_now_degrades_visibly(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 20b (THE MAJOR - poison-rule VISIBILITY): the reviewer's
+    second silent-poison repro - a repo-root `build/` dir (no src
+    ancestry, no pom-declared module) whose peek exhausts its own entry
+    cap before ruling code out. Same visible outcome as the peek-positive
+    case above, via the OTHER trigger: `peek_truncated`."""
+    import json
+
+    from agenttalk.comprehension import discovery
+
+    (java_repo / "pom.xml").write_text(
+        "<project><groupId>com.acme</groupId><artifactId>root</artifactId>"
+        "<dependencies><dependency>"
+        "<groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId>"
+        "</dependency></dependencies></project>",
+        encoding="utf-8",
+    )
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "app").mkdir(parents=True)
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "app" / "Consumer.java").write_text(
+        "package com.acme.app;\nimport org.slf4j.Logger;\nclass Consumer {}\n",
+        encoding="utf-8",
+    )
+    build_dir = java_repo / "build"
+    build_dir.mkdir()
+    real_scandir = discovery.os.scandir
+
+    class _FakeEntry:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.path = str(build_dir / name)
+
+        def is_symlink(self) -> bool:
+            return False
+
+        def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+            return False
+
+        def is_file(self, *, follow_symlinks: bool = True) -> bool:
+            return True
+
+    bulk = [_FakeEntry(f"Compiled{i}.class")
+            for i in range(discovery._MAX_EXCLUDED_DIRECTORY_PEEK_ENTRIES + 10)]
+
+    def _fake_scandir(path):
+        from pathlib import Path
+        if isinstance(path, (str, Path)) and Path(path) == build_dir:
+            return bulk
+        return real_scandir(path)
+
+    monkeypatch.setattr(discovery.os, "scandir", _fake_scandir)
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    poison_problems = [
+        p for p in problems_doc["problems"] if p["reason_code"] == "externality_suppressed"]
+    assert any(p["path"] == "build" for p in poison_problems)
+
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["externality_suppressed"] is True
+    assert any(
+        r["path"] == "build" and r["trigger"] == "peek_truncated"
+        for r in scan_doc["externality_suppressed_roots"]
+    )
+
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    slf4j_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "import" and r.get("target_unresolved") == "org.slf4j.Logger")
+    assert slf4j_edge["resolution_state"] == "unresolved"
+    assert slf4j_edge.get("target_external") is None
+
 
 def test_run_scan_a_normal_repo_with_target_full_of_class_files_keeps_confident_externals(
     java_repo: Path,
@@ -3137,6 +3306,15 @@ def test_run_scan_a_normal_repo_with_target_full_of_class_files_keeps_confident_
         if r["relation"] == "import"
         and r.get("target_external") == "org.apache.commons.lang3.StringUtils")
     assert import_edge["resolution_state"] == "resolved"
+
+    # FIX ROUND 20b (THE MAJOR - poison-rule VISIBILITY): the control
+    # case must carry NO poison artifacts at all - a genuine compiled-
+    # output target/ never trips the peek, the flag, or the problem.
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["externality_suppressed"] is False
+    assert scan_doc["externality_suppressed_roots"] == []
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    assert not any(p["reason_code"] == "externality_suppressed" for p in problems_doc["problems"])
 
 
 def test_run_scan_an_import_into_an_excluded_generated_dir_is_unresolved_not_deleted(

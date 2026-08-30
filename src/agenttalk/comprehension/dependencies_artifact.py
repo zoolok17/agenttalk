@@ -408,6 +408,26 @@ def _degraded_java_suffix_match(qualified_name: str, degraded_paths: frozenset[s
     return any(path == suffix or path.endswith("/" + suffix) for path in degraded_paths)
 
 
+#: FIX ROUND 20b (seventeenth-round dispatch, THE ASK - taken): the
+#: platform reserves these three top-level namespaces (the JLS for
+#: ``java.*``, the servlet/EE and Jakarta EE specs for ``javax.*``/
+#: ``jakarta.*``) - a vendored or excluded region inside a repo this run
+#: scanned structurally CANNOT contain a legitimate declaration under any
+#: of them, the same positive-grounds reasoning ``_JAVA_LANG_SIMPLE_
+#: NAMES`` already applies to the bare-simple-name case. The poison rule
+#: (``_classify_registry_miss``/the wildcard-import branch below) is
+#: deliberately blunt and run-wide by design - but blunt should still stop
+#: at a boundary the language itself guarantees, rather than also
+#: suppressing the one class of import a poisoned run can ALWAYS resolve
+#: with total confidence regardless of what any excluded region turned
+#: out to hold.
+_PLATFORM_RESERVED_NAMESPACE_PREFIXES = ("java.", "javax.", "jakarta.")
+
+
+def _is_platform_reserved_namespace(qualified_name: str) -> bool:
+    return any(qualified_name.startswith(prefix) for prefix in _PLATFORM_RESERVED_NAMESPACE_PREFIXES)
+
+
 def _classify_registry_miss(
     qualified_name: str, *, duplicate_qualified_names: set[str],
     unit_ids_by_qualified_name: dict[str, list[str]], degraded_paths: frozenset[str],
@@ -471,14 +491,22 @@ def _classify_registry_miss(
     even suspected of holding first-party source. ``_degraded_java_
     suffix_match`` above is UNCHANGED (kept - it answers a different,
     EXACT question: a specific file this run tried and failed to read,
-    never a containment guess)."""
+    never a containment guess).
+
+    FIX ROUND 20b (seventeenth-round dispatch, THE ASK - taken): a
+    poisoned run still resolves a target under one of ``java.*``/
+    ``javax.*``/``jakarta.*`` as EXTERNAL - the platform reserves those
+    namespaces, so no excluded region this run swallowed could ever
+    legitimately contain one (see ``_is_platform_reserved_namespace``'s
+    own docstring). Checked LAST, after every OTHER positive-grounds
+    exclusion above still applies unchanged."""
     if "${" in qualified_name:
         return "unresolved", None
     if qualified_name in duplicate_qualified_names:
         return "ambiguous", sorted(unit_ids_by_qualified_name.get(qualified_name, []))
     if _degraded_java_suffix_match(qualified_name, degraded_paths):
         return "unresolved", None
-    if externality_poisoned:
+    if externality_poisoned and not _is_platform_reserved_namespace(qualified_name):
         return "unresolved", None
     return "external", None
 
@@ -848,7 +876,11 @@ def _edge_claim_to_record(
         package_prefix = edge.target[:-2]
         if package_prefix in in_scan_packages:
             resolution_state, target_unresolved = "unresolved", edge.target
-        elif externality_poisoned:
+        elif externality_poisoned and not _is_platform_reserved_namespace(package_prefix):
+            # FIX ROUND 20b (THE ASK - taken): same reserved-namespace
+            # exemption as _classify_registry_miss - a wildcard import of
+            # java.*/javax.*/jakarta.* still resolves external under
+            # poison.
             resolution_state, target_unresolved = "unresolved", edge.target
         else:
             resolution_state, target_external = "resolved", edge.target
