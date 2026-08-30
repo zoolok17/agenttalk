@@ -404,7 +404,23 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
             continue
         if adapter is not None:
             try:
-                text = data.decode("utf-8", errors="replace")
+                # FIX ROUND 20 (sixteenth cold read, B1 BLOCKER, wrong-
+                # data): a UTF-8 BOM on a .java file (ordinary Windows-
+                # tooling output, a legal javac input, pervasive in
+                # legacy estates) is not whitespace - plain "utf-8"
+                # decoding left it as the file's own leading character,
+                # defeating _PACKAGE_RE's own `^\s*package` anchor. The
+                # unit then published a WRONG qualified name (the bare
+                # simple name, package lost entirely), a wrong unit_id,
+                # and every importer of the real type published a
+                # confident EXTERNAL claim for genuine in-repo source -
+                # a complete, zero-problem run. "utf-8-sig" strips a
+                # leading BOM when present and is byte-identical to
+                # plain "utf-8" when absent - applied at every one of
+                # this worker's own decode sites (.java/pom.xml/web.xml/
+                # the xml-root sniff) so every consumer inherits the fix
+                # from one mechanism, never a second copy to drift.
+                text = data.decode("utf-8-sig", errors="replace")
                 result = adapter.parse_java_source(rel, text)
             except Exception as exc:  # noqa: BLE001 - a producer bug must degrade, never abort the scan
                 problems.append(WorkerProblem(
@@ -468,7 +484,7 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
             # claim uses, wrapped as a JavaFileResult with no units/entry
             # points of its own.
             try:
-                text = data.decode("utf-8", errors="replace")
+                text = data.decode("utf-8-sig", errors="replace")
                 pom_units, build_edges, profile_scoped_dependency_count = (
                     java_adapter.parse_maven_pom(rel, text))
             except Exception as exc:  # noqa: BLE001 - a producer bug must degrade, never abort the scan
@@ -506,7 +522,7 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
             # it, is what that decision calls for. Same already-read-bytes
             # / same java_results channel as pom.xml's build edges.
             try:
-                text = data.decode("utf-8", errors="replace")
+                text = data.decode("utf-8-sig", errors="replace")
                 web_entry_points = java_adapter.parse_web_xml(rel, text)
             except Exception as exc:  # noqa: BLE001 - a producer bug must degrade, never abort the scan
                 problems.append(WorkerProblem(
@@ -529,7 +545,7 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
             # inverted allowlist's whole point.
             if rel_lower.endswith(".xml") and rel_name_lower not in _ADAPTER_HANDLED_XML_BASENAMES:
                 root_element = java_adapter.sniff_xml_root_element(
-                    data.decode("utf-8", errors="replace"))
+                    data.decode("utf-8-sig", errors="replace"))
                 if root_element is None:
                     degrades_run = False
                     detail = (

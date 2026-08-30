@@ -73,6 +73,27 @@ def test_process_paths_claims_every_file_with_its_size(tmp_path: Path) -> None:
     assert result.problems == []
 
 
+def test_process_paths_a_bom_prefixed_java_file_still_extracts_its_real_qualified_name(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 20 (sixteenth cold read, B1 BLOCKER, wrong-data): mirrors
+    the reader's own .cr16-h shape - a UTF-8 BOM on a .java file
+    (ordinary Windows-tooling output, a legal javac input, pervasive in
+    legacy estates) is not whitespace, so plain "utf-8" decoding left it
+    as the file's own leading character, defeating _PACKAGE_RE's
+    ``^\\s*package`` anchor - the unit published a WRONG qualified name
+    (the bare simple name, package lost entirely). "utf-8-sig" strips
+    the BOM; the package must now be recovered correctly, CRLF line
+    endings notwithstanding."""
+    (tmp_path / "Foo.java").write_bytes(
+        ("﻿" + "package p;\r\nclass Foo {}\r\n").encode("utf-8"))
+    result = worker.process_paths(tmp_path, ["Foo.java"])
+    assert result.problems == []
+    units = result.java_results["Foo.java"]["units"]
+    assert len(units) == 1
+    assert units[0]["qualified_name"] == "p.Foo"
+
+
 def test_process_paths_reports_a_traversal_path_as_a_problem_not_a_crash(
     tmp_path: Path,
 ) -> None:

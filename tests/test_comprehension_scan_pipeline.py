@@ -1379,6 +1379,36 @@ def test_run_scan_a_utf16_java_file_degrades_instead_of_silently_vanishing(
     assert legacy_problems[0]["reason_code"] == "binary_excluded_code_bearing_file"
 
 
+def test_run_scan_a_bom_prefixed_java_file_lets_an_importer_resolve_internal(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 20 (sixteenth cold read, B1 BLOCKER, wrong-data): mirrors
+    the reader's own .cr16-h pair, end to end - a UTF-8-BOM-prefixed
+    .java file (CRLF line endings too) used to publish a WRONG qualified
+    name (the bare simple name, its package lost to the BOM defeating
+    _PACKAGE_RE's own anchor), so an importer of the real type published
+    a confident EXTERNAL claim for genuine in-repo source. Must now
+    resolve the real package and let an importer resolve INTERNAL."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "p" / "Legacy.java").write_bytes(
+        ("﻿" + "package p;\r\nclass Legacy {}\r\n").encode("utf-8"))
+    (java_repo / "src" / "main" / "java" / "p" / "Consumer.java").write_text(
+        "package p;\nimport p.Legacy;\nclass Consumer {}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+
+    assert any(u.get("qualified_name") == "p.Legacy" for u in modules_doc["units"])
+    legacy_unit_id = next(
+        u["unit_id"] for u in modules_doc["units"] if u.get("qualified_name") == "p.Legacy")
+    import_edge = next(r for r in dependencies_doc["edges"] if r["relation"] == "import")
+    assert import_edge["resolution_state"] == "resolved"
+    assert import_edge.get("target_external") is None
+    assert import_edge.get("target_unit_id") == legacy_unit_id
+
+
 def test_run_scan_a_genuinely_binary_file_still_stays_silent(java_repo: Path) -> None:
     """Companion negative case - a genuinely binary file (an extension
     on neither the adapter-handled nor the tier-2 code-bearing list)
