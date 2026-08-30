@@ -228,7 +228,24 @@ def _excluded_directory_contains_a_code_bearing_file(directory: Path) -> tuple[b
     what a symlink points to; skipping it (still the right, safe choice
     - this peek never follows symlinks) now marks the peek
     ``truncated`` the same way running out of the entry cap does,
-    rather than silently counting as "confidently no code"."""
+    rather than silently counting as "confidently no code".
+
+    FIX ROUND 21 (seventeenth cold read, CR17-5 MAJOR, completeness -
+    calibration, CRITICAL for the exit-gate measurement): a code-bearing
+    file sitting under a RECOGNIZED GENERATED-OUTPUT position inside the
+    excluded root (``target/generated-sources``, ``target/generated-
+    test-sources``, ``build/generated`` - MapStruct/Lombok/JPA-
+    metamodel/protobuf-generated ``.java``, ubiquitous in any ordinary
+    compiled Maven/Gradle repo) is EXPECTED, build-tool-authored output,
+    indistinguishable to a bare extension check from vendored first-
+    party source - poisoning round 20's own POISON RULE on the single
+    MOST COMMON repo state (any compiled repo at all) rather than the
+    genuinely suspicious shapes it exists to catch. Exempted by POSITION
+    specifically (never by excluded-root NAME, and never the root as a
+    whole) - a ``.java`` sitting anywhere ELSE inside the same excluded
+    root (a vendored reactor module under ``target/``, a stray hand-
+    written file) still counts as evidence and still poisons, exactly
+    as before this round."""
     visited = 0
     symlink_skipped = False
     stack = [directory]
@@ -251,10 +268,35 @@ def _excluded_directory_contains_a_code_bearing_file(directory: Path) -> tuple[b
                 elif entry.is_file(follow_symlinks=False) and entry.name.lower().endswith(
                     tuple(_DEGRADABLE_EXCLUDED_EXTENSIONS),
                 ):
+                    relative_to_excluded_root = Path(entry.path).relative_to(
+                        directory).as_posix()
+                    if _sits_under_a_recognized_generated_output_position(
+                        relative_to_excluded_root,
+                    ):
+                        continue
                     return True, False
             except OSError:
                 continue
     return False, symlink_skipped
+
+
+#: FIX ROUND 21 (seventeenth cold read, CR17-5 MAJOR, completeness -
+#: calibration): CLOSED, PROVISIONAL list of recognized generated-output
+#: positions - documented like tier 2 (worker.py's own extension sets),
+#: not chasing exhaustiveness. Anchored to the START of the path
+#: relative to the excluded root itself (the excluded root IS ``target``/
+#: ``build`` by construction - discovery only ever peeks inside a
+#: ``generated_or_vendor``-category root), never a mid-path search - a
+#: coincidentally-named ``generated`` directory living somewhere ELSE
+#: inside an excluded tree (e.g. ``target/some-vendor-lib/generated/``)
+#: is NOT this recognized position and still counts as evidence.
+_RECOGNIZED_GENERATED_OUTPUT_POSITIONS = (
+    "generated-sources/", "generated-test-sources/", "generated/",
+)
+
+
+def _sits_under_a_recognized_generated_output_position(relative_to_excluded_root: str) -> bool:
+    return relative_to_excluded_root.startswith(_RECOGNIZED_GENERATED_OUTPUT_POSITIONS)
 
 
 _SECRET_FILE_PATTERNS = (

@@ -226,7 +226,19 @@ def test_enumerate_scope_a_real_repo_root_build_output_dir_stays_silent(
     extension - a target/ full of annotation-processor-GENERATED
     .java is the classic, ordinary Maven case; a blanket degrading rule
     would re-degrade every normal Maven repo, the exact regression
-    round 16b's own B4 calibration already fixed once for tier 2."""
+    round 16b's own B4 calibration already fixed once for tier 2.
+
+    FIX ROUND 21 (seventeenth cold read, CR17-5 MAJOR, completeness -
+    calibration): this fixture's own ``target/generated-sources/`` is
+    now the EXACT recognized generated-output position CR17-5 exempts -
+    the poison rule no longer fires either, not just F4's own
+    degradation boundary. Before this round, EVERY compiled Maven repo
+    (MapStruct/Lombok/JPA-metamodel/protobuf-generated .java is
+    ubiquitous under this exact path) poisoned its own entire
+    externality surface - the single most common repo state. See the
+    companion test below for the position that still poisons (a
+    code-bearing file sitting anywhere ELSE inside the same excluded
+    root)."""
     target_dir = tmp_path / "target" / "generated-sources"
     target_dir.mkdir(parents=True)
     (target_dir / "Generated.java").write_text("package p;\nclass Generated {}\n", encoding="utf-8")
@@ -241,14 +253,29 @@ def test_enumerate_scope_a_real_repo_root_build_output_dir_stays_silent(
     )
     assert result.degraded is False
     assert not any(p["reason_code"] == "excluded_region_contains_code" for p in result.problems)
-    # FIX ROUND 20 (sixteenth cold read, M1+M2 MAJOR, wrong-data - the
-    # POISON RULE): the peek now runs for EVERY generated/vendor
-    # exclusion, not just ones under an uncarved src ancestor - so this
-    # SAME repo-root target/ (genuinely code-containing) DOES poison
-    # confident externality run-wide, even though F4's OWN narrow
-    # degradation boundary correctly stays unaffected (degraded is still
-    # False, asserted above) - two separate consumers of one peek.
+    assert result.excluded_region_may_contain_target is False
+    assert result.poisoning_excluded_roots == []
+
+
+def test_enumerate_scope_a_code_bearing_file_outside_the_generated_position_still_poisons(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 21 (CR17-5 MAJOR): the exemption is by POSITION, never
+    by the excluded root's own name or the root as a whole - a .java
+    sitting directly under ``target/`` (NOT inside ``generated-
+    sources/``/``generated-test-sources/``) is exactly the vendored-
+    module/stray-src-build shape the poison rule exists to catch, and
+    must still poison, unchanged."""
+    target_dir = tmp_path / "target" / "some-vendor-module"
+    target_dir.mkdir(parents=True)
+    (target_dir / "Vendored.java").write_text(
+        "package p;\nclass Vendored {}\n", encoding="utf-8")
+    comp_dir = _comprehension_dir(tmp_path)
+
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+
     assert result.excluded_region_may_contain_target is True
+    assert any(r["path"] == "target" for r in result.poisoning_excluded_roots)
 
 
 def test_enumerate_scope_a_vendor_dir_with_real_code_poisons_without_degrading(

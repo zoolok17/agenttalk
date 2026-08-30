@@ -3414,6 +3414,45 @@ def test_run_scan_a_normal_repo_with_target_full_of_class_files_keeps_confident_
     assert not any(p["reason_code"] == "externality_suppressed" for p in problems_doc["problems"])
 
 
+def test_run_scan_a_compiled_repo_with_generated_sources_keeps_confident_externals(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 21 (seventeenth cold read, CR17-5 MAJOR, completeness -
+    calibration, CRITICAL for the exit-gate measurement): mirrors the
+    reader's own .cr17-built shape - an ordinary COMPILED Maven repo
+    with real annotation-processor-generated .java under target/
+    generated-sources (MapStruct/Lombok/JPA-metamodel/protobuf are all
+    ubiquitous here) used to poison the ENTIRE run's externality surface
+    on this single most common repo state. The run must stay complete,
+    with precise externals, and no poison artifacts at all - the SAME
+    control the plain-.class-only test above already gets, now also
+    holding when target/ additionally contains real generated .java."""
+    import json
+
+    generated_dir = java_repo / "target" / "generated-sources" / "annotations" / "p"
+    generated_dir.mkdir(parents=True)
+    (generated_dir / "ConsumerMapperImpl.java").write_text(
+        "package p;\nclass ConsumerMapperImpl {}\n", encoding="utf-8")
+    (java_repo / "src" / "main" / "java" / "p" / "Consumer.java").write_text(
+        "package p;\nimport org.apache.commons.lang3.StringUtils;\nclass Consumer {}\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    import_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "import"
+        and r.get("target_external") == "org.apache.commons.lang3.StringUtils")
+    assert import_edge["resolution_state"] == "resolved"
+
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["externality_suppressed"] is False
+    assert scan_doc["externality_suppressed_roots"] == []
+
+
 def test_run_scan_an_import_into_an_excluded_generated_dir_is_unresolved_not_deleted(
     java_repo: Path,
 ) -> None:
