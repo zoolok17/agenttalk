@@ -135,6 +135,55 @@ def test_source_understood_unknown_when_the_adapter_failed_to_parse():
     assert summaries[0].stored_assessment_state == "needs_evidence"
 
 
+def test_dependencies_resolved_and_entry_points_mapped_also_unknown_when_parse_failed():
+    """FIX ROUND 16 (twelfth cold read, M2 MAJOR, wrong-data): a parse-
+    failed unit used to report dependencies_resolved satisfied/
+    no_declared_dependencies and entry_points_mapped not_applicable/
+    no_entry_point - both confidently derived from the necessarily EMPTY
+    evidence a failed parse leaves behind (zero edges, zero features),
+    never from anything the source actually says. A reader who trusts
+    source_understood=unknown must not then find two adjacent checks on
+    the SAME unit confidently answered from a parsed prefix that never
+    existed - both must be unknown too, for the identical reason."""
+    signals, summaries = ra.build_readiness(
+        [_unit(
+            "u1", language="java", adapter_problem_reason="parse_failed",
+            adapter_problem_reasons=["parse_failed"],
+        )], [], [])
+    dependencies_signal = _signal_by_check(signals, "dependencies_resolved")
+    assert dependencies_signal.stored_status == "unknown"
+    assert dependencies_signal.reason_code == "adapter_parse_failed"
+    entry_points_signal = _signal_by_check(signals, "entry_points_mapped")
+    assert entry_points_signal.stored_status == "unknown"
+    # entry_points_mapped's own dispatch (unlike dependencies_resolved's)
+    # publishes the bare reason code, matching its existing
+    # cli_main_unrecognized convention - never "adapter_"-prefixed.
+    assert entry_points_signal.reason_code == "parse_failed"
+    assert summaries[0].stored_assessment_state == "needs_evidence"
+
+
+def test_file_unit_dependencies_resolved_unknown_not_not_applicable_when_parse_failed():
+    """FIX ROUND 16 (M2 MAJOR): the FILE-kind path
+    (_check_dependencies_resolved_for_file) has its OWN early return for
+    "no contained units and no direct edges" - not_applicable, a claim
+    that "dependencies" does not meaningfully apply here. That claim is
+    not independently knowable when the parse that would have found any
+    contained units or edges never completed - a parse-failed file with
+    zero of either must report unknown, never the confident not_
+    applicable a genuinely typeless (but successfully parsed) file
+    earns."""
+    from dataclasses import replace
+    file_unit = _unit(
+        "u-file", language="java", adapter_problem_reason="parse_failed",
+        adapter_problem_reasons=["parse_failed"],
+    )
+    file_unit = replace(file_unit, kind="file")
+    signals, _ = ra.build_readiness([file_unit], [], [])
+    signal = _signal_by_check(signals, "dependencies_resolved")
+    assert signal.stored_status == "unknown"
+    assert signal.reason_code == "adapter_parse_failed"
+
+
 def test_source_understood_unknown_when_the_file_is_an_unsupported_language():
     """FIX ROUND 14 (tenth cold read, CR10-5 JUDGE, completeness): a
     recognized-but-unsupported source shape (JSP/properties/Spring-XML/

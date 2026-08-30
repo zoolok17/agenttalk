@@ -177,13 +177,28 @@ def _signal(unit_id: str, check: str, stored_status: str, basis: str, reason_cod
 #: system (a discovery-level problem, a pipeline-level refusal, ...).
 #: Its closed vocabulary is exactly modules_artifact.ModuleRecord's own
 #: ``adapter_problem_reasons`` contract, nothing wider.
+#: FIX ROUND 16 (twelfth cold read, M2 MAJOR, wrong-data): every reason
+#: meaning "this file's content itself could not be confidently
+#: processed" used to feed ONLY source_understood - dependencies_resolved
+#: and entry_points_mapped kept computing their own confident answer from
+#: whatever (necessarily empty, since nothing ever looked) evidence
+#: existed, publishing a wrong confident positive/negative rather than
+#: honestly propagating the SAME evidence gap. Widened to feed all three
+#: - a reader who trusts source_understood=unknown must not then find
+#: two adjacent checks on the identical unit confidently answered from a
+#: parsed prefix that never actually existed. ``route_annotation_
+#: unassociated``/``route_value_unrecoverable``/``cli_main_unrecognized``
+#: stay narrowly scoped (unchanged) - each is a fact about ONE already-
+#: understood construct within a file the adapter DID successfully
+#: parse, never a whole-file evidence gap.
 _READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
-    "parse_failed": frozenset({"source_understood"}),
-    "path_excluded": frozenset({"source_understood"}),
-    "resource_limit": frozenset({"source_understood"}),
-    "non_utf8_path": frozenset({"source_understood"}),
-    "case_collision": frozenset({"source_understood"}),
-    "no_types_extracted": frozenset({"source_understood"}),
+    "parse_failed": frozenset({"source_understood", "dependencies_resolved", "entry_points_mapped"}),
+    "path_excluded": frozenset({"source_understood", "dependencies_resolved", "entry_points_mapped"}),
+    "resource_limit": frozenset({"source_understood", "dependencies_resolved", "entry_points_mapped"}),
+    "non_utf8_path": frozenset({"source_understood", "dependencies_resolved", "entry_points_mapped"}),
+    "case_collision": frozenset({"source_understood", "dependencies_resolved", "entry_points_mapped"}),
+    "no_types_extracted": frozenset({
+        "source_understood", "dependencies_resolved", "entry_points_mapped"}),
     "route_annotation_unassociated": frozenset(),
     "route_value_unrecoverable": frozenset(),
     "cli_main_unrecognized": frozenset({"entry_points_mapped"}),
@@ -191,7 +206,8 @@ _READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
     # recognized-but-unsupported source language (worker.py) is exactly
     # "this file's content itself could not be confidently processed" -
     # the same bucket parse_failed/no_types_extracted already feed.
-    "unsupported_language": frozenset({"source_understood"}),
+    "unsupported_language": frozenset({
+        "source_understood", "dependencies_resolved", "entry_points_mapped"}),
 }
 
 
@@ -273,6 +289,20 @@ _AMBIGUOUS_DEPENDENCY_EXCLUDED_RELATIONS = frozenset({"test"})
 
 
 def _check_dependencies_resolved(unit: ModuleRecord, outgoing: list[DependencyRecord]) -> ReadinessSignal:
+    # FIX ROUND 16 (twelfth cold read, M2 MAJOR, wrong-data): mirrors
+    # _check_source_understood's own "no positive claim without positive
+    # evidence" discipline - a file the adapter never successfully read
+    # or parsed (or degraded away entirely) has ZERO real edges to
+    # examine below not because it genuinely declares no dependencies,
+    # but because nothing ever looked. A confident satisfied/
+    # no_declared_dependencies over an EVIDENCE GAP is exactly the
+    # un-evidenced positive this check exists to avoid.
+    understanding_reasons = _reasons_feeding("dependencies_resolved", unit.adapter_problem_reasons)
+    if understanding_reasons:
+        return _signal(
+            unit.unit_id, "dependencies_resolved", "unknown", "detected",
+            f"adapter_{understanding_reasons[0]}",
+        )
     relevant = [edge for edge in outgoing if edge.relation in _DEPENDENCY_RESOLUTION_RELATIONS]
     any_ambiguous = any(
         edge.resolution_state == "ambiguous"
@@ -352,7 +382,24 @@ def _check_dependencies_resolved_for_file(
     own (a plain non-code file, or one the adapter never understood) is
     ``not_applicable`` - the concept of "dependencies" does not
     meaningfully apply to it, so a confident positive would be exactly
-    the un-evidenced satisfied this check exists to avoid."""
+    the un-evidenced satisfied this check exists to avoid.
+
+    FIX ROUND 16 (twelfth cold read, M2 MAJOR, wrong-data): a parse-
+    failed (or otherwise adapter-never-ran) file has NO contained units
+    and NO direct outgoing edges for the exact same "nothing ever
+    looked" reason a healthy, genuinely typeless file does - the two
+    were indistinguishable here, so the confident not_applicable/
+    no_contained_units default below used to cover BOTH, an
+    un-evidenced claim exactly like the satisfied one this check
+    already guards against elsewhere. Checked FIRST, unconditionally -
+    "no contained units" is not independently knowable when the parse
+    that would have found them never completed."""
+    understanding_reasons = _reasons_feeding("dependencies_resolved", unit.adapter_problem_reasons)
+    if understanding_reasons:
+        return _signal(
+            unit.unit_id, "dependencies_resolved", "unknown", "detected",
+            f"adapter_{understanding_reasons[0]}",
+        )
     if not contained_unit_ids and not direct_outgoing:
         return _signal(
             unit.unit_id, "dependencies_resolved", "not_applicable", "detected", "no_contained_units")
