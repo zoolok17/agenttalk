@@ -937,7 +937,13 @@ def test_run_scan_a_same_package_no_import_test_reference_stays_unknown_never_sa
         if s["unit_id"] == widget_unit["unit_id"] and s["check"] == "test_evidence_located"
     )
     assert test_evidence["stored_status"] == "unknown"
-    assert test_evidence["reason_code"] == "no_test_evidence_found"
+    # FIX ROUND 17 (thirteenth cold read, CR13-7 MINOR): the inferred
+    # test-pairing edge above IS something this run found - the more
+    # precise "insufficient_test_evidence" reason names that a pairing
+    # was located but is not enough alone, distinct from
+    # "no_test_evidence_found" (nothing at all). The (b)-pin itself is
+    # about the STATUS staying unknown, unaffected by this wording split.
+    assert test_evidence["reason_code"] == "insufficient_test_evidence"
 
 
 def test_run_scan_unrecognized_main_like_shape_reports_entry_points_mapped_unknown(

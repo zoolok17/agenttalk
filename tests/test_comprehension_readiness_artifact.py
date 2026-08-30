@@ -570,6 +570,40 @@ def test_test_evidence_located_unaffected_by_an_ordinary_production_to_productio
     assert signal.stored_status == "unknown"
 
 
+def test_test_evidence_located_reason_code_names_an_inferred_pairing_when_one_exists():
+    """FIX ROUND 17 (thirteenth cold read, CR13-7 MINOR): "no_test_
+    evidence_found" is a FALSE statement when this run's own
+    dependencies.json already holds an inferred test-pairing edge naming
+    this unit - it read SOMETHING, just not enough. Split by what was
+    actually found: insufficient_test_evidence (an inferred-only pairing
+    exists) vs no_test_evidence_found (nothing at all). stored_status
+    stays unknown either way."""
+    edges = [_edge(
+        "test-unit", relation="test", resolution_state="resolved", target_unit_id="prod-unit",
+        evidence_class="inferred")]
+    modules = [
+        _unit("test-unit", classification="test"),
+        _unit("prod-unit", classification="production"),
+    ]
+    signals, _ = ra.build_readiness(modules, edges, [])
+    signal = next(
+        s for s in signals if s.unit_id == "prod-unit" and s.check == "test_evidence_located")
+    assert signal.stored_status == "unknown"
+    assert signal.reason_code == "insufficient_test_evidence"
+
+
+def test_test_evidence_located_reason_code_is_no_test_evidence_found_with_nothing_at_all():
+    """Companion negative case: a production unit named by NO test-
+    relation edge at all (not even an inferred one) keeps the ORIGINAL
+    no_test_evidence_found spelling - "we looked, found nothing," a
+    materially different, weaker claim than "found an inferred pairing
+    but not enough"."""
+    signals, _ = ra.build_readiness([_unit("prod-unit", classification="production")], [], [])
+    signal = _signal_by_check(signals, "test_evidence_located")
+    assert signal.stored_status == "unknown"
+    assert signal.reason_code == "no_test_evidence_found"
+
+
 def test_test_evidence_located_stays_unknown_for_an_inferred_convention_only_pairing():
     """FIX ROUND 15 (eleventh cold read, F4 MAJOR, wrong-data, cr11-fx4
     verbatim): the name-derived test pairing (strip Test/Tests/IT,

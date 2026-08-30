@@ -509,7 +509,9 @@ def _check_feature_linked(unit: ModuleRecord, feature_states: list[str]) -> Read
     return _signal(unit.unit_id, "feature_linked", "unknown", "detected", "feature_not_confirmed")
 
 
-def _check_test_evidence_located(unit: ModuleRecord, is_tested: bool) -> ReadinessSignal:
+def _check_test_evidence_located(
+    unit: ModuleRecord, is_tested: bool, has_inferred_pairing: bool,
+) -> ReadinessSignal:
     # FIX ROUND 14 (tenth cold read, CR10-7 MINOR, wrong-data - the
     # tautology half): a unit classified "test" used to satisfy THIS
     # check about ITSELF, which is meaningless - "test evidence located"
@@ -524,6 +526,19 @@ def _check_test_evidence_located(unit: ModuleRecord, is_tested: bool) -> Readine
     if is_tested:
         return _signal(
             unit.unit_id, "test_evidence_located", "satisfied", "detected", "test_evidence_located")
+    # FIX ROUND 17 (thirteenth cold read, CR13-7 MINOR): "no_test_evidence_
+    # found" is a FALSE statement when this run's own dependencies.json
+    # already holds a test-relation pairing naming this unit - it read
+    # SOMETHING, just not enough to satisfy this check (the inferred
+    # name-pairing guess alone, round 15's own fx4 shape, with no
+    # corroborating extracted/declared invoke/import reference). Split
+    # by what was actually found, wording only - the stored_status stays
+    # unknown either way, the 16b (b)-pin (same-package-no-import stays
+    # unknown, never satisfied via the inferred edge alone) is unaffected.
+    if has_inferred_pairing:
+        return _signal(
+            unit.unit_id, "test_evidence_located", "unknown", "detected",
+            "insufficient_test_evidence")
     return _signal(unit.unit_id, "test_evidence_located", "unknown", "detected", "no_test_evidence_found")
 
 
@@ -615,6 +630,21 @@ def build_readiness(
         and edge.from_unit_id in test_unit_ids
     }
 
+    # FIX ROUND 17 (thirteenth cold read, CR13-7 MINOR): every unit named
+    # by a "test" relation edge at all, regardless of evidence_class -
+    # since the only test-edge producer emits "inferred" and a real
+    # extracted/declared one would already be in tested_unit_ids above
+    # (making is_tested True, the check below never reached), reaching
+    # this set with is_tested False means the edge that names this unit
+    # IS the inferred-only pairing - "we looked, found a name-derived
+    # guess, just not enough to satisfy the check" is a materially
+    # different, more honest statement than "no_test_evidence_found"'s
+    # own "we looked and found nothing at all."
+    inferred_test_pairing_unit_ids = {
+        edge.target_unit_id for edge in dependencies
+        if edge.relation == "test" and edge.target_unit_id is not None
+    }
+
     entry_point_owner_ids = {
         unit_id for feature in features for unit_id in feature.unit_ids
     }
@@ -659,14 +689,19 @@ def build_readiness(
         # fact up to its owning file" idiom CR10-1's dependencies_signal
         # already established for this exact unit/file relationship.
         is_tested = unit.unit_id in tested_unit_ids
-        if unit.kind == "file" and not is_tested:
-            is_tested = bool(tested_unit_ids & _transitive_descendants(unit.unit_id))
+        has_inferred_pairing = unit.unit_id in inferred_test_pairing_unit_ids
+        if unit.kind == "file":
+            descendants = _transitive_descendants(unit.unit_id)
+            if not is_tested:
+                is_tested = bool(tested_unit_ids & descendants)
+            if not has_inferred_pairing:
+                has_inferred_pairing = bool(inferred_test_pairing_unit_ids & descendants)
         unit_signals = [
             _check_source_understood(unit),
             dependencies_signal,
             _check_entry_points_mapped(unit, unit.unit_id in entry_point_owner_ids),
             _check_feature_linked(unit, feature_states_by_unit.get(unit.unit_id, [])),
-            _check_test_evidence_located(unit, is_tested),
+            _check_test_evidence_located(unit, is_tested, has_inferred_pairing),
             _check_boundaries_identified(unit),
         ]
         all_signals.extend(unit_signals)
