@@ -134,6 +134,37 @@ def _entry_points_by_kind(entry_points: list[EntryPointRecord]) -> dict[str, int
     return dict(sorted(by_kind.items()))
 
 
+def _feature_unit_ids_including_owning_files(
+    features: list[FeatureRecord], modules: list[ModuleRecord],
+) -> set[str]:
+    """FIX ROUND 22 (eighteenth cold read, F1 MAJOR, wrong-data): a
+    feature's own ``unit_ids`` name the COMPONENT that implements it
+    (``features_artifact.build_features`` attaches to the component
+    whenever its qualified name resolves - the common case for any
+    real, in-repo class - never the file), so ``units_without_feature``
+    named the very FILE that implements one of this run's own detected
+    features - contradicting ``readiness.json``'s own (this same
+    round's) ``feature_linked`` mirroring, which now correctly reports
+    that file as satisfied. Walks up through nested-type containment
+    (a nested type's own container is its outer type, never the file
+    directly) from every feature-owning unit, adding each ancestor -
+    every intermediate nested-type container and, eventually, the
+    owning file itself - to the covered set too: the same "roll a
+    per-type fact up to its owning file" idiom readiness_artifact.py's
+    own F1 fix just established for entry_points_mapped/feature_linked."""
+    module_by_id = {m.unit_id: m for m in modules}
+    covered = {u for f in features for u in f.unit_ids}
+    for unit_id in list(covered):
+        current = module_by_id.get(unit_id)
+        while current is not None and current.container_unit_id is not None:
+            parent_id = current.container_unit_id
+            if parent_id in covered:
+                break
+            covered.add(parent_id)
+            current = module_by_id.get(parent_id)
+    return covered
+
+
 def _fan_counts(dependencies: list[DependencyRecord]) -> tuple[dict[str, int], dict[str, int]]:
     fan_out: dict[str, int] = {}
     fan_in: dict[str, int] = {}
@@ -343,7 +374,7 @@ def project_comprehension(
             or p.get("qualified_name") in allowed_qualified_names
         ]
 
-    all_feature_unit_ids = {u for f in features for u in f.unit_ids}
+    all_feature_unit_ids = _feature_unit_ids_including_owning_files(features, modules)
     units_without_feature = [m.unit_id for m in modules if m.unit_id not in all_feature_unit_ids]
     unmapped_entry_points = [e.entry_point_id for e in entry_points if not e.feature_ids]
 

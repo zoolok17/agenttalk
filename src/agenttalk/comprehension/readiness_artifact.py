@@ -649,6 +649,64 @@ def _check_feature_linked(unit: ModuleRecord, feature_states: list[str]) -> Read
     return _signal(unit.unit_id, "feature_linked", "unknown", "detected", "feature_not_confirmed")
 
 
+def _aggregate_file_signal_from_components(
+    unit: ModuleRecord, check: str, component_signals: list[ReadinessSignal],
+) -> ReadinessSignal:
+    """FIX ROUND 22 (eighteenth cold read, F1 MAJOR, wrong-data): a
+    file's own ``entry_points_mapped``/``feature_linked`` used to be
+    computed directly from ``entry_point_owner_ids``/``feature_states_
+    by_unit`` - but ``features_artifact.build_features`` attaches an
+    entry point or feature to the COMPONENT's own unit_id whenever its
+    qualified name resolves (the common case for any real, in-repo
+    class), never the file's - so a file whose single contained class
+    genuinely serves a real, mapped entry point still reported the
+    confident negative (``not_applicable``/``no_entry_point``,
+    ``unsatisfied``/``no_feature_link``) - two contradictory published
+    facts about the identical single-type file, the exact class CR10-1
+    (``dependencies_resolved``) and round 15's own F4
+    (``test_evidence_located``) already closed for their own checks.
+
+    A single component child MIRRORS its own signal exactly - no
+    attribution ambiguity at all (there is only one real candidate).
+    Two or more component children aggregate worse-of, but NOT via one
+    linear confidence spectrum the way ``_DEPENDENCIES_RESOLVED_RANK``
+    orders its own three states: an attributed ``unknown`` anywhere
+    among the children wins outright (this file's own real evidence is
+    genuinely unresolved for at least one of its declared types - the
+    same "never MORE CONFIDENT than a component genuinely unsure of
+    itself" discipline CR17-2 already established, just generalized
+    from a two-way to an N-way comparison); failing that, a real
+    ``satisfied`` claim from ANY child wins over an unrelated sibling's
+    mere absence (a different, non-conflicting fact about a DIFFERENT
+    declared type - one class having no entry point of its own never
+    invalidates another class's real, mapped one); only when EVERY
+    child genuinely has none does the file keep its own honest absence
+    claim (``not_applicable``/``unsatisfied``, unchanged from before
+    this round) - the "genuinely entry-point-free file keeps its honest
+    negative" case. Reuses each winning component's OWN already-final
+    ``reason_code`` verbatim (never re-derived) - it is already the
+    correct, most specific citation for whichever real fact won."""
+    if len(component_signals) == 1:
+        only = component_signals[0]
+        return _signal(unit.unit_id, check, only.stored_status, only.basis, only.reason_code)
+    unknown_signals = sorted(
+        (s for s in component_signals if s.stored_status == "unknown"),
+        key=lambda s: s.reason_code,
+    )
+    if unknown_signals:
+        chosen = unknown_signals[0]
+        return _signal(unit.unit_id, check, "unknown", chosen.basis, chosen.reason_code)
+    satisfied_signals = [s for s in component_signals if s.stored_status == "satisfied"]
+    if satisfied_signals:
+        chosen = satisfied_signals[0]
+        return _signal(unit.unit_id, check, "satisfied", chosen.basis, chosen.reason_code)
+    absence_signal = next(
+        s for s in component_signals if s.stored_status not in ("unknown", "satisfied"))
+    return _signal(
+        unit.unit_id, check, absence_signal.stored_status, absence_signal.basis,
+        absence_signal.reason_code)
+
+
 def _check_test_evidence_located(
     unit: ModuleRecord, is_tested: bool, has_inferred_pairing: bool,
 ) -> ReadinessSignal:
@@ -805,6 +863,37 @@ def build_readiness(
             current = parent
         return None
 
+    # FIX ROUND 22 (eighteenth cold read, F1 MAJOR, wrong-data): computed
+    # for EVERY unit first (component and file identically, exactly as
+    # before this round), so the file-level override pass below can look
+    # up each file's own DIRECT top-level component children's ALREADY-
+    # COMPUTED verdicts - see _aggregate_file_signal_from_components.
+    entry_points_mapped_by_unit_id: dict[str, ReadinessSignal] = {
+        unit.unit_id: _check_entry_points_mapped(unit, unit.unit_id in entry_point_owner_ids)
+        for unit in modules
+    }
+    feature_linked_by_unit_id: dict[str, ReadinessSignal] = {
+        unit.unit_id: _check_feature_linked(unit, feature_states_by_unit.get(unit.unit_id, []))
+        for unit in modules
+    }
+    for unit in modules:
+        if unit.kind != "file":
+            continue
+        component_children = [
+            module_by_id[child_id] for child_id in children_by_container.get(unit.unit_id, [])
+            if module_by_id.get(child_id) is not None and module_by_id[child_id].kind == "component"
+        ]
+        if not component_children:
+            continue
+        entry_points_mapped_by_unit_id[unit.unit_id] = _aggregate_file_signal_from_components(
+            unit, "entry_points_mapped",
+            [entry_points_mapped_by_unit_id[c.unit_id] for c in component_children],
+        )
+        feature_linked_by_unit_id[unit.unit_id] = _aggregate_file_signal_from_components(
+            unit, "feature_linked",
+            [feature_linked_by_unit_id[c.unit_id] for c in component_children],
+        )
+
     all_signals: list[ReadinessSignal] = []
     summaries: list[UnitReadinessSummary] = []
 
@@ -841,8 +930,8 @@ def build_readiness(
         unit_signals = [
             _check_source_understood(unit),
             dependencies_signal,
-            _check_entry_points_mapped(unit, unit.unit_id in entry_point_owner_ids),
-            _check_feature_linked(unit, feature_states_by_unit.get(unit.unit_id, [])),
+            entry_points_mapped_by_unit_id[unit.unit_id],
+            feature_linked_by_unit_id[unit.unit_id],
             _check_test_evidence_located(unit, is_tested, has_inferred_pairing),
             _check_boundaries_identified(unit),
         ]

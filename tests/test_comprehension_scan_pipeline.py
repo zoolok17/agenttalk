@@ -267,6 +267,127 @@ def test_web_xml_listener_reason_attaches_to_its_own_java_files_unit_end_to_end(
         assert signal["reason_code"] == "unsupported_entry_point_shape", class_name
 
 
+def _readiness_signal(readiness_doc, modules_doc, *, display_name, kind, check):
+    unit_id = next(
+        u["unit_id"] for u in modules_doc["units"]
+        if u["kind"] == kind and u["display_name"] == display_name)
+    return next(
+        s for s in readiness_doc["signals"] if s["unit_id"] == unit_id and s["check"] == check)
+
+
+def test_a_single_type_files_own_unit_mirrors_its_components_entry_point_signals(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 22 (eighteenth cold read, F1 MAJOR, wrong-data): the
+    reader's own .cr18-jee shape - a file's own entry_points_mapped/
+    feature_linked used to be computed straight from entry_point_
+    owner_ids/feature_states_by_unit, which build_features attaches to
+    the COMPONENT's own unit_id whenever its qualified name resolves
+    (the common case) - never the file's. A single-type file's own
+    FILE-kind unit therefore published the confident negative
+    (not_applicable/no_entry_point, unsatisfied/no_feature_link) even
+    though its one contained class genuinely serves a real, mapped
+    entry point in the SAME run - two contradictory published facts
+    about the identical file. Now the file mirrors its one component's
+    verdict exactly, for BOTH a served route (OrderServlet, kind
+    http_route) and an interception-only filter (AuditFilter, kind
+    http_filter - round 21b's own distinct kind)."""
+    import json
+
+    pkg_dir = java_repo / "src" / "main" / "java" / "p"
+    (pkg_dir / "OrderServlet.java").write_text(
+        'package p;\n@WebServlet("/orders")\npublic class OrderServlet '
+        'extends HttpServlet {}\n',
+        encoding="utf-8",
+    )
+    (pkg_dir / "AuditFilter.java").write_text(
+        'package p;\n@WebFilter(urlPatterns = {"/audit/*"})\n'
+        "public class AuditFilter implements Filter {}\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+
+    for class_name in ("OrderServlet", "AuditFilter"):
+        component_signal = _readiness_signal(
+            readiness_doc, modules_doc, display_name=class_name, kind="component",
+            check="entry_points_mapped")
+        file_signal = _readiness_signal(
+            readiness_doc, modules_doc, display_name=f"{class_name}.java", kind="file",
+            check="entry_points_mapped")
+        assert component_signal["stored_status"] == "satisfied", class_name
+        assert file_signal["stored_status"] == "satisfied", class_name
+        assert file_signal["reason_code"] == component_signal["reason_code"], class_name
+
+    projection = scan_pipeline.get_report(java_repo)
+    units_without_feature_ids = set(projection.get("units_without_feature", []))
+    for class_name in ("OrderServlet", "AuditFilter"):
+        file_unit_id = next(
+            u["unit_id"] for u in modules_doc["units"]
+            if u["kind"] == "file" and u["display_name"] == f"{class_name}.java")
+        assert file_unit_id not in units_without_feature_ids, class_name
+
+
+def test_a_multi_type_files_own_unit_never_reports_more_confident_than_its_worst_component(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 22 (F1 MAJOR): a multi-type file aggregates worse-of
+    across its own direct top-level components - a real satisfied claim
+    from one class (a served route) wins over an unrelated sibling's
+    mere absence of one (a plain helper class), since the two are
+    different, non-conflicting facts about different declared types."""
+    import json
+
+    source = (
+        "package p;\n"
+        '@WebServlet("/wide")\n'
+        "class WideServlet extends HttpServlet {}\n"
+        "class PlainHelper {}\n"
+    )
+    (java_repo / "src" / "main" / "java" / "p" / "Multi.java").write_text(
+        source, encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+
+    file_signal = _readiness_signal(
+        readiness_doc, modules_doc, display_name="Multi.java", kind="file",
+        check="entry_points_mapped")
+    assert file_signal["stored_status"] == "satisfied"
+    assert file_signal["reason_code"] == "entry_point_mapped"
+
+
+def test_a_genuinely_entry_point_free_file_keeps_its_honest_negative(java_repo: Path) -> None:
+    """FIX ROUND 22 (F1 MAJOR): a companion control - a file whose only
+    contained class genuinely has no entry point and no feature link
+    keeps reporting the honest negative, unaffected by this round's fix
+    (never a regression toward an un-evidenced positive)."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "p" / "PlainDao.java").write_text(
+        "package p;\nclass PlainDao {}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+
+    file_signal = _readiness_signal(
+        readiness_doc, modules_doc, display_name="PlainDao.java", kind="file",
+        check="entry_points_mapped")
+    component_signal = _readiness_signal(
+        readiness_doc, modules_doc, display_name="PlainDao", kind="component",
+        check="entry_points_mapped")
+    assert file_signal["stored_status"] == "not_applicable"
+    assert component_signal["stored_status"] == "not_applicable"
+    feature_signal = _readiness_signal(
+        readiness_doc, modules_doc, display_name="PlainDao.java", kind="file",
+        check="feature_linked")
+    assert feature_signal["stored_status"] == "unsatisfied"
+
+
 def test_run_scan_web_servlet_and_jax_rs_routes_publish_end_to_end_cr13_c(
     java_repo: Path,
 ) -> None:
