@@ -100,7 +100,40 @@ _BENIGN_NON_CODE_BASENAMES = frozenset({
 #: either.
 _DEGRADING_CODE_EXTENSIONS = frozenset({
     ".jsp", ".jspx", ".jspf", ".tag", ".sql", ".groovy", ".kt", ".scala", ".xhtml", ".ftl", ".vm",
+    # FIX ROUND 17 (thirteenth cold read, CR13-1 MAJOR, wrong-data, part
+    # (b) - GROW TIER 2): the three-tier rule's own inversion is
+    # RATIFIED, but this list stayed too narrow - the reader's own
+    # polyglot fixture (a legacy web app whose .js files carry the real
+    # browser-side behavior; .pks/.pkb Oracle PL/SQL package bodies, real
+    # migration estate) scanned COMPLETE, not degraded, over genuine
+    # application code this producer simply has no adapter for. Every
+    # UNAMBIGUOUS application-code extension the reader named, added:
+    # .js/.ts (the reader's own repro), .py/.cs/.php/.rb/.go (the same
+    # class - a real application-language source file, never tooling),
+    # .pks/.pkb (Oracle PL/SQL package spec/body - real database-tier
+    # migration estate), .xsl (JUDGE - a transform is code-bearing;
+    # included per the reviewer's own lean). This closes the specific
+    # incoherence the reader also named (.vm/.ftl degrading while the
+    # same app's .js did not - now both degrade, for the same reason).
+    #
+    # .py's own tools-vs-source-root question (the reviewer's own 16b
+    # residual, "tools/script.py stays record-only elsewhere"): NOT
+    # implemented as a source-root split here - this producer has no
+    # existing "recognized source root" concept for a non-Java language
+    # to key that split off (the Java-specific src/main/java convention
+    # does not generalize), and inventing one for this alone would be
+    # exactly the speculative concept-building this codebase avoids.
+    # Taken per the reviewer's own offered fallback: ALL .py degrades,
+    # PROVISIONAL like every other entry in this list - reviewer-3 rules
+    # on the finer split if still wanted.
+    ".js", ".ts", ".py", ".cs", ".php", ".rb", ".go", ".pks", ".pkb", ".xsl",
 })
+#: FIX ROUND 17 (thirteenth cold read, CR13-1 MAJOR): this whole list is
+#: PROVISIONAL and expected to GROW as this producer meets more real
+#: languages - closed and narrow by construction (round 16's own
+#: inversion means an absent entry here is still recorded, never
+#: silently vanished; it just under-claims degradation for a language
+#: this list has not caught up to yet). Reviewer-3 ratifies additions.
 #: Spring bean XML's own root element - the ONE xml root name this
 #: producer recognizes as code-bearing (a bean declaration is
 #: application wiring, not tooling configuration). PROVISIONAL, like

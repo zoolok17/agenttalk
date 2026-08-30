@@ -319,11 +319,55 @@ Examples are `unsupported_language`, `parse_failed`, `path_excluded`,
 reason because that failure publishes no `problems.json`.
 
 A run is `degraded` if an enabled adapter fails, an input budget truncates the
-scope, or part of the selected source is unsupported. Ordinary unresolved
-dependencies and readiness blockers are domain findings and do not by
-themselves make the scan command fail. A fatal configuration, confinement, or
-publication error publishes no run. Exceeding the durable-artifact ceiling also
-publishes no run; it does not truncate the inventory and call the result valid.
+scope, or part of the selected source is unsupported *and code-bearing* (see
+"Unsupported-language degradation is tiered, not binary" below). Ordinary
+unresolved dependencies and readiness blockers are domain findings and do not
+by themselves make the scan command fail. A fatal configuration, confinement,
+or publication error publishes no run. Exceeding the durable-artifact ceiling
+also publishes no run; it does not truncate the inventory and call the result
+valid.
+
+#### Unsupported-language degradation is tiered, not binary
+
+An amendment (task #55 slice-1 PR-B, fix rounds 16-17): the plain reading above
+- *any* unsupported file degrades the run - was measured against real
+repositories and does not hold. An unsupported extension resolves through
+THREE tiers, not two:
+
+1. **Adapter-handled** - a bundled adapter recognizes the language and parses
+   it normally. Not part of this section.
+2. **Recognized code-bearing, unsupported** - a CLOSED, PROVISIONAL list of
+   extensions this producer has no adapter for yet, but that name real
+   application-source shapes on the JVM and its adjacent migration estate
+   (JSP/JSF-family templates, SQL, Groovy/Kotlin/Scala, XSLT transforms, and -
+   as this producer meets more real repositories - other unambiguous
+   application languages such as JavaScript/TypeScript, Python, C#, PHP,
+   Ruby, Go, and Oracle PL/SQL package bodies). Every file matching this tier
+   is recorded in `problems.json` (`unsupported_language`) AND degrades the
+   run - it is genuinely missed application code, the same standard a fresh
+   migration reader applies ("would a reader say the inventory missed
+   something they needed?" - the reader test fix round 14b's own reviewer
+   delta first established, reused unchanged for this tier).
+3. **Everything else non-benign** - any extension neither adapter-handled,
+   on a closed BENIGN allowlist (documentation, plain text, lockfiles,
+   images), nor on the tier-2 list above. Still recorded in `problems.json`
+   (never silently dropped - a file's mere absence from the closed
+   recognized-code-bearing list is not evidence that it is tooling, only
+   that this producer has not yet been taught to recognize it as
+   application code) but does NOT degrade the run - a build/tooling/
+   infrastructure/configuration file (`Dockerfile`, a Maven wrapper script,
+   CI YAML, `.properties`/`.yml` application configuration) is not "missed
+   application code" the same way an unrecognized JVM-language source file
+   is, even though this producer cannot parse either one.
+
+The tier-2 list is explicitly PROVISIONAL and expected to GROW as this
+producer is measured against more real, polyglot repositories - an absent
+entry under-claims degradation for a real application language this list has
+not yet caught up to, but (per tier 3's own guarantee) never silently
+vanishes the file from `problems.json` entirely. Growing the list is a
+narrow, low-risk change (one frozenset entry plus a regression test); judged
+not to require a design amendment of its own each time reviewer-3 ratifies an
+addition.
 
 ### Fact provenance and canonical merge
 

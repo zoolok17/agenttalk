@@ -140,6 +140,11 @@ def test_process_paths_flags_jsp_properties_and_sql_as_unsupported_language(
 @pytest.mark.parametrize("filename", [
     "Foo.jsp", "Foo.jspx", "Foo.jspf", "Foo.tag", "schema.sql", "Foo.groovy",
     "Foo.kt", "Foo.scala", "view.xhtml", "template.ftl", "template.vm",
+    # FIX ROUND 17 (thirteenth cold read, CR13-1 MAJOR, part (b) - GROW
+    # TIER 2): the reader's own polyglot evidence - real application-code
+    # extensions this list was too narrow to catch.
+    "app.js", "app.ts", "script.py", "Program.cs", "index.php", "app.rb",
+    "main.go", "Package.pks", "Package.pkb", "transform.xsl",
 ])
 def test_process_paths_flags_every_tier2_code_bearing_extension_as_degrading(
     tmp_path: Path, filename: str,
@@ -154,6 +159,26 @@ def test_process_paths_flags_every_tier2_code_bearing_extension_as_degrading(
     assert len(result.problems) == 1
     assert result.problems[0].reason_code == "unsupported_language"
     assert result.problems[0].degrades_run is True
+
+
+def test_process_paths_a_polyglot_legacy_web_app_now_degrades_cr13_b(tmp_path: Path) -> None:
+    """FIX ROUND 17 (thirteenth cold read, CR13-1 MAJOR, wrong-data):
+    mirrors the reader's own .cr13-b shape - a legacy web app whose real
+    behavior lives in .js files, plus Oracle PL/SQL package spec/body
+    (.pks/.pkb) and an XSL transform - all genuine, unambiguous
+    application-code shapes this producer has no adapter for. Round 16's
+    own three-tier rule, pre-growth, scanned this repo COMPLETE (0
+    degrading) over real migration estate; must now DEGRADE."""
+    (tmp_path / "legacy.js").write_text("function submit() {}\n", encoding="utf-8")
+    (tmp_path / "OrderPkg.pks").write_text("CREATE PACKAGE order_pkg AS END;\n", encoding="utf-8")
+    (tmp_path / "OrderPkg.pkb").write_text("CREATE PACKAGE BODY order_pkg AS END;\n", encoding="utf-8")
+    (tmp_path / "report.xsl").write_text(
+        "<xsl:stylesheet version=\"1.0\"></xsl:stylesheet>", encoding="utf-8")
+    paths = ["legacy.js", "OrderPkg.pks", "OrderPkg.pkb", "report.xsl"]
+    result = worker.process_paths(tmp_path, paths)
+    assert len(result.problems) == 4
+    assert all(p.reason_code == "unsupported_language" for p in result.problems)
+    assert all(p.degrades_run is True for p in result.problems)
 
 
 @pytest.mark.parametrize("filename", [
