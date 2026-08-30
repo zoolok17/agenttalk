@@ -241,6 +241,43 @@ def test_enumerate_scope_a_real_repo_root_build_output_dir_stays_silent(
     )
     assert result.degraded is False
     assert not any(p["reason_code"] == "excluded_region_contains_code" for p in result.problems)
+    # FIX ROUND 20 (sixteenth cold read, M1+M2 MAJOR, wrong-data - the
+    # POISON RULE): the peek now runs for EVERY generated/vendor
+    # exclusion, not just ones under an uncarved src ancestor - so this
+    # SAME repo-root target/ (genuinely code-containing) DOES poison
+    # confident externality run-wide, even though F4's OWN narrow
+    # degradation boundary correctly stays unaffected (degraded is still
+    # False, asserted above) - two separate consumers of one peek.
+    assert result.excluded_region_may_contain_target is True
+
+
+def test_enumerate_scope_a_vendor_dir_with_real_code_poisons_without_degrading(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 20 (sixteenth cold read, M1+M2 MAJOR, wrong-data - the
+    POISON RULE): a generated/vendor-named directory at repo root
+    (no src ancestor at all - never F4's own degradation boundary)
+    that genuinely contains hand-written code (the mainstream Maven
+    vendored-module shape, ``vendor/<module>/src/main/java/...``, is
+    exactly this - a plain ``vendor`` name at repo root) must still
+    poison confident externality run-wide, even though it never
+    degrades the run on its own (m2's own JUDGE: declare the boundary
+    honestly via the poison rule + projection, rather than widening F4's
+    own degradation)."""
+    vendor_dir = tmp_path / "vendor" / "some-module" / "src" / "main" / "java" / "com" / "acme"
+    vendor_dir.mkdir(parents=True)
+    (vendor_dir / "Widget.java").write_text("package com.acme;\nclass Widget {}\n", encoding="utf-8")
+    comp_dir = _comprehension_dir(tmp_path)
+
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+
+    assert not any(f.relative_path.endswith("Widget.java") for f in result.files)
+    assert any(
+        e["category"] == "generated_or_vendor" and e["path"] == "vendor"
+        for e in result.excluded_roots
+    )
+    assert result.degraded is False
+    assert result.excluded_region_may_contain_target is True
 
 
 def test_enumerate_scope_an_ant_style_build_dir_with_only_binaries_stays_silent(
@@ -263,6 +300,7 @@ def test_enumerate_scope_an_ant_style_build_dir_with_only_binaries_stays_silent(
         for e in result.excluded_roots
     )
     assert result.degraded is False
+    assert result.excluded_region_may_contain_target is False
     assert not any(p["reason_code"] == "excluded_region_contains_code" for p in result.problems)
 
 

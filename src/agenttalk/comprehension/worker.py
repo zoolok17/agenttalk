@@ -487,6 +487,15 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                 text = data.decode("utf-8-sig", errors="replace")
                 pom_units, build_edges, profile_scoped_dependency_count = (
                     java_adapter.parse_maven_pom(rel, text))
+                # FIX ROUND 20 (sixteenth cold read, M1+M2 MAJOR - THE
+                # REACTOR RULE): a separate, additional call (not baked
+                # into parse_maven_pom's own return arity, which 28+
+                # existing call sites already unpack positionally) - see
+                # declared_reactor_module_paths's own docstring for why
+                # this producer resolves nothing itself; scan_pipeline.py
+                # does the excluded-region cross-reference after the
+                # worker returns.
+                declared_module_paths = java_adapter.declared_reactor_module_paths(text)
             except Exception as exc:  # noqa: BLE001 - a producer bug must degrade, never abort the scan
                 problems.append(WorkerProblem(
                     reason_code="parse_failed", relative_path=rel,
@@ -500,7 +509,10 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                 # build through, so a sibling pom's dependency on it can
                 # resolve internal instead of a hardcoded external guess.
                 java_results[rel] = java_adapter.file_result_to_json(
-                    java_adapter.JavaFileResult(units=pom_units, edges=build_edges))
+                    java_adapter.JavaFileResult(
+                        units=pom_units, edges=build_edges,
+                        declared_module_paths=declared_module_paths,
+                    ))
                 # Round 11c (reviewer-3 delta on round 11b, vehicle
                 # change): a profile-scoped dependency this adapter
                 # excludes (a profile may be active by default) is a

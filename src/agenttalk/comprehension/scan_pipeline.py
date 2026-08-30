@@ -25,6 +25,7 @@ forks:
 
 from __future__ import annotations
 
+import posixpath
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -201,6 +202,12 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     # "no code" outcome a fully-explored directory gets. Same "warning"
     # bucket every other missing-evidence reason already gets.
     "excluded_region_peek_truncated": "warning",
+    # FIX ROUND 20 (sixteenth cold read, M1+M2 MAJOR - THE REACTOR
+    # RULE): a pom's own declared <module> resolving into an excluded
+    # region - positive, direct evidence the region holds first-party
+    # source. Same "warning" bucket every other missing-evidence reason
+    # already gets.
+    "module_directory_excluded": "warning",
 }
 _DEFAULT_PROBLEM_SEVERITY = "warning"
 
@@ -460,16 +467,93 @@ def run_scan(
         # false-positive external claim over evidence that is merely
         # missing, not genuinely third-party.
         degraded_paths = frozenset(worker_problem_reasons_by_path)
-        # FIX ROUND 16 (twelfth cold read, B2 BLOCKER, part 3): every
-        # relative path discovery excluded outright this run - queryable
-        # here for the identical reason ``degraded_paths`` is: an import
-        # naming a type whose hypothetical file lives under one of these
-        # never-walked regions must never resolve a confident external
-        # claim either.
-        excluded_root_paths = frozenset(r["path"] for r in discovery_result.excluded_roots)
+        # FIX ROUND 18 (fourteenth cold read, F6 JUDGE, taken): a file
+        # discovery excluded outright as binary content (a NUL byte in
+        # its sniffed prefix) records ONLY a bare exclusion count/
+        # excluded_roots entry, never a problem - correct for a genuine
+        # binary blob, but silently identical for a UTF-16-encoded
+        # .java file (a legal javac input) or a tier-2 code-bearing
+        # file (.jsp, .kt, ...) that happened to trip the same
+        # heuristic: the run still reports complete/zero problems even
+        # though real code went unread. Named and degrading here,
+        # exactly the same severity tier 2 already gets - a genuinely
+        # binary extension (absent from both the adapter-handled and
+        # tier-2 sets) stays exactly as silent as it is today. Moved
+        # ahead of build_dependencies (round 20) - its own finding now
+        # also feeds the poison rule below (a code-bearing file THIS
+        # RUN excluded is exactly as poisoning as a code-bearing
+        # DIRECTORY discovery's own peek finds).
+        binary_excluded_code_bearing_problems = [
+            _problem_record(
+                "binary_excluded_code_bearing_file",
+                entry["path"],
+                "a file whose extension this run would otherwise have tried to understand "
+                "as code was excluded outright as binary content (a NUL byte in its sniffed "
+                "prefix) - a UTF-16-encoded source file is a legal compiler input that trips "
+                "this heuristic; recorded as a genuine unread-code gap, never silently "
+                "vanished the way a genuinely binary file correctly still is",
+            )
+            for entry in discovery_result.excluded_roots
+            if entry["category"] == "binary"
+            and worker.is_a_code_bearing_extension_worth_degrading_when_silently_excluded(
+                entry["path"])
+        ]
+        # FIX ROUND 20 (sixteenth cold read, M1+M2 MAJOR - THE REACTOR
+        # RULE): a pom's own declared <module> entry whose path resolves
+        # into a region this run excluded outright is positive, DIRECT
+        # evidence that region holds real, first-party source - stronger
+        # than the generic peek (discovery.py), since it is the build
+        # tool's own explicit declaration. Resolved here (not in java.py
+        # or worker.py, neither of which has discovery's own excluded-
+        # root paths available) against each declaring pom's own
+        # directory; both sides of the comparison are plain repo-
+        # relative paths in the SAME coordinate space, so - unlike the
+        # now-retired qualified-name-vs-directory string match - a
+        # straightforward prefix/equality check is exact, not a guess.
+        excluded_root_paths_for_reactor_rule = [r["path"] for r in discovery_result.excluded_roots]
+        reactor_rule_problems = []
+        for pom_path, result in java_results.items():
+            pom_dir = pom_path.rsplit("/", 1)[0] if "/" in pom_path else ""
+            for module_path in result.declared_module_paths:
+                resolved = posixpath.normpath(
+                    posixpath.join(pom_dir, module_path)) if pom_dir else posixpath.normpath(
+                    module_path)
+                resolved = resolved.replace("\\", "/")
+                if any(
+                    resolved == root or resolved.startswith(root + "/")
+                    for root in excluded_root_paths_for_reactor_rule
+                ):
+                    reactor_rule_problems.append(_problem_record(
+                        "module_directory_excluded",
+                        pom_path,
+                        f"this pom declares <module>{module_path}</module>, whose own path "
+                        f"({resolved!r}) resolves into a region this run excluded outright - "
+                        "positive evidence the excluded region holds real, first-party source, "
+                        "not third-party build output",
+                    ))
+        # FIX ROUND 20 (sixteenth cold read, M1+M2 MAJOR, wrong-data -
+        # THE POISON RULE): retires the round-16 string-matching
+        # excluded-region guard for the containment question entirely
+        # (inert for the mainstream Maven layout, where an excluded
+        # root's own recorded path - a bare directory name - has no
+        # string relationship at all to the unwalked source arbitrarily
+        # deeper inside it). A registry miss may publish a confident
+        # EXTERNAL claim only when this run can vouch every excluded
+        # region was genuinely code-free - discovery's own run-wide peek
+        # result (generated/vendor DIRECTORIES), OR'd with a code-bearing
+        # binary-excluded FILE (round 18's own F6 finding - the single-
+        # file mirror image of the same directory peek), OR'd with the
+        # reactor rule's own finding (a pom explicitly declaring a
+        # module inside an excluded region is decisive on its own,
+        # regardless of what the generic peek happened to find).
+        externality_poisoned = (
+            discovery_result.excluded_region_may_contain_target
+            or bool(binary_excluded_code_bearing_problems)
+            or bool(reactor_rule_problems)
+        )
         dependencies = dependencies_artifact.build_dependencies(
             java_results, file_digests=file_digests, degraded_paths=degraded_paths,
-            excluded_root_paths=excluded_root_paths)
+            externality_poisoned=externality_poisoned)
         entry_points, features = features_artifact.build_features(
             java_results, file_digests=file_digests)
         readiness_signals, readiness_summaries = readiness_artifact.build_readiness(
@@ -506,34 +590,6 @@ def run_scan(
             for group in modules_by_conflict_id.values()
         ]
 
-        # FIX ROUND 18 (fourteenth cold read, F6 JUDGE, taken): a file
-        # discovery excluded outright as binary content (a NUL byte in
-        # its sniffed prefix) records ONLY a bare exclusion count/
-        # excluded_roots entry, never a problem - correct for a genuine
-        # binary blob, but silently identical for a UTF-16-encoded
-        # .java file (a legal javac input) or a tier-2 code-bearing
-        # file (.jsp, .kt, ...) that happened to trip the same
-        # heuristic: the run still reports complete/zero problems even
-        # though real code went unread. Named and degrading here,
-        # exactly the same severity tier 2 already gets - a genuinely
-        # binary extension (absent from both the adapter-handled and
-        # tier-2 sets) stays exactly as silent as it is today.
-        binary_excluded_code_bearing_problems = [
-            _problem_record(
-                "binary_excluded_code_bearing_file",
-                entry["path"],
-                "a file whose extension this run would otherwise have tried to understand "
-                "as code was excluded outright as binary content (a NUL byte in its sniffed "
-                "prefix) - a UTF-16-encoded source file is a legal compiler input that trips "
-                "this heuristic; recorded as a genuine unread-code gap, never silently "
-                "vanished the way a genuinely binary file correctly still is",
-            )
-            for entry in discovery_result.excluded_roots
-            if entry["category"] == "binary"
-            and worker.is_a_code_bearing_extension_worth_degrading_when_silently_excluded(
-                entry["path"])
-        ]
-
         problems = [
             _problem_record(p["reason_code"], p.get("path"), p["detail"])
             for p in discovery_result.problems
@@ -545,7 +601,8 @@ def run_scan(
             _problem_record(
                 "case_collision", second, bounded_detail(f"case-folds identically to {first!r}"))
             for first, second in case_collisions
-        ] + duplicate_qualified_name_problems + binary_excluded_code_bearing_problems
+        ] + duplicate_qualified_name_problems + binary_excluded_code_bearing_problems + (
+            reactor_rule_problems)
         # FIX ROUND 14b (reviewer-3's ratified CR10-5 split): a worker
         # problem's own `degrades_run` (worker.py) distinguishes
         # "recorded, visible" from "the run's status also degrades over
@@ -558,7 +615,7 @@ def run_scan(
         status = "degraded" if (
             discovery_result.degraded or discovery_result.problems or case_collisions
             or degrading_worker_problems or duplicate_qualified_name_problems
-            or binary_excluded_code_bearing_problems
+            or binary_excluded_code_bearing_problems or reactor_rule_problems
         ) else "complete"
 
         modules_doc = {

@@ -342,6 +342,24 @@ class DiscoveryResult:
     whole_scope_fingerprint: str | None = None
     fingerprint_complete: bool = True
     degraded: bool = False
+    #: FIX ROUND 20 (sixteenth cold read, M1+M2 MAJOR, wrong-data - the
+    #: POISON RULE): True when ANY generated/vendor-named excluded
+    #: directory this run swallowed either genuinely contains an
+    #: adapter-handled/tier-2 code-bearing file, or the peek exceeded its
+    #: own entry cap before it could confirm either way - regardless of
+    #: whether that directory sits under an "uncarved src ancestor" (F4's
+    #: OWN narrower degradation boundary, unchanged). A registry miss may
+    #: publish a confident EXTERNAL claim only when this is False for the
+    #: whole run - dependencies_artifact.py consults it (alongside its
+    #: own reactor-rule finding) rather than trying to string-match an
+    #: individual target's own qualified name against an excluded root's
+    #: path, which round 19's own fix could never make sound for the
+    #: mainstream Maven vendored-module-inside-an-excluded-tree shape
+    #: (the excluded root is recorded as a bare directory name -
+    #: ``vendor`` - while the unwalked source lives arbitrarily deeper -
+    #: ``vendor/<module>/src/main/java/<pkg>/...`` - with no string
+    #: relationship the qualified name alone could ever recover).
+    excluded_region_may_contain_target: bool = False
 
 
 def _windows_architecture() -> str:
@@ -600,6 +618,7 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
     excluded_roots: list[dict[str, str]] = []
     problems: list[dict[str, str]] = []
     degraded = False
+    excluded_region_may_contain_target = False
     entry_count = 0
     hashed_total = 0
     entry_cap_hit = False
@@ -624,7 +643,7 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
         excluded_roots.append({"path": relative_path, "category": category})
 
     def _walk(directory: Path, depth: int = 0) -> None:
-        nonlocal entry_count, hashed_total, degraded, entry_cap_hit
+        nonlocal entry_count, hashed_total, degraded, entry_cap_hit, excluded_region_may_contain_target
         if depth > MAX_NESTING_DEPTH:
             degraded = True
             problems.append({
@@ -696,44 +715,67 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                     # code - never a real build-output tree, which has
                     # no `src` segment in its own path at all and stays
                     # silent, unaffected.
-                    if category == "generated_or_vendor" and _sits_under_an_uncarved_src_segment(
-                        relative,
-                    ):
+                    #
+                    # FIX ROUND 20 (sixteenth cold read, M1+M2 MAJOR,
+                    # wrong-data - the POISON RULE): the peek itself now
+                    # runs for EVERY generated/vendor exclusion, not just
+                    # ones under an uncarved src ancestor - the mainstream
+                    # Maven vendored-module shape (``vendor/<module>/
+                    # src/main/java/...``) has NO src segment in the
+                    # excluded root's OWN path (only arbitrarily deeper,
+                    # never recorded), so F4's own narrow boundary alone
+                    # can never see it. Scoped to the generated_or_vendor
+                    # CATEGORY specifically (never dependency-cache/vcs/
+                    # hard-excluded, which structurally can never hold
+                    # first-party code by the SAME reasoning discovery
+                    # already excludes them by name without walking, and
+                    # peeking a real node_modules/.m2 would be both
+                    # expensive and pointless). F4's OWN degradation
+                    # STAYS gated to the ratified src-ancestry boundary
+                    # (unchanged, below) - only the run-wide POISON flag
+                    # (consumed by dependencies_artifact.py to decide
+                    # whether a registry miss may ever publish a
+                    # confident external claim) widens to run-wide.
+                    if category == "generated_or_vendor":
                         contains_code, peek_truncated = (
                             _excluded_directory_contains_a_code_bearing_file(entry)
                         )
-                        if contains_code:
-                            degraded = True
-                            problems.append({
-                                "reason_code": "excluded_region_contains_code",
-                                "path": relative,
-                                "detail": "a generated/vendor-named directory nested under an "
-                                          "unrecognized bare src/ root contains at least one "
-                                          "adapter-handled or tier-2 code-bearing file - "
-                                          "excluded from the inventory as if it were build "
-                                          "output, but this content is genuinely unread code",
-                            })
-                        elif peek_truncated:
-                            # FIX ROUND 19b (reviewer-3's rejection of
-                            # round 19, THE MAJOR, wrong-data): the peek
-                            # hit its own entry cap before finding (or
-                            # ruling out) a code-bearing file - an
-                            # honestly UNKNOWN outcome, never silently
-                            # folded into the same confident "no code"
-                            # answer a fully-explored, genuinely code-
-                            # free directory gets. Degrades, the same
-                            # "record the truncation" discipline every
-                            # other cap in this module already follows.
-                            degraded = True
-                            problems.append({
-                                "reason_code": "excluded_region_peek_truncated",
-                                "path": relative,
-                                "detail": "a generated/vendor-named directory nested under an "
-                                          "unrecognized bare src/ root exceeded this run's "
-                                          f"{_MAX_EXCLUDED_DIRECTORY_PEEK_ENTRIES}-entry peek "
-                                          "cap before a code-bearing file could be confirmed "
-                                          "present or absent - not confidently either",
-                            })
+                        if contains_code or peek_truncated:
+                            excluded_region_may_contain_target = True
+                        if _sits_under_an_uncarved_src_segment(relative):
+                            if contains_code:
+                                degraded = True
+                                problems.append({
+                                    "reason_code": "excluded_region_contains_code",
+                                    "path": relative,
+                                    "detail": "a generated/vendor-named directory nested under "
+                                              "an unrecognized bare src/ root contains at least "
+                                              "one adapter-handled or tier-2 code-bearing file - "
+                                              "excluded from the inventory as if it were build "
+                                              "output, but this content is genuinely unread code",
+                                })
+                            elif peek_truncated:
+                                # FIX ROUND 19b (reviewer-3's rejection of
+                                # round 19, THE MAJOR, wrong-data): the peek
+                                # hit its own entry cap before finding (or
+                                # ruling out) a code-bearing file - an
+                                # honestly UNKNOWN outcome, never silently
+                                # folded into the same confident "no code"
+                                # answer a fully-explored, genuinely code-
+                                # free directory gets. Degrades, the same
+                                # "record the truncation" discipline every
+                                # other cap in this module already follows.
+                                degraded = True
+                                problems.append({
+                                    "reason_code": "excluded_region_peek_truncated",
+                                    "path": relative,
+                                    "detail": "a generated/vendor-named directory nested under "
+                                              "an unrecognized bare src/ root exceeded this "
+                                              f"run's {_MAX_EXCLUDED_DIRECTORY_PEEK_ENTRIES}-"
+                                              "entry peek cap before a code-bearing file could "
+                                              "be confirmed present or absent - not confidently "
+                                              "either",
+                                })
                     continue
                 if relative in submodule_boundaries:
                     boundaries.append(
@@ -848,4 +890,5 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
         whole_scope_fingerprint=fingerprint,
         fingerprint_complete=fingerprint_complete,
         degraded=degraded,
+        excluded_region_may_contain_target=excluded_region_may_contain_target,
     )

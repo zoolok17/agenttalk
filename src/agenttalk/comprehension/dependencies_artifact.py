@@ -408,130 +408,10 @@ def _degraded_java_suffix_match(qualified_name: str, degraded_paths: frozenset[s
     return any(path == suffix or path.endswith("/" + suffix) for path in degraded_paths)
 
 
-def _excluded_region_match(qualified_name: str, excluded_root_paths: frozenset[str]) -> bool:
-    """FIX ROUND 16 (twelfth cold read, B2 BLOCKER, part 3): mirrors
-    :func:`_degraded_java_suffix_match`'s own reasoning, for the mirror-
-    image relationship - a target whose hypothetical file lives INSIDE a
-    directory THIS run excluded outright (a bare generated/vendor
-    directory name at repo/module root - ``out/``, ``build/``, ``dist/``,
-    never one merely nested inside a recognized source root, which never
-    reaches ``excluded_root_paths`` at all - see ``discovery.py``'s
-    ``_is_inside_a_recognized_source_root``) must never become a
-    confident EXTERNAL claim either: the registry has no entry for it
-    because the file was never even walked, not because the type is
-    genuinely third-party.
-
-    FIX ROUND 19 (fifteenth cold read, F1 BLOCKER, wrong-data): this used
-    to test ONLY ``suffix.startswith(root + "/")`` - correct for the case
-    an excluded root truly IS a bare, no-scaffolding ancestor of the
-    qualified name's own path (e.g. ``target`` excluding ``target/gen/
-    Stub.java``, package ``target.gen`` - the excluded root and the
-    package structure share the SAME coordinate space because there is
-    no source-root prefix in between). It missed the mirror-image shape:
-    an excluded root that instead carries EXTRA source-root scaffolding
-    the qualified name never spells (``src/main/java/...``, ``core/src/
-    main/java/...``, a bare Ant ``src/...``) - the exact same repo-root
-    anchoring round 18's own F1 fixed in ``discovery.py``, standing
-    unfixed here. Its own sibling, :func:`_degraded_java_suffix_match`,
-    already uses the correct technique for that second shape (checking
-    whether the REAL, scaffolded path ENDS WITH the qualified name's own
-    scaffolding-free suffix) - added here ALONGSIDE the original prefix
-    check, not instead of it, since real repos exhibit both
-    relationships depending on where the excluded region actually sits.
-    Checks, for each excluded root: (1) the ORIGINAL prefix relationship
-    (the qualified path starts with the root, unscaffolded case); (2) a
-    single excluded FILE (the binary-sniff case F6 of round 18
-    introduced) whose own path ends with the type's full ``.java``
-    suffix; (3) an excluded DIRECTORY whose own path ends with the
-    type's PACKAGE path (the type's hypothetical file would live one
-    level deeper than the directory itself).
-
-    NAMED LIMIT (round 16b, reviewer-3's own finding - declared, NOT
-    claimed closed, the same discipline round 12b's wildcard limit
-    already follows, UNCHANGED by this round's fix): this still has no
-    way to know a code generator placed the file under an ADDITIONAL
-    root the qualified name never mentions (a Maven/Gradle annotation-
-    processor shape: ``target/generated-sources/annotations/com/acme/
-    MapperImpl.java`` declares ``com.acme.MapperImpl`` - a qualified name
-    with no "target/generated-sources/annotations/" segment anywhere in
-    it). A MapStruct/QueryDSL/protobuf-generated type under such a root
-    still publishes ``resolved``/``external`` - the registry genuinely
-    has no entry, discovery genuinely pruned the whole `target/` tree,
-    and nothing observable here distinguishes this shape from a
-    genuinely third-party dependency. Undetectable BY CONSTRUCTION this
-    slice - never silently assumed correct.
-
-    OVER-MATCH BOUND (round 19b, reviewer-3's own derivation on round
-    19's F1 - written down so the next reader does not have to re-derive
-    it): the tail checks added in round 19 (``root.endswith(...)``)
-    could in principle fire on an ACCIDENTAL tail match - some genuinely
-    external package whose own last segment happens to spell one of the
-    same names an excluded root can end in. The risk is BOUNDED, not
-    open-ended: every ``excluded_root_paths`` entry is a directory or
-    file discovery excluded by NAME, so its own basename is always one
-    of the closed, enumerated set this producer excludes by name -
-    discovery.py's ``_HARD_EXCLUDE_DIR_NAMES`` / ``_VCS_DIR_NAMES`` /
-    ``_DEPENDENCY_CACHE_DIR_NAMES`` / ``_GENERATED_VENDOR_DIR_NAMES``
-    (19 names total at this writing - the closed union, not a number to
-    hardcode elsewhere). The tail check can therefore only ever fire
-    when BOTH hold: (1) the external package's own last segment (or,
-    for a single-type match, its file's own simple name) IS one of
-    those 19 names, AND (2) this SAME repo's own scan actually recorded
-    a matching excluded tree this run. Given both, ``unresolved`` is the
-    CORRECT answer regardless - discovery genuinely did not walk that
-    excluded region, so the registry genuinely has no evidence either
-    way, the identical epistemic state a true excluded-region match is
-    in. The residual this bound leaves open is narrow: a genuine
-    external dependency whose own 1-2-segment package happens to BOTH
-    share one of these 19 names AND coincide with an excluded tree this
-    same repo also happens to have - failing toward ``unresolved``
-    (an honest "don't know"), never toward a wrong confident claim in
-    either direction."""
-    suffix = qualified_name.replace(".", "/") + ".java"
-    package_path = qualified_name.rsplit(".", 1)[0].replace(".", "/") if "." in qualified_name else None
-    for root in excluded_root_paths:
-        if root == suffix or suffix.startswith(root + "/"):
-            return True
-        if root.endswith("/" + suffix):
-            return True
-        if package_path is not None and (root == package_path or root.endswith("/" + package_path)):
-            return True
-    return False
-
-
-def _excluded_region_package_match(
-    package_prefix: str, excluded_root_paths: frozenset[str],
-) -> bool:
-    """FIX ROUND 16c (reviewer-3's approval-conditioned minor on round
-    16b): the package-prefix sibling of :func:`_excluded_region_match`,
-    for a wildcard import - a wildcard names a PACKAGE, never a type, so
-    there is no ``.java`` suffix to append the way a plain/static
-    import's own qualified spelling gets one. Matches when the
-    package's OWN hypothetical directory lives inside (or IS) a region
-    THIS run excluded outright - the same "never a confident external
-    claim over a directory that was simply never walked" reasoning
-    ``_excluded_region_match`` already applies to a single type.
-
-    FIX ROUND 19 (fifteenth cold read, F1 BLOCKER sweep - same asymmetry
-    class): this had the IDENTICAL gap ``_excluded_region_match`` did -
-    only checking ``package_path.startswith(root + "/")`` (correct for a
-    bare, no-scaffolding excluded ancestor) missed the mirror-image
-    shape, an excluded root carrying scaffolding the package path never
-    spells. Checks both directions the same way its sibling now does:
-    the original prefix relationship, and the excluded root's own path
-    ENDING WITH the package path."""
-    package_path = package_prefix.replace(".", "/")
-    return any(
-        package_path == root or package_path.startswith(root + "/")
-        or root.endswith("/" + package_path)
-        for root in excluded_root_paths
-    )
-
-
 def _classify_registry_miss(
     qualified_name: str, *, duplicate_qualified_names: set[str],
     unit_ids_by_qualified_name: dict[str, list[str]], degraded_paths: frozenset[str],
-    excluded_root_paths: frozenset[str],
+    externality_poisoned: bool,
 ) -> tuple[str, list[str] | None]:
     """FIX ROUND 16 (twelfth cold read, B1+B2 BLOCKERS - the shared
     class): called ONLY once an exact registry lookup for
@@ -562,14 +442,43 @@ def _classify_registry_miss(
     collide with a real one either). ``parse_maven_pom`` (java.py)
     already expands the two self-referential properties resolvable from
     the SAME file before constructing the edge; any OTHER property
-    reaches this rule."""
+    reaches this rule.
+
+    FIX ROUND 20 (sixteenth cold read, M1+M2 MAJOR, wrong-data - THE
+    POISON RULE): the excluded-region CONTAINMENT question used to be
+    answered by string-matching a target's own qualified name against
+    an excluded root's own path (``_excluded_region_match``, now
+    retired) - inert for the mainstream Maven layout, where discovery
+    records an excluded root as its bare DIRECTORY NAME (``vendor``)
+    while the unwalked source it swallows lives arbitrarily deeper
+    (``vendor/<module>/src/main/java/<pkg>/...``), a relationship no
+    string comparison over the qualified name alone can ever recover -
+    a vendored, in-reactor module inside an excluded tree published as
+    a confident third-party EXTERNAL claim, the exact over-claim round
+    18's own F3 named for a different mechanism. Replaced with evidence
+    the run already collects instead of trying to string-match the
+    unknowable: ``externality_poisoned`` is True when discovery's own
+    peek (run for EVERY generated/vendor exclusion, not just ones under
+    a recognized source root - see ``discovery.DiscoveryResult.
+    excluded_region_may_contain_target``) found - or could not rule
+    out, on truncation - an adapter-handled/tier-2 code-bearing file
+    inside ANY excluded region this run swallowed, OR the reactor rule
+    (scan_pipeline.py) found a pom's own declared ``<module>`` resolving
+    into one. Deliberately BLUNT and run-wide, not per-target: a miss
+    may publish EXTERNAL only when EVERY excluded root this run recorded
+    was verified code-free - true for an ordinary repo's own target/
+    full of compiled output, false the moment ANY excluded region is
+    even suspected of holding first-party source. ``_degraded_java_
+    suffix_match`` above is UNCHANGED (kept - it answers a different,
+    EXACT question: a specific file this run tried and failed to read,
+    never a containment guess)."""
     if "${" in qualified_name:
         return "unresolved", None
     if qualified_name in duplicate_qualified_names:
         return "ambiguous", sorted(unit_ids_by_qualified_name.get(qualified_name, []))
     if _degraded_java_suffix_match(qualified_name, degraded_paths):
         return "unresolved", None
-    if _excluded_region_match(qualified_name, excluded_root_paths):
+    if externality_poisoned:
         return "unresolved", None
     return "external", None
 
@@ -578,7 +487,7 @@ def build_dependencies(
     java_results: dict[str, java_adapter.JavaFileResult],
     *, file_digests: dict[str, str] | None = None,
     degraded_paths: frozenset[str] = frozenset(),
-    excluded_root_paths: frozenset[str] = frozenset(),
+    externality_poisoned: bool = False,
 ) -> list[DependencyRecord]:
     """``java_results`` carries every producer's claims uniformly, keyed
     by relative path - including a ``pom.xml``'s ``build`` edges (B-3,
@@ -611,13 +520,14 @@ def build_dependencies(
     declared types resolves ``unresolved``, never a false-positive
     ``resolved``/``target_external``.
 
-    ``excluded_root_paths`` (FIX ROUND 16, twelfth cold read, B2 BLOCKER)
-    names every relative path discovery excluded outright this run (a
-    bare generated/vendor directory name at repo/module root, or a
-    resource-cap/binary exclusion) - queryable here for the identical
-    reason ``degraded_paths`` is: an import naming a type whose
-    hypothetical file lives under one of these never walked regions must
-    never be stamped a confident external claim either.
+    ``externality_poisoned`` (FIX ROUND 20, sixteenth cold read, M1+M2
+    MAJOR - THE POISON RULE, superseding round 16's own B2 BLOCKER
+    string-matching approach) is True when this run cannot vouch that
+    EVERY excluded region it swallowed was genuinely code-free (see
+    ``_classify_registry_miss``'s own docstring) - queryable here for
+    the identical reason ``degraded_paths`` is: a registry miss must
+    never be stamped a confident external claim while any excluded
+    region might hold the very first-party source it is missing.
     """
     file_digests = file_digests or {}
     (
@@ -657,7 +567,7 @@ def build_dependencies(
                 import_qualified_by_simple=import_qualified_by_simple,
                 package=package, degraded_paths=degraded_paths,
                 unit_ids_by_qualified_name=unit_ids_by_qualified_name,
-                excluded_root_paths=excluded_root_paths, in_scan_packages=in_scan_packages,
+                externality_poisoned=externality_poisoned, in_scan_packages=in_scan_packages,
             )
             records.append(record)
 
@@ -756,7 +666,7 @@ def _edge_claim_to_record(
     duplicate_qualified_names: set[str], local_qualified_by_simple: dict[str, str],
     import_qualified_by_simple: dict[str, str], package: str | None,
     degraded_paths: frozenset[str], unit_ids_by_qualified_name: dict[str, list[str]],
-    excluded_root_paths: frozenset[str] = frozenset(),
+    externality_poisoned: bool = False,
     in_scan_packages: set[str] = frozenset(),
 ) -> DependencyRecord:
     target_unit_id = target_external = target_unresolved = confidence = None
@@ -833,7 +743,7 @@ def _edge_claim_to_record(
                 outcome, candidates = _classify_registry_miss(
                     imported, duplicate_qualified_names=duplicate_qualified_names,
                     unit_ids_by_qualified_name=unit_ids_by_qualified_name,
-                    degraded_paths=degraded_paths, excluded_root_paths=excluded_root_paths,
+                    degraded_paths=degraded_paths, externality_poisoned=externality_poisoned,
                 )
                 if outcome == "ambiguous":
                     resolution_state, candidate_unit_ids = "ambiguous", candidates
@@ -855,7 +765,7 @@ def _edge_claim_to_record(
             outcome, candidates = _classify_registry_miss(
                 edge.target, duplicate_qualified_names=duplicate_qualified_names,
                 unit_ids_by_qualified_name=unit_ids_by_qualified_name,
-                degraded_paths=degraded_paths, excluded_root_paths=excluded_root_paths,
+                degraded_paths=degraded_paths, externality_poisoned=externality_poisoned,
             )
             if outcome == "ambiguous":
                 resolution_state, target_unresolved, candidate_unit_ids = (
@@ -883,7 +793,7 @@ def _edge_claim_to_record(
             outcome, candidates = _classify_registry_miss(
                 type_prefix, duplicate_qualified_names=duplicate_qualified_names,
                 unit_ids_by_qualified_name=unit_ids_by_qualified_name,
-                degraded_paths=degraded_paths, excluded_root_paths=excluded_root_paths,
+                degraded_paths=degraded_paths, externality_poisoned=externality_poisoned,
             )
             if outcome == "ambiguous":
                 resolution_state, target_unresolved, candidate_unit_ids = (
@@ -927,14 +837,18 @@ def _edge_claim_to_record(
         # gen.*` with `target/` excluded published resolved/external
         # while `import target.Stub` in the SAME file (the non-wildcard
         # twin) correctly published unresolved: two different answers
-        # about one excluded tree, in the same run. Checked here too,
-        # via the package-prefix sibling of `_excluded_region_match`
-        # (a wildcard names a package, not a type - no `.java` suffix
-        # to append).
+        # about one excluded tree, in the same run. Checked here too.
+        #
+        # FIX ROUND 20 (sixteenth cold read, M1+M2 MAJOR - THE POISON
+        # RULE): the excluded-region check itself is now the SAME
+        # run-wide poison flag `_classify_registry_miss` uses, never a
+        # per-target string match against an excluded root's own path -
+        # see that function's own docstring for why the string-matching
+        # approach was retired.
         package_prefix = edge.target[:-2]
         if package_prefix in in_scan_packages:
             resolution_state, target_unresolved = "unresolved", edge.target
-        elif _excluded_region_package_match(package_prefix, excluded_root_paths):
+        elif externality_poisoned:
             resolution_state, target_unresolved = "unresolved", edge.target
         else:
             resolution_state, target_external = "resolved", edge.target
@@ -960,7 +874,7 @@ def _edge_claim_to_record(
             outcome, candidates = _classify_registry_miss(
                 edge.target, duplicate_qualified_names=duplicate_qualified_names,
                 unit_ids_by_qualified_name=unit_ids_by_qualified_name,
-                degraded_paths=degraded_paths, excluded_root_paths=excluded_root_paths,
+                degraded_paths=degraded_paths, externality_poisoned=externality_poisoned,
             )
             if outcome == "ambiguous":
                 resolution_state, target_unresolved, candidate_unit_ids = (

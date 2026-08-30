@@ -2906,6 +2906,143 @@ def test_run_scan_a_wildcard_import_of_an_ant_style_excluded_vendor_package_is_u
     assert import_edge.get("target_external") is None
 
 
+def test_run_scan_a_vendored_reactor_module_reports_unresolved_via_the_reactor_rule(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 20 (sixteenth cold read, M1+M2 MAJOR, wrong-data - THE
+    POISON RULE + THE REACTOR RULE): mirrors the reader's own .cr16-c
+    vendor-module reactor shape - the root pom declares
+    <module>vendor</module>, and "vendor" is EXCLUDED outright
+    (matches generated_or_vendor by name) - discovery records it as a
+    bare directory path ("vendor"), while the unwalked module's own
+    source lives arbitrarily deeper (vendor/src/main/java/...), a
+    relationship no string match over a qualified name alone could ever
+    recover. The app module's own build edge (a <dependency> on the
+    vendored module's coordinate) AND an import edge into the vendored
+    module's own package must BOTH resolve unresolved - never a
+    confident third-party EXTERNAL claim over a declared, in-reactor
+    module - and the run must degrade via the reactor rule's own named
+    problem, naming the module."""
+    import json
+
+    (java_repo / "pom.xml").write_text(
+        "<project><groupId>com.acme</groupId><artifactId>root</artifactId>"
+        "<packaging>pom</packaging>"
+        "<modules><module>vendor</module><module>app</module></modules>"
+        "</project>",
+        encoding="utf-8",
+    )
+    (java_repo / "vendor" / "src" / "main" / "java" / "com" / "acme" / "vendor").mkdir(
+        parents=True)
+    (java_repo / "vendor" / "src" / "main" / "java" / "com" / "acme" / "vendor" / "Widget.java"
+     ).write_text("package com.acme.vendor;\nclass Widget {}\n", encoding="utf-8")
+    (java_repo / "vendor" / "pom.xml").write_text(
+        "<project><groupId>com.acme</groupId><artifactId>vendor-lib</artifactId></project>",
+        encoding="utf-8",
+    )
+    (java_repo / "app").mkdir(parents=True)
+    (java_repo / "app" / "pom.xml").write_text(
+        "<project><groupId>com.acme</groupId><artifactId>app</artifactId>"
+        "<dependencies><dependency>"
+        "<groupId>com.acme</groupId><artifactId>vendor-lib</artifactId>"
+        "</dependency></dependencies></project>",
+        encoding="utf-8",
+    )
+    (java_repo / "app" / "src" / "main" / "java" / "com" / "acme" / "app").mkdir(parents=True)
+    (java_repo / "app" / "src" / "main" / "java" / "com" / "acme" / "app" / "Consumer.java"
+     ).write_text(
+        "package com.acme.app;\nimport com.acme.vendor.Widget;\nclass Consumer {}\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    reactor_problems = [
+        p for p in problems_doc["problems"] if p["reason_code"] == "module_directory_excluded"]
+    assert len(reactor_problems) == 1
+    assert reactor_problems[0]["path"] == "pom.xml"
+
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    build_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "build" and r.get("target_unresolved") == "com.acme:vendor-lib")
+    assert build_edge["resolution_state"] == "unresolved"
+    assert build_edge.get("target_external") is None
+
+    import_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "import" and r.get("target_unresolved") == "com.acme.vendor.Widget")
+    assert import_edge["resolution_state"] == "unresolved"
+    assert import_edge.get("target_external") is None
+
+
+def test_run_scan_a_pom_declared_module_named_build_reports_unresolved_via_the_reactor_rule(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 20 (sixteenth cold read, M1+M2 MAJOR, wrong-data - THE
+    REACTOR RULE): mirrors the reader's own .cr16-b root build/ module
+    shape - a module directory that HAPPENS to be literally named
+    "build" (one of the generated/vendor names, excluded by name
+    regardless of Maven's own explicit declaration otherwise). The
+    build tool's own declaration is authoritative positive evidence,
+    stronger than the generic peek - the reactor rule must fire (and
+    degrade) regardless of what the peek's own generic extension-sniff
+    happens to find."""
+    import json
+
+    (java_repo / "pom.xml").write_text(
+        "<project><groupId>com.acme</groupId><artifactId>root</artifactId>"
+        "<packaging>pom</packaging>"
+        "<modules><module>build</module></modules>"
+        "</project>",
+        encoding="utf-8",
+    )
+    (java_repo / "build").mkdir(parents=True)
+    (java_repo / "build" / "pom.xml").write_text(
+        "<project><groupId>com.acme</groupId><artifactId>build-module</artifactId></project>",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    reactor_problems = [
+        p for p in problems_doc["problems"] if p["reason_code"] == "module_directory_excluded"]
+    assert len(reactor_problems) == 1
+
+
+def test_run_scan_a_normal_repo_with_target_full_of_class_files_keeps_confident_externals(
+    java_repo: Path,
+) -> None:
+    """Companion negative case - a normal, healthy Maven repo's own
+    target/ directory, full of genuinely compiled .class output and no
+    pom-declared module pointing into it, must NOT poison externality:
+    an ordinary import of a genuine third-party type still resolves a
+    confident external claim, exactly as before this round."""
+    import json
+
+    target_dir = java_repo / "target" / "classes" / "p"
+    target_dir.mkdir(parents=True)
+    (target_dir / "App.class").write_bytes(b"\xca\xfe\xba\xbe")
+    (java_repo / "src" / "main" / "java" / "p" / "Consumer.java").write_text(
+        "package p;\nimport org.apache.commons.lang3.StringUtils;\nclass Consumer {}\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    import_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "import"
+        and r.get("target_external") == "org.apache.commons.lang3.StringUtils")
+    assert import_edge["resolution_state"] == "resolved"
+
+
 def test_run_scan_an_import_into_an_excluded_generated_dir_is_unresolved_not_deleted(
     java_repo: Path,
 ) -> None:

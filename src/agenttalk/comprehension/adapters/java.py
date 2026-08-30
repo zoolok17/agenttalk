@@ -745,6 +745,16 @@ class JavaFileResult:
     edges: list[JavaEdgeClaim] = field(default_factory=list)
     entry_points: list[JavaEntryPointClaim] = field(default_factory=list)
     problems: list[JavaAdapterProblem] = field(default_factory=list)
+    #: FIX ROUND 20 (sixteenth cold read, M1+M2 MAJOR - THE REACTOR
+    #: RULE): a pom's own declared ``<modules><module>...</module>
+    #: </modules>`` reactor entries, as RAW path strings exactly as
+    #: written (never resolved against the pom's own directory here -
+    #: that needs discovery's own excluded-root paths, which this
+    #: producer has no knowledge of; scan_pipeline.py does the
+    #: resolve-and-cross-reference after the worker returns). Empty for
+    #: every producer except a pom.xml that declares at least one
+    #: module - see ``declared_reactor_module_paths``.
+    declared_module_paths: list[str] = field(default_factory=list)
 
 
 def _strip_comments_and_strings(text: str) -> tuple[str, bool]:
@@ -2524,6 +2534,11 @@ _XML_TAG_RE = re.compile(r"<(/?)([A-Za-z][\w.-]*)\b[^>]*?(/?)>")
 #: same-shaped non-nesting assumption (Maven's own schema never nests
 #: one ``<dependencies>`` inside another).
 _DEPENDENCIES_ELEMENT_RE = re.compile(r"<dependencies>(.*?)</dependencies>", re.DOTALL)
+#: FIX ROUND 20 (sixteenth cold read, M1+M2 MAJOR - THE REACTOR RULE):
+#: a Maven aggregator's own declared child-module list - see
+#: ``declared_reactor_module_paths``.
+_MODULES_ELEMENT_RE = re.compile(r"<modules>(.*?)</modules>", re.DOTALL)
+_MODULE_RE = re.compile(r"<module>\s*([^<]+?)\s*</module>")
 
 
 def _enclosing_tag_stack(sanitized: str, before: int) -> list[str]:
@@ -2575,6 +2590,41 @@ def _module_own_dependency_blocks(sanitized: str) -> list[re.Match]:
             continue
         yield from _DEPENDENCY_BLOCK_RE.finditer(
             sanitized, deps_match.start(1), deps_match.end(1))
+
+
+def declared_reactor_module_paths(text: str) -> list[str]:
+    """FIX ROUND 20 (sixteenth cold read, M1+M2 MAJOR, wrong-data - THE
+    REACTOR RULE): a pom's own declared ``<modules><module>...</module>
+    </modules>`` reactor entries - a Maven aggregator's explicit list of
+    its own child module directories. A ``<module>`` entry whose path
+    resolves into a region THIS run excluded outright is positive,
+    DIRECT evidence that region holds real, first-party source -
+    stronger than any generic file-extension peek, since it is the
+    build tool's own explicit declaration, not a heuristic.
+
+    Scoped to the project's own TOP-LEVEL ``<modules>`` element (a
+    direct child of ``<project>``, never one nested inside a
+    ``<profile>``'s own conditionally-active module list) - the same
+    "declare the module's own facts, not a conditional activation's"
+    discipline :func:`_module_own_dependency_blocks` already applies to
+    ``<dependencies>``.
+
+    Returns RAW path strings exactly as written (a bare directory name,
+    or occasionally a relative path like ``../shared``) - resolving them
+    against the pom's own directory and cross-referencing them against
+    this run's excluded regions is scan_pipeline.py's own job, which has
+    discovery's own excluded-root paths available; this producer,
+    called from inside the sanitized worker, does not."""
+    sanitized = _strip_xml_comments(text)
+    paths: list[str] = []
+    for modules_match in _MODULES_ELEMENT_RE.finditer(sanitized):
+        if _enclosing_tag_stack(sanitized, modules_match.start()) != ["project"]:
+            continue
+        for module_match in _MODULE_RE.finditer(
+            sanitized, modules_match.start(1), modules_match.end(1),
+        ):
+            paths.append(_bounded_route_target(module_match.group(1).strip()))
+    return paths
 
 
 def _count_profile_scoped_dependencies(sanitized: str) -> int:
@@ -2894,6 +2944,7 @@ def file_result_to_json(result: JavaFileResult) -> dict[str, Any]:
         "edges": [asdict(e) for e in result.edges],
         "entry_points": [asdict(p) for p in result.entry_points],
         "problems": [asdict(p) for p in result.problems],
+        "declared_module_paths": list(result.declared_module_paths),
     }
 
 
@@ -2903,4 +2954,5 @@ def file_result_from_json(payload: dict[str, Any]) -> JavaFileResult:
         edges=[JavaEdgeClaim(**e) for e in payload["edges"]],
         entry_points=[JavaEntryPointClaim(**p) for p in payload["entry_points"]],
         problems=[JavaAdapterProblem(**p) for p in payload.get("problems", [])],
+        declared_module_paths=list(payload.get("declared_module_paths", [])),
     )

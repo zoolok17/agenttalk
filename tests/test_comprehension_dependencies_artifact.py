@@ -415,17 +415,22 @@ def test_static_import_edge_is_ambiguous_on_a_genuine_registry_collision():
     ])
 
 
-def test_import_edge_is_unresolved_not_external_into_an_excluded_region():
-    """FIX ROUND 16 (twelfth cold read, B2 BLOCKER, wrong-data): mirrors
-    ``_degraded_java_suffix_match``'s own reasoning for the mirror-image
-    relationship - a target whose hypothetical file lives inside a
-    directory THIS run excluded outright (never walked, so it can never
-    have a registry entry) is not "genuinely external" just because the
-    registry has no entry for it. Reviewer-3's own ``.cr12-hex`` shape:
-    a PaymentGateway type that lives under an excluded ``out/`` region
-    at repo root (not inside a recognized source root, so the exclusion
-    genuinely fires) must not silently become a confident external
-    claim - and must not be silently deleted from the inventory either."""
+def test_import_edge_is_unresolved_not_external_when_externality_poisoned():
+    """FIX ROUND 20 (sixteenth cold read, M1+M2 MAJOR - THE POISON RULE,
+    superseding round 16's own B2 BLOCKER string-matching approach):
+    mirrors ``_degraded_java_suffix_match``'s own reasoning for the
+    mirror-image relationship - a target whose hypothetical file lives
+    inside a region THIS run excluded outright (never walked, so it can
+    never have a registry entry) is not "genuinely external" just
+    because the registry has no entry for it. The string-matching guard
+    this test originally exercised (``_excluded_region_match``) is
+    retired entirely - inert for the mainstream Maven layout, where an
+    excluded root's own recorded path has no string relationship to the
+    unwalked source arbitrarily deeper inside it. Now driven by the
+    run-wide ``externality_poisoned`` flag scan_pipeline.py computes
+    from discovery's own peek + the reactor rule - a registry miss must
+    not silently become a confident external claim, and must not be
+    silently deleted from the inventory either."""
     results = {
         "p/OrderService.java": _parse(
             "p/OrderService.java",
@@ -433,19 +438,18 @@ def test_import_edge_is_unresolved_not_external_into_an_excluded_region():
             "import p.out.PaymentGateway;\n"
             "class OrderService {}\n"),
     }
-    records = da.build_dependencies(
-        results, excluded_root_paths=frozenset({"p/out"}))
+    records = da.build_dependencies(results, externality_poisoned=True)
     import_edge = next(r for r in records if r.relation == "import")
     assert import_edge.resolution_state == "unresolved"
     assert import_edge.target_unresolved == "p.out.PaymentGateway"
     assert import_edge.target_external is None
 
 
-def test_import_edge_still_resolves_external_when_not_excluded():
-    """Companion negative case: the SAME shape with no excluded_root_paths
-    entry still resolves external as before - the fix only closes the
-    specific excluded-region gap, never turns every registry miss into
-    unresolved."""
+def test_import_edge_still_resolves_external_when_not_poisoned():
+    """Companion negative case: the SAME shape with externality_poisoned
+    left at its default (False) still resolves external as before - the
+    poison rule only closes the specific excluded-region gap, never
+    turns every registry miss into unresolved."""
     results = {
         "p/OrderService.java": _parse(
             "p/OrderService.java",
@@ -501,15 +505,17 @@ def test_wildcard_import_edge_still_resolves_external_when_its_package_is_not_in
     assert import_edge.target_external == "java.util.*"
 
 
-def test_wildcard_import_edge_into_an_excluded_region_stays_unresolved_too():
+def test_wildcard_import_edge_when_externality_poisoned_stays_unresolved_too():
     """FIX ROUND 16c (reviewer-3's approval-conditioned minor on round
     16b - "the last door"): the wildcard branch consulted ONLY
     in_scan_packages, never the excluded-region check every OTHER
     registry-miss caller already goes through - ``import target.gen.*``
-    with ``target/`` excluded published resolved/external while
-    ``import target.Stub`` in the SAME file (the non-wildcard twin)
-    correctly published unresolved: two different answers about one
-    excluded tree, in the same run. Both must now agree."""
+    published resolved/external while ``import target.Stub`` in the
+    SAME file (the non-wildcard twin) correctly published unresolved:
+    two different answers about one excluded tree, in the same run.
+    Both must now agree, driven by the SAME run-wide
+    ``externality_poisoned`` flag (round 20's own POISON RULE) as the
+    plain import edge."""
     results = {
         "r/Report.java": _parse(
             "r/Report.java",
@@ -518,7 +524,7 @@ def test_wildcard_import_edge_into_an_excluded_region_stays_unresolved_too():
             "import target.Stub;\n"
             "class Report {}\n"),
     }
-    records = da.build_dependencies(results, excluded_root_paths=frozenset({"target"}))
+    records = da.build_dependencies(results, externality_poisoned=True)
     wildcard_edge = next(
         r for r in records if r.relation == "import" and r.target_unresolved == "target.gen.*")
     plain_edge = next(
@@ -529,16 +535,16 @@ def test_wildcard_import_edge_into_an_excluded_region_stays_unresolved_too():
     assert plain_edge.target_external is None
 
 
-def test_wildcard_import_edge_into_an_unexcluded_package_still_resolves_external():
-    """Companion negative case: a wildcard import whose package sits
-    OUTSIDE any excluded root still resolves external as before - the
-    fix only closes the specific excluded-tree gap."""
+def test_wildcard_import_edge_still_resolves_external_when_not_poisoned():
+    """Companion negative case: a wildcard import still resolves
+    external as before when externality_poisoned is left at its default
+    (False) - the poison rule only closes the specific gap."""
     results = {
         "r/Report.java": _parse(
             "r/Report.java",
             "package r;\nimport java.util.*;\nclass Report {}\n"),
     }
-    records = da.build_dependencies(results, excluded_root_paths=frozenset({"target"}))
+    records = da.build_dependencies(results)
     import_edge = next(r for r in records if r.relation == "import")
     assert import_edge.resolution_state == "resolved"
     assert import_edge.target_external == "java.util.*"
@@ -1157,13 +1163,13 @@ def test_inherit_edge_through_an_import_of_a_duplicate_qualified_name_is_ambiguo
     ])
 
 
-def test_inherit_edge_through_an_import_into_an_excluded_region_stays_unresolved_too():
+def test_inherit_edge_through_an_import_when_externality_poisoned_stays_unresolved_too():
     """FIX ROUND 16b (BLOCKER 2, the excluded-region variant of the same
-    shape): mirrors the duplicate-FQN reproduction above, for B2's
-    excluded-region check instead - an inherit edge through an import
-    whose hypothetical file lives under a still-excluded region must
-    stay unresolved, matching the import edge, never a confident
-    external claim over a directory this run never walked."""
+    shape) / FIX ROUND 20 (M1+M2, THE POISON RULE): an inherit edge
+    through an import whose hypothetical file lives under a poisoned
+    region must stay unresolved, matching the import edge, never a
+    confident external claim while any excluded region might hold the
+    first-party source it is missing."""
     results = {
         "r/OrderService.java": _parse(
             "r/OrderService.java",
@@ -1172,7 +1178,7 @@ def test_inherit_edge_through_an_import_into_an_excluded_region_stays_unresolved
             "class OrderService extends PaymentGateway {\n"
             "}\n"),
     }
-    records = da.build_dependencies(results, excluded_root_paths=frozenset({"p/out"}))
+    records = da.build_dependencies(results, externality_poisoned=True)
     inherit = next(r for r in records if r.relation == "inherit")
     import_edge = next(r for r in records if r.relation == "import")
     assert inherit.resolution_state == "unresolved"
