@@ -1659,6 +1659,27 @@ def _route_literal_list_at(original: str, anchor: int) -> list[str] | None:
 #: real, only its rendering changes.
 _ROUTE_NAME_CONTROL_CHAR_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
 
+#: FIX ROUND 22 (eighteenth cold read, F6 MINOR, wrong-data): this
+#: function's own docstring promises "safe, single-line, printable
+#: text" - but only C0/DEL were ever escaped; a Unicode BIDI-control
+#: character (a RIGHT-TO-LEFT OVERRIDE, U+202E, is the classic
+#: "Trojan Source" spoofing character - it can make a route's own
+#: PUBLISHED rendering read backwards or reorder its visible
+#: characters) and the two Unicode line/paragraph separators (U+2028/
+#: U+2029, invisible to a C0-only check but still real line breaks to
+#: many renderers/parsers) passed through RAW. A CLOSED, named set -
+#: like the C0 rule beside it, deliberately NOT chasing full Unicode
+#: exhaustiveness: every BIDI embedding/override/isolate control
+#: (U+202A-U+202E, U+2066-U+2069), the two implicit directional marks
+#: (U+200E/U+200F), and the two Unicode line separators (U+2028/
+#: U+2029).
+_UNICODE_DIRECTIONAL_AND_LINE_CONTROL_CHARS = frozenset(
+    "\u200e\u200f"  # LRM, RLM
+    "\u202a\u202b\u202c\u202d\u202e"  # LRE, RLE, PDF, LRO, RLO
+    "\u2066\u2067\u2068\u2069"  # LRI, RLI, FSI, PDI
+    "\u2028\u2029"  # LINE SEPARATOR, PARAGRAPH SEPARATOR
+)
+
 
 def _sanitize_route_name_control_chars(value: str) -> str:
     out = []
@@ -1668,6 +1689,8 @@ def _sanitize_route_name_control_chars(value: str) -> str:
             out.append(escape)
         elif ord(ch) < 0x20 or ord(ch) == 0x7F:
             out.append(f"\\x{ord(ch):02x}")
+        elif ch in _UNICODE_DIRECTIONAL_AND_LINE_CONTROL_CHARS:
+            out.append(f"\\u{ord(ch):04x}")
         else:
             out.append(ch)
     return "".join(out)

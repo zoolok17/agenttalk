@@ -995,6 +995,33 @@ class Controller {
     assert routes[0].target == "/  line1\\n  line2"
 
 
+def test_route_value_with_a_bidi_override_or_line_separator_is_escaped_not_raw():
+    """FIX ROUND 22 (eighteenth cold read, F6 MINOR, wrong-data):
+    _sanitize_route_name_control_chars's own docstring promises "safe,
+    single-line, printable text" - but only C0/DEL were ever escaped. A
+    RIGHT-TO-LEFT OVERRIDE (U+202E, the classic "Trojan Source" spoofing
+    character - it can make a route's own published rendering read
+    backwards) and a Unicode LINE SEPARATOR (U+2028, a real line break
+    invisible to a C0-only check) both passed through RAW. Both now
+    escape to a visible \\uXXXX form, the same choke point the C0
+    control-char fix (round 20's own P1) already established."""
+    rtl_override = chr(0x202E)
+    line_separator = chr(0x2028)
+    src = (
+        "package p;\n"
+        "class Controller {\n"
+        f'  @GetMapping("/api{rtl_override}evil{line_separator}end")\n'
+        "  void list() {}\n"
+        "}\n"
+    )
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /api\\u202eevil\\u2028end"
+    assert rtl_override not in routes[0].target
+    assert line_separator not in routes[0].target
+
+
 # ----------------------------------------------------------- malformed java (round 15 F5)
 
 def test_an_unterminated_char_literal_is_detected_as_malformed_not_silently_truncated():
