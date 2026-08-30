@@ -75,6 +75,39 @@ def _readiness_state_filter_note(readiness_state: str | None) -> dict[str, Any]:
     return {}
 
 
+def _unit_or_feature_filter_note(
+    unit_id: str | None, feature_id: str | None, filtered_modules: list[ModuleRecord],
+) -> dict[str, Any]:
+    """FIX ROUND 23 (nineteenth cold read, F10, completeness - retires the
+    round 18/18b carry ("`--unit` naming a nonexistent id") BY MECHANISM
+    rather than leaving it a declared-and-answered note only): round 18b
+    ruled correctly that `--unit`/`--feature` name an OPEN per-run id
+    space with no closed vocabulary to validate against, so no REFUSAL
+    belongs here - that ruling stands, unchanged. What it left unbuilt
+    was a visible signal distinguishing "this id genuinely matched
+    nothing" from "I forgot to pass the filter", beyond a caller having
+    to actively cross-reference the bare `filters` echo (CR13-9) against
+    an empty `units` list themselves. Same absent-not-null idiom
+    ``_readiness_state_filter_note`` already established - present only
+    when the filter narrowed the run to zero units, silent (empty dict)
+    otherwise."""
+    if (unit_id is not None or feature_id is not None) and not filtered_modules:
+        parts = []
+        if unit_id is not None:
+            parts.append(f"unit_id={unit_id!r}")
+        if feature_id is not None:
+            parts.append(f"feature_id={feature_id!r}")
+        return {
+            "unit_or_feature_filter_note": (
+                f"no unit matched the requested {' and '.join(parts)} - a healthy empty "
+                "result for an id that does not exist this run (see round 18b: --unit/"
+                "--feature name an open per-run id space, never a closed vocabulary to "
+                "refuse against), not a sign the filter silently did nothing"
+            ),
+        }
+    return {}
+
+
 def _bounded(records: list[Any], cap: int | None = None) -> tuple[list[Any], int]:
     # cap is read from the module global at CALL time (never a def-time
     # default) so a test can monkeypatch _MAX_ROWS_PER_SECTION and see it
@@ -506,6 +539,7 @@ def project_comprehension(
             "dependencies_only": dependencies_only,
         },
         **_readiness_state_filter_note(readiness_state),
+        **_unit_or_feature_filter_note(unit_id, feature_id, filtered_modules),
         "counts": {
             # M10 (cold-read, PR-B fix round 3): these are WHOLE-RUN
             # totals - deliberately unaffected by unit_id/feature_id/

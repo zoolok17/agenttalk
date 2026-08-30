@@ -220,6 +220,38 @@ def test_a_nonexistent_feature_id_yields_empty_scoped_sections():
     assert payload["filters"]["feature_id"] == "does-not-exist"
 
 
+def test_a_nonexistent_unit_id_now_carries_a_visible_filter_note_f10():
+    """FIX ROUND 23 (nineteenth cold read, F10, completeness): retires the
+    round 18/18b carry BY MECHANISM - an unmatched --unit id used to be
+    distinguishable from "the filter silently did nothing" only by a
+    caller cross-referencing the bare filters echo against an empty
+    units list themselves. A visible note is now present instead."""
+    payload = pr.project_comprehension(**_base_kwargs(
+        modules=[_unit("u1")], unit_id="does-not-exist"))
+    assert payload["units"] == []
+    assert "does-not-exist" in payload["unit_or_feature_filter_note"]
+
+
+def test_a_nonexistent_feature_id_also_carries_the_filter_note_f10():
+    payload = pr.project_comprehension(**_base_kwargs(
+        modules=[_unit("u1")], features=[_feature("f1", ["u1"])],
+        feature_id="does-not-exist"))
+    assert payload["units"] == []
+    assert "does-not-exist" in payload["unit_or_feature_filter_note"]
+
+
+def test_no_filter_note_when_unit_and_feature_filters_are_absent_f10():
+    payload = pr.project_comprehension(**_base_kwargs(modules=[_unit("u1")]))
+    assert "unit_or_feature_filter_note" not in payload
+
+
+def test_no_filter_note_when_a_unit_id_actually_matches_f10():
+    payload = pr.project_comprehension(**_base_kwargs(
+        modules=[_unit("u1")], unit_id="u1"))
+    assert payload["units"] != []
+    assert "unit_or_feature_filter_note" not in payload
+
+
 def test_filters_key_echoes_every_applied_filter_verbatim():
     """FIX ROUND 17 (thirteenth cold read, CR13-9 MINOR): report --json
     must echo its applied filters so a caller can positively confirm
