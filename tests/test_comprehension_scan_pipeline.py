@@ -920,6 +920,58 @@ def test_scan_json_boundaries_list_is_bounded_not_unbounded(
     assert scan_doc["boundaries_omitted_count"] == 1
 
 
+def test_report_and_status_surface_a_reparse_point_boundary(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 22 (eighteenth cold read, F5 MAJOR, completeness): the
+    reader's own .cr18-link shape - a reparse-point boundary concealing
+    a real source tree was recorded in scan.json's own `boundaries` but
+    NEITHER `report --json` NOR `status --json` ever surfaced it - a
+    consumer of either saw complete/0 problems/exclusions that quietly
+    omit the entire skipped subtree, with no way to independently judge
+    whether a boundary might be hiding real, unscanned source. Injects
+    a synthetic boundary via discovery.enumerate_scope's own return
+    value (real junction/symlink creation is not permitted in this
+    sandbox, the same established technique the scan.json-level tests
+    above already use)."""
+    import dataclasses
+
+    from agenttalk.comprehension import discovery as discoverymod
+
+    real_enumerate_scope = discoverymod.enumerate_scope
+
+    def _enumerate_scope(root, comprehension_dir):
+        result = real_enumerate_scope(root, comprehension_dir)
+        boundary = discoverymod.BoundaryEntry(
+            relative_path="vendor/external-link", boundary_kind="symlink")
+        return dataclasses.replace(result, boundaries=[*result.boundaries, boundary])
+
+    monkeypatch.setattr(scan_pipeline.discovery, "enumerate_scope", _enumerate_scope)
+
+    scan_pipeline.run_scan(java_repo)
+    report = scan_pipeline.get_report(java_repo)
+    status = scan_pipeline.get_status(java_repo)
+
+    assert report["boundaries"] == [{"path": "vendor/external-link", "kind": "symlink"}]
+    assert report["boundaries_omitted_count"] == 0
+    assert status["boundary_count"] == 1
+
+
+def test_report_and_status_show_zero_boundaries_on_a_boundary_free_repo(
+    java_repo: Path,
+) -> None:
+    """Companion control: an ordinary repo with no reparse-point/symlink
+    boundary at all shows empty/zero in both surfaces, never a stale or
+    fabricated value."""
+    scan_pipeline.run_scan(java_repo)
+    report = scan_pipeline.get_report(java_repo)
+    status = scan_pipeline.get_status(java_repo)
+
+    assert report["boundaries"] == []
+    assert report["boundaries_omitted_count"] == 0
+    assert status["boundary_count"] == 0
+
+
 def test_canary_sweep_no_artifact_or_report_leaks_the_absolute_root_or_a_planted_canary(
     java_repo: Path, monkeypatch,
 ) -> None:

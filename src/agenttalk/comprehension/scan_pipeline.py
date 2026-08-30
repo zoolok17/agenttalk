@@ -1212,6 +1212,19 @@ def get_status(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
         "generated_at": _scan_field(scan_doc, "generated_at", scan_id),
         "adapters": _scan_field(scan_doc, "adapters", scan_id),
         "problem_count": _scan_field(scan_doc, "problem_count", scan_id),
+        # FIX ROUND 22 (eighteenth cold read, F5 MAJOR, completeness): a
+        # reparse-point boundary concealing a real source tree was
+        # recorded in scan.json's own bounded `boundaries` list but
+        # never surfaced here - status previously gave no hint at all
+        # that a boundary might be hiding unscanned source. The TRUE
+        # total (the bounded list's own length plus whatever this run's
+        # own cap omitted) - status's own read-cost tier (scan.json
+        # only, no other artifact) makes a bare count the right size
+        # here; `report --json` carries the full bounded list.
+        "boundary_count": (
+            len(_scan_field(scan_doc, "boundaries", scan_id))
+            + _scan_field(scan_doc, "boundaries_omitted_count", scan_id)
+        ),
         "record_counts": _scan_field(scan_doc, "record_counts", scan_id),
         "root_binding": _scan_field(scan_doc, "root_binding", scan_id),
         # Note 1 (second cold read, fix round 4): this function's own
@@ -1393,6 +1406,19 @@ def get_report(
     payload["excluded_roots"] = _scan_field(records["scan"], "excluded_roots", scan_id)
     payload["excluded_roots_omitted_count"] = _scan_field(
         records["scan"], "excluded_roots_omitted_count", scan_id)
+    # FIX ROUND 22 (eighteenth cold read, F5 MAJOR, completeness): a
+    # reparse-point boundary concealing a real source tree is recorded
+    # in scan.json's own `boundaries` (M4/round 6) but neither
+    # `report --json` NOR `status --json` ever surfaced it - a consumer
+    # saw complete/0 problems/exclusions that quietly omit the entire
+    # skipped subtree, with no way to independently judge whether a
+    # boundary might be hiding real, unscanned source (R-15a requires
+    # report expose indexed/excluded scope + caps/truncation). Layered
+    # onto the projection the same way `excluded_roots` already is
+    # (round 20's own m2), never recomputed here.
+    payload["boundaries"] = _scan_field(records["scan"], "boundaries", scan_id)
+    payload["boundaries_omitted_count"] = _scan_field(
+        records["scan"], "boundaries_omitted_count", scan_id)
     return payload
 
 
