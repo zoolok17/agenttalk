@@ -116,6 +116,24 @@ def _dependency_summary(dependencies: list[DependencyRecord]) -> dict[str, int]:
     return summary
 
 
+def _entry_points_by_kind(entry_points: list[EntryPointRecord]) -> dict[str, int]:
+    """FIX ROUND 21b (reviewer-3's re-delta, THE MAJOR's own counted-
+    means question, taken): ``counts.entry_points`` is a single bare
+    total across every kind - harmless while every kind genuinely served
+    a request, but ``http_filter`` (this round's own new kind - a filter
+    INTERCEPTS, it does not serve) now shares that same total, so "how
+    many entry points does this app have" no longer answers "how many
+    does it SERVE" on its own. ``counts.entry_points`` itself is
+    UNCHANGED (still the full superset count, the same discipline
+    ``_dependency_summary``'s own ``unresolved`` already follows) - this
+    is a new, separate per-kind breakdown a caller can read instead of
+    guessing from the bare total."""
+    by_kind: dict[str, int] = {}
+    for entry_point in entry_points:
+        by_kind[entry_point.kind] = by_kind.get(entry_point.kind, 0) + 1
+    return dict(sorted(by_kind.items()))
+
+
 def _fan_counts(dependencies: list[DependencyRecord]) -> tuple[dict[str, int], dict[str, int]]:
     fan_out: dict[str, int] = {}
     fan_in: dict[str, int] = {}
@@ -415,6 +433,7 @@ def project_comprehension(
             "dependencies": len(dependencies),
             "features": len(features),
             "entry_points": len(entry_points),
+            "entry_points_by_kind": _entry_points_by_kind(entry_points),
             "readiness_signals": len(readiness_signals),
             "problems": len(problems),
         },

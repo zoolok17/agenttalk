@@ -2341,13 +2341,22 @@ public class DispatcherServlet extends HttpServlet {
     assert [r.target for r in routes] == ["/api/*"]
 
 
-def test_web_filter_annotation_publishes_its_own_url_patterns_as_routes():
+def test_web_filter_annotation_publishes_its_own_url_patterns_as_a_distinct_filter_kind():
     """FIX ROUND 21 (seventeenth cold read, CR17-3 MAJOR, wrong-data -
     JUDGE, taken): @WebFilter shares @WebServlet's own shape exactly
-    (class-level, not composable, urlPatterns IS the complete served
-    pattern) - contained enough to MODEL as a real route, unlike
+    (class-level, not composable, urlPatterns IS the complete
+    intercepted pattern) - contained enough to MODEL, unlike
     @WebListener (a lifecycle callback, enrolled as unsupported
-    instead, see the companion test below)."""
+    instead, see the companion test below).
+
+    FIX ROUND 21b (reviewer-3's re-delta, THE MAJOR, wrong-data,
+    OVERTURNS round 21's own kind="http_route" choice): a filter
+    INTERCEPTS, it does not SERVE - publishing kind="http_route" made
+    an app with one served endpoint plus one filter inventory as TWO
+    served routes, byte-identically. Now kind="http_filter" - the URL
+    pattern still survives as real migration information (the route
+    edge below, and the entry point's own name), just under a kind that
+    is never confused with a served route."""
     src = """
 package p;
 
@@ -2358,9 +2367,10 @@ public class AuthFilter implements Filter {
     result = java.parse_java_source("AuthFilter.java", src)
     routes = _edges(result, "route")
     assert sorted(r.target for r in routes) == ["/api/*", "/secure/*"]
-    http_entry_points = [e for e in result.entry_points if e.kind == "http_route"]
-    assert sorted(e.name for e in http_entry_points) == ["/api/*", "/secure/*"]
-    assert all(e.qualified_name == "p.AuthFilter" for e in http_entry_points)
+    assert not any(e.kind == "http_route" for e in result.entry_points)
+    filter_entry_points = [e for e in result.entry_points if e.kind == "http_filter"]
+    assert sorted(e.name for e in filter_entry_points) == ["/api/*", "/secure/*"]
+    assert all(e.qualified_name == "p.AuthFilter" for e in filter_entry_points)
 
 
 def test_web_listener_annotation_is_enrolled_not_confidently_absent():
@@ -2384,11 +2394,20 @@ public class AppLifecycleListener implements ServletContextListener {
     assert not any(e.kind == "http_route" for e in result.entry_points)
 
 
-def test_web_xml_filter_is_enrolled_attributed_to_its_own_filter_class():
+def test_web_xml_filter_is_modeled_as_http_filter_attributed_to_its_own_filter_class():
     """FIX ROUND 21 (CR17-3 MAJOR, wrong-data): a web.xml <filter> - the
-    direct XML twin of <servlet> - used to publish nothing at all. Now
-    enrolled as unsupported_entry_point_shape, attributed to its own
-    <filter-class> when declared."""
+    direct XML twin of <servlet> - used to publish nothing at all.
+
+    FIX ROUND 21b (reviewer-3's re-delta, THE MAJOR's own web.xml-
+    symmetry question, taken - OVERTURNS round 21's own enroll-only
+    choice): <servlet>/<servlet-mapping> already models at this exact
+    fidelity (CR13-2, round 17) - leaving <filter>/<filter-mapping>
+    enrolled-only was the identical two-opposite-answers contradiction
+    the reviewer raised for @WebFilter, just for the XML shape instead
+    of the annotation. Now MODELED, joined against <filter-mapping>'s
+    own filter-name the same way a servlet-mapping already joins
+    <servlet-class>, published as kind="http_filter" - never
+    "http_route", a filter intercepts, it does not serve."""
     web_xml = """<web-app>
   <filter>
     <filter-name>auth</filter-name>
@@ -2401,12 +2420,12 @@ def test_web_xml_filter_is_enrolled_attributed_to_its_own_filter_class():
 </web-app>
 """
     entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
-    assert any(
-        p.reason_code == "unsupported_entry_point_shape"
-        and p.qualified_name == "com.acme.web.AuthFilter"
-        for p in problems
-    )
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in problems)
     assert not any(e.kind == "http_route" for e in entry_points)
+    filter_entry_points = [e for e in entry_points if e.kind == "http_filter"]
+    assert len(filter_entry_points) == 1
+    assert filter_entry_points[0].qualified_name == "com.acme.web.AuthFilter"
+    assert filter_entry_points[0].name == "/*"
 
 
 def test_web_xml_listener_is_enrolled_attributed_to_its_own_listener_class():
@@ -2429,20 +2448,30 @@ def test_web_xml_listener_is_enrolled_attributed_to_its_own_listener_class():
     assert entry_points == []
 
 
-def test_web_xml_filter_with_no_filter_class_is_still_enrolled_with_no_qualified_name():
-    """Companion negative case: a malformed/incomplete <filter> (no
-    <filter-class>) still records the gap - never confidently absent -
-    just with no owner to attribute it to."""
+def test_web_xml_filter_with_no_filter_class_falls_back_to_the_synthetic_owner():
+    """FIX ROUND 21b: companion negative case for the now-modeled
+    <filter>/<filter-mapping> pair - a malformed/incomplete <filter>
+    (no <filter-class>) is simply not in ``_filter_class_by_name``'s own
+    mapping, so its <filter-mapping> falls back to the synthetic
+    ``{relative_path}#{filter_name}`` owner, the exact same accepted
+    asymmetry an unmatched <servlet-mapping> already has (round 17's own
+    CR13-2 docstring) - never a silent drop, still published."""
     web_xml = """<web-app>
   <filter>
     <filter-name>auth</filter-name>
   </filter>
+  <filter-mapping>
+    <filter-name>auth</filter-name>
+    <url-pattern>/*</url-pattern>
+  </filter-mapping>
 </web-app>
 """
     entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
-    matching = [p for p in problems if p.reason_code == "unsupported_entry_point_shape"]
-    assert len(matching) == 1
-    assert matching[0].qualified_name is None
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in problems)
+    filter_entry_points = [e for e in entry_points if e.kind == "http_filter"]
+    assert len(filter_entry_points) == 1
+    assert filter_entry_points[0].qualified_name == "WEB-INF/web.xml#auth"
+    assert filter_entry_points[0].name == "/*"
 
 
 def test_jax_rs_path_composes_class_and_method_level_like_spring_request_mapping():

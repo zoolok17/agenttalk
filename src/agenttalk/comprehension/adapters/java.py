@@ -123,22 +123,27 @@ UNSUPPORTED_INVOKE_SHAPES = ("constructor_call",)
 #: reviewer-3 ratifies.
 #: FIX ROUND 21 (seventeenth cold read, CR17-3 MAJOR, wrong-data): a
 #: servlet ``<listener>``/``@WebListener`` (a lifecycle callback, no URL
-#: pattern of its own to model as a route) and a servlet ``<filter>``/
-#: ``<filter-mapping>`` declared via plain web.xml XML (as opposed to
-#: the ``@WebFilter`` annotation, contained enough to actually MODEL as
-#: a route below - see the loop beside ``_WEB_FILTER_ANNOTATION_RE``) -
-#: the direct twins of the already-modeled servlet-mapping/@WebServlet
-#: shapes, previously unrecognized entirely: zero entry points AND the
-#: confident negative, on a complete run, for a real, common JEE idiom.
-#: ``web_xml_listener`` names BOTH the XML ``<listener>`` element and
-#: the ``@WebListener`` annotation - same underlying gap (a lifecycle
-#: callback with no route to model) regardless of which mechanism
-#: declares it.
+#: pattern of its own to model as a route) declared via web.xml XML or
+#: the annotation form - previously unrecognized entirely: zero entry
+#: points AND the confident negative, on a complete run, for a real,
+#: common JEE idiom. ``web_xml_listener`` names BOTH the XML
+#: ``<listener>`` element and the ``@WebListener`` annotation - same
+#: underlying gap (a lifecycle callback with no route to model)
+#: regardless of which mechanism declares it.
+#:
+#: FIX ROUND 21b (reviewer-3's re-delta, THE MAJOR's own web.xml-
+#: symmetry question, taken): ``web_xml_filter`` (web.xml's own
+#: ``<filter>``/``<filter-mapping>``) is RETIRED from this tuple - round
+#: 21 enrolled it here reasoning it was less contained than
+#: ``@WebFilter``, but it is now modeled the same way (see
+#: ``_filter_class_by_name``/``parse_web_xml`` below), at the exact same
+#: fidelity ``<servlet>``/``<servlet-mapping>`` already models with -
+#: consistent, not a special case.
 UNSUPPORTED_ENTRY_POINT_SHAPES = (
     "jax_ws_web_method", "jax_rs_verb_only_method",
     "spring_scheduled", "kafka_listener", "jms_message_driven",
     "ejb_remote_component", "websocket_server_endpoint",
-    "web_xml_listener", "web_xml_filter",
+    "web_xml_listener",
 )
 
 #: FIX ROUND 15 (eleventh cold read, F3 MAJOR, wrong-data): the ORIGINAL
@@ -784,7 +789,16 @@ class JavaEdgeClaim:
 @dataclass(frozen=True)
 class JavaEntryPointClaim:
     qualified_name: str
-    kind: str  # "cli_main" | "http_route"
+    # FIX ROUND 21b (reviewer-3's re-delta, THE MAJOR, wrong-data):
+    # "http_filter" is a DISTINCT kind from "http_route" - a filter
+    # INTERCEPTS every request matching its own url-pattern, it does not
+    # SERVE one (the same class publishing both a served route and a
+    # filter is two real, different things, not one construct double-
+    # counted as if an app had two served endpoints for one). See
+    # UNSUPPORTED_ENTRY_POINT_SHAPES's own docstring for the enrolled
+    # (unmodeled) shapes this adapter still only acknowledges rather
+    # than composes.
+    kind: str  # "cli_main" | "http_route" | "http_filter"
     name: str
     line: int | None
     evidence_class: str
@@ -2313,7 +2327,29 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     # FIX ROUND 21 (seventeenth cold read, CR17-3 MAJOR, wrong-data -
     # JUDGE, taken): @WebFilter shares @WebServlet's own shape exactly -
     # same fail-safes, same composition semantics (none - a filter's own
-    # value/urlPatterns IS the complete served pattern).
+    # value/urlPatterns IS the complete intercepted pattern).
+    #
+    # FIX ROUND 21b (reviewer-3's re-delta, THE MAJOR, wrong-data,
+    # OVERTURNS round 21's own kind="http_route" choice): a filter
+    # INTERCEPTS every request matching its own url-pattern, it does not
+    # SERVE one - publishing it as kind="http_route" made an app with
+    # one real served endpoint plus one filter inventory as TWO served
+    # routes, byte-shaped identically, and made ``entry_points_mapped``
+    # a confident positive about a non-serving class. Kind is now the
+    # dedicated "http_filter" - the URL pattern still survives as real
+    # migration information (both the edge below and the entry point's
+    # own ``name``), just never counted or read as a served endpoint
+    # (see ``projector.py``'s own ``entry_points_by_kind`` breakdown).
+    # Deliberately NOT added to ``classes_with_route_entry_points`` -
+    # that set means "this class has a real SERVED route," which a
+    # filter-only class does not (unrelated in practice to the two JAX-
+    # RS-specific checks that set feeds, but precise naming matters here
+    # given how easily "route" and "filter" have already been conflated
+    # once). The edge's own ``relation`` stays "route" unchanged - the
+    # design's own relation vocabulary is closed (R-11a) and has no
+    # dedicated "filter" bucket; "route" is still the closest real
+    # relation for a URL-pattern-shaped association, entry-point kind
+    # aside.
     for match in _WEB_FILTER_ANNOTATION_RE.finditer(sanitized):
         line = _line_at(newline_offsets, match.start())
         target_type = _class_level_route_target(match.start(), class_header_associations)
@@ -2336,14 +2372,13 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             ))
             continue
         for path in paths:
-            classes_with_route_entry_points.add(target_type)
             edges.append(JavaEdgeClaim(
                 from_qualified_name=target_type, relation="route", target=path,
                 target_kind="external_route", evidence_class="declared",
                 line=line, phase="runtime",
             ))
             entry_points.append(JavaEntryPointClaim(
-                qualified_name=target_type, kind="http_route",
+                qualified_name=target_type, kind="http_filter",
                 name=path, line=line, evidence_class="declared",
             ))
 
@@ -3064,20 +3099,56 @@ def _servlet_class_by_name(sanitized: str) -> dict[str, str]:
 
 #: FIX ROUND 21 (seventeenth cold read, CR17-3 MAJOR, wrong-data): a
 #: web.xml ``<filter>``/``<filter-mapping>`` pair - the direct XML twin
-#: of ``<servlet>``/``<servlet-mapping>``, but NOT modeled as a route
-#: here the way a servlet mapping is (unlike ``@WebFilter``, contained
-#: enough to model above, the XML form's own url-pattern is enrolled as
-#: an unsupported shape instead - see UNSUPPORTED_ENTRY_POINT_SHAPES's
-#: own docstring for the reasoning). ``<filter>`` alone (no separate
-#: mapping needed) already names its own implementing class directly.
+#: of ``<servlet>``/``<servlet-mapping>``. ``<filter>`` alone (no
+#: separate mapping needed) already names its own implementing class
+#: directly.
+#:
+#: FIX ROUND 21b (reviewer-3's re-delta, THE MAJOR's own web.xml-
+#: symmetry question, taken): round 21 enrolled this shape as an
+#: unsupported gap rather than modeling it, reasoning it was less
+#: contained than ``@WebFilter`` - but the contradiction the reviewer
+#: raised cuts both ways: ``<servlet>``/``<servlet-mapping>`` already
+#: models at this SAME fidelity (CR13-2, round 17), so leaving
+#: ``<filter>``/``<filter-mapping>`` enrolled-only was two opposite
+#: answers for the two structurally IDENTICAL XML shapes, not just for
+#: the annotation-vs-XML pair the reviewer named. Modeled the same way
+#: below, joined against ``<filter-mapping>`` the same way
+#: ``_servlet_class_by_name`` already joins servlet mappings.
 _FILTER_BLOCK_RE = re.compile(r"<filter>(.*?)</filter>", re.DOTALL)
 _FILTER_NAME_RE = re.compile(r"<filter-name>([^<]+)</filter-name>")
 _FILTER_CLASS_RE = re.compile(r"<filter-class>\s*([^<]+?)\s*</filter-class>")
+_FILTER_MAPPING_BLOCK_RE = re.compile(r"<filter-mapping>(.*?)</filter-mapping>", re.DOTALL)
 #: A ``<listener>`` element names its own implementing class directly -
 #: no separate mapping/name indirection at all (a listener has no URL
 #: pattern of its own; it is a lifecycle callback, registered wholesale).
+#: Stays enrolled-only (never modeled) - unlike a filter or servlet,
+#: there is no url-pattern here to compose a real route/filter target
+#: from, so there is nothing this producer's declared-only bar would
+#: let it publish beyond the bare fact that a listener exists.
 _LISTENER_BLOCK_RE = re.compile(r"<listener>(.*?)</listener>", re.DOTALL)
 _LISTENER_CLASS_RE = re.compile(r"<listener-class>\s*([^<]+?)\s*</listener-class>")
+
+
+def _filter_class_by_name(sanitized: str) -> dict[str, str]:
+    """FIX ROUND 21b (THE MAJOR's own web.xml-symmetry follow-through):
+    web.xml's own ``<filter>`` element (``<filter-name>``/
+    ``<filter-class>`` pair), joined below against ``<filter-mapping>``'s
+    own filter-name - the exact same join ``_servlet_class_by_name``
+    already performs for servlets. A filter-name with no matching
+    ``<filter>`` block (malformed, or genuinely absent) is simply not in
+    this mapping - callers keep the synthetic ``{relative_path}#{filter_
+    name}`` fallback for it, the same asymmetry already accepted for an
+    unmatched servlet-mapping."""
+    mapping: dict[str, str] = {}
+    for block_match in _FILTER_BLOCK_RE.finditer(sanitized):
+        block = block_match.group(1)
+        name_match = _FILTER_NAME_RE.search(block)
+        class_match = _FILTER_CLASS_RE.search(block)
+        if name_match is None or class_match is None:
+            continue
+        mapping[name_match.group(1).strip()] = _bounded_route_target(
+            class_match.group(1).strip())
+    return mapping
 
 
 def parse_web_xml(
@@ -3106,12 +3177,21 @@ def parse_web_xml(
     ``<filter>``/``<filter-mapping>`` or ``<listener>`` element - direct
     twins of the already-modeled servlet shapes - used to publish
     nothing at all, on a complete run, for a real and common JEE idiom.
-    Each declared ``<filter>``/``<listener>`` now records a named
-    ``unsupported_entry_point_shape`` problem, attributed to its own
-    implementing class when the element is well-formed enough to name
-    one (never a guessed or fabricated entry point - this producer does
-    not model these shapes' own request-handling semantics, only
-    acknowledges that a recognized mechanism exists)."""
+    A declared ``<listener>`` records a named ``unsupported_entry_point_
+    shape`` problem, attributed to its own implementing class when the
+    element is well-formed enough to name one (never a guessed or
+    fabricated entry point - this producer does not model a listener's
+    own lifecycle-callback semantics, only acknowledges that a
+    recognized mechanism exists).
+
+    FIX ROUND 21b (reviewer-3's re-delta, THE MAJOR's own web.xml-
+    symmetry follow-through): ``<filter>``/``<filter-mapping>`` is now
+    MODELED, not merely enrolled - each mapping's own ``<filter-class>``
+    (via ``_filter_class_by_name``) becomes the entry point's
+    ``qualified_name`` the same way a servlet-mapping's own
+    ``<servlet-class>`` already does, published with ``kind=
+    "http_filter"`` (never ``"http_route"`` - a filter intercepts, it
+    does not serve; see ``JavaEntryPointClaim.kind``'s own docstring)."""
     entry_points = []
     problems = []
     sanitized = _strip_xml_comments(text)
@@ -3136,20 +3216,31 @@ def parse_web_xml(
                 name=url_pattern, line=_line_at(newline_offsets, absolute_offset),
                 evidence_class="declared",
             ))
-    for block_match in _FILTER_BLOCK_RE.finditer(sanitized):
+    filter_class_by_name = _filter_class_by_name(sanitized)
+    for block_match in _FILTER_MAPPING_BLOCK_RE.finditer(sanitized):
         block = block_match.group(1)
-        class_match = _FILTER_CLASS_RE.search(block)
-        qualified_name = (
-            _bounded_route_target(class_match.group(1).strip())
-            if class_match is not None else None)
-        problems.append(JavaAdapterProblem(
-            reason_code="unsupported_entry_point_shape",
-            detail=f"a <filter> declared at line {_line_at(newline_offsets, block_match.start())} "
-                   "names a recognized entry-point mechanism (web_xml_filter) this adapter "
-                   "does not model - no entry point published, but not confidently absent "
-                   "either",
-            qualified_name=qualified_name,
-        ))
+        name_match = _FILTER_NAME_RE.search(block)
+        if name_match is None:
+            # Same silent-drop shape round 15b's own JUDGE carry already
+            # names for a nameless <servlet-mapping> - not a new gap.
+            continue
+        filter_name = name_match.group(1).strip()
+        owner_qualified_name = filter_class_by_name.get(
+            filter_name, f"{relative_path}#{filter_name}")
+        # NAMED LIMIT: a <filter-mapping> may target a <servlet-name>
+        # instead of a <url-pattern> (dispatch "apply to whichever URLs
+        # this named servlet handles") - a real, DTD-valid alternative
+        # shape this producer does not compose a target from; such a
+        # mapping publishes no entry point, silently, the same accepted
+        # asymmetry as an unmatched filter/servlet-mapping pair above.
+        for pattern_match in _SERVLET_MAPPING_URL_PATTERN_RE.finditer(block):
+            url_pattern = _bounded_route_target(pattern_match.group(1).strip())
+            absolute_offset = block_match.start(1) + pattern_match.start()
+            entry_points.append(JavaEntryPointClaim(
+                qualified_name=owner_qualified_name, kind="http_filter",
+                name=url_pattern, line=_line_at(newline_offsets, absolute_offset),
+                evidence_class="declared",
+            ))
     for block_match in _LISTENER_BLOCK_RE.finditer(sanitized):
         block = block_match.group(1)
         class_match = _LISTENER_CLASS_RE.search(block)

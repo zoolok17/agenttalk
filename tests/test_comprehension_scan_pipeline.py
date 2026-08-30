@@ -111,6 +111,80 @@ def test_scan_json_names_unsupported_entry_point_shapes_as_a_declared_gap(
         java_adapter.UNSUPPORTED_ENTRY_POINT_SHAPES)
 
 
+def test_a_served_route_a_filter_and_a_listener_report_correctly_distinct_shapes(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 21b (reviewer-3's re-delta, THE MAJOR, wrong-data,
+    end-to-end): the reviewer's own 3-class shape verbatim - one class
+    with a real served route (@WebServlet), one with an interception-
+    only @WebFilter, one lifecycle-only @WebListener. Before this fix,
+    the filter published kind=http_route indistinguishable from the
+    servlet's own real route, inflating an app with ONE served endpoint
+    to look like TWO. Now: exactly one served route in the served
+    count, the filter visible under its own http_filter kind (not
+    counted as served), and the listener still unmodeled (enrolled as
+    unsupported_entry_point_shape, never a confident negative)."""
+    import json
+
+    pkg_dir = java_repo / "src" / "main" / "java" / "p"
+    (pkg_dir / "OrdersServlet.java").write_text(
+        'package p;\n@WebServlet("/orders")\npublic class OrdersServlet '
+        'extends HttpServlet {}\n',
+        encoding="utf-8",
+    )
+    (pkg_dir / "AuthFilter.java").write_text(
+        'package p;\n@WebFilter(urlPatterns = {"/api/*"})\n'
+        "public class AuthFilter implements Filter {}\n",
+        encoding="utf-8",
+    )
+    (pkg_dir / "AppLifecycleListener.java").write_text(
+        "package p;\n@WebListener\npublic class AppLifecycleListener "
+        "implements ServletContextListener {}\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    report = scan_pipeline.get_report(java_repo)
+
+    assert report["counts"]["entry_points_by_kind"].get("http_route") == 1
+    assert report["counts"]["entry_points_by_kind"].get("http_filter") == 1
+    assert "http_route" not in [
+        e["kind"] for e in report["entry_points"] if e["name"] == "/api/*"]
+    filter_entries = [e for e in report["entry_points"] if e["name"] == "/api/*"]
+    assert len(filter_entries) == 1
+    assert filter_entries[0]["kind"] == "http_filter"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    listener_problems = [
+        p for p in problems_doc["problems"]
+        if p.get("qualified_name") == "p.AppLifecycleListener"
+        and p["reason_code"] == "unsupported_entry_point_shape"
+    ]
+    assert len(listener_problems) == 1
+    # The listener publishes no entry point at all (only the problem
+    # above) - just the java_repo fixture's own App.main (cli_main) plus
+    # the served route and the filter, nothing from the listener.
+    assert len(report["entry_points"]) == 3
+    assert report["counts"]["entry_points_by_kind"] == {
+        "cli_main": 1, "http_filter": 1, "http_route": 1,
+    }
+
+    # DECIDED (round 21b, THE MAJOR's own entry_points_mapped question):
+    # a filter-only unit still reports entry_points_mapped satisfied -
+    # this signal answers "did this run find a real, evidenced boundary
+    # construct," not "does this unit serve a complete route," and a
+    # declared filter genuinely is such a construct.
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    filter_unit_id = next(
+        u["unit_id"] for u in modules_doc["units"]
+        if u["kind"] == "component" and u["display_name"] == "AuthFilter")
+    filter_signal = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == filter_unit_id and s["check"] == "entry_points_mapped")
+    assert filter_signal["stored_status"] == "satisfied"
+
+
 def test_run_scan_web_servlet_and_jax_rs_routes_publish_end_to_end_cr13_c(
     java_repo: Path,
 ) -> None:

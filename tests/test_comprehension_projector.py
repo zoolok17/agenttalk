@@ -44,9 +44,11 @@ def _feature(feature_id: str, unit_ids: list[str], state: str = "candidate") -> 
     )
 
 
-def _entry_point(entry_point_id: str, owning_unit_id: str, feature_ids: list[str]) -> EntryPointRecord:
+def _entry_point(
+    entry_point_id: str, owning_unit_id: str, feature_ids: list[str], *, kind: str = "http_route",
+) -> EntryPointRecord:
     return EntryPointRecord(
-        entry_point_id=entry_point_id, kind="http_route", name="/x",
+        entry_point_id=entry_point_id, kind=kind, name="/x",
         owning_unit_id=owning_unit_id, feature_ids=feature_ids, evidence_class="declared",
     )
 
@@ -82,6 +84,28 @@ def test_counts_and_freshness_stub():
         "state": "not_evaluated", "reason_code": "freshness_not_implemented_this_slice",
     }
     assert payload["schema_version"] == pr.PROJECTION_SCHEMA_VERSION
+
+
+def test_entry_points_by_kind_breaks_down_the_bare_total_by_kind():
+    """FIX ROUND 21b (reviewer-3's re-delta, THE MAJOR's own counted-
+    means question): counts.entry_points is a single bare total across
+    every kind - http_filter (round 21b's own new kind - a filter
+    intercepts, it does not serve) sharing that total means "how many
+    entry points" no longer answers "how many are SERVED" on its own.
+    counts.entry_points itself stays the unchanged full superset (never
+    renamed) - entry_points_by_kind is the new, separate breakdown a
+    caller reads instead of guessing from the bare total."""
+    entry_points = [
+        _entry_point("ep-route", "u1", [], kind="http_route"),
+        _entry_point("ep-filter-1", "u1", [], kind="http_filter"),
+        _entry_point("ep-filter-2", "u2", [], kind="http_filter"),
+        _entry_point("ep-cli", "u3", [], kind="cli_main"),
+    ]
+    payload = pr.project_comprehension(**_base_kwargs(entry_points=entry_points))
+    assert payload["counts"]["entry_points"] == 4
+    assert payload["counts"]["entry_points_by_kind"] == {
+        "cli_main": 1, "http_filter": 2, "http_route": 1,
+    }
 
 
 # ----------------------------------------------------------- filters

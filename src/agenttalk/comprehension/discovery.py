@@ -290,6 +290,17 @@ def _excluded_directory_contains_a_code_bearing_file(directory: Path) -> tuple[b
 #: coincidentally-named ``generated`` directory living somewhere ELSE
 #: inside an excluded tree (e.g. ``target/some-vendor-lib/generated/``)
 #: is NOT this recognized position and still counts as evidence.
+#:
+#: DECLARED (round 21b, reviewer-3's re-delta, item 4(a)): the
+#: ``startswith`` match below exempts a code-bearing file at ANY DEPTH
+#: under a recognized position, not merely a direct child - a real,
+#: accepted trade: first-party source someone deliberately (or
+#: accidentally) parked several directories deep under a genuine
+#: ``generated-sources/`` root goes UNDETECTED by this peek specifically.
+#: The reactor rule (round 20's own M1+M2) is the only backstop left for
+#: that shape - it still fires independently whenever a pom's own
+#: declared ``<module>`` path resolves into the excluded region,
+#: regardless of what this peek alone concluded.
 _RECOGNIZED_GENERATED_OUTPUT_POSITIONS = (
     "generated-sources/", "generated-test-sources/", "generated/",
 )

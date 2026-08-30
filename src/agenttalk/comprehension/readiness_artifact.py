@@ -602,6 +602,24 @@ def _check_entry_points_mapped(unit: ModuleRecord, has_entry_point: bool) -> Rea
             unit.unit_id, "entry_points_mapped", "unknown", "detected",
             _propagated_reason_spelling(entry_point_reasons[0]),
         )
+    # FIX ROUND 21b (reviewer-3's re-delta, THE MAJOR's own entry_points_
+    # mapped question, DECIDED - satisfied-with-the-distinct-kind, not a
+    # filter-specific treatment): ``has_entry_point`` is kind-agnostic by
+    # construction (derived from ``features.py``'s own unit-owns-a-
+    # feature rollup, which does not look at kind either) - a unit whose
+    # ONLY entry point is now a ``http_filter`` (round 21b's own new
+    # kind) still reports ``satisfied`` here, unchanged. This signal
+    # answers the design's own question ("externally visible entry
+    # points are mapped") - whether THIS run found a real, evidenced,
+    # boundary-crossing construct for the unit - not "does this unit
+    # serve a complete, servable HTTP route." A declared servlet filter
+    # genuinely IS such a construct (every matching request passes
+    # through it) even though it does not itself serve one; a NEW
+    # filter-specific readiness value would need its own vocabulary
+    # entry for a claim ("mapped, but only to an interception point")
+    # this slice's own six-signal floor does not need to make. Consistent
+    # with ``cli_main``/``http_route`` already sharing this same
+    # heterogeneous "is-there-an-entry-point" signal today.
     if has_entry_point:
         return _signal(unit.unit_id, "entry_points_mapped", "satisfied", "detected", "entry_point_mapped")
     return _signal(

@@ -442,6 +442,18 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                 # SAME mechanism the resource cap already relies on -
                 # any WorkerProblem for this path already makes it
                 # ineligible for a confident external claim.
+                #
+                # DECLARED (round 21b, reviewer-3's re-delta, item 4(b)):
+                # this check false-positives on a file that is genuinely
+                # valid UTF-8 but happens to contain a LEGITIMATE literal
+                # U+FFFD character (in a string constant, a comment, ...)
+                # - a real if rare shape. Accepted: the cost is a one-
+                # sided OVER-report (this file's own adapter analysis is
+                # skipped and its importers under-claim, resolving
+                # unresolved instead of a resolved internal edge, never a
+                # WRONG claim in the other direction), and the recorded
+                # detail already states this as evidence ("likely Latin-
+                # 1/CP1252 ... ") rather than a certain conclusion.
                 if "�" in text:
                     problems.append(WorkerProblem(
                         reason_code="encoding_undecodable", relative_path=rel,
