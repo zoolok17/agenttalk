@@ -300,14 +300,19 @@ problem rather than two silently merged units.
   states, exclusions, unsupported files, generated/vendor handling, resource
   omissions, conflicts, and problems.
 
-`scan.json`'s `unsupported_relations`, `unsupported_invoke_shapes`, and
-`unsupported_entry_point_shapes` are a STATIC CAPABILITY DECLARATION - the
-named, enumerated set of recognized-but-unmodeled shapes this producer VERSION
-carries, published unconditionally on every run regardless of whether that run
-actually contains a matching shape. A per-run INSTANCE of any of these gaps is
-what `problems.json`'s own reason-coded records already surface, one per
-affected file or unit - these three fields answer "what can this version not
-model," never "did this run hit one."
+`scan.json`'s `unsupported_relations`, `unsupported_invoke_shapes`,
+`unsupported_entry_point_shapes`, and `entry_point_kinds` are a STATIC
+CAPABILITY DECLARATION - the named, enumerated set of recognized-but-unmodeled
+shapes (the first three) or recognized, closed, meaning-bearing values (the
+fourth) this producer VERSION carries, published unconditionally on every run
+regardless of whether that run actually contains a matching shape or kind. A
+per-run INSTANCE of any of these is what `problems.json`'s or `features.json`'s
+own records already surface, one per affected file, unit, or entry point -
+these four fields answer "what can this version publish, and what does it
+mean," never "did this run hit one." (`entry_point_kinds` added round 21c: a
+consumer reading an entry point's own `kind` - e.g. `"http_filter"` - needs a
+declared meaning to know it is deliberately excluded from a "served route"
+count, not merely a differently-spelled synonym for `"http_route"`.)
 
 The whole-scope fingerprint is wider than the set of files selected into a pack.
 A new file therefore changes it even when no old selected-path digest changes.

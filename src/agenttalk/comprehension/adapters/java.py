@@ -146,6 +146,33 @@ UNSUPPORTED_ENTRY_POINT_SHAPES = (
     "web_xml_listener",
 )
 
+#: FIX ROUND 21c (reviewer-3's re-delta, THE ASK - second instance, closing
+#: the class): the CLOSED set of every ``JavaEntryPointClaim.kind`` value
+#: this producer version ever publishes, each with a one-line meaning - a
+#: consumer seeing ``"http_filter"`` in ``features.json``/``report --json``
+#: previously had to infer "this is not a served endpoint" purely from the
+#: name; this makes that distinction an explicit, versioned declaration
+#: rather than tribal knowledge. Same STATIC CAPABILITY DECLARATION shape
+#: ``UNSUPPORTED_RELATIONS``/``UNSUPPORTED_INVOKE_SHAPES``/
+#: ``UNSUPPORTED_ENTRY_POINT_SHAPES`` already establish (round 18b's own
+#: design-doc sentence, restated here to cover this fourth capability
+#: field too rather than leaving it a one-off): published unconditionally
+#: on every run, regardless of whether that run actually contains an
+#: entry point of a given kind - "what this version CAN publish and what
+#: each kind means," never a per-run instance (``features.json``'s own
+#: entry-point records are that). Adding a new kind in a future round
+#: means adding it here in the SAME commit - never leaving the meaning to
+#: be inferred from the name alone the way ``"http_filter"`` briefly was.
+ENTRY_POINT_KINDS: dict[str, str] = {
+    "cli_main": "a recognized command-line process entry point (a main method)",
+    "http_route": "a declared HTTP/UI route this class SERVES - counted as a served endpoint",
+    "http_filter": (
+        "a declared HTTP request interceptor (a servlet filter) - it "
+        "intercepts requests matching its own pattern, it does NOT serve one; "
+        "never counted or read as a served endpoint"
+    ),
+}
+
 #: FIX ROUND 15 (eleventh cold read, F3 MAJOR, wrong-data): the ORIGINAL
 #: combined pattern classified a bare ``/test/`` package segment with NO
 #: corroboration at all - the same bug class CR10-7 already fixed for

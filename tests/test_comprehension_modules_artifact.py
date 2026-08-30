@@ -431,6 +431,87 @@ def test_an_attributed_worker_problem_reaches_only_its_own_enclosing_unit():
     assert file_record.adapter_problem_reasons == []
 
 
+def test_a_cross_file_reason_still_attaches_to_the_named_classs_own_unit():
+    """FIX ROUND 21c (reviewer-3's re-delta, THE CARRY, wrong-data): a
+    web.xml <listener>'s own unsupported_entry_point_shape problem is
+    correctly recorded against web.xml's own path (it has no unit of
+    its own) but NAMES a class declared in a completely different
+    .java file - worker_problem_reasons_by_unit's own (path,
+    qualified_name) key can never match across files.
+    worker_problem_reasons_by_qualified_name resolves this via the
+    class's own qualified name alone, regardless of which file the
+    reason was originally recorded against."""
+    source = "package com.acme;\nclass XmlListener {\n}\n"
+    discovery = _discovery([
+        EnumeratedFile(relative_path="WEB-INF/web.xml", byte_count=1, content_digest="w"),
+        EnumeratedFile(
+            relative_path="com/acme/XmlListener.java", byte_count=len(source),
+            content_digest="digest1"),
+    ])
+    java_results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(),
+        "com/acme/XmlListener.java": _java_result("com/acme/XmlListener.java", source),
+    }
+    records = ma.build_modules(
+        discovery, java_results,
+        worker_problem_reasons_by_qualified_name={
+            "com.acme.XmlListener": ["unsupported_entry_point_shape"]},
+    )
+    listener_unit = next(r for r in records if r.display_name == "XmlListener")
+    assert listener_unit.adapter_problem_reason == "unsupported_entry_point_shape"
+    assert listener_unit.adapter_problem_reasons == ["unsupported_entry_point_shape"]
+
+
+def test_a_cross_file_reason_for_a_class_not_resolved_in_scan_invents_no_unit():
+    """Companion negative case (the reviewer's own third test): a
+    listener-class the run never actually walked (outside scope, or
+    excluded) has ZERO claimants in the registry - the reason is left
+    unattached, never fabricating a unit that does not exist. The
+    web.xml-attributed problems.json record (built elsewhere, from the
+    SAME worker problem) is the only trace of it either way, unchanged
+    by this function."""
+    discovery = _discovery([
+        EnumeratedFile(relative_path="WEB-INF/web.xml", byte_count=1, content_digest="w"),
+    ])
+    java_results = {"WEB-INF/web.xml": java_adapter.JavaFileResult()}
+    records = ma.build_modules(
+        discovery, java_results,
+        worker_problem_reasons_by_qualified_name={
+            "com.acme.NotInScan": ["unsupported_entry_point_shape"]},
+    )
+    assert len(records) == 1
+    assert records[0].kind == "file"
+    assert records[0].adapter_problem_reasons == []
+
+
+def test_a_cross_file_reason_for_a_duplicate_qualified_name_is_left_ambiguous():
+    """A genuine registry collision (two units declaring the identical
+    qualified name) already gets its own separate, visible conflict_id
+    problem - a cross-file reason must not silently pick one of the two
+    candidates to attach to."""
+    source = "package com.acme;\nclass XmlListener {\n}\n"
+    discovery = _discovery([
+        EnumeratedFile(relative_path="WEB-INF/web.xml", byte_count=1, content_digest="w"),
+        EnumeratedFile(
+            relative_path="a/XmlListener.java", byte_count=len(source), content_digest="d1"),
+        EnumeratedFile(
+            relative_path="b/XmlListener.java", byte_count=len(source), content_digest="d2"),
+    ])
+    java_results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(),
+        "a/XmlListener.java": _java_result("a/XmlListener.java", source),
+        "b/XmlListener.java": _java_result("b/XmlListener.java", source),
+    }
+    records = ma.build_modules(
+        discovery, java_results,
+        worker_problem_reasons_by_qualified_name={
+            "com.acme.XmlListener": ["unsupported_entry_point_shape"]},
+    )
+    components = [r for r in records if r.kind == "component"]
+    assert len(components) == 2
+    assert all(c.adapter_problem_reasons == [] for c in components)
+
+
 def test_to_json_sorts_paths_and_classification():
     source = "package p;\nclass Foo {\n}\n"
     discovery = _discovery([

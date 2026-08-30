@@ -111,6 +111,26 @@ def test_scan_json_names_unsupported_entry_point_shapes_as_a_declared_gap(
         java_adapter.UNSUPPORTED_ENTRY_POINT_SHAPES)
 
 
+def test_scan_json_names_the_entry_point_kind_vocabulary_as_a_declared_capability(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 21c (reviewer-3's re-delta, THE ASK - second instance,
+    closing the class): a consumer reading an entry point's own `kind`
+    (e.g. "http_filter") needs a declared meaning to know it is
+    deliberately excluded from a served-route count, not merely a
+    differently-spelled synonym for "http_route" - the same static-
+    capability-declaration shape unsupported_entry_point_shapes and its
+    two siblings already establish."""
+    import json
+
+    from agenttalk.comprehension.adapters import java as java_adapter
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["entry_point_kinds"] == dict(java_adapter.ENTRY_POINT_KINDS)
+    assert set(scan_doc["entry_point_kinds"]) == {"cli_main", "http_route", "http_filter"}
+
+
 def test_a_served_route_a_filter_and_a_listener_report_correctly_distinct_shapes(
     java_repo: Path,
 ) -> None:
@@ -183,6 +203,68 @@ def test_a_served_route_a_filter_and_a_listener_report_correctly_distinct_shapes
         s for s in readiness_doc["signals"]
         if s["unit_id"] == filter_unit_id and s["check"] == "entry_points_mapped")
     assert filter_signal["stored_status"] == "satisfied"
+
+
+def test_web_xml_listener_reason_attaches_to_its_own_java_files_unit_end_to_end(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 21c (reviewer-3's re-delta, THE CARRY, wrong-data,
+    end-to-end): the reviewer's own exact shape - a web.xml <listener>
+    names a class declared in a completely different .java file.
+    Before this fix, the resulting unsupported_entry_point_shape
+    problem (correctly recorded against web.xml's own path - web.xml
+    has no unit of its own) never reached the listener class's own
+    unit, so readiness published the confident negative not_applicable/
+    no_entry_point on a class this run already knew carried an
+    unmodeled listener. The @WebListener ANNOTATION spelling never had
+    this problem (recorded same-file already) - both must report
+    identically now."""
+    import json
+
+    pkg_dir = java_repo / "src" / "main" / "java" / "p"
+    (pkg_dir / "XmlListener.java").write_text(
+        "package p;\npublic class XmlListener implements ServletContextListener {}\n",
+        encoding="utf-8",
+    )
+    (pkg_dir / "AnnotationListener.java").write_text(
+        "package p;\n@WebListener\npublic class AnnotationListener "
+        "implements ServletContextListener {}\n",
+        encoding="utf-8",
+    )
+    (java_repo / "WEB-INF").mkdir(parents=True)
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <listener>\n"
+        "    <listener-class>p.XmlListener</listener-class>\n"
+        "  </listener>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    xml_listener_problems = [
+        p for p in problems_doc["problems"]
+        if p.get("qualified_name") == "p.XmlListener"
+        and p["reason_code"] == "unsupported_entry_point_shape"
+    ]
+    assert len(xml_listener_problems) == 1
+    # Recorded against web.xml's own path - unchanged, never moved.
+    assert xml_listener_problems[0]["path"] == "WEB-INF/web.xml"
+
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+
+    for class_name in ("XmlListener", "AnnotationListener"):
+        unit_id = next(
+            u["unit_id"] for u in modules_doc["units"]
+            if u["kind"] == "component" and u["display_name"] == class_name)
+        signal = next(
+            s for s in readiness_doc["signals"]
+            if s["unit_id"] == unit_id and s["check"] == "entry_points_mapped")
+        assert signal["stored_status"] == "unknown", class_name
+        assert signal["reason_code"] == "unsupported_entry_point_shape", class_name
 
 
 def test_run_scan_web_servlet_and_jax_rs_routes_publish_end_to_end_cr13_c(

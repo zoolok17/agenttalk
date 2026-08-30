@@ -183,6 +183,7 @@ def build_modules(
     discovery: DiscoveryResult, java_results: dict[str, java_adapter.JavaFileResult],
     *, worker_problem_reasons_by_path: dict[str, list[str]] | None = None,
     worker_problem_reasons_by_unit: dict[tuple[str, str], list[str]] | None = None,
+    worker_problem_reasons_by_qualified_name: dict[str, list[str]] | None = None,
 ) -> list[ModuleRecord]:
     """``java_results`` maps a ``.java`` file's relative path to its
     already-parsed :class:`~.adapters.java.JavaFileResult` (item 3) -
@@ -217,7 +218,21 @@ def build_modules(
     MORE than one distinct reason recorded (round 8's N3) - the closed,
     single-value ``adapter_problem_reason`` vocabulary takes only the
     FIRST (sorted) of them; the full list is never discarded, published
-    separately as ``adapter_problem_reasons``."""
+    separately as ``adapter_problem_reasons``.
+
+    ``worker_problem_reasons_by_qualified_name`` (FIX ROUND 21c,
+    reviewer-3's re-delta, THE CARRY) is the CROSS-FILE counterpart to
+    ``worker_problem_reasons_by_unit`` above: keyed by bare qualified
+    name alone, for a worker problem recorded against a DIFFERENT file
+    than the one declaring the type it names - a web.xml ``<listener>``
+    element's own problem is correctly recorded against web.xml's own
+    path (web.xml has no unit of its own to broadcast to), naming a
+    class declared in some other ``.java`` file entirely, so the tuple-
+    keyed map above can never match it. Applied via
+    ``_attribute_cross_file_entry_point_reasons`` below, after every
+    record is built - resolved the same "unambiguous or not resolved at
+    all" way ``features_artifact.py``'s own owner resolution already
+    treats a qualified name."""
     records: list[ModuleRecord] = []
     worker_problem_reasons_by_path = worker_problem_reasons_by_path or {}
     worker_problem_reasons_by_unit = worker_problem_reasons_by_unit or {}
@@ -363,7 +378,65 @@ def build_modules(
             adapter_problem_reasons=list(reasons),
         ))
 
+    records = _attribute_cross_file_entry_point_reasons(
+        records, worker_problem_reasons_by_qualified_name or {})
     return _populate_duplicate_qualified_name_conflicts(records)
+
+
+def _attribute_cross_file_entry_point_reasons(
+    records: list[ModuleRecord],
+    worker_problem_reasons_by_qualified_name: dict[str, list[str]],
+) -> list[ModuleRecord]:
+    """FIX ROUND 21c (reviewer-3's re-delta, THE CARRY, wrong-data): a
+    worker problem recorded against a DIFFERENT file than the one
+    declaring the type it names (web.xml's own ``<listener>`` element,
+    naming a class declared in some other ``.java`` file entirely)
+    could never reach that class's own unit via ``worker_problem_
+    reasons_by_unit`` - that map is keyed by ``(relative_path,
+    qualified_name)``, and the declaring file (web.xml) is never the
+    SAME path as the named class's own file. Readiness then published
+    the confident negative ``not_applicable``/``no_entry_point`` on a
+    class this SAME run already knows carries an unmodeled listener.
+    The annotation spelling (``@WebListener``) never has this problem -
+    it is recorded directly against the class's own file, same-file,
+    already correctly attributed above.
+
+    Resolved via the exact same "unambiguous or not resolved at all"
+    registry discipline ``features_artifact.py``'s own owner resolution
+    already applies to a qualified name: a name with EXACTLY ONE
+    "component"-kind claimant in THIS run gets the reason merged onto
+    that one unit's own record; a name with zero or 2+ claimants
+    (unresolved in-scan, or a genuine duplicate-qualified-name collision
+    - already its own separate, visible problem) is left alone - the
+    declaring file's own problems.json record is the only trace of it
+    either way, exactly as it always was before this fix. Never invents
+    a unit that does not already exist."""
+    if not worker_problem_reasons_by_qualified_name:
+        return records
+    unit_ids_by_qualified_name: dict[str, list[str]] = {}
+    for record in records:
+        if record.kind == "component" and record.qualified_name is not None:
+            unit_ids_by_qualified_name.setdefault(record.qualified_name, []).append(record.unit_id)
+    extra_reasons_by_unit_id: dict[str, list[str]] = {}
+    for qualified_name, reasons in worker_problem_reasons_by_qualified_name.items():
+        candidates = unit_ids_by_qualified_name.get(qualified_name, [])
+        if len(candidates) != 1:
+            continue
+        extra_reasons_by_unit_id[candidates[0]] = reasons
+    if not extra_reasons_by_unit_id:
+        return records
+    updated: list[ModuleRecord] = []
+    for record in records:
+        extra = extra_reasons_by_unit_id.get(record.unit_id)
+        if not extra:
+            updated.append(record)
+            continue
+        merged = sorted({*record.adapter_problem_reasons, *extra})
+        updated.append(replace(
+            record, adapter_problem_reasons=merged,
+            adapter_problem_reason=merged[0] if merged else None,
+        ))
+    return updated
 
 
 def _populate_duplicate_qualified_name_conflicts(records: list[ModuleRecord]) -> list[ModuleRecord]:

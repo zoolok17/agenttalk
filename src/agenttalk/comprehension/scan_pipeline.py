@@ -457,10 +457,33 @@ def run_scan(
             p.relative_path: [] for p in worker_result.problems if p.qualified_name is None
         }
         worker_problem_reasons_by_unit: dict[tuple[str, str], list[str]] = {}
+        # FIX ROUND 21c (reviewer-3's re-delta, THE CARRY, wrong-data):
+        # every worker problem carrying a qualified_name ALSO accumulates
+        # here, keyed by that bare qualified_name alone - no relative_path
+        # at all. A same-file adapter reason (cli_main_unrecognized,
+        # route_annotation_unassociated, ...) is already correctly
+        # attributed via worker_problem_reasons_by_unit above; this is
+        # additive for exactly the CROSS-FILE case that tuple can never
+        # match - a web.xml <listener>'s own unsupported_entry_point_shape
+        # problem is recorded at web.xml's own path (the declaring file,
+        # correctly - web.xml genuinely has no unit of its own to
+        # broadcast to), naming a class declared in an entirely
+        # DIFFERENT .java file. modules_artifact.build_modules resolves
+        # this via the SAME exact-qualified-name registry lookup
+        # features_artifact.py's own owner resolution already uses -
+        # never applied when the name is ambiguous (2+ claimants) or
+        # unresolved in-scan (0 claimants), in which case the
+        # web.xml-attributed problems.json record stands on its own,
+        # unchanged, exactly as it always did before this fix.
+        worker_problem_reasons_by_qualified_name: dict[str, list[str]] = {}
         for p in worker_result.problems:
             if p.qualified_name is not None:
                 reasons = worker_problem_reasons_by_unit.setdefault(
                     (p.relative_path, p.qualified_name), [])
+                qualified_name_reasons = worker_problem_reasons_by_qualified_name.setdefault(
+                    p.qualified_name, [])
+                if p.reason_code not in qualified_name_reasons:
+                    qualified_name_reasons.append(p.reason_code)
             else:
                 reasons = worker_problem_reasons_by_path[p.relative_path]
             if p.reason_code not in reasons:
@@ -469,11 +492,14 @@ def run_scan(
             reasons.sort()
         for reasons in worker_problem_reasons_by_unit.values():
             reasons.sort()
+        for reasons in worker_problem_reasons_by_qualified_name.values():
+            reasons.sort()
 
         modules = modules_artifact.build_modules(
             discovery_result, java_results,
             worker_problem_reasons_by_path=worker_problem_reasons_by_path,
             worker_problem_reasons_by_unit=worker_problem_reasons_by_unit,
+            worker_problem_reasons_by_qualified_name=worker_problem_reasons_by_qualified_name,
         )
         # M7 (cold-read, PR-B fix round 3): discovery already computed
         # each file's own content digest - dependencies_artifact.py and
@@ -974,6 +1000,12 @@ def run_scan(
             # enumerated-coverage-gap idiom the two lines above already
             # publish.
             "unsupported_entry_point_shapes": list(java_adapter.UNSUPPORTED_ENTRY_POINT_SHAPES),
+            # FIX ROUND 21c (reviewer-3's re-delta, THE ASK - second
+            # instance, closing the class): the SAME static-capability-
+            # declaration shape as the three fields above, for the entry-
+            # point KIND vocabulary itself - see ENTRY_POINT_KINDS's own
+            # docstring.
+            "entry_point_kinds": dict(java_adapter.ENTRY_POINT_KINDS),
             "record_counts": record_counts,
             "problem_count": len(problems),
             "artifacts": artifact_summaries,
