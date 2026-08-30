@@ -230,6 +230,57 @@ def test_run_scan_a_jax_rs_verb_only_resource_reports_entry_points_mapped_unknow
         p["reason_code"] == "unsupported_entry_point_shape" for p in problems_doc["problems"])
 
 
+def test_run_scan_a_mapped_route_alongside_an_unrecognized_main_reports_unknown(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 18b (reviewer-3's priority-1 co-occurrence probe on
+    round 18's F2 readiness reorder): a class with a REAL, composed
+    @GetMapping route AND ALSO an unrecognizable main-like method
+    (main(String) - outside the recognized array/varargs grammar) used
+    to report the confident SATISFIED positive (has_entry_point=True
+    won outright over the attributed cli_main_unrecognized reason) -
+    the same has_entry_point-wins-first bug F2's own mixed-JAX-RS-class
+    fix closed, now proven to reach a SECOND, independent reason code
+    beyond the one F2 was written for. The reviewer rules the new
+    answer correct: a unit with one mapped route and one unclassifiable
+    construct is not fully mapped - entry_points_mapped must report
+    unknown, never satisfied."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "p" / "OrderController.java").write_text(
+        "package p;\n"
+        "\n"
+        "public class OrderController {\n"
+        "  @GetMapping(\"/orders\")\n"
+        "  public void list() {}\n"
+        "\n"
+        "  public static void main(String args) {}\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+
+    controller_unit = next(
+        u for u in modules_doc["units"] if u["display_name"] == "OrderController")
+    assert "cli_main_unrecognized" in controller_unit["adapter_problem_reasons"]
+
+    entry_points_mapped = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == controller_unit["unit_id"] and s["check"] == "entry_points_mapped"
+    )
+    assert entry_points_mapped["stored_status"] == "unknown"
+    assert entry_points_mapped["reason_code"] == "cli_main_unrecognized"
+
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    route_targets = {
+        r["target_external"] for r in dependencies_doc["edges"] if r["relation"] == "route"
+    }
+    assert "GET /orders" in route_targets
+
+
 def test_run_scan_a_mixed_jax_rs_resource_reports_entry_points_mapped_unknown(
     java_repo: Path,
 ) -> None:

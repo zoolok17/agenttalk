@@ -300,6 +300,15 @@ problem rather than two silently merged units.
   states, exclusions, unsupported files, generated/vendor handling, resource
   omissions, conflicts, and problems.
 
+`scan.json`'s `unsupported_relations`, `unsupported_invoke_shapes`, and
+`unsupported_entry_point_shapes` are a STATIC CAPABILITY DECLARATION - the
+named, enumerated set of recognized-but-unmodeled shapes this producer VERSION
+carries, published unconditionally on every run regardless of whether that run
+actually contains a matching shape. A per-run INSTANCE of any of these gaps is
+what `problems.json`'s own reason-coded records already surface, one per
+affected file or unit - these three fields answer "what can this version not
+model," never "did this run hit one."
+
 The whole-scope fingerprint is wider than the set of files selected into a pack.
 A new file therefore changes it even when no old selected-path digest changes.
 Hard-excluded secret/VCS/cache content is represented by exclusion category and

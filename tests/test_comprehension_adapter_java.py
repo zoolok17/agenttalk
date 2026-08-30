@@ -2376,6 +2376,76 @@ public class OrderResource {
     assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
 
 
+def test_the_annotation_stack_cursor_advances_monotonically_past_nested_swagger_annotations():
+    """FIX ROUND 18b (reviewer-3's pre-verified MAJOR on round 18's F2):
+    _ANY_ANNOTATION_RE also matches an annotation NESTED inside another
+    annotation's own argument list (@ApiResponses({@ApiResponse(...)}) -
+    the normal Swagger-documented JAX-RS shape) - finditer resumes
+    scanning right after the outer annotation's own NAME (before its
+    parens), walks straight into that argument list, and finds the
+    nested one as a separate match. The stack-grouping walk assigned
+    previous_span_end UNCONDITIONALLY, so this nested match's own
+    (smaller) span REGRESSED the cursor backward into the middle of the
+    outer annotation's own parens - the next real annotation then saw
+    the outer's own trailing "})" in the gap and incorrectly started a
+    new stack, corrupting stack membership for every annotation that
+    follows in the WHOLE FILE, not just one method: a fully mapped
+    resource could publish its own route AND still get flagged
+    unsupported_entry_point_shape. previous_span_end now advances
+    monotonically (never regresses).
+
+    Four rows in ONE file, sharing one cursor across all of them - the
+    exact cross-boundary corruption this bug caused: (1) Swagger order A
+    (@GET, then the nested-Swagger annotation, then @Path - the nested
+    annotation SANDWICHED between the marker and its own @Path) stays
+    clean; (2) Swagger order B (the mirror image - @Path, then the
+    nested annotation, then @GET) stays clean; (3) the mixed class
+    (round 18's own F2 shape) still gets flagged; (4) the intervening-
+    @Produces bridge (the companion test above) still stays clean."""
+    src = """
+package p;
+
+@Path("/swagger-a")
+public class SwaggerOrderA {
+    @GET
+    @ApiResponses({@ApiResponse(code = 200, message = "OK")})
+    @Path("/{id}")
+    public void get() {}
+}
+
+@Path("/swagger-b")
+public class SwaggerOrderB {
+    @Path("/{id}")
+    @ApiResponses({@ApiResponse(code = 200, message = "OK")})
+    @GET
+    public void get() {}
+}
+
+@Path("/mixed")
+public class MixedResource {
+    @GET
+    public void list() {}
+
+    @GET
+    @Path("/{id}")
+    public void get() {}
+}
+
+@Path("/bridge")
+public class BridgeResource {
+    @GET
+    @Produces("application/json")
+    @Path("/{id}")
+    public void get() {}
+}
+"""
+    result = java.parse_java_source("Resources.java", src)
+    flagged = {
+        p.qualified_name for p in result.problems if p.reason_code == "unsupported_entry_point_shape"
+    }
+    assert flagged == {"p.MixedResource"}
+
+
 def test_web_method_annotation_is_the_named_class_closer_not_a_silent_negative():
     """FIX ROUND 17 (CR13-3 MAJOR, part (b) - THE CLASS-CLOSER): a route-
     like annotation family this adapter recognizes as a routing

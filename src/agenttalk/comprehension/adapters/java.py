@@ -2073,7 +2073,23 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             stack_id_by_annotation_start[ann_match.start()] = current_stack_id
             if ann_match.group(1) == "Path":
                 stack_has_path[current_stack_id] = True
-            previous_span_end = span_end
+            # FIX ROUND 18b (reviewer-3's pre-verified MAJOR on round 18's
+            # F2): _ANY_ANNOTATION_RE also matches an annotation NESTED
+            # inside another annotation's own argument list
+            # (@ApiResponses({@ApiResponse(...)}) - the normal Swagger-
+            # documented JAX-RS shape) - finditer resumes scanning right
+            # after the OUTER annotation's own NAME (before its parens),
+            # so it walks straight into that argument list and finds the
+            # nested one as a separate match. Assigning previous_span_end
+            # UNCONDITIONALLY let this nested match's own (smaller) span
+            # REGRESS the cursor backward into the middle of the outer
+            # annotation's own parens; the next real annotation then saw
+            # the outer's own trailing "})" in the gap and incorrectly
+            # started a new stack - corrupting stack membership for
+            # every annotation that follows in the WHOLE FILE, not just
+            # this one method. previous_span_end must never regress -
+            # advance monotonically instead.
+            previous_span_end = span_end if previous_span_end is None else max(previous_span_end, span_end)
         for verb_match in _JAX_RS_VERB_ANNOTATION_RE.finditer(sanitized):
             enclosing = _enclosing_qualified_name(verb_match.start(), types, primary_qualified)
             if enclosing not in jax_rs_path_classes:
