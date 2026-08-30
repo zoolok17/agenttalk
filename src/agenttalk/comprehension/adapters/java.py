@@ -603,6 +603,41 @@ def _stack_gap_is_only_whitespace_and_modifiers(gap: str) -> bool:
     return not _MODIFIER_KEYWORD_RE.sub("", gap).strip()
 
 
+def _route_annotation_targets_a_method(sanitized: str, span_end: int) -> bool:
+    """FIX ROUND 20 (sixteenth cold read, m1 MINOR, wrong-data): a route
+    annotation is only ever legal (JAX-RS/Spring) on a METHOD - never a
+    FIELD, even though nothing previously checked which kind of member a
+    method-level-looking route annotation actually decorates. Skips past
+    any interleaving modifier keyword or other stacked annotation (the
+    same tolerance the F6 stack-grouping fix already established, round
+    19) to reach the member's own declarator, then checks whether a
+    ``(`` (a parameter list) appears before a top-level ``;``/``=``/
+    ``{`` - the same syntactic distinguisher the JLS itself draws
+    between a method and a field declaration."""
+    pos = span_end
+    while pos < len(sanitized):
+        while pos < len(sanitized) and sanitized[pos].isspace():
+            pos += 1
+        if pos >= len(sanitized):
+            return False
+        modifier_match = _MODIFIER_KEYWORD_RE.match(sanitized, pos)
+        if modifier_match is not None:
+            pos = modifier_match.end()
+            continue
+        if sanitized[pos] == "@":
+            ann_match = _ANY_ANNOTATION_RE.match(sanitized, pos)
+            if ann_match is not None:
+                pos = _skip_optional_annotation_args(sanitized, ann_match.end())
+                continue
+        break
+    for ch in sanitized[pos:]:
+        if ch == "(":
+            return True
+        if ch in ";={":
+            return False
+    return False
+
+
 def _route_method_attributes(sanitized_segment: str) -> list[str]:
     match = _ROUTE_METHOD_ATTR_RE.search(sanitized_segment)
     if match is None:
@@ -2027,7 +2062,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     for match in _ROUTE_ANNOTATION_RE.finditer(sanitized):
         line = _line_at(newline_offsets, match.start())
         enclosing = _enclosing_qualified_name(match.start(), types, primary_qualified)
-        _span_end, paths, explicit_methods = _route_annotation_span(match)
+        span_end, paths, explicit_methods = _route_annotation_span(match)
         class_target = _class_level_route_target(match.start(), class_header_associations)
         if class_target is not None:
             # A bare class-level annotation with no method-level mapping
@@ -2062,6 +2097,21 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                        "confidently associated with any declared type - suppressed rather "
                        "than published as a route",
             ))
+            continue
+        # FIX ROUND 20 (sixteenth cold read, m1 MINOR, wrong-data): a
+        # route annotation is only ever legal (JAX-RS/Spring) on a
+        # METHOD (or the class header, handled above) - a route
+        # annotation sitting on a FIELD used to publish a full,
+        # confident entry point + edge + feature + satisfied anyway,
+        # since nothing here ever checked WHAT kind of member the
+        # annotation actually decorates, only that it sits inside some
+        # type's own body. The missing precondition is structural (this
+        # shape does not compile as real JAX-RS/Spring), not a
+        # comprehension failure - silently produces nothing, the same
+        # confident "no route here" a class with no route annotation at
+        # all correctly gets, never a problem over source that was
+        # never a real route to begin with.
+        if not _route_annotation_targets_a_method(sanitized, span_end):
             continue
         if paths is None:
             # FAIL-SAFE (fix round 11, seventh cold read BLOCKER part 2):

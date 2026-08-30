@@ -2543,6 +2543,49 @@ public class MixedResource {
     assert flagged == {"p.MixedResource"}
 
 
+def test_a_route_annotation_on_a_field_publishes_nothing():
+    """FIX ROUND 20 (sixteenth cold read, m1 MINOR, wrong-data): mirrors
+    the reader's own .cr16-l field shape - a route annotation is only
+    ever legal (JAX-RS/Spring) on a method, never a field. Used to
+    publish a full, confident entry point + edge + feature + satisfied
+    anyway, since nothing checked WHAT kind of member the annotation
+    actually decorates. The missing precondition is structural (this
+    does not compile as real JAX-RS/Spring) - publishes nothing, the
+    same confident "no route here" a class with no route annotation at
+    all correctly gets."""
+    src = """
+package p;
+
+public class OrderResource {
+    @GetMapping("/orders")
+    private String route;
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    assert _edges(result, "route") == []
+    assert not any(e.kind == "http_route" for e in result.entry_points)
+    assert result.problems == []
+
+
+def test_a_route_annotation_on_an_abstract_interface_method_still_composes():
+    """Companion control case for m1 - an interface's own abstract method
+    (no body, just a bare parameter list then `;`) is still a genuine
+    METHOD declaration and must stay published, unaffected by the field
+    check - the reader's own flagged "legitimately registered Spring"
+    shape."""
+    src = """
+package p;
+
+public interface OrderApi {
+    @GetMapping("/orders")
+    String list();
+}
+"""
+    result = java.parse_java_source("OrderApi.java", src)
+    routes = _edges(result, "route")
+    assert [r.target for r in routes] == ["GET /orders"]
+
+
 def test_web_method_annotation_is_the_named_class_closer_not_a_silent_negative():
     """FIX ROUND 17 (CR13-3 MAJOR, part (b) - THE CLASS-CLOSER): a route-
     like annotation family this adapter recognizes as a routing
