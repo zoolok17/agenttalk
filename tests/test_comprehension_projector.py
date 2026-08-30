@@ -242,6 +242,35 @@ def test_readiness_state_filter_rejects_an_unrecognized_state_f8():
         pr.project_comprehension(**_base_kwargs(readiness_state="not-a-real-state"))
 
 
+@pytest.mark.parametrize("state", ["assessed", "blocked", "not_applicable"])
+def test_readiness_state_filter_on_a_structurally_unreachable_state_adds_a_note(state):
+    """FIX ROUND 17 (thirteenth cold read, CR13-6 MINOR, JUDGE - taken):
+    CR10-11's own finding - three of ASSESSMENT_STATES's four values are
+    structurally unreachable this slice (a permanently-unknown
+    boundaries_identified signal rules out assessed/not_applicable;
+    source_understood never returning unsatisfied rules out blocked). A
+    caller filtering on one of these used to get a silently EMPTY result,
+    indistinguishable from "no unit happens to match" - now a visible
+    note names the structural reason."""
+    payload = pr.project_comprehension(**_base_kwargs(readiness_state=state))
+    assert state in payload["readiness_state_filter_note"]
+    assert payload["readiness"]["summaries"] == []
+
+
+def test_readiness_state_filter_on_the_reachable_state_adds_no_note():
+    """Companion negative case: needs_evidence is the one reachable
+    state this slice - filtering on it must never carry the
+    structurally-unreachable note."""
+    payload = pr.project_comprehension(**_base_kwargs(
+        readiness_summaries=[_summary("u1", "needs_evidence")], readiness_state="needs_evidence"))
+    assert "readiness_state_filter_note" not in payload
+
+
+def test_no_readiness_state_filter_adds_no_note():
+    payload = pr.project_comprehension(**_base_kwargs())
+    assert "readiness_state_filter_note" not in payload
+
+
 @pytest.mark.parametrize("filter_kwargs", [
     {"unit_id": "u1"},
     {"feature_id": "f1"},

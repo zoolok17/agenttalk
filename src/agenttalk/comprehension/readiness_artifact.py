@@ -79,7 +79,10 @@ ASSESSMENT_STATE_CAVEAT = (
     "data/configuration relations item 3 names as explicit coverage "
     "gaps) and is unconditionally unknown, non-blocker severity, so no "
     "unit can roll up to assessed or not_applicable until a later slice "
-    "adds that producer."
+    "adds that producer. blocked is equally unreachable this slice, for "
+    "a separate reason: the only blocker-severity check, "
+    "source_understood, never returns unsatisfied - an absence of "
+    "adapter evidence is unknown, never a confident negative."
 )
 
 CHECKS = (

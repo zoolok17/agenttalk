@@ -45,6 +45,35 @@ WHOLE_RUN_SECTIONS = (
     "units_without_feature", "unmapped_entry_points",
 )
 
+#: FIX ROUND 17 (thirteenth cold read, CR13-6 MINOR, JUDGE - taken): CR10-11's
+#: own finding (readiness_artifact.ASSESSMENT_STATE_CAVEAT) - three of
+#: ASSESSMENT_STATES's four values are structurally unreachable this
+#: slice. A ``--readiness`` filter naming one of them used to return a
+#: silently EMPTY units/readiness section - indistinguishable from "no
+#: unit happens to be in this state right now" (a real, meaningful
+#: answer for a reachable state) versus "this state cannot occur at all
+#: this slice" (a structural fact about the policy, not about this run's
+#: data). Named here so ``project_comprehension`` can add a visible note
+#: rather than leave a caller to independently rediscover CR10-11.
+_STRUCTURALLY_UNREACHABLE_ASSESSMENT_STATES = frozenset({"assessed", "blocked", "not_applicable"})
+
+
+def _readiness_state_filter_note(readiness_state: str | None) -> dict[str, Any]:
+    """FIX ROUND 17 (CR13-6 MINOR, JUDGE - taken): an EMPTY dict (never a
+    key with a ``None``/empty value) when the filter is absent or names a
+    reachable state - the same absent-not-null idiom every other optional
+    field in this artifact family already follows. Spread into the
+    payload at the call site."""
+    if readiness_state in _STRUCTURALLY_UNREACHABLE_ASSESSMENT_STATES:
+        return {
+            "readiness_state_filter_note": (
+                f"'{readiness_state}' cannot occur for any unit this slice (see "
+                "readiness_artifact.ASSESSMENT_STATE_CAVEAT) - an empty result here means "
+                "the state is structurally unreachable, not that no unit currently matches it"
+            ),
+        }
+    return {}
+
 
 def _bounded(records: list[Any], cap: int | None = None) -> tuple[list[Any], int]:
     # cap is read from the module global at CALL time (never a def-time
@@ -339,6 +368,7 @@ def project_comprehension(
             "reason_code": "freshness_not_implemented_this_slice",
         },
         "whole_run_sections": list(WHOLE_RUN_SECTIONS),
+        **_readiness_state_filter_note(readiness_state),
         "counts": {
             # M10 (cold-read, PR-B fix round 3): these are WHOLE-RUN
             # totals - deliberately unaffected by unit_id/feature_id/
