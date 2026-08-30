@@ -120,6 +120,94 @@ def test_acknowledge_headless_without_agent_identity_reports_and_refuses(
     assert not (tmp_path / ".agenttalk").exists()
 
 
+# ----------------------------------------------------------- --recover-stale-lock (CR17-1)
+
+def _acquire_real_lock(root: Path):
+    from agenttalk.comprehension import lock as lockmod
+    from agenttalk.comprehension import paths as pathsmod
+    from agenttalk.comprehension import privacy as privacymod
+
+    comp_dir = pathsmod.comprehension_dir(root / ".agenttalk")
+    privacy_result = privacymod.run_privacy_preflight(root)
+    return lockmod.acquire_scan_lock(
+        comp_dir, privacy=privacy_result, predecessor_index_digest=None)
+
+
+def test_scan_recover_stale_lock_live_owner_non_tty_refuses_never_attendance(
+    java_repo: Path, capsys,
+) -> None:
+    """FIX ROUND 21 (seventeenth cold read, CR17-1 BLOCKER, safety
+    contract): the reader's own exact three-step repro - a live lock
+    holder, the flag passed, from a non-TTY shell (every pytest run,
+    by default) - must refuse outright, exit 2, and never even reach an
+    attendance prompt (a live owner is refused BEFORE attendance is
+    ever consulted, per the fix's own part 1) - the lock file must
+    still exist afterward, never silently cleared."""
+    from agenttalk.comprehension import lock as lockmod
+
+    live = _acquire_real_lock(java_repo)
+    exit_code = _run(["comprehension", "scan", "--recover-stale-lock"], java_repo)
+    assert exit_code == 2
+    assert "comprehension_lock_contended" in capsys.readouterr().err
+    assert live.path.exists()
+    lockmod.release_scan_lock(live)
+
+
+def _make_unverifiable(monkeypatch, stale) -> None:
+    """A same-PID-but-different-process-identity match (PID reuse) can
+    never prove death - the NORMAL (non-override) acquire path correctly
+    raises ScanLockUnrecoverable for it (never silently auto-reclaims,
+    unlike a provably-dead owner), which is exactly the shape
+    --recover-stale-lock's own attended override exists for."""
+    from agenttalk.comprehension import lock as lockmod
+    from agenttalk.lifecycle_lock import ProcessIdentity
+
+    different_identity = ProcessIdentity(
+        scheme=stale.process_identity.scheme, value=stale.process_identity.value + "-reused")
+    monkeypatch.setattr(lockmod, "process_observation", lambda pid: ("alive", different_identity))
+
+
+def test_scan_recover_stale_lock_unverifiable_owner_non_tty_refuses(
+    java_repo: Path, capsys, monkeypatch,
+) -> None:
+    """The reader's own non-TTY refusal case for a genuinely unverifiable
+    (never provably dead) owner: no attended confirmation was ever given
+    (no real terminal, no AGENTTALK_SELF) - must still refuse, never
+    silently recover just because the flag was passed."""
+    stale = _acquire_real_lock(java_repo)
+    _make_unverifiable(monkeypatch, stale)
+    exit_code = _run(["comprehension", "scan", "--recover-stale-lock"], java_repo)
+    assert exit_code == 2
+    assert "AGENTTALK_SELF" in capsys.readouterr().err
+    assert stale.path.exists()  # never cleared without attendance
+
+
+def test_scan_recover_stale_lock_unverifiable_owner_attended_confirmation_recovers(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """The reader's own dead/unverifiable-owner-recovery-still-works-
+    attended case: once attendance is proven (simulated here directly,
+    since no test anywhere in this codebase yet simulates a real TTY),
+    the scan proceeds and the forced recovery is recorded, never
+    silent."""
+    import json
+
+    stale = _acquire_real_lock(java_repo)
+    _make_unverifiable(monkeypatch, stale)
+    monkeypatch.setattr(cli, "_comprehension_confirm_attended", lambda prompt_lines: True)
+    exit_code = _run(["comprehension", "scan", "--recover-stale-lock"], java_repo)
+    assert exit_code == 0
+    assert not stale.path.exists()
+    from agenttalk.comprehension import paths as pathsmod
+
+    comp_dir = pathsmod.comprehension_dir(java_repo / ".agenttalk")
+    status = scan_pipeline.get_status(java_repo)
+    run_dir = pathsmod.run_dir(comp_dir, status["latest_scan_id"])
+    problems_doc = json.loads((run_dir / "problems.json").read_text(encoding="utf-8"))
+    assert any(
+        p["reason_code"] == "scan_lock_forcibly_recovered" for p in problems_doc["problems"])
+
+
 # ----------------------------------------------------------- status
 
 def test_status_before_any_scan(tmp_path: Path, capsys) -> None:

@@ -2217,7 +2217,17 @@ def test_scan_json_content_digest_is_stable_across_two_real_content_identical_sc
     assert digestsmod.canonical_content_digest(first_doc) == digestsmod.canonical_content_digest(second_doc)
 
 
-def test_recover_stale_lock_flag_clears_an_existing_lock(java_repo: Path) -> None:
+def test_recover_stale_lock_flag_clears_a_dead_owners_lock(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 21 (seventeenth cold read, CR17-1 BLOCKER, safety
+    contract): the flag no longer clears ANY lock unconditionally - this
+    fixture's own lock is genuinely stale (a dead owner, per the
+    monkeypatched liveness check), so the recovery is safe, and the run
+    now also RECORDS the forced recovery as a named, degrading problem
+    rather than silently proceeding as if nothing unusual happened."""
+    import json
+
     from agenttalk.comprehension import lock as lockmod
     from agenttalk.comprehension import paths as pathsmod
     from agenttalk.comprehension import privacy as privacymod
@@ -2227,8 +2237,34 @@ def test_recover_stale_lock_flag_clears_an_existing_lock(java_repo: Path) -> Non
     stale = lockmod.acquire_scan_lock(comp_dir, privacy=privacy_result, predecessor_index_digest=None)
     assert stale.path.exists()
 
+    monkeypatch.setattr(lockmod, "process_observation", lambda pid: ("dead", None))
     outcome = scan_pipeline.run_scan(java_repo, recover_stale_lock=True)
-    assert outcome.status == "complete"
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    assert any(
+        p["reason_code"] == "scan_lock_forcibly_recovered" for p in problems_doc["problems"])
+
+
+def test_recover_stale_lock_flag_refuses_a_provably_live_local_owner(java_repo: Path) -> None:
+    """The other half of CR17-1's own fix: a live local owner (this test's
+    own process, by construction) must never be silently cleared by the
+    flag, even when it is explicitly passed - ScanLockContended, the
+    exact same refusal an ordinary contended acquire already raises."""
+    from agenttalk.comprehension import lock as lockmod
+    from agenttalk.comprehension import paths as pathsmod
+    from agenttalk.comprehension import privacy as privacymod
+    from agenttalk.comprehension.errors import ScanLockContended
+
+    comp_dir = pathsmod.comprehension_dir(java_repo / ".agenttalk")
+    privacy_result = privacymod.run_privacy_preflight(java_repo)
+    live = lockmod.acquire_scan_lock(comp_dir, privacy=privacy_result, predecessor_index_digest=None)
+    assert live.path.exists()
+
+    with pytest.raises(ScanLockContended):
+        scan_pipeline.run_scan(java_repo, recover_stale_lock=True)
+    assert live.path.exists()  # never deleted
+    lockmod.release_scan_lock(live)
 
 
 # ----------------------------------------------------------- get_status

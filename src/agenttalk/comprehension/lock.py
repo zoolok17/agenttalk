@@ -370,16 +370,56 @@ def release_scan_lock(handle: ScanLockHandle) -> None:
     os.remove(handle.path)
 
 
-def recover_stale_lock(comprehension_dir: Path) -> None:
-    """Attended-only override: unconditionally clear an existing scan.lock.
+def recover_stale_lock(comprehension_dir: Path) -> dict | None:
+    """Attended-only override: clears an existing scan.lock — UNLESS its
+    recorded owner is a provably live, same-host, same-process match, in
+    which case this REFUSES outright (``ScanLockContended``, the exact
+    same live-contention refusal an ordinary acquire attempt already
+    raises for the identical evidence).
 
-    This function performs no attendance check itself — proving an
-    interactive terminal and explicit operator confirmation is the CLI's
-    job (PR-B's ``--recover-stale-lock`` flag). By the time this is called,
-    the operator has already confirmed the prior scan is gone; this is the
-    single place that acts on that confirmation, so PR-B's CLI has exactly
-    one internal call to make.
-    """
+    FIX ROUND 21 (seventeenth cold read, CR17-1 BLOCKER, safety
+    contract): this function used to clear the lock UNCONDITIONALLY,
+    with no check of who (or whether anyone) held it - a live local
+    owner is not "stale" by any reading of the design ("A lock is
+    reclaimed automatically only when the recorded local process
+    identity is definitely dead; an unverifiable or remote-looking
+    owner requires the explicit attended --recover-stale-lock action" -
+    a PROVABLY LIVE local owner is neither dead nor unverifiable, so
+    this override was never meant to reach it at all). Recovery is for
+    a dead, unverifiable, or remote-looking owner only - reuses the
+    exact same liveness evidence ``_classify_and_maybe_reclaim`` already
+    computes for the ordinary (non-override) acquire path, so a live
+    local owner is refused here the identical way it would be refused
+    there.
+
+    This function still performs no ATTENDANCE check itself - proving an
+    interactive terminal and explicit operator confirmation remains the
+    CLI's own job (PR-B's ``--recover-stale-lock`` flag). Returns the
+    previous lock record (so the caller can record a forced-recovery
+    trace - CR17-1's own part 3) or ``None`` when there was no lock to
+    clear at all (a no-op recovery attempt is not itself notable)."""
     path = _lock_path(comprehension_dir)
+    if not path.exists():
+        return None
+    try:
+        record = _read_lock_record(path)
+    except ScanLockUnrecoverable:
+        # A malformed/unreadable record can never be proven to name a
+        # live owner either - safe to treat as clearable, the same fail
+        # side the design's own dead/unverifiable/remote-looking list
+        # already covers. No liveness record to check against, so no
+        # further evidence is available to refuse on.
+        record = None
+    if record is not None and record["host_identity"] == host_identity():
+        status, observed = process_observation(record["pid"])
+        if status == "alive":
+            recorded = record["process_identity"]
+            if (
+                observed is not None
+                and observed.scheme == recorded["scheme"]
+                and observed.value == recorded["value"]
+            ):
+                raise ScanLockContended(record)
     with contextlib.suppress(FileNotFoundError):
         os.remove(path)
+    return record

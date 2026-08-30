@@ -276,27 +276,71 @@ def test_release_refuses_if_lock_file_is_gone(
 
 # ----------------------------------------------------------- recover_stale_lock (attended-only)
 
-def test_recover_stale_lock_clears_an_existing_lock_unconditionally(
+def test_recover_stale_lock_refuses_a_provably_live_local_owner(
     comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
-    """recover_stale_lock performs NO liveness check — it is the attended
-    override, called only after a human has already confirmed the prior
-    scan is gone (design: the CLI flag requires attendance; this function
-    is what it calls once attendance is proven)."""
+    """FIX ROUND 21 (seventeenth cold read, CR17-1 BLOCKER, safety
+    contract): recover_stale_lock used to clear ANY lock unconditionally,
+    with no liveness check at all - a live local owner is never "stale"
+    by the design's own wording ("A lock is reclaimed automatically only
+    when the recorded local process identity is definitely dead... an
+    unverifiable or remote-looking owner requires the explicit attended
+    --recover-stale-lock action" - a PROVABLY LIVE owner is neither).
+    This lock is acquired by THIS SAME test process (a real, live,
+    same-host, same-identity owner by construction) - recovery must
+    refuse it exactly the way an ordinary contended acquire already
+    does, never silently clear it."""
+    live = lockmod.acquire_scan_lock(
+        comprehension_dir, privacy=comprehension_privacy,
+        predecessor_index_digest=None)
+    assert live.path.exists()
+    with pytest.raises(ScanLockContended):
+        lockmod.recover_stale_lock(comprehension_dir)
+    assert live.path.exists()  # never deleted - refused before clearing
+    lockmod.release_scan_lock(live)
+
+
+def test_recover_stale_lock_clears_a_dead_owners_lock(
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
+) -> None:
+    """The attended override's own real job: a dead owner's lock is safe
+    to clear - returns the previous record (for the caller's own forced-
+    recovery trace) and the file is actually gone afterward."""
     stale = lockmod.acquire_scan_lock(
         comprehension_dir, privacy=comprehension_privacy,
         predecessor_index_digest=None)
-    assert stale.path.exists()
-    lockmod.recover_stale_lock(comprehension_dir)
+    monkeypatch.setattr(lockmod, "process_observation", lambda pid: ("dead", None))
+    previous = lockmod.recover_stale_lock(comprehension_dir)
     assert not stale.path.exists()
+    assert previous is not None
+    assert previous["pid"] == stale.pid
     fresh = lockmod.acquire_scan_lock(
         comprehension_dir, privacy=comprehension_privacy,
         predecessor_index_digest=None)
     lockmod.release_scan_lock(fresh)
 
 
+def test_recover_stale_lock_clears_an_unverifiable_owners_lock(
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
+) -> None:
+    """The other half of "dead, unverifiable, or remote-looking" - a
+    same-PID-but-different-process-identity match (PID reuse) can never
+    prove death, but it is exactly the unverifiable case the attended
+    override exists for, and must still be clearable."""
+    stale = lockmod.acquire_scan_lock(
+        comprehension_dir, privacy=comprehension_privacy,
+        predecessor_index_digest=None)
+    different_identity = ProcessIdentity(
+        scheme=stale.process_identity.scheme, value=stale.process_identity.value + "-reused")
+    monkeypatch.setattr(
+        lockmod, "process_observation", lambda pid: ("alive", different_identity))
+    previous = lockmod.recover_stale_lock(comprehension_dir)
+    assert not stale.path.exists()
+    assert previous is not None
+
+
 def test_recover_stale_lock_on_an_absent_lock_is_a_silent_no_op(tmp_path: Path) -> None:
-    lockmod.recover_stale_lock(tmp_path)  # must not raise
+    assert lockmod.recover_stale_lock(tmp_path) is None  # must not raise
     assert not (tmp_path / "scan.lock").exists()
 
 

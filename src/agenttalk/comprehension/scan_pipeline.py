@@ -213,6 +213,10 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     # was suppressed run-wide. Same bucket as every other named-gap
     # reason code above.
     "externality_suppressed": "warning",
+    # FIX ROUND 21 (seventeenth cold read, CR17-1 BLOCKER): a forced
+    # --recover-stale-lock recovery - safety-relevant provenance, same
+    # bucket as every other named-gap reason code above.
+    "scan_lock_forcibly_recovered": "warning",
 }
 _DEFAULT_PROBLEM_SEVERITY = "warning"
 
@@ -327,8 +331,16 @@ def run_scan(
     agenttalk_dir = root / ".agenttalk"
     comprehension_dir = paths.comprehension_dir(agenttalk_dir)
 
+    # FIX ROUND 21 (seventeenth cold read, CR17-1 BLOCKER, part 3): a
+    # forced lock recovery is a safety-relevant event this run's own
+    # provenance must not stay silent about - captured here (before the
+    # record is gone) and turned into a named, degrading problem once
+    # `problems` is assembled below. `None` means either the override
+    # was never requested, or nothing was actually there to clear (a
+    # genuine no-op, not itself notable).
+    forced_lock_recovery_record = None
     if recover_stale_lock:
-        lock.recover_stale_lock(comprehension_dir)
+        forced_lock_recovery_record = lock.recover_stale_lock(comprehension_dir)
 
     privacy_result = _obtain_privacy(
         root, acknowledge_unignored=acknowledge_unignored, work_id=work_id)
@@ -641,6 +653,19 @@ def run_scan(
             for group in modules_by_conflict_id.values()
         ]
 
+        # FIX ROUND 21 (seventeenth cold read, CR17-1 BLOCKER, part 3): a
+        # forced --recover-stale-lock recovery is a safety-relevant event
+        # this run's own provenance must not stay silent about.
+        forced_lock_recovery_problems = [
+            _problem_record(
+                "scan_lock_forcibly_recovered", None,
+                f"an attended --recover-stale-lock action cleared an existing scan.lock "
+                f"(previously recorded pid {forced_lock_recovery_record.get('pid')!r}, "
+                f"acquired {forced_lock_recovery_record.get('acquired_at')!r}) before this "
+                "run began - the prior owner was not provably live, but its own scan was "
+                "never confirmed complete",
+            )
+        ] if forced_lock_recovery_record is not None else []
         problems = [
             _problem_record(p["reason_code"], p.get("path"), p["detail"])
             for p in discovery_result.problems
@@ -653,7 +678,8 @@ def run_scan(
                 "case_collision", second, bounded_detail(f"case-folds identically to {first!r}"))
             for first, second in case_collisions
         ] + duplicate_qualified_name_problems + binary_excluded_code_bearing_problems + (
-            reactor_rule_problems) + externality_suppressed_problems
+            reactor_rule_problems) + externality_suppressed_problems + (
+            forced_lock_recovery_problems)
         # FIX ROUND 14b (reviewer-3's ratified CR10-5 split): a worker
         # problem's own `degrades_run` (worker.py) distinguishes
         # "recorded, visible" from "the run's status also degrades over
@@ -679,7 +705,7 @@ def run_scan(
             discovery_result.degraded or discovery_result.problems or case_collisions
             or degrading_worker_problems or duplicate_qualified_name_problems
             or binary_excluded_code_bearing_problems or reactor_rule_problems
-            or externality_poisoned
+            or externality_poisoned or forced_lock_recovery_problems
         ) else "complete"
 
         modules_doc = {

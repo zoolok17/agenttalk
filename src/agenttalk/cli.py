@@ -2088,6 +2088,44 @@ def _print_scan_json_integrity_if_not_verified(payload: dict) -> None:
         print(f"scan_json_integrity: {integrity.get('state')} ({integrity.get('reason_code')})")
 
 
+def _comprehension_recover_stale_lock_and_rescan(
+    args: argparse.Namespace, root: Path, exc: Exception, *,
+    acknowledge_unignored: bool = False, work_id: str | None = None,
+):
+    """FIX ROUND 21 (seventeenth cold read, CR17-1 BLOCKER, safety
+    contract): shared by both the plain-scan path and the privacy-
+    override retry path - each reaches here only after a genuine
+    ``ScanLockUnrecoverable`` (the lock is dead-but-unconfirmable,
+    unverifiable, or remote-looking; a LIVE local owner never reaches
+    this function at all - ``ScanLockContended`` refuses it outright,
+    unconditionally, before this is ever called). ``--recover-stale-
+    lock`` is consulted HERE, for the first time, exactly once - never
+    threaded into an initial attempt the way it used to be. Returns a
+    ``ScanOutcome`` on success, or an ``int`` exit code for the caller
+    to return directly."""
+    from agenttalk.comprehension import scan_pipeline
+    from agenttalk.comprehension.errors import ComprehensionError
+
+    if not args.recover_stale_lock:
+        sys.stderr.write(f"agenttalk: {exc}\n")
+        return 2
+    confirmed = _comprehension_confirm_attended([
+        f"ATTENDED ACTION: recover-stale-lock at {root}",
+        exc.detail,
+        "This clears the existing scan.lock - a live owner is refused outright instead, "
+        "never reaching this prompt.",
+    ])
+    if not confirmed:
+        return _comprehension_escalate(args, action="recover-stale-lock", error=exc)
+    try:
+        return scan_pipeline.run_scan(
+            root, acknowledge_unignored=acknowledge_unignored, work_id=work_id,
+            recover_stale_lock=True)
+    except ComprehensionError as exc2:
+        sys.stderr.write(f"agenttalk: {exc2}\n")
+        return 2
+
+
 def cmd_comprehension(args: argparse.Namespace) -> int:
     """Local, offline static comprehension inventory (task #55 slice-1).
     Scope simplifications this slice (named, not silent): no config.json
@@ -2117,7 +2155,18 @@ def cmd_comprehension(args: argparse.Namespace) -> int:
     if action == "scan":
         outcome = None
         try:
-            outcome = scan_pipeline.run_scan(root, recover_stale_lock=args.recover_stale_lock)
+            # FIX ROUND 21 (seventeenth cold read, CR17-1 BLOCKER, safety
+            # contract): the FIRST attempt never passes the raw CLI flag
+            # straight through - an ordinary dead-owner lock is already
+            # reclaimed automatically inside acquire_scan_lock, with no
+            # override needed at all; passing the flag here unconditionally
+            # used to clear ANY lock (live or dead) before that machinery
+            # ever ran, defeating ScanLockContended's own live-owner
+            # refusal entirely. The override is only ever consulted below,
+            # after a genuine ScanLockUnrecoverable (dead-but-unconfirmable/
+            # unverifiable/remote-looking) proves recovery is actually the
+            # right question to ask.
+            outcome = scan_pipeline.run_scan(root)
         except VcsPrivacyRefused as exc:
             if not args.acknowledge_unignored_private_store:
                 sys.stderr.write(f"agenttalk: {exc}\n")
@@ -2138,30 +2187,25 @@ def cmd_comprehension(args: argparse.Namespace) -> int:
                     work_id=args.work_id)
             try:
                 outcome = scan_pipeline.run_scan(
-                    root, acknowledge_unignored=True, work_id=args.work_id,
-                    recover_stale_lock=args.recover_stale_lock)
+                    root, acknowledge_unignored=True, work_id=args.work_id)
+            except ScanLockUnrecoverable as exc2:
+                outcome = _comprehension_recover_stale_lock_and_rescan(
+                    args, root, exc2, acknowledge_unignored=True, work_id=args.work_id)
+                if isinstance(outcome, int):
+                    return outcome
             except ComprehensionError as exc2:
                 sys.stderr.write(f"agenttalk: {exc2}\n")
                 return 2
         except ScanLockContended as exc:
+            # A live, provably-same-host, provably-same-process owner is
+            # never "stale" - refused outright regardless of whether
+            # --recover-stale-lock was passed (CR17-1's own fix part 1).
             sys.stderr.write(f"agenttalk: {exc}\n")
             return 2
         except ScanLockUnrecoverable as exc:
-            if args.recover_stale_lock:
-                sys.stderr.write(f"agenttalk: {exc}\n")
-                return 2
-            confirmed = _comprehension_confirm_attended([
-                f"ATTENDED ACTION: recover-stale-lock at {root}",
-                exc.detail,
-                "This unconditionally clears the existing scan.lock.",
-            ])
-            if not confirmed:
-                return _comprehension_escalate(args, action="recover-stale-lock", error=exc)
-            try:
-                outcome = scan_pipeline.run_scan(root, recover_stale_lock=True)
-            except ComprehensionError as exc2:
-                sys.stderr.write(f"agenttalk: {exc2}\n")
-                return 2
+            outcome = _comprehension_recover_stale_lock_and_rescan(args, root, exc)
+            if isinstance(outcome, int):
+                return outcome
         except (ArtifactLimitExceeded, ComprehensionError) as exc:
             sys.stderr.write(f"agenttalk: {exc}\n")
             return 2
