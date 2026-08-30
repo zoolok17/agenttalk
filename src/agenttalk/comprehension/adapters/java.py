@@ -256,6 +256,22 @@ _QUALIFIED_CALL_RE = re.compile(
 #: referencing this file's own declared static fields) - that stays a
 #: named carry if this heuristic proves too narrow or too wide in a
 #: future round.
+#:
+#: NAMED CASE (round 19b, reviewer-3's own finding - documented so a
+#: future reader does not have to rediscover it): a genuine EXTERNAL
+#: type whose own name happens to BE all-caps (``java.net.URI`` -
+#: ``URI.create(...)``) also loses its invoke edge under this
+#: heuristic, whenever it reaches the qualifier-neither-local-nor-
+#: import-recognized branch this applies to. Accepted, not a silent
+#: gap: ``invoke`` is already scoped OUT of ``dependencies_resolved``
+#: entirely (round 12's own F2, ``readiness_artifact.py``'s
+#: ``_DEPENDENCY_RESOLUTION_RELATIONS`` - deliberately excludes
+#: ``invoke`` so ordinary JDK/library calls, which always resolve
+#: unresolved with zero in-scan candidates, never cry a false
+#: unsatisfied over entirely healthy code), so a missing invoke edge
+#: for a JDK/library call has NO readiness-visible effect either way -
+#: the same "JDK noise invoke was already meant to be invisible to"
+#: reasoning this heuristic's own cost rides on, not a new exposure.
 _ALL_CAPS_CONSTANT_QUALIFIER_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 #: FIX ROUND 13 (ninth cold read, CR9-2 MAJOR): the enumerated-recognizer
 #: lesson (rounds 8/10 for headers/routes) applied here too - the old

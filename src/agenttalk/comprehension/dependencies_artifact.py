@@ -459,7 +459,34 @@ def _excluded_region_match(qualified_name: str, excluded_root_paths: frozenset[s
     has no entry, discovery genuinely pruned the whole `target/` tree,
     and nothing observable here distinguishes this shape from a
     genuinely third-party dependency. Undetectable BY CONSTRUCTION this
-    slice - never silently assumed correct."""
+    slice - never silently assumed correct.
+
+    OVER-MATCH BOUND (round 19b, reviewer-3's own derivation on round
+    19's F1 - written down so the next reader does not have to re-derive
+    it): the tail checks added in round 19 (``root.endswith(...)``)
+    could in principle fire on an ACCIDENTAL tail match - some genuinely
+    external package whose own last segment happens to spell one of the
+    same names an excluded root can end in. The risk is BOUNDED, not
+    open-ended: every ``excluded_root_paths`` entry is a directory or
+    file discovery excluded by NAME, so its own basename is always one
+    of the closed, enumerated set this producer excludes by name -
+    discovery.py's ``_HARD_EXCLUDE_DIR_NAMES`` / ``_VCS_DIR_NAMES`` /
+    ``_DEPENDENCY_CACHE_DIR_NAMES`` / ``_GENERATED_VENDOR_DIR_NAMES``
+    (19 names total at this writing - the closed union, not a number to
+    hardcode elsewhere). The tail check can therefore only ever fire
+    when BOTH hold: (1) the external package's own last segment (or,
+    for a single-type match, its file's own simple name) IS one of
+    those 19 names, AND (2) this SAME repo's own scan actually recorded
+    a matching excluded tree this run. Given both, ``unresolved`` is the
+    CORRECT answer regardless - discovery genuinely did not walk that
+    excluded region, so the registry genuinely has no evidence either
+    way, the identical epistemic state a true excluded-region match is
+    in. The residual this bound leaves open is narrow: a genuine
+    external dependency whose own 1-2-segment package happens to BOTH
+    share one of these 19 names AND coincide with an excluded tree this
+    same repo also happens to have - failing toward ``unresolved``
+    (an honest "don't know"), never toward a wrong confident claim in
+    either direction."""
     suffix = qualified_name.replace(".", "/") + ".java"
     package_path = qualified_name.rsplit(".", 1)[0].replace(".", "/") if "." in qualified_name else None
     for root in excluded_root_paths:

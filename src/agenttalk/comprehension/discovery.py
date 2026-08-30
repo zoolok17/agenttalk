@@ -184,7 +184,7 @@ def _sits_under_an_uncarved_src_segment(relative_path: str) -> bool:
     return "src" in relative_path.split("/")
 
 
-def _excluded_directory_contains_a_code_bearing_file(directory: Path) -> bool:
+def _excluded_directory_contains_a_code_bearing_file(directory: Path) -> tuple[bool, bool]:
     """A BOUNDED peek inside a directory this run is about to exclude
     outright as ``generated_or_vendor`` - never added to ``files``,
     never hashed, just a cheap extension check so an excluded region
@@ -196,7 +196,28 @@ def _excluded_directory_contains_a_code_bearing_file(directory: Path) -> bool:
     is the safe, conservative choice, not a correctness requirement).
     Short-circuits on the FIRST match; bounded by a hard entry-count cap
     (PROVISIONAL, like every other cap in this module) against a
-    pathologically large excluded subtree."""
+    pathologically large excluded subtree.
+
+    Returns ``(found, truncated)``. FIX ROUND 19b (reviewer-3's rejection
+    of round 19, THE MAJOR, wrong-data): this used to return a bare
+    ``bool``, with cap exhaustion silently folded into the SAME ``False``
+    a genuinely fully-explored, code-free directory returns - the caller
+    then read "exhausted" as "no code found", a confident negative this
+    peek never actually earned. Measured: two repos differing ONLY in
+    the FILENAME of the one ``.java`` among thousands of ``.class``
+    files inside a bare ``src/build/`` (the normal Ant-era shape, easily
+    past the entry cap) published DIFFERENT run status purely because
+    ``os.scandir`` happened to visit one filename before the cap and the
+    other after it - a published outcome depending on filesystem
+    enumeration order, on a plane whose entire design is reproducible
+    runs. ``truncated`` is ``True`` only when the cap was hit WITHOUT
+    finding a match - the caller (discovery.py's own ``_walk``) now
+    treats that as its own honest, distinct, still-degrading outcome
+    (``excluded_region_peek_truncated``) rather than silently reusing
+    the confident "no code" problem code - the same "record the
+    truncation, never just stop looking" discipline every OTHER cap in
+    this module already follows (``MAX_FILESYSTEM_ENTRIES``, the
+    per-file/total-byte caps, ...)."""
     visited = 0
     stack = [directory]
     while stack:
@@ -208,7 +229,7 @@ def _excluded_directory_contains_a_code_bearing_file(directory: Path) -> bool:
         for entry in entries:
             visited += 1
             if visited > _MAX_EXCLUDED_DIRECTORY_PEEK_ENTRIES:
-                return False
+                return False, True
             try:
                 if entry.is_symlink():
                     continue
@@ -217,10 +238,10 @@ def _excluded_directory_contains_a_code_bearing_file(directory: Path) -> bool:
                 elif entry.is_file(follow_symlinks=False) and entry.name.lower().endswith(
                     tuple(_DEGRADABLE_EXCLUDED_EXTENSIONS),
                 ):
-                    return True
+                    return True, False
             except OSError:
                 continue
-    return False
+    return False, False
 
 
 _SECRET_FILE_PATTERNS = (
@@ -677,17 +698,42 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                     # silent, unaffected.
                     if category == "generated_or_vendor" and _sits_under_an_uncarved_src_segment(
                         relative,
-                    ) and _excluded_directory_contains_a_code_bearing_file(entry):
-                        degraded = True
-                        problems.append({
-                            "reason_code": "excluded_region_contains_code",
-                            "path": relative,
-                            "detail": "a generated/vendor-named directory nested under an "
-                                      "unrecognized bare src/ root contains at least one "
-                                      "adapter-handled or tier-2 code-bearing file - excluded "
-                                      "from the inventory as if it were build output, but this "
-                                      "content is genuinely unread code",
-                        })
+                    ):
+                        contains_code, peek_truncated = (
+                            _excluded_directory_contains_a_code_bearing_file(entry)
+                        )
+                        if contains_code:
+                            degraded = True
+                            problems.append({
+                                "reason_code": "excluded_region_contains_code",
+                                "path": relative,
+                                "detail": "a generated/vendor-named directory nested under an "
+                                          "unrecognized bare src/ root contains at least one "
+                                          "adapter-handled or tier-2 code-bearing file - "
+                                          "excluded from the inventory as if it were build "
+                                          "output, but this content is genuinely unread code",
+                            })
+                        elif peek_truncated:
+                            # FIX ROUND 19b (reviewer-3's rejection of
+                            # round 19, THE MAJOR, wrong-data): the peek
+                            # hit its own entry cap before finding (or
+                            # ruling out) a code-bearing file - an
+                            # honestly UNKNOWN outcome, never silently
+                            # folded into the same confident "no code"
+                            # answer a fully-explored, genuinely code-
+                            # free directory gets. Degrades, the same
+                            # "record the truncation" discipline every
+                            # other cap in this module already follows.
+                            degraded = True
+                            problems.append({
+                                "reason_code": "excluded_region_peek_truncated",
+                                "path": relative,
+                                "detail": "a generated/vendor-named directory nested under an "
+                                          "unrecognized bare src/ root exceeded this run's "
+                                          f"{_MAX_EXCLUDED_DIRECTORY_PEEK_ENTRIES}-entry peek "
+                                          "cap before a code-bearing file could be confirmed "
+                                          "present or absent - not confidently either",
+                            })
                     continue
                 if relative in submodule_boundaries:
                     boundaries.append(

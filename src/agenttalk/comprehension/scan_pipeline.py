@@ -194,6 +194,13 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     # src/ root that swallows real code (discovery.py) - the same
     # "warning" bucket every other missing-evidence reason already gets.
     "excluded_region_contains_code": "warning",
+    # FIX ROUND 19b (reviewer-3's rejection of round 19, THE MAJOR,
+    # wrong-data): the excluded-directory peek's own entry cap exceeded
+    # before a code-bearing file could be confirmed present or absent -
+    # honestly unknown, never silently folded into the same confident
+    # "no code" outcome a fully-explored directory gets. Same "warning"
+    # bucket every other missing-evidence reason already gets.
+    "excluded_region_peek_truncated": "warning",
 }
 _DEFAULT_PROBLEM_SEVERITY = "warning"
 

@@ -266,6 +266,98 @@ def test_enumerate_scope_an_ant_style_build_dir_with_only_binaries_stays_silent(
     assert not any(p["reason_code"] == "excluded_region_contains_code" for p in result.problems)
 
 
+class _FakeExcludedDirEntry:
+    """Mimics the subset of ``os.DirEntry`` the peek function uses -
+    lets a test control PEEK-ORDER deterministically without creating
+    thousands of real files, and without depending on any real
+    filesystem's own (unspecified) directory-listing order."""
+
+    def __init__(self, directory: Path, name: str, *, is_dir: bool = False) -> None:
+        self.name = name
+        self.path = str(directory / name)
+        self._is_dir = is_dir
+
+    def is_symlink(self) -> bool:
+        return False
+
+    def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+        return self._is_dir
+
+    def is_file(self, *, follow_symlinks: bool = True) -> bool:
+        return not self._is_dir
+
+
+def test_enumerate_scope_reports_the_same_degraded_outcome_regardless_of_peek_order(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 19b (reviewer-3's rejection of round 19, THE MAJOR,
+    wrong-data): the peek's own entry-count cap used to fold BOTH
+    "fully explored, genuinely no code" AND "exceeded the cap before
+    finding out" into the identical bare ``False`` - the caller then
+    read cap-exhaustion as a confident negative. Measured: two repos
+    differing ONLY in the FILENAME of the one .java among thousands of
+    .class files inside a bare src/build/ (the normal Ant-era shape,
+    easily past the cap) published DIFFERENT run status purely because
+    scan order happened to visit one filename before the cap and the
+    other after it - a published outcome depending on filesystem
+    enumeration order. Both orderings must now degrade - one via
+    excluded_region_contains_code (found within the cap), the other via
+    excluded_region_peek_truncated (the cap exhausted first, an
+    honestly UNKNOWN outcome, never silently treated as absent)."""
+    build_dir = tmp_path / "src" / "build"
+    build_dir.mkdir(parents=True)
+    bulk = [
+        _FakeExcludedDirEntry(build_dir, f"Compiled{i}.class")
+        for i in range(discovery._MAX_EXCLUDED_DIRECTORY_PEEK_ENTRIES + 10)
+    ]
+    real_scandir = discovery.os.scandir
+
+    def _run_with_java_at(position: int):
+        entries = list(bulk)
+        entries.insert(position, _FakeExcludedDirEntry(build_dir, "Real.java"))
+
+        def _fake_scandir(path):
+            if Path(path) == build_dir:
+                return entries
+            return real_scandir(path)
+
+        monkeypatch.setattr(discovery.os, "scandir", _fake_scandir)
+        comp_dir = _comprehension_dir(tmp_path)
+        return discovery.enumerate_scope(tmp_path, comp_dir)
+
+    early_result = _run_with_java_at(0)
+    late_result = _run_with_java_at(len(bulk))
+
+    assert early_result.degraded is True
+    assert any(
+        p["reason_code"] == "excluded_region_contains_code" for p in early_result.problems)
+    assert late_result.degraded is True
+    assert any(
+        p["reason_code"] == "excluded_region_peek_truncated" for p in late_result.problems)
+
+
+def test_enumerate_scope_a_fully_explored_excluded_dir_under_the_cap_stays_silent(
+    tmp_path: Path,
+) -> None:
+    """Companion negative case - a bare src/ root's own excluded
+    directory, fully explored WELL under the peek cap and genuinely
+    free of any code-bearing extension, must stay silent (not
+    truncated, not degraded) - the truncation problem is for exceeding
+    the cap specifically, never merely for existing."""
+    build_dir = tmp_path / "src" / "build"
+    build_dir.mkdir(parents=True)
+    (build_dir / "Helper.class").write_bytes(b"\xca\xfe\xba\xbe")
+    comp_dir = _comprehension_dir(tmp_path)
+
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+
+    assert result.degraded is False
+    assert not any(
+        p["reason_code"] == "excluded_region_peek_truncated" for p in result.problems)
+    assert not any(
+        p["reason_code"] == "excluded_region_contains_code" for p in result.problems)
+
+
 def test_git_as_a_regular_file_is_hard_excluded_not_enumerated(tmp_path: Path) -> None:
     """M2 (sixth cold read, fix round 10): a git WORKTREE or submodule
     checkout stores `.git` as a REGULAR FILE (a `gitdir: ...` pointer),
