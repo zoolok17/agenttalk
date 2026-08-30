@@ -179,6 +179,11 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     # detects and tags (conflict_id), but never surfaced anywhere an
     # operator actually reads until now.
     "duplicate_qualified_name": "warning",
+    # FIX ROUND 17 (thirteenth cold read, CR13-3 MAJOR, part (b) - THE
+    # CLASS-CLOSER): a recognized-but-unsupported route-like annotation
+    # (JAX-WS's own @WebMethod) - under-claimed evidence, the same
+    # "warning" bucket every other missing-evidence reason already gets.
+    "unsupported_entry_point_shape": "warning",
 }
 _DEFAULT_PROBLEM_SEVERITY = "warning"
 
@@ -709,6 +714,11 @@ def run_scan(
             "excluded_roots_omitted_count": excluded_roots_omitted,
             "unsupported_relations": list(java_adapter.UNSUPPORTED_RELATIONS),
             "unsupported_invoke_shapes": list(java_adapter.UNSUPPORTED_INVOKE_SHAPES),
+            # FIX ROUND 17 (thirteenth cold read, CR13-3 MAJOR, part (b) -
+            # THE CLASS-CLOSER): the entry-point edition of the same
+            # enumerated-coverage-gap idiom the two lines above already
+            # publish.
+            "unsupported_entry_point_shapes": list(java_adapter.UNSUPPORTED_ENTRY_POINT_SHAPES),
             "record_counts": record_counts,
             "problem_count": len(problems),
             "artifacts": artifact_summaries,

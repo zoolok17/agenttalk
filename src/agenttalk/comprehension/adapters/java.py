@@ -65,6 +65,16 @@ UNSUPPORTED_RELATIONS = ("data", "configuration")
 #: visible without guessing.
 UNSUPPORTED_INVOKE_SHAPES = ("constructor_call",)
 
+#: FIX ROUND 17 (thirteenth cold read, CR13-3 MAJOR, part (b) - THE
+#: CLASS-CLOSER): the entry-point edition of the SAME enumerated-
+#: recognizer class UNSUPPORTED_INVOKE_SHAPES already closes for invoke -
+#: a route-like annotation family this adapter recognizes as a routing/
+#: endpoint mechanism but has not modeled gets a NAMED reason code
+#: (``unsupported_entry_point_shape``, attributed to its own enclosing
+#: type - see ``_WEB_METHOD_ANNOTATION_RE``) rather than a silent
+#: confident negative on the class it decorates.
+UNSUPPORTED_ENTRY_POINT_SHAPES = ("jax_ws_web_method",)
+
 #: FIX ROUND 15 (eleventh cold read, F3 MAJOR, wrong-data): the ORIGINAL
 #: combined pattern classified a bare ``/test/`` package segment with NO
 #: corroboration at all - the same bug class CR10-7 already fixed for
@@ -288,6 +298,34 @@ _MAIN_STRING_TYPE_SPELLINGS = frozenset({"String", "java.lang.String"})
 _ROUTE_ANNOTATIONS = (
     "RequestMapping", "GetMapping", "PostMapping", "PutMapping",
     "DeleteMapping", "PatchMapping",
+    # FIX ROUND 17 (thirteenth cold read, CR13-3 MAJOR, wrong-data, part
+    # (a) - JAX-RS): the enumerated-recognizer class, entry-point
+    # edition - @WebServlet and JAX-RS @Path published NO entry point
+    # and NO problem at all, the class landing on the confident negative
+    # entry_points_mapped=not_applicable/no_entry_point. @Path composes
+    # EXACTLY like a plain @RequestMapping already does (a class-level
+    # @Path is a prefix; a method-level @Path composes against it) - no
+    # new composition code needed, only this recognized name.
+    #
+    # NAMED LIMIT: JAX-RS's own separate verb designators (@GET/@POST/
+    # ...) are deliberately NOT recognized here - a resource method
+    # commonly carries a verb annotation AND a separate @Path together
+    # (unlike Spring, where one method has exactly one route
+    # annotation); folding both into this SAME per-annotation-match loop
+    # would publish TWO independent, duplicate edges for the one route
+    # they jointly describe (verified: an early draft did exactly this).
+    # Correctly merging two separate annotations into one route needs
+    # per-METHOD grouping this adapter has no existing mechanism for -
+    # wider than this round's own scope. A JAX-RS method with @Path of
+    # its own (composed with the class prefix, verb unknown - the
+    # identical "no method attribute" state a bare @RequestMapping
+    # already publishes) is recognized; a method relying SOLELY on a
+    # bare verb annotation with no @Path of its own is not - declared
+    # here, a fast-follow if reviewer-3 wants the fuller merge.
+    # @WebServlet is NOT composable the same way (it names a whole
+    # class's route directly, with no method-level counterpart) -
+    # handled by its own dedicated pass, not this tuple.
+    "Path",
 )
 #: Fix round 11 (seventh cold read BLOCKER, part 1 - de-enumerate
 #: RECOGNITION): a FULLY-QUALIFIED route annotation
@@ -371,6 +409,28 @@ _ROUTE_METHOD_VALUE_RE = re.compile(r"(?:[A-Za-z_$][\w$]*\.)*([A-Za-z_$][\w$]*)"
 _REQUEST_METHOD_VOCABULARY = frozenset({
     "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE",
 })
+#: FIX ROUND 17 (thirteenth cold read, CR13-3 MAJOR, part (a) -
+#: @WebServlet): NOT composable the way @RequestMapping/@Path are - it
+#: names a whole class's route(s) directly, with no method-level
+#: counterpart to compose against - so it gets its own dedicated
+#: recognition pass below, never folded into _ROUTE_ANNOTATIONS (which
+#: would wrongly treat a class carrying ONLY this annotation as "a bare
+#: prefix with no invocable route", the composable family's own
+#: legitimate no-method-level-mapping case).
+_WEB_SERVLET_ANNOTATION_RE = re.compile(r"@(?:[A-Za-z_$][\w$]*\.)*WebServlet\b")
+#: FIX ROUND 17 (CR13-3 MAJOR, part (b) - THE CLASS-CLOSER): a route-like
+#: annotation family this adapter recognizes AS a routing/endpoint
+#: mechanism but has never modeled (JAX-WS's own SOAP endpoint idiom -
+#: a genuinely different routing paradigm from HTTP-route recognition
+#: above) - the same "under-claim, never silently guess OR silently
+#: drop" idiom UNSUPPORTED_INVOKE_SHAPES already established for a
+#: different recognized-but-unsupported shape (a constructor call).
+#: Recognizing this by name (never publishing a fabricated route for
+#: it) closes the enumerated-recognizer class regardless of which
+#: SPECIFIC route family this adapter has modeled so far - the next one
+#: it has not yet met still surfaces as a NAMED gap, never a silent
+#: confident negative.
+_WEB_METHOD_ANNOTATION_RE = re.compile(r"@(?:[A-Za-z_$][\w$]*\.)*WebMethod\b")
 
 
 def _route_method_attributes(sanitized_segment: str) -> list[str]:
@@ -398,7 +458,12 @@ def _route_method_attributes(sanitized_segment: str) -> list[str]:
 #: its content are recovered SEPARATELY, from the ORIGINAL text, starting
 #: exactly at this match's end position (sanitization preserves length/
 #: position exactly). See _route_paths.
-_ROUTE_NAMED_ATTR_RE = re.compile(r"\b(?:value|path)\s*=")
+#: FIX ROUND 17 (thirteenth cold read, CR13-3 MAJOR, part (a)): added
+#: ``urlPatterns`` - @WebServlet's own named attribute
+#: (``@WebServlet(urlPatterns = {"/api/*"})``); a bare
+#: ``@WebServlet("/api/*")`` is still recovered via the existing
+#: positional-literal fallback below, unchanged.
+_ROUTE_NAMED_ATTR_RE = re.compile(r"\b(?:value|path|urlPatterns)\s*=")
 # The segment always starts with the annotation's own opening "(" (see
 # _matching_close_paren's caller) - a bare positional literal is
 # recognized only when it leads the argument list.
@@ -1837,6 +1902,62 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                 qualified_name=enclosing, kind="http_route",
                 name=target, line=line, evidence_class="declared",
             ))
+
+    # FIX ROUND 17 (thirteenth cold read, CR13-3 MAJOR, wrong-data, part
+    # (a) - @WebServlet): unlike @RequestMapping/@Path, this annotation
+    # is NOT composable - it decorates a class directly, and its own
+    # value(s)/urlPatterns ARE the complete served route(s), with no
+    # method-level counterpart. Reuses the SAME class-association and
+    # value-recovery fail-safes (unassociated / value-unrecoverable) the
+    # Spring/JAX-RS loop above already established, never a separate,
+    # laxer standard for this family.
+    for match in _WEB_SERVLET_ANNOTATION_RE.finditer(sanitized):
+        line = _line_at(newline_offsets, match.start())
+        target_type = _class_level_route_target(match.start(), class_header_associations)
+        if target_type is None:
+            problems.append(JavaAdapterProblem(
+                reason_code="route_annotation_unassociated",
+                detail=f"a @WebServlet annotation at line {line} could not be confidently "
+                       "associated with any declared type - suppressed rather than "
+                       "published as a route",
+            ))
+            continue
+        _span_end, paths, _explicit_methods = _route_annotation_span(match)
+        if paths is None:
+            problems.append(JavaAdapterProblem(
+                reason_code="route_value_unrecoverable",
+                detail=f"a @WebServlet annotation at line {line} has a value/urlPatterns "
+                       "that could not be recovered as a literal - suppressed rather than "
+                       "published with a guessed or partial value",
+                qualified_name=target_type,
+            ))
+            continue
+        for path in paths:
+            edges.append(JavaEdgeClaim(
+                from_qualified_name=target_type, relation="route", target=path,
+                target_kind="external_route", evidence_class="declared",
+                line=line, phase="runtime",
+            ))
+            entry_points.append(JavaEntryPointClaim(
+                qualified_name=target_type, kind="http_route",
+                name=path, line=line, evidence_class="declared",
+            ))
+
+    # FIX ROUND 17 (CR13-3 MAJOR, part (b) - THE CLASS-CLOSER): a route-
+    # like annotation family this adapter recognizes but has not modeled
+    # (JAX-WS's own SOAP endpoint idiom, @WebMethod) - never silently
+    # falls through to a confident "no entry point" negative on the
+    # class it decorates. See UNSUPPORTED_ENTRY_POINT_SHAPES.
+    for match in _WEB_METHOD_ANNOTATION_RE.finditer(sanitized):
+        line = _line_at(newline_offsets, match.start())
+        enclosing = _enclosing_qualified_name(match.start(), types, primary_qualified)
+        problems.append(JavaAdapterProblem(
+            reason_code="unsupported_entry_point_shape",
+            detail=f"a @WebMethod annotation at line {line} names a recognized routing/"
+                   "endpoint mechanism (JAX-WS SOAP) this adapter does not model - no "
+                   "entry point published, but not confidently absent either",
+            qualified_name=enclosing,
+        ))
 
     # Note 10 (second cold read, fix round 4): finditer, not search - a
     # file with more than one top-level type can declare more than one

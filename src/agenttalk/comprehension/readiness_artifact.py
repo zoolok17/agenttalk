@@ -222,6 +222,13 @@ _READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
     "route_annotation_unassociated": frozenset(),
     "route_value_unrecoverable": frozenset(),
     "cli_main_unrecognized": frozenset({"entry_points_mapped"}),
+    # FIX ROUND 17 (thirteenth cold read, CR13-3 MAJOR, part (b) - THE
+    # CLASS-CLOSER): a class carrying a recognized-but-unsupported
+    # route-like annotation (JAX-WS's own @WebMethod) must feed
+    # entry_points_mapped UNKNOWN - never the confident not_applicable/
+    # no_entry_point negative a class that genuinely serves no route at
+    # all correctly gets.
+    "unsupported_entry_point_shape": frozenset({"entry_points_mapped"}),
     # FIX ROUND 14 (tenth cold read, CR10-5 JUDGE, completeness): a
     # recognized-but-unsupported source language (worker.py) is exactly
     # "this file's content itself could not be confidently processed" -

@@ -94,6 +94,103 @@ def test_scan_json_names_unsupported_invoke_shapes_as_a_declared_gap(
         java_adapter.UNSUPPORTED_INVOKE_SHAPES)
 
 
+def test_scan_json_names_unsupported_entry_point_shapes_as_a_declared_gap(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 17 (thirteenth cold read, CR13-3 MAJOR, part (b) - THE
+    CLASS-CLOSER): the entry-point edition of the same enumerated-
+    coverage-gap idiom UNSUPPORTED_INVOKE_SHAPES/UNSUPPORTED_RELATIONS
+    already establish."""
+    import json
+
+    from agenttalk.comprehension.adapters import java as java_adapter
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["unsupported_entry_point_shapes"] == list(
+        java_adapter.UNSUPPORTED_ENTRY_POINT_SHAPES)
+
+
+def test_run_scan_web_servlet_and_jax_rs_routes_publish_end_to_end_cr13_c(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 17 (thirteenth cold read, CR13-3 MAJOR, wrong-data):
+    mirrors the reader's own .cr13-c shape - both @WebServlet and JAX-RS
+    @Path publish real entry points end to end, no synthetic edge
+    construction. Both used to publish NO entry point and NO problem at
+    all - the class landing on the confident negative."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "p" / "DispatcherServlet.java").write_text(
+        "package p;\n"
+        "\n"
+        "@WebServlet(urlPatterns = {\"/api/*\"})\n"
+        "public class DispatcherServlet extends HttpServlet {\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (java_repo / "src" / "main" / "java" / "p" / "OrderResource.java").write_text(
+        "package p;\n"
+        "\n"
+        "@Path(\"/orders\")\n"
+        "public class OrderResource {\n"
+        "  @Path(\"/list\")\n"
+        "  public void list() {}\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
+
+    route_targets = {
+        r["target_external"] for r in dependencies_doc["edges"] if r["relation"] == "route"
+    }
+    assert "/api/*" in route_targets
+    assert "/orders/list" in route_targets
+    entry_point_names = {e["name"] for e in features_doc["entry_points"]}
+    assert "/api/*" in entry_point_names
+    assert "/orders/list" in entry_point_names
+
+
+def test_run_scan_a_web_method_class_reports_entry_points_mapped_unknown(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 17 (thirteenth cold read, CR13-3 MAJOR, part (b) - THE
+    CLASS-CLOSER): a class carrying a recognized-but-unsupported route-
+    like annotation (JAX-WS's own @WebMethod) must report
+    entry_points_mapped unknown, never the confident not_applicable/
+    no_entry_point negative - end to end, the declared gap must also
+    survive to problems.json."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "p" / "OrderEndpoint.java").write_text(
+        "package p;\n"
+        "\n"
+        "public class OrderEndpoint {\n"
+        "  @WebMethod\n"
+        "  public void placeOrder() {}\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+
+    endpoint_unit = next(u for u in modules_doc["units"] if u["display_name"] == "OrderEndpoint")
+    entry_points_mapped = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == endpoint_unit["unit_id"] and s["check"] == "entry_points_mapped"
+    )
+    assert entry_points_mapped["stored_status"] == "unknown"
+    assert entry_points_mapped["reason_code"] == "unsupported_entry_point_shape"
+    assert any(
+        p["reason_code"] == "unsupported_entry_point_shape" for p in problems_doc["problems"])
+
+
 def test_report_carries_the_real_manifest_digest_f7(java_repo: Path) -> None:
     """FIX ROUND 12 (eighth cold read, F7): get_report passed
     manifest_digest=None to the projector unconditionally, even though a

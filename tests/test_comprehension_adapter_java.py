@@ -2215,6 +2215,87 @@ def test_parse_maven_pom_excludes_plugin_scoped_dependencies():
     assert profile_scoped_count == 0
 
 
+# ----------------------------------------------------------- @WebServlet / JAX-RS (route)
+
+def test_web_servlet_annotation_publishes_its_own_url_patterns_as_routes():
+    """FIX ROUND 17 (thirteenth cold read, CR13-3 MAJOR, wrong-data, part
+    (a)): @WebServlet published NO entry point and NO problem at all -
+    the enumerated-recognizer class, entry-point edition. Unlike
+    @RequestMapping, it is not composable - the annotation decorates the
+    class directly and its own urlPatterns ARE the complete route(s)."""
+    src = """
+package p;
+
+@WebServlet(urlPatterns = {"/api/*", "/legacy/*"})
+public class DispatcherServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("DispatcherServlet.java", src)
+    routes = _edges(result, "route")
+    assert sorted(r.target for r in routes) == ["/api/*", "/legacy/*"]
+    http_entry_points = [e for e in result.entry_points if e.kind == "http_route"]
+    assert sorted(e.name for e in http_entry_points) == ["/api/*", "/legacy/*"]
+    assert all(e.qualified_name == "p.DispatcherServlet" for e in http_entry_points)
+
+
+def test_web_servlet_annotation_recovers_a_bare_positional_value():
+    """@WebServlet("/api/*") - the bare positional form, no named
+    urlPatterns/value attribute at all - still recovered via the
+    existing positional-literal fallback."""
+    src = """
+package p;
+
+@WebServlet("/api/*")
+public class DispatcherServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("DispatcherServlet.java", src)
+    routes = _edges(result, "route")
+    assert [r.target for r in routes] == ["/api/*"]
+
+
+def test_jax_rs_path_composes_class_and_method_level_like_spring_request_mapping():
+    """FIX ROUND 17 (CR13-3 MAJOR, part (a)): JAX-RS's own @Path composes
+    EXACTLY like a plain @RequestMapping already does - a class-level
+    @Path is a prefix, and a method-level @Path composes against it. The
+    verb stays unknown (JAX-RS's separate @GET/@POST/... designators are
+    a named limit, not recognized here - see _ROUTE_ANNOTATIONS's own
+    comment: merging a separate verb annotation with an adjacent @Path
+    would need per-method grouping this adapter does not have)."""
+    src = """
+package p;
+
+@Path("/orders")
+public class OrderResource {
+    @Path("/list")
+    public void list() {}
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    routes = _edges(result, "route")
+    assert [r.target for r in routes] == ["/orders/list"]
+
+
+def test_web_method_annotation_is_the_named_class_closer_not_a_silent_negative():
+    """FIX ROUND 17 (CR13-3 MAJOR, part (b) - THE CLASS-CLOSER): a route-
+    like annotation family this adapter recognizes as a routing
+    mechanism but has not modeled (JAX-WS's own @WebMethod) must publish
+    a NAMED problem, attributed to its own enclosing type - never
+    silently fall through to a confident "no entry point" negative."""
+    src = """
+package p;
+
+public class OrderEndpoint {
+    @WebMethod
+    public void placeOrder() {}
+}
+"""
+    result = java.parse_java_source("OrderEndpoint.java", src)
+    assert not any(e.kind == "http_route" for e in result.entry_points)
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.OrderEndpoint"
+
+
 # ----------------------------------------------------------- web.xml (route)
 
 def test_parse_web_xml_extracts_servlet_mapping_routes():
