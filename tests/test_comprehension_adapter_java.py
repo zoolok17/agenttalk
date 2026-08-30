@@ -2484,6 +2484,61 @@ def test_parse_maven_pom_group_and_artifact_id_are_length_bounded():
     assert oversized_group not in edges[0].target
 
 
+# ----------------------------------------- F3 MAJOR (round 18): parent groupId fallback
+
+def test_parse_maven_pom_registers_a_unit_using_a_groupid_inherited_from_parent():
+    """FIX ROUND 18 (fourteenth cold read, F3 MAJOR, wrong-data): a child
+    pom that inherits its groupId from its own <parent> block (the
+    standard, common Maven reactor spelling) used to register no unit at
+    all - round 17's own NAMED LIMIT called this a safe under-claim, but
+    the reviewer states it is actually an OVER-claim: a sibling's
+    dependency edge on that child publishes a confident resolved/
+    external, not an honest unresolved. Now registers the unit using the
+    parent's groupId, paired with the pom's own (never-inherited)
+    artifactId."""
+    pom = (
+        "<project>"
+        "<parent><groupId>com.acme</groupId><artifactId>acme-parent</artifactId>"
+        "<version>1.0</version></parent>"
+        "<artifactId>acme-core</artifactId>"
+        "</project>"
+    )
+    units, _edges, _profile_count = java.parse_maven_pom("acme-core/pom.xml", pom)
+    assert len(units) == 1
+    assert units[0].qualified_name == "com.acme:acme-core"
+    assert units[0].simple_name == "acme-core"
+
+
+def test_parse_maven_pom_prefers_its_own_explicit_groupid_over_parents():
+    """The existing explicit-groupId case must stay green, unchanged -
+    an own project-level <groupId> always wins over a <parent>'s,
+    regardless of textual order in the file."""
+    pom = (
+        "<project>"
+        "<parent><groupId>com.acme</groupId><artifactId>acme-parent</artifactId>"
+        "<version>1.0</version></parent>"
+        "<groupId>com.acme.override</groupId>"
+        "<artifactId>acme-core</artifactId>"
+        "</project>"
+    )
+    units, _edges, _profile_count = java.parse_maven_pom("acme-core/pom.xml", pom)
+    assert len(units) == 1
+    assert units[0].qualified_name == "com.acme.override:acme-core"
+
+
+def test_parse_maven_pom_registers_no_unit_for_a_pom_with_neither_groupid_nor_parent():
+    """A pathological pom with NEITHER an explicit project-level groupId
+    NOR a readable <parent> still registers no unit at all - unchanged
+    from before this round; this adapter has no basis to invent an
+    identity for it. (Whether a dependent's edge on such a coordinate
+    should be classified `unresolved` rather than `external` is a
+    separate, open registry-policy question left for reviewer-3 - see
+    the PR description.)"""
+    pom = "<project><artifactId>acme-core</artifactId></project>"
+    units, _edges, _profile_count = java.parse_maven_pom("acme-core/pom.xml", pom)
+    assert units == []
+
+
 # ----------------------------------------------------------- xml root sniff (round 14b)
 
 def test_sniff_xml_root_element_recognizes_spring_beans():

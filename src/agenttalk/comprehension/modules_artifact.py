@@ -319,7 +319,19 @@ def build_modules(
                 # simple_name generally is a no-op for Java types and the
                 # actual fix for coordinates.
                 display_name=unit_claim.simple_name,
-                language="java",
+                # FIX ROUND 18 (fourteenth cold read, F4 MINOR, wrong-
+                # data): this used to hardcode "java" regardless of the
+                # producing file - true for an ordinary .java type, but
+                # FALSE for a pom-coordinate component (a pom.xml is an
+                # XML document, never Java source), which is how the
+                # SAME pom's own published language flipped between
+                # "java" and "xml" depending purely on whether it
+                # happened to declare its own project-level groupId (a
+                # component-kind unit) or stayed file-only. Every
+                # producer's unit now gets ONE stable, truthful value
+                # from the same path-based lookup the file-kind record
+                # below already uses.
+                language=_language_for_path(relative_path),
                 paths=[relative_path],
                 source_digests={relative_path: file_entry.content_digest},
                 classification=[unit_claim.classification],
@@ -338,7 +350,7 @@ def build_modules(
             unit_id=file_unit_id,
             kind="file",
             display_name=relative_path.rsplit("/", 1)[-1],
-            language="java",
+            language=_language_for_path(relative_path),
             paths=[relative_path],
             source_digests={relative_path: file_entry.content_digest},
             classification=[java_result.units[0].classification],

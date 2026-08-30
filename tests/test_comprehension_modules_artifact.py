@@ -220,6 +220,43 @@ def test_a_pom_coordinate_component_publishes_the_artifact_id_as_display_name():
     assert component.display_name == "shop-web"
 
 
+def test_a_pom_coordinate_component_and_its_file_record_both_publish_xml_language():
+    """FIX ROUND 18 (fourteenth cold read, F4 MINOR, wrong-data): a
+    pom's own published ``language`` used to FLIP between "java" and
+    "xml" within a single run depending entirely on whether that
+    specific pom happened to declare its own project-level groupId (a
+    "component"-kind unit, hardcoded language="java" - false for an XML
+    document) versus staying "file"-kind only (correctly "xml" via
+    _language_for_path). Every pom-produced unit must now carry the
+    identical, truthful language value regardless of which path it
+    took - mirrors the reader's own reactor fixture with three poms:
+    one with its own groupId, one inheriting groupId from <parent>, and
+    one with neither."""
+    own_group_units, _e1, _c1 = java_adapter.parse_maven_pom(
+        "own/pom.xml",
+        "<project><groupId>com.acme</groupId><artifactId>own</artifactId></project>",
+    )
+    inherited_units, _e2, _c2 = java_adapter.parse_maven_pom(
+        "inherited/pom.xml",
+        "<project><parent><groupId>com.acme</groupId>"
+        "<artifactId>acme-parent</artifactId><version>1.0</version></parent>"
+        "<artifactId>inherited</artifactId></project>",
+    )
+    discovery = _discovery([
+        EnumeratedFile(relative_path="own/pom.xml", byte_count=1, content_digest="a"),
+        EnumeratedFile(relative_path="inherited/pom.xml", byte_count=1, content_digest="b"),
+        EnumeratedFile(relative_path="neither/pom.xml", byte_count=1, content_digest="c"),
+    ])
+    java_results = {
+        "own/pom.xml": java_adapter.JavaFileResult(units=own_group_units),
+        "inherited/pom.xml": java_adapter.JavaFileResult(units=inherited_units),
+        "neither/pom.xml": java_adapter.JavaFileResult(),
+    }
+    records = ma.build_modules(discovery, java_results)
+    languages = {record.language for record in records}
+    assert languages == {"xml"}
+
+
 def test_two_components_declaring_the_same_qualified_name_share_a_conflict_id():
     """FIX ROUND 16 (twelfth cold read, B1 BLOCKER, wrong-data): two units
     genuinely declaring the identical fully-qualified name (a real

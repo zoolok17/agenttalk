@@ -1274,6 +1274,38 @@ def test_a_reactor_module_dependency_resolves_internal_to_the_sibling_pom():
         "shared-lib/pom.xml", "com.acme:shared-lib")
 
 
+def test_a_reactor_module_that_inherits_groupid_from_parent_resolves_internal():
+    """FIX ROUND 18 (fourteenth cold read, F3 MAJOR, wrong-data): mirrors
+    the reader's own parent-inheritance shape - shared-lib/pom.xml
+    declares NO project-level groupId of its own, only inheriting it
+    from its <parent> block (the standard, common Maven reactor
+    spelling). A sibling's dependency edge on it must now resolve
+    internal, the same as the explicit-groupId case above."""
+    _app_units, app_edges, _c1 = java_adapter.parse_maven_pom(
+        "app/pom.xml",
+        "<project><groupId>com.acme</groupId><artifactId>app</artifactId>"
+        "<dependencies><dependency>"
+        "<groupId>com.acme</groupId><artifactId>shared-lib</artifactId>"
+        "</dependency></dependencies></project>",
+    )
+    shared_units, shared_edges, _c2 = java_adapter.parse_maven_pom(
+        "shared-lib/pom.xml",
+        "<project><parent><groupId>com.acme</groupId>"
+        "<artifactId>acme-parent</artifactId><version>1.0</version></parent>"
+        "<artifactId>shared-lib</artifactId></project>",
+    )
+    results = {
+        "app/pom.xml": java_adapter.JavaFileResult(edges=app_edges),
+        "shared-lib/pom.xml": java_adapter.JavaFileResult(units=shared_units, edges=shared_edges),
+    }
+    records = da.build_dependencies(results)
+    build_edge = next(r for r in records if r.relation == "build")
+    assert build_edge.resolution_state == "resolved"
+    assert build_edge.target_external is None
+    assert build_edge.target_unit_id == da._java_component_unit_id(
+        "shared-lib/pom.xml", "com.acme:shared-lib")
+
+
 def test_a_genuinely_external_pom_dependency_still_resolves_external():
     """Companion negative case: a dependency naming NO in-scan pom's own
     coordinate still resolves external as before - the fix only closes
