@@ -388,6 +388,51 @@ def test_a_genuinely_entry_point_free_file_keeps_its_honest_negative(java_repo: 
     assert feature_signal["stored_status"] == "unsatisfied"
 
 
+def test_non_code_infrastructure_files_no_longer_publish_as_production(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 23 (nineteenth cold read, F3 MAJOR, wrong-data): the
+    reader's own .cr19-cls shape - README, LICENSE, Dockerfile, mvnw, a
+    CI YAML, and a release script all used to publish classification=
+    production, indistinguishable from real application code to a
+    consumer scoping migration work by classification==production. The
+    run already knows these are not application code (worker.py's own
+    non-degrading unsupported_language problem, or complete silence for
+    a benign-extension file like README.md) - now derived as
+    "infrastructure" instead. A genuine Java class and an unmodeled
+    TIER-2 shape (a .jsp - real, unmodeled application code, NOT
+    infrastructure) are both unaffected."""
+    import json
+
+    (java_repo / "README.md").write_text("# Demo\n", encoding="utf-8")
+    (java_repo / "LICENSE").write_text("Apache 2.0\n", encoding="utf-8")
+    (java_repo / "Dockerfile").write_text("FROM eclipse-temurin:21\n", encoding="utf-8")
+    (java_repo / "mvnw").write_text("#!/bin/sh\necho mvnw\n", encoding="utf-8")
+    (java_repo / ".github" / "workflows").mkdir(parents=True)
+    (java_repo / ".github" / "workflows" / "ci.yml").write_text(
+        "on: push\njobs: {}\n", encoding="utf-8")
+    (java_repo / "release.sh").write_text("#!/bin/sh\necho release\n", encoding="utf-8")
+    (java_repo / "src" / "main" / "webapp" / "index.jsp").parent.mkdir(
+        parents=True, exist_ok=True)
+    (java_repo / "src" / "main" / "webapp" / "index.jsp").write_text(
+        "<%= \"hi\" %>\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+
+    infra_names = {
+        "README.md", "LICENSE", "Dockerfile", "mvnw", "ci.yml", "release.sh"}
+    for name in infra_names:
+        unit = next(u for u in modules_doc["units"] if u["display_name"] == name)
+        assert unit["classification"] == ["infrastructure"], name
+
+    app_unit = next(u for u in modules_doc["units"] if u["display_name"] == "App.java")
+    assert app_unit["classification"] == ["production"]
+
+    jsp_unit = next(u for u in modules_doc["units"] if u["display_name"] == "index.jsp")
+    assert jsp_unit["classification"] == ["production"]
+
+
 def test_a_files_own_signal_rolls_up_through_a_nested_entry_point_class(
     java_repo: Path,
 ) -> None:

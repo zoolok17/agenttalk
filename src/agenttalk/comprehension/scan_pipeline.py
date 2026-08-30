@@ -495,11 +495,25 @@ def run_scan(
         for reasons in worker_problem_reasons_by_qualified_name.values():
             reasons.sort()
 
+        # FIX ROUND 23 (nineteenth cold read, F3 MAJOR, wrong-data): the
+        # non-degrading half of worker.py's own "unsupported_language"
+        # reason (TIER 3 - a build/tooling/infra file this producer was
+        # never going to model) is the exact in-run evidence modules_
+        # artifact.py's own classification derivation needs to
+        # distinguish it from the DEGRADING half (TIER 2 - a real,
+        # unmodeled application-code file) - both currently collapse
+        # into the identical reason_code string once threaded through
+        # worker_problem_reasons_by_path above.
+        non_degrading_unsupported_language_paths = frozenset(
+            p.relative_path for p in worker_result.problems
+            if p.reason_code == "unsupported_language" and not p.degrades_run
+        )
         modules = modules_artifact.build_modules(
             discovery_result, java_results,
             worker_problem_reasons_by_path=worker_problem_reasons_by_path,
             worker_problem_reasons_by_unit=worker_problem_reasons_by_unit,
             worker_problem_reasons_by_qualified_name=worker_problem_reasons_by_qualified_name,
+            non_degrading_unsupported_language_paths=non_degrading_unsupported_language_paths,
         )
         # M7 (cold-read, PR-B fix round 3): discovery already computed
         # each file's own content digest - dependencies_artifact.py and

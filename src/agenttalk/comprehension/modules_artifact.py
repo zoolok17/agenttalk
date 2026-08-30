@@ -159,6 +159,60 @@ def _default_classification(relative_path: str) -> str:
     return "production"
 
 
+def _derive_classification(
+    relative_path: str, *, java_result_is_none: bool, reasons: list[str],
+    non_degrading_unsupported_language_paths: frozenset[str],
+) -> str:
+    """FIX ROUND 23 (nineteenth cold read, F3 MAJOR, wrong-data): every
+    non-test file published ``classification=production`` regardless
+    of whether this SAME run recorded it as a genuine build/tooling/
+    infra file this producer was never going to model at all (README,
+    LICENSE, Dockerfile, mvnw, a CI YAML, a release script) - the
+    design's own vocabulary names ``infrastructure`` as an alternative
+    to production/test, and #208 groups by classification; a consumer
+    scoping migration work by ``classification==production`` pulled in
+    the README. The evidence already exists in-run: worker.py's own
+    non-degrading ``unsupported_language`` problem (TIER 3 - "not on
+    the recognized code-bearing list, so this run does not degrade
+    over it"), or the complete absence of any worker problem at all for
+    a file matching its own benign-extension/basename allowlist -
+    classification simply never consulted either.
+
+    DECIDED (reviewer-3 ratifies): derives ``infrastructure`` for this
+    non-degrading/benign-non-code case ONLY. A TIER-2 file (a JSP, a
+    Kotlin source, a Spring-bean-XML config, ...) is genuinely UNMODELED
+    APPLICATION code, not infrastructure - worker.py's own
+    ``degrades_run=True`` on that identical reason code is the exact
+    discriminator this run already computed, so it is deliberately
+    excluded here and keeps its existing production/test classification
+    unchanged. ``pom.xml``/``web.xml`` are unaffected either way - both
+    are genuinely adapter-handled (``java_result`` is never ``None`` for
+    them), never carrying ``unsupported_language`` at all.
+
+    A file under a recognized TEST path (``_default_classification``
+    already returns ``"test"``) is deliberately never overridden here -
+    a test fixture (``test/fixtures/data.txt``) is genuinely part of
+    the test estate, migration-relevant to test-coverage decisions the
+    same way a real test source file is, not a build/tooling concern
+    the way a root-level README or a CI YAML is - checked FIRST,
+    unconditionally."""
+    default = _default_classification(relative_path)
+    if default == "test":
+        return default
+    if relative_path in non_degrading_unsupported_language_paths:
+        return "infrastructure"
+    if java_result_is_none and not reasons:
+        # No worker problem recorded AT ALL - worker.py's own inverted
+        # allowlist (round 16's own fix) means an unenumerated,
+        # non-adapter-handled extension ALWAYS gets "unsupported_
+        # language" recorded; reaching here with nothing recorded can
+        # only happen for a file matching its own BENIGN extension/
+        # basename set (a README, a .gitignore, a lockfile, ...) -
+        # genuinely never tier-2, since tier-2 always gets recorded.
+        return "infrastructure"
+    return default
+
+
 def _producer(
     *, name: str, version: int, source_digest: str | None,
     basis: str, rule_version: int | None = None,
@@ -184,6 +238,7 @@ def build_modules(
     *, worker_problem_reasons_by_path: dict[str, list[str]] | None = None,
     worker_problem_reasons_by_unit: dict[tuple[str, str], list[str]] | None = None,
     worker_problem_reasons_by_qualified_name: dict[str, list[str]] | None = None,
+    non_degrading_unsupported_language_paths: frozenset[str] | None = None,
 ) -> list[ModuleRecord]:
     """``java_results`` maps a ``.java`` file's relative path to its
     already-parsed :class:`~.adapters.java.JavaFileResult` (item 3) -
@@ -236,6 +291,7 @@ def build_modules(
     records: list[ModuleRecord] = []
     worker_problem_reasons_by_path = worker_problem_reasons_by_path or {}
     worker_problem_reasons_by_unit = worker_problem_reasons_by_unit or {}
+    non_degrading_unsupported_language_paths = non_degrading_unsupported_language_paths or frozenset()
 
     for file_entry in discovery.files:
         relative_path = file_entry.relative_path
@@ -250,7 +306,10 @@ def build_modules(
                 language=_language_for_path(relative_path),
                 paths=[relative_path],
                 source_digests={relative_path: file_entry.content_digest},
-                classification=[_default_classification(relative_path)],
+                classification=[_derive_classification(
+                    relative_path, java_result_is_none=java_result is None, reasons=reasons,
+                    non_degrading_unsupported_language_paths=non_degrading_unsupported_language_paths,
+                )],
                 container_unit_id=None,
                 producers=[_producer(
                     name="discovery", version=1, source_digest=file_entry.content_digest,

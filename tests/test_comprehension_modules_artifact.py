@@ -20,6 +20,11 @@ def _discovery(files: list[EnumeratedFile]) -> DiscoveryResult:
 # ----------------------------------------------------------- non-Java files
 
 def test_a_non_java_file_becomes_a_single_file_unit():
+    """FIX ROUND 23 (nineteenth cold read, F3 MAJOR, wrong-data):
+    README.md matches worker.py's own benign-extension allowlist (never
+    even recorded a worker problem) - it is genuinely non-code
+    infrastructure, not "production" application code, the reader's own
+    named example of this class."""
     discovery = _discovery([EnumeratedFile(relative_path="README.md", byte_count=3, content_digest="abc")])
     records = ma.build_modules(discovery, {})
     assert len(records) == 1
@@ -28,7 +33,7 @@ def test_a_non_java_file_becomes_a_single_file_unit():
     assert record.language == "unknown"
     assert record.paths == ["README.md"]
     assert record.container_unit_id is None
-    assert record.classification == ["production"]
+    assert record.classification == ["infrastructure"]
 
 
 def test_a_file_under_a_test_path_is_classified_test():
@@ -44,15 +49,23 @@ def test_a_file_under_a_bare_test_package_segment_stays_production():
     "/test/" package segment NOT under the real build-convention root
     (src/test/...) has no corroborating evidence available at this
     file-record layer (no import/framework information here) - it must
-    stay production, never a guess, the same "same bug class as CR10-7"
-    fix the adapter's own per-type classifier already applies."""
+    NEVER be guessed "test", the same "same bug class as CR10-7" fix
+    the adapter's own per-type classifier already applies.
+
+    FIX ROUND 23 (F3 MAJOR): this fixture's own .txt extension is
+    ALSO a benign, non-degrading shape (worker.py's own allowlist) -
+    it now derives "infrastructure" rather than "production" (a plain
+    text file is not application code either), but the ORIGINAL point
+    still holds unchanged: it is never "test" just because of the bare
+    package segment."""
     discovery = _discovery([
         EnumeratedFile(
             relative_path="src/main/resources/com/lab/test/fixture.txt",
             byte_count=1, content_digest="d"),
     ])
     records = ma.build_modules(discovery, {})
-    assert records[0].classification == ["production"]
+    assert records[0].classification != ["test"]
+    assert records[0].classification == ["infrastructure"]
 
 
 def test_a_repository_root_test_directory_file_is_sufficient_alone():
