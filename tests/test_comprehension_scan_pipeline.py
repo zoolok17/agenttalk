@@ -3607,6 +3607,26 @@ def test_a_conflicted_units_readiness_signals_stay_unknown_not_confident(
             if s["unit_id"] == unit_id and s["check"] == "source_understood")
         assert source_signal["reason_code"] != "duplicate_qualified_name"
 
+    # FIX ROUND 23 (nineteenth cold read, F4 MINOR, wrong-data + a
+    # stale claim in round 22's own comment): a FILE never carries a
+    # conflict_id itself - the reader's own .cr19-dup four-row shape
+    # (2 components + their 2 single-type-owning files) - both
+    # Config.java FILE units (single-top-level-type, the one component
+    # being the conflicted claimant) must ALSO report unknown on
+    # dependencies_resolved/test_evidence_located now, not just the
+    # component itself.
+    config_file_unit_ids = [
+        u["unit_id"] for u in modules_doc["units"]
+        if u["kind"] == "file" and u["display_name"] == "Config.java"]
+    assert len(config_file_unit_ids) == 2
+    for unit_id in config_file_unit_ids:
+        for check in ("dependencies_resolved", "test_evidence_located"):
+            signal = next(
+                s for s in readiness_doc["signals"]
+                if s["unit_id"] == unit_id and s["check"] == check)
+            assert signal["stored_status"] == "unknown", (unit_id, check)
+            assert signal["reason_code"] == "duplicate_qualified_name", (unit_id, check)
+
     # The conflict problem itself is still recorded, unaffected.
     assert any(p["reason_code"] == "duplicate_qualified_name" for p in problems_doc["problems"])
 

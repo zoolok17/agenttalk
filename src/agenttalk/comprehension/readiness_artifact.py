@@ -891,16 +891,34 @@ def build_readiness(
     # file-aggregation pass below runs, so a file containing a
     # conflicted component correctly inherits the same "never MORE
     # CONFIDENT than a component genuinely unsure of itself" unknown via
-    # the existing worse-of aggregation, not a separate special case.
-    # DECIDED (reviewer-3 ratifies the scope): applied to
-    # dependencies_resolved/entry_points_mapped/feature_linked/test_
-    # evidence_located - every signal whose OWN answer depends on this
-    # unit's identity being unambiguous. source_understood deliberately
-    # stays untouched - the adapter genuinely parsed this exact file/
-    # class; what is ambiguous is cross-file IDENTITY, not
-    # comprehension, a different fact entirely. boundaries_identified
-    # is unaffected either way (always unknown regardless, unrelated to
-    # identity).
+    # the existing worse-of aggregation for entry_points_mapped/
+    # feature_linked SPECIFICALLY.
+    #
+    # FIX ROUND 23 (nineteenth cold read, F4 MINOR, wrong-data + a
+    # stale claim in this SAME comment, corrected): this comment
+    # previously claimed all four signals - dependencies_resolved/
+    # entry_points_mapped/feature_linked/test_evidence_located -
+    # inherit via "the existing worse-of aggregation" once this loop
+    # runs. FALSE for two of them: dependencies_resolved/test_evidence_
+    # located are computed in the MAIN per-unit loop below, straight
+    # from the unit's OWN edges/test-pairing facts - neither one ever
+    # consults a CONTAINED component's own conflict_id at all, so a
+    # file containing a conflicted component kept publishing CONFIDENT
+    # dependencies_resolved/test_evidence_located while the component
+    # itself correctly reported unknown. The override immediately below
+    # applies to entry_points_mapped/feature_linked ONLY (matching what
+    # the file-aggregation pass right after it actually consults) -
+    # dependencies_resolved/test_evidence_located get their OWN,
+    # separate, narrower extension in the main loop below (single-top-
+    # level-type files only - the design's merge rule 4 applied
+    # consistently with CR17-2's own established single-type-file
+    # scoping, never a multi-type file where the ambiguity CR17-2
+    # itself already declines to guess through). source_understood
+    # deliberately stays untouched throughout - the adapter genuinely
+    # parsed this exact file/class; what is ambiguous is cross-file
+    # IDENTITY, not comprehension, a different fact entirely.
+    # boundaries_identified is unaffected either way (always unknown
+    # regardless, unrelated to identity).
     for unit in modules:
         if unit.conflict_id is None:
             continue
@@ -991,6 +1009,36 @@ def build_readiness(
             test_evidence_signal = _signal(
                 unit.unit_id, "test_evidence_located", "unknown", "detected",
                 "duplicate_qualified_name")
+        # FIX ROUND 23 (nineteenth cold read, F4 MINOR, wrong-data): a
+        # FILE unit never carries a conflict_id itself (only "component"-
+        # kind records do), so the override above never applies to a
+        # file directly - a file containing a conflicted component kept
+        # publishing CONFIDENT dependencies_resolved/test_evidence_
+        # located while the component itself correctly reported
+        # unknown. Extended for a SINGLE-top-level-type file only (the
+        # design's own merge rule 4 applied consistently with CR17-2's
+        # own established single-type-file scoping - there is no
+        # attribution ambiguity at all when there is only one real
+        # candidate); a multi-type file is NOT extended here, the same
+        # "cannot honestly credit one sibling's own fact to the whole
+        # file" reasoning CR17-2 already applies to its own multi-type
+        # branch.
+        if unit.kind == "file":
+            direct_component_children = [
+                module_by_id[child_id] for child_id in children_by_container.get(unit.unit_id, [])
+                if module_by_id.get(child_id) is not None
+                and module_by_id[child_id].kind == "component"
+            ]
+            if (
+                len(direct_component_children) == 1
+                and direct_component_children[0].conflict_id is not None
+            ):
+                dependencies_signal = _signal(
+                    unit.unit_id, "dependencies_resolved", "unknown", "detected",
+                    "duplicate_qualified_name")
+                test_evidence_signal = _signal(
+                    unit.unit_id, "test_evidence_located", "unknown", "detected",
+                    "duplicate_qualified_name")
         unit_signals = [
             _check_source_understood(unit),
             dependencies_signal,
