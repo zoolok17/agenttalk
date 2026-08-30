@@ -368,6 +368,21 @@ def project_comprehension(
             "reason_code": "freshness_not_implemented_this_slice",
         },
         "whole_run_sections": list(WHOLE_RUN_SECTIONS),
+        # FIX ROUND 17 (thirteenth cold read, CR13-9 MINOR): the applied
+        # filters, echoed verbatim - a caller getting zero rows back
+        # (e.g. --unit naming an id that matches nothing, a legitimate
+        # query result, never refused - see the design's own filter
+        # contract) had no way to tell "this unit is genuinely absent/
+        # stale" apart from "I forgot to pass the filter at all" without
+        # comparing against its OWN request out-of-band. Present
+        # unconditionally (never omitted), unlike the OTHER optional
+        # fields in this artifact family - a caller needs a filters key
+        # to exist even on an UNFILTERED response, to positively confirm
+        # nothing was silently applied.
+        "filters": {
+            "unit_id": unit_id, "feature_id": feature_id, "readiness_state": readiness_state,
+            "dependencies_only": dependencies_only,
+        },
         **_readiness_state_filter_note(readiness_state),
         "counts": {
             # M10 (cold-read, PR-B fix round 3): these are WHOLE-RUN

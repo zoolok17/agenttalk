@@ -179,6 +179,38 @@ def test_a_nonexistent_feature_id_yields_empty_scoped_sections():
     assert payload["dependencies"] == []
     assert payload["readiness"]["summaries"] == []
     assert payload["readiness"]["signals"] == []
+    # FIX ROUND 17 (thirteenth cold read, CR13-9 MINOR): zero rows for a
+    # stale/nonexistent selector must be distinguishable from zero rows
+    # genuinely returned with no filter applied at all - the echoed
+    # filters key makes the applied feature_id visible right here.
+    assert payload["filters"]["feature_id"] == "does-not-exist"
+
+
+def test_filters_key_echoes_every_applied_filter_verbatim():
+    """FIX ROUND 17 (thirteenth cold read, CR13-9 MINOR): report --json
+    must echo its applied filters so a caller can positively confirm
+    what was asked for, rather than inferring it out-of-band by
+    comparing against their own request."""
+    payload = pr.project_comprehension(**_base_kwargs(
+        unit_id="u1", feature_id="f1", readiness_state="needs_evidence",
+        dependencies_only=True,
+    ))
+    assert payload["filters"] == {
+        "unit_id": "u1", "feature_id": "f1", "readiness_state": "needs_evidence",
+        "dependencies_only": True,
+    }
+
+
+def test_filters_key_is_present_and_all_null_with_no_filter_applied():
+    """Companion: an UNFILTERED response still carries the filters key
+    (never omitted, unlike this artifact family's usual absent-not-null
+    idiom) - a caller needs the key to exist even here, to positively
+    confirm nothing was silently applied."""
+    payload = pr.project_comprehension(**_base_kwargs())
+    assert payload["filters"] == {
+        "unit_id": None, "feature_id": None, "readiness_state": None,
+        "dependencies_only": False,
+    }
 
 
 def test_readiness_state_filter_narrows_signals_and_summaries():
