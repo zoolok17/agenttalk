@@ -99,7 +99,33 @@ UNSUPPORTED_INVOKE_SHAPES = ("constructor_call",)
 #: qualified_name, exactly like every other instance of any of these
 #: three named gaps - this tuple is not the only or the right place to
 #: look for "did this run actually hit one of these," problems.json is.
-UNSUPPORTED_ENTRY_POINT_SHAPES = ("jax_ws_web_method", "jax_rs_verb_only_method")
+#: FIX ROUND 19 (fifteenth cold read, F3 MAJOR, wrong-data): five more
+#: entry-point families the DESIGN'S OWN VOCABULARY names (scheduled
+#: jobs, event consumers, process starts...) fell through to the
+#: confident negative - @Scheduled, @KafkaListener (and its message-
+#: listener siblings), @MessageDriven, an EJB @Remote component, and
+#: @ServerEndpoint all published not_applicable/no_entry_point on an
+#: otherwise complete run. The SAME class-closer mechanism @WebMethod
+#: already established, applied to five more recognized-but-unmodeled
+#: families - see the annotation constants and their loop below.
+#:
+#: JUDGE (annotation set, closed and PROVISIONAL like tier 2 - explicitly
+#: NOT chasing exhaustiveness): ``kafka_listener`` also recognizes
+#: @RabbitListener/@JmsListener, the obvious same-idiom siblings a real
+#: Spring messaging codebase mixes freely - grouped under one shape
+#: name rather than three near-identical ones. ``ejb_remote_component``
+#: recognizes ONLY @Remote, not @Stateless - @Stateless alone marks a
+#: purely LOCAL session bean (no external entry point at all; the
+#: existing confident negative is already correct for it), while
+#: @Remote is what actually marks remote invocability, with or without
+#: @Stateless alongside it. A future round may find a real repo whose
+#: shape needs a different member added or this reasoning revisited;
+#: reviewer-3 ratifies.
+UNSUPPORTED_ENTRY_POINT_SHAPES = (
+    "jax_ws_web_method", "jax_rs_verb_only_method",
+    "spring_scheduled", "kafka_listener", "jms_message_driven",
+    "ejb_remote_component", "websocket_server_endpoint",
+)
 
 #: FIX ROUND 15 (eleventh cold read, F3 MAJOR, wrong-data): the ORIGINAL
 #: combined pattern classified a bare ``/test/`` package segment with NO
@@ -457,6 +483,52 @@ _WEB_SERVLET_ANNOTATION_RE = re.compile(r"@(?:[A-Za-z_$][\w$]*\.)*WebServlet\b")
 #: it has not yet met still surfaces as a NAMED gap, never a silent
 #: confident negative.
 _WEB_METHOD_ANNOTATION_RE = re.compile(r"@(?:[A-Za-z_$][\w$]*\.)*WebMethod\b")
+#: FIX ROUND 19 (fifteenth cold read, F3 MAJOR, wrong-data): five more
+#: recognized-but-unmodeled entry-point families, the SAME class-closer
+#: treatment @WebMethod already gets - see UNSUPPORTED_ENTRY_POINT_
+#: SHAPES's own comment for the annotation-set judgment calls. Each
+#: tuple is ``(shape_name, pattern, human-readable label, is_class_
+#: level)`` - @Scheduled/the message-listener family decorate a METHOD
+#: (associated via ``_enclosing_qualified_name``, same as @WebMethod);
+#: @MessageDriven/@Remote/@ServerEndpoint decorate the CLASS itself
+#: (associated via ``_class_level_route_target``/``class_header_
+#: associations``, the same mechanism @WebServlet already needs for
+#: the identical reason - a class-level annotation's own position sits
+#: BEFORE the type's body, outside what ``_enclosing_qualified_name``
+#: can resolve). Looped over uniformly below rather than five near-
+#: identical copies of two different loops.
+_UNENROLLED_ENTRY_POINT_FAMILIES: tuple[tuple[str, re.Pattern[str], str, bool], ...] = (
+    (
+        "spring_scheduled",
+        re.compile(r"@(?:[A-Za-z_$][\w$]*\.)*Scheduled\b"),
+        "a @Scheduled annotation",
+        False,
+    ),
+    (
+        "kafka_listener",
+        re.compile(r"@(?:[A-Za-z_$][\w$]*\.)*(?:KafkaListener|RabbitListener|JmsListener)\b"),
+        "a message-listener annotation (@KafkaListener/@RabbitListener/@JmsListener)",
+        False,
+    ),
+    (
+        "jms_message_driven",
+        re.compile(r"@(?:[A-Za-z_$][\w$]*\.)*MessageDriven\b"),
+        "a @MessageDriven annotation",
+        True,
+    ),
+    (
+        "ejb_remote_component",
+        re.compile(r"@(?:[A-Za-z_$][\w$]*\.)*Remote\b"),
+        "an EJB @Remote annotation",
+        True,
+    ),
+    (
+        "websocket_server_endpoint",
+        re.compile(r"@(?:[A-Za-z_$][\w$]*\.)*ServerEndpoint\b"),
+        "a @ServerEndpoint annotation",
+        True,
+    ),
+)
 #: FIX ROUND 18 (fourteenth cold read, F2 MAJOR, wrong-data): JAX-RS's
 #: own verb designators, recognized as MARKERS ONLY - see the named
 #: limit beside _ROUTE_ANNOTATIONS, which this does NOT reopen: no
@@ -2122,6 +2194,28 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                    "entry point published, but not confidently absent either",
             qualified_name=enclosing,
         ))
+
+    # FIX ROUND 19 (fifteenth cold read, F3 MAJOR, wrong-data): five more
+    # recognized-but-unmodeled entry-point families (scheduled jobs,
+    # event consumers, process starts - the design's own vocabulary),
+    # the SAME class-closer treatment @WebMethod already gets. See
+    # UNSUPPORTED_ENTRY_POINT_SHAPES for the annotation-set judgment.
+    for shape_name, pattern, label, is_class_level in _UNENROLLED_ENTRY_POINT_FAMILIES:
+        for match in pattern.finditer(sanitized):
+            line = _line_at(newline_offsets, match.start())
+            if is_class_level:
+                enclosing = _class_level_route_target(match.start(), class_header_associations)
+                if enclosing is None:
+                    continue
+            else:
+                enclosing = _enclosing_qualified_name(match.start(), types, primary_qualified)
+            problems.append(JavaAdapterProblem(
+                reason_code="unsupported_entry_point_shape",
+                detail=f"{label} at line {line} names a recognized entry-point mechanism "
+                       f"({shape_name}) this adapter does not model - no entry point "
+                       "published, but not confidently absent either",
+                qualified_name=enclosing,
+            ))
 
     # Note 10 (second cold read, fix round 4): finditer, not search - a
     # file with more than one top-level type can declare more than one

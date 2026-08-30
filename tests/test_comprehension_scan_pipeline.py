@@ -191,6 +191,39 @@ def test_run_scan_a_web_method_class_reports_entry_points_mapped_unknown(
         p["reason_code"] == "unsupported_entry_point_shape" for p in problems_doc["problems"])
 
 
+def test_run_scan_a_scheduled_job_class_reports_entry_points_mapped_unknown(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 19 (fifteenth cold read, F3 MAJOR, wrong-data): one of
+    the five newly-enrolled entry-point families (@Scheduled) must
+    report entry_points_mapped unknown end to end, the same as
+    @WebMethod already does - never the confident not_applicable/
+    no_entry_point negative."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "p" / "JobRunner.java").write_text(
+        "package p;\n"
+        "\n"
+        "public class JobRunner {\n"
+        "  @Scheduled(fixedRate = 5000)\n"
+        "  public void cleanup() {}\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+
+    job_unit = next(u for u in modules_doc["units"] if u["display_name"] == "JobRunner")
+    entry_points_mapped = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == job_unit["unit_id"] and s["check"] == "entry_points_mapped"
+    )
+    assert entry_points_mapped["stored_status"] == "unknown"
+    assert entry_points_mapped["reason_code"] == "unsupported_entry_point_shape"
+
+
 def test_run_scan_a_jax_rs_verb_only_resource_reports_entry_points_mapped_unknown(
     java_repo: Path,
 ) -> None:

@@ -2466,6 +2466,84 @@ public class OrderEndpoint {
     assert problem.qualified_name == "p.OrderEndpoint"
 
 
+def test_five_unenrolled_entry_point_families_get_the_named_class_closer():
+    """FIX ROUND 19 (fifteenth cold read, F3 MAJOR, wrong-data): mirrors
+    the reader's own ``.cr15-f`` five-family shape - @Scheduled,
+    @KafkaListener, @MessageDriven, an EJB @Remote component, and
+    @ServerEndpoint all used to publish the confident
+    not_applicable/no_entry_point negative on an otherwise complete run.
+    The same class-closer treatment @WebMethod already gets, enrolled
+    for all five, each under its own named shape."""
+    src = """
+package p;
+
+public class JobRunner {
+    @Scheduled(fixedRate = 5000)
+    public void cleanup() {}
+}
+
+public class OrderEventConsumer {
+    @KafkaListener(topics = "orders")
+    public void onOrder(String message) {}
+}
+
+@MessageDriven
+public class OrderMdb {
+}
+
+@Remote
+public class BillingService {
+}
+
+@ServerEndpoint("/chat")
+public class ChatEndpoint {
+}
+"""
+    result = java.parse_java_source("Various.java", src)
+    problems_by_class = {
+        p.qualified_name: p for p in result.problems if p.reason_code == "unsupported_entry_point_shape"
+    }
+    assert set(problems_by_class) == {
+        "p.JobRunner", "p.OrderEventConsumer", "p.OrderMdb", "p.BillingService", "p.ChatEndpoint",
+    }
+    assert "spring_scheduled" in problems_by_class["p.JobRunner"].detail
+    assert "kafka_listener" in problems_by_class["p.OrderEventConsumer"].detail
+    assert "jms_message_driven" in problems_by_class["p.OrderMdb"].detail
+    assert "ejb_remote_component" in problems_by_class["p.BillingService"].detail
+    assert "websocket_server_endpoint" in problems_by_class["p.ChatEndpoint"].detail
+
+
+def test_a_plain_class_with_none_of_the_five_families_stays_not_applicable():
+    """Companion negative case - an ordinary class with no recognized
+    entry-point annotation at all must stay the confident
+    not_applicable/no_entry_point negative, unaffected."""
+    src = """
+package p;
+
+public class PlainService {
+    public void doWork() {}
+}
+"""
+    result = java.parse_java_source("PlainService.java", src)
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+
+
+def test_a_local_only_stateless_ejb_is_not_flagged_as_a_remote_component():
+    """Companion negative case for the ejb_remote_component JUDGE - a
+    purely LOCAL @Stateless session bean (no @Remote alongside it) has
+    no external entry point at all; the existing confident negative is
+    already correct for it and must stay unaffected."""
+    src = """
+package p;
+
+@Stateless
+public class LocalOnlyService {
+}
+"""
+    result = java.parse_java_source("LocalOnlyService.java", src)
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+
+
 # ----------------------------------------------------------- web.xml (route)
 
 def test_parse_web_xml_extracts_servlet_mapping_routes():
