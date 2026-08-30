@@ -184,6 +184,31 @@ def test_process_paths_flags_an_xml_file_with_no_determinable_root_as_record_onl
     assert "could not be determined" in result.problems[0].detail
 
 
+def test_process_paths_flags_previously_unenumerated_code_extensions_too(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 16 (twelfth cold read, B4 BLOCKER, wrong-data): mirrors
+    reviewer-3's own ``.cr12-jsf`` fixture - ``.xhtml``, ``.groovy``,
+    ``.tag``, ``.jspf`` are all real, code-bearing JSF/JSP-adjacent
+    files that the OLD closed CODE-extension allowlist did not name -
+    they used to vanish with NO java_results entry and NO WorkerProblem
+    at all (not even addressed as a coverage gap). The INVERTED
+    BENIGN-extension allowlist now flags every one of them
+    unsupported_language, degrading (presumed code-bearing, per the
+    inversion's own "guilty until proven benign" direction), still
+    addressable (file_claims unaffected)."""
+    (tmp_path / "view.xhtml").write_text("<html></html>", encoding="utf-8")
+    (tmp_path / "Helper.groovy").write_text("class Helper {}\n", encoding="utf-8")
+    (tmp_path / "widget.tag").write_text("<jsp:root/>", encoding="utf-8")
+    (tmp_path / "fragment.jspf").write_text("<%@ include file=\"x\" %>", encoding="utf-8")
+    paths = ["view.xhtml", "Helper.groovy", "widget.tag", "fragment.jspf"]
+    result = worker.process_paths(tmp_path, paths)
+    assert len(result.file_claims) == 4  # still addressable
+    assert {p.relative_path for p in result.problems} == set(paths)
+    assert all(p.reason_code == "unsupported_language" for p in result.problems)
+    assert all(p.degrades_run is True for p in result.problems)
+
+
 def test_process_paths_does_not_flag_ordinary_non_source_files(tmp_path: Path) -> None:
     """This stays deliberately narrow - an ordinary repository's
     documentation/text/lockfile/generic-config files outside the named
