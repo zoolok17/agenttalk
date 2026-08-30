@@ -28,13 +28,15 @@ def _unit(
 
 def _edge(
     from_unit_id: str, *, relation: str = "invoke", resolution_state: str, target_unit_id=None,
-    evidence_class: str = "extracted",
+    evidence_class: str = "extracted", externality_suppressed: bool = False,
 ) -> DependencyRecord:
     return DependencyRecord(
-        edge_id=f"edge-{from_unit_id}-{relation}-{resolution_state}-{evidence_class}",
+        edge_id=f"edge-{from_unit_id}-{relation}-{resolution_state}-{evidence_class}"
+                f"-{externality_suppressed}",
         from_unit_id=from_unit_id,
         relation=relation, phase="runtime", optional=False, evidence_class=evidence_class,
         resolution_state=resolution_state, target_unit_id=target_unit_id,
+        externality_suppressed=externality_suppressed,
     )
 
 
@@ -253,6 +255,59 @@ def test_dependencies_resolved_unsatisfied_when_an_edge_is_unresolved():
     edges = [_edge("u1", relation="import", resolution_state="unresolved")]
     signals, _ = ra.build_readiness([_unit("u1")], edges, [])
     assert _signal_by_check(signals, "dependencies_resolved").stored_status == "unsatisfied"
+
+
+def test_dependencies_resolved_unknown_with_externality_suppressed_reason_on_a_poisoned_run():
+    """FIX ROUND 20c (readiness carry, inherited from round 20 - THE
+    MAJOR): on a POISONED run, a healthy unit whose ONLY unresolved edge
+    is an externality miss (org.slf4j, marked externality_suppressed by
+    dependencies_artifact.py's own poison-rule branch) must never
+    publish the blocker-severity UNSATISFIED/unresolved_dependency claim
+    - the producer ABSTAINED from a positive external claim, it did not
+    find a real dependency problem."""
+    edges = [_edge(
+        "u1", relation="import", resolution_state="unresolved", externality_suppressed=True)]
+    signals, _ = ra.build_readiness([_unit("u1")], edges, [], externality_poisoned=True)
+    signal = _signal_by_check(signals, "dependencies_resolved")
+    assert signal.stored_status == "unknown"
+    assert signal.reason_code == "externality_suppressed"
+
+
+def test_dependencies_resolved_satisfied_on_a_clean_run_with_the_same_shape():
+    """Companion negative case: the identical unit/edge shape, but this
+    run was never poisoned (externality_poisoned left at its default
+    False) - an all-resolved unit still reports satisfied as before."""
+    edges = [_edge("u1", relation="import", resolution_state="resolved")]
+    signals, _ = ra.build_readiness([_unit("u1")], edges, [])
+    signal = _signal_by_check(signals, "dependencies_resolved")
+    assert signal.stored_status == "satisfied"
+
+
+def test_dependencies_resolved_stays_unsatisfied_on_a_poisoned_run_with_a_genuine_internal_miss():
+    """FIX ROUND 20c: a unit with BOTH an externality miss AND a genuine
+    unresolved INTERNAL dependency (externality_suppressed=False) must
+    keep the existing UNSATISFIED claim - that claim is still true (a
+    real dependency problem exists) and wins over the poison-caused
+    abstention on the OTHER edge."""
+    edges = [
+        _edge("u1", relation="import", resolution_state="unresolved", externality_suppressed=True),
+        _edge("u1", relation="build", resolution_state="unresolved", externality_suppressed=False),
+    ]
+    signals, _ = ra.build_readiness([_unit("u1")], edges, [], externality_poisoned=True)
+    signal = _signal_by_check(signals, "dependencies_resolved")
+    assert signal.stored_status == "unsatisfied"
+    assert signal.reason_code == "unresolved_dependency"
+
+
+def test_dependencies_resolved_satisfied_for_a_reserved_namespace_import_under_poison():
+    """FIX ROUND 20c: a reserved-namespace import (java.*/javax.*/
+    jakarta.*) resolves EXTERNAL even under poison (round 20b's own THE
+    ASK) - it never reaches this check as an unresolved edge at all, so
+    the unit stays satisfied-eligible, unaffected by poisoning."""
+    edges = [_edge("u1", relation="import", resolution_state="resolved")]
+    signals, _ = ra.build_readiness([_unit("u1")], edges, [], externality_poisoned=True)
+    signal = _signal_by_check(signals, "dependencies_resolved")
+    assert signal.stored_status == "satisfied"
 
 
 def test_dependencies_resolved_unknown_when_an_edge_is_ambiguous():

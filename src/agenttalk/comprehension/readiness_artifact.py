@@ -364,7 +364,9 @@ _DEPENDENCY_RESOLUTION_RELATIONS = frozenset({"import", "inherit", "build"})
 _AMBIGUOUS_DEPENDENCY_EXCLUDED_RELATIONS = frozenset({"test"})
 
 
-def _check_dependencies_resolved(unit: ModuleRecord, outgoing: list[DependencyRecord]) -> ReadinessSignal:
+def _check_dependencies_resolved(
+    unit: ModuleRecord, outgoing: list[DependencyRecord], externality_poisoned: bool = False,
+) -> ReadinessSignal:
     # FIX ROUND 16 (twelfth cold read, M2 MAJOR, wrong-data): mirrors
     # _check_source_understood's own "no positive claim without positive
     # evidence" discipline - a file the adapter never successfully read
@@ -399,8 +401,27 @@ def _check_dependencies_resolved(unit: ModuleRecord, outgoing: list[DependencyRe
         return _signal(
             unit.unit_id, "dependencies_resolved", "satisfied", "detected",
             "no_declared_dependencies")
-    states = {edge.resolution_state for edge in relevant}
-    if "unresolved" in states:
+    unresolved_edges = [edge for edge in relevant if edge.resolution_state == "unresolved"]
+    if unresolved_edges:
+        # FIX ROUND 20c (readiness carry, inherited from round 20 - THE
+        # MAJOR): on a poisoned run, a healthy unit whose ONLY unresolved
+        # edges are externality misses (org.slf4j, ...) used to publish
+        # UNSATISFIED/unresolved_dependency - a blocker-severity
+        # we-looked-and-found-a-deficiency claim, when this producer
+        # actually ABSTAINED from a positive external claim because this
+        # run's own external surface is unknown (round 20's own POISON
+        # RULE). Distinguished per-edge via DependencyRecord.
+        # externality_suppressed (set ONLY by the poison branch of
+        # _classify_registry_miss/its wildcard twin, never by a genuine
+        # registry miss) - never guessed from resolution_state alone,
+        # which cannot tell the two apart. A unit that ALSO has a genuine
+        # unresolved dependency (externality_suppressed=False on at
+        # least one edge) keeps the existing UNSATISFIED claim - that
+        # claim is still true and wins.
+        if externality_poisoned and all(edge.externality_suppressed for edge in unresolved_edges):
+            return _signal(
+                unit.unit_id, "dependencies_resolved", "unknown", "detected",
+                "externality_suppressed")
         return _signal(
             unit.unit_id, "dependencies_resolved", "unsatisfied", "detected", "unresolved_dependency")
     return _signal(unit.unit_id, "dependencies_resolved", "satisfied", "detected", "dependencies_resolved")
@@ -422,17 +443,18 @@ def _check_dependencies_resolved(unit: ModuleRecord, outgoing: list[DependencyRe
 def _check_dependencies_resolved_for_component(
     unit: ModuleRecord, own_outgoing: list[DependencyRecord], file_unit_id: str | None,
     children_by_container: dict[str, list[str]], outgoing_by_unit: dict[str, list[DependencyRecord]],
+    externality_poisoned: bool = False,
 ) -> ReadinessSignal:
     own_relevant = [e for e in own_outgoing if e.relation in _DEPENDENCY_RESOLUTION_RELATIONS]
     if own_relevant or file_unit_id is None:
-        return _check_dependencies_resolved(unit, own_outgoing)
+        return _check_dependencies_resolved(unit, own_outgoing, externality_poisoned)
     file_outgoing = outgoing_by_unit.get(file_unit_id, [])
     file_relevant = [e for e in file_outgoing if e.relation in _DEPENDENCY_RESOLUTION_RELATIONS]
     if not file_relevant:
-        return _check_dependencies_resolved(unit, own_outgoing)
+        return _check_dependencies_resolved(unit, own_outgoing, externality_poisoned)
     top_level_siblings = len(children_by_container.get(file_unit_id, []))
     if top_level_siblings <= 1:
-        return _check_dependencies_resolved(unit, file_outgoing)
+        return _check_dependencies_resolved(unit, file_outgoing, externality_poisoned)
     return _signal(
         unit.unit_id, "dependencies_resolved", "unknown", "detected",
         "file_scoped_dependencies_not_attributed")
@@ -440,7 +462,7 @@ def _check_dependencies_resolved_for_component(
 
 def _check_dependencies_resolved_for_file(
     unit: ModuleRecord, direct_outgoing: list[DependencyRecord], contained_unit_ids: set[str],
-    outgoing_by_unit: dict[str, list[DependencyRecord]],
+    outgoing_by_unit: dict[str, list[DependencyRecord]], externality_poisoned: bool = False,
 ) -> ReadinessSignal:
     """N6 (fourth cold read, fix round 6): edges attach to the declared
     TYPE a call/import/route site lives in, never to the FILE that
@@ -482,7 +504,7 @@ def _check_dependencies_resolved_for_file(
     outgoing = list(direct_outgoing)
     for contained_id in contained_unit_ids:
         outgoing.extend(outgoing_by_unit.get(contained_id, []))
-    return _check_dependencies_resolved(unit, outgoing)
+    return _check_dependencies_resolved(unit, outgoing, externality_poisoned)
 
 
 def _check_entry_points_mapped(unit: ModuleRecord, has_entry_point: bool) -> ReadinessSignal:
@@ -603,6 +625,7 @@ def build_readiness(
     modules: list[ModuleRecord],
     dependencies: list[DependencyRecord],
     features: list[FeatureRecord],
+    externality_poisoned: bool = False,
 ) -> tuple[list[ReadinessSignal], list[UnitReadinessSummary]]:
     outgoing_by_unit: dict[str, list[DependencyRecord]] = {}
     for edge in dependencies:
@@ -711,11 +734,12 @@ def build_readiness(
             dependencies_signal = _check_dependencies_resolved_for_file(
                 unit, outgoing_by_unit.get(unit.unit_id, []),
                 _transitive_descendants(unit.unit_id), outgoing_by_unit,
+                externality_poisoned,
             )
         else:
             dependencies_signal = _check_dependencies_resolved_for_component(
                 unit, outgoing_by_unit.get(unit.unit_id, []), _owning_file_unit_id(unit),
-                children_by_container, outgoing_by_unit,
+                children_by_container, outgoing_by_unit, externality_poisoned,
             )
         # FIX ROUND 15 (eleventh cold read, F4 MAJOR part 3, wrong-data):
         # a "test" edge always resolves to the CONTAINED TYPE (a test

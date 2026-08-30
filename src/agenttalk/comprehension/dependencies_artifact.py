@@ -65,6 +65,17 @@ class DependencyRecord:
     # declaring the identical qualified name) and a same-simple-name-
     # across-packages tie both publish their own real candidate set.
     candidate_unit_ids: list[str] = field(default_factory=list)
+    # FIX ROUND 20c (readiness carry, inherited from round 20): True only
+    # when this specific edge's `unresolved` resolution_state came from
+    # the poison rule (round 20's M1+M2) - never from a genuine registry
+    # miss (a duplicate name, an unexpanded Maven property, a degraded-
+    # file suffix match). The readiness layer (readiness_artifact.py's
+    # own _check_dependencies_resolved) reads this to distinguish "this
+    # producer abstained from a positive external claim because this
+    # run's own external surface is unknown" from "this producer found a
+    # real, unresolved dependency" - the two used to collapse into the
+    # identical unsatisfied/unresolved_dependency signal.
+    externality_suppressed: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -83,6 +94,7 @@ class DependencyRecord:
             "conflict_id": self.conflict_id,
             "evidence": self.evidence,
             "candidate_unit_ids": self.candidate_unit_ids,
+            "externality_suppressed": self.externality_suppressed,
         }
 
 
@@ -97,6 +109,7 @@ def dependency_record_from_json(payload: dict[str, Any]) -> DependencyRecord:
         producers=list(payload.get("producers", [])), conflict_id=payload.get("conflict_id"),
         evidence=list(payload.get("evidence", [])),
         candidate_unit_ids=list(payload.get("candidate_unit_ids", [])),
+        externality_suppressed=payload.get("externality_suppressed", False),
     )
 
 
@@ -408,19 +421,37 @@ def _degraded_java_suffix_match(qualified_name: str, degraded_paths: frozenset[s
     return any(path == suffix or path.endswith("/" + suffix) for path in degraded_paths)
 
 
-#: FIX ROUND 20b (seventeenth-round dispatch, THE ASK - taken): the
-#: platform reserves these three top-level namespaces (the JLS for
-#: ``java.*``, the servlet/EE and Jakarta EE specs for ``javax.*``/
-#: ``jakarta.*``) - a vendored or excluded region inside a repo this run
-#: scanned structurally CANNOT contain a legitimate declaration under any
-#: of them, the same positive-grounds reasoning ``_JAVA_LANG_SIMPLE_
-#: NAMES`` already applies to the bare-simple-name case. The poison rule
-#: (``_classify_registry_miss``/the wildcard-import branch below) is
-#: deliberately blunt and run-wide by design - but blunt should still stop
-#: at a boundary the language itself guarantees, rather than also
-#: suppressing the one class of import a poisoned run can ALWAYS resolve
-#: with total confidence regardless of what any excluded region turned
-#: out to hold.
+#: FIX ROUND 20b (seventeenth-round dispatch, THE ASK - taken), corrected
+#: round 20c (its own imprecision, owned): these three namespaces are NOT
+#: all reserved the same way, and the exemption's own strength differs
+#: per prefix accordingly:
+#:
+#: - ``java.*`` is RUNTIME-ENFORCED - the JLS reserves it, and the JVM's
+#:   own classloader rejects any attempt to define a class under it
+#:   ("Prohibited package name: java.*") outside the bootstrap classpath.
+#:   No vendored or excluded region this run scanned can EVER legitimately
+#:   contain a real ``java.*`` declaration - the exemption here is total.
+#: - ``javax.*``/``jakarta.*`` are CONVENTION-RESERVED, not enforced by
+#:   any runtime - they are the servlet/EE and Jakarta EE specs' own
+#:   namespace conventions, but the classloader will happily load a class
+#:   under either. ``javax.servlet`` itself is ordinary, VENDORABLE
+#:   third-party code (the servlet-api jar) - nothing stops a vendored
+#:   copy of it, or a first-party shim placed under the same convention,
+#:   from sitting inside an excluded region.
+#:
+#: NAMED RESIDUAL (three conditions, mild consequence): first-party code
+#: that (1) is genuinely placed under one of these reserved-looking
+#: namespaces, AND (2) sits inside a region this run excluded, AND (3)
+#: this run is poisoned - publishes as a confident EXTERNAL claim instead
+#: of the poison rule's own honest unresolved. All three conditions must
+#: hold simultaneously, and the consequence is mild: a ``javax.*``/
+#: ``jakarta.*`` type reported external is exactly what a migration
+#: reader already expects to see for that namespace, not a surprising or
+#: actionable-looking claim. Keeping all three exemptions (rather than
+#: narrowing to ``java.*`` alone) is the deliberate, recommended trade -
+#: narrowing would re-noise every legacy poisoned run's own javax.*
+#: imports (the single most common reserved-namespace import in any pre-
+#: Jakarta-EE-9 codebase) for a residual this narrow and this mild.
 _PLATFORM_RESERVED_NAMESPACE_PREFIXES = ("java.", "javax.", "jakarta.")
 
 
@@ -432,13 +463,13 @@ def _classify_registry_miss(
     qualified_name: str, *, duplicate_qualified_names: set[str],
     unit_ids_by_qualified_name: dict[str, list[str]], degraded_paths: frozenset[str],
     externality_poisoned: bool,
-) -> tuple[str, list[str] | None]:
+) -> tuple[str, list[str] | None, bool]:
     """FIX ROUND 16 (twelfth cold read, B1+B2 BLOCKERS - the shared
     class): called ONLY once an exact registry lookup for
     ``qualified_name`` has already MISSED. Never itself performs the
     exact-match check - callers keep that (it needs their own
     type-prefix-vs-full-target distinction). Returns
-    ``(outcome, candidate_unit_ids)`` where ``outcome`` is one of
+    ``(outcome, candidate_unit_ids, externality_suppressed)`` where ``outcome`` is one of
     ``"ambiguous"`` / ``"unresolved"`` / ``"external"`` - the class the
     round-16 dispatch itself names: an import target may publish
     EXTERNAL only on POSITIVE grounds (not in-scan AND not a duplicate
@@ -495,20 +526,40 @@ def _classify_registry_miss(
 
     FIX ROUND 20b (seventeenth-round dispatch, THE ASK - taken): a
     poisoned run still resolves a target under one of ``java.*``/
-    ``javax.*``/``jakarta.*`` as EXTERNAL - the platform reserves those
-    namespaces, so no excluded region this run swallowed could ever
-    legitimately contain one (see ``_is_platform_reserved_namespace``'s
-    own docstring). Checked LAST, after every OTHER positive-grounds
-    exclusion above still applies unchanged."""
+    ``javax.*``/``jakarta.*`` as EXTERNAL - ``java.*`` is RUNTIME-ENFORCED
+    (the classloader itself rejects a non-bootstrap declaration there);
+    ``javax.*``/``jakarta.*`` are convention-reserved only, not enforced
+    (``javax.servlet`` is itself ordinary, vendorable third-party code) -
+    see ``_is_platform_reserved_namespace``'s own docstring for the named
+    residual this weaker pair still carries (first-party code genuinely
+    placed under one of them, inside an excluded region, on a poisoned
+    run, publishes external - three conditions, a mild consequence, kept
+    anyway rather than re-noising every legacy poisoned run's own
+    javax.* imports). Checked LAST, after every OTHER positive-grounds
+    exclusion above still applies unchanged.
+
+    FIX ROUND 20c (readiness carry, inherited from round 20): the
+    third return element - ``externality_suppressed`` - is True ONLY
+    when THIS specific miss was classified unresolved BY THE POISON
+    RULE, never for the ``${...}``/duplicate-name/degraded-suffix
+    branches above (each answers a genuinely different question - a
+    real problem this run found, not an abstention). Callers thread
+    this onto the published ``DependencyRecord`` so the readiness layer
+    can honestly distinguish "abstained from a positive claim because
+    this run's external surface is unknown" from "found a real,
+    unresolved dependency" - the two used to collapse into the
+    identical ``unsatisfied``/``unresolved_dependency`` signal, a
+    blocker-severity found-a-problem claim over a producer that
+    actually never looked."""
     if "${" in qualified_name:
-        return "unresolved", None
+        return "unresolved", None, False
     if qualified_name in duplicate_qualified_names:
-        return "ambiguous", sorted(unit_ids_by_qualified_name.get(qualified_name, []))
+        return "ambiguous", sorted(unit_ids_by_qualified_name.get(qualified_name, [])), False
     if _degraded_java_suffix_match(qualified_name, degraded_paths):
-        return "unresolved", None
+        return "unresolved", None, False
     if externality_poisoned and not _is_platform_reserved_namespace(qualified_name):
-        return "unresolved", None
-    return "external", None
+        return "unresolved", None, True
+    return "external", None, False
 
 
 def build_dependencies(
@@ -699,6 +750,11 @@ def _edge_claim_to_record(
 ) -> DependencyRecord:
     target_unit_id = target_external = target_unresolved = confidence = None
     candidate_unit_ids: list[str] = []
+    # FIX ROUND 20c (readiness carry): set True only by the poison
+    # branch of _classify_registry_miss (or its inline wildcard-import
+    # twin below) - never by the `${...}`/duplicate-name/degraded-
+    # suffix branches, which each report a genuine, different problem.
+    externality_suppressed = False
     if edge.target_kind == "internal_candidate":
         # FIX ROUND 14 (CR10-3): chain-aware - a dotted target may be a
         # member-navigation chain (an enum constant, a nested type
@@ -768,11 +824,12 @@ def _edge_claim_to_record(
             # outcome, not just the degraded one.
             imported = import_qualified_by_simple[edge.target]
             if imported == target_unresolved:
-                outcome, candidates = _classify_registry_miss(
+                outcome, candidates, poisoned_miss = _classify_registry_miss(
                     imported, duplicate_qualified_names=duplicate_qualified_names,
                     unit_ids_by_qualified_name=unit_ids_by_qualified_name,
                     degraded_paths=degraded_paths, externality_poisoned=externality_poisoned,
                 )
+                externality_suppressed = poisoned_miss
                 if outcome == "ambiguous":
                     resolution_state, candidate_unit_ids = "ambiguous", candidates
                 elif outcome == "external":
@@ -790,11 +847,12 @@ def _edge_claim_to_record(
         if exact_unit_id is not None:
             resolution_state, target_unit_id, confidence = "resolved", exact_unit_id, "high"
         else:
-            outcome, candidates = _classify_registry_miss(
+            outcome, candidates, poisoned_miss = _classify_registry_miss(
                 edge.target, duplicate_qualified_names=duplicate_qualified_names,
                 unit_ids_by_qualified_name=unit_ids_by_qualified_name,
                 degraded_paths=degraded_paths, externality_poisoned=externality_poisoned,
             )
+            externality_suppressed = poisoned_miss
             if outcome == "ambiguous":
                 resolution_state, target_unresolved, candidate_unit_ids = (
                     "ambiguous", edge.target, candidates)
@@ -818,11 +876,12 @@ def _edge_claim_to_record(
         if exact_unit_id is not None:
             resolution_state, target_unit_id, confidence = "resolved", exact_unit_id, "high"
         else:
-            outcome, candidates = _classify_registry_miss(
+            outcome, candidates, poisoned_miss = _classify_registry_miss(
                 type_prefix, duplicate_qualified_names=duplicate_qualified_names,
                 unit_ids_by_qualified_name=unit_ids_by_qualified_name,
                 degraded_paths=degraded_paths, externality_poisoned=externality_poisoned,
             )
+            externality_suppressed = poisoned_miss
             if outcome == "ambiguous":
                 resolution_state, target_unresolved, candidate_unit_ids = (
                     "ambiguous", edge.target, candidates)
@@ -882,6 +941,11 @@ def _edge_claim_to_record(
             # java.*/javax.*/jakarta.* still resolves external under
             # poison.
             resolution_state, target_unresolved = "unresolved", edge.target
+            # FIX ROUND 20c (readiness carry): unlike the in_scan_packages
+            # branch above (a genuinely different, non-poison reason this
+            # stays unresolved), this branch's own unresolved outcome IS
+            # the poison rule.
+            externality_suppressed = True
         else:
             resolution_state, target_external = "resolved", edge.target
     elif edge.target_kind == "internal_pom_coordinate_or_external":
@@ -903,11 +967,12 @@ def _edge_claim_to_record(
         if exact_unit_id is not None:
             resolution_state, target_unit_id, confidence = "resolved", exact_unit_id, "high"
         else:
-            outcome, candidates = _classify_registry_miss(
+            outcome, candidates, poisoned_miss = _classify_registry_miss(
                 edge.target, duplicate_qualified_names=duplicate_qualified_names,
                 unit_ids_by_qualified_name=unit_ids_by_qualified_name,
                 degraded_paths=degraded_paths, externality_poisoned=externality_poisoned,
             )
+            externality_suppressed = poisoned_miss
             if outcome == "ambiguous":
                 resolution_state, target_unresolved, candidate_unit_ids = (
                     "ambiguous", edge.target, candidates)
@@ -943,4 +1008,5 @@ def _edge_claim_to_record(
             rule_version=java_adapter.RULE_VERSION, source_digest=source_digest,
         )],
         candidate_unit_ids=candidate_unit_ids,
+        externality_suppressed=externality_suppressed,
     )

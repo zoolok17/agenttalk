@@ -608,7 +608,7 @@ def run_scan(
         entry_points, features = features_artifact.build_features(
             java_results, file_digests=file_digests)
         readiness_signals, readiness_summaries = readiness_artifact.build_readiness(
-            modules, dependencies, features)
+            modules, dependencies, features, externality_poisoned=externality_poisoned)
 
         # N1 (third cold read, fix round 5): find_case_fold_collisions
         # existed with its own passing unit tests and zero production

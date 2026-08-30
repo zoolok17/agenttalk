@@ -3202,6 +3202,23 @@ def test_run_scan_an_undeclared_vendored_module_silently_poisoned_now_degrades_v
     assert slf4j_edge["resolution_state"] == "unresolved"
     assert slf4j_edge.get("target_external") is None
 
+    # FIX ROUND 20c (readiness carry, inherited from round 20 - THE
+    # MAJOR): the Consumer unit's only unresolved edges are both
+    # externality misses (poisoned by "vendor") - dependencies_resolved
+    # must report unknown/externality_suppressed, never the blocker-
+    # severity unsatisfied/unresolved_dependency claim over a producer
+    # that actually abstained.
+    assert slf4j_edge["externality_suppressed"] is True
+    assert vendor_edge["externality_suppressed"] is True
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    consumer_unit = next(u for u in modules_doc["units"] if u["display_name"] == "Consumer")
+    dependencies_resolved = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == consumer_unit["unit_id"] and s["check"] == "dependencies_resolved")
+    assert dependencies_resolved["stored_status"] == "unknown"
+    assert dependencies_resolved["reason_code"] == "externality_suppressed"
+
 
 def test_run_scan_a_truncated_peek_build_dir_silently_poisoned_now_degrades_visibly(
     java_repo: Path, monkeypatch,
