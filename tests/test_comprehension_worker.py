@@ -137,6 +137,112 @@ def test_process_paths_flags_jsp_properties_and_sql_as_unsupported_language(
     assert degrades_by_path["app.properties"] is False
 
 
+@pytest.mark.parametrize("filename", [
+    "Foo.jsp", "Foo.jspx", "Foo.jspf", "Foo.tag", "schema.sql", "Foo.groovy",
+    "Foo.kt", "Foo.scala", "view.xhtml", "template.ftl", "template.vm",
+])
+def test_process_paths_flags_every_tier2_code_bearing_extension_as_degrading(
+    tmp_path: Path, filename: str,
+) -> None:
+    """FIX ROUND 16b (reviewer-3's rejection of round 16, BLOCKER 1 - the
+    B4 CALIBRATION): the closed, recognized CODE-BEARING list (TIER 2) -
+    every member individually confirmed still degrading after the
+    three-tier recalibration, not just the four the round-16 battery
+    happened to cover."""
+    (tmp_path / filename).write_text("placeholder content\n", encoding="utf-8")
+    result = worker.process_paths(tmp_path, [filename])
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "unsupported_language"
+    assert result.problems[0].degrades_run is True
+
+
+@pytest.mark.parametrize("filename", [
+    "mvnw", "mvnw.cmd", "Dockerfile", "LICENSE", "CHANGELOG", "ci.yml",
+    "application.yml", "package.json",
+])
+def test_process_paths_flags_tier3_build_tooling_files_as_record_only(
+    tmp_path: Path, filename: str,
+) -> None:
+    """FIX ROUND 16b (BLOCKER 1, the B4 CALIBRATION): reviewer-3's own
+    38-repo battery measured an ordinary healthy Spring Boot repo
+    scanning DEGRADED with 10 recorded problems - mvnw/mvnw.cmd/
+    Dockerfile/LICENSE/CI YAMLs/application.yml all wrongly flipped a
+    clean run to degraded under round 16's own "presumed code-bearing by
+    default" rule. TIER 3 (everything non-benign, non-adapter-handled,
+    and NOT on the tier-2 closed list) is now recorded - the round-16
+    inversion's own win, never silently un-recorded - but never
+    degrading: a build/tooling/infra/config file is not "missed
+    application code" the way a JSP or a Kotlin source is."""
+    (tmp_path / filename).write_text("placeholder content\n", encoding="utf-8")
+    result = worker.process_paths(tmp_path, [filename])
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "unsupported_language"
+    assert result.problems[0].degrades_run is False
+
+
+def test_process_paths_incoherence_application_properties_and_yml_now_agree(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 16b (BLOCKER 1): reviewer-3's own sharpest measured
+    case - application.properties and application.yml are the IDENTICAL
+    configuration, merely a different serialization, but round 16's own
+    rule left them incoherent (properties record-only via its
+    pre-existing carve-out, yml degrading via the default). Both must
+    now record, neither degrades."""
+    (tmp_path / "application.properties").write_text("key=value\n", encoding="utf-8")
+    (tmp_path / "application.yml").write_text("key: value\n", encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["application.properties", "application.yml"])
+    assert len(result.problems) == 2
+    assert all(p.reason_code == "unsupported_language" for p in result.problems)
+    assert all(p.degrades_run is False for p in result.problems)
+
+
+def test_process_paths_lock_family_stays_silent_while_package_json_records(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 16b (BLOCKER 1): the reviewer's own named check - the
+    lockfile family (a genuine benign basename/extension) stays
+    completely silent (no WorkerProblem at all), while package.json (an
+    ordinary .json file, not itself a recognized lockfile basename)
+    still gets recorded, tier-3, never degrading."""
+    (tmp_path / "package-lock.json").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "yarn.lock").write_text("# yarn lockfile v1\n", encoding="utf-8")
+    (tmp_path / "package.json").write_text("{}\n", encoding="utf-8")
+    result = worker.process_paths(
+        tmp_path, ["package-lock.json", "yarn.lock", "package.json"])
+    assert {p.relative_path for p in result.problems} == {"package.json"}
+    assert result.problems[0].degrades_run is False
+
+
+def test_process_paths_a_composite_healthy_spring_boot_repo_does_not_degrade(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 16b (BLOCKER 1): reviewer-3's own composite shape - an
+    ordinary, entirely healthy Spring Boot repo's non-code surface
+    (Maven wrapper, Dockerfile, LICENSE, CI config, application.yml/
+    .properties) must record every file (round 16's own win, unchanged)
+    but never degrade the run over any of them."""
+    (tmp_path / "mvnw").write_text("#!/bin/sh\n", encoding="utf-8")
+    (tmp_path / "mvnw.cmd").write_text("@ECHO OFF\n", encoding="utf-8")
+    (tmp_path / "Dockerfile").write_text("FROM eclipse-temurin:21\n", encoding="utf-8")
+    (tmp_path / "LICENSE").write_text("Apache License 2.0\n", encoding="utf-8")
+    (tmp_path / "ci.yml").write_text("name: CI\n", encoding="utf-8")
+    (tmp_path / "application.yml").write_text("server:\n  port: 8080\n", encoding="utf-8")
+    (tmp_path / "application.properties").write_text("server.port=8080\n", encoding="utf-8")
+    (tmp_path / "App.java").write_text(
+        "package p;\nclass App {\n  public static void main(String[] a) {}\n}\n",
+        encoding="utf-8")
+    paths = [
+        "mvnw", "mvnw.cmd", "Dockerfile", "LICENSE", "ci.yml",
+        "application.yml", "application.properties", "App.java",
+    ]
+    result = worker.process_paths(tmp_path, paths)
+    assert len(result.problems) == 7  # every non-adapter, non-code-bearing file
+    assert all(p.reason_code == "unsupported_language" for p in result.problems)
+    assert all(p.degrades_run is False for p in result.problems)
+    assert "App.java" in result.java_results
+
+
 def test_process_paths_flags_a_spring_bean_xml_file_as_degrading(tmp_path: Path) -> None:
     """FIX ROUND 14b (reviewer-3's ratified split): a Spring bean XML
     file (root element ``<beans>``) IS code-bearing configuration -

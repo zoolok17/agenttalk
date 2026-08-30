@@ -155,10 +155,12 @@ def test_dependencies_resolved_and_entry_points_mapped_also_unknown_when_parse_f
     assert dependencies_signal.reason_code == "adapter_parse_failed"
     entry_points_signal = _signal_by_check(signals, "entry_points_mapped")
     assert entry_points_signal.stored_status == "unknown"
-    # entry_points_mapped's own dispatch (unlike dependencies_resolved's)
-    # publishes the bare reason code, matching its existing
-    # cli_main_unrecognized convention - never "adapter_"-prefixed.
-    assert entry_points_signal.reason_code == "parse_failed"
+    # FIX ROUND 16b (LOW - unify the two spellings): a whole-file
+    # evidence-gap reason now publishes the SAME "adapter_X" spelling on
+    # every check it feeds - source_understood, dependencies_resolved,
+    # and entry_points_mapped alike, never two spellings for one fact
+    # about one unit.
+    assert entry_points_signal.reason_code == "adapter_parse_failed"
     assert summaries[0].stored_assessment_state == "needs_evidence"
 
 

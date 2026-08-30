@@ -446,8 +446,23 @@ def _check_entry_points_mapped(unit: ModuleRecord, has_entry_point: bool) -> Rea
     # CONFIDENCE of the negative changes.
     entry_point_reasons = _reasons_feeding("entry_points_mapped", unit.adapter_problem_reasons)
     if entry_point_reasons:
-        return _signal(
-            unit.unit_id, "entry_points_mapped", "unknown", "detected", entry_point_reasons[0])
+        reason = entry_point_reasons[0]
+        # FIX ROUND 16b (reviewer-3's rejection of round 16, LOW - unify
+        # the two spellings): M2's widening (this round) made a
+        # whole-file evidence-gap reason (parse_failed, ...) feed THIS
+        # check too, alongside source_understood/dependencies_resolved -
+        # but only THOSE two ever prefixed it "adapter_X"; this check
+        # kept publishing the bare reason for the identical fact about
+        # the identical unit, two spellings for one thing. A reason that
+        # ALSO feeds source_understood now gets the SAME "adapter_X"
+        # spelling here. cli_main_unrecognized (narrowly scoped - a fact
+        # about ONE already-understood construct, never a whole-file
+        # gap) stays bare, unchanged - it is problems.json's own
+        # reason_code verbatim, the existing join key a reader uses to
+        # correlate this signal with its concrete problem row.
+        if "source_understood" in _READINESS_CHECKS_BY_REASON_CODE[reason]:
+            reason = f"adapter_{reason}"
+        return _signal(unit.unit_id, "entry_points_mapped", "unknown", "detected", reason)
     return _signal(
         unit.unit_id, "entry_points_mapped", "not_applicable", "detected", "no_entry_point")
 

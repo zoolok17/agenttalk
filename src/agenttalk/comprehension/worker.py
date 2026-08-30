@@ -72,6 +72,35 @@ _BENIGN_NON_CODE_BASENAMES = frozenset({
     ".gitignore", ".gitattributes", ".gitmodules", ".editorconfig", ".dockerignore",
     "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "composer.lock", "poetry.lock",
 })
+#: FIX ROUND 16b (reviewer-3's rejection of round 16, BLOCKER 1 - the B4
+#: CALIBRATION): round 16's own inversion is RATIFIED (an unenumerated
+#: extension must never silently vanish with no problem recorded at
+#: all) - but "recorded" and "degrades this run" were left as the SAME
+#: claim, and that half is OVERTURNED, measured on a 38-repo battery: an
+#: ordinary healthy Spring Boot repo scanned DEGRADED with 10 recorded
+#: problems - `mvnw`, `mvnw.cmd`, `Dockerfile`, `LICENSE`, CI YAMLs, and
+#: `application.yml` all flipped a clean run to degraded. Sharpest case:
+#: `application.properties` stayed record-only (its own pre-existing
+#: carve-out) while `application.yml` - the IDENTICAL configuration,
+#: merely a different serialization - degraded, an incoherent claim
+#: about the same information under two different reasonable spellings.
+#:
+#: THREE TIERS now, not two: (1) adapter-handled languages are parsed
+#: normally, unchanged; (2) this CLOSED, PROVISIONAL list of recognized
+#: CODE-BEARING shapes (plus Spring bean XML, still via the existing
+#: root-element sniff below) is recorded AND degrades - a real,
+#: application-level source file this producer simply has no adapter
+#: for yet; (3) EVERYTHING ELSE non-benign (any extension neither
+#: adapter-handled, benign, nor on this list - `Dockerfile`, `mvnw`, a
+#: CI YAML, `application.yml`, ...) is still recorded (round 16's own
+#: win - the cr12-jsf silent-vanish class stays closed, every one of
+#: these still gets a WorkerProblem) but no longer flips status - a
+#: build/tooling/infra file is not "missed application code" the way a
+#: JSP or a Kotlin source is, even though this producer cannot parse it
+#: either.
+_DEGRADING_CODE_EXTENSIONS = frozenset({
+    ".jsp", ".jspx", ".jspf", ".tag", ".sql", ".groovy", ".kt", ".scala", ".xhtml", ".ftl", ".vm",
+})
 #: Spring bean XML's own root element - the ONE xml root name this
 #: producer recognizes as code-bearing (a bean declaration is
 #: application wiring, not tooling configuration). PROVISIONAL, like
@@ -437,30 +466,35 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                         f"element <{root_element}> is tooling/config XML, not code-bearing, "
                         "so this run does not degrade over it"
                     )
-            elif rel_lower.endswith(".properties"):
-                # .properties - record-only per reviewer-3's own reader
-                # test, never a missed-application-code claim.
-                degrades_run = False
-                detail = (
-                    "no bundled adapter recognizes this file's language - not a "
-                    "code-bearing shape, so this run does not degrade over it"
-                )
-            else:
-                # FIX ROUND 16 (B4 BLOCKER): every OTHER non-benign
-                # extension - `.jsp`/`.jspx`/`.sql` from the previous
-                # closed list, PLUS any extension this producer has never
-                # explicitly seen before (`.xhtml`/`.groovy`/`.tag`/
-                # `.jspf`/... reviewer-3's own `.cr12-jsf` fixture) - is
-                # presumed CODE-BEARING by default: the inversion's whole
-                # point is that an unrecognized extension is guilty
-                # (degrades) until proven benign by the allowlist above,
-                # never innocent-by-default the way the old closed list
-                # left it.
+            elif rel_lower.endswith(tuple(_DEGRADING_CODE_EXTENSIONS)):
+                # FIX ROUND 16b (BLOCKER 1, the B4 CALIBRATION): TIER 2 -
+                # a closed, recognized CODE-BEARING shape this producer
+                # simply has no adapter for yet (JSP/JSF-family, SQL,
+                # Groovy/Kotlin/Scala on the JVM) - real application
+                # source, genuinely "missed application code".
                 degrades_run = True
                 detail = (
-                    "no bundled adapter recognizes this file's language - it remains an "
-                    "addressable file unit but contributes no units, edges, or entry "
-                    "points; a code-bearing shape, so this run degrades"
+                    "no bundled adapter recognizes this file's language - a recognized "
+                    "code-bearing shape (not benign, not tooling/infra), so this run degrades"
+                )
+            else:
+                # FIX ROUND 16b (BLOCKER 1, the B4 CALIBRATION): TIER 3 -
+                # every OTHER non-benign, non-adapter-handled extension
+                # (`Dockerfile`, `mvnw`/`mvnw.cmd`, a CI YAML,
+                # `application.yml`, `.properties`, ...) is still
+                # RECORDED (round 16's own win over the old closed list's
+                # silent vanish stays closed - every one of these still
+                # gets a WorkerProblem) but never degrades: a build/
+                # tooling/infra/config file this producer cannot parse is
+                # not "missed application code" the way a JSP or a Kotlin
+                # source is, even though the registry has no adapter for
+                # it either. Presumed BENIGN-OF-STATUS by default now -
+                # the inverted allowlist's own win (never silently
+                # un-recorded) stands regardless of this tier.
+                degrades_run = False
+                detail = (
+                    "no bundled adapter recognizes this file's language - not on the "
+                    "recognized code-bearing list, so this run does not degrade over it"
                 )
             problems.append(WorkerProblem(
                 reason_code="unsupported_language", relative_path=rel, detail=detail,
