@@ -142,9 +142,12 @@ def test_process_paths_flags_jsp_properties_and_sql_as_unsupported_language(
     "Foo.kt", "Foo.scala", "view.xhtml", "template.ftl", "template.vm",
     # FIX ROUND 17 (thirteenth cold read, CR13-1 MAJOR, part (b) - GROW
     # TIER 2): the reader's own polyglot evidence - real application-code
-    # extensions this list was too narrow to catch.
-    "app.js", "app.ts", "script.py", "Program.cs", "index.php", "app.rb",
-    "main.go", "Package.pks", "Package.pkb", "transform.xsl",
+    # extensions this list was too narrow to catch. FIX ROUND 17b
+    # (TIER-2 PARTIAL OVERTURN): .js/.ts/.py REMOVED from this list -
+    # see test_process_paths_flags_js_ts_py_as_tier3_record_only below,
+    # the companion negative case.
+    "Program.cs", "index.php", "app.rb", "main.go", "Package.pks",
+    "Package.pkb", "transform.xsl",
 ])
 def test_process_paths_flags_every_tier2_code_bearing_extension_as_degrading(
     tmp_path: Path, filename: str,
@@ -161,6 +164,28 @@ def test_process_paths_flags_every_tier2_code_bearing_extension_as_degrading(
     assert result.problems[0].degrades_run is True
 
 
+@pytest.mark.parametrize("filename", ["app.js", "app.ts", "script.py"])
+def test_process_paths_flags_js_ts_py_as_tier3_record_only(
+    tmp_path: Path, filename: str,
+) -> None:
+    """FIX ROUND 17b (reviewer-3's rejection of round 17, TIER-2 PARTIAL
+    OVERTURN, measured): round 17 added .js/.ts/.py to tier 2 -
+    OVERTURNED. Unlike .cs/.php/.rb/.go/.pks/.pkb/.xsl, these three are
+    ROUTINELY INCIDENTAL in an ordinary Java repository (a
+    `scripts/release.py` helper, a webapp's own static `app.js`/`app.ts`
+    asset) - re-degrading the round-16b composite Spring Boot repo
+    (this producer's own acceptance fixture for the three-tier rule
+    itself) is exactly the regression this reverts. Still recorded
+    (tier 3's own guarantee, never silently vanished) - just never
+    degrading, the same trade already accepted everywhere else in tier
+    3."""
+    (tmp_path / filename).write_text("placeholder content\n", encoding="utf-8")
+    result = worker.process_paths(tmp_path, [filename])
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "unsupported_language"
+    assert result.problems[0].degrades_run is False
+
+
 def test_process_paths_a_polyglot_legacy_web_app_now_degrades_cr13_b(tmp_path: Path) -> None:
     """FIX ROUND 17 (thirteenth cold read, CR13-1 MAJOR, wrong-data):
     mirrors the reader's own .cr13-b shape - a legacy web app whose real
@@ -168,7 +193,13 @@ def test_process_paths_a_polyglot_legacy_web_app_now_degrades_cr13_b(tmp_path: P
     (.pks/.pkb) and an XSL transform - all genuine, unambiguous
     application-code shapes this producer has no adapter for. Round 16's
     own three-tier rule, pre-growth, scanned this repo COMPLETE (0
-    degrading) over real migration estate; must now DEGRADE."""
+    degrading) over real migration estate; must now DEGRADE.
+
+    FIX ROUND 17b (TIER-2 PARTIAL OVERTURN): .js REMOVED from tier 2 -
+    re-degrading THIS SAME composite (this producer's own three-tier-rule
+    acceptance fixture) over an ordinary webapp static asset was exactly
+    the regression that got it overturned. .js now stays record-only
+    (tier 3); .pks/.pkb/.xsl (never merely incidental) still degrade."""
     (tmp_path / "legacy.js").write_text("function submit() {}\n", encoding="utf-8")
     (tmp_path / "OrderPkg.pks").write_text("CREATE PACKAGE order_pkg AS END;\n", encoding="utf-8")
     (tmp_path / "OrderPkg.pkb").write_text("CREATE PACKAGE BODY order_pkg AS END;\n", encoding="utf-8")
@@ -178,7 +209,11 @@ def test_process_paths_a_polyglot_legacy_web_app_now_degrades_cr13_b(tmp_path: P
     result = worker.process_paths(tmp_path, paths)
     assert len(result.problems) == 4
     assert all(p.reason_code == "unsupported_language" for p in result.problems)
-    assert all(p.degrades_run is True for p in result.problems)
+    degrades_by_path = {p.relative_path: p.degrades_run for p in result.problems}
+    assert degrades_by_path["legacy.js"] is False
+    assert degrades_by_path["OrderPkg.pks"] is True
+    assert degrades_by_path["OrderPkg.pkb"] is True
+    assert degrades_by_path["report.xsl"] is True
 
 
 @pytest.mark.parametrize("filename", [

@@ -103,30 +103,35 @@ _DEGRADING_CODE_EXTENSIONS = frozenset({
     # FIX ROUND 17 (thirteenth cold read, CR13-1 MAJOR, wrong-data, part
     # (b) - GROW TIER 2): the three-tier rule's own inversion is
     # RATIFIED, but this list stayed too narrow - the reader's own
-    # polyglot fixture (a legacy web app whose .js files carry the real
-    # browser-side behavior; .pks/.pkb Oracle PL/SQL package bodies, real
+    # polyglot fixture (.pks/.pkb Oracle PL/SQL package bodies, real
     # migration estate) scanned COMPLETE, not degraded, over genuine
-    # application code this producer simply has no adapter for. Every
-    # UNAMBIGUOUS application-code extension the reader named, added:
-    # .js/.ts (the reader's own repro), .py/.cs/.php/.rb/.go (the same
-    # class - a real application-language source file, never tooling),
+    # application code this producer simply has no adapter for. Added
+    # the UNAMBIGUOUS application-code extensions the reader named that
+    # are NEVER incidental in an ordinary Java repository: .cs/.php/.rb/
+    # .go (a real application-language source file, never tooling),
     # .pks/.pkb (Oracle PL/SQL package spec/body - real database-tier
     # migration estate), .xsl (JUDGE - a transform is code-bearing;
-    # included per the reviewer's own lean). This closes the specific
-    # incoherence the reader also named (.vm/.ftl degrading while the
-    # same app's .js did not - now both degrade, for the same reason).
+    # included per the reviewer's own lean).
     #
-    # .py's own tools-vs-source-root question (the reviewer's own 16b
-    # residual, "tools/script.py stays record-only elsewhere"): NOT
-    # implemented as a source-root split here - this producer has no
-    # existing "recognized source root" concept for a non-Java language
-    # to key that split off (the Java-specific src/main/java convention
-    # does not generalize), and inventing one for this alone would be
-    # exactly the speculative concept-building this codebase avoids.
-    # Taken per the reviewer's own offered fallback: ALL .py degrades,
-    # PROVISIONAL like every other entry in this list - reviewer-3 rules
-    # on the finer split if still wanted.
-    ".js", ".ts", ".py", ".cs", ".php", ".rb", ".go", ".pks", ".pkb", ".xsl",
+    # FIX ROUND 17b (reviewer-3's rejection of round 17, TIER-2 PARTIAL
+    # OVERTURN, measured): round 17 also added .js/.ts/.py - OVERTURNED.
+    # Unlike .cs/.php/.rb/.go/.pks/.pkb/.xsl, these three are ROUTINELY
+    # INCIDENTAL in an ordinary Java repository (a `scripts/release.py`
+    # helper, a webapp's own static `app.js`/`app.ts` asset) - measured
+    # against the round-16b composite Spring Boot repo (this producer's
+    # own acceptance fixture for the three-tier rule), whose own
+    # completeness was the condition tier 2 was accepted under: adding
+    # these three silently re-degraded that same repo and reversed two
+    # of its own ratified battery rows. The criterion that actually
+    # separates tier 2 from tier 3 (see the module-level PROVISIONAL
+    # note below): NEVER-incidental application/database estate, not
+    # merely "a real programming language." A genuine Python/Node
+    # service living in a polyglot monorepo still gets tier 3's own
+    # guarantee (recorded, never silently vanished) - the SAME
+    # under-claim trade this whole three-tier rule already accepts
+    # everywhere else, applied consistently rather than carved out for
+    # these three specifically.
+    ".cs", ".php", ".rb", ".go", ".pks", ".pkb", ".xsl",
 })
 #: FIX ROUND 17 (thirteenth cold read, CR13-1 MAJOR): this whole list is
 #: PROVISIONAL and expected to GROW as this producer meets more real
@@ -134,6 +139,19 @@ _DEGRADING_CODE_EXTENSIONS = frozenset({
 #: inversion means an absent entry here is still recorded, never
 #: silently vanished; it just under-claims degradation for a language
 #: this list has not caught up to yet). Reviewer-3 ratifies additions.
+#:
+#: FIX ROUND 17b (measured criterion, replacing "any real programming
+#: language" after that reading proved too wide): an extension belongs
+#: here only when it is NEVER-INCIDENTAL application/database estate in
+#: an ordinary Java repository - a file this extension names is ALWAYS
+#: real migration-relevant source, never a routine helper/tooling/asset
+#: script that merely happens to share the same language. `.js`/`.ts`/
+#: `.py` failed this exact test (a `scripts/release.py` helper, a
+#: webapp's own static `app.js` asset are BOTH routine and common) and
+#: were removed; `.cs`/`.php`/`.rb`/`.go`/`.pks`/`.pkb`/`.xsl` pass it
+#: (never merely incidental tooling in a Java repo). Consult THIS
+#: criterion, not the list's own current membership, before adding a
+#: new extension.
 #: Spring bean XML's own root element - the ONE xml root name this
 #: producer recognizes as code-bearing (a bean declaration is
 #: application wiring, not tooling configuration). PROVISIONAL, like

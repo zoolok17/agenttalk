@@ -331,23 +331,33 @@ valid.
 
 An amendment (task #55 slice-1 PR-B, fix rounds 16-17): the plain reading above
 - *any* unsupported file degrades the run - was measured against real
-repositories and does not hold. An unsupported extension resolves through
-THREE tiers, not two:
+repositories and does not hold: an ordinary Spring Boot repository scanned
+`degraded` over its own Maven wrapper, its CI configuration, and its
+`LICENSE` file. An unsupported extension resolves through THREE tiers, not
+two:
 
 1. **Adapter-handled** - a bundled adapter recognizes the language and parses
    it normally. Not part of this section.
 2. **Recognized code-bearing, unsupported** - a CLOSED, PROVISIONAL list of
-   extensions this producer has no adapter for yet, but that name real
-   application-source shapes on the JVM and its adjacent migration estate
-   (JSP/JSF-family templates, SQL, Groovy/Kotlin/Scala, XSLT transforms, and -
-   as this producer meets more real repositories - other unambiguous
-   application languages such as JavaScript/TypeScript, Python, C#, PHP,
-   Ruby, Go, and Oracle PL/SQL package bodies). Every file matching this tier
-   is recorded in `problems.json` (`unsupported_language`) AND degrades the
-   run - it is genuinely missed application code, the same standard a fresh
-   migration reader applies ("would a reader say the inventory missed
-   something they needed?" - the reader test fix round 14b's own reviewer
-   delta first established, reused unchanged for this tier).
+   extensions this producer has no adapter for yet. Membership is decided by
+   ONE criterion: the extension names NEVER-INCIDENTAL application or
+   database estate - a file with this extension is ALWAYS real,
+   migration-relevant source in an ordinary Java repository, never a routine
+   helper/tooling/asset script that merely happens to share the same
+   language (a repository-wide `scripts/release.py` helper or a webapp's own
+   static `app.js` asset are both routine and common, and FAILED this
+   criterion on measurement - removed after initially being added on the
+   weaker "any real programming language" reading). Every file matching this
+   tier is recorded in `problems.json` (`unsupported_language`) AND degrades
+   the run - the same standard a fresh migration reader applies ("would a
+   reader say the inventory missed something they needed?" - the reader
+   test a reviewer's own delta first established, reused unchanged for this
+   tier). The current membership is a source-code fact, not a design fact -
+   see `worker.py`'s own `_DEGRADING_CODE_EXTENSIONS` constant (and its
+   neighboring criterion comment) for the list actually enforced; this
+   section describes the RULE that constant must satisfy, not an inline copy
+   of its contents, which would drift out of sync with the code the moment
+   either changes independently.
 3. **Everything else non-benign** - any extension neither adapter-handled,
    on a closed BENIGN allowlist (documentation, plain text, lockfiles,
    images), nor on the tier-2 list above. Still recorded in `problems.json`
@@ -360,14 +370,15 @@ THREE tiers, not two:
    application code" the same way an unrecognized JVM-language source file
    is, even though this producer cannot parse either one.
 
-The tier-2 list is explicitly PROVISIONAL and expected to GROW as this
+The tier-2 list is explicitly PROVISIONAL and expected to GROW (and
+occasionally SHRINK, on the identical criterion, per measurement) as this
 producer is measured against more real, polyglot repositories - an absent
 entry under-claims degradation for a real application language this list has
 not yet caught up to, but (per tier 3's own guarantee) never silently
-vanishes the file from `problems.json` entirely. Growing the list is a
+vanishes the file from `problems.json` entirely. Changing the list is a
 narrow, low-risk change (one frozenset entry plus a regression test); judged
-not to require a design amendment of its own each time reviewer-3 ratifies an
-addition.
+not to require a design amendment of its own each time a reviewer ratifies a
+change.
 
 ### Fact provenance and canonical merge
 

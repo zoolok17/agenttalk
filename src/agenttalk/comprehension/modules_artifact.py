@@ -172,10 +172,6 @@ def _producer(
     return entry
 
 
-def _display_name(qualified_name: str) -> str:
-    return qualified_name.rsplit(".", 1)[-1]
-
-
 def _parent_qualified_name(qualified_name: str, known_names: set[str]) -> str | None:
     if "." not in qualified_name:
         return None
@@ -307,7 +303,22 @@ def build_modules(
             records.append(ModuleRecord(
                 unit_id=unit_id_by_qualified_name[unit_claim.qualified_name],
                 kind="component",
-                display_name=_display_name(unit_claim.qualified_name),
+                # FIX ROUND 17b (reviewer-3's rejection of round 17, MINOR
+                # 4): this used to re-derive the display name from
+                # qualified_name via _display_name (a bare rightmost DOT
+                # segment) instead of publishing the producer's own
+                # simple_name it already carries - correct for an
+                # ordinary Java type (whose simple_name IS its qualified
+                # name's own rightmost dot segment, so behavior does not
+                # change there) but WRONG for a pom coordinate
+                # ("com.acme:shop-web"), where the rightmost dot segment
+                # lands INSIDE the colon-joined artifactId
+                # ("acme:shop-web" - neither the groupId nor the
+                # artifactId) - the CR13c simple_name carry becoming
+                # visible on a second producer. Trusting the claim's own
+                # simple_name generally is a no-op for Java types and the
+                # actual fix for coordinates.
+                display_name=unit_claim.simple_name,
                 language="java",
                 paths=[relative_path],
                 source_digests={relative_path: file_entry.content_digest},

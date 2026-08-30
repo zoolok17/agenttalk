@@ -194,6 +194,32 @@ def test_a_component_publishes_its_own_fully_qualified_name():
     assert file_record.qualified_name is None
 
 
+def test_a_pom_coordinate_component_publishes_the_artifact_id_as_display_name():
+    """FIX ROUND 17b (reviewer-3's rejection of round 17, MINOR 4): a
+    pom coordinate's own component re-derived display_name from
+    qualified_name via a bare rightmost-dot-segment split
+    ("com.acme:shop-web" -> "acme:shop-web" - neither the groupId nor
+    the artifactId) instead of publishing parse_maven_pom's own,
+    already-correct simple_name ("shop-web") - the CR13c simple_name
+    carry becoming visible on a second producer. An ordinary Java
+    type's own simple_name already agrees with the old derivation (see
+    the companion fully-qualified-name test above, unaffected), so
+    trusting the claim's own simple_name generally is a no-op there and
+    the actual fix here."""
+    pom_units, _edges, _count = java_adapter.parse_maven_pom(
+        "pom.xml",
+        "<project><groupId>com.acme</groupId><artifactId>shop-web</artifactId></project>",
+    )
+    discovery = _discovery([
+        EnumeratedFile(relative_path="pom.xml", byte_count=1, content_digest="a"),
+    ])
+    java_results = {"pom.xml": java_adapter.JavaFileResult(units=pom_units)}
+    records = ma.build_modules(discovery, java_results)
+    component = next(r for r in records if r.kind == "component")
+    assert component.qualified_name == "com.acme:shop-web"
+    assert component.display_name == "shop-web"
+
+
 def test_two_components_declaring_the_same_qualified_name_share_a_conflict_id():
     """FIX ROUND 16 (twelfth cold read, B1 BLOCKER, wrong-data): two units
     genuinely declaring the identical fully-qualified name (a real
