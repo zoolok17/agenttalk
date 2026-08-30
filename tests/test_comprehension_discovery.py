@@ -358,7 +358,18 @@ def test_enumerate_scope_reports_the_same_degraded_outcome_regardless_of_peek_or
         entries.insert(position, _FakeExcludedDirEntry(build_dir, "Real.java"))
 
         def _fake_scandir(path):
-            if Path(path) == build_dir:
+            # FIX ROUND 20 (CI-round fix - discovered while investigating a
+            # cross-platform dev-gate failure on this PR's own tip):
+            # `discovery.os` IS the process-wide `os` module - patching
+            # `scandir` here intercepts EVERY caller, not just discovery.py's
+            # own. On POSIX (never Windows - the exact reason this passed on
+            # every windows leg and failed on every linux/macos one),
+            # `shutil.rmtree` internally calls `os.scandir(topfd)` with a raw
+            # integer file descriptor while cleaning up an unrelated
+            # directory (pytest's own tmp_path teardown) - `Path(path)`
+            # unconditionally wrapped an int and raised TypeError instead of
+            # falling through to the real scandir.
+            if isinstance(path, (str, Path)) and Path(path) == build_dir:
                 return entries
             return real_scandir(path)
 
@@ -416,7 +427,9 @@ def test_enumerate_scope_a_symlink_inside_an_excluded_dir_degrades_as_truncated_
     real_scandir = discovery.os.scandir
 
     def _fake_scandir(path):
-        if Path(path) == build_dir:
+        # Same POSIX-only `shutil.rmtree(topfd=<int>)` leak documented on
+        # the sibling fixture above - never wrap a raw fd in `Path()`.
+        if isinstance(path, (str, Path)) and Path(path) == build_dir:
             return [_FakeExcludedDirEntry(build_dir, "link-to-somewhere", is_symlink=True)]
         return real_scandir(path)
 
