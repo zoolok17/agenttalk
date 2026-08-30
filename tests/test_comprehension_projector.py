@@ -202,6 +202,37 @@ def test_readiness_state_filter_also_narrows_units_f8():
     assert [u["unit_id"] for u in payload["units"]] == ["u1"]
 
 
+def test_readiness_state_filter_narrows_dependencies_features_entry_points_and_problems_too():
+    """FIX ROUND 16 (twelfth cold read, M3 MAJOR, wrong-data): the THIRD
+    instance of the same sibling-filter defect (F2, then MINOR 1 on
+    --unit) - dependencies/features/entry_points, and now problems too
+    (a FOURTH section, never narrowed by ANY filter until now, joined by
+    path/qualified_name since a problem row carries no unit_id of its
+    own), never narrowed by --readiness even though none of the four is
+    a whole_run_sections member."""
+    modules = [_unit("u1"), _unit("u2")]
+    edges = [
+        _edge("e1", "u1", resolution_state="resolved", target_unit_id="u2"),
+        _edge("e2", "u2", resolution_state="resolved", target_unit_id="u2"),
+    ]
+    features = [_feature("f1", ["u1"]), _feature("f2", ["u2"])]
+    entry_points = [_entry_point("ep1", "u1", []), _entry_point("ep2", "u2", [])]
+    summaries = [_summary("u1", "blocked"), _summary("u2", "assessed")]
+    problems = [
+        {"reason_code": "parse_failed", "path": "u1.java", "detail": "x"},
+        {"reason_code": "parse_failed", "path": "u2.java", "detail": "y"},
+        {"reason_code": "case_collision", "path": None, "detail": "z"},
+    ]
+    payload = pr.project_comprehension(**_base_kwargs(
+        modules=modules, dependencies=edges, features=features, entry_points=entry_points,
+        readiness_summaries=summaries, problems=problems, readiness_state="blocked",
+    ))
+    assert [e["edge_id"] for e in payload["dependencies"]] == ["e1"]
+    assert [f["feature_id"] for f in payload["features"]] == ["f1"]
+    assert [e["entry_point_id"] for e in payload["entry_points"]] == ["ep1"]
+    assert {p["detail"] for p in payload["problems"]} == {"x", "z"}
+
+
 def test_readiness_state_filter_rejects_an_unrecognized_state_f8():
     """FIX ROUND 12 (F8): an unrecognized --readiness value used to
     silently match nothing (empty rows, exit 0) - indistinguishable from
@@ -209,6 +240,50 @@ def test_readiness_state_filter_rejects_an_unrecognized_state_f8():
     mistake it is, against the closed vocabulary."""
     with pytest.raises(InvalidReadinessStateFilter):
         pr.project_comprehension(**_base_kwargs(readiness_state="not-a-real-state"))
+
+
+@pytest.mark.parametrize("filter_kwargs", [
+    {"unit_id": "u1"},
+    {"feature_id": "f1"},
+    {"readiness_state": "blocked"},
+])
+def test_every_filter_narrows_every_non_whole_run_section_the_same_way(filter_kwargs):
+    """FIX ROUND 16 (twelfth cold read, M3 MAJOR - the class-closer): F2,
+    MINOR 1, and now M3 were each a SEPARATE cold read discovering the
+    identical shape - one more section quietly exempt from whichever
+    filter a caller happened to test with. Parametrized across all three
+    filters against the SAME fixture (u1 in scope, u2 not) so a FUTURE
+    new filter (or a future new section) that regresses this class only
+    has to fail ONE parametrized case here, never wait for a fourth cold
+    read to notice by hand. whole_run_sections itself names the sections
+    this deliberately does not check."""
+    modules = [_unit("u1"), _unit("u2")]
+    edges = [
+        _edge("e1", "u1", resolution_state="resolved", target_unit_id="u2"),
+        _edge("e2", "u2", resolution_state="resolved", target_unit_id="u2"),
+    ]
+    features = [_feature("f1", ["u1"]), _feature("f2", ["u2"])]
+    entry_points = [
+        _entry_point("ep1", "u1", ["f1"]), _entry_point("ep2", "u2", ["f2"]),
+    ]
+    signals = [_signal("u1"), _signal("u2")]
+    summaries = [_summary("u1", "blocked"), _summary("u2", "assessed")]
+    problems = [
+        {"reason_code": "parse_failed", "path": "u1.java", "detail": "keep"},
+        {"reason_code": "parse_failed", "path": "u2.java", "detail": "drop"},
+    ]
+    payload = pr.project_comprehension(**_base_kwargs(
+        modules=modules, dependencies=edges, features=features, entry_points=entry_points,
+        readiness_signals=signals, readiness_summaries=summaries, problems=problems,
+        **filter_kwargs,
+    ))
+    assert [u["unit_id"] for u in payload["units"]] == ["u1"]
+    assert [e["edge_id"] for e in payload["dependencies"]] == ["e1"]
+    assert [f["feature_id"] for f in payload["features"]] == ["f1"]
+    assert [e["entry_point_id"] for e in payload["entry_points"]] == ["ep1"]
+    assert [s["unit_id"] for s in payload["readiness"]["signals"]] == ["u1"]
+    assert [s["unit_id"] for s in payload["readiness"]["summaries"]] == ["u1"]
+    assert [p["detail"] for p in payload["problems"]] == ["keep"]
 
 
 # ------------------------------ MAJOR 3 (sixth cold read, fix round 10):

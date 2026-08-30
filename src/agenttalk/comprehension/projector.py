@@ -234,14 +234,50 @@ def project_comprehension(
         # implies "units" IS one of the filtered ones. Same allowed-set the
         # signals/summaries above already narrow to.
         filtered_modules = [m for m in filtered_modules if m.unit_id in allowed_unit_ids]
-        # F8 (eighth cold read): --unit/--feature both narrow "units"
-        # already - --readiness never did, even though whole_run_sections
-        # (self-describing which sections stay whole-run) implies "units"
-        # IS one of the filtered ones. Same allowed-set the signals/
+        # FIX ROUND 16 (twelfth cold read, M3 MAJOR, wrong-data): the
+        # THIRD instance of the same sibling-filter defect (F2, then
+        # MINOR 1 on --unit) - dependencies/features/entry_points never
+        # narrowed by --readiness either, even though none of the three
+        # is a whole_run_sections member. Same allowed-set units/signals/
         # summaries above already narrow to.
+        filtered_dependencies = [
+            e for e in filtered_dependencies
+            if e.from_unit_id in allowed_unit_ids
+            or (e.target_unit_id is not None and e.target_unit_id in allowed_unit_ids)
+        ]
+        filtered_features = [
+            f for f in filtered_features if any(u in allowed_unit_ids for u in f.unit_ids)
+        ]
+        filtered_entry_points = [
+            e for e in filtered_entry_points if e.owning_unit_id in allowed_unit_ids
+        ]
     if unit_id is not None:
         filtered_signals = [s for s in filtered_signals if s.unit_id == unit_id]
         filtered_summaries = [s for s in filtered_summaries if s.unit_id == unit_id]
+
+    # FIX ROUND 16 (twelfth cold read, M3 MAJOR, wrong-data): problems.json
+    # rows carry no unit_id of their own (only an optional path/
+    # qualified_name) - the FOURTH sibling section, never narrowed by ANY
+    # of the three filters until now, even though "problems" is not a
+    # whole_run_sections member either. Joined against whichever units
+    # survived every OTHER active filter above (filtered_modules, by now
+    # reflecting the AND of --unit/--feature/--readiness) via the two
+    # identifying fields a problem row can carry. A problem with NEITHER
+    # field (a scan-wide refusal, attributable to no single unit) is kept
+    # in every filtered view - excluding it would be a false, silent
+    # exclusion, never a safe under-claim the way keeping it is.
+    filtered_problems = problems
+    if unit_id is not None or feature_id is not None or readiness_state is not None:
+        allowed_paths = {p for m in filtered_modules for p in m.paths}
+        allowed_qualified_names = {
+            m.qualified_name for m in filtered_modules if m.qualified_name is not None
+        }
+        filtered_problems = [
+            p for p in filtered_problems
+            if (p.get("path") is None and p.get("qualified_name") is None)
+            or p.get("path") in allowed_paths
+            or p.get("qualified_name") in allowed_qualified_names
+        ]
 
     all_feature_unit_ids = {u for f in features for u in f.unit_ids}
     units_without_feature = [m.unit_id for m in modules if m.unit_id not in all_feature_unit_ids]
@@ -259,7 +295,7 @@ def project_comprehension(
 
     units_rows, units_omitted = _bounded([m.to_json() for m in filtered_modules])
     dependency_rows, dependency_omitted = _bounded([e.to_json() for e in filtered_dependencies])
-    problem_rows, problem_omitted = _bounded(problems)
+    problem_rows, problem_omitted = _bounded(filtered_problems)
     # M10 (cold-read, PR-B fix round 3): features/entry_points/readiness
     # signals+summaries had no row cap and no truncation/omitted count at
     # all - unbounded on a large repo (the reviewer measured readiness
