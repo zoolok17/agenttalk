@@ -1190,6 +1190,24 @@ def get_report(
     # in the projection, not just the manifest (scan.json) - layered the
     # same way, straight off the already-verified loaded document.
     payload["exclusions"] = _scan_field(records["scan"], "exclusions", scan_id)
+    # FIX ROUND 20 (sixteenth cold read, m2 JUDGE, completeness): a
+    # code-bearing excluded root with no src ancestry (so F4 never
+    # degrades) and no pom-declared <module> path (so THE REACTOR RULE
+    # never fires) still stays fully silent to a report --json caller -
+    # the poison rule protects import RESOLUTION (an affected edge
+    # correctly reports unresolved rather than a confident external
+    # guess) but never surfaces WHICH directories were excluded in the
+    # first place, leaving a caller with no way to independently judge
+    # whether one of them might hold real, first-party source. Rather
+    # than widen F4's own deliberately narrow degradation (a real
+    # comprehension failure over source this run actually walked),
+    # this declares the boundary honestly: scan.json already computes
+    # and bounds excluded_roots (M4/round 6, Minor 7/round 7) - layered
+    # onto the projection the same way exclusions already is (round
+    # 11c), never recomputed here.
+    payload["excluded_roots"] = _scan_field(records["scan"], "excluded_roots", scan_id)
+    payload["excluded_roots_omitted_count"] = _scan_field(
+        records["scan"], "excluded_roots_omitted_count", scan_id)
     return payload
 
 

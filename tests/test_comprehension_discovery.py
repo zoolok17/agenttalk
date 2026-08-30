@@ -310,13 +310,16 @@ class _FakeExcludedDirEntry:
     thousands of real files, and without depending on any real
     filesystem's own (unspecified) directory-listing order."""
 
-    def __init__(self, directory: Path, name: str, *, is_dir: bool = False) -> None:
+    def __init__(
+        self, directory: Path, name: str, *, is_dir: bool = False, is_symlink: bool = False,
+    ) -> None:
         self.name = name
         self.path = str(directory / name)
         self._is_dir = is_dir
+        self._is_symlink = is_symlink
 
     def is_symlink(self) -> bool:
-        return False
+        return self._is_symlink
 
     def is_dir(self, *, follow_symlinks: bool = True) -> bool:
         return self._is_dir
@@ -394,6 +397,37 @@ def test_enumerate_scope_a_fully_explored_excluded_dir_under_the_cap_stays_silen
         p["reason_code"] == "excluded_region_peek_truncated" for p in result.problems)
     assert not any(
         p["reason_code"] == "excluded_region_contains_code" for p in result.problems)
+
+
+def test_enumerate_scope_a_symlink_inside_an_excluded_dir_degrades_as_truncated_not_silent(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 20 (sixteenth cold read, P6 MINOR, taken): the peek used
+    to silently skip a symlinked subdirectory as if it were simply
+    absent - folding "we deliberately never looked here" into the same
+    confident ``False`` a genuinely explored, code-free directory
+    returns. We do not know what the symlink points to (and never
+    follow it - that part is unchanged, still the safe choice); this
+    must now degrade the same honest, uncertain way cap-exhaustion
+    already does (``excluded_region_peek_truncated``), never stay
+    silent."""
+    build_dir = tmp_path / "src" / "build"
+    build_dir.mkdir(parents=True)
+    real_scandir = discovery.os.scandir
+
+    def _fake_scandir(path):
+        if Path(path) == build_dir:
+            return [_FakeExcludedDirEntry(build_dir, "link-to-somewhere", is_symlink=True)]
+        return real_scandir(path)
+
+    monkeypatch.setattr(discovery.os, "scandir", _fake_scandir)
+    comp_dir = _comprehension_dir(tmp_path)
+
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+
+    assert result.degraded is True
+    assert any(
+        p["reason_code"] == "excluded_region_peek_truncated" for p in result.problems)
 
 
 def test_git_as_a_regular_file_is_hard_excluded_not_enumerated(tmp_path: Path) -> None:

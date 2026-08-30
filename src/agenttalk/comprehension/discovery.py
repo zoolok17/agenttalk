@@ -217,8 +217,20 @@ def _excluded_directory_contains_a_code_bearing_file(directory: Path) -> tuple[b
     the confident "no code" problem code - the same "record the
     truncation, never just stop looking" discipline every OTHER cap in
     this module already follows (``MAX_FILESYSTEM_ENTRIES``, the
-    per-file/total-byte caps, ...)."""
+    per-file/total-byte caps, ...).
+
+    FIX ROUND 20 (sixteenth cold read, P6 MINOR, taken): a symlinked
+    subdirectory used to be silently skipped as if it were simply
+    absent - folding "we deliberately never look here" into the same
+    ``False`` a genuinely explored, code-free directory returns, exactly
+    the confident-negative-from-an-unexplored-region defect round 19b
+    already fixed for cap exhaustion above. We genuinely do not know
+    what a symlink points to; skipping it (still the right, safe choice
+    - this peek never follows symlinks) now marks the peek
+    ``truncated`` the same way running out of the entry cap does,
+    rather than silently counting as "confidently no code"."""
     visited = 0
+    symlink_skipped = False
     stack = [directory]
     while stack:
         current = stack.pop()
@@ -232,6 +244,7 @@ def _excluded_directory_contains_a_code_bearing_file(directory: Path) -> tuple[b
                 return False, True
             try:
                 if entry.is_symlink():
+                    symlink_skipped = True
                     continue
                 if entry.is_dir(follow_symlinks=False):
                     stack.append(Path(entry.path))
@@ -241,7 +254,7 @@ def _excluded_directory_contains_a_code_bearing_file(directory: Path) -> tuple[b
                     return True, False
             except OSError:
                 continue
-    return False, False
+    return False, symlink_skipped
 
 
 _SECRET_FILE_PATTERNS = (

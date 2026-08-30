@@ -3063,6 +3063,16 @@ def test_run_scan_a_vendored_reactor_module_reports_unresolved_via_the_reactor_r
     assert import_edge["resolution_state"] == "unresolved"
     assert import_edge.get("target_external") is None
 
+    # FIX ROUND 20 (sixteenth cold read, m2 JUDGE, completeness): the
+    # poison rule protects import RESOLUTION above, but a report --json
+    # caller still had no way to see WHICH directory was excluded and
+    # judge for itself whether it might hold real source - scan.json
+    # already computes and bounds this (M4/round 6); the projection now
+    # surfaces it too, the same way `exclusions` already is.
+    report = scan_pipeline.get_report(java_repo)
+    assert {"path": "vendor", "category": "generated_or_vendor"} in report["excluded_roots"]
+    assert report["excluded_roots_omitted_count"] == 0
+
 
 def test_run_scan_a_pom_declared_module_named_build_reports_unresolved_via_the_reactor_rule(
     java_repo: Path,
