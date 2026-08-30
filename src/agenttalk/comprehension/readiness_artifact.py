@@ -876,6 +876,39 @@ def build_readiness(
         unit.unit_id: _check_feature_linked(unit, feature_states_by_unit.get(unit.unit_id, []))
         for unit in modules
     }
+    # FIX ROUND 22 (eighteenth cold read, F4, wrong-data, narrow
+    # trigger): a unit carrying a conflict_id (modules_artifact.py's own
+    # duplicate-qualified-name collision tag) published CONFIDENT
+    # readiness on every signal that depends on knowing WHICH real
+    # unit's own identity/relationships are under discussion - the
+    # design's own merge rule 4 says a verbatim dependent's readiness
+    # stays unknown until an explicit declaration resolves the conflict.
+    # Compounded by round 21c's own 2+-claimant skip: a cross-file
+    # entry-point/feature reason genuinely meant for one of two
+    # identically-named claimants reaches NEITHER (deliberately, to
+    # avoid guessing which one) - so a confident no_entry_point is
+    # PROVABLY false for at least one of them. Overridden BEFORE the
+    # file-aggregation pass below runs, so a file containing a
+    # conflicted component correctly inherits the same "never MORE
+    # CONFIDENT than a component genuinely unsure of itself" unknown via
+    # the existing worse-of aggregation, not a separate special case.
+    # DECIDED (reviewer-3 ratifies the scope): applied to
+    # dependencies_resolved/entry_points_mapped/feature_linked/test_
+    # evidence_located - every signal whose OWN answer depends on this
+    # unit's identity being unambiguous. source_understood deliberately
+    # stays untouched - the adapter genuinely parsed this exact file/
+    # class; what is ambiguous is cross-file IDENTITY, not
+    # comprehension, a different fact entirely. boundaries_identified
+    # is unaffected either way (always unknown regardless, unrelated to
+    # identity).
+    for unit in modules:
+        if unit.conflict_id is None:
+            continue
+        entry_points_mapped_by_unit_id[unit.unit_id] = _signal(
+            unit.unit_id, "entry_points_mapped", "unknown", "detected",
+            "duplicate_qualified_name")
+        feature_linked_by_unit_id[unit.unit_id] = _signal(
+            unit.unit_id, "feature_linked", "unknown", "detected", "duplicate_qualified_name")
     for unit in modules:
         if unit.kind != "file":
             continue
@@ -927,12 +960,26 @@ def build_readiness(
                 is_tested = bool(tested_unit_ids & descendants)
             if not has_inferred_pairing:
                 has_inferred_pairing = bool(inferred_test_pairing_unit_ids & descendants)
+        test_evidence_signal = _check_test_evidence_located(unit, is_tested, has_inferred_pairing)
+        # FIX ROUND 22 (F4, wrong-data, narrow trigger): see the
+        # entry_points_mapped_by_unit_id/feature_linked_by_unit_id
+        # override above - dependencies_resolved/test_evidence_located
+        # get the identical conflict-driven override here, the two
+        # remaining identity-dependent signals this per-unit loop (not
+        # the precomputed dicts above) computes.
+        if unit.conflict_id is not None:
+            dependencies_signal = _signal(
+                unit.unit_id, "dependencies_resolved", "unknown", "detected",
+                "duplicate_qualified_name")
+            test_evidence_signal = _signal(
+                unit.unit_id, "test_evidence_located", "unknown", "detected",
+                "duplicate_qualified_name")
         unit_signals = [
             _check_source_understood(unit),
             dependencies_signal,
             entry_points_mapped_by_unit_id[unit.unit_id],
             feature_linked_by_unit_id[unit.unit_id],
-            _check_test_evidence_located(unit, is_tested, has_inferred_pairing),
+            test_evidence_signal,
             _check_boundaries_identified(unit),
         ]
         all_signals.extend(unit_signals)

@@ -3366,6 +3366,75 @@ def test_run_scan_a_duplicate_qualified_name_publishes_ambiguous_import_and_a_pr
     assert outcome.status == "degraded"
 
 
+def test_a_conflicted_units_readiness_signals_stay_unknown_not_confident(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 22 (eighteenth cold read, F4, wrong-data, narrow
+    trigger): the reader's own .cr18-dup shape - a unit carrying a
+    conflict_id (a genuine duplicate-qualified-name collision) used to
+    publish CONFIDENT readiness on every signal, even though the
+    design's own merge rule 4 says a verbatim dependent's readiness
+    stays unknown until the conflict is explicitly resolved, and
+    round 21c's own 2+-claimant skip means neither claimant ever
+    receives this run's own real entry-point/feature facts either. Both
+    colliding units now report unknown/duplicate_qualified_name on
+    dependencies_resolved/entry_points_mapped/feature_linked/test_
+    evidence_located - the conflict problem itself is still recorded
+    (unchanged), and a non-conflicted twin class in the SAME run stays
+    fully confident (this override is scoped to conflicted units only)."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "app").mkdir(parents=True)
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "app" / "Boot.java").write_text(
+        "package com.acme.app;\nimport com.acme.Config;\nclass Boot {}\n", encoding="utf-8")
+    (java_repo / "modA" / "src" / "main" / "java" / "com" / "acme").mkdir(parents=True)
+    (java_repo / "modA" / "src" / "main" / "java" / "com" / "acme" / "Config.java").write_text(
+        "package com.acme;\nclass Config {}\n", encoding="utf-8")
+    (java_repo / "modB" / "src" / "main" / "java" / "com" / "acme").mkdir(parents=True)
+    (java_repo / "modB" / "src" / "main" / "java" / "com" / "acme" / "Config.java").write_text(
+        "package com.acme;\nclass Config {}\n", encoding="utf-8")
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "other").mkdir(parents=True)
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "other" / "Plain.java").write_text(
+        "package com.acme.other;\nclass Plain {}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+
+    conflict_checks = (
+        "dependencies_resolved", "entry_points_mapped", "feature_linked",
+        "test_evidence_located",
+    )
+    config_unit_ids = [
+        u["unit_id"] for u in modules_doc["units"]
+        if u.get("qualified_name") == "com.acme.Config"]
+    assert len(config_unit_ids) == 2
+    for unit_id in config_unit_ids:
+        for check in conflict_checks:
+            signal = next(
+                s for s in readiness_doc["signals"]
+                if s["unit_id"] == unit_id and s["check"] == check)
+            assert signal["stored_status"] == "unknown", (unit_id, check)
+            assert signal["reason_code"] == "duplicate_qualified_name", (unit_id, check)
+        source_signal = next(
+            s for s in readiness_doc["signals"]
+            if s["unit_id"] == unit_id and s["check"] == "source_understood")
+        assert source_signal["reason_code"] != "duplicate_qualified_name"
+
+    # The conflict problem itself is still recorded, unaffected.
+    assert any(p["reason_code"] == "duplicate_qualified_name" for p in problems_doc["problems"])
+
+    # A non-conflicted twin class in the SAME run stays fully confident.
+    plain_unit_id = next(
+        u["unit_id"] for u in modules_doc["units"]
+        if u["kind"] == "component" and u["display_name"] == "Plain")
+    plain_dependencies_signal = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == plain_unit_id and s["check"] == "dependencies_resolved")
+    assert plain_dependencies_signal["reason_code"] != "duplicate_qualified_name"
+
+
 def test_run_scan_an_import_of_a_binary_sniffed_excluded_file_is_unresolved_not_external(
     java_repo: Path,
 ) -> None:
