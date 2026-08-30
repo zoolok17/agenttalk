@@ -148,6 +148,81 @@ def _is_inside_a_recognized_source_root(relative_path: str) -> bool:
     return bool(_RECOGNIZED_SOURCE_ROOT_SEGMENT_RE.search(relative_path))
 
 
+#: FIX ROUND 19 (fifteenth cold read, F4 MAJOR, wrong-data): the round-18
+#: Ant-layout residual (a bare ``src/`` root, never recognized by
+#: ``_RECOGNIZED_SOURCE_ROOT_SEGMENT_RE`` above since it has no ``main``/
+#: ``test`` scaffolding) is measured WIDER than accepted - a DOMAIN
+#: package literally named ``vendor``/``out``/etc under such a root is
+#: deleted from the inventory as ``generated_or_vendor`` on a COMPLETE
+#: run, asserting a factually wrong category about real, hand-written
+#: code. Generalizes round 18's own F6 standard (a binary-sniffed file
+#: whose extension is code-bearing degrades the run) to the DIRECTORY
+#: exclusion case: kept in sync by hand with worker.py's own
+#: ``_ADAPTER_EXTENSIONS``/``_DEGRADING_CODE_EXTENSIONS`` (discovery.py
+#: cannot import worker.py - worker.py already imports discovery.py,
+#: and this module owns filesystem access exclusively) - see that
+#: module's own criterion comment before adding a new one here.
+_DEGRADABLE_EXCLUDED_EXTENSIONS = frozenset({
+    ".java",
+    ".jsp", ".jspx", ".jspf", ".tag", ".sql", ".groovy", ".kt", ".scala", ".xhtml", ".ftl", ".vm",
+    ".cs", ".php", ".rb", ".go", ".pks", ".pkb", ".xsl",
+})
+#: A genuine build-output position (repo/module-root ``target``/
+#: ``build``/``dist``/etc, the classic contents of which ARE generated
+#: `.java`/`.class`/`.jar`) has NO ``src`` segment anywhere in its own
+#: path - a blanket degrading rule there would degrade every ordinary
+#: Maven/Gradle repo (the exact regression round 16b's own B4
+#: calibration measurement already fixed once for the analogous tier-2
+#: rule). An excluded region nested under a literal ``src`` segment that
+#: was NOT carved out as a recognized source root (the Ant case) is a
+#: different position entirely - real, hand-authored source trees are
+#: the ONLY thing that legitimately lives under a bare ``src/``.
+_MAX_EXCLUDED_DIRECTORY_PEEK_ENTRIES = 5_000
+
+
+def _sits_under_an_uncarved_src_segment(relative_path: str) -> bool:
+    return "src" in relative_path.split("/")
+
+
+def _excluded_directory_contains_a_code_bearing_file(directory: Path) -> bool:
+    """A BOUNDED peek inside a directory this run is about to exclude
+    outright as ``generated_or_vendor`` - never added to ``files``,
+    never hashed, just a cheap extension check so an excluded region
+    that swallows real, hand-written code can be told apart from an
+    ordinary build-output tree (a real ``target/``/``build/`` full of
+    compiled ``.class``/``.jar`` output stays silent, unaffected).
+    Never follows a symlink (this walk exists purely to answer a yes/no
+    extension question, never to enumerate or hash content - skipping
+    is the safe, conservative choice, not a correctness requirement).
+    Short-circuits on the FIRST match; bounded by a hard entry-count cap
+    (PROVISIONAL, like every other cap in this module) against a
+    pathologically large excluded subtree."""
+    visited = 0
+    stack = [directory]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            continue
+        for entry in entries:
+            visited += 1
+            if visited > _MAX_EXCLUDED_DIRECTORY_PEEK_ENTRIES:
+                return False
+            try:
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(Path(entry.path))
+                elif entry.is_file(follow_symlinks=False) and entry.name.lower().endswith(
+                    tuple(_DEGRADABLE_EXCLUDED_EXTENSIONS),
+                ):
+                    return True
+            except OSError:
+                continue
+    return False
+
+
 _SECRET_FILE_PATTERNS = (
     ".env", ".env.*", "*.pem", "*.pfx", "*.p12", "*.ppk",
     "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
@@ -592,6 +667,27 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                 category = _exclusion_category(entry.name, relative, is_dir=True)
                 if category is not None:
                     _record_exclusion(category, relative)
+                    # FIX ROUND 19 (fifteenth cold read, F4 MAJOR, wrong-
+                    # data): a generated/vendor-NAMED directory that
+                    # sits under an uncarved bare `src/` root (the Ant
+                    # residual round 18 accepted, then measured wider
+                    # than accepted) can swallow real, hand-written
+                    # code - never a real build-output tree, which has
+                    # no `src` segment in its own path at all and stays
+                    # silent, unaffected.
+                    if category == "generated_or_vendor" and _sits_under_an_uncarved_src_segment(
+                        relative,
+                    ) and _excluded_directory_contains_a_code_bearing_file(entry):
+                        degraded = True
+                        problems.append({
+                            "reason_code": "excluded_region_contains_code",
+                            "path": relative,
+                            "detail": "a generated/vendor-named directory nested under an "
+                                      "unrecognized bare src/ root contains at least one "
+                                      "adapter-handled or tier-2 code-bearing file - excluded "
+                                      "from the inventory as if it were build output, but this "
+                                      "content is genuinely unread code",
+                        })
                     continue
                 if relative in submodule_boundaries:
                     boundaries.append(

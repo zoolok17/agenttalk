@@ -189,6 +189,11 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     # the same "warning" bucket every other missing-evidence reason
     # already gets.
     "binary_excluded_code_bearing_file": "warning",
+    # FIX ROUND 19 (fifteenth cold read, F4 MAJOR, wrong-data): a
+    # generated/vendor-named directory nested under an uncarved bare
+    # src/ root that swallows real code (discovery.py) - the same
+    # "warning" bucket every other missing-evidence reason already gets.
+    "excluded_region_contains_code": "warning",
 }
 _DEFAULT_PROBLEM_SEVERITY = "warning"
 

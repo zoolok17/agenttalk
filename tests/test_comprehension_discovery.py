@@ -190,6 +190,82 @@ def test_enumerate_scope_does_not_recognize_a_bare_ant_style_java_root(
     )
 
 
+def test_enumerate_scope_degrades_an_ant_style_vendor_dir_that_contains_real_code(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 19 (fifteenth cold read, F4 MAJOR, wrong-data): a bare
+    ``src/`` root (Ant/Eclipse convention, never recognized as a source
+    root - no ``main``/``test`` scaffolding) has a DOMAIN package
+    literally named ``vendor`` excluded as ``generated_or_vendor`` on a
+    run that would otherwise report complete - factually wrong, since
+    the directory holds real, hand-written ``.java`` source. Must
+    degrade the run with a named problem, the same standard round 18's
+    own F6 already established for a single binary-sniffed file."""
+    vendor_dir = tmp_path / "src" / "vendor"
+    vendor_dir.mkdir(parents=True)
+    (vendor_dir / "Helper.java").write_text("package vendor;\nclass Helper {}\n", encoding="utf-8")
+    comp_dir = _comprehension_dir(tmp_path)
+
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+
+    assert not any(f.relative_path.endswith("Helper.java") for f in result.files)
+    assert any(
+        e["category"] == "generated_or_vendor" and e["path"] == "src/vendor"
+        for e in result.excluded_roots
+    )
+    assert result.degraded is True
+    assert any(p["reason_code"] == "excluded_region_contains_code" for p in result.problems)
+
+
+def test_enumerate_scope_a_real_repo_root_build_output_dir_stays_silent(
+    tmp_path: Path,
+) -> None:
+    """Companion negative case - a genuine build-output directory at
+    repo root (no ``src`` segment anywhere in its own path at all) must
+    stay silent even when it happens to contain a code-bearing
+    extension - a target/ full of annotation-processor-GENERATED
+    .java is the classic, ordinary Maven case; a blanket degrading rule
+    would re-degrade every normal Maven repo, the exact regression
+    round 16b's own B4 calibration already fixed once for tier 2."""
+    target_dir = tmp_path / "target" / "generated-sources"
+    target_dir.mkdir(parents=True)
+    (target_dir / "Generated.java").write_text("package p;\nclass Generated {}\n", encoding="utf-8")
+    comp_dir = _comprehension_dir(tmp_path)
+
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+
+    assert not any(f.relative_path.endswith("Generated.java") for f in result.files)
+    assert any(
+        e["category"] == "generated_or_vendor" and e["path"] == "target"
+        for e in result.excluded_roots
+    )
+    assert result.degraded is False
+    assert not any(p["reason_code"] == "excluded_region_contains_code" for p in result.problems)
+
+
+def test_enumerate_scope_an_ant_style_build_dir_with_only_binaries_stays_silent(
+    tmp_path: Path,
+) -> None:
+    """Companion negative case - a bare src/ root's own ``build``
+    directory containing only compiled ``.class`` output (no adapter-
+    handled or tier-2 extension at all) stays silent - the boundary
+    rule requires BOTH conditions (an uncarved src/ ancestor AND a real
+    code-bearing extension inside), never just one."""
+    build_dir = tmp_path / "src" / "build"
+    build_dir.mkdir(parents=True)
+    (build_dir / "Helper.class").write_bytes(b"\xca\xfe\xba\xbe")
+    comp_dir = _comprehension_dir(tmp_path)
+
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+
+    assert any(
+        e["category"] == "generated_or_vendor" and e["path"] == "src/build"
+        for e in result.excluded_roots
+    )
+    assert result.degraded is False
+    assert not any(p["reason_code"] == "excluded_region_contains_code" for p in result.problems)
+
+
 def test_git_as_a_regular_file_is_hard_excluded_not_enumerated(tmp_path: Path) -> None:
     """M2 (sixth cold read, fix round 10): a git WORKTREE or submodule
     checkout stores `.git` as a REGULAR FILE (a `gitdir: ...` pointer),
