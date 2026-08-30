@@ -62,6 +62,26 @@ POLICY_ID = "agenttalk.comprehension.readiness.default_policy"
 #: matching nothing.
 ASSESSMENT_STATES = ("assessed", "needs_evidence", "blocked", "not_applicable")
 
+#: FIX ROUND 16 (twelfth cold read, N2 MINOR): CR10-11's own finding
+#: (``assessment_state`` is currently a CONSTANT - ``needs_evidence`` -
+#: for every unit this slice, since ``boundaries_identified`` has no
+#: producer yet and is unconditionally ``unknown``) lived only in this
+#: module's own docstring and in two test docstrings - a reader of
+#: readiness.json alone (or the projection) had no way to discover it
+#: without already knowing to check the source. Published as a real
+#: field (``scan_pipeline.py`` writes it onto readiness.json) rather
+#: than left implicit, the same "declare the honest gap, don't bury it"
+#: discipline ``freshness``'s own ``not_evaluated``/named-reason-code
+#: shape already follows.
+ASSESSMENT_STATE_CAVEAT = (
+    "assessment_state is currently a constant (needs_evidence) for every "
+    "unit this slice - boundaries_identified has no producer yet (the "
+    "data/configuration relations item 3 names as explicit coverage "
+    "gaps) and is unconditionally unknown, non-blocker severity, so no "
+    "unit can roll up to assessed or not_applicable until a later slice "
+    "adds that producer."
+)
+
 CHECKS = (
     "source_understood",
     "dependencies_resolved",

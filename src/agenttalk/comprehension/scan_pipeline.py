@@ -530,6 +530,10 @@ def run_scan(
                 scan_id=scan_id, generated_at=generated_at),
             "signals": [s.to_json() for s in readiness_signals],
             "summaries": [s.to_json() for s in readiness_summaries],
+            # FIX ROUND 16 (twelfth cold read, N2 MINOR): declared here,
+            # not just in readiness_artifact.py's own module docstring -
+            # see ASSESSMENT_STATE_CAVEAT.
+            "assessment_state_caveat": readiness_artifact.ASSESSMENT_STATE_CAVEAT,
         }
         problems_doc = {
             **_envelope(

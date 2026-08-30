@@ -2206,6 +2206,21 @@ def test_run_scan_refuses_and_publishes_no_run_when_a_ceiling_is_exceeded(
 
 # ----------------------------------------------------------- FIX ROUND 16 (twelfth cold read)
 
+def test_readiness_json_declares_the_assessment_state_caveat(java_repo: Path) -> None:
+    """FIX ROUND 16 (twelfth cold read, N2 MINOR): CR10-11's own finding
+    (assessment_state is currently a CONSTANT - needs_evidence - for
+    every unit this slice) lived only in readiness_artifact.py's own
+    module docstring and two test docstrings - a reader of readiness.json
+    alone had no way to discover it. Published as a real field now."""
+    import json
+
+    from agenttalk.comprehension import readiness_artifact
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    assert readiness_doc["assessment_state_caveat"] == readiness_artifact.ASSESSMENT_STATE_CAVEAT
+
+
 def test_run_scan_a_duplicate_qualified_name_publishes_ambiguous_import_and_a_problem(
     java_repo: Path,
 ) -> None:
