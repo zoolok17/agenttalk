@@ -2637,6 +2637,193 @@ public class OrdersAuthFilter implements Filter {
     assert "servlet_name_scoped_filter" in matching[0].detail
 
 
+# --------------------------------------------------- round 23 F1/F2 (web.xml/pom attribute tolerance + XML decode)
+
+def test_web_xml_structural_tag_matrix_tolerates_attributes_prefixes_and_whitespace():
+    """FIX ROUND 23 (nineteenth cold read, F1 BLOCKER, wrong-data): every
+    structural web.xml regex anchored on the BARE literal tag - a legal
+    <servlet id="...">, a namespace-prefixed <j:servlet-mapping>, or
+    whitespace/newlines inside the tag (<servlet\\n id="x">) matched
+    NOTHING, so the whole descriptor published nothing at all - the
+    DEFAULT OUTPUT shape of IBM RAD/WSAD tooling (an id attribute on
+    every structural element), exactly the WebSphere-era estate this
+    scanner targets. c1/c8 are bare-tag controls that already worked;
+    c2-c7 each isolate one tolerance gap."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>c1</servlet-name>
+    <servlet-class>com.C1</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>c1</servlet-name>
+    <url-pattern>/c1</url-pattern>
+  </servlet-mapping>
+  <servlet id="Servlet_2">
+    <servlet-name>c2</servlet-name>
+    <servlet-class>com.C2</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>c2</servlet-name>
+    <url-pattern>/c2</url-pattern>
+  </servlet-mapping>
+  <j:servlet-mapping>
+    <servlet-name>c3</servlet-name>
+    <url-pattern>/c3</url-pattern>
+  </j:servlet-mapping>
+  <servlet
+      id="Servlet_7">
+    <servlet-name>c7</servlet-name>
+    <servlet-class>com.C7</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>c7</servlet-name>
+    <url-pattern>/c7</url-pattern>
+  </servlet-mapping>
+  <filter id="Filter_1">
+    <filter-name>c6</filter-name>
+    <filter-class>com.C6Filter</filter-class>
+  </filter>
+  <filter-mapping>
+    <filter-name>c6</filter-name>
+    <url-pattern>/c6</url-pattern>
+  </filter-mapping>
+  <listener id="Listener_1">
+    <listener-class>com.C6Listener</listener-class>
+  </listener>
+  <servlet-mapping >
+    <servlet-name>c8</servlet-name>
+    <url-pattern>/c8</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern["/c1"] == "com.C1"
+    assert routes_by_pattern["/c2"] == "com.C2"
+    assert routes_by_pattern["/c3"] == "WEB-INF/web.xml#c3"
+    assert routes_by_pattern["/c7"] == "com.C7"
+    assert routes_by_pattern["/c6"] == "com.C6Filter"
+    assert routes_by_pattern["/c8"] == "WEB-INF/web.xml#c8"
+    listener_problems = [
+        p for p in problems
+        if p.reason_code == "unsupported_entry_point_shape" and p.qualified_name == "com.C6Listener"
+    ]
+    assert len(listener_problems) == 1
+
+
+def test_web_xml_attribute_bearing_servlet_filter_and_listener_end_to_end():
+    """FIX ROUND 23 (F1 BLOCKER): the reader's own .cr19-webxmlattr
+    shape - a servlet, a filter, and a listener, each with an id
+    attribute on its own structural tag, all published/enrolled in the
+    SAME run."""
+    web_xml = """<web-app>
+  <servlet id="s1">
+    <servlet-name>admin</servlet-name>
+    <servlet-class>com.acme.AdminServlet</servlet-class>
+  </servlet>
+  <servlet-mapping id="m1">
+    <servlet-name>admin</servlet-name>
+    <url-pattern>/admin/*</url-pattern>
+  </servlet-mapping>
+  <filter id="f1">
+    <filter-name>auth</filter-name>
+    <filter-class>com.acme.AuthFilter</filter-class>
+  </filter>
+  <filter-mapping id="fm1">
+    <filter-name>auth</filter-name>
+    <url-pattern>/*</url-pattern>
+  </filter-mapping>
+  <listener id="l1">
+    <listener-class>com.acme.AppListener</listener-class>
+  </listener>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: (e.qualified_name, e.kind) for e in entry_points}
+    assert routes_by_pattern["/admin/*"] == ("com.acme.AdminServlet", "http_route")
+    assert routes_by_pattern["/*"] == ("com.acme.AuthFilter", "http_filter")
+    assert any(
+        p.reason_code == "unsupported_entry_point_shape"
+        and p.qualified_name == "com.acme.AppListener"
+        for p in problems
+    )
+
+
+def test_parse_maven_pom_dependency_with_an_attribute_on_its_own_tag():
+    """FIX ROUND 23 (F1 BLOCKER): the reader's own .cr19-pomattr shape -
+    _DEPENDENCY_BLOCK_RE had the identical bare-tag anchor as web.xml's
+    own regexes; a <dependency id="x"> silently dropped the entire
+    dependency."""
+    pom = """<project>
+  <dependencies>
+    <dependency id="x">
+      <groupId>org.springframework</groupId>
+      <artifactId>spring-core</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.springframework:spring-core"}
+
+
+def test_web_xml_url_pattern_cdata_and_entity_decoding():
+    """FIX ROUND 23 (F1(d) + F2 MAJOR, wrong-data): a CDATA-wrapped
+    <url-pattern> published nothing at all (F1(d)); an XML entity
+    reference (&#47;, &amp;) published VERBATIM as the literal escape
+    sequence instead of the character it names (F2) - a real route
+    /c5/x published as the false string /c5&#47;x. Both now decode to
+    the real value; the reader's own .cr19-xml shape
+    (&#47;admin&amp;danger -> /admin&danger) and the &#10; composition
+    with the EXISTING control-char sanitizer (must come out escaped,
+    never a raw embedded newline)."""
+    web_xml = """<web-app>
+  <servlet-mapping>
+    <servlet-name>s4</servlet-name>
+    <url-pattern><![CDATA[/c4]]></url-pattern>
+  </servlet-mapping>
+  <servlet-mapping>
+    <servlet-name>s5</servlet-name>
+    <url-pattern>/c5&#47;x</url-pattern>
+  </servlet-mapping>
+  <servlet-mapping>
+    <servlet-name>sxml</servlet-name>
+    <url-pattern>&#47;admin&amp;danger</url-pattern>
+  </servlet-mapping>
+  <servlet-mapping>
+    <servlet-name>snl</servlet-name>
+    <url-pattern>/nl&#10;end</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    names = {e.name for e in entry_points}
+    assert "/c4" in names
+    assert "/c5/x" in names
+    assert "/admin&danger" in names
+    assert "/nl\\nend" in names
+    assert not any("\n" in e.name for e in entry_points)
+    assert problems == []
+
+
+def test_web_xml_url_pattern_with_an_undefined_entity_is_unrecoverable():
+    """FIX ROUND 23 (F2 MAJOR): an entity reference this producer has no
+    general-entity table for (a custom DTD-declared entity) must never
+    publish a guessed or partially-decoded value - routed to the
+    existing route_value_unrecoverable honesty instead."""
+    web_xml = """<web-app>
+  <servlet-mapping>
+    <servlet-name>sbad</servlet-name>
+    <url-pattern>/bad&undefined;end</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert entry_points == []
+    matching = [p for p in problems if p.reason_code == "route_value_unrecoverable"]
+    assert len(matching) == 1
+
+
 def test_jax_rs_path_composes_class_and_method_level_like_spring_request_mapping():
     """FIX ROUND 17 (CR13-3 MAJOR, part (a)): JAX-RS's own @Path composes
     EXACTLY like a plain @RequestMapping already does - a class-level

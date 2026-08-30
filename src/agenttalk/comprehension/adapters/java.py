@@ -2830,6 +2830,100 @@ def sniff_xml_root_element(text: str) -> str | None:
     return match.group(2) if match.group(2) is not None else match.group(1)
 
 
+#: FIX ROUND 23 (nineteenth cold read, F1 BLOCKER, wrong-data): every
+#: STRUCTURAL child-element regex in this file (web.xml's own
+#: ``<servlet>``/``<servlet-mapping>``/``<filter>``/``<filter-mapping>``/
+#: ``<listener>``, pom.xml's own ``<dependency>``) anchored on the BARE
+#: literal tag - a legal ``<servlet id="...">``, a namespace-prefixed
+#: ``<j:servlet-mapping>``, or whitespace/newlines inside the tag
+#: (``<servlet\n id="x">``) matched NOTHING, so the entire descriptor
+#: published nothing at all: no entry points, no enrolled-gap problems
+#: (every enrolled-gap path lives INSIDE these same block loops), a
+#: run reporting complete/0 problems, and readiness publishing the
+#: confident ``no_entry_point`` negative - on the DEFAULT OUTPUT shape
+#: of IBM RAD/WSAD tooling (an ``id`` attribute on every structural
+#: element), i.e. exactly the WebSphere-era estate this scanner
+#: targets. ``_XML_ROOT_ELEMENT_RE`` above already tolerates exactly
+#: this (attributes, a namespace prefix) for the ROOT element alone -
+#: this reuses the identical tolerance as ONE shared block-pattern
+#: builder for every structural child tag pair instead of re-deriving
+#: it once per tag name (and inevitably missing one, the same class of
+#: gap this round exists to close).
+#:
+#: The lookahead (``(?=[\s/>])``) requires the EXACT tag name boundary
+#: right after the local name - without it, ``servlet`` would also
+#: match as a prefix of ``servlet-mapping`` (a real, different element)
+#: since both start with the same six letters.
+def _structural_block_pattern(tag: str) -> re.Pattern[str]:
+    escaped = re.escape(tag)
+    return re.compile(
+        rf"<(?:[A-Za-z_][\w.-]*:)?{escaped}(?=[\s/>])[^>]*>(.*?)"
+        rf"</(?:[A-Za-z_][\w.-]*:)?{escaped}\s*>",
+        re.DOTALL,
+    )
+
+
+#: FIX ROUND 23 (nineteenth cold read, F1(d) + F2, wrong-data): a
+#: published route name is XML TEXT CONTENT, which this producer used
+#: to publish completely raw - a CDATA-wrapped value
+#: (``<url-pattern><![CDATA[/c4]]></url-pattern>``) matched nothing at
+#: all (the CDATA markers themselves are not text, F1(d)); an entity
+#: reference (``&#47;``, ``&amp;``) published VERBATIM as the literal
+#: escape sequence rather than the character it names - a real route
+#: ``/c5/x`` published as the false string ``/c5&#47;x`` (F2), the
+#: same "a published name must be the REAL value, not its own source
+#: spelling" class as round 20's own P1 and round 22's own F6.
+#:
+#: CDATA content is XML-spec LITERAL - entities are never expanded
+#: inside a CDATA section, so it is unwrapped and returned immediately,
+#: never entity-decoded. Otherwise, every numeric character reference
+#: (``&#NN;``/``&#xHH;``) and the five PREDEFINED XML entities
+#: (``&amp;``/``&lt;``/``&gt;``/``&quot;``/``&apos;``) are decoded to
+#: the real character. An UNDEFINED entity reference (anything else
+#: shaped like ``&name;`` - a DTD-declared custom entity this producer
+#: has no general-entity table for) returns ``None`` - the caller must
+#: treat the whole value as UNRECOVERABLE (the existing ``route_value_
+#: unrecoverable`` honesty, never a guessed or partially-decoded
+#: value) rather than publish a name it cannot prove is real. A
+#: decoded control/bidi character then flows through the EXISTING
+#: ``_sanitize_route_name_control_chars`` choke point unchanged - this
+#: function only recovers the real text, sanitization is a separate,
+#: already-established later step.
+_CDATA_WRAPPED_RE = re.compile(r"\A\s*<!\[CDATA\[(.*?)\]\]>\s*\Z", re.DOTALL)
+_XML_ENTITY_REF_RE = re.compile(r"&#(\d+);|&#[xX]([0-9A-Fa-f]+);|&([A-Za-z][A-Za-z0-9]*);")
+_XML_PREDEFINED_ENTITIES = {"amp": "&", "lt": "<", "gt": ">", "quot": '"', "apos": "'"}
+
+
+def _decode_xml_text(raw: str) -> str | None:
+    cdata_match = _CDATA_WRAPPED_RE.match(raw)
+    if cdata_match is not None:
+        return cdata_match.group(1)
+    if "&" not in raw:
+        return raw
+    out = []
+    pos = 0
+    for match in _XML_ENTITY_REF_RE.finditer(raw):
+        out.append(raw[pos:match.start()])
+        decimal, hexadecimal, named = match.group(1), match.group(2), match.group(3)
+        if decimal is not None:
+            codepoint = int(decimal)
+        elif hexadecimal is not None:
+            codepoint = int(hexadecimal, 16)
+        else:
+            if named not in _XML_PREDEFINED_ENTITIES:
+                return None
+            out.append(_XML_PREDEFINED_ENTITIES[named])
+            pos = match.end()
+            continue
+        try:
+            out.append(chr(codepoint))
+        except (ValueError, OverflowError):
+            return None
+        pos = match.end()
+    out.append(raw[pos:])
+    return "".join(out)
+
+
 #: M3 (fourth cold read, fix round 6): captures the WHOLE dependency
 #: block rather than anchoring on groupId immediately followed by
 #: artifactId - <optional>/<scope> (and <version>, ignored) can appear in
@@ -2837,7 +2931,7 @@ def sniff_xml_root_element(text: str) -> str | None:
 #: the Spring route annotations already handle (M8, round 3). Non-greedy
 #: so it stops at THIS dependency's own closing tag, never spanning into
 #: a sibling <dependency> block.
-_DEPENDENCY_BLOCK_RE = re.compile(r"<dependency>(.*?)</dependency>", re.DOTALL)
+_DEPENDENCY_BLOCK_RE = _structural_block_pattern("dependency")
 _DEPENDENCY_GROUP_ID_RE = re.compile(r"<groupId>\s*([^<]+?)\s*</groupId>")
 _DEPENDENCY_ARTIFACT_ID_RE = re.compile(r"<artifactId>\s*([^<]+?)\s*</artifactId>")
 #: Maven's own boolean spelling - never assumed False for anything but a
@@ -3177,16 +3271,22 @@ def parse_maven_pom(
 #: once and EVERY url-pattern inside it - the same "recover every
 #: array element, don't stop at the first" shape round 10's M1 already
 #: applied to Spring route arrays.
-_SERVLET_MAPPING_BLOCK_RE = re.compile(r"<servlet-mapping>(.*?)</servlet-mapping>", re.DOTALL)
+_SERVLET_MAPPING_BLOCK_RE = _structural_block_pattern("servlet-mapping")
 _SERVLET_MAPPING_NAME_RE = re.compile(r"<servlet-name>([^<]+)</servlet-name>")
-_SERVLET_MAPPING_URL_PATTERN_RE = re.compile(r"<url-pattern>([^<]+)</url-pattern>")
+#: FIX ROUND 23 (nineteenth cold read, F1(d), wrong-data): widened from
+#: ``[^<]+`` (DOTALL OFF) to ``.*?`` (DOTALL ON) so a CDATA-wrapped
+#: value (``<url-pattern><![CDATA[/c4]]></url-pattern>``) is captured
+#: at all instead of matching nothing - see ``_decode_xml_text`` below,
+#: which unwraps the CDATA section (and separately decodes entities,
+#: F2) from whatever this captures.
+_SERVLET_MAPPING_URL_PATTERN_RE = re.compile(r"<url-pattern>(.*?)</url-pattern>", re.DOTALL)
 #: FIX ROUND 17 (thirteenth cold read, CR13-2 MAJOR, wrong-data): the
 #: OTHER half of a web.xml's servlet declaration - <servlet-name>/
 #: <servlet-class> pairs, joined below against <servlet-mapping>'s own
 #: servlet-name to recover the REAL implementing class a mapped route
 #: actually serves. An exact tag match (never confused with
 #: <servlet-mapping>, a different closing tag entirely).
-_SERVLET_BLOCK_RE = re.compile(r"<servlet>(.*?)</servlet>", re.DOTALL)
+_SERVLET_BLOCK_RE = _structural_block_pattern("servlet")
 _SERVLET_CLASS_RE = re.compile(r"<servlet-class>\s*([^<]+?)\s*</servlet-class>")
 #: FIX ROUND 22 (eighteenth cold read, F3 MAJOR, wrong-data): a
 #: ``<servlet>`` carrying ``<load-on-startup>`` but no ``<servlet-
@@ -3242,10 +3342,10 @@ def _servlet_class_by_name(sanitized: str) -> dict[str, str]:
 #: the annotation-vs-XML pair the reviewer named. Modeled the same way
 #: below, joined against ``<filter-mapping>`` the same way
 #: ``_servlet_class_by_name`` already joins servlet mappings.
-_FILTER_BLOCK_RE = re.compile(r"<filter>(.*?)</filter>", re.DOTALL)
+_FILTER_BLOCK_RE = _structural_block_pattern("filter")
 _FILTER_NAME_RE = re.compile(r"<filter-name>([^<]+)</filter-name>")
 _FILTER_CLASS_RE = re.compile(r"<filter-class>\s*([^<]+?)\s*</filter-class>")
-_FILTER_MAPPING_BLOCK_RE = re.compile(r"<filter-mapping>(.*?)</filter-mapping>", re.DOTALL)
+_FILTER_MAPPING_BLOCK_RE = _structural_block_pattern("filter-mapping")
 #: A ``<listener>`` element names its own implementing class directly -
 #: no separate mapping/name indirection at all (a listener has no URL
 #: pattern of its own; it is a lifecycle callback, registered wholesale).
@@ -3253,7 +3353,7 @@ _FILTER_MAPPING_BLOCK_RE = re.compile(r"<filter-mapping>(.*?)</filter-mapping>",
 #: there is no url-pattern here to compose a real route/filter target
 #: from, so there is nothing this producer's declared-only bar would
 #: let it publish beyond the bare fact that a listener exists.
-_LISTENER_BLOCK_RE = re.compile(r"<listener>(.*?)</listener>", re.DOTALL)
+_LISTENER_BLOCK_RE = _structural_block_pattern("listener")
 _LISTENER_CLASS_RE = re.compile(r"<listener-class>\s*([^<]+?)\s*</listener-class>")
 
 
@@ -3339,8 +3439,25 @@ def parse_web_xml(
             # CR9-6 (ninth cold read, judged, completeness): same per-field
             # bounding discipline as the pom producer above and every Java
             # route target - a url-pattern published verbatim, unbounded.
-            url_pattern = _bounded_route_target(pattern_match.group(1).strip())
             absolute_offset = block_match.start(1) + pattern_match.start()
+            # FIX ROUND 23 (F1(d) + F2): decode the CDATA/entity-escaped
+            # XML text content before publication - see
+            # _decode_xml_text's own docstring. An undefined entity
+            # reference is unrecoverable, the same honesty the
+            # annotation-route path already uses for a value it cannot
+            # prove is real.
+            decoded = _decode_xml_text(pattern_match.group(1))
+            if decoded is None:
+                problems.append(JavaAdapterProblem(
+                    reason_code="route_value_unrecoverable",
+                    detail=f"a <url-pattern> declared at line "
+                           f"{_line_at(newline_offsets, absolute_offset)} contains an "
+                           "undefined XML entity reference - suppressed rather than "
+                           "published with a guessed or partial value",
+                    qualified_name=owner_qualified_name,
+                ))
+                continue
+            url_pattern = _bounded_route_target(decoded.strip())
             entry_points.append(JavaEntryPointClaim(
                 qualified_name=owner_qualified_name, kind="http_route",
                 name=url_pattern, line=_line_at(newline_offsets, absolute_offset),
@@ -3409,8 +3526,22 @@ def parse_web_xml(
             ))
             continue
         for pattern_match in url_pattern_matches:
-            url_pattern = _bounded_route_target(pattern_match.group(1).strip())
             absolute_offset = block_match.start(1) + pattern_match.start()
+            # FIX ROUND 23 (F1(d) + F2): see the servlet-mapping loop's
+            # own identical comment above - the same decode-or-
+            # unrecoverable choke point applies here too.
+            decoded = _decode_xml_text(pattern_match.group(1))
+            if decoded is None:
+                problems.append(JavaAdapterProblem(
+                    reason_code="route_value_unrecoverable",
+                    detail=f"a <url-pattern> declared at line "
+                           f"{_line_at(newline_offsets, absolute_offset)} contains an "
+                           "undefined XML entity reference - suppressed rather than "
+                           "published with a guessed or partial value",
+                    qualified_name=owner_qualified_name,
+                ))
+                continue
+            url_pattern = _bounded_route_target(decoded.strip())
             entry_points.append(JavaEntryPointClaim(
                 qualified_name=owner_qualified_name, kind="http_filter",
                 name=url_pattern, line=_line_at(newline_offsets, absolute_offset),
