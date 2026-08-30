@@ -440,6 +440,87 @@ def test_component_with_its_own_edges_is_unaffected_by_file_scoped_imports():
     assert service_signal.stored_status == "satisfied"
 
 
+# ------------------- dependencies_resolved, CR17-2 (round 21): single-type component-vs-file
+
+def test_single_type_component_with_own_resolved_edge_still_mirrors_a_files_unresolved_import():
+    """FIX ROUND 21 (seventeenth cold read, CR17-2 MAJOR, wrong-data):
+    the component-mirrors-file rule (CR10-1, round 14) fired ONLY when
+    the component had ZERO own edges - a component with its own real
+    edge (every servlet/exception/DAO with an `extends`/`implements`)
+    flipped it off the mirror path entirely, so the component published
+    SATISFIED while its own FILE published unsatisfied for an import
+    edge attached to the file unit instead (imports attach file-scoped,
+    CR10-1) - two contradictory published facts about the identical
+    single-type file. A single-top-level-type file has no attribution
+    ambiguity; the component's own verdict must never be MORE CONFIDENT
+    than the file's - the worse of the two wins."""
+    file_unit = _file_unit("Solo")
+    component = _unit("comp1", container_unit_id="Solo")
+    edges = [
+        _edge("Solo", relation="import", resolution_state="unresolved"),
+        _edge("comp1", relation="inherit", resolution_state="resolved", target_unit_id="ext"),
+    ]
+    signals, _ = ra.build_readiness([file_unit, component], edges, [])
+    component_signal = next(
+        s for s in signals if s.unit_id == "comp1" and s.check == "dependencies_resolved")
+    assert component_signal.stored_status == "unsatisfied"
+
+
+def test_single_type_component_with_own_resolved_edge_mirrors_a_files_ambiguous_import():
+    """The reader's second reproduced mechanism: an ambiguous (not
+    merely unresolved) file-scoped import edge must also drag the
+    component's own otherwise-clean verdict down to unknown."""
+    file_unit = _file_unit("Solo")
+    component = _unit("comp1", container_unit_id="Solo")
+    edges = [
+        _edge("Solo", relation="import", resolution_state="ambiguous"),
+        _edge("comp1", relation="inherit", resolution_state="resolved", target_unit_id="ext"),
+    ]
+    signals, _ = ra.build_readiness([file_unit, component], edges, [])
+    component_signal = next(
+        s for s in signals if s.unit_id == "comp1" and s.check == "dependencies_resolved")
+    assert component_signal.stored_status == "unknown"
+    assert component_signal.reason_code == "ambiguous_dependency"
+
+
+def test_single_type_component_with_own_resolved_edge_mirrors_a_files_externality_suppressed_import():
+    """The reader's third reproduced mechanism: a poisoned run's own
+    externality-suppressed file-scoped import (round 20c's own
+    unknown/externality_suppressed signal, never unsatisfied) must
+    still drag an otherwise-satisfied component down to unknown, not
+    leave it wrongly satisfied."""
+    file_unit = _file_unit("Solo")
+    component = _unit("comp1", container_unit_id="Solo")
+    edges = [
+        _edge(
+            "Solo", relation="import", resolution_state="unresolved",
+            externality_suppressed=True),
+        _edge("comp1", relation="inherit", resolution_state="resolved", target_unit_id="ext"),
+    ]
+    signals, _ = ra.build_readiness([file_unit, component], edges, [], externality_poisoned=True)
+    component_signal = next(
+        s for s in signals if s.unit_id == "comp1" and s.check == "dependencies_resolved")
+    assert component_signal.stored_status == "unknown"
+    assert component_signal.reason_code == "externality_suppressed"
+
+
+def test_single_type_component_and_file_both_clean_stays_satisfied():
+    """Companion clean control: a single-top-level-type file where BOTH
+    the component's own edge and the file's own edge resolve cleanly
+    must still report satisfied - CR17-2's fix combines statuses, it
+    does not manufacture a problem where none exists."""
+    file_unit = _file_unit("Solo")
+    component = _unit("comp1", container_unit_id="Solo")
+    edges = [
+        _edge("Solo", relation="import", resolution_state="resolved", target_unit_id="ext1"),
+        _edge("comp1", relation="inherit", resolution_state="resolved", target_unit_id="ext2"),
+    ]
+    signals, _ = ra.build_readiness([file_unit, component], edges, [])
+    component_signal = next(
+        s for s in signals if s.unit_id == "comp1" and s.check == "dependencies_resolved")
+    assert component_signal.stored_status == "satisfied"
+
+
 # ------------------------------------------- dependencies_resolved, file units (N6, round 6)
 
 def test_file_units_dependencies_resolved_derives_from_contained_units_not_vacuously_satisfied():

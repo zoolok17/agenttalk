@@ -440,24 +440,79 @@ def _check_dependencies_resolved(
 #: resolution outcome; a multi-type file's import evidence cannot be
 #: honestly credited to any ONE sibling, so it degrades to unknown with
 #: a named reason instead of guessing.
+#: FIX ROUND 21 (seventeenth cold read, CR17-2 MAJOR, wrong-data): a
+#: confidence ranking for the three real outcomes `_check_dependencies_
+#: resolved` ever returns - used to combine a component's own verdict
+#: with its single-top-level-type file's verdict, the worse (higher-
+#: ranked) of the two winning. `satisfied` is never the winner over a
+#: real `unknown`/`unsatisfied` elsewhere in the SAME file.
+_DEPENDENCIES_RESOLVED_RANK = {"satisfied": 0, "unknown": 1, "unsatisfied": 2}
+
+
 def _check_dependencies_resolved_for_component(
     unit: ModuleRecord, own_outgoing: list[DependencyRecord], file_unit_id: str | None,
     children_by_container: dict[str, list[str]], outgoing_by_unit: dict[str, list[DependencyRecord]],
     externality_poisoned: bool = False,
 ) -> ReadinessSignal:
     own_relevant = [e for e in own_outgoing if e.relation in _DEPENDENCY_RESOLUTION_RELATIONS]
-    if own_relevant or file_unit_id is None:
+    if file_unit_id is None:
         return _check_dependencies_resolved(unit, own_outgoing, externality_poisoned)
     file_outgoing = outgoing_by_unit.get(file_unit_id, [])
     file_relevant = [e for e in file_outgoing if e.relation in _DEPENDENCY_RESOLUTION_RELATIONS]
     if not file_relevant:
+        # The file has no relevant edges of its own either - nothing to
+        # combine with; the component's own verdict (its own edges, or
+        # the honest no_declared_dependencies default) already reflects
+        # everything real evidence exists for.
         return _check_dependencies_resolved(unit, own_outgoing, externality_poisoned)
     top_level_siblings = len(children_by_container.get(file_unit_id, []))
-    if top_level_siblings <= 1:
-        return _check_dependencies_resolved(unit, file_outgoing, externality_poisoned)
-    return _signal(
-        unit.unit_id, "dependencies_resolved", "unknown", "detected",
-        "file_scoped_dependencies_not_attributed")
+    if top_level_siblings > 1:
+        if not own_relevant:
+            # Multi-type file, this component has no edges of its own -
+            # the file's edges cannot be honestly credited to any ONE
+            # sibling. Unchanged from before this round.
+            return _signal(
+                unit.unit_id, "dependencies_resolved", "unknown", "detected",
+                "file_scoped_dependencies_not_attributed")
+        # Multi-type file, but THIS component has real edges of its
+        # own - those are unambiguously its own regardless of its
+        # siblings; the file's OTHER, unattributable edges are a
+        # separate question this check does not borrow into a status
+        # about THIS component specifically. Unchanged from before this
+        # round.
+        return _check_dependencies_resolved(unit, own_outgoing, externality_poisoned)
+    # Single-top-level-type file: the component's own verdict used to be
+    # computed from own_outgoing ALONE whenever it had at least one
+    # relevant edge of its own - a component with one resolved `inherit`
+    # edge (every servlet/exception/DAO in real Java) published
+    # dependencies_resolved SATISFIED while its OWN FILE published
+    # unsatisfied/unknown for an import edge attached to the FILE unit
+    # instead (imports attach file-scoped, per CR10-1/round 14) - two
+    # contradictory published facts about the identical single-type
+    # file, in the same run, reproduced via three distinct mechanisms
+    # (a wildcard-unresolved import, an ambiguous import, an
+    # externality-suppressed import). A single-top-level-type file has
+    # no attribution ambiguity at all (there is only one real candidate
+    # for either edge set), so the component's own verdict must never
+    # be MORE CONFIDENT than the file's: the worse of the two wins,
+    # satisfied only when BOTH are clean. When this component has no
+    # edges of its own, the file's own verdict is the ONLY real
+    # evidence either way and is returned as-is (unchanged from before
+    # this round - preserves the file's own real reason_code rather
+    # than substituting the component's own uninformative
+    # no_declared_dependencies default).
+    component_signal = _check_dependencies_resolved(unit, own_outgoing, externality_poisoned)
+    file_signal = _check_dependencies_resolved(unit, file_outgoing, externality_poisoned)
+    if not own_relevant:
+        return file_signal
+    if (
+        _DEPENDENCIES_RESOLVED_RANK[file_signal.stored_status]
+        > _DEPENDENCIES_RESOLVED_RANK[component_signal.stored_status]
+    ):
+        return _signal(
+            unit.unit_id, "dependencies_resolved", file_signal.stored_status, "detected",
+            file_signal.reason_code)
+    return component_signal
 
 
 def _check_dependencies_resolved_for_file(
