@@ -2287,21 +2287,72 @@ def parse_maven_pom(
 _SERVLET_MAPPING_BLOCK_RE = re.compile(r"<servlet-mapping>(.*?)</servlet-mapping>", re.DOTALL)
 _SERVLET_MAPPING_NAME_RE = re.compile(r"<servlet-name>([^<]+)</servlet-name>")
 _SERVLET_MAPPING_URL_PATTERN_RE = re.compile(r"<url-pattern>([^<]+)</url-pattern>")
+#: FIX ROUND 17 (thirteenth cold read, CR13-2 MAJOR, wrong-data): the
+#: OTHER half of a web.xml's servlet declaration - <servlet-name>/
+#: <servlet-class> pairs, joined below against <servlet-mapping>'s own
+#: servlet-name to recover the REAL implementing class a mapped route
+#: actually serves. An exact tag match (never confused with
+#: <servlet-mapping>, a different closing tag entirely).
+_SERVLET_BLOCK_RE = re.compile(r"<servlet>(.*?)</servlet>", re.DOTALL)
+_SERVLET_CLASS_RE = re.compile(r"<servlet-class>\s*([^<]+?)\s*</servlet-class>")
+
+
+def _servlet_class_by_name(sanitized: str) -> dict[str, str]:
+    """FIX ROUND 17 (thirteenth cold read, CR13-2 MAJOR, wrong-data):
+    web.xml's own ``<servlet>`` element (``<servlet-name>``/
+    ``<servlet-class>`` pair) - twice carried as an M5/M7 fast-follow,
+    now the actual fix: ``<servlet-class>`` was NEVER read at all, so
+    every mapped route's entry point owner was a synthetic
+    ``{relative_path}#{servlet_name}`` placeholder with no linkage to
+    the class that actually serves it - a mapped servlet class got the
+    confident negative ``entry_points_mapped=not_applicable/
+    no_entry_point`` while the route it serves was owned by the web.xml
+    FILE unit instead. A servlet-name with no matching ``<servlet>``
+    block (malformed, or genuinely absent) is simply not in this
+    mapping - callers keep the old synthetic-owner fallback for it."""
+    mapping: dict[str, str] = {}
+    for block_match in _SERVLET_BLOCK_RE.finditer(sanitized):
+        block = block_match.group(1)
+        name_match = _SERVLET_MAPPING_NAME_RE.search(block)
+        class_match = _SERVLET_CLASS_RE.search(block)
+        if name_match is None or class_match is None:
+            continue
+        mapping[name_match.group(1).strip()] = _bounded_route_target(
+            class_match.group(1).strip())
+    return mapping
 
 
 def parse_web_xml(relative_path: str, text: str) -> list[JavaEntryPointClaim]:
     """``route`` entry points declared as plain ``<servlet-mapping>``/
     ``<url-pattern>`` pairs in a ``web.xml`` - the same "trivially present,
-    named, no inference" bar as the annotation-based routes above."""
+    named, no inference" bar as the annotation-based routes above.
+
+    FIX ROUND 17 (CR13-2 MAJOR): each mapping's own ``<servlet-class>``
+    (via ``_servlet_class_by_name``), when declared, now becomes the
+    entry point's ``qualified_name`` - the SAME registry
+    ``features_artifact.build_features`` already resolves entry-point
+    owners through (``by_qualified_name``, an EXACT match, no inference)
+    then resolves it to the real implementing unit automatically, no
+    further plumbing needed here. Published even when that class does
+    NOT resolve in-scan (the resolution miss falls through to the
+    existing file-owner fallback in ``build_features`` unchanged - "the
+    web.xml ownership stays") - a reader still sees WHICH class the
+    mapping names, via the feature's own label, rather than only the
+    servlet-name string. Only a mapping with NO matching ``<servlet>``
+    block at all keeps the old synthetic ``{relative_path}#{servlet_
+    name}`` placeholder."""
     entry_points = []
     sanitized = _strip_xml_comments(text)
     newline_offsets = _newline_offsets(sanitized)
+    servlet_class_by_name = _servlet_class_by_name(sanitized)
     for block_match in _SERVLET_MAPPING_BLOCK_RE.finditer(sanitized):
         block = block_match.group(1)
         name_match = _SERVLET_MAPPING_NAME_RE.search(block)
         if name_match is None:
             continue
         servlet_name = name_match.group(1).strip()
+        owner_qualified_name = servlet_class_by_name.get(
+            servlet_name, f"{relative_path}#{servlet_name}")
         for pattern_match in _SERVLET_MAPPING_URL_PATTERN_RE.finditer(block):
             # CR9-6 (ninth cold read, judged, completeness): same per-field
             # bounding discipline as the pom producer above and every Java
@@ -2309,7 +2360,7 @@ def parse_web_xml(relative_path: str, text: str) -> list[JavaEntryPointClaim]:
             url_pattern = _bounded_route_target(pattern_match.group(1).strip())
             absolute_offset = block_match.start(1) + pattern_match.start()
             entry_points.append(JavaEntryPointClaim(
-                qualified_name=f"{relative_path}#{servlet_name}", kind="http_route",
+                qualified_name=owner_qualified_name, kind="http_route",
                 name=url_pattern, line=_line_at(newline_offsets, absolute_offset),
                 evidence_class="declared",
             ))

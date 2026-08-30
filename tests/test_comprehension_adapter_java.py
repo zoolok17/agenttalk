@@ -2273,6 +2273,50 @@ def test_parse_web_xml_captures_every_url_pattern_in_one_servlet_mapping():
     assert all(e.kind == "http_route" and e.evidence_class == "declared" for e in entry_points)
 
 
+def test_parse_web_xml_links_a_mapping_to_its_declared_servlet_class():
+    """FIX ROUND 17 (thirteenth cold read, CR13-2 MAJOR, wrong-data):
+    <servlet-class> was NEVER read at all - twice carried as an M5/M7
+    fast-follow, now the actual fix. A <servlet> element's own
+    servlet-name/servlet-class pair, joined against <servlet-mapping>'s
+    identical servlet-name, must give the mapped route its real
+    implementing class as the entry point's own qualified_name -
+    features_artifact.build_features already resolves an entry point's
+    owner through an exact qualified_name match against the SAME
+    registry every other producer's units build through; no further
+    plumbing needed once the real class name is published here."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>dispatcher</servlet-name>
+    <servlet-class>com.acme.web.DispatcherServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>dispatcher</servlet-name>
+    <url-pattern>/api/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert len(entry_points) == 1
+    assert entry_points[0].qualified_name == "com.acme.web.DispatcherServlet"
+
+
+def test_parse_web_xml_falls_back_to_the_synthetic_owner_with_no_matching_servlet():
+    """Companion negative case: a <servlet-mapping> with no matching
+    <servlet> element (malformed, or genuinely absent) keeps the OLD
+    synthetic {relative_path}#{servlet_name} placeholder - the fix only
+    closes the specific case where a real <servlet-class> exists and was
+    simply never read."""
+    web_xml = """<web-app>
+  <servlet-mapping>
+    <servlet-name>legacy</servlet-name>
+    <url-pattern>/legacy/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert entry_points[0].qualified_name == "WEB-INF/web.xml#legacy"
+
+
 def test_parse_web_xml_url_pattern_is_length_bounded():
     """FIX ROUND 13 (ninth cold read, CR9-6, judged completeness): a
     url-pattern published VERBATIM, UNBOUNDED, while every Java route

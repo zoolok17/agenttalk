@@ -73,6 +73,76 @@ def test_web_xml_entry_point_gets_a_clean_label_not_the_file_extension():
     assert features[0].label == "legacy"
 
 
+def test_web_xml_entry_point_owner_is_the_real_servlet_class_when_declared():
+    """FIX ROUND 17 (thirteenth cold read, CR13-2 MAJOR, wrong-data): a
+    mapped route whose <servlet-class> IS declared and resolves to a
+    real in-scan unit must be owned by that class, not the web.xml
+    file - features_artifact.build_features already resolves an entry
+    point's owner through an exact qualified_name match; parse_web_xml
+    now publishes the real class name, so no further plumbing is
+    needed here."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>dispatcher</servlet-name>
+    <servlet-class>com.acme.web.DispatcherServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>dispatcher</servlet-name>
+    <url-pattern>/api/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points = java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml)
+    servlet_source = (
+        "package com.acme.web;\nclass DispatcherServlet {\n}\n"
+    )
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
+        "com/acme/web/DispatcherServlet.java": java_adapter.parse_java_source(
+            "com/acme/web/DispatcherServlet.java", servlet_source),
+    }
+    entry_point_records, features = fa.build_features(results)
+    servlet_unit_id = fa.digests.unit_id(
+        kind="component", paths=["com/acme/web/DispatcherServlet.java"],
+        qualified_name="com.acme.web.DispatcherServlet",
+    )
+    assert len(entry_point_records) == 1
+    assert entry_point_records[0].owning_unit_id == servlet_unit_id
+    assert len(features) == 1
+    assert features[0].label == "DispatcherServlet"
+    assert features[0].unit_ids == [servlet_unit_id]
+
+
+def test_web_xml_entry_point_still_owned_by_the_file_when_the_class_is_out_of_scan():
+    """Companion: a <servlet-class> that IS declared but does not
+    resolve to any in-scan unit (out-of-scope compiled dependency, or
+    genuinely missing from this scan) must keep the web.xml file as
+    owner - the same safe fallback an unresolved synthetic name already
+    got - never a confident claim about a class this run cannot see."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>dispatcher</servlet-name>
+    <servlet-class>com.acme.web.DispatcherServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>dispatcher</servlet-name>
+    <url-pattern>/api/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points = java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml)
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
+    }
+    entry_point_records, features = fa.build_features(results)
+    file_unit_id = fa._java_file_unit_id("WEB-INF/web.xml")
+    assert len(entry_point_records) == 1
+    assert entry_point_records[0].owning_unit_id == file_unit_id
+    # The class name is still visible - the feature label names it,
+    # rather than only the bare servlet-name string.
+    assert features[0].label == "DispatcherServlet"
+
+
 def test_two_servlet_mappings_in_one_web_xml_produce_two_features_not_one():
     """FIX ROUND 14 (tenth cold read, CR10-8 MINOR, wrong-data): a
     web.xml with two <servlet-mapping> entries has no real declared-type

@@ -943,6 +943,54 @@ def test_run_scan_carries_a_web_xml_servlet_route_through_the_worker(
     assert any(e["name"] == "/api/*" and e["kind"] == "http_route" for e in doc["entry_points"])
 
 
+def test_run_scan_links_a_web_xml_route_to_its_real_servlet_class_end_to_end(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 17 (thirteenth cold read, CR13-2 MAJOR, wrong-data):
+    end to end, no synthetic edge construction - a web.xml <servlet>/
+    <servlet-mapping> pair naming a REAL in-scan class must make that
+    class's own entry_points_mapped satisfied (never the confident
+    not_applicable/no_entry_point negative it used to get, while the
+    route it serves was silently owned by the web.xml FILE unit
+    instead)."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "web").mkdir(parents=True)
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "web" / "DispatcherServlet.java").write_text(
+        "package com.acme.web;\nclass DispatcherServlet {\n}\n", encoding="utf-8")
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "    <servlet-class>com.acme.web.DispatcherServlet</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "    <url-pattern>/api/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+
+    servlet_unit = next(
+        u for u in modules_doc["units"] if u["display_name"] == "DispatcherServlet")
+    entry_point = next(
+        e for e in features_doc["entry_points"] if e["name"] == "/api/*")
+    assert entry_point["owning_unit_id"] == servlet_unit["unit_id"]
+
+    entry_points_mapped = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == servlet_unit["unit_id"] and s["check"] == "entry_points_mapped"
+    )
+    assert entry_points_mapped["stored_status"] == "satisfied"
+
+
 def test_run_scan_publishes_problems_json_and_it_reaches_the_report(
     java_repo: Path, monkeypatch,
 ) -> None:
