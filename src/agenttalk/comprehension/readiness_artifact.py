@@ -216,6 +216,12 @@ def _signal(unit_id: str, check: str, stored_status: str, basis: str, reason_cod
 #: parse, never a whole-file evidence gap.
 _READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
     "parse_failed": frozenset({"source_understood", "dependencies_resolved", "entry_points_mapped"}),
+    # FIX ROUND 21 (seventeenth cold read, CR17-4 MAJOR, wrong-data): an
+    # undecodable-as-UTF-8 file (Latin-1/CP1252 source, most commonly)
+    # skips adapter analysis entirely - the same genuine whole-file
+    # evidence gap parse_failed already is, never a narrower fact.
+    "encoding_undecodable": frozenset(
+        {"source_understood", "dependencies_resolved", "entry_points_mapped"}),
     "path_excluded": frozenset({"source_understood", "dependencies_resolved", "entry_points_mapped"}),
     "resource_limit": frozenset({"source_understood", "dependencies_resolved", "entry_points_mapped"}),
     "non_utf8_path": frozenset({"source_understood", "dependencies_resolved", "entry_points_mapped"}),

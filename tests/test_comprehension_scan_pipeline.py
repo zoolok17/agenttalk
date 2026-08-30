@@ -1472,6 +1472,50 @@ def test_run_scan_a_utf16_java_file_degrades_instead_of_silently_vanishing(
     assert reason_codes == {"binary_excluded_code_bearing_file", "externality_suppressed"}
 
 
+def test_run_scan_a_latin1_java_file_degrades_and_its_importer_stays_unresolved(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 21 (seventeenth cold read, CR17-4 MAJOR, wrong-data):
+    mirrors the reader's own .cr17-enc2 pair, end to end - a Latin-1/
+    CP1252-encoded .java file (a real, common European-legacy-estate
+    shape) used to decode with a fabricated, truncated qualified name
+    (the U+FFFD replacement character falls outside \\w), publishing a
+    confident external claim for its importer over what is actually
+    in-repo source, on a complete/zero-problem run. Now: the run
+    degrades, a named problem is recorded, no fabricated unit exists at
+    all, and the importer correctly stays unresolved rather than a
+    false confident external claim."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "p" / "Café.java").write_bytes(
+        "package p;\npublic class Café {}\n".encode("latin-1"))
+    (java_repo / "src" / "main" / "java" / "p" / "other").mkdir(parents=True)
+    (java_repo / "src" / "main" / "java" / "p" / "other" / "Consumer.java").write_text(
+        "package p.other;\nimport p.Café;\nclass Consumer {}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    cafe_problems = [p for p in problems_doc["problems"] if "Café" in p["path"]]
+    assert len(cafe_problems) == 1
+    assert cafe_problems[0]["reason_code"] == "encoding_undecodable"
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    # No COMPONENT-kind unit at all for this file (the fabricated-name
+    # shape) - only its ordinary file-kind record, unaffected either way
+    # (every file gets one regardless of whether adapter analysis ran).
+    assert not any(u["kind"] == "component" and "Café" in (u.get("paths") or [""])[0]
+                   for u in modules_doc["units"])
+
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    import_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "import" and (r.get("target_unresolved") or "").endswith("Café"))
+    assert import_edge["resolution_state"] == "unresolved"
+    assert import_edge.get("target_external") is None
+
+
 def test_run_scan_a_bom_prefixed_java_file_lets_an_importer_resolve_internal(
     java_repo: Path,
 ) -> None:

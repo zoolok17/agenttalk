@@ -146,6 +146,9 @@ def _bounded_boundaries(entries: list[dict[str, str]]) -> tuple[list[dict[str, s
 #: not-yet-measured judgment call in this module.
 _PROBLEM_SEVERITY_BY_REASON_CODE = {
     "parse_failed": "warning",
+    # FIX ROUND 21 (seventeenth cold read, CR17-4 MAJOR): same bucket as
+    # every other genuine whole-file evidence gap above.
+    "encoding_undecodable": "warning",
     "path_excluded": "warning",
     "resource_limit": "warning",
     "non_utf8_path": "warning",

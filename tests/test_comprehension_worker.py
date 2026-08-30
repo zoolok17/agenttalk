@@ -94,6 +94,45 @@ def test_process_paths_a_bom_prefixed_java_file_still_extracts_its_real_qualifie
     assert units[0]["qualified_name"] == "p.Foo"
 
 
+def test_process_paths_a_latin1_java_file_records_a_problem_not_a_fabricated_name(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 21 (seventeenth cold read, CR17-4 MAJOR, wrong-data):
+    mirrors the reader's own .cr17-enc2 pair - Latin-1/CP1252 source
+    (the DEFAULT encoding of many pre-Maven-3 European estates) decodes
+    with errors="replace", substituting U+FFFD for the non-UTF-8 byte -
+    outside \\w, so the type-name anchor regex silently skips over it,
+    fabricating a TRUNCATED qualified name (``Café`` -> ``Caf``) rather
+    than failing visibly. Adapter analysis is now skipped entirely and a
+    named, degrading problem recorded instead - no unit, no fabricated
+    name anywhere."""
+    (tmp_path / "Cafe.java").write_bytes(
+        "package p;\nclass Café {}\n".encode("latin-1"))
+    result = worker.process_paths(tmp_path, ["Cafe.java"])
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "encoding_undecodable"
+    assert result.problems[0].relative_path == "Cafe.java"
+    java_result = result.java_results.get("Cafe.java")
+    if java_result is not None:
+        assert java_result["units"] == []
+
+
+def test_process_paths_a_genuine_utf8_java_file_with_unicode_identifier_stays_clean(
+    tmp_path: Path,
+) -> None:
+    """Companion control: the SAME accented identifier, correctly UTF-8
+    encoded, must decode cleanly with no U+FFFD anywhere and no problem
+    recorded - this is ordinary, legal Java (the JLS permits Unicode
+    letters in identifiers)."""
+    (tmp_path / "Cafe.java").write_bytes(
+        "package p;\nclass Café {}\n".encode("utf-8"))
+    result = worker.process_paths(tmp_path, ["Cafe.java"])
+    assert result.problems == []
+    units = result.java_results["Cafe.java"]["units"]
+    assert len(units) == 1
+    assert units[0]["qualified_name"] == "p.Café"
+
+
 def test_process_paths_reports_a_traversal_path_as_a_problem_not_a_crash(
     tmp_path: Path,
 ) -> None:

@@ -421,6 +421,36 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                 # the xml-root sniff) so every consumer inherits the fix
                 # from one mechanism, never a second copy to drift.
                 text = data.decode("utf-8-sig", errors="replace")
+                # FIX ROUND 21 (seventeenth cold read, CR17-4 MAJOR,
+                # wrong-data): Latin-1/CP1252 source (the DEFAULT
+                # encoding of many pre-Maven-3 European estates) decoded
+                # with errors="replace" silently substitutes U+FFFD for
+                # every byte sequence "utf-8-sig" cannot decode - and
+                # U+FFFD is outside \w, so _PACKAGE_RE/the type-name
+                # anchor regexes simply skip over it, producing a
+                # TRUNCATED, FABRICATED qualified name (e.g. a class
+                # named "Café" decodes to "Caf�" and extracts as
+                # "Caf") - wrong on its own, and every importer of the
+                # REAL type then publishes a confident EXTERNAL claim
+                # for what is actually in-repo source, on a complete/
+                # zero-problem run. Never attempt charset detection this
+                # slice (declared, not a silent gap) - skip adapter
+                # analysis entirely instead, the same "cannot trust what
+                # would be extracted" treatment the per-file resource
+                # cap above already gets. Feeds the existing
+                # degraded_paths suppression (scan_pipeline.py) via the
+                # SAME mechanism the resource cap already relies on -
+                # any WorkerProblem for this path already makes it
+                # ineligible for a confident external claim.
+                if "�" in text:
+                    problems.append(WorkerProblem(
+                        reason_code="encoding_undecodable", relative_path=rel,
+                        detail="this file's bytes could not be decoded as UTF-8 (the "
+                               "decoded text contains the U+FFFD replacement character) - "
+                               "likely Latin-1/CP1252 or another non-UTF-8 encoding; "
+                               "adapter analysis skipped rather than risk a corrupted or "
+                               "fabricated qualified name"))
+                    continue
                 result = adapter.parse_java_source(rel, text)
             except Exception as exc:  # noqa: BLE001 - a producer bug must degrade, never abort the scan
                 problems.append(WorkerProblem(
