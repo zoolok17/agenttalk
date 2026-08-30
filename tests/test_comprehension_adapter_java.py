@@ -2324,6 +2324,58 @@ public class ItemResource {
     assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
 
 
+def test_a_mixed_jax_rs_class_gets_the_class_closer_for_its_uncomposed_verb_method():
+    """FIX ROUND 18 (fourteenth cold read, F2 MAJOR, wrong-data): the
+    reader's own repro - the DOMINANT real REST shape, a collection GET
+    (verb-only, no method-level @Path) alongside an item GET (@GET
+    PLUS its own @Path, composing normally). Round 17b's class-closer
+    only fired when a class produced ZERO routes at all - this class
+    produces ONE real route (get()) and used to publish
+    entry_points_mapped SATISFIED even though list()'s route is
+    genuinely missing from the inventory. The composed route must
+    still publish (the marker mechanism never suppresses a real one),
+    AND the class must now also get the named problem."""
+    src = """
+package p;
+
+@Path("/orders")
+public class OrderResource {
+    @GET
+    public void list() {}
+
+    @GET
+    @Path("/{id}")
+    public void get() {}
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    routes = _edges(result, "route")
+    assert [r.target for r in routes] == ["/orders/{id}"]
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.OrderResource"
+
+
+def test_a_mixed_jax_rs_class_with_an_intervening_annotation_still_composes():
+    """The verb marker's own annotation stack must tolerate an
+    intervening, unrelated annotation (@Produces is common between a
+    verb designator and its own @Path) - never mistaking it for a
+    stack break that would falsely orphan a method whose route DID
+    compose."""
+    src = """
+package p;
+
+@Path("/orders")
+public class OrderResource {
+    @GET
+    @Produces("application/json")
+    @Path("/{id}")
+    public void get() {}
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+
+
 def test_web_method_annotation_is_the_named_class_closer_not_a_silent_negative():
     """FIX ROUND 17 (CR13-3 MAJOR, part (b) - THE CLASS-CLOSER): a route-
     like annotation family this adapter recognizes as a routing

@@ -230,6 +230,68 @@ def test_run_scan_a_jax_rs_verb_only_resource_reports_entry_points_mapped_unknow
         p["reason_code"] == "unsupported_entry_point_shape" for p in problems_doc["problems"])
 
 
+def test_run_scan_a_mixed_jax_rs_resource_reports_entry_points_mapped_unknown(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 18 (fourteenth cold read, F2 MAJOR, wrong-data): mirrors
+    the reader's own Repro B - a PURE verb-only class (round 17b) and a
+    MIXED class (some routes compose, one verb-only method does not)
+    must AGREE on entry_points_mapped=unknown within the same run - the
+    mixed class used to publish the confident SATISFIED negative
+    instead, even though its own list() route is genuinely missing."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "p" / "PureVerbOnly.java").write_text(
+        "package p;\n"
+        "\n"
+        "@Path(\"/legacy\")\n"
+        "public class PureVerbOnly {\n"
+        "  @GET\n"
+        "  public void list() {}\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (java_repo / "src" / "main" / "java" / "p" / "OrderResource.java").write_text(
+        "package p;\n"
+        "\n"
+        "@Path(\"/orders\")\n"
+        "public class OrderResource {\n"
+        "  @GET\n"
+        "  public void list() {}\n"
+        "\n"
+        "  @GET\n"
+        "  @Path(\"/{id}\")\n"
+        "  public void get() {}\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+
+    def _entry_points_mapped(display_name: str) -> dict:
+        unit = next(u for u in modules_doc["units"] if u["display_name"] == display_name)
+        return next(
+            s for s in readiness_doc["signals"]
+            if s["unit_id"] == unit["unit_id"] and s["check"] == "entry_points_mapped"
+        )
+
+    pure_signal = _entry_points_mapped("PureVerbOnly")
+    mixed_signal = _entry_points_mapped("OrderResource")
+    assert pure_signal["stored_status"] == "unknown"
+    assert mixed_signal["stored_status"] == "unknown"
+    assert pure_signal["reason_code"] == mixed_signal["reason_code"] == "unsupported_entry_point_shape"
+
+    # the composed route must still publish - the marker mechanism never
+    # suppresses a route that genuinely composed.
+    route_targets = {
+        r["target_external"] for r in dependencies_doc["edges"] if r["relation"] == "route"
+    }
+    assert "/orders/{id}" in route_targets
+
+
 def test_report_carries_the_real_manifest_digest_f7(java_repo: Path) -> None:
     """FIX ROUND 12 (eighth cold read, F7): get_report passed
     manifest_digest=None to the projector unconditionally, even though a

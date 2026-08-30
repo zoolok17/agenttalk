@@ -473,8 +473,6 @@ def _check_dependencies_resolved_for_file(
 
 
 def _check_entry_points_mapped(unit: ModuleRecord, has_entry_point: bool) -> ReadinessSignal:
-    if has_entry_point:
-        return _signal(unit.unit_id, "entry_points_mapped", "satisfied", "detected", "entry_point_mapped")
     # FIX ROUND 13b (reviewer-3's B1 class-closer), routed via the
     # explicit reason-class map (round 13c): a method literally named
     # main that the adapter's strict cli_main detector could not
@@ -483,10 +481,21 @@ def _check_entry_points_mapped(unit: ModuleRecord, has_entry_point: bool) -> Rea
     # modules_artifact.build_modules's worker_problem_reasons_by_unit)
     # must feed UNKNOWN here, never the confident "no entry point"
     # negative - the same three-state move round 11 already made for an
-    # unrecoverable route value. No entry point is ever published for
-    # this shape either way (a private/instance helper coincidentally
-    # named "main" is never claimed as a real one) - only the
-    # CONFIDENCE of the negative changes.
+    # unrecoverable route value.
+    #
+    # FIX ROUND 18 (fourteenth cold read, F2 MAJOR, wrong-data): this
+    # reason check used to run ONLY when ``has_entry_point`` was already
+    # False - true for every reason this map fed here UNTIL this round
+    # (each one's own genuine entry point count was always exactly
+    # zero), but a MIXED JAX-RS class breaks that assumption: it
+    # publishes a real, composed route for ONE method while ALSO
+    # carrying an attributed unsupported_entry_point_shape problem for
+    # ANOTHER, uncomposed one in the SAME unit - the old ordering let
+    # the genuine route win outright, publishing the confident
+    # SATISFIED negative over a unit two-thirds unmapped. An attributed
+    # reason now always wins over a bare has_entry_point=True - never
+    # masked by an unrelated real entry point elsewhere in the same
+    # unit - checked first, unconditionally.
     entry_point_reasons = _reasons_feeding("entry_points_mapped", unit.adapter_problem_reasons)
     if entry_point_reasons:
         # FIX ROUND 16c (reviewer-3's LOW on round 16b): routed through
@@ -497,6 +506,8 @@ def _check_entry_points_mapped(unit: ModuleRecord, has_entry_point: bool) -> Rea
             unit.unit_id, "entry_points_mapped", "unknown", "detected",
             _propagated_reason_spelling(entry_point_reasons[0]),
         )
+    if has_entry_point:
+        return _signal(unit.unit_id, "entry_points_mapped", "satisfied", "detected", "entry_point_mapped")
     return _signal(
         unit.unit_id, "entry_points_mapped", "not_applicable", "detected", "no_entry_point")
 
