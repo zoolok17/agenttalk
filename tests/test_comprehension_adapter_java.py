@@ -1648,9 +1648,18 @@ public class Controller {
 """
     result = java.parse_java_source("Controller.java", src)
     assert _edges(result, "route") == []
-    assert len(result.problems) == 1
-    assert result.problems[0].reason_code == "route_value_unrecoverable"
-    assert "could not be recovered as a literal" in result.problems[0].detail
+    # FIX ROUND 20 (sixteenth cold read, M3 MAJOR, wrong-data): the
+    # class-level annotation's OWN unrecoverable value now also records
+    # its own problem (attributed to the class), alongside the existing
+    # method-level fail-safe that fires because the class's own prefix
+    # is unrecoverable - two DISTINCT facts about the same class, both
+    # visible, never just the method-level half.
+    assert len(result.problems) == 2
+    assert all(p.reason_code == "route_value_unrecoverable" for p in result.problems)
+    assert any(
+        "could not be recovered as a literal" in p.detail and p.qualified_name == "p.Controller"
+        for p in result.problems
+    )
 
 
 def test_class_level_string_concatenation_is_unrecoverable_not_a_fabricated_fragment():
@@ -1672,8 +1681,11 @@ public class Controller {
 """
     result = java.parse_java_source("Controller.java", src)
     assert _edges(result, "route") == []
-    assert len(result.problems) == 1
-    assert result.problems[0].reason_code == "route_value_unrecoverable"
+    # FIX ROUND 20 (sixteenth cold read, M3 MAJOR, wrong-data): same as
+    # the constant-reference shape above - the class-level annotation's
+    # own unrecoverable value now records its own problem too.
+    assert len(result.problems) == 2
+    assert all(p.reason_code == "route_value_unrecoverable" for p in result.problems)
 
 
 def test_method_level_constant_reference_value_is_unrecoverable_not_the_bare_class_prefix():

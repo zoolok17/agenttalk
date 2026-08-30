@@ -222,8 +222,21 @@ _READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
     "case_collision": frozenset({"source_understood", "dependencies_resolved", "entry_points_mapped"}),
     "no_types_extracted": frozenset({
         "source_understood", "dependencies_resolved", "entry_points_mapped"}),
-    "route_annotation_unassociated": frozenset(),
-    "route_value_unrecoverable": frozenset(),
+    # FIX ROUND 20 (sixteenth cold read, M3 MAJOR, wrong-data): these
+    # two used to feed NOTHING at all - round 13c's own scoping (away
+    # from source_understood, a whole-file evidence gap these are NOT)
+    # overshot into feeding zero checks whatsoever, rather than the
+    # narrower, entry-adjacent check they actually ARE evidence about.
+    # A path-constants class (@Path(ApiPaths.ORDERS), a common idiom)
+    # published entry_points_mapped/feature_linked as CONFIDENT
+    # NEGATIVES while the run itself recorded it could not read the
+    # route - the same "trust the recorded gap, don't recompute a
+    # confident answer from evidence that never existed" principle
+    # round 16's own M2 already applied to source_understood/
+    # dependencies_resolved/entry_points_mapped, extended to these two
+    # reasons' own correct, narrower destination.
+    "route_annotation_unassociated": frozenset({"entry_points_mapped", "feature_linked"}),
+    "route_value_unrecoverable": frozenset({"entry_points_mapped", "feature_linked"}),
     "cli_main_unrecognized": frozenset({"entry_points_mapped"}),
     # FIX ROUND 17 (thirteenth cold read, CR13-3 MAJOR, part (b) - THE
     # CLASS-CLOSER): a class carrying a recognized-but-unsupported
@@ -513,6 +526,21 @@ def _check_entry_points_mapped(unit: ModuleRecord, has_entry_point: bool) -> Rea
 
 
 def _check_feature_linked(unit: ModuleRecord, feature_states: list[str]) -> ReadinessSignal:
+    # FIX ROUND 20 (sixteenth cold read, M3 MAJOR, wrong-data): a class
+    # whose own route the adapter could not read (route_value_
+    # unrecoverable/route_annotation_unassociated - see
+    # _READINESS_CHECKS_BY_REASON_CODE) used to report the CONFIDENT
+    # negative "no feature link" for the identical reason
+    # entry_points_mapped now reports unknown for - the same evidence
+    # gap, two disagreeing confidences about it. Checked first, the
+    # same "an attributed reason wins over a bare positive/negative
+    # signal" discipline _check_entry_points_mapped already follows.
+    feature_link_reasons = _reasons_feeding("feature_linked", unit.adapter_problem_reasons)
+    if feature_link_reasons:
+        return _signal(
+            unit.unit_id, "feature_linked", "unknown", "detected",
+            _propagated_reason_spelling(feature_link_reasons[0]),
+        )
     if not feature_states:
         return _signal(unit.unit_id, "feature_linked", "unsatisfied", "detected", "no_feature_link")
     if "confirmed" in feature_states:

@@ -1995,6 +1995,24 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             continue
         if paths is None:
             class_route_prefix_unrecoverable.add(target_type)
+            # FIX ROUND 20 (sixteenth cold read, M3 MAJOR, wrong-data):
+            # this branch tracked the class as prefix-unrecoverable (so
+            # every method-level route inside it correctly stays
+            # suppressed, below) but never itself recorded a problem -
+            # only the METHOD-level unrecoverable-value fail-safe did.
+            # A class-level @Path(SOME_CONSTANT) (a path-constants class,
+            # a common idiom) then had no problems.json record at all
+            # naming ITS OWN unrecoverable value, even though the whole
+            # class's routes are silently gone. Recorded here too, the
+            # same reason_code, attributed to the class itself.
+            problems.append(JavaAdapterProblem(
+                reason_code="route_value_unrecoverable",
+                detail=f"a class-level route annotation at line "
+                       f"{_line_at(newline_offsets, match.start())} has a value that could "
+                       "not be recovered as a literal - suppressed rather than published "
+                       "with a guessed or partial value",
+                qualified_name=target_type,
+            ))
         elif paths:
             class_route_prefix[target_type] = paths
             if match.group(1) == "Path":

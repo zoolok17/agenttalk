@@ -1182,6 +1182,92 @@ def test_run_scan_unrecognized_main_like_shape_reports_entry_points_mapped_unkno
     assert source_understood["stored_status"] == "satisfied"
 
 
+def test_run_scan_a_path_constants_class_reports_entry_points_and_feature_unknown(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 20 (sixteenth cold read, M3 MAJOR, wrong-data): mirrors
+    the reader's own .cr16-e shape - a path-constants class
+    (@RequestMapping(ApiPaths.ORDERS), a common idiom) used to publish
+    entry_points_mapped not_applicable/no_entry_point AND feature_linked
+    unsatisfied as CONFIDENT NEGATIVES, while the run itself recorded
+    (via route_value_unrecoverable) that it could not read the route at
+    all. Both signals must now report unknown, and problems.json must
+    name BOTH the class-level annotation's own unrecoverable value AND
+    the method-level fail-safe it triggers."""
+    (java_repo / "src" / "main" / "java" / "p" / "Controller.java").write_text(
+        "package p;\n"
+        "\n"
+        "@RequestMapping(ApiPaths.ORDERS)\n"
+        "public class Controller {\n"
+        "  @GetMapping(\"/list\")\n"
+        "  public void list() {}\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    import json
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+
+    controller_unit = next(
+        u for u in modules_doc["units"] if u["display_name"] == "Controller")
+    assert "route_value_unrecoverable" in controller_unit["adapter_problem_reasons"]
+
+    entry_points_mapped = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == controller_unit["unit_id"] and s["check"] == "entry_points_mapped"
+    )
+    feature_linked = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == controller_unit["unit_id"] and s["check"] == "feature_linked"
+    )
+    assert entry_points_mapped["stored_status"] == "unknown"
+    assert entry_points_mapped["reason_code"] == "route_value_unrecoverable"
+    assert feature_linked["stored_status"] == "unknown"
+    assert feature_linked["reason_code"] == "route_value_unrecoverable"
+
+    route_problems = [
+        p for p in problems_doc["problems"] if p["reason_code"] == "route_value_unrecoverable"]
+    assert len(route_problems) == 2
+
+
+def test_run_scan_a_class_with_no_route_at_all_stays_the_honest_negative(
+    java_repo: Path,
+) -> None:
+    """Companion negative case - a plain class with no route annotation
+    at all must keep its confident not_applicable/unsatisfied negatives,
+    unaffected by the M3 routing change."""
+    (java_repo / "src" / "main" / "java" / "p" / "PlainService.java").write_text(
+        "package p;\n"
+        "\n"
+        "public class PlainService {\n"
+        "  public void doWork() {}\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    import json
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+
+    plain_unit = next(u for u in modules_doc["units"] if u["display_name"] == "PlainService")
+    entry_points_mapped = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == plain_unit["unit_id"] and s["check"] == "entry_points_mapped"
+    )
+    feature_linked = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == plain_unit["unit_id"] and s["check"] == "feature_linked"
+    )
+    assert entry_points_mapped["stored_status"] == "not_applicable"
+    assert feature_linked["stored_status"] == "unsatisfied"
+
+
 def test_run_scan_populates_source_digest_on_dependency_and_feature_producers(
     java_repo: Path,
 ) -> None:
