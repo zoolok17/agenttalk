@@ -25,6 +25,21 @@ only one this codebase already shells out to elsewhere — see
 other supported VCS is claimed; its absence routes through the SAME
 "no VCS" attended-acknowledgement path as a plain non-VCS directory,
 exactly as the design requires for anything that cannot be proven.
+
+FIX ROUND 33 (twenty-ninth cold read, R1 REJECT on round 32's own F1,
+reviewer-3's delta): the design's own "synthetic child path" wording
+(quoted above) describes a PROOF BY PROXY — checking ONE stand-in path
+and generalizing its answer to the whole store — and that proxy proof
+was measured broken: any Git rule that discriminates by real filename or
+real scan-id shape (rather than by a probe's own fixed literal spelling)
+defeats it while leaving the probe itself "ignored". This module's own
+:func:`run_privacy_preflight`/:func:`_check_ignore` remain a cheap, EARLY
+fail-fast against an obviously-unignored store — refusing before any
+scan work even starts is still worth doing — but they are NOT this
+plane's actual privacy guarantee any more. The guarantee is
+:func:`verify_published_paths_ignored`, called by ``publish.py``
+immediately AFTER a run's real files exist on disk, checking those exact
+real paths directly — no proxy, nothing left to generalize.
 """
 
 from __future__ import annotations
@@ -58,6 +73,20 @@ GIT_TIMEOUT_SECONDS = 2.0
 #: module. The probe names themselves are fixed, arbitrary literals — they
 #: never correspond to a real scan_id/nonce a writer could produce, so a
 #: probe can never collide with real content.
+#:
+#: FIX ROUND 33 (twenty-ninth cold read, R1 REJECT on round 32's own F1,
+#: reviewer-3's delta): even THREE sentinels are still sentinels — the
+#: proof this constant enables is still "these specific LITERAL paths are
+#: ignored, therefore everything published is," which is false for any
+#: rule that discriminates by real filename or real scan-id SHAPE rather
+#: than by these probes' own fixed literal spelling. Confirmed defeated
+#: three ways (see ``verify_published_paths_ignored``'s own docstring for
+#: the fix). This preflight — and the module-level probe below — is
+#: DEMOTED to a cheap, EARLY, non-authoritative fail-fast: a real store
+#: this obviously unignored is refused before any scan work even starts,
+#: which is still worth doing, but it is NO LONGER the guarantee. The
+#: guarantee is ``verify_published_paths_ignored``, checked against the
+#: REAL, now-existing published paths, after publication.
 _PRIVACY_PROBE_RELATIVE_PATHS = (
     f"{RELATIVE_COMPREHENSION_DIR}/{INDEX_FILENAME}",
     f"{RELATIVE_COMPREHENSION_DIR}/{RUNS_DIRNAME}/privacy-probe-run/scan.json",
@@ -166,9 +195,11 @@ def _check_ignore_one(root: Path, relative_path: str) -> tuple[bool, str | None]
     the directory is ignored" — never inferred by reading ``.gitignore``
     text). Returns ``(is_ignored, matched_rule)``, or ``None`` if the query
     itself could not be trusted. Shared by :func:`_check_ignore` (the
-    multi-probe preflight) and :func:`verify_concrete_path_ignored` (the
-    round 32 belt re-check publish.py runs immediately before publication) —
-    the same git check-ignore machinery, never duplicated.
+    demoted, early-refusal multi-probe preflight) and
+    :func:`verify_published_paths_ignored` (the round 33 ground-truth
+    check publish.py runs immediately after publication, against every
+    real published path) — the same git check-ignore machinery, never
+    duplicated.
 
     FIX ROUND 32 (F1 BLOCKER, discovered while building the multi-probe
     regression fixtures — a proper `!pattern` re-inclusion chain (unlike the
@@ -197,14 +228,18 @@ def _check_ignore_one(root: Path, relative_path: str) -> tuple[bool, str | None]
 
 
 def _check_ignore(root: Path) -> tuple[bool, str | None] | None:
-    """Proves ignore status of the WHOLE comprehension store by checking
-    EVERY probe in :data:`_PRIVACY_PROBE_RELATIVE_PATHS` (see that
-    constant's own docstring for why one probe is not enough) and requiring
-    all of them to independently prove ignored. Returns
-    ``(True, matched_rule)`` (the first probe's own rule) only when every
-    probe is ignored; ``(False, None)`` as soon as any probe proves NOT
-    ignored; ``None`` (untrustworthy) as soon as any probe's query itself
-    could not be trusted."""
+    """FIX ROUND 33 (twenty-ninth cold read, demoted): a cheap, EARLY,
+    NON-AUTHORITATIVE fail-fast heuristic only — checks EVERY probe in
+    :data:`_PRIVACY_PROBE_RELATIVE_PATHS` (see that constant's own
+    docstring for why even three fixed, synthetic probes cannot prove the
+    whole store ignored) and requires all of them to independently prove
+    ignored. A store this obviously unignored is refused before any scan
+    work even starts — still worth doing — but a ``True`` result here is
+    NOT the guarantee; see :func:`verify_published_paths_ignored` for the
+    actual ground-truth check. Returns ``(True, matched_rule)`` (the first
+    probe's own rule) only when every probe is ignored; ``(False, None)``
+    as soon as any probe proves NOT ignored; ``None`` (untrustworthy) as
+    soon as any probe's query itself could not be trusted."""
     first_matched_rule: str | None = None
     for probe_path in _PRIVACY_PROBE_RELATIVE_PATHS:
         probe_status = _check_ignore_one(root, probe_path)
@@ -218,29 +253,55 @@ def _check_ignore(root: Path) -> tuple[bool, str | None] | None:
     return True, first_matched_rule
 
 
-def verify_concrete_path_ignored(root: Path, relative_path: str) -> None:
-    """FIX ROUND 32 (twenty-eighth cold read, F1 BLOCKER): the "belt" half
-    of the fix — re-verifies ONE concrete, real path's ignore status
-    immediately before publication commits it, closing the TOCTOU-shaped
-    gap between the preflight's own proof (captured once, at lock
-    acquisition) and the moment content is actually about to become visible
-    to Git under that exact path (e.g. a ``.gitignore`` edited mid-run).
-    Reuses the identical check-ignore machinery the preflight probes use —
-    no new mechanism. Raises :class:`VcsPrivacyRefused` (``vcs_kind="git"``)
-    if ``relative_path`` is not (or can no longer be trusted to be) proven
-    ignored; returns ``None`` on success.
+def verify_published_paths_ignored(root: Path, relative_paths: list[str]) -> None:
+    """FIX ROUND 33 (twenty-ninth cold read, R1 REJECT on round 32's own
+    F1, reviewer-3's delta): STOPS PROVING BY PROXY. Round 32 replaced one
+    synthetic sentinel with three, but the proof was still "these specific
+    literal paths are ignored, therefore everything published is" — false
+    for any rule discriminating by real filename or real id shape.
+    Reviewer-3 broke it three ways, each confirmed by actually staging
+    artifacts in a run the old preflight/belt ALLOWED:
 
-    Callers must gate on the recorded disposition themselves: this is only
-    meaningful when that disposition was the automatic ``"ignored"`` — an
-    operator who explicitly ACKNOWLEDGED an unignored store already
-    accepted this exact risk for this one run, and re-checking here would
-    spuriously refuse a publish that operator already attended to."""
-    status = _check_ignore_one(root, relative_path)
-    if status is None or not status[0]:
-        raise VcsPrivacyRefused(
-            f"{relative_path} is not proven ignored by Git immediately before "
-            "publication (belt re-check) — refusing to publish", vcs_kind="git",
-        )
+    1. The probes name fixed FILENAMES (``scan.json``, ``owner.json``) — a
+       ``.gitignore`` re-including a DIFFERENT real filename specifically
+       (``!.../runs/*/modules.json``) leaves every probe "ignored" while
+       that one real artifact (and, by the same rule shape, any other
+       filename the probes never named) leaks.
+    2. The probe id is the fixed literal ``"privacy-probe-run"`` — a rule
+       keyed on the REAL scan-id shape (``!.../runs/2026*/``) leaks an
+       entire real run while looking unremarkable, since the probe's own
+       id never matches that pattern and so still reports "ignored".
+    3. The pre-rename belt asked about ``runs/<scan_id>/`` BEFORE the
+       rename created it — a directory-only pattern cannot be confirmed
+       against a path that does not yet exist, so the belt's own answer
+       could flip the instant the rename actually landed.
+
+    The fix: no synthetic stand-in at all. The caller passes the ACTUAL,
+    now-published relative file paths under ``runs/<scan_id>/`` — real
+    filenames, the real scan-id, checked only AFTER the rename so every
+    path genuinely exists on disk — and this asks git's ignore matcher
+    about EACH ONE directly. There is no generalization left to defeat,
+    because nothing here is inferred from a stand-in; the paths ARE the
+    published content. Raises :class:`VcsPrivacyRefused` (``vcs_kind=
+    "git"``) the moment any real path is not (or can no longer be trusted
+    to be) proven ignored; the caller is responsible for removing the
+    just-published run directory on this raise — this function only ever
+    queries git, it never touches the filesystem itself.
+
+    Callers must gate on the recorded disposition themselves, same as
+    round 32's own belt did: only meaningful for the automatic ``"ignored"``
+    disposition — an operator who explicitly ACKNOWLEDGED an unignored
+    store already accepted this exact risk for this one run, and
+    re-checking here would spuriously refuse a publish that operator
+    already attended to."""
+    for relative_path in relative_paths:
+        status = _check_ignore_one(root, relative_path)
+        if status is None or not status[0]:
+            raise VcsPrivacyRefused(
+                f"{relative_path} is not proven ignored by Git immediately after "
+                "publication (ground-truth re-check) — refusing to publish, and "
+                "removing the just-published run", vcs_kind="git",
+            )
 
 
 def run_privacy_preflight(root: Path) -> PrivacyPreflightResult:

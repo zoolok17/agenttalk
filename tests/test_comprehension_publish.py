@@ -236,15 +236,17 @@ def test_rename_refuses_when_run_directory_already_exists(
     lockmod.release_scan_lock(lock)
 
 
-# --------------------- FIX ROUND 32 (twenty-eighth cold read, F1 BLOCKER):
-# the "belt" re-check immediately before the rename commits the staging dir
+# --------------------- FIX ROUND 33 (twenty-ninth cold read, R1 REJECT on
+# round 32's own F1): the pre-rename "belt" (a synthetic, proof-by-proxy
+# single path) is replaced by a POST-rename ground-truth check against
+# every REAL file the run actually published, with rollback on refusal.
 
-def test_publish_run_belt_recheck_passes_when_still_ignored(
+def test_publish_run_ground_truth_check_passes_when_still_ignored(
     comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
-    """Regression control: the belt re-check must not spuriously refuse an
-    ordinary publish when the comprehension dir is still genuinely ignored
-    exactly as the preflight proved."""
+    """Regression control: the ground-truth check must not spuriously
+    refuse an ordinary publish when the comprehension dir is still
+    genuinely ignored exactly as the preflight proved."""
     lock, staging = _stage(comprehension_dir, comprehension_privacy, "scan-1")
     pub.publish_run(
         staging_handle=staging, lock_handle=lock,
@@ -254,14 +256,19 @@ def test_publish_run_belt_recheck_passes_when_still_ignored(
     assert (comprehension_dir / "runs" / "scan-1").is_dir()
 
 
-def test_publish_run_belt_recheck_refuses_when_gitignore_removed_mid_run(
+def test_publish_run_ground_truth_check_refuses_and_rolls_back_mid_run_gitignore_removal(
     comprehension_privacy_root: Path, comprehension_dir: Path,
     comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
     """The preflight proved ``.agenttalk/`` ignored at lock-acquisition
     time, but a ``.gitignore`` removal DURING the run (a TOCTOU-shaped gap)
-    must still be caught immediately before the rename actually commits the
-    staging dir into ``runs/`` - the whole point of the belt re-check."""
+    must still be caught - now checked against the REAL, just-published
+    ``runs/scan-1/scan.json`` (a path that only exists AFTER the rename,
+    never a synthetic stand-in checked before it existed - DEFEAT 3 from
+    round 32's own pre-rename belt). On refusal, the just-published run
+    directory is rolled back (removed) - nothing is left stageable in
+    either ``.staging/`` (already renamed away) or ``runs/`` (just
+    removed)."""
     lock, staging = _stage(comprehension_dir, comprehension_privacy, "scan-1")
     (comprehension_privacy_root / ".gitignore").unlink()
     with pytest.raises(VcsPrivacyRefused):
@@ -270,19 +277,88 @@ def test_publish_run_belt_recheck_refuses_when_gitignore_removed_mid_run(
             run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None,
             record_counts=_COUNTS, privacy_result=comprehension_privacy,
         )
-    assert staging.path.exists()  # never renamed
-    assert not (comprehension_dir / "runs" / "scan-1").exists()
+    assert not staging.path.exists()  # renamed away, never restored
+    assert not (comprehension_dir / "runs" / "scan-1").exists()  # rolled back
     assert not lock.path.exists()  # still released despite the refusal (design step 3)
 
 
-def test_rename_belt_recheck_skipped_for_acknowledged_unignored_disposition(
+def test_publish_run_ground_truth_check_refuses_defeat_1_filename_specific_reinclusion(
+    comprehension_privacy_root: Path, comprehension_dir: Path,
+    comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """FIX ROUND 33's own DEFEAT 1 (reviewer-3's delta on round 32's F1):
+    a synthetic probe named by a FIXED, arbitrary filename ("scan.json")
+    stays "ignored" under a rule that re-includes a DIFFERENT real
+    artifact filename specifically - the old sentinel could never see
+    this, because it never checked the OTHER real filenames a run
+    actually publishes. Here a second real artifact ("modules.json") is
+    re-included by name; the ground-truth check enumerates the ACTUAL
+    published files (not a synthetic stand-in) and must catch it."""
+    (comprehension_privacy_root / ".gitignore").write_text(
+        ".agenttalk/**\n"
+        "!.agenttalk/comprehension/\n"
+        "!.agenttalk/comprehension/runs/\n"
+        "!.agenttalk/comprehension/runs/scan-1/\n"
+        "!.agenttalk/comprehension/runs/scan-1/modules.json\n",
+        encoding="utf-8",
+    )
+    lock = lockmod.acquire_scan_lock(
+        comprehension_dir, privacy=comprehension_privacy, predecessor_index_digest=None)
+    staging = stg.create_staging_dir(scan_id="scan-1", lock_handle=lock)
+    (staging.path / "scan.json").write_text("hello", encoding="utf-8")
+    (staging.path / "modules.json").write_text("leaked", encoding="utf-8")
+    with pytest.raises(VcsPrivacyRefused):
+        pub.publish_run(
+            staging_handle=staging, lock_handle=lock,
+            run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None,
+            record_counts={"scan.json": 1, "modules.json": 1}, privacy_result=comprehension_privacy,
+        )
+    assert not (comprehension_dir / "runs" / "scan-1").exists()  # rolled back
+
+
+def test_publish_run_ground_truth_check_refuses_defeat_2_scan_id_shape_reinclusion(
+    comprehension_privacy_root: Path, comprehension_dir: Path,
+    comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """FIX ROUND 33's own DEFEAT 2 (reviewer-3's delta, THE WORST one): a
+    synthetic probe using a FIXED, non-matching literal scan-id
+    ("privacy-probe-run") stays "ignored" under a rule keyed on the REAL
+    scan-id's own shape (a date-prefixed pattern, ``runs/2026*/``) - that
+    rule leaks an ENTIRE real run while looking unremarkable, since the
+    probe's own literal id never matches it. Uses a realistic, date-
+    shaped scan_id (unlike this file's own bare "scan-1" convention
+    elsewhere) specifically so the shape-keyed rule below has something
+    real to match against."""
+    real_scan_id = "20260901T120000000000Z-a1b2c3d4"
+    (comprehension_privacy_root / ".gitignore").write_text(
+        ".agenttalk/**\n"
+        "!.agenttalk/comprehension/\n"
+        "!.agenttalk/comprehension/runs/\n"
+        "!.agenttalk/comprehension/runs/2026*/\n"
+        "!.agenttalk/comprehension/runs/2026*/**\n",
+        encoding="utf-8",
+    )
+    lock = lockmod.acquire_scan_lock(
+        comprehension_dir, privacy=comprehension_privacy, predecessor_index_digest=None)
+    staging = stg.create_staging_dir(scan_id=real_scan_id, lock_handle=lock)
+    (staging.path / "scan.json").write_text("hello", encoding="utf-8")
+    with pytest.raises(VcsPrivacyRefused):
+        pub.publish_run(
+            staging_handle=staging, lock_handle=lock,
+            run_summary={"scan_id": real_scan_id}, predecessor_index_digest=None,
+            record_counts={"scan.json": 1}, privacy_result=comprehension_privacy,
+        )
+    assert not (comprehension_dir / "runs" / real_scan_id).exists()  # rolled back
+
+
+def test_rename_ground_truth_check_skipped_for_acknowledged_unignored_disposition(
     comprehension_privacy_root: Path, comprehension_dir: Path,
 ) -> None:
     """An operator who explicitly ACKNOWLEDGED an unignored store already
-    accepted this exact risk for this one run - the belt re-check only
-    applies to the automatic "ignored" disposition and must not spuriously
-    re-refuse a publish that was never claiming "ignored" in the first
-    place."""
+    accepted this exact risk for this one run - the ground-truth check
+    only applies to the automatic "ignored" disposition and must not
+    spuriously re-refuse a publish that was never claiming "ignored" in
+    the first place."""
     acknowledged = privacymod.acknowledge_unignored_private_store(
         comprehension_privacy_root, vcs_kind="git", work_id="w1")
     (comprehension_privacy_root / ".gitignore").unlink()  # genuinely unignored
@@ -295,7 +371,7 @@ def test_rename_belt_recheck_skipped_for_acknowledged_unignored_disposition(
     assert (comprehension_dir / "runs" / "scan-1").is_dir()
 
 
-def test_rename_belt_recheck_skipped_when_no_privacy_result_passed(
+def test_rename_ground_truth_check_skipped_when_no_privacy_result_passed(
     comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
     """``privacy_result`` is optional (default ``None``) precisely so tests

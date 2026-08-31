@@ -35,6 +35,7 @@ import contextlib
 import json
 import os
 import re
+import shutil
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -50,14 +51,13 @@ from .envelope import (
     validate_envelope,
     validate_scan_id,
 )
-from .errors import ComprehensionError, StagingSourceEscapesRoot
+from .errors import ComprehensionError, StagingSourceEscapesRoot, VcsPrivacyRefused
 from .lock import ScanLockHandle, release_scan_lock
-from .paths import RELATIVE_COMPREHENSION_DIR, RUNS_DIRNAME
 from .paths import index_path as _index_path
 from .paths import project_root_from_comprehension_dir
 from .paths import runs_dir as _runs_dir
 from .paths import staging_dir as _staging_dir
-from .privacy import PrivacyPreflightResult, verify_concrete_path_ignored
+from .privacy import PrivacyPreflightResult, verify_published_paths_ignored
 from .staging import _OWNER_FILENAME, StagingHandle, _validate_owner_doc
 
 INDEX_SCHEMA_VERSION = 1
@@ -156,18 +156,23 @@ def rename_staging_to_run(
     path (never from the handle's claimed fields) — all three raise
     :class:`~.errors.StagingSourceEscapesRoot`.
 
-    FIX ROUND 32 (twenty-eighth cold read, F1 BLOCKER, privacy boundary,
-    "belt" half): ``privacy_result`` is optional so tests exercising the
-    rename mechanics alone need not construct one, but the real
-    ``scan_pipeline.run_scan`` orchestrator always passes the one it
-    obtained at lock acquisition. When its ``vcs_privacy`` is the automatic
-    ``"ignored"`` (never for an explicit ``acknowledged_unignored``/
-    ``no_vcs_acknowledged`` override, which already accepted this exact
-    risk), the concrete ``runs/<scan_id>/`` path is re-verified ignored via
-    ``privacy.verify_concrete_path_ignored`` immediately before this
-    rename — closing the TOCTOU-shaped gap between the preflight's own
-    proof (captured once, before this scan even started) and this exact
-    moment content becomes visible to Git under that exact path.
+    FIX ROUND 33 (twenty-ninth cold read, R1 REJECT on round 32's own F1,
+    reviewer-3's delta - "stop proving by proxy"): ``privacy_result`` is
+    optional so tests exercising the rename mechanics alone need not
+    construct one, but the real ``scan_pipeline.run_scan`` orchestrator
+    always passes the one it obtained at lock acquisition. When its
+    ``vcs_privacy`` is the automatic ``"ignored"`` (never for an explicit
+    ``acknowledged_unignored``/``no_vcs_acknowledged`` override, which
+    already accepted this exact risk), :func:`_verify_published_ignored_
+    or_rollback` re-verifies EVERY REAL file now published under
+    ``runs/<scan_id>/`` is ignored — a ground-truth check against paths
+    that actually exist, run only AFTER the rename below, replacing round
+    32's own pre-rename single-synthetic-path "belt" (which proved by
+    proxy against a path that did not exist yet, and was defeated three
+    ways - see :func:`privacy.verify_published_paths_ignored`'s own
+    docstring). A failure here removes the just-renamed run directory
+    before raising - the content already sat in ``.staging/`` regardless,
+    so this rollback adds no NEW exposure window, only a fail-closed one.
     """
     if staging_handle.owner_token != lock_handle.owner_token:
         raise StagingOwnershipMismatch(
@@ -208,14 +213,11 @@ def rename_staging_to_run(
     dst = resolve_under_root(scan_id, root=_runs_dir(comprehension_dir), label="run directory")
     if dst.exists():
         raise RunDirectoryExists(f"runs/{scan_id}/ already exists — scan IDs must be unique")
-    if privacy_result is not None and privacy_result.vcs_privacy == "ignored":
-        root = project_root_from_comprehension_dir(comprehension_dir)
-        relative_run_path = f"{RELATIVE_COMPREHENSION_DIR}/{RUNS_DIRNAME}/{scan_id}"
-        verify_concrete_path_ignored(root, relative_run_path)
     dst.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if not _is_windows():
         os.rename(staging_handle.path, dst)
         _strip_owner_file(dst)
+        _verify_published_ignored_or_rollback(dst, comprehension_dir, privacy_result)
         return dst
     deadline = time.monotonic() + _RENAME_RETRY_TIMEOUT_SECONDS
     delay = 0.01
@@ -223,6 +225,7 @@ def rename_staging_to_run(
         try:
             os.rename(staging_handle.path, dst)
             _strip_owner_file(dst)
+            _verify_published_ignored_or_rollback(dst, comprehension_dir, privacy_result)
             return dst
         except PermissionError as exc:
             if time.monotonic() >= deadline:
@@ -232,6 +235,39 @@ def rename_staging_to_run(
                 ) from exc
             time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
             delay = min(delay * 2, 0.25)
+
+
+def _verify_published_ignored_or_rollback(
+    dst: Path, comprehension_dir: Path, privacy_result: PrivacyPreflightResult | None,
+) -> None:
+    """FIX ROUND 33 (twenty-ninth cold read, R1 REJECT on round 32's own
+    F1, reviewer-3's delta): the ground-truth replacement for round 32's
+    own pre-rename "belt" - see :func:`privacy.verify_published_paths_
+    ignored`'s own docstring for the three ways that belt was defeated.
+    Runs ONLY after the rename above has already landed ``dst`` on disk
+    (mind DEFEAT 3: never check a path before it exists), and only when
+    the recorded disposition is the automatic ``"ignored"`` (an
+    ``acknowledged_unignored``/``no_vcs_acknowledged`` override already
+    accepted this exact risk and must never be re-refused here).
+
+    Enumerates every REAL file `dst` now contains (never a synthetic
+    stand-in), converts each to a project-root-relative POSIX path, and
+    hands the list to :func:`privacy.verify_published_paths_ignored`. On
+    refusal, removes the just-published run directory before letting the
+    exception propagate - the content already sat in ``.staging/``
+    regardless of this check, so deleting it here on failure closes the
+    window rather than widening it."""
+    if privacy_result is None or privacy_result.vcs_privacy != "ignored":
+        return
+    root = project_root_from_comprehension_dir(comprehension_dir)
+    published_paths = sorted(
+        path.relative_to(root).as_posix() for path in dst.rglob("*") if path.is_file()
+    )
+    try:
+        verify_published_paths_ignored(root, published_paths)
+    except VcsPrivacyRefused:
+        shutil.rmtree(dst, ignore_errors=False)
+        raise
 
 
 def _strip_owner_file(run_dir: Path) -> None:
