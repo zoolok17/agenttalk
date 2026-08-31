@@ -184,11 +184,20 @@ UNSUPPORTED_INVOKE_SHAPES = ("constructor_call", "instance_qualified_call")
 #: filter``/``startup_only_servlet`` each name BOTH the XML and
 #: annotation spelling of their own shape - the same "one name, two
 #: mechanisms" precedent ``web_xml_listener`` already established.
+#: FIX ROUND 30 (twenty-sixth cold read, F1(1a) BLOCKER, wrong-data): a
+#: ``<servlet>`` backed by ``<jsp-file>`` instead of ``<servlet-class>``
+#: (servlet-only, spec-legal, ubiquitous in JSP/Struts-era estates) used
+#: to be entirely invisible to ``_servlet_class_by_name``'s own old
+#: class-keyed map - misreported as genuinely undeclared rather than
+#: enrolled as a recognized-but-unmodeled shape. The LEAN choice (real
+#: migration-relevant estate a reader needs, not folded under a generic
+#: code): its own named member, with the JSP path itself in the detail.
 UNSUPPORTED_ENTRY_POINT_SHAPES = (
     "jax_ws_web_method", "jax_rs_verb_only_method",
     "spring_scheduled", "kafka_listener", "jms_message_driven",
     "ejb_remote_component", "websocket_server_endpoint",
     "web_xml_listener", "servlet_name_scoped_filter", "startup_only_servlet",
+    "jsp_file_servlet",
 )
 
 #: FIX ROUND 21c (reviewer-3's re-delta, THE ASK - second instance, closing
@@ -3754,6 +3763,14 @@ _SERVLET_BLOCK_RE = _structural_block_pattern("servlet")
 #: ``{path}#{servlet_name}`` placeholder instead. Every consumer decodes
 #: via ``_decode_xml_text`` before use.
 _SERVLET_CLASS_RE = _leaf_value_pattern("servlet-class", dotall=True)
+#: FIX ROUND 30 (twenty-sixth cold read, F1 BLOCKER, wrong-data): a
+#: ``<servlet>`` may declare ``<jsp-file>`` INSTEAD of ``<servlet-class>``
+#: (a JSP-backed servlet - servlet-spec-legal, ubiquitous in JSP/Struts-
+#: era estates) - servlet-only, filters have no equivalent. See
+#: ``_servlet_class_by_name``'s own docstring for why this now matters:
+#: a name backed by a ``<jsp-file>`` alone must be tracked as a REAL
+#: declaration, not silently invisible to the declared-names registry.
+_JSP_FILE_RE = _leaf_value_pattern("jsp-file", dotall=True)
 #: FIX ROUND 22 (eighteenth cold read, F3 MAJOR, wrong-data): a
 #: ``<servlet>`` carrying ``<load-on-startup>`` but no ``<servlet-
 #: mapping>`` at all is the standard startup-only servlet idiom (a
@@ -3801,31 +3818,137 @@ _LOAD_ON_STARTUP_RE = _leaf_presence_pattern("load-on-startup")
 #: kind, resolved once path/qualified-name-to-unit_id registries exist)
 #: so their own readiness reports unknown, never a confident negative
 #: for whichever one lost the old last-write-wins race.
-def _split_name_conflicts(
-    occurrences: dict[str, list[str]],
-) -> tuple[dict[str, str], dict[str, list[str]]]:
-    """Splits ``name -> [every decoded class value declared for it, in
-    file order]`` into ``(mapping, conflicts)`` - ``mapping`` holds every
-    name whose occurrences all AGREE (one distinct value, published
-    exactly as before), ``conflicts`` holds every name with 2+ DISTINCT
-    values, each value list SORTED (order-independent: swapping which
-    block appears first in the file must never change which candidates
-    are named, only ``_split_xml_comments_and_cdata``'s own file-order
-    walk feeds this, never the caller's own order of interpretation)."""
-    mapping: dict[str, str] = {}
+#: FIX ROUND 30 (twenty-sixth cold read, F1 BLOCKER, wrong-data, THE
+#: ROOT CAUSE): ``_servlet_class_by_name``/``_filter_class_by_name`` were
+#: built to answer "which CLASS backs this name" - round 29's own F9c
+#: and F1 then reused their key set to answer a DIFFERENT question, "is
+#: this name DECLARED at all" (and "how many declarations conflict"). A
+#: ``<servlet>``/``<filter>`` block with a decodable NAME but no
+#: decodable CLASS is invisible to a map keyed only by resolved class -
+#: silently misreporting a real declaration (a ``<jsp-file>``-backed
+#: servlet; a name-only ``<description>``/``<init-param>`` block; an
+#: undecodable ``<servlet-class>``) as genuinely absent, or silently
+#: resolving a real conflict to whichever declaration happened to carry
+#: a decodable class. One declaration per name is no longer collapsed
+#: into a single class-or-nothing value up front - every block whose
+#: OWN NAME decoded is recorded here, regardless of what (if anything)
+#: backs it, so the caller's own "is this name declared" question and
+#: "which class backs it" question are answered from the SAME registry
+#: rather than one silently standing in for the other.
+@dataclass(frozen=True)
+class _DescriptorDeclaration:
+    """One ``<servlet>``/``<filter>`` block's own declaration of a name.
+    Exactly one of ``class_value``/``jsp_path`` is set, or neither
+    (``class_undecodable`` distinguishes "a class was present but this
+    producer could not decode it" from "no class element at all")."""
+
+    class_value: str | None
+    jsp_path: str | None
+    class_undecodable: bool
+    block_start: int
+
+
+@dataclass(frozen=True)
+class _DescriptorRegistry:
+    """Every name a web.xml's own ``<servlet>``/``<filter>`` elements
+    declare, resolved into what a mapping targeting that name can safely
+    use.
+
+    ``resolved``: name -> class, for names where every declaration
+    agrees on the identical real class (the historical single-value
+    case, including the benign "two identical declarations" twin).
+    ``conflicts``: name -> sorted candidate labels, for names with 2+
+    declarations that do NOT all agree - round 30 F1(3): this now counts
+    DECLARATIONS, not merely distinct decodable class values, so a
+    mixed class+``<jsp-file>`` pair or a half-undecodable pair (one real
+    class, one unreadable) is a conflict too, never silently resolved to
+    whichever declaration happened to carry a usable class. A candidate
+    label may name a non-class claimant (see ``_descriptor_candidate_
+    label``) - the conflict is about the DECLARATION disagreeing, not
+    necessarily about two rival class names.
+    ``class_undecodable``: (name, block_start) pairs for a name declared
+    EXACTLY ONCE, whose own class element was present but undecodable -
+    unchanged shape from round 24, but now excludes a name that is ALSO
+    a conflict (round 30 F1(1e) - a second, disagreeing declaration
+    makes it a conflict instead, never a silent single-class resolution
+    alongside an ignored unreadable sibling).
+    ``jsp_file_only``: name -> (jsp_path, block_start), for a name
+    declared exactly once via ``<jsp-file>`` with no ``<servlet-class>``
+    at all (round 30 F1(1a) - servlet-only, filters have no equivalent).
+    ``no_backing``: name -> block_start, for a name declared with
+    neither a usable class nor (servlet-only) a ``<jsp-file>`` at all -
+    a bare ``<description>``/``<init-param>``-only block (round 30
+    F1(1b)).
+    ``declared_names``: EVERY name at least one block declares, mapping
+    or not - the registry a "genuinely undeclared" check must gate on
+    (round 30 F1(1)). The OLD check gated on ``resolved``/``conflicts``
+    instead, which is exactly why a ``<jsp-file>`` servlet or a
+    name-only declaration was misreported as undeclared - it was never
+    in either of those, despite being genuinely declared."""
+
+    resolved: dict[str, str]
+    conflicts: dict[str, list[str]]
+    class_undecodable: list[tuple[str, int]]
+    jsp_file_only: dict[str, tuple[str, int]]
+    no_backing: dict[str, int]
+    declared_names: frozenset[str]
+
+
+def _descriptor_candidate_label(declaration: _DescriptorDeclaration) -> str:
+    """The printable claimant a conflict's own problem detail names for
+    one declaration - a real class name when one decoded, else a
+    bracketed marker distinguishing WHY no real class claimant exists
+    (round 30 F1(3): "argue the candidate representation" - a marker,
+    never a guessed or blank value, keeps a conflict's own detail text
+    honest about what it actually knows)."""
+    if declaration.class_value is not None:
+        return declaration.class_value
+    if declaration.jsp_path is not None:
+        return f"<jsp-file:{declaration.jsp_path}>"
+    if declaration.class_undecodable:
+        return "<unrecoverable class>"
+    return "<no backing class>"
+
+
+def _resolve_descriptor_declarations(
+    declarations: dict[str, list[_DescriptorDeclaration]],
+) -> _DescriptorRegistry:
+    """Resolves every name's own declaration(s) - see
+    ``_DescriptorRegistry``'s own docstring for what each output field
+    means. A name's candidate LABELS (not raw declarations) decide
+    conflict-vs-resolved: exactly one distinct label across every
+    declaration of a name (whether that is 1 declaration, or several
+    that all agree) resolves; 2+ distinct labels conflict. Order-
+    independent the same way round 29's own ``_split_name_conflicts``
+    was - labels are SORTED before comparison/publication, only file
+    order feeds which declaration is representative when all agree."""
+    resolved: dict[str, str] = {}
     conflicts: dict[str, list[str]] = {}
-    for name, values in occurrences.items():
-        distinct = sorted(set(values))
-        if len(distinct) == 1:
-            mapping[name] = distinct[0]
+    class_undecodable: list[tuple[str, int]] = []
+    jsp_file_only: dict[str, tuple[str, int]] = {}
+    no_backing: dict[str, int] = {}
+    for name, occurrences in declarations.items():
+        labels = sorted({_descriptor_candidate_label(o) for o in occurrences})
+        if len(labels) > 1:
+            conflicts[name] = labels
+            continue
+        representative = occurrences[0]
+        if representative.class_value is not None:
+            resolved[name] = representative.class_value
+        elif representative.jsp_path is not None:
+            jsp_file_only[name] = (representative.jsp_path, representative.block_start)
+        elif representative.class_undecodable:
+            class_undecodable.append((name, representative.block_start))
         else:
-            conflicts[name] = distinct
-    return mapping, conflicts
+            no_backing[name] = representative.block_start
+    return _DescriptorRegistry(
+        resolved=resolved, conflicts=conflicts, class_undecodable=class_undecodable,
+        jsp_file_only=jsp_file_only, no_backing=no_backing,
+        declared_names=frozenset(declarations),
+    )
 
 
-def _servlet_class_by_name(
-    sanitized: str, structural: str,
-) -> tuple[dict[str, str], list[tuple[str, int]], list[int], dict[str, list[str]]]:
+def _servlet_class_by_name(sanitized: str, structural: str) -> tuple[_DescriptorRegistry, list[int]]:
     """FIX ROUND 17 (thirteenth cold read, CR13-2 MAJOR, wrong-data):
     web.xml's own ``<servlet>`` element (``<servlet-name>``/
     ``<servlet-class>`` pair) - twice carried as an M5/M7 fast-follow,
@@ -3836,19 +3959,9 @@ def _servlet_class_by_name(
     confident negative ``entry_points_mapped=not_applicable/
     no_entry_point`` while the route it serves was owned by the web.xml
     FILE unit instead. A servlet-name with no matching ``<servlet>``
-    block (malformed, or genuinely absent) is simply not in this
-    mapping - callers keep the old synthetic-owner fallback for it.
-
-    FIX ROUND 24 (twentieth cold read, F5 MINOR, wrong-data): a
-    ``<servlet-class>`` present but UNDECODABLE (CDATA/entity
-    constructs ``_decode_xml_text`` refuses to guess through) is a
-    DIFFERENT fact from one genuinely absent - the caller must record a
-    problem for it rather than silently falling back to the synthetic
-    owner as if the class were never declared at all. Returns
-    ``(mapping, undecodable)`` - the second list names every servlet
-    whose own class element was present but could not be decoded, each
-    paired with its ``<servlet>`` block's own start offset for the
-    caller's line-number lookup.
+    block (malformed, or genuinely absent) is simply not in the
+    returned registry's own ``resolved`` mapping - callers keep the old
+    synthetic-owner fallback for it.
 
     FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE, F2): the
     ``<servlet>`` boundary itself is now found against the CDATA-blanked
@@ -3863,20 +3976,17 @@ def _servlet_class_by_name(
     honest under-claim (the mapping still falls back to its own
     synthetic owner) but indistinguishable from the genuinely-nameless
     case, exactly what this whole mechanism exists to separate. Returns
-    a THIRD list now - ``name_undecodable`` block start offsets, no
+    a SECOND value now - ``name_undecodable`` block start offsets, no
     servlet_name possible since the name itself is what failed to
     decode - the caller records the identical problem class the mapping
     side already does.
 
-    FIX ROUND 29 (F1 BLOCKER): returns a FOURTH value now - ``conflicts``
-    (see ``_split_name_conflicts``'s own docstring) - a servlet-name
-    declared twice with two DIFFERENT class values. ``mapping`` no
-    longer silently picks whichever occurrence happened to be declared
-    last; a conflicting name is absent from ``mapping`` entirely (the
-    caller must treat it exactly like an unmatched name, never resolve
-    it to either candidate)."""
-    occurrences: dict[str, list[str]] = {}
-    undecodable: list[tuple[str, int]] = []
+    FIX ROUND 30 (twenty-sixth cold read, F1 BLOCKER, THE ROOT CAUSE):
+    returns a :class:`_DescriptorRegistry` now (was a 4-tuple splitting
+    only resolved-class-or-conflict) - see its own docstring for the
+    full mechanism. Every block whose own name decoded is recorded as a
+    declaration, whether or not it carries a usable class."""
+    declarations: dict[str, list[_DescriptorDeclaration]] = {}
     name_undecodable: list[int] = []
     for block_match in _SERVLET_BLOCK_RE.finditer(structural):
         # FIX ROUND 26 (twenty-second cold read, F2 BLOCKER, wrong-data):
@@ -3892,8 +4002,7 @@ def _servlet_class_by_name(
         block_sanitized = sanitized[block_match.start(1):block_match.end(1)]
         block_structural = structural[block_match.start(1):block_match.end(1)]
         name_match = _SERVLET_MAPPING_NAME_RE.search(block_structural)
-        class_match = _SERVLET_CLASS_RE.search(block_structural)
-        if name_match is None or class_match is None:
+        if name_match is None:
             continue
         # FIX ROUND 25 (twenty-first cold read, F4, wrong-data): decoded
         # the same as the class below.
@@ -3902,13 +4011,30 @@ def _servlet_class_by_name(
             name_undecodable.append(block_match.start())
             continue
         servlet_name = decoded_name.strip()
-        decoded_class = _decode_xml_text(block_sanitized[class_match.start(1):class_match.end(1)])
-        if decoded_class is None:
-            undecodable.append((servlet_name, block_match.start()))
+        class_match = _SERVLET_CLASS_RE.search(block_structural)
+        if class_match is None:
+            # FIX ROUND 30 (F1(1a)/(1b)): no <servlet-class> at all - a
+            # <jsp-file>-backed servlet if one decodes, else a bare
+            # name-only declaration. Still a REAL declaration either way
+            # - recorded, never skipped the way the pre-round-30 code
+            # silently dropped both shapes entirely.
+            jsp_match = _JSP_FILE_RE.search(block_structural)
+            jsp_path = (
+                _decode_xml_text(block_sanitized[jsp_match.start(1):jsp_match.end(1)])
+                if jsp_match is not None else None
+            )
+            declarations.setdefault(servlet_name, []).append(_DescriptorDeclaration(
+                class_value=None,
+                jsp_path=_bounded_route_target(jsp_path.strip()) if jsp_path is not None else None,
+                class_undecodable=False, block_start=block_match.start(),
+            ))
             continue
-        occurrences.setdefault(servlet_name, []).append(_bounded_route_target(decoded_class.strip()))
-    mapping, conflicts = _split_name_conflicts(occurrences)
-    return mapping, undecodable, name_undecodable, conflicts
+        decoded_class = _decode_xml_text(block_sanitized[class_match.start(1):class_match.end(1)])
+        declarations.setdefault(servlet_name, []).append(_DescriptorDeclaration(
+            class_value=_bounded_route_target(decoded_class.strip()) if decoded_class is not None else None,
+            jsp_path=None, class_undecodable=decoded_class is None, block_start=block_match.start(),
+        ))
+    return _resolve_descriptor_declarations(declarations), name_undecodable
 
 
 #: FIX ROUND 21 (seventeenth cold read, CR17-3 MAJOR, wrong-data): a
@@ -3957,35 +4083,25 @@ _LISTENER_BLOCK_RE = _structural_block_pattern("listener")
 _LISTENER_CLASS_RE = _leaf_value_pattern("listener-class", dotall=True)
 
 
-def _filter_class_by_name(
-    sanitized: str, structural: str,
-) -> tuple[dict[str, str], list[tuple[str, int]], list[int], dict[str, list[str]]]:
+def _filter_class_by_name(sanitized: str, structural: str) -> tuple[_DescriptorRegistry, list[int]]:
     """FIX ROUND 21b (THE MAJOR's own web.xml-symmetry follow-through):
     web.xml's own ``<filter>`` element (``<filter-name>``/
     ``<filter-class>`` pair), joined below against ``<filter-mapping>``'s
     own filter-name - the exact same join ``_servlet_class_by_name``
     already performs for servlets. A filter-name with no matching
     ``<filter>`` block (malformed, or genuinely absent) is simply not in
-    this mapping - callers keep the synthetic ``{relative_path}#{filter_
-    name}`` fallback for it, the same asymmetry already accepted for an
-    unmatched servlet-mapping.
+    the returned registry's own ``resolved`` mapping - callers keep the
+    synthetic ``{relative_path}#{filter_name}`` fallback for it, the
+    same asymmetry already accepted for an unmatched servlet-mapping.
 
-    FIX ROUND 24 (twentieth cold read, F5 MINOR, wrong-data): the exact
-    same undecodable-vs-absent distinction ``_servlet_class_by_name``
-    now makes - see its own docstring.
-
-    FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE, F2): the exact
-    same CDATA-blanked boundary scan ``_servlet_class_by_name`` now
-    uses - see its own docstring.
-
-    FIX ROUND 25 (micro-round 25b, item 1, R3 BLOCK-SIDE GAP): the exact
-    same third ``name_undecodable`` list ``_servlet_class_by_name`` now
-    returns - see its own docstring.
-
-    FIX ROUND 29 (F1 BLOCKER): the exact same FOURTH ``conflicts`` value
-    ``_servlet_class_by_name`` now returns - see its own docstring."""
-    occurrences: dict[str, list[str]] = {}
-    undecodable: list[tuple[str, int]] = []
+    FIX ROUND 30 (twenty-sixth cold read, F1 BLOCKER, THE ROOT CAUSE):
+    returns a :class:`_DescriptorRegistry` now, the exact same shape
+    ``_servlet_class_by_name`` returns - see its own docstring for the
+    full mechanism. A filter has no ``<jsp-file>`` equivalent (servlet-
+    only per spec), so ``jsp_file_only`` is always empty here - a
+    filter-name declared with no usable class always lands in
+    ``no_backing`` instead."""
+    declarations: dict[str, list[_DescriptorDeclaration]] = {}
     name_undecodable: list[int] = []
     for block_match in _FILTER_BLOCK_RE.finditer(structural):
         # FIX ROUND 26 (twenty-second cold read, F2 BLOCKER, wrong-data):
@@ -3995,8 +4111,7 @@ def _filter_class_by_name(
         block_sanitized = sanitized[block_match.start(1):block_match.end(1)]
         block_structural = structural[block_match.start(1):block_match.end(1)]
         name_match = _FILTER_NAME_RE.search(block_structural)
-        class_match = _FILTER_CLASS_RE.search(block_structural)
-        if name_match is None or class_match is None:
+        if name_match is None:
             continue
         # FIX ROUND 25 (twenty-first cold read, F4, wrong-data): the
         # exact same decode discipline as ``_servlet_class_by_name``
@@ -4006,13 +4121,21 @@ def _filter_class_by_name(
             name_undecodable.append(block_match.start())
             continue
         filter_name = decoded_name.strip()
-        decoded_class = _decode_xml_text(block_sanitized[class_match.start(1):class_match.end(1)])
-        if decoded_class is None:
-            undecodable.append((filter_name, block_match.start()))
+        class_match = _FILTER_CLASS_RE.search(block_structural)
+        if class_match is None:
+            # FIX ROUND 30 (F1(1b)): a bare name-only declaration - still
+            # a real declaration, never skipped.
+            declarations.setdefault(filter_name, []).append(_DescriptorDeclaration(
+                class_value=None, jsp_path=None, class_undecodable=False,
+                block_start=block_match.start(),
+            ))
             continue
-        occurrences.setdefault(filter_name, []).append(_bounded_route_target(decoded_class.strip()))
-    mapping, conflicts = _split_name_conflicts(occurrences)
-    return mapping, undecodable, name_undecodable, conflicts
+        decoded_class = _decode_xml_text(block_sanitized[class_match.start(1):class_match.end(1)])
+        declarations.setdefault(filter_name, []).append(_DescriptorDeclaration(
+            class_value=_bounded_route_target(decoded_class.strip()) if decoded_class is not None else None,
+            jsp_path=None, class_undecodable=decoded_class is None, block_start=block_match.start(),
+        ))
+    return _resolve_descriptor_declarations(declarations), name_undecodable
 
 
 #: FIX ROUND 24 (micro-round 24b, reviewer-3 delta on `3a7abc2`, item 1,
@@ -4130,19 +4253,24 @@ def parse_web_xml(
 
     FIX ROUND 29 (twenty-fifth cold read, F1 BLOCKER, wrong-data): return
     arity WIDENED AGAIN, to a 4-tuple - ``descriptor_name_conflicts``, a
-    list of ``(anchor, sorted_candidate_qualified_names)`` pairs, one per
-    servlet-name/filter-name this file declares twice with two DIFFERENT
-    class values (see ``_split_name_conflicts``'s own docstring for the
-    full mechanism). ``scan_pipeline.py`` aggregates this across every
-    web.xml a run processes and hands it to ``modules_artifact.
-    build_modules``, which stamps a shared ``conflict_id``/
-    ``conflict_kind="duplicate_descriptor_name"`` on whichever candidate
-    classes resolve in-scan - the same generic "a unit carrying a
-    conflict_id reports unknown on its dependent readiness signals"
-    override ``duplicate_qualified_name`` conflicts already trigger
-    (readiness_artifact.py), reused for a DIFFERENT root cause via a
-    DIFFERENT ``conflict_kind`` string (never silently mislabeled as an
-    FQN collision, which this is not).
+    list of ``(anchor, sorted_candidate_labels)`` pairs, one per
+    servlet-name/filter-name this file declares more than once,
+    disagreeing (see ``_resolve_descriptor_declarations``'s own
+    docstring for the full mechanism - round 30 widened what counts as
+    "disagreeing" from 2+ distinct decodable class values to 2+
+    declarations that do not all agree, so a candidate label may name a
+    non-class claimant, never only ever a real class name). ``scan_
+    pipeline.py`` aggregates this across every web.xml a run processes
+    and hands it to ``modules_artifact.build_modules``, which stamps a
+    shared ``conflict_id``/``conflict_kind="duplicate_descriptor_name"``
+    on whichever candidate LABELS resolve to a real, in-scan class
+    (never a non-class label, which can never match a real qualified
+    name) - the same generic "a unit carrying a conflict_id reports
+    unknown on its dependent readiness signals" override ``duplicate_
+    qualified_name`` conflicts already trigger (readiness_artifact.py),
+    reused for a DIFFERENT root cause via a DIFFERENT ``conflict_kind``
+    string (never silently mislabeled as an FQN collision, which this is
+    not).
 
     FIX ROUND 29 (F9c JUDGE): a ``<servlet-mapping>``/``<filter-mapping>``
     naming a servlet-name/filter-name that NO ``<servlet>``/``<filter>``
@@ -4155,7 +4283,31 @@ def parse_web_xml(
     distinct undeclared name. No ``conflict_id``/``conflict_kind`` is
     stamped for this case (unlike the duplicate-name conflict) - there is
     no candidate CLASS at all to attribute one to; the fallback owner
-    itself is unchanged."""
+    itself is unchanged.
+
+    FIX ROUND 30 (twenty-sixth cold read, F1 BLOCKER, THE ROOT CAUSE):
+    F9c's own "genuinely undeclared" check above and F1's own conflict
+    detector both used to gate on the SAME class-keyed map
+    (``_servlet_class_by_name``'s/``_filter_class_by_name``'s old
+    ``mapping``/``conflicts`` pair) - built to answer "which class backs
+    this name," not "is this name declared at all." A name declared via
+    ``<jsp-file>`` (servlet-only, spec-legal, ubiquitous in JSP/Struts-
+    era estates) or via a bare name-only ``<description>``/``<init-
+    param>``-only block was invisible to that map entirely - genuinely
+    declared, but absent from both ``mapping`` and ``conflicts``, so the
+    ghost-mapping check misreported it as undeclared, and a REAL
+    conflict between a class-backed and a jsp-backed (or name-only)
+    declaration of the same name resolved confidently to whichever
+    declaration carried a decodable class, the exact defect F1 exists to
+    prevent, reachable through a declaration shape the old detector
+    could not see. Both lookups now return a
+    :class:`_DescriptorRegistry` - see its own docstring for the full
+    mechanism, including the two new reason codes (``jsp_file_servlet``,
+    enrolled in ``UNSUPPORTED_ENTRY_POINT_SHAPES``; ``descriptor_name_
+    without_class``, new) that replace the old silent-drop for a
+    declared-but-unbacked name, and the ``route_value_unrecoverable``
+    fix so it no longer ALSO triggers ``undeclared_descriptor_name`` for
+    the identical anchor in the identical run."""
     entry_points = []
     problems = []
     edges: list[JavaEdgeClaim] = []
@@ -4171,32 +4323,32 @@ def parse_web_xml(
     sanitized, structural = _split_xml_comments_and_cdata(text)
     newline_offsets = _newline_offsets(sanitized)
     descriptor_name_conflicts: list[tuple[str, list[str]]] = []
-    (
-        servlet_class_by_name, servlet_class_undecodable, servlet_name_undecodable,
-        servlet_class_conflicts,
-    ) = _servlet_class_by_name(sanitized, structural)
-    # FIX ROUND 29 (twenty-fifth cold read, F1 BLOCKER, wrong-data): a
-    # servlet-name declared twice with two DIFFERENT class values - see
-    # _split_name_conflicts's own docstring for the full mechanism. One
-    # visible problem per conflicting NAME (never per occurrence, so a
-    # name mapped by several <servlet-mapping> elements does not spam
-    # duplicate rows for the identical underlying conflict); the mapping
-    # loop below already leaves a conflicting name OUT of `servlet_
-    # class_by_name` entirely, so its own `.get(name, fallback)` already
-    # falls through to the synthetic owner with no further change needed
-    # here - no adapter chosen authoritative by execution order.
-    for servlet_name, candidate_classes in sorted(servlet_class_conflicts.items()):
+    servlet_registry, servlet_name_undecodable = _servlet_class_by_name(sanitized, structural)
+    # FIX ROUND 29/30 (twenty-fifth/twenty-sixth cold reads, F1 BLOCKER,
+    # wrong-data): a servlet-name declared more than once, disagreeing -
+    # see `_resolve_descriptor_declarations`'s own docstring for the full
+    # mechanism (round 30 widened this from "2+ distinct decodable class
+    # values" to "2+ declarations that do not all agree," so a mixed
+    # class+<jsp-file> pair or a half-undecodable pair is a conflict too).
+    # One visible problem per conflicting NAME (never per occurrence, so
+    # a name mapped by several <servlet-mapping> elements does not spam
+    # duplicate rows for the identical underlying conflict); the registry
+    # already leaves a conflicting name OUT of its own `resolved` mapping
+    # entirely, so `.get(name, fallback)` below already falls through to
+    # the synthetic owner with no further change needed here - no
+    # adapter chosen authoritative by execution order.
+    for servlet_name, candidate_labels in sorted(servlet_registry.conflicts.items()):
         problems.append(JavaAdapterProblem(
             reason_code="duplicate_descriptor_name",
             detail=f"<servlet-name>{servlet_name}</servlet-name> is declared more than "
-                   f"once with different <servlet-class> values ({', '.join(candidate_classes)}) "
+                   f"once with disagreeing backing declarations ({', '.join(candidate_labels)}) "
                    "- no declaration is authoritative by execution order, so its mapped "
                    "route falls back to the synthetic per-mapping owner rather than "
                    "picking one",
             qualified_name=f"{relative_path}#{servlet_name}",
         ))
         descriptor_name_conflicts.append((
-            f"{relative_path}#servlet#{servlet_name}", candidate_classes))
+            f"{relative_path}#servlet#{servlet_name}", candidate_labels))
     # FIX ROUND 24 (twentieth cold read, F5 MINOR, wrong-data): a
     # servlet whose own <servlet-class> is present but undecodable
     # (CDATA/entity constructs) silently fell back to the synthetic
@@ -4204,13 +4356,54 @@ def parse_web_xml(
     # UNDERLYING fact is different (a real class name this producer
     # could not recover, not a class that was never declared). Recorded
     # visibly rather than left indistinguishable from the absent case.
-    for servlet_name, block_start in servlet_class_undecodable:
+    # FIX ROUND 30 (F1(1e)): only reached for a name whose ONLY
+    # declaration is this unrecoverable one - a name with a SECOND,
+    # disagreeing declaration is a conflict instead (above), never a
+    # silent single-class resolution alongside an ignored sibling.
+    for servlet_name, block_start in servlet_registry.class_undecodable:
         problems.append(JavaAdapterProblem(
             reason_code="route_value_unrecoverable",
             detail=f"a <servlet-class> declared at line "
                    f"{_line_at(newline_offsets, block_start)} contains XML constructs "
                    "this producer does not decode - its mapped route falls back to the "
                    "synthetic per-mapping owner rather than the real class",
+            qualified_name=f"{relative_path}#{servlet_name}",
+        ))
+    # FIX ROUND 30 (twenty-sixth cold read, F1(1a) BLOCKER, wrong-data):
+    # a <servlet> backed by <jsp-file> instead of <servlet-class> (spec-
+    # legal, ubiquitous in JSP/Struts-era estates) used to be entirely
+    # invisible to the old class-keyed map - previously misreported as
+    # genuinely undeclared (see the ghost-mapping check below, now gated
+    # on `declared_names` instead). Enrolled as its own named entry-point
+    # shape (the lean option: real migration-relevant estate, not folded
+    # under a generic code) via the SAME class-closer mechanism every
+    # other recognized-but-unmodeled shape already uses - the JSP path
+    # itself is named in the detail so a migration reader sees the real
+    # backing implementation, not just a bare servlet-name.
+    for servlet_name, (jsp_path, block_start) in sorted(servlet_registry.jsp_file_only.items()):
+        problems.append(JavaAdapterProblem(
+            reason_code="unsupported_entry_point_shape",
+            detail=f"a <servlet> declared at line {_line_at(newline_offsets, block_start)} "
+                   f"names <servlet-name>{servlet_name}</servlet-name>, backed by "
+                   f"<jsp-file>{jsp_path}</jsp-file> rather than a <servlet-class> "
+                   "(jsp_file_servlet) - its mapped route falls back to the synthetic "
+                   "per-mapping owner, naming the JSP directly here instead",
+            qualified_name=f"{relative_path}#{servlet_name}",
+        ))
+    # FIX ROUND 30 (twenty-sixth cold read, F1(1b) BLOCKER, wrong-data):
+    # a <servlet> declaring a name but backed by neither a usable class
+    # nor a <jsp-file> (a bare <description>/<init-param>-only block) is
+    # the SAME invisible-to-the-old-map shape as the jsp-file case above,
+    # minus a named implementation to point at - a genuinely declared
+    # name this producer simply cannot attribute a route to.
+    for servlet_name, block_start in sorted(servlet_registry.no_backing.items()):
+        problems.append(JavaAdapterProblem(
+            reason_code="descriptor_name_without_class",
+            detail=f"a <servlet> declared at line {_line_at(newline_offsets, block_start)} "
+                   f"names <servlet-name>{servlet_name}</servlet-name> but declares neither a "
+                   "<servlet-class> nor a <jsp-file> - its mapped route falls back to the "
+                   "synthetic per-mapping owner, since no backing implementation is named "
+                   "at all",
             qualified_name=f"{relative_path}#{servlet_name}",
         ))
     # FIX ROUND 25 (micro-round 25b, item 1, R3 BLOCK-SIDE GAP): the
@@ -4278,12 +4471,16 @@ def parse_web_xml(
         # name's own two-DIFFERENT-classes case; collected here and
         # recorded once per distinct undeclared name below (never per
         # occurrence, matching the conflict loop's own dedup discipline).
-        if (
-            servlet_name not in servlet_class_by_name
-            and servlet_name not in servlet_class_conflicts
-        ):
+        #
+        # FIX ROUND 30 (twenty-sixth cold read, F1(1) BLOCKER): gated on
+        # `declared_names` now, not `resolved`/`conflicts` - see
+        # `_DescriptorRegistry`'s own docstring for why the old gate
+        # misreported a <jsp-file>-backed or name-only declaration as
+        # genuinely undeclared (both are absent from `resolved` AND
+        # `conflicts`, despite being real declarations).
+        if servlet_name not in servlet_registry.declared_names:
             undeclared_servlet_names.add(servlet_name)
-        owner_qualified_name = servlet_class_by_name.get(
+        owner_qualified_name = servlet_registry.resolved.get(
             servlet_name, f"{relative_path}#{servlet_name}")
         for pattern_match in _SERVLET_MAPPING_URL_PATTERN_RE.finditer(block_structural):
             # CR9-6 (ninth cold read, judged, completeness): same per-field
@@ -4391,33 +4588,46 @@ def parse_web_xml(
                    "absent either",
             qualified_name=qualified_name,
         ))
-    (
-        filter_class_by_name, filter_class_undecodable, filter_name_undecodable,
-        filter_class_conflicts,
-    ) = _filter_class_by_name(sanitized, structural)
-    # FIX ROUND 29 (F1 BLOCKER): the identical duplicate-descriptor-name
-    # conflict handling as the servlet loop above - see its own comment.
-    for filter_name, candidate_classes in sorted(filter_class_conflicts.items()):
+    filter_registry, filter_name_undecodable = _filter_class_by_name(sanitized, structural)
+    # FIX ROUND 29/30 (F1 BLOCKER): the identical duplicate-descriptor-
+    # name conflict handling as the servlet loop above - see its own
+    # comment.
+    for filter_name, candidate_labels in sorted(filter_registry.conflicts.items()):
         problems.append(JavaAdapterProblem(
             reason_code="duplicate_descriptor_name",
             detail=f"<filter-name>{filter_name}</filter-name> is declared more than once "
-                   f"with different <filter-class> values ({', '.join(candidate_classes)}) - "
+                   f"with disagreeing backing declarations ({', '.join(candidate_labels)}) - "
                    "no declaration is authoritative by execution order, so its mapped "
                    "route falls back to the synthetic per-mapping owner rather than "
                    "picking one",
             qualified_name=f"{relative_path}#{filter_name}",
         ))
         descriptor_name_conflicts.append((
-            f"{relative_path}#filter#{filter_name}", candidate_classes))
+            f"{relative_path}#filter#{filter_name}", candidate_labels))
     # FIX ROUND 24 (F5 MINOR, wrong-data): the identical undecodable-
-    # class visibility fix as the servlet loop above.
-    for filter_name, block_start in filter_class_undecodable:
+    # class visibility fix as the servlet loop above. FIX ROUND 30
+    # (F1(1e)): only reached for a name whose only declaration is this
+    # unrecoverable one - see the servlet loop's own comment.
+    for filter_name, block_start in filter_registry.class_undecodable:
         problems.append(JavaAdapterProblem(
             reason_code="route_value_unrecoverable",
             detail=f"a <filter-class> declared at line "
                    f"{_line_at(newline_offsets, block_start)} contains XML constructs "
                    "this producer does not decode - its mapped route falls back to the "
                    "synthetic per-mapping owner rather than the real class",
+            qualified_name=f"{relative_path}#{filter_name}",
+        ))
+    # FIX ROUND 30 (twenty-sixth cold read, F1(1b) BLOCKER, wrong-data):
+    # the filter twin of the servlet no-backing case above - a filter has
+    # no <jsp-file> equivalent, so every no-usable-class filter name
+    # lands here.
+    for filter_name, block_start in sorted(filter_registry.no_backing.items()):
+        problems.append(JavaAdapterProblem(
+            reason_code="descriptor_name_without_class",
+            detail=f"a <filter> declared at line {_line_at(newline_offsets, block_start)} "
+                   f"names <filter-name>{filter_name}</filter-name> but declares no "
+                   "<filter-class> - its mapped route falls back to the synthetic "
+                   "per-mapping owner, since no backing implementation is named at all",
             qualified_name=f"{relative_path}#{filter_name}",
         ))
     # FIX ROUND 25 (micro-round 25b, item 1, R3 BLOCK-SIDE GAP): the
@@ -4458,14 +4668,13 @@ def parse_web_xml(
             ))
             continue
         filter_name = decoded_name.strip()
-        # FIX ROUND 29 (F9c JUDGE): the filter twin of the servlet-
-        # mapping ghost-name fix above - see its own comment.
-        if (
-            filter_name not in filter_class_by_name
-            and filter_name not in filter_class_conflicts
-        ):
+        # FIX ROUND 29/30 (F9c JUDGE / F1(1) BLOCKER): the filter twin of
+        # the servlet-mapping ghost-name check above - gated on
+        # `declared_names` now, not `resolved`/`conflicts` - see the
+        # servlet loop's own comment.
+        if filter_name not in filter_registry.declared_names:
             undeclared_filter_names.add(filter_name)
-        owner_qualified_name = filter_class_by_name.get(
+        owner_qualified_name = filter_registry.resolved.get(
             filter_name, f"{relative_path}#{filter_name}")
         # FIX ROUND 22 (eighteenth cold read, F3 MAJOR, wrong-data): a
         # <filter-mapping> may target a <servlet-name> instead of a

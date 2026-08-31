@@ -205,6 +205,13 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     # between two declarations) but the same "recorded, degrading"
     # bucket.
     "undeclared_descriptor_name": "warning",
+    # FIX ROUND 30 (twenty-sixth cold read, F1 BLOCKER): a web.xml
+    # <servlet>/<filter> declaring a name but backed by neither a usable
+    # class nor (servlet-only) a <jsp-file> - a THIRD descriptor-
+    # inconsistency root cause (genuinely declared, but nothing this
+    # producer can attribute a route to), same "recorded, degrading"
+    # bucket as its two siblings above.
+    "descriptor_name_without_class": "warning",
     # FIX ROUND 17 (thirteenth cold read, CR13-3 MAJOR, part (b) - THE
     # CLASS-CLOSER): a recognized-but-unsupported route-like annotation
     # (JAX-WS's own @WebMethod) - under-claimed evidence, the same

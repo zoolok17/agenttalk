@@ -2193,6 +2193,234 @@ def test_run_scan_a_three_way_duplicate_servlet_name_publishes_one_conflict_row(
     assert all(s["conflict_kind"] == "duplicate_descriptor_name" for s in servlets)
 
 
+def test_run_scan_the_four_name_matrix_each_declared_name_gets_its_own_honest_row(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 30 (twenty-sixth cold read, F1 BLOCKER, THE ROOT CAUSE):
+    _servlet_class_by_name's own OLD class-keyed map was invisible to
+    any declaration that did not carry a usable class - four servlet-
+    mapping names, each hitting a DIFFERENT shape the old map could not
+    distinguish, must each publish its own ONE honest problem row.
+
+    - "ghost": no <servlet> element at all -> undeclared_descriptor_name
+      (round 29 F9c, unaffected by this round - the control).
+    - "jspBacked": a <jsp-file>-backed servlet, no <servlet-class> at
+      all -> jsp_file_servlet (unsupported_entry_point_shape), naming
+      the JSP path - NEVER undeclared_descriptor_name (F1(1a)): this
+      name IS declared, just not class-backed.
+    - "nameOnly": a bare <description>-only <servlet> block, no class,
+      no jsp-file -> descriptor_name_without_class - NEVER
+      undeclared_descriptor_name (F1(1b)).
+    - "unreadableClass": a <servlet-class> present but undecodable
+      (split CDATA) -> route_value_unrecoverable ONLY - NEVER ALSO
+      undeclared_descriptor_name for the same anchor (F1(1c), the
+      self-contradiction the reader's own repro named: the name is
+      literally sitting in a list called `undecodable`)."""
+    import json
+
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name>jspBacked</servlet-name>\n"
+        "    <jsp-file>/WEB-INF/jsp/admin.jsp</jsp-file>\n"
+        "  </servlet>\n"
+        "  <servlet>\n"
+        "    <servlet-name>nameOnly</servlet-name>\n"
+        "    <description>legacy servlet, class retired</description>\n"
+        "  </servlet>\n"
+        "  <servlet>\n"
+        "    <servlet-name>unreadableClass</servlet-name>\n"
+        "    <servlet-class><![CDATA[com.a]]>b<![CDATA[cme.Admin]]></servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>ghost</servlet-name>\n"
+        "    <url-pattern>/ghost/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>jspBacked</servlet-name>\n"
+        "    <url-pattern>/jsp/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>nameOnly</servlet-name>\n"
+        "    <url-pattern>/name-only/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>unreadableClass</servlet-name>\n"
+        "    <url-pattern>/unreadable/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    by_reason: dict[str, list[dict]] = {}
+    for p in problems_doc["problems"]:
+        by_reason.setdefault(p["reason_code"], []).append(p)
+
+    ghost_rows = [p for p in by_reason.get("undeclared_descriptor_name", []) if "ghost" in p["detail"]]
+    assert len(ghost_rows) == 1
+
+    jsp_rows = [
+        p for p in by_reason.get("unsupported_entry_point_shape", []) if "jspBacked" in p["detail"]]
+    assert len(jsp_rows) == 1
+    assert "admin.jsp" in jsp_rows[0]["detail"]
+
+    name_only_rows = [
+        p for p in by_reason.get("descriptor_name_without_class", []) if "nameOnly" in p["detail"]]
+    assert len(name_only_rows) == 1
+
+    unreadable_rows = [
+        p for p in by_reason.get("route_value_unrecoverable", [])
+        if p["qualified_name"] == "WEB-INF/web.xml#unreadableClass"]
+    assert len(unreadable_rows) == 1
+
+    # THE self-contradiction (F1(1c)) and its two siblings: none of the
+    # three genuinely-declared-but-unbacked names may ALSO appear as an
+    # undeclared_descriptor_name row.
+    undeclared_details = " ".join(p["detail"] for p in by_reason.get("undeclared_descriptor_name", []))
+    assert "jspBacked" not in undeclared_details
+    assert "nameOnly" not in undeclared_details
+    assert "unreadableClass" not in undeclared_details
+
+
+@pytest.mark.parametrize("swap_order", [False, True])
+def test_run_scan_a_class_and_jsp_file_pair_for_the_same_name_is_a_conflict(
+    java_repo: Path, swap_order: bool,
+) -> None:
+    """FIX ROUND 30 (twenty-sixth cold read, F1(1d)/.cr26-desc3 case E,
+    BLOCKER, wrong-data): the SAME servlet-name declared twice - once
+    class-backed, once <jsp-file>-backed - used to resolve CONFIDENTLY
+    to the class (the old map only ever saw the one declaration that
+    happened to carry a decodable class), zero problems, no conflict_id
+    - the exact defect round 29's own F1 exists to prevent, reachable
+    through a declaration shape the old detector could not see. Now a
+    real conflict: one `duplicate_descriptor_name` row, and the mapped
+    route falls back to the synthetic per-mapping owner (the web.xml
+    file), never confidently to the class. Parametrized on block order -
+    order-independence proven both ways."""
+    import json
+
+    web_dir = java_repo / "src" / "main" / "java" / "com" / "acme" / "web"
+    web_dir.mkdir(parents=True)
+    (web_dir / "MixedServlet.java").write_text(
+        "package com.acme.web;\nclass MixedServlet {\n}\n", encoding="utf-8")
+    (java_repo / "WEB-INF").mkdir()
+    servlet_blocks = [
+        "  <servlet>\n"
+        "    <servlet-name>mixed</servlet-name>\n"
+        "    <servlet-class>com.acme.web.MixedServlet</servlet-class>\n"
+        "  </servlet>\n",
+        "  <servlet>\n"
+        "    <servlet-name>mixed</servlet-name>\n"
+        "    <jsp-file>/WEB-INF/jsp/mixed.jsp</jsp-file>\n"
+        "  </servlet>\n",
+    ]
+    if swap_order:
+        servlet_blocks.reverse()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n" + "".join(servlet_blocks) +
+        "  <servlet-mapping>\n"
+        "    <servlet-name>mixed</servlet-name>\n"
+        "    <url-pattern>/mixed/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matching = [p for p in problems_doc["problems"] if p["reason_code"] == "duplicate_descriptor_name"]
+    assert len(matching) == 1
+    assert "com.acme.web.MixedServlet" in matching[0]["detail"]
+    assert "mixed.jsp" in matching[0]["detail"]
+
+    features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
+    entry_point = next(e for e in features_doc["entry_points"] if e["name"] == "/mixed/*")
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    web_xml_unit = next(
+        u for u in modules_doc["units"] if u["kind"] == "file" and u["paths"] == ["WEB-INF/web.xml"])
+    mixed_servlet_unit = next(u for u in modules_doc["units"] if u["display_name"] == "MixedServlet")
+    # THE remedy-claim truthfulness fix: the route falls back to the
+    # web.xml FILE, never confidently to the class - the exact defect
+    # this test exists to prevent.
+    assert entry_point["owning_unit_id"] == web_xml_unit["unit_id"]
+    assert entry_point["owning_unit_id"] != mixed_servlet_unit["unit_id"]
+
+
+@pytest.mark.parametrize("swap_order", [False, True])
+def test_run_scan_a_half_undecodable_conflict_never_confidently_resolves(
+    java_repo: Path, swap_order: bool,
+) -> None:
+    """FIX ROUND 30 (twenty-sixth cold read, F1(1e)/.cr26-desc3 case F,
+    BLOCKER, wrong-data): the SAME servlet-name declared twice - one
+    <servlet-class> decodable, one not - used to resolve CONFIDENTLY to
+    whichever decoded, publishing ONLY a `route_value_unrecoverable` row
+    whose own remedy claim ("falls back to the synthetic per-mapping
+    owner") was FALSE for that run (it actually resolved to the real
+    class). Now a real conflict: exactly ONE `duplicate_descriptor_name`
+    row (never a second, contradicting `route_value_unrecoverable` row
+    for the same anchor), and the mapped route genuinely falls back to
+    the synthetic owner - the remedy claim is true again. Parametrized
+    on block order - order-independence proven both ways."""
+    import json
+
+    web_dir = java_repo / "src" / "main" / "java" / "com" / "acme" / "web"
+    web_dir.mkdir(parents=True)
+    (web_dir / "HalfBadServlet.java").write_text(
+        "package com.acme.web;\nclass HalfBadServlet {\n}\n", encoding="utf-8")
+    (java_repo / "WEB-INF").mkdir()
+    servlet_blocks = [
+        "  <servlet>\n"
+        "    <servlet-name>halfbad</servlet-name>\n"
+        "    <servlet-class>com.acme.web.HalfBadServlet</servlet-class>\n"
+        "  </servlet>\n",
+        "  <servlet>\n"
+        "    <servlet-name>halfbad</servlet-name>\n"
+        "    <servlet-class><![CDATA[com.a]]>b<![CDATA[cme.Other]]></servlet-class>\n"
+        "  </servlet>\n",
+    ]
+    if swap_order:
+        servlet_blocks.reverse()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n" + "".join(servlet_blocks) +
+        "  <servlet-mapping>\n"
+        "    <servlet-name>halfbad</servlet-name>\n"
+        "    <url-pattern>/halfbad/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    # Exactly one row for this anchor - never a second, contradicting
+    # route_value_unrecoverable row alongside the conflict row.
+    matching_conflict = [
+        p for p in problems_doc["problems"] if p["reason_code"] == "duplicate_descriptor_name"]
+    matching_unrecoverable = [
+        p for p in problems_doc["problems"] if p["reason_code"] == "route_value_unrecoverable"]
+    assert len(matching_conflict) == 1
+    assert matching_unrecoverable == []
+    assert "com.acme.web.HalfBadServlet" in matching_conflict[0]["detail"]
+
+    features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
+    entry_point = next(e for e in features_doc["entry_points"] if e["name"] == "/halfbad/*")
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    web_xml_unit = next(
+        u for u in modules_doc["units"] if u["kind"] == "file" and u["paths"] == ["WEB-INF/web.xml"])
+    half_bad_unit = next(u for u in modules_doc["units"] if u["display_name"] == "HalfBadServlet")
+    assert entry_point["owning_unit_id"] == web_xml_unit["unit_id"]
+    assert entry_point["owning_unit_id"] != half_bad_unit["unit_id"]
+
+
 def test_run_scan_a_benign_duplicate_servlet_declaration_collapses_silently(
     java_repo: Path,
 ) -> None:
