@@ -2475,6 +2475,71 @@ def test_run_scan_a_benign_duplicate_servlet_declaration_collapses_silently(
     assert entry_point["owning_unit_id"] == servlet_unit["unit_id"]
 
 
+def test_run_scan_unsupported_invoke_shapes_publish_zero_instance_rows(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 30 (twenty-sixth cold read, F2 MAJOR, completeness):
+    a class carrying BOTH a field-injected collaborator call and a
+    constructor call - the two UNSUPPORTED_INVOKE_SHAPES members -
+    publishes ZERO problems.json instance rows for either (deliberately,
+    weighed against noise), ONE import edge (the real, resolvable
+    dependency), and dependencies_resolved=satisfied - the exact shape
+    the design doc's own (now-narrowed) capability-declaration sentence
+    and java.py's own comment both describe. Regression coverage for the
+    documentation-only fix: this behavior itself is unchanged by round
+    30, only the sentence claiming otherwise was corrected."""
+    import json
+
+    controller_dir = java_repo / "src" / "main" / "java" / "p" / "web"
+    controller_dir.mkdir(parents=True)
+    (controller_dir / "OrderController.java").write_text(
+        "package p.web;\n"
+        "import p.OrderService;\n"
+        "class OrderController {\n"
+        "  private OrderService orderService;\n"
+        "  void run() {\n"
+        "    orderService.place(1);\n"
+        "    throw new RuntimeException(\"boom\");\n"
+        "  }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    service_dir = java_repo / "src" / "main" / "java" / "p"
+    (service_dir / "OrderService.java").write_text(
+        "package p;\nclass OrderService {\n  void place(int id) {}\n}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    controller_problems = [
+        p for p in problems_doc["problems"] if p.get("qualified_name") == "p.web.OrderController"]
+    assert controller_problems == []
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    controller_component_unit = next(
+        u for u in modules_doc["units"] if u.get("qualified_name") == "p.web.OrderController")
+    controller_file_unit = next(
+        u for u in modules_doc["units"]
+        if u["kind"] == "file" and u["paths"] == ["src/main/java/p/web/OrderController.java"])
+
+    # FIX ROUND 14 (CR10-1): an import edge attaches to its FILE unit,
+    # never the declared type - the ONE real, resolvable dependency this
+    # class has lives on the file unit's own from_unit_id.
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    controller_edges = [
+        e for e in dependencies_doc["edges"]
+        if e["from_unit_id"] == controller_file_unit["unit_id"]]
+    assert len(controller_edges) == 1
+    assert controller_edges[0]["relation"] == "import"
+    assert controller_edges[0]["resolution_state"] == "resolved"
+
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    dependencies_resolved_signal = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == controller_component_unit["unit_id"] and s["check"] == "dependencies_resolved")
+    assert dependencies_resolved_signal["stored_status"] == "satisfied"
+
+
 def test_run_scan_a_servlet_mapping_naming_an_undeclared_servlet_publishes_a_problem(
     java_repo: Path,
 ) -> None:

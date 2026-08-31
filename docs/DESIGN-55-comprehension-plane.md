@@ -305,14 +305,28 @@ problem rather than two silently merged units.
 CAPABILITY DECLARATION - the named, enumerated set of recognized-but-unmodeled
 shapes (the first three) or recognized, closed, meaning-bearing values (the
 fourth) this producer VERSION carries, published unconditionally on every run
-regardless of whether that run actually contains a matching shape or kind. A
-per-run INSTANCE of any of these is what `problems.json`'s or `features.json`'s
-own records already surface, one per affected file, unit, or entry point -
-these four fields answer "what can this version publish, and what does it
-mean," never "did this run hit one." (`entry_point_kinds` added round 21c: a
-consumer reading an entry point's own `kind` - e.g. `"http_filter"` - needs a
-declared meaning to know it is deliberately excluded from a "served route"
-count, not merely a differently-spelled synonym for `"http_route"`.)
+regardless of whether that run actually contains a matching shape or kind.
+These four fields answer "what can this version publish, and what does it
+mean," never "did this run hit one" - but only `unsupported_entry_point_shapes`
+and `entry_point_kinds` also surface a per-run INSTANCE of that answer
+elsewhere: an entry point published against one of `UNSUPPORTED_ENTRY_POINT_
+SHAPES`'s own named shapes gets its own `problems.json` record (`reason_code=
+unsupported_entry_point_shape`, this class's own `qualified_name`), and every
+published entry point already carries its own `kind` value directly as a
+`features.json` field (round 21c: a consumer reading it - e.g. `"http_filter"`
+- needs a declared meaning to know it is deliberately excluded from a "served
+route" count, not merely a differently-spelled synonym for `"http_route"`).
+`unsupported_relations` and `unsupported_invoke_shapes` are declared ONLY as
+static facts - a reactor's own `<modules>` aggregator entry (the `"include"`
+member) and a constructor-call or field-injected collaborator call (the two
+`UNSUPPORTED_INVOKE_SHAPES` members) never produce a per-run instance record
+anywhere (round 30 F2, twenty-sixth cold read): every constructor call and
+every field-injected call in every file would flood `problems.json` for no
+addressable action, so this producer deliberately does not instance-track
+either family - `problems.json`/`features.json` can never answer "did this
+run hit an unsupported relation/invoke shape," only the static fields above
+can (a weaker, different answer: "this version's own recognized-but-unmodeled
+vocabulary includes this shape," not "this run actually has one").
 
 The whole-scope fingerprint is wider than the set of files selected into a pack.
 A new file therefore changes it even when no old selected-path digest changes.

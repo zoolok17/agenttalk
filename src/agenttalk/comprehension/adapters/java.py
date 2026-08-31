@@ -124,9 +124,24 @@ UNSUPPORTED_INVOKE_SHAPES = ("constructor_call", "instance_qualified_call")
 #: report. A F2 mixed-class verb-only-method DOES publish its own
 #: per-run, per-class INSTANCE - as a problems.json record with
 #: reason_code=unsupported_entry_point_shape and this class's own
-#: qualified_name, exactly like every other instance of any of these
-#: three named gaps - this tuple is not the only or the right place to
+#: qualified_name - this tuple is not the only or the right place to
 #: look for "did this run actually hit one of these," problems.json is.
+#:
+#: FIX ROUND 30 (twenty-sixth cold read, F2 MAJOR, completeness,
+#: narrowed): the sentence above previously read "exactly like every
+#: other instance of any of these three named gaps" - an OVERCLAIM.
+#: UNSUPPORTED_ENTRY_POINT_SHAPES is the ONLY one of the three that
+#: actually surfaces a per-run instance this way. A class carrying BOTH
+#: an UNSUPPORTED_INVOKE_SHAPES member (a field-injected collaborator
+#: call, a constructor call) publishes ZERO instance rows for either -
+#: weighed against noise deliberately: every constructor call and every
+#: field-injected call in every file would flood problems.json for no
+#: addressable action, so this producer does not instance-track this
+#: family at all. UNSUPPORTED_RELATIONS' own "include" member (a
+#: reactor's <modules> aggregator entry) is the same - zero problems,
+#: by design, never wired to a per-run instance. Narrowed here so a
+#: reader of this comment alone cannot conclude the sibling tuples work
+#: the same way UNSUPPORTED_ENTRY_POINT_SHAPES does.
 #: FIX ROUND 19 (fifteenth cold read, F3 MAJOR, wrong-data): five more
 #: entry-point families the DESIGN'S OWN VOCABULARY names (scheduled
 #: jobs, event consumers, process starts...) fell through to the

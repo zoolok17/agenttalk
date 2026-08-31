@@ -517,6 +517,26 @@ _AMBIGUOUS_DEPENDENCY_EXCLUDED_RELATIONS = frozenset({"test"})
 def _check_dependencies_resolved(
     unit: ModuleRecord, outgoing: list[DependencyRecord], externality_poisoned: bool = False,
 ) -> ReadinessSignal:
+    # FIX ROUND 30 (twenty-sixth cold read, F2 MAJOR, completeness -
+    # reconciled framing): a class whose ONLY real collaborators are
+    # WIRED (constructor injection, or a field-injected `@Autowired`/
+    # `@Inject` collaborator) reports `satisfied` here exactly like a
+    # class with zero collaborators at all - `relevant` below only ever
+    # looks at import/inherit/build edges, and a wired collaborator call
+    # is `invoke`-relation-shaped by java.py's own extraction, which
+    # this check has never consulted (round 12b's own scoping). This is
+    # NOT a bug this check can fix - the collaborator is invisible at
+    # the EXTRACTION layer (java.py's own declared
+    # UNSUPPORTED_INVOKE_SHAPES residual: `constructor_call`/
+    # `instance_qualified_call` never produce an edge at all) - but the
+    # WIRING SHAPE is worth naming plainly here rather than only in
+    # java.py's own extraction-side docstring: `dependencies_resolved=
+    # satisfied` on a DI-wired class means "every import/inherit/build
+    # edge this producer could see resolved," never "every real
+    # collaborator this class actually wires is visible to this run" -
+    # a real estate migration reader could easily read the stronger,
+    # unintended claim into a bare `satisfied`.
+    #
     # FIX ROUND 16 (twelfth cold read, M2 MAJOR, wrong-data): mirrors
     # _check_source_understood's own "no positive claim without positive
     # evidence" discipline - a file the adapter never successfully read
