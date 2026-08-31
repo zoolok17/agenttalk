@@ -71,6 +71,17 @@ _BENIGN_NON_CODE_EXTENSIONS = frozenset({
 _BENIGN_NON_CODE_BASENAMES = frozenset({
     ".gitignore", ".gitattributes", ".gitmodules", ".editorconfig", ".dockerignore",
     "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "composer.lock", "poetry.lock",
+    # FIX ROUND 25 (twenty-first cold read, F9, take-it): a closed,
+    # well-known set of EXTENSIONLESS project-metadata files - the same
+    # class of benign, non-code documentation _BENIGN_NON_CODE_
+    # EXTENSIONS already covers for ".md"/".txt" variants, but these
+    # five routinely ship with NO extension at all (a bare "LICENSE",
+    # never "LICENSE.txt") - README.md already benign, an extensionless
+    # LICENSE recorded unsupported_language, an asymmetry between two
+    # equally inert project-root files. PROVISIONAL, like every other
+    # closed-set constant in this module - documented the same way tier
+    # 2's own criterion is.
+    "license", "notice", "copying", "authors", "changelog",
 })
 #: FIX ROUND 16b (reviewer-3's rejection of round 16, BLOCKER 1 - the B4
 #: CALIBRATION): round 16's own inversion is RATIFIED (an unenumerated

@@ -299,7 +299,7 @@ def test_process_paths_a_polyglot_legacy_web_app_now_degrades_cr13_b(tmp_path: P
 
 
 @pytest.mark.parametrize("filename", [
-    "mvnw", "mvnw.cmd", "Dockerfile", "LICENSE", "CHANGELOG", "ci.yml",
+    "mvnw", "mvnw.cmd", "Dockerfile", "ci.yml",
     "application.yml", "package.json",
 ])
 def test_process_paths_flags_tier3_build_tooling_files_as_record_only(
@@ -314,7 +314,13 @@ def test_process_paths_flags_tier3_build_tooling_files_as_record_only(
     and NOT on the tier-2 closed list) is now recorded - the round-16
     inversion's own win, never silently un-recorded - but never
     degrading: a build/tooling/infra/config file is not "missed
-    application code" the way a JSP or a Kotlin source is."""
+    application code" the way a JSP or a Kotlin source is.
+
+    FIX ROUND 25 (twenty-first cold read, F9, take-it): LICENSE/
+    CHANGELOG moved to the fully-benign basename set (see
+    ``test_process_paths_flags_extensionless_project_metadata_files_
+    as_benign`` below) - removed from this list, since they no longer
+    record anything at all."""
     (tmp_path / filename).write_text("placeholder content\n", encoding="utf-8")
     result = worker.process_paths(tmp_path, [filename])
     assert len(result.problems) == 1
@@ -356,6 +362,25 @@ def test_process_paths_lock_family_stays_silent_while_package_json_records(
     assert result.problems[0].degrades_run is False
 
 
+@pytest.mark.parametrize("filename", [
+    "LICENSE", "NOTICE", "COPYING", "AUTHORS", "CHANGELOG",
+])
+def test_process_paths_flags_extensionless_project_metadata_files_as_benign(
+    tmp_path: Path, filename: str,
+) -> None:
+    """FIX ROUND 25 (twenty-first cold read, F9, take-it): README.md is
+    already benign (a recognized extension), but an EXTENSIONLESS
+    LICENSE - the far more common real-world spelling, never
+    "LICENSE.txt" - recorded unsupported_language, an asymmetry between
+    two equally inert project-root files. A closed, well-known
+    extensionless set now joins the benign basenames, silent like every
+    other benign file (case-insensitive, matching this producer's own
+    existing basename comparison)."""
+    (tmp_path / filename).write_text("placeholder content\n", encoding="utf-8")
+    result = worker.process_paths(tmp_path, [filename])
+    assert result.problems == []
+
+
 def test_process_paths_a_composite_healthy_spring_boot_repo_does_not_degrade(
     tmp_path: Path,
 ) -> None:
@@ -363,7 +388,11 @@ def test_process_paths_a_composite_healthy_spring_boot_repo_does_not_degrade(
     ordinary, entirely healthy Spring Boot repo's non-code surface
     (Maven wrapper, Dockerfile, LICENSE, CI config, application.yml/
     .properties) must record every file (round 16's own win, unchanged)
-    but never degrade the run over any of them."""
+    but never degrade the run over any of them.
+
+    FIX ROUND 25 (twenty-first cold read, F9, take-it): LICENSE is now
+    fully benign (silent, no problem at all) - see the extensionless-
+    metadata test below - so it no longer contributes to this count."""
     (tmp_path / "mvnw").write_text("#!/bin/sh\n", encoding="utf-8")
     (tmp_path / "mvnw.cmd").write_text("@ECHO OFF\n", encoding="utf-8")
     (tmp_path / "Dockerfile").write_text("FROM eclipse-temurin:21\n", encoding="utf-8")
@@ -379,9 +408,10 @@ def test_process_paths_a_composite_healthy_spring_boot_repo_does_not_degrade(
         "application.yml", "application.properties", "App.java",
     ]
     result = worker.process_paths(tmp_path, paths)
-    assert len(result.problems) == 7  # every non-adapter, non-code-bearing file
+    assert len(result.problems) == 6  # every non-adapter, non-code-bearing, non-benign file
     assert all(p.reason_code == "unsupported_language" for p in result.problems)
     assert all(p.degrades_run is False for p in result.problems)
+    assert "LICENSE" not in {p.relative_path for p in result.problems}
     assert "App.java" in result.java_results
 
 
