@@ -191,6 +191,19 @@ def test_pairing_message_when_acknowledge_true_and_empty_work_id() -> None:
     assert message is not None
 
 
+def test_pairing_message_when_acknowledge_true_and_whitespace_only_work_id() -> None:
+    """FIX ROUND 30 (twenty-sixth cold read, F5 polish, wrong-data): a
+    whitespace-only work_id ("   ") used to pass this guard - a bare
+    truthiness check treats any non-empty string as fine, and a string
+    of only whitespace IS non-empty. --run's own identical shape
+    (_resolve_run_id, round 29's own F7) already refuses whitespace-
+    only explicitly; mirrored here."""
+    message = privacy.acknowledge_requires_work_id_message(
+        acknowledge_unignored=True, work_id="   ")
+    assert message is not None
+    assert "--work-id" in message
+
+
 def test_pairing_message_is_none_when_acknowledge_true_and_work_id_present() -> None:
     assert privacy.acknowledge_requires_work_id_message(
         acknowledge_unignored=True, work_id="migrate-checkout") is None

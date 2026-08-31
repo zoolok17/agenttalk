@@ -3950,17 +3950,21 @@ def test_get_report_refuses_an_empty_or_whitespace_run_id(java_repo: Path, bad_r
 
 
 @pytest.mark.parametrize("bad_run_id", ["", "   "])
-def test_validate_run_reports_invalid_for_an_empty_or_whitespace_run_id(
+def test_validate_run_raises_for_an_empty_or_whitespace_run_id(
     java_repo: Path, bad_run_id: str,
 ) -> None:
-    """FIX ROUND 29 (F7 polish): validate_run's own contract catches this
-    the same way it already catches a malformed-but-non-empty run_id -
-    reported via valid:False, never raised."""
+    """FIX ROUND 30 (twenty-sixth cold read, F5 polish, wrong-data): an
+    empty or whitespace-only --run is a CALLER-level malformed-argument
+    error, the SAME class get_status/get_report already raise directly
+    for - round 29's own F7 fix wrongly folded this shape into
+    validate's own "report a run's own problems via valid:False, don't
+    raise" data contract, alongside a well-formed-but-nonexistent or
+    malformed-but-non-empty run_id (a genuinely different case - see
+    test_validate_run_reports_invalid_for_a_malformed_run_id, still
+    reported via valid:False, unchanged)."""
     scan_pipeline.run_scan(java_repo)
-    result = scan_pipeline.validate_run(java_repo, run_id=bad_run_id)
-    assert result["valid"] is False
-    assert "empty or whitespace" in result["detail"]
-    assert result["scan_id"] == bad_run_id
+    with pytest.raises(scan_pipeline.EnvelopeError, match="empty or whitespace"):
+        scan_pipeline.validate_run(java_repo, run_id=bad_run_id)
 
 
 def _delete_index_field(java_repo: Path, key: str) -> None:

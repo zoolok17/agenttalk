@@ -63,7 +63,24 @@ def _readiness_state_filter_note(readiness_state: str | None) -> dict[str, Any]:
     key with a ``None``/empty value) when the filter is absent or names a
     reachable state - the same absent-not-null idiom every other optional
     field in this artifact family already follows. Spread into the
-    payload at the call site."""
+    payload at the call site.
+
+    FIX ROUND 30 (twenty-sixth cold read, F6 note, JUDGE - taken): a
+    ``--readiness <valid, reachable state>`` that simply matches ZERO
+    units this run emits NO note at all - asymmetric with ``--unit``/
+    ``--feature``, which always get one on a zero-match result (see
+    ``_unit_or_feature_filter_note``). Declared as a deliberate
+    difference, not a silent gap: ``--unit``/``--feature`` name an OPEN,
+    UNVALIDATED per-run id space (round 18b's own ruling) - a typo and a
+    genuine zero-match are indistinguishable without a note. ``--
+    readiness`` is validated up front against a CLOSED, closed-and-
+    reachable-known vocabulary (``InvalidReadinessStateFilter`` already
+    refuses anything else, including the three structurally-unreachable
+    states this function itself names above) - a caller reaching this
+    point already knows their state was recognized, so a zero-match
+    result is ordinary, unambiguous "no unit is currently in that state"
+    - the same disambiguation a note would add for an open id space is
+    not needed for a validated, closed one."""
     if readiness_state in _STRUCTURALLY_UNREACHABLE_ASSESSMENT_STATES:
         return {
             "readiness_state_filter_note": (
@@ -77,6 +94,7 @@ def _readiness_state_filter_note(readiness_state: str | None) -> dict[str, Any]:
 
 def _unit_or_feature_filter_note(
     unit_id: str | None, feature_id: str | None, filtered_modules: list[ModuleRecord],
+    *, unit_id_exists: bool = True, feature_id_exists: bool = True,
 ) -> dict[str, Any]:
     """FIX ROUND 23 (nineteenth cold read, F10, completeness - retires the
     round 18/18b carry ("`--unit` naming a nonexistent id") BY MECHANISM
@@ -90,19 +108,41 @@ def _unit_or_feature_filter_note(
     an empty `units` list themselves. Same absent-not-null idiom
     ``_readiness_state_filter_note`` already established - present only
     when the filter narrowed the run to zero units, silent (empty dict)
-    otherwise."""
+    otherwise.
+
+    FIX ROUND 30 (twenty-sixth cold read, F4 polish, wrong-data): the
+    note's own wording used to claim "an id that does not exist this
+    run" UNCONDITIONALLY - false when BOTH `unit_id` and `feature_id`
+    are given, both individually name something real this run, but the
+    unit simply is not part of that feature (a healthy, DISJOINT-filter
+    empty result, not a nonexistent-id one). ``unit_id_exists``/
+    ``feature_id_exists`` (each defaulting True - a caller passing only
+    one filter never needs the other's existence checked) let the
+    caller distinguish the two before wording the note; both are
+    "healthy empty," only the REASON differs."""
     if (unit_id is not None or feature_id is not None) and not filtered_modules:
         parts = []
         if unit_id is not None:
             parts.append(f"unit_id={unit_id!r}")
         if feature_id is not None:
             parts.append(f"feature_id={feature_id!r}")
+        if unit_id is not None and feature_id is not None and unit_id_exists and feature_id_exists:
+            reason = (
+                "unit_id and feature_id BOTH name something real this run, but they are "
+                "DISJOINT - the named unit is not part of the named feature (see round "
+                "18b: --unit/--feature name an open per-run id space, never a closed "
+                "vocabulary to refuse against)"
+            )
+        else:
+            reason = (
+                "a healthy empty result for an id that does not exist this run (see round "
+                "18b: --unit/--feature name an open per-run id space, never a closed "
+                "vocabulary to refuse against)"
+            )
         return {
             "unit_or_feature_filter_note": (
-                f"no unit matched the requested {' and '.join(parts)} - a healthy empty "
-                "result for an id that does not exist this run (see round 18b: --unit/"
-                "--feature name an open per-run id space, never a closed vocabulary to "
-                "refuse against), not a sign the filter silently did nothing"
+                f"no unit matched the requested {' and '.join(parts)} - {reason}, not a "
+                "sign the filter silently did nothing"
             ),
         }
     return {}
@@ -576,7 +616,11 @@ def project_comprehension(
             "dependencies_only": dependencies_only,
         },
         **_readiness_state_filter_note(readiness_state),
-        **_unit_or_feature_filter_note(unit_id, feature_id, filtered_modules),
+        **_unit_or_feature_filter_note(
+            unit_id, feature_id, filtered_modules,
+            unit_id_exists=any(m.unit_id == unit_id for m in modules),
+            feature_id_exists=any(f.feature_id == feature_id for f in features),
+        ),
         "counts": {
             # M10 (cold-read, PR-B fix round 3): these are WHOLE-RUN
             # totals - deliberately unaffected by unit_id/feature_id/

@@ -239,8 +239,16 @@ def acknowledge_requires_work_id_message(
 
     Returns the refusal message when the pairing is invalid
     (acknowledgement requested with no ``work_id``), ``None`` when the
-    pairing is fine (or acknowledgement was never requested at all)."""
-    if not acknowledge_unignored or work_id:
+    pairing is fine (or acknowledgement was never requested at all).
+
+    FIX ROUND 30 (twenty-sixth cold read, F5 polish, wrong-data): a
+    whitespace-only ``work_id`` (``"   "``) used to pass this guard - a
+    bare truthiness check treats any non-empty string as fine, and a
+    string of only whitespace IS non-empty. ``--run``'s own identical
+    shape (``_resolve_run_id``, round 29's own F7) already refuses
+    whitespace-only explicitly; mirrored here so the two guards cannot
+    independently drift on what counts as "no real value was given.\""""
+    if not acknowledge_unignored or (work_id is not None and work_id.strip()):
         return None
     return (
         "--acknowledge-unignored-private-store requires --work-id "

@@ -266,6 +266,37 @@ def test_no_filter_note_when_a_unit_id_actually_matches_f10():
     assert "unit_or_feature_filter_note" not in payload
 
 
+def test_disjoint_unit_and_feature_filters_get_a_disjoint_not_nonexistent_note_f4():
+    """FIX ROUND 30 (twenty-sixth cold read, F4 polish, wrong-data): both
+    `unit_id` and `feature_id` name something REAL this run - the unit
+    simply is not part of the named feature - but the note used to claim
+    "an id that does not exist this run" regardless, false for this
+    shape. The note must distinguish disjoint-filters from a genuinely
+    nonexistent id."""
+    payload = pr.project_comprehension(**_base_kwargs(
+        modules=[_unit("u1"), _unit("u2")], features=[_feature("f1", ["u2"])],
+        unit_id="u1", feature_id="f1"))
+    assert payload["units"] == []
+    note = payload["unit_or_feature_filter_note"]
+    assert "u1" in note and "f1" in note
+    assert "DISJOINT" in note
+    assert "does not exist this run" not in note
+
+
+def test_a_nonexistent_unit_id_alongside_a_real_feature_id_still_says_nonexistent_f4():
+    """FIX ROUND 30 (F4 polish): companion control - when one of the two
+    ids genuinely does not exist this run, the note must still say so,
+    never the disjoint wording (which would be misleading - there is no
+    real second id to be disjoint FROM)."""
+    payload = pr.project_comprehension(**_base_kwargs(
+        modules=[_unit("u1")], features=[_feature("f1", ["u1"])],
+        unit_id="does-not-exist", feature_id="f1"))
+    assert payload["units"] == []
+    note = payload["unit_or_feature_filter_note"]
+    assert "does not exist this run" in note
+    assert "DISJOINT" not in note
+
+
 def test_filters_key_echoes_every_applied_filter_verbatim():
     """FIX ROUND 17 (thirteenth cold read, CR13-9 MINOR): report --json
     must echo its applied filters so a caller can positively confirm
@@ -380,6 +411,22 @@ def test_readiness_state_filter_on_the_reachable_state_adds_no_note():
 
 def test_no_readiness_state_filter_adds_no_note():
     payload = pr.project_comprehension(**_base_kwargs())
+    assert "readiness_state_filter_note" not in payload
+
+
+def test_a_zero_match_reachable_readiness_state_filter_adds_no_note_f6():
+    """FIX ROUND 30 (twenty-sixth cold read, F6 note, JUDGE - taken): a
+    valid, REACHABLE readiness_state that simply matches zero units this
+    run gets no note either - declared as a deliberate difference from
+    --unit/--feature (which always get one on a zero-match result):
+    --readiness is validated up front against a closed vocabulary
+    (InvalidReadinessStateFilter already refuses anything unrecognized),
+    so a caller reaching this point already knows their state was
+    real - unlike --unit/--feature's open, unvalidated id space, a
+    zero-match result here is ordinary, not ambiguous."""
+    payload = pr.project_comprehension(**_base_kwargs(
+        readiness_summaries=[_summary("u1", "not_applicable")], readiness_state="needs_evidence"))
+    assert payload["readiness"]["summaries"] == []
     assert "readiness_state_filter_note" not in payload
 
 

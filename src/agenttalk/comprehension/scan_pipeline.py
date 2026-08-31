@@ -2017,15 +2017,18 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
     index_doc, _digest = publish.read_current_index(comprehension_dir)
     if index_doc is None:
         raise NotScanned(f"no comprehension run has ever been published under {root.name!r}")
-    # FIX ROUND 29 (F7 polish): unlike get_status/get_report (which raise
-    # directly), validate_run's own contract catches a bad run_id and
-    # reports it via valid:False rather than raising - scan_id here
-    # deliberately stays the RAW run_id when one was given (even an
-    # invalid one), so the return value's own "scan_id" field still
-    # shows the caller's actual bad input; the real refusal happens
-    # inside the try block below, via the SAME _resolve_run_id used by
-    # the other two, caught by the existing except clause.
-    scan_id = run_id if run_id is not None else _index_field(index_doc, "latest_scan_id")
+    # FIX ROUND 30 (twenty-sixth cold read, F5 polish, wrong-data): an
+    # empty or whitespace-only --run is a CALLER-level malformed-argument
+    # error - the SAME class get_status/get_report already raise
+    # directly for (exit 2 command error), never validate's own
+    # "report a run's own problems via valid:False, don't raise" data
+    # contract (round 29's own F7 fix wrongly folded this one shape into
+    # that contract alongside a WELL-FORMED-but-nonexistent run_id, a
+    # genuinely different case that correctly stays inside the try/
+    # except below, unchanged). ``_resolve_run_id`` runs here now,
+    # unconditionally, BEFORE the try block - matching get_status/
+    # get_report exactly for THIS one shape.
+    scan_id = _resolve_run_id(run_id, index_doc)
     # Round 7b: a default the anchor state stays at if an EARLIER step in
     # the try block below (record loading/conversion, the required-field
     # check) fails first - this run's scan.json integrity genuinely was
@@ -2038,7 +2041,6 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
         "state": "unverified", "reason_code": "not_evaluated_before_an_earlier_failure",
     }
     try:
-        scan_id = _resolve_run_id(run_id, index_doc)
         records = _load_run_records(comprehension_dir, scan_id)
         # Minor 2 (round 7b): validate never checked scan.json's OWN
         # scalar fields at all (only the separate "artifacts" digest
