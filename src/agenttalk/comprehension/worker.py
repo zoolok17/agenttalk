@@ -265,25 +265,6 @@ def is_a_root_sniffed_xml_extension(relative_path: str) -> bool:
     return lower.endswith(".xml") and name_lower not in _ADAPTER_HANDLED_XML_BASENAMES
 
 
-def is_an_adapter_handled_xml_basename(relative_path: str) -> bool:
-    """FIX ROUND 31 (twenty-seventh cold read, F3 MINOR, completeness,
-    lean take): the exact complement of :func:`is_a_root_sniffed_xml_
-    extension` above - ``pom.xml``/``web.xml`` specifically, the two
-    basenames that predicate deliberately EXCLUDES (they are never
-    root-sniffed at all; a real adapter parses them directly). A
-    binary/UTF-16-excluded ``pom.xml``/``web.xml`` previously got NO
-    acknowledgement whatsoever (no unit, no problem) while a binary/
-    UTF-16-excluded ``logback.xml`` DOES (round 26b/micro-round 28b) -
-    the MORE migration-material file (a build/routing descriptor,
-    always code-bearing by definition - unlike a generic ``.xml`` whose
-    tier a root-sniff would have decided) was the unaddressable one.
-    Used by scan_pipeline.py to synthesize the SAME kind of visible,
-    empty-classification unit the root-sniffed case already gets, via
-    its own honestly-named reason code (never the root-sniffed one -
-    there is no tier ambiguity here to name)."""
-    return Path(relative_path).name.lower() in _ADAPTER_HANDLED_XML_BASENAMES
-
-
 WORKER_SCHEMA_VERSION = 1
 _WORKER_TIMEOUT_SECONDS = 300.0
 

@@ -423,7 +423,7 @@ def build_modules(
     worker_problem_reasons_by_qualified_name: dict[str, list[str]] | None = None,
     non_degrading_unsupported_language_paths: frozenset[str] | None = None,
     binary_excluded_root_sniffed_xml_digests: dict[str, str] | None = None,
-    binary_excluded_adapter_handled_descriptor_digests: dict[str, str] | None = None,
+    binary_excluded_code_bearing_digests: dict[str, str] | None = None,
     descriptor_name_conflicts: list[tuple[str, list[str]]] | None = None,
 ) -> list[ModuleRecord]:
     """``java_results`` maps a ``.java`` file's relative path to its
@@ -489,21 +489,46 @@ def build_modules(
     closing the gap ``CLASSIFICATION_CAVEAT``'s own sentence had wrongly
     assumed was already closed.
 
-    ``binary_excluded_adapter_handled_descriptor_digests`` (FIX ROUND 31,
-    twenty-seventh cold read, F3 MINOR, completeness) is the SAME
-    additive shape as ``binary_excluded_root_sniffed_xml_digests`` above,
-    for a binary/UTF-16-excluded ``pom.xml``/``web.xml`` specifically -
-    these two never reach ``worker.is_a_root_sniffed_xml_extension``
-    (they are adapter-handled, never root-sniffed), so they previously
-    got NO modules.json UNIT at all when excluded, even though round
-    18's own F6 fix already records a real, DEGRADING problem for them
-    (``binary_excluded_code_bearing_file`` - these two ARE code-bearing
-    by definition, unlike the root-sniffed case's genuine tier
-    ambiguity). Reuses that SAME existing reason code here rather than
-    inventing a new one - the problem this unit's own ``adapter_problem_
-    reason`` names is the identical fact scan_pipeline.py's own
-    ``binary_excluded_code_bearing_problems`` already publishes for the
-    same path.
+    ``binary_excluded_code_bearing_digests`` (FIX ROUND 31, twenty-seventh
+    cold read, F3 MINOR, completeness - WIDENED by FIX ROUND 32, twenty-
+    eighth cold read, F8 LOW, JUDGE, taken) is the SAME additive shape as
+    ``binary_excluded_root_sniffed_xml_digests`` above, for every binary/
+    UTF-16-excluded file this run would otherwise have tried to understand
+    as code (``worker.is_a_code_bearing_extension_worth_degrading_when_
+    silently_excluded`` - adapter-handled ``.java``, ``pom.xml``/
+    ``web.xml``, AND every tier-2 ``_DEGRADING_CODE_EXTENSIONS`` shape:
+    ``.jsp``, ``.kt``, ...) - none of these ever reach ``worker.is_a_root_
+    sniffed_xml_extension`` (that predicate is for the genuine TIER
+    AMBIGUITY case, never for something already known to be code-bearing),
+    so they previously got NO modules.json UNIT at all when excluded, even
+    though round 18's own F6 fix already records a real, DEGRADING problem
+    for them (``binary_excluded_code_bearing_file`` - these ARE code-
+    bearing by definition, unlike the root-sniffed case's genuine tier
+    ambiguity).
+
+    ROUND 31 ITSELF only ever populated this for the two adapter-handled
+    XML basenames (``pom.xml``/``web.xml``) - a binary-excluded ``.java``
+    file (or a binary-excluded ``.jsp``/``.kt``/...) got the same real,
+    visible, DEGRADING problem but still no synthesized unit, an
+    inconsistency the reader's own F8 measured: two files in the identical
+    epistemic state (this run never read either one), different
+    visibility. Widened here to the FULL code-bearing predicate - the
+    exact same one scan_pipeline.py's own ``binary_excluded_code_bearing_
+    problems`` already uses, so the two can never independently drift on
+    what counts as "code-bearing" for this purpose.
+
+    Reuses that SAME existing reason code here rather than inventing a
+    new one - the problem this unit's own ``adapter_problem_reason``
+    names is the identical fact scan_pipeline.py's own ``binary_excluded_
+    code_bearing_problems`` already publishes for the same path. This
+    reason code was ALREADY added to readiness_artifact.py's own
+    ``_READINESS_CHECKS_BY_REASON_CODE`` map in round 31 (the lesson that
+    round learned the hard way - a reason reaching a SYNTHESIZED unit for
+    the first time, rather than only ever a worker-attributed one, needs
+    an entry there or it raises a bare ``KeyError``) - reusing the
+    IDENTICAL reason code for this wider set of paths needs no second
+    entry; the map is keyed on the reason code, not on which predicate
+    populated it.
 
     ``descriptor_name_conflicts`` (FIX ROUND 29, twenty-fifth cold read,
     F1 BLOCKER, wrong-data) is the aggregate of every web.xml this run
@@ -516,8 +541,7 @@ def build_modules(
     worker_problem_reasons_by_unit = worker_problem_reasons_by_unit or {}
     non_degrading_unsupported_language_paths = non_degrading_unsupported_language_paths or frozenset()
     binary_excluded_root_sniffed_xml_digests = binary_excluded_root_sniffed_xml_digests or {}
-    binary_excluded_adapter_handled_descriptor_digests = (
-        binary_excluded_adapter_handled_descriptor_digests or {})
+    binary_excluded_code_bearing_digests = binary_excluded_code_bearing_digests or {}
 
     for relative_path, content_digest in sorted(binary_excluded_root_sniffed_xml_digests.items()):
         records.append(ModuleRecord(
@@ -536,7 +560,7 @@ def build_modules(
             adapter_problem_reasons=["binary_excluded_root_sniffed_xml"],
         ))
 
-    for relative_path, content_digest in sorted(binary_excluded_adapter_handled_descriptor_digests.items()):
+    for relative_path, content_digest in sorted(binary_excluded_code_bearing_digests.items()):
         records.append(ModuleRecord(
             unit_id=digests.unit_id(kind="file", paths=[relative_path], qualified_name=None),
             kind="file",

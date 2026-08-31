@@ -657,22 +657,26 @@ def run_scan(
             and "content_digest" in entry
             and worker.is_a_root_sniffed_xml_extension(entry["path"])
         }
-        # FIX ROUND 31 (twenty-seventh cold read, F3 MINOR, completeness):
-        # the exact same additive-unit shape as the root-sniffed-xml
-        # dict above, for a binary-excluded pom.xml/web.xml specifically
-        # (worker.is_a_root_sniffed_xml_extension deliberately EXCLUDES
-        # both - see its own docstring) - these two previously got NO
-        # modules.json unit at all when binary-excluded, even though
-        # round 18's own F6 fix (below) already records a real,
-        # DEGRADING problem for them. See build_modules's own
-        # binary_excluded_adapter_handled_descriptor_digests parameter
-        # docstring.
-        binary_excluded_adapter_handled_descriptor_digests = {
+        # FIX ROUND 31 (twenty-seventh cold read, F3 MINOR, completeness),
+        # WIDENED by FIX ROUND 32 (twenty-eighth cold read, F8 LOW, JUDGE,
+        # taken): the exact same additive-unit shape as the root-sniffed-
+        # xml dict above, for EVERY binary-excluded file this run would
+        # otherwise have tried to understand as code (the SAME predicate
+        # `binary_excluded_code_bearing_problems` below already uses, so
+        # the two can never independently drift) - round 31 itself only
+        # ever populated this for pom.xml/web.xml specifically; a binary-
+        # excluded .java (or a binary-excluded tier-2 shape like .jsp/
+        # .kt) got the identical real, DEGRADING problem but still no
+        # synthesized unit, the SAME epistemic state with different
+        # visibility the reader's own F8 measured. See build_modules's
+        # own binary_excluded_code_bearing_digests parameter docstring.
+        binary_excluded_code_bearing_digests = {
             entry["path"]: entry["content_digest"]
             for entry in discovery_result.excluded_roots
             if entry["category"] == "binary"
             and "content_digest" in entry
-            and worker.is_an_adapter_handled_xml_basename(entry["path"])
+            and worker.is_a_code_bearing_extension_worth_degrading_when_silently_excluded(
+                entry["path"])
         }
         # FIX ROUND 29 (twenty-fifth cold read, F1 BLOCKER, wrong-data):
         # every web.xml this run parsed may have recorded its own
@@ -692,8 +696,7 @@ def run_scan(
             worker_problem_reasons_by_qualified_name=worker_problem_reasons_by_qualified_name,
             non_degrading_unsupported_language_paths=non_degrading_unsupported_language_paths,
             binary_excluded_root_sniffed_xml_digests=binary_excluded_root_sniffed_xml_digests,
-            binary_excluded_adapter_handled_descriptor_digests=(
-                binary_excluded_adapter_handled_descriptor_digests),
+            binary_excluded_code_bearing_digests=binary_excluded_code_bearing_digests,
             descriptor_name_conflicts=descriptor_name_conflicts,
         )
         # M7 (cold-read, PR-B fix round 3): discovery already computed

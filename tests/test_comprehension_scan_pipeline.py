@@ -3672,6 +3672,48 @@ def test_run_scan_a_binary_excluded_web_xml_also_gets_its_own_unit(java_repo: Pa
     assert "binary_excluded_root_sniffed_xml" in logback_units[0]["adapter_problem_reasons"]
 
 
+def test_run_scan_a_binary_excluded_java_file_also_gets_its_own_unit(java_repo: Path) -> None:
+    """FIX ROUND 32 (twenty-eighth cold read, F8 LOW, JUDGE - taken):
+    round 31's own F3 fix closed the gap for pom.xml/web.xml specifically
+    (via a narrow adapter-handled-XML-basename predicate) - a binary-
+    excluded .java file got the identical real, DEGRADING
+    binary_excluded_code_bearing_file problem (round 18's own F6) but
+    STILL no synthesized unit at all, the SAME epistemic state ("this run
+    never read this file") with different visibility from its web.xml
+    twin. Widened to the full code-bearing predicate
+    (worker.is_a_code_bearing_extension_worth_degrading_when_silently_
+    excluded) so a .java (and, by the same widened predicate, any tier-2
+    _DEGRADING_CODE_EXTENSIONS shape) now gets the same treatment."""
+    import json
+
+    web_dir = java_repo / "src" / "main" / "java" / "com" / "acme"
+    web_dir.mkdir(parents=True)
+    (web_dir / "Legacy.java").write_bytes(
+        "package com.acme;\nclass Legacy {\n}\n".encode("utf-16"))
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matching = [
+        p for p in problems_doc["problems"] if p["path"] == "src/main/java/com/acme/Legacy.java"]
+    reason_codes = {p["reason_code"] for p in matching}
+    assert "binary_excluded_code_bearing_file" in reason_codes
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    legacy_units = [
+        u for u in modules_doc["units"] if u["paths"] == ["src/main/java/com/acme/Legacy.java"]]
+    assert len(legacy_units) == 1
+    assert legacy_units[0]["classification"] == []
+    assert "binary_excluded_code_bearing_file" in legacy_units[0]["adapter_problem_reasons"]
+
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    legacy_signals = [
+        s for s in readiness_doc["signals"] if s["unit_id"] == legacy_units[0]["unit_id"]]
+    assert len(legacy_signals) == 6
+    assert all(s["stored_status"] == "unknown" for s in legacy_signals)
+
+
 def test_run_scan_a_utf16_gitmodules_degrades_with_an_encoding_undecodable_problem(
     java_repo: Path,
 ) -> None:
