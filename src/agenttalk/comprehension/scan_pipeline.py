@@ -848,6 +848,30 @@ def run_scan(
             modules, dependencies, features, entry_points,
             externality_poisoned=externality_poisoned)
 
+        # FIX ROUND 29 (twenty-fifth cold read, F2 MAJOR, wrong-data):
+        # design step 8 ("Normalize records, resolve only evidenced
+        # edges, merge declarations") has no referential-integrity pass
+        # at all this slice - a producer bug minting a dangling
+        # reference (an edge/entry-point/feature/signal/module naming a
+        # unit, entry point, or feature that does not exist) would
+        # publish an immutable run reporting clean/complete forever,
+        # discoverable only if a caller happened to also run `validate`
+        # afterward. The SAME sweep `validate_run` runs against records
+        # read back from disk now runs HERE too, against these same
+        # records still in memory, before any of them is ever written
+        # to staging - a producer bug is refused at its own source,
+        # never merely detectable after the fact.
+        _publish_time_dangling = _dangling_reference_categories(
+            modules=modules, dependencies=dependencies, entry_points=entry_points,
+            features=features, readiness_signals=readiness_signals,
+        )
+        if any(ids for _, ids in _publish_time_dangling):
+            raise ComprehensionError(
+                "refusing to publish: this run's own records contain a dangling "
+                "cross-artifact reference - "
+                f"{_dangling_reference_detail(_publish_time_dangling)}"
+            )
+
         # N1 (third cold read, fix round 5): find_case_fold_collisions
         # existed with its own passing unit tests and zero production
         # callers - the same dead-code shape round 3's M9 found for
@@ -1673,6 +1697,107 @@ def _actual_record_count(name: str, doc: dict[str, Any]) -> int:
     return sum(len(doc.get(key) or []) for key in _RECORD_COUNT_SECTION_KEYS[name])
 
 
+def _dangling_reference_categories(
+    *,
+    modules: list[modules_artifact.ModuleRecord],
+    dependencies: list[dependencies_artifact.DependencyRecord],
+    entry_points: list[features_artifact.EntryPointRecord],
+    features: list[features_artifact.FeatureRecord],
+    readiness_signals: list[readiness_artifact.ReadinessSignal],
+) -> tuple[tuple[str, list[str]], ...]:
+    """FIX ROUND 29 (twenty-fifth cold read, F2 MAJOR, wrong-data): the
+    ONE cross-artifact reference sweep both ``validate_run`` (below, on
+    records read back from disk) and ``run_scan`` itself (publish time,
+    on the SAME record types still in memory, before anything is ever
+    written to staging) now call - the identical "one predicate, two
+    call sites" discipline MICRO-ROUND 28b's own pairing-predicate
+    already established, so the two can never independently drift.
+
+    Publish-time validation (design step 8) previously had NO
+    referential-integrity pass at all - a producer bug minting a
+    dangling reference would publish a run that reports clean/complete
+    forever, discoverable only if a caller happened to also run
+    ``validate`` afterward. Sharing this function means the SAME bug
+    that would make ``validate`` report invalid now REFUSES to publish
+    in the first place.
+
+    Started as round 28's own five categories (edge.from_unit_id,
+    entry_point.owning_unit_id/declared_in_unit_id, feature.unit_ids/
+    entry_point_ids, readiness signals[].unit_id, module.
+    container_unit_id) - widened here by THREE more the reader measured
+    unswept (the reader re-signed the digest chain and got ``valid:
+    true`` + ``report`` exit 0 with a fabricated ``target_unit_id``):
+    ``dependencies[].target_unit_id`` (a ``resolved`` edge naming no
+    real unit), ``dependencies[].candidate_unit_ids`` (an ``ambiguous``
+    edge's own candidate set), and ``entry_points[].feature_ids`` (an
+    entry point naming a feature that does not exist). Generalized as a
+    list of (label, ids) categories rather than an enumerated
+    combinatorial branch - the same discipline round 28's own version
+    of this function already established, now with three more members
+    a future reference needs no new branch to join, only one more
+    list entry."""
+    unit_ids = {m.unit_id for m in modules}
+    entry_point_ids = {e.entry_point_id for e in entry_points}
+    feature_ids = {f.feature_id for f in features}
+    dangling_edges = [e.edge_id for e in dependencies if e.from_unit_id not in unit_ids]
+    dangling_entry_points = [
+        e.entry_point_id for e in entry_points if e.owning_unit_id not in unit_ids]
+    dangling_declared_in = [
+        e.entry_point_id for e in entry_points
+        if e.declared_in_unit_id and e.declared_in_unit_id not in unit_ids
+    ]
+    dangling_feature_unit_refs = [
+        f.feature_id for f in features if any(u not in unit_ids for u in f.unit_ids)]
+    dangling_feature_entry_point_refs = [
+        f.feature_id for f in features
+        if any(ep not in entry_point_ids for ep in f.entry_point_ids)
+    ]
+    dangling_signals = [s.signal_id for s in readiness_signals if s.unit_id not in unit_ids]
+    dangling_containers = [
+        m.unit_id for m in modules
+        if m.container_unit_id is not None and m.container_unit_id not in unit_ids
+    ]
+    # FIX ROUND 29 (F2): the three newly-covered families.
+    dangling_target_unit_ids = [
+        e.edge_id for e in dependencies
+        if e.resolution_state == "resolved" and e.target_unit_id is not None
+        and e.target_unit_id not in unit_ids
+    ]
+    dangling_candidate_unit_ids = [
+        e.edge_id for e in dependencies
+        if e.resolution_state == "ambiguous"
+        and any(c not in unit_ids for c in e.candidate_unit_ids)
+    ]
+    dangling_entry_point_feature_ids = [
+        e.entry_point_id for e in entry_points
+        if any(fid not in feature_ids for fid in e.feature_ids)
+    ]
+    return (
+        ("edge(s) reference an unknown from_unit_id", dangling_edges),
+        ("entry point(s) reference an unknown owning_unit_id", dangling_entry_points),
+        ("entry point(s) reference an unknown declared_in_unit_id", dangling_declared_in),
+        ("feature(s) reference an unknown unit_id", dangling_feature_unit_refs),
+        ("feature(s) reference an unknown entry_point_id", dangling_feature_entry_point_refs),
+        ("readiness signal(s) reference an unknown unit_id", dangling_signals),
+        ("module(s) reference an unknown container_unit_id", dangling_containers),
+        ("edge(s) reference an unknown target_unit_id", dangling_target_unit_ids),
+        ("edge(s) reference an unknown candidate_unit_id", dangling_candidate_unit_ids),
+        ("entry point(s) reference an unknown feature_id", dangling_entry_point_feature_ids),
+    )
+
+
+def _dangling_reference_detail(
+    categories: tuple[tuple[str, list[str]], ...],
+) -> str | None:
+    """``None`` when every category is clean; otherwise one joined
+    sentence naming every non-empty category and its count - shared by
+    both of this function's own callers so the wording can never drift
+    between them."""
+    return " and ".join(
+        f"{len(ids)} {label}" for label, ids in categories if ids
+    ) or None
+
+
 def _verify_artifact_digests(
     scan_doc: dict[str, Any], raw_docs: dict[str, dict[str, Any]], run_dir: Path,
 ) -> None:
@@ -1845,66 +1970,22 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
         valid = False
         detail = str(exc)
         records = None
-    unit_ids = {m.unit_id for m in records["modules"]} if records else set()
-    entry_point_ids = {e.entry_point_id for e in records["entry_points"]} if records else set()
-    dangling_edges = [
-        e.edge_id for e in (records["dependencies"] if records else [])
-        if e.from_unit_id not in unit_ids
-    ] if records else []
-    # ROUND 9b (sixth cold read, honesty tightening): dangling EDGES were
-    # already flagged (above) - dangling ENTRY POINTS (an owning_unit_id
-    # naming no real unit, exactly the same "unattributable synthesized
-    # owner" shape round 9's own BLOCKER fixed at the adapter level) were
-    # not, so a THIS class of wrong-data could still slip past validate
-    # undetected on the entry-point side even though the edge side would
-    # have caught its own instance.
-    dangling_entry_points = [
-        e.entry_point_id for e in (records["entry_points"] if records else [])
-        if e.owning_unit_id not in unit_ids
-    ] if records else []
-    # FIX ROUND 28 (twenty-fourth cold read, F4, completeness): the sweep
-    # only ever covered edge.from_unit_id and entry_point.owning_unit_id -
-    # four more unit/entry_point-id-shaped references this same artifact
-    # family carries were never checked, each exactly as capable of
-    # naming a record that does not exist as the two already covered.
-    dangling_declared_in = [
-        e.entry_point_id for e in (records["entry_points"] if records else [])
-        if e.declared_in_unit_id and e.declared_in_unit_id not in unit_ids
-    ] if records else []
-    dangling_feature_unit_refs = [
-        f.feature_id for f in (records["features"] if records else [])
-        if any(u not in unit_ids for u in f.unit_ids)
-    ] if records else []
-    dangling_feature_entry_point_refs = [
-        f.feature_id for f in (records["features"] if records else [])
-        if any(ep not in entry_point_ids for ep in f.entry_point_ids)
-    ] if records else []
-    dangling_signals = [
-        s.signal_id for s in (records["readiness_signals"] if records else [])
-        if s.unit_id not in unit_ids
-    ] if records else []
-    dangling_containers = [
-        m.unit_id for m in (records["modules"] if records else [])
-        if m.container_unit_id is not None and m.container_unit_id not in unit_ids
-    ] if records else []
-    # Generalized (never enumerated per-combination) the same way M-4/
-    # round 4 and M2/round 6 already established for the projector's own
-    # bounded sections - seven categories makes an explicit combinatorial
-    # branch unwieldy, and a future eighth reference would silently need
-    # its own new branch instead of just joining this list.
-    _dangling_categories = (
-        ("edge(s) reference an unknown from_unit_id", dangling_edges),
-        ("entry point(s) reference an unknown owning_unit_id", dangling_entry_points),
-        ("entry point(s) reference an unknown declared_in_unit_id", dangling_declared_in),
-        ("feature(s) reference an unknown unit_id", dangling_feature_unit_refs),
-        ("feature(s) reference an unknown entry_point_id", dangling_feature_entry_point_refs),
-        ("readiness signal(s) reference an unknown unit_id", dangling_signals),
-        ("module(s) reference an unknown container_unit_id", dangling_containers),
+    # FIX ROUND 29 (twenty-fifth cold read, F2 MAJOR): the sweep itself
+    # now lives in _dangling_reference_categories, shared with publish-
+    # time (run_scan, before anything is ever written to staging) - see
+    # its own docstring. An empty-records fallback (every category
+    # empty) when validation failed before records ever loaded, the
+    # same "nothing to check yet" shape this function's own try/except
+    # above already handles for `valid`.
+    _dangling_categories = _dangling_reference_categories(
+        modules=records["modules"] if records else [],
+        dependencies=records["dependencies"] if records else [],
+        entry_points=records["entry_points"] if records else [],
+        features=records["features"] if records else [],
+        readiness_signals=records["readiness_signals"] if records else [],
     )
     invalid = any(ids for _, ids in _dangling_categories)
-    dangling_detail = " and ".join(
-        f"{len(ids)} {label}" for label, ids in _dangling_categories if ids
-    ) or None
+    dangling_detail = _dangling_reference_detail(_dangling_categories)
     return {
         "scan_id": scan_id,
         "valid": valid and not invalid,

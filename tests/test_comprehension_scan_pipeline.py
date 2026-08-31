@@ -3491,7 +3491,7 @@ def test_validate_run_success_detail_names_the_record_count_and_reference_checks
     assert "reference" in result["detail"]
 
 
-def test_validate_run_flags_an_entry_point_with_an_unknown_owning_unit(
+def test_run_scan_refuses_to_publish_an_entry_point_with_an_unknown_owning_unit(
     java_repo: Path, monkeypatch,
 ) -> None:
     """ROUND 9b (sixth cold read, honesty tightening): validate already
@@ -3499,10 +3499,17 @@ def test_validate_run_flags_an_entry_point_with_an_unknown_owning_unit(
     but never an ENTRY POINT referencing an unknown owning_unit_id - the
     same "unattributable synthesized owner" shape round 9's own BLOCKER
     fixed at the adapter level could still slip past validate
-    undetected on the entry-point side. Injects a synthetic entry point
-    via features_artifact.build_features's own return value (so the
-    artifact is digested consistently from the start, not mutated after
-    publication) rather than corrupting an on-disk artifact."""
+    undetected on the entry-point side.
+
+    FIX ROUND 29 (twenty-fifth cold read, F2 MAJOR): this used to let
+    `run_scan` PUBLISH the injected orphan (self-consistent digests
+    throughout - nothing byte-level was ever tampered) and rely on a
+    SEPARATE `validate_run` call to catch it after the fact. The SAME
+    sweep now also runs at publish time, against these same in-memory
+    records, before anything is ever written to staging - injecting a
+    dangling reference here now means `run_scan` itself refuses,
+    never a run that quietly reports "valid: false" only if a caller
+    happens to check afterward."""
     from agenttalk.comprehension import features_artifact as featuresmod
 
     real_build_features = featuresmod.build_features
@@ -3517,20 +3524,18 @@ def test_validate_run_flags_an_entry_point_with_an_unknown_owning_unit(
 
     monkeypatch.setattr(scan_pipeline.features_artifact, "build_features", _inject_a_dangling_entry_point)
 
-    scan_pipeline.run_scan(java_repo)
-    result = scan_pipeline.validate_run(java_repo)
-    assert result["valid"] is False
-    assert "owning_unit_id" in result["detail"]
+    with pytest.raises(scan_pipeline.ComprehensionError, match="owning_unit_id"):
+        scan_pipeline.run_scan(java_repo)
 
 
-def test_validate_run_flags_an_entry_point_with_an_unknown_declared_in_unit(
+def test_run_scan_refuses_to_publish_an_entry_point_with_an_unknown_declared_in_unit(
     java_repo: Path, monkeypatch,
 ) -> None:
     """FIX ROUND 28 (twenty-fourth cold read, F4, completeness): the
     dangling-reference sweep never covered declared_in_unit_id (round
-    27's own new field) - a value naming no real unit could slip past
-    validate exactly the same way an unknown owning_unit_id used to
-    before round 9b's own fix."""
+    27's own new field). FIX ROUND 29 (F2): now caught at PUBLISH time,
+    not merely by a later validate_run call - see the sibling test
+    above."""
     from agenttalk.comprehension import features_artifact as featuresmod
 
     real_build_features = featuresmod.build_features
@@ -3548,17 +3553,16 @@ def test_validate_run_flags_an_entry_point_with_an_unknown_declared_in_unit(
     monkeypatch.setattr(
         scan_pipeline.features_artifact, "build_features", _inject_a_dangling_declared_in)
 
-    scan_pipeline.run_scan(java_repo)
-    result = scan_pipeline.validate_run(java_repo)
-    assert result["valid"] is False
-    assert "declared_in_unit_id" in result["detail"]
+    with pytest.raises(scan_pipeline.ComprehensionError, match="declared_in_unit_id"):
+        scan_pipeline.run_scan(java_repo)
 
 
-def test_validate_run_flags_a_feature_with_an_unknown_unit_id(
+def test_run_scan_refuses_to_publish_a_feature_with_an_unknown_unit_id(
     java_repo: Path, monkeypatch,
 ) -> None:
-    """FIX ROUND 28 (F4, completeness): feature.unit_ids was never swept
-    for dangling references either."""
+    """FIX ROUND 28 (F4, completeness) + FIX ROUND 29 (F2, now caught at
+    publish time): feature.unit_ids was never swept for dangling
+    references either."""
     from agenttalk.comprehension import features_artifact as featuresmod
 
     real_build_features = featuresmod.build_features
@@ -3574,17 +3578,18 @@ def test_validate_run_flags_a_feature_with_an_unknown_unit_id(
     monkeypatch.setattr(
         scan_pipeline.features_artifact, "build_features", _inject_a_dangling_feature_unit)
 
-    scan_pipeline.run_scan(java_repo)
-    result = scan_pipeline.validate_run(java_repo)
-    assert result["valid"] is False
-    assert "feature(s) reference an unknown unit_id" in result["detail"]
+    with pytest.raises(
+        scan_pipeline.ComprehensionError, match="feature\\(s\\) reference an unknown unit_id",
+    ):
+        scan_pipeline.run_scan(java_repo)
 
 
-def test_validate_run_flags_a_feature_with_an_unknown_entry_point_id(
+def test_run_scan_refuses_to_publish_a_feature_with_an_unknown_entry_point_id(
     java_repo: Path, monkeypatch,
 ) -> None:
-    """FIX ROUND 28 (F4, completeness): feature.entry_point_ids was never
-    swept for dangling references either."""
+    """FIX ROUND 28 (F4, completeness) + FIX ROUND 29 (F2, now caught at
+    publish time): feature.entry_point_ids was never swept for dangling
+    references either."""
     from agenttalk.comprehension import features_artifact as featuresmod
 
     real_build_features = featuresmod.build_features
@@ -3600,17 +3605,18 @@ def test_validate_run_flags_a_feature_with_an_unknown_entry_point_id(
     monkeypatch.setattr(
         scan_pipeline.features_artifact, "build_features", _inject_a_dangling_feature_entry_point)
 
-    scan_pipeline.run_scan(java_repo)
-    result = scan_pipeline.validate_run(java_repo)
-    assert result["valid"] is False
-    assert "feature(s) reference an unknown entry_point_id" in result["detail"]
+    with pytest.raises(
+        scan_pipeline.ComprehensionError, match="feature\\(s\\) reference an unknown entry_point_id",
+    ):
+        scan_pipeline.run_scan(java_repo)
 
 
-def test_validate_run_flags_a_readiness_signal_with_an_unknown_unit_id(
+def test_run_scan_refuses_to_publish_a_readiness_signal_with_an_unknown_unit_id(
     java_repo: Path, monkeypatch,
 ) -> None:
-    """FIX ROUND 28 (F4, completeness): readiness signals[].unit_id was
-    never swept for dangling references either."""
+    """FIX ROUND 28 (F4, completeness) + FIX ROUND 29 (F2, now caught at
+    publish time): readiness signals[].unit_id was never swept for
+    dangling references either."""
     from agenttalk.comprehension import readiness_artifact as readinessmod
 
     real_build_readiness = readinessmod.build_readiness
@@ -3627,17 +3633,18 @@ def test_validate_run_flags_a_readiness_signal_with_an_unknown_unit_id(
     monkeypatch.setattr(
         scan_pipeline.readiness_artifact, "build_readiness", _inject_a_dangling_signal)
 
-    scan_pipeline.run_scan(java_repo)
-    result = scan_pipeline.validate_run(java_repo)
-    assert result["valid"] is False
-    assert "readiness signal(s) reference an unknown unit_id" in result["detail"]
+    with pytest.raises(
+        scan_pipeline.ComprehensionError, match="readiness signal\\(s\\) reference an unknown unit_id",
+    ):
+        scan_pipeline.run_scan(java_repo)
 
 
-def test_validate_run_flags_a_module_with_an_unknown_container_unit_id(
+def test_run_scan_refuses_to_publish_a_module_with_an_unknown_container_unit_id(
     java_repo: Path, monkeypatch,
 ) -> None:
-    """FIX ROUND 28 (F4, completeness): module.container_unit_id was
-    never swept for dangling references either."""
+    """FIX ROUND 28 (F4, completeness) + FIX ROUND 29 (F2, now caught at
+    publish time): module.container_unit_id was never swept for
+    dangling references either."""
     from agenttalk.comprehension import modules_artifact as modulesmod
 
     real_build_modules = modulesmod.build_modules
@@ -3654,10 +3661,103 @@ def test_validate_run_flags_a_module_with_an_unknown_container_unit_id(
     monkeypatch.setattr(
         scan_pipeline.modules_artifact, "build_modules", _inject_a_dangling_container)
 
-    scan_pipeline.run_scan(java_repo)
-    result = scan_pipeline.validate_run(java_repo)
-    assert result["valid"] is False
-    assert "module(s) reference an unknown container_unit_id" in result["detail"]
+    with pytest.raises(
+        scan_pipeline.ComprehensionError, match="module\\(s\\) reference an unknown container_unit_id",
+    ):
+        scan_pipeline.run_scan(java_repo)
+
+
+def test_run_scan_refuses_to_publish_a_dependency_edge_with_an_unknown_target_unit_id(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 29 (twenty-fifth cold read, F2 MAJOR, wrong-data): the
+    reader re-signed the digest chain and got `valid: true` + `report`
+    exit 0 with a fabricated `target_unit_id` - dependencies[].
+    target_unit_id was never swept at all, at either validate or
+    publish time."""
+    from agenttalk.comprehension import dependencies_artifact as depsmod
+
+    real_build_dependencies = depsmod.build_dependencies
+
+    def _inject_a_dangling_target(*args, **kwargs):
+        edges = real_build_dependencies(*args, **kwargs)
+        orphan = depsmod.DependencyRecord(
+            edge_id="orphan-edge",
+            from_unit_id=scan_pipeline.digests.unit_id(
+                kind="component", paths=["src/main/java/p/App.java"], qualified_name="p.App"),
+            relation="import", phase="runtime",
+            optional=False, evidence_class="extracted", resolution_state="resolved",
+            target_unit_id="does-not-exist",
+        )
+        return [*edges, orphan]
+
+    monkeypatch.setattr(
+        scan_pipeline.dependencies_artifact, "build_dependencies", _inject_a_dangling_target)
+
+    with pytest.raises(
+        scan_pipeline.ComprehensionError, match="edge\\(s\\) reference an unknown target_unit_id",
+    ):
+        scan_pipeline.run_scan(java_repo)
+
+
+def test_run_scan_refuses_to_publish_a_dependency_edge_with_an_unknown_candidate_unit_id(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 29 (F2 MAJOR): the ambiguous-resolution twin of the
+    target_unit_id test above - dependencies[].candidate_unit_ids was
+    equally unswept."""
+    from agenttalk.comprehension import dependencies_artifact as depsmod
+
+    real_build_dependencies = depsmod.build_dependencies
+
+    def _inject_a_dangling_candidate(*args, **kwargs):
+        edges = real_build_dependencies(*args, **kwargs)
+        orphan = depsmod.DependencyRecord(
+            edge_id="orphan-edge",
+            from_unit_id=scan_pipeline.digests.unit_id(
+                kind="component", paths=["src/main/java/p/App.java"], qualified_name="p.App"),
+            relation="import", phase="runtime",
+            optional=False, evidence_class="extracted", resolution_state="ambiguous",
+            candidate_unit_ids=["does-not-exist"],
+        )
+        return [*edges, orphan]
+
+    monkeypatch.setattr(
+        scan_pipeline.dependencies_artifact, "build_dependencies", _inject_a_dangling_candidate)
+
+    with pytest.raises(
+        scan_pipeline.ComprehensionError, match="edge\\(s\\) reference an unknown candidate_unit_id",
+    ):
+        scan_pipeline.run_scan(java_repo)
+
+
+def test_run_scan_refuses_to_publish_an_entry_point_with_an_unknown_feature_id(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 29 (F2 MAJOR): entry_points[].feature_ids was equally
+    unswept - an entry point naming a feature that does not exist."""
+    from agenttalk.comprehension import features_artifact as featuresmod
+
+    real_build_features = featuresmod.build_features
+
+    def _inject_a_dangling_feature_id(*args, **kwargs):
+        entry_points, features = real_build_features(*args, **kwargs)
+        real_owner = entry_points[0].owning_unit_id if entry_points else scan_pipeline.digests.unit_id(
+            kind="component", paths=["src/main/java/p/App.java"], qualified_name="p.App")
+        orphan = featuresmod.EntryPointRecord(
+            entry_point_id="orphan-entry-point-feature", kind="http_route", name="GET /orphan",
+            owning_unit_id=real_owner, feature_ids=["does-not-exist-feature"],
+            evidence_class="declared",
+        )
+        return [*entry_points, orphan], features
+
+    monkeypatch.setattr(
+        scan_pipeline.features_artifact, "build_features", _inject_a_dangling_feature_id)
+
+    with pytest.raises(
+        scan_pipeline.ComprehensionError, match="entry point\\(s\\) reference an unknown feature_id",
+    ):
+        scan_pipeline.run_scan(java_repo)
 
 
 def test_scan_json_carries_per_artifact_and_run_level_digests(java_repo: Path) -> None:
