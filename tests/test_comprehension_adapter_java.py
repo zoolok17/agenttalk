@@ -4341,7 +4341,13 @@ def test_sniff_xml_root_element_recognizes_the_spring_dtd_form_doctype_as_beans(
 # ----------------------------------------------------------- honest gaps
 
 def test_unsupported_relations_are_named_not_silently_omitted():
-    assert java.UNSUPPORTED_RELATIONS == ("data", "configuration")
+    """FIX ROUND 29 (twenty-fifth cold read, F9a note): "include" is part
+    of dependencies_artifact.CLOSED_RELATIONS's own closed vocabulary
+    but this adapter never actually emits it - a pom's own <parent>
+    coordinate and a reactor's own <modules><module> aggregator entries
+    are exactly the two shapes it would cover. Declared, not silently
+    absent from this same static-capability tuple."""
+    assert java.UNSUPPORTED_RELATIONS == ("data", "configuration", "include")
 
 
 def test_unsupported_invoke_shapes_are_named_not_silently_omitted():

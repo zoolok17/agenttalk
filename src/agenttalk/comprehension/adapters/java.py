@@ -47,7 +47,19 @@ RULE_VERSION = 1
 
 #: Relations this adapter does NOT attempt this slice - named, not hidden
 #: (design: "Unsupported relation types remain coverage gaps").
-UNSUPPORTED_RELATIONS = ("data", "configuration")
+#:
+#: FIX ROUND 29 (twenty-fifth cold read, F9a note, declare-not-silently-
+#: leave-implicit): "include" is part of ``dependencies_artifact.
+#: CLOSED_RELATIONS``'s own closed vocabulary but this adapter never
+#: actually emits it - a pom's own ``<parent>`` coordinate (the existing
+#: "A pom's own <parent> coordinate is invisible" named carry) and a
+#: reactor's own ``<modules><module>`` aggregator entries (modeled only
+#: as the REACTOR RULE's own excluded-region evidence, round 20, never
+#: as a real dependency edge of their own) are exactly the two shapes
+#: "include" would cover. Declared here, in the same static-capability
+#: tuple every OTHER recognized-but-unmodeled relation already uses,
+#: rather than left silently absent from it.
+UNSUPPORTED_RELATIONS = ("data", "configuration", "include")
 #: FIX ROUND 14 (tenth cold read, CR10-3 JUDGE, alongside the chain-aware
 #: resolution fix): item-3's "invoke" scope ("direct syntactic same-file/
 #: qualified static calls") was written and read as METHOD calls only -
