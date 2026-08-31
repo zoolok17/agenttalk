@@ -3600,6 +3600,42 @@ def _filter_class_by_name(
     return mapping, undecodable
 
 
+#: FIX ROUND 24 (micro-round 24b, reviewer-3 delta on `3a7abc2`, item 1,
+#: latent-not-live): the SAME "positive evidence, not merely absence of
+#: a negative" gap F1b closed for pom.xml - a web.xml that parses
+#: without error but yields zero entry points AND zero problems would
+#: read as ``source_understood`` satisfied purely from absence, the
+#: identical inversion. Today this is HONEST for a genuinely empty
+#: ``<web-app/>`` (there is nothing declared at all - the same "named,
+#: explicit non-problem" shape ``is_effectively_empty_java_source``
+#: already establishes for a blank/comment-only ``.java`` file: nothing
+#: to misunderstand is itself a POSITIVE finding, not an evidence gap).
+#: It is DISHONEST for a web.xml that HAS real content (metadata, an
+#: unrecognized element shape, ...) but that content happens to produce
+#: none of the five element families this adapter models - exactly the
+#: shape that would mask the NEXT web.xml parser blindness the same way
+#: the pom.xml one did. A self-closing ``<web-app/>`` is unambiguously
+#: empty by construction (no possible children); an open/close pair's
+#: own captured body, stripped of whitespace, distinguishes the two.
+_WEB_APP_SELF_CLOSING_RE = re.compile(r"<(?:[A-Za-z_][\w.-]*:)?web-app(?=[\s/])[^>]*/>")
+_WEB_APP_BLOCK_RE = _structural_block_pattern("web-app")
+
+
+def is_effectively_empty_web_xml(text: str) -> bool:
+    """True when a ``<web-app>`` root is genuinely empty - self-closing,
+    or an open/close pair with nothing but whitespace between them.
+    False for a root this function cannot even find (a different or
+    malformed root element) - that is a DIFFERENT fact (an unrecognized
+    shape), not an empty one, and the caller must not conflate the two."""
+    sanitized = _strip_xml_comments(text)
+    if _WEB_APP_SELF_CLOSING_RE.search(sanitized) is not None:
+        return True
+    block_match = _WEB_APP_BLOCK_RE.search(sanitized)
+    if block_match is None:
+        return False
+    return block_match.group(1).strip() == ""
+
+
 def parse_web_xml(
     relative_path: str, text: str,
 ) -> tuple[list[JavaEntryPointClaim], list[JavaAdapterProblem]]:

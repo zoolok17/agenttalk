@@ -660,6 +660,56 @@ def test_process_paths_does_not_flag_a_minimal_pom_with_a_real_coordinate_f1b(
     assert result.problems == []
 
 
+def test_process_paths_flags_a_web_xml_that_extracts_nothing_but_has_real_content(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 24b (reviewer-3 delta on `3a7abc2`, item 1, wrong-
+    data): the SAME positive-evidence gate F1b already gives pom.xml,
+    extended to web.xml - a parse that succeeds but yields zero entry
+    points and zero problems, over a root that has REAL content (a
+    <display-name>, here) that simply matches none of this adapter's
+    five modeled element families, must not read as a complete, zero-
+    problem run - exactly the shape that would mask the next web.xml
+    parser blindness the same way the pom.xml one did."""
+    (tmp_path / "web.xml").write_text(
+        "<web-app><display-name>Legacy App</display-name></web-app>\n", encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["web.xml"])
+    matching = [p for p in result.problems if p.reason_code == "no_web_xml_facts_extracted"]
+    assert len(matching) == 1
+    assert matching[0].relative_path == "web.xml"
+
+
+def test_process_paths_does_not_flag_a_genuinely_empty_web_app(tmp_path: Path) -> None:
+    """MICRO-ROUND 24b (item 1): a genuinely empty <web-app/> - nothing
+    declared at all - gets the SAME "nothing to misunderstand is itself
+    a positive finding" treatment Empty.java already gets, not the new
+    gate. Judged deliberately: unlike a pom (which always carries SOME
+    identity under Maven's own model), an empty descriptor is a real,
+    common, legitimate shape (e.g. an otherwise fully annotation-driven
+    webapp with no XML-declared servlets at all)."""
+    (tmp_path / "web.xml").write_text("<web-app/>\n", encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["web.xml"])
+    assert result.problems == []
+
+
+def test_process_paths_does_not_flag_a_normal_web_xml_with_a_real_mapping(
+    tmp_path: Path,
+) -> None:
+    """Companion control: a normal, real web.xml with a genuine mapping
+    must not be flagged - it has real, non-empty extraction (one entry
+    point), the ordinary healthy case."""
+    (tmp_path / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>s1</servlet-name>\n"
+        "    <url-pattern>/s1</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["web.xml"])
+    assert result.problems == []
+
+
 def test_process_paths_flags_a_pom_dependency_with_an_undecodable_groupid_f4(
     tmp_path: Path,
 ) -> None:

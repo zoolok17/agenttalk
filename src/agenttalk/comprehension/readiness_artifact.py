@@ -299,6 +299,12 @@ _READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
     # whole-file evidence gap (the same narrow scoping `route_value_
     # unrecoverable` already gets, restated for the dependency side).
     "dependency_value_unrecoverable": frozenset({"dependencies_resolved"}),
+    # FIX ROUND 24 (micro-round 24b, item 1, wrong-data): web.xml's own
+    # analogue of `no_pom_facts_extracted` - a parse that succeeded but
+    # yielded zero entry points and zero problems over a root that is
+    # not genuinely empty (worker.py).
+    "no_web_xml_facts_extracted": frozenset({
+        "source_understood", "dependencies_resolved", "entry_points_mapped"}),
 }
 
 

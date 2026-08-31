@@ -660,6 +660,28 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                 java_results[rel] = java_adapter.file_result_to_json(
                     java_adapter.JavaFileResult(
                         entry_points=web_entry_points, problems=web_problems))
+                # FIX ROUND 24 (micro-round 24b, item 1, wrong-data): the
+                # SAME positive-evidence gate F1b already gives pom.xml -
+                # a parse that succeeds but yields ZERO entry points AND
+                # zero problems reads as source_understood satisfied
+                # purely from absence. Honest for a genuinely EMPTY
+                # <web-app/> (nothing declared at all - the Empty.java
+                # treatment, a positive finding); dishonest for a web.xml
+                # with real content that simply matches none of this
+                # adapter's five modeled element families - exactly the
+                # shape that would mask the NEXT web.xml parser
+                # blindness the same way the pom.xml one did.
+                if (
+                    not web_entry_points and not web_problems
+                    and not java_adapter.is_effectively_empty_web_xml(text)
+                ):
+                    problems.append(WorkerProblem(
+                        reason_code="no_web_xml_facts_extracted", relative_path=rel,
+                        detail="the web.xml adapter parsed this file but extracted no "
+                               "entry points and recorded no problems, over a root that "
+                               "is not genuinely empty - an unrecognized or unmodeled "
+                               "web.xml shape, not a legitimately empty descriptor",
+                    ))
         elif not (
             rel_lower.endswith(tuple(_BENIGN_NON_CODE_EXTENSIONS))
             or rel_name_lower in _BENIGN_NON_CODE_BASENAMES
