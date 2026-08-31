@@ -2048,6 +2048,15 @@ def test_run_scan_a_duplicate_servlet_name_with_conflicting_classes_publishes_a_
     assert len(matching) == 1
     assert "com.acme.web.ServletA" in matching[0]["detail"]
     assert "com.acme.web.ServletB" in matching[0]["detail"]
+    # MICRO-ROUND 29b (reviewer-3's delta on F1, wrong-data): the round-16
+    # problems emitter used to group by conflict_id alone and hardcode
+    # reason_code=duplicate_qualified_name, publishing a SECOND, factually
+    # false row for this exact conflict ("'com.acme.web.ServletA' declared
+    # in [...]" - it is declared in ServletA.java only) that contradicted
+    # this same conflict_id's own conflict_kind and duplicated the row
+    # above. Exactly one problem row for this conflict now - never two.
+    assert not any(p["reason_code"] == "duplicate_qualified_name" for p in problems_doc["problems"])
+    assert len(problems_doc["problems"]) == 1
 
     modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
     servlet_a = next(u for u in modules_doc["units"] if u["display_name"] == "ServletA")
@@ -2115,6 +2124,12 @@ def test_run_scan_a_duplicate_filter_name_with_conflicting_classes_publishes_a_c
     assert len(matching) == 1
     assert "com.acme.web.FilterA" in matching[0]["detail"]
     assert "com.acme.web.FilterB" in matching[0]["detail"]
+    # MICRO-ROUND 29b (reviewer-3's delta on F1, wrong-data): the filter
+    # twin of the servlet-name check above - the old emitter would have
+    # published a second, false duplicate_qualified_name row for this
+    # SAME conflict_id.
+    assert not any(p["reason_code"] == "duplicate_qualified_name" for p in problems_doc["problems"])
+    assert len(problems_doc["problems"]) == 1
 
     modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
     filter_a = next(u for u in modules_doc["units"] if u["display_name"] == "FilterA")
@@ -2122,6 +2137,60 @@ def test_run_scan_a_duplicate_filter_name_with_conflicting_classes_publishes_a_c
     assert filter_a["conflict_id"] is not None
     assert filter_a["conflict_id"] == filter_b["conflict_id"]
     assert filter_a["conflict_kind"] == "duplicate_descriptor_name"
+
+
+def test_run_scan_a_three_way_duplicate_servlet_name_publishes_one_conflict_row(
+    java_repo: Path,
+) -> None:
+    """MICRO-ROUND 29b (reviewer-3's own matrix, one-condition fix): the
+    SAME servlet-name declared THREE times with three different class
+    values - the round-16 problems emitter's own bug generalizes to any
+    group size, not just 2. Exactly one problem row (java.py's own
+    duplicate_descriptor_name), never a second, false
+    duplicate_qualified_name row for the same conflict_id."""
+    import json
+
+    web_dir = java_repo / "src" / "main" / "java" / "com" / "acme" / "web"
+    web_dir.mkdir(parents=True)
+    for letter in ("A", "B", "C"):
+        (web_dir / f"Servlet{letter}.java").write_text(
+            f"package com.acme.web;\nclass Servlet{letter} {{\n}}\n", encoding="utf-8")
+    (java_repo / "WEB-INF").mkdir()
+    servlet_blocks = "".join(
+        "  <servlet>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        f"    <servlet-class>com.acme.web.Servlet{letter}</servlet-class>\n"
+        "  </servlet>\n"
+        for letter in ("A", "B", "C")
+    )
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n" + servlet_blocks +
+        "  <servlet-mapping>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "    <url-pattern>/api/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matching = [p for p in problems_doc["problems"] if p["reason_code"] == "duplicate_descriptor_name"]
+    assert len(matching) == 1
+    for letter in ("A", "B", "C"):
+        assert f"com.acme.web.Servlet{letter}" in matching[0]["detail"]
+    assert not any(p["reason_code"] == "duplicate_qualified_name" for p in problems_doc["problems"])
+    assert len(problems_doc["problems"]) == 1
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    servlets = [
+        next(u for u in modules_doc["units"] if u["display_name"] == f"Servlet{letter}")
+        for letter in ("A", "B", "C")
+    ]
+    assert len({s["conflict_id"] for s in servlets}) == 1
+    assert all(s["conflict_kind"] == "duplicate_descriptor_name" for s in servlets)
 
 
 def test_run_scan_a_benign_duplicate_servlet_declaration_collapses_silently(
@@ -2162,6 +2231,11 @@ def test_run_scan_a_benign_duplicate_servlet_declaration_collapses_silently(
 
     problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
     assert not any(p["reason_code"] == "duplicate_descriptor_name" for p in problems_doc["problems"])
+    # MICRO-ROUND 29b (reviewer-3's own matrix): the benign twin must
+    # publish NO conflict row of either reason code - never
+    # duplicate_qualified_name either, since no conflict_id is stamped
+    # at all for an identical-class re-declaration.
+    assert problems_doc["problems"] == []
 
     modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
     servlet_unit = next(
@@ -2455,8 +2529,22 @@ def test_run_scan_refuses_to_publish_modules_out_of_deterministic_order(
 
     monkeypatch.setattr(scan_pipeline.modules_artifact, "build_modules", _reverse_the_order)
 
-    with pytest.raises(scan_pipeline.ComprehensionError, match="deterministic"):
+    with pytest.raises(scan_pipeline.ComprehensionError, match="deterministic") as exc_info:
         scan_pipeline.run_scan(java_repo)
+
+    # MICRO-ROUND 29b (JUDGE, note-only, chosen behavior): this refusal
+    # fires after staging creation but before anything is written there -
+    # staging.py's own Note 10 judges the resulting orphaned `.staging/`
+    # directory DESIGNED, not a leak (bounded, self-clearing on the next
+    # scan's own lock-acquisition reclaim) - so the directory is left in
+    # place, never proactively deleted here, but the refusal message now
+    # names the existing remedy rather than leaving it to be discovered
+    # separately.
+    assert "prune --staging" in str(exc_info.value)
+    comp_dir = scan_pipeline.paths.comprehension_dir(java_repo / ".agenttalk")
+    staging_entries = list(scan_pipeline.paths.staging_dir(comp_dir).iterdir())
+    assert len(staging_entries) == 1
+    assert [p.name for p in staging_entries[0].iterdir()] == ["owner.json"]
 
 
 def test_run_scan_an_encoding_undecodable_root_sniffed_xml_publishes_no_classification(
@@ -3740,8 +3828,19 @@ def test_run_scan_refuses_to_publish_an_entry_point_with_an_unknown_owning_unit(
 
     monkeypatch.setattr(scan_pipeline.features_artifact, "build_features", _inject_a_dangling_entry_point)
 
-    with pytest.raises(scan_pipeline.ComprehensionError, match="owning_unit_id"):
+    with pytest.raises(scan_pipeline.ComprehensionError, match="owning_unit_id") as exc_info:
         scan_pipeline.run_scan(java_repo)
+
+    # MICRO-ROUND 29b (JUDGE, note-only, chosen behavior): the same
+    # orphaned-staging-dir disposition as the F6 ordering refusal - see
+    # its own test for the full reasoning. Named here once, at this
+    # representative F2 category, since the disposition is a property of
+    # the shared raise site, not of which dangling category triggered it.
+    assert "prune --staging" in str(exc_info.value)
+    comp_dir = scan_pipeline.paths.comprehension_dir(java_repo / ".agenttalk")
+    staging_entries = list(scan_pipeline.paths.staging_dir(comp_dir).iterdir())
+    assert len(staging_entries) == 1
+    assert [p.name for p in staging_entries[0].iterdir()] == ["owner.json"]
 
 
 def test_run_scan_refuses_to_publish_an_entry_point_with_an_unknown_declared_in_unit(
@@ -4624,6 +4723,11 @@ def test_run_scan_a_duplicate_qualified_name_publishes_ambiguous_import_and_a_pr
     assert len(config_units) == 2
     assert config_units[0]["conflict_id"] is not None
     assert config_units[0]["conflict_id"] == config_units[1]["conflict_id"]
+    # MICRO-ROUND 29b (reviewer-3's own matrix): a genuine FQN collision
+    # must still publish its own row, unaffected by the fix that
+    # suppresses the SIBLING (descriptor-name) conflict_kind's second,
+    # false row.
+    assert config_units[0]["conflict_kind"] == "duplicate_qualified_name"
 
     dup_problems = [
         p for p in problems_doc["problems"] if p["reason_code"] == "duplicate_qualified_name"]

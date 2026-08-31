@@ -874,10 +874,28 @@ def run_scan(
             features=features, readiness_signals=readiness_signals,
         )
         if any(ids for _, ids in _publish_time_dangling):
+            # MICRO-ROUND 29b (JUDGE, note-only, lean take): this refusal
+            # fires after `create_staging_dir` (line ~495) but before any
+            # artifact is ever written there - it leaves behind an
+            # orphaned `.staging/<id>/` holding only `owner.json`.
+            # staging.py's own Note 10 already judges this DESIGNED, not a
+            # leak (bounded, one per failed attempt, self-clearing the
+            # moment this still-live process actually ends, since the
+            # NEXT run's own lock-acquisition reclaim then sees a dead
+            # owner) - the same dead-or-leave-alone contract this refusal
+            # must not special-case around. Named here instead, pointing
+            # an operator at the existing remedy rather than leaving them
+            # to discover `prune --staging` separately (the same
+            # named-not-silent idiom round 17's own CR13-10 carry already
+            # asks for).
             raise ComprehensionError(
                 "refusing to publish: this run's own records contain a dangling "
                 "cross-artifact reference - "
-                f"{_dangling_reference_detail(_publish_time_dangling)}"
+                f"{_dangling_reference_detail(_publish_time_dangling)} "
+                "(this run's own .staging/ directory is left in place, self-clearing "
+                "on the next scan's own lock-acquisition reclaim once this process "
+                "exits; run `agenttalk comprehension prune --staging` to reclaim it "
+                "sooner)"
             )
 
         # FIX ROUND 29 (twenty-fifth cold read, F6 polish, wrong-data):
@@ -893,9 +911,16 @@ def run_scan(
         # actually checks.
         _expected_module_order = sorted(modules, key=lambda m: (m.paths[0] if m.paths else "", m.unit_id))
         if modules != _expected_module_order:
+            # MICRO-ROUND 29b (JUDGE, note-only): the same orphaned-
+            # staging-dir disposition as the dangling-reference refusal
+            # above - see its own comment.
             raise ComprehensionError(
                 "refusing to publish: modules.json's own records are not in "
-                "deterministic (path-then-unit_id) order"
+                "deterministic (path-then-unit_id) order "
+                "(this run's own .staging/ directory is left in place, self-clearing "
+                "on the next scan's own lock-acquisition reclaim once this process "
+                "exits; run `agenttalk comprehension prune --staging` to reclaim it "
+                "sooner)"
             )
 
         # N1 (third cold read, fix round 5): find_case_fold_collisions
@@ -913,9 +938,28 @@ def run_scan(
         # grouping modules_artifact.py's own conflict_id tagging by the
         # id itself since that is the one value both colliding units
         # share.
+        #
+        # MICRO-ROUND 29b (reviewer-3's delta on round 29's own F1, one-
+        # condition wrong-data fix): `conflict_id` gained a SECOND
+        # meaning in round 29 - `conflict_kind` now distinguishes an FQN
+        # collision (`duplicate_qualified_name`) from a web.xml
+        # descriptor-name collision (`duplicate_descriptor_name`) sharing
+        # the SAME `conflict_id` tagging mechanism - but this emitter,
+        # written before `conflict_kind` existed, grouped by `conflict_id`
+        # alone and hardcoded `reason_code="duplicate_qualified_name"` for
+        # every group. A descriptor-name conflict's own candidate classes
+        # now ALSO flow through here, publishing a SECOND, factually false
+        # problem row (`"p.A" declared in [A.java, B.java]"` - `p.A` is
+        # declared in `A.java` only) that contradicts `modules.json`'s own
+        # `conflict_kind` for the same `conflict_id`, duplicating
+        # `java.py`'s own already-correct `duplicate_descriptor_name` row
+        # (round 29 F1). Filtered to groups whose `conflict_kind` is
+        # actually `duplicate_qualified_name` - the descriptor conflict
+        # already has its own accurate row; this emitter must not
+        # generate a second, generic one for it.
         modules_by_conflict_id: dict[str, list[modules_artifact.ModuleRecord]] = {}
         for m in modules:
-            if m.conflict_id is not None:
+            if m.conflict_id is not None and m.conflict_kind == "duplicate_qualified_name":
                 modules_by_conflict_id.setdefault(m.conflict_id, []).append(m)
         duplicate_qualified_name_problems = [
             _problem_record(
