@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from agenttalk.comprehension import readiness_artifact as ra
 from agenttalk.comprehension.dependencies_artifact import DependencyRecord
-from agenttalk.comprehension.features_artifact import FeatureRecord
+from agenttalk.comprehension.features_artifact import EntryPointRecord, FeatureRecord
 from agenttalk.comprehension.modules_artifact import ModuleRecord
 
 
@@ -616,6 +616,146 @@ def test_feature_linked_satisfied_when_a_confirmed_feature_links_it():
     features = [_feature("Foo", "confirmed", ["u1"])]
     signals, _ = ra.build_readiness([_unit("u1")], [], features)
     assert _signal_by_check(signals, "feature_linked").stored_status == "satisfied"
+
+
+# ------------------------ entry_points_mapped / feature_linked, declared_in (round 27 F1 BLOCKER)
+
+def _entry_point(
+    entry_point_id: str, *, owning_unit_id: str, declared_in_unit_id: str,
+    feature_ids: list[str],
+) -> EntryPointRecord:
+    return EntryPointRecord(
+        entry_point_id=entry_point_id, kind="http_route", name="/checkout",
+        owning_unit_id=owning_unit_id, feature_ids=feature_ids,
+        evidence_class="declared", declared_in_unit_id=declared_in_unit_id,
+    )
+
+
+def test_entry_points_mapped_satisfied_for_the_declaring_file_even_when_ownership_resolved_elsewhere():
+    """FIX ROUND 27 (twenty-third cold read, F1 BLOCKER, wrong-data,
+    .cr23-webxml-neg): a web.xml that DECLARES a route whose <servlet-
+    class> resolves in-scan used to publish entry_points_mapped not_
+    applicable/no_entry_point on a complete/0-problem run - ownership
+    moves to the implementing class (CR13-2), and nothing previously
+    credited the DECLARING file with the evidence at all. The declaring
+    file (u_webxml, never the owner u_servlet) must be satisfied too -
+    it is the exact real-world JEE shape (a web.xml naming an in-repo
+    servlet class), not an edge case."""
+    features = [_feature("Checkout", "candidate", ["u_servlet"])]
+    entry_points = [_entry_point(
+        "ep1", owning_unit_id="u_servlet", declared_in_unit_id="u_webxml",
+        feature_ids=["feature-Checkout"])]
+    signals, _ = ra.build_readiness(
+        [_unit("u_webxml"), _unit("u_servlet")], [], features, entry_points)
+    webxml_signal = next(s for s in signals if s.unit_id == "u_webxml" and s.check == "entry_points_mapped")
+    servlet_signal = next(s for s in signals if s.unit_id == "u_servlet" and s.check == "entry_points_mapped")
+    assert webxml_signal.stored_status == "satisfied"
+    assert servlet_signal.stored_status == "satisfied"
+
+
+def test_entry_points_mapped_stays_the_honest_negative_for_a_file_that_declared_nothing():
+    """Companion control: a file that neither owns nor declared any
+    entry point (a genuinely route-free web.xml, or an unrelated file)
+    keeps its honest not_applicable/no_entry_point negative - the F1
+    fix only ADDS evidence for a real declaring file, it never
+    fabricates evidence for one that published nothing at all."""
+    features = [_feature("Checkout", "candidate", ["u_servlet"])]
+    entry_points = [_entry_point(
+        "ep1", owning_unit_id="u_servlet", declared_in_unit_id="u_webxml",
+        feature_ids=["feature-Checkout"])]
+    signals, _ = ra.build_readiness(
+        [_unit("u_webxml"), _unit("u_servlet"), _unit("u_unrelated")],
+        [], features, entry_points)
+    unrelated_signal = next(
+        s for s in signals if s.unit_id == "u_unrelated" and s.check == "entry_points_mapped")
+    assert unrelated_signal.stored_status == "not_applicable"
+
+
+def test_feature_linked_reflects_the_declaring_files_own_feature_state_even_when_ownership_resolved_elsewhere():
+    """FIX ROUND 27 (F1 BLOCKER): the same fix, feature_linked side -
+    readiness ~608's own stale comment claimed route edges (and, by the
+    same wrong model, feature linkage) always attach to the file unit
+    directly; corrected. The declaring file inherits its own feature's
+    state (candidate here, so unknown/feature_not_confirmed - never the
+    confident unsatisfied/no_feature_link negative a file with zero
+    evidence gets)."""
+    features = [_feature("Checkout", "candidate", ["u_servlet"])]
+    entry_points = [_entry_point(
+        "ep1", owning_unit_id="u_servlet", declared_in_unit_id="u_webxml",
+        feature_ids=["feature-Checkout"])]
+    signals, _ = ra.build_readiness(
+        [_unit("u_webxml"), _unit("u_servlet")], [], features, entry_points)
+    webxml_signal = next(s for s in signals if s.unit_id == "u_webxml" and s.check == "feature_linked")
+    assert webxml_signal.stored_status == "unknown"
+    assert webxml_signal.reason_code == "feature_not_confirmed"
+
+
+def test_feature_linked_satisfied_for_the_declaring_file_when_the_feature_is_confirmed():
+    """A confirmed (not merely candidate) feature the declaring file
+    itself never owns must still let that file report satisfied."""
+    features = [_feature("Checkout", "confirmed", ["u_servlet"])]
+    entry_points = [_entry_point(
+        "ep1", owning_unit_id="u_servlet", declared_in_unit_id="u_webxml",
+        feature_ids=["feature-Checkout"])]
+    signals, _ = ra.build_readiness(
+        [_unit("u_webxml"), _unit("u_servlet")], [], features, entry_points)
+    webxml_signal = next(s for s in signals if s.unit_id == "u_webxml" and s.check == "feature_linked")
+    assert webxml_signal.stored_status == "satisfied"
+
+
+# -------------------------- feature_linked whole-file evidence-gap map (round 27 F2 MAJOR)
+
+def test_feature_linked_unknown_not_confident_negative_for_an_encoding_undecodable_file():
+    """FIX ROUND 27 (twenty-third cold read, F2 MAJOR, wrong-data,
+    .cr23-featgap): feature_linked used to OMIT every whole-file
+    evidence-gap reason (encoding_undecodable, parse_failed,
+    unsupported_language, ...) from its own reason map, while entry_
+    points_mapped/dependencies_resolved/source_understood correctly
+    routed to unknown for the identical reason - the reader's own
+    control is airtight: byte-identical controllers differing only in
+    encoding flip feature_linked from unknown to a CONFIDENT unsatisfied/
+    no_feature_link. Trust the recorded gap here too."""
+    unit = _unit("u1", adapter_problem_reasons=["encoding_undecodable"])
+    signals, _ = ra.build_readiness([unit], [], [])
+    signal = _signal_by_check(signals, "feature_linked")
+    assert signal.stored_status == "unknown"
+    assert signal.reason_code == "adapter_encoding_undecodable"
+
+
+def test_feature_linked_unknown_not_confident_negative_for_an_unsupported_language_file():
+    """FIX ROUND 27 (F2 MAJOR): the tier-2 JSP/SQL/Kotlin twin of the
+    encoding case above - the reader's own .cr23-big resource_limit
+    shape and the tier-2 unsupported_language shape are the SAME class
+    of gap, both must route to unknown here."""
+    unit = _unit("u1", adapter_problem_reasons=["unsupported_language"])
+    signals, _ = ra.build_readiness([unit], [], [])
+    signal = _signal_by_check(signals, "feature_linked")
+    assert signal.stored_status == "unknown"
+    assert signal.reason_code == "adapter_unsupported_language"
+
+
+def test_feature_linked_unknown_not_confident_negative_for_a_resource_limit_file():
+    """FIX ROUND 27 (F2 MAJOR, .cr23-big): a file this run skipped
+    adapter analysis for entirely because it exceeded the per-file
+    resource cap must not publish a confident feature_linked negative
+    either."""
+    unit = _unit("u1", adapter_problem_reasons=["resource_limit"])
+    signals, _ = ra.build_readiness([unit], [], [])
+    signal = _signal_by_check(signals, "feature_linked")
+    assert signal.stored_status == "unknown"
+    assert signal.reason_code == "adapter_resource_limit"
+
+
+def test_feature_linked_unaffected_control_a_genuinely_understood_feature_free_unit_stays_negative():
+    """Companion control: a unit the adapter genuinely UNDERSTOOD, with
+    no recorded evidence gap and no feature link at all, must keep the
+    honest confident negative - the F2 fix only routes RECORDED gaps to
+    unknown, it never manufactures unknown for real, evidenced
+    absence."""
+    signals, _ = ra.build_readiness([_unit("u1")], [], [])
+    signal = _signal_by_check(signals, "feature_linked")
+    assert signal.stored_status == "unsatisfied"
+    assert signal.reason_code == "no_feature_link"
 
 
 # ----------------------------------------------------------- test_evidence_located

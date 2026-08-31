@@ -70,6 +70,24 @@ class EntryPointRecord:
     conflict_id: str | None = None
     confidence: str | None = None
     evidence: list[dict[str, Any]] = field(default_factory=list)
+    #: FIX ROUND 27 (twenty-third cold read, F1 BLOCKER, wrong-data): the
+    #: FILE unit whose own adapter claim DECLARED this entry point - set
+    #: unconditionally, regardless of where ``owning_unit_id`` resolved.
+    #: For an annotation-based route the two are usually the same unit
+    #: (the class's own file). For a web.xml-declared route whose
+    #: <servlet-class> resolves in-scan, they DIVERGE: ``owning_unit_id``
+    #: moves to the implementing class (CR13-2, round 17), but nothing
+    #: previously remembered that web.xml itself was the file that
+    #: DECLARED the route - readiness_artifact.py's own entry_points_
+    #: mapped/feature_linked checks then found no evidence at all for
+    #: the declaring file and published the confident negative on a
+    #: complete/0-problem run, for essentially every real JEE repo (a
+    #: web.xml naming an in-repo servlet class is the normal case, not
+    #: an edge case). Readiness now credits a file as having real entry-
+    #: point/feature evidence when it EITHER owns an entry point OR
+    #: declared one whose ownership resolved elsewhere - this field is
+    #: what makes the second half possible.
+    declared_in_unit_id: str = ""
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -83,6 +101,7 @@ class EntryPointRecord:
             "conflict_id": self.conflict_id,
             "confidence": self.confidence,
             "evidence": self.evidence,
+            "declared_in_unit_id": self.declared_in_unit_id,
         }
 
 
@@ -93,6 +112,7 @@ def entry_point_record_from_json(payload: dict[str, Any]) -> EntryPointRecord:
         evidence_class=payload["evidence_class"], producers=list(payload.get("producers", [])),
         conflict_id=payload.get("conflict_id"), confidence=payload.get("confidence"),
         evidence=list(payload.get("evidence", [])),
+        declared_in_unit_id=payload.get("declared_in_unit_id", payload["owning_unit_id"]),
     )
 
 
@@ -228,6 +248,14 @@ def build_features(
                     entry_point_id=entry_point_id, kind=claim.kind, name=claim.name,
                     owning_unit_id=owning_unit_id, feature_ids=[feature_id],
                     evidence_class=claim.evidence_class, producers=[producer],
+                    # FIX ROUND 27 (F1 BLOCKER): the FILE that declared
+                    # THIS claim - independent of owning_unit_id, which
+                    # may have resolved to a different (implementing)
+                    # unit entirely. A rare coalesced-claim shape (M-5)
+                    # takes the first claim's own declaring file, the
+                    # same "first claim is representative" convention
+                    # this function already uses for the feature label.
+                    declared_in_unit_id=_java_file_unit_id(path),
                 )
             elif producer not in existing.producers:
                 entry_points_by_id[entry_point_id] = replace(

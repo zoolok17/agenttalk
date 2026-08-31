@@ -48,7 +48,7 @@ from typing import Any
 
 from . import digests
 from .dependencies_artifact import DependencyRecord
-from .features_artifact import FeatureRecord
+from .features_artifact import EntryPointRecord, FeatureRecord
 from .modules_artifact import ModuleRecord
 
 POLICY_VERSION = 1
@@ -114,7 +114,12 @@ PROVENANCE_CAVEAT = (
     "('Fact provenance and canonical merge'), none populated yet. An empty "
     "producers/evidence list here means 'not implemented this slice', never "
     "'genuinely no evidence exists' - the full provenance implementation is a "
-    "known fast-follow carry, not a silent gap."
+    "known fast-follow carry, not a silent gap. scan.json's own VCS revision "
+    "and dirty-state binding is the identical shape of gap (design-promised, "
+    "not implemented this slice, the standing PR-C entry criterion named "
+    "elsewhere in this PR) - every OTHER unimplemented promise this producer "
+    "makes is declared in-artifact; this one now is too, rather than being the "
+    "one silent exception."
 )
 
 CHECKS = (
@@ -246,20 +251,37 @@ def _signal(unit_id: str, check: str, stored_status: str, basis: str, reason_cod
 #: stay narrowly scoped (unchanged) - each is a fact about ONE already-
 #: understood construct within a file the adapter DID successfully
 #: parse, never a whole-file evidence gap.
+#: FIX ROUND 27 (twenty-third cold read, F2 MAJOR, wrong-data): every
+#: whole-file evidence-gap reason below used to feed source_understood/
+#: dependencies_resolved/entry_points_mapped but OMIT feature_linked -
+#: while the NARROWER in-file gaps (route_annotation_unassociated/
+#: route_value_unrecoverable, below) correctly included it. A file the
+#: run RECORDED it could not read (a Latin-1-encoded controller, a
+#: tier-2 JSP/SQL/Kotlin file with no adapter) then published the
+#: CONFIDENT unsatisfied/no_feature_link negative - the reader's own
+#: control is airtight: byte-identical controllers differing only in
+#: encoding flip feature_linked from unknown to confident unsatisfied.
+#: Blast radius: every non-UTF-8 file plus every tier-2 file - the bulk
+#: of a real target estate. Trusts the recorded gap here too (the SAME
+#: "don't recompute a confident answer from evidence that never
+#: existed" principle round 16's own M2 already applied to the other
+#: three checks, and round 20's own M3 already applied to the two
+#: narrower reasons).
+_WHOLE_FILE_EVIDENCE_GAP_CHECKS = frozenset({
+    "source_understood", "dependencies_resolved", "entry_points_mapped", "feature_linked",
+})
 _READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
-    "parse_failed": frozenset({"source_understood", "dependencies_resolved", "entry_points_mapped"}),
+    "parse_failed": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
     # FIX ROUND 21 (seventeenth cold read, CR17-4 MAJOR, wrong-data): an
     # undecodable-as-UTF-8 file (Latin-1/CP1252 source, most commonly)
     # skips adapter analysis entirely - the same genuine whole-file
     # evidence gap parse_failed already is, never a narrower fact.
-    "encoding_undecodable": frozenset(
-        {"source_understood", "dependencies_resolved", "entry_points_mapped"}),
-    "path_excluded": frozenset({"source_understood", "dependencies_resolved", "entry_points_mapped"}),
-    "resource_limit": frozenset({"source_understood", "dependencies_resolved", "entry_points_mapped"}),
-    "non_utf8_path": frozenset({"source_understood", "dependencies_resolved", "entry_points_mapped"}),
-    "case_collision": frozenset({"source_understood", "dependencies_resolved", "entry_points_mapped"}),
-    "no_types_extracted": frozenset({
-        "source_understood", "dependencies_resolved", "entry_points_mapped"}),
+    "encoding_undecodable": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
+    "path_excluded": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
+    "resource_limit": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
+    "non_utf8_path": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
+    "case_collision": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
+    "no_types_extracted": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
     # FIX ROUND 20 (sixteenth cold read, M3 MAJOR, wrong-data): these
     # two used to feed NOTHING at all - round 13c's own scoping (away
     # from source_understood, a whole-file evidence gap these are NOT)
@@ -287,13 +309,11 @@ _READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
     # recognized-but-unsupported source language (worker.py) is exactly
     # "this file's content itself could not be confidently processed" -
     # the same bucket parse_failed/no_types_extracted already feed.
-    "unsupported_language": frozenset({
-        "source_understood", "dependencies_resolved", "entry_points_mapped"}),
+    "unsupported_language": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
     # FIX ROUND 24 (twentieth cold read, F1b, wrong-data): a pom.xml's
     # own analogue of `no_types_extracted` - a parse that succeeded but
     # registered no coordinate/edge/reactor-module fact at all (worker.py).
-    "no_pom_facts_extracted": frozenset({
-        "source_understood", "dependencies_resolved", "entry_points_mapped"}),
+    "no_pom_facts_extracted": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
     # FIX ROUND 24 (twentieth cold read, F4 MINOR, wrong-data): a fact
     # about ONE dependency within an otherwise-understood pom - never a
     # whole-file evidence gap (the same narrow scoping `route_value_
@@ -303,8 +323,7 @@ _READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
     # analogue of `no_pom_facts_extracted` - a parse that succeeded but
     # yielded zero entry points and zero problems over a root that is
     # not genuinely empty (worker.py).
-    "no_web_xml_facts_extracted": frozenset({
-        "source_understood", "dependencies_resolved", "entry_points_mapped"}),
+    "no_web_xml_facts_extracted": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
 }
 
 
@@ -604,9 +623,21 @@ def _check_dependencies_resolved_for_file(
     always-on positive signal that was never actually evidence of
     anything. Derives the file's own signal from the UNION of its
     contained units' edges instead (recursing through nested types),
-    PLUS any edge attributed directly to the file itself (the pom.xml/
-    web.xml shape, where build/route edges attach to the file unit
-    directly - there being no component-level unit for those producers).
+    PLUS any edge attributed directly to the file itself (the pom.xml
+    shape, where BUILD edges attach to the file unit directly - there
+    being no component-level unit for that producer).
+
+    FIX ROUND 27 (twenty-third cold read, F1 BLOCKER, correction): this
+    docstring used to also claim web.xml's own ROUTE entry points attach
+    to the file unit directly, the same way build edges do - FALSE once
+    the reader measured it: a web.xml-declared route's OWNERSHIP moves
+    to its implementing servlet class whenever that class resolves
+    in-scan (CR13-2, round 17) - only pom.xml's build edges genuinely
+    stay file-attached unconditionally. See `_check_entry_points_mapped`/
+    `_check_feature_linked`'s own `declared_in_unit_id` handling in
+    `build_readiness` for how the declaring file still gets credited
+    even though ownership itself moved elsewhere - a DIFFERENT mechanism
+    from this function's own direct-edge union, not the same one.
     A file with neither any contained unit nor any direct edge of its
     own (a plain non-code file, or one the adapter never understood) is
     ``not_applicable`` - the concept of "dependencies" does not
@@ -832,6 +863,7 @@ def build_readiness(
     modules: list[ModuleRecord],
     dependencies: list[DependencyRecord],
     features: list[FeatureRecord],
+    entry_points: list[EntryPointRecord] = (),
     externality_poisoned: bool = False,
 ) -> tuple[list[ReadinessSignal], list[UnitReadinessSummary]]:
     outgoing_by_unit: dict[str, list[DependencyRecord]] = {}
@@ -921,6 +953,30 @@ def build_readiness(
     for feature in features:
         for unit_id in feature.unit_ids:
             feature_states_by_unit.setdefault(unit_id, []).append(feature.state)
+    # FIX ROUND 27 (twenty-third cold read, F1 BLOCKER, wrong-data): a
+    # file that DECLARED a published entry point but does not OWN it
+    # (ownership resolved to a different in-scan unit - CR13-2's own
+    # web.xml <servlet-class> join is the common real shape: the
+    # implementing servlet class becomes the owner, but web.xml itself
+    # is what declared the route) used to have ZERO evidence here at
+    # all - `entry_point_owner_ids`/`feature_states_by_unit` only ever
+    # reflected the RESOLVED owner. `EntryPointRecord.declared_in_unit_
+    # id` (features_artifact.py) names the declaring file unconditionally
+    # - added here ADDITIVELY (never replacing the owner-based evidence
+    # above) so a file with a real, published route it declared is
+    # satisfied regardless of where ownership resolved. For an
+    # annotation-based route, declared_in and the resolved owner are
+    # already the same unit (the class's own file), so this is a no-op
+    # there - it only changes anything for the XML-declared-route
+    # asymmetry this round's own fixture measures.
+    feature_state_by_feature_id = {f.feature_id: f.state for f in features}
+    for entry_point in entry_points:
+        entry_point_owner_ids.add(entry_point.declared_in_unit_id)
+        for feature_id in entry_point.feature_ids:
+            state = feature_state_by_feature_id.get(feature_id)
+            if state is not None:
+                feature_states_by_unit.setdefault(
+                    entry_point.declared_in_unit_id, []).append(state)
 
     def _owning_file_unit_id(unit: ModuleRecord) -> str | None:
         current = unit
