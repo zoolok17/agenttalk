@@ -2083,6 +2083,89 @@ def test_run_scan_a_duplicate_servlet_name_with_conflicting_classes_publishes_a_
             assert signal["reason_code"] == "duplicate_descriptor_name"
 
 
+def test_run_scan_a_descriptor_conflict_with_only_one_in_scan_candidate_reports_unknown(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 31 (twenty-seventh cold read, F1 BLOCKER, wrong-data):
+    the descriptor-conflict readiness override used to require 2+
+    IN-SCAN candidates before stamping a conflict_id at all
+    ("fewer than 2 in-scan candidates means there is nothing this run
+    can actually see conflicting") - empirically FALSE. The common real
+    shape has exactly ONE in-scan claimant: the rival backing here is a
+    jar class (com.jar.RemoteServlet) never in this scan - java.py's
+    own duplicate_descriptor_name problem is published either way,
+    naming LocalServlet as one of the rival backings, but the OLD gate
+    left LocalServlet with no conflict_id at all - readiness gave it a
+    CONFIDENT negative, byte-identical to Unrelated (a POJO with zero
+    descriptor involvement), on a run that both saw and published the
+    conflict. Now: LocalServlet reports unknown/duplicate_descriptor_
+    name and gets a conflict_id; Unrelated keeps its own honest,
+    unaffected confident negative - the fix must not over-apply."""
+    import json
+
+    web_dir = java_repo / "src" / "main" / "java" / "com" / "x"
+    web_dir.mkdir(parents=True)
+    (web_dir / "LocalServlet.java").write_text(
+        "package com.x;\nclass LocalServlet {\n}\n", encoding="utf-8")
+    (web_dir / "Unrelated.java").write_text(
+        "package com.x;\nclass Unrelated {\n}\n", encoding="utf-8")
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "    <servlet-class>com.x.LocalServlet</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "    <servlet-class>com.jar.RemoteServlet</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "    <url-pattern>/api/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matching = [p for p in problems_doc["problems"] if p["reason_code"] == "duplicate_descriptor_name"]
+    assert len(matching) == 1
+    assert "com.x.LocalServlet" in matching[0]["detail"]
+    assert "com.jar.RemoteServlet" in matching[0]["detail"]
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    local_servlet = next(u for u in modules_doc["units"] if u["display_name"] == "LocalServlet")
+    unrelated = next(u for u in modules_doc["units"] if u["display_name"] == "Unrelated")
+    assert local_servlet["conflict_id"] is not None
+    assert local_servlet["conflict_kind"] == "duplicate_descriptor_name"
+    assert unrelated["conflict_id"] is None
+
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    for check in ("entry_points_mapped", "feature_linked"):
+        signal = next(
+            s for s in readiness_doc["signals"]
+            if s["unit_id"] == local_servlet["unit_id"] and s["check"] == check)
+        assert signal["stored_status"] == "unknown"
+        assert signal["reason_code"] == "duplicate_descriptor_name"
+
+    # Unrelated must keep its own honest, unaffected confident negative -
+    # the fix must not sweep up every unlinked unit into "unknown".
+    entry_points_signal = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == unrelated["unit_id"] and s["check"] == "entry_points_mapped")
+    assert entry_points_signal["stored_status"] == "not_applicable"
+    assert entry_points_signal["reason_code"] == "no_entry_point"
+    feature_linked_signal = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == unrelated["unit_id"] and s["check"] == "feature_linked")
+    assert feature_linked_signal["stored_status"] == "unsatisfied"
+    assert feature_linked_signal["reason_code"] == "no_feature_link"
+
+
 def test_run_scan_a_duplicate_filter_name_with_conflicting_classes_publishes_a_conflict(
     java_repo: Path,
 ) -> None:
@@ -2415,6 +2498,22 @@ def test_run_scan_a_single_block_naming_both_a_class_and_a_jsp_file_is_a_conflic
         u for u in modules_doc["units"] if u["display_name"] == "BothBackedServlet")
     assert entry_point["owning_unit_id"] == web_xml_unit["unit_id"]
     assert entry_point["owning_unit_id"] != both_backed_unit["unit_id"]
+
+    # FIX ROUND 31 (twenty-seventh cold read, F1 BLOCKER): the jsp-file
+    # half of this conflict has no unit at all - only ONE in-scan
+    # candidate (BothBackedServlet itself). The old >=2-in-scan gate
+    # left it with no conflict_id, a confident negative byte-identical
+    # to an uninvolved POJO - now it must report unknown/
+    # duplicate_descriptor_name and carry a conflict_id.
+    assert both_backed_unit["conflict_id"] is not None
+    assert both_backed_unit["conflict_kind"] == "duplicate_descriptor_name"
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    for check in ("entry_points_mapped", "feature_linked"):
+        signal = next(
+            s for s in readiness_doc["signals"]
+            if s["unit_id"] == both_backed_unit["unit_id"] and s["check"] == check)
+        assert signal["stored_status"] == "unknown"
+        assert signal["reason_code"] == "duplicate_descriptor_name"
 
 
 @pytest.mark.parametrize("swap_order", [False, True])

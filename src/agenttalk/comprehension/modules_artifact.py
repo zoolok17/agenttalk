@@ -719,20 +719,39 @@ def _populate_descriptor_name_conflicts(
     from :func:`_populate_duplicate_qualified_name_conflicts` above, so
     it gets its OWN ``conflict_kind`` (never silently relabeled as
     ``"duplicate_qualified_name"``, which would misattribute the cause).
-    Mirrors that function's own mechanism otherwise: only a candidate
-    class that actually resolves to a real, in-scan COMPONENT unit gets
-    a conflict_id (an unresolved candidate name has no unit to stamp);
-    fewer than 2 in-scan candidates means there is nothing this RUN can
-    actually see conflicting, so no conflict_id is stamped at all - the
-    problem record java.py already published for the raw descriptor
-    fact stays the only trace, same as any other reference this run
+    Mirrors that function's own mechanism otherwise, with ONE
+    deliberate difference (round 31, twenty-seventh cold read, F1
+    BLOCKER, wrong-data - see below): only a candidate class that
+    actually resolves to a real, in-scan COMPONENT unit gets a
+    conflict_id at all (an unresolved candidate name has no unit to
+    stamp) - the problem record java.py already published for the raw
+    descriptor fact stays the only trace for a candidate this run
     cannot resolve in-scan.
 
     A class ALREADY carrying a conflict_id (e.g. its own independent
     duplicate-qualified-name collision) is left untouched - first
     conflict wins, never silently overwritten by a second, unrelated
     one; a vanishingly rare double-conflict shape, not worth a compound
-    conflict_id/kind for."""
+    conflict_id/kind for.
+
+    FIX ROUND 31 (twenty-seventh cold read, F1 BLOCKER, wrong-data):
+    this used to require 2+ IN-SCAN candidates before stamping anything
+    at all ("fewer than 2 in-scan candidates means there is nothing
+    this run can actually see conflicting") - empirically FALSE. The
+    COMMON real shape has exactly ONE in-scan claimant: the rival
+    backing is a jar class (never in this scan), a ``<jsp-file>``, or
+    an unrecoverable value - java.py's own ``duplicate_descriptor_name``
+    problem is published either way, naming the in-scan class as one of
+    the rival backings, but the gate above left that SAME class with NO
+    conflict_id - readiness then gave it a CONFIDENT negative
+    (``not_applicable``/``no_entry_point``, ``unsatisfied``/
+    ``no_feature_link``), byte-identical to a POJO with zero descriptor
+    involvement, on a run that both SAW and PUBLISHED the conflict. The
+    gate now applies whenever there is AT LEAST ONE in-scan candidate -
+    the conflict_id stamps every in-scan claimant (one or more); an
+    out-of-scan/non-class rival is still represented by its own
+    candidate label in java.py's own problem row (unchanged), never by
+    a conflict_id here (there is no unit to stamp one on)."""
     if not descriptor_name_conflicts:
         return records
     unit_id_by_qualified_name: dict[str, str] = {
@@ -747,7 +766,7 @@ def _populate_descriptor_name_conflicts(
             for name in candidate_qualified_names
             if name in unit_id_by_qualified_name
         })
-        if len(candidate_unit_ids) < 2:
+        if not candidate_unit_ids:
             continue
         conflict_id = digests.conflict_id(
             conflict_kind="duplicate_descriptor_name", anchor=anchor,
