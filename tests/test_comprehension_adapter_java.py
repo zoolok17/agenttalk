@@ -4355,8 +4355,15 @@ def test_unsupported_invoke_shapes_are_named_not_silently_omitted():
     (`new OrderNotFound(id)`) produces no invoke edge - a sub-shape gap
     within the otherwise-supported "invoke" relation, not a whole
     deferred relation, so it gets its own narrower, equally explicit
-    enumeration rather than silence."""
-    assert java.UNSUPPORTED_INVOKE_SHAPES == ("constructor_call",)
+    enumeration rather than silence.
+
+    FIX ROUND 29 (F9b note, declare): a field-injected collaborator call
+    (`@Autowired`/`@Inject` field, then `fooService.doThing()`) is the
+    same class of gap - a lowercase-led, instance-qualified call this
+    invoke extractor cannot see - folded in as "instance_qualified_call"
+    alongside its sibling."""
+    assert java.UNSUPPORTED_INVOKE_SHAPES == (
+        "constructor_call", "instance_qualified_call")
 
 
 def test_a_constructor_call_produces_no_invoke_edge():
@@ -4364,6 +4371,23 @@ def test_a_constructor_call_produces_no_invoke_edge():
         "OrderService.java",
         "package p;\nclass OrderService {\n"
         "  void run() { throw new OrderNotFound(1); }\n"
+        "}\n",
+    )
+    assert not any(e.relation == "invoke" for e in result.edges)
+
+
+def test_a_field_injected_collaborator_call_produces_no_invoke_edge():
+    """FIX ROUND 29 (F9b note, declare): a real DI-wired collaborator
+    (`@Autowired private OrderService orderService;`, then
+    `orderService.place(...)` elsewhere in the class) is called through
+    a lowercase-led instance qualifier - the same
+    "instance_qualified_call" gap `UNSUPPORTED_INVOKE_SHAPES` now names,
+    not a type-qualified call this extractor can resolve."""
+    result = java.parse_java_source(
+        "OrderController.java",
+        "package p;\nclass OrderController {\n"
+        "  @Autowired private OrderService orderService;\n"
+        "  void run() { orderService.place(1); }\n"
         "}\n",
     )
     assert not any(e.relation == "invoke" for e in result.edges)

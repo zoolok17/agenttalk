@@ -75,7 +75,23 @@ UNSUPPORTED_RELATIONS = ("data", "configuration", "include")
 #: invoke target would be, so emitting them now adds resolution surface
 #: for no evidenced benefit this slice; declaring it keeps the gap
 #: visible without guessing.
-UNSUPPORTED_INVOKE_SHAPES = ("constructor_call",)
+#:
+#: FIX ROUND 29 (twenty-fifth cold read, F9b note, declare-not-silently-
+#: leave-implicit): a field-injected collaborator call (``@Autowired``/
+#: ``@Inject`` on a field, then ``fooService.doThing()`` elsewhere in the
+#: class) is a lowercase-led, instance-qualified call - the exact shape
+#: ``test_lowercase_qualifier_still_produces_no_invoke_edge`` already
+#: proves publishes NO invoke edge at all, since round 13b's own B2
+#: control drew the type-qualified/instance-qualified line. Previously
+#: demonstrated only by that test, never declared here alongside its
+#: sibling constructor-call gap - a reader of this tuple alone, the
+#: static-capability declaration migration tooling would consult, could
+#: not tell a whole class of real DI-wired collaboration is invisible to
+#: this producer. Folded in as its own named member rather than a new,
+#: separate tuple: both are "a call exists in the source but this invoke
+#: extractor's own qualifier-must-be-a-type discipline cannot see it,"
+#: the same class of gap CR10-3 already named for constructor calls.
+UNSUPPORTED_INVOKE_SHAPES = ("constructor_call", "instance_qualified_call")
 
 #: FIX ROUND 17 (thirteenth cold read, CR13-3 MAJOR, part (b) - THE
 #: CLASS-CLOSER): the entry-point edition of the SAME enumerated-
