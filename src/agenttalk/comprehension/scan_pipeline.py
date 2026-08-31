@@ -1251,6 +1251,13 @@ def run_scan(
             },
             "whole_scope_fingerprint": discovery_result.whole_scope_fingerprint,
             "fingerprint_complete": discovery_result.fingerprint_complete,
+            # FIX ROUND 30 (twenty-sixth cold read, F3 MINOR, completeness):
+            # see FINGERPRINT_CAVEAT's own docstring - the same "declare
+            # the gap in-artifact, don't leave it to be independently
+            # rediscovered" discipline ASSESSMENT_STATE_CAVEAT/
+            # CLASSIFICATION_CAVEAT/PROVENANCE_CAVEAT/structural_caveat
+            # already follow for their own artifacts.
+            "fingerprint_caveat": discovery.FINGERPRINT_CAVEAT,
             # N2 (fourth cold read, fix round 6): the design names "the
             # effective include/exclude rules... and their configuration
             # digest" as a scan.json field. config.json parsing itself is

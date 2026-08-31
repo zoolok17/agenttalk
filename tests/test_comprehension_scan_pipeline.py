@@ -4979,6 +4979,24 @@ def test_modules_json_declares_the_classification_caveat(java_repo: Path) -> Non
     assert modules_doc["classification_caveat"] == modules_artifact.CLASSIFICATION_CAVEAT
 
 
+def test_scan_json_declares_the_fingerprint_caveat(java_repo: Path) -> None:
+    """FIX ROUND 30 (twenty-sixth cold read, F3 MINOR, completeness): the
+    SAME "declare it, don't leave it to be independently rediscovered"
+    discipline the other *_CAVEAT fields already establish -
+    whole_scope_fingerprint's own entry-level-not-content-level
+    sensitivity for generated_or_vendor/resource_limit_oversized (and
+    dependency_cache's own complete absence from it) was previously
+    declared only in a discovery.py comment while fingerprint_complete
+    published true. Published as a real scan.json field now."""
+    import json
+
+    from agenttalk.comprehension import discovery
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["fingerprint_caveat"] == discovery.FINGERPRINT_CAVEAT
+
+
 def test_run_scan_a_duplicate_qualified_name_publishes_ambiguous_import_and_a_problem(
     java_repo: Path,
 ) -> None:

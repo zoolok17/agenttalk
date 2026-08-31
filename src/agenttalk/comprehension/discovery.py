@@ -719,6 +719,46 @@ def _submodule_boundary_paths(root: Path) -> tuple[frozenset[str], dict[str, str
     return frozenset(paths), None
 
 
+#: FIX ROUND 30 (twenty-sixth cold read, F3 MINOR, completeness): round
+#: 29's own F3 fix (see ``enumerate_scope``'s own fingerprint-assembly
+#: comment below) widened ``whole_scope_fingerprint`` to cover every
+#: non-hard-excluded category via its own ``content_digest`` when one is
+#: already in hand - but ``generated_or_vendor``/``resource_limit_
+#: oversized`` deliberately carry ``None`` instead (reading a skipped
+#: directory's own bytes, or a file excluded by size BEFORE any read at
+#: all, would defeat the entire point of skipping it). The SEMANTICS
+#: were already ratified (reviewer-3's round 29 R3 delta) - what was
+#: missing is the PUBLISHED declaration: a caller reading `scan.json`
+#: alone, with `fingerprint_complete: true`, had no way to discover
+#: that a content change entirely inside an already-excluded
+#: generated/vendor or dependency-cache tree leaves the fingerprint
+#: byte-identical. Declared here, the same "declare the gap" idiom
+#: ``ASSESSMENT_STATE_CAVEAT``/``PROVENANCE_CAVEAT``/``CLASSIFICATION_
+#: CAVEAT``/``FEATURES_STRUCTURAL_CAVEAT`` already establish for their
+#: own artifacts - published unconditionally in scan.json, never only
+#: in this module's own comment.
+FINGERPRINT_CAVEAT = (
+    "whole_scope_fingerprint's own sensitivity to an excluded region is "
+    "ENTRY-LEVEL, not CONTENT-LEVEL, for the generated_or_vendor and "
+    "resource_limit_oversized categories - a directory or file appearing, "
+    "disappearing, or being excluded under a different category changes the "
+    "fingerprint, but a content change (an added or modified file) entirely "
+    "inside an already-excluded region of one of these two categories does "
+    "not, since no per-file bytes are ever read for either (reading them "
+    "just to fingerprint them would defeat the entire point of skipping "
+    "them). The dependency_cache category (alongside secret/vcs/hard-"
+    "excluded) has NO fingerprint sensitivity at all - not even entry-level "
+    "- its own excluded_roots entry exists (visible in scan.json's own "
+    "exclusions/excluded_roots fields) but is never selected into the "
+    "fingerprint computation at all, unlike generated_or_vendor/"
+    "resource_limit_oversized which at least contribute their own "
+    "path+category. The binary and resource_limit_total_bytes "
+    "categories are NOT affected by either gap - both already read the "
+    "file's own bytes before excluding it, so their own content_digest "
+    "already makes the fingerprint sensitive to a content change there."
+)
+
+
 def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
     """Walk ``root``, apply default excludes, record symlink/submodule
     boundaries, enforce the three pre-freshness resource caps in the
