@@ -576,6 +576,12 @@ _WEB_SERVLET_ANNOTATION_RE = re.compile(r"@(?:[A-Za-z_$][\w$]*\.)*WebServlet\b")
 #: with no URL pattern of its own). Reuses the identical class-
 #: association and value-recovery fail-safes.
 _WEB_FILTER_ANNOTATION_RE = re.compile(r"@(?:[A-Za-z_$][\w$]*\.)*WebFilter\b")
+#: FIX ROUND 25 (micro-round 25b, item 2, F5 ANNOTATION TWIN): detects a
+#: `servletNames` attribute anywhere in a @WebFilter's own argument
+#: span, independent of whether `value`/`urlPatterns` ALSO appears - the
+#: annotation twin of the XML `<filter-mapping>`'s own servlet-name
+#: scoping, round 25's own F5.
+_WEB_FILTER_SERVLET_NAMES_ATTR_RE = re.compile(r"\bservletNames\s*=")
 #: FIX ROUND 17 (CR13-3 MAJOR, part (b) - THE CLASS-CLOSER): a route-like
 #: annotation family this adapter recognizes AS a routing/endpoint
 #: mechanism but has never modeled (JAX-WS's own SOAP endpoint idiom -
@@ -2497,6 +2503,38 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                 qualified_name=target_type,
             ))
             continue
+        # FIX ROUND 25 (micro-round 25b, item 2, F5 ANNOTATION TWIN): the
+        # XML spelling (round 25's own F5, a <filter-mapping> with BOTH
+        # <url-pattern> and <servlet-name>) now records the dropped
+        # servlet-name-scoped half even when a real url-pattern ALSO
+        # publishes - the annotation spelling had the identical gap,
+        # unfixed: `@WebFilter(urlPatterns={"/a"}, servletNames={"s1"})`
+        # published the pattern route and recorded NOTHING for the
+        # dropped servletNames half, the exact XML-vs-annotation
+        # asymmetry class round 21 already rejected on. Checked
+        # independently of `paths` (which can be non-empty here) - the
+        # SAME small argument-span scan `_route_annotation_span` already
+        # performs internally, not threaded through its own return value
+        # since every other caller has no use for it.
+        arg_pos = match.end()
+        while arg_pos < len(sanitized) and sanitized[arg_pos].isspace():
+            arg_pos += 1
+        if arg_pos < len(sanitized) and sanitized[arg_pos] == "(":
+            close_pos = _matching_close_paren(sanitized, arg_pos)
+            if (
+                close_pos is not None
+                and _WEB_FILTER_SERVLET_NAMES_ATTR_RE.search(
+                    sanitized[arg_pos:close_pos + 1]) is not None
+            ):
+                problems.append(JavaAdapterProblem(
+                    reason_code="unsupported_entry_point_shape",
+                    detail=f"a @WebFilter annotation at line {line} declares BOTH a "
+                           "value/urlPatterns and a servletNames attribute "
+                           "(servlet_name_scoped_filter) - the url-pattern half publishes "
+                           "normally, but this producer does not compose a target from "
+                           "the servlet-name-scoped half",
+                    qualified_name=target_type,
+                ))
         for path in paths:
             edges.append(JavaEdgeClaim(
                 from_qualified_name=target_type, relation="route", target=path,
@@ -3612,7 +3650,7 @@ _LOAD_ON_STARTUP_RE = _leaf_presence_pattern("load-on-startup")
 
 def _servlet_class_by_name(
     sanitized: str, structural: str,
-) -> tuple[dict[str, str], list[tuple[str, int]]]:
+) -> tuple[dict[str, str], list[tuple[str, int]], list[int]]:
     """FIX ROUND 17 (thirteenth cold read, CR13-2 MAJOR, wrong-data):
     web.xml's own ``<servlet>`` element (``<servlet-name>``/
     ``<servlet-class>`` pair) - twice carried as an M5/M7 fast-follow,
@@ -3641,9 +3679,22 @@ def _servlet_class_by_name(
     ``<servlet>`` boundary itself is now found against the CDATA-blanked
     ``structural`` string - a ``<description>`` documenting a long-
     removed servlet must never be mistaken for a live one. Its own
-    VALUE is recovered from ``sanitized`` by offset."""
+    VALUE is recovered from ``sanitized`` by offset.
+
+    FIX ROUND 25 (micro-round 25b, reviewer-3 delta on ``5aa5c09``,
+    item 1, R3 BLOCK-SIDE GAP): a ``<servlet-name>`` present but
+    UNDECODABLE, inside this ``<servlet>`` BLOCK itself (not the
+    mapping), used to be treated the SAME as one genuinely absent - an
+    honest under-claim (the mapping still falls back to its own
+    synthetic owner) but indistinguishable from the genuinely-nameless
+    case, exactly what this whole mechanism exists to separate. Returns
+    a THIRD list now - ``name_undecodable`` block start offsets, no
+    servlet_name possible since the name itself is what failed to
+    decode - the caller records the identical problem class the mapping
+    side already does."""
     mapping: dict[str, str] = {}
     undecodable: list[tuple[str, int]] = []
+    name_undecodable: list[int] = []
     for block_match in _SERVLET_BLOCK_RE.finditer(structural):
         block = sanitized[block_match.start(1):block_match.end(1)]
         name_match = _SERVLET_MAPPING_NAME_RE.search(block)
@@ -3651,12 +3702,10 @@ def _servlet_class_by_name(
         if name_match is None or class_match is None:
             continue
         # FIX ROUND 25 (twenty-first cold read, F4, wrong-data): decoded
-        # the same as the class below - an undecodable servlet-name here
-        # is treated the same as one genuinely absent (this <servlet>
-        # declaration simply never joins), matching the existing,
-        # accepted asymmetry for an unmatched servlet-mapping.
+        # the same as the class below.
         decoded_name = _decode_xml_text(name_match.group(1))
         if decoded_name is None:
+            name_undecodable.append(block_match.start())
             continue
         servlet_name = decoded_name.strip()
         decoded_class = _decode_xml_text(class_match.group(1))
@@ -3664,7 +3713,7 @@ def _servlet_class_by_name(
             undecodable.append((servlet_name, block_match.start()))
             continue
         mapping[servlet_name] = _bounded_route_target(decoded_class.strip())
-    return mapping, undecodable
+    return mapping, undecodable, name_undecodable
 
 
 #: FIX ROUND 21 (seventeenth cold read, CR17-3 MAJOR, wrong-data): a
@@ -3715,7 +3764,7 @@ _LISTENER_CLASS_RE = _leaf_value_pattern("listener-class", dotall=True)
 
 def _filter_class_by_name(
     sanitized: str, structural: str,
-) -> tuple[dict[str, str], list[tuple[str, int]]]:
+) -> tuple[dict[str, str], list[tuple[str, int]], list[int]]:
     """FIX ROUND 21b (THE MAJOR's own web.xml-symmetry follow-through):
     web.xml's own ``<filter>`` element (``<filter-name>``/
     ``<filter-class>`` pair), joined below against ``<filter-mapping>``'s
@@ -3732,9 +3781,14 @@ def _filter_class_by_name(
 
     FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE, F2): the exact
     same CDATA-blanked boundary scan ``_servlet_class_by_name`` now
-    uses - see its own docstring."""
+    uses - see its own docstring.
+
+    FIX ROUND 25 (micro-round 25b, item 1, R3 BLOCK-SIDE GAP): the exact
+    same third ``name_undecodable`` list ``_servlet_class_by_name`` now
+    returns - see its own docstring."""
     mapping: dict[str, str] = {}
     undecodable: list[tuple[str, int]] = []
+    name_undecodable: list[int] = []
     for block_match in _FILTER_BLOCK_RE.finditer(structural):
         block = sanitized[block_match.start(1):block_match.end(1)]
         name_match = _FILTER_NAME_RE.search(block)
@@ -3742,10 +3796,11 @@ def _filter_class_by_name(
         if name_match is None or class_match is None:
             continue
         # FIX ROUND 25 (twenty-first cold read, F4, wrong-data): the
-        # exact same decode-or-treat-as-absent discipline as
-        # ``_servlet_class_by_name`` above.
+        # exact same decode discipline as ``_servlet_class_by_name``
+        # above.
         decoded_name = _decode_xml_text(name_match.group(1))
         if decoded_name is None:
+            name_undecodable.append(block_match.start())
             continue
         filter_name = decoded_name.strip()
         decoded_class = _decode_xml_text(class_match.group(1))
@@ -3753,7 +3808,7 @@ def _filter_class_by_name(
             undecodable.append((filter_name, block_match.start()))
             continue
         mapping[filter_name] = _bounded_route_target(decoded_class.strip())
-    return mapping, undecodable
+    return mapping, undecodable, name_undecodable
 
 
 #: FIX ROUND 24 (micro-round 24b, reviewer-3 delta on `3a7abc2`, item 1,
@@ -3855,8 +3910,8 @@ def parse_web_xml(
     # still needs the RAW CDATA markers intact.
     structural = _blank_cdata_sections(sanitized)
     newline_offsets = _newline_offsets(sanitized)
-    servlet_class_by_name, servlet_class_undecodable = _servlet_class_by_name(
-        sanitized, structural)
+    servlet_class_by_name, servlet_class_undecodable, servlet_name_undecodable = (
+        _servlet_class_by_name(sanitized, structural))
     # FIX ROUND 24 (twentieth cold read, F5 MINOR, wrong-data): a
     # servlet whose own <servlet-class> is present but undecodable
     # (CDATA/entity constructs) silently fell back to the synthetic
@@ -3872,6 +3927,23 @@ def parse_web_xml(
                    "this producer does not decode - its mapped route falls back to the "
                    "synthetic per-mapping owner rather than the real class",
             qualified_name=f"{relative_path}#{servlet_name}",
+        ))
+    # FIX ROUND 25 (micro-round 25b, item 1, R3 BLOCK-SIDE GAP): the
+    # SAME visibility fix, one join-side over - a <servlet> block's own
+    # <servlet-name> present but undecodable used to fall back silently
+    # to the same "genuinely absent" treatment, indistinguishable from
+    # a <servlet> that never declared a name at all. No real name is
+    # possible to attribute here (the name itself is what failed to
+    # decode) - qualified_name stays unset, same as any other whole-
+    # file-scoped problem.
+    for block_start in servlet_name_undecodable:
+        problems.append(JavaAdapterProblem(
+            reason_code="route_value_unrecoverable",
+            detail=f"a <servlet> declared at line "
+                   f"{_line_at(newline_offsets, block_start)} names a <servlet-name> "
+                   "containing XML constructs this producer does not decode - any "
+                   "mapping targeting it falls back to the synthetic per-mapping owner "
+                   "rather than the real class",
         ))
     mapped_servlet_names: set[str] = set()
     for block_match in _SERVLET_MAPPING_BLOCK_RE.finditer(structural):
@@ -3927,6 +3999,13 @@ def parse_web_xml(
                     qualified_name=owner_qualified_name,
                 ))
                 continue
+            # MICRO-ROUND 25b (item 3, F6): an EMPTY <url-pattern></url-pattern>
+            # (decoded to "") is servlet-spec-LEGAL - it names the
+            # application's own CONTEXT ROOT ("/"), not a malformed or
+            # missing value - so `url_pattern` below is correctly the
+            # empty string, publishing a genuine but nameless entry
+            # point. Kept as the real, honest value rather than
+            # fabricating a placeholder name for it.
             url_pattern = _bounded_route_target(decoded.strip())
             entry_points.append(JavaEntryPointClaim(
                 qualified_name=owner_qualified_name, kind="http_route",
@@ -3971,7 +4050,8 @@ def parse_web_xml(
                    "absent either",
             qualified_name=qualified_name,
         ))
-    filter_class_by_name, filter_class_undecodable = _filter_class_by_name(sanitized, structural)
+    filter_class_by_name, filter_class_undecodable, filter_name_undecodable = (
+        _filter_class_by_name(sanitized, structural))
     # FIX ROUND 24 (F5 MINOR, wrong-data): the identical undecodable-
     # class visibility fix as the servlet loop above.
     for filter_name, block_start in filter_class_undecodable:
@@ -3982,6 +4062,17 @@ def parse_web_xml(
                    "this producer does not decode - its mapped route falls back to the "
                    "synthetic per-mapping owner rather than the real class",
             qualified_name=f"{relative_path}#{filter_name}",
+        ))
+    # FIX ROUND 25 (micro-round 25b, item 1, R3 BLOCK-SIDE GAP): the
+    # filter twin of the servlet-block fix above.
+    for block_start in filter_name_undecodable:
+        problems.append(JavaAdapterProblem(
+            reason_code="route_value_unrecoverable",
+            detail=f"a <filter> declared at line "
+                   f"{_line_at(newline_offsets, block_start)} names a <filter-name> "
+                   "containing XML constructs this producer does not decode - any "
+                   "mapping targeting it falls back to the synthetic per-mapping owner "
+                   "rather than the real class",
         ))
     for block_match in _FILTER_MAPPING_BLOCK_RE.finditer(structural):
         block = sanitized[block_match.start(1):block_match.end(1)]

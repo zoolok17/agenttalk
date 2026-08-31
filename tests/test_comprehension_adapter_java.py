@@ -3429,6 +3429,133 @@ def test_web_xml_an_undecodable_name_only_descriptor_still_degrades():
     assert problems != []
 
 
+# --------------------------------------------------- micro-round 25b (block-side name decode; @WebFilter twin)
+
+def test_web_xml_an_undecodable_servlet_name_in_the_servlet_block_records_a_problem():
+    """MICRO-ROUND 25b (reviewer-3 delta on `5aa5c09`, item 1, R3 BLOCK-
+    SIDE GAP): a <servlet-name> present but UNDECODABLE inside the
+    <servlet> BLOCK itself (not the mapping) fell back silently to the
+    synthetic file owner with NO problem - an honest under-claim owner,
+    but indistinguishable from the genuinely-nameless case, exactly
+    what this whole mechanism exists to separate. The mapping's own
+    plain-text servlet-name still publishes (falling back to the
+    synthetic owner, since the <servlet> declaration never joins), but
+    a problem must now record WHY the real owner could not be
+    resolved."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name><![CDATA[s]]>x<![CDATA[]]></servlet-name>
+    <servlet-class>com.acme.Hidden</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>s</servlet-name>
+    <url-pattern>/h2</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern["/h2"] == "WEB-INF/web.xml#s"
+    matching = [p for p in problems if p.reason_code == "route_value_unrecoverable"]
+    assert any("<servlet>" in p.detail and "<servlet-name>" in p.detail for p in matching)
+
+
+def test_web_xml_an_undecodable_filter_name_in_the_filter_block_records_a_problem():
+    """MICRO-ROUND 25b (item 1, R3 BLOCK-SIDE GAP): the filter twin of
+    the servlet-block case above."""
+    web_xml = """<web-app>
+  <filter>
+    <filter-name><![CDATA[f]]>x<![CDATA[]]></filter-name>
+    <filter-class>com.acme.Hidden</filter-class>
+  </filter>
+  <filter-mapping>
+    <filter-name>f</filter-name>
+    <url-pattern>/h2</url-pattern>
+  </filter-mapping>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern["/h2"] == "WEB-INF/web.xml#f"
+    matching = [p for p in problems if p.reason_code == "route_value_unrecoverable"]
+    assert any("<filter>" in p.detail and "<filter-name>" in p.detail for p in matching)
+
+
+def test_web_xml_a_wholly_wrapped_servlet_name_in_the_block_still_decodes_and_joins():
+    """MICRO-ROUND 25b (item 1): companion control - a WHOLLY-wrapped
+    (not split/mixed) CDATA servlet-name in the <servlet> block decodes
+    cleanly and joins normally, publishing the REAL class as owner."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name><![CDATA[s]]></servlet-name>
+    <servlet-class>com.acme.RealClass</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>s</servlet-name>
+    <url-pattern>/ok</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern["/ok"] == "com.acme.RealClass"
+    assert problems == []
+
+
+def test_web_xml_a_genuinely_nameless_servlet_block_stays_silent():
+    """MICRO-ROUND 25b (item 1): companion control - a <servlet> block
+    with NO <servlet-name> at all (genuinely absent, not undecodable)
+    must stay silent, the existing, unchanged, already-accepted
+    behavior - never conflated with the new undecodable case."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-class>com.acme.NoName</servlet-class>
+  </servlet>
+</web-app>
+"""
+    _entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert problems == []
+
+
+def test_web_filter_annotation_with_servlet_names_records_the_dropped_half():
+    """MICRO-ROUND 25b (item 2, F5 ANNOTATION TWIN): @WebFilter(
+    urlPatterns={"/a"}, servletNames={"s1"}) published the pattern
+    route and recorded NOTHING for the dropped servletNames half - the
+    XML spelling (<filter-mapping> with both <url-pattern> and
+    <servlet-name>, round 25's own F5) now records this, but its
+    annotation twin did not - the exact XML-vs-annotation asymmetry
+    class round 21 already rejected on. Now records the same
+    unsupported_entry_point_shape instance for the annotation spelling
+    too."""
+    src = """
+package p;
+
+@WebFilter(urlPatterns = {"/a"}, servletNames = {"s1"})
+public class MixedFilter implements Filter {}
+"""
+    result = java.parse_java_source("MixedFilter.java", src)
+    assert any(e.name == "/a" for e in result.entry_points)
+    assert any(
+        p.reason_code == "unsupported_entry_point_shape" and "servletNames" in p.detail
+        for p in result.problems
+    )
+
+
+def test_web_filter_annotation_with_only_url_patterns_stays_clean():
+    """MICRO-ROUND 25b (item 2): companion control - a @WebFilter with
+    ONLY urlPatterns (no servletNames scoping at all) must stay clean,
+    the ordinary healthy case."""
+    src = """
+package p;
+
+@WebFilter(urlPatterns = {"/a"})
+public class PlainFilter implements Filter {}
+"""
+    result = java.parse_java_source("PlainFilter.java", src)
+    assert any(e.name == "/a" for e in result.entry_points)
+    assert result.problems == []
+
+
 def test_a_cdata_wrapped_pom_module_publishes_the_reactor_path():
     """FIX ROUND 25 (twenty-first cold read, F8, wrong-data): <module>
     was left off round 24's decode-or-record discipline - a CDATA-
