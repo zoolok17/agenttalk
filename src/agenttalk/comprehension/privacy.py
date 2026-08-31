@@ -268,6 +268,16 @@ def acknowledge_unignored_private_store(
     operator was shown and confirmed the risk for — an attended override
     for root A must never silently cover a write in unrelated root B
     (reviewer-1 cold-read finding 1 on PR-A, rq-6cc5560b62f6).
+
+    FIX ROUND 29 (twenty-fifth cold read, F5 MAJOR, completeness):
+    ``work_id`` is REQUIRED to be non-empty (above) but is NEVER verified
+    against a real, existing work item this slice — no work-item
+    subcommand or plane exists yet to check it against, so a fabricated,
+    unrelated, or already-closed work_id is accepted with no validation
+    beyond non-emptiness. The recorded ``PrivacyPreflightResult.work_id``
+    (and ``scan.json``'s own ``privacy.work_id`` field, downstream) is
+    exactly what the caller passed, never a confirmed binding — see
+    ``readiness_artifact.PROVENANCE_CAVEAT``'s own declaration of this gap.
     """
     if not isinstance(work_id, str) or not work_id.strip():
         raise VcsPrivacyRefused(

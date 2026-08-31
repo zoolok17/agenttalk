@@ -4317,6 +4317,28 @@ def test_scan_json_declares_the_provenance_caveat(java_repo: Path) -> None:
     assert scan_doc["provenance_caveat"] == readiness_artifact.PROVENANCE_CAVEAT
 
 
+def test_scan_json_declares_the_work_id_binding_is_unverified(java_repo: Path) -> None:
+    """FIX ROUND 29 (twenty-fifth cold read, F5 MAJOR, completeness): the
+    attended --acknowledge-unignored-private-store override's own
+    work_id is caller-supplied and NOT verified against a real work item
+    this slice (no work-item subcommand/plane exists yet to check
+    existence against) - the SECOND instance this round of
+    provenance_caveat's own former "every other unimplemented promise is
+    declared" boast going false. Declared explicitly now (as an
+    enumerated item, not a boast), checked via the string itself rather
+    than only equality against the module constant, the same discipline
+    the sibling problems.json test above already follows."""
+    import json
+
+    from agenttalk.comprehension import readiness_artifact
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert "work_id" in scan_doc["provenance_caveat"]
+    assert "NOT verified against a real work item" in scan_doc["provenance_caveat"]
+    assert scan_doc["provenance_caveat"] == readiness_artifact.PROVENANCE_CAVEAT
+
+
 def test_scan_json_declares_the_record_count_definition(java_repo: Path) -> None:
     """FIX ROUND 28 (twenty-fourth cold read, F8, declare-not-silently-
     leave-to-a-docstring): round 26's own F7 note declared record_count's

@@ -107,28 +107,48 @@ ASSESSMENT_STATE_CAVEAT = (
 #: readable DECLARATION of that gap, published once in scan.json,
 #: the same "declare it, don't leave it to be independently
 #: rediscovered" discipline ``ASSESSMENT_STATE_CAVEAT`` already follows.
+#: FIX ROUND 29 (twenty-fifth cold read, F5 MAJOR, completeness): this
+#: caveat's own closing sentence used to BOAST a sweeping claim ("every
+#: OTHER unimplemented promise this producer makes is declared in-
+#: artifact; this one now is too") rather than merely enumerate what is
+#: actually declared - a claim that has now gone false TWICE in one
+#: round alone (round 29's own F3, the whole_scope_fingerprint gap,
+#: fixed by WIDENING rather than declaring; and this same F5, the
+#: work-item-binding gap below, genuinely undeclared until now). A
+#: boast is a standing liability: it must stay true FOREVER as new gaps
+#: are found, and nothing enforces that. Rewritten as a plain
+#: ENUMERATED list instead, which cannot silently go false the same way
+#: - a future gap simply needs its own new bullet, never a re-audit of
+#: whether the boast still holds.
 PROVENANCE_CAVEAT = (
-    "readiness signal producers and dependency/readiness evidence pointers are "
-    "empty for every record this slice, and producer identity never carries a "
-    "configuration/policy digest or a capture time - all design-promised "
-    "('Fact provenance and canonical merge'), none populated yet. An empty "
-    "producers/evidence list here means 'not implemented this slice', never "
-    "'genuinely no evidence exists' - the full provenance implementation is a "
-    "known fast-follow carry, not a silent gap. scan.json's own VCS revision "
-    "and dirty-state binding is the identical shape of gap (design-promised, "
-    "not implemented this slice, the standing PR-C entry criterion named "
-    "elsewhere in this PR) - every OTHER unimplemented promise this producer "
-    "makes is declared in-artifact; this one now is too, rather than being the "
-    "one silent exception.\n\n"
-    "FIX ROUND 28 (twenty-fourth cold read, F10, completeness): problems.json's "
-    "own records are a DIFFERENT shape of the same gap, not merely an unlisted "
-    "instance of it - a modules/dependencies/features/readiness record carries "
-    "an empty producers/evidence list (the field exists, unpopulated); a "
-    "problems.json record has no producers/evidence field AT ALL (structurally "
-    "absent, never merely empty) - the same 'not implemented this slice, never "
-    "genuinely no provenance' honesty applies to it too, stated here so a "
-    "consumer checking this caveat for problems.json's own coverage does not "
-    "have to independently notice the field is missing rather than empty."
+    "This producer's own declared-gap list (each item design-promised, none "
+    "implemented this slice, none a silent omission):\n\n"
+    "1. Readiness signal producers and dependency/readiness evidence pointers "
+    "are empty for every record; producer identity never carries a "
+    "configuration/policy digest or a capture time (design: 'Fact provenance "
+    "and canonical merge'). An empty producers/evidence list means 'not "
+    "implemented this slice', never 'genuinely no evidence exists' - a known "
+    "fast-follow carry.\n"
+    "2. scan.json's own VCS revision and dirty-state binding - the standing "
+    "PR-C entry criterion named elsewhere in this PR.\n"
+    "3. problems.json's own records are a DIFFERENT shape of gap 1, not "
+    "merely an unlisted instance of it - a modules/dependencies/features/"
+    "readiness record carries an empty producers/evidence list (the field "
+    "exists, unpopulated); a problems.json record has no producers/evidence "
+    "field AT ALL (structurally absent, never merely empty) - the same "
+    "honesty applies, stated here so a consumer checking this caveat for "
+    "problems.json's own coverage does not have to independently notice the "
+    "field is missing rather than empty.\n"
+    "4. FIX ROUND 29 (twenty-fifth cold read, F5 MAJOR): the attended "
+    "--acknowledge-unignored-private-store override's own work_id (design: "
+    "'applies to one run bound to an existing work item') is CALLER-"
+    "SUPPLIED and NOT verified against a real work item this slice - no "
+    "work-item subcommand or plane exists yet to check existence against, "
+    "so a fabricated, unrelated, or already-closed work_id is accepted with "
+    "no validation beyond non-emptiness. scan.json's own privacy.work_id "
+    "field records exactly what the caller passed, never a confirmed "
+    "binding - a real work-item existence check is the standing carry; this "
+    "is the machine-readable declaration of the gap, not the fix."
 )
 
 CHECKS = (
