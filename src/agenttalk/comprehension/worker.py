@@ -217,10 +217,28 @@ def is_a_code_bearing_extension_worth_degrading_when_silently_excluded(
     dropping a ``.jsp`` file, an inconsistency in how seriously
     different silent-drop shapes are treated. Genuinely binary
     extensions (``.png``, ``.bin``, ...) are absent from BOTH sets and
-    stay exactly as silent as they are today."""
+    stay exactly as silent as they are today.
+
+    FIX ROUND 26 (twenty-second cold read, F4 MAJOR, wrong-data): this
+    predicate consulted only EXTENSIONS - a UTF-16-encoded ``pom.xml``/
+    ``web.xml`` (a legal input to the same legacy Windows tooling that
+    produces a UTF-16 ``.java`` file) tripped the identical binary-sniff
+    heuristic but was never recognized as code-bearing here (a
+    basename-matched producer has no extension of its own to check), so
+    it was silently dropped - complete, 0 problems, no unit, no edges,
+    no entry points - while a UTF-16 ``.java`` correctly degrades. An
+    unreadable BUILD/ROUTING descriptor is at least as material as an
+    unreadable ``.java`` file (it defines the estate's own structure) -
+    now also consults ``_ADAPTER_HANDLED_XML_BASENAMES``, the same
+    treatment (a degrading problem, plus externality suppression via
+    scan_pipeline.py's own poison rule, which keys off this predicate)."""
     lower = relative_path.lower()
-    return lower.endswith(tuple(_ADAPTER_EXTENSIONS)) or lower.endswith(
-        tuple(_DEGRADING_CODE_EXTENSIONS))
+    name_lower = Path(relative_path).name.lower()
+    return (
+        lower.endswith(tuple(_ADAPTER_EXTENSIONS))
+        or lower.endswith(tuple(_DEGRADING_CODE_EXTENSIONS))
+        or name_lower in _ADAPTER_HANDLED_XML_BASENAMES
+    )
 
 
 WORKER_SCHEMA_VERSION = 1
@@ -367,6 +385,47 @@ class WorkerResult:
     exclusions: dict[str, int] = field(default_factory=dict)
 
 
+def _decode_text_or_flag_undecodable(
+    data: bytes, rel: str, problems: list[WorkerProblem],
+) -> str | None:
+    """Decodes ``data`` as UTF-8 (BOM-tolerant), guarding against a
+    silent, WRONG decode - never raises.
+
+    FIX ROUND 26 (twenty-second cold read, F3 BLOCKER, wrong-data,
+    Amperian-critical): round 21's own CR17-4 U+FFFD ``encoding_
+    undecodable`` guard existed ONLY on the ``.java`` decode site - the
+    ``pom.xml``/``web.xml``/xml-root-sniff decode sites all decoded
+    ``errors="replace"`` with NO guard at all, so a Latin-1/CP1252 pom
+    (the default encoding of many pre-Maven-3 European estates -
+    Amperian's own estate among them) published a FABRICATED coordinate
+    (``com.example:caf�-core``) on a complete/zero-problem run, and
+    a UTF-8 sibling's edge to the REAL coordinate published a confident
+    ``resolved``/``external`` claim (the registry never saw the
+    fabricated identity, so the miss looked genuine) - the exact
+    CR13-4/round-18-F3 over-claim class, reintroduced through an
+    unguarded decode site. Fixed AS THE CLASS: one shared decode helper,
+    used at every one of this worker's own decode sites, so a future new
+    decode site inherits the guard automatically rather than needing its
+    own copy remembered.
+
+    Returns the decoded text, or ``None`` (having already appended an
+    ``encoding_undecodable`` WorkerProblem) when the decoded text
+    contains U+FFFD - the caller must skip adapter analysis entirely in
+    that case, the same "cannot trust what would be extracted" treatment
+    the ``.java`` branch already established."""
+    text = data.decode("utf-8-sig", errors="replace")
+    if "�" in text:
+        problems.append(WorkerProblem(
+            reason_code="encoding_undecodable", relative_path=rel,
+            detail="this file's bytes could not be decoded as UTF-8 (the "
+                   "decoded text contains the U+FFFD replacement character) - "
+                   "likely Latin-1/CP1252 or another non-UTF-8 encoding; "
+                   "adapter analysis skipped rather than risk a corrupted or "
+                   "fabricated qualified name"))
+        return None
+    return text
+
+
 def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
     """The worker's unit of work: read each of ``relative_paths`` under
     ``root``, produce its default file-unit claim, AND - for a recognized
@@ -448,7 +507,6 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                 # this worker's own decode sites (.java/pom.xml/web.xml/
                 # the xml-root sniff) so every consumer inherits the fix
                 # from one mechanism, never a second copy to drift.
-                text = data.decode("utf-8-sig", errors="replace")
                 # FIX ROUND 21 (seventeenth cold read, CR17-4 MAJOR,
                 # wrong-data): Latin-1/CP1252 source (the DEFAULT
                 # encoding of many pre-Maven-3 European estates) decoded
@@ -482,14 +540,13 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                 # WRONG claim in the other direction), and the recorded
                 # detail already states this as evidence ("likely Latin-
                 # 1/CP1252 ... ") rather than a certain conclusion.
-                if "�" in text:
-                    problems.append(WorkerProblem(
-                        reason_code="encoding_undecodable", relative_path=rel,
-                        detail="this file's bytes could not be decoded as UTF-8 (the "
-                               "decoded text contains the U+FFFD replacement character) - "
-                               "likely Latin-1/CP1252 or another non-UTF-8 encoding; "
-                               "adapter analysis skipped rather than risk a corrupted or "
-                               "fabricated qualified name"))
+                #
+                # FIX ROUND 26 (twenty-second cold read, F3 BLOCKER):
+                # routed through the shared `_decode_text_or_flag_
+                # undecodable` helper - see its own docstring for why
+                # this guard is no longer a copy living only here.
+                text = _decode_text_or_flag_undecodable(data, rel, problems)
+                if text is None:
                     continue
                 result = adapter.parse_java_source(rel, text)
             except Exception as exc:  # noqa: BLE001 - a producer bug must degrade, never abort the scan
@@ -554,7 +611,13 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
             # claim uses, wrapped as a JavaFileResult with no units/entry
             # points of its own.
             try:
-                text = data.decode("utf-8-sig", errors="replace")
+                # FIX ROUND 26 (twenty-second cold read, F3 BLOCKER,
+                # wrong-data, Amperian-critical): this decode site never
+                # had the U+FFFD guard the .java branch carries - see
+                # `_decode_text_or_flag_undecodable`'s own docstring.
+                text = _decode_text_or_flag_undecodable(data, rel, problems)
+                if text is None:
+                    continue
                 pom_units, build_edges, profile_scoped_dependency_count = (
                     java_adapter.parse_maven_pom(rel, text))
                 # FIX ROUND 20 (sixteenth cold read, M1+M2 MAJOR - THE
@@ -651,7 +714,13 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
             # it, is what that decision calls for. Same already-read-bytes
             # / same java_results channel as pom.xml's build edges.
             try:
-                text = data.decode("utf-8-sig", errors="replace")
+                # FIX ROUND 26 (twenty-second cold read, F3 BLOCKER,
+                # wrong-data): the same missing guard as pom.xml's own
+                # decode site above - see `_decode_text_or_flag_
+                # undecodable`'s own docstring.
+                text = _decode_text_or_flag_undecodable(data, rel, problems)
+                if text is None:
+                    continue
                 web_entry_points, web_problems = java_adapter.parse_web_xml(rel, text)
             except Exception as exc:  # noqa: BLE001 - a producer bug must degrade, never abort the scan
                 problems.append(WorkerProblem(
@@ -706,8 +775,18 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
             # anything NOT adapter-handled and NOT benign now - the
             # inverted allowlist's whole point.
             if rel_lower.endswith(".xml") and rel_name_lower not in _ADAPTER_HANDLED_XML_BASENAMES:
-                root_element = java_adapter.sniff_xml_root_element(
-                    data.decode("utf-8-sig", errors="replace"))
+                # FIX ROUND 26 (twenty-second cold read, F3 BLOCKER,
+                # wrong-data): the same missing guard swept to this
+                # decode site too - see `_decode_text_or_flag_
+                # undecodable`'s own docstring. An undecodable tooling/
+                # config XML now records `encoding_undecodable` and
+                # skips the root-element guess entirely, rather than
+                # risking a tier verdict computed from a corrupted root
+                # element name.
+                xml_text = _decode_text_or_flag_undecodable(data, rel, problems)
+                if xml_text is None:
+                    continue
+                root_element = java_adapter.sniff_xml_root_element(xml_text)
                 if root_element is None:
                     degrades_run = False
                     detail = (

@@ -777,6 +777,128 @@ def test_process_paths_does_not_flag_a_cdata_wrapped_pom_dependency_groupid_f4(
     assert result.problems == []
 
 
+def test_process_paths_a_latin1_pom_records_a_problem_not_a_fabricated_coordinate(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 26 (twenty-second cold read, F3 BLOCKER, wrong-data,
+    Amperian-critical, .cr22-enc): round 21's own CR17-4 U+FFFD guard
+    existed ONLY on the .java decode site - pom.xml's own decode site
+    had none at all, so a Latin-1/CP1252 pom (the default encoding of
+    many pre-Maven-3 European estates - Amperian's own estate among
+    them) published a FABRICATED, truncated coordinate rather than
+    failing visibly. Mirrors the .java control above one producer
+    over."""
+    (tmp_path / "pom.xml").write_bytes(
+        "<project><groupId>com.example</groupId>"
+        "<artifactId>café-core</artifactId></project>\n".encode("latin-1"))
+    result = worker.process_paths(tmp_path, ["pom.xml"])
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "encoding_undecodable"
+    assert result.problems[0].relative_path == "pom.xml"
+    assert "pom.xml" not in result.java_results
+
+
+def test_process_paths_a_genuine_utf8_pom_with_unicode_content_stays_clean(
+    tmp_path: Path,
+) -> None:
+    """Companion control: the same accented coordinate, correctly UTF-8
+    encoded, must decode cleanly with no problem recorded."""
+    (tmp_path / "pom.xml").write_bytes(
+        "<project><groupId>com.example</groupId>"
+        "<artifactId>café-core</artifactId></project>\n".encode("utf-8"))
+    result = worker.process_paths(tmp_path, ["pom.xml"])
+    assert result.problems == []
+    units = result.java_results["pom.xml"]["units"]
+    assert units[0]["qualified_name"] == "com.example:café-core"
+
+
+def test_process_paths_a_latin1_web_xml_records_a_problem_not_a_false_route(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 26 (F3 BLOCKER, wrong-data): the web.xml twin - a
+    Latin-1-encoded web.xml must never publish a corrupted/fabricated
+    route derived from an undecodable byte sequence."""
+    (tmp_path / "web.xml").write_bytes(
+        "<web-app><servlet-mapping><servlet-name>café</servlet-name>"
+        "<url-pattern>/café/*</url-pattern></servlet-mapping></web-app>\n"
+        .encode("latin-1"))
+    result = worker.process_paths(tmp_path, ["web.xml"])
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "encoding_undecodable"
+    assert result.problems[0].relative_path == "web.xml"
+    assert "web.xml" not in result.java_results
+
+
+def test_process_paths_a_genuine_utf8_web_xml_with_unicode_content_stays_clean(
+    tmp_path: Path,
+) -> None:
+    """Companion control: the same web.xml, correctly UTF-8 encoded."""
+    (tmp_path / "web.xml").write_bytes(
+        "<web-app><servlet-mapping><servlet-name>café</servlet-name>"
+        "<url-pattern>/café/*</url-pattern></servlet-mapping></web-app>\n"
+        .encode("utf-8"))
+    result = worker.process_paths(tmp_path, ["web.xml"])
+    assert result.problems == []
+    entry_points = result.java_results["web.xml"]["entry_points"]
+    assert entry_points[0]["name"] == "/café/*"
+
+
+def test_process_paths_a_latin1_tooling_xml_records_encoding_undecodable_not_unsupported_language(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 26 (F3 BLOCKER, wrong-data, xml-root-sniff branch): a
+    non-adapter-handled XML file (Spring bean config here) that is
+    Latin-1-encoded must record `encoding_undecodable`, never guess a
+    tier verdict (`unsupported_language`) from a root-element name that
+    may itself be corrupted by the undecodable byte sequence."""
+    (tmp_path / "beans.xml").write_bytes(
+        b'<?xml version="1.0"?>\n<beans><!-- caf\xe9 --></beans>\n')
+    result = worker.process_paths(tmp_path, ["beans.xml"])
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "encoding_undecodable"
+    assert result.problems[0].relative_path == "beans.xml"
+
+
+def test_process_paths_a_genuine_utf8_tooling_xml_still_gets_the_tier2_verdict(
+    tmp_path: Path,
+) -> None:
+    """Companion control: an ordinary UTF-8 Spring bean XML must still
+    get its existing tier-2 unsupported_language verdict, unaffected by
+    the new encoding guard on this decode site."""
+    (tmp_path / "beans.xml").write_bytes(
+        '<?xml version="1.0"?>\n<beans><!-- café --></beans>\n'.encode("utf-8"))
+    result = worker.process_paths(tmp_path, ["beans.xml"])
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "unsupported_language"
+    assert result.problems[0].degrades_run is True
+
+
+def test_is_a_code_bearing_extension_worth_degrading_when_silently_excluded_includes_pom_and_web_xml_f4(
+) -> None:
+    """FIX ROUND 26 (twenty-second cold read, F4 MAJOR, wrong-data): a
+    UTF-16-encoded pom.xml/web.xml is a legal input to the same legacy
+    Windows tooling that produces a UTF-16 .java file, and trips the
+    identical binary-sniff heuristic (discovery.py's own NUL-byte
+    prefix check) - but the predicate scan_pipeline.py consults to
+    decide whether such a silent exclusion is a genuine, unaffected
+    binary blob or a real code file this run failed to read at all only
+    ever checked EXTENSIONS, so a basename-matched producer (pom.xml/
+    web.xml have no extension of their own the extension-based check
+    would recognize) fell through silently - complete, zero problems,
+    while a UTF-16 .java correctly degrades. Now consults
+    `_ADAPTER_HANDLED_XML_BASENAMES` too, the identical treatment."""
+    assert worker.is_a_code_bearing_extension_worth_degrading_when_silently_excluded(
+        "pom.xml") is True
+    assert worker.is_a_code_bearing_extension_worth_degrading_when_silently_excluded(
+        "some/nested/web.xml") is True
+    assert worker.is_a_code_bearing_extension_worth_degrading_when_silently_excluded(
+        "POM.XML") is True
+    assert worker.is_a_code_bearing_extension_worth_degrading_when_silently_excluded(
+        "readme.md") is False
+    assert worker.is_a_code_bearing_extension_worth_degrading_when_silently_excluded(
+        "logo.png") is False
+
+
 def test_process_paths_is_deterministic_regardless_of_input_order(tmp_path: Path) -> None:
     """N4 (cold-read, PR-B fix round 3): comparing bare SETS of sizes
     cannot detect a cross-contamination bug (e.g. a.txt's claim
