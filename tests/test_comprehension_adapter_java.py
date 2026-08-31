@@ -3308,6 +3308,189 @@ def test_pom_description_cdata_does_not_fabricate_a_dependency_edge():
     assert {e.target for e in edges} == {"org.real:real-lib"}
 
 
+# --------------------------------------------------- fix round 25 F4+F5+F8 (servlet-name/filter-name decode discipline)
+
+def test_web_xml_a_cdata_wrapped_servlet_name_publishes_not_silence():
+    """FIX ROUND 25 (twenty-first cold read, F4 MAJOR, wrong-data,
+    .cr21-mixedname): <servlet-name>/<filter-name> were left OFF round
+    24's decode-or-record discipline - a CDATA-wrapped servlet-name made
+    the match None and the whole mapping loop silently `continue`d:
+    PlainServlet's own /plain mapping (no CDATA) published normally
+    while HiddenServlet - genuinely MAPPED to /hidden in the SAME
+    descriptor - got the confident not_applicable/no_entry_point
+    negative, problems=[], complete. Now decodes correctly and /hidden
+    publishes with its real owner, exactly like /plain."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>Plain</servlet-name>
+    <servlet-class>com.acme.PlainServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>Plain</servlet-name>
+    <url-pattern>/plain</url-pattern>
+  </servlet-mapping>
+  <servlet>
+    <servlet-name>Hidden</servlet-name>
+    <servlet-class>com.acme.HiddenServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name><![CDATA[Hidden]]></servlet-name>
+    <url-pattern>/hidden</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern["/plain"] == "com.acme.PlainServlet"
+    assert routes_by_pattern["/hidden"] == "com.acme.HiddenServlet"
+    assert problems == []
+
+
+def test_web_xml_an_undecodable_servlet_name_records_a_problem_not_silence():
+    """FIX ROUND 25 (F4 MAJOR): a servlet-name that IS present but
+    genuinely undecodable (split CDATA) must record a real problem
+    instead of the whole mapping vanishing with zero visibility."""
+    web_xml = """<web-app>
+  <servlet-mapping>
+    <servlet-name><![CDATA[Hid]]>d<![CDATA[en]]></servlet-name>
+    <url-pattern>/hidden</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert entry_points == []
+    matching = [p for p in problems if p.reason_code == "route_value_unrecoverable"]
+    assert len(matching) == 1
+    assert "servlet-mapping" in matching[0].detail
+
+
+def test_web_xml_a_cdata_wrapped_filter_name_publishes_not_silence():
+    """FIX ROUND 25 (F4 MAJOR): the filter twin of the servlet-mapping
+    case above."""
+    web_xml = """<web-app>
+  <filter>
+    <filter-name>Plain</filter-name>
+    <filter-class>com.acme.PlainFilter</filter-class>
+  </filter>
+  <filter-mapping>
+    <filter-name>Plain</filter-name>
+    <url-pattern>/plain</url-pattern>
+  </filter-mapping>
+  <filter>
+    <filter-name>Hidden</filter-name>
+    <filter-class>com.acme.HiddenFilter</filter-class>
+  </filter>
+  <filter-mapping>
+    <filter-name><![CDATA[Hidden]]></filter-name>
+    <url-pattern>/hidden</url-pattern>
+  </filter-mapping>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern["/plain"] == "com.acme.PlainFilter"
+    assert routes_by_pattern["/hidden"] == "com.acme.HiddenFilter"
+    assert problems == []
+
+
+def test_web_xml_an_undecodable_filter_name_records_a_problem_not_silence():
+    """FIX ROUND 25 (F4 MAJOR): the filter twin of the undecodable-name
+    control above."""
+    web_xml = """<web-app>
+  <filter-mapping>
+    <filter-name><![CDATA[Hid]]>d<![CDATA[en]]></filter-name>
+    <url-pattern>/hidden</url-pattern>
+  </filter-mapping>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert entry_points == []
+    matching = [p for p in problems if p.reason_code == "route_value_unrecoverable"]
+    assert len(matching) == 1
+    assert "filter-mapping" in matching[0].detail
+
+
+def test_web_xml_an_undecodable_name_only_descriptor_still_degrades():
+    """FIX ROUND 25 (F4 MAJOR, .cr21-enc, whole-file-gate control): a
+    web.xml whose ONLY mapping has an undecodable name must still
+    surface a real problem (never a complete, zero-problem run) - the
+    24b whole-file gate alone cannot be relied on once a per-mapping
+    problem is recorded instead, but the run must stay visibly
+    degraded either way."""
+    web_xml = """<web-app>
+  <servlet-mapping>
+    <servlet-name><![CDATA[a]]>b<![CDATA[c]]></servlet-name>
+    <url-pattern>/x</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert entry_points == []
+    assert problems != []
+
+
+def test_a_cdata_wrapped_pom_module_publishes_the_reactor_path():
+    """FIX ROUND 25 (twenty-first cold read, F8, wrong-data): <module>
+    was left off round 24's decode-or-record discipline - a CDATA-
+    wrapped module path used to match nothing at all, silently dropping
+    the whole reactor entry."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <packaging>pom</packaging>
+  <modules>
+    <module><![CDATA[core]]></module>
+  </modules>
+</project>
+"""
+    assert java.declared_reactor_module_paths(pom) == ["core"]
+
+
+def test_a_cdata_wrapped_pom_optional_and_scope_decode_correctly():
+    """FIX ROUND 25 (F8, wrong-data): <optional>/<scope> were left off
+    round 24's decode-or-record discipline too - a CDATA-wrapped value
+    used to match nothing at all, silently falling back to the default
+    (optional: false, phase: build) rather than the real declared value."""
+    pom = """<project>
+  <dependencies>
+    <dependency>
+      <groupId>org.a</groupId>
+      <artifactId>a</artifactId>
+      <optional><![CDATA[true]]></optional>
+      <scope><![CDATA[test]]></scope>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    edge = next(e for e in edges if e.target == "org.a:a")
+    assert edge.optional is True
+    assert edge.phase == "test"
+
+
+def test_web_xml_filter_mapping_with_both_url_pattern_and_servlet_name_enrolls_the_dropped_half():
+    """FIX ROUND 25 (twenty-first cold read, F5 MINOR, completeness):
+    a <filter-mapping> with BOTH <url-pattern> AND <servlet-name>
+    publishes the patterns and drops the servlet-name half with NO
+    enrolled instance at all (the problem previously recorded only when
+    url_pattern_matches was empty) - scan.json declares the
+    servlet_name_scoped_filter shape but this run's own instance never
+    surfaced. Now records the instance whenever a servlet-name scoping
+    is present-and-dropped, even alongside published patterns."""
+    web_xml = """<web-app>
+  <filter-mapping>
+    <filter-name>mixed</filter-name>
+    <url-pattern>/mixed/*</url-pattern>
+    <servlet-name>SomeServlet</servlet-name>
+  </filter-mapping>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert {e.name for e in entry_points} == {"/mixed/*"}
+    matching = [p for p in problems if p.reason_code == "unsupported_entry_point_shape"]
+    assert any("servlet_name_scoped_filter" in p.detail for p in matching)
+
+
 def test_jax_rs_path_composes_class_and_method_level_like_spring_request_mapping():
     """FIX ROUND 17 (CR13-3 MAJOR, part (a)): JAX-RS's own @Path composes
     EXACTLY like a plain @RequestMapping already does - a class-level

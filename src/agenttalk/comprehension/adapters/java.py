@@ -3065,13 +3065,19 @@ _DEPENDENCY_ARTIFACT_ID_RE = _leaf_value_pattern("artifactId", dotall=True)
 #: pattern's own generic body, not a ``(true|false)`` alternation, is
 #: sufficient - and keeps this leaf on the SAME shared builder as every
 #: other one, MICRO-ROUND 23b).
-_DEPENDENCY_OPTIONAL_RE = _leaf_value_pattern("optional")
+#: FIX ROUND 25 (twenty-first cold read, F4/F8 MAJOR, wrong-data):
+#: widened to DOTALL - a CDATA-wrapped ``<optional>``/``<scope>`` used
+#: to match nothing at all, same class as F4's own servlet-name/filter-
+#: name gap. Decoded at the call site via ``_decode_xml_text`` before
+#: use (an undecodable value is treated the same as absent - never a
+#: guessed boolean/phase).
+_DEPENDENCY_OPTIONAL_RE = _leaf_value_pattern("optional", dotall=True)
 #: Maven's own scope vocabulary (compile/provided/runtime/test/system/
 #: import) - this slice maps only the one the design names explicitly
 #: ("scope test -> phase test"); every other spelling (including no
 #: <scope> at all, Maven's own "compile" default) stays this adapter's
 #: existing "build" phase.
-_DEPENDENCY_SCOPE_RE = _leaf_value_pattern("scope")
+_DEPENDENCY_SCOPE_RE = _leaf_value_pattern("scope", dotall=True)
 
 #: M1 (seventh cold read, fix round 11): a bare open/close XML tag
 #: (attributes ignored - this adapter's own bar is "a handful of flat
@@ -3109,7 +3115,12 @@ _DEPENDENCIES_ELEMENT_RE = _structural_block_pattern("dependencies")
 #: a Maven aggregator's own declared child-module list - see
 #: ``declared_reactor_module_paths``.
 _MODULES_ELEMENT_RE = _structural_block_pattern("modules")
-_MODULE_RE = _leaf_value_pattern("module")
+#: FIX ROUND 25 (twenty-first cold read, F8, wrong-data): widened to
+#: DOTALL - a CDATA-wrapped ``<module>`` path used to match nothing at
+#: all, silently dropping the whole reactor entry. Decoded at the call
+#: site via ``_decode_xml_text``; an undecodable path records a problem
+#: rather than silently vanishing (see ``declared_reactor_module_paths``).
+_MODULE_RE = _leaf_value_pattern("module", dotall=True)
 
 
 def _enclosing_tag_stack(sanitized: str, before: int) -> list[str]:
@@ -3213,7 +3224,17 @@ def declared_reactor_module_paths(text: str) -> list[str]:
             structural, modules_match.start(1), modules_match.end(1),
         ):
             raw_value = sanitized[module_match.start(1):module_match.end(1)]
-            paths.append(_bounded_route_target(raw_value.strip()))
+            # FIX ROUND 25 (twenty-first cold read, F8, wrong-data): a
+            # CDATA-wrapped <module> now MATCHES (widened to DOTALL) but
+            # must still be DECODED before use - an undecodable path
+            # (split/mixed CDATA, an undefined entity) is treated the
+            # same as a genuinely absent one (silently excluded from
+            # the reactor list), never a value with literal CDATA
+            # markers still embedded in it.
+            decoded_value = _decode_xml_text(raw_value)
+            if decoded_value is None:
+                continue
+            paths.append(_bounded_route_target(decoded_value.strip()))
     return paths
 
 
@@ -3511,10 +3532,20 @@ def parse_maven_pom(
         group_id = _expand_self_referential_property(
             _bounded_route_target(group_decoded.strip()))
         artifact_id = _bounded_route_target(artifact_decoded.strip())
+        # FIX ROUND 25 (twenty-first cold read, F8, wrong-data): both
+        # widened to DOTALL - decoded the same as every other leaf;
+        # an undecodable value (split/mixed CDATA, an undefined entity)
+        # is treated the same as a genuinely absent one (the existing,
+        # accepted "optional: false"/"phase: build" default), never a
+        # raw, undecoded value fed into the comparison below.
         optional_match = _DEPENDENCY_OPTIONAL_RE.search(block)
-        optional = optional_match is not None and optional_match.group(1).lower() == "true"
+        optional_decoded = (
+            _decode_xml_text(optional_match.group(1)) if optional_match is not None else None)
+        optional = optional_decoded is not None and optional_decoded.strip().lower() == "true"
         scope_match = _DEPENDENCY_SCOPE_RE.search(block)
-        scope = scope_match.group(1).strip().lower() if scope_match else None
+        scope_decoded = (
+            _decode_xml_text(scope_match.group(1)) if scope_match is not None else None)
+        scope = scope_decoded.strip().lower() if scope_decoded is not None else None
         phase = "test" if scope == "test" else "build"
         edges.append(JavaEdgeClaim(
             from_qualified_name=from_name, relation="build",
@@ -3538,7 +3569,13 @@ def parse_maven_pom(
 #: array element, don't stop at the first" shape round 10's M1 already
 #: applied to Spring route arrays.
 _SERVLET_MAPPING_BLOCK_RE = _structural_block_pattern("servlet-mapping")
-_SERVLET_MAPPING_NAME_RE = _leaf_value_pattern("servlet-name")
+#: FIX ROUND 25 (twenty-first cold read, F4 MAJOR, wrong-data): widened
+#: to DOTALL - a CDATA-wrapped ``<servlet-name>`` used to match nothing
+#: at all, silently dropping the WHOLE mapping (no entry point, no
+#: problem) with no visibility whatsoever, unlike every other leaf this
+#: producer already decodes-or-records. Decoded at each call site via
+#: ``_decode_xml_text``.
+_SERVLET_MAPPING_NAME_RE = _leaf_value_pattern("servlet-name", dotall=True)
 #: FIX ROUND 23 (nineteenth cold read, F1(d), wrong-data): widened from
 #: ``[^<]+`` (DOTALL OFF) to ``.*?`` (DOTALL ON) so a CDATA-wrapped
 #: value (``<url-pattern><![CDATA[/c4]]></url-pattern>``) is captured
@@ -3613,7 +3650,15 @@ def _servlet_class_by_name(
         class_match = _SERVLET_CLASS_RE.search(block)
         if name_match is None or class_match is None:
             continue
-        servlet_name = name_match.group(1).strip()
+        # FIX ROUND 25 (twenty-first cold read, F4, wrong-data): decoded
+        # the same as the class below - an undecodable servlet-name here
+        # is treated the same as one genuinely absent (this <servlet>
+        # declaration simply never joins), matching the existing,
+        # accepted asymmetry for an unmatched servlet-mapping.
+        decoded_name = _decode_xml_text(name_match.group(1))
+        if decoded_name is None:
+            continue
+        servlet_name = decoded_name.strip()
         decoded_class = _decode_xml_text(class_match.group(1))
         if decoded_class is None:
             undecodable.append((servlet_name, block_match.start()))
@@ -3640,7 +3685,11 @@ def _servlet_class_by_name(
 #: below, joined against ``<filter-mapping>`` the same way
 #: ``_servlet_class_by_name`` already joins servlet mappings.
 _FILTER_BLOCK_RE = _structural_block_pattern("filter")
-_FILTER_NAME_RE = _leaf_value_pattern("filter-name")
+#: FIX ROUND 25 (twenty-first cold read, F4 MAJOR, wrong-data): the
+#: exact same widening/decode discipline as ``_SERVLET_MAPPING_NAME_RE``
+#: above - a CDATA-wrapped ``<filter-name>`` silently dropped the whole
+#: filter-mapping, the filter twin of the servlet-name gap.
+_FILTER_NAME_RE = _leaf_value_pattern("filter-name", dotall=True)
 #: FIX ROUND 24 (F5 MINOR, wrong-data): same DOTALL widening as
 #: ``_SERVLET_CLASS_RE`` above, same reason - a CDATA-wrapped
 #: ``<filter-class>`` used to silently drop this filter from
@@ -3692,7 +3741,13 @@ def _filter_class_by_name(
         class_match = _FILTER_CLASS_RE.search(block)
         if name_match is None or class_match is None:
             continue
-        filter_name = name_match.group(1).strip()
+        # FIX ROUND 25 (twenty-first cold read, F4, wrong-data): the
+        # exact same decode-or-treat-as-absent discipline as
+        # ``_servlet_class_by_name`` above.
+        decoded_name = _decode_xml_text(name_match.group(1))
+        if decoded_name is None:
+            continue
+        filter_name = decoded_name.strip()
         decoded_class = _decode_xml_text(class_match.group(1))
         if decoded_class is None:
             undecodable.append((filter_name, block_match.start()))
@@ -3823,8 +3878,29 @@ def parse_web_xml(
         block = sanitized[block_match.start(1):block_match.end(1)]
         name_match = _SERVLET_MAPPING_NAME_RE.search(block)
         if name_match is None:
+            # Same silent-drop shape round 15b's own JUDGE carry already
+            # names for a nameless <servlet-mapping> - not a new gap.
             continue
-        servlet_name = name_match.group(1).strip()
+        # FIX ROUND 25 (twenty-first cold read, F4 MAJOR, wrong-data): a
+        # servlet-name PRESENT but UNDECODABLE (CDATA/entity constructs)
+        # used to make the WHOLE mapping vanish silently (no entry
+        # point, no problem, on an otherwise complete run) - a DIFFERENT
+        # fact from the genuinely-nameless case just above, and the
+        # reason another mapping's own real route (in the SAME file)
+        # could mask the whole-file positive-evidence gate entirely.
+        # Recorded visibly instead.
+        decoded_name = _decode_xml_text(name_match.group(1))
+        if decoded_name is None:
+            problems.append(JavaAdapterProblem(
+                reason_code="route_value_unrecoverable",
+                detail=f"a <servlet-mapping> declared at line "
+                       f"{_line_at(newline_offsets, block_match.start())} names a "
+                       "<servlet-name> containing XML constructs this producer does not "
+                       "decode - the whole mapping is suppressed rather than published "
+                       "with a guessed name",
+            ))
+            continue
+        servlet_name = decoded_name.strip()
         mapped_servlet_names.add(servlet_name)
         owner_qualified_name = servlet_class_by_name.get(
             servlet_name, f"{relative_path}#{servlet_name}")
@@ -3869,7 +3945,13 @@ def parse_web_xml(
     for block_match in _SERVLET_BLOCK_RE.finditer(structural):
         block = sanitized[block_match.start(1):block_match.end(1)]
         name_match = _SERVLET_MAPPING_NAME_RE.search(block)
-        if name_match is None or name_match.group(1).strip() in mapped_servlet_names:
+        # FIX ROUND 25 (F4, wrong-data): decoded before the membership
+        # check - comparing a raw, undecoded CDATA-wrapped name against
+        # `mapped_servlet_names` (which only ever holds DECODED names)
+        # would never match, incorrectly treating an already-mapped
+        # servlet as unmapped.
+        decoded_name = _decode_xml_text(name_match.group(1)) if name_match is not None else None
+        if decoded_name is None or decoded_name.strip() in mapped_servlet_names:
             continue
         if _LOAD_ON_STARTUP_RE.search(block) is None:
             continue
@@ -3908,7 +3990,22 @@ def parse_web_xml(
             # Same silent-drop shape round 15b's own JUDGE carry already
             # names for a nameless <servlet-mapping> - not a new gap.
             continue
-        filter_name = name_match.group(1).strip()
+        # FIX ROUND 25 (twenty-first cold read, F4 MAJOR, wrong-data):
+        # the filter twin of the servlet-mapping fix above - a filter-
+        # name present but undecodable used to make the whole mapping
+        # vanish silently.
+        decoded_name = _decode_xml_text(name_match.group(1))
+        if decoded_name is None:
+            problems.append(JavaAdapterProblem(
+                reason_code="route_value_unrecoverable",
+                detail=f"a <filter-mapping> declared at line "
+                       f"{_line_at(newline_offsets, block_match.start())} names a "
+                       "<filter-name> containing XML constructs this producer does not "
+                       "decode - the whole mapping is suppressed rather than published "
+                       "with a guessed name",
+            ))
+            continue
+        filter_name = decoded_name.strip()
         owner_qualified_name = filter_class_by_name.get(
             filter_name, f"{relative_path}#{filter_name}")
         # FIX ROUND 22 (eighteenth cold read, F3 MAJOR, wrong-data): a
@@ -3923,16 +4020,43 @@ def parse_web_xml(
         # the same way, never silently falling through to zero
         # iterations and zero problems.
         url_pattern_matches = list(_SERVLET_MAPPING_URL_PATTERN_RE.finditer(block))
-        if not url_pattern_matches:
+        # FIX ROUND 25 (twenty-first cold read, F5 MINOR, completeness):
+        # round 22's own fix only enrolled this shape when
+        # url_pattern_matches was EMPTY, silently assuming that was
+        # always the reason - a <filter-mapping> declaring BOTH a
+        # <servlet-name> AND one or more <url-pattern> siblings (legal,
+        # if unusual - a filter scoped both ways) published the
+        # url-pattern half normally but dropped the servlet-name half
+        # with NO enrolled instance at all, even though scan.json
+        # already declares this shape as a recognized coverage gap.
+        # Checked independently of url_pattern_matches now - present
+        # alongside published patterns records the SAME problem, worded
+        # accurately for that case (never claiming "no entry point
+        # published" when one genuinely was, via the sibling pattern).
+        servlet_name_scoping_match = _SERVLET_MAPPING_NAME_RE.search(block)
+        if servlet_name_scoping_match is not None:
+            if url_pattern_matches:
+                detail = (
+                    f"a <filter-mapping> declared at line "
+                    f"{_line_at(newline_offsets, block_match.start())} names BOTH a "
+                    "<servlet-name> and a <url-pattern> (servlet_name_scoped_filter) - "
+                    "the url-pattern half publishes normally, but this producer does not "
+                    "compose a target from the servlet-name-scoped half"
+                )
+            else:
+                detail = (
+                    f"a <filter-mapping> declared at line "
+                    f"{_line_at(newline_offsets, block_match.start())} names a "
+                    "<servlet-name> rather than a <url-pattern> (servlet_name_scoped_"
+                    "filter) - no entry point published, but not confidently absent "
+                    "either"
+                )
             problems.append(JavaAdapterProblem(
                 reason_code="unsupported_entry_point_shape",
-                detail=f"a <filter-mapping> declared at line "
-                       f"{_line_at(newline_offsets, block_match.start())} names a "
-                       "<servlet-name> rather than a <url-pattern> (servlet_name_scoped_"
-                       "filter) - no entry point published, but not confidently absent "
-                       "either",
+                detail=detail,
                 qualified_name=owner_qualified_name,
             ))
+        if not url_pattern_matches:
             continue
         for pattern_match in url_pattern_matches:
             absolute_offset = block_match.start(1) + pattern_match.start()
