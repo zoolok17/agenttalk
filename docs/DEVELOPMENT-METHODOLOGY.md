@@ -174,6 +174,15 @@ the fix is real, for the same reason a self-assessed risk tier is unreliable —
 "looks fixed" that was never independently re-probed is a belief wearing the clothes of
 a verified fact.
 
+**Honest status of both mechanisms above.** Today, an unbriefed cold read and a
+ratification pass are applied at the change-owner's or lead's judgment for
+product-facing work — tiered by the same blast-radius reasoning as §3 — not yet
+triggered by a codified, checkable rule that says exactly which changes require one.
+Making that trigger explicit is itself a named, tracked open item on this project's own
+backlog, not a gap papered over here: until it lands, "was this reviewed at the tier its
+risk warranted" is a question to ask of the record for a specific change, not an
+assumption this document is entitled to make on the record's behalf.
+
 ---
 
 ## 7. The carry ledger
