@@ -4482,6 +4482,21 @@ def parse_web_xml(
     # PATTERN, two names, each with its own otherwise-unambiguous
     # backing) - recorded via its own sibling reason code rather than
     # silently left as zero problems on a spec-invalid descriptor.
+    #
+    # MICRO-ROUND 31b (reviewer-3 delta, R4, declared - under-reporting,
+    # not wrong data): this check is FILE-SCOPED - it only ever compares
+    # `<url-pattern>` values declared within THIS ONE web.xml's own
+    # `<servlet-mapping>` elements. A `@WebServlet("/x")` colliding with
+    # a DIFFERENT web.xml's own `/x` mapping (or the SAME web.xml if a
+    # repo somehow carries more than one) publishes two entry points and
+    # zero `duplicate_route_target` problems, complete - a real, cross-
+    # source route collision this producer simply does not check for
+    # this slice, never claimed. An ABSENT row therefore means "no
+    # collision found within this one descriptor's own mappings," never
+    # "no route collisions exist in this run" - the same absence-is-not-
+    # a-confident-negative discipline round 30's own R2 rename applied
+    # to `dependencies_resolved`'s reason, here for a check's own SCOPE
+    # rather than a reason's own name.
     route_pattern_owners: dict[str, set[str]] = {}
     for block_match in _SERVLET_MAPPING_BLOCK_RE.finditer(structural):
         # FIX ROUND 26 (twenty-second cold read, F2 BLOCKER, wrong-data):
@@ -4670,17 +4685,25 @@ def parse_web_xml(
             qualified_name=qualified_name,
         ))
     filter_registry, filter_name_undecodable = _filter_class_by_name(sanitized, structural)
-    # FIX ROUND 29/30 (F1 BLOCKER): the identical duplicate-descriptor-
-    # name conflict handling as the servlet loop above - see its own
-    # comment.
+    # FIX ROUND 29/30/31 (F1 BLOCKER): the identical duplicate-
+    # descriptor-name conflict handling as the servlet loop above - see
+    # its own comment.
+    #
+    # MICRO-ROUND 31b (reviewer-3 delta, R2 one-sentence fix, wrong-
+    # data): a SINGLE <filter> block declaring TWO <filter-class>
+    # elements (round 31's own F2 fix) also lands here now, declared
+    # exactly ONCE with two disagreeing backings within that one
+    # declaration - the servlet path's own detail was already reworded
+    # around occurrence count for the identical shape (round 31's own
+    # F1(1)/(1e) plus micro-round 30b's own R1), but the fix never
+    # traveled to this, its filter twin. Copied verbatim.
     for filter_name, candidate_labels in sorted(filter_registry.conflicts.items()):
         problems.append(JavaAdapterProblem(
             reason_code="duplicate_descriptor_name",
-            detail=f"<filter-name>{filter_name}</filter-name> is declared more than once "
-                   f"with disagreeing backing declarations ({', '.join(candidate_labels)}) - "
-                   "no declaration is authoritative by execution order, so its mapped "
-                   "route falls back to the synthetic per-mapping owner rather than "
-                   "picking one",
+            detail=f"<filter-name>{filter_name}</filter-name> has disagreeing backing "
+                   f"declarations ({', '.join(candidate_labels)}) - no declaration is "
+                   "authoritative by execution order, so its mapped route falls back to "
+                   "the synthetic per-mapping owner rather than picking one",
             qualified_name=f"{relative_path}#{filter_name}",
         ))
         descriptor_name_conflicts.append((

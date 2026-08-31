@@ -2241,7 +2241,14 @@ def test_run_scan_two_filter_class_elements_in_one_block_is_a_conflict(
     java_repo: Path, swap_order: bool,
 ) -> None:
     """FIX ROUND 31 (F2 MAJOR): the filter twin of the servlet test
-    above."""
+    above.
+
+    MICRO-ROUND 31b (reviewer-3 delta, R2 one-sentence fix, wrong-
+    data): this name is declared exactly ONCE (one <filter> block),
+    with two disagreeing backings within it - the detail must never
+    overclaim "is declared more than once" (the servlet path's own
+    identical shape was already reworded around occurrence count; this
+    fix never traveled to its filter twin until now)."""
     import json
 
     web_dir = java_repo / "src" / "main" / "java" / "com" / "acme" / "web"
@@ -2279,6 +2286,7 @@ def test_run_scan_two_filter_class_elements_in_one_block_is_a_conflict(
     assert len(matching) == 1
     assert "com.acme.web.FirstFilter" in matching[0]["detail"]
     assert "com.acme.web.SecondFilter" in matching[0]["detail"]
+    assert "more than once" not in matching[0]["detail"]
 
     modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
     first_filter = next(u for u in modules_doc["units"] if u["display_name"] == "FirstFilter")

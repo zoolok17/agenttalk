@@ -218,6 +218,15 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     # shape of the three descriptor-name reasons above (one PATTERN,
     # two names, rather than one NAME, two backings) - same "recorded,
     # degrading" bucket.
+    #
+    # MICRO-ROUND 31b (reviewer-3 delta, R4, declared): this reason is
+    # FILE-SCOPED - java.py's own detector only ever compares mappings
+    # within ONE web.xml, never against an annotation-declared route or
+    # a DIFFERENT web.xml's own mappings, so its absence means "no
+    # collision within this one descriptor," never "no route collision
+    # exists anywhere in this run" (a real, declared under-reporting
+    # scope, not wrong data - the cross-source check stays out of this
+    # slice).
     "duplicate_route_target": "warning",
     # FIX ROUND 17 (thirteenth cold read, CR13-3 MAJOR, part (b) - THE
     # CLASS-CLOSER): a recognized-but-unsupported route-like annotation
