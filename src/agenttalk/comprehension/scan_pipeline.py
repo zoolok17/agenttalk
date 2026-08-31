@@ -54,6 +54,7 @@ from .envelope import (
     require_field,
     resolve_under_root,
     validate_envelope,
+    validate_relative_path,
     validate_scan_id,
 )
 from .errors import ComprehensionError, EnvelopeError, bounded_detail, bounded_os_error_detail
@@ -940,6 +941,21 @@ def run_scan(
                 "sooner)"
             )
 
+        # FIX ROUND 32 (twenty-eighth cold read, F4(a) MAJOR, completeness):
+        # the SAME "refuse at the source, never merely detectable after
+        # the fact" discipline as the dangling-reference sweep just above -
+        # see _module_path_confinement_violations's own docstring.
+        _publish_time_path_violations = _module_path_confinement_violations(modules)
+        if _publish_time_path_violations:
+            raise ComprehensionError(
+                "refusing to publish: this run's own module records contain an "
+                "unconfined path - " + "; ".join(_publish_time_path_violations) + " "
+                "(this run's own .staging/ directory is left in place, self-clearing "
+                "on the next scan's own lock-acquisition reclaim once this process "
+                "exits; run `agenttalk comprehension prune --staging` to reclaim it "
+                "sooner)"
+            )
+
         # FIX ROUND 29 (twenty-fifth cold read, F6 polish, wrong-data):
         # design step 8 names "deterministic ordering" as a real publish-
         # validation requirement, alongside referential integrity above -
@@ -1741,6 +1757,40 @@ def get_report(
     records = _load_run_records(comprehension_dir, scan_id)
     anchor_state = _scan_json_anchor_state(index_doc, scan_id, records["scan"], records["run_dir"])
     _verify_artifact_digests(records["scan"], records["raw_docs"], records["run_dir"])
+    # FIX ROUND 32 (twenty-eighth cold read, F4(b) MAJOR, completeness,
+    # JUDGE - taken): `validate` catches a dangling cross-artifact
+    # reference; `report` never checked at all - a run with one (a
+    # producer bug, or a hand-edited artifact, that still passes schema/
+    # envelope/digest verification) was projected and emitted with the
+    # SAME dangling records `validate` would flag, `scan_json_integrity`
+    # verified alongside them. Reuses the identical sweep `validate_run`
+    # already runs (never a second, narrower notion of "referentially
+    # sound" invented here) - the SAME M-1 precedent this function's own
+    # digest check follows ("report verifies... before projecting it...
+    # rather than projecting tampered content as fact") extends naturally
+    # to this dimension too.
+    _report_dangling = _dangling_reference_categories(
+        modules=records["modules"], dependencies=records["dependencies"],
+        entry_points=records["entry_points"], features=records["features"],
+        readiness_signals=records["readiness_signals"],
+    )
+    if any(ids for _, ids in _report_dangling):
+        raise ComprehensionError(
+            "refusing to report: this run's own records contain a dangling "
+            "cross-artifact reference - "
+            f"{_dangling_reference_detail(_report_dangling)} "
+            "(run `agenttalk comprehension validate` for the full detail)"
+        )
+    # FIX ROUND 32 (F4(a) MAJOR, completeness): the same path-confinement
+    # sweep publish-time and `validate` now run - see _module_path_
+    # confinement_violations's own docstring.
+    _report_path_violations = _module_path_confinement_violations(records["modules"])
+    if _report_path_violations:
+        raise ComprehensionError(
+            "refusing to report: this run's own module records contain an "
+            "unconfined path - " + "; ".join(_report_path_violations) + " "
+            "(run `agenttalk comprehension validate` for the full detail)"
+        )
     payload = projector.project_comprehension(
         scan_id=_scan_field(records["scan"], "scan_id", scan_id),
         generated_at=_scan_field(records["scan"], "generated_at", scan_id),
@@ -1934,6 +1984,49 @@ def _dangling_reference_detail(
     return " and ".join(
         f"{len(ids)} {label}" for label, ids in categories if ids
     ) or None
+
+
+def _module_path_confinement_violations(
+    modules: list[modules_artifact.ModuleRecord],
+) -> list[str]:
+    """FIX ROUND 32 (twenty-eighth cold read, F4 MAJOR, completeness):
+    neither ``validate`` nor publish-time ever checked that a module's own
+    persisted ``paths``/``source_digests`` entries are still confined,
+    project-relative POSIX paths (design, "Local storage model") - a
+    corrupted (or maliciously edited) ``modules.json`` naming an absolute
+    path (``C:/Windows/win.ini``) reported ``valid:true`` from ``validate``
+    and was projected and emitted verbatim by ``report``, neither ever
+    having a reason to distrust a record whose digest/schema/cross-
+    reference checks all otherwise pass - this dimension was simply never
+    checked at all, by anything, after publication.
+
+    Reuses ``envelope.validate_relative_path`` - the SAME syntactic
+    confinement predicate every OTHER persisted path in this package is
+    already held to - never a second, parallel notion of "confined"
+    invented here. Shares this ONE predicate across publish-time (``run_
+    scan``, refusing before anything reaches staging) and ``validate_run``
+    (below, on records read back from disk) exactly the way ``_dangling_
+    reference_categories`` already shares its own sweep between the two -
+    the same "one predicate, every call site" discipline, so the two can
+    never independently drift on what "confined" means.
+
+    Returns one description per violating (unit_id, path) pair - a module
+    can name more than one escaping path across ``paths`` and ``source_
+    digests``, and every one is worth surfacing, not just the first."""
+    violations: list[str] = []
+    for module in modules:
+        for path in module.paths:
+            try:
+                validate_relative_path(path, label=f"module {module.unit_id}'s own path")
+            except EnvelopeError as exc:
+                violations.append(str(exc))
+        for path in module.source_digests:
+            try:
+                validate_relative_path(
+                    path, label=f"module {module.unit_id}'s own source_digests key")
+            except EnvelopeError as exc:
+                violations.append(str(exc))
+    return violations
 
 
 def _verify_artifact_digests(
@@ -2133,12 +2226,23 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
         features=records["features"] if records else [],
         readiness_signals=records["readiness_signals"] if records else [],
     )
-    invalid = any(ids for _, ids in _dangling_categories)
+    # FIX ROUND 32 (twenty-eighth cold read, F4(a) MAJOR, completeness):
+    # the same sweep publish-time now runs (see _module_path_confinement_
+    # violations's own docstring) - folded in here alongside the dangling-
+    # reference sweep so a single `invalid` boolean and detail sentence
+    # cover both integrity dimensions, never a second silent gap the
+    # reader would have to separately discover.
+    _path_violations = _module_path_confinement_violations(
+        records["modules"] if records else [])
     dangling_detail = _dangling_reference_detail(_dangling_categories)
+    invalid = any(ids for _, ids in _dangling_categories) or bool(_path_violations)
+    invalid_detail = " and ".join(
+        part for part in (dangling_detail, "; ".join(_path_violations) or None) if part
+    )
     return {
         "scan_id": scan_id,
         "valid": valid and not invalid,
-        "detail": detail if not invalid else dangling_detail,
+        "detail": detail if not invalid else invalid_detail,
         "scan_json_integrity": anchor_state,
         "external_revalidation": {
             "performed": False,

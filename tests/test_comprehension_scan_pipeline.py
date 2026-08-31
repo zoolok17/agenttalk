@@ -5116,6 +5116,91 @@ def test_run_scan_refuses_to_publish_an_entry_point_with_an_unknown_feature_id(
         scan_pipeline.run_scan(java_repo)
 
 
+# --------------------- FIX ROUND 32 (twenty-eighth cold read, F4 MAJOR,
+# completeness): path confinement is now checked at publish time, on
+# `validate`, and on `report` - none of the three checked it before.
+
+def test_run_scan_refuses_to_publish_a_module_with_an_unconfined_path(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """A module record whose own `paths` entry escapes project
+    confinement (an absolute path, e.g. rewritten to C:/Windows/win.ini)
+    used to publish cleanly - nothing checked this dimension at all."""
+    from agenttalk.comprehension import modules_artifact as modulesmod
+
+    real_build_modules = modulesmod.build_modules
+
+    def _inject_an_unconfined_path(*args, **kwargs):
+        records = real_build_modules(*args, **kwargs)
+        escaping = modulesmod.ModuleRecord(
+            unit_id="escaping-module", kind="file", display_name="win.ini", language="unknown",
+            paths=["C:/Windows/win.ini"], source_digests={}, classification=[],
+            container_unit_id=None, producers=[],
+        )
+        return [*records, escaping]
+
+    monkeypatch.setattr(scan_pipeline.modules_artifact, "build_modules", _inject_an_unconfined_path)
+
+    with pytest.raises(scan_pipeline.ComprehensionError, match="unconfined path"):
+        scan_pipeline.run_scan(java_repo)
+
+
+def test_validate_and_report_refuse_a_published_run_with_an_unconfined_path(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 32 (F4(a) MAJOR): the reader's own t4/t7 shapes - a
+    module's own `paths` entry escaping confinement was never checked on
+    READ either. `_verify_artifact_digests` checks the RAW on-disk JSON
+    docs, unaffected by patching the record CONVERTER's return value here,
+    so this proves the read-path check fires independently of the digest
+    check, on an otherwise genuinely well-formed, already-published run."""
+    import dataclasses
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    real_from_json = scan_pipeline.modules_artifact.module_record_from_json
+
+    def _corrupt_the_first_modules_path(payload):
+        record = real_from_json(payload)
+        return dataclasses.replace(record, paths=["C:/Windows/win.ini"])
+
+    monkeypatch.setattr(
+        scan_pipeline.modules_artifact, "module_record_from_json", _corrupt_the_first_modules_path)
+
+    result = scan_pipeline.validate_run(java_repo, run_id=outcome.scan_id)
+    assert result["valid"] is False
+    assert "must be relative, not absolute" in result["detail"]
+
+    with pytest.raises(scan_pipeline.ComprehensionError, match="unconfined path"):
+        scan_pipeline.get_report(java_repo, run_id=outcome.scan_id)
+
+
+def test_report_refuses_a_published_run_with_a_dangling_container_reference(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 32 (F4(b) MAJOR, completeness, JUDGE - taken): `validate`
+    already caught a dangling cross-artifact reference (round 28/29);
+    `report` never checked at all - a run with one was projected and
+    emitted with `scan_json_integrity` verified alongside it. Reuses the
+    identical sweep `validate` already runs, on an otherwise genuinely
+    well-formed, already-published run (the digest check, over the RAW
+    on-disk JSON, is unaffected by patching the record converter here)."""
+    import dataclasses
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    real_from_json = scan_pipeline.modules_artifact.module_record_from_json
+
+    def _corrupt_the_first_modules_container(payload):
+        record = real_from_json(payload)
+        return dataclasses.replace(record, container_unit_id="does-not-exist")
+
+    monkeypatch.setattr(
+        scan_pipeline.modules_artifact, "module_record_from_json",
+        _corrupt_the_first_modules_container)
+
+    with pytest.raises(scan_pipeline.ComprehensionError, match="unknown container_unit_id"):
+        scan_pipeline.get_report(java_repo, run_id=outcome.scan_id)
+
+
 def test_scan_json_carries_per_artifact_and_run_level_digests(java_repo: Path) -> None:
     """M2 (cold-read, PR-B fix round 3): scan.json must carry per-artifact
     byte SHA-256 + canonical content digest + record count + schema
