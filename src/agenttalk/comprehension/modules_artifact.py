@@ -593,7 +593,19 @@ def build_modules(
     records = _attribute_cross_file_entry_point_reasons(
         records, worker_problem_reasons_by_qualified_name or {})
     records = _populate_duplicate_qualified_name_conflicts(records)
-    return _populate_descriptor_name_conflicts(records, descriptor_name_conflicts or [])
+    records = _populate_descriptor_name_conflicts(records, descriptor_name_conflicts or [])
+    # FIX ROUND 29 (twenty-fifth cold read, F6 polish, wrong-data):
+    # MICRO-ROUND 28b's own binary-excluded-root-sniffed-XML synthesized
+    # units are built in their OWN loop, BEFORE the main per-file loop
+    # below - so they landed PREPENDED to every other record, never
+    # interleaved in path order the way every other unit already is
+    # (the design's own publish-validation step names "deterministic
+    # ordering" as a real requirement, not merely an accident of
+    # whichever loop happened to run first). Sorted here, once, at the
+    # very end - by each record's own first path, then unit_id for a
+    # stable tie-break between two records sharing the identical path
+    # (a file-kind record and its own component-kind children).
+    return sorted(records, key=lambda r: (r.paths[0] if r.paths else "", r.unit_id))
 
 
 def _attribute_cross_file_entry_point_reasons(

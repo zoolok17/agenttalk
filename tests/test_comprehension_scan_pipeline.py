@@ -2336,6 +2336,52 @@ def test_run_scan_a_utf16_root_sniffed_xml_records_but_does_not_degrade(
     assert all(s["stored_status"] == "unknown" for s in unit_signals)
 
 
+def test_run_scan_publishes_modules_in_path_sorted_order_not_prepended(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 29 (twenty-fifth cold read, F6 polish, wrong-data):
+    micro-round 28b's own binary-excluded-root-sniffed-XML synthesized
+    units are built in their OWN loop, BEFORE the main per-file loop -
+    they landed PREPENDED to every other record, never interleaved in
+    path order the way every other unit already is (the design's own
+    publish-validation step names "deterministic ordering" as a real
+    requirement). `z-config/logback.xml` sorts AFTER the default
+    fixture's own `pom.xml`/`src/...` units alphabetically - it must
+    NOT be first in modules.json's own units list."""
+    import json
+
+    (java_repo / "z-config").mkdir()
+    (java_repo / "z-config" / "logback.xml").write_bytes(
+        "<beans><!-- café --></beans>\n".encode("utf-16"))
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    unit_paths = [u["paths"][0] for u in modules_doc["units"]]
+    assert unit_paths == sorted(unit_paths)
+    assert unit_paths[0] != "z-config/logback.xml"
+
+
+def test_run_scan_refuses_to_publish_modules_out_of_deterministic_order(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 29 (F6 polish): the publish-time guard - a future
+    producer bug reintroducing non-deterministic module ordering must be
+    refused at its own source, the same way a dangling reference already
+    is (F2), rather than leaving "deterministic ordering" a design claim
+    nothing actually checks."""
+    from agenttalk.comprehension import modules_artifact as modulesmod
+
+    real_build_modules = modulesmod.build_modules
+
+    def _reverse_the_order(*args, **kwargs):
+        return list(reversed(real_build_modules(*args, **kwargs)))
+
+    monkeypatch.setattr(scan_pipeline.modules_artifact, "build_modules", _reverse_the_order)
+
+    with pytest.raises(scan_pipeline.ComprehensionError, match="deterministic"):
+        scan_pipeline.run_scan(java_repo)
+
+
 def test_run_scan_an_encoding_undecodable_root_sniffed_xml_publishes_no_classification(
     java_repo: Path,
 ) -> None:

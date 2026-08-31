@@ -872,6 +872,24 @@ def run_scan(
                 f"{_dangling_reference_detail(_publish_time_dangling)}"
             )
 
+        # FIX ROUND 29 (twenty-fifth cold read, F6 polish, wrong-data):
+        # design step 8 names "deterministic ordering" as a real publish-
+        # validation requirement, alongside referential integrity above -
+        # nothing enforced it (micro-round 28b's own binary-excluded-
+        # root-sniffed-XML synthesized units landed PREPENDED to modules,
+        # never interleaved in path order, until modules_artifact.py's
+        # own build_modules sorted its return value). A cheap, judge-
+        # taken assertion here catches a FUTURE regression at its own
+        # source the same way the dangling-reference check above does,
+        # rather than leaving "deterministic ordering" a claim nothing
+        # actually checks.
+        _expected_module_order = sorted(modules, key=lambda m: (m.paths[0] if m.paths else "", m.unit_id))
+        if modules != _expected_module_order:
+            raise ComprehensionError(
+                "refusing to publish: modules.json's own records are not in "
+                "deterministic (path-then-unit_id) order"
+            )
+
         # N1 (third cold read, fix round 5): find_case_fold_collisions
         # existed with its own passing unit tests and zero production
         # callers - the same dead-code shape round 3's M9 found for
