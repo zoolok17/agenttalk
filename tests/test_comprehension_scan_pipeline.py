@@ -1951,6 +1951,125 @@ def test_run_scan_a_utf16_java_file_degrades_instead_of_silently_vanishing(
     assert reason_codes == {"binary_excluded_code_bearing_file", "externality_suppressed"}
 
 
+@pytest.mark.parametrize("basename", ["beans.xml", "struts-config.xml", "logback.xml"])
+def test_run_scan_a_utf16_root_sniffed_xml_records_but_does_not_degrade(
+    java_repo: Path, basename: str,
+) -> None:
+    """FIX ROUND 26b (reviewer-3 delta on `38a21f3`, item 2, R4 carry
+    OVERTURNED - closed, wrong-data): a binary-excluded, non-adapter-
+    handled .xml file (round 26's own basename widening only ever
+    caught pom.xml/web.xml) used to vanish completely - complete, 0
+    problems, no poison - while its UTF-8 twin would DEGRADE the run if
+    it happened to be tier-2 code-bearing (beans.xml/struts-config.xml)
+    - a wrong-data silence. FIXED AS THE HONEST MIDDLE GROUND: this run
+    cannot decode the file to sniff its root element, so it cannot tell
+    a tier-2 shape from a tier-3 one (logback.xml) either - recorded
+    (visible, addressable) but never degrading, for ALL THREE basenames
+    alike (the boundary case, logback.xml, gets the identical
+    treatment - guessing toward degrading would brand every repo
+    carrying an unreadable logback.xml)."""
+    import json
+
+    (java_repo / basename).write_bytes("<beans><!-- café --></beans>\n".encode("utf-16"))
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert any(
+        e["category"] == "binary" and e["path"] == basename
+        for e in scan_doc["excluded_roots"]
+    )
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matching = [p for p in problems_doc["problems"] if p["path"] == basename]
+    assert len(matching) == 1
+    assert matching[0]["reason_code"] == "binary_excluded_root_sniffed_xml"
+
+
+def test_run_scan_a_utf16_pom_xml_still_degrades_unaffected_by_the_root_sniffed_xml_carve_out(
+    java_repo: Path,
+) -> None:
+    """Companion control: round 26's own F4 fix (pom.xml/web.xml always
+    degrade when binary-excluded) must be unaffected by this round's own
+    new, deliberately-non-degrading root-sniffed-xml problem - the two
+    predicates are mutually exclusive by construction
+    (`is_a_root_sniffed_xml_extension` excludes both adapter-handled
+    basenames), verified here end to end rather than merely assumed."""
+    import json
+
+    (java_repo / "pom.xml").write_bytes(
+        "<project><groupId>g</groupId><artifactId>a</artifactId></project>\n"
+        .encode("utf-16"))
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matching = [p for p in problems_doc["problems"] if p["path"] == "pom.xml"]
+    reason_codes = {p["reason_code"] for p in matching}
+    assert "binary_excluded_code_bearing_file" in reason_codes
+    assert "binary_excluded_root_sniffed_xml" not in reason_codes
+
+
+def test_run_scan_a_utf16_gitmodules_degrades_with_an_encoding_undecodable_problem(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 26b (reviewer-3 delta on `38a21f3`, item 1, wrong-data):
+    a UTF-16-encoded .gitmodules used to decode with errors="replace"
+    into garbled text that simply matched no "path = ..." line - an
+    EMPTY boundary set via the ordinary success path (not the existing
+    unreadable-file problem path), so a real submodule's own foreign
+    source silently walked straight into the fingerprint AND this run's
+    own inventory as first-party units, on a complete/zero-problem run.
+    Now: a named, degrading problem is recorded instead - the submodule
+    directory still cannot be excluded (its own path was never
+    successfully read), but the run is no longer silently claiming
+    completeness over it."""
+    import json
+
+    (java_repo / ".gitmodules").write_bytes(
+        '[submodule "lib"]\n\tpath = lib\n\turl = https://example.invalid/lib.git\n'
+        .encode("utf-16"))
+    submodule_dir = java_repo / "lib"
+    submodule_dir.mkdir()
+    (submodule_dir / "Foreign.java").write_text(
+        "package foreign;\nclass Foreign {}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matching = [p for p in problems_doc["problems"] if p["path"] == ".gitmodules"]
+    assert len(matching) == 1
+    assert matching[0]["reason_code"] == "encoding_undecodable"
+
+
+def test_run_scan_a_utf8_gitmodules_stays_the_existing_clean_boundary_behavior(
+    java_repo: Path,
+) -> None:
+    """Companion control: an ordinary UTF-8 .gitmodules must be
+    unaffected by the new encoding guard - the submodule boundary is
+    still correctly identified and excluded, run stays complete."""
+    import json
+
+    (java_repo / ".gitmodules").write_text(
+        '[submodule "lib"]\n\tpath = lib\n\turl = https://example.invalid/lib.git\n',
+        encoding="utf-8")
+    submodule_dir = java_repo / "lib"
+    submodule_dir.mkdir()
+    (submodule_dir / "Foreign.java").write_text(
+        "package foreign;\nclass Foreign {}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert any(b["path"] == "lib" for b in scan_doc["boundaries"])
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    assert not any(p["path"] == ".gitmodules" for p in problems_doc["problems"])
+
+
 def test_run_scan_a_latin1_java_file_degrades_and_its_importer_stays_unresolved(
     java_repo: Path,
 ) -> None:

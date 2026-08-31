@@ -227,6 +227,15 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     # --recover-stale-lock recovery - safety-relevant provenance, same
     # bucket as every other named-gap reason code above.
     "scan_lock_forcibly_recovered": "warning",
+    # FIX ROUND 26b (reviewer-3 delta on `38a21f3`, item 2, R4 carry
+    # OVERTURNED - closed): a binary-excluded, non-adapter-handled .xml
+    # file this run could not root-sniff to determine its tier - visible
+    # (same "warning" bucket) but DELIBERATELY never in the run's own
+    # degrading-problem set below (see `status`'s own comment) - this
+    # run has no evidence either way, and degrading would brand every
+    # repo carrying an unreadable logback.xml, the round-16 dilution
+    # this producer's own tier calibration already refuses to reopen.
+    "binary_excluded_root_sniffed_xml": "warning",
 }
 _DEFAULT_PROBLEM_SEVERITY = "warning"
 
@@ -604,6 +613,38 @@ def run_scan(
             and worker.is_a_code_bearing_extension_worth_degrading_when_silently_excluded(
                 entry["path"])
         ]
+        # FIX ROUND 26b (reviewer-3 delta on `38a21f3`, item 2, R4 carry
+        # OVERTURNED - closed, wrong-data): a binary-excluded, non-
+        # adapter-handled .xml file (a Spring bean/Struts config XML, or
+        # an ordinary logback.xml - this run cannot tell which without
+        # decoding it, which is exactly what binary exclusion prevents)
+        # used to vanish completely silently - complete, 0 problems, no
+        # poison - while its UTF-8 twin would DEGRADE the run if it were
+        # tier-2 code-bearing. RECORDED here (visible, addressable in
+        # problems.json) but deliberately kept OUT of both the `status`
+        # degradation OR-chain below and `externality_poisoned` - this
+        # run has no evidence the file was actually code-bearing, and
+        # guessing toward degrading would brand every repo carrying an
+        # unreadable logback.xml, the round-16 dilution this producer's
+        # own tier calibration already refuses to reopen. Excludes
+        # pom.xml/web.xml (already covered, and degrading, above) by
+        # construction - `is_a_root_sniffed_xml_extension` itself
+        # excludes both adapter-handled basenames.
+        binary_excluded_root_sniffed_xml_problems = [
+            _problem_record(
+                "binary_excluded_root_sniffed_xml",
+                entry["path"],
+                "an XML file excluded outright as binary content (a NUL byte in its "
+                "sniffed prefix) could not be root-element-sniffed to determine whether "
+                "it is code-bearing (e.g. Spring bean/Struts config XML) or ordinary "
+                "tooling/config XML (e.g. logback.xml) - recorded as a genuine unread-"
+                "file gap, but never guessed toward a degrading verdict this run has no "
+                "evidence for",
+            )
+            for entry in discovery_result.excluded_roots
+            if entry["category"] == "binary"
+            and worker.is_a_root_sniffed_xml_extension(entry["path"])
+        ]
         # FIX ROUND 20 (sixteenth cold read, M1+M2 MAJOR - THE REACTOR
         # RULE): a pom's own declared <module> entry whose path resolves
         # into a region this run excluded outright is positive, DIRECT
@@ -787,8 +828,8 @@ def run_scan(
                 "case_collision", second, bounded_detail(f"case-folds identically to {first!r}"))
             for first, second in case_collisions
         ] + duplicate_qualified_name_problems + binary_excluded_code_bearing_problems + (
-            reactor_rule_problems) + externality_suppressed_problems + (
-            forced_lock_recovery_problems)
+            binary_excluded_root_sniffed_xml_problems) + reactor_rule_problems + (
+            externality_suppressed_problems) + forced_lock_recovery_problems
         # FIX ROUND 14b (reviewer-3's ratified CR10-5 split): a worker
         # problem's own `degrades_run` (worker.py) distinguishes
         # "recorded, visible" from "the run's status also degrades over
@@ -810,6 +851,12 @@ def run_scan(
         # generated-sources peek hit now also degrades, correctly: its
         # dependency resolution really is incomplete, unlike round 16b's
         # own dilution case (where nothing was actually wrong).
+        # FIX ROUND 26b (item 2): `binary_excluded_root_sniffed_xml_
+        # problems` is DELIBERATELY absent from this OR-chain (and from
+        # `externality_poisoned` above) - recorded, never degrading, see
+        # its own comment above for why guessing a verdict here would be
+        # the round-16 dilution this producer's own tier calibration
+        # already refuses to reopen.
         status = "degraded" if (
             discovery_result.degraded or discovery_result.problems or case_collisions
             or degrading_worker_problems or duplicate_qualified_name_problems

@@ -650,13 +650,17 @@ def _submodule_boundary_paths(root: Path) -> tuple[frozenset[str], dict[str, str
     - ``problem`` is ``None`` on success (including the ordinary "no
     ``.gitmodules`` file" case, never a failure), or a problem dict the
     caller must record (marking the fingerprint incomplete) when the
-    file exists but could not be read."""
+    file exists but could not be read OR could not be DECODED (FIX ROUND
+    26b: a UTF-16-encoded ``.gitmodules`` decoded with ``errors=
+    "replace"`` used to succeed silently into an empty boundary set -
+    the identical omission as an unreadable file, now recorded the same
+    way)."""
     gitmodules = root / ".gitmodules"
     if not gitmodules.is_file():
         return frozenset(), None
     paths: set[str] = set()
     try:
-        text = gitmodules.read_text(encoding="utf-8", errors="replace")
+        text = gitmodules.read_text(encoding="utf-8-sig", errors="replace")
     except OSError as exc:
         return frozenset(), {
             "reason_code": "parse_failed",
@@ -664,6 +668,32 @@ def _submodule_boundary_paths(root: Path) -> tuple[frozenset[str], dict[str, str
             "detail": bounded_os_error_detail(
                 "could not read .gitmodules - submodule boundaries are unknown, "
                 "so none could be excluded", exc),
+        }
+    # FIX ROUND 26b (reviewer-3 delta on `38a21f3`, item 1, wrong-data):
+    # errors="replace" silently substitutes U+FFFD for every byte
+    # sequence it cannot decode - a UTF-16-encoded .gitmodules (a legal
+    # git config encoding some legacy Windows tooling produces) then
+    # simply matches no "path = ..." line in the garbled text, returning
+    # an EMPTY boundary set via this function's own SUCCESS path, never
+    # reaching the except-OSError problem path above. The real submodule
+    # then walks straight into the fingerprint AND its own foreign
+    # source is inventoried as this repo's own first-party units, on a
+    # complete/zero-problem run - measured. Undecodable is exactly as
+    # much an enumeration omission as unreadable is (N2's own reasoning,
+    # unchanged) - routed through the SAME named, degrading problem
+    # rather than a silent empty return. This module cannot import
+    # worker.py's own `_decode_text_or_flag_undecodable` (the reverse
+    # import already exists; discovery.py owns filesystem access
+    # exclusively - the same constraint the existing `_DEGRADABLE_
+    # EXCLUDED_EXTENSIONS` carry already names), so the guard is
+    # duplicated inline rather than shared.
+    if "�" in text:
+        return frozenset(), {
+            "reason_code": "encoding_undecodable",
+            "path": ".gitmodules",
+            "detail": "could not decode .gitmodules as UTF-8 (the decoded text contains "
+                      "the U+FFFD replacement character) - submodule boundaries are "
+                      "unknown, so none could be excluded",
         }
     for line in text.splitlines():
         stripped = line.strip()

@@ -241,6 +241,30 @@ def is_a_code_bearing_extension_worth_degrading_when_silently_excluded(
     )
 
 
+def is_a_root_sniffed_xml_extension(relative_path: str) -> bool:
+    """FIX ROUND 26b (reviewer-3 delta on `38a21f3`, item 2, R4 carry
+    OVERTURNED - closed, wrong-data): a binary-excluded ``.xml`` file
+    that is NOT one of the two adapter-handled basenames (``pom.xml``/
+    ``web.xml``) is exactly the file this worker's own root-sniff branch
+    (``sniff_xml_root_element``) would otherwise have decoded and
+    inspected to decide its tier - a UTF-16-encoded Spring bean XML/
+    Struts config XML (tier 2, code-bearing) or a UTF-16 ``logback.xml``
+    (tier 3, not code-bearing) both trip discovery's own binary sniff
+    identically, and neither ever reaches the root-element sniff at all,
+    so this run genuinely has no evidence to tell them apart - unlike
+    ``is_a_code_bearing_extension_worth_degrading_when_silently_
+    excluded`` above (which answers "definitely code-bearing"), this
+    answers only "would have been root-sniffed, tier unknown." Used by
+    scan_pipeline.py to RECORD (never silently vanish) this shape
+    without guessing a degrading verdict it has no evidence for -
+    degrading every repo with an unreadable ``logback.xml`` would be the
+    exact round-16 dilution this producer's own tier calibration already
+    refuses to reopen."""
+    lower = relative_path.lower()
+    name_lower = Path(relative_path).name.lower()
+    return lower.endswith(".xml") and name_lower not in _ADAPTER_HANDLED_XML_BASENAMES
+
+
 WORKER_SCHEMA_VERSION = 1
 _WORKER_TIMEOUT_SECONDS = 300.0
 
