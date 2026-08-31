@@ -18,14 +18,15 @@ concurrency:
 permissions:
   contents: read
 
-# CodeQL is the sole CI-native exception declared in dev-gate.json. Every
-# OTHER CLI-runnable voting check lives in the committed dev-gate plan -
-# except client-reference-tripwire below, a deliberate SECOND exception:
-# its CI/local halves must run with DIFFERENT semantics (fail-closed vs.
-# fail-open - see scripts/client_reference_tripwire.py's module docstring
-# and scripts/githooks/pre-commit), which does not fit dev-gate's
-# single-command, identical-everywhere model. Flagged for the lead as an
-# open question, not a unilateral call: task #216.
+# Two declared CI-native exceptions live outside the committed dev-gate
+# plan (see docs/DEV-GATE.md); every OTHER CLI-runnable voting check lives
+# there instead. CodeQL is the first, because GitHub owns its analysis
+# runtime. client-reference-tripwire below is the second, confirmed
+# exception (task #216): its CI/local halves must run with DIFFERENT
+# semantics (fail-closed vs. fail-open - see
+# scripts/client_reference_tripwire.py's module docstring and
+# scripts/githooks/pre-commit), which dev-gate's single-command,
+# identical-everywhere model cannot express.
 jobs:
   codeql:
     name: codeql (security-extended)
