@@ -1,7 +1,8 @@
 """#55 slice-1 PR-B item 3: the bundled Java adapter
 (DESIGN-55-comprehension-plane.md, Artifact 2's closed relation vocabulary;
 approved PR-B plan item-3 relation-scope decision, 2026-08-27). Small,
-synthetic fixtures only - not Amperian itself, kept fast and hermetic.
+synthetic fixtures only - not the target client's own codebase itself,
+kept fast and hermetic.
 """
 
 from __future__ import annotations

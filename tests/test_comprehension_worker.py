@@ -803,11 +803,11 @@ def test_process_paths_a_latin1_pom_records_a_problem_not_a_fabricated_coordinat
     tmp_path: Path,
 ) -> None:
     """FIX ROUND 26 (twenty-second cold read, F3 BLOCKER, wrong-data,
-    Amperian-critical, .cr22-enc): round 21's own CR17-4 U+FFFD guard
+    client-corpus-critical, .cr22-enc): round 21's own CR17-4 U+FFFD guard
     existed ONLY on the .java decode site - pom.xml's own decode site
     had none at all, so a Latin-1/CP1252 pom (the default encoding of
-    many pre-Maven-3 European estates - Amperian's own estate among
-    them) published a FABRICATED, truncated coordinate rather than
+    many pre-Maven-3 European estates - the target client's own estate
+    among them) published a FABRICATED, truncated coordinate rather than
     failing visibly. Mirrors the .java control above one producer
     over."""
     (tmp_path / "pom.xml").write_bytes(

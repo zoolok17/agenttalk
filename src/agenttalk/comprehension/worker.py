@@ -416,12 +416,12 @@ def _decode_text_or_flag_undecodable(
     silent, WRONG decode - never raises.
 
     FIX ROUND 26 (twenty-second cold read, F3 BLOCKER, wrong-data,
-    Amperian-critical): round 21's own CR17-4 U+FFFD ``encoding_
+    client-corpus-critical): round 21's own CR17-4 U+FFFD ``encoding_
     undecodable`` guard existed ONLY on the ``.java`` decode site - the
     ``pom.xml``/``web.xml``/xml-root-sniff decode sites all decoded
     ``errors="replace"`` with NO guard at all, so a Latin-1/CP1252 pom
     (the default encoding of many pre-Maven-3 European estates -
-    Amperian's own estate among them) published a FABRICATED coordinate
+    the target client's own estate among them) published a FABRICATED coordinate
     (``com.example:caf�-core``) on a complete/zero-problem run, and
     a UTF-8 sibling's edge to the REAL coordinate published a confident
     ``resolved``/``external`` claim (the registry never saw the
@@ -649,7 +649,7 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
             # points of its own.
             try:
                 # FIX ROUND 26 (twenty-second cold read, F3 BLOCKER,
-                # wrong-data, Amperian-critical): this decode site never
+                # wrong-data, client-corpus-critical): this decode site never
                 # had the U+FFFD guard the .java branch carries - see
                 # `_decode_text_or_flag_undecodable`'s own docstring.
                 text = _decode_text_or_flag_undecodable(data, rel, problems)

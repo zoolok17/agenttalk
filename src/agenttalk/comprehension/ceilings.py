@@ -11,7 +11,7 @@ DESIGN-55-comprehension-plane.md, "Validation tiers and size ceilings":
     normal read path.
 
 These constants are PROVISIONAL per the design's own "Scan behavior"
-section pending a measured Amperian corpus run (PR-B's exit gate) — this
+section pending a measured client-corpus run (PR-B's exit gate) — this
 module enforces whatever the constants say, not a claim that these exact
 numbers are final.
 

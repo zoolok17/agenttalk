@@ -1,5 +1,5 @@
 """The bundled Java adapter (approved PR-B plan, C-5: Java-only this
-slice, sized to Amperian's backend).
+slice, sized to the target client's own backend).
 
 DESIGN-55-comprehension-plane.md, Artifact 2, names the closed slice-1
 relation vocabulary: ``import``, ``include``, ``inherit``, ``invoke``,
