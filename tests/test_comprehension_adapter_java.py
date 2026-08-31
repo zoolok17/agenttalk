@@ -3027,6 +3027,53 @@ def test_web_xml_split_cdata_url_pattern_is_unrecoverable():
     assert entry_points == []
     matching = [p for p in problems if p.reason_code == "route_value_unrecoverable"]
     assert len(matching) == 1
+    # FIX ROUND 24 (twentieth cold read, F3 MINOR, wrong-data): this
+    # refusal's own detail used to hard-code "a <url-pattern> ... contains
+    # an undefined XML entity reference" - a false, DEFINITE claim for
+    # THIS shape, which has no entity in it at all (the same None
+    # return, from a different cause, one hard-coded message). The new
+    # message names entity references as one POSSIBLE cause among
+    # several this producer refuses to guess through, never asserting
+    # this specific value definitely contains one.
+    assert "contains an undefined XML entity reference" not in matching[0].detail
+
+
+def test_web_xml_mixed_content_cdata_url_pattern_is_unrecoverable():
+    """FIX ROUND 24 (twentieth cold read, F2 MAJOR, wrong-data): a CDATA
+    section adjacent to plain text in the SAME value
+    (<url-pattern>/mix<![CDATA[ed]]>/*</url-pattern>, real route
+    /mixed/*) is a THIRD shape neither the wholly-wrapped decode nor the
+    split-section refusal caught - it fell through to the no-'&' early
+    return, publishing the literal CDATA markers verbatim
+    ('/mix<![CDATA[ed]]>/*'). Refused as unrecoverable instead."""
+    web_xml = """<web-app>
+  <servlet-mapping>
+    <servlet-name>smixed</servlet-name>
+    <url-pattern>/mix<![CDATA[ed]]>/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert entry_points == []
+    matching = [p for p in problems if p.reason_code == "route_value_unrecoverable"]
+    assert len(matching) == 1
+    assert not any("<![CDATA[" in e.name for e in entry_points)
+
+
+def test_web_xml_wholly_wrapped_cdata_url_pattern_still_decodes():
+    """Companion control (FIX ROUND 24 F2): a single, WHOLLY-wrapped
+    CDATA value (round 23's own control shape) must stay decoded, not
+    swept into the new mixed-content refusal."""
+    web_xml = """<web-app>
+  <servlet-mapping>
+    <servlet-name>swhole</servlet-name>
+    <url-pattern><![CDATA[/whole]]></url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert {e.name for e in entry_points} == {"/whole"}
+    assert problems == []
 
 
 def test_jax_rs_path_composes_class_and_method_level_like_spring_request_mapping():

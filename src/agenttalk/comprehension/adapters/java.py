@@ -2958,10 +2958,26 @@ def _decode_xml_text(raw: str) -> str | None:
     # text) - the existing `route_value_unrecoverable` honesty already
     # covers "cannot prove this decode is correct" for exactly this
     # class of case (F2's own undefined-entity handling, above).
-    if raw.count("<![CDATA[") > 1:
-        return None
-    cdata_match = _CDATA_WRAPPED_RE.match(raw)
-    if cdata_match is not None:
+    # FIX ROUND 24 (twentieth cold read, F2 MAJOR, wrong-data): MIXED
+    # content - a CDATA section adjacent to plain text in the SAME value
+    # (``/mix<![CDATA[ed]]>/*`` for the real route ``/mixed/*``) is a
+    # THIRD shape neither the wholly-wrapped decode above nor the split-
+    # section refusal caught - ``_CDATA_WRAPPED_RE``'s own ``\A``/``\Z``
+    # anchors correctly refuse to match it (it is not wholly one CDATA
+    # section), so it fell through the OTHER branch instead: no ``&`` in
+    # the raw text, so the literal CDATA markers themselves published
+    # VERBATIM in the route name. Any ``<![CDATA[`` marker anywhere in a
+    # value that does not wholly-wrap it - one section with real
+    # trailing/leading text, or two-or-more sections (23b's own split-
+    # CDATA case) - now refuses the SAME way: correctly reconstituting
+    # mixed content needs the identical per-section unwrap-and-
+    # concatenate pass 23b's own split-CDATA argument already declined
+    # as real complexity for a shape this producer has never seen
+    # splitting ordinary route text in an actual legacy web.xml.
+    if "<![CDATA[" in raw:
+        cdata_match = _CDATA_WRAPPED_RE.match(raw)
+        if cdata_match is None or raw.count("<![CDATA[") > 1:
+            return None
         return cdata_match.group(1)
     if "&" not in raw:
         return raw
@@ -3542,9 +3558,10 @@ def parse_web_xml(
                 problems.append(JavaAdapterProblem(
                     reason_code="route_value_unrecoverable",
                     detail=f"a <url-pattern> declared at line "
-                           f"{_line_at(newline_offsets, absolute_offset)} contains an "
-                           "undefined XML entity reference - suppressed rather than "
-                           "published with a guessed or partial value",
+                           f"{_line_at(newline_offsets, absolute_offset)} contains XML "
+                           "constructs this producer does not decode (an undefined "
+                           "entity reference, or CDATA mixed with other content) - "
+                           "suppressed rather than published with a guessed value",
                     qualified_name=owner_qualified_name,
                 ))
                 continue
@@ -3626,9 +3643,10 @@ def parse_web_xml(
                 problems.append(JavaAdapterProblem(
                     reason_code="route_value_unrecoverable",
                     detail=f"a <url-pattern> declared at line "
-                           f"{_line_at(newline_offsets, absolute_offset)} contains an "
-                           "undefined XML entity reference - suppressed rather than "
-                           "published with a guessed or partial value",
+                           f"{_line_at(newline_offsets, absolute_offset)} contains XML "
+                           "constructs this producer does not decode (an undefined "
+                           "entity reference, or CDATA mixed with other content) - "
+                           "suppressed rather than published with a guessed value",
                     qualified_name=owner_qualified_name,
                 ))
                 continue
