@@ -3729,7 +3729,10 @@ public class OrderResource {
 """
     result = java.parse_java_source("OrderResource.java", src)
     routes = _edges(result, "route")
-    assert [r.target for r in routes] == ["/orders/{id}"]
+    # FIX ROUND 32 (F2 BLOCKER): get()'s own @GET now folds into the
+    # published target - this route was never bare "/orders/{id}", it
+    # just used to publish as if it were (see that fix).
+    assert [r.target for r in routes] == ["GET /orders/{id}"]
     problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
     assert problem.qualified_name == "p.OrderResource"
 

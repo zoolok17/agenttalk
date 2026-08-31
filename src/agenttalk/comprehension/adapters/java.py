@@ -764,6 +764,59 @@ def _stack_gap_is_only_whitespace_and_modifiers(gap: str) -> bool:
     return not _MODIFIER_KEYWORD_RE.sub("", gap).strip()
 
 
+def _jax_rs_verb_by_path_annotation_start(sanitized: str) -> dict[int, str]:
+    """FIX ROUND 32 (twenty-eighth cold read, F2 BLOCKER, wrong-data): JAX-RS
+    spells its verb as a SEPARATE annotation from its route (@GET/@POST/
+    @DELETE beside, never fused into, a method-level @Path) - unlike
+    Spring's own ``*Mapping`` family, whose name already implies the verb
+    (see ``_ROUTE_METHOD_BY_ANNOTATION``). The main route-composition loop
+    only ever consulted THAT map, so two JAX-RS methods sharing one @Path
+    but differing only by verb (``@GET`` vs ``@POST``, the reader's own
+    ``InvoiceResource`` shape) composed the identical ``target`` string and
+    collapsed into ONE published entry point, silently losing that they
+    are two different handlers - exactly the M-5/N2 shape
+    ``_ROUTE_METHOD_BY_ANNOTATION`` already exists to prevent for Spring,
+    never extended to this sibling-annotation family.
+
+    Reuses the IDENTICAL contiguous-annotation-stack grouping already
+    established for the round-18 orphaned-verb-marker check (tolerating an
+    intervening unrelated annotation like ``@Produces`` or an interleaved
+    modifier keyword, in either order) - the inverse direction: given a
+    method-level @Path's own annotation start position, is there a JAX-RS
+    verb designator anywhere in ITS OWN stack? Returns a map from every
+    annotation's start position to the single verb name found in its stack
+    (omitted entirely when there is none) - a caller looks up its own
+    @Path match's ``.start()`` in this map.
+
+    A bare @Path method with NO sibling verb marker anywhere in its stack
+    is JAX-RS's own sub-resource-locator idiom (a method that returns a
+    FURTHER resource, not itself a request handler) - genuinely a
+    different shape, not merely "verb unknown," so it deliberately keeps
+    its bare-path name (same fallback Spring's own bare @RequestMapping
+    already gets) rather than guessing a verb for it.
+    """
+    stack_id_by_start: dict[int, int] = {}
+    verb_by_stack: dict[int, str] = {}
+    current_stack_id = -1
+    previous_span_end: int | None = None
+    for ann_match in _ANY_ANNOTATION_RE.finditer(sanitized):
+        span_end = _skip_optional_annotation_args(sanitized, ann_match.end())
+        if previous_span_end is None or not _stack_gap_is_only_whitespace_and_modifiers(
+            sanitized[previous_span_end:ann_match.start()],
+        ):
+            current_stack_id += 1
+        stack_id_by_start[ann_match.start()] = current_stack_id
+        name = ann_match.group(1)
+        if name in _JAX_RS_VERB_ANNOTATIONS and current_stack_id not in verb_by_stack:
+            verb_by_stack[current_stack_id] = name
+        previous_span_end = span_end if previous_span_end is None else max(previous_span_end, span_end)
+    return {
+        start: verb_by_stack[stack_id]
+        for start, stack_id in stack_id_by_start.items()
+        if stack_id in verb_by_stack
+    }
+
+
 def _route_annotation_targets_a_method(sanitized: str, span_end: int) -> bool:
     """FIX ROUND 20 (sixteenth cold read, m1 MINOR, wrong-data): a route
     annotation is only ever legal (JAX-RS/Spring) on a METHOD - never a
@@ -2310,6 +2363,9 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     # down) - checked against jax_rs_path_classes afterward to find a
     # @Path-carrying class that composed to nothing at all.
     classes_with_route_entry_points: set[str] = set()
+    # FIX ROUND 32 (F2 BLOCKER): computed once, outside the loop below -
+    # see _jax_rs_verb_by_path_annotation_start's own docstring.
+    jax_rs_stack_verb_by_annotation_start = _jax_rs_verb_by_path_annotation_start(sanitized)
     for match in _ROUTE_ANNOTATION_RE.finditer(sanitized):
         line = _line_at(newline_offsets, match.start())
         enclosing = _enclosing_qualified_name(match.start(), types, primary_qualified)
@@ -2430,6 +2486,13 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         # combination (path x method) is now its own entry point, the
         # multi-entry-point machinery already existing for this fan-out.
         verb = _ROUTE_METHOD_BY_ANNOTATION.get(match.group(1))
+        if verb is None and match.group(1) == "Path":
+            # FIX ROUND 32 (F2 BLOCKER, wrong-data): JAX-RS's own verb
+            # designator is a SEPARATE sibling annotation, never fused
+            # into "Path" the way Spring's *Mapping family fuses its own
+            # verb into its annotation name - see
+            # _jax_rs_verb_by_path_annotation_start's own docstring.
+            verb = jax_rs_stack_verb_by_annotation_start.get(match.start())
         methods: list[str | None] = [verb] if verb else (explicit_methods or [None])
         if composed:
             targets = [
