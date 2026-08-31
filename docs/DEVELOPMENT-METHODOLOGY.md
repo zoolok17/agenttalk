@@ -205,8 +205,13 @@ something. The pipeline:
   every officially supported combination of operating system and language/runtime
   version the project claims to support (a multi-OS, multi-version matrix, not a
   single representative leg);
-- runs static analysis, dependency/vulnerability scanning, and secret-scanning as
-  voting checks, not advisory ones;
+- runs static analysis, dependency/vulnerability scanning, and secret-scanning on
+  every change, with the target that every one of them **votes** on the merge
+  decision rather than merely logging a finding for someone to read later. Where a
+  scanner was adopted before that wiring was complete, any of its findings that do
+  not yet gate the merge are named as an open carry-ledger item (§7) with an owner
+  and a target date — never silently treated as passing just because the job's exit
+  code was green;
 - has no local escape hatch: a check that can be skipped with a flag is not a gate,
   it is a suggestion;
 - treats an individual matrix leg's pass as incomplete evidence on its own — only the
