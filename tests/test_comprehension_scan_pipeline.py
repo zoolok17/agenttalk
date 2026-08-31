@@ -2497,7 +2497,16 @@ def test_run_scan_two_servlets_mapped_to_the_same_url_pattern_publishes_a_proble
     records a duplicate_route_target problem naming both owners; both
     servlets keep their own otherwise-unambiguous, unaffected readiness
     (this is a route-target collision, never a descriptor-name
-    conflict - neither servlet gets a conflict_id)."""
+    conflict - neither servlet gets a conflict_id).
+
+    FIX ROUND 32 (twenty-eighth cold read, F7 LOW, JUDGE - taken,
+    CORRECTION): round 31's own claim that this flips the run to
+    DEGRADED is corrected here - duplicate_route_target is a fact ABOUT
+    well-parsed descriptor content, matching none of the design's three
+    degradation conditions (a parse failure, an evidence gap, or a
+    resource cap). Recorded, non-degrading now, the same bucket
+    `binary_excluded_root_sniffed_xml` (round 26b) already established
+    for the identical shape of claim."""
     import json
 
     web_dir = java_repo / "src" / "main" / "java" / "com" / "acme" / "web"
@@ -2530,7 +2539,7 @@ def test_run_scan_two_servlets_mapped_to_the_same_url_pattern_publishes_a_proble
     )
 
     outcome = scan_pipeline.run_scan(java_repo)
-    assert outcome.status == "degraded"
+    assert outcome.status == "complete"
 
     problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
     matching = [p for p in problems_doc["problems"] if p["reason_code"] == "duplicate_route_target"]
@@ -2612,7 +2621,11 @@ def test_run_scan_two_servlet_names_backed_by_the_same_class_mapped_to_one_patte
     ONE owner (keyed on the resolved CLASS) and publish zero problems -
     contradicting this check's own "2+ different servlets" claim. Now
     keyed on the (name, class) pair, so two distinct names always count
-    as two, regardless of what class either resolves to."""
+    as two, regardless of what class either resolves to.
+
+    FIX ROUND 32 (F7 LOW, JUDGE - taken): duplicate_route_target is
+    recorded, non-degrading (see that fix's own reasoning) - status
+    stays complete."""
     import json
 
     web_dir = java_repo / "src" / "main" / "java" / "com" / "acme" / "web"
@@ -2643,7 +2656,7 @@ def test_run_scan_two_servlet_names_backed_by_the_same_class_mapped_to_one_patte
     )
 
     outcome = scan_pipeline.run_scan(java_repo)
-    assert outcome.status == "degraded"
+    assert outcome.status == "complete"
 
     problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
     matching = [p for p in problems_doc["problems"] if p["reason_code"] == "duplicate_route_target"]
