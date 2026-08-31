@@ -231,25 +231,27 @@ spots.
 
 ## Evidence provenance and limits
 
-The original `jaws-legacy/docs/dryrun/RETRO.md` is referenced but is absent from
-this clone and its reachable history at the research cut. Rev 2 therefore separates
-four evidence categories instead of describing all requirements as JAWS field facts.
+The original dogfood target repo's `docs/dryrun/RETRO.md` is referenced but is
+absent from this clone and its reachable history at the research cut. Rev 2
+therefore separates four evidence categories instead of describing all
+requirements as dogfood-target field facts.
 
 | Provenance | What it supports | What it does not support |
 | --- | --- | --- |
 | Checked-in agenttalk code and policy at `abc1c6e` | Existing local-store, onboarding, wrapper, console, and reset contracts; product privacy and workflow constraints. | Claims about a client legacy repository's languages, components, or business flows. |
 | [DESIGN #201](DESIGN-201-wrapper-owned-reply-delivery.md) and [DESIGN #202](DESIGN-202-interruption-aware-redelivery.md) | A checked-in account of agenttalk wrapper delivery/redelivery failures and the mechanisms proposed to address them. | Direct evidence that a static client-code extractor needs runtime, state, or fleet entities in slice 1. Requirements extrapolated from these designs are later-slice target architecture. |
 | Pinned external prior art | Candidate schemas, adapters, and query shapes worth testing. | Evidence that an upstream tool satisfies agenttalk's privacy, correctness, scale, or platform contract. |
-| Missing JAWS Plateau 1 retrospective | Nothing normative yet. | Application-specific entity/relation sufficiency, language coverage, business-flow coverage, or a claim that the target architecture reconstructs the JAWS domain map. |
+| Missing dogfood migration Plateau 1 retrospective | Nothing normative yet. | Application-specific entity/relation sufficiency, language coverage, business-flow coverage, or a claim that the target architecture reconstructs the dogfood target's domain map. |
 
 The checked-in proxy evidence still motivates later work: the recorded failures crossed
 configuration, runtime mode, persisted state, retry/cleanup, test reachability, and
 fleet capability boundaries. That is an extrapolation from agenttalk's own runtime,
-not a finding from static analysis of JAWS client source. Rev 2 preserves those needs
-as slices 2–4 and does not use them to enlarge slice 1.
+not a finding from static analysis of the dogfood target's source. Rev 2 preserves
+those needs as slices 2–4 and does not use them to enlarge slice 1.
 
-Until the original retrospective is obtained, the design MUST describe any JAWS-
-specific language, framework, component, and business-flow coverage as unknown. The
+Until the original retrospective is obtained, the design MUST describe any
+dogfood-target-specific language, framework, component, and business-flow coverage
+as unknown. The
 later requirements below are hypotheses to validate against that record, not proof that
 the named vocabulary is sufficient.
 
@@ -258,7 +260,7 @@ the named vocabulary is sufficient.
 | Checked-in agenttalk product/workflow constraints | R-01 through R-09, R-21, R-22, and R-23a. |
 | Pinned prior-art mechanisms reconciled to the companion S1 design | R-10a, R-11a, R-12a, R-15a, R-17a, and R-24. |
 | Extrapolated from agenttalk's #201/#202 runtime failures; later target only | R-10b, R-11b/c, R-12b, R-13, R-14, R-15b, R-16, R-17b, R-18 through R-20, and R-23b. |
-| Deferred until the missing JAWS retrospective is obtained | Any assertion that the entity/relation vocabulary, adapter language set, or coverage criteria are sufficient for the JAWS application/domain. |
+| Deferred until the missing dogfood migration retrospective is obtained | Any assertion that the entity/relation vocabulary, adapter language set, or coverage criteria are sufficient for the dogfood target's application/domain. |
 
 ## Delivery slices and normative meaning
 
@@ -360,7 +362,7 @@ paths, available ranges/symbol pointers, and source digests.
 symbol/type/callable, configuration key, build target, test, and documentation/decision
 entities. S3 adds persisted record, runtime process instance, state, and event entities.
 There is no S1 producer for these types; S1 reports their absence as unsupported or
-unknown. JAWS-specific sufficiency remains deferred until its retrospective is obtained.
+unknown. Dogfood-target-specific sufficiency remains deferred until its retrospective is obtained.
 
 **R-11a — Static direct relations [S1, companion-design producer].** S1 MUST retain
 the companion design's closed direct relation set: `import`, `include`, `inherit`,
@@ -440,7 +442,7 @@ freshness. No S1 delta producer exists.
 **R-19 — Lifecycle/state-machine queries [S3 later, extrapolated].** For retrying or
 persisted workflows, S3 MUST answer how state is entered, recorded, observed, retried,
 cleaned, and exited; list cycles and terminal states; and identify states with no proven
-escape. This target comes from agenttalk's #202 failure class, not static JAWS evidence.
+escape. This target comes from agenttalk's #202 failure class, not static dogfood-target evidence.
 
 **R-20 — Counterexample evaluation [S4 later, extrapolated].** S4 SHOULD evaluate
 proposed conditions and invariants over checked-in defaults and captured S3
@@ -542,7 +544,7 @@ produces them.
 
 ## Residual risks and open questions
 
-1. **Original field record:** obtain the JAWS Plateau 1 retrospective before claiming
+1. **Original field record:** obtain the dogfood migration's Plateau 1 retrospective before claiming
    application-specific requirements. The S2–S4 extrapolations may change or be removed
    when that evidence is available.
 2. **Production network isolation:** S1 has a test-time network-deny harness and a

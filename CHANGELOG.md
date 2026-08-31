@@ -5,6 +5,8 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+[2026-08-31: client references genericized; entries otherwise unchanged]
+
 ## [Unreleased]
 
 ## [0.86.0] - 2026-08-26
@@ -46,8 +48,8 @@ Theme: **the console tells the truth about risk — and the comprehension plane 
 
 Theme: **seat reliability — a wrapped seat fails loudly, recovers honestly.**
 
-Field basis: the v0.84.0 two-seat live smoke plus the JAWS retrospective's
-remaining seat-reliability findings (#202/#204/#205).
+Field basis: the v0.84.0 two-seat live smoke plus the dogfood migration's
+retrospective's remaining seat-reliability findings (#202/#204/#205).
 
 ### Added
 
@@ -93,7 +95,7 @@ remaining seat-reliability findings (#202/#204/#205).
 
 Theme: **every seat can answer — wrapper-owned reply delivery.**
 
-Field basis: the JAWS migration dry-run retrospective. A claude-wrapped seat
+Field basis: the dogfood migration's dry-run retrospective. A claude-wrapped seat
 could not deliver a bus reply in 5 of 5 work turns — its harness statically
 rejected the prescribed reply command and approval-gated every literal
 respelling, so finished answers dead-lettered into files indistinguishable on
