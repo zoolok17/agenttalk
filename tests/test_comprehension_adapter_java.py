@@ -3163,6 +3163,151 @@ def test_an_undecodable_servlet_class_is_flagged_not_silently_misattributed():
     assert any(p.qualified_name == "WEB-INF/web.xml#admin" for p in matching)
 
 
+# --------------------------------------------------- fix round 25 F1+F2+F3 (CDATA invisible to structural XML)
+
+_POM_DESCRIPTION_MATRIX = [
+    ("A_no_description", ""),
+    ("B_plain_text", "<description>Plain text, no markup at all.</description>"),
+    ("C_balanced_tag", "<description><![CDATA[some <b>bold</b> text]]></description>"),
+    ("D_unbalanced_br", "<description><![CDATA[some text <br> more text]]></description>"),
+    ("E_unbalanced_p", "<description><![CDATA[some text <p> more text]]></description>"),
+    ("F_self_closing_br", "<description><![CDATA[some text <br/> more text]]></description>"),
+]
+
+
+@pytest.mark.parametrize("case_name,description_xml", _POM_DESCRIPTION_MATRIX)
+def test_pom_description_cdata_never_corrupts_the_tag_stack(case_name, description_xml):
+    """FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE, F1 BLOCKER,
+    .cr21-pomcdata, wrong-data): the STRUCTURAL XML layer
+    (_XML_TAG_RE/_enclosing_tag_stack) never blanked CDATA - a pom's own
+    <description> CDATA containing an unbalanced HTML tag (<br> - common
+    in legacy pom descriptions) permanently corrupted the tag stack
+    (push with no pop), so every subsequent gate testing ==["project"]
+    failed: both real dependencies vanished and <modules> vanished (the
+    reactor backstop silently disabled). The reader's own 6-case
+    mutation matrix: A/B/C/F are all fine even before this fix (no
+    unbalanced tag to corrupt anything); D and E are the ones that
+    actually reproduce the corruption. All six must publish identically
+    correctly after this fix - the fix must not merely dodge the two
+    failing cases, it must make the mechanism itself CDATA-blind."""
+    pom = f"""<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <packaging>pom</packaging>
+  {description_xml}
+  <dependencies>
+    <dependency><groupId>org.a</groupId><artifactId>a</artifactId></dependency>
+    <dependency><groupId>org.b</groupId><artifactId>b</artifactId></dependency>
+  </dependencies>
+  <modules>
+    <module>core</module>
+  </modules>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.a:a", "org.b:b"}, case_name
+    assert java.declared_reactor_module_paths(pom) == ["core"], case_name
+
+
+def test_pom_description_cdata_c_style_snippet_never_pushes_a_phantom_tag():
+    """FIX ROUND 25 (F1 BLOCKER): a C-style code snippet in CDATA
+    (``i<n;i++``) reads as an unclosed ``<n`` tag to a naive scanner -
+    the same phantom-tag-push corruption as the HTML case, a different
+    real-world source (a pom documenting a code example)."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <description><![CDATA[for (int i = 0; i<n; i++) { doWork(i); }]]></description>
+  <dependencies>
+    <dependency><groupId>org.a</groupId><artifactId>a</artifactId></dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.a:a"}
+
+
+def test_pom_description_cdata_does_not_hide_the_pom_s_own_coordinate():
+    """FIX ROUND 25 (F1 BLOCKER, .cr21-pomcdata): the reader verified
+    BOTH element orderings - Maven's own conventional order registers
+    the project coordinate BEFORE the description, which is why round
+    24's own F1b positive-evidence gate stayed silent over this bug (a
+    real coordinate WAS registered) - but a corrupted tag stack still
+    hides everything textually AFTER the description (dependencies,
+    modules), which is the actual, measured defect."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <description><![CDATA[some text <br> more text]]></description>
+  <dependencies>
+    <dependency><groupId>org.a</groupId><artifactId>a</artifactId></dependency>
+  </dependencies>
+</project>
+"""
+    units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {u.qualified_name for u in units} == {"com.acme:root"}
+    assert {e.target for e in edges} == {"org.a:a"}
+
+
+def test_web_xml_description_cdata_does_not_fabricate_a_route():
+    """FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE, F2 BLOCKER,
+    .cr21-webinj, wrong-data): a web.xml <description> CDATA that
+    DOCUMENTS a long-removed mapping (a real, common shape - "this used
+    to map /legacy/* to LegacyServlet") published it as a LIVE route -
+    a fabricated entry point, since the structural block regexes never
+    understood CDATA and matched the documented example text as if it
+    were real markup."""
+    web_xml = """<web-app>
+  <description><![CDATA[
+    This app used to have:
+    <servlet-mapping>
+      <servlet-name>legacy</servlet-name>
+      <url-pattern>/legacy/*</url-pattern>
+    </servlet-mapping>
+    but that servlet was removed in 2019.
+  ]]></description>
+  <servlet-mapping>
+    <servlet-name>real</servlet-name>
+    <url-pattern>/real/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    names = {e.name for e in entry_points}
+    assert "/legacy/*" not in names
+    assert names == {"/real/*"}
+
+
+def test_pom_description_cdata_does_not_fabricate_a_dependency_edge():
+    """FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE, F3 MAJOR,
+    .cr21-pominj, lower field realism but the threat model says scanned
+    content is untrusted): a pom <description> CDATA containing a
+    LITERAL, premature "</description>" closing tag (still perfectly
+    inert CDATA text - the section has not reached its own real "]]>"
+    yet) makes a naive, CDATA-blind tag-stack scanner pop "description"
+    off the stack early, so the injected markup that follows (still
+    textually INSIDE the CDATA) reads as sitting directly at
+    ["project"] level once the stack is corrupted - publishing a
+    fabricated resolved dependency edge for content that was never
+    really declared anywhere in the document."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <description><![CDATA[
+    </description>
+    <dependencies>
+      <dependency><groupId>com.fake</groupId><artifactId>injected</artifactId></dependency>
+    </dependencies>
+  ]]></description>
+  <dependencies>
+    <dependency><groupId>org.real</groupId><artifactId>real-lib</artifactId></dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.real:real-lib"}
+
+
 def test_jax_rs_path_composes_class_and_method_level_like_spring_request_mapping():
     """FIX ROUND 17 (CR13-3 MAJOR, part (a)): JAX-RS's own @Path composes
     EXACTLY like a plain @RequestMapping already does - a class-level

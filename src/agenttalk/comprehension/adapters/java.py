@@ -2779,6 +2779,37 @@ def _strip_xml_comments(text: str) -> str:
     return _XML_COMMENT_RE.sub(_blank, text)
 
 
+_CDATA_SECTION_RE = re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL)
+
+
+def _blank_cdata_sections(text: str) -> str:
+    """Blanks EVERY ``<![CDATA[...]]>`` section - markers included - with
+    spaces while preserving every newline and the overall length/offsets,
+    the exact same idiom ``_strip_xml_comments`` already uses for XML
+    comments.
+
+    FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE, F1+F2+F3,
+    wrong-data): every STRUCTURAL scan in this file (``_XML_TAG_RE``/
+    ``_enclosing_tag_stack``, and every ``_structural_block_pattern``-
+    based container regex) treated CDATA content as ordinary markup -
+    CDATA exists PRECISELY so arbitrary text (including text that looks
+    like XML) is never parsed as markup, and this producer's own coarse,
+    non-CDATA-aware scanners violated that on a legacy pom's own
+    ``<description>`` (a common home for HTML snippets - an unbalanced
+    ``<br>`` permanently corrupts the tag-stack's own push/pop tracking
+    for every position AFTER it) or a web.xml ``<description>``
+    documenting a long-removed mapping (published as a live, fabricated
+    entry point). This blanks CDATA content for STRUCTURAL scanning
+    ONLY - the caller must still recover the RAW text (CDATA markers
+    intact) from the ORIGINAL comment-stripped string, by OFFSET, for
+    any leaf value that needs ``_decode_xml_text`` - never call
+    ``.group()`` on a match found against this blanked string when the
+    matched TEXT (not just its position) is needed."""
+    def _blank(match: re.Match) -> str:
+        return "".join(c if c == "\n" else " " for c in match.group(0))
+    return _CDATA_SECTION_RE.sub(_blank, text)
+
+
 #: FIX ROUND 14b (reviewer-3's ratified CR10-5 split): the first element
 #: tag after comments/prolog/doctype - deliberately NOT a real XML parser
 #: (coarse S1 evidence, matching this whole adapter's own bar). Requires
@@ -3100,7 +3131,7 @@ def _enclosing_tag_stack(sanitized: str, before: int) -> list[str]:
     return stack
 
 
-def _module_own_dependency_blocks(sanitized: str) -> list[re.Match]:
+def _module_own_dependency_blocks(structural: str) -> list[re.Match]:
     """M1 (seventh cold read BLOCKER, wrong-data): ``parse_maven_pom``
     used to match every ``<dependency>`` block ANYWHERE in the file -
     ``<dependencyManagement>`` (transitive/BOM-style declarations, NOT
@@ -3124,12 +3155,21 @@ def _module_own_dependency_blocks(sanitized: str) -> list[re.Match]:
     dependencies are conditionally active; a plugin's dependencies are
     the BUILD TOOL's own, not the module's), and inventing a phase/marker
     for them would imply a supported, evidenced distinction this slice
-    does not actually make. Honest v1: excluded, named here."""
-    for deps_match in _DEPENDENCIES_ELEMENT_RE.finditer(sanitized):
-        if _enclosing_tag_stack(sanitized, deps_match.start()) != ["project"]:
+    does not actually make. Honest v1: excluded, named here.
+
+    FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE): takes the
+    CDATA-blanked ``structural`` string, never the raw one - a
+    ``<description>``'s own CDATA content must never be scanned for
+    ``<dependencies>``/``<dependency>`` boundaries or feed the tag-stack.
+    The yielded match OFFSETS are valid against the ORIGINAL comment-
+    stripped string too (blanking preserves length) - the caller must
+    recover any VALUE text by slicing that original string, never via
+    ``.group()`` on these matches."""
+    for deps_match in _DEPENDENCIES_ELEMENT_RE.finditer(structural):
+        if _enclosing_tag_stack(structural, deps_match.start()) != ["project"]:
             continue
         yield from _DEPENDENCY_BLOCK_RE.finditer(
-            sanitized, deps_match.start(1), deps_match.end(1))
+            structural, deps_match.start(1), deps_match.end(1))
 
 
 def declared_reactor_module_paths(text: str) -> list[str]:
@@ -3154,16 +3194,26 @@ def declared_reactor_module_paths(text: str) -> list[str]:
     against the pom's own directory and cross-referencing them against
     this run's excluded regions is scan_pipeline.py's own job, which has
     discovery's own excluded-root paths available; this producer,
-    called from inside the sanitized worker, does not."""
+    called from inside the sanitized worker, does not.
+
+    FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE): the
+    ``<modules>`` boundary and its own tag-stack scoping check now scan
+    the CDATA-blanked ``structural`` string, never the raw one - a
+    ``<description>``'s own CDATA content must never feed either. Each
+    ``<module>``'s own VALUE is recovered from the ORIGINAL comment-
+    stripped string by offset (blanking preserves length), never via
+    ``.group()`` on a match found against the blanked string."""
     sanitized = _strip_xml_comments(text)
+    structural = _blank_cdata_sections(sanitized)
     paths: list[str] = []
-    for modules_match in _MODULES_ELEMENT_RE.finditer(sanitized):
-        if _enclosing_tag_stack(sanitized, modules_match.start()) != ["project"]:
+    for modules_match in _MODULES_ELEMENT_RE.finditer(structural):
+        if _enclosing_tag_stack(structural, modules_match.start()) != ["project"]:
             continue
         for module_match in _MODULE_RE.finditer(
-            sanitized, modules_match.start(1), modules_match.end(1),
+            structural, modules_match.start(1), modules_match.end(1),
         ):
-            paths.append(_bounded_route_target(module_match.group(1).strip()))
+            raw_value = sanitized[module_match.start(1):module_match.end(1)]
+            paths.append(_bounded_route_target(raw_value.strip()))
     return paths
 
 
@@ -3190,12 +3240,20 @@ def pom_dependency_decode_problems(text: str) -> list[int]:
     block whose own groupId or artifactId element is PRESENT but could
     not be decoded - never one that is simply absent (that is the
     existing, unchanged, silent-and-legitimate "malformed dependency"
-    case ``parse_maven_pom`` itself already handles by omission)."""
+    case ``parse_maven_pom`` itself already handles by omission).
+
+    FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE): the
+    dependency block's own BOUNDARY is found against the CDATA-blanked
+    ``structural`` string; its own VALUE (recovered from the original,
+    CDATA-preserving ``sanitized`` string by offset) is what the leaf
+    regexes below actually search - never the reverse, or a CDATA-
+    wrapped groupId/artifactId could never be found at all."""
     sanitized = _strip_xml_comments(text)
+    structural = _blank_cdata_sections(sanitized)
     newline_offsets = _newline_offsets(sanitized)
     lines: list[int] = []
-    for match in _module_own_dependency_blocks(sanitized):
-        block = match.group(1)
+    for match in _module_own_dependency_blocks(structural):
+        block = sanitized[match.start(1):match.end(1)]
         group_match = _DEPENDENCY_GROUP_ID_RE.search(block)
         artifact_match = _DEPENDENCY_ARTIFACT_ID_RE.search(block)
         group_undecodable = (
@@ -3207,7 +3265,7 @@ def pom_dependency_decode_problems(text: str) -> list[int]:
     return lines
 
 
-def _count_profile_scoped_dependencies(sanitized: str) -> int:
+def _count_profile_scoped_dependencies(structural: str) -> int:
     """Round 11c (reviewer-3 delta on round 11b, VEHICLE CHANGE): every
     ``<dependency>`` block inside a ``<profile>``'s own ``<dependencies>``
     element, counted. Round 11's own M1 fix excludes profile-scoped
@@ -3224,28 +3282,45 @@ def _count_profile_scoped_dependencies(sanitized: str) -> int:
     "degraded" means by putting both in the same bucket. Surfaced
     instead as a named exclusion COUNT (the same idiom
     ``scan.json``'s own ``exclusions`` map already uses for discovery-
-    level categories) - visible without touching run status at all."""
+    level categories) - visible without touching run status at all.
+
+    FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE): takes the
+    CDATA-blanked ``structural`` string - a pure count, no value ever
+    recovered, so there is nothing to slice back from the original."""
     count = 0
-    for deps_match in _DEPENDENCIES_ELEMENT_RE.finditer(sanitized):
-        if _enclosing_tag_stack(sanitized, deps_match.start()) != ["project", "profiles", "profile"]:
+    for deps_match in _DEPENDENCIES_ELEMENT_RE.finditer(structural):
+        if _enclosing_tag_stack(structural, deps_match.start()) != ["project", "profiles", "profile"]:
             continue
         count += sum(
             1 for _ in _DEPENDENCY_BLOCK_RE.finditer(
-                sanitized, deps_match.start(1), deps_match.end(1))
+                structural, deps_match.start(1), deps_match.end(1))
         )
     return count
 
 
-def _own_and_parent_group_ids(sanitized: str) -> tuple[str | None, str | None]:
+def _own_and_parent_group_ids(
+    sanitized: str, structural: str,
+) -> tuple[str | None, str | None]:
     """FIX ROUND 19 (fifteenth cold read, F2 MAJOR): the project-level and
     ``<parent>``-block groupId scan :func:`_project_own_coordinate`
     already performs, factored out so ``parse_maven_pom``'s own
     ``${project.groupId}``/``${project.parent.groupId}`` self-referential
     property expansion (see its own docstring) can reuse the identical
-    parse without a second, separately-maintained walk."""
+    parse without a second, separately-maintained walk.
+
+    FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE): the tag-stack
+    CONTEXT check now runs against the CDATA-blanked ``structural``
+    string - a ``<description>``'s own CDATA content (an unbalanced HTML
+    tag is a common, real shape) must never corrupt the push/pop stack
+    for every position after it. The leaf regex itself still scans the
+    raw ``sanitized`` string (it must, to find a CDATA-wrapped groupId
+    at all) - a groupId TEXT that happens to live inside some OTHER
+    element's own CDATA content is still correctly rejected by the stack
+    check, since blanking never removes the real, non-CDATA tags
+    (``<description>`` itself) surrounding that CDATA span."""
     group_id = parent_group_id = None
     for match in _DEPENDENCY_GROUP_ID_RE.finditer(sanitized):
-        stack = _enclosing_tag_stack(sanitized, match.start())
+        stack = _enclosing_tag_stack(structural, match.start())
         if stack == ["project"]:
             group_id = _bounded_route_target(match.group(1).strip())
             break
@@ -3254,7 +3329,7 @@ def _own_and_parent_group_ids(sanitized: str) -> tuple[str | None, str | None]:
     return group_id, parent_group_id
 
 
-def _project_own_coordinate(sanitized: str) -> tuple[str, str] | None:
+def _project_own_coordinate(sanitized: str, structural: str) -> tuple[str, str] | None:
     """FIX ROUND 17 (thirteenth cold read, CR13-4 MAJOR, wrong-data):
     this pom's OWN ``groupId:artifactId`` identity - a direct child of
     ``<project>``, never one nested inside ``<parent>``/``<dependency>``/
@@ -3292,13 +3367,18 @@ def _project_own_coordinate(sanitized: str) -> tuple[str, str] | None:
     inheritance walk. Such a module's own identity then stays
     unregistered, so a sibling depending on it via that (further)
     inherited groupId still resolves ``unresolved`` - never a false
-    internal claim, but not resolved either."""
-    group_id, parent_group_id = _own_and_parent_group_ids(sanitized)
+    internal claim, but not resolved either.
+
+    FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE): both tag-
+    stack context checks now run against the CDATA-blanked
+    ``structural`` string - see ``_own_and_parent_group_ids``'s own
+    docstring for why."""
+    group_id, parent_group_id = _own_and_parent_group_ids(sanitized, structural)
     if group_id is None:
         group_id = parent_group_id
     artifact_id = None
     for match in _DEPENDENCY_ARTIFACT_ID_RE.finditer(sanitized):
-        if _enclosing_tag_stack(sanitized, match.start()) == ["project"]:
+        if _enclosing_tag_stack(structural, match.start()) == ["project"]:
             artifact_id = _bounded_route_target(match.group(1).strip())
             break
     if group_id is None or artifact_id is None:
@@ -3349,9 +3429,20 @@ def parse_maven_pom(
     already gets, never a hardcoded external guess."""
     from_name = relative_path
     sanitized = _strip_xml_comments(text)
+    # FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE, F1+F3,
+    # wrong-data): the STRUCTURAL layer (tag-stack, every container
+    # boundary regex below) scans this CDATA-blanked string instead of
+    # `sanitized` - a <description>'s own CDATA content (an unbalanced
+    # HTML tag is a common, real legacy-pom shape) must never corrupt
+    # the tag-stack or be mistaken for real markup. `sanitized` itself
+    # is kept, unchanged, as the source every VALUE is recovered from
+    # (by offset - blanking preserves length) once a match's own
+    # position is known - the leaf decode battery still needs the RAW
+    # CDATA markers intact.
+    structural = _blank_cdata_sections(sanitized)
     newline_offsets = _newline_offsets(sanitized)
     units: list[JavaUnitClaim] = []
-    own_coordinate = _project_own_coordinate(sanitized)
+    own_coordinate = _project_own_coordinate(sanitized, structural)
     if own_coordinate is not None:
         own_group_id, own_artifact_id = own_coordinate
         units.append(JavaUnitClaim(
@@ -3377,7 +3468,7 @@ def parse_maven_pom(
     # HARD RULE below (dependencies_artifact._classify_registry_miss)
     # ensures an unexpanded ``${`` can never satisfy the positive-
     # grounds external test regardless.
-    own_project_group_id, parent_group_id = _own_and_parent_group_ids(sanitized)
+    own_project_group_id, parent_group_id = _own_and_parent_group_ids(sanitized, structural)
     effective_own_group_id = (
         own_project_group_id if own_project_group_id is not None else parent_group_id
     )
@@ -3390,8 +3481,8 @@ def parse_maven_pom(
         return value
 
     edges = []
-    for match in _module_own_dependency_blocks(sanitized):
-        block = match.group(1)
+    for match in _module_own_dependency_blocks(structural):
+        block = sanitized[match.start(1):match.end(1)]
         group_match = _DEPENDENCY_GROUP_ID_RE.search(block)
         artifact_match = _DEPENDENCY_ARTIFACT_ID_RE.search(block)
         if group_match is None or artifact_match is None:
@@ -3432,7 +3523,7 @@ def parse_maven_pom(
             evidence_class="declared", line=_line_at(newline_offsets, match.start()), phase=phase,
             optional=optional,
         ))
-    return units, edges, _count_profile_scoped_dependencies(sanitized)
+    return units, edges, _count_profile_scoped_dependencies(structural)
 
 
 #: FIX ROUND 15 (eleventh cold read, F1 MAJOR, wrong-data): a single
@@ -3483,7 +3574,7 @@ _LOAD_ON_STARTUP_RE = _leaf_presence_pattern("load-on-startup")
 
 
 def _servlet_class_by_name(
-    sanitized: str,
+    sanitized: str, structural: str,
 ) -> tuple[dict[str, str], list[tuple[str, int]]]:
     """FIX ROUND 17 (thirteenth cold read, CR13-2 MAJOR, wrong-data):
     web.xml's own ``<servlet>`` element (``<servlet-name>``/
@@ -3507,11 +3598,17 @@ def _servlet_class_by_name(
     ``(mapping, undecodable)`` - the second list names every servlet
     whose own class element was present but could not be decoded, each
     paired with its ``<servlet>`` block's own start offset for the
-    caller's line-number lookup."""
+    caller's line-number lookup.
+
+    FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE, F2): the
+    ``<servlet>`` boundary itself is now found against the CDATA-blanked
+    ``structural`` string - a ``<description>`` documenting a long-
+    removed servlet must never be mistaken for a live one. Its own
+    VALUE is recovered from ``sanitized`` by offset."""
     mapping: dict[str, str] = {}
     undecodable: list[tuple[str, int]] = []
-    for block_match in _SERVLET_BLOCK_RE.finditer(sanitized):
-        block = block_match.group(1)
+    for block_match in _SERVLET_BLOCK_RE.finditer(structural):
+        block = sanitized[block_match.start(1):block_match.end(1)]
         name_match = _SERVLET_MAPPING_NAME_RE.search(block)
         class_match = _SERVLET_CLASS_RE.search(block)
         if name_match is None or class_match is None:
@@ -3568,7 +3665,7 @@ _LISTENER_CLASS_RE = _leaf_value_pattern("listener-class", dotall=True)
 
 
 def _filter_class_by_name(
-    sanitized: str,
+    sanitized: str, structural: str,
 ) -> tuple[dict[str, str], list[tuple[str, int]]]:
     """FIX ROUND 21b (THE MAJOR's own web.xml-symmetry follow-through):
     web.xml's own ``<filter>`` element (``<filter-name>``/
@@ -3582,11 +3679,15 @@ def _filter_class_by_name(
 
     FIX ROUND 24 (twentieth cold read, F5 MINOR, wrong-data): the exact
     same undecodable-vs-absent distinction ``_servlet_class_by_name``
-    now makes - see its own docstring."""
+    now makes - see its own docstring.
+
+    FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE, F2): the exact
+    same CDATA-blanked boundary scan ``_servlet_class_by_name`` now
+    uses - see its own docstring."""
     mapping: dict[str, str] = {}
     undecodable: list[tuple[str, int]] = []
-    for block_match in _FILTER_BLOCK_RE.finditer(sanitized):
-        block = block_match.group(1)
+    for block_match in _FILTER_BLOCK_RE.finditer(structural):
+        block = sanitized[block_match.start(1):block_match.end(1)]
         name_match = _FILTER_NAME_RE.search(block)
         class_match = _FILTER_CLASS_RE.search(block)
         if name_match is None or class_match is None:
@@ -3626,14 +3727,23 @@ def is_effectively_empty_web_xml(text: str) -> bool:
     or an open/close pair with nothing but whitespace between them.
     False for a root this function cannot even find (a different or
     malformed root element) - that is a DIFFERENT fact (an unrecognized
-    shape), not an empty one, and the caller must not conflate the two."""
+    shape), not an empty one, and the caller must not conflate the two.
+
+    FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE): the root
+    itself is found against the CDATA-blanked ``structural`` string
+    (never mistake CDATA content for the real closing tag) - but
+    EMPTINESS is judged against the ORIGINAL, CDATA-preserving
+    ``sanitized`` string: a ``<web-app>`` whose only content is a CDATA
+    section is NOT empty (real content lives there, even if it happens
+    to blank to whitespace for structural purposes)."""
     sanitized = _strip_xml_comments(text)
-    if _WEB_APP_SELF_CLOSING_RE.search(sanitized) is not None:
+    structural = _blank_cdata_sections(sanitized)
+    if _WEB_APP_SELF_CLOSING_RE.search(structural) is not None:
         return True
-    block_match = _WEB_APP_BLOCK_RE.search(sanitized)
+    block_match = _WEB_APP_BLOCK_RE.search(structural)
     if block_match is None:
         return False
-    return block_match.group(1).strip() == ""
+    return sanitized[block_match.start(1):block_match.end(1)].strip() == ""
 
 
 def parse_web_xml(
@@ -3680,8 +3790,18 @@ def parse_web_xml(
     entry_points = []
     problems = []
     sanitized = _strip_xml_comments(text)
+    # FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE, F2, wrong-
+    # data): every STRUCTURAL boundary below (servlet/servlet-mapping/
+    # filter/filter-mapping/listener) is now found against this CDATA-
+    # blanked string - a <description> documenting a long-removed
+    # mapping (a real, common shape) must never be mistaken for a live
+    # one. `sanitized` stays the source every VALUE is recovered from,
+    # by offset (blanking preserves length) - the leaf decode battery
+    # still needs the RAW CDATA markers intact.
+    structural = _blank_cdata_sections(sanitized)
     newline_offsets = _newline_offsets(sanitized)
-    servlet_class_by_name, servlet_class_undecodable = _servlet_class_by_name(sanitized)
+    servlet_class_by_name, servlet_class_undecodable = _servlet_class_by_name(
+        sanitized, structural)
     # FIX ROUND 24 (twentieth cold read, F5 MINOR, wrong-data): a
     # servlet whose own <servlet-class> is present but undecodable
     # (CDATA/entity constructs) silently fell back to the synthetic
@@ -3699,8 +3819,8 @@ def parse_web_xml(
             qualified_name=f"{relative_path}#{servlet_name}",
         ))
     mapped_servlet_names: set[str] = set()
-    for block_match in _SERVLET_MAPPING_BLOCK_RE.finditer(sanitized):
-        block = block_match.group(1)
+    for block_match in _SERVLET_MAPPING_BLOCK_RE.finditer(structural):
+        block = sanitized[block_match.start(1):block_match.end(1)]
         name_match = _SERVLET_MAPPING_NAME_RE.search(block)
         if name_match is None:
             continue
@@ -3746,8 +3866,8 @@ def parse_web_xml(
     # class-closer way <listener> already is. An unmapped servlet with
     # NO <load-on-startup> either is the existing, separately-accepted
     # "orphaned servlet" carry - unchanged, not this shape.
-    for block_match in _SERVLET_BLOCK_RE.finditer(sanitized):
-        block = block_match.group(1)
+    for block_match in _SERVLET_BLOCK_RE.finditer(structural):
+        block = sanitized[block_match.start(1):block_match.end(1)]
         name_match = _SERVLET_MAPPING_NAME_RE.search(block)
         if name_match is None or name_match.group(1).strip() in mapped_servlet_names:
             continue
@@ -3769,7 +3889,7 @@ def parse_web_xml(
                    "absent either",
             qualified_name=qualified_name,
         ))
-    filter_class_by_name, filter_class_undecodable = _filter_class_by_name(sanitized)
+    filter_class_by_name, filter_class_undecodable = _filter_class_by_name(sanitized, structural)
     # FIX ROUND 24 (F5 MINOR, wrong-data): the identical undecodable-
     # class visibility fix as the servlet loop above.
     for filter_name, block_start in filter_class_undecodable:
@@ -3781,8 +3901,8 @@ def parse_web_xml(
                    "synthetic per-mapping owner rather than the real class",
             qualified_name=f"{relative_path}#{filter_name}",
         ))
-    for block_match in _FILTER_MAPPING_BLOCK_RE.finditer(sanitized):
-        block = block_match.group(1)
+    for block_match in _FILTER_MAPPING_BLOCK_RE.finditer(structural):
+        block = sanitized[block_match.start(1):block_match.end(1)]
         name_match = _FILTER_NAME_RE.search(block)
         if name_match is None:
             # Same silent-drop shape round 15b's own JUDGE carry already
@@ -3837,8 +3957,8 @@ def parse_web_xml(
                 name=url_pattern, line=_line_at(newline_offsets, absolute_offset),
                 evidence_class="declared",
             ))
-    for block_match in _LISTENER_BLOCK_RE.finditer(sanitized):
-        block = block_match.group(1)
+    for block_match in _LISTENER_BLOCK_RE.finditer(structural):
+        block = sanitized[block_match.start(1):block_match.end(1)]
         class_match = _LISTENER_CLASS_RE.search(block)
         # FIX ROUND 24 (F5 MINOR): same label-only treatment as the
         # servlet startup-check above - cosmetic here (this shape is
