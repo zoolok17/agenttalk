@@ -195,7 +195,16 @@ def _derive_classification(
     the test estate, migration-relevant to test-coverage decisions the
     same way a real test source file is, not a build/tooling concern
     the way a root-level README or a CI YAML is - checked FIRST,
-    unconditionally."""
+    unconditionally.
+
+    MICRO-ROUND 23b (reviewer-3 delta, R3 note, ratified with residual):
+    ``"infrastructure"`` for a README/LICENSE is the CLOSEST AVAILABLE
+    value in this producer's closed classification vocabulary
+    (production/test/infrastructure), not an exact one - a future
+    ``"documentation"`` member is where prose-only files like these
+    would actually belong. Named explicitly so the next reader does not
+    conclude the vocabulary was examined and found sufficient; not
+    extended this slice."""
     default = _default_classification(relative_path)
     if default == "test":
         return default
