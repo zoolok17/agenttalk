@@ -999,11 +999,24 @@ def build_readiness(
     # id` (features_artifact.py) names the declaring file unconditionally
     # - added here ADDITIVELY (never replacing the owner-based evidence
     # above) so a file with a real, published route it declared is
-    # satisfied regardless of where ownership resolved. For an
-    # annotation-based route, declared_in and the resolved owner are
-    # already the same unit (the class's own file), so this is a no-op
-    # there - it only changes anything for the XML-declared-route
-    # asymmetry this round's own fixture measures.
+    # satisfied regardless of where ownership resolved.
+    #
+    # CORRECTION (round 28's own F6, twenty-fourth cold read): this
+    # comment used to claim that for an annotation-based route
+    # "declared_in and the resolved owner are already the same unit" -
+    # FALSE (declared_in_unit_id is always the FILE; the resolved owner
+    # is the COMPONENT, a different unit_id, whenever the class
+    # resolves in-scan). This addition is a no-op for the annotation
+    # case for an UNRELATED reason: whenever the file has a component
+    # child, round 22's own containment rollup (below, `_aggregate_
+    # file_signal_from_components`) OVERWRITES the file's own
+    # precomputed entry_points_mapped/feature_linked signal regardless
+    # of what this set contains for it - so adding the file's own
+    # declared_in_unit_id here changes nothing DOWNSTREAM for that
+    # shape, not because the two ids coincide. It only changes anything
+    # for a producer like web.xml, which declares routes with no
+    # component-kind unit of its own to roll up through at all - the
+    # XML-declared-route asymmetry this round's own fixture measures.
     feature_state_by_feature_id = {f.feature_id: f.state for f in features}
     for entry_point in entry_points:
         entry_point_owner_ids.add(entry_point.declared_in_unit_id)

@@ -2076,6 +2076,56 @@ def test_run_scan_a_utf16_root_sniffed_xml_records_but_does_not_degrade(
     assert matching[0]["reason_code"] == "binary_excluded_root_sniffed_xml"
 
 
+def test_run_scan_an_encoding_undecodable_root_sniffed_xml_publishes_no_classification(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 28 (twenty-fourth cold read, F2 BLOCKER, round-27
+    regression, wrong-data, end to end): the one-byte reader repro -
+    a Latin-1-encoded beans.xml (a lone high-bit byte, no NUL bytes, so
+    it passes discovery's binary sniff and only fails to decode at the
+    worker's own root-sniff site) records `encoding_undecodable` and
+    stays non-degrading (round 27's own F3 ruling, unchanged), but must
+    publish an EMPTY classification - not the confident `infrastructure`
+    round 27's own fix wrongly fed it."""
+    import json
+
+    (java_repo / "beans.xml").write_bytes("<beans><!-- café --></beans>\n".encode("latin-1"))
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matching = [p for p in problems_doc["problems"] if p["path"] == "beans.xml"]
+    assert len(matching) == 1
+    assert matching[0]["reason_code"] == "encoding_undecodable"
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    beans_units = [u for u in modules_doc["units"] if u["paths"] == ["beans.xml"]]
+    assert len(beans_units) == 1
+    assert beans_units[0]["classification"] == []
+
+
+def test_run_scan_a_readable_root_sniffed_xml_still_gets_a_decided_classification(
+    java_repo: Path,
+) -> None:
+    """Companion control, one-byte pair with the test above: the SAME
+    beans.xml content, genuinely UTF-8-decodable this time, must be
+    entirely unaffected by the F2 fix - a real, decided `production`
+    classification (this is genuinely unmodeled application code, tier-
+    2 code-bearing, so the run also degrades)."""
+    import json
+
+    (java_repo / "beans.xml").write_bytes("<beans><!-- café --></beans>\n".encode("utf-8"))
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    beans_units = [u for u in modules_doc["units"] if u["paths"] == ["beans.xml"]]
+    assert len(beans_units) == 1
+    assert beans_units[0]["classification"] == ["production"]
+
+
 def test_run_scan_a_utf16_pom_xml_still_degrades_unaffected_by_the_root_sniffed_xml_carve_out(
     java_repo: Path,
 ) -> None:
@@ -3730,6 +3780,22 @@ def test_scan_json_declares_the_provenance_caveat(java_repo: Path) -> None:
     outcome = scan_pipeline.run_scan(java_repo)
     scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
     assert scan_doc["provenance_caveat"] == readiness_artifact.PROVENANCE_CAVEAT
+
+
+def test_modules_json_declares_the_classification_caveat(java_repo: Path) -> None:
+    """FIX ROUND 28 (twenty-fourth cold read, F3 JUDGE): the SAME
+    "declare it, don't leave it to be independently rediscovered"
+    discipline ASSESSMENT_STATE_CAVEAT/FEATURES_STRUCTURAL_CAVEAT/
+    PROVENANCE_CAVEAT already established - a `complete` run may still
+    carry an encoding-undecodable, non-adapter .xml file with NO decided
+    classification at all. Published as a real modules.json field now."""
+    import json
+
+    from agenttalk.comprehension import modules_artifact
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    assert modules_doc["classification_caveat"] == modules_artifact.CLASSIFICATION_CAVEAT
 
 
 def test_run_scan_a_duplicate_qualified_name_publishes_ambiguous_import_and_a_problem(

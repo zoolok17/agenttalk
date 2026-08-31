@@ -73,9 +73,26 @@ class EntryPointRecord:
     #: FIX ROUND 27 (twenty-third cold read, F1 BLOCKER, wrong-data): the
     #: FILE unit whose own adapter claim DECLARED this entry point - set
     #: unconditionally, regardless of where ``owning_unit_id`` resolved.
-    #: For an annotation-based route the two are usually the same unit
-    #: (the class's own file). For a web.xml-declared route whose
-    #: <servlet-class> resolves in-scan, they DIVERGE: ``owning_unit_id``
+    #:
+    #: CORRECTION (round 28's own F6, twenty-fourth cold read): this
+    #: comment used to claim that for an annotation-based route "the two
+    #: are usually the same unit (the class's own file)" - FALSE. When
+    #: the class resolves in-scan, ``owning_unit_id`` is the COMPONENT
+    #: unit (the declared type itself), never the FILE unit ``declared_
+    #: in_unit_id`` always is - the two are different KINDS of unit_id
+    #: even in the common annotation case. Readiness never shows a
+    #: divergence there anyway, but for an UNRELATED reason: round 22's
+    #: own containment rollup (``_aggregate_file_signal_from_
+    #: components``) already derives the file's own signal by mirroring
+    #: its single contained component's signal, independent of and
+    #: prior to this field's own existence. Round 27's ``build_
+    #: readiness`` fix (its own ``declared_in_unit_id`` credit) is a
+    #: NO-OP for the annotation case for that reason - not because the
+    #: two ids coincide - and matters ONLY for a producer like web.xml
+    #: that has no component-kind unit of its own to roll up through.
+    #: For a web.xml-declared route whose <servlet-class> resolves
+    #: in-scan, the file/owner split is real and this field is what
+    #: closes the gap: ``owning_unit_id``
     #: moves to the implementing class (CR13-2, round 17), but nothing
     #: previously remembered that web.xml itself was the file that
     #: DECLARED the route - readiness_artifact.py's own entry_points_

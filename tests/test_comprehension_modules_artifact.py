@@ -44,6 +44,65 @@ def test_a_file_under_a_test_path_is_classified_test():
     assert records[0].classification == ["test"]
 
 
+def test_an_encoding_undecodable_non_adapter_xml_publishes_no_classification():
+    """FIX ROUND 28 (twenty-fourth cold read, F2 BLOCKER, round-27
+    regression, wrong-data): round 27's own F3 fix widened non_
+    degrading_unsupported_language_paths to ALSO include encoding-
+    undecodable non-adapter .xml files - correct for the DEGRADE
+    question, but it fed the SAME set into classification, publishing a
+    confident ["infrastructure"] for a file this producer admits it
+    never actually read. `encoding_undecodable` in the worker's own
+    recorded reasons must publish an EMPTY classification list instead -
+    the closed vocabulary has no "unknown" member to guess into."""
+    discovery = _discovery([
+        EnumeratedFile(relative_path="beans.xml", byte_count=96, content_digest="e"),
+    ])
+    records = ma.build_modules(
+        discovery, {},
+        worker_problem_reasons_by_path={"beans.xml": ["encoding_undecodable"]},
+        non_degrading_unsupported_language_paths=frozenset({"beans.xml"}),
+    )
+    assert len(records) == 1
+    assert records[0].classification == []
+
+
+def test_a_non_degrading_unsupported_language_path_without_encoding_undecodable_still_gets_infrastructure():
+    """Companion control: round 28's own F2 fix narrows ONLY the
+    encoding-undecodable case - a genuinely benign, readable non-
+    degrading file (worker.py's own real positive "not code-bearing"
+    evidence, e.g. an unsupported_language reason with no decode
+    failure) is unaffected and still gets "infrastructure"."""
+    discovery = _discovery([
+        EnumeratedFile(relative_path="config.properties", byte_count=10, content_digest="f"),
+    ])
+    records = ma.build_modules(
+        discovery, {},
+        worker_problem_reasons_by_path={"config.properties": ["unsupported_language"]},
+        non_degrading_unsupported_language_paths=frozenset({"config.properties"}),
+    )
+    assert len(records) == 1
+    assert records[0].classification == ["infrastructure"]
+
+
+def test_a_readable_tier2_xml_keeps_its_production_classification_unaffected():
+    """Companion control: a genuinely-decodable tier-2 XML (a real
+    Spring bean/Struts config - worker.py records its own degrading
+    "unsupported_language" problem, but does NOT add it to the non-
+    degrading set, since decoding succeeded and the shape is real
+    unmodeled application code) must be entirely unaffected by the F2
+    fix - production, same as before round 27/28 ever touched this
+    path."""
+    discovery = _discovery([
+        EnumeratedFile(relative_path="beans.xml", byte_count=96, content_digest="g"),
+    ])
+    records = ma.build_modules(
+        discovery, {},
+        worker_problem_reasons_by_path={"beans.xml": ["unsupported_language"]},
+    )
+    assert len(records) == 1
+    assert records[0].classification == ["production"]
+
+
 def test_a_file_under_a_bare_test_package_segment_stays_production():
     """FIX ROUND 15 (eleventh cold read, F3 MAJOR, wrong-data): a bare
     "/test/" package segment NOT under the real build-convention root

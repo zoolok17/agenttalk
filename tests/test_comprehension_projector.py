@@ -64,6 +64,19 @@ def _signal(unit_id: str) -> ReadinessSignal:
     )
 
 
+def _feature_linked_signal(unit_id: str, status: str, reason_code: str = "ok") -> ReadinessSignal:
+    """FIX ROUND 28 (twenty-fourth cold read, F1 MAJOR): units_without_
+    feature/units_with_unknown_feature_linkage now DERIVE from these
+    signals directly (readiness.json's own feature_linked verdicts),
+    never recompute their own linkage from features/modules - a test
+    fixture must hand in the real signal, not rely on the projector to
+    infer it."""
+    return ReadinessSignal(
+        signal_id=f"sig-feature-{unit_id}", unit_id=unit_id, check="feature_linked",
+        stored_status=status, severity="warning", basis="detected", reason_code=reason_code,
+    )
+
+
 def _base_kwargs(**overrides):
     kwargs = {
         "scan_id": "scan-1", "generated_at": "2026-08-27T00:00:00Z",
@@ -488,9 +501,79 @@ def test_dependencies_only_omits_the_other_sections():
 
 def test_units_without_feature_lists_unlinked_units():
     features = [_feature("f1", ["u1"])]
+    signals = [
+        _feature_linked_signal("u1", "satisfied"),
+        _feature_linked_signal("u2", "unsatisfied"),
+    ]
     payload = pr.project_comprehension(**_base_kwargs(
-        modules=[_unit("u1"), _unit("u2")], features=features))
+        modules=[_unit("u1"), _unit("u2")], features=features, readiness_signals=signals))
     assert payload["units_without_feature"] == ["u2"]
+    assert payload["units_with_unknown_feature_linkage"] == []
+
+
+def test_units_with_unknown_feature_linkage_lists_unknown_units_separately():
+    signals = [
+        _feature_linked_signal("u1", "unknown"),
+        _feature_linked_signal("u2", "unsatisfied"),
+    ]
+    payload = pr.project_comprehension(**_base_kwargs(
+        modules=[_unit("u1"), _unit("u2")], readiness_signals=signals))
+    assert payload["units_without_feature"] == ["u2"]
+    assert payload["units_with_unknown_feature_linkage"] == ["u1"]
+
+
+# ------------------- F1 (round 28, .cr24): derive from readiness signals, never recompute
+
+def test_declaring_file_with_unknown_feature_linked_is_not_a_confident_negative():
+    """FIX ROUND 28 (twenty-fourth cold read, F1 MAJOR, wrong-data,
+    .cr24-jee): the round-27 web.xml/declaring-file shape - readiness's
+    own feature_linked signal for the declaring file is `unknown` (a
+    candidate feature, not yet confirmed). The retired containment-
+    recompute would have called this unit's linkage from features.json/
+    modules alone, blind to that unknown - it must land in units_with_
+    unknown_feature_linkage, never in units_without_feature (the
+    confident-negative list)."""
+    signals = [_feature_linked_signal("u_webxml", "unknown")]
+    payload = pr.project_comprehension(**_base_kwargs(
+        modules=[_unit("u_webxml")], readiness_signals=signals))
+    assert payload["units_without_feature"] == []
+    assert payload["units_with_unknown_feature_linkage"] == ["u_webxml"]
+
+
+def test_encoding_undecodable_units_land_in_the_unknown_bucket_not_the_negative_one():
+    """.cr24-undec: four encoding-undecodable units (feature_linked
+    unknown/adapter_encoding_undecodable, per readiness_artifact's own
+    round 27 F2 fix) must never surface as a confident "no feature" -
+    round 27's own fix at the readiness layer is worthless if the
+    projector re-derives its own confident negative on top of it."""
+    signals = [_feature_linked_signal(f"u{i}", "unknown") for i in range(4)]
+    payload = pr.project_comprehension(**_base_kwargs(
+        modules=[_unit(f"u{i}") for i in range(4)], readiness_signals=signals))
+    assert payload["units_without_feature"] == []
+    assert payload["units_with_unknown_feature_linkage"] == ["u0", "u1", "u2", "u3"]
+
+
+def test_a_satisfied_unit_appears_in_neither_coverage_gap_list():
+    """.cr24-canary: a unit with a real, confirmed feature link is the
+    control - it must not be swept into either list by a fixture bug or
+    an off-by-one in the partition."""
+    signals = [_feature_linked_signal("u_linked", "satisfied")]
+    payload = pr.project_comprehension(**_base_kwargs(
+        modules=[_unit("u_linked")], readiness_signals=signals))
+    assert payload["units_without_feature"] == []
+    assert payload["units_with_unknown_feature_linkage"] == []
+
+
+def test_a_genuinely_unlinked_unit_still_lands_in_units_without_feature():
+    """A real, confident negative (no evidence gap, no feature at all)
+    must still be reported - the F1 fix only changes WHERE the answer
+    comes from (derived from readiness signals, never recomputed), it
+    must never make units_without_feature go silently empty."""
+    signals = [_feature_linked_signal("u_orphan", "unsatisfied")]
+    payload = pr.project_comprehension(**_base_kwargs(
+        modules=[_unit("u_orphan")], readiness_signals=signals))
+    assert payload["units_without_feature"] == ["u_orphan"]
+    assert payload["units_with_unknown_feature_linkage"] == []
 
 
 def test_unmapped_entry_points_lists_entry_points_with_no_feature_link():
@@ -645,7 +728,17 @@ def test_no_projection_list_anywhere_exceeds_the_row_cap(monkeypatch):
     edges = edges + fan_out_edges + fan_in_edges
     features = [_feature("f1", ["u1"]), _feature("f2", ["u1"])]  # u2, u3 have no feature link
     entry_points = [_entry_point("ep1", "u2", []), _entry_point("ep2", "u3", [])]  # both unmapped
-    signals = [_signal("u1"), _signal("u2")]
+    signals = [
+        _signal("u1"), _signal("u2"),
+        # FIX ROUND 28 (F1): units_without_feature/units_with_unknown_
+        # feature_linkage now DERIVE from these feature_linked signals
+        # rather than recomputing from features/modules - two of each so
+        # the (monkeypatched) cap of 1 clips one from each list too.
+        _feature_linked_signal("u2", "unsatisfied"),
+        _feature_linked_signal("u3", "unsatisfied"),
+        _feature_linked_signal("u4", "unknown"),
+        _feature_linked_signal("u5", "unknown"),
+    ]
     summaries = [_summary("u1", "blocked"), _summary("u2", "assessed")]
     problems = [
         {"reason_code": "parse_failed", "path": "a", "detail": "x"},
@@ -722,8 +815,9 @@ def test_no_projection_list_anywhere_exceeds_the_row_cap(monkeypatch):
     assert payload["omitted_counts"] == {
         "units": 2, "dependencies": len(edges) - 1, "problems": 1,
         "features": 1, "entry_points": 1,
-        "readiness_signals": 1, "readiness_summaries": 1,
-        "units_without_feature": 1, "unmapped_entry_points": 1,
+        "readiness_signals": len(signals) - 1, "readiness_summaries": 1,
+        "units_without_feature": 1, "units_with_unknown_feature_linkage": 1,
+        "unmapped_entry_points": 1,
         "high_fan_out_units": 1, "high_fan_in_units": 1,
     }
     # Meta-assertion (M2, fourth cold read, fix round 6): every capped
@@ -761,7 +855,7 @@ def test_whole_run_sections_are_named_outside_counts_for_a_filtered_caller():
         modules=[_unit("u1"), _unit("u2")], unit_id="u1"))
     assert set(payload["whole_run_sections"]) == {
         "counts", "dependency_summary", "high_fan_out_units", "high_fan_in_units",
-        "units_without_feature", "unmapped_entry_points",
+        "units_without_feature", "units_with_unknown_feature_linkage", "unmapped_entry_points",
     }
     # every named section is actually present in this same payload.
     assert set(payload["whole_run_sections"]) <= payload.keys()

@@ -42,7 +42,7 @@ _MAX_ROWS_PER_SECTION = 1000
 #: without a caller needing to already know to check a sibling section.
 WHOLE_RUN_SECTIONS = (
     "counts", "dependency_summary", "high_fan_out_units", "high_fan_in_units",
-    "units_without_feature", "unmapped_entry_points",
+    "units_without_feature", "units_with_unknown_feature_linkage", "unmapped_entry_points",
 )
 
 #: FIX ROUND 17 (thirteenth cold read, CR13-6 MINOR, JUDGE - taken): CR10-11's
@@ -201,35 +201,45 @@ def _entry_points_by_kind(entry_points: list[EntryPointRecord]) -> dict[str, int
     return dict(sorted(by_kind.items()))
 
 
-def _feature_unit_ids_including_owning_files(
-    features: list[FeatureRecord], modules: list[ModuleRecord],
-) -> set[str]:
-    """FIX ROUND 22 (eighteenth cold read, F1 MAJOR, wrong-data): a
-    feature's own ``unit_ids`` name the COMPONENT that implements it
-    (``features_artifact.build_features`` attaches to the component
-    whenever its qualified name resolves - the common case for any
-    real, in-repo class - never the file), so ``units_without_feature``
-    named the very FILE that implements one of this run's own detected
-    features - contradicting ``readiness.json``'s own (this same
-    round's) ``feature_linked`` mirroring, which now correctly reports
-    that file as satisfied. Walks up through nested-type containment
-    (a nested type's own container is its outer type, never the file
-    directly) from every feature-owning unit, adding each ancestor -
-    every intermediate nested-type container and, eventually, the
-    owning file itself - to the covered set too: the same "roll a
-    per-type fact up to its owning file" idiom readiness_artifact.py's
-    own F1 fix just established for entry_points_mapped/feature_linked."""
-    module_by_id = {m.unit_id: m for m in modules}
-    covered = {u for f in features for u in f.unit_ids}
-    for unit_id in list(covered):
-        current = module_by_id.get(unit_id)
-        while current is not None and current.container_unit_id is not None:
-            parent_id = current.container_unit_id
-            if parent_id in covered:
-                break
-            covered.add(parent_id)
-            current = module_by_id.get(parent_id)
-    return covered
+def _units_by_feature_linked_status(
+    readiness_signals: list[ReadinessSignal],
+) -> tuple[list[str], list[str]]:
+    """FIX ROUND 28 (twenty-fourth cold read, F1 MAJOR, wrong-data):
+    ``units_without_feature`` used to RECOMPUTE its own feature-linkage
+    from ``features.json`` + containment alone (the retired ``_feature_
+    unit_ids_including_owning_files`` this function replaces) - entirely
+    blind to round 27's own two new mechanisms readiness_artifact.py's
+    own ``feature_linked`` check consults (``declared_in_unit_id``
+    credit; the whole-file evidence-gap map). A web.xml whose declared
+    route published (readiness correctly reports ``unknown``/
+    ``feature_not_confirmed``) still appeared in ``units_without_
+    feature`` as a CONFIDENT negative, the exact contradiction round
+    22's own F1 fix closed for the file/component split, reopened here
+    for a different divergence; likewise every unit whose readiness
+    reports ``unknown``/``adapter_encoding_undecodable`` (or any other
+    whole-file-gap reason) - a run that RECORDED it could not read a
+    file should never assert a confident "no feature" about it either.
+    Fixed AS THE CLASS, not the instance: ``feature_linked`` in
+    readiness.json is the single source of truth for feature linkage -
+    the projection now DERIVES from it directly rather than
+    recomputing an independent answer that can silently diverge.
+
+    Returns ``(confident_negative_unit_ids, unknown_unit_ids)`` - every
+    unit's own ``feature_linked`` signal is exactly one of ``satisfied``/
+    ``unknown``/``unsatisfied`` (this check has no ``not_applicable``
+    branch), so these two lists partition every unit whose feature
+    linkage is NOT satisfied, never silently dropping the unknown ones
+    the way lumping them into the confident-negative list would."""
+    confident_negative: list[str] = []
+    unknown: list[str] = []
+    for signal in readiness_signals:
+        if signal.check != "feature_linked":
+            continue
+        if signal.stored_status == "unsatisfied":
+            confident_negative.append(signal.unit_id)
+        elif signal.stored_status == "unknown":
+            unknown.append(signal.unit_id)
+    return confident_negative, unknown
 
 
 def _fan_counts(dependencies: list[DependencyRecord]) -> tuple[dict[str, int], dict[str, int]]:
@@ -449,8 +459,8 @@ def project_comprehension(
             or p.get("qualified_name") in allowed_qualified_names
         ]
 
-    all_feature_unit_ids = _feature_unit_ids_including_owning_files(features, modules)
-    units_without_feature = [m.unit_id for m in modules if m.unit_id not in all_feature_unit_ids]
+    units_without_feature, units_with_unknown_feature_linkage = _units_by_feature_linked_status(
+        readiness_signals)
     unmapped_entry_points = [e.entry_point_id for e in entry_points if not e.feature_ids]
 
     fan_out, fan_in = _fan_counts(dependencies)
@@ -487,6 +497,15 @@ def project_comprehension(
     # scaling 1:1 with unit count).
     units_without_feature_rows, units_without_feature_omitted = _bounded(
         sorted(units_without_feature))
+    # FIX ROUND 28 (twenty-fourth cold read, F1 MAJOR): a unit whose own
+    # feature_linked signal is `unknown` (a whole-file evidence gap, or
+    # any other undecided reason) must NOT vanish - it is neither a
+    # confident negative (units_without_feature, above) nor linked
+    # (satisfied, omitted from both) - a separate bounded list + an
+    # unbounded true count (below, in "counts"), so a caller can see
+    # this population exists even if the row list itself truncates.
+    units_with_unknown_feature_linkage_rows, units_with_unknown_feature_linkage_omitted = _bounded(
+        sorted(units_with_unknown_feature_linkage))
     unmapped_entry_points_rows, unmapped_entry_points_omitted = _bounded(
         sorted(unmapped_entry_points))
     # M2 (fourth cold read, fix round 6): these two were hard-sliced to a
@@ -557,18 +576,24 @@ def project_comprehension(
             "entry_points_by_kind": _entry_points_by_kind(entry_points),
             "readiness_signals": len(readiness_signals),
             "problems": len(problems),
+            # FIX ROUND 28 (twenty-fourth cold read, F1 MAJOR): the TRUE,
+            # unbounded count - never hidden behind the bounded row
+            # list's own possible truncation below.
+            "units_with_unknown_feature_linkage": len(units_with_unknown_feature_linkage),
         },
         "dependency_summary": _dependency_summary(dependencies),
         "high_fan_out_units": high_fan_out_rows,
         "high_fan_in_units": high_fan_in_rows,
         "units_without_feature": units_without_feature_rows,
+        "units_with_unknown_feature_linkage": units_with_unknown_feature_linkage_rows,
         "unmapped_entry_points": unmapped_entry_points_rows,
         "problems": problem_rows,
         "truncated": bool(
             units_omitted or dependency_omitted or problem_omitted
             or feature_omitted or entry_point_omitted
             or readiness_signal_omitted or readiness_summary_omitted
-            or units_without_feature_omitted or unmapped_entry_points_omitted
+            or units_without_feature_omitted or units_with_unknown_feature_linkage_omitted
+            or unmapped_entry_points_omitted
             or high_fan_out_omitted or high_fan_in_omitted
         ),
         "omitted_counts": {
@@ -577,6 +602,7 @@ def project_comprehension(
             "readiness_signals": readiness_signal_omitted,
             "readiness_summaries": readiness_summary_omitted,
             "units_without_feature": units_without_feature_omitted,
+            "units_with_unknown_feature_linkage": units_with_unknown_feature_linkage_omitted,
             "unmapped_entry_points": unmapped_entry_points_omitted,
             "high_fan_out_units": high_fan_out_omitted,
             "high_fan_in_units": high_fan_in_omitted,
