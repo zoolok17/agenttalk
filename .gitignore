@@ -80,3 +80,9 @@ docs/ovhcloud_api_key.txt
 *api_key*
 *.pat
 .secrets/
+
+# #216 client-reference tripwire: the salt is the one secret that must never
+# be committed (the denylist hash file it drives IS committed, deliberately -
+# see scripts/client_reference_tripwire.py). CI reads it from a repo secret;
+# a local pre-commit run reads this gitignored file instead.
+/.agenttalk-tripwire-salt

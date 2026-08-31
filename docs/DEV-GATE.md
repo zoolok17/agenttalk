@@ -78,8 +78,11 @@ Every local run checks:
 - clean and stable Git binding before and after execution.
 
 Every CI leg runs the source/wheel, packaging, and binding checks for its one interpreter. The canonical
-`linux/3.12` leg additionally runs Ruff, Bandit, gitleaks, pip-audit, Semgrep, and zizmor. CodeQL remains the
-single declared CI-native exception because GitHub owns its analysis runtime.
+`linux/3.12` leg additionally runs Ruff, Bandit, gitleaks, pip-audit, Semgrep, and zizmor. Two checks are
+declared CI-native exceptions, each for a stated reason rather than left to be discovered: CodeQL, because
+GitHub owns its analysis runtime, and the client-reference tripwire (`.github/workflows/security.yml`),
+because its pre-commit and CI halves must run with different fail-open/fail-closed semantics (task #216) -
+a distinction this plan's single-command, identical-everywhere model cannot express.
 
 Wheel dependency/test-tool resolution, Semgrep registry rules, and the PyPI advisory database are live external
 inputs. Their locators, observation times, and explicitly unversioned identities appear in `external_inputs`;

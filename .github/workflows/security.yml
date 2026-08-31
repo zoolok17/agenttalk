@@ -18,8 +18,15 @@ concurrency:
 permissions:
   contents: read
 
-# CodeQL is the sole CI-native exception declared in dev-gate.json. Every
-# CLI-runnable voting check lives in the committed dev-gate plan instead.
+# Two declared CI-native exceptions live outside the committed dev-gate
+# plan (see docs/DEV-GATE.md); every OTHER CLI-runnable voting check lives
+# there instead. CodeQL is the first, because GitHub owns its analysis
+# runtime. client-reference-tripwire below is the second, confirmed
+# exception (task #216): its CI/local halves must run with DIFFERENT
+# semantics (fail-closed vs. fail-open - see
+# scripts/client_reference_tripwire.py's module docstring and
+# scripts/githooks/pre-commit), which dev-gate's single-command,
+# identical-everywhere model cannot express.
 jobs:
   codeql:
     name: codeql (security-extended)
@@ -37,3 +44,53 @@ jobs:
           languages: python
           queries: security-extended
       - uses: github/codeql-action/analyze@78ed0c7291d93e40c51b085850dc669a4c3ab73b  # v3
+
+  client-reference-tripwire:
+    name: client-reference-tripwire
+    runs-on: ubuntu-latest
+    # Only a push or PR event has a meaningful base..head pair to diff; a
+    # scheduled/manual run has neither, so it is N/A rather than a false
+    # "checked, found nothing" pass - never claim a run that did not happen.
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Check added lines for denylisted client references
+        env:
+          AGENTTALK_TRIPWIRE_SALT: ${{ secrets.AGENTTALK_TRIPWIRE_SALT }}
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == true }}
+        run: |
+          set +e
+          python scripts/client_reference_tripwire.py check-diff "$BASE_SHA" "$HEAD_SHA" --repo .
+          status=$?
+          set -e
+          case "$status" in
+            0)
+              echo "client-reference-tripwire: clean."
+              ;;
+            1)
+              echo "::error::client-reference-tripwire: denylisted content detected in added lines - see the step output above for file/line; this blocks the merge."
+              exit 1
+              ;;
+            2)
+              if [ "$IS_FORK_PR" = "true" ]; then
+                echo "::error::client-reference-tripwire: HOLD - the salt secret is not exposed to fork-PR runs (GitHub's own security model). This check did NOT run and cannot be treated as a pass. A maintainer with repo secret access must re-run this job (workflow_dispatch, or by pulling the branch into a same-repo branch) before merging."
+              else
+                echo "::error::client-reference-tripwire: HOLD - the salt secret is unavailable in this run (AGENTTALK_TRIPWIRE_SALT is unset). This check did NOT run and cannot be treated as a pass. Provision the repo secret before merging."
+              fi
+              exit 1
+              ;;
+            *)
+              echo "::error::client-reference-tripwire: unexpected exit status $status - treating as a HOLD, not a pass."
+              exit 1
+              ;;
+          esac
