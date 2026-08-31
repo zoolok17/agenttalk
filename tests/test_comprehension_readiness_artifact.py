@@ -140,7 +140,7 @@ def test_source_understood_unknown_when_the_adapter_failed_to_parse():
 def test_dependencies_resolved_and_entry_points_mapped_also_unknown_when_parse_failed():
     """FIX ROUND 16 (twelfth cold read, M2 MAJOR, wrong-data): a parse-
     failed unit used to report dependencies_resolved satisfied/
-    no_declared_dependencies and entry_points_mapped not_applicable/
+    no_modeled_dependencies and entry_points_mapped not_applicable/
     no_entry_point - both confidently derived from the necessarily EMPTY
     evidence a failed parse leaves behind (zero edges, zero features),
     never from anything the source actually says. A reader who trusts
@@ -327,13 +327,13 @@ def test_dependencies_resolved_satisfied_when_an_unresolved_edge_is_invoke_only(
     signals, _ = ra.build_readiness([_unit("u1")], edges, [])
     signal = _signal_by_check(signals, "dependencies_resolved")
     assert signal.stored_status == "satisfied"
-    assert signal.reason_code == "no_declared_dependencies"
+    assert signal.reason_code == "no_modeled_dependencies"
 
 
 def test_dependencies_resolved_unknown_when_the_only_edge_is_an_ambiguous_invoke():
     """FIX ROUND 15 (eleventh cold read, M6 JUDGE - taken): a unit whose
     ONLY cross-unit dependency is an ambiguous INVOKE used to report
-    satisfied/no_declared_dependencies - an honest reason code over a
+    satisfied/no_modeled_dependencies - an honest reason code over a
     real unknown. An ambiguous resolution is never JDK/library noise
     (that's always "unresolved", zero in-scan candidates to tie on) -
     it only fires when the scanner found 2+ REAL in-scan candidates and
@@ -357,14 +357,14 @@ def test_dependencies_resolved_unaffected_by_an_ambiguous_test_edge():
     signals, _ = ra.build_readiness([_unit("u1")], edges, [])
     signal = _signal_by_check(signals, "dependencies_resolved")
     assert signal.stored_status == "satisfied"
-    assert signal.reason_code == "no_declared_dependencies"
+    assert signal.reason_code == "no_modeled_dependencies"
 
 
 def test_dependencies_resolved_satisfied_when_all_edges_resolved():
     """FIX ROUND 12b (reviewer-3): this used to rely on `_edge`'s default
     relation ("invoke") - post-scoping (round 12's F2/F5 fix), an invoke
     edge is filtered out entirely, so this test passed via the
-    no-qualifying-edges/no_declared_dependencies branch, byte-identical to a unit
+    no-qualifying-edges/no_modeled_dependencies branch, byte-identical to a unit
     with zero edges at all, and would have survived deletion of the
     all-resolved branch it names. relation="import" (like its moved
     siblings) makes this a real dependency edge that actually reaches
@@ -374,6 +374,23 @@ def test_dependencies_resolved_satisfied_when_all_edges_resolved():
     signal = _signal_by_check(signals, "dependencies_resolved")
     assert signal.stored_status == "satisfied"
     assert signal.reason_code == "dependencies_resolved"
+
+
+def test_dependencies_resolved_satisfied_with_no_modeled_dependencies_when_a_unit_has_zero_edges():
+    """MICRO-ROUND 30b (reviewer-3 delta on round 30's own F2, R2, wrong-
+    data): the WIRING shape named in round 30's own F2 - a class whose
+    real collaborators arrive ONLY by constructor injection or a field-
+    injected call (UNSUPPORTED_INVOKE_SHAPES, java.py) never produces an
+    edge at ALL, not even an unresolved one, so this unit reaches
+    build_readiness with zero edges of its own. "no_declared_dependencies"
+    (the pre-30b name) read as "the one true source of dependency
+    information for this unit" - "no_modeled_dependencies" names what was
+    actually checked (the import/inherit/build relations this check
+    models), never a claim that no real collaboration exists."""
+    signals, _ = ra.build_readiness([_unit("u1")], [], [])
+    signal = _signal_by_check(signals, "dependencies_resolved")
+    assert signal.stored_status == "satisfied"
+    assert signal.reason_code == "no_modeled_dependencies"
 
 
 def _file_unit(unit_id: str) -> ModuleRecord:
@@ -406,7 +423,7 @@ def test_component_with_no_own_edges_and_multiple_siblings_reports_unknown_not_s
     shape): a component with no edges of its own, sharing a file with
     ANOTHER top-level declared type, cannot honestly credit the file's
     import evidence to just this one sibling - never a vacuous
-    satisfied/no_declared_dependencies (the un-evidenced positive the
+    satisfied/no_modeled_dependencies (the un-evidenced positive the
     readiness policy refuses everywhere else), degrades to unknown with
     a named reason instead."""
     file_unit = _file_unit("Multi")
@@ -526,7 +543,7 @@ def test_single_type_component_and_file_both_clean_stays_satisfied():
 def test_file_units_dependencies_resolved_derives_from_contained_units_not_vacuously_satisfied():
     """N6 (fourth cold read, fix round 6): edges attach to the declared
     TYPE, never the FILE that contains it - a file unit's own
-    dependencies_resolved used to always be satisfied/no_declared_dependencies
+    dependencies_resolved used to always be satisfied/no_modeled_dependencies
     (it never receives outgoing edges directly), a structurally
     always-on positive signal that was never actually evidence of
     anything. A file whose CONTAINED component unit has an unresolved

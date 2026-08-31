@@ -1437,7 +1437,7 @@ def test_run_scan_ordinary_jdk_invoke_calls_never_drive_dependencies_resolved_un
         if s["unit_id"] == pricing_unit["unit_id"] and s["check"] == "dependencies_resolved"
     )
     assert dependencies_resolved["stored_status"] == "satisfied"
-    assert dependencies_resolved["reason_code"] == "no_declared_dependencies"
+    assert dependencies_resolved["reason_code"] == "no_modeled_dependencies"
 
 
 def test_run_scan_a_custom_exception_extending_runtimeexception_reports_dependencies_resolved_satisfied(
@@ -2351,6 +2351,70 @@ def test_run_scan_a_class_and_jsp_file_pair_for_the_same_name_is_a_conflict(
     # this test exists to prevent.
     assert entry_point["owning_unit_id"] == web_xml_unit["unit_id"]
     assert entry_point["owning_unit_id"] != mixed_servlet_unit["unit_id"]
+
+
+@pytest.mark.parametrize("swap_order", [False, True])
+def test_run_scan_a_single_block_naming_both_a_class_and_a_jsp_file_is_a_conflict(
+    java_repo: Path, swap_order: bool,
+) -> None:
+    """MICRO-ROUND 30b (reviewer-3 delta, R1 note-only, wrong-data): a
+    SINGLE <servlet> block declaring BOTH <servlet-class> AND <jsp-
+    file> is spec-ILLEGAL (the schema makes them a choice) - this used
+    to resolve SILENTLY to the class (checked first, jsp-file only
+    considered when no class was present), the jsp-file discarded with
+    no trace at all - complete, zero rows, on a descriptor that cannot
+    actually deploy in any real container. Now a real conflict: one
+    duplicate_descriptor_name row naming BOTH candidates, and the
+    mapped route falls back to the synthetic per-mapping owner, never
+    confidently to the class. Parametrized on which element appears
+    first WITHIN the one block - order-independence proven both ways."""
+    import json
+
+    web_dir = java_repo / "src" / "main" / "java" / "com" / "acme" / "web"
+    web_dir.mkdir(parents=True)
+    (web_dir / "BothBackedServlet.java").write_text(
+        "package com.acme.web;\nclass BothBackedServlet {\n}\n", encoding="utf-8")
+    (java_repo / "WEB-INF").mkdir()
+    class_line = "    <servlet-class>com.acme.web.BothBackedServlet</servlet-class>\n"
+    jsp_line = "    <jsp-file>/WEB-INF/jsp/both.jsp</jsp-file>\n"
+    inner_lines = [class_line, jsp_line]
+    if swap_order:
+        inner_lines.reverse()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name>bothbacked</servlet-name>\n"
+        + "".join(inner_lines) +
+        "  </servlet>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>bothbacked</servlet-name>\n"
+        "    <url-pattern>/bothbacked/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matching = [p for p in problems_doc["problems"] if p["reason_code"] == "duplicate_descriptor_name"]
+    assert len(matching) == 1
+    assert "com.acme.web.BothBackedServlet" in matching[0]["detail"]
+    assert "both.jsp" in matching[0]["detail"]
+    # Never the pre-fix "is declared more than once" overclaim - this
+    # name is declared exactly once, with two disagreeing backings.
+    assert "more than once" not in matching[0]["detail"]
+
+    features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
+    entry_point = next(e for e in features_doc["entry_points"] if e["name"] == "/bothbacked/*")
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    web_xml_unit = next(
+        u for u in modules_doc["units"] if u["kind"] == "file" and u["paths"] == ["WEB-INF/web.xml"])
+    both_backed_unit = next(
+        u for u in modules_doc["units"] if u["display_name"] == "BothBackedServlet")
+    assert entry_point["owning_unit_id"] == web_xml_unit["unit_id"]
+    assert entry_point["owning_unit_id"] != both_backed_unit["unit_id"]
 
 
 @pytest.mark.parametrize("swap_order", [False, True])

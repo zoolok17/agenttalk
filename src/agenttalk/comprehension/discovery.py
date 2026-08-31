@@ -737,6 +737,22 @@ def _submodule_boundary_paths(root: Path) -> tuple[frozenset[str], dict[str, str
 #: CAVEAT``/``FEATURES_STRUCTURAL_CAVEAT`` already establish for their
 #: own artifacts - published unconditionally in scan.json, never only
 #: in this module's own comment.
+#:
+#: MICRO-ROUND 30b (reviewer-3 delta on round 30's own F3, R3, wrong-
+#: data - correct before merge, a caveat exists to be trusted): the
+#: FIRST version of this caveat claimed ``dependency_cache`` (alongside
+#: secret/vcs/hard_excluded) has "NO fingerprint sensitivity at all -
+#: not even entry-level... never selected into the fingerprint
+#: computation" - MEASURED FALSE. `exclusions` (the category -> count
+#: tally, below) feeds `fingerprint_input` unconditionally, for EVERY
+#: category, including these four - a `node_modules` tree appearing or
+#: disappearing changes its own category's count, which changes the
+#: fingerprint (measured both directions). The MECHANISM claim (no
+#: per-entry path/digest ever joins the fingerprint for these four
+#: categories) was always right; only the BEHAVIOR claim (therefore no
+#: sensitivity at all) was wrong - a category's own AGGREGATE COUNT is
+#: not "no sensitivity", it is a coarser one than generated_or_vendor's
+#: own per-entry path tracking. Corrected below.
 FINGERPRINT_CAVEAT = (
     "whole_scope_fingerprint's own sensitivity to an excluded region is "
     "ENTRY-LEVEL, not CONTENT-LEVEL, for the generated_or_vendor and "
@@ -747,12 +763,13 @@ FINGERPRINT_CAVEAT = (
     "not, since no per-file bytes are ever read for either (reading them "
     "just to fingerprint them would defeat the entire point of skipping "
     "them). The dependency_cache category (alongside secret/vcs/hard-"
-    "excluded) has NO fingerprint sensitivity at all - not even entry-level "
-    "- its own excluded_roots entry exists (visible in scan.json's own "
-    "exclusions/excluded_roots fields) but is never selected into the "
-    "fingerprint computation at all, unlike generated_or_vendor/"
-    "resource_limit_oversized which at least contribute their own "
-    "path+category. The binary and resource_limit_total_bytes "
+    "excluded) contributes no PER-ENTRY input (no individual path or digest "
+    "joins the fingerprint) - but its own CATEGORY TALLY does: a whole "
+    "region of one of these categories appearing or disappearing changes "
+    "the count recorded under that category, which does change the "
+    "fingerprint; only a content change (or a path change that leaves the "
+    "count unchanged) entirely inside an already-excluded region of one of "
+    "these categories never does. The binary and resource_limit_total_bytes "
     "categories are NOT affected by either gap - both already read the "
     "file's own bytes before excluding it, so their own content_digest "
     "already makes the fingerprint sensitive to a content change there."

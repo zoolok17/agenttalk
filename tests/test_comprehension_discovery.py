@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -1051,6 +1052,67 @@ def test_whole_scope_fingerprint_is_unaffected_by_a_secret_files_content(
     assert any(e["category"] == "secret" for e in before.excluded_roots)
     (tmp_path / ".env").write_bytes(b"SECRET=v2-completely-different-length-too")
     after = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert before.whole_scope_fingerprint == after.whole_scope_fingerprint
+
+
+def test_whole_scope_fingerprint_changes_when_a_dependency_cache_directory_appears(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 30b (reviewer-3 delta on round 30's own F3, R3, wrong-
+    data - correct before merge): dependency_cache contributes no PER-
+    ENTRY input to the fingerprint (no individual path/digest for it
+    ever joins the fingerprint's own input) - but its own CATEGORY TALLY
+    does, via the pre-existing `exclusions` category+count field, the
+    SAME mechanism the generated_or_vendor-count-alone test above
+    already relies on. A whole new dependency_cache region appearing
+    changes that category's own count, which changes the fingerprint -
+    the round-30 F3 caveat's FIRST version wrongly claimed this
+    category has NO fingerprint sensitivity at all, measured false."""
+    (tmp_path / "a.txt").write_bytes(b"hello")
+    comp_dir = _comprehension_dir(tmp_path)
+    before = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert before.exclusions.get("dependency_cache") is None
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "pkg.js").write_bytes(b"module.exports = {};")
+    after = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert after.exclusions.get("dependency_cache") == 1
+    assert before.whole_scope_fingerprint != after.whole_scope_fingerprint
+
+
+def test_whole_scope_fingerprint_changes_when_a_dependency_cache_directory_disappears(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 30b (R3): the reverse direction - measured, not just
+    assumed symmetric with the appearance case above."""
+    (tmp_path / "a.txt").write_bytes(b"hello")
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "pkg.js").write_bytes(b"module.exports = {};")
+    comp_dir = _comprehension_dir(tmp_path)
+    before = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert before.exclusions.get("dependency_cache") == 1
+    shutil.rmtree(tmp_path / "node_modules")
+    after = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert after.exclusions.get("dependency_cache") is None
+    assert before.whole_scope_fingerprint != after.whole_scope_fingerprint
+
+
+def test_whole_scope_fingerprint_is_unaffected_by_content_changes_inside_an_existing_dependency_cache_directory(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 30b (R3 control): the content-change half of the
+    caveat's own claim, which the appearance/disappearance tests above
+    do not exercise - an existing dependency_cache region's own count
+    stays unchanged when a file inside it is modified (this producer
+    never walks into it at all, so there is nothing to read in the
+    first place), so the fingerprint stays byte-identical too."""
+    (tmp_path / "a.txt").write_bytes(b"hello")
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "pkg.js").write_bytes(b"module.exports = {};")
+    comp_dir = _comprehension_dir(tmp_path)
+    before = discovery.enumerate_scope(tmp_path, comp_dir)
+    (tmp_path / "node_modules" / "pkg.js").write_bytes(b"module.exports = { totally: 'different' };")
+    after = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert before.exclusions.get("dependency_cache") == after.exclusions.get("dependency_cache") == 1
     assert before.whole_scope_fingerprint == after.whole_scope_fingerprint
 
 

@@ -2014,7 +2014,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     # a type-scoped claim: in a public-class-plus-package-private-helper
     # file, the FIRST class was credited with the helper's own import
     # (a false edge), and the helper itself published no edges at all,
-    # letting readiness stamp it satisfied/no_declared_dependencies with
+    # letting readiness stamp it satisfied/no_modeled_dependencies with
     # zero real evidence - exactly the un-evidenced positive the
     # readiness policy refuses everywhere else. Never a real type's own
     # qualified name (relative_path's "/" and ".java" can never appear
@@ -4027,28 +4027,44 @@ def _servlet_class_by_name(sanitized: str, structural: str) -> tuple[_Descriptor
             continue
         servlet_name = decoded_name.strip()
         class_match = _SERVLET_CLASS_RE.search(block_structural)
-        if class_match is None:
-            # FIX ROUND 30 (F1(1a)/(1b)): no <servlet-class> at all - a
-            # <jsp-file>-backed servlet if one decodes, else a bare
-            # name-only declaration. Still a REAL declaration either way
-            # - recorded, never skipped the way the pre-round-30 code
-            # silently dropped both shapes entirely.
-            jsp_match = _JSP_FILE_RE.search(block_structural)
-            jsp_path = (
-                _decode_xml_text(block_sanitized[jsp_match.start(1):jsp_match.end(1)])
-                if jsp_match is not None else None
-            )
+        jsp_match = _JSP_FILE_RE.search(block_structural)
+        # MICRO-ROUND 30b (reviewer-3 delta, R1 note-only, wrong-data): a
+        # SINGLE <servlet> block naming BOTH <servlet-class> AND <jsp-
+        # file> is spec-ILLEGAL (the servlet DTD/schema makes them a
+        # choice, never both) - round 30's own F1 fix checked class
+        # first and only fell through to jsp-file when no class was
+        # present, so a both-backings block silently resolved to the
+        # class alone, the jsp-file discarded with no trace at all
+        # (complete, zero rows, on a descriptor that cannot actually
+        # deploy in any real container). Both are now recorded as
+        # SEPARATE declarations of the SAME name from this ONE block -
+        # the existing conflict machinery (2+ distinct candidate labels
+        # for one name) already treats this as a conflict with no
+        # further change needed, reusing the SAME <jsp-file:...> label
+        # vocabulary round 30's own F1 fix established, rather than
+        # inventing a parallel "invalid descriptor" mechanism.
+        if class_match is not None:
+            decoded_class = _decode_xml_text(block_sanitized[class_match.start(1):class_match.end(1)])
+            declarations.setdefault(servlet_name, []).append(_DescriptorDeclaration(
+                class_value=_bounded_route_target(decoded_class.strip()) if decoded_class is not None else None,
+                jsp_path=None, class_undecodable=decoded_class is None, block_start=block_match.start(),
+            ))
+        if jsp_match is not None:
+            jsp_path = _decode_xml_text(block_sanitized[jsp_match.start(1):jsp_match.end(1)])
             declarations.setdefault(servlet_name, []).append(_DescriptorDeclaration(
                 class_value=None,
                 jsp_path=_bounded_route_target(jsp_path.strip()) if jsp_path is not None else None,
                 class_undecodable=False, block_start=block_match.start(),
             ))
-            continue
-        decoded_class = _decode_xml_text(block_sanitized[class_match.start(1):class_match.end(1)])
-        declarations.setdefault(servlet_name, []).append(_DescriptorDeclaration(
-            class_value=_bounded_route_target(decoded_class.strip()) if decoded_class is not None else None,
-            jsp_path=None, class_undecodable=decoded_class is None, block_start=block_match.start(),
-        ))
+        if class_match is None and jsp_match is None:
+            # FIX ROUND 30 (F1(1b)): neither a <servlet-class> nor a
+            # <jsp-file> at all - a bare name-only declaration. Still a
+            # REAL declaration - recorded, never skipped the way the
+            # pre-round-30 code silently dropped it entirely.
+            declarations.setdefault(servlet_name, []).append(_DescriptorDeclaration(
+                class_value=None, jsp_path=None, class_undecodable=False,
+                block_start=block_match.start(),
+            ))
     return _resolve_descriptor_declarations(declarations), name_undecodable
 
 
@@ -4352,14 +4368,21 @@ def parse_web_xml(
     # entirely, so `.get(name, fallback)` below already falls through to
     # the synthetic owner with no further change needed here - no
     # adapter chosen authoritative by execution order.
+    # MICRO-ROUND 30b (reviewer-3 delta, R1 note-only, wrong-data): a
+    # SINGLE <servlet> block declaring BOTH <servlet-class> AND <jsp-
+    # file> (spec-ILLEGAL - the schema makes them a choice) also lands
+    # here now (two candidate labels from the ONE block, below) - the
+    # detail's own "is declared more than once" wording would overclaim
+    # for that shape (declared exactly ONCE, with two disagreeing
+    # backings within that single declaration), so it is worded around
+    # OCCURRENCE COUNT entirely, accurate for both shapes.
     for servlet_name, candidate_labels in sorted(servlet_registry.conflicts.items()):
         problems.append(JavaAdapterProblem(
             reason_code="duplicate_descriptor_name",
-            detail=f"<servlet-name>{servlet_name}</servlet-name> is declared more than "
-                   f"once with disagreeing backing declarations ({', '.join(candidate_labels)}) "
-                   "- no declaration is authoritative by execution order, so its mapped "
-                   "route falls back to the synthetic per-mapping owner rather than "
-                   "picking one",
+            detail=f"<servlet-name>{servlet_name}</servlet-name> has disagreeing backing "
+                   f"declarations ({', '.join(candidate_labels)}) - no declaration is "
+                   "authoritative by execution order, so its mapped route falls back to "
+                   "the synthetic per-mapping owner rather than picking one",
             qualified_name=f"{relative_path}#{servlet_name}",
         ))
         descriptor_name_conflicts.append((

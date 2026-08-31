@@ -504,7 +504,7 @@ _DEPENDENCY_RESOLUTION_RELATIONS = frozenset({"import", "inherit", "build"})
 #: which one a call targets - never JDK noise, always a substantive
 #: uncertainty about this codebase's own structure. A unit whose only
 #: cross-unit dependency happens to be an ambiguous invoke/inherit
-#: reported satisfied/no_declared_dependencies - an honest reason code
+#: reported satisfied/no_modeled_dependencies - an honest reason code
 #: over a real unknown. Checked across relations regardless of
 #: ``_DEPENDENCY_RESOLUTION_RELATIONS`` scoping, EXCEPT ``test``: a test
 #: edge is a name-derived CONVENTION GUESS (F4), never a real declared
@@ -543,7 +543,7 @@ def _check_dependencies_resolved(
     # or parsed (or degraded away entirely) has ZERO real edges to
     # examine below not because it genuinely declares no dependencies,
     # but because nothing ever looked. A confident satisfied/
-    # no_declared_dependencies over an EVIDENCE GAP is exactly the
+    # no_modeled_dependencies over an EVIDENCE GAP is exactly the
     # un-evidenced positive this check exists to avoid.
     understanding_reasons = _reasons_feeding("dependencies_resolved", unit.adapter_problem_reasons)
     if understanding_reasons:
@@ -566,11 +566,25 @@ def _check_dependencies_resolved(
         # this check to import/inherit/build, a unit whose ONLY edges are
         # scoped-out invoke noise also lands here - it may have plenty of
         # real behavioral dependencies, just none of the kinds this check
-        # evaluates. "no_declared_dependencies" names what was actually
-        # checked, not a claim about the unit's real dependency surface.
+        # evaluates.
+        #
+        # MICRO-ROUND 30b (reviewer-3 delta on round 30's own F2, R2,
+        # renamed AGAIN): "no_declared_dependencies" itself still
+        # overclaimed - "declared" reads as "the one true source of
+        # dependency information for this unit", when it only ever meant
+        # "declared via the import/inherit/build relations this check
+        # evaluates". A class whose two real collaborators arrive by
+        # field-injection and constructor call (round 30's own F2 shape)
+        # published this exact reason alongside `satisfied`, asserting
+        # more than was actually established. "no_modeled_dependencies"
+        # names what was checked - the relations THIS PRODUCER VERSION
+        # models - never a claim about the unit's real dependency
+        # surface, reason codes being this producer's own open
+        # vocabulary (unlike `dependencies_resolved`'s own frozen
+        # status enum, which is unchanged - still `satisfied`).
         return _signal(
             unit.unit_id, "dependencies_resolved", "satisfied", "detected",
-            "no_declared_dependencies")
+            "no_modeled_dependencies")
     unresolved_edges = [edge for edge in relevant if edge.resolution_state == "unresolved"]
     if unresolved_edges:
         # FIX ROUND 20c (readiness carry, inherited from round 20 - THE
@@ -602,7 +616,7 @@ def _check_dependencies_resolved(
 #: fix - java.py's ``file_scope_qualified`` - closes the false-
 #: attribution half; this closes the readiness half). A component with
 #: NO edges of its own used to report a confident satisfied/
-#: no_declared_dependencies regardless of whether its file actually
+#: no_modeled_dependencies regardless of whether its file actually
 #: has real, unattributed import evidence - an un-evidenced positive.
 #: A single-top-level-type file has no attribution ambiguity at all
 #: (there is only one possible owner for the file's own imports), so
@@ -632,7 +646,7 @@ def _check_dependencies_resolved_for_component(
     if not file_relevant:
         # The file has no relevant edges of its own either - nothing to
         # combine with; the component's own verdict (its own edges, or
-        # the honest no_declared_dependencies default) already reflects
+        # the honest no_modeled_dependencies default) already reflects
         # everything real evidence exists for.
         return _check_dependencies_resolved(unit, own_outgoing, externality_poisoned)
     top_level_siblings = len(children_by_container.get(file_unit_id, []))
@@ -670,7 +684,7 @@ def _check_dependencies_resolved_for_component(
     # evidence either way and is returned as-is (unchanged from before
     # this round - preserves the file's own real reason_code rather
     # than substituting the component's own uninformative
-    # no_declared_dependencies default).
+    # no_modeled_dependencies default).
     component_signal = _check_dependencies_resolved(unit, own_outgoing, externality_poisoned)
     file_signal = _check_dependencies_resolved(unit, file_outgoing, externality_poisoned)
     if not own_relevant:
@@ -694,7 +708,7 @@ def _check_dependencies_resolved_for_file(
     happens to contain it (M-4, round 5's own containment fix didn't
     change edge attribution) - a Java file's own "file" unit therefore
     NEVER receives outgoing edges directly and always reported
-    dependencies_resolved satisfied/no_declared_dependencies, a structurally
+    dependencies_resolved satisfied/no_modeled_dependencies, a structurally
     always-on positive signal that was never actually evidence of
     anything. Derives the file's own signal from the UNION of its
     contained units' edges instead (recursing through nested types),
