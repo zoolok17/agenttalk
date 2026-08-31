@@ -625,6 +625,41 @@ def test_process_paths_does_not_flag_an_empty_or_comment_only_java_file(
     assert result.problems == []
 
 
+def test_process_paths_flags_a_pom_that_extracts_absolutely_nothing_f1b(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 24 (twentieth cold read, F1b, wrong-data): the SAME
+    "positive evidence, not merely absence of a negative" discipline
+    BLOCKER 1b (round 8) already closed for a .java file's own zero-
+    types case, extended to pom.xml - a pom parse that SUCCEEDS but
+    registers no own coordinate, no dependency edge, and no reactor
+    module read as a complete, zero-problem run (the exact mechanism
+    that let a namespace-prefixed pom - this round's own F1 - silently
+    vanish while `source_understood` confidently reported satisfied). A
+    real pom always carries SOME identity under Maven's own model, so
+    "nothing at all" is never legitimately minimal the way an empty
+    .java file can be."""
+    (tmp_path / "pom.xml").write_text(
+        "<project>\n  <modelVersion>4.0.0</modelVersion>\n</project>\n", encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["pom.xml"])
+    matching = [p for p in result.problems if p.reason_code == "no_pom_facts_extracted"]
+    assert len(matching) == 1
+    assert matching[0].relative_path == "pom.xml"
+
+
+def test_process_paths_does_not_flag_a_minimal_pom_with_a_real_coordinate_f1b(
+    tmp_path: Path,
+) -> None:
+    """Companion control: a minimal but genuinely real pom (its own
+    groupId:artifactId, no dependencies/modules) must NOT be flagged -
+    a leaf module with no deps is a normal, common, legitimate shape."""
+    (tmp_path / "pom.xml").write_text(
+        "<project><groupId>com.acme</groupId><artifactId>leaf</artifactId></project>\n",
+        encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["pom.xml"])
+    assert result.problems == []
+
+
 def test_process_paths_is_deterministic_regardless_of_input_order(tmp_path: Path) -> None:
     """N4 (cold-read, PR-B fix round 3): comparing bare SETS of sizes
     cannot detect a cross-contamination bug (e.g. a.txt's claim

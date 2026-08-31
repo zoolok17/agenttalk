@@ -2932,6 +2932,82 @@ def test_parse_maven_pom_dependency_groupid_with_xml_space_attribute():
     assert {e.target for e in edges} == {"org.springframework:spring-core"}
 
 
+# --------------------------------------------------- fix round 24 F1 (tag-stack local-name fix, .cr20-pomns)
+
+def test_a_fully_namespace_prefixed_pom_still_registers_its_own_coordinate_and_edge():
+    """FIX ROUND 24 (twentieth cold read, F1 BLOCKER, wrong-data,
+    .cr20-pomns): every pom-coordinate gate (`_project_own_coordinate`/
+    `_own_and_parent_group_ids`) tests `_enclosing_tag_stack(...) ==
+    ["project"]` - `_XML_TAG_RE` captured a namespace PREFIX as the tag
+    name (`<x:project>` recorded as `"x"`, never `"project"`), so a
+    fully-prefixed pom (namespace-identical to a plain one) silently
+    failed every one of these checks: no own coordinate registered, no
+    dependency edge published, even though the container-level regexes
+    (already prefix-tolerant since round 23) matched fine. Fixed by
+    making `_XML_TAG_RE` capture the LOCAL name regardless of an
+    optional namespace prefix - the identical tolerance standard 23b's
+    own leaf/container patterns already established, applied to the
+    tag-stack tracker every pom-coordinate consumer shares."""
+    pom = """<x:project xmlns:x="http://maven.apache.org/POM/4.0.0">
+  <x:groupId>org.prefixed</x:groupId>
+  <x:artifactId>prefixed-lib</x:artifactId>
+  <x:dependencies>
+    <x:dependency>
+      <x:groupId>org.other</x:groupId>
+      <x:artifactId>other-lib</x:artifactId>
+    </x:dependency>
+  </x:dependencies>
+</x:project>
+"""
+    units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {u.qualified_name for u in units} == {"org.prefixed:prefixed-lib"}
+    assert {e.target for e in edges} == {"org.other:other-lib"}
+
+
+def test_a_fully_namespace_prefixed_pom_still_declares_its_reactor_modules():
+    """FIX ROUND 24 (F1 BLOCKER, .cr20-pomns): `declared_reactor_module_
+    paths` scopes its own `<modules>` match to `_enclosing_tag_stack(...)
+    == ["project"]` too - the same tag-stack blindness silently made the
+    reactor rule's own backstop inert for a prefixed aggregator pom (no
+    modules ever recovered, so a vendored/excluded prefixed module would
+    never trip the reactor rule's own unresolved-not-external
+    protection)."""
+    pom = """<x:project xmlns:x="http://maven.apache.org/POM/4.0.0">
+  <x:groupId>org.prefixed</x:groupId>
+  <x:artifactId>prefixed-aggregator</x:artifactId>
+  <x:packaging>pom</x:packaging>
+  <x:modules>
+    <x:module>legacy-core</x:module>
+    <x:module>legacy-web</x:module>
+  </x:modules>
+</x:project>
+"""
+    assert java.declared_reactor_module_paths(pom) == ["legacy-core", "legacy-web"]
+
+
+def test_web_xml_prefixed_descriptor_regression_stays_green_after_tag_stack_fix():
+    """FIX ROUND 24 (F1 BLOCKER): the tag-stack fix touches a shared
+    regex `_enclosing_tag_stack` alone consumes - web.xml's own
+    structural/leaf tolerance (23b's own fix) never calls
+    `_enclosing_tag_stack` at all, so this is a pure regression control,
+    not a new mechanism."""
+    web_xml = """<j:web-app>
+  <j:servlet>
+    <j:servlet-name>full</j:servlet-name>
+    <j:servlet-class>com.C</j:servlet-class>
+  </j:servlet>
+  <j:servlet-mapping>
+    <j:servlet-name>full</j:servlet-name>
+    <j:url-pattern>/full</j:url-pattern>
+  </j:servlet-mapping>
+</j:web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern["/full"] == "com.C"
+    assert problems == []
+
+
 def test_web_xml_split_cdata_url_pattern_is_unrecoverable():
     """MICRO-ROUND 23b (reviewer-3's own MINOR, wrong-data): TWO CDATA
     sections in one <url-pattern> value (a legal escape-trick shape,

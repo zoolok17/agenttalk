@@ -257,6 +257,11 @@ _READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
     # the same bucket parse_failed/no_types_extracted already feed.
     "unsupported_language": frozenset({
         "source_understood", "dependencies_resolved", "entry_points_mapped"}),
+    # FIX ROUND 24 (twentieth cold read, F1b, wrong-data): a pom.xml's
+    # own analogue of `no_types_extracted` - a parse that succeeded but
+    # registered no coordinate/edge/reactor-module fact at all (worker.py).
+    "no_pom_facts_extracted": frozenset({
+        "source_understood", "dependencies_resolved", "entry_points_mapped"}),
 }
 
 
@@ -314,13 +319,35 @@ def _check_source_understood(unit: ModuleRecord) -> ReadinessSignal:
 
     ``satisfied`` requires POSITIVE adapter evidence (no recorded reason
     that FEEDS this specific check - see ``_READINESS_CHECKS_BY_REASON_
-    CODE`` - meaning a real :class:`~.adapters.java.JavaFileResult`
-    exists for this unit) AND a known ``language`` - never derived from
-    the mere ABSENCE of a specific, named failure. That inversion is
-    what closes the class: a fourth worker failure kind this check has
-    never heard of still comes through as unknown (its own reason_code,
-    prefixed), because the default without positive evidence is
-    unknown, not satisfied."""
+    CODE``) AND a known ``language`` - never derived from the mere
+    ABSENCE of a specific, named failure alone. The positive-evidence
+    half of that guarantee is enforced by CONVENTION at every worker.py
+    dispatch branch, not by this function inspecting a raw adapter
+    result directly: every producer that runs to completion without
+    raising and extracts genuinely nothing real is required to record
+    its own reason (``no_types_extracted`` for a .java file, ``no_pom_
+    facts_extracted`` for a pom.xml - FIX ROUND 24, twentieth cold read,
+    F1b - closing the identical gap round 8's own BLOCKER 1b already
+    closed for .java, never previously extended to pom.xml, which let a
+    namespace-prefixed pom this round's own F1 tag-stack bug silently
+    emptied read as a confident satisfied). That inversion is what
+    closes the class: a future worker failure kind this check has never
+    heard of still comes through as unknown (its own reason_code,
+    prefixed), because the default without a POSITIVE, producer-
+    declared reason is unknown, not satisfied.
+
+    A genuinely blank/comment-only Java file (or ``package-info.java``/
+    ``module-info.java``) is DELIBERATELY NOT covered by this same
+    discipline - it is a NAMED, EXPLICIT non-problem (``is_effectively_
+    empty_java_source``/``_LEGITIMATELY_TYPELESS_BASENAMES``), not an
+    unrecognized shape the adapter silently missed. ``satisfied`` is the
+    CORRECT claim for it: there is genuinely nothing in the file to
+    misunderstand, the vacuous-but-true positive a real parse/coverage
+    gap is not. Unlike a pom.xml (which always carries SOME identity,
+    own or ``<parent>``-inherited, under Maven's own model), "nothing at
+    all" is a legitimate, common Java shape - reclassifying it as
+    unknown would manufacture a false negative for every such file
+    rather than close a real gap."""
     understanding_reasons = _reasons_feeding("source_understood", unit.adapter_problem_reasons)
     if understanding_reasons:
         return _signal(

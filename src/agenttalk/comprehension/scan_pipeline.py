@@ -157,6 +157,9 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     # succeeded but extracted zero declared types - closing the zero-
     # extraction evidence hole as a class (worker.py).
     "no_types_extracted": "warning",
+    # FIX ROUND 24 (twentieth cold read, F1b): a pom.xml's own analogue,
+    # same bucket.
+    "no_pom_facts_extracted": "warning",
     # BLOCKER fail-safe (sixth cold read, fix round 10): a route
     # annotation the java adapter could not confidently associate with
     # a class or a method - under-claimed rather than published wrong.

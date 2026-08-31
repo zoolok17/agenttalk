@@ -3697,6 +3697,37 @@ def test_a_conflicted_components_own_multi_type_file_also_stays_unknown_r4(
         assert signal["reason_code"] == "duplicate_qualified_name", check
 
 
+def test_run_scan_a_pom_extracting_nothing_reports_source_understood_unknown_f1b(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 24 (twentieth cold read, F1b, wrong-data): a pom that
+    parses without error but registers no coordinate/edge/reactor-module
+    at all must publish `source_understood`/`dependencies_resolved` as
+    unknown, not the confident satisfied a bare `language != unknown`
+    check used to derive - the exact mechanism that let this round's
+    own F1 namespace-prefixed pom silently vanish while reading as a
+    complete, zero-problem run."""
+    import json
+
+    (java_repo / "pom.xml").write_text(
+        "<project>\n  <modelVersion>4.0.0</modelVersion>\n</project>\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+
+    assert any(p["reason_code"] == "no_pom_facts_extracted" for p in problems_doc["problems"])
+    pom_unit_id = next(u["unit_id"] for u in modules_doc["units"] if "pom.xml" in u["paths"])
+    for check in ("source_understood", "dependencies_resolved"):
+        signal = next(
+            s for s in readiness_doc["signals"]
+            if s["unit_id"] == pom_unit_id and s["check"] == check)
+        assert signal["stored_status"] == "unknown", check
+        assert signal["reason_code"] == "adapter_no_pom_facts_extracted", check
+
+
 def test_run_scan_an_import_of_a_binary_sniffed_excluded_file_is_unresolved_not_external(
     java_repo: Path,
 ) -> None:

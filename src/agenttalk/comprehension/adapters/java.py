@@ -3018,7 +3018,29 @@ _DEPENDENCY_SCOPE_RE = _leaf_value_pattern("scope")
 #: (attributes ignored - this adapter's own bar is "a handful of flat
 #: structural tags", not a general XML parser); a trailing ``/`` before
 #: ``>`` marks a self-closing tag, which never opens a body at all.
-_XML_TAG_RE = re.compile(r"<(/?)([A-Za-z][\w.-]*)\b[^>]*?(/?)>")
+#:
+#: FIX ROUND 24 (twentieth cold read, F1 BLOCKER, wrong-data): this
+#: regex fed ``_enclosing_tag_stack`` the PREFIX, not the local name, for
+#: a namespace-prefixed tag (``<x:project>`` recorded as ``"x"``) - every
+#: consumer's own ``_enclosing_tag_stack(...) == ["project"]``-style
+#: scoping check then silently failed on a namespace-identical, fully
+#: legal pom, measured to produce THREE false facts in one run
+#: (``source_understood`` satisfied over a file the adapter understood
+#: nothing of, ``dependencies_resolved`` not_applicable for a pom with a
+#: real dependency, a sibling edge onto it published resolved/EXTERNAL -
+#: the exact CR13-4/round-18 F3 over-claim class) plus a silently INERT
+#: reactor rule (``declared_reactor_module_paths``/``_project_own_
+#: coordinate`` both return empty/None). The SAME optional-prefix
+#: tolerance 23b's own leaf/container patterns already establish, one
+#: rule for the whole parser now - a non-capturing prefix group ahead of
+#: the real name capture, so group(2) is always the LOCAL name
+#: regardless of whether a prefix is present. Every consumer of
+#: ``_enclosing_tag_stack`` (``_module_own_dependency_blocks``,
+#: ``declared_reactor_module_paths``, ``_count_profile_scoped_
+#: dependencies``, ``_own_and_parent_group_ids``, ``_project_own_
+#: coordinate``) is fixed by this ONE shared regex - none of them
+#: inspects a tag name directly.
+_XML_TAG_RE = re.compile(r"<(/?)(?:[A-Za-z_][\w.-]*:)?([A-Za-z][\w.-]*)\b[^>]*?(/?)>")
 #: Every ``<dependencies>...</dependencies>`` element, regardless of
 #: nesting context - non-greedy, mirroring ``_DEPENDENCY_BLOCK_RE``'s own
 #: same-shaped non-nesting assumption (Maven's own schema never nests

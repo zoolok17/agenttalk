@@ -582,6 +582,34 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                         exclusions.get("profile_scoped_dependencies", 0)
                         + profile_scoped_dependency_count
                     )
+                # FIX ROUND 24 (twentieth cold read, F1b, wrong-data): a
+                # pom parse that SUCCEEDS but registers no own coordinate,
+                # no dependency edge, and no reactor module - the SAME
+                # "positive evidence, not merely absence of a negative"
+                # gap BLOCKER 1b (round 8) already closed for a .java
+                # file's own zero-types case, never extended to pom.xml -
+                # a namespace-prefixed pom this adapter's own coordinate/
+                # dependency/reactor gates all silently failed to
+                # recognize (before this round's own tag-stack fix) read
+                # as a COMPLETE, zero-problem run, `source_understood`
+                # confidently satisfied over a file the adapter understood
+                # nothing of. A REAL pom always carries SOME identity
+                # (own or `<parent>`-inherited) per Maven's own model, so
+                # "genuinely nothing at all" is never a legitimate minimal
+                # shape the way an empty .java file can be - a profile-
+                # scoped-only pom (real facts, merely excluded by policy)
+                # is exempted via the SAME count checked just above.
+                if (
+                    not pom_units and not build_edges and not declared_module_paths
+                    and not profile_scoped_dependency_count
+                ):
+                    problems.append(WorkerProblem(
+                        reason_code="no_pom_facts_extracted", relative_path=rel,
+                        detail="the pom adapter parsed this file but extracted no "
+                               "coordinate, dependency, or reactor-module facts at all - "
+                               "an unrecognized or unmodeled pom shape, not a "
+                               "legitimately minimal one",
+                    ))
         elif rel_name_lower == "web.xml":
             # M9 (cold-read, PR-B fix round 3): parse_web_xml existed as a
             # producer with its own passing unit tests but no dispatch
