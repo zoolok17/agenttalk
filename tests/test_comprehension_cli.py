@@ -450,6 +450,44 @@ def test_report_after_a_scan(java_repo: Path, capsys) -> None:
     assert payload["counts"]["units"] > 0
 
 
+def test_report_unit_filter_note_present_for_a_malformed_length_id(
+    java_repo: Path, capsys,
+) -> None:
+    """FIX ROUND 31 (twenty-seventh cold read, N6 VERIFY): the reader
+    could not reproduce this end to end and asked for it to be checked
+    at the real CLI layer specifically - `report --unit <a 16-char,
+    non-64-hex id>` was reported as returning a healthy empty with NO
+    unit_or_feature_filter_note. Verified NOT reproducible: round 23's
+    own F10 note and round 30's own F4 refinement both survive intact
+    through the real CLI --json path - the note is present regardless
+    of the id's own length/grammar, exactly as `--unit`/`--feature`'s
+    own open-id-space ruling (round 18b) requires."""
+    _run(["comprehension", "scan", "--json"], java_repo)
+    capsys.readouterr()
+    exit_code = _run(["comprehension", "report", "--unit", "deadbeefdeadbeef", "--json"], java_repo)
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["units"] == []
+    assert "deadbeefdeadbeef" in payload["unit_or_feature_filter_note"]
+
+
+def test_report_unit_filter_note_present_for_a_well_formed_absent_id(
+    java_repo: Path, capsys,
+) -> None:
+    """FIX ROUND 31 (N6 VERIFY): the companion shape - a well-formed
+    64-hex id (the real unit_id grammar) that simply matches nothing
+    this run. Also present, confirming the note's own coverage does
+    not depend on the caller's id happening to look malformed."""
+    _run(["comprehension", "scan", "--json"], java_repo)
+    capsys.readouterr()
+    absent_64_hex = "de" * 32
+    exit_code = _run(["comprehension", "report", "--unit", absent_64_hex, "--json"], java_repo)
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["units"] == []
+    assert absent_64_hex in payload["unit_or_feature_filter_note"]
+
+
 def test_report_before_any_scan_refuses(tmp_path: Path, capsys) -> None:
     exit_code = _run(["comprehension", "report", "--json"], tmp_path)
     assert exit_code == 2
