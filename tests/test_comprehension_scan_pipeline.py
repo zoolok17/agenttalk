@@ -3423,6 +3423,42 @@ def test_get_status_before_any_scan_raises_not_scanned(tmp_path: Path) -> None:
         scan_pipeline.get_status(tmp_path)
 
 
+@pytest.mark.parametrize("bad_run_id", ["", "   "])
+def test_get_status_refuses_an_empty_or_whitespace_run_id(java_repo: Path, bad_run_id: str) -> None:
+    """FIX ROUND 29 (twenty-fifth cold read, F7 polish, wrong-data): a
+    `--run` value of "" (or whitespace-only) used to fall through the
+    bare `run_id or _index_field(...)` falsy check exactly like `None`
+    (not provided) - silently resolving to the LATEST run instead of
+    ever reaching the closed scan-ID grammar's own refusal, which
+    already correctly rejects an empty string; it just never got the
+    chance to fire."""
+    scan_pipeline.run_scan(java_repo)
+    with pytest.raises(scan_pipeline.EnvelopeError, match="empty or whitespace"):
+        scan_pipeline.get_status(java_repo, run_id=bad_run_id)
+
+
+@pytest.mark.parametrize("bad_run_id", ["", "   "])
+def test_get_report_refuses_an_empty_or_whitespace_run_id(java_repo: Path, bad_run_id: str) -> None:
+    """FIX ROUND 29 (F7 polish): the get_report twin of the test above."""
+    scan_pipeline.run_scan(java_repo)
+    with pytest.raises(scan_pipeline.EnvelopeError, match="empty or whitespace"):
+        scan_pipeline.get_report(java_repo, run_id=bad_run_id)
+
+
+@pytest.mark.parametrize("bad_run_id", ["", "   "])
+def test_validate_run_reports_invalid_for_an_empty_or_whitespace_run_id(
+    java_repo: Path, bad_run_id: str,
+) -> None:
+    """FIX ROUND 29 (F7 polish): validate_run's own contract catches this
+    the same way it already catches a malformed-but-non-empty run_id -
+    reported via valid:False, never raised."""
+    scan_pipeline.run_scan(java_repo)
+    result = scan_pipeline.validate_run(java_repo, run_id=bad_run_id)
+    assert result["valid"] is False
+    assert "empty or whitespace" in result["detail"]
+    assert result["scan_id"] == bad_run_id
+
+
 def _delete_index_field(java_repo: Path, key: str) -> None:
     import json
 

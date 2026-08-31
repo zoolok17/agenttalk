@@ -1325,6 +1325,25 @@ def _index_field(index_doc: dict[str, Any], key: str) -> Any:
     return require_field(index_doc, key, doc_name="index.json")
 
 
+def _resolve_run_id(run_id: str | None, index_doc: dict[str, Any]) -> str:
+    """FIX ROUND 29 (twenty-fifth cold read, F7 polish, wrong-data): a
+    ``--run`` value of ``""`` (or whitespace-only) used to fall through
+    the bare ``run_id or _index_field(...)`` falsy check exactly like
+    ``None`` (not provided) - silently resolving to the LATEST run
+    instead of ever reaching the closed scan-ID grammar's own refusal
+    (``envelope.validate_scan_id``, which already correctly rejects an
+    empty string - it just never got the chance to). Shared by
+    ``get_status``/``get_report``/``validate_run`` so the same mistake
+    can never independently recur at a fourth call site: ``None`` means
+    "not provided, use the latest"; anything else - including an empty
+    or whitespace-only string - is treated as a REAL, explicit value the
+    caller must account for, refused here before it can be silently
+    substituted."""
+    if run_id is not None and not run_id.strip():
+        raise EnvelopeError(f"--run must not be empty or whitespace-only, got {run_id!r}")
+    return run_id if run_id is not None else _index_field(index_doc, "latest_scan_id")
+
+
 #: Round 7b (reviewer-3 delta on 84ef111): the index run-summary
 #: retention cap (``_INDEX_RUNS_MAX`` in publish.py) can age an older
 #: run's anchor entry out of ``index.json`` entirely - after which
@@ -1453,7 +1472,7 @@ def get_status(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
         # class CR10-12 (privacy.py) already fixed once. The basename is
         # enough to identify which directory was never scanned.
         raise NotScanned(f"no comprehension run has ever been published under {root.name!r}")
-    scan_id = run_id or _index_field(index_doc, "latest_scan_id")
+    scan_id = _resolve_run_id(run_id, index_doc)
     run_dir = _resolved_run_dir(comprehension_dir, scan_id)
     scan_doc = _load_single_artifact(
         run_dir, scan_id, "scan.json", SCAN_ARTIFACT_TYPE, SCAN_SCHEMA_VERSION)
@@ -1599,7 +1618,7 @@ def get_report(
     index_doc, _digest = publish.read_current_index(comprehension_dir)
     if index_doc is None:
         raise NotScanned(f"no comprehension run has ever been published under {root.name!r}")
-    scan_id = run_id or _index_field(index_doc, "latest_scan_id")
+    scan_id = _resolve_run_id(run_id, index_doc)
     records = _load_run_records(comprehension_dir, scan_id)
     anchor_state = _scan_json_anchor_state(index_doc, scan_id, records["scan"], records["run_dir"])
     _verify_artifact_digests(records["scan"], records["raw_docs"], records["run_dir"])
@@ -1914,7 +1933,15 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
     index_doc, _digest = publish.read_current_index(comprehension_dir)
     if index_doc is None:
         raise NotScanned(f"no comprehension run has ever been published under {root.name!r}")
-    scan_id = run_id or _index_field(index_doc, "latest_scan_id")
+    # FIX ROUND 29 (F7 polish): unlike get_status/get_report (which raise
+    # directly), validate_run's own contract catches a bad run_id and
+    # reports it via valid:False rather than raising - scan_id here
+    # deliberately stays the RAW run_id when one was given (even an
+    # invalid one), so the return value's own "scan_id" field still
+    # shows the caller's actual bad input; the real refusal happens
+    # inside the try block below, via the SAME _resolve_run_id used by
+    # the other two, caught by the existing except clause.
+    scan_id = run_id if run_id is not None else _index_field(index_doc, "latest_scan_id")
     # Round 7b: a default the anchor state stays at if an EARLIER step in
     # the try block below (record loading/conversion, the required-field
     # check) fails first - this run's scan.json integrity genuinely was
@@ -1927,6 +1954,7 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
         "state": "unverified", "reason_code": "not_evaluated_before_an_earlier_failure",
     }
     try:
+        scan_id = _resolve_run_id(run_id, index_doc)
         records = _load_run_records(comprehension_dir, scan_id)
         # Minor 2 (round 7b): validate never checked scan.json's OWN
         # scalar fields at all (only the separate "artifacts" digest
