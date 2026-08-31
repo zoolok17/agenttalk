@@ -3013,8 +3013,20 @@ def _decode_xml_text(raw: str) -> str | None:
 #: so it stops at THIS dependency's own closing tag, never spanning into
 #: a sibling <dependency> block.
 _DEPENDENCY_BLOCK_RE = _structural_block_pattern("dependency")
-_DEPENDENCY_GROUP_ID_RE = _leaf_value_pattern("groupId")
-_DEPENDENCY_ARTIFACT_ID_RE = _leaf_value_pattern("artifactId")
+#: FIX ROUND 24 (twentieth cold read, F4 MINOR, wrong-data): widened
+#: from ``[^<]+?`` (DOTALL OFF) to ``.*?`` (DOTALL ON), the SAME url-
+#: pattern treatment round 23's own F1(d) already established - a CDATA-
+#: wrapped ``<groupId>``/``<artifactId>`` (``<groupId><![CDATA[com.
+#: example]]></groupId>``) could not even be MATCHED at all by a
+#: ``[^<]``-excluding body (CDATA content starts with its own literal
+#: ``<``), so the whole dependency block silently vanished with no
+#: problem recorded - a complete, zero-problem run over a genuinely
+#: declared dependency. Every consumer now decodes the captured raw
+#: text via ``_decode_xml_text`` before use (see ``_module_own_
+#: dependency_facts``/``pom_dependency_decode_problems`` below) rather
+#: than using it directly - matching is not the same as decoding.
+_DEPENDENCY_GROUP_ID_RE = _leaf_value_pattern("groupId", dotall=True)
+_DEPENDENCY_ARTIFACT_ID_RE = _leaf_value_pattern("artifactId", dotall=True)
 #: Maven's own boolean spelling - never assumed False for anything but a
 #: genuinely absent or explicit ``false`` element; only an explicit
 #: ``true`` element makes an edge optional. The caller already lower-
@@ -3153,6 +3165,46 @@ def declared_reactor_module_paths(text: str) -> list[str]:
         ):
             paths.append(_bounded_route_target(module_match.group(1).strip()))
     return paths
+
+
+def pom_dependency_decode_problems(text: str) -> list[int]:
+    """FIX ROUND 24 (twentieth cold read, F4 MINOR, wrong-data): a
+    module-own ``<dependency>``'s own ``<groupId>``/``<artifactId>``
+    present but UNDECODABLE (a split/mixed CDATA shape, or an undefined
+    entity reference - ``_decode_xml_text`` refuses to guess through
+    either) makes the dependency edge silently vanish from
+    ``parse_maven_pom``'s own return - the SAME "positive evidence, not
+    silence" gap F1b closes for a whole-pom parse, one level down, for a
+    single dependency within an otherwise-healthy pom.
+
+    ``parse_maven_pom``'s own return arity is fixed at ``(units, edges,
+    profile_scoped_dependency_count)`` - 28+ existing call sites already
+    unpack it positionally (see ``declared_reactor_module_paths``'s own
+    docstring for the identical constraint) - so this is a SEPARATE,
+    additive call, the same pattern ``declared_reactor_module_paths``
+    already established: worker.py calls this too and turns each
+    returned line number into its own ``WorkerProblem``, rather than
+    ``parse_maven_pom`` growing a fourth return value.
+
+    Returns the 1-based line number of every module-own ``<dependency>``
+    block whose own groupId or artifactId element is PRESENT but could
+    not be decoded - never one that is simply absent (that is the
+    existing, unchanged, silent-and-legitimate "malformed dependency"
+    case ``parse_maven_pom`` itself already handles by omission)."""
+    sanitized = _strip_xml_comments(text)
+    newline_offsets = _newline_offsets(sanitized)
+    lines: list[int] = []
+    for match in _module_own_dependency_blocks(sanitized):
+        block = match.group(1)
+        group_match = _DEPENDENCY_GROUP_ID_RE.search(block)
+        artifact_match = _DEPENDENCY_ARTIFACT_ID_RE.search(block)
+        group_undecodable = (
+            group_match is not None and _decode_xml_text(group_match.group(1)) is None)
+        artifact_undecodable = (
+            artifact_match is not None and _decode_xml_text(artifact_match.group(1)) is None)
+        if group_undecodable or artifact_undecodable:
+            lines.append(_line_at(newline_offsets, match.start()))
+    return lines
 
 
 def _count_profile_scoped_dependencies(sanitized: str) -> int:
@@ -3344,14 +3396,30 @@ def parse_maven_pom(
         artifact_match = _DEPENDENCY_ARTIFACT_ID_RE.search(block)
         if group_match is None or artifact_match is None:
             continue
+        # FIX ROUND 24 (twentieth cold read, F4 MINOR, wrong-data): a
+        # CDATA-wrapped groupId/artifactId now MATCHES (the regex was
+        # widened to DOTALL, above) but must still be DECODED before
+        # use - publishing the raw match directly would embed the CDATA
+        # markers themselves in the coordinate, the same class of defect
+        # F2 already closed for url-pattern. An undecodable value (a
+        # split/mixed CDATA shape, or an undefined entity) is surfaced
+        # separately by `pom_dependency_decode_problems` below - this
+        # function's own return arity is fixed (28+ existing call sites
+        # already unpack it positionally), so it stays silent here,
+        # exactly as an absent element already is, and does not publish
+        # a guessed value either way.
+        group_decoded = _decode_xml_text(group_match.group(1))
+        artifact_decoded = _decode_xml_text(artifact_match.group(1))
+        if group_decoded is None or artifact_decoded is None:
+            continue
         # CR9-6 (ninth cold read, judged, completeness): a pom's own
         # groupId/artifactId published VERBATIM, UNBOUNDED (a hostile or
         # merely enormous pom - a 5000-char fixture - published whole),
         # while every Java route target is already length-bounded
         # (invariant 3) - routed through the same per-field discipline.
         group_id = _expand_self_referential_property(
-            _bounded_route_target(group_match.group(1).strip()))
-        artifact_id = _bounded_route_target(artifact_match.group(1).strip())
+            _bounded_route_target(group_decoded.strip()))
+        artifact_id = _bounded_route_target(artifact_decoded.strip())
         optional_match = _DEPENDENCY_OPTIONAL_RE.search(block)
         optional = optional_match is not None and optional_match.group(1).lower() == "true"
         scope_match = _DEPENDENCY_SCOPE_RE.search(block)
@@ -3394,7 +3462,14 @@ _SERVLET_MAPPING_URL_PATTERN_RE = _leaf_value_pattern("url-pattern", dotall=True
 #: actually serves. An exact tag match (never confused with
 #: <servlet-mapping>, a different closing tag entirely).
 _SERVLET_BLOCK_RE = _structural_block_pattern("servlet")
-_SERVLET_CLASS_RE = _leaf_value_pattern("servlet-class")
+#: FIX ROUND 24 (F5 MINOR, wrong-data): widened to DOTALL for the SAME
+#: reason as ``_DEPENDENCY_GROUP_ID_RE`` above - a CDATA-wrapped
+#: ``<servlet-class>`` used to match nothing at all, silently dropping
+#: this servlet from ``_servlet_class_by_name``'s own join and mis-
+#: attributing its mapped route's owner to the synthetic
+#: ``{path}#{servlet_name}`` placeholder instead. Every consumer decodes
+#: via ``_decode_xml_text`` before use.
+_SERVLET_CLASS_RE = _leaf_value_pattern("servlet-class", dotall=True)
 #: FIX ROUND 22 (eighteenth cold read, F3 MAJOR, wrong-data): a
 #: ``<servlet>`` carrying ``<load-on-startup>`` but no ``<servlet-
 #: mapping>`` at all is the standard startup-only servlet idiom (a
@@ -3407,7 +3482,9 @@ _SERVLET_CLASS_RE = _leaf_value_pattern("servlet-class")
 _LOAD_ON_STARTUP_RE = _leaf_presence_pattern("load-on-startup")
 
 
-def _servlet_class_by_name(sanitized: str) -> dict[str, str]:
+def _servlet_class_by_name(
+    sanitized: str,
+) -> tuple[dict[str, str], list[tuple[str, int]]]:
     """FIX ROUND 17 (thirteenth cold read, CR13-2 MAJOR, wrong-data):
     web.xml's own ``<servlet>`` element (``<servlet-name>``/
     ``<servlet-class>`` pair) - twice carried as an M5/M7 fast-follow,
@@ -3419,17 +3496,33 @@ def _servlet_class_by_name(sanitized: str) -> dict[str, str]:
     no_entry_point`` while the route it serves was owned by the web.xml
     FILE unit instead. A servlet-name with no matching ``<servlet>``
     block (malformed, or genuinely absent) is simply not in this
-    mapping - callers keep the old synthetic-owner fallback for it."""
+    mapping - callers keep the old synthetic-owner fallback for it.
+
+    FIX ROUND 24 (twentieth cold read, F5 MINOR, wrong-data): a
+    ``<servlet-class>`` present but UNDECODABLE (CDATA/entity
+    constructs ``_decode_xml_text`` refuses to guess through) is a
+    DIFFERENT fact from one genuinely absent - the caller must record a
+    problem for it rather than silently falling back to the synthetic
+    owner as if the class were never declared at all. Returns
+    ``(mapping, undecodable)`` - the second list names every servlet
+    whose own class element was present but could not be decoded, each
+    paired with its ``<servlet>`` block's own start offset for the
+    caller's line-number lookup."""
     mapping: dict[str, str] = {}
+    undecodable: list[tuple[str, int]] = []
     for block_match in _SERVLET_BLOCK_RE.finditer(sanitized):
         block = block_match.group(1)
         name_match = _SERVLET_MAPPING_NAME_RE.search(block)
         class_match = _SERVLET_CLASS_RE.search(block)
         if name_match is None or class_match is None:
             continue
-        mapping[name_match.group(1).strip()] = _bounded_route_target(
-            class_match.group(1).strip())
-    return mapping
+        servlet_name = name_match.group(1).strip()
+        decoded_class = _decode_xml_text(class_match.group(1))
+        if decoded_class is None:
+            undecodable.append((servlet_name, block_match.start()))
+            continue
+        mapping[servlet_name] = _bounded_route_target(decoded_class.strip())
+    return mapping, undecodable
 
 
 #: FIX ROUND 21 (seventeenth cold read, CR17-3 MAJOR, wrong-data): a
@@ -3451,7 +3544,11 @@ def _servlet_class_by_name(sanitized: str) -> dict[str, str]:
 #: ``_servlet_class_by_name`` already joins servlet mappings.
 _FILTER_BLOCK_RE = _structural_block_pattern("filter")
 _FILTER_NAME_RE = _leaf_value_pattern("filter-name")
-_FILTER_CLASS_RE = _leaf_value_pattern("filter-class")
+#: FIX ROUND 24 (F5 MINOR, wrong-data): same DOTALL widening as
+#: ``_SERVLET_CLASS_RE`` above, same reason - a CDATA-wrapped
+#: ``<filter-class>`` used to silently drop this filter from
+#: ``_filter_class_by_name``'s own join.
+_FILTER_CLASS_RE = _leaf_value_pattern("filter-class", dotall=True)
 _FILTER_MAPPING_BLOCK_RE = _structural_block_pattern("filter-mapping")
 #: A ``<listener>`` element names its own implementing class directly -
 #: no separate mapping/name indirection at all (a listener has no URL
@@ -3461,10 +3558,18 @@ _FILTER_MAPPING_BLOCK_RE = _structural_block_pattern("filter-mapping")
 #: from, so there is nothing this producer's declared-only bar would
 #: let it publish beyond the bare fact that a listener exists.
 _LISTENER_BLOCK_RE = _structural_block_pattern("listener")
-_LISTENER_CLASS_RE = _leaf_value_pattern("listener-class")
+#: FIX ROUND 24 (F5 MINOR, wrong-data): same DOTALL widening, same
+#: reason - a CDATA-wrapped ``<listener-class>`` used to match nothing,
+#: publishing the enrolled problem's own ``qualified_name`` as ``None``
+#: rather than the real class (cosmetic - this producer never models a
+#: listener beyond the bare fact one exists - but decoded consistently
+#: with every other class-name leaf all the same).
+_LISTENER_CLASS_RE = _leaf_value_pattern("listener-class", dotall=True)
 
 
-def _filter_class_by_name(sanitized: str) -> dict[str, str]:
+def _filter_class_by_name(
+    sanitized: str,
+) -> tuple[dict[str, str], list[tuple[str, int]]]:
     """FIX ROUND 21b (THE MAJOR's own web.xml-symmetry follow-through):
     web.xml's own ``<filter>`` element (``<filter-name>``/
     ``<filter-class>`` pair), joined below against ``<filter-mapping>``'s
@@ -3473,17 +3578,26 @@ def _filter_class_by_name(sanitized: str) -> dict[str, str]:
     ``<filter>`` block (malformed, or genuinely absent) is simply not in
     this mapping - callers keep the synthetic ``{relative_path}#{filter_
     name}`` fallback for it, the same asymmetry already accepted for an
-    unmatched servlet-mapping."""
+    unmatched servlet-mapping.
+
+    FIX ROUND 24 (twentieth cold read, F5 MINOR, wrong-data): the exact
+    same undecodable-vs-absent distinction ``_servlet_class_by_name``
+    now makes - see its own docstring."""
     mapping: dict[str, str] = {}
+    undecodable: list[tuple[str, int]] = []
     for block_match in _FILTER_BLOCK_RE.finditer(sanitized):
         block = block_match.group(1)
         name_match = _FILTER_NAME_RE.search(block)
         class_match = _FILTER_CLASS_RE.search(block)
         if name_match is None or class_match is None:
             continue
-        mapping[name_match.group(1).strip()] = _bounded_route_target(
-            class_match.group(1).strip())
-    return mapping
+        filter_name = name_match.group(1).strip()
+        decoded_class = _decode_xml_text(class_match.group(1))
+        if decoded_class is None:
+            undecodable.append((filter_name, block_match.start()))
+            continue
+        mapping[filter_name] = _bounded_route_target(decoded_class.strip())
+    return mapping, undecodable
 
 
 def parse_web_xml(
@@ -3531,7 +3645,23 @@ def parse_web_xml(
     problems = []
     sanitized = _strip_xml_comments(text)
     newline_offsets = _newline_offsets(sanitized)
-    servlet_class_by_name = _servlet_class_by_name(sanitized)
+    servlet_class_by_name, servlet_class_undecodable = _servlet_class_by_name(sanitized)
+    # FIX ROUND 24 (twentieth cold read, F5 MINOR, wrong-data): a
+    # servlet whose own <servlet-class> is present but undecodable
+    # (CDATA/entity constructs) silently fell back to the synthetic
+    # owner - the same outcome as a genuinely absent class, but the
+    # UNDERLYING fact is different (a real class name this producer
+    # could not recover, not a class that was never declared). Recorded
+    # visibly rather than left indistinguishable from the absent case.
+    for servlet_name, block_start in servlet_class_undecodable:
+        problems.append(JavaAdapterProblem(
+            reason_code="route_value_unrecoverable",
+            detail=f"a <servlet-class> declared at line "
+                   f"{_line_at(newline_offsets, block_start)} contains XML constructs "
+                   "this producer does not decode - its mapped route falls back to the "
+                   "synthetic per-mapping owner rather than the real class",
+            qualified_name=f"{relative_path}#{servlet_name}",
+        ))
     mapped_servlet_names: set[str] = set()
     for block_match in _SERVLET_MAPPING_BLOCK_RE.finditer(sanitized):
         block = block_match.group(1)
@@ -3588,9 +3718,13 @@ def parse_web_xml(
         if _LOAD_ON_STARTUP_RE.search(block) is None:
             continue
         class_match = _SERVLET_CLASS_RE.search(block)
+        # FIX ROUND 24 (F5 MINOR): this is only a LABEL on an already-
+        # recorded problem (this shape is enrolled-only, never modeled)
+        # - an undecodable class falls back to the same None a genuinely
+        # absent one already gets, never a raw, undecoded value.
+        decoded_class = _decode_xml_text(class_match.group(1)) if class_match is not None else None
         qualified_name = (
-            _bounded_route_target(class_match.group(1).strip())
-            if class_match is not None else None)
+            _bounded_route_target(decoded_class.strip()) if decoded_class is not None else None)
         problems.append(JavaAdapterProblem(
             reason_code="unsupported_entry_point_shape",
             detail=f"a <servlet> declared at line {_line_at(newline_offsets, block_match.start())} "
@@ -3599,7 +3733,18 @@ def parse_web_xml(
                    "absent either",
             qualified_name=qualified_name,
         ))
-    filter_class_by_name = _filter_class_by_name(sanitized)
+    filter_class_by_name, filter_class_undecodable = _filter_class_by_name(sanitized)
+    # FIX ROUND 24 (F5 MINOR, wrong-data): the identical undecodable-
+    # class visibility fix as the servlet loop above.
+    for filter_name, block_start in filter_class_undecodable:
+        problems.append(JavaAdapterProblem(
+            reason_code="route_value_unrecoverable",
+            detail=f"a <filter-class> declared at line "
+                   f"{_line_at(newline_offsets, block_start)} contains XML constructs "
+                   "this producer does not decode - its mapped route falls back to the "
+                   "synthetic per-mapping owner rather than the real class",
+            qualified_name=f"{relative_path}#{filter_name}",
+        ))
     for block_match in _FILTER_MAPPING_BLOCK_RE.finditer(sanitized):
         block = block_match.group(1)
         name_match = _FILTER_NAME_RE.search(block)
@@ -3659,9 +3804,12 @@ def parse_web_xml(
     for block_match in _LISTENER_BLOCK_RE.finditer(sanitized):
         block = block_match.group(1)
         class_match = _LISTENER_CLASS_RE.search(block)
+        # FIX ROUND 24 (F5 MINOR): same label-only treatment as the
+        # servlet startup-check above - cosmetic here (this shape is
+        # enrolled-only, never modeled beyond the bare fact it exists).
+        decoded_class = _decode_xml_text(class_match.group(1)) if class_match is not None else None
         qualified_name = (
-            _bounded_route_target(class_match.group(1).strip())
-            if class_match is not None else None)
+            _bounded_route_target(decoded_class.strip()) if decoded_class is not None else None)
         problems.append(JavaAdapterProblem(
             reason_code="unsupported_entry_point_shape",
             detail=f"a <listener> declared at line {_line_at(newline_offsets, block_match.start())} "

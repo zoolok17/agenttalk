@@ -262,6 +262,11 @@ _READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
     # registered no coordinate/edge/reactor-module fact at all (worker.py).
     "no_pom_facts_extracted": frozenset({
         "source_understood", "dependencies_resolved", "entry_points_mapped"}),
+    # FIX ROUND 24 (twentieth cold read, F4 MINOR, wrong-data): a fact
+    # about ONE dependency within an otherwise-understood pom - never a
+    # whole-file evidence gap (the same narrow scoping `route_value_
+    # unrecoverable` already gets, restated for the dependency side).
+    "dependency_value_unrecoverable": frozenset({"dependencies_resolved"}),
 }
 
 

@@ -660,6 +660,43 @@ def test_process_paths_does_not_flag_a_minimal_pom_with_a_real_coordinate_f1b(
     assert result.problems == []
 
 
+def test_process_paths_flags_a_pom_dependency_with_an_undecodable_groupid_f4(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 24 (twentieth cold read, F4 MINOR, wrong-data): a
+    module-own <dependency>'s own groupId that is present but
+    undecodable (split CDATA) must be recorded as a real problem, not
+    silently dropped from the edge list with a complete, zero-problem
+    run."""
+    (tmp_path / "pom.xml").write_text(
+        "<project><groupId>com.acme</groupId><artifactId>root</artifactId>"
+        "<dependencies><dependency>"
+        "<groupId><![CDATA[org.a]]>b<![CDATA[c]]></groupId>"
+        "<artifactId>lib</artifactId>"
+        "</dependency></dependencies></project>\n",
+        encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["pom.xml"])
+    matching = [p for p in result.problems if p.reason_code == "dependency_value_unrecoverable"]
+    assert len(matching) == 1
+    assert matching[0].relative_path == "pom.xml"
+
+
+def test_process_paths_does_not_flag_a_cdata_wrapped_pom_dependency_groupid_f4(
+    tmp_path: Path,
+) -> None:
+    """Companion control: a wholly-CDATA-wrapped groupId decodes cleanly
+    and must not be flagged."""
+    (tmp_path / "pom.xml").write_text(
+        "<project><groupId>com.acme</groupId><artifactId>root</artifactId>"
+        "<dependencies><dependency>"
+        "<groupId><![CDATA[org.springframework]]></groupId>"
+        "<artifactId>spring-core</artifactId>"
+        "</dependency></dependencies></project>\n",
+        encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["pom.xml"])
+    assert result.problems == []
+
+
 def test_process_paths_is_deterministic_regardless_of_input_order(tmp_path: Path) -> None:
     """N4 (cold-read, PR-B fix round 3): comparing bare SETS of sizes
     cannot detect a cross-contamination bug (e.g. a.txt's claim

@@ -555,6 +555,13 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                 # does the excluded-region cross-reference after the
                 # worker returns.
                 declared_module_paths = java_adapter.declared_reactor_module_paths(text)
+                # FIX ROUND 24 (twentieth cold read, F4 MINOR, wrong-
+                # data): same reasoning - a module-own dependency's own
+                # groupId/artifactId that is present but undecodable
+                # (CDATA/entity constructs) silently vanishes from
+                # parse_maven_pom's own return with no problem recorded.
+                undecodable_dependency_lines = (
+                    java_adapter.pom_dependency_decode_problems(text))
             except Exception as exc:  # noqa: BLE001 - a producer bug must degrade, never abort the scan
                 problems.append(WorkerProblem(
                     reason_code="parse_failed", relative_path=rel,
@@ -609,6 +616,18 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                                "coordinate, dependency, or reactor-module facts at all - "
                                "an unrecognized or unmodeled pom shape, not a "
                                "legitimately minimal one",
+                    ))
+                # FIX ROUND 24 (twentieth cold read, F4 MINOR, wrong-
+                # data): a real, present groupId/artifactId this adapter
+                # could not decode - the dependency edge silently
+                # vanished with no problem recorded; visible now.
+                for line in undecodable_dependency_lines:
+                    problems.append(WorkerProblem(
+                        reason_code="dependency_value_unrecoverable", relative_path=rel,
+                        detail=f"a <dependency> declared at line {line} has a groupId or "
+                               "artifactId containing XML constructs this producer does "
+                               "not decode - suppressed rather than published with a "
+                               "guessed coordinate",
                     ))
         elif rel_name_lower == "web.xml":
             # M9 (cold-read, PR-B fix round 3): parse_web_xml existed as a

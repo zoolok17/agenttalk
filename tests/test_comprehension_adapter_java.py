@@ -3076,6 +3076,93 @@ def test_web_xml_wholly_wrapped_cdata_url_pattern_still_decodes():
     assert problems == []
 
 
+def test_a_cdata_wrapped_pom_dependency_groupid_publishes_the_edge_not_silence():
+    """FIX ROUND 24 (twentieth cold read, F4 MINOR, wrong-data): a CDATA-
+    wrapped <groupId> could not even be MATCHED by the old [^<]+? body
+    (CDATA content starts with its own literal <), so the whole
+    dependency block silently vanished - complete/0 problems/no edge at
+    all over a genuinely declared dependency. Widened to DOTALL + decode
+    via _decode_xml_text - the edge now publishes correctly."""
+    pom = """<project>
+  <dependencies>
+    <dependency>
+      <groupId><![CDATA[org.springframework]]></groupId>
+      <artifactId>spring-core</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.springframework:spring-core"}
+
+
+def test_a_split_cdata_pom_dependency_groupid_is_flagged_not_silent():
+    """FIX ROUND 24 (F4 MINOR): a groupId whose own CDATA cannot be
+    decoded (the split-CDATA shape, same refuse-over-guess choice as
+    url-pattern) must not silently vanish - pom_dependency_decode_
+    problems surfaces its own line number so worker.py can record a
+    real problem instead."""
+    pom = """<project>
+  <dependencies>
+    <dependency>
+      <groupId><![CDATA[org.a]]>b<![CDATA[c]]></groupId>
+      <artifactId>spring-core</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert edges == []
+    assert java.pom_dependency_decode_problems(pom) == [3]
+
+
+def test_a_cdata_wrapped_servlet_class_joins_the_real_route_owner():
+    """FIX ROUND 24 (twentieth cold read, F5 MINOR, wrong-data): a CDATA-
+    wrapped <servlet-class> could not be matched by the old [^<]+? body
+    either, silently dropping this servlet from _servlet_class_by_name's
+    own join - the mapped route's owner mis-attributed to the synthetic
+    web.xml#name placeholder instead of the real class. Widened +
+    decoded - the real class now joins correctly."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>admin</servlet-name>
+    <servlet-class><![CDATA[com.acme.AdminServlet]]></servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>admin</servlet-name>
+    <url-pattern>/admin/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern["/admin/*"] == "com.acme.AdminServlet"
+    assert problems == []
+
+
+def test_an_undecodable_servlet_class_is_flagged_not_silently_misattributed():
+    """FIX ROUND 24 (F5 MINOR): a <servlet-class> present but undecodable
+    (split CDATA) must not silently fall back to the synthetic owner
+    with no problem recorded - a real class this producer could not
+    recover is a different fact from a genuinely absent one."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>admin</servlet-name>
+    <servlet-class><![CDATA[com.a]]>b<![CDATA[cme.Admin]]></servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>admin</servlet-name>
+    <url-pattern>/admin/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern["/admin/*"] == "WEB-INF/web.xml#admin"
+    matching = [p for p in problems if p.reason_code == "route_value_unrecoverable"]
+    assert any(p.qualified_name == "WEB-INF/web.xml#admin" for p in matching)
+
+
 def test_jax_rs_path_composes_class_and_method_level_like_spring_request_mapping():
     """FIX ROUND 17 (CR13-3 MAJOR, part (a)): JAX-RS's own @Path composes
     EXACTLY like a plain @RequestMapping already does - a class-level
