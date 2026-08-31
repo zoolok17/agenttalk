@@ -318,6 +318,20 @@ def test_scan_help_declares_scope_exclude_config_as_not_implemented_this_slice(c
     assert "not implemented this slice" in help_text
 
 
+def test_scan_help_declares_it_does_not_require_an_initialized_root(capsys) -> None:
+    """FIX ROUND 29 (twenty-fifth cold read, F8a polish, declare-not-
+    silently-simplify): the design's own step 1 says scan "resolves the
+    INITIALIZED project root" - this slice never actually checks that,
+    it just writes .agenttalk/comprehension/ under whatever root
+    resolves, initialized or not. Declared rather than enforced (real
+    init-checking is a repo-wide bus concern, wider than this command)."""
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["comprehension", "scan", "--help"])
+    assert exc.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "does not require the project root to already be initialized" in help_text
+
+
 def test_report_help_declares_human_output_byte_identical_to_json(capsys) -> None:
     """MICRO-ROUND 28b (reviewer-3 delta on `02c6b30`, R5, OVERTURNED
     RATIONALE): dropping this fact as "redundant with round-26 F6" was
@@ -347,6 +361,23 @@ def test_status_after_a_scan(java_repo: Path, capsys) -> None:
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "complete"
     assert payload["latest_scan_id"]
+
+
+def test_status_human_output_prints_the_artifact_integrity_hint(
+    java_repo: Path, capsys,
+) -> None:
+    """FIX ROUND 29 (twenty-fifth cold read, F8b polish): the round-7c
+    parity precedent - default human output must not tell a strictly
+    LESS honest story than --json, which already carries artifact_
+    integrity_hint unconditionally. It existed only in --json before
+    this fix."""
+    _run(["comprehension", "scan"], java_repo)
+    capsys.readouterr()
+    exit_code = _run(["comprehension", "status"], java_repo)
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "validate" in out
+    assert scan_pipeline.STATUS_ARTIFACT_INTEGRITY_HINT in out
 
 
 def test_status_human_output_is_silent_about_integrity_when_verified(

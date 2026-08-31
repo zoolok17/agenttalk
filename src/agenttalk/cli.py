@@ -2276,6 +2276,13 @@ def cmd_comprehension(args: argparse.Namespace) -> int:
             print(f"status:   {payload['status']}")
             print(f"problems: {payload['problem_count']}")
             _print_scan_json_integrity_if_not_verified(payload)
+            # FIX ROUND 29 (twenty-fifth cold read, F8b polish): the
+            # round-7c parity precedent (default human output must not
+            # tell a strictly LESS honest story than --json, which
+            # already carries this field unconditionally) - artifact_
+            # integrity_hint existed only in --json output, never in the
+            # default human rendering a caller most commonly sees.
+            print(f"hint:     {payload['artifact_integrity_hint']}")
         return 0
 
     if action == "report":
@@ -14164,11 +14171,21 @@ def build_parser() -> argparse.ArgumentParser:
     # slice - had no declaration anywhere a `--help` reader would see it.
     cscan = compsub.add_parser(
         "scan", help="Create and publish one immutable comprehension run.",
+        # FIX ROUND 29 (twenty-fifth cold read, F8a polish, declare-not-
+        # silently-simplify): the design's own step 1 says scan "resolves
+        # the INITIALIZED project root" - this slice never actually
+        # checks that .agenttalk/ was created via `agenttalk init` first,
+        # it simply writes .agenttalk/comprehension/ under whatever root
+        # resolves, initialized or not. Declared rather than enforced -
+        # requiring real init here is a repo-wide bus concern, wider than
+        # this one command, and out of scope for a lean fix.
         description="Create and publish one immutable comprehension run. "
                     "--scope/--exclude narrowing and --config (config.json parsing) are "
                     "design-promised for this command but not implemented this slice - "
                     "every scan walks the whole repository root with no narrowing or "
-                    "configuration overrides.",
+                    "configuration overrides. This slice does not require the project root "
+                    "to already be initialized (`agenttalk init`) - it creates "
+                    ".agenttalk/comprehension/ under whatever root resolves either way.",
     )
     cscan.add_argument(
         "--work-id",

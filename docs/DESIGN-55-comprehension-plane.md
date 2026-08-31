@@ -600,6 +600,16 @@ cryptographically true.
 
 One scan follows this fixed pipeline:
 
+FIX ROUND 29 (twenty-fifth cold read, task #55 slice-1 PR-B, F8a polish,
+declare-not-silently-simplify): step 1's own "initialized project root"
+wording is NOT enforced this slice - `scan` never checks that `.agenttalk/`
+was created via `agenttalk init` first; it resolves whatever root the
+caller names (or the bus's own root-discovery walk finds) and creates
+`.agenttalk/comprehension/` under it either way, initialized or not.
+Requiring real init here is a repo-wide bus concern wider than this one
+command - declared rather than enforced this slice (see `scan --help`'s
+own description).
+
 1. Resolve the initialized project root and load/validate local configuration.
 2. Prove the private-store VCS disposition or obtain the attended per-run
    acknowledgement described below. This happens before staging or lock files
