@@ -909,14 +909,15 @@ def build_readiness(
     # applies to entry_points_mapped/feature_linked ONLY (matching what
     # the file-aggregation pass right after it actually consults) -
     # dependencies_resolved/test_evidence_located get their OWN,
-    # separate, narrower extension in the main loop below (single-top-
-    # level-type files only - the design's merge rule 4 applied
-    # consistently with CR17-2's own established single-type-file
-    # scoping, never a multi-type file where the ambiguity CR17-2
-    # itself already declines to guess through). source_understood
-    # deliberately stays untouched throughout - the adapter genuinely
-    # parsed this exact file/class; what is ambiguous is cross-file
-    # IDENTITY, not comprehension, a different fact entirely.
+    # separate extension in the main loop below - MICRO-ROUND 23b widened
+    # this from round 23's own single-top-level-type-file-only scoping
+    # to ANY conflicted component anywhere in the file's own containment
+    # chain (reviewer-3's own R4 consistency ask), matching entry_points_
+    # mapped/feature_linked's identical "an attributed unknown anywhere
+    # wins outright" policy for a 2+-children file exactly. source_
+    # understood deliberately stays untouched throughout - the adapter
+    # genuinely parsed this exact file/class; what is ambiguous is
+    # cross-file IDENTITY, not comprehension, a different fact entirely.
     # boundaries_identified is unaffected either way (always unknown
     # regardless, unrelated to identity).
     for unit in modules:
@@ -1009,30 +1010,40 @@ def build_readiness(
             test_evidence_signal = _signal(
                 unit.unit_id, "test_evidence_located", "unknown", "detected",
                 "duplicate_qualified_name")
-        # FIX ROUND 23 (nineteenth cold read, F4 MINOR, wrong-data): a
-        # FILE unit never carries a conflict_id itself (only "component"-
-        # kind records do), so the override above never applies to a
-        # file directly - a file containing a conflicted component kept
-        # publishing CONFIDENT dependencies_resolved/test_evidence_
-        # located while the component itself correctly reported
-        # unknown. Extended for a SINGLE-top-level-type file only (the
-        # design's own merge rule 4 applied consistently with CR17-2's
-        # own established single-type-file scoping - there is no
-        # attribution ambiguity at all when there is only one real
-        # candidate); a multi-type file is NOT extended here, the same
-        # "cannot honestly credit one sibling's own fact to the whole
-        # file" reasoning CR17-2 already applies to its own multi-type
-        # branch.
+        # FIX ROUND 23 (nineteenth cold read, F4 MINOR, wrong-data),
+        # EXTENDED micro-round 23b (reviewer-3's own R4 consistency ask,
+        # taken): a FILE unit never carries a conflict_id itself (only
+        # "component"-kind records do), so the override above never
+        # applies to a file directly - a file containing a conflicted
+        # component kept publishing CONFIDENT dependencies_resolved/
+        # test_evidence_located while the component itself correctly
+        # reported unknown. Round 23's own fix scoped this to a SINGLE
+        # top-level-type file only (direct children, CR17-2's own
+        # terminology) - but entry_points_mapped/feature_linked's own
+        # file-aggregation above already extends the identical "an
+        # attributed unknown anywhere wins outright" policy across ALL
+        # transitive descendants, for ANY number of children (round
+        # 22b's own R1) - two different policies for the SAME 2+-
+        # children-file shape on one record was an inconsistency, not a
+        # deliberate distinction (the reviewer's own Multi.java repro:
+        # dependencies_resolved published a confident satisfied - TRUE
+        # about the file's own edges - while a sibling component's own
+        # IDENTITY is unknown, the exact fact entry_points_mapped/
+        # feature_linked already surface as unknown for the SAME file).
+        # Widened to match: ANY conflicted component anywhere in the
+        # file's own containment chain (not just a lone direct child)
+        # now overrides both signals, the identical descendant walk
+        # entry_points_mapped/feature_linked's own aggregation already
+        # uses above - never guessing which sibling's facts are real
+        # when one sibling's own identity is itself unresolved.
         if unit.kind == "file":
-            direct_component_children = [
-                module_by_id[child_id] for child_id in children_by_container.get(unit.unit_id, [])
+            conflicted_descendants = [
+                module_by_id[child_id] for child_id in descendants
                 if module_by_id.get(child_id) is not None
                 and module_by_id[child_id].kind == "component"
+                and module_by_id[child_id].conflict_id is not None
             ]
-            if (
-                len(direct_component_children) == 1
-                and direct_component_children[0].conflict_id is not None
-            ):
+            if conflicted_descendants:
                 dependencies_signal = _signal(
                     unit.unit_id, "dependencies_resolved", "unknown", "detected",
                     "duplicate_qualified_name")

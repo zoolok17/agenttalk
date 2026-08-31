@@ -3640,6 +3640,63 @@ def test_a_conflicted_units_readiness_signals_stay_unknown_not_confident(
     assert plain_dependencies_signal["reason_code"] != "duplicate_qualified_name"
 
 
+def test_a_conflicted_components_own_multi_type_file_also_stays_unknown_r4(
+    java_repo: Path,
+) -> None:
+    """MICRO-ROUND 23b (reviewer-3's own R4 consistency ask, taken): round
+    23's own F4 fix only extended the file-level override to a SINGLE
+    top-level-type file - a MULTI-type file (the reviewer's own
+    Multi.java repro) kept publishing a CONFIDENT dependencies_resolved
+    satisfied (TRUE about the file's own unioned edges - a clean sibling
+    class really does have a resolved import), while entry_points_
+    mapped/feature_linked's own file-aggregation ALREADY reports unknown
+    for the identical file, since one of its two top-level types is
+    itself conflicted - two different policies for the same 2+-children
+    shape on one record. Widened to match: ANY conflicted component
+    anywhere in the file's own containment chain now overrides
+    dependencies_resolved/test_evidence_located too, regardless of how
+    many top-level types the file declares."""
+    import json
+
+    (java_repo / "modC" / "src" / "main" / "java" / "com" / "acme" / "multiconflict").mkdir(
+        parents=True)
+    (java_repo / "modC" / "src" / "main" / "java" / "com" / "acme" / "multiconflict" / "Dup.java"
+     ).write_text("package com.acme.multiconflict;\nclass Dup {}\n", encoding="utf-8")
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "multiconflict").mkdir(parents=True)
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "other").mkdir(parents=True)
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "other" / "Plain2.java").write_text(
+        "package com.acme.other;\nclass Plain2 {}\n", encoding="utf-8")
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "multiconflict" / "Dup.java"
+     ).write_text(
+        "package com.acme.multiconflict;\n"
+        "import com.acme.other.Plain2;\n"
+        "class Dup {}\n"
+        "class Sibling {\n"
+        "    Plain2 p;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+
+    multi_file_unit_id = next(
+        u["unit_id"] for u in modules_doc["units"]
+        if u["kind"] == "file" and u["display_name"] == "Dup.java"
+        and len([
+            m for m in modules_doc["units"]
+            if m["kind"] == "component" and m.get("container_unit_id") == u["unit_id"]
+        ]) == 2
+    )
+    for check in ("dependencies_resolved", "test_evidence_located"):
+        signal = next(
+            s for s in readiness_doc["signals"]
+            if s["unit_id"] == multi_file_unit_id and s["check"] == check)
+        assert signal["stored_status"] == "unknown", check
+        assert signal["reason_code"] == "duplicate_qualified_name", check
+
+
 def test_run_scan_an_import_of_a_binary_sniffed_excluded_file_is_unresolved_not_external(
     java_repo: Path,
 ) -> None:
