@@ -1,6 +1,6 @@
 """Shared reply-construction rules for the CLI and the wrapper.
 
-#201 (JAWS retro finding 1): a wrapped child that cannot run shell commands
+#201 (the dogfood migration's retro finding 1): a wrapped child that cannot run shell commands
 cannot deliver `agenttalk reply`, so the wrapper delivers a child-written
 draft file itself. The CLI and the wrapper MUST apply byte-identical
 correlation-echo and digest rules or nonce dedupe silently forks (the

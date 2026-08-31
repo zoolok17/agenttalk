@@ -1,7 +1,7 @@
 """#201 wrapper-owned reply delivery (freeform path).
 
 A wrapped child whose harness statically rejects or approval-gates shell
-commands (the JAWS claude seat: 5/5 turns undeliverable) answers by writing
+commands (the dogfood claude seat: 5/5 turns undeliverable) answers by writing
 the wrapper-declared draft file; the wrapper validates and publishes it with
 exact thread correlation. Fixture Store + injected drive — NO real CLI here
 (the real spawn path is covered by the stub canary's draft_only scenario).

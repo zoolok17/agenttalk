@@ -4,8 +4,9 @@ Status: rev 3 — rev 1 REJECTED (3 blockers, all resolved in rev 2); rev 2
 re-verdict found 3 NEW defects in the rev-2 additions (NEW-1 blocker, NEW-2
 major, NEW-3 minor), fixed here per the reviewer's prescriptions; reviewer
 pre-cleared rev 3 as approve-implement with these deltas. Author:
-claude-agenttalk-lead · 2026-08-25. Field basis: JAWS retro finding 2;
-mechanism investigation 2026-08-25 (anchors verified at master a35297c).
+claude-agenttalk-lead · 2026-08-25. Field basis: the dogfood migration's
+retrospective, finding 2; mechanism investigation 2026-08-25 (anchors
+verified at master a35297c).
 
 ## Verified mechanism (unchanged from rev 1, review-confirmed)
 
