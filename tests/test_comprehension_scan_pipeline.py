@@ -3697,6 +3697,65 @@ def test_a_conflicted_components_own_multi_type_file_also_stays_unknown_r4(
         assert signal["reason_code"] == "duplicate_qualified_name", check
 
 
+def test_a_component_with_a_conflicted_nested_descendant_also_stays_unknown_f6(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 24 (twentieth cold read, F6 MINOR, consistency,
+    ``.cr20-nest``): round 22's own F1 invariant ("never more confident
+    than your components") was only ever applied at the FILE level -
+    `Outer` (a real, unique `@WebServlet` with its own resolved import)
+    contains a statically NESTED class `Inner`, whose own qualified name
+    (`com.acme.Outer.Inner`) collides with an entirely unrelated
+    top-level class also named `Inner` declared in a package literally
+    named `com.acme.Outer` (a real, if unusual, shaded/relocated-package
+    shape this producer's own coarse qualified-name computation cannot
+    tell apart from genuine nesting) - `Outer` ITSELF is never a
+    conflict claimant (its own qualified name `com.acme.Outer` is
+    unique), so the pre-existing per-unit `conflict_id` override never
+    fires for it directly; only the NEW component-level nested-
+    descendant aggregation this round adds can catch it. The enclosing
+    FILE already correctly rolled up to unknown via the existing file-
+    level aggregation - `Outer`, one level in, must now too."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "com" / "acme").mkdir(parents=True)
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "other").mkdir(parents=True)
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "other" / "Plain3.java").write_text(
+        "package com.acme.other;\nclass Plain3 {}\n", encoding="utf-8")
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "Outer.java").write_text(
+        "package com.acme;\n"
+        "import com.acme.other.Plain3;\n"
+        '@WebServlet("/outer")\n'
+        "class Outer {\n"
+        "    Plain3 p;\n"
+        "    static class Inner {}\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "Outer").mkdir(parents=True)
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "Outer" / "Inner.java").write_text(
+        "package com.acme.Outer;\nclass Inner {}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+
+    outer_unit_id = next(
+        u["unit_id"] for u in modules_doc["units"]
+        if u["kind"] == "component" and u["qualified_name"] == "com.acme.Outer")
+    assert next(
+        u for u in modules_doc["units"] if u["unit_id"] == outer_unit_id
+    )["conflict_id"] is None
+
+    for check in ("dependencies_resolved", "entry_points_mapped", "feature_linked",
+                  "test_evidence_located"):
+        signal = next(
+            s for s in readiness_doc["signals"]
+            if s["unit_id"] == outer_unit_id and s["check"] == check)
+        assert signal["stored_status"] == "unknown", check
+        assert signal["reason_code"] == "duplicate_qualified_name", check
+
+
 def test_run_scan_a_pom_extracting_nothing_reports_source_understood_unknown_f1b(
     java_repo: Path,
 ) -> None:

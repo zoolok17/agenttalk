@@ -960,6 +960,44 @@ def build_readiness(
             "duplicate_qualified_name")
         feature_linked_by_unit_id[unit.unit_id] = _signal(
             unit.unit_id, "feature_linked", "unknown", "detected", "duplicate_qualified_name")
+    # FIX ROUND 24 (twentieth cold read, F6 MINOR, consistency): round
+    # 22's own F1 invariant ("never MORE CONFIDENT than your components")
+    # was only ever applied at the FILE level - a COMPONENT with its own
+    # NESTED component descendant (a statically nested class one level
+    # further in) kept publishing its OWN direct, un-aggregated signal
+    # regardless of a nested descendant's real facts (the reader's own
+    # `.cr20-nest`: `Outer` published a confident `satisfied`/`no_entry_
+    # point` pair while its own nested `Inner` was conflicted and
+    # reported `unknown` for the identical underlying identity question -
+    # the enclosing FILE correctly rolled up to `unknown` via the
+    # existing file-level aggregation below, but `Outer` itself, one
+    # level in, did not). Aggregates `Outer`'s own ALREADY-COMPUTED
+    # direct signal together with its own nested descendants' signals
+    # via the identical worse-of ranking - unlike the file-level
+    # aggregation (which never independently owns entry-point evidence
+    # of its own, so a lone child's signal is mirrored exactly), a
+    # component's own DIRECT evidence is real and independent (`Outer`
+    # itself may be its own real `@WebServlet`) and must not be silently
+    # discarded - it is included in the comparison, not replaced by it.
+    for unit in modules:
+        if unit.kind != "component":
+            continue
+        nested_component_descendants = [
+            module_by_id[child_id] for child_id in _transitive_descendants(unit.unit_id)
+            if module_by_id.get(child_id) is not None and module_by_id[child_id].kind == "component"
+        ]
+        if not nested_component_descendants:
+            continue
+        entry_points_mapped_by_unit_id[unit.unit_id] = _aggregate_file_signal_from_components(
+            unit, "entry_points_mapped",
+            [entry_points_mapped_by_unit_id[unit.unit_id]]
+            + [entry_points_mapped_by_unit_id[c.unit_id] for c in nested_component_descendants],
+        )
+        feature_linked_by_unit_id[unit.unit_id] = _aggregate_file_signal_from_components(
+            unit, "feature_linked",
+            [feature_linked_by_unit_id[unit.unit_id]]
+            + [feature_linked_by_unit_id[c.unit_id] for c in nested_component_descendants],
+        )
     for unit in modules:
         if unit.kind != "file":
             continue
@@ -1020,14 +1058,21 @@ def build_readiness(
         # its transitive descendants does - the same "roll a per-type
         # fact up to its owning file" idiom CR10-1's dependencies_signal
         # already established for this exact unit/file relationship.
+        # FIX ROUND 24 (F6 MINOR, consistency): computed for BOTH kinds
+        # now (the conflict-descendant check just below needs it for
+        # "component" units too) - the test-status ROLLUP immediately
+        # below stays FILE-only, unchanged; F6 does not touch that
+        # separate mechanism.
+        own_transitive_descendants = (
+            _transitive_descendants(unit.unit_id) if unit.kind in ("file", "component") else frozenset()
+        )
         is_tested = unit.unit_id in tested_unit_ids
         has_inferred_pairing = unit.unit_id in inferred_test_pairing_unit_ids
         if unit.kind == "file":
-            descendants = _transitive_descendants(unit.unit_id)
             if not is_tested:
-                is_tested = bool(tested_unit_ids & descendants)
+                is_tested = bool(tested_unit_ids & own_transitive_descendants)
             if not has_inferred_pairing:
-                has_inferred_pairing = bool(inferred_test_pairing_unit_ids & descendants)
+                has_inferred_pairing = bool(inferred_test_pairing_unit_ids & own_transitive_descendants)
         test_evidence_signal = _check_test_evidence_located(unit, is_tested, has_inferred_pairing)
         # FIX ROUND 22 (F4, wrong-data, narrow trigger): see the
         # entry_points_mapped_by_unit_id/feature_linked_by_unit_id
@@ -1068,9 +1113,16 @@ def build_readiness(
         # entry_points_mapped/feature_linked's own aggregation already
         # uses above - never guessing which sibling's facts are real
         # when one sibling's own identity is itself unresolved.
-        if unit.kind == "file":
+        # FIX ROUND 24 (twentieth cold read, F6 MINOR, consistency):
+        # widened from FILE-only to ALSO cover a "component"-kind unit
+        # with its own nested component descendant - round-22 F1's own
+        # invariant ("never more confident than your components")
+        # applies one level in too, the identical descendant walk and
+        # ranking, restated for dependencies_resolved/test_evidence_
+        # located instead of entry_points_mapped/feature_linked.
+        if unit.kind in ("file", "component"):
             conflicted_descendants = [
-                module_by_id[child_id] for child_id in descendants
+                module_by_id[child_id] for child_id in own_transitive_descendants
                 if module_by_id.get(child_id) is not None
                 and module_by_id[child_id].kind == "component"
                 and module_by_id[child_id].conflict_id is not None
