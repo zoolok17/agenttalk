@@ -192,6 +192,62 @@ def _language_for_path(relative_path: str) -> str:
     return "unknown"
 
 
+#: FIX ROUND 32 (twenty-eighth cold read, F3 MAJOR, wrong-data): the OLD
+#: discriminator for "infrastructure" classification among tier-3
+#: (recorded, non-degrading ``unsupported_language``) paths was TIER
+#: MEMBERSHIP ITSELF - every tier-3 path got "infrastructure", with no
+#: further distinction. Tier 3 is a DEGRADATION calibration (worker.py's
+#: own three-tier rule: "never-incidental application/database estate" vs
+#: everything else), not a classification one - it deliberately includes
+#: real, polyglot APPLICATION source this producer just has no adapter
+#: for (an Express/Node service's own ``.js``, a Python ETL job's own
+#: ``.py`` - round 17b's own measured "routinely incidental" exclusion
+#: from tier 2) alongside genuine build/tooling/infra files (a
+#: Dockerfile, a CI YAML, a build wrapper). Both landed in the identical
+#: bucket as a `.gitignore` - a real service's own source file classified
+#: the SAME as a project's own tooling plumbing.
+#:
+#: The discriminator instead is this closed, PROVISIONAL basename/
+#: extension/well-known-CI-path allowlist - the SAME closed-set
+#: convention every other calibration constant in this package already
+#: follows (documented, expected to grow, safe direction to be wrong in
+#: is UNDER-claiming). A tier-3 path matching NEITHER this list NOR the
+#: benign-extension/basename allowlist (worker.py's own, which never even
+#: reaches this branch - see ``_derive_classification`` below) gets an
+#: EMPTY classification, never a guessed "infrastructure" - the same
+#: "no decided value" discipline round 28's own encoding_undecodable fix
+#: already established for a file this producer never even read.
+_CONFIDENT_INFRASTRUCTURE_BASENAMES = frozenset({
+    "dockerfile", "makefile", "jenkinsfile", "vagrantfile", "procfile",
+    "mvnw", "mvnw.cmd", "gradlew", "gradlew.bat",
+    ".travis.yml", ".gitlab-ci.yml", ".drone.yml", "appveyor.yml", "azure-pipelines.yml",
+})
+#: ``.sh``/``.bash`` (round 23's own ratified ``release.sh`` shape,
+#: reconfirmed here rather than regressed): a shell script is essentially
+#: ALWAYS a build/release/tooling script in an ordinary repository, never
+#: a genuine polyglot application SERVICE the way a ``.js``/``.py`` file
+#: can be - unlike those two, it never needed round 17b's own "routinely
+#: incidental" carve-out to begin with.
+_CONFIDENT_INFRASTRUCTURE_EXTENSIONS = frozenset({".properties", ".sh", ".bash"})
+#: A lowercase POSIX-spelled substring, checked anywhere in the path -
+#: both are well-known, CI-specific directory conventions (arbitrary
+#: basenames live inside them, e.g. ``.github/workflows/build.yml``),
+#: never a claim about an arbitrary ``.yml``/``.yaml`` file elsewhere in
+#: the tree (an ``application.yml`` is real application configuration,
+#: not confidently infrastructure).
+_CONFIDENT_INFRASTRUCTURE_PATH_SEGMENTS = (".github/workflows/", ".circleci/")
+
+
+def _is_confident_infrastructure_path(relative_path: str) -> bool:
+    posix_lower = relative_path.replace("\\", "/").lower()
+    name_lower = posix_lower.rsplit("/", 1)[-1]
+    return (
+        name_lower in _CONFIDENT_INFRASTRUCTURE_BASENAMES
+        or name_lower.endswith(tuple(_CONFIDENT_INFRASTRUCTURE_EXTENSIONS))
+        or any(segment in posix_lower for segment in _CONFIDENT_INFRASTRUCTURE_PATH_SEGMENTS)
+    )
+
+
 def _default_classification(relative_path: str) -> str:
     if _TEST_SOURCE_ROOT_SEGMENT.search(relative_path.replace("\\", "/")):
         return "test"
@@ -297,6 +353,21 @@ def _derive_classification(
     decoded/root-sniffed), so both get the identical empty-
     classification treatment. The caveat's own sentence is true now,
     not merely asserted.
+
+    FIX ROUND 32 (twenty-eighth cold read, F3 MAJOR, wrong-data,
+    CORRECTION): every paragraph above still describes the intent
+    correctly, but the ``non_degrading_unsupported_language_paths``
+    branch below used to derive ``"infrastructure"`` from TIER
+    MEMBERSHIP ALONE - true for a Dockerfile/CI-YAML/build-wrapper, but
+    ALSO true for a polyglot repo's own real, unmodeled application
+    source (an Express service's ``.js``, a Python ETL job's ``.py`` -
+    round 17b's own measured "routinely incidental" exclusion from tier
+    2) - a real service source file classified the identical
+    "infrastructure" as a `.gitignore`. See
+    ``_is_confident_infrastructure_path`` for the closed allowlist that
+    now discriminates within this branch; a tier-3 path matching neither
+    it nor worker.py's own benign allowlist gets no classification at
+    all.
     """
     default = _default_classification(relative_path)
     if default == "test":
@@ -304,7 +375,15 @@ def _derive_classification(
     if "encoding_undecodable" in reasons or "binary_excluded_root_sniffed_xml" in reasons:
         return None
     if relative_path in non_degrading_unsupported_language_paths:
-        return "infrastructure"
+        # FIX ROUND 32 (F3 MAJOR): tier-3 membership alone is no longer
+        # the discriminator - see _is_confident_infrastructure_path's own
+        # docstring. A tier-3 path that does not match this closed
+        # allowlist (a polyglot service's own real source this producer
+        # merely has no adapter for) gets NO classification at all,
+        # never a guessed "infrastructure".
+        if _is_confident_infrastructure_path(relative_path):
+            return "infrastructure"
+        return None
     if java_result_is_none and not reasons:
         # No worker problem recorded AT ALL - worker.py's own inverted
         # allowlist (round 16's own fix) means an unenumerated,

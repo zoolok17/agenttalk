@@ -433,6 +433,41 @@ def test_non_code_infrastructure_files_no_longer_publish_as_production(
     assert jsp_unit["classification"] == ["production"]
 
 
+def test_polyglot_application_source_in_tier_3_is_not_classified_infrastructure(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 32 (twenty-eighth cold read, F3 MAJOR, wrong-data):
+    mirrors the reader's own .cr28-polyapp shape - a real Node/Express
+    service (server.js) and a Python ETL job (etl_job.py) are BOTH tier-3
+    (worker.py's own round-17b "routinely incidental" exclusion from
+    tier 2) alongside a Dockerfile, but they are genuine, unmodeled
+    APPLICATION source, not build/tooling/infra - the OLD tier-membership
+    discriminator classified all of them identically as "infrastructure".
+    Neither now gets a guessed classification at all; the Dockerfile
+    (confidently infrastructure) and a real Java class (production) stay
+    exactly as before."""
+    import json
+
+    (java_repo / "server.js").write_text(
+        "const app = require('express')();\napp.listen(3000);\n", encoding="utf-8")
+    (java_repo / "etl_job.py").write_text(
+        "def run():\n    pass\n", encoding="utf-8")
+    (java_repo / "Dockerfile").write_text("FROM eclipse-temurin:21\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+
+    server_unit = next(u for u in modules_doc["units"] if u["display_name"] == "server.js")
+    etl_unit = next(u for u in modules_doc["units"] if u["display_name"] == "etl_job.py")
+    dockerfile_unit = next(u for u in modules_doc["units"] if u["display_name"] == "Dockerfile")
+    app_unit = next(u for u in modules_doc["units"] if u["display_name"] == "App.java")
+
+    assert server_unit["classification"] == []
+    assert etl_unit["classification"] == []
+    assert dockerfile_unit["classification"] == ["infrastructure"]
+    assert app_unit["classification"] == ["production"]
+
+
 def test_a_files_own_signal_rolls_up_through_a_nested_entry_point_class(
     java_repo: Path,
 ) -> None:
