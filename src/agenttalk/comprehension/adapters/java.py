@@ -4560,7 +4560,7 @@ def parse_web_xml(
     # a-confident-negative discipline round 30's own R2 rename applied
     # to `dependencies_resolved`'s reason, here for a check's own SCOPE
     # rather than a reason's own name.
-    route_pattern_owners: dict[str, set[str]] = {}
+    route_pattern_owners: dict[str, set[tuple[str, str]]] = {}
     for block_match in _SERVLET_MAPPING_BLOCK_RE.finditer(structural):
         # FIX ROUND 26 (twenty-second cold read, F2 BLOCKER, wrong-data):
         # web-app 2.4/2.5 puts <description> BEFORE <servlet-name>, so a
@@ -4651,7 +4651,22 @@ def parse_web_xml(
             # point. Kept as the real, honest value rather than
             # fabricating a placeholder name for it.
             url_pattern = _bounded_route_target(decoded.strip())
-            route_pattern_owners.setdefault(url_pattern, set()).add(owner_qualified_name)
+            # FIX ROUND 32 (twenty-eighth cold read, F6 MINOR, wrong-data):
+            # deduped on `owner_qualified_name` ALONE before - two
+            # DIFFERENT servlet-names both backed by the SAME class (a
+            # real, legal descriptor shape - one servlet class, multiple
+            # <servlet> declarations under different names) resolved to
+            # the identical owner_qualified_name and collapsed into a set
+            # of size 1, so `len(owner_entries) < 2` below silently never
+            # fired, contradicting this check's own detail message
+            # ("mapped by 2+ different servlets"). Deduped on the
+            # (servlet_name, owner_qualified_name) PAIR instead - a given
+            # name resolves to exactly one owner within this file, so the
+            # SAME name mapped twice (case A/B's own existing dedup) still
+            # collapses to one element exactly as before, while two
+            # DISTINCT names sharing one class now correctly count as two.
+            route_pattern_owners.setdefault(url_pattern, set()).add(
+                (servlet_name, owner_qualified_name))
             # FIX ROUND 27 (F4, mechanism confirmed): the paired
             # route-relation edge every annotation-based route already
             # emits alongside its own entry point - see this function's
@@ -4690,15 +4705,16 @@ def parse_web_xml(
     # file genuinely was fully understood; the inconsistency is a fact
     # ABOUT its content, never an evidence gap that should suppress any
     # unit's own readiness).
-    for url_pattern, owners in sorted(route_pattern_owners.items()):
-        if len(owners) < 2:
+    for url_pattern, owner_entries in sorted(route_pattern_owners.items()):
+        if len(owner_entries) < 2:
             continue
+        described = ", ".join(
+            f"{name} ({qualified})" for name, qualified in sorted(owner_entries))
         problems.append(JavaAdapterProblem(
             reason_code="duplicate_route_target",
             detail=f"<url-pattern>{url_pattern}</url-pattern> is mapped by 2+ different "
-                   f"servlets ({', '.join(sorted(owners))}) - undefined dispatch, no real "
-                   "container can serve the identical pattern from more than one owner "
-                   "at once",
+                   f"servlet-names ({described}) - undefined dispatch, no real container "
+                   "can serve the identical pattern from more than one owner at once",
             qualified_name=f"{relative_path}#duplicate_route_target#{url_pattern}",
         ))
     # FIX ROUND 22 (eighteenth cold read, F3 MAJOR, wrong-data): a

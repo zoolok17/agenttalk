@@ -2602,6 +2602,99 @@ def test_run_scan_two_servlets_mapped_to_different_url_patterns_publishes_no_pro
     assert not any(p["reason_code"] == "duplicate_route_target" for p in problems_doc["problems"])
 
 
+def test_run_scan_two_servlet_names_backed_by_the_same_class_mapped_to_one_pattern_publishes_a_problem(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 32 (twenty-eighth cold read, F6 MINOR, wrong-data): case
+    C - two DIFFERENT servlet-names (a real, legal descriptor shape - one
+    servlet class registered under two names) both backed by the SAME
+    class, mapped to the identical <url-pattern>, used to dedup down to
+    ONE owner (keyed on the resolved CLASS) and publish zero problems -
+    contradicting this check's own "2+ different servlets" claim. Now
+    keyed on the (name, class) pair, so two distinct names always count
+    as two, regardless of what class either resolves to."""
+    import json
+
+    web_dir = java_repo / "src" / "main" / "java" / "com" / "acme" / "web"
+    web_dir.mkdir(parents=True)
+    (web_dir / "SharedServlet.java").write_text(
+        "package com.acme.web;\nclass SharedServlet {\n}\n", encoding="utf-8")
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name>a</servlet-name>\n"
+        "    <servlet-class>com.acme.web.SharedServlet</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet>\n"
+        "    <servlet-name>b</servlet-name>\n"
+        "    <servlet-class>com.acme.web.SharedServlet</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>a</servlet-name>\n"
+        "    <url-pattern>/shared/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>b</servlet-name>\n"
+        "    <url-pattern>/shared/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matching = [p for p in problems_doc["problems"] if p["reason_code"] == "duplicate_route_target"]
+    assert len(matching) == 1
+    assert "a" in matching[0]["detail"]
+    assert "b" in matching[0]["detail"]
+    assert "com.acme.web.SharedServlet" in matching[0]["detail"]
+    assert "/shared/*" in matching[0]["detail"]
+
+
+def test_run_scan_the_same_servlet_name_mapped_twice_to_one_pattern_publishes_no_problem(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 32 (F6's own case D regression control): the SAME
+    servlet-name mapped to the identical <url-pattern> twice (two
+    <servlet-mapping> elements, one name) is never a "2+ different
+    servlets" collision - the (name, class) pair dedup this fix relies on
+    must still collapse this to a single element, exactly as the old
+    class-keyed dedup did."""
+    import json
+
+    web_dir = java_repo / "src" / "main" / "java" / "com" / "acme" / "web"
+    web_dir.mkdir(parents=True)
+    (web_dir / "SoleServlet.java").write_text(
+        "package com.acme.web;\nclass SoleServlet {\n}\n", encoding="utf-8")
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name>sole</servlet-name>\n"
+        "    <servlet-class>com.acme.web.SoleServlet</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>sole</servlet-name>\n"
+        "    <url-pattern>/dup/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>sole</servlet-name>\n"
+        "    <url-pattern>/dup/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    assert not any(p["reason_code"] == "duplicate_route_target" for p in problems_doc["problems"])
+
+
 def test_run_scan_a_duplicate_filter_name_with_conflicting_classes_publishes_a_conflict(
     java_repo: Path,
 ) -> None:
