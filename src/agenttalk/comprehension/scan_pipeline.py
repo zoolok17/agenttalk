@@ -190,6 +190,13 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     # detects and tags (conflict_id), but never surfaced anywhere an
     # operator actually reads until now.
     "duplicate_qualified_name": "warning",
+    # FIX ROUND 29 (twenty-fifth cold read, F1 BLOCKER): a web.xml
+    # declaring the SAME servlet-name/filter-name twice with different
+    # class values - a real collision, a DIFFERENT root cause from
+    # duplicate_qualified_name above (this one is entirely local to one
+    # descriptor file, never a cross-file FQN collision) but the same
+    # "recorded, degrading" bucket.
+    "duplicate_descriptor_name": "warning",
     # FIX ROUND 17 (thirteenth cold read, CR13-3 MAJOR, part (b) - THE
     # CLASS-CLOSER): a recognized-but-unsupported route-like annotation
     # (JAX-WS's own @WebMethod) - under-claimed evidence, the same
@@ -618,6 +625,17 @@ def run_scan(
             and "content_digest" in entry
             and worker.is_a_root_sniffed_xml_extension(entry["path"])
         }
+        # FIX ROUND 29 (twenty-fifth cold read, F1 BLOCKER, wrong-data):
+        # every web.xml this run parsed may have recorded its own
+        # duplicated servlet-name/filter-name conflicts (java.parse_
+        # web_xml's own descriptor_name_conflicts) - aggregated across
+        # every producer here, the same "collect once, thread through"
+        # pattern non_degrading_unsupported_language_paths above follows.
+        descriptor_name_conflicts = [
+            conflict
+            for result in java_results.values()
+            for conflict in result.descriptor_name_conflicts
+        ]
         modules = modules_artifact.build_modules(
             discovery_result, java_results,
             worker_problem_reasons_by_path=worker_problem_reasons_by_path,
@@ -625,6 +643,7 @@ def run_scan(
             worker_problem_reasons_by_qualified_name=worker_problem_reasons_by_qualified_name,
             non_degrading_unsupported_language_paths=non_degrading_unsupported_language_paths,
             binary_excluded_root_sniffed_xml_digests=binary_excluded_root_sniffed_xml_digests,
+            descriptor_name_conflicts=descriptor_name_conflicts,
         )
         # M7 (cold-read, PR-B fix round 3): discovery already computed
         # each file's own content digest - dependencies_artifact.py and

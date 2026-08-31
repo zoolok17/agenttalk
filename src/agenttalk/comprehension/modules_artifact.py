@@ -95,6 +95,18 @@ class ModuleRecord:
     container_unit_id: str | None
     producers: list[dict[str, Any]]
     conflict_id: str | None = None
+    #: FIX ROUND 29 (twenty-fifth cold read, F1 BLOCKER): names WHICH
+    #: conflict produced ``conflict_id`` - ``"duplicate_qualified_name"``
+    #: (two units declaring the identical fully-qualified name across
+    #: files) or ``"duplicate_descriptor_name"`` (a web.xml servlet-name/
+    #: filter-name declared twice with different class values, entirely
+    #: local to one descriptor). Both conflict kinds route through the
+    #: SAME generic readiness override (any unit carrying a conflict_id
+    #: reports unknown on its dependent signals) - but that override's
+    #: own published ``reason_code`` must name the REAL cause, never
+    #: reuse ``duplicate_qualified_name`` for a conflict that is not
+    #: actually an FQN collision. ``None`` whenever ``conflict_id`` is.
+    conflict_kind: str | None = None
     evidence: list[dict[str, Any]] = field(default_factory=list)
     #: M-2 (third cold read, fix round 5): CLOSES THE CLASS - the THIRD
     #: instance of a file that no adapter ever actually analyzed
@@ -144,6 +156,7 @@ class ModuleRecord:
             "container_unit_id": self.container_unit_id,
             "producers": self.producers,
             "conflict_id": self.conflict_id,
+            "conflict_kind": self.conflict_kind,
             "evidence": self.evidence,
             "adapter_problem_reason": self.adapter_problem_reason,
             "adapter_problem_reasons": self.adapter_problem_reasons,
@@ -161,7 +174,8 @@ def module_record_from_json(payload: dict[str, Any]) -> ModuleRecord:
         source_digests=dict(payload["source_digests"]),
         classification=list(payload["classification"]),
         container_unit_id=payload["container_unit_id"], producers=list(payload["producers"]),
-        conflict_id=payload.get("conflict_id"), evidence=list(payload.get("evidence", [])),
+        conflict_id=payload.get("conflict_id"), conflict_kind=payload.get("conflict_kind"),
+        evidence=list(payload.get("evidence", [])),
         adapter_problem_reason=payload.get("adapter_problem_reason"),
         adapter_problem_reasons=list(payload.get("adapter_problem_reasons", [])),
         qualified_name=payload.get("qualified_name"),
@@ -330,6 +344,7 @@ def build_modules(
     worker_problem_reasons_by_qualified_name: dict[str, list[str]] | None = None,
     non_degrading_unsupported_language_paths: frozenset[str] | None = None,
     binary_excluded_root_sniffed_xml_digests: dict[str, str] | None = None,
+    descriptor_name_conflicts: list[tuple[str, list[str]]] | None = None,
 ) -> list[ModuleRecord]:
     """``java_results`` maps a ``.java`` file's relative path to its
     already-parsed :class:`~.adapters.java.JavaFileResult` (item 3) -
@@ -392,7 +407,14 @@ def build_modules(
     own ``adapter_problem_reasons``) - the SAME visible, empty-
     classification form the encoding-undecodable twin already gets,
     closing the gap ``CLASSIFICATION_CAVEAT``'s own sentence had wrongly
-    assumed was already closed."""
+    assumed was already closed.
+
+    ``descriptor_name_conflicts`` (FIX ROUND 29, twenty-fifth cold read,
+    F1 BLOCKER, wrong-data) is the aggregate of every web.xml this run
+    parsed own ``java.parse_web_xml``-produced conflicts (a servlet-name/
+    filter-name declared twice with different class values) - see
+    :func:`_populate_descriptor_name_conflicts`'s own docstring for the
+    resolution mechanism."""
     records: list[ModuleRecord] = []
     worker_problem_reasons_by_path = worker_problem_reasons_by_path or {}
     worker_problem_reasons_by_unit = worker_problem_reasons_by_unit or {}
@@ -570,7 +592,8 @@ def build_modules(
 
     records = _attribute_cross_file_entry_point_reasons(
         records, worker_problem_reasons_by_qualified_name or {})
-    return _populate_duplicate_qualified_name_conflicts(records)
+    records = _populate_duplicate_qualified_name_conflicts(records)
+    return _populate_descriptor_name_conflicts(records, descriptor_name_conflicts or [])
 
 
 def _attribute_cross_file_entry_point_reasons(
@@ -663,7 +686,71 @@ def _populate_duplicate_qualified_name_conflicts(records: list[ModuleRecord]) ->
     if not conflict_id_by_unit_id:
         return records
     return [
-        replace(record, conflict_id=conflict_id_by_unit_id[record.unit_id])
+        replace(
+            record, conflict_id=conflict_id_by_unit_id[record.unit_id],
+            conflict_kind="duplicate_qualified_name")
         if record.unit_id in conflict_id_by_unit_id else record
+        for record in records
+    ]
+
+
+def _populate_descriptor_name_conflicts(
+    records: list[ModuleRecord],
+    descriptor_name_conflicts: list[tuple[str, list[str]]],
+) -> list[ModuleRecord]:
+    """FIX ROUND 29 (twenty-fifth cold read, F1 BLOCKER, wrong-data): a
+    web.xml declaring the SAME servlet-name/filter-name twice with
+    DIFFERENT class values (``java.parse_web_xml``'s own ``descriptor_
+    name_conflicts`` - see its docstring for the full mechanism) is a
+    real conflict, entirely LOCAL to one descriptor file, never a
+    cross-file fully-qualified-name collision - a DIFFERENT root cause
+    from :func:`_populate_duplicate_qualified_name_conflicts` above, so
+    it gets its OWN ``conflict_kind`` (never silently relabeled as
+    ``"duplicate_qualified_name"``, which would misattribute the cause).
+    Mirrors that function's own mechanism otherwise: only a candidate
+    class that actually resolves to a real, in-scan COMPONENT unit gets
+    a conflict_id (an unresolved candidate name has no unit to stamp);
+    fewer than 2 in-scan candidates means there is nothing this RUN can
+    actually see conflicting, so no conflict_id is stamped at all - the
+    problem record java.py already published for the raw descriptor
+    fact stays the only trace, same as any other reference this run
+    cannot resolve in-scan.
+
+    A class ALREADY carrying a conflict_id (e.g. its own independent
+    duplicate-qualified-name collision) is left untouched - first
+    conflict wins, never silently overwritten by a second, unrelated
+    one; a vanishingly rare double-conflict shape, not worth a compound
+    conflict_id/kind for."""
+    if not descriptor_name_conflicts:
+        return records
+    unit_id_by_qualified_name: dict[str, str] = {
+        record.qualified_name: record.unit_id
+        for record in records
+        if record.kind == "component" and record.qualified_name is not None
+    }
+    conflict_id_by_unit_id: dict[str, str] = {}
+    for anchor, candidate_qualified_names in descriptor_name_conflicts:
+        candidate_unit_ids = sorted({
+            unit_id_by_qualified_name[name]
+            for name in candidate_qualified_names
+            if name in unit_id_by_qualified_name
+        })
+        if len(candidate_unit_ids) < 2:
+            continue
+        conflict_id = digests.conflict_id(
+            conflict_kind="duplicate_descriptor_name", anchor=anchor,
+            claim_digests=candidate_unit_ids,
+        )
+        for unit_id in candidate_unit_ids:
+            conflict_id_by_unit_id.setdefault(unit_id, conflict_id)
+
+    if not conflict_id_by_unit_id:
+        return records
+    return [
+        replace(
+            record, conflict_id=conflict_id_by_unit_id[record.unit_id],
+            conflict_kind="duplicate_descriptor_name")
+        if record.unit_id in conflict_id_by_unit_id and record.conflict_id is None
+        else record
         for record in records
     ]

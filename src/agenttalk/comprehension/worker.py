@@ -764,7 +764,8 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                 # filter publishes - threaded into JavaFileResult below,
                 # the identical channel every annotation-based route's
                 # own edge already flows through.
-                web_entry_points, web_problems, web_edges = java_adapter.parse_web_xml(rel, text)
+                web_entry_points, web_problems, web_edges, web_descriptor_name_conflicts = (
+                    java_adapter.parse_web_xml(rel, text))
             except Exception as exc:  # noqa: BLE001 - a producer bug must degrade, never abort the scan
                 problems.append(WorkerProblem(
                     reason_code="parse_failed", relative_path=rel,
@@ -783,7 +784,8 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                 java_results[rel] = java_adapter.file_result_to_json(
                     java_adapter.JavaFileResult(
                         entry_points=web_entry_points, problems=web_problems,
-                        edges=web_edges))
+                        edges=web_edges,
+                        descriptor_name_conflicts=web_descriptor_name_conflicts))
                 # FIX ROUND 24 (micro-round 24b, item 1, wrong-data): the
                 # SAME positive-evidence gate F1b already gives pom.xml -
                 # a parse that succeeds but yields ZERO entry points AND

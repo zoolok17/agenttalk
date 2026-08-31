@@ -908,6 +908,15 @@ class JavaFileResult:
     #: every producer except a pom.xml that declares at least one
     #: module - see ``declared_reactor_module_paths``.
     declared_module_paths: list[str] = field(default_factory=list)
+    #: FIX ROUND 29 (twenty-fifth cold read, F1 BLOCKER): a web.xml's own
+    #: duplicated servlet-name/filter-name conflicts (see ``parse_web_
+    #: xml``'s own docstring) - ``(anchor, sorted_candidate_qualified_
+    #: names)`` pairs, empty for every producer except a web.xml that
+    #: declares at least one such conflict. Same additive-field
+    #: precedent as ``declared_module_paths`` above (a pom's own reactor
+    #: entries) - a fact synthesized while parsing ONE file, consumed
+    #: later at the whole-run level (modules_artifact.py).
+    descriptor_name_conflicts: list[tuple[str, list[str]]] = field(default_factory=list)
 
 
 def _strip_comments_and_strings(text: str) -> tuple[str, bool]:
@@ -3720,9 +3729,66 @@ _SERVLET_CLASS_RE = _leaf_value_pattern("servlet-class", dotall=True)
 _LOAD_ON_STARTUP_RE = _leaf_presence_pattern("load-on-startup")
 
 
+#: FIX ROUND 29 (twenty-fifth cold read, F1 BLOCKER, wrong-data): a
+#: web.xml declaring the SAME servlet-name (or filter-name) twice with
+#: two DIFFERENT class values used to resolve LAST-DECLARATION-WINS,
+#: silently - ``_servlet_class_by_name``/``_filter_class_by_name`` both
+#: built a plain ``dict[str, str]``, so the second occurrence simply
+#: overwrote the first with no trace. The mapped route then published a
+#: CONFIDENT owner (whichever class happened to be declared last - the
+#: reader proved this by swapping the two ``<servlet>`` blocks and
+#: getting a DIFFERENT published owner from the identical facts) and a
+#: CONFIDENT ``no_entry_point``/``no_feature_link`` negative for the
+#: "losing" class, which is every bit as real a declared claimant as
+#: the winner - complete, zero problems, no visible trace of the
+#: contradiction at all. Routine in a merged web-fragment / copy-paste
+#: / hand-merged descriptor, exactly the target estates' own shape.
+#:
+#: Fixed as the class, mirroring the EXISTING duplicate-qualified-name
+#: conflict machinery (modules_artifact.py's own ``_populate_duplicate_
+#: qualified_name_conflicts`` + readiness_artifact.py's own generic
+#: "any unit carrying a conflict_id reports unknown on its dependent
+#: signals" override) rather than inventing a parallel mechanism: every
+#: OCCURRENCE of a name is collected (never overwritten), and split
+#: after the fact into unambiguous names (exactly one DISTINCT class
+#: value across every occurrence - the benign "two identical
+#: declarations, a harmless merge artifact" twin JUDGED to collapse
+#: silently, same as the design's own general default for a fact that
+#: does not actually conflict) versus genuinely conflicting names (2+
+#: DISTINCT class values). The caller records one visible problem per
+#: conflicting name and leaves its mapped route on the SAME synthetic-
+#: owner fallback an unmatched name already gets (no adapter chosen
+#: authoritative by execution order) - never resolving to either
+#: candidate. The candidate classes themselves get a conflict_id
+#: (modules_artifact.py, a NEW ``"duplicate_descriptor_name"`` conflict
+#: kind, resolved once path/qualified-name-to-unit_id registries exist)
+#: so their own readiness reports unknown, never a confident negative
+#: for whichever one lost the old last-write-wins race.
+def _split_name_conflicts(
+    occurrences: dict[str, list[str]],
+) -> tuple[dict[str, str], dict[str, list[str]]]:
+    """Splits ``name -> [every decoded class value declared for it, in
+    file order]`` into ``(mapping, conflicts)`` - ``mapping`` holds every
+    name whose occurrences all AGREE (one distinct value, published
+    exactly as before), ``conflicts`` holds every name with 2+ DISTINCT
+    values, each value list SORTED (order-independent: swapping which
+    block appears first in the file must never change which candidates
+    are named, only ``_split_xml_comments_and_cdata``'s own file-order
+    walk feeds this, never the caller's own order of interpretation)."""
+    mapping: dict[str, str] = {}
+    conflicts: dict[str, list[str]] = {}
+    for name, values in occurrences.items():
+        distinct = sorted(set(values))
+        if len(distinct) == 1:
+            mapping[name] = distinct[0]
+        else:
+            conflicts[name] = distinct
+    return mapping, conflicts
+
+
 def _servlet_class_by_name(
     sanitized: str, structural: str,
-) -> tuple[dict[str, str], list[tuple[str, int]], list[int]]:
+) -> tuple[dict[str, str], list[tuple[str, int]], list[int], dict[str, list[str]]]:
     """FIX ROUND 17 (thirteenth cold read, CR13-2 MAJOR, wrong-data):
     web.xml's own ``<servlet>`` element (``<servlet-name>``/
     ``<servlet-class>`` pair) - twice carried as an M5/M7 fast-follow,
@@ -3763,8 +3829,16 @@ def _servlet_class_by_name(
     a THIRD list now - ``name_undecodable`` block start offsets, no
     servlet_name possible since the name itself is what failed to
     decode - the caller records the identical problem class the mapping
-    side already does."""
-    mapping: dict[str, str] = {}
+    side already does.
+
+    FIX ROUND 29 (F1 BLOCKER): returns a FOURTH value now - ``conflicts``
+    (see ``_split_name_conflicts``'s own docstring) - a servlet-name
+    declared twice with two DIFFERENT class values. ``mapping`` no
+    longer silently picks whichever occurrence happened to be declared
+    last; a conflicting name is absent from ``mapping`` entirely (the
+    caller must treat it exactly like an unmatched name, never resolve
+    it to either candidate)."""
+    occurrences: dict[str, list[str]] = {}
     undecodable: list[tuple[str, int]] = []
     name_undecodable: list[int] = []
     for block_match in _SERVLET_BLOCK_RE.finditer(structural):
@@ -3795,8 +3869,9 @@ def _servlet_class_by_name(
         if decoded_class is None:
             undecodable.append((servlet_name, block_match.start()))
             continue
-        mapping[servlet_name] = _bounded_route_target(decoded_class.strip())
-    return mapping, undecodable, name_undecodable
+        occurrences.setdefault(servlet_name, []).append(_bounded_route_target(decoded_class.strip()))
+    mapping, conflicts = _split_name_conflicts(occurrences)
+    return mapping, undecodable, name_undecodable, conflicts
 
 
 #: FIX ROUND 21 (seventeenth cold read, CR17-3 MAJOR, wrong-data): a
@@ -3847,7 +3922,7 @@ _LISTENER_CLASS_RE = _leaf_value_pattern("listener-class", dotall=True)
 
 def _filter_class_by_name(
     sanitized: str, structural: str,
-) -> tuple[dict[str, str], list[tuple[str, int]], list[int]]:
+) -> tuple[dict[str, str], list[tuple[str, int]], list[int], dict[str, list[str]]]:
     """FIX ROUND 21b (THE MAJOR's own web.xml-symmetry follow-through):
     web.xml's own ``<filter>`` element (``<filter-name>``/
     ``<filter-class>`` pair), joined below against ``<filter-mapping>``'s
@@ -3868,8 +3943,11 @@ def _filter_class_by_name(
 
     FIX ROUND 25 (micro-round 25b, item 1, R3 BLOCK-SIDE GAP): the exact
     same third ``name_undecodable`` list ``_servlet_class_by_name`` now
-    returns - see its own docstring."""
-    mapping: dict[str, str] = {}
+    returns - see its own docstring.
+
+    FIX ROUND 29 (F1 BLOCKER): the exact same FOURTH ``conflicts`` value
+    ``_servlet_class_by_name`` now returns - see its own docstring."""
+    occurrences: dict[str, list[str]] = {}
     undecodable: list[tuple[str, int]] = []
     name_undecodable: list[int] = []
     for block_match in _FILTER_BLOCK_RE.finditer(structural):
@@ -3895,8 +3973,9 @@ def _filter_class_by_name(
         if decoded_class is None:
             undecodable.append((filter_name, block_match.start()))
             continue
-        mapping[filter_name] = _bounded_route_target(decoded_class.strip())
-    return mapping, undecodable, name_undecodable
+        occurrences.setdefault(filter_name, []).append(_bounded_route_target(decoded_class.strip()))
+    mapping, conflicts = _split_name_conflicts(occurrences)
+    return mapping, undecodable, name_undecodable, conflicts
 
 
 #: FIX ROUND 24 (micro-round 24b, reviewer-3 delta on `3a7abc2`, item 1,
@@ -3945,7 +4024,10 @@ def is_effectively_empty_web_xml(text: str) -> bool:
 
 def parse_web_xml(
     relative_path: str, text: str,
-) -> tuple[list[JavaEntryPointClaim], list[JavaAdapterProblem], list[JavaEdgeClaim]]:
+) -> tuple[
+    list[JavaEntryPointClaim], list[JavaAdapterProblem], list[JavaEdgeClaim],
+    list[tuple[str, list[str]]],
+]:
     """``route`` entry points declared as plain ``<servlet-mapping>``/
     ``<url-pattern>`` pairs in a ``web.xml`` - the same "trivially present,
     named, no inference" bar as the annotation-based routes above.
@@ -4007,7 +4089,23 @@ def parse_web_xml(
     ``qualified_name`` the same way a servlet-mapping's own
     ``<servlet-class>`` already does, published with ``kind=
     "http_filter"`` (never ``"http_route"`` - a filter intercepts, it
-    does not serve; see ``JavaEntryPointClaim.kind``'s own docstring)."""
+    does not serve; see ``JavaEntryPointClaim.kind``'s own docstring).
+
+    FIX ROUND 29 (twenty-fifth cold read, F1 BLOCKER, wrong-data): return
+    arity WIDENED AGAIN, to a 4-tuple - ``descriptor_name_conflicts``, a
+    list of ``(anchor, sorted_candidate_qualified_names)`` pairs, one per
+    servlet-name/filter-name this file declares twice with two DIFFERENT
+    class values (see ``_split_name_conflicts``'s own docstring for the
+    full mechanism). ``scan_pipeline.py`` aggregates this across every
+    web.xml a run processes and hands it to ``modules_artifact.
+    build_modules``, which stamps a shared ``conflict_id``/
+    ``conflict_kind="duplicate_descriptor_name"`` on whichever candidate
+    classes resolve in-scan - the same generic "a unit carrying a
+    conflict_id reports unknown on its dependent readiness signals"
+    override ``duplicate_qualified_name`` conflicts already trigger
+    (readiness_artifact.py), reused for a DIFFERENT root cause via a
+    DIFFERENT ``conflict_kind`` string (never silently mislabeled as an
+    FQN collision, which this is not)."""
     entry_points = []
     problems = []
     edges: list[JavaEdgeClaim] = []
@@ -4022,8 +4120,33 @@ def parse_web_xml(
     # now come from ONE ordered scan - see `_split_xml_comments_and_cdata`.
     sanitized, structural = _split_xml_comments_and_cdata(text)
     newline_offsets = _newline_offsets(sanitized)
-    servlet_class_by_name, servlet_class_undecodable, servlet_name_undecodable = (
-        _servlet_class_by_name(sanitized, structural))
+    descriptor_name_conflicts: list[tuple[str, list[str]]] = []
+    (
+        servlet_class_by_name, servlet_class_undecodable, servlet_name_undecodable,
+        servlet_class_conflicts,
+    ) = _servlet_class_by_name(sanitized, structural)
+    # FIX ROUND 29 (twenty-fifth cold read, F1 BLOCKER, wrong-data): a
+    # servlet-name declared twice with two DIFFERENT class values - see
+    # _split_name_conflicts's own docstring for the full mechanism. One
+    # visible problem per conflicting NAME (never per occurrence, so a
+    # name mapped by several <servlet-mapping> elements does not spam
+    # duplicate rows for the identical underlying conflict); the mapping
+    # loop below already leaves a conflicting name OUT of `servlet_
+    # class_by_name` entirely, so its own `.get(name, fallback)` already
+    # falls through to the synthetic owner with no further change needed
+    # here - no adapter chosen authoritative by execution order.
+    for servlet_name, candidate_classes in sorted(servlet_class_conflicts.items()):
+        problems.append(JavaAdapterProblem(
+            reason_code="duplicate_descriptor_name",
+            detail=f"<servlet-name>{servlet_name}</servlet-name> is declared more than "
+                   f"once with different <servlet-class> values ({', '.join(candidate_classes)}) "
+                   "- no declaration is authoritative by execution order, so its mapped "
+                   "route falls back to the synthetic per-mapping owner rather than "
+                   "picking one",
+            qualified_name=f"{relative_path}#{servlet_name}",
+        ))
+        descriptor_name_conflicts.append((
+            f"{relative_path}#servlet#{servlet_name}", candidate_classes))
     # FIX ROUND 24 (twentieth cold read, F5 MINOR, wrong-data): a
     # servlet whose own <servlet-class> is present but undecodable
     # (CDATA/entity constructs) silently fell back to the synthetic
@@ -4189,8 +4312,24 @@ def parse_web_xml(
                    "absent either",
             qualified_name=qualified_name,
         ))
-    filter_class_by_name, filter_class_undecodable, filter_name_undecodable = (
-        _filter_class_by_name(sanitized, structural))
+    (
+        filter_class_by_name, filter_class_undecodable, filter_name_undecodable,
+        filter_class_conflicts,
+    ) = _filter_class_by_name(sanitized, structural)
+    # FIX ROUND 29 (F1 BLOCKER): the identical duplicate-descriptor-name
+    # conflict handling as the servlet loop above - see its own comment.
+    for filter_name, candidate_classes in sorted(filter_class_conflicts.items()):
+        problems.append(JavaAdapterProblem(
+            reason_code="duplicate_descriptor_name",
+            detail=f"<filter-name>{filter_name}</filter-name> is declared more than once "
+                   f"with different <filter-class> values ({', '.join(candidate_classes)}) - "
+                   "no declaration is authoritative by execution order, so its mapped "
+                   "route falls back to the synthetic per-mapping owner rather than "
+                   "picking one",
+            qualified_name=f"{relative_path}#{filter_name}",
+        ))
+        descriptor_name_conflicts.append((
+            f"{relative_path}#filter#{filter_name}", candidate_classes))
     # FIX ROUND 24 (F5 MINOR, wrong-data): the identical undecodable-
     # class visibility fix as the servlet loop above.
     for filter_name, block_start in filter_class_undecodable:
@@ -4358,7 +4497,7 @@ def parse_web_xml(
                    "either",
             qualified_name=qualified_name,
         ))
-    return entry_points, problems, edges
+    return entry_points, problems, edges, descriptor_name_conflicts
 
 
 def file_result_to_json(result: JavaFileResult) -> dict[str, Any]:
@@ -4373,6 +4512,9 @@ def file_result_to_json(result: JavaFileResult) -> dict[str, Any]:
         "entry_points": [asdict(p) for p in result.entry_points],
         "problems": [asdict(p) for p in result.problems],
         "declared_module_paths": list(result.declared_module_paths),
+        "descriptor_name_conflicts": [
+            [anchor, list(candidates)] for anchor, candidates in result.descriptor_name_conflicts
+        ],
     }
 
 
@@ -4383,4 +4525,8 @@ def file_result_from_json(payload: dict[str, Any]) -> JavaFileResult:
         entry_points=[JavaEntryPointClaim(**p) for p in payload["entry_points"]],
         problems=[JavaAdapterProblem(**p) for p in payload.get("problems", [])],
         declared_module_paths=list(payload.get("declared_module_paths", [])),
+        descriptor_name_conflicts=[
+            (anchor, list(candidates))
+            for anchor, candidates in payload.get("descriptor_name_conflicts", [])
+        ],
     )

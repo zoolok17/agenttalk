@@ -1933,6 +1933,189 @@ def test_run_scan_links_a_web_xml_route_to_its_real_servlet_class_end_to_end(
     assert entry_points_mapped["stored_status"] == "satisfied"
 
 
+@pytest.mark.parametrize("swap_order", [False, True])
+def test_run_scan_a_duplicate_servlet_name_with_conflicting_classes_publishes_a_conflict(
+    java_repo: Path, swap_order: bool,
+) -> None:
+    """FIX ROUND 29 (twenty-fifth cold read, F1 BLOCKER, wrong-data): a
+    web.xml declaring the SAME servlet-name twice with two DIFFERENT
+    <servlet-class> values used to resolve LAST-DECLARATION-WINS,
+    silently - a confident route owner (the position-dependent winner)
+    and a confident no_entry_point/no_feature_link negative for the
+    "losing" class, on a complete, zero-problem run. Neither candidate
+    class may be a position-dependent winner now: the mapped route
+    falls back to the web.xml FILE's own ownership (the same fallback
+    an unmatched name already gets), a visible `duplicate_descriptor_name`
+    problem names both claimants, both classes share a conflict_id, and
+    both report entry_points_mapped/feature_linked unknown - never a
+    confident negative for either. Parametrized on block order: the
+    reader proved order-dependence by swapping the two <servlet> blocks
+    and getting a DIFFERENT published owner from identical facts - this
+    test asserts the fixed output is IDENTICAL either order."""
+    import json
+
+    web_dir = java_repo / "src" / "main" / "java" / "com" / "acme" / "web"
+    web_dir.mkdir(parents=True)
+    (web_dir / "ServletA.java").write_text(
+        "package com.acme.web;\nclass ServletA {\n}\n", encoding="utf-8")
+    (web_dir / "ServletB.java").write_text(
+        "package com.acme.web;\nclass ServletB {\n}\n", encoding="utf-8")
+    (java_repo / "WEB-INF").mkdir()
+    servlet_blocks = [
+        "  <servlet>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "    <servlet-class>com.acme.web.ServletA</servlet-class>\n"
+        "  </servlet>\n",
+        "  <servlet>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "    <servlet-class>com.acme.web.ServletB</servlet-class>\n"
+        "  </servlet>\n",
+    ]
+    if swap_order:
+        servlet_blocks.reverse()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n" + "".join(servlet_blocks) +
+        "  <servlet-mapping>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "    <url-pattern>/api/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matching = [p for p in problems_doc["problems"] if p["reason_code"] == "duplicate_descriptor_name"]
+    assert len(matching) == 1
+    assert "com.acme.web.ServletA" in matching[0]["detail"]
+    assert "com.acme.web.ServletB" in matching[0]["detail"]
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    servlet_a = next(u for u in modules_doc["units"] if u["display_name"] == "ServletA")
+    servlet_b = next(u for u in modules_doc["units"] if u["display_name"] == "ServletB")
+    assert servlet_a["conflict_id"] is not None
+    assert servlet_a["conflict_id"] == servlet_b["conflict_id"]
+    assert servlet_a["conflict_kind"] == "duplicate_descriptor_name"
+    assert servlet_b["conflict_kind"] == "duplicate_descriptor_name"
+
+    features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
+    entry_point = next(e for e in features_doc["entry_points"] if e["name"] == "/api/*")
+    web_xml_unit = next(
+        u for u in modules_doc["units"] if u["kind"] == "file" and u["paths"] == ["WEB-INF/web.xml"])
+    assert entry_point["owning_unit_id"] == web_xml_unit["unit_id"]
+    assert entry_point["owning_unit_id"] not in (servlet_a["unit_id"], servlet_b["unit_id"])
+
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    for unit_id in (servlet_a["unit_id"], servlet_b["unit_id"]):
+        for check in ("entry_points_mapped", "feature_linked"):
+            signal = next(
+                s for s in readiness_doc["signals"]
+                if s["unit_id"] == unit_id and s["check"] == check)
+            assert signal["stored_status"] == "unknown"
+            assert signal["reason_code"] == "duplicate_descriptor_name"
+
+
+def test_run_scan_a_duplicate_filter_name_with_conflicting_classes_publishes_a_conflict(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 29 (F1 BLOCKER): the filter twin of the servlet-name
+    conflict above - <filter-name> declared twice with two different
+    <filter-class> values."""
+    import json
+
+    web_dir = java_repo / "src" / "main" / "java" / "com" / "acme" / "web"
+    web_dir.mkdir(parents=True)
+    (web_dir / "FilterA.java").write_text(
+        "package com.acme.web;\nclass FilterA {\n}\n", encoding="utf-8")
+    (web_dir / "FilterB.java").write_text(
+        "package com.acme.web;\nclass FilterB {\n}\n", encoding="utf-8")
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <filter>\n"
+        "    <filter-name>auth</filter-name>\n"
+        "    <filter-class>com.acme.web.FilterA</filter-class>\n"
+        "  </filter>\n"
+        "  <filter>\n"
+        "    <filter-name>auth</filter-name>\n"
+        "    <filter-class>com.acme.web.FilterB</filter-class>\n"
+        "  </filter>\n"
+        "  <filter-mapping>\n"
+        "    <filter-name>auth</filter-name>\n"
+        "    <url-pattern>/secure/*</url-pattern>\n"
+        "  </filter-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matching = [p for p in problems_doc["problems"] if p["reason_code"] == "duplicate_descriptor_name"]
+    assert len(matching) == 1
+    assert "com.acme.web.FilterA" in matching[0]["detail"]
+    assert "com.acme.web.FilterB" in matching[0]["detail"]
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    filter_a = next(u for u in modules_doc["units"] if u["display_name"] == "FilterA")
+    filter_b = next(u for u in modules_doc["units"] if u["display_name"] == "FilterB")
+    assert filter_a["conflict_id"] is not None
+    assert filter_a["conflict_id"] == filter_b["conflict_id"]
+    assert filter_a["conflict_kind"] == "duplicate_descriptor_name"
+
+
+def test_run_scan_a_benign_duplicate_servlet_declaration_collapses_silently(
+    java_repo: Path,
+) -> None:
+    """Companion control (F1's own JUDGE call): two IDENTICAL
+    declarations (same servlet-name, SAME class - the harmless merge-
+    artifact twin) must not be treated as a conflict at all - no
+    problem, no conflict_id, the mapping resolves normally to the one
+    real class, exactly the single-declaration behavior."""
+    import json
+
+    web_dir = java_repo / "src" / "main" / "java" / "com" / "acme" / "web"
+    web_dir.mkdir(parents=True)
+    (web_dir / "DispatcherServlet.java").write_text(
+        "package com.acme.web;\nclass DispatcherServlet {\n}\n", encoding="utf-8")
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "    <servlet-class>com.acme.web.DispatcherServlet</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "    <servlet-class>com.acme.web.DispatcherServlet</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "    <url-pattern>/api/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    assert not any(p["reason_code"] == "duplicate_descriptor_name" for p in problems_doc["problems"])
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    servlet_unit = next(
+        u for u in modules_doc["units"] if u["display_name"] == "DispatcherServlet")
+    assert servlet_unit["conflict_id"] is None
+
+    features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
+    entry_point = next(e for e in features_doc["entry_points"] if e["name"] == "/api/*")
+    assert entry_point["owning_unit_id"] == servlet_unit["unit_id"]
+
+
 def test_run_scan_publishes_problems_json_and_it_reaches_the_report(
     java_repo: Path, monkeypatch,
 ) -> None:

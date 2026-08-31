@@ -1116,11 +1116,20 @@ def build_readiness(
     for unit in modules:
         if unit.conflict_id is None:
             continue
+        # FIX ROUND 29 (twenty-fifth cold read, F1 BLOCKER): this override
+        # is generic (ANY conflict_id, regardless of what produced it) -
+        # but its own published reason_code must name the REAL conflict
+        # kind, never hardcode "duplicate_qualified_name" for a unit whose
+        # conflict_id actually came from a duplicate DESCRIPTOR name
+        # (modules_artifact.py's own conflict_kind field, added alongside
+        # conflict_id for exactly this - every unit with a conflict_id
+        # now also carries a conflict_kind, the fallback below is
+        # defense-in-depth only, never expected to fire).
+        conflict_reason = unit.conflict_kind or "duplicate_qualified_name"
         entry_points_mapped_by_unit_id[unit.unit_id] = _signal(
-            unit.unit_id, "entry_points_mapped", "unknown", "detected",
-            "duplicate_qualified_name")
+            unit.unit_id, "entry_points_mapped", "unknown", "detected", conflict_reason)
         feature_linked_by_unit_id[unit.unit_id] = _signal(
-            unit.unit_id, "feature_linked", "unknown", "detected", "duplicate_qualified_name")
+            unit.unit_id, "feature_linked", "unknown", "detected", conflict_reason)
     # FIX ROUND 24 (twentieth cold read, F6 MINOR, consistency): round
     # 22's own F1 invariant ("never MORE CONFIDENT than your components")
     # was only ever applied at the FILE level - a COMPONENT with its own
@@ -1242,12 +1251,15 @@ def build_readiness(
         # remaining identity-dependent signals this per-unit loop (not
         # the precomputed dicts above) computes.
         if unit.conflict_id is not None:
+            # FIX ROUND 29 (F1 BLOCKER): names the REAL conflict kind -
+            # see the entry_points_mapped/feature_linked override above.
+            own_conflict_reason = unit.conflict_kind or "duplicate_qualified_name"
             dependencies_signal = _signal(
                 unit.unit_id, "dependencies_resolved", "unknown", "detected",
-                "duplicate_qualified_name")
+                own_conflict_reason)
             test_evidence_signal = _signal(
                 unit.unit_id, "test_evidence_located", "unknown", "detected",
-                "duplicate_qualified_name")
+                own_conflict_reason)
         # FIX ROUND 23 (nineteenth cold read, F4 MINOR, wrong-data),
         # EXTENDED micro-round 23b (reviewer-3's own R4 consistency ask,
         # taken): a FILE unit never carries a conflict_id itself (only
@@ -1289,12 +1301,22 @@ def build_readiness(
                 and module_by_id[child_id].conflict_id is not None
             ]
             if conflicted_descendants:
+                # FIX ROUND 29 (F1 BLOCKER): names the REAL conflict kind
+                # of whichever conflicted descendant is found first
+                # (sorted by unit_id for determinism) - descendants could
+                # in principle carry different conflict kinds, but the
+                # unit ABOVE them is unknown regardless of which one, the
+                # same way its own confidence already collapses to the
+                # single worse-of verdict rather than a per-descendant one.
+                descendant_conflict_reason = sorted(
+                    conflicted_descendants, key=lambda m: m.unit_id,
+                )[0].conflict_kind or "duplicate_qualified_name"
                 dependencies_signal = _signal(
                     unit.unit_id, "dependencies_resolved", "unknown", "detected",
-                    "duplicate_qualified_name")
+                    descendant_conflict_reason)
                 test_evidence_signal = _signal(
                     unit.unit_id, "test_evidence_located", "unknown", "detected",
-                    "duplicate_qualified_name")
+                    descendant_conflict_reason)
         unit_signals = [
             _check_source_understood(unit),
             dependencies_signal,
