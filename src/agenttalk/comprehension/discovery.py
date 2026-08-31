@@ -319,9 +319,35 @@ def _sits_under_a_recognized_generated_output_position(relative_to_excluded_root
     return relative_to_excluded_root.startswith(_RECOGNIZED_GENERATED_OUTPUT_POSITIONS)
 
 
+#: FIX ROUND 32 (twenty-eighth cold read, F5 MAJOR, completeness): widened
+#: from a battery that measured seven real, secret-shaped paths (a
+#: ``.netrc``, an EXTENSION-form ``.env`` file like ``conf/app.env``/
+#: ``conf/production.env`` - the pre-existing ``.env``/``.env.*`` entries
+#: only ever matched a DOTFILE-style name, never this equally common
+#: extension spelling - a Java keystore, a bare ``credentials`` file, a
+#: ``secrets.properties``, and a PEM-family private key under a ``.key``
+#: extension) leaking their PATH and content DIGEST (never the secret
+#: VALUE itself - this producer never reads excluded content) because
+#: none of them matched this closed pattern set and so fell through as an
+#: ordinary discovered file. ``*.env``/``*.key``/``*.jks``/``*.keystore``/
+#: ``*.p8``/``.netrc``/``credentials`` are added as new entries;
+#: ``secrets.properties`` is added as an EXACT LITERAL rather than a
+#: glob (``*secret*`` or similar) deliberately - a wildcard would also
+#: swallow a harmless, unrelated file that merely mentions "secret" in
+#: its name (a ``docs/secrets-rotation-policy.md``), which is a real
+#: completeness cost (the safe direction for an actual secret is to
+#: under-model it, but there is no reason to pay that cost for a file
+#: that was never actually secret-shaped to begin with) for no matching
+#: benefit, since the reader's own reproduction named this one specific,
+#: well-known basename. PROVISIONAL, like every other closed-set
+#: constant in this package - a genuinely secret-shaped basename absent
+#: from this set still leaks path+digest, the same under-claim trade
+#: struck everywhere else in this module.
 _SECRET_FILE_PATTERNS = (
-    ".env", ".env.*", "*.pem", "*.pfx", "*.p12", "*.ppk",
+    ".env", ".env.*", "*.env", "*.pem", "*.pfx", "*.p12", "*.ppk",
     "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
+    "*.key", "*.jks", "*.keystore", "*.p8", ".netrc", "credentials",
+    "secrets.properties",
 )
 _BINARY_SNIFF_BYTES = 8192
 _PLATFORM_PROBE_RELATIVE_DIR = f"{RELATIVE_COMPREHENSION_DIR}/.platform-probe"

@@ -519,6 +519,38 @@ def test_enumerate_scope_excludes_secret_file_patterns(tmp_path: Path, filename:
     assert result.exclusions.get("secret") == 1
 
 
+@pytest.mark.parametrize("filename", [
+    ".netrc", "app.env", "production.env", "app.jks", "credentials",
+    "secrets.properties", "service-account.key",
+])
+def test_enumerate_scope_excludes_round_32_widened_secret_file_patterns(
+    tmp_path: Path, filename: str,
+) -> None:
+    """FIX ROUND 32 (twenty-eighth cold read, F5 MAJOR, completeness): the
+    reader's own seven measured shapes - each used to leak its path and
+    content digest as an ordinary discovered file, matching none of the
+    OLD closed pattern set."""
+    (tmp_path / filename).write_bytes(b"secret")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert result.files == []
+    assert result.exclusions.get("secret") == 1
+
+
+def test_enumerate_scope_does_not_over_exclude_a_plausible_false_positive(tmp_path: Path) -> None:
+    """FIX ROUND 32 (F5's own weighed disposition): ``secrets.properties``
+    is matched as an EXACT LITERAL, deliberately never a wildcard - a
+    harmless, unrelated file that merely mentions "secret" in its own name
+    (documentation, never actual secret material) must stay a real,
+    modeled file, not disappear into the same bucket."""
+    (tmp_path / "credentials.md").write_bytes(b"# how to obtain credentials\n")
+    (tmp_path / "docs-about-secrets.txt").write_bytes(b"not a secret\n")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert {f.relative_path for f in result.files} == {"credentials.md", "docs-about-secrets.txt"}
+    assert result.exclusions.get("secret", 0) == 0
+
+
 def test_enumerate_scope_excludes_binary_content(tmp_path: Path) -> None:
     (tmp_path / "photo.dat").write_bytes(b"\x00\x01\x02binarydata")
     comp_dir = _comprehension_dir(tmp_path)
