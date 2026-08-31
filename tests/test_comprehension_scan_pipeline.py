@@ -2370,6 +2370,121 @@ def test_run_scan_two_identical_servlet_class_elements_in_one_block_collapses_si
     assert entry_point["owning_unit_id"] == servlet_unit["unit_id"]
 
 
+def test_run_scan_two_servlets_mapped_to_the_same_url_pattern_publishes_a_problem(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 31 (twenty-seventh cold read, N4 JUDGE, taken - lean):
+    two DIFFERENT servlet-names, each with its own unambiguous backing
+    class, mapped to the IDENTICAL <url-pattern> - a container-rejected
+    descriptor (undefined dispatch), previously zero problems. Now
+    records a duplicate_route_target problem naming both owners; both
+    servlets keep their own otherwise-unambiguous, unaffected readiness
+    (this is a route-target collision, never a descriptor-name
+    conflict - neither servlet gets a conflict_id)."""
+    import json
+
+    web_dir = java_repo / "src" / "main" / "java" / "com" / "acme" / "web"
+    web_dir.mkdir(parents=True)
+    (web_dir / "ServletA.java").write_text(
+        "package com.acme.web;\nclass ServletA {\n}\n", encoding="utf-8")
+    (web_dir / "ServletB.java").write_text(
+        "package com.acme.web;\nclass ServletB {\n}\n", encoding="utf-8")
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name>a</servlet-name>\n"
+        "    <servlet-class>com.acme.web.ServletA</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet>\n"
+        "    <servlet-name>b</servlet-name>\n"
+        "    <servlet-class>com.acme.web.ServletB</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>a</servlet-name>\n"
+        "    <url-pattern>/mix/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>b</servlet-name>\n"
+        "    <url-pattern>/mix/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matching = [p for p in problems_doc["problems"] if p["reason_code"] == "duplicate_route_target"]
+    assert len(matching) == 1
+    assert "com.acme.web.ServletA" in matching[0]["detail"]
+    assert "com.acme.web.ServletB" in matching[0]["detail"]
+    assert "/mix/*" in matching[0]["detail"]
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    servlet_a = next(u for u in modules_doc["units"] if u["display_name"] == "ServletA")
+    servlet_b = next(u for u in modules_doc["units"] if u["display_name"] == "ServletB")
+    assert servlet_a["conflict_id"] is None
+    assert servlet_b["conflict_id"] is None
+
+    # Both servlets keep their own otherwise-unambiguous entry_points_
+    # mapped verdict, unaffected by the new problem - the fix records a
+    # visible row without ever reaching either unit's own
+    # adapter_problem_reasons (the synthetic qualified_name above never
+    # matches a real unit).
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    for unit_id in (servlet_a["unit_id"], servlet_b["unit_id"]):
+        signal = next(
+            s for s in readiness_doc["signals"]
+            if s["unit_id"] == unit_id and s["check"] == "entry_points_mapped")
+        assert signal["stored_status"] == "satisfied"
+
+
+def test_run_scan_two_servlets_mapped_to_different_url_patterns_publishes_no_problem(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 31 (N4 control): two DIFFERENT servlet-names mapped to
+    two DIFFERENT url-patterns is the ordinary, healthy shape - must
+    never trigger duplicate_route_target."""
+    import json
+
+    web_dir = java_repo / "src" / "main" / "java" / "com" / "acme" / "web"
+    web_dir.mkdir(parents=True)
+    (web_dir / "ServletA.java").write_text(
+        "package com.acme.web;\nclass ServletA {\n}\n", encoding="utf-8")
+    (web_dir / "ServletB.java").write_text(
+        "package com.acme.web;\nclass ServletB {\n}\n", encoding="utf-8")
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name>a</servlet-name>\n"
+        "    <servlet-class>com.acme.web.ServletA</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet>\n"
+        "    <servlet-name>b</servlet-name>\n"
+        "    <servlet-class>com.acme.web.ServletB</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>a</servlet-name>\n"
+        "    <url-pattern>/a/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>b</servlet-name>\n"
+        "    <url-pattern>/b/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    assert not any(p["reason_code"] == "duplicate_route_target" for p in problems_doc["problems"])
+
+
 def test_run_scan_a_duplicate_filter_name_with_conflicting_classes_publishes_a_conflict(
     java_repo: Path,
 ) -> None:

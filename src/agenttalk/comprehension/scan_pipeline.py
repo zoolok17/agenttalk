@@ -212,6 +212,13 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     # producer can attribute a route to), same "recorded, degrading"
     # bucket as its two siblings above.
     "descriptor_name_without_class": "warning",
+    # FIX ROUND 31 (twenty-seventh cold read, N4 JUDGE, taken): two
+    # DIFFERENT servlet-names mapped to the IDENTICAL <url-pattern> - a
+    # container-rejected descriptor (undefined dispatch), the mirror
+    # shape of the three descriptor-name reasons above (one PATTERN,
+    # two names, rather than one NAME, two backings) - same "recorded,
+    # degrading" bucket.
+    "duplicate_route_target": "warning",
     # FIX ROUND 17 (thirteenth cold read, CR13-3 MAJOR, part (b) - THE
     # CLASS-CLOSER): a recognized-but-unsupported route-like annotation
     # (JAX-WS's own @WebMethod) - under-claimed evidence, the same
