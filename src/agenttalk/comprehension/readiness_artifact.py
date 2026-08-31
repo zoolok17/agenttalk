@@ -85,6 +85,38 @@ ASSESSMENT_STATE_CAVEAT = (
     "adapter evidence is unknown, never a confident negative."
 )
 
+#: FIX ROUND 24 (twentieth cold read, F8b, declare-not-silently-guess):
+#: the design's own "Fact provenance and canonical merge" section
+#: promises every producer entry names "the bundled adapter and
+#: version, extraction-rule version, grammar/indexer version when
+#: applicable, effective configuration or policy digest, source content
+#: digest, and capture time", and every dependency/readiness record
+#: carries its own evidence pointers - none of that is populated this
+#: slice (every readiness signal's own ``producers``/``evidence`` field
+#: is an empty list; producer identity never carries a configuration/
+#: policy digest or a capture time either), and neither of this
+#: package's own two existing structural declarations (``ASSESSMENT_
+#: STATE_CAVEAT``/``features_artifact.FEATURES_STRUCTURAL_CAVEAT``)
+#: says so - a consumer reading an empty ``producers``/``evidence`` list
+#: has no way to tell "not implemented this slice" from "genuinely no
+#: evidence exists," the exact ambiguity this whole declared-absence
+#: idiom exists to close. The FULL provenance implementation stays the
+#: existing, already-named fast-follow carry (config.json parsing,
+#: `conflict_id` population, per-producer digest/capture-time plumbing
+#: across all four artifact builders) - this is only the machine-
+#: readable DECLARATION of that gap, published once in scan.json,
+#: the same "declare it, don't leave it to be independently
+#: rediscovered" discipline ``ASSESSMENT_STATE_CAVEAT`` already follows.
+PROVENANCE_CAVEAT = (
+    "readiness signal producers and dependency/readiness evidence pointers are "
+    "empty for every record this slice, and producer identity never carries a "
+    "configuration/policy digest or a capture time - all design-promised "
+    "('Fact provenance and canonical merge'), none populated yet. An empty "
+    "producers/evidence list here means 'not implemented this slice', never "
+    "'genuinely no evidence exists' - the full provenance implementation is a "
+    "known fast-follow carry, not a silent gap."
+)
+
 CHECKS = (
     "source_understood",
     "dependencies_resolved",

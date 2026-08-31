@@ -3506,6 +3506,24 @@ def test_features_json_declares_the_structural_caveat(java_repo: Path) -> None:
     assert all(f["state"] == "candidate" for f in features_doc["features"])
 
 
+def test_scan_json_declares_the_provenance_caveat(java_repo: Path) -> None:
+    """FIX ROUND 24 (twentieth cold read, F8b, declare-not-silently-
+    guess): the SAME "declare it, don't leave it to be independently
+    rediscovered" discipline ASSESSMENT_STATE_CAVEAT/FEATURES_
+    STRUCTURAL_CAVEAT already established - readiness signal producers,
+    dependency/readiness evidence pointers, and producer identity's own
+    config/policy digest are all empty/absent this slice, none of it
+    previously declared anywhere a consumer could discover without
+    already knowing to check. Published as a real scan.json field now."""
+    import json
+
+    from agenttalk.comprehension import readiness_artifact
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["provenance_caveat"] == readiness_artifact.PROVENANCE_CAVEAT
+
+
 def test_run_scan_a_duplicate_qualified_name_publishes_ambiguous_import_and_a_problem(
     java_repo: Path,
 ) -> None:
@@ -3629,6 +3647,19 @@ def test_a_conflicted_units_readiness_signals_stay_unknown_not_confident(
 
     # The conflict problem itself is still recorded, unaffected.
     assert any(p["reason_code"] == "duplicate_qualified_name" for p in problems_doc["problems"])
+
+    # FIX ROUND 24 (twentieth cold read, F8a, design-promised, taken):
+    # the design's own item 4 promises problems.json records "that
+    # conflict_id, every claimant, and the disputed fields" - a consumer
+    # could not join the problem back to the two units that DO share a
+    # conflict_id at all. Both colliding units' own modules.json
+    # conflict_id must match the problem's own conflict_id exactly.
+    conflict_problem = next(
+        p for p in problems_doc["problems"] if p["reason_code"] == "duplicate_qualified_name")
+    unit_conflict_ids = {
+        u["conflict_id"] for u in modules_doc["units"] if u["unit_id"] in config_unit_ids}
+    assert unit_conflict_ids == {conflict_problem["conflict_id"]}
+    assert conflict_problem["conflict_id"] is not None
 
     # A non-conflicted twin class in the SAME run stays fully confident.
     plain_unit_id = next(

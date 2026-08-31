@@ -231,6 +231,7 @@ _DEFAULT_PROBLEM_SEVERITY = "warning"
 
 def _problem_record(
     reason_code: str, path: str | None, detail: str, *, qualified_name: str | None = None,
+    conflict_id: str | None = None,
 ) -> dict[str, Any]:
     """FIX ROUND 13d (reviewer-3's LOW on round 13c): ``qualified_name``
     was internal-only - round 13c attributed a ``cli_main_unrecognized``
@@ -241,7 +242,15 @@ def _problem_record(
     "somewhere in this file" - no way to join the two. Published WHEN
     PRESENT, the key omitted entirely otherwise (never a null) - the
     same absent-not-null idiom every other optional field in this
-    artifact family already follows."""
+    artifact family already follows.
+
+    FIX ROUND 24 (twentieth cold read, F8a, design-promised, taken): the
+    design's own item 4 ("`problems.json` records that `conflict_id`,
+    every claimant, and the disputed fields") named a field this
+    function never had a parameter for at all - a ``duplicate_qualified_
+    name`` problem published no ``conflict_id``, so a consumer could not
+    join the problem back to the two (or more) ``modules.json`` units
+    that DO share one. Same absent-not-null idiom as ``qualified_name``."""
     record = {
         "problem_id": digests.problem_id(reason_code=reason_code, path=path, detail=detail),
         "reason_code": reason_code,
@@ -251,6 +260,8 @@ def _problem_record(
     }
     if qualified_name is not None:
         record["qualified_name"] = qualified_name
+    if conflict_id is not None:
+        record["conflict_id"] = conflict_id
     return record
 
 
@@ -715,6 +726,11 @@ def run_scan(
                     f"{group[0].qualified_name!r} declared in "
                     f"{sorted(p for m in group for p in m.paths)}"),
                 qualified_name=group[0].qualified_name,
+                # FIX ROUND 24 (twentieth cold read, F8a): every unit in
+                # `group` shares this SAME conflict_id by construction
+                # (that is how `modules_by_conflict_id` grouped them) -
+                # `group[0]` is as good a source for it as any other.
+                conflict_id=group[0].conflict_id,
             )
             for group in modules_by_conflict_id.values()
         ]
@@ -1032,6 +1048,15 @@ def run_scan(
             # point KIND vocabulary itself - see ENTRY_POINT_KINDS's own
             # docstring.
             "entry_point_kinds": dict(java_adapter.ENTRY_POINT_KINDS),
+            # FIX ROUND 24 (twentieth cold read, F8b, declare-not-
+            # silently-guess): see readiness_artifact.PROVENANCE_CAVEAT's
+            # own docstring - the SAME "declare it in scan.json, don't
+            # leave it to be independently rediscovered" discipline
+            # ASSESSMENT_STATE_CAVEAT/FEATURES_STRUCTURAL_CAVEAT already
+            # follow, published here rather than only in readiness.json
+            # since the gap spans producer identity across every
+            # artifact, not readiness signals alone.
+            "provenance_caveat": readiness_artifact.PROVENANCE_CAVEAT,
             "record_counts": record_counts,
             "problem_count": len(problems),
             "artifacts": artifact_summaries,
