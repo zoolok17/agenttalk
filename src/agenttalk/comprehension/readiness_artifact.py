@@ -267,8 +267,24 @@ def _signal(unit_id: str, check: str, stored_status: str, basis: str, reason_cod
 #: existed" principle round 16's own M2 already applied to the other
 #: three checks, and round 20's own M3 already applied to the two
 #: narrower reasons).
+#:
+#: MICRO-ROUND 27b (JUDGE, small, taken): ``test_evidence_located`` was
+#: still omitted - a whole-file-gap unit's own status was ALREADY
+#: ``unknown`` there regardless (``_check_test_evidence_located`` never
+#: reports a confident value without either a real test-pairing edge or
+#: an inferred one, and a file the adapter never read has neither), but
+#: the REASON was the misleading ``no_test_evidence_found`` - "we looked
+#: for test evidence and found none," when the true fact is "this file
+#: was never read at all." Reviewer-3's own measurement: the remaining
+#: sixth check, ``boundaries_identified``, is unconditionally ``unknown``
+#: for every unit regardless of any reason code (it has no producer this
+#: slice at all - see its own module docstring) - already covered by its
+#: own, separate, stronger guarantee, so it is deliberately NOT added
+#: here; adding it would be a no-op wearing the same name as this fix
+#: for a check that consults no reason at all.
 _WHOLE_FILE_EVIDENCE_GAP_CHECKS = frozenset({
     "source_understood", "dependencies_resolved", "entry_points_mapped", "feature_linked",
+    "test_evidence_located",
 })
 _READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
     "parse_failed": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
@@ -822,6 +838,25 @@ def _check_test_evidence_located(
         return _signal(
             unit.unit_id, "test_evidence_located", "not_applicable", "detected",
             "unit_is_itself_a_test")
+    # MICRO-ROUND 27b (JUDGE, small, taken): a whole-file-gap unit (the
+    # adapter never successfully read it - Latin-1, a tier-2 language
+    # with no adapter, a resource-cap skip, ...) has neither a real nor
+    # an inferred test-pairing edge, by construction - the fall-through
+    # below already reported unknown/no_test_evidence_found for it, an
+    # HONEST status with a MISLEADING reason ("we looked for test
+    # evidence and found none" when the true fact is "this file was
+    # never read at all"). Checked AFTER the test-classification branch
+    # above (classification is a path-based fact, independent of
+    # whether the adapter could read the file - a test-classified unit
+    # stays not_applicable regardless) but before is_tested/has_
+    # inferred_pairing are consulted, the same "trust the recorded gap"
+    # precedent every other whole-file-gap check already follows.
+    understanding_reasons = _reasons_feeding("test_evidence_located", unit.adapter_problem_reasons)
+    if understanding_reasons:
+        return _signal(
+            unit.unit_id, "test_evidence_located", "unknown", "detected",
+            _propagated_reason_spelling(understanding_reasons[0]),
+        )
     if is_tested:
         return _signal(
             unit.unit_id, "test_evidence_located", "satisfied", "detected", "test_evidence_located")

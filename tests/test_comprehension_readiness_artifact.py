@@ -880,6 +880,37 @@ def test_test_evidence_located_reason_code_is_no_test_evidence_found_with_nothin
     assert signal.reason_code == "no_test_evidence_found"
 
 
+def test_test_evidence_located_names_the_real_whole_file_gap_reason_not_no_test_evidence_found():
+    """MICRO-ROUND 27b (reviewer-3 delta on `43bf38c`, JUDGE 2, small,
+    taken): a whole-file-gap unit (the adapter never successfully read
+    it - encoding_undecodable here) reported the honest status
+    (unknown) with a MISLEADING reason (no_test_evidence_found - "we
+    looked for test evidence and found none") when the true fact is
+    "this file was never read at all." Now names the real gap instead -
+    the same trust-the-recorded-gap discipline every other whole-file
+    check already follows."""
+    unit = _unit("u1", adapter_problem_reasons=["encoding_undecodable"])
+    signals, _ = ra.build_readiness([unit], [], [])
+    signal = _signal_by_check(signals, "test_evidence_located")
+    assert signal.stored_status == "unknown"
+    assert signal.reason_code == "adapter_encoding_undecodable"
+
+
+def test_test_evidence_located_stays_not_applicable_for_a_test_classified_whole_file_gap_unit():
+    """Companion control: a whole-file-gap unit that is ALSO
+    test-classified (classification is a path-based fact, independent
+    of whether the adapter could read the file) keeps its existing
+    not_applicable/unit_is_itself_a_test - this check genuinely does
+    not apply to a test unit regardless of read success, checked before
+    the new whole-file-gap routing."""
+    unit = _unit(
+        "u1", classification="test", adapter_problem_reasons=["encoding_undecodable"])
+    signals, _ = ra.build_readiness([unit], [], [])
+    signal = _signal_by_check(signals, "test_evidence_located")
+    assert signal.stored_status == "not_applicable"
+    assert signal.reason_code == "unit_is_itself_a_test"
+
+
 def test_test_evidence_located_stays_unknown_for_an_inferred_convention_only_pairing():
     """FIX ROUND 15 (eleventh cold read, F4 MAJOR, wrong-data, cr11-fx4
     verbatim): the name-derived test pairing (strip Test/Tests/IT,
