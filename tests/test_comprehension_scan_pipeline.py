@@ -2173,6 +2173,83 @@ def test_run_scan_a_benign_duplicate_servlet_declaration_collapses_silently(
     assert entry_point["owning_unit_id"] == servlet_unit["unit_id"]
 
 
+def test_run_scan_a_servlet_mapping_naming_an_undeclared_servlet_publishes_a_problem(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 29 (twenty-fifth cold read, F9c JUDGE, wrong-data): a
+    <servlet-mapping> naming a <servlet-name> that NO <servlet> element
+    declares at all (a ghost mapping, never merely a duplicate) used to
+    fall through to the synthetic per-mapping owner with NO problem
+    recorded at all - resolved+feature published, zero problems, on a
+    complete run, for a real descriptor inconsistency. Now records its
+    own `undeclared_descriptor_name` problem, naming the ghost name; the
+    entry point still publishes via the same synthetic-owner fallback
+    (unchanged), just no longer silently."""
+    import json
+
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>ghost</servlet-name>\n"
+        "    <url-pattern>/api/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matching = [
+        p for p in problems_doc["problems"] if p["reason_code"] == "undeclared_descriptor_name"]
+    assert len(matching) == 1
+    assert "ghost" in matching[0]["detail"]
+
+    features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
+    entry_point = next(e for e in features_doc["entry_points"] if e["name"] == "/api/*")
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    web_xml_unit = next(
+        u for u in modules_doc["units"] if u["kind"] == "file" and u["paths"] == ["WEB-INF/web.xml"])
+    assert entry_point["owning_unit_id"] == web_xml_unit["unit_id"]
+
+
+def test_run_scan_a_filter_mapping_naming_an_undeclared_filter_publishes_a_problem(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 29 (F9c JUDGE): the filter twin of the servlet ghost-
+    mapping fix above."""
+    import json
+
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <filter-mapping>\n"
+        "    <filter-name>ghost</filter-name>\n"
+        "    <url-pattern>/api/*</url-pattern>\n"
+        "  </filter-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matching = [
+        p for p in problems_doc["problems"] if p["reason_code"] == "undeclared_descriptor_name"]
+    assert len(matching) == 1
+    assert "ghost" in matching[0]["detail"]
+
+    features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
+    entry_point = next(e for e in features_doc["entry_points"] if e["name"] == "/api/*")
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    web_xml_unit = next(
+        u for u in modules_doc["units"] if u["kind"] == "file" and u["paths"] == ["WEB-INF/web.xml"])
+    assert entry_point["owning_unit_id"] == web_xml_unit["unit_id"]
+
+
 def test_run_scan_publishes_problems_json_and_it_reaches_the_report(
     java_repo: Path, monkeypatch,
 ) -> None:

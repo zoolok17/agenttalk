@@ -4142,7 +4142,20 @@ def parse_web_xml(
     override ``duplicate_qualified_name`` conflicts already trigger
     (readiness_artifact.py), reused for a DIFFERENT root cause via a
     DIFFERENT ``conflict_kind`` string (never silently mislabeled as an
-    FQN collision, which this is not)."""
+    FQN collision, which this is not).
+
+    FIX ROUND 29 (F9c JUDGE): a ``<servlet-mapping>``/``<filter-mapping>``
+    naming a servlet-name/filter-name that NO ``<servlet>``/``<filter>``
+    element declares AT ALL (a ghost mapping, never merely a duplicate)
+    used to fall through to the same synthetic-owner fallback a
+    conflicting name gets, with no problem recorded - resolved+feature
+    published, zero problems, on a complete run. At least as recordable
+    as ``duplicate_descriptor_name``'s own two-different-classes case;
+    now records its own ``undeclared_descriptor_name`` problem, once per
+    distinct undeclared name. No ``conflict_id``/``conflict_kind`` is
+    stamped for this case (unlike the duplicate-name conflict) - there is
+    no candidate CLASS at all to attribute one to; the fallback owner
+    itself is unchanged."""
     entry_points = []
     problems = []
     edges: list[JavaEdgeClaim] = []
@@ -4218,6 +4231,7 @@ def parse_web_xml(
                    "rather than the real class",
         ))
     mapped_servlet_names: set[str] = set()
+    undeclared_servlet_names: set[str] = set()
     for block_match in _SERVLET_MAPPING_BLOCK_RE.finditer(structural):
         # FIX ROUND 26 (twenty-second cold read, F2 BLOCKER, wrong-data):
         # web-app 2.4/2.5 puts <description> BEFORE <servlet-name>, so a
@@ -4253,6 +4267,22 @@ def parse_web_xml(
             continue
         servlet_name = decoded_name.strip()
         mapped_servlet_names.add(servlet_name)
+        # FIX ROUND 29 (twenty-fifth cold read, F9c JUDGE, wrong-data): a
+        # <servlet-mapping> naming a <servlet-name> that no <servlet>
+        # element declares AT ALL (never merely a duplicate - genuinely
+        # absent) used to fall through to the same synthetic-owner
+        # fallback a conflicting name gets, silently - resolved+feature
+        # published, ZERO problems, on a complete run, for a real
+        # descriptor inconsistency (a ghost mapping to a name the file
+        # never backs). At least as recordable as duplicate_descriptor_
+        # name's own two-DIFFERENT-classes case; collected here and
+        # recorded once per distinct undeclared name below (never per
+        # occurrence, matching the conflict loop's own dedup discipline).
+        if (
+            servlet_name not in servlet_class_by_name
+            and servlet_name not in servlet_class_conflicts
+        ):
+            undeclared_servlet_names.add(servlet_name)
         owner_qualified_name = servlet_class_by_name.get(
             servlet_name, f"{relative_path}#{servlet_name}")
         for pattern_match in _SERVLET_MAPPING_URL_PATTERN_RE.finditer(block_structural):
@@ -4303,6 +4333,18 @@ def parse_web_xml(
                 name=url_pattern, line=_line_at(newline_offsets, absolute_offset),
                 evidence_class="declared",
             ))
+    # FIX ROUND 29 (F9c JUDGE): one visible problem per distinct
+    # undeclared servlet-name - see the collection site's own comment
+    # above.
+    for servlet_name in sorted(undeclared_servlet_names):
+        problems.append(JavaAdapterProblem(
+            reason_code="undeclared_descriptor_name",
+            detail=f"<servlet-mapping> names <servlet-name>{servlet_name}</servlet-name>, "
+                   "which no <servlet> element in this file declares at all - its mapped "
+                   "route falls back to the synthetic per-mapping owner rather than a "
+                   "real class",
+            qualified_name=f"{relative_path}#{servlet_name}",
+        ))
     # FIX ROUND 22 (eighteenth cold read, F3 MAJOR, wrong-data): a
     # <servlet> carrying <load-on-startup> but NEVER named by any
     # <servlet-mapping> above is the standard startup-only servlet
@@ -4389,6 +4431,7 @@ def parse_web_xml(
                    "mapping targeting it falls back to the synthetic per-mapping owner "
                    "rather than the real class",
         ))
+    undeclared_filter_names: set[str] = set()
     for block_match in _FILTER_MAPPING_BLOCK_RE.finditer(structural):
         # FIX ROUND 26 (F2 BLOCKER): the same block-interior two-string
         # fix as the servlet-mapping loop above.
@@ -4415,6 +4458,13 @@ def parse_web_xml(
             ))
             continue
         filter_name = decoded_name.strip()
+        # FIX ROUND 29 (F9c JUDGE): the filter twin of the servlet-
+        # mapping ghost-name fix above - see its own comment.
+        if (
+            filter_name not in filter_class_by_name
+            and filter_name not in filter_class_conflicts
+        ):
+            undeclared_filter_names.add(filter_name)
         owner_qualified_name = filter_class_by_name.get(
             filter_name, f"{relative_path}#{filter_name}")
         # FIX ROUND 22 (eighteenth cold read, F3 MAJOR, wrong-data): a
@@ -4518,6 +4568,17 @@ def parse_web_xml(
                 name=url_pattern, line=_line_at(newline_offsets, absolute_offset),
                 evidence_class="declared",
             ))
+    # FIX ROUND 29 (F9c JUDGE): the filter twin of the servlet ghost-name
+    # emission above.
+    for filter_name in sorted(undeclared_filter_names):
+        problems.append(JavaAdapterProblem(
+            reason_code="undeclared_descriptor_name",
+            detail=f"<filter-mapping> names <filter-name>{filter_name}</filter-name>, "
+                   "which no <filter> element in this file declares at all - its mapped "
+                   "route falls back to the synthetic per-mapping owner rather than a "
+                   "real class",
+            qualified_name=f"{relative_path}#{filter_name}",
+        ))
     for block_match in _LISTENER_BLOCK_RE.finditer(structural):
         # FIX ROUND 26 (F2 BLOCKER): the same block-interior two-string
         # fix as every other loop in this function.

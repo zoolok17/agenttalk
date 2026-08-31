@@ -564,6 +564,10 @@ def test_process_paths_dispatches_web_xml_through_the_java_results_channel(
     java_results channel."""
     (tmp_path / "web.xml").write_text(
         "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "    <servlet-class>p.Dispatcher</servlet-class>\n"
+        "  </servlet>\n"
         "  <servlet-mapping>\n"
         "    <servlet-name>dispatcher</servlet-name>\n"
         "    <url-pattern>/api/*</url-pattern>\n"
@@ -730,6 +734,10 @@ def test_process_paths_does_not_flag_a_normal_web_xml_with_a_real_mapping(
     point), the ordinary healthy case."""
     (tmp_path / "web.xml").write_text(
         "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name>s1</servlet-name>\n"
+        "    <servlet-class>p.S1</servlet-class>\n"
+        "  </servlet>\n"
         "  <servlet-mapping>\n"
         "    <servlet-name>s1</servlet-name>\n"
         "    <url-pattern>/s1</url-pattern>\n"
@@ -856,7 +864,9 @@ def test_process_paths_a_genuine_utf8_web_xml_with_unicode_content_stays_clean(
 ) -> None:
     """Companion control: the same web.xml, correctly UTF-8 encoded."""
     (tmp_path / "web.xml").write_bytes(
-        "<web-app><servlet-mapping><servlet-name>café</servlet-name>"
+        "<web-app><servlet><servlet-name>café</servlet-name>"
+        "<servlet-class>p.Cafe</servlet-class></servlet>"
+        "<servlet-mapping><servlet-name>café</servlet-name>"
         "<url-pattern>/café/*</url-pattern></servlet-mapping></web-app>\n"
         .encode("utf-8"))
     result = worker.process_paths(tmp_path, ["web.xml"])
