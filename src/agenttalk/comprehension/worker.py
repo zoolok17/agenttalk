@@ -410,7 +410,7 @@ class WorkerResult:
 
 
 def _decode_text_or_flag_undecodable(
-    data: bytes, rel: str, problems: list[WorkerProblem],
+    data: bytes, rel: str, problems: list[WorkerProblem], *, degrades_run: bool = True,
 ) -> str | None:
     """Decodes ``data`` as UTF-8 (BOM-tolerant), guarding against a
     silent, WRONG decode - never raises.
@@ -432,6 +432,18 @@ def _decode_text_or_flag_undecodable(
     decode site inherits the guard automatically rather than needing its
     own copy remembered.
 
+    FIX ROUND 27 (twenty-third cold read, F3 MAJOR, wrong-data): a
+    binary-excluded and an encoding-undecodable, non-adapter-handled
+    ``.xml`` file are EPISTEMICALLY IDENTICAL - neither can be root-
+    sniffed to determine its own tier, since decoding is exactly what
+    failed. Round 26b's own binary ruling already refused to degrade the
+    binary-excluded twin ("degrading every repo carrying an unreadable
+    logback.xml"); this call's ``degrades_run`` lets the xml-root-sniff
+    call site (worker.py) pass ``False`` for the identical reason,
+    without changing anything for the OTHER three decode sites (.java/
+    pom.xml/web.xml), which stay degrading unconditionally - they are
+    code-bearing by definition, never merely possibly so.
+
     Returns the decoded text, or ``None`` (having already appended an
     ``encoding_undecodable`` WorkerProblem) when the decoded text
     contains U+FFFD - the caller must skip adapter analysis entirely in
@@ -445,7 +457,8 @@ def _decode_text_or_flag_undecodable(
                    "decoded text contains the U+FFFD replacement character) - "
                    "likely Latin-1/CP1252 or another non-UTF-8 encoding; "
                    "adapter analysis skipped rather than risk a corrupted or "
-                   "fabricated qualified name"))
+                   "fabricated qualified name",
+            degrades_run=degrades_run))
         return None
     return text
 
@@ -745,7 +758,13 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                 text = _decode_text_or_flag_undecodable(data, rel, problems)
                 if text is None:
                     continue
-                web_entry_points, web_problems = java_adapter.parse_web_xml(rel, text)
+                # FIX ROUND 27 (twenty-third cold read, F4, mechanism
+                # confirmed): parse_web_xml now also returns the paired
+                # route-relation edges every web.xml-declared route/
+                # filter publishes - threaded into JavaFileResult below,
+                # the identical channel every annotation-based route's
+                # own edge already flows through.
+                web_entry_points, web_problems, web_edges = java_adapter.parse_web_xml(rel, text)
             except Exception as exc:  # noqa: BLE001 - a producer bug must degrade, never abort the scan
                 problems.append(WorkerProblem(
                     reason_code="parse_failed", relative_path=rel,
@@ -763,7 +782,8 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                     ))
                 java_results[rel] = java_adapter.file_result_to_json(
                     java_adapter.JavaFileResult(
-                        entry_points=web_entry_points, problems=web_problems))
+                        entry_points=web_entry_points, problems=web_problems,
+                        edges=web_edges))
                 # FIX ROUND 24 (micro-round 24b, item 1, wrong-data): the
                 # SAME positive-evidence gate F1b already gives pom.xml -
                 # a parse that succeeds but yields ZERO entry points AND
@@ -807,7 +827,19 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                 # skips the root-element guess entirely, rather than
                 # risking a tier verdict computed from a corrupted root
                 # element name.
-                xml_text = _decode_text_or_flag_undecodable(data, rel, problems)
+                #
+                # FIX ROUND 27 (twenty-third cold read, F3 MAJOR, wrong-
+                # data): degrades_run=False here - this run cannot root-
+                # sniff an undecodable file's own tier any more than it
+                # can root-sniff a BINARY-excluded one (round 26b's own
+                # ruling already refuses to degrade that twin), so
+                # guessing toward degrading here would be the identical
+                # round-16 dilution. scan_pipeline.py's own classification
+                # override also now treats this path the same as a non-
+                # degrading unsupported_language file (infrastructure,
+                # not production) - see its own comment.
+                xml_text = _decode_text_or_flag_undecodable(
+                    data, rel, problems, degrades_run=False)
                 if xml_text is None:
                     continue
                 root_element = java_adapter.sniff_xml_root_element(xml_text)

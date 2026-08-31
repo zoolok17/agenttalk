@@ -178,6 +178,17 @@ def _derive_classification(
     a file matching its own benign-extension/basename allowlist -
     classification simply never consulted either.
 
+    FIX ROUND 27 (twenty-third cold read, F3 MAJOR, wrong-data):
+    ``non_degrading_unsupported_language_paths`` (scan_pipeline.py, the
+    parameter name unchanged) now ALSO includes the non-degrading half
+    of ``encoding_undecodable`` for a non-adapter-handled ``.xml`` file
+    (worker.py's own xml-root-sniff decode site) - a binary-excluded and
+    an encoding-undecodable file are epistemically identical (neither
+    can be root-sniffed to determine its own tier), so this same
+    ``infrastructure`` derivation now applies to both, not just the
+    binary-excluded twin. This function itself needed no change - it
+    already trusts whatever this SET contains, generically.
+
     DECIDED (reviewer-3 ratifies): derives ``infrastructure`` for this
     non-degrading/benign-non-code case ONLY. A TIER-2 file (a JSP, a
     Kotlin source, a Spring-bean-XML config, ...) is genuinely UNMODELED

@@ -532,6 +532,95 @@ def test_a_dependency_free_multi_route_controller_publishes_zero_external_end_to
         for row in report["high_fan_out_units"])
 
 
+def test_web_xml_declaring_an_in_scan_servlet_route_is_satisfied_end_to_end_f1(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 27 (twenty-third cold read, F1 BLOCKER, wrong-data,
+    .cr23-webxml-neg, end-to-end): a web.xml that DECLARES a route
+    whose <servlet-class> resolves in-scan used to publish entry_
+    points_mapped not_applicable/no_entry_point on a complete/0-problem
+    run - ownership moves to the implementing class (CR13-2), and
+    nothing credited the DECLARING file with the evidence. Verified
+    through the REAL pipeline, not a hand-built fixture."""
+    import json
+
+    pkg_dir = java_repo / "src" / "main" / "java" / "com" / "acme"
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    (pkg_dir / "CheckoutServlet.java").write_text(
+        "package com.acme;\npublic class CheckoutServlet {}\n", encoding="utf-8")
+    webinf = java_repo / "WEB-INF"
+    webinf.mkdir(exist_ok=True)
+    (webinf / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name>Checkout</servlet-name>\n"
+        "    <servlet-class>com.acme.CheckoutServlet</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>Checkout</servlet-name>\n"
+        "    <url-pattern>/checkout</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    webxml_unit = next(
+        u for u in modules_doc["units"]
+        if u["kind"] == "file" and "WEB-INF/web.xml" in u["paths"])
+    signal = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == webxml_unit["unit_id"] and s["check"] == "entry_points_mapped")
+    assert signal["stored_status"] == "satisfied"
+
+
+def test_web_xml_route_and_filter_edges_match_the_entry_point_count_end_to_end_f4(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 27 (F4, mechanism confirmed, .cr23-jee, end-to-end): a
+    web.xml declaring both a servlet route and a filter used to report
+    matching entry points but a dependency_summary.routes count that
+    disagreed (2 entry points, 0 routes, since neither emitted its own
+    edge) - now both counts agree."""
+    pkg_dir = java_repo / "src" / "main" / "java" / "com" / "acme"
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    (pkg_dir / "CheckoutServlet.java").write_text(
+        "package com.acme;\npublic class CheckoutServlet {}\n", encoding="utf-8")
+    (pkg_dir / "AuthFilter.java").write_text(
+        "package com.acme;\npublic class AuthFilter {}\n", encoding="utf-8")
+    webinf = java_repo / "WEB-INF"
+    webinf.mkdir(exist_ok=True)
+    (webinf / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name>Checkout</servlet-name>\n"
+        "    <servlet-class>com.acme.CheckoutServlet</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>Checkout</servlet-name>\n"
+        "    <url-pattern>/checkout</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "  <filter>\n"
+        "    <filter-name>Auth</filter-name>\n"
+        "    <filter-class>com.acme.AuthFilter</filter-class>\n"
+        "  </filter>\n"
+        "  <filter-mapping>\n"
+        "    <filter-name>Auth</filter-name>\n"
+        "    <url-pattern>/secure/*</url-pattern>\n"
+        "  </filter-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8")
+
+    scan_pipeline.run_scan(java_repo)
+    report = scan_pipeline.get_report(java_repo)
+    web_xml_entry_points = [
+        e for e in report["entry_points"] if e["name"] in ("/checkout", "/secure/*")]
+    assert len(web_xml_entry_points) == 2
+    assert report["dependency_summary"]["routes"] >= 2
+
+
 def _component_unit_id(report, display_name):
     return next(
         u["unit_id"] for u in report["units"]

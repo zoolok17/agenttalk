@@ -740,6 +740,28 @@ def test_process_paths_does_not_flag_a_normal_web_xml_with_a_real_mapping(
     assert result.problems == []
 
 
+def test_process_paths_web_xml_route_publishes_a_paired_route_edge_f4(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 27 (twenty-third cold read, F4, mechanism confirmed):
+    parse_web_xml now returns a third value (edges) - the worker must
+    thread it into JavaFileResult, the same channel every annotation-
+    based route's own paired edge already flows through."""
+    (tmp_path / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>s1</servlet-name>\n"
+        "    <url-pattern>/s1</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["web.xml"])
+    edges = result.java_results["web.xml"]["edges"]
+    assert len(edges) == 1
+    assert edges[0]["relation"] == "route"
+    assert edges[0]["target"] == "/s1"
+
+
 def test_process_paths_flags_a_pom_dependency_with_an_undecodable_groupid_f4(
     tmp_path: Path,
 ) -> None:
@@ -859,6 +881,25 @@ def test_process_paths_a_latin1_tooling_xml_records_encoding_undecodable_not_uns
     assert result.problems[0].relative_path == "beans.xml"
 
 
+def test_process_paths_a_latin1_tooling_xml_does_not_degrade_the_run_f3(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 27 (twenty-third cold read, F3 MAJOR, wrong-data): a
+    binary-excluded and an encoding-undecodable, non-adapter-handled
+    .xml file are epistemically identical - this run cannot root-sniff
+    either one's own tier. Round 26b's own binary ruling already
+    refused to degrade the binary-excluded twin (a tier-2 shape vs. an
+    ordinary logback.xml are indistinguishable without reading); the
+    encoding-undecodable case must get the SAME treatment, not the
+    stale WorkerProblem.degrades_run=True default."""
+    (tmp_path / "logback.xml").write_bytes(
+        b'<?xml version="1.0"?>\n<configuration><!-- caf\xe9 --></configuration>\n')
+    result = worker.process_paths(tmp_path, ["logback.xml"])
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "encoding_undecodable"
+    assert result.problems[0].degrades_run is False
+
+
 def test_process_paths_a_genuine_utf8_tooling_xml_still_gets_the_tier2_verdict(
     tmp_path: Path,
 ) -> None:
@@ -871,6 +912,23 @@ def test_process_paths_a_genuine_utf8_tooling_xml_still_gets_the_tier2_verdict(
     assert len(result.problems) == 1
     assert result.problems[0].reason_code == "unsupported_language"
     assert result.problems[0].degrades_run is True
+
+
+def test_process_paths_a_latin1_properties_file_is_unaffected_by_the_f3_encoding_guard(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 27 (F3 MAJOR, sweep): the reviewer's own sweep question -
+    do .properties/.md latin-1 twins behave? Yes, unaffected: this
+    producer never decodes a .properties file's own content at all (it
+    is classified purely by extension in the tier-3 branch), so an
+    undecodable encoding here was never a distinguishable case to begin
+    with - stays record-only, non-degrading, exactly like its UTF-8
+    twin."""
+    (tmp_path / "app.properties").write_bytes("café=touché\n".encode("latin-1"))
+    result = worker.process_paths(tmp_path, ["app.properties"])
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "unsupported_language"
+    assert result.problems[0].degrades_run is False
 
 
 def test_is_a_code_bearing_extension_worth_degrading_when_silently_excluded_includes_pom_and_web_xml_f4(

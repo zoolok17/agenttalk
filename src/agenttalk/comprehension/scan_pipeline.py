@@ -541,9 +541,27 @@ def run_scan(
         # unmodeled application-code file) - both currently collapse
         # into the identical reason_code string once threaded through
         # worker_problem_reasons_by_path above.
+        # FIX ROUND 27 (twenty-third cold read, F3 MAJOR, wrong-data):
+        # widened to also include the non-degrading half of
+        # "encoding_undecodable" - a binary-excluded and an encoding-
+        # undecodable, non-adapter-handled .xml file are EPISTEMICALLY
+        # IDENTICAL (this run cannot know the file's own tier without
+        # reading it, in either case), and round 26b's own binary ruling
+        # already refused to degrade OR misclassify the binary-excluded
+        # twin ("degrading every repo carrying an unreadable
+        # logback.xml") - an encoding-undecodable one previously kept
+        # BOTH the production default (never reaching this set at all)
+        # AND WorkerProblem.degrades_run's own True default, reopening
+        # the identical round-16/round-23-F3 harm this set exists to
+        # prevent. worker.py's own xml-root-sniff decode site now passes
+        # degrades_run=False for exactly this non-adapter-handled-XML
+        # case (never for .java/pom.xml/web.xml, which stay degrading -
+        # they are code-bearing by definition), so filtering on
+        # `not p.degrades_run` here correctly isolates only that case.
         non_degrading_unsupported_language_paths = frozenset(
             p.relative_path for p in worker_result.problems
-            if p.reason_code == "unsupported_language" and not p.degrades_run
+            if not p.degrades_run
+            and p.reason_code in ("unsupported_language", "encoding_undecodable")
         )
         modules = modules_artifact.build_modules(
             discovery_result, java_results,
@@ -750,7 +768,8 @@ def run_scan(
         entry_points, features = features_artifact.build_features(
             java_results, file_digests=file_digests)
         readiness_signals, readiness_summaries = readiness_artifact.build_readiness(
-            modules, dependencies, features, externality_poisoned=externality_poisoned)
+            modules, dependencies, features, entry_points,
+            externality_poisoned=externality_poisoned)
 
         # N1 (third cold read, fix round 5): find_case_fold_collisions
         # existed with its own passing unit tests and zero production

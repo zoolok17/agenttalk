@@ -2490,7 +2490,7 @@ def test_web_xml_filter_is_modeled_as_http_filter_attributed_to_its_own_filter_c
   </filter-mapping>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert not any(p.reason_code == "unsupported_entry_point_shape" for p in problems)
     assert not any(e.kind == "http_route" for e in entry_points)
     filter_entry_points = [e for e in entry_points if e.kind == "http_filter"]
@@ -2510,7 +2510,7 @@ def test_web_xml_listener_is_enrolled_attributed_to_its_own_listener_class():
   </listener>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert any(
         p.reason_code == "unsupported_entry_point_shape"
         and p.qualified_name == "com.acme.web.AppLifecycleListener"
@@ -2537,7 +2537,7 @@ def test_web_xml_filter_with_no_filter_class_falls_back_to_the_synthetic_owner()
   </filter-mapping>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert not any(p.reason_code == "unsupported_entry_point_shape" for p in problems)
     filter_entry_points = [e for e in entry_points if e.kind == "http_filter"]
     assert len(filter_entry_points) == 1
@@ -2563,7 +2563,7 @@ def test_web_xml_filter_mapping_by_servlet_name_is_enrolled_not_silent():
   </filter-mapping>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert entry_points == []
     matching = [
         p for p in problems
@@ -2596,7 +2596,7 @@ def test_web_xml_startup_only_servlet_with_no_mapping_is_enrolled_not_silent():
   </servlet-mapping>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert len(entry_points) == 1
     assert entry_points[0].qualified_name == "com.acme.web.OrdersServlet"
     matching = [
@@ -2719,7 +2719,7 @@ def test_web_xml_structural_tag_matrix_tolerates_attributes_prefixes_and_whitesp
   </servlet-mapping>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
     assert routes_by_pattern["/c1"] == "com.C1"
     assert routes_by_pattern["/c2"] == "com.C2"
@@ -2761,7 +2761,7 @@ def test_web_xml_attribute_bearing_servlet_filter_and_listener_end_to_end():
   </listener>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     routes_by_pattern = {e.name: (e.qualified_name, e.kind) for e in entry_points}
     assert routes_by_pattern["/admin/*"] == ("com.acme.AdminServlet", "http_route")
     assert routes_by_pattern["/*"] == ("com.acme.AuthFilter", "http_filter")
@@ -2819,7 +2819,7 @@ def test_web_xml_url_pattern_cdata_and_entity_decoding():
   </servlet-mapping>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     names = {e.name for e in entry_points}
     assert "/c4" in names
     assert "/c5/x" in names
@@ -2841,7 +2841,7 @@ def test_web_xml_url_pattern_with_an_undefined_entity_is_unrecoverable():
   </servlet-mapping>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert entry_points == []
     matching = [p for p in problems if p.reason_code == "route_value_unrecoverable"]
     assert len(matching) == 1
@@ -2871,7 +2871,7 @@ def test_web_xml_fully_prefixed_descriptor_still_publishes_the_route():
   </j:servlet-mapping>
 </j:web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
     assert routes_by_pattern["/full"] == "com.C"
     assert problems == []
@@ -2892,7 +2892,7 @@ def test_web_xml_attribute_bearing_leaf_element_still_publishes():
   </servlet-mapping>
 </web-app>
 """
-    entry_points, _problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, _problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
     assert routes_by_pattern["/leaf"] == "com.Leaf"
 
@@ -3002,7 +3002,7 @@ def test_web_xml_prefixed_descriptor_regression_stays_green_after_tag_stack_fix(
   </j:servlet-mapping>
 </j:web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
     assert routes_by_pattern["/full"] == "com.C"
     assert problems == []
@@ -3023,7 +3023,7 @@ def test_web_xml_split_cdata_url_pattern_is_unrecoverable():
   </servlet-mapping>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert entry_points == []
     matching = [p for p in problems if p.reason_code == "route_value_unrecoverable"]
     assert len(matching) == 1
@@ -3053,7 +3053,7 @@ def test_web_xml_mixed_content_cdata_url_pattern_is_unrecoverable():
   </servlet-mapping>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert entry_points == []
     matching = [p for p in problems if p.reason_code == "route_value_unrecoverable"]
     assert len(matching) == 1
@@ -3071,7 +3071,7 @@ def test_web_xml_wholly_wrapped_cdata_url_pattern_still_decodes():
   </servlet-mapping>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert {e.name for e in entry_points} == {"/whole"}
     assert problems == []
 
@@ -3134,7 +3134,7 @@ def test_a_cdata_wrapped_servlet_class_joins_the_real_route_owner():
   </servlet-mapping>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
     assert routes_by_pattern["/admin/*"] == "com.acme.AdminServlet"
     assert problems == []
@@ -3156,7 +3156,7 @@ def test_an_undecodable_servlet_class_is_flagged_not_silently_misattributed():
   </servlet-mapping>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
     assert routes_by_pattern["/admin/*"] == "WEB-INF/web.xml#admin"
     matching = [p for p in problems if p.reason_code == "route_value_unrecoverable"]
@@ -3272,7 +3272,7 @@ def test_web_xml_description_cdata_does_not_fabricate_a_route():
   </servlet-mapping>
 </web-app>
 """
-    entry_points, _problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, _problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     names = {e.name for e in entry_points}
     assert "/legacy/*" not in names
     assert names == {"/real/*"}
@@ -3339,7 +3339,7 @@ def test_web_xml_a_cdata_wrapped_servlet_name_publishes_not_silence():
   </servlet-mapping>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
     assert routes_by_pattern["/plain"] == "com.acme.PlainServlet"
     assert routes_by_pattern["/hidden"] == "com.acme.HiddenServlet"
@@ -3357,7 +3357,7 @@ def test_web_xml_an_undecodable_servlet_name_records_a_problem_not_silence():
   </servlet-mapping>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert entry_points == []
     matching = [p for p in problems if p.reason_code == "route_value_unrecoverable"]
     assert len(matching) == 1
@@ -3386,7 +3386,7 @@ def test_web_xml_a_cdata_wrapped_filter_name_publishes_not_silence():
   </filter-mapping>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
     assert routes_by_pattern["/plain"] == "com.acme.PlainFilter"
     assert routes_by_pattern["/hidden"] == "com.acme.HiddenFilter"
@@ -3403,7 +3403,7 @@ def test_web_xml_an_undecodable_filter_name_records_a_problem_not_silence():
   </filter-mapping>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert entry_points == []
     matching = [p for p in problems if p.reason_code == "route_value_unrecoverable"]
     assert len(matching) == 1
@@ -3424,7 +3424,7 @@ def test_web_xml_an_undecodable_name_only_descriptor_still_degrades():
   </servlet-mapping>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert entry_points == []
     assert problems != []
 
@@ -3453,7 +3453,7 @@ def test_web_xml_an_undecodable_servlet_name_in_the_servlet_block_records_a_prob
   </servlet-mapping>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
     assert routes_by_pattern["/h2"] == "WEB-INF/web.xml#s"
     matching = [p for p in problems if p.reason_code == "route_value_unrecoverable"]
@@ -3474,7 +3474,7 @@ def test_web_xml_an_undecodable_filter_name_in_the_filter_block_records_a_proble
   </filter-mapping>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
     assert routes_by_pattern["/h2"] == "WEB-INF/web.xml#f"
     matching = [p for p in problems if p.reason_code == "route_value_unrecoverable"]
@@ -3496,7 +3496,7 @@ def test_web_xml_a_wholly_wrapped_servlet_name_in_the_block_still_decodes_and_jo
   </servlet-mapping>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
     assert routes_by_pattern["/ok"] == "com.acme.RealClass"
     assert problems == []
@@ -3513,7 +3513,7 @@ def test_web_xml_a_genuinely_nameless_servlet_block_stays_silent():
   </servlet>
 </web-app>
 """
-    _entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    _entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert problems == []
 
 
@@ -3612,7 +3612,7 @@ def test_web_xml_filter_mapping_with_both_url_pattern_and_servlet_name_enrolls_t
   </filter-mapping>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert {e.name for e in entry_points} == {"/mixed/*"}
     matching = [p for p in problems if p.reason_code == "unsupported_entry_point_shape"]
     assert any("servlet_name_scoped_filter" in p.detail for p in matching)
@@ -4000,7 +4000,7 @@ def test_parse_web_xml_extracts_servlet_mapping_routes():
   </servlet-mapping>
 </web-app>
 """
-    entry_points, _web_problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, _web_problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert len(entry_points) == 1
     assert entry_points[0].name == "/api/*"
     assert entry_points[0].kind == "http_route"
@@ -4023,7 +4023,7 @@ def test_parse_web_xml_ignores_a_commented_out_servlet_mapping():
   </servlet-mapping>
 </web-app>
 """
-    entry_points, _web_problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, _web_problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert [e.name for e in entry_points] == ["/api/*"]
 
 
@@ -4042,10 +4042,68 @@ def test_parse_web_xml_captures_every_url_pattern_in_one_servlet_mapping():
   </servlet-mapping>
 </web-app>
 """
-    entry_points, _web_problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, _web_problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert sorted(e.name for e in entry_points) == ["*.do", "/legacy/*", "/old/*"]
     assert len({e.qualified_name for e in entry_points}) == 1
     assert all(e.kind == "http_route" and e.evidence_class == "declared" for e in entry_points)
+
+
+def test_parse_web_xml_a_servlet_mapping_route_publishes_a_paired_route_edge():
+    """FIX ROUND 27 (twenty-third cold read, F4, mechanism confirmed,
+    .cr23-routesym): a web.xml-declared route published a real entry
+    point but no matching `route`-relation edge, unlike every
+    annotation-based route - one document reported 4 route/filter
+    entry points and dependency_summary.routes: 2. Every published
+    servlet-mapping route must now ALSO emit its own paired edge, one
+    per url-pattern, with the identical owner/target/line."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>dispatcher</servlet-name>
+    <servlet-class>com.acme.web.DispatcherServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>dispatcher</servlet-name>
+    <url-pattern>/api/*</url-pattern>
+    <url-pattern>/api2/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _problems, edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert len(entry_points) == 2
+    assert len(edges) == 2
+    for edge in edges:
+        assert edge.relation == "route"
+        assert edge.target_kind == "external_route"
+        assert edge.from_qualified_name == "com.acme.web.DispatcherServlet"
+        assert edge.evidence_class == "declared"
+    assert sorted(e.target for e in edges) == ["/api/*", "/api2/*"]
+    assert sorted(e.name for e in entry_points) == sorted(e.target for e in edges)
+
+
+def test_parse_web_xml_a_filter_mapping_route_publishes_a_paired_route_edge():
+    """FIX ROUND 27 (F4, mechanism confirmed): the filter twin of the
+    servlet-mapping case above - @WebFilter's own annotation path
+    already emits this pairing for a filter entry point, the XML
+    <filter-mapping> shape must match it at the same fidelity."""
+    web_xml = """<web-app>
+  <filter>
+    <filter-name>auth</filter-name>
+    <filter-class>com.acme.web.AuthFilter</filter-class>
+  </filter>
+  <filter-mapping>
+    <filter-name>auth</filter-name>
+    <url-pattern>/secure/*</url-pattern>
+  </filter-mapping>
+</web-app>
+"""
+    entry_points, _problems, edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert len(entry_points) == 1
+    assert len(edges) == 1
+    assert edges[0].relation == "route"
+    assert edges[0].target_kind == "external_route"
+    assert edges[0].from_qualified_name == "com.acme.web.AuthFilter"
+    assert edges[0].target == "/secure/*"
+    assert entry_points[0].kind == "http_filter"
 
 
 def test_parse_web_xml_links_a_mapping_to_its_declared_servlet_class():
@@ -4070,7 +4128,7 @@ def test_parse_web_xml_links_a_mapping_to_its_declared_servlet_class():
   </servlet-mapping>
 </web-app>
 """
-    entry_points, _web_problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, _web_problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert len(entry_points) == 1
     assert entry_points[0].qualified_name == "com.acme.web.DispatcherServlet"
 
@@ -4088,7 +4146,7 @@ def test_parse_web_xml_falls_back_to_the_synthetic_owner_with_no_matching_servle
   </servlet-mapping>
 </web-app>
 """
-    entry_points, _web_problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, _web_problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert entry_points[0].qualified_name == "WEB-INF/web.xml#legacy"
 
 
@@ -4107,7 +4165,7 @@ def test_parse_web_xml_url_pattern_is_length_bounded():
   </servlet-mapping>
 </web-app>
 """
-    entry_points, _web_problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, _web_problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert len(entry_points[0].name) <= _MAX_ROUTE_TARGET_LENGTH + len("...(truncated)")
     assert entry_points[0].name != oversized
 
@@ -4370,7 +4428,7 @@ def test_split_xml_comments_and_cdata_a_comment_marker_inside_cdata_web_xml_rout
 </web-app>
 -->
 """
-    entry_points, _problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, _problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert {e.name for e in entry_points} == {"/beta/*"}
 
 
@@ -4455,7 +4513,7 @@ def test_web_xml_a_cdata_description_before_servlet_name_does_not_steal_the_clas
   </servlet-mapping>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
     assert routes_by_pattern == {"/checkout": "com.acme.CheckoutServlet"}
     assert "com.oldvendor.RetiredServlet" not in {e.qualified_name for e in entry_points}
@@ -4481,7 +4539,7 @@ def test_web_xml_a_cdata_description_in_the_mapping_does_not_fabricate_a_servlet
   </servlet-mapping>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
     assert routes_by_pattern == {"/checkout": "com.acme.CheckoutServlet"}
     assert problems == []
@@ -4514,7 +4572,7 @@ def test_web_xml_a_cdata_description_does_not_fabricate_a_load_on_startup_proble
   </filter-mapping>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
     assert routes_by_pattern["/ordinary"] == "com.acme.OrdinaryServlet"
     assert routes_by_pattern["/real"] == "com.acme.RealFilter"
@@ -4564,7 +4622,7 @@ def test_web_xml_a_wholly_cdata_wrapped_servlet_name_still_decodes_in_the_block(
   </servlet-mapping>
 </web-app>
 """
-    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    entry_points, problems, _edges = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
     assert routes_by_pattern == {"/checkout": "com.acme.CheckoutServlet"}
     assert problems == []

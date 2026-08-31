@@ -3924,10 +3924,34 @@ def is_effectively_empty_web_xml(text: str) -> bool:
 
 def parse_web_xml(
     relative_path: str, text: str,
-) -> tuple[list[JavaEntryPointClaim], list[JavaAdapterProblem]]:
+) -> tuple[list[JavaEntryPointClaim], list[JavaAdapterProblem], list[JavaEdgeClaim]]:
     """``route`` entry points declared as plain ``<servlet-mapping>``/
     ``<url-pattern>`` pairs in a ``web.xml`` - the same "trivially present,
     named, no inference" bar as the annotation-based routes above.
+
+    FIX ROUND 27 (twenty-third cold read, F4, mechanism confirmed): a
+    web.xml-declared route/filter published a real ENTRY POINT but no
+    matching ``route``-relation EDGE - the annotation-based paths above
+    (``@RequestMapping``/``@WebServlet``/``@WebFilter``) always emit both
+    together (see their own ``edges.append(JavaEdgeClaim(relation=
+    "route", ...))`` sites), so a run mixing annotation and XML routes
+    published an entry-point count and a ``dependency_summary.routes``
+    count that DISAGREED (round 21b's own same-fidelity claim - "the
+    exact same fidelity <servlet>/<servlet-mapping> already models with"
+    - was true for entry points but false for edges). Fixed by emitting
+    the identical paired edge at both this function's own publication
+    sites, below - a ``route``-relation edge is already bucketed
+    entirely separately from import/inherit/build in every consumer
+    (``readiness_artifact._DEPENDENCY_RESOLUTION_RELATIONS`` excludes
+    it; ``projector._NON_DEPENDENCY_RELATIONS`` buckets it into its own
+    ``dependency_summary.routes`` count, round 22's own F2) - adding
+    these edges cannot affect any external/fan/dependency-resolution
+    count, only make the existing ``routes`` count honest. Return arity
+    WIDENED here (unlike ``parse_maven_pom``'s own deliberately-frozen
+    arity) - this function has far fewer call sites, and the edges are
+    computed at the exact same point the entry points already are, so a
+    second, separately-maintained parse pass would be real duplication
+    for no benefit.
 
     FIX ROUND 17 (CR13-2 MAJOR): each mapping's own ``<servlet-class>``
     (via ``_servlet_class_by_name``), when declared, now becomes the
@@ -3965,6 +3989,7 @@ def parse_web_xml(
     does not serve; see ``JavaEntryPointClaim.kind``'s own docstring)."""
     entry_points = []
     problems = []
+    edges: list[JavaEdgeClaim] = []
     # FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE, F2, wrong-
     # data): every STRUCTURAL boundary below (servlet/servlet-mapping/
     # filter/filter-mapping/listener) is found against the CDATA-blanked
@@ -4067,8 +4092,9 @@ def parse_web_xml(
                     reason_code="route_value_unrecoverable",
                     detail=f"a <url-pattern> declared at line "
                            f"{_line_at(newline_offsets, absolute_offset)} contains XML "
-                           "constructs this producer does not decode (an undefined "
-                           "entity reference, or CDATA mixed with other content) - "
+                           "constructs this producer does not decode (an undefined or "
+                           "DOCTYPE-declared custom entity reference this producer "
+                           "does not resolve, or CDATA mixed with other content) - "
                            "suppressed rather than published with a guessed value",
                     qualified_name=owner_qualified_name,
                 ))
@@ -4081,6 +4107,16 @@ def parse_web_xml(
             # point. Kept as the real, honest value rather than
             # fabricating a placeholder name for it.
             url_pattern = _bounded_route_target(decoded.strip())
+            # FIX ROUND 27 (F4, mechanism confirmed): the paired
+            # route-relation edge every annotation-based route already
+            # emits alongside its own entry point - see this function's
+            # own docstring.
+            edges.append(JavaEdgeClaim(
+                from_qualified_name=owner_qualified_name, relation="route",
+                target=url_pattern, target_kind="external_route",
+                evidence_class="declared",
+                line=_line_at(newline_offsets, absolute_offset), phase="runtime",
+            ))
             entry_points.append(JavaEntryPointClaim(
                 qualified_name=owner_qualified_name, kind="http_route",
                 name=url_pattern, line=_line_at(newline_offsets, absolute_offset),
@@ -4246,13 +4282,24 @@ def parse_web_xml(
                     reason_code="route_value_unrecoverable",
                     detail=f"a <url-pattern> declared at line "
                            f"{_line_at(newline_offsets, absolute_offset)} contains XML "
-                           "constructs this producer does not decode (an undefined "
-                           "entity reference, or CDATA mixed with other content) - "
+                           "constructs this producer does not decode (an undefined or "
+                           "DOCTYPE-declared custom entity reference this producer "
+                           "does not resolve, or CDATA mixed with other content) - "
                            "suppressed rather than published with a guessed value",
                     qualified_name=owner_qualified_name,
                 ))
                 continue
             url_pattern = _bounded_route_target(decoded.strip())
+            # FIX ROUND 27 (F4, mechanism confirmed): the filter twin of
+            # the servlet-mapping loop's own paired-edge fix above - the
+            # annotation-based @WebFilter path already emits this same
+            # pairing for a filter entry point.
+            edges.append(JavaEdgeClaim(
+                from_qualified_name=owner_qualified_name, relation="route",
+                target=url_pattern, target_kind="external_route",
+                evidence_class="declared",
+                line=_line_at(newline_offsets, absolute_offset), phase="runtime",
+            ))
             entry_points.append(JavaEntryPointClaim(
                 qualified_name=owner_qualified_name, kind="http_filter",
                 name=url_pattern, line=_line_at(newline_offsets, absolute_offset),
@@ -4280,7 +4327,7 @@ def parse_web_xml(
                    "either",
             qualified_name=qualified_name,
         ))
-    return entry_points, problems
+    return entry_points, problems, edges
 
 
 def file_result_to_json(result: JavaFileResult) -> dict[str, Any]:
