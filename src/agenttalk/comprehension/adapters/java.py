@@ -2797,55 +2797,85 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     return JavaFileResult(units=units, edges=edges, entry_points=entry_points, problems=problems)
 
 
-_XML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+#: FIX ROUND 26 (twenty-second cold read, F1 BLOCKER, wrong-data): a
+#: comment pass and a CDATA pass used to run as two INDEPENDENT regex
+#: passes, each blind to the other's own markers - ``_strip_xml_comments``
+#: ran on the RAW text, BEFORE CDATA blanking existed, so a literal
+#: ``<!--`` living inside a CDATA section's own text content (CDATA text
+#: is never parsed as markup at all, by the XML spec) was read as a real
+#: comment opening, and the regex hunted for the next ``-->`` ANYWHERE in
+#: the file - past the CDATA's own closing ``]]>``, swallowing whatever
+#: real, live markup happened to follow textually. Measured: a pom's
+#: ``<description>`` CDATA containing a stray ``<!--`` swallowed the
+#: entire real ``<dependencies>`` block that followed it (edges=[],
+#: complete, 0 problems); a web.xml twin silently dropped a live route.
+#: Symmetric risk the other way (a literal ``<![CDATA[`` inside a REAL
+#: comment is comment text, not the start of a CDATA section) was never
+#: actually reachable by the old two-pass code (comments were already
+#: fully stripped before the CDATA pass ever ran), but a single ordered
+#: scan closes both directions uniformly rather than leaving one
+#: implicitly correct by accident of pass order.
+_XML_COMMENT_OR_CDATA_START_RE = re.compile(r"<!--|<!\[CDATA\[")
 
 
-def _strip_xml_comments(text: str) -> str:
-    """Blanks XML comment content with spaces while preserving every
-    newline and the overall length/offsets - mirrors
-    ``_strip_comments_and_strings``'s Java-comment handling exactly.
+def _split_xml_comments_and_cdata(text: str) -> tuple[str, str]:
+    """Single LEFT-TO-RIGHT pass recognizing XML comments and CDATA
+    sections in DOCUMENT ORDER - replaces the old two-independent-passes
+    ``_strip_xml_comments``/``_blank_cdata_sections`` (FIX ROUND 26,
+    twenty-second cold read, F1 BLOCKER - see
+    ``_XML_COMMENT_OR_CDATA_START_RE``'s own comment for the exact
+    exploit this closes).
 
-    M-1 (second cold read, fix round 4): ``parse_maven_pom`` and
-    ``parse_web_xml`` regexed the RAW xml with no comment stripping at
-    all (unlike the Java path, which sanitizes first and has the proving
-    test) - a commented-out ``<dependency>``/``<servlet-mapping>`` block
-    published exactly as if it were live, declared evidence. Commented-out
-    dependencies are common in legacy poms.
-    """
-    def _blank(match: re.Match) -> str:
-        return "".join(c if c == "\n" else " " for c in match.group(0))
-    return _XML_COMMENT_RE.sub(_blank, text)
+    Returns ``(sanitized, structural)``: ``sanitized`` blanks comment
+    content only, offset-preserving, leaving CDATA markers and content
+    intact (the source every real leaf VALUE is still recovered from, by
+    offset, for ``_decode_xml_text``); ``structural`` additionally blanks
+    every CDATA section too (the source every STRUCTURAL scan - the
+    tag-stack, every container-boundary regex - must use instead). The
+    two-string discipline this module already established, now built
+    from one ordered scan instead of two independently-blind ones.
 
-
-_CDATA_SECTION_RE = re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL)
-
-
-def _blank_cdata_sections(text: str) -> str:
-    """Blanks EVERY ``<![CDATA[...]]>`` section - markers included - with
-    spaces while preserving every newline and the overall length/offsets,
-    the exact same idiom ``_strip_xml_comments`` already uses for XML
-    comments.
-
-    FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE, F1+F2+F3,
-    wrong-data): every STRUCTURAL scan in this file (``_XML_TAG_RE``/
-    ``_enclosing_tag_stack``, and every ``_structural_block_pattern``-
-    based container regex) treated CDATA content as ordinary markup -
-    CDATA exists PRECISELY so arbitrary text (including text that looks
-    like XML) is never parsed as markup, and this producer's own coarse,
-    non-CDATA-aware scanners violated that on a legacy pom's own
-    ``<description>`` (a common home for HTML snippets - an unbalanced
-    ``<br>`` permanently corrupts the tag-stack's own push/pop tracking
-    for every position AFTER it) or a web.xml ``<description>``
-    documenting a long-removed mapping (published as a live, fabricated
-    entry point). This blanks CDATA content for STRUCTURAL scanning
-    ONLY - the caller must still recover the RAW text (CDATA markers
-    intact) from the ORIGINAL comment-stripped string, by OFFSET, for
-    any leaf value that needs ``_decode_xml_text`` - never call
-    ``.group()`` on a match found against this blanked string when the
-    matched TEXT (not just its position) is needed."""
-    def _blank(match: re.Match) -> str:
-        return "".join(c if c == "\n" else " " for c in match.group(0))
-    return _CDATA_SECTION_RE.sub(_blank, text)
+    Whichever marker - ``<!--`` or ``<![CDATA[`` - occurs FIRST at the
+    current scan position wins and is treated as that construct through
+    to its own matching terminator (``-->``/``]]>``); the scan then
+    resumes immediately after that terminator, never re-entering the
+    span just consumed looking for the OTHER marker type. An unterminated
+    comment or CDATA section (no closing marker before EOF) blanks
+    through to EOF, the same fail-safe direction the old two passes
+    already took for an unterminated comment."""
+    sanitized_parts: list[str] = []
+    structural_parts: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        marker = _XML_COMMENT_OR_CDATA_START_RE.search(text, i)
+        if marker is None:
+            tail = text[i:]
+            sanitized_parts.append(tail)
+            structural_parts.append(tail)
+            break
+        preamble = text[i:marker.start()]
+        sanitized_parts.append(preamble)
+        structural_parts.append(preamble)
+        if marker.group(0) == "<!--":
+            end = text.find("-->", marker.end())
+            end = n if end == -1 else end + 3
+            segment = text[marker.start():end]
+            blanked = "".join(c if c == "\n" else " " for c in segment)
+            sanitized_parts.append(blanked)
+            structural_parts.append(blanked)
+        else:
+            end = text.find("]]>", marker.end())
+            end = n if end == -1 else end + 3
+            segment = text[marker.start():end]
+            # CDATA content is preserved RAW in `sanitized` (a real leaf
+            # value's own CDATA markers must survive for
+            # `_decode_xml_text`); `structural` blanks it, the same
+            # offset-preserving idiom as everywhere else in this module.
+            sanitized_parts.append(segment)
+            structural_parts.append("".join(c if c == "\n" else " " for c in segment))
+        i = end
+    return "".join(sanitized_parts), "".join(structural_parts)
 
 
 #: FIX ROUND 14b (reviewer-3's ratified CR10-5 split): the first element
@@ -2895,7 +2925,7 @@ def sniff_xml_root_element(text: str) -> str | None:
     structure past that point cannot be trusted at all, so the search
     stops right there rather than reading whatever text happens to
     follow (which could itself be inside the broken comment)."""
-    sanitized = _strip_xml_comments(text)
+    sanitized, _structural = _split_xml_comments_and_cdata(text)
     sanitized = _XML_PI_RE.sub(_blank_match, sanitized)
     sanitized = _XML_DOCTYPE_RE.sub(_blank_match, sanitized)
     unterminated_comment_start = sanitized.find("<!--")
@@ -3252,8 +3282,7 @@ def declared_reactor_module_paths(text: str) -> list[str]:
     ``<module>``'s own VALUE is recovered from the ORIGINAL comment-
     stripped string by offset (blanking preserves length), never via
     ``.group()`` on a match found against the blanked string."""
-    sanitized = _strip_xml_comments(text)
-    structural = _blank_cdata_sections(sanitized)
+    sanitized, structural = _split_xml_comments_and_cdata(text)
     paths: list[str] = []
     for modules_match in _MODULES_ELEMENT_RE.finditer(structural):
         if _enclosing_tag_stack(structural, modules_match.start()) != ["project"]:
@@ -3307,18 +3336,29 @@ def pom_dependency_decode_problems(text: str) -> list[int]:
     CDATA-preserving ``sanitized`` string by offset) is what the leaf
     regexes below actually search - never the reverse, or a CDATA-
     wrapped groupId/artifactId could never be found at all."""
-    sanitized = _strip_xml_comments(text)
-    structural = _blank_cdata_sections(sanitized)
+    sanitized, structural = _split_xml_comments_and_cdata(text)
     newline_offsets = _newline_offsets(sanitized)
     lines: list[int] = []
     for match in _module_own_dependency_blocks(structural):
-        block = sanitized[match.start(1):match.end(1)]
-        group_match = _DEPENDENCY_GROUP_ID_RE.search(block)
-        artifact_match = _DEPENDENCY_ARTIFACT_ID_RE.search(block)
+        # FIX ROUND 26 (twenty-second cold read, F2 BLOCKER, wrong-data):
+        # the interior leaf search now runs against `block_structural`
+        # (the CDATA-blanked slice), never `block_sanitized` directly -
+        # the exact same two-string discipline every DOCUMENT-level scan
+        # in this file already follows, extended one level deeper into a
+        # block's own interior, where it was missing entirely.
+        block_sanitized = sanitized[match.start(1):match.end(1)]
+        block_structural = structural[match.start(1):match.end(1)]
+        group_match = _DEPENDENCY_GROUP_ID_RE.search(block_structural)
+        artifact_match = _DEPENDENCY_ARTIFACT_ID_RE.search(block_structural)
         group_undecodable = (
-            group_match is not None and _decode_xml_text(group_match.group(1)) is None)
+            group_match is not None
+            and _decode_xml_text(block_sanitized[group_match.start(1):group_match.end(1)]) is None
+        )
         artifact_undecodable = (
-            artifact_match is not None and _decode_xml_text(artifact_match.group(1)) is None)
+            artifact_match is not None
+            and _decode_xml_text(
+                block_sanitized[artifact_match.start(1):artifact_match.end(1)]) is None
+        )
         if group_undecodable or artifact_undecodable:
             lines.append(_line_at(newline_offsets, match.start()))
     return lines
@@ -3487,18 +3527,20 @@ def parse_maven_pom(
     resolve-internal-or-classify-the-miss treatment a Java import
     already gets, never a hardcoded external guess."""
     from_name = relative_path
-    sanitized = _strip_xml_comments(text)
     # FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE, F1+F3,
     # wrong-data): the STRUCTURAL layer (tag-stack, every container
-    # boundary regex below) scans this CDATA-blanked string instead of
-    # `sanitized` - a <description>'s own CDATA content (an unbalanced
-    # HTML tag is a common, real legacy-pom shape) must never corrupt
-    # the tag-stack or be mistaken for real markup. `sanitized` itself
-    # is kept, unchanged, as the source every VALUE is recovered from
-    # (by offset - blanking preserves length) once a match's own
+    # boundary regex below) scans the CDATA-blanked `structural` string
+    # instead of `sanitized` - a <description>'s own CDATA content (an
+    # unbalanced HTML tag is a common, real legacy-pom shape) must never
+    # corrupt the tag-stack or be mistaken for real markup. `sanitized`
+    # itself is kept, unchanged, as the source every VALUE is recovered
+    # from (by offset - blanking preserves length) once a match's own
     # position is known - the leaf decode battery still needs the RAW
-    # CDATA markers intact.
-    structural = _blank_cdata_sections(sanitized)
+    # CDATA markers intact. FIX ROUND 26 (F1 BLOCKER): both now come
+    # from ONE ordered scan (see `_split_xml_comments_and_cdata`) - a
+    # comment and a CDATA section are resolved in DOCUMENT ORDER, never
+    # two independently-blind passes.
+    sanitized, structural = _split_xml_comments_and_cdata(text)
     newline_offsets = _newline_offsets(sanitized)
     units: list[JavaUnitClaim] = []
     own_coordinate = _project_own_coordinate(sanitized, structural)
@@ -3541,9 +3583,15 @@ def parse_maven_pom(
 
     edges = []
     for match in _module_own_dependency_blocks(structural):
-        block = sanitized[match.start(1):match.end(1)]
-        group_match = _DEPENDENCY_GROUP_ID_RE.search(block)
-        artifact_match = _DEPENDENCY_ARTIFACT_ID_RE.search(block)
+        # FIX ROUND 26 (twenty-second cold read, F2 BLOCKER, wrong-data):
+        # every interior leaf search below now runs against
+        # `block_structural` (CDATA-blanked), never `block_sanitized`
+        # directly - the same two-string discipline every document-level
+        # scan already follows, extended into the block's own interior.
+        block_sanitized = sanitized[match.start(1):match.end(1)]
+        block_structural = structural[match.start(1):match.end(1)]
+        group_match = _DEPENDENCY_GROUP_ID_RE.search(block_structural)
+        artifact_match = _DEPENDENCY_ARTIFACT_ID_RE.search(block_structural)
         if group_match is None or artifact_match is None:
             continue
         # FIX ROUND 24 (twentieth cold read, F4 MINOR, wrong-data): a
@@ -3558,8 +3606,9 @@ def parse_maven_pom(
         # already unpack it positionally), so it stays silent here,
         # exactly as an absent element already is, and does not publish
         # a guessed value either way.
-        group_decoded = _decode_xml_text(group_match.group(1))
-        artifact_decoded = _decode_xml_text(artifact_match.group(1))
+        group_decoded = _decode_xml_text(block_sanitized[group_match.start(1):group_match.end(1)])
+        artifact_decoded = _decode_xml_text(
+            block_sanitized[artifact_match.start(1):artifact_match.end(1)])
         if group_decoded is None or artifact_decoded is None:
             continue
         # CR9-6 (ninth cold read, judged, completeness): a pom's own
@@ -3576,13 +3625,15 @@ def parse_maven_pom(
         # is treated the same as a genuinely absent one (the existing,
         # accepted "optional: false"/"phase: build" default), never a
         # raw, undecoded value fed into the comparison below.
-        optional_match = _DEPENDENCY_OPTIONAL_RE.search(block)
+        optional_match = _DEPENDENCY_OPTIONAL_RE.search(block_structural)
         optional_decoded = (
-            _decode_xml_text(optional_match.group(1)) if optional_match is not None else None)
+            _decode_xml_text(block_sanitized[optional_match.start(1):optional_match.end(1)])
+            if optional_match is not None else None)
         optional = optional_decoded is not None and optional_decoded.strip().lower() == "true"
-        scope_match = _DEPENDENCY_SCOPE_RE.search(block)
+        scope_match = _DEPENDENCY_SCOPE_RE.search(block_structural)
         scope_decoded = (
-            _decode_xml_text(scope_match.group(1)) if scope_match is not None else None)
+            _decode_xml_text(block_sanitized[scope_match.start(1):scope_match.end(1)])
+            if scope_match is not None else None)
         scope = scope_decoded.strip().lower() if scope_decoded is not None else None
         phase = "test" if scope == "test" else "build"
         edges.append(JavaEdgeClaim(
@@ -3696,19 +3747,30 @@ def _servlet_class_by_name(
     undecodable: list[tuple[str, int]] = []
     name_undecodable: list[int] = []
     for block_match in _SERVLET_BLOCK_RE.finditer(structural):
-        block = sanitized[block_match.start(1):block_match.end(1)]
-        name_match = _SERVLET_MAPPING_NAME_RE.search(block)
-        class_match = _SERVLET_CLASS_RE.search(block)
+        # FIX ROUND 26 (twenty-second cold read, F2 BLOCKER, wrong-data):
+        # web-app 2.4/2.5 puts <description> BEFORE <servlet-name>, so a
+        # CDATA description quoting a fake, retired servlet-name/class
+        # used to WIN this search's first-match race (it ran directly on
+        # `block`, a CDATA-preserving slice, with no context check at
+        # all) - fabricating a servlet identity for a route that never
+        # existed. Located against `block_structural` (CDATA-blanked)
+        # instead; the real value is still recovered from
+        # `block_sanitized` at the SAME offsets, the identical two-string
+        # idiom every document-level scan in this file already follows.
+        block_sanitized = sanitized[block_match.start(1):block_match.end(1)]
+        block_structural = structural[block_match.start(1):block_match.end(1)]
+        name_match = _SERVLET_MAPPING_NAME_RE.search(block_structural)
+        class_match = _SERVLET_CLASS_RE.search(block_structural)
         if name_match is None or class_match is None:
             continue
         # FIX ROUND 25 (twenty-first cold read, F4, wrong-data): decoded
         # the same as the class below.
-        decoded_name = _decode_xml_text(name_match.group(1))
+        decoded_name = _decode_xml_text(block_sanitized[name_match.start(1):name_match.end(1)])
         if decoded_name is None:
             name_undecodable.append(block_match.start())
             continue
         servlet_name = decoded_name.strip()
-        decoded_class = _decode_xml_text(class_match.group(1))
+        decoded_class = _decode_xml_text(block_sanitized[class_match.start(1):class_match.end(1)])
         if decoded_class is None:
             undecodable.append((servlet_name, block_match.start()))
             continue
@@ -3790,20 +3852,25 @@ def _filter_class_by_name(
     undecodable: list[tuple[str, int]] = []
     name_undecodable: list[int] = []
     for block_match in _FILTER_BLOCK_RE.finditer(structural):
-        block = sanitized[block_match.start(1):block_match.end(1)]
-        name_match = _FILTER_NAME_RE.search(block)
-        class_match = _FILTER_CLASS_RE.search(block)
+        # FIX ROUND 26 (twenty-second cold read, F2 BLOCKER, wrong-data):
+        # the exact same block-interior two-string fix
+        # ``_servlet_class_by_name`` above now applies - see its own
+        # comment.
+        block_sanitized = sanitized[block_match.start(1):block_match.end(1)]
+        block_structural = structural[block_match.start(1):block_match.end(1)]
+        name_match = _FILTER_NAME_RE.search(block_structural)
+        class_match = _FILTER_CLASS_RE.search(block_structural)
         if name_match is None or class_match is None:
             continue
         # FIX ROUND 25 (twenty-first cold read, F4, wrong-data): the
         # exact same decode discipline as ``_servlet_class_by_name``
         # above.
-        decoded_name = _decode_xml_text(name_match.group(1))
+        decoded_name = _decode_xml_text(block_sanitized[name_match.start(1):name_match.end(1)])
         if decoded_name is None:
             name_undecodable.append(block_match.start())
             continue
         filter_name = decoded_name.strip()
-        decoded_class = _decode_xml_text(class_match.group(1))
+        decoded_class = _decode_xml_text(block_sanitized[class_match.start(1):class_match.end(1)])
         if decoded_class is None:
             undecodable.append((filter_name, block_match.start()))
             continue
@@ -3846,8 +3913,7 @@ def is_effectively_empty_web_xml(text: str) -> bool:
     ``sanitized`` string: a ``<web-app>`` whose only content is a CDATA
     section is NOT empty (real content lives there, even if it happens
     to blank to whitespace for structural purposes)."""
-    sanitized = _strip_xml_comments(text)
-    structural = _blank_cdata_sections(sanitized)
+    sanitized, structural = _split_xml_comments_and_cdata(text)
     if _WEB_APP_SELF_CLOSING_RE.search(structural) is not None:
         return True
     block_match = _WEB_APP_BLOCK_RE.search(structural)
@@ -3899,16 +3965,16 @@ def parse_web_xml(
     does not serve; see ``JavaEntryPointClaim.kind``'s own docstring)."""
     entry_points = []
     problems = []
-    sanitized = _strip_xml_comments(text)
     # FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE, F2, wrong-
     # data): every STRUCTURAL boundary below (servlet/servlet-mapping/
-    # filter/filter-mapping/listener) is now found against this CDATA-
-    # blanked string - a <description> documenting a long-removed
+    # filter/filter-mapping/listener) is found against the CDATA-blanked
+    # `structural` string - a <description> documenting a long-removed
     # mapping (a real, common shape) must never be mistaken for a live
-    # one. `sanitized` stays the source every VALUE is recovered from,
-    # by offset (blanking preserves length) - the leaf decode battery
-    # still needs the RAW CDATA markers intact.
-    structural = _blank_cdata_sections(sanitized)
+    # one. `sanitized` stays the source every VALUE is recovered from, by
+    # offset (blanking preserves length) - the leaf decode battery still
+    # needs the RAW CDATA markers intact. FIX ROUND 26 (F1 BLOCKER): both
+    # now come from ONE ordered scan - see `_split_xml_comments_and_cdata`.
+    sanitized, structural = _split_xml_comments_and_cdata(text)
     newline_offsets = _newline_offsets(sanitized)
     servlet_class_by_name, servlet_class_undecodable, servlet_name_undecodable = (
         _servlet_class_by_name(sanitized, structural))
@@ -3947,8 +4013,15 @@ def parse_web_xml(
         ))
     mapped_servlet_names: set[str] = set()
     for block_match in _SERVLET_MAPPING_BLOCK_RE.finditer(structural):
-        block = sanitized[block_match.start(1):block_match.end(1)]
-        name_match = _SERVLET_MAPPING_NAME_RE.search(block)
+        # FIX ROUND 26 (twenty-second cold read, F2 BLOCKER, wrong-data):
+        # web-app 2.4/2.5 puts <description> BEFORE <servlet-name>, so a
+        # CDATA description quoting a fake servlet-name/url-pattern could
+        # steal this whole join - located against `block_structural`
+        # (CDATA-blanked) instead of the raw, CDATA-preserving `block`;
+        # real values still recovered from `block_sanitized` by offset.
+        block_sanitized = sanitized[block_match.start(1):block_match.end(1)]
+        block_structural = structural[block_match.start(1):block_match.end(1)]
+        name_match = _SERVLET_MAPPING_NAME_RE.search(block_structural)
         if name_match is None:
             # Same silent-drop shape round 15b's own JUDGE carry already
             # names for a nameless <servlet-mapping> - not a new gap.
@@ -3961,7 +4034,7 @@ def parse_web_xml(
         # reason another mapping's own real route (in the SAME file)
         # could mask the whole-file positive-evidence gate entirely.
         # Recorded visibly instead.
-        decoded_name = _decode_xml_text(name_match.group(1))
+        decoded_name = _decode_xml_text(block_sanitized[name_match.start(1):name_match.end(1)])
         if decoded_name is None:
             problems.append(JavaAdapterProblem(
                 reason_code="route_value_unrecoverable",
@@ -3976,7 +4049,7 @@ def parse_web_xml(
         mapped_servlet_names.add(servlet_name)
         owner_qualified_name = servlet_class_by_name.get(
             servlet_name, f"{relative_path}#{servlet_name}")
-        for pattern_match in _SERVLET_MAPPING_URL_PATTERN_RE.finditer(block):
+        for pattern_match in _SERVLET_MAPPING_URL_PATTERN_RE.finditer(block_structural):
             # CR9-6 (ninth cold read, judged, completeness): same per-field
             # bounding discipline as the pom producer above and every Java
             # route target - a url-pattern published verbatim, unbounded.
@@ -3987,7 +4060,8 @@ def parse_web_xml(
             # reference is unrecoverable, the same honesty the
             # annotation-route path already uses for a value it cannot
             # prove is real.
-            decoded = _decode_xml_text(pattern_match.group(1))
+            decoded = _decode_xml_text(
+                block_sanitized[pattern_match.start(1):pattern_match.end(1)])
             if decoded is None:
                 problems.append(JavaAdapterProblem(
                     reason_code="route_value_unrecoverable",
@@ -4022,24 +4096,32 @@ def parse_web_xml(
     # NO <load-on-startup> either is the existing, separately-accepted
     # "orphaned servlet" carry - unchanged, not this shape.
     for block_match in _SERVLET_BLOCK_RE.finditer(structural):
-        block = sanitized[block_match.start(1):block_match.end(1)]
-        name_match = _SERVLET_MAPPING_NAME_RE.search(block)
+        # FIX ROUND 26 (F2 BLOCKER): the same block-interior two-string
+        # fix as every other loop in this function - see the
+        # servlet-mapping loop's own comment above.
+        block_sanitized = sanitized[block_match.start(1):block_match.end(1)]
+        block_structural = structural[block_match.start(1):block_match.end(1)]
+        name_match = _SERVLET_MAPPING_NAME_RE.search(block_structural)
         # FIX ROUND 25 (F4, wrong-data): decoded before the membership
         # check - comparing a raw, undecoded CDATA-wrapped name against
         # `mapped_servlet_names` (which only ever holds DECODED names)
         # would never match, incorrectly treating an already-mapped
         # servlet as unmapped.
-        decoded_name = _decode_xml_text(name_match.group(1)) if name_match is not None else None
+        decoded_name = (
+            _decode_xml_text(block_sanitized[name_match.start(1):name_match.end(1)])
+            if name_match is not None else None)
         if decoded_name is None or decoded_name.strip() in mapped_servlet_names:
             continue
-        if _LOAD_ON_STARTUP_RE.search(block) is None:
+        if _LOAD_ON_STARTUP_RE.search(block_structural) is None:
             continue
-        class_match = _SERVLET_CLASS_RE.search(block)
+        class_match = _SERVLET_CLASS_RE.search(block_structural)
         # FIX ROUND 24 (F5 MINOR): this is only a LABEL on an already-
         # recorded problem (this shape is enrolled-only, never modeled)
         # - an undecodable class falls back to the same None a genuinely
         # absent one already gets, never a raw, undecoded value.
-        decoded_class = _decode_xml_text(class_match.group(1)) if class_match is not None else None
+        decoded_class = (
+            _decode_xml_text(block_sanitized[class_match.start(1):class_match.end(1)])
+            if class_match is not None else None)
         qualified_name = (
             _bounded_route_target(decoded_class.strip()) if decoded_class is not None else None)
         problems.append(JavaAdapterProblem(
@@ -4075,8 +4157,11 @@ def parse_web_xml(
                    "rather than the real class",
         ))
     for block_match in _FILTER_MAPPING_BLOCK_RE.finditer(structural):
-        block = sanitized[block_match.start(1):block_match.end(1)]
-        name_match = _FILTER_NAME_RE.search(block)
+        # FIX ROUND 26 (F2 BLOCKER): the same block-interior two-string
+        # fix as the servlet-mapping loop above.
+        block_sanitized = sanitized[block_match.start(1):block_match.end(1)]
+        block_structural = structural[block_match.start(1):block_match.end(1)]
+        name_match = _FILTER_NAME_RE.search(block_structural)
         if name_match is None:
             # Same silent-drop shape round 15b's own JUDGE carry already
             # names for a nameless <servlet-mapping> - not a new gap.
@@ -4085,7 +4170,7 @@ def parse_web_xml(
         # the filter twin of the servlet-mapping fix above - a filter-
         # name present but undecodable used to make the whole mapping
         # vanish silently.
-        decoded_name = _decode_xml_text(name_match.group(1))
+        decoded_name = _decode_xml_text(block_sanitized[name_match.start(1):name_match.end(1)])
         if decoded_name is None:
             problems.append(JavaAdapterProblem(
                 reason_code="route_value_unrecoverable",
@@ -4110,7 +4195,7 @@ def parse_web_xml(
         # class already closed for <listener>/@WebListener; now enrolled
         # the same way, never silently falling through to zero
         # iterations and zero problems.
-        url_pattern_matches = list(_SERVLET_MAPPING_URL_PATTERN_RE.finditer(block))
+        url_pattern_matches = list(_SERVLET_MAPPING_URL_PATTERN_RE.finditer(block_structural))
         # FIX ROUND 25 (twenty-first cold read, F5 MINOR, completeness):
         # round 22's own fix only enrolled this shape when
         # url_pattern_matches was EMPTY, silently assuming that was
@@ -4124,7 +4209,7 @@ def parse_web_xml(
         # alongside published patterns records the SAME problem, worded
         # accurately for that case (never claiming "no entry point
         # published" when one genuinely was, via the sibling pattern).
-        servlet_name_scoping_match = _SERVLET_MAPPING_NAME_RE.search(block)
+        servlet_name_scoping_match = _SERVLET_MAPPING_NAME_RE.search(block_structural)
         if servlet_name_scoping_match is not None:
             if url_pattern_matches:
                 detail = (
@@ -4154,7 +4239,8 @@ def parse_web_xml(
             # FIX ROUND 23 (F1(d) + F2): see the servlet-mapping loop's
             # own identical comment above - the same decode-or-
             # unrecoverable choke point applies here too.
-            decoded = _decode_xml_text(pattern_match.group(1))
+            decoded = _decode_xml_text(
+                block_sanitized[pattern_match.start(1):pattern_match.end(1)])
             if decoded is None:
                 problems.append(JavaAdapterProblem(
                     reason_code="route_value_unrecoverable",
@@ -4173,12 +4259,17 @@ def parse_web_xml(
                 evidence_class="declared",
             ))
     for block_match in _LISTENER_BLOCK_RE.finditer(structural):
-        block = sanitized[block_match.start(1):block_match.end(1)]
-        class_match = _LISTENER_CLASS_RE.search(block)
+        # FIX ROUND 26 (F2 BLOCKER): the same block-interior two-string
+        # fix as every other loop in this function.
+        block_sanitized = sanitized[block_match.start(1):block_match.end(1)]
+        block_structural = structural[block_match.start(1):block_match.end(1)]
+        class_match = _LISTENER_CLASS_RE.search(block_structural)
         # FIX ROUND 24 (F5 MINOR): same label-only treatment as the
         # servlet startup-check above - cosmetic here (this shape is
         # enrolled-only, never modeled beyond the bare fact it exists).
-        decoded_class = _decode_xml_text(class_match.group(1)) if class_match is not None else None
+        decoded_class = (
+            _decode_xml_text(block_sanitized[class_match.start(1):class_match.end(1)])
+            if class_match is not None else None)
         qualified_name = (
             _bounded_route_target(decoded_class.strip()) if decoded_class is not None else None)
         problems.append(JavaAdapterProblem(

@@ -4329,3 +4329,242 @@ def test_parsing_a_large_file_completes_well_under_a_generous_bound():
     elapsed = time.monotonic() - start
     assert len(_edges(result, "import")) == 20_000
     assert elapsed < 5.0, f"parsing took {elapsed:.2f}s - possible quadratic regression"
+
+
+# --------------------------------------------------- fix round 26 F1 (comment-vs-CDATA document order)
+
+def test_split_xml_comments_and_cdata_a_comment_marker_inside_cdata_never_swallows_real_markup():
+    """FIX ROUND 26 (twenty-second cold read, F1 BLOCKER, .cr22-
+    cdatacomment, wrong-data): _strip_xml_comments used to run on the
+    RAW text BEFORE _blank_cdata_sections ever ran, so a literal
+    "<!--" living inside a <description>'s own CDATA content started a
+    comment match that swallowed real markup up to the NEXT "-->"
+    anywhere in the file - here, the whole real <dependencies> block.
+    The unified, order-aware scanner must recognize the "<!--" as inert
+    CDATA text (never a real comment opening) and leave the real
+    dependency block intact."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <description><![CDATA[see <!-- the readme for details ]]></description>
+  <dependencies>
+    <dependency><groupId>org.real</groupId><artifactId>real-lib</artifactId></dependency>
+  </dependencies>
+</project>
+-->
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.real:real-lib"}
+
+
+def test_split_xml_comments_and_cdata_a_comment_marker_inside_cdata_web_xml_route_survives():
+    """FIX ROUND 26 (F1 BLOCKER, .cr22-cdatacomment-web2): the web.xml
+    twin - a stray "<!--" inside a <description>'s CDATA must not mask
+    a live route declared later in the same file."""
+    web_xml = """<web-app>
+  <description><![CDATA[migrated from <!-- the old dispatcher ]]></description>
+  <servlet-mapping>
+    <servlet-name>beta</servlet-name>
+    <url-pattern>/beta/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+-->
+"""
+    entry_points, _problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert {e.name for e in entry_points} == {"/beta/*"}
+
+
+def test_split_xml_comments_and_cdata_a_cdata_marker_inside_a_real_comment_stays_inert():
+    """FIX ROUND 26 (F1 BLOCKER, the symmetric ordering control): a
+    literal "<![CDATA[" living inside a REAL XML comment is comment
+    text, never the start of a genuine CDATA section - a comment
+    documenting the CDATA idiom itself (e.g. in a template/example)
+    must not accidentally open a CDATA span that swallows whatever
+    follows the comment's own real "-->"."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <!-- example: wrap free text like <![CDATA[ this -->
+  <dependencies>
+    <dependency><groupId>org.real</groupId><artifactId>real-lib</artifactId></dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.real:real-lib"}
+
+
+def test_split_xml_comments_and_cdata_matches_the_old_two_pass_behavior_on_ordinary_input():
+    """FIX ROUND 26 (F1 BLOCKER, regression control): on ordinary,
+    non-adversarial XML (a ratified pom description/CDATA shape from
+    round 25's own matrix), the new single ordered scan must produce
+    the identical (sanitized, structural) pair the old two independent
+    passes already produced - the fix changes only the ADVERSARIAL
+    ordering case, never the common one."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <!-- a plain, unremarkable comment -->
+  <description><![CDATA[some <b>bold</b> text]]></description>
+  <dependencies>
+    <dependency><groupId>org.a</groupId><artifactId>a</artifactId></dependency>
+  </dependencies>
+</project>
+"""
+    sanitized, structural = java._split_xml_comments_and_cdata(pom)
+    assert "<dependency>" in sanitized
+    assert "<dependency>" in structural
+    assert "<![CDATA[" in sanitized
+    assert "<![CDATA[" not in structural
+    assert len(sanitized) == len(pom)
+    assert len(structural) == len(pom)
+
+
+def test_split_xml_comments_and_cdata_an_unterminated_comment_blanks_to_eof():
+    """FIX ROUND 26 (F1 BLOCKER): the fail-safe direction for a genuinely
+    malformed, unterminated comment is unchanged from the old passes -
+    blank through to EOF, never read whatever text happens to follow."""
+    text = "before<!-- never closed"
+    sanitized, structural = java._split_xml_comments_and_cdata(text)
+    assert sanitized.strip() == "before"
+    assert structural.strip() == "before"
+    assert len(sanitized) == len(text)
+
+
+# --------------------------------------------------- fix round 26 F2 (block-interior leaf searches unpaired)
+
+def test_web_xml_a_cdata_description_before_servlet_name_does_not_steal_the_class_join():
+    """FIX ROUND 26 (twenty-second cold read, F2 BLOCKER, .cr22-webdesc3,
+    wrong-data): web-app 2.4/2.5 legally places <description> BEFORE
+    <servlet-name> - a CDATA description quoting a fake, retired
+    servlet-name/servlet-class pair used to WIN the block-interior
+    search's first-match race (it ran directly on a CDATA-preserving
+    slice, with no context check at all), fabricating an owner for a
+    servlet that was never really declared. The real CheckoutServlet
+    must resolve, and the fake RetiredServlet must never appear
+    anywhere in the published entry points."""
+    web_xml = """<web-app>
+  <servlet>
+    <description><![CDATA[<servlet-name>FakeName</servlet-name><servlet-class>com.oldvendor.RetiredServlet</servlet-class>]]></description>
+    <servlet-name>CheckoutServlet</servlet-name>
+    <servlet-class>com.acme.CheckoutServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>CheckoutServlet</servlet-name>
+    <url-pattern>/checkout</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern == {"/checkout": "com.acme.CheckoutServlet"}
+    assert "com.oldvendor.RetiredServlet" not in {e.qualified_name for e in entry_points}
+    assert problems == []
+
+
+def test_web_xml_a_cdata_description_in_the_mapping_does_not_fabricate_a_servlet_name():
+    """FIX ROUND 26 (F2 BLOCKER, .cr22-webdesc, wrong-data): the same
+    attack against <servlet-mapping>'s own <description>/<servlet-name>
+    ordering - a fabricated servlet-name must never steal the join away
+    from the real, later-declared name in the same mapping block, which
+    would otherwise leave the REAL servlet with a confident
+    no_entry_point/no_feature_link negative."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>CheckoutServlet</servlet-name>
+    <servlet-class>com.acme.CheckoutServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <description><![CDATA[<servlet-name>Fake</servlet-name>]]></description>
+    <servlet-name>CheckoutServlet</servlet-name>
+    <url-pattern>/checkout</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern == {"/checkout": "com.acme.CheckoutServlet"}
+    assert problems == []
+
+
+def test_web_xml_a_cdata_description_does_not_fabricate_a_load_on_startup_problem():
+    """FIX ROUND 26 (F2 BLOCKER, .cr22-webdesc2, wrong-data): a CDATA
+    description quoting a fake <load-on-startup> (a servlet that is
+    genuinely NOT startup-only, and NOT unmapped) must never trigger
+    the startup_only_servlet enrolled-gap problem - and the sibling
+    filter-mapping half of the same fixture must still join correctly."""
+    web_xml = """<web-app>
+  <servlet>
+    <description><![CDATA[<load-on-startup>1</load-on-startup>]]></description>
+    <servlet-name>Ordinary</servlet-name>
+    <servlet-class>com.acme.OrdinaryServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>Ordinary</servlet-name>
+    <url-pattern>/ordinary</url-pattern>
+  </servlet-mapping>
+  <filter>
+    <description><![CDATA[<filter-name>Fake</filter-name>]]></description>
+    <filter-name>RealFilter</filter-name>
+    <filter-class>com.acme.RealFilter</filter-class>
+  </filter>
+  <filter-mapping>
+    <filter-name>RealFilter</filter-name>
+    <url-pattern>/real</url-pattern>
+  </filter-mapping>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern["/ordinary"] == "com.acme.OrdinaryServlet"
+    assert routes_by_pattern["/real"] == "com.acme.RealFilter"
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in problems)
+
+
+def test_pom_a_cdata_description_in_a_dependency_block_does_not_fabricate_optional_or_scope():
+    """FIX ROUND 26 (F2 BLOCKER, sweep to pom.xml's own block-interior
+    searches): a <dependency> element has no legal <description> child,
+    but the interior optional/scope leaf searches must still be located
+    against the CDATA-blanked block, not a raw, CDATA-preserving slice -
+    regression control mirroring the web.xml attack shape one producer
+    over."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <dependencies>
+    <dependency>
+      <groupId>org.real</groupId>
+      <artifactId>real-lib</artifactId>
+      <optional><![CDATA[<scope>test</scope>]]>false</optional>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert len(edges) == 1
+    assert edges[0].phase == "build"
+    assert edges[0].optional is False
+
+
+def test_web_xml_a_wholly_cdata_wrapped_servlet_name_still_decodes_in_the_block():
+    """FIX ROUND 26 (F2 BLOCKER, regression control): a servlet-name that
+    is wholly (not adversarially) CDATA-wrapped inside the <servlet>
+    block itself must still decode and join correctly - the F2 fix
+    (searching the CDATA-blanked block slice) must not break the F4
+    decode-or-record discipline round 25 already established for this
+    same block."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name><![CDATA[Checkout]]></servlet-name>
+    <servlet-class><![CDATA[com.acme.CheckoutServlet]]></servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>Checkout</servlet-name>
+    <url-pattern>/checkout</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern == {"/checkout": "com.acme.CheckoutServlet"}
+    assert problems == []
