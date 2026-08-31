@@ -943,6 +943,117 @@ def test_whole_scope_fingerprint_changes_when_a_new_file_is_added(tmp_path: Path
     assert before.whole_scope_fingerprint != after.whole_scope_fingerprint
 
 
+# ------------------- F3 (round 29, twenty-fifth cold read): non-hard-excluded
+# categories now contribute to the fingerprint too
+
+def test_whole_scope_fingerprint_changes_when_a_binary_excluded_files_content_changes(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 29 (twenty-fifth cold read, F3 MAJOR, wrong-data): a
+    changed binary-excluded file used to leave whole_scope_fingerprint
+    completely UNCHANGED, even though the same run publishes its own
+    changed content_digest in modules.json (round 28b's own binary-twin-
+    unit fix) - a real, silent gap. The fingerprint must change when a
+    binary-excluded file's own content changes."""
+    (tmp_path / "logback.xml").write_bytes(b"<config>\x00v1</config>")
+    comp_dir = _comprehension_dir(tmp_path)
+    before = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert any(e["category"] == "binary" for e in before.excluded_roots)
+    (tmp_path / "logback.xml").write_bytes(b"<config>\x00v2</config>")
+    after = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert before.whole_scope_fingerprint != after.whole_scope_fingerprint
+
+
+def test_an_oversized_files_excluded_roots_entry_carries_no_content_digest(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 29 (F3 MAJOR, sweep): the docstring's own "same
+    treatment applies to generated/vendor/oversize" - measured for the
+    resource_limit_oversized category too. Unlike binary/
+    resource_limit_total_bytes, NO content_digest is possible here at
+    all (excluded from stat().st_size alone, BEFORE any read, by design
+    - reading the file just to fingerprint it would reopen the exact
+    resource-exhaustion risk this cap exists to prevent). This category
+    also always records its own degrading `resource_limit` problem, so
+    (like resource_limit_total_bytes) `whole_scope_fingerprint` itself
+    is always `None` whenever it fires - asserted directly against the
+    excluded_roots entry instead, the one fact this fix's own docstring
+    claims (path+category only, digest deliberately absent)."""
+    monkeypatch.setattr(discovery, "MAX_PER_FILE_BYTES", 4)
+    (tmp_path / "big.bin").write_bytes(b"12345")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    entry = next(e for e in result.excluded_roots if e["category"] == "resource_limit_oversized")
+    assert "content_digest" not in entry
+
+
+def test_a_total_bytes_capped_files_excluded_roots_entry_carries_its_content_digest(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 29 (F3 MAJOR, sweep): the resource_limit_total_bytes
+    twin - bytes ARE already read here (the cap is checked AFTER
+    reading, unlike resource_limit_oversized), so a real content_digest
+    is carried the same way binary's already is. This category always
+    ALSO records a degrading `resource_limit` problem of its own
+    (unrelated to this fix), so `whole_scope_fingerprint` itself is
+    always `None` whenever it fires (fingerprint_complete=False) - the
+    content_digest is asserted directly instead, the fact this fix
+    actually adds and the one a future non-degrading consumer of this
+    same category would need."""
+    monkeypatch.setattr(discovery, "MAX_HASHED_TOTAL_BYTES", 3)
+    (tmp_path / "over.txt").write_bytes(b"aaaa")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    entry = next(e for e in result.excluded_roots if e["category"] == "resource_limit_total_bytes")
+    assert entry["content_digest"] == hashlib.sha256(b"aaaa").hexdigest()
+
+
+def test_whole_scope_fingerprint_changes_when_a_generated_or_vendor_directorys_own_path_changes(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 29 (F3 MAJOR, sweep): the generated_or_vendor twin - no
+    per-file digest is possible here at all (a directory-level skip,
+    never walked, so there is no enumerated content to digest without
+    defeating the entire point of excluding it), but the fingerprint
+    must still be sensitive to WHICH path was excluded, not merely how
+    many. The pre-existing `exclusions` category+COUNT field would
+    already make a brand-new generated/vendor exclusion change the
+    fingerprint on its own (1 vs 0) - too weak a test to prove this
+    fix's own path-level addition actually did anything. Isolated here:
+    renaming the excluded directory keeps the count identical (exactly
+    one generated_or_vendor exclusion, either way) while the PATH
+    itself changes - only this fix's own per-entry path/category tuple
+    can tell the two scans apart."""
+    (tmp_path / "a.txt").write_bytes(b"hello")
+    (tmp_path / "target").mkdir()
+    (tmp_path / "target" / "output.class").write_bytes(b"compiled")
+    comp_dir = _comprehension_dir(tmp_path)
+    before = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert before.exclusions.get("generated_or_vendor") == 1
+    (tmp_path / "target").rename(tmp_path / "build")
+    after = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert after.exclusions.get("generated_or_vendor") == 1
+    assert before.whole_scope_fingerprint != after.whole_scope_fingerprint
+
+
+def test_whole_scope_fingerprint_is_unaffected_by_a_secret_files_content(
+    tmp_path: Path,
+) -> None:
+    """Companion control: secret/VCS/dependency-cache exclusions stay OUT
+    of the fingerprint entirely, unchanged - the design's own "not read
+    or copied into the fingerprint" wording for exactly these
+    categories (confidentiality for secrets; cost for VCS/dependency-
+    cache directories genuinely never worth walking at all)."""
+    (tmp_path / "a.txt").write_bytes(b"hello")
+    (tmp_path / ".env").write_bytes(b"SECRET=v1")
+    comp_dir = _comprehension_dir(tmp_path)
+    before = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert any(e["category"] == "secret" for e in before.excluded_roots)
+    (tmp_path / ".env").write_bytes(b"SECRET=v2-completely-different-length-too")
+    after = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert before.whole_scope_fingerprint == after.whole_scope_fingerprint
+
+
 # ------------------------- effective exclude-rule digest (N2, round 6)
 
 def test_effective_exclude_rule_digest_is_deterministic() -> None:

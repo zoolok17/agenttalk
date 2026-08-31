@@ -23,15 +23,24 @@ measurement against a representative corpus (task #55 slice-1 dispatch,
 C-6) - this module enforces whatever the constants currently say, not a
 claim that these exact numbers are final.
 
-Scope simplification for THIS commit (flagged, not silently decided): the
-design distinguishes hard-excluded content (secret/VCS/cache - "not read or
+FIX ROUND 29 (twenty-fifth cold read, F3 MAJOR, completeness): the design
+distinguishes hard-excluded content (secret/VCS/cache - "not read or
 copied into the fingerprint") from the wider set that still contributes to
 whole-scope freshness tracking even when not adapter-addressable. This
-module currently treats every default-exclude category uniformly: tallied
-by category+count, never read for hashing, never in the whole-scope
-fingerprint's per-entry inputs. Revisit if review wants the wider
-freshness-tracking behavior for generated/vendor/binary content
-specifically.
+module used to treat every default-exclude category uniformly (tallied by
+category+count, never in the whole-scope fingerprint's per-entry inputs at
+all) - a real gap, measured: a changed binary-excluded file left the
+fingerprint unchanged while the same run published its own changed
+content_digest in modules.json. Widened now: `binary`/`generated_or_
+vendor`/`resource_limit_oversized`/`resource_limit_total_bytes` each join
+the fingerprint via their own `excluded_roots` entry (path + category +
+content_digest when one is already in hand, `None` when computing one
+would require re-reading bytes this producer deliberately never reads at
+all - see `enumerate_scope`'s own fingerprint-assembly comment for the
+per-category detail). `secret`/`vcs`/`dependency_cache`/`hard_excluded`
+remain OUT of the fingerprint entirely, unchanged - genuinely never read
+or copied, for confidentiality (secret) and cost (VCS/dependency-cache
+directories) reasons the design's own wording already names.
 
 CRITICAL ORDERING (per the lead's explicit round-4 confirmation on the
 approved PR-B plan): the per-file byte-size cap is checked from
@@ -968,7 +977,14 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                 continue
             if hashed_total + len(data) > MAX_HASHED_TOTAL_BYTES:
                 degraded = True
-                _record_exclusion("resource_limit_total_bytes", relative)
+                # FIX ROUND 29 (twenty-fifth cold read, F3 MAJOR, wrong-
+                # data): the bytes are ALREADY in hand here (`data`, read
+                # just above) - the same "carry the digest, never re-read"
+                # discipline round 28b's own binary-category fix already
+                # established, now applied to this category too.
+                _record_exclusion(
+                    "resource_limit_total_bytes", relative,
+                    content_digest=hashlib.sha256(data).hexdigest())
                 problems.append({
                     "reason_code": "resource_limit",
                     "path": relative,
@@ -997,6 +1013,42 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
 
     fingerprint = None
     if fingerprint_complete:
+        # FIX ROUND 29 (twenty-fifth cold read, F3 MAJOR, completeness):
+        # this module's own docstring names the design's requirement (the
+        # fingerprint covers every NON-hard-excluded entry) and declared,
+        # as a scope simplification, that every default-exclude category
+        # was folded uniformly into the OTHER extreme instead - never in
+        # the fingerprint at all, even for the categories that are
+        # genuinely fine to include. Measured: a changed binary-excluded
+        # file left the fingerprint unchanged while modules.json published
+        # its changed source_digest - a real, silent gap, not a merely
+        # theoretical one. Widened here rather than left declared: a
+        # NON-hard-excluded category's own excluded_roots entries now
+        # join the fingerprint too, each carrying its own content_digest
+        # when one is already in hand (never re-read for this alone) -
+        # ``binary`` (round 28b) and ``resource_limit_total_bytes``
+        # (above, this round) both already read the file's bytes before
+        # excluding it; ``generated_or_vendor`` (a directory-level skip,
+        # no per-file bytes ever read at all - reading its own contents
+        # just to fingerprint them would defeat the entire point of
+        # skipping it) and ``resource_limit_oversized`` (excluded from
+        # ``stat().st_size`` alone, BEFORE any read, by design - the
+        # identical reasoning) both carry ``None`` instead: the fingerprint
+        # is still sensitive to that PATH's own presence/category (a
+        # generated/vendor tree appearing, disappearing, or being excluded
+        # under a different category all change the fingerprint), just not
+        # to a content change happening entirely inside an already-
+        # excluded region - a named, accepted residual, not silently
+        # unlimited. ``secret``/``vcs``/``dependency_cache``/
+        # ``hard_excluded`` stay OUT of the fingerprint entirely,
+        # unchanged - the design's own "not read or copied into the
+        # fingerprint" wording for exactly these categories (secret files
+        # for confidentiality; VCS/dependency-cache directories because
+        # walking them at all would be both expensive and pointless).
+        non_hard_excluded_categories = frozenset({
+            "binary", "generated_or_vendor", "resource_limit_oversized",
+            "resource_limit_total_bytes",
+        })
         fingerprint_input = {
             "platform_identity": {
                 "os_family": platform_identity.os_family,
@@ -1012,6 +1064,11 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                 (b.relative_path, b.boundary_kind) for b in boundaries
             ),
             "exclusions": dict(sorted(exclusions.items())),
+            "non_hard_excluded": sorted(
+                (entry["path"], entry["category"], entry.get("content_digest"))
+                for entry in excluded_roots
+                if entry["category"] in non_hard_excluded_categories
+            ),
         }
         fingerprint = hashlib.sha256(
             json.dumps(fingerprint_input, sort_keys=True, separators=(",", ":")).encode("utf-8")
