@@ -3014,6 +3014,27 @@ def test_run_scan_with_acknowledge_but_no_work_id_refuses(tmp_path: Path) -> Non
         scan_pipeline.run_scan(tmp_path, acknowledge_unignored=True)
 
 
+def test_run_scan_with_acknowledge_but_no_work_id_refuses_even_with_no_privacy_issue(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 28 (twenty-fourth cold read, F9, wrong-refusal-timing):
+    the sibling test above only exercises the pairing refusal on a repo
+    the preflight was ALSO going to refuse anyway - the refusal used to
+    live inside the preflight's own except branch, so a caller who
+    passed --acknowledge-unignored-private-store with no --work-id
+    against a repo with NO privacy issue at all (.agenttalk correctly
+    ignored here) silently proceeded, no different from never having
+    passed the flag. The pairing is a property of the arguments
+    themselves, never of what the preflight happens to find - must
+    refuse here too."""
+    _init_git_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(".agenttalk/\nbuild/\n", encoding="utf-8")
+    _write_sample_java_project(tmp_path)
+    with pytest.raises(scan_pipeline.ScanRefused, match="work-id"):
+        scan_pipeline.run_scan(tmp_path, acknowledge_unignored=True)
+    assert not (tmp_path / ".agenttalk").exists()
+
+
 def test_run_scan_with_acknowledge_and_work_id_proceeds(tmp_path: Path) -> None:
     _init_git_repo(tmp_path)
     (tmp_path / ".gitignore").write_text("build/\n", encoding="utf-8")
@@ -3270,6 +3291,143 @@ def test_validate_run_flags_an_entry_point_with_an_unknown_owning_unit(
     assert "owning_unit_id" in result["detail"]
 
 
+def test_validate_run_flags_an_entry_point_with_an_unknown_declared_in_unit(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 28 (twenty-fourth cold read, F4, completeness): the
+    dangling-reference sweep never covered declared_in_unit_id (round
+    27's own new field) - a value naming no real unit could slip past
+    validate exactly the same way an unknown owning_unit_id used to
+    before round 9b's own fix."""
+    from agenttalk.comprehension import features_artifact as featuresmod
+
+    real_build_features = featuresmod.build_features
+
+    def _inject_a_dangling_declared_in(*args, **kwargs):
+        entry_points, features = real_build_features(*args, **kwargs)
+        real_owner = entry_points[0].owning_unit_id if entry_points else "does-not-exist-owner"
+        orphan = featuresmod.EntryPointRecord(
+            entry_point_id="orphan-declared-in", kind="http_route", name="GET /orphan",
+            owning_unit_id=real_owner, feature_ids=[], evidence_class="declared",
+            declared_in_unit_id="does-not-exist-declarer",
+        )
+        return [*entry_points, orphan], features
+
+    monkeypatch.setattr(
+        scan_pipeline.features_artifact, "build_features", _inject_a_dangling_declared_in)
+
+    scan_pipeline.run_scan(java_repo)
+    result = scan_pipeline.validate_run(java_repo)
+    assert result["valid"] is False
+    assert "declared_in_unit_id" in result["detail"]
+
+
+def test_validate_run_flags_a_feature_with_an_unknown_unit_id(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 28 (F4, completeness): feature.unit_ids was never swept
+    for dangling references either."""
+    from agenttalk.comprehension import features_artifact as featuresmod
+
+    real_build_features = featuresmod.build_features
+
+    def _inject_a_dangling_feature_unit(*args, **kwargs):
+        entry_points, features = real_build_features(*args, **kwargs)
+        orphan = featuresmod.FeatureRecord(
+            feature_id="orphan-feature-unit", label="Orphan", state="candidate",
+            origin="detected", unit_ids=["does-not-exist"], entry_point_ids=[],
+        )
+        return entry_points, [*features, orphan]
+
+    monkeypatch.setattr(
+        scan_pipeline.features_artifact, "build_features", _inject_a_dangling_feature_unit)
+
+    scan_pipeline.run_scan(java_repo)
+    result = scan_pipeline.validate_run(java_repo)
+    assert result["valid"] is False
+    assert "feature(s) reference an unknown unit_id" in result["detail"]
+
+
+def test_validate_run_flags_a_feature_with_an_unknown_entry_point_id(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 28 (F4, completeness): feature.entry_point_ids was never
+    swept for dangling references either."""
+    from agenttalk.comprehension import features_artifact as featuresmod
+
+    real_build_features = featuresmod.build_features
+
+    def _inject_a_dangling_feature_entry_point(*args, **kwargs):
+        entry_points, features = real_build_features(*args, **kwargs)
+        orphan = featuresmod.FeatureRecord(
+            feature_id="orphan-feature-ep", label="Orphan", state="candidate",
+            origin="detected", unit_ids=[], entry_point_ids=["does-not-exist-ep"],
+        )
+        return entry_points, [*features, orphan]
+
+    monkeypatch.setattr(
+        scan_pipeline.features_artifact, "build_features", _inject_a_dangling_feature_entry_point)
+
+    scan_pipeline.run_scan(java_repo)
+    result = scan_pipeline.validate_run(java_repo)
+    assert result["valid"] is False
+    assert "feature(s) reference an unknown entry_point_id" in result["detail"]
+
+
+def test_validate_run_flags_a_readiness_signal_with_an_unknown_unit_id(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 28 (F4, completeness): readiness signals[].unit_id was
+    never swept for dangling references either."""
+    from agenttalk.comprehension import readiness_artifact as readinessmod
+
+    real_build_readiness = readinessmod.build_readiness
+
+    def _inject_a_dangling_signal(*args, **kwargs):
+        signals, summaries = real_build_readiness(*args, **kwargs)
+        orphan = readinessmod.ReadinessSignal(
+            signal_id="orphan-signal", unit_id="does-not-exist", check="source_understood",
+            stored_status="unknown", severity="warning", basis="detected",
+            reason_code="test_injected",
+        )
+        return [*signals, orphan], summaries
+
+    monkeypatch.setattr(
+        scan_pipeline.readiness_artifact, "build_readiness", _inject_a_dangling_signal)
+
+    scan_pipeline.run_scan(java_repo)
+    result = scan_pipeline.validate_run(java_repo)
+    assert result["valid"] is False
+    assert "readiness signal(s) reference an unknown unit_id" in result["detail"]
+
+
+def test_validate_run_flags_a_module_with_an_unknown_container_unit_id(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 28 (F4, completeness): module.container_unit_id was
+    never swept for dangling references either."""
+    from agenttalk.comprehension import modules_artifact as modulesmod
+
+    real_build_modules = modulesmod.build_modules
+
+    def _inject_a_dangling_container(*args, **kwargs):
+        records = real_build_modules(*args, **kwargs)
+        orphan = modulesmod.ModuleRecord(
+            unit_id="orphan-module", kind="file", display_name="Orphan.txt", language="unknown",
+            paths=["Orphan.txt"], source_digests={}, classification=[],
+            container_unit_id="does-not-exist", producers=[],
+        )
+        return [*records, orphan]
+
+    monkeypatch.setattr(
+        scan_pipeline.modules_artifact, "build_modules", _inject_a_dangling_container)
+
+    scan_pipeline.run_scan(java_repo)
+    result = scan_pipeline.validate_run(java_repo)
+    assert result["valid"] is False
+    assert "module(s) reference an unknown container_unit_id" in result["detail"]
+
+
 def test_scan_json_carries_per_artifact_and_run_level_digests(java_repo: Path) -> None:
     """M2 (cold-read, PR-B fix round 3): scan.json must carry per-artifact
     byte SHA-256 + canonical content digest + record count + schema
@@ -3289,6 +3447,39 @@ def test_scan_json_carries_per_artifact_and_run_level_digests(java_repo: Path) -
         assert artifact["record_count"] >= 0
         assert artifact["schema_version"] >= 1
     assert doc["content_digest"]
+
+
+def test_verify_artifact_digests_catches_a_falsified_record_count(tmp_path: Path) -> None:
+    """FIX ROUND 28 (twenty-fourth cold read, F4, completeness): scan.json's
+    own declared ``record_count`` is derivable from the artifact's own
+    on-disk content the exact same way byte_sha256/content_digest
+    already are - a scan.json that falsifies ONLY this one field (both
+    digests correct) previously passed every check here. No end-to-end
+    reproduction exists through run_scan/validate_run's own public
+    surface (record_counts is correct by construction from the same doc
+    it publishes, and any post-hoc edit to scan.json itself trips the
+    OUTER anchor check - MAJOR 3/round 7 - before ever reaching this
+    function) - a direct unit test of the defense-in-depth check itself,
+    guarding a future change that breaks that construction invariant."""
+    from agenttalk.comprehension import digests
+
+    modules_doc = {
+        "schema_version": 1, "artifact_type": scan_pipeline.MODULES_ARTIFACT_TYPE,
+        "scan_id": "scan-1", "generated_at": "2026-08-27T00:00:00Z",
+        "units": [{"unit_id": "u1"}, {"unit_id": "u2"}],
+    }
+    modules_bytes = digests.canonical_json_bytes(modules_doc)
+    (tmp_path / "modules.json").write_bytes(modules_bytes)
+    entry = {
+        "name": "modules.json", "artifact_type": scan_pipeline.MODULES_ARTIFACT_TYPE,
+        "schema_version": 1,
+        "content_digest": digests.canonical_content_digest(modules_doc),
+        "byte_sha256": digests.sha256_bytes(modules_bytes),
+        "record_count": 1,  # falsified - the doc actually has 2 units
+    }
+    scan_doc = {"artifacts": [entry], "content_digest": digests.run_content_digest([entry])}
+    with pytest.raises(scan_pipeline.ComprehensionError, match="record_count"):
+        scan_pipeline._verify_artifact_digests(scan_doc, {"modules.json": modules_doc}, tmp_path)
 
 
 def test_validate_run_catches_a_tampered_artifact_via_its_digest(java_repo: Path) -> None:

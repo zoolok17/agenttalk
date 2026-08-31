@@ -333,16 +333,28 @@ def _resolved_run_dir(comprehension_dir: Path, scan_id: str) -> Path:
 def _obtain_privacy(
     root: Path, *, acknowledge_unignored: bool, work_id: str | None,
 ) -> PrivacyPreflightResult:
+    # FIX ROUND 28 (twenty-fourth cold read, F9, wrong-refusal-timing):
+    # this pairing refusal used to live INSIDE the except branch below -
+    # only reached when the preflight actually found something to
+    # acknowledge. A caller who passed --acknowledge-unignored-private-
+    # store with no --work-id against a repo that happened to have no
+    # unignored private store at all silently proceeded, no different
+    # from never having passed the flag - the caller's own invalid
+    # invocation was masked by a preflight outcome it had no way to
+    # predict up front. The pairing is a property of the ARGUMENTS
+    # themselves (design: "applies to one run bound to an existing work
+    # item"), never of what the preflight happens to find - checked
+    # first, unconditionally, before the preflight ever runs.
+    if acknowledge_unignored and not work_id:
+        raise ScanRefused(
+            "--acknowledge-unignored-private-store requires --work-id "
+            "(design: \"applies to one run bound to an existing work item\")"
+        )
     try:
         return privacy.run_privacy_preflight(root)
     except VcsPrivacyRefused as exc:
         if not acknowledge_unignored:
             raise
-        if not work_id:
-            raise ScanRefused(
-                "--acknowledge-unignored-private-store requires --work-id "
-                "(design: \"applies to one run bound to an existing work item\")"
-            ) from exc
         return privacy.acknowledge_unignored_private_store(
             root, vcs_kind=exc.vcs_kind, work_id=work_id, matched_rule=None,
         )
@@ -1557,6 +1569,25 @@ def get_report(
     return payload
 
 
+#: FIX ROUND 28 (F4): the SAME per-artifact section-key formula
+#: ``run_scan`` uses to compute ``record_counts`` at publish time
+#: (~945 above) - kept here as the one other place that formula must
+#: stay in lock-step, since a verifier recomputing it independently
+#: (rather than importing a shared function) would silently drift the
+#: moment either side changed without the other.
+_RECORD_COUNT_SECTION_KEYS: dict[str, tuple[str, ...]] = {
+    "modules.json": ("units",),
+    "dependencies.json": ("edges",),
+    "features.json": ("entry_points", "features"),
+    "readiness.json": ("signals", "summaries"),
+    "problems.json": ("problems",),
+}
+
+
+def _actual_record_count(name: str, doc: dict[str, Any]) -> int:
+    return sum(len(doc.get(key) or []) for key in _RECORD_COUNT_SECTION_KEYS[name])
+
+
 def _verify_artifact_digests(
     scan_doc: dict[str, Any], raw_docs: dict[str, dict[str, Any]], run_dir: Path,
 ) -> None:
@@ -1582,7 +1613,17 @@ def _verify_artifact_digests(
     passed validation because the re-canonicalized bytes matched, even
     though the file on disk no longer did. The content-digest check above
     is unaffected by this fix - it is deliberately insensitive to exactly
-    that class of byte-level-only difference."""
+    that class of byte-level-only difference.
+
+    FIX ROUND 28 (twenty-fourth cold read, F4, completeness): this
+    verified byte_sha256/content_digest but never the declared
+    ``record_count`` itself - a scan.json falsifying that one field
+    (e.g. understating modules.json's true unit count) passed every
+    check here even though the design's own ceiling/summary machinery
+    treats it as load-bearing. Recomputed from the SAME per-artifact
+    section-key formula ``run_scan`` itself uses to compute
+    ``record_counts`` at publish time (this module, ~945), applied to
+    the document actually on disk rather than trusted from scan.json."""
     declared_artifacts = scan_doc.get("artifacts")
     if not declared_artifacts:
         raise ComprehensionError("scan.json is missing its artifacts digest summary")
@@ -1640,7 +1681,13 @@ def _verify_artifact_digests(
                 f"{name}'s byte_sha256 does not match its declared value in scan.json")
         require_field(entry, "artifact_type", doc_name=entry_label)
         require_field(entry, "schema_version", doc_name=entry_label)
-        require_field(entry, "record_count", doc_name=entry_label)
+        declared_record_count = require_field(entry, "record_count", doc_name=entry_label)
+        actual_record_count = _actual_record_count(name, doc)
+        if actual_record_count != declared_record_count:
+            raise ComprehensionError(
+                f"{name}'s record_count ({declared_record_count}) does not match the "
+                f"{actual_record_count} record(s) actually present in its own sections"
+            )
     if digests.run_content_digest(declared_artifacts) != scan_doc.get("content_digest"):
         raise ComprehensionError(
             "scan.json's run-level content_digest does not match its declared artifacts")
@@ -1702,6 +1749,7 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
         detail = str(exc)
         records = None
     unit_ids = {m.unit_id for m in records["modules"]} if records else set()
+    entry_point_ids = {e.entry_point_id for e in records["entry_points"]} if records else set()
     dangling_edges = [
         e.edge_id for e in (records["dependencies"] if records else [])
         if e.from_unit_id not in unit_ids
@@ -1717,20 +1765,49 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
         e.entry_point_id for e in (records["entry_points"] if records else [])
         if e.owning_unit_id not in unit_ids
     ] if records else []
-    invalid = dangling_edges or dangling_entry_points
-    if dangling_edges and dangling_entry_points:
-        dangling_detail = (
-            f"{len(dangling_edges)} edge(s) reference an unknown from_unit_id and "
-            f"{len(dangling_entry_points)} entry point(s) reference an unknown owning_unit_id"
-        )
-    elif dangling_edges:
-        dangling_detail = f"{len(dangling_edges)} edge(s) reference an unknown from_unit_id"
-    elif dangling_entry_points:
-        dangling_detail = (
-            f"{len(dangling_entry_points)} entry point(s) reference an unknown owning_unit_id"
-        )
-    else:
-        dangling_detail = None
+    # FIX ROUND 28 (twenty-fourth cold read, F4, completeness): the sweep
+    # only ever covered edge.from_unit_id and entry_point.owning_unit_id -
+    # four more unit/entry_point-id-shaped references this same artifact
+    # family carries were never checked, each exactly as capable of
+    # naming a record that does not exist as the two already covered.
+    dangling_declared_in = [
+        e.entry_point_id for e in (records["entry_points"] if records else [])
+        if e.declared_in_unit_id and e.declared_in_unit_id not in unit_ids
+    ] if records else []
+    dangling_feature_unit_refs = [
+        f.feature_id for f in (records["features"] if records else [])
+        if any(u not in unit_ids for u in f.unit_ids)
+    ] if records else []
+    dangling_feature_entry_point_refs = [
+        f.feature_id for f in (records["features"] if records else [])
+        if any(ep not in entry_point_ids for ep in f.entry_point_ids)
+    ] if records else []
+    dangling_signals = [
+        s.signal_id for s in (records["readiness_signals"] if records else [])
+        if s.unit_id not in unit_ids
+    ] if records else []
+    dangling_containers = [
+        m.unit_id for m in (records["modules"] if records else [])
+        if m.container_unit_id is not None and m.container_unit_id not in unit_ids
+    ] if records else []
+    # Generalized (never enumerated per-combination) the same way M-4/
+    # round 4 and M2/round 6 already established for the projector's own
+    # bounded sections - seven categories makes an explicit combinatorial
+    # branch unwieldy, and a future eighth reference would silently need
+    # its own new branch instead of just joining this list.
+    _dangling_categories = (
+        ("edge(s) reference an unknown from_unit_id", dangling_edges),
+        ("entry point(s) reference an unknown owning_unit_id", dangling_entry_points),
+        ("entry point(s) reference an unknown declared_in_unit_id", dangling_declared_in),
+        ("feature(s) reference an unknown unit_id", dangling_feature_unit_refs),
+        ("feature(s) reference an unknown entry_point_id", dangling_feature_entry_point_refs),
+        ("readiness signal(s) reference an unknown unit_id", dangling_signals),
+        ("module(s) reference an unknown container_unit_id", dangling_containers),
+    )
+    invalid = any(ids for _, ids in _dangling_categories)
+    dangling_detail = " and ".join(
+        f"{len(ids)} {label}" for label, ids in _dangling_categories if ids
+    ) or None
     return {
         "scan_id": scan_id,
         "valid": valid and not invalid,
