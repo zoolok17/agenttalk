@@ -4026,37 +4026,42 @@ def _servlet_class_by_name(sanitized: str, structural: str) -> tuple[_Descriptor
             name_undecodable.append(block_match.start())
             continue
         servlet_name = decoded_name.strip()
-        class_match = _SERVLET_CLASS_RE.search(block_structural)
-        jsp_match = _JSP_FILE_RE.search(block_structural)
-        # MICRO-ROUND 30b (reviewer-3 delta, R1 note-only, wrong-data): a
-        # SINGLE <servlet> block naming BOTH <servlet-class> AND <jsp-
-        # file> is spec-ILLEGAL (the servlet DTD/schema makes them a
-        # choice, never both) - round 30's own F1 fix checked class
-        # first and only fell through to jsp-file when no class was
-        # present, so a both-backings block silently resolved to the
-        # class alone, the jsp-file discarded with no trace at all
-        # (complete, zero rows, on a descriptor that cannot actually
-        # deploy in any real container). Both are now recorded as
-        # SEPARATE declarations of the SAME name from this ONE block -
-        # the existing conflict machinery (2+ distinct candidate labels
-        # for one name) already treats this as a conflict with no
-        # further change needed, reusing the SAME <jsp-file:...> label
-        # vocabulary round 30's own F1 fix established, rather than
-        # inventing a parallel "invalid descriptor" mechanism.
-        if class_match is not None:
+        # FIX ROUND 31 (twenty-seventh cold read, F2 MAJOR, wrong-data):
+        # ALL occurrences of each backing element within this ONE block
+        # are collected now (``finditer``, was ``search`` - first-match-
+        # only). TWO <servlet-class> elements in one block used to
+        # resolve SILENTLY to the FIRST (the second never became a
+        # declaration at all, so the conflict machinery was never
+        # reached) - byte-for-byte the same defect micro-round 30b's own
+        # R1 fixed for class+jsp, unswept to the same-element-kind case,
+        # and a direct violation of "declaration order inside a block is
+        # never authoritative" (round 29's own F1 rule). Each occurrence
+        # becomes its own declaration of the SAME name from this SAME
+        # block; identical repeated values collapse to one distinct
+        # label (the round-29 benign-twin precedent, unchanged - this is
+        # the SAME distinct-label mechanism ``_resolve_descriptor_
+        # declarations`` already applies regardless of how many
+        # declarations came from one block versus several), while
+        # disagreeing values (2+ DIFFERENT classes, 2+ DIFFERENT jsp
+        # paths, or any class+jsp mix) become a real conflict - no new
+        # mechanism, the SAME one micro-round 30b's own R1 fix
+        # established for the cross-element shape.
+        class_matches = list(_SERVLET_CLASS_RE.finditer(block_structural))
+        jsp_matches = list(_JSP_FILE_RE.finditer(block_structural))
+        for class_match in class_matches:
             decoded_class = _decode_xml_text(block_sanitized[class_match.start(1):class_match.end(1)])
             declarations.setdefault(servlet_name, []).append(_DescriptorDeclaration(
                 class_value=_bounded_route_target(decoded_class.strip()) if decoded_class is not None else None,
                 jsp_path=None, class_undecodable=decoded_class is None, block_start=block_match.start(),
             ))
-        if jsp_match is not None:
+        for jsp_match in jsp_matches:
             jsp_path = _decode_xml_text(block_sanitized[jsp_match.start(1):jsp_match.end(1)])
             declarations.setdefault(servlet_name, []).append(_DescriptorDeclaration(
                 class_value=None,
                 jsp_path=_bounded_route_target(jsp_path.strip()) if jsp_path is not None else None,
                 class_undecodable=False, block_start=block_match.start(),
             ))
-        if class_match is None and jsp_match is None:
+        if not class_matches and not jsp_matches:
             # FIX ROUND 30 (F1(1b)): neither a <servlet-class> nor a
             # <jsp-file> at all - a bare name-only declaration. Still a
             # REAL declaration - recorded, never skipped the way the
@@ -4152,8 +4157,12 @@ def _filter_class_by_name(sanitized: str, structural: str) -> tuple[_DescriptorR
             name_undecodable.append(block_match.start())
             continue
         filter_name = decoded_name.strip()
-        class_match = _FILTER_CLASS_RE.search(block_structural)
-        if class_match is None:
+        # FIX ROUND 31 (twenty-seventh cold read, F2 MAJOR, wrong-data):
+        # the filter twin of the servlet loop's own findall sweep above -
+        # see its own comment. ALL <filter-class> occurrences within this
+        # block are collected now, not just the first.
+        class_matches = list(_FILTER_CLASS_RE.finditer(block_structural))
+        if not class_matches:
             # FIX ROUND 30 (F1(1b)): a bare name-only declaration - still
             # a real declaration, never skipped.
             declarations.setdefault(filter_name, []).append(_DescriptorDeclaration(
@@ -4161,11 +4170,12 @@ def _filter_class_by_name(sanitized: str, structural: str) -> tuple[_DescriptorR
                 block_start=block_match.start(),
             ))
             continue
-        decoded_class = _decode_xml_text(block_sanitized[class_match.start(1):class_match.end(1)])
-        declarations.setdefault(filter_name, []).append(_DescriptorDeclaration(
-            class_value=_bounded_route_target(decoded_class.strip()) if decoded_class is not None else None,
-            jsp_path=None, class_undecodable=decoded_class is None, block_start=block_match.start(),
-        ))
+        for class_match in class_matches:
+            decoded_class = _decode_xml_text(block_sanitized[class_match.start(1):class_match.end(1)])
+            declarations.setdefault(filter_name, []).append(_DescriptorDeclaration(
+                class_value=_bounded_route_target(decoded_class.strip()) if decoded_class is not None else None,
+                jsp_path=None, class_undecodable=decoded_class is None, block_start=block_match.start(),
+            ))
     return _resolve_descriptor_declarations(declarations), name_undecodable
 
 
