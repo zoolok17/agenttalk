@@ -318,6 +318,21 @@ def test_scan_help_declares_scope_exclude_config_as_not_implemented_this_slice(c
     assert "not implemented this slice" in help_text
 
 
+def test_report_help_declares_human_output_byte_identical_to_json(capsys) -> None:
+    """MICRO-ROUND 28b (reviewer-3 delta on `02c6b30`, R5, OVERTURNED
+    RATIONALE): dropping this fact as "redundant with round-26 F6" was
+    wrong - F6 declares it on `scan --help` alone, which says nothing
+    about `report`. A `report --help` reader had no way to discover
+    this fact without independently finding cmd_comprehension's own
+    docstring or this PR's description."""
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["comprehension", "report", "--help"])
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "byte-for-byte" in help_text
+    assert "--json" in help_text
+
+
 def test_status_before_any_scan(tmp_path: Path, capsys) -> None:
     exit_code = _run(["comprehension", "status", "--json"], tmp_path)
     assert exit_code == 0

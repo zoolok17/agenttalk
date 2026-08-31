@@ -349,6 +349,16 @@ _READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
     # yielded zero entry points and zero problems over a root that is
     # not genuinely empty (worker.py).
     "no_web_xml_facts_extracted": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
+    # MICRO-ROUND 28b (reviewer-3 delta on `02c6b30`, R2, wrong-data): a
+    # binary-excluded, non-adapter-handled .xml file is EPISTEMICALLY
+    # IDENTICAL to an encoding-undecodable one (neither was ever
+    # decoded/root-sniffed, so this run cannot know its own tier) -
+    # modules_artifact.py's own build_modules now synthesizes a real
+    # unit for this case too (it used to publish no unit at all), and
+    # that unit's readiness must be the SAME honest six-unknown-rows
+    # shape the encoding-undecodable twin already gets, never a
+    # confident guess computed over evidence that never existed.
+    "binary_excluded_root_sniffed_xml": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
 }
 
 

@@ -743,7 +743,9 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
         degraded = True
         problems.append(submodule_problem)
 
-    def _record_exclusion(category: str, relative_path: str) -> None:
+    def _record_exclusion(
+        category: str, relative_path: str, *, content_digest: str | None = None,
+    ) -> None:
         exclusions[category] = exclusions.get(category, 0) + 1
         # FIX ROUND 16 (twelfth cold read, B2 BLOCKER, part 2): a bare
         # count-only record hid WHICH path was excluded and WHY - the
@@ -751,7 +753,26 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
         # design's own scan.json fields already name, and the same
         # discipline `boundaries` already follows. Bounded at publish
         # time (scan_pipeline.py), the same way `boundaries` already is.
-        excluded_roots.append({"path": relative_path, "category": category})
+        entry = {"path": relative_path, "category": category}
+        # MICRO-ROUND 28b (reviewer-3 delta on `02c6b30`, R2, wrong-data):
+        # a binary-excluded file's own bytes are already in hand at the
+        # ONE call site that passes this (the binary-sniff exclusion,
+        # below) - `content_digest` is carried through here (never
+        # recomputed) so scan_pipeline.py can synthesize a real
+        # modules.json unit for a root-sniffed-XML binary exclusion the
+        # same "record, don't vanish" way it already does for an
+        # encoding-undecodable twin, without discovery.py needing to
+        # know anything about XML/root-sniffing itself - discovery.py
+        # cannot import worker.py (the reverse import already exists,
+        # and discovery.py owns filesystem access exclusively), the
+        # same constraint the existing `_DEGRADABLE_EXCLUDED_EXTENSIONS`
+        # carry (Named decisions and residuals) already documents.
+        # Absent (never null) for every OTHER exclusion category, the
+        # same absent-not-null idiom this artifact family already
+        # follows for an optional field.
+        if content_digest is not None:
+            entry["content_digest"] = content_digest
+        excluded_roots.append(entry)
 
     def _walk(directory: Path, depth: int = 0) -> None:
         nonlocal entry_count, hashed_total, degraded, entry_cap_hit, excluded_region_may_contain_target
@@ -942,7 +963,8 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                 })
                 continue
             if _looks_binary(data):
-                _record_exclusion("binary", relative)
+                _record_exclusion(
+                    "binary", relative, content_digest=hashlib.sha256(data).hexdigest())
                 continue
             if hashed_total + len(data) > MAX_HASHED_TOTAL_BYTES:
                 degraded = True

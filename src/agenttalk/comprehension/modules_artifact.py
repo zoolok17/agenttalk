@@ -263,24 +263,31 @@ def _derive_classification(
     not grow one (a frozen-vocabulary rule, the same discipline the
     readiness signal states already follow structurally), so "no
     decided value" is expressed as the absence of any classification at
-    all, never a guessed or invented one. The binary-excluded twin
-    (``binary_excluded_root_sniffed_xml`` / ``binary_excluded_code_
-    bearing_file``, round 26b/26) never reaches this function at all -
-    discovery excludes it before a ``ModuleRecord`` is ever built for
-    it, honest BY OMISSION - this is the identical honesty for the
-    encoding-undecodable case, which DOES still get a real unit (and
-    real, correctly-`unknown` readiness signals) since discovery itself
-    successfully enumerated and read the file's own bytes; only the
-    CONTENT never decoded. The readable tier-2 path (a genuinely-
-    decodable Spring bean/Struts XML - production, degrading) and the
-    genuinely-benign non-degrading path (``.properties``/``.md``/
-    README, real positive "not code-bearing" evidence, still gets
-    ``infrastructure``) are BOTH unaffected - this only narrows the ONE
-    case where "non-degrading" and "genuinely undecodable" coincide."""
+    all, never a guessed or invented one.
+
+    MICRO-ROUND 28b (reviewer-3 delta on `02c6b30`, R2, wrong-data):
+    this docstring previously claimed the binary-excluded root-sniffed-
+    XML twin (``binary_excluded_root_sniffed_xml``, round 26b) "never
+    reaches this function at all... honest BY OMISSION" - MEASURED
+    FALSE: ``CLASSIFICATION_CAVEAT`` itself already claimed the two
+    twins share "the same epistemics," which they did NOT while one
+    published a real unit (empty classification, six visible unknown
+    readiness rows) and the other published no unit at all. Fixed the
+    unit-level HALF that was actually missing (scan_pipeline.py now
+    synthesizes a file-kind unit for a binary-excluded root-sniffed-XML
+    path too, from the content_digest discovery.py already had in hand
+    at the exclusion site) - ``binary_excluded_root_sniffed_xml`` now
+    reaches this exact same check, right alongside `encoding_
+    undecodable`, both meaning the identical "this run cannot know the
+    file's own tier" fact for the identical reason (neither was ever
+    decoded/root-sniffed), so both get the identical empty-
+    classification treatment. The caveat's own sentence is true now,
+    not merely asserted.
+    """
     default = _default_classification(relative_path)
     if default == "test":
         return default
-    if "encoding_undecodable" in reasons:
+    if "encoding_undecodable" in reasons or "binary_excluded_root_sniffed_xml" in reasons:
         return None
     if relative_path in non_degrading_unsupported_language_paths:
         return "infrastructure"
@@ -322,6 +329,7 @@ def build_modules(
     worker_problem_reasons_by_unit: dict[tuple[str, str], list[str]] | None = None,
     worker_problem_reasons_by_qualified_name: dict[str, list[str]] | None = None,
     non_degrading_unsupported_language_paths: frozenset[str] | None = None,
+    binary_excluded_root_sniffed_xml_digests: dict[str, str] | None = None,
 ) -> list[ModuleRecord]:
     """``java_results`` maps a ``.java`` file's relative path to its
     already-parsed :class:`~.adapters.java.JavaFileResult` (item 3) -
@@ -370,11 +378,43 @@ def build_modules(
     ``_attribute_cross_file_entry_point_reasons`` below, after every
     record is built - resolved the same "unambiguous or not resolved at
     all" way ``features_artifact.py``'s own owner resolution already
-    treats a qualified name."""
+    treats a qualified name.
+
+    ``binary_excluded_root_sniffed_xml_digests`` (MICRO-ROUND 28b,
+    reviewer-3 delta on ``02c6b30``, R2, wrong-data) maps a binary-
+    excluded, non-adapter-handled ``.xml`` file's own relative path to
+    the content_digest discovery.py already computed at its own
+    exclusion site - these paths are NOT in ``discovery.files`` (they
+    were excluded before ever reaching that list), so they need their
+    own separate, additive record-construction pass rather than routing
+    through the main loop below. Each publishes a real ``ModuleRecord``
+    (empty classification, ``binary_excluded_root_sniffed_xml`` in its
+    own ``adapter_problem_reasons``) - the SAME visible, empty-
+    classification form the encoding-undecodable twin already gets,
+    closing the gap ``CLASSIFICATION_CAVEAT``'s own sentence had wrongly
+    assumed was already closed."""
     records: list[ModuleRecord] = []
     worker_problem_reasons_by_path = worker_problem_reasons_by_path or {}
     worker_problem_reasons_by_unit = worker_problem_reasons_by_unit or {}
     non_degrading_unsupported_language_paths = non_degrading_unsupported_language_paths or frozenset()
+    binary_excluded_root_sniffed_xml_digests = binary_excluded_root_sniffed_xml_digests or {}
+
+    for relative_path, content_digest in sorted(binary_excluded_root_sniffed_xml_digests.items()):
+        records.append(ModuleRecord(
+            unit_id=digests.unit_id(kind="file", paths=[relative_path], qualified_name=None),
+            kind="file",
+            display_name=relative_path.rsplit("/", 1)[-1],
+            language=_language_for_path(relative_path),
+            paths=[relative_path],
+            source_digests={relative_path: content_digest},
+            classification=[],
+            container_unit_id=None,
+            producers=[_producer(
+                name="discovery", version=1, source_digest=content_digest, basis="extracted",
+            )],
+            adapter_problem_reason="binary_excluded_root_sniffed_xml",
+            adapter_problem_reasons=["binary_excluded_root_sniffed_xml"],
+        ))
 
     for file_entry in discovery.files:
         relative_path = file_entry.relative_path

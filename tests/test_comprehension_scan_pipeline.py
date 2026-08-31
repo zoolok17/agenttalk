@@ -2056,7 +2056,16 @@ def test_run_scan_a_utf16_root_sniffed_xml_records_but_does_not_degrade(
     (visible, addressable) but never degrading, for ALL THREE basenames
     alike (the boundary case, logback.xml, gets the identical
     treatment - guessing toward degrading would brand every repo
-    carrying an unreadable logback.xml)."""
+    carrying an unreadable logback.xml).
+
+    MICRO-ROUND 28b (reviewer-3 delta on `02c6b30`, R2, wrong-data): the
+    caveat published alongside this fix claims this binary-excluded
+    twin gets "the same epistemics" as its encoding-undecodable
+    sibling - MEASURED FALSE until now: the undecodable twin publishes
+    a real unit (empty classification, six unknown readiness rows)
+    while this one published no unit at all. Now publishes the
+    identical unit-level form too - problems.json is unaffected
+    (unchanged assertions below)."""
     import json
 
     (java_repo / basename).write_bytes("<beans><!-- café --></beans>\n".encode("utf-16"))
@@ -2074,6 +2083,17 @@ def test_run_scan_a_utf16_root_sniffed_xml_records_but_does_not_degrade(
     matching = [p for p in problems_doc["problems"] if p["path"] == basename]
     assert len(matching) == 1
     assert matching[0]["reason_code"] == "binary_excluded_root_sniffed_xml"
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    units = [u for u in modules_doc["units"] if u["paths"] == [basename]]
+    assert len(units) == 1
+    assert units[0]["classification"] == []
+    assert units[0]["adapter_problem_reasons"] == ["binary_excluded_root_sniffed_xml"]
+
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    unit_signals = [s for s in readiness_doc["signals"] if s["unit_id"] == units[0]["unit_id"]]
+    assert len(unit_signals) == 6
+    assert all(s["stored_status"] == "unknown" for s in unit_signals)
 
 
 def test_run_scan_an_encoding_undecodable_root_sniffed_xml_publishes_no_classification(
@@ -3270,6 +3290,22 @@ def test_validate_run_reports_valid_for_a_healthy_run(java_repo: Path) -> None:
     assert result["external_revalidation"] == {
         "performed": False, "reason_code": "no_external_evidence_pointers_this_slice",
     }
+
+
+def test_validate_run_success_detail_names_the_record_count_and_reference_checks(
+    java_repo: Path,
+) -> None:
+    """MICRO-ROUND 28b (reviewer-3 delta on `02c6b30`, R3 note): the
+    success detail sentence still named only the ORIGINAL digest-era
+    checks even after round 28's own F4 fix added record-count
+    verification and the widened cross-artifact reference sweep - the
+    same artifact_integrity_hint discipline (declare what a mechanism
+    actually covers) applied to validate's own success detail too."""
+    scan_pipeline.run_scan(java_repo)
+    result = scan_pipeline.validate_run(java_repo)
+    assert result["valid"] is True
+    assert "record count" in result["detail"]
+    assert "reference" in result["detail"]
 
 
 def test_validate_run_flags_an_entry_point_with_an_unknown_owning_unit(

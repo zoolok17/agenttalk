@@ -207,6 +207,47 @@ def run_privacy_preflight(root: Path) -> PrivacyPreflightResult:
     )
 
 
+def acknowledge_requires_work_id_message(
+    *, acknowledge_unignored: bool, work_id: str | None,
+) -> str | None:
+    """The ``--acknowledge-unignored-private-store``/``--work-id``
+    pairing predicate - MICRO-ROUND 28b (reviewer-3 delta on `02c6b30`,
+    R4, taken): shared by ``scan_pipeline.py``'s own ``_obtain_privacy``
+    and ``cli.py``'s own ``cmd_comprehension``, TWO independent call
+    sites deliberately kept independent rather than unified into one.
+
+    FIX ROUND 21's own CR17-1 BLOCKER analysis (reaffirmed here by
+    reviewer-3's own R4 ruling): ``cmd_comprehension``'s ``scan`` action
+    calls ``scan_pipeline.run_scan`` TWICE under different
+    circumstances - an UNACKNOWLEDGED first attempt (so an ordinary
+    dead-owner lock is reclaimed automatically with no override needed,
+    and a live-owner lock refusal is never masked by a flag the caller
+    only meant for the PRIVACY question), then an ACKNOWLEDGED retry
+    ONLY after a real ``VcsPrivacyRefused`` proves the override is
+    actually needed. Collapsing the two call sites into one (always
+    passing ``acknowledge_unignored`` through from the very start) would
+    REOPEN that exact BLOCKER - the override would clear a live,
+    legitimately-held lock before ``ScanLockContended``'s own refusal
+    ever got a chance to fire. The two call sites - and the two
+    genuinely distinct error-reporting surfaces around them (a typed
+    :class:`~.errors.ScanRefused` here in ``scan_pipeline.py``, a plain
+    stderr write + exit 2 in ``cli.py``) - are LOAD-BEARING duplication,
+    not oversight; only the PREDICATE itself (the pairing rule, and its
+    exact wording) is shared here, so the two sites can never
+    independently drift on what "requires --work-id" actually means.
+    Do not "simplify" this by unifying the two call sites.
+
+    Returns the refusal message when the pairing is invalid
+    (acknowledgement requested with no ``work_id``), ``None`` when the
+    pairing is fine (or acknowledgement was never requested at all)."""
+    if not acknowledge_unignored or work_id:
+        return None
+    return (
+        "--acknowledge-unignored-private-store requires --work-id "
+        "(design: \"applies to one run bound to an existing work item\")"
+    )
+
+
 def acknowledge_unignored_private_store(
     root: Path, *, vcs_kind: str, work_id: str, matched_rule: str | None = None,
 ) -> PrivacyPreflightResult:

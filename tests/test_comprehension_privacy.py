@@ -176,6 +176,33 @@ def test_acknowledge_carries_through_the_matched_rule_when_provided(tmp_path: Pa
     assert result.matched_rule == ".gitignore:1:build/"
 
 
+# --------------------- MICRO-ROUND 28b (R4): shared pairing predicate
+
+def test_pairing_message_when_acknowledge_true_and_no_work_id() -> None:
+    message = privacy.acknowledge_requires_work_id_message(
+        acknowledge_unignored=True, work_id=None)
+    assert message is not None
+    assert "--work-id" in message
+
+
+def test_pairing_message_when_acknowledge_true_and_empty_work_id() -> None:
+    message = privacy.acknowledge_requires_work_id_message(
+        acknowledge_unignored=True, work_id="")
+    assert message is not None
+
+
+def test_pairing_message_is_none_when_acknowledge_true_and_work_id_present() -> None:
+    assert privacy.acknowledge_requires_work_id_message(
+        acknowledge_unignored=True, work_id="migrate-checkout") is None
+
+
+def test_pairing_message_is_none_when_acknowledge_false_regardless_of_work_id() -> None:
+    assert privacy.acknowledge_requires_work_id_message(
+        acknowledge_unignored=False, work_id=None) is None
+    assert privacy.acknowledge_requires_work_id_message(
+        acknowledge_unignored=False, work_id="w1") is None
+
+
 def test_direct_construction_of_preflight_result_is_rejected() -> None:
     """reviewer-1 cold-read finding 1 on PR-A, rq-6cc5560b62f6: the dataclass
     must not be publicly constructible despite its docstring claim."""

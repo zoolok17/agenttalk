@@ -2141,7 +2141,10 @@ def cmd_comprehension(args: argparse.Namespace) -> int:
         ScanLockContended,
         ScanLockUnrecoverable,
     )
-    from agenttalk.comprehension.privacy import VcsPrivacyRefused
+    from agenttalk.comprehension.privacy import (
+        VcsPrivacyRefused,
+        acknowledge_requires_work_id_message,
+    )
 
     action = getattr(args, "comprehension_cmd", None)
     if action is None:
@@ -2163,13 +2166,22 @@ def cmd_comprehension(args: argparse.Namespace) -> int:
         # scan - the invalid flag pairing was never even evaluated. The
         # pairing is a property of the arguments themselves, never of
         # what the first attempt happens to find - checked first here,
-        # unconditionally, before scan_pipeline.run_scan is ever called
-        # (scan_pipeline.py's own _obtain_privacy makes the identical
-        # correction one layer down, for any OTHER caller of run_scan
-        # that passes acknowledge_unignored=True up front).
-        if args.acknowledge_unignored_private_store and not args.work_id:
-            sys.stderr.write(
-                "agenttalk: --acknowledge-unignored-private-store requires --work-id\n")
+        # unconditionally, before scan_pipeline.run_scan is ever called.
+        #
+        # MICRO-ROUND 28b (reviewer-3 delta on `02c6b30`, R4, taken): the
+        # predicate itself is now shared with scan_pipeline.py's own
+        # `_obtain_privacy` (privacy.acknowledge_requires_work_id_
+        # message) - see that function's own docstring for why THIS call
+        # site stays separate rather than being unified with it (CR17-1's
+        # own load-bearing two-attempt lock/privacy ordering: this
+        # action's first scan_pipeline.run_scan(root) call deliberately
+        # never forwards acknowledge_unignored, so a live lock refusal is
+        # never masked by a flag meant only for the privacy question).
+        pairing_error = acknowledge_requires_work_id_message(
+            acknowledge_unignored=args.acknowledge_unignored_private_store,
+            work_id=args.work_id)
+        if pairing_error is not None:
+            sys.stderr.write(f"agenttalk: {pairing_error}\n")
             return 2
         outcome = None
         try:
@@ -14187,7 +14199,17 @@ def build_parser() -> argparse.ArgumentParser:
     cstatus.set_defaults(func=cmd_comprehension)
 
     creport = compsub.add_parser(
-        "report", help="Answer fixed single-run migration questions from one comprehension run.")
+        "report", help="Answer fixed single-run migration questions from one comprehension run.",
+        # MICRO-ROUND 28b (reviewer-3 delta on `02c6b30`, R5, OVERTURNED
+        # RATIONALE): dropping this as "redundant with round-26 F6" was
+        # wrong - F6 declares this fact on `scan --help` alone, which
+        # says nothing about `report` itself; the design doc is not the
+        # CLI surface a `--help` reader actually sees. Mirrors `scan`'s
+        # own description= precedent above.
+        description="Answer fixed single-run migration questions from one comprehension run. "
+                    "Human output prints the identical validated projection --json emits, "
+                    "byte-for-byte - a friendlier rendering is a later refinement, deliberately "
+                    "not built this slice.")
     creport.add_argument("--run", help="Report on this scan_id instead of the latest.")
     creport.add_argument("--unit", dest="unit_id", help="Filter to one unit ID.")
     creport.add_argument("--feature", dest="feature_id", help="Filter to one feature ID.")

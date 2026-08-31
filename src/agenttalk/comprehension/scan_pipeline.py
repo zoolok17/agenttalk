@@ -369,11 +369,16 @@ def _obtain_privacy(
     # themselves (design: "applies to one run bound to an existing work
     # item"), never of what the preflight happens to find - checked
     # first, unconditionally, before the preflight ever runs.
-    if acknowledge_unignored and not work_id:
-        raise ScanRefused(
-            "--acknowledge-unignored-private-store requires --work-id "
-            "(design: \"applies to one run bound to an existing work item\")"
-        )
+    #
+    # MICRO-ROUND 28b (reviewer-3 delta on `02c6b30`, R4, taken): the
+    # predicate itself now lives in privacy.py, shared with cli.py's own
+    # identical check - see that function's own docstring for why the
+    # two CALL SITES stay deliberately separate (CR17-1's own load-
+    # bearing two-attempt lock/privacy ordering).
+    pairing_error = privacy.acknowledge_requires_work_id_message(
+        acknowledge_unignored=acknowledge_unignored, work_id=work_id)
+    if pairing_error is not None:
+        raise ScanRefused(pairing_error)
     try:
         return privacy.run_privacy_preflight(root)
     except VcsPrivacyRefused as exc:
@@ -599,12 +604,27 @@ def run_scan(
             if not p.degrades_run
             and p.reason_code in ("unsupported_language", "encoding_undecodable")
         )
+        # MICRO-ROUND 28b (reviewer-3 delta on `02c6b30`, R2, wrong-data):
+        # computed HERE, before build_modules, so it can feed a real
+        # modules.json unit for each such path - see build_modules's own
+        # binary_excluded_root_sniffed_xml_digests parameter docstring.
+        # Reused below (unchanged) for the existing problems.json record
+        # this same predicate already produces - one predicate, two
+        # consumers, never two independently-drifting copies of it.
+        binary_excluded_root_sniffed_xml_digests = {
+            entry["path"]: entry["content_digest"]
+            for entry in discovery_result.excluded_roots
+            if entry["category"] == "binary"
+            and "content_digest" in entry
+            and worker.is_a_root_sniffed_xml_extension(entry["path"])
+        }
         modules = modules_artifact.build_modules(
             discovery_result, java_results,
             worker_problem_reasons_by_path=worker_problem_reasons_by_path,
             worker_problem_reasons_by_unit=worker_problem_reasons_by_unit,
             worker_problem_reasons_by_qualified_name=worker_problem_reasons_by_qualified_name,
             non_degrading_unsupported_language_paths=non_degrading_unsupported_language_paths,
+            binary_excluded_root_sniffed_xml_digests=binary_excluded_root_sniffed_xml_digests,
         )
         # M7 (cold-read, PR-B fix round 3): discovery already computed
         # each file's own content digest - dependencies_artifact.py and
@@ -684,10 +704,14 @@ def run_scan(
         # pom.xml/web.xml (already covered, and degrading, above) by
         # construction - `is_a_root_sniffed_xml_extension` itself
         # excludes both adapter-handled basenames.
+        # MICRO-ROUND 28b (R2): iterates the SAME dict build_modules just
+        # consumed above (one predicate, two consumers) rather than
+        # recomputing the path set independently - the two could
+        # otherwise silently drift apart.
         binary_excluded_root_sniffed_xml_problems = [
             _problem_record(
                 "binary_excluded_root_sniffed_xml",
-                entry["path"],
+                path,
                 "an XML file excluded outright as binary content (a NUL byte in its "
                 "sniffed prefix) could not be root-element-sniffed to determine whether "
                 "it is code-bearing (e.g. Spring bean/Struts config XML) or ordinary "
@@ -695,9 +719,7 @@ def run_scan(
                 "file gap, but never guessed toward a degrading verdict this run has no "
                 "evidence for",
             )
-            for entry in discovery_result.excluded_roots
-            if entry["category"] == "binary"
-            and worker.is_a_root_sniffed_xml_extension(entry["path"])
+            for path in binary_excluded_root_sniffed_xml_digests
         ]
         # FIX ROUND 20 (sixteenth cold read, M1+M2 MAJOR - THE REACTOR
         # RULE): a pom's own declared <module> entry whose path resolves
@@ -1771,9 +1793,21 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
         anchor_state = _scan_json_anchor_state(index_doc, scan_id, records["scan"], records["run_dir"])
         _verify_artifact_digests(records["scan"], records["raw_docs"], records["run_dir"])
         valid = True
+        # MICRO-ROUND 28b (reviewer-3 delta on `02c6b30`, R3 note): this
+        # sentence still named only the ORIGINAL digest-era checks even
+        # after round 28's own F4 fix added record-count verification
+        # (_verify_artifact_digests, above) and the widened cross-
+        # artifact reference sweep (dangling_edges/dangling_entry_points/
+        # dangling_declared_in/dangling_feature_*/dangling_signals/
+        # dangling_containers, below) - the SAME artifact_integrity_hint
+        # discipline (declare what a mechanism actually covers, don't
+        # leave a caller to assume the OLD, narrower scope) applied to
+        # validate's own success detail, not just status's pointer at it.
         detail = (
-            "all artifacts verified: schema, envelope identity, scan_id consistency, and "
-            "per-artifact/run-level content digests"
+            "all artifacts verified: schema, envelope identity, scan_id consistency, "
+            "per-artifact/run-level content digests, declared record counts against "
+            "actual on-disk records, and cross-artifact unit/entry-point/feature/"
+            "signal reference integrity"
         )
         # Round 7c (reviewer-3 delta on 95d9cd8): valid:true's own detail
         # sentence claimed "all artifacts verified" even when scan.json's
