@@ -671,7 +671,14 @@ The v1 surface stays migration-shaped and read-mostly:
 | `agenttalk comprehension validate` | Perform full-run integrity validation and separately revalidate external evidence pointers for one run or the latest run. Supports `--json`. |
 | `agenttalk comprehension prune --staging` | Reclaim only definitely abandoned, unpublished staging directories. It never deletes runs or packs. |
 
-Examples of the proposed syntax, not runnable in rev 2:
+Examples of the proposed syntax. FIX ROUND 28 (task #55 slice-1 PR-B,
+twenty-fourth cold read, F11, completeness): by this round the underlying
+`scan`/`status`/`report`/`validate` operations are fully implemented and
+tested as direct Python entry points (`scan_pipeline.run_scan`/
+`get_status`/`get_report`/`validate_run`, ~980 tests) - only the literal
+`agenttalk comprehension <verb>` argparse shell surface itself remains
+unwired this slice, so these exact shell invocations are still not
+runnable as shown, but the operations they name are real, not aspirational:
 
 ```text
 agenttalk comprehension scan --scope src/legacy --scope tests/characterization
@@ -689,6 +696,13 @@ turn “findings exist” into a scripting failure unless a later, explicit poli
 command is designed for that purpose.
 
 `report --json` is the stable automation contract. Human output may evolve.
+FIX ROUND 28 (F5, completeness): this slice publishes no separate human-
+rendering code path at all for `report` (or `status`/`validate`) - a
+caller of `scan_pipeline.get_report` receives exactly the same validated
+projection `--json` would also emit, byte-for-byte, until a future slice
+actually builds a distinct human-formatted rendering. "Human output may
+evolve" names a real future direction, not a divergence that already
+exists today.
 `validate` does not repair or rewrite an immutable run. V1 has no arbitrary
 graph query, multi-run `diff`, contract-inventory query, background watcher,
 auto-rescan daemon, managed export command, or published-data delete command.
