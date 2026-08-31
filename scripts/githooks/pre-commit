@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Client-reference tripwire pre-commit hook (task #216).
+#
+# Install (once, per clone): `git config core.hooksPath scripts/githooks`
+#
+# Provisioning the salt (once, per clone): write it to the gitignored
+# .agenttalk-tripwire-salt file at the repo root. Ask the lead for the value -
+# it is never committed, and this hook runs FAIL-OPEN (advisory only) when
+# it's absent, specifically so a fresh clone without it yet is never blocked
+# from committing. The CI gate (.github/workflows/security.yml) is the real,
+# fail-CLOSED enforcement boundary - this hook exists to catch the common
+# case early and cheaply, not to be the backstop.
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+# There is no "diff against the index" ref check-diff can take directly (it
+# diffs two commits), so the staged-content check goes through `check` on
+# every staged file's INDEX content instead - the same underlying module,
+# same salt/denylist, same exit-code contract, just a different, index-aware
+# entry point for the one case (uncommitted staged changes) `check-diff`
+# cannot express.
+mapfile -t staged_files < <(git diff --cached --name-only --diff-filter=ACM)
+if [ "${#staged_files[@]}" -eq 0 ]; then
+  exit 0
+fi
+
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+to_check=()
+for f in "${staged_files[@]}"; do
+  # Only the staged (about-to-be-committed) CONTENT, never the working-tree
+  # copy - a file with unstaged edits on top of a clean staged version must
+  # not fail the commit for content that isn't actually being committed.
+  dest="$tmp_dir/$f"
+  mkdir -p "$(dirname "$dest")"
+  if git show ":$f" > "$dest" 2>/dev/null; then
+    to_check+=("$dest")
+  fi
+done
+
+if [ "${#to_check[@]}" -eq 0 ]; then
+  exit 0
+fi
+
+set +e
+python3 scripts/client_reference_tripwire.py \
+  --local-salt-file .agenttalk-tripwire-salt check "${to_check[@]}"
+status=$?
+set -e
+
+case "$status" in
+  0)
+    exit 0
+    ;;
+  1)
+    echo "" >&2
+    echo "client-reference-tripwire: BLOCKED - denylisted content detected in" >&2
+    echo "staged changes (see file/line above, relative to $tmp_dir - map it back" >&2
+    echo "to your real file of the same relative path). Remove it before committing." >&2
+    exit 1
+    ;;
+  2)
+    # FAIL-OPEN here on purpose: the salt not being provisioned locally is
+    # the expected state for a fresh clone, and CI is the real gate. See
+    # the header comment above.
+    echo "client-reference-tripwire: salt not configured locally - skipping" >&2
+    echo "  (this check WILL still run, fail-closed, in CI before merge)." >&2
+    exit 0
+    ;;
+  *)
+    echo "client-reference-tripwire: unexpected exit status $status - treating as" >&2
+    echo "  fail-open locally (see above); CI remains the real gate." >&2
+    exit 0
+    ;;
+esac
