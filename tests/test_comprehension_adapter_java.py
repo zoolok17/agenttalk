@@ -2847,6 +2847,112 @@ def test_web_xml_url_pattern_with_an_undefined_entity_is_unrecoverable():
     assert len(matching) == 1
 
 
+# --------------------------------------------------- micro-round 23b R1 (leaf tolerance) / R2 (split CDATA)
+
+def test_web_xml_fully_prefixed_descriptor_still_publishes_the_route():
+    """MICRO-ROUND 23b (reviewer-3 delta on `4a4038b`, R1 - the F1
+    BLOCKER's own shape, narrowed but not closed): round 23's own fix
+    tolerated a namespace prefix on the CONTAINER tags only
+    (<servlet>/<servlet-mapping>) - a REAL fully-prefixed descriptor (a
+    single namespace applied to every element, the WebSphere/JAXB-
+    generated shape) also prefixes every LEAF value element
+    (<servlet-name>/<servlet-class>/<url-pattern>), which still had a
+    bare-tag-only regex and matched nothing - the container matched,
+    then found no leaf inside it, publishing zero entry points and zero
+    problems over a genuinely fully-mapped servlet."""
+    web_xml = """<j:web-app>
+  <j:servlet>
+    <j:servlet-name>full</j:servlet-name>
+    <j:servlet-class>com.C</j:servlet-class>
+  </j:servlet>
+  <j:servlet-mapping>
+    <j:servlet-name>full</j:servlet-name>
+    <j:url-pattern>/full</j:url-pattern>
+  </j:servlet-mapping>
+</j:web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern["/full"] == "com.C"
+    assert problems == []
+
+
+def test_web_xml_attribute_bearing_leaf_element_still_publishes():
+    """MICRO-ROUND 23b (R1): an attribute on a LEAF element's own tag
+    (<url-pattern id="u1">), not just on a container tag - the same
+    tolerance gap, one level down."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name id="n1">leaf</servlet-name>
+    <servlet-class>com.Leaf</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>leaf</servlet-name>
+    <url-pattern id="u1">/leaf</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern["/leaf"] == "com.Leaf"
+
+
+def test_parse_maven_pom_fully_prefixed_dependency_still_publishes_the_edge():
+    """MICRO-ROUND 23b (R1): the reviewer's own pom-side repro -
+    <x:dependency><x:groupId>...<x:artifactId>... - the container tag
+    already tolerated the prefix (round 23's own F1), but groupId/
+    artifactId did not, so the edge never published at all."""
+    pom = """<project>
+  <dependencies>
+    <x:dependency>
+      <x:groupId>org.springframework</x:groupId>
+      <x:artifactId>spring-core</x:artifactId>
+    </x:dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.springframework:spring-core"}
+
+
+def test_parse_maven_pom_dependency_groupid_with_xml_space_attribute():
+    """MICRO-ROUND 23b (R1): a <groupId xml:space="preserve"> - a legal
+    attribute on a leaf value element, the same class of gap as the
+    <url-pattern id="u1"> case above, restated for pom.xml."""
+    pom = """<project>
+  <dependencies>
+    <dependency>
+      <groupId xml:space="preserve">org.springframework</groupId>
+      <artifactId>spring-core</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.springframework:spring-core"}
+
+
+def test_web_xml_split_cdata_url_pattern_is_unrecoverable():
+    """MICRO-ROUND 23b (reviewer-3's own MINOR, wrong-data): TWO CDATA
+    sections in one <url-pattern> value (a legal escape-trick shape,
+    used to embed a literal "]]>") made the decoder backtrack past the
+    first section's real closing marker and stitch together a string
+    the descriptor never actually contains
+    (<![CDATA[/a]]>b<![CDATA[c]]> decoded to "/a]]>b<![CDATA[c").
+    Refused as unrecoverable instead of publishing that wrong value."""
+    web_xml = """<web-app>
+  <servlet-mapping>
+    <servlet-name>ssplit</servlet-name>
+    <url-pattern><![CDATA[/a]]>b<![CDATA[c]]></url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert entry_points == []
+    matching = [p for p in problems if p.reason_code == "route_value_unrecoverable"]
+    assert len(matching) == 1
+
+
 def test_jax_rs_path_composes_class_and_method_level_like_spring_request_mapping():
     """FIX ROUND 17 (CR13-3 MAJOR, part (a)): JAX-RS's own @Path composes
     EXACTLY like a plain @RequestMapping already does - a class-level

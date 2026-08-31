@@ -2871,6 +2871,44 @@ def _structural_block_pattern(tag: str) -> re.Pattern[str]:
     )
 
 
+#: MICRO-ROUND 23b (reviewer-3 delta on `4a4038b`, R1 - the F1 BLOCKER's
+#: own shape, narrowed but not yet closed): ``_structural_block_pattern``
+#: above already tolerates an attribute-bearing, namespace-prefixed
+#: CONTAINER tag (``<servlet>``, ``<servlet-mapping>``, ``<filter>``,
+#: ``<filter-mapping>``, ``<listener>``, ``<dependency>``) - but every
+#: LEAF VALUE element nested inside one of those containers
+#: (``<servlet-name>``, ``<servlet-class>``, ``<url-pattern>``,
+#: ``<filter-name>``, ``<filter-class>``, ``<listener-class>``,
+#: ``<groupId>``, ``<artifactId>``, ``<optional>``, ``<scope>``,
+#: ``<module>``) kept its own bare literal-tag regex. A REAL fully-
+#: prefixed descriptor (every element carries the same namespace prefix,
+#: not just the containers) matched the container fine and then found NO
+#: leaf inside it - publishing nothing (the reviewer's own fully-prefixed
+#: ``j:web-app`` published zero entry points and zero problems; the pom
+#: side's ``<x:dependency><x:groupId>...`` produced no edge at all). One
+#: shared leaf-tolerance builder, used for every leaf tag in both
+#: descriptors, closes this the same way ``_structural_block_pattern``
+#: already closed it for containers - a leaf's own body stays ``[^<]+?``
+#: (never spans into a nested/sibling element the way a container's own
+#: ``.*?`` body deliberately does), except ``url-pattern`` which keeps
+#: its round-23 ``.*?``/DOTALL body for CDATA passthrough.
+def _leaf_value_pattern(tag: str, *, dotall: bool = False) -> re.Pattern[str]:
+    escaped = re.escape(tag)
+    body = r"(.*?)" if dotall else r"([^<]+?)"
+    return re.compile(
+        rf"<(?:[A-Za-z_][\w.-]*:)?{escaped}(?=[\s/>])[^>]*>{body}"
+        rf"</(?:[A-Za-z_][\w.-]*:)?{escaped}\s*>",
+        re.DOTALL if dotall else 0,
+    )
+
+
+#: Same tolerance, for a leaf checked only for PRESENCE (``<load-on-
+#: startup>`` - value never read, only whether the element exists at all).
+def _leaf_presence_pattern(tag: str) -> re.Pattern[str]:
+    escaped = re.escape(tag)
+    return re.compile(rf"<(?:[A-Za-z_][\w.-]*:)?{escaped}(?=[\s/>])[^>]*>")
+
+
 #: FIX ROUND 23 (nineteenth cold read, F1(d) + F2, wrong-data): a
 #: published route name is XML TEXT CONTENT, which this producer used
 #: to publish completely raw - a CDATA-wrapped value
@@ -2903,6 +2941,25 @@ _XML_PREDEFINED_ENTITIES = {"amp": "&", "lt": "<", "gt": ">", "quot": '"', "apos
 
 
 def _decode_xml_text(raw: str) -> str | None:
+    # MICRO-ROUND 23b (reviewer-3's own MINOR, wrong-data): TWO OR MORE
+    # CDATA sections in one value (a legal, if esoteric, XML shape - a
+    # document splits CDATA to embed a literal "]]>" inside one, via the
+    # standard "]]]]><![CDATA[>" escape trick) made `_CDATA_WRAPPED_RE`'s
+    # own lazy body backtrack PAST the first section's real closing
+    # "]]>" to find one near the string's end instead, so
+    # "<![CDATA[/a]]>b<![CDATA[c]]>" decoded to "/a]]>b<![CDATA[c" - a
+    # string this descriptor never actually contains, stitched together
+    # from the wrong markers. Reviewer sanctioned two remedies (unwrap
+    # every section, or refuse); refusing is chosen: correctly
+    # reconstituting split CDATA needs a real per-section unwrap-and-
+    # concatenate pass, real complexity for a shape this producer has
+    # never seen in an actual legacy web.xml (split CDATA exists almost
+    # exclusively to embed a literal "]]>", not to split ordinary route
+    # text) - the existing `route_value_unrecoverable` honesty already
+    # covers "cannot prove this decode is correct" for exactly this
+    # class of case (F2's own undefined-entity handling, above).
+    if raw.count("<![CDATA[") > 1:
+        return None
     cdata_match = _CDATA_WRAPPED_RE.match(raw)
     if cdata_match is not None:
         return cdata_match.group(1)
@@ -2940,18 +2997,22 @@ def _decode_xml_text(raw: str) -> str | None:
 #: so it stops at THIS dependency's own closing tag, never spanning into
 #: a sibling <dependency> block.
 _DEPENDENCY_BLOCK_RE = _structural_block_pattern("dependency")
-_DEPENDENCY_GROUP_ID_RE = re.compile(r"<groupId>\s*([^<]+?)\s*</groupId>")
-_DEPENDENCY_ARTIFACT_ID_RE = re.compile(r"<artifactId>\s*([^<]+?)\s*</artifactId>")
+_DEPENDENCY_GROUP_ID_RE = _leaf_value_pattern("groupId")
+_DEPENDENCY_ARTIFACT_ID_RE = _leaf_value_pattern("artifactId")
 #: Maven's own boolean spelling - never assumed False for anything but a
 #: genuinely absent or explicit ``false`` element; only an explicit
-#: ``true`` element makes an edge optional.
-_DEPENDENCY_OPTIONAL_RE = re.compile(r"<optional>\s*(true|false)\s*</optional>", re.IGNORECASE)
+#: ``true`` element makes an edge optional. The caller already lower-
+#: cases the captured value before comparing it to ``"true"`` (a leaf
+#: pattern's own generic body, not a ``(true|false)`` alternation, is
+#: sufficient - and keeps this leaf on the SAME shared builder as every
+#: other one, MICRO-ROUND 23b).
+_DEPENDENCY_OPTIONAL_RE = _leaf_value_pattern("optional")
 #: Maven's own scope vocabulary (compile/provided/runtime/test/system/
 #: import) - this slice maps only the one the design names explicitly
 #: ("scope test -> phase test"); every other spelling (including no
 #: <scope> at all, Maven's own "compile" default) stays this adapter's
 #: existing "build" phase.
-_DEPENDENCY_SCOPE_RE = re.compile(r"<scope>\s*([\w.-]+)\s*</scope>")
+_DEPENDENCY_SCOPE_RE = _leaf_value_pattern("scope")
 
 #: M1 (seventh cold read, fix round 11): a bare open/close XML tag
 #: (attributes ignored - this adapter's own bar is "a handful of flat
@@ -2962,12 +3023,12 @@ _XML_TAG_RE = re.compile(r"<(/?)([A-Za-z][\w.-]*)\b[^>]*?(/?)>")
 #: nesting context - non-greedy, mirroring ``_DEPENDENCY_BLOCK_RE``'s own
 #: same-shaped non-nesting assumption (Maven's own schema never nests
 #: one ``<dependencies>`` inside another).
-_DEPENDENCIES_ELEMENT_RE = re.compile(r"<dependencies>(.*?)</dependencies>", re.DOTALL)
+_DEPENDENCIES_ELEMENT_RE = _structural_block_pattern("dependencies")
 #: FIX ROUND 20 (sixteenth cold read, M1+M2 MAJOR - THE REACTOR RULE):
 #: a Maven aggregator's own declared child-module list - see
 #: ``declared_reactor_module_paths``.
-_MODULES_ELEMENT_RE = re.compile(r"<modules>(.*?)</modules>", re.DOTALL)
-_MODULE_RE = re.compile(r"<module>\s*([^<]+?)\s*</module>")
+_MODULES_ELEMENT_RE = _structural_block_pattern("modules")
+_MODULE_RE = _leaf_value_pattern("module")
 
 
 def _enclosing_tag_stack(sanitized: str, before: int) -> list[str]:
@@ -3280,14 +3341,14 @@ def parse_maven_pom(
 #: array element, don't stop at the first" shape round 10's M1 already
 #: applied to Spring route arrays.
 _SERVLET_MAPPING_BLOCK_RE = _structural_block_pattern("servlet-mapping")
-_SERVLET_MAPPING_NAME_RE = re.compile(r"<servlet-name>([^<]+)</servlet-name>")
+_SERVLET_MAPPING_NAME_RE = _leaf_value_pattern("servlet-name")
 #: FIX ROUND 23 (nineteenth cold read, F1(d), wrong-data): widened from
 #: ``[^<]+`` (DOTALL OFF) to ``.*?`` (DOTALL ON) so a CDATA-wrapped
 #: value (``<url-pattern><![CDATA[/c4]]></url-pattern>``) is captured
 #: at all instead of matching nothing - see ``_decode_xml_text`` below,
 #: which unwraps the CDATA section (and separately decodes entities,
 #: F2) from whatever this captures.
-_SERVLET_MAPPING_URL_PATTERN_RE = re.compile(r"<url-pattern>(.*?)</url-pattern>", re.DOTALL)
+_SERVLET_MAPPING_URL_PATTERN_RE = _leaf_value_pattern("url-pattern", dotall=True)
 #: FIX ROUND 17 (thirteenth cold read, CR13-2 MAJOR, wrong-data): the
 #: OTHER half of a web.xml's servlet declaration - <servlet-name>/
 #: <servlet-class> pairs, joined below against <servlet-mapping>'s own
@@ -3295,7 +3356,7 @@ _SERVLET_MAPPING_URL_PATTERN_RE = re.compile(r"<url-pattern>(.*?)</url-pattern>"
 #: actually serves. An exact tag match (never confused with
 #: <servlet-mapping>, a different closing tag entirely).
 _SERVLET_BLOCK_RE = _structural_block_pattern("servlet")
-_SERVLET_CLASS_RE = re.compile(r"<servlet-class>\s*([^<]+?)\s*</servlet-class>")
+_SERVLET_CLASS_RE = _leaf_value_pattern("servlet-class")
 #: FIX ROUND 22 (eighteenth cold read, F3 MAJOR, wrong-data): a
 #: ``<servlet>`` carrying ``<load-on-startup>`` but no ``<servlet-
 #: mapping>`` at all is the standard startup-only servlet idiom (a
@@ -3305,7 +3366,7 @@ _SERVLET_CLASS_RE = re.compile(r"<servlet-class>\s*([^<]+?)\s*</servlet-class>")
 #: startup>`` either is not this shape; that residual carry is
 #: unchanged). Presence alone matters, never the priority VALUE - this
 #: producer does not model startup ORDER semantics.
-_LOAD_ON_STARTUP_RE = re.compile(r"<load-on-startup>")
+_LOAD_ON_STARTUP_RE = _leaf_presence_pattern("load-on-startup")
 
 
 def _servlet_class_by_name(sanitized: str) -> dict[str, str]:
@@ -3351,8 +3412,8 @@ def _servlet_class_by_name(sanitized: str) -> dict[str, str]:
 #: below, joined against ``<filter-mapping>`` the same way
 #: ``_servlet_class_by_name`` already joins servlet mappings.
 _FILTER_BLOCK_RE = _structural_block_pattern("filter")
-_FILTER_NAME_RE = re.compile(r"<filter-name>([^<]+)</filter-name>")
-_FILTER_CLASS_RE = re.compile(r"<filter-class>\s*([^<]+?)\s*</filter-class>")
+_FILTER_NAME_RE = _leaf_value_pattern("filter-name")
+_FILTER_CLASS_RE = _leaf_value_pattern("filter-class")
 _FILTER_MAPPING_BLOCK_RE = _structural_block_pattern("filter-mapping")
 #: A ``<listener>`` element names its own implementing class directly -
 #: no separate mapping/name indirection at all (a listener has no URL
@@ -3362,7 +3423,7 @@ _FILTER_MAPPING_BLOCK_RE = _structural_block_pattern("filter-mapping")
 #: from, so there is nothing this producer's declared-only bar would
 #: let it publish beyond the bare fact that a listener exists.
 _LISTENER_BLOCK_RE = _structural_block_pattern("listener")
-_LISTENER_CLASS_RE = re.compile(r"<listener-class>\s*([^<]+?)\s*</listener-class>")
+_LISTENER_CLASS_RE = _leaf_value_pattern("listener-class")
 
 
 def _filter_class_by_name(sanitized: str) -> dict[str, str]:
