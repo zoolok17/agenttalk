@@ -276,6 +276,25 @@ def _problem_record(
     return record
 
 
+#: FIX ROUND 28 (twenty-fourth cold read, F8, declare-not-silently-leave-
+#: to-a-docstring): round 26's own F7 note declared record_count's
+#: definition ("the TOTAL number of individual records across every
+#: top-level collection... not the length of any one named array") only
+#: in a docstring a consumer of the PUBLISHED artifact never sees - the
+#: same gap PROVENANCE_CAVEAT/CLASSIFICATION_CAVEAT/FEATURES_STRUCTURAL_
+#: CAVEAT already close for their own promises. Published in scan.json
+#: itself now, not left implicit in source a consumer has no path to.
+RECORD_COUNT_DEFINITION = (
+    "each artifacts[] entry's own record_count is the TOTAL number of "
+    "individual records across every top-level collection that artifact "
+    "publishes, not the length of any one named array - readiness.json's "
+    "record_count sums signals+summaries, features.json's sums entry_points"
+    "+features; modules.json/dependencies.json/problems.json each publish "
+    "exactly one collection, so their own record_count equals that single "
+    "array's length."
+)
+
+
 def _artifact_summary(
     *, name: str, artifact_type: str, schema_version: int, record_count: int,
     doc: dict[str, Any], canonical_bytes: bytes,
@@ -296,7 +315,12 @@ def _artifact_summary(
     ``entry_points``/``features``) sums across all of them (see this
     call's own caller for each document's exact sum, and Note 2's own
     fix-round-4 history for why an unsummed count previously understated
-    it)."""
+    it).
+
+    FIX ROUND 28 (F8): that definition is now ALSO published in-artifact,
+    see ``RECORD_COUNT_DEFINITION`` above - this docstring is unchanged
+    (still the right place for an implementer reading this function),
+    it is simply no longer the ONLY place a reader could find it."""
     return {
         "name": name,
         "artifact_type": artifact_type,
@@ -1154,6 +1178,7 @@ def run_scan(
             # artifact, not readiness signals alone.
             "provenance_caveat": readiness_artifact.PROVENANCE_CAVEAT,
             "record_counts": record_counts,
+            "record_count_definition": RECORD_COUNT_DEFINITION,
             "problem_count": len(problems),
             "artifacts": artifact_summaries,
             "content_digest": run_digest,
@@ -1317,6 +1342,24 @@ def _require_scan_json_body_fields(scan_doc: dict[str, Any], scan_id: str) -> No
         _scan_field(scan_doc, key, scan_id)
 
 
+#: FIX ROUND 28 (twenty-fourth cold read, F7, completeness): get_status's
+#: own docstring already states its narrower read-cost tier (scan.json's
+#: own envelope/anchor only - never modules/dependencies/features/
+#: readiness/problems) - that distinction lived only in source, invisible
+#: to an actual caller who might otherwise read a healthy status response
+#: as having already checked every artifact's own digest. Declared in the
+#: payload now, pointing at `validate` as the real full-run verification
+#: path - the same "declare it, don't leave it to be independently
+#: rediscovered" discipline every other caveat/note here already follows.
+STATUS_ARTIFACT_INTEGRITY_HINT = (
+    "status verifies only scan.json's own envelope and index anchor - it does "
+    "NOT check modules.json/dependencies.json/features.json/readiness.json/"
+    "problems.json's own digests or record counts (report/validate do, in "
+    "full, every time); run `validate` for full-run artifact integrity "
+    "verification."
+)
+
+
 def get_status(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
     """design: "Show the latest run, completeness, source revision/
     fingerprint, freshness, adapter coverage, and problem counts."
@@ -1383,6 +1426,7 @@ def get_status(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
         "freshness": {
             "state": "not_evaluated", "reason_code": "freshness_not_implemented_this_slice",
         },
+        "artifact_integrity_hint": STATUS_ARTIFACT_INTEGRITY_HINT,
     }
 
 

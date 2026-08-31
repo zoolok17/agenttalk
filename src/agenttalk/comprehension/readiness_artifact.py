@@ -119,7 +119,16 @@ PROVENANCE_CAVEAT = (
     "not implemented this slice, the standing PR-C entry criterion named "
     "elsewhere in this PR) - every OTHER unimplemented promise this producer "
     "makes is declared in-artifact; this one now is too, rather than being the "
-    "one silent exception."
+    "one silent exception.\n\n"
+    "FIX ROUND 28 (twenty-fourth cold read, F10, completeness): problems.json's "
+    "own records are a DIFFERENT shape of the same gap, not merely an unlisted "
+    "instance of it - a modules/dependencies/features/readiness record carries "
+    "an empty producers/evidence list (the field exists, unpopulated); a "
+    "problems.json record has no producers/evidence field AT ALL (structurally "
+    "absent, never merely empty) - the same 'not implemented this slice, never "
+    "genuinely no provenance' honesty applies to it too, stated here so a "
+    "consumer checking this caveat for problems.json's own coverage does not "
+    "have to independently notice the field is missing rather than empty."
 )
 
 CHECKS = (

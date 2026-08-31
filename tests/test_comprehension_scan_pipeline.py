@@ -3145,6 +3145,19 @@ def test_get_status_reports_the_latest_scan(java_repo: Path) -> None:
     assert status["freshness"]["state"] == "not_evaluated"
 
 
+def test_get_status_declares_its_own_narrower_verification_tier(java_repo: Path) -> None:
+    """FIX ROUND 28 (twenty-fourth cold read, F7, completeness): status's
+    own narrower read-cost tier (scan.json's own envelope/anchor only -
+    never modules/dependencies/features/readiness/problems, unlike
+    report/validate) previously lived only in this function's own
+    docstring, invisible to an actual caller. Declared in the payload
+    now, pointing at `validate` as the real full-run verification path."""
+    scan_pipeline.run_scan(java_repo)
+    status = scan_pipeline.get_status(java_repo)
+    assert status["artifact_integrity_hint"] == scan_pipeline.STATUS_ARTIFACT_INTEGRITY_HINT
+    assert "validate" in status["artifact_integrity_hint"]
+
+
 def test_get_status_before_any_scan_raises_not_scanned(tmp_path: Path) -> None:
     with pytest.raises(scan_pipeline.NotScanned):
         scan_pipeline.get_status(tmp_path)
@@ -3963,14 +3976,42 @@ def test_scan_json_declares_the_provenance_caveat(java_repo: Path) -> None:
     dependency/readiness evidence pointers, and producer identity's own
     config/policy digest are all empty/absent this slice, none of it
     previously declared anywhere a consumer could discover without
-    already knowing to check. Published as a real scan.json field now."""
+    already knowing to check. Published as a real scan.json field now.
+
+    FIX ROUND 28 (twenty-fourth cold read, F10, completeness): problems.
+    json's own records are a DIFFERENT shape of the same gap - a
+    producers/evidence list that exists but stays empty (every OTHER
+    artifact) versus a producers/evidence field that is structurally
+    ABSENT (problems.json has neither field at all). The caveat now
+    names this half too, checked here via the string itself rather than
+    only equality against the module constant (equality alone would
+    stay green even if the problems-half sentence were dropped again -
+    it would just be comparing two now-DIFFERENT constants that happen
+    to still match each other)."""
     import json
 
     from agenttalk.comprehension import readiness_artifact
 
     outcome = scan_pipeline.run_scan(java_repo)
     scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert "problems.json" in scan_doc["provenance_caveat"]
     assert scan_doc["provenance_caveat"] == readiness_artifact.PROVENANCE_CAVEAT
+
+
+def test_scan_json_declares_the_record_count_definition(java_repo: Path) -> None:
+    """FIX ROUND 28 (twenty-fourth cold read, F8, declare-not-silently-
+    leave-to-a-docstring): round 26's own F7 note declared record_count's
+    definition (summed across a document's own several record kinds, not
+    the length of any one named array) only in a docstring a consumer of
+    the published artifact never sees - the same "declare it, don't
+    leave it to be independently rediscovered" discipline every other
+    caveat here already establishes. Published as a real scan.json field
+    now."""
+    import json
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["record_count_definition"] == scan_pipeline.RECORD_COUNT_DEFINITION
 
 
 def test_modules_json_declares_the_classification_caveat(java_repo: Path) -> None:
