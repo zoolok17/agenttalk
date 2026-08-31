@@ -52,9 +52,12 @@ from .envelope import (
 )
 from .errors import ComprehensionError, StagingSourceEscapesRoot
 from .lock import ScanLockHandle, release_scan_lock
+from .paths import RELATIVE_COMPREHENSION_DIR, RUNS_DIRNAME
 from .paths import index_path as _index_path
+from .paths import project_root_from_comprehension_dir
 from .paths import runs_dir as _runs_dir
 from .paths import staging_dir as _staging_dir
+from .privacy import PrivacyPreflightResult, verify_concrete_path_ignored
 from .staging import _OWNER_FILENAME, StagingHandle, _validate_owner_doc
 
 INDEX_SCHEMA_VERSION = 1
@@ -115,6 +118,7 @@ def _is_windows() -> bool:
 
 def rename_staging_to_run(
     staging_handle: StagingHandle, lock_handle: ScanLockHandle,
+    *, privacy_result: PrivacyPreflightResult | None = None,
 ) -> Path:
     """Publish step 1: rename the staging directory to
     ``runs/<scan_id>/``. Bounded exponential retry on a Windows sharing
@@ -151,6 +155,19 @@ def rename_staging_to_run(
     RE-DERIVED from the ``owner.json`` actually on disk at that confined
     path (never from the handle's claimed fields) — all three raise
     :class:`~.errors.StagingSourceEscapesRoot`.
+
+    FIX ROUND 32 (twenty-eighth cold read, F1 BLOCKER, privacy boundary,
+    "belt" half): ``privacy_result`` is optional so tests exercising the
+    rename mechanics alone need not construct one, but the real
+    ``scan_pipeline.run_scan`` orchestrator always passes the one it
+    obtained at lock acquisition. When its ``vcs_privacy`` is the automatic
+    ``"ignored"`` (never for an explicit ``acknowledged_unignored``/
+    ``no_vcs_acknowledged`` override, which already accepted this exact
+    risk), the concrete ``runs/<scan_id>/`` path is re-verified ignored via
+    ``privacy.verify_concrete_path_ignored`` immediately before this
+    rename — closing the TOCTOU-shaped gap between the preflight's own
+    proof (captured once, before this scan even started) and this exact
+    moment content becomes visible to Git under that exact path.
     """
     if staging_handle.owner_token != lock_handle.owner_token:
         raise StagingOwnershipMismatch(
@@ -191,6 +208,10 @@ def rename_staging_to_run(
     dst = resolve_under_root(scan_id, root=_runs_dir(comprehension_dir), label="run directory")
     if dst.exists():
         raise RunDirectoryExists(f"runs/{scan_id}/ already exists — scan IDs must be unique")
+    if privacy_result is not None and privacy_result.vcs_privacy == "ignored":
+        root = project_root_from_comprehension_dir(comprehension_dir)
+        relative_run_path = f"{RELATIVE_COMPREHENSION_DIR}/{RUNS_DIRNAME}/{scan_id}"
+        verify_concrete_path_ignored(root, relative_run_path)
     dst.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if not _is_windows():
         os.rename(staging_handle.path, dst)
@@ -342,6 +363,7 @@ def publish_run(
     predecessor_index_digest: str | None,
     now: datetime | None = None,
     record_counts: dict[str, int] | None = None,
+    privacy_result: PrivacyPreflightResult | None = None,
 ) -> dict:
     """The ordinary end-to-end orchestrator: enforce the durable-artifact
     ceilings, rename, CAS-write the index, then always release the lock —
@@ -368,6 +390,10 @@ def publish_run(
     ``ceilings.measure_staging_artifacts``), it does not count as 0
     records. The byte ceiling is always measured directly from disk
     regardless and can never be skipped this way.
+
+    ``privacy_result``: forwarded to :func:`rename_staging_to_run` unchanged
+    — see that function's own FIX ROUND 32 docstring section for the belt
+    re-check this enables.
     """
     try:
         if (
@@ -380,7 +406,7 @@ def publish_run(
         measurements = measure_staging_artifacts(
             staging_handle.path, record_counts=record_counts or {})
         enforce_artifact_ceilings(measurements)
-        rename_staging_to_run(staging_handle, lock_handle)
+        rename_staging_to_run(staging_handle, lock_handle, privacy_result=privacy_result)
         return publish_index_cas(
             lock_handle.path.parent, scan_id=staging_handle.scan_id, run_summary=run_summary,
             predecessor_index_digest=predecessor_index_digest, now=now,

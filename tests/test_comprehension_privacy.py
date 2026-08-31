@@ -93,6 +93,65 @@ def test_no_plane_output_is_written_on_refusal(tmp_path: Path) -> None:
     assert not (tmp_path / ".agenttalk").exists()
 
 
+# --------------------- FIX ROUND 32 (twenty-eighth cold read, F1 BLOCKER):
+# a single probe at one synthetic depth generalizes its one answer to the
+# whole store - these prove the multi-probe rewrite closes both measured
+# defeat shapes while leaving the genuinely-safe and genuinely-refused
+# shapes unchanged.
+
+def test_shapeA_broad_rule_still_proven_ignored(tmp_path: Path) -> None:
+    """Control: a genuinely safe, broad rule ignores every probe for
+    real - unaffected by the multi-probe rewrite."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(".agenttalk/\n", encoding="utf-8")
+    _commit_all(tmp_path, "base")
+    result = privacy.run_privacy_preflight(tmp_path)
+    assert result.vcs_privacy == "ignored"
+
+
+def test_shapeB_unrelated_rule_still_refused(tmp_path: Path) -> None:
+    """Control: a rule that ignores nothing under the comprehension dir
+    stays refused exactly as before."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text("build/\n*.log\n", encoding="utf-8")
+    _commit_all(tmp_path, "base")
+    with pytest.raises(VcsPrivacyRefused):
+        privacy.run_privacy_preflight(tmp_path)
+
+
+def test_probe_negate_reinclusion_idiom_now_refused(tmp_path: Path) -> None:
+    """A git re-inclusion idiom (ignore everything under .agenttalk/, then
+    re-include comprehension/runs/**) made the OLD single ``.privacy-probe/
+    probe.json`` sentinel come back "ignored" while the REAL published
+    artifacts under runs/** stayed un-ignored and stageable by
+    ``git add -A``. The multi-probe rewrite must now refuse - the runs/
+    probe proves un-ignored."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(
+        ".agenttalk/**\n"
+        "!.agenttalk/comprehension/\n"
+        "!.agenttalk/comprehension/runs/\n"
+        "!.agenttalk/comprehension/runs/**\n",
+        encoding="utf-8")
+    _commit_all(tmp_path, "base")
+    with pytest.raises(VcsPrivacyRefused):
+        privacy.run_privacy_preflight(tmp_path)
+
+
+def test_probe_shapeC_rule_scoped_to_old_probe_dir_now_refused(tmp_path: Path) -> None:
+    """A rule matching ONLY the OLD probe's own private subdirectory
+    unlocked the write under the single-probe mechanism (it never touched
+    index.json/runs//.staging). The multi-probe rewrite no longer probes
+    that path at all (only index.json / runs / .staging), so this rule
+    proves nothing and every real probe proves un-ignored."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(
+        "/.agenttalk/**/.privacy-probe/\n", encoding="utf-8")
+    _commit_all(tmp_path, "base")
+    with pytest.raises(VcsPrivacyRefused):
+        privacy.run_privacy_preflight(tmp_path)
+
+
 # ----------------------------------------------------------- already tracked (refuse even if ignored later)
 
 def test_refuses_when_comprehension_dir_is_already_tracked(tmp_path: Path) -> None:

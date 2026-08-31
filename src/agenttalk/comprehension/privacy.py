@@ -36,10 +36,33 @@ from pathlib import Path
 
 from .digests import root_binding_digest
 from .errors import VcsPrivacyRefused
-from .paths import RELATIVE_COMPREHENSION_DIR
+from .paths import INDEX_FILENAME, RELATIVE_COMPREHENSION_DIR, RUNS_DIRNAME, STAGING_DIRNAME
 
 GIT_TIMEOUT_SECONDS = 2.0
-_PROBE_RELATIVE_PATH = f"{RELATIVE_COMPREHENSION_DIR}/.privacy-probe/probe.json"
+
+#: FIX ROUND 32 (twenty-eighth cold read, F1 BLOCKER, privacy boundary): a
+#: single probe at one synthetic, writer-never-uses-it depth (the old
+#: ``.privacy-probe/probe.json`` sentinel this replaces) generalizes its ONE
+#: answer to the WHOLE comprehension store. A git re-inclusion idiom
+#: (``.agenttalk/**`` then ``!.agenttalk/comprehension/runs/**``) makes that
+#: one answer "ignored" while the REAL published artifacts under ``runs/**``
+#: stay un-ignored and stageable by ``git add -A``; a rule scoped only to the
+#: probe's own private subdirectory (``/.agenttalk/**/.privacy-probe/``)
+#: defeats it the same way. Probing instead at every structural depth the
+#: writer actually creates (``index.json`` directly under the comprehension
+#: dir, a ``runs/<id>/`` entry, a ``.staging/<id>/`` entry — see paths.py's
+#: own layout) and requiring ALL of them to independently prove ignored
+#: closes both shapes: a broad ``.agenttalk/`` or ``.agenttalk/comprehension/``
+#: rule still ignores every probe exactly as before; only a rule that
+#: unignores one of the real shapes now fails to generalize past this
+#: module. The probe names themselves are fixed, arbitrary literals — they
+#: never correspond to a real scan_id/nonce a writer could produce, so a
+#: probe can never collide with real content.
+_PRIVACY_PROBE_RELATIVE_PATHS = (
+    f"{RELATIVE_COMPREHENSION_DIR}/{INDEX_FILENAME}",
+    f"{RELATIVE_COMPREHENSION_DIR}/{RUNS_DIRNAME}/privacy-probe-run/scan.json",
+    f"{RELATIVE_COMPREHENSION_DIR}/{STAGING_DIRNAME}/privacy-probe-run-deadbeef/owner.json",
+)
 
 #: Sentinel identity only this module's own factory functions hold —
 #: PrivacyPreflightResult.__post_init__ refuses any construction that
@@ -137,22 +160,87 @@ def _tracked_paths_under_comprehension_dir(root: Path) -> list[str] | None:
     return [line for line in result.stdout.splitlines() if line]
 
 
-def _check_ignore(root: Path) -> tuple[bool, str | None] | None:
-    """Proves ignore status via Git's OWN matcher against a synthetic
-    child path (design: "use Git's ignore matcher on a synthetic child
-    path to prove the directory is ignored" — never inferred by reading
-    ``.gitignore`` text). Returns ``(is_ignored, matched_rule)``, or
-    ``None`` if the query itself could not be trusted."""
-    result = _run_git(root, "check-ignore", "--no-index", "-v", _PROBE_RELATIVE_PATH)
+def _check_ignore_one(root: Path, relative_path: str) -> tuple[bool, str | None] | None:
+    """Proves ignore status of ONE concrete path via Git's OWN matcher
+    (design: "use Git's ignore matcher on a synthetic child path to prove
+    the directory is ignored" — never inferred by reading ``.gitignore``
+    text). Returns ``(is_ignored, matched_rule)``, or ``None`` if the query
+    itself could not be trusted. Shared by :func:`_check_ignore` (the
+    multi-probe preflight) and :func:`verify_concrete_path_ignored` (the
+    round 32 belt re-check publish.py runs immediately before publication) —
+    the same git check-ignore machinery, never duplicated.
+
+    FIX ROUND 32 (F1 BLOCKER, discovered while building the multi-probe
+    regression fixtures — a proper `!pattern` re-inclusion chain (unlike the
+    single-level negation this module used to only ever probe past): ``git
+    check-ignore -v``'s own EXIT CODE is 0 whenever ANY pattern matched the
+    path — including a NEGATION pattern that actually un-ignores it. The
+    exit code alone is therefore not the real verdict; the matched
+    pattern's own text is — a pattern starting with ``!`` means "not
+    ignored after all," regardless of the 0 exit code. Both this probe
+    check and the pre-round-32 single-probe version it replaces were
+    exposed to this, but the old probe's own synthetic subdirectory was
+    never a realistic re-inclusion target, so it never actually surfaced."""
+    result = _run_git(root, "check-ignore", "--no-index", "-v", relative_path)
     if result is None:
         return None
     if result.returncode == 0:
         # `-v` output: "<source>:<linenum>:<pattern>\t<pathname>"
-        matched_rule = result.stdout.split("\t", 1)[0].strip() or None
-        return True, matched_rule
+        metadata = result.stdout.split("\t", 1)[0].strip()
+        pattern = metadata.split(":", 2)[-1] if metadata else ""
+        if pattern.startswith("!"):
+            return False, None
+        return True, metadata or None
     if result.returncode == 1:
         return False, None
     return None  # 128 or anything else: git itself could not answer
+
+
+def _check_ignore(root: Path) -> tuple[bool, str | None] | None:
+    """Proves ignore status of the WHOLE comprehension store by checking
+    EVERY probe in :data:`_PRIVACY_PROBE_RELATIVE_PATHS` (see that
+    constant's own docstring for why one probe is not enough) and requiring
+    all of them to independently prove ignored. Returns
+    ``(True, matched_rule)`` (the first probe's own rule) only when every
+    probe is ignored; ``(False, None)`` as soon as any probe proves NOT
+    ignored; ``None`` (untrustworthy) as soon as any probe's query itself
+    could not be trusted."""
+    first_matched_rule: str | None = None
+    for probe_path in _PRIVACY_PROBE_RELATIVE_PATHS:
+        probe_status = _check_ignore_one(root, probe_path)
+        if probe_status is None:
+            return None
+        is_ignored, matched_rule = probe_status
+        if not is_ignored:
+            return False, None
+        if first_matched_rule is None:
+            first_matched_rule = matched_rule
+    return True, first_matched_rule
+
+
+def verify_concrete_path_ignored(root: Path, relative_path: str) -> None:
+    """FIX ROUND 32 (twenty-eighth cold read, F1 BLOCKER): the "belt" half
+    of the fix — re-verifies ONE concrete, real path's ignore status
+    immediately before publication commits it, closing the TOCTOU-shaped
+    gap between the preflight's own proof (captured once, at lock
+    acquisition) and the moment content is actually about to become visible
+    to Git under that exact path (e.g. a ``.gitignore`` edited mid-run).
+    Reuses the identical check-ignore machinery the preflight probes use —
+    no new mechanism. Raises :class:`VcsPrivacyRefused` (``vcs_kind="git"``)
+    if ``relative_path`` is not (or can no longer be trusted to be) proven
+    ignored; returns ``None`` on success.
+
+    Callers must gate on the recorded disposition themselves: this is only
+    meaningful when that disposition was the automatic ``"ignored"`` — an
+    operator who explicitly ACKNOWLEDGED an unignored store already
+    accepted this exact risk for this one run, and re-checking here would
+    spuriously refuse a publish that operator already attended to."""
+    status = _check_ignore_one(root, relative_path)
+    if status is None or not status[0]:
+        raise VcsPrivacyRefused(
+            f"{relative_path} is not proven ignored by Git immediately before "
+            "publication (belt re-check) — refusing to publish", vcs_kind="git",
+        )
 
 
 def run_privacy_preflight(root: Path) -> PrivacyPreflightResult:

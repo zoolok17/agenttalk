@@ -1402,7 +1402,7 @@ def run_scan(
     index = publish.publish_run(
         staging_handle=staging_handle, lock_handle=lock_handle,
         run_summary=run_summary, predecessor_index_digest=predecessor_digest,
-        record_counts=record_counts, now=now,
+        record_counts=record_counts, now=now, privacy_result=privacy_result,
     )
     run_dir = paths.run_dir(comprehension_dir, scan_id)
     return ScanOutcome(scan_id=scan_id, status=status, index=index, run_dir=run_dir)

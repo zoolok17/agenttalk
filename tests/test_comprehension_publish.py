@@ -19,9 +19,10 @@ from pathlib import Path
 import pytest
 
 from agenttalk.comprehension import lock as lockmod
+from agenttalk.comprehension import privacy as privacymod
 from agenttalk.comprehension import publish as pub
 from agenttalk.comprehension import staging as stg
-from agenttalk.comprehension.errors import ComprehensionError
+from agenttalk.comprehension.errors import ComprehensionError, VcsPrivacyRefused
 from agenttalk.comprehension.privacy import PrivacyPreflightResult
 
 
@@ -232,6 +233,78 @@ def test_rename_refuses_when_run_directory_already_exists(
     with pytest.raises(pub.RunDirectoryExists):
         pub.rename_staging_to_run(staging, lock)
     assert staging.path.exists()  # untouched
+    lockmod.release_scan_lock(lock)
+
+
+# --------------------- FIX ROUND 32 (twenty-eighth cold read, F1 BLOCKER):
+# the "belt" re-check immediately before the rename commits the staging dir
+
+def test_publish_run_belt_recheck_passes_when_still_ignored(
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """Regression control: the belt re-check must not spuriously refuse an
+    ordinary publish when the comprehension dir is still genuinely ignored
+    exactly as the preflight proved."""
+    lock, staging = _stage(comprehension_dir, comprehension_privacy, "scan-1")
+    pub.publish_run(
+        staging_handle=staging, lock_handle=lock,
+        run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None,
+        record_counts=_COUNTS, privacy_result=comprehension_privacy,
+    )
+    assert (comprehension_dir / "runs" / "scan-1").is_dir()
+
+
+def test_publish_run_belt_recheck_refuses_when_gitignore_removed_mid_run(
+    comprehension_privacy_root: Path, comprehension_dir: Path,
+    comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """The preflight proved ``.agenttalk/`` ignored at lock-acquisition
+    time, but a ``.gitignore`` removal DURING the run (a TOCTOU-shaped gap)
+    must still be caught immediately before the rename actually commits the
+    staging dir into ``runs/`` - the whole point of the belt re-check."""
+    lock, staging = _stage(comprehension_dir, comprehension_privacy, "scan-1")
+    (comprehension_privacy_root / ".gitignore").unlink()
+    with pytest.raises(VcsPrivacyRefused):
+        pub.publish_run(
+            staging_handle=staging, lock_handle=lock,
+            run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None,
+            record_counts=_COUNTS, privacy_result=comprehension_privacy,
+        )
+    assert staging.path.exists()  # never renamed
+    assert not (comprehension_dir / "runs" / "scan-1").exists()
+    assert not lock.path.exists()  # still released despite the refusal (design step 3)
+
+
+def test_rename_belt_recheck_skipped_for_acknowledged_unignored_disposition(
+    comprehension_privacy_root: Path, comprehension_dir: Path,
+) -> None:
+    """An operator who explicitly ACKNOWLEDGED an unignored store already
+    accepted this exact risk for this one run - the belt re-check only
+    applies to the automatic "ignored" disposition and must not spuriously
+    re-refuse a publish that was never claiming "ignored" in the first
+    place."""
+    acknowledged = privacymod.acknowledge_unignored_private_store(
+        comprehension_privacy_root, vcs_kind="git", work_id="w1")
+    (comprehension_privacy_root / ".gitignore").unlink()  # genuinely unignored
+    lock, staging = _stage(comprehension_dir, acknowledged, "scan-1")
+    pub.publish_run(
+        staging_handle=staging, lock_handle=lock,
+        run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None,
+        record_counts=_COUNTS, privacy_result=acknowledged,
+    )
+    assert (comprehension_dir / "runs" / "scan-1").is_dir()
+
+
+def test_rename_belt_recheck_skipped_when_no_privacy_result_passed(
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """``privacy_result`` is optional (default ``None``) precisely so tests
+    exercising the rename mechanics alone need not construct one - this is
+    the existing, pre-round-32 calling shape and must keep working
+    unchanged."""
+    lock, staging = _stage(comprehension_dir, comprehension_privacy, "scan-1")
+    result = pub.rename_staging_to_run(staging, lock)
+    assert result == comprehension_dir / "runs" / "scan-1"
     lockmod.release_scan_lock(lock)
 
 
