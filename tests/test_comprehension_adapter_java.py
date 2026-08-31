@@ -4101,7 +4101,10 @@ def test_parse_web_xml_a_filter_mapping_route_publishes_a_paired_route_edge():
     assert len(entry_points) == 1
     assert len(edges) == 1
     assert edges[0].relation == "route"
-    assert edges[0].target_kind == "external_route"
+    # FIX ROUND 29 (F4 MAJOR, completeness): target_kind now distinguishes
+    # a filter's own edge from a served route's - see dependencies_
+    # artifact.DependencyRecord.route_kind's own docstring.
+    assert edges[0].target_kind == "external_filter"
     assert edges[0].from_qualified_name == "com.acme.web.AuthFilter"
     assert edges[0].target == "/secure/*"
     assert entry_points[0].kind == "http_filter"

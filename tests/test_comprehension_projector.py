@@ -28,12 +28,13 @@ def _unit(unit_id: str) -> ModuleRecord:
 def _edge(
     edge_id: str, from_unit_id: str, *, resolution_state: str, target_unit_id=None,
     target_external=None, externality_suppressed: bool = False, relation: str = "invoke",
+    route_kind=None,
 ):
     return DependencyRecord(
         edge_id=edge_id, from_unit_id=from_unit_id, relation=relation, phase="runtime",
         optional=False, evidence_class="extracted", resolution_state=resolution_state,
         target_unit_id=target_unit_id, target_external=target_external,
-        externality_suppressed=externality_suppressed,
+        externality_suppressed=externality_suppressed, route_kind=route_kind,
     )
 
 
@@ -594,7 +595,7 @@ def test_dependency_summary_categorizes_every_edge():
     payload = pr.project_comprehension(**_base_kwargs(dependencies=edges))
     assert payload["dependency_summary"] == {
         "internal": 1, "external": 1, "unresolved": 1, "ambiguous": 1,
-        "externality_suppressed": 0, "routes": 0,
+        "externality_suppressed": 0, "routes": 0, "routes_by_kind": {},
     }
 
 
@@ -614,9 +615,31 @@ def test_dependency_summary_never_counts_route_edges_as_external_dependencies():
     payload = pr.project_comprehension(**_base_kwargs(dependencies=edges))
     assert payload["dependency_summary"] == {
         "internal": 0, "external": 0, "unresolved": 0, "ambiguous": 0,
-        "externality_suppressed": 0, "routes": 7,
+        "externality_suppressed": 0, "routes": 7, "routes_by_kind": {},
     }
     assert payload["high_fan_out_units"] == []
+
+
+def test_dependency_summary_splits_routes_by_kind():
+    """FIX ROUND 29 (twenty-fifth cold read, F4 MAJOR, completeness):
+    `routes` alone counted EVERY route-relation edge as one bucket -
+    both a served route AND an intercepting filter - while the same
+    payload's own `entry_points_by_kind` already separates `http_route`
+    from `http_filter`, and a pre-aggregated integer had nothing to
+    join back to it. `routes` itself stays UNCHANGED (the total); the
+    new `routes_by_kind` dict mirrors entry_points_by_kind's own exact
+    key vocabulary so a caller can join the two directly."""
+    edges = [
+        _edge("route-1", "u1", resolution_state="resolved",
+              target_external="/api/orders", relation="route", route_kind="http_route"),
+        _edge("route-2", "u1", resolution_state="resolved",
+              target_external="/api/users", relation="route", route_kind="http_route"),
+        _edge("filter-1", "u1", resolution_state="resolved",
+              target_external="/secure/*", relation="route", route_kind="http_filter"),
+    ]
+    payload = pr.project_comprehension(**_base_kwargs(dependencies=edges))
+    assert payload["dependency_summary"]["routes"] == 3
+    assert payload["dependency_summary"]["routes_by_kind"] == {"http_filter": 1, "http_route": 2}
 
 
 def test_dependency_summary_still_counts_a_real_external_import_alongside_routes():

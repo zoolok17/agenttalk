@@ -1933,6 +1933,63 @@ def test_run_scan_links_a_web_xml_route_to_its_real_servlet_class_end_to_end(
     assert entry_points_mapped["stored_status"] == "satisfied"
 
 
+def test_run_scan_a_route_and_a_filter_report_their_own_split_dependency_summary_counts(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 29 (twenty-fifth cold read, F4 MAJOR, completeness):
+    end to end - one servlet-mapping route and one filter-mapping filter
+    in the same run must publish `dependency_summary.routes_by_kind ==
+    {"http_filter": 1, "http_route": 1}`, joinable directly against
+    `counts.entry_points_by_kind`'s own identical key vocabulary,
+    instead of a single pre-aggregated `routes: 2` integer with nothing
+    to tell the two apart."""
+    import json
+
+    web_dir = java_repo / "src" / "main" / "java" / "com" / "acme" / "web"
+    web_dir.mkdir(parents=True)
+    (web_dir / "DispatcherServlet.java").write_text(
+        "package com.acme.web;\nclass DispatcherServlet {\n}\n", encoding="utf-8")
+    (web_dir / "AuthFilter.java").write_text(
+        "package com.acme.web;\nclass AuthFilter {\n}\n", encoding="utf-8")
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "    <servlet-class>com.acme.web.DispatcherServlet</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "    <url-pattern>/api/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "  <filter>\n"
+        "    <filter-name>auth</filter-name>\n"
+        "    <filter-class>com.acme.web.AuthFilter</filter-class>\n"
+        "  </filter>\n"
+        "  <filter-mapping>\n"
+        "    <filter-name>auth</filter-name>\n"
+        "    <url-pattern>/secure/*</url-pattern>\n"
+        "  </filter-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    route_kinds = sorted(e["route_kind"] for e in dependencies_doc["edges"] if e["route_kind"])
+    assert route_kinds == ["http_filter", "http_route"]
+
+    payload = scan_pipeline.get_report(java_repo)
+    assert payload["dependency_summary"]["routes"] == 2
+    assert payload["dependency_summary"]["routes_by_kind"] == {"http_filter": 1, "http_route": 1}
+    # java_repo's own default fixture also carries a `main` method
+    # (cli_main), unrelated to this fix - checked as a subset, not
+    # asserting the whole dict, so that fixture detail cannot break this
+    # test.
+    assert payload["counts"]["entry_points_by_kind"]["http_filter"] == 1
+    assert payload["counts"]["entry_points_by_kind"]["http_route"] == 1
+
+
 @pytest.mark.parametrize("swap_order", [False, True])
 def test_run_scan_a_duplicate_servlet_name_with_conflicting_classes_publishes_a_conflict(
     java_repo: Path, swap_order: bool,

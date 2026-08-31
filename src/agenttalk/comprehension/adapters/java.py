@@ -2566,9 +2566,18 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             # edge's `relation` stays "route", never a distinct
             # "filter" value; the kind distinction is the paired entry
             # point's own job.
+            #
+            # FIX ROUND 29 (F4 MAJOR, completeness): `target_kind` -
+            # this producer's OWN internal resolution-kind vocabulary,
+            # never part of the design's public `relation` field the
+            # comment above keeps frozen - now names "external_filter"
+            # here specifically, so dependencies_artifact.py can publish
+            # a real route_kind distinguishing this edge from a served
+            # route's, mirroring entry_points_by_kind's own existing
+            # http_route/http_filter split.
             edges.append(JavaEdgeClaim(
                 from_qualified_name=target_type, relation="route", target=path,
-                target_kind="external_route", evidence_class="declared",
+                target_kind="external_filter", evidence_class="declared",
                 line=line, phase="runtime",
             ))
             entry_points.append(JavaEntryPointClaim(
@@ -4464,9 +4473,15 @@ def parse_web_xml(
             # wrong data (`relation` never promised to encode kind) and
             # not extended here - see `ENTRY_POINT_KINDS`'s own comment
             # for why the relation vocabulary stays closed.
+            #
+            # FIX ROUND 29 (F4 MAJOR, completeness): `target_kind` (this
+            # producer's own internal resolution-kind vocabulary, never
+            # the frozen public `relation` field above) now names
+            # "external_filter" here - see the identical comment at the
+            # annotation-based @WebFilter site.
             edges.append(JavaEdgeClaim(
                 from_qualified_name=owner_qualified_name, relation="route",
-                target=url_pattern, target_kind="external_route",
+                target=url_pattern, target_kind="external_filter",
                 evidence_class="declared",
                 line=_line_at(newline_offsets, absolute_offset), phase="runtime",
             ))

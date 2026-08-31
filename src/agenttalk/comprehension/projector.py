@@ -166,9 +166,26 @@ def _dependency_summary(dependencies: list[DependencyRecord]) -> dict[str, int]:
         # without it.
         "routes": 0,
     }
+    # FIX ROUND 29 (twenty-fifth cold read, F4 MAJOR, completeness):
+    # `routes` above counts EVERY route-relation edge as one bucket -
+    # both a served route AND an intercepting filter (relation itself
+    # stays "route" for both, by micro-round 27b's own ruling) - while
+    # the SAME payload's own `entry_points_by_kind` already separates
+    # `http_route` from `http_filter`, and `ENTRY_POINT_KINDS`'s own
+    # "never counted as served" sentence makes that distinction load-
+    # bearing. A pre-aggregated integer had nothing to join back to it.
+    # `routes` itself stays UNCHANGED (the same "never redefine a
+    # published field, add a new one" discipline `externality_
+    # suppressed` above already follows) - `routes_by_kind` is the new,
+    # additive dict, keyed by the IDENTICAL `http_route`/`http_filter`
+    # vocabulary `entry_points_by_kind` already uses, so a caller can
+    # join the two directly by key.
+    routes_by_kind: dict[str, int] = {}
     for edge in dependencies:
         if edge.relation in _NON_DEPENDENCY_RELATIONS:
             summary["routes"] += 1
+            if edge.route_kind is not None:
+                routes_by_kind[edge.route_kind] = routes_by_kind.get(edge.route_kind, 0) + 1
             continue
         if edge.resolution_state == "resolved" and edge.target_unit_id is not None:
             summary["internal"] += 1
@@ -180,6 +197,7 @@ def _dependency_summary(dependencies: list[DependencyRecord]) -> dict[str, int]:
             summary["unresolved"] += 1
             if edge.externality_suppressed:
                 summary["externality_suppressed"] += 1
+    summary["routes_by_kind"] = dict(sorted(routes_by_kind.items()))
     return summary
 
 

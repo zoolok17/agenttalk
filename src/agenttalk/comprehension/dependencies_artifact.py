@@ -76,6 +76,23 @@ class DependencyRecord:
     # real, unresolved dependency" - the two used to collapse into the
     # identical unsatisfied/unresolved_dependency signal.
     externality_suppressed: bool = False
+    #: FIX ROUND 29 (twenty-fifth cold read, F4 MAJOR, completeness):
+    #: ``dependency_summary.routes`` (projector.py) used to count EVERY
+    #: route-relation edge as one bucket - both a served route AND an
+    #: intercepting filter (micro-round 27b's own JUDGE ruling keeps
+    #: ``relation`` itself frozen at ``"route"`` for both, the served-
+    #: vs-intercepts distinction living on the paired entry point's own
+    #: ``kind`` instead) - but nothing let a consumer tell the two
+    #: apart from the pre-aggregated integer alone, unlike
+    #: ``entry_points_by_kind``'s own already-separated ``http_route``/
+    #: ``http_filter`` counts for the identical fact. ``"http_route"``/
+    #: ``"http_filter"`` (mirroring ``JavaEntryPointClaim.kind``'s own
+    #: vocabulary exactly), ``None`` for every non-route-relation edge -
+    #: set once, here, from the adapter's own emission-site knowledge
+    #: (``JavaEdgeClaim.target_kind``, ``"external_route"``/``"external_
+    #: filter"``), never re-derived by guessing from an edge's own
+    #: target string.
+    route_kind: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -95,6 +112,7 @@ class DependencyRecord:
             "evidence": self.evidence,
             "candidate_unit_ids": self.candidate_unit_ids,
             "externality_suppressed": self.externality_suppressed,
+            "route_kind": self.route_kind,
         }
 
 
@@ -110,6 +128,7 @@ def dependency_record_from_json(payload: dict[str, Any]) -> DependencyRecord:
         evidence=list(payload.get("evidence", [])),
         candidate_unit_ids=list(payload.get("candidate_unit_ids", [])),
         externality_suppressed=payload.get("externality_suppressed", False),
+        route_kind=payload.get("route_kind"),
     )
 
 
@@ -984,6 +1003,13 @@ def _edge_claim_to_record(
         resolution_state = "resolved"
         target_external = edge.target
 
+    # FIX ROUND 29 (F4 MAJOR, completeness): the adapter's own emission-
+    # site knowledge (target_kind), never re-derived - see DependencyRecord.
+    # route_kind's own docstring.
+    route_kind = {
+        "external_route": "http_route", "external_filter": "http_filter",
+    }.get(edge.target_kind)
+
     return DependencyRecord(
         edge_id=digests.edge_id(
             from_unit_id=from_unit_id, relation=edge.relation, target=edge.target,
@@ -1009,4 +1035,5 @@ def _edge_claim_to_record(
         )],
         candidate_unit_ids=candidate_unit_ids,
         externality_suppressed=externality_suppressed,
+        route_kind=route_kind,
     )
