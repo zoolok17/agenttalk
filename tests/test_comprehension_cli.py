@@ -101,6 +101,31 @@ def test_acknowledge_without_work_id_refuses(tmp_path: Path, capsys) -> None:
     assert "--work-id" in capsys.readouterr().err
 
 
+def test_acknowledge_without_work_id_refuses_even_with_no_privacy_issue(
+    tmp_path: Path, capsys,
+) -> None:
+    """FIX ROUND 28 (twenty-fourth cold read, F9, wrong-refusal-timing,
+    same class found one layer down at the CLI): the sibling test above
+    only exercises this pairing refusal on a repo the privacy preflight
+    was ALSO going to refuse anyway (`ignore_agenttalk=False`) - the
+    check used to live entirely inside `cmd_comprehension`'s own `except
+    VcsPrivacyRefused` branch, reached only when the FIRST, unacknow-
+    ledged `scan_pipeline.run_scan(root)` attempt actually hit a privacy
+    refusal. Against a repo with NO privacy issue at all
+    (`.agenttalk/` correctly ignored here), `--acknowledge-unignored-
+    private-store` with no `--work-id` silently proceeded to a normal,
+    successful scan - the invalid flag pairing was never even evaluated.
+    The pairing is a property of the arguments themselves, never of what
+    the first scan attempt happens to find - must refuse here too."""
+    _init_git_repo(tmp_path, ignore_agenttalk=True)
+    _write_sample_java_project(tmp_path)
+    exit_code = _run(
+        ["comprehension", "scan", "--acknowledge-unignored-private-store"], tmp_path)
+    assert exit_code == 2
+    assert "--work-id" in capsys.readouterr().err
+    assert not (tmp_path / ".agenttalk").exists()
+
+
 def test_acknowledge_headless_without_agent_identity_reports_and_refuses(
     tmp_path: Path, capsys,
 ) -> None:

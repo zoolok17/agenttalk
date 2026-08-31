@@ -672,13 +672,19 @@ The v1 surface stays migration-shaped and read-mostly:
 | `agenttalk comprehension prune --staging` | Reclaim only definitely abandoned, unpublished staging directories. It never deletes runs or packs. |
 
 Examples of the proposed syntax. FIX ROUND 28 (task #55 slice-1 PR-B,
-twenty-fourth cold read, F11, completeness): by this round the underlying
-`scan`/`status`/`report`/`validate` operations are fully implemented and
-tested as direct Python entry points (`scan_pipeline.run_scan`/
-`get_status`/`get_report`/`validate_run`, ~980 tests) - only the literal
-`agenttalk comprehension <verb>` argparse shell surface itself remains
-unwired this slice, so these exact shell invocations are still not
-runnable as shown, but the operations they name are real, not aspirational:
+twenty-fourth cold read, F11, completeness): by this round `scan`/
+`status`/`report`/`validate`/`prune` are fully wired as a real, tested
+`agenttalk comprehension <verb>` CLI (`cli.py`'s `cmd_comprehension`,
+~1230 tests across `test_comprehension_cli.py`/`test_comprehension_
+scan_pipeline.py`) - not merely as direct Python entry points behind an
+unbuilt shell surface. `pack` remains the later increment named in
+`comprehension --help`'s own description (its example line below is not
+runnable - no `pack` subcommand is registered at all), and `--scope`/
+`--exclude`/`--config` narrowing remains the not-implemented-this-slice
+gap `scan --help` already declares (round 26's own F5 - the `scan` line
+below is not runnable as shown either, since `--scope`/`--exclude` are
+not registered arguments); `status`/`report`/`validate` below ARE
+runnable exactly as shown:
 
 ```text
 agenttalk comprehension scan --scope src/legacy --scope tests/characterization
@@ -695,14 +701,10 @@ validated run use agenttalk's ordinary command-error exit. The CLI must never
 turn “findings exist” into a scripting failure unless a later, explicit policy
 command is designed for that purpose.
 
-`report --json` is the stable automation contract. Human output may evolve.
-FIX ROUND 28 (F5, completeness): this slice publishes no separate human-
-rendering code path at all for `report` (or `status`/`validate`) - a
-caller of `scan_pipeline.get_report` receives exactly the same validated
-projection `--json` would also emit, byte-for-byte, until a future slice
-actually builds a distinct human-formatted rendering. "Human output may
-evolve" names a real future direction, not a divergence that already
-exists today.
+`report --json` is the stable automation contract. Human output may evolve
+(`cmd_comprehension`'s own docstring already declares this slice's `report`
+human mode prints the identical JSON projection, byte-for-byte - round 26's
+own F6).
 `validate` does not repair or rewrite an immutable run. V1 has no arbitrary
 graph query, multi-run `diff`, contract-inventory query, background watcher,
 auto-rescan daemon, managed export command, or published-data delete command.

@@ -2153,6 +2153,24 @@ def cmd_comprehension(args: argparse.Namespace) -> int:
     root = _comprehension_root(args)
 
     if action == "scan":
+        # FIX ROUND 28 (twenty-fourth cold read, F9, wrong-refusal-
+        # timing): the --work-id pairing check below used to live ONLY
+        # inside the `except VcsPrivacyRefused` branch - reached only
+        # when the first, unacknowledged scan_pipeline.run_scan(root)
+        # attempt actually hit a privacy refusal. Against a repo with no
+        # privacy issue at all, --acknowledge-unignored-private-store
+        # with no --work-id silently proceeded to a normal, successful
+        # scan - the invalid flag pairing was never even evaluated. The
+        # pairing is a property of the arguments themselves, never of
+        # what the first attempt happens to find - checked first here,
+        # unconditionally, before scan_pipeline.run_scan is ever called
+        # (scan_pipeline.py's own _obtain_privacy makes the identical
+        # correction one layer down, for any OTHER caller of run_scan
+        # that passes acknowledge_unignored=True up front).
+        if args.acknowledge_unignored_private_store and not args.work_id:
+            sys.stderr.write(
+                "agenttalk: --acknowledge-unignored-private-store requires --work-id\n")
+            return 2
         outcome = None
         try:
             # FIX ROUND 21 (seventeenth cold read, CR17-1 BLOCKER, safety
@@ -2171,10 +2189,9 @@ def cmd_comprehension(args: argparse.Namespace) -> int:
             if not args.acknowledge_unignored_private_store:
                 sys.stderr.write(f"agenttalk: {exc}\n")
                 return 2
-            if not args.work_id:
-                sys.stderr.write(
-                    "agenttalk: --acknowledge-unignored-private-store requires --work-id\n")
-                return 2
+            # --work-id is already guaranteed present here - the upfront
+            # pairing guard above refuses before this try block is ever
+            # entered otherwise.
             confirmed = _comprehension_confirm_attended([
                 f"ATTENDED ACTION: acknowledge-unignored-private-store at {root}",
                 "The private comprehension store is not proven ignored by your VCS.",
