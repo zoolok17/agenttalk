@@ -276,6 +276,23 @@ def test_comprehension_help_declares_pack_as_a_later_increment(capsys) -> None:
     assert "later increment" in help_text
 
 
+def test_scan_help_declares_scope_exclude_config_as_not_implemented_this_slice(capsys) -> None:
+    """FIX ROUND 26 (twenty-second cold read, F5 completeness): `pack`
+    got an explicit later-increment declaration (see the test above),
+    but --scope/--exclude/--config - equally design-promised for THIS
+    command per DESIGN-55's own scan narrowing/config.json parsing
+    sections, and equally absent this slice - had no declaration
+    anywhere a --help reader would see it."""
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["comprehension", "scan", "--help"])
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "--scope" in help_text
+    assert "--exclude" in help_text
+    assert "--config" in help_text
+    assert "not implemented this slice" in help_text
+
+
 def test_status_before_any_scan(tmp_path: Path, capsys) -> None:
     exit_code = _run(["comprehension", "status", "--json"], tmp_path)
     assert exit_code == 0

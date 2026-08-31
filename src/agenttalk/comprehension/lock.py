@@ -238,8 +238,23 @@ def _classify_and_maybe_reclaim(path: Path) -> None:
     if record["host_identity"] != host_identity():
         # A lock recorded on a different host can never be proven dead from
         # here (design: "an unverifiable or remote-looking owner").
+        # FIX ROUND 26 (twenty-second cold read, F8, wrong-data): the
+        # generic "run --recover-stale-lock" remedy is misleading here -
+        # the flag CAN force-clear this record (it removes the file on
+        # trust), but it cannot verify anything about a foreign host's
+        # own process state, so re-running it alone does not help if
+        # that host keeps re-acquiring the lock. States the real remedy
+        # (independently confirm the other host's scan is gone) instead.
         raise ScanLockUnrecoverable(
-            f"scan.lock was recorded on a different host ({record['host_identity']!r})")
+            f"scan.lock was recorded on a different host ({record['host_identity']!r})",
+            remedy=(
+                "--recover-stale-lock can force-clear this record, but it cannot verify "
+                "a foreign host's process state at all - confirm independently that the "
+                f"scan on host {record['host_identity']!r} is genuinely gone before "
+                "relying on it; re-running the flag alone will not help if that host "
+                "keeps re-acquiring the lock"
+            ),
+        )
     status, observed = process_observation(record["pid"])
     if status == "dead":
         with contextlib.suppress(FileNotFoundError):

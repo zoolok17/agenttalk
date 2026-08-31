@@ -176,10 +176,25 @@ class ScanLockUnrecoverable(ScanLockError):
 
     reason_code = "comprehension_lock_unrecoverable"
 
-    def __init__(self, detail: str) -> None:
+    def __init__(self, detail: str, *, remedy: str | None = None) -> None:
+        # FIX ROUND 26 (twenty-second cold read, F8, wrong-data): every
+        # call site used to share ONE generic remedy sentence ("run
+        # --recover-stale-lock after confirming the prior scan is really
+        # gone") - accurate for a same-host dead/unverifiable/malformed-
+        # record owner (the flag genuinely resolves those), but a caller
+        # who supplied the flag for a DIFFERENT-HOST owner and hit this
+        # again (that host keeps re-acquiring) was told the same generic
+        # advice, as if simply running the flag they had already run
+        # would help - it cannot, since this flag has no way to observe
+        # a foreign host's process state at all. `remedy` lets a call
+        # site override the generic sentence with the ACTUAL remedy for
+        # its own case; unset, every existing call site is unchanged.
         self.detail = detail
-        super().__init__(
-            f"{self.reason_code}: {detail}; this cannot be reclaimed automatically - "
+        remedy_text = remedy if remedy is not None else (
             "an attended operator must run --recover-stale-lock after confirming the "
             "prior scan is really gone"
+        )
+        super().__init__(
+            f"{self.reason_code}: {detail}; this cannot be reclaimed automatically - "
+            f"{remedy_text}"
         )

@@ -14127,7 +14127,20 @@ def build_parser() -> argparse.ArgumentParser:
     pcomp.set_defaults(func=cmd_comprehension, comprehension_cmd=None)
     compsub = pcomp.add_subparsers(dest="comprehension_cmd")
 
-    cscan = compsub.add_parser("scan", help="Create and publish one immutable comprehension run.")
+    # FIX ROUND 26 (twenty-second cold read, F5 completeness): `pack` got
+    # an explicit later-increment declaration (see `pcomp`'s own
+    # description above) but `--scope`/`--exclude`/`--config` - equally
+    # design-promised for THIS command, per DESIGN-55's own scan
+    # narrowing/config.json parsing sections, and equally absent this
+    # slice - had no declaration anywhere a `--help` reader would see it.
+    cscan = compsub.add_parser(
+        "scan", help="Create and publish one immutable comprehension run.",
+        description="Create and publish one immutable comprehension run. "
+                    "--scope/--exclude narrowing and --config (config.json parsing) are "
+                    "design-promised for this command but not implemented this slice - "
+                    "every scan walks the whole repository root with no narrowing or "
+                    "configuration overrides.",
+    )
     cscan.add_argument(
         "--work-id",
         help="Work item ID bound to an attended --acknowledge-unignored-private-store run.")

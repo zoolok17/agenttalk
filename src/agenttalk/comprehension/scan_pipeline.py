@@ -277,7 +277,17 @@ def _artifact_summary(
     digests.canonical_content_digest already existed with no production
     caller. The run-level content_digest below is computed from exactly
     this shape (digests.run_content_digest reads artifact_type/
-    schema_version/record_count/content_digest from each entry)."""
+    schema_version/record_count/content_digest from each entry).
+
+    FIX ROUND 26 (twenty-second cold read, F7 note, doc-only): ``record_
+    count`` is the TOTAL number of individual records across every
+    top-level collection this document publishes, not the length of any
+    one named array - a document with several distinct record kinds
+    (readiness.json's own ``signals``/``summaries``; features.json's own
+    ``entry_points``/``features``) sums across all of them (see this
+    call's own caller for each document's exact sum, and Note 2's own
+    fix-round-4 history for why an unsummed count previously understated
+    it)."""
     return {
         "name": name,
         "artifact_type": artifact_type,

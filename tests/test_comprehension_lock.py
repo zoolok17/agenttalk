@@ -225,6 +225,31 @@ def test_different_host_identity_is_unrecoverable_even_if_pid_matches(
     assert stale.path.exists()
 
 
+def test_different_host_refusal_states_the_actual_remedy_not_just_rerun_the_flag(
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
+) -> None:
+    """FIX ROUND 26 (twenty-second cold read, F8, wrong-data): the
+    generic "run --recover-stale-lock" remedy is misleading for a
+    foreign-host owner - a caller who already supplied the flag and hit
+    this again (the other host keeps re-acquiring) was told the exact
+    same advice as if they had never run it. The message must instead
+    name the actual remedy: confirm independently that the OTHER host's
+    scan is genuinely gone - the flag cannot verify a foreign host's own
+    process state at all."""
+    monkeypatch.setattr(lockmod, "host_identity", lambda: "host-a")
+    lockmod.acquire_scan_lock(
+        comprehension_dir, privacy=comprehension_privacy, predecessor_index_digest=None)
+    monkeypatch.setattr(lockmod, "host_identity", lambda: "host-b")
+    with pytest.raises(ScanLockUnrecoverable) as exc_info:
+        lockmod.acquire_scan_lock(
+            comprehension_dir, privacy=comprehension_privacy,
+            predecessor_index_digest=None)
+    message = str(exc_info.value)
+    assert "confirm" in message.lower()
+    assert "host-a" in message
+    assert "cannot verify" in message.lower()
+
+
 # ----------------------------------------------------------- malformed lock record
 
 @pytest.mark.parametrize("raw", [
