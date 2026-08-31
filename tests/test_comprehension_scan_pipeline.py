@@ -3265,7 +3265,18 @@ def test_run_scan_a_utf16_pom_xml_still_degrades_unaffected_by_the_root_sniffed_
     new, deliberately-non-degrading root-sniffed-xml problem - the two
     predicates are mutually exclusive by construction
     (`is_a_root_sniffed_xml_extension` excludes both adapter-handled
-    basenames), verified here end to end rather than merely assumed."""
+    basenames), verified here end to end rather than merely assumed.
+
+    FIX ROUND 31 (twenty-seventh cold read, F3 MINOR, completeness): a
+    binary/UTF-16-excluded pom.xml/web.xml previously got NO modules.json
+    unit at all - the MORE migration-material file (a build/routing
+    descriptor, always code-bearing by definition) was the unaddressable
+    one, while a UTF-16 logback.xml (not adapter-handled) already got a
+    real unit (round 26b/micro-round 28b). Now published: empty
+    classification, the SAME already-recorded binary_excluded_code_
+    bearing_file reason in adapter_problem_reasons, and six honest
+    unknown readiness rows - never a confident guess over a file this
+    run admits it never read."""
     import json
 
     (java_repo / "pom.xml").write_bytes(
@@ -3280,6 +3291,47 @@ def test_run_scan_a_utf16_pom_xml_still_degrades_unaffected_by_the_root_sniffed_
     reason_codes = {p["reason_code"] for p in matching}
     assert "binary_excluded_code_bearing_file" in reason_codes
     assert "binary_excluded_root_sniffed_xml" not in reason_codes
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    pom_units = [u for u in modules_doc["units"] if u["paths"] == ["pom.xml"]]
+    assert len(pom_units) == 1
+    assert pom_units[0]["classification"] == []
+    assert "binary_excluded_code_bearing_file" in pom_units[0]["adapter_problem_reasons"]
+
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    pom_signals = [s for s in readiness_doc["signals"] if s["unit_id"] == pom_units[0]["unit_id"]]
+    assert len(pom_signals) == 6
+    assert all(s["stored_status"] == "unknown" for s in pom_signals)
+
+
+def test_run_scan_a_binary_excluded_web_xml_also_gets_its_own_unit(java_repo: Path) -> None:
+    """FIX ROUND 31 (twenty-seventh cold read, F3 MINOR, completeness):
+    the web.xml twin of the pom.xml test above - .cr27-enc2 verbatim.
+    A binary-excluded web.xml is the MORE migration-material file (a
+    routing descriptor) yet was the unaddressable one; a UTF-16
+    logback.xml (not adapter-handled) already got a unit. Both must
+    now be true at once, in the SAME run - the fix must not regress the
+    already-working non-adapter-handled case while closing this one."""
+    import json
+
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_bytes(
+        "<web-app></web-app>\n".encode("utf-16"))
+    (java_repo / "logback.xml").write_bytes("<configuration></configuration>\n".encode("utf-16"))
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    web_xml_units = [u for u in modules_doc["units"] if u["paths"] == ["WEB-INF/web.xml"]]
+    assert len(web_xml_units) == 1
+    assert web_xml_units[0]["classification"] == []
+    assert "binary_excluded_code_bearing_file" in web_xml_units[0]["adapter_problem_reasons"]
+
+    logback_units = [u for u in modules_doc["units"] if u["paths"] == ["logback.xml"]]
+    assert len(logback_units) == 1
+    assert logback_units[0]["classification"] == []
+    assert "binary_excluded_root_sniffed_xml" in logback_units[0]["adapter_problem_reasons"]
 
 
 def test_run_scan_a_utf16_gitmodules_degrades_with_an_encoding_undecodable_problem(

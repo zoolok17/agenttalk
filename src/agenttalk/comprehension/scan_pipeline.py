@@ -640,6 +640,23 @@ def run_scan(
             and "content_digest" in entry
             and worker.is_a_root_sniffed_xml_extension(entry["path"])
         }
+        # FIX ROUND 31 (twenty-seventh cold read, F3 MINOR, completeness):
+        # the exact same additive-unit shape as the root-sniffed-xml
+        # dict above, for a binary-excluded pom.xml/web.xml specifically
+        # (worker.is_a_root_sniffed_xml_extension deliberately EXCLUDES
+        # both - see its own docstring) - these two previously got NO
+        # modules.json unit at all when binary-excluded, even though
+        # round 18's own F6 fix (below) already records a real,
+        # DEGRADING problem for them. See build_modules's own
+        # binary_excluded_adapter_handled_descriptor_digests parameter
+        # docstring.
+        binary_excluded_adapter_handled_descriptor_digests = {
+            entry["path"]: entry["content_digest"]
+            for entry in discovery_result.excluded_roots
+            if entry["category"] == "binary"
+            and "content_digest" in entry
+            and worker.is_an_adapter_handled_xml_basename(entry["path"])
+        }
         # FIX ROUND 29 (twenty-fifth cold read, F1 BLOCKER, wrong-data):
         # every web.xml this run parsed may have recorded its own
         # duplicated servlet-name/filter-name conflicts (java.parse_
@@ -658,6 +675,8 @@ def run_scan(
             worker_problem_reasons_by_qualified_name=worker_problem_reasons_by_qualified_name,
             non_degrading_unsupported_language_paths=non_degrading_unsupported_language_paths,
             binary_excluded_root_sniffed_xml_digests=binary_excluded_root_sniffed_xml_digests,
+            binary_excluded_adapter_handled_descriptor_digests=(
+                binary_excluded_adapter_handled_descriptor_digests),
             descriptor_name_conflicts=descriptor_name_conflicts,
         )
         # M7 (cold-read, PR-B fix round 3): discovery already computed

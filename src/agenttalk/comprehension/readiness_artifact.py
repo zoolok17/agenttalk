@@ -379,6 +379,18 @@ _READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
     # shape the encoding-undecodable twin already gets, never a
     # confident guess computed over evidence that never existed.
     "binary_excluded_root_sniffed_xml": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
+    # FIX ROUND 31 (twenty-seventh cold read, F3 MINOR, completeness):
+    # modules_artifact.py's own build_modules now ALSO synthesizes a
+    # real unit for a binary/UTF-16-excluded pom.xml/web.xml (it used to
+    # publish no unit at all, unlike the root-sniffed-xml twin above) -
+    # this reason (round 18's own F6, already a real, degrading problem)
+    # can now reach a real ModuleRecord's own adapter_problem_reasons
+    # for the first time; its readiness must be the SAME honest six-
+    # unknown-rows shape every other whole-file evidence gap gets,
+    # never a confident guess computed over evidence that never
+    # existed - and never a bare KeyError from this map not knowing the
+    # reason at all (see _reasons_feeding's own docstring).
+    "binary_excluded_code_bearing_file": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
 }
 
 

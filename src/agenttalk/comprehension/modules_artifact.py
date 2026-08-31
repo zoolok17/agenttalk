@@ -344,6 +344,7 @@ def build_modules(
     worker_problem_reasons_by_qualified_name: dict[str, list[str]] | None = None,
     non_degrading_unsupported_language_paths: frozenset[str] | None = None,
     binary_excluded_root_sniffed_xml_digests: dict[str, str] | None = None,
+    binary_excluded_adapter_handled_descriptor_digests: dict[str, str] | None = None,
     descriptor_name_conflicts: list[tuple[str, list[str]]] | None = None,
 ) -> list[ModuleRecord]:
     """``java_results`` maps a ``.java`` file's relative path to its
@@ -409,6 +410,22 @@ def build_modules(
     closing the gap ``CLASSIFICATION_CAVEAT``'s own sentence had wrongly
     assumed was already closed.
 
+    ``binary_excluded_adapter_handled_descriptor_digests`` (FIX ROUND 31,
+    twenty-seventh cold read, F3 MINOR, completeness) is the SAME
+    additive shape as ``binary_excluded_root_sniffed_xml_digests`` above,
+    for a binary/UTF-16-excluded ``pom.xml``/``web.xml`` specifically -
+    these two never reach ``worker.is_a_root_sniffed_xml_extension``
+    (they are adapter-handled, never root-sniffed), so they previously
+    got NO modules.json UNIT at all when excluded, even though round
+    18's own F6 fix already records a real, DEGRADING problem for them
+    (``binary_excluded_code_bearing_file`` - these two ARE code-bearing
+    by definition, unlike the root-sniffed case's genuine tier
+    ambiguity). Reuses that SAME existing reason code here rather than
+    inventing a new one - the problem this unit's own ``adapter_problem_
+    reason`` names is the identical fact scan_pipeline.py's own
+    ``binary_excluded_code_bearing_problems`` already publishes for the
+    same path.
+
     ``descriptor_name_conflicts`` (FIX ROUND 29, twenty-fifth cold read,
     F1 BLOCKER, wrong-data) is the aggregate of every web.xml this run
     parsed own ``java.parse_web_xml``-produced conflicts (a servlet-name/
@@ -420,6 +437,8 @@ def build_modules(
     worker_problem_reasons_by_unit = worker_problem_reasons_by_unit or {}
     non_degrading_unsupported_language_paths = non_degrading_unsupported_language_paths or frozenset()
     binary_excluded_root_sniffed_xml_digests = binary_excluded_root_sniffed_xml_digests or {}
+    binary_excluded_adapter_handled_descriptor_digests = (
+        binary_excluded_adapter_handled_descriptor_digests or {})
 
     for relative_path, content_digest in sorted(binary_excluded_root_sniffed_xml_digests.items()):
         records.append(ModuleRecord(
@@ -436,6 +455,23 @@ def build_modules(
             )],
             adapter_problem_reason="binary_excluded_root_sniffed_xml",
             adapter_problem_reasons=["binary_excluded_root_sniffed_xml"],
+        ))
+
+    for relative_path, content_digest in sorted(binary_excluded_adapter_handled_descriptor_digests.items()):
+        records.append(ModuleRecord(
+            unit_id=digests.unit_id(kind="file", paths=[relative_path], qualified_name=None),
+            kind="file",
+            display_name=relative_path.rsplit("/", 1)[-1],
+            language=_language_for_path(relative_path),
+            paths=[relative_path],
+            source_digests={relative_path: content_digest},
+            classification=[],
+            container_unit_id=None,
+            producers=[_producer(
+                name="discovery", version=1, source_digest=content_digest, basis="extracted",
+            )],
+            adapter_problem_reason="binary_excluded_code_bearing_file",
+            adapter_problem_reasons=["binary_excluded_code_bearing_file"],
         ))
 
     for file_entry in discovery.files:
