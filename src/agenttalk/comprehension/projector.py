@@ -346,7 +346,13 @@ def _project_readiness_summary(summary: UnitReadinessSummary) -> dict[str, Any]:
     carried only ``stored_assessment_state``, a missing-key surprise for
     any design-shaped consumer. Adds them at the PROJECTION layer only
     (never persisted into readiness.json itself, which stores scan-time
-    values exclusively)."""
+    values exclusively).
+
+    FIX ROUND 35 (twenty-ninth cold read, F6 LOW, declare): this trio is
+    published on the unit SUMMARY payload only, never threaded onto an
+    individual ``ReadinessSignal`` row alongside its own ``stored_status``
+    - see ``readiness_artifact.PROVENANCE_CAVEAT``'s own item 5 for why
+    this is a declared scope, not an oversight."""
     payload = summary.to_json()
     payload["revalidated_status"] = "unknown"
     payload["revalidated_at"] = None

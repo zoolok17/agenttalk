@@ -120,6 +120,9 @@ ASSESSMENT_STATE_CAVEAT = (
 #: ENUMERATED list instead, which cannot silently go false the same way
 #: - a future gap simply needs its own new bullet, never a re-audit of
 #: whether the boast still holds.
+#: FIX ROUND 35 (twenty-ninth cold read, F6 LOW, declare): a fifth
+#: bullet added, exactly as designed above - the revalidated_* trio's
+#: summary-only publication level, see item 5's own reasoning.
 PROVENANCE_CAVEAT = (
     "This producer's own declared-gap list (each item design-promised, none "
     "implemented this slice, none a silent omission):\n\n"
@@ -148,7 +151,22 @@ PROVENANCE_CAVEAT = (
     "no validation beyond non-emptiness. scan.json's own privacy.work_id "
     "field records exactly what the caller passed, never a confirmed "
     "binding - a real work-item existence check is the standing carry; this "
-    "is the machine-readable declaration of the gap, not the fix."
+    "is the machine-readable declaration of the gap, not the fix.\n"
+    "5. FIX ROUND 35 (twenty-ninth cold read, F6 LOW): the design's own "
+    "'report --json ... emits stored_status, revalidated_status, "
+    "revalidated_at, and revalidation_reason' sentence pairs revalidated_* "
+    "with stored_status, the per-SIGNAL field - but this producer only ever "
+    "publishes the revalidated_* trio on a unit's readiness SUMMARY payload, "
+    "never threaded onto its individual readiness_signals rows. Declared "
+    "rather than silently narrowed: no revalidation pass exists this slice "
+    "at all (every value is the same not-implemented placeholder "
+    "regardless of level), so publishing it identically on every one of a "
+    "unit's own signal rows would add copies of that placeholder, never new "
+    "information - the projection's own consumption story (report "
+    "grouping, pack admission) already operates at unit/summary "
+    "granularity, the level this trio is actually published at. A real "
+    "external-pointer revalidation pass, when it lands, is where a per-"
+    "signal value would first carry real content to publish."
 )
 
 CHECKS = (
