@@ -3551,6 +3551,26 @@ def test_run_scan_refuses_to_publish_modules_out_of_deterministic_order(
     assert [p.name for p in staging_entries[0].iterdir()] == ["owner.json"]
 
 
+def test_run_scan_refuses_to_publish_a_problem_id_collision(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 36 (thirtieth cold read, F2 MAJOR, part (c)): the
+    publish-time backstop - a future problem emitter that forgets a
+    distinguishing datum the same way round 36's own F1/F2 reactor and
+    coordinate shapes did must be refused at its own source, never
+    silently published with an understated problem_count. Forces the
+    condition directly (rather than needing a fresh emitter bug, since
+    F1 already closed the two known reachable shapes) by monkeypatching
+    the shared detector itself - the same "one predicate, two call
+    sites" wiring the dangling-reference refusal above already
+    establishes."""
+    monkeypatch.setattr(
+        scan_pipeline, "_problem_id_collisions", lambda problems: ["deadbeef"])
+
+    with pytest.raises(scan_pipeline.ComprehensionError, match="problem_id"):
+        scan_pipeline.run_scan(java_repo)
+
+
 def test_run_scan_an_encoding_undecodable_root_sniffed_xml_publishes_no_classification(
     java_repo: Path,
 ) -> None:
@@ -5314,6 +5334,45 @@ def test_report_refuses_a_published_run_with_a_dangling_container_reference(
         scan_pipeline.get_report(java_repo, run_id=outcome.scan_id)
 
 
+def test_validate_run_catches_a_problem_id_shared_by_non_identical_records(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 36 (thirtieth cold read, F2 MAJOR, part (c)): the
+    problem_id-collision sweep publish time now refuses on (run_scan)
+    is shared here too, so a run corrupted by some OTHER path (or
+    published before this check existed) is still caught by `validate`
+    rather than silently reporting valid:true forever. Mirrors the
+    dangling-container test's own technique: corrupts the IN-MEMORY
+    records validate builds (never the on-disk bytes, which stay
+    genuinely digest-clean) via a monkeypatched loader, isolating this
+    one check from the separate digest-integrity dimension. A clean
+    control runs first, proving the corruption (not some unrelated
+    fixture problem) is what flips valid to False."""
+    (java_repo / "notes.xyz").write_text("hello", encoding="utf-8")
+    outcome = scan_pipeline.run_scan(java_repo)
+
+    clean = scan_pipeline.validate_run(java_repo, run_id=outcome.scan_id)
+    assert clean["valid"] is True
+
+    real_load = scan_pipeline._load_run_records
+
+    def _duplicate_the_first_problem_with_different_bytes(comprehension_dir, scan_id):
+        records = dict(real_load(comprehension_dir, scan_id))
+        problems = list(records["problems"])
+        assert problems, "fixture must record at least one real problem"
+        corrupted = dict(problems[0])
+        corrupted["detail"] = corrupted["detail"] + " (a different fact, same id)"
+        records["problems"] = [*problems, corrupted]
+        return records
+
+    monkeypatch.setattr(
+        scan_pipeline, "_load_run_records", _duplicate_the_first_problem_with_different_bytes)
+
+    result = scan_pipeline.validate_run(java_repo, run_id=outcome.scan_id)
+    assert result["valid"] is False
+    assert "problem_id" in result["detail"]
+
+
 def test_scan_json_carries_per_artifact_and_run_level_digests(java_repo: Path) -> None:
     """M2 (cold-read, PR-B fix round 3): scan.json must carry per-artifact
     byte SHA-256 + canonical content digest + record count + schema
@@ -6603,6 +6662,88 @@ def test_run_scan_reactor_modules_outside_root_and_missing_are_both_recorded(
     assert scan_doc["externality_suppressed"] is True
 
 
+def test_run_scan_each_reactor_trigger_gets_its_own_truthful_suppression_detail_and_id(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 36 (thirtieth cold read, F1 BLOCKER + F2 MAJOR,
+    wrong-data, .cr30-reactor-outside/-missing/-excluded verbatim): the
+    externality_suppressed detail synthesized from reactor_rule_problems
+    used to be ONE fixed literal - "this pom's own declared <module>
+    resolves into an excluded region" - emitted identically for all
+    three reactor triggers. TRUE only for module_directory_excluded;
+    MEASURED FALSE for module_outside_scan_root and module_directory_
+    missing (no excluded region exists in either case) - a migration
+    reader sent to inspect an exclusion that does not exist. One pom
+    declaring all three bad <module> shapes at once also proves F2: N
+    bad reactor entries in the SAME pom must publish N distinct
+    problem_ids, never collide on one shared literal detail."""
+    import json
+
+    (java_repo / "pom.xml").write_text(
+        "<project><groupId>com.acme</groupId><artifactId>root</artifactId>"
+        "<packaging>pom</packaging>"
+        "<modules>"
+        "<module>../outside-repo</module>"
+        "<module>nonexistent-dir</module>"
+        "<module>vendor</module>"
+        "</modules>"
+        "</project>",
+        encoding="utf-8",
+    )
+    (java_repo / "vendor" / "src" / "main" / "java" / "com" / "acme" / "vendor").mkdir(
+        parents=True)
+    (java_repo / "vendor" / "src" / "main" / "java" / "com" / "acme" / "vendor" / "Widget.java"
+     ).write_text("package com.acme.vendor;\nclass Widget {}\n", encoding="utf-8")
+    (java_repo / "vendor" / "pom.xml").write_text(
+        "<project><groupId>com.acme</groupId><artifactId>vendor-lib</artifactId></project>",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    # "vendor" is itself excluded by name AND holds real code, so
+    # discovery's own generic peek ALSO contributes its own "peek_
+    # positive" externality_suppressed record alongside the three
+    # reactor-rule-driven ones this test targets - filtered to the
+    # <module>-naming ones specifically.
+    suppression_problems = [
+        p for p in problems_doc["problems"]
+        if p["reason_code"] == "externality_suppressed" and "<module>" in p["detail"]]
+    assert len(suppression_problems) == 3
+
+    by_module = {}
+    for p in suppression_problems:
+        if "../outside-repo" in p["detail"]:
+            by_module["outside"] = p
+        elif "nonexistent-dir" in p["detail"]:
+            by_module["missing"] = p
+        elif "<module>vendor</module>" in p["detail"]:
+            by_module["excluded"] = p
+    assert set(by_module) == {"outside", "missing", "excluded"}
+
+    assert "resolves OUTSIDE this run's own scanned root" in by_module["outside"]["detail"]
+    assert "excluded region" not in by_module["outside"]["detail"]
+
+    assert "does not exist as a directory" in by_module["missing"]["detail"]
+    assert "excluded region" not in by_module["missing"]["detail"]
+
+    assert "resolves into a region this run excluded outright" in by_module["excluded"]["detail"]
+
+    # F2: three genuinely distinct facts about the SAME pom must publish
+    # three distinct problem_ids - never collide on one shared literal.
+    problem_ids = {p["problem_id"] for p in suppression_problems}
+    assert len(problem_ids) == 3
+
+    # F2 "honest count": scan.json's own problem_count must equal the
+    # actual number of records in problems.json - never overstated by a
+    # since-fixed id collision, never understated by an over-eager
+    # coalesce of genuinely distinct records.
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["problem_count"] == len(problems_doc["problems"])
+
+
 def test_run_scan_a_pom_with_an_unrecoverable_own_coordinate_poisons_externality_run_wide(
     java_repo: Path,
 ) -> None:
@@ -6660,6 +6801,45 @@ def test_run_scan_a_pom_with_an_unrecoverable_own_coordinate_poisons_externality
         if r["relation"] == "build" and r.get("target_unresolved") == "org.slf4j:slf4j-api")
     assert build_edge["resolution_state"] == "unresolved"
     assert build_edge.get("target_external") is None
+
+
+def test_run_scan_two_undecodable_coordinates_in_one_pom_get_distinct_suppression_ids(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 36 (thirtieth cold read, F2 MAJOR part (b), wrong-data):
+    the reactor case was not the only way to reach N byte-identical
+    externality_suppressed records sharing ONE problem_id - the
+    coordinate branch keyed its own suppression detail only on
+    relative_path, so a pom with BOTH its own project-level artifactId
+    AND its <parent> groupId undecodable (two independent WorkerProblems
+    for the SAME path) published two byte-identical suppression records
+    colliding on one id, understating the true problem count the same
+    way the reactor shape did."""
+    import json
+
+    (java_repo / "pom.xml").write_text(
+        "<project>\n"
+        "  <parent><groupId>com&badent;other</groupId>"
+        "<artifactId>other-parent</artifactId></parent>\n"
+        "  <artifactId>bad&badent2;name</artifactId>\n"
+        "</project>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    coordinate_problems = [
+        p for p in problems_doc["problems"]
+        if p["reason_code"] == "coordinate_value_unrecoverable"]
+    assert len(coordinate_problems) == 2
+
+    suppression_problems = [
+        p for p in problems_doc["problems"] if p["reason_code"] == "externality_suppressed"]
+    assert len(suppression_problems) == 2
+    assert len({p["problem_id"] for p in suppression_problems}) == 2
+    assert len({p["detail"] for p in suppression_problems}) == 2
 
 
 def test_run_scan_an_undeclared_vendored_module_silently_poisoned_now_degrades_visibly(

@@ -323,6 +323,58 @@ def _problem_record(
     return record
 
 
+def _canonical_problem_record(problem: dict[str, Any]) -> tuple[tuple[str, Any], ...]:
+    """A hashable, order-independent form of one problem record, used
+    only to test byte-equivalence between two records that happen to
+    share a ``problem_id`` - never published itself."""
+    return tuple(sorted(problem.items()))
+
+
+def _problem_id_collisions(problems: list[dict[str, Any]]) -> list[str]:
+    """FIX ROUND 36 (thirtieth cold read, F2 MAJOR, part (c)): ``problem_
+    id`` is a stable hash of ``(reason_code, path, detail)`` - by
+    construction, two records sharing an id SHOULD always be byte-
+    identical (the same triple hashes the same way every time). A
+    per-trigger emitter that forgets a distinguishing datum (round 36's
+    own F1/F2 reactor and coordinate shapes) can mint two records that
+    share an id while actually differing in every OTHER field - a
+    genuine stable-ID corruption, not merely a duplicate. Returns the
+    sorted, deduplicated list of colliding ids (empty when every id's
+    own repeated occurrences are byte-identical) - shared by ``run_scan``
+    (publish time, refuses) and :func:`validate_run` (read-time, reports
+    invalid), the same "one predicate, two call sites" discipline
+    ``_dangling_reference_categories`` already established."""
+    canonical_by_id: dict[str, tuple[tuple[str, Any], ...]] = {}
+    colliding: list[str] = []
+    for p in problems:
+        pid = p["problem_id"]
+        canonical = _canonical_problem_record(p)
+        if pid not in canonical_by_id:
+            canonical_by_id[pid] = canonical
+        elif canonical != canonical_by_id[pid] and pid not in colliding:
+            colliding.append(pid)
+    return sorted(colliding)
+
+
+def _coalesce_byte_identical_problems(problems: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """FIX ROUND 36 (F2 MAJOR, part (c)): the canonical merge rule this
+    artifact family already follows elsewhere (byte-equivalent claims
+    coalesce into one published record, never counted twice) - applied
+    here at publish time, AFTER :func:`_problem_id_collisions` has
+    already confirmed every repeated id's own occurrences are genuinely
+    byte-identical (a real collision refuses publication instead; this
+    function is never reached with one present). Order-preserving: the
+    first occurrence of each byte-identical group is kept."""
+    seen: set[tuple[tuple[str, Any], ...]] = set()
+    coalesced: list[dict[str, Any]] = []
+    for p in problems:
+        canonical = _canonical_problem_record(p)
+        if canonical not in seen:
+            seen.add(canonical)
+            coalesced.append(p)
+    return coalesced
+
+
 #: FIX ROUND 28 (twenty-fourth cold read, F8, declare-not-silently-leave-
 #: to-a-docstring): round 26's own F7 note declared record_count's
 #: definition ("the TOTAL number of individual records across every
@@ -835,6 +887,15 @@ def run_scan(
         # straightforward prefix/equality check is exact, not a guess.
         excluded_root_paths_for_reactor_rule = [r["path"] for r in discovery_result.excluded_roots]
         reactor_rule_problems = []
+        # FIX ROUND 36 (thirtieth cold read, F1 BLOCKER + F2 MAJOR,
+        # wrong-data): parallel to `reactor_rule_problems`, one entry per
+        # appended problem, carrying the module's own resolved path - the
+        # DISTINGUISHING DATUM the externality_suppressed synthesis below
+        # needs both to state a truthful, per-trigger cause (not one fixed
+        # literal borrowed from the original excluded-region member alone)
+        # and to keep each synthesized record's own problem_id unique when
+        # one pom declares more than one bad <module> entry.
+        reactor_rule_suppression_causes = []
         for pom_path, result in java_results.items():
             pom_dir = pom_path.rsplit("/", 1)[0] if "/" in pom_path else ""
             for module_path in result.declared_module_paths:
@@ -866,6 +927,11 @@ def run_scan(
                         "declared reactor member this run cannot see at all, never merely "
                         "absent",
                     ))
+                    reactor_rule_suppression_causes.append((
+                        pom_path, module_path, resolved,
+                        "resolves OUTSIDE this run's own scanned root - a declared reactor "
+                        "member this run cannot see at all",
+                    ))
                     continue
                 if any(
                     resolved == excluded_root or resolved.startswith(excluded_root + "/")
@@ -878,6 +944,10 @@ def run_scan(
                         f"({resolved!r}) resolves into a region this run excluded outright - "
                         "positive evidence the excluded region holds real, first-party source, "
                         "not third-party build output",
+                    ))
+                    reactor_rule_suppression_causes.append((
+                        pom_path, module_path, resolved,
+                        "resolves into a region this run excluded outright",
                     ))
                 elif not (root / resolved).is_dir():
                     # FIX ROUND 35 (F3 MAJOR): a <module> pointing at a
@@ -892,6 +962,11 @@ def run_scan(
                         f"this pom declares <module>{module_path}</module>, whose own path "
                         f"({resolved!r}) does not exist as a directory in this scan at all - "
                         "a stale or broken reactor declaration",
+                    ))
+                    reactor_rule_suppression_causes.append((
+                        pom_path, module_path, resolved,
+                        "does not exist as a directory in this scan at all - a stale or "
+                        "broken reactor declaration",
                     ))
         # FIX ROUND 20 (sixteenth cold read, M1+M2 MAJOR, wrong-data -
         # THE POISON RULE): retires the round-16 string-matching
@@ -967,20 +1042,37 @@ def run_scan(
             )
             for p in binary_excluded_code_bearing_problems
         ] + [
+            # FIX ROUND 36 (thirtieth cold read, F1 BLOCKER, wrong-data):
+            # this used to be ONE fixed literal ("resolves into an
+            # excluded region") emitted for all three reactor-rule
+            # triggers - true only for module_directory_excluded, FALSE
+            # for module_outside_scan_root/module_directory_missing
+            # (measured: no excluded region exists in either run at all).
+            # Per-trigger truthful cause now, plus the module's own path
+            # (`module_path`) as the distinguishing datum - the same
+            # datum that keeps this record's own problem_id unique when
+            # one pom declares more than one bad <module> entry (F2).
             _problem_record(
-                "externality_suppressed", p["path"],
-                "this pom's own declared <module> resolves into an excluded region - every "
-                "external-registry-miss import in this run resolves unresolved rather than a "
-                "confident external claim because of it",
+                "externality_suppressed", pom_path,
+                f"this pom declares <module>{module_path}</module>, whose own path "
+                f"({resolved!r}) {cause} - every external-registry-miss import in this run "
+                "resolves unresolved rather than a confident external claim because of it",
             )
-            for p in reactor_rule_problems
+            for pom_path, module_path, resolved, cause in reactor_rule_suppression_causes
         ] + [
+            # FIX ROUND 36 (F2 MAJOR, part b): the identical shape is
+            # reachable here too - a pom with BOTH its own groupId AND
+            # its <parent> groupId undecodable emits two coordinate_
+            # value_unrecoverable WorkerProblems for the SAME relative_
+            # path; a fixed detail here would collide on problem_id the
+            # same way the reactor case did. `p.detail` already embeds
+            # the distinguishing "declared at line N" - reused verbatim
+            # rather than re-deriving it, so the two can never drift.
             _problem_record(
                 "externality_suppressed", p.relative_path,
-                "this pom's own project-level coordinate contains XML constructs this "
-                "producer does not decode - every external-registry-miss import in this "
-                "run resolves unresolved rather than a confident external claim because "
-                "of it",
+                f"this pom's own project-level coordinate is unrecoverable ({p.detail}) - "
+                "every external-registry-miss import in this run resolves unresolved rather "
+                "than a confident external claim because of it",
             )
             for p in coordinate_unrecoverable_problems
         ]
@@ -1172,6 +1264,24 @@ def run_scan(
         ] + duplicate_qualified_name_problems + binary_excluded_code_bearing_problems + (
             binary_excluded_root_sniffed_xml_problems) + reactor_rule_problems + (
             externality_suppressed_problems) + forced_lock_recovery_problems
+        # FIX ROUND 36 (thirtieth cold read, F2 MAJOR, part (c)): refuse
+        # to publish if any problem_id's own repeated occurrences are NOT
+        # byte-identical (a genuine stable-ID corruption - see
+        # _problem_id_collisions's own docstring); otherwise coalesce any
+        # byte-identical duplicates into one record each, so problem_
+        # count/record_count never overstate the number of DISTINCT
+        # problems this run actually found.
+        _problem_id_collisions_found = _problem_id_collisions(problems)
+        if _problem_id_collisions_found:
+            _shown = _problem_id_collisions_found[:5]
+            _more = len(_problem_id_collisions_found) - len(_shown)
+            raise ComprehensionError(
+                f"refusing to publish: {len(_problem_id_collisions_found)} problem_id(s) are "
+                "shared by records with different content (a stable-ID corruption, never "
+                f"silently published): {', '.join(_shown)}"
+                + (f", ...and {_more} more" if _more else "")
+            )
+        problems = _coalesce_byte_identical_problems(problems)
         # FIX ROUND 14b (reviewer-3's ratified CR10-5 split): a worker
         # problem's own `degrades_run` (worker.py) distinguishes
         # "recorded, visible" from "the run's status also degrades over
@@ -2381,10 +2491,26 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
     # reader would have to separately discover.
     _path_violations = _module_path_confinement_violations(
         records["modules"] if records else [])
+    # FIX ROUND 36 (thirtieth cold read, F2 MAJOR, part (c)): the SAME
+    # problem_id-collision sweep publish time now refuses on (run_scan,
+    # above) - shared here so a run published BEFORE this check existed,
+    # or corrupted by some other path, is still caught by `validate`
+    # rather than silently reporting valid:true.
+    _problem_id_collision_ids = _problem_id_collisions(records["problems"] if records else [])
     dangling_detail = _dangling_reference_detail(_dangling_categories)
-    invalid = any(ids for _, ids in _dangling_categories) or bool(_path_violations)
+    invalid = (
+        any(ids for _, ids in _dangling_categories)
+        or bool(_path_violations)
+        or bool(_problem_id_collision_ids)
+    )
+    _problem_id_collision_detail = (
+        f"{len(_problem_id_collision_ids)} problem_id(s) shared by non-identical records"
+        if _problem_id_collision_ids else None
+    )
     invalid_detail = " and ".join(
-        part for part in (dangling_detail, "; ".join(_path_violations) or None) if part
+        part for part in (
+            dangling_detail, "; ".join(_path_violations) or None, _problem_id_collision_detail,
+        ) if part
     )
     return {
         "scan_id": scan_id,
