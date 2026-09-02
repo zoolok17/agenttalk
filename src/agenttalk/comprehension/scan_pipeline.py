@@ -1312,13 +1312,22 @@ def run_scan(
             _problem_record(
                 "case_collision", second, bounded_detail(f"case-folds identically to {first!r}"))
             if is_pure_case_fold_collision(first, second) else
+            # FIX ROUND 37 (thirty-first cold read, F6 LOW, wrong-data):
+            # this template was measured well over MAX_PROBLEM_DETAIL_
+            # LENGTH (200) by construction, before even adding a real
+            # path - every instance published a silently mid-word-
+            # mangled fragment (bounded_detail's own prior lack of a
+            # truncation marker made this invisible). Shortened below
+            # the bound for an ordinary path; bounded_detail's own new
+            # visible marker covers a pathologically long one. A
+            # discriminator lost past the bound would also defeat
+            # detail-based uniqueness - one more argument for F1's own
+            # id-level fix this round already lands.
             _problem_record(
                 "unicode_normalization_collision", second, bounded_detail(
-                    f"collides with {first!r} once Unicode-normalized (NFC) and case-folded, "
-                    "but not by a bare case-fold alone - a Unicode canonical-equivalence "
-                    "difference (e.g. a precomposed accented character versus its decomposed "
-                    "combining-mark form) a consumer's own filesystem/normalizer may resolve "
-                    "to either spelling"))
+                    f"collides with {first!r} once NFC-normalized and case-folded, not by a "
+                    "bare case-fold alone - a Unicode canonical-equivalence difference (e.g. "
+                    "precomposed vs. decomposed accents)"))
             for first, second in case_collisions
         ] + duplicate_qualified_name_problems + binary_excluded_code_bearing_problems + (
             binary_excluded_root_sniffed_xml_problems) + reactor_rule_problems + (

@@ -44,8 +44,17 @@ def bounded_detail(text: str) -> str:
     parse-failure message, or an :class:`EnvelopeError`'s message) before
     it is persisted - defense in depth against an unbounded exception
     message of any origin, current or future, ballooning a problem
-    record."""
-    return text[:MAX_PROBLEM_DETAIL_LENGTH]
+    record.
+
+    FIX ROUND 37 (thirty-first cold read, F6 LOW, wrong-data): this used
+    to slice at exactly ``MAX_PROBLEM_DETAIL_LENGTH`` with NO marker -
+    silently truncating mid-word, indistinguishable from a detail that
+    genuinely ends there. The same visible-truncation marker
+    ``adapters.java._bounded_route_target`` already establishes for the
+    identical shape - a truncated detail now says so."""
+    if len(text) <= MAX_PROBLEM_DETAIL_LENGTH:
+        return text
+    return text[:MAX_PROBLEM_DETAIL_LENGTH] + "...(truncated)"
 
 
 class EnvelopeError(ComprehensionError):

@@ -1206,6 +1206,15 @@ def test_run_scan_reports_a_unicode_normalization_collision_not_a_false_case_col
     assert len(collisions) == 1
     assert collisions[0]["path"] == f"src/main/java/p/{nfd_name}"
     assert not any(p["reason_code"] == "case_collision" for p in problems_doc["problems"])
+    # FIX ROUND 37 (thirty-first cold read, F6 LOW, wrong-data): this
+    # template was measured well over MAX_PROBLEM_DETAIL_LENGTH (200) by
+    # construction, before even adding a real path - every instance
+    # published a silently mid-word-mangled fragment. Shortened; for an
+    # ordinary path like this one, the detail must be whole, never
+    # truncated at all (bounded_detail's own new marker covers only the
+    # pathological case, not the common one).
+    assert not collisions[0]["detail"].endswith("...(truncated)")
+    assert collisions[0]["detail"].endswith("decomposed accents)")
 
     scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
     assert "unicode_normalization_collision" in scan_doc["degraded_by"]
