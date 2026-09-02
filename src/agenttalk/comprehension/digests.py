@@ -194,15 +194,43 @@ def conflict_id(*, conflict_kind: str, anchor: str, claim_digests: list[str]) ->
     )
 
 
-def problem_id(*, reason_code: str, path: str | None, detail: str) -> str:
+def problem_id(
+    *, reason_code: str, path: str | None, detail: str, qualified_name: str | None = None,
+) -> str:
     """N3 (third cold read, fix round 5): DESIGN-55-comprehension-plane.md's
     ``problems.json`` section: "Each record has a stable ID and reason
     code, severity, producers, optional relative path and line, and a
     generated message." A stable ID over the record's own identifying
     fields, the same domain-separated-hash pattern every other artifact's
-    stable ID already uses here."""
+    stable ID already uses here.
+
+    FIX ROUND 37 (thirty-first cold read, F1 BLOCKER - availability,
+    lead's own override of round 36's per-site preference, ratified or
+    overturned by reviewer-3): ``qualified_name`` was NOT a hash input -
+    round 36b fixed two JAX-RS class-closer sites whose own distinguishing
+    datum (the class) sat BESIDE the detail rather than in it, but the
+    reader's own AST sweep found NINETEEN more emitters carrying the same
+    coupling, all keyed on nothing sharper than a source LINE - two
+    same-kind declarations sharing one line (an ordinary, minified/
+    one-line web.xml with two ``<listener>`` elements) collide and the
+    round-36 collision detector correctly, but catastrophically, bricks
+    the whole scan. Per-site detail edits are the enumeration antipattern
+    this arc keeps re-learning (19 sites today, unknown emitters
+    tomorrow); ``qualified_name`` closes the class structurally, at the
+    one chokepoint every problem record already passes through to get an
+    id. ``None`` hashes as the empty string, distinct from any real
+    qualified name - a change from unattributed to attributed (or vice
+    versa) on an otherwise-identical record is itself a real content
+    change, correctly a new id, never a collision. Round 36b's own
+    "details carry their own distinguishing datum" rule stays in force as
+    a readability SHOULD for the reactor/closer sites already updated -
+    this is additive, not a reason to revert those."""
     return _domain_separated_id(
-        _PROBLEM_ID_DOMAIN, {"reason_code": reason_code, "path": path, "detail": detail},
+        _PROBLEM_ID_DOMAIN,
+        {
+            "reason_code": reason_code, "path": path, "detail": detail,
+            "qualified_name": qualified_name or "",
+        },
     )
 
 

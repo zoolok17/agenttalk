@@ -316,7 +316,13 @@ def _problem_record(
     join the problem back to the two (or more) ``modules.json`` units
     that DO share one. Same absent-not-null idiom as ``qualified_name``."""
     record = {
-        "problem_id": digests.problem_id(reason_code=reason_code, path=path, detail=detail),
+        # FIX ROUND 37 (thirty-first cold read, F1 BLOCKER - availability):
+        # qualified_name now feeds the id too - see digests.problem_id's
+        # own docstring for why (round 36's collision detector bricked a
+        # scan on two same-kind, same-line declarations at 19 sites whose
+        # own distinguishing datum sat here, never in the hashed detail).
+        "problem_id": digests.problem_id(
+            reason_code=reason_code, path=path, detail=detail, qualified_name=qualified_name),
         "reason_code": reason_code,
         "severity": _PROBLEM_SEVERITY_BY_REASON_CODE.get(reason_code, _DEFAULT_PROBLEM_SEVERITY),
         "path": path,

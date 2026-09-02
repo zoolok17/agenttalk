@@ -3666,6 +3666,104 @@ def test_run_scan_two_zero_route_jax_rs_classes_in_one_file_does_not_brick_the_s
     assert len({p["problem_id"] for p in shape_problems}) == 2
 
 
+def test_run_scan_two_listeners_on_one_minified_web_xml_line_does_not_brick_the_scan(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 37 (thirty-first cold read, F1 BLOCKER - availability,
+    .cr31-listener verbatim): round 36b fixed the two JAX-RS closer
+    sites, but the reader's own AST sweep found NINETEEN more emitters
+    whose detail's only discriminator is {line} while the true
+    distinguishing datum (the class) sits beside it in qualified_name.
+    Any two same-kind declarations sharing ONE SOURCE LINE - a minified/
+    one-line web.xml with two <listener> elements, utterly ordinary
+    Spring estate output - collided and bricked the scan entirely.
+    Fixed structurally at digests.problem_id itself (qualified_name now
+    an input) rather than per-site."""
+    import json
+
+    (java_repo / "src" / "main" / "webapp" / "WEB-INF").mkdir(parents=True)
+    (java_repo / "src" / "main" / "webapp" / "WEB-INF" / "web.xml").write_text(
+        '<web-app>'
+        '<listener><listener-class>p.FooListener</listener-class></listener>'
+        '<listener><listener-class>p.BarListener</listener-class></listener>'
+        '</web-app>\n',
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    listener_problems = [
+        p for p in problems_doc["problems"]
+        if p["reason_code"] == "unsupported_entry_point_shape"
+        and p.get("qualified_name") in {"p.FooListener", "p.BarListener"}]
+    assert {p["qualified_name"] for p in listener_problems} == {"p.FooListener", "p.BarListener"}
+    assert len({p["problem_id"] for p in listener_problems}) == 2
+
+
+def test_run_scan_two_startup_only_servlets_on_one_line_does_not_brick_the_scan(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 37 (F1 BLOCKER - availability, .cr31-startup2 verbatim):
+    the identical coupling defect at the @WebServlet startup-only-
+    registration site (no value/urlPatterns attribute at all) - two
+    startup-only servlet classes declared on ONE source line share an
+    identical line-only detail, previously colliding on problem_id."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "p").mkdir(parents=True, exist_ok=True)
+    (java_repo / "src" / "main" / "java" / "p" / "Startups.java").write_text(
+        "package p;\n"
+        "import javax.servlet.annotation.WebServlet;\n"
+        '@WebServlet(name = "foo") class FooStartup {} '
+        '@WebServlet(name = "bar") class BarStartup {}\n',
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    startup_problems = [
+        p for p in problems_doc["problems"]
+        if p["reason_code"] == "unsupported_entry_point_shape"
+        and p.get("qualified_name") in {"p.FooStartup", "p.BarStartup"}]
+    assert {p["qualified_name"] for p in startup_problems} == {"p.FooStartup", "p.BarStartup"}
+    assert len({p["problem_id"] for p in startup_problems}) == 2
+
+
+def test_run_scan_two_scheduled_methods_on_one_line_in_different_classes_does_not_brick(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 37 (F1 BLOCKER - availability, .cr31-collide verbatim):
+    the identical coupling defect in the _UNENROLLED_ENTRY_POINT_
+    FAMILIES class-closer loop (@Scheduled/@KafkaListener/...) - two
+    @Scheduled methods in two DIFFERENT classes, declared on ONE source
+    line, share an identical line-only detail, previously colliding on
+    problem_id."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "p").mkdir(parents=True, exist_ok=True)
+    (java_repo / "src" / "main" / "java" / "p" / "Jobs.java").write_text(
+        "package p;\n"
+        "class FooJob { @Scheduled void run() {} } "
+        "class BarJob { @Scheduled void run() {} }\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    scheduled_problems = [
+        p for p in problems_doc["problems"]
+        if p["reason_code"] == "unsupported_entry_point_shape"
+        and p.get("qualified_name") in {"p.FooJob", "p.BarJob"}]
+    assert {p["qualified_name"] for p in scheduled_problems} == {"p.FooJob", "p.BarJob"}
+    assert len({p["problem_id"] for p in scheduled_problems}) == 2
+
+
 def test_run_scan_an_encoding_undecodable_root_sniffed_xml_publishes_no_classification(
     java_repo: Path,
 ) -> None:

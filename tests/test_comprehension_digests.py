@@ -258,3 +258,35 @@ def test_problem_id_differs_by_reason_code_path_or_detail() -> None:
     assert dg.problem_id(reason_code="resource_limit", path="p/Foo.java", detail="x") != base
     assert dg.problem_id(reason_code="parse_failed", path="p/Bar.java", detail="x") != base
     assert dg.problem_id(reason_code="parse_failed", path="p/Foo.java", detail="y") != base
+
+
+def test_problem_id_differs_by_qualified_name() -> None:
+    """FIX ROUND 37 (thirty-first cold read, F1 BLOCKER - availability):
+    qualified_name now feeds the hash too - two records sharing an
+    identical (reason_code, path, detail) but naming a DIFFERENT class
+    must publish different ids; this is the structural fix for the 19
+    coupling sites the reader's own AST sweep found (a source-line-only
+    discriminator collides when two same-kind declarations share one
+    line - an ordinary minified/one-line web.xml with two <listener>
+    elements, for instance)."""
+    base = dg.problem_id(
+        reason_code="unsupported_entry_point_shape", path="web.xml", detail="x",
+        qualified_name="p.FooListener")
+    other_class = dg.problem_id(
+        reason_code="unsupported_entry_point_shape", path="web.xml", detail="x",
+        qualified_name="p.BarListener")
+    unattributed = dg.problem_id(
+        reason_code="unsupported_entry_point_shape", path="web.xml", detail="x")
+    assert other_class != base
+    assert unattributed != base
+    assert unattributed != other_class
+
+
+def test_problem_id_unattributed_is_stable_and_distinct_from_a_literal_empty_name() -> None:
+    """None (never attributed) hashes as the empty string, deterministic
+    across calls, and distinct in EFFECT from a real qualified_name -
+    the empty-string encoding is an internal implementation choice, not
+    a claim that "" is a legitimate qualified name."""
+    a = dg.problem_id(reason_code="parse_failed", path="p/Foo.java", detail="x")
+    b = dg.problem_id(reason_code="parse_failed", path="p/Foo.java", detail="x", qualified_name=None)
+    assert a == b
