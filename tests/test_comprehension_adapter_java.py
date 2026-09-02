@@ -3800,6 +3800,33 @@ public class ItemResource {
     assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
 
 
+def test_jax_rs_path_with_no_verb_marker_and_no_method_level_path_is_a_confident_negative():
+    """FIX ROUND 36 (thirtieth cold read, F3 MAJOR, wrong-data,
+    NoMethodPath verbatim): the round-17b class-closer above used to
+    fire for EVERY zero-route @Path class, asserting "JAX-RS's own
+    verb-only method idiom ... is not recognized" as the cause even for
+    a class with ZERO verb annotations and zero handler methods at all
+    (an abstract/base/locator-holder class - a genuine JAX-RS sub-
+    resource-locator possibility this producer cannot see through
+    either way) - a fabricated cause, degrading a run where nothing was
+    actually missed. This class-level @Path composes to nothing
+    recognizable and has no verb marker anywhere in it either - the
+    confident negative is correct here: no entry point, no problem."""
+    src = """
+package p;
+
+@Path("/locator")
+public class LocatorResource {
+    public Object delegate() {
+        return null;
+    }
+}
+"""
+    result = java.parse_java_source("LocatorResource.java", src)
+    assert not any(e.kind == "http_route" for e in result.entry_points)
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+
+
 def test_a_mixed_jax_rs_class_gets_the_class_closer_for_its_uncomposed_verb_method():
     """FIX ROUND 18 (fourteenth cold read, F2 MAJOR, wrong-data): the
     reader's own repro - the DOMINANT real REST shape, a collection GET

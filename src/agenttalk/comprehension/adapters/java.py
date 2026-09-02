@@ -2747,25 +2747,6 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                 name=path, line=line, evidence_class="declared",
             ))
 
-    # FIX ROUND 17b (reviewer-3's rejection of round 17, THE MAJOR): a
-    # class carrying a recognized @Path from which NO route ever
-    # composed (JAX-RS's own verb-only method idiom - @GET/@POST with no
-    # method-level @Path of its own, the DOMINANT real-world JAX-RS
-    # shape - is not recognized, the named limit beside
-    # _ROUTE_ANNOTATIONS) gets the SAME class-closer treatment @WebMethod
-    # already gets below - honest unknown, never the confident negative
-    # a class that genuinely serves no route at all correctly gets.
-    for jax_rs_class in sorted(jax_rs_path_classes - classes_with_route_entry_points):
-        problems.append(JavaAdapterProblem(
-            reason_code="unsupported_entry_point_shape",
-            detail="a class-level @Path is declared, but no route ever composed against it - "
-                   "JAX-RS's own verb-only method idiom (@GET/@POST with no method-level "
-                   "@Path of its own) is not recognized (see the named limit beside "
-                   "_ROUTE_ANNOTATIONS) - no entry point published, but not confidently "
-                   "absent either",
-            qualified_name=jax_rs_class,
-        ))
-
     # FIX ROUND 18 (fourteenth cold read, F2 MAJOR, wrong-data): a MIXED
     # @Path-carrying class - some methods compose a route of their own,
     # others rely SOLELY on a bare JAX-RS verb designator (@GET/@POST/
@@ -2773,13 +2754,22 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     # real REST shape (a collection GET plus an item GET) - used to
     # publish entry_points_mapped SATISFIED even though the verb-only
     # routes are genuinely missing from the inventory: the round-17b
-    # class-closer above only ever fires when a class produces ZERO
+    # class-closer below only ever fired when a class produces ZERO
     # routes at all, never one that produced SOME. A verb marker's own
     # CONTIGUOUS annotation stack (textually adjacent annotations, in
     # either order, tolerating an intervening unrelated annotation like
     # @Produces - never a full method-signature extraction, never a
     # route composed off it) is checked for a sibling @Path; a marker
     # with none anywhere in its stack is orphaned.
+    #
+    # FIX ROUND 36 (thirtieth cold read, F3 MAJOR, wrong-data): computed
+    # BEFORE the round-17b zero-route loop below now (previously after,
+    # duplicating none of this - just reordered) so that loop can
+    # consult it: a class-level @Path from which zero routes composed
+    # must only claim "the verb-only idiom is not recognized" when a
+    # verb marker actually was seen in it - the branch that PROVES that
+    # cause. See the round-17b loop's own comment for the fabricated-
+    # cause case this reordering closes.
     jax_rs_orphaned_verb_marker_classes: set[str] = set()
     if jax_rs_path_classes:
         stack_id_by_annotation_start: dict[int, int] = {}
@@ -2820,6 +2810,46 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             stack_id = stack_id_by_annotation_start.get(verb_match.start())
             if stack_id is not None and not stack_has_path.get(stack_id, False):
                 jax_rs_orphaned_verb_marker_classes.add(enclosing)
+
+    # FIX ROUND 17b (reviewer-3's rejection of round 17, THE MAJOR): a
+    # class carrying a recognized @Path from which NO route ever
+    # composed (JAX-RS's own verb-only method idiom - @GET/@POST with no
+    # method-level @Path of its own, the DOMINANT real-world JAX-RS
+    # shape - is not recognized, the named limit beside
+    # _ROUTE_ANNOTATIONS) gets the SAME class-closer treatment @WebMethod
+    # already gets below - honest unknown, never the confident negative
+    # a class that genuinely serves no route at all correctly gets.
+    #
+    # FIX ROUND 36 (thirtieth cold read, F3 MAJOR, wrong-data): this used
+    # to fire for EVERY zero-route @Path class, asserting the verb-only
+    # idiom as the cause even when NO verb marker was ever seen in the
+    # class at all (measured: an abstract/base/locator-holder class with
+    # zero verb annotations and zero handler methods) - a fabricated
+    # cause plus an unwarranted degraded run for a class where nothing
+    # was actually missed. Narrowed to the classes `jax_rs_orphaned_verb_
+    # marker_classes` above actually proves this cause for; a zero-route
+    # @Path class with NO verb marker at all gets no problem here - the
+    # confident negative IS correct for that class (a class-level @Path
+    # composing to nothing recognizable, with no verb-only idiom either,
+    # is a genuine "no route here", not a masked gap - the JAX-RS sub-
+    # resource-locator possibility this producer cannot see through
+    # either way is no more addressable by naming it than by staying
+    # silent, and this producer's own bar is never guessing a cause it
+    # cannot prove).
+    for jax_rs_class in sorted(
+        (jax_rs_path_classes - classes_with_route_entry_points)
+        & jax_rs_orphaned_verb_marker_classes
+    ):
+        problems.append(JavaAdapterProblem(
+            reason_code="unsupported_entry_point_shape",
+            detail="a class-level @Path is declared, but no route ever composed against it - "
+                   "JAX-RS's own verb-only method idiom (@GET/@POST with no method-level "
+                   "@Path of its own) is not recognized (see the named limit beside "
+                   "_ROUTE_ANNOTATIONS) - no entry point published, but not confidently "
+                   "absent either",
+            qualified_name=jax_rs_class,
+        ))
+
     for jax_rs_class in sorted(jax_rs_orphaned_verb_marker_classes & classes_with_route_entry_points):
         problems.append(JavaAdapterProblem(
             reason_code="unsupported_entry_point_shape",
