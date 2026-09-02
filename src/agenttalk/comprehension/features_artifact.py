@@ -161,10 +161,16 @@ class FeatureRecord:
         }
 
 
-def _producer(source_digest: str | None) -> dict[str, Any]:
+def _producer(source_digest: str | None, *, basis: str) -> dict[str, Any]:
+    """FIX ROUND 37 (thirty-first cold read, F5 MAJOR, wrong-data):
+    ``basis`` used to be the hardcoded literal ``"extracted"`` here,
+    regardless of the SAME record's own ``evidence_class`` field - see
+    dependencies_artifact.py's own identical fix and docstring for the
+    measured contradiction this closes. The caller passes its own
+    claim's ``evidence_class`` straight through."""
     return {
         "producer": java_adapter.ADAPTER_NAME, "producer_version": java_adapter.ADAPTER_VERSION,
-        "rule_version": java_adapter.RULE_VERSION, "basis": "extracted",
+        "rule_version": java_adapter.RULE_VERSION, "basis": basis,
         "source_digest": source_digest,
     }
 
@@ -258,7 +264,7 @@ def build_features(
             entry_point_id = digests.entry_point_id(
                 kind=claim.kind, owning_unit_id=owning_unit_id, name=claim.name,
             )
-            producer = _producer(file_digests.get(path))
+            producer = _producer(file_digests.get(path), basis=claim.evidence_class)
             existing = entry_points_by_id.get(entry_point_id)
             if existing is None:
                 entry_points_by_id[entry_point_id] = EntryPointRecord(
@@ -284,7 +290,13 @@ def build_features(
         features.append(FeatureRecord(
             feature_id=feature_id, label=label, state=state, origin="detected",
             unit_ids=[owning_unit_id], entry_point_ids=list(entry_points_by_id),
-            producers=[_producer(file_digests.get(owner_path))],
+            # FIX ROUND 37 (F5 MAJOR): a feature can aggregate more than
+            # one entry-point claim (M-5's own coalesce case) with
+            # potentially different evidence classes - the SAME "first
+            # claim is representative" convention this function already
+            # uses for the feature's own label is reused here too, never
+            # a second, independently-decided representative.
+            producers=[_producer(file_digests.get(owner_path), basis=first_claim.evidence_class)],
         ))
 
     return entry_point_records, features

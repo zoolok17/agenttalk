@@ -68,9 +68,18 @@ def test_web_xml_entry_point_gets_a_clean_label_not_the_file_extension():
     results = {
         "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
     }
-    _entry_point_records, features = fa.build_features(results)
+    entry_point_records, features = fa.build_features(results)
     assert len(features) == 1
     assert features[0].label == "legacy"
+    # FIX ROUND 37 (thirty-first cold read, F5 MAJOR, wrong-data,
+    # declared control): a web.xml servlet-mapping entry point's own
+    # evidence_class is "declared" (an explicit descriptor declaration,
+    # no source-code inference involved) - producers[].basis must match
+    # it, never the hardcoded "extracted" every producer used to publish
+    # regardless.
+    assert entry_point_records[0].evidence_class == "declared"
+    assert entry_point_records[0].producers[0]["basis"] == "declared"
+    assert features[0].producers[0]["basis"] == "declared"
 
 
 def test_web_xml_entry_point_owner_is_the_real_servlet_class_when_declared():
@@ -237,6 +246,12 @@ def test_duplicate_entry_point_claims_coalesce_to_one_record_with_merged_produce
         {"App.java": result}, file_digests={"App.java": "deadbeef"})
     assert len(entry_points) == 1
     assert len(features[0].entry_point_ids) == 1
+    # FIX ROUND 37 (thirty-first cold read, F5 MAJOR, wrong-data): this
+    # claim's own evidence_class is "extracted" - producers[].basis must
+    # match it exactly, never a hardcoded literal that happens to agree
+    # here but not for a "declared"/"inferred" claim elsewhere.
+    assert entry_points[0].producers[0]["basis"] == "extracted"
+    assert features[0].producers[0]["basis"] == "extracted"
     assert len(entry_points[0].producers) == 1
 
 

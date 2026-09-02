@@ -25,6 +25,13 @@ def test_source_digest_is_populated_from_file_digests():
     results = {"p/Foo.java": _parse("p/Foo.java", "package p;\nimport java.util.List;\nclass Foo {}\n")}
     records = da.build_dependencies(results, file_digests={"p/Foo.java": "deadbeef"})
     assert records[0].producers[0]["source_digest"] == "deadbeef"
+    # FIX ROUND 37 (thirty-first cold read, F5 MAJOR, wrong-data,
+    # extracted control): a plain import edge's own evidence_class is
+    # "extracted" (real syntactic evidence, no inference/declaration
+    # involved) - producers[].basis must match it exactly, never a
+    # hardcoded literal that happens to agree here but not elsewhere.
+    assert records[0].evidence_class == "extracted"
+    assert records[0].producers[0]["basis"] == "extracted"
 
 
 def test_source_digest_defaults_to_none_without_file_digests():
@@ -639,6 +646,12 @@ def test_test_edge_resolves_to_the_wrong_convention_guess_but_never_satisfies_re
     test_edge = next(r for r in records if r.relation == "test")
     assert test_edge.resolution_state == "resolved"
     assert test_edge.evidence_class == "inferred"
+    # FIX ROUND 37 (thirty-first cold read, F5 MAJOR, wrong-data):
+    # producers[].basis used to be the hardcoded literal "extracted"
+    # regardless of this SAME record's own evidence_class - two
+    # contradictory provenance claims about the identical edge. basis
+    # must match evidence_class exactly.
+    assert test_edge.producers[0]["basis"] == "inferred"
     integration_unit_id = da._java_component_unit_id("com/acme/Integration.java", "com.acme.Integration")
     assert test_edge.target_unit_id == integration_unit_id
     # BillingEngine (the class actually exercised, per the reviewer's
@@ -1275,6 +1288,13 @@ def test_build_edges_from_pom_xml_are_attributed_to_the_pom_file():
     assert records[0].target_external == "org.springframework:spring-core"
     assert records[0].from_unit_id == da.digests.unit_id(
         kind="file", paths=["pom.xml"], qualified_name=None)
+    # FIX ROUND 37 (thirty-first cold read, F5 MAJOR, wrong-data,
+    # declared control): a pom <dependency>'s own evidence_class is
+    # "declared" (an explicit build-file declaration, no source-code
+    # inference involved) - producers[].basis must match it, never the
+    # hardcoded "extracted" every producer used to publish regardless.
+    assert records[0].evidence_class == "declared"
+    assert records[0].producers[0]["basis"] == "declared"
 
 
 def test_optional_and_scope_test_thread_through_to_the_dependency_record():

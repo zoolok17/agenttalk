@@ -416,10 +416,22 @@ def _resolve_internal_candidate_chain(
     return state, None, target, None, candidates
 
 
-def _producer(*, name: str, version: int, rule_version: int, source_digest: str | None) -> dict[str, Any]:
+def _producer(
+    *, name: str, version: int, rule_version: int, source_digest: str | None, basis: str,
+) -> dict[str, Any]:
+    """FIX ROUND 37 (thirty-first cold read, F5 MAJOR, wrong-data):
+    ``basis`` used to be the hardcoded literal ``"extracted"`` here,
+    regardless of the SAME record's own ``evidence_class`` field - the
+    design defines ``basis`` as extracted-vs-inferred-vs-declared, and
+    ``JavaEdgeClaim.evidence_class`` already carries EXACTLY that same
+    three-way fact for this exact edge (measured: 65 records published
+    ``evidence_class: "declared"``/4 ``"inferred"`` beside a ``basis``
+    claiming ``"extracted"`` - two contradictory provenance claims about
+    the SAME record). The caller passes its own edge's ``evidence_class``
+    straight through - never re-derived, so the two can never drift."""
     return {
         "producer": name, "producer_version": version, "rule_version": rule_version,
-        "basis": "extracted", "source_digest": source_digest,
+        "basis": basis, "source_digest": source_digest,
     }
 
 
@@ -1032,6 +1044,7 @@ def _edge_claim_to_record(
         producers=[_producer(
             name=java_adapter.ADAPTER_NAME, version=java_adapter.ADAPTER_VERSION,
             rule_version=java_adapter.RULE_VERSION, source_digest=source_digest,
+            basis=edge.evidence_class,
         )],
         candidate_unit_ids=candidate_unit_ids,
         externality_suppressed=externality_suppressed,
