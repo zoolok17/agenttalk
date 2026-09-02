@@ -160,6 +160,12 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     # whole-file-identity-ambiguity severity, a distinct reason_code
     # since the cause (Unicode canonical equivalence, not case) differs.
     "unicode_normalization_collision": "warning",
+    # FIX ROUND 37 (thirty-first cold read, F2 BLOCKER, wrong-data): the
+    # same whole-file-evidence-gap severity as path_excluded/resource_
+    # limit above - a real, parseable, adapter-handled file this run
+    # nonetheless excluded (its own name collided with the secret-file
+    # pattern set).
+    "secret_pattern_matched_code_bearing_file": "warning",  # nosec B105 - a reason_code string, not a credential
     # BLOCKER 1b (fifth cold read, fix round 8): a .java file whose parse
     # succeeded but extracted zero declared types - closing the zero-
     # extraction evidence hole as a class (worker.py).

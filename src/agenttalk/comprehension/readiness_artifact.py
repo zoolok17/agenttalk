@@ -349,6 +349,11 @@ _READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
     # identical whole-file-identity-ambiguity treatment, since either
     # unit's own identity is equally unproven by this run.
     "unicode_normalization_collision": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
+    # FIX ROUND 37 (thirty-first cold read, F2 BLOCKER, wrong-data): the
+    # same whole-file evidence gap as path_excluded/resource_limit above -
+    # a real, parseable, adapter-handled file this run excluded because
+    # its own name collided with the secret-file pattern set.
+    "secret_pattern_matched_code_bearing_file": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
     "no_types_extracted": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
     # FIX ROUND 20 (sixteenth cold read, M3 MAJOR, wrong-data): these
     # two used to feed NOTHING at all - round 13c's own scoping (away

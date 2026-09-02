@@ -586,6 +586,84 @@ def test_enumerate_scope_does_not_over_exclude_a_plausible_false_positive(tmp_pa
     assert result.exclusions.get("secret", 0) == 0
 
 
+def test_enumerate_scope_no_longer_excludes_secretsjava_as_a_secret(tmp_path: Path) -> None:
+    """FIX ROUND 37 (thirty-first cold read, F2 BLOCKER, wrong-data,
+    .cr31-secretname verbatim): round 35's own ``secrets.*`` GLOB matched
+    case-insensitively on Windows (``fnmatch.fnmatch`` applies
+    ``os.path.normcase``) - so it also matched ``Secrets.java``, a real,
+    parseable, adapter-handled JAVA SOURCE FILE, silently dropping it as
+    category "secret" (its own GET route would vanish, complete/0
+    problems). Narrowed to a closed extension list that never includes
+    ``.java`` at all - this file is no longer excluded, period."""
+    (tmp_path / "Secrets.java").write_bytes(
+        b"package p;\nclass Secrets { void get() {} }\n")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert {f.relative_path for f in result.files} == {"Secrets.java"}
+    assert result.exclusions.get("secret", 0) == 0
+
+
+def test_enumerate_scope_canary_inversion_is_fixed(tmp_path: Path) -> None:
+    """FIX ROUND 37 (F2 BLOCKER, .cr31-canary verbatim): the reader's own
+    measured inversion - the REAL credentials.properties was INCLUDED
+    (not on the closed list) while Secrets.java (not a credential at
+    all) was EXCLUDED, purely because of Windows' own case-insensitive
+    fnmatch. Both directions checked together: the genuine secret-shaped
+    literal stays excluded, the ordinary Java source stays included."""
+    (tmp_path / "Secrets.java").write_bytes(b"package p;\nclass Secrets {}\n")
+    (tmp_path / "credentials").write_bytes(b"user:pass\n")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert {f.relative_path for f in result.files} == {"Secrets.java"}
+    assert result.exclusions.get("secret", 0) == 1
+
+
+def test_matches_any_secret_pattern_is_case_insensitive_on_every_platform() -> None:
+    """FIX ROUND 37 (F2 BLOCKER, part 2 - the case policy; also answers
+    F9's cross-platform-inventory-divergence note): unit-tested directly
+    against the predicate, per this arc's own established discipline for
+    a platform-sensitive detector (round 36's own F4 caveat) - a real
+    filesystem's own case behavior is not something to assert against.
+    Deliberately decided case-insensitive, identically on every platform:
+    an UPPERCASE spelling of a genuine secret-shaped name is exactly as
+    sensitive as its lowercase form."""
+    assert discovery._matches_any_secret_pattern("id_rsa") is True
+    assert discovery._matches_any_secret_pattern("ID_RSA") is True
+    assert discovery._matches_any_secret_pattern("Id_Rsa") is True
+    assert discovery._matches_any_secret_pattern(".env") is True
+    assert discovery._matches_any_secret_pattern(".ENV") is True
+    assert discovery._matches_any_secret_pattern("secrets.yaml") is True
+    assert discovery._matches_any_secret_pattern("SECRETS.YAML") is True
+    assert discovery._matches_any_secret_pattern("Secrets.java") is False
+    assert discovery._matches_any_secret_pattern("SECRETS.JAVA") is False
+
+
+def test_enumerate_scope_records_a_visible_degrading_problem_for_a_calibrated_collision(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 37 (F2 BLOCKER, part 3 - THE CALIBRATION RULE): any
+    secret-pattern hit on a genuinely adapter-handled extension must
+    record a visible, degrading problem instead of a silent exclusion -
+    a defense-in-depth structural rule for whatever FUTURE secret
+    pattern collides with an adapter-handled extension, not only
+    today's ``secrets.*`` shape (already closed off by part 1). Forces
+    the condition directly via a synthetic pattern, the same technique
+    this whole arc already uses to test a structural rule independent
+    of which concrete pattern triggers it."""
+    monkeypatch.setattr(discovery, "_SECRET_FILE_PATTERNS", ("secretcalibration.java",))
+    (tmp_path / "secretcalibration.java").write_bytes(b"package p;\nclass C {}\n")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert result.files == []
+    assert result.exclusions.get("secret", 0) == 1
+    assert result.degraded is True
+    calibration_problems = [
+        p for p in result.problems
+        if p["reason_code"] == "secret_pattern_matched_code_bearing_file"]
+    assert len(calibration_problems) == 1
+    assert calibration_problems[0]["path"] == "secretcalibration.java"
+
+
 def test_enumerate_scope_excludes_binary_content(tmp_path: Path) -> None:
     (tmp_path / "photo.dat").write_bytes(b"\x00\x01\x02binarydata")
     comp_dir = _comprehension_dir(tmp_path)

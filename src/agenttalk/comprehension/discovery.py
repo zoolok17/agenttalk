@@ -351,23 +351,64 @@ def _sits_under_a_recognized_generated_output_position(relative_to_excluded_root
 #: ``secrets.yaml``, and a Spring Boot ``application-secret.properties``)
 #: leaked path+digest the same way round 32's own battery did. ``.pgpass``/
 #: ``.git-credentials``/``.dockercfg``/``.htpasswd``/``.npmrc`` are added
-#: as new literal entries; ``secrets.*`` is added as a GLOB (narrower than
-#: a bare ``*secret*``, matching only a basename that STARTS WITH the
-#: literal "secrets." - "secrets.yaml"/"secrets.json"/"secrets.properties"
-#: all match, but "docs/secrets-rotation-policy.md" does NOT, since it has
-#: no dot immediately after "secrets" - the exact false-positive shape
-#: round 32's own judgment already weighed and rejected a wider glob for);
-#: ``application-secret.properties`` is added as an exact literal, the
-#: same conservative choice round 32 made for the identical-shaped
-#: ``secrets.properties``.
+#: as new literal entries; ``application-secret.properties`` is added as
+#: an exact literal, the same conservative choice round 32 made for the
+#: identical-shaped ``secrets.properties``.
+#: FIX ROUND 37 (thirty-first cold read, F2 BLOCKER, wrong-data): round
+#: 35's own ``secrets.*`` GLOB was measured matching FAR wider than its
+#: own docstring claimed - ``fnmatch.fnmatch`` applies ``os.path.
+#: normcase``, case-INSENSITIVE on Windows, so ``secrets.*`` (meant to
+#: catch ``secrets.yaml``/``secrets.json``/``secrets.properties``) also
+#: matched ``Secrets.java`` - a real, parseable, adapter-handled JAVA
+#: SOURCE FILE, silently dropped as category "secret" (its own GET route
+#: vanished, complete/0 problems - worse than the tier-2 standard, where
+#: an unparseable code file at least degrades VISIBLY). Narrowed from an
+#: open glob to a CLOSED, explicit extension list - every real-world
+#: "secrets.<config-format>" shape this producer has actually measured,
+#: never a bare ``*`` that can suffix-match an arbitrary code extension.
 _SECRET_FILE_PATTERNS = (
     ".env", ".env.*", "*.env", "*.pem", "*.pfx", "*.p12", "*.ppk",
     "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
     "*.key", "*.jks", "*.keystore", "*.p8", ".netrc", "credentials",
-    "secrets.properties",
+    "secrets.properties", "secrets.yaml", "secrets.yml", "secrets.json", "secrets.xml",
     ".pgpass", ".git-credentials", ".dockercfg", ".htpasswd", ".npmrc",
-    "secrets.*", "application-secret.properties",
+    "application-secret.properties",
 )
+#: FIX ROUND 37 (F2 BLOCKER, part 2 - the case policy): ``fnmatch.
+#: fnmatch``'s own case sensitivity is a PLATFORM FACT
+#: (``os.path.normcase``), not a decision this producer ever made - the
+#: SAME pattern set matched case-insensitively on Windows and case-
+#: sensitively on Linux/macOS, an inventory divergence across platforms
+#: for the identical repository and the identical rule set (the reader's
+#: own F9 note). Decided explicitly here, deliberately, the SAME on every
+#: platform: secret-pattern matching is case-INSENSITIVE (a credential
+#: file named ``ID_RSA`` or ``SECRETS.YAML`` is exactly as sensitive as
+#: its lowercase spelling, and the safe direction for a security-relevant
+#: exclusion is to exclude MORE, not fewer, case spellings) - via
+#: ``fnmatch.fnmatchcase`` (never applies any platform normcase) over an
+#: explicit ``casefold()`` of both the name and the pattern, so the
+#: SAME two strings compare identically regardless of which OS is
+#: running this code.
+def _matches_any_secret_pattern(name: str) -> bool:
+    folded = name.casefold()
+    return any(
+        fnmatch.fnmatchcase(folded, pattern.casefold()) for pattern in _SECRET_FILE_PATTERNS
+    )
+
+
+#: FIX ROUND 37 (F2 BLOCKER, part 3 - the calibration rule): kept in
+#: sync by hand with worker.py's own ``_ADAPTER_EXTENSIONS`` (discovery.py
+#: cannot import worker.py - see ``_DEGRADABLE_EXCLUDED_EXTENSIONS``'s own
+#: comment for why). Deliberately NARROWER than that set: genuinely
+#: adapter-PARSED extensions only (this producer actually reads and
+#: extracts from these), not every recognized-but-unmodeled tier-2 shape
+#: - a secret-pattern hit on one of THESE extensions discards real,
+#: parseable inventory the run would otherwise have understood, the
+#: exact "worse than tier-2" shape F2 measured: an unparseable code file
+#: at least degrades visibly; a parseable one must not vanish silently
+#: just because its own name happens to collide with a secret-shaped
+#: pattern.
+_ADAPTER_HANDLED_EXTENSIONS_FOR_SECRET_CALIBRATION = frozenset({".java"})
 #: FIX ROUND 35 (F4 MINOR, completeness): the provisional-set caveat
 #: this closed list has always deserved but never published in-artifact
 #: (declared only in the source comments above) - the same *_CAVEAT
@@ -383,7 +424,15 @@ SECRET_PATTERNS_CAVEAT = (
     "its value - this producer never reads excluded content either way) "
     "are published as an ordinary discovered file, the same safe-"
     "direction-to-be-wrong-in trade every other provisional set in this "
-    "package accepts."
+    "package accepts. Matching is deliberately case-insensitive on every "
+    "platform (a credential file named in any letter case is equally "
+    "sensitive). The OTHER direction also exists and is declared here "
+    "too (FIX ROUND 37, F2 BLOCKER): a real, parseable, adapter-handled "
+    "source file whose OWN name happens to collide with one of these "
+    "patterns is excluded the same as a genuine secret would be, but "
+    "never silently - a secret_pattern_matched_code_bearing_file problem "
+    "is recorded and the run degrades, naming exactly which adapter-"
+    "handled file this exclusion list discarded."
 )
 _BINARY_SNIFF_BYTES = 8192
 _PLATFORM_PROBE_RELATIVE_DIR = f"{RELATIVE_COMPREHENSION_DIR}/.platform-probe"
@@ -699,7 +748,7 @@ def _exclusion_category(name: str, relative_path: str, *, is_dir: bool) -> str |
         ):
             return "generated_or_vendor"
         return None
-    if any(fnmatch.fnmatch(name, pattern) for pattern in _SECRET_FILE_PATTERNS):
+    if _matches_any_secret_pattern(name):
         return "secret"
     return None
 
@@ -1050,6 +1099,29 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
             # A regular file.
             category = _exclusion_category(entry.name, relative, is_dir=False)
             if category is not None:
+                # FIX ROUND 37 (thirty-first cold read, F2 BLOCKER, part
+                # 3 - THE CALIBRATION RULE): a secret-pattern hit on a
+                # genuinely adapter-handled extension discards real,
+                # parseable inventory - worse than the tier-2 standard
+                # (an unparseable code file at least degrades visibly).
+                # Still excluded (safe direction: never read a file this
+                # producer cannot rule out is a real secret), but never
+                # silently - recorded and degrading, naming exactly which
+                # file this exclusion list discarded.
+                if category == "secret" and entry.name.lower().endswith(
+                    tuple(_ADAPTER_HANDLED_EXTENSIONS_FOR_SECRET_CALIBRATION),
+                ):
+                    degraded = True
+                    problems.append({
+                        "reason_code": "secret_pattern_matched_code_bearing_file",
+                        "path": relative,
+                        "detail": f"{entry.name!r} matches this producer's own secret-file "
+                                  "exclusion pattern set, but its extension is genuinely "
+                                  "adapter-handled - excluded the same as a real secret would "
+                                  "be (never read), but never silently: a parseable file this "
+                                  "run could otherwise have understood is missing from the "
+                                  "inventory because of this",
+                    })
                 _record_exclusion(category, relative)
                 continue
             entry_count += 1
