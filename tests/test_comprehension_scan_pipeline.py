@@ -3619,6 +3619,53 @@ def test_run_scan_refuses_to_publish_a_problem_id_collision(
         scan_pipeline.run_scan(java_repo)
 
 
+def test_run_scan_two_zero_route_jax_rs_classes_in_one_file_does_not_brick_the_scan(
+    java_repo: Path,
+) -> None:
+    """MICRO-ROUND 36b (reviewer-3 delta on `0d8d6c9`, THE COUPLING
+    DEFECT - availability regression): the JAX-RS class-closer's own two
+    emitters carried their distinguishing datum (the class) BESIDE the
+    detail (`qualified_name`), not IN it - the two sites round 36's own
+    F1 sweep missed. Round 36's own new problem_id-collision detector
+    then correctly proved two genuinely distinct facts (two different
+    @Path classes in the SAME ordinary, legal .java file) shared one id
+    and hard-refused, converting a reporting gap into an availability
+    bug: the scan bricked entirely (ComprehensionError, no run
+    published) for a shape no existing test exercised. Fixed by naming
+    the class in both closer details - the scan must complete, publish
+    two distinct problems, with two distinct problem_ids."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "p" / "Resources.java").write_text(
+        "package p;\n"
+        "import javax.ws.rs.GET;\n"
+        "import javax.ws.rs.Path;\n"
+        "\n"
+        "@Path(\"/orders\")\n"
+        "class OrderResource {\n"
+        "    @GET\n"
+        "    public void list() {}\n"
+        "}\n"
+        "\n"
+        "@Path(\"/items\")\n"
+        "class ItemResource {\n"
+        "    @GET\n"
+        "    public void list() {}\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    shape_problems = [
+        p for p in problems_doc["problems"]
+        if p["reason_code"] == "unsupported_entry_point_shape"]
+    assert {p.get("qualified_name") for p in shape_problems} == {"p.OrderResource", "p.ItemResource"}
+    assert len({p["problem_id"] for p in shape_problems}) == 2
+
+
 def test_run_scan_an_encoding_undecodable_root_sniffed_xml_publishes_no_classification(
     java_repo: Path,
 ) -> None:

@@ -3781,6 +3781,41 @@ public class OrderResource {
     assert problem.qualified_name == "p.OrderResource"
 
 
+def test_two_zero_route_jax_rs_classes_in_one_file_get_distinct_details():
+    """MICRO-ROUND 36b (reviewer-3 delta on `0d8d6c9`, THE COUPLING
+    DEFECT): `problem_id` hashes (reason_code, path, detail) -
+    `qualified_name` is NOT an input. This loop's own detail never named
+    the class, only the enclosing FILE - two DIFFERENT @Path classes in
+    the SAME file (legal, ordinary Java), both hitting this same
+    zero-route verb-only-idiom branch, produced byte-identical details
+    and therefore one shared problem_id despite being two genuinely
+    distinct facts - round 36's own new collision detector then
+    correctly refused to publish the whole scan. The class name is now
+    IN the detail (the same fix the reactor sites already apply with
+    their own module path), so two classes in one file get two
+    genuinely distinct records."""
+    src = """
+package p;
+
+@Path("/orders")
+class OrderResource {
+    @GET
+    public void list() {}
+}
+
+@Path("/items")
+class ItemResource {
+    @GET
+    public void list() {}
+}
+"""
+    result = java.parse_java_source("Resources.java", src)
+    problems = [p for p in result.problems if p.reason_code == "unsupported_entry_point_shape"]
+    assert {p.qualified_name for p in problems} == {"p.OrderResource", "p.ItemResource"}
+    assert len({p.detail for p in problems}) == 2
+    assert all(p.qualified_name in p.detail for p in problems)
+
+
 def test_jax_rs_path_with_a_real_method_level_route_is_not_flagged_the_class_closer():
     """Companion negative case - the reviewer's own ItemResource row: a
     class-level @Path with a REAL method-level @Path composing against
@@ -3859,6 +3894,41 @@ public class OrderResource {
     assert [r.target for r in routes] == ["GET /orders/{id}"]
     problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
     assert problem.qualified_name == "p.OrderResource"
+
+
+def test_two_mixed_jax_rs_classes_in_one_file_get_distinct_details():
+    """MICRO-ROUND 36b: the identical coupling defect in the MIXED-class
+    closer branch (a class with at least one real composed route PLUS
+    an uncomposed verb-only method elsewhere in it) - same fix, same
+    proof: two classes in one file must publish two distinct records."""
+    src = """
+package p;
+
+@Path("/orders")
+class OrderResource {
+    @GET
+    public void list() {}
+
+    @GET
+    @Path("/{id}")
+    public void get() {}
+}
+
+@Path("/items")
+class ItemResource {
+    @GET
+    public void list() {}
+
+    @GET
+    @Path("/{id}")
+    public void get() {}
+}
+"""
+    result = java.parse_java_source("Resources.java", src)
+    problems = [p for p in result.problems if p.reason_code == "unsupported_entry_point_shape"]
+    assert {p.qualified_name for p in problems} == {"p.OrderResource", "p.ItemResource"}
+    assert len({p.detail for p in problems}) == 2
+    assert all(p.qualified_name in p.detail for p in problems)
 
 
 def test_a_mixed_jax_rs_class_with_an_intervening_annotation_still_composes():

@@ -207,12 +207,28 @@ UNSUPPORTED_INVOKE_SHAPES = ("constructor_call", "instance_qualified_call")
 #: enrolled as a recognized-but-unmodeled shape. The LEAN choice (real
 #: migration-relevant estate a reader needs, not folded under a generic
 #: code): its own named member, with the JSP path itself in the detail.
+#: MICRO-ROUND 36b (reviewer-3 delta on `0d8d6c9`, THE LOCATOR CARRY,
+#: ruled): round 36's own F3 fix correctly gives a class-level `@Path`
+#: with NO verb marker and no method-level `@Path` a confident negative
+#: (no route ever composed against it, genuinely nothing recognizable) -
+#: but a REAL JAX-RS shape can produce exactly that source pattern on
+#: purpose: a sub-resource LOCATOR, a method returning ANOTHER resource
+#: object for the container to keep dispatching into, with no route
+#: annotation of its own to find. This producer cannot see through that
+#: delegation at all (no type resolution) - naming it as a PER-INSTANCE
+#: problem on every bare `@Path` class would dilute the class-closer
+#: mechanism onto classes that are genuinely, confidently empty (the
+#: DOMINANT case F3 correctly leaves silent), the same over-broadcast
+#: risk `UNSUPPORTED_RELATIONS`'s own dilution rule already declines
+#: elsewhere. Declared instead, once, as a recognized-but-unmodeled
+#: COMPOSITION shape this adapter version cannot resolve at all - the
+#: STATIC capability declaration, never a per-run instance.
 UNSUPPORTED_ENTRY_POINT_SHAPES = (
     "jax_ws_web_method", "jax_rs_verb_only_method",
     "spring_scheduled", "kafka_listener", "jms_message_driven",
     "ejb_remote_component", "websocket_server_endpoint",
     "web_xml_listener", "servlet_name_scoped_filter", "startup_only_servlet",
-    "jsp_file_servlet",
+    "jsp_file_servlet", "jax_rs_sub_resource_locator",
 )
 
 #: FIX ROUND 21c (reviewer-3's re-delta, THE ASK - second instance, closing
@@ -2855,23 +2871,40 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         (jax_rs_path_classes - classes_with_route_entry_points)
         & jax_rs_orphaned_verb_marker_classes
     ):
+        # MICRO-ROUND 36b (reviewer-3 delta on `0d8d6c9`, THE COUPLING
+        # DEFECT): `problem_id` hashes (reason_code, path, detail) -
+        # `qualified_name` is NOT an input. This loop's own detail never
+        # named the class, only `path` (the FILE) - two DIFFERENT
+        # @Path classes in the SAME file (legal, ordinary Java) hit this
+        # SAME loop with an IDENTICAL detail, so round 36's own new
+        # collision detector correctly proved two genuinely distinct
+        # facts shared one id and hard-refused - turning a reporting gap
+        # (round 36's own R1 sweep missed these two sites) into an
+        # availability bug (the scan bricked entirely). Per the SAME
+        # invariant the reactor sites already satisfy with the module
+        # path: the class name is now IN the detail, the distinguishing
+        # datum this site always had BESIDE the detail (`qualified_name`)
+        # but never inside it.
         problems.append(JavaAdapterProblem(
             reason_code="unsupported_entry_point_shape",
-            detail="a class-level @Path is declared, but no route ever composed against it - "
-                   "JAX-RS's own verb-only method idiom (@GET/@POST with no method-level "
-                   "@Path of its own) is not recognized (see the named limit beside "
-                   "_ROUTE_ANNOTATIONS) - no entry point published, but not confidently "
-                   "absent either",
+            detail=f"{jax_rs_class}'s own class-level @Path is declared, but no route ever "
+                   "composed against it - JAX-RS's own verb-only method idiom (@GET/@POST "
+                   "with no method-level @Path of its own) is not recognized (see the named "
+                   "limit beside _ROUTE_ANNOTATIONS) - no entry point published, but not "
+                   "confidently absent either",
             qualified_name=jax_rs_class,
         ))
 
     for jax_rs_class in sorted(jax_rs_orphaned_verb_marker_classes & classes_with_route_entry_points):
+        # MICRO-ROUND 36b: the identical coupling defect, same fix - see
+        # the sibling loop's own comment just above.
         problems.append(JavaAdapterProblem(
             reason_code="unsupported_entry_point_shape",
-            detail="a class-level @Path is declared and at least one route composed against "
-                   "it, but a JAX-RS verb designator (@GET/@POST/...) elsewhere in the class "
-                   "has no method-level @Path of its own to compose against - that route is "
-                   "missing from the inventory even though this class is not entirely unmapped",
+            detail=f"{jax_rs_class}'s own class-level @Path is declared and at least one "
+                   "route composed against it, but a JAX-RS verb designator (@GET/@POST/...) "
+                   "elsewhere in the class has no method-level @Path of its own to compose "
+                   "against - that route is missing from the inventory even though this "
+                   "class is not entirely unmapped",
             qualified_name=jax_rs_class,
         ))
 
