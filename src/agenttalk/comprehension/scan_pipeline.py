@@ -1576,7 +1576,15 @@ def run_scan(
         # it" from "this run declined to claim externality run-wide" -
         # without this, the two are indistinguishable from dependencies.
         # json alone. Bounded the same way every other list here is.
-        externality_suppressed_roots, externality_suppressed_roots_omitted = _bounded_boundaries([
+        # FIX ROUND 37 (thirty-first cold read, F7 LOW, wrong-data): this
+        # is a SET of (path, trigger) roots this run poisoned externality
+        # over, never an event log - but the "reactor" trigger below
+        # publishes one entry per BAD MODULE ENTRY, not per pom, so a
+        # single pom with 2+ bad <module> entries (round 36's own F1/F2
+        # reactor-trigger fix) published byte-identical duplicate rows
+        # here for the identical (path, "reactor") pair. Deduped, order-
+        # preserving (first occurrence kept), before bounding.
+        _externality_suppressed_root_entries = [
             {"path": entry["path"], "trigger": entry["trigger"]}
             for entry in discovery_result.poisoning_excluded_roots
         ] + [
@@ -1590,7 +1598,16 @@ def run_scan(
             # per pom whose own coordinate could not be decoded.
             {"path": p.relative_path, "trigger": "coordinate_unrecoverable"}
             for p in coordinate_unrecoverable_problems
-        ])
+        ]
+        _seen_externality_suppressed_roots: set[tuple[str, str]] = set()
+        _deduped_externality_suppressed_root_entries = []
+        for entry in _externality_suppressed_root_entries:
+            key = (entry["path"], entry["trigger"])
+            if key not in _seen_externality_suppressed_roots:
+                _seen_externality_suppressed_roots.add(key)
+                _deduped_externality_suppressed_root_entries.append(entry)
+        externality_suppressed_roots, externality_suppressed_roots_omitted = _bounded_boundaries(
+            _deduped_externality_suppressed_root_entries)
 
         scan_doc = {
             **_envelope(

@@ -7099,6 +7099,17 @@ def test_run_scan_each_reactor_trigger_gets_its_own_truthful_suppression_detail_
     scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
     assert scan_doc["problem_count"] == len(problems_doc["problems"])
 
+    # FIX ROUND 37 (thirty-first cold read, F7 LOW, wrong-data, .cr31-
+    # reactor verbatim): externality_suppressed_roots is a SET of (path,
+    # trigger) roots this run poisoned externality over, never an event
+    # log - the SAME pom's own THREE reactor triggers above used to
+    # publish three byte-identical {"path": "pom.xml", "trigger":
+    # "reactor"} rows here; deduped to one.
+    reactor_roots = [
+        r for r in scan_doc["externality_suppressed_roots"]
+        if r["path"] == "pom.xml" and r["trigger"] == "reactor"]
+    assert len(reactor_roots) == 1
+
 
 def test_run_scan_a_pom_with_an_unrecoverable_own_coordinate_poisons_externality_run_wide(
     java_repo: Path,
