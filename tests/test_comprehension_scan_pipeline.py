@@ -5951,6 +5951,79 @@ def test_scan_json_declares_the_secret_patterns_caveat(java_repo: Path) -> None:
     assert scan_doc["secret_patterns_caveat"] == discovery.SECRET_PATTERNS_CAVEAT
 
 
+def test_scan_json_degraded_by_is_empty_on_a_complete_run(java_repo: Path) -> None:
+    """FIX ROUND 35 (twenty-ninth cold read, F5 MINOR, completeness):
+    regression control - a genuinely complete run names no reasons at all."""
+    import json
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert outcome.status == "complete"
+    assert scan_doc["degraded_by"] == []
+
+
+def test_scan_json_degraded_by_names_the_reason_that_actually_degraded(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 35 (F5 MINOR, completeness): `degraded` on its own never
+    told a consumer WHICH of the (up to seven, and growing) independent
+    warning-severity reasons actually drove the degradation - severity
+    does not discriminate. Mirrors the reader's own duplicate-qualified-
+    name reactor shape."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "app").mkdir(parents=True)
+    (java_repo / "src" / "main" / "java" / "com" / "acme" / "app" / "Boot.java").write_text(
+        "package com.acme.app;\nimport com.acme.Config;\nclass Boot {}\n", encoding="utf-8")
+    (java_repo / "modA" / "src" / "main" / "java" / "com" / "acme").mkdir(parents=True)
+    (java_repo / "modA" / "src" / "main" / "java" / "com" / "acme" / "Config.java").write_text(
+        "package com.acme;\nclass Config {}\n", encoding="utf-8")
+    (java_repo / "modB" / "src" / "main" / "java" / "com" / "acme").mkdir(parents=True)
+    (java_repo / "modB" / "src" / "main" / "java" / "com" / "acme" / "Config.java").write_text(
+        "package com.acme;\nclass Config {}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert outcome.status == "degraded"
+    assert scan_doc["degraded_by"] == ["duplicate_qualified_name"]
+
+
+def test_scan_json_degraded_by_combines_multiple_independent_reasons(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 35 (F5 MINOR, completeness): two INDEPENDENT degrading
+    sources in the SAME run (a case-fold collision, discovery-level, and a
+    duplicate qualified name, modules-level) must both be named, sorted -
+    proving the set aggregates across OR-chain terms rather than only
+    ever reporting the first one found."""
+    import dataclasses
+    import json
+
+    from agenttalk.comprehension import discovery as discoverymod
+
+    (java_repo / "modA" / "src" / "main" / "java" / "com" / "acme").mkdir(parents=True)
+    (java_repo / "modA" / "src" / "main" / "java" / "com" / "acme" / "Config.java").write_text(
+        "package com.acme;\nclass Config {}\n", encoding="utf-8")
+    (java_repo / "modB" / "src" / "main" / "java" / "com" / "acme").mkdir(parents=True)
+    (java_repo / "modB" / "src" / "main" / "java" / "com" / "acme" / "Config.java").write_text(
+        "package com.acme;\nclass Config {}\n", encoding="utf-8")
+
+    real_enumerate_scope = discoverymod.enumerate_scope
+
+    def _enumerate_scope(root, comprehension_dir):
+        result = real_enumerate_scope(root, comprehension_dir)
+        colliding = discoverymod.EnumeratedFile(
+            relative_path="src/main/java/p/APP.JAVA", byte_count=1, content_digest="deadbeef")
+        return dataclasses.replace(result, files=[*result.files, colliding])
+
+    monkeypatch.setattr(scan_pipeline.discovery, "enumerate_scope", _enumerate_scope)
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert outcome.status == "degraded"
+    assert scan_doc["degraded_by"] == ["case_collision", "duplicate_qualified_name"]
+
+
 def test_run_scan_a_duplicate_qualified_name_publishes_ambiguous_import_and_a_problem(
     java_repo: Path,
 ) -> None:
