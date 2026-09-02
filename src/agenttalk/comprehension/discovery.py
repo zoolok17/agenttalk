@@ -343,11 +343,47 @@ def _sits_under_a_recognized_generated_output_position(relative_to_excluded_root
 #: constant in this package - a genuinely secret-shaped basename absent
 #: from this set still leaks path+digest, the same under-claim trade
 #: struck everywhere else in this module.
+#: FIX ROUND 35 (twenty-ninth cold read, F4 MINOR, completeness): a
+#: further measured battery of seven canonical credential files (a
+#: Postgres ``.pgpass``, a git credential store, Docker's own legacy
+#: ``.dockercfg`` (embeds base64-encoded registry auth), Apache's
+#: ``.htpasswd``, an npm ``.npmrc`` (can carry a registry auth token), a
+#: ``secrets.yaml``, and a Spring Boot ``application-secret.properties``)
+#: leaked path+digest the same way round 32's own battery did. ``.pgpass``/
+#: ``.git-credentials``/``.dockercfg``/``.htpasswd``/``.npmrc`` are added
+#: as new literal entries; ``secrets.*`` is added as a GLOB (narrower than
+#: a bare ``*secret*``, matching only a basename that STARTS WITH the
+#: literal "secrets." - "secrets.yaml"/"secrets.json"/"secrets.properties"
+#: all match, but "docs/secrets-rotation-policy.md" does NOT, since it has
+#: no dot immediately after "secrets" - the exact false-positive shape
+#: round 32's own judgment already weighed and rejected a wider glob for);
+#: ``application-secret.properties`` is added as an exact literal, the
+#: same conservative choice round 32 made for the identical-shaped
+#: ``secrets.properties``.
 _SECRET_FILE_PATTERNS = (
     ".env", ".env.*", "*.env", "*.pem", "*.pfx", "*.p12", "*.ppk",
     "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
     "*.key", "*.jks", "*.keystore", "*.p8", ".netrc", "credentials",
     "secrets.properties",
+    ".pgpass", ".git-credentials", ".dockercfg", ".htpasswd", ".npmrc",
+    "secrets.*", "application-secret.properties",
+)
+#: FIX ROUND 35 (F4 MINOR, completeness): the provisional-set caveat
+#: this closed list has always deserved but never published in-artifact
+#: (declared only in the source comments above) - the same *_CAVEAT
+#: discipline every other provisional set in this package already
+#: follows (see FINGERPRINT_CAVEAT).
+SECRET_PATTERNS_CAVEAT = (
+    "the secret-file exclusion list is a closed, PROVISIONAL basename/"  # noqa: S105  # nosec B105 - a prose caveat string, not a credential
+    "extension set (see discovery._SECRET_FILE_PATTERNS), grown battery-"
+    "by-battery as real secret-shaped paths are measured leaking - it is "
+    "not, and does not claim to be, an exhaustive catalogue of every "
+    "credential-file convention. A genuinely secret-shaped path absent "
+    "from this set is not excluded: its path and content digest (never "
+    "its value - this producer never reads excluded content either way) "
+    "are published as an ordinary discovered file, the same safe-"
+    "direction-to-be-wrong-in trade every other provisional set in this "
+    "package accepts."
 )
 _BINARY_SNIFF_BYTES = 8192
 _PLATFORM_PROBE_RELATIVE_DIR = f"{RELATIVE_COMPREHENSION_DIR}/.platform-probe"

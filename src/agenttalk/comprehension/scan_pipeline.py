@@ -1378,6 +1378,11 @@ def run_scan(
             # CLASSIFICATION_CAVEAT/PROVENANCE_CAVEAT/structural_caveat
             # already follow for their own artifacts.
             "fingerprint_caveat": discovery.FINGERPRINT_CAVEAT,
+            # FIX ROUND 35 (twenty-ninth cold read, F4 MINOR, completeness):
+            # the same in-artifact declaration discipline, for the secret-
+            # file exclusion list's own provisional-set boundary - see
+            # SECRET_PATTERNS_CAVEAT's own docstring.
+            "secret_patterns_caveat": discovery.SECRET_PATTERNS_CAVEAT,
             # N2 (fourth cold read, fix round 6): the design names "the
             # effective include/exclude rules... and their configuration
             # digest" as a scan.json field. config.json parsing itself is

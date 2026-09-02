@@ -5937,6 +5937,20 @@ def test_scan_json_declares_the_fingerprint_caveat(java_repo: Path) -> None:
     assert scan_doc["fingerprint_caveat"] == discovery.FINGERPRINT_CAVEAT
 
 
+def test_scan_json_declares_the_secret_patterns_caveat(java_repo: Path) -> None:
+    """FIX ROUND 35 (twenty-ninth cold read, F4 MINOR, completeness): the
+    SAME in-artifact declaration discipline - the secret-file exclusion
+    list's own provisional-set boundary previously lived only in a
+    discovery.py comment. Published as a real scan.json field now."""
+    import json
+
+    from agenttalk.comprehension import discovery
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["secret_patterns_caveat"] == discovery.SECRET_PATTERNS_CAVEAT
+
+
 def test_run_scan_a_duplicate_qualified_name_publishes_ambiguous_import_and_a_problem(
     java_repo: Path,
 ) -> None:

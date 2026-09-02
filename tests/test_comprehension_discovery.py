@@ -537,6 +537,41 @@ def test_enumerate_scope_excludes_round_32_widened_secret_file_patterns(
     assert result.exclusions.get("secret") == 1
 
 
+@pytest.mark.parametrize("filename", [
+    ".pgpass", ".git-credentials", ".dockercfg", ".htpasswd", ".npmrc",
+    "secrets.yaml", "application-secret.properties",
+])
+def test_enumerate_scope_excludes_round_35_widened_secret_file_patterns(
+    tmp_path: Path, filename: str,
+) -> None:
+    """FIX ROUND 35 (twenty-ninth cold read, F4 MINOR, completeness): a
+    further measured battery of seven canonical credential files - each
+    used to leak its path and content digest as an ordinary discovered
+    file, matching none of the pattern set as of round 32."""
+    (tmp_path / filename).write_bytes(b"secret")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert result.files == []
+    assert result.exclusions.get("secret") == 1
+
+
+def test_enumerate_scope_does_not_over_exclude_a_secrets_glob_false_positive(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 35 (F4's own weighed disposition): the new ``secrets.*``
+    glob is deliberately narrower than a bare ``*secret*`` - it matches
+    only a basename that STARTS WITH the literal "secrets." (so
+    "secrets.yaml" is excluded), never a hyphenated or otherwise
+    differently-shaped name that merely mentions "secrets" - the exact
+    false-positive shape round 32's own judgment already rejected a wider
+    glob for."""
+    (tmp_path / "secrets-rotation-policy.md").write_bytes(b"# rotate secrets quarterly\n")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert {f.relative_path for f in result.files} == {"secrets-rotation-policy.md"}
+    assert result.exclusions.get("secret", 0) == 0
+
+
 def test_enumerate_scope_does_not_over_exclude_a_plausible_false_positive(tmp_path: Path) -> None:
     """FIX ROUND 32 (F5's own weighed disposition): ``secrets.properties``
     is matched as an EXACT LITERAL, deliberately never a wildcard - a
