@@ -424,7 +424,11 @@ def _verify_store_ignored_or_rollback(
     Gated on the ``"ignored"`` disposition exactly as round 33's own
     check was - an attended ``acknowledged_unignored``/``no_vcs_
     acknowledged`` override already accepted this exact risk and must
-    never be re-refused here."""
+    never be re-refused here.
+
+    MICRO-ROUND 34b (reviewer-3's re-delta, declared): see
+    :func:`privacy.verify_store_ignored`'s own docstring for the
+    irreducible one-git-call-wide instant this call cannot see past."""
     if privacy_result is None or privacy_result.vcs_privacy != "ignored":
         return
     root = project_root_from_comprehension_dir(comprehension_dir)

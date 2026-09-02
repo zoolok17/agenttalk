@@ -320,7 +320,14 @@ def verify_store_ignored(root: Path, relative_store_dir: str) -> None:
     ``"ignored"`` disposition — an operator who explicitly ACKNOWLEDGED
     an unignored store already accepted this exact risk for this one
     run, and re-checking here would spuriously refuse a publish that
-    operator already attended to."""
+    operator already attended to.
+
+    MICRO-ROUND 34b (reviewer-3's re-delta, note-level ask, declared):
+    a ``.gitignore`` change landing AFTER this call returns is outside
+    this guarantee BY CONSTRUCTION — every check-then-act has an instant
+    after which it cannot see; this one narrows that window from the
+    entire scan (round 32) to one git invocation, as narrow as this
+    shape gets."""
     result = _run_git(root, "ls-files", "--others", "--exclude-standard", "--", relative_store_dir)
     if result is None or result.returncode != 0:
         raise VcsPrivacyRefused(
