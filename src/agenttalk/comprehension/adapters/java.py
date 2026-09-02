@@ -3518,6 +3518,45 @@ def pom_dependency_decode_problems(text: str) -> list[int]:
     return lines
 
 
+def pom_own_coordinate_decode_problems(text: str) -> list[int]:
+    """FIX ROUND 35 (twenty-ninth cold read, F1 BLOCKER, wrong-data - the
+    twin-emitter class again): the SAME split ``pom_dependency_decode_
+    problems`` already established, one level up - THIS pom's OWN
+    project-level ``<groupId>``/``<artifactId>``, and its ``<parent>``
+    block's own ``groupId``, present but UNDECODABLE (a split/mixed CDATA
+    shape, or an undefined entity reference) used to publish silently
+    UNDECODED (see ``_own_and_parent_group_ids``/``_project_own_
+    coordinate``'s own round 35 fix) rather than surfacing as a visible
+    gap. ``_project_own_coordinate`` now treats an undecodable value as
+    ABSENT (never a guessed/raw one) - this is the separate, additive
+    VISIBILITY half, the identical two-function split the dependency site
+    already uses: ``parse_maven_pom``'s own return arity is fixed (28+
+    existing call sites already unpack it positionally), so worker.py
+    calls this too and turns each returned line number into its own
+    ``WorkerProblem``, rather than growing a new return value.
+
+    Returns the 1-based line number of every project-level groupId/
+    artifactId or ``<parent>`` groupId element that is PRESENT but could
+    not be decoded - never one that is simply absent (the existing,
+    unchanged, legitimate "no coordinate declared at this level" case
+    ``_project_own_coordinate``'s own named limit already documents)."""
+    sanitized, structural = _split_xml_comments_and_cdata(text)
+    newline_offsets = _newline_offsets(sanitized)
+    lines: list[int] = []
+    for match in _DEPENDENCY_GROUP_ID_RE.finditer(sanitized):
+        stack = _enclosing_tag_stack(structural, match.start())
+        if stack in (["project"], ["project", "parent"]) and _decode_xml_text(
+            match.group(1)) is None:
+            lines.append(_line_at(newline_offsets, match.start()))
+    for match in _DEPENDENCY_ARTIFACT_ID_RE.finditer(sanitized):
+        if (
+            _enclosing_tag_stack(structural, match.start()) == ["project"]
+            and _decode_xml_text(match.group(1)) is None
+        ):
+            lines.append(_line_at(newline_offsets, match.start()))
+    return sorted(set(lines))
+
+
 def _count_profile_scoped_dependencies(structural: str) -> int:
     """Round 11c (reviewer-3 delta on round 11b, VEHICLE CHANGE): every
     ``<dependency>`` block inside a ``<profile>``'s own ``<dependencies>``
@@ -3553,7 +3592,7 @@ def _count_profile_scoped_dependencies(structural: str) -> int:
 
 def _own_and_parent_group_ids(
     sanitized: str, structural: str,
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None, bool]:
     """FIX ROUND 19 (fifteenth cold read, F2 MAJOR): the project-level and
     ``<parent>``-block groupId scan :func:`_project_own_coordinate`
     already performs, factored out so ``parse_maven_pom``'s own
@@ -3570,16 +3609,57 @@ def _own_and_parent_group_ids(
     at all) - a groupId TEXT that happens to live inside some OTHER
     element's own CDATA content is still correctly rejected by the stack
     check, since blanking never removes the real, non-CDATA tags
-    (``<description>`` itself) surrounding that CDATA span."""
+    (``<description>`` itself) surrounding that CDATA span.
+
+    FIX ROUND 35 (twenty-ninth cold read, F1 BLOCKER, wrong-data - the
+    twin-emitter class again): this function found a CDATA-wrapped
+    groupId (widened to DOTALL for exactly that reason, per its own round
+    25 note above) and then PUBLISHED IT UNDECODED - the raw ``<![CDATA[``
+    markers, or an un-expanded numeric/named entity, embedded directly in
+    the coordinate string, unlike every other leaf value in this file
+    (the ``<dependency>`` site since round 24, the ``<module>`` site
+    since round 25). Both leaf reads now go through ``_decode_xml_text``
+    exactly like those siblings - an undecodable value (split/mixed
+    CDATA, an undefined entity) is treated as ABSENT for the RETURNED
+    ``group_id`` (never a raw, undecoded string), the same "undecodable ==
+    absent" honesty this function's OWN caller already documents for the
+    genuinely-missing case ("If ``<parent>`` is itself absent, or its own
+    ``groupId`` is unreadable, this still returns ``None``"). Visibility
+    for the undecodable-but-present case is a separate, additive concern -
+    see :func:`pom_own_coordinate_decode_problems`, the same split
+    ``pom_dependency_decode_problems`` already established for the
+    sibling site.
+
+    The third return value, ``project_group_id_declared_but_broken``,
+    distinguishes "no project-level ``<groupId>`` at all" (a real,
+    legitimate reason to fall back to the ``<parent>``'s own inherited
+    one - :func:`_project_own_coordinate`'s own CONTAINED FIX) from "one
+    IS declared, but this producer could not read it" - falling back to
+    a DIFFERENT value in the second case would risk registering this pom
+    under a coordinate it does not actually have (the parent's groupId
+    and a broken project-level override are not guaranteed to agree),
+    the exact over-claim class this whole fix exists to prevent. ``${
+    project.groupId}`` expansion (this function's OTHER caller,
+    ``parse_maven_pom``) does not need this distinction - an
+    unresolvable self-reference there simply leaves the property
+    unexpanded, never a false registry hit either way - so it ignores
+    this third value."""
     group_id = parent_group_id = None
+    project_group_id_declared_but_broken = False
     for match in _DEPENDENCY_GROUP_ID_RE.finditer(sanitized):
         stack = _enclosing_tag_stack(structural, match.start())
         if stack == ["project"]:
-            group_id = _bounded_route_target(match.group(1).strip())
+            decoded = _decode_xml_text(match.group(1))
+            if decoded is not None:
+                group_id = _bounded_route_target(decoded.strip())
+            else:
+                project_group_id_declared_but_broken = True
             break
         if stack == ["project", "parent"] and parent_group_id is None:
-            parent_group_id = _bounded_route_target(match.group(1).strip())
-    return group_id, parent_group_id
+            decoded = _decode_xml_text(match.group(1))
+            if decoded is not None:
+                parent_group_id = _bounded_route_target(decoded.strip())
+    return group_id, parent_group_id, project_group_id_declared_but_broken
 
 
 def _project_own_coordinate(sanitized: str, structural: str) -> tuple[str, str] | None:
@@ -3625,14 +3705,30 @@ def _project_own_coordinate(sanitized: str, structural: str) -> tuple[str, str] 
     FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE): both tag-
     stack context checks now run against the CDATA-blanked
     ``structural`` string - see ``_own_and_parent_group_ids``'s own
-    docstring for why."""
-    group_id, parent_group_id = _own_and_parent_group_ids(sanitized, structural)
-    if group_id is None:
+    docstring for why.
+
+    FIX ROUND 35 (twenty-ninth cold read, F1 BLOCKER, wrong-data): the
+    artifactId leaf below now goes through ``_decode_xml_text`` too - see
+    ``_own_and_parent_group_ids``'s own round 35 note for the full
+    symptom (a CDATA-wrapped or entity-escaped coordinate published
+    undecoded let a sibling's real intra-reactor dependency edge resolve
+    a CONFIDENT ``external`` claim on an in-scan module - the exact
+    round-18-F3 over-claim class this producer's own registry-miss
+    discipline exists to prevent). A project-level ``<groupId>`` that IS
+    declared but could not be decoded never falls back to the ``<parent>``
+    block's own groupId either - see ``_own_and_parent_group_ids``'s own
+    third return value for why (falling back there risks registering
+    this pom under a coordinate it may not actually have)."""
+    group_id, parent_group_id, group_id_declared_but_broken = _own_and_parent_group_ids(
+        sanitized, structural)
+    if group_id is None and not group_id_declared_but_broken:
         group_id = parent_group_id
     artifact_id = None
     for match in _DEPENDENCY_ARTIFACT_ID_RE.finditer(sanitized):
         if _enclosing_tag_stack(structural, match.start()) == ["project"]:
-            artifact_id = _bounded_route_target(match.group(1).strip())
+            decoded = _decode_xml_text(match.group(1))
+            if decoded is not None:
+                artifact_id = _bounded_route_target(decoded.strip())
             break
     if group_id is None or artifact_id is None:
         return None
@@ -3723,7 +3819,8 @@ def parse_maven_pom(
     # HARD RULE below (dependencies_artifact._classify_registry_miss)
     # ensures an unexpanded ``${`` can never satisfy the positive-
     # grounds external test regardless.
-    own_project_group_id, parent_group_id = _own_and_parent_group_ids(sanitized, structural)
+    own_project_group_id, parent_group_id, _group_id_declared_but_broken = (
+        _own_and_parent_group_ids(sanitized, structural))
     effective_own_group_id = (
         own_project_group_id if own_project_group_id is not None else parent_group_id
     )

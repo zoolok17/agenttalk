@@ -163,6 +163,9 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     "no_pom_facts_extracted": "warning",
     # FIX ROUND 24 (twentieth cold read, F4 MINOR): same bucket.
     "dependency_value_unrecoverable": "warning",
+    # FIX ROUND 35 (twenty-ninth cold read, F1 BLOCKER): same bucket - the
+    # pom's own coordinate twin of the dependency-site reason above.
+    "coordinate_value_unrecoverable": "warning",
     # FIX ROUND 24 (micro-round 24b, item 1): same bucket.
     "no_web_xml_facts_extracted": "warning",
     # BLOCKER fail-safe (sixth cold read, fix round 10): a route

@@ -3264,6 +3264,59 @@ def test_pom_description_cdata_does_not_hide_the_pom_s_own_coordinate():
     assert {e.target for e in edges} == {"org.a:a"}
 
 
+def test_a_split_cdata_project_own_coordinate_is_flagged_not_silent():
+    """FIX ROUND 35 (twenty-ninth cold read, F1 BLOCKER, wrong-data, .cr29-
+    xmlent variant - split CDATA): the project-level groupId's own value
+    cannot be decoded (split-CDATA shape) - the coordinate must be treated
+    as ABSENT (no unit published, never a raw undecoded string), and
+    pom_own_coordinate_decode_problems must surface its own line number so
+    worker.py can record a real, visible problem instead of silence -
+    exactly the same treatment the sibling dependency site already gets."""
+    pom = """<project>
+  <groupId><![CDATA[com.a]]>b<![CDATA[cme]]></groupId>
+  <artifactId>root</artifactId>
+</project>
+"""
+    units, _edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert units == []
+    assert java.pom_own_coordinate_decode_problems(pom) == [2]
+
+
+def test_an_undefined_entity_project_own_coordinate_is_flagged_not_silent():
+    """FIX ROUND 35 (F1 BLOCKER, .cr29-xmlent verbatim - undefined-entity
+    asymmetry): the reader's own measured asymmetry - the dependency site
+    already records dependency_value_unrecoverable and degrades for an
+    undefined entity reference; the own-coordinate site used to publish
+    "com.acme:bad&undefinedent;name" SILENTLY. Now symmetric: treated as
+    absent, own line surfaced."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>bad&undefinedent;name</artifactId>
+</project>
+"""
+    units, _edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert units == []
+    assert java.pom_own_coordinate_decode_problems(pom) == [3]
+
+
+def test_an_undecodable_project_own_coordinate_never_falls_back_to_parent():
+    """Companion control: when the project-level groupId is PRESENT but
+    undecodable, the <parent> block's own groupId must never be silently
+    substituted in its place - `_own_and_parent_group_ids` breaks at the
+    first project-level match regardless of its own decodability, the
+    same "this IS the real element, not merely absent" reasoning an
+    undecodable <dependency> groupId already gets."""
+    pom = """<project>
+  <parent><groupId>com.other</groupId><artifactId>other-parent</artifactId>
+    <version>1.0</version></parent>
+  <groupId><![CDATA[com.a]]>b<![CDATA[cme]]></groupId>
+  <artifactId>root</artifactId>
+</project>
+"""
+    units, _edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert units == []  # never falls back to "com.other:root"
+
+
 def test_web_xml_description_cdata_does_not_fabricate_a_route():
     """FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE, F2 BLOCKER,
     .cr21-webinj, wrong-data): a web.xml <description> CDATA that

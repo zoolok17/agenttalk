@@ -1361,6 +1361,101 @@ def test_a_reactor_module_that_inherits_groupid_from_parent_resolves_internal():
         "shared-lib/pom.xml", "com.acme:shared-lib")
 
 
+def test_a_cdata_wrapped_reactor_module_coordinate_still_resolves_internal():
+    """FIX ROUND 35 (twenty-ninth cold read, F1 BLOCKER, wrong-data, .cr29-
+    cdata verbatim): the reader's own killer consequence - shared-lib/
+    pom.xml wraps its OWN project-level groupId/artifactId in CDATA (a
+    real, if unusual, shape - some generators do this). Before the round
+    35 fix, `_project_own_coordinate` published this UNDECODED
+    ("<![CDATA[com.acme]]>:<![CDATA[shared-lib]]>"), which never matches
+    app/pom.xml's own plain "com.acme:shared-lib" dependency target - the
+    registry miss then satisfied the positive-grounds external test and
+    published a CONFIDENT resolved/EXTERNAL claim for an in-scan module,
+    the exact round-18-F3 over-claim class this producer's own registry
+    exists to prevent. Now decoded first - the edge must resolve
+    INTERNAL, identically to the plain-groupId control above."""
+    _app_units, app_edges, _c1 = java_adapter.parse_maven_pom(
+        "app/pom.xml",
+        "<project><groupId>com.acme</groupId><artifactId>app</artifactId>"
+        "<dependencies><dependency>"
+        "<groupId>com.acme</groupId><artifactId>shared-lib</artifactId>"
+        "</dependency></dependencies></project>",
+    )
+    shared_units, shared_edges, _c2 = java_adapter.parse_maven_pom(
+        "shared-lib/pom.xml",
+        "<project><groupId><![CDATA[com.acme]]></groupId>"
+        "<artifactId><![CDATA[shared-lib]]></artifactId></project>",
+    )
+    assert {u.qualified_name for u in shared_units} == {"com.acme:shared-lib"}
+    results = {
+        "app/pom.xml": java_adapter.JavaFileResult(edges=app_edges),
+        "shared-lib/pom.xml": java_adapter.JavaFileResult(units=shared_units, edges=shared_edges),
+    }
+    records = da.build_dependencies(results)
+    build_edge = next(r for r in records if r.relation == "build")
+    assert build_edge.resolution_state == "resolved"
+    assert build_edge.target_external is None
+    assert build_edge.target_unit_id == da._java_component_unit_id(
+        "shared-lib/pom.xml", "com.acme:shared-lib")
+
+
+def test_a_cdata_wrapped_parent_group_id_still_resolves_internal():
+    """FIX ROUND 35 (F1 BLOCKER, .cr29-cdata2 variant - CDATA-in-<parent>):
+    the same undecoded-publication defect, but for the <parent> block's
+    own groupId this pom's own coordinate falls back to when it declares
+    no project-level groupId of its own."""
+    _app_units, app_edges, _c1 = java_adapter.parse_maven_pom(
+        "app/pom.xml",
+        "<project><groupId>com.acme</groupId><artifactId>app</artifactId>"
+        "<dependencies><dependency>"
+        "<groupId>com.acme</groupId><artifactId>shared-lib</artifactId>"
+        "</dependency></dependencies></project>",
+    )
+    shared_units, shared_edges, _c2 = java_adapter.parse_maven_pom(
+        "shared-lib/pom.xml",
+        "<project><parent><groupId><![CDATA[com.acme]]></groupId>"
+        "<artifactId>acme-parent</artifactId><version>1.0</version></parent>"
+        "<artifactId>shared-lib</artifactId></project>",
+    )
+    assert {u.qualified_name for u in shared_units} == {"com.acme:shared-lib"}
+    results = {
+        "app/pom.xml": java_adapter.JavaFileResult(edges=app_edges),
+        "shared-lib/pom.xml": java_adapter.JavaFileResult(units=shared_units, edges=shared_edges),
+    }
+    records = da.build_dependencies(results)
+    build_edge = next(r for r in records if r.relation == "build")
+    assert build_edge.resolution_state == "resolved"
+    assert build_edge.target_external is None
+
+
+def test_a_numeric_entity_reactor_module_coordinate_still_resolves_internal():
+    """FIX ROUND 35 (F1 BLOCKER, .cr29-cdata2 variant - numeric-entity
+    form): the reader's own measured "com&#46;acme:mod&#45;a" shape -
+    numeric character references (&#46; is '.', &#45; is '-') decode via
+    the same _decode_xml_text boundary, never published raw."""
+    _app_units, app_edges, _c1 = java_adapter.parse_maven_pom(
+        "app/pom.xml",
+        "<project><groupId>com.acme</groupId><artifactId>app</artifactId>"
+        "<dependencies><dependency>"
+        "<groupId>com.acme</groupId><artifactId>shared-lib</artifactId>"
+        "</dependency></dependencies></project>",
+    )
+    shared_units, shared_edges, _c2 = java_adapter.parse_maven_pom(
+        "shared-lib/pom.xml",
+        "<project><groupId>com&#46;acme</groupId>"
+        "<artifactId>shared&#45;lib</artifactId></project>",
+    )
+    assert {u.qualified_name for u in shared_units} == {"com.acme:shared-lib"}
+    results = {
+        "app/pom.xml": java_adapter.JavaFileResult(edges=app_edges),
+        "shared-lib/pom.xml": java_adapter.JavaFileResult(units=shared_units, edges=shared_edges),
+    }
+    records = da.build_dependencies(results)
+    build_edge = next(r for r in records if r.relation == "build")
+    assert build_edge.resolution_state == "resolved"
+    assert build_edge.target_external is None
+
+
 def test_a_genuinely_external_pom_dependency_still_resolves_external():
     """Companion negative case: a dependency naming NO in-scan pom's own
     coordinate still resolves external as before - the fix only closes

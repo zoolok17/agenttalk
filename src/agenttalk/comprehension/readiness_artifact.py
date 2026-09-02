@@ -364,6 +364,17 @@ _READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
     # whole-file evidence gap (the same narrow scoping `route_value_
     # unrecoverable` already gets, restated for the dependency side).
     "dependency_value_unrecoverable": frozenset({"dependencies_resolved"}),
+    # FIX ROUND 35 (twenty-ninth cold read, F1 BLOCKER, wrong-data): unlike
+    # the dependency-site reason above (one edge, within an otherwise-
+    # understood pom), an undecodable OWN coordinate means NO unit is ever
+    # registered for this pom at all (`_project_own_coordinate` now treats
+    # it as absent) - the same "no coordinate/edge/reactor-module fact"
+    # shape `no_pom_facts_extracted` already gets, since this file's own
+    # identity could not be confidently established either way. The
+    # synthesized file-kind fallback unit this reason reaches (worker.py's
+    # own `worker_problem_reasons_by_path` broadcast, when no component
+    # unit exists) gets the SAME whole-file treatment.
+    "coordinate_value_unrecoverable": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
     # FIX ROUND 24 (micro-round 24b, item 1, wrong-data): web.xml's own
     # analogue of `no_pom_facts_extracted` - a parse that succeeded but
     # yielded zero entry points and zero problems over a root that is

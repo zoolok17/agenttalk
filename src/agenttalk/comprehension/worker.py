@@ -673,6 +673,11 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                 # parse_maven_pom's own return with no problem recorded.
                 undecodable_dependency_lines = (
                     java_adapter.pom_dependency_decode_problems(text))
+                # FIX ROUND 35 (twenty-ninth cold read, F1 BLOCKER, wrong-
+                # data): the same split for the pom's OWN coordinate - see
+                # pom_own_coordinate_decode_problems's own docstring.
+                undecodable_own_coordinate_lines = (
+                    java_adapter.pom_own_coordinate_decode_problems(text))
             except Exception as exc:  # noqa: BLE001 - a producer bug must degrade, never abort the scan
                 problems.append(WorkerProblem(
                     reason_code="parse_failed", relative_path=rel,
@@ -739,6 +744,20 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                                "artifactId containing XML constructs this producer does "
                                "not decode - suppressed rather than published with a "
                                "guessed coordinate",
+                    ))
+                # FIX ROUND 35 (twenty-ninth cold read, F1 BLOCKER, wrong-
+                # data): a real, present project-level groupId/artifactId
+                # (or <parent> groupId) this adapter could not decode -
+                # this pom's own coordinate silently vanished (treated as
+                # absent) with no problem recorded; visible now.
+                for line in undecodable_own_coordinate_lines:
+                    problems.append(WorkerProblem(
+                        reason_code="coordinate_value_unrecoverable", relative_path=rel,
+                        detail=f"this pom's own project-level groupId/artifactId (or its "
+                               f"<parent> block's own groupId), declared at line {line}, "
+                               "contains XML constructs this producer does not decode - "
+                               "this pom's own coordinate is treated as absent rather than "
+                               "published with a guessed value",
                     ))
         elif rel_name_lower == "web.xml":
             # M9 (cold-read, PR-B fix round 3): parse_web_xml existed as a
