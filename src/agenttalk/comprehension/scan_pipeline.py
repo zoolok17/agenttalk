@@ -50,6 +50,7 @@ from . import (
 from .adapters import java as java_adapter
 from .envelope import (
     find_case_fold_collisions,
+    is_pure_case_fold_collision,
     read_json_document,
     require_field,
     resolve_under_root,
@@ -154,6 +155,11 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     "resource_limit": "warning",
     "non_utf8_path": "warning",
     "case_collision": "warning",
+    # FIX ROUND 36 (thirtieth cold read, F4 MAJOR, completeness): the
+    # normalization-variant sibling of case_collision above - same
+    # whole-file-identity-ambiguity severity, a distinct reason_code
+    # since the cause (Unicode canonical equivalence, not case) differs.
+    "unicode_normalization_collision": "warning",
     # BLOCKER 1b (fifth cold read, fix round 8): a .java file whose parse
     # succeeded but extracted zero declared types - closing the zero-
     # extraction evidence hole as a class (worker.py).
@@ -1258,8 +1264,24 @@ def run_scan(
                 p.reason_code, p.relative_path, p.detail, qualified_name=p.qualified_name)
             for p in worker_result.problems
         ] + [
+            # FIX ROUND 36 (thirtieth cold read, F4 MAJOR, completeness):
+            # `case_collisions` now ALSO carries Unicode normalization-
+            # variant pairs (find_case_fold_collisions's own round-36
+            # widened key) - a pair that only collides once NFC-
+            # normalized does NOT "case-fold identically" (that claim is
+            # false for it, per this round's own invariant), so each
+            # pair's own truthful cause is checked before choosing the
+            # detail/reason_code.
             _problem_record(
                 "case_collision", second, bounded_detail(f"case-folds identically to {first!r}"))
+            if is_pure_case_fold_collision(first, second) else
+            _problem_record(
+                "unicode_normalization_collision", second, bounded_detail(
+                    f"collides with {first!r} once Unicode-normalized (NFC) and case-folded, "
+                    "but not by a bare case-fold alone - a Unicode canonical-equivalence "
+                    "difference (e.g. a precomposed accented character versus its decomposed "
+                    "combining-mark form) a consumer's own filesystem/normalizer may resolve "
+                    "to either spelling"))
             for first, second in case_collisions
         ] + duplicate_qualified_name_problems + binary_excluded_code_bearing_problems + (
             binary_excluded_root_sniffed_xml_problems) + reactor_rule_problems + (
@@ -1328,8 +1350,17 @@ def run_scan(
         # degraded this run."
         degraded_by: set[str] = set()
         degraded_by.update(p["reason_code"] for p in discovery_result.problems)
-        if case_collisions:
-            degraded_by.add("case_collision")
+        # FIX ROUND 36 (F4 MAJOR): `case_collisions` now mixes two
+        # distinct reason codes (a normalization-variant pair is not a
+        # case_collision - see is_pure_case_fold_collision) - each
+        # pair's own real reason joins the set, never a blanket
+        # "case_collision" that could be false for a normalization-only
+        # pair.
+        degraded_by.update(
+            "case_collision" if is_pure_case_fold_collision(first, second)
+            else "unicode_normalization_collision"
+            for first, second in case_collisions
+        )
         degraded_by.update(p.reason_code for p in worker_result.problems if p.degrades_run)
         degraded_by.update(p["reason_code"] for p in duplicate_qualified_name_problems)
         degraded_by.update(p["reason_code"] for p in binary_excluded_code_bearing_problems)

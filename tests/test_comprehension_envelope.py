@@ -245,3 +245,44 @@ def test_find_case_fold_collisions_ignores_exact_duplicates() -> None:
     a record listed twice); this helper only reports a CASE-FOLD collision
     between two DISTINCT spellings."""
     assert env.find_case_fold_collisions(["src/Foo.java", "src/Foo.java"]) == []
+
+
+def test_find_case_fold_collisions_finds_an_nfc_nfd_normalization_variant_pair() -> None:
+    """FIX ROUND 36 (thirtieth cold read, F4 MAJOR, completeness, .cr30-
+    uni verbatim): a bare casefold() never normalizes composition - a
+    precomposed 'é' (U+00E9, NFC) and 'e' + a combining acute accent
+    (U+0065 U+0301, NFD) casefold to DIFFERENT strings even though they
+    render as the visually identical name, the exact ambiguity this
+    detector exists to catch (platform_identity's own unicode_
+    normalizing: false already admits both forms coexist). Unit-tested
+    directly against the detector, per the reader's own caveat: a real
+    filesystem's own case-fold/normalization behavior (NTFS especially)
+    is not something this test relies on or asserts about."""
+    import unicodedata
+
+    nfc = unicodedata.normalize("NFC", "src/Café.java")
+    nfd = unicodedata.normalize("NFD", "src/Café.java")
+    assert nfc != nfd  # the two spellings really are distinct code-point sequences
+    collisions = env.find_case_fold_collisions([nfc, nfd, "src/bar.java"])
+    assert collisions == [(nfc, nfd)]
+
+
+def test_find_case_fold_collisions_plain_ascii_control_is_unaffected() -> None:
+    """Companion control: an ordinary plain-ASCII case-fold collision
+    (no Unicode normalization variance involved at all) is unaffected by
+    the widened NFC-normalizing key."""
+    collisions = env.find_case_fold_collisions(["src/Foo.java", "src/foo.java"])
+    assert collisions == [("src/Foo.java", "src/foo.java")]
+
+
+def test_is_pure_case_fold_collision_distinguishes_the_two_causes() -> None:
+    """FIX ROUND 36 (F4 MAJOR): the per-pair cause check a caller needs
+    to publish a TRUTHFUL detail - "case-folds identically" is true for
+    an ordinary case-only pair, but FALSE for a pair that only collides
+    once Unicode-normalized (nothing differs by case at all)."""
+    import unicodedata
+
+    nfc = unicodedata.normalize("NFC", "Café.java")
+    nfd = unicodedata.normalize("NFD", "Café.java")
+    assert env.is_pure_case_fold_collision("Foo.java", "foo.java") is True
+    assert env.is_pure_case_fold_collision(nfc, nfd) is False

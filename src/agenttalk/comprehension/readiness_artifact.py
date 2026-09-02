@@ -344,6 +344,11 @@ _READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
     "resource_limit": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
     "non_utf8_path": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
     "case_collision": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
+    # FIX ROUND 36 (thirtieth cold read, F4 MAJOR, completeness): the
+    # normalization-variant sibling of case_collision above - the
+    # identical whole-file-identity-ambiguity treatment, since either
+    # unit's own identity is equally unproven by this run.
+    "unicode_normalization_collision": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
     "no_types_extracted": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
     # FIX ROUND 20 (sixteenth cold read, M3 MAJOR, wrong-data): these
     # two used to feed NOTHING at all - round 13c's own scoping (away

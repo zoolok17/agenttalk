@@ -1164,6 +1164,54 @@ def test_run_scan_reports_a_case_collision_between_two_enumerated_paths(
     assert collisions[0]["path"] == "src/main/java/p/APP.JAVA"
 
 
+def test_run_scan_reports_a_unicode_normalization_collision_not_a_false_case_collision(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 36 (thirtieth cold read, F4 MAJOR, completeness, .cr30-
+    uni verbatim): an NFC/NFD Unicode canonical-equivalence pair (a
+    precomposed 'é' versus its decomposed combining-mark form) collides
+    only once Unicode-normalized, never by a bare case-fold - publishing
+    it as case_collision would assert a FALSE cause (per this round's
+    own invariant). Injected the same portable way the plain case-fold
+    test above does (two genuinely NFC/NFD-distinct paths are not
+    reliably both writable-and-distinguishable on every real host
+    filesystem - the reader's own NTFS caveat)."""
+    import dataclasses
+    import json
+    import unicodedata
+
+    from agenttalk.comprehension import discovery as discoverymod
+
+    nfc_name = unicodedata.normalize("NFC", "Café.java")
+    nfd_name = unicodedata.normalize("NFD", "Café.java")
+    assert nfc_name != nfd_name
+
+    real_enumerate_scope = discoverymod.enumerate_scope
+
+    def _enumerate_scope(root, comprehension_dir):
+        result = real_enumerate_scope(root, comprehension_dir)
+        first = discoverymod.EnumeratedFile(
+            relative_path=f"src/main/java/p/{nfc_name}", byte_count=1, content_digest="aaa")
+        second = discoverymod.EnumeratedFile(
+            relative_path=f"src/main/java/p/{nfd_name}", byte_count=1, content_digest="bbb")
+        return dataclasses.replace(result, files=[*result.files, first, second])
+
+    monkeypatch.setattr(scan_pipeline.discovery, "enumerate_scope", _enumerate_scope)
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    collisions = [
+        p for p in problems_doc["problems"]
+        if p["reason_code"] == "unicode_normalization_collision"]
+    assert len(collisions) == 1
+    assert collisions[0]["path"] == f"src/main/java/p/{nfd_name}"
+    assert not any(p["reason_code"] == "case_collision" for p in problems_doc["problems"])
+
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert "unicode_normalization_collision" in scan_doc["degraded_by"]
+    assert "case_collision" not in scan_doc["degraded_by"]
+
+
 def test_scan_json_publishes_boundary_path_and_kind_not_just_a_count(
     java_repo: Path, monkeypatch,
 ) -> None:

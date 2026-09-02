@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -227,14 +228,43 @@ def resolve_under_root(value: Any, *, root: Path, label: str = "path") -> Path:
 def find_case_fold_collisions(paths: list[str]) -> list[tuple[str, str]]:
     """Return every distinct pair of ``paths`` that collide once
     case-folded — a scan problem (``case_collision``), never two silently
-    merged units (design, "Common JSON envelope")."""
+    merged units (design, "Common JSON envelope").
+
+    FIX ROUND 36 (thirtieth cold read, F4 MAJOR, completeness): the key
+    used to be ``casefold()`` alone — two Unicode NFC/NFD canonical-
+    equivalent spellings of the IDENTICAL visible name (a precomposed
+    accented character, e.g. ``"é"`` U+00E9, versus the decomposed form
+    ``"e"`` + a combining acute accent, U+0065 U+0301) casefold to
+    DIFFERENT strings, since casefold never normalizes composition — so
+    this detector missed them entirely even though ``platform_identity``
+    already publishes ``unicode_normalizing: false`` (this producer's own
+    admission that both forms can coexist on disk) and a consumer handed
+    either path opens whichever form its own normalizer happens to emit,
+    reading the other one's digest as stale. The key now NFC-normalizes
+    before casefolding, so a normalization-variant pair collides here
+    too — see :func:`is_pure_case_fold_collision` for the per-pair
+    TRUTHFUL cause (never assert "case-folds identically" for a pair
+    that only collides once normalized, the exact invariant this whole
+    round adopts)."""
     seen: dict[str, str] = {}
     collisions: list[tuple[str, str]] = []
     for path in paths:
-        key = path.casefold()
+        key = unicodedata.normalize("NFC", path).casefold()
         prior = seen.get(key)
         if prior is not None and prior != path:
             collisions.append((prior, path))
         else:
             seen[key] = path
     return collisions
+
+
+def is_pure_case_fold_collision(first: str, second: str) -> bool:
+    """FIX ROUND 36 (F4 MAJOR): distinguishes, for one already-detected
+    colliding pair, whether a BARE case-fold (no Unicode normalization)
+    already proves the two identical - the only case
+    :func:`find_case_fold_collisions`'s own ``case_collision`` detail
+    ("case-folds identically to ...") is actually true for. ``False``
+    means the pair collides only once NFC-normalized - a Unicode
+    canonical-equivalence difference the caller must describe honestly
+    instead, never as a bare case-fold claim."""
+    return first.casefold() == second.casefold()
