@@ -908,10 +908,26 @@ def run_scan(
         # reactor rule's own finding (a pom explicitly declaring a
         # module inside an excluded region is decisive on its own,
         # regardless of what the generic peek happened to find).
+        # MICRO-ROUND 35b (reviewer-3 delta on `32a5fa6`, R1c wrong-data):
+        # `coordinate_value_unrecoverable` (round 35's own F1) is a NEW
+        # reason code the poison OR-chain below was never taught - the
+        # same epistemic state F3's own reactor-rule problems already
+        # poison on: in-scan content (this pom's own project-level
+        # coordinate) that this run cannot identify at all. Without this
+        # clause, a run that RECORDS the problem still let a genuine
+        # intra-reactor sibling edge resolve CONFIDENT EXTERNAL via the
+        # unchanged fallback path - the same false fact F1's own fix
+        # closed for the direct case, reopened here for the indirect
+        # (poisoning) one.
+        coordinate_unrecoverable_problems = [
+            p for p in worker_result.problems
+            if p.reason_code == "coordinate_value_unrecoverable"
+        ]
         externality_poisoned = (
             discovery_result.excluded_region_may_contain_target
             or bool(binary_excluded_code_bearing_problems)
             or bool(reactor_rule_problems)
+            or bool(coordinate_unrecoverable_problems)
         )
         # FIX ROUND 20b (seventeenth-round dispatch, THE MAJOR - poison-
         # rule VISIBILITY): reviewer-3 measured the poison rule firing
@@ -958,6 +974,15 @@ def run_scan(
                 "confident external claim because of it",
             )
             for p in reactor_rule_problems
+        ] + [
+            _problem_record(
+                "externality_suppressed", p.relative_path,
+                "this pom's own project-level coordinate contains XML constructs this "
+                "producer does not decode - every external-registry-miss import in this "
+                "run resolves unresolved rather than a confident external claim because "
+                "of it",
+            )
+            for p in coordinate_unrecoverable_problems
         ]
         dependencies = dependencies_artifact.build_dependencies(
             java_results, file_digests=file_digests, degraded_paths=degraded_paths,
@@ -1373,6 +1398,11 @@ def run_scan(
         ] + [
             {"path": p["path"], "trigger": "reactor"}
             for p in reactor_rule_problems
+        ] + [
+            # MICRO-ROUND 35b (R1c): the fourth poisoning trigger, one
+            # per pom whose own coordinate could not be decoded.
+            {"path": p.relative_path, "trigger": "coordinate_unrecoverable"}
+            for p in coordinate_unrecoverable_problems
         ])
 
         scan_doc = {

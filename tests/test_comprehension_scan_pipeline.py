@@ -6603,6 +6603,65 @@ def test_run_scan_reactor_modules_outside_root_and_missing_are_both_recorded(
     assert scan_doc["externality_suppressed"] is True
 
 
+def test_run_scan_a_pom_with_an_unrecoverable_own_coordinate_poisons_externality_run_wide(
+    java_repo: Path,
+) -> None:
+    """MICRO-ROUND 35b (reviewer-3 delta on `32a5fa6`, R1c wrong-data,
+    the reviewer's own undefined-entity shape verbatim): round 35's own
+    F1 fix stopped a CDATA/entity-broken pom coordinate from resolving a
+    genuine intra-reactor SIBLING edge to a fabricated CONFIDENT EXTERNAL
+    claim directly - but the poison OR-chain (`externality_poisoned`) was
+    never taught the new `coordinate_value_unrecoverable` reason code, so
+    a genuinely UNRELATED external-registry-miss dependency elsewhere in
+    the SAME run still resolved confident external, on a run that itself
+    RECORDS it cannot read this pom's own coordinate - the same
+    epistemic gap F3's own reactor-rule problems already poison on
+    (in-scan content this run cannot identify at all). A single pom with
+    both an unrecoverable own coordinate AND an ordinary external
+    dependency: the dependency's own build edge must resolve unresolved,
+    never a confident external claim, while this run cannot vouch its
+    own reactor is fully known."""
+    import json
+
+    (java_repo / "pom.xml").write_text(
+        "<project><groupId>com.acme</groupId>"
+        "<artifactId>bad&undefinedent;name</artifactId>"
+        "<dependencies><dependency>"
+        "<groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId>"
+        "</dependency></dependencies></project>",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    coordinate_problems = [
+        p for p in problems_doc["problems"]
+        if p["reason_code"] == "coordinate_value_unrecoverable"]
+    assert len(coordinate_problems) == 1
+    assert coordinate_problems[0]["path"] == "pom.xml"
+
+    poison_problems = [
+        p for p in problems_doc["problems"] if p["reason_code"] == "externality_suppressed"]
+    assert any(p["path"] == "pom.xml" for p in poison_problems)
+
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["externality_suppressed"] is True
+    assert any(
+        r["path"] == "pom.xml" and r["trigger"] == "coordinate_unrecoverable"
+        for r in scan_doc["externality_suppressed_roots"])
+    assert "externality_suppressed" in scan_doc["degraded_by"]
+
+    dependencies_doc = json.loads(
+        (outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    build_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "build" and r.get("target_unresolved") == "org.slf4j:slf4j-api")
+    assert build_edge["resolution_state"] == "unresolved"
+    assert build_edge.get("target_external") is None
+
+
 def test_run_scan_an_undeclared_vendored_module_silently_poisoned_now_degrades_visibly(
     java_repo: Path,
 ) -> None:
