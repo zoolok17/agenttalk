@@ -1791,6 +1791,12 @@ public class Controller {
         "could not be recovered as a literal" in p.detail and p.qualified_name == "p.Controller"
         for p in result.problems
     )
+    # FIX ROUND 35 (twenty-ninth cold read, F10 LOW, wrong-data): the
+    # METHOD-level fail-safe (the "incomplete fragment" half, fired
+    # because the class's own prefix is unrecoverable) used to carry
+    # qualified_name=None even though the owning class is known - both
+    # problems about this same class must now attribute it.
+    assert all(p.qualified_name == "p.Controller" for p in result.problems)
 
 
 def test_class_level_string_concatenation_is_unrecoverable_not_a_fabricated_fragment():
@@ -1840,6 +1846,12 @@ public class Controller {
     assert len(result.problems) == 1
     assert result.problems[0].reason_code == "route_value_unrecoverable"
     assert "could not be recovered as a literal" in result.problems[0].detail
+    # FIX ROUND 35 (twenty-ninth cold read, F10 LOW, wrong-data): this
+    # JAX-RS/Spring method-level fail-safe now attributes the owning
+    # type too, same as its @WebServlet twin already did - a consumer
+    # used to see qualified_name=None here even though the enclosing
+    # class is known.
+    assert result.problems[0].qualified_name == "p.Controller"
 
 
 def test_route_array_with_one_unrecoverable_element_is_unrecoverable_not_truncated():
@@ -1858,6 +1870,8 @@ class Controller {
     assert _edges(result, "route") == []
     assert len(result.problems) == 1
     assert result.problems[0].reason_code == "route_value_unrecoverable"
+    # FIX ROUND 35 (F10 LOW, wrong-data): same owning-type attribution.
+    assert result.problems[0].qualified_name == "p.Controller"
 
 
 def test_genuinely_valueless_method_annotation_still_composes_the_prefix_alone():

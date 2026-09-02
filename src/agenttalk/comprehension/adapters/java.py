@@ -2465,11 +2465,19 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             # than a bare fragment), or any other non-literal expression.
             # Never compose against an implicit empty value; suppress
             # and record why.
+            # FIX ROUND 35 (twenty-ninth cold read, F10 LOW, wrong-data):
+            # attribute the owning type here too - its @WebServlet twin
+            # (below) already does, and the type IS known: it is this
+            # same `enclosing` computed for every iteration of this loop
+            # (None only if no type was ever extracted at all, the same
+            # whole-file-scoped fallback every other unset qualified_name
+            # in this adapter uses).
             problems.append(JavaAdapterProblem(
                 reason_code="route_value_unrecoverable",
                 detail=f"a route annotation at line {line} has a value that could not be "
                        "recovered as a literal - suppressed rather than published with a "
                        "guessed or partial value",
+                qualified_name=enclosing,
             ))
             continue
         if enclosing in class_route_prefix_unrecoverable:
@@ -2477,11 +2485,14 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             # prefix could not be recovered - composing this method's
             # value against an implicit empty prefix would publish a
             # bare FRAGMENT as if it were the complete served path.
+            # FIX ROUND 35 (F10 LOW, wrong-data): same owning-type
+            # attribution as the sibling fail-safe just above.
             problems.append(JavaAdapterProblem(
                 reason_code="route_value_unrecoverable",
                 detail=f"a route annotation at line {line} is inside a class whose own route "
                        "prefix could not be recovered as a literal - suppressed rather than "
                        "published as an incomplete fragment",
+                qualified_name=enclosing,
             ))
             continue
         prefixes = class_route_prefix.get(enclosing)

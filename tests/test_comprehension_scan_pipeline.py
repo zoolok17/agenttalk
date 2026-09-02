@@ -1426,14 +1426,20 @@ def test_run_scan_a_route_value_constant_never_flips_source_understood_for_ordin
     assert any(p["reason_code"] == "route_value_unrecoverable" for p in problems_doc["problems"])
     assert not any(r["relation"] == "route" for r in json.loads(
         (outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))["edges"])
-    # FIX ROUND 13d (reviewer-3's LOW on round 13c): an UNATTRIBUTED
-    # problem (this one is file-wide, no single owning type) must omit
-    # the qualified_name KEY entirely - never publish it as null - the
-    # same absent-not-null idiom every other optional field in this
-    # artifact family already follows.
+    # FIX ROUND 13d (reviewer-3's LOW on round 13c) established the
+    # idiom this problem family follows: an unattributed problem omits
+    # the qualified_name KEY entirely, never publishes it as null.
+    # FIX ROUND 35 (twenty-ninth cold read, F10 LOW, wrong-data): this
+    # fixture's own route problem is NOT actually file-wide - Gamma is
+    # its one, entirely knowable owning type, the same fact its
+    # @WebServlet sibling already attributed - the round-13d comment's
+    # premise about THIS fixture was simply wrong. Now attributed like
+    # any other route_value_unrecoverable whose enclosing type is known;
+    # the absent-not-null idiom itself stands unchanged for the problems
+    # that are genuinely unattributable.
     route_problem = next(
         p for p in problems_doc["problems"] if p["reason_code"] == "route_value_unrecoverable")
-    assert "qualified_name" not in route_problem
+    assert route_problem["qualified_name"] == "p.Gamma"
 
 
 def test_run_scan_reports_unknown_not_satisfied_for_a_resource_capped_java_file(
