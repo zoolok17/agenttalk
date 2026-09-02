@@ -283,3 +283,94 @@ def test_direct_construction_of_preflight_result_is_rejected() -> None:
             vcs_privacy="ignored", vcs_kind="git", matched_rule=None, work_id=None,
             root_binding="deadbeef",
         )
+
+
+# --------------------- FIX ROUND 34 (reviewer-3's re-delta on round 33's
+# own R1 fix - THE HOLE): verify_store_ignored, the store-wide ground-truth
+# check that replaces per-directory enumeration entirely.
+
+def test_preflight_still_refuses_a_static_index_json_only_reinclusion(tmp_path: Path) -> None:
+    """Regression control (dispatch item 3): the PREFLIGHT's own probe
+    already names the real ``index.json`` path literally (see
+    ``_PRIVACY_PROBE_RELATIVE_PATHS``), so a STATIC rule (present from
+    the very start, unlike the round 34 MID-RUN flip shapes above) that
+    re-includes only ``index.json`` was already caught before round 34
+    and must stay caught - round 34 only widens the POST-publish
+    guarantee, it never narrows the preflight's own existing reach."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(
+        ".agenttalk/**\n"
+        "!.agenttalk/comprehension/\n"
+        "!.agenttalk/comprehension/index.json\n",
+        encoding="utf-8",
+    )
+    _commit_all(tmp_path, "base")
+    with pytest.raises(VcsPrivacyRefused):
+        privacy.run_privacy_preflight(tmp_path)
+
+
+def test_verify_store_ignored_passes_when_the_whole_store_is_ignored(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(".agenttalk/\n", encoding="utf-8")
+    _commit_all(tmp_path, "base")
+    store = tmp_path / ".agenttalk" / "comprehension"
+    (store / "runs" / "scan-1").mkdir(parents=True)
+    (store / "index.json").write_text("{}", encoding="utf-8")
+    (store / "runs" / "scan-1" / "scan.json").write_text("{}", encoding="utf-8")
+    privacy.verify_store_ignored(tmp_path, ".agenttalk/comprehension")  # must not raise
+
+
+def test_verify_store_ignored_refuses_when_index_json_specifically_is_stageable(
+    tmp_path: Path,
+) -> None:
+    """The reader's own THE HOLE shape: a rule re-including ONLY
+    index.json (never touching runs/**) still makes it stageable - the
+    whole-store check must catch this exactly as it catches a runs/**
+    leak, since it never enumerates by directory at all."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(
+        ".agenttalk/**\n"
+        "!.agenttalk/comprehension/\n"
+        "!.agenttalk/comprehension/index.json\n",
+        encoding="utf-8",
+    )
+    _commit_all(tmp_path, "base")
+    store = tmp_path / ".agenttalk" / "comprehension"
+    (store / "runs" / "scan-1").mkdir(parents=True)
+    (store / "index.json").write_text("{}", encoding="utf-8")
+    (store / "runs" / "scan-1" / "scan.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(VcsPrivacyRefused, match="index.json"):
+        privacy.verify_store_ignored(tmp_path, ".agenttalk/comprehension")
+
+
+def test_verify_store_ignored_refuses_on_an_unanticipated_new_file(tmp_path: Path) -> None:
+    """The class-closure proof: a file NO enumeration ever anticipated
+    (never named by any probe, any prior fix, or any test fixture) must
+    still be caught, because this check never enumerates anything - it
+    asks git what is stageable, period."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(
+        ".agenttalk/**\n"
+        "!.agenttalk/comprehension/\n"
+        "!.agenttalk/comprehension/a-file-nobody-named.txt\n",
+        encoding="utf-8",
+    )
+    _commit_all(tmp_path, "base")
+    store = tmp_path / ".agenttalk" / "comprehension"
+    store.mkdir(parents=True)
+    (store / "index.json").write_text("{}", encoding="utf-8")
+    (store / "a-file-nobody-named.txt").write_text("surprise", encoding="utf-8")
+    with pytest.raises(VcsPrivacyRefused, match="a-file-nobody-named.txt"):
+        privacy.verify_store_ignored(tmp_path, ".agenttalk/comprehension")
+
+
+def test_verify_store_ignored_fails_closed_when_not_a_git_repo(tmp_path: Path) -> None:
+    """A genuine git query failure (no repository at all here) must
+    refuse, never silently treat "the query broke" as "nothing is
+    stageable" - fail-closed, the same discipline every other check in
+    this module already follows."""
+    store = tmp_path / ".agenttalk" / "comprehension"
+    store.mkdir(parents=True)
+    (store / "index.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(VcsPrivacyRefused):
+        privacy.verify_store_ignored(tmp_path, ".agenttalk/comprehension")

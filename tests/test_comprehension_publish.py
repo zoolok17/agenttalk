@@ -236,15 +236,17 @@ def test_rename_refuses_when_run_directory_already_exists(
     lockmod.release_scan_lock(lock)
 
 
-# --------------------- FIX ROUND 33 (twenty-ninth cold read, R1 REJECT on
-# round 32's own F1): the pre-rename "belt" (a synthetic, proof-by-proxy
-# single path) is replaced by a POST-rename ground-truth check against
-# every REAL file the run actually published, with rollback on refusal.
+# --------------------- FIX ROUND 34 (reviewer-3's re-delta on round 33's
+# own R1 fix - THE HOLE): round 33's own ground-truth check only ever
+# enumerated runs/<scan_id>/ - index.json (written by the OTHER publish
+# step, at the store root) sat outside its reach. Replaced by ONE store-
+# wide check (no enumeration anywhere) run after BOTH publish steps
+# complete, with rollback of both the run directory AND index.json.
 
-def test_publish_run_ground_truth_check_passes_when_still_ignored(
+def test_publish_run_store_wide_check_passes_when_still_ignored(
     comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
-    """Regression control: the ground-truth check must not spuriously
+    """Regression control: the store-wide check must not spuriously
     refuse an ordinary publish when the comprehension dir is still
     genuinely ignored exactly as the preflight proved."""
     lock, staging = _stage(comprehension_dir, comprehension_privacy, "scan-1")
@@ -254,21 +256,19 @@ def test_publish_run_ground_truth_check_passes_when_still_ignored(
         record_counts=_COUNTS, privacy_result=comprehension_privacy,
     )
     assert (comprehension_dir / "runs" / "scan-1").is_dir()
+    assert (comprehension_dir / "index.json").exists()
 
 
-def test_publish_run_ground_truth_check_refuses_and_rolls_back_mid_run_gitignore_removal(
+def test_publish_run_store_wide_check_refuses_and_rolls_back_mid_run_gitignore_removal(
     comprehension_privacy_root: Path, comprehension_dir: Path,
     comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
     """The preflight proved ``.agenttalk/`` ignored at lock-acquisition
     time, but a ``.gitignore`` removal DURING the run (a TOCTOU-shaped gap)
-    must still be caught - now checked against the REAL, just-published
-    ``runs/scan-1/scan.json`` (a path that only exists AFTER the rename,
-    never a synthetic stand-in checked before it existed - DEFEAT 3 from
-    round 32's own pre-rename belt). On refusal, the just-published run
-    directory is rolled back (removed) - nothing is left stageable in
-    either ``.staging/`` (already renamed away) or ``runs/`` (just
-    removed)."""
+    must still be caught - checked once, after both publish steps
+    complete. On refusal, the just-published run directory AND index.json
+    are both rolled back - nothing is left stageable anywhere in the
+    store."""
     lock, staging = _stage(comprehension_dir, comprehension_privacy, "scan-1")
     (comprehension_privacy_root / ".gitignore").unlink()
     with pytest.raises(VcsPrivacyRefused):
@@ -279,21 +279,19 @@ def test_publish_run_ground_truth_check_refuses_and_rolls_back_mid_run_gitignore
         )
     assert not staging.path.exists()  # renamed away, never restored
     assert not (comprehension_dir / "runs" / "scan-1").exists()  # rolled back
+    assert not (comprehension_dir / "index.json").exists()  # first-ever publish: removed, not restored
     assert not lock.path.exists()  # still released despite the refusal (design step 3)
 
 
-def test_publish_run_ground_truth_check_refuses_defeat_1_filename_specific_reinclusion(
+def test_publish_run_store_wide_check_refuses_defeat_1_filename_specific_reinclusion(
     comprehension_privacy_root: Path, comprehension_dir: Path,
     comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
-    """FIX ROUND 33's own DEFEAT 1 (reviewer-3's delta on round 32's F1):
-    a synthetic probe named by a FIXED, arbitrary filename ("scan.json")
-    stays "ignored" under a rule that re-includes a DIFFERENT real
-    artifact filename specifically - the old sentinel could never see
-    this, because it never checked the OTHER real filenames a run
-    actually publishes. Here a second real artifact ("modules.json") is
-    re-included by name; the ground-truth check enumerates the ACTUAL
-    published files (not a synthetic stand-in) and must catch it."""
+    """Round 32's own DEFEAT 1 (reviewer-3's delta): a rule re-including a
+    real artifact filename specifically ("modules.json") - the store-wide
+    check asks git directly what is stageable, never enumerates a
+    directory by hand, so it catches this the same way it catches
+    everything else."""
     (comprehension_privacy_root / ".gitignore").write_text(
         ".agenttalk/**\n"
         "!.agenttalk/comprehension/\n"
@@ -316,19 +314,16 @@ def test_publish_run_ground_truth_check_refuses_defeat_1_filename_specific_reinc
     assert not (comprehension_dir / "runs" / "scan-1").exists()  # rolled back
 
 
-def test_publish_run_ground_truth_check_refuses_defeat_2_scan_id_shape_reinclusion(
+def test_publish_run_store_wide_check_refuses_defeat_2_scan_id_shape_reinclusion(
     comprehension_privacy_root: Path, comprehension_dir: Path,
     comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
-    """FIX ROUND 33's own DEFEAT 2 (reviewer-3's delta, THE WORST one): a
-    synthetic probe using a FIXED, non-matching literal scan-id
-    ("privacy-probe-run") stays "ignored" under a rule keyed on the REAL
-    scan-id's own shape (a date-prefixed pattern, ``runs/2026*/``) - that
-    rule leaks an ENTIRE real run while looking unremarkable, since the
-    probe's own literal id never matches it. Uses a realistic, date-
-    shaped scan_id (unlike this file's own bare "scan-1" convention
-    elsewhere) specifically so the shape-keyed rule below has something
-    real to match against."""
+    """Round 32's own DEFEAT 2 (reviewer-3's delta, THE WORST one): a rule
+    keyed on the REAL scan-id's own shape (a date-prefixed pattern,
+    ``runs/2026*/``) - the store-wide check has no probe id to defeat at
+    all. Uses a realistic, date-shaped scan_id (unlike this file's own
+    bare "scan-1" convention elsewhere) so the shape-keyed rule has
+    something real to match against."""
     real_scan_id = "20260901T120000000000Z-a1b2c3d4"
     (comprehension_privacy_root / ".gitignore").write_text(
         ".agenttalk/**\n"
@@ -351,12 +346,92 @@ def test_publish_run_ground_truth_check_refuses_defeat_2_scan_id_shape_reinclusi
     assert not (comprehension_dir / "runs" / real_scan_id).exists()  # rolled back
 
 
-def test_rename_ground_truth_check_skipped_for_acknowledged_unignored_disposition(
+def test_publish_run_store_wide_check_refuses_defeat_3_index_json_only_reinclusion(
+    comprehension_privacy_root: Path, comprehension_dir: Path,
+    comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """THE HOLE round 34 itself closes: a rule re-including ONLY
+    index.json (never touching runs/**) leaked it under round 33's own
+    check, since that check only ever enumerated ``runs/<scan_id>/`` -
+    index.json is written by the OTHER publish step, at the store root,
+    never inside that directory. Asserts the FULL rollback contract: the
+    run directory is removed, the PRE-write index.json bytes are restored
+    byte-exact (there was already a published generation before this
+    attempt), and a real ``git ls-files --others --exclude-standard``
+    query against the whole store proves NOTHING is left stageable
+    afterward - not just a disposition check, the actual ground truth."""
+    import subprocess
+
+    lock1, staging1 = _stage(comprehension_dir, comprehension_privacy, "scan-1")
+    pub.publish_run(
+        staging_handle=staging1, lock_handle=lock1,
+        run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None,
+        record_counts=_COUNTS, privacy_result=comprehension_privacy,
+    )
+    prior_index_bytes = (comprehension_dir / "index.json").read_bytes()
+    _doc, predecessor_digest = pub.read_current_index(comprehension_dir)
+
+    (comprehension_privacy_root / ".gitignore").write_text(
+        ".agenttalk/**\n"
+        "!.agenttalk/comprehension/\n"
+        "!.agenttalk/comprehension/index.json\n",
+        encoding="utf-8",
+    )
+    lock2, staging2 = _stage(comprehension_dir, comprehension_privacy, "scan-2")
+    with pytest.raises(VcsPrivacyRefused, match="index.json"):
+        pub.publish_run(
+            staging_handle=staging2, lock_handle=lock2,
+            run_summary={"scan_id": "scan-2"}, predecessor_index_digest=predecessor_digest,
+            record_counts=_COUNTS, privacy_result=comprehension_privacy,
+        )
+    assert not (comprehension_dir / "runs" / "scan-2").exists()  # rolled back
+    assert (comprehension_dir / "runs" / "scan-1").exists()  # the OLD generation is untouched
+    assert (comprehension_dir / "index.json").read_bytes() == prior_index_bytes  # byte-exact restore
+
+    # The refused attempt's own residual exposure (never the operator's own
+    # still-broken .gitignore, a separate real-world problem outside this
+    # fix's scope) - restore the good rule and prove nothing is left over
+    # from the rolled-back scan-2 attempt.
+    (comprehension_privacy_root / ".gitignore").write_text(".agenttalk/\n", encoding="utf-8")
+    result = subprocess.run(
+        ["git", "-C", str(comprehension_privacy_root), "ls-files", "--others",
+         "--exclude-standard", "--", ".agenttalk/comprehension"],
+        capture_output=True, text=True, encoding="utf-8", check=True,
+    )
+    assert result.stdout.strip() == ""  # git add -A would stage nothing from the store
+
+
+def test_publish_run_store_wide_check_refuses_on_an_unanticipated_new_file(
+    comprehension_privacy_root: Path, comprehension_dir: Path,
+    comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """The class-closure proof: a file no enumeration ever anticipated
+    (dropped directly into the store, never named by any probe or any
+    prior fix) must still be caught - the store-wide check never
+    enumerates anything, it asks git what is stageable, period."""
+    (comprehension_privacy_root / ".gitignore").write_text(
+        ".agenttalk/**\n"
+        "!.agenttalk/comprehension/\n"
+        "!.agenttalk/comprehension/a-file-nobody-named.txt\n",
+        encoding="utf-8",
+    )
+    lock, staging = _stage(comprehension_dir, comprehension_privacy, "scan-1")
+    (comprehension_dir / "a-file-nobody-named.txt").write_text("surprise", encoding="utf-8")
+    with pytest.raises(VcsPrivacyRefused, match="a-file-nobody-named.txt"):
+        pub.publish_run(
+            staging_handle=staging, lock_handle=lock,
+            run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None,
+            record_counts=_COUNTS, privacy_result=comprehension_privacy,
+        )
+    assert not (comprehension_dir / "runs" / "scan-1").exists()  # rolled back
+
+
+def test_publish_run_store_wide_check_skipped_for_acknowledged_unignored_disposition(
     comprehension_privacy_root: Path, comprehension_dir: Path,
 ) -> None:
     """An operator who explicitly ACKNOWLEDGED an unignored store already
-    accepted this exact risk for this one run - the ground-truth check
-    only applies to the automatic "ignored" disposition and must not
+    accepted this exact risk for this one run - the store-wide check only
+    applies to the automatic "ignored" disposition and must not
     spuriously re-refuse a publish that was never claiming "ignored" in
     the first place."""
     acknowledged = privacymod.acknowledge_unignored_private_store(
@@ -371,17 +446,31 @@ def test_rename_ground_truth_check_skipped_for_acknowledged_unignored_dispositio
     assert (comprehension_dir / "runs" / "scan-1").is_dir()
 
 
-def test_rename_ground_truth_check_skipped_when_no_privacy_result_passed(
+def test_rename_has_no_privacy_parameter_and_publish_run_still_works_without_one(
     comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
-    """``privacy_result`` is optional (default ``None``) precisely so tests
-    exercising the rename mechanics alone need not construct one - this is
-    the existing, pre-round-32 calling shape and must keep working
-    unchanged."""
+    """FIX ROUND 34: ``rename_staging_to_run`` no longer takes a
+    ``privacy_result`` at all (the whole-store check lives solely in
+    ``publish_run`` now) - tests exercising the rename mechanics alone
+    still need construct nothing privacy-related."""
     lock, staging = _stage(comprehension_dir, comprehension_privacy, "scan-1")
     result = pub.rename_staging_to_run(staging, lock)
     assert result == comprehension_dir / "runs" / "scan-1"
     lockmod.release_scan_lock(lock)
+
+
+def test_publish_run_store_wide_check_skipped_when_no_privacy_result_passed(
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """``privacy_result`` is optional (default ``None``) precisely so tests
+    exercising ``publish_run`` alone need not construct one."""
+    lock, staging = _stage(comprehension_dir, comprehension_privacy, "scan-1")
+    pub.publish_run(
+        staging_handle=staging, lock_handle=lock,
+        run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None,
+        record_counts=_COUNTS,
+    )
+    assert (comprehension_dir / "runs" / "scan-1").is_dir()
 
 
 # ----------------------------------------------------------- crash injection

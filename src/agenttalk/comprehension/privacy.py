@@ -36,10 +36,21 @@ defeats it while leaving the probe itself "ignored". This module's own
 :func:`run_privacy_preflight`/:func:`_check_ignore` remain a cheap, EARLY
 fail-fast against an obviously-unignored store — refusing before any
 scan work even starts is still worth doing — but they are NOT this
-plane's actual privacy guarantee any more. The guarantee is
-:func:`verify_published_paths_ignored`, called by ``publish.py``
-immediately AFTER a run's real files exist on disk, checking those exact
-real paths directly — no proxy, nothing left to generalize.
+plane's actual privacy guarantee any more.
+
+FIX ROUND 34 (reviewer-3's re-delta on round 33's own R1 fix — THE
+HOLE): round 33's own ground-truth check (enumerate the real files
+``rename_staging_to_run`` just wrote under ``runs/<scan_id>/``, verify
+each directly) reached everything INSIDE that one directory, but
+publication's OTHER step — ``publish.publish_index_cas``, which
+CAS-writes ``index.json`` at the store root — was never in its
+enumeration. THE GUARANTEE now belongs to :func:`verify_store_ignored`:
+called by ``publish.py`` once, after BOTH publish steps fully complete,
+asking git directly what is stageable across the WHOLE store
+(``git ls-files --others --exclude-standard``) rather than enumerating
+any directory by hand — this covers ``index.json``, every
+``runs/<id>/`` artifact, and any file a future slice adds under this
+same store, with no enumeration left to fall out of date.
 """
 
 from __future__ import annotations
@@ -80,13 +91,22 @@ GIT_TIMEOUT_SECONDS = 2.0
 #: ignored, therefore everything published is," which is false for any
 #: rule that discriminates by real filename or real scan-id SHAPE rather
 #: than by these probes' own fixed literal spelling. Confirmed defeated
-#: three ways (see ``verify_published_paths_ignored``'s own docstring for
-#: the fix). This preflight — and the module-level probe below — is
+#: three ways. This preflight — and the module-level probe below — is
 #: DEMOTED to a cheap, EARLY, non-authoritative fail-fast: a real store
 #: this obviously unignored is refused before any scan work even starts,
-#: which is still worth doing, but it is NO LONGER the guarantee. The
-#: guarantee is ``verify_published_paths_ignored``, checked against the
-#: REAL, now-existing published paths, after publication.
+#: which is still worth doing, but it is NO LONGER the guarantee.
+#:
+#: FIX ROUND 34 (reviewer-3's re-delta — THE HOLE): note that the first
+#: probe above already names the REAL ``index.json`` path (not a
+#: synthetic id) — so a rule targeting it specifically WAS caught, but
+#: only at THIS one-time, pre-scan moment. A ``.gitignore`` flip that
+#: re-includes ``index.json`` AFTER this preflight ran (and specifically
+#: before ``publish.publish_index_cas`` writes it) is invisible to a
+#: check that only ever runs once, before the scan even starts. THE
+#: guarantee is now ``verify_store_ignored``, called once by
+#: ``publish.py`` after BOTH publish steps fully complete, asking git
+#: directly what is stageable across the whole store rather than probing
+#: (or enumerating) anything by hand.
 _PRIVACY_PROBE_RELATIVE_PATHS = (
     f"{RELATIVE_COMPREHENSION_DIR}/{INDEX_FILENAME}",
     f"{RELATIVE_COMPREHENSION_DIR}/{RUNS_DIRNAME}/privacy-probe-run/scan.json",
@@ -194,12 +214,11 @@ def _check_ignore_one(root: Path, relative_path: str) -> tuple[bool, str | None]
     (design: "use Git's ignore matcher on a synthetic child path to prove
     the directory is ignored" — never inferred by reading ``.gitignore``
     text). Returns ``(is_ignored, matched_rule)``, or ``None`` if the query
-    itself could not be trusted. Shared by :func:`_check_ignore` (the
-    demoted, early-refusal multi-probe preflight) and
-    :func:`verify_published_paths_ignored` (the round 33 ground-truth
-    check publish.py runs immediately after publication, against every
-    real published path) — the same git check-ignore machinery, never
-    duplicated.
+    itself could not be trusted. Used only by :func:`_check_ignore` (the
+    demoted, early-refusal multi-probe preflight) — the round 34 ground-
+    truth check (:func:`verify_store_ignored`) asks a different git
+    question entirely (``ls-files --others``, not ``check-ignore``), so
+    it does not share this helper.
 
     FIX ROUND 32 (F1 BLOCKER, discovered while building the multi-probe
     regression fixtures — a proper `!pattern` re-inclusion chain (unlike the
@@ -235,8 +254,8 @@ def _check_ignore(root: Path) -> tuple[bool, str | None] | None:
     whole store ignored) and requires all of them to independently prove
     ignored. A store this obviously unignored is refused before any scan
     work even starts — still worth doing — but a ``True`` result here is
-    NOT the guarantee; see :func:`verify_published_paths_ignored` for the
-    actual ground-truth check. Returns ``(True, matched_rule)`` (the first
+    NOT the guarantee; see :func:`verify_store_ignored` for the actual
+    ground-truth check. Returns ``(True, matched_rule)`` (the first
     probe's own rule) only when every probe is ignored; ``(False, None)``
     as soon as any probe proves NOT ignored; ``None`` (untrustworthy) as
     soon as any probe's query itself could not be trusted."""
@@ -253,55 +272,70 @@ def _check_ignore(root: Path) -> tuple[bool, str | None] | None:
     return True, first_matched_rule
 
 
-def verify_published_paths_ignored(root: Path, relative_paths: list[str]) -> None:
-    """FIX ROUND 33 (twenty-ninth cold read, R1 REJECT on round 32's own
-    F1, reviewer-3's delta): STOPS PROVING BY PROXY. Round 32 replaced one
-    synthetic sentinel with three, but the proof was still "these specific
-    literal paths are ignored, therefore everything published is" — false
-    for any rule discriminating by real filename or real id shape.
-    Reviewer-3 broke it three ways, each confirmed by actually staging
-    artifacts in a run the old preflight/belt ALLOWED:
+def verify_store_ignored(root: Path, relative_store_dir: str) -> None:
+    """FIX ROUND 34 (reviewer-3's re-delta on round 33's own R1 fix - THE
+    HOLE): round 33 stopped proving by proxy for the ``runs/<scan_id>/``
+    directory (enumerating its own real files and checking each one
+    directly) — but publication is TWO steps: step 1 renames staging into
+    ``runs/<scan_id>/``; step 2 CAS-writes ``index.json`` at the STORE
+    ROOT, never inside the directory step 1's own enumeration ever
+    walked. A mid-run ``.gitignore`` flip re-including ONLY ``index.json``
+    left it unprotected by anything but the demoted, early preflight —
+    the identical flip re-including ``runs/**`` was correctly refused,
+    proving the mechanism works everywhere it REACHES; ``index.json`` sat
+    outside its reach. Round 32's probes forgot filenames and id shapes;
+    round 33's check remembers those perfectly and forgot the file
+    written by the OTHER publication step — the same class of defect,
+    a third time.
 
-    1. The probes name fixed FILENAMES (``scan.json``, ``owner.json``) — a
-       ``.gitignore`` re-including a DIFFERENT real filename specifically
-       (``!.../runs/*/modules.json``) leaves every probe "ignored" while
-       that one real artifact (and, by the same rule shape, any other
-       filename the probes never named) leaks.
-    2. The probe id is the fixed literal ``"privacy-probe-run"`` — a rule
-       keyed on the REAL scan-id shape (``!.../runs/2026*/``) leaks an
-       entire real run while looking unremarkable, since the probe's own
-       id never matches that pattern and so still reports "ignored".
-    3. The pre-rename belt asked about ``runs/<scan_id>/`` BEFORE the
-       rename created it — a directory-only pattern cannot be confirmed
-       against a path that does not yet exist, so the belt's own answer
-       could flip the instant the rename actually landed.
+    RETIRES THE CLASS (reviewer-3's own prescription, taken): no
+    enumeration at all, of anything. Asks git ONCE, after publication
+    fully completes, what is actually stageable across the WHOLE store —
+    ``git ls-files --others --exclude-standard`` lists every untracked
+    path that is NOT excluded by ``.gitignore``/``.git/info/exclude``/
+    global excludes, scoped to ``relative_store_dir``. Anything this
+    returns is stageable BY DEFINITION — there is nothing left to
+    generalize from, and nothing to fall out of date, because this
+    covers ``index.json``, every ``runs/<id>/`` artifact, and any file a
+    future slice adds under this same directory, with nobody needing to
+    remember to enumerate it.
 
-    The fix: no synthetic stand-in at all. The caller passes the ACTUAL,
-    now-published relative file paths under ``runs/<scan_id>/`` — real
-    filenames, the real scan-id, checked only AFTER the rename so every
-    path genuinely exists on disk — and this asks git's ignore matcher
-    about EACH ONE directly. There is no generalization left to defeat,
-    because nothing here is inferred from a stand-in; the paths ARE the
-    published content. Raises :class:`VcsPrivacyRefused` (``vcs_kind=
-    "git"``) the moment any real path is not (or can no longer be trusted
-    to be) proven ignored; the caller is responsible for removing the
-    just-published run directory on this raise — this function only ever
-    queries git, it never touches the filesystem itself.
+    Tracked files inside the store are a SEPARATE, already-covered
+    concern: :func:`run_privacy_preflight`'s own ``_tracked_paths_under_
+    comprehension_dir`` check already refuses those, at lock acquisition,
+    before any scan work starts. ``--others`` deliberately never
+    re-flags an already-tracked path (that is what "others" excludes) —
+    this function's own job is only the untracked-and-unignored gap that
+    earlier check cannot see.
+
+    Raises :class:`VcsPrivacyRefused` (``vcs_kind="git"``) the moment
+    anything is stageable, or the query itself could not be trusted
+    (fail-closed, same as every other check in this module); the caller
+    is responsible for rolling back the just-completed publication on
+    this raise — this function only ever queries git, it never touches
+    the filesystem itself.
 
     Callers must gate on the recorded disposition themselves, same as
-    round 32's own belt did: only meaningful for the automatic ``"ignored"``
-    disposition — an operator who explicitly ACKNOWLEDGED an unignored
-    store already accepted this exact risk for this one run, and
-    re-checking here would spuriously refuse a publish that operator
-    already attended to."""
-    for relative_path in relative_paths:
-        status = _check_ignore_one(root, relative_path)
-        if status is None or not status[0]:
-            raise VcsPrivacyRefused(
-                f"{relative_path} is not proven ignored by Git immediately after "
-                "publication (ground-truth re-check) — refusing to publish, and "
-                "removing the just-published run", vcs_kind="git",
-            )
+    round 33's own check did: only meaningful for the automatic
+    ``"ignored"`` disposition — an operator who explicitly ACKNOWLEDGED
+    an unignored store already accepted this exact risk for this one
+    run, and re-checking here would spuriously refuse a publish that
+    operator already attended to."""
+    result = _run_git(root, "ls-files", "--others", "--exclude-standard", "--", relative_store_dir)
+    if result is None or result.returncode != 0:
+        raise VcsPrivacyRefused(
+            "git ls-files could not be trusted to answer whether "
+            f"{relative_store_dir}/ has any stageable (untracked, unignored) content "
+            "immediately after publication — refusing", vcs_kind="git",
+        )
+    stageable = sorted(line for line in result.stdout.splitlines() if line)
+    if stageable:
+        raise VcsPrivacyRefused(
+            f"{len(stageable)} path(s) under {relative_store_dir}/ are stageable "
+            f"(untracked and not ignored) immediately after publication (e.g. "
+            f"{stageable[0]!r}) — refusing, rolling back the just-published run, and "
+            "restoring the prior index.json", vcs_kind="git",
+        )
 
 
 def run_privacy_preflight(root: Path) -> PrivacyPreflightResult:

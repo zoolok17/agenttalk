@@ -53,11 +53,12 @@ from .envelope import (
 )
 from .errors import ComprehensionError, StagingSourceEscapesRoot, VcsPrivacyRefused
 from .lock import ScanLockHandle, release_scan_lock
+from .paths import RELATIVE_COMPREHENSION_DIR
 from .paths import index_path as _index_path
 from .paths import project_root_from_comprehension_dir
 from .paths import runs_dir as _runs_dir
 from .paths import staging_dir as _staging_dir
-from .privacy import PrivacyPreflightResult, verify_published_paths_ignored
+from .privacy import PrivacyPreflightResult, verify_store_ignored
 from .staging import _OWNER_FILENAME, StagingHandle, _validate_owner_doc
 
 INDEX_SCHEMA_VERSION = 1
@@ -118,7 +119,6 @@ def _is_windows() -> bool:
 
 def rename_staging_to_run(
     staging_handle: StagingHandle, lock_handle: ScanLockHandle,
-    *, privacy_result: PrivacyPreflightResult | None = None,
 ) -> Path:
     """Publish step 1: rename the staging directory to
     ``runs/<scan_id>/``. Bounded exponential retry on a Windows sharing
@@ -156,23 +156,19 @@ def rename_staging_to_run(
     path (never from the handle's claimed fields) — all three raise
     :class:`~.errors.StagingSourceEscapesRoot`.
 
-    FIX ROUND 33 (twenty-ninth cold read, R1 REJECT on round 32's own F1,
-    reviewer-3's delta - "stop proving by proxy"): ``privacy_result`` is
-    optional so tests exercising the rename mechanics alone need not
-    construct one, but the real ``scan_pipeline.run_scan`` orchestrator
-    always passes the one it obtained at lock acquisition. When its
-    ``vcs_privacy`` is the automatic ``"ignored"`` (never for an explicit
-    ``acknowledged_unignored``/``no_vcs_acknowledged`` override, which
-    already accepted this exact risk), :func:`_verify_published_ignored_
-    or_rollback` re-verifies EVERY REAL file now published under
-    ``runs/<scan_id>/`` is ignored — a ground-truth check against paths
-    that actually exist, run only AFTER the rename below, replacing round
-    32's own pre-rename single-synthetic-path "belt" (which proved by
-    proxy against a path that did not exist yet, and was defeated three
-    ways - see :func:`privacy.verify_published_paths_ignored`'s own
-    docstring). A failure here removes the just-renamed run directory
-    before raising - the content already sat in ``.staging/`` regardless,
-    so this rollback adds no NEW exposure window, only a fail-closed one.
+    FIX ROUND 34 (reviewer-3's re-delta on round 33's own R1 fix - THE
+    HOLE): this function no longer takes a ``privacy_result`` or performs
+    any privacy check of its own. Round 33's own per-directory ground-
+    truth check (enumerate ``dst``'s real files, verify each) reached
+    everything renamed here, but publication's OTHER step
+    (:func:`publish_index_cas`, which writes ``index.json`` at the STORE
+    ROOT, never inside this directory) was outside its reach - the same
+    "forgot something" class as round 32's own sentinel defeats, a third
+    time. The privacy guarantee is now ONE store-wide check
+    (:func:`_verify_store_ignored_or_rollback`), run by :func:`publish_run`
+    ONLY after BOTH publish steps fully complete - see that function's own
+    docstring. No enumeration of any directory happens here or there
+    anymore; nothing to fall out of date.
     """
     if staging_handle.owner_token != lock_handle.owner_token:
         raise StagingOwnershipMismatch(
@@ -217,7 +213,6 @@ def rename_staging_to_run(
     if not _is_windows():
         os.rename(staging_handle.path, dst)
         _strip_owner_file(dst)
-        _verify_published_ignored_or_rollback(dst, comprehension_dir, privacy_result)
         return dst
     deadline = time.monotonic() + _RENAME_RETRY_TIMEOUT_SECONDS
     delay = 0.01
@@ -225,7 +220,6 @@ def rename_staging_to_run(
         try:
             os.rename(staging_handle.path, dst)
             _strip_owner_file(dst)
-            _verify_published_ignored_or_rollback(dst, comprehension_dir, privacy_result)
             return dst
         except PermissionError as exc:
             if time.monotonic() >= deadline:
@@ -235,39 +229,6 @@ def rename_staging_to_run(
                 ) from exc
             time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
             delay = min(delay * 2, 0.25)
-
-
-def _verify_published_ignored_or_rollback(
-    dst: Path, comprehension_dir: Path, privacy_result: PrivacyPreflightResult | None,
-) -> None:
-    """FIX ROUND 33 (twenty-ninth cold read, R1 REJECT on round 32's own
-    F1, reviewer-3's delta): the ground-truth replacement for round 32's
-    own pre-rename "belt" - see :func:`privacy.verify_published_paths_
-    ignored`'s own docstring for the three ways that belt was defeated.
-    Runs ONLY after the rename above has already landed ``dst`` on disk
-    (mind DEFEAT 3: never check a path before it exists), and only when
-    the recorded disposition is the automatic ``"ignored"`` (an
-    ``acknowledged_unignored``/``no_vcs_acknowledged`` override already
-    accepted this exact risk and must never be re-refused here).
-
-    Enumerates every REAL file `dst` now contains (never a synthetic
-    stand-in), converts each to a project-root-relative POSIX path, and
-    hands the list to :func:`privacy.verify_published_paths_ignored`. On
-    refusal, removes the just-published run directory before letting the
-    exception propagate - the content already sat in ``.staging/``
-    regardless of this check, so deleting it here on failure closes the
-    window rather than widening it."""
-    if privacy_result is None or privacy_result.vcs_privacy != "ignored":
-        return
-    root = project_root_from_comprehension_dir(comprehension_dir)
-    published_paths = sorted(
-        path.relative_to(root).as_posix() for path in dst.rglob("*") if path.is_file()
-    )
-    try:
-        verify_published_paths_ignored(root, published_paths)
-    except VcsPrivacyRefused:
-        shutil.rmtree(dst, ignore_errors=False)
-        raise
 
 
 def _strip_owner_file(run_dir: Path) -> None:
@@ -391,6 +352,95 @@ def _replace_with_windows_retry(src: Path, dst: Path) -> None:
     os.replace(src, dst)
 
 
+def _read_index_bytes_if_exists(comprehension_dir: Path) -> bytes | None:
+    """FIX ROUND 34: captures ``index.json``'s exact PRE-write bytes
+    before :func:`publish_index_cas` overwrites it, so a later privacy
+    rollback can restore them byte-for-byte rather than reconstruct a
+    document. ``None`` means no index has ever been published yet (the
+    very first publish) — a rollback then DELETES the just-written index
+    rather than "restoring" a file that never existed."""
+    try:
+        return _index_path(comprehension_dir).read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def _restore_index_bytes(path: Path, content: bytes) -> None:
+    """FIX ROUND 34: writes ``content`` to a sibling temp file and swaps
+    it in atomically — the identical durable-write idiom
+    :func:`publish_index_cas` itself already uses, applied in reverse."""
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=".rollback.tmp", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        _replace_with_windows_retry(tmp_path, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp_path)
+        raise
+
+
+def _verify_store_ignored_or_rollback(
+    *, comprehension_dir: Path, run_dir: Path, privacy_result: PrivacyPreflightResult | None,
+    prior_index_bytes: bytes | None,
+) -> None:
+    """FIX ROUND 34 (reviewer-3's re-delta on round 33's own R1 fix - THE
+    HOLE): publication is TWO steps - :func:`rename_staging_to_run`
+    (``runs/<scan_id>/``) and :func:`publish_index_cas` (``index.json``,
+    at the STORE ROOT). Round 33's own ground-truth check only ever
+    enumerated the first step's own directory - ``index.json``, written
+    by the SECOND step, was never in that enumeration, covered only by
+    the demoted, one-time, pre-scan preflight. A mid-run ``.gitignore``
+    flip re-including ONLY ``index.json`` therefore leaked it while
+    ``runs/**`` stayed correctly refused - the mechanism worked
+    everywhere it reached; ``index.json`` sat outside its reach.
+
+    RETIRES THE CLASS (reviewer-3's own prescription, taken - the lean
+    fold): called ONCE, here in the orchestrator, after BOTH publish
+    steps above have fully completed - never a per-step check that some
+    future third publish step could just as easily fall outside of
+    again. Delegates to :func:`privacy.verify_store_ignored`, which asks
+    git about the WHOLE store directly (no enumeration of any directory,
+    by this function or that one) - covering ``index.json``, every
+    ``runs/<id>/`` artifact, and any file a future slice adds under this
+    same store, with nothing to remember to include.
+
+    On refusal: removes the just-published run directory (``run_dir``)
+    exactly as round 33's own rollback did, AND restores ``index.json``
+    to its exact pre-write bytes (``prior_index_bytes``, captured by the
+    caller BEFORE :func:`publish_index_cas` ran) - or, when this was the
+    very first publish ever (no prior index existed), removes the just-
+    written index.json entirely rather than "restoring" a file that
+    never existed. Neither rollback widens the exposure window: the run's
+    own content already sat in ``.staging/`` regardless of this check,
+    and the successor index was only ever swapped in by an atomic
+    replace - reversing that swap is the same class of operation, not a
+    new one.
+
+    Gated on the ``"ignored"`` disposition exactly as round 33's own
+    check was - an attended ``acknowledged_unignored``/``no_vcs_
+    acknowledged`` override already accepted this exact risk and must
+    never be re-refused here."""
+    if privacy_result is None or privacy_result.vcs_privacy != "ignored":
+        return
+    root = project_root_from_comprehension_dir(comprehension_dir)
+    try:
+        verify_store_ignored(root, RELATIVE_COMPREHENSION_DIR)
+    except VcsPrivacyRefused:
+        shutil.rmtree(run_dir, ignore_errors=False)
+        index_path = _index_path(comprehension_dir)
+        if prior_index_bytes is None:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(index_path)
+        else:
+            _restore_index_bytes(index_path, prior_index_bytes)
+        raise
+
+
 def publish_run(
     *,
     staging_handle: StagingHandle,
@@ -427,9 +477,17 @@ def publish_run(
     records. The byte ceiling is always measured directly from disk
     regardless and can never be skipped this way.
 
-    ``privacy_result``: forwarded to :func:`rename_staging_to_run` unchanged
-    — see that function's own FIX ROUND 32 docstring section for the belt
-    re-check this enables.
+    ``privacy_result``: FIX ROUND 34 (reviewer-3's re-delta on round 33's
+    own R1 fix - THE HOLE) - no longer forwarded to
+    :func:`rename_staging_to_run` (which no longer takes one at all).
+    Instead, immediately after BOTH publish steps below fully complete,
+    :func:`_verify_store_ignored_or_rollback` asks git ONCE about the
+    WHOLE store (never an enumeration of either step's own directory,
+    which is exactly the class of gap that let ``index.json`` - written
+    by step 2, never step 1's own directory - escape round 33's own
+    per-directory check). On refusal, both the just-published run
+    directory AND the just-replaced ``index.json`` are rolled back before
+    the exception propagates.
     """
     try:
         if (
@@ -442,10 +500,17 @@ def publish_run(
         measurements = measure_staging_artifacts(
             staging_handle.path, record_counts=record_counts or {})
         enforce_artifact_ceilings(measurements)
-        rename_staging_to_run(staging_handle, lock_handle, privacy_result=privacy_result)
-        return publish_index_cas(
-            lock_handle.path.parent, scan_id=staging_handle.scan_id, run_summary=run_summary,
+        comprehension_dir = lock_handle.path.parent
+        run_dir = rename_staging_to_run(staging_handle, lock_handle)
+        prior_index_bytes = _read_index_bytes_if_exists(comprehension_dir)
+        index = publish_index_cas(
+            comprehension_dir, scan_id=staging_handle.scan_id, run_summary=run_summary,
             predecessor_index_digest=predecessor_index_digest, now=now,
         )
+        _verify_store_ignored_or_rollback(
+            comprehension_dir=comprehension_dir, run_dir=run_dir, privacy_result=privacy_result,
+            prior_index_bytes=prior_index_bytes,
+        )
+        return index
     finally:
         release_scan_lock(lock_handle)
