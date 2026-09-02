@@ -183,11 +183,23 @@ def module_record_from_json(payload: dict[str, Any]) -> ModuleRecord:
 
 
 def _language_for_path(relative_path: str) -> str:
-    basename = relative_path.rsplit("/", 1)[-1]
+    """FIX ROUND 37 (thirty-first cold read, F4 MAJOR, wrong-data): this
+    used to match case-SENSITIVELY (a plain ``endswith``/``in`` check on
+    the path/basename verbatim) while worker.py's own dispatch (the
+    thing that decides whether a file is actually parsed at all) matches
+    case-INSENSITIVELY (``rel_lower``/``rel_name_lower``, lowercased
+    before every comparison) - a ``.JAVA`` file was PARSED as Java (a
+    real route extracted, a real unit built) but published
+    ``language: "unknown"``, a contradiction between two facts about
+    the identical file in the SAME run. One case policy now, aligned
+    with the worker: lowercase before matching, exactly like worker.py
+    already does."""
+    lower = relative_path.lower()
+    basename = lower.rsplit("/", 1)[-1]
     if basename in _LANGUAGE_BY_BASENAME:
         return _LANGUAGE_BY_BASENAME[basename]
     for ext, lang in _LANGUAGE_BY_EXTENSION.items():
-        if relative_path.endswith(ext):
+        if lower.endswith(ext):
             return lang
     return "unknown"
 

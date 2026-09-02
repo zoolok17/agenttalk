@@ -271,6 +271,37 @@ def test_pom_xml_and_web_xml_are_recognized_as_adapter_understood():
     assert by_path["WEB-INF/web.xml"].language == "xml"
 
 
+def test_language_matching_is_case_insensitive_matching_the_workers_own_dispatch(
+) -> None:
+    """FIX ROUND 37 (thirty-first cold read, F4 MAJOR, wrong-data,
+    .cr31-upperext verbatim): _language_for_path matched case-
+    SENSITIVELY (a plain endswith/in check) while worker.py's own
+    dispatch - the thing that decides whether a file is actually
+    parsed at all - matches case-insensitively (rel_lower/rel_name_
+    lower). A .JAVA file was PARSED as Java (a real component unit,
+    from java_results) but published language "unknown" - a
+    contradiction between two facts about the identical file in the
+    same run. Also covers the basename half (POM.XML) and a control
+    (uppercase extensions this producer never maps to a language at
+    all, unaffected either way)."""
+    discovery = _discovery([
+        EnumeratedFile(relative_path="p/Upper.JAVA", byte_count=1, content_digest="a"),
+        EnumeratedFile(relative_path="POM.XML", byte_count=1, content_digest="b"),
+        EnumeratedFile(relative_path="Notes.JSP", byte_count=1, content_digest="c"),
+        EnumeratedFile(relative_path="dump.SQL", byte_count=1, content_digest="d"),
+    ])
+    java_results = {
+        "p/Upper.JAVA": java_adapter.JavaFileResult(),
+        "POM.XML": java_adapter.JavaFileResult(),
+    }
+    records = ma.build_modules(discovery, java_results)
+    by_path = {r.paths[0]: r for r in records}
+    assert by_path["p/Upper.JAVA"].language == "java"
+    assert by_path["POM.XML"].language == "xml"
+    assert by_path["Notes.JSP"].language == "unknown"
+    assert by_path["dump.SQL"].language == "unknown"
+
+
 # ----------------------------------------------------------- java files
 
 def _java_result(relative_path: str, source: str) -> java_adapter.JavaFileResult:
