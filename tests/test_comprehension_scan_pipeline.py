@@ -6466,6 +6466,50 @@ def test_run_scan_a_pom_declared_module_named_build_reports_unresolved_via_the_r
     assert scan_doc["externality_suppressed"] is True
 
 
+def test_run_scan_reactor_modules_outside_root_and_missing_are_both_recorded(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 35 (twenty-ninth cold read, F3 MAJOR, completeness,
+    .cr29-reactor2 verbatim): a <module> pointing OUTSIDE the scanned
+    root (climbing above it via "..") or at a NONEXISTENT directory used
+    to leave NO trace at all - no boundary, no problem, complete/0 -
+    even though the excluded-region shape (the sibling tests above)
+    correctly records module_directory_excluded. Both new shapes now get
+    the same visible, degrading treatment."""
+    import json
+
+    (java_repo / "pom.xml").write_text(
+        "<project><groupId>com.acme</groupId><artifactId>root</artifactId>"
+        "<packaging>pom</packaging>"
+        "<modules>"
+        "<module>../outside-repo</module>"
+        "<module>nonexistent-dir</module>"
+        "</modules>"
+        "</project>",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    outside_problems = [
+        p for p in problems_doc["problems"] if p["reason_code"] == "module_outside_scan_root"]
+    assert len(outside_problems) == 1
+    assert outside_problems[0]["path"] == "pom.xml"
+
+    missing_problems = [
+        p for p in problems_doc["problems"] if p["reason_code"] == "module_directory_missing"]
+    assert len(missing_problems) == 1
+    assert missing_problems[0]["path"] == "pom.xml"
+
+    # Same externality-poisoning consequence the excluded-region shape
+    # already gets - a reactor member this run cannot see is positive
+    # evidence of real, unmodeled first-party source.
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["externality_suppressed"] is True
+
+
 def test_run_scan_an_undeclared_vendored_module_silently_poisoned_now_degrades_visibly(
     java_repo: Path,
 ) -> None:

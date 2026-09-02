@@ -260,6 +260,11 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     # source. Same "warning" bucket every other missing-evidence reason
     # already gets.
     "module_directory_excluded": "warning",
+    # FIX ROUND 35 (twenty-ninth cold read, F3 MAJOR, completeness): the
+    # two sibling shapes the reactor rule above never covered - same
+    # bucket.
+    "module_outside_scan_root": "warning",
+    "module_directory_missing": "warning",
     # FIX ROUND 20b (seventeenth-round dispatch, THE MAJOR - poison-rule
     # VISIBILITY): one per triggering root/pom, naming why externality
     # was suppressed run-wide. Same bucket as every other named-gap
@@ -837,9 +842,34 @@ def run_scan(
                     posixpath.join(pom_dir, module_path)) if pom_dir else posixpath.normpath(
                     module_path)
                 resolved = resolved.replace("\\", "/")
+                # FIX ROUND 35 (twenty-ninth cold read, F3 MAJOR,
+                # completeness): a <module> pointing OUTSIDE this run's
+                # own scanned root (a relative path climbing above it via
+                # "..", or an absolute path outright) used to leave NO
+                # trace at all - no boundary, no problem, complete/0 -
+                # even though the design promises submodule/boundary
+                # visibility and invariant 5 promises excluded paths stay
+                # visible. A reactor member this run cannot even SEE is
+                # at least as material as one it merely excluded, so it
+                # gets the SAME treatment (same reactor_rule_problems
+                # list, so it inherits the identical degrading-status and
+                # externality-poisoning consequences the excluded-region
+                # case already has, argued: positive evidence of real,
+                # unmodeled first-party source this run has no visibility
+                # into is exactly what both shapes are).
+                if resolved.startswith("/") or resolved == ".." or resolved.startswith("../"):
+                    reactor_rule_problems.append(_problem_record(
+                        "module_outside_scan_root",
+                        pom_path,
+                        f"this pom declares <module>{module_path}</module>, whose own path "
+                        f"({resolved!r}) resolves OUTSIDE this run's own scanned root - a "
+                        "declared reactor member this run cannot see at all, never merely "
+                        "absent",
+                    ))
+                    continue
                 if any(
-                    resolved == root or resolved.startswith(root + "/")
-                    for root in excluded_root_paths_for_reactor_rule
+                    resolved == excluded_root or resolved.startswith(excluded_root + "/")
+                    for excluded_root in excluded_root_paths_for_reactor_rule
                 ):
                     reactor_rule_problems.append(_problem_record(
                         "module_directory_excluded",
@@ -848,6 +878,20 @@ def run_scan(
                         f"({resolved!r}) resolves into a region this run excluded outright - "
                         "positive evidence the excluded region holds real, first-party source, "
                         "not third-party build output",
+                    ))
+                elif not (root / resolved).is_dir():
+                    # FIX ROUND 35 (F3 MAJOR): a <module> pointing at a
+                    # NONEXISTENT directory (a stale or broken reactor
+                    # declaration, a typo) is a DIFFERENT fact from an
+                    # excluded one (this run did walk that location - it
+                    # genuinely is not there), but equally invisible
+                    # otherwise - same visible-and-degrading treatment.
+                    reactor_rule_problems.append(_problem_record(
+                        "module_directory_missing",
+                        pom_path,
+                        f"this pom declares <module>{module_path}</module>, whose own path "
+                        f"({resolved!r}) does not exist as a directory in this scan at all - "
+                        "a stale or broken reactor declaration",
                     ))
         # FIX ROUND 20 (sixteenth cold read, M1+M2 MAJOR, wrong-data -
         # THE POISON RULE): retires the round-16 string-matching
