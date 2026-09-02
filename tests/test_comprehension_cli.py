@@ -501,6 +501,36 @@ def test_report_unit_filter_note_present_for_a_well_formed_absent_id(
     assert absent_64_hex in payload["unit_or_feature_filter_note"]
 
 
+def test_report_unit_filter_note_present_for_the_literal_deadbeef_shape(
+    java_repo: Path, capsys,
+) -> None:
+    """FIX ROUND 37 (thirty-first cold read, F8 VERIFY FIRST - conflicting
+    evidence): the reader reported `report --unit deadbeef` (an 8-char
+    id, one length variant shorter than round 31's own already-verified
+    16-char and 64-hex shapes) as showing NO unknown-selector note,
+    directly conflicting with round 31's own N6 verification that the
+    note survives through the real CLI --json path regardless of the
+    id's own length/grammar. Reproduced here with the reader's own
+    EXACT literal id: the note IS present, unchanged - VERIFIED NOT
+    REPRODUCIBLE, closing this specific length variant precisely rather
+    than assuming round 31's own coverage generalizes to it."""
+    _run(["comprehension", "scan", "--json"], java_repo)
+    capsys.readouterr()
+    exit_code = _run(["comprehension", "report", "--unit", "deadbeef", "--json"], java_repo)
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["units"] == []
+    assert "deadbeef" in payload["unit_or_feature_filter_note"]
+
+    # Also confirmed for HUMAN (non --json) output - cli.py's own report
+    # action prints the identical JSON payload either way (no separate
+    # human-rendering code path that could drop the note).
+    exit_code = _run(["comprehension", "report", "--unit", "deadbeef"], java_repo)
+    assert exit_code == 0
+    human_payload = json.loads(capsys.readouterr().out)
+    assert "deadbeef" in human_payload["unit_or_feature_filter_note"]
+
+
 def test_report_before_any_scan_refuses(tmp_path: Path, capsys) -> None:
     exit_code = _run(["comprehension", "report", "--json"], tmp_path)
     assert exit_code == 2
