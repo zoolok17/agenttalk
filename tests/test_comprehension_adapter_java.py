@@ -1067,6 +1067,36 @@ def test_route_value_with_a_c1_control_character_nel_is_escaped_not_raw():
     assert nel not in routes[0].target
 
 
+def test_route_value_with_invisible_format_characters_is_escaped_not_raw():
+    """FIX ROUND 35 (twenty-ninth cold read, F7 LOW, wrong-data): this
+    escape set's own docstring promises a safe, single-line, PRINTABLE
+    rendering - but a route name that differs from another only by a
+    ZERO WIDTH SPACE (U+200B) prints IDENTICALLY, spoofing a reader into
+    believing two distinct routes are the same one. The reader measured
+    U+200B passed through raw. SOFT HYPHEN (U+00AD), WORD JOINER
+    (U+2060), and a MID-STRING ZERO WIDTH NO-BREAK SPACE (U+FEFF - never
+    a genuine leading BOM here, since the file-level decode already
+    strips one before this adapter ever sees the text) share the same
+    invisible-rendering hazard and are escaped alongside it."""
+    zwsp = chr(0x200B)
+    shy = chr(0x00AD)
+    word_joiner = chr(0x2060)
+    zwnbsp = chr(0xFEFF)
+    src = (
+        "package p;\n"
+        "class Controller {\n"
+        f'  @GetMapping("/api{zwsp}{shy}mid{word_joiner}dle{zwnbsp}end")\n'
+        "  void list() {}\n"
+        "}\n"
+    )
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /api\\u200b\\u00admid\\u2060dle\\ufeffend"
+    for invisible in (zwsp, shy, word_joiner, zwnbsp):
+        assert invisible not in routes[0].target
+
+
 # ----------------------------------------------------------- malformed java (round 15 F5)
 
 def test_an_unterminated_char_literal_is_detected_as_malformed_not_silently_truncated():

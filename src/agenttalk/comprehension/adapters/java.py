@@ -1815,15 +1815,47 @@ _ROUTE_NAME_CONTROL_CHAR_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
 #: "the two implicit directional marks," but Unicode 6.3 added ALM
 #: alongside the very isolate controls (U+2066-U+2069) already in this
 #: set, making it a THIRD implicit directional mark this set was
-#: silently missing, not a new criterion. U+FEFF (BOM) and U+00A0
-#: (NBSP) deliberately stay OUT - neither is a bidi control, and pulling
-#: either in starts the Unicode-exhaustiveness chase this set's own
-#: docstring already declines.
+#: silently missing, not a new criterion. U+00A0 (NBSP) deliberately
+#: stays OUT - it is not a bidi control and renders as an ordinary
+#: (blank-looking but real) space, not an invisible-format character;
+#: pulling it in starts the Unicode-exhaustiveness chase this set's own
+#: docstring already declines. U+FEFF used to be listed here as a
+#: second deliberate holdout - FIX ROUND 35 (twenty-ninth cold read, F7
+#: LOW, wrong-data) moved it OUT of this holdout note: it is escaped
+#: below by the invisible-format set instead, for the reason given
+#: there.
 _UNICODE_DIRECTIONAL_AND_LINE_CONTROL_CHARS = frozenset(
     "\u200e\u200f\u061c"  # LRM, RLM, ALM
     "\u202a\u202b\u202c\u202d\u202e"  # LRE, RLE, PDF, LRO, RLO
     "\u2066\u2067\u2068\u2069"  # LRI, RLI, FSI, PDI
     "\u2028\u2029"  # LINE SEPARATOR, PARAGRAPH SEPARATOR
+)
+
+#: FIX ROUND 35 (twenty-ninth cold read, F7 LOW, wrong-data): this
+#: escaping choke point's own docstring (above) promises a "safe,
+#: single-line, printable" rendering - the BIDI/line-separator set
+#: already chases characters that make published text spoof its own
+#: reading order or fake a line break, but a DIFFERENT invisible-
+#: rendering hazard passed through RAW: characters that render as
+#: NOTHING at all. Two routes that differ only by a ZERO WIDTH SPACE
+#: (U+200B) print IDENTICALLY in a terminal table or a UI, yet compare
+#: unequal as strings - the reader measured exactly this, a U+200B
+#: published raw. A CLOSED, named set, same discipline as its sibling
+#: above: ZERO WIDTH SPACE (U+200B), SOFT HYPHEN (U+00AD, invisible
+#: outside a line-break opportunity - no renderer here ever breaks
+#: lines), WORD JOINER (U+2060), and ZERO WIDTH NO-BREAK SPACE
+#: (U+FEFF). U+FEFF is safe to treat unconditionally as an invisible
+#: character here, never a genuine leading byte-order mark: this
+#: function only ever sees an already-decoded route name, and the
+#: file-level decode this producer performs upstream
+#: (``worker.py``'s own "utf-8-sig", BOM-tolerant) already strips a
+#: real leading BOM before any text reaches this adapter - any U+FEFF
+#: seen here is necessarily mid-string.
+_UNICODE_INVISIBLE_FORMAT_CHARS = frozenset(
+    "\u200b"  # ZERO WIDTH SPACE
+    "\u00ad"  # SOFT HYPHEN
+    "\u2060"  # WORD JOINER
+    "\ufeff"  # ZERO WIDTH NO-BREAK SPACE
 )
 
 
@@ -1841,9 +1873,13 @@ def _sanitize_route_name_control_chars(value: str) -> str:
             # rule right here), not the Unicode-exhaustiveness rule the
             # BIDI/line-separator set above deliberately declines to
             # chase - it was simply missing from this condition.
-            # U+00A0/U+200B stay out (not control characters).
+            # U+00A0 stays out (not a control character). U+200B used
+            # to be named here too - FIX ROUND 35 moved it to the
+            # invisible-format branch below, where it is escaped.
             out.append(f"\\x{ord(ch):02x}")
         elif ch in _UNICODE_DIRECTIONAL_AND_LINE_CONTROL_CHARS:
+            out.append(f"\\u{ord(ch):04x}")
+        elif ch in _UNICODE_INVISIBLE_FORMAT_CHARS:
             out.append(f"\\u{ord(ch):04x}")
         else:
             out.append(ch)
