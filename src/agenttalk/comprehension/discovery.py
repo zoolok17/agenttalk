@@ -104,6 +104,26 @@ _DEPENDENCY_CACHE_DIR_NAMES = frozenset({
     "node_modules", ".m2", ".gradle", "__pycache__", ".venv", "venv", ".tox",
     ".mypy_cache", ".pytest_cache",
 })
+#: FIX ROUND 37 (thirty-first cold read, F9 LOW, carry - folded into F2's
+#: own case policy): unlike F2's own secret-file PATTERN matching (now
+#: deliberately case-insensitive, identically on every platform - see
+#: discovery._matches_any_secret_pattern), this directory-NAME set (and
+#: its siblings _HARD_EXCLUDE_DIR_NAMES/_VCS_DIR_NAMES/_DEPENDENCY_
+#: CACHE_DIR_NAMES above) is matched via a plain `name in {...}` test -
+#: case-SENSITIVE on every platform, by construction of Python's own
+#: `in` operator. This is a REAL, DECLARED asymmetry with F2's own
+#: choice, not an oversight left unexamined: a directory literally
+#: named "Target" (capitalized) is NOT recognized as generated/vendor
+#: output, on Windows or Linux alike - unification with F2's own case-
+#: insensitive policy is a real behavior change (widening exclusion
+#: coverage for every one of these four directory-name sets at once)
+#: out of scope for this LOW item. Covered by a direct unit test on the
+#: predicate itself (explicit strings, no real filesystem) rather than
+#: an end-to-end fixture - a real "Target"-vs-"target" DIRECTORY PAIR
+#: cannot even be constructed on this dev host's own case-INSENSITIVE
+#: NTFS filesystem to prove anything about real per-OS enumeration
+#: order either way, the identical constraint round 36's own F4 secret-
+#: pattern caveat already names for this exact class of check.
 _GENERATED_VENDOR_DIR_NAMES = frozenset({"target", "build", "dist", "vendor", "out", ".next"})
 #: FIX ROUND 16 (twelfth cold read, B2 BLOCKER, wrong-data): the ANY-
 #: DEPTH name exclusion silently deleted a real, standard hexagonal-

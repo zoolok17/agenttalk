@@ -638,6 +638,23 @@ def test_matches_any_secret_pattern_is_case_insensitive_on_every_platform() -> N
     assert discovery._matches_any_secret_pattern("SECRETS.JAVA") is False
 
 
+def test_generated_vendor_dir_name_matching_is_case_sensitive_declared_asymmetry() -> None:
+    """FIX ROUND 37 (F9 LOW, carry - folded into F2's own case policy):
+    unlike F2's own secret-pattern matching (now deliberately case-
+    insensitive), the generated/vendor directory-name predicate is
+    matched via a plain `name in {...}` test - case-SENSITIVE on every
+    platform, a real, declared asymmetry, not an oversight. Unit-tested
+    directly against the predicate (explicit strings, no real
+    filesystem) - a real "Target"-vs-"target" directory PAIR cannot
+    even be constructed on this dev host's own case-insensitive NTFS
+    filesystem to prove anything about real per-OS enumeration order
+    either way, the identical constraint the F2/F4 caveats already name
+    for this same class of check."""
+    assert discovery._exclusion_category("target", "target", is_dir=True) == "generated_or_vendor"
+    assert discovery._exclusion_category("Target", "Target", is_dir=True) is None
+    assert discovery._exclusion_category("TARGET", "TARGET", is_dir=True) is None
+
+
 def test_enumerate_scope_records_a_visible_degrading_problem_for_a_calibrated_collision(
     tmp_path: Path, monkeypatch,
 ) -> None:
