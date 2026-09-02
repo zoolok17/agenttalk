@@ -401,6 +401,31 @@ def test_publish_run_store_wide_check_refuses_defeat_3_index_json_only_reinclusi
     assert result.stdout.strip() == ""  # git add -A would stage nothing from the store
 
 
+def test_publish_run_does_not_brick_when_only_scan_lock_is_stageable(
+    comprehension_privacy_root: Path, comprehension_dir: Path,
+    comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """FIX ROUND 35 (twenty-ninth cold read, F2 MAJOR part (b), JUDGE -
+    taken, .cr29-deadend verbatim): a .gitignore matching everything BUT
+    scan.lock's own name (the scanner's own transient process-identity
+    file, still on disk when the store-wide check runs, before publish_
+    run's own finally releases it) must not brick an otherwise-genuinely-
+    private publish - the lock is process metadata, never client data."""
+    (comprehension_privacy_root / ".gitignore").write_text(
+        ".agenttalk/**\n"
+        "!.agenttalk/comprehension/\n"
+        "!.agenttalk/comprehension/scan.lock\n",
+        encoding="utf-8",
+    )
+    lock, staging = _stage(comprehension_dir, comprehension_privacy, "scan-1")
+    pub.publish_run(
+        staging_handle=staging, lock_handle=lock,
+        run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None,
+        record_counts=_COUNTS, privacy_result=comprehension_privacy,
+    )
+    assert (comprehension_dir / "runs" / "scan-1").is_dir()
+
+
 def test_publish_run_store_wide_check_refuses_on_an_unanticipated_new_file(
     comprehension_privacy_root: Path, comprehension_dir: Path,
     comprehension_privacy: PrivacyPreflightResult,

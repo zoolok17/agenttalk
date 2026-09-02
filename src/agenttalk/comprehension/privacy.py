@@ -272,7 +272,9 @@ def _check_ignore(root: Path) -> tuple[bool, str | None] | None:
     return True, first_matched_rule
 
 
-def verify_store_ignored(root: Path, relative_store_dir: str) -> None:
+def verify_store_ignored(
+    root: Path, relative_store_dir: str, *, exclude_relative_paths: frozenset[str] = frozenset(),
+) -> None:
     """FIX ROUND 34 (reviewer-3's re-delta on round 33's own R1 fix - THE
     HOLE): round 33 stopped proving by proxy for the ``runs/<scan_id>/``
     directory (enumerating its own real files and checking each one
@@ -327,7 +329,19 @@ def verify_store_ignored(root: Path, relative_store_dir: str) -> None:
     this guarantee BY CONSTRUCTION — every check-then-act has an instant
     after which it cannot see; this one narrows that window from the
     entire scan (round 32) to one git invocation, as narrow as this
-    shape gets."""
+    shape gets.
+
+    FIX ROUND 35 (twenty-ninth cold read, F2 MAJOR part (b), JUDGE -
+    taken): ``exclude_relative_paths`` names paths this check must never
+    treat as stageable content, even if git itself would report them as
+    untracked-and-unignored - specifically ``scan.lock``, the SCANNER'S
+    OWN transient process-identity file (host, PID, owner token), held
+    until publication fully completes and therefore still ON DISK at the
+    exact moment this call runs. It is process metadata this producer
+    itself writes and removes, never client graph data - a ``.gitignore``
+    matching everything BUT the lock's own name would otherwise brick
+    every future publish on a file that is not the thing this guarantee
+    exists to protect."""
     result = _run_git(root, "ls-files", "--others", "--exclude-standard", "--", relative_store_dir)
     if result is None or result.returncode != 0:
         raise VcsPrivacyRefused(
@@ -335,7 +349,9 @@ def verify_store_ignored(root: Path, relative_store_dir: str) -> None:
             f"{relative_store_dir}/ has any stageable (untracked, unignored) content "
             "immediately after publication — refusing", vcs_kind="git",
         )
-    stageable = sorted(line for line in result.stdout.splitlines() if line)
+    stageable = sorted(
+        line for line in result.stdout.splitlines() if line and line not in exclude_relative_paths
+    )
     if stageable:
         raise VcsPrivacyRefused(
             f"{len(stageable)} path(s) under {relative_store_dir}/ are stageable "

@@ -364,6 +364,57 @@ def test_verify_store_ignored_refuses_on_an_unanticipated_new_file(tmp_path: Pat
         privacy.verify_store_ignored(tmp_path, ".agenttalk/comprehension")
 
 
+def test_verify_store_ignored_excludes_scan_lock_from_stageability(tmp_path: Path) -> None:
+    """FIX ROUND 35 (twenty-ninth cold read, F2 MAJOR part (b), JUDGE -
+    taken, .cr29-deadend verbatim): a .gitignore matching everything BUT
+    scan.lock's own name (the scanner's own transient process-identity
+    file, still on disk at the exact moment this check runs, held until
+    publication fully completes) must never brick a publish on process
+    metadata that was never client graph data to begin with."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(
+        ".agenttalk/**\n"
+        "!.agenttalk/comprehension/\n"
+        "!.agenttalk/comprehension/scan.lock\n",
+        encoding="utf-8",
+    )
+    _commit_all(tmp_path, "base")
+    store = tmp_path / ".agenttalk" / "comprehension"
+    (store / "runs" / "scan-1").mkdir(parents=True)
+    (store / "index.json").write_text("{}", encoding="utf-8")
+    (store / "scan.lock").write_text("{}", encoding="utf-8")
+    privacy.verify_store_ignored(  # must not raise
+        tmp_path, ".agenttalk/comprehension",
+        exclude_relative_paths=frozenset({".agenttalk/comprehension/scan.lock"}),
+    )
+
+
+def test_verify_store_ignored_still_refuses_a_real_leak_alongside_the_lock(
+    tmp_path: Path,
+) -> None:
+    """Companion control: the lock's own exclusion must never widen into
+    a blanket pass - a REAL leaked artifact alongside the (excluded)
+    lock still refuses."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(
+        ".agenttalk/**\n"
+        "!.agenttalk/comprehension/\n"
+        "!.agenttalk/comprehension/scan.lock\n"
+        "!.agenttalk/comprehension/index.json\n",
+        encoding="utf-8",
+    )
+    _commit_all(tmp_path, "base")
+    store = tmp_path / ".agenttalk" / "comprehension"
+    store.mkdir(parents=True)
+    (store / "index.json").write_text("{}", encoding="utf-8")
+    (store / "scan.lock").write_text("{}", encoding="utf-8")
+    with pytest.raises(VcsPrivacyRefused, match="index.json"):
+        privacy.verify_store_ignored(
+            tmp_path, ".agenttalk/comprehension",
+            exclude_relative_paths=frozenset({".agenttalk/comprehension/scan.lock"}),
+        )
+
+
 def test_verify_store_ignored_fails_closed_when_not_a_git_repo(tmp_path: Path) -> None:
     """A genuine git query failure (no repository at all here) must
     refuse, never silently treat "the query broke" as "nothing is

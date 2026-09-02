@@ -53,7 +53,7 @@ from .envelope import (
 )
 from .errors import ComprehensionError, StagingSourceEscapesRoot, VcsPrivacyRefused
 from .lock import ScanLockHandle, release_scan_lock
-from .paths import RELATIVE_COMPREHENSION_DIR
+from .paths import LOCK_FILENAME, RELATIVE_COMPREHENSION_DIR
 from .paths import index_path as _index_path
 from .paths import project_root_from_comprehension_dir
 from .paths import runs_dir as _runs_dir
@@ -432,8 +432,18 @@ def _verify_store_ignored_or_rollback(
     if privacy_result is None or privacy_result.vcs_privacy != "ignored":
         return
     root = project_root_from_comprehension_dir(comprehension_dir)
+    # FIX ROUND 35 (twenty-ninth cold read, F2 MAJOR part (b), JUDGE -
+    # taken): scan.lock is still on disk at this exact point (this
+    # function runs before publish_run's own `finally: release_scan_
+    # lock(...)`) - it is the scanner's own transient process-identity
+    # file, never client graph data, so it is excluded BY NAME from the
+    # stageability question - see verify_store_ignored's own docstring.
+    lock_relative_path = f"{RELATIVE_COMPREHENSION_DIR}/{LOCK_FILENAME}"
     try:
-        verify_store_ignored(root, RELATIVE_COMPREHENSION_DIR)
+        verify_store_ignored(
+            root, RELATIVE_COMPREHENSION_DIR,
+            exclude_relative_paths=frozenset({lock_relative_path}),
+        )
     except VcsPrivacyRefused:
         shutil.rmtree(run_dir, ignore_errors=False)
         index_path = _index_path(comprehension_dir)

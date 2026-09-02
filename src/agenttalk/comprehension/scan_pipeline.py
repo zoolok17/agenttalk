@@ -58,7 +58,7 @@ from .envelope import (
     validate_scan_id,
 )
 from .errors import ComprehensionError, EnvelopeError, bounded_detail, bounded_os_error_detail
-from .privacy import PrivacyPreflightResult, VcsPrivacyRefused
+from .privacy import PrivacyPreflightResult
 
 GENERATOR_VERSION = 1
 
@@ -421,14 +421,33 @@ def _obtain_privacy(
         acknowledge_unignored=acknowledge_unignored, work_id=work_id)
     if pairing_error is not None:
         raise ScanRefused(pairing_error)
-    try:
-        return privacy.run_privacy_preflight(root)
-    except VcsPrivacyRefused as exc:
-        if not acknowledge_unignored:
-            raise
+    # FIX ROUND 35 (twenty-ninth cold read, F2 MAJOR part (a) - the newest
+    # mechanism's own dead end): this used to run the preflight FIRST,
+    # unconditionally, and only ever converted to `acknowledged_unignored`
+    # when THAT SAME preflight raised - so an attended, correctly-paired
+    # acknowledgment was reachable ONLY for a preflight-detected refusal,
+    # never for round 34's own store-wide post-publish refusal (which the
+    # cheap, early preflight cannot see by construction - that is exactly
+    # why the store-wide check exists). When the preflight passed but the
+    # deeper check later refused, the CLI's own attempt-2 retry (already
+    # acknowledge_unignored=True at this point) hit this SAME preflight,
+    # which passed AGAIN, returned "ignored" AGAIN, and the store-wide
+    # check refused AGAIN - forever, with the refusal's own message
+    # directing the operator to a flag that provably could never change
+    # the outcome. An attended, correctly-paired acknowledgment (the
+    # pairing above already REQUIRES a non-empty work_id) now applies
+    # UNCONDITIONALLY - it is a statement that the operator has already
+    # accepted this run's own privacy risk, never conditional on which
+    # LAYER would have refused it. `vcs_kind` is still detected the same
+    # way `run_privacy_preflight`'s own worktree check would - never
+    # skipped, since scan.json's own `privacy.vcs_kind` field must still
+    # be accurate either way.
+    if acknowledge_unignored:
+        vcs_kind = "git" if privacy._is_git_worktree(root) else "none"  # noqa: SLF001
         return privacy.acknowledge_unignored_private_store(
-            root, vcs_kind=exc.vcs_kind, work_id=work_id, matched_rule=None,
+            root, vcs_kind=vcs_kind, work_id=work_id, matched_rule=None,
         )
+    return privacy.run_privacy_preflight(root)
 
 
 def run_scan(

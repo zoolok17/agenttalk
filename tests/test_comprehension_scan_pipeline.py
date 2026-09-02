@@ -4607,6 +4607,58 @@ def test_run_scan_with_acknowledge_and_work_id_proceeds(tmp_path: Path) -> None:
     assert outcome.status == "complete"
 
 
+def test_run_scan_store_wide_dead_end_now_escapes_with_acknowledge_and_work_id(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 35 (twenty-ninth cold read, F2 MAJOR part (a), .cr29-
+    deadend verbatim): a rule that re-includes a real artifact filename
+    specifically (modules.json, never named by any of the preflight's own
+    three FIXED literal probes) passes the cheap, early preflight but is
+    caught by round 34's own store-wide post-publish check. Before this
+    fix, an operator retrying with --acknowledge-unignored-private-store
+    hit the IDENTICAL passing preflight, got the automatic "ignored"
+    disposition again, and the store-wide check refused again - FOREVER,
+    with the refusal's own message directing the operator to a flag that
+    provably could never change the outcome. A properly-attended
+    acknowledge+work-id run must now proceed."""
+    _init_git_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(
+        ".agenttalk/**\n"
+        "!.agenttalk/comprehension/\n"
+        "!.agenttalk/comprehension/runs/\n"
+        "!.agenttalk/comprehension/runs/*/\n"
+        "!.agenttalk/comprehension/runs/*/modules.json\n",
+        encoding="utf-8",
+    )
+    _write_sample_java_project(tmp_path)
+    with pytest.raises(VcsPrivacyRefused, match="modules.json"):
+        scan_pipeline.run_scan(tmp_path)
+    outcome = scan_pipeline.run_scan(
+        tmp_path, acknowledge_unignored=True, work_id="migrate-app")
+    assert outcome.status == "complete"
+
+
+def test_run_scan_store_wide_dead_end_still_refuses_headless(tmp_path: Path) -> None:
+    """Companion control (.cr29-privflip's own headless half): the SAME
+    scenario, with no attended acknowledgment - must keep refusing on
+    every retry, never silently proceed just because a prior attempt also
+    failed."""
+    _init_git_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(
+        ".agenttalk/**\n"
+        "!.agenttalk/comprehension/\n"
+        "!.agenttalk/comprehension/runs/\n"
+        "!.agenttalk/comprehension/runs/*/\n"
+        "!.agenttalk/comprehension/runs/*/modules.json\n",
+        encoding="utf-8",
+    )
+    _write_sample_java_project(tmp_path)
+    with pytest.raises(VcsPrivacyRefused, match="modules.json"):
+        scan_pipeline.run_scan(tmp_path)
+    with pytest.raises(VcsPrivacyRefused, match="modules.json"):
+        scan_pipeline.run_scan(tmp_path)
+
+
 def test_a_second_scan_chains_the_predecessor_digest(java_repo: Path) -> None:
     first = scan_pipeline.run_scan(java_repo)
     (java_repo / "src" / "main" / "java" / "p" / "Other.java").write_text(
