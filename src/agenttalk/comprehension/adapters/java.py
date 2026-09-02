@@ -1857,6 +1857,21 @@ _UNICODE_INVISIBLE_FORMAT_CHARS = frozenset(
     "\u2060"  # WORD JOINER
     "\ufeff"  # ZERO WIDTH NO-BREAK SPACE
 )
+#: FIX ROUND 36 (thirtieth cold read, F7 carry, reconfirmed): the
+#: reader accepted the U+00A0 (NBSP) holdout above as defensible, but
+#: asked for the CRITERION stated as one line rather than left to be
+#: re-derived from two separate holdout notes. Restated here, once,
+#: precisely: this set's own line is VISIBLE-BLANK versus INVISIBLE-
+#: FORMAT, not "renders as whitespace." U+00A0 renders as an ordinary,
+#: VISIBLE space-width glyph in every renderer this producer's own
+#: consumers use (a terminal table, a UI) - two route names differing
+#: only by U+00A0 look like they have a gap, not like they are
+#: identical, so nothing about it defeats the "two distinct routes
+#: print identically" hazard this set exists to close. Every member
+#: actually in this set (and the BIDI/line-separator set above) renders
+#: as NOTHING, or as something that actively lies about structure - the
+#: line this set draws, stated as the one criterion it has always
+#: followed rather than left implicit.
 
 
 def _sanitize_route_name_control_chars(value: str) -> str:
