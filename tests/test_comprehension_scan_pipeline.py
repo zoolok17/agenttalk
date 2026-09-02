@@ -2048,6 +2048,144 @@ def test_run_scan_carries_a_web_xml_servlet_route_through_the_worker(
     assert any(e["name"] == "/api/*" and e["kind"] == "http_route" for e in doc["entry_points"])
 
 
+def test_run_scan_a_listener_naming_an_out_of_scan_class_marks_the_file_unknown(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 37 (thirty-first cold read, F3 MAJOR, wrong-data,
+    .cr31-listenonly verbatim): a web.xml <listener> naming a class NOT
+    in this scan at all (a jar-shipped listener, e.g. Spring's own
+    ContextLoaderListener - the NORMAL real-world shape) used to reach
+    NOTHING: not the (never-matching) same-file map, not the cross-file
+    qualified-name map (zero in-scan claimants), so web.xml's own FILE
+    unit published the confident not_applicable/no_entry_point negative,
+    directly contradicting this SAME run's own problems.json record
+    ("not confidently absent either"). The declaring file's own unit
+    (modules.json already publishes one for web.xml) must report
+    unknown/unsupported_entry_point_shape instead."""
+    import json
+
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <listener>\n"
+        "    <listener-class>org.springframework.web.context.ContextLoaderListener"
+        "</listener-class>\n"
+        "  </listener>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+
+    file_signal = _readiness_signal(
+        readiness_doc, modules_doc, display_name="web.xml", kind="file",
+        check="entry_points_mapped")
+    assert file_signal["stored_status"] == "unknown"
+    assert file_signal["reason_code"] == "unsupported_entry_point_shape"
+
+
+def test_run_scan_a_listener_naming_an_in_scan_class_marks_both_component_and_file_unknown(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 37 (F3 MAJOR, .cr31-listenerclass verbatim): when the
+    <listener>'s own class IS in scan (one claimant), the EXISTING
+    round-21c cross-file attribution correctly marks that class's own
+    component unit unknown - but web.xml's own declaring-file unit must
+    ALSO be unknown: "this file names an unmodeled entry-point
+    mechanism" is a fact about web.xml itself, never contingent on
+    whether the referenced class happens to also be in scope."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "p" / "MyListener.java").write_text(
+        "package p;\nclass MyListener {}\n", encoding="utf-8")
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <listener>\n"
+        "    <listener-class>p.MyListener</listener-class>\n"
+        "  </listener>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+
+    component_signal = _readiness_signal(
+        readiness_doc, modules_doc, display_name="MyListener", kind="component",
+        check="entry_points_mapped")
+    file_signal = _readiness_signal(
+        readiness_doc, modules_doc, display_name="web.xml", kind="file",
+        check="entry_points_mapped")
+    assert component_signal["stored_status"] == "unknown"
+    assert file_signal["stored_status"] == "unknown"
+    assert file_signal["reason_code"] == "unsupported_entry_point_shape"
+
+
+def test_run_scan_three_unmodeled_shapes_never_let_a_real_route_win_satisfied(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 37 (F3 MAJOR, .cr31-shapes verbatim): a web.xml carrying
+    THREE unmodeled entry-point shapes (a <listener> naming an out-of-
+    scan class, a servlet-name-scoped filter, and a startup-only
+    servlet) ALONGSIDE a genuine, real, mapped <servlet-mapping> route -
+    the file's own entry_points_mapped must stay unknown, never the
+    confident satisfied a real route elsewhere in the same file used to
+    win outright (an attributed reason always wins over a bare
+    has_entry_point=True - see _check_entry_points_mapped's own
+    ordering)."""
+    import json
+
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <listener>\n"
+        "    <listener-class>org.springframework.web.context.ContextLoaderListener"
+        "</listener-class>\n"
+        "  </listener>\n"
+        "  <filter>\n"
+        "    <filter-name>auditFilter</filter-name>\n"
+        "    <filter-class>p.AuditFilter</filter-class>\n"
+        "  </filter>\n"
+        "  <filter-mapping>\n"
+        "    <filter-name>auditFilter</filter-name>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "  </filter-mapping>\n"
+        "  <servlet>\n"
+        "    <servlet-name>startupOnly</servlet-name>\n"
+        "    <servlet-class>p.StartupOnlyServlet</servlet-class>\n"
+        "    <load-on-startup>1</load-on-startup>\n"
+        "  </servlet>\n"
+        "  <servlet>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "    <servlet-class>p.DispatcherServlet</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "    <url-pattern>/api/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
+
+    assert any(
+        e["name"] == "/api/*" and e["kind"] == "http_route" for e in features_doc["entry_points"])
+
+    file_signal = _readiness_signal(
+        readiness_doc, modules_doc, display_name="web.xml", kind="file",
+        check="entry_points_mapped")
+    assert file_signal["stored_status"] == "unknown"
+    assert file_signal["reason_code"] == "unsupported_entry_point_shape"
+
+
 def test_run_scan_links_a_web_xml_route_to_its_real_servlet_class_end_to_end(
     java_repo: Path,
 ) -> None:

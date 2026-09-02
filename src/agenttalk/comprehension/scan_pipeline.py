@@ -679,17 +679,39 @@ def run_scan(
         # attributed via worker_problem_reasons_by_unit above; this is
         # additive for exactly the CROSS-FILE case that tuple can never
         # match - a web.xml <listener>'s own unsupported_entry_point_shape
-        # problem is recorded at web.xml's own path (the declaring file,
-        # correctly - web.xml genuinely has no unit of its own to
-        # broadcast to), naming a class declared in an entirely
-        # DIFFERENT .java file. modules_artifact.build_modules resolves
-        # this via the SAME exact-qualified-name registry lookup
-        # features_artifact.py's own owner resolution already uses -
-        # never applied when the name is ambiguous (2+ claimants) or
-        # unresolved in-scan (0 claimants), in which case the
-        # web.xml-attributed problems.json record stands on its own,
-        # unchanged, exactly as it always did before this fix.
+        # problem is recorded at web.xml's own path (the declaring file),
+        # naming a class declared in an entirely DIFFERENT .java file.
+        # modules_artifact.build_modules resolves this via the SAME
+        # exact-qualified-name registry lookup features_artifact.py's own
+        # owner resolution already uses - applied when the name resolves
+        # to exactly one in-scan claimant; a name ambiguous (2+
+        # claimants) is left alone (a genuine duplicate-qualified-name
+        # collision, already its own separate, visible problem). FIX
+        # ROUND 37 (thirty-first cold read, F3 MAJOR, wrong-data): the
+        # unresolved-in-scan case (0 claimants - the NORMAL real-world
+        # shape for a jar-shipped listener class) used to ALSO stand on
+        # its own here, meaning the web.xml FILE unit itself (modules.
+        # json already publishes one) never received the reason -
+        # readiness then published a confident negative directly
+        # contradicting this same run's own problems.json record. Now
+        # falls back to the declaring file's own unit instead - see
+        # worker_declaring_paths_by_qualified_name below.
         worker_problem_reasons_by_qualified_name: dict[str, list[str]] = {}
+        # FIX ROUND 37 (thirty-first cold read, F3 MAJOR, wrong-data): the
+        # cross-file attribution below (_attribute_cross_file_entry_point_
+        # reasons) resolves a qualified name to an in-scan unit ONLY when
+        # exactly one candidate exists - when the named class is NOT in
+        # scan at all (a jar-shipped listener, the NORMAL real-world case
+        # for many <listener>/<filter> declarations), the reason reached
+        # NOTHING: not the (never-matching) tuple map, not the qualified-
+        # name map's own zero-candidate case, so a confidently-clean
+        # web.xml FILE unit published not_applicable/no_entry_point,
+        # directly contradicting this SAME run's own problems.json record
+        # ("not confidently absent either"). This tracks each qualified
+        # name's own DECLARING path(s) (web.xml's own path, for the
+        # <listener> shape) so that zero-candidate case can fall back to
+        # the declaring file's own unit instead of attaching to nothing.
+        worker_declaring_paths_by_qualified_name: dict[str, set[str]] = {}
         for p in worker_result.problems:
             if p.qualified_name is not None:
                 reasons = worker_problem_reasons_by_unit.setdefault(
@@ -698,6 +720,8 @@ def run_scan(
                     p.qualified_name, [])
                 if p.reason_code not in qualified_name_reasons:
                     qualified_name_reasons.append(p.reason_code)
+                worker_declaring_paths_by_qualified_name.setdefault(
+                    p.qualified_name, set()).add(p.relative_path)
             else:
                 reasons = worker_problem_reasons_by_path[p.relative_path]
             if p.reason_code not in reasons:
@@ -791,6 +815,7 @@ def run_scan(
             worker_problem_reasons_by_path=worker_problem_reasons_by_path,
             worker_problem_reasons_by_unit=worker_problem_reasons_by_unit,
             worker_problem_reasons_by_qualified_name=worker_problem_reasons_by_qualified_name,
+            worker_declaring_paths_by_qualified_name=worker_declaring_paths_by_qualified_name,
             non_degrading_unsupported_language_paths=non_degrading_unsupported_language_paths,
             binary_excluded_root_sniffed_xml_digests=binary_excluded_root_sniffed_xml_digests,
             binary_excluded_code_bearing_digests=binary_excluded_code_bearing_digests,

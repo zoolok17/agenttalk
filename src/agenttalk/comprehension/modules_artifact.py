@@ -448,6 +448,7 @@ def build_modules(
     *, worker_problem_reasons_by_path: dict[str, list[str]] | None = None,
     worker_problem_reasons_by_unit: dict[tuple[str, str], list[str]] | None = None,
     worker_problem_reasons_by_qualified_name: dict[str, list[str]] | None = None,
+    worker_declaring_paths_by_qualified_name: dict[str, set[str]] | None = None,
     non_degrading_unsupported_language_paths: frozenset[str] | None = None,
     binary_excluded_root_sniffed_xml_digests: dict[str, str] | None = None,
     binary_excluded_code_bearing_digests: dict[str, str] | None = None,
@@ -494,13 +495,31 @@ def build_modules(
     name alone, for a worker problem recorded against a DIFFERENT file
     than the one declaring the type it names - a web.xml ``<listener>``
     element's own problem is correctly recorded against web.xml's own
-    path (web.xml has no unit of its own to broadcast to), naming a
-    class declared in some other ``.java`` file entirely, so the tuple-
-    keyed map above can never match it. Applied via
+    path, naming a class declared in some other ``.java`` file entirely,
+    so the tuple-keyed map above can never match it. Applied via
     ``_attribute_cross_file_entry_point_reasons`` below, after every
     record is built - resolved the same "unambiguous or not resolved at
     all" way ``features_artifact.py``'s own owner resolution already
     treats a qualified name.
+
+    FIX ROUND 37 (thirty-first cold read, F3 MAJOR, wrong-data,
+    CORRECTION): the paragraph above previously claimed "web.xml has no
+    unit of its own to broadcast to" - MEASURED FALSE: modules.json
+    already publishes a real file-kind unit for web.xml, the same as
+    for every other file this run enumerates. That false premise is
+    exactly what let the zero-in-scan-claimant case (a jar-shipped
+    listener class, the NORMAL real-world shape) fall through to
+    nothing - see ``worker_declaring_paths_by_qualified_name`` and
+    ``_attribute_cross_file_entry_point_reasons``'s own updated
+    docstring for the fallback this round adds.
+
+    ``worker_declaring_paths_by_qualified_name`` (FIX ROUND 37) tracks
+    each qualified name's own DECLARING path(s) (web.xml's own path, for
+    the ``<listener>`` shape) alongside the reasons above - needed
+    because a qualified name resolving to ZERO in-scan claimants must
+    still reach a real unit somewhere, and the only unit this run can
+    honestly attribute it to is the file that declared the reference in
+    the first place.
 
     ``binary_excluded_root_sniffed_xml_digests`` (MICRO-ROUND 28b,
     reviewer-3 delta on ``02c6b30``, R2, wrong-data) maps a binary-
@@ -757,7 +776,8 @@ def build_modules(
         ))
 
     records = _attribute_cross_file_entry_point_reasons(
-        records, worker_problem_reasons_by_qualified_name or {})
+        records, worker_problem_reasons_by_qualified_name or {},
+        worker_declaring_paths_by_qualified_name or {})
     records = _populate_duplicate_qualified_name_conflicts(records)
     records = _populate_descriptor_name_conflicts(records, descriptor_name_conflicts or [])
     # FIX ROUND 29 (twenty-fifth cold read, F6 polish, wrong-data):
@@ -777,6 +797,7 @@ def build_modules(
 def _attribute_cross_file_entry_point_reasons(
     records: list[ModuleRecord],
     worker_problem_reasons_by_qualified_name: dict[str, list[str]],
+    worker_declaring_paths_by_qualified_name: dict[str, set[str]],
 ) -> list[ModuleRecord]:
     """FIX ROUND 21c (reviewer-3's re-delta, THE CARRY, wrong-data): a
     worker problem recorded against a DIFFERENT file than the one
@@ -796,24 +817,63 @@ def _attribute_cross_file_entry_point_reasons(
     registry discipline ``features_artifact.py``'s own owner resolution
     already applies to a qualified name: a name with EXACTLY ONE
     "component"-kind claimant in THIS run gets the reason merged onto
-    that one unit's own record; a name with zero or 2+ claimants
-    (unresolved in-scan, or a genuine duplicate-qualified-name collision
-    - already its own separate, visible problem) is left alone - the
-    declaring file's own problems.json record is the only trace of it
-    either way, exactly as it always was before this fix. Never invents
-    a unit that does not already exist."""
+    that one unit's own record.
+
+    FIX ROUND 37 (thirty-first cold read, F3 MAJOR, wrong-data): the
+    DECLARING file's own unit (web.xml's own file-kind record - modules.
+    json already publishes one, the round-21c comment's own premise
+    "web.xml genuinely has no unit of its own to broadcast to" was
+    FALSE) now ALSO always gets ``unsupported_entry_point_shape``,
+    regardless of whether the class resolves to zero, one, or more
+    in-scan claimants. This is a fact about the DECLARING FILE - "this
+    file names an unmodeled entry-point mechanism" - never contingent
+    on whether this run happens to ALSO have the target class in scope;
+    a listener/filter class that IS in scan (one claimant) still leaves
+    web.xml itself carrying an unmodeled declaration, and a class NOT in
+    scan at all (the NORMAL real-world case - a jar-shipped listener,
+    e.g. Spring's own ContextLoaderListener) must not let the reason
+    reach NOTHING just because there is no component to attribute it to
+    either. The one-claimant component attribution is unchanged and
+    additive - both units carry the reason when both apply. Restricted
+    to ``unsupported_entry_point_shape`` specifically: the web.xml
+    descriptor-conflict reason codes (``duplicate_descriptor_name``,
+    ``undeclared_descriptor_name``, ``descriptor_name_without_class``,
+    ...) ALSO carry a qualified_name here (a synthetic, file-anchored
+    anchor - never a real class - see their own emission sites), but
+    they already have their OWN dedicated, purpose-built resolution
+    machinery (``_populate_descriptor_name_conflicts``) that decides
+    which unit(s) they concern; broadcasting them onto the declaring
+    file's own unit too would be a second, independently-maintained
+    attribution path for a fact that mechanism already owns - out of
+    scope for the narrower gap this round measured."""
     if not worker_problem_reasons_by_qualified_name:
         return records
     unit_ids_by_qualified_name: dict[str, list[str]] = {}
+    file_unit_id_by_path: dict[str, str] = {}
     for record in records:
         if record.kind == "component" and record.qualified_name is not None:
             unit_ids_by_qualified_name.setdefault(record.qualified_name, []).append(record.unit_id)
+        elif record.kind == "file" and len(record.paths) == 1:
+            file_unit_id_by_path[record.paths[0]] = record.unit_id
     extra_reasons_by_unit_id: dict[str, list[str]] = {}
     for qualified_name, reasons in worker_problem_reasons_by_qualified_name.items():
         candidates = unit_ids_by_qualified_name.get(qualified_name, [])
-        if len(candidates) != 1:
+        if len(candidates) == 1:
+            extra_reasons_by_unit_id.setdefault(candidates[0], []).extend(reasons)
+        # 2+ claimants: a genuine duplicate-qualified-name collision,
+        # already its own separate, visible problem - the component
+        # side is not this fallback's job either way.
+        #
+        # FIX ROUND 37 (F3 MAJOR): the declaring file's own unit ALWAYS
+        # gets unsupported_entry_point_shape, independent of the
+        # candidate count above - see this function's own docstring.
+        fallback_reasons = [r for r in reasons if r == "unsupported_entry_point_shape"]
+        if not fallback_reasons:
             continue
-        extra_reasons_by_unit_id[candidates[0]] = reasons
+        for declaring_path in worker_declaring_paths_by_qualified_name.get(qualified_name, ()):
+            file_unit_id = file_unit_id_by_path.get(declaring_path)
+            if file_unit_id is not None:
+                extra_reasons_by_unit_id.setdefault(file_unit_id, []).extend(fallback_reasons)
     if not extra_reasons_by_unit_id:
         return records
     updated: list[ModuleRecord] = []
