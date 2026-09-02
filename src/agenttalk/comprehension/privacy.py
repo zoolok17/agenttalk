@@ -113,6 +113,13 @@ _PRIVACY_PROBE_RELATIVE_PATHS = (
     f"{RELATIVE_COMPREHENSION_DIR}/{STAGING_DIRNAME}/privacy-probe-run-deadbeef/owner.json",
 )
 
+#: MICRO-ROUND 35b (reviewer-3 delta on `32a5fa6`, informed consent):
+#: how many stageable paths ``verify_store_ignored``'s own refusal
+#: message names individually before falling back to "...and N more" -
+#: bounded the same way every other path list in this artifact family
+#: already is (``boundaries``, ``excluded_roots``, ...), never unbounded.
+_STAGEABLE_PATHS_NAMED_LIMIT = 20
+
 #: Sentinel identity only this module's own factory functions hold —
 #: PrivacyPreflightResult.__post_init__ refuses any construction that
 #: doesn't present it (reviewer-1 cold-read finding 1 on PR-A,
@@ -353,10 +360,20 @@ def verify_store_ignored(
         line for line in result.stdout.splitlines() if line and line not in exclude_relative_paths
     )
     if stageable:
+        # MICRO-ROUND 35b (reviewer-3 delta on `32a5fa6`, informed
+        # consent): naming only the count plus ONE exemplar path
+        # (`stageable[0]`) left an operator deciding whether to consent
+        # to a multi-path exposure unable to see the rest of what would
+        # be exposed. Lists the full set now, bounded (never unbounded -
+        # a pathological repo could stage thousands of paths) the same
+        # way every other path list in this artifact family already is.
+        named = [repr(p) for p in stageable[:_STAGEABLE_PATHS_NAMED_LIMIT]]
+        if len(stageable) > _STAGEABLE_PATHS_NAMED_LIMIT:
+            named.append(f"...and {len(stageable) - _STAGEABLE_PATHS_NAMED_LIMIT} more")
         raise VcsPrivacyRefused(
             f"{len(stageable)} path(s) under {relative_store_dir}/ are stageable "
-            f"(untracked and not ignored) immediately after publication (e.g. "
-            f"{stageable[0]!r}) — refusing, rolling back the just-published run, and "
+            f"(untracked and not ignored) immediately after publication: "
+            f"{', '.join(named)} — refusing, rolling back the just-published run, and "
             "restoring the prior index.json", vcs_kind="git",
         )
 

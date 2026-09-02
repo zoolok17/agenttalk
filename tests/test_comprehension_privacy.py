@@ -364,6 +364,45 @@ def test_verify_store_ignored_refuses_on_an_unanticipated_new_file(tmp_path: Pat
         privacy.verify_store_ignored(tmp_path, ".agenttalk/comprehension")
 
 
+def test_verify_store_ignored_refusal_names_every_stageable_path_up_to_a_bound(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 35b (reviewer-3 delta on `32a5fa6`, informed consent):
+    the refusal used to name only the total count plus ONE exemplar path
+    (`stageable[0]`) - an operator deciding whether to consent to a
+    multi-path exposure could not see the rest of what would be exposed.
+    Now lists the full set, still bounded (never unbounded, the same
+    discipline every other path list in this artifact family already
+    follows) rather than truncated to one."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(
+        ".agenttalk/**\n"
+        "!.agenttalk/comprehension/\n"
+        "!.agenttalk/comprehension/index.json\n"
+        "!.agenttalk/comprehension/leak-*.json\n",
+        encoding="utf-8",
+    )
+    _commit_all(tmp_path, "base")
+    store = tmp_path / ".agenttalk" / "comprehension"
+    store.mkdir(parents=True)
+    (store / "index.json").write_text("{}", encoding="utf-8")
+    leaked_names = [f"leak-{i:02d}.json" for i in range(25)]
+    for name in leaked_names:
+        (store / name).write_text("{}", encoding="utf-8")
+    with pytest.raises(VcsPrivacyRefused) as excinfo:
+        privacy.verify_store_ignored(tmp_path, ".agenttalk/comprehension")
+    message = str(excinfo.value)
+    assert "26 path(s)" in message
+    # "index.json" sorts before every "leak-*" name, occupying one of the
+    # first 20 named slots itself - the remaining 19 are leak-00..leak-18.
+    combined_sorted = sorted([*leaked_names, "index.json"])
+    for name in combined_sorted[:20]:
+        assert name in message
+    assert "...and 6 more" in message
+    for name in combined_sorted[20:]:
+        assert name not in message
+
+
 def test_verify_store_ignored_excludes_scan_lock_from_stageability(tmp_path: Path) -> None:
     """FIX ROUND 35 (twenty-ninth cold read, F2 MAJOR part (b), JUDGE -
     taken, .cr29-deadend verbatim): a .gitignore matching everything BUT
