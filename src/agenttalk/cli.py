@@ -14152,13 +14152,21 @@ def build_parser() -> argparse.ArgumentParser:
     # slice implements five (scan/status/report/validate/prune) - `pack`
     # is a LATER increment (the design's own increment 3) with nothing
     # declaring its absence anywhere a `--help` reader would see it.
+    #
+    # FIX ROUND 36 (thirtieth cold read, F6 LOW, completeness): `pack`
+    # got its own declaration above, but `/api/comprehension` (the
+    # design's own PR-D increment - the HTTP surface this same data
+    # would be served through) is EQUALLY unimplemented this slice and
+    # had no declaration anywhere a `--help` reader would see it either.
     pcomp = sub.add_parser(
         "comprehension",
         help="Local, offline static comprehension inventory for one legacy repository (task #55).",
         description="Local, offline static comprehension inventory for one legacy repository "
                     "(task #55 slice-1). This slice implements scan/status/report/validate/"
                     "prune - `pack` (bounded evidence-pack construction) is a later increment, "
-                    "not yet implemented.",
+                    "not yet implemented. The `/api/comprehension` HTTP surface (PR-D's own "
+                    "increment) is equally not implemented this slice - every command here is "
+                    "CLI-only.",
     )
     pcomp.set_defaults(func=cmd_comprehension, comprehension_cmd=None)
     compsub = pcomp.add_subparsers(dest="comprehension_cmd")

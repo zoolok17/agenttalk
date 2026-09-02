@@ -301,6 +301,19 @@ def test_comprehension_help_declares_pack_as_a_later_increment(capsys) -> None:
     assert "later increment" in help_text
 
 
+def test_comprehension_help_declares_the_api_surface_as_not_implemented(capsys) -> None:
+    """FIX ROUND 36 (thirtieth cold read, F6 LOW, completeness): `pack`
+    got its own declaration (see the test above), but `/api/comprehension`
+    (PR-D's own increment - the HTTP surface this same data would be
+    served through) is equally unimplemented this slice and had no
+    declaration anywhere a --help reader would see it either."""
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["comprehension", "--help"])
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "/api/comprehension" in help_text
+
+
 def test_scan_help_declares_scope_exclude_config_as_not_implemented_this_slice(capsys) -> None:
     """FIX ROUND 26 (twenty-second cold read, F5 completeness): `pack`
     got an explicit later-increment declaration (see the test above),
