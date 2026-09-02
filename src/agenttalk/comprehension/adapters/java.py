@@ -4460,6 +4460,33 @@ def is_effectively_empty_web_xml(text: str) -> bool:
     return sanitized[block_match.start(1):block_match.end(1)].strip() == ""
 
 
+#: MICRO-ROUND 31b (reviewer-3 delta, R4, declared - under-reporting,
+#: not wrong data), published in-artifact by FIX ROUND 36 (thirtieth
+#: cold read, F5 MINOR, completeness): ``duplicate_route_target``'s own
+#: check is narrower than its name suggests - it only ever compares
+#: ``<url-pattern>`` values declared within ONE web.xml's own
+#: ``<servlet-mapping>`` elements. Two gaps this leaves, both real:
+#: a ``@WebServlet`` annotation route colliding with a web.xml mapping
+#: (or the reverse) is never cross-checked at all, since this producer
+#: never compares the two families against each other; and two
+#: DIFFERENT web.xml files (or the same one twice, however unlikely)
+#: each declaring the identical pattern are equally unchecked. An
+#: ABSENT ``duplicate_route_target`` row therefore means "no collision
+#: found within this one descriptor's own mappings," never "no route
+#: collisions exist in this run" - declared here, in-artifact, the same
+#: "an absent row must not read as covered" discipline every other
+#: ``*_CAVEAT`` in this package already follows, rather than left only
+#: in this source comment for a reader to independently rediscover.
+DUPLICATE_ROUTE_TARGET_CAVEAT = (
+    "duplicate_route_target only ever compares <url-pattern> values declared within ONE "
+    "web.xml file's own <servlet-mapping> elements - it never cross-checks a @WebServlet "
+    "annotation route against a web.xml mapping (or the reverse), and never cross-checks "
+    "two different web.xml files against each other. An absent duplicate_route_target row "
+    "means no collision was found within one descriptor's own mappings, never that no route "
+    "collisions exist anywhere in this run."
+)
+
+
 def parse_web_xml(
     relative_path: str, text: str,
 ) -> tuple[
@@ -4734,6 +4761,10 @@ def parse_web_xml(
     # a-confident-negative discipline round 30's own R2 rename applied
     # to `dependencies_resolved`'s reason, here for a check's own SCOPE
     # rather than a reason's own name.
+    #
+    # FIX ROUND 36 (thirtieth cold read, F5 MINOR, completeness): this
+    # scope limit lived only in this source comment - published now,
+    # in-artifact, as DUPLICATE_ROUTE_TARGET_CAVEAT (this module).
     route_pattern_owners: dict[str, set[tuple[str, str]]] = {}
     for block_match in _SERVLET_MAPPING_BLOCK_RE.finditer(structural):
         # FIX ROUND 26 (twenty-second cold read, F2 BLOCKER, wrong-data):

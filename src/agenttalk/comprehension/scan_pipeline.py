@@ -1597,6 +1597,11 @@ def run_scan(
             # file exclusion list's own provisional-set boundary - see
             # SECRET_PATTERNS_CAVEAT's own docstring.
             "secret_patterns_caveat": discovery.SECRET_PATTERNS_CAVEAT,
+            # FIX ROUND 36 (thirtieth cold read, F5 MINOR, completeness):
+            # the same in-artifact declaration discipline, for
+            # duplicate_route_target's own file-scoped check boundary -
+            # see DUPLICATE_ROUTE_TARGET_CAVEAT's own docstring.
+            "duplicate_route_target_caveat": java_adapter.DUPLICATE_ROUTE_TARGET_CAVEAT,
             # N2 (fourth cold read, fix round 6): the design names "the
             # effective include/exclude rules... and their configuration
             # digest" as a scan.json field. config.json parsing itself is

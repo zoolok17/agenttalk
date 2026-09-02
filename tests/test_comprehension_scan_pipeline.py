@@ -6064,6 +6064,22 @@ def test_scan_json_declares_the_secret_patterns_caveat(java_repo: Path) -> None:
     assert scan_doc["secret_patterns_caveat"] == discovery.SECRET_PATTERNS_CAVEAT
 
 
+def test_scan_json_declares_the_duplicate_route_target_caveat(java_repo: Path) -> None:
+    """FIX ROUND 36 (thirtieth cold read, F5 MINOR, completeness): the
+    SAME in-artifact declaration discipline - duplicate_route_target's
+    own file-scoped check boundary (never cross-checked against a
+    @WebServlet annotation route, never cross-checked against a second
+    web.xml) previously lived only in a java.py source comment.
+    Published as a real scan.json field now."""
+    import json
+
+    from agenttalk.comprehension.adapters import java as java_adapter
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["duplicate_route_target_caveat"] == java_adapter.DUPLICATE_ROUTE_TARGET_CAVEAT
+
+
 def test_scan_json_degraded_by_is_empty_on_a_complete_run(java_repo: Path) -> None:
     """FIX ROUND 35 (twenty-ninth cold read, F5 MINOR, completeness):
     regression control - a genuinely complete run names no reasons at all."""
