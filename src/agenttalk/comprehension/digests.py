@@ -13,6 +13,26 @@ Two distinct digest families, per DESIGN-55-comprehension-plane.md's
 Both use the same canonical-JSON-bytes recipe already established elsewhere
 in this codebase (``signing.canonical_payload``, ``attention.source_hash``):
 ``sort_keys=True``, compact separators, ``ensure_ascii=False``.
+
+MICRO-ROUND 38b (reviewer-3 delta on ``740a856``): this module follows TWO
+DIFFERENT conventions for an optional string component, stated once here
+rather than left implicit per function. ``entry_point_id`` and
+``problem_id`` both fold ``qualified_name is None`` to the empty string
+before hashing (``qualified_name or ""``) - deliberate, since for BOTH,
+``None`` (unattributed) and ``""`` (an empty but present value) are meant
+to be indistinguishable identity components, and no emitter in this
+package ever actually publishes a literal empty string for either field
+today (a synthetic owner is always ``path#name`` shaped). ``unit_id``
+keeps ``qualified_name`` un-folded - ``None`` and ``""`` hash DIFFERENTLY
+there, because a file-kind unit's ``qualified_name`` really is ``None``
+(no declared type), while a component-kind unit's is always a real,
+non-empty dotted name - collapsing the two there would conflate two
+genuinely different unit shapes. Latent today (no id family has a real
+empty-string emitter - the micro-round 38b leaf-decode fix in
+``adapters/java.py`` refuses to publish an empty identity component at
+all, rather than ever testing this distinction), but worth one explicit
+sentence before a future emitter's own choice has to be reverse-
+engineered from which function it happens to call.
 """
 
 from __future__ import annotations

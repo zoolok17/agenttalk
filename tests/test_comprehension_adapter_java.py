@@ -4858,6 +4858,114 @@ def test_pom_dependency_coordinate_with_an_interior_comment_splices_it_out():
     ) == []
 
 
+# ------------------------------------------------------- micro-round 38b (empty-after-splice, THE BLOCKER)
+
+def test_pom_comment_only_groupid_does_not_publish_a_bogus_coordinate():
+    """MICRO-ROUND 38b (reviewer-3 delta on `740a856`, THE BLOCKER,
+    wrong-data): <groupId><!--TODO--></groupId> is WELL-FORMED XML
+    ("inherited from parent" comments are what people write) yielding
+    the empty string after splice - which `_decode_xml_leaf` correctly
+    decodes, but publishing an empty groupId as a REAL, present value
+    produces the bogus coordinate ":core" (a coordinate that cannot
+    exist). Must publish NO unit for this pom's own coordinate, and
+    record it via the existing unrecoverable path (never silently)."""
+    pom = (
+        "<project><groupId><!--TODO--></groupId><artifactId>core</artifactId></project>"
+    )
+    units, _edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert units == []
+    assert not any(":core" in u.qualified_name for u in units)
+    assert java.pom_own_coordinate_decode_problems(pom) != []
+
+
+def test_pom_whitespace_only_groupid_does_not_publish_a_bogus_coordinate():
+    """MICRO-ROUND 38b (THE BLOCKER, whitespace-only control): a
+    <groupId> containing only whitespace (no comment at all) must land
+    identically to the comment-only case above - both are "empty after
+    decode," not two different shapes."""
+    pom = "<project><groupId>   </groupId><artifactId>core</artifactId></project>"
+    units, _edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert units == []
+    assert not any(":core" in u.qualified_name for u in units)
+    assert java.pom_own_coordinate_decode_problems(pom) != []
+
+
+def test_pom_genuinely_empty_groupid_lands_identically_to_comment_only():
+    """MICRO-ROUND 38b (THE BLOCKER, spelling-parity check): a
+    genuinely empty <groupId></groupId> and a comment-only one must
+    publish IDENTICALLY (both absent, both flagged) - the splice must
+    not create a NEW, divergent path to "empty" that the genuinely-
+    empty spelling does not also reach."""
+    empty_pom = "<project><groupId></groupId><artifactId>core</artifactId></project>"
+    comment_pom = "<project><groupId><!--TODO--></groupId><artifactId>core</artifactId></project>"
+    empty_units, _e, _p = java.parse_maven_pom("pom.xml", empty_pom)
+    comment_units, _e2, _p2 = java.parse_maven_pom("pom.xml", comment_pom)
+    assert empty_units == comment_units == []
+    assert java.pom_own_coordinate_decode_problems(empty_pom) != []
+    assert java.pom_own_coordinate_decode_problems(comment_pom) != []
+
+
+def test_two_modules_with_comment_only_groupid_and_the_same_artifactid_do_not_collide():
+    """MICRO-ROUND 38b (THE BLOCKER, the two-modules-collide shape):
+    before this fix, two DIFFERENT modules each declaring a comment-
+    only <groupId> and the identical <artifactId> both published the
+    SAME bogus coordinate (":artifactId") - a real identity collision
+    between two otherwise-unrelated modules, purely from two empty
+    groupIds coinciding. Neither module registers a coordinate unit at
+    all now, so there is nothing to collide on."""
+    pom_a = "<project><groupId><!--x--></groupId><artifactId>shared</artifactId></project>"
+    pom_b = "<project><groupId><!--y--></groupId><artifactId>shared</artifactId></project>"
+    units_a, _ea, _pa = java.parse_maven_pom("modA/pom.xml", pom_a)
+    units_b, _eb, _pb = java.parse_maven_pom("modB/pom.xml", pom_b)
+    assert units_a == units_b == []
+
+
+def test_web_xml_comment_only_url_pattern_still_publishes_the_context_root():
+    """MICRO-ROUND 38b (THE BLOCKER, url-pattern is the OTHER edge):
+    unlike a coordinate/name, an empty <url-pattern> is servlet-spec-
+    LEGAL (round 25's own micro-round 25b F6 ruling) - a comment-only
+    one must keep publishing the SAME empty context-root value a
+    genuinely empty one already does, never be treated as
+    unrecoverable."""
+    empty_entry_points, empty_problems, _e, _c = java.parse_web_xml(
+        "web.xml",
+        "<web-app><servlet-mapping><servlet-name>a</servlet-name>"
+        "<url-pattern></url-pattern></servlet-mapping></web-app>",
+    )
+    comment_entry_points, comment_problems, _e2, _c2 = java.parse_web_xml(
+        "web.xml",
+        "<web-app><servlet-mapping><servlet-name>a</servlet-name>"
+        "<url-pattern><!--root--></url-pattern></servlet-mapping></web-app>",
+    )
+    assert [e.name for e in empty_entry_points] == [e.name for e in comment_entry_points] == [""]
+    assert not any(p.reason_code == "route_value_unrecoverable" for p in empty_problems)
+    assert not any(p.reason_code == "route_value_unrecoverable" for p in comment_problems)
+
+
+def test_web_xml_comment_only_servlet_name_does_not_publish_a_bogus_route():
+    """MICRO-ROUND 38b (THE BLOCKER, the servlet-name twin of the pom
+    coordinate collision): a comment-only <servlet-name> used to
+    resolve to a REAL in-scan class via a shared "" dict key - two
+    otherwise-unrelated blank-named declarations would silently
+    resolve to each other. Must publish no entry point at all, and
+    record it via the existing unrecoverable path."""
+    entry_points, problems, _edges, _c = java.parse_web_xml(
+        "WEB-INF/web.xml",
+        "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name><!--x--></servlet-name>\n"
+        "    <servlet-class>com.acme.RealClass</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name><!--x--></servlet-name>\n"
+        "    <url-pattern>/x</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+    )
+    assert entry_points == []
+    assert any(p.reason_code == "route_value_unrecoverable" for p in problems)
+
+
 # --------------------------------------------------- fix round 26 F2 (block-interior leaf searches unpaired)
 
 def test_web_xml_a_cdata_description_before_servlet_name_does_not_steal_the_class_join():

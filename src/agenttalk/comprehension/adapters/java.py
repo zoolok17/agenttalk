@@ -3404,6 +3404,31 @@ def _decode_xml_leaf(blanked: str, raw: str) -> str | None:
     return _decode_xml_text(_splice_comment_spans(raw))
 
 
+def _is_blank_identity(decoded: str | None) -> bool:
+    """MICRO-ROUND 38b (reviewer-3 delta on `740a856`, THE BLOCKER,
+    wrong-data): every leaf pattern in this module is DOTALL (``.*?``,
+    zero-or-more) - a genuinely empty element (``<groupId></groupId>``)
+    and a comment-only or whitespace-only one (``<groupId><!--TODO-->
+    </groupId>``) both already match and both decode to an empty (or
+    all-whitespace) string, identically - measured directly, not merely
+    reasoned about (both forms of an empty pom coordinate publish the
+    identical, bogus ``":core"`` before this fix; both forms of an
+    empty ``<servlet-name>`` already resolved to each other via a
+    shared blank-string dict key, an unrelated collision the identical
+    class of bug). ``decoded.strip()`` alone is not a safe substitute
+    for this check at a call site, since an all-whitespace value that
+    is NOT blank-checked would still publish as a real (stripped-empty)
+    identity component.
+
+    Used ONLY at IDENTITY-bearing leaf sites (a coordinate, a class
+    name, a servlet/filter name, a jsp-file path, a reactor module
+    path) - never at ``<url-pattern>``, where an empty value is the
+    servlet-spec-legal, ratified (round 25's own micro-round 25b F6)
+    CONTEXT-ROOT value and must keep publishing as ``""``, not be
+    treated as unrecoverable."""
+    return decoded is None or decoded.strip() == ""
+
+
 def _decode_xml_text(raw: str) -> str | None:
     # MICRO-ROUND 23b (reviewer-3's own MINOR, wrong-data): TWO OR MORE
     # CDATA sections in one value (a legal, if esoteric, XML shape - a
@@ -3670,7 +3695,12 @@ def declared_reactor_module_paths(text: str) -> list[str]:
             # `text` by `_decode_xml_leaf`) is decoded correctly now
             # instead of publishing its own blanked whitespace.
             decoded_value = _decode_xml_leaf(blanked_value, raw_value)
-            if decoded_value is None:
+            # MICRO-ROUND 38b (THE BLOCKER): a reactor module path that
+            # decodes to empty/whitespace-only (a comment-only or
+            # genuinely empty <module>) names no real path at all -
+            # identical treatment to undecodable, never an empty-string
+            # reactor entry.
+            if _is_blank_identity(decoded_value):
                 continue
             paths.append(_bounded_route_target(decoded_value.strip()))
     return paths
@@ -3727,19 +3757,26 @@ def pom_dependency_decode_problems(text: str) -> list[int]:
         # out of block_text) is decoded correctly now via
         # _decode_xml_leaf, the same chokepoint every other leaf decode
         # in this module now goes through.
+        #
+        # MICRO-ROUND 38b (THE BLOCKER): a blank-after-decode value
+        # (comment-only or genuinely empty) is exactly as undecodable
+        # as a real decode failure for an identity-bearing coordinate -
+        # `_is_blank_identity` (not a bare `is None`) so this mirror
+        # agrees with the value-extraction site below on what counts
+        # as "undecodable" for this same coordinate.
         group_undecodable = (
             group_match is not None
-            and _decode_xml_leaf(
+            and _is_blank_identity(_decode_xml_leaf(
                 block_sanitized[group_match.start(1):group_match.end(1)],
                 block_text[group_match.start(1):group_match.end(1)],
-            ) is None
+            ))
         )
         artifact_undecodable = (
             artifact_match is not None
-            and _decode_xml_leaf(
+            and _is_blank_identity(_decode_xml_leaf(
                 block_sanitized[artifact_match.start(1):artifact_match.end(1)],
                 block_text[artifact_match.start(1):artifact_match.end(1)],
-            ) is None
+            ))
         )
         if group_undecodable or artifact_undecodable:
             lines.append(_line_at(newline_offsets, match.start()))
@@ -3774,15 +3811,21 @@ def pom_own_coordinate_decode_problems(text: str) -> list[int]:
     # FIX ROUND 38 (F2 BLOCKER): a comment interior to this leaf's own
     # value (blanked in `sanitized`, spliced out of `text` by
     # `_decode_xml_leaf`) is decoded correctly now.
+    # MICRO-ROUND 38b (THE BLOCKER): _is_blank_identity, not a bare
+    # `is None` - a comment-only/whitespace-only coordinate is exactly
+    # as undecodable as a real decode failure, and this mirror must
+    # agree with the value-extraction sites below on what counts as
+    # "undecodable" for this coordinate.
     for match in _DEPENDENCY_GROUP_ID_RE.finditer(sanitized):
         stack = _enclosing_tag_stack(structural, match.start())
-        if stack in (["project"], ["project", "parent"]) and _decode_xml_leaf(
-            match.group(1), text[match.start(1):match.end(1)]) is None:
+        if stack in (["project"], ["project", "parent"]) and _is_blank_identity(_decode_xml_leaf(
+            match.group(1), text[match.start(1):match.end(1)])):
             lines.append(_line_at(newline_offsets, match.start()))
     for match in _DEPENDENCY_ARTIFACT_ID_RE.finditer(sanitized):
         if (
             _enclosing_tag_stack(structural, match.start()) == ["project"]
-            and _decode_xml_leaf(match.group(1), text[match.start(1):match.end(1)]) is None
+            and _is_blank_identity(
+                _decode_xml_leaf(match.group(1), text[match.start(1):match.end(1)]))
         ):
             lines.append(_line_at(newline_offsets, match.start()))
     return sorted(set(lines))
@@ -3880,18 +3923,32 @@ def _own_and_parent_group_ids(
     # FIX ROUND 38 (F2 BLOCKER): a comment interior to this leaf's own
     # value is decoded correctly now via _decode_xml_leaf, instead of
     # publishing the blanked span's own literal whitespace.
+    # MICRO-ROUND 38b (reviewer-3 delta on `740a856`, THE BLOCKER,
+    # wrong-data): a comment-only or whitespace-only <groupId> (well-
+    # formed XML - "inherited from parent" comments are what people
+    # write) decoded/spliced to an empty string, which `decoded is not
+    # None` treated as a REAL, present groupId - publishing a coordinate
+    # like ":core" (empty groupId, real artifactId) that cannot exist,
+    # and letting two such modules collide on their shared empty
+    # groupId. `_is_blank_identity` now gates both branches - blank is
+    # treated exactly like "declared but broken" for the project level
+    # (never silently falls back to the parent's own groupId, the same
+    # over-claim risk this function's own docstring already reasons
+    # about for a genuine decode failure), and simply left unset for
+    # the parent level (the safe "no usable parent groupId" default,
+    # identical to a genuinely absent <parent> block).
     for match in _DEPENDENCY_GROUP_ID_RE.finditer(sanitized):
         stack = _enclosing_tag_stack(structural, match.start())
         if stack == ["project"]:
             decoded = _decode_xml_leaf(match.group(1), text[match.start(1):match.end(1)])
-            if decoded is not None:
+            if not _is_blank_identity(decoded):
                 group_id = _bounded_route_target(decoded.strip())
             else:
                 project_group_id_declared_but_broken = True
             break
         if stack == ["project", "parent"] and parent_group_id is None:
             decoded = _decode_xml_leaf(match.group(1), text[match.start(1):match.end(1)])
-            if decoded is not None:
+            if not _is_blank_identity(decoded):
                 parent_group_id = _bounded_route_target(decoded.strip())
     return group_id, parent_group_id, project_group_id_declared_but_broken
 
@@ -3961,10 +4018,12 @@ def _project_own_coordinate(
         group_id = parent_group_id
     artifact_id = None
     # FIX ROUND 38 (F2 BLOCKER): see _own_and_parent_group_ids's own note.
+    # MICRO-ROUND 38b (THE BLOCKER): _is_blank_identity, not a bare
+    # `is None` - see _own_and_parent_group_ids's own identical fix.
     for match in _DEPENDENCY_ARTIFACT_ID_RE.finditer(sanitized):
         if _enclosing_tag_stack(structural, match.start()) == ["project"]:
             decoded = _decode_xml_leaf(match.group(1), text[match.start(1):match.end(1)])
-            if decoded is not None:
+            if not _is_blank_identity(decoded):
                 artifact_id = _bounded_route_target(decoded.strip())
             break
     if group_id is None or artifact_id is None:
@@ -4106,7 +4165,13 @@ def parse_maven_pom(
         artifact_decoded = _decode_xml_leaf(
             block_sanitized[artifact_match.start(1):artifact_match.end(1)],
             block_text[artifact_match.start(1):artifact_match.end(1)])
-        if group_decoded is None or artifact_decoded is None:
+        # MICRO-ROUND 38b (THE BLOCKER): a blank-after-decode groupId/
+        # artifactId (comment-only or genuinely empty) is exactly as
+        # undecodable as a real decode failure - _is_blank_identity,
+        # not a bare `is None`, so this never publishes an empty-string
+        # half of a coordinate (visibility comes from
+        # pom_dependency_decode_problems's own matching fix above).
+        if _is_blank_identity(group_decoded) or _is_blank_identity(artifact_decoded):
             continue
         # CR9-6 (ninth cold read, judged, completeness): a pom's own
         # groupId/artifactId published VERBATIM, UNBOUNDED (a hostile or
@@ -4439,7 +4504,13 @@ def _servlet_class_by_name(
         decoded_name = _decode_xml_leaf(
             block_sanitized[name_match.start(1):name_match.end(1)],
             block_text[name_match.start(1):name_match.end(1)])
-        if decoded_name is None:
+        # MICRO-ROUND 38b (THE BLOCKER): a blank-after-decode servlet-
+        # name (comment-only or genuinely empty) is exactly as
+        # undecodable as a real decode failure - two DIFFERENT blank
+        # servlet-names would otherwise resolve to EACH OTHER via a
+        # shared "" dict key, the identical class of bogus-identity
+        # collision as the pom coordinate case.
+        if _is_blank_identity(decoded_name):
             name_undecodable.append(block_match.start())
             continue
         servlet_name = decoded_name.strip()
@@ -4465,21 +4536,28 @@ def _servlet_class_by_name(
         # established for the cross-element shape.
         class_matches = list(_SERVLET_CLASS_RE.finditer(block_structural))
         jsp_matches = list(_JSP_FILE_RE.finditer(block_structural))
+        # MICRO-ROUND 38b (THE BLOCKER): _is_blank_identity, not a bare
+        # `is None` - a class/jsp-file value that decodes to empty or
+        # whitespace-only (comment-only or genuinely empty) is exactly
+        # as undecodable/absent as a real decode failure, never a real,
+        # empty-string class name or jsp path.
         for class_match in class_matches:
             decoded_class = _decode_xml_leaf(
                 block_sanitized[class_match.start(1):class_match.end(1)],
                 block_text[class_match.start(1):class_match.end(1)])
+            class_blank = _is_blank_identity(decoded_class)
             declarations.setdefault(servlet_name, []).append(_DescriptorDeclaration(
-                class_value=_bounded_route_target(decoded_class.strip()) if decoded_class is not None else None,
-                jsp_path=None, class_undecodable=decoded_class is None, block_start=block_match.start(),
+                class_value=_bounded_route_target(decoded_class.strip()) if not class_blank else None,
+                jsp_path=None, class_undecodable=class_blank, block_start=block_match.start(),
             ))
         for jsp_match in jsp_matches:
             jsp_path = _decode_xml_leaf(
                 block_sanitized[jsp_match.start(1):jsp_match.end(1)],
                 block_text[jsp_match.start(1):jsp_match.end(1)])
+            jsp_blank = _is_blank_identity(jsp_path)
             declarations.setdefault(servlet_name, []).append(_DescriptorDeclaration(
                 class_value=None,
-                jsp_path=_bounded_route_target(jsp_path.strip()) if jsp_path is not None else None,
+                jsp_path=_bounded_route_target(jsp_path.strip()) if not jsp_blank else None,
                 class_undecodable=False, block_start=block_match.start(),
             ))
         if not class_matches and not jsp_matches:
@@ -4580,7 +4658,10 @@ def _filter_class_by_name(
         decoded_name = _decode_xml_leaf(
             block_sanitized[name_match.start(1):name_match.end(1)],
             block_text[name_match.start(1):name_match.end(1)])
-        if decoded_name is None:
+        # MICRO-ROUND 38b (THE BLOCKER): see _servlet_class_by_name's own
+        # identical fix - a blank-after-decode filter-name is exactly as
+        # undecodable as a real decode failure.
+        if _is_blank_identity(decoded_name):
             name_undecodable.append(block_match.start())
             continue
         filter_name = decoded_name.strip()
@@ -4601,9 +4682,10 @@ def _filter_class_by_name(
             decoded_class = _decode_xml_leaf(
                 block_sanitized[class_match.start(1):class_match.end(1)],
                 block_text[class_match.start(1):class_match.end(1)])
+            class_blank = _is_blank_identity(decoded_class)
             declarations.setdefault(filter_name, []).append(_DescriptorDeclaration(
-                class_value=_bounded_route_target(decoded_class.strip()) if decoded_class is not None else None,
-                jsp_path=None, class_undecodable=decoded_class is None, block_start=block_match.start(),
+                class_value=_bounded_route_target(decoded_class.strip()) if not class_blank else None,
+                jsp_path=None, class_undecodable=class_blank, block_start=block_match.start(),
             ))
     return _resolve_descriptor_declarations(declarations), name_undecodable
 
@@ -4985,14 +5067,20 @@ def parse_web_xml(
         decoded_name = _decode_xml_leaf(
             block_sanitized[name_match.start(1):name_match.end(1)],
             block_text[name_match.start(1):name_match.end(1)])
-        if decoded_name is None:
+        # MICRO-ROUND 38b (THE BLOCKER): a blank-after-decode servlet-
+        # name (comment-only or genuinely empty <servlet-name>) is
+        # exactly as undecodable as a real decode failure - two
+        # DIFFERENT mappings with a blank name would otherwise both
+        # resolve to the SAME synthetic owner via a shared "" key.
+        if _is_blank_identity(decoded_name):
             problems.append(JavaAdapterProblem(
                 reason_code="route_value_unrecoverable",
                 detail=f"a <servlet-mapping> declared at line "
                        f"{_line_at(newline_offsets, block_match.start())} names a "
-                       "<servlet-name> containing XML constructs this producer does not "
-                       "decode - the whole mapping is suppressed rather than published "
-                       "with a guessed name",
+                       "<servlet-name> this producer cannot resolve to a real value "
+                       "(undecodable XML constructs, or a comment-only/empty element) - "
+                       "the whole mapping is suppressed rather than published with a "
+                       "guessed or empty name",
             ))
             continue
         servlet_name = decoded_name.strip()
@@ -5150,7 +5238,11 @@ def parse_web_xml(
                 block_sanitized[name_match.start(1):name_match.end(1)],
                 block_text[name_match.start(1):name_match.end(1)])
             if name_match is not None else None)
-        if decoded_name is None or decoded_name.strip() in mapped_servlet_names:
+        # MICRO-ROUND 38b (THE BLOCKER): _is_blank_identity, not a bare
+        # `is None` - a blank-after-decode name is exactly as
+        # unresolvable as a real decode failure for this membership
+        # check.
+        if _is_blank_identity(decoded_name) or decoded_name.strip() in mapped_servlet_names:
             continue
         if _LOAD_ON_STARTUP_RE.search(block_structural) is None:
             continue
@@ -5159,13 +5251,17 @@ def parse_web_xml(
         # recorded problem (this shape is enrolled-only, never modeled)
         # - an undecodable class falls back to the same None a genuinely
         # absent one already gets, never a raw, undecoded value.
+        # MICRO-ROUND 38b (THE BLOCKER): _is_blank_identity - a blank-
+        # after-decode class is exactly as absent as a real one for
+        # this label.
         decoded_class = (
             _decode_xml_leaf(
                 block_sanitized[class_match.start(1):class_match.end(1)],
                 block_text[class_match.start(1):class_match.end(1)])
             if class_match is not None else None)
         qualified_name = (
-            _bounded_route_target(decoded_class.strip()) if decoded_class is not None else None)
+            _bounded_route_target(decoded_class.strip())
+            if not _is_blank_identity(decoded_class) else None)
         problems.append(JavaAdapterProblem(
             reason_code="unsupported_entry_point_shape",
             detail=f"a <servlet> declared at line {_line_at(newline_offsets, block_match.start())} "
@@ -5255,14 +5351,18 @@ def parse_web_xml(
         decoded_name = _decode_xml_leaf(
             block_sanitized[name_match.start(1):name_match.end(1)],
             block_text[name_match.start(1):name_match.end(1)])
-        if decoded_name is None:
+        # MICRO-ROUND 38b (THE BLOCKER): see the servlet-mapping loop's
+        # own identical fix - a blank-after-decode filter-name is
+        # exactly as unresolvable as a real decode failure.
+        if _is_blank_identity(decoded_name):
             problems.append(JavaAdapterProblem(
                 reason_code="route_value_unrecoverable",
                 detail=f"a <filter-mapping> declared at line "
                        f"{_line_at(newline_offsets, block_match.start())} names a "
-                       "<filter-name> containing XML constructs this producer does not "
-                       "decode - the whole mapping is suppressed rather than published "
-                       "with a guessed name",
+                       "<filter-name> this producer cannot resolve to a real value "
+                       "(undecodable XML constructs, or a comment-only/empty element) - "
+                       "the whole mapping is suppressed rather than published with a "
+                       "guessed or empty name",
             ))
             continue
         filter_name = decoded_name.strip()
@@ -5403,8 +5503,12 @@ def parse_web_xml(
                 block_sanitized[class_match.start(1):class_match.end(1)],
                 block_text[class_match.start(1):class_match.end(1)])
             if class_match is not None else None)
+        # MICRO-ROUND 38b (THE BLOCKER): _is_blank_identity - a blank-
+        # after-decode class is exactly as absent as a real one for
+        # this label.
         qualified_name = (
-            _bounded_route_target(decoded_class.strip()) if decoded_class is not None else None)
+            _bounded_route_target(decoded_class.strip())
+            if not _is_blank_identity(decoded_class) else None)
         problems.append(JavaAdapterProblem(
             reason_code="unsupported_entry_point_shape",
             detail=f"a <listener> declared at line {_line_at(newline_offsets, block_match.start())} "
