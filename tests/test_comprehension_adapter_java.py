@@ -4938,6 +4938,47 @@ def test_two_modules_with_comment_only_groupid_and_the_same_artifactid_do_not_co
     assert units_a == units_b == []
 
 
+def test_pom_zero_width_space_only_artifactid_does_not_publish_a_bogus_coordinate():
+    """FIX ROUND 39 (thirty-third cold read, F4 LOW, .cr33-zwsp,
+    wrong-data): `_is_blank_identity` used `str.strip()` alone, which
+    only removes Unicode WHITESPACE - a ZERO WIDTH SPACE (U+200B) is an
+    invisible-FORMAT character, not whitespace, so an artifactId
+    containing only one escaped this gate and published a bogus
+    "com.acme:\\u200b"-shaped coordinate while the comment-only and
+    genuinely-empty spellings of the SAME (to any renderer) value
+    correctly refused - three identically-rendering spellings
+    diverged. Reuses _UNICODE_INVISIBLE_FORMAT_CHARS (the same closed
+    set the route-name escape choke point already uses for the
+    identical "renders as nothing" hazard, round 35's own F7)."""
+    zero_width_space = chr(0x200B)  # ZERO WIDTH SPACE - invisible-format, not whitespace
+    pom = (
+        "<project><groupId>com.acme</groupId>"
+        f"<artifactId>{zero_width_space}</artifactId></project>"
+    )
+    units, _edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert units == []
+    assert java.pom_own_coordinate_decode_problems(pom) != []
+
+
+def test_pom_a_visible_artifactid_containing_a_zero_width_space_is_unaffected():
+    """FIX ROUND 39 (F4 LOW, control): the fix above must not treat a
+    REAL, visible identity value merely CONTAINING an invisible
+    character as blank - only a value consisting ENTIRELY of
+    whitespace/invisible characters is blank. The published coordinate
+    escapes the embedded invisible character to its visible ``\\u200b``
+    text form (the existing, unrelated route-name sanitization every
+    other published value already goes through) - unaffected by this
+    fix either way; what matters here is that a unit is published at
+    all, never that this one is blank."""
+    artifact_id = "re" + chr(0x200B) + "al"  # a real value merely CONTAINING one, not blank
+    pom = (
+        f"<project><groupId>com.acme</groupId><artifactId>{artifact_id}</artifactId></project>"
+    )
+    units, _edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert [u.qualified_name for u in units] == ["com.acme:re\\u200bal"]
+    assert java.pom_own_coordinate_decode_problems(pom) == []
+
+
 def test_web_xml_comment_only_url_pattern_still_publishes_the_context_root():
     """MICRO-ROUND 38b (THE BLOCKER, url-pattern is the OTHER edge):
     unlike a coordinate/name, an empty <url-pattern> is servlet-spec-

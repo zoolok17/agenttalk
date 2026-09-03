@@ -3465,8 +3465,23 @@ def _is_blank_identity(decoded: str | None) -> bool:
     path) - never at ``<url-pattern>``, where an empty value is the
     servlet-spec-legal, ratified (round 25's own micro-round 25b F6)
     CONTEXT-ROOT value and must keep publishing as ``""``, not be
-    treated as unrecoverable."""
-    return decoded is None or decoded.strip() == ""
+    treated as unrecoverable.
+
+    FIX ROUND 39 (thirty-third cold read, F4 LOW, wrong-data): ``str.
+    strip()`` alone only removes Unicode WHITESPACE - an identity leaf
+    containing ONLY an invisible-FORMAT character (``\\u200b`` ZERO
+    WIDTH SPACE among them) is not whitespace by that definition, so it
+    escaped this gate entirely and published a bogus ``"\\u200b:svc"``-
+    shaped coordinate while the comment-only and genuinely-empty
+    spellings of the identical (to any renderer) value correctly
+    refused - three spellings that render IDENTICALLY (nothing at all)
+    diverged. Reuses ``_UNICODE_INVISIBLE_FORMAT_CHARS`` (the same
+    closed set ``_sanitize_route_name_control_chars`` already escapes
+    for the sibling "two routes print identically, compare unequal"
+    hazard, round 35's own F7) rather than inventing a second one."""
+    if decoded is None:
+        return True
+    return all(ch.isspace() or ch in _UNICODE_INVISIBLE_FORMAT_CHARS for ch in decoded)
 
 
 def _decode_xml_text(raw: str) -> str | None:
