@@ -94,6 +94,16 @@ def measure_staging_artifacts(
             raise ArtifactLimitExceeded(
                 f"{path.name} is a symlink - a staged artifact must be a real file, "
                 "never a link that could resolve outside the private staging tree")
+        # M (cold-read PR-B fix round 47 completeness): a directory
+        # entry directly inside staging_dir is silently skipped, never
+        # measured or refused - deliberate, not an oversight: this
+        # function's own docstring already states v1's staging layout is
+        # flat (no producer this slice ever creates a subdirectory here),
+        # so nothing legitimate is ever hidden by this skip; it exists
+        # only so a hypothetical stray subdirectory can never crash
+        # is_file()/stat() below rather than because subdirectories are
+        # an expected, load-bearing shape this function chooses to
+        # ignore.
         if not path.is_file():
             continue
         if path.name not in record_counts:
