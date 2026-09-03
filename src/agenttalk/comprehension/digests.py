@@ -224,7 +224,16 @@ def problem_id(
     change, correctly a new id, never a collision. Round 36b's own
     "details carry their own distinguishing datum" rule stays in force as
     a readability SHOULD for the reactor/closer sites already updated -
-    this is additive, not a reason to revert those."""
+    this is additive, not a reason to revert those.
+
+    FIX ROUND 37c (LATENT note, reviewer-3's own delta on round 37b): a
+    literal empty string ``""`` for ``qualified_name`` hashes identically
+    to ``None`` (both fold to ``""`` below) - DELIBERATELY equivalent, not
+    an accidental collision. No emitter today ever publishes an empty
+    string (a synthetic owner is always ``path#name`` shaped, never
+    empty), so this is presently unreachable - named here so a future
+    emitter is not written believing an empty string is distinct from
+    absent."""
     return _domain_separated_id(
         _PROBLEM_ID_DOMAIN,
         {
