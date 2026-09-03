@@ -1426,6 +1426,45 @@ def test_report_and_status_show_zero_boundaries_on_a_boundary_free_repo(
     assert status["boundary_count"] == 0
 
 
+def test_get_report_exposes_degraded_by_so_a_caller_can_tell_why(java_repo: Path) -> None:
+    """M (cold-read PR-B fix round 47 completeness): scan.json's own
+    degraded_by (the sorted set of reason_codes that actually set
+    status="degraded") was published but exposed by NO read command - a
+    report --json caller saw status="degraded" with no way to tell why
+    short of separately loading problems.json and re-deriving which
+    reason_codes carry degrades_run themselves. Reuses the reader's own
+    duplicate-servlet-name fixture (an ordinary, real degrading shape)
+    to prove the field now reaches report --json."""
+    web_dir = java_repo / "src" / "main" / "java" / "com" / "acme" / "web"
+    web_dir.mkdir(parents=True)
+    (web_dir / "ServletA.java").write_text(
+        "package com.acme.web;\nclass ServletA {\n}\n", encoding="utf-8")
+    (web_dir / "ServletB.java").write_text(
+        "package com.acme.web;\nclass ServletB {\n}\n", encoding="utf-8")
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "    <servlet-class>com.acme.web.ServletA</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "    <servlet-class>com.acme.web.ServletB</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "    <url-pattern>/api/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+    report = scan_pipeline.get_report(java_repo)
+    assert report["degraded_by"] == ["duplicate_descriptor_name"]
+
+
 def test_canary_sweep_no_artifact_or_report_leaks_the_absolute_root_or_a_planted_canary(
     java_repo: Path, monkeypatch,
 ) -> None:

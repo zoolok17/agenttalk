@@ -2264,6 +2264,12 @@ def _scan_json_anchor_state(
 _SCAN_JSON_REQUIRED_BODY_FIELDS = (
     "scan_id", "status", "generated_at", "adapters", "problem_count",
     "record_counts", "root_binding", "whole_scope_fingerprint", "fingerprint_complete",
+    # M (round 47 completeness): get_report now reads degraded_by too
+    # (below) - added here so validate's own required-field check and
+    # get_report's own read can never independently drift, the same
+    # "these two must funnel through one list" discipline this constant
+    # already exists to enforce for every other scalar field.
+    "degraded_by",
 )
 
 
@@ -2621,6 +2627,15 @@ def get_report(
     payload["boundaries"] = _scan_field(records["scan"], "boundaries", scan_id)
     payload["boundaries_omitted_count"] = _scan_field(
         records["scan"], "boundaries_omitted_count", scan_id)
+    # M (cold-read PR-B fix round 47 completeness): scan.json's own
+    # degraded_by (the sorted set of reason_codes that actually set
+    # status="degraded" - see its own assembly comment in run_scan) was
+    # published but exposed by NO read command - a report --json caller
+    # saw status="degraded" with no way to tell WHY short of separately
+    # loading problems.json and re-deriving which reason_codes carry
+    # degrades_run themselves. Layered onto the projection the same way
+    # every other scan.json-level field above already is.
+    payload["degraded_by"] = _scan_field(records["scan"], "degraded_by", scan_id)
     return payload
 
 
