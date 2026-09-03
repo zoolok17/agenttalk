@@ -1096,6 +1096,22 @@ def run_scan(
                 # unmodeled first-party source this run has no visibility
                 # into is exactly what both shapes are).
                 if resolved.startswith("/") or resolved == ".." or resolved.startswith("../"):
+                    # FIX ROUND 42 (thirty-sixth cold read, F1 MAJOR,
+                    # wrong-data): round 41's own F4 chokepoint now
+                    # bounds this detail unconditionally - but bounding
+                    # alone does not keep two DIFFERENT module paths
+                    # sharing a long common prefix from truncating
+                    # IDENTICALLY (a real, ordinary shape for a deep
+                    # enterprise reactor, or a ../-chained outside-root
+                    # path), and this call passed no qualified_name at
+                    # all - the SAME (reason_code, path) for every
+                    # <module> in one pom, with no other distinguishing
+                    # datum, let two genuinely different declared
+                    # members collide on problem_id and coalesce into
+                    # one record (`duplicate_route_target`'s own
+                    # synthetic qualified_name is exactly the pattern
+                    # that already protects it from this same class -
+                    # mirrored here).
                     reactor_rule_problems.append(_problem_record(
                         "module_outside_scan_root",
                         pom_path,
@@ -1103,6 +1119,7 @@ def run_scan(
                         f"({resolved!r}) resolves OUTSIDE this run's own scanned root - a "
                         "declared reactor member this run cannot see at all, never merely "
                         "absent",
+                        qualified_name=f"{pom_path}#module#{module_path}",
                     ))
                     reactor_rule_suppression_causes.append((
                         pom_path, module_path, resolved,
@@ -1114,6 +1131,9 @@ def run_scan(
                     resolved == excluded_root or resolved.startswith(excluded_root + "/")
                     for excluded_root in excluded_root_paths_for_reactor_rule
                 ):
+                    # FIX ROUND 42 (F1 MAJOR): see the sibling site just
+                    # above for the full reasoning - the same synthetic
+                    # qualified_name fix.
                     reactor_rule_problems.append(_problem_record(
                         "module_directory_excluded",
                         pom_path,
@@ -1121,6 +1141,7 @@ def run_scan(
                         f"({resolved!r}) resolves into a region this run excluded outright - "
                         "positive evidence the excluded region holds real, first-party source, "
                         "not third-party build output",
+                        qualified_name=f"{pom_path}#module#{module_path}",
                     ))
                     reactor_rule_suppression_causes.append((
                         pom_path, module_path, resolved,
@@ -1133,12 +1154,16 @@ def run_scan(
                     # excluded one (this run did walk that location - it
                     # genuinely is not there), but equally invisible
                     # otherwise - same visible-and-degrading treatment.
+                    # FIX ROUND 42 (F1 MAJOR): see the first reactor-rule
+                    # site above for the full reasoning - the same
+                    # synthetic qualified_name fix.
                     reactor_rule_problems.append(_problem_record(
                         "module_directory_missing",
                         pom_path,
                         f"this pom declares <module>{module_path}</module>, whose own path "
                         f"({resolved!r}) does not exist as a directory in this scan at all - "
                         "a stale or broken reactor declaration",
+                        qualified_name=f"{pom_path}#module#{module_path}",
                     ))
                     reactor_rule_suppression_causes.append((
                         pom_path, module_path, resolved,
@@ -1229,11 +1254,14 @@ def run_scan(
             # (`module_path`) as the distinguishing datum - the same
             # datum that keeps this record's own problem_id unique when
             # one pom declares more than one bad <module> entry (F2).
+            # FIX ROUND 42 (F1 MAJOR): the fourth reactor-rule site
+            # sharing the same gap - see the three above.
             _problem_record(
                 "externality_suppressed", pom_path,
                 f"this pom declares <module>{module_path}</module>, whose own path "
                 f"({resolved!r}) {cause} - every external-registry-miss import in this run "
                 "resolves unresolved rather than a confident external claim because of it",
+                qualified_name=f"{pom_path}#module#{module_path}",
             )
             for pom_path, module_path, resolved, cause in reactor_rule_suppression_causes
         ] + [
@@ -1517,8 +1545,18 @@ def run_scan(
             # false for it, per this round's own invariant), so each
             # pair's own truthful cause is checked before choosing the
             # detail/reason_code.
+            # FIX ROUND 42 (F1 MAJOR, preemptive - not reproduced, same
+            # class): `path=second` distinguishes an ordinary pairwise
+            # collision, but a genuine 3+-way case-fold group ties the
+            # SAME `second` to more than one `first` - if two such
+            # `first` values shared a long common prefix, the bounded
+            # detail (this template's own fixed text is short) would
+            # truncate identically with nothing else to distinguish
+            # them. `qualified_name` carries the raw, unbounded `first`
+            # - the same synthetic-field fix as the reactor sites above.
             _problem_record(
-                "case_collision", second, bounded_detail(f"case-folds identically to {first!r}"))
+                "case_collision", second, bounded_detail(f"case-folds identically to {first!r}"),
+                qualified_name=first)
             if is_pure_case_fold_collision(first, second) else
             # FIX ROUND 37 (thirty-first cold read, F6 LOW, wrong-data):
             # this template was measured well over MAX_PROBLEM_DETAIL_
@@ -1544,10 +1582,13 @@ def run_scan(
             # one short clause) - fixed text is 97 chars, leaving ~103
             # for the path, comfortable for a realistic deep Maven/
             # Java package path.
+            # FIX ROUND 42 (F1 MAJOR, preemptive): same fix as the
+            # case_collision sibling just above.
             _problem_record(
                 "unicode_normalization_collision", second, bounded_detail(
                     f"collides with {first!r} once NFC-normalized, not by a bare case-fold "
-                    "(canonical equivalence, e.g. accents)"))
+                    "(canonical equivalence, e.g. accents)"),
+                qualified_name=first)
             for first, second in case_collisions
         ] + duplicate_qualified_name_problems + binary_excluded_code_bearing_problems + (
             binary_excluded_root_sniffed_xml_problems) + reactor_rule_problems + (

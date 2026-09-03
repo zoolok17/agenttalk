@@ -3127,7 +3127,19 @@ def test_run_scan_a_real_invisible_character_and_its_own_escaped_spelling_get_di
     (never containing the real character at all) passes through
     unescaped - both bounded display strings come out byte-identical,
     even though the real, undisplayed url-patterns were never the
-    same. Same fix, same mechanism as the truncation test above."""
+    same. Same fix, same mechanism as the truncation test above.
+
+    CORRECTED (round 42, thirty-sixth cold read, F2 MINOR): this test
+    used to assert the two ALSO display identically - true only because
+    the escape choke point was itself non-injective at the time (a
+    literal backslash was never escaped, so pattern_b's own leading
+    backslash passed through unchanged). Round 42's own F2 fix escapes
+    a literal backslash first, closing that gap too - pattern_b's own
+    leading backslash now escapes to two literal backslashes, so the
+    two patterns no longer display identically EITHER. Kept as a
+    control here for exactly that: the id-level fix (F1+F2) and the
+    injective-escape fix (F2, round 42) are independent guarantees, and
+    this pair now demonstrates both holding simultaneously."""
     import json
 
     real_zwsp = chr(0x200B)
@@ -3159,8 +3171,12 @@ def test_run_scan_a_real_invisible_character_and_its_own_escaped_spelling_get_di
     features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
     entry_points = [ep for ep in features_doc["entry_points"] if ep["kind"] == "http_route"]
     assert len(entry_points) == 2
-    assert len({ep["name"] for ep in entry_points}) == 1, (
-        "the real ZWSP and its own escaped spelling must still display identically"
+    # CORRECTED (round 42, F2): now that the escape itself is
+    # injective, this pair no longer displays identically either - see
+    # this test's own docstring correction.
+    assert len({ep["name"] for ep in entry_points}) == 2, (
+        "a real ZWSP and its own literal escaped spelling must not display identically "
+        "now that the escape choke point is injective (round 42's own F2 fix)"
     )
     assert len({ep["entry_point_id"] for ep in entry_points}) == 2, (
         "a real invisible character and its own escaped literal spelling "
@@ -3172,7 +3188,12 @@ def test_run_scan_a_real_invisible_character_and_its_own_escaped_spelling_get_di
         (outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
     route_edges = [e for e in dependencies_doc["edges"] if e["relation"] == "route"]
     assert len(route_edges) == 2
-    assert len({e["target_external"] for e in route_edges}) == 1
+    # CORRECTED (round 42, F2): same correction as entry_points' own
+    # name assertion above.
+    assert len({e["target_external"] for e in route_edges}) == 2, (
+        "a real ZWSP and its own literal escaped spelling must not display identically "
+        "now that the escape choke point is injective (round 42's own F2 fix)"
+    )
     assert len({e["edge_id"] for e in route_edges}) == 2, (
         "a real invisible character and its own escaped literal spelling "
         "must not collide on edge_id merely because they display identically"
@@ -7667,6 +7688,74 @@ def test_run_scan_each_reactor_trigger_gets_its_own_truthful_suppression_detail_
         r for r in scan_doc["externality_suppressed_roots"]
         if r["path"] == "pom.xml" and r["trigger"] == "reactor"]
     assert len(reactor_roots) == 1
+
+
+def test_run_scan_two_missing_reactor_modules_sharing_a_long_prefix_get_distinct_ids(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 42 (thirty-sixth cold read, F1 MAJOR, .cr36-reactor,
+    wrong-data): round 41's own F4 fix bounded `_problem_record`'s own
+    `detail` unconditionally at the chokepoint, but never audited the
+    templates it newly bounds against round 40's own invariant ("every
+    template places its distinguishing datum within the first 200
+    chars"). The reactor-rule templates put `module_path` right after a
+    ~27-character fixed prefix ("this pom declares <module>") AND passed
+    NO `qualified_name` at all - so two DIFFERENT declared `<module>`
+    paths sharing a common prefix of ~180+ characters (an ordinary shape
+    for a deep-enterprise reactor's own directory layout) diverge only
+    PAST the 200-char bound: both truncate to the IDENTICAL bounded
+    detail, and with no other distinguishing datum (same reason_code,
+    same pom path, qualified_name=None), the two collide on problem_id
+    and the deliberate byte-identical coalescer silently merges them -
+    one declared-but-missing reactor member vanishes with zero signal,
+    problem_count understates the true count, validate blesses it.
+    Fixed by threading a synthetic qualified_name carrying the FULL,
+    raw (never-bounded) module path - the same pattern `duplicate_
+    route_target`'s own synthetic qualified_name already used safely."""
+    import json
+
+    prefix = "sub/" * 45  # 180 characters, comfortably past the 200-char bound once wrapped
+    assert len(prefix) == 180
+    module_a = f"{prefix}dirA"
+    module_b = f"{prefix}dirB"
+    assert module_a != module_b
+
+    (java_repo / "pom.xml").write_text(
+        "<project><groupId>com.acme</groupId><artifactId>root</artifactId>"
+        "<packaging>pom</packaging>"
+        "<modules>"
+        f"<module>{module_a}</module>"
+        f"<module>{module_b}</module>"
+        "</modules>"
+        "</project>",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    missing_problems = [
+        p for p in problems_doc["problems"] if p["reason_code"] == "module_directory_missing"]
+    assert len(missing_problems) == 2, (
+        "two genuinely different reactor modules must not coalesce into one record "
+        "merely because they truncate identically"
+    )
+    assert len({p["problem_id"] for p in missing_problems}) == 2
+    assert {p["qualified_name"] for p in missing_problems} == {
+        f"pom.xml#module#{module_a}", f"pom.xml#module#{module_b}",
+    }
+
+    suppression_problems = [
+        p for p in problems_doc["problems"]
+        if p["reason_code"] == "externality_suppressed" and "<module>" in p["detail"]]
+    assert len(suppression_problems) == 2
+    assert len({p["problem_id"] for p in suppression_problems}) == 2
+
+    # Honest count: scan.json's own problem_count must equal the actual
+    # number of records in problems.json.
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["problem_count"] == len(problems_doc["problems"])
 
 
 def test_run_scan_a_pom_with_an_unrecoverable_own_coordinate_poisons_externality_run_wide(

@@ -2069,6 +2069,25 @@ _UNICODE_INVISIBLE_FORMAT_CHARS = frozenset(
 def _sanitize_route_name_control_chars(value: str) -> str:
     out = []
     for ch in value:
+        # FIX ROUND 42 (thirty-sixth cold read, F2 MINOR, wrong-data):
+        # this escaping choke point was itself NON-INJECTIVE - a real
+        # control/invisible/bidi character escapes to a literal
+        # backslash-prefixed spelling (e.g. a real newline -> the two
+        # characters ``\n``), but a route that already contains that
+        # EXACT literal spelling as ordinary text (a route named with a
+        # literal backslash followed by the letter "n") passed through
+        # UNCHANGED, since a bare backslash was never itself escaped -
+        # the two inputs published byte-identical names. Checked FIRST,
+        # unconditionally: a literal backslash always escapes to two
+        # literal backslashes, a spelling no OTHER branch below ever
+        # produces (every other escape starts with exactly one
+        # backslash followed by a letter/hex digit, never a second
+        # backslash) - reserving "two backslashes in a row" as a marker
+        # only a real backslash character can produce closes the
+        # ambiguity structurally, not just for the one reported pair.
+        if ch == "\\":
+            out.append("\\\\")
+            continue
         escape = _ROUTE_NAME_CONTROL_CHAR_ESCAPES.get(ch)
         if escape is not None:
             out.append(escape)

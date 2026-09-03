@@ -481,3 +481,39 @@ def test_a_single_oversized_url_pattern_is_bounded_and_id_sensitive_past_the_bou
         "non-colliding oversized route"
     )
 
+
+def test_a_real_newline_and_its_own_literal_backslash_n_spelling_publish_distinct_names():
+    """FIX ROUND 42 (thirty-sixth cold read, F2 MINOR, .cr36-amb/.cr36-
+    amb2, wrong-data): `_sanitize_route_name_control_chars` (the display-
+    write escape choke point) was itself NON-INJECTIVE - it escapes a
+    real newline to the literal two-character text ``\\n``, but never
+    escaped a literal backslash character itself, so a route ALREADY
+    containing that exact literal spelling (a route named with a real
+    backslash followed by the letter "n", not a real newline) passed
+    through unchanged and published the IDENTICAL name - complete/0,
+    no duplicate_route_target (round 41's own F3 correctly groups on
+    the raw, pre-escape value, so the collision is invisible to that
+    check too). Fixed by escaping a literal backslash FIRST, to two
+    literal backslashes - a spelling no other escape in this function
+    ever produces, so it can never collide with a real control
+    character's own escape."""
+    real_newline_source = (
+        "package p;\nclass Amb {\n"
+        '  @GetMapping("/orders\\n/more")\n  void list() {}\n}\n'
+    )
+    literal_backslash_n_source = (
+        "package p;\nclass Amb2 {\n"
+        r'  @GetMapping("/orders\\n/more")' "\n  void list() {}\n}\n"
+    )
+    real_newline_result = _parse("Amb.java", real_newline_source)
+    literal_result = _parse("Amb2.java", literal_backslash_n_source)
+    assert "\n" in real_newline_result.edges[0].target
+    assert "\\" in literal_result.edges[0].target and "\n" not in literal_result.edges[0].target
+
+    entry_points_a, _f = fa.build_features({"Amb.java": real_newline_result})
+    entry_points_b, _f = fa.build_features({"Amb2.java": literal_result})
+    assert entry_points_a[0].name != entry_points_b[0].name, (
+        "a real newline and its own literal backslash-n spelling must not publish "
+        "the identical escaped display name"
+    )
+
