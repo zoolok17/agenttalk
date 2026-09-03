@@ -656,6 +656,11 @@ _SPRING_STEREOTYPE_ANNOTATION_RE = re.compile(
 #: reserved word, never itself an identifier, so this can never
 #: misfire on an unrelated annotation/name.
 _ABSTRACT_MODIFIER_RE = re.compile(r"\babstract\b")
+#: FIX ROUND 46 (fortieth cold read, F1 MAJOR): the identical anchoring
+#: discipline ``_ABSTRACT_MODIFIER_RE`` already establishes, searched
+#: over the same backward-anchored trivia span - ``static`` is a
+#: reserved word here too, never itself an identifier.
+_STATIC_MODIFIER_RE = re.compile(r"\bstatic\b")
 #: Fix round 11 (seventh cold read BLOCKER, part 1 - de-enumerate
 #: RECOGNITION): a FULLY-QUALIFIED route annotation
 #: (``@org.springframework.web.bind.annotation.RequestMapping(...)``) was
@@ -1037,7 +1042,16 @@ class JavaUnitClaim:
     ``has_stereotype`` (Spring-specific) is deliberately NOT carried
     here - a descriptor's own instantiation contract does not depend on
     it, only on whether the class can be instantiated/dispatched to at
-    all."""
+    all.
+
+    FIX ROUND 46 (fortieth cold read, F1 MAJOR - THE MATRIX'S OWN
+    MISSING DIMENSION): ``is_non_static_member``/``is_local`` join the
+    same registrability facts for the identical cross-file reason - a
+    web.xml descriptor naming a non-static member or local class (F2's
+    own binary-name resolution now makes this reachable) is exactly as
+    uninstantiable-by-a-container as naming an interface/abstract/enum,
+    and this fact is ALSO only fully knowable from the declaring file's
+    own nesting structure, never from the descriptor's own file."""
 
     relative_path: str
     qualified_name: str
@@ -1047,6 +1061,8 @@ class JavaUnitClaim:
     is_interface: bool = False
     is_abstract: bool = False
     is_enum: bool = False
+    is_non_static_member: bool = False
+    is_local: bool = False
 
 
 @dataclass(frozen=True)
@@ -1384,7 +1400,7 @@ def _find_type_header_brace(sanitized: str, clause_start: int) -> int | None:
 
 def _extract_types(
     sanitized: str, package: str | None,
-) -> list[tuple[str, str, str, int, str | None, str | None, int]]:
+) -> list[tuple[str, str, str, int, str | None, str | None, int, bool]]:
     """Returns ``(qualified_name, simple_name, container_prefix, brace_pos,
     extends, implements_raw, end_brace_pos)`` for every declared type,
     correctly nested by tracking brace depth against each type header's own
@@ -1508,10 +1524,27 @@ def _extract_types(
                     qualified = f"{package}.{simple_name}"
                 else:
                     qualified = simple_name
+                # FIX ROUND 46 (fortieth cold read, F1 MAJOR - THE MATRIX'S
+                # OWN MISSING DIMENSION): ``is_local`` - a declared type
+                # nested more than ONE brace deeper than its immediate
+                # enclosing type's own body brace (``stack[-1][0]``) sits
+                # inside some intervening block (a method body, a
+                # constructor body, an initializer block) rather than
+                # directly in the enclosing type's own body - the only way
+                # a NAMED type declaration can appear at that depth in real
+                # Java is a local class. A direct member (static or
+                # instance) always lands at EXACTLY ``stack[-1][0] + 1``
+                # (immediately inside the enclosing type's own body, zero
+                # intervening braces) - the SAME depth-tracking this
+                # function already performs for containment, reused here
+                # rather than a second, separately-maintained scan. A
+                # top-level type (``stack`` empty) is never local by
+                # construction.
+                is_local = bool(stack) and depth != stack[-1][0] + 1
                 result_index = len(results)
                 results.append([
                     qualified, simple_name, container_prefix,
-                    header_start, extends_raw, implements_raw, i,
+                    header_start, extends_raw, implements_raw, i, is_local,
                 ])
                 stack.append((depth, qualified, result_index))
             depth += 1
@@ -1525,7 +1558,7 @@ def _extract_types(
 
 def _enclosing_qualified_name(
     position: int,
-    types: list[tuple[str, str, str, int, str | None, str | None, int]],
+    types: list[tuple[str, str, str, int, str | None, str | None, int, bool]],
     fallback: str,
 ) -> str:
     """The innermost declared type whose ``[brace_pos, end_brace_pos]``
@@ -1540,7 +1573,7 @@ def _enclosing_qualified_name(
     which precedes every type header and is legitimately file-scoped."""
     best: str | None = None
     best_span = None
-    for qualified, _simple, _container, start, _extends, _implements, end in types:
+    for qualified, _simple, _container, start, _extends, _implements, end, _is_local in types:
         if start <= position <= end and (best_span is None or (end - start) < best_span):
             best = qualified
             best_span = end - start
@@ -1549,7 +1582,7 @@ def _enclosing_qualified_name(
 
 def _position_inside_any_type_body(
     position: int,
-    types: list[tuple[str, str, str, int, str | None, str | None, int]],
+    types: list[tuple[str, str, str, int, str | None, str | None, int, bool]],
 ) -> bool:
     """Whether ``position`` falls inside SOME declared type's own
     ``[header_start, end_brace_pos]`` span - fix round 10's fail-safe
@@ -1559,7 +1592,7 @@ def _position_inside_any_type_body(
     are the SAME string by coincidence, so comparing names could not
     tell "genuinely outside every type" apart from "inside the file's
     only type" - the exact case this fail-safe must never fire on."""
-    return any(start <= position <= end for _q, _s, _c, start, _e, _i, end in types)
+    return any(start <= position <= end for _q, _s, _c, start, _e, _i, end, _il in types)
 
 
 def _split_type_list(raw: str) -> list[str]:
@@ -2383,22 +2416,23 @@ def _preceding_declaration_start(sanitized: str, header_start: int) -> int:
 
 def _class_header_associations(
     sanitized: str,
-    types: list[tuple[str, str, str, int, str | None, str | None, int]],
+    types: list[tuple[str, str, str, int, str | None, str | None, int, bool]],
 ) -> list[tuple[int, int, str]]:
     """``[(declaration_start, header_start, qualified_name), ...]`` for
     every declared type - the backward-anchored trivia span computed
     ONCE per header, up front, rather than re-derived per annotation."""
     return [
         (_preceding_declaration_start(sanitized, header_start), header_start, qualified)
-        for qualified, _s, _c, header_start, _e, _i, _end in types
+        for qualified, _s, _c, header_start, _e, _i, _end, _il in types
     ]
 
 
 def _class_registrability(
     sanitized: str, declaration_start: int, header_start: int,
-) -> tuple[bool, bool, bool, bool]:
-    """``(is_interface, is_abstract, has_stereotype, is_enum)`` for ONE
-    declared type, anchored the same way :func:`_class_level_route_target`
+) -> tuple[bool, bool, bool, bool, bool]:
+    """``(is_interface, is_abstract, has_stereotype, is_enum, is_static)``
+    for ONE declared type, anchored the same way
+    :func:`_class_level_route_target`
     already is.
 
     FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER - THE
@@ -2444,6 +2478,23 @@ def _class_registrability(
       registered" claim than the interface/abstract case, closer to
       `@WebServlet`'s own epistemics than to Spring's own weaker one,
       even though the ANNOTATION is Spring's own family.
+    - ``is_static``: FIX ROUND 46 (fortieth cold read, F1 MAJOR - THE
+      MATRIX'S OWN MISSING DIMENSION): the ``static`` modifier, found
+      the identical way ``is_abstract`` already is. This function has
+      no visibility into ``container_prefix`` (whether this type is
+      nested at all) - the caller combines this with
+      ``_extract_types``'s own ``container_prefix``/``is_local`` to
+      derive ``is_non_static_member`` (a NON-static MEMBER class - its
+      only constructor takes an implicit enclosing-instance reference,
+      so no container's reflective ``getConstructor().newInstance()``
+      can ever invoke it) and to route a local class (``is_local``,
+      declared inside a method/constructor/initializer body - never
+      nameable or referenceable from outside that one method, so no
+      manual registration path can reach it either) to the STRONGEST
+      claim in this matrix. A STATIC nested concrete class remains
+      exactly as instantiable as a top-level one - ``container_prefix``
+      non-empty alone was never sufficient, only non-empty AND not
+      ``static``.
     """
     is_interface = False
     is_enum = False
@@ -2455,11 +2506,18 @@ def _class_registrability(
     trivia = sanitized[declaration_start:header_start]
     is_abstract = _ABSTRACT_MODIFIER_RE.search(trivia) is not None
     has_stereotype = _SPRING_STEREOTYPE_ANNOTATION_RE.search(trivia) is not None
-    return is_interface, is_abstract, has_stereotype, is_enum
+    # FIX ROUND 46 (fortieth cold read, F1 MAJOR): the SAME trivia span
+    # ``is_abstract`` already searches carries the ``static`` modifier
+    # too, when present - the one input this function's own caller needs
+    # (alongside ``container_prefix``, which this function has no
+    # visibility into at all) to derive ``is_non_static_member``.
+    is_static = _STATIC_MODIFIER_RE.search(trivia) is not None
+    return is_interface, is_abstract, has_stereotype, is_enum, is_static
 
 
 def _uninstantiable_class_problem(
     target_type: str, is_interface: bool, is_abstract: bool, is_enum: bool,
+    is_non_static_member: bool, is_local: bool,
     line: int, annotation_label: str,
 ) -> JavaAdapterProblem | None:
     """FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER): @WebServlet
@@ -2486,17 +2544,34 @@ def _uninstantiable_class_problem(
     interface/abstract cells get - both are provable claims, but this
     keeps the enum-specific reasoning (no OTHER class can ever extend
     an enum) visible in the detail text rather than silently folded
-    into the type-kind-agnostic phrasing."""
-    if not (is_interface or is_abstract or is_enum):
+    into the type-kind-agnostic phrasing.
+
+    FIX ROUND 46 (fortieth cold read, F1 MAJOR - THE MATRIX'S OWN
+    MISSING DIMENSION): `is_non_static_member`/`is_local` join the same
+    STRONG claim, never the Spring/JAX-RS weaker hedge - a servlet
+    container instantiates via reflective `getConstructor().
+    newInstance()`, which requires a public no-arg constructor; a
+    non-static member class's only constructor takes an implicit
+    enclosing-instance argument (no no-arg constructor exists, period -
+    unlike interface/abstract/Spring's own "not through this class
+    alone," there is no manual-registration escape a servlet container
+    recognizes at all), and a local class is additionally unnameable
+    from outside its own declaring method, closing off even a
+    hypothetical one."""
+    if not (is_interface or is_abstract or is_enum or is_non_static_member or is_local):
         return None
     if is_interface:
         shape = "an INTERFACE"
     elif is_abstract:
         shape = "ABSTRACT"
-    else:
+    elif is_enum:
         shape = "an ENUM"
+    elif is_local:
+        shape = "a LOCAL class (method/constructor-body-declared)"
+    else:
+        shape = "a NON-STATIC MEMBER class"
     detail_suffix = (
-        "never instantiated as an ordinary servlet/filter" if is_enum
+        "never instantiated as an ordinary servlet/filter" if (is_enum or is_local or is_non_static_member)
         else "never served, only concrete classes are instantiated"
     )
     return JavaAdapterProblem(
@@ -2605,10 +2680,27 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     # ACTUAL class, in a DIFFERENT file, where this file's own
     # `class_registrability` dict below is out of scope entirely.
     class_header_associations = _class_header_associations(sanitized, types)
-    class_registrability = {
-        qualified: _class_registrability(sanitized, declaration_start, header_start)
-        for declaration_start, header_start, qualified in class_header_associations
+    # FIX ROUND 46 (fortieth cold read, F1 MAJOR - THE MATRIX'S OWN
+    # MISSING DIMENSION): `container_prefix`/`is_local` are facts
+    # `_extract_types` already computed for every declared type -
+    # `_class_registrability` itself has no visibility into either (it
+    # only ever sees one type's own backward-anchored trivia span), so
+    # they are combined with its own `is_static` HERE, once, into the
+    # single `is_non_static_member` fact every registrability call site
+    # below now consults alongside is_interface/is_abstract/is_enum.
+    container_and_local_by_qualified = {
+        qualified: (container_prefix, is_local)
+        for qualified, _simple, container_prefix, _brace_pos, _extends, _implements, _end, is_local
+        in types
     }
+    class_registrability: dict[str, tuple[bool, bool, bool, bool, bool, bool]] = {}
+    for declaration_start, header_start, qualified in class_header_associations:
+        is_interface, is_abstract, has_stereotype, is_enum, is_static = _class_registrability(
+            sanitized, declaration_start, header_start)
+        container_prefix, is_local = container_and_local_by_qualified.get(qualified, ("", False))
+        is_non_static_member = bool(container_prefix) and not is_static
+        class_registrability[qualified] = (
+            is_interface, is_abstract, has_stereotype, is_enum, is_non_static_member, is_local)
     # FIX ROUND 14 (tenth cold read, CR10-1 MAJOR): an ``import`` is a
     # FILE-scoped Java fact (every type declared in the file sees every
     # import, regardless of which one actually uses it) - publishing it
@@ -2635,11 +2727,18 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             line=_line_at(newline_offsets, brace_pos),
             classification=_classify(
                 relative_path, simple, has_test_framework_evidence=has_test_framework_evidence),
-            is_interface=class_registrability.get(qualified, (False, False, False, False))[0],
-            is_abstract=class_registrability.get(qualified, (False, False, False, False))[1],
-            is_enum=class_registrability.get(qualified, (False, False, False, False))[3],
+            is_interface=class_registrability.get(
+                qualified, (False, False, False, False, False, False))[0],
+            is_abstract=class_registrability.get(
+                qualified, (False, False, False, False, False, False))[1],
+            is_enum=class_registrability.get(
+                qualified, (False, False, False, False, False, False))[3],
+            is_non_static_member=class_registrability.get(
+                qualified, (False, False, False, False, False, False))[4],
+            is_local=class_registrability.get(
+                qualified, (False, False, False, False, False, False))[5],
         )
-        for qualified, simple, _container, brace_pos, _extends, _implements, _end in types
+        for qualified, simple, _container, brace_pos, _extends, _implements, _end, _il in types
     ]
 
     edges: list[JavaEdgeClaim] = []
@@ -2687,7 +2786,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             evidence_class="extracted", line=line, phase="runtime",
         ))
 
-    for qualified, simple, _container, brace_pos, extends, implements_raw, _end in types:
+    for qualified, simple, _container, brace_pos, extends, implements_raw, _end, _il in types:
         line = _line_at(newline_offsets, brace_pos)
         if extends:
             for name in _split_type_list(extends):
@@ -3142,9 +3241,10 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         # (folded into N5 at round 27) - see "Named decisions and
         # residuals".
         if match.group(1) == "Path" and prefixes is not None:
-            is_interface, is_abstract, _has_stereotype, is_enum = class_registrability.get(
-                enclosing, (False, False, False, False))
-            if is_interface or is_abstract or is_enum:
+            (is_interface, is_abstract, _has_stereotype, is_enum,
+             is_non_static_member, is_local) = class_registrability.get(
+                enclosing, (False, False, False, False, False, False))
+            if is_interface or is_abstract or is_enum or is_non_static_member or is_local:
                 # MICRO-ROUND 44b (F2, judged - taken): an enum
                 # decorated with a class-level @Path is a DIFFERENT,
                 # STRONGER claim than the interface/abstract cells -
@@ -3156,8 +3256,30 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                 # exist. Same enrolled shape name regardless (the
                 # actionable fact - "not served through this class" -
                 # is the same either way, only the reason differs).
-                if is_enum:
-                    shape_clause = "an ENUM - never instantiated as an ordinary resource class"
+                # FIX ROUND 46 (fortieth cold read, F1 MAJOR - THE
+                # MATRIX'S OWN MISSING DIMENSION): a LOCAL class (method/
+                # constructor/initializer-body-declared) gets the SAME
+                # stronger enum-style wording - it is not merely
+                # unnameable from a bean-registration XML file, it is
+                # unnameable/unreferenceable from ANYWHERE outside its
+                # own declaring method, so no manual-registration escape
+                # exists either. A NON-STATIC MEMBER class gets the
+                # WEAKER "not through this class alone" wording, same as
+                # interface/abstract - JAX-RS supports manual/
+                # programmatic resource registration (``Application.
+                # getSingletons()``/a ``ResourceConfig.register(new
+                # Outer().new Inner())`` call this single-file producer
+                # cannot see), the identical single-file-blind-spot
+                # epistemics the missing-stereotype Spring cell already
+                # leans on - never provably "never served", only "not
+                # provably served through this class alone."
+                if is_enum or is_local:
+                    reason = "an ENUM" if is_enum else "a LOCAL class (method/constructor-body-declared)"
+                    shape_clause = f"{reason} - never instantiated as an ordinary resource class"
+                elif is_non_static_member:
+                    shape_clause = (
+                        "a NON-STATIC MEMBER class - served only through a manually-registered instance"
+                    )
                 else:
                     shape_clause = (
                         ("an INTERFACE" if is_interface else "ABSTRACT")
@@ -3181,10 +3303,11 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         # and micro-round 44b's own interface/abstract check just
         # above) with their own, different epistemics.
         if match.group(1) != "Path":
-            is_interface, is_abstract, has_stereotype, is_enum = class_registrability.get(
-                enclosing, (False, False, False, False))
+            (is_interface, is_abstract, has_stereotype, is_enum,
+             is_non_static_member, is_local) = class_registrability.get(
+                enclosing, (False, False, False, False, False, False))
             unregistered_detail = None
-            if is_enum:
+            if is_enum or is_local:
                 # MICRO-ROUND 44b (reviewer-3's own item-2 construction,
                 # F2 - a cell the matrix keyed past, since it keys on
                 # type-kind + stereotype, not instantiability): an enum
@@ -3197,7 +3320,15 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                 # separately rather than the weaker interface/abstract
                 # clause, which would falsely imply a subclass/
                 # implementer might exist.
-                unregistered_detail = (f"a Spring route at line {line} is declared on an ENUM - "
+                # FIX ROUND 46 (fortieth cold read, F1 MAJOR - THE
+                # MATRIX'S OWN MISSING DIMENSION): a LOCAL class earns
+                # the identical stronger wording - unnameable/
+                # unreferenceable from anywhere outside its own
+                # declaring method, so no separate XML `<bean>`
+                # declaration (the escape every other "not through this
+                # class alone" cell leans on) could ever name it either.
+                reason = "an ENUM" if is_enum else "a LOCAL class (method/constructor-body-declared)"
+                unregistered_detail = (f"a Spring route at line {line} is declared on {reason} - "
                     "never instantiated as an ordinary Spring bean (spring_route_on_"
                     "unregistered_class)")
             elif is_interface:
@@ -3216,6 +3347,20 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                 unregistered_detail = (f"a Spring route at line {line} is not served through "
                     "this class alone - this class is ABSTRACT (spring_route_on_"
                     "unregistered_class)")
+            elif is_non_static_member:
+                # FIX ROUND 46 (F1 MAJOR): Spring's own component-scan
+                # candidate filter (`isIndependent()`) excludes a
+                # non-static member class from ordinary scanning - but a
+                # manually-registered bean instance (a `@Bean` factory
+                # method supplying the enclosing instance explicitly)
+                # is a real escape this single-file producer cannot
+                # rule out, the identical "not provably served through
+                # this class alone" epistemics the missing-stereotype
+                # cell below already leans on - never the stronger
+                # "never served" claim.
+                unregistered_detail = (f"a Spring route at line {line} is not served through "
+                    "this class alone - this class is a NON-STATIC MEMBER class "
+                    "(spring_route_on_unregistered_class)")
             elif not has_stereotype:
                 # Unknowable from this file alone (see
                 # _class_registrability's own docstring) - a separate
@@ -3379,10 +3524,12 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         # FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER - THE
         # REGISTRABILITY MATRIX): see _uninstantiable_class_problem's
         # own docstring - shared with @WebFilter below.
-        is_interface, is_abstract, _has_stereotype, is_enum = class_registrability.get(
-            target_type, (False, False, False, False))
+        (is_interface, is_abstract, _has_stereotype, is_enum,
+         is_non_static_member, is_local) = class_registrability.get(
+            target_type, (False, False, False, False, False, False))
         uninstantiable_problem = _uninstantiable_class_problem(
-            target_type, is_interface, is_abstract, is_enum, line, "@WebServlet")
+            target_type, is_interface, is_abstract, is_enum,
+            is_non_static_member, is_local, line, "@WebServlet")
         if uninstantiable_problem is not None:
             problems.append(uninstantiable_problem)
             continue
@@ -3473,10 +3620,12 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         # FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER): see
         # _uninstantiable_class_problem's own docstring - shared with
         # @WebServlet above.
-        is_interface, is_abstract, _has_stereotype, is_enum = class_registrability.get(
-            target_type, (False, False, False, False))
+        (is_interface, is_abstract, _has_stereotype, is_enum,
+         is_non_static_member, is_local) = class_registrability.get(
+            target_type, (False, False, False, False, False, False))
         uninstantiable_problem = _uninstantiable_class_problem(
-            target_type, is_interface, is_abstract, is_enum, line, "@WebFilter")
+            target_type, is_interface, is_abstract, is_enum,
+            is_non_static_member, is_local, line, "@WebFilter")
         if uninstantiable_problem is not None:
             problems.append(uninstantiable_problem)
             continue

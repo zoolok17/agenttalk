@@ -1805,6 +1805,258 @@ public enum ApiFilter {
     assert "an ENUM" in problem.detail
 
 
+def test_spring_route_on_a_non_static_member_class_is_unregistered():
+    """FIX ROUND 46 (fortieth cold read, F1 MAJOR - THE MATRIX'S OWN
+    MISSING DIMENSION, .cr40-matrix /n-nonstatic): a concrete
+    non-static (instance) MEMBER class - its own constructor takes an
+    implicit reference to its enclosing instance, so Spring's own
+    `isIndependent()` component-scan filter excludes it - still
+    published complete/0, since the matrix keyed on type-kind +
+    stereotype only, never declaration context. Suppressed now with the
+    SAME weaker "not through this class alone" claim the missing-
+    stereotype cell already earns (a manually-registered bean instance
+    is a real escape this single-file producer cannot rule out)."""
+    src = """
+package p;
+
+class Outer {
+    @RestController
+    class Inner {
+        @GetMapping("/n-nonstatic")
+        void handle() {}
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.Outer.Inner"
+    assert "spring_route_on_unregistered_class" in problem.detail
+    assert "NON-STATIC MEMBER" in problem.detail
+
+
+def test_spring_route_on_a_static_nested_class_is_unaffected():
+    """FIX ROUND 46 (F1 MAJOR, .cr40-matrix /n-static-ok control): a
+    STATIC nested class remains exactly as instantiable as a top-level
+    one - `container_prefix` non-empty alone was never sufficient for
+    is_non_static_member, only non-empty AND not `static`. Must keep
+    publishing exactly as before."""
+    src = """
+package p;
+
+class Outer {
+    @RestController
+    static class Inner {
+        @GetMapping("/n-static-ok")
+        void handle() {}
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].from_qualified_name == "p.Outer.Inner"
+
+
+def test_jax_rs_route_on_a_non_static_member_class_is_unregistered():
+    """FIX ROUND 46 (F1 MAJOR, .cr40-inner GET /bad-res/y): the JAX-RS
+    sibling - a non-static member resource class's only constructor
+    still takes an implicit enclosing-instance argument, so a
+    container's reflective no-arg construction can never invoke it
+    either. Same weaker "not through this class alone" claim JAX-RS's
+    own interface/abstract cell already earns (a manually-registered
+    resource instance is a real escape this producer cannot see)."""
+    src = """
+package p;
+
+class Outer {
+    @Path("/bad-res")
+    class Inner {
+        @GET
+        @Path("y")
+        void get() {}
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.Outer.Inner"
+    assert "jax_rs_route_on_unregistered_class" in problem.detail
+    assert "NON-STATIC MEMBER" in problem.detail
+
+
+def test_jax_rs_route_on_a_static_nested_class_is_unaffected():
+    """FIX ROUND 46 (F1 MAJOR, .cr40-inner control): a static nested
+    JAX-RS resource class must keep publishing exactly as before."""
+    src = """
+package p;
+
+class Outer {
+    @Path("/good-res")
+    static class Inner {
+        @GET
+        @Path("y")
+        void get() {}
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].from_qualified_name == "p.Outer.Inner"
+
+
+def test_web_servlet_on_a_non_static_member_class_is_never_instantiated():
+    """FIX ROUND 46 (F1 MAJOR, .cr40-inner /bad-servlet): a servlet
+    container instantiates via reflective `getConstructor().
+    newInstance()`, which requires a public no-arg constructor - a
+    non-static member class's only constructor takes an implicit
+    enclosing-instance argument (no no-arg constructor exists, period,
+    unlike Spring/JAX-RS's own manual-registration escape) - the
+    STRONG claim, same shape @WebServlet's own interface/abstract/enum
+    cells already get."""
+    src = """
+package p;
+
+class Outer {
+    @WebServlet("/bad-servlet")
+    class Inner {
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.Outer.Inner"
+    assert "webservlet_on_uninstantiable_class" in problem.detail
+    assert "NON-STATIC MEMBER" in problem.detail
+
+
+def test_web_filter_on_a_non_static_member_class_is_never_instantiated():
+    """FIX ROUND 46 (F1 MAJOR, .cr40-inner /bad-filter): the @WebFilter
+    sibling of the @WebServlet non-static-member case above."""
+    src = """
+package p;
+
+class Outer {
+    @WebFilter("/bad-filter")
+    class Inner {
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.Outer.Inner"
+    assert "webservlet_on_uninstantiable_class" in problem.detail
+    assert "NON-STATIC MEMBER" in problem.detail
+
+
+def test_web_servlet_on_a_static_nested_class_is_unaffected():
+    """FIX ROUND 46 (F1 MAJOR, .cr40-inner control): a static nested
+    @WebServlet class must keep publishing exactly as before - proves
+    is_non_static_member correctly gates off for the shared
+    `_uninstantiable_class_problem` helper too, not just Spring/JAX-RS."""
+    src = """
+package p;
+
+class Outer {
+    @WebServlet("/good-servlet")
+    static class Inner {
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].from_qualified_name == "p.Outer.Inner"
+
+
+def test_spring_route_on_a_method_local_class_is_never_instantiated():
+    """FIX ROUND 46 (F1 MAJOR, .cr40-local /local-route): a class
+    declared INSIDE a method body (a local class) is unnameable/
+    unreferenceable from anywhere outside its own declaring method - no
+    separate XML `<bean>` declaration (the escape every other "not
+    through this class alone" cell leans on) could ever name it either,
+    so it earns the SAME stronger "never instantiated" wording the enum
+    cell already does, not the weaker hedge."""
+    src = """
+package p;
+
+class Outer {
+    void register() {
+        @RestController
+        class LocalCtrl {
+            @GetMapping("/local-route")
+            void handle() {}
+        }
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.Outer.LocalCtrl"
+    assert "spring_route_on_unregistered_class" in problem.detail
+    assert "LOCAL class" in problem.detail
+
+
+def test_jax_rs_route_on_a_method_local_class_is_never_instantiated():
+    """FIX ROUND 46 (F1 MAJOR, .cr40-local sibling): the JAX-RS twin of
+    the method-local case above - a method-level @Path is required here
+    (unlike the bare-verb dominant idiom) so a route actually composes
+    and reaches this producer's own registrability check at all; the
+    verb-only-no-composed-route shape is already suppressed by the
+    pre-existing, unrelated jax_rs_verb_only_method class-closer."""
+    src = """
+package p;
+
+class Outer {
+    void register() {
+        @Path("/local-res")
+        class LocalResource {
+            @GET
+            @Path("y")
+            void get() {}
+        }
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.Outer.LocalResource"
+    assert "jax_rs_route_on_unregistered_class" in problem.detail
+    assert "LOCAL class" in problem.detail
+
+
+def test_web_servlet_on_a_method_local_class_is_never_instantiated():
+    """FIX ROUND 46 (F1 MAJOR, .cr40-local sibling): the @WebServlet
+    twin of the method-local case above, exercising the shared
+    `_uninstantiable_class_problem` helper's own local-class branch."""
+    src = """
+package p;
+
+class Outer {
+    void register() {
+        @WebServlet("/local-servlet")
+        class LocalServlet {
+        }
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.Outer.LocalServlet"
+    assert "webservlet_on_uninstantiable_class" in problem.detail
+    assert "LOCAL class" in problem.detail
+
+
 def test_method_level_route_with_no_class_level_mapping_is_unchanged():
     """M5 (fourth cold read, fix round 6): a class with no class-level
     route annotation at all must publish the method's own route exactly
