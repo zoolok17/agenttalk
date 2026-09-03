@@ -578,7 +578,22 @@ carry (folded into "Named decisions and residuals" as N5 at round 27) for
 good. Unlike Spring, JAX-RS needs no separate stereotype annotation - a
 class-level `@Path` is itself sufficient registration evidence for a
 concrete class, so only type-kind (interface/abstract vs. concrete) governs
-this family, never a missing-stereotype cell.
+this family, never a missing-stereotype cell. Micro-round 44b additionally
+closed an ENUM cell the matrix keyed past (it keys on type-kind + stereotype
+presence, not instantiability): an enum is never instantiated the ordinary
+way and, unlike an interface/abstract class, no other class can ever extend
+one - a provably stronger "never registered" claim for both the Spring and
+JAX-RS families, folded into each family's own existing enrolled shape.
+
+NAMED LIMIT (declared, MICRO-ROUND 44b): registrability checks cover type
+kind (interface/abstract/enum) and Spring stereotype presence only -
+constructor accessibility and other finer instantiability constraints (a
+concrete `@WebServlet` class whose only constructor is private, which a
+container can never invoke either, was reviewer-3's own measured example)
+are not modeled; this single-file, syntactic-only adapter does not track
+constructor declarations or their own access modifiers at all. A declared
+gap rather than a guessed pass/fail, per this producer's own "under-claim
+over guess" bar.
 
 The scanner never invents an internal target because names look similar.
 Ambiguous resolution creates an unresolved edge with candidates. Dynamic

@@ -23,6 +23,14 @@ Per the lead's decided item-3 relation scope on the approved PR-B plan
        DEPLOYMENT-level base path (JAX-RS's own @ApplicationPath, or a
        non-root DispatcherServlet mapping) is never composed in; a
        published route may not be the full path actually served.
+       NAMED LIMIT (declared, MICRO-ROUND 44b): registrability checks
+       (_class_registrability) cover TYPE KIND (interface/abstract/
+       enum) and Spring stereotype PRESENCE only - constructor
+       accessibility and other finer instantiability constraints (e.g.
+       a concrete @WebServlet class whose only constructor is private,
+       which a container can never invoke either) are not modeled; this
+       single-file, syntactic-only adapter does not track constructor
+       declarations or their own access modifiers at all.
     4. data, configuration - DEFERRED. Both would require call/type
        resolution to mean anything, which is inference, not declaration.
        Reported as EXPLICIT, ENUMERATED coverage gaps
@@ -2318,9 +2326,9 @@ def _class_header_associations(
 
 def _class_registrability(
     sanitized: str, declaration_start: int, header_start: int,
-) -> tuple[bool, bool, bool]:
-    """``(is_interface, is_abstract, has_stereotype)`` for ONE declared
-    type, anchored the same way :func:`_class_level_route_target`
+) -> tuple[bool, bool, bool, bool]:
+    """``(is_interface, is_abstract, has_stereotype, is_enum)`` for ONE
+    declared type, anchored the same way :func:`_class_level_route_target`
     already is.
 
     FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER - THE
@@ -2355,15 +2363,29 @@ def _class_registrability(
       single-file producer cannot see could still register it) -
       every caller must read a missing stereotype as "not provably a
       bean from this file," never as "never a bean."
+    - ``is_enum``: MICRO-ROUND 44b (reviewer-3's own item-2
+      construction, F2 - a cell the matrix keyed past, since it keys
+      on type-kind + stereotype, not instantiability): an enum type is
+      NEVER instantiated the ordinary way (``new EnumType()``) - its
+      instances are the fixed, compiler-generated set of declared
+      constants, and Java forbids any OTHER class from extending an
+      enum (unlike an interface/abstract class, no concrete implementor
+      can ever exist elsewhere) - a PROVABLY stronger "never
+      registered" claim than the interface/abstract case, closer to
+      `@WebServlet`'s own epistemics than to Spring's own weaker one,
+      even though the ANNOTATION is Spring's own family.
     """
     is_interface = False
+    is_enum = False
     if sanitized[header_start:header_start + 1] != "@":
         keyword_match = _TYPE_NAME_ANCHOR_RE.match(sanitized, header_start)
-        is_interface = keyword_match is not None and keyword_match.group(1) == "interface"
+        if keyword_match is not None:
+            is_interface = keyword_match.group(1) == "interface"
+            is_enum = keyword_match.group(1) == "enum"
     trivia = sanitized[declaration_start:header_start]
     is_abstract = _ABSTRACT_MODIFIER_RE.search(trivia) is not None
     has_stereotype = _SPRING_STEREOTYPE_ANNOTATION_RE.search(trivia) is not None
-    return is_interface, is_abstract, has_stereotype
+    return is_interface, is_abstract, has_stereotype, is_enum
 
 
 def _uninstantiable_class_problem(
@@ -2987,16 +3009,32 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         # (folded into N5 at round 27) - see "Named decisions and
         # residuals".
         if match.group(1) == "Path" and prefixes is not None:
-            is_interface, is_abstract, _has_stereotype = class_registrability.get(
-                enclosing, (False, False, False))
-            if is_interface or is_abstract:
-                shape = "an INTERFACE" if is_interface else "ABSTRACT"
+            is_interface, is_abstract, _has_stereotype, is_enum = class_registrability.get(
+                enclosing, (False, False, False, False))
+            if is_interface or is_abstract or is_enum:
+                # MICRO-ROUND 44b (F2, judged - taken): an enum
+                # decorated with a class-level @Path is a DIFFERENT,
+                # STRONGER claim than the interface/abstract cells -
+                # unlike them, no other class can ever extend/implement
+                # an enum (Java forbids it), so there is no possible
+                # implementing resource class to point at either;
+                # worded separately rather than reusing the interface/
+                # abstract clause, which would falsely imply one might
+                # exist. Same enrolled shape name regardless (the
+                # actionable fact - "not served through this class" -
+                # is the same either way, only the reason differs).
+                if is_enum:
+                    shape_clause = "an ENUM - never instantiated as an ordinary resource class"
+                else:
+                    shape_clause = (
+                        ("an INTERFACE" if is_interface else "ABSTRACT")
+                        + " - served only through an implementing/extending resource class"
+                    )
                 problems.append(JavaAdapterProblem(
                     reason_code="unsupported_entry_point_shape",
                     detail=bounded_detail(
                         f"a @Path route at line {line} is declared on a class that is "
-                        f"{shape} (jax_rs_route_on_unregistered_class) - served only "
-                        "through an implementing/extending resource class"),
+                        f"{shape_clause} (jax_rs_route_on_unregistered_class)"),
                     qualified_name=enclosing,
                 ))
                 continue
@@ -3010,32 +3048,52 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         # and micro-round 44b's own interface/abstract check just
         # above) with their own, different epistemics.
         if match.group(1) != "Path":
-            is_interface, is_abstract, has_stereotype = class_registrability.get(
-                enclosing, (False, False, False))
-            unregistered_reason = None
-            if is_interface:
+            is_interface, is_abstract, has_stereotype, is_enum = class_registrability.get(
+                enclosing, (False, False, False, False))
+            unregistered_detail = None
+            if is_enum:
+                # MICRO-ROUND 44b (reviewer-3's own item-2 construction,
+                # F2 - a cell the matrix keyed past, since it keys on
+                # type-kind + stereotype, not instantiability): an enum
+                # is NEVER instantiated the ordinary way Spring's own
+                # bean machinery requires (`new EnumType()`) - its
+                # instances are the fixed, compiler-generated set of
+                # declared constants, and unlike interface/abstract, no
+                # OTHER class can ever extend an enum (Java forbids it)
+                # - a PROVABLY stronger "never registered" claim, worded
+                # separately rather than the weaker interface/abstract
+                # clause, which would falsely imply a subclass/
+                # implementer might exist.
+                unregistered_detail = (f"a Spring route at line {line} is declared on an ENUM - "
+                    "never instantiated as an ordinary Spring bean (spring_route_on_"
+                    "unregistered_class)")
+            elif is_interface:
                 # Spring's own merged-annotation lookup DOES search
                 # interfaces (an implementing, registered bean inherits
                 # the mapping) - a materially WEAKER claim than "never
                 # served", the same epistemic line 43-N3 already drew
                 # for JAX-RS's own annotation-inheritance rule.
-                unregistered_reason = "this class is an INTERFACE"
+                unregistered_detail = (f"a Spring route at line {line} is not served through "
+                    "this class alone - this class is an INTERFACE (spring_route_on_"
+                    "unregistered_class)")
             elif is_abstract:
                 # Never a bean instance itself, but a concrete subclass
                 # inherits the mapping - same "not through this class
                 # alone" epistemics as the interface case.
-                unregistered_reason = "this class is ABSTRACT"
+                unregistered_detail = (f"a Spring route at line {line} is not served through "
+                    "this class alone - this class is ABSTRACT (spring_route_on_"
+                    "unregistered_class)")
             elif not has_stereotype:
                 # Unknowable from this file alone (see
                 # _class_registrability's own docstring) - a separate
                 # XML <bean> declaration could still register it.
-                unregistered_reason = "no Spring stereotype found on this class"
-            if unregistered_reason is not None:
+                unregistered_detail = (f"a Spring route at line {line} is not served through "
+                    "this class alone - no Spring stereotype found on this class "
+                    "(spring_route_on_unregistered_class)")
+            if unregistered_detail is not None:
                 problems.append(JavaAdapterProblem(
                     reason_code="unsupported_entry_point_shape",
-                    detail=bounded_detail(f"a Spring route at line {line} is not served through "
-                           f"this class alone - {unregistered_reason} "
-                           "(spring_route_on_unregistered_class)"),
+                    detail=bounded_detail(unregistered_detail),
                     qualified_name=enclosing,
                 ))
                 continue
@@ -3188,8 +3246,8 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         # FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER - THE
         # REGISTRABILITY MATRIX): see _uninstantiable_class_problem's
         # own docstring - shared with @WebFilter below.
-        is_interface, is_abstract, _has_stereotype = class_registrability.get(
-            target_type, (False, False, False))
+        is_interface, is_abstract, _has_stereotype, _is_enum = class_registrability.get(
+            target_type, (False, False, False, False))
         uninstantiable_problem = _uninstantiable_class_problem(
             target_type, is_interface, is_abstract, line, "@WebServlet")
         if uninstantiable_problem is not None:
@@ -3282,8 +3340,8 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         # FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER): see
         # _uninstantiable_class_problem's own docstring - shared with
         # @WebServlet above.
-        is_interface, is_abstract, _has_stereotype = class_registrability.get(
-            target_type, (False, False, False))
+        is_interface, is_abstract, _has_stereotype, _is_enum = class_registrability.get(
+            target_type, (False, False, False, False))
         uninstantiable_problem = _uninstantiable_class_problem(
             target_type, is_interface, is_abstract, line, "@WebFilter")
         if uninstantiable_problem is not None:

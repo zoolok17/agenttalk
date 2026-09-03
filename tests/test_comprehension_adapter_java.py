@@ -1488,6 +1488,65 @@ public class Controller {
     assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
 
 
+def test_a_spring_route_on_an_enum_is_never_a_registered_bean():
+    """MICRO-ROUND 44b (reviewer-3's own item-2 construction, F2 - a
+    cell the registrability matrix keyed past, since it keys on
+    type-kind + stereotype, not instantiability): an ENUM carrying
+    @RestController and its own route methods still published a
+    confident served route - a container/Spring never instantiates an
+    enum the ordinary way (`new EnumType()`); its instances are the
+    fixed, compiler-generated set of declared constants, and unlike an
+    interface/abstract class, no OTHER class can ever extend an enum
+    (Java forbids it) - a PROVABLY stronger "never registered" claim,
+    not the weaker "not through this class alone" wording the
+    interface/abstract cells get."""
+    src = """
+package p;
+
+@RestController
+public enum OrderMode {
+    FAST, SLOW;
+
+    @GetMapping("/orders")
+    public void list() {}
+}
+"""
+    result = java.parse_java_source("OrderMode.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.OrderMode"
+    assert "spring_route_on_unregistered_class" in problem.detail
+    assert "ENUM" in problem.detail
+    assert "never instantiated" in problem.detail
+
+
+def test_a_jax_rs_path_on_an_enum_is_never_a_registered_resource():
+    """MICRO-ROUND 44b (F2, JAX-RS sibling): the same enum
+    unreachability, for a class-level @Path instead of a Spring
+    stereotype - folded into the SAME jax_rs_route_on_unregistered_class
+    shape as the interface/abstract cells (the actionable fact is the
+    same), but worded separately since, unlike interface/abstract, no
+    implementing resource class could ever exist for an enum either."""
+    src = """
+package p;
+
+@Path("/api/orders")
+public enum OrderResource {
+    FAST, SLOW;
+
+    @GET
+    @Path("/list")
+    public void list() {}
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.OrderResource"
+    assert "jax_rs_route_on_unregistered_class" in problem.detail
+    assert "an ENUM" in problem.detail
+
+
 def test_a_concrete_subclass_of_an_abstract_mapped_controller_publishes_nothing_of_its_own():
     """FIX ROUND 44 (F1 BLOCKER, concrete-subclass-of-abstract control):
     this single-file, syntactic-only producer has no inheritance
@@ -1569,6 +1628,35 @@ package p;
 
 @WebServlet("/api")
 public class ApiServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("ApiServlet.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "/api"
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+
+
+def test_web_servlet_with_only_a_private_constructor_still_publishes_a_declared_gap():
+    """MICRO-ROUND 44b (reviewer-3's own item-2 construction, F2 -
+    declared, not fixed): a concrete @WebServlet class whose ONLY
+    constructor is private can never be instantiated by a servlet
+    container either - the same unreachability question as F1's own
+    interface/abstract/enum cells - but this single-file, syntactic-
+    only adapter tracks no constructor declarations or their own access
+    modifiers at all, so there is no cheap, existing fact to check this
+    against (unlike type-kind, which the header parse already sees).
+    Judged: declare the gap (module docstring + design doc), do not
+    guess a pass/fail. This is a REGRESSION LOCK proving today's
+    (unchanged, declared-gap) output - a future round adding
+    constructor tracking should update this test deliberately, not
+    discover the behavior changed by accident."""
+    src = """
+package p;
+
+@WebServlet("/api")
+public class ApiServlet extends HttpServlet {
+    private ApiServlet() {}
 }
 """
     result = java.parse_java_source("ApiServlet.java", src)
