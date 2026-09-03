@@ -4425,6 +4425,23 @@ def _project_own_coordinate(
             break
     if group_id is None or artifact_id is None:
         return None
+    # FIX ROUND 43 (thirty-seventh cold read, F3 MAJOR): an unexpanded
+    # Maven property (``${revision}``, ``${custom.group}``, ...) left in
+    # either half is not a genuine identity - the SAME "${" HARD RULE
+    # ``dependencies_artifact._classify_registry_miss`` already applies
+    # to a DEPENDENCY's own target (never a positive-grounds external
+    # claim) now applies here too, to the identity SIDE: publishing a
+    # unit under a literal "${revision}:core" string would register a
+    # coordinate that cannot exist. NAMED LIMIT: this adapter has no
+    # properties/profile-activation evaluator (see this function's own
+    # NAMED LIMIT above for the analogous multi-file gap) - such a
+    # module's own identity stays unregistered; a sibling depending on
+    # it via the real, evaluated value still resolves ``unresolved``,
+    # the same honest non-claim the target-side guard already produces
+    # for this exact shape - never a false claim on either side, never
+    # divergent between them.
+    if "${" in group_id or "${" in artifact_id:
+        return None
     return group_id, artifact_id
 
 

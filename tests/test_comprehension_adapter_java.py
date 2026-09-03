@@ -5247,6 +5247,48 @@ def test_a_self_closed_parent_groupid_is_the_same_safe_absent_default_as_a_missi
     assert [e.target for e in edges] == ["com.other:lib"]
 
 
+def test_an_unresolvable_property_in_the_own_groupid_never_registers_a_fabricated_identity():
+    """FIX ROUND 43 (thirty-seventh cold read, F3 MAJOR, .cr37-
+    coordprop, wrong-data): the SAME "${" HARD RULE
+    ``dependencies_artifact._classify_registry_miss`` already applies
+    to a DEPENDENCY's own unexpandable target property (see
+    ``test_an_unexpandable_pom_property_dependency_stays_unresolved_
+    spelling_retained`` in the dependencies-artifact test file) now
+    applies to this pom's OWN identity too - an unresolved
+    ``${custom.prop}`` (not one of the two self-referential properties
+    this producer can expand from the same file) left in the own
+    ``<groupId>`` must never register a coordinate that cannot exist
+    (``${custom.prop}:core``). No unit at all - the same honest
+    non-claim the dependency-target side already produces for this
+    exact shape, never a false positive on either side."""
+    pom = """<project>
+  <groupId>${custom.prop}</groupId>
+  <artifactId>core</artifactId>
+</project>
+"""
+    units, _edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert units == []
+    assert not any("${custom.prop}" in u.qualified_name for u in units)
+
+
+def test_the_two_self_referential_properties_still_expand_for_the_own_identity_path():
+    """FIX ROUND 43 (F3 MAJOR, expansion control): round 43's own new
+    "${" guard on the identity path must never catch the TWO self-
+    referential properties this producer already expands elsewhere
+    (``${project.groupId}``/``${project.parent.groupId}`` in a
+    DEPENDENCY's own target - see the dependencies-artifact test
+    file's own ``test_a_project_groupid_property_dependency_expands_
+    and_resolves_internal``) - those are resolved against THIS SAME
+    module's own already-parsed groupId before publication, never left
+    as a literal, unresolved ``${`` string in the first place, so this
+    guard never has occasion to fire for them. A plain, real groupId
+    (no property at all) must keep registering exactly as it always
+    has."""
+    pom = "<project><groupId>com.acme</groupId><artifactId>core</artifactId></project>"
+    units, _edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert [u.qualified_name for u in units] == ["com.acme:core"]
+
+
 def test_pom_a_visible_artifactid_containing_a_zero_width_space_is_unaffected():
     """FIX ROUND 39 (F4 LOW, control): the fix above must not treat a
     REAL, visible identity value merely CONTAINING an invisible
