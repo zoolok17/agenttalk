@@ -4367,6 +4367,88 @@ public class OrderResource {
     assert "jax_rs_method_path_without_root_resource" in problem.detail
 
 
+def test_a_class_level_path_on_a_jax_rs_interface_is_not_served_through_it_alone():
+    """MICRO-ROUND 44b (reviewer-3's own measured HOLD on round 44):
+    a class-level @Path DOES exist here (unlike the no-root-resource
+    shape above) but the class it decorates is an INTERFACE - reviewer-3
+    measured this publishing a confident served route, owned by the
+    interface itself, complete/0. The route's own EXISTENCE is
+    defensible (JAX-RS's own annotation-inheritance rule, JSR-370 s3.6,
+    means an implementing, registered concrete resource class DOES
+    inherit the mapping) but the OWNER is wrong (an interface never
+    itself serves a request) and complete/0 asserts a certainty this
+    producer does not have (no concrete implementor may exist anywhere
+    in-scan at all - in this fixture, none does). The SAME weaker "not
+    through this class alone" claim the Spring cell already earns
+    applies here too - reviewer-3's own explicit instruction: NOT
+    @WebServlet's own stronger "never served" claim, which would be
+    wrong for JAX-RS specifically (its own spec grants inheritance,
+    unlike @WebServlet). Closes the round-25 abstract-@Path carry
+    (folded into N5 at round 27)."""
+    src = """
+package p;
+
+@Path("/api/orders")
+public interface OrderResource {
+    @GET
+    @Path("/list")
+    void list();
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.OrderResource"
+    assert "jax_rs_route_on_unregistered_class" in problem.detail
+    assert "an INTERFACE" in problem.detail
+
+
+def test_a_class_level_path_on_an_abstract_jax_rs_class_is_not_served_through_it_alone():
+    """MICRO-ROUND 44b (reviewer-3's own measured HOLD): the abstract-
+    class sibling of the interface case above - the exact round-25
+    abstract-@Path carry (folded into N5 at round 27), now closed by
+    this same fix rather than left open indefinitely."""
+    src = """
+package p;
+
+@Path("/api/orders")
+public abstract class OrderResource {
+    @GET
+    @Path("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.OrderResource"
+    assert "jax_rs_route_on_unregistered_class" in problem.detail
+    assert "ABSTRACT" in problem.detail
+
+
+def test_a_class_level_path_on_a_concrete_jax_rs_class_still_publishes():
+    """MICRO-ROUND 44b (reviewer-3's own measured HOLD, control): the
+    genuinely serveable cell - a concrete class-level @Path resource
+    must keep publishing exactly as before. Unlike Spring, JAX-RS needs
+    no separate stereotype annotation - a class-level @Path is itself
+    sufficient registration evidence for a concrete class."""
+    src = """
+package p;
+
+@Path("/api/orders")
+public class OrderResource {
+    @GET
+    @Path("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /api/orders/list"
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+
+
 def test_a_spring_method_mapping_with_no_class_level_mapping_still_publishes_the_route():
     """FIX ROUND 43 (N3, Spring-parity control): the SAME standalone
     shape (no class-level route annotation, a real method-level one)
@@ -4675,24 +4757,27 @@ public class OrderResource {
     assert result.problems == []
 
 
-def test_a_route_annotation_on_an_abstract_interface_method_still_composes():
+def test_a_route_annotation_on_an_abstract_interface_method_still_associates():
     """Companion control case for m1 - an interface's own abstract method
     (no body, just a bare parameter list then `;`) is still a genuine
-    METHOD declaration and must stay published, unaffected by the field
-    check.
+    METHOD declaration, not a field, and must still REACH composition -
+    never silently vanish with zero trace the way a field-misread would.
 
-    CORRECTED (round 44, thirty-eighth cold read, F1 BLOCKER - THE
-    REGISTRABILITY MATRIX): re-based on JAX-RS instead of Spring - round
-    44's own registrability gate now suppresses any SPRING-family route
-    on an interface (see the class-level companion test above), and a
-    body-less interface method is inherently that exact shape, making
-    Spring unusable for exercising m1 at all going forward. JAX-RS is
-    untouched here - a class-level @Path already registers a root
-    resource, and JAX-RS's own interface/abstract disposition is a
-    declared, separate residual (see "Named decisions and residuals"),
-    not attempted this round - so a class-level @Path plus a body-less
-    interface method still proves m1's own "recognized as a method, not
-    a field" property, unaffected by round 44's own Spring-only gate."""
+    CORRECTED TWICE. Round 44 (F1, THE REGISTRABILITY MATRIX) first
+    re-based this on JAX-RS instead of Spring, since Spring started
+    suppressing any route on an interface and a body-less method is
+    inherently that exact shape. MICRO-ROUND 44b (reviewer-3's own
+    measured HOLD) then closed the JAX-RS interface/abstract residual
+    too - a class-level @Path plus a body-less interface method is NOW
+    suppressed as `jax_rs_route_on_unregistered_class` the same way.
+    Since a body-less method can ONLY exist in an interface or an
+    abstract class - the very two shapes registrability now suppresses
+    for both families - no annotation-composed fixture can prove m1 by
+    PUBLISHING anymore; the strongest available proof is that the
+    annotation reached the SUPPRESSION at all (one real problem,
+    attributed to this class) rather than m1 wrongly reading it as a
+    field and dropping it with NO trace whatsoever (zero problems, zero
+    entry points, silence)."""
     src = """
 package p;
 
@@ -4704,8 +4789,12 @@ public interface OrderApi {
 }
 """
     result = java.parse_java_source("OrderApi.java", src)
-    routes = _edges(result, "route")
-    assert [r.target for r in routes] == ["GET /api/orders"]
+    assert _edges(result, "route") == []
+    assert len(result.problems) == 1
+    problem = result.problems[0]
+    assert problem.qualified_name == "p.OrderApi"
+    assert problem.reason_code == "unsupported_entry_point_shape"
+    assert "jax_rs_route_on_unregistered_class" in problem.detail
 
 
 def test_web_method_annotation_is_the_named_class_closer_not_a_silent_negative():

@@ -251,6 +251,14 @@ UNSUPPORTED_ENTRY_POINT_SHAPES = (
     # that real epistemic difference.
     "spring_route_on_unregistered_class",
     "webservlet_on_uninstantiable_class",
+    # MICRO-ROUND 44b (reviewer-3's own measured HOLD on round 44):
+    # the JAX-RS sibling of `spring_route_on_unregistered_class`, own
+    # name since JAX-RS needs no separate stereotype annotation (a
+    # class-level @Path is itself sufficient registration evidence for
+    # a CONCRETE class - only type-kind matters here) - see the
+    # matching call site's own docstring. CLOSES the round-25 abstract-
+    # @Path carry (folded into N5 at round 27).
+    "jax_rs_route_on_unregistered_class",
 )
 
 #: FIX ROUND 21c (reviewer-3's re-delta, THE ASK - second instance, closing
@@ -2949,16 +2957,58 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                 qualified_name=enclosing,
             ))
             continue
+        # MICRO-ROUND 44b (reviewer-3's own measured HOLD on round 44's
+        # own declared JAX-RS residual): a class-level @Path DOES exist
+        # here (`prefixes is not None` - the `prefixes is None` case
+        # just above is a DIFFERENT shape, already suppressed with its
+        # own reason) but the class it decorates is an interface or
+        # abstract - reviewer-3 measured this publishing a confident
+        # served route, `owned by` the interface/abstract type itself,
+        # complete/0. Verdict (reviewer-3's own, applied verbatim): the
+        # route's EXISTENCE is defensible (JAX-RS's own annotation-
+        # inheritance rule, JSR-370 s3.6, is real - an implementing/
+        # extending concrete resource class DOES inherit the mapping),
+        # but the OWNER is wrong (an interface/abstract class never
+        # itself serves a request) and complete/0 asserts a certainty
+        # this producer does not have (no concrete implementor may
+        # exist anywhere in-scan at all). The SAME weaker "not through
+        # this class alone" claim the Spring cell above already earns
+        # (Spring's own merged-annotation lookup ALSO searches
+        # interfaces/superclasses) is exactly right here too -
+        # reviewer-3's own explicit instruction: do NOT copy
+        # @WebServlet's own STRONGER "never served" claim onto this
+        # cell; @WebServlet's own claim is provable only because that
+        # annotation is never inherited at all (Servlet spec) - JAX-RS
+        # is the opposite case by its own spec. Unlike Spring, JAX-RS
+        # needs no separate stereotype annotation (a class-level @Path
+        # is itself sufficient registration evidence for a CONCRETE
+        # class) - only type-kind matters here, never a missing-
+        # stereotype cell. CLOSES the round-25 abstract-@Path carry
+        # (folded into N5 at round 27) - see "Named decisions and
+        # residuals".
+        if match.group(1) == "Path" and prefixes is not None:
+            is_interface, is_abstract, _has_stereotype = class_registrability.get(
+                enclosing, (False, False, False))
+            if is_interface or is_abstract:
+                shape = "an INTERFACE" if is_interface else "ABSTRACT"
+                problems.append(JavaAdapterProblem(
+                    reason_code="unsupported_entry_point_shape",
+                    detail=bounded_detail(
+                        f"a @Path route at line {line} is declared on a class that is "
+                        f"{shape} (jax_rs_route_on_unregistered_class) - served only "
+                        "through an implementing/extending resource class"),
+                    qualified_name=enclosing,
+                ))
+                continue
         # FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER - THE
         # REGISTRABILITY MATRIX): the Spring half of the matrix
         # _class_registrability's own docstring names. Checked for
         # EVERY Spring-family route (both the class-prefix and the
         # standalone-method shapes below publish for `enclosing`) -
-        # never for JAX-RS (`match.group(1) == "Path"`), which already
-        # has its own N3 check above with its own, different epistemics
-        # (JAX-RS's annotation-inheritance rule, JSR-370 s3.6, is not
-        # this producer's concern here - not attempted this round, see
-        # "Named decisions and residuals").
+        # never for JAX-RS (`match.group(1) == "Path"`), which now has
+        # its own two checks above (N3's "no class-level @Path at all",
+        # and micro-round 44b's own interface/abstract check just
+        # above) with their own, different epistemics.
         if match.group(1) != "Path":
             is_interface, is_abstract, has_stereotype = class_registrability.get(
                 enclosing, (False, False, False))

@@ -551,26 +551,34 @@ not be the full path actually served. Publishing a guessed prefix would risk
 a confident, wrong route; this stays a named gap rather than either a guess
 or a silent omission.
 
-NAMED LIMIT (declared and PARTIALLY closed, PR-B round 44 - THE REGISTRABILITY
-MATRIX): a class-level route annotation used to publish regardless of whether
-the class it decorates can ever actually be the thing a container/framework
-instantiates and dispatches a request to. Closed for Spring's own family (an
-interface or abstract class is "not served through this class alone" - an
-implementing/subclass bean may serve it, Spring's own merged-annotation
-lookup searches both - and a concrete class with no recognized stereotype
-annotation anywhere in this file is "not provably a bean from this file",
-never "never a bean", since a separate XML `<bean>` declaration could still
-register it) and for `@WebServlet`/`@WebFilter` (an interface or abstract
-class here is provably "never served" - a container only instantiates
-concrete classes, and neither annotation is inherited, Servlet spec). NOT
-closed for JAX-RS's own `@Path`: JSR-370 s3.6 grants JAX-RS resource classes
-their own annotation-inheritance rule (a concrete implementer/subclass
-inherits a superinterface's/superclass's own `@Path`), a materially
-different epistemic than this producer assumed for Spring before round 44 -
-whether an interface/abstract JAX-RS root resource should get the same
-"not through this class alone" treatment as Spring, or whether JAX-RS's own
-inheritance rule makes it more readily "genuinely servable" than Spring's,
-is an open, undecided question, not silently resolved either way this round.
+NAMED LIMIT (declared and CLOSED, PR-B round 44 + micro-round 44b - THE
+REGISTRABILITY MATRIX): a class-level route annotation used to publish
+regardless of whether the class it decorates can ever actually be the thing
+a container/framework instantiates and dispatches a request to. Closed for
+Spring's own family (an interface or abstract class is "not served through
+this class alone" - an implementing/subclass bean may serve it, Spring's own
+merged-annotation lookup searches both - and a concrete class with no
+recognized stereotype annotation anywhere in this file is "not provably a
+bean from this file", never "never a bean", since a separate XML `<bean>`
+declaration could still register it), for `@WebServlet`/`@WebFilter` (an
+interface or abstract class here is provably "never served" - a container
+only instantiates concrete classes, and neither annotation is inherited,
+Servlet spec), and - closed by micro-round 44b, on reviewer-3's own measured
+HOLD - for JAX-RS's own `@Path` on an interface or abstract class too: JSR-370
+s3.6 grants JAX-RS resource classes their own annotation-inheritance rule (a
+concrete implementer/subclass inherits a superinterface's/superclass's own
+`@Path`), so the route's own EXISTENCE is exactly as defensible as Spring's -
+but the OWNER (the interface/abstract type itself) is wrong, and no concrete
+implementor may exist anywhere in-scan at all. Given Spring's own inheritance
+rule already earns the WEAKER "not through this class alone" treatment
+(never the `@WebServlet`-style "never served" claim, which would be wrong
+here - JAX-RS's own inheritance rule is real, unlike `@WebServlet`'s), JAX-RS
+gets the identical weaker treatment, closing the round-25 abstract-`@Path`
+carry (folded into "Named decisions and residuals" as N5 at round 27) for
+good. Unlike Spring, JAX-RS needs no separate stereotype annotation - a
+class-level `@Path` is itself sufficient registration evidence for a
+concrete class, so only type-kind (interface/abstract vs. concrete) governs
+this family, never a missing-stereotype cell.
 
 The scanner never invents an internal target because names look similar.
 Ambiguous resolution creates an unresolved edge with candidates. Dynamic
