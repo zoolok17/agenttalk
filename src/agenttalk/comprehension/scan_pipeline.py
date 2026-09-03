@@ -1420,11 +1420,23 @@ def run_scan(
             # discriminator lost past the bound would also defeat
             # detail-based uniqueness - one more argument for F1's own
             # id-level fix this round already lands.
+            #
+            # FIX ROUND 38 (thirty-second cold read, F5 polish, wrong-
+            # data): round 37's own "fits comfortably under the bound
+            # for an ordinary path" claim was measured FALSE - this
+            # template's own fixed text alone was 168 of the 200-char
+            # bound, leaving only 32 for the quoted colliding path
+            # itself (`first!r`, including its own quote characters) -
+            # any real path over ~30 characters, which is most of them,
+            # already truncates. Shortened genuinely (the colliding
+            # path is the essential datum here; the explainer is now
+            # one short clause) - fixed text is 97 chars, leaving ~103
+            # for the path, comfortable for a realistic deep Maven/
+            # Java package path.
             _problem_record(
                 "unicode_normalization_collision", second, bounded_detail(
-                    f"collides with {first!r} once NFC-normalized and case-folded, not by a "
-                    "bare case-fold alone - a Unicode canonical-equivalence difference (e.g. "
-                    "precomposed vs. decomposed accents)"))
+                    f"collides with {first!r} once NFC-normalized, not by a bare case-fold "
+                    "(canonical equivalence, e.g. accents)"))
             for first, second in case_collisions
         ] + duplicate_qualified_name_problems + binary_excluded_code_bearing_problems + (
             binary_excluded_root_sniffed_xml_problems) + reactor_rule_problems + (

@@ -1213,12 +1213,68 @@ def test_run_scan_reports_a_unicode_normalization_collision_not_a_false_case_col
     # ordinary path like this one, the detail must be whole, never
     # truncated at all (bounded_detail's own new marker covers only the
     # pathological case, not the common one).
+    #
+    # FIX ROUND 38 (thirty-second cold read, F5 polish, wrong-data):
+    # round 37's own shortening was ITSELF measured still too long (168
+    # of 200 chars fixed, leaving only ~32 for the quoted path) - see
+    # test_run_scan_a_unicode_normalization_collision_with_a_realistic_
+    # deep_path_is_not_truncated below for the fixture that actually
+    # exercises the bound; this wording-only assertion just tracks the
+    # current (shortened again) template text.
     assert not collisions[0]["detail"].endswith("...(truncated)")
-    assert collisions[0]["detail"].endswith("decomposed accents)")
+    assert collisions[0]["detail"].endswith("e.g. accents)")
 
     scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
     assert "unicode_normalization_collision" in scan_doc["degraded_by"]
     assert "case_collision" not in scan_doc["degraded_by"]
+
+
+def test_run_scan_a_unicode_normalization_collision_with_a_realistic_deep_path_is_not_truncated(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 38 (thirty-second cold read, F5 polish, .cr32 verbatim,
+    wrong-data): round 37's own F6 fix claimed this template "fits
+    comfortably under the bound for an ordinary path" - measured FALSE:
+    the fixed text alone was 168 of the 200-char MAX_PROBLEM_DETAIL_
+    LENGTH, leaving only ~32 chars for the quoted colliding path
+    (`first!r`, quotes included) - any path over ~30 characters, which
+    is every realistic Maven/Java package path, already truncated. A
+    genuinely deep, realistic path (`src/main/java/com/acme/platform/
+    orders/service/internal/InvoiceProcessor.java`, 76 characters) is
+    used here specifically because it is exactly the kind of path
+    round 37's own claim said would fit but measurably did not."""
+    import dataclasses
+    import json
+    import unicodedata
+
+    from agenttalk.comprehension import discovery as discoverymod
+
+    deep_dir = "src/main/java/com/acme/platform/orders/service/internal"
+    raw_name = f"{deep_dir}/InvóiceProcessor.java"
+    nfc_name = unicodedata.normalize("NFC", raw_name)
+    nfd_name = unicodedata.normalize("NFD", raw_name)
+    assert nfc_name != nfd_name
+
+    real_enumerate_scope = discoverymod.enumerate_scope
+
+    def _enumerate_scope(root, comprehension_dir):
+        result = real_enumerate_scope(root, comprehension_dir)
+        first = discoverymod.EnumeratedFile(
+            relative_path=nfc_name, byte_count=1, content_digest="aaa")
+        second = discoverymod.EnumeratedFile(
+            relative_path=nfd_name, byte_count=1, content_digest="bbb")
+        return dataclasses.replace(result, files=[*result.files, first, second])
+
+    monkeypatch.setattr(scan_pipeline.discovery, "enumerate_scope", _enumerate_scope)
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    collisions = [
+        p for p in problems_doc["problems"]
+        if p["reason_code"] == "unicode_normalization_collision"]
+    assert len(collisions) == 1
+    assert not collisions[0]["detail"].endswith("...(truncated)")
+    assert repr(nfc_name) in collisions[0]["detail"]
 
 
 def test_scan_json_publishes_boundary_path_and_kind_not_just_a_count(
