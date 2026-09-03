@@ -633,20 +633,38 @@ evidence can support:
 - statically visible external integration, configuration, and data boundaries
   are identified, otherwise unknown.
 
-NAMED LIMIT (reconciled, PR-B round 43, N2): this list used to also read "...
-or explicitly classified shared" for the `feature_linked` bullet - no
-"shared" classification value exists anywhere in this implementation (the
-classification vocabulary is `production`/`test` only), and
-`readiness_artifact._check_feature_linked` has no bypass for
-infrastructure/shared code either - a unit with zero linked features always
-reports `unsatisfied`/`no_feature_link`, regardless of what kind of code it
-is. The aspiration was never built, and the design text describing it as
-already-covered was reconciled to match, rather than left for a reader to
-discover only by diffing prose against code. Left open (not decided this
-round): whether "shared/infrastructure code should not need a feature link
-to read as satisfied" is worth building at all - it would need its own
-classification value, its own producer, and a definition of what counts as
-"shared" this scan can actually evidence, none of which exist yet.
+NAMED LIMIT (reconciled, PR-B round 43, N2; premise CORRECTED, PR-B round 44,
+F4): this list used to also read "... or explicitly classified shared" for
+the `feature_linked` bullet - no "shared" classification value exists
+anywhere in this implementation, and `readiness_artifact._check_feature_
+linked` has no bypass for it (or for anything else) - a unit with zero
+linked features always reports `unsatisfied`/`no_feature_link`, regardless
+of what kind of code it is. The aspiration was never built, and the design
+text describing it as already-covered was reconciled to match, rather than
+left for a reader to discover only by diffing prose against code.
+
+Round 43's own reconciliation additionally OVERCLAIMED the vocabulary
+itself as "`production`/`test` only" - FALSE: `infrastructure` is a real,
+already-published third value (`_is_confident_infrastructure_path`,
+`modules_artifact.py`; this table's own row above already lists it).
+`_check_feature_linked` also already receives the FULL classified
+`ModuleRecord` at its own call site - no new plumbing is needed to supply
+classification to it, only a policy decision to consult it. But
+`infrastructure` is not necessarily the SAME concept the original "shared"
+wording meant - `infrastructure` names non-code build/tooling/doc files
+(`Dockerfile`, `README`, a CI YAML) that already get a full six-signal
+readiness row as a named, accepted noise source (see "Named decisions and
+residuals" - round 20's own P4/round 16's own N4), where "shared" more
+plausibly meant a genuine CODE unit (an internal shared library/utility
+class used by several features) that classification alone does not
+currently distinguish from any other `production` unit. Left open (not
+decided this round): whether `infrastructure`-classified units should
+bypass `feature_linked` (folding into the existing P4/N4 noise carry, not a
+new one), and whether a SEPARATE "shared code" concept is worth building at
+all - the latter would still need its own classification value, its own
+producer, and a definition of what counts as "shared" this scan can
+actually evidence; the former needs only a policy decision plus a small
+code change, since every other precondition already exists.
 
 The immutable artifact stores `stored_assessment_state`: `assessed`,
 `needs_evidence`, `blocked`, or `not_applicable`. Any required scan-time blocker

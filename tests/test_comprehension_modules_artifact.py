@@ -308,6 +308,84 @@ def _java_result(relative_path: str, source: str) -> java_adapter.JavaFileResult
     return java_adapter.parse_java_source(relative_path, source)
 
 
+def test_a_mixed_production_and_test_file_publishes_the_union_regardless_of_order():
+    """FIX ROUND 44 (thirty-eighth cold read, F3 MAJOR, .cr38-mixcls,
+    wrong-data): the file-kind unit's own classification used to be
+    ``java_result.units[0].classification`` - decided by DECLARATION
+    ORDER, not by what the file actually contains. Two files with the
+    IDENTICAL type set (one JUnit TestCase-shaped type + one production
+    helper), differing only in which type is declared first, used to
+    publish OPPOSITE classifications. The design already declares
+    classification a SET (this field is a list) - the honest value for
+    a mixed file is the UNION of every contained unit's own
+    classification, sorted for deterministic order, regardless of
+    declaration order."""
+    order_a_source = (
+        "package p;\n"
+        "import org.junit.Test;\n"
+        "\n"
+        "class OrderHelper {\n"
+        "}\n"
+        "\n"
+        "class OrderTest {\n"
+        "}\n"
+    )
+    order_b_source = (
+        "package p;\n"
+        "import org.junit.Test;\n"
+        "\n"
+        "class OrderTest {\n"
+        "}\n"
+        "\n"
+        "class OrderHelper {\n"
+        "}\n"
+    )
+    for label, source in (("OrderA.java", order_a_source), ("OrderB.java", order_b_source)):
+        discovery = _discovery([
+            EnumeratedFile(relative_path=label, byte_count=len(source), content_digest="d"),
+        ])
+        java_results = {label: _java_result(label, source)}
+        records = ma.build_modules(discovery, java_results)
+        file_record = next(r for r in records if r.kind == "file")
+        assert file_record.classification == ["production", "test"], label
+        component_classifications = {
+            r.classification[0] for r in records if r.kind == "component"
+        }
+        assert component_classifications == {"production", "test"}, label
+
+
+def test_a_single_classification_file_publishes_only_that_one_value():
+    """FIX ROUND 44 (F3 MAJOR, single-type control): a file whose
+    contained type(s) are ALL the same classification must keep
+    publishing a single-element list, unchanged - the union fix must
+    never fabricate a second value that was never actually present."""
+    source = "package p;\nclass Foo {\n}\n"
+    discovery = _discovery([
+        EnumeratedFile(relative_path="p/Foo.java", byte_count=len(source), content_digest="d"),
+    ])
+    java_results = {"p/Foo.java": _java_result("p/Foo.java", source)}
+    records = ma.build_modules(discovery, java_results)
+    file_record = next(r for r in records if r.kind == "file")
+    assert file_record.classification == ["production"]
+
+
+def test_the_classification_vocabulary_is_exactly_production_test_infrastructure():
+    """FIX ROUND 44 (F4 POLISH): locks the closed, three-value
+    classification vocabulary this producer actually publishes -
+    round 43's own N2 reconciliation had overclaimed it as
+    production/test only (corrected in the design doc); a fourth value
+    must never silently appear."""
+    discovery = _discovery([
+        EnumeratedFile(relative_path="p/Foo.java", byte_count=1, content_digest="a"),
+        EnumeratedFile(relative_path="src/test/resources/fixture.txt", byte_count=1, content_digest="b"),
+        EnumeratedFile(relative_path="README.md", byte_count=1, content_digest="c"),
+    ])
+    java_results = {"p/Foo.java": _java_result("p/Foo.java", "package p;\nclass Foo {\n}\n")}
+    records = ma.build_modules(discovery, java_results)
+    observed = {c for r in records for c in r.classification}
+    assert observed == {"production", "test", "infrastructure"}
+
+
 def test_a_java_file_with_one_top_level_type_produces_a_component_and_a_file_unit():
     source = "package p;\nclass Foo {\n}\n"
     discovery = _discovery([

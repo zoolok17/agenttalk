@@ -784,7 +784,26 @@ def build_modules(
             language=_language_for_path(relative_path),
             paths=[relative_path],
             source_digests={relative_path: file_entry.content_digest},
-            classification=[java_result.units[0].classification],
+            # FIX ROUND 44 (thirty-eighth cold read, F3 MAJOR, wrong-
+            # data, .cr38-mixcls): used to be `java_result.units[0].
+            # classification` alone - the file's own classification
+            # decided by DECLARATION ORDER, not by what the file
+            # actually contains. Two files with the identical type set
+            # (one JUnit TestCase + one production helper) published
+            # OPPOSITE classifications depending purely on which type a
+            # developer happened to write first - readiness then
+            # asserted contradictory-sounding verdicts
+            # (`no_test_evidence_found` on a file CONTAINING a test
+            # type, `unit_is_itself_a_test` on a file containing
+            # production code) for what should be the SAME honest fact
+            # about a mixed file. The design already declares
+            # classification a SET (this field is a list, never a bare
+            # string) - the honest value for a mixed file is the UNION
+            # of every contained unit's own classification, sorted for
+            # deterministic ordering (this producer's own closed,
+            # two-value vocabulary has no meaningful precedence between
+            # "production" and "test" to order by instead).
+            classification=sorted({u.classification for u in java_result.units}),
             container_unit_id=None,  # a file is the top of its own containment chain
             producers=[_producer(
                 name="discovery", version=1, source_digest=file_entry.content_digest,
