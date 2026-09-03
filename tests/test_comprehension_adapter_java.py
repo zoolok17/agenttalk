@@ -1205,6 +1205,34 @@ def test_an_unclosed_block_comment_is_detected_as_malformed_not_silently_truncat
     assert any(p.reason_code == "parse_failed" for p in result.problems)
 
 
+def test_a_file_truncated_mid_class_with_no_unterminated_literal_still_reports_parse_failed():
+    """M (cold-read PR-B fix round 47 completeness, "JUDGE this one
+    seriously - borders wrong-data"): a file chopped off mid-declaration
+    - no unterminated string/comment at all, every token before the cut
+    is perfectly well-formed - never set `malformed` (a purely LEXICAL
+    detector), so it published FileController as an ordinary unit with
+    NO signal that its own body never actually closed. _extract_types's
+    own `stack` is left non-empty at loop end for exactly this case -
+    now surfaced as a parse_failed problem naming the truncated type,
+    the same class of fact the unterminated-literal/comment cases above
+    already surface, just at brace-structure granularity."""
+    src = (
+        "package p;\n"
+        "class PathUtil {\n"
+        "}\n"
+        "class FileController {\n"
+        '  @GetMapping("/one") void a() {}\n'
+    )
+    result = java.parse_java_source("Truncated.java", src)
+    assert {u.qualified_name for u in result.units} == {"p.PathUtil", "p.FileController"}
+    truncation_problems = [
+        p for p in result.problems
+        if p.reason_code == "parse_failed" and p.qualified_name == "p.FileController"
+    ]
+    assert len(truncation_problems) == 1
+    assert "closing brace was never found" in truncation_problems[0].detail
+
+
 def test_sixteen_valid_literal_and_comment_shapes_are_never_flagged_malformed():
     """FIX ROUND 15 (F5 regression battery): the reviewer explicitly
     verified 16 valid literal/comment shapes all sanitize correctly -

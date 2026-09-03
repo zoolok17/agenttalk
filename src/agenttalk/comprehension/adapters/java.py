@@ -1400,8 +1400,9 @@ def _find_type_header_brace(sanitized: str, clause_start: int) -> int | None:
 
 def _extract_types(
     sanitized: str, package: str | None,
-) -> list[tuple[str, str, str, int, str | None, str | None, int, bool]]:
-    """Returns ``(qualified_name, simple_name, container_prefix, brace_pos,
+) -> tuple[list[tuple[str, str, str, int, str | None, str | None, int, bool]], list[str]]:
+    """Returns ``(types, unclosed_qualified_names)``. ``types`` is
+    ``(qualified_name, simple_name, container_prefix, brace_pos,
     extends, implements_raw, end_brace_pos)`` for every declared type,
     correctly nested by tracking brace depth against each type header's own
     opening brace. ``end_brace_pos`` (the position of the type's OWN closing
@@ -1409,6 +1410,21 @@ def _extract_types(
     later match (a call, an annotation, a main method) to the innermost
     declared type whose body actually contains it, rather than to whichever
     type happened to be declared first in the file.
+
+    M (cold-read PR-B fix round 47 completeness, "JUDGE this one
+    seriously - borders wrong-data"): a genuinely truncated file (EOF
+    reached mid-declaration, no unterminated string/comment - a
+    DIFFERENT truncation than ``_strip_comments_and_strings``'s own
+    ``malformed`` return already detects) left ``stack`` non-empty at
+    loop end with NOTHING checking it - that type still published as an
+    ordinary unit, and its collapsed containment span (never widened
+    past its own header, since its closing brace was never found to
+    correct it) silently misattributed real content in the cut-off tail
+    to a SIBLING type instead of flagging it unreliable. ``stack``'s own
+    remaining entries at loop end are exactly the types whose closing
+    brace was never found - returned by qualified name so the caller can
+    raise one named problem per truncated type, the same class of fact
+    ``malformed`` already surfaces for the lexical case.
 
     BLOCKER 1a (fifth cold read, fix round 8): each candidate header is
     now located in two stages - _TYPE_NAME_ANCHOR_RE anchors only the
@@ -1553,7 +1569,8 @@ def _extract_types(
             if stack and stack[-1][0] == depth:
                 _, _, result_index = stack.pop()
                 results[result_index][6] = i
-    return [tuple(result) for result in results]
+    unclosed_qualified_names = [qualified for _depth, qualified, _result_index in stack]
+    return [tuple(result) for result in results], unclosed_qualified_names
 
 
 def _enclosing_qualified_name(
@@ -2706,7 +2723,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         for prefix in _TEST_FRAMEWORK_IMPORT_PREFIXES
     )
 
-    types = _extract_types(sanitized, package)
+    types, _unclosed_type_qualified_names = _extract_types(sanitized, package)
     local_simple_names = {simple for _, simple, *_ in types}
     primary_qualified = types[0][0] if types else (package or relative_path)
     # FIX ROUND 45 (thirty-ninth cold read, F2 MAJOR): moved up from
@@ -4052,6 +4069,40 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                    "parsed and is not represented in this file's units/edges/entry "
                    "points"),
         ))
+
+    # M (round 47 completeness, "JUDGE this one seriously - borders
+    # wrong-data"): a truncated file whose braces never balance by EOF -
+    # distinct from `malformed` above (no unterminated string/comment
+    # here, just a file chopped off mid-declaration) - published the
+    # truncated type as an ordinary unit with no signal at all; real
+    # content in the cut-off tail silently misattributes to a sibling
+    # type instead of being flagged unreliable. One problem per
+    # truncated type, the same parse_failed reason_code/severity/routing
+    # `malformed` already uses above - this is the identical "reached
+    # EOF still inside something unterminated" fact, at brace-structure
+    # granularity instead of lexical.
+    #
+    # Gated on `not malformed`: an unterminated string/comment already
+    # blanks everything from the truncation point to EOF (`malformed`'s
+    # own case, above) - any type that happened to be OPEN at that point
+    # necessarily ends up in `_unclosed_type_qualified_names` too, purely
+    # as a downstream consequence of the SAME root cause `malformed`
+    # already reported once. Without this gate, cr11-fx10's own fixture
+    # (an unterminated char literal inside PathUtil's body) publishes a
+    # second, differently-worded parse_failed problem for PathUtil that
+    # adds no new information over the first - two symptoms of one
+    # cause, not two causes.
+    if not malformed:
+        for _unclosed_qualified in _unclosed_type_qualified_names:
+            problems.append(JavaAdapterProblem(
+                reason_code="parse_failed",
+                detail=bounded_detail(
+                    f"{_unclosed_qualified}'s own closing brace was never found before end of "
+                    "file - this type's body is truncated; content after the point of "
+                    "truncation is not reliably represented in this file's units/edges/entry "
+                    "points"),
+                qualified_name=_unclosed_qualified,
+            ))
 
     if not units:
         # BLOCKER (sixth cold read, fix round 9): route/entry-point
