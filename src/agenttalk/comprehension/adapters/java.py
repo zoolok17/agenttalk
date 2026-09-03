@@ -6377,10 +6377,22 @@ def parse_web_xml(
     for servlet_name in sorted(undeclared_servlet_names):
         problems.append(JavaAdapterProblem(
             reason_code="undeclared_descriptor_name",
-            detail=bounded_detail(f"<servlet-mapping> names <servlet-name>{servlet_name}</servlet-name>, "
-                   "which no <servlet> element in this file declares at all - its mapped "
-                   "route falls back to the synthetic per-mapping owner rather than a "
-                   "real class"),
+            # M (cold-read PR-B fix round 47 completeness): this route is
+            # published against the synthetic file owner - honest about
+            # WHO this producer attributes it to, but silent on the
+            # separate, real-world fact that a genuine server cannot
+            # register a <servlet-mapping> whose own <servlet-name>
+            # resolves to nothing - the SAME "a real server cannot..."
+            # fact this file's own duplicate-url-pattern check (below)
+            # already names for its sibling shape. Added (compactly - the
+            # distinguishing datum, servlet_name, must stay within
+            # bounded_detail's own MAX_PROBLEM_DETAIL_LENGTH per round
+            # 41's own rule) so a reader does not mistake "published
+            # here" for "will actually route at runtime."
+            detail=bounded_detail(
+                f"<servlet-mapping> names <servlet-name>{servlet_name}</servlet-name> with no "
+                "matching <servlet> - falls back to a synthetic owner; a real server cannot "
+                "register it, so it likely never dispatches"),
             qualified_name=f"{relative_path}#{servlet_name}",
         ))
     # FIX ROUND 31 (twenty-seventh cold read, N4 JUDGE, taken): one
@@ -6679,10 +6691,13 @@ def parse_web_xml(
     for filter_name in sorted(undeclared_filter_names):
         problems.append(JavaAdapterProblem(
             reason_code="undeclared_descriptor_name",
-            detail=bounded_detail(f"<filter-mapping> names <filter-name>{filter_name}</filter-name>, "
-                   "which no <filter> element in this file declares at all - its mapped "
-                   "route falls back to the synthetic per-mapping owner rather than a "
-                   "real class"),
+            # M (cold-read PR-B fix round 47 completeness): the filter
+            # twin of the servlet-mapping clause above - same real-world
+            # fact, same reason for adding it.
+            detail=bounded_detail(
+                f"<filter-mapping> names <filter-name>{filter_name}</filter-name> with no "
+                "matching <filter> - falls back to a synthetic owner; a real server cannot "
+                "register it, so it likely never dispatches"),
             qualified_name=f"{relative_path}#{filter_name}",
         ))
     for block_match in _LISTENER_BLOCK_RE.finditer(structural):

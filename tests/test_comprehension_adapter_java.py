@@ -3773,6 +3773,11 @@ def test_web_xml_url_pattern_cdata_and_entity_decoding():
         "WEB-INF/web.xml#s4", "WEB-INF/web.xml#s5",
         "WEB-INF/web.xml#sxml", "WEB-INF/web.xml#snl",
     }
+    # M (cold-read PR-B fix round 47 completeness): the detail must also
+    # say a real server cannot register this mapping at all - never
+    # just "published against the synthetic owner" with no hint that it
+    # is unlikely to ever actually dispatch.
+    assert all("real server cannot register it" in p.detail for p in problems)
 
 
 def test_web_xml_url_pattern_with_an_undefined_entity_is_unrecoverable():
