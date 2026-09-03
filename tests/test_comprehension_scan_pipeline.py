@@ -6416,7 +6416,29 @@ def test_scan_json_degraded_by_combines_multiple_independent_reasons(
     sources in the SAME run (a case-fold collision, discovery-level, and a
     duplicate qualified name, modules-level) must both be named, sorted -
     proving the set aggregates across OR-chain terms rather than only
-    ever reporting the first one found."""
+    ever reporting the first one found.
+
+    FIX ROUND 37b (thirty-first cold read's own reclassification -
+    URGENT, wrong-data, platform divergence): this test's own injected
+    colliding path used to be a SINGLE phantom, "src/main/java/p/
+    APP.JAVA" - never written to disk, but case-folding IDENTICAL to
+    the java_repo fixture's own real "src/main/java/p/App.java".
+    worker.process_paths's own file read (resolved.read_bytes(),
+    worker.py) is not mocked here - only discovery.enumerate_scope is -
+    so on a case-INSENSITIVE filesystem (Windows, this dev host) that
+    read SILENTLY SUCCEEDED, resolving "APP.JAVA" to the real "App.java"
+    bytes; on a case-SENSITIVE one (Linux, the real CI legs) the
+    identical read genuinely FAILS (no file exists with that exact
+    case), recording an EXTRA parse_failed problem the Windows run never
+    saw - divergent published facts (the exact class of bug this whole
+    round's own F2/F4 fixes were closing elsewhere) for the identical
+    test, previously invisible because CI evidence was misread as an
+    unrelated infra stall. Fixed at the fixture: BOTH colliding paths are
+    now purely phantom (neither ever exists on disk, in any case,
+    on any platform), so the read fails identically everywhere,
+    deterministically producing parse_failed on both platforms - the
+    correct, platform-independent expectation is that all THREE reasons
+    are named, not two."""
     import dataclasses
     import json
 
@@ -6433,16 +6455,23 @@ def test_scan_json_degraded_by_combines_multiple_independent_reasons(
 
     def _enumerate_scope(root, comprehension_dir):
         result = real_enumerate_scope(root, comprehension_dir)
-        colliding = discoverymod.EnumeratedFile(
-            relative_path="src/main/java/p/APP.JAVA", byte_count=1, content_digest="deadbeef")
-        return dataclasses.replace(result, files=[*result.files, colliding])
+        # Both phantom - neither is ever written to disk, so their own
+        # case-fold collision is proven at the discovery layer alone,
+        # never accidentally resolved against a real file by the OS's
+        # own case-insensitive path lookup (worker.process_paths's own
+        # file read is not mocked here).
+        first_phantom = discoverymod.EnumeratedFile(
+            relative_path="src/main/java/p/Ghost.java", byte_count=1, content_digest="aaa")
+        second_phantom = discoverymod.EnumeratedFile(
+            relative_path="src/main/java/p/GHOST.JAVA", byte_count=1, content_digest="bbb")
+        return dataclasses.replace(result, files=[*result.files, first_phantom, second_phantom])
 
     monkeypatch.setattr(scan_pipeline.discovery, "enumerate_scope", _enumerate_scope)
 
     outcome = scan_pipeline.run_scan(java_repo)
     scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
     assert outcome.status == "degraded"
-    assert scan_doc["degraded_by"] == ["case_collision", "duplicate_qualified_name"]
+    assert scan_doc["degraded_by"] == ["case_collision", "duplicate_qualified_name", "parse_failed"]
 
 
 def test_run_scan_a_duplicate_qualified_name_publishes_ambiguous_import_and_a_problem(
