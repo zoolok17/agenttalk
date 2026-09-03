@@ -2915,6 +2915,25 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     # can tell, after composition, whether ANY route actually came out
     # the other end.
     jax_rs_path_classes: set[str] = set()
+    # NAMED LIMIT (declared, PR-B round 45, C2 - judged, not chased):
+    # `_explicit_methods` here is a class-level `@RequestMapping(method =
+    # RequestMethod.X)` restriction (Spring's own less-common idiom of
+    # scoping every contained handler to one or more HTTP verbs at the
+    # class level) - `_route_annotation_span` already recovers it (the
+    # SAME parse this loop's own method-level twin, below, already uses
+    # to fold an explicit `method =` into a route's identity), but it is
+    # discarded here, never composed down onto a contained method-level
+    # route that carries no `method =` attribute of its own. Judged
+    # DECLARE, symmetric to `class_route_prefix_unrecoverable`'s own
+    # base-path declaration above: composing it is NOT the "genuinely
+    # cheap" case that would flip this to a fix - Spring's own precise
+    # inheritance semantics for a class-level `method` restriction
+    # composing against an UNRESTRICTED method-level mapping are exactly
+    # the kind of framework-behavior uncertainty this producer's own
+    # "under-claim over guess" bar exists to stay out of; guessing a
+    # composition rule that turns out to disagree with Spring's real
+    # runtime behavior would be a wrong-data bug, strictly worse than
+    # today's honest silence on this one attribute.
     for match in _ROUTE_ANNOTATION_RE.finditer(sanitized):
         _span_end, paths, _explicit_methods = _route_annotation_span(match)
         target_type = _class_level_route_target(match.start(), class_header_associations)

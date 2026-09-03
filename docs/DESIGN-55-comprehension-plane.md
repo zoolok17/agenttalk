@@ -265,12 +265,19 @@ The canonical content digest is the SHA-256 of a specified canonical JSON
 projection. That projection removes `scan_id`, `generated_at`, capture times,
 lock/owner tokens, and any other generation identity; it retains schema
 versions, source-scope identity, platform identity, adapter/configuration
-versions, record IDs, record content, problem codes, and ordering. `scan.json`
-computes its run-level `content_digest` from the ordered tuple of artifact type,
-schema version, record count, and artifact content digest. Comparing this one
-field answers whether two generations are content-equivalent. Manifest and
-exact-byte digests still authenticate the concrete generation and normally
-differ between rescans.
+versions, record IDs, record content, problem codes, and ordering.
+`scan.json` computes its own run-level `content_digest` from the ordered
+tuple of artifact type, schema version, record count, and artifact content
+digest - taken over exactly the FIVE artifacts this slice's own producers
+emit (`modules.json`, `dependencies.json`, `features.json`, `readiness.json`,
+`problems.json`; corrected, PR-B round 45, C1 - the sentence previously read
+as if this covered artifacts generically, an overclaim against this slice's
+own closed producer set). `scan.json` itself is deliberately excluded from
+this tuple - it is the SUMMARY of these five artifacts, not a sixth entry in
+its own digest; a self-referential digest has no fixed point. Comparing this
+one field answers whether two generations are content-equivalent. Manifest
+and exact-byte digests still authenticate the concrete generation and
+normally differ between rescans.
 
 All persisted paths use project-relative POSIX spelling. Absolute paths,
 `..` segments, NULs, URL-like values, and paths resolving outside the project
@@ -569,6 +576,18 @@ association is runtime container wiring). A published route may therefore
 not be the full path actually served. Publishing a guessed prefix would risk
 a confident, wrong route; this stays a named gap rather than either a guess
 or a silent omission.
+
+NAMED LIMIT (declared, PR-B round 45, C2 - judged, not chased): a
+class-level `@RequestMapping`'s own `method = RequestMethod.X` restriction
+(Spring's own less-common idiom of scoping every handler contained in a
+class to one or more HTTP verbs at the class level) is recognized by the
+same parse the method-level `method = ...` attribute already is, but never
+composed down onto a contained method-level route that declares no `method =`
+of its own - symmetric to the base-path limit just above, and judged the
+same way: composing it is not the "genuinely cheap" case that would justify
+a fix, since Spring's own precise inheritance semantics for this composition
+are exactly the framework-behavior uncertainty this producer's own
+under-claim-over-guess bar exists to stay out of.
 
 NAMED LIMIT (declared and CLOSED, PR-B round 44 + micro-round 44b - THE
 REGISTRABILITY MATRIX): a class-level route annotation used to publish

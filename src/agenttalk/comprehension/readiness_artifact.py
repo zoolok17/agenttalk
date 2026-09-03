@@ -599,6 +599,24 @@ def _check_dependencies_resolved(
     # a real estate migration reader could easily read the stronger,
     # unintended claim into a bare `satisfied`.
     #
+    # FIX ROUND 45 (thirty-ninth cold read, C3, doc-only, no behavior
+    # change): the identical reconciling caveat round 30's own paragraph
+    # just above states for a DI-wired `invoke` collaborator applies
+    # symmetrically to `test`, round 12b's own DELIBERATE exclusion
+    # (`_DEPENDENCY_RESOLUTION_RELATIONS`'s own docstring: "test... [is]
+    # covered by [its] own dedicated check... and never belong[s] here
+    # either" - test_evidence_located is that dedicated check). A unit
+    # with a same-unit unresolved/ambiguous TEST-relation edge (its own
+    # name-derived pairing guess, F4, could not confidently resolve)
+    # still reports `dependencies_resolved=satisfied` whenever its
+    # import/inherit/build edges are otherwise clean - not a
+    # contradiction: this check's own "satisfied" has never claimed
+    # anything about test-pairing evidence, only about the THREE
+    # relations it was always scoped to; test_evidence_located is the
+    # signal a reader consults for the test-pairing question instead,
+    # exactly the same "different checks answer different questions"
+    # reconciliation this producer already applies to the DI-wiring case.
+    #
     # FIX ROUND 16 (twelfth cold read, M2 MAJOR, wrong-data): mirrors
     # _check_source_understood's own "no positive claim without positive
     # evidence" discipline - a file the adapter never successfully read
