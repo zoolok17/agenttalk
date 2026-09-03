@@ -1976,6 +1976,34 @@ class Outer {
     assert routes[0].from_qualified_name == "p.Outer.Inner"
 
 
+def test_spring_route_on_a_nested_record_without_the_static_keyword_is_unaffected():
+    """FIX ROUND 46 (F1 MAJOR, regression lock): a nested `record` is
+    IMPLICITLY static by JLS rule - nobody writes the redundant
+    `static` keyword on one - so `container_prefix` non-empty AND no
+    literal `static` modifier must NOT be misread as a non-static
+    member here; a record is concrete and fully instantiable
+    regardless of nesting, unaffected by declaration context at all.
+    `_class_registrability`'s own `is_static` counts an interface/enum/
+    record/annotation-type declaration as static unconditionally,
+    exactly for this reason."""
+    src = """
+package p;
+
+class Outer {
+    @RestController
+    record Inner(String id) {
+        @GetMapping("/n-record-ok")
+        void handle() {}
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].from_qualified_name == "p.Outer.Inner"
+
+
 def test_spring_route_on_a_method_local_class_is_never_instantiated():
     """FIX ROUND 46 (F1 MAJOR, .cr40-local /local-route): a class
     declared INSIDE a method body (a local class) is unnameable/

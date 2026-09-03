@@ -2498,11 +2498,14 @@ def _class_registrability(
     """
     is_interface = False
     is_enum = False
-    if sanitized[header_start:header_start + 1] != "@":
+    is_record = False
+    is_annotation_type = sanitized[header_start:header_start + 1] == "@"
+    if not is_annotation_type:
         keyword_match = _TYPE_NAME_ANCHOR_RE.match(sanitized, header_start)
         if keyword_match is not None:
             is_interface = keyword_match.group(1) == "interface"
             is_enum = keyword_match.group(1) == "enum"
+            is_record = keyword_match.group(1) == "record"
     trivia = sanitized[declaration_start:header_start]
     is_abstract = _ABSTRACT_MODIFIER_RE.search(trivia) is not None
     has_stereotype = _SPRING_STEREOTYPE_ANNOTATION_RE.search(trivia) is not None
@@ -2510,8 +2513,22 @@ def _class_registrability(
     # ``is_abstract`` already searches carries the ``static`` modifier
     # too, when present - the one input this function's own caller needs
     # (alongside ``container_prefix``, which this function has no
-    # visibility into at all) to derive ``is_non_static_member``.
-    is_static = _STATIC_MODIFIER_RE.search(trivia) is not None
+    # visibility into at all) to derive ``is_non_static_member``. An
+    # interface/enum/record/annotation-type declaration is IMPLICITLY
+    # static when nested, by JLS rule, regardless of whether the
+    # literal ``static`` keyword is written (nobody writes it, since it
+    # is redundant) - counted as static here too, or a nested record
+    # (concrete, fully instantiable, unaffected by nesting at all)
+    # would otherwise be misread as a non-static member and wrongly
+    # suppressed. Never actually OBSERVABLE for interface/enum (checked
+    # ahead of is_non_static_member at every call site, so the stronger,
+    # correct claim always wins regardless) - this only matters for
+    # record/annotation-type, which have no dedicated check of their own
+    # to take priority first.
+    is_static = (
+        _STATIC_MODIFIER_RE.search(trivia) is not None
+        or is_interface or is_enum or is_record or is_annotation_type
+    )
     return is_interface, is_abstract, has_stereotype, is_enum, is_static
 
 
