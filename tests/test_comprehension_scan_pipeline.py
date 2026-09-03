@@ -2768,6 +2768,81 @@ def test_run_scan_two_servlets_mapped_to_the_same_url_pattern_publishes_a_proble
         assert signal["stored_status"] == "satisfied"
 
 
+def test_run_scan_two_out_of_scan_servlets_mapped_to_the_same_pattern_get_distinct_ids(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 38 (thirty-second cold read, F1 BLOCKER, wrong-data):
+    the twin of the test above, but with BOTH servlet-classes OUT OF
+    SCAN (never declared anywhere in this run) rather than real, in-scan
+    classes. Each entry point then falls back to the SAME synthetic file
+    owner (`WEB-INF/web.xml`'s own file unit, since neither resolves via
+    `owning_unit_by_qualified_name`) - `entry_point_id` used to hash only
+    `(kind, owning_unit_id, name)`, and both mappings share all three
+    (same `http_route` kind, same file owner, same composed name since
+    they share one url-pattern) even though `features_artifact.
+    build_features`'s own `group_key` already keeps them in two SEPARATE
+    feature groups via each claim's own `qualified_name`. Before this
+    round's own fix (entry_point_id now also hashes `qualified_name`),
+    this published 2 entry-point records sharing 1 distinct id - two
+    features cross-claiming one id, record_count overstating the
+    distinct-record total, `validate` reporting valid:true over a live
+    stable-ID corruption. Mutation-verified: reverting the qualified_name
+    hash input reproduces exactly this (1 distinct id for 2 records)."""
+    import json
+
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name>a</servlet-name>\n"
+        "    <servlet-class>com.acme.web.OutOfScanA</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet>\n"
+        "    <servlet-name>b</servlet-name>\n"
+        "    <servlet-class>com.acme.web.OutOfScanB</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>a</servlet-name>\n"
+        "    <url-pattern>/shared/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>b</servlet-name>\n"
+        "    <url-pattern>/shared/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+
+    features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
+    all_entry_points = features_doc["entry_points"]
+    # java_repo's own fixture also writes a real App.java with a main()
+    # method, publishing an unrelated cli_main entry point alongside the
+    # two http_route mappings under test - filtered out here.
+    entry_points = [ep for ep in all_entry_points if ep["kind"] == "http_route"]
+    assert len(entry_points) == 2
+    ids = {ep["entry_point_id"] for ep in entry_points}
+    assert len(ids) == 2, "the two out-of-scan mappings must not collide on entry_point_id"
+
+    all_features = features_doc["features"]
+    route_feature_ids = ids
+    features = [f for f in all_features if set(f["entry_point_ids"]) & route_feature_ids]
+    assert len(features) == 2
+    claimed_ids = {ep_id for f in features for ep_id in f["entry_point_ids"]}
+    assert claimed_ids == ids, "each feature must claim its own entry_point_id, never share one"
+    for ep in entry_points:
+        assert ep.get("conflict_id") is None
+
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    features_summary = next(a for a in scan_doc["artifacts"] if a["name"] == "features.json")
+    assert features_summary["record_count"] == len(all_entry_points) + len(all_features)
+
+    validate_result = scan_pipeline.validate_run(java_repo, run_id=outcome.scan_id)
+    assert validate_result["valid"] is True
+
+
 def test_run_scan_two_servlets_mapped_to_different_url_patterns_publishes_no_problem(
     java_repo: Path,
 ) -> None:
@@ -3763,6 +3838,39 @@ def test_run_scan_refuses_to_publish_a_problem_id_collision(
         scan_pipeline, "_problem_id_collisions", lambda problems: ["deadbeef"])
 
     with pytest.raises(scan_pipeline.ComprehensionError, match="problem_id"):
+        scan_pipeline.run_scan(java_repo)
+
+
+@pytest.mark.parametrize("id_attr", [
+    "unit_id", "edge_id", "entry_point_id", "feature_id", "signal_id",
+])
+def test_run_scan_refuses_to_publish_an_id_family_collision(
+    java_repo: Path, monkeypatch, id_attr: str,
+) -> None:
+    """FIX ROUND 38 (thirty-second cold read, F1 BLOCKER, part (c)): the
+    problem_id-collision backstop above (round 36's F2), generalized -
+    ``entry_point_id``'s own round-38 F1 blocker (two genuinely distinct
+    entry-point records that fell back to the same synthetic file owner
+    shared an identical id, before this round's own fix widened its hash
+    input) proved this "byte-identical or refuse" invariant was never
+    swept for any family but ``problems.json``. Every OTHER family
+    (``unit_id``, ``edge_id``, ``feature_id``, ``signal_id``) must be
+    refused the identical way. Forces the condition one family at a time
+    by monkeypatching the shared generic detector to report a collision
+    only for the family under test, the real detector otherwise -
+    proving each family's own publish-time call site is actually wired,
+    not merely that the shared function exists."""
+    real_id_family_collisions = scan_pipeline._id_family_collisions
+    target = id_attr
+
+    def _fake(records, *, id_attr):
+        if id_attr == target:
+            return ["deadbeef"]
+        return real_id_family_collisions(records, id_attr=id_attr)
+
+    monkeypatch.setattr(scan_pipeline, "_id_family_collisions", _fake)
+
+    with pytest.raises(scan_pipeline.ComprehensionError, match=f"{id_attr}\\(s\\)"):
         scan_pipeline.run_scan(java_repo)
 
 

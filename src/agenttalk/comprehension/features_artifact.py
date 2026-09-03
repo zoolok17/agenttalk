@@ -261,8 +261,16 @@ def build_features(
         # _coalesce_by_edge_id already applies to edges (M6, round 3).
         entry_points_by_id: dict[str, EntryPointRecord] = {}
         for path, claim, _owner in claims:
+            # FIX ROUND 38 (F1 BLOCKER): `claim.qualified_name` is the
+            # exact distinguishing datum `group_key` above already uses
+            # to keep two file-fallback-owned claims apart - threaded
+            # into the id itself now too, closing the by-construction
+            # collision reachable across two DIFFERENT groups that
+            # nonetheless share kind/owning_unit_id/name (see digests.
+            # entry_point_id's own docstring).
             entry_point_id = digests.entry_point_id(
                 kind=claim.kind, owning_unit_id=owning_unit_id, name=claim.name,
+                qualified_name=claim.qualified_name,
             )
             producer = _producer(file_digests.get(path), basis=claim.evidence_class)
             existing = entry_points_by_id.get(entry_point_id)

@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import posixpath
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -341,56 +341,105 @@ def _problem_record(
     return record
 
 
-def _canonical_problem_record(problem: dict[str, Any]) -> tuple[tuple[str, Any], ...]:
-    """A hashable, order-independent form of one problem record, used
-    only to test byte-equivalence between two records that happen to
-    share a ``problem_id`` - never published itself."""
-    return tuple(sorted(problem.items()))
+def _canonical_record(record: Any) -> bytes:
+    """A hashable, order-independent form of one record - a dataclass
+    instance (every id family this producer publishes except
+    ``problems.json``, both in memory at publish time and after its own
+    ``*_record_from_json`` conversion at validate time) or a plain dict
+    (``problems.json``'s own shape, never converted to a dataclass) -
+    used only to test byte-equivalence between two records that happen
+    to share an id. Never published itself. Reuses ``digests.
+    canonical_json_bytes`` (the same canonical-JSON recipe every digest
+    in this package already hashes against) rather than a bare sorted-
+    items tuple, since a record's own fields can nest lists/dicts
+    (``paths``, ``producers``, ``evidence``, ...) that a plain tuple
+    cannot hash.
+
+    FIX ROUND 38 (thirty-second cold read, F1 BLOCKER, part (c)):
+    generalizes what was ``_canonical_problem_record`` (round 36's F2,
+    ``problems.json``-only) so the SAME byte-identical check applies to
+    every family."""
+    payload = asdict(record) if is_dataclass(record) else record
+    return digests.canonical_json_bytes(payload)
+
+
+def _id_family_collisions(records: list[Any], *, id_attr: str) -> list[str]:
+    """FIX ROUND 38 (thirty-second cold read, F1 BLOCKER, parts (b)/(c)):
+    ``problem_id``'s own round-36 F2 stable-ID-corruption detector,
+    generalized to every id family this producer publishes
+    (``entry_point_id``, ``edge_id``, ``feature_id``, ``unit_id``,
+    ``signal_id``) - by construction, two records sharing an id SHOULD
+    always be byte-identical (the same hash input hashes the same way
+    every time); a corrupted id whose two occurrences differ in every
+    OTHER field is a genuine stable-ID corruption, not merely a
+    duplicate. Round 38's own F1 blocker (two entry-point records that
+    fell back to the same synthetic file owner shared an identical
+    ``entry_point_id``, before this round's own fix widened its hash
+    input) proved this invariant was never actually swept for any
+    family but ``problems.json`` - closed here as the class, not the
+    instance: every family gets the identical check now, sharing this
+    one function rather than five near-duplicates. Returns the sorted,
+    deduplicated list of colliding ids (empty when every id's own
+    repeated occurrences are byte-identical) - shared by ``run_scan``
+    (publish time, refuses) and :func:`validate_run` (read-time, reports
+    invalid), the same "one predicate, two call sites" discipline
+    ``_dangling_reference_categories`` already established."""
+    canonical_by_id: dict[str, bytes] = {}
+    colliding: list[str] = []
+    for r in records:
+        rid = r[id_attr] if isinstance(r, dict) else getattr(r, id_attr)
+        canonical = _canonical_record(r)
+        if rid not in canonical_by_id:
+            canonical_by_id[rid] = canonical
+        elif canonical != canonical_by_id[rid] and rid not in colliding:
+            colliding.append(rid)
+    return sorted(colliding)
+
+
+def _coalesce_byte_identical(records: list[Any], *, id_attr: str) -> list[Any]:
+    """FIX ROUND 38 (F1 BLOCKER, part (c)): the canonical merge rule this
+    artifact family already follows elsewhere (byte-equivalent claims
+    coalesce into one published record, never counted twice), generalized
+    from ``_coalesce_byte_identical_problems`` (round 36's F2,
+    ``problems.json``-only) to every id family - applied here at publish
+    time, AFTER :func:`_id_family_collisions` has already confirmed every
+    repeated id's own occurrences in ``records`` are genuinely byte-
+    identical (a real collision refuses publication instead; this
+    function is never reached with one present for that family).
+    Order-preserving: the first occurrence of each byte-identical group
+    is kept. ``id_attr`` is unused by the coalescing itself (which keys
+    on the full canonical record, matching every occurrence exactly) but
+    kept as a parameter so every call site stays self-documenting about
+    which family it is coalescing."""
+    del id_attr
+    seen: set[bytes] = set()
+    coalesced: list[Any] = []
+    for r in records:
+        canonical = _canonical_record(r)
+        if canonical not in seen:
+            seen.add(canonical)
+            coalesced.append(r)
+    return coalesced
 
 
 def _problem_id_collisions(problems: list[dict[str, Any]]) -> list[str]:
     """FIX ROUND 36 (thirtieth cold read, F2 MAJOR, part (c)): ``problem_
-    id`` is a stable hash of ``(reason_code, path, detail)`` - by
-    construction, two records sharing an id SHOULD always be byte-
-    identical (the same triple hashes the same way every time). A
-    per-trigger emitter that forgets a distinguishing datum (round 36's
-    own F1/F2 reactor and coordinate shapes) can mint two records that
-    share an id while actually differing in every OTHER field - a
-    genuine stable-ID corruption, not merely a duplicate. Returns the
-    sorted, deduplicated list of colliding ids (empty when every id's
-    own repeated occurrences are byte-identical) - shared by ``run_scan``
-    (publish time, refuses) and :func:`validate_run` (read-time, reports
-    invalid), the same "one predicate, two call sites" discipline
-    ``_dangling_reference_categories`` already established."""
-    canonical_by_id: dict[str, tuple[tuple[str, Any], ...]] = {}
-    colliding: list[str] = []
-    for p in problems:
-        pid = p["problem_id"]
-        canonical = _canonical_problem_record(p)
-        if pid not in canonical_by_id:
-            canonical_by_id[pid] = canonical
-        elif canonical != canonical_by_id[pid] and pid not in colliding:
-            colliding.append(pid)
-    return sorted(colliding)
+    id`` is a stable hash of ``(reason_code, path, detail, qualified_
+    name)`` - by construction, two records sharing an id SHOULD always be
+    byte-identical. Delegates to :func:`_id_family_collisions` (round 38's
+    own generalization of this exact check to every id family) - kept as
+    its own named function since ``problems.json``'s records are plain
+    dicts (never converted to a dataclass) and this is the one call site
+    every existing caller and test already names directly."""
+    return _id_family_collisions(problems, id_attr="problem_id")
 
 
 def _coalesce_byte_identical_problems(problems: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """FIX ROUND 36 (F2 MAJOR, part (c)): the canonical merge rule this
-    artifact family already follows elsewhere (byte-equivalent claims
-    coalesce into one published record, never counted twice) - applied
-    here at publish time, AFTER :func:`_problem_id_collisions` has
-    already confirmed every repeated id's own occurrences are genuinely
-    byte-identical (a real collision refuses publication instead; this
-    function is never reached with one present). Order-preserving: the
-    first occurrence of each byte-identical group is kept."""
-    seen: set[tuple[tuple[str, Any], ...]] = set()
-    coalesced: list[dict[str, Any]] = []
-    for p in problems:
-        canonical = _canonical_problem_record(p)
-        if canonical not in seen:
-            seen.add(canonical)
-            coalesced.append(p)
-    return coalesced
+    """FIX ROUND 36 (F2 MAJOR, part (c)): delegates to
+    :func:`_coalesce_byte_identical` (round 38's own generalization) -
+    kept as its own named function for the same reason
+    :func:`_problem_id_collisions` is."""
+    return _coalesce_byte_identical(problems, id_attr="problem_id")
 
 
 #: FIX ROUND 28 (twenty-fourth cold read, F8, declare-not-silently-leave-
@@ -1127,6 +1176,54 @@ def run_scan(
         readiness_signals, readiness_summaries = readiness_artifact.build_readiness(
             modules, dependencies, features, entry_points,
             externality_poisoned=externality_poisoned)
+
+        # FIX ROUND 38 (thirty-second cold read, F1 BLOCKER, parts (b)/
+        # (c)): the SAME stable-ID-corruption sweep problems.json already
+        # gets (below, at its own construction site) run here too, for
+        # every OTHER id family - unit_id, edge_id, feature_id, and
+        # signal_id are all "safe by construction" on inspection (their
+        # own hash input already includes whatever datum keeps two
+        # genuinely different records from colliding), enumerated here so
+        # that conclusion is checked, not merely asserted: unit_id's own
+        # `paths` component already distinguishes any two components at
+        # different locations; edge_id's records are already coalesced
+        # by `_coalesce_by_edge_id` before reaching this point, so no
+        # colliding-but-different pair can survive to here; feature_id
+        # already hashes `unit_ids` (the owning file/component), the same
+        # datum that keeps two file-fallback features apart upstream;
+        # signal_id already hashes the full `unit_id`, which is itself
+        # already collision-safe. entry_point_id was the one family that
+        # was NOT safe (this round's own F1 blocker, fixed above at
+        # digests.entry_point_id/features_artifact.build_features) - this
+        # sweep is the backstop that would have caught it, and now covers
+        # every family so a future emitter bug in any of them is refused
+        # at its own source too, never silently published.
+        _id_family_collisions_found = [
+            (id_attr, label, ids) for id_attr, label, ids in (
+                ("unit_id", "module(s)", _id_family_collisions(modules, id_attr="unit_id")),
+                ("edge_id", "dependency edge(s)",
+                 _id_family_collisions(dependencies, id_attr="edge_id")),
+                ("entry_point_id", "entry point(s)",
+                 _id_family_collisions(entry_points, id_attr="entry_point_id")),
+                ("feature_id", "feature(s)", _id_family_collisions(features, id_attr="feature_id")),
+                ("signal_id", "readiness signal(s)",
+                 _id_family_collisions(readiness_signals, id_attr="signal_id")),
+            ) if ids
+        ]
+        if _id_family_collisions_found:
+            _id_family_detail = "; ".join(
+                f"{len(ids)} {id_attr}(s) shared by {label} with different content"
+                for id_attr, label, ids in _id_family_collisions_found
+            )
+            raise ComprehensionError(
+                f"refusing to publish: {_id_family_detail} "
+                "(a stable-ID corruption, never silently published)"
+            )
+        modules = _coalesce_byte_identical(modules, id_attr="unit_id")
+        dependencies = _coalesce_byte_identical(dependencies, id_attr="edge_id")
+        entry_points = _coalesce_byte_identical(entry_points, id_attr="entry_point_id")
+        features = _coalesce_byte_identical(features, id_attr="feature_id")
+        readiness_signals = _coalesce_byte_identical(readiness_signals, id_attr="signal_id")
 
         # FIX ROUND 29 (twenty-fifth cold read, F2 MAJOR, wrong-data):
         # design step 8 ("Normalize records, resolve only evidenced
@@ -2596,19 +2693,44 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
     # or corrupted by some other path, is still caught by `validate`
     # rather than silently reporting valid:true.
     _problem_id_collision_ids = _problem_id_collisions(records["problems"] if records else [])
+    # FIX ROUND 38 (thirty-second cold read, F1 BLOCKER, parts (b)/(c)):
+    # the SAME sweep, generalized to every OTHER id family - see the
+    # matching publish-time block in `run_scan` for why unit_id/edge_id/
+    # feature_id/signal_id are "safe by construction" and entry_point_id
+    # was not, before this round's own fix.
+    _id_family_collision_ids_found = [
+        (id_attr, label, ids) for id_attr, label, ids in (
+            ("unit_id", "module(s)",
+             _id_family_collisions(records["modules"] if records else [], id_attr="unit_id")),
+            ("edge_id", "dependency edge(s)", _id_family_collisions(
+                records["dependencies"] if records else [], id_attr="edge_id")),
+            ("entry_point_id", "entry point(s)", _id_family_collisions(
+                records["entry_points"] if records else [], id_attr="entry_point_id")),
+            ("feature_id", "feature(s)", _id_family_collisions(
+                records["features"] if records else [], id_attr="feature_id")),
+            ("signal_id", "readiness signal(s)", _id_family_collisions(
+                records["readiness_signals"] if records else [], id_attr="signal_id")),
+        ) if ids
+    ]
     dangling_detail = _dangling_reference_detail(_dangling_categories)
     invalid = (
         any(ids for _, ids in _dangling_categories)
         or bool(_path_violations)
         or bool(_problem_id_collision_ids)
+        or bool(_id_family_collision_ids_found)
     )
     _problem_id_collision_detail = (
         f"{len(_problem_id_collision_ids)} problem_id(s) shared by non-identical records"
         if _problem_id_collision_ids else None
     )
+    _id_family_collision_detail = "; ".join(
+        f"{len(ids)} {id_attr}(s) shared by {label} with different content"
+        for id_attr, label, ids in _id_family_collision_ids_found
+    ) or None
     invalid_detail = " and ".join(
         part for part in (
             dangling_detail, "; ".join(_path_violations) or None, _problem_id_collision_detail,
+            _id_family_collision_detail,
         ) if part
     )
     return {

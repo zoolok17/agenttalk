@@ -162,10 +162,32 @@ def edge_id(*, from_unit_id: str, relation: str, target: str, phase: str) -> str
     )
 
 
-def entry_point_id(*, kind: str, owning_unit_id: str, name: str) -> str:
+def entry_point_id(
+    *, kind: str, owning_unit_id: str, name: str, qualified_name: str | None = None,
+) -> str:
+    """FIX ROUND 38 (thirty-second cold read, F1 BLOCKER, wrong-data):
+    ``qualified_name`` was NOT a hash input - two declarations whose
+    classes are OUT OF SCAN both fall back to the SAME synthetic file
+    owner (``features_artifact.build_features``'s own file-fallback
+    path), so when they also share ``kind``/``name`` (e.g. two
+    ``<servlet-mapping>``s naming the same ``<url-pattern>``, each
+    backed by a different out-of-scan class) their ids collided BY
+    CONSTRUCTION even though the records genuinely differ - two entry-
+    point records, one distinct id, two features cross-claiming it.
+    ``build_features`` already computes and uses this exact
+    distinguishing datum (the claim's own declared ``qualified_name``)
+    to keep the two under SEPARATE feature groups (``group_key``) - it
+    was simply never carried into the id itself, the identical gap
+    ``problem_id`` had before round 37's own F1 fix, now closed the same
+    way: ``None`` hashes as the empty string (see ``problem_id``'s own
+    docstring for why ``None``/``""`` are deliberately equivalent),
+    distinct from any real qualified name."""
     return _domain_separated_id(
         _ENTRY_POINT_ID_DOMAIN,
-        {"kind": kind, "owning_unit_id": owning_unit_id, "name": name},
+        {
+            "kind": kind, "owning_unit_id": owning_unit_id, "name": name,
+            "qualified_name": qualified_name or "",
+        },
     )
 
 
