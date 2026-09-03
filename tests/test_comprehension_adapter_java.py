@@ -4734,6 +4734,79 @@ def test_split_xml_comments_and_cdata_an_unterminated_comment_blanks_to_eof():
     assert len(sanitized) == len(text)
 
 
+# ------------------------------- fix round 38 F2 (a comment interior to a leaf value corrupts its own decode)
+
+def test_splice_comment_spans_removes_a_comment_and_leaves_comment_free_text_untouched():
+    """FIX ROUND 38 (thirty-second cold read, F2 BLOCKER, wrong-data):
+    the new splice primitive itself - a comment interior to a string is
+    removed (never blanked, unlike _split_xml_comments_and_cdata's own
+    structural-scan blanking), concatenating the text around it exactly
+    the way an XML text node does; comment-free text is returned
+    unchanged (the common, overwhelming case, no marker to splice)."""
+    assert java._splice_comment_spans("mod<!--internal build tag-->b") == "modb"
+    assert java._splice_comment_spans("/a<!--x-->b") == "/ab"
+    assert java._splice_comment_spans("ordinary text, no comment") == "ordinary text, no comment"
+    # A comment-shaped "<!--" living inside this SAME value's own CDATA
+    # content is not a comment - left alone, CDATA markers intact for
+    # _decode_xml_text's own subsequent CDATA unwrap.
+    assert (
+        java._splice_comment_spans("<![CDATA[see <!-- the readme]]>")
+        == "<![CDATA[see <!-- the readme]]>"
+    )
+
+
+def test_web_xml_url_pattern_with_an_interior_comment_splices_it_out():
+    """FIX ROUND 38 (thirty-second cold read, F2 BLOCKER, .cr32-xmlleaf,
+    wrong-data): a comment interior to a <url-pattern>'s own value
+    (/a<!--x-->b) used to publish the entry point's own name as literal
+    blanked whitespace ("/a        b") instead of the spec-correct,
+    concatenated value ("/ab") a real container would actually serve -
+    the boundary already refused the sibling CDATA/entity-unrecoverable
+    shapes; a plain interior comment fell through uncaught. Comment
+    BEFORE/AFTER the live value (not interior to it) is unaffected,
+    already covered by the round-4/6 annotation-side controls and the
+    round-26 CDATA-vs-comment ordering controls above."""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
+        "WEB-INF/web.xml",
+        "<web-app>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>a</servlet-name>\n"
+        "    <url-pattern>/a<!--internal routing note-->b</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+    )
+    assert [e.name for e in entry_points] == ["/ab"]
+    assert not any(p.reason_code == "route_value_unrecoverable" for p in problems)
+
+
+def test_pom_dependency_coordinate_with_an_interior_comment_splices_it_out():
+    """FIX ROUND 38 (thirty-second cold read, F2 BLOCKER, .cr32-xmlleaf,
+    wrong-data): the pom twin - a comment interior to a <dependency>'s
+    own <artifactId> (cmt<!--x-->lib) used to publish the edge's own
+    target coordinate as literal blanked whitespace ("org.cmt:cmt
+    lib"), a string that could never resolve against any real registry
+    entry, silently vanishing a real dependency edge (a genuinely
+    undecodable groupId/artifactId already surfaces as a visible
+    problem via pom_dependency_decode_problems - this shape used to
+    reach neither branch: not decoded correctly, not flagged as
+    undecodable either, simply absent)."""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom(
+        "pom.xml",
+        "<project><groupId>com.acme</groupId><artifactId>root</artifactId>"
+        "<dependencies><dependency>"
+        "<groupId>org.cmt</groupId><artifactId>cmt<!--internal build tag-->lib</artifactId>"
+        "</dependency></dependencies></project>",
+    )
+    build_edges = [e for e in edges if e.relation == "build"]
+    assert [e.target for e in build_edges] == ["org.cmt:cmtlib"]
+    assert java.pom_dependency_decode_problems(
+        "<project><groupId>com.acme</groupId><artifactId>root</artifactId>"
+        "<dependencies><dependency>"
+        "<groupId>org.cmt</groupId><artifactId>cmt<!--internal build tag-->lib</artifactId>"
+        "</dependency></dependencies></project>",
+    ) == []
+
+
 # --------------------------------------------------- fix round 26 F2 (block-interior leaf searches unpaired)
 
 def test_web_xml_a_cdata_description_before_servlet_name_does_not_steal_the_class_join():

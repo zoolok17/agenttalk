@@ -16,6 +16,61 @@ def _parse(relative_path: str, source: str) -> java_adapter.JavaFileResult:
     return java_adapter.parse_java_source(relative_path, source)
 
 
+def _parse_pom(relative_path: str, source: str) -> java_adapter.JavaFileResult:
+    units, edges, _profile_scoped_count = java_adapter.parse_maven_pom(relative_path, source)
+    return java_adapter.JavaFileResult(units=units, edges=edges)
+
+
+# --------------------------------------------------------- pom build edge (internal_pom_coordinate_or_external)
+
+def test_pom_dependency_on_a_sibling_whose_own_coordinate_has_an_interior_comment_resolves_internal():
+    """FIX ROUND 38 (thirty-second cold read, F2 BLOCKER, .cr32-pomws,
+    wrong-data): a comment interior to a pom's own <artifactId>
+    (mod<!--x-->b) used to publish that module's own REGISTERED
+    identity as the corrupted, blanked-whitespace spelling ("com.acme:
+    mod        b") - a real sibling pom's <dependency> on the true
+    "com.acme:modb" then found no match in the shared registry and
+    resolved a false, confident EXTERNAL claim instead of internal (the
+    exact over-claim class round 18's own F3 fix, and this producer's
+    whole internal_pom_coordinate_or_external discipline, exist to
+    prevent). Control (below, no comment): the identical dependency
+    already resolves internal - proving this fix closes the comment
+    shape specifically, not a coincidence of this one fixture."""
+    mod_a_pom = (
+        "<project><groupId>com.acme</groupId>"
+        "<artifactId>mod<!--internal build tag-->b</artifactId></project>"
+    )
+    mod_b_pom = (
+        "<project><groupId>com.acme</groupId><artifactId>consumer</artifactId>"
+        "<dependencies><dependency>"
+        "<groupId>com.acme</groupId><artifactId>modb</artifactId>"
+        "</dependency></dependencies></project>"
+    )
+    results = {
+        "modA/pom.xml": _parse_pom("modA/pom.xml", mod_a_pom),
+        "modB/pom.xml": _parse_pom("modB/pom.xml", mod_b_pom),
+    }
+    records = da.build_dependencies(results)
+    build_edge = next(r for r in records if r.relation == "build")
+    assert build_edge.resolution_state == "resolved"
+    assert build_edge.target_external is None
+    assert build_edge.target_unit_id is not None
+
+    # Control: the byte-identical scenario, minus the comment - already
+    # resolved internal before this round; must be unaffected by it.
+    control_results = {
+        "modA/pom.xml": _parse_pom(
+            "modA/pom.xml",
+            "<project><groupId>com.acme</groupId><artifactId>modb</artifactId></project>"),
+        "modB/pom.xml": _parse_pom("modB/pom.xml", mod_b_pom),
+    }
+    control_records = da.build_dependencies(control_results)
+    control_build_edge = next(r for r in control_records if r.relation == "build")
+    assert control_build_edge.resolution_state == "resolved"
+    assert control_build_edge.target_external is None
+    assert control_build_edge.target_unit_id == build_edge.target_unit_id
+
+
 # ----------------------------------------------------------- import (external)
 
 def test_source_digest_is_populated_from_file_digests():

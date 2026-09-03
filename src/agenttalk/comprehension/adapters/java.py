@@ -3318,6 +3318,76 @@ _XML_ENTITY_REF_RE = re.compile(r"&#(\d+);|&#[xX]([0-9A-Fa-f]+);|&([A-Za-z][A-Za
 _XML_PREDEFINED_ENTITIES = {"amp": "&", "lt": "<", "gt": ">", "quot": '"', "apos": "'"}
 
 
+def _splice_comment_spans(raw: str) -> str:
+    """FIX ROUND 38 (thirty-second cold read, F2 BLOCKER, wrong-data):
+    a leaf value's own boundary is found against ``structural`` (which
+    blanks a comment's own span to spaces, so a comment does not break a
+    ``[^<]+?``-style leaf body the way a real nested tag would); the
+    VALUE itself is then recovered from ``sanitized`` at that same
+    offset - which ALSO blanks the comment, offset-preserving, for every
+    STRUCTURAL scan that still needs it. A comment span living INSIDE a
+    leaf's own bounded raw text therefore published as literal blanked
+    whitespace (``mod<!--c-->b`` -> ``"mod             b"``) rather than
+    the spec-correct value: XML text nodes concatenate around a comment
+    (``mod<!--c-->b`` IS ``modb`` to Maven, ``/a<!--x-->b`` IS ``/ab`` to
+    a container), the same way this producer already concatenates around
+    every OTHER construct it strips.
+
+    Splices (never blanks) every comment span out of ``raw`` - the true,
+    unblanked original text at this exact leaf's own offset, never
+    ``sanitized`` - reusing ``_split_xml_comments_and_cdata``'s own
+    document-order comment/CDATA recognition so a comment-shaped
+    ``<!--`` living inside this SAME leaf's own CDATA content is
+    correctly left alone (CDATA content is literal; a comment marker
+    inside it is not a comment), never misread as a second comment. A
+    leaf with no comment at all (the overwhelming common case) returns
+    ``raw`` unchanged - no marker is found, nothing is spliced."""
+    parts: list[str] = []
+    i = 0
+    n = len(raw)
+    while i < n:
+        marker = _XML_COMMENT_OR_CDATA_START_RE.search(raw, i)
+        if marker is None:
+            parts.append(raw[i:])
+            break
+        parts.append(raw[i:marker.start()])
+        if marker.group(0) == "<!--":
+            end = raw.find("-->", marker.end())
+            end = n if end == -1 else end + 3
+            # SPLICE: the comment's own span (markers and content alike)
+            # is dropped entirely here, never blanked - this is the one
+            # spot in this module where a comment's own bytes are
+            # actually removed rather than replaced with equal-length
+            # whitespace, since this string is never used for offset-
+            # dependent structural scanning again, only decoded.
+        else:
+            end = raw.find("]]>", marker.end())
+            end = n if end == -1 else end + 3
+            parts.append(raw[marker.start():end])
+        i = end
+    return "".join(parts)
+
+
+def _decode_xml_leaf(blanked: str, raw: str) -> str | None:
+    """FIX ROUND 38 (thirty-second cold read, F2 BLOCKER, wrong-data):
+    the ONE chokepoint every leaf-value decode call site in this module
+    now goes through, in place of calling :func:`_decode_xml_text`
+    directly on a ``sanitized``-recovered value alone. ``blanked`` is the
+    existing recovery (``sanitized``'s own slice at this leaf's offset -
+    comments blanked to spaces, CDATA preserved raw); ``raw`` is the
+    SAME leaf span recovered from the true, unblanked original text at
+    the identical offset. The two are byte-identical whenever no comment
+    intersects this leaf (checked first, so the overwhelmingly common
+    case is one string comparison plus the unchanged decode path,
+    exactly as fast as before this round); when they differ, a comment
+    intersects this leaf's own span, and ``raw`` is spliced (see
+    :func:`_splice_comment_spans`) before decoding, rather than the
+    corrupted blanked value."""
+    if raw == blanked:
+        return _decode_xml_text(blanked)
+    return _decode_xml_text(_splice_comment_spans(raw))
+
+
 def _decode_xml_text(raw: str) -> str | None:
     # MICRO-ROUND 23b (reviewer-3's own MINOR, wrong-data): TWO OR MORE
     # CDATA sections in one value (a legal, if esoteric, XML shape - a
@@ -3569,7 +3639,8 @@ def declared_reactor_module_paths(text: str) -> list[str]:
         for module_match in _MODULE_RE.finditer(
             structural, modules_match.start(1), modules_match.end(1),
         ):
-            raw_value = sanitized[module_match.start(1):module_match.end(1)]
+            blanked_value = sanitized[module_match.start(1):module_match.end(1)]
+            raw_value = text[module_match.start(1):module_match.end(1)]
             # FIX ROUND 25 (twenty-first cold read, F8, wrong-data): a
             # CDATA-wrapped <module> now MATCHES (widened to DOTALL) but
             # must still be DECODED before use - an undecodable path
@@ -3577,7 +3648,12 @@ def declared_reactor_module_paths(text: str) -> list[str]:
             # same as a genuinely absent one (silently excluded from
             # the reactor list), never a value with literal CDATA
             # markers still embedded in it.
-            decoded_value = _decode_xml_text(raw_value)
+            #
+            # FIX ROUND 38 (F2 BLOCKER): a comment interior to this
+            # value's own span (blanked in `sanitized`, spliced out of
+            # `text` by `_decode_xml_leaf`) is decoded correctly now
+            # instead of publishing its own blanked whitespace.
+            decoded_value = _decode_xml_leaf(blanked_value, raw_value)
             if decoded_value is None:
                 continue
             paths.append(_bounded_route_target(decoded_value.strip()))
@@ -3627,16 +3703,27 @@ def pom_dependency_decode_problems(text: str) -> list[int]:
         # block's own interior, where it was missing entirely.
         block_sanitized = sanitized[match.start(1):match.end(1)]
         block_structural = structural[match.start(1):match.end(1)]
+        block_text = text[match.start(1):match.end(1)]
         group_match = _DEPENDENCY_GROUP_ID_RE.search(block_structural)
         artifact_match = _DEPENDENCY_ARTIFACT_ID_RE.search(block_structural)
+        # FIX ROUND 38 (F2 BLOCKER): a comment interior to groupId/
+        # artifactId's own value (blanked in block_sanitized, spliced
+        # out of block_text) is decoded correctly now via
+        # _decode_xml_leaf, the same chokepoint every other leaf decode
+        # in this module now goes through.
         group_undecodable = (
             group_match is not None
-            and _decode_xml_text(block_sanitized[group_match.start(1):group_match.end(1)]) is None
+            and _decode_xml_leaf(
+                block_sanitized[group_match.start(1):group_match.end(1)],
+                block_text[group_match.start(1):group_match.end(1)],
+            ) is None
         )
         artifact_undecodable = (
             artifact_match is not None
-            and _decode_xml_text(
-                block_sanitized[artifact_match.start(1):artifact_match.end(1)]) is None
+            and _decode_xml_leaf(
+                block_sanitized[artifact_match.start(1):artifact_match.end(1)],
+                block_text[artifact_match.start(1):artifact_match.end(1)],
+            ) is None
         )
         if group_undecodable or artifact_undecodable:
             lines.append(_line_at(newline_offsets, match.start()))
@@ -3668,15 +3755,18 @@ def pom_own_coordinate_decode_problems(text: str) -> list[int]:
     sanitized, structural = _split_xml_comments_and_cdata(text)
     newline_offsets = _newline_offsets(sanitized)
     lines: list[int] = []
+    # FIX ROUND 38 (F2 BLOCKER): a comment interior to this leaf's own
+    # value (blanked in `sanitized`, spliced out of `text` by
+    # `_decode_xml_leaf`) is decoded correctly now.
     for match in _DEPENDENCY_GROUP_ID_RE.finditer(sanitized):
         stack = _enclosing_tag_stack(structural, match.start())
-        if stack in (["project"], ["project", "parent"]) and _decode_xml_text(
-            match.group(1)) is None:
+        if stack in (["project"], ["project", "parent"]) and _decode_xml_leaf(
+            match.group(1), text[match.start(1):match.end(1)]) is None:
             lines.append(_line_at(newline_offsets, match.start()))
     for match in _DEPENDENCY_ARTIFACT_ID_RE.finditer(sanitized):
         if (
             _enclosing_tag_stack(structural, match.start()) == ["project"]
-            and _decode_xml_text(match.group(1)) is None
+            and _decode_xml_leaf(match.group(1), text[match.start(1):match.end(1)]) is None
         ):
             lines.append(_line_at(newline_offsets, match.start()))
     return sorted(set(lines))
@@ -3716,7 +3806,7 @@ def _count_profile_scoped_dependencies(structural: str) -> int:
 
 
 def _own_and_parent_group_ids(
-    sanitized: str, structural: str,
+    sanitized: str, structural: str, text: str,
 ) -> tuple[str | None, str | None, bool]:
     """FIX ROUND 19 (fifteenth cold read, F2 MAJOR): the project-level and
     ``<parent>``-block groupId scan :func:`_project_own_coordinate`
@@ -3771,23 +3861,28 @@ def _own_and_parent_group_ids(
     this third value."""
     group_id = parent_group_id = None
     project_group_id_declared_but_broken = False
+    # FIX ROUND 38 (F2 BLOCKER): a comment interior to this leaf's own
+    # value is decoded correctly now via _decode_xml_leaf, instead of
+    # publishing the blanked span's own literal whitespace.
     for match in _DEPENDENCY_GROUP_ID_RE.finditer(sanitized):
         stack = _enclosing_tag_stack(structural, match.start())
         if stack == ["project"]:
-            decoded = _decode_xml_text(match.group(1))
+            decoded = _decode_xml_leaf(match.group(1), text[match.start(1):match.end(1)])
             if decoded is not None:
                 group_id = _bounded_route_target(decoded.strip())
             else:
                 project_group_id_declared_but_broken = True
             break
         if stack == ["project", "parent"] and parent_group_id is None:
-            decoded = _decode_xml_text(match.group(1))
+            decoded = _decode_xml_leaf(match.group(1), text[match.start(1):match.end(1)])
             if decoded is not None:
                 parent_group_id = _bounded_route_target(decoded.strip())
     return group_id, parent_group_id, project_group_id_declared_but_broken
 
 
-def _project_own_coordinate(sanitized: str, structural: str) -> tuple[str, str] | None:
+def _project_own_coordinate(
+    sanitized: str, structural: str, text: str,
+) -> tuple[str, str] | None:
     """FIX ROUND 17 (thirteenth cold read, CR13-4 MAJOR, wrong-data):
     this pom's OWN ``groupId:artifactId`` identity - a direct child of
     ``<project>``, never one nested inside ``<parent>``/``<dependency>``/
@@ -3845,13 +3940,14 @@ def _project_own_coordinate(sanitized: str, structural: str) -> tuple[str, str] 
     third return value for why (falling back there risks registering
     this pom under a coordinate it may not actually have)."""
     group_id, parent_group_id, group_id_declared_but_broken = _own_and_parent_group_ids(
-        sanitized, structural)
+        sanitized, structural, text)
     if group_id is None and not group_id_declared_but_broken:
         group_id = parent_group_id
     artifact_id = None
+    # FIX ROUND 38 (F2 BLOCKER): see _own_and_parent_group_ids's own note.
     for match in _DEPENDENCY_ARTIFACT_ID_RE.finditer(sanitized):
         if _enclosing_tag_stack(structural, match.start()) == ["project"]:
-            decoded = _decode_xml_text(match.group(1))
+            decoded = _decode_xml_leaf(match.group(1), text[match.start(1):match.end(1)])
             if decoded is not None:
                 artifact_id = _bounded_route_target(decoded.strip())
             break
@@ -3918,7 +4014,7 @@ def parse_maven_pom(
     sanitized, structural = _split_xml_comments_and_cdata(text)
     newline_offsets = _newline_offsets(sanitized)
     units: list[JavaUnitClaim] = []
-    own_coordinate = _project_own_coordinate(sanitized, structural)
+    own_coordinate = _project_own_coordinate(sanitized, structural, text)
     if own_coordinate is not None:
         own_group_id, own_artifact_id = own_coordinate
         units.append(JavaUnitClaim(
@@ -3945,7 +4041,7 @@ def parse_maven_pom(
     # ensures an unexpanded ``${`` can never satisfy the positive-
     # grounds external test regardless.
     own_project_group_id, parent_group_id, _group_id_declared_but_broken = (
-        _own_and_parent_group_ids(sanitized, structural))
+        _own_and_parent_group_ids(sanitized, structural, text))
     effective_own_group_id = (
         own_project_group_id if own_project_group_id is not None else parent_group_id
     )
@@ -3966,6 +4062,7 @@ def parse_maven_pom(
         # scan already follows, extended into the block's own interior.
         block_sanitized = sanitized[match.start(1):match.end(1)]
         block_structural = structural[match.start(1):match.end(1)]
+        block_text = text[match.start(1):match.end(1)]
         group_match = _DEPENDENCY_GROUP_ID_RE.search(block_structural)
         artifact_match = _DEPENDENCY_ARTIFACT_ID_RE.search(block_structural)
         if group_match is None or artifact_match is None:
@@ -3982,9 +4079,17 @@ def parse_maven_pom(
         # already unpack it positionally), so it stays silent here,
         # exactly as an absent element already is, and does not publish
         # a guessed value either way.
-        group_decoded = _decode_xml_text(block_sanitized[group_match.start(1):group_match.end(1)])
-        artifact_decoded = _decode_xml_text(
-            block_sanitized[artifact_match.start(1):artifact_match.end(1)])
+        # FIX ROUND 38 (F2 BLOCKER): a comment interior to groupId/
+        # artifactId's own value (blanked in block_sanitized, spliced
+        # out of block_text) is decoded correctly now, instead of
+        # publishing the blanked span's own literal whitespace as part
+        # of the coordinate.
+        group_decoded = _decode_xml_leaf(
+            block_sanitized[group_match.start(1):group_match.end(1)],
+            block_text[group_match.start(1):group_match.end(1)])
+        artifact_decoded = _decode_xml_leaf(
+            block_sanitized[artifact_match.start(1):artifact_match.end(1)],
+            block_text[artifact_match.start(1):artifact_match.end(1)])
         if group_decoded is None or artifact_decoded is None:
             continue
         # CR9-6 (ninth cold read, judged, completeness): a pom's own
@@ -4003,12 +4108,16 @@ def parse_maven_pom(
         # raw, undecoded value fed into the comparison below.
         optional_match = _DEPENDENCY_OPTIONAL_RE.search(block_structural)
         optional_decoded = (
-            _decode_xml_text(block_sanitized[optional_match.start(1):optional_match.end(1)])
+            _decode_xml_leaf(
+                block_sanitized[optional_match.start(1):optional_match.end(1)],
+                block_text[optional_match.start(1):optional_match.end(1)])
             if optional_match is not None else None)
         optional = optional_decoded is not None and optional_decoded.strip().lower() == "true"
         scope_match = _DEPENDENCY_SCOPE_RE.search(block_structural)
         scope_decoded = (
-            _decode_xml_text(block_sanitized[scope_match.start(1):scope_match.end(1)])
+            _decode_xml_leaf(
+                block_sanitized[scope_match.start(1):scope_match.end(1)],
+                block_text[scope_match.start(1):scope_match.end(1)])
             if scope_match is not None else None)
         scope = scope_decoded.strip().lower() if scope_decoded is not None else None
         phase = "test" if scope == "test" else "build"
@@ -4248,7 +4357,9 @@ def _resolve_descriptor_declarations(
     )
 
 
-def _servlet_class_by_name(sanitized: str, structural: str) -> tuple[_DescriptorRegistry, list[int]]:
+def _servlet_class_by_name(
+    sanitized: str, structural: str, text: str,
+) -> tuple[_DescriptorRegistry, list[int]]:
     """FIX ROUND 17 (thirteenth cold read, CR13-2 MAJOR, wrong-data):
     web.xml's own ``<servlet>`` element (``<servlet-name>``/
     ``<servlet-class>`` pair) - twice carried as an M5/M7 fast-follow,
@@ -4301,12 +4412,17 @@ def _servlet_class_by_name(sanitized: str, structural: str) -> tuple[_Descriptor
         # idiom every document-level scan in this file already follows.
         block_sanitized = sanitized[block_match.start(1):block_match.end(1)]
         block_structural = structural[block_match.start(1):block_match.end(1)]
+        block_text = text[block_match.start(1):block_match.end(1)]
         name_match = _SERVLET_MAPPING_NAME_RE.search(block_structural)
         if name_match is None:
             continue
         # FIX ROUND 25 (twenty-first cold read, F4, wrong-data): decoded
-        # the same as the class below.
-        decoded_name = _decode_xml_text(block_sanitized[name_match.start(1):name_match.end(1)])
+        # the same as the class below. FIX ROUND 38 (F2 BLOCKER): a
+        # comment interior to this value is decoded correctly now via
+        # _decode_xml_leaf.
+        decoded_name = _decode_xml_leaf(
+            block_sanitized[name_match.start(1):name_match.end(1)],
+            block_text[name_match.start(1):name_match.end(1)])
         if decoded_name is None:
             name_undecodable.append(block_match.start())
             continue
@@ -4334,13 +4450,17 @@ def _servlet_class_by_name(sanitized: str, structural: str) -> tuple[_Descriptor
         class_matches = list(_SERVLET_CLASS_RE.finditer(block_structural))
         jsp_matches = list(_JSP_FILE_RE.finditer(block_structural))
         for class_match in class_matches:
-            decoded_class = _decode_xml_text(block_sanitized[class_match.start(1):class_match.end(1)])
+            decoded_class = _decode_xml_leaf(
+                block_sanitized[class_match.start(1):class_match.end(1)],
+                block_text[class_match.start(1):class_match.end(1)])
             declarations.setdefault(servlet_name, []).append(_DescriptorDeclaration(
                 class_value=_bounded_route_target(decoded_class.strip()) if decoded_class is not None else None,
                 jsp_path=None, class_undecodable=decoded_class is None, block_start=block_match.start(),
             ))
         for jsp_match in jsp_matches:
-            jsp_path = _decode_xml_text(block_sanitized[jsp_match.start(1):jsp_match.end(1)])
+            jsp_path = _decode_xml_leaf(
+                block_sanitized[jsp_match.start(1):jsp_match.end(1)],
+                block_text[jsp_match.start(1):jsp_match.end(1)])
             declarations.setdefault(servlet_name, []).append(_DescriptorDeclaration(
                 class_value=None,
                 jsp_path=_bounded_route_target(jsp_path.strip()) if jsp_path is not None else None,
@@ -4404,7 +4524,9 @@ _LISTENER_BLOCK_RE = _structural_block_pattern("listener")
 _LISTENER_CLASS_RE = _leaf_value_pattern("listener-class", dotall=True)
 
 
-def _filter_class_by_name(sanitized: str, structural: str) -> tuple[_DescriptorRegistry, list[int]]:
+def _filter_class_by_name(
+    sanitized: str, structural: str, text: str,
+) -> tuple[_DescriptorRegistry, list[int]]:
     """FIX ROUND 21b (THE MAJOR's own web.xml-symmetry follow-through):
     web.xml's own ``<filter>`` element (``<filter-name>``/
     ``<filter-class>`` pair), joined below against ``<filter-mapping>``'s
@@ -4431,13 +4553,17 @@ def _filter_class_by_name(sanitized: str, structural: str) -> tuple[_DescriptorR
         # comment.
         block_sanitized = sanitized[block_match.start(1):block_match.end(1)]
         block_structural = structural[block_match.start(1):block_match.end(1)]
+        block_text = text[block_match.start(1):block_match.end(1)]
         name_match = _FILTER_NAME_RE.search(block_structural)
         if name_match is None:
             continue
         # FIX ROUND 25 (twenty-first cold read, F4, wrong-data): the
         # exact same decode discipline as ``_servlet_class_by_name``
-        # above.
-        decoded_name = _decode_xml_text(block_sanitized[name_match.start(1):name_match.end(1)])
+        # above. FIX ROUND 38 (F2 BLOCKER): ditto its own comment-splice
+        # fix.
+        decoded_name = _decode_xml_leaf(
+            block_sanitized[name_match.start(1):name_match.end(1)],
+            block_text[name_match.start(1):name_match.end(1)])
         if decoded_name is None:
             name_undecodable.append(block_match.start())
             continue
@@ -4456,7 +4582,9 @@ def _filter_class_by_name(sanitized: str, structural: str) -> tuple[_DescriptorR
             ))
             continue
         for class_match in class_matches:
-            decoded_class = _decode_xml_text(block_sanitized[class_match.start(1):class_match.end(1)])
+            decoded_class = _decode_xml_leaf(
+                block_sanitized[class_match.start(1):class_match.end(1)],
+                block_text[class_match.start(1):class_match.end(1)])
             declarations.setdefault(filter_name, []).append(_DescriptorDeclaration(
                 class_value=_bounded_route_target(decoded_class.strip()) if decoded_class is not None else None,
                 jsp_path=None, class_undecodable=decoded_class is None, block_start=block_match.start(),
@@ -4676,7 +4804,7 @@ def parse_web_xml(
     sanitized, structural = _split_xml_comments_and_cdata(text)
     newline_offsets = _newline_offsets(sanitized)
     descriptor_name_conflicts: list[tuple[str, list[str]]] = []
-    servlet_registry, servlet_name_undecodable = _servlet_class_by_name(sanitized, structural)
+    servlet_registry, servlet_name_undecodable = _servlet_class_by_name(sanitized, structural, text)
     # FIX ROUND 29/30 (twenty-fifth/twenty-sixth cold reads, F1 BLOCKER,
     # wrong-data): a servlet-name declared more than once, disagreeing -
     # see `_resolve_descriptor_declarations`'s own docstring for the full
@@ -4823,6 +4951,7 @@ def parse_web_xml(
         # real values still recovered from `block_sanitized` by offset.
         block_sanitized = sanitized[block_match.start(1):block_match.end(1)]
         block_structural = structural[block_match.start(1):block_match.end(1)]
+        block_text = text[block_match.start(1):block_match.end(1)]
         name_match = _SERVLET_MAPPING_NAME_RE.search(block_structural)
         if name_match is None:
             # Same silent-drop shape round 15b's own JUDGE carry already
@@ -4835,8 +4964,11 @@ def parse_web_xml(
         # fact from the genuinely-nameless case just above, and the
         # reason another mapping's own real route (in the SAME file)
         # could mask the whole-file positive-evidence gate entirely.
-        # Recorded visibly instead.
-        decoded_name = _decode_xml_text(block_sanitized[name_match.start(1):name_match.end(1)])
+        # Recorded visibly instead. FIX ROUND 38 (F2 BLOCKER): a comment
+        # interior to this value is decoded correctly now.
+        decoded_name = _decode_xml_leaf(
+            block_sanitized[name_match.start(1):name_match.end(1)],
+            block_text[name_match.start(1):name_match.end(1)])
         if decoded_name is None:
             problems.append(JavaAdapterProblem(
                 reason_code="route_value_unrecoverable",
@@ -4881,9 +5013,13 @@ def parse_web_xml(
             # _decode_xml_text's own docstring. An undefined entity
             # reference is unrecoverable, the same honesty the
             # annotation-route path already uses for a value it cannot
-            # prove is real.
-            decoded = _decode_xml_text(
-                block_sanitized[pattern_match.start(1):pattern_match.end(1)])
+            # prove is real. FIX ROUND 38 (F2 BLOCKER): a comment
+            # interior to this value (mod<!--c-->b) is decoded correctly
+            # now via _decode_xml_leaf, instead of publishing the
+            # blanked span's own literal whitespace as part of the route.
+            decoded = _decode_xml_leaf(
+                block_sanitized[pattern_match.start(1):pattern_match.end(1)],
+                block_text[pattern_match.start(1):pattern_match.end(1)])
             if decoded is None:
                 problems.append(JavaAdapterProblem(
                     reason_code="route_value_unrecoverable",
@@ -4985,14 +5121,18 @@ def parse_web_xml(
         # servlet-mapping loop's own comment above.
         block_sanitized = sanitized[block_match.start(1):block_match.end(1)]
         block_structural = structural[block_match.start(1):block_match.end(1)]
+        block_text = text[block_match.start(1):block_match.end(1)]
         name_match = _SERVLET_MAPPING_NAME_RE.search(block_structural)
         # FIX ROUND 25 (F4, wrong-data): decoded before the membership
         # check - comparing a raw, undecoded CDATA-wrapped name against
         # `mapped_servlet_names` (which only ever holds DECODED names)
         # would never match, incorrectly treating an already-mapped
-        # servlet as unmapped.
+        # servlet as unmapped. FIX ROUND 38 (F2 BLOCKER): a comment
+        # interior to this value is decoded correctly now.
         decoded_name = (
-            _decode_xml_text(block_sanitized[name_match.start(1):name_match.end(1)])
+            _decode_xml_leaf(
+                block_sanitized[name_match.start(1):name_match.end(1)],
+                block_text[name_match.start(1):name_match.end(1)])
             if name_match is not None else None)
         if decoded_name is None or decoded_name.strip() in mapped_servlet_names:
             continue
@@ -5004,7 +5144,9 @@ def parse_web_xml(
         # - an undecodable class falls back to the same None a genuinely
         # absent one already gets, never a raw, undecoded value.
         decoded_class = (
-            _decode_xml_text(block_sanitized[class_match.start(1):class_match.end(1)])
+            _decode_xml_leaf(
+                block_sanitized[class_match.start(1):class_match.end(1)],
+                block_text[class_match.start(1):class_match.end(1)])
             if class_match is not None else None)
         qualified_name = (
             _bounded_route_target(decoded_class.strip()) if decoded_class is not None else None)
@@ -5016,7 +5158,7 @@ def parse_web_xml(
                    "absent either",
             qualified_name=qualified_name,
         ))
-    filter_registry, filter_name_undecodable = _filter_class_by_name(sanitized, structural)
+    filter_registry, filter_name_undecodable = _filter_class_by_name(sanitized, structural, text)
     # FIX ROUND 29/30/31 (F1 BLOCKER): the identical duplicate-
     # descriptor-name conflict handling as the servlet loop above - see
     # its own comment.
@@ -5083,6 +5225,7 @@ def parse_web_xml(
         # fix as the servlet-mapping loop above.
         block_sanitized = sanitized[block_match.start(1):block_match.end(1)]
         block_structural = structural[block_match.start(1):block_match.end(1)]
+        block_text = text[block_match.start(1):block_match.end(1)]
         name_match = _FILTER_NAME_RE.search(block_structural)
         if name_match is None:
             # Same silent-drop shape round 15b's own JUDGE carry already
@@ -5091,8 +5234,11 @@ def parse_web_xml(
         # FIX ROUND 25 (twenty-first cold read, F4 MAJOR, wrong-data):
         # the filter twin of the servlet-mapping fix above - a filter-
         # name present but undecodable used to make the whole mapping
-        # vanish silently.
-        decoded_name = _decode_xml_text(block_sanitized[name_match.start(1):name_match.end(1)])
+        # vanish silently. FIX ROUND 38 (F2 BLOCKER): a comment interior
+        # to this value is decoded correctly now.
+        decoded_name = _decode_xml_leaf(
+            block_sanitized[name_match.start(1):name_match.end(1)],
+            block_text[name_match.start(1):name_match.end(1)])
         if decoded_name is None:
             problems.append(JavaAdapterProblem(
                 reason_code="route_value_unrecoverable",
@@ -5166,9 +5312,11 @@ def parse_web_xml(
             absolute_offset = block_match.start(1) + pattern_match.start()
             # FIX ROUND 23 (F1(d) + F2): see the servlet-mapping loop's
             # own identical comment above - the same decode-or-
-            # unrecoverable choke point applies here too.
-            decoded = _decode_xml_text(
-                block_sanitized[pattern_match.start(1):pattern_match.end(1)])
+            # unrecoverable choke point applies here too. FIX ROUND 38
+            # (F2 BLOCKER): ditto its own comment-splice fix.
+            decoded = _decode_xml_leaf(
+                block_sanitized[pattern_match.start(1):pattern_match.end(1)],
+                block_text[pattern_match.start(1):pattern_match.end(1)])
             if decoded is None:
                 problems.append(JavaAdapterProblem(
                     reason_code="route_value_unrecoverable",
@@ -5229,12 +5377,15 @@ def parse_web_xml(
         # fix as every other loop in this function.
         block_sanitized = sanitized[block_match.start(1):block_match.end(1)]
         block_structural = structural[block_match.start(1):block_match.end(1)]
+        block_text = text[block_match.start(1):block_match.end(1)]
         class_match = _LISTENER_CLASS_RE.search(block_structural)
         # FIX ROUND 24 (F5 MINOR): same label-only treatment as the
         # servlet startup-check above - cosmetic here (this shape is
         # enrolled-only, never modeled beyond the bare fact it exists).
         decoded_class = (
-            _decode_xml_text(block_sanitized[class_match.start(1):class_match.end(1)])
+            _decode_xml_leaf(
+                block_sanitized[class_match.start(1):class_match.end(1)],
+                block_text[class_match.start(1):class_match.end(1)])
             if class_match is not None else None)
         qualified_name = (
             _bounded_route_target(decoded_class.strip()) if decoded_class is not None else None)

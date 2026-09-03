@@ -123,6 +123,48 @@ def test_web_xml_entry_point_owner_is_the_real_servlet_class_when_declared():
     assert features[0].unit_ids == [servlet_unit_id]
 
 
+def test_web_xml_entry_point_owner_resolves_when_the_servlet_class_has_an_interior_comment():
+    """FIX ROUND 38 (thirty-second cold read, F2 BLOCKER, .cr32-svclass,
+    wrong-data): a comment interior to a <servlet-class>'s own value
+    (Sv<!--x-->One) used to publish the owner's own qualified_name as
+    the corrupted, blanked-whitespace spelling ("com.acme.Sv        One")
+    - which can never exact-match the REAL in-scan class com.acme.
+    SvOne, detaching the route from its real owner (falls back to the
+    file, per the companion test below) and handing the real class a
+    confident no_entry_point negative on an otherwise complete run, zero
+    problems. The twin of test_web_xml_entry_point_owner_is_the_real_
+    servlet_class_when_declared above, with an interior comment spliced
+    out of the class value instead of a clean one."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>one</servlet-name>
+    <servlet-class>com.acme.Sv<!--internal build tag-->One</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>one</servlet-name>
+    <url-pattern>/one/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = (
+        java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml))
+    assert entry_points[0].qualified_name == "com.acme.SvOne"
+    servlet_source = "package com.acme;\nclass SvOne {\n}\n"
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
+        "com/acme/SvOne.java": java_adapter.parse_java_source(
+            "com/acme/SvOne.java", servlet_source),
+    }
+    entry_point_records, features = fa.build_features(results)
+    servlet_unit_id = fa.digests.unit_id(
+        kind="component", paths=["com/acme/SvOne.java"], qualified_name="com.acme.SvOne",
+    )
+    assert len(entry_point_records) == 1
+    assert entry_point_records[0].owning_unit_id == servlet_unit_id
+    assert len(features) == 1
+    assert features[0].unit_ids == [servlet_unit_id]
+
+
 def test_web_xml_entry_point_still_owned_by_the_file_when_the_class_is_out_of_scan():
     """Companion: a <servlet-class> that IS declared but does not
     resolve to any in-scan unit (out-of-scope compiled dependency, or
