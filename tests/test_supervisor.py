@@ -2842,6 +2842,118 @@ def test_codex_config_overlay_sets_keys_preserves_others_idempotent() -> None:
     assert "shell_environment_policy" not in out
 
 
+def _make_linked_worktree(tmp_path: Path, *, main_name: str = "main", wt_name: str = "wt") -> tuple[Path, Path, Path]:
+    """Build a real linked-worktree .git layout under tmp_path (no git binary
+    needed - _linked_worktree_admin_dir/_worktree_common_dir only ever read
+    these files). Returns (worktree_dir, admin_dir, common_git_dir)."""
+    main = tmp_path / main_name
+    common_git = main / ".git"
+    common_git.mkdir(parents=True)
+    (common_git / "objects").mkdir()
+    (common_git / "refs").mkdir()
+    (common_git / "logs").mkdir()
+    admin_dir = common_git / "worktrees" / wt_name
+    admin_dir.mkdir(parents=True)
+    (admin_dir / "commondir").write_text("../..\n", encoding="utf-8")
+    worktree = tmp_path / wt_name
+    worktree.mkdir()
+    (worktree / ".git").write_text(f"gitdir: {admin_dir}\n", encoding="utf-8")
+    return worktree, admin_dir, common_git
+
+
+def test_codex_worktree_writable_roots_for_a_linked_worktree_is_narrow(tmp_path: Path) -> None:
+    worktree, admin_dir, common_git = _make_linked_worktree(tmp_path)
+    roots = sup.codex_worktree_writable_roots(worktree)
+    assert roots == (
+        str(admin_dir.resolve()),
+        str((common_git / "objects").resolve()),
+        str((common_git / "refs").resolve()),
+        str((common_git / "logs").resolve()),
+    )
+    # Narrow: a SIBLING worktree's own admin dir is never named.
+    other_admin = common_git / "worktrees" / "other-agent-wt"
+    assert str(other_admin) not in roots
+    # Every granted root is inside .git - this never touches the operator's
+    # actual source tree (the worktree's own working files, or the main
+    # checkout's), only git's own metadata storage.
+    for granted in roots:
+        assert Path(granted).is_relative_to(common_git)
+    assert str(worktree.resolve()) not in roots
+    assert str(common_git.parent.resolve()) not in roots
+
+
+def test_codex_worktree_writable_roots_for_the_main_checkout_grants_the_whole_worktrees_parent(
+    tmp_path: Path,
+) -> None:
+    worktree, _admin_dir, common_git = _make_linked_worktree(tmp_path)
+    # repo_path is the MAIN checkout (not itself a linked worktree) - the
+    # ordinary case, since agents create worktrees elsewhere, later, under
+    # names not known at seed time.
+    roots = sup.codex_worktree_writable_roots(worktree.parent / "main")
+    assert roots == (
+        str((common_git / "worktrees").resolve()),
+        str((common_git / "objects").resolve()),
+        str((common_git / "refs").resolve()),
+        str((common_git / "logs").resolve()),
+    )
+    # Wider than the single-worktree case (every worktree's admin dir is
+    # covered, not just one), but STILL never the operator's actual source
+    # tree - everything granted stays inside .git.
+    for granted in roots:
+        assert Path(granted).is_relative_to(common_git)
+    assert str(common_git.parent.resolve()) not in roots
+
+
+def test_codex_worktree_writable_roots_is_empty_for_a_plain_checkout_with_no_git_dir(
+    tmp_path: Path,
+) -> None:
+    plain = tmp_path / "no-git-here"
+    plain.mkdir()
+    assert sup.codex_worktree_writable_roots(plain) == ()
+
+
+def test_codex_worktree_writable_roots_fails_soft_on_missing_or_malformed_state(
+    tmp_path: Path,
+) -> None:
+    # Nonexistent repo_path entirely.
+    assert sup.codex_worktree_writable_roots(tmp_path / "does-not-exist") == ()
+    # .git is a file (linked-worktree-shaped) but not a gitdir: pointer.
+    garbled = tmp_path / "garbled"
+    garbled.mkdir()
+    (garbled / ".git").write_text("not a gitdir pointer\n", encoding="utf-8")
+    assert sup.codex_worktree_writable_roots(garbled) == ()
+    # gitdir: points somewhere with no commondir file.
+    orphan = tmp_path / "orphan"
+    orphan.mkdir()
+    admin = tmp_path / "admin-with-no-commondir"
+    admin.mkdir()
+    (orphan / ".git").write_text(f"gitdir: {admin}\n", encoding="utf-8")
+    assert sup.codex_worktree_writable_roots(orphan) == ()
+
+
+def test_codex_config_overlay_renders_extra_writable_roots_and_stays_idempotent() -> None:
+    extra = (r"C:\proj\agenttalk\.git\worktrees", r"C:\proj\agenttalk\.git\objects")
+    out = sup.codex_config_overlay("", repo_path=r"C:\proj\agenttalk",
+                                   extra_writable_roots=extra)
+    assert (
+        'writable_roots = ["C:\\\\proj\\\\agenttalk", '
+        '"C:\\\\proj\\\\agenttalk\\\\.git\\\\worktrees", '
+        '"C:\\\\proj\\\\agenttalk\\\\.git\\\\objects"]'
+    ) in out
+    # Idempotent re-apply with the SAME extras.
+    assert sup.codex_config_overlay(out, repo_path=r"C:\proj\agenttalk",
+                                    extra_writable_roots=extra) == out
+    # Re-seeding with DIFFERENT extras REPLACES the array, not accumulates it.
+    reseeded = sup.codex_config_overlay(out, repo_path=r"C:\proj\agenttalk",
+                                        extra_writable_roots=(r"C:\proj\agenttalk\.git\refs",))
+    assert "worktrees" not in reseeded
+    assert r'"C:\\proj\\agenttalk\\.git\\refs"' in reseeded
+    # No extras at all -> byte-identical to the pre-#169 single-root form.
+    assert sup.codex_config_overlay("", repo_path=r"C:\proj\agenttalk") == (
+        sup.codex_config_overlay("", repo_path=r"C:\proj\agenttalk", extra_writable_roots=())
+    )
+
+
 def test_seed_claude_settings_merges_default_mode() -> None:
     out = sup.seed_claude_settings('{"model": "opus"}', mode="bypassPermissions")
     data = json.loads(out)
@@ -2905,6 +3017,26 @@ def test_seed_codex_config_cli_overlays_in_place(tmp_path: Path) -> None:
     txt = (home / "config.toml").read_text(encoding="utf-8")
     assert 'model = "x"' in txt and 'approval_policy = "never"' in txt
     assert 'sandbox = "unelevated"' in txt
+
+
+def test_seed_codex_config_cli_grants_worktree_admin_roots_for_169(tmp_path: Path) -> None:
+    """--seed-codex-config with --repo pointed at a linked worktree also
+    grants that worktree's own git-admin state (#169) - not just the
+    worktree's ordinary files, which writable_roots=[<repo>] already
+    covered before this fix and still covers unchanged."""
+    _team(tmp_path)
+    worktree, admin_dir, common_git = _make_linked_worktree(tmp_path, main_name="main-repo", wt_name="agent-wt")
+    home = tmp_path / "iso"
+    home.mkdir()
+    rc = _run(["supervise", "--seed-codex-config", "--home", str(home),
+               "--repo", str(worktree), "--sandbox", "unelevated"], tmp_path)
+    assert rc == 0
+    txt = (home / "config.toml").read_text(encoding="utf-8")
+    assert str(worktree.resolve()).replace("\\", "\\\\") in txt
+    assert str(admin_dir.resolve()).replace("\\", "\\\\") in txt
+    assert str((common_git / "objects").resolve()).replace("\\", "\\\\") in txt
+    assert str((common_git / "refs").resolve()).replace("\\", "\\\\") in txt
+    assert str((common_git / "logs").resolve()).replace("\\", "\\\\") in txt
 
 
 def test_seed_claude_settings_cli_merges(tmp_path: Path) -> None:

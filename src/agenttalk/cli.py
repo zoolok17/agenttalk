@@ -12370,8 +12370,14 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             cxc.repair_duplicate_project_tables(cfg_p, Path(repo))
         existing = cfg_p.read_text(encoding="utf-8-sig") if cfg_p.exists() else ""
         cfg_p.parent.mkdir(parents=True, exist_ok=True)
+        # #169: also grant whatever git-worktree admin state this agent needs
+        # to commit/push its own worktree - see codex_worktree_writable_roots
+        # for exactly what that is and isn't.
+        extra_roots = sup.codex_worktree_writable_roots(repo)
         cfg_p.write_text(sup.codex_config_overlay(existing, repo_path=repo,
-                                                  windows_sandbox=sandbox), encoding="utf-8")
+                                                  windows_sandbox=sandbox,
+                                                  extra_writable_roots=extra_roots),
+                         encoding="utf-8")
         print(f"seeded codex config.toml (sandbox={sandbox}): {cfg_p}")
         return 0
     if args.seed_claude_settings:

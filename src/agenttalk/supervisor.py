@@ -15189,16 +15189,144 @@ def _toml_basic_str(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def _linked_worktree_admin_dir(path: Path) -> Path | None:
+    """Return the admin dir a linked worktree's ``<path>/.git`` points at.
+
+    A linked worktree's own ``.git`` is a plain FILE containing
+    ``gitdir: <admin-dir>`` (git's own mechanism for finding its per-worktree
+    metadata, which lives elsewhere - see ``git worktree`` documentation).
+    Returns ``None`` (fail-soft, never raises) if ``<path>/.git`` doesn't
+    exist, is a directory (an ordinary checkout, not a linked worktree), or
+    can't be read/parsed - callers treat that as "nothing extra to grant",
+    not as an error.
+    """
+    git_marker = path / ".git"
+    try:
+        if not git_marker.is_file():
+            return None
+        text = git_marker.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+    prefix = "gitdir:"
+    if not text.startswith(prefix):
+        return None
+    raw = text[len(prefix):].strip()
+    if not raw:
+        return None
+    try:
+        return (path / raw).resolve() if not Path(raw).is_absolute() else Path(raw).resolve()
+    except (OSError, RuntimeError):
+        return None
+
+
+def _worktree_common_dir(admin_dir: Path) -> Path | None:
+    """Resolve the shared ``.git`` common dir a worktree admin dir points at.
+
+    Every linked worktree's admin dir holds a ``commondir`` file (git's own
+    mechanism) naming the common dir - usually relative (``../..``), always
+    resolved from the admin dir itself. Fail-soft: ``None`` on any read/parse
+    problem, never raises.
+    """
+    commondir_file = admin_dir / "commondir"
+    try:
+        raw = commondir_file.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+    if not raw:
+        return None
+    try:
+        candidate = Path(raw)
+        return (admin_dir / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+    except (OSError, RuntimeError):
+        return None
+
+
+def codex_worktree_writable_roots(repo_path: str | os.PathLike[str]) -> tuple[str, ...]:
+    """Extra ``sandbox_workspace_write.writable_roots`` entries for #169: a
+    codex agent's OWN git worktree commit/push.
+
+    A linked worktree's git metadata does not live inside the worktree - it
+    lives in the MAIN checkout's ``.git/worktrees/<name>/`` (per-worktree
+    index/HEAD/logs), and new objects plus ref/reflog updates land in the
+    shared ``.git/objects``, ``.git/refs``, ``.git/logs`` that admin dir's own
+    ``commondir`` file points back to. None of that is reachable from a plain
+    ``writable_roots=[<repo_path>]`` grant when the worktree lives outside
+    ``repo_path`` - which is the common case, since an agent creates its own
+    worktree elsewhere, ad hoc, well after this function has already run at
+    launch-time seeding. Without it, `git commit`/`git push` fails on
+    ``.git/worktrees/<name>/index.lock`` even though ordinary file edits
+    inside the worktree already work fine.
+
+    Two shapes, in order of preference - narrowest achievable, not narrowest
+    imaginable:
+    - If ``repo_path`` IS ITSELF a linked worktree, grant exactly its own
+      admin dir. Narrow: no other worktree's metadata is touched.
+    - Otherwise (``repo_path`` is a plain checkout - the case every currently
+      seeded agent is in today, since agents create worktrees elsewhere,
+      after seeding, under names not known yet), grant the whole
+      ``<repo_path>/.git/worktrees/`` parent. This is WIDER than one agent's
+      own worktree: it also exposes every OTHER agent's worktree-scoped git
+      state (index, HEAD, per-worktree logs) under the same repo. There is no
+      narrower target that survives every worktree an agent might create
+      later without inventing a second, worktree-creation-triggered reseed
+      path alongside the existing launch-time one - deliberately not done
+      here (do not invent a parallel mechanism). It does NOT expose
+      ``.git/config``, ``.git/hooks``, ``.git/info``, or anything outside
+      ``.git`` - and does not touch the operator's actual source tree at all
+      beyond what ``writable_roots=[<repo_path>]`` already grants today.
+
+    Either way, ALSO grants ``.git/objects``, ``.git/refs``, and
+    ``.git/logs`` - git's shared, cross-worktree object/ref/reflog storage
+    that any worktree's commit/push writes into by git's own design (history
+    is shared on purpose; there is no per-worktree substore to grant
+    instead). This is the part that can't be narrowed further at all: it
+    grants filesystem-level write access to any ref or object in the repo,
+    not only the seeded agent's own branch - git offers no filesystem-level
+    way to scope tighter than that.
+
+    Returns ``()`` (nothing to add - the existing single-root grant is
+    unchanged) for a plain checkout with no linked-worktree structure to
+    reason about, or if any of it can't be read. Never raises.
+    """
+    try:
+        root = Path(repo_path)
+        own_admin_dir = _linked_worktree_admin_dir(root)
+        if own_admin_dir is not None:
+            worktrees_grant = own_admin_dir
+            common_dir = _worktree_common_dir(own_admin_dir)
+        else:
+            git_dir = root / ".git"
+            if not git_dir.is_dir():
+                return ()
+            worktrees_grant = git_dir / "worktrees"
+            common_dir = git_dir
+        if common_dir is None:
+            return ()
+        return tuple(
+            str(p) for p in (
+                worktrees_grant,
+                common_dir / "objects",
+                common_dir / "refs",
+                common_dir / "logs",
+            )
+        )
+    except (OSError, RuntimeError):
+        return ()
+
+
 def codex_config_overlay(text: str, *, repo_path: str,
-                         windows_sandbox: str = "unelevated") -> str:
+                         windows_sandbox: str = "unelevated",
+                         extra_writable_roots: tuple[str, ...] = ()) -> str:
     """Overlay the unattended-auto-mode keys onto an existing codex config.toml,
     PRESERVING every other key the operator set. Managed keys (double-quoted
     values, per the ruling): root ``approval_policy="never"`` +
     ``sandbox_mode="workspace-write"``; ``[windows] sandbox="<windows_sandbox>"``
     (the UAC fix - "unelevated" avoids the per-home elevated-sandbox admin
-    install); ``[sandbox_workspace_write] writable_roots=["<repo>"]``. Idempotent:
-    re-applying replaces our managed lines in place. (Healing a BOM-corrupted config's
-    duplicate [projects] tables is done by the seed via
+    install); ``[sandbox_workspace_write] writable_roots=["<repo>", ...]`` -
+    ``repo_path`` plus, when given, ``extra_writable_roots`` (see
+    :func:`codex_worktree_writable_roots` for #169's worktree-commit grant).
+    Idempotent: re-applying replaces our managed lines in place. (Healing a
+    BOM-corrupted config's duplicate [projects] tables is done by the seed via
     ``codex_config.repair_duplicate_project_tables`` — a SEMANTIC, project-scoped
     collapse — not here, so this overlay never drops unrelated operator tables; D-26.)"""
     secs = _toml_sections(text)
@@ -15207,8 +15335,9 @@ def codex_config_overlay(text: str, *, repo_path: str,
     _toml_set_key(root, "sandbox_mode", '"workspace-write"')
     _toml_set_key(_toml_table(secs, "windows"), "sandbox",
                   _toml_basic_str(windows_sandbox))
+    roots = [repo_path, *extra_writable_roots]
     _toml_set_key(_toml_table(secs, "sandbox_workspace_write"), "writable_roots",
-                  "[" + _toml_basic_str(repo_path) + "]")
+                  "[" + ", ".join(_toml_basic_str(r) for r in roots) + "]")
     out: list[str] = []
     for s in secs:
         if s["header"] is not None:
