@@ -1041,17 +1041,35 @@ def _edge_claim_to_record(
 
     # FIX ROUND 41 (thirty-fifth cold read, F1+F2 BLOCKER/MAJOR, wrong-
     # data - THE STRUCTURAL CURE): `target_external` is display-bounded
-    # HERE, and ONLY here, for a route/filter edge (`route_kind is not
-    # None`) - java.py no longer bounds anything at extraction, and
-    # `edge.target`/this function's own registry resolution above
-    # already used the raw value throughout (an exact-match/registry
-    # lookup on a bounded, lossy coordinate is exactly how two genuinely
-    # different pom dependency coordinates used to coalesce into one
-    # resolved edge). A pom coordinate, an import target, or any other
-    # qualified-name-shaped `target_external` is a judged identity field
-    # (see java_adapter.bounded_route_target's own docstring) - published
-    # raw/unbounded, deliberately, never display-projected.
-    if target_external is not None and route_kind is not None:
+    # HERE, and ONLY here - java.py no longer bounds anything at
+    # extraction, and `edge.target`/this function's own registry
+    # resolution above already used the raw value throughout for every
+    # branch (an exact-match/registry lookup on a bounded, lossy
+    # coordinate is exactly how two genuinely different pom dependency
+    # coordinates used to coalesce into one resolved edge).
+    #
+    # FIX ROUND 42 (thirty-sixth cold read, F3 MAJOR, completeness -
+    # THE RECONCILIATION): round 41 bounded this ONLY for a route/filter
+    # edge (`route_kind is not None`), reasoning every other `target_
+    # external` (a pom coordinate, an import target) is a qualified-
+    # name-shaped IDENTITY field that must stay raw - but `target_
+    # external` itself is never re-looked-up or re-hashed once assigned
+    # here (every registry exact-match/`_classify_registry_miss` call
+    # above it already ran against the RAW `edge.target`; `edge_id`
+    # hashes `edge.target` directly, never this field) - it is a
+    # terminal DISPLAY value, a LABEL, for every target_kind, not just
+    # the route ones. Bounding it universally closes Artifact-1's own
+    # "Bounded derived or declared label" promise (a pom coordinate/
+    # import target used to publish fully unbounded, against invariant
+    # 8's own declared ceilings, backstopped only by the 16MiB whole-
+    # run refusal) without reopening any collision risk - the thing
+    # round 41 was protecting (the HASH input) was never this field to
+    # begin with. `qualified_name` (modules_artifact.py) is the
+    # different case: a LIVING identity other edges/units continue to
+    # exact-match against for the rest of this same run - it stays raw,
+    # with a DECLARED ceiling instead (see the design doc's own amended
+    # caveat).
+    if target_external is not None:
         target_external = java_adapter.bounded_route_target(target_external)
 
     return DependencyRecord(

@@ -452,6 +452,7 @@ Each unit record contains:
 | `unit_id` | Deterministic SHA-256 ID over unit kind, normalized path, and qualified name. |
 | `kind` | Closed adapter vocabulary such as `service`, `package`, `module`, `component`, or `file`. |
 | `display_name` | Bounded derived or declared label; never a source excerpt. |
+| `qualified_name` | Declared/derived identity string (a Java-style dotted name, or a pom `groupId:artifactId` coordinate), when the adapter has one; `null` for a bare file unit. Unlike `display_name`, this is the field other records exact-match/registry-compare against for the rest of the same run - see the bounded-consumption note below for why it is never per-field truncated the way `display_name` is. |
 | `language` | Detected language or `unknown`. |
 | `paths` | Sorted relative source paths that make up the unit. |
 | `source_digests` | Per-path hashes used as direct staleness evidence; they do not replace the whole-scope fingerprint. |
@@ -466,6 +467,40 @@ may appear in a future S4 two-run projection as a candidate, but it must not
 silently rewrite identity. This keeps references auditable and avoids false
 rename certainty.
 
+**Bounded consumption, per-field (invariant 8, amended - PR-B round 42):**
+a *label* field (`display_name` here; `dependencies.json`'s own
+`target_external`) is a terminal, never-re-hashed, never-re-looked-up display
+value - it is truncated per-field with a visible marker, the same discipline a
+route/filter name already used. A *living identity* field (`qualified_name`
+here; a pom coordinate published through `target_external` before this round's
+own reconciliation was a case of this too, now corrected) is exact-matched and
+conflict-detected against for the rest of the same run - truncating it
+per-field would let two genuinely different declared identities collide
+whenever they share a long common prefix, exactly the class of bug PR-B's own
+round 41 fixed for a route target and round 42 fixed for a reactor-module path.
+`qualified_name` therefore publishes RAW and UNBOUNDED, deliberately, with no
+per-field ceiling of its own - the only backstop for a pathological value is
+invariant 8's own WHOLE-ARTIFACT ceiling (16 MiB / 100,000 records), which
+refuses to publish the run at all rather than silently truncating an identity.
+This is a declared, accepted residual, not an oversight: a per-field identity
+ceiling was considered and rejected, since any such ceiling reintroduces
+exactly the collision class both rounds just closed.
+
+**Decision record - raw bytes in a durable identity field (PR-B round 42,
+F4, no code change):** because `qualified_name` publishes raw, it may carry a
+real bidi/invisible/control character byte-for-byte into `modules.json`/
+`dependencies.json` (a `duplicate_qualified_name`/`conflict_id` claim keys on
+the exact same raw value, so escaping it here would only reopen the identity
+question this section just closed). This is safe for the durable artifact
+itself (bounded UTF-8 JSON, never rendered directly) but NOT safe for a
+consumer that prints it - `agenttalk comprehension report --json` already
+serializes with `ensure_ascii`, so the CLI's own JSON output is inert; the
+#208 migration-UI contract already requires every *displayed* label to be
+escaped before rendering. Recorded here as the accepted division of
+responsibility: this plane's own durable artifacts carry raw bytes by design;
+any consumer that renders one to a human must escape it itself, the same
+obligation it already has for any other free-text field.
+
 ## Artifact 2: dependency edges
 
 `dependencies.json` stores only direct static extracted, inferred, ambiguous, or
@@ -475,8 +510,11 @@ derived by report/UI code so they cannot drift from the edge set.
 Each edge contains:
 
 - a deterministic `edge_id` and `from_unit_id`;
-- a target union: internal `unit_id`; normalized external package/system name,
-  or - when `relation == "route"` - the route pattern (`relation` is the
+- a target union: internal `unit_id`; a bounded, displayed external
+  package/system name label (`target_external` - see Artifact 1's own
+  per-field bounded-consumption note; `edge_id` itself is always computed
+  from the raw, unbounded value, never this label), or - when
+  `relation == "route"` - the route pattern (`relation` is the
   discriminator a consumer dispatches on); or an explicit unresolved
   identifier;
 - a closed relation from the coarse slice-1 vocabulary: `import`, `include`,
@@ -955,18 +993,26 @@ network-denied design and cannot weaken this boundary.
 
 ## Freshness, admission, and failure behavior
 
-Freshness is a read-time projection with exactly three values. It is computed
-against the scan's whole-scope fingerprint, never only the paths returned in a
-pack:
+Freshness is a read-time projection with **four** values (amended, PR-B round
+42, F6 - see the note below the table for why three was never quite honest).
+It is computed against the scan's whole-scope fingerprint, never only the
+paths returned in a pack:
 
 | Value | Exact condition |
 | --- | --- |
 | `current` | The run is valid; the current enumeration completed under the same root, platform/path policy, scope/configuration, and adapter identities; its whole-scope fingerprint equals the stored fingerprint; and every selected source pointer still matches. |
 | `stale` | At least one selected input path is proven changed or deleted, or the caller requested an exact VCS revision that is proven different. Direct proof of staleness wins even if the whole-scope fingerprint also differs. |
 | `unknown` | Re-enumeration is incomplete or errors; root/platform/configuration/adapter identity differs; the scan's scope fingerprint was incomplete; or the whole-scope fingerprint differs without direct selected-path proof. A newly added or changed unselected path therefore yields `unknown` because its relevance cannot be decided from the old pack. |
+| `not_evaluated` | Freshness evaluation was never attempted for this projection at all (no comparison was run, successfully or otherwise) - distinct from `unknown`, which always means a comparison WAS attempted and could not reach a decided answer. Slice 1's own `report`/`status` publish this value today, since config.json-driven freshness evaluation is not implemented yet (a named, deferred decision elsewhere in this document). |
 
 No scope-level mismatch can produce `current`. A status of `unknown` is not a
-weaker spelling of fresh. The result, reason code, current fingerprint when
+weaker spelling of fresh. `not_evaluated` is not a weaker spelling of `unknown`
+either - forcing every not-yet-evaluated case into `unknown` would erase the
+real distinction between "we checked and could not tell" and "we never
+checked," a strictly less honest merge this producer declines to make; PR-C's
+own freshness-evaluation work removes most `not_evaluated` occurrences by
+actually running the comparison, not by reclassifying the ones that remain
+into `unknown`. The result, reason code, current fingerprint when
 available, and evaluation time appear together; the immutable pack is not
 rewritten. Dispatch requires `current` unless the attended work-item waiver
 defined above exists.

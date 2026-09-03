@@ -605,7 +605,7 @@ def build_modules(
         records.append(ModuleRecord(
             unit_id=digests.unit_id(kind="file", paths=[relative_path], qualified_name=None),
             kind="file",
-            display_name=relative_path.rsplit("/", 1)[-1],
+            display_name=java_adapter.bounded_route_target(relative_path.rsplit("/", 1)[-1]),
             language=_language_for_path(relative_path),
             paths=[relative_path],
             source_digests={relative_path: content_digest},
@@ -622,7 +622,7 @@ def build_modules(
         records.append(ModuleRecord(
             unit_id=digests.unit_id(kind="file", paths=[relative_path], qualified_name=None),
             kind="file",
-            display_name=relative_path.rsplit("/", 1)[-1],
+            display_name=java_adapter.bounded_route_target(relative_path.rsplit("/", 1)[-1]),
             language=_language_for_path(relative_path),
             paths=[relative_path],
             source_digests={relative_path: content_digest},
@@ -653,7 +653,7 @@ def build_modules(
             records.append(ModuleRecord(
                 unit_id=digests.unit_id(kind="file", paths=[relative_path], qualified_name=None),
                 kind="file",
-                display_name=relative_path.rsplit("/", 1)[-1],
+                display_name=java_adapter.bounded_route_target(relative_path.rsplit("/", 1)[-1]),
                 language=_language_for_path(relative_path),
                 paths=[relative_path],
                 source_digests={relative_path: file_entry.content_digest},
@@ -742,7 +742,14 @@ def build_modules(
                 # visible on a second producer. Trusting the claim's own
                 # simple_name generally is a no-op for Java types and the
                 # actual fix for coordinates.
-                display_name=unit_claim.simple_name,
+                # FIX ROUND 42 (thirty-sixth cold read, F3 MAJOR,
+                # completeness - THE RECONCILIATION): `display_name` is
+                # a LABEL, never re-hashed or re-looked-up (`unit_id`
+                # above is keyed on `qualified_name`, not this field) -
+                # bounded at display the same way `target_external`
+                # now is (dependencies_artifact.py), closing Artifact-
+                # 1's own "Bounded derived or declared label" promise.
+                display_name=java_adapter.bounded_route_target(unit_claim.simple_name),
                 # FIX ROUND 18 (fourteenth cold read, F4 MINOR, wrong-
                 # data): this used to hardcode "java" regardless of the
                 # producing file - true for an ordinary .java type, but
@@ -773,7 +780,7 @@ def build_modules(
         records.append(ModuleRecord(
             unit_id=file_unit_id,
             kind="file",
-            display_name=relative_path.rsplit("/", 1)[-1],
+            display_name=java_adapter.bounded_route_target(relative_path.rsplit("/", 1)[-1]),
             language=_language_for_path(relative_path),
             paths=[relative_path],
             source_digests={relative_path: file_entry.content_digest},

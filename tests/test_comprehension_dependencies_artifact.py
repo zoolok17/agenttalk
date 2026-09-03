@@ -1728,8 +1728,17 @@ def test_two_dependency_coordinates_sharing_a_200_char_prefix_get_distinct_edges
     coalescing to one resolved/external edge with zero signal that a
     real, distinct dependency vanished. Fixed (round 41's own
     structural cure): java.py no longer bounds a coordinate at
-    extraction at all - published raw/unbounded, since a coordinate is
-    an IDENTITY field, not display text."""
+    extraction at all - the HASH input is now always raw/unbounded.
+
+    CORRECTED (round 42, thirty-sixth cold read, F3 MAJOR, completeness
+    - THE RECONCILIATION): this test used to assert `target_external`
+    publishes fully raw/unbounded too - round 42 reconciles that
+    against the design's own "Bounded derived or declared label"
+    promise: `target_external` is a terminal DISPLAY label (never
+    re-hashed or re-looked-up once assigned), so it is now bounded at
+    display the same way a route/filter's own name already was - only
+    `edge_id` (the actual identity) stays computed from the raw value,
+    which is what this test's own real point always was."""
     prefix = "com.acme." + "x" * 200
     pom = (
         "<project><groupId>com.acme</groupId><artifactId>consumer</artifactId>"
@@ -1746,7 +1755,12 @@ def test_two_dependency_coordinates_sharing_a_200_char_prefix_get_distinct_edges
         "two genuinely different dependency coordinates must not collide on edge_id "
         "merely because they truncate identically"
     )
-    assert {e.target_external for e in build_edges} == {f"{prefix}A:lib", f"{prefix}B:lib"}
+    # target_external is now a bounded DISPLAY label (round 42's own
+    # F3) - both truncate to the identical marker-suffixed string, but
+    # edge_id (asserted above) still differs, proving the id is
+    # genuinely raw-derived regardless of what the label displays.
+    assert len({e.target_external for e in build_edges}) == 1
+    assert all(e.target_external.endswith("...(truncated)") for e in build_edges)
 
 
 def test_a_single_oversized_dependency_coordinate_resolves_using_its_own_real_identity():

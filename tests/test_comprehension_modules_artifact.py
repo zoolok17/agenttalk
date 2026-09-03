@@ -677,3 +677,29 @@ def test_to_json_sorts_paths_and_classification():
     payload = records[0].to_json()
     assert payload["paths"] == sorted(payload["paths"])
     assert "unit_id" in payload and "producers" in payload
+
+
+def test_a_file_with_an_oversized_basename_gets_a_bounded_display_name():
+    """FIX ROUND 42 (thirty-sixth cold read, F3 MAJOR, .cr36-label,
+    completeness - THE RECONCILIATION): `display_name` (a file's own
+    basename, or a component's own simple_name) used to publish fully
+    unbounded, against Artifact-1's own "Bounded derived or declared
+    label" promise and invariant 8's declared ceilings - the only
+    backstop was the 16MiB whole-run refusal (graceful degradation with
+    no inventory at all). `display_name` is never re-hashed or re-
+    looked-up (`unit_id` is keyed on `paths`/`qualified_name`, never
+    this field), so bounding it at display carries none of the
+    collision risk round 41 was protecting against for an identity
+    field - it is a pure label. The file's own `paths` entry (the real
+    identity) stays raw/unbounded either way."""
+    from agenttalk.comprehension.adapters.java import _MAX_ROUTE_TARGET_LENGTH
+
+    oversized_name = "x" * (_MAX_ROUTE_TARGET_LENGTH + 50) + ".txt"
+    discovery = _discovery([
+        EnumeratedFile(relative_path=oversized_name, byte_count=3, content_digest="abc"),
+    ])
+    records = ma.build_modules(discovery, {})
+    assert len(records) == 1
+    assert records[0].display_name.endswith("...(truncated)")
+    assert len(records[0].display_name) <= _MAX_ROUTE_TARGET_LENGTH + len("...(truncated)")
+    assert records[0].paths == [oversized_name]
