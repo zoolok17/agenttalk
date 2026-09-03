@@ -1077,6 +1077,29 @@ def test_process_paths_a_docs_example_web_xml_is_still_stray_counted_after_f2(
     assert result.exclusions == {"stray_web_xml_ignored": 1}
 
 
+def test_test_source_root_segment_stays_hand_synced_across_every_copy() -> None:
+    """MICRO-ROUND 44b (F3, the hand-synced-set hazard, second
+    instance): `_TEST_SOURCE_ROOT_SEGMENT` has THREE real, compiled
+    copies in this package - `adapters/java.py`, `modules_artifact.py`,
+    and this module's own round-44 F2 addition - byte-identical today,
+    but nothing locked them together; a future edit to any ONE could
+    silently drift from the other two with no test catching it. The
+    same accepted-duplication risk `_TEST_SOURCE_ROOT_SEGMENT` itself
+    already carries as a named residual (see "Named decisions and
+    residuals") - this is the one-line equality lock that residual's
+    own text says would close the drift risk, even though the
+    duplication itself stays accepted (worker.py cannot import either
+    of the other two - see this module's own copy's docstring)."""
+    from agenttalk.comprehension import modules_artifact
+    from agenttalk.comprehension.adapters import java as java_adapter
+
+    assert (
+        worker._TEST_SOURCE_ROOT_SEGMENT.pattern
+        == modules_artifact._TEST_SOURCE_ROOT_SEGMENT.pattern
+        == java_adapter._TEST_SOURCE_ROOT_SEGMENT.pattern
+    )
+
+
 def test_process_paths_a_latin1_tooling_xml_records_encoding_undecodable_not_unsupported_language(
     tmp_path: Path,
 ) -> None:
