@@ -1091,6 +1091,13 @@ preflight:
    risk, operator, time, and eventual scan ID. Scripts and wrappers cannot supply
    the acknowledgement.
 
+After publication fully completes, the plane asks git once, directly, what is
+actually stageable across the whole private store (`git ls-files --others
+--exclude-standard`) rather than enumerating any directory by hand, refusing
+and rolling back the just-published run if anything is - a `.gitignore`
+change landing after that one call returns is outside this guarantee by
+construction, the irreducible instant every check-then-act leaves.
+
 V1 defines **export** as deliberately moving any raw artifact, report, pack,
 query descriptor, path/symbol list, or graph-derived file outside the private
 store; staging it in VCS and serving it beyond loopback are also export. V1 has
