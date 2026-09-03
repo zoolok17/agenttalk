@@ -1854,6 +1854,67 @@ def _route_literal_list_at(original: str, anchor: int) -> tuple[list[str], list[
 #: real, only its rendering changes.
 _ROUTE_NAME_CONTROL_CHAR_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
 
+#: FIX ROUND 40 (thirty-fourth cold read, Part B S2 deliverable): one
+#: table naming all three closed sets this module's escaping/blankness/
+#: collision checks consult, and which checks consult which - so the
+#: next divergence between checks is a table edit here, not a fresh
+#: cold-read finding (round 40's own F3 was exactly this kind of
+#: divergence, found by reading, not by this table - it did not exist
+#: yet).
+#:
+#: 1. C0/DEL/C1 control chars (ord<0x20, 0x7F, 0x80-0x9F).
+#:    Criterion: control character.
+#:    Escape (_sanitize_route_name_control_chars): escaped, \\xHH.
+#:    Blankness (_is_blank_identity): NOT a member - a lone C0 control
+#:    is corrupt content, not "no content" (see NOTE below).
+#:    Collision (digests.*_id): n/a - F1/F2's own identity_name/
+#:    identity_target split bypasses the escaped/bounded value entirely
+#:    for every route/pattern identity input.
+#:
+#: 2. _UNICODE_DIRECTIONAL_AND_LINE_CONTROL_CHARS (12 members: LRM/RLM/
+#:    ALM, LRE/RLE/PDF/LRO/RLO, LRI/RLI/FSI/PDI, LINE/PARAGRAPH
+#:    SEPARATOR).
+#:    Criterion: renders as nothing, or lies about structure.
+#:    Escape: escaped, \\uHHHH.
+#:    Blankness: a member (round 40 F3 - was NOT consulted before this
+#:    round; that gap was this round's own F3 finding).
+#:    Collision: n/a - same identity_name/identity_target bypass.
+#:
+#: 3. _UNICODE_INVISIBLE_FORMAT_CHARS (4 members: ZWSP U+200B, SOFT
+#:    HYPHEN U+00AD, WORD JOINER U+2060, ZWNBSP U+FEFF).
+#:    Criterion: renders as nothing.
+#:    Escape: escaped, \\uHHHH.
+#:    Blankness: a member (round 39 F4).
+#:    Collision: n/a - same bypass.
+#:
+#: 4. Ordinary Python whitespace (str.isspace()).
+#:    Criterion: renders as a real gap, not nothing.
+#:    Escape: NOT escaped - passes through unchanged (a real gap is not
+#:    a rendering hazard).
+#:    Blankness: a member (via decoded.isspace()).
+#:    Collision: n/a - same bypass.
+#:
+#: NOTE: ESCAPE and BLANKNESS deliberately use DIFFERENT criteria by
+#: design (reviewer-ratified, round 40's own F3 dispatch) - ESCAPE asks
+#: "could this character's RAW form corrupt a downstream consumer
+#: (JSON-Lines logging, a terminal table, reading order)," BLANKNESS
+#: asks "does this character contribute any VISIBLE content at all."
+#: The two closed Unicode sets satisfy both questions identically (every
+#: member of each renders as nothing or lies about structure), so they
+#: are escaped AND blank-eligible; whitespace is escape-exempt (a
+#: literal space is not a corruption hazard) but IS blank-eligible (an
+#: all-whitespace identity is still empty); C0/DEL/C1 controls are
+#: escape-only (never blank-eligible - a lone C0 control is not "no
+#: content," it is corrupt content, a materially different problem the
+#: existing decode-failure/undecodable machinery already reports
+#: separately). COLLISION never consults any of these sets directly -
+#: F1/F2's own fix (round 40) made every route/pattern identity input
+#: bypass the escaped/bounded value entirely via identity_name/
+#: identity_target, so no closed-set membership choice can ever cause a
+#: route/pattern id collision again; a pom coordinate/class qualified
+#: name was never escaped or bounded in the first place (S1's own
+#: audit, round 40), so it needs no such bypass.
+
 #: FIX ROUND 22 (eighteenth cold read, F6 MINOR, wrong-data): this
 #: function's own docstring promises "safe, single-line, printable
 #: text" - but only C0/DEL were ever escaped; a Unicode BIDI-control
