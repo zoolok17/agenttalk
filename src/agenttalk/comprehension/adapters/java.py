@@ -235,6 +235,7 @@ UNSUPPORTED_ENTRY_POINT_SHAPES = (
     "ejb_remote_component", "websocket_server_endpoint",
     "web_xml_listener", "servlet_name_scoped_filter", "startup_only_servlet",
     "jsp_file_servlet", "jax_rs_sub_resource_locator",
+    "jax_rs_method_path_without_root_resource",
 )
 
 #: FIX ROUND 21c (reviewer-3's re-delta, THE ASK - second instance, closing
@@ -2792,6 +2793,40 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             ))
             continue
         prefixes = class_route_prefix.get(enclosing)
+        # FIX ROUND 43 (thirty-seventh cold read, N3, judged - suppress):
+        # the STANDALONE-method-route branch just below (``elif paths:``)
+        # composes a method-level route with no class-level prefix at
+        # all, unconditionally - a real, valid shape for SPRING (a
+        # @Controller/@RestController needs no class-level
+        # @RequestMapping; a bare method-level @GetMapping is a fully
+        # served route on its own), but that Spring-specific reasoning
+        # was never re-examined for JAX-RS when this same branch started
+        # handling both families. Per JAX-RS's own spec (JSR-370 s3.1):
+        # "Root resource classes are POJOs that are annotated with
+        # @Path" - a class with NO class-level @Path is never registered
+        # as a root resource at all, so a method-level @Path on it is
+        # unreachable through this class alone (it could only ever
+        # matter as a sub-resource returned by ANOTHER resource's own
+        # locator method - a cross-file relationship this single-file
+        # producer cannot trace, and a materially different, weaker
+        # claim than "this class serves this route"). Publishing it as a
+        # confident http_route the same way Spring's genuinely-valid
+        # standalone shape does is the false positive. `prefixes is
+        # None` here means "no class-level route annotation of ANY kind
+        # was found for this class" - `class_route_prefix_unrecoverable`
+        # (a DIFFERENT, already-suppressed shape: one WAS found but
+        # could not be read) was already excluded by the fail-safe
+        # above.
+        if match.group(1) == "Path" and prefixes is None and paths:
+            problems.append(JavaAdapterProblem(
+                reason_code="unsupported_entry_point_shape",
+                detail=bounded_detail(f"a @Path method at line {line} has no class-level @Path "
+                       "on its own enclosing class - JAX-RS requires a class-level @Path to "
+                       "register a root resource at all (jax_rs_method_path_without_root_"
+                       "resource); not a route this class alone can serve"),
+                qualified_name=enclosing,
+            ))
+            continue
         if prefixes:
             if paths:
                 composed = [_compose_route_path(prefix, p) for prefix in prefixes for p in paths]

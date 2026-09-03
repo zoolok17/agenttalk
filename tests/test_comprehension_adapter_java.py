@@ -4077,6 +4077,55 @@ public class ItemResource {
     assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
 
 
+def test_a_jax_rs_method_path_with_no_class_level_path_is_not_a_root_resource():
+    """FIX ROUND 43 (thirty-seventh cold read, N3, wrong-data - judged,
+    suppress): a class with NO class-level @Path is never a JAX-RS root
+    resource at all (JSR-370 s3.1: "root resource classes ... are
+    annotated with @Path") - its own method-level @Path is unreachable
+    on its own (it could only ever matter as a sub-resource returned by
+    ANOTHER resource's own locator method, a cross-file relationship
+    this single-file producer cannot trace). The STANDALONE-method-
+    route branch used to compose this unconditionally, correct for
+    Spring (no class-level @RequestMapping required there) but never
+    re-examined for JAX-RS specifically - a confident false-positive
+    http_route for a class that cannot actually serve one."""
+    src = """
+package p;
+
+public class OrderResource {
+    @GET
+    @Path("/orders")
+    public void list() {}
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    assert not any(e.kind == "http_route" for e in result.entry_points)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.OrderResource"
+    assert "jax_rs_method_path_without_root_resource" in problem.detail
+
+
+def test_a_spring_method_mapping_with_no_class_level_mapping_still_publishes_the_route():
+    """FIX ROUND 43 (N3, Spring-parity control): the SAME standalone
+    shape (no class-level route annotation, a real method-level one)
+    for SPRING must keep publishing exactly as it always has - the
+    round 43 fix is JAX-RS-specific (gated on ``match.group(1) ==
+    "Path"``), never touching Spring's own genuinely valid standalone-
+    method-route shape."""
+    src = """
+package p;
+
+public class OrderController {
+    @GetMapping("/orders")
+    public void list() {}
+}
+"""
+    result = java.parse_java_source("OrderController.java", src)
+    assert any(e.kind == "http_route" for e in result.entry_points)
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+
+
 def test_an_application_path_prefix_is_never_composed_into_a_published_route():
     """FIX ROUND 43 (thirty-seventh cold read, F5 MAJOR, .cr37-apppath,
     completeness - declared, not fixed): a JAX-RS @ApplicationPath on

@@ -607,10 +607,25 @@ evidence can support:
 - source is included and understood by an adapter;
 - direct internal dependencies are resolved or explicitly marked dynamic;
 - externally visible entry points are mapped;
-- the unit is linked to a confirmed feature or explicitly classified shared;
+- the unit is linked to a confirmed feature (`feature_linked`);
 - build/test or characterization evidence is located, otherwise unknown;
 - statically visible external integration, configuration, and data boundaries
   are identified, otherwise unknown.
+
+NAMED LIMIT (reconciled, PR-B round 43, N2): this list used to also read "...
+or explicitly classified shared" for the `feature_linked` bullet - no
+"shared" classification value exists anywhere in this implementation (the
+classification vocabulary is `production`/`test` only), and
+`readiness_artifact._check_feature_linked` has no bypass for
+infrastructure/shared code either - a unit with zero linked features always
+reports `unsatisfied`/`no_feature_link`, regardless of what kind of code it
+is. The aspiration was never built, and the design text describing it as
+already-covered was reconciled to match, rather than left for a reader to
+discover only by diffing prose against code. Left open (not decided this
+round): whether "shared/infrastructure code should not need a feature link
+to read as satisfied" is worth building at all - it would need its own
+classification value, its own producer, and a definition of what counts as
+"shared" this scan can actually evidence, none of which exist yet.
 
 The immutable artifact stores `stored_assessment_state`: `assessed`,
 `needs_evidence`, `blocked`, or `not_applicable`. Any required scan-time blocker
