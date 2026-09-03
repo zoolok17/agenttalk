@@ -12,7 +12,29 @@ generic edge."
 Per the lead's decided item-3 relation scope on the approved PR-B plan
 (rq-cd8eac8f2bca dispatch, 2026-08-27):
 
-    1. import, inherit, build, test - as planned.
+    1. import, inherit, build, test - as planned. NAMED LIMIT
+       (declared, FIX ROUND 45): the recognized TEST SOURCE ROOT
+       conventions are a closed, PROVISIONAL set - Maven's own
+       ``src/test/`` and ``src/it/`` (the failsafe/invoker-plugin
+       integration-test convention), and a bare top-level ``tests?/``
+       (the Ant-style pre-Maven layout) - matched CASE-INSENSITIVELY
+       (round 37's own F4 policy: one case policy, lowercase before
+       matching, applied here to close a real gap - a platform this
+       producer itself records as case-insensitive treated
+       ``src/Test/`` and ``src/test/`` as different facts about the
+       identical directory). A MODULE-LOCAL bare ``test/`` segment
+       (e.g. ``svc/test/Foo.java``, an Ant-style layout nested inside a
+       multi-module repo rather than at its own root) is deliberately
+       NOT recognized here or in ``modules_artifact.py``'s own
+       ``_default_classification`` - round 15's own established rule
+       (a package literally named ``test`` is common in legacy/lab
+       code with zero supporting evidence of being a real test root)
+       already requires CORROBORATION (a same-file test-framework
+       import) before trusting a bare ``test/`` segment, and neither
+       this path-only classification nor the worker's own web.xml
+       gate has per-file import evidence available to provide it -
+       only ``_classify``'s own richer, per-file call (which DOES see
+       imports) applies the bare-segment rule, with corroboration.
     2. invoke - direct syntactic same-file/qualified static calls only, NO
        type resolution, evidence_class=extracted.
     3. route - ONLY as a named, annotation-DECLARED producer: Spring MVC
@@ -334,7 +356,7 @@ ENTRY_POINT_KINDS: dict[str, str] = {
 #: F3 fixed was a test segment declared INSIDE a package path
 #: (``com/lab/test/TestOrder.java``), never the repository root itself;
 #: root-anchoring here does not reopen that hole.
-_TEST_SOURCE_ROOT_SEGMENT = re.compile(r"(?:^|/)src/test/|^tests?/")
+_TEST_SOURCE_ROOT_SEGMENT = re.compile(r"(?:^|/)src/(?:test|it)/|^tests?/")
 _BARE_TEST_PATH_SEGMENT = re.compile(r"(?:^|/)test/")
 #: FIX ROUND 14 (tenth cold read, CR10-7 MINOR, wrong-data): a bare
 #: name-suffix match alone is NOT corroborating evidence on its own - an
@@ -1223,7 +1245,21 @@ def _line_at(newline_offsets: list[int], offset: int) -> int:
 def _classify(
     relative_path: str, simple_name: str | None, *, has_test_framework_evidence: bool = False,
 ) -> str:
-    normalized_path = relative_path.replace("\\", "/")
+    # FIX ROUND 45 (thirty-ninth cold read, F1 MAJOR, wrong-data): this
+    # used to match `_TEST_SOURCE_ROOT_SEGMENT`/`_BARE_TEST_PATH_SEGMENT`
+    # (both lowercase-only patterns) case-SENSITIVELY against the raw
+    # path - on a platform this run itself records as case-insensitive
+    # (the common case: Windows/default macOS), `src/Test/...` and
+    # `src/test/...` name the IDENTICAL directory but classified
+    # differently. Round 37's own F4 already established this
+    # producer's own policy for exactly this situation ("one case
+    # policy: lowercase before matching, exactly like worker.py already
+    # does") - applied here now too. Never applied to `simple_name`
+    # below: a Java class NAME is case-sensitive by language rule,
+    # always, regardless of platform - `_TEST_NAME_SUFFIX`'s own
+    # deliberately-mixed-case pattern (`Test|Tests|IT`) must stay
+    # exactly as case-sensitive as Java identifiers themselves are.
+    normalized_path = relative_path.replace("\\", "/").lower()
     if _TEST_SOURCE_ROOT_SEGMENT.search(normalized_path):
         return "test"
     if _BARE_TEST_PATH_SEGMENT.search(normalized_path) and has_test_framework_evidence:
@@ -2634,7 +2670,13 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         # split ``_classify`` now applies.
         if _TEST_NAME_SUFFIX.search(simple) and (
             has_test_framework_evidence
-            or _TEST_SOURCE_ROOT_SEGMENT.search(relative_path.replace("\\", "/"))
+            # FIX ROUND 45 (F1 MAJOR, wrong-data): this is a FOURTH real
+            # call site of the same case-sensitivity bug named for
+            # `_classify` and worker.py's own gate - matched against
+            # the raw path, never lower-cased. Round 37's own F4 "one
+            # case policy" applies identically here (path matching
+            # only; `simple`, a Java identifier, is never lower-cased).
+            or _TEST_SOURCE_ROOT_SEGMENT.search(relative_path.replace("\\", "/").lower())
         ):
             under_test = _TEST_NAME_SUFFIX.sub("", simple)
             if under_test:

@@ -1077,6 +1077,80 @@ def test_process_paths_a_docs_example_web_xml_is_still_stray_counted_after_f2(
     assert result.exclusions == {"stray_web_xml_ignored": 1}
 
 
+def test_process_paths_an_upper_case_src_test_web_inf_web_xml_is_also_stray_counted(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 45 (thirty-ninth cold read, F1 MAJOR, wrong-data,
+    .cr39-casetest): the round-44 F2 gate matched
+    `_TEST_SOURCE_ROOT_SEGMENT` (a lowercase-only pattern) against the
+    RAW path, never lower-cased - on a case-insensitive filesystem
+    (Windows/default-macOS, both explicitly in scope for this
+    producer), ``src/Test/...`` and ``src/test/...`` name the identical
+    directory, yet only the second one was ever recognized as test
+    source. Applying round 37's own F4 "one case policy" here (the
+    WEB-INF parent-name check one clause earlier in the same
+    expression already lower-cases its own operand)."""
+    web_inf = tmp_path / "src" / "Test" / "resources" / "WEB-INF"
+    web_inf.mkdir(parents=True)
+    (web_inf / "web.xml").write_text(_web_xml_with_one_mapping(), encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["src/Test/resources/WEB-INF/web.xml"])
+    assert result.problems == []
+    assert "src/Test/resources/WEB-INF/web.xml" not in result.java_results
+    assert result.exclusions == {"stray_web_xml_ignored": 1}
+
+
+def test_process_paths_a_lower_case_src_test_web_inf_web_xml_still_stray_counted(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 45 (F1 MAJOR, .cr39-casetest-lower, regression control):
+    the already-lowercase spelling from round 44 must keep landing in
+    the same bucket after the case-fold is added - the fix only widens
+    recognition, it must never narrow it."""
+    web_inf = tmp_path / "src" / "test" / "resources" / "WEB-INF"
+    web_inf.mkdir(parents=True)
+    (web_inf / "web.xml").write_text(_web_xml_with_one_mapping(), encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["src/test/resources/WEB-INF/web.xml"])
+    assert result.problems == []
+    assert "src/test/resources/WEB-INF/web.xml" not in result.java_results
+    assert result.exclusions == {"stray_web_xml_ignored": 1}
+
+
+def test_process_paths_a_src_it_web_inf_web_xml_is_also_stray_counted(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 45 (F1 MAJOR, .cr39-testroots): Maven's own ``src/it/``
+    (the failsafe/invoker-plugin integration-test convention) is a real
+    test source root round 44's own predicate never recognized -
+    widened alongside ``src/test/`` and the bare ``tests?/`` root."""
+    web_inf = tmp_path / "src" / "it" / "some-invoker-test" / "WEB-INF"
+    web_inf.mkdir(parents=True)
+    (web_inf / "web.xml").write_text(_web_xml_with_one_mapping(), encoding="utf-8")
+    result = worker.process_paths(
+        tmp_path, ["src/it/some-invoker-test/WEB-INF/web.xml"])
+    assert result.problems == []
+    assert "src/it/some-invoker-test/WEB-INF/web.xml" not in result.java_results
+    assert result.exclusions == {"stray_web_xml_ignored": 1}
+
+
+def test_process_paths_a_src_iterations_web_inf_web_xml_still_publishes(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 45 (F1 MAJOR, .cr39-testroots, negative control): a
+    ``src/iterations/`` directory must NOT be mistaken for ``src/it/`` -
+    the widened pattern requires a trailing ``/`` immediately after
+    ``it``, so a same-prefix segment name must keep publishing its
+    route exactly as before."""
+    web_inf = tmp_path / "src" / "iterations" / "webapp" / "WEB-INF"
+    web_inf.mkdir(parents=True)
+    (web_inf / "web.xml").write_text(_web_xml_with_one_mapping(), encoding="utf-8")
+    result = worker.process_paths(
+        tmp_path, ["src/iterations/webapp/WEB-INF/web.xml"])
+    assert result.exclusions == {}
+    entry_points = result.java_results[
+        "src/iterations/webapp/WEB-INF/web.xml"]["entry_points"]
+    assert entry_points[0]["name"] == "/example"
+
+
 def test_test_source_root_segment_stays_hand_synced_across_every_copy() -> None:
     """MICRO-ROUND 44b (F3, the hand-synced-set hazard, second
     instance): `_TEST_SOURCE_ROOT_SEGMENT` has THREE real, compiled

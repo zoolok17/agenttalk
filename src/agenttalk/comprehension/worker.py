@@ -56,7 +56,7 @@ from .errors import ComprehensionError, bounded_detail, bounded_os_error_detail
 #: "Named decisions and residuals") - a shared, lower-level module all
 #: three could import from would close this properly, wider than this
 #: fix.
-_TEST_SOURCE_ROOT_SEGMENT = re.compile(r"(?:^|/)src/test/|^tests?/")
+_TEST_SOURCE_ROOT_SEGMENT = re.compile(r"(?:^|/)src/(?:test|it)/|^tests?/")
 
 _ADAPTER_EXTENSIONS = {".java": java_adapter}
 _ADAPTER_HANDLED_XML_BASENAMES = frozenset({"pom.xml", "web.xml"})
@@ -775,7 +775,15 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                     ))
         elif rel_name_lower == "web.xml" and (
             Path(rel).parent.name.lower() != "web-inf"
-            or _TEST_SOURCE_ROOT_SEGMENT.search(rel.replace("\\", "/"))
+            # FIX ROUND 45 (thirty-ninth cold read, F1 MAJOR, wrong-
+            # data): this used to match case-SENSITIVELY against a
+            # lowercase-only pattern, one clause after the `WEB-INF`
+            # parent-name check right above it ALREADY lowercases its
+            # own operand - the inconsistency was within this one
+            # expression. `src/Test/...` and `src/test/...` name the
+            # SAME directory on a case-insensitive platform (the
+            # common case); round 37's own F4 policy applies here too.
+            or _TEST_SOURCE_ROOT_SEGMENT.search(rel.replace("\\", "/").lower())
         ):
             # FIX ROUND 43 (thirty-seventh cold read, F4 MAJOR, wrong-
             # data - declared gap): per the Servlet spec, a REAL

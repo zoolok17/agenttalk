@@ -462,6 +462,25 @@ Each unit record contains:
 | `conflict_id` | Optional stable link shared by incompatible claims. |
 | `evidence` | Bounded local evidence pointers. |
 
+**NAMED LIMIT (declared, PR-B round 45, F1):** a `test` classification driven
+by path alone recognizes a closed, provisional set of test-source-root
+conventions - Maven's own `src/test/`, Maven's `src/it/` (the
+failsafe/invoker-plugin integration-test convention, added this round), and a
+bare top-level `tests?/` - matched case-insensitively (round 37's own F4 "one
+case policy": lowercase before matching, extended here to close a real gap -
+this producer already records the default platform as case-insensitive, so
+`src/Test/` and `src/test/` name the identical directory and must not be
+classified differently). This case-fold applies to path matching only; it is
+never applied to a Java identifier check (the `Test`/`Tests`/`IT` simple-name
+suffix), since Java identifiers are case-sensitive by language rule regardless
+of platform. A MODULE-LOCAL bare `test/` segment not anchored under `src/` or
+the repository root (an Ant-style layout such as `svc/test/Foo.java`) is
+deliberately NOT recognized by the path-only classifiers (`modules_artifact.py`
+and the worker's own descriptor gate) - round 15's own rule already requires a
+same-file test-framework import as corroboration before trusting a bare
+`test/` segment that lightly, and only the adapter's own per-file
+`_classify` call has that per-file import evidence available.
+
 Renaming a unit changes its path-derived ID. Matching a rename by content hash
 may appear in a future S4 two-run projection as a candidate, but it must not
 silently rewrite identity. This keeps references auditable and avoids false

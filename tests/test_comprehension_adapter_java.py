@@ -528,6 +528,61 @@ def test_a_package_segment_literally_named_test_still_stays_production():
     assert result.units[0].classification == "production"
 
 
+def test_an_upper_case_src_test_path_classifies_as_test_with_no_corroboration(
+) -> None:
+    """FIX ROUND 45 (thirty-ninth cold read, F1 MAJOR, wrong-data,
+    .cr39-casetest): `_classify`'s own test-source-root check matched
+    `_TEST_SOURCE_ROOT_SEGMENT` (a lowercase-only pattern) against the
+    RAW path, never lower-cased - on a case-insensitive filesystem
+    (Windows/default-macOS), ``src/Test/...`` and ``src/test/...`` name
+    the identical directory, yet only the second spelling was ever
+    recognized as sufficient evidence alone. Round 37's own F4 "one
+    case policy" (lowercase before matching) closes this the same way
+    it already closed worker.py's own dispatch."""
+    src = "package p;\nclass Helper {\n}\n"
+    result = java.parse_java_source("src/Test/java/p/Helper.java", src)
+    assert result.units[0].classification == "test"
+
+
+def test_a_src_it_path_classifies_as_test_with_no_corroboration() -> None:
+    """FIX ROUND 45 (F1 MAJOR, .cr39-testroots): Maven's own ``src/it/``
+    (the failsafe/invoker-plugin integration-test convention) is a real
+    test source root, sufficient alone exactly like ``src/test/`` - not
+    previously recognized by `_TEST_SOURCE_ROOT_SEGMENT`."""
+    src = "package p;\nclass Helper {\n}\n"
+    result = java.parse_java_source("src/it/java/p/Helper.java", src)
+    assert result.units[0].classification == "test"
+
+
+def test_a_src_iterations_path_without_corroboration_stays_production() -> None:
+    """FIX ROUND 45 (F1 MAJOR, .cr39-testroots, negative control): a
+    ``src/iterations/`` package segment must not be mistaken for
+    ``src/it/`` - the widened pattern requires a trailing ``/``
+    immediately after ``it``, so this stays production without
+    corroboration, exactly as before the widening."""
+    src = "package p;\nclass Helper {\n}\n"
+    result = java.parse_java_source("src/iterations/java/p/Helper.java", src)
+    assert result.units[0].classification == "production"
+
+
+def test_a_name_suffix_hit_under_an_upper_case_src_test_root_still_produces_a_test_edge(
+) -> None:
+    """FIX ROUND 45 (F1 MAJOR, wrong-data, fourth real call site): the
+    name-suffix test-edge corroboration check (FIX ROUND 14/15's own
+    ``_TEST_NAME_SUFFIX`` + source-root fallback, at the nested-type
+    loop) has its OWN separate `_TEST_SOURCE_ROOT_SEGMENT.search(...)`
+    call, matched against the raw path exactly like `_classify`'s own
+    pre-fix bug - case-folded here too, so a same-file suffix hit under
+    ``src/Test/...`` (no test-framework import at all) still corroborates
+    and produces the test edge, not silently dropped by case alone."""
+    src = "package p;\nclass FooTest {\n}\n"
+    result = java.parse_java_source("src/Test/java/p/FooTest.java", src)
+    assert result.units[0].classification == "test"
+    test_edges = _edges(result, "test")
+    assert len(test_edges) == 1
+    assert test_edges[0].target == "Foo"
+
+
 # ----------------------------------------------------------- invoke
 
 def test_qualified_call_resolves_against_an_import():

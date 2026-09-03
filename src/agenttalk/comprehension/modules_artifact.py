@@ -80,7 +80,7 @@ _LANGUAGE_BY_BASENAME = {"pom.xml": "xml", "web.xml": "xml"}
 #: layout) - sufficient alone. Anchored to the very START of the path
 #: ONLY - the bug F3 fixed was a test segment INSIDE a package path,
 #: never the repository root itself; root-anchoring does not reopen it.
-_TEST_SOURCE_ROOT_SEGMENT = re.compile(r"(?:^|/)src/test/|^tests?/")
+_TEST_SOURCE_ROOT_SEGMENT = re.compile(r"(?:^|/)src/(?:test|it)/|^tests?/")
 
 
 @dataclass(frozen=True)
@@ -288,7 +288,14 @@ def _is_confident_infrastructure_path(relative_path: str) -> bool:
 
 
 def _default_classification(relative_path: str) -> str:
-    if _TEST_SOURCE_ROOT_SEGMENT.search(relative_path.replace("\\", "/")):
+    # FIX ROUND 45 (thirty-ninth cold read, F1 MAJOR, wrong-data): the
+    # same case-sensitivity bug java.py's own _classify just fixed -
+    # `_TEST_SOURCE_ROOT_SEGMENT` is a lowercase-only pattern, matched
+    # here case-sensitively against a path that may reach this producer
+    # in ANY case on a case-insensitive filesystem (the common case).
+    # Round 37's own F4 policy: one case policy, lowercase before
+    # matching.
+    if _TEST_SOURCE_ROOT_SEGMENT.search(relative_path.replace("\\", "/").lower()):
         return "test"
     return "production"
 

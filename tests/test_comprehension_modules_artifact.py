@@ -44,6 +44,46 @@ def test_a_file_under_a_test_path_is_classified_test():
     assert records[0].classification == ["test"]
 
 
+def test_a_file_under_an_upper_case_src_test_path_is_also_classified_test():
+    """FIX ROUND 45 (thirty-ninth cold read, F1 MAJOR, wrong-data,
+    .cr39-casetest): `_default_classification` matched
+    `_TEST_SOURCE_ROOT_SEGMENT` (a lowercase-only pattern)
+    case-SENSITIVELY against the raw path - on a case-insensitive
+    filesystem, ``src/Test/...`` and ``src/test/...`` name the
+    identical directory, yet only the lowercase spelling was ever
+    classified test. Round 37's own F4 "one case policy" applies here
+    too."""
+    discovery = _discovery([
+        EnumeratedFile(relative_path="src/Test/resources/fixture.txt", byte_count=1, content_digest="d"),
+    ])
+    records = ma.build_modules(discovery, {})
+    assert records[0].classification == ["test"]
+
+
+def test_a_file_under_a_src_it_path_is_also_classified_test():
+    """FIX ROUND 45 (F1 MAJOR, .cr39-testroots): Maven's own ``src/it/``
+    (the failsafe/invoker-plugin integration-test convention) is a real
+    test source root, not previously recognized by
+    `_TEST_SOURCE_ROOT_SEGMENT`."""
+    discovery = _discovery([
+        EnumeratedFile(relative_path="src/it/some-invoker-test/fixture.txt", byte_count=1, content_digest="d"),
+    ])
+    records = ma.build_modules(discovery, {})
+    assert records[0].classification == ["test"]
+
+
+def test_a_file_under_a_src_iterations_path_is_not_classified_test():
+    """FIX ROUND 45 (F1 MAJOR, .cr39-testroots, negative control): a
+    ``src/iterations/`` directory must not be mistaken for ``src/it/`` -
+    the widened pattern requires a trailing ``/`` immediately after
+    ``it``."""
+    discovery = _discovery([
+        EnumeratedFile(relative_path="src/iterations/webapp/fixture.txt", byte_count=1, content_digest="d"),
+    ])
+    records = ma.build_modules(discovery, {})
+    assert records[0].classification == ["infrastructure"]
+
+
 def test_an_encoding_undecodable_non_adapter_xml_publishes_no_classification():
     """FIX ROUND 28 (twenty-fourth cold read, F2 BLOCKER, round-27
     regression, wrong-data): round 27's own F3 fix widened non_
