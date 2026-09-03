@@ -555,6 +555,26 @@ def test_enumerate_scope_excludes_round_35_widened_secret_file_patterns(
     assert result.exclusions.get("secret") == 1
 
 
+def test_enumerate_scope_excludes_a_secret_shaped_directory_name_not_just_files(
+    tmp_path: Path,
+) -> None:
+    """M (cold-read PR-B fix round 47 completeness): secret-pattern
+    matching used to apply to FILES only - a directory literally named
+    ``.env`` (a real convention: a whole directory of per-environment
+    secret files) walked its children uninhibited, publishing whatever
+    was inside as ordinary discovered files. The SAME closed pattern set
+    now also governs directory names, excluding the whole subtree the
+    same safe way a secret-shaped file already is."""
+    env_dir = tmp_path / ".env"
+    env_dir.mkdir()
+    (env_dir / "production").write_bytes(b"DB_PASSWORD=hunter2\n")
+    (tmp_path / "App.java").write_bytes(b"class App {}\n")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert [f.relative_path for f in result.files] == ["App.java"]
+    assert result.exclusions.get("secret") == 1
+
+
 def test_enumerate_scope_excludes_a_credentials_json_service_account_key(tmp_path: Path) -> None:
     """FIX ROUND 41 (thirty-fifth cold read, F7 POLISH, completeness): the
     bare ``credentials`` literal (an AWS-CLI-style file) was already

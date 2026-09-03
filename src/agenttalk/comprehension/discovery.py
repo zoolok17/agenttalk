@@ -826,6 +826,19 @@ def _exclusion_category(name: str, relative_path: str, *, is_dir: bool) -> str |
             relative_path,
         ):
             return "generated_or_vendor"
+        # M (cold-read PR-B fix round 47 completeness): secret-pattern
+        # matching used to apply to FILES only - a directory literally
+        # named ``.env`` (a real, if less common, convention: a whole
+        # directory of per-environment secret files, e.g. ``.env/
+        # production``) walked its children uninhibited, since this
+        # branch returned before ever consulting
+        # _matches_any_secret_pattern. The SAME closed, casefolded
+        # pattern set already governs files - reused here unchanged (no
+        # second, parallel notion of "secret-shaped"), so a secret-shaped
+        # directory name is excluded, subtree and all, the same safe
+        # direction this producer already takes for a secret-shaped file.
+        if _matches_any_secret_pattern(name):
+            return "secret"
         return None
     if _matches_any_secret_pattern(name):
         return "secret"

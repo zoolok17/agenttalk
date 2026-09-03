@@ -2289,6 +2289,27 @@ STATUS_ARTIFACT_INTEGRITY_HINT = (
     "verification."
 )
 
+#: M (cold-read PR-B fix round 47 completeness): ``root_binding`` (privacy.
+#: PrivacyPreflightResult's own docstring) is verified against the CURRENT
+#: root exactly ONCE, at write time, by ``lock.acquire_scan_lock`` - never
+#: again after that. No read command (this function, `report`, `validate`)
+#: recomputes ``digests.root_binding_digest`` of the root it was actually
+#: invoked against and compares it to the value recorded here; a run
+#: directory renamed, copied, or transplanted wholesale into a DIFFERENT
+#: project root (or a store moved to a different path on the same machine)
+#: still reports this same root_binding value, unverified, and every read
+#: command still reports valid:true/status "complete" for it. The same
+#: "declare it, don't leave it to be independently rediscovered"
+#: discipline STATUS_ARTIFACT_INTEGRITY_HINT already follows for a
+#: different narrower-than-assumed guarantee.
+ROOT_BINDING_VERIFICATION_CAVEAT = (
+    "root_binding is bound to the project root at SCAN (write) time only, "
+    "verified there once by the writer lock - no read command (status/"
+    "report/validate) recomputes or re-checks it against the root a read is "
+    "actually invoked against; a run directory renamed, copied, or moved to "
+    "a different project root still reports this same value, unverified."
+)
+
 
 def get_status(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
     """design: "Show the latest run, completeness, source revision/
@@ -2347,6 +2368,7 @@ def get_status(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
         ),
         "record_counts": _scan_field(scan_doc, "record_counts", scan_id),
         "root_binding": _scan_field(scan_doc, "root_binding", scan_id),
+        "root_binding_verification_caveat": ROOT_BINDING_VERIFICATION_CAVEAT,
         # Note 1 (second cold read, fix round 4): this function's own
         # docstring cites the design's "source revision/fingerprint" as
         # part of what status shows - it was never actually returned.

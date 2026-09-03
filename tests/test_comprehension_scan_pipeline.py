@@ -5903,6 +5903,23 @@ def test_get_status_declares_its_own_narrower_verification_tier(java_repo: Path)
     assert "validate" in status["artifact_integrity_hint"]
 
 
+def test_get_status_declares_root_binding_is_never_reverified_on_read(java_repo: Path) -> None:
+    """M (cold-read PR-B fix round 47 completeness): root_binding is
+    checked against the current root exactly once, at write time
+    (lock.acquire_scan_lock) - no read command recomputes or re-verifies
+    it, so a run directory renamed/transplanted into a different project
+    root still reports valid:true/status "complete" for it. Declared
+    alongside the field itself now, the same discipline
+    STATUS_ARTIFACT_INTEGRITY_HINT already follows for a different gap."""
+    scan_pipeline.run_scan(java_repo)
+    status = scan_pipeline.get_status(java_repo)
+    assert (
+        status["root_binding_verification_caveat"]
+        == scan_pipeline.ROOT_BINDING_VERIFICATION_CAVEAT
+    )
+    assert "root_binding" in status
+
+
 def test_get_status_before_any_scan_raises_not_scanned(tmp_path: Path) -> None:
     with pytest.raises(scan_pipeline.NotScanned):
         scan_pipeline.get_status(tmp_path)
