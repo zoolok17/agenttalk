@@ -3744,6 +3744,166 @@ def test_a_cdata_wrapped_pom_module_publishes_the_reactor_path():
     assert java.declared_reactor_module_paths(pom) == ["core"]
 
 
+def test_a_self_closed_top_level_modules_never_declares_a_profile_s_own_reactor_entry():
+    """FIX ROUND 43 (thirty-seventh cold read, F1 BLOCKER, .cr37-
+    selfclose-mod, wrong-data - THE SELF-CLOSING TAG DEFECT): a self-
+    closing ``<modules/>`` used to match as an OPENING tag (the shared
+    ``[^>]*>`` prefix freely absorbs the trailing ``/``), and with no
+    body of its own, the lazy/DOTALL capture scanned FORWARD to the
+    NEXT ``</modules>`` anywhere in the document - here, a PROFILE's
+    own conditionally-active module list - fabricating a phantom
+    UNCONDITIONAL reactor member out of a declaration this producer's
+    own "declare the module's own facts, not a conditional
+    activation's" rule (see this function's own docstring) explicitly
+    excludes. Now a self-closed ``<modules/>`` is an explicit, empty
+    element - it has no children to yield, so the profile's own list is
+    never even reached through it."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <modules/>
+  <profiles>
+    <profile>
+      <modules>
+        <module>only-active-in-profile</module>
+      </modules>
+    </profile>
+  </profiles>
+</project>
+"""
+    assert java.declared_reactor_module_paths(pom) == []
+
+
+def test_a_self_closed_top_level_modules_with_a_space_before_the_slash_is_the_same_empty_element():
+    """FIX ROUND 43 (.cr37-selfclose-space): the ``<modules />`` spelling
+    (whitespace before the self-closing ``/``) must be recognized
+    identically to ``<modules/>`` - a real, common XML formatting
+    choice, not a different shape."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <modules />
+  <profiles>
+    <profile>
+      <modules>
+        <module>only-active-in-profile</module>
+      </modules>
+    </profile>
+  </profiles>
+</project>
+"""
+    assert java.declared_reactor_module_paths(pom) == []
+
+
+def test_a_profile_s_own_declared_modules_alone_is_still_correctly_excluded():
+    """FIX ROUND 43 (.cr37-selfclose-ctl, control): the SAME profile-
+    only ``<modules>`` list, with NO self-closed top-level ``<modules/>``
+    anywhere in the document at all - this producer's existing, pre-
+    round-43 exclusion of profile-scoped modules must stay unchanged.
+    Distinguishes "the exclusion rule itself" (already correct) from
+    "the self-closing defect that used to bypass it" (round 43's own
+    fix)."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <profiles>
+    <profile>
+      <modules>
+        <module>only-active-in-profile</module>
+      </modules>
+    </profile>
+  </profiles>
+</project>
+"""
+    assert java.declared_reactor_module_paths(pom) == []
+
+
+def test_a_self_closed_top_level_dependencies_never_publishes_a_profile_s_own_dependency_as_direct():
+    """FIX ROUND 43 (thirty-seventh cold read, F1 BLOCKER, .cr37-
+    selfclose-dep, wrong-data): the SAME self-closing defect as the
+    ``<modules/>`` case above, for ``<dependencies/>`` - a self-closed
+    top-level ``<dependencies/>`` used to swallow forward into a
+    PROFILE's own ``<dependencies>`` block, publishing that profile-
+    scoped dependency as an unconditional, direct edge (round 11's own
+    M1 exclusion, bypassed). The profile's own dependency is still
+    correctly counted as profile-scoped (never lost, never fabricated
+    as direct)."""
+    pom = """<project>
+  <dependencies/>
+  <profiles>
+    <profile>
+      <dependencies>
+        <dependency>
+          <groupId>com.acme</groupId>
+          <artifactId>only-in-profile</artifactId>
+        </dependency>
+      </dependencies>
+    </profile>
+  </profiles>
+</project>
+"""
+    _units, edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert edges == []
+    assert profile_scoped_count == 1
+
+
+def test_a_self_closed_top_level_dependencies_and_modules_combined():
+    """FIX ROUND 43 (.cr37-selfclose, combined): both self-closing
+    defects (``<dependencies/>`` and ``<modules/>``) in ONE pom, each
+    followed by a profile's own conditionally-active list of the same
+    kind - neither published as an unconditional, top-level
+    declaration."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <modules/>
+  <dependencies/>
+  <profiles>
+    <profile>
+      <modules>
+        <module>only-active-in-profile</module>
+      </modules>
+      <dependencies>
+        <dependency>
+          <groupId>com.acme</groupId>
+          <artifactId>only-in-profile</artifactId>
+        </dependency>
+      </dependencies>
+    </profile>
+  </profiles>
+</project>
+"""
+    assert java.declared_reactor_module_paths(pom) == []
+    _units, edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert edges == []
+    assert profile_scoped_count == 1
+
+
+def test_an_ordinary_pom_with_no_self_closed_elements_is_unaffected():
+    """FIX ROUND 43 (.cr37-pom, control): a completely ordinary pom -
+    real open/close ``<modules>``/``<dependencies>``, no self-closing
+    tag anywhere - must publish exactly as it always has. Round 43's
+    fix must never change behavior for a well-formed document that
+    never exercises the self-closing branch at all."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <modules>
+    <module>core</module>
+  </modules>
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>core</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    assert java.declared_reactor_module_paths(pom) == ["core"]
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert [e.target for e in edges] == ["com.acme:core"]
+
+
 def test_a_cdata_wrapped_pom_optional_and_scope_decode_correctly():
     """FIX ROUND 25 (F8, wrong-data): <optional>/<scope> were left off
     round 24's decode-or-record discipline too - a CDATA-wrapped value
@@ -4994,6 +5154,97 @@ def test_pom_zero_width_space_only_artifactid_does_not_publish_a_bogus_coordinat
     units, _edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
     assert units == []
     assert java.pom_own_coordinate_decode_problems(pom) != []
+
+
+def test_a_self_closed_project_level_groupid_never_swallows_a_dependency_s_own_coordinate():
+    """FIX ROUND 43 (thirty-seventh cold read, F2 BLOCKER, .cr37-coord,
+    wrong-data - THE SELF-CLOSING TAG DEFECT): a self-closed project-
+    level ``<groupId/>`` used to match as an opening tag and its lazy
+    body scanned FORWARD to the NEXT ``</groupId>`` ANYWHERE in the
+    document-wide scan ``_own_and_parent_group_ids``/
+    ``pom_own_coordinate_decode_problems`` both run - here, a
+    dependency's own ``<groupId>``, several elements later. The
+    fabricated "value" was raw, unrelated XML markup (everything
+    between the two tags, including the dependency's own artifactId
+    and surrounding structure), and the dependency's own real
+    ``<groupId>`` match VANISHED from the scan entirely (its own start
+    position lay inside the text the phantom match had already
+    consumed).
+
+    Judged disposition (per the ``<parent/>``/comment-only-groupId fail-
+    safe precedent already established for "present but blank"): a
+    self-closed leaf is present with an EMPTY value, exactly as
+    undecodable as a comment-only or whitespace-only one - refused via
+    the EXISTING ``project_group_id_declared_but_broken``/
+    ``_is_blank_identity`` machinery, no new disposition needed. The
+    dependency's own coordinate, no longer swallowed, resolves
+    normally."""
+    pom = """<project>
+  <groupId/>
+  <artifactId>core</artifactId>
+  <dependencies>
+    <dependency>
+      <groupId>com.other</groupId>
+      <artifactId>lib</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert units == []
+    assert not any(":core" in u.qualified_name for u in units)
+    assert [e.target for e in edges] == ["com.other:lib"]
+    assert java.pom_own_coordinate_decode_problems(pom) != []
+
+
+def test_a_self_closed_project_level_artifactid_never_swallows_a_dependency_s_own_coordinate():
+    """FIX ROUND 43 (.cr37-coord-artifactId, F2 BLOCKER): the SAME
+    defect as the groupId case above, for the project's own
+    ``<artifactId/>`` - it must not swallow forward into a
+    dependency's own ``<artifactId>``, corrupting or losing both."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId/>
+  <dependencies>
+    <dependency>
+      <groupId>com.other</groupId>
+      <artifactId>lib</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert units == []
+    assert [e.target for e in edges] == ["com.other:lib"]
+    assert java.pom_own_coordinate_decode_problems(pom) != []
+
+
+def test_a_self_closed_parent_groupid_is_the_same_safe_absent_default_as_a_missing_parent():
+    """FIX ROUND 43 (.cr37-coord-parent, control): a self-closed
+    ``<parent><groupId/></parent>`` must land on the SAME safe "no
+    usable parent groupId" default a genuinely absent ``<parent>``
+    block already gets - never a crash, never a swallowed neighbor,
+    and (unlike the project-level case) no ``declared_but_broken``
+    problem either, since a missing/blank PARENT groupId is not this
+    pom's own coordinate being broken - it simply has no inherited
+    fallback."""
+    pom = """<project>
+  <parent>
+    <groupId/>
+    <artifactId>parent-core</artifactId>
+  </parent>
+  <artifactId>child</artifactId>
+  <dependencies>
+    <dependency>
+      <groupId>com.other</groupId>
+      <artifactId>lib</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert units == []
+    assert [e.target for e in edges] == ["com.other:lib"]
 
 
 def test_pom_a_visible_artifactid_containing_a_zero_width_space_is_unaffected():
