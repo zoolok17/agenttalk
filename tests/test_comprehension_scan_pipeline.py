@@ -2976,11 +2976,76 @@ def test_run_scan_two_out_of_scan_classes_sharing_a_simple_name_completes_not_re
     assert validate_result["valid"] is True
 
 
+def test_run_scan_three_ordinary_routes_publish_unaffected_by_the_identity_fix(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 40 (thirty-fourth cold read, Part A F1+F2, .cr34-canary,
+    control): a plain fixture of three ordinary, short, non-colliding
+    routes across three distinct servlet classes - none long enough to
+    truncate, none containing an escaped character - must publish
+    exactly as before this round's own identity/display split: 3
+    entry points, 3 edges, each with its own distinct id, names
+    unaffected. The identity fix only ever changes behavior when the
+    raw and bounded-display values DIFFER; this fixture keeps them
+    identical throughout, so it is the fix's own no-op case."""
+    import json
+
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name>a</servlet-name>\n"
+        "    <servlet-class>com.acme.web.AlphaServlet</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet>\n"
+        "    <servlet-name>b</servlet-name>\n"
+        "    <servlet-class>com.acme.web.BetaServlet</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet>\n"
+        "    <servlet-name>c</servlet-name>\n"
+        "    <servlet-class>com.acme.web.GammaServlet</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>a</servlet-name>\n"
+        "    <url-pattern>/alpha</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>b</servlet-name>\n"
+        "    <url-pattern>/beta</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>c</servlet-name>\n"
+        "    <url-pattern>/gamma</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+
+    features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
+    entry_points = [ep for ep in features_doc["entry_points"] if ep["kind"] == "http_route"]
+    assert len(entry_points) == 3
+    assert {ep["name"] for ep in entry_points} == {"/alpha", "/beta", "/gamma"}
+    assert len({ep["entry_point_id"] for ep in entry_points}) == 3
+
+    dependencies_doc = json.loads(
+        (outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    route_edges = [e for e in dependencies_doc["edges"] if e["relation"] == "route"]
+    assert len(route_edges) == 3
+    assert {e["target_external"] for e in route_edges} == {"/alpha", "/beta", "/gamma"}
+    assert len({e["edge_id"] for e in route_edges}) == 3
+
+    validate_result = scan_pipeline.validate_run(java_repo, run_id=outcome.scan_id)
+    assert validate_result["valid"] is True
+
+
 def test_run_scan_two_url_patterns_truncating_to_the_same_display_string_get_distinct_ids(
     java_repo: Path,
 ) -> None:
     """FIX ROUND 40 (thirty-fourth cold read, Part A F1+F2 BLOCKER,
-    .cr34-trunc / .cr34-collide, wrong-data): `_bounded_route_target`
+    .cr34-collide, wrong-data): `_bounded_route_target`
     (sanitize + truncate to 200 chars) used to be applied at LEAF
     EXTRACTION time, before the truncated value was fed into
     `digests.entry_point_id`/`digests.edge_id` as the route's own

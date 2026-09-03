@@ -440,3 +440,44 @@ def test_to_json_sorts_id_lists():
     payload = features[0].to_json()
     assert payload["entry_point_ids"] == sorted(payload["entry_point_ids"])
     assert entry_points[0].to_json()["feature_ids"] == [features[0].feature_id]
+
+
+def test_a_single_oversized_url_pattern_is_bounded_and_id_sensitive_past_the_bound():
+    """FIX ROUND 40 (thirty-fourth cold read, Part A F1+F2, .cr34-trunc,
+    contrast control): the twin of dependencies_artifact's own collision
+    test, but with only ONE oversized route each time (no collision
+    partner) - the ordinary, common truncation case must keep
+    publishing the SAME bounded, marker-suffixed display name it always
+    has (round 13's own CR9-6 fix), while entry_point_id is now
+    sensitive to a change PAST the 200-char bound - proving the id is
+    genuinely computed from the raw value, not merely re-deriving the
+    same truncated string two different ways."""
+    prefix = "/" + "x" * 199
+
+    def _build(pattern: str):
+        web_xml = """<web-app>
+  <servlet>
+    <servlet-name>a</servlet-name>
+    <servlet-class>com.acme.web.SoloServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>a</servlet-name>
+    <url-pattern>%s</url-pattern>
+  </servlet-mapping>
+</web-app>
+""" % pattern
+        entry_points, _p, _e, _c = java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml)
+        results = {"WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points)}
+        return fa.build_features(results)
+
+    entry_points_a, _features_a = _build(prefix + "A" * 60)
+    entry_points_b, _features_b = _build(prefix + "B" * 60)
+    assert len(entry_points_a) == len(entry_points_b) == 1
+    name_a, name_b = entry_points_a[0].name, entry_points_b[0].name
+    assert name_a == name_b, "both oversized patterns must truncate to the identical display name"
+    assert name_a.endswith("...(truncated)")
+    assert entry_points_a[0].entry_point_id != entry_points_b[0].entry_point_id, (
+        "entry_point_id must still differ past the truncation bound for a single, "
+        "non-colliding oversized route"
+    )
+
