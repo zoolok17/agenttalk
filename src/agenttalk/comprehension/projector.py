@@ -95,6 +95,7 @@ def _readiness_state_filter_note(readiness_state: str | None) -> dict[str, Any]:
 def _unit_or_feature_filter_note(
     unit_id: str | None, feature_id: str | None, filtered_modules: list[ModuleRecord],
     *, unit_id_exists: bool = True, feature_id_exists: bool = True,
+    narrowed_to_zero_by_readiness: bool = False,
 ) -> dict[str, Any]:
     """FIX ROUND 23 (nineteenth cold read, F10, completeness - retires the
     round 18/18b carry ("`--unit` naming a nonexistent id") BY MECHANISM
@@ -119,14 +120,40 @@ def _unit_or_feature_filter_note(
     ``feature_id_exists`` (each defaulting True - a caller passing only
     one filter never needs the other's existence checked) let the
     caller distinguish the two before wording the note; both are
-    "healthy empty," only the REASON differs."""
+    "healthy empty," only the REASON differs.
+
+    M4 (cold-read, PR-B fix round 47): round 30's own fix still assumed
+    only TWO possible causes for an empty result (nonexistent id, or a
+    disjoint unit/feature pair) - it never accounted for a THIRD active
+    filter, --readiness, also narrowing the SAME `filtered_modules` this
+    note inspects. Measured: `--unit <real id>` with no `--feature`
+    (so the "DISJOINT" branch cannot even fire) plus a `--readiness`
+    that happens to exclude that unit produced "an id that does not
+    exist this run" - false, the id exists, --readiness is what emptied
+    it. Symmetrically, `--unit <real id> --feature <real id>` (unit
+    genuinely IN that feature) plus an excluding `--readiness` produced
+    "DISJOINT" - also false, they are not disjoint at all.
+    ``narrowed_to_zero_by_readiness`` (True only when unit_id/feature_id
+    ALONE would already have matched at least one module, but the run's
+    own final `filtered_modules` is empty once --readiness is applied
+    too) lets this note name the ACTUAL cause instead of guessing from
+    unit_id_exists/feature_id_exists alone - the same "detail proves
+    cause" discipline every other problem/note in this package already
+    follows: assert a cause only when the code that emits the note can
+    actually prove it produced this empty result."""
     if (unit_id is not None or feature_id is not None) and not filtered_modules:
         parts = []
         if unit_id is not None:
             parts.append(f"unit_id={unit_id!r}")
         if feature_id is not None:
             parts.append(f"feature_id={feature_id!r}")
-        if unit_id is not None and feature_id is not None and unit_id_exists and feature_id_exists:
+        if narrowed_to_zero_by_readiness:
+            reason = (
+                "unit_id/feature_id matched at least one unit this run, but the additional "
+                "--readiness filter then narrowed that down to zero - not a nonexistent id, "
+                "and not necessarily a disjoint unit/feature combination either"
+            )
+        elif unit_id is not None and feature_id is not None and unit_id_exists and feature_id_exists:
             reason = (
                 "unit_id and feature_id BOTH name something real this run, but they are "
                 "DISJOINT - the named unit is not part of the named feature (see round "
@@ -473,6 +500,16 @@ def project_comprehension(
     if feature_unit_ids is not None:
         filtered_summaries = [s for s in filtered_summaries if s.unit_id in feature_unit_ids]
         filtered_signals = [s for s in filtered_signals if s.unit_id in feature_unit_ids]
+    # M4 (cold-read, PR-B fix round 47): captured BEFORE --readiness
+    # narrows filtered_modules any further, below - lets
+    # _unit_or_feature_filter_note tell "unit_id/feature_id themselves
+    # matched nothing" (this snapshot is already empty) apart from
+    # "unit_id/feature_id matched something, but --readiness then
+    # narrowed it to zero" (this snapshot is non-empty, the final
+    # filtered_modules is not) - the SAME distinction round 30's own F4
+    # fix drew between a nonexistent id and a disjoint unit/feature pair,
+    # now extended to a third cause the note previously could not see.
+    _modules_before_readiness_filter = filtered_modules
     if readiness_state is not None:
         # M3 (sixth cold read, fix round 10): filters on the design's
         # projection-level assessment_state (this slice: equal to
@@ -638,6 +675,11 @@ def project_comprehension(
             unit_id, feature_id, filtered_modules,
             unit_id_exists=any(m.unit_id == unit_id for m in modules),
             feature_id_exists=any(f.feature_id == feature_id for f in features),
+            narrowed_to_zero_by_readiness=(
+                readiness_state is not None
+                and bool(_modules_before_readiness_filter)
+                and not filtered_modules
+            ),
         ),
         "counts": {
             # M10 (cold-read, PR-B fix round 3): these are WHOLE-RUN

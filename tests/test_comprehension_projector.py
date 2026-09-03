@@ -297,6 +297,44 @@ def test_a_nonexistent_unit_id_alongside_a_real_feature_id_still_says_nonexisten
     assert "DISJOINT" not in note
 
 
+def test_a_readiness_filter_that_empties_an_otherwise_matching_unit_id_blames_readiness_cr41_mix():
+    """M4 (cold-read PR-B fix round 47, ".cr41-mix"): `unit_id` names
+    something REAL this run (no `feature_id` at all, so the DISJOINT
+    branch cannot even fire) - but the ADDITIONAL `--readiness` filter
+    excludes it, emptying `filtered_modules` the same way a genuinely
+    nonexistent id would. The note used to claim "an id that does not
+    exist this run" here - false, u1 exists; --readiness is what emptied
+    it."""
+    payload = pr.project_comprehension(**_base_kwargs(
+        modules=[_unit("u1")], readiness_summaries=[_summary("u1", "assessed")],
+        unit_id="u1", readiness_state="needs_evidence"))
+    assert payload["units"] == []
+    note = payload["unit_or_feature_filter_note"]
+    assert "u1" in note
+    assert "does not exist this run" not in note
+    assert "DISJOINT" not in note
+    assert "--readiness" in note
+
+
+def test_a_readiness_filter_that_empties_a_non_disjoint_pair_does_not_claim_disjoint_cr41_mix():
+    """M4 (cold-read PR-B fix round 47, ".cr41-mix"): `unit_id` and
+    `feature_id` both name something real AND u1 genuinely IS part of f1
+    (not disjoint at all) - but `--readiness` excludes u1, emptying
+    `filtered_modules`. The note used to claim "DISJOINT" here purely
+    because both ids existed - false; they intersect fine, --readiness is
+    what emptied it."""
+    payload = pr.project_comprehension(**_base_kwargs(
+        modules=[_unit("u1")], features=[_feature("f1", ["u1"])],
+        readiness_summaries=[_summary("u1", "assessed")],
+        unit_id="u1", feature_id="f1", readiness_state="needs_evidence"))
+    assert payload["units"] == []
+    note = payload["unit_or_feature_filter_note"]
+    assert "u1" in note and "f1" in note
+    assert "DISJOINT" not in note
+    assert "does not exist this run" not in note
+    assert "--readiness" in note
+
+
 def test_filters_key_echoes_every_applied_filter_verbatim():
     """FIX ROUND 17 (thirteenth cold read, CR13-9 MINOR): report --json
     must echo its applied filters so a caller can positively confirm
