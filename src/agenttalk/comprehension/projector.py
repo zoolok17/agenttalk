@@ -181,6 +181,13 @@ _NON_DEPENDENCY_RELATIONS = frozenset({"route"})
 
 
 def _dependency_summary(dependencies: list[DependencyRecord]) -> dict[str, int]:
+    # NAMED LIMIT (declared, PR-B round 46, F3 - judged, not chased): this
+    # summary's own `routes`/`routes_by_kind` are UNSEGMENTED by owning-
+    # unit classification - a route/filter served by a test-classified
+    # unit counts identically alongside a production one. See
+    # readiness_artifact.PROVENANCE_CAVEAT's own item 6 for the full
+    # declaration and why segmenting it is a real new join (this function
+    # never receives `modules` at all), not a cheap addition here.
     # FIX ROUND 21 (seventeenth cold read, CR17-6 MINOR): round 20c's own
     # per-edge externality_suppressed marker distinguishes "this producer
     # ABSTAINED from a positive external claim because this run's own
@@ -252,7 +259,12 @@ def _entry_points_by_kind(entry_points: list[EntryPointRecord]) -> dict[str, int
     UNCHANGED (still the full superset count, the same discipline
     ``_dependency_summary``'s own ``unresolved`` already follows) - this
     is a new, separate per-kind breakdown a caller can read instead of
-    guessing from the bare total."""
+    guessing from the bare total.
+
+    NAMED LIMIT (declared, PR-B round 46, F3 - judged, not chased): this
+    breakdown is also UNSEGMENTED by owning-unit classification - see
+    ``_dependency_summary``'s own identical note and readiness_artifact.
+    PROVENANCE_CAVEAT's own item 6."""
     by_kind: dict[str, int] = {}
     for entry_point in entry_points:
         by_kind[entry_point.kind] = by_kind.get(entry_point.kind, 0) + 1

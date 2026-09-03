@@ -177,7 +177,20 @@ PROVENANCE_CAVEAT = (
     "grouping, pack admission) already operates at unit/summary "
     "granularity, the level this trio is actually published at. A real "
     "external-pointer revalidation pass, when it lands, is where a per-"
-    "signal value would first carry real content to publish."
+    "signal value would first carry real content to publish.\n"
+    "6. FIX ROUND 46 (fortieth cold read, F3 completeness, judged - "
+    "declared, not chased): report --json's own counts.entry_points_by_kind "
+    "and dependency_summary.routes/routes_by_kind are UNSEGMENTED by "
+    "classification - a route/filter served by a test-classified unit "
+    "(a JAX-RS resource test harness, an integration-test servlet fixture) "
+    "counts identically alongside a production one. This is not wrong-data "
+    "(classification IS published, per-unit, and joinable back to any of "
+    "these counts via owning_unit_id) - but segmenting them would need a "
+    "unit_id-to-classification join neither _entry_points_by_kind nor "
+    "_dependency_summary currently has available at all (neither receives "
+    "modules, only entry_points/dependencies), a real new join, not a "
+    "cheap one-line addition at an existing site. Join classification via "
+    "owning_unit_id to segment either count yourself, meanwhile."
 )
 
 CHECKS = (
