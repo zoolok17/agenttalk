@@ -183,6 +183,48 @@ def test_dependencies_resolved_and_entry_points_mapped_spell_the_same_propagated
     assert signal_a.reason_code == signal_b.reason_code == "adapter_parse_failed"
 
 
+def test_rollup_a_confirmed_warning_severity_unsatisfied_signal_never_reads_as_assessed():
+    """FIX ROUND 43 (thirty-seventh cold read, N1, latent): the only two
+    checks that can ever produce "unsatisfied" today
+    (dependencies_resolved/feature_linked) are both warning-severity,
+    never blocker - _rollup's own "blocked" branch only fires on
+    blocker severity, so a confirmed unresolved dependency used to fall
+    through to "assessed", the SAME rollup value a unit with zero
+    issues at all gets. Exercises _rollup directly with an ALL-KNOWN
+    signal set (no "unknown" status anywhere) - the shape this module's
+    own docstring says is unreachable through the real check pipeline
+    today (boundaries_identified is permanently unknown), but is
+    exactly the shape a later slice's own boundaries_identified
+    producer would make reachable. Must land on needs_evidence, never
+    the fully-clean assessed a unit with a real, confirmed issue does
+    not deserve."""
+    signals = [
+        ra._signal("u1", "source_understood", "satisfied", "detected", "ok"),
+        ra._signal("u1", "dependencies_resolved", "unsatisfied", "detected", "unresolved_dependency"),
+        ra._signal("u1", "entry_points_mapped", "satisfied", "detected", "ok"),
+        ra._signal("u1", "feature_linked", "satisfied", "detected", "ok"),
+        ra._signal("u1", "test_evidence_located", "satisfied", "detected", "ok"),
+        ra._signal("u1", "boundaries_identified", "satisfied", "detected", "ok"),
+    ]
+    assert ra._rollup(signals) == "needs_evidence"
+
+
+def test_rollup_all_satisfied_signals_still_reach_assessed():
+    """Companion control: _rollup's own "assessed" branch must still be
+    reachable for a unit with genuinely zero outstanding issues - round
+    43's own N1 fix narrows what falls through to it, never removes it
+    entirely."""
+    signals = [
+        ra._signal("u1", "source_understood", "satisfied", "detected", "ok"),
+        ra._signal("u1", "dependencies_resolved", "satisfied", "detected", "ok"),
+        ra._signal("u1", "entry_points_mapped", "satisfied", "detected", "ok"),
+        ra._signal("u1", "feature_linked", "satisfied", "detected", "ok"),
+        ra._signal("u1", "test_evidence_located", "satisfied", "detected", "ok"),
+        ra._signal("u1", "boundaries_identified", "satisfied", "detected", "ok"),
+    ]
+    assert ra._rollup(signals) == "assessed"
+
+
 def test_file_unit_dependencies_resolved_unknown_not_not_applicable_when_parse_failed():
     """FIX ROUND 16 (M2 MAJOR): the FILE-kind path
     (_check_dependencies_resolved_for_file) has its OWN early return for

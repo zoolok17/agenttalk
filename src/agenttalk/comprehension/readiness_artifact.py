@@ -39,6 +39,17 @@ discovered: ``assessment_state`` is currently a CONSTANT
 unevidenced its own individual signals are - it carries no discriminating
 information yet. This will change the moment a later slice adds the
 ``data``/``configuration`` producer ``boundaries_identified`` needs.
+
+FIX ROUND 43 (thirty-seventh cold read, N1, latent - cheap guard taken
+now): ``_rollup`` also escalates a warning-severity ``unsatisfied``
+signal (``dependencies_resolved``/``feature_linked`` - the only two
+checks that can produce it today) to ``needs_evidence``, never letting
+it fall through to ``assessed`` once ``boundaries_identified`` stops
+being permanently ``unknown``. No observable effect today (the
+permanent-``unknown`` interception above still always fires first),
+but closes the gap proactively rather than leaving it to be
+independently rediscovered the day a later slice makes ``assessed``
+reachable for the first time.
 """
 
 from __future__ import annotations
@@ -1014,6 +1025,23 @@ def _rollup(signals: list[ReadinessSignal]) -> str:
     if any(s.severity == "blocker" and s.stored_status == "unsatisfied" for s in applicable):
         return "blocked"
     if any(s.stored_status == "unknown" for s in applicable):
+        return "needs_evidence"
+    # FIX ROUND 43 (thirty-seventh cold read, N1, latent): the only two
+    # checks that can ever produce "unsatisfied" today
+    # (dependencies_resolved/feature_linked) are both warning-severity,
+    # never blocker - so a confirmed unresolved dependency or missing
+    # feature link used to fall through both branches above straight to
+    # "assessed", the SAME rollup value as a unit with zero issues at
+    # all. Currently unreachable in practice (boundaries_identified's
+    # own permanent "unknown" - see this module's own docstring -
+    # always intercepts at "needs_evidence" first), but the moment a
+    # later slice gives boundaries_identified a real producer, this
+    # stops being latent. Escalates to "needs_evidence" (never
+    # "blocked" - that severity is reserved, by this module's own
+    # documented judgment, for source_understood alone) rather than
+    # inventing a fifth ASSESSMENT_STATES value for a severity scheme
+    # this module's own docstring already calls provisional.
+    if any(s.severity == "warning" and s.stored_status == "unsatisfied" for s in applicable):
         return "needs_evidence"
     return "assessed"
 
