@@ -328,28 +328,38 @@ def problem_id(
 
     THE INVARIANT (micro-round 40b, reviewer-3's own delta on round 40's
     S1 - restated as a checkable rule, not merely a measurement): this
-    id also hashes ``detail`` - and since round 40's own F4, ``detail``
-    is uniformly routed through ``errors.bounded_detail`` (truncated to
-    ``MAX_PROBLEM_DETAIL_LENGTH`` characters) before it ever reaches
+    id also hashes ``detail`` - and since round 41's own F4, ``detail``
+    IS now uniformly routed through ``errors.bounded_detail`` (truncated
+    to ``MAX_PROBLEM_DETAIL_LENGTH`` characters) before it ever reaches
     here, so a per-trigger detail template that puts its OWN
     distinguishing datum (the fact that makes two same-reason_code/
     same-path/same-qualified_name problems genuinely different) PAST
     that bound would let two truly different problems collide on this
     id - the identical class of bug F1/F2 fixed for a route's own
-    identity. Round 40's own audit found this not YET reachable (every
-    existing per-trigger template embeds its own distinguishing datum -
-    typically a source line number - within the first ~30 characters),
-    but that is a measurement of today's templates, not a property this
-    function enforces. THE RULE, stated so it is auditable at template-
-    writing time rather than re-derived by a future reader: every
-    problem detail template must place its own distinguishing datum
-    within the first ``MAX_PROBLEM_DETAIL_LENGTH`` characters
-    (``errors.py``) - the same discipline round 36's own invariant ("a
-    problem detail may assert a cause only if the branch that emitted
-    it proved that cause; any per-trigger detail must include the
-    trigger's own distinguishing datum, which also keeps problem_id
-    unique") already established, restated here to name WHERE that
-    datum must sit now that the detail is length-bounded.
+    identity.
+
+    CORRECTED (round 41, thirty-fifth cold read, F4 MAJOR): this
+    docstring's own "uniformly routed" claim was FALSE when micro-round
+    40b wrote it - only java.py's own emitters ever called
+    ``bounded_detail`` directly; ``scan_pipeline._problem_record`` (the
+    ONE chokepoint every problem this run publishes actually passes
+    through) did not call it at all, so 12 of that function's own 15
+    call sites published a raw, unbounded detail - one measured at 707
+    characters, 3.3x this function's own declared 214-char ceiling.
+    Fixed at the chokepoint itself (``_problem_record`` now calls
+    ``bounded_detail`` unconditionally, closing every current AND
+    future caller in one place, never a per-site sweep again) - the
+    claim above is true again, and now true STRUCTURALLY, not by
+    convention. THE RULE, stated so it is auditable at template-writing
+    time rather than re-derived by a future reader: every problem
+    detail template must place its own distinguishing datum within the
+    first ``MAX_PROBLEM_DETAIL_LENGTH`` characters (``errors.py``) - the
+    same discipline round 36's own invariant ("a problem detail may
+    assert a cause only if the branch that emitted it proved that
+    cause; any per-trigger detail must include the trigger's own
+    distinguishing datum, which also keeps problem_id unique") already
+    established, restated here to name WHERE that datum must sit now
+    that the detail is length-bounded.
 
     FIX ROUND 37c (LATENT note, reviewer-3's own delta on round 37b): a
     literal empty string ``""`` for ``qualified_name`` hashes identically

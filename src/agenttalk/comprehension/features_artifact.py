@@ -277,16 +277,27 @@ def build_features(
             # collision reachable across two DIFFERENT groups that
             # nonetheless share kind/owning_unit_id/name (see digests.
             # entry_point_id's own docstring).
+            #
+            # FIX ROUND 41 (thirty-fifth cold read, F1+F2, THE
+            # STRUCTURAL CURE): `claim.name` is now always the RAW,
+            # unbounded/unescaped value (java.py no longer bounds
+            # anything at extraction) - hashed here directly, never
+            # through a display-projection that could make two
+            # genuinely different names collide. The PUBLISHED record's
+            # own `name` field is bounded separately, below, at the one
+            # point it is actually serialized for display - see
+            # java_adapter.bounded_route_target's own docstring for the
+            # full architecture.
             entry_point_id = digests.entry_point_id(
                 kind=claim.kind, owning_unit_id=owning_unit_id,
-                name=claim.identity_name or claim.name,
-                qualified_name=claim.qualified_name,
+                name=claim.name, qualified_name=claim.qualified_name,
             )
             producer = _producer(file_digests.get(path), basis=claim.evidence_class)
             existing = entry_points_by_id.get(entry_point_id)
             if existing is None:
                 entry_points_by_id[entry_point_id] = EntryPointRecord(
-                    entry_point_id=entry_point_id, kind=claim.kind, name=claim.name,
+                    entry_point_id=entry_point_id, kind=claim.kind,
+                    name=java_adapter.bounded_route_target(claim.name),
                     owning_unit_id=owning_unit_id, feature_ids=[feature_id],
                     evidence_class=claim.evidence_class, producers=[producer],
                     # FIX ROUND 27 (F1 BLOCKER): the FILE that declared

@@ -1712,3 +1712,97 @@ def test_to_json_round_trips_all_fields():
     payload = record.to_json()
     assert payload["edge_id"] == record.edge_id
     assert payload["relation"] == "import"
+
+
+# ------------------- round 41 (F1+F2, THE STRUCTURAL CURE): pom coordinate identity
+
+def test_two_dependency_coordinates_sharing_a_200_char_prefix_get_distinct_edges():
+    """FIX ROUND 41 (thirty-fifth cold read, Part A F1 BLOCKER, .cr35-pom,
+    wrong-data): round 40's own S1 audit claimed a pom coordinate was
+    "never escaped or bounded in the first place" - FALSE: a pom
+    <dependency>'s own groupId:artifactId was bounded (java.py's
+    round-13 CR9-6 fix) AND used directly as this edge's own identity
+    (hashed for edge_id, exact-matched against the registry). Two
+    genuinely different dependency coordinates sharing a >200-char
+    groupId prefix used to truncate to the IDENTICAL target string,
+    coalescing to one resolved/external edge with zero signal that a
+    real, distinct dependency vanished. Fixed (round 41's own
+    structural cure): java.py no longer bounds a coordinate at
+    extraction at all - published raw/unbounded, since a coordinate is
+    an IDENTITY field, not display text."""
+    prefix = "com.acme." + "x" * 200
+    pom = (
+        "<project><groupId>com.acme</groupId><artifactId>consumer</artifactId>"
+        "<dependencies>"
+        f"<dependency><groupId>{prefix}A</groupId><artifactId>lib</artifactId></dependency>"
+        f"<dependency><groupId>{prefix}B</groupId><artifactId>lib</artifactId></dependency>"
+        "</dependencies></project>"
+    )
+    results = {"pom.xml": _parse_pom("pom.xml", pom)}
+    records = da.build_dependencies(results)
+    build_edges = [r for r in records if r.relation == "build"]
+    assert len(build_edges) == 2
+    assert len({e.edge_id for e in build_edges}) == 2, (
+        "two genuinely different dependency coordinates must not collide on edge_id "
+        "merely because they truncate identically"
+    )
+    assert {e.target_external for e in build_edges} == {f"{prefix}A:lib", f"{prefix}B:lib"}
+
+
+def test_a_single_oversized_dependency_coordinate_resolves_using_its_own_real_identity():
+    """FIX ROUND 41 (Part A F1, .cr35-pom, contrast control): a single
+    oversized dependency coordinate (no collision partner) must resolve
+    against a sibling module's OWN identically-oversized, real
+    coordinate - proving the registry match itself uses the raw value,
+    not a truncated projection that would match neither the real
+    in-scan module nor the dependency's own real target."""
+    prefix = "com.acme." + "x" * 200
+    consumer_pom = (
+        "<project><groupId>com.acme</groupId><artifactId>consumer</artifactId>"
+        "<dependencies><dependency>"
+        f"<groupId>{prefix}</groupId><artifactId>lib</artifactId>"
+        "</dependency></dependencies></project>"
+    )
+    lib_pom = f"<project><groupId>{prefix}</groupId><artifactId>lib</artifactId></project>"
+    results = {
+        "consumer/pom.xml": _parse_pom("consumer/pom.xml", consumer_pom),
+        "lib/pom.xml": _parse_pom("lib/pom.xml", lib_pom),
+    }
+    records = da.build_dependencies(results)
+    build_edge = next(r for r in records if r.relation == "build")
+    assert build_edge.resolution_state == "resolved"
+    assert build_edge.target_unit_id is not None
+    assert build_edge.target_external is None
+
+
+def test_two_modules_with_own_coordinates_sharing_a_200_char_prefix_do_not_fabricate_a_conflict():
+    """FIX ROUND 41 (Part A F2 MAJOR, .cr35-dupcoord, wrong-data): the
+    module-own-coordinate twin of F1 above - two DIFFERENT modules'
+    OWN groupId:artifactId, sharing a >200-char groupId prefix, used to
+    publish the SAME truncated qualified_name, which this producer's
+    own registry then reads as a genuine duplicate-qualified-name
+    collision (a real registry-conflict mechanism, M12) - fabricating a
+    shared conflict_id and a duplicate_qualified_name problem for two
+    claims that were never actually in conflict. Fixed the same way as
+    F1: published raw, so two genuinely different coordinates are
+    genuinely different qualified_names, never spuriously identical."""
+    prefix = "com.acme." + "x" * 200
+    mod_a_pom = f"<project><groupId>{prefix}A</groupId><artifactId>lib</artifactId></project>"
+    mod_b_pom = f"<project><groupId>{prefix}B</groupId><artifactId>lib</artifactId></project>"
+    results = {
+        "modA/pom.xml": _parse_pom("modA/pom.xml", mod_a_pom),
+        "modB/pom.xml": _parse_pom("modB/pom.xml", mod_b_pom),
+    }
+    all_units = [u for result in results.values() for u in result.units]
+    assert len(all_units) == 2
+    assert len({u.qualified_name for u in all_units}) == 2, (
+        "two genuinely different module coordinates must not collide on qualified_name "
+        "merely because they truncate identically"
+    )
+    # No fabricated conflict: build_dependencies must not need to consult
+    # a shared conflict_id for either module's own unresolved dependents
+    # here (there are none) - the registry itself (_build_registry) is
+    # exercised the same way features_artifact.py's own duplicate-name
+    # detection is, via a plain distinct-qualified-name check above,
+    # since dependencies_artifact.py has no dependents to resolve in
+    # this fixture on its own.

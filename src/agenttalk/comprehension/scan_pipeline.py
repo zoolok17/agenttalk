@@ -320,7 +320,28 @@ def _problem_record(
     function never had a parameter for at all - a ``duplicate_qualified_
     name`` problem published no ``conflict_id``, so a consumer could not
     join the problem back to the two (or more) ``modules.json`` units
-    that DO share one. Same absent-not-null idiom as ``qualified_name``."""
+    that DO share one. Same absent-not-null idiom as ``qualified_name``.
+
+    FIX ROUND 41 (thirty-fifth cold read, F4 MAJOR, completeness): every
+    problem this run ever publishes passes through THIS one function -
+    but round 40's own ``bounded_detail`` sweep only ever touched
+    java.py's own call sites, never this chokepoint itself, so 12 of
+    this module's own 15 ``_problem_record`` call sites published an
+    unbounded ``detail`` (one measured at 707 characters, 3.3x the
+    declared 214-char ceiling), several of them interpolating caller
+    (scanned-repo)-controlled path/module data. Bounded HERE now,
+    unconditionally, closing every current call site AND any future one
+    in a single place - the exact chokepoint discipline this producer
+    already applies to every other id-construction concern (``digests.
+    problem_id`` itself, one line below, is the same pattern: one
+    function every caller passes through, never a per-site sweep).
+    ``bounded_detail`` is its own idempotent no-op on an already-bounded
+    string (see its own docstring), so a caller that already routed a
+    piece of its own detail through it - e.g. wrapping an already-
+    bounded ``WorkerProblem.detail`` into a larger template - never gets
+    double-truncated or a marker broken mid-string; it is simply bounded
+    again, safely, to the SAME final form."""
+    detail = bounded_detail(detail)
     record = {
         # FIX ROUND 37 (thirty-first cold read, F1 BLOCKER - availability):
         # qualified_name now feeds the id too - see digests.problem_id's

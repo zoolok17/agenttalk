@@ -989,23 +989,25 @@ class Controller {
     result = java.parse_java_source("Controller.java", src)
     routes = _edges(result, "route")
     assert len(routes) == 1
-    # FIX ROUND 20 (P1 JUDGE, taken): the dedent still produces a real
-    # embedded newline internally - published escaped (\n -> \\n) by
-    # _sanitize_route_name_control_chars, never as a raw control
-    # character in a published route name.
-    assert routes[0].target == "/  line1\\n  line2"
+    # FIX ROUND 41 (thirty-fifth cold read, F1+F2, THE STRUCTURAL CURE):
+    # the dedent still produces a real embedded newline internally - the
+    # CLAIM itself now carries it RAW (escaping moved to display-write
+    # in dependencies_artifact.py; see bounded_route_target's own
+    # docstring for why an extraction-time transform is never applied
+    # to an identity-bearing claim field again).
+    assert routes[0].target == "/  line1\n  line2"
 
 
-def test_route_value_with_a_bidi_override_or_line_separator_is_escaped_not_raw():
-    """FIX ROUND 22 (eighteenth cold read, F6 MINOR, wrong-data):
-    _sanitize_route_name_control_chars's own docstring promises "safe,
-    single-line, printable text" - but only C0/DEL were ever escaped. A
-    RIGHT-TO-LEFT OVERRIDE (U+202E, the classic "Trojan Source" spoofing
-    character - it can make a route's own published rendering read
-    backwards) and a Unicode LINE SEPARATOR (U+2028, a real line break
-    invisible to a C0-only check) both passed through RAW. Both now
-    escape to a visible \\uXXXX form, the same choke point the C0
-    control-char fix (round 20's own P1) already established."""
+def test_route_value_with_a_bidi_override_or_line_separator_is_stored_raw():
+    """FIX ROUND 41 (thirty-fifth cold read, F1+F2, THE STRUCTURAL
+    CURE): a RIGHT-TO-LEFT OVERRIDE (U+202E, the classic "Trojan Source"
+    spoofing character) and a Unicode LINE SEPARATOR (U+2028) are no
+    longer escaped by the adapter itself - escaping moved to display-
+    write (see `test_comprehension_dependencies_artifact.py`'s own
+    escape-set battery for the published, escaped form). The CLAIM the
+    adapter emits carries them RAW, unconditionally - this is what
+    `entry_point_id`/`edge_id` now hash, and what a future producer
+    consuming the claim directly must expect."""
     rtl_override = chr(0x202E)
     line_separator = chr(0x2028)
     src = (
@@ -1018,17 +1020,13 @@ def test_route_value_with_a_bidi_override_or_line_separator_is_escaped_not_raw()
     result = java.parse_java_source("Controller.java", src)
     routes = _edges(result, "route")
     assert len(routes) == 1
-    assert routes[0].target == "GET /api\\u202eevil\\u2028end"
-    assert rtl_override not in routes[0].target
-    assert line_separator not in routes[0].target
+    assert routes[0].target == f"GET /api{rtl_override}evil{line_separator}end"
 
 
-def test_route_value_with_an_arabic_letter_mark_is_escaped_not_raw():
-    """FIX ROUND 22b (reviewer-3's delta on round 22, R5, wrong-data):
-    U+061C ARABIC LETTER MARK is the THIRD implicit directional mark by
-    the escape set's own stated criterion (Unicode 6.3 added ALM
-    alongside the isolate controls already in the set) - previously
-    missing, passed through RAW."""
+def test_route_value_with_an_arabic_letter_mark_is_stored_raw():
+    """FIX ROUND 41 (F1+F2, THE STRUCTURAL CURE): U+061C ARABIC LETTER
+    MARK is no longer escaped by the adapter itself - see the bidi/line-
+    separator test above for the full reasoning."""
     alm = chr(0x061C)
     src = (
         "package p;\n"
@@ -1040,18 +1038,14 @@ def test_route_value_with_an_arabic_letter_mark_is_escaped_not_raw():
     result = java.parse_java_source("Controller.java", src)
     routes = _edges(result, "route")
     assert len(routes) == 1
-    assert routes[0].target == "GET /api\\u061cend"
-    assert alm not in routes[0].target
+    assert routes[0].target == f"GET /api{alm}end"
 
 
-def test_route_value_with_a_c1_control_character_nel_is_escaped_not_raw():
-    """FIX ROUND 23 (nineteenth cold read, F5 LOW, wrong-data): the C1
-    control block (U+0080-U+009F, including U+0085 NEL - a line
-    terminator in XML 1.1 and many renderers) sits under the SAME
-    control-character criterion as C0/DEL, not the Unicode-
-    exhaustiveness rule this file's own BIDI/line-separator set
-    deliberately declines to chase - it was simply missing. U+00A0/
-    U+200B stay out (not control characters)."""
+def test_route_value_with_a_c1_control_character_nel_is_stored_raw():
+    """FIX ROUND 41 (F1+F2, THE STRUCTURAL CURE): the C1 control block
+    (U+0080-U+009F, including U+0085 NEL) is no longer escaped by the
+    adapter itself - see the bidi/line-separator test above for the
+    full reasoning."""
     nel = chr(0x0085)
     src = (
         "package p;\n"
@@ -1063,21 +1057,19 @@ def test_route_value_with_a_c1_control_character_nel_is_escaped_not_raw():
     result = java.parse_java_source("Controller.java", src)
     routes = _edges(result, "route")
     assert len(routes) == 1
-    assert routes[0].target == "GET /api\\x85end"
-    assert nel not in routes[0].target
+    assert routes[0].target == f"GET /api{nel}end"
 
 
-def test_route_value_with_invisible_format_characters_is_escaped_not_raw():
-    """FIX ROUND 35 (twenty-ninth cold read, F7 LOW, wrong-data): this
-    escape set's own docstring promises a safe, single-line, PRINTABLE
-    rendering - but a route name that differs from another only by a
-    ZERO WIDTH SPACE (U+200B) prints IDENTICALLY, spoofing a reader into
-    believing two distinct routes are the same one. The reader measured
-    U+200B passed through raw. SOFT HYPHEN (U+00AD), WORD JOINER
-    (U+2060), and a MID-STRING ZERO WIDTH NO-BREAK SPACE (U+FEFF - never
-    a genuine leading BOM here, since the file-level decode already
-    strips one before this adapter ever sees the text) share the same
-    invisible-rendering hazard and are escaped alongside it."""
+def test_route_value_with_invisible_format_characters_is_stored_raw():
+    """FIX ROUND 41 (F1+F2, THE STRUCTURAL CURE): ZERO WIDTH SPACE
+    (U+200B), SOFT HYPHEN (U+00AD), WORD JOINER (U+2060), and ZERO WIDTH
+    NO-BREAK SPACE (U+FEFF) are no longer escaped by the adapter itself
+    - see the bidi/line-separator test above for the full reasoning
+    (the non-injective escape of exactly these characters is what let
+    two genuinely different routes collide on entry_point_id/edge_id in
+    the first place, round 40's own F1+F2 finding - the claim itself
+    must carry the real character, never its escaped spelling, for the
+    id to be trustworthy)."""
     zwsp = chr(0x200B)
     shy = chr(0x00AD)
     word_joiner = chr(0x2060)
@@ -1092,9 +1084,7 @@ def test_route_value_with_invisible_format_characters_is_escaped_not_raw():
     result = java.parse_java_source("Controller.java", src)
     routes = _edges(result, "route")
     assert len(routes) == 1
-    assert routes[0].target == "GET /api\\u200b\\u00admid\\u2060dle\\ufeffend"
-    for invisible in (zwsp, shy, word_joiner, zwnbsp):
-        assert invisible not in routes[0].target
+    assert routes[0].target == f"GET /api{zwsp}{shy}mid{word_joiner}dle{zwnbsp}end"
 
 
 # ----------------------------------------------------------- malformed java (round 15 F5)
@@ -1254,11 +1244,19 @@ class Controller {
     assert routes[0].target == "/orders"
 
 
-def test_route_target_is_length_bounded_not_stored_as_an_unbounded_raw_excerpt():
-    """invariant 3 (design: "must not store... string-literal bodies") -
-    a route target is a normalized identifier, never an unbounded raw
-    source excerpt; an oversized literal is truncated rather than copied
-    verbatim regardless of size."""
+def test_route_target_is_recovered_verbatim_regardless_of_size():
+    """invariant 3 (design: "must not store... string-literal bodies")
+    is now the PUBLISHED display field's own concern, not the claim's -
+    FIX ROUND 41 (thirty-fifth cold read, F1+F2, THE STRUCTURAL CURE):
+    an oversized literal used to be truncated at EXTRACTION time,
+    silently making the CLAIM's own `target` (an `edge_id` input) a
+    lossy projection of what was actually declared - two genuinely
+    different, sufficiently-long routes sharing a common prefix
+    collided. The claim now carries the value VERBATIM, whatever its
+    size; `dependencies_artifact.py` bounds it only at the one point it
+    is actually serialized for display (see
+    `test_comprehension_dependencies_artifact.py`'s own length-bound
+    battery)."""
     from agenttalk.comprehension.adapters.java import _MAX_ROUTE_TARGET_LENGTH
 
     oversized = "/" + ("x" * (_MAX_ROUTE_TARGET_LENGTH + 50))
@@ -1271,19 +1269,25 @@ class Controller {{
 """
     result = java.parse_java_source("Controller.java", src)
     routes = _edges(result, "route")
-    assert len(routes[0].target) <= _MAX_ROUTE_TARGET_LENGTH + len("...(truncated)")
-    assert routes[0].target != oversized
+    assert routes[0].target == oversized
 
 
-def test_a_route_annotation_with_an_embedded_newline_publishes_an_escaped_name():
+def test_a_route_annotation_with_an_embedded_newline_publishes_the_raw_control_character():
     """FIX ROUND 20 (sixteenth cold read, P1 JUDGE, taken): a Java text
     block can carry a RAW newline directly inside a string literal
     (JEP 378) - the annotation's own escapes decode per Java semantics
     (Minor 6, round 7), so this legitimately decodes to a route value
-    containing an actual control character. A published name with a raw
-    '\\n' is hostile to every downstream consumer (problems.json/
-    dependencies.json/features.json, a CLI table, a future UI) - escaped
-    to a visible, printable representation rather than published raw."""
+    containing an actual control character.
+
+    CORRECTED (round 41, thirty-fifth cold read, F1+F2, THE STRUCTURAL
+    CURE): this used to assert the CLAIM's own `target` was already
+    escaped (`\\n` -> `\\\\n`) - escaping a raw control character is a
+    real, necessary discipline for a PUBLISHED name (hostile to
+    problems.json/dependencies.json/features.json, a CLI table, a
+    future UI), but doing it at extraction time made the claim itself a
+    lossy display projection, exactly the F1+F2 hazard. The claim now
+    carries the real control character; `dependencies_artifact.py`
+    escapes it only when actually publishing a display field."""
     src = '''
 package p;
 class Controller {
@@ -1296,8 +1300,8 @@ class Controller {
 '''
     result = java.parse_java_source("Controller.java", src)
     routes = _edges(result, "route")
-    assert "\n" not in routes[0].target
-    assert "\\n" in routes[0].target
+    assert "\n" in routes[0].target
+    assert "\\n" not in routes[0].target
 
 
 def test_bare_request_mapping_with_no_path_still_produces_a_named_route():
@@ -2920,8 +2924,12 @@ def test_web_xml_url_pattern_cdata_and_entity_decoding():
     assert "/c4" in names
     assert "/c5/x" in names
     assert "/admin&danger" in names
-    assert "/nl\\nend" in names
-    assert not any("\n" in e.name for e in entry_points)
+    # FIX ROUND 41 (thirty-fifth cold read, F1+F2, THE STRUCTURAL CURE):
+    # the decoded entity is a REAL newline now, carried raw in the
+    # claim - control-char escaping moved to display-write (see
+    # test_comprehension_dependencies_artifact.py's own escape-set
+    # battery for the published, escaped "/nl\\nend" form).
+    assert "/nl\nend" in names
     # FIX ROUND 29 (F9c JUDGE): none of s4/s5/sxml/snl is backed by a
     # <servlet> element - orthogonal to this test's own CDATA/entity
     # decoding concern, but now correctly recorded as its own
@@ -3841,6 +3849,11 @@ public class OrderResource {
     assert not any(e.kind == "http_route" for e in result.entry_points)
     problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
     assert problem.qualified_name == "p.OrderResource"
+    # FIX ROUND 41 (thirty-fifth cold read, F6 POLISH): 11 of the 12
+    # UNSUPPORTED_ENTRY_POINT_SHAPES already name their own vocabulary
+    # token parenthetically in their detail - jax_rs_verb_only_method
+    # was the missing one.
+    assert "jax_rs_verb_only_method" in problem.detail
 
 
 def test_two_zero_route_jax_rs_classes_in_one_file_get_distinct_details():
@@ -3963,6 +3976,9 @@ public class OrderResource {
     assert [r.target for r in routes] == ["GET /orders/{id}"]
     problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
     assert problem.qualified_name == "p.OrderResource"
+    # FIX ROUND 41 (F6 POLISH): the mixed-class sibling of the zero-route
+    # loop's own missing-token fix.
+    assert "jax_rs_verb_only_method" in problem.detail
 
 
 def test_two_mixed_jax_rs_classes_in_one_file_get_distinct_details():
@@ -4434,11 +4450,20 @@ def test_parse_web_xml_falls_back_to_the_synthetic_owner_with_no_matching_servle
     assert entry_points[0].qualified_name == "WEB-INF/web.xml#legacy"
 
 
-def test_parse_web_xml_url_pattern_is_length_bounded():
+def test_parse_web_xml_url_pattern_is_recovered_verbatim_regardless_of_size():
     """FIX ROUND 13 (ninth cold read, CR9-6, judged completeness): a
     url-pattern published VERBATIM, UNBOUNDED, while every Java route
     target is already length-bounded (invariant 3) - routed through the
-    same per-field bounding discipline (_bounded_route_target)."""
+    same per-field bounding discipline.
+
+    CORRECTED (round 41, thirty-fifth cold read, F1+F2, THE STRUCTURAL
+    CURE): that per-field bounding discipline moved from EXTRACTION to
+    DISPLAY-WRITE - bounding a route value at extraction made the CLAIM
+    itself (an `entry_point_id`/`edge_id` input) a lossy projection,
+    letting two genuinely different oversized patterns collide. The
+    claim now carries the value verbatim, whatever its size; see
+    test_comprehension_features_artifact.py's own length-bound battery
+    for the published, bounded display form."""
     from agenttalk.comprehension.adapters.java import _MAX_ROUTE_TARGET_LENGTH
 
     oversized = "/" + ("x" * (_MAX_ROUTE_TARGET_LENGTH + 50))
@@ -4450,14 +4475,26 @@ def test_parse_web_xml_url_pattern_is_length_bounded():
 </web-app>
 """
     entry_points, _web_problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
-    assert len(entry_points[0].name) <= _MAX_ROUTE_TARGET_LENGTH + len("...(truncated)")
-    assert entry_points[0].name != oversized
+    assert entry_points[0].name == oversized
 
 
-def test_parse_maven_pom_group_and_artifact_id_are_length_bounded():
+def test_parse_maven_pom_group_and_artifact_id_are_recovered_verbatim_regardless_of_size():
     """FIX ROUND 13 (CR9-6): same per-field bounding discipline applied
     to a pom's own groupId/artifactId - a hostile or merely enormous pom
-    used to publish either verbatim, unbounded."""
+    used to publish either verbatim, unbounded.
+
+    CORRECTED (round 41, thirty-fifth cold read, F1+F2 BLOCKER, wrong-
+    data - THE STRUCTURAL CURE): CR9-6's own reasoning was the bug - a
+    pom coordinate is an IDENTITY field (this edge's own `target`, exact-
+    matched against the in-scan registry, and an `edge_id` input), not
+    free display text like a route name. Bounding it here let two
+    genuinely different, >200-char-prefix-sharing dependency coordinates
+    coalesce into ONE resolved edge with zero signal - the reader's own
+    measured F1 finding. JUDGED (round 41): a qualified-name-shaped
+    identity field is never bounded, at extraction OR display - unlike a
+    route/filter name, which is bounded only at display-write (see
+    `bounded_route_target`'s own docstring for the judged line this
+    producer now draws between the two)."""
     from agenttalk.comprehension.adapters.java import _MAX_ROUTE_TARGET_LENGTH
 
     oversized_group = "g" * (_MAX_ROUTE_TARGET_LENGTH + 50)
@@ -4468,8 +4505,7 @@ def test_parse_maven_pom_group_and_artifact_id_are_length_bounded():
     )
     _units, edges, _profile_count = java.parse_maven_pom("pom.xml", pom)
     assert len(edges) == 1
-    assert len(edges[0].target) <= 2 * (_MAX_ROUTE_TARGET_LENGTH + len("...(truncated)")) + 1
-    assert oversized_group not in edges[0].target
+    assert edges[0].target == f"{oversized_group}:spring-core"
 
 
 # ----------------------------------------- F3 MAJOR (round 18): parent groupId fallback
@@ -4964,18 +5000,21 @@ def test_pom_a_visible_artifactid_containing_a_zero_width_space_is_unaffected():
     """FIX ROUND 39 (F4 LOW, control): the fix above must not treat a
     REAL, visible identity value merely CONTAINING an invisible
     character as blank - only a value consisting ENTIRELY of
-    whitespace/invisible characters is blank. The published coordinate
-    escapes the embedded invisible character to its visible ``\\u200b``
-    text form (the existing, unrelated route-name sanitization every
-    other published value already goes through) - unaffected by this
-    fix either way; what matters here is that a unit is published at
-    all, never that this one is blank."""
+    whitespace/invisible characters is blank; what matters here is that
+    a unit is published at all, never that this one is blank.
+
+    CORRECTED (round 41, thirty-fifth cold read, F1+F2, THE STRUCTURAL
+    CURE): this used to assert the published coordinate escapes the
+    embedded invisible character to its visible ``\\u200b`` text form -
+    a pom coordinate is an IDENTITY field, never escaped/bounded at
+    all (see `bounded_route_target`'s own docstring) - the real
+    character is published raw."""
     artifact_id = "re" + chr(0x200B) + "al"  # a real value merely CONTAINING one, not blank
     pom = (
         f"<project><groupId>com.acme</groupId><artifactId>{artifact_id}</artifactId></project>"
     )
     units, _edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
-    assert [u.qualified_name for u in units] == ["com.acme:re\\u200bal"]
+    assert [u.qualified_name for u in units] == [f"com.acme:{artifact_id}"]
     assert java.pom_own_coordinate_decode_problems(pom) == []
 
 
@@ -5003,14 +5042,18 @@ def test_pom_a_visible_artifactid_containing_a_bidi_control_char_is_unaffected()
     """FIX ROUND 40 (Part A F3 LOW, control): the fix above must not
     treat a REAL, visible identity value merely CONTAINING a bidi
     control character as blank - only a value consisting ENTIRELY of
-    whitespace/invisible-format/bidi-control characters is blank."""
+    whitespace/invisible-format/bidi-control characters is blank.
+
+    CORRECTED (round 41, thirty-fifth cold read, F1+F2, THE STRUCTURAL
+    CURE): same correction as the ZWSP control test above - a pom
+    coordinate is an IDENTITY field, published raw, never escaped."""
     lrm = chr(0x200E)
     artifact_id = "re" + lrm + "al"  # a real value merely CONTAINING one, not blank
     pom = (
         f"<project><groupId>com.acme</groupId><artifactId>{artifact_id}</artifactId></project>"
     )
     units, _edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
-    assert [u.qualified_name for u in units] == ["com.acme:re\\u200eal"]
+    assert [u.qualified_name for u in units] == [f"com.acme:{artifact_id}"]
     assert java.pom_own_coordinate_decode_problems(pom) == []
 
 
@@ -5280,3 +5323,148 @@ public class OrderResource {
     result = java.parse_java_source("OrderResource.java", src)
     problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
     assert "jax_rs_sub_resource_locator" in problem.detail
+
+
+def test_two_genuinely_different_url_patterns_sharing_a_200_char_prefix_do_not_false_positive():
+    """FIX ROUND 41 (thirty-fifth cold read, Part A F3 MAJOR, .cr35-
+    duproute2, wrong-data): `route_pattern_owners` (the duplicate_route_
+    target grouping dict) used to key on the DISPLAY (bounded) value,
+    one line above the site round 40 threaded the raw value into the
+    published claims - so two genuinely DIFFERENT url-patterns sharing a
+    >200-char prefix (truncating to the identical bounded string) got a
+    FALSE duplicate_route_target problem, internally contradictory with
+    the same run's own entry-point ids correctly saying the two patterns
+    differ. Fixed as a side effect of round 41's own structural cure
+    (url_pattern is the raw value everywhere now, so this dict keys on
+    it correctly)."""
+    prefix = "/" + "x" * 200
+    web_xml = (
+        "<web-app>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>a</servlet-name>\n"
+        f"    <url-pattern>{prefix}A</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>b</servlet-name>\n"
+        f"    <url-pattern>{prefix}B</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n"
+    )
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
+        "WEB-INF/web.xml", web_xml)
+    assert {e.name for e in entry_points} == {prefix + "A", prefix + "B"}
+    assert not any(p.reason_code == "duplicate_route_target" for p in problems)
+
+
+def test_two_servlet_mappings_on_the_genuinely_identical_pattern_still_get_the_real_problem():
+    """FIX ROUND 41 (Part A F3, control): the true duplicate case (both
+    mappings name the SAME, ordinary, short pattern) must still fire
+    duplicate_route_target - the fix above only narrows the false
+    positive, it must not also suppress the genuine one."""
+    web_xml = (
+        "<web-app>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>a</servlet-name>\n"
+        "    <url-pattern>/mix/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>b</servlet-name>\n"
+        "    <url-pattern>/mix/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n"
+    )
+    _entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
+        "WEB-INF/web.xml", web_xml)
+    matching = [p for p in problems if p.reason_code == "duplicate_route_target"]
+    assert len(matching) == 1
+    assert "/mix/*" in matching[0].detail
+
+
+# ------------------- round 41 (F5 MAJOR, completeness): a comment inside a route annotation
+
+@pytest.mark.parametrize("annotation", [
+    '@RequestMapping(value = /* legacy */ "/users")',
+    '@RequestMapping(/* legacy */ "/users")',
+    '@RequestMapping("/users" /* trailing */)',
+    '@RequestMapping(value = "/users" /* trailing */)',
+    '@RequestMapping({/* first */ "/users"})',
+    '@RequestMapping(\n        value = "/users" // trailing line comment\n    )',
+])
+def test_a_comment_in_any_realistic_position_around_a_route_literal_still_publishes_it(annotation):
+    """FIX ROUND 41 (thirty-fifth cold read, Part A F5 MAJOR, completeness
+    - the Java-annotation analogue of round 38's own XML comment splice):
+    a comment sitting between the named/positional anchor and the real
+    literal, or between the literal and the annotation's own closing
+    paren, used to make the literal reader give up at the comment's own
+    first character (neither whitespace nor a literal start) - silently
+    suppressing a REAL, cleanly-declared, served route as
+    "unrecoverable." `/* TODO */`-style comments inside an annotation's
+    argument list are realistic legacy code, not a contrived edge case.
+    All six placements here must publish the identical route, unaffected
+    by where the comment sits."""
+    src = f"""
+package p;
+class Controller {{
+    {annotation}
+    void list() {{}}
+}}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert result.problems == []
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "/users"
+
+
+def test_cr35_real_a_trailing_legacy_comment_does_not_suppress_a_post_route():
+    """FIX ROUND 41 (Part A F5, .cr35-real): the reader's own concrete
+    repro - a POST route whose own literal is followed by a trailing
+    legacy comment inside the annotation's argument list."""
+    src = """
+package p;
+class AdminController {
+    @PostMapping(value = "/admin/users" /* legacy, pre-2019 endpoint */)
+    void create() {}
+}
+"""
+    result = java.parse_java_source("AdminController.java", src)
+    assert result.problems == []
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "POST /admin/users"
+
+
+def test_a_comment_does_not_rescue_a_genuine_constant_reference():
+    """FIX ROUND 41 (Part A F5, control): the comment-skip fix must not
+    widen recovery to a genuinely non-literal value - a constant
+    reference beside a comment must still refuse exactly as it always
+    has."""
+    src = """
+package p;
+class Controller {
+    @GetMapping(/* not a literal */ SomeConstants.LIST)
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert _edges(result, "route") == []
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "route_value_unrecoverable"
+
+
+def test_a_comment_does_not_rescue_a_genuine_string_concatenation():
+    """FIX ROUND 41 (Part A F5, control): a comment beside a
+    concatenation expression must still refuse - the comment-skip fix
+    only ever tolerates a comment AROUND an otherwise-clean literal,
+    never past a `+` that signals more content follows."""
+    src = """
+package p;
+class Controller {
+    @GetMapping(/* comment */ "/a" + "/b")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert _edges(result, "route") == []
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "route_value_unrecoverable"

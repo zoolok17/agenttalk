@@ -1039,13 +1039,22 @@ def _edge_claim_to_record(
         "external_route": "http_route", "external_filter": "http_filter",
     }.get(edge.target_kind)
 
+    # FIX ROUND 41 (thirty-fifth cold read, F1+F2 BLOCKER/MAJOR, wrong-
+    # data - THE STRUCTURAL CURE): `target_external` is display-bounded
+    # HERE, and ONLY here, for a route/filter edge (`route_kind is not
+    # None`) - java.py no longer bounds anything at extraction, and
+    # `edge.target`/this function's own registry resolution above
+    # already used the raw value throughout (an exact-match/registry
+    # lookup on a bounded, lossy coordinate is exactly how two genuinely
+    # different pom dependency coordinates used to coalesce into one
+    # resolved edge). A pom coordinate, an import target, or any other
+    # qualified-name-shaped `target_external` is a judged identity field
+    # (see java_adapter.bounded_route_target's own docstring) - published
+    # raw/unbounded, deliberately, never display-projected.
+    if target_external is not None and route_kind is not None:
+        target_external = java_adapter.bounded_route_target(target_external)
+
     return DependencyRecord(
-        # FIX ROUND 39 (F1(c) sweep-continuation): `edge.from_qualified_
-        # name` is the exact distinguishing datum this producer's own
-        # `by_qualified_name.get(...) or file_unit_id_by_path[path]`
-        # fallback loses when two out-of-scan classes collapse to the
-        # same synthetic file owner - see digests.edge_id's own
-        # docstring.
         # FIX ROUND 39 (F1(c) sweep-continuation): `edge.from_qualified_
         # name` is the exact distinguishing datum this producer's own
         # `by_qualified_name.get(...) or file_unit_id_by_path[path]`
@@ -1054,7 +1063,7 @@ def _edge_claim_to_record(
         # docstring.
         edge_id=digests.edge_id(
             from_unit_id=from_unit_id, relation=edge.relation,
-            target=edge.identity_target or edge.target,
+            target=edge.target,
             phase=edge.phase, from_qualified_name=edge.from_qualified_name,
         ),
         from_unit_id=from_unit_id,

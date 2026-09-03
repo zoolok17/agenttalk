@@ -8092,3 +8092,67 @@ def test_run_scan_a_wildcard_import_of_an_in_scan_package_is_unresolved_not_exte
         if r["relation"] == "import" and r.get("target_unresolved") == "com.acme.util.*")
     assert import_edge["resolution_state"] == "unresolved"
     assert import_edge.get("target_external") is None
+
+
+# ------------------- round 41 (F4 MAJOR, completeness): _problem_record's own chokepoint bound
+
+def test_problem_record_bounds_an_unbounded_detail_at_the_chokepoint():
+    """FIX ROUND 41 (thirty-fifth cold read, Part A F4 MAJOR, .cr35-
+    longmod, completeness): `_problem_record` - the ONE function every
+    problem this run publishes passes through - never called
+    `bounded_detail` itself; round 40's own sweep only ever touched
+    java.py's own emitters, so 12 of THIS function's own 15 call sites
+    published an unbounded detail (one reader-measured site reached 707
+    characters, 3.3x the declared 214-char ceiling). Now bounded
+    centrally, unconditionally, here."""
+    from agenttalk.comprehension.errors import MAX_PROBLEM_DETAIL_LENGTH
+
+    oversized_detail = "this pom declares a module whose own path " + "x" * 700
+    assert len(oversized_detail) > 214
+    record = scan_pipeline._problem_record("externality_suppressed", "pom.xml", oversized_detail)
+    assert len(record["detail"]) <= MAX_PROBLEM_DETAIL_LENGTH + len("...(truncated)")
+    assert record["detail"].endswith("...(truncated)")
+
+
+def test_problem_record_never_produces_a_broken_marker_from_an_embedded_bounded_value():
+    """FIX ROUND 41 (Part A F4, .cr35-longmod, completeness - the
+    embedded-marker case): several `_problem_record` callers build a
+    detail by interpolating an ALREADY-bounded inner value (e.g. a
+    WorkerProblem's own detail, already routed through bounded_detail
+    once) into a larger outer template. If the OUTER string still needs
+    truncating, a naive re-slice could land INSIDE the inner value's
+    own already-terminal marker, publishing a broken half-marker
+    followed by a fresh one. `bounded_detail`'s own idempotency (a
+    string already in final form is returned unchanged) means the
+    OUTER template here is what actually gets sliced - this test proves
+    the final published detail's own marker is genuinely TERMINAL, not
+    a broken fragment buried mid-string."""
+    from agenttalk.comprehension.errors import MAX_PROBLEM_DETAIL_LENGTH, bounded_detail
+
+    already_bounded_inner = bounded_detail("a nested detail " + "y" * 300)
+    assert already_bounded_inner.endswith("...(truncated)")
+    outer_detail = (
+        f"this pom's own project-level coordinate is unrecoverable ({already_bounded_inner}) - "
+        "every external-registry-miss import in this run resolves unresolved rather than a "
+        "confident external claim because of it"
+    )
+    record = scan_pipeline._problem_record("externality_suppressed", "pom.xml", outer_detail)
+    assert len(record["detail"]) <= MAX_PROBLEM_DETAIL_LENGTH + len("...(truncated)")
+    # The marker sits at the very END of the published detail, never
+    # mid-string - a single, terminal occurrence, not two markers or a
+    # marker cut in half.
+    assert record["detail"].endswith("...(truncated)")
+    assert record["detail"].count("...(truncated)") == 1
+
+
+def test_problem_record_is_idempotent_on_an_already_bounded_detail():
+    """FIX ROUND 41 (Part A F4, completeness): calling _problem_record
+    with a detail that is ALREADY in bounded_detail's own final form
+    (within bounds, already marker-terminated) must not re-slice it -
+    the one case where re-processing could only ever damage, never
+    improve, an already-correct result."""
+    from agenttalk.comprehension.errors import bounded_detail
+
+    already_bounded = bounded_detail("a short detail " + "z" * 300)
+    record = scan_pipeline._problem_record("externality_suppressed", "pom.xml", already_bounded)
+    assert record["detail"] == already_bounded

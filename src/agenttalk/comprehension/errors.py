@@ -31,6 +31,19 @@ class ComprehensionError(RuntimeError):
 #: up to ``MAX_PROBLEM_DETAIL_LENGTH + len("...(truncated)")`` = 214
 #: characters long. A consumer sizing a buffer/column on "bounded to
 #: 200" undercounts by the marker's own length.
+#:
+#: CORRECTED (round 41, thirty-fifth cold read, F4 MAJOR): this note's
+#: own "so a truncated detail can be up to 214 characters" reads as a
+#: universal guarantee - it was NOT one at the time it was written.
+#: ``scan_pipeline._problem_record``, the one chokepoint every published
+#: problem actually passes through, did not call ``bounded_detail`` at
+#: all; 12 of its own 15 call sites published a raw, unbounded detail (a
+#: 707-character one measured). The guarantee is now real, and
+#: structural rather than conventional: ``_problem_record`` calls
+#: ``bounded_detail`` unconditionally, so every problem this run
+#: publishes - current AND future callers alike - is genuinely bounded
+#: to 214 characters, not merely every one that happens to remember to
+#: ask for it.
 MAX_PROBLEM_DETAIL_LENGTH = 200
 
 
@@ -49,6 +62,13 @@ def bounded_os_error_detail(action: str, exc: OSError) -> str:
     return f"{action}: {reason}"[:MAX_PROBLEM_DETAIL_LENGTH]
 
 
+#: FIX ROUND 41 (thirty-fifth cold read, F4 MAJOR, completeness): named
+#: so ``bounded_detail``'s own idempotency check (below) and any caller
+#: checking whether a string is already-bounded share one literal,
+#: never two independently-typed copies that could drift.
+TRUNCATION_MARKER = "...(truncated)"
+
+
 def bounded_detail(text: str) -> str:
     """Length-bounds an already path-free detail string (an adapter's own
     parse-failure message, or an :class:`EnvelopeError`'s message) before
@@ -60,11 +80,31 @@ def bounded_detail(text: str) -> str:
     to slice at exactly ``MAX_PROBLEM_DETAIL_LENGTH`` with NO marker -
     silently truncating mid-word, indistinguishable from a detail that
     genuinely ends there. The same visible-truncation marker
-    ``adapters.java._bounded_route_target`` already establishes for the
-    identical shape - a truncated detail now says so."""
+    ``adapters.java.bounded_route_target`` already establishes for the
+    identical shape - a truncated detail now says so.
+
+    FIX ROUND 41 (thirty-fifth cold read, F4 MAJOR, completeness): this
+    is now called at exactly ONE chokepoint - ``scan_pipeline.
+    _problem_record``, unconditionally, for every problem this run ever
+    publishes - closing the round-40 gap where only java.py's own
+    emitters routed their details through this function (12 of
+    ``_problem_record``'s own 15 call sites did not; one measured 707
+    chars against this function's own 214-char ceiling). Several of
+    those callers build a detail by INTERPOLATING an already-bounded
+    inner value (e.g. a ``WorkerProblem.detail`` an adapter already
+    ran through this exact function) into a larger template string - if
+    that larger string still needs truncating, a naive re-slice could
+    land INSIDE the inner value's own already-terminal marker,
+    publishing a broken half-marker followed by this call's own fresh
+    one. IDEMPOTENT now: a string that is ALREADY in this function's own
+    final form (ends with the marker, already within bounds) is returned
+    UNCHANGED rather than re-sliced - the one case where re-processing
+    could only ever damage, never improve, an already-correct result."""
+    if text.endswith(TRUNCATION_MARKER) and len(text) <= MAX_PROBLEM_DETAIL_LENGTH + len(TRUNCATION_MARKER):
+        return text
     if len(text) <= MAX_PROBLEM_DETAIL_LENGTH:
         return text
-    return text[:MAX_PROBLEM_DETAIL_LENGTH] + "...(truncated)"
+    return text[:MAX_PROBLEM_DETAIL_LENGTH] + TRUNCATION_MARKER
 
 
 class EnvelopeError(ComprehensionError):

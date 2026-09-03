@@ -973,22 +973,18 @@ class JavaEdgeClaim:
     #: case: unset or ``false`` in the pom is False, only an explicit
     #: ``true`` element flips it.
     optional: bool = False
-    #: FIX ROUND 40 (thirty-fourth cold read, F1+F2 MAJOR, wrong-data -
-    #: THE LOSSY DISPLAY PROJECTION): ``target`` is the DISPLAY value -
-    #: safe to publish (control/invisible characters escaped, length-
-    #: bounded), but LOSSY: truncated past 200 chars, and its own escape
-    #: is not injective (a real ZERO WIDTH SPACE and the literal 6-
-    #: character escape spelling for it both escape to the identical
-    #: displayed text). Two DECLARED,
-    #: genuinely different routes could therefore DISPLAY identically
-    #: and silently collide on ``edge_id`` if that hashed ``target``
-    #: directly. ``identity_target`` is the SAME route's own raw,
-    #: unbounded, unescaped value (or ``None`` when the route never went
-    #: through the lossy transform at all, e.g. a route composed from
-    #: zero real path fragments) - ``dependencies_artifact.py`` hashes
-    #: THIS for ``edge_id``, never ``target``, while ``target`` keeps
-    #: publishing as the existing, safe display value unchanged.
-    identity_target: str | None = None
+    #: FIX ROUND 41 (thirty-fifth cold read, F1+F2 BLOCKER/MAJOR, wrong-
+    #: data - THE STRUCTURAL CURE): round 40 gave this field a sibling,
+    #: ``identity_target``, holding a raw/unbounded parallel of
+    #: ``target`` for ``edge_id`` to hash instead - a per-site thread
+    #: that missed every OTHER identity-bearing extraction site this
+    #: adapter bounds (pom coordinates, web.xml class names), the exact
+    #: enumeration antipattern this arc keeps re-learning. Deleted: this
+    #: field, and every other extraction site in this module, now hold
+    #: the RAW, unbounded, unescaped decoded value directly in ``target``
+    #: itself - bounding/escaping is a DISPLAY-WRITE concern applied only
+    #: in the artifact builders, to a route/filter edge's own published
+    #: ``target_external``, never to this field.
 
 
 @dataclass(frozen=True)
@@ -1007,11 +1003,6 @@ class JavaEntryPointClaim:
     name: str
     line: int | None
     evidence_class: str
-    #: FIX ROUND 40 (F1+F2 MAJOR): the raw, unbounded/unescaped parallel
-    #: of ``name`` - see ``JavaEdgeClaim.identity_target``'s own
-    #: docstring for the full reasoning (identical hazard, identical
-    #: fix, for the entry-point side of the same route).
-    identity_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1679,7 +1670,7 @@ def _java_string_literal_content(text: str, quote_pos: int) -> str | None:
 
 def _route_paths(
     sanitized: str, original: str, group_start: int, group_end: int,
-) -> tuple[list[str], list[str]] | None:
+) -> list[str] | None:
     """Recover the annotation's literal path/value string(s), in
     declaration order. LOCATES the attribute (by name, or the leading
     positional literal) against the SANITIZED segment - comments and
@@ -1736,12 +1727,12 @@ def _route_paths(
     sanitized_segment = sanitized[group_start:group_end]
     unrecoverable = False
     for match in _ROUTE_NAMED_ATTR_RE.finditer(sanitized_segment):
-        pair = _route_literal_list_at(original, group_start + match.end())
-        if pair is None:
+        values = _route_literal_list_at(original, group_start + match.end())
+        if values is None:
             unrecoverable = True
             continue
-        if pair[0]:
-            return pair
+        if values:
+            return values
     if not unrecoverable:
         positional_match = _ROUTE_POSITIONAL_ANCHOR_RE.match(sanitized_segment)
         if positional_match is not None:
@@ -1752,80 +1743,141 @@ def _route_paths(
             leads_with_other_named_attr = _ROUTE_LEADING_NAMED_ATTR_RE.match(
                 sanitized_segment, positional_match.end()) is not None
             if not leads_with_other_named_attr:
-                pair = _route_literal_list_at(original, group_start + positional_match.end())
-                if pair is None:
+                values = _route_literal_list_at(
+                    original, group_start + positional_match.end())
+                if values is None:
                     unrecoverable = True
-                elif pair[0]:
-                    return pair
-    return None if unrecoverable else ([], [])
+                elif values:
+                    return values
+    return None if unrecoverable else []
+
+
+def _skip_whitespace_and_comments(original: str, pos: int) -> int:
+    """FIX ROUND 41 (thirty-fifth cold read, F5 MAJOR, completeness):
+    advances ``pos`` past any run of real whitespace AND/OR a Java
+    comment (``//...``/``/*...*/``), returning the first position that
+    is neither. A comment is recognized ONLY by its own unambiguous
+    two-character opener (``//`` or ``/*``) - deliberately NOT by
+    consulting the sanitized/blanked string the rest of this module
+    uses to tell a comment from real content, since a string/char
+    literal's own interior is blanked IDENTICALLY there
+    (``_strip_comments_and_strings`` blanks both the same way): scanning
+    the blanked string for "where does the blank run end" would run
+    PAST a comment's own real end and straight through a following,
+    ALSO-blanked string literal - exactly the failure this fix first
+    shipped with and then caught (a comment immediately followed by the
+    very literal this function exists to recover consumed the literal
+    too, an even worse regression than the bug being fixed). The
+    comment's own end is instead re-derived directly from ``original``,
+    using the identical rule ``_strip_comments_and_strings`` itself
+    uses (next ``\\n``/EOF for ``//``, next ``*/``/EOF for ``/*``)."""
+    n = len(original)
+    while pos < n:
+        if original[pos].isspace():
+            pos += 1
+            continue
+        if original[pos] == "/" and pos + 1 < n and original[pos + 1] == "/":
+            j = original.find("\n", pos)
+            pos = n if j == -1 else j
+            continue
+        if original[pos] == "/" and pos + 1 < n and original[pos + 1] == "*":
+            j = original.find("*/", pos + 2)
+            pos = n if j == -1 else j + 2
+            continue
+        break
+    return pos
 
 
 def _value_terminates_at(original: str, pos: int) -> bool:
-    """Whether ``pos`` (skipping whitespace) sits at a legitimate
-    boundary for the value just recovered - the next named attribute's
-    comma, or the annotation's own closing paren. Anything else (a `+`,
-    another token) means what was just read is only the FIRST fragment
-    of a larger expression (e.g. string concatenation) - fix round 11:
-    silently returning that first fragment as if it were the whole value
-    published a FABRICATED path worse than a bare omission."""
+    """Whether ``pos`` (skipping whitespace AND a trailing comment) sits
+    at a legitimate boundary for the value just recovered - the next
+    named attribute's comma, or the annotation's own closing paren.
+    Anything else (a `+`, another token) means what was just read is
+    only the FIRST fragment of a larger expression (e.g. string
+    concatenation) - fix round 11: silently returning that first
+    fragment as if it were the whole value published a FABRICATED path
+    worse than a bare omission.
+
+    FIX ROUND 41 (thirty-fifth cold read, F5 MAJOR, completeness - the
+    Java-annotation analogue of round 38's own XML comment splice): a
+    trailing comment between the literal's own closing quote and the
+    real terminator (``@RequestMapping("/users" /* trailing */)``) used
+    to make this return False - the comment's own first character (a
+    `/`) is neither whitespace nor a terminator, so a perfectly clean
+    literal was treated as "more content follows" and suppressed as
+    unrecoverable. See ``_route_literal_list_at``'s own docstring for
+    the matching fix on the LEADING side of a literal."""
     n = len(original)
-    while pos < n and original[pos].isspace():
-        pos += 1
+    pos = _skip_whitespace_and_comments(original, pos)
     return pos >= n or original[pos] in ",)"
 
 
-def _route_literal_list_at(original: str, anchor: int) -> tuple[list[str], list[str]] | None:
+def _route_literal_list_at(original: str, anchor: int) -> list[str] | None:
     """Every string literal value at ``anchor``: a bare literal
     (``"..."``), or, when Spring's own array-literal shorthand is used
     for a multi-value ``value``/``path``/positional attribute
     (``{"...", "..."}``), EVERY element in declaration order (fix round
-    10 MAJOR 1). Returns ``([], [])`` when nothing at all sits here (a
+    10 MAJOR 1). Returns ``[]`` when nothing at all sits here (a
     genuinely valueless annotation); ``None`` (fix round 11) when
     something sits here but is not a clean literal or literal array -
     a constant reference, a concatenation, or an array containing any
     non-literal element - never silently truncated to whichever leading
     literal fragment happened to parse.
 
-    FIX ROUND 40 (thirty-fourth cold read, F1+F2 MAJOR, wrong-data - THE
-    LOSSY DISPLAY PROJECTION): returns a ``(display, identity)`` PAIR of
-    parallel lists now, not one - ``display`` is the existing bounded/
-    escaped value (``_bounded_route_target``, safe for a published
-    route name, but LOSSY: truncated past 200 chars, and its own
-    control-char escape is not injective, e.g. a real U+200B and the
-    literal 6-character text ``\\u200b`` both escape to the identical
-    displayed spelling). ``identity`` is the SAME literal's own
-    unbounded, unescaped decoded content - what a route's own
-    entry_point_id/edge_id must hash instead, so two DECLARED, GENUINELY
-    DIFFERENT routes that merely DISPLAY identically after this lossy
-    projection (two >200-char routes sharing a 200-char prefix; a real
-    U+200B versus its own escaped spelling) still get distinct ids, never
-    silently coalesced into one published record. See
-    ``_compose_route_identity``'s own docstring for how these compose
-    alongside their bounded siblings without duplicating the whole
-    composition pipeline."""
+    FIX ROUND 41 (thirty-fifth cold read, F1+F2+F3 BLOCKER/MAJOR,
+    wrong-data - THE STRUCTURAL CURE): round 40's own fix threaded a
+    parallel (display, identity) pair through this function so an
+    entry_point_id/edge_id could hash the raw value instead of the
+    bounded/escaped display projection - but the identical class of bug
+    was independently reachable at every OTHER identity-bearing site
+    this adapter bounds (pom coordinates, web.xml class names), which
+    round 40's own S1 audit missed because it only ever constructed
+    degenerate pairs for ROUTES. Threading a parallel raw value site by
+    site does not scale to a class of bug this general - it is the
+    enumeration antipattern this arc keeps re-learning (see digests.
+    problem_id's own round-37 F1 note for the identical lesson about
+    per-site edits). THE CURE: bounding/escaping is deleted from
+    EXTRACTION entirely. This function - and every other extraction
+    site in this module - returns the RAW, unbounded, unescaped decoded
+    value, always. `bounded_route_target` still exists, but its only
+    caller now is DISPLAY-WRITE code in features_artifact.py/
+    dependencies_artifact.py, applied to a route/filter target's own
+    published `name`/`target_external` field, never to any value an id
+    hashes or a registry/grouping key uses. See `bounded_route_target`'s
+    own docstring for the full architecture.
+
+    FIX ROUND 41 (thirty-fifth cold read, F5 MAJOR, completeness - the
+    Java-annotation analogue of round 38's own XML comment splice): a
+    comment sitting BETWEEN the named/positional anchor and the real
+    literal (``@RequestMapping(value = /* legacy */ "/users")`` - an
+    entirely realistic legacy-code shape) used to make this function
+    give up at the comment's own first character (neither whitespace
+    nor a literal start), suppressing a REAL, cleanly-declared, served
+    route as "unrecoverable." Every whitespace-skip below now also
+    skips a comment span (via ``_skip_whitespace_and_comments``) exactly
+    like whitespace, on both sides of the literal (leading, between
+    array elements, and trailing before the terminator check)."""
     n = len(original)
-    pos = anchor
-    while pos < n and original[pos].isspace():
-        pos += 1
+    pos = _skip_whitespace_and_comments(original, anchor)
     if pos >= n or original[pos] in ",)":
-        return [], []
+        return []
     if original[pos] == "{":
         values: list[str] = []
-        raw_values: list[str] = []
         pos += 1
         while pos < n:
-            while pos < n and (original[pos].isspace() or original[pos] == ","):
+            pos = _skip_whitespace_and_comments(original, pos)
+            while pos < n and original[pos] == ",":
                 pos += 1
+                pos = _skip_whitespace_and_comments(original, pos)
             if pos < n and original[pos] == "}":
-                return values, raw_values
+                return values
             if pos >= n or original[pos] != '"':
                 return None
             span = _java_string_literal_span(original, pos)
             if span is None:
                 return None
             content, pos = span
-            values.append(_bounded_route_target(content))
-            raw_values.append(content)
+            values.append(content)
         return None
     if original[pos] != '"':
         return None
@@ -1835,7 +1887,7 @@ def _route_literal_list_at(original: str, anchor: int) -> tuple[list[str], list[
     content, end = span
     if not _value_terminates_at(original, end):
         return None
-    return [_bounded_route_target(content)], [content]
+    return [content]
 
 
 #: FIX ROUND 20 (sixteenth cold read, P1 JUDGE, taken): a route literal's
@@ -1864,35 +1916,37 @@ _ROUTE_NAME_CONTROL_CHAR_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
 #:
 #: 1. C0/DEL/C1 control chars (ord<0x20, 0x7F, 0x80-0x9F).
 #:    Criterion: control character.
-#:    Escape (_sanitize_route_name_control_chars): escaped, \\xHH.
+#:    Escape (_sanitize_route_name_control_chars): escaped, \\xHH -
+#:    DISPLAY-WRITE ONLY as of round 41 (see below), never at
+#:    extraction.
 #:    Blankness (_is_blank_identity): NOT a member - a lone C0 control
 #:    is corrupt content, not "no content" (see NOTE below).
-#:    Collision (digests.*_id): n/a - F1/F2's own identity_name/
-#:    identity_target split bypasses the escaped/bounded value entirely
-#:    for every route/pattern identity input.
+#:    Collision (digests.*_id): n/a as of round 41's own structural cure
+#:    - no extraction site escapes or bounds an identity input at all
+#:    (see below), so no closed-set membership choice can affect an id.
 #:
 #: 2. _UNICODE_DIRECTIONAL_AND_LINE_CONTROL_CHARS (12 members: LRM/RLM/
 #:    ALM, LRE/RLE/PDF/LRO/RLO, LRI/RLI/FSI/PDI, LINE/PARAGRAPH
 #:    SEPARATOR).
 #:    Criterion: renders as nothing, or lies about structure.
-#:    Escape: escaped, \\uHHHH.
+#:    Escape: escaped, \\uHHHH - DISPLAY-WRITE ONLY as of round 41.
 #:    Blankness: a member (round 40 F3 - was NOT consulted before this
 #:    round; that gap was this round's own F3 finding).
-#:    Collision: n/a - same identity_name/identity_target bypass.
+#:    Collision: n/a, same reason as above.
 #:
 #: 3. _UNICODE_INVISIBLE_FORMAT_CHARS (4 members: ZWSP U+200B, SOFT
 #:    HYPHEN U+00AD, WORD JOINER U+2060, ZWNBSP U+FEFF).
 #:    Criterion: renders as nothing.
-#:    Escape: escaped, \\uHHHH.
+#:    Escape: escaped, \\uHHHH - DISPLAY-WRITE ONLY as of round 41.
 #:    Blankness: a member (round 39 F4).
-#:    Collision: n/a - same bypass.
+#:    Collision: n/a, same reason as above.
 #:
 #: 4. Ordinary Python whitespace (str.isspace()).
 #:    Criterion: renders as a real gap, not nothing.
 #:    Escape: NOT escaped - passes through unchanged (a real gap is not
 #:    a rendering hazard).
 #:    Blankness: a member (via decoded.isspace()).
-#:    Collision: n/a - same bypass.
+#:    Collision: n/a, same reason as above.
 #:
 #: NOTE: ESCAPE and BLANKNESS deliberately use DIFFERENT criteria by
 #: design (reviewer-ratified, round 40's own F3 dispatch) - ESCAPE asks
@@ -1907,13 +1961,31 @@ _ROUTE_NAME_CONTROL_CHAR_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
 #: escape-only (never blank-eligible - a lone C0 control is not "no
 #: content," it is corrupt content, a materially different problem the
 #: existing decode-failure/undecodable machinery already reports
-#: separately). COLLISION never consults any of these sets directly -
-#: F1/F2's own fix (round 40) made every route/pattern identity input
-#: bypass the escaped/bounded value entirely via identity_name/
-#: identity_target, so no closed-set membership choice can ever cause a
-#: route/pattern id collision again; a pom coordinate/class qualified
-#: name was never escaped or bounded in the first place (S1's own
-#: audit, round 40), so it needs no such bypass.
+#: separately).
+#:
+#: COLLISION - CORRECTED (round 41, thirty-fifth cold read, F1+F2
+#: BLOCKER/MAJOR): this table used to claim the F1/F2 fix worked by
+#: giving every route/pattern identity input a parallel raw field
+#: (``identity_name``/``identity_target``) to bypass the escaped/
+#: bounded value - and separately claimed "a pom coordinate/class
+#: qualified name was never escaped or bounded in the first place."
+#: BOTH claims were FALSE: pom groupId/artifactId (own-unit AND
+#: dependency-target coordinates) and web.xml servlet/filter class
+#: names were bounded via ``bounded_route_target`` at extraction all
+#: along (this reader's own S1 audit checked routes only, and so did
+#: reviewer-3's independent cross-method verification - both anchored
+#: on the same surface). The per-site identity-field thread has now
+#: missed twice; round 41 deletes the class instead: NO extraction site
+#: in this module calls ``bounded_route_target`` (or the escape
+#: function it wraps) anymore, for ANY value - route, pattern, pom
+#: coordinate, or class name. Every claim field holds the raw, decoded
+#: value directly. Bounding/escaping becomes a DISPLAY-WRITE concern,
+#: applied only in ``features_artifact.py``/``dependencies_artifact.py``
+#: to a route/filter edge's own published ``name``/``target_external``
+#: - never to any id input, registry/grouping key, or conflict anchor,
+#: and never to a qualified-name-shaped identity field at all (a
+#: judged, deliberate choice - see ``bounded_route_target``'s own
+#: docstring).
 
 #: FIX ROUND 22 (eighteenth cold read, F6 MINOR, wrong-data): this
 #: function's own docstring promises "safe, single-line, printable
@@ -2021,7 +2093,38 @@ def _sanitize_route_name_control_chars(value: str) -> str:
     return "".join(out)
 
 
-def _bounded_route_target(value: str) -> str:
+def bounded_route_target(value: str) -> str:
+    """Sanitize (escape control/invisible/bidi characters - see the
+    closed-set table above `_ROUTE_NAME_CONTROL_CHAR_ESCAPES`) and
+    length-bound a route/filter target for DISPLAY.
+
+    FIX ROUND 41 (thirty-fifth cold read, F1+F2 BLOCKER/MAJOR, wrong-
+    data - THE STRUCTURAL CURE): this used to be called at EXTRACTION
+    time (a private ``_``-prefixed helper, called from inside this
+    module's own route/pom/descriptor parsing) - so every identity
+    field this adapter ever bounded (a route name, a pom coordinate, a
+    web.xml class name) was hashed and registry-matched using the
+    LOSSY, truncated/escaped value instead of the real one. Round 40's
+    own fix threaded a raw parallel field through the ONE class of site
+    it tested (routes) and missed every other one this same function
+    touched - round 41 deletes the class instead: no extraction site in
+    this module calls this function anymore. It is PUBLIC now (no
+    leading underscore) because its only remaining callers are
+    DISPLAY-WRITE code in ``features_artifact.py``/
+    ``dependencies_artifact.py``, applied ONLY to a route/filter edge's
+    own published ``name``/``target_external`` field - never to any
+    value an id hashes, a registry/grouping key uses, or a conflict
+    anchor compares.
+
+    JUDGED (round 41): a qualified-name-shaped identity field (a pom
+    coordinate, a class name) is NEVER bounded, at extraction OR
+    display - it published raw/unbounded both places, deliberately, per
+    the round's own ruling that an identity field is not free text (see
+    ``dependencies_artifact.py``'s own docstring note at its
+    `target_external` construction site). Only a route/filter's own
+    NAME is display-bounded, since that field alone is genuinely
+    free-form, potentially-hostile, human-facing text - never an
+    identity a consumer joins on."""
     value = _sanitize_route_name_control_chars(value)
     if len(value) <= _MAX_ROUTE_TARGET_LENGTH:
         return value
@@ -2436,7 +2539,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
 
     def _route_annotation_span(
         match: re.Match,
-    ) -> tuple[int, tuple[list[str], list[str]] | None, list[str]]:
+    ) -> tuple[int, list[str] | None, list[str]]:
         # N10 (third cold read, fix round 5): find the annotation's own
         # argument-list parens by tracking nesting depth (below), rather
         # than a regex that stopped at the FIRST close-paren anywhere in
@@ -2457,7 +2560,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                     _route_paths(sanitized, text, arg_pos, close_pos + 1),
                     _route_method_attributes(sanitized[arg_pos:close_pos + 1]),
                 )
-        return match.end(), ([], []), []
+        return match.end(), [], []
 
     # M5 (fourth cold read, fix round 6): a class-level @RequestMapping is
     # a PREFIX for every method-level route inside that class - Spring's
@@ -2478,11 +2581,6 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     # is what gets tested against it.
     class_header_associations = _class_header_associations(sanitized, types)
     class_route_prefix: dict[str, list[str]] = {}
-    # FIX ROUND 40 (F1+F2 MAJOR): the raw (pre-_bounded_route_target)
-    # parallel of class_route_prefix - see _route_literal_list_at's own
-    # docstring for why entry_point_id/edge_id must hash this, never the
-    # bounded display value.
-    class_route_prefix_raw: dict[str, list[str]] = {}
     # Fix round 11 (seventh cold read BLOCKER part 2 - the fail-safe for
     # unrecoverable values): a class-level route annotation whose OWN
     # value could not be recovered as a literal (a constant reference, a
@@ -2506,11 +2604,11 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     # the other end.
     jax_rs_path_classes: set[str] = set()
     for match in _ROUTE_ANNOTATION_RE.finditer(sanitized):
-        _span_end, paths_pair, _explicit_methods = _route_annotation_span(match)
+        _span_end, paths, _explicit_methods = _route_annotation_span(match)
         target_type = _class_level_route_target(match.start(), class_header_associations)
         if target_type is None:
             continue
-        if paths_pair is None:
+        if paths is None:
             class_route_prefix_unrecoverable.add(target_type)
             # FIX ROUND 20 (sixteenth cold read, M3 MAJOR, wrong-data):
             # this branch tracked the class as prefix-unrecoverable (so
@@ -2530,14 +2628,8 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                        "with a guessed or partial value"),
                 qualified_name=target_type,
             ))
-        elif paths_pair[0]:
-            class_route_prefix[target_type] = paths_pair[0]
-            # FIX ROUND 40 (F1+F2 MAJOR): the RAW, unbounded/unescaped
-            # parallel of the class-level prefix, composed alongside the
-            # bounded one below for entry_point_id/edge_id's own
-            # identity inputs - see _route_literal_list_at's own
-            # docstring.
-            class_route_prefix_raw[target_type] = paths_pair[1]
+        elif paths:
+            class_route_prefix[target_type] = paths
             if match.group(1) == "Path":
                 jax_rs_path_classes.add(target_type)
 
@@ -2553,7 +2645,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     for match in _ROUTE_ANNOTATION_RE.finditer(sanitized):
         line = _line_at(newline_offsets, match.start())
         enclosing = _enclosing_qualified_name(match.start(), types, primary_qualified)
-        span_end, paths_pair, explicit_methods = _route_annotation_span(match)
+        span_end, paths, explicit_methods = _route_annotation_span(match)
         class_target = _class_level_route_target(match.start(), class_header_associations)
         if class_target is not None:
             # A bare class-level annotation with no method-level mapping
@@ -2615,7 +2707,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         # never a real route to begin with.
         if not _route_annotation_targets_a_method(sanitized, span_end):
             continue
-        if paths_pair is None:
+        if paths is None:
             # FAIL-SAFE (fix round 11, seventh cold read BLOCKER part 2):
             # this route annotation's OWN value could not be recovered
             # as a literal - a constant reference, a concatenation
@@ -2654,23 +2746,10 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                 qualified_name=enclosing,
             ))
             continue
-        # FIX ROUND 40 (F1+F2 MAJOR): `paths`/`prefixes` stay the
-        # existing BOUNDED (display-safe) lists, composed exactly as
-        # before - `paths_raw`/`prefixes_raw` are their raw, unbounded/
-        # unescaped parallels (same length, same order), composed
-        # ALONGSIDE via the identical composition calls, never a second,
-        # separately-derived notion of the route. See
-        # JavaEdgeClaim.identity_target's own docstring for why.
-        paths, paths_raw = paths_pair
         prefixes = class_route_prefix.get(enclosing)
-        prefixes_raw = class_route_prefix_raw.get(enclosing)
         if prefixes:
             if paths:
                 composed = [_compose_route_path(prefix, p) for prefix in prefixes for p in paths]
-                composed_raw = [
-                    _compose_route_path(prefix_raw, p_raw)
-                    for prefix_raw in prefixes_raw for p_raw in paths_raw
-                ]
             else:
                 # M5 composition note (fifth cold read, fix round 7): a
                 # valueless method annotation (bare ``@GetMapping``)
@@ -2681,7 +2760,6 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                 # fallback below and silently losing the prefix
                 # entirely.
                 composed = [_compose_route_path(prefix, "") for prefix in prefixes]
-                composed_raw = [_compose_route_path(prefix_raw, "") for prefix_raw in prefixes_raw]
         elif paths:
             # LOW-2 (round 7c): the same leading-slash normalization
             # _compose_route_path applies to a class prefix, applied
@@ -2689,10 +2767,8 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             # prefix at all) must not publish a different spelling of
             # the same served path just because it lacked one.
             composed = [_normalize_route_leading_slash(p) for p in paths]
-            composed_raw = [_normalize_route_leading_slash(p_raw) for p_raw in paths_raw]
         else:
             composed = []
-            composed_raw = []
         # N2 (fifth cold read, fix round 8): a verb-specific annotation's
         # own implied method (GetMapping -> GET, ...) always wins when
         # known; a plain @RequestMapping has none of its own, so its
@@ -2781,32 +2857,18 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                 for m in methods
                 for p in composed
             ]
-            # FIX ROUND 40 (F1+F2 MAJOR): the raw parallel of `targets`,
-            # same cartesian order - `m` (the verb) is a fixed, closed-
-            # vocabulary string, never subject to the lossy transform,
-            # so it is reused as-is on both sides.
-            targets_raw = [
-                f"{m} {p}" if m else p
-                for m in methods
-                for p in composed_raw
-            ]
         else:
             targets = [f"{enclosing}#{match.group(1)}"]
-            # A synthetic, already-unique-by-construction fallback name -
-            # never drawn from the lossy transform, so there is no raw
-            # counterpart to diverge from it.
-            targets_raw = [None]
-        for target, identity_target in zip(targets, targets_raw, strict=True):
+        for target in targets:
             classes_with_route_entry_points.add(enclosing)
             edges.append(JavaEdgeClaim(
                 from_qualified_name=enclosing, relation="route", target=target,
                 target_kind="external_route", evidence_class="declared",
-                line=line, phase="runtime", identity_target=identity_target,
+                line=line, phase="runtime",
             ))
             entry_points.append(JavaEntryPointClaim(
                 qualified_name=enclosing, kind="http_route",
                 name=target, line=line, evidence_class="declared",
-                identity_name=identity_target,
             ))
 
     # FIX ROUND 17 (thirteenth cold read, CR13-3 MAJOR, wrong-data, part
@@ -2831,8 +2893,8 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                        "suppressed rather than published as a route"),
             ))
             continue
-        _span_end, paths_pair, _explicit_methods = _route_annotation_span(match)
-        if paths_pair is None:
+        _span_end, paths, _explicit_methods = _route_annotation_span(match)
+        if paths is None:
             problems.append(JavaAdapterProblem(
                 reason_code="route_value_unrecoverable",
                 detail=bounded_detail(f"a @WebServlet annotation at line {line} has a value/urlPatterns "
@@ -2841,12 +2903,6 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                 qualified_name=target_type,
             ))
             continue
-        # FIX ROUND 40 (F1+F2 MAJOR): @WebServlet is not composable (no
-        # method-level counterpart, no class-level prefix) - each
-        # urlPattern IS the complete route, so no composition step is
-        # needed, only the same bounded/raw split every other route
-        # site now carries.
-        paths, paths_raw = paths_pair
         # FIX ROUND 22 (eighteenth cold read, F3 MAJOR, wrong-data): a
         # genuinely EMPTY paths list (`_route_paths`'s own "no value/
         # urlPatterns attribute at all" case) means Spring's own "serves
@@ -2870,16 +2926,16 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                 qualified_name=target_type,
             ))
             continue
-        for path, path_raw in zip(paths, paths_raw, strict=True):
+        for path in paths:
             classes_with_route_entry_points.add(target_type)
             edges.append(JavaEdgeClaim(
                 from_qualified_name=target_type, relation="route", target=path,
                 target_kind="external_route", evidence_class="declared",
-                line=line, phase="runtime", identity_target=path_raw,
+                line=line, phase="runtime",
             ))
             entry_points.append(JavaEntryPointClaim(
                 qualified_name=target_type, kind="http_route",
-                name=path, line=line, evidence_class="declared", identity_name=path_raw,
+                name=path, line=line, evidence_class="declared",
             ))
 
     # FIX ROUND 21 (seventeenth cold read, CR17-3 MAJOR, wrong-data -
@@ -2921,8 +2977,8 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                        "suppressed rather than published as a route"),
             ))
             continue
-        _span_end, paths_pair, _explicit_methods = _route_annotation_span(match)
-        if paths_pair is None:
+        _span_end, paths, _explicit_methods = _route_annotation_span(match)
+        if paths is None:
             problems.append(JavaAdapterProblem(
                 reason_code="route_value_unrecoverable",
                 detail=bounded_detail(f"a @WebFilter annotation at line {line} has a value/urlPatterns "
@@ -2931,9 +2987,6 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                 qualified_name=target_type,
             ))
             continue
-        # FIX ROUND 40 (F1+F2 MAJOR): see the @WebServlet twin's own
-        # identical comment above.
-        paths, paths_raw = paths_pair
         # FIX ROUND 22 (eighteenth cold read, F3 MAJOR, wrong-data): a
         # genuinely EMPTY paths list means this @WebFilter carries no
         # value/urlPatterns attribute at all - the standard servlet-
@@ -2984,7 +3037,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                            "the servlet-name-scoped half"),
                     qualified_name=target_type,
                 ))
-        for path, path_raw in zip(paths, paths_raw, strict=True):
+        for path in paths:
             # MICRO-ROUND 27b (JUDGE, declared): see the identical note
             # at parse_web_xml's own filter-mapping edge site - this
             # edge's `relation` stays "route", never a distinct
@@ -3002,11 +3055,11 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             edges.append(JavaEdgeClaim(
                 from_qualified_name=target_type, relation="route", target=path,
                 target_kind="external_filter", evidence_class="declared",
-                line=line, phase="runtime", identity_target=path_raw,
+                line=line, phase="runtime",
             ))
             entry_points.append(JavaEntryPointClaim(
                 qualified_name=target_type, kind="http_filter",
-                name=path, line=line, evidence_class="declared", identity_name=path_raw,
+                name=path, line=line, evidence_class="declared",
             ))
 
     # FIX ROUND 18 (fourteenth cold read, F2 MAJOR, wrong-data): a MIXED
@@ -3116,26 +3169,35 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         # path: the class name is now IN the detail, the distinguishing
         # datum this site always had BESIDE the detail (`qualified_name`)
         # but never inside it.
+        # FIX ROUND 41 (thirty-fifth cold read, F6 POLISH): this detail
+        # named the idiom in prose but never its own enrolled vocabulary
+        # token (jax_rs_verb_only_method) - 11 of the other 12 shapes in
+        # UNSUPPORTED_ENTRY_POINT_SHAPES already name theirs
+        # parenthetically; added here for the same operator-searchable
+        # consistency (grep the reason_code, find every detail that
+        # actually names it).
         problems.append(JavaAdapterProblem(
             reason_code="unsupported_entry_point_shape",
             detail=bounded_detail(f"{jax_rs_class}'s own class-level @Path is declared, but no route ever "
-                   "composed against it - JAX-RS's own verb-only method idiom (@GET/@POST "
-                   "with no method-level @Path of its own) is not recognized (see the named "
-                   "limit beside _ROUTE_ANNOTATIONS) - no entry point published, but not "
-                   "confidently absent either"),
+                   "composed against it - JAX-RS's own verb-only method idiom "
+                   "(jax_rs_verb_only_method - @GET/@POST with no method-level @Path of its "
+                   "own) is not recognized (see the named limit beside _ROUTE_ANNOTATIONS) - "
+                   "no entry point published, but not confidently absent either"),
             qualified_name=jax_rs_class,
         ))
 
     for jax_rs_class in sorted(jax_rs_orphaned_verb_marker_classes & classes_with_route_entry_points):
         # MICRO-ROUND 36b: the identical coupling defect, same fix - see
         # the sibling loop's own comment just above.
+        # FIX ROUND 41 (F6 POLISH): same missing-token fix as the
+        # sibling loop just above.
         problems.append(JavaAdapterProblem(
             reason_code="unsupported_entry_point_shape",
-            detail=bounded_detail(f"{jax_rs_class}'s own class-level @Path is declared and at least one "
-                   "route composed against it, but a JAX-RS verb designator (@GET/@POST/...) "
-                   "elsewhere in the class has no method-level @Path of its own to compose "
-                   "against - that route is missing from the inventory even though this "
-                   "class is not entirely unmapped"),
+            detail=bounded_detail(f"{jax_rs_class}'s own class-level @Path composes at least one route, "
+                   "but a JAX-RS verb-only method (jax_rs_verb_only_method) elsewhere in the "
+                   "class has no method-level @Path to compose against - that route is "
+                   "missing from the inventory even though this class is not entirely "
+                   "unmapped"),
             qualified_name=jax_rs_class,
         ))
 
@@ -3951,7 +4013,11 @@ def declared_reactor_module_paths(text: str) -> list[str]:
             # reactor entry.
             if _is_blank_identity(decoded_value):
                 continue
-            paths.append(_bounded_route_target(decoded_value.strip()))
+            # FIX ROUND 41 (thirty-fifth cold read, F1+F2, THE STRUCTURAL
+            # CURE): raw, never bounded - see _route_literal_list_at's
+            # own docstring for why bounding moved out of extraction
+            # entirely.
+            paths.append(decoded_value.strip())
     return paths
 
 
@@ -4191,14 +4257,17 @@ def _own_and_parent_group_ids(
         if stack == ["project"]:
             decoded = _decode_xml_leaf(match.group(1), text[match.start(1):match.end(1)])
             if not _is_blank_identity(decoded):
-                group_id = _bounded_route_target(decoded.strip())
+                # FIX ROUND 41 (F1+F2, THE STRUCTURAL CURE): raw, never
+                # bounded - a coordinate is an IDENTITY field, published
+                # unbounded; see bounded_route_target's own docstring.
+                group_id = decoded.strip()
             else:
                 project_group_id_declared_but_broken = True
             break
         if stack == ["project", "parent"] and parent_group_id is None:
             decoded = _decode_xml_leaf(match.group(1), text[match.start(1):match.end(1)])
             if not _is_blank_identity(decoded):
-                parent_group_id = _bounded_route_target(decoded.strip())
+                parent_group_id = decoded.strip()
     return group_id, parent_group_id, project_group_id_declared_but_broken
 
 
@@ -4273,7 +4342,7 @@ def _project_own_coordinate(
         if _enclosing_tag_stack(structural, match.start()) == ["project"]:
             decoded = _decode_xml_leaf(match.group(1), text[match.start(1):match.end(1)])
             if not _is_blank_identity(decoded):
-                artifact_id = _bounded_route_target(decoded.strip())
+                artifact_id = decoded.strip()
             break
     if group_id is None or artifact_id is None:
         return None
@@ -4422,14 +4491,20 @@ def parse_maven_pom(
         # pom_dependency_decode_problems's own matching fix above).
         if _is_blank_identity(group_decoded) or _is_blank_identity(artifact_decoded):
             continue
-        # CR9-6 (ninth cold read, judged, completeness): a pom's own
-        # groupId/artifactId published VERBATIM, UNBOUNDED (a hostile or
-        # merely enormous pom - a 5000-char fixture - published whole),
-        # while every Java route target is already length-bounded
-        # (invariant 3) - routed through the same per-field discipline.
-        group_id = _expand_self_referential_property(
-            _bounded_route_target(group_decoded.strip()))
-        artifact_id = _bounded_route_target(artifact_decoded.strip())
+        # CORRECTED (round 41, thirty-fifth cold read, F1+F2 BLOCKER):
+        # CR9-6's own original reasoning (a pom's own groupId/artifactId
+        # published verbatim/unbounded, routed through the SAME per-
+        # field discipline a Java route target uses) was exactly the
+        # BUG - this coordinate is an IDENTITY field (this edge's own
+        # `target`, exact-matched against the in-scan registry, and an
+        # input to `edge_id`), not free display text. Bounding it here
+        # let two genuinely different, >200-char-prefix-sharing
+        # dependency coordinates coalesce into ONE resolved edge with
+        # zero signal. Published raw/unbounded now - see
+        # bounded_route_target's own docstring for the judged
+        # identity-vs-display line this producer now draws everywhere.
+        group_id = _expand_self_referential_property(group_decoded.strip())
+        artifact_id = artifact_decoded.strip()
         # FIX ROUND 25 (twenty-first cold read, F8, wrong-data): both
         # widened to DOTALL - decoded the same as every other leaf;
         # an undecodable value (split/mixed CDATA, an undefined entity)
@@ -4795,8 +4870,10 @@ def _servlet_class_by_name(
                 block_sanitized[class_match.start(1):class_match.end(1)],
                 block_text[class_match.start(1):class_match.end(1)])
             class_blank = _is_blank_identity(decoded_class)
+            # FIX ROUND 41 (F1+F2, THE STRUCTURAL CURE): raw, never
+            # bounded - a class name is an IDENTITY field.
             declarations.setdefault(servlet_name, []).append(_DescriptorDeclaration(
-                class_value=_bounded_route_target(decoded_class.strip()) if not class_blank else None,
+                class_value=decoded_class.strip() if not class_blank else None,
                 jsp_path=None, class_undecodable=class_blank, block_start=block_match.start(),
             ))
         for jsp_match in jsp_matches:
@@ -4806,7 +4883,7 @@ def _servlet_class_by_name(
             jsp_blank = _is_blank_identity(jsp_path)
             declarations.setdefault(servlet_name, []).append(_DescriptorDeclaration(
                 class_value=None,
-                jsp_path=_bounded_route_target(jsp_path.strip()) if not jsp_blank else None,
+                jsp_path=jsp_path.strip() if not jsp_blank else None,
                 class_undecodable=False, block_start=block_match.start(),
             ))
         if not class_matches and not jsp_matches:
@@ -4932,8 +5009,10 @@ def _filter_class_by_name(
                 block_sanitized[class_match.start(1):class_match.end(1)],
                 block_text[class_match.start(1):class_match.end(1)])
             class_blank = _is_blank_identity(decoded_class)
+            # FIX ROUND 41 (F1+F2, THE STRUCTURAL CURE): raw, never
+            # bounded - a class name is an IDENTITY field.
             declarations.setdefault(filter_name, []).append(_DescriptorDeclaration(
-                class_value=_bounded_route_target(decoded_class.strip()) if not class_blank else None,
+                class_value=decoded_class.strip() if not class_blank else None,
                 jsp_path=None, class_undecodable=class_blank, block_start=block_match.start(),
             ))
     return _resolve_descriptor_declarations(declarations), name_undecodable
@@ -5392,16 +5471,16 @@ def parse_web_xml(
             # empty string, publishing a genuine but nameless entry
             # point. Kept as the real, honest value rather than
             # fabricating a placeholder name for it.
-            # FIX ROUND 40 (F1+F2 MAJOR): `url_pattern_raw` is the same
-            # value BEFORE `_bounded_route_target`'s own lossy display
-            # transform (truncation past 200 chars; a non-injective
-            # control/invisible-character escape) - entry_point_id/
-            # edge_id must hash THIS, never the bounded display value,
-            # so two genuinely different, long/invisible-character-
-            # bearing patterns never silently collide. See
-            # JavaEdgeClaim.identity_target's own docstring.
-            url_pattern_raw = decoded.strip()
-            url_pattern = _bounded_route_target(url_pattern_raw)
+            # FIX ROUND 41 (thirty-fifth cold read, F1+F2+F3, wrong-data
+            # - THE STRUCTURAL CURE): `url_pattern` is the RAW decoded
+            # value, never bounded/escaped at extraction - see
+            # _route_literal_list_at's own docstring for why bounding
+            # moved to display-write in the artifact builders. This is
+            # also what fixes F3 directly: `route_pattern_owners` below
+            # keys on this SAME raw value, so two genuinely different
+            # patterns that only display-collide can no longer trigger
+            # a false duplicate_route_target problem.
+            url_pattern = decoded.strip()
             # FIX ROUND 32 (twenty-eighth cold read, F6 MINOR, wrong-data):
             # deduped on `owner_qualified_name` ALONE before - two
             # DIFFERENT servlet-names both backed by the SAME class (a
@@ -5427,12 +5506,11 @@ def parse_web_xml(
                 target=url_pattern, target_kind="external_route",
                 evidence_class="declared",
                 line=_line_at(newline_offsets, absolute_offset), phase="runtime",
-                identity_target=url_pattern_raw,
             ))
             entry_points.append(JavaEntryPointClaim(
                 qualified_name=owner_qualified_name, kind="http_route",
                 name=url_pattern, line=_line_at(newline_offsets, absolute_offset),
-                evidence_class="declared", identity_name=url_pattern_raw,
+                evidence_class="declared",
             ))
     # FIX ROUND 29 (F9c JUDGE): one visible problem per distinct
     # undeclared servlet-name - see the collection site's own comment
@@ -5518,8 +5596,9 @@ def parse_web_xml(
                 block_sanitized[class_match.start(1):class_match.end(1)],
                 block_text[class_match.start(1):class_match.end(1)])
             if class_match is not None else None)
+        # FIX ROUND 41 (F1+F2, THE STRUCTURAL CURE): raw, never bounded.
         qualified_name = (
-            _bounded_route_target(decoded_class.strip())
+            decoded_class.strip()
             if not _is_blank_identity(decoded_class) else None)
         problems.append(JavaAdapterProblem(
             reason_code="unsupported_entry_point_shape",
@@ -5704,8 +5783,7 @@ def parse_web_xml(
                     qualified_name=owner_qualified_name,
                 ))
                 continue
-            url_pattern_raw = decoded.strip()
-            url_pattern = _bounded_route_target(url_pattern_raw)
+            url_pattern = decoded.strip()
             # FIX ROUND 27 (F4, mechanism confirmed): the filter twin of
             # the servlet-mapping loop's own paired-edge fix above - the
             # annotation-based @WebFilter path already emits this same
@@ -5731,13 +5809,11 @@ def parse_web_xml(
                 target=url_pattern, target_kind="external_filter",
                 evidence_class="declared",
                 line=_line_at(newline_offsets, absolute_offset), phase="runtime",
-                identity_target=url_pattern_raw,
             ))
             entry_points.append(JavaEntryPointClaim(
                 qualified_name=owner_qualified_name, kind="http_filter",
                 name=url_pattern, line=_line_at(newline_offsets, absolute_offset),
                 evidence_class="declared",
-                identity_name=url_pattern_raw,
             ))
     # FIX ROUND 29 (F9c JUDGE): the filter twin of the servlet ghost-name
     # emission above.
@@ -5768,8 +5844,9 @@ def parse_web_xml(
         # MICRO-ROUND 38b (THE BLOCKER): _is_blank_identity - a blank-
         # after-decode class is exactly as absent as a real one for
         # this label.
+        # FIX ROUND 41 (F1+F2, THE STRUCTURAL CURE): raw, never bounded.
         qualified_name = (
-            _bounded_route_target(decoded_class.strip())
+            decoded_class.strip()
             if not _is_blank_identity(decoded_class) else None)
         problems.append(JavaAdapterProblem(
             reason_code="unsupported_entry_point_shape",
