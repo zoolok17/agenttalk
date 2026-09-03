@@ -3784,11 +3784,19 @@ def test_web_xml_filter_mapping_with_both_url_pattern_and_servlet_name_enrolls_t
 def test_jax_rs_path_composes_class_and_method_level_like_spring_request_mapping():
     """FIX ROUND 17 (CR13-3 MAJOR, part (a)): JAX-RS's own @Path composes
     EXACTLY like a plain @RequestMapping already does - a class-level
-    @Path is a prefix, and a method-level @Path composes against it. The
-    verb stays unknown (JAX-RS's separate @GET/@POST/... designators are
-    a named limit, not recognized here - see _ROUTE_ANNOTATIONS's own
-    comment: merging a separate verb annotation with an adjacent @Path
-    would need per-method grouping this adapter does not have)."""
+    @Path is a prefix, and a method-level @Path composes against it.
+
+    CORRECTED (round 39, thirty-third cold read, F3 MAJOR, wrong-data -
+    confident false positive): this test used to assert the composed
+    value published as a REAL, served http_route with the verb left
+    unknown - measured wrong. A method-level @Path with NO verb
+    designator of its own (no sibling @GET/@POST) is JAX-RS's own SUB-
+    RESOURCE-LOCATOR idiom (JSR-339): it never handles a request
+    directly, it returns another resource object the container keeps
+    dispatching into. Publishing it as a confident served http_route
+    was the false positive; no entry point is published for it now, and
+    the enrolled-but-unmodeled shape (jax_rs_sub_resource_locator)
+    records a real problem instead, attributed to the class."""
     src = """
 package p;
 
@@ -3799,8 +3807,11 @@ public class OrderResource {
 }
 """
     result = java.parse_java_source("OrderResource.java", src)
-    routes = _edges(result, "route")
-    assert [r.target for r in routes] == ["/orders/list"]
+    assert _edges(result, "route") == []
+    assert not any(e.kind == "http_route" for e in result.entry_points)
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.OrderResource"
+    assert "/orders/list" in problem.detail
 
 
 def test_jax_rs_verb_only_methods_get_the_class_closer_not_a_silent_negative():
@@ -3871,12 +3882,19 @@ def test_jax_rs_path_with_a_real_method_level_route_is_not_flagged_the_class_clo
     """Companion negative case - the reviewer's own ItemResource row: a
     class-level @Path with a REAL method-level @Path composing against
     it must stay satisfied, never get the class-closer treatment
-    reserved for a class where nothing ever composed."""
+    reserved for a class where nothing ever composed.
+
+    CORRECTED (round 39, F3 MAJOR): a bare method-level @Path with no
+    verb of its own is now recognized as a sub-resource locator, never
+    a real route (see the sibling test above) - this "real route"
+    control now needs an actual verb designator (@GET) to stay a real,
+    served route at all."""
     src = """
 package p;
 
 @Path("/items")
 public class ItemResource {
+    @GET
     @Path("/list")
     public void list() {}
 }

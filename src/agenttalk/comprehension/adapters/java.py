@@ -2582,6 +2582,46 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             # verb into its annotation name - see
             # _jax_rs_verb_by_path_annotation_start's own docstring.
             verb = jax_rs_stack_verb_by_annotation_start.get(match.start())
+        # FIX ROUND 39 (thirty-third cold read, F3 MAJOR, wrong-data -
+        # confident false positive): a method-level @Path with NO verb
+        # designator (no sibling @GET/@POST found for it) that STILL
+        # composes a route (a class-level prefix, or its own method-
+        # level @Path value) is JAX-RS's own SUB-RESOURCE LOCATOR idiom
+        # (JSR-339) - it never handles a request directly, it returns
+        # ANOTHER resource object for the container to keep dispatching
+        # into. Micro-round 36b's own ruling declined a per-instance
+        # problem for the DOMINANT, genuinely-empty "class-level @Path,
+        # zero routes composed, no verb marker anywhere" case (naming a
+        # cause on a class that is genuinely, confidently empty would
+        # dilute the class-closer mechanism) - but this is the OTHER
+        # half of that same shape: a route DOES compose here, so this
+        # producer published a CONFIDENT, served http_route for a
+        # method JSR-339 says never serves one - the false positive
+        # micro-round 36b's own reasoning never covered (it only
+        # reasoned about the NON-composed case). `jax_rs_sub_resource_
+        # locator` was already declared in UNSUPPORTED_ENTRY_POINT_
+        # SHAPES (a static capability declaration) but never actually
+        # emitted anywhere - this is its first real instance, the
+        # design's own "an entry point published against an enrolled
+        # shape must carry its own problems.json record" requirement
+        # now met. Lean choice (a): do not publish as http_route (the
+        # kind's own declared meaning - "counted as a served endpoint"
+        # - is false for a locator); record the enrolled-shape instance
+        # problem instead, attributed to the class, exactly like the
+        # verb-only sibling's own class-closer treatment above -
+        # readiness's own entry_points_mapped reports unknown, never a
+        # confident negative, for this class.
+        if match.group(1) == "Path" and verb is None and composed:
+            problems.append(JavaAdapterProblem(
+                reason_code="unsupported_entry_point_shape",
+                detail=f"a @Path method at line {line} composes a route ({', '.join(composed)}) "
+                       "but declares no verb designator (@GET/@POST/...) of its own - JAX-RS's "
+                       "own sub-resource-locator idiom (jax_rs_sub_resource_locator): it never "
+                       "handles a request directly, so no served http_route is published for "
+                       "it - not confidently absent either",
+                qualified_name=enclosing,
+            ))
+            continue
         methods: list[str | None] = [verb] if verb else (explicit_methods or [None])
         if composed:
             targets = [

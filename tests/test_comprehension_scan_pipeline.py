@@ -669,7 +669,16 @@ def test_run_scan_web_servlet_and_jax_rs_routes_publish_end_to_end_cr13_c(
     mirrors the reader's own .cr13-c shape - both @WebServlet and JAX-RS
     @Path publish real entry points end to end, no synthetic edge
     construction. Both used to publish NO entry point and NO problem at
-    all - the class landing on the confident negative."""
+    all - the class landing on the confident negative.
+
+    CORRECTED (round 39, F3 MAJOR, wrong-data - confident false
+    positive): the JAX-RS half of this fixture (a method-level @Path
+    with no verb designator of its own) is JAX-RS's own sub-resource-
+    locator idiom (JSR-339) - it never handles a request directly, so
+    publishing it as a confident served http_route was itself a false
+    positive this round corrects. It no longer publishes a route or
+    edge; the @WebServlet half is unaffected (a real, verb-less-by-
+    design servlet mapping, a different mechanism entirely)."""
     import json
 
     (java_repo / "src" / "main" / "java" / "p" / "DispatcherServlet.java").write_text(
@@ -694,15 +703,21 @@ def test_run_scan_web_servlet_and_jax_rs_routes_publish_end_to_end_cr13_c(
     outcome = scan_pipeline.run_scan(java_repo)
     dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
     features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
 
     route_targets = {
         r["target_external"] for r in dependencies_doc["edges"] if r["relation"] == "route"
     }
     assert "/api/*" in route_targets
-    assert "/orders/list" in route_targets
+    assert "/orders/list" not in route_targets
     entry_point_names = {e["name"] for e in features_doc["entry_points"]}
     assert "/api/*" in entry_point_names
-    assert "/orders/list" in entry_point_names
+    assert "/orders/list" not in entry_point_names
+    locator_problems = [
+        p for p in problems_doc["problems"] if p["reason_code"] == "unsupported_entry_point_shape"
+        and p.get("qualified_name") == "p.OrderResource"
+    ]
+    assert len(locator_problems) == 1
 
 
 def test_run_scan_a_web_method_class_reports_entry_points_mapped_unknown(
@@ -859,13 +874,18 @@ def test_run_scan_jax_rs_methods_sharing_a_path_but_differing_by_verb_stay_disti
     assert "/invoices/{id}" not in entry_point_names  # never bare, unfolded
 
 
-def test_run_scan_jax_rs_method_path_with_no_verb_marker_keeps_bare_name(
+def test_run_scan_jax_rs_method_path_with_no_verb_marker_publishes_no_route(
     java_repo: Path,
 ) -> None:
-    """Control (named limit, deliberate): a method-level @Path with NO
-    sibling verb marker anywhere in its own annotation stack (JAX-RS's own
-    sub-resource-locator idiom) must keep its bare-path name, never guess
-    a verb for it - the F2 fix's own boundary, asserted directly."""
+    """CORRECTED (round 39, thirty-third cold read, F3 MAJOR, wrong-data
+    - confident false positive): this test used to assert (named a
+    "deliberate limit") that a method-level @Path with NO sibling verb
+    marker anywhere in its own annotation stack still published its
+    bare-path name as a real, served http_route - measured wrong. This
+    IS JAX-RS's own sub-resource-locator idiom (JSR-339): it never
+    handles a request directly, so no route/entry point is published
+    for it now; the enrolled-but-unmodeled shape
+    (jax_rs_sub_resource_locator) records a real problem instead."""
     import json
 
     (java_repo / "src" / "main" / "java" / "p" / "OrderResource.java").write_text(
@@ -882,7 +902,15 @@ def test_run_scan_jax_rs_method_path_with_no_verb_marker_keeps_bare_name(
     outcome = scan_pipeline.run_scan(java_repo)
     features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
     entry_point_names = {e["name"] for e in features_doc["entry_points"]}
-    assert "/orders/list" in entry_point_names
+    assert "/orders/list" not in entry_point_names
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    locator_problems = [
+        p for p in problems_doc["problems"] if p["reason_code"] == "unsupported_entry_point_shape"
+        and p.get("qualified_name") == "p.OrderResource"
+    ]
+    assert len(locator_problems) == 1
+    assert "/orders/list" in locator_problems[0]["detail"]
 
 
 def test_run_scan_a_mapped_route_alongside_an_unrecognized_main_reports_unknown(
