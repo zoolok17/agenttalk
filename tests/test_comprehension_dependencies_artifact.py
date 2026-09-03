@@ -1835,15 +1835,16 @@ def test_resolve_descriptor_qualified_name_translates_a_dollar_spelled_binary_na
 
 
 def test_resolve_descriptor_qualified_name_prefers_an_exact_match_over_translation():
-    """FIX ROUND 46 (F2 MAJOR, collision disposition): a class literally
-    named WITH a `$` character in its own identifier (Java allows it,
-    though the JLS discourages it) must resolve to ITSELF when one
-    exists in-scan, never be guessed away by the `$`-to-`.` fallback -
-    the exact spelling is tried first, unconditionally, so no genuine
-    ambiguity between "a literal $ identifier" and "a binary-spelled
-    nested class" is possible: the exact reading always wins when it
-    exists, and translation is only ever a fallback for when it does
-    not."""
+    """FIX ROUND 46 (F2 MAJOR); corrected MICRO-ROUND 46b (reviewer-3's
+    own delta): the exact-match-first branch this asserts is defensive,
+    harmless behavior for a HYPOTHETICAL non-source-derived registry -
+    it is UNREACHABLE for this producer's own real registries, since
+    `_TYPE_NAME_ANCHOR_RE`'s own `\\w+` identifier capture can never
+    include a `$` character, so no qualified_name this adapter computes
+    ever contains one; translation is what decides every real
+    resolution here. Locks the exact-first ORDERING as a unit-level
+    contract regardless, so a future change to this function cannot
+    silently invert it without this test noticing."""
     registry = {"com.acme.Foo$Bar": "literal-unit", "com.acme.Foo.Bar": "nested-unit"}
     assert da.resolve_descriptor_qualified_name("com.acme.Foo$Bar", registry) == "com.acme.Foo$Bar"
 

@@ -161,18 +161,29 @@ def resolve_descriptor_qualified_name(qualified_name: str, registry: dict[str, A
     a served route here - two artifacts, opposite claims about the
     identical class).
 
-    Tries the EXACT spelling first, unconditionally - a class literally
-    named with a ``$`` character (Java allows it, though the JLS
-    discourages it) must resolve to ITSELF when one exists in-scan,
-    never be guessed away by translation. Only when that exact lookup
-    misses AND the name contains ``$`` does this try the translated
-    form (every ``$`` replaced with ``.`` - ``$`` is reserved for
-    binary class nesting and can never legitimately separate PACKAGE
-    segments, so this translation is safe and never touches a real
-    package dot). This ordering is also the collision disposition: a
-    literal ``$``-named class always wins over a translated guess,
-    since the exact match is tried and accepted first, so no genuine
-    ambiguity between the two readings is possible.
+    Tries the EXACT spelling first, then - only on a miss, and only when
+    the name contains ``$`` - the fully-translated form (every ``$``
+    replaced with ``.``; ``$`` is reserved for binary class nesting and
+    can never legitimately separate PACKAGE segments, so this
+    translation is always safe).
+
+    MICRO-ROUND 46b (reviewer-3's own delta on `6d7882e`, corrected):
+    the exact-match branch is UNREACHABLE for this producer's own
+    in-scan registries specifically - ``_TYPE_NAME_ANCHOR_RE``'s own
+    ``\\w+`` identifier capture can never include a ``$`` character in
+    the first place, so no qualified_name this adapter ever computes
+    contains one; translation is what actually decides every real
+    resolution here. Kept anyway as harmless, correct defensive
+    behavior for a hypothetical non-source-derived registry (or a
+    future identifier capture widened to accept ``$``) - never load-
+    bearing for THIS producer's own callers today. If translation ever
+    produces a name that collides with an ALREADY-declared different
+    class of the identical dotted spelling, this function does not
+    arbitrate that either way - the caller's own PRE-EXISTING duplicate-
+    qualified-name conflict machinery already handles two units sharing
+    one name honestly (a stamped conflict, dependent signals reported
+    unknown), the same mechanism any other same-name collision already
+    goes through, never a silent pick here.
 
     Returns the registry KEY that should be looked up (``qualified_
     name`` itself, unresolved either way, when neither form is present
