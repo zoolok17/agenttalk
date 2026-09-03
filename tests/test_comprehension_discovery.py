@@ -555,6 +555,36 @@ def test_enumerate_scope_excludes_round_35_widened_secret_file_patterns(
     assert result.exclusions.get("secret") == 1
 
 
+def test_enumerate_scope_excludes_a_credentials_json_service_account_key(tmp_path: Path) -> None:
+    """FIX ROUND 41 (thirty-fifth cold read, F7 POLISH, completeness): the
+    bare ``credentials`` literal (an AWS-CLI-style file) was already
+    closed, but the equally common ``credentials.json`` shape (a
+    downloaded Google Cloud service-account key or OAuth client-secret
+    file) was not - the same class of gap round 32/35 each closed for a
+    different basename."""
+    (tmp_path / "credentials.json").write_bytes(b'{"type": "service_account"}')
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert result.files == []
+    assert result.exclusions.get("secret") == 1
+
+
+def test_enumerate_scope_does_not_over_exclude_an_unrelated_credentials_source_file(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 41 (F7 POLISH, control): ``credentials.json`` is an EXACT
+    literal, never a ``credentials.*`` glob - a real, unrelated source
+    file that merely shares the "credentials" stem (e.g. a Go package's
+    own ``credentials.go``) must not be swept up the way a wider glob
+    would (the identical round-37 lesson ``secrets.*`` already learned
+    for ``Secrets.java``)."""
+    (tmp_path / "credentials.go").write_bytes(b"package aws\n")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert {f.relative_path for f in result.files} == {"credentials.go"}
+    assert result.exclusions.get("secret", 0) == 0
+
+
 def test_enumerate_scope_does_not_over_exclude_a_secrets_glob_false_positive(
     tmp_path: Path,
 ) -> None:

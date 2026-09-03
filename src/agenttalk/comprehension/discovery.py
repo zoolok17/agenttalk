@@ -386,10 +386,20 @@ def _sits_under_a_recognized_generated_output_position(relative_to_excluded_root
 #: open glob to a CLOSED, explicit extension list - every real-world
 #: "secrets.<config-format>" shape this producer has actually measured,
 #: never a bare ``*`` that can suffix-match an arbitrary code extension.
+#: FIX ROUND 41 (thirty-fifth cold read, F7 POLISH, completeness): the
+#: bare ``credentials`` literal (an AWS-CLI-style ``~/.aws/credentials``,
+#: no extension) was already closed, but the equally common
+#: ``credentials.json`` shape (a downloaded Google Cloud service-account
+#: key or OAuth client-secret file) was not - the same class of gap
+#: round 32/35 each closed for a different basename. Added as an EXACT
+#: LITERAL, the SAME round-37 calibration already applied to every
+#: other entry here (never a ``credentials.*`` glob, which would also
+#: swallow an unrelated, real ``credentials.py``/``credentials.go``
+#: source file the way ``secrets.*`` swallowed ``Secrets.java``).
 _SECRET_FILE_PATTERNS = (
     ".env", ".env.*", "*.env", "*.pem", "*.pfx", "*.p12", "*.ppk",
     "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
-    "*.key", "*.jks", "*.keystore", "*.p8", ".netrc", "credentials",
+    "*.key", "*.jks", "*.keystore", "*.p8", ".netrc", "credentials", "credentials.json",
     "secrets.properties", "secrets.yaml", "secrets.yml", "secrets.json", "secrets.xml",
     ".pgpass", ".git-credentials", ".dockercfg", ".htpasswd", ".npmrc",
     "application-secret.properties",
