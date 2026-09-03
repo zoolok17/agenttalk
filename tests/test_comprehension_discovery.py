@@ -681,6 +681,37 @@ def test_enumerate_scope_records_a_visible_degrading_problem_for_a_calibrated_co
     assert calibration_problems[0]["path"] == "secretcalibration.java"
 
 
+def test_enumerate_scope_records_a_visible_non_degrading_problem_for_a_secret_xml_collision(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 38 (thirty-second cold read, F4 MINOR, .cr32-secretxml,
+    wrong-data): round 37's own calibration rule above was ``.java``-
+    only, but the closed secrets list's own literal entries reach past
+    ``.java`` - a code-bearing Spring beans XML root named exactly
+    ``secrets.xml`` (one of the list's own eleven exact literals) used
+    to drop category=secret with a COMPLETE/0-problem run, while a
+    byte-equivalent ``beans.xml`` (no name collision) degrades via the
+    ordinary root-sniff/tier machinery - ``SECRET_PATTERNS_CAVEAT``'s own
+    "never silently" sentence was not actually true for this member of
+    its own closed list. Recorded now, but NOT degrading (unlike the
+    ``.java`` case above): this producer excludes pre-read, so whether
+    this specific file was genuinely code-bearing or ordinary config is
+    unknowable without reading content this rule exists to never read -
+    "record, don't guess," the round 26b precedent."""
+    (tmp_path / "secrets.xml").write_bytes(
+        b"<beans><bean id=\"x\" class=\"com.acme.X\"/></beans>")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert result.files == []
+    assert result.exclusions.get("secret", 0) == 1
+    assert result.degraded is False
+    calibration_problems = [
+        p for p in result.problems
+        if p["reason_code"] == "secret_pattern_matched_code_bearing_file"]
+    assert len(calibration_problems) == 1
+    assert calibration_problems[0]["path"] == "secrets.xml"
+
+
 def test_enumerate_scope_excludes_binary_content(tmp_path: Path) -> None:
     (tmp_path / "photo.dat").write_bytes(b"\x00\x01\x02binarydata")
     comp_dir = _comprehension_dir(tmp_path)

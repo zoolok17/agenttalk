@@ -429,6 +429,36 @@ def _matches_any_secret_pattern(name: str) -> bool:
 #: just because its own name happens to collide with a secret-shaped
 #: pattern.
 _ADAPTER_HANDLED_EXTENSIONS_FOR_SECRET_CALIBRATION = frozenset({".java"})
+#: FIX ROUND 38 (thirty-second cold read, F4 MINOR, wrong-data): the
+#: calibration above was ``.java``-only, but the closed secrets list's
+#: OWN literal members reach past ``.java`` - ``secrets.xml`` is one of
+#: its eleven exact-literal entries, and a Spring beans root (or any
+#: other genuinely code-bearing XML/properties/YAML/JSON descriptor)
+#: sharing that exact name is dropped category=secret with a
+#: COMPLETE/0-problem run, while a byte-equivalent ``beans.xml`` (no
+#: name collision) degrades via the established root-sniff/tier
+#: machinery - the identical epistemic gap F2 already closed for
+#: ``.java``, unclosed for the rest of the closed list's own
+#: potentially-code-bearing members, so ``SECRET_PATTERNS_CAVEAT``'s own
+#: "never silently" sentence was not actually true for them.
+#:
+#: Deliberately a SEPARATE, narrower-consequence set from the one
+#: above: unlike ``.java`` (unambiguously a real compilation unit by
+#: extension alone - this producer parses every one it can read), this
+#: producer excludes a secret-pattern hit PRE-READ, so whether one of
+#: these five extensions is genuinely code-bearing (a Spring beans XML
+#: root, an actually-Java `application.properties`) or merely secret-
+#: shaped config this run correctly never needed to see is UNKNOWABLE
+#: without reading content this exclusion rule exists specifically to
+#: never read (the round 26b precedent: an excluded file's own tier is
+#: unknowable pre-read). Recorded (never silently), but NOT degrading -
+#: "record, don't guess," the same disposition round 26b's own
+#: ``binary_excluded_root_sniffed_xml`` established for the identical
+#: "could be code, could be ordinary, cannot tell without reading"
+#: shape.
+_POTENTIALLY_CODE_BEARING_EXTENSIONS_FOR_SECRET_CALIBRATION = frozenset({
+    ".xml", ".properties", ".yaml", ".yml", ".json",
+})
 #: FIX ROUND 35 (F4 MINOR, completeness): the provisional-set caveat
 #: this closed list has always deserved but never published in-artifact
 #: (declared only in the source comments above) - the same *_CAVEAT
@@ -452,7 +482,16 @@ SECRET_PATTERNS_CAVEAT = (
     "patterns is excluded the same as a genuine secret would be, but "
     "never silently - a secret_pattern_matched_code_bearing_file problem "
     "is recorded and the run degrades, naming exactly which adapter-"
-    "handled file this exclusion list discarded."
+    "handled file this exclusion list discarded. Widened (FIX ROUND 38, "
+    "F4 MINOR): the identical visibility now also covers a secret-"
+    "excluded file whose extension is one of this list's OWN other "
+    "potentially-code-bearing members (.xml/.properties/.yaml/.yml/"
+    ".json - secrets.xml among the literal entries above) - recorded the "
+    "same way, but NOT degrading, since (unlike a .java file) this "
+    "producer never reads excluded content and genuinely cannot tell "
+    "whether one of these five extensions was real, code-bearing "
+    "content or ordinary config without reading what this exclusion "
+    "rule exists specifically to never read."
 )
 _BINARY_SNIFF_BYTES = 8192
 _PLATFORM_PROBE_RELATIVE_DIR = f"{RELATIVE_COMPREHENSION_DIR}/.platform-probe"
@@ -1141,6 +1180,31 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                                   "be (never read), but never silently: a parseable file this "
                                   "run could otherwise have understood is missing from the "
                                   "inventory because of this",
+                    })
+                # FIX ROUND 38 (F4 MINOR, wrong-data): the SAME visibility
+                # for the closed list's OTHER potentially-code-bearing
+                # members (secrets.xml et al) - never degrading, since
+                # this file's own tier is genuinely unknowable pre-read
+                # (see _POTENTIALLY_CODE_BEARING_EXTENSIONS_FOR_SECRET_
+                # CALIBRATION's own docstring for why this is "record,
+                # don't guess," not the .java case's "known code-bearing,
+                # so degrade" disposition).
+                elif category == "secret" and entry.name.lower().endswith(
+                    tuple(_POTENTIALLY_CODE_BEARING_EXTENSIONS_FOR_SECRET_CALIBRATION),
+                ):
+                    problems.append({
+                        "reason_code": "secret_pattern_matched_code_bearing_file",
+                        "path": relative,
+                        "detail": f"{entry.name!r} matches this producer's own secret-file "
+                                  "exclusion pattern set, and its extension is one this "
+                                  "producer sometimes finds genuinely code-bearing (a Spring "
+                                  "beans XML root, an actually-parsed properties/YAML/JSON "
+                                  "descriptor) - excluded the same as a real secret would be "
+                                  "(never read, so its own tier is unknowable), but never "
+                                  "silently: recorded, not degrading, since this run cannot "
+                                  "tell whether this specific file was ordinary config or real "
+                                  "inventory without reading content this rule exists to never "
+                                  "read",
                     })
                 _record_exclusion(category, relative)
                 continue
