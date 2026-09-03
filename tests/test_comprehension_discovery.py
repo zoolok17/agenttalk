@@ -892,7 +892,14 @@ def test_unreadable_gitmodules_records_a_problem_and_marks_the_fingerprint_incom
     discipline: an unreadable .gitmodules IS an enumeration omission
     (you cannot know what you failed to exclude) and must record a
     problem and mark the fingerprint incomplete, same as every other
-    bounded-problem exit in this module."""
+    bounded-problem exit in this module.
+
+    FIX ROUND 47 (forty-first cold read, B1 BLOCKER): the parse now
+    delegates entirely to a ``git config -f`` subprocess (see
+    ``_submodule_boundary_paths``'s own docstring) - a real permission-
+    denied file makes THAT subprocess exit non-zero, never reachable by
+    monkeypatching ``Path.read_text`` (no longer called at all). Same
+    disposition simulated at its own new boundary instead."""
     (tmp_path / ".gitmodules").write_text(
         '[submodule "lib"]\n\tpath = lib\n\turl = https://example.invalid/lib.git\n',
         encoding="utf-8",
@@ -901,14 +908,15 @@ def test_unreadable_gitmodules_records_a_problem_and_marks_the_fingerprint_incom
     submodule_dir.mkdir()
     (submodule_dir / "inner.txt").write_bytes(b"should never be enumerated")
 
-    real_read_text = Path.read_text
+    real_run = subprocess.run
 
-    def _read_text(self: Path, *args, **kwargs):
-        if self.name == ".gitmodules":
-            raise OSError("permission denied")
-        return real_read_text(self, *args, **kwargs)
+    def _run(args, *pos_args, **kwargs):
+        if args[:2] == ["git", "config"]:
+            return subprocess.CompletedProcess(
+                args, returncode=128, stdout="", stderr="fatal: unable to read config file")
+        return real_run(args, *pos_args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_text", _read_text)
+    monkeypatch.setattr(discovery.subprocess, "run", _run)
     comp_dir = _comprehension_dir(tmp_path)
     result = discovery.enumerate_scope(tmp_path, comp_dir)
     assert any(p["reason_code"] == "parse_failed" and p["path"] == ".gitmodules"
@@ -919,6 +927,148 @@ def test_unreadable_gitmodules_records_a_problem_and_marks_the_fingerprint_incom
     # its boundary could not be identified - the honest, visible failure
     # mode this fix trades for the old silent one.
     assert any(f.relative_path == "lib/inner.txt" for f in result.files)
+
+
+def test_git_binary_absent_for_gitmodules_records_a_problem_and_marks_incomplete(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 47 (forty-first cold read, B1 BLOCKER): a genuinely
+    absent git binary (FileNotFoundError from subprocess.run itself,
+    never reaching a CompletedProcess at all) must get the SAME fail-
+    open treatment as any other git-invocation failure - never a crash,
+    never a silent empty boundary set. Deliberately NOT routed through
+    the privacy preflight's own no-VCS disposition (a different
+    question - this call only ever needs the git BINARY, never proof
+    that `root` itself is a git worktree)."""
+    (tmp_path / ".gitmodules").write_text(
+        '[submodule "lib"]\n\tpath = lib\n\turl = https://example.invalid/lib.git\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "lib").mkdir()
+
+    def _run(*_args, **_kwargs):
+        raise FileNotFoundError("git not found")
+
+    monkeypatch.setattr(discovery.subprocess, "run", _run)
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert any(p["reason_code"] == "parse_failed" and p["path"] == ".gitmodules"
+               for p in result.problems)
+    assert result.fingerprint_complete is False
+
+
+def test_gitmodules_a_core_path_key_never_fabricates_a_submodule_boundary(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 47 (forty-first cold read, B1 BLOCKER, wrong-data,
+    .cr41-gmspur - THE WORST FAILURE SHAPE): the old hand-rolled parse
+    matched ANY line whose key (after stripping) was exactly "path",
+    with no section scope at all - a [core] block's own `path = svc`
+    key (real, unrelated git config, no reason it could not sit in this
+    same file) was read identically to a real submodule declaration,
+    fabricating a boundary at `svc/` - the REAL module `svc/` was then
+    silently DELETED from the inventory on a complete/zero-problem run.
+    `git config -f --list` reads this line as `core.path`, never
+    `submodule.*.path` - proven here: `svc/` must be enumerated
+    normally, not excluded as a boundary."""
+    (tmp_path / ".gitmodules").write_text("[core]\n\tpath = svc\n", encoding="utf-8")
+    svc_dir = tmp_path / "svc"
+    svc_dir.mkdir()
+    (svc_dir / "inner.txt").write_bytes(b"must be enumerated normally - not a submodule")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert result.boundaries == []
+    assert sorted(f.relative_path for f in result.files) == [".gitmodules", "svc/inner.txt"]
+
+
+def test_gitmodules_a_quoted_path_value_still_excludes_the_real_directory(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 47 (B1 BLOCKER, wrong-data, .cr41-gmquote - the mirror
+    LEAKAGE direction): git reads a quoted path value (`path =
+    "libs/foo"`) as the unquoted string `libs/foo` - the old hand-
+    rolled parse's own bare `.strip()` left the surrounding quote
+    characters IN the value, which then never matched the real on-disk
+    directory, silently never excluding it (a genuine external
+    submodule's own source published as first-party units)."""
+    (tmp_path / ".gitmodules").write_text(
+        '[submodule "foo"]\n\tpath = "libs/foo"\n\turl = https://example.invalid/foo.git\n',
+        encoding="utf-8",
+    )
+    foo_dir = tmp_path / "libs" / "foo"
+    foo_dir.mkdir(parents=True)
+    (foo_dir / "inner.txt").write_bytes(b"should never be enumerated")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert len(result.boundaries) == 1
+    assert result.boundaries[0].relative_path == "libs/foo"
+    assert result.boundaries[0].boundary_kind == "submodule"
+    assert not any(f.relative_path.startswith("libs/foo/") for f in result.files)
+
+
+def test_gitmodules_a_trailing_slash_path_value_still_excludes_the_real_directory(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 47 (B1 BLOCKER, wrong-data, .cr41-gmslash): a trailing
+    slash (`path = libs/foo/`, a real, legal git-config spelling) is
+    preserved verbatim by git's own parser - stripped here so the
+    boundary set still exact-matches the enumerator's own trailing-
+    slash-free relative paths, rather than silently leaking."""
+    (tmp_path / ".gitmodules").write_text(
+        '[submodule "foo"]\n\tpath = libs/foo/\n\turl = https://example.invalid/foo.git\n',
+        encoding="utf-8",
+    )
+    foo_dir = tmp_path / "libs" / "foo"
+    foo_dir.mkdir(parents=True)
+    (foo_dir / "inner.txt").write_bytes(b"should never be enumerated")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert len(result.boundaries) == 1
+    assert result.boundaries[0].relative_path == "libs/foo"
+    assert not any(f.relative_path.startswith("libs/foo/") for f in result.files)
+
+
+def test_gitmodules_a_trailing_inline_comment_still_excludes_the_real_directory(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 47 (B1 BLOCKER, wrong-data, .cr41-gmcmt): a trailing
+    inline comment (`path = libs/foo ; note`, a real, legal git-config
+    spelling) is stripped by git's own parser before this producer ever
+    sees the value - the old hand-rolled parse's own bare `.strip()`
+    left the comment text IN the value, never matching the real
+    directory."""
+    (tmp_path / ".gitmodules").write_text(
+        '[submodule "foo"]\n\tpath = libs/foo ; legacy mirror\n'
+        "\turl = https://example.invalid/foo.git\n",
+        encoding="utf-8",
+    )
+    foo_dir = tmp_path / "libs" / "foo"
+    foo_dir.mkdir(parents=True)
+    (foo_dir / "inner.txt").write_bytes(b"should never be enumerated")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert len(result.boundaries) == 1
+    assert result.boundaries[0].relative_path == "libs/foo"
+    assert not any(f.relative_path.startswith("libs/foo/") for f in result.files)
+
+
+def test_gitmodules_an_ordinary_unquoted_path_is_unaffected(tmp_path: Path) -> None:
+    """FIX ROUND 47 (B1 BLOCKER control, .cr41-gmnorm): the ordinary,
+    dominant real-world shape (a bare, unquoted path, no trailing slash
+    or comment) must keep excluding the real directory exactly as
+    before this fix."""
+    (tmp_path / ".gitmodules").write_text(
+        '[submodule "foo"]\n\tpath = libs/foo\n\turl = https://example.invalid/foo.git\n',
+        encoding="utf-8",
+    )
+    foo_dir = tmp_path / "libs" / "foo"
+    foo_dir.mkdir(parents=True)
+    (foo_dir / "inner.txt").write_bytes(b"should never be enumerated")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert len(result.boundaries) == 1
+    assert result.boundaries[0].relative_path == "libs/foo"
+    assert not any(f.relative_path.startswith("libs/foo/") for f in result.files)
 
 
 # ----------------------------------------------------------- resource caps

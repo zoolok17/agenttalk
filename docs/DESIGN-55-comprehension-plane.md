@@ -307,6 +307,26 @@ problem rather than two silently merged units.
   states, exclusions, unsupported files, generated/vendor handling, resource
   omissions, conflicts, and problems.
 
+NAMED LIMIT (declared and CLOSED, PR-B round 47, B1 - THE WORST FAILURE
+SHAPE): a `.gitmodules` submodule boundary is parsed via a real `git config -f
+<file> --list` subprocess call (the same git binary the privacy layer already
+shells out to), restricted to `submodule.*.path` keys - never a hand-rolled
+text parse of the file's own contents. A hand-rolled parse is a SECOND,
+independently-maintained grammar for a format git itself already owns, and
+the two grammars silently diverged in both directions: an unrelated
+`[core] path = ...` key (real, common git config, no section scope in the
+old parse) fabricated a submodule boundary that DELETED the real directory
+from the inventory; a quoted, trailing-slash, or trailing-comment path value
+(all real, legal git-config spellings) was read by git but produced no
+boundary at all, LEAKING a genuine external submodule's own source as
+first-party units. Delegating to git's own parser closes both directions at
+once - unquoting, comment-stripping, and section scoping all come from git,
+never re-derived. A missing/erroring `git` binary (a real, if rare,
+possibility - this call needs only the binary on PATH, never a real `.git`
+worktree at the scanned root) gets the SAME fail-open, degrading-problem
+treatment this producer already gives an unreadable or undecodable
+`.gitmodules` file - never a silent empty boundary set.
+
 `scan.json`'s `unsupported_relations`, `unsupported_invoke_shapes`,
 `unsupported_entry_point_shapes`, and `entry_point_kinds` are a STATIC
 CAPABILITY DECLARATION - the named, enumerated set of recognized-but-unmodeled

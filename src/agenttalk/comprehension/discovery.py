@@ -60,11 +60,21 @@ import os
 import re
 import shutil
 import stat as stat_module
+import subprocess  # nosec B404 - invokes the real git binary to parse .gitmodules; no shell, no untrusted input
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .errors import bounded_os_error_detail
+from .errors import bounded_detail, bounded_os_error_detail
 from .paths import RELATIVE_COMPREHENSION_DIR
+
+#: FIX ROUND 47 (forty-first cold read, B1 BLOCKER): the SAME timeout
+#: value privacy.py's own ``_run_git`` already uses for every git
+#: invocation - duplicated rather than imported (this module owns
+#: filesystem/subprocess access for the discovery stage; privacy.py is
+#: a later-stage enforcement concern that never imports discovery.py
+#: either - the same accepted, hand-synced-duplication shape this
+#: package already carries for ``_TEST_SOURCE_ROOT_SEGMENT``).
+_GIT_CONFIG_TIMEOUT_SECONDS = 2.0
 
 PATH_NORMALIZATION_VERSION = 1
 
@@ -823,77 +833,108 @@ def _exclusion_category(name: str, relative_path: str, *, is_dir: bool) -> str |
 
 
 def _submodule_boundary_paths(root: Path) -> tuple[frozenset[str], dict[str, str] | None]:
-    """A minimal ``.gitmodules`` parse: every ``path = ...`` line's value,
-    POSIX-spelled. Full git-submodule semantics (nested configs, URL
-    rewriting) are out of scope - this only needs the boundary PATHS
-    themselves, to satisfy "submodules are external boundaries unless
-    explicitly included" (design). No git subprocess is invoked; this is a
-    plain text parse of a file already inside the resolved root.
+    """Every declared ``submodule.<name>.path`` value from ``.gitmodules``,
+    POSIX-spelled - the boundary PATHS needed to satisfy "submodules are
+    external boundaries unless explicitly included" (design). Full git-
+    submodule semantics (nested configs, URL rewriting) stay out of scope.
 
-    N2 (seventh cold read, fix round 11): an unreadable ``.gitmodules``
-    used to silently return an EMPTY boundary set - indistinguishable
-    from "no submodules at all" - so any real submodule then walked
-    STRAIGHT INTO the fingerprint with ``fingerprint_complete: true``.
-    Fail-open against this package's own choke-point discipline: you
-    cannot know what you failed to exclude. Returns ``(paths, problem)``
-    - ``problem`` is ``None`` on success (including the ordinary "no
-    ``.gitmodules`` file" case, never a failure), or a problem dict the
-    caller must record (marking the fingerprint incomplete) when the
-    file exists but could not be read OR could not be DECODED (FIX ROUND
-    26b: a UTF-16-encoded ``.gitmodules`` decoded with ``errors=
-    "replace"`` used to succeed silently into an empty boundary set -
-    the identical omission as an unreadable file, now recorded the same
-    way)."""
+    FIX ROUND 47 (forty-first cold read, B1 BLOCKER, wrong-data - THE
+    WORST FAILURE SHAPE): this used to be a hand-rolled plain-text parse
+    (``key.strip() == "path"``) with no section scope and no value
+    unquoting - genuinely a DIFFERENT, incompatible grammar from git's
+    own config-file format, in both directions. (a) FABRICATION: a
+    ``[core]`` block's own ``path = svc`` key (a real, common
+    ``.gitmodules``-adjacent shape - nothing stops an operator from
+    hand-editing stray config into this file) matched the same bare
+    ``key == "path"`` check with NO section awareness, inventing a
+    submodule boundary at ``svc/`` that git itself never recognizes at
+    all (``git config -f --list`` reads it as ``core.path``, not
+    ``submodule.*.path``) - the REAL module ``svc/`` was silently
+    DELETED from the inventory on a complete/zero-problem run. (b)
+    LEAKAGE (the mirror direction): a quoted path (``path = "libs/foo"``),
+    a trailing slash, or a trailing inline comment are all read by git as
+    the real submodule path, but the old hand-rolled parse's own naive
+    ``strip()`` either left the surrounding quotes/comment IN the value
+    (never matching the real on-disk directory, so the exclusion silently
+    never applied) or split on the wrong boundary - a genuine external
+    submodule's own source then published as first-party units.
+
+    FIXED per the reader's own prescription: delegate to
+    ``git config -f <file> --list`` - the real git config parser (the
+    same binary privacy.py already shells out to, for the identical
+    reason: guessing at git's own file format from first principles is
+    exactly the class of defect this fix retires). Unquoting, comment
+    stripping, and section scoping (restricting to ``submodule.*.path``
+    keys specifically) all come free from git's own parser - there is no
+    longer a second, hand-maintained grammar to keep in sync with git's
+    real one.
+
+    ``git`` ABSENT or ERRORING (a real, if rare, possibility - unlike the
+    privacy preflight's own VCS-worktree check, this call needs only the
+    ``git`` BINARY on PATH, never a real ``.git`` worktree at ``root``,
+    since ``-f <file>`` reads the given file directly) is treated with
+    the SAME fail-open discipline this function already established for
+    an unreadable/undecodable file (N2/round 26b, below) - a declared,
+    degrading ``parse_failed`` problem, never a silent empty boundary
+    set. This is a DIFFERENT question from whether ``root`` itself is a
+    git worktree (the privacy preflight's own ``no_vcs_acknowledged``
+    disposition already covers that, upstream of this call, and does not
+    require git to be resolvable there either) - reusing that path here
+    would conflate two independent facts ("is this root under git" vs.
+    "can this one config file be parsed"), so this function keeps its
+    own narrow, already-established fail-open shape instead.
+
+    Returns ``(paths, problem)`` - ``problem`` is ``None`` on success
+    (including the ordinary "no ``.gitmodules`` file" case, never a
+    failure), or a problem dict the caller must record (marking the
+    fingerprint incomplete) otherwise."""
     gitmodules = root / ".gitmodules"
     if not gitmodules.is_file():
         return frozenset(), None
-    paths: set[str] = set()
     try:
-        text = gitmodules.read_text(encoding="utf-8-sig", errors="replace")
-    except OSError as exc:
+        result = subprocess.run(  # noqa: S603,S607  # nosec B603 B607
+            ["git", "config", "-f", str(gitmodules), "--list"],
+            check=False,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_GIT_CONFIG_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
         return frozenset(), {
             "reason_code": "parse_failed",
             "path": ".gitmodules",
             "detail": bounded_os_error_detail(
-                "could not read .gitmodules - submodule boundaries are unknown, "
-                "so none could be excluded", exc),
+                "could not invoke git to parse .gitmodules - submodule boundaries are "
+                "unknown, so none could be excluded", exc),
         }
-    # FIX ROUND 26b (reviewer-3 delta on `38a21f3`, item 1, wrong-data):
-    # errors="replace" silently substitutes U+FFFD for every byte
-    # sequence it cannot decode - a UTF-16-encoded .gitmodules (a legal
-    # git config encoding some legacy Windows tooling produces) then
-    # simply matches no "path = ..." line in the garbled text, returning
-    # an EMPTY boundary set via this function's own SUCCESS path, never
-    # reaching the except-OSError problem path above. The real submodule
-    # then walks straight into the fingerprint AND its own foreign
-    # source is inventoried as this repo's own first-party units, on a
-    # complete/zero-problem run - measured. Undecodable is exactly as
-    # much an enumeration omission as unreadable is (N2's own reasoning,
-    # unchanged) - routed through the SAME named, degrading problem
-    # rather than a silent empty return. This module cannot import
-    # worker.py's own `_decode_text_or_flag_undecodable` (the reverse
-    # import already exists; discovery.py owns filesystem access
-    # exclusively - the same constraint the existing `_DEGRADABLE_
-    # EXCLUDED_EXTENSIONS` carry already names), so the guard is
-    # duplicated inline rather than shared.
-    if "�" in text:
+    if result.returncode != 0:
         return frozenset(), {
-            "reason_code": "encoding_undecodable",
+            "reason_code": "parse_failed",
             "path": ".gitmodules",
-            "detail": "could not decode .gitmodules as UTF-8 (the decoded text contains "
-                      "the U+FFFD replacement character) - submodule boundaries are "
-                      "unknown, so none could be excluded",
+            "detail": bounded_detail(
+                "git config -f .gitmodules --list exited "
+                f"{result.returncode} - submodule boundaries are unknown, so none could "
+                "be excluded"),
         }
-    for line in text.splitlines():
-        stripped = line.strip()
-        # N7 (fourth cold read, fix round 6): startswith("path") also
-        # matched a DIFFERENT git-config key that merely starts with the
-        # same letters (e.g. "pathspec = ..."), silently treating an
-        # unrelated key's value as if it were a submodule path. The key
-        # (everything before "=", trimmed) must equal "path" exactly.
-        key, sep, value = stripped.partition("=")
-        if sep and key.strip() == "path":
-            value = value.strip().replace("\\", "/")
+    paths: set[str] = set()
+    for line in result.stdout.splitlines():
+        # `git config --list` emits one already-unquoted, already-
+        # comment-stripped "key=value" pair per line (multi-valued keys
+        # repeat the key) - restricted to the real submodule-path key
+        # shape (`submodule.<name>.path`), never the bare `key == "path"`
+        # check the old hand-rolled parse used, which had no section
+        # awareness at all.
+        key, sep, value = line.partition("=")
+        if sep and key.startswith("submodule.") and key.endswith(".path"):
+            # A trailing slash (`libs/foo/`, a real, legal git-config
+            # spelling) is otherwise never produced by the enumerator's
+            # own `relative` paths this set is exact-matched against
+            # below - stripped here so it still excludes the real
+            # directory rather than silently leaking it.
+            value = value.strip().replace("\\", "/").rstrip("/")
             if value:
                 paths.add(value)
     return frozenset(paths), None

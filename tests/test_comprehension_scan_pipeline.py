@@ -4753,7 +4753,7 @@ def test_run_scan_a_binary_excluded_java_file_also_gets_its_own_unit(java_repo: 
     assert all(s["stored_status"] == "unknown" for s in legacy_signals)
 
 
-def test_run_scan_a_utf16_gitmodules_degrades_with_an_encoding_undecodable_problem(
+def test_run_scan_a_utf16_gitmodules_degrades_with_a_parse_failed_problem(
     java_repo: Path,
 ) -> None:
     """FIX ROUND 26b (reviewer-3 delta on `38a21f3`, item 1, wrong-data):
@@ -4763,10 +4763,19 @@ def test_run_scan_a_utf16_gitmodules_degrades_with_an_encoding_undecodable_probl
     unreadable-file problem path), so a real submodule's own foreign
     source silently walked straight into the fingerprint AND this run's
     own inventory as first-party units, on a complete/zero-problem run.
-    Now: a named, degrading problem is recorded instead - the submodule
-    directory still cannot be excluded (its own path was never
-    successfully read), but the run is no longer silently claiming
-    completeness over it."""
+    A named, degrading problem is recorded instead - the submodule
+    directory still cannot be excluded, but the run is no longer
+    silently claiming completeness over it.
+
+    FIX ROUND 47 (forty-first cold read, B1 BLOCKER): the parse now
+    delegates entirely to a real `git config -f` subprocess (see
+    `_submodule_boundary_paths`'s own docstring) - git's own config
+    parser rejects a UTF-16-encoded file outright (`fatal: bad config
+    line 1`, exit 128), landing in the SAME generic `parse_failed`
+    branch every other git-invocation failure does, never a dedicated
+    `encoding_undecodable` reason this producer no longer separately
+    detects (there is no manual decode step left to have its own
+    undecodable case at all)."""
     import json
 
     (java_repo / ".gitmodules").write_bytes(
@@ -4783,7 +4792,7 @@ def test_run_scan_a_utf16_gitmodules_degrades_with_an_encoding_undecodable_probl
     problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
     matching = [p for p in problems_doc["problems"] if p["path"] == ".gitmodules"]
     assert len(matching) == 1
-    assert matching[0]["reason_code"] == "encoding_undecodable"
+    assert matching[0]["reason_code"] == "parse_failed"
 
 
 def test_run_scan_a_utf8_gitmodules_stays_the_existing_clean_boundary_behavior(
