@@ -1529,6 +1529,25 @@ def run_scan(
                 "never confirmed complete",
             )
         ] if forced_lock_recovery_record is not None else []
+        # FIX ROUND 43 (thirty-seventh cold read, close-item, audited -
+        # no code change): this generic loop never threads
+        # qualified_name (always None) - every discovery.py problem's
+        # own uniqueness rests entirely on `path`. Audited all 15 of
+        # discovery.py's own problem-dict emission sites against the
+        # round-40/42 detail-truncation collision invariant: every one
+        # carries a `path` naturally unique to one real filesystem entry
+        # touched at most once per scan (a directory-nesting/entry-
+        # count/per-file-byte/whole-scope-hash cap trip, a directory-
+        # listing/stat/read OSError, a non-UTF-8 path, an unverifiable
+        # junction, an excluded-region code peek, a secret-pattern hit -
+        # each keyed on that one entry's own `relative` path, never
+        # shared across two differently-caused instances). `path` is
+        # its own explicit, separate `digests.problem_id` hash input
+        # (see that function's own signature) - two genuinely different
+        # discovery problems can never collide on `problem_id` here
+        # regardless of what their own `detail` text says or how it
+        # truncates. Nothing to fix; enumerated so a later round does
+        # not need to re-derive this.
         problems = [
             _problem_record(p["reason_code"], p.get("path"), p["detail"])
             for p in discovery_result.problems
