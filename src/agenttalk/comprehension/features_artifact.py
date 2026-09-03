@@ -247,7 +247,16 @@ def build_features(
     for (owning_unit_id, _distinguisher), claims in entry_points_by_owner.items():
         owner_path, first_claim, _owner = claims[0]
         label = _feature_label(first_claim.qualified_name)
-        feature_id = digests.feature_id(label=label, unit_ids=[owning_unit_id])
+        # FIX ROUND 39 (F1 BLOCKER): `first_claim.qualified_name`/`kind`
+        # are the exact distinguishing data `group_key` above already
+        # uses to keep two file-fallback-owned claims apart - threaded
+        # into feature_id itself now too, the same fix shape round 38
+        # applied to entry_point_id (see digests.feature_id's own
+        # docstring).
+        feature_id = digests.feature_id(
+            label=label, unit_ids=[owning_unit_id],
+            qualified_name=first_claim.qualified_name, kind=first_claim.kind,
+        )
 
         # M-5 (third cold read, fix round 5): two claims that normalize to
         # the SAME entry_point_id (kind+owning_unit_id+name) - e.g. a

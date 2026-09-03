@@ -1023,9 +1023,21 @@ def _edge_claim_to_record(
     }.get(edge.target_kind)
 
     return DependencyRecord(
+        # FIX ROUND 39 (F1(c) sweep-continuation): `edge.from_qualified_
+        # name` is the exact distinguishing datum this producer's own
+        # `by_qualified_name.get(...) or file_unit_id_by_path[path]`
+        # fallback loses when two out-of-scan classes collapse to the
+        # same synthetic file owner - see digests.edge_id's own
+        # docstring.
+        # FIX ROUND 39 (F1(c) sweep-continuation): `edge.from_qualified_
+        # name` is the exact distinguishing datum this producer's own
+        # `by_qualified_name.get(...) or file_unit_id_by_path[path]`
+        # fallback loses when two out-of-scan classes collapse to the
+        # same synthetic file owner - see digests.edge_id's own
+        # docstring.
         edge_id=digests.edge_id(
             from_unit_id=from_unit_id, relation=edge.relation, target=edge.target,
-            phase=edge.phase,
+            phase=edge.phase, from_qualified_name=edge.from_qualified_name,
         ),
         from_unit_id=from_unit_id,
         relation=edge.relation,

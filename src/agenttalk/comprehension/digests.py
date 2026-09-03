@@ -173,12 +173,44 @@ def unit_id(*, kind: str, paths: list[str], qualified_name: str | None) -> str:
     )
 
 
-def edge_id(*, from_unit_id: str, relation: str, target: str, phase: str) -> str:
+def edge_id(
+    *, from_unit_id: str, relation: str, target: str, phase: str,
+    from_qualified_name: str | None = None,
+) -> str:
     """DESIGN-55-comprehension-plane.md, Artifact 2: "a deterministic
-    edge_id and from_unit_id"."""
+    edge_id and from_unit_id".
+
+    FIX ROUND 39 (thirty-third cold read, F1(c) - re-running the
+    collision hunt against every family's own DEGENERATE/FALLBACK
+    inputs, per reviewer-3's own standard): ``from_qualified_name`` was
+    NOT a hash input - two OUT-OF-SCAN declaring classes (real,
+    different classes this scan cannot see - `dependencies_artifact.
+    build_dependencies`'s own ``by_qualified_name.get(edge.from_
+    qualified_name) or file_unit_id_by_path[path]`` fallback) both
+    resolve ``from_unit_id`` to the SAME synthetic file unit; when they
+    also share ``relation``/``target``/``phase`` (two out-of-scan
+    servlets mapped to the identical ``<url-pattern>``, an ordinary
+    real-world shape already named by round 31's own ``duplicate_
+    route_target`` problem) their edges collided BY CONSTRUCTION and
+    were silently coalesced into ONE published record, even though they
+    are genuinely two different declaring classes' own facts - measured
+    directly (two adapter-level edges collapsing to one dependency
+    record). ``from_qualified_name`` is exactly the datum this
+    producer's own emission site already has and already differs
+    between the two - threaded into the id now, the same fix shape
+    round 38/39 already applied to ``entry_point_id``/``feature_id``.
+    Deliberately does NOT change the coalescing this id family's own
+    ``_coalesce_by_edge_id`` intentionally performs for a genuinely
+    repeated fact (the same class's own identical call site emitted
+    more than once) - ``from_qualified_name`` is identical for those,
+    so they still collide (and coalesce) exactly as before. ``None``
+    folds to ``""``, per this module's own stated convention."""
     return _domain_separated_id(
         _EDGE_ID_DOMAIN,
-        {"from_unit_id": from_unit_id, "relation": relation, "target": target, "phase": phase},
+        {
+            "from_unit_id": from_unit_id, "relation": relation, "target": target, "phase": phase,
+            "from_qualified_name": from_qualified_name or "",
+        },
     )
 
 
@@ -211,9 +243,35 @@ def entry_point_id(
     )
 
 
-def feature_id(*, label: str, unit_ids: list[str]) -> str:
+def feature_id(
+    *, label: str, unit_ids: list[str], qualified_name: str | None = None, kind: str | None = None,
+) -> str:
+    """FIX ROUND 39 (thirty-third cold read, F1 BLOCKER, wrong-data):
+    neither ``qualified_name`` nor ``kind`` was a hash input - for an
+    OUT-OF-SCAN class, ``label`` is the SIMPLE name (``_feature_label``)
+    and ``unit_ids`` is the SAME synthetic file-fallback unit, so two
+    jar-shipped classes sharing a simple name in different packages
+    (two ``LoginServlet``s - utterly ordinary) produced two DIFFERENT
+    features sharing ONE id - the identical by-construction collision
+    class ``entry_point_id`` had before round 38's own F1 fix, missed
+    by round 38's own collision sweep because that sweep hunted
+    canonicalisation/list-join ambiguity, never this family's own
+    DEGENERATE-INPUT shape (a fallback owner plus a simple-name label).
+    ``features_artifact.build_features`` already computes and uses the
+    exact distinguishing datum (the claim's own full ``qualified_name``)
+    to keep the two under SEPARATE feature groups (``group_key``) -
+    threaded into the id itself now too, the same fix shape as
+    ``entry_point_id``'s own. ``kind`` is threaded too (a filter and a
+    servlet sharing a simple name and a fallback owner collided
+    identically, proving kind was not discriminated either) - both
+    ``None``-fold to the empty string, per this module's own stated
+    convention (see the module docstring)."""
     return _domain_separated_id(
-        _FEATURE_ID_DOMAIN, {"label": label, "unit_ids": sorted(unit_ids)},
+        _FEATURE_ID_DOMAIN,
+        {
+            "label": label, "unit_ids": sorted(unit_ids),
+            "qualified_name": qualified_name or "", "kind": kind or "",
+        },
     )
 
 

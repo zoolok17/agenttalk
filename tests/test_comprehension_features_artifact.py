@@ -196,6 +196,98 @@ def test_web_xml_entry_point_still_owned_by_the_file_when_the_class_is_out_of_sc
     assert features[0].label == "DispatcherServlet"
 
 
+def test_two_out_of_scan_classes_sharing_a_simple_name_get_distinct_feature_ids():
+    """FIX ROUND 39 (thirty-third cold read, F1 BLOCKER, .cr33-fid,
+    wrong-data): `feature_id = hash(label, unit_ids=[owner])` - for an
+    OUT-OF-SCAN class, `label` is the SIMPLE name and `owner` is the
+    SAME synthetic file-fallback unit, so two jar-shipped classes
+    sharing a simple name in different packages (two `LoginServlet`s -
+    utterly ordinary) produced two DIFFERENT features sharing ONE id.
+    `qualified_name` (the claim's own full dotted name) is exactly the
+    distinguishing datum `group_key` already uses to keep the two
+    feature groups apart - now threaded into feature_id itself too."""
+    web_xml_a = """<web-app>
+  <servlet>
+    <servlet-name>a</servlet-name>
+    <servlet-class>com.vendor.pkg1.LoginServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>a</servlet-name>
+    <url-pattern>/a/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    web_xml_b = """<web-app>
+  <servlet>
+    <servlet-name>b</servlet-name>
+    <servlet-class>com.vendor.pkg2.LoginServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>b</servlet-name>
+    <url-pattern>/b/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points_a, _p1, _e1, _c1 = java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml_a)
+    entry_points_b, _p2, _e2, _c2 = java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml_b)
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(
+            entry_points=[*entry_points_a, *entry_points_b]),
+    }
+    entry_point_records, features = fa.build_features(results)
+    assert len(entry_point_records) == 2
+    assert len(features) == 2
+    feature_ids = {f.feature_id for f in features}
+    assert len(feature_ids) == 2, "two distinct classes must not share one feature_id"
+    assert {f.label for f in features} == {"LoginServlet"}
+    claimed_ids = {ep_id for f in features for ep_id in f.entry_point_ids}
+    assert claimed_ids == {e.entry_point_id for e in entry_point_records}
+
+
+def test_three_out_of_scan_classes_sharing_a_simple_name_across_servlet_and_filter_kinds():
+    """FIX ROUND 39 (F1 BLOCKER, .cr33-fid3, wrong-data): the third
+    reader fixture proves `kind` was not discriminated either - a
+    `<filter>` and a `<servlet>`, both out-of-scan, sharing a simple
+    name, collided on feature_id the identical way two servlets did.
+    `kind` is threaded into feature_id now too."""
+    web_xml_servlet = """<web-app>
+  <servlet>
+    <servlet-name>a</servlet-name>
+    <servlet-class>com.vendor.pkg1.Shared</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>a</servlet-name>
+    <url-pattern>/a/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    web_xml_filter = """<web-app>
+  <filter>
+    <filter-name>b</filter-name>
+    <filter-class>com.vendor.pkg2.Shared</filter-class>
+  </filter>
+  <filter-mapping>
+    <filter-name>b</filter-name>
+    <url-pattern>/b/*</url-pattern>
+  </filter-mapping>
+</web-app>
+"""
+    entry_points_servlet, _p1, _e1, _c1 = java_adapter.parse_web_xml(
+        "WEB-INF/web.xml", web_xml_servlet)
+    entry_points_filter, _p2, _e2, _c2 = java_adapter.parse_web_xml(
+        "WEB-INF/web.xml", web_xml_filter)
+    assert entry_points_servlet[0].kind != entry_points_filter[0].kind
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(
+            entry_points=[*entry_points_servlet, *entry_points_filter]),
+    }
+    entry_point_records, features = fa.build_features(results)
+    assert len(entry_point_records) == 2
+    assert len(features) == 2
+    assert len({f.feature_id for f in features}) == 2, (
+        "a servlet and a filter sharing a simple name must not share a feature_id")
+
+
 def test_two_servlet_mappings_in_one_web_xml_produce_two_features_not_one():
     """FIX ROUND 14 (tenth cold read, CR10-8 MINOR, wrong-data): a
     web.xml with two <servlet-mapping> entries has no real declared-type

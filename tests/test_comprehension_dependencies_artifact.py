@@ -744,6 +744,47 @@ def test_byte_identical_invoke_edges_coalesce_to_one_record_with_merged_producer
     assert len(invoke_records[0].producers) == 1
 
 
+def test_two_out_of_scan_classes_routed_to_the_same_target_get_distinct_edge_ids():
+    """FIX ROUND 39 (thirty-third cold read, F1(c), re-running the
+    collision hunt against edge_id's own degenerate/fallback inputs,
+    per reviewer-3's own standard): `build_dependencies`'s own
+    `by_qualified_name.get(edge.from_qualified_name) or file_unit_id_
+    by_path[path]` fallback resolves BOTH of two out-of-scan classes'
+    own route edges to the SAME synthetic file unit - when they also
+    share relation/target/phase (two out-of-scan servlets mapped to
+    the identical <url-pattern>, the same ordinary shape round 31's
+    own duplicate_route_target problem already names), the two edges
+    collided BY CONSTRUCTION and silently coalesced into ONE published
+    record, though they are genuinely two different declaring classes'
+    own facts. `from_qualified_name` (real, different for each class,
+    already available at the emission site) is now threaded into
+    edge_id too. The control above (three identical calls from the
+    SAME class) proves this does not disturb genuine coalescing -
+    `from_qualified_name` is identical there, so it still collapses."""
+    web_xml = (
+        "<web-app>"
+        "<servlet><servlet-name>a</servlet-name>"
+        "<servlet-class>com.vendor.pkg1.OutOfScanA</servlet-class></servlet>"
+        "<servlet><servlet-name>b</servlet-name>"
+        "<servlet-class>com.vendor.pkg2.OutOfScanB</servlet-class></servlet>"
+        "<servlet-mapping><servlet-name>a</servlet-name>"
+        "<url-pattern>/shared/*</url-pattern></servlet-mapping>"
+        "<servlet-mapping><servlet-name>b</servlet-name>"
+        "<url-pattern>/shared/*</url-pattern></servlet-mapping>"
+        "</web-app>"
+    )
+    entry_points, problems, edges, _conflicts = java_adapter.parse_web_xml(
+        "WEB-INF/web.xml", web_xml)
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(
+            entry_points=entry_points, edges=edges, problems=problems),
+    }
+    records = da.build_dependencies(results)
+    route_records = [r for r in records if r.relation == "route"]
+    assert len(route_records) == 2
+    assert len({r.edge_id for r in route_records}) == 2
+
+
 # ----------------------------------------------------------- M12: registry collisions and invoke over-reach
 
 def test_duplicate_qualified_name_never_resolves_confidently_to_either_claimant():

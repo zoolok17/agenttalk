@@ -2895,6 +2895,58 @@ def test_run_scan_two_out_of_scan_servlets_mapped_to_the_same_pattern_get_distin
     features_summary = next(a for a in scan_doc["artifacts"] if a["name"] == "features.json")
     assert features_summary["record_count"] == len(all_entry_points) + len(all_features)
 
+
+def test_run_scan_two_out_of_scan_classes_sharing_a_simple_name_completes_not_refuses(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 39 (thirty-third cold read, F1 BLOCKER, .cr33-fid2,
+    wrong-data): round 38's own id-family sweep ruled `feature_id`
+    "safe by construction" - false: for an out-of-scan class, `label`
+    is the simple name and `unit_ids` is the SAME synthetic file
+    owner, so two jar-shipped classes sharing a simple name in
+    different packages (two `LoginServlet`s, an utterly ordinary
+    shape) collided on `feature_id`, and round 38's own publish-time
+    sweep then REFUSED TO PUBLISH the whole run - permanently
+    unscannable, since no --scope/--exclude exists to narrow past it
+    this slice. Different url-patterns here (unlike the entry_point_id
+    fixture above) isolate the bug to feature_id specifically - the
+    entry points themselves never collided."""
+    import json
+
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name>a</servlet-name>\n"
+        "    <servlet-class>com.vendor.pkg1.LoginServlet</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet>\n"
+        "    <servlet-name>b</servlet-name>\n"
+        "    <servlet-class>com.vendor.pkg2.LoginServlet</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>a</servlet-name>\n"
+        "    <url-pattern>/a/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>b</servlet-name>\n"
+        "    <url-pattern>/b/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+
+    features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
+    login_features = [f for f in features_doc["features"] if f["label"] == "LoginServlet"]
+    assert len(login_features) == 2
+    assert len({f["feature_id"] for f in login_features}) == 2
+
+    validate_result = scan_pipeline.validate_run(java_repo, run_id=outcome.scan_id)
+    assert validate_result["valid"] is True
+
     validate_result = scan_pipeline.validate_run(java_repo, run_id=outcome.scan_id)
     assert validate_result["valid"] is True
 

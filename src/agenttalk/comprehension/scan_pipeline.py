@@ -422,6 +422,70 @@ def _coalesce_byte_identical(records: list[Any], *, id_attr: str) -> list[Any]:
     return coalesced
 
 
+#: FIX ROUND 39 (thirty-third cold read, F1 BLOCKER, part (b)):
+#: ``feature_id``'s own refusal message (id value only, no path/label)
+#: was measured OPERATOR-UNLOCATABLE - a real collision refuses the
+#: whole run permanently (no ``--scope``/``--exclude`` exists to narrow
+#: past it this slice) with nothing an operator could use to find which
+#: two declarations actually collided. Named per-family in priority
+#: order - the first attribute present on a given record family wins,
+#: so this one function serves every family sharing this refusal
+#: mechanism, not a per-family special case.
+_ID_COLLISION_LOCATOR_ATTRS: tuple[str, ...] = ("label", "name", "display_name", "check")
+
+
+def _id_collision_locator(record: Any) -> str:
+    """A short, human-locatable description of one record involved in a
+    stable-ID collision - enough for an operator to find the actual
+    declaring path(s)/label(s) without reading the raw artifact byte
+    for byte. Never the full record."""
+    if isinstance(record, dict):
+        parts = [f"{k}={record[k]!r}" for k in ("path", "reason_code") if record.get(k)]
+        return ", ".join(parts) if parts else repr(record)[:80]
+    parts = []
+    for attr in _ID_COLLISION_LOCATOR_ATTRS:
+        value = getattr(record, attr, None)
+        if value:
+            parts.append(f"{attr}={value!r}")
+            break
+    paths = getattr(record, "paths", None)
+    if paths:
+        parts.append(f"paths={list(paths)!r}")
+    owner = (
+        getattr(record, "owning_unit_id", None)
+        or getattr(record, "unit_id", None)
+        or getattr(record, "from_unit_id", None)
+    )
+    if owner:
+        parts.append(f"unit={owner[:12]}...")
+    return ", ".join(parts) if parts else repr(record)[:80]
+
+
+def _id_collision_detail(
+    records: list[Any], *, id_attr: str, colliding_ids: list[str],
+) -> str:
+    """FIX ROUND 39 (F1 BLOCKER, part (b)): one line per colliding id,
+    naming the id (truncated - the full hex is in the artifact itself)
+    and every distinct locator among the records sharing it, so a
+    refusal is ACTIONABLE - an operator can grep the named label(s)/
+    path(s) directly instead of the id value alone."""
+    by_id: dict[str, list[Any]] = {}
+    for r in records:
+        rid = r[id_attr] if isinstance(r, dict) else getattr(r, id_attr)
+        if rid in colliding_ids:
+            by_id.setdefault(rid, []).append(r)
+    lines = []
+    for rid in colliding_ids:
+        locators = sorted({_id_collision_locator(r) for r in by_id.get(rid, [])})
+        shown = locators[:5]
+        more = len(locators) - len(shown)
+        lines.append(
+            f"{id_attr}={rid[:12]}...: " + "; ".join(shown)
+            + (f" (and {more} more)" if more else "")
+        )
+    return " | ".join(lines)
+
+
 def _problem_id_collisions(problems: list[dict[str, Any]]) -> list[str]:
     """FIX ROUND 36 (thirtieth cold read, F2 MAJOR, part (c)): ``problem_
     id`` is a stable hash of ``(reason_code, path, detail, qualified_
@@ -1180,40 +1244,66 @@ def run_scan(
         # FIX ROUND 38 (thirty-second cold read, F1 BLOCKER, parts (b)/
         # (c)): the SAME stable-ID-corruption sweep problems.json already
         # gets (below, at its own construction site) run here too, for
-        # every OTHER id family - unit_id, edge_id, feature_id, and
-        # signal_id are all "safe by construction" on inspection (their
-        # own hash input already includes whatever datum keeps two
-        # genuinely different records from colliding), enumerated here so
-        # that conclusion is checked, not merely asserted: unit_id's own
-        # `paths` component already distinguishes any two components at
-        # different locations; edge_id's records are already coalesced
-        # by `_coalesce_by_edge_id` before reaching this point, so no
-        # colliding-but-different pair can survive to here; feature_id
-        # already hashes `unit_ids` (the owning file/component), the same
-        # datum that keeps two file-fallback features apart upstream;
-        # signal_id already hashes the full `unit_id`, which is itself
-        # already collision-safe. entry_point_id was the one family that
-        # was NOT safe (this round's own F1 blocker, fixed above at
-        # digests.entry_point_id/features_artifact.build_features) - this
-        # sweep is the backstop that would have caught it, and now covers
-        # every family so a future emitter bug in any of them is refused
-        # at its own source too, never silently published.
+        # every OTHER id family - this sweep is the backstop that would
+        # have caught any of them, and now covers every family so a
+        # future emitter bug in any of them is refused at its own source
+        # too, never silently published.
+        #
+        # CORRECTED (round 39, thirty-third cold read, F1(c)): round 38's
+        # own "safe by construction" ruling for unit_id/edge_id/feature_id
+        # /signal_id was WRONG for two of the four - both round 38's own
+        # sweep AND reviewer-3's re-derivation hunted only CANONICALISATION
+        # ambiguity (list-join/sort-order questions), never each family's
+        # own DEGENERATE/FALLBACK inputs (an out-of-scan owner, a simple-
+        # name label, a synthetic unit) - the standard this round's own
+        # re-hunt now applies to all four, enumerated:
+        #   - unit_id: SAFE - `paths` always differs between two distinct
+        #     files/components, even a duplicate-qualified-name conflict
+        #     (handled via conflict_id, a separate mechanism, not a
+        #     unit_id collision).
+        #   - edge_id: WAS NOT SAFE, now fixed (round 39's own F1(c)) -
+        #     `by_qualified_name.get(edge.from_qualified_name) or
+        #     file_unit_id_by_path[path]` resolves two OUT-OF-SCAN
+        #     declaring classes to the SAME synthetic file unit; two such
+        #     classes sharing relation/target/phase (two out-of-scan
+        #     servlets routed to the identical <url-pattern>, the same
+        #     shape round 31's own duplicate_route_target already names)
+        #     collided BY CONSTRUCTION and silently coalesced into one
+        #     record. `from_qualified_name` (real, different per class)
+        #     is now a hash input - see digests.edge_id's own docstring.
+        #   - feature_id: WAS NOT SAFE, fixed in round 39's own F1 - see
+        #     digests.feature_id's own docstring (two out-of-scan classes
+        #     sharing a simple name and a fallback owner collided).
+        #   - signal_id: SAFE - hashes the full `unit_id`, itself already
+        #     collision-safe (above), plus a closed (check, policy_
+        #     version) vocabulary with no degenerate/fallback input of its
+        #     own to hunt.
+        # entry_point_id was round 38's own fix; feature_id and edge_id
+        # are round 39's own - all four families now verified, not merely
+        # asserted, against their own degenerate inputs specifically.
+        _id_family_specs = (
+            ("unit_id", "module(s)", "modules.json", modules),
+            ("edge_id", "dependency edge(s)", "dependencies.json", dependencies),
+            ("entry_point_id", "entry point(s)", "features.json", entry_points),
+            ("feature_id", "feature(s)", "features.json", features),
+            ("signal_id", "readiness signal(s)", "readiness.json", readiness_signals),
+        )
         _id_family_collisions_found = [
-            (id_attr, label, ids) for id_attr, label, ids in (
-                ("unit_id", "module(s)", _id_family_collisions(modules, id_attr="unit_id")),
-                ("edge_id", "dependency edge(s)",
-                 _id_family_collisions(dependencies, id_attr="edge_id")),
-                ("entry_point_id", "entry point(s)",
-                 _id_family_collisions(entry_points, id_attr="entry_point_id")),
-                ("feature_id", "feature(s)", _id_family_collisions(features, id_attr="feature_id")),
-                ("signal_id", "readiness signal(s)",
-                 _id_family_collisions(readiness_signals, id_attr="signal_id")),
-            ) if ids
+            (id_attr, label, artifact, family_records, ids)
+            for id_attr, label, artifact, family_records in _id_family_specs
+            for ids in [_id_family_collisions(family_records, id_attr=id_attr)] if ids
         ]
         if _id_family_collisions_found:
-            _id_family_detail = "; ".join(
-                f"{len(ids)} {id_attr}(s) shared by {label} with different content"
-                for id_attr, label, ids in _id_family_collisions_found
+            # FIX ROUND 39 (F1 BLOCKER, part (b)): named the artifact and
+            # every colliding record's own label/path, not the bare id
+            # count - a refusal that names no path/label/remedy left an
+            # operator with no way to locate the actual collision, on a
+            # run that (this slice) has no --scope/--exclude to narrow
+            # past it either.
+            _id_family_detail = " | ".join(
+                f"{artifact}: {len(ids)} {id_attr}(s) shared by {label} with different "
+                f"content - {_id_collision_detail(family_records, id_attr=id_attr, colliding_ids=ids)}"
+                for id_attr, label, artifact, family_records, ids in _id_family_collisions_found
             )
             raise ComprehensionError(
                 f"refusing to publish: {_id_family_detail} "
@@ -2705,24 +2795,25 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
     # or corrupted by some other path, is still caught by `validate`
     # rather than silently reporting valid:true.
     _problem_id_collision_ids = _problem_id_collisions(records["problems"] if records else [])
-    # FIX ROUND 38 (thirty-second cold read, F1 BLOCKER, parts (b)/(c)):
+    # FIX ROUND 38/39 (thirty-second/thirty-third cold reads, F1 BLOCKER):
     # the SAME sweep, generalized to every OTHER id family - see the
-    # matching publish-time block in `run_scan` for why unit_id/edge_id/
-    # feature_id/signal_id are "safe by construction" and entry_point_id
-    # was not, before this round's own fix.
+    # matching publish-time block in `run_scan` for the full, corrected
+    # per-family enumeration (unit_id/signal_id safe by construction;
+    # entry_point_id/feature_id/edge_id were not, each fixed in turn).
+    _validate_id_family_specs = (
+        ("unit_id", "module(s)", "modules.json", records["modules"] if records else []),
+        ("edge_id", "dependency edge(s)", "dependencies.json",
+         records["dependencies"] if records else []),
+        ("entry_point_id", "entry point(s)", "features.json",
+         records["entry_points"] if records else []),
+        ("feature_id", "feature(s)", "features.json", records["features"] if records else []),
+        ("signal_id", "readiness signal(s)", "readiness.json",
+         records["readiness_signals"] if records else []),
+    )
     _id_family_collision_ids_found = [
-        (id_attr, label, ids) for id_attr, label, ids in (
-            ("unit_id", "module(s)",
-             _id_family_collisions(records["modules"] if records else [], id_attr="unit_id")),
-            ("edge_id", "dependency edge(s)", _id_family_collisions(
-                records["dependencies"] if records else [], id_attr="edge_id")),
-            ("entry_point_id", "entry point(s)", _id_family_collisions(
-                records["entry_points"] if records else [], id_attr="entry_point_id")),
-            ("feature_id", "feature(s)", _id_family_collisions(
-                records["features"] if records else [], id_attr="feature_id")),
-            ("signal_id", "readiness signal(s)", _id_family_collisions(
-                records["readiness_signals"] if records else [], id_attr="signal_id")),
-        ) if ids
+        (id_attr, label, artifact, family_records, ids)
+        for id_attr, label, artifact, family_records in _validate_id_family_specs
+        for ids in [_id_family_collisions(family_records, id_attr=id_attr)] if ids
     ]
     dangling_detail = _dangling_reference_detail(_dangling_categories)
     invalid = (
@@ -2735,9 +2826,14 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
         f"{len(_problem_id_collision_ids)} problem_id(s) shared by non-identical records"
         if _problem_id_collision_ids else None
     )
-    _id_family_collision_detail = "; ".join(
-        f"{len(ids)} {id_attr}(s) shared by {label} with different content"
-        for id_attr, label, ids in _id_family_collision_ids_found
+    # FIX ROUND 39 (F1 BLOCKER, part (b)): the same operator-locatable
+    # detail run_scan's own publish-time refusal now builds - see its
+    # own comment for why the bare id-count message was measured
+    # unlocatable.
+    _id_family_collision_detail = " | ".join(
+        f"{artifact}: {len(ids)} {id_attr}(s) shared by {label} with different content - "
+        f"{_id_collision_detail(family_records, id_attr=id_attr, colliding_ids=ids)}"
+        for id_attr, label, artifact, family_records, ids in _id_family_collision_ids_found
     ) or None
     invalid_detail = " and ".join(
         part for part in (
