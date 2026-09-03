@@ -2429,10 +2429,10 @@ def _class_header_associations(
 
 def _class_registrability(
     sanitized: str, declaration_start: int, header_start: int,
-) -> tuple[bool, bool, bool, bool, bool]:
-    """``(is_interface, is_abstract, has_stereotype, is_enum, is_static)``
-    for ONE declared type, anchored the same way
-    :func:`_class_level_route_target`
+) -> tuple[bool, bool, bool, bool, bool, bool]:
+    """``(is_interface, is_abstract, has_stereotype, is_enum, is_static,
+    is_interface_or_annotation_type)`` for ONE declared type, anchored
+    the same way :func:`_class_level_route_target`
     already is.
 
     FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER - THE
@@ -2495,6 +2495,21 @@ def _class_registrability(
       exactly as instantiable as a top-level one - ``container_prefix``
       non-empty alone was never sufficient, only non-empty AND not
       ``static``.
+    - ``is_interface_or_annotation_type``: FIX ROUND 47 (forty-first
+      cold read, M1 MAJOR - THE CONTAINER DIMENSION, sibling of round
+      46's own declared-TYPE dimension): JLS 9.5 - every member type
+      declared INSIDE an interface (or an annotation type, itself a
+      special kind of interface per JLS 9.6) is implicitly static,
+      regardless of whether the member itself writes ``static`` or is
+      an interface/enum/record/annotation-type of its own. Round 46's
+      own ``is_non_static_member`` looked only at the MEMBER's own
+      ``static`` modifier, never at what KIND of type contains it - a
+      concrete class nested inside an interface (a real, common idiom:
+      a default-method helper, a nested implementation class) was
+      misread as a non-static member and wrongly suppressed. The
+      caller consults THIS type's own flag when it is acting as a
+      CONTAINER for some other type's own ``container_prefix``, never
+      when describing itself.
     """
     is_interface = False
     is_enum = False
@@ -2529,7 +2544,15 @@ def _class_registrability(
         _STATIC_MODIFIER_RE.search(trivia) is not None
         or is_interface or is_enum or is_record or is_annotation_type
     )
-    return is_interface, is_abstract, has_stereotype, is_enum, is_static
+    # FIX ROUND 47 (forty-first cold read, M1 MAJOR - THE CONTAINER
+    # DIMENSION, sibling of round 46's declared-type dimension): an
+    # annotation type is itself a special kind of interface (JLS 9.6) -
+    # returned combined with ``is_interface`` here so the caller can
+    # test ONE flag ("this type, as a CONTAINER, makes its own members
+    # implicitly static per JLS 9.5") without re-deriving the ``@``
+    # check a second time.
+    is_interface_or_annotation_type = is_interface or is_annotation_type
+    return is_interface, is_abstract, has_stereotype, is_enum, is_static, is_interface_or_annotation_type
 
 
 def _uninstantiable_class_problem(
@@ -2710,12 +2733,32 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         for qualified, _simple, container_prefix, _brace_pos, _extends, _implements, _end, is_local
         in types
     }
+    # FIX ROUND 47 (forty-first cold read, M1 MAJOR - THE CONTAINER
+    # DIMENSION): a genuine TWO-PASS build now, not one - `is_non_static_
+    # member` needs to know whether the CONTAINER itself is an interface/
+    # annotation type (JLS 9.5: every member of one is implicitly static),
+    # and that container is some OTHER entry in this same dict, not yet
+    # necessarily populated if this loop combined both facts in one pass
+    # over `class_header_associations`'s own (correct today, but never
+    # guaranteed) declaration order. Pass 1 gathers each type's own raw,
+    # order-independent facts; pass 2 combines them with `container_
+    # prefix`/`is_local`, consulting pass 1's own dict for the CONTAINER's
+    # entry regardless of which order the two were declared in.
+    raw_registrability = {
+        qualified: _class_registrability(sanitized, declaration_start, header_start)
+        for declaration_start, header_start, qualified in class_header_associations
+    }
     class_registrability: dict[str, tuple[bool, bool, bool, bool, bool, bool]] = {}
-    for declaration_start, header_start, qualified in class_header_associations:
-        is_interface, is_abstract, has_stereotype, is_enum, is_static = _class_registrability(
-            sanitized, declaration_start, header_start)
+    for qualified, (
+        is_interface, is_abstract, has_stereotype, is_enum, is_static, _is_iface_or_anno,
+    ) in raw_registrability.items():
         container_prefix, is_local = container_and_local_by_qualified.get(qualified, ("", False))
-        is_non_static_member = bool(container_prefix) and not is_static
+        container_facts = raw_registrability.get(container_prefix) if container_prefix else None
+        container_is_interface_or_annotation_type = (
+            container_facts is not None and container_facts[5])
+        is_non_static_member = (
+            bool(container_prefix) and not is_static and not container_is_interface_or_annotation_type
+        )
         class_registrability[qualified] = (
             is_interface, is_abstract, has_stereotype, is_enum, is_non_static_member, is_local)
     # FIX ROUND 14 (tenth cold read, CR10-1 MAJOR): an ``import`` is a

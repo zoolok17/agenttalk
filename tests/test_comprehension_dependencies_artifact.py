@@ -1869,3 +1869,149 @@ def test_resolve_descriptor_qualified_name_is_a_no_op_without_a_dollar_sign():
     registry = {"com.acme.Plain": "unit-1"}
     assert da.resolve_descriptor_qualified_name("com.acme.Plain", registry) == "com.acme.Plain"
     assert da.resolve_descriptor_qualified_name("com.acme.NotThere", registry) == "com.acme.NotThere"
+
+
+def _java_result_with_source(relative_path: str, source: str) -> java_adapter.JavaFileResult:
+    return java_adapter.parse_java_source(relative_path, source)
+
+
+def test_compute_descriptor_registrability_verdicts_suppresses_a_single_uninstantiable_class():
+    """FIX ROUND 47 (forty-first cold read, B2+B3 - THE DESCRIPTOR
+    FAMILY): the ordinary, single-declaration case - one abstract class,
+    no duplicates - must still suppress, unchanged from round 45/46's
+    own behavior, now decided upstream instead of inside
+    features_artifact.build_features itself."""
+    results = {
+        "com/acme/Abs.java": _java_result_with_source(
+            "com/acme/Abs.java", "package com.acme;\npublic abstract class Abs {\n}\n"),
+    }
+    verdicts = da.compute_descriptor_registrability_verdicts(results)
+    verdict = verdicts["com.acme.Abs"]
+    assert verdict.suppress is True
+    assert "descriptor_route_on_uninstantiable_class" in verdict.detail
+    assert "ABSTRACT" in verdict.detail
+
+
+def test_compute_descriptor_registrability_verdicts_does_not_suppress_a_concrete_class():
+    """FIX ROUND 47 (B2+B3 control): an ordinary concrete class, no
+    duplicates, must never suppress."""
+    results = {
+        "com/acme/Plain.java": _java_result_with_source(
+            "com/acme/Plain.java", "package com.acme;\npublic class Plain {\n}\n"),
+    }
+    verdicts = da.compute_descriptor_registrability_verdicts(results)
+    assert verdicts["com.acme.Plain"].suppress is False
+
+
+def test_compute_descriptor_registrability_verdicts_suppresses_when_every_duplicate_is_uninstantiable(
+) -> None:
+    """FIX ROUND 47 (B2 BLOCKER, wrong-data - .cr41-dupshapes, the
+    realistic .cr41-duptest trigger: a src/test/java copy of the same
+    FQN as a production abstract class): round 45/46's own downstream
+    check resolved a descriptor target through by_qualified_name, which
+    EMPTIES itself entirely for a duplicate qualified name - so a
+    duplicate FQN silently skipped the registrability check ENTIRELY,
+    publishing a confident served route for a class this run
+    independently knew was uninstantiable on EVERY declaration sharing
+    that name. This verdict is grouped independently of
+    by_qualified_name (never emptied on a duplicate) - decided here
+    instead: every duplicate candidate is uninstantiable, so suppress,
+    certain regardless of which declaration a container actually loads."""
+    results = {
+        "com/acme/Abs.java": _java_result_with_source(
+            "com/acme/Abs.java", "package com.acme;\npublic abstract class Abs {\n}\n"),
+        "src/test/java/com/acme/Abs.java": _java_result_with_source(
+            "src/test/java/com/acme/Abs.java",
+            "package com.acme;\npublic abstract class Abs {\n}\n"),
+    }
+    verdicts = da.compute_descriptor_registrability_verdicts(results)
+    verdict = verdicts["com.acme.Abs"]
+    assert verdict.suppress is True
+    assert "descriptor_route_on_uninstantiable_class" in verdict.detail
+    assert "2 duplicate declarations" in verdict.detail
+    assert "every one of which is uninstantiable" in verdict.detail
+
+
+def test_compute_descriptor_registrability_verdicts_suppresses_a_mixed_duplicate_as_ambiguous(
+) -> None:
+    """FIX ROUND 47 (B2 BLOCKER, .cr41-solshapes-mixed): a duplicate FQN
+    where one declaration is concrete/instantiable and the OTHER is
+    abstract - this producer cannot know which declaration a container
+    actually resolves at runtime, so it must not confidently publish a
+    served route either way (the same "ambiguous, never confidently
+    pick one" honesty this producer's own duplicate-qualified-name
+    conflict machinery already applies elsewhere)."""
+    results = {
+        "com/acme/Mixed.java": _java_result_with_source(
+            "com/acme/Mixed.java", "package com.acme;\npublic class Mixed {\n}\n"),
+        "vendor/com/acme/Mixed.java": _java_result_with_source(
+            "vendor/com/acme/Mixed.java", "package com.acme;\npublic abstract class Mixed {\n}\n"),
+    }
+    verdicts = da.compute_descriptor_registrability_verdicts(results)
+    verdict = verdicts["com.acme.Mixed"]
+    assert verdict.suppress is True
+    assert "descriptor_route_on_uninstantiable_class" in verdict.detail
+    assert "conflicting declarations" in verdict.detail
+    assert "cannot know which one a container actually loads" in verdict.detail
+
+
+def test_build_dependencies_never_builds_a_route_edge_for_a_suppressed_descriptor_target(
+) -> None:
+    """FIX ROUND 47 (forty-first cold read, B3 MAJOR, wrong-data,
+    .cr41-absbase): the route-edge builder never consulted registrability
+    at all - it published a route-relation edge for EVERY descriptor
+    mapping unconditionally, even one features_artifact.build_features
+    simultaneously suppressed as an entry point (one run publishing
+    entry_points: 0 alongside dependency_summary.routes: 4 for the
+    IDENTICAL uninstantiable classes - self-contradicting). With the
+    upstream verdict now threaded through, the edge for an uninstantiable
+    target is never built at all."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>abs</servlet-name>
+    <servlet-class>com.acme.AbsBase</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>abs</servlet-name>
+    <url-pattern>/abs-base/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, edges, _descriptor_name_conflicts = (
+        java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml))
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points, edges=edges),
+        "com/acme/AbsBase.java": _java_result_with_source(
+            "com/acme/AbsBase.java", "package com.acme;\npublic abstract class AbsBase {\n}\n"),
+    }
+    verdicts = da.compute_descriptor_registrability_verdicts(results)
+    records = da.build_dependencies(results, descriptor_registrability_verdicts=verdicts)
+    assert not any(r.route_kind is not None for r in records)
+
+
+def test_build_dependencies_still_builds_a_route_edge_for_a_concrete_descriptor_target(
+) -> None:
+    """FIX ROUND 47 (B3 control): the ordinary, dominant case - a
+    concrete servlet class - must keep publishing its route edge
+    exactly as before."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>ok</servlet-name>
+    <servlet-class>com.acme.OkServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>ok</servlet-name>
+    <url-pattern>/ok/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, edges, _descriptor_name_conflicts = (
+        java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml))
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points, edges=edges),
+        "com/acme/OkServlet.java": _java_result_with_source(
+            "com/acme/OkServlet.java", "package com.acme;\npublic class OkServlet {\n}\n"),
+    }
+    verdicts = da.compute_descriptor_registrability_verdicts(results)
+    records = da.build_dependencies(results, descriptor_registrability_verdicts=verdicts)
+    assert any(r.route_kind == "http_route" for r in records)

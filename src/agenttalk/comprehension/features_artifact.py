@@ -26,7 +26,12 @@ from typing import Any
 
 from . import digests
 from .adapters import java as java_adapter
-from .dependencies_artifact import _build_registry, _java_file_unit_id, resolve_descriptor_qualified_name
+from .dependencies_artifact import (
+    DescriptorRegistrabilityVerdict,
+    _build_registry,
+    _java_file_unit_id,
+    resolve_descriptor_qualified_name,
+)
 
 #: FIX ROUND 22 (eighteenth cold read, F7 MINOR): the SAME "declare the
 #: structurally unreachable, don't leave it to be independently
@@ -225,46 +230,26 @@ class DescriptorRegistrabilityProblem:
     resolved class's own file) - the same attribution
     ``_uninstantiable_class_problem`` uses is not reusable here
     verbatim (its own wording assumes an annotation, never a
-    descriptor), so this is a small, dedicated sibling."""
+    descriptor), so this is a small, dedicated sibling.
+
+    FIX ROUND 47 (forty-first cold read, B2+B3 - THE DESCRIPTOR FAMILY):
+    ``detail`` is now taken VERBATIM from the shared, upstream
+    ``DescriptorRegistrabilityVerdict`` (``dependencies_artifact.
+    compute_descriptor_registrability_verdicts``) rather than re-derived
+    here per-claim - the wording (including the duplicate-qualified-
+    name disposition) is decided ONCE, in one place, for every
+    consumer."""
 
     relative_path: str
     qualified_name: str
     detail: str
 
 
-def _descriptor_uninstantiable_detail(
-    qualified_name: str, is_interface: bool, is_abstract: bool, is_enum: bool,
-    is_non_static_member: bool, is_local: bool, line: int | None,
-) -> str:
-    # FIX ROUND 46 (fortieth cold read, F1 MAJOR - THE MATRIX'S OWN
-    # MISSING DIMENSION): a non-static member/local class earns the
-    # IDENTICAL strongest claim a descriptor already gives interface/
-    # abstract/enum - a descriptor names ONE specific class with no
-    # implementor-may-serve escape (the Spring/JAX-RS weaker hedge never
-    # applies here at all), and neither shape has a no-arg constructor a
-    # container's reflective instantiation could ever invoke either.
-    if is_interface:
-        shape = "an INTERFACE"
-    elif is_abstract:
-        shape = "ABSTRACT"
-    elif is_enum:
-        shape = "an ENUM"
-    elif is_local:
-        shape = "a LOCAL class (method/constructor-body-declared)"
-    else:
-        shape = "a NON-STATIC MEMBER class"
-    at_line = f" at line {line}" if line is not None else ""
-    return (
-        f"a <servlet-class>/<filter-class>{at_line} names {qualified_name}, which is {shape} "
-        "(descriptor_route_on_uninstantiable_class) - a descriptor names one specific class "
-        "with no implementor-may-serve escape, and a container never instantiates this class at all"
-    )
-
-
 def build_features(
     java_results: dict[str, java_adapter.JavaFileResult],
     *, confirmed_labels: frozenset[str] = frozenset(),
     file_digests: dict[str, str] | None = None,
+    descriptor_registrability_verdicts: dict[str, DescriptorRegistrabilityVerdict] | None = None,
 ) -> tuple[list[EntryPointRecord], list[FeatureRecord], list[DescriptorRegistrabilityProblem]]:
     """Returns ``(entry_points, features, descriptor_registrability_problems)``.
     ``confirmed_labels`` names which candidate feature labels a
@@ -298,32 +283,33 @@ def build_features(
     the resolved unit's own ``modules.json`` record (``modules_artifact.
     _attribute_cross_file_entry_point_reasons``, reused verbatim - the
     exact same cross-file attribution mechanism the web.xml ``<listener>``
-    case already established)."""
+    case already established).
+
+    FIX ROUND 47 (forty-first cold read, B2 BLOCKER, wrong-data - THE
+    DESCRIPTOR FAMILY, the reader's own recommended structural shape):
+    the registrability check used to be rebuilt HERE, independently,
+    from ``JavaUnitClaim``s directly - resolved against ``by_qualified_
+    name``, which EMPTIES ITSELF entirely for a duplicate qualified
+    name (see ``_build_registry``'s own docstring), so a duplicate FQN
+    (a ``src/test/java`` copy of the same class, a real, common shape)
+    made ``resolved_unit_id`` ``None`` and silently skipped the WHOLE
+    registrability check, publishing a confident served route for a
+    class this run independently knew was uninstantiable. Moved
+    upstream: ``descriptor_registrability_verdicts`` is now computed
+    ONCE, before this function (and ``dependencies_artifact.
+    build_dependencies``'s own route-edge builder) ever run - see
+    ``dependencies_artifact.compute_descriptor_registrability_
+    verdicts``'s own docstring for the full mechanism and the duplicate
+    disposition - and consulted here via its OWN resolution, entirely
+    independent of ``by_qualified_name``'s own emptying behavior."""
     file_digests = file_digests or {}
+    descriptor_registrability_verdicts = descriptor_registrability_verdicts or {}
     (
         by_qualified_name, _by_simple_name, _file_unit_ids, _duplicate_names,
         _unit_ids_by_qname, _in_scan_packages,
     ) = _build_registry(java_results)
 
     owning_unit_by_qualified_name = by_qualified_name
-    # FIX ROUND 45 (F2 MAJOR): each declared type's own registrability -
-    # built directly from `JavaUnitClaim.is_interface`/`is_abstract`/
-    # `is_enum` (this round's own new fields), never `_build_registry`'s
-    # return (which stops at unit_id, carries no type-kind). Only ever
-    # consulted below when `by_qualified_name` ALSO resolved the same
-    # name unambiguously - a duplicate-qualified-name collision is
-    # already its own separate, visible problem elsewhere; this map
-    # itself makes no attempt to arbitrate one.
-    # FIX ROUND 46 (fortieth cold read, F1 MAJOR): also carries
-    # is_non_static_member/is_local now, the SAME two facts the F1
-    # registrability dimension added.
-    registrability_by_qualified_name: dict[str, tuple[bool, bool, bool, bool, bool]] = {
-        unit.qualified_name: (
-            unit.is_interface, unit.is_abstract, unit.is_enum,
-            unit.is_non_static_member, unit.is_local)
-        for result in java_results.values()
-        for unit in result.units
-    }
     descriptor_registrability_problems: list[DescriptorRegistrabilityProblem] = []
     # FIX ROUND 14 (tenth cold read, CR10-8 MINOR, wrong-data): grouped
     # by owning_unit_id ALONE - a claim with no real declared-type owner
@@ -358,26 +344,28 @@ def build_features(
             resolved_qualified_name = resolve_descriptor_qualified_name(
                 claim.qualified_name, owning_unit_by_qualified_name)
             resolved_unit_id = owning_unit_by_qualified_name.get(resolved_qualified_name)
-            # FIX ROUND 45 (F2 MAJOR): only ``http_route``/``http_filter``
-            # claims name a class the container must actually instantiate
-            # - ``cli_main`` has no such class-instantiation contract at
-            # all. Only reachable here for a claim whose OWNING class
-            # resolved UNAMBIGUOUSLY (`resolved_unit_id is not None`) -
-            # every annotation-sourced route on an uninstantiable class
-            # already self-suppresses, same-file, before it ever reaches
-            # `result.entry_points` (see java.py's own registrability
-            # checks) - so any SURVIVING claim whose resolved owner is
-            # uninstantiable can only be a web.xml descriptor claim.
-            if resolved_unit_id is not None and claim.kind in ("http_route", "http_filter"):
-                (is_interface, is_abstract, is_enum,
-                 is_non_static_member, is_local) = registrability_by_qualified_name.get(
-                    resolved_qualified_name, (False, False, False, False, False))
-                if is_interface or is_abstract or is_enum or is_non_static_member or is_local:
+            # FIX ROUND 47 (forty-first cold read, B2 BLOCKER, wrong-
+            # data): only ``http_route``/``http_filter`` claims name a
+            # class the container must actually instantiate -
+            # ``cli_main`` has no such class-instantiation contract at
+            # all. Resolved against the SHARED upstream verdict map
+            # DIRECTLY - never gated on `resolved_unit_id is not None`
+            # (that check is `by_qualified_name`-based, which empties on
+            # a duplicate qualified name; the verdict map handles a
+            # duplicate honestly instead of silently skipping it - see
+            # `compute_descriptor_registrability_verdicts`'s own
+            # docstring). Every annotation-sourced route on an
+            # uninstantiable class already self-suppresses, same-file,
+            # before it ever reaches `result.entry_points` (see java.py's
+            # own registrability checks) - so any SURVIVING claim with a
+            # suppressed verdict can only be a web.xml descriptor claim.
+            if claim.kind in ("http_route", "http_filter"):
+                verdict_key = resolve_descriptor_qualified_name(
+                    claim.qualified_name, descriptor_registrability_verdicts)
+                verdict = descriptor_registrability_verdicts.get(verdict_key)
+                if verdict is not None and verdict.suppress:
                     descriptor_registrability_problems.append(DescriptorRegistrabilityProblem(
-                        relative_path=path, qualified_name=resolved_qualified_name,
-                        detail=_descriptor_uninstantiable_detail(
-                            resolved_qualified_name, is_interface, is_abstract, is_enum,
-                            is_non_static_member, is_local, claim.line),
+                        relative_path=path, qualified_name=verdict_key, detail=verdict.detail or "",
                     ))
                     continue
             if resolved_unit_id is not None:

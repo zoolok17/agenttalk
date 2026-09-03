@@ -1281,11 +1281,23 @@ def run_scan(
             )
             for p in coordinate_unrecoverable_problems
         ]
+        # FIX ROUND 47 (forty-first cold read, B2+B3+M2 - THE DESCRIPTOR
+        # FAMILY, the reader's own recommended structural shape): decided
+        # ONCE, here, before EITHER artifact builder runs, so both
+        # inherit the identical verdict rather than each independently
+        # (and, per B2/B3, inconsistently) re-deriving it - see
+        # dependencies_artifact.compute_descriptor_registrability_
+        # verdicts's own docstring for the full mechanism.
+        descriptor_registrability_verdicts = (
+            dependencies_artifact.compute_descriptor_registrability_verdicts(java_results))
         dependencies = dependencies_artifact.build_dependencies(
             java_results, file_digests=file_digests, degraded_paths=degraded_paths,
-            externality_poisoned=externality_poisoned)
+            externality_poisoned=externality_poisoned,
+            descriptor_registrability_verdicts=descriptor_registrability_verdicts)
         entry_points, features, descriptor_registrability_problems = (
-            features_artifact.build_features(java_results, file_digests=file_digests))
+            features_artifact.build_features(
+                java_results, file_digests=file_digests,
+                descriptor_registrability_verdicts=descriptor_registrability_verdicts))
         # FIX ROUND 45 (thirty-ninth cold read, F2 MAJOR - THE MATRIX'S
         # OWN MISSING COLUMN): a web.xml <servlet-class>/<filter-class>
         # resolving to an in-scan interface/abstract/enum class - only

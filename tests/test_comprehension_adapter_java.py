@@ -1859,6 +1859,83 @@ class Outer {
     assert routes[0].from_qualified_name == "p.Outer.Inner"
 
 
+def test_spring_route_on_a_class_nested_inside_an_interface_is_unaffected():
+    """FIX ROUND 47 (forty-first cold read, M1 MAJOR, wrong-data - THE
+    CONTAINER DIMENSION, .cr41-ifacenest /in-iface): JLS 9.5 - every
+    member type declared inside an INTERFACE is implicitly static,
+    regardless of whether it writes `static` itself (nobody does, since
+    it is redundant - the identical reasoning round 46's own record/
+    annotation-type fix already established for the MEMBER's own kind,
+    now applied to the CONTAINER's kind instead). Round 46's own
+    `is_non_static_member` looked only at the member's own `static`
+    modifier, never at what kind of type contains it - a real, common
+    idiom (a default-method helper class nested inside an interface)
+    was misread as a non-static member and wrongly suppressed, dropping
+    a real, servable route."""
+    src = """
+package p;
+
+interface Outer {
+    @RestController
+    class Inner {
+        @GetMapping("/in-iface")
+        void handle() {}
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].from_qualified_name == "p.Outer.Inner"
+
+
+def test_spring_route_on_a_class_nested_inside_an_annotation_type_is_unaffected():
+    """FIX ROUND 47 (M1 MAJOR, .cr41-ifacenest /in-anno): the annotation-
+    type sibling of the interface case above - JLS 9.6 makes an
+    annotation type itself a special kind of interface, so JLS 9.5's
+    own implicit-static rule for interface members applies identically."""
+    src = """
+package p;
+
+@interface Outer {
+    @RestController
+    class Inner {
+        @GetMapping("/in-anno")
+        void handle() {}
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+
+
+def test_spring_route_on_a_non_static_member_of_an_ordinary_class_is_still_unregistered():
+    """FIX ROUND 47 (M1 MAJOR, .cr41-ifacenest /inner-bad control): the
+    container-kind fix must not over-correct - a member nested inside
+    an ORDINARY CLASS (never an interface/annotation type) is still a
+    genuine non-static member when it carries no `static` of its own,
+    and must keep suppressing exactly as round 46 already established."""
+    src = """
+package p;
+
+class Outer {
+    @RestController
+    class Inner {
+        @GetMapping("/inner-bad")
+        void handle() {}
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.Outer.Inner"
+    assert "NON-STATIC MEMBER" in problem.detail
+
+
 def test_jax_rs_route_on_a_non_static_member_class_is_unregistered():
     """FIX ROUND 46 (F1 MAJOR, .cr40-inner GET /bad-res/y): the JAX-RS
     sibling - a non-static member resource class's only constructor

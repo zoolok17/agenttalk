@@ -3,12 +3,24 @@
 
 from __future__ import annotations
 
+from agenttalk.comprehension import dependencies_artifact as da
 from agenttalk.comprehension import features_artifact as fa
 from agenttalk.comprehension.adapters import java as java_adapter
 
 
 def _parse(relative_path: str, source: str) -> java_adapter.JavaFileResult:
     return java_adapter.parse_java_source(relative_path, source)
+
+
+def _build_features_with_verdicts(results: dict[str, java_adapter.JavaFileResult]):
+    """FIX ROUND 47 (forty-first cold read, B2+B3+M2 - THE DESCRIPTOR
+    FAMILY): the descriptor registrability verdict is now computed
+    UPSTREAM (``dependencies_artifact.compute_descriptor_registrability_
+    verdicts``, called once in scan_pipeline.py before either artifact
+    builder runs) rather than rebuilt inside ``build_features`` itself -
+    mirrors that same upstream-then-inherit shape at the unit-test level."""
+    verdicts = da.compute_descriptor_registrability_verdicts(results)
+    return fa.build_features(results, descriptor_registrability_verdicts=verdicts)
 
 
 def test_a_main_method_produces_one_candidate_feature_with_one_entry_point():
@@ -196,7 +208,7 @@ def test_web_xml_servlet_class_naming_an_abstract_class_is_suppressed_and_report
         "com/acme/web/AbstractServlet.java": java_adapter.parse_java_source(
             "com/acme/web/AbstractServlet.java", servlet_source),
     }
-    entry_point_records, features, problems = fa.build_features(results)
+    entry_point_records, features, problems = _build_features_with_verdicts(results)
     assert entry_point_records == []
     assert features == []
     assert len(problems) == 1
@@ -230,7 +242,7 @@ def test_web_xml_filter_class_naming_an_interface_is_suppressed_and_reported():
         "com/acme/web/FilterApi.java": java_adapter.parse_java_source(
             "com/acme/web/FilterApi.java", filter_source),
     }
-    entry_point_records, features, problems = fa.build_features(results)
+    entry_point_records, features, problems = _build_features_with_verdicts(results)
     assert entry_point_records == []
     assert features == []
     assert len(problems) == 1
@@ -263,7 +275,7 @@ def test_web_xml_servlet_class_naming_an_enum_is_suppressed_and_reported():
         "com/acme/web/EnumServlet.java": java_adapter.parse_java_source(
             "com/acme/web/EnumServlet.java", servlet_source),
     }
-    entry_point_records, features, problems = fa.build_features(results)
+    entry_point_records, features, problems = _build_features_with_verdicts(results)
     assert entry_point_records == []
     assert features == []
     assert len(problems) == 1
@@ -296,7 +308,7 @@ def test_web_xml_servlet_class_naming_a_concrete_class_is_unaffected_by_f2():
         "com/acme/web/DispatcherServlet.java": java_adapter.parse_java_source(
             "com/acme/web/DispatcherServlet.java", servlet_source),
     }
-    entry_point_records, features, problems = fa.build_features(results)
+    entry_point_records, features, problems = _build_features_with_verdicts(results)
     assert len(entry_point_records) == 1
     assert len(features) == 1
     assert problems == []
@@ -325,7 +337,7 @@ def test_web_xml_servlet_class_naming_an_abstract_class_not_in_scan_still_publis
     entry_points, _web_problems, _edges, _descriptor_name_conflicts = (
         java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml))
     results = {"WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points)}
-    entry_point_records, features, problems = fa.build_features(results)
+    entry_point_records, features, problems = _build_features_with_verdicts(results)
     assert len(entry_point_records) == 1
     assert len(features) == 1
     assert problems == []
@@ -362,7 +374,7 @@ def test_web_xml_servlet_class_binary_spelling_resolves_a_non_static_member_clas
         "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
         "com/acme/Host.java": java_adapter.parse_java_source("com/acme/Host.java", host_source),
     }
-    entry_point_records, features, problems = fa.build_features(results)
+    entry_point_records, features, problems = _build_features_with_verdicts(results)
     assert entry_point_records == []
     assert features == []
     assert len(problems) == 1
@@ -392,7 +404,7 @@ def test_web_xml_filter_class_binary_spelling_resolves_a_non_static_member_class
         "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
         "com/acme/Host.java": java_adapter.parse_java_source("com/acme/Host.java", host_source),
     }
-    entry_point_records, features, problems = fa.build_features(results)
+    entry_point_records, features, problems = _build_features_with_verdicts(results)
     assert entry_point_records == []
     assert features == []
     assert len(problems) == 1
@@ -424,7 +436,7 @@ def test_web_xml_servlet_class_dot_spelled_still_resolves_the_identical_class():
         "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
         "com/acme/Host.java": java_adapter.parse_java_source("com/acme/Host.java", host_source),
     }
-    entry_point_records, features, problems = fa.build_features(results)
+    entry_point_records, features, problems = _build_features_with_verdicts(results)
     assert entry_point_records == []
     assert len(problems) == 1
     assert problems[0].qualified_name == "com.acme.Host.NestedAbs"
