@@ -200,6 +200,31 @@ def _run_git(root: Path, *args: str) -> subprocess.CompletedProcess | None:
         return None
 
 
+def _run_git_with_stdin(
+    root: Path, *args: str, input_text: str,
+) -> subprocess.CompletedProcess | None:
+    """FIX ROUND 47 (forty-first cold read, M8 MAJOR, wrong-data): the
+    ONE call site (:func:`_check_ignore_one`, below) that needs git's own
+    NUL-separated ``-z`` output - which git only ever produces alongside
+    ``--stdin`` (NUL-separated INPUT too), never for a plain command-line
+    argument. A dedicated sibling to :func:`_run_git` rather than
+    widening it for every caller - no other call site in this module
+    needs to feed git anything over stdin at all."""
+    try:
+        return subprocess.run(  # noqa: S603,S607  # nosec B603 B607
+            ["git", "-C", str(root), *args],
+            check=False,
+            capture_output=True,
+            input=input_text,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def _is_git_worktree(root: Path) -> bool:
     result = _run_git(root, "rev-parse", "--is-inside-work-tree")
     return result is not None and result.returncode == 0 and result.stdout.strip() == "true"
@@ -237,17 +262,63 @@ def _check_ignore_one(root: Path, relative_path: str) -> tuple[bool, str | None]
     ignored after all," regardless of the 0 exit code. Both this probe
     check and the pre-round-32 single-probe version it replaces were
     exposed to this, but the old probe's own synthetic subdirectory was
-    never a realistic re-inclusion target, so it never actually surfaced."""
-    result = _run_git(root, "check-ignore", "--no-index", "-v", relative_path)
+    never a realistic re-inclusion target, so it never actually surfaced.
+
+    FIX ROUND 47 (forty-first cold read, M8 MAJOR, wrong-data): the
+    round-32 fix parsed ``-v``'s own colon-and-tab text format
+    (``<source>:<linenum>:<pattern>\t<pathname>``) via ``split(":", 2)`` -
+    which SILENTLY MIS-PARSES the moment ``<source>`` itself contains a
+    colon, which an ABSOLUTE WINDOWS PATH always does (a drive letter,
+    e.g. ``C:`` followed by a backslash-separated home directory) -
+    exactly the shape a real ``core.excludesFile`` resolves to on that
+    platform. The negation guard (checking whether
+    the extracted pattern starts with ``!``) then reads the WRONG field
+    entirely (a fragment of the line number, or the source path's own
+    tail) and never fires - so a genuine re-inclusion pattern was read as
+    an ordinary ignore rule, and the "proof of ignoredness" ``matched_
+    rule`` this preflight publishes NAMES THE NEGATION PATTERN ITSELF as
+    if it proved the opposite. Round 34's own post-publish
+    :func:`verify_store_ignored` (a DIFFERENT git query, ``ls-files
+    --others``, never this ``-v`` text format at all) already contains
+    this end-to-end - refusal and rollback held even when this preflight
+    was fooled - so this was a preflight-nullified-on-Windows gap, never
+    an actual leak. Fixed per the reader's own prescription: ``git
+    check-ignore -v -z --stdin`` (git only emits NUL-separated fields -
+    ``<source>\\0<line>\\0<pattern>\\0<pathname>\\0`` - alongside
+    ``--stdin``, itself requiring the query path over NUL-terminated
+    stdin rather than a command-line argument) - unambiguous regardless
+    of what characters ``<source>`` itself contains."""
+    result = _run_git_with_stdin(
+        root, "check-ignore", "--no-index", "-v", "-z", "--stdin",
+        input_text=relative_path + "\0",
+    )
     if result is None:
         return None
     if result.returncode == 0:
-        # `-v` output: "<source>:<linenum>:<pattern>\t<pathname>"
-        metadata = result.stdout.split("\t", 1)[0].strip()
-        pattern = metadata.split(":", 2)[-1] if metadata else ""
+        # FIX ROUND 47 (M8 MAJOR): four NUL-separated fields per match -
+        # source, line, pattern, pathname - never ambiguous, since NUL
+        # can never appear inside any of them (git's own `-z` contract).
+        fields = result.stdout.split("\0")
+        source, pattern = (fields[0], fields[2]) if len(fields) >= 3 else ("", "")
         if pattern.startswith("!"):
             return False, None
-        return True, metadata or None
+        # FIX ROUND 47 (M9 MAJOR, wrong-data - invariant 3, the sibling
+        # FIELD): a global `core.excludesFile` (a real, mainstream git
+        # config, e.g. `~/.gitignore`) resolves to an ABSOLUTE path
+        # OUTSIDE the scanned root, and git's own `-v`/`-z` output names
+        # it exactly that way, INCLUDING the OS username on every
+        # platform where the home directory embeds one - persisted
+        # verbatim into scan.json's own `privacy.matched_rule` field, an
+        # environment-value leak round 14's own rule already refused for
+        # the REFUSAL MESSAGE, never swept to this sibling FIELD. An
+        # in-repo source (`.gitignore`, `.git/info/exclude`) is already
+        # relative in git's own output - never touched here. Reduced to
+        # its own basename only when absolute; the full path is never
+        # persisted anywhere in this artifact.
+        if source and Path(source).is_absolute():
+            source = Path(source).name
+        matched_rule = f"{source}:{pattern}" if source or pattern else None
+        return True, matched_rule
     if result.returncode == 1:
         return False, None
     return None  # 128 or anything else: git itself could not answer

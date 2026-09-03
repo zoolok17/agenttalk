@@ -464,3 +464,98 @@ def test_verify_store_ignored_fails_closed_when_not_a_git_repo(tmp_path: Path) -
     (store / "index.json").write_text("{}", encoding="utf-8")
     with pytest.raises(VcsPrivacyRefused):
         privacy.verify_store_ignored(tmp_path, ".agenttalk/comprehension")
+
+
+# ----------------------------------------------------------- global excludesFile (M8/M9)
+
+def _configure_repo_scoped_excludes_file(root: Path, excludes_file: Path) -> None:
+    """A REPO-scoped (never --global) core.excludesFile override - the
+    identical resolution shape a real, mainstream global ~/.gitignore
+    produces (an absolute path OUTSIDE the scanned root), reproduced
+    without touching this test host's own actual global git config at
+    all."""
+    _git(root, "config", "core.excludesFile", str(excludes_file))
+
+
+def test_check_ignore_one_negation_via_global_excludes_file_is_not_ignored(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 47 (forty-first cold read, M8 MAJOR, wrong-data,
+    .cr41-globalneg2): `git check-ignore -v`'s own text output is
+    `<source>:<linenum>:<pattern>\\t<pathname>` - the OLD parse split
+    this on `:` at most twice, which SILENTLY MIS-PARSES the moment
+    `<source>` itself contains a colon. A global `core.excludesFile`
+    resolves to an ABSOLUTE path - on Windows, always containing a
+    colon right after the drive letter - so the negation guard (does
+    the extracted pattern start with `!`) read the WRONG field
+    entirely and never fired: a genuine re-inclusion pattern
+    (`!important.log`) was read as an ordinary ignore rule, reporting
+    "ignored" for a path git itself says is NOT ignored. Fixed via
+    `-z --stdin` (NUL-separated fields, never ambiguous regardless of
+    what characters the source path contains)."""
+    _init_repo(tmp_path)
+    excludes_dir = tmp_path.parent / f"{tmp_path.name}-global-excludes"
+    excludes_dir.mkdir(exist_ok=True)
+    excludes_file = excludes_dir / "gitignore-global-test.txt"
+    excludes_file.write_text("*.log\n!important.log\n", encoding="utf-8")
+    _configure_repo_scoped_excludes_file(tmp_path, excludes_file)
+    (tmp_path / "important.log").write_text("keep me", encoding="utf-8")
+    (tmp_path / "debug.log").write_text("noise", encoding="utf-8")
+    _commit_all(tmp_path, "base")
+
+    not_ignored = privacy._check_ignore_one(tmp_path, "important.log")  # noqa: SLF001
+    assert not_ignored == (False, None)
+
+    ignored = privacy._check_ignore_one(tmp_path, "debug.log")  # noqa: SLF001
+    assert ignored is not None
+    assert ignored[0] is True
+
+
+def test_check_ignore_one_global_excludes_file_matched_rule_never_leaks_the_absolute_path(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 47 (M9 MAJOR, wrong-data - invariant 3, the sibling
+    FIELD, .cr41-globaltilde): scan.json's own privacy.matched_rule
+    used to persist the ABSOLUTE path of a global core.excludesFile
+    verbatim - which, on any real developer machine, embeds the OS
+    username in the home-directory portion of the path (round 14's own
+    environment-value rule was applied to the REFUSAL MESSAGE, never
+    swept to this sibling published FIELD). Reduced to its own basename
+    only when the source is absolute; an in-repo `.gitignore` (already
+    relative in git's own output) is unaffected."""
+    _init_repo(tmp_path)
+    excludes_dir = tmp_path.parent / f"{tmp_path.name}-global-excludes2"
+    excludes_dir.mkdir(exist_ok=True)
+    excludes_file = excludes_dir / "gitignore-global-test.txt"
+    excludes_file.write_text("*.secret\n", encoding="utf-8")
+    _configure_repo_scoped_excludes_file(tmp_path, excludes_file)
+    (tmp_path / "creds.secret").write_text("x", encoding="utf-8")
+    _commit_all(tmp_path, "base")
+
+    result = privacy._check_ignore_one(tmp_path, "creds.secret")  # noqa: SLF001
+    assert result is not None
+    is_ignored, matched_rule = result
+    assert is_ignored is True
+    assert matched_rule is not None
+    # Never the absolute path, never the parent directory (which embeds
+    # this test host's own real absolute temp-dir location) - only the
+    # excludes file's own basename survives.
+    assert str(excludes_dir) not in matched_rule
+    assert excludes_file.name in matched_rule
+
+
+def test_check_ignore_one_in_repo_gitignore_source_is_unaffected(tmp_path: Path) -> None:
+    """FIX ROUND 47 (M9 control): an ordinary in-repo `.gitignore` is
+    already relative in git's own output - never touched by the
+    absolute-path-to-basename reduction."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text("*.tmp\n", encoding="utf-8")
+    (tmp_path / "scratch.tmp").write_text("x", encoding="utf-8")
+    _commit_all(tmp_path, "base")
+
+    result = privacy._check_ignore_one(tmp_path, "scratch.tmp")  # noqa: SLF001
+    assert result is not None
+    is_ignored, matched_rule = result
+    assert is_ignored is True
+    assert matched_rule is not None
+    assert matched_rule.startswith(".gitignore:")
