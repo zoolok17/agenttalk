@@ -1820,3 +1820,51 @@ def test_two_modules_with_own_coordinates_sharing_a_200_char_prefix_do_not_fabri
     # detection is, via a plain distinct-qualified-name check above,
     # since dependencies_artifact.py has no dependents to resolve in
     # this fixture on its own.
+
+
+def test_resolve_descriptor_qualified_name_translates_a_dollar_spelled_binary_name():
+    """FIX ROUND 46 (fortieth cold read, F2 MAJOR, wrong-data - THE
+    DESCRIPTOR GATE IS BLIND TO THE BINARY SPELLING): a real container
+    requires the JVM's own binary class name (`$` separates every
+    nesting level) in a descriptor - never the source-dotted spelling
+    this adapter's own qualified_name always publishes. Translating
+    every `$` to `.` resolves it against the source-dotted registry."""
+    registry = {"com.acme.Host.NestedAbs": "unit-1"}
+    assert da.resolve_descriptor_qualified_name(
+        "com.acme.Host$NestedAbs", registry) == "com.acme.Host.NestedAbs"
+
+
+def test_resolve_descriptor_qualified_name_prefers_an_exact_match_over_translation():
+    """FIX ROUND 46 (F2 MAJOR, collision disposition): a class literally
+    named WITH a `$` character in its own identifier (Java allows it,
+    though the JLS discourages it) must resolve to ITSELF when one
+    exists in-scan, never be guessed away by the `$`-to-`.` fallback -
+    the exact spelling is tried first, unconditionally, so no genuine
+    ambiguity between "a literal $ identifier" and "a binary-spelled
+    nested class" is possible: the exact reading always wins when it
+    exists, and translation is only ever a fallback for when it does
+    not."""
+    registry = {"com.acme.Foo$Bar": "literal-unit", "com.acme.Foo.Bar": "nested-unit"}
+    assert da.resolve_descriptor_qualified_name("com.acme.Foo$Bar", registry) == "com.acme.Foo$Bar"
+
+
+def test_resolve_descriptor_qualified_name_leaves_an_unresolvable_name_unchanged():
+    """FIX ROUND 46 (F2 MAJOR control): neither the exact spelling nor
+    the translated form is present (a jar-shipped class, or a genuine
+    typo) - returns the ORIGINAL qualified_name unchanged, so the
+    caller's own existing "not in scan" fallback handling applies
+    exactly as it always has, never a fabricated resolution."""
+    registry: dict[str, str] = {"com.acme.SomethingElse": "unit-1"}
+    assert da.resolve_descriptor_qualified_name(
+        "com.acme.Host$NestedAbs", registry) == "com.acme.Host$NestedAbs"
+
+
+def test_resolve_descriptor_qualified_name_is_a_no_op_without_a_dollar_sign():
+    """FIX ROUND 46 (F2 MAJOR control): the ordinary, dominant case - a
+    descriptor already spelled source-dotted, or naming a top-level
+    class - must never even attempt translation (no `$` present at
+    all), the identical cheap early-return the dominant real-world
+    case already needed before this fix."""
+    registry = {"com.acme.Plain": "unit-1"}
+    assert da.resolve_descriptor_qualified_name("com.acme.Plain", registry) == "com.acme.Plain"
+    assert da.resolve_descriptor_qualified_name("com.acme.NotThere", registry) == "com.acme.NotThere"

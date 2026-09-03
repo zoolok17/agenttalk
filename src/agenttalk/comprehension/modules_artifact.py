@@ -23,6 +23,7 @@ from typing import Any
 
 from . import digests
 from .adapters import java as java_adapter
+from .dependencies_artifact import resolve_descriptor_qualified_name
 from .discovery import DiscoveryResult
 
 MODULES_ARTIFACT_TYPE = "agenttalk.comprehension.modules"
@@ -902,7 +903,18 @@ def _attribute_cross_file_entry_point_reasons(
             file_unit_id_by_path[record.paths[0]] = record.unit_id
     extra_reasons_by_unit_id: dict[str, list[str]] = {}
     for qualified_name, reasons in worker_problem_reasons_by_qualified_name.items():
-        candidates = unit_ids_by_qualified_name.get(qualified_name, [])
+        # FIX ROUND 46 (fortieth cold read, F2 MAJOR, wrong-data - THE
+        # DESCRIPTOR GATE IS BLIND TO THE BINARY SPELLING): a web.xml
+        # <listener-class> naming a nested class in real binary spelling
+        # (`Host$NestedAbs`) never string-matched this registry's own
+        # source-dotted keys - see `resolve_descriptor_qualified_name`'s
+        # own docstring for the full mechanism. The SAME resolution
+        # `features_artifact.build_features` now applies to <servlet-
+        # class>/<filter-class>, applied here too (invariant 10: fix
+        # the class, not the one instance a cold read happened to name).
+        resolved_qualified_name = resolve_descriptor_qualified_name(
+            qualified_name, unit_ids_by_qualified_name)
+        candidates = unit_ids_by_qualified_name.get(resolved_qualified_name, [])
         if len(candidates) == 1:
             extra_reasons_by_unit_id.setdefault(candidates[0], []).extend(reasons)
         # 2+ claimants: a genuine duplicate-qualified-name collision,

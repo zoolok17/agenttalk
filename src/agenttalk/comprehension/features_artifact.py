@@ -26,7 +26,7 @@ from typing import Any
 
 from . import digests
 from .adapters import java as java_adapter
-from .dependencies_artifact import _build_registry, _java_file_unit_id
+from .dependencies_artifact import _build_registry, _java_file_unit_id, resolve_descriptor_qualified_name
 
 #: FIX ROUND 22 (eighteenth cold read, F7 MINOR): the SAME "declare the
 #: structurally unreachable, don't leave it to be independently
@@ -233,14 +233,26 @@ class DescriptorRegistrabilityProblem:
 
 
 def _descriptor_uninstantiable_detail(
-    qualified_name: str, is_interface: bool, is_abstract: bool, is_enum: bool, line: int | None,
+    qualified_name: str, is_interface: bool, is_abstract: bool, is_enum: bool,
+    is_non_static_member: bool, is_local: bool, line: int | None,
 ) -> str:
+    # FIX ROUND 46 (fortieth cold read, F1 MAJOR - THE MATRIX'S OWN
+    # MISSING DIMENSION): a non-static member/local class earns the
+    # IDENTICAL strongest claim a descriptor already gives interface/
+    # abstract/enum - a descriptor names ONE specific class with no
+    # implementor-may-serve escape (the Spring/JAX-RS weaker hedge never
+    # applies here at all), and neither shape has a no-arg constructor a
+    # container's reflective instantiation could ever invoke either.
     if is_interface:
         shape = "an INTERFACE"
     elif is_abstract:
         shape = "ABSTRACT"
-    else:
+    elif is_enum:
         shape = "an ENUM"
+    elif is_local:
+        shape = "a LOCAL class (method/constructor-body-declared)"
+    else:
+        shape = "a NON-STATIC MEMBER class"
     at_line = f" at line {line}" if line is not None else ""
     return (
         f"a <servlet-class>/<filter-class>{at_line} names {qualified_name}, which is {shape} "
@@ -302,8 +314,13 @@ def build_features(
     # name unambiguously - a duplicate-qualified-name collision is
     # already its own separate, visible problem elsewhere; this map
     # itself makes no attempt to arbitrate one.
-    registrability_by_qualified_name: dict[str, tuple[bool, bool, bool]] = {
-        unit.qualified_name: (unit.is_interface, unit.is_abstract, unit.is_enum)
+    # FIX ROUND 46 (fortieth cold read, F1 MAJOR): also carries
+    # is_non_static_member/is_local now, the SAME two facts the F1
+    # registrability dimension added.
+    registrability_by_qualified_name: dict[str, tuple[bool, bool, bool, bool, bool]] = {
+        unit.qualified_name: (
+            unit.is_interface, unit.is_abstract, unit.is_enum,
+            unit.is_non_static_member, unit.is_local)
         for result in java_results.values()
         for unit in result.units
     }
@@ -328,7 +345,19 @@ def build_features(
 
     for path, result in java_results.items():
         for claim in result.entry_points:
-            resolved_unit_id = owning_unit_by_qualified_name.get(claim.qualified_name)
+            # FIX ROUND 46 (fortieth cold read, F2 MAJOR, wrong-data - THE
+            # DESCRIPTOR GATE IS BLIND TO THE BINARY SPELLING): a real
+            # container requires the JVM's own binary name
+            # (`Host$NestedAbs`) in a descriptor naming a nested class -
+            # never the source-dotted spelling this adapter's own
+            # `qualified_name` always publishes - so an exact string
+            # match against `by_qualified_name` never fired for ANY
+            # nested class named this way. Resolved via the shared
+            # exact-then-translated boundary - see its own docstring for
+            # the full mechanism and the collision disposition.
+            resolved_qualified_name = resolve_descriptor_qualified_name(
+                claim.qualified_name, owning_unit_by_qualified_name)
+            resolved_unit_id = owning_unit_by_qualified_name.get(resolved_qualified_name)
             # FIX ROUND 45 (F2 MAJOR): only ``http_route``/``http_filter``
             # claims name a class the container must actually instantiate
             # - ``cli_main`` has no such class-instantiation contract at
@@ -340,13 +369,15 @@ def build_features(
             # checks) - so any SURVIVING claim whose resolved owner is
             # uninstantiable can only be a web.xml descriptor claim.
             if resolved_unit_id is not None and claim.kind in ("http_route", "http_filter"):
-                is_interface, is_abstract, is_enum = registrability_by_qualified_name.get(
-                    claim.qualified_name, (False, False, False))
-                if is_interface or is_abstract or is_enum:
+                (is_interface, is_abstract, is_enum,
+                 is_non_static_member, is_local) = registrability_by_qualified_name.get(
+                    resolved_qualified_name, (False, False, False, False, False))
+                if is_interface or is_abstract or is_enum or is_non_static_member or is_local:
                     descriptor_registrability_problems.append(DescriptorRegistrabilityProblem(
-                        relative_path=path, qualified_name=claim.qualified_name,
+                        relative_path=path, qualified_name=resolved_qualified_name,
                         detail=_descriptor_uninstantiable_detail(
-                            claim.qualified_name, is_interface, is_abstract, is_enum, claim.line),
+                            resolved_qualified_name, is_interface, is_abstract, is_enum,
+                            is_non_static_member, is_local, claim.line),
                     ))
                     continue
             if resolved_unit_id is not None:

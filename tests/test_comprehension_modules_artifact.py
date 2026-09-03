@@ -735,6 +735,37 @@ def test_a_cross_file_reason_still_attaches_to_the_named_classs_own_unit():
     assert listener_unit.adapter_problem_reasons == ["unsupported_entry_point_shape"]
 
 
+def test_a_cross_file_reason_binary_spelled_still_attaches_to_the_named_classs_own_unit():
+    """FIX ROUND 46 (fortieth cold read, F2 MAJOR, wrong-data - THE
+    DESCRIPTOR GATE IS BLIND TO THE BINARY SPELLING): a web.xml
+    <listener-class> naming a NESTED class in the JVM's own real binary
+    spelling (`Host$NestedListener`, `$` separating the nesting level)
+    never string-matched this registry's own source-dotted key
+    (`Host.NestedListener`) at all - the reason silently landed
+    nowhere. Resolved via the SAME exact-then-translated boundary
+    `features_artifact.build_features` now applies to <servlet-class>/
+    <filter-class> (invariant 10: fix the class, not the one instance a
+    cold read happened to name)."""
+    source = "package com.acme;\nclass Host {\n  class NestedListener {\n  }\n}\n"
+    discovery = _discovery([
+        EnumeratedFile(relative_path="WEB-INF/web.xml", byte_count=1, content_digest="w"),
+        EnumeratedFile(
+            relative_path="com/acme/Host.java", byte_count=len(source), content_digest="digest1"),
+    ])
+    java_results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(),
+        "com/acme/Host.java": _java_result("com/acme/Host.java", source),
+    }
+    records = ma.build_modules(
+        discovery, java_results,
+        worker_problem_reasons_by_qualified_name={
+            "com.acme.Host$NestedListener": ["unsupported_entry_point_shape"]},
+    )
+    listener_unit = next(r for r in records if r.display_name == "NestedListener")
+    assert listener_unit.adapter_problem_reason == "unsupported_entry_point_shape"
+    assert listener_unit.adapter_problem_reasons == ["unsupported_entry_point_shape"]
+
+
 def test_a_cross_file_reason_for_a_class_not_resolved_in_scan_invents_no_unit():
     """Companion negative case (the reviewer's own third test): a
     listener-class the run never actually walked (outside scope, or

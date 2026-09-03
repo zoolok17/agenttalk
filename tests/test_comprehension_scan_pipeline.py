@@ -2328,6 +2328,67 @@ def test_run_scan_links_a_web_xml_route_to_its_real_servlet_class_end_to_end(
     assert entry_points_mapped["stored_status"] == "satisfied"
 
 
+def test_run_scan_a_web_xml_servlet_class_binary_spelling_attributes_to_the_class_end_to_end(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 46 (fortieth cold read, F2 MAJOR, wrong-data - THE
+    DESCRIPTOR GATE IS BLIND TO THE BINARY SPELLING, .cr40-desc): end to
+    end - a real container requires the JVM's own binary class name
+    (`com.acme.web.Dispatcher$Inner`) in <servlet-class> for a nested
+    class, never the source-dotted spelling (`com.acme.web.Dispatcher.
+    Inner`) this adapter's own qualified_name always publishes. Before
+    this fix, an exact string match never fired for this shape at all -
+    the route fell back to the web.xml FILE unit, and the resolved
+    class's own entry_points_mapped stayed a confident negative even
+    though this run's own features.json already named it as the
+    served route's owner (had it resolved). Now resolves and attributes
+    to the CLASS's own unit - the same satisfied signal
+    test_run_scan_links_a_web_xml_route_to_its_real_servlet_class_end_
+    to_end asserts for the dot-spelled case, proven here for the
+    binary-spelled one too."""
+    import json
+
+    web_dir = java_repo / "src" / "main" / "java" / "com" / "acme" / "web"
+    web_dir.mkdir(parents=True)
+    (web_dir / "Dispatcher.java").write_text(
+        "package com.acme.web;\n"
+        "class Dispatcher {\n"
+        "  static class Inner {\n"
+        "  }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "    <servlet-class>com.acme.web.Dispatcher$Inner</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "    <url-pattern>/dollar-api/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+
+    inner_unit = next(u for u in modules_doc["units"] if u["display_name"] == "Inner")
+    entry_point = next(e for e in features_doc["entry_points"] if e["name"] == "/dollar-api/*")
+    assert entry_point["owning_unit_id"] == inner_unit["unit_id"]
+
+    entry_points_mapped = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == inner_unit["unit_id"] and s["check"] == "entry_points_mapped"
+    )
+    assert entry_points_mapped["stored_status"] == "satisfied"
+
+
 def test_run_scan_a_web_xml_servlet_class_naming_an_abstract_class_degrades_end_to_end(
     java_repo: Path,
 ) -> None:

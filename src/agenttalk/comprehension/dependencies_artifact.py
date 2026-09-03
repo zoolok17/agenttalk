@@ -140,6 +140,50 @@ def _java_file_unit_id(relative_path: str) -> str:
     return digests.unit_id(kind="file", paths=[relative_path], qualified_name=None)
 
 
+def resolve_descriptor_qualified_name(qualified_name: str, registry: dict[str, Any]) -> str:
+    """FIX ROUND 46 (fortieth cold read, F2 MAJOR, wrong-data - THE
+    DESCRIPTOR GATE IS BLIND TO THE BINARY SPELLING): a real servlet
+    container requires the JVM's own BINARY class name in a web.xml
+    ``<servlet-class>``/``<filter-class>``/``<listener-class>`` for a
+    nested class - ``com.example.Host$NestedAbs`` (``$`` separates
+    every nesting level beyond the outermost class) - never the
+    SOURCE-dotted spelling ``JavaUnitClaim.qualified_name`` publishes
+    (``com.example.Host.NestedAbs``, this adapter's own consistent
+    convention, unrelated to what a real container is actually
+    configured with). Every cross-file resolution against a qualified-
+    name-keyed registry (``by_qualified_name`` in ``features_artifact.
+    build_features``, ``unit_ids_by_qualified_name`` in ``modules_
+    artifact._attribute_cross_file_entry_point_reasons``) string-
+    matched the raw descriptor value and NEVER fired for any nested
+    class at all - the route/reason silently fell back to the
+    declaring file's own owner, contradicting the SAME run's own
+    readiness signal for the real class (``no_entry_point`` there,
+    a served route here - two artifacts, opposite claims about the
+    identical class).
+
+    Tries the EXACT spelling first, unconditionally - a class literally
+    named with a ``$`` character (Java allows it, though the JLS
+    discourages it) must resolve to ITSELF when one exists in-scan,
+    never be guessed away by translation. Only when that exact lookup
+    misses AND the name contains ``$`` does this try the translated
+    form (every ``$`` replaced with ``.`` - ``$`` is reserved for
+    binary class nesting and can never legitimately separate PACKAGE
+    segments, so this translation is safe and never touches a real
+    package dot). This ordering is also the collision disposition: a
+    literal ``$``-named class always wins over a translated guess,
+    since the exact match is tried and accepted first, so no genuine
+    ambiguity between the two readings is possible.
+
+    Returns the registry KEY that should be looked up (``qualified_
+    name`` itself, unresolved either way, when neither form is present
+    in ``registry`` - the caller's own ordinary "not in scan" handling
+    applies unchanged)."""
+    if qualified_name in registry or "$" not in qualified_name:
+        return qualified_name
+    translated = qualified_name.replace("$", ".")
+    return translated if translated in registry else qualified_name
+
+
 def _build_registry(
     java_results: dict[str, java_adapter.JavaFileResult],
 ) -> tuple[

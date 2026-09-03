@@ -331,6 +331,105 @@ def test_web_xml_servlet_class_naming_an_abstract_class_not_in_scan_still_publis
     assert problems == []
 
 
+def test_web_xml_servlet_class_binary_spelling_resolves_a_non_static_member_class():
+    """FIX ROUND 46 (fortieth cold read, F2 MAJOR, wrong-data - THE
+    DESCRIPTOR GATE IS BLIND TO THE BINARY SPELLING, .cr40-desc): a
+    real servlet container requires the JVM's own binary class name
+    (`com.acme.Host$NestedAbs`) in <servlet-class> for a nested class -
+    never the source-dotted spelling (`com.acme.Host.NestedAbs`) this
+    adapter's own `qualified_name` always publishes. An exact string
+    match against the registry never fired for ANY nested class this
+    way - the route silently fell back to the web.xml FILE unit while
+    the SAME run's own readiness signal said the real class has
+    no_entry_point, two artifacts making opposite claims. Now resolves
+    (exact-then-translated) and, since NestedAbs is non-static member,
+    is ALSO suppressed by round 46's own F1 dimension."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>abs</servlet-name>
+    <servlet-class>com.acme.Host$NestedAbs</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>abs</servlet-name>
+    <url-pattern>/nested-abs</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = (
+        java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml))
+    host_source = "package com.acme;\nclass Host {\n  class NestedAbs {\n  }\n}\n"
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
+        "com/acme/Host.java": java_adapter.parse_java_source("com/acme/Host.java", host_source),
+    }
+    entry_point_records, features, problems = fa.build_features(results)
+    assert entry_point_records == []
+    assert features == []
+    assert len(problems) == 1
+    assert problems[0].qualified_name == "com.acme.Host.NestedAbs"
+    assert "descriptor_route_on_uninstantiable_class" in problems[0].detail
+    assert "NON-STATIC MEMBER" in problems[0].detail
+
+
+def test_web_xml_filter_class_binary_spelling_resolves_a_non_static_member_class():
+    """FIX ROUND 46 (F2 MAJOR, .cr40-desc sibling): the <filter-class>
+    twin of the binary-spelling case above."""
+    web_xml = """<web-app>
+  <filter>
+    <filter-name>abs</filter-name>
+    <filter-class>com.acme.Host$NestedAbs</filter-class>
+  </filter>
+  <filter-mapping>
+    <filter-name>abs</filter-name>
+    <url-pattern>/nested-iface</url-pattern>
+  </filter-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = (
+        java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml))
+    host_source = "package com.acme;\nclass Host {\n  class NestedAbs {\n  }\n}\n"
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
+        "com/acme/Host.java": java_adapter.parse_java_source("com/acme/Host.java", host_source),
+    }
+    entry_point_records, features, problems = fa.build_features(results)
+    assert entry_point_records == []
+    assert features == []
+    assert len(problems) == 1
+    assert problems[0].qualified_name == "com.acme.Host.NestedAbs"
+    assert "descriptor_route_on_uninstantiable_class" in problems[0].detail
+
+
+def test_web_xml_servlet_class_dot_spelled_still_resolves_the_identical_class():
+    """FIX ROUND 46 (F2 MAJOR, .cr40-desc dot-spelled control): the
+    ALREADY-source-dotted spelling of the identical nested class must
+    keep resolving exactly as it always has (this was never broken -
+    an exact string match already succeeds for it) - proving both
+    spellings of "this class" converge on the SAME suppression."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>abs</servlet-name>
+    <servlet-class>com.acme.Host.NestedAbs</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>abs</servlet-name>
+    <url-pattern>/nested-abs-dotted</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = (
+        java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml))
+    host_source = "package com.acme;\nclass Host {\n  class NestedAbs {\n  }\n}\n"
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
+        "com/acme/Host.java": java_adapter.parse_java_source("com/acme/Host.java", host_source),
+    }
+    entry_point_records, features, problems = fa.build_features(results)
+    assert entry_point_records == []
+    assert len(problems) == 1
+    assert problems[0].qualified_name == "com.acme.Host.NestedAbs"
+
+
 def test_web_xml_entry_point_still_owned_by_the_file_when_the_class_is_out_of_scan():
     """Companion: a <servlet-class> that IS declared but does not
     resolve to any in-scan unit (out-of-scope compiled dependency, or
