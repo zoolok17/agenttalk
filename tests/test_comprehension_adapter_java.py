@@ -1660,6 +1660,57 @@ interface Unrelated {
     assert [u.qualified_name for u in result.units] == ["p.Unrelated"]
 
 
+def test_two_same_line_unassociated_route_annotations_get_distinct_problem_ids():
+    """FIX ROUND 38 (thirty-second cold read, F3 MINOR, .cr32-coalesce,
+    wrong-data): two unassociated route annotations on the SAME source
+    line (an unterminated generic bound, both annotations stacked before
+    it) used to publish byte-identical details (`detail` names only
+    `{line}`, `qualified_name` is None for this reason code) - the exact
+    same-id-different-content-looking shape round 36's own coalescer
+    exists to merge, except here the two records genuinely ARE distinct
+    facts (two separate annotations, two separate suppressions), so
+    merging them UNDERSTATES problem_count - the coalescer's own
+    justification ("never overstate") inverted. Fixed by adding the
+    annotation's own absolute offset (unique per match) to the detail,
+    the same class of fix round 37's own F1 used for problem_id itself,
+    one level up."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders") @GetMapping("/list") public class Controller<T extends Comparable<T {
+    void list() {}
+}
+
+@interface Unrelated {
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert len(result.problems) == 2
+    assert all(p.reason_code == "route_annotation_unassociated" for p in result.problems)
+    details = [p.detail for p in result.problems]
+    assert len(set(details)) == 2, "two distinct annotations must publish two distinct details"
+
+
+def test_one_unassociated_route_annotation_publishes_exactly_one_problem():
+    """FIX ROUND 38 (F3 MINOR, control): a single unassociated route
+    annotation must still publish exactly one problem - the offset
+    added above is a distinguishing datum for genuine multiplicity,
+    never a reason to fragment or duplicate the ordinary single case."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders") public class Controller<T extends Comparable<T {
+    void list() {}
+}
+
+@interface Unrelated {
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "route_annotation_unassociated"
+
+
 def test_route_value_multi_element_array_publishes_every_element():
     """MAJOR 1 (sixth cold read, fix round 10): a declared multi-value
     route array used to publish only its first path, silently dropping

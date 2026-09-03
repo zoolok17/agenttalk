@@ -2467,9 +2467,20 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             # case needed here to keep in step with that one.
             problems.append(JavaAdapterProblem(
                 reason_code="route_annotation_unassociated",
-                detail=f"a class-level-looking route annotation at line {line} could not be "
-                       "confidently associated with any declared type - suppressed rather "
-                       "than published as a route",
+                # FIX ROUND 38 (thirty-second cold read, F3 MINOR, wrong-
+                # data): `line` alone is not a distinguishing datum - two
+                # unassociated route annotations on the SAME source line
+                # (a minified/one-line file, the same shape round 37's
+                # own F1 already closed for problem_id itself) produced
+                # byte-identical details, silently coalescing two real
+                # problems into one and understating problem_count. The
+                # annotation's own absolute character offset (`match.
+                # start()`), unique per match by construction, closes it
+                # the same way round 37's own qualified_name fix closed
+                # the identical class of collision one level up.
+                detail=f"a class-level-looking route annotation at line {line} "
+                       f"(offset {match.start()}) could not be confidently associated with "
+                       "any declared type - suppressed rather than published as a route",
             ))
             continue
         # FIX ROUND 20 (sixteenth cold read, m1 MINOR, wrong-data): a
@@ -2606,9 +2617,12 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         if target_type is None:
             problems.append(JavaAdapterProblem(
                 reason_code="route_annotation_unassociated",
-                detail=f"a @WebServlet annotation at line {line} could not be confidently "
-                       "associated with any declared type - suppressed rather than "
-                       "published as a route",
+                # FIX ROUND 38 (F3 MINOR): see the class-closer's own
+                # identical fix above - the offset is the distinguishing
+                # datum two same-line unassociated annotations need.
+                detail=f"a @WebServlet annotation at line {line} (offset {match.start()}) "
+                       "could not be confidently associated with any declared type - "
+                       "suppressed rather than published as a route",
             ))
             continue
         _span_end, paths, _explicit_methods = _route_annotation_span(match)
@@ -2688,9 +2702,11 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         if target_type is None:
             problems.append(JavaAdapterProblem(
                 reason_code="route_annotation_unassociated",
-                detail=f"a @WebFilter annotation at line {line} could not be confidently "
-                       "associated with any declared type - suppressed rather than "
-                       "published as a route",
+                # FIX ROUND 38 (F3 MINOR): see the class-closer's own
+                # identical fix above.
+                detail=f"a @WebFilter annotation at line {line} (offset {match.start()}) "
+                       "could not be confidently associated with any declared type - "
+                       "suppressed rather than published as a route",
             ))
             continue
         _span_end, paths, _explicit_methods = _route_annotation_span(match)
