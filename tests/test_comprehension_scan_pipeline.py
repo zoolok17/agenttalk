@@ -6762,6 +6762,41 @@ def test_validate_run_catches_a_whitespace_only_rewrite_of_an_artifact(
     assert "byte_sha256" in result["detail"]
 
 
+def test_validate_run_catches_a_record_counts_map_that_disagrees_with_its_own_artifacts_list(
+    java_repo: Path,
+) -> None:
+    """M (cold-read PR-B fix round 47 completeness): scan.json's own
+    top-level record_counts map was only ever validated for PRESENCE
+    (the "record_counts" key exists) - never that its own per-name
+    values agree with artifacts[].record_count, the value
+    _verify_artifact_digests already proves matches what is genuinely
+    on disk. Reproduced: hand-edit ONLY record_counts["modules.json"]
+    (re-signing scan.json's own byte_sha256/content_digest anchor in
+    index.json so this isolates the new consistency check from the
+    pre-existing anchor-mismatch check, the same isolation technique
+    the scan_id-consistency test above uses)."""
+    import json
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    scan_path = outcome.run_dir / "scan.json"
+    doc = json.loads(scan_path.read_text(encoding="utf-8"))
+    doc["record_counts"]["modules.json"] += 1
+    canonical_bytes = scan_pipeline.digests.canonical_json_bytes(doc)
+    scan_path.write_bytes(canonical_bytes)
+    comp_dir = scan_pipeline.paths.comprehension_dir(java_repo / ".agenttalk")
+    index_path = scan_pipeline.paths.index_path(comp_dir)
+    index_doc = json.loads(index_path.read_text(encoding="utf-8"))
+    for run_summary in index_doc["runs"]:
+        if run_summary["scan_id"] == outcome.scan_id:
+            run_summary["scan_json_byte_sha256"] = scan_pipeline.digests.sha256_bytes(canonical_bytes)
+            run_summary["scan_json_content_digest"] = scan_pipeline.digests.canonical_content_digest(doc)
+    index_path.write_text(json.dumps(index_doc), encoding="utf-8")
+
+    result = scan_pipeline.validate_run(java_repo)
+    assert result["valid"] is False
+    assert "record_counts" in result["detail"]
+
+
 def test_validate_run_catches_a_loaded_artifact_silently_dropped_from_scan_jsons_declared_list(
     java_repo: Path,
 ) -> None:

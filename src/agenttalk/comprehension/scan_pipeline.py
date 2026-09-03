@@ -2928,6 +2928,27 @@ def _verify_artifact_digests(
                 f"{name}'s record_count ({declared_record_count}) does not match the "
                 f"{actual_record_count} record(s) actually present in its own sections"
             )
+        # M (cold-read PR-B fix round 47 completeness): scan.json's own
+        # top-level `record_counts` map (a SECOND, separate field naming
+        # the same per-artifact counts - published for status/report's
+        # own summary use) was only ever validated for PRESENCE
+        # (_SCAN_JSON_REQUIRED_BODY_FIELDS checks the "record_counts" key
+        # exists) - never that its own per-name values actually agree
+        # with this loop's own artifacts[].record_count, the value this
+        # loop just proved matches what is genuinely on disk. A scan.json
+        # could declare two DIFFERENT counts for the same artifact across
+        # its own two fields and pass every check here. Tied into this
+        # SAME loop (never a second, separately-maintained sweep) since
+        # `entry`/`name`/`declared_record_count` are already in scope.
+        record_counts_map = require_field(scan_doc, "record_counts", doc_name="scan.json")
+        summary_record_count = require_field(
+            record_counts_map, name, doc_name="scan.json's record_counts map")
+        if summary_record_count != declared_record_count:
+            raise ComprehensionError(
+                f"scan.json's record_counts[{name!r}] ({summary_record_count}) does not match "
+                f"its own artifacts[].record_count ({declared_record_count}) for the same "
+                "artifact"
+            )
     if digests.run_content_digest(declared_artifacts) != scan_doc.get("content_digest"):
         raise ComprehensionError(
             "scan.json's run-level content_digest does not match its declared artifacts")
