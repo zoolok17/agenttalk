@@ -1576,8 +1576,23 @@ def run_scan(
         # its own comment above for why guessing a verdict here would be
         # the round-16 dilution this producer's own tier calibration
         # already refuses to reopen.
+        # FIX ROUND 39 (thirty-third cold read, F2 MAJOR, wrong-data - THE
+        # SELF-CONTRADICTION): `discovery_result.problems` used to be a
+        # bare TRUTHINESS check - any discovery problem at all degraded
+        # the run, regardless of what that specific problem's own
+        # `degrades_run` flag said, defeating round 38's own F4 non-
+        # degrading branch one layer up (a secrets.xml collision
+        # published status=degraded while the SAME run's own problem
+        # detail and caveat both said "recorded, NOT DEGRADING" - one of
+        # the two published facts was false in every such run). Filtered
+        # on each problem's own `degrades_run` now, the round-30 F5
+        # lesson (the per-instance flag is authoritative, never a blanket
+        # list-truthiness or reason-code check) applied here the same way
+        # it already is for `worker_result.problems` below.
+        degrading_discovery_problems = any(
+            p.get("degrades_run", True) for p in discovery_result.problems)
         status = "degraded" if (
-            discovery_result.degraded or discovery_result.problems or case_collisions
+            discovery_result.degraded or degrading_discovery_problems or case_collisions
             or degrading_worker_problems or duplicate_qualified_name_problems
             or binary_excluded_code_bearing_problems or reactor_rule_problems
             or externality_poisoned or forced_lock_recovery_problems
@@ -1594,7 +1609,11 @@ def run_scan(
         # drift - never a second, separately-maintained notion of "what
         # degraded this run."
         degraded_by: set[str] = set()
-        degraded_by.update(p["reason_code"] for p in discovery_result.problems)
+        # FIX ROUND 39 (F2 MAJOR): see status's own identical fix above -
+        # only a discovery problem whose own degrades_run is true belongs
+        # in this set, never every discovery problem unconditionally.
+        degraded_by.update(
+            p["reason_code"] for p in discovery_result.problems if p.get("degrades_run", True))
         # FIX ROUND 36 (F4 MAJOR): `case_collisions` now mixes two
         # distinct reason codes (a normalization-variant pair is not a
         # case_collision - see is_pure_case_fold_collision) - each

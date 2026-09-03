@@ -1018,6 +1018,7 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                 "reason_code": "resource_limit",
                 "path": directory.relative_to(root).as_posix(),
                 "detail": f"exceeded the {MAX_NESTING_DEPTH}-level nesting cap",
+                "degrades_run": True,
             })
             return
         try:
@@ -1029,6 +1030,7 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                 # M-3 (third cold read, fix round 5): never str(exc) - an
                 # OSError's own string embeds its ABSOLUTE filename.
                 "detail": bounded_os_error_detail("directory could not be listed", exc),
+                "degrades_run": True,
             })
             return
         for entry in entries:
@@ -1051,6 +1053,7 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                 problems.append({
                     "reason_code": "non_utf8_path", "path": non_utf8_detail["path"],
                     "detail": non_utf8_detail["detail"],
+                    "degrades_run": True,
                 })
                 continue
             boundary_kind = _boundary_kind(entry)
@@ -1068,6 +1071,7 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                         "detail": "could not stat this entry to check whether it is a "
                                   "directory junction - excluded rather than risk "
                                   "following one outside the root",
+                        "degrades_run": True,
                     })
                 boundaries.append(BoundaryEntry(relative_path=relative, boundary_kind=boundary_kind))
                 continue
@@ -1125,6 +1129,7 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                                               "one adapter-handled or tier-2 code-bearing file - "
                                               "excluded from the inventory as if it were build "
                                               "output, but this content is genuinely unread code",
+                                    "degrades_run": True,
                                 })
                             elif peek_truncated:
                                 # FIX ROUND 19b (reviewer-3's rejection of
@@ -1147,6 +1152,7 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                                               "entry peek cap before a code-bearing file could "
                                               "be confirmed present or absent - not confidently "
                                               "either",
+                                    "degrades_run": True,
                                 })
                     continue
                 if relative in submodule_boundaries:
@@ -1180,6 +1186,7 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                                   "be (never read), but never silently: a parseable file this "
                                   "run could otherwise have understood is missing from the "
                                   "inventory because of this",
+                        "degrades_run": True,
                     })
                 # FIX ROUND 38 (F4 MINOR, wrong-data): the SAME visibility
                 # for the closed list's OTHER potentially-code-bearing
@@ -1205,6 +1212,24 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                                   "tell whether this specific file was ordinary config or real "
                                   "inventory without reading content this rule exists to never "
                                   "read",
+                        # FIX ROUND 39 (thirty-third cold read, F2 MAJOR,
+                        # wrong-data - THE SELF-CONTRADICTION): this
+                        # detail's own "not degrading" claim was defeated
+                        # one layer up in scan_pipeline.py, which computed
+                        # status/degraded_by from the bare TRUTHINESS of
+                        # `discovery_result.problems` (any problem at all,
+                        # never checking degrades_run) - so this run
+                        # published status=degraded + degraded_by
+                        # containing this exact reason_code, contradicting
+                        # the caveat and this very sentence in the SAME
+                        # run. `degrades_run` is now a real, per-problem
+                        # published (internally - never serialized into
+                        # problems.json itself, same as WorkerProblem's
+                        # own field) flag scan_pipeline.py actually reads,
+                        # the round-30 F5 lesson (per-instance flags are
+                        # authoritative) applied to discovery's own
+                        # problems too.
+                        "degrades_run": False,
                     })
                 _record_exclusion(category, relative)
                 continue
@@ -1216,6 +1241,7 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                     "reason_code": "resource_limit",
                     "path": relative,
                     "detail": f"exceeded the {MAX_FILESYSTEM_ENTRIES}-entry filesystem cap",
+                    "degrades_run": True,
                 })
                 return
             try:
@@ -1224,6 +1250,7 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                 problems.append({
                     "reason_code": "parse_failed", "path": relative,
                     "detail": bounded_os_error_detail("could not stat the file", exc),
+                    "degrades_run": True,
                 })
                 continue
             # The per-file size cap is checked from stat() ALONE, before any
@@ -1236,6 +1263,7 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                     "reason_code": "resource_limit",
                     "path": relative,
                     "detail": f"{size} bytes exceeds the {MAX_PER_FILE_BYTES}-byte per-file cap",
+                    "degrades_run": True,
                 })
                 continue
             try:
@@ -1244,6 +1272,7 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                 problems.append({
                     "reason_code": "parse_failed", "path": relative,
                     "detail": bounded_os_error_detail("could not read the file's bytes", exc),
+                    "degrades_run": True,
                 })
                 continue
             if _looks_binary(data):
@@ -1265,6 +1294,7 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                     "path": relative,
                     "detail": f"whole-scope hashed bytes would exceed the "
                               f"{MAX_HASHED_TOTAL_BYTES}-byte cap",
+                    "degrades_run": True,
                 })
                 continue
             hashed_total += len(data)

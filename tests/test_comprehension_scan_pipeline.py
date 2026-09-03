@@ -2947,8 +2947,87 @@ def test_run_scan_two_out_of_scan_classes_sharing_a_simple_name_completes_not_re
     validate_result = scan_pipeline.validate_run(java_repo, run_id=outcome.scan_id)
     assert validate_result["valid"] is True
 
-    validate_result = scan_pipeline.validate_run(java_repo, run_id=outcome.scan_id)
-    assert validate_result["valid"] is True
+
+def test_run_scan_a_secrets_xml_collision_stays_complete_not_degraded(java_repo: Path) -> None:
+    """FIX ROUND 39 (thirty-third cold read, F2 MAJOR, .cr33-secxml,
+    wrong-data - THE SELF-CONTRADICTION): round 38's own F4 fix
+    recorded a secret-excluded `secrets.xml` collision as a visible,
+    NON-degrading problem (`SECRET_PATTERNS_CAVEAT` says so explicitly)
+    - but `run_scan`'s own status/degraded_by computation used to
+    derive from the bare TRUTHINESS of `discovery_result.problems`
+    (any discovery problem at all degrades, never checking each
+    problem's own `degrades_run`), so this exact run published
+    status=degraded + degraded_by containing `secret_pattern_matched_
+    code_bearing_file` - directly contradicting the SAME run's own
+    problem detail and caveat, both of which say "recorded, NOT
+    DEGRADING." One of the two published facts was false in every such
+    run. Fixed by deriving status/degraded_by from each discovery
+    problem's own (now-real) `degrades_run` flag."""
+    import json
+
+    (java_repo / "secrets.xml").write_text(
+        "<beans><bean id=\"x\" class=\"com.acme.X\"/></beans>", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matching = [
+        p for p in problems_doc["problems"]
+        if p["reason_code"] == "secret_pattern_matched_code_bearing_file"]
+    assert len(matching) == 1
+
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert "secret_pattern_matched_code_bearing_file" not in scan_doc["degraded_by"]
+
+
+def test_run_scan_a_genuinely_degrading_discovery_problem_still_degrades(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 39 (F2 MAJOR, control): the fix above must not flip
+    every discovery problem to non-degrading - a real resource-limit
+    hit (a file over the per-file byte cap) still publishes
+    status=degraded and names its own reason_code in degraded_by,
+    exactly as before this round."""
+    import json
+
+    from agenttalk.comprehension import discovery as discoverymod
+
+    monkeypatch.setattr(discoverymod, "MAX_PER_FILE_BYTES", 200)
+    (java_repo / "big.bin").write_bytes(b"\xff" * 500)
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert "resource_limit" in scan_doc["degraded_by"]
+
+
+def test_run_scan_mixed_degrading_and_non_degrading_discovery_problems(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 39 (F2 MAJOR, mixed control): a run with BOTH a
+    non-degrading secrets.xml collision AND a genuinely-degrading
+    resource-limit hit must publish status=degraded (the genuine
+    problem alone earns it) with degraded_by naming ONLY the
+    degrading reason_code, never the non-degrading one - proving the
+    fix filters per-problem, not merely "the first problem decides
+    the whole run."""
+    import json
+
+    from agenttalk.comprehension import discovery as discoverymod
+
+    monkeypatch.setattr(discoverymod, "MAX_PER_FILE_BYTES", 200)
+    (java_repo / "secrets.xml").write_text(
+        "<beans><bean id=\"x\" class=\"com.acme.X\"/></beans>", encoding="utf-8")
+    (java_repo / "big.bin").write_bytes(b"\xff" * 500)
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert "resource_limit" in scan_doc["degraded_by"]
+    assert "secret_pattern_matched_code_bearing_file" not in scan_doc["degraded_by"]
 
 
 def test_run_scan_two_servlets_mapped_to_different_url_patterns_publishes_no_problem(
