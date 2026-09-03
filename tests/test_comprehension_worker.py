@@ -561,8 +561,14 @@ def test_process_paths_dispatches_web_xml_through_the_java_results_channel(
     own passing unit tests but no dispatch anywhere in the pipeline - a
     valid servlet-mapping web.xml produced no route at all. Wired in the
     same shape as pom.xml's build edges: same already-read bytes, same
-    java_results channel."""
-    (tmp_path / "web.xml").write_text(
+    java_results channel.
+
+    FIX ROUND 43 (F4 MAJOR): moved under ``WEB-INF/`` - a real
+    deployable descriptor's own required location (see round 43's own
+    stray-web.xml exclusion below); a bare top-level ``web.xml`` is no
+    longer treated as one at all."""
+    (tmp_path / "WEB-INF").mkdir()
+    (tmp_path / "WEB-INF" / "web.xml").write_text(
         "<web-app>\n"
         "  <servlet>\n"
         "    <servlet-name>dispatcher</servlet-name>\n"
@@ -575,10 +581,10 @@ def test_process_paths_dispatches_web_xml_through_the_java_results_channel(
         "</web-app>\n",
         encoding="utf-8",
     )
-    result = worker.process_paths(tmp_path, ["web.xml"])
+    result = worker.process_paths(tmp_path, ["WEB-INF/web.xml"])
     assert result.problems == []
-    assert "web.xml" in result.java_results
-    entry_points = result.java_results["web.xml"]["entry_points"]
+    assert "WEB-INF/web.xml" in result.java_results
+    entry_points = result.java_results["WEB-INF/web.xml"]["entry_points"]
     assert entry_points and entry_points[0]["name"] == "/api/*"
     assert entry_points[0]["kind"] == "http_route"
 
@@ -704,13 +710,17 @@ def test_process_paths_flags_a_web_xml_that_extracts_nothing_but_has_real_conten
     <display-name>, here) that simply matches none of this adapter's
     five modeled element families, must not read as a complete, zero-
     problem run - exactly the shape that would mask the next web.xml
-    parser blindness the same way the pom.xml one did."""
-    (tmp_path / "web.xml").write_text(
+    parser blindness the same way the pom.xml one did.
+
+    FIX ROUND 43 (F4 MAJOR): moved under ``WEB-INF/`` - see round 43's
+    own stray-web.xml exclusion note above."""
+    (tmp_path / "WEB-INF").mkdir()
+    (tmp_path / "WEB-INF" / "web.xml").write_text(
         "<web-app><display-name>Legacy App</display-name></web-app>\n", encoding="utf-8")
-    result = worker.process_paths(tmp_path, ["web.xml"])
+    result = worker.process_paths(tmp_path, ["WEB-INF/web.xml"])
     matching = [p for p in result.problems if p.reason_code == "no_web_xml_facts_extracted"]
     assert len(matching) == 1
-    assert matching[0].relative_path == "web.xml"
+    assert matching[0].relative_path == "WEB-INF/web.xml"
 
 
 def test_process_paths_does_not_flag_a_genuinely_empty_web_app(tmp_path: Path) -> None:
@@ -720,9 +730,13 @@ def test_process_paths_does_not_flag_a_genuinely_empty_web_app(tmp_path: Path) -
     gate. Judged deliberately: unlike a pom (which always carries SOME
     identity under Maven's own model), an empty descriptor is a real,
     common, legitimate shape (e.g. an otherwise fully annotation-driven
-    webapp with no XML-declared servlets at all)."""
-    (tmp_path / "web.xml").write_text("<web-app/>\n", encoding="utf-8")
-    result = worker.process_paths(tmp_path, ["web.xml"])
+    webapp with no XML-declared servlets at all).
+
+    FIX ROUND 43 (F4 MAJOR): moved under ``WEB-INF/`` - see round 43's
+    own stray-web.xml exclusion note above."""
+    (tmp_path / "WEB-INF").mkdir()
+    (tmp_path / "WEB-INF" / "web.xml").write_text("<web-app/>\n", encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["WEB-INF/web.xml"])
     assert result.problems == []
 
 
@@ -731,8 +745,12 @@ def test_process_paths_does_not_flag_a_normal_web_xml_with_a_real_mapping(
 ) -> None:
     """Companion control: a normal, real web.xml with a genuine mapping
     must not be flagged - it has real, non-empty extraction (one entry
-    point), the ordinary healthy case."""
-    (tmp_path / "web.xml").write_text(
+    point), the ordinary healthy case.
+
+    FIX ROUND 43 (F4 MAJOR): moved under ``WEB-INF/`` - see round 43's
+    own stray-web.xml exclusion note above."""
+    (tmp_path / "WEB-INF").mkdir()
+    (tmp_path / "WEB-INF" / "web.xml").write_text(
         "<web-app>\n"
         "  <servlet>\n"
         "    <servlet-name>s1</servlet-name>\n"
@@ -744,7 +762,7 @@ def test_process_paths_does_not_flag_a_normal_web_xml_with_a_real_mapping(
         "  </servlet-mapping>\n"
         "</web-app>\n",
         encoding="utf-8")
-    result = worker.process_paths(tmp_path, ["web.xml"])
+    result = worker.process_paths(tmp_path, ["WEB-INF/web.xml"])
     assert result.problems == []
 
 
@@ -754,8 +772,12 @@ def test_process_paths_web_xml_route_publishes_a_paired_route_edge_f4(
     """FIX ROUND 27 (twenty-third cold read, F4, mechanism confirmed):
     parse_web_xml now returns a third value (edges) - the worker must
     thread it into JavaFileResult, the same channel every annotation-
-    based route's own paired edge already flows through."""
-    (tmp_path / "web.xml").write_text(
+    based route's own paired edge already flows through.
+
+    FIX ROUND 43 (F4 MAJOR): moved under ``WEB-INF/`` - see round 43's
+    own stray-web.xml exclusion note above."""
+    (tmp_path / "WEB-INF").mkdir()
+    (tmp_path / "WEB-INF" / "web.xml").write_text(
         "<web-app>\n"
         "  <servlet-mapping>\n"
         "    <servlet-name>s1</servlet-name>\n"
@@ -763,8 +785,8 @@ def test_process_paths_web_xml_route_publishes_a_paired_route_edge_f4(
         "  </servlet-mapping>\n"
         "</web-app>\n",
         encoding="utf-8")
-    result = worker.process_paths(tmp_path, ["web.xml"])
-    edges = result.java_results["web.xml"]["edges"]
+    result = worker.process_paths(tmp_path, ["WEB-INF/web.xml"])
+    edges = result.java_results["WEB-INF/web.xml"]["edges"]
     assert len(edges) == 1
     assert edges[0]["relation"] == "route"
     assert edges[0]["target"] == "/s1"
@@ -847,32 +869,130 @@ def test_process_paths_a_latin1_web_xml_records_a_problem_not_a_false_route(
 ) -> None:
     """FIX ROUND 26 (F3 BLOCKER, wrong-data): the web.xml twin - a
     Latin-1-encoded web.xml must never publish a corrupted/fabricated
-    route derived from an undecodable byte sequence."""
-    (tmp_path / "web.xml").write_bytes(
+    route derived from an undecodable byte sequence.
+
+    FIX ROUND 43 (F4 MAJOR): moved under ``WEB-INF/`` - see round 43's
+    own stray-web.xml exclusion note above."""
+    (tmp_path / "WEB-INF").mkdir()
+    (tmp_path / "WEB-INF" / "web.xml").write_bytes(
         "<web-app><servlet-mapping><servlet-name>café</servlet-name>"
         "<url-pattern>/café/*</url-pattern></servlet-mapping></web-app>\n"
         .encode("latin-1"))
-    result = worker.process_paths(tmp_path, ["web.xml"])
+    result = worker.process_paths(tmp_path, ["WEB-INF/web.xml"])
     assert len(result.problems) == 1
     assert result.problems[0].reason_code == "encoding_undecodable"
-    assert result.problems[0].relative_path == "web.xml"
-    assert "web.xml" not in result.java_results
+    assert result.problems[0].relative_path == "WEB-INF/web.xml"
+    assert "WEB-INF/web.xml" not in result.java_results
 
 
 def test_process_paths_a_genuine_utf8_web_xml_with_unicode_content_stays_clean(
     tmp_path: Path,
 ) -> None:
-    """Companion control: the same web.xml, correctly UTF-8 encoded."""
-    (tmp_path / "web.xml").write_bytes(
+    """Companion control: the same web.xml, correctly UTF-8 encoded.
+
+    FIX ROUND 43 (F4 MAJOR): moved under ``WEB-INF/`` - see round 43's
+    own stray-web.xml exclusion note above."""
+    (tmp_path / "WEB-INF").mkdir()
+    (tmp_path / "WEB-INF" / "web.xml").write_bytes(
         "<web-app><servlet><servlet-name>café</servlet-name>"
         "<servlet-class>p.Cafe</servlet-class></servlet>"
         "<servlet-mapping><servlet-name>café</servlet-name>"
         "<url-pattern>/café/*</url-pattern></servlet-mapping></web-app>\n"
         .encode("utf-8"))
+    result = worker.process_paths(tmp_path, ["WEB-INF/web.xml"])
+    assert result.problems == []
+    entry_points = result.java_results["WEB-INF/web.xml"]["entry_points"]
+    assert entry_points[0]["name"] == "/café/*"
+
+
+def test_process_paths_a_stray_web_xml_outside_web_inf_publishes_no_routes(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 43 (thirty-seventh cold read, F4 MAJOR, .cr37-
+    strayweb, wrong-data - declared gap): a file merely NAMED
+    "web.xml" that does NOT live directly inside a ``WEB-INF/``
+    directory - a docs/examples copy, a tutorial snippet, a test-
+    resources fixture - is not a shape any servlet container will ever
+    load as a real deployment descriptor. Publishing its
+    <servlet-mapping> as a genuinely SERVED route over-claims this
+    scan's own confidence. No route, no problem (a real, deliberate,
+    named scope limitation, not a defect this run failed to handle) -
+    only a visible, counted exclusion."""
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name>example</servlet-name>\n"
+        "    <servlet-class>p.Example</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>example</servlet-name>\n"
+        "    <url-pattern>/example</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["docs/web.xml"])
+    assert result.problems == []
+    assert "docs/web.xml" not in result.java_results
+    assert result.exclusions == {"stray_web_xml_ignored": 1}
+
+
+def test_process_paths_a_top_level_web_xml_with_no_web_inf_parent_is_also_stray(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 43 (.cr37-strayweb, the bare-top-level shape): the
+    SAME exclusion for a ``web.xml`` sitting directly at the scan
+    root - no ``WEB-INF/`` parent at all, the shape every worker-level
+    test in this file used before this round (an unrealistic fixture,
+    corrected above, not a genuine deployable location)."""
+    (tmp_path / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name>example</servlet-name>\n"
+        "    <servlet-class>p.Example</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>example</servlet-name>\n"
+        "    <url-pattern>/example</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8")
     result = worker.process_paths(tmp_path, ["web.xml"])
     assert result.problems == []
-    entry_points = result.java_results["web.xml"]["entry_points"]
-    assert entry_points[0]["name"] == "/café/*"
+    assert "web.xml" not in result.java_results
+    assert result.exclusions == {"stray_web_xml_ignored": 1}
+
+
+def test_process_paths_web_inf_web_xml_is_not_counted_as_stray(tmp_path: Path) -> None:
+    """FIX ROUND 43 (.cr37-strayweb, control): a genuine ``WEB-INF/
+    web.xml`` must never be counted as a stray exclusion - the control
+    proving the gate distinguishes the two shapes, not merely
+    excludes everything named "web.xml"."""
+    (tmp_path / "WEB-INF").mkdir()
+    (tmp_path / "WEB-INF" / "web.xml").write_text("<web-app/>\n", encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["WEB-INF/web.xml"])
+    assert result.exclusions == {}
+
+
+def test_process_paths_a_lower_case_web_inf_directory_still_counts(tmp_path: Path) -> None:
+    """FIX ROUND 43 (.cr37-strayweb, case-insensitivity control): the
+    ``WEB-INF/`` gate must be case-insensitive, matching this file's
+    own established "dispatch is never extension/name-case-sensitive"
+    discipline (Note 10) - Windows/default-macOS filesystems make a
+    differently-cased ``web-inf`` directory perfectly reachable."""
+    (tmp_path / "web-inf").mkdir()
+    (tmp_path / "web-inf" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>example</servlet-name>\n"
+        "    <url-pattern>/example</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["web-inf/web.xml"])
+    assert result.exclusions == {}
+    entry_points = result.java_results["web-inf/web.xml"]["entry_points"]
+    assert entry_points[0]["name"] == "/example"
 
 
 def test_process_paths_a_latin1_tooling_xml_records_encoding_undecodable_not_unsupported_language(

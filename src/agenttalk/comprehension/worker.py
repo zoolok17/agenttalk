@@ -759,6 +759,32 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                                "this pom's own coordinate is treated as absent rather than "
                                "published with a guessed value",
                     ))
+        elif rel_name_lower == "web.xml" and Path(rel).parent.name.lower() != "web-inf":
+            # FIX ROUND 43 (thirty-seventh cold read, F4 MAJOR, wrong-
+            # data - declared gap): per the Servlet spec, a REAL
+            # deployable descriptor always lives directly inside a
+            # `WEB-INF/` directory (never nested any deeper, never
+            # anywhere else) - `WEB-INF/web.xml` is already this
+            # producer's OWN assumed convention elsewhere (see
+            # features_artifact.py's own worked example,
+            # "WEB-INF/web.xml#dispatcher"). A file merely NAMED
+            # "web.xml" outside that one real location - a docs/
+            # examples copy, a tutorial snippet, a test-resources
+            # fixture - is not a shape any servlet container will ever
+            # load as a deployment descriptor, and publishing its
+            # <servlet-mapping>/<filter-mapping> entries as genuinely
+            # SERVED routes over-claims this scan's own confidence
+            # about what the target application actually exposes.
+            #
+            # Judged: an EXCLUSION count (the same `profile_scoped_
+            # dependencies` idiom above, and scan.json's own discovery-
+            # level `exclusions` map), never a silently-vanished file
+            # and never a `parse_failed`/degrading problem either - a
+            # stray web.xml copy is a real, deliberate, named scope
+            # limitation, not a defect this run failed to handle.
+            exclusions["stray_web_xml_ignored"] = (
+                exclusions.get("stray_web_xml_ignored", 0) + 1
+            )
         elif rel_name_lower == "web.xml":
             # M9 (cold-read, PR-B fix round 3): parse_web_xml existed as a
             # producer with its own passing unit tests but no dispatch
