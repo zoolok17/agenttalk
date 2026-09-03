@@ -41,6 +41,8 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from ..errors import bounded_detail
+
 ADAPTER_NAME = "java"
 ADAPTER_VERSION = 1
 RULE_VERSION = 1
@@ -971,6 +973,22 @@ class JavaEdgeClaim:
     #: case: unset or ``false`` in the pom is False, only an explicit
     #: ``true`` element flips it.
     optional: bool = False
+    #: FIX ROUND 40 (thirty-fourth cold read, F1+F2 MAJOR, wrong-data -
+    #: THE LOSSY DISPLAY PROJECTION): ``target`` is the DISPLAY value -
+    #: safe to publish (control/invisible characters escaped, length-
+    #: bounded), but LOSSY: truncated past 200 chars, and its own escape
+    #: is not injective (a real ZERO WIDTH SPACE and the literal 6-
+    #: character escape spelling for it both escape to the identical
+    #: displayed text). Two DECLARED,
+    #: genuinely different routes could therefore DISPLAY identically
+    #: and silently collide on ``edge_id`` if that hashed ``target``
+    #: directly. ``identity_target`` is the SAME route's own raw,
+    #: unbounded, unescaped value (or ``None`` when the route never went
+    #: through the lossy transform at all, e.g. a route composed from
+    #: zero real path fragments) - ``dependencies_artifact.py`` hashes
+    #: THIS for ``edge_id``, never ``target``, while ``target`` keeps
+    #: publishing as the existing, safe display value unchanged.
+    identity_target: str | None = None
 
 
 @dataclass(frozen=True)
@@ -989,6 +1007,11 @@ class JavaEntryPointClaim:
     name: str
     line: int | None
     evidence_class: str
+    #: FIX ROUND 40 (F1+F2 MAJOR): the raw, unbounded/unescaped parallel
+    #: of ``name`` - see ``JavaEdgeClaim.identity_target``'s own
+    #: docstring for the full reasoning (identical hazard, identical
+    #: fix, for the entry-point side of the same route).
+    identity_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1656,7 +1679,7 @@ def _java_string_literal_content(text: str, quote_pos: int) -> str | None:
 
 def _route_paths(
     sanitized: str, original: str, group_start: int, group_end: int,
-) -> list[str] | None:
+) -> tuple[list[str], list[str]] | None:
     """Recover the annotation's literal path/value string(s), in
     declaration order. LOCATES the attribute (by name, or the leading
     positional literal) against the SANITIZED segment - comments and
@@ -1713,12 +1736,12 @@ def _route_paths(
     sanitized_segment = sanitized[group_start:group_end]
     unrecoverable = False
     for match in _ROUTE_NAMED_ATTR_RE.finditer(sanitized_segment):
-        values = _route_literal_list_at(original, group_start + match.end())
-        if values is None:
+        pair = _route_literal_list_at(original, group_start + match.end())
+        if pair is None:
             unrecoverable = True
             continue
-        if values:
-            return values
+        if pair[0]:
+            return pair
     if not unrecoverable:
         positional_match = _ROUTE_POSITIONAL_ANCHOR_RE.match(sanitized_segment)
         if positional_match is not None:
@@ -1729,12 +1752,12 @@ def _route_paths(
             leads_with_other_named_attr = _ROUTE_LEADING_NAMED_ATTR_RE.match(
                 sanitized_segment, positional_match.end()) is not None
             if not leads_with_other_named_attr:
-                values = _route_literal_list_at(original, group_start + positional_match.end())
-                if values is None:
+                pair = _route_literal_list_at(original, group_start + positional_match.end())
+                if pair is None:
                     unrecoverable = True
-                elif values:
-                    return values
-    return None if unrecoverable else []
+                elif pair[0]:
+                    return pair
+    return None if unrecoverable else ([], [])
 
 
 def _value_terminates_at(original: str, pos: int) -> bool:
@@ -1751,31 +1774,50 @@ def _value_terminates_at(original: str, pos: int) -> bool:
     return pos >= n or original[pos] in ",)"
 
 
-def _route_literal_list_at(original: str, anchor: int) -> list[str] | None:
+def _route_literal_list_at(original: str, anchor: int) -> tuple[list[str], list[str]] | None:
     """Every string literal value at ``anchor``: a bare literal
     (``"..."``), or, when Spring's own array-literal shorthand is used
     for a multi-value ``value``/``path``/positional attribute
     (``{"...", "..."}``), EVERY element in declaration order (fix round
-    10 MAJOR 1). Returns ``[]`` when nothing at all sits here (a
+    10 MAJOR 1). Returns ``([], [])`` when nothing at all sits here (a
     genuinely valueless annotation); ``None`` (fix round 11) when
     something sits here but is not a clean literal or literal array -
     a constant reference, a concatenation, or an array containing any
     non-literal element - never silently truncated to whichever leading
-    literal fragment happened to parse."""
+    literal fragment happened to parse.
+
+    FIX ROUND 40 (thirty-fourth cold read, F1+F2 MAJOR, wrong-data - THE
+    LOSSY DISPLAY PROJECTION): returns a ``(display, identity)`` PAIR of
+    parallel lists now, not one - ``display`` is the existing bounded/
+    escaped value (``_bounded_route_target``, safe for a published
+    route name, but LOSSY: truncated past 200 chars, and its own
+    control-char escape is not injective, e.g. a real U+200B and the
+    literal 6-character text ``\\u200b`` both escape to the identical
+    displayed spelling). ``identity`` is the SAME literal's own
+    unbounded, unescaped decoded content - what a route's own
+    entry_point_id/edge_id must hash instead, so two DECLARED, GENUINELY
+    DIFFERENT routes that merely DISPLAY identically after this lossy
+    projection (two >200-char routes sharing a 200-char prefix; a real
+    U+200B versus its own escaped spelling) still get distinct ids, never
+    silently coalesced into one published record. See
+    ``_compose_route_identity``'s own docstring for how these compose
+    alongside their bounded siblings without duplicating the whole
+    composition pipeline."""
     n = len(original)
     pos = anchor
     while pos < n and original[pos].isspace():
         pos += 1
     if pos >= n or original[pos] in ",)":
-        return []
+        return [], []
     if original[pos] == "{":
         values: list[str] = []
+        raw_values: list[str] = []
         pos += 1
         while pos < n:
             while pos < n and (original[pos].isspace() or original[pos] == ","):
                 pos += 1
             if pos < n and original[pos] == "}":
-                return values
+                return values, raw_values
             if pos >= n or original[pos] != '"':
                 return None
             span = _java_string_literal_span(original, pos)
@@ -1783,6 +1825,7 @@ def _route_literal_list_at(original: str, anchor: int) -> list[str] | None:
                 return None
             content, pos = span
             values.append(_bounded_route_target(content))
+            raw_values.append(content)
         return None
     if original[pos] != '"':
         return None
@@ -1792,7 +1835,7 @@ def _route_literal_list_at(original: str, anchor: int) -> list[str] | None:
     content, end = span
     if not _value_terminates_at(original, end):
         return None
-    return [_bounded_route_target(content)]
+    return [_bounded_route_target(content)], [content]
 
 
 #: FIX ROUND 20 (sixteenth cold read, P1 JUDGE, taken): a route literal's
@@ -2330,7 +2373,9 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             line=_line_at(newline_offsets, match.start()), phase="runtime",
         ))
 
-    def _route_annotation_span(match: re.Match) -> tuple[int, list[str] | None, list[str]]:
+    def _route_annotation_span(
+        match: re.Match,
+    ) -> tuple[int, tuple[list[str], list[str]] | None, list[str]]:
         # N10 (third cold read, fix round 5): find the annotation's own
         # argument-list parens by tracking nesting depth (below), rather
         # than a regex that stopped at the FIRST close-paren anywhere in
@@ -2351,7 +2396,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                     _route_paths(sanitized, text, arg_pos, close_pos + 1),
                     _route_method_attributes(sanitized[arg_pos:close_pos + 1]),
                 )
-        return match.end(), [], []
+        return match.end(), ([], []), []
 
     # M5 (fourth cold read, fix round 6): a class-level @RequestMapping is
     # a PREFIX for every method-level route inside that class - Spring's
@@ -2372,6 +2417,11 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     # is what gets tested against it.
     class_header_associations = _class_header_associations(sanitized, types)
     class_route_prefix: dict[str, list[str]] = {}
+    # FIX ROUND 40 (F1+F2 MAJOR): the raw (pre-_bounded_route_target)
+    # parallel of class_route_prefix - see _route_literal_list_at's own
+    # docstring for why entry_point_id/edge_id must hash this, never the
+    # bounded display value.
+    class_route_prefix_raw: dict[str, list[str]] = {}
     # Fix round 11 (seventh cold read BLOCKER part 2 - the fail-safe for
     # unrecoverable values): a class-level route annotation whose OWN
     # value could not be recovered as a literal (a constant reference, a
@@ -2395,11 +2445,11 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     # the other end.
     jax_rs_path_classes: set[str] = set()
     for match in _ROUTE_ANNOTATION_RE.finditer(sanitized):
-        _span_end, paths, _explicit_methods = _route_annotation_span(match)
+        _span_end, paths_pair, _explicit_methods = _route_annotation_span(match)
         target_type = _class_level_route_target(match.start(), class_header_associations)
         if target_type is None:
             continue
-        if paths is None:
+        if paths_pair is None:
             class_route_prefix_unrecoverable.add(target_type)
             # FIX ROUND 20 (sixteenth cold read, M3 MAJOR, wrong-data):
             # this branch tracked the class as prefix-unrecoverable (so
@@ -2413,14 +2463,20 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             # same reason_code, attributed to the class itself.
             problems.append(JavaAdapterProblem(
                 reason_code="route_value_unrecoverable",
-                detail=f"a class-level route annotation at line "
+                detail=bounded_detail(f"a class-level route annotation at line "
                        f"{_line_at(newline_offsets, match.start())} has a value that could "
                        "not be recovered as a literal - suppressed rather than published "
-                       "with a guessed or partial value",
+                       "with a guessed or partial value"),
                 qualified_name=target_type,
             ))
-        elif paths:
-            class_route_prefix[target_type] = paths
+        elif paths_pair[0]:
+            class_route_prefix[target_type] = paths_pair[0]
+            # FIX ROUND 40 (F1+F2 MAJOR): the RAW, unbounded/unescaped
+            # parallel of the class-level prefix, composed alongside the
+            # bounded one below for entry_point_id/edge_id's own
+            # identity inputs - see _route_literal_list_at's own
+            # docstring.
+            class_route_prefix_raw[target_type] = paths_pair[1]
             if match.group(1) == "Path":
                 jax_rs_path_classes.add(target_type)
 
@@ -2436,7 +2492,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     for match in _ROUTE_ANNOTATION_RE.finditer(sanitized):
         line = _line_at(newline_offsets, match.start())
         enclosing = _enclosing_qualified_name(match.start(), types, primary_qualified)
-        span_end, paths, explicit_methods = _route_annotation_span(match)
+        span_end, paths_pair, explicit_methods = _route_annotation_span(match)
         class_target = _class_level_route_target(match.start(), class_header_associations)
         if class_target is not None:
             # A bare class-level annotation with no method-level mapping
@@ -2478,9 +2534,9 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                 # start()`), unique per match by construction, closes it
                 # the same way round 37's own qualified_name fix closed
                 # the identical class of collision one level up.
-                detail=f"a class-level-looking route annotation at line {line} "
+                detail=bounded_detail(f"a class-level-looking route annotation at line {line} "
                        f"(offset {match.start()}) could not be confidently associated with "
-                       "any declared type - suppressed rather than published as a route",
+                       "any declared type - suppressed rather than published as a route"),
             ))
             continue
         # FIX ROUND 20 (sixteenth cold read, m1 MINOR, wrong-data): a
@@ -2498,7 +2554,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         # never a real route to begin with.
         if not _route_annotation_targets_a_method(sanitized, span_end):
             continue
-        if paths is None:
+        if paths_pair is None:
             # FAIL-SAFE (fix round 11, seventh cold read BLOCKER part 2):
             # this route annotation's OWN value could not be recovered
             # as a literal - a constant reference, a concatenation
@@ -2516,9 +2572,9 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             # in this adapter uses).
             problems.append(JavaAdapterProblem(
                 reason_code="route_value_unrecoverable",
-                detail=f"a route annotation at line {line} has a value that could not be "
+                detail=bounded_detail(f"a route annotation at line {line} has a value that could not be "
                        "recovered as a literal - suppressed rather than published with a "
-                       "guessed or partial value",
+                       "guessed or partial value"),
                 qualified_name=enclosing,
             ))
             continue
@@ -2531,16 +2587,29 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             # attribution as the sibling fail-safe just above.
             problems.append(JavaAdapterProblem(
                 reason_code="route_value_unrecoverable",
-                detail=f"a route annotation at line {line} is inside a class whose own route "
+                detail=bounded_detail(f"a route annotation at line {line} is inside a class whose own route "
                        "prefix could not be recovered as a literal - suppressed rather than "
-                       "published as an incomplete fragment",
+                       "published as an incomplete fragment"),
                 qualified_name=enclosing,
             ))
             continue
+        # FIX ROUND 40 (F1+F2 MAJOR): `paths`/`prefixes` stay the
+        # existing BOUNDED (display-safe) lists, composed exactly as
+        # before - `paths_raw`/`prefixes_raw` are their raw, unbounded/
+        # unescaped parallels (same length, same order), composed
+        # ALONGSIDE via the identical composition calls, never a second,
+        # separately-derived notion of the route. See
+        # JavaEdgeClaim.identity_target's own docstring for why.
+        paths, paths_raw = paths_pair
         prefixes = class_route_prefix.get(enclosing)
+        prefixes_raw = class_route_prefix_raw.get(enclosing)
         if prefixes:
             if paths:
                 composed = [_compose_route_path(prefix, p) for prefix in prefixes for p in paths]
+                composed_raw = [
+                    _compose_route_path(prefix_raw, p_raw)
+                    for prefix_raw in prefixes_raw for p_raw in paths_raw
+                ]
             else:
                 # M5 composition note (fifth cold read, fix round 7): a
                 # valueless method annotation (bare ``@GetMapping``)
@@ -2551,6 +2620,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                 # fallback below and silently losing the prefix
                 # entirely.
                 composed = [_compose_route_path(prefix, "") for prefix in prefixes]
+                composed_raw = [_compose_route_path(prefix_raw, "") for prefix_raw in prefixes_raw]
         elif paths:
             # LOW-2 (round 7c): the same leading-slash normalization
             # _compose_route_path applies to a class prefix, applied
@@ -2558,8 +2628,10 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             # prefix at all) must not publish a different spelling of
             # the same served path just because it lacked one.
             composed = [_normalize_route_leading_slash(p) for p in paths]
+            composed_raw = [_normalize_route_leading_slash(p_raw) for p_raw in paths_raw]
         else:
             composed = []
+            composed_raw = []
         # N2 (fifth cold read, fix round 8): a verb-specific annotation's
         # own implied method (GetMapping -> GET, ...) always wins when
         # known; a plain @RequestMapping has none of its own, so its
@@ -2614,11 +2686,11 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         if match.group(1) == "Path" and verb is None and composed:
             problems.append(JavaAdapterProblem(
                 reason_code="unsupported_entry_point_shape",
-                detail=f"a @Path method at line {line} composes a route ({', '.join(composed)}) "
+                detail=bounded_detail(f"a @Path method at line {line} composes a route ({', '.join(composed)}) "
                        "but declares no verb designator (@GET/@POST/...) of its own - JAX-RS's "
                        "own sub-resource-locator idiom (jax_rs_sub_resource_locator): it never "
                        "handles a request directly, so no served http_route is published for "
-                       "it - not confidently absent either",
+                       "it - not confidently absent either"),
                 qualified_name=enclosing,
             ))
             continue
@@ -2629,18 +2701,32 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                 for m in methods
                 for p in composed
             ]
+            # FIX ROUND 40 (F1+F2 MAJOR): the raw parallel of `targets`,
+            # same cartesian order - `m` (the verb) is a fixed, closed-
+            # vocabulary string, never subject to the lossy transform,
+            # so it is reused as-is on both sides.
+            targets_raw = [
+                f"{m} {p}" if m else p
+                for m in methods
+                for p in composed_raw
+            ]
         else:
             targets = [f"{enclosing}#{match.group(1)}"]
-        for target in targets:
+            # A synthetic, already-unique-by-construction fallback name -
+            # never drawn from the lossy transform, so there is no raw
+            # counterpart to diverge from it.
+            targets_raw = [None]
+        for target, identity_target in zip(targets, targets_raw, strict=True):
             classes_with_route_entry_points.add(enclosing)
             edges.append(JavaEdgeClaim(
                 from_qualified_name=enclosing, relation="route", target=target,
                 target_kind="external_route", evidence_class="declared",
-                line=line, phase="runtime",
+                line=line, phase="runtime", identity_target=identity_target,
             ))
             entry_points.append(JavaEntryPointClaim(
                 qualified_name=enclosing, kind="http_route",
                 name=target, line=line, evidence_class="declared",
+                identity_name=identity_target,
             ))
 
     # FIX ROUND 17 (thirteenth cold read, CR13-3 MAJOR, wrong-data, part
@@ -2660,21 +2746,27 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                 # FIX ROUND 38 (F3 MINOR): see the class-closer's own
                 # identical fix above - the offset is the distinguishing
                 # datum two same-line unassociated annotations need.
-                detail=f"a @WebServlet annotation at line {line} (offset {match.start()}) "
+                detail=bounded_detail(f"a @WebServlet annotation at line {line} (offset {match.start()}) "
                        "could not be confidently associated with any declared type - "
-                       "suppressed rather than published as a route",
+                       "suppressed rather than published as a route"),
             ))
             continue
-        _span_end, paths, _explicit_methods = _route_annotation_span(match)
-        if paths is None:
+        _span_end, paths_pair, _explicit_methods = _route_annotation_span(match)
+        if paths_pair is None:
             problems.append(JavaAdapterProblem(
                 reason_code="route_value_unrecoverable",
-                detail=f"a @WebServlet annotation at line {line} has a value/urlPatterns "
+                detail=bounded_detail(f"a @WebServlet annotation at line {line} has a value/urlPatterns "
                        "that could not be recovered as a literal - suppressed rather than "
-                       "published with a guessed or partial value",
+                       "published with a guessed or partial value"),
                 qualified_name=target_type,
             ))
             continue
+        # FIX ROUND 40 (F1+F2 MAJOR): @WebServlet is not composable (no
+        # method-level counterpart, no class-level prefix) - each
+        # urlPattern IS the complete route, so no composition step is
+        # needed, only the same bounded/raw split every other route
+        # site now carries.
+        paths, paths_raw = paths_pair
         # FIX ROUND 22 (eighteenth cold read, F3 MAJOR, wrong-data): a
         # genuinely EMPTY paths list (`_route_paths`'s own "no value/
         # urlPatterns attribute at all" case) means Spring's own "serves
@@ -2691,23 +2783,23 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         if not paths:
             problems.append(JavaAdapterProblem(
                 reason_code="unsupported_entry_point_shape",
-                detail=f"a @WebServlet annotation at line {line} declares no value/"
+                detail=bounded_detail(f"a @WebServlet annotation at line {line} declares no value/"
                        "urlPatterns attribute at all (startup_only_servlet - a startup-only "
                        "registration, e.g. name/loadOnStartup) - no entry point published, "
-                       "but not confidently absent either",
+                       "but not confidently absent either"),
                 qualified_name=target_type,
             ))
             continue
-        for path in paths:
+        for path, path_raw in zip(paths, paths_raw, strict=True):
             classes_with_route_entry_points.add(target_type)
             edges.append(JavaEdgeClaim(
                 from_qualified_name=target_type, relation="route", target=path,
                 target_kind="external_route", evidence_class="declared",
-                line=line, phase="runtime",
+                line=line, phase="runtime", identity_target=path_raw,
             ))
             entry_points.append(JavaEntryPointClaim(
                 qualified_name=target_type, kind="http_route",
-                name=path, line=line, evidence_class="declared",
+                name=path, line=line, evidence_class="declared", identity_name=path_raw,
             ))
 
     # FIX ROUND 21 (seventeenth cold read, CR17-3 MAJOR, wrong-data -
@@ -2744,21 +2836,24 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                 reason_code="route_annotation_unassociated",
                 # FIX ROUND 38 (F3 MINOR): see the class-closer's own
                 # identical fix above.
-                detail=f"a @WebFilter annotation at line {line} (offset {match.start()}) "
+                detail=bounded_detail(f"a @WebFilter annotation at line {line} (offset {match.start()}) "
                        "could not be confidently associated with any declared type - "
-                       "suppressed rather than published as a route",
+                       "suppressed rather than published as a route"),
             ))
             continue
-        _span_end, paths, _explicit_methods = _route_annotation_span(match)
-        if paths is None:
+        _span_end, paths_pair, _explicit_methods = _route_annotation_span(match)
+        if paths_pair is None:
             problems.append(JavaAdapterProblem(
                 reason_code="route_value_unrecoverable",
-                detail=f"a @WebFilter annotation at line {line} has a value/urlPatterns "
+                detail=bounded_detail(f"a @WebFilter annotation at line {line} has a value/urlPatterns "
                        "that could not be recovered as a literal - suppressed rather than "
-                       "published with a guessed or partial value",
+                       "published with a guessed or partial value"),
                 qualified_name=target_type,
             ))
             continue
+        # FIX ROUND 40 (F1+F2 MAJOR): see the @WebServlet twin's own
+        # identical comment above.
+        paths, paths_raw = paths_pair
         # FIX ROUND 22 (eighteenth cold read, F3 MAJOR, wrong-data): a
         # genuinely EMPTY paths list means this @WebFilter carries no
         # value/urlPatterns attribute at all - the standard servlet-
@@ -2770,10 +2865,10 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         if not paths:
             problems.append(JavaAdapterProblem(
                 reason_code="unsupported_entry_point_shape",
-                detail=f"a @WebFilter annotation at line {line} declares no value/"
+                detail=bounded_detail(f"a @WebFilter annotation at line {line} declares no value/"
                        "urlPatterns attribute at all (servlet_name_scoped_filter - e.g. "
                        "servletNames only) - no entry point published, but not confidently "
-                       "absent either",
+                       "absent either"),
                 qualified_name=target_type,
             ))
             continue
@@ -2802,14 +2897,14 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             ):
                 problems.append(JavaAdapterProblem(
                     reason_code="unsupported_entry_point_shape",
-                    detail=f"a @WebFilter annotation at line {line} declares BOTH a "
+                    detail=bounded_detail(f"a @WebFilter annotation at line {line} declares BOTH a "
                            "value/urlPatterns and a servletNames attribute "
                            "(servlet_name_scoped_filter) - the url-pattern half publishes "
                            "normally, but this producer does not compose a target from "
-                           "the servlet-name-scoped half",
+                           "the servlet-name-scoped half"),
                     qualified_name=target_type,
                 ))
-        for path in paths:
+        for path, path_raw in zip(paths, paths_raw, strict=True):
             # MICRO-ROUND 27b (JUDGE, declared): see the identical note
             # at parse_web_xml's own filter-mapping edge site - this
             # edge's `relation` stays "route", never a distinct
@@ -2827,11 +2922,11 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             edges.append(JavaEdgeClaim(
                 from_qualified_name=target_type, relation="route", target=path,
                 target_kind="external_filter", evidence_class="declared",
-                line=line, phase="runtime",
+                line=line, phase="runtime", identity_target=path_raw,
             ))
             entry_points.append(JavaEntryPointClaim(
                 qualified_name=target_type, kind="http_filter",
-                name=path, line=line, evidence_class="declared",
+                name=path, line=line, evidence_class="declared", identity_name=path_raw,
             ))
 
     # FIX ROUND 18 (fourteenth cold read, F2 MAJOR, wrong-data): a MIXED
@@ -2943,11 +3038,11 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         # but never inside it.
         problems.append(JavaAdapterProblem(
             reason_code="unsupported_entry_point_shape",
-            detail=f"{jax_rs_class}'s own class-level @Path is declared, but no route ever "
+            detail=bounded_detail(f"{jax_rs_class}'s own class-level @Path is declared, but no route ever "
                    "composed against it - JAX-RS's own verb-only method idiom (@GET/@POST "
                    "with no method-level @Path of its own) is not recognized (see the named "
                    "limit beside _ROUTE_ANNOTATIONS) - no entry point published, but not "
-                   "confidently absent either",
+                   "confidently absent either"),
             qualified_name=jax_rs_class,
         ))
 
@@ -2956,11 +3051,11 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         # the sibling loop's own comment just above.
         problems.append(JavaAdapterProblem(
             reason_code="unsupported_entry_point_shape",
-            detail=f"{jax_rs_class}'s own class-level @Path is declared and at least one "
+            detail=bounded_detail(f"{jax_rs_class}'s own class-level @Path is declared and at least one "
                    "route composed against it, but a JAX-RS verb designator (@GET/@POST/...) "
                    "elsewhere in the class has no method-level @Path of its own to compose "
                    "against - that route is missing from the inventory even though this "
-                   "class is not entirely unmapped",
+                   "class is not entirely unmapped"),
             qualified_name=jax_rs_class,
         ))
 
@@ -2974,9 +3069,9 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         enclosing = _enclosing_qualified_name(match.start(), types, primary_qualified)
         problems.append(JavaAdapterProblem(
             reason_code="unsupported_entry_point_shape",
-            detail=f"a @WebMethod annotation at line {line} names a recognized routing/"
+            detail=bounded_detail(f"a @WebMethod annotation at line {line} names a recognized routing/"
                    "endpoint mechanism (JAX-WS SOAP) this adapter does not model - no "
-                   "entry point published, but not confidently absent either",
+                   "entry point published, but not confidently absent either"),
             qualified_name=enclosing,
         ))
 
@@ -2996,9 +3091,9 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                 enclosing = _enclosing_qualified_name(match.start(), types, primary_qualified)
             problems.append(JavaAdapterProblem(
                 reason_code="unsupported_entry_point_shape",
-                detail=f"{label} at line {line} names a recognized entry-point mechanism "
+                detail=bounded_detail(f"{label} at line {line} names a recognized entry-point mechanism "
                        f"({shape_name}) this adapter does not model - no entry point "
-                       "published, but not confidently absent either",
+                       "published, but not confidently absent either"),
                 qualified_name=enclosing,
             ))
 
@@ -3036,10 +3131,10 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         if close_pos is None:
             problems.append(JavaAdapterProblem(
                 reason_code="cli_main_unrecognized",
-                detail=f"a method literally named main returning void at line {line} did "
+                detail=bounded_detail(f"a method literally named main returning void at line {line} did "
                        "not match any recognized public-static-void-main(String[]) "
                        "signature shape - no cli_main entry point published, but not "
-                       "confidently absent either",
+                       "confidently absent either"),
                 qualified_name=enclosing,
             ))
             continue
@@ -3073,10 +3168,10 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         # to), never a silent negative.
         problems.append(JavaAdapterProblem(
             reason_code="cli_main_unrecognized",
-            detail=f"a method literally named main returning void at line {line} did not "
+            detail=bounded_detail(f"a method literally named main returning void at line {line} did not "
                    "match any recognized public-static-void-main(String[]) signature "
                    "shape - no cli_main entry point published, but not confidently absent "
-                   "either",
+                   "either"),
             qualified_name=enclosing,
         ))
 
@@ -3097,11 +3192,11 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     if malformed:
         problems.append(JavaAdapterProblem(
             reason_code="parse_failed",
-            detail="this file's own comment/string/char-literal scan reached end of "
+            detail=bounded_detail("this file's own comment/string/char-literal scan reached end of "
                    "file while still inside an unterminated block comment or string/"
                    "char literal - everything after that point could not be reliably "
                    "parsed and is not represented in this file's units/edges/entry "
-                   "points",
+                   "points"),
         ))
 
     if not units:
@@ -4982,10 +5077,10 @@ def parse_web_xml(
     for servlet_name, candidate_labels in sorted(servlet_registry.conflicts.items()):
         problems.append(JavaAdapterProblem(
             reason_code="duplicate_descriptor_name",
-            detail=f"<servlet-name>{servlet_name}</servlet-name> has disagreeing backing "
+            detail=bounded_detail(f"<servlet-name>{servlet_name}</servlet-name> has disagreeing backing "
                    f"declarations ({', '.join(candidate_labels)}) - no declaration is "
                    "authoritative by execution order, so its mapped route falls back to "
-                   "the synthetic per-mapping owner rather than picking one",
+                   "the synthetic per-mapping owner rather than picking one"),
             qualified_name=f"{relative_path}#{servlet_name}",
         ))
         descriptor_name_conflicts.append((
@@ -5004,10 +5099,10 @@ def parse_web_xml(
     for servlet_name, block_start in servlet_registry.class_undecodable:
         problems.append(JavaAdapterProblem(
             reason_code="route_value_unrecoverable",
-            detail=f"a <servlet-class> declared at line "
+            detail=bounded_detail(f"a <servlet-class> declared at line "
                    f"{_line_at(newline_offsets, block_start)} contains XML constructs "
                    "this producer does not decode - its mapped route falls back to the "
-                   "synthetic per-mapping owner rather than the real class",
+                   "synthetic per-mapping owner rather than the real class"),
             qualified_name=f"{relative_path}#{servlet_name}",
         ))
     # FIX ROUND 30 (twenty-sixth cold read, F1(1a) BLOCKER, wrong-data):
@@ -5024,11 +5119,11 @@ def parse_web_xml(
     for servlet_name, (jsp_path, block_start) in sorted(servlet_registry.jsp_file_only.items()):
         problems.append(JavaAdapterProblem(
             reason_code="unsupported_entry_point_shape",
-            detail=f"a <servlet> declared at line {_line_at(newline_offsets, block_start)} "
+            detail=bounded_detail(f"a <servlet> declared at line {_line_at(newline_offsets, block_start)} "
                    f"names <servlet-name>{servlet_name}</servlet-name>, backed by "
                    f"<jsp-file>{jsp_path}</jsp-file> rather than a <servlet-class> "
                    "(jsp_file_servlet) - its mapped route falls back to the synthetic "
-                   "per-mapping owner, naming the JSP directly here instead",
+                   "per-mapping owner, naming the JSP directly here instead"),
             qualified_name=f"{relative_path}#{servlet_name}",
         ))
     # FIX ROUND 30 (twenty-sixth cold read, F1(1b) BLOCKER, wrong-data):
@@ -5040,11 +5135,11 @@ def parse_web_xml(
     for servlet_name, block_start in sorted(servlet_registry.no_backing.items()):
         problems.append(JavaAdapterProblem(
             reason_code="descriptor_name_without_class",
-            detail=f"a <servlet> declared at line {_line_at(newline_offsets, block_start)} "
+            detail=bounded_detail(f"a <servlet> declared at line {_line_at(newline_offsets, block_start)} "
                    f"names <servlet-name>{servlet_name}</servlet-name> but declares neither a "
                    "<servlet-class> nor a <jsp-file> - its mapped route falls back to the "
                    "synthetic per-mapping owner, since no backing implementation is named "
-                   "at all",
+                   "at all"),
             qualified_name=f"{relative_path}#{servlet_name}",
         ))
     # FIX ROUND 25 (micro-round 25b, item 1, R3 BLOCK-SIDE GAP): the
@@ -5058,11 +5153,11 @@ def parse_web_xml(
     for block_start in servlet_name_undecodable:
         problems.append(JavaAdapterProblem(
             reason_code="route_value_unrecoverable",
-            detail=f"a <servlet> declared at line "
+            detail=bounded_detail(f"a <servlet> declared at line "
                    f"{_line_at(newline_offsets, block_start)} names a <servlet-name> "
                    "containing XML constructs this producer does not decode - any "
                    "mapping targeting it falls back to the synthetic per-mapping owner "
-                   "rather than the real class",
+                   "rather than the real class"),
         ))
     mapped_servlet_names: set[str] = set()
     undeclared_servlet_names: set[str] = set()
@@ -5130,12 +5225,12 @@ def parse_web_xml(
         if _is_blank_identity(decoded_name):
             problems.append(JavaAdapterProblem(
                 reason_code="route_value_unrecoverable",
-                detail=f"a <servlet-mapping> declared at line "
+                detail=bounded_detail(f"a <servlet-mapping> declared at line "
                        f"{_line_at(newline_offsets, block_match.start())} names a "
                        "<servlet-name> this producer cannot resolve to a real value "
                        "(undecodable XML constructs, or a comment-only/empty element) - "
                        "the whole mapping is suppressed rather than published with a "
-                       "guessed or empty name",
+                       "guessed or empty name"),
             ))
             continue
         servlet_name = decoded_name.strip()
@@ -5182,12 +5277,12 @@ def parse_web_xml(
             if decoded is None:
                 problems.append(JavaAdapterProblem(
                     reason_code="route_value_unrecoverable",
-                    detail=f"a <url-pattern> declared at line "
+                    detail=bounded_detail(f"a <url-pattern> declared at line "
                            f"{_line_at(newline_offsets, absolute_offset)} contains XML "
                            "constructs this producer does not decode (an undefined or "
                            "DOCTYPE-declared custom entity reference this producer "
                            "does not resolve, or CDATA mixed with other content) - "
-                           "suppressed rather than published with a guessed value",
+                           "suppressed rather than published with a guessed value"),
                     qualified_name=owner_qualified_name,
                 ))
                 continue
@@ -5198,7 +5293,16 @@ def parse_web_xml(
             # empty string, publishing a genuine but nameless entry
             # point. Kept as the real, honest value rather than
             # fabricating a placeholder name for it.
-            url_pattern = _bounded_route_target(decoded.strip())
+            # FIX ROUND 40 (F1+F2 MAJOR): `url_pattern_raw` is the same
+            # value BEFORE `_bounded_route_target`'s own lossy display
+            # transform (truncation past 200 chars; a non-injective
+            # control/invisible-character escape) - entry_point_id/
+            # edge_id must hash THIS, never the bounded display value,
+            # so two genuinely different, long/invisible-character-
+            # bearing patterns never silently collide. See
+            # JavaEdgeClaim.identity_target's own docstring.
+            url_pattern_raw = decoded.strip()
+            url_pattern = _bounded_route_target(url_pattern_raw)
             # FIX ROUND 32 (twenty-eighth cold read, F6 MINOR, wrong-data):
             # deduped on `owner_qualified_name` ALONE before - two
             # DIFFERENT servlet-names both backed by the SAME class (a
@@ -5224,11 +5328,12 @@ def parse_web_xml(
                 target=url_pattern, target_kind="external_route",
                 evidence_class="declared",
                 line=_line_at(newline_offsets, absolute_offset), phase="runtime",
+                identity_target=url_pattern_raw,
             ))
             entry_points.append(JavaEntryPointClaim(
                 qualified_name=owner_qualified_name, kind="http_route",
                 name=url_pattern, line=_line_at(newline_offsets, absolute_offset),
-                evidence_class="declared",
+                evidence_class="declared", identity_name=url_pattern_raw,
             ))
     # FIX ROUND 29 (F9c JUDGE): one visible problem per distinct
     # undeclared servlet-name - see the collection site's own comment
@@ -5236,10 +5341,10 @@ def parse_web_xml(
     for servlet_name in sorted(undeclared_servlet_names):
         problems.append(JavaAdapterProblem(
             reason_code="undeclared_descriptor_name",
-            detail=f"<servlet-mapping> names <servlet-name>{servlet_name}</servlet-name>, "
+            detail=bounded_detail(f"<servlet-mapping> names <servlet-name>{servlet_name}</servlet-name>, "
                    "which no <servlet> element in this file declares at all - its mapped "
                    "route falls back to the synthetic per-mapping owner rather than a "
-                   "real class",
+                   "real class"),
             qualified_name=f"{relative_path}#{servlet_name}",
         ))
     # FIX ROUND 31 (twenty-seventh cold read, N4 JUDGE, taken): one
@@ -5260,9 +5365,9 @@ def parse_web_xml(
             f"{name} ({qualified})" for name, qualified in sorted(owner_entries))
         problems.append(JavaAdapterProblem(
             reason_code="duplicate_route_target",
-            detail=f"<url-pattern>{url_pattern}</url-pattern> is mapped by 2+ different "
+            detail=bounded_detail(f"<url-pattern>{url_pattern}</url-pattern> is mapped by 2+ different "
                    f"servlet-names ({described}) - undefined dispatch, no real container "
-                   "can serve the identical pattern from more than one owner at once",
+                   "can serve the identical pattern from more than one owner at once"),
             qualified_name=f"{relative_path}#duplicate_route_target#{url_pattern}",
         ))
     # FIX ROUND 22 (eighteenth cold read, F3 MAJOR, wrong-data): a
@@ -5319,10 +5424,10 @@ def parse_web_xml(
             if not _is_blank_identity(decoded_class) else None)
         problems.append(JavaAdapterProblem(
             reason_code="unsupported_entry_point_shape",
-            detail=f"a <servlet> declared at line {_line_at(newline_offsets, block_match.start())} "
+            detail=bounded_detail(f"a <servlet> declared at line {_line_at(newline_offsets, block_match.start())} "
                    "carries <load-on-startup> but no <servlet-mapping> at all "
                    "(startup_only_servlet) - no entry point published, but not confidently "
-                   "absent either",
+                   "absent either"),
             qualified_name=qualified_name,
         ))
     filter_registry, filter_name_undecodable = _filter_class_by_name(sanitized, structural, text)
@@ -5341,10 +5446,10 @@ def parse_web_xml(
     for filter_name, candidate_labels in sorted(filter_registry.conflicts.items()):
         problems.append(JavaAdapterProblem(
             reason_code="duplicate_descriptor_name",
-            detail=f"<filter-name>{filter_name}</filter-name> has disagreeing backing "
+            detail=bounded_detail(f"<filter-name>{filter_name}</filter-name> has disagreeing backing "
                    f"declarations ({', '.join(candidate_labels)}) - no declaration is "
                    "authoritative by execution order, so its mapped route falls back to "
-                   "the synthetic per-mapping owner rather than picking one",
+                   "the synthetic per-mapping owner rather than picking one"),
             qualified_name=f"{relative_path}#{filter_name}",
         ))
         descriptor_name_conflicts.append((
@@ -5356,10 +5461,10 @@ def parse_web_xml(
     for filter_name, block_start in filter_registry.class_undecodable:
         problems.append(JavaAdapterProblem(
             reason_code="route_value_unrecoverable",
-            detail=f"a <filter-class> declared at line "
+            detail=bounded_detail(f"a <filter-class> declared at line "
                    f"{_line_at(newline_offsets, block_start)} contains XML constructs "
                    "this producer does not decode - its mapped route falls back to the "
-                   "synthetic per-mapping owner rather than the real class",
+                   "synthetic per-mapping owner rather than the real class"),
             qualified_name=f"{relative_path}#{filter_name}",
         ))
     # FIX ROUND 30 (twenty-sixth cold read, F1(1b) BLOCKER, wrong-data):
@@ -5369,10 +5474,10 @@ def parse_web_xml(
     for filter_name, block_start in sorted(filter_registry.no_backing.items()):
         problems.append(JavaAdapterProblem(
             reason_code="descriptor_name_without_class",
-            detail=f"a <filter> declared at line {_line_at(newline_offsets, block_start)} "
+            detail=bounded_detail(f"a <filter> declared at line {_line_at(newline_offsets, block_start)} "
                    f"names <filter-name>{filter_name}</filter-name> but declares no "
                    "<filter-class> - its mapped route falls back to the synthetic "
-                   "per-mapping owner, since no backing implementation is named at all",
+                   "per-mapping owner, since no backing implementation is named at all"),
             qualified_name=f"{relative_path}#{filter_name}",
         ))
     # FIX ROUND 25 (micro-round 25b, item 1, R3 BLOCK-SIDE GAP): the
@@ -5380,11 +5485,11 @@ def parse_web_xml(
     for block_start in filter_name_undecodable:
         problems.append(JavaAdapterProblem(
             reason_code="route_value_unrecoverable",
-            detail=f"a <filter> declared at line "
+            detail=bounded_detail(f"a <filter> declared at line "
                    f"{_line_at(newline_offsets, block_start)} names a <filter-name> "
                    "containing XML constructs this producer does not decode - any "
                    "mapping targeting it falls back to the synthetic per-mapping owner "
-                   "rather than the real class",
+                   "rather than the real class"),
         ))
     undeclared_filter_names: set[str] = set()
     for block_match in _FILTER_MAPPING_BLOCK_RE.finditer(structural):
@@ -5412,12 +5517,12 @@ def parse_web_xml(
         if _is_blank_identity(decoded_name):
             problems.append(JavaAdapterProblem(
                 reason_code="route_value_unrecoverable",
-                detail=f"a <filter-mapping> declared at line "
+                detail=bounded_detail(f"a <filter-mapping> declared at line "
                        f"{_line_at(newline_offsets, block_match.start())} names a "
                        "<filter-name> this producer cannot resolve to a real value "
                        "(undecodable XML constructs, or a comment-only/empty element) - "
                        "the whole mapping is suppressed rather than published with a "
-                       "guessed or empty name",
+                       "guessed or empty name"),
             ))
             continue
         filter_name = decoded_name.strip()
@@ -5474,7 +5579,7 @@ def parse_web_xml(
                 )
             problems.append(JavaAdapterProblem(
                 reason_code="unsupported_entry_point_shape",
-                detail=detail,
+                detail=bounded_detail(detail),
                 qualified_name=owner_qualified_name,
             ))
         if not url_pattern_matches:
@@ -5491,16 +5596,17 @@ def parse_web_xml(
             if decoded is None:
                 problems.append(JavaAdapterProblem(
                     reason_code="route_value_unrecoverable",
-                    detail=f"a <url-pattern> declared at line "
+                    detail=bounded_detail(f"a <url-pattern> declared at line "
                            f"{_line_at(newline_offsets, absolute_offset)} contains XML "
                            "constructs this producer does not decode (an undefined or "
                            "DOCTYPE-declared custom entity reference this producer "
                            "does not resolve, or CDATA mixed with other content) - "
-                           "suppressed rather than published with a guessed value",
+                           "suppressed rather than published with a guessed value"),
                     qualified_name=owner_qualified_name,
                 ))
                 continue
-            url_pattern = _bounded_route_target(decoded.strip())
+            url_pattern_raw = decoded.strip()
+            url_pattern = _bounded_route_target(url_pattern_raw)
             # FIX ROUND 27 (F4, mechanism confirmed): the filter twin of
             # the servlet-mapping loop's own paired-edge fix above - the
             # annotation-based @WebFilter path already emits this same
@@ -5526,21 +5632,23 @@ def parse_web_xml(
                 target=url_pattern, target_kind="external_filter",
                 evidence_class="declared",
                 line=_line_at(newline_offsets, absolute_offset), phase="runtime",
+                identity_target=url_pattern_raw,
             ))
             entry_points.append(JavaEntryPointClaim(
                 qualified_name=owner_qualified_name, kind="http_filter",
                 name=url_pattern, line=_line_at(newline_offsets, absolute_offset),
                 evidence_class="declared",
+                identity_name=url_pattern_raw,
             ))
     # FIX ROUND 29 (F9c JUDGE): the filter twin of the servlet ghost-name
     # emission above.
     for filter_name in sorted(undeclared_filter_names):
         problems.append(JavaAdapterProblem(
             reason_code="undeclared_descriptor_name",
-            detail=f"<filter-mapping> names <filter-name>{filter_name}</filter-name>, "
+            detail=bounded_detail(f"<filter-mapping> names <filter-name>{filter_name}</filter-name>, "
                    "which no <filter> element in this file declares at all - its mapped "
                    "route falls back to the synthetic per-mapping owner rather than a "
-                   "real class",
+                   "real class"),
             qualified_name=f"{relative_path}#{filter_name}",
         ))
     for block_match in _LISTENER_BLOCK_RE.finditer(structural):
@@ -5566,10 +5674,10 @@ def parse_web_xml(
             if not _is_blank_identity(decoded_class) else None)
         problems.append(JavaAdapterProblem(
             reason_code="unsupported_entry_point_shape",
-            detail=f"a <listener> declared at line {_line_at(newline_offsets, block_match.start())} "
+            detail=bounded_detail(f"a <listener> declared at line {_line_at(newline_offsets, block_match.start())} "
                    "names a recognized entry-point mechanism (web_xml_listener) this adapter "
                    "does not model - no entry point published, but not confidently absent "
-                   "either",
+                   "either"),
             qualified_name=qualified_name,
         ))
     return entry_points, problems, edges, descriptor_name_conflicts

@@ -278,7 +278,8 @@ def build_features(
             # nonetheless share kind/owning_unit_id/name (see digests.
             # entry_point_id's own docstring).
             entry_point_id = digests.entry_point_id(
-                kind=claim.kind, owning_unit_id=owning_unit_id, name=claim.name,
+                kind=claim.kind, owning_unit_id=owning_unit_id,
+                name=claim.identity_name or claim.name,
                 qualified_name=claim.qualified_name,
             )
             producer = _producer(file_digests.get(path), basis=claim.evidence_class)

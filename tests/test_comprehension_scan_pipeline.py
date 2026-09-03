@@ -2976,6 +2976,147 @@ def test_run_scan_two_out_of_scan_classes_sharing_a_simple_name_completes_not_re
     assert validate_result["valid"] is True
 
 
+def test_run_scan_two_url_patterns_truncating_to_the_same_display_string_get_distinct_ids(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 40 (thirty-fourth cold read, Part A F1+F2 BLOCKER,
+    .cr34-trunc / .cr34-collide, wrong-data): `_bounded_route_target`
+    (sanitize + truncate to 200 chars) used to be applied at LEAF
+    EXTRACTION time, before the truncated value was fed into
+    `digests.entry_point_id`/`digests.edge_id` as the route's own
+    identity - so two GENUINELY DIFFERENT declared url-patterns that
+    merely share a >200-char prefix truncated to the IDENTICAL bounded
+    string, and collided on both ids even though nothing about the
+    real, undisplayed data was actually the same. Both mappings share
+    one servlet-class (isolating the bug to the route value itself,
+    not the owner/qualified_name entry_point_id's round-38 fix already
+    keeps apart). Fixed by threading the RAW, pre-bounding value
+    alongside the bounded display value all the way to
+    `JavaEntryPointClaim.identity_name`/`JavaEdgeClaim.identity_target`,
+    consumed at each id's own call site in preference to the (lossy)
+    display value - the published `name`/`target_external` fields keep
+    using the unchanged, safe, bounded value."""
+    import json
+
+    prefix = "/" + "x" * 199
+    pattern_a = prefix + "A" * 60
+    pattern_b = prefix + "B" * 60
+    assert pattern_a != pattern_b
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name>a</servlet-name>\n"
+        "    <servlet-class>com.acme.web.SharedServlet</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>a</servlet-name>\n"
+        f"    <url-pattern>{pattern_a}</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>a</servlet-name>\n"
+        f"    <url-pattern>{pattern_b}</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+
+    features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
+    entry_points = [ep for ep in features_doc["entry_points"] if ep["kind"] == "http_route"]
+    assert len(entry_points) == 2
+    # Both publish the SAME (truncated) display name - the display
+    # projection is unaffected by this fix.
+    assert len({ep["name"] for ep in entry_points}) == 1
+    assert len({ep["entry_point_id"] for ep in entry_points}) == 2, (
+        "two genuinely different url-patterns must not collide on "
+        "entry_point_id merely because they truncate identically"
+    )
+
+    dependencies_doc = json.loads(
+        (outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    route_edges = [e for e in dependencies_doc["edges"] if e["relation"] == "route"]
+    assert len(route_edges) == 2
+    assert len({e["target_external"] for e in route_edges}) == 1
+    assert len({e["edge_id"] for e in route_edges}) == 2, (
+        "two genuinely different url-patterns must not collide on "
+        "edge_id merely because they truncate identically"
+    )
+
+    validate_result = scan_pipeline.validate_run(java_repo, run_id=outcome.scan_id)
+    assert validate_result["valid"] is True
+
+
+def test_run_scan_a_real_invisible_character_and_its_own_escaped_spelling_get_distinct_ids(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 40 (thirty-fourth cold read, Part A F1+F2 BLOCKER,
+    .cr34-dupname / .cr34-enc, wrong-data): the SAME lossy-projection
+    bug as the truncation case above, reached through the escaping
+    half of `_bounded_route_target` instead of the length half - a
+    route containing a REAL ZERO WIDTH SPACE (U+200B) escapes to the
+    six-character literal text ``\\u200b`` for display, and a DIFFERENT
+    route that spells that same six-character text out LITERALLY
+    (never containing the real character at all) passes through
+    unescaped - both bounded display strings come out byte-identical,
+    even though the real, undisplayed url-patterns were never the
+    same. Same fix, same mechanism as the truncation test above."""
+    import json
+
+    real_zwsp = chr(0x200B)
+    pattern_a = "/shared/" + real_zwsp
+    pattern_b = "/shared/" + "\\u200b"
+    assert pattern_a != pattern_b
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name>a</servlet-name>\n"
+        "    <servlet-class>com.acme.web.SharedServlet</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>a</servlet-name>\n"
+        f"    <url-pattern>{pattern_a}</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>a</servlet-name>\n"
+        f"    <url-pattern>{pattern_b}</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+
+    features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
+    entry_points = [ep for ep in features_doc["entry_points"] if ep["kind"] == "http_route"]
+    assert len(entry_points) == 2
+    assert len({ep["name"] for ep in entry_points}) == 1, (
+        "the real ZWSP and its own escaped spelling must still display identically"
+    )
+    assert len({ep["entry_point_id"] for ep in entry_points}) == 2, (
+        "a real invisible character and its own escaped literal spelling "
+        "must not collide on entry_point_id merely because they display "
+        "identically"
+    )
+
+    dependencies_doc = json.loads(
+        (outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    route_edges = [e for e in dependencies_doc["edges"] if e["relation"] == "route"]
+    assert len(route_edges) == 2
+    assert len({e["target_external"] for e in route_edges}) == 1
+    assert len({e["edge_id"] for e in route_edges}) == 2, (
+        "a real invisible character and its own escaped literal spelling "
+        "must not collide on edge_id merely because they display identically"
+    )
+
+    validate_result = scan_pipeline.validate_run(java_repo, run_id=outcome.scan_id)
+    assert validate_result["valid"] is True
+
+
 def test_run_scan_a_secrets_xml_collision_stays_complete_not_degraded(java_repo: Path) -> None:
     """FIX ROUND 39 (thirty-third cold read, F2 MAJOR, .cr33-secxml,
     wrong-data - THE SELF-CONTRADICTION): round 38's own F4 fix

@@ -1036,7 +1036,8 @@ def _edge_claim_to_record(
         # same synthetic file owner - see digests.edge_id's own
         # docstring.
         edge_id=digests.edge_id(
-            from_unit_id=from_unit_id, relation=edge.relation, target=edge.target,
+            from_unit_id=from_unit_id, relation=edge.relation,
+            target=edge.identity_target or edge.target,
             phase=edge.phase, from_qualified_name=edge.from_qualified_name,
         ),
         from_unit_id=from_unit_id,
