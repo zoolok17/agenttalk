@@ -549,7 +549,7 @@ def test_a_dependency_free_multi_route_controller_publishes_zero_external_end_to
     pkg_dir = java_repo / "src" / "main" / "java" / "p"
     routes = "\n".join(f'  @GetMapping("/wide/{i}")\n  public void h{i}() {{}}' for i in range(7))
     (pkg_dir / "WideController.java").write_text(
-        f"package p;\npublic class WideController {{\n{routes}\n}}\n", encoding="utf-8")
+        f"package p;\n@RestController\npublic class WideController {{\n{routes}\n}}\n", encoding="utf-8")
     (pkg_dir / "UsesExternal.java").write_text(
         "package p;\nimport java.util.List;\nclass UsesExternal {\n"
         "  List<String> items;\n"
@@ -933,6 +933,7 @@ def test_run_scan_a_mapped_route_alongside_an_unrecognized_main_reports_unknown(
     (java_repo / "src" / "main" / "java" / "p" / "OrderController.java").write_text(
         "package p;\n"
         "\n"
+        "@RestController\n"
         "public class OrderController {\n"
         "  @GetMapping(\"/orders\")\n"
         "  public void list() {}\n"

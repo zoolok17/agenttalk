@@ -236,6 +236,21 @@ UNSUPPORTED_ENTRY_POINT_SHAPES = (
     "web_xml_listener", "servlet_name_scoped_filter", "startup_only_servlet",
     "jsp_file_servlet", "jax_rs_sub_resource_locator",
     "jax_rs_method_path_without_root_resource",
+    # FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER - THE
+    # REGISTRABILITY MATRIX): round 43's own N3 established the
+    # principle for JAX-RS alone ("not reachable through this class
+    # alone" => suppress + enrolled shape) without enumerating the
+    # SIBLING shapes the same principle governs for Spring and
+    # @WebServlet/@WebFilter - see _class_registrability's own
+    # docstring for the full matrix and the epistemic argument per
+    # cell. Two shapes, not one per sub-case, since Spring's own claim
+    # ("not through THIS class alone; an implementer/subclass MAY
+    # serve it") is a genuinely weaker, different claim than
+    # @WebServlet/@WebFilter's own ("a container never instantiates
+    # this class at all") - collapsing them into one name would blur
+    # that real epistemic difference.
+    "spring_route_on_unregistered_class",
+    "webservlet_on_uninstantiable_class",
 )
 
 #: FIX ROUND 21c (reviewer-3's re-delta, THE ASK - second instance, closing
@@ -567,6 +582,27 @@ _ROUTE_ANNOTATIONS = (
     # handled by its own dedicated pass, not this tuple.
     "Path",
 )
+#: FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER): the closed set of
+#: Spring stereotype annotations this producer recognizes as PROOF a
+#: class is registered as a bean by ITSELF (never via a separate XML
+#: `<bean>` declaration this single-file producer cannot see) -
+#: `@Controller`/`@RestController` are Spring MVC's own two, widened to
+#: the other three meta-annotated-with-`@Component` stereotypes
+#: (`@Component`/`@Service`/`@Repository`) since any of the five is
+#: sufficient for Spring's own component-scan to register the class,
+#: and a `@RequestMapping` on a `@Service`/`@Repository`-annotated class
+#: is unusual but not invalid Java. See :func:`_class_registrability`'s
+#: own docstring for how the absence of any of these five is judged.
+_SPRING_STEREOTYPE_ANNOTATIONS = ("Controller", "RestController", "Component", "Service", "Repository")
+_SPRING_STEREOTYPE_ANNOTATION_RE = re.compile(
+    r"@(?:[A-Za-z_$][\w$]*\.)*(" + "|".join(_SPRING_STEREOTYPE_ANNOTATIONS) + r")\b"
+)
+#: The `abstract` modifier, recognized anywhere in a type's own
+#: backward-anchored declaration-trivia span (modifiers + annotations
+#: between the preceding declaration and this type's own keyword) - a
+#: reserved word, never itself an identifier, so this can never
+#: misfire on an unrelated annotation/name.
+_ABSTRACT_MODIFIER_RE = re.compile(r"\babstract\b")
 #: Fix round 11 (seventh cold read BLOCKER, part 1 - de-enumerate
 #: RECOGNITION): a FULLY-QUALIFIED route annotation
 #: (``@org.springframework.web.bind.annotation.RequestMapping(...)``) was
@@ -2272,6 +2308,83 @@ def _class_header_associations(
     ]
 
 
+def _class_registrability(
+    sanitized: str, declaration_start: int, header_start: int,
+) -> tuple[bool, bool, bool]:
+    """``(is_interface, is_abstract, has_stereotype)`` for ONE declared
+    type, anchored the same way :func:`_class_level_route_target`
+    already is.
+
+    FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER - THE
+    REGISTRABILITY MATRIX): a class-level route annotation's own
+    publication decision needs to know whether the class it decorates
+    can ever actually be the thing a container/framework instantiates
+    and dispatches a request to - not just whether the annotation
+    itself parses. Round 43's own N3 established exactly this
+    principle for JAX-RS ("not reachable through this class alone" =>
+    suppress + enrolled shape) but never enumerated the SIBLING shapes
+    the same principle governs for Spring and the servlet/filter
+    annotations - this function is the one shared fact-gatherer every
+    one of those call sites now consults, so the matrix has ONE place
+    to extend instead of five separately-reasoned checks:
+
+    - ``is_interface``: a REAL interface, never an annotation-type
+      declaration (``@interface`` - :func:`_extract_types`'s own
+      round-10c note backs THAT header's own ``header_start`` up to
+      include its leading ``@``, which is exactly what distinguishes
+      the two here without re-deriving the keyword a second time).
+    - ``is_abstract``: the ``abstract`` modifier anywhere in this
+      type's own backward-anchored declaration-trivia span
+      (``[declaration_start, header_start)``) - the IDENTICAL span
+      :func:`_class_level_route_target` already searches for a route
+      annotation, since a modifier and an annotation live in the exact
+      same trivia.
+    - ``has_stereotype``: one of the five closed Spring stereotype
+      annotations (``_SPRING_STEREOTYPE_ANNOTATIONS``) found in that
+      same span - proof, FROM THIS FILE ALONE, that Spring's own
+      component scan registers this class as a bean. Its ABSENCE is
+      NOT proof of absence (a separate XML ``<bean>`` declaration this
+      single-file producer cannot see could still register it) -
+      every caller must read a missing stereotype as "not provably a
+      bean from this file," never as "never a bean."
+    """
+    is_interface = False
+    if sanitized[header_start:header_start + 1] != "@":
+        keyword_match = _TYPE_NAME_ANCHOR_RE.match(sanitized, header_start)
+        is_interface = keyword_match is not None and keyword_match.group(1) == "interface"
+    trivia = sanitized[declaration_start:header_start]
+    is_abstract = _ABSTRACT_MODIFIER_RE.search(trivia) is not None
+    has_stereotype = _SPRING_STEREOTYPE_ANNOTATION_RE.search(trivia) is not None
+    return is_interface, is_abstract, has_stereotype
+
+
+def _uninstantiable_class_problem(
+    target_type: str, is_interface: bool, is_abstract: bool, line: int, annotation_label: str,
+) -> JavaAdapterProblem | None:
+    """FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER): @WebServlet
+    and @WebFilter share this exact shape - a servlet container only
+    ever instantiates a CONCRETE class, and neither annotation is
+    inherited by a subclass (Servlet spec) - unlike Spring's own
+    merged-annotation lookup (which DOES search interfaces/superclasses
+    for a route mapping), an interface or abstract class decorated with
+    either of these two annotations can PROVABLY never be registered.
+    A stronger "never served" claim is correct here - a materially
+    different epistemic than the Spring family's own weaker "not
+    through this class alone" wording, which is why this is a
+    separate enrolled shape rather than one shared with Spring's own."""
+    if not (is_interface or is_abstract):
+        return None
+    shape = "an INTERFACE" if is_interface else "ABSTRACT"
+    return JavaAdapterProblem(
+        reason_code="unsupported_entry_point_shape",
+        detail=bounded_detail(
+            f"a {annotation_label} annotation at line {line} is {shape} "
+            "(webservlet_on_uninstantiable_class) - never served, only concrete classes "
+            "are instantiated"),
+        qualified_name=target_type,
+    )
+
+
 def _class_level_route_target(
     ann_start: int, associations: list[tuple[int, int, str]],
 ) -> str | None:
@@ -2626,6 +2739,15 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     # see this producer's own capability description and the design
     # doc's own Artifact-2 section for the same limit stated there.
     class_header_associations = _class_header_associations(sanitized, types)
+    # FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER): computed ONCE,
+    # alongside class_header_associations (the same declaration_start/
+    # header_start pairs this reuses) - every route-family publish site
+    # below consults this ONE dict rather than re-deriving a class's own
+    # shape per call site.
+    class_registrability = {
+        qualified: _class_registrability(sanitized, declaration_start, header_start)
+        for declaration_start, header_start, qualified in class_header_associations
+    }
     class_route_prefix: dict[str, list[str]] = {}
     # Fix round 11 (seventh cold read BLOCKER part 2 - the fail-safe for
     # unrecoverable values): a class-level route annotation whose OWN
@@ -2827,6 +2949,46 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                 qualified_name=enclosing,
             ))
             continue
+        # FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER - THE
+        # REGISTRABILITY MATRIX): the Spring half of the matrix
+        # _class_registrability's own docstring names. Checked for
+        # EVERY Spring-family route (both the class-prefix and the
+        # standalone-method shapes below publish for `enclosing`) -
+        # never for JAX-RS (`match.group(1) == "Path"`), which already
+        # has its own N3 check above with its own, different epistemics
+        # (JAX-RS's annotation-inheritance rule, JSR-370 s3.6, is not
+        # this producer's concern here - not attempted this round, see
+        # "Named decisions and residuals").
+        if match.group(1) != "Path":
+            is_interface, is_abstract, has_stereotype = class_registrability.get(
+                enclosing, (False, False, False))
+            unregistered_reason = None
+            if is_interface:
+                # Spring's own merged-annotation lookup DOES search
+                # interfaces (an implementing, registered bean inherits
+                # the mapping) - a materially WEAKER claim than "never
+                # served", the same epistemic line 43-N3 already drew
+                # for JAX-RS's own annotation-inheritance rule.
+                unregistered_reason = "this class is an INTERFACE"
+            elif is_abstract:
+                # Never a bean instance itself, but a concrete subclass
+                # inherits the mapping - same "not through this class
+                # alone" epistemics as the interface case.
+                unregistered_reason = "this class is ABSTRACT"
+            elif not has_stereotype:
+                # Unknowable from this file alone (see
+                # _class_registrability's own docstring) - a separate
+                # XML <bean> declaration could still register it.
+                unregistered_reason = "no Spring stereotype found on this class"
+            if unregistered_reason is not None:
+                problems.append(JavaAdapterProblem(
+                    reason_code="unsupported_entry_point_shape",
+                    detail=bounded_detail(f"a Spring route at line {line} is not served through "
+                           f"this class alone - {unregistered_reason} "
+                           "(spring_route_on_unregistered_class)"),
+                    qualified_name=enclosing,
+                ))
+                continue
         if prefixes:
             if paths:
                 composed = [_compose_route_path(prefix, p) for prefix in prefixes for p in paths]
@@ -2973,6 +3135,16 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                        "suppressed rather than published as a route"),
             ))
             continue
+        # FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER - THE
+        # REGISTRABILITY MATRIX): see _uninstantiable_class_problem's
+        # own docstring - shared with @WebFilter below.
+        is_interface, is_abstract, _has_stereotype = class_registrability.get(
+            target_type, (False, False, False))
+        uninstantiable_problem = _uninstantiable_class_problem(
+            target_type, is_interface, is_abstract, line, "@WebServlet")
+        if uninstantiable_problem is not None:
+            problems.append(uninstantiable_problem)
+            continue
         _span_end, paths, _explicit_methods = _route_annotation_span(match)
         if paths is None:
             problems.append(JavaAdapterProblem(
@@ -3056,6 +3228,16 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                        "could not be confidently associated with any declared type - "
                        "suppressed rather than published as a route"),
             ))
+            continue
+        # FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER): see
+        # _uninstantiable_class_problem's own docstring - shared with
+        # @WebServlet above.
+        is_interface, is_abstract, _has_stereotype = class_registrability.get(
+            target_type, (False, False, False))
+        uninstantiable_problem = _uninstantiable_class_problem(
+            target_type, is_interface, is_abstract, line, "@WebFilter")
+        if uninstantiable_problem is not None:
+            problems.append(uninstantiable_problem)
             continue
         _span_end, paths, _explicit_methods = _route_annotation_span(match)
         if paths is None:

@@ -369,6 +369,7 @@ def test_class_level_request_mapping_composes_on_a_bounded_generic_controller():
 package p;
 
 @RequestMapping("/api/base")
+@RestController
 public class Controller<T extends Comparable<T>> {
     @GetMapping("/list")
     void list() {}
@@ -760,8 +761,10 @@ class Foo {
 def test_route_edge_and_entry_point_are_attributed_to_the_enclosing_type():
     src = """
 package p;
+@RestController
 class Other {
 }
+@RestController
 class Controller {
     @RequestMapping("/api/widgets")
     void list() {}
@@ -779,6 +782,7 @@ class Controller {
 def test_request_mapping_with_literal_path_produces_a_declared_route():
     src = """
 package p;
+@RestController
 class Controller {
     @RequestMapping("/api/widgets")
     void list() {}
@@ -798,6 +802,7 @@ class Controller {
 def test_get_mapping_value_attribute_is_recovered():
     src = """
 package p;
+@RestController
 class Controller {
     @GetMapping(value = "/api/widgets/{id}")
     void get() {}
@@ -818,6 +823,7 @@ def test_get_and_post_on_the_same_path_produce_distinct_route_targets():
     the SAME entry_point_id for two genuinely distinct entry points."""
     src = """
 package p;
+@RestController
 class Controller {
     @GetMapping("/orders")
     void list() {}
@@ -840,6 +846,7 @@ def test_request_mapping_finds_value_even_when_a_different_attribute_comes_first
     absent entirely."""
     src = """
 package p;
+@RestController
 class Controller {
     @RequestMapping(produces = "application/json", value = "/orders")
     void list() {}
@@ -862,6 +869,7 @@ def test_route_value_after_a_nested_call_argument_is_not_truncated_away():
     ("p.Controller#RequestMapping"), with "/api/widgets" entirely lost."""
     src = """
 package p;
+@RestController
 class Controller {
     @RequestMapping(produces = someHelper(x, y), value = "/api/widgets")
     void list() {}
@@ -882,6 +890,7 @@ def test_route_value_ignores_a_commented_out_line_before_the_live_one():
     "/v1/legacy-removed" (the commented-out value), never "/v2/orders"."""
     src = """
 package p;
+@RestController
 class Controller {
     @RequestMapping(
         // value = "/v1/legacy-removed"
@@ -901,6 +910,7 @@ def test_route_value_ignores_a_block_comment_before_the_live_attribute():
     case, via a block comment wedged directly in the argument list."""
     src = """
 package p;
+@RestController
 class Controller {
     @GetMapping(/* value = "/OLD" */ value = "/NEW")
     void list() {}
@@ -928,6 +938,7 @@ def test_route_value_with_an_escaped_quote_is_not_truncated():
     from a malformed/raw one) against the properly UNESCAPED value."""
     src = r"""
 package p;
+@RestController
 class Controller {
     @RequestMapping(value = "/api/\"quoted\"/thing")
     void list() {}
@@ -955,6 +966,7 @@ def test_route_value_as_a_text_block_is_recovered():
     malformed one that merely happens to contain it)."""
     src = '''
 package p;
+@RestController
 class Controller {
     @RequestMapping(value = """
         /api/textblock""")
@@ -978,6 +990,7 @@ def test_route_value_as_a_text_block_dedents_using_the_closing_delimiters_own_in
     2-space difference, not be fully dedented to zero."""
     src = '''
 package p;
+@RestController
 class Controller {
     @RequestMapping(value = """
         line1
@@ -1012,6 +1025,7 @@ def test_route_value_with_a_bidi_override_or_line_separator_is_stored_raw():
     line_separator = chr(0x2028)
     src = (
         "package p;\n"
+        "@RestController\n"
         "class Controller {\n"
         f'  @GetMapping("/api{rtl_override}evil{line_separator}end")\n'
         "  void list() {}\n"
@@ -1030,6 +1044,7 @@ def test_route_value_with_an_arabic_letter_mark_is_stored_raw():
     alm = chr(0x061C)
     src = (
         "package p;\n"
+        "@RestController\n"
         "class Controller {\n"
         f'  @GetMapping("/api{alm}end")\n'
         "  void list() {}\n"
@@ -1049,6 +1064,7 @@ def test_route_value_with_a_c1_control_character_nel_is_stored_raw():
     nel = chr(0x0085)
     src = (
         "package p;\n"
+        "@RestController\n"
         "class Controller {\n"
         f'  @GetMapping("/api{nel}end")\n'
         "  void list() {}\n"
@@ -1076,6 +1092,7 @@ def test_route_value_with_invisible_format_characters_is_stored_raw():
     zwnbsp = chr(0xFEFF)
     src = (
         "package p;\n"
+        "@RestController\n"
         "class Controller {\n"
         f'  @GetMapping("/api{zwsp}{shy}mid{word_joiner}dle{zwnbsp}end")\n'
         "  void list() {}\n"
@@ -1173,6 +1190,7 @@ def test_standalone_method_route_without_a_leading_slash_is_normalized_like_a_co
     path depending on something the route itself has no say over."""
     src = """
 package p;
+@RestController
 class Controller {
     @GetMapping("list")
     void list() {}
@@ -1187,6 +1205,7 @@ class Controller {
 def test_request_mapping_path_attribute_is_recovered_ahead_of_an_unrelated_literal():
     src = """
 package p;
+@RestController
 class Controller {
     @RequestMapping(method = "GET", path = "/orders")
     void list() {}
@@ -1208,6 +1227,7 @@ def test_two_request_mappings_on_one_path_distinguished_by_method_attribute_do_n
     two different handlers."""
     src = """
 package p;
+@RestController
 class Controller {
     @RequestMapping(value = "/orders", method = RequestMethod.GET)
     void list() {}
@@ -1233,6 +1253,7 @@ def test_route_value_recovery_continues_past_a_non_literal_named_attribute_match
     continue searching past the non-literal match instead."""
     src = """
 package p;
+@RestController
 class Controller {
     @RequestMapping(path = someExpr(), value = "/orders")
     void list() {}
@@ -1262,6 +1283,7 @@ def test_route_target_is_recovered_verbatim_regardless_of_size():
     oversized = "/" + ("x" * (_MAX_ROUTE_TARGET_LENGTH + 50))
     src = f"""
 package p;
+@RestController
 class Controller {{
     @RequestMapping("{oversized}")
     void list() {{}}
@@ -1290,6 +1312,7 @@ def test_a_route_annotation_with_an_embedded_newline_publishes_the_raw_control_c
     escapes it only when actually publishing a display field."""
     src = '''
 package p;
+@RestController
 class Controller {
     @RequestMapping("""
 /orders
@@ -1307,6 +1330,7 @@ class Controller {
 def test_bare_request_mapping_with_no_path_still_produces_a_named_route():
     src = """
 package p;
+@RestController
 class Controller {
     @RequestMapping
     void handle() {}
@@ -1341,6 +1365,7 @@ def test_class_level_request_mapping_composes_with_a_method_level_route():
 package p;
 
 @RequestMapping("/api/orders")
+@RestController
 public class Controller {
     @GetMapping("/list")
     void list() {}
@@ -1355,12 +1380,22 @@ public class Controller {
     assert http_entry_points[0].name == "GET /api/orders/list"
 
 
-def test_class_level_request_mapping_composes_on_a_modified_interface():
+def test_class_level_request_mapping_on_an_interface_is_not_served_through_it_alone():
     """M5 (fifth cold read, fix round 7): the type header regex matches
     ``class``, ``interface``, or ``enum`` alike, and Spring's own
-    declared composition semantics apply the same way to an interface
-    carrying a class-level mapping - the dispatch's explicit second
-    fixture shape ("plus an interface case")."""
+    declared composition semantics compute the SAME composed path for
+    an interface carrying a class-level mapping.
+
+    CORRECTED (round 44, thirty-eighth cold read, F1 BLOCKER - THE
+    REGISTRABILITY MATRIX): this test used to assert the composed
+    value published as a REAL, served route - wrong. An interface is
+    never itself the thing Spring instantiates as a bean; the mapping
+    is only genuinely served through an implementing, registered
+    bean (Spring's own merged-annotation lookup does search
+    interfaces) - a materially weaker claim than "this class serves
+    this route." No route is published; the enrolled shape
+    (spring_route_on_unregistered_class) records why, exactly like
+    JAX-RS's own round-43 N3 sibling."""
     src = """
 package p;
 
@@ -1371,9 +1406,217 @@ public interface Controller {
 }
 """
     result = java.parse_java_source("Controller.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.Controller"
+    assert "spring_route_on_unregistered_class" in problem.detail
+    assert "INTERFACE" in problem.detail
+
+
+def test_class_level_request_mapping_on_an_abstract_class_is_not_served_through_it_alone():
+    """FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER, .cr38-
+    stereotype - THE REGISTRABILITY MATRIX): an ABSTRACT class is never
+    itself instantiated as a Spring bean - only a CONCRETE subclass can
+    be - so a class-level @RequestMapping on one is not served through
+    it alone either, the same weaker claim as the interface sibling
+    above (a concrete subclass MAY inherit the mapping, unlike
+    @WebServlet's own provably-stronger "never" claim below)."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+@RestController
+public abstract class Controller {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.Controller"
+    assert "spring_route_on_unregistered_class" in problem.detail
+    assert "ABSTRACT" in problem.detail
+
+
+def test_class_level_request_mapping_with_no_stereotype_found_in_file_is_not_served():
+    """FIX ROUND 44 (F1 BLOCKER, .cr38-stereotype): a CONCRETE class
+    with a class-level @RequestMapping but no recognized Spring
+    stereotype (@Controller/@RestController/@Component/@Service/
+    @Repository) ANYWHERE in this file is not provably a registered
+    bean - a separate XML <bean> declaration this single-file producer
+    cannot see could still register it, so the disposition is "not
+    provably a bean from this file," never "never a bean" (see
+    _class_registrability's own docstring)."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+public class Controller {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.Controller"
+    assert "spring_route_on_unregistered_class" in problem.detail
+    assert "no Spring stereotype" in problem.detail
+
+
+def test_class_level_request_mapping_with_a_stereotype_on_a_concrete_class_still_publishes():
+    """FIX ROUND 44 (F1 BLOCKER, .cr38-stereotype control): the ONE
+    genuinely serveable cell of the registrability matrix - a CONCRETE
+    class carrying a recognized Spring stereotype annotation - must
+    keep publishing exactly as before; round 44's own new gate must
+    never suppress the case it was designed to leave alone."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+@RestController
+public class Controller {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
     routes = _edges(result, "route")
     assert len(routes) == 1
     assert routes[0].target == "GET /api/orders/list"
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+
+
+def test_a_concrete_subclass_of_an_abstract_mapped_controller_publishes_nothing_of_its_own():
+    """FIX ROUND 44 (F1 BLOCKER, concrete-subclass-of-abstract control):
+    this single-file, syntactic-only producer has no inheritance
+    resolution - a concrete subclass of an abstract, mapped controller
+    is never linked back to the abstract class's own annotation (the
+    abstract class's own route stays suppressed, unchanged; the
+    subclass, having no route annotation of its own, publishes
+    nothing) - never a fabricated inference that the subclass serves
+    the parent's route."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+@RestController
+public abstract class BaseController {
+    @GetMapping("/list")
+    void list() {}
+}
+
+public class OrderController extends BaseController {
+}
+"""
+    result = java.parse_java_source("OrderController.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.BaseController"
+    assert "ABSTRACT" in problem.detail
+
+
+def test_web_servlet_on_an_abstract_class_is_never_served():
+    """FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER, .cr38-servlet
+    - THE REGISTRABILITY MATRIX): a servlet container only ever
+    instantiates a CONCRETE class, and @WebServlet is not inherited by
+    a subclass (Servlet spec) - unlike Spring's own merged-annotation
+    lookup, this is a PROVABLY stronger "never served" claim, not the
+    weaker "not through this class alone" wording the Spring family
+    gets."""
+    src = """
+package p;
+
+@WebServlet("/api")
+public abstract class BaseServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("BaseServlet.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.BaseServlet"
+    assert "webservlet_on_uninstantiable_class" in problem.detail
+    assert "ABSTRACT" in problem.detail
+    assert "never served" in problem.detail
+
+
+def test_web_servlet_on_an_interface_is_never_served():
+    """FIX ROUND 44 (F1 BLOCKER, .cr38-servlet): the interface sibling
+    of the abstract-class case above - a servlet container never
+    instantiates an interface either."""
+    src = """
+package p;
+
+@WebServlet("/api")
+public interface ApiServlet {
+}
+"""
+    result = java.parse_java_source("ApiServlet.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.ApiServlet"
+    assert "webservlet_on_uninstantiable_class" in problem.detail
+    assert "an INTERFACE" in problem.detail
+
+
+def test_web_servlet_on_a_concrete_class_still_publishes():
+    """FIX ROUND 44 (F1 BLOCKER, .cr38-servlet control): the genuinely
+    serveable cell - a concrete @WebServlet class must keep publishing
+    exactly as before."""
+    src = """
+package p;
+
+@WebServlet("/api")
+public class ApiServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("ApiServlet.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "/api"
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+
+
+def test_web_filter_on_an_abstract_class_is_never_served():
+    """FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER - THE LESSON
+    APPLIED): @WebFilter shares @WebServlet's own shape exactly (an
+    existing code comment already says so) - round 44's own explicit
+    lesson is that a round establishing a registrability principle must
+    enumerate every sibling shape it governs, not just the one or two
+    fixtures a cold read happened to name. Fixed here in the SAME
+    round rather than leaving it for the next cold read to find."""
+    src = """
+package p;
+
+@WebFilter("/api/*")
+public abstract class BaseFilter implements Filter {
+}
+"""
+    result = java.parse_java_source("BaseFilter.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.BaseFilter"
+    assert "webservlet_on_uninstantiable_class" in problem.detail
+    assert "ABSTRACT" in problem.detail
+
+
+def test_web_filter_on_a_concrete_class_still_publishes():
+    """FIX ROUND 44 (F1 BLOCKER, @WebFilter control): the genuinely
+    serveable cell - a concrete @WebFilter class must keep publishing
+    exactly as before."""
+    src = """
+package p;
+
+@WebFilter("/api/*")
+public class ApiFilter implements Filter {
+}
+"""
+    result = java.parse_java_source("ApiFilter.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "/api/*"
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
 
 
 def test_method_level_route_with_no_class_level_mapping_is_unchanged():
@@ -1383,6 +1626,7 @@ def test_method_level_route_with_no_class_level_mapping_is_unchanged():
     genuinely exists."""
     src = """
 package p;
+@RestController
 class Controller {
     @GetMapping("/list")
     void list() {}
@@ -1406,6 +1650,7 @@ def test_class_level_request_mapping_with_a_valueless_method_annotation_uses_the
 package p;
 
 @RequestMapping("/api/orders")
+@RestController
 public class Controller {
     @GetMapping
     void list() {}
@@ -1426,6 +1671,7 @@ def test_class_level_request_mapping_prefix_without_a_leading_slash_still_compos
 package p;
 
 @RequestMapping("orders")
+@RestController
 public final class Controller {
     @GetMapping("list")
     void list() {}
@@ -1449,6 +1695,7 @@ package p;
 
 @RequestMapping("/api/orders")
 @ConditionalOnProperty(name = "x", havingValue = String.valueOf(true))
+@RestController
 public class Controller {
     @GetMapping("/list")
     void list() {}
@@ -1497,6 +1744,7 @@ package p;
 sealed interface Shape permits Controller {}
 
 @RequestMapping("/api/orders")
+@RestController
 public non-sealed class Controller implements Shape {
     @GetMapping("/list")
     void list() {}
@@ -1520,6 +1768,7 @@ def test_cannot_associate_route_annotation_is_suppressed_with_a_problem_not_publ
 package p;
 
 @RequestMapping("/api/orders");
+@RestController
 public class Controller {
     @GetMapping("/list")
     void list() {}
@@ -1721,6 +1970,7 @@ def test_route_value_multi_element_array_publishes_every_element():
     every other declared route."""
     src = """
 package p;
+@RestController
 class Controller {
     @GetMapping({"/list", "/all"})
     void list() {}
@@ -1741,6 +1991,7 @@ def test_multi_value_class_prefix_composes_every_prefix_element():
 package p;
 
 @RequestMapping({"/a", "/b"})
+@RestController
 public class Controller {
     @GetMapping("/list")
     void list() {}
@@ -1758,6 +2009,7 @@ def test_braced_multi_value_method_attribute_does_not_coalesce_two_handlers():
     it, silently re-coalescing two distinct handlers into one."""
     src = """
 package p;
+@RestController
 class Controller {
     @RequestMapping(value = "/thing", method = {RequestMethod.GET, RequestMethod.POST})
     void thing() {}
@@ -1785,6 +2037,7 @@ def test_fully_qualified_class_level_request_mapping_still_composes():
 package p;
 
 @org.springframework.web.bind.annotation.RequestMapping("/api/orders")
+@RestController
 public class Controller {
     @GetMapping("/list")
     void list() {}
@@ -1805,6 +2058,7 @@ def test_both_annotations_fully_qualified_still_composes():
 package p;
 
 @org.springframework.web.bind.annotation.RequestMapping("/api/orders")
+@RestController
 public class Controller {
     @org.springframework.web.bind.annotation.GetMapping("/list")
     void list() {}
@@ -1940,6 +2194,7 @@ def test_genuinely_valueless_method_annotation_still_composes_the_prefix_alone()
 package p;
 
 @RequestMapping("/api/orders")
+@RestController
 public class Controller {
     @GetMapping
     void list() {}
@@ -1958,6 +2213,7 @@ def test_static_imported_bare_method_constant_does_not_coalesce_two_handlers():
     sibling into one identical, method-less target."""
     src = """
 package p;
+@RestController
 class Controller {
     @RequestMapping(value = "/thing", method = GET)
     void getThing() {}
@@ -1977,6 +2233,7 @@ def test_fully_qualified_method_constant_does_not_coalesce_two_handlers():
     `method =`, which a package-qualified spelling never satisfies)."""
     src = """
 package p;
+@RestController
 class Controller {
     @RequestMapping(value = "/thing", method = org.springframework.web.bind.annotation.RequestMethod.GET)
     void getThing() {}
@@ -2002,6 +2259,7 @@ def test_non_enum_method_value_never_publishes_as_an_invented_http_verb():
     evidence)."""
     src = """
 package p;
+@RestController
 class Controller {
     @RequestMapping(value = "/api/orders", method = HttpConstants.READ_METHOD)
     void list() {}
@@ -2019,6 +2277,7 @@ def test_request_method_values_array_index_is_also_validated():
     single value."""
     src = """
 package p;
+@RestController
 class Controller {
     @RequestMapping(value = "/api/orders", method = RequestMethod.values()[0])
     void list() {}
@@ -2047,6 +2306,7 @@ def test_get_mapping_with_only_a_produces_attribute_still_composes_the_prefix():
 package p;
 
 @RequestMapping("/api/orders")
+@RestController
 public class Controller {
     @GetMapping(produces = "application/json")
     void list() {}
@@ -2065,6 +2325,7 @@ def test_post_mapping_with_consumes_and_produces_still_composes_the_prefix():
 package p;
 
 @RequestMapping("/api/orders")
+@RestController
 public class Controller {
     @PostMapping(consumes = "application/json", produces = "application/json")
     void create() {}
@@ -4116,6 +4377,7 @@ def test_a_spring_method_mapping_with_no_class_level_mapping_still_publishes_the
     src = """
 package p;
 
+@RestController
 public class OrderController {
     @GetMapping("/orders")
     public void list() {}
@@ -4417,19 +4679,33 @@ def test_a_route_annotation_on_an_abstract_interface_method_still_composes():
     """Companion control case for m1 - an interface's own abstract method
     (no body, just a bare parameter list then `;`) is still a genuine
     METHOD declaration and must stay published, unaffected by the field
-    check - the reader's own flagged "legitimately registered Spring"
-    shape."""
+    check.
+
+    CORRECTED (round 44, thirty-eighth cold read, F1 BLOCKER - THE
+    REGISTRABILITY MATRIX): re-based on JAX-RS instead of Spring - round
+    44's own registrability gate now suppresses any SPRING-family route
+    on an interface (see the class-level companion test above), and a
+    body-less interface method is inherently that exact shape, making
+    Spring unusable for exercising m1 at all going forward. JAX-RS is
+    untouched here - a class-level @Path already registers a root
+    resource, and JAX-RS's own interface/abstract disposition is a
+    declared, separate residual (see "Named decisions and residuals"),
+    not attempted this round - so a class-level @Path plus a body-less
+    interface method still proves m1's own "recognized as a method, not
+    a field" property, unaffected by round 44's own Spring-only gate."""
     src = """
 package p;
 
+@Path("/api")
 public interface OrderApi {
-    @GetMapping("/orders")
+    @GET
+    @Path("/orders")
     String list();
 }
 """
     result = java.parse_java_source("OrderApi.java", src)
     routes = _edges(result, "route")
-    assert [r.target for r in routes] == ["GET /orders"]
+    assert [r.target for r in routes] == ["GET /api/orders"]
 
 
 def test_web_method_annotation_is_the_named_class_closer_not_a_silent_negative():
@@ -5780,6 +6056,7 @@ def test_a_comment_in_any_realistic_position_around_a_route_literal_still_publis
     by where the comment sits."""
     src = f"""
 package p;
+@RestController
 class Controller {{
     {annotation}
     void list() {{}}
@@ -5798,6 +6075,7 @@ def test_cr35_real_a_trailing_legacy_comment_does_not_suppress_a_post_route():
     legacy comment inside the annotation's argument list."""
     src = """
 package p;
+@RestController
 class AdminController {
     @PostMapping(value = "/admin/users" /* legacy, pre-2019 endpoint */)
     void create() {}

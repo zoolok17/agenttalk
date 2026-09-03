@@ -326,7 +326,7 @@ def test_two_servlet_mappings_in_one_web_xml_produce_two_features_not_one():
 
 def test_two_routes_on_the_same_controller_group_into_one_feature():
     source = (
-        "package p;\nclass Controller {\n"
+        "package p;\n@RestController\nclass Controller {\n"
         '  @GetMapping("/api/widgets")\n  void list() {}\n'
         '  @PostMapping("/api/widgets")\n  void create() {}\n'
         "}\n"
@@ -347,7 +347,7 @@ def test_get_and_post_on_the_same_path_are_two_distinct_entry_points_not_a_dupli
     primary key published twice. Two methods on one route are two entry
     points to a migration reader, never collapsed into one."""
     source = (
-        "package p;\nclass Controller {\n"
+        "package p;\n@RestController\nclass Controller {\n"
         '  @GetMapping("/orders")\n  void list() {}\n'
         '  @PostMapping("/orders")\n  void create() {}\n'
         "}\n"
@@ -395,7 +395,7 @@ def test_entry_points_on_different_classes_produce_separate_features():
             "App.java", "package p;\nclass App {\n  public static void main(String[] a) {}\n}\n"),
         "Controller.java": _parse(
             "Controller.java",
-            'package p;\nclass Controller {\n  @GetMapping("/x")\n  void get() {}\n}\n',
+            'package p;\n@RestController\nclass Controller {\n  @GetMapping("/x")\n  void get() {}\n}\n',
         ),
     }
     entry_points, features = fa.build_features(results)
@@ -498,11 +498,11 @@ def test_a_real_newline_and_its_own_literal_backslash_n_spelling_publish_distinc
     ever produces, so it can never collide with a real control
     character's own escape."""
     real_newline_source = (
-        "package p;\nclass Amb {\n"
+        "package p;\n@RestController\nclass Amb {\n"
         '  @GetMapping("/orders\\n/more")\n  void list() {}\n}\n'
     )
     literal_backslash_n_source = (
-        "package p;\nclass Amb2 {\n"
+        "package p;\n@RestController\nclass Amb2 {\n"
         r'  @GetMapping("/orders\\n/more")' "\n  void list() {}\n}\n"
     )
     real_newline_result = _parse("Amb.java", real_newline_source)

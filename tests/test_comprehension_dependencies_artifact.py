@@ -1351,7 +1351,7 @@ def test_route_edge_resolves_as_external_with_declared_evidence():
     results = {
         "Controller.java": _parse(
             "Controller.java",
-            'package p;\nclass Controller {\n  @RequestMapping("/api/widgets")\n  void list() {}\n}\n',
+            'package p;\n@RestController\nclass Controller {\n  @RequestMapping("/api/widgets")\n  void list() {}\n}\n',
         ),
     }
     records = da.build_dependencies(results)
