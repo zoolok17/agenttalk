@@ -39,6 +39,9 @@ AGGREGATE_ARTIFACT_TYPE = "agenttalk-dev-gate-aggregate"
 PREFLIGHT_ARTIFACT_TYPE = "agenttalk-dev-gate-preflight-block"
 DEFAULT_MANIFEST = "dev-gate.json"
 DEFAULT_PROFILE = "release"
+DIAGNOSTIC_LIMIT = 2000
+_PYTEST_REPORT_SIDECAR_LIMIT = 32_768
+_PYTEST_REPORT_TRACEBACK_LIMIT = 12_000
 
 REQUIRED_CI_OSES = ("linux", "windows", "macos")
 REQUIRED_CI_PYTHONS = ("3.10", "3.11", "3.12", "3.13")
@@ -102,6 +105,52 @@ namespace = {
     "__spec__": spec,
 }
 exec(code, namespace, namespace)
+""".strip()
+
+
+# Pytest needs one extra fail-soft boundary: the gate-owned reporter is useful
+# evidence, not part of the test vote.  Resolve the real pytest package before
+# exposing the candidate import root, then load the reporter opportunistically.
+# A reporter import or construction failure is recorded in its private sidecar
+# and pytest still runs without the plugin.
+_ISOLATED_PYTEST_LAUNCHER = """
+import importlib
+import json
+import sys
+from pathlib import Path
+
+candidate_import_root = sys.argv.pop(1)
+report_path = Path(sys.argv.pop(1))
+pytest = importlib.import_module("pytest")
+if candidate_import_root:
+    sys.path.insert(0, candidate_import_root)
+plugins = []
+try:
+    reporter_module = importlib.import_module("agenttalk.dev_gate")
+    plugins.append(reporter_module._PytestFailureReporter(report_path))
+except BaseException as exc:
+    reporter_error = "unprintable reporter failure"
+    try:
+        reporter_error = (type(exc).__name__ + ": " + str(exc))[:1000]
+    except BaseException:  # noqa: S110 - diagnostics must not change the test vote
+        pass
+    payload = {
+        "schema_version": 1,
+        "status": "unavailable",
+        "complete": False,
+        "observed_failures": 0,
+        "first_failure": None,
+        "reporter_error": reporter_error,
+    }
+    try:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False) + "\\n",
+            encoding="utf-8",
+        )
+    except BaseException:
+        pass
+raise SystemExit(pytest.main(sys.argv[1:], plugins=plugins))
 """.strip()
 
 
@@ -278,7 +327,11 @@ def validate_manifest(data: Any) -> dict[str, Any]:
             raise GateBlock("manifest_schema_invalid", f"checks.{check_id}.timeout_seconds must be positive")
 
     required_contract = {
-        "pytest": {"paths": ["tests"], "args": ["-q"], "test_requirement": "pytest>=8.0"},
+        "pytest": {
+            "paths": ["tests"],
+            "args": ["-q", "-o", "verbosity_assertions=2"],
+            "test_requirement": "pytest>=8.0",
+        },
         "ruff": {"paths": ["src", "tests"]},
         "bandit": {"paths": ["src"], "exclude": ["src/agenttalk/skills"]},
         "gitleaks": {"config": ".gitleaks.toml", "require_full_history": True},
@@ -576,20 +629,21 @@ def _validate_check_command(
         minor = f"{suffix[2]}.{suffix[3:]}"
         python = require_python(minor) if mode == "source" else require_runtime_python(minor, "test")
         spec = manifest["checks"]["pytest"]
-        launcher = [python, "-I", "-c", _ISOLATED_TOOL_LAUNCHER, "pytest"]
+        launcher = [python, "-I", "-c", _ISOLATED_PYTEST_LAUNCHER]
         suffix_args = [*spec["args"], "-p", "no:cacheprovider", "--basetemp"]
         valid = (
             item["mode"] == mode
-            and len(argv) == len(launcher) + 1 + len(suffix_args) + 1 + len(spec["paths"])
+            and len(argv) == len(launcher) + 2 + len(suffix_args) + 1 + len(spec["paths"])
             and argv[: len(launcher)] == launcher
             and (
                 _is_absolute_path_text(argv[len(launcher)])
                 if mode == "source"
                 else argv[len(launcher)] == ""
             )
-            and argv[len(launcher) + 1 : len(launcher) + 1 + len(suffix_args)] == suffix_args
-            and _is_absolute_path_text(argv[len(launcher) + 1 + len(suffix_args)])
-            and argv[len(launcher) + 2 + len(suffix_args) :] == spec["paths"]
+            and _is_absolute_path_text(argv[len(launcher) + 1])
+            and argv[len(launcher) + 2 : len(launcher) + 2 + len(suffix_args)] == suffix_args
+            and _is_absolute_path_text(argv[len(launcher) + 2 + len(suffix_args)])
+            and argv[len(launcher) + 3 + len(suffix_args) :] == spec["paths"]
         )
     elif check_id == "package-build":
         python = require_python(expected_minors[0])
@@ -981,6 +1035,7 @@ def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, 
             or isinstance(item["duration_ms"], bool)
             or item["duration_ms"] < 0
             or not isinstance(item["diagnostic"], str)
+            or len(item["diagnostic"]) > DIAGNOSTIC_LIMIT
         ):
             raise GateBlock("evidence_schema_invalid", f"checks[{index}] semantics are invalid")
         if not isinstance(item["argv"], list) or not all(isinstance(arg, str) for arg in item["argv"]):
@@ -1394,6 +1449,34 @@ def write_preflight_block_evidence(
     return output_path, sha256_bytes(raw), artifact
 
 
+def _aggregate_leg_blocker(artifact: dict[str, Any]) -> dict[str, str]:
+    first_blocker = artifact["blockers"][0] if artifact["blockers"] else None
+    failed = (
+        next(
+            (
+                check
+                for check in artifact["checks"]
+                if check["id"] == first_blocker["check_id"]
+            ),
+            None,
+        )
+        if first_blocker is not None
+        else None
+    )
+    if failed is None:
+        return {
+            "code": "ci_leg_blocked",
+            "check_id": artifact["ci_leg"],
+            "detail": "CI leg blocked without a failed check result",
+        }
+    detail = failed["diagnostic"] or f"{failed['id']} did not pass"
+    return {
+        "code": failed["reason_code"] or failed["status"],
+        "check_id": artifact["ci_leg"],
+        "detail": _bounded_text(f"[{failed['id']}]\n{detail}", DIAGNOSTIC_LIMIT),
+    }
+
+
 def aggregate_leg_artifacts(
     manifest: dict[str, Any],
     profile: str,
@@ -1484,7 +1567,7 @@ def aggregate_leg_artifacts(
             for artifact in ordered
         ],
         "blockers": [
-            {"code": "ci_leg_blocked", "check_id": artifact["ci_leg"], "detail": "CI leg blocked"}
+            _aggregate_leg_blocker(artifact)
             for artifact in ordered
             if artifact["verdict"] != "pass"
         ],
@@ -1816,12 +1899,344 @@ def source_environment(base: dict[str, str], source_root: Path) -> dict[str, str
     return env
 
 
-def _log_tail(path: Path, limit: int = 2000) -> str:
+def _bounded_text(value: str, limit: int) -> str:
+    """Keep a stable prefix and make truncation explicit."""
+
+    value = value.encode("utf-8", errors="replace").decode("utf-8")
+    if limit <= 0:
+        return ""
+    if len(value) <= limit:
+        return value
+    digest = hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:12]
+    marker = f"...[truncated sha256:{digest}]"
+    if len(marker) >= limit:
+        return marker[:limit]
+    return value[: limit - len(marker)] + marker
+
+
+def _bounded_excerpt(value: str, limit: int) -> str:
+    """Keep both ends of a traceback excerpt inside a fixed budget."""
+
+    value = value.encode("utf-8", errors="replace").decode("utf-8")
+    if limit <= 0:
+        return ""
+    if len(value) <= limit:
+        return value
+    digest = hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:12]
+    marker = f"\n...[truncated sha256:{digest}]...\n"
+    if len(marker) >= limit:
+        return marker[:limit]
+    remaining = limit - len(marker)
+    head = remaining // 2
+    return value[:head] + marker + value[-(remaining - head) :]
+
+
+def _safe_exception_text(exc: BaseException, limit: int) -> str:
+    text = "unprintable reporter failure"
+    try:
+        text = f"{type(exc).__name__}: {exc}"
+    except BaseException:  # noqa: S110 - diagnostics must not change the test vote
+        pass
+    return _bounded_text(text, limit)
+
+
+def _is_utf8_scalar_text(value: str) -> bool:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+class _PytestFailureReporter:
+    """Fail-soft pytest plugin that records the first failure as it happens."""
+
+    def __init__(self, path: str | Path):
+        self._path = Path(path)
+        self._observed_failures = 0
+        self._first_failure: dict[str, str] | None = None
+        self._reporter_error: str | None = None
+        self._complete = False
+        self._persist()
+
+    def _payload(self) -> dict[str, Any]:
+        if self._reporter_error is not None:
+            status = "error"
+        elif self._first_failure is not None:
+            status = "captured"
+        elif self._complete:
+            status = "no_failure"
+        else:
+            status = "running"
+        return {
+            "schema_version": 1,
+            "status": status,
+            "complete": self._complete,
+            "observed_failures": self._observed_failures,
+            "first_failure": (
+                None if self._first_failure is None else dict(self._first_failure)
+            ),
+            "reporter_error": self._reporter_error,
+        }
+
+    def _persist(self) -> None:
+        payload = self._payload()
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False) + "\n"
+        if len(raw.encode("utf-8")) > _PYTEST_REPORT_SIDECAR_LIMIT:
+            failure = payload.get("first_failure")
+            if isinstance(failure, dict):
+                failure["nodeid"] = _bounded_text(str(failure.get("nodeid", "")), 240)
+                failure["frame"] = _bounded_text(str(failure.get("frame", "")), 240)
+                failure["assertion"] = _bounded_text(str(failure.get("assertion", "")), 500)
+                failure["traceback"] = _bounded_excerpt(str(failure.get("traceback", "")), 1500)
+            raw = json.dumps(payload, sort_keys=True, ensure_ascii=False) + "\n"
+        if len(raw.encode("utf-8")) > _PYTEST_REPORT_SIDECAR_LIMIT:
+            raise ValueError("pytest reporter sidecar exceeded its fixed bound")
+        write_text(self._path, raw, encoding="utf-8", newline="\n")
+
+    def _remember_error(self, exc: BaseException) -> None:
+        self._reporter_error = _safe_exception_text(exc, 500)
+        try:
+            self._persist()
+        except BaseException:  # noqa: S110 - reporter failure cannot change the test vote
+            pass
+
+    def _guard(self, action: Any) -> None:
+        try:
+            action()
+        except BaseException as exc:
+            self._remember_error(exc)
+
+    @staticmethod
+    def _failure_from_report(report: Any, default_phase: str) -> dict[str, str]:
+        nodeid = str(getattr(report, "nodeid", ""))
+        phase = str(getattr(report, "when", default_phase) or default_phase)
+        location = getattr(report, "location", None)
+        function = ""
+        if isinstance(location, tuple) and len(location) >= 3:
+            function = str(location[2])
+
+        longrepr = getattr(report, "longrepr", None)
+        crash = getattr(longrepr, "reprcrash", None)
+        crash_path = str(getattr(crash, "path", "") or "")
+        crash_line = getattr(crash, "lineno", None)
+        crash_message = str(getattr(crash, "message", "") or "")
+        if crash_path and isinstance(crash_line, int):
+            frame = f"{crash_path}:{crash_line}"
+        elif isinstance(location, tuple) and len(location) >= 2:
+            location_line = location[1]
+            if isinstance(location_line, int):
+                location_line += 1
+            frame = f"{location[0]}:{location_line}"
+            if function:
+                frame += f" in {function}"
+        else:
+            frame = "unavailable"
+
+        longrepr_text = str(getattr(report, "longreprtext", "") or "")
+        if not longrepr_text and longrepr is not None:
+            longrepr_text = str(longrepr)
+        assertion_lines = []
+        for line in longrepr_text.splitlines():
+            stripped = line.lstrip()
+            if stripped.startswith("E "):
+                assertion_lines.append(stripped[1:].lstrip())
+        summary_prefixes = (
+            "AssertionError",
+            "assert ",
+            "At index ",
+            "Differing items:",
+            "Extra items",
+            "Left contains",
+            "Right contains",
+            "where ",
+        )
+        priority_lines = [
+            line
+            for line in assertion_lines
+            if line.startswith(summary_prefixes) and len(line) <= 1000
+        ]
+        assertion = (
+            "\n".join(priority_lines[:8])
+            or crash_message
+            or "failure detail unavailable"
+        )
+        return {
+            "nodeid": _bounded_text(nodeid or "collection", 600),
+            "phase": _bounded_text(phase, 40),
+            "frame": _bounded_text(frame, 600),
+            "assertion": _bounded_text(assertion, 2000),
+            "traceback": _bounded_excerpt(longrepr_text, _PYTEST_REPORT_TRACEBACK_LIMIT),
+        }
+
+    def _observe(self, report: Any, default_phase: str) -> None:
+        if not bool(getattr(report, "failed", False)):
+            return
+        self._observed_failures += 1
+        if self._first_failure is None:
+            self._first_failure = self._failure_from_report(report, default_phase)
+        self._persist()
+
+    def pytest_collectreport(self, report: Any) -> None:
+        self._guard(lambda: self._observe(report, "collect"))
+
+    def pytest_runtest_logreport(self, report: Any) -> None:
+        self._guard(lambda: self._observe(report, "call"))
+
+    def pytest_sessionfinish(self, session: Any, exitstatus: Any) -> None:
+        del session, exitstatus
+
+        def finish() -> None:
+            self._complete = True
+            self._persist()
+
+        self._guard(finish)
+
+
+def _log_tail(path: Path, limit: int = DIAGNOSTIC_LIMIT) -> str:
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
     return text[-limit:]
+
+
+def _load_pytest_report(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(_PYTEST_REPORT_SIDECAR_LIMIT + 1)
+    except FileNotFoundError:
+        return None, "sidecar missing"
+    except OSError:
+        return None, "sidecar unreadable"
+    if not raw:
+        return None, "sidecar empty"
+    if len(raw) > _PYTEST_REPORT_SIDECAR_LIMIT:
+        return None, "sidecar oversized"
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, "sidecar corrupt"
+    if not isinstance(payload, dict):
+        return None, "sidecar invalid"
+    required = {
+        "schema_version",
+        "status",
+        "complete",
+        "observed_failures",
+        "first_failure",
+        "reporter_error",
+    }
+    if set(payload) != required:
+        return None, "sidecar invalid"
+    status = payload.get("status")
+    observed = payload.get("observed_failures")
+    reporter_error = payload.get("reporter_error")
+    if (
+        payload.get("schema_version") != 1
+        or status not in {"running", "captured", "no_failure", "error", "unavailable"}
+        or not isinstance(payload.get("complete"), bool)
+        or not isinstance(observed, int)
+        or isinstance(observed, bool)
+        or observed < 0
+        or not (
+            reporter_error is None
+            or (isinstance(reporter_error, str) and _is_utf8_scalar_text(reporter_error))
+        )
+    ):
+        return None, "sidecar invalid"
+    failure = payload.get("first_failure")
+    if failure is not None:
+        failure_fields = {"nodeid", "phase", "frame", "assertion", "traceback"}
+        if (
+            not isinstance(failure, dict)
+            or set(failure) != failure_fields
+            or not all(
+                isinstance(failure.get(field), str)
+                and _is_utf8_scalar_text(failure[field])
+                for field in failure_fields
+            )
+        ):
+            return None, "sidecar invalid"
+    return payload, None
+
+
+def _pytest_tail_fallback(tail: str, reason: str) -> str:
+    prefix = (
+        "[agenttalk pytest diagnostic v1]\n"
+        "source: terminal-tail fallback\n"
+        f"reason: {_bounded_text(reason, 300)}\n"
+        "--- terminal tail ---\n"
+    )
+    remaining = max(0, DIAGNOSTIC_LIMIT - len(prefix))
+    return prefix + tail[-remaining:] if remaining else prefix[:DIAGNOSTIC_LIMIT]
+
+
+def _reported_pytest_diagnostic(report: dict[str, Any], tail: str) -> str:
+    failure = report["first_failure"]
+    if not isinstance(failure, dict):
+        raise ValueError("pytest report lacks a first failure")
+    omitted = max(0, int(report["observed_failures"]) - 1)
+    priority = "\n".join(
+        [
+            "[agenttalk pytest diagnostic v1]",
+            "source: gate reporter",
+            f"test: {_bounded_text(failure['nodeid'], 300)}",
+            f"phase: {_bounded_text(failure['phase'], 40)}",
+            f"failing frame: {_bounded_text(failure['frame'], 300)}",
+            "assertion:",
+            _bounded_text(failure["assertion"], 420),
+            f"additional failures omitted: {omitted}",
+            "traceback excerpt:",
+            _bounded_excerpt(failure["traceback"], 380),
+        ]
+    )
+    priority = _bounded_text(priority, DIAGNOSTIC_LIMIT)
+    separator = "\n--- terminal tail ---\n"
+    remaining = DIAGNOSTIC_LIMIT - len(priority) - len(separator)
+    if remaining <= 0:
+        return priority
+    return priority + separator + tail[-remaining:]
+
+
+def _pytest_diagnostic(outcome: CommandOutcome, sidecar: Path) -> str:
+    """Select a bounded pytest diagnostic without ever changing the test vote."""
+
+    try:
+        if outcome.status in {"timeout", "error", "missing"}:
+            return _pytest_tail_fallback(outcome.diagnostic, f"pytest process {outcome.status}")
+        report, problem = _load_pytest_report(sidecar)
+        if problem is not None or report is None:
+            return _pytest_tail_fallback(outcome.diagnostic, problem or "sidecar unavailable")
+        status = report["status"]
+        reporter_error = report["reporter_error"]
+        if status == "unavailable":
+            detail = "reporter unavailable"
+            if reporter_error:
+                detail += f": {reporter_error}"
+            return _pytest_tail_fallback(outcome.diagnostic, detail)
+        if status == "error" or reporter_error:
+            detail = "reporter error"
+            if reporter_error:
+                detail += f": {reporter_error}"
+            return _pytest_tail_fallback(outcome.diagnostic, detail)
+        if report["complete"] is not True:
+            return _pytest_tail_fallback(outcome.diagnostic, "reporter incomplete")
+        failure = report["first_failure"]
+        if outcome.status == "fail":
+            if status != "captured" or not isinstance(failure, dict):
+                return _pytest_tail_fallback(outcome.diagnostic, "reporter produced no failure")
+            if report["observed_failures"] < 1 or not failure["nodeid"]:
+                return _pytest_tail_fallback(outcome.diagnostic, "reporter produced invalid failure")
+            return _reported_pytest_diagnostic(report, outcome.diagnostic)
+        if status != "no_failure" or failure is not None or report["observed_failures"] != 0:
+            return _pytest_tail_fallback(outcome.diagnostic, "reporter result disagrees with pytest")
+        return outcome.diagnostic
+    except BaseException as exc:
+        return _pytest_tail_fallback(
+            outcome.diagnostic,
+            f"diagnostic selector error: {_safe_exception_text(exc, 100)}",
+        )
 
 
 def _sha256_file(path: Path) -> str:
@@ -1904,6 +2319,7 @@ def _record_from_outcome(
     python: str | None = None,
     import_provenance: dict[str, Any] | None = None,
     runtime_environment: dict[str, Any] | None = None,
+    diagnostic: str | None = None,
 ) -> dict[str, Any]:
     log_hash = _sha256_file(outcome.log_path) if outcome.log_path.exists() else ""
     return {
@@ -1918,7 +2334,7 @@ def _record_from_outcome(
         "exit_code": outcome.returncode,
         "duration_ms": outcome.duration_ms,
         "reason_code": outcome.reason_code,
-        "diagnostic": outcome.diagnostic,
+        "diagnostic": outcome.diagnostic if diagnostic is None else diagnostic,
         "log": {"path": str(outcome.log_path), "sha256": log_hash},
         "import_provenance": import_provenance,
         "runtime_environment": runtime_environment,
@@ -1942,7 +2358,7 @@ def _blocked_record(check_id: str, detail: str, logs_dir: Path) -> dict[str, Any
         "exit_code": None,
         "duration_ms": 0,
         "reason_code": "blocked_dependency",
-        "diagnostic": detail,
+        "diagnostic": detail[-DIAGNOSTIC_LIMIT:],
         "log": {"path": str(log_path), "sha256": _sha256_file(log_path)},
         "import_provenance": None,
         "runtime_environment": None,
@@ -2075,6 +2491,26 @@ def isolated_tool_argv(
         _ISOLATED_TOOL_LAUNCHER,
         module,
         import_root,
+        *args,
+    ]
+
+
+def isolated_pytest_argv(
+    interpreter: str | Path,
+    report_path: str | Path,
+    *args: str,
+    candidate_import_root: Path | None = None,
+) -> list[str]:
+    """Return an isolated pytest argv with a fail-soft gate reporter."""
+
+    import_root = "" if candidate_import_root is None else str(candidate_import_root.resolve())
+    return [
+        str(interpreter),
+        "-I",
+        "-c",
+        _ISOLATED_PYTEST_LAUNCHER,
+        import_root,
+        str(Path(report_path).resolve()),
         *args,
     ]
 
@@ -2323,7 +2759,7 @@ def _change_record_failure(record: dict[str, Any], code: str, detail: str) -> di
     changed = dict(record)
     changed["status"] = "fail"
     changed["reason_code"] = code
-    changed["diagnostic"] = detail[-2000:]
+    changed["diagnostic"] = detail[-DIAGNOSTIC_LIMIT:]
     if changed.get("exit_code") == 0:
         changed["exit_code"] = 1
     return changed
@@ -2478,9 +2914,12 @@ def _run_pytest_mode(
         )
     except GateBlock as exc:
         return _blocked_record(check_id, exc.detail, logs_dir)
-    argv = isolated_tool_argv(
+    report_path = (
+        logs_dir / (re.sub(r"[^A-Za-z0-9_.-]+", "-", check_id) + ".pytest.json")
+    ).resolve()
+    argv = isolated_pytest_argv(
         interpreter.path,
-        "pytest",
+        report_path,
         *spec.get("args", []),
         "-p",
         "no:cacheprovider",
@@ -2507,6 +2946,7 @@ def _run_pytest_mode(
         python=interpreter.requested,
         import_provenance=provenance,
         runtime_environment=runtime_environment,
+        diagnostic=_pytest_diagnostic(outcome, report_path),
     )
 
 
@@ -3014,6 +3454,7 @@ def _synthetic_record(
     tool_path: str,
     tool_version: str,
 ) -> dict[str, Any]:
+    diagnostic = diagnostic[-DIAGNOSTIC_LIMIT:]
     log_path = logs_dir / f"{check_id}.log"
     logs_dir.mkdir(parents=True, exist_ok=True)
     write_text(log_path, diagnostic + ("\n" if diagnostic else ""), encoding="utf-8", newline="\n")
@@ -3649,7 +4090,10 @@ def validate_aggregate_artifact(
     for index, blocker in enumerate(blockers):
         item = _require_object(blocker, f"aggregate.blockers[{index}]")
         _require_artifact_fields(item, {"code", "check_id", "detail"}, f"aggregate.blockers[{index}]")
-        if not all(_is_nonempty_string(item[field]) for field in ("code", "check_id", "detail")):
+        if (
+            not all(_is_nonempty_string(item[field]) for field in ("code", "check_id", "detail"))
+            or len(item["detail"]) > DIAGNOSTIC_LIMIT
+        ):
             raise GateBlock("evidence_schema_invalid", f"aggregate.blockers[{index}] is invalid")
     if record["complete"]:
         if leg_ids != expected:
