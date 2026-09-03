@@ -4979,6 +4979,41 @@ def test_pom_a_visible_artifactid_containing_a_zero_width_space_is_unaffected():
     assert java.pom_own_coordinate_decode_problems(pom) == []
 
 
+def test_pom_bidi_control_char_only_artifactid_does_not_publish_a_bogus_coordinate():
+    """FIX ROUND 40 (thirty-fourth cold read, Part A F3 LOW, .cr34-bidi,
+    wrong-data): the twin of the ZWSP test above, but for the OTHER
+    closed set - `_is_blank_identity` used to consult only
+    _UNICODE_INVISIBLE_FORMAT_CHARS, missing _UNICODE_DIRECTIONAL_AND_
+    LINE_CONTROL_CHARS - a lone LEFT-TO-RIGHT MARK (U+200E) is neither
+    whitespace nor invisible-format, yet renders as nothing (the
+    identical hazard the invisible-format set exists to close), so an
+    artifactId containing only one still escaped this gate and
+    published a bogus "com.acme:\\u200e"-shaped coordinate."""
+    lrm = chr(0x200E)  # LEFT-TO-RIGHT MARK - bidi control, not whitespace/invisible-format
+    pom = (
+        "<project><groupId>com.acme</groupId>"
+        f"<artifactId>{lrm}</artifactId></project>"
+    )
+    units, _edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert units == []
+    assert java.pom_own_coordinate_decode_problems(pom) != []
+
+
+def test_pom_a_visible_artifactid_containing_a_bidi_control_char_is_unaffected():
+    """FIX ROUND 40 (Part A F3 LOW, control): the fix above must not
+    treat a REAL, visible identity value merely CONTAINING a bidi
+    control character as blank - only a value consisting ENTIRELY of
+    whitespace/invisible-format/bidi-control characters is blank."""
+    lrm = chr(0x200E)
+    artifact_id = "re" + lrm + "al"  # a real value merely CONTAINING one, not blank
+    pom = (
+        f"<project><groupId>com.acme</groupId><artifactId>{artifact_id}</artifactId></project>"
+    )
+    units, _edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert [u.qualified_name for u in units] == ["com.acme:re\\u200eal"]
+    assert java.pom_own_coordinate_decode_problems(pom) == []
+
+
 def test_web_xml_comment_only_url_pattern_still_publishes_the_context_root():
     """MICRO-ROUND 38b (THE BLOCKER, url-pattern is the OTHER edge):
     unlike a coordinate/name, an empty <url-pattern> is servlet-spec-

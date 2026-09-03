@@ -3573,10 +3573,29 @@ def _is_blank_identity(decoded: str | None) -> bool:
     diverged. Reuses ``_UNICODE_INVISIBLE_FORMAT_CHARS`` (the same
     closed set ``_sanitize_route_name_control_chars`` already escapes
     for the sibling "two routes print identically, compare unequal"
-    hazard, round 35's own F7) rather than inventing a second one."""
+    hazard, round 35's own F7) rather than inventing a second one.
+
+    FIX ROUND 40 (thirty-fourth cold read, Part A F3 LOW, wrong-data):
+    round 39's own fix only consulted the invisible-FORMAT set, missing
+    this escaping choke point's OTHER closed set - a BIDI/line-control
+    character (a lone LEFT-TO-RIGHT MARK, say) is not whitespace and
+    not invisible-format either, yet it also renders as nothing (or as
+    something that actively lies about structure) in every consumer
+    this producer targets, the identical "renders as nothing" hazard
+    the invisible-format set exists to close. An identity leaf
+    containing only one still escaped this gate. Now consults the
+    UNION of both closed sets - the escaping logic itself
+    (``_sanitize_route_name_control_chars``) correctly keeps its own
+    per-set treatment unchanged; only the blankness TEST is widened
+    here."""
     if decoded is None:
         return True
-    return all(ch.isspace() or ch in _UNICODE_INVISIBLE_FORMAT_CHARS for ch in decoded)
+    return all(
+        ch.isspace()
+        or ch in _UNICODE_INVISIBLE_FORMAT_CHARS
+        or ch in _UNICODE_DIRECTIONAL_AND_LINE_CONTROL_CHARS
+        for ch in decoded
+    )
 
 
 def _decode_xml_text(raw: str) -> str | None:
