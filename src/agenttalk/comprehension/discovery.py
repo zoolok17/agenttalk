@@ -976,24 +976,38 @@ def _submodule_boundary_paths(root: Path) -> tuple[frozenset[str], dict[str, str
 #: own per-entry path tracking. Corrected below.
 FINGERPRINT_CAVEAT = (
     "whole_scope_fingerprint's own sensitivity to an excluded region is "
-    "ENTRY-LEVEL, not CONTENT-LEVEL, for the generated_or_vendor and "
-    "resource_limit_oversized categories - a directory or file appearing, "
-    "disappearing, or being excluded under a different category changes the "
-    "fingerprint, but a content change (an added or modified file) entirely "
-    "inside an already-excluded region of one of these two categories does "
-    "not, since no per-file bytes are ever read for either (reading them "
-    "just to fingerprint them would defeat the entire point of skipping "
-    "them). The dependency_cache category (alongside secret/vcs/hard-"
-    "excluded) contributes no PER-ENTRY input (no individual path or digest "
-    "joins the fingerprint) - but its own CATEGORY TALLY does: a whole "
-    "region of one of these categories appearing or disappearing changes "
-    "the count recorded under that category, which does change the "
+    "ENTRY-LEVEL, not CONTENT-LEVEL, for the generated_or_vendor category - "
+    "a directory or file appearing, disappearing, or being excluded under a "
+    "different category changes the fingerprint, but a content change (an "
+    "added or modified file) entirely inside an already-excluded generated/"
+    "vendor region does not, since no per-file bytes are ever read for it "
+    "(reading them just to fingerprint them would defeat the entire point "
+    "of skipping it). The dependency_cache category (alongside secret/vcs/"
+    "hard-excluded) contributes no PER-ENTRY input (no individual path or "
+    "digest joins the fingerprint) - but its own CATEGORY TALLY does: a "
+    "whole region of one of these categories appearing or disappearing "
+    "changes the count recorded under that category, which does change the "
     "fingerprint; only a content change (or a path change that leaves the "
     "count unchanged) entirely inside an already-excluded region of one of "
-    "these categories never does. The binary and resource_limit_total_bytes "
-    "categories are NOT affected by either gap - both already read the "
-    "file's own bytes before excluding it, so their own content_digest "
-    "already makes the fingerprint sensitive to a content change there."
+    "these categories never does. The binary category is NOT affected by "
+    "either gap - it already reads the file's own bytes before excluding "
+    "it, so its own content_digest already makes the fingerprint sensitive "
+    "to a content change there.\n\n"
+    "FIX ROUND 47 (forty-first cold read, M7 MAJOR, corrected): the "
+    "resource_limit_oversized and resource_limit_total_bytes categories "
+    "were PREVIOUSLY described here as having their own fingerprint-"
+    "sensitivity granularity too (entry-level for the former, content-level "
+    "for the latter) - both claims describe DEAD CODE that can never "
+    "actually execute. Both categories ALWAYS record a genuinely degrading "
+    "problem (`degrades_run: True`) at the exact same call site as their "
+    "own exclusion - fingerprint_complete is False, and whole_scope_"
+    "fingerprint is None, unconditionally, for the ENTIRE run whenever "
+    "either category has even one entry; the fingerprint is never "
+    "partially or coarsely computed for a run containing one, only ever "
+    "entirely absent. A caller reading fingerprint_complete: false and "
+    "whole_scope_fingerprint: null already sees this honestly - this "
+    "caveat's own job (an ENTRY-LEVEL-vs-CONTENT-LEVEL granularity "
+    "question) simply does not arise for either resource_limit category."
 )
 
 
@@ -1365,7 +1379,29 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
     # `fingerprint_complete = False` at each of the eight problem-raising
     # sites above) makes a ninth future exit incomplete-by-construction
     # instead of relying on every future editor to remember the flag.
-    fingerprint_complete = not problems
+    #
+    # FIX ROUND 47 (forty-first cold read, M3 MAJOR, wrong-data - THE
+    # BARE-TRUTHINESS SIBLING): this was `not problems` - round 39's own
+    # F2 exact class (scan_pipeline.py's own status computation used to
+    # make the identical mistake, fixed there, never swept here too).
+    # `secret_pattern_matched_code_bearing_file` (.cr41-secretxml) is
+    # explicitly recorded `degrades_run: False` - a genuinely non-
+    # degrading, purely informational problem (this run cannot tell
+    # whether the excluded file was ordinary config or real inventory,
+    # but that not-knowing itself is not evidence anything was actually
+    # missed from the fingerprint) - yet its mere PRESENCE permanently
+    # nulled the fingerprint (`freshness` stays `not_evaluated` forever
+    # for this run, disqualifying it from any future "is this still
+    # current" dispatch), while every OTHER discovery-level problem
+    # recorded here IS a genuine walked-content omission and correctly
+    # marks it incomplete. Derived from each problem's own `degrades_run`
+    # flag now, the same per-instance-authoritative discipline round 39
+    # already established - swept for any OTHER bare-truthiness
+    # aggregate in this module and found none (every other boolean here -
+    # `degraded`, `entry_cap_hit`, `excluded_region_may_contain_target` -
+    # is already set explicitly, per-condition, never derived from a
+    # bare collection-truthiness check).
+    fingerprint_complete = not any(p.get("degrades_run", True) for p in problems)
 
     fingerprint = None
     if fingerprint_complete:

@@ -727,7 +727,15 @@ def test_enumerate_scope_records_a_visible_non_degrading_problem_for_a_secret_xm
     ``.java`` case above): this producer excludes pre-read, so whether
     this specific file was genuinely code-bearing or ordinary config is
     unknowable without reading content this rule exists to never read -
-    "record, don't guess," the round 26b precedent."""
+    "record, don't guess," the round 26b precedent.
+
+    FIX ROUND 47 (forty-first cold read, M3 MAJOR, wrong-data - THE
+    BARE-TRUTHINESS SIBLING, .cr41-secretxml): `fingerprint_complete`
+    used to be `not problems` - a bare truthiness check that treated
+    even this explicitly non-degrading problem's mere PRESENCE as
+    nulling the fingerprint (freshness permanently unknown for this
+    run), the round-39 F2 exact class, never swept here. Now derived
+    from `degrades_run` - this problem must NOT null the fingerprint."""
     (tmp_path / "secrets.xml").write_bytes(
         b"<beans><bean id=\"x\" class=\"com.acme.X\"/></beans>")
     comp_dir = _comprehension_dir(tmp_path)
@@ -740,6 +748,31 @@ def test_enumerate_scope_records_a_visible_non_degrading_problem_for_a_secret_xm
         if p["reason_code"] == "secret_pattern_matched_code_bearing_file"]
     assert len(calibration_problems) == 1
     assert calibration_problems[0]["path"] == "secrets.xml"
+    assert result.fingerprint_complete is True
+    assert result.whole_scope_fingerprint is not None
+
+
+def test_enumerate_scope_a_genuinely_degrading_problem_still_nulls_the_fingerprint(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 47 (M3 MAJOR control, .cr41-binjava): the mirror case -
+    a discovery-level problem that IS degrading (an unlistable
+    directory, a resource cap - a genuine walked-content omission) must
+    still null the fingerprint exactly as before this fix; only a
+    problem explicitly marked non-degrading is exempted."""
+    # A nesting depth past MAX_NESTING_DEPTH is a genuine walked-content
+    # omission (the same resource_limit shape every other cap in this
+    # module raises) - simpler to trigger deterministically here than
+    # monkeypatching OS-level directory permissions.
+    current = tmp_path
+    for i in range(discovery.MAX_NESTING_DEPTH + 2):
+        current = current / f"d{i}"
+    current.mkdir(parents=True)
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert any(p["reason_code"] == "resource_limit" for p in result.problems)
+    assert result.fingerprint_complete is False
+    assert result.whole_scope_fingerprint is None
 
 
 def test_enumerate_scope_excludes_binary_content(tmp_path: Path) -> None:
@@ -1359,6 +1392,13 @@ def test_an_oversized_files_excluded_roots_entry_carries_no_content_digest(
     result = discovery.enumerate_scope(tmp_path, comp_dir)
     entry = next(e for e in result.excluded_roots if e["category"] == "resource_limit_oversized")
     assert "content_digest" not in entry
+    # FIX ROUND 47 (forty-first cold read, M7 MAJOR, corrected): the
+    # docstring's own claim, now also code-verified directly - the
+    # FINGERPRINT_CAVEAT's own former discussion of this category's
+    # fingerprint-sensitivity GRANULARITY was dead code, since the
+    # fingerprint is unconditionally absent, never partially present.
+    assert result.fingerprint_complete is False
+    assert result.whole_scope_fingerprint is None
 
 
 def test_a_total_bytes_capped_files_excluded_roots_entry_carries_its_content_digest(
@@ -1380,6 +1420,13 @@ def test_a_total_bytes_capped_files_excluded_roots_entry_carries_its_content_dig
     result = discovery.enumerate_scope(tmp_path, comp_dir)
     entry = next(e for e in result.excluded_roots if e["category"] == "resource_limit_total_bytes")
     assert entry["content_digest"] == hashlib.sha256(b"aaaa").hexdigest()
+    # FIX ROUND 47 (M7 MAJOR, corrected): see the sibling assertion in
+    # the resource_limit_oversized test above - the content_digest this
+    # category DOES carry is never actually consulted for the
+    # fingerprint, since the fingerprint is unconditionally absent
+    # whenever this category fires at all.
+    assert result.fingerprint_complete is False
+    assert result.whole_scope_fingerprint is None
 
 
 def test_whole_scope_fingerprint_changes_when_a_generated_or_vendor_directorys_own_path_changes(
