@@ -2328,6 +2328,67 @@ def test_run_scan_links_a_web_xml_route_to_its_real_servlet_class_end_to_end(
     assert entry_points_mapped["stored_status"] == "satisfied"
 
 
+def test_run_scan_a_web_xml_servlet_class_naming_an_abstract_class_degrades_end_to_end(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 45 (thirty-ninth cold read, F2 MAJOR - THE MATRIX'S OWN
+    MISSING COLUMN, .cr39-descabs): end to end - a web.xml <servlet-
+    class> naming a real, in-scan ABSTRACT class must degrade the run,
+    publish an unsupported_entry_point_shape/descriptor_route_on_
+    uninstantiable_class problem, suppress the route entirely (no
+    feature, no entry point), and report the resolved class's own
+    entry_points_mapped as unknown - never the confident satisfied
+    test_run_scan_links_a_web_xml_route_to_its_real_servlet_class_end_
+    to_end asserts for a concrete class, and never a silently-published
+    served route for a class a container can never instantiate."""
+    import json
+
+    web_dir = java_repo / "src" / "main" / "java" / "com" / "acme" / "web"
+    web_dir.mkdir(parents=True)
+    (web_dir / "AbstractServlet.java").write_text(
+        "package com.acme.web;\npublic abstract class AbstractServlet {\n}\n", encoding="utf-8")
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name>abs</servlet-name>\n"
+        "    <servlet-class>com.acme.web.AbstractServlet</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>abs</servlet-name>\n"
+        "    <url-pattern>/abs/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["status"] == "degraded"
+    assert "unsupported_entry_point_shape" in scan_doc["degraded_by"]
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    descriptor_problem = next(
+        p for p in problems_doc["problems"]
+        if p["qualified_name"] == "com.acme.web.AbstractServlet")
+    assert descriptor_problem["reason_code"] == "unsupported_entry_point_shape"
+    assert "descriptor_route_on_uninstantiable_class" in descriptor_problem["detail"]
+    assert descriptor_problem["path"] == "WEB-INF/web.xml"
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+
+    assert not any(e["name"] == "/abs/*" for e in features_doc["entry_points"])
+    servlet_unit = next(
+        u for u in modules_doc["units"] if u["display_name"] == "AbstractServlet")
+    entry_points_mapped = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == servlet_unit["unit_id"] and s["check"] == "entry_points_mapped"
+    )
+    assert entry_points_mapped["stored_status"] == "unknown"
+
+
 def test_run_scan_a_route_and_a_filter_report_their_own_split_dependency_summary_counts(
     java_repo: Path,
 ) -> None:
@@ -5884,12 +5945,12 @@ def test_run_scan_refuses_to_publish_an_entry_point_with_an_unknown_owning_unit(
     real_build_features = featuresmod.build_features
 
     def _inject_a_dangling_entry_point(*args, **kwargs):
-        entry_points, features = real_build_features(*args, **kwargs)
+        entry_points, features, _problems = real_build_features(*args, **kwargs)
         orphan = featuresmod.EntryPointRecord(
             entry_point_id="orphan-entry-point", kind="http_route", name="GET /orphan",
             owning_unit_id="does-not-exist", feature_ids=[], evidence_class="declared",
         )
-        return [*entry_points, orphan], features
+        return [*entry_points, orphan], features, _problems
 
     monkeypatch.setattr(scan_pipeline.features_artifact, "build_features", _inject_a_dangling_entry_point)
 
@@ -5921,14 +5982,14 @@ def test_run_scan_refuses_to_publish_an_entry_point_with_an_unknown_declared_in_
     real_build_features = featuresmod.build_features
 
     def _inject_a_dangling_declared_in(*args, **kwargs):
-        entry_points, features = real_build_features(*args, **kwargs)
+        entry_points, features, _problems = real_build_features(*args, **kwargs)
         real_owner = entry_points[0].owning_unit_id if entry_points else "does-not-exist-owner"
         orphan = featuresmod.EntryPointRecord(
             entry_point_id="orphan-declared-in", kind="http_route", name="GET /orphan",
             owning_unit_id=real_owner, feature_ids=[], evidence_class="declared",
             declared_in_unit_id="does-not-exist-declarer",
         )
-        return [*entry_points, orphan], features
+        return [*entry_points, orphan], features, _problems
 
     monkeypatch.setattr(
         scan_pipeline.features_artifact, "build_features", _inject_a_dangling_declared_in)
@@ -5948,12 +6009,12 @@ def test_run_scan_refuses_to_publish_a_feature_with_an_unknown_unit_id(
     real_build_features = featuresmod.build_features
 
     def _inject_a_dangling_feature_unit(*args, **kwargs):
-        entry_points, features = real_build_features(*args, **kwargs)
+        entry_points, features, _problems = real_build_features(*args, **kwargs)
         orphan = featuresmod.FeatureRecord(
             feature_id="orphan-feature-unit", label="Orphan", state="candidate",
             origin="detected", unit_ids=["does-not-exist"], entry_point_ids=[],
         )
-        return entry_points, [*features, orphan]
+        return entry_points, [*features, orphan], _problems
 
     monkeypatch.setattr(
         scan_pipeline.features_artifact, "build_features", _inject_a_dangling_feature_unit)
@@ -5975,12 +6036,12 @@ def test_run_scan_refuses_to_publish_a_feature_with_an_unknown_entry_point_id(
     real_build_features = featuresmod.build_features
 
     def _inject_a_dangling_feature_entry_point(*args, **kwargs):
-        entry_points, features = real_build_features(*args, **kwargs)
+        entry_points, features, _problems = real_build_features(*args, **kwargs)
         orphan = featuresmod.FeatureRecord(
             feature_id="orphan-feature-ep", label="Orphan", state="candidate",
             origin="detected", unit_ids=[], entry_point_ids=["does-not-exist-ep"],
         )
-        return entry_points, [*features, orphan]
+        return entry_points, [*features, orphan], _problems
 
     monkeypatch.setattr(
         scan_pipeline.features_artifact, "build_features", _inject_a_dangling_feature_entry_point)
@@ -6121,7 +6182,7 @@ def test_run_scan_refuses_to_publish_an_entry_point_with_an_unknown_feature_id(
     real_build_features = featuresmod.build_features
 
     def _inject_a_dangling_feature_id(*args, **kwargs):
-        entry_points, features = real_build_features(*args, **kwargs)
+        entry_points, features, _problems = real_build_features(*args, **kwargs)
         real_owner = entry_points[0].owning_unit_id if entry_points else scan_pipeline.digests.unit_id(
             kind="component", paths=["src/main/java/p/App.java"], qualified_name="p.App")
         orphan = featuresmod.EntryPointRecord(
@@ -6129,7 +6190,7 @@ def test_run_scan_refuses_to_publish_an_entry_point_with_an_unknown_feature_id(
             owning_unit_id=real_owner, feature_ids=["does-not-exist-feature"],
             evidence_class="declared",
         )
-        return [*entry_points, orphan], features
+        return [*entry_points, orphan], features, _problems
 
     monkeypatch.setattr(
         scan_pipeline.features_artifact, "build_features", _inject_a_dangling_feature_id)

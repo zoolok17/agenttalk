@@ -210,23 +210,83 @@ def _feature_label(qualified_name: str) -> str:
     return qualified_name.rsplit(".", 1)[-1]
 
 
+@dataclass(frozen=True)
+class DescriptorRegistrabilityProblem:
+    """FIX ROUND 45 (thirty-ninth cold read, F2 MAJOR - THE MATRIX'S OWN
+    MISSING COLUMN): one web.xml ``<servlet-class>``/``<filter-class>``
+    that resolved, cross-file, to a real in-scan class this run already
+    knows (via ``JavaUnitClaim.is_interface``/``is_abstract``/
+    ``is_enum``, threaded through this round) can never actually be
+    instantiated/dispatched to - a descriptor names ONE specific class
+    with no implementor-may-serve escape (unlike Spring/JAX-RS's own
+    weaker class-level-annotation claim), so this is the STRONGEST of
+    the three registrability claims this producer models. ``relative_
+    path`` is the DECLARING file (the web.xml itself, never the
+    resolved class's own file) - the same attribution
+    ``_uninstantiable_class_problem`` uses is not reusable here
+    verbatim (its own wording assumes an annotation, never a
+    descriptor), so this is a small, dedicated sibling."""
+
+    relative_path: str
+    qualified_name: str
+    detail: str
+
+
+def _descriptor_uninstantiable_detail(
+    qualified_name: str, is_interface: bool, is_abstract: bool, is_enum: bool, line: int | None,
+) -> str:
+    if is_interface:
+        shape = "an INTERFACE"
+    elif is_abstract:
+        shape = "ABSTRACT"
+    else:
+        shape = "an ENUM"
+    at_line = f" at line {line}" if line is not None else ""
+    return (
+        f"a <servlet-class>/<filter-class>{at_line} names {qualified_name}, which is {shape} "
+        "(descriptor_route_on_uninstantiable_class) - a descriptor names one specific class "
+        "with no implementor-may-serve escape, and a container never instantiates this class at all"
+    )
+
+
 def build_features(
     java_results: dict[str, java_adapter.JavaFileResult],
     *, confirmed_labels: frozenset[str] = frozenset(),
     file_digests: dict[str, str] | None = None,
-) -> tuple[list[EntryPointRecord], list[FeatureRecord]]:
-    """Returns ``(entry_points, features)``. ``confirmed_labels`` names
-    which candidate feature labels a ``config.json`` declaration confirms
-    (state -> ``confirmed``) - an empty set (the default) means every
-    feature stays ``candidate``, matching "a detector may create only a
-    candidate."
+) -> tuple[list[EntryPointRecord], list[FeatureRecord], list[DescriptorRegistrabilityProblem]]:
+    """Returns ``(entry_points, features, descriptor_registrability_problems)``.
+    ``confirmed_labels`` names which candidate feature labels a
+    ``config.json`` declaration confirms (state -> ``confirmed``) - an
+    empty set (the default) means every feature stays ``candidate``,
+    matching "a detector may create only a candidate."
 
     ``file_digests`` maps a relative path to discovery's own content
     digest for that file (M7, cold-read PR-B fix round 3: every producer
     here carried ``source_digest=None`` unconditionally - the design's
     per-fact producer identity, source content digest included, was never
     actually populated even though the digest was already computed and
-    available upstream)."""
+    available upstream).
+
+    FIX ROUND 45 (thirty-ninth cold read, F2 MAJOR): return arity WIDENED
+    (unlike ``EntryPointRecord``'s own frozen shape) to carry
+    ``descriptor_registrability_problems`` - a web.xml ``<servlet-class>``/
+    ``<filter-class>`` claim whose OWN qualified name resolves,
+    unambiguously, to a real declared class this run ALSO knows is
+    interface/abstract/enum. See ``DescriptorRegistrabilityProblem``'s
+    own docstring for why this can only be decided HERE, cross-file, and
+    ``java.py``'s own ``UNSUPPORTED_ENTRY_POINT_SHAPES`` docstring for
+    why the reason_code is the SAME ``unsupported_entry_point_shape``
+    every sibling registrability shape already uses (never a new reason
+    code - only a new shape name embedded in the detail, the established
+    convention every family member since round 44 already follows).
+    Suppressed the same way an uninstantiable annotation target already
+    is - never published as a served route/filter, only as this problem;
+    ``scan_pipeline.py`` is responsible for feeding this into
+    ``problems.json``/``degraded_by`` and re-attributing the reason onto
+    the resolved unit's own ``modules.json`` record (``modules_artifact.
+    _attribute_cross_file_entry_point_reasons``, reused verbatim - the
+    exact same cross-file attribution mechanism the web.xml ``<listener>``
+    case already established)."""
     file_digests = file_digests or {}
     (
         by_qualified_name, _by_simple_name, _file_unit_ids, _duplicate_names,
@@ -234,6 +294,20 @@ def build_features(
     ) = _build_registry(java_results)
 
     owning_unit_by_qualified_name = by_qualified_name
+    # FIX ROUND 45 (F2 MAJOR): each declared type's own registrability -
+    # built directly from `JavaUnitClaim.is_interface`/`is_abstract`/
+    # `is_enum` (this round's own new fields), never `_build_registry`'s
+    # return (which stops at unit_id, carries no type-kind). Only ever
+    # consulted below when `by_qualified_name` ALSO resolved the same
+    # name unambiguously - a duplicate-qualified-name collision is
+    # already its own separate, visible problem elsewhere; this map
+    # itself makes no attempt to arbitrate one.
+    registrability_by_qualified_name: dict[str, tuple[bool, bool, bool]] = {
+        unit.qualified_name: (unit.is_interface, unit.is_abstract, unit.is_enum)
+        for result in java_results.values()
+        for unit in result.units
+    }
+    descriptor_registrability_problems: list[DescriptorRegistrabilityProblem] = []
     # FIX ROUND 14 (tenth cold read, CR10-8 MINOR, wrong-data): grouped
     # by owning_unit_id ALONE - a claim with no real declared-type owner
     # (web.xml's servlet-mapping entry points; parse_web_xml's synthetic
@@ -255,6 +329,26 @@ def build_features(
     for path, result in java_results.items():
         for claim in result.entry_points:
             resolved_unit_id = owning_unit_by_qualified_name.get(claim.qualified_name)
+            # FIX ROUND 45 (F2 MAJOR): only ``http_route``/``http_filter``
+            # claims name a class the container must actually instantiate
+            # - ``cli_main`` has no such class-instantiation contract at
+            # all. Only reachable here for a claim whose OWNING class
+            # resolved UNAMBIGUOUSLY (`resolved_unit_id is not None`) -
+            # every annotation-sourced route on an uninstantiable class
+            # already self-suppresses, same-file, before it ever reaches
+            # `result.entry_points` (see java.py's own registrability
+            # checks) - so any SURVIVING claim whose resolved owner is
+            # uninstantiable can only be a web.xml descriptor claim.
+            if resolved_unit_id is not None and claim.kind in ("http_route", "http_filter"):
+                is_interface, is_abstract, is_enum = registrability_by_qualified_name.get(
+                    claim.qualified_name, (False, False, False))
+                if is_interface or is_abstract or is_enum:
+                    descriptor_registrability_problems.append(DescriptorRegistrabilityProblem(
+                        relative_path=path, qualified_name=claim.qualified_name,
+                        detail=_descriptor_uninstantiable_detail(
+                            claim.qualified_name, is_interface, is_abstract, is_enum, claim.line),
+                    ))
+                    continue
             if resolved_unit_id is not None:
                 owning_unit_id, group_key = resolved_unit_id, (resolved_unit_id, None)
             else:
@@ -349,7 +443,7 @@ def build_features(
             producers=[_producer(file_digests.get(owner_path), basis=first_claim.evidence_class)],
         ))
 
-    return entry_point_records, features
+    return entry_point_records, features, descriptor_registrability_problems
 
 
 def feature_record_from_json(payload: dict[str, Any]) -> FeatureRecord:

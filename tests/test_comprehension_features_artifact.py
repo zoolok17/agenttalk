@@ -16,7 +16,7 @@ def test_a_main_method_produces_one_candidate_feature_with_one_entry_point():
         "App.java",
         "package p;\nclass App {\n  public static void main(String[] args) {}\n}\n",
     )}
-    entry_points, features = fa.build_features(results)
+    entry_points, features, _problems = fa.build_features(results)
     assert len(entry_points) == 1
     assert entry_points[0].kind == "cli_main"
     assert len(features) == 1
@@ -35,7 +35,7 @@ def test_source_digest_is_populated_from_file_digests():
         "App.java",
         "package p;\nclass App {\n  public static void main(String[] args) {}\n}\n",
     )}
-    entry_points, features = fa.build_features(
+    entry_points, features, _problems = fa.build_features(
         results, file_digests={"App.java": "deadbeef"})
     assert entry_points[0].producers[0]["source_digest"] == "deadbeef"
     assert features[0].producers[0]["source_digest"] == "deadbeef"
@@ -46,7 +46,7 @@ def test_source_digest_defaults_to_none_without_file_digests():
         "App.java",
         "package p;\nclass App {\n  public static void main(String[] args) {}\n}\n",
     )}
-    entry_points, features = fa.build_features(results)
+    entry_points, features, _problems = fa.build_features(results)
     assert entry_points[0].producers[0]["source_digest"] is None
 
 
@@ -68,7 +68,7 @@ def test_web_xml_entry_point_gets_a_clean_label_not_the_file_extension():
     results = {
         "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
     }
-    entry_point_records, features = fa.build_features(results)
+    entry_point_records, features, _problems = fa.build_features(results)
     assert len(features) == 1
     assert features[0].label == "legacy"
     # FIX ROUND 37 (thirty-first cold read, F5 MAJOR, wrong-data,
@@ -111,7 +111,7 @@ def test_web_xml_entry_point_owner_is_the_real_servlet_class_when_declared():
         "com/acme/web/DispatcherServlet.java": java_adapter.parse_java_source(
             "com/acme/web/DispatcherServlet.java", servlet_source),
     }
-    entry_point_records, features = fa.build_features(results)
+    entry_point_records, features, _problems = fa.build_features(results)
     servlet_unit_id = fa.digests.unit_id(
         kind="component", paths=["com/acme/web/DispatcherServlet.java"],
         qualified_name="com.acme.web.DispatcherServlet",
@@ -155,7 +155,7 @@ def test_web_xml_entry_point_owner_resolves_when_the_servlet_class_has_an_interi
         "com/acme/SvOne.java": java_adapter.parse_java_source(
             "com/acme/SvOne.java", servlet_source),
     }
-    entry_point_records, features = fa.build_features(results)
+    entry_point_records, features, _problems = fa.build_features(results)
     servlet_unit_id = fa.digests.unit_id(
         kind="component", paths=["com/acme/SvOne.java"], qualified_name="com.acme.SvOne",
     )
@@ -163,6 +163,172 @@ def test_web_xml_entry_point_owner_resolves_when_the_servlet_class_has_an_interi
     assert entry_point_records[0].owning_unit_id == servlet_unit_id
     assert len(features) == 1
     assert features[0].unit_ids == [servlet_unit_id]
+
+
+def test_web_xml_servlet_class_naming_an_abstract_class_is_suppressed_and_reported():
+    """FIX ROUND 45 (thirty-ninth cold read, F2 MAJOR - THE MATRIX'S OWN
+    MISSING COLUMN, .cr39-descabs): a web.xml <servlet-class> naming a
+    real, in-scan ABSTRACT class - a container can never instantiate it,
+    the STRONGEST of the three registrability claims this producer
+    models (a descriptor names ONE specific class, no implementor-may-
+    serve escape) - used to publish a confident served route anyway, on
+    a complete/0-problem run, because JavaUnitClaim carried no type-kind
+    at all and registrability was never consulted outside java.py's own
+    single-file parse. Now suppressed (no entry point, no feature) and
+    reported via descriptor_registrability_problems (unsupported_entry_
+    point_shape, descriptor_route_on_uninstantiable_class)."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>abs</servlet-name>
+    <servlet-class>com.acme.web.AbstractServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>abs</servlet-name>
+    <url-pattern>/abs/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = (
+        java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml))
+    servlet_source = "package com.acme.web;\npublic abstract class AbstractServlet {\n}\n"
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
+        "com/acme/web/AbstractServlet.java": java_adapter.parse_java_source(
+            "com/acme/web/AbstractServlet.java", servlet_source),
+    }
+    entry_point_records, features, problems = fa.build_features(results)
+    assert entry_point_records == []
+    assert features == []
+    assert len(problems) == 1
+    assert problems[0].relative_path == "WEB-INF/web.xml"
+    assert problems[0].qualified_name == "com.acme.web.AbstractServlet"
+    assert "descriptor_route_on_uninstantiable_class" in problems[0].detail
+    assert "ABSTRACT" in problems[0].detail
+
+
+def test_web_xml_filter_class_naming_an_interface_is_suppressed_and_reported():
+    """FIX ROUND 45 (F2 MAJOR, .cr39-descabs sibling): the identical gap
+    for a <filter-class> naming an INTERFACE, via a real <filter>/
+    <filter-mapping> pair - the http_filter kind sibling of the servlet
+    case above."""
+    web_xml = """<web-app>
+  <filter>
+    <filter-name>iface</filter-name>
+    <filter-class>com.acme.web.FilterApi</filter-class>
+  </filter>
+  <filter-mapping>
+    <filter-name>iface</filter-name>
+    <url-pattern>/iface/*</url-pattern>
+  </filter-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = (
+        java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml))
+    filter_source = "package com.acme.web;\npublic interface FilterApi {\n}\n"
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
+        "com/acme/web/FilterApi.java": java_adapter.parse_java_source(
+            "com/acme/web/FilterApi.java", filter_source),
+    }
+    entry_point_records, features, problems = fa.build_features(results)
+    assert entry_point_records == []
+    assert features == []
+    assert len(problems) == 1
+    assert problems[0].qualified_name == "com.acme.web.FilterApi"
+    assert "descriptor_route_on_uninstantiable_class" in problems[0].detail
+    assert "an INTERFACE" in problems[0].detail
+
+
+def test_web_xml_servlet_class_naming_an_enum_is_suppressed_and_reported():
+    """FIX ROUND 45 (F2 MAJOR, .cr39-descabs sibling): an ENUM gets the
+    identical STRONGEST-claim treatment - no other class can ever
+    extend an enum, so a descriptor naming one is exactly as
+    uninstantiable as naming an interface/abstract class."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>e</servlet-name>
+    <servlet-class>com.acme.web.EnumServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>e</servlet-name>
+    <url-pattern>/e/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = (
+        java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml))
+    servlet_source = "package com.acme.web;\npublic enum EnumServlet {\n  A, B;\n}\n"
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
+        "com/acme/web/EnumServlet.java": java_adapter.parse_java_source(
+            "com/acme/web/EnumServlet.java", servlet_source),
+    }
+    entry_point_records, features, problems = fa.build_features(results)
+    assert entry_point_records == []
+    assert features == []
+    assert len(problems) == 1
+    assert problems[0].qualified_name == "com.acme.web.EnumServlet"
+    assert "an ENUM" in problems[0].detail
+
+
+def test_web_xml_servlet_class_naming_a_concrete_class_is_unaffected_by_f2():
+    """FIX ROUND 45 (F2 MAJOR, .cr39-descabs control): the ordinary,
+    dominant case - a <servlet-class> naming a real CONCRETE class -
+    must keep publishing exactly as before, never suppressed. The twin
+    of test_web_xml_entry_point_owner_is_the_real_servlet_class_when_
+    declared above, asserting the new problems list stays empty too."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>dispatcher</servlet-name>
+    <servlet-class>com.acme.web.DispatcherServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>dispatcher</servlet-name>
+    <url-pattern>/api/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = (
+        java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml))
+    servlet_source = "package com.acme.web;\nclass DispatcherServlet {\n}\n"
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
+        "com/acme/web/DispatcherServlet.java": java_adapter.parse_java_source(
+            "com/acme/web/DispatcherServlet.java", servlet_source),
+    }
+    entry_point_records, features, problems = fa.build_features(results)
+    assert len(entry_point_records) == 1
+    assert len(features) == 1
+    assert problems == []
+
+
+def test_web_xml_servlet_class_naming_an_abstract_class_not_in_scan_still_publishes():
+    """FIX ROUND 45 (F2 MAJOR, .cr39-descabs control): a <servlet-class>
+    naming a class this run cannot see at all (a jar-shipped abstract
+    base servlet, the normal real-world case for a framework-provided
+    class) must keep the existing file-owner fallback publication
+    unchanged - this producer cannot know that class's own type-kind
+    without it being in-scan, and guessing suppression over evidence
+    that never existed would be exactly the wrong direction to be
+    wrong in."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>abs</servlet-name>
+    <servlet-class>com.framework.AbstractDispatchServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>abs</servlet-name>
+    <url-pattern>/abs/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = (
+        java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml))
+    results = {"WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points)}
+    entry_point_records, features, problems = fa.build_features(results)
+    assert len(entry_point_records) == 1
+    assert len(features) == 1
+    assert problems == []
 
 
 def test_web_xml_entry_point_still_owned_by_the_file_when_the_class_is_out_of_scan():
@@ -187,7 +353,7 @@ def test_web_xml_entry_point_still_owned_by_the_file_when_the_class_is_out_of_sc
     results = {
         "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
     }
-    entry_point_records, features = fa.build_features(results)
+    entry_point_records, features, _problems = fa.build_features(results)
     file_unit_id = fa._java_file_unit_id("WEB-INF/web.xml")
     assert len(entry_point_records) == 1
     assert entry_point_records[0].owning_unit_id == file_unit_id
@@ -234,7 +400,7 @@ def test_two_out_of_scan_classes_sharing_a_simple_name_get_distinct_feature_ids(
         "WEB-INF/web.xml": java_adapter.JavaFileResult(
             entry_points=[*entry_points_a, *entry_points_b]),
     }
-    entry_point_records, features = fa.build_features(results)
+    entry_point_records, features, _problems = fa.build_features(results)
     assert len(entry_point_records) == 2
     assert len(features) == 2
     feature_ids = {f.feature_id for f in features}
@@ -281,7 +447,7 @@ def test_three_out_of_scan_classes_sharing_a_simple_name_across_servlet_and_filt
         "WEB-INF/web.xml": java_adapter.JavaFileResult(
             entry_points=[*entry_points_servlet, *entry_points_filter]),
     }
-    entry_point_records, features = fa.build_features(results)
+    entry_point_records, features, _problems = fa.build_features(results)
     assert len(entry_point_records) == 2
     assert len(features) == 2
     assert len({f.feature_id for f in features}) == 2, (
@@ -312,7 +478,7 @@ def test_two_servlet_mappings_in_one_web_xml_produce_two_features_not_one():
     results = {
         "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
     }
-    entry_point_records, features = fa.build_features(results)
+    entry_point_records, features, _problems = fa.build_features(results)
     assert len(entry_point_records) == 2
     assert len(features) == 2
     assert sorted(f.label for f in features) == ["dispatcher", "legacy"]
@@ -332,7 +498,7 @@ def test_two_routes_on_the_same_controller_group_into_one_feature():
         "}\n"
     )
     results = {"Controller.java": _parse("Controller.java", source)}
-    entry_points, features = fa.build_features(results)
+    entry_points, features, _problems = fa.build_features(results)
     assert len(entry_points) == 2
     assert len(features) == 1
     assert sorted(features[0].entry_point_ids) == sorted(e.entry_point_id for e in entry_points)
@@ -353,7 +519,7 @@ def test_get_and_post_on_the_same_path_are_two_distinct_entry_points_not_a_dupli
         "}\n"
     )
     results = {"Controller.java": _parse("Controller.java", source)}
-    entry_points, features = fa.build_features(results)
+    entry_points, features, _problems = fa.build_features(results)
     ids = [e.entry_point_id for e in entry_points]
     assert len(ids) == len(set(ids)), "two distinct routes published the SAME entry_point_id"
     assert {e.name for e in entry_points} == {"GET /orders", "POST /orders"}
@@ -376,7 +542,7 @@ def test_duplicate_entry_point_claims_coalesce_to_one_record_with_merged_produce
         )],
         entry_points=[claim, claim],
     )
-    entry_points, features = fa.build_features(
+    entry_points, features, _problems = fa.build_features(
         {"App.java": result}, file_digests={"App.java": "deadbeef"})
     assert len(entry_points) == 1
     assert len(features[0].entry_point_ids) == 1
@@ -398,7 +564,7 @@ def test_entry_points_on_different_classes_produce_separate_features():
             'package p;\n@RestController\nclass Controller {\n  @GetMapping("/x")\n  void get() {}\n}\n',
         ),
     }
-    entry_points, features = fa.build_features(results)
+    entry_points, features, _problems = fa.build_features(results)
     assert len(features) == 2
     assert {f.label for f in features} == {"App", "Controller"}
 
@@ -406,20 +572,20 @@ def test_entry_points_on_different_classes_produce_separate_features():
 def test_confirmed_labels_promote_feature_state():
     results = {"App.java": _parse(
         "App.java", "package p;\nclass App {\n  public static void main(String[] a) {}\n}\n")}
-    _entry_points, features = fa.build_features(results, confirmed_labels=frozenset({"App"}))
+    _entry_points, features, _problems = fa.build_features(results, confirmed_labels=frozenset({"App"}))
     assert features[0].state == "confirmed"
 
 
 def test_unconfirmed_label_stays_candidate():
     results = {"App.java": _parse(
         "App.java", "package p;\nclass App {\n  public static void main(String[] a) {}\n}\n")}
-    _entry_points, features = fa.build_features(results, confirmed_labels=frozenset({"SomeOther"}))
+    _entry_points, features, _problems = fa.build_features(results, confirmed_labels=frozenset({"SomeOther"}))
     assert features[0].state == "candidate"
 
 
 def test_no_entry_points_means_no_features():
     results = {"Widget.java": _parse("Widget.java", "package p;\nclass Widget {}\n")}
-    entry_points, features = fa.build_features(results)
+    entry_points, features, _problems = fa.build_features(results)
     assert entry_points == []
     assert features == []
 
@@ -427,8 +593,8 @@ def test_no_entry_points_means_no_features():
 def test_ids_are_deterministic_across_two_builds():
     results = {"App.java": _parse(
         "App.java", "package p;\nclass App {\n  public static void main(String[] a) {}\n}\n")}
-    first_ep, first_f = fa.build_features(results)
-    second_ep, second_f = fa.build_features(results)
+    first_ep, first_f, _problems = fa.build_features(results)
+    second_ep, second_f, _problems = fa.build_features(results)
     assert {e.entry_point_id for e in first_ep} == {e.entry_point_id for e in second_ep}
     assert {f.feature_id for f in first_f} == {f.feature_id for f in second_f}
 
@@ -436,7 +602,7 @@ def test_ids_are_deterministic_across_two_builds():
 def test_to_json_sorts_id_lists():
     results = {"App.java": _parse(
         "App.java", "package p;\nclass App {\n  public static void main(String[] a) {}\n}\n")}
-    entry_points, features = fa.build_features(results)
+    entry_points, features, _problems = fa.build_features(results)
     payload = features[0].to_json()
     assert payload["entry_point_ids"] == sorted(payload["entry_point_ids"])
     assert entry_points[0].to_json()["feature_ids"] == [features[0].feature_id]
@@ -470,8 +636,8 @@ def test_a_single_oversized_url_pattern_is_bounded_and_id_sensitive_past_the_bou
         results = {"WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points)}
         return fa.build_features(results)
 
-    entry_points_a, _features_a = _build(prefix + "A" * 60)
-    entry_points_b, _features_b = _build(prefix + "B" * 60)
+    entry_points_a, _features_a, _problems_a = _build(prefix + "A" * 60)
+    entry_points_b, _features_b, _problems_b = _build(prefix + "B" * 60)
     assert len(entry_points_a) == len(entry_points_b) == 1
     name_a, name_b = entry_points_a[0].name, entry_points_b[0].name
     assert name_a == name_b, "both oversized patterns must truncate to the identical display name"
@@ -510,8 +676,8 @@ def test_a_real_newline_and_its_own_literal_backslash_n_spelling_publish_distinc
     assert "\n" in real_newline_result.edges[0].target
     assert "\\" in literal_result.edges[0].target and "\n" not in literal_result.edges[0].target
 
-    entry_points_a, _f = fa.build_features({"Amb.java": real_newline_result})
-    entry_points_b, _f = fa.build_features({"Amb2.java": literal_result})
+    entry_points_a, _f, _problems = fa.build_features({"Amb.java": real_newline_result})
+    entry_points_b, _f, _problems = fa.build_features({"Amb2.java": literal_result})
     assert entry_points_a[0].name != entry_points_b[0].name, (
         "a real newline and its own literal backslash-n spelling must not publish "
         "the identical escaped display name"

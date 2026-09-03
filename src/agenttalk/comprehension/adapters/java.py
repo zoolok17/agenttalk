@@ -289,6 +289,21 @@ UNSUPPORTED_ENTRY_POINT_SHAPES = (
     # matching call site's own docstring. CLOSES the round-25 abstract-
     # @Path carry (folded into N5 at round 27).
     "jax_rs_route_on_unregistered_class",
+    # FIX ROUND 45 (thirty-ninth cold read, F2 MAJOR - THE MATRIX'S OWN
+    # MISSING COLUMN): a web.xml ``<servlet-class>``/``<filter-class>``
+    # is a THIRD, STILL STRONGER registrability claim than any
+    # annotation family above - a descriptor explicitly instructs the
+    # container to instantiate THIS SPECIFIC named class, with no
+    # implementor-may-serve escape an interface/abstract annotation
+    # target still has (Spring/JAX-RS's own weaker claim). This adapter
+    # cannot decide this AT PARSE TIME (registrability is a per-file,
+    # per-class fact this single-file parse of one web.xml cannot see
+    # for a class declared in a DIFFERENT file) - resolved instead at
+    # the cross-file registry step (`features_artifact.build_features`,
+    # once every file's own `JavaUnitClaim.is_interface`/`is_abstract`/
+    # `is_enum` is available together) and enrolled here for the same
+    # STATIC CAPABILITY DECLARATION reason every sibling shape is.
+    "descriptor_route_on_uninstantiable_class",
 )
 
 #: FIX ROUND 21c (reviewer-3's re-delta, THE ASK - second instance, closing
@@ -1006,13 +1021,32 @@ _MAX_ROUTE_TARGET_LENGTH = 200
 class JavaUnitClaim:
     """One declared Java type (design, Artifact 1: a bundled adapter may
     additionally identify a package/module/component within a file
-    unit)."""
+    unit).
+
+    FIX ROUND 45 (thirty-ninth cold read, F2 MAJOR): ``is_interface``/
+    ``is_abstract``/``is_enum`` (the same per-type facts THE REGISTRABILITY
+    MATRIX's own ``_class_registrability`` already gathers, round 44)
+    now travel WITH the unit claim, so they survive into a run's own
+    cross-file registry (``dependencies_artifact._build_registry``,
+    which folds every file's own ``result.units`` together) - the one
+    place a web.xml ``<servlet-class>``/``<filter-class>`` in ANOTHER
+    file resolves ownership to an actual declared class. Before this,
+    registrability was consultable only WITHIN the single file that
+    declared the class - unreachable from a descriptor in a different
+    file, since nothing carried the fact across the file boundary.
+    ``has_stereotype`` (Spring-specific) is deliberately NOT carried
+    here - a descriptor's own instantiation contract does not depend on
+    it, only on whether the class can be instantiated/dispatched to at
+    all."""
 
     relative_path: str
     qualified_name: str
     simple_name: str
     line: int
     classification: str
+    is_interface: bool = False
+    is_abstract: bool = False
+    is_enum: bool = False
 
 
 @dataclass(frozen=True)
@@ -2560,6 +2594,21 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     types = _extract_types(sanitized, package)
     local_simple_names = {simple for _, simple, *_ in types}
     primary_qualified = types[0][0] if types else (package or relative_path)
+    # FIX ROUND 45 (thirty-ninth cold read, F2 MAJOR): moved up from
+    # immediately before the route-annotation composition loop (where
+    # round 44 first introduced it) to HERE, before `units` is built
+    # below - `JavaUnitClaim` now carries each declared type's own
+    # registrability (is_interface/is_abstract/is_enum) so it survives
+    # into the cross-file registry `dependencies_artifact._build_registry`
+    # assembles from every file's own `result.units` - the one place a
+    # web.xml `<servlet-class>`/`<filter-class>` resolves ownership to an
+    # ACTUAL class, in a DIFFERENT file, where this file's own
+    # `class_registrability` dict below is out of scope entirely.
+    class_header_associations = _class_header_associations(sanitized, types)
+    class_registrability = {
+        qualified: _class_registrability(sanitized, declaration_start, header_start)
+        for declaration_start, header_start, qualified in class_header_associations
+    }
     # FIX ROUND 14 (tenth cold read, CR10-1 MAJOR): an ``import`` is a
     # FILE-scoped Java fact (every type declared in the file sees every
     # import, regardless of which one actually uses it) - publishing it
@@ -2586,6 +2635,9 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             line=_line_at(newline_offsets, brace_pos),
             classification=_classify(
                 relative_path, simple, has_test_framework_evidence=has_test_framework_evidence),
+            is_interface=class_registrability.get(qualified, (False, False, False, False))[0],
+            is_abstract=class_registrability.get(qualified, (False, False, False, False))[1],
+            is_enum=class_registrability.get(qualified, (False, False, False, False))[3],
         )
         for qualified, simple, _container, brace_pos, _extends, _implements, _end in types
     ]
@@ -2833,16 +2885,13 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     # a named, declared gap rather than either a guess or a silent one -
     # see this producer's own capability description and the design
     # doc's own Artifact-2 section for the same limit stated there.
-    class_header_associations = _class_header_associations(sanitized, types)
-    # FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER): computed ONCE,
-    # alongside class_header_associations (the same declaration_start/
-    # header_start pairs this reuses) - every route-family publish site
-    # below consults this ONE dict rather than re-deriving a class's own
-    # shape per call site.
-    class_registrability = {
-        qualified: _class_registrability(sanitized, declaration_start, header_start)
-        for declaration_start, header_start, qualified in class_header_associations
-    }
+    # FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER): `class_registrability`
+    # is computed ONCE, alongside `class_header_associations` (the same
+    # declaration_start/header_start pairs this reuses) - every
+    # route-family publish site below consults this ONE dict rather than
+    # re-deriving a class's own shape per call site. FIX ROUND 45 (F2):
+    # both now computed further up, before `units` is built - see that
+    # site's own comment.
     class_route_prefix: dict[str, list[str]] = {}
     # Fix round 11 (seventh cold read BLOCKER part 2 - the fail-safe for
     # unrecoverable values): a class-level route annotation whose OWN

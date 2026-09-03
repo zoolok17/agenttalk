@@ -604,6 +604,32 @@ way and, unlike an interface/abstract class, no other class can ever extend
 one - a provably stronger "never registered" claim for both the Spring and
 JAX-RS families, folded into each family's own existing enrolled shape.
 
+NAMED LIMIT (declared and CLOSED, PR-B round 45 - THE MATRIX'S OWN MISSING
+COLUMN): a web.xml `<servlet-class>`/`<filter-class>` is a THIRD, STILL
+STRONGER registrability claim than any annotation family above - a descriptor
+explicitly names ONE specific class for the container to instantiate, with no
+implementor-may-serve escape an interface/abstract annotation target still
+has (Spring/JAX-RS's own weaker claim, above). This could not be decided at
+parse time (a single web.xml file's own parse cannot see another file's own
+declared class), so `JavaUnitClaim` now carries each declared type's own
+`is_interface`/`is_abstract`/`is_enum` (round 44's own `_class_registrability`
+facts, threaded through) and `features_artifact.build_features` - the one
+place a descriptor's `qualified_name` already resolves cross-file - consults
+it: an in-scan interface/abstract/enum target suppresses the route/filter
+entirely (never published) and records `unsupported_entry_point_shape`
+(`descriptor_route_on_uninstantiable_class`), degrading the run and
+re-attributing the reason onto the resolved class's own `modules.json` record
+via the SAME cross-file mechanism the web.xml `<listener>` case already
+established (`modules_artifact._attribute_cross_file_entry_point_reasons`). A
+descriptor naming a class NOT in this run's own scan (the normal real-world
+case - a jar-shipped servlet/filter base class) keeps publishing unchanged -
+this producer has no type-kind evidence for a class it never parsed, and
+suppressing over evidence that never existed would be exactly the wrong
+direction to be wrong in; ARGUED, not chased, whether an explicit
+unknowability caveat is needed here beyond the existing honest-external-case
+precedent (`test_web_xml_entry_point_still_owned_by_the_file_when_the_class_
+is_out_of_scan`'s own established shape) - no new caveat added this round.
+
 NAMED LIMIT (declared, MICRO-ROUND 44b): registrability checks cover type
 kind (interface/abstract/enum) and Spring stereotype presence only -
 constructor accessibility and other finer instantiability constraints (a
