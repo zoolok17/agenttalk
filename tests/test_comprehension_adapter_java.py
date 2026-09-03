@@ -1707,6 +1707,49 @@ public class ApiFilter implements Filter {
     assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
 
 
+def test_web_servlet_on_an_enum_is_never_instantiated():
+    """FIX ROUND 45 (thirty-ninth cold read, F3 MINOR, wrong-data,
+    .cr39-enumservlet - a cell-drop the matrix itself exists to
+    prevent): round 44b closed the enum cell for Spring and JAX-RS but
+    `_uninstantiable_class_problem`'s own signature never accepted
+    `is_enum` at all, so the SAME enum decorated with @WebServlet
+    instead still published complete/0 in the identical probe where
+    its own @Path/@RestController sibling correctly suppressed."""
+    src = """
+package p;
+
+@WebServlet("/api")
+public enum ApiServlet {
+    A, B;
+}
+"""
+    result = java.parse_java_source("ApiServlet.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.ApiServlet"
+    assert "webservlet_on_uninstantiable_class" in problem.detail
+    assert "an ENUM" in problem.detail
+
+
+def test_web_filter_on_an_enum_is_never_instantiated():
+    """FIX ROUND 45 (F3 MINOR, .cr39-enumservlet, @WebFilter sibling):
+    the same cell-drop, for @WebFilter instead of @WebServlet."""
+    src = """
+package p;
+
+@WebFilter("/api/*")
+public enum ApiFilter {
+    A, B;
+}
+"""
+    result = java.parse_java_source("ApiFilter.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.ApiFilter"
+    assert "webservlet_on_uninstantiable_class" in problem.detail
+    assert "an ENUM" in problem.detail
+
+
 def test_method_level_route_with_no_class_level_mapping_is_unchanged():
     """M5 (fourth cold read, fix round 6): a class with no class-level
     route annotation at all must publish the method's own route exactly

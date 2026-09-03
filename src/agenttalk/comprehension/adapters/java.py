@@ -2389,7 +2389,8 @@ def _class_registrability(
 
 
 def _uninstantiable_class_problem(
-    target_type: str, is_interface: bool, is_abstract: bool, line: int, annotation_label: str,
+    target_type: str, is_interface: bool, is_abstract: bool, is_enum: bool,
+    line: int, annotation_label: str,
 ) -> JavaAdapterProblem | None:
     """FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER): @WebServlet
     and @WebFilter share this exact shape - a servlet container only
@@ -2401,16 +2402,38 @@ def _uninstantiable_class_problem(
     A stronger "never served" claim is correct here - a materially
     different epistemic than the Spring family's own weaker "not
     through this class alone" wording, which is why this is a
-    separate enrolled shape rather than one shared with Spring's own."""
-    if not (is_interface or is_abstract):
+    separate enrolled shape rather than one shared with Spring's own.
+
+    FIX ROUND 45 (thirty-ninth cold read, F3 MINOR, wrong-data - a
+    cell-drop the matrix itself exists to prevent): this caller's own
+    `_class_registrability` already computes `is_enum` too (round 44b
+    closed the enum cell for Spring and JAX-RS) but this function's own
+    signature never accepted it, so an enum decorated with @WebServlet/
+    @WebFilter still published complete/0 in the SAME probe where the
+    identical enum's own @Path/@RestController correctly suppressed.
+    Worded with the same "ordinary" hedge round 44b's own Spring/JAX-RS
+    enum wording uses, not the plain "never served" phrase the
+    interface/abstract cells get - both are provable claims, but this
+    keeps the enum-specific reasoning (no OTHER class can ever extend
+    an enum) visible in the detail text rather than silently folded
+    into the type-kind-agnostic phrasing."""
+    if not (is_interface or is_abstract or is_enum):
         return None
-    shape = "an INTERFACE" if is_interface else "ABSTRACT"
+    if is_interface:
+        shape = "an INTERFACE"
+    elif is_abstract:
+        shape = "ABSTRACT"
+    else:
+        shape = "an ENUM"
+    detail_suffix = (
+        "never instantiated as an ordinary servlet/filter" if is_enum
+        else "never served, only concrete classes are instantiated"
+    )
     return JavaAdapterProblem(
         reason_code="unsupported_entry_point_shape",
         detail=bounded_detail(
             f"a {annotation_label} annotation at line {line} is {shape} "
-            "(webservlet_on_uninstantiable_class) - never served, only concrete classes "
-            "are instantiated"),
+            f"(webservlet_on_uninstantiable_class) - {detail_suffix}"),
         qualified_name=target_type,
     )
 
@@ -3246,10 +3269,10 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         # FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER - THE
         # REGISTRABILITY MATRIX): see _uninstantiable_class_problem's
         # own docstring - shared with @WebFilter below.
-        is_interface, is_abstract, _has_stereotype, _is_enum = class_registrability.get(
+        is_interface, is_abstract, _has_stereotype, is_enum = class_registrability.get(
             target_type, (False, False, False, False))
         uninstantiable_problem = _uninstantiable_class_problem(
-            target_type, is_interface, is_abstract, line, "@WebServlet")
+            target_type, is_interface, is_abstract, is_enum, line, "@WebServlet")
         if uninstantiable_problem is not None:
             problems.append(uninstantiable_problem)
             continue
@@ -3340,10 +3363,10 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         # FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER): see
         # _uninstantiable_class_problem's own docstring - shared with
         # @WebServlet above.
-        is_interface, is_abstract, _has_stereotype, _is_enum = class_registrability.get(
+        is_interface, is_abstract, _has_stereotype, is_enum = class_registrability.get(
             target_type, (False, False, False, False))
         uninstantiable_problem = _uninstantiable_class_problem(
-            target_type, is_interface, is_abstract, line, "@WebFilter")
+            target_type, is_interface, is_abstract, is_enum, line, "@WebFilter")
         if uninstantiable_problem is not None:
             problems.append(uninstantiable_problem)
             continue
