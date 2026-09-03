@@ -995,6 +995,88 @@ def test_process_paths_a_lower_case_web_inf_directory_still_counts(tmp_path: Pat
     assert entry_points[0]["name"] == "/example"
 
 
+def _web_xml_with_one_mapping(url_pattern: str = "/example") -> str:
+    return (
+        "<web-app>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>example</servlet-name>\n"
+        f"    <url-pattern>{url_pattern}</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n"
+    )
+
+
+def test_process_paths_a_test_resources_web_inf_web_xml_is_stray_counted_not_served(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 44 (thirty-eighth cold read, F2 MAJOR, .cr38-webxml,
+    wrong-data): round 43's own F4 gate only ever checked LOCATION
+    (the immediate parent directory name), never classification - a
+    test-resources copy can genuinely sit directly inside a real
+    ``WEB-INF/`` directory (``src/test/resources/WEB-INF/web.xml``, a
+    real, common servlet-container integration-test fixture shape) and
+    still passed the gate, publishing a confident served route for a
+    descriptor that is never part of the deployed application. Now the
+    SAME stray-exclusion bucket the round-43 code comment already named
+    this exact case under."""
+    web_inf = tmp_path / "src" / "test" / "resources" / "WEB-INF"
+    web_inf.mkdir(parents=True)
+    (web_inf / "web.xml").write_text(_web_xml_with_one_mapping(), encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["src/test/resources/WEB-INF/web.xml"])
+    assert result.problems == []
+    assert "src/test/resources/WEB-INF/web.xml" not in result.java_results
+    assert result.exclusions == {"stray_web_xml_ignored": 1}
+
+
+def test_process_paths_a_tests_directory_web_inf_web_xml_is_also_stray_counted(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 44 (F2 MAJOR, .cr38-webxml): the SAME test-source-root
+    predicate this producer already uses elsewhere recognizes a bare
+    top-level ``tests/`` root too, not only Maven's own ``src/test/``
+    layout - both spellings of "this is test source" must land
+    identically."""
+    web_inf = tmp_path / "tests" / "fixtures" / "WEB-INF"
+    web_inf.mkdir(parents=True)
+    (web_inf / "web.xml").write_text(_web_xml_with_one_mapping(), encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["tests/fixtures/WEB-INF/web.xml"])
+    assert result.problems == []
+    assert "tests/fixtures/WEB-INF/web.xml" not in result.java_results
+    assert result.exclusions == {"stray_web_xml_ignored": 1}
+
+
+def test_process_paths_a_main_web_inf_web_xml_still_publishes_a_served_route(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 44 (F2 MAJOR, .cr38-webxml control): a genuine
+    ``src/main/webapp/WEB-INF/web.xml`` (never under any test source
+    root) must keep publishing its route exactly as before - round
+    44's own new classification check must never over-exclude the
+    real, deployed descriptor it exists beside."""
+    web_inf = tmp_path / "src" / "main" / "webapp" / "WEB-INF"
+    web_inf.mkdir(parents=True)
+    (web_inf / "web.xml").write_text(_web_xml_with_one_mapping(), encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["src/main/webapp/WEB-INF/web.xml"])
+    assert result.exclusions == {}
+    entry_points = result.java_results["src/main/webapp/WEB-INF/web.xml"]["entry_points"]
+    assert entry_points[0]["name"] == "/example"
+
+
+def test_process_paths_a_docs_example_web_xml_is_still_stray_counted_after_f2(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 44 (F2 MAJOR, .cr38-webxml control): round 43's own
+    docs/examples case (never under WEB-INF/ at all) must stay
+    unaffected by round 44's own added classification check - it was
+    already excluded on location grounds alone."""
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "web.xml").write_text(_web_xml_with_one_mapping(), encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["docs/web.xml"])
+    assert result.problems == []
+    assert "docs/web.xml" not in result.java_results
+    assert result.exclusions == {"stray_web_xml_ignored": 1}
+
+
 def test_process_paths_a_latin1_tooling_xml_records_encoding_undecodable_not_unsupported_language(
     tmp_path: Path,
 ) -> None:

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess  # nosec B404 - launches only the bundled worker module, argv fixed, shell disabled
 import sys
 from dataclasses import dataclass, field
@@ -43,6 +44,19 @@ from typing import Any
 from .adapters import java as java_adapter
 from .envelope import EnvelopeError, resolve_under_root
 from .errors import ComprehensionError, bounded_detail, bounded_os_error_detail
+
+#: FIX ROUND 44 (thirty-eighth cold read, F2 MAJOR): a THIRD copy of the
+#: same test-source-root predicate java.py's own module docstring
+#: (near `_TEST_SOURCE_ROOT_SEGMENT`) and modules_artifact.py's own
+#: `_default_classification` already carry - worker.py cannot import
+#: either (this module IS the sanitized subprocess boundary those two
+#: run as regular in-process code; discovery.py's own docstring already
+#: names the identical constraint for the reverse direction). Accepted
+#: the same way the existing two-copy duplication already is (see
+#: "Named decisions and residuals") - a shared, lower-level module all
+#: three could import from would close this properly, wider than this
+#: fix.
+_TEST_SOURCE_ROOT_SEGMENT = re.compile(r"(?:^|/)src/test/|^tests?/")
 
 _ADAPTER_EXTENSIONS = {".java": java_adapter}
 _ADAPTER_HANDLED_XML_BASENAMES = frozenset({"pom.xml", "web.xml"})
@@ -759,7 +773,10 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                                "this pom's own coordinate is treated as absent rather than "
                                "published with a guessed value",
                     ))
-        elif rel_name_lower == "web.xml" and Path(rel).parent.name.lower() != "web-inf":
+        elif rel_name_lower == "web.xml" and (
+            Path(rel).parent.name.lower() != "web-inf"
+            or _TEST_SOURCE_ROOT_SEGMENT.search(rel.replace("\\", "/"))
+        ):
             # FIX ROUND 43 (thirty-seventh cold read, F4 MAJOR, wrong-
             # data - declared gap): per the Servlet spec, a REAL
             # deployable descriptor always lives directly inside a
@@ -775,6 +792,34 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
             # <servlet-mapping>/<filter-mapping> entries as genuinely
             # SERVED routes over-claims this scan's own confidence
             # about what the target application actually exposes.
+            #
+            # FIX ROUND 44 (thirty-eighth cold read, F2 MAJOR, wrong-
+            # data - the gap this round's own comment named but the
+            # code never checked): a test-resources copy - the THIRD
+            # of the three cases named just above - can genuinely sit
+            # directly inside a real `WEB-INF/` directory
+            # (`src/test/resources/WEB-INF/web.xml`, a real, common
+            # shape for a servlet-container integration test fixture)
+            # and still passed this gate, since the gate only ever
+            # checked location, never classification. This producer
+            # already computes, elsewhere in the SAME pipeline, exactly
+            # the evidence that would catch this (a unit under a
+            # recognized test source root classifies `test` -
+            # modules_artifact.py's own `_default_classification`) but
+            # never consulted it here. `_TEST_SOURCE_ROOT_SEGMENT` is
+            # the SAME predicate re-applied directly to this file's own
+            # path (worker.py cannot import modules_artifact.py - see
+            # that constant's own docstring above) - test classification
+            # always wins first in the real pipeline too (`_default_
+            # classification` checks it before any infrastructure
+            # heuristic), so this direct re-check can never disagree
+            # with what the eventual unit record would say.
+            #
+            # Judged: the SAME exclusion bucket as the other two cases,
+            # not a separate one - all three are the identical
+            # underlying judgment ("not a genuine deployment
+            # descriptor"), and the round-43 comment above already
+            # named all three together as one class.
             #
             # Judged: an EXCLUSION count (the same `profile_scoped_
             # dependencies` idiom above, and scan.json's own discovery-
