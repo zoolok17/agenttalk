@@ -6065,12 +6065,76 @@ def test_validate_run_success_detail_names_the_record_count_and_reference_checks
     checks even after round 28's own F4 fix added record-count
     verification and the widened cross-artifact reference sweep - the
     same artifact_integrity_hint discipline (declare what a mechanism
-    actually covers) applied to validate's own success detail too."""
+    actually covers) applied to validate's own success detail too.
+
+    FIX ROUND 47 (THE SENTENCE AUDIT): the sentence had drifted again -
+    module path confinement (round 32), problem_id/id-family collision-
+    freedom (rounds 36/38/39), and readiness-summary reference integrity
+    (M11, this round) were all checks `invalid` actually depended on but
+    this sentence never named."""
     scan_pipeline.run_scan(java_repo)
     result = scan_pipeline.validate_run(java_repo)
     assert result["valid"] is True
     assert "record count" in result["detail"]
     assert "reference" in result["detail"]
+    assert "scan_id consistency" in result["detail"]
+    assert "readiness-summary" in result["detail"]
+    assert "path confinement" in result["detail"]
+    assert "collision-freedom" in result["detail"]
+
+
+def test_validate_run_catches_an_artifact_whose_own_scan_id_does_not_match_the_run(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 47 (forty-first cold read, M5 MAJOR, wrong-data - THE
+    SENTENCE AUDIT): validate's own success detail claimed "scan_id
+    consistency" as one of its checks, but no code anywhere actually
+    compared a loaded artifact's own internal scan_id field against the
+    run being read. A run directory whose own modules.json carries a
+    DIFFERENT scan_id (e.g. copied from another run, or hand-edited)
+    passed silently. Reproduced with the digest/record_count otherwise
+    self-consistent (content_digest is UNAFFECTED - scan_id is a
+    GENERATION_IDENTITY key already stripped before content-hashing -
+    only byte_sha256 needs re-signing) so this test isolates the NEW
+    scan_id check specifically, not the pre-existing digest check."""
+    import json
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_path = outcome.run_dir / "modules.json"
+    doc = json.loads(modules_path.read_text(encoding="utf-8"))
+    doc["scan_id"] = "some-other-run-entirely"
+    modules_path.write_text(
+        scan_pipeline.digests.canonical_json_bytes(doc).decode("utf-8"), encoding="utf-8")
+    # Re-sign byte_sha256 only - content_digest is unaffected (scan_id is
+    # stripped before content-hashing) and record_count is unaffected
+    # (units unchanged) - so the pre-existing digest/record_count checks
+    # would NOT catch this on their own, isolating the new check.
+    scan_path = outcome.run_dir / "scan.json"
+    scan_doc = json.loads(scan_path.read_text(encoding="utf-8"))
+    for entry in scan_doc["artifacts"]:
+        if entry["name"] == "modules.json":
+            entry["byte_sha256"] = scan_pipeline.digests.sha256_file(modules_path)
+    scan_path.write_text(
+        scan_pipeline.digests.canonical_json_bytes(scan_doc).decode("utf-8"), encoding="utf-8")
+
+    result = scan_pipeline.validate_run(java_repo)
+    assert result["valid"] is False
+    assert "scan_id" in result["detail"]
+    assert "some-other-run-entirely" in result["detail"]
+
+    with pytest.raises(scan_pipeline.ComprehensionError, match="scan_id"):
+        scan_pipeline.get_report(java_repo)
+
+
+def test_get_status_own_scan_id_is_provably_the_requested_run(java_repo: Path) -> None:
+    """FIX ROUND 47 (M5 MAJOR): get_status's own scan.json load goes
+    through the SAME choke point now - its own returned scan_id field
+    is provably the requested run's own identity, never scan.json's
+    internal field read back uncompared (a mismatch would raise before
+    get_status's own return statement is ever reached)."""
+    outcome = scan_pipeline.run_scan(java_repo)
+    payload = scan_pipeline.get_status(java_repo)
+    assert payload["scan_id"] == outcome.scan_id
 
 
 def test_run_scan_refuses_to_publish_an_entry_point_with_an_unknown_owning_unit(
@@ -6320,6 +6384,72 @@ def test_run_scan_refuses_to_publish_a_dependency_edge_with_an_unknown_candidate
 
     with pytest.raises(
         scan_pipeline.ComprehensionError, match="edge\\(s\\) reference an unknown candidate_unit_id",
+    ):
+        scan_pipeline.run_scan(java_repo)
+
+
+def test_run_scan_refuses_to_publish_a_dependency_edge_with_an_unknown_target_unit_id_even_when_unresolved(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """M10 (cold-read PR-B fix round 47): the target_unit_id sweep used to
+    gate on resolution_state == "resolved" - but projector._fan_counts
+    reads edge.target_unit_id unconditionally (no resolution_state check
+    at all), so a dangling target_unit_id on a non-"resolved" edge would
+    silently feed the projector's own fan-in count while this sweep stayed
+    blind to it. Proves the sweep now catches it regardless of
+    resolution_state (a producer bug, not today's real producer's own
+    shape, which never actually sets target_unit_id off "resolved" - this
+    is the sweep's OWN defense against that assumption drifting)."""
+    from agenttalk.comprehension import dependencies_artifact as depsmod
+
+    real_build_dependencies = depsmod.build_dependencies
+
+    def _inject_a_dangling_unresolved_target(*args, **kwargs):
+        edges = real_build_dependencies(*args, **kwargs)
+        orphan = depsmod.DependencyRecord(
+            edge_id="orphan-edge",
+            from_unit_id=scan_pipeline.digests.unit_id(
+                kind="component", paths=["src/main/java/p/App.java"], qualified_name="p.App"),
+            relation="import", phase="runtime",
+            optional=False, evidence_class="extracted", resolution_state="unresolved",
+            target_unit_id="does-not-exist",
+        )
+        return [*edges, orphan]
+
+    monkeypatch.setattr(
+        scan_pipeline.dependencies_artifact, "build_dependencies", _inject_a_dangling_unresolved_target)
+
+    with pytest.raises(
+        scan_pipeline.ComprehensionError, match="edge\\(s\\) reference an unknown target_unit_id",
+    ):
+        scan_pipeline.run_scan(java_repo)
+
+
+def test_run_scan_refuses_to_publish_a_readiness_summary_with_an_unknown_unit_id(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """M11 (cold-read PR-B fix round 47): readiness.json's own
+    summaries[].unit_id had NO cross-reference sweep at all - every other
+    unit_id-shaped reference (signals[].unit_id, edges, entry points,
+    features, module containers) was already covered; UnitReadinessSummary
+    was the one family missed."""
+    from agenttalk.comprehension import readiness_artifact as readinessmod
+
+    real_build_readiness = readinessmod.build_readiness
+
+    def _inject_a_dangling_summary(*args, **kwargs):
+        signals, summaries = real_build_readiness(*args, **kwargs)
+        orphan = readinessmod.UnitReadinessSummary(
+            unit_id="does-not-exist", stored_assessment_state="needs_evidence",
+        )
+        return signals, [*summaries, orphan]
+
+    monkeypatch.setattr(
+        scan_pipeline.readiness_artifact, "build_readiness", _inject_a_dangling_summary)
+
+    with pytest.raises(
+        scan_pipeline.ComprehensionError,
+        match="readiness summary\\(s\\) reference an unknown unit_id",
     ):
         scan_pipeline.run_scan(java_repo)
 

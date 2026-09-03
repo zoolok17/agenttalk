@@ -1419,6 +1419,7 @@ def run_scan(
         _publish_time_dangling = _dangling_reference_categories(
             modules=modules, dependencies=dependencies, entry_points=entry_points,
             features=features, readiness_signals=readiness_signals,
+            readiness_summaries=readiness_summaries,
         )
         if any(ids for _, ids in _publish_time_dangling):
             # MICRO-ROUND 29b (JUDGE, note-only, lean take): this refusal
@@ -2365,12 +2366,36 @@ def _load_single_artifact(
     """Read and envelope/schema-validate ONE artifact document - shared
     by :func:`get_status` (which, per the design's own read-cost tier,
     loads scan.json only) and :func:`_load_run_records` (which loads
-    every artifact, for callers that verify what they actually load)."""
+    every artifact, for callers that verify what they actually load).
+
+    FIX ROUND 47 (forty-first cold read, M5 MAJOR, wrong-data - THE
+    SENTENCE AUDIT): ``validate_run``'s own success detail sentence
+    claimed "scan_id consistency" as one of the things it verifies, but
+    no code anywhere actually compared a LOADED artifact's own internal
+    ``scan_id`` field against the run this call was actually asked to
+    read - ``scan_id`` (the parameter here) was used ONLY to prefix an
+    error message, never checked against the document's own declared
+    value. A run directory whose own artifact was hand-edited (or
+    copied from a DIFFERENT run) to carry a mismatched ``scan_id``
+    passed silently; ``get_status --run X`` and ``validate --run X``
+    could report two different internal identities for the identical
+    request, since neither ever cross-checked it. Implemented here, the
+    ONE choke point every artifact load (scan.json included) already
+    funnels through - so ``get_status``'s own scan_id field is
+    PROVABLY the requested one by the time it is read back out (a
+    mismatch raises before that point is ever reached), never needing
+    a second, separate fix at its own return statement."""
     try:
         doc = read_json_document(run_dir / name)
     except EnvelopeError as exc:
         raise ComprehensionError(f"{scan_id}'s {name} could not be read: {exc}") from exc
-    return validate_envelope(doc, artifact_type=artifact_type, schema_version=schema_version)
+    validated = validate_envelope(doc, artifact_type=artifact_type, schema_version=schema_version)
+    doc_scan_id = validated.get("scan_id")
+    if doc_scan_id != scan_id:
+        raise ComprehensionError(
+            f"{name}'s own scan_id ({doc_scan_id!r}) does not match the requested run "
+            f"({scan_id!r}) - this run's own artifacts are internally inconsistent")
+    return validated
 
 
 def _load_run_records(comprehension_dir: Path, scan_id: str) -> dict[str, Any]:
@@ -2483,6 +2508,7 @@ def get_report(
         modules=records["modules"], dependencies=records["dependencies"],
         entry_points=records["entry_points"], features=records["features"],
         readiness_signals=records["readiness_signals"],
+        readiness_summaries=records["readiness_summaries"],
     )
     if any(ids for _, ids in _report_dangling):
         raise ComprehensionError(
@@ -2602,6 +2628,7 @@ def _dangling_reference_categories(
     entry_points: list[features_artifact.EntryPointRecord],
     features: list[features_artifact.FeatureRecord],
     readiness_signals: list[readiness_artifact.ReadinessSignal],
+    readiness_summaries: list[readiness_artifact.UnitReadinessSummary],
 ) -> tuple[tuple[str, list[str]], ...]:
     """FIX ROUND 29 (twenty-fifth cold read, F2 MAJOR, wrong-data): the
     ONE cross-artifact reference sweep both ``validate_run`` (below, on
@@ -2633,7 +2660,25 @@ def _dangling_reference_categories(
     combinatorial branch - the same discipline round 28's own version
     of this function already established, now with three more members
     a future reference needs no new branch to join, only one more
-    list entry."""
+    list entry.
+
+    M10 (cold-read PR-B fix round 47): ``dangling_target_unit_ids`` used
+    to gate on ``resolution_state == "resolved"`` - but ``projector.
+    _fan_counts`` reads ``edge.target_unit_id`` unconditionally (``if
+    edge.target_unit_id is not None``, no ``resolution_state`` check at
+    all), so a dangling ``target_unit_id`` on a non-``resolved`` edge
+    would silently feed the projector's own fan-in count while validate's
+    sweep stayed blind to it - a defensive integrity check must match its
+    consumer's own read pattern, not merely the current producer's
+    invariant (today ``target_unit_id`` happens to be set only when
+    ``resolution_state == "resolved"``, but that is an assumption this
+    sweep should not silently depend on). The gate is now simply
+    ``target_unit_id is not None``.
+
+    M11 (cold-read PR-B fix round 47): ``readiness.json``'s own
+    ``summaries[].unit_id`` had NO cross-reference sweep at all - every
+    other artifact's unit_id-shaped reference is covered above;
+    ``UnitReadinessSummary`` was the one family missed."""
     unit_ids = {m.unit_id for m in modules}
     entry_point_ids = {e.entry_point_id for e in entry_points}
     feature_ids = {f.feature_id for f in features}
@@ -2657,9 +2702,10 @@ def _dangling_reference_categories(
     ]
     # FIX ROUND 29 (F2): the three newly-covered families.
     dangling_target_unit_ids = [
+        # M10 (round 47): no resolution_state gate - _fan_counts reads
+        # target_unit_id unconditionally, so this sweep must too.
         e.edge_id for e in dependencies
-        if e.resolution_state == "resolved" and e.target_unit_id is not None
-        and e.target_unit_id not in unit_ids
+        if e.target_unit_id is not None and e.target_unit_id not in unit_ids
     ]
     dangling_candidate_unit_ids = [
         e.edge_id for e in dependencies
@@ -2669,6 +2715,11 @@ def _dangling_reference_categories(
     dangling_entry_point_feature_ids = [
         e.entry_point_id for e in entry_points
         if any(fid not in feature_ids for fid in e.feature_ids)
+    ]
+    # M11 (round 47): readiness.json's own summaries[].unit_id, the one
+    # unit_id-shaped reference family this sweep never covered.
+    dangling_summary_unit_ids = [
+        s.unit_id for s in readiness_summaries if s.unit_id not in unit_ids
     ]
     return (
         ("edge(s) reference an unknown from_unit_id", dangling_edges),
@@ -2681,6 +2732,7 @@ def _dangling_reference_categories(
         ("edge(s) reference an unknown target_unit_id", dangling_target_unit_ids),
         ("edge(s) reference an unknown candidate_unit_id", dangling_candidate_unit_ids),
         ("entry point(s) reference an unknown feature_id", dangling_entry_point_feature_ids),
+        ("readiness summary(s) reference an unknown unit_id", dangling_summary_unit_ids),
     )
 
 
@@ -2899,11 +2951,26 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
         # discipline (declare what a mechanism actually covers, don't
         # leave a caller to assume the OLD, narrower scope) applied to
         # validate's own success detail, not just status's pointer at it.
+        #
+        # FIX ROUND 47 (forty-first cold read, THE SENTENCE AUDIT): this
+        # sentence had drifted again, the identical class MICRO-ROUND 28b
+        # already fixed once - `invalid` (below) is also driven by module
+        # path confinement (_module_path_confinement_violations, round
+        # 32), problem_id collisions (_problem_id_collisions, round 36),
+        # and the per-id-family collision sweep (_id_family_collisions,
+        # rounds 38/39) - none of which this sentence ever named, even
+        # though a run failing ONLY one of them is exactly as `invalid`
+        # as a dangling reference. M11 (this round) also added readiness-
+        # summary reference integrity to the sweep itself - folded in
+        # here too, so the claim is complete for every check `invalid`
+        # actually depends on, not just the ones present when this
+        # sentence was last written.
         detail = (
             "all artifacts verified: schema, envelope identity, scan_id consistency, "
             "per-artifact/run-level content digests, declared record counts against "
-            "actual on-disk records, and cross-artifact unit/entry-point/feature/"
-            "signal reference integrity"
+            "actual on-disk records, cross-artifact unit/entry-point/feature/signal/"
+            "readiness-summary reference integrity, module path confinement, and "
+            "problem/unit/edge/entry-point/feature/signal id collision-freedom"
         )
         # Round 7c (reviewer-3 delta on 95d9cd8): valid:true's own detail
         # sentence claimed "all artifacts verified" even when scan.json's
@@ -2935,6 +3002,7 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
         entry_points=records["entry_points"] if records else [],
         features=records["features"] if records else [],
         readiness_signals=records["readiness_signals"] if records else [],
+        readiness_summaries=records["readiness_summaries"] if records else [],
     )
     # FIX ROUND 32 (twenty-eighth cold read, F4(a) MAJOR, completeness):
     # the same sweep publish-time now runs (see _module_path_confinement_

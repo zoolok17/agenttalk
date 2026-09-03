@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .ceilings import enforce_artifact_ceilings, measure_staging_artifacts
-from .digests import canonical_content_digest
+from .digests import sha256_file
 from .envelope import (
     EnvelopeError,
     read_json_document,
@@ -245,16 +245,31 @@ def _strip_owner_file(run_dir: Path) -> None:
 
 
 def read_current_index(comprehension_dir: Path) -> tuple[dict | None, str | None]:
-    """Returns ``(index_doc, content_digest)`` — ``(None, None)`` when no
-    index has ever been published yet. A caller captures the digest at lock
+    """Returns ``(index_doc, digest)`` — ``(None, None)`` when no index has
+    ever been published yet. A caller captures the digest at lock
     acquisition time as the CAS precondition for the publish that follows.
-    """
+
+    M6 (cold-read PR-B fix round 47): ``digest`` is an EXACT-BYTE digest of
+    ``index.json``'s own on-disk bytes (``digests.sha256_file``), never
+    ``canonical_content_digest`` — the CAS exists to detect ANY concurrent
+    modification to this file, but ``canonical_content_digest`` deliberately
+    strips ``GENERATION_IDENTITY_KEYS`` (which includes ``scan_id`` -
+    simultaneously the very field ``_build_successor_index`` uses to locate
+    a run's own entry). A concurrent writer that changed only a stripped
+    field (e.g. hand-edited ``scan_id`` on a stored run entry) would
+    silently pass the old, content-digest-based CAS check even though the
+    file's bytes genuinely differ - the anchor was strippable by an edit
+    the CAS exists to catch. ``canonical_content_digest`` itself is
+    unchanged and stays correct for its own content-equivalence callers
+    (scan.json's declared ``content_digest``, the per-artifact verification
+    in ``_verify_artifact_digests``/``_scan_json_anchor_state``) - none of
+    those compare across a read-modify-write gap the way this CAS does."""
     path = _index_path(comprehension_dir)
     if not path.exists():
         return None, None
     doc = read_json_document(path)
     validate_envelope(doc, artifact_type=INDEX_ARTIFACT_TYPE, schema_version=INDEX_SCHEMA_VERSION)
-    return doc, canonical_content_digest(doc)
+    return doc, sha256_file(path)
 
 
 def _build_successor_index(

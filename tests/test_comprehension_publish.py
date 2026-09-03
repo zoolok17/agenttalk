@@ -630,8 +630,48 @@ def test_read_current_index_matches_the_published_digest(
     )
     doc, digest = pub.read_current_index(comprehension_dir)
     assert doc["latest_scan_id"] == "scan-1"
-    from agenttalk.comprehension.digests import canonical_content_digest
-    assert digest == canonical_content_digest(doc)
+    # M6 (cold-read PR-B fix round 47): the CAS digest is an EXACT-BYTE
+    # digest of index.json's own on-disk bytes now, never
+    # canonical_content_digest (which strips scan_id and would blind the
+    # CAS to exactly the edit it exists to catch — see
+    # test_read_current_index_digest_changes_when_only_a_stripped_
+    # generation_identity_field_changes below).
+    from agenttalk.comprehension.digests import sha256_file
+    assert digest == sha256_file(comprehension_dir / "index.json")
+
+
+def test_read_current_index_digest_changes_when_only_a_stripped_generation_identity_field_changes(
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """M6 (cold-read PR-B fix round 47, BLOCKER): the CAS precondition used
+    to be ``canonical_content_digest(doc)``, which strips
+    ``GENERATION_IDENTITY_KEYS`` (including ``scan_id``) at every nesting
+    depth before hashing — so a concurrent hand-edit that changed ONLY a
+    stored run entry's own ``scan_id`` (a stripped field, and simultaneously
+    the CAS's own anchor/identity key) would leave the canonical digest
+    unchanged and silently pass the CAS check, even though index.json's
+    bytes genuinely differ. Reproduces the exact mechanism: publish once,
+    capture the digest, hand-edit only the stored run entry's ``scan_id``
+    on disk, and prove the digest now DOES change (byte-level, never blind
+    to a stripped-field-only edit)."""
+    lock, staging = _stage(comprehension_dir, comprehension_privacy, "scan-1")
+    pub.publish_run(
+        staging_handle=staging, lock_handle=lock,
+        run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None, record_counts=_COUNTS,
+    )
+    _doc, digest_before = pub.read_current_index(comprehension_dir)
+    index_path = comprehension_dir / "index.json"
+    doc = json.loads(index_path.read_text(encoding="utf-8"))
+    doc["runs"][0]["scan_id"] = "scan-1-tampered"
+    index_path.write_text(
+        json.dumps(doc, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    _doc, digest_after = pub.read_current_index(comprehension_dir)
+    assert digest_after != digest_before
+    with pytest.raises(pub.IndexCasConflict):
+        pub.publish_index_cas(
+            comprehension_dir, scan_id="scan-2", run_summary={"scan_id": "scan-2"},
+            predecessor_index_digest=digest_before,
+        )
 
 
 # ----------------------------------------------------------- Windows sharing-violation fixture
