@@ -326,6 +326,31 @@ def problem_id(
     a readability SHOULD for the reactor/closer sites already updated -
     this is additive, not a reason to revert those.
 
+    THE INVARIANT (micro-round 40b, reviewer-3's own delta on round 40's
+    S1 - restated as a checkable rule, not merely a measurement): this
+    id also hashes ``detail`` - and since round 40's own F4, ``detail``
+    is uniformly routed through ``errors.bounded_detail`` (truncated to
+    ``MAX_PROBLEM_DETAIL_LENGTH`` characters) before it ever reaches
+    here, so a per-trigger detail template that puts its OWN
+    distinguishing datum (the fact that makes two same-reason_code/
+    same-path/same-qualified_name problems genuinely different) PAST
+    that bound would let two truly different problems collide on this
+    id - the identical class of bug F1/F2 fixed for a route's own
+    identity. Round 40's own audit found this not YET reachable (every
+    existing per-trigger template embeds its own distinguishing datum -
+    typically a source line number - within the first ~30 characters),
+    but that is a measurement of today's templates, not a property this
+    function enforces. THE RULE, stated so it is auditable at template-
+    writing time rather than re-derived by a future reader: every
+    problem detail template must place its own distinguishing datum
+    within the first ``MAX_PROBLEM_DETAIL_LENGTH`` characters
+    (``errors.py``) - the same discipline round 36's own invariant ("a
+    problem detail may assert a cause only if the branch that emitted
+    it proved that cause; any per-trigger detail must include the
+    trigger's own distinguishing datum, which also keeps problem_id
+    unique") already established, restated here to name WHERE that
+    datum must sit now that the detail is length-bounded.
+
     FIX ROUND 37c (LATENT note, reviewer-3's own delta on round 37b): a
     literal empty string ``""`` for ``qualified_name`` hashes identically
     to ``None`` (both fold to ``""`` below) - DELIBERATELY equivalent, not

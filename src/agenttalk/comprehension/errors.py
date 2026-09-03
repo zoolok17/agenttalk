@@ -21,6 +21,16 @@ class ComprehensionError(RuntimeError):
 #: bounded templated free text; the projection exposes no raw source,
 #: absolute paths, or parser logs"). PROVISIONAL, like this package's
 #: other bound constants.
+#:
+#: MICRO-ROUND 40b (reviewer-3's own delta on round 40, one-word note):
+#: this is the TRUNCATION point, not the published field's own maximum
+#: length - ``bounded_detail`` (below) appends the ``"...(truncated)"``
+#: marker AFTER slicing to this many characters (round 37's own F6
+#: fix, so a truncation is never silently indistinguishable from a
+#: detail that genuinely ends there), so a truncated ``detail`` can be
+#: up to ``MAX_PROBLEM_DETAIL_LENGTH + len("...(truncated)")`` = 214
+#: characters long. A consumer sizing a buffer/column on "bounded to
+#: 200" undercounts by the marker's own length.
 MAX_PROBLEM_DETAIL_LENGTH = 200
 
 
