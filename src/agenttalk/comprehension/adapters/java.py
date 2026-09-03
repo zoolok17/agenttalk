@@ -2684,13 +2684,32 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         # readiness's own entry_points_mapped reports unknown, never a
         # confident negative, for this class.
         if match.group(1) == "Path" and verb is None and composed:
+            # FIX ROUND 40 (thirty-fourth cold read, Part A F5 MAJOR,
+            # wrong-data - detail-proves-cause): the detail below used
+            # to assert "it never handles a request directly" for
+            # EVERY no-recognized-verb case - but "no verb designator
+            # this producer RECOGNIZES" is not the same claim as "no
+            # verb designator at all." JAX-RS's own custom-verb
+            # extension (a caller-defined annotation meta-annotated
+            # with @HttpMethod, e.g. a project's own @LOCK) is spelled,
+            # on the method itself, as just another annotation in the
+            # stack - syntactically indistinguishable, without cross-
+            # file type resolution this single-file producer does not
+            # do, from an unrelated annotation like @Deprecated. Such a
+            # method IS a real, if unrecognized, verb-designated
+            # handler - never provably a locator. Worded to cover both
+            # possibilities honestly rather than asserting the locator
+            # cause as proven; kept short so the id-bearing half of the
+            # message (the composed route itself, and the named
+            # jax_rs_sub_resource_locator shape) survives
+            # bounded_detail's own 200-char bound for an ordinary,
+            # short route.
             problems.append(JavaAdapterProblem(
                 reason_code="unsupported_entry_point_shape",
-                detail=bounded_detail(f"a @Path method at line {line} composes a route ({', '.join(composed)}) "
-                       "but declares no verb designator (@GET/@POST/...) of its own - JAX-RS's "
-                       "own sub-resource-locator idiom (jax_rs_sub_resource_locator): it never "
-                       "handles a request directly, so no served http_route is published for "
-                       "it - not confidently absent either"),
+                detail=bounded_detail(f"a @Path method at line {line} composes ({', '.join(composed)}) "
+                       "with no RECOGNIZED verb - a sub-resource locator "
+                       "(jax_rs_sub_resource_locator) or unrecognized custom verb; not modeled "
+                       "either way"),
                 qualified_name=enclosing,
             ))
             continue

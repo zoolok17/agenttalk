@@ -5197,3 +5197,86 @@ def test_web_xml_a_wholly_cdata_wrapped_servlet_name_still_decodes_in_the_block(
     routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
     assert routes_by_pattern == {"/checkout": "com.acme.CheckoutServlet"}
     assert problems == []
+
+
+def test_jax_rs_sub_resource_locator_detail_is_length_bounded_not_published_verbatim():
+    """FIX ROUND 40 (thirty-fourth cold read, Part A F4 LOW, .cr34-detail,
+    completeness): the sub-resource-locator detail composed above joins
+    EVERY distinct composed route into the message verbatim
+    (`', '.join(composed)`) - with a long class-level @Path and a long
+    method-level @Path (each independently bounded to
+    _MAX_ROUTE_TARGET_LENGTH, but never the CONCATENATION of the two),
+    the reader measured this specific site publishing a 2558-character
+    detail, unbounded like every other adapter-composed detail= string
+    in this module before this round's own AST-located sweep wrapped
+    all 38 unwrapped sites in errors.bounded_detail. Now every one -
+    this site included - truncates the same way _bounded_route_target
+    already does for a published route name."""
+    from agenttalk.comprehension.errors import MAX_PROBLEM_DETAIL_LENGTH
+
+    long_prefix = "/orders" + "p" * 190
+    long_suffix = "/list" + "s" * 190
+    src = f"""
+package p;
+
+@Path("{long_prefix}")
+public class OrderResource {{
+    @Path("{long_suffix}")
+    public void list() {{}}
+}}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert len(problem.detail) <= MAX_PROBLEM_DETAIL_LENGTH + len("...(truncated)")
+    assert problem.detail.endswith("...(truncated)")
+
+
+def test_jax_rs_custom_verb_annotation_gets_the_honest_either_way_wording():
+    """FIX ROUND 40 (thirty-fourth cold read, Part A F5 MAJOR, .cr34-jaxrs,
+    wrong-data - detail-proves-cause): the sub-resource-locator detail
+    used to assert "it never handles a request directly" for EVERY
+    no-recognized-verb method - false for a project-defined custom verb
+    (JAX-RS's own @HttpMethod meta-annotation idiom, e.g. a local WebDAV
+    @LOCK annotation - never one of this producer's own recognized
+    @GET/@POST/... names), which IS a real, if unrecognized, verb
+    designator. Syntactically this producer sees only "some other
+    annotation in the stack besides @Path" - indistinguishable, without
+    cross-file resolution, from an unrelated annotation - so the detail
+    must cover both possibilities rather than assert the locator cause
+    as proven."""
+    src = """
+package p;
+
+@Path("/orders")
+public class OrderResource {
+    @LOCK
+    @Path("/list")
+    public void list() {}
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    assert _edges(result, "route") == []
+    assert not any(e.kind == "http_route" for e in result.entry_points)
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert "no RECOGNIZED verb" in problem.detail
+    assert "unrecognized custom verb" in problem.detail
+    assert "never handles a request directly" not in problem.detail
+
+
+def test_jax_rs_a_bare_path_method_with_no_other_annotation_still_names_the_locator_idiom():
+    """FIX ROUND 40 (Part A F5, control): the true bare-locator case (no
+    other annotation at all in the method's own stack) keeps naming the
+    sub-resource-locator idiom by name in the detail - the wording widen
+    above must not lose the useful, still-true half of the old claim."""
+    src = """
+package p;
+
+@Path("/orders")
+public class OrderResource {
+    @Path("/list")
+    public void list() {}
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert "jax_rs_sub_resource_locator" in problem.detail
