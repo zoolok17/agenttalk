@@ -538,6 +538,19 @@ unsupported or unknown rather than emitting empty-looking facts. `persists`,
 producer and are invalid in a slice-1 artifact. No static adapter may mint
 `runtime_observed` evidence.
 
+NAMED LIMIT (declared, PR-B round 43): a `route`-relation edge's own pattern
+is composed only from class-level + method-level annotations (Spring's
+`@RequestMapping` family, JAX-RS's `@Path`). A deployment-level base path a
+container or framework prepends at runtime - JAX-RS's own `@ApplicationPath`,
+or a non-root `DispatcherServlet` `<servlet-mapping>` - is never composed in;
+the java adapter has no static, one-class-owns-one-prefix fact linking a
+discovered route back to the specific application/servlet class that
+ultimately dispatches it (unlike class-level `@RequestMapping`/`@Path`, that
+association is runtime container wiring). A published route may therefore
+not be the full path actually served. Publishing a guessed prefix would risk
+a confident, wrong route; this stays a named gap rather than either a guess
+or a silent omission.
+
 The scanner never invents an internal target because names look similar.
 Ambiguous resolution creates an unresolved edge with candidates. Dynamic
 dispatch and runtime wiring are expected unknowns and remain visible in the

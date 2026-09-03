@@ -4077,6 +4077,40 @@ public class ItemResource {
     assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
 
 
+def test_an_application_path_prefix_is_never_composed_into_a_published_route():
+    """FIX ROUND 43 (thirty-seventh cold read, F5 MAJOR, .cr37-apppath,
+    completeness - declared, not fixed): a JAX-RS @ApplicationPath on
+    the application's own root class is a DEPLOYMENT-level base path
+    the container prepends to every @Path at runtime - this producer
+    has no static, one-class-owns-one-prefix fact linking a discovered
+    resource back to the SPECIFIC Application subclass that ultimately
+    serves it (unlike class-level @Path, which composition already
+    handles), so it is deliberately never composed in. A published
+    "/orders/list" may, in the real deployed application, actually be
+    served at "/api/orders/list" - a NAMED LIMIT now (see this
+    producer's own capability description and the design doc's own
+    Artifact-2 section), not a silent, undeclared gap. This output is
+    UNCHANGED from before round 43 - only the honesty of its scope
+    changed."""
+    src = """
+package p;
+
+@ApplicationPath("/api")
+public class RestConfig extends Application {
+}
+
+@Path("/orders")
+public class OrderResource {
+    @GET
+    @Path("/list")
+    public void list() {}
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    route = next(e for e in result.entry_points if e.kind == "http_route")
+    assert route.name == "GET /orders/list"
+
+
 def test_jax_rs_path_with_no_verb_marker_and_no_method_level_path_is_a_confident_negative():
     """FIX ROUND 36 (thirtieth cold read, F3 MAJOR, wrong-data,
     NoMethodPath verbatim): the round-17b class-closer above used to

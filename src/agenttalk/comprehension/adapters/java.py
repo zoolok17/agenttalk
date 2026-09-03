@@ -18,7 +18,11 @@ Per the lead's decided item-3 relation scope on the approved PR-B plan
     3. route - ONLY as a named, annotation-DECLARED producer: Spring MVC
        request-mapping family annotations, and plain-XML web.xml
        servlet-mapping declarations when trivially present.
-       evidence_class=declared.
+       evidence_class=declared. NAMED LIMIT (declared, FIX ROUND 43):
+       class-level + method-level annotation composition only - a
+       DEPLOYMENT-level base path (JAX-RS's own @ApplicationPath, or a
+       non-root DispatcherServlet mapping) is never composed in; a
+       published route may not be the full path actually served.
     4. data, configuration - DEFERRED. Both would require call/type
        resolution to mean anything, which is inference, not declaration.
        Reported as EXPLICIT, ENUMERATED coverage gaps
@@ -2598,6 +2602,28 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     # annotation's own START position - not the position AFTER it, which
     # a class-level check never actually needed to resume walking from -
     # is what gets tested against it.
+    #
+    # NAMED LIMIT, declared (FIX ROUND 43, thirty-seventh cold read, F5
+    # MAJOR - undeclared until this round): class-level + method-level
+    # composition (above) is the ONLY prefix this producer composes. A
+    # DEPLOYMENT-level base path prepended by the container/framework
+    # itself - JAX-RS's own @ApplicationPath (the JAX-RS Application
+    # subclass's own root path, prepended to EVERY @Path in the
+    # application) or a Spring DispatcherServlet's own <servlet-mapping>
+    # url-pattern (when it is anything other than the bare "/" root
+    # mapping) - is NEVER composed into a published http_route's own
+    # name. A published "/orders" may, in the real deployed application,
+    # actually be served at "/api/orders" (an @ApplicationPath("/api"))
+    # or "/app/orders" (a DispatcherServlet mapped at "/app/*") - this
+    # producer has no cross-reference from an annotation-discovered
+    # route back to the SPECIFIC servlet/application class it is
+    # ultimately dispatched through (that association is itself runtime
+    # container wiring, not a static one-class-owns-one-path-prefix fact
+    # the way class-level @RequestMapping/@Path is). Publishing a
+    # GUESSED base path would risk a confident, wrong route; this stays
+    # a named, declared gap rather than either a guess or a silent one -
+    # see this producer's own capability description and the design
+    # doc's own Artifact-2 section for the same limit stated there.
     class_header_associations = _class_header_associations(sanitized, types)
     class_route_prefix: dict[str, list[str]] = {}
     # Fix round 11 (seventh cold read BLOCKER part 2 - the fail-safe for
