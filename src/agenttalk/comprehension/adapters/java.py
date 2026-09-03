@@ -3870,10 +3870,23 @@ def _body_text(source: str, match: re.Match[str]) -> str:
 #: side's ``<x:dependency><x:groupId>...`` produced no edge at all). One
 #: shared leaf-tolerance builder, used for every leaf tag in both
 #: descriptors, closes this the same way ``_structural_block_pattern``
-#: already closed it for containers - a leaf's own body stays ``[^<]+?``
-#: (never spans into a nested/sibling element the way a container's own
-#: ``.*?`` body deliberately does), except ``url-pattern`` which keeps
-#: its round-23 ``.*?``/DOTALL body for CDATA passthrough.
+#: already closed it for containers.
+#:
+#: FIX ROUND 44 (thirty-eighth cold read, N3, judged - taken): every one
+#: of this function's own 12 call sites passed ``dotall=True`` - each
+#: leaf was migrated to it ONE AT A TIME, over several rounds, as its
+#: own CDATA-wrapping bug was found (round 23's own ``url-pattern`` fix
+#: was the first; round 24/25 widened ``<dependency>``/``<module>`` the
+#: same way; every other leaf eventually followed). By this round, the
+#: ORIGINAL non-DOTALL ``[^<]+?`` body (deliberately narrower - never
+#: spans into a nested/sibling element even without DOTALL) had become
+#: genuinely unreachable, a dead alternation in a security-reviewed
+#: regex - exactly the kind of reader trap this producer's own bar
+#: does not accept elsewhere. Removed; the parameter and its own
+#: now-pointless branch are gone, not merely defaulted differently -
+#: a caller wanting the narrower, non-DOTALL body back would need to
+#: argue why THIS leaf is the one exception, not silently inherit a
+#: default nothing currently uses.
 #: FIX ROUND 43 (thirty-seventh cold read, F2 BLOCKER): the same self-
 #: closing alternation as :func:`_structural_block_pattern` - a self-
 #: closed leaf (``<groupId/>``) used to read forward into a SIBLING
@@ -3885,13 +3898,12 @@ def _body_text(source: str, match: re.Match[str]) -> str:
 #: ``""``), the same "present but blank" shape ``_is_blank_identity``
 #: already treats as undecodable at every coordinate call site - not a
 #: new disposition, the existing one, now reachable by the right input.
-def _leaf_value_pattern(tag: str, *, dotall: bool = False) -> re.Pattern[str]:
+def _leaf_value_pattern(tag: str) -> re.Pattern[str]:
     escaped = re.escape(tag)
-    body = r"(.*?)" if dotall else r"([^<]+?)"
     return re.compile(
         rf"<(?:[A-Za-z_][\w.-]*:)?{escaped}(?=[\s/>])[^>]*?"
-        rf"(?:/>|(?<!/)>{body}</(?:[A-Za-z_][\w.-]*:)?{escaped}\s*>)",
-        re.DOTALL if dotall else 0,
+        rf"(?:/>|(?<!/)>(.*?)</(?:[A-Za-z_][\w.-]*:)?{escaped}\s*>)",
+        re.DOTALL,
     )
 
 
@@ -4147,8 +4159,8 @@ _DEPENDENCY_BLOCK_RE = _structural_block_pattern("dependency")
 #: text via ``_decode_xml_text`` before use (see ``_module_own_
 #: dependency_facts``/``pom_dependency_decode_problems`` below) rather
 #: than using it directly - matching is not the same as decoding.
-_DEPENDENCY_GROUP_ID_RE = _leaf_value_pattern("groupId", dotall=True)
-_DEPENDENCY_ARTIFACT_ID_RE = _leaf_value_pattern("artifactId", dotall=True)
+_DEPENDENCY_GROUP_ID_RE = _leaf_value_pattern("groupId")
+_DEPENDENCY_ARTIFACT_ID_RE = _leaf_value_pattern("artifactId")
 #: Maven's own boolean spelling - never assumed False for anything but a
 #: genuinely absent or explicit ``false`` element; only an explicit
 #: ``true`` element makes an edge optional. The caller already lower-
@@ -4162,13 +4174,13 @@ _DEPENDENCY_ARTIFACT_ID_RE = _leaf_value_pattern("artifactId", dotall=True)
 #: name gap. Decoded at the call site via ``_decode_xml_text`` before
 #: use (an undecodable value is treated the same as absent - never a
 #: guessed boolean/phase).
-_DEPENDENCY_OPTIONAL_RE = _leaf_value_pattern("optional", dotall=True)
+_DEPENDENCY_OPTIONAL_RE = _leaf_value_pattern("optional")
 #: Maven's own scope vocabulary (compile/provided/runtime/test/system/
 #: import) - this slice maps only the one the design names explicitly
 #: ("scope test -> phase test"); every other spelling (including no
 #: <scope> at all, Maven's own "compile" default) stays this adapter's
 #: existing "build" phase.
-_DEPENDENCY_SCOPE_RE = _leaf_value_pattern("scope", dotall=True)
+_DEPENDENCY_SCOPE_RE = _leaf_value_pattern("scope")
 
 #: M1 (seventh cold read, fix round 11): a bare open/close XML tag
 #: (attributes ignored - this adapter's own bar is "a handful of flat
@@ -4211,7 +4223,7 @@ _MODULES_ELEMENT_RE = _structural_block_pattern("modules")
 #: all, silently dropping the whole reactor entry. Decoded at the call
 #: site via ``_decode_xml_text``; an undecodable path records a problem
 #: rather than silently vanishing (see ``declared_reactor_module_paths``).
-_MODULE_RE = _leaf_value_pattern("module", dotall=True)
+_MODULE_RE = _leaf_value_pattern("module")
 
 
 def _enclosing_tag_stack(sanitized: str, before: int) -> list[str]:
@@ -4893,14 +4905,14 @@ _SERVLET_MAPPING_BLOCK_RE = _structural_block_pattern("servlet-mapping")
 #: problem) with no visibility whatsoever, unlike every other leaf this
 #: producer already decodes-or-records. Decoded at each call site via
 #: ``_decode_xml_text``.
-_SERVLET_MAPPING_NAME_RE = _leaf_value_pattern("servlet-name", dotall=True)
+_SERVLET_MAPPING_NAME_RE = _leaf_value_pattern("servlet-name")
 #: FIX ROUND 23 (nineteenth cold read, F1(d), wrong-data): widened from
 #: ``[^<]+`` (DOTALL OFF) to ``.*?`` (DOTALL ON) so a CDATA-wrapped
 #: value (``<url-pattern><![CDATA[/c4]]></url-pattern>``) is captured
 #: at all instead of matching nothing - see ``_decode_xml_text`` below,
 #: which unwraps the CDATA section (and separately decodes entities,
 #: F2) from whatever this captures.
-_SERVLET_MAPPING_URL_PATTERN_RE = _leaf_value_pattern("url-pattern", dotall=True)
+_SERVLET_MAPPING_URL_PATTERN_RE = _leaf_value_pattern("url-pattern")
 #: FIX ROUND 17 (thirteenth cold read, CR13-2 MAJOR, wrong-data): the
 #: OTHER half of a web.xml's servlet declaration - <servlet-name>/
 #: <servlet-class> pairs, joined below against <servlet-mapping>'s own
@@ -4915,7 +4927,7 @@ _SERVLET_BLOCK_RE = _structural_block_pattern("servlet")
 #: attributing its mapped route's owner to the synthetic
 #: ``{path}#{servlet_name}`` placeholder instead. Every consumer decodes
 #: via ``_decode_xml_text`` before use.
-_SERVLET_CLASS_RE = _leaf_value_pattern("servlet-class", dotall=True)
+_SERVLET_CLASS_RE = _leaf_value_pattern("servlet-class")
 #: FIX ROUND 30 (twenty-sixth cold read, F1 BLOCKER, wrong-data): a
 #: ``<servlet>`` may declare ``<jsp-file>`` INSTEAD of ``<servlet-class>``
 #: (a JSP-backed servlet - servlet-spec-legal, ubiquitous in JSP/Struts-
@@ -4923,7 +4935,7 @@ _SERVLET_CLASS_RE = _leaf_value_pattern("servlet-class", dotall=True)
 #: ``_servlet_class_by_name``'s own docstring for why this now matters:
 #: a name backed by a ``<jsp-file>`` alone must be tracked as a REAL
 #: declaration, not silently invisible to the declared-names registry.
-_JSP_FILE_RE = _leaf_value_pattern("jsp-file", dotall=True)
+_JSP_FILE_RE = _leaf_value_pattern("jsp-file")
 #: FIX ROUND 22 (eighteenth cold read, F3 MAJOR, wrong-data): a
 #: ``<servlet>`` carrying ``<load-on-startup>`` but no ``<servlet-
 #: mapping>`` at all is the standard startup-only servlet idiom (a
@@ -5259,12 +5271,12 @@ _FILTER_BLOCK_RE = _structural_block_pattern("filter")
 #: exact same widening/decode discipline as ``_SERVLET_MAPPING_NAME_RE``
 #: above - a CDATA-wrapped ``<filter-name>`` silently dropped the whole
 #: filter-mapping, the filter twin of the servlet-name gap.
-_FILTER_NAME_RE = _leaf_value_pattern("filter-name", dotall=True)
+_FILTER_NAME_RE = _leaf_value_pattern("filter-name")
 #: FIX ROUND 24 (F5 MINOR, wrong-data): same DOTALL widening as
 #: ``_SERVLET_CLASS_RE`` above, same reason - a CDATA-wrapped
 #: ``<filter-class>`` used to silently drop this filter from
 #: ``_filter_class_by_name``'s own join.
-_FILTER_CLASS_RE = _leaf_value_pattern("filter-class", dotall=True)
+_FILTER_CLASS_RE = _leaf_value_pattern("filter-class")
 _FILTER_MAPPING_BLOCK_RE = _structural_block_pattern("filter-mapping")
 #: A ``<listener>`` element names its own implementing class directly -
 #: no separate mapping/name indirection at all (a listener has no URL
@@ -5280,7 +5292,7 @@ _LISTENER_BLOCK_RE = _structural_block_pattern("listener")
 #: rather than the real class (cosmetic - this producer never models a
 #: listener beyond the bare fact one exists - but decoded consistently
 #: with every other class-name leaf all the same).
-_LISTENER_CLASS_RE = _leaf_value_pattern("listener-class", dotall=True)
+_LISTENER_CLASS_RE = _leaf_value_pattern("listener-class")
 
 
 def _filter_class_by_name(

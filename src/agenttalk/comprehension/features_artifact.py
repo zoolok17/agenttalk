@@ -63,6 +63,27 @@ class EntryPointRecord:
     entry_point_id: str
     kind: str
     name: str
+    #: NAMED LIMIT, declared (PR-B round 44, N1, thirty-eighth cold
+    #: read): this field's own unit KIND is heterogeneous depending on
+    #: how its claim's own ``qualified_name`` resolved - the clean case
+    #: (a real, unambiguous declared type) resolves to a COMPONENT
+    #: unit_id (`_build_registry`'s own `by_qualified_name`); a
+    #: `duplicate_qualified_name` conflict (two units declaring the
+    #: identical fully-qualified name) removes that name from `by_
+    #: qualified_name` ENTIRELY (see that function's own docstring), so
+    #: the SAME claim instead falls back to the FILE unit_id
+    #: (`_java_file_unit_id`) here, even though a real declared type
+    #: exists - just an ambiguous one. Judged defensible, not a bug:
+    #: with two-plus duplicate claimants, there is no single correct
+    #: component owner to point at without arbitrarily favoring one -
+    #: the file-unit fallback is the SAME "ambiguous, never confidently
+    #: pick one" honesty this producer already applies to a registry-
+    #: miss resolution elsewhere, extended here rather than invented
+    #: fresh. A consumer grouping entry points by owner-unit KIND alone
+    #: (never resolving the id itself) sees this as two different
+    #: shapes for what is, from THIS field's own contract, one
+    #: consistent "the owner" concept - named here so that surprise is
+    #: looked up, not independently rediscovered.
     owning_unit_id: str
     feature_ids: list[str]
     evidence_class: str
