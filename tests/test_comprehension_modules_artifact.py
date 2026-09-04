@@ -111,14 +111,66 @@ def test_a_non_degrading_unsupported_language_path_without_encoding_undecodable_
     encoding-undecodable case - a genuinely benign, readable non-
     degrading file (worker.py's own real positive "not code-bearing"
     evidence, e.g. an unsupported_language reason with no decode
-    failure) is unaffected and still gets "infrastructure"."""
+    failure) is unaffected and still gets "infrastructure". Uses
+    ``release.sh`` (round 23's own ratified confident-infrastructure
+    shape) rather than an arbitrary ``.properties`` file - round 48's
+    own N2 fix narrowed that extension out of the confident set (see
+    the dedicated test below)."""
     discovery = _discovery([
-        EnumeratedFile(relative_path="config.properties", byte_count=10, content_digest="f"),
+        EnumeratedFile(relative_path="release.sh", byte_count=10, content_digest="f"),
     ])
     records = ma.build_modules(
         discovery, {},
-        worker_problem_reasons_by_path={"config.properties": ["unsupported_language"]},
-        non_degrading_unsupported_language_paths=frozenset({"config.properties"}),
+        worker_problem_reasons_by_path={"release.sh": ["unsupported_language"]},
+        non_degrading_unsupported_language_paths=frozenset({"release.sh"}),
+    )
+    assert len(records) == 1
+    assert records[0].classification == ["infrastructure"]
+
+
+def test_an_arbitrary_properties_file_no_longer_gets_confident_infrastructure(
+) -> None:
+    """FIX ROUND 48 (forty-second cold read, N2 MAJOR, wrong-data,
+    judged - taken): a blanket ``.properties`` extension match used to
+    sit in ``_CONFIDENT_INFRASTRUCTURE_EXTENSIONS`` with no justifying
+    "mandated by one specific tool" comment of its own, unlike ``.sh``/
+    ``.bash`` - and unlike those two, an ARBITRARY ``.properties`` file
+    (Spring Boot's own ``application.properties``, Hibernate's own
+    ``hibernate.properties``) is routinely genuine PRODUCTION RUNTIME
+    configuration, not build/release/CI tooling. Measured end to end: a
+    real ``application.properties`` carrying a live datasource URL
+    classified ``infrastructure``, silently exempting it from
+    readiness's own production-unit evaluation - the identical bucket a
+    Dockerfile gets. Narrowed to the specific, genuinely-always-tooling
+    basenames the convention actually covers (gradle.properties et al,
+    now in _CONFIDENT_INFRASTRUCTURE_BASENAMES) - an arbitrary
+    ``.properties`` file now gets the SAME "no decided value" empty
+    classification any other non-qualifying tier-3 path already gets."""
+    discovery = _discovery([
+        EnumeratedFile(
+            relative_path="application.properties", byte_count=40, content_digest="f"),
+    ])
+    records = ma.build_modules(
+        discovery, {},
+        worker_problem_reasons_by_path={"application.properties": ["unsupported_language"]},
+        non_degrading_unsupported_language_paths=frozenset({"application.properties"}),
+    )
+    assert len(records) == 1
+    assert records[0].classification == []
+
+
+def test_a_gradle_properties_file_still_gets_confident_infrastructure() -> None:
+    """Control: the specific, genuinely-always-build-tooling
+    ``.properties`` basenames this convention actually covers (moved to
+    _CONFIDENT_INFRASTRUCTURE_BASENAMES by round 48's own N2 fix) are
+    unaffected by narrowing the blanket extension match away."""
+    discovery = _discovery([
+        EnumeratedFile(relative_path="gradle.properties", byte_count=10, content_digest="f"),
+    ])
+    records = ma.build_modules(
+        discovery, {},
+        worker_problem_reasons_by_path={"gradle.properties": ["unsupported_language"]},
+        non_degrading_unsupported_language_paths=frozenset({"gradle.properties"}),
     )
     assert len(records) == 1
     assert records[0].classification == ["infrastructure"]

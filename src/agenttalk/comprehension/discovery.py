@@ -960,7 +960,7 @@ def _submodule_boundary_paths(root: Path) -> tuple[frozenset[str], dict[str, str
         return frozenset(), None
     try:
         result = subprocess.run(  # noqa: S603,S607  # nosec B603 B607
-            ["git", "config", "-f", str(gitmodules), "--list"],
+            ["git", "config", "-f", str(gitmodules), "--list", "-z"],
             check=False,
             capture_output=True,
             stdin=subprocess.DEVNULL,
@@ -987,15 +987,28 @@ def _submodule_boundary_paths(root: Path) -> tuple[frozenset[str], dict[str, str
                 "be excluded"),
         }
     paths: set[str] = set()
-    for line in result.stdout.splitlines():
-        # `git config --list` emits one already-unquoted, already-
-        # comment-stripped "key=value" pair per line (multi-valued keys
-        # repeat the key) - restricted to the real submodule-path key
-        # shape (`submodule.<name>.path`), never the bare `key == "path"`
-        # check the old hand-rolled parse used, which had no section
-        # awareness at all.
-        key, sep, value = line.partition("=")
-        if sep and key.startswith("submodule.") and key.endswith(".path"):
+    # FIX ROUND 48 (forty-second cold read, N1, judged - taken): a plain
+    # (non-``-z``) ``--list`` line is ``key=value``, split via
+    # ``line.partition("=")`` - a real, legal git-config subsection name
+    # containing its OWN literal ``=`` (``[submodule "a=b"]``) makes git
+    # emit ``submodule.a=b.path=libs/foo`` as ONE line with TWO ``=``
+    # characters; partitioning on the FIRST one splits it as
+    # key=``submodule.a``, value=``b.path=libs/foo`` - the key no longer
+    # ends with ``.path``, so this genuine submodule path is silently
+    # NEVER recognized, reopening the exact LEAKAGE direction round 47's
+    # own fix closed (a real external submodule's own source published
+    # as first-party). ``-z`` (the same NUL-safe idiom round 47's own
+    # `_check_ignore_one` fix already established for `git check-ignore`)
+    # makes this unambiguous regardless of what the value OR the key
+    # itself contains: each entry is NUL-terminated, and the key/value
+    # split within an entry is on the first NEWLINE - a character that
+    # can never appear in a git config KEY - never on `=`, which very
+    # much can.
+    for entry in result.stdout.split("\0"):
+        if not entry:
+            continue
+        key, _sep, value = entry.partition("\n")
+        if key.startswith("submodule.") and key.endswith(".path"):
             # A trailing slash (`libs/foo/`, a real, legal git-config
             # spelling) is otherwise never produced by the enumerator's
             # own `relative` paths this set is exact-matched against

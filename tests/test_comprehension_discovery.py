@@ -1164,6 +1164,36 @@ def test_gitmodules_a_quoted_path_value_still_excludes_the_real_directory(
     assert not any(f.relative_path.startswith("libs/foo/") for f in result.files)
 
 
+def test_gitmodules_a_subsection_name_containing_an_equals_sign_still_excludes_the_directory(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 48 (forty-second cold read, N1, judged - taken): a
+    legal git-config subsection name containing its OWN literal ``=``
+    (``[submodule "a=b"]``, a real if unusual spelling) makes plain
+    ``git config --list`` emit ``submodule.a=b.path=libs/foo`` as ONE
+    line with TWO ``=`` characters - splitting on the FIRST one (the
+    old approach) reads the key as ``submodule.a`` (never ending in
+    ``.path``), silently never recognizing this genuine submodule path
+    and reopening the exact LEAKAGE direction round 47's own fix closed
+    (a real external submodule published as first-party). ``-z``
+    (NUL-separated entries, key/value split on the first NEWLINE
+    instead) is unambiguous regardless of what the key or value
+    contains."""
+    (tmp_path / ".gitmodules").write_text(
+        '[submodule "a=b"]\n\tpath = libs/foo\n\turl = https://example.invalid/foo.git\n',
+        encoding="utf-8",
+    )
+    foo_dir = tmp_path / "libs" / "foo"
+    foo_dir.mkdir(parents=True)
+    (foo_dir / "inner.txt").write_bytes(b"should never be enumerated")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert len(result.boundaries) == 1
+    assert result.boundaries[0].relative_path == "libs/foo"
+    assert result.boundaries[0].boundary_kind == "submodule"
+    assert not any(f.relative_path.startswith("libs/foo/") for f in result.files)
+
+
 def test_gitmodules_a_trailing_slash_path_value_still_excludes_the_real_directory(
     tmp_path: Path,
 ) -> None:

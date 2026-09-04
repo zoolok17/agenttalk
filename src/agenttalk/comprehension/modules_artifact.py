@@ -234,6 +234,14 @@ _CONFIDENT_INFRASTRUCTURE_BASENAMES = frozenset({
     "dockerfile", "makefile", "jenkinsfile", "vagrantfile", "procfile",
     "mvnw", "mvnw.cmd", "gradlew", "gradlew.bat",
     ".travis.yml", ".gitlab-ci.yml", ".drone.yml", "appveyor.yml", "azure-pipelines.yml",
+    # FIX ROUND 48 (forty-second cold read, N2, judged - taken): moved
+    # here FROM the blanket ``.properties`` extension match below - these
+    # three specific basenames are each MANDATED by one specific, real
+    # tool convention (Gradle's own build/wrapper config; the Android SDK
+    # tooling's own local-machine-path file), satisfying this set's own
+    # stated rule exactly. An ARBITRARY ``.properties`` file does not (see
+    # that rule's own restatement below).
+    "gradle.properties", "gradle-wrapper.properties", "local.properties",
 })
 #: ``.sh``/``.bash`` (round 23's own ratified ``release.sh`` shape,
 #: reconfirmed here rather than regressed): a shell script is essentially
@@ -241,7 +249,27 @@ _CONFIDENT_INFRASTRUCTURE_BASENAMES = frozenset({
 #: a genuine polyglot application SERVICE the way a ``.js``/``.py`` file
 #: can be - unlike those two, it never needed round 17b's own "routinely
 #: incidental" carve-out to begin with.
-_CONFIDENT_INFRASTRUCTURE_EXTENSIONS = frozenset({".properties", ".sh", ".bash"})
+#:
+#: FIX ROUND 48 (forty-second cold read, N2 MAJOR, wrong-data, judged -
+#: taken): a blanket ``.properties`` extension match used to sit here
+#: too, with no justifying comment of its own the way ``.sh``/``.bash``
+#: each earned one - and unlike those two, it violates this set's OWN
+#: stated rule (round 35's own comment above: "MANDATED by one specific,
+#: real tool or platform convention... independent of this run ever
+#: reading its content"). A ``.properties`` file's role varies WIDELY -
+#: Spring Boot's own ``application.properties``, Hibernate's own
+#: ``hibernate.properties``, log4j's own ``log4j.properties`` are all
+#: genuine, often security/config-sensitive PRODUCTION RUNTIME
+#: configuration, not build/release/CI tooling - measured end to end: a
+#: real ``application.properties`` carrying a live datasource URL
+#: classified ``infrastructure``, the identical bucket a Dockerfile
+#: gets, silently exempting it from readiness's own production-unit
+#: evaluation. The specific, genuinely-always-tooling ``.properties``
+#: basenames this convention actually covers (Gradle's own build/
+#: wrapper config, the Android SDK's own local-path file) are named
+#: explicitly above instead - narrower, but no longer a blanket
+#: extension match that sweeps in arbitrary application config.
+_CONFIDENT_INFRASTRUCTURE_EXTENSIONS = frozenset({".sh", ".bash"})
 #: A lowercase POSIX-spelled substring, checked anywhere in the path -
 #: both are well-known, CI-specific directory conventions (arbitrary
 #: basenames live inside them, e.g. ``.github/workflows/build.yml``),
