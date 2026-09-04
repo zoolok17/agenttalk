@@ -1202,12 +1202,47 @@ def test_run_scan_reports_a_case_collision_between_two_enumerated_paths(
     # source_understood as unknown, never a confident satisfied/
     # adapter_understood computed over evidence this run cannot
     # actually trust which file it came from.
+    # MICRO-ROUND 48c (F4, CI RED on all four Linux legs - the round-37
+    # phantom-APP.JAVA lesson's own mirror): this assertion used to
+    # require EXACTLY 4 colliding units (file + component, both paths) -
+    # true on this dev host's own case-INSENSITIVE filesystem (Windows/
+    # default macOS), where reading the injected, differently-cased
+    # "APP.JAVA" path secretly succeeds (the OS folds case at lookup),
+    # so the worker actually parses a FOURTH, phantom component unit for
+    # it. On a real case-SENSITIVE filesystem (Linux, this PR's own CI),
+    # that exact-case path has NO backing file at all - reading it
+    # genuinely fails (`parse_failed`), so no component unit is ever
+    # constructed for "APP.JAVA" at all - only 3 real units exist:
+    # the real App.java's own file+component pair, and APP.JAVA's own
+    # file-kind unit alone (build_modules unconditionally constructs one
+    # file-kind record per `discovery.files` entry, regardless of
+    # whether the worker could read it - see readiness_artifact.py's own
+    # `path_excluded` analysis, MICRO-ROUND 48c, for the identical
+    # "reaches a real unit either way" mechanism). Verified empirically
+    # by simulating a case-sensitive read failure for "APP.JAVA" -
+    # exactly 3 units result, and the injected file-kind unit's own
+    # `adapter_problem_reasons` carries BOTH `case_collision` and
+    # `parse_failed` together. This is a TRUE platform difference in the
+    # UNIT SET itself, never a wiring gap - the wiring's own actual
+    # invariant (every unit that DOES exist and touches a colliding path
+    # carries the reason) holds identically on both platforms, so this
+    # assertion now checks THAT invariant directly - a floor of 3 (the
+    # two file-kind records plus App.java's own always-real component,
+    # true on every platform), a ceiling of 4 (this dev host's own
+    # case-insensitive-filesystem phantom, never more), and universal
+    # membership (every unit actually touching either colliding path
+    # carries the reason - never merely counted after already filtering
+    # for it, the tautology the old assertion's own construction hid).
     modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
-    colliding_unit_ids = {
-        u["unit_id"] for u in modules_doc["units"]
-        if "case_collision" in u["adapter_problem_reasons"]
-    }
-    assert len(colliding_unit_ids) == 4  # file + component, both paths
+    colliding_paths = {"src/main/java/p/App.java", "src/main/java/p/APP.JAVA"}
+    colliding_units = [
+        u for u in modules_doc["units"] if colliding_paths & set(u["paths"])
+    ]
+    assert 3 <= len(colliding_units) <= 4
+    colliding_unit_ids = set()
+    for unit in colliding_units:
+        assert "case_collision" in unit["adapter_problem_reasons"], unit["unit_id"]
+        colliding_unit_ids.add(unit["unit_id"])
     readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
     source_understood_signals = {
         s["unit_id"]: s for s in readiness_doc["signals"] if s["check"] == "source_understood"
@@ -1987,6 +2022,73 @@ def test_run_scan_an_import_only_test_reference_reports_test_evidence_located_sa
     test_evidence = next(
         s for s in readiness_doc["signals"]
         if s["unit_id"] == order_unit["unit_id"] and s["check"] == "test_evidence_located"
+    )
+    assert test_evidence["stored_status"] == "satisfied"
+
+
+def test_a_mixed_files_own_import_counts_as_test_evidence_for_its_target(
+    java_repo: Path,
+) -> None:
+    """MICRO-ROUND 48c (F3, the argued analysis, measured): readiness_
+    artifact.py's own `test_unit_ids` set-comprehension uses BARE
+    membership (`"test" in classification`), unchanged since before
+    round 44's own classification-union fix - argued, in the analysis
+    beside that line, to be the CORRECT answer for its own question
+    ("does an edge FROM this unit count as coming from a test-
+    classified source?"), unlike `_check_test_evidence_located`'s own
+    exemption check (a DIFFERENT question, correctly narrowed to
+    exclusive membership by round 48's own F3).
+
+    Colocates a plain production class (`Helper`) and a test-suffix-
+    named, test-framework-evidenced class (`HelperTest`) in the SAME
+    physical file, outside any recognized test source root - the
+    file's own classification is genuinely mixed, `["production",
+    "test"]`. That file's own `import p.Target;` (Java attributes
+    imports at FILE scope, never to one declared type inside it -
+    adapters.java's own `file_scope_qualified`) still resolves as real,
+    extracted test evidence for `Target` - the intended behavior the
+    analysis concludes bare membership must keep producing, not a
+    residual bug to fix."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "p" / "Target.java").write_text(
+        "package p;\nclass Target {\n  void run() {}\n}\n", encoding="utf-8")
+    (java_repo / "src" / "main" / "java" / "p" / "Mixed.java").write_text(
+        "package p;\n"
+        "import p.Target;\n"
+        "import org.junit.Test;\n"
+        "class Helper {\n"
+        "}\n"
+        "class HelperTest {\n"
+        "  @Test void checks() {}\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+
+    mixed_file_unit = next(
+        u for u in modules_doc["units"]
+        if u["kind"] == "file" and any(p.endswith("p/Mixed.java") for p in u["paths"])
+    )
+    assert sorted(mixed_file_unit["classification"]) == ["production", "test"]
+
+    target_unit = next(u for u in modules_doc["units"] if u["display_name"] == "Target")
+
+    import_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "import" and r.get("evidence_class") == "extracted"
+        and r["resolution_state"] == "resolved" and r["target_unit_id"] == target_unit["unit_id"]
+    )
+    assert import_edge["from_unit_id"] == mixed_file_unit["unit_id"]
+
+    test_evidence = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == target_unit["unit_id"] and s["check"] == "test_evidence_located"
     )
     assert test_evidence["stored_status"] == "satisfied"
 
@@ -3714,6 +3816,88 @@ def test_a_secret_excluded_code_bearing_file_produces_no_unit(java_repo: Path) -
         "secret_pattern_matched_code_bearing_file" in record.get("adapter_problem_reasons", [])
         for record in modules_doc["units"]
     )
+
+
+def test_a_non_utf8_path_produces_no_unit(java_repo: Path, monkeypatch) -> None:
+    """MICRO-ROUND 48c (F1, widening the 48b dead-entry family):
+    `non_utf8_path` shares the identical structural shape as `secret_
+    pattern_matched_code_bearing_file` above - its own, sole emitter
+    sits inside discovery.py's own enumeration walk, which `continue`s
+    past the offending entry BEFORE it is ever appended to `discovery.
+    files`, so `modules_artifact.build_modules`'s own main loop (which
+    only ever constructs a record by iterating `discovery.files` itself)
+    can never construct one for it. Locks the structural fact directly,
+    the same way the secret-excluded test above does - a real non-UTF-8
+    filename is POSIX-only and not reliably constructible from every
+    dev/CI platform (see test_comprehension_discovery.py's own precedent
+    for this), so the underlying check is monkeypatched to fire for one
+    real, ordinary path instead - the SAME technique test_comprehension_
+    discovery.py's own `test_an_unrepresentable_filename_marks_the_
+    fingerprint_incomplete` already establishes."""
+    import json
+
+    from agenttalk.comprehension import discovery as discoverymod
+
+    (java_repo / "weird.txt").write_bytes(b"anything")
+    monkeypatch.setattr(
+        discoverymod, "_non_utf8_path_problem_detail",
+        lambda relative: (
+            {"path": relative, "detail": "simulated non-utf8 path"}
+            if relative == "weird.txt" else None
+        ),
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    assert any(p["reason_code"] == "non_utf8_path" for p in problems_doc["problems"])
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    assert not any("weird.txt" in record["paths"] for record in modules_doc["units"])
+    assert not any(
+        "non_utf8_path" in record.get("adapter_problem_reasons", [])
+        for record in modules_doc["units"]
+    )
+
+
+def test_path_excluded_is_confirmed_reachable_on_a_real_unit(java_repo: Path, monkeypatch) -> None:
+    """MICRO-ROUND 48c (F1, the corrected half): unlike the two dead
+    members above, `path_excluded`'s own emitter (worker.py's `resolve_
+    under_root` defense-in-depth re-confinement check) runs on a path
+    that is UNCONDITIONALLY still in `discovery.files` at that point
+    (scan_pipeline.py hands the worker exactly that list, unfiltered) -
+    so build_modules's own main loop unconditionally constructs a real
+    unit for it regardless, and attributes this reason via `worker_
+    problem_reasons_by_path`. This is NOT a member of the dead-entry
+    family despite superficially similar wording - locks the CORRECTED
+    claim (reachable, not dead) end-to-end, complementing test_
+    comprehension_modules_artifact.py's own synthetic-input proof of the
+    same fact at the build_modules level directly."""
+    import json
+
+    (java_repo / "blocked.txt").write_bytes(b"anything")
+    real_resolve = workermod.resolve_under_root
+
+    def _fake_resolve_under_root(value, *, root, label="path"):
+        if value == "blocked.txt":
+            raise workermod.EnvelopeError(
+                f"{label} resolves outside the project root: {value!r}")
+        return real_resolve(value, root=root, label=label)
+
+    monkeypatch.setattr(workermod, "resolve_under_root", _fake_resolve_under_root)
+
+    outcome = scan_pipeline.run_scan(java_repo)
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    assert any(
+        p["reason_code"] == "path_excluded" and p.get("path") == "blocked.txt"
+        for p in problems_doc["problems"]
+    )
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    matching = [record for record in modules_doc["units"] if "blocked.txt" in record["paths"]]
+    assert len(matching) == 1
+    assert "path_excluded" in matching[0]["adapter_problem_reasons"]
 
 
 def test_run_scan_a_genuinely_degrading_discovery_problem_still_degrades(
@@ -7489,6 +7673,49 @@ def test_scan_json_declares_the_provenance_caveat(java_repo: Path) -> None:
     scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
     assert "problems.json" in scan_doc["provenance_caveat"]
     assert scan_doc["provenance_caveat"] == readiness_artifact.PROVENANCE_CAVEAT
+
+
+@pytest.mark.parametrize("basename,expected_classification", [
+    # the specific, genuinely-always-tooling basename the round-48 N2
+    # narrowing kept in _CONFIDENT_INFRASTRUCTURE_BASENAMES.
+    ("gradle.properties", ["infrastructure"]),
+    # control: an ARBITRARY .properties file (Spring Boot's own
+    # convention) - genuine production runtime configuration, never
+    # confidently infrastructure since round 48's own N2 narrowing.
+    ("application.properties", []),
+])
+def test_run_scan_the_properties_basename_split_end_to_end(
+    java_repo: Path, basename: str, expected_classification: list[str],
+) -> None:
+    """MICRO-ROUND 48c (F2, measurement vs described intent): reviewer-3
+    measured both `application.properties` and an arbitrary `some-
+    other.properties` as `classification=[]` (honest, ratified) but
+    could not reach the POSITIVE basename case with its own fixtures -
+    neither one is a member of `_CONFIDENT_INFRASTRUCTURE_BASENAMES`,
+    so neither ever exercises the rule this round 48's own N2 fix
+    actually added. Settled here with a genuine measurement of BOTH
+    directions, end to end through the real pipeline (not the direct
+    build_modules unit test test_comprehension_modules_artifact.py
+    already has) - the basename rule DOES exist in code exactly as
+    described: a real `gradle.properties` classifies `["infrastructure"]`
+    (worker.py's own non-degrading `unsupported_language` tier-3 path,
+    then `_is_confident_infrastructure_path`'s basename membership), a
+    real `application.properties` classifies `[]` (same tier-3 path,
+    but not on the basename allowlist) - no code/description reconcile
+    was needed; the gap was fixture coverage only."""
+    import json
+
+    (java_repo / basename).write_text(
+        "org.gradle.jvmargs=-Xmx2g\n" if basename == "gradle.properties"
+        else "datasource.url=jdbc:postgresql://prod-db/app\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    record = next(r for r in modules_doc["units"] if basename in r["paths"])
+    assert record["classification"] == expected_classification
 
 
 def test_scan_json_declares_the_route_composition_caveat(java_repo: Path) -> None:
