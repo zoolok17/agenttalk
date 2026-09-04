@@ -6787,6 +6787,21 @@ def test_get_status_reports_the_latest_scan(java_repo: Path) -> None:
     assert status["freshness"]["state"] == "not_evaluated"
 
 
+def test_get_status_includes_boundary_count_and_degraded_by(java_repo: Path) -> None:
+    """MICRO-ROUND 50 (Cluster 5, status parity BLOCKER): degraded_by
+    (literally the answer to "why is this degraded") was never returned
+    by get_status at all - JSON or human - only get_report read it, so
+    an operator asking status could not see it without a second call.
+    Read here the identical way get_report already does (the SAME
+    scan.json field, never a second, independently-drifting copy) - both
+    functions must always agree on this field for the same run."""
+    scan_pipeline.run_scan(java_repo)
+    status = scan_pipeline.get_status(java_repo)
+    report = scan_pipeline.get_report(java_repo)
+    assert status["boundary_count"] == 0
+    assert status["degraded_by"] == report["degraded_by"] == []
+
+
 def test_get_status_declares_its_own_narrower_verification_tier(java_repo: Path) -> None:
     """FIX ROUND 28 (twenty-fourth cold read, F7, completeness): status's
     own narrower read-cost tier (scan.json's own envelope/anchor only -
@@ -8106,6 +8121,32 @@ def test_run_scan_failure_surfaces_the_original_error_even_if_release_also_fails
     with pytest.raises(_OriginalFailure) as excinfo:
         scan_pipeline.run_scan(java_repo)
     assert isinstance(excinfo.value.__cause__, _ReleaseFailure)
+
+
+def test_run_scan_releases_the_lock_when_staging_reclaim_fails(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 5, the staging brick BLOCKER): staging.
+    reclaim_abandoned_staging used to run BEFORE this function's own
+    try/except lock-release handler - an undeletable dead-owner staging
+    directory (staging.StagingReclaimFailed) leaked the just-acquired
+    lock on EVERY attempt, since this SAME reclaim runs again,
+    identically, on the very next lock acquisition, hitting the same
+    undeletable directory again. Moved inside the try block this round -
+    the lock must now be released even when this call fails, exactly
+    like every other mid-pipeline failure already is."""
+    from agenttalk.comprehension import staging as stagingmod
+
+    def _boom_reclaim(*_args, **_kwargs):
+        raise stagingmod.StagingReclaimFailed("simulated undeletable staging directory")
+
+    monkeypatch.setattr(scan_pipeline.staging, "reclaim_abandoned_staging", _boom_reclaim)
+
+    with pytest.raises(stagingmod.StagingReclaimFailed):
+        scan_pipeline.run_scan(java_repo)
+
+    comp_dir = scan_pipeline.paths.comprehension_dir(java_repo / ".agenttalk")
+    assert not scan_pipeline.paths.lock_path(comp_dir).exists()
 
 
 # ----------------------------------------------------------- ceilings integration

@@ -2275,6 +2275,19 @@ def cmd_comprehension(args: argparse.Namespace) -> int:
             print(f"scan_id:  {payload['scan_id']}")
             print(f"status:   {payload['status']}")
             print(f"problems: {payload['problem_count']}")
+            # MICRO-ROUND 50 (Cluster 5, status parity BLOCKER): the SAME
+            # round-7c/round-29 parity precedent immediately below
+            # (default human output must not tell a strictly LESS honest
+            # story than --json, which already carries both fields
+            # unconditionally) had not actually been applied to these
+            # two - boundary_count (a real, if partial, source-coverage
+            # gap signal) and degraded_by (literally the answer to "why
+            # is this degraded," the single most useful field for a
+            # degraded run) were both --json-only until now, even though
+            # this exact precedent was already established for
+            # artifact_integrity_hint right below.
+            print(f"boundaries: {payload['boundary_count']}")
+            print(f"degraded_by: {', '.join(payload['degraded_by']) or '(none)'}")
             _print_scan_json_integrity_if_not_verified(payload)
             # FIX ROUND 29 (twenty-fifth cold read, F8b polish): the
             # round-7c parity precedent (default human output must not
@@ -2332,7 +2345,22 @@ def cmd_comprehension(args: argparse.Namespace) -> int:
         from agenttalk.comprehension import staging as staging_mod
 
         comprehension_dir = comprehension_paths.comprehension_dir(root / ".agenttalk")
-        report = staging_mod.prune_staging(comprehension_dir)
+        # MICRO-ROUND 50 (Cluster 5, concurrent prune): prune_staging's
+        # own reclaim can now raise a typed StagingReclaimFailed (an
+        # undeletable dead-owner directory - see staging.py's own
+        # docstring) - previously unhandled here, an ugly, unhandled
+        # traceback with no exit-code contract at all. The SAME typed-
+        # refusal-to-exit-2 pattern the `validate` action above already
+        # uses; a benign concurrent-reclaim RACE (this same directory
+        # already removed by the automatic lock-acquisition call site,
+        # or another `prune --staging` racing this one) is handled one
+        # level down, inside reclaim_abandoned_staging itself, and never
+        # reaches here as a failure at all.
+        try:
+            report = staging_mod.prune_staging(comprehension_dir)
+        except ComprehensionError as exc:
+            sys.stderr.write(f"agenttalk: {exc}\n")
+            return 2
         payload = {
             "reclaimed": report.reclaimed,
             "retained": [{"name": name, "reason": reason} for name, reason in report.retained],

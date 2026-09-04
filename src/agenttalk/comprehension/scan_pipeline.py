@@ -735,16 +735,30 @@ def run_scan(
     lock_handle = lock.acquire_scan_lock(
         comprehension_dir, privacy=privacy_result, predecessor_index_digest=predecessor_digest,
     )
-    # M-5 (second cold read, PR-B fix round 4): staging.reclaim_abandoned_
-    # staging had ZERO production callers despite its own docstring
-    # claiming "called automatically at lock acquisition" - wired here,
-    # matching both that docstring and the design's own phrasing ("At
-    # lock acquisition, the scanner reclaims only unpublished staging
-    # directories..."). Cleans up whatever a PRIOR crashed or refused run
-    # left behind before this run adds its own.
-    staging.reclaim_abandoned_staging(comprehension_dir)
-
     try:
+        # M-5 (second cold read, PR-B fix round 4): staging.reclaim_
+        # abandoned_staging had ZERO production callers despite its own
+        # docstring claiming "called automatically at lock acquisition" -
+        # wired here, matching both that docstring and the design's own
+        # phrasing ("At lock acquisition, the scanner reclaims only
+        # unpublished staging directories..."). Cleans up whatever a
+        # PRIOR crashed or refused run left behind before this run adds
+        # its own.
+        #
+        # MICRO-ROUND 50 (Cluster 5, the staging brick BLOCKER): this
+        # call used to sit OUTSIDE this try block entirely - a raised
+        # StagingReclaimFailed (an undeletable dead-owner directory,
+        # round 50's own new refusal) propagated straight past the lock-
+        # release safety net below, LEAKING the just-acquired lock on
+        # every single attempt (this reclaim runs again, identically, on
+        # the very next lock acquisition, hitting the same undeletable
+        # directory again) - a permanent brick that also permanently
+        # holds scan.lock, compounding the failure it was already named
+        # for. Moved inside: any exception here now reaches the SAME
+        # chained release-then-reraise handling every other failure in
+        # this function already gets.
+        staging.reclaim_abandoned_staging(comprehension_dir)
+
         scan_id = _generate_scan_id(now)
 
         # M-5 (second cold read, PR-B fix round 4): discovery and the
@@ -2451,6 +2465,16 @@ def get_status(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
             len(_scan_field(scan_doc, "boundaries", scan_id))
             + _scan_field(scan_doc, "boundaries_omitted_count", scan_id)
         ),
+        # MICRO-ROUND 50 (Cluster 5, status parity BLOCKER): scan.json's
+        # own degraded_by (the sorted set of reason_codes that actually
+        # set status="degraded" - a REQUIRED field, see
+        # _SCAN_JSON_REQUIRED_BODY_FIELDS's own docstring) was never
+        # returned here at all - get_report already reads it (below),
+        # but status, the FIRST place an operator actually looks to ask
+        # "why is this degraded," could not answer that question without
+        # a second `report` call. Read the identical way get_report
+        # already does, never a second, independently-drifting copy.
+        "degraded_by": _scan_field(scan_doc, "degraded_by", scan_id),
         "record_counts": _scan_field(scan_doc, "record_counts", scan_id),
         "root_binding": _scan_field(scan_doc, "root_binding", scan_id),
         "root_binding_verification_caveat": ROOT_BINDING_VERIFICATION_CAVEAT,

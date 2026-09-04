@@ -48,11 +48,47 @@ from .envelope import (
     validate_rfc3339_utc,
     validate_scan_id,
 )
+from .errors import ComprehensionError, bounded_os_error_detail
 from .lock import ScanLockHandle, host_identity
 from .paths import staging_dir as _staging_dir
 
 OWNER_SCHEMA_VERSION = 1
 _OWNER_FILENAME = "owner.json"
+
+
+class StagingReclaimFailed(ComprehensionError):
+    """MICRO-ROUND 50 (Cluster 5, the staging brick): a definitely-dead
+    owner's own staging directory was selected for reclaim (per this
+    module's own dead-or-leave-it-alone contract) but could not actually
+    be REMOVED - a file inside it still held open by another process, a
+    permissions/ACL issue, or any other OS-level deletion failure
+    (measured: a raw ``PermissionError [WinError 5]`` on Windows,
+    completely unhandled). This is not an ordinary transient I/O error:
+    since this SAME directory is reclaimed again, identically, on EVERY
+    future lock acquisition (this module's own automatic call site), an
+    undeletable entry here is a PERMANENT BRICK - every future scan
+    attempt hits the identical failure, forever, until an operator
+    investigates and clears it by hand. A named, typed refusal with a
+    concrete remedy, never a raw, unhandled ``OSError`` traceback.
+
+    NAMED RESIDUAL, not silently dropped: this round closes the two
+    IMMEDIATE harms (a raw, unhandled traceback naming an absolute local
+    path; the leaked ``scan.lock`` compounding the brick on every future
+    attempt - see ``scan_pipeline.run_scan``'s own round-50 fix) but does
+    NOT add an operator escape hatch (e.g. a ``--force-staging`` flag to
+    skip or force-remove a specific stuck entry) - genuinely OUT of a
+    "judge fix-vs-issue, cheap fix only" scope this round: it needs new
+    CLI surface (argparse plumbing, a new attended-action shape) and a
+    real design decision about what "force" is even allowed to do to
+    content whose owner cannot be proven dead by deletion (only by
+    process-liveness, already proven here). Left as a real, undeletable-
+    on-this-host directory an operator must clear by hand (the SAME
+    manual-intervention shape a permanently unrecoverable scan.lock
+    already has via ``--recover-stale-lock``) until a future round
+    measures this as a common-enough gap to justify the new surface."""
+
+    reason_code = "comprehension_staging_reclaim_failed"
+
 
 #: Sentinel identity only this module's own factory function holds — mirrors
 #: ``privacy._ISSUED_BY_THIS_MODULE`` exactly (same non-fabricability
@@ -212,6 +248,30 @@ def _classify_one_staging_dir(
         doc = read_json_document(owner_path)
         owner = _validate_owner_doc(doc)
     except EnvelopeError as exc:
+        # NAMED RESIDUAL, not silently dropped (MICRO-ROUND 50, Cluster 5,
+        # judged - fix vs issue): a PRIOR failed shutil.rmtree attempt on
+        # THIS same directory (a StagingReclaimFailed, above) may already
+        # have deleted owner.json itself before hitting whatever file it
+        # could not remove - rmtree's own deletion order is
+        # implementation-defined, so owner.json (a single file directly
+        # in the directory root) can vanish before the failure surfaces.
+        # A directory in exactly this state reads identically to a
+        # GENUINELY malformed/never-written owner.json - this branch
+        # cannot (and does not try to) tell "debris from my own prior
+        # failed reclaim, whose owner WAS already proven dead" apart from
+        # "an unrelated, ambiguous anomaly," and RETAINS both the same
+        # way, forever - a directory in the first state can never
+        # automatically re-prove its own dead owner without owner.json's
+        # own pid to check, so it silently accumulates rather than ever
+        # being retried. Closing this needs a real design decision
+        # (rename-then-delete so a partial rmtree failure can never leave
+        # owner.json gone while other content remains, or a secondary
+        # marker recorded before the delete begins) - genuinely out of a
+        # "judge fix-vs-issue, cheap fix only" scope this round. Left for
+        # a future round if measured as a common-enough gap; an operator
+        # can always clear a directory in this state manually today, the
+        # same "retained, not silently deleted" contract every other
+        # ambiguous case here already has.
         return "retain", f"owner.json is missing or malformed: {exc}"
     if owner["host_identity"] != host_identity():
         return "retain", f"owner.json names a different host ({owner['host_identity']!r})"
@@ -230,6 +290,27 @@ def reclaim_abandoned_staging(comprehension_dir: Path) -> StagingReclaimReport:
     the explicit ``comprehension prune --staging`` maintenance command
     (design: "performs the same check") — both share this one function so
     the two call sites can never drift apart.
+
+    MICRO-ROUND 50 (Cluster 5, the staging brick BLOCKER): ``shutil.
+    rmtree(..., ignore_errors=False)`` used to let a raw ``OSError``
+    (measured: ``PermissionError [WinError 5]``, a file inside still
+    held open) propagate completely unhandled - see
+    :class:`StagingReclaimFailed`'s own docstring for why this is a
+    PERMANENT brick, not a transient failure, if left as a raw
+    traceback. Caught here and converted to that named, typed refusal
+    with a concrete remedy.
+
+    MICRO-ROUND 50 (Cluster 5, concurrent prune): a ``FileNotFoundError``
+    specifically (never folded into the same-``OSError`` refusal above)
+    is a genuinely BENIGN race, not a failure at all - this SAME
+    function runs at every lock acquisition AND from the explicit
+    ``prune --staging`` command, so two overlapping calls (an automatic
+    reclaim racing an operator's manual prune, or two manual prunes)
+    can both select the identical dead-owner directory for reclaim; by
+    the time this call's own ``shutil.rmtree`` runs, the other caller
+    already removed it. The outcome this call was trying to reach ("this
+    directory no longer exists") is already true - counted as reclaimed,
+    never raised as a failure the caller has to investigate.
     """
     staging_root = _staging_dir(comprehension_dir)
     report = StagingReclaimReport()
@@ -238,7 +319,21 @@ def reclaim_abandoned_staging(comprehension_dir: Path) -> StagingReclaimReport:
     for entry in sorted(staging_root.iterdir()):
         disposition, reason = _classify_one_staging_dir(entry, staging_root=staging_root)
         if disposition == "reclaim":
-            shutil.rmtree(entry, ignore_errors=False)
+            try:
+                shutil.rmtree(entry, ignore_errors=False)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise StagingReclaimFailed(
+                    bounded_os_error_detail(
+                        f"{entry.name!r}'s own dead-owner staging directory could not be "
+                        "deleted", exc,
+                    ) + " - this directory is reclaimed again, identically, on EVERY "
+                    "future scan attempt (this is a permanent brick, not a transient "
+                    "failure); an operator must investigate what still holds it open "
+                    "(a file handle, a permissions/ACL issue, ...) and remove it "
+                    "manually before retrying"
+                ) from exc
             report.reclaimed.append(entry.name)
         else:
             report.retained.append((entry.name, reason or "unknown"))

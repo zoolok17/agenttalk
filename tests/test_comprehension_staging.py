@@ -180,6 +180,56 @@ def test_reclaim_removes_a_definitely_dead_owners_staging_dir(
     lockmod.release_scan_lock(lock)
 
 
+def test_reclaim_raises_a_named_refusal_when_the_directory_cannot_be_deleted(
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 5, the staging brick BLOCKER): a
+    definitely-dead owner's own staging directory that cannot actually be
+    deleted (measured: a raw PermissionError [WinError 5] on Windows, a
+    file still held open) used to propagate a raw, unhandled OSError.
+    Converted to a named StagingReclaimFailed refusal carrying the OS's
+    own bounded, path-free reason plus a concrete remedy - never a raw
+    traceback naming an absolute local path."""
+    lock = _lock(comprehension_dir, comprehension_privacy)
+    handle = stg.create_staging_dir(scan_id="scan-1", lock_handle=lock)
+    monkeypatch.setattr(stg, "process_observation", lambda pid: ("dead", None))
+    monkeypatch.setattr(
+        stg.shutil, "rmtree",
+        lambda path, ignore_errors=False: (_ for _ in ()).throw(
+            PermissionError(5, "Access is denied")),
+    )
+    with pytest.raises(stg.StagingReclaimFailed, match="Access is denied"):
+        stg.reclaim_abandoned_staging(comprehension_dir)
+    assert handle.path.exists()  # never removed - the delete itself failed
+    lockmod.release_scan_lock(lock)
+
+
+def test_reclaim_treats_a_concurrently_removed_directory_as_already_reclaimed(
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 5, concurrent prune): a FileNotFoundError
+    from shutil.rmtree is a genuinely BENIGN race - this same function
+    runs at every lock acquisition AND from the explicit
+    ``prune --staging`` command, so an overlapping call (an automatic
+    reclaim racing an operator's manual prune, or two manual prunes) can
+    both select the identical dead-owner directory; by the time THIS
+    call's own rmtree runs, the other one already removed it. The
+    outcome this call wanted ("this directory no longer exists") is
+    already true - counted as reclaimed, never raised as a failure."""
+    lock = _lock(comprehension_dir, comprehension_privacy)
+    handle = stg.create_staging_dir(scan_id="scan-1", lock_handle=lock)
+    monkeypatch.setattr(stg, "process_observation", lambda pid: ("dead", None))
+    monkeypatch.setattr(
+        stg.shutil, "rmtree",
+        lambda path, ignore_errors=False: (_ for _ in ()).throw(
+            FileNotFoundError(2, "No such file or directory")),
+    )
+    report = stg.reclaim_abandoned_staging(comprehension_dir)
+    assert report.reclaimed == [handle.path.name]
+    assert report.retained == []
+    lockmod.release_scan_lock(lock)
+
+
 def test_reclaim_removes_only_the_dead_ones_among_several(
     comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
 ) -> None:

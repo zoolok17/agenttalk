@@ -393,6 +393,27 @@ def test_status_human_output_prints_the_artifact_integrity_hint(
     assert scan_pipeline.STATUS_ARTIFACT_INTEGRITY_HINT in out
 
 
+def test_status_human_output_prints_boundary_count_and_degraded_by(
+    java_repo: Path, capsys,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 5, status parity BLOCKER): the SAME round-
+    7c/round-29 parity precedent as the artifact_integrity_hint fix
+    above had not actually been applied to these two fields -
+    boundary_count and degraded_by (literally the answer to "why is
+    this degraded") were both --json-only, never in the default human
+    rendering an operator most commonly sees. A healthy, non-degraded
+    scan still shows both fields (a genuinely empty degraded_by rendered
+    as "(none)", never a blank line indistinguishable from "the field
+    itself is missing")."""
+    _run(["comprehension", "scan"], java_repo)
+    capsys.readouterr()
+    exit_code = _run(["comprehension", "status"], java_repo)
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "boundaries: 0" in out
+    assert "degraded_by: (none)" in out
+
+
 def test_status_human_output_is_silent_about_integrity_when_verified(
     java_repo: Path, capsys,
 ) -> None:
@@ -727,6 +748,27 @@ def test_prune_without_staging_flag_refuses(tmp_path: Path, capsys) -> None:
     exit_code = _run(["comprehension", "prune"], tmp_path)
     assert exit_code == 2
     assert "--staging" in capsys.readouterr().err
+
+
+def test_prune_staging_reports_a_named_refusal_instead_of_a_raw_traceback(
+    java_repo: Path, capsys, monkeypatch,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 5, concurrent prune): an undeletable dead-
+    owner directory (staging.StagingReclaimFailed) used to be completely
+    unhandled here - an ugly, unhandled traceback with no exit-code
+    contract at all, unlike every sibling comprehension action (scan/
+    status/report/validate), which all convert a typed ComprehensionError
+    into a clean "agenttalk: ..." message + exit 2."""
+    from agenttalk.comprehension import staging as stagingmod
+
+    def _boom_prune(*_args, **_kwargs):
+        raise stagingmod.StagingReclaimFailed("simulated undeletable staging directory")
+
+    monkeypatch.setattr(stagingmod, "prune_staging", _boom_prune)
+
+    exit_code = _run(["comprehension", "prune", "--staging"], java_repo)
+    assert exit_code == 2
+    assert "simulated undeletable staging directory" in capsys.readouterr().err
 
 
 # ----------------------------------------------------------- bare subcommand

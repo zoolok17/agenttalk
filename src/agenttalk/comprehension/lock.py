@@ -31,6 +31,7 @@ import contextlib
 import ctypes
 import json
 import os
+import shutil
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -39,7 +40,12 @@ from typing import Any
 
 from ..lifecycle_lock import ProcessIdentity, process_identity, process_observation
 from .digests import root_binding_digest
-from .envelope import EnvelopeError, read_json_document, validate_rfc3339_utc
+from .envelope import (
+    EnvelopeError,
+    path_is_reparse_point_or_symlink,
+    read_json_document,
+    validate_rfc3339_utc,
+)
 from .errors import PrivacyProofRootMismatch, ScanLockContended, ScanLockUnrecoverable
 from .paths import lock_path as _lock_path
 from .paths import project_root_from_comprehension_dir
@@ -385,6 +391,42 @@ def release_scan_lock(handle: ScanLockHandle) -> None:
     os.remove(handle.path)
 
 
+def _remove_lock_path_regardless_of_shape(path: Path) -> None:
+    """MICRO-ROUND 50 (Cluster 5, directory-shaped scan.lock BLOCKER):
+    ``os.remove(path)`` alone only ever handles the ORDINARY case (an
+    existing plain file, or none at all - the design's own assumed
+    shape). If ``scan.lock`` has somehow become a DIRECTORY (an operator
+    mistake, a prior bug elsewhere, ...), ``os.remove()`` refuses it
+    outright (``IsADirectoryError``/``PermissionError``, depending on
+    platform) - ``--recover-stale-lock``'s own advertised job ("clears
+    an existing scan.lock") silently could not be done for this one
+    shape, contradicting its own help text with an unhandled crash
+    instead of the recovery it promises.
+
+    Never followed through a reparse point/symlink to delete real
+    content living elsewhere (the exact class of risk round 50's own
+    Cluster 0 fix closed for ``runs/``/``.staging/``) - a reparse point/
+    symlink is removed as ITSELF, platform-specific (a POSIX symlink via
+    ``os.remove`` never follows it regardless of what it points to; a
+    Windows directory JUNCTION specifically requires ``os.rmdir``
+    instead - ``os.remove`` refuses a directory-attributed path on
+    Windows even when it is a junction, not a real directory). An
+    ordinary directory (no reparse point at all) is removed with
+    ``shutil.rmtree`` - correctly recovering the shape ``os.remove``
+    alone never could."""
+    if path_is_reparse_point_or_symlink(path):
+        if os.name == "nt":
+            os.rmdir(path)
+        else:
+            os.remove(path)
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+        return
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(path)
+
+
 def recover_stale_lock(comprehension_dir: Path) -> dict | None:
     """Attended-only override: clears an existing scan.lock — UNLESS its
     recorded owner is a provably live, same-host, same-process match, in
@@ -449,8 +491,7 @@ def recover_stale_lock(comprehension_dir: Path) -> dict | None:
                 and observed.value == recorded["value"]
             ):
                 raise ScanLockContended(record)
-    with contextlib.suppress(FileNotFoundError):
-        os.remove(path)
+    _remove_lock_path_regardless_of_shape(path)
     if record_unreadable:
         return {"pid": None, "acquired_at": None, "record_unreadable": True}
     return record

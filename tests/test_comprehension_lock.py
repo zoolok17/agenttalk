@@ -372,6 +372,47 @@ def test_recover_stale_lock_on_an_absent_lock_is_a_silent_no_op(tmp_path: Path) 
     assert not (tmp_path / "scan.lock").exists()
 
 
+def test_recover_stale_lock_clears_a_directory_shaped_lock(tmp_path: Path) -> None:
+    """MICRO-ROUND 50 (Cluster 5, directory-shaped scan.lock BLOCKER):
+    ``os.remove()`` alone refuses a directory outright - ``scan.lock``
+    somehow being a directory (an operator mistake, a prior bug
+    elsewhere, ...) used to make this function's own advertised job
+    ("clears an existing scan.lock") crash with an unhandled OSError
+    instead, directly contradicting ScanLockUnrecoverable's own remedy
+    text (\"run --recover-stale-lock\") which promised this would work."""
+    tmp_path.mkdir(exist_ok=True)
+    lock_path = tmp_path / "scan.lock"
+    (lock_path / "nested").mkdir(parents=True)  # non-empty, the harder case
+    previous = lockmod.recover_stale_lock(tmp_path)
+    assert not lock_path.exists()
+    assert previous == {"pid": None, "acquired_at": None, "record_unreadable": True}
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows directory junctions only")
+def test_recover_stale_lock_clears_a_junctioned_lock_without_touching_its_target(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 5, directory-shaped scan.lock - the
+    reparse-point half): a JUNCTIONED scan.lock must be removed as
+    ITSELF (os.rmdir, never os.remove, which refuses a directory-
+    attributed path on Windows even for a junction) - never followed
+    through to delete the real content it points to, the exact class of
+    risk round 50's own Cluster 0 fix closed for runs/.staging."""
+    outside = tmp_path.parent / "outside-scan-lock-junction-target"
+    outside.mkdir(exist_ok=True)
+    (outside / "real_content.txt").write_bytes(b"do not delete me\n")
+    lock_path = tmp_path / "scan.lock"
+    subprocess.run(  # noqa: S603,S607  # nosec B603 B607
+        ["cmd", "/c", "mklink", "/J", str(lock_path), str(outside)],
+        check=True, capture_output=True, text=True,
+    )
+    previous = lockmod.recover_stale_lock(tmp_path)
+    assert not lock_path.exists()  # the junction itself is gone
+    assert outside.exists()  # its real target is untouched
+    assert (outside / "real_content.txt").read_bytes() == b"do not delete me\n"
+    assert previous == {"pid": None, "acquired_at": None, "record_unreadable": True}
+
+
 # ----------------------------------------------------------- host_identity()
 
 def test_host_identity_returns_a_non_empty_string() -> None:
