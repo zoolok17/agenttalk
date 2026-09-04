@@ -364,6 +364,17 @@ _READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
     # skips adapter analysis entirely - the same genuine whole-file
     # evidence gap parse_failed already is, never a narrower fact.
     "encoding_undecodable": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
+    # MICRO-ROUND 49 (forty-third cold read, M5, judged): a raw source
+    # containing a `\uXXXX` escape that decodes to a structural
+    # character (/, *, ", or a newline - see java.py's own
+    # `_structural_unicode_escape_detected` docstring) means this
+    # adapter's own lexing may disagree with a real compiler's - the
+    # SAME genuine whole-file evidence gap `parse_failed`/`encoding_
+    # undecodable` already are, never a narrower fact (the risk is not
+    # scoped to any one declared type - a smuggled comment delimiter
+    # can fabricate a phantom type OR hide a real import anywhere in
+    # the file).
+    "source_uses_structural_unicode_escapes": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
     # MICRO-ROUND 48c (reviewer-3's own table hunt on the round-48b dead-
     # entry family, below): this one is CONFIRMED LIVE, not a member of
     # that family, despite superficially similar wording - the reviewer's

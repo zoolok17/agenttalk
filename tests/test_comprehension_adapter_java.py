@@ -91,6 +91,33 @@ class Foo {}
     assert _edges(result, "import") == []
 
 
+def test_two_imports_on_one_physical_line_both_extract():
+    """MICRO-ROUND 49 (forty-third cold read, M1 MAJOR, wrong-data):
+    _IMPORT_RE used to be LINE-anchored - `import java.util.List;
+    import java.util.Map;` on ONE physical line is ordinary, legal Java
+    (a semicolon ends a statement, never a newline), but the SECOND
+    import there sat behind neither a line-start nor a statement-start
+    anchor and was silently dropped. Reproduced pre-fix exactly as
+    measured: only the first of the two imports was ever extracted."""
+    src = "package p;\nimport java.util.List; import java.util.Map;\nclass Foo {}\n"
+    result = java.parse_java_source("Foo.java", src)
+    assert {e.target for e in _edges(result, "import")} == {"java.util.List", "java.util.Map"}
+
+
+def test_an_import_sharing_a_line_with_another_still_corroborates_test_classification():
+    """MICRO-ROUND 49 (M1's own real-world consequence): a real JUnit
+    test class whose `import org.junit.Test;` happens to share a
+    physical line with another import used to lose that import
+    entirely - classifying `production` (not `test`) AND separately
+    reporting no test-framework evidence at all, two false artifacts
+    from the one dropped match."""
+    src = "package p;\nimport java.util.List; import org.junit.Test;\nclass FooTest {\n}\n"
+    result = java.parse_java_source("p/FooTest.java", src)
+    imports = {e.target for e in _edges(result, "import")}
+    assert imports == {"java.util.List", "org.junit.Test"}
+    assert result.units[0].classification == "test"
+
+
 # ----------------------------------------------------------- types / nesting
 
 def test_extracts_a_nested_class_with_correct_qualified_name():
@@ -192,6 +219,79 @@ interface Combo extends Foo, Bar {
     result = java.parse_java_source("Combo.java", src)
     inherit = _edges(result, "inherit")
     assert {e.target for e in inherit} == {"Foo", "Bar"}
+
+
+def test_a_wildcard_bound_in_implements_with_no_own_extends_clause_fabricates_nothing():
+    """MICRO-ROUND 49 (forty-third cold read, 49-M6, wrong-data - the
+    extractor structural audit's own new finding): _HEADER_EXTENDS_RE
+    used to be a bare, unscoped .search over the WHOLE clause zone -
+    `implements List<? extends Number>` has no class-level `extends`
+    clause of its own, but the wildcard bound's own "extends" was the
+    only one in the zone, and with no implements/permits AHEAD of IT,
+    the lazy capture ran to end-of-clause, fabricating an inherit edge
+    to a nonexistent type `Number>`. Reproduced pre-fix exactly as
+    measured. Now correctly produces no inherit edge for a nonexistent
+    superclass - only the real Comparable implements edge."""
+    src = """
+package p;
+class A implements Comparable<? extends Number> {
+}
+"""
+    result = java.parse_java_source("A.java", src)
+    inherit = _edges(result, "inherit")
+    targets = {e.target for e in inherit}
+    assert "Number>" not in targets
+    assert not any(">" in t for t in targets)
+    assert targets == {"Comparable"}
+
+
+def test_a_real_extends_clause_alongside_an_implements_wildcard_bound_still_resolves():
+    """Control for the fix above: a class with BOTH a real extends
+    clause AND an implements list carrying a wildcard bound, in the
+    SAME header - the truncation must not cut off the real extends
+    clause, which always comes first in JLS grammar."""
+    src = """
+package p;
+class A extends BaseThing implements Comparable<? extends Number> {
+}
+"""
+    result = java.parse_java_source("A.java", src)
+    inherit = _edges(result, "inherit")
+    targets = {e.target for e in inherit}
+    assert "BaseThing" in targets
+    assert "Comparable" in targets
+    assert not any(">" in t for t in targets)
+
+
+def test_the_class_own_extends_clause_may_itself_carry_a_wildcard_bound():
+    """Control: the class's OWN extends clause (no implements at all)
+    legitimately contains a wildcard bound - this is the FIRST
+    "extends" in the zone, the real one, and must still resolve to the
+    real supertype base name, never truncated or confused with the
+    wildcard's own inner "extends"."""
+    src = """
+package p;
+class A extends java.util.ArrayList<? extends Number> {
+}
+"""
+    result = java.parse_java_source("A.java", src)
+    inherit = _edges(result, "inherit")
+    assert {e.target for e in inherit} == {"java.util.ArrayList"}
+
+
+def test_an_interface_extending_multiple_parents_with_a_wildcard_bound_in_the_first():
+    """Control: an interface's own multi-parent extends list, wildcard
+    bound in the FIRST parent - both parents must still resolve, base
+    names only, never a fabricated third target from the bound."""
+    src = """
+package p;
+interface Combo extends Comparable<? extends Number>, java.io.Closeable {
+}
+"""
+    result = java.parse_java_source("Combo.java", src)
+    inherit = _edges(result, "inherit")
+    targets = {e.target for e in inherit}
+    assert targets == {"Comparable", "java.io.Closeable"}
 
 
 # ------------------------------------------------- BLOCKER 1a header battery
@@ -414,6 +514,72 @@ def test_a_file_with_zero_extracted_types_publishes_no_route_or_entry_point_clai
     assert result.units == []
     assert result.edges == []
     assert result.entry_points == []
+
+
+def test_an_escaped_comment_delimiter_records_a_structural_unicode_escape_problem():
+    """MICRO-ROUND 49 (forty-third cold read, M5, judged - detect-and-
+    degrade): JLS 3.3 decodes \\uXXXX escapes in a translation step
+    BEFORE tokenization - a real compiler sees `\\u002F\\u002A` as `/*`,
+    the start of a real comment, but this adapter's own sanitizer never
+    decodes unicode escapes before lexing, so it reads the SAME six
+    characters as ordinary code. This adapter does not attempt to
+    decode-and-relex (a named limit) - it detects the risk and degrades
+    the file's own claims instead of silently trusting either
+    reading."""
+    backslash = chr(92)
+    escaped_comment_open = backslash + "u002F" + backslash + "u002A"
+    src = (
+        "package p;\n"
+        "public class Real {\n"
+        "  " + escaped_comment_open + " looks like code to javac, a comment to nobody here */\n"
+        "  void m() {}\n"
+        "}\n"
+    )
+    result = java.parse_java_source("Real.java", src)
+    assert any(p.reason_code == "source_uses_structural_unicode_escapes" for p in result.problems)
+
+
+def test_an_escaped_newline_records_a_structural_unicode_escape_problem():
+    """MICRO-ROUND 49 (M5's own escaped-newline shape): `\\u000A` decodes
+    to a real line terminator - a real compiler sees two physical
+    lines where this adapter's own `//` comment scan sees one, so a
+    declaration meant to follow the escaped newline could be silently
+    swallowed as trailing comment text (or the reverse)."""
+    backslash = chr(92)
+    escaped_newline = backslash + "u000A"
+    src = (
+        "package p;\n"
+        "public class Real {\n"
+        "  // a comment" + escaped_newline + "import java.util.List;\n"
+        "  void m() {}\n"
+        "}\n"
+    )
+    result = java.parse_java_source("Real.java", src)
+    assert any(p.reason_code == "source_uses_structural_unicode_escapes" for p in result.problems)
+
+
+def test_an_ordinary_unicode_escape_never_flags_a_structural_problem():
+    """Control: a harmless \\uXXXX escape that decodes to an ORDINARY
+    character (a plain letter, no lexical significance) must never be
+    mistaken for the structural shape above - the whole point is the
+    CLOSED set of characters that change lexing, never "any escape"."""
+    backslash = chr(92)
+    escaped_a = backslash + "u0041"  # 'A' - lexically inert
+    src = (
+        "package p;\n"
+        "public class Real {\n"
+        "  String s = \"" + escaped_a + "\";\n"
+        "  void m() {}\n"
+        "}\n"
+    )
+    result = java.parse_java_source("Real.java", src)
+    assert not any(p.reason_code == "source_uses_structural_unicode_escapes" for p in result.problems)
+
+
+def test_a_file_with_no_unicode_escapes_at_all_never_flags_a_structural_problem():
+    src = "package p;\npublic class Real {\n  void m() {}\n}\n"
+    result = java.parse_java_source("Real.java", src)
+    assert not any(p.reason_code == "source_uses_structural_unicode_escapes" for p in result.problems)
 
 
 # ----------------------------------------------------------- test classification + relation
@@ -3550,6 +3716,173 @@ public class DispatcherServlet extends HttpServlet {
     assert all(e.qualified_name == "p.DispatcherServlet" for e in http_entry_points)
 
 
+def test_web_servlet_annotation_is_suppressed_when_metadata_complete():
+    """MICRO-ROUND 49 (forty-third cold read, M2 MAJOR, wrong-data):
+    Servlet 3.0 s8.1 - once the effective web.xml declares metadata-
+    complete="true", the container MUST NOT scan @WebServlet at all.
+    Reproduced pre-fix exactly as measured: this annotation's own
+    urlPatterns published as a live route/entry point regardless,
+    complete/0, on a half-migrated legacy app (a frozen, metadata-
+    complete descriptor plus still-present but now-inert annotations -
+    this producer's own target scenario)."""
+    src = """
+package p;
+
+@WebServlet(urlPatterns = {"/api/*"})
+public class DispatcherServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("DispatcherServlet.java", src, metadata_complete=True)
+    assert _edges(result, "route") == []
+    assert [e for e in result.entry_points if e.kind == "http_route"] == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert "metadata-complete" in problem.detail
+    assert problem.qualified_name == "p.DispatcherServlet"
+
+
+def test_web_servlet_annotation_control_metadata_complete_absent():
+    """Control for the fix above: metadata_complete=False (the default,
+    ordinary case - the attribute absent or false) must keep publishing
+    the route exactly as before this round."""
+    src = """
+package p;
+
+@WebServlet(urlPatterns = {"/api/*"})
+public class DispatcherServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("DispatcherServlet.java", src, metadata_complete=False)
+    assert [r.target for r in _edges(result, "route")] == ["/api/*"]
+
+
+def test_web_filter_annotation_is_suppressed_when_metadata_complete():
+    """MICRO-ROUND 49 (M2's own @WebFilter twin): the identical Servlet
+    3.0 s8.1 rule applies to @WebFilter unchanged."""
+    src = """
+package p;
+
+@WebFilter(urlPatterns = {"/api/*"})
+public class AuthFilter implements Filter {
+}
+"""
+    result = java.parse_java_source("AuthFilter.java", src, metadata_complete=True)
+    assert _edges(result, "route") == []
+    assert [e for e in result.entry_points if e.kind == "http_filter"] == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert "metadata-complete" in problem.detail
+
+
+def test_spring_route_annotation_is_never_suppressed_by_metadata_complete():
+    """MICRO-ROUND 49 (M2's own scoping control): metadata-complete is a
+    SERVLET-annotation-family concept (Servlet 3.0 s8.1 names exactly
+    @WebServlet/@WebFilter/@WebListener) - Spring's own @RequestMapping
+    family is scanned by Spring itself, never the servlet container, so
+    it is entirely unaffected regardless of metadata-complete."""
+    src = """
+package p;
+
+@RestController
+public class UserController {
+  @GetMapping("/users") void list() {}
+}
+"""
+    result = java.parse_java_source("UserController.java", src, metadata_complete=True)
+    assert [r.target for r in _edges(result, "route")] == ["GET /users"]
+
+
+def test_jax_rs_route_annotation_is_never_suppressed_by_metadata_complete():
+    """MICRO-ROUND 49 (M2's own scoping control, JAX-RS twin): JAX-RS's
+    own @Path/@GET etc. are scanned by the JAX-RS runtime, never the
+    servlet container's own annotation scan - unaffected by metadata-
+    complete for the identical reason as the Spring control above."""
+    src = """
+package p;
+
+@Path("/users")
+public class UserResource {
+  @GET
+  @Path("/list")
+  public String list() { return ""; }
+}
+"""
+    result = java.parse_java_source("UserResource.java", src, metadata_complete=True)
+    assert len(_edges(result, "route")) == 1
+
+
+def test_web_servlet_name_attribute_is_recorded_for_the_cross_file_join():
+    """MICRO-ROUND 49 (forty-third cold read, M3 MAJOR, wrong-data): a
+    @WebServlet's own `name=` attribute, published on JavaFileResult
+    for worker.py's own cross-file join into a web.xml's declared_names
+    registry (Servlet spec s8.2.3 - one shared namespace). Includes the
+    startup-only shape (name declared, no url mapping at all) - the
+    name is still real and joinable even though this file alone
+    publishes no route for it."""
+    src = """
+package p;
+
+@WebServlet(name = "Checkout", urlPatterns = {"/checkout"})
+public class CheckoutServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("CheckoutServlet.java", src)
+    assert result.web_servlet_declared_names == {"Checkout": "p.CheckoutServlet"}
+
+
+def test_web_servlet_name_only_startup_shape_still_records_the_name():
+    src = """
+package p;
+
+@WebServlet(name = "InitOnly")
+public class InitServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("InitServlet.java", src)
+    assert result.web_servlet_declared_names == {"InitOnly": "p.InitServlet"}
+
+
+def test_web_filter_name_attribute_is_recorded_for_the_cross_file_join():
+    """MICRO-ROUND 49 (M3's own @WebFilter twin)."""
+    src = """
+package p;
+
+@WebFilter(name = "Auth", urlPatterns = {"/secure/*"})
+public class AuthFilter implements Filter {
+}
+"""
+    result = java.parse_java_source("AuthFilter.java", src)
+    assert result.web_filter_declared_names == {"Auth": "p.AuthFilter"}
+
+
+def test_web_servlet_without_a_name_attribute_records_nothing():
+    """Control: the ordinary, name-absent case must never fabricate an
+    entry in the cross-file join registry."""
+    src = """
+package p;
+
+@WebServlet(urlPatterns = {"/checkout"})
+public class CheckoutServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("CheckoutServlet.java", src)
+    assert result.web_servlet_declared_names == {}
+
+
+def test_web_servlet_name_is_not_recorded_when_metadata_complete():
+    """MICRO-ROUND 49 (M2/M3 interaction): once the effective descriptor
+    sets metadata-complete=true, the container does not scan THIS
+    annotation at all - its own name= is exactly as inert as its own
+    urlPatterns=, so it must not join the cross-file registry either."""
+    src = """
+package p;
+
+@WebServlet(name = "Checkout", urlPatterns = {"/checkout"})
+public class CheckoutServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("CheckoutServlet.java", src, metadata_complete=True)
+    assert result.web_servlet_declared_names == {}
+
+
 def test_web_servlet_annotation_recovers_a_bare_positional_value():
     """@WebServlet("/api/*") - the bare positional form, no named
     urlPatterns/value attribute at all - still recovered via the
@@ -5806,6 +6139,40 @@ public class LocalOnlyService {
 
 # ----------------------------------------------------------- web.xml (route)
 
+def test_web_app_declares_metadata_complete_true():
+    web_xml = '<web-app metadata-complete="true"><servlet></servlet></web-app>'
+    assert java.web_app_declares_metadata_complete(web_xml) is True
+
+
+def test_web_app_declares_metadata_complete_absent_control():
+    """Control: the ordinary, attribute-absent case (Servlet 3.0 s8.1's
+    own default is false) must never be mistaken for true."""
+    web_xml = "<web-app><servlet></servlet></web-app>"
+    assert java.web_app_declares_metadata_complete(web_xml) is False
+
+
+def test_web_app_declares_metadata_complete_false_explicit_control():
+    web_xml = '<web-app metadata-complete="false"><servlet></servlet></web-app>'
+    assert java.web_app_declares_metadata_complete(web_xml) is False
+
+
+def test_web_app_declares_metadata_complete_ignores_a_leaf_elsewhere_in_the_document():
+    """Scoping control: the attribute is read from the root <web-app>'s
+    OWN opening tag only - a leaf element elsewhere in the descriptor
+    that happens to contain the literal text must never be mistaken for
+    the real, root-level declaration."""
+    web_xml = (
+        '<web-app><description>see metadata-complete="true" in the wiki</description>'
+        "<servlet></servlet></web-app>"
+    )
+    assert java.web_app_declares_metadata_complete(web_xml) is False
+
+
+def test_web_app_declares_metadata_complete_single_quoted_attribute():
+    web_xml = "<web-app metadata-complete='true'><servlet></servlet></web-app>"
+    assert java.web_app_declares_metadata_complete(web_xml) is True
+
+
 def test_parse_web_xml_extracts_servlet_mapping_routes():
     web_xml = """<web-app>
   <servlet-mapping>
@@ -5965,6 +6332,91 @@ def test_parse_web_xml_falls_back_to_the_synthetic_owner_with_no_matching_servle
 """
     entry_points, _web_problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert entry_points[0].qualified_name == "WEB-INF/web.xml#legacy"
+
+
+def test_parse_web_xml_a_mapping_naming_an_annotation_only_servlet_resolves_to_its_class():
+    """MICRO-ROUND 49 (forty-third cold read, M3 MAJOR, wrong-data):
+    Servlet spec s8.2.3 - servlet names share ONE namespace regardless
+    of whether they are declared via XML or an annotation. A <servlet-
+    mapping> naming a servlet that is declared ONLY by a real, in-scan
+    @WebServlet(name=...) annotation (no matching <servlet> element at
+    all) used to get a FALSE undeclared_descriptor_name (degrading the
+    run) and its route mis-attributed to web.xml's own FILE unit -
+    reproduced pre-fix exactly as measured. Now resolves directly to
+    the annotation-declaring class, and no problem is recorded."""
+    web_xml = """<web-app>
+  <servlet-mapping>
+    <servlet-name>Checkout</servlet-name>
+    <url-pattern>/checkout</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
+        "WEB-INF/web.xml", web_xml,
+        annotation_declared_servlet_names={"Checkout": "com.acme.CheckoutServlet"})
+    assert len(entry_points) == 1
+    assert entry_points[0].qualified_name == "com.acme.CheckoutServlet"
+    assert not any(p.reason_code == "undeclared_descriptor_name" for p in problems)
+
+
+def test_parse_web_xml_a_mapping_naming_an_annotation_only_filter_resolves_to_its_class():
+    """MICRO-ROUND 49 (M3's own @WebFilter twin)."""
+    web_xml = """<web-app>
+  <filter-mapping>
+    <filter-name>Auth</filter-name>
+    <url-pattern>/secure/*</url-pattern>
+  </filter-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
+        "WEB-INF/web.xml", web_xml,
+        annotation_declared_filter_names={"Auth": "com.acme.AuthFilter"})
+    assert len(entry_points) == 1
+    assert entry_points[0].qualified_name == "com.acme.AuthFilter"
+    assert not any(p.reason_code == "undeclared_descriptor_name" for p in problems)
+
+
+def test_parse_web_xml_a_genuinely_undeclared_name_control_still_flags():
+    """Control for the fix above: a <servlet-mapping> naming something
+    declared NOWHERE (not in web.xml's own <servlet> blocks, not in any
+    annotation this run scanned) must keep reporting undeclared_
+    descriptor_name exactly as before this round."""
+    web_xml = """<web-app>
+  <servlet-mapping>
+    <servlet-name>Ghost</servlet-name>
+    <url-pattern>/ghost</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
+        "WEB-INF/web.xml", web_xml,
+        annotation_declared_servlet_names={"Checkout": "com.acme.CheckoutServlet"})
+    assert entry_points[0].qualified_name == "WEB-INF/web.xml#Ghost"
+    assert any(p.reason_code == "undeclared_descriptor_name" for p in problems)
+
+
+def test_parse_web_xml_a_name_declared_differently_by_xml_and_annotation_conflicts():
+    """MICRO-ROUND 49 (M3's own conflict control - the .cr43-double
+    shape, unchanged behavior): a name declared via a REAL <servlet>
+    element AND, disagreeing, via an annotation - the SAME conflict
+    machinery that already handles two disagreeing XML declarations
+    (round 30's own F1) must catch this cross-source disagreement too,
+    never silently pick one side."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>Checkout</servlet-name>
+    <servlet-class>com.acme.XmlCheckoutServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>Checkout</servlet-name>
+    <url-pattern>/checkout</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    _entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
+        "WEB-INF/web.xml", web_xml,
+        annotation_declared_servlet_names={"Checkout": "com.acme.AnnotationCheckoutServlet"})
+    assert any(p.reason_code == "duplicate_descriptor_name" for p in problems)
 
 
 def test_parse_web_xml_url_pattern_is_recovered_verbatim_regardless_of_size():

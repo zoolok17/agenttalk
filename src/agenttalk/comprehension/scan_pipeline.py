@@ -151,6 +151,9 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     # FIX ROUND 21 (seventeenth cold read, CR17-4 MAJOR): same bucket as
     # every other genuine whole-file evidence gap above.
     "encoding_undecodable": "warning",
+    # MICRO-ROUND 49 (M5, judged): same whole-file-evidence-gap bucket -
+    # see readiness_artifact.py's own table entry for the reasoning.
+    "source_uses_structural_unicode_escapes": "warning",
     "path_excluded": "warning",
     "resource_limit": "warning",
     "non_utf8_path": "warning",

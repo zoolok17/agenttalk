@@ -611,6 +611,130 @@ def test_web_xml_declaring_an_in_scan_servlet_route_is_satisfied_end_to_end_f1(
     assert signal["stored_status"] == "satisfied"
 
 
+def test_web_xml_metadata_complete_suppresses_an_annotation_route_end_to_end(
+    java_repo: Path,
+) -> None:
+    """MICRO-ROUND 49 (forty-third cold read, M2 MAJOR, wrong-data,
+    end-to-end): Servlet 3.0 s8.1 - a web.xml declaring metadata-
+    complete="true" makes the container ignore EVERY servlet/filter
+    annotation, but this fact is only knowable from web.xml, and the
+    @WebServlet-decorated route lives in a DIFFERENT file entirely -
+    verified through the real pipeline (worker.py's own cross-file
+    pre-scan), not a single-file adapter call."""
+    import json
+
+    pkg_dir = java_repo / "src" / "main" / "java" / "com" / "acme"
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    (pkg_dir / "LegacyServlet.java").write_text(
+        "package com.acme;\n"
+        "@WebServlet(urlPatterns = {\"/legacy\"})\n"
+        "public class LegacyServlet extends HttpServlet {\n"
+        "}\n",
+        encoding="utf-8")
+    webinf = java_repo / "WEB-INF"
+    webinf.mkdir(exist_ok=True)
+    (webinf / "web.xml").write_text(
+        '<web-app metadata-complete="true">\n'
+        "</web-app>\n",
+        encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    servlet_unit = next(
+        u for u in modules_doc["units"] if u["display_name"] == "LegacyServlet")
+    assert "unsupported_entry_point_shape" in servlet_unit["adapter_problem_reasons"]
+
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    route_edges = [e for e in dependencies_doc["edges"] if e["relation"] == "route"]
+    assert route_edges == []
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    metadata_problems = [
+        p for p in problems_doc["problems"]
+        if p["reason_code"] == "unsupported_entry_point_shape" and "metadata-complete" in p["detail"]
+    ]
+    assert len(metadata_problems) == 1
+
+
+def test_web_xml_metadata_complete_absent_control_end_to_end(java_repo: Path) -> None:
+    """Control for the fix above: an ordinary web.xml with no metadata-
+    complete attribute at all must keep publishing the annotation
+    route exactly as before this round."""
+    import json
+
+    pkg_dir = java_repo / "src" / "main" / "java" / "com" / "acme"
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    (pkg_dir / "LegacyServlet.java").write_text(
+        "package com.acme;\n"
+        "@WebServlet(urlPatterns = {\"/legacy\"})\n"
+        "public class LegacyServlet extends HttpServlet {\n"
+        "}\n",
+        encoding="utf-8")
+    webinf = java_repo / "WEB-INF"
+    webinf.mkdir(exist_ok=True)
+    (webinf / "web.xml").write_text("<web-app>\n</web-app>\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    route_edges = [e for e in dependencies_doc["edges"] if e["relation"] == "route"]
+    assert [e["target_external"] for e in route_edges] == ["/legacy"]
+
+
+def test_web_xml_mapping_naming_an_annotation_only_servlet_resolves_end_to_end(
+    java_repo: Path,
+) -> None:
+    """MICRO-ROUND 49 (forty-third cold read, M3 MAJOR, wrong-data,
+    end-to-end): the cross-file join itself - a web.xml <servlet-
+    mapping> names a servlet that is declared ONLY by a real, in-scan
+    @WebServlet(name=...) annotation IN A DIFFERENT FILE, with no
+    matching <servlet> element in web.xml at all. Verified through the
+    real pipeline (worker.py's own deferred-web.xml pass, which needs
+    the FULL cross-file name registry regardless of which file this
+    run happens to read first) - not a hand-built fixture at the
+    adapter level."""
+    import json
+
+    pkg_dir = java_repo / "src" / "main" / "java" / "com" / "acme"
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    (pkg_dir / "CheckoutServlet.java").write_text(
+        "package com.acme;\n"
+        "@WebServlet(name = \"Checkout\", urlPatterns = {\"/checkout\"})\n"
+        "public class CheckoutServlet extends HttpServlet {\n"
+        "}\n",
+        encoding="utf-8")
+    webinf = java_repo / "WEB-INF"
+    webinf.mkdir(exist_ok=True)
+    (webinf / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>Checkout</servlet-name>\n"
+        "    <url-pattern>/checkout</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    assert not any(p["reason_code"] == "undeclared_descriptor_name" for p in problems_doc["problems"])
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    servlet_unit = next(
+        u for u in modules_doc["units"] if u["display_name"] == "CheckoutServlet")
+    signal = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == servlet_unit["unit_id"] and s["check"] == "entry_points_mapped")
+    assert signal["stored_status"] == "satisfied"
+
+    webxml_unit = next(
+        u for u in modules_doc["units"]
+        if u["kind"] == "file" and "WEB-INF/web.xml" in u["paths"])
+    webxml_signal = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == webxml_unit["unit_id"] and s["check"] == "entry_points_mapped")
+    assert webxml_signal["stored_status"] == "not_applicable"
+
+
 def test_web_xml_route_and_filter_edges_match_the_entry_point_count_end_to_end_f4(
     java_repo: Path,
 ) -> None:
@@ -5868,6 +5992,45 @@ def test_run_scan_does_not_flag_package_info_java_as_a_type_extraction_problem(
         u for u in modules_doc["units"]
         if u["paths"] == ["src/main/java/p/package-info.java"])
     assert package_info_unit["adapter_problem_reason"] is None
+
+
+def test_run_scan_an_escaped_comment_delimiter_degrades_and_reports_unknown_end_to_end(
+    java_repo: Path,
+) -> None:
+    """MICRO-ROUND 49 (forty-third cold read, M5, judged - detect-and-
+    degrade, end to end): a real file containing a \\uXXXX escape that
+    decodes to a structural character degrades the run and reports
+    source_understood unknown for that unit - visible, never silently
+    trusted either way."""
+    import json
+
+    backslash = chr(92)
+    escaped_comment_open = backslash + "u002F" + backslash + "u002A"
+    (java_repo / "src" / "main" / "java" / "p" / "Real.java").write_text(
+        "package p;\n"
+        "public class Real {\n"
+        "  " + escaped_comment_open + " a real compiler reads this as a comment */\n"
+        "  void m() {}\n"
+        "}\n",
+        encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matching = [
+        p for p in problems_doc["problems"]
+        if p["reason_code"] == "source_uses_structural_unicode_escapes"]
+    assert len(matching) == 1
+    assert matching[0]["path"] == "src/main/java/p/Real.java"
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    real_unit = next(u for u in modules_doc["units"] if u["display_name"] == "Real")
+    source_understood = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == real_unit["unit_id"] and s["check"] == "source_understood")
+    assert source_understood["stored_status"] == "unknown"
 
 
 def test_run_scan_does_not_flag_module_info_java_as_a_type_extraction_problem(

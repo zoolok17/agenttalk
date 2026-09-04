@@ -424,11 +424,30 @@ _TEST_FRAMEWORK_IMPORT_PREFIXES = ("org.junit", "junit.framework", "org.testng")
 #: audit's own mandate exists to catch. `(?:\A|(?<=[\r\n]))` recognizes
 #: string-start, LF, AND bare CR as a valid line-start position (a CRLF
 #: pair's own `\n` half still satisfies it too - unchanged for the
-#: ordinary case). Deliberately still LINE-anchored, not STATEMENT-
-#: anchored (an import not first on its own physical line is a
-#: SEPARATE, already-named carry - M1, this round - left alone here).
+#: ordinary case). `package` legally occurs at most once, and only as
+#: the compilation unit's own FIRST statement (nothing but comments can
+#: precede it) - line-anchoring it is not a defect, so it keeps this
+#: narrower anchor unchanged.
 _PACKAGE_RE = re.compile(r"(?:\A|(?<=[\r\n]))\s*package\s+([\w.]+)\s*;")
-_IMPORT_RE = re.compile(r"(?:\A|(?<=[\r\n]))\s*import\s+(static\s+)?([\w.]+(?:\.\*)?)\s*;")
+#: MICRO-ROUND 49 (forty-third cold read, M1 MAJOR, wrong-data): `import`
+#: WAS still line-anchored like `_PACKAGE_RE` above (round 49's own B3
+#: fix only widened which characters count as "line start", never
+#: whether line-start is the right anchor at all) - but unlike
+#: `package`, Java allows more than one `import` statement, and nothing
+#: in the JLS requires each to start its own physical line: `import a.B;
+#: import c.D;` on ONE line is ordinary, legal Java (a semicolon ends a
+#: statement, not a newline). The second import there sat behind neither
+#: a line-start NOR a statement-start anchor and was silently dropped -
+#: concretely, a real JUnit test class whose `import org.junit.Test;`
+#: happened to share a physical line with another import lost that
+#: import entirely, so no test-framework evidence was ever recorded:
+#: the class classified `production` (not `test`) and separately
+#: reported `no_test_evidence_found`, TWO false artifacts from one
+#: dropped match. Now STATEMENT-anchored: `(?<=;)` joins the existing
+#: string-start/line-start alternatives, so an import immediately
+#: following another statement's own closing `;` (on the same physical
+#: line) is recognized exactly the same as one that starts a fresh line.
+_IMPORT_RE = re.compile(r"(?:\A|(?<=[\r\n;]))\s*import\s+(static\s+)?([\w.]+(?:\.\*)?)\s*;")
 #: BLOCKER 1a (fifth cold read, fix round 8): the OLD single fixed-shape
 #: regex (`\b(class|interface|enum)\s+(\w+)(?:\s*<[^>{]*>)?(?:\s+
 #: extends\s+([\w.<>,\s]+?))?(?:\s+implements\s+([\w.<>,\s]+?))?\s*\{`)
@@ -462,8 +481,29 @@ _TYPE_NAME_ANCHOR_RE = re.compile(r"\b(class|interface|enum|record)\s+(\w+)")
 #: may itself contain the word "extends") has already been skipped past
 #: depth-aware, so these can safely take the first top-level match
 #: without confusing a generic bound for the class's own superclass.
+#:
+#: MICRO-ROUND 49 (forty-third cold read, 49-M6, wrong-data - the
+#: audit's own new finding): that reasoning covers only the type's OWN
+#: generic-PARAMETER list (`class Foo<T extends Bound>`, already
+#: skipped past before `clause_start`) - it does NOT cover a wildcard
+#: bound inside a SUPERTYPE's own type ARGUMENTS, which sits INSIDE the
+#: clause zone this regex actually searches: `class A implements
+#: List<? extends Number>` has no `extends` clause of its own, but the
+#: flat `.search` below found the wildcard's "extends" anyway (the only
+#: one in the zone), and - since no `implements`/`permits` follows IT -
+#: the lazy capture group ran to end-of-clause, fabricating an
+#: `inherit` edge to a nonexistent type `Number>`. Fixed at the call
+#: site, not the pattern itself: the search zone is truncated at the
+#: first top-level `implements`/`permits` keyword before ``_HEADER_
+#: EXTENDS_RE`` ever runs - safe because JLS grammar puts a class's own
+#: `extends` before `implements`/`permits` unconditionally, and neither
+#: keyword can ever legally appear inside a type-argument list (unlike
+#: `extends`, which the wildcard/bounded-type-parameter shape makes
+#: legal there) - so truncating there can never cut off a real
+#: superclass clause, only the wildcard-bound false match.
 _HEADER_EXTENDS_RE = re.compile(r"\bextends\s+(.+?)(?=\s*\b(?:implements|permits)\b|\Z)", re.DOTALL)
 _HEADER_IMPLEMENTS_RE = re.compile(r"\bimplements\s+(.+?)(?=\s*\bpermits\b|\Z)", re.DOTALL)
+_HEADER_IMPLEMENTS_OR_PERMITS_ANCHOR_RE = re.compile(r"\b(?:implements|permits)\b")
 #: FIX ROUND 13 (ninth cold read, CR9-1 BLOCKER): the old pattern captured
 #: only the LAST dotted segment before the method call - so a call
 #: deliberately written fully qualified to disambiguate two same-simple-
@@ -1067,6 +1107,12 @@ _ROUTE_POSITIONAL_ANCHOR_RE = re.compile(r"\A\(")
 #: whole route as unrecoverable - factually wrong, since no value
 #: expression was ever written for this annotation to fail to recover.
 _ROUTE_LEADING_NAMED_ATTR_RE = re.compile(r"\s*[A-Za-z_$][\w$]*\s*=(?!=)")
+#: MICRO-ROUND 49 (M3 MAJOR, wrong-data): @WebServlet/@WebFilter's own
+#: registration ``name`` attribute - never confused with ``urlPatterns``/
+#: ``value`` (a disjoint attribute name), so this can share the exact
+#: same top-level-only scan `_ROUTE_NAMED_ATTR_RE` needed after round
+#: 49's own B2 fix (see `_top_level_paren_depth_matches`).
+_WEB_COMPONENT_NAME_ATTR_RE = re.compile(r"\bname\s*=")
 #: invariant 3 (design: "must not store... string-literal bodies"): a
 #: route target is captured as a normalized route IDENTIFIER, never an
 #: unbounded raw excerpt - truncated past this length rather than stored
@@ -1233,6 +1279,21 @@ class JavaFileResult:
     #: entries) - a fact synthesized while parsing ONE file, consumed
     #: later at the whole-run level (modules_artifact.py).
     descriptor_name_conflicts: list[tuple[str, list[str]]] = field(default_factory=list)
+    #: MICRO-ROUND 49 (forty-third cold read, M3 MAJOR, wrong-data): this
+    #: FILE's own ``@WebServlet(name=...)``/``@WebFilter(name=...)``
+    #: declared names, mapped to the qualified name of the class each
+    #: decorates - empty for every producer except a ``.java`` file with
+    #: at least one recoverable ``name=`` attribute on one of these two
+    #: annotation families. Same additive-field precedent as
+    #: ``descriptor_name_conflicts`` above - a fact synthesized while
+    #: parsing ONE file, consumed later by a DIFFERENT file (a web.xml
+    #: whose own ``<servlet-mapping>``/``<filter-mapping>`` names this
+    #: same servlet/filter - Servlet spec s8.2.3, one shared namespace
+    #: regardless of which mechanism declared it), threaded across the
+    #: run by ``worker.py`` (see its own docstring for the ordering
+    #: this cross-file join needs).
+    web_servlet_declared_names: dict[str, str] = field(default_factory=dict)
+    web_filter_declared_names: dict[str, str] = field(default_factory=dict)
 
 
 def _find_unescaped_text_block_delimiter(text: str, start: int) -> int:
@@ -1593,7 +1654,18 @@ def _extract_types(
         if brace_pos is None:
             continue
         clause_text = sanitized[clause_start:brace_pos]
-        extends_match = _HEADER_EXTENDS_RE.search(clause_text)
+        # MICRO-ROUND 49 (49-M6, wrong-data): see _HEADER_EXTENDS_RE's
+        # own comment - truncate the zone at the first top-level
+        # implements/permits keyword before searching for "extends", so
+        # a wildcard bound inside implements'/permits' own type
+        # arguments (`implements List<? extends Number>`) can never be
+        # mistaken for the class's own (absent) extends clause.
+        implements_or_permits_anchor = _HEADER_IMPLEMENTS_OR_PERMITS_ANCHOR_RE.search(clause_text)
+        extends_zone = (
+            clause_text if implements_or_permits_anchor is None
+            else clause_text[:implements_or_permits_anchor.start()]
+        )
+        extends_match = _HEADER_EXTENDS_RE.search(extends_zone)
         implements_match = _HEADER_IMPLEMENTS_RE.search(clause_text)
         header_start = name_match.start()
         if name_match.group(1) == "interface":
@@ -1883,6 +1955,46 @@ _JAVA_SIMPLE_ESCAPES = {
     "s": " ", "0": "\0", '"': '"', "'": "'", "\\": "\\",
 }
 _JAVA_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+#: MICRO-ROUND 49 (forty-third cold read, M5, judged): the closed set of
+#: characters that can change LEXING if smuggled in as a `\uXXXX` escape
+#: rather than written literally - a comment delimiter half (``/``,
+#: ``*``), a string-literal delimiter (``"``), or a line terminator.
+#: Deliberately NOT every character `_JAVA_SIMPLE_ESCAPES` above knows
+#: about (a `\t`/`\b`/`\f`-decoding escape changes no lexical BOUNDARY
+#: this adapter's own sanitizer looks for) - narrower than "any escape,"
+#: precisely the shapes that matter.
+_STRUCTURAL_UNICODE_ESCAPE_CHARS = frozenset({"/", "*", '"', "\n", "\r"})
+
+
+def _structural_unicode_escape_detected(text: str) -> bool:
+    """MICRO-ROUND 49 (M5, judged - detect-and-degrade, not a decoder):
+    a `\\uXXXX` escape (JLS 3.3 - decoded in a TRANSLATION step BEFORE
+    tokenization, so a real compiler sees its DECODED character, never
+    the six raw source characters) that decodes to a structural
+    character is a real risk this adapter's own sanitizer - which never
+    decodes unicode escapes before lexing, a named limit, full JLS 3.3
+    translation being out of scope - cannot see: an escaped comment
+    delimiter can smuggle real, live code past this adapter as if it
+    were dead comment text, or the reverse - close what this adapter
+    believes is still comment content early, reading real comment prose
+    as live code and fabricating a phantom type from it; an escaped
+    newline can hide a real import or declaration inside what this
+    adapter reads as one unbroken physical line.
+
+    Scanned over the RAW text, never the sanitized one - the escape can
+    sit either inside or outside what this adapter itself believes is a
+    comment/string, and BOTH directions are the risk this function
+    exists to catch, so restricting the scan to "outside a comment" (by
+    this adapter's own, possibly-already-wrong belief) would beg the
+    exact question being asked. Detection only - never decoded, never
+    acted on; the caller records a bounded, degrading problem and
+    leaves this file's own claims as visible but not confidently
+    trustworthy, rather than building a full unicode-escape-aware
+    lexer for a shape real-world source uses vanishingly rarely."""
+    for match in _JAVA_UNICODE_ESCAPE_RE.finditer(text):
+        if chr(int(match.group(1), 16)) in _STRUCTURAL_UNICODE_ESCAPE_CHARS:
+            return True
+    return False
 
 
 def _decode_java_string_escapes(raw: str) -> str:
@@ -2419,6 +2531,33 @@ _UNICODE_INVISIBLE_FORMAT_CHARS = frozenset(
 #: followed rather than left implicit.
 
 
+def _annotation_declared_name(
+    sanitized: str, original: str, arg_pos: int, close_pos: int,
+) -> str | None:
+    """MICRO-ROUND 49 (M3 MAJOR, wrong-data): the literal value of this
+    annotation's own top-level ``name=`` attribute (``@WebServlet(name=
+    ...)``/``@WebFilter(name=...)``) - ``None`` when absent, or present
+    but unrecoverable (a constant reference, a concatenation, ...),
+    never a guess. ``arg_pos``/``close_pos`` are the annotation's own
+    opening/closing paren positions - the identical span
+    :func:`_route_paths` receives; ``target_depth=1`` for the identical
+    reason its own call site explains (the span includes its own
+    wrapping parens, so a top-level attribute sits one paren deep, not
+    zero) - and the same nesting-awareness round 49's own B2 fix gave
+    ``value=``/``path=``/``urlPatterns=`` applies here too: a NESTED
+    annotation's own ``name=`` (there is no such shape for ``@WebInit
+    Param`` today, but the principle is the same one B2 already
+    established) could never be mistaken for this annotation's own."""
+    sanitized_segment = sanitized[arg_pos:close_pos + 1]
+    for match in _top_level_paren_depth_matches(
+        _WEB_COMPONENT_NAME_ATTR_RE, sanitized_segment, target_depth=1,
+    ):
+        values = _route_literal_list_at(original, arg_pos + match.end())
+        if values:
+            return values[0]
+    return None
+
+
 def _sanitize_route_name_control_chars(value: str) -> str:
     out = []
     for ch in value:
@@ -2865,9 +3004,20 @@ def _compose_route_path(prefix: str, path: str) -> str:
     return f"{prefix_part}/{path_part}"
 
 
-def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
+def parse_java_source(
+    relative_path: str, text: str, *, metadata_complete: bool = False,
+) -> JavaFileResult:
     """Parse one ``.java`` file's TEXT (already read by the sanitized
-    worker - this function never touches the filesystem itself)."""
+    worker - this function never touches the filesystem itself).
+
+    ``metadata_complete`` (MICRO-ROUND 49, M2 MAJOR) - True when this
+    RUN's own web.xml declares ``<web-app metadata-complete="true">``
+    (see :func:`web_app_declares_metadata_complete`) - a whole-
+    deployment fact this single-file function has no way to discover
+    on its own, threaded in by the caller (``worker.py``'s own small
+    pre-scan). Default ``False`` (the ordinary, ``metadata-complete``-
+    absent case) preserves every existing call site's own behavior
+    unchanged."""
     sanitized, malformed = _strip_comments_and_strings(text)
     newline_offsets = _newline_offsets(sanitized)
     package_match = _PACKAGE_RE.search(sanitized)
@@ -2997,6 +3147,28 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     edges: list[JavaEdgeClaim] = []
     entry_points: list[JavaEntryPointClaim] = []
     problems: list[JavaAdapterProblem] = []
+
+    # MICRO-ROUND 49 (M5, judged): see _structural_unicode_escape_
+    # detected's own docstring - a whole-file evidence gap (this
+    # file's own claims are not confidently trustworthy), not narrowed
+    # to any one unit, the same broadcast shape `parse_failed` already
+    # has via `worker_problem_reasons_by_path`.
+    if _structural_unicode_escape_detected(text):
+        # degrades_run is decided at the WORKER level (worker.py defaults
+        # every adapter problem to degrading unless explicitly named as
+        # an exception) - JavaAdapterProblem itself carries no such
+        # field; this reason code is not one of the named exceptions,
+        # so it degrades by default, correctly.
+        problems.append(JavaAdapterProblem(
+            reason_code="source_uses_structural_unicode_escapes",
+            detail=bounded_detail(
+                "this file's raw source contains a \\uXXXX escape that decodes to a "
+                "structural character (/, *, \", or a newline) - JLS 3.3 decodes unicode "
+                "escapes in a translation step BEFORE tokenization, so a real compiler may "
+                "lex this file differently than this adapter's own sanitizer does (a "
+                "smuggled comment delimiter, or a hidden line break) - this file's own "
+                "claims are not confidently trustworthy"),
+        ))
 
     for target, is_static, line in imports:
         # D-1 (reviewer-3, PR-B delta review round 2): a plain (non-static,
@@ -3359,6 +3531,14 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     # down) - checked against jax_rs_path_classes afterward to find a
     # @Path-carrying class that composed to nothing at all.
     classes_with_route_entry_points: set[str] = set()
+    # MICRO-ROUND 49 (M3 MAJOR, wrong-data): @WebServlet(name=...)/
+    # @WebFilter(name=...)'s own declared name, mapped to the class it
+    # decorates - published on JavaFileResult for worker.py's own
+    # cross-file join into a web.xml's own declared_names registry (see
+    # JavaFileResult's own docstring for why this cannot resolve here,
+    # in a single-file function with no visibility into web.xml at all).
+    web_servlet_declared_names: dict[str, str] = {}
+    web_filter_declared_names: dict[str, str] = {}
     # FIX ROUND 32 (F2 BLOCKER): computed once, outside the loop below -
     # see _jax_rs_verb_by_path_annotation_start's own docstring.
     jax_rs_stack_verb_by_annotation_start = _jax_rs_verb_by_path_annotation_start(sanitized)
@@ -3823,6 +4003,42 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         if uninstantiable_problem is not None:
             problems.append(uninstantiable_problem)
             continue
+        # MICRO-ROUND 49 (M2 MAJOR, wrong-data): Servlet 3.0 s8.1 - the
+        # container never even LOOKS at this annotation's own arguments
+        # once the effective descriptor sets metadata-complete=true, so
+        # this check runs BEFORE any route-value recovery below, not
+        # after (the annotation's own value is irrelevant either way).
+        if metadata_complete:
+            problems.append(JavaAdapterProblem(
+                reason_code="unsupported_entry_point_shape",
+                detail=bounded_detail(f"a @WebServlet annotation at line {line} is not scanned by "
+                       "the container (Servlet 3.0 s8.1: the effective web.xml declares "
+                       "metadata-complete=\"true\") - suppressed rather than published as a "
+                       "live route"),
+                qualified_name=target_type,
+            ))
+            continue
+        # MICRO-ROUND 49 (M3 MAJOR, wrong-data): this annotation's own
+        # `name=` attribute, if present - independent of whether its
+        # own value/urlPatterns is recoverable, empty, or absent (a
+        # startup-only servlet declares a name with NO url mapping at
+        # all, and still needs to be findable by a web.xml <servlet-
+        # mapping> that names it - Servlet spec s8.2.3, one shared
+        # namespace). Recomputes the annotation's own arg span rather
+        # than threading it through `_route_annotation_span`'s return
+        # value, the same choice its own servletNames-conflict check
+        # below already makes for the identical reason (see that
+        # site's own comment).
+        name_arg_pos = match.end()
+        while name_arg_pos < len(sanitized) and sanitized[name_arg_pos].isspace():
+            name_arg_pos += 1
+        if name_arg_pos < len(sanitized) and sanitized[name_arg_pos] == "(":
+            name_close_pos = _matching_close_paren(sanitized, name_arg_pos)
+            if name_close_pos is not None:
+                declared_name = _annotation_declared_name(
+                    sanitized, text, name_arg_pos, name_close_pos)
+                if declared_name is not None:
+                    web_servlet_declared_names[declared_name] = target_type
         _span_end, paths, _explicit_methods = _route_annotation_span(match)
         if paths is None:
             problems.append(JavaAdapterProblem(
@@ -3919,6 +4135,31 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         if uninstantiable_problem is not None:
             problems.append(uninstantiable_problem)
             continue
+        # MICRO-ROUND 49 (M2 MAJOR, wrong-data): see the identical
+        # @WebServlet check above - the same Servlet 3.0 s8.1 rule
+        # applies to @WebFilter unchanged.
+        if metadata_complete:
+            problems.append(JavaAdapterProblem(
+                reason_code="unsupported_entry_point_shape",
+                detail=bounded_detail(f"a @WebFilter annotation at line {line} is not scanned by "
+                       "the container (Servlet 3.0 s8.1: the effective web.xml declares "
+                       "metadata-complete=\"true\") - suppressed rather than published as a "
+                       "live route"),
+                qualified_name=target_type,
+            ))
+            continue
+        # MICRO-ROUND 49 (M3's own @WebFilter twin): see the identical
+        # @WebServlet extraction above.
+        name_arg_pos = match.end()
+        while name_arg_pos < len(sanitized) and sanitized[name_arg_pos].isspace():
+            name_arg_pos += 1
+        if name_arg_pos < len(sanitized) and sanitized[name_arg_pos] == "(":
+            name_close_pos = _matching_close_paren(sanitized, name_arg_pos)
+            if name_close_pos is not None:
+                declared_name = _annotation_declared_name(
+                    sanitized, text, name_arg_pos, name_close_pos)
+                if declared_name is not None:
+                    web_filter_declared_names[declared_name] = target_type
         _span_end, paths, _explicit_methods = _route_annotation_span(match)
         if paths is None:
             problems.append(JavaAdapterProblem(
@@ -4342,7 +4583,11 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         # place this function actually returns its result, not as a
         # filter a future caller could forget to apply.
         return JavaFileResult(units=[], edges=[], entry_points=[], problems=[])
-    return JavaFileResult(units=units, edges=edges, entry_points=entry_points, problems=problems)
+    return JavaFileResult(
+        units=units, edges=edges, entry_points=entry_points, problems=problems,
+        web_servlet_declared_names=web_servlet_declared_names,
+        web_filter_declared_names=web_filter_declared_names,
+    )
 
 
 #: FIX ROUND 26 (twenty-second cold read, F1 BLOCKER, wrong-data): a
@@ -5864,6 +6109,7 @@ def _resolve_descriptor_declarations(
 
 def _servlet_class_by_name(
     sanitized: str, structural: str, text: str,
+    *, annotation_declared_names: dict[str, str] | None = None,
 ) -> tuple[_DescriptorRegistry, list[int]]:
     """FIX ROUND 17 (thirteenth cold read, CR13-2 MAJOR, wrong-data):
     web.xml's own ``<servlet>`` element (``<servlet-name>``/
@@ -5901,7 +6147,19 @@ def _servlet_class_by_name(
     returns a :class:`_DescriptorRegistry` now (was a 4-tuple splitting
     only resolved-class-or-conflict) - see its own docstring for the
     full mechanism. Every block whose own name decoded is recorded as a
-    declaration, whether or not it carries a usable class."""
+    declaration, whether or not it carries a usable class.
+
+    ``annotation_declared_names`` (MICRO-ROUND 49, M3 MAJOR, wrong-data):
+    name -> qualified_name pairs from this SAME run's own
+    ``@WebServlet(name=...)`` annotations (Servlet spec s8.2.3: servlet
+    names share ONE namespace regardless of whether they are declared
+    via XML or an annotation - a name is a name). Injected as ordinary
+    declarations (``block_start=-1``, an XML-only field this synthetic
+    source has no real value for) BEFORE conflict resolution, so a name
+    declared identically both ways still resolves cleanly, and a name
+    declared DIFFERENTLY by an annotation and an XML ``<servlet>`` block
+    correctly conflicts through the SAME existing mechanism - no special
+    case needed for either shape."""
     declarations: dict[str, list[_DescriptorDeclaration]] = {}
     name_undecodable: list[int] = []
     for block_match in _SERVLET_BLOCK_RE.finditer(structural):
@@ -5995,6 +6253,11 @@ def _servlet_class_by_name(
                 class_value=None, jsp_path=None, class_undecodable=False,
                 block_start=block_match.start(),
             ))
+    for name, qualified_name in (annotation_declared_names or {}).items():
+        declarations.setdefault(name, []).append(_DescriptorDeclaration(
+            class_value=qualified_name, jsp_path=None, class_undecodable=False,
+            block_start=-1,
+        ))
     return _resolve_descriptor_declarations(declarations), name_undecodable
 
 
@@ -6046,6 +6309,7 @@ _LISTENER_CLASS_RE = _leaf_value_pattern("listener-class")
 
 def _filter_class_by_name(
     sanitized: str, structural: str, text: str,
+    *, annotation_declared_names: dict[str, str] | None = None,
 ) -> tuple[_DescriptorRegistry, list[int]]:
     """FIX ROUND 21b (THE MAJOR's own web.xml-symmetry follow-through):
     web.xml's own ``<filter>`` element (``<filter-name>``/
@@ -6115,6 +6379,11 @@ def _filter_class_by_name(
                 class_value=decoded_class.strip() if not class_blank else None,
                 jsp_path=None, class_undecodable=class_blank, block_start=block_match.start(),
             ))
+    for name, qualified_name in (annotation_declared_names or {}).items():
+        declarations.setdefault(name, []).append(_DescriptorDeclaration(
+            class_value=qualified_name, jsp_path=None, class_undecodable=False,
+            block_start=-1,
+        ))
     return _resolve_descriptor_declarations(declarations), name_undecodable
 
 
@@ -6169,6 +6438,41 @@ def is_effectively_empty_web_xml(text: str) -> bool:
     return _body_text(sanitized, block_match).strip() == ""
 
 
+_METADATA_COMPLETE_ATTR_RE = re.compile(r'\bmetadata-complete\s*=\s*(["\'])(.*?)\1')
+
+
+def web_app_declares_metadata_complete(text: str) -> bool:
+    """MICRO-ROUND 49 (forty-third cold read, M2 MAJOR, wrong-data - a
+    structural absence, not a flat-regex miss): ``<web-app metadata-
+    complete="true">`` was never read anywhere in this file until now.
+    Servlet 3.0 s8.1: when the EFFECTIVE deployment descriptor sets this
+    attribute, the container MUST NOT scan servlet/filter/listener
+    annotations at all - every ``@WebServlet``/``@WebFilter`` route this
+    adapter would otherwise publish for an in-app class is then FALSE
+    for that deployment. A half-migrated legacy app (a frozen,
+    metadata-complete descriptor left in place after the code moved to
+    annotations, or deliberately kept to freeze registration) is exactly
+    this producer's own target scenario - publishing the entire
+    annotation route surface as if it were live is a whole-run false
+    positive, not a narrow miss.
+
+    Read from the root ``<web-app>``'s own OPENING TAG ONLY (the span
+    ``_body_span`` excludes) - never the whole document - so a
+    ``<description>`` or similar leaf happening to contain the literal
+    text ``metadata-complete="true"`` elsewhere in the descriptor can
+    never be mistaken for the real, root-level declaration. Absent
+    attribute, or a root this function cannot even find, both read as
+    ``False`` (not metadata-complete) - the ordinary, default case
+    (Servlet 3.0 s8.1's own default is ``false``), never a guess."""
+    sanitized, structural = _split_xml_comments_and_cdata(text)
+    block_match = _WEB_APP_BLOCK_RE.search(structural)
+    if block_match is None:
+        return False
+    opening_tag = sanitized[block_match.start():_body_span(block_match)[0]]
+    attr_match = _METADATA_COMPLETE_ATTR_RE.search(opening_tag)
+    return attr_match is not None and attr_match.group(2).strip().lower() == "true"
+
+
 #: MICRO-ROUND 31b (reviewer-3 delta, R4, declared - under-reporting,
 #: not wrong data), published in-artifact by FIX ROUND 36 (thirtieth
 #: cold read, F5 MINOR, completeness): ``duplicate_route_target``'s own
@@ -6198,6 +6502,9 @@ DUPLICATE_ROUTE_TARGET_CAVEAT = (
 
 def parse_web_xml(
     relative_path: str, text: str,
+    *,
+    annotation_declared_servlet_names: dict[str, str] | None = None,
+    annotation_declared_filter_names: dict[str, str] | None = None,
 ) -> tuple[
     list[JavaEntryPointClaim], list[JavaAdapterProblem], list[JavaEdgeClaim],
     list[tuple[str, list[str]]],
@@ -6205,6 +6512,22 @@ def parse_web_xml(
     """``route`` entry points declared as plain ``<servlet-mapping>``/
     ``<url-pattern>`` pairs in a ``web.xml`` - the same "trivially present,
     named, no inference" bar as the annotation-based routes above.
+
+    ``annotation_declared_servlet_names``/``annotation_declared_filter_
+    names`` (MICRO-ROUND 49, M3 MAJOR, wrong-data): name -> qualified_
+    name pairs from this SAME run's own ``@WebServlet(name=...)``/
+    ``@WebFilter(name=...)`` annotations, gathered across every ``.java``
+    file this run scans (this function has no filesystem access of its
+    own - the caller, ``worker.py``, is the one place that sees every
+    file). Servlet/filter names share ONE namespace regardless of
+    whether they are declared via XML or an annotation (Servlet spec
+    s8.2.3) - a ``<servlet-mapping>`` naming an annotation-only servlet
+    used to get a FALSE ``undeclared_descriptor_name`` (the name IS
+    declared, just never where this function looked) and its route
+    mis-attributed to web.xml's own FILE unit instead of the real,
+    instantiable class that annotation decorates - both now resolve
+    through :func:`_servlet_class_by_name`/:func:`_filter_class_by_name`
+    directly, no separate mechanism needed.
 
     FIX ROUND 27 (twenty-third cold read, F4, mechanism confirmed): a
     web.xml-declared route/filter published a real ENTRY POINT but no
@@ -6337,7 +6660,8 @@ def parse_web_xml(
     sanitized, structural = _split_xml_comments_and_cdata(text)
     newline_offsets = _newline_offsets(sanitized)
     descriptor_name_conflicts: list[tuple[str, list[str]]] = []
-    servlet_registry, servlet_name_undecodable = _servlet_class_by_name(sanitized, structural, text)
+    servlet_registry, servlet_name_undecodable = _servlet_class_by_name(
+        sanitized, structural, text, annotation_declared_names=annotation_declared_servlet_names)
     # FIX ROUND 29/30 (twenty-fifth/twenty-sixth cold reads, F1 BLOCKER,
     # wrong-data): a servlet-name declared more than once, disagreeing -
     # see `_resolve_descriptor_declarations`'s own docstring for the full
@@ -6727,7 +7051,8 @@ def parse_web_xml(
                    "absent either"),
             qualified_name=qualified_name,
         ))
-    filter_registry, filter_name_undecodable = _filter_class_by_name(sanitized, structural, text)
+    filter_registry, filter_name_undecodable = _filter_class_by_name(
+        sanitized, structural, text, annotation_declared_names=annotation_declared_filter_names)
     # FIX ROUND 29/30/31 (F1 BLOCKER): the identical duplicate-
     # descriptor-name conflict handling as the servlet loop above - see
     # its own comment.
@@ -6996,6 +7321,8 @@ def file_result_to_json(result: JavaFileResult) -> dict[str, Any]:
         "descriptor_name_conflicts": [
             [anchor, list(candidates)] for anchor, candidates in result.descriptor_name_conflicts
         ],
+        "web_servlet_declared_names": dict(result.web_servlet_declared_names),
+        "web_filter_declared_names": dict(result.web_filter_declared_names),
     }
 
 
@@ -7010,4 +7337,6 @@ def file_result_from_json(payload: dict[str, Any]) -> JavaFileResult:
             (anchor, list(candidates))
             for anchor, candidates in payload.get("descriptor_name_conflicts", [])
         ],
+        web_servlet_declared_names=dict(payload.get("web_servlet_declared_names", {})),
+        web_filter_declared_names=dict(payload.get("web_filter_declared_names", {})),
     )

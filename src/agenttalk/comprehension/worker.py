@@ -492,6 +492,53 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
     problems: list[WorkerProblem] = []
     java_results: dict[str, dict[str, Any]] = {}
     exclusions: dict[str, int] = {}
+
+    # MICRO-ROUND 49 (M3 MAJOR, wrong-data): every @WebServlet(name=...)/
+    # @WebFilter(name=...) declared name this run's own .java files
+    # carry, accumulated as the main loop below encounters them - a
+    # web.xml's own <servlet-mapping>/<filter-mapping> needs the FULL
+    # set to resolve a name-space lookup correctly (Servlet spec
+    # s8.2.3), but web.xml may be processed BEFORE some of those .java
+    # files in `relative_paths`' own order. Rather than a second full
+    # read+parse pass over every .java file (correct, but doubles real
+    # adapter work for every file, not just one small web.xml the way
+    # the metadata-complete pre-scan above can afford to), web.xml's
+    # OWN processing is deferred to a second, short pass after the main
+    # loop finishes (below) - by then this dict is fully populated
+    # regardless of the original iteration order, and every .java file
+    # is still read and parsed exactly once.
+    annotation_declared_servlet_names: dict[str, str] = {}
+    annotation_declared_filter_names: dict[str, str] = {}
+    deferred_web_xml: list[tuple[str, bytes]] = []
+
+    # MICRO-ROUND 49 (M2 MAJOR, wrong-data): a small, cheap pre-scan for
+    # web.xml's own metadata-complete declaration - Servlet 3.0 s8.1
+    # makes this ONE deployment-wide fact govern EVERY .java file's own
+    # @WebServlet/@WebFilter dispatch below, but it is only knowable
+    # once web.xml itself is read, which may come before OR after any
+    # given .java file in `relative_paths` - this run's own iteration
+    # order is never something the fact may depend on. Reads web.xml a
+    # second time here (the main loop below reads it again, at its own
+    # normal turn, where it is decoded for real and any genuine read/
+    # decode problem is reported) - a small, one-time cost for a small
+    # file, traded for not restructuring this loop's own single-pass
+    # shape. Silent on any failure here (missing, unreadable, wrong
+    # encoding) - this pre-scan's own job is only "is metadata-complete
+    # declared," never "report a problem with web.xml," which the main
+    # loop's own normal pass already owns exclusively.
+    metadata_complete = False
+    for rel in relative_paths:
+        if Path(rel).name.lower() != "web.xml":
+            continue
+        try:
+            resolved = resolve_under_root(rel, root=root, label="worker input path")
+            data = resolved.read_bytes()
+        except (EnvelopeError, OSError):
+            continue
+        text = _decode_text_or_flag_undecodable(data, rel, [])
+        if text is not None and java_adapter.web_app_declares_metadata_complete(text):
+            metadata_complete = True
+            break
     for rel in relative_paths:
         try:
             resolved = resolve_under_root(rel, root=root, label="worker input path")
@@ -599,13 +646,19 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                 text = _decode_text_or_flag_undecodable(data, rel, problems)
                 if text is None:
                     continue
-                result = adapter.parse_java_source(rel, text)
+                result = adapter.parse_java_source(rel, text, metadata_complete=metadata_complete)
             except Exception as exc:  # noqa: BLE001 - a producer bug must degrade, never abort the scan
                 problems.append(WorkerProblem(
                     reason_code="parse_failed", relative_path=rel,
                     detail=bounded_detail(f"{adapter.ADAPTER_NAME} adapter failed: {exc}")))
             else:
                 java_results[rel] = adapter.file_result_to_json(result)
+                # MICRO-ROUND 49 (M3 MAJOR, wrong-data): accumulated
+                # across every .java file this run scans - see this
+                # function's own docstring for why web.xml's own
+                # processing is deferred to see the FULL set.
+                annotation_declared_servlet_names.update(result.web_servlet_declared_names)
+                annotation_declared_filter_names.update(result.web_filter_declared_names)
                 # BLOCKER 1b (fifth cold read, fix round 8): a parse that
                 # SUCCEEDS but extracts ZERO units used to count as
                 # positive adapter evidence with no problem recorded at
@@ -846,82 +899,12 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                 exclusions.get("stray_web_xml_ignored", 0) + 1
             )
         elif rel_name_lower == "web.xml":
-            # M9 (cold-read, PR-B fix round 3): parse_web_xml existed as a
-            # producer with its own passing unit tests but no dispatch
-            # anywhere in the pipeline - the suite reported a capability
-            # (servlet-mapping routes) the pipeline did not actually have.
-            # The approved item-3 relation scope already names this exact
-            # case ("plain-XML web.xml servlet-mapping declarations when
-            # trivially present") as in-scope; wiring it in, not deleting
-            # it, is what that decision calls for. Same already-read-bytes
-            # / same java_results channel as pom.xml's build edges.
-            try:
-                # FIX ROUND 26 (twenty-second cold read, F3 BLOCKER,
-                # wrong-data): the same missing guard as pom.xml's own
-                # decode site above - see `_decode_text_or_flag_
-                # undecodable`'s own docstring.
-                text = _decode_text_or_flag_undecodable(data, rel, problems)
-                if text is None:
-                    continue
-                # FIX ROUND 27 (twenty-third cold read, F4, mechanism
-                # confirmed): parse_web_xml now also returns the paired
-                # route-relation edges every web.xml-declared route/
-                # filter publishes - threaded into JavaFileResult below,
-                # the identical channel every annotation-based route's
-                # own edge already flows through.
-                web_entry_points, web_problems, web_edges, web_descriptor_name_conflicts = (
-                    java_adapter.parse_web_xml(rel, text))
-            except Exception as exc:  # noqa: BLE001 - a producer bug must degrade, never abort the scan
-                problems.append(WorkerProblem(
-                    reason_code="parse_failed", relative_path=rel,
-                    detail=bounded_detail(f"{java_adapter.ADAPTER_NAME} adapter failed: {exc}")))
-            else:
-                # FIX ROUND 21 (seventeenth cold read, CR17-3 MAJOR):
-                # <filter>/<listener> elements now record their own
-                # unsupported_entry_point_shape problems - surfaced the
-                # same way every other adapter problem already is.
-                for adapter_problem in web_problems:
-                    problems.append(WorkerProblem(
-                        reason_code=adapter_problem.reason_code, relative_path=rel,
-                        detail=adapter_problem.detail,
-                        qualified_name=adapter_problem.qualified_name,
-                        # FIX ROUND 32 (twenty-eighth cold read, F7 LOW,
-                        # JUDGE - taken): the SAME non-degrading exception
-                        # as the .java-file conversion loop above - see
-                        # that site's own comment for the reasoning.
-                        # duplicate_route_target is only ever emitted from
-                        # THIS web.xml parsing path, never from the .java
-                        # annotation-route path, so this is the one real
-                        # call site that needed it.
-                        degrades_run=adapter_problem.reason_code != "duplicate_route_target",
-                    ))
-                java_results[rel] = java_adapter.file_result_to_json(
-                    java_adapter.JavaFileResult(
-                        entry_points=web_entry_points, problems=web_problems,
-                        edges=web_edges,
-                        descriptor_name_conflicts=web_descriptor_name_conflicts))
-                # FIX ROUND 24 (micro-round 24b, item 1, wrong-data): the
-                # SAME positive-evidence gate F1b already gives pom.xml -
-                # a parse that succeeds but yields ZERO entry points AND
-                # zero problems reads as source_understood satisfied
-                # purely from absence. Honest for a genuinely EMPTY
-                # <web-app/> (nothing declared at all - the Empty.java
-                # treatment, a positive finding); dishonest for a web.xml
-                # with real content that simply matches none of this
-                # adapter's five modeled element families - exactly the
-                # shape that would mask the NEXT web.xml parser
-                # blindness the same way the pom.xml one did.
-                if (
-                    not web_entry_points and not web_problems
-                    and not java_adapter.is_effectively_empty_web_xml(text)
-                ):
-                    problems.append(WorkerProblem(
-                        reason_code="no_web_xml_facts_extracted", relative_path=rel,
-                        detail="the web.xml adapter parsed this file but extracted no "
-                               "entry points and recorded no problems, over a root that "
-                               "is not genuinely empty - an unrecognized or unmodeled "
-                               "web.xml shape, not a legitimately empty descriptor",
-                    ))
+            # MICRO-ROUND 49 (M3 MAJOR, wrong-data): deferred to a second
+            # pass after this loop (below) - see this function's own
+            # docstring for why. The claim, resource-cap, and dispatch
+            # logic above already ran identically for this path; only
+            # the actual adapter call moves.
+            deferred_web_xml.append((rel, data))
         elif not (
             rel_lower.endswith(tuple(_BENIGN_NON_CODE_EXTENSIONS))
             or rel_name_lower in _BENIGN_NON_CODE_BASENAMES
@@ -1014,6 +997,94 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                 reason_code="unsupported_language", relative_path=rel, detail=detail,
                 degrades_run=degrades_run,
             ))
+
+    # MICRO-ROUND 49 (M3 MAJOR, wrong-data): every web.xml this run
+    # found, processed HERE - after the main loop above, so
+    # `annotation_declared_servlet_names`/`annotation_declared_filter_
+    # names` are fully populated from every .java file this run scans,
+    # regardless of web.xml's own position in `relative_paths`. Same
+    # decode/dispatch/problem-recording logic the main loop's own
+    # web.xml branch always had - only the ordering moved.
+    for rel, data in deferred_web_xml:
+        # M9 (cold-read, PR-B fix round 3): parse_web_xml existed as a
+        # producer with its own passing unit tests but no dispatch
+        # anywhere in the pipeline - the suite reported a capability
+        # (servlet-mapping routes) the pipeline did not actually have.
+        # The approved item-3 relation scope already names this exact
+        # case ("plain-XML web.xml servlet-mapping declarations when
+        # trivially present") as in-scope; wiring it in, not deleting
+        # it, is what that decision calls for. Same already-read-bytes
+        # / same java_results channel as pom.xml's build edges.
+        try:
+            # FIX ROUND 26 (twenty-second cold read, F3 BLOCKER,
+            # wrong-data): the same missing guard as pom.xml's own
+            # decode site above - see `_decode_text_or_flag_
+            # undecodable`'s own docstring.
+            text = _decode_text_or_flag_undecodable(data, rel, problems)
+            if text is None:
+                continue
+            # FIX ROUND 27 (twenty-third cold read, F4, mechanism
+            # confirmed): parse_web_xml now also returns the paired
+            # route-relation edges every web.xml-declared route/
+            # filter publishes - threaded into JavaFileResult below,
+            # the identical channel every annotation-based route's
+            # own edge already flows through.
+            web_entry_points, web_problems, web_edges, web_descriptor_name_conflicts = (
+                java_adapter.parse_web_xml(
+                    rel, text,
+                    annotation_declared_servlet_names=annotation_declared_servlet_names,
+                    annotation_declared_filter_names=annotation_declared_filter_names))
+        except Exception as exc:  # noqa: BLE001 - a producer bug must degrade, never abort the scan
+            problems.append(WorkerProblem(
+                reason_code="parse_failed", relative_path=rel,
+                detail=bounded_detail(f"{java_adapter.ADAPTER_NAME} adapter failed: {exc}")))
+        else:
+            # FIX ROUND 21 (seventeenth cold read, CR17-3 MAJOR):
+            # <filter>/<listener> elements now record their own
+            # unsupported_entry_point_shape problems - surfaced the
+            # same way every other adapter problem already is.
+            for adapter_problem in web_problems:
+                problems.append(WorkerProblem(
+                    reason_code=adapter_problem.reason_code, relative_path=rel,
+                    detail=adapter_problem.detail,
+                    qualified_name=adapter_problem.qualified_name,
+                    # FIX ROUND 32 (twenty-eighth cold read, F7 LOW,
+                    # JUDGE - taken): the SAME non-degrading exception
+                    # as the .java-file conversion loop above - see
+                    # that site's own comment for the reasoning.
+                    # duplicate_route_target is only ever emitted from
+                    # THIS web.xml parsing path, never from the .java
+                    # annotation-route path, so this is the one real
+                    # call site that needed it.
+                    degrades_run=adapter_problem.reason_code != "duplicate_route_target",
+                ))
+            java_results[rel] = java_adapter.file_result_to_json(
+                java_adapter.JavaFileResult(
+                    entry_points=web_entry_points, problems=web_problems,
+                    edges=web_edges,
+                    descriptor_name_conflicts=web_descriptor_name_conflicts))
+            # FIX ROUND 24 (micro-round 24b, item 1, wrong-data): the
+            # SAME positive-evidence gate F1b already gives pom.xml -
+            # a parse that succeeds but yields ZERO entry points AND
+            # zero problems reads as source_understood satisfied
+            # purely from absence. Honest for a genuinely EMPTY
+            # <web-app/> (nothing declared at all - the Empty.java
+            # treatment, a positive finding); dishonest for a web.xml
+            # with real content that simply matches none of this
+            # adapter's five modeled element families - exactly the
+            # shape that would mask the NEXT web.xml parser
+            # blindness the same way the pom.xml one did.
+            if (
+                not web_entry_points and not web_problems
+                and not java_adapter.is_effectively_empty_web_xml(text)
+            ):
+                problems.append(WorkerProblem(
+                    reason_code="no_web_xml_facts_extracted", relative_path=rel,
+                    detail="the web.xml adapter parsed this file but extracted no "
+                           "entry points and recorded no problems, over a root that "
+                           "is not genuinely empty - an unrecognized or unmodeled "
+                           "web.xml shape, not a legitimately empty descriptor",
+                ))
 
     return WorkerResult(
         schema_version=WORKER_SCHEMA_VERSION, file_claims=claims, problems=problems,
