@@ -58,6 +58,26 @@ from .errors import ComprehensionError, bounded_detail, bounded_os_error_detail
 #: fix.
 _TEST_SOURCE_ROOT_SEGMENT = re.compile(r"(?:^|/)src/(?:test|it)/|^tests?/")
 
+
+def _rel_is_under_deployment_root(rel: str, deployment_root: str) -> bool:
+    """MICRO-ROUND 50 (Cluster 1, B2 BLOCKER): ``True`` iff ``rel`` (a
+    ``.java`` file's own repo-relative path) sits inside the deployment
+    ``deployment_root`` names - the directory directly containing that
+    deployment's own ``WEB-INF/`` (see the metadata-complete pre-scan's
+    own docstring). ``"."`` (``Path(...).as_posix()``'s own spelling for
+    "no parent segment at all" - a top-level ``WEB-INF/web.xml``) means
+    the WHOLE repo tree IS the one deployment, matching every path.
+    Assumes deployment roots are DISJOINT sibling directories (the
+    realistic multi-module-reactor shape - independent WAR modules never
+    nest one inside another) rather than resolving a nested-root
+    conflict; a future round can revisit if that assumption is ever
+    measured false."""
+    if deployment_root == ".":
+        return True
+    rel_posix = rel.replace("\\", "/")
+    return rel_posix == deployment_root or rel_posix.startswith(f"{deployment_root}/")
+
+
 _ADAPTER_EXTENSIONS = {".java": java_adapter}
 _ADAPTER_HANDLED_XML_BASENAMES = frozenset({"pom.xml", "web.xml"})
 #: FIX ROUND 16 (twelfth cold read, B4 BLOCKER, wrong-data): INVERTED
@@ -513,22 +533,57 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
 
     # MICRO-ROUND 49 (M2 MAJOR, wrong-data): a small, cheap pre-scan for
     # web.xml's own metadata-complete declaration - Servlet 3.0 s8.1
-    # makes this ONE deployment-wide fact govern EVERY .java file's own
-    # @WebServlet/@WebFilter dispatch below, but it is only knowable
-    # once web.xml itself is read, which may come before OR after any
-    # given .java file in `relative_paths` - this run's own iteration
-    # order is never something the fact may depend on. Reads web.xml a
-    # second time here (the main loop below reads it again, at its own
-    # normal turn, where it is decoded for real and any genuine read/
-    # decode problem is reported) - a small, one-time cost for a small
-    # file, traded for not restructuring this loop's own single-pass
-    # shape. Silent on any failure here (missing, unreadable, wrong
-    # encoding) - this pre-scan's own job is only "is metadata-complete
-    # declared," never "report a problem with web.xml," which the main
-    # loop's own normal pass already owns exclusively.
-    metadata_complete = False
+    # makes this fact govern EVERY .java file's own @WebServlet/
+    # @WebFilter dispatch below, but it is only knowable once web.xml
+    # itself is read, which may come before OR after any given .java
+    # file in `relative_paths` - this run's own iteration order is never
+    # something the fact may depend on. Reads web.xml a second time here
+    # (the main loop below reads it again, at its own normal turn, where
+    # it is decoded for real and any genuine read/decode problem is
+    # reported) - a small, one-time cost for a small file, traded for
+    # not restructuring this loop's own single-pass shape. Silent on any
+    # failure here (missing, unreadable, wrong encoding) - this pre-
+    # scan's own job is only "is metadata-complete declared, and where,"
+    # never "report a problem with web.xml," which the main loop's own
+    # normal pass already owns exclusively.
+    #
+    # MICRO-ROUND 50 (Cluster 1, B2 BLOCKER, wrong-data): this used to be
+    # ONE GLOBAL bool, set the moment ANY file named web.xml ANYWHERE in
+    # the scan declared metadata-complete=true, with no notion of WHICH
+    # deployment that fact belongs to. Reviewer-3 measured a two-module
+    # reactor where only mod-a/WEB-INF/web.xml declares metadata-
+    # complete=true publishing ZERO entry points repo-wide, including
+    # mod-b's own (a wholly separate, independent deployment whose own
+    # web.xml never made that declaration) - and a
+    # src/test/resources/WEB-INF/web.xml test fixture silencing
+    # PRODUCTION annotations elsewhere in the same repo, since this scan
+    # never checked WHERE a web.xml sat or whether it was even a real,
+    # loadable deployment descriptor before trusting its declaration.
+    #
+    # Fixed two ways at once: (1) scoped from a single bool to a SET of
+    # DEPLOYMENT ROOTS that declared metadata-complete=true - a
+    # deployment root is the directory that directly CONTAINS its own
+    # WEB-INF/ (the Servlet spec's own webapp-root convention; per the
+    # reactor's own layout, ``mod-a/WEB-INF/web.xml``'s deployment root
+    # is ``mod-a``, never the whole repo) - a .java file's own dispatch
+    # below now checks whether IT sits under one of these roots, never a
+    # single repo-wide flag; (2) reuses the EXACT SAME "is this even a
+    # real, loadable deployment descriptor" gate the main loop's own
+    # dispatch branch already applies (round 43/44's own stray-web.xml
+    # exclusion, `_TEST_SOURCE_ROOT_SEGMENT` included) - a web.xml
+    # sitting anywhere other than directly inside a WEB-INF/ directory,
+    # or one under a recognized test source root, can never set this
+    # flag for ANY deployment, closing the test-fixture gap at the same
+    # time as the multi-module one.
+    metadata_complete_deployment_roots: set[str] = set()
     for rel in relative_paths:
         if Path(rel).name.lower() != "web.xml":
+            continue
+        rel_posix = rel.replace("\\", "/")
+        if (
+            Path(rel).parent.name.lower() != "web-inf"
+            or _TEST_SOURCE_ROOT_SEGMENT.search(rel_posix.lower())
+        ):
             continue
         try:
             resolved = resolve_under_root(rel, root=root, label="worker input path")
@@ -537,8 +592,7 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
             continue
         text = _decode_text_or_flag_undecodable(data, rel, [])
         if text is not None and java_adapter.web_app_declares_metadata_complete(text):
-            metadata_complete = True
-            break
+            metadata_complete_deployment_roots.add(Path(rel).parent.parent.as_posix())
     for rel in relative_paths:
         try:
             resolved = resolve_under_root(rel, root=root, label="worker input path")
@@ -646,6 +700,12 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                 text = _decode_text_or_flag_undecodable(data, rel, problems)
                 if text is None:
                     continue
+                # MICRO-ROUND 50 (Cluster 1, B2): scoped to THIS file's
+                # own deployment - see the pre-scan's own docstring.
+                metadata_complete = any(
+                    _rel_is_under_deployment_root(rel, deployment_root)
+                    for deployment_root in metadata_complete_deployment_roots
+                )
                 result = adapter.parse_java_source(rel, text, metadata_complete=metadata_complete)
             except Exception as exc:  # noqa: BLE001 - a producer bug must degrade, never abort the scan
                 problems.append(WorkerProblem(

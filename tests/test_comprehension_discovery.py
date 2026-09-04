@@ -314,6 +314,112 @@ def test_enumerate_scope_a_first_party_java_only_under_target_classes_still_pois
     assert any(r["path"] == "target" for r in result.poisoning_excluded_roots)
 
 
+def test_enumerate_scope_a_first_party_kotlin_only_under_target_classes_still_poisons(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 1, B5 BLOCKER, wrong-data - the .kt twin
+    of 49b's own .java repro): 49b's own narrowing keyed on ``.java``
+    ONLY - a build never legitimately copies Kotlin SOURCE into
+    ``classes/`` either (kotlinc compiles it away exactly like javac
+    does), so a first-party-only ``.kt`` class was still wrongly exempted
+    and published as a confident external claim until this fix."""
+    classes_dir = tmp_path / "target" / "classes" / "gen"
+    classes_dir.mkdir(parents=True)
+    (classes_dir / "Mapper.kt").write_text(
+        "package gen\nclass Mapper\n", encoding="utf-8")
+    comp_dir = _comprehension_dir(tmp_path)
+
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+
+    assert not any(f.relative_path.endswith("Mapper.kt") for f in result.files)
+    assert result.excluded_region_may_contain_target is True
+    assert any(r["path"] == "target" for r in result.poisoning_excluded_roots)
+
+
+def test_enumerate_scope_a_first_party_scala_only_under_target_classes_still_poisons(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 1, B5's own .scala twin)."""
+    classes_dir = tmp_path / "target" / "classes" / "gen"
+    classes_dir.mkdir(parents=True)
+    (classes_dir / "Mapper.scala").write_text(
+        "package gen\nclass Mapper\n", encoding="utf-8")
+    comp_dir = _comprehension_dir(tmp_path)
+
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+
+    assert not any(f.relative_path.endswith("Mapper.scala") for f in result.files)
+    assert result.excluded_region_may_contain_target is True
+    assert any(r["path"] == "target" for r in result.poisoning_excluded_roots)
+
+
+def test_enumerate_scope_a_first_party_kotlin_only_under_target_resources_still_poisons(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 1, B5): the fix applies uniformly across
+    ALL FOUR recognized build-output resource positions, not merely
+    ``classes/`` - a first-party ``.kt`` under ``target/resources/``
+    (a real, if unusual, build layout) must poison identically."""
+    resources_dir = tmp_path / "target" / "resources" / "gen"
+    resources_dir.mkdir(parents=True)
+    (resources_dir / "Mapper.kt").write_text(
+        "package gen\nclass Mapper\n", encoding="utf-8")
+    comp_dir = _comprehension_dir(tmp_path)
+
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+
+    assert not any(f.relative_path.endswith("Mapper.kt") for f in result.files)
+    assert result.excluded_region_may_contain_target is True
+    assert any(r["path"] == "target" for r in result.poisoning_excluded_roots)
+
+
+def test_enumerate_scope_a_properties_file_under_target_classes_stays_silent(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 1, B5 control): a ``.properties`` file
+    (never a JVM-compiled-source extension) is an ordinary Maven/Gradle
+    resource-processing copy under ``classes/`` - must stay exempt,
+    unaffected by narrowing the exemption to JVM source."""
+    classes_dir = tmp_path / "target" / "classes"
+    classes_dir.mkdir(parents=True)
+    (classes_dir / "application.properties").write_text(
+        "key=value\n", encoding="utf-8")
+    comp_dir = _comprehension_dir(tmp_path)
+
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+
+    assert not any(f.relative_path.endswith("application.properties") for f in result.files)
+    assert result.degraded is False
+    assert result.excluded_region_may_contain_target is False
+    assert result.poisoning_excluded_roots == []
+
+
+def test_enumerate_scope_a_groovy_file_under_target_classes_stays_silent(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 1, B5, the judged exclusion): unlike
+    .java/.kt/.scala, a real Groovy build commonly ships raw ``.groovy``
+    files LOADED AT RUNTIME FROM THE CLASSPATH (Grails, Jenkins Job DSL,
+    Spock config scripts, ...), never compiled ahead of time - a
+    legitimate resource-copy target this producer cannot distinguish
+    from "stray compiled-away source" without executing the build.
+    Deliberately excluded from the narrower JVM-compiled-source set (see
+    ``_JVM_COMPILED_SOURCE_EXTENSIONS``'s own docstring) - stays exempt,
+    unchanged by this round's fix."""
+    classes_dir = tmp_path / "target" / "classes"
+    classes_dir.mkdir(parents=True)
+    (classes_dir / "Config.groovy").write_text(
+        "class Config {}\n", encoding="utf-8")
+    comp_dir = _comprehension_dir(tmp_path)
+
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+
+    assert not any(f.relative_path.endswith("Config.groovy") for f in result.files)
+    assert result.degraded is False
+    assert result.excluded_region_may_contain_target is False
+    assert result.poisoning_excluded_roots == []
+
+
 def test_enumerate_scope_a_code_bearing_file_outside_the_generated_position_still_poisons(
     tmp_path: Path,
 ) -> None:
@@ -770,6 +876,68 @@ def test_enumerate_scope_a_secret_shaped_directory_hiding_code_under_a_bare_src_
     matching = [p for p in result.problems if p["reason_code"] == "excluded_region_contains_code"]
     assert len(matching) == 1
     assert "'secret'-category" in matching[0]["detail"]
+
+
+def test_enumerate_scope_a_secret_shaped_directory_with_a_generated_position_still_poisons(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 1, B4 BLOCKER, wrong-data): the generated-
+    output-POSITION exemption (``_sits_under_a_recognized_generated_
+    output_position``, reasoning specifically about a BUILD TOOL's own
+    output layout) used to apply unconditionally, inside ANY poison-
+    eligible excluded root - including one excluded because its NAME
+    matches a SECRET pattern. ``credentials/generated/Real.java``
+    published a confident external claim exactly as an ordinary
+    ``target/generated-sources/Real.java`` correctly does, directly
+    contradicting ``secret_patterns_caveat``'s own promise that a
+    secret-shaped exclusion is "never silently... recorded and the run
+    degrades" - a real ``.java`` sitting inside a ``credentials/``
+    directory is exactly the suspicious shape the secret category exists
+    to catch, regardless of which sub-path it happens to sit at."""
+    generated = tmp_path / "credentials" / "generated"
+    generated.mkdir(parents=True)
+    (generated / "Real.java").write_text("package p;\nclass Real {}\n", encoding="utf-8")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert result.exclusions.get("secret") == 1
+    assert result.excluded_region_may_contain_target is True
+    assert any(p["path"] == "credentials" for p in result.poisoning_excluded_roots)
+
+
+def test_enumerate_scope_a_secret_shaped_directory_with_a_generated_sources_position_still_poisons(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 1, B4's own ``generated-sources/`` twin -
+    the other member of ``_RECOGNIZED_GENERATED_SOURCE_POSITIONS`` the
+    same exemption gate reads)."""
+    generated_sources = tmp_path / "credentials" / "generated-sources"
+    generated_sources.mkdir(parents=True)
+    (generated_sources / "Real.java").write_text("package p;\nclass Real {}\n", encoding="utf-8")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert result.exclusions.get("secret") == 1
+    assert result.excluded_region_may_contain_target is True
+    assert any(p["path"] == "credentials" for p in result.poisoning_excluded_roots)
+
+
+def test_enumerate_scope_a_generated_or_vendor_directory_with_a_generated_position_stays_silent(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 1, B4 control - the category the exemption
+    IS actually about): the identical position, under an ordinary
+    ``target/`` (category ``generated_or_vendor``, never ``secret``),
+    must stay exempt exactly as it did before this round's fix -
+    narrowing the exemption to one category must never also narrow it
+    away from the category it was designed for."""
+    generated = tmp_path / "target" / "generated"
+    generated.mkdir(parents=True)
+    (generated / "Real.java").write_text("package p;\nclass Real {}\n", encoding="utf-8")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert not any(f.relative_path.endswith("Real.java") for f in result.files)
+    assert result.degraded is False
+    assert result.excluded_region_may_contain_target is False
+    assert result.poisoning_excluded_roots == []
 
 
 def test_enumerate_scope_an_empty_secret_shaped_directory_does_not_poison(tmp_path: Path) -> None:

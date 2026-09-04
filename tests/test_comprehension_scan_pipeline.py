@@ -680,6 +680,129 @@ def test_web_xml_metadata_complete_absent_control_end_to_end(java_repo: Path) ->
     assert [e["target_external"] for e in route_edges] == ["/legacy"]
 
 
+def test_web_xml_metadata_complete_in_one_reactor_module_never_suppresses_another(
+    java_repo: Path,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 1, B2 BLOCKER, wrong-data): metadata-
+    complete used to be ONE GLOBAL FLAG set by any web.xml anywhere in
+    the scan - a two-module reactor where only mod-a declares it
+    published ZERO entry points repo-wide, including mod-b's own (a
+    wholly independent deployment whose own web.xml never made that
+    declaration). Scoped to the declaring deployment's own root
+    (the directory directly containing its own WEB-INF/) - mod-a's own
+    annotation is suppressed, mod-b's own is entirely unaffected."""
+    import json
+
+    mod_a_pkg = java_repo / "mod-a" / "src" / "main" / "java" / "com" / "acme"
+    mod_a_pkg.mkdir(parents=True, exist_ok=True)
+    (mod_a_pkg / "AServlet.java").write_text(
+        "package com.acme;\n"
+        "@WebServlet(urlPatterns = {\"/a\"})\n"
+        "public class AServlet extends HttpServlet {\n"
+        "}\n",
+        encoding="utf-8")
+    (java_repo / "mod-a" / "WEB-INF").mkdir(parents=True, exist_ok=True)
+    (java_repo / "mod-a" / "WEB-INF" / "web.xml").write_text(
+        '<web-app metadata-complete="true">\n</web-app>\n', encoding="utf-8")
+
+    mod_b_pkg = java_repo / "mod-b" / "src" / "main" / "java" / "com" / "acme"
+    mod_b_pkg.mkdir(parents=True, exist_ok=True)
+    (mod_b_pkg / "BServlet.java").write_text(
+        "package com.acme;\n"
+        "@WebServlet(urlPatterns = {\"/b\"})\n"
+        "public class BServlet extends HttpServlet {\n"
+        "}\n",
+        encoding="utf-8")
+    (java_repo / "mod-b" / "WEB-INF").mkdir(parents=True, exist_ok=True)
+    (java_repo / "mod-b" / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n</web-app>\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    a_servlet = next(u for u in modules_doc["units"] if u["display_name"] == "AServlet")
+    b_servlet = next(u for u in modules_doc["units"] if u["display_name"] == "BServlet")
+    assert "unsupported_entry_point_shape" in a_servlet["adapter_problem_reasons"]
+    assert "unsupported_entry_point_shape" not in b_servlet["adapter_problem_reasons"]
+
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    route_targets = {
+        e["target_external"] for e in dependencies_doc["edges"] if e["relation"] == "route"
+    }
+    assert "/a" not in route_targets
+    assert "/b" in route_targets
+
+
+def test_web_xml_metadata_complete_single_module_control_end_to_end(java_repo: Path) -> None:
+    """MICRO-ROUND 50 (Cluster 1, B2 control): the ORDINARY, single-
+    deployment shape (the pre-existing round-49 fixture's own layout)
+    must keep suppressing repo-wide exactly as before - scoping to a
+    deployment root must never narrow the single-module case, which is
+    the whole repo tree (deployment root ``"."``, matching every file)."""
+    import json
+
+    pkg_dir = java_repo / "src" / "main" / "java" / "com" / "acme"
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    (pkg_dir / "LegacyServlet.java").write_text(
+        "package com.acme;\n"
+        "@WebServlet(urlPatterns = {\"/legacy\"})\n"
+        "public class LegacyServlet extends HttpServlet {\n"
+        "}\n",
+        encoding="utf-8")
+    webinf = java_repo / "WEB-INF"
+    webinf.mkdir(exist_ok=True)
+    (webinf / "web.xml").write_text(
+        '<web-app metadata-complete="true">\n</web-app>\n', encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    servlet_unit = next(
+        u for u in modules_doc["units"] if u["display_name"] == "LegacyServlet")
+    assert "unsupported_entry_point_shape" in servlet_unit["adapter_problem_reasons"]
+
+
+def test_web_xml_metadata_complete_in_a_test_resources_fixture_never_sets_the_flag(
+    java_repo: Path,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 1, B2 BLOCKER, wrong-data): a
+    ``src/test/resources/WEB-INF/web.xml`` (a real, common servlet-
+    container integration-test fixture - round 44's own named shape)
+    declaring metadata-complete=true used to silence PRODUCTION
+    annotations elsewhere in the same repo, since the pre-scan never
+    checked whether a web.xml was even a real, loadable deployment
+    descriptor before trusting its declaration. Reuses the exact same
+    gate the main dispatch loop already applies to this shape
+    (`_TEST_SOURCE_ROOT_SEGMENT`) - this file can never set the flag for
+    ANY deployment now."""
+    import json
+
+    pkg_dir = java_repo / "src" / "main" / "java" / "com" / "acme"
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    (pkg_dir / "LegacyServlet.java").write_text(
+        "package com.acme;\n"
+        "@WebServlet(urlPatterns = {\"/legacy\"})\n"
+        "public class LegacyServlet extends HttpServlet {\n"
+        "}\n",
+        encoding="utf-8")
+    webinf = java_repo / "WEB-INF"
+    webinf.mkdir(exist_ok=True)
+    (webinf / "web.xml").write_text("<web-app>\n</web-app>\n", encoding="utf-8")
+
+    test_webinf = java_repo / "src" / "test" / "resources" / "WEB-INF"
+    test_webinf.mkdir(parents=True, exist_ok=True)
+    (test_webinf / "web.xml").write_text(
+        '<web-app metadata-complete="true">\n</web-app>\n', encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    servlet_unit = next(
+        u for u in modules_doc["units"] if u["display_name"] == "LegacyServlet")
+    assert "unsupported_entry_point_shape" not in servlet_unit["adapter_problem_reasons"]
+
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    route_edges = [e for e in dependencies_doc["edges"] if e["relation"] == "route"]
+    assert [e["target_external"] for e in route_edges] == ["/legacy"]
+
+
 def test_web_xml_mapping_naming_an_annotation_only_servlet_resolves_end_to_end(
     java_repo: Path,
 ) -> None:
@@ -733,6 +856,56 @@ def test_web_xml_mapping_naming_an_annotation_only_servlet_resolves_end_to_end(
         s for s in readiness_doc["signals"]
         if s["unit_id"] == webxml_unit["unit_id"] and s["check"] == "entry_points_mapped")
     assert webxml_signal["stored_status"] == "not_applicable"
+
+
+def test_web_xml_mapping_naming_an_annotation_only_filter_resolves_end_to_end(
+    java_repo: Path,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 1, B3 BLOCKER, wrong-data, end-to-end,
+    the @WebFilter twin of the servlet test above): before this fix,
+    ``_annotation_declared_name`` read a ``name=`` attribute @WebFilter
+    does not have (spec: ``filterName``) - a real @WebFilter(filterName=
+    ...) never populated ``web_filter_declared_names``, so a <filter-
+    mapping> naming it (with no <filter> element in web.xml at all - the
+    same annotation-only shape the servlet test above exercises) was
+    misread as a genuinely UNDECLARED name: ``undeclared_descriptor_name``
+    published, the route falling back to a synthetic owner, and
+    ``entry_points_mapped`` reporting a confident negative for a filter
+    that is, in fact, fully declared and correctly named. Verified
+    through the real pipeline (worker.py's own deferred-web.xml pass),
+    not a hand-built adapter-level fixture."""
+    import json
+
+    pkg_dir = java_repo / "src" / "main" / "java" / "com" / "acme"
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    (pkg_dir / "AuthFilter.java").write_text(
+        "package com.acme;\n"
+        "@WebFilter(filterName = \"Auth\", urlPatterns = {\"/secure/*\"})\n"
+        "public class AuthFilter implements Filter {\n"
+        "}\n",
+        encoding="utf-8")
+    webinf = java_repo / "WEB-INF"
+    webinf.mkdir(exist_ok=True)
+    (webinf / "web.xml").write_text(
+        "<web-app>\n"
+        "  <filter-mapping>\n"
+        "    <filter-name>Auth</filter-name>\n"
+        "    <url-pattern>/secure/*</url-pattern>\n"
+        "  </filter-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    assert not any(p["reason_code"] == "undeclared_descriptor_name" for p in problems_doc["problems"])
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    filter_unit = next(u for u in modules_doc["units"] if u["display_name"] == "AuthFilter")
+    signal = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == filter_unit["unit_id"] and s["check"] == "entry_points_mapped")
+    assert signal["stored_status"] == "satisfied"
 
 
 def test_web_xml_route_and_filter_edges_match_the_entry_point_count_end_to_end_f4(

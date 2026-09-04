@@ -260,9 +260,12 @@ def _sits_under_an_uncarved_src_segment(relative_path: str) -> bool:
     return "src" in relative_path.split("/")
 
 
-def _excluded_directory_contains_a_code_bearing_file(directory: Path) -> tuple[bool, bool]:
+def _excluded_directory_contains_a_code_bearing_file(
+    directory: Path, *, category: str,
+) -> tuple[bool, bool]:
     """A BOUNDED peek inside a directory this run is about to exclude
-    outright as ``generated_or_vendor`` - never added to ``files``,
+    outright as ``generated_or_vendor`` (or ``secret`` - see
+    ``category``'s own round-50 note below) - never added to ``files``,
     never hashed, just a cheap extension check so an excluded region
     that swallows real, hand-written code can be told apart from an
     ordinary build-output tree (a real ``target/``/``build/`` full of
@@ -321,7 +324,28 @@ def _excluded_directory_contains_a_code_bearing_file(directory: Path) -> tuple[b
     whole) - a ``.java`` sitting anywhere ELSE inside the same excluded
     root (a vendored reactor module under ``target/``, a stray hand-
     written file) still counts as evidence and still poisons, exactly
-    as before this round."""
+    as before this round.
+
+    MICRO-ROUND 50 (Cluster 1, B4 BLOCKER, wrong-data): the generated-
+    output-POSITION exemption above is reasoning specifically about a
+    BUILD TOOL's own output layout (Maven/Gradle's ``generated-sources``/
+    ``classes`` conventions) - it has nothing to do with, and must never
+    apply inside, a directory this run excluded because its NAME matches
+    a SECRET pattern (``credentials/``, ``.env/``, ...). Reviewer-3
+    measured ``credentials/generated/Real.java`` publishing a confident
+    external claim - the generated-SOURCE position exemption fired
+    inside a secret-shaped root exactly as it would inside an ordinary
+    ``target/``, directly contradicting ``secret_patterns_caveat``'s own
+    promise that secret-shaped content is "never silently... recorded
+    and the run degrades". ``category`` (the excluded root's OWN
+    ``_exclusion_category`` result, passed in by the one caller that
+    already computed it) gates this: the position exemption is consulted
+    ONLY when ``category == "generated_or_vendor"`` - the one category
+    this reasoning is actually about. Precedence rule, stated once here
+    for any future stacked-category case: a MORE SPECIFIC, more
+    dangerous category (``secret``) always wins over a general
+    structural exemption reasoned about a DIFFERENT category
+    (``generated_or_vendor``) - never the reverse."""
     visited = 0
     symlink_skipped = False
     stack = [directory]
@@ -346,9 +370,12 @@ def _excluded_directory_contains_a_code_bearing_file(directory: Path) -> tuple[b
                 ):
                     relative_to_excluded_root = Path(entry.path).relative_to(
                         directory).as_posix()
-                    if _sits_under_a_recognized_generated_output_position(
-                        relative_to_excluded_root,
-                        is_java_source=entry.name.lower().endswith(".java"),
+                    if category == "generated_or_vendor" and (
+                        _sits_under_a_recognized_generated_output_position(
+                            relative_to_excluded_root,
+                            is_jvm_compiled_source=entry.name.lower().endswith(
+                                tuple(_JVM_COMPILED_SOURCE_EXTENSIONS)),
+                        )
                     ):
                         continue
                     return True, False
@@ -423,6 +450,37 @@ _RECOGNIZED_GENERATED_SOURCE_POSITIONS = (
 _RECOGNIZED_BUILD_OUTPUT_RESOURCE_POSITIONS = (
     "classes/", "test-classes/", "resources/", "test-resources/",
 )
+#: MICRO-ROUND 50 (Cluster 1, B5 BLOCKER, wrong-data): the 49b narrowing
+#: above keyed on ``.java`` ONLY - reviewer-3 measured a `.kt`/`.scala`
+#: file under ``target/classes/`` still getting the resource-copy
+#: exemption and publishing a confident external claim, the identical
+#: "vendored/stray real code, wrongly exempted" shape 49b already fixed
+#: for `.java` (the ORIGINAL fix's own reason - "a build never
+#: legitimately copies SOURCE into classes/, only compiles it away" -
+#: holds identically for every JVM-compiled-language source extension,
+#: not merely the one this producer's own adapter happens to PARSE).
+#: Reused from ``_DEGRADABLE_EXCLUDED_EXTENSIONS`` above rather than a
+#: new literal list (that set is already this module's own maintained
+#: registry of code-bearing extensions) - but NARROWED to the three
+#: that are ALWAYS compiled away, never legitimately deployed as a raw
+#: source-shaped resource: ``.java``/``.kt``/``.scala``.
+#:
+#: ``.groovy`` is DELIBERATELY EXCLUDED from this narrower set, despite
+#: being in ``_DEGRADABLE_EXCLUDED_EXTENSIONS`` - reviewer-3's own
+#: point, judged: unlike the other three, a real, common Groovy build
+#: shape (Grails, Jenkins Job DSL, Spock config scripts, ...) ships raw
+#: ``.groovy`` files that are LOADED AT RUNTIME FROM THE CLASSPATH,
+#: never compiled ahead of time - a legitimate resource-copy target this
+#: producer has no way to distinguish from "stray compiled-away source"
+#: without executing the build. Declaring `.java`/`.kt`/`.scala` (never
+#: legitimately a runtime-loaded script) poisons unconditionally is safe
+#: and closes the measured gap; additionally declaring `.groovy` would
+#: risk a NEW false-positive poison on an otherwise-correct, common
+#: build shape this round never measured - left exempted (as every
+#: extension outside this narrower set already is) until a future round
+#: measures the "stray real .groovy source under classes/" shape as a
+#: genuine, common gap worth the tradeoff.
+_JVM_COMPILED_SOURCE_EXTENSIONS = frozenset({".java", ".kt", ".scala"})
 #: NAMED RESIDUAL, not silently dropped: an EXPLODED WAR shape
 #: (``target/<artifactId>-<version>/WEB-INF/classes/``) is NOT covered -
 #: the artifact-id/version segment is per-project, dynamic, and this
@@ -460,20 +518,22 @@ _RECOGNIZED_BUILD_OUTPUT_RESOURCE_POSITIONS = (
 #: to catch the common case, the identical over-wide-exemption dilution
 #: round 16 already named and rejected once for a different position.
 def _sits_under_a_recognized_generated_output_position(
-    relative_to_excluded_root: str, *, is_java_source: bool,
+    relative_to_excluded_root: str, *, is_jvm_compiled_source: bool,
 ) -> bool:
     """MICRO-ROUND 49b (BLOCKER fix - see ``_RECOGNIZED_BUILD_OUTPUT_
     RESOURCE_POSITIONS``'s own docstring): a generated-SOURCE position
     exempts any code-bearing extension unconditionally (that IS what a
     build tool legitimately writes there); a build-output RESOURCE
-    position exempts every extension EXCEPT ``.java`` - a real ``.java``
-    file is never a legitimate resource copy, so one found here is
-    exactly the "vendored/stray real code" shape the poison rule exists
-    to catch, identically to one found anywhere else in the excluded
-    region."""
+    position exempts every extension EXCEPT a JVM-compiled-source one
+    (MICRO-ROUND 50, Cluster 1, B5: widened from ``.java``-only - see
+    ``_JVM_COMPILED_SOURCE_EXTENSIONS``'s own docstring) - a real
+    ``.java``/``.kt``/``.scala`` file is never a legitimate resource
+    copy, so one found here is exactly the "vendored/stray real code"
+    shape the poison rule exists to catch, identically to one found
+    anywhere else in the excluded region."""
     if relative_to_excluded_root.startswith(_RECOGNIZED_GENERATED_SOURCE_POSITIONS):
         return True
-    return not is_java_source and relative_to_excluded_root.startswith(
+    return not is_jvm_compiled_source and relative_to_excluded_root.startswith(
         _RECOGNIZED_BUILD_OUTPUT_RESOURCE_POSITIONS,
     )
 
@@ -1435,7 +1495,8 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                     # silently.
                     if category not in _DIRECTORY_CATEGORIES_THAT_CANNOT_HIDE_FIRST_PARTY_CODE:
                         contains_code, peek_truncated = (
-                            _excluded_directory_contains_a_code_bearing_file(entry)
+                            _excluded_directory_contains_a_code_bearing_file(
+                                entry, category=category)
                         )
                         if contains_code or peek_truncated:
                             excluded_region_may_contain_target = True

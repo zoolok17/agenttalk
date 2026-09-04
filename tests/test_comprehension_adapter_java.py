@@ -3896,7 +3896,37 @@ public class InitServlet extends HttpServlet {
 
 
 def test_web_filter_name_attribute_is_recorded_for_the_cross_file_join():
-    """MICRO-ROUND 49 (M3's own @WebFilter twin)."""
+    """MICRO-ROUND 49 (M3's own @WebFilter twin).
+
+    MICRO-ROUND 50 (Cluster 1, B3 BLOCKER, wrong-data): this fixture used
+    to spell ``name = "Auth"`` - @WebFilter has NO ``name`` attribute at
+    all (spec: ``filterName``) - so this test only ever exercised
+    already-non-compiling Java, and the false-positive match it measured
+    (round 49's own regex read ``name=`` as an ordinary ATTRIBUTE, never
+    checking it was one @WebFilter actually declares) silently never
+    fired on any REAL @WebFilter, which spells the SAME concept
+    ``filterName=`` instead. Fixed to the real, compiling attribute
+    name - reviewer-3 verified with javac 1.8 that ``name = "Auth"`` on
+    a real @WebFilter is a compile error (no such element)."""
+    src = """
+package p;
+
+@WebFilter(filterName = "Auth", urlPatterns = {"/secure/*"})
+public class AuthFilter implements Filter {
+}
+"""
+    result = java.parse_java_source("AuthFilter.java", src)
+    assert result.web_filter_declared_names == {"Auth": "p.AuthFilter"}
+
+
+def test_web_filter_name_attribute_is_never_read_only_filtername_is():
+    """MICRO-ROUND 50 (Cluster 1, B3 BLOCKER control): @WebFilter has no
+    ``name`` attribute at all (spec: ``filterName``) - this reads as an
+    ordinary, lexically-inert identifier, never a registration name, and
+    must never populate the cross-file join registry. This exact shape
+    (``name = "Auth"`` on a real @WebFilter) is a compile error under a
+    real javac - the fixture exists only to prove this producer's own
+    reading, never to claim it is legal Java."""
     src = """
 package p;
 
@@ -3905,7 +3935,7 @@ public class AuthFilter implements Filter {
 }
 """
     result = java.parse_java_source("AuthFilter.java", src)
-    assert result.web_filter_declared_names == {"Auth": "p.AuthFilter"}
+    assert result.web_filter_declared_names == {}
 
 
 def test_web_servlet_without_a_name_attribute_records_nothing():

@@ -1136,12 +1136,30 @@ _ROUTE_POSITIONAL_ANCHOR_RE = re.compile(r"\A\(")
 #: whole route as unrecoverable - factually wrong, since no value
 #: expression was ever written for this annotation to fail to recover.
 _ROUTE_LEADING_NAMED_ATTR_RE = re.compile(r"\s*[A-Za-z_$][\w$]*\s*=(?!=)")
-#: MICRO-ROUND 49 (M3 MAJOR, wrong-data): @WebServlet/@WebFilter's own
-#: registration ``name`` attribute - never confused with ``urlPatterns``/
-#: ``value`` (a disjoint attribute name), so this can share the exact
-#: same top-level-only scan `_ROUTE_NAMED_ATTR_RE` needed after round
-#: 49's own B2 fix (see `_top_level_paren_depth_matches`).
+#: MICRO-ROUND 49 (M3 MAJOR, wrong-data): @WebServlet's own registration
+#: ``name`` attribute - never confused with ``urlPatterns``/``value`` (a
+#: disjoint attribute name), so this can share the exact same top-level-
+#: only scan `_ROUTE_NAMED_ATTR_RE` needed after round 49's own B2 fix
+#: (see `_top_level_paren_depth_matches`).
+#:
+#: MICRO-ROUND 50 (Cluster 1, B3 BLOCKER, wrong-data): round 49's own
+#: comment above (before this fix) claimed this attribute was shared by
+#: "@WebServlet/@WebFilter" - FALSE. @WebFilter has NO ``name`` attribute
+#: at all (javax/jakarta.servlet.annotation.WebFilter's own declared
+#: members are ``filterName``, ``value``, ``urlPatterns``, ``servletNames``,
+#: ...; ``name`` is @WebServlet-only) - reviewer-3 proved this reads as
+#: an ordinary, lexically-inert identifier on a REAL @WebFilter, only
+#: ever matching on already-non-compiling Java that happens to spell an
+#: attribute named ``name=`` (the existing test at the old call site
+#: asserted exactly that non-compiling shape, never a real @WebFilter).
+#: This regex is now @WebServlet-only; see `_WEB_FILTER_FILTER_NAME_
+#: ATTR_RE` for @WebFilter's own, real attribute.
 _WEB_COMPONENT_NAME_ATTR_RE = re.compile(r"\bname\s*=")
+#: MICRO-ROUND 50 (Cluster 1, B3's own fix): @WebFilter's REAL
+#: registration attribute (spec: ``filterName``) - see
+#: `_WEB_COMPONENT_NAME_ATTR_RE`'s own docstring for why these two are
+#: separate regexes rather than one shared between the two annotations.
+_WEB_FILTER_FILTER_NAME_ATTR_RE = re.compile(r"\bfilterName\s*=")
 #: invariant 3 (design: "must not store... string-literal bodies"): a
 #: route target is captured as a normalized route IDENTIFIER, never an
 #: unbounded raw excerpt - truncated past this length rather than stored
@@ -2616,24 +2634,29 @@ _UNICODE_INVISIBLE_FORMAT_CHARS = frozenset(
 
 def _annotation_declared_name(
     sanitized: str, original: str, arg_pos: int, close_pos: int,
+    *, name_attr_re: re.Pattern[str] = _WEB_COMPONENT_NAME_ATTR_RE,
 ) -> str | None:
     """MICRO-ROUND 49 (M3 MAJOR, wrong-data): the literal value of this
-    annotation's own top-level ``name=`` attribute (``@WebServlet(name=
-    ...)``/``@WebFilter(name=...)``) - ``None`` when absent, or present
-    but unrecoverable (a constant reference, a concatenation, ...),
-    never a guess. ``arg_pos``/``close_pos`` are the annotation's own
-    opening/closing paren positions - the identical span
-    :func:`_route_paths` receives; ``target_depth=1`` for the identical
-    reason its own call site explains (the span includes its own
-    wrapping parens, so a top-level attribute sits one paren deep, not
-    zero) - and the same nesting-awareness round 49's own B2 fix gave
-    ``value=``/``path=``/``urlPatterns=`` applies here too: a NESTED
-    annotation's own ``name=`` (there is no such shape for ``@WebInit
-    Param`` today, but the principle is the same one B2 already
-    established) could never be mistaken for this annotation's own."""
+    annotation's own top-level registration-name attribute
+    (``@WebServlet(name=...)`` by default; pass ``name_attr_re=
+    _WEB_FILTER_FILTER_NAME_ATTR_RE`` for ``@WebFilter(filterName=...)``
+    - MICRO-ROUND 50, Cluster 1, B3: the two annotations do NOT share an
+    attribute name, see `_WEB_COMPONENT_NAME_ATTR_RE`'s own docstring)
+    - ``None`` when absent, or present but unrecoverable (a constant
+    reference, a concatenation, ...), never a guess. ``arg_pos``/
+    ``close_pos`` are the annotation's own opening/closing paren
+    positions - the identical span :func:`_route_paths` receives;
+    ``target_depth=1`` for the identical reason its own call site
+    explains (the span includes its own wrapping parens, so a top-level
+    attribute sits one paren deep, not zero) - and the same nesting-
+    awareness round 49's own B2 fix gave ``value=``/``path=``/
+    ``urlPatterns=`` applies here too: a NESTED annotation's own name
+    attribute (there is no such shape for ``@WebInitParam`` today, but
+    the principle is the same one B2 already established) could never
+    be mistaken for this annotation's own."""
     sanitized_segment = sanitized[arg_pos:close_pos + 1]
     for match in _top_level_paren_depth_matches(
-        _WEB_COMPONENT_NAME_ATTR_RE, sanitized_segment, target_depth=1,
+        name_attr_re, sanitized_segment, target_depth=1,
     ):
         values = _route_literal_list_at(original, arg_pos + match.end())
         if values:
@@ -4294,6 +4317,17 @@ def parse_java_source(
             continue
         # MICRO-ROUND 49 (M3's own @WebFilter twin): see the identical
         # @WebServlet extraction above.
+        #
+        # MICRO-ROUND 50 (Cluster 1, B3 BLOCKER, wrong-data): this used
+        # to call _annotation_declared_name with its default ``name=``
+        # attribute pattern - @WebFilter has no such attribute (spec:
+        # filterName) - so this only ever matched on already-non-
+        # compiling Java that happened to spell a bogus ``name=``
+        # attribute; a REAL @WebFilter(filterName="auth") (plus its own
+        # <servlet-mapping>-style XML co-declaration) never populated
+        # web_filter_declared_names at all, silently missing the round-
+        # 49 conflict-join this dict exists to feed. Reads filterName=
+        # now, matching the spec this annotation actually declares.
         name_arg_pos = match.end()
         while name_arg_pos < len(sanitized) and sanitized[name_arg_pos].isspace():
             name_arg_pos += 1
@@ -4301,7 +4335,8 @@ def parse_java_source(
             name_close_pos = _matching_close_paren(sanitized, name_arg_pos)
             if name_close_pos is not None:
                 declared_name = _annotation_declared_name(
-                    sanitized, text, name_arg_pos, name_close_pos)
+                    sanitized, text, name_arg_pos, name_close_pos,
+                    name_attr_re=_WEB_FILTER_FILTER_NAME_ATTR_RE)
                 if declared_name is not None:
                     web_filter_declared_names[declared_name] = target_type
                 # MICRO-ROUND 49 (m2's own @WebFilter twin): see the
