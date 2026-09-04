@@ -2107,6 +2107,13 @@ def run_scan(
             # point KIND vocabulary itself - see ENTRY_POINT_KINDS's own
             # docstring.
             "entry_point_kinds": dict(java_adapter.ENTRY_POINT_KINDS),
+            # FIX ROUND 48 (forty-second cold read, F5 MAJOR completeness):
+            # the base-path composition limit ENTRY_POINT_KINDS's own
+            # "counted as a served endpoint" claim needs alongside it -
+            # see ROUTE_COMPOSITION_CAVEAT's own docstring. Every sibling
+            # limit already publishes in-artifact; this was the one that
+            # did not.
+            "route_composition_caveat": java_adapter.ROUTE_COMPOSITION_CAVEAT,
             # FIX ROUND 24 (twentieth cold read, F8b, declare-not-
             # silently-guess): see readiness_artifact.PROVENANCE_CAVEAT's
             # own docstring - the SAME "declare it in scan.json, don't

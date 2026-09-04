@@ -7462,6 +7462,27 @@ def test_scan_json_declares_the_provenance_caveat(java_repo: Path) -> None:
     assert scan_doc["provenance_caveat"] == readiness_artifact.PROVENANCE_CAVEAT
 
 
+def test_scan_json_declares_the_route_composition_caveat(java_repo: Path) -> None:
+    """FIX ROUND 48 (forty-second cold read, F5 MAJOR completeness, the
+    round-35 standard - "the ARTIFACT is the surface"): the deployment
+    base-path composition limit (JAX-RS's own @ApplicationPath, a
+    Spring DispatcherServlet mapped past bare '/') was declared only in
+    source comments, this adapter's own capability description, and the
+    design doc - never in a published artifact, even though
+    entry_point_kinds right beside it tells a consumer http_route is
+    "counted as a served endpoint" with no hint the published name may
+    be missing a deployment-level prefix. Every sibling limit already
+    publishes in-artifact; this is the one that did not."""
+    import json
+
+    from agenttalk.comprehension.adapters import java as java_adapter
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert "ApplicationPath" in scan_doc["route_composition_caveat"]
+    assert scan_doc["route_composition_caveat"] == java_adapter.ROUTE_COMPOSITION_CAVEAT
+
+
 def test_scan_json_declares_the_work_id_binding_is_unverified(java_repo: Path) -> None:
     """FIX ROUND 29 (twenty-fifth cold read, F5 MAJOR, completeness): the
     attended --acknowledge-unignored-private-store override's own
