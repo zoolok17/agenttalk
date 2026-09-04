@@ -124,12 +124,30 @@ _DEPENDENCY_CACHE_DIR_NAMES = frozenset({
 #: never walked or peeked, by construction of `_exclusion_category`
 #: itself) - every other directory-exclusion category is poison-
 #: eligible BY DEFAULT, so a future widened category never has to be
-#: separately remembered here. `hard_excluded` (`.git`/`.agenttalk`)
-#: and `vcs` (`.hg`/`.svn`) are VCS/tooling-internal state, never a
-#: package a build could ever place first-party source under; `
-#: dependency_cache` (`node_modules`/`.m2`/etc) is third-party-package-
-#: manager state by construction of the directory NAME itself - peeking
-#: any of the three would be both expensive and pointless.
+#: separately remembered here.
+#:
+#: MICRO-ROUND 48b (reviewer-3's own attack, corrected): the paragraph
+#: above is only TRUE per-category, not uniformly, as originally
+#: written. `hard_excluded` (`.git`/`.agenttalk`) and `vcs` (`.hg`/
+#: `.svn`) are ALL dot-prefixed - not a legal Java identifier, so
+#: neither name can ever coincide with a real package segment
+#: regardless of position; peeking either would be both expensive and
+#: pointless, exactly as before. `dependency_cache` (`node_modules`/
+#: `.m2`/`.gradle`/`__pycache__`/`.venv`/`venv`/`.tox`/etc) is
+#: DIFFERENT: several of its own names (`node_modules`, `venv`,
+#: `__pycache__`) ARE legal Java identifiers, so a real domain package
+#: could coincidentally share one. Kept OFF the poison-eligible set
+#: anyway - poisoning run-wide externality confidence on every
+#: ordinary `node_modules`/`venv` across a ROI-typical repo would
+#: re-create the exact round-16 dilution its own source-root guard
+#: exists to prevent - but the fix for the coincidental-package case is
+#: the TARGETED one, not poison-eligibility: `_exclusion_category`'s
+#: own dependency_cache branch below now carries the identical round-16
+#: source-root guard the `generated_or_vendor` branch already has, so a
+#: dependency_cache-shaped name sitting inside a recognized source root
+#: is not excluded at all (walked as ordinary content) - no first-party
+#: code is ever silently lost to this category, without ever needing to
+#: poison the run over it.
 _DIRECTORY_CATEGORIES_THAT_CANNOT_HIDE_FIRST_PARTY_CODE = frozenset({
     "hard_excluded", "vcs", "dependency_cache",
 })
@@ -854,7 +872,9 @@ def _exclusion_category(name: str, relative_path: str, *, is_dir: bool) -> str |
     if is_dir:
         if name in _VCS_DIR_NAMES:
             return "vcs"
-        if name in _DEPENDENCY_CACHE_DIR_NAMES:
+        if name in _DEPENDENCY_CACHE_DIR_NAMES and not _is_inside_a_recognized_source_root(
+            relative_path,
+        ):
             return "dependency_cache"
         if name in _GENERATED_VENDOR_DIR_NAMES and not _is_inside_a_recognized_source_root(
             relative_path,

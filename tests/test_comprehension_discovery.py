@@ -670,6 +670,32 @@ def test_enumerate_scope_an_empty_secret_shaped_directory_does_not_poison(tmp_pa
     assert result.problems == []
 
 
+@pytest.mark.parametrize("dirname", ["venv", "node_modules", "__pycache__"])
+def test_enumerate_scope_a_dependency_cache_shaped_directory_inside_a_recognized_source_root_is_inventoried(
+    tmp_path: Path, dirname: str,
+) -> None:
+    """MICRO-ROUND 48b (reviewer-3's own attack on round 48's F1,
+    corrected): unlike `vcs`/`hard_excluded` (both dot-prefixed - never
+    a legal Java identifier), several `dependency_cache` directory
+    names (`node_modules`, `venv`, `__pycache__`) ARE legal Java
+    identifiers, so a real domain package could coincidentally share
+    one - the same "domain package coincidentally named like the
+    exclusion category" shape round 16 already fixed for generated/
+    vendor names and round 48's own F1 already fixed for secret names,
+    now applied to dependency_cache too via the identical source-root
+    guard (never poison-eligibility - see the module-level comment
+    above `_DIRECTORY_CATEGORIES_THAT_CANNOT_HIDE_FIRST_PARTY_CODE`)."""
+    pkg_dir = tmp_path / "src" / "main" / "java" / "com" / "ex" / dirname
+    pkg_dir.mkdir(parents=True)
+    (pkg_dir / "Handler.java").write_text(
+        f"package com.ex.{dirname};\nclass Handler {{}}\n", encoding="utf-8")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert f"src/main/java/com/ex/{dirname}/Handler.java" in {
+        f.relative_path for f in result.files}
+    assert result.exclusions.get("dependency_cache", 0) == 0
+
+
 def test_enumerate_scope_excludes_a_credentials_json_service_account_key(tmp_path: Path) -> None:
     """FIX ROUND 41 (thirty-fifth cold read, F7 POLISH, completeness): the
     bare ``credentials`` literal (an AWS-CLI-style file) was already

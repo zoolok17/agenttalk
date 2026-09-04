@@ -698,6 +698,20 @@ _STATIC_MODIFIER_RE = re.compile(r"\bstatic\b")
 _ROUTE_ANNOTATION_RE = re.compile(
     r"@(?:[A-Za-z_$][\w$]*\.)*(" + "|".join(_ROUTE_ANNOTATIONS) + r")\b"
 )
+#: MICRO-ROUND 48b (F2, reviewer-3's own reasoning-overturn on round 43/
+#: 45's own deferral): round 45's own C2 deferral (declaring, not
+#: composing, a class-level method restriction) cited its JUSTIFICATION
+#: as VOLUME - but @ApplicationPath has no such volume concern: the
+#: annotation appears at most once or twice in a whole application (one
+#: JAX-RS ``Application`` subclass, occasionally two for a versioned
+#: API). The reactor rule's own precedent (round 20: publish per-run on
+#: comparable positive evidence, once, rather than never) applies
+#: instead here - recognized (never composed - see
+#: ROUTE_COMPOSITION_CAVEAT, unchanged) so a ONE-LINE, non-degrading,
+#: informational signal can name the declared value once per occurrence,
+#: closing the "silent" half of this named limit without guessing at
+#: the composition itself.
+_APPLICATION_PATH_ANNOTATION_RE = re.compile(r"@(?:[A-Za-z_$][\w$]*\.)*ApplicationPath\b")
 #: M-5 (third cold read, fix round 5): a verb-specific annotation names its
 #: own HTTP method unambiguously; plain ``@RequestMapping`` does not (it
 #: may carry a ``method = ...`` attribute this slice does not parse, or
@@ -3203,6 +3217,43 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             class_route_prefix[target_type] = paths
             if match.group(1) == "Path":
                 jax_rs_path_classes.add(target_type)
+
+    # MICRO-ROUND 48b (F2): @ApplicationPath's own declared value, when
+    # present, is recorded once per annotation occurrence - a one-line,
+    # non-degrading, informational signal (worker.py's own conversion
+    # site keys degrades_run off this reason_code, the same non-
+    # degrading exception duplicate_route_target already has). Never
+    # composed into any published http_route (ROUTE_COMPOSITION_CAVEAT,
+    # unchanged) - this only closes the SILENCE half of that named
+    # limit. Independent of _ROUTE_ANNOTATION_RE/class_route_prefix
+    # above - @ApplicationPath is not itself a route-composition
+    # annotation, just a single fact worth naming when genuinely present.
+    for match in _APPLICATION_PATH_ANNOTATION_RE.finditer(sanitized):
+        line = _line_at(newline_offsets, match.start())
+        enclosing = _enclosing_qualified_name(match.start(), types, primary_qualified)
+        arg_pos = match.end()
+        while arg_pos < len(sanitized) and sanitized[arg_pos].isspace():
+            arg_pos += 1
+        value: list[str] | None = []
+        if arg_pos < len(sanitized) and sanitized[arg_pos] == "(":
+            close_pos = _matching_close_paren(sanitized, arg_pos)
+            if close_pos is not None:
+                value = _route_paths(sanitized, text, arg_pos, close_pos + 1)
+        if value:
+            detail = bounded_detail(
+                f"@ApplicationPath({value[0]!r}) at line {line} declares a deployment-level "
+                "base path this producer does not compose into any published http_route - "
+                "see this run's own route_composition_caveat")
+        else:
+            detail = bounded_detail(
+                f"@ApplicationPath at line {line} declares a deployment-level base path "
+                "(value not recovered as a literal) this producer does not compose into "
+                "any published http_route - see this run's own route_composition_caveat")
+        problems.append(JavaAdapterProblem(
+            reason_code="deployment_base_path_declared",
+            detail=detail,
+            qualified_name=enclosing,
+        ))
 
     # FIX ROUND 17b (THE MAJOR): every class that actually got AT LEAST
     # one route entry point published, from ANY family (Spring/JAX-RS

@@ -5154,6 +5154,55 @@ public class OrderResource {
     assert route.name == "GET /orders/list"
 
 
+def test_an_application_path_annotation_publishes_a_non_degrading_informational_signal():
+    """MICRO-ROUND 48b (F2, reviewer-3's own reasoning-overturn): round
+    43/45's own deferral cited round-45 C2's VOLUME justification, which
+    does not apply to @ApplicationPath (it appears at most once or twice
+    in a whole application) - the reactor rule's own precedent (publish
+    per-run on comparable positive evidence) applies instead. This is
+    the SAME source as the composition-is-unaffected test above - only
+    the NEW signal is asserted here, since that test already locks the
+    unaffected route composition."""
+    src = """
+package p;
+
+@ApplicationPath("/api")
+public class RestConfig extends Application {
+}
+
+@Path("/orders")
+public class OrderResource {
+    @GET
+    @Path("/list")
+    public void list() {}
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    matching = [p for p in result.problems if p.reason_code == "deployment_base_path_declared"]
+    assert len(matching) == 1
+    assert matching[0].qualified_name == "p.RestConfig"
+    assert "/api" in matching[0].detail
+
+
+def test_no_application_path_annotation_publishes_no_signal():
+    """Control for the test above: a JAX-RS resource with no
+    @ApplicationPath anywhere in the file must never publish
+    `deployment_base_path_declared` - the signal fires only on genuine
+    presence, never as a guess or a blanket per-file note."""
+    src = """
+package p;
+
+@Path("/orders")
+public class OrderResource {
+    @GET
+    @Path("/list")
+    public void list() {}
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    assert not any(p.reason_code == "deployment_base_path_declared" for p in result.problems)
+
+
 def test_jax_rs_path_with_no_verb_marker_and_no_method_level_path_is_a_confident_negative():
     """FIX ROUND 36 (thirtieth cold read, F3 MAJOR, wrong-data,
     NoMethodPath verbatim): the round-17b class-closer above used to

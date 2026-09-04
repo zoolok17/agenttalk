@@ -3687,6 +3687,35 @@ def test_run_scan_a_secrets_xml_collision_stays_complete_not_degraded(java_repo:
     assert "secret_pattern_matched_code_bearing_file" not in scan_doc["degraded_by"]
 
 
+def test_a_secret_excluded_code_bearing_file_produces_no_unit(java_repo: Path) -> None:
+    """MICRO-ROUND 48b (F3, the dead-table-entry lock): readiness_
+    artifact.py's own `_READINESS_CHECKS_BY_REASON_CODE["secret_pattern_
+    matched_code_bearing_file"]` entry is dead code TODAY because a
+    secret-excluded file never gets a ModuleRecord/unit at all - a
+    structural fact a later round could silently change (e.g. by adding
+    a synthesized-unit pass for this reason code the way `binary_
+    excluded_root_sniffed_xml`/`binary_excluded_code_bearing_file`
+    already have). This test locks the STRUCTURAL FACT itself, not the
+    dead-code consequence, so a future change that makes the entry live
+    trips THIS test - a controlled, expected failure naming exactly what
+    changed - rather than a cold read rediscovering the same gap cold."""
+    import json
+
+    (java_repo / "secrets.xml").write_text(
+        "<beans><bean id=\"x\" class=\"com.acme.X\"/></beans>", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    assert not any(
+        "secrets.xml" in record["paths"] for record in modules_doc["units"]
+    )
+    assert not any(
+        "secret_pattern_matched_code_bearing_file" in record.get("adapter_problem_reasons", [])
+        for record in modules_doc["units"]
+    )
+
+
 def test_run_scan_a_genuinely_degrading_discovery_problem_still_degrades(
     java_repo: Path, monkeypatch,
 ) -> None:
@@ -7481,6 +7510,65 @@ def test_scan_json_declares_the_route_composition_caveat(java_repo: Path) -> Non
     scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
     assert "ApplicationPath" in scan_doc["route_composition_caveat"]
     assert scan_doc["route_composition_caveat"] == java_adapter.ROUTE_COMPOSITION_CAVEAT
+
+
+def test_run_scan_an_application_path_annotation_publishes_a_non_degrading_signal(
+    java_repo: Path,
+) -> None:
+    """MICRO-ROUND 48b (F2, .cr42-routes shape): an @ApplicationPath
+    actually parsed this run publishes a one-line, non-degrading,
+    informational `deployment_base_path_declared` problem naming the
+    value - never composed into the published route (unchanged from
+    round 43/45), but no longer silent either. status stays complete:
+    this is informational, the same non-degrading treatment
+    `duplicate_route_target` already gets, never a sign anything was
+    missed."""
+    import json
+
+    web_dir = java_repo / "src" / "main" / "java" / "com" / "acme" / "web"
+    web_dir.mkdir(parents=True)
+    (web_dir / "RestConfig.java").write_text(
+        "package com.acme.web;\n"
+        "@javax.ws.rs.ApplicationPath(\"/api\")\n"
+        "public class RestConfig extends Application {\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (web_dir / "OrderResource.java").write_text(
+        "package com.acme.web;\n"
+        "@Path(\"/orders\")\n"
+        "public class OrderResource {\n"
+        "    @GET\n"
+        "    @Path(\"/list\")\n"
+        "    public void list() {}\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matching = [
+        p for p in problems_doc["problems"]
+        if p["reason_code"] == "deployment_base_path_declared"]
+    assert len(matching) == 1
+    assert "/api" in matching[0]["detail"]
+
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert "deployment_base_path_declared" not in scan_doc["degraded_by"]
+
+
+def test_run_scan_an_absent_application_path_publishes_no_signal(java_repo: Path) -> None:
+    """Control: the sample project's own routes (no @ApplicationPath
+    anywhere) must never publish `deployment_base_path_declared` - the
+    signal is genuine-presence-only, never a per-run blanket note."""
+    import json
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    assert not any(
+        p["reason_code"] == "deployment_base_path_declared" for p in problems_doc["problems"])
 
 
 def test_scan_json_declares_the_work_id_binding_is_unverified(java_repo: Path) -> None:

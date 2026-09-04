@@ -650,6 +650,13 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                     problems.append(WorkerProblem(
                         reason_code=problem.reason_code, relative_path=rel,
                         detail=problem.detail, qualified_name=problem.qualified_name,
+                        # MICRO-ROUND 48b (F2): deployment_base_path_declared is
+                        # informational, never degrading - the SAME non-degrading
+                        # exception duplicate_route_target already has at its own
+                        # web.xml conversion site below, needed here for the first
+                        # time since no other .java-parse-path reason code has ever
+                        # been non-degrading.
+                        degrades_run=problem.reason_code != "deployment_base_path_declared",
                     ))
         elif rel_name_lower == "pom.xml":
             # reviewer-3 B-3 (PR-B delta review): a pom.xml's build-relation

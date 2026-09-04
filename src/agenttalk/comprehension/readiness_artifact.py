@@ -377,6 +377,24 @@ _READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
     # same whole-file evidence gap as path_excluded/resource_limit above -
     # a real, parseable, adapter-handled file this run excluded because
     # its own name collided with the secret-file pattern set.
+    #
+    # DEAD ENTRY, INVARIANT (round 48's own F2 audit; MICRO-ROUND 48b,
+    # same treatment as the round-42 one-record-per-path carry): this
+    # mapping can never actually be CONSULTED by a real unit today - it
+    # depends on the structural fact that a secret-excluded file never
+    # gets a ModuleRecord/unit at all (discovery.py never computes a
+    # content digest for it beyond the exclusion-site record, and
+    # build_modules has no synthesized-unit pass for this reason code the
+    # way it does for `binary_excluded_root_sniffed_xml`/`binary_
+    # excluded_code_bearing_file` above), so `adapter_problem_reasons`
+    # can never actually contain this string on any record this producer
+    # emits. Locked by `test_a_secret_excluded_code_bearing_file_
+    # produces_no_unit` (test_comprehension_scan_pipeline.py) - if a
+    # future round starts synthesizing a unit for a secret-excluded file
+    # (the open carry round 48's own F2 declared, deliberately NOT built
+    # this round), that lock test will fail FIRST, not a future cold
+    # read - at which point this entry becomes live and this comment
+    # should be deleted.
     "secret_pattern_matched_code_bearing_file": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
     "no_types_extracted": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
     # FIX ROUND 20 (sixteenth cold read, M3 MAJOR, wrong-data): these
@@ -402,6 +420,19 @@ _READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
     # no_entry_point negative a class that genuinely serves no route at
     # all correctly gets.
     "unsupported_entry_point_shape": frozenset({"entry_points_mapped"}),
+    # MICRO-ROUND 48b (F2): an @ApplicationPath's own declared value is
+    # attributed to the real class it decorates (never a fabricated,
+    # never-matching qualified_name the way `duplicate_route_target`
+    # uses to avoid ever reaching a real unit) - so it DOES reach a real
+    # unit's own `adapter_problem_reasons` and needs an entry here or
+    # `_check_source_understood`/its siblings raise a bare `KeyError`
+    # the first time this reason appears. Deliberately EMPTY: this
+    # reason names no evidence gap in ANY of the six checks - the file
+    # was fully understood, its routes fully composed (class + method
+    # level); this is a scope note about a DEPLOYMENT-level base path
+    # never composed in, not a fact this run failed to establish about
+    # anything.
+    "deployment_base_path_declared": frozenset(),
     # FIX ROUND 14 (tenth cold read, CR10-5 JUDGE, completeness): a
     # recognized-but-unsupported source language (worker.py) is exactly
     # "this file's content itself could not be confidently processed" -

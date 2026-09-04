@@ -244,6 +244,15 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     # scope, not wrong data - the cross-source check stays out of this
     # slice).
     "duplicate_route_target": "warning",
+    # MICRO-ROUND 48b (F2): an @ApplicationPath's own declared value,
+    # recorded once per occurrence - "warning" severity in problems.json
+    # (the same bucket every reason code in this table uses, per this
+    # module's own PROVISIONAL "all warning, pending a future
+    # distinction" judgment above), but NON-degrading via the same
+    # per-reason-code exception `duplicate_route_target` already has at
+    # its own worker.py conversion site - purely informational, never a
+    # sign anything was actually missed from this run.
+    "deployment_base_path_declared": "warning",
     # FIX ROUND 17 (thirteenth cold read, CR13-3 MAJOR, part (b) - THE
     # CLASS-CLOSER): a recognized-but-unsupported route-like annotation
     # (JAX-WS's own @WebMethod) - under-claimed evidence, the same
