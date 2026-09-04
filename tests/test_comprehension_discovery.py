@@ -824,6 +824,81 @@ def test_dot_prefixed_secret_literal_stays_excluded_even_inside_a_recognized_sou
         for p in result.problems)
 
 
+def test_dot_prefixed_secret_glob_match_stays_excluded_even_inside_a_recognized_source_root(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 4, m5 BLOCKER, wrong-data): round 49's own
+    dot-prefixed-literal check filtered to EXACT literals only (``*``/
+    ``?`` excluded from the derived set) - a name like ``.env.production``
+    is dot-prefixed (never a legal Java package segment, the identical
+    reasoning round 49 already established for a bare ``.env``) but only
+    matches the GLOB ``.env.*``, which that filter wrongly excluded
+    since every string ``.env.*`` can ever match is dot-prefixed by
+    construction (fnmatch's own leading ``.`` is a literal character,
+    never a wildcard). Reproduced pre-fix exactly as measured: admitted
+    via the source-root exemption instead of excluded unconditionally."""
+    env_dir = tmp_path / "src" / "main" / "resources" / ".env.production"
+    env_dir.mkdir(parents=True)
+    (env_dir / "secret.txt").write_bytes(b"DB_PASSWORD=hunter2\n")
+    (tmp_path / "src" / "main" / "java" / "p").mkdir(parents=True)
+    (tmp_path / "src" / "main" / "java" / "p" / "App.java").write_bytes(b"package p;\nclass App {}\n")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert "src/main/resources/.env.production/secret.txt" not in {
+        f.relative_path for f in result.files}
+    assert result.exclusions.get("secret", 0) == 1
+    assert not any(
+        p["reason_code"] == "secret_shaped_path_admitted_via_source_root_exemption"
+        for p in result.problems)
+
+
+def test_dot_prefixed_name_matching_a_non_dot_anchored_glob_stays_excluded(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 4, m5's own second gap): a directory
+    literally named ``.pem`` is dot-prefixed, but only matches the NON-
+    dot-anchored glob ``*.pem`` (via ``*`` matching the empty string -
+    fnmatch's own ordinary behavior) - the round-49 filter's own pattern-
+    shape reasoning missed this entirely, since ``*.pem`` itself does not
+    start with a literal dot even though it matches this dot-prefixed
+    name. Must still be excluded unconditionally, the identical
+    reasoning applied to WHICHEVER pattern happens to match, not to the
+    matching pattern's own spelling."""
+    pem_dir = tmp_path / "src" / "main" / "resources" / ".pem"
+    pem_dir.mkdir(parents=True)
+    (pem_dir / "key.bin").write_bytes(b"-----BEGIN PRIVATE KEY-----\n")
+    (tmp_path / "src" / "main" / "java" / "p").mkdir(parents=True)
+    (tmp_path / "src" / "main" / "java" / "p" / "App.java").write_bytes(b"package p;\nclass App {}\n")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert "src/main/resources/.pem/key.bin" not in {f.relative_path for f in result.files}
+    assert result.exclusions.get("secret", 0) == 1
+    assert not any(
+        p["reason_code"] == "secret_shaped_path_admitted_via_source_root_exemption"
+        for p in result.problems)
+
+
+def test_non_dot_prefixed_name_matching_a_glob_still_uses_the_source_root_exemption(
+    tmp_path: Path,
+) -> None:
+    """Control: the m5 fix must never widen past dot-prefixed names -
+    an ordinary, non-dot-prefixed secret-pattern match (e.g. a real
+    "id_rsa"-shaped name is exact-literal already covered elsewhere;
+    here a plain "credentials" directory) still gets the source-root
+    exemption exactly as round 48 established, unaffected by this
+    round's own fix."""
+    creds_dir = tmp_path / "src" / "main" / "java" / "com" / "ex" / "credentials"
+    creds_dir.mkdir(parents=True)
+    (creds_dir / "Handler.java").write_bytes(b"package com.ex.credentials;\nclass Handler {}\n")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert "src/main/java/com/ex/credentials/Handler.java" in {
+        f.relative_path for f in result.files}
+    assert any(
+        p["reason_code"] == "secret_shaped_path_admitted_via_source_root_exemption"
+        for p in result.problems)
+
+
 def test_enumerate_scope_a_secret_shaped_directory_hiding_code_poisons_externality(
     tmp_path: Path,
 ) -> None:
@@ -1813,6 +1888,65 @@ def test_whole_scope_fingerprint_changes_when_a_new_file_is_added(tmp_path: Path
     comp_dir = _comprehension_dir(tmp_path)
     before = discovery.enumerate_scope(tmp_path, comp_dir)
     (tmp_path / "b.txt").write_bytes(b"world")
+    after = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert before.whole_scope_fingerprint != after.whole_scope_fingerprint
+
+
+def test_whole_scope_fingerprint_changes_when_an_empty_admitted_directory_appears(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 4, M4 BLOCKER, wrong-data, .cr44p-emptya/
+    -emptyb/-fpx/-fpy): an admitted (non-excluded) directory that is
+    EMPTY contributes nothing to `files` (which names only files) -
+    before this fix, creating one changed NOTHING about the fingerprint,
+    with fingerprint_complete still true, even though the tree genuinely
+    changed. A future PR-C freshness check reading only the fingerprint
+    would have wrongly called the changed tree still current - the same
+    class of danger round 49's own C2 fix closed for a poison-status
+    flip, here for plain directory presence."""
+    (tmp_path / "a.txt").write_bytes(b"hello")
+    comp_dir = _comprehension_dir(tmp_path)
+    before = discovery.enumerate_scope(tmp_path, comp_dir)
+    (tmp_path / "empty_dir").mkdir()
+    after = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert before.whole_scope_fingerprint != after.whole_scope_fingerprint
+
+
+def test_whole_scope_fingerprint_changes_when_an_empty_admitted_directory_is_renamed(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 4, M4's own control): two DIFFERENT empty
+    directory trees (an empty dir named "a" vs one named "b") must not
+    fingerprint equal to each other - proves the fix records the
+    directory's own PATH, not merely "an empty directory exists
+    somewhere"."""
+    (tmp_path / "src.txt").write_bytes(b"hello")
+    comp_dir = _comprehension_dir(tmp_path)
+    (tmp_path / "empty_a").mkdir()
+    first = discovery.enumerate_scope(tmp_path, comp_dir)
+    (tmp_path / "empty_a").rmdir()
+    (tmp_path / "empty_b").mkdir()
+    second = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert first.whole_scope_fingerprint != second.whole_scope_fingerprint
+
+
+def test_whole_scope_fingerprint_is_unaffected_by_an_admitted_directorys_own_file_content(
+    tmp_path: Path,
+) -> None:
+    """Control: an admitted directory's own path joining the fingerprint
+    must never DOUBLE-COUNT a file already inside it - a plain content
+    change to a file inside an ordinary (non-empty) admitted directory
+    still changes the fingerprint via `files`' own content_digest exactly
+    as before this round, and adding `admitted_directories` does not
+    introduce a second, redundant sensitivity to the same fact via a
+    different path (this only matters for genuinely EMPTY directories,
+    the actual gap this round closes)."""
+    nested = tmp_path / "pkg"
+    nested.mkdir()
+    (nested / "a.txt").write_bytes(b"hello")
+    comp_dir = _comprehension_dir(tmp_path)
+    before = discovery.enumerate_scope(tmp_path, comp_dir)
+    (nested / "a.txt").write_bytes(b"world")
     after = discovery.enumerate_scope(tmp_path, comp_dir)
     assert before.whole_scope_fingerprint != after.whole_scope_fingerprint
 

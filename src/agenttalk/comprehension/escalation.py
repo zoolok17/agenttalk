@@ -131,9 +131,26 @@ def escalate_attended_action_required(
 def escalate_scan_lock_unrecoverable(
     store: Any, *, sender: str, error: ScanLockUnrecoverable,
 ) -> EscalationResult:
-    """One-call integration point for a caught :class:`ScanLockUnrecoverable`."""
+    """One-call integration point for a caught :class:`ScanLockUnrecoverable`.
+
+    MICRO-ROUND 50 (Cluster 4, m4 BLOCKER, wrong-data): ``reason`` used to
+    be ``error.detail`` alone - FIX ROUND 26 (lock.py's own
+    ``_classify_and_maybe_reclaim``) corrected the misleading GENERIC
+    "run --recover-stale-lock" remedy on the exception's own STRING
+    representation only (``str(error)``, which composes ``detail`` with
+    the call site's own real, per-case ``remedy=`` text) - ``.detail``
+    itself was never touched by that fix and still carries only the bare
+    fact (e.g. "scan.lock was recorded on a different host..."), with NO
+    remedy text at all. This durable, persisted escalation message (sent
+    to an operator, unlike a transient stderr print) inherited the SAME
+    generic implication round 26 already proved false for a cross-host
+    lock - its own body named only the hardcoded ``recover-stale-lock``
+    action with no case-specific caveat, exactly the shape round 26's
+    own reproducer showed does not help there. ``str(error)`` (the full,
+    remedy-inclusive text) is used now, so the durable record always
+    carries whatever specific remedy the raising call site attached."""
     return escalate_attended_action_required(
-        store, sender=sender, action=ACTION_RECOVER_STALE_LOCK, reason=error.detail,
+        store, sender=sender, action=ACTION_RECOVER_STALE_LOCK, reason=str(error),
     )
 
 

@@ -625,29 +625,43 @@ def _matches_any_secret_pattern(name: str) -> bool:
     )
 
 
-#: MICRO-ROUND 49 (forty-third cold read, C3, wrong-data): every EXACT-
-#: LITERAL (never a glob - ``*``/``?`` excluded) entry in
-#: ``_SECRET_FILE_PATTERNS`` that is itself dot-prefixed - derived, never
-#: hand-duplicated, so this can never drift from the pattern set it is
-#: computed from. A dot-prefixed name can NEVER be a legal Java package
-#: segment (a package identifier cannot start with ``.`` - the SAME fact
-#: ``_HARD_EXCLUDE_DIR_NAMES``'s own docstring already relies on for
-#: ``.git``/``.svn``), so round 48's own source-root exemption (below -
-#: "a domain package coincidentally named like the exclusion category" -
-#: real for ``credentials``, which IS a legal package segment) can never
-#: legitimately apply to one of these seven: a ``.env`` directory sitting
-#: under ``src/main/resources`` is exactly as much a secrets store as one
-#: at the repo root, never first-party source the exemption was built to
-#: protect.
-_DOT_PREFIXED_SECRET_LITERALS = frozenset(
-    pattern for pattern in _SECRET_FILE_PATTERNS
-    if pattern.startswith(".") and "*" not in pattern and "?" not in pattern
-)
-
-
+#: MICRO-ROUND 49 (forty-third cold read, C3, wrong-data): a dot-prefixed
+#: NAME can NEVER be a legal Java package segment (a package identifier
+#: cannot start with ``.`` - the SAME fact ``_HARD_EXCLUDE_DIR_NAMES``'s
+#: own docstring already relies on for ``.git``/``.svn``), so round 48's
+#: own source-root exemption (below - "a domain package coincidentally
+#: named like the exclusion category" - real for ``credentials``, which
+#: IS a legal package segment) can never legitimately apply to one: a
+#: ``.env`` directory sitting under ``src/main/resources`` is exactly as
+#: much a secrets store as one at the repo root, never first-party
+#: source the exemption was built to protect.
+#:
+#: MICRO-ROUND 50 (Cluster 4, m5 BLOCKER, wrong-data): the FIRST version
+#: of this check filtered `_SECRET_FILE_PATTERNS` down to exact literals
+#: only (``*``/``?`` excluded), reasoning "dot-prefixed AND not a glob" -
+#: but the invariant this function actually needs to prove is about the
+#: NAME being tested, not the shape of whichever pattern happens to
+#: match it. Two real, measured gaps that reasoning missed: a name like
+#: ``.env.production`` is dot-prefixed but only matches the GLOB
+#: ``.env.*`` (excluded by the old filter for containing ``*``, even
+#: though every string that glob can ever match is itself dot-prefixed
+#: by construction - the pattern's own leading ``.`` is a literal
+#: character in fnmatch syntax, never a wildcard); a name like ``.pem``
+#: is dot-prefixed but matches the NON-dot-anchored glob ``*.pem`` (via
+#: ``*`` matching the empty string - fnmatch's own ordinary behavior,
+#: not an edge case). Both used to fall through to the source-root-
+#: exempt path, admitted as if they could be a coincidental domain
+#: package - impossible for either, being dot-prefixed. Simplified to
+#: the actual invariant: ANY name starting with ``.`` that matches this
+#: producer's own secret pattern set AT ALL (literal or glob, regardless
+#: of which specific pattern matched or whether that pattern's own text
+#: happens to start with a dot) is unconditionally excluded - no second,
+#: derived pattern subset to keep in sync, and no wildcard-shaped blind
+#: spot left to rediscover a third time.
 def _matches_a_dot_prefixed_secret_literal(name: str) -> bool:
-    folded = name.casefold()
-    return any(folded == pattern.casefold() for pattern in _DOT_PREFIXED_SECRET_LITERALS)
+    if not name.startswith("."):
+        return False
+    return _matches_any_secret_pattern(name)
 
 
 #: FIX ROUND 37 (F2 BLOCKER, part 3 - the calibration rule): kept in
@@ -1087,14 +1101,15 @@ def _exclusion_category(name: str, relative_path: str, *, is_dir: bool) -> str |
         # resolving into it published a CONFIDENT third-party dependency
         # for what was actually unscanned first-party code.
         # MICRO-ROUND 49 (forty-third cold read, C3, wrong-data): the
-        # guard above is OVER-WIDE for the seven DOT-PREFIXED secret
-        # literals (see ``_DOT_PREFIXED_SECRET_LITERALS``'s own
-        # docstring) - a dot-prefixed name can never be a legal Java
-        # package segment, so the "coincidental domain package" reasoning
-        # this guard exists for never applies to one. Checked FIRST,
-        # unconditionally (no source-root exemption at all): a ``.env``
-        # directory is excluded EVERYWHERE, the same as ``.git``/``.svn``
-        # already are via ``_HARD_EXCLUDE_DIR_NAMES``.
+        # guard above is OVER-WIDE for a DOT-PREFIXED secret-shaped name
+        # (see ``_matches_a_dot_prefixed_secret_literal``'s own
+        # docstring, round 50's own m5 fix included) - a dot-prefixed
+        # name can never be a legal Java package segment, so the
+        # "coincidental domain package" reasoning this guard exists for
+        # never applies to one. Checked FIRST, unconditionally (no
+        # source-root exemption at all): a ``.env`` directory is
+        # excluded EVERYWHERE, the same as ``.git``/``.svn`` already are
+        # via ``_HARD_EXCLUDE_DIR_NAMES``.
         if _matches_a_dot_prefixed_secret_literal(name):
             return "secret"
         if _matches_any_secret_pattern(name) and not _is_inside_a_recognized_source_root(
@@ -1324,6 +1339,10 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
 
     files: list[EnumeratedFile] = []
     boundaries: list[BoundaryEntry] = []
+    # MICRO-ROUND 50 (Cluster 4, M4 BLOCKER, wrong-data): every ADMITTED
+    # (non-excluded) directory's own relative path - see the round-50 M4
+    # comment at `fingerprint_input`'s own construction, below, for why.
+    admitted_directories: list[str] = []
     exclusions: dict[str, int] = {}
     excluded_roots: list[dict[str, str]] = []
     problems: list[dict[str, str]] = []
@@ -1546,11 +1565,11 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                 # MICRO-ROUND 49 (forty-third cold read, C3, completeness
                 # - the visibility half): `category` is None here means
                 # this directory was NOT excluded - but a secret-shaped
-                # name (never one of the seven dot-prefixed literals,
-                # which are now excluded unconditionally above and can
-                # never reach this point) could still have been ADMITTED
-                # via the source-root exemption rather than genuinely
-                # not secret-shaped at all. Recorded, not silently
+                # name (never a dot-prefixed one, which is now excluded
+                # unconditionally above and can never reach this point -
+                # see round 50's own m5 fix) could still have been
+                # ADMITTED via the source-root exemption rather than
+                # genuinely not secret-shaped at all. Recorded, not silently
                 # walked as if this producer never noticed the name -
                 # the same "declared, not hidden" discipline every other
                 # judged exemption in this module already follows.
@@ -1574,6 +1593,7 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                     boundaries.append(
                         BoundaryEntry(relative_path=relative, boundary_kind="submodule"))
                     continue
+                admitted_directories.append(relative)
                 _walk(entry, depth + 1)
                 continue
             # A regular file.
@@ -1805,6 +1825,22 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
             "boundaries": sorted(
                 (b.relative_path, b.boundary_kind) for b in boundaries
             ),
+            # MICRO-ROUND 50 (Cluster 4, M4 BLOCKER, wrong-data,
+            # .cr44p-emptya/-emptyb/-fpx/-fpy): `files` above names only
+            # FILES - an ADMITTED (non-excluded) directory that is empty,
+            # or contains only further empty subdirectories, contributed
+            # NOTHING to `fingerprint_input` at all before this fix. Two
+            # trees differing ONLY by such a directory's presence (an
+            # empty `foo/` created, or renamed to `bar/`) published the
+            # IDENTICAL whole_scope_fingerprint with fingerprint_complete:
+            # true - a real structural difference a future PR-C freshness
+            # check would have wrongly called "still current" (the
+            # identical class of danger round 49's own C2 fix closed for
+            # a poison-status flip, applied here to plain directory
+            # presence). Every admitted directory's own relative path
+            # now joins the fingerprint directly - the leanest fix that
+            # actually closes the gap, not a wider declared caveat.
+            "admitted_directories": sorted(admitted_directories),
             "exclusions": dict(sorted(exclusions.items())),
             "non_hard_excluded": sorted(
                 (entry["path"], entry["category"], entry.get("content_digest"))

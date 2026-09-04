@@ -583,6 +583,46 @@ def test_dependencies_only_omits_the_other_sections():
     assert payload["dependency_summary"]["external"] == 1
 
 
+def test_dependencies_only_omitted_counts_never_names_an_absent_section():
+    """MICRO-ROUND 50 (Cluster 4, m3 BLOCKER, wrong-data, .cr44j-big):
+    omitted_counts used to name "units"/"features"/"entry_points"/
+    "readiness_signals"/"readiness_summaries" - and report a real-
+    looking number for each - even in dependencies_only mode, where the
+    payload never adds any of those five sections at all. A caller
+    reading a nonzero (or zero) count for a section that plain does not
+    exist in the response gets a number true of neither reading. None of
+    the five keys may appear when dependencies_only is set; the ones
+    that DO exist (units_without_feature, high_fan_out_units, ...) -
+    themselves published unconditionally, dependencies_only or not -
+    must still appear."""
+    edges = [_edge("e1", "u1", resolution_state="resolved", target_external="java.util.List")]
+    payload = pr.project_comprehension(**_base_kwargs(dependencies=edges, dependencies_only=True))
+    absent_section_keys = {
+        "units", "features", "entry_points", "readiness_signals", "readiness_summaries",
+    }
+    assert absent_section_keys.isdisjoint(payload["omitted_counts"])
+    for key in ("dependencies", "problems", "units_without_feature",
+                "units_with_unknown_feature_linkage", "unmapped_entry_points",
+                "high_fan_out_units", "high_fan_in_units"):
+        assert key in payload["omitted_counts"]
+
+
+def test_dependencies_only_still_names_omitted_counts_for_published_sections(monkeypatch):
+    """Control: the fix above must never suppress omitted_counts for a
+    section this response genuinely publishes and genuinely truncates -
+    dependencies_only still names "dependencies" and still counts a real
+    truncation there."""
+    monkeypatch.setattr(pr, "_MAX_ROWS_PER_SECTION", 1)
+    edges = [
+        _edge(f"e{i}", "u1", resolution_state="resolved", target_external=f"java.util.List{i}")
+        for i in range(3)
+    ]
+    payload = pr.project_comprehension(
+        **_base_kwargs(dependencies=edges, dependencies_only=True))
+    assert payload["omitted_counts"]["dependencies"] == 2
+    assert payload["truncated"] is True
+
+
 # ----------------------------------------------------------- coverage-gap fields
 
 def test_units_without_feature_lists_unlinked_units():

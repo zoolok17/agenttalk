@@ -710,26 +710,37 @@ def project_comprehension(
         "units_with_unknown_feature_linkage": units_with_unknown_feature_linkage_rows,
         "unmapped_entry_points": unmapped_entry_points_rows,
         "problems": problem_rows,
-        "truncated": bool(
-            units_omitted or dependency_omitted or problem_omitted
-            or feature_omitted or entry_point_omitted
-            or readiness_signal_omitted or readiness_summary_omitted
-            or units_without_feature_omitted or units_with_unknown_feature_linkage_omitted
-            or unmapped_entry_points_omitted
-            or high_fan_out_omitted or high_fan_in_omitted
-        ),
-        "omitted_counts": {
-            "units": units_omitted, "dependencies": dependency_omitted, "problems": problem_omitted,
-            "features": feature_omitted, "entry_points": entry_point_omitted,
-            "readiness_signals": readiness_signal_omitted,
-            "readiness_summaries": readiness_summary_omitted,
-            "units_without_feature": units_without_feature_omitted,
-            "units_with_unknown_feature_linkage": units_with_unknown_feature_linkage_omitted,
-            "unmapped_entry_points": unmapped_entry_points_omitted,
-            "high_fan_out_units": high_fan_out_omitted,
-            "high_fan_in_units": high_fan_in_omitted,
-        },
     }
+
+    # MICRO-ROUND 50 (Cluster 4, m3 BLOCKER, wrong-data, .cr44j-big): when
+    # `dependencies_only` is set, the payload below never adds "units"/
+    # "features"/"entry_points"/"readiness" at all - but `omitted_counts`
+    # (and the `truncated` flag it feeds) used to name those five
+    # dimensions and report a real-looking number for each UNCONDITIONALLY,
+    # computed from row lists this response never actually returns. That
+    # number is true of NEITHER reading a caller could give it: not "0
+    # omitted, everything shown" (nothing of that section is shown at all,
+    # so "omitted" does not even apply), and not "N rows omitted from the
+    # section below" (there is no section below to have omitted anything
+    # FROM). Excluded from both `omitted_counts` and the `truncated`
+    # aggregation below whenever the section itself is absent - the
+    # accounting now matches the payload's own actual shape exactly.
+    omitted_counts: dict[str, int] = {
+        "dependencies": dependency_omitted, "problems": problem_omitted,
+        "units_without_feature": units_without_feature_omitted,
+        "units_with_unknown_feature_linkage": units_with_unknown_feature_linkage_omitted,
+        "unmapped_entry_points": unmapped_entry_points_omitted,
+        "high_fan_out_units": high_fan_out_omitted,
+        "high_fan_in_units": high_fan_in_omitted,
+    }
+    if not dependencies_only:
+        omitted_counts["units"] = units_omitted
+        omitted_counts["features"] = feature_omitted
+        omitted_counts["entry_points"] = entry_point_omitted
+        omitted_counts["readiness_signals"] = readiness_signal_omitted
+        omitted_counts["readiness_summaries"] = readiness_summary_omitted
+    payload["truncated"] = bool(any(omitted_counts.values()))
+    payload["omitted_counts"] = omitted_counts
 
     if not dependencies_only:
         payload["units"] = units_rows
