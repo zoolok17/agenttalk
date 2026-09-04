@@ -558,6 +558,33 @@ def test_an_escaped_newline_records_a_structural_unicode_escape_problem():
     assert any(p.reason_code == "source_uses_structural_unicode_escapes" for p in result.problems)
 
 
+def test_a_unicode_escaped_backslash_before_a_quote_records_a_structural_unicode_escape_problem():
+    """MICRO-ROUND 49b (F2 MAJOR, reviewer-3's own javac-verified proof):
+    \\u005c decodes to a literal backslash - immediately before a real
+    quote, the decoded pair \\" is JLS 3.10.6's own escaped-quote
+    sequence (a real compiler reads the string/char literal as
+    CONTINUING past it, to a later real closing quote), while this
+    adapter's own sanitizer sees six ordinary raw characters followed
+    by an unescaped quote and closes the literal right there - the two
+    disagree about where the literal ends, the same class of risk the
+    other five structural characters already cover, smuggled via the
+    ESCAPE MECHANISM itself. Reviewer verified with javac 1.8: legal,
+    compiles to two real classes. The backslash itself was missing from
+    the closed set - reproduced pre-fix exactly as reported (silent,
+    the judge trusting its own wrong reading)."""
+    backslash = chr(92)
+    quote = chr(34)
+    src = (
+        "package p;\n"
+        "public class Real {\n"
+        "  String s = " + quote + "abc" + backslash + "u005c" + quote + ";\n"
+        "  void m() {}\n"
+        "}\n"
+    )
+    result = java.parse_java_source("Real.java", src)
+    assert any(p.reason_code == "source_uses_structural_unicode_escapes" for p in result.problems)
+
+
 def test_an_ordinary_unicode_escape_never_flags_a_structural_problem():
     """Control: a harmless \\uXXXX escape that decodes to an ORDINARY
     character (a plain letter, no lexical significance) must never be

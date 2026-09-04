@@ -348,6 +348,7 @@ def _excluded_directory_contains_a_code_bearing_file(directory: Path) -> tuple[b
                         directory).as_posix()
                     if _sits_under_a_recognized_generated_output_position(
                         relative_to_excluded_root,
+                        is_java_source=entry.name.lower().endswith(".java"),
                     ):
                         continue
                     return True, False
@@ -377,29 +378,51 @@ def _excluded_directory_contains_a_code_bearing_file(directory: Path) -> tuple[b
 #: that shape - it still fires independently whenever a pom's own
 #: declared ``<module>`` path resolves into the excluded region,
 #: regardless of what this peek alone concluded.
-#: MICRO-ROUND 49 (forty-third cold read, C1, wrong-data): the four
-#: positions above only ever cover build-tool-GENERATED SOURCE (a real
-#: .java the build tool itself wrote) - the round-21 comment's own
-#: stated goal ("any compiled repo at all") is measurably narrower than
-#: the shape it names: a ``target/classes/`` (Maven) or ``build/
-#: classes/``/``build/resources/`` (Gradle) tree holds COPIED, not
-#: generated, resources (``.sql``/``.jsp``/etc. copied byte-identical
-#: from ``src/main/resources`` by the build's own resource-processing
-#: step) - not covered by any position above, so the SINGLE MOST
-#: ORDINARY repo state (anyone who ran a build before committing, or
-#: checked in a ``target/``/``build/`` directory) poisoned externality
-#: resolution for a resource shape with no code-generation angle at
-#: all. Extended to the compiled-output positions BOTH major build
-#: tools name unambiguously: Maven's own ``classes/``/``test-classes/``
-#: (a single compiled+resource-copy tree, no separate resources
-#: position), Gradle's own ``resources/``/``test-resources/`` (kept
-#: separate from its own ``classes/``). Same narrow-by-construction
-#: guard as the four positions above (never a coincidental domain
-#: package - a package would need to be positioned EXACTLY at ``target/
-#: classes/...``/``build/resources/...``, the build tool's own output
-#: root, to collide, not merely share a name somewhere else in the
-#: tree).
+#: MICRO-ROUND 49 (forty-third cold read, C1, wrong-data): the round-21
+#: comment's own stated goal ("any compiled repo at all") is measurably
+#: narrower than the shape it names - a ``target/classes/`` (Maven) or
+#: ``build/classes/``/``build/resources/`` (Gradle) tree holds COPIED,
+#: not generated, resources (``.sql``/``.jsp``/etc. copied byte-
+#: identical from ``src/main/resources`` by the build's own resource-
+#: processing step) - not covered by the generated-SOURCE positions
+#: below, so the SINGLE MOST ORDINARY repo state (anyone who ran a
+#: build before committing) poisoned externality resolution for a
+#: resource shape with no code-generation angle at all.
 #:
+#: MICRO-ROUND 49b (BLOCKER, reviewer-3's own two-SHA repro - a
+#: regression THIS round introduced): the first version of this fix
+#: exempted these positions the SAME way as generated-SOURCE (any
+#: ``_DEGRADABLE_EXCLUDED_EXTENSIONS`` match, ``.java`` included) - but
+#: unlike ``generated-sources/``, a build never legitimately COPIES
+#: ``.java`` into ``classes/``/``resources/`` (only compiles it away
+#: entirely, or copies non-source resources) - a real, first-party
+#: class existing ONLY under ``target/classes/`` (no ``src/`` copy at
+#: all - e.g. a `.java` file placed there directly, or a decompiled/
+#: hand-added one) is exactly the "vendored/stray real code" shape the
+#: poison rule exists to catch, and the first version wrongly exempted
+#: it too, publishing a genuine first-party class as a confidently-
+#: RESOLVED EXTERNAL dependency. Narrowed to KEY (a), the reviewer's own
+#: two offered options: on WHAT THE PEEK FOUND, not merely WHERE - these
+#: four positions exempt only a NON-``.java`` extension (the resource-
+#: copy shapes this fix actually targets); a ``.java`` found here still
+#: poisons, identically to one found anywhere else in the excluded
+#: region, matching the ORIGINAL four generated-SOURCE positions' own
+#: unconditional exemption not at all (chosen over key (b), digest-
+#: deduplication against the already-inventoried registry: heavier
+#: machinery for the identical outcome here - a first-party-only
+#: ``.java`` has no inventoried duplicate to match regardless, so it
+#: would poison under EITHER key; key (a) reaches the same correct
+#: answer with a one-line, already-available check).
+_RECOGNIZED_GENERATED_SOURCE_POSITIONS = (
+    "generated-sources/", "generated-test-sources/", "generated/",
+)
+#: MICRO-ROUND 49b: resource-copy positions ONLY - see the docstring
+#: above for why ``.java`` is deliberately excluded from this tier's own
+#: exemption (checked by the caller, `_excluded_directory_contains_a_
+#: code_bearing_file`, not baked into this tuple itself).
+_RECOGNIZED_BUILD_OUTPUT_RESOURCE_POSITIONS = (
+    "classes/", "test-classes/", "resources/", "test-resources/",
+)
 #: NAMED RESIDUAL, not silently dropped: an EXPLODED WAR shape
 #: (``target/<artifactId>-<version>/WEB-INF/classes/``) is NOT covered -
 #: the artifact-id/version segment is per-project, dynamic, and this
@@ -409,14 +432,34 @@ def _excluded_directory_contains_a_code_bearing_file(directory: Path) -> tuple[b
 #: ``WEB-INF/classes/`` still counts as poisoning evidence today -
 #: correctly conservative (never masking a genuinely misplaced real
 #: file), left for a future round if measured as a real, common gap.
-_RECOGNIZED_GENERATED_OUTPUT_POSITIONS = (
-    "generated-sources/", "generated-test-sources/", "generated/",
-    "classes/", "test-classes/", "resources/", "test-resources/",
-)
-
-
-def _sits_under_a_recognized_generated_output_position(relative_to_excluded_root: str) -> bool:
-    return relative_to_excluded_root.startswith(_RECOGNIZED_GENERATED_OUTPUT_POSITIONS)
+#:
+#: ALSO NAMED (reviewer-3's own pre-existing find, present at BOTH
+#: 65ab95c and this round's own tips - NOT a defect this round
+#: introduced): ``target/generated-sources/annotations`` - the exact,
+#: extremely common Maven annotation-processor output directory - is
+#: silently UNINVENTORIED the same way every other excluded position
+#: is; this producer has never modeled "trust build-tool-generated
+#: source as if it were first-party" (a materially different, larger
+#: feature than the poison rule's own "don't falsely blame this content
+#: for an unrelated registry miss" scope). Filed as a follow-up, not
+#: fixed here.
+def _sits_under_a_recognized_generated_output_position(
+    relative_to_excluded_root: str, *, is_java_source: bool,
+) -> bool:
+    """MICRO-ROUND 49b (BLOCKER fix - see ``_RECOGNIZED_BUILD_OUTPUT_
+    RESOURCE_POSITIONS``'s own docstring): a generated-SOURCE position
+    exempts any code-bearing extension unconditionally (that IS what a
+    build tool legitimately writes there); a build-output RESOURCE
+    position exempts every extension EXCEPT ``.java`` - a real ``.java``
+    file is never a legitimate resource copy, so one found here is
+    exactly the "vendored/stray real code" shape the poison rule exists
+    to catch, identically to one found anywhere else in the excluded
+    region."""
+    if relative_to_excluded_root.startswith(_RECOGNIZED_GENERATED_SOURCE_POSITIONS):
+        return True
+    return not is_java_source and relative_to_excluded_root.startswith(
+        _RECOGNIZED_BUILD_OUTPUT_RESOURCE_POSITIONS,
+    )
 
 
 #: FIX ROUND 32 (twenty-eighth cold read, F5 MAJOR, completeness): widened

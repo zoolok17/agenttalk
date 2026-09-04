@@ -451,6 +451,44 @@ _READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
     # future cold read - at which point that entry becomes live and its
     # share of this comment should be deleted.
     "secret_pattern_matched_code_bearing_file": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
+    # MICRO-ROUND 49b (F3, settle - reviewer-3's own round-48-KeyError-
+    # class hunt): a SECOND, structurally DIFFERENT dead-entry family
+    # from the one above - not "never added to discovery.files" (these
+    # units are constructed completely normally), but "this reason's
+    # only emitter attributes it to a SYNTHETIC, fabricated qualified_
+    # name that can never match any REAL unit's own qualified_name."
+    # Each of these five web.xml/modules-identity reasons anchors itself
+    # to a made-up marker string specifically so it never gets
+    # broadcast file-wide either (only a bare `qualified_name=None`
+    # problem does that, per `worker_problem_reasons_by_path`'s own
+    # `None`-gated construction in scan_pipeline.py) - `duplicate_
+    # descriptor_name`/`descriptor_name_without_class`/`undeclared_
+    # descriptor_name` anchor to `f"{relative_path}#{name}"`;
+    # `duplicate_route_target` anchors to `f"{relative_path}#duplicate_
+    # route_target#{url_pattern}"` (both by DESIGN, per their own
+    # emission-site comments: "there are two real owners involved and
+    # no single one to anchor to... a real qualified_name here would
+    # broadcast this reason file-wide"). `duplicate_qualified_name`
+    # never even reaches `adapter_problem_reasons` at all - it is
+    # published exclusively via `ModuleRecord.conflict_kind`/
+    # `conflict_id`, a wholly separate field this module's own conflict-
+    # override loop (below) consults directly, never through this
+    # table. PROVEN, not merely argued: constructed all five reproducer
+    # shapes end to end and measured `modules.json`'s own units for a
+    # match - zero, for every one, confirming none can ever be consulted
+    # by a real unit today. Mapped to the SAME narrower entry_points_
+    # mapped/feature_linked destination `route_annotation_unassociated`/
+    # `route_value_unrecoverable` above already use (the closest live
+    # analogue for what each WOULD mean if a future round ever
+    # synthesizes a real attribution path for one) - never actually
+    # looked up in practice, retained for the case where that stops
+    # being true, the same "declared, not fixed, until it needs to be"
+    # discipline the family above already established.
+    "duplicate_descriptor_name": frozenset({"entry_points_mapped", "feature_linked"}),
+    "descriptor_name_without_class": frozenset({"entry_points_mapped", "feature_linked"}),
+    "undeclared_descriptor_name": frozenset({"entry_points_mapped", "feature_linked"}),
+    "duplicate_route_target": frozenset({"entry_points_mapped", "feature_linked"}),
+    "duplicate_qualified_name": frozenset({"entry_points_mapped", "feature_linked"}),
     "no_types_extracted": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
     # FIX ROUND 20 (sixteenth cold read, M3 MAJOR, wrong-data): these
     # two used to feed NOTHING at all - round 13c's own scoping (away

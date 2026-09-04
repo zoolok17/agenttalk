@@ -4024,6 +4024,97 @@ def test_path_excluded_is_confirmed_reachable_on_a_real_unit(java_repo: Path, mo
     assert "path_excluded" in matching[0]["adapter_problem_reasons"]
 
 
+def _assert_reason_never_attaches_to_a_real_unit(outcome, reason_code: str) -> None:
+    import json
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    assert any(p["reason_code"] == reason_code for p in problems_doc["problems"])
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    assert not any(
+        reason_code in record.get("adapter_problem_reasons", []) for record in modules_doc["units"])
+
+
+def test_duplicate_descriptor_name_never_attaches_to_a_real_unit(java_repo: Path) -> None:
+    """MICRO-ROUND 49b (F3, settle - reviewer-3's own round-48-KeyError-
+    class hunt): duplicate_descriptor_name anchors its own problem to a
+    SYNTHETIC qualified_name (f"{relative_path}#{name}") by design (two
+    real owners, no single one to anchor to) - never a real unit's own
+    qualified_name, never None (which would broadcast file-wide instead).
+    Proven, not merely argued: constructed the exact reproducer and
+    measured modules.json's own units for a match - zero."""
+    (java_repo / "WEB-INF").mkdir(parents=True, exist_ok=True)
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet><servlet-name>s1</servlet-name><servlet-class>com.acme.A</servlet-class></servlet>\n"
+        "  <servlet><servlet-name>s1</servlet-name><servlet-class>com.acme.B</servlet-class></servlet>\n"
+        "</web-app>\n",
+        encoding="utf-8")
+    outcome = scan_pipeline.run_scan(java_repo)
+    _assert_reason_never_attaches_to_a_real_unit(outcome, "duplicate_descriptor_name")
+
+
+def test_duplicate_route_target_never_attaches_to_a_real_unit(java_repo: Path) -> None:
+    """MICRO-ROUND 49b (F3's own duplicate_route_target twin): anchors to
+    f"{relative_path}#duplicate_route_target#{url_pattern}" by design -
+    the identical "two real owners, no single anchor" shape."""
+    (java_repo / "WEB-INF").mkdir(parents=True, exist_ok=True)
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet-mapping><servlet-name>a</servlet-name><url-pattern>/x</url-pattern></servlet-mapping>\n"
+        "  <servlet-mapping><servlet-name>b</servlet-name><url-pattern>/x</url-pattern></servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8")
+    outcome = scan_pipeline.run_scan(java_repo)
+    _assert_reason_never_attaches_to_a_real_unit(outcome, "duplicate_route_target")
+
+
+def test_descriptor_name_without_class_never_attaches_to_a_real_unit(java_repo: Path) -> None:
+    """MICRO-ROUND 49b (F3's own descriptor_name_without_class twin): a
+    <servlet> declaring a name but backed by neither a usable class nor
+    a <jsp-file> - anchors to f"{relative_path}#{name}", the same
+    synthetic-marker shape."""
+    (java_repo / "WEB-INF").mkdir(parents=True, exist_ok=True)
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet><servlet-name>s1</servlet-name></servlet>\n"
+        "</web-app>\n",
+        encoding="utf-8")
+    outcome = scan_pipeline.run_scan(java_repo)
+    _assert_reason_never_attaches_to_a_real_unit(outcome, "descriptor_name_without_class")
+
+
+def test_undeclared_descriptor_name_never_attaches_to_a_real_unit(java_repo: Path) -> None:
+    """MICRO-ROUND 49b (F3's own undeclared_descriptor_name twin): a
+    <servlet-mapping> naming a servlet declared nowhere at all - anchors
+    to f"{relative_path}#{name}", the same synthetic-marker shape."""
+    (java_repo / "WEB-INF").mkdir(parents=True, exist_ok=True)
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet-mapping><servlet-name>ghost</servlet-name><url-pattern>/g</url-pattern></servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8")
+    outcome = scan_pipeline.run_scan(java_repo)
+    _assert_reason_never_attaches_to_a_real_unit(outcome, "undeclared_descriptor_name")
+
+
+def test_duplicate_qualified_name_never_attaches_via_adapter_problem_reasons(java_repo: Path) -> None:
+    """MICRO-ROUND 49b (F3's own duplicate_qualified_name settlement -
+    structurally DIFFERENT from its four siblings above): this reason
+    never even reaches adapter_problem_reasons at all - it is published
+    exclusively via ModuleRecord's own conflict_kind/conflict_id fields,
+    which readiness_artifact.py's own conflict-override loop consults
+    directly, never through _READINESS_CHECKS_BY_REASON_CODE. Two
+    files declaring the identical fully-qualified name is the real
+    reproducer; the readiness signal still correctly reports unknown -
+    via conflict_kind, not a table lookup on this string."""
+    (java_repo / "src" / "main" / "java" / "p" / "Dup1.java").write_text(
+        "package p;\nclass Widget {}\n", encoding="utf-8")
+    (java_repo / "src" / "main" / "java" / "p" / "Dup2.java").write_text(
+        "package p;\nclass Widget {}\n", encoding="utf-8")
+    outcome = scan_pipeline.run_scan(java_repo)
+    _assert_reason_never_attaches_to_a_real_unit(outcome, "duplicate_qualified_name")
+
+
 def test_run_scan_a_genuinely_degrading_discovery_problem_still_degrades(
     java_repo: Path, monkeypatch,
 ) -> None:
@@ -9378,6 +9469,74 @@ def test_run_scan_a_built_checkouts_target_classes_keeps_confident_externals(
     scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
     assert scan_doc["externality_suppressed"] is False
     assert scan_doc["externality_suppressed_roots"] == []
+
+
+def test_run_scan_a_first_party_class_only_under_target_classes_still_poisons(
+    java_repo: Path,
+) -> None:
+    """MICRO-ROUND 49b (BLOCKER, reviewer-3's own two-SHA repro, end to
+    end): the exact fixture the reviewer used to block the gate - src
+    imports gen.Mapper; gen/Mapper.java lives SOLELY under target/
+    classes/ (no src/ copy at all). The first version of the C1 fix
+    published this as a confidently-RESOLVED EXTERNAL dependency on
+    complete/0 - the same repo state at 65ab95c (before C1) was honest
+    (unresolved + externality_suppressed + degraded), so this was a
+    genuine regression, not merely an unfixed gap. Reproduced pre-fix
+    exactly as reported."""
+    import json
+
+    classes_dir = java_repo / "target" / "classes" / "gen"
+    classes_dir.mkdir(parents=True)
+    (classes_dir / "Mapper.java").write_text(
+        "package gen;\nclass Mapper {}\n", encoding="utf-8")
+    (java_repo / "src" / "main" / "java" / "p" / "Consumer.java").write_text(
+        "package p;\nimport gen.Mapper;\nclass Consumer {}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    import_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "import" and r.get("target_unresolved") == "gen.Mapper")
+    assert import_edge["resolution_state"] == "unresolved"
+    assert import_edge.get("target_external") is None
+
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["externality_suppressed"] is True
+    assert any(r["path"] == "target" for r in scan_doc["externality_suppressed_roots"])
+
+
+def test_run_scan_a_java_copy_of_an_already_inventoried_class_under_target_classes_still_poisons(
+    java_repo: Path,
+) -> None:
+    """MICRO-ROUND 49b (F1's own key-(a)-vs-key-(b) control): a .java
+    file under target/classes/ that happens to be a byte-for-byte COPY
+    of an already-inventoried src/ file. Key (a) (this producer's own
+    chosen fix - exempt by EXTENSION, never .java, regardless of
+    content) still poisons this shape, deliberately: distinguishing
+    "a copy of something real" from "a first-party class with no other
+    home" would need key (b)'s own digest-deduplication machinery this
+    round did not build - key (a) is conservatively correct (never
+    masks a genuinely misplaced real file) at the cost of this one
+    provably-harmless shape also poisoning. Named, not silently
+    assumed: if a future round measures this as a real, common false
+    positive, key (b) is the documented alternative."""
+    import json
+
+    src_content = "package p;\nclass Widget {}\n"
+    (java_repo / "src" / "main" / "java" / "p").mkdir(parents=True, exist_ok=True)
+    (java_repo / "src" / "main" / "java" / "p" / "Widget.java").write_text(
+        src_content, encoding="utf-8")
+    classes_dir = java_repo / "target" / "classes" / "p"
+    classes_dir.mkdir(parents=True)
+    (classes_dir / "Widget.java").write_text(src_content, encoding="utf-8")
+    (java_repo / "src" / "main" / "java" / "p" / "Consumer.java").write_text(
+        "package p;\nimport some.external.Thing;\nclass Consumer {}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["externality_suppressed"] is True
 
 
 def test_run_scan_an_import_into_an_excluded_generated_dir_is_unresolved_not_deleted(

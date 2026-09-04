@@ -1992,7 +1992,25 @@ _JAVA_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
 #: about (a `\t`/`\b`/`\f`-decoding escape changes no lexical BOUNDARY
 #: this adapter's own sanitizer looks for) - narrower than "any escape,"
 #: precisely the shapes that matter.
-_STRUCTURAL_UNICODE_ESCAPE_CHARS = frozenset({"/", "*", '"', "\n", "\r"})
+#:
+#: MICRO-ROUND 49b (MAJOR, reviewer-3's own javac-verified proof): this
+#: set's own closure claim ("precisely the shapes that matter") was
+#: FALSE - missing the backslash itself. `\` decodes to a literal
+#: `\` - immediately BEFORE a real, literal `"` in source, the decoded
+#: pair `\"` is JLS 3.10.6's own escaped-quote sequence: a real compiler
+#: reads it as ESCAPING that quote (the string/char literal continues
+#: past it), while this adapter's own sanitizer sees the six raw source
+#: characters `\` followed by an ordinary, unescaped `"` and reads
+#: THAT quote as a real delimiter - the two disagree about where the
+#: literal ends, the identical class of risk the other five members
+#: already cover, just smuggled via the ESCAPE MECHANISM itself rather
+#: than the character it produces. Reviewer verified with javac 1.8:
+#: legal, compiles to two real classes. Added as the sixth, and genuinely
+#: final, member - a decoded backslash changes what the NEXT character
+#: means (an escape-introducer), exactly as it does when written
+#: literally; nothing else in JLS 3.10.6/3.10.7's own escape grammar
+#: shares that property, so the set is closed again, this time for real.
+_STRUCTURAL_UNICODE_ESCAPE_CHARS = frozenset({"/", "*", '"', "\n", "\r", "\\"})
 
 
 def _structural_unicode_escape_detected(text: str) -> bool:

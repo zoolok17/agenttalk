@@ -288,6 +288,32 @@ def test_enumerate_scope_a_built_checkouts_target_classes_stays_silent(
     assert result.poisoning_excluded_roots == []
 
 
+def test_enumerate_scope_a_first_party_java_only_under_target_classes_still_poisons(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 49b (BLOCKER, reviewer-3's own two-SHA repro - a
+    regression the C1 fix above introduced): the first version of the
+    C1 fix exempted target/classes/ the SAME way as generated-sources/
+    (any code-bearing extension, .java included) - but a build never
+    legitimately COPIES .java into classes/ (only compiles it away
+    entirely). A real, first-party class existing ONLY under target/
+    classes/ (no src/ copy at all) is exactly the vendored/stray-real-
+    code shape the poison rule exists to catch, and the first version
+    wrongly exempted it too. Reproduced pre-fix exactly as reported:
+    poisoning_excluded_roots was empty, must be non-empty again."""
+    classes_dir = tmp_path / "target" / "classes" / "gen"
+    classes_dir.mkdir(parents=True)
+    (classes_dir / "Mapper.java").write_text(
+        "package gen;\nclass Mapper {}\n", encoding="utf-8")
+    comp_dir = _comprehension_dir(tmp_path)
+
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+
+    assert not any(f.relative_path.endswith("Mapper.java") for f in result.files)
+    assert result.excluded_region_may_contain_target is True
+    assert any(r["path"] == "target" for r in result.poisoning_excluded_roots)
+
+
 def test_enumerate_scope_a_code_bearing_file_outside_the_generated_position_still_poisons(
     tmp_path: Path,
 ) -> None:
