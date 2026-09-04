@@ -13,13 +13,14 @@ from agenttalk.comprehension.modules_artifact import ModuleRecord
 
 
 def _unit(
-    unit_id: str, *, language: str = "java", classification: str = "production",
+    unit_id: str, *, language: str = "java", classification: str | list[str] = "production",
     adapter_problem_reason: str | None = None, adapter_problem_reasons: list[str] | None = None,
     container_unit_id: str | None = None,
 ) -> ModuleRecord:
     return ModuleRecord(
         unit_id=unit_id, kind="component", display_name=unit_id, language=language,
-        paths=[f"{unit_id}.java"], source_digests={}, classification=[classification],
+        paths=[f"{unit_id}.java"], source_digests={},
+        classification=[classification] if isinstance(classification, str) else classification,
         container_unit_id=container_unit_id, producers=[],
         adapter_problem_reason=adapter_problem_reason,
         adapter_problem_reasons=adapter_problem_reasons or [],
@@ -825,6 +826,45 @@ def test_test_evidence_located_not_applicable_for_a_test_classified_unit():
     PRODUCTION unit a test pairs to, never the test class's own record."""
     signals, _ = ra.build_readiness([_unit("u1", classification="test")], [], [])
     assert _signal_by_check(signals, "test_evidence_located").stored_status == "not_applicable"
+
+
+def test_test_evidence_located_gets_a_real_verdict_for_a_mixed_production_and_test_unit(
+) -> None:
+    """FIX ROUND 48 (forty-second cold read, F3 MAJOR, wrong-data, .cr42-
+    mixedcls): round 44's own classification union fix means a file
+    declaring BOTH a production and a test type publishes classification
+    ['production', 'test'] - the OLD bare membership test (`"test" in
+    unit.classification`) was TRUE for this mixed unit exactly as it is
+    for a pure-test one, publishing a blanket not_applicable/unit_is_
+    itself_a_test for real, colocated production code that genuinely
+    needs a real verdict. Narrowed to EXCLUSIVE membership - a mixed
+    unit now falls through to the SAME evidence-based evaluation an
+    ordinary production unit gets (no test-relation edge here, so
+    unknown/no_test_evidence_found - never the blanket exemption)."""
+    signals, _ = ra.build_readiness([_unit("u1", classification=["production", "test"])], [], [])
+    signal = _signal_by_check(signals, "test_evidence_located")
+    assert signal.stored_status != "not_applicable"
+    assert signal.reason_code != "unit_is_itself_a_test"
+
+
+def test_test_evidence_located_pure_test_control_stays_not_applicable() -> None:
+    """Control: a PURE test unit (classification == {"test"} exactly, the
+    shape the exemption actually targets) must keep its own
+    not_applicable/unit_is_itself_a_test verdict unchanged - proving the
+    narrowed exclusive-membership check does not overreact."""
+    signals, _ = ra.build_readiness([_unit("u1", classification=["test"])], [], [])
+    signal = _signal_by_check(signals, "test_evidence_located")
+    assert signal.stored_status == "not_applicable"
+    assert signal.reason_code == "unit_is_itself_a_test"
+
+
+def test_test_evidence_located_pure_production_control_is_unaffected() -> None:
+    """Control: an ordinary, single-classified production unit's own
+    verdict is unaffected by the narrowed check."""
+    signals, _ = ra.build_readiness([_unit("u1", classification="production")], [], [])
+    signal = _signal_by_check(signals, "test_evidence_located")
+    assert signal.stored_status != "not_applicable"
+    assert signal.reason_code != "unit_is_itself_a_test"
 
 
 def test_test_evidence_located_satisfied_when_targeted_by_a_declared_or_extracted_test_edge():

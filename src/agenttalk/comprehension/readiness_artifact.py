@@ -998,9 +998,36 @@ def _check_test_evidence_located(
     # check about ITSELF, which is meaningless - "test evidence located"
     # asks whether a PRODUCTION unit has a test pairing with it; a test
     # class is not a production unit that could ever need one. Never
-    # applicable to a test unit's own record; only a production unit
-    # actually targeted by a "test" relation edge satisfies it.
-    if "test" in unit.classification:
+    # applicable to a PURE test unit's own record; only a production
+    # unit actually targeted by a "test" relation edge satisfies it.
+    #
+    # FIX ROUND 48 (forty-second cold read, F3 MAJOR, wrong-data - the
+    # widened-field rule violated at its OWN fix site, .cr42-mixedcls):
+    # round 44's own classification union fix (a file-kind unit's
+    # classification is the union of every contained type's own
+    # classification, e.g. ['production', 'test'] for a file declaring
+    # both) never got this consumer re-audited - `"test" in unit.
+    # classification` is TRUE for a MIXED unit exactly as it is for a
+    # PURE-test one, so a file containing real, colocated production
+    # code published a blanket not_applicable/unit_is_itself_a_test for
+    # that production code too, the identical "publishes a confident
+    # non-answer for content that needs a real verdict" shape round 44's
+    # own comment already named as the exact symptom being fixed for
+    # OTHER checks. Narrowed to EXCLUSIVE membership (classification is
+    # PURELY {"test"}, nothing else) - a mixed unit falls through to the
+    # SAME evidence-based evaluation (is_tested/has_inferred_pairing) an
+    # ordinary production unit already gets, never a NEW, unvetted
+    # "colocated test type counts as its own evidence" heuristic invented
+    # here - the existing name-inferred-pairing mechanism is already the
+    # weaker, heuristic tier this producer accepts; colocation in the
+    # identical file is not given a free pass beyond that. Argued, not
+    # unilaterally decided: `test_unit_ids` below (feeding OTHER units'
+    # own is_tested) correctly keeps its own bare membership test
+    # unchanged - a mixed unit's own outgoing test-relation edges are
+    # still genuine test evidence for whatever they target, the
+    # "meaning survives the union" question answers differently for
+    # that consumer than it does for this one.
+    if set(unit.classification) == {"test"}:
         return _signal(
             unit.unit_id, "test_evidence_located", "not_applicable", "detected",
             "unit_is_itself_a_test")
