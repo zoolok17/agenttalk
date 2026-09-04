@@ -609,6 +609,132 @@ def test_a_file_with_no_unicode_escapes_at_all_never_flags_a_structural_problem(
     assert not any(p.reason_code == "source_uses_structural_unicode_escapes" for p in result.problems)
 
 
+def test_an_even_backslash_run_before_a_u_marker_is_not_an_escape_at_all():
+    """MICRO-ROUND 50 (Cluster 3, m1, reviewer-3's own javac-verified
+    proof): JLS 3.3 - a Unicode escape is `\\` UnicodeMarker HexDigit{4},
+    a SINGLE literal backslash. An EVEN-length run of consecutive
+    backslashes immediately before a `u+`+hex marker is `run/2` ordinary,
+    literal backslash PAIRS - none of them is eligible to combine with
+    the marker, so `\\\\u002f` (two literal backslashes) is legal
+    escaping-UTILITY code (e.g. a helper building literal `\\uXXXX` TEXT
+    as DATA) that a real compiler never translates at all - the OLD
+    bare-regex body raised a false alarm on this exact legal shape,
+    treating every raw `\\uXXXX`-shaped substring as an escape
+    regardless of what preceded the backslash."""
+    backslash = chr(92)
+    two_backslashes_then_marker = backslash * 2 + "u002f"  # legal, NOT an escape
+    src = (
+        "package p;\n"
+        "public class Real {\n"
+        "  String s = \"" + two_backslashes_then_marker + "\";\n"
+        "  void m() {}\n"
+        "}\n"
+    )
+    result = java.parse_java_source("Real.java", src)
+    assert not any(p.reason_code == "source_uses_structural_unicode_escapes" for p in result.problems)
+
+
+def test_an_odd_backslash_run_before_a_u_marker_is_still_a_real_escape():
+    """Control for m1 above: an ODD-length run (three backslashes) -
+    the first two cancel as one literal pair, the third is genuinely
+    eligible and combines with the marker that follows, exactly as a
+    single backslash would. Must still be detected."""
+    backslash = chr(92)
+    three_backslashes_then_marker = backslash * 3 + "u002f"  # real escape (decodes to '/')
+    src = (
+        "package p;\n"
+        "public class Real {\n"
+        "  String s = \"" + three_backslashes_then_marker + "\";\n"
+        "  void m() {}\n"
+        "}\n"
+    )
+    result = java.parse_java_source("Real.java", src)
+    assert any(p.reason_code == "source_uses_structural_unicode_escapes" for p in result.problems)
+
+
+def test_a_multi_u_marker_unicode_escape_is_detected():
+    """MICRO-ROUND 50 (Cluster 3, M2 BLOCKER, wrong-data): JLS 3.3's own
+    UnicodeMarker production is `u | UnicodeMarker u` - ONE OR MORE `u`
+    characters, spec-legal and accepted by every real compiler. The OLD
+    single-`u` regex bypassed this whole detection gate SILENTLY for any
+    escape spelled with 2+ `u`s - reproduced here with `\\uu000a` (two
+    `u`s), which decodes to a real newline exactly as `\\u000a` does."""
+    backslash = chr(92)
+    escaped_newline_multi_u = backslash + "uu000A"
+    src = (
+        "package p;\n"
+        "public class Real {\n"
+        "  // a comment" + escaped_newline_multi_u + "import java.util.List;\n"
+        "  void m() {}\n"
+        "}\n"
+    )
+    result = java.parse_java_source("Real.java", src)
+    assert any(p.reason_code == "source_uses_structural_unicode_escapes" for p in result.problems)
+
+
+def test_an_escaped_single_quote_records_a_structural_unicode_escape_problem():
+    """MICRO-ROUND 50 (Cluster 3, M3 BLOCKER, wrong-data): round 49b's
+    own "closed, this time for real" claim was still false - `'`
+    (U+0027, the char-literal delimiter, its own dedicated branch in
+    this adapter's sanitizer) was missing from the closed set. A
+    `\\u0027` decodes to a real single quote BEFORE this adapter's own
+    sanitizer ever runs - exactly the same smuggled-delimiter risk the
+    comment/string-delimiter members already cover, just for the char-
+    literal shape."""
+    backslash = chr(92)
+    escaped_quote = backslash + "u0027"
+    src = (
+        "package p;\n"
+        "public class Real {\n"
+        "  String s = \"" + escaped_quote + "\";\n"
+        "  void m() {}\n"
+        "}\n"
+    )
+    result = java.parse_java_source("Real.java", src)
+    assert any(p.reason_code == "source_uses_structural_unicode_escapes" for p in result.problems)
+
+
+#: Per-character trigger fixtures for the derivation-lock test below - a
+#: bare "*" never opens anything on its own (only "/*" together does), so
+#: this cannot be a single generic "ch + stuff + ch" template; each
+#: member's own REAL triggering shape is named explicitly instead.
+_SANITIZER_DELIMITER_TRIGGER_FIXTURES = {
+    "/": "a//b\nc",
+    "*": "a/*b*/c",
+    '"': 'a"b"c',
+    "'": "a'b'c",
+}
+
+
+def test_structural_unicode_escape_chars_is_derived_from_the_sanitizers_own_delimiters():
+    """MICRO-ROUND 50 (Cluster 3, the derivation-lock test - the reader's
+    own mandate: "the closed set claim should either be derived from the
+    sanitizer's own delimiter set or dropped"). Proves all three parts of
+    the derivation are real, not merely declared:
+
+    (1) every character in `_SANITIZER_DELIMITER_CHARS` genuinely
+    participates in triggering a special (blanked) region in
+    `_strip_comments_and_strings` - directly invoking the sanitizer on
+    its own real triggering shape, rather than trusting the constant's
+    own name.
+    (2) the trigger fixture table above covers the WHOLE set, both
+    directions - nothing in the real set goes untested, and the table
+    never tests a character the real set does not actually contain.
+    (3) `_STRUCTURAL_UNICODE_ESCAPE_CHARS` is a proper superset of
+    `_SANITIZER_DELIMITER_CHARS`, with EXACTLY the three additional,
+    independently-justified members (the two line terminators and the
+    escape-introducer backslash) - never a fourth, undocumented member
+    quietly re-introducing manual enumeration."""
+    assert set(_SANITIZER_DELIMITER_TRIGGER_FIXTURES) == java._SANITIZER_DELIMITER_CHARS
+    for ch, fixture in _SANITIZER_DELIMITER_TRIGGER_FIXTURES.items():
+        sanitized, _malformed = java._strip_comments_and_strings(fixture)
+        assert sanitized != fixture, (
+            f"{ch!r} is in _SANITIZER_DELIMITER_CHARS but its own trigger fixture "
+            f"{fixture!r} was not treated specially by _strip_comments_and_strings")
+    assert java._STRUCTURAL_UNICODE_ESCAPE_CHARS == (
+        java._SANITIZER_DELIMITER_CHARS | {"\n", "\r", "\\"})
+
+
 # ----------------------------------------------------------- test classification + relation
 
 def test_test_suffixed_class_is_classified_test_and_produces_a_test_edge():

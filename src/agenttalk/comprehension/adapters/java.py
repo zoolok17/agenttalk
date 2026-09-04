@@ -1388,6 +1388,26 @@ def _next_line_terminator_or_eof(text: str, pos: int) -> int:
     return min(newline, cr)
 
 
+#: MICRO-ROUND 50 (Cluster 3, the reader's own remediation note, adopted
+#: as mandate): the EXACT set of characters ``_strip_comments_and_
+#: strings`` below opens a comment/string/char-literal region on - ``/``
+#: (both ``//`` and ``/*``), ``"`` (plain string and text-block), and
+#: ``'`` (char literal). SINGLE SOURCE for two independent claims that
+#: must never drift apart again: (1) the gate at the top of that
+#: function's own loop below reads THIS constant directly, never a
+#: second, hand-copied condition, so removing a member here makes its
+#: own branch provably unreachable rather than silently stale; (2)
+#: ``_STRUCTURAL_UNICODE_ESCAPE_CHARS`` is DERIVED from it (unioned with
+#: the two line-terminator members and the escape-introducer member,
+#: each independently justified on its own JLS 3.3 grounds - see that
+#: constant's own docstring) rather than re-enumerated by hand a second
+#: time. "The closed set claim should either be derived from the
+#: sanitizer's own delimiter set or dropped" - the reader's own words,
+#: taken literally. A dedicated derivation-lock test proves member (1)
+#: by actually invoking the sanitizer.
+_SANITIZER_DELIMITER_CHARS = frozenset({"/", "*", '"', "'"})
+
+
 def _strip_comments_and_strings(text: str) -> tuple[str, bool]:
     """Blanks comment and string/char literal CONTENT with spaces while
     preserving every newline and the overall length/offsets, so a later
@@ -1414,6 +1434,17 @@ def _strip_comments_and_strings(text: str) -> tuple[str, bool]:
     n = len(text)
     while i < n:
         ch = text[i]
+        # MICRO-ROUND 50 (Cluster 3): gated on _SANITIZER_DELIMITER_CHARS
+        # itself - see that constant's own docstring for why. Behavior-
+        # preserving: every character this gate admits still falls
+        # through to the SAME per-character branches below unchanged (a
+        # bare "*" not preceded by "/", for instance, matches none of
+        # them and reaches the same "ordinary content" outcome the old,
+        # ungated code already gave it).
+        if ch not in _SANITIZER_DELIMITER_CHARS:
+            result.append(ch)
+            i += 1
+            continue
         if ch == "/" and i + 1 < n and text[i + 1] == "/":
             end = _next_line_terminator_or_eof(text, i)
             result.append(" " * (end - i))
@@ -2001,7 +2032,21 @@ _JAVA_SIMPLE_ESCAPES = {
     "n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f",
     "s": " ", "0": "\0", '"': '"', "'": "'", "\\": "\\",
 }
-_JAVA_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+#: MICRO-ROUND 50 (Cluster 3, M2 BLOCKER, wrong-data): JLS 3.3's own
+#: ``UnicodeMarker`` production is ``u | UnicodeMarker u`` - ONE OR MORE
+#: ``u`` characters, never exactly one. The OLD ``_JAVA_UNICODE_ESCAPE_
+#: RE`` (``\\u([0-9a-fA-F]{4})``, still used unchanged by
+#: ``_decode_java_string_escapes`` below - a DIFFERENT phase, JLS
+#: 3.10.6/3.10.7 string-escape decoding on ALREADY-DELIMITED literal
+#: content, not raw-source unicode translation) matched exactly one
+#: literal ``u`` - a real ``\uu000a`` (two ``u``s, spec-legal and
+#: accepted by every real compiler) never matched it AT ALL, bypassing
+#: this whole detection gate silently. This pattern names ONLY the
+#: marker-plus-hex half of a real escape; eligibility (whether the
+#: preceding ``\`` may even start one) is a SEPARATE grammar question -
+#: see ``_structural_unicode_escape_detected``'s own docstring for why
+#: that cannot be a regex prefix on this same pattern.
+_UNICODE_ESCAPE_MARKER_AND_HEX_RE = re.compile(r"u+([0-9a-fA-F]{4})")
 #: MICRO-ROUND 49 (forty-third cold read, M5, judged): the closed set of
 #: characters that can change LEXING if smuggled in as a `\uXXXX` escape
 #: rather than written literally - a comment delimiter half (``/``,
@@ -2023,12 +2068,27 @@ _JAVA_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
 #: literal ends, the identical class of risk the other five members
 #: already cover, just smuggled via the ESCAPE MECHANISM itself rather
 #: than the character it produces. Reviewer verified with javac 1.8:
-#: legal, compiles to two real classes. Added as the sixth, and genuinely
-#: final, member - a decoded backslash changes what the NEXT character
-#: means (an escape-introducer), exactly as it does when written
-#: literally; nothing else in JLS 3.10.6/3.10.7's own escape grammar
-#: shares that property, so the set is closed again, this time for real.
-_STRUCTURAL_UNICODE_ESCAPE_CHARS = frozenset({"/", "*", '"', "\n", "\r", "\\"})
+#: legal, compiles to two real classes. Added as the sixth member.
+#:
+#: MICRO-ROUND 50 (Cluster 3, M3 BLOCKER, wrong-data - the reader's own
+#: remediation note, adopted as mandate): round 49b's own "closed, this
+#: time for real" claim was STILL false - ``'`` (U+0027, the char-
+#: literal delimiter, its own dedicated branch in ``_strip_comments_
+#: and_strings`` above) was missing, an escaped single quote before a
+#: real one hides a char-literal delimiter exactly as an escaped double
+#: quote hides a string one, publishing a phantom top-level type on a
+#: fully legal file. Rather than keep discovering members one at a time,
+#: this set is now DERIVED from ``_SANITIZER_DELIMITER_CHARS`` (single
+#: source - see that constant's own docstring) unioned with the two
+#: line-terminator members and the escape-introducer member, each still
+#: independently justified above on its own JLS 3.3 grounds (neither is
+#: a sanitizer "delimiter" in the same sense ``/``/``"``/``'`` are - a
+#: newline is significant EVERYWHERE, not just inside a comment/string
+#: open, and a backslash matters because it changes what the NEXT
+#: character means, not because it opens a region). Closed by
+#: CONSTRUCTION now, not by manual enumeration - the derivation-lock
+#: test proves the sanitizer side of that construction is real.
+_STRUCTURAL_UNICODE_ESCAPE_CHARS = _SANITIZER_DELIMITER_CHARS | frozenset({"\n", "\r", "\\"})
 
 #: MICRO-ROUND 49c (reviewer-3's ask): a short, human-readable label per
 #: member of the closed set above, for the published problem detail -
@@ -2043,6 +2103,7 @@ _STRUCTURAL_UNICODE_ESCAPE_DESCRIPTIONS = {
     "/": "'/' (a comment-delimiter half)",
     "*": "'*' (a comment-delimiter half)",
     '"': "a quote (a literal delimiter)",
+    "'": "a single quote (a char-literal delimiter)",
     "\n": "a newline",
     "\r": "a carriage return",
     "\\": "a backslash (an escape introducer)",
@@ -2079,12 +2140,75 @@ def _structural_unicode_escape_detected(text: str) -> tuple[str, int] | None:
     RAW-text offset (``None`` if no member of the set was found), rather
     than a bare bool - the caller uses this to name a concrete, real
     instance (which character, at which line) in the published detail
-    instead of a fixed, and now-stale-on-arrival, enumeration."""
-    for match in _JAVA_UNICODE_ESCAPE_RE.finditer(text):
+    instead of a fixed, and now-stale-on-arrival, enumeration.
+
+    MICRO-ROUND 50 (Cluster 3, THE ESCAPE GATE, FIXED AS GRAMMAR NOT
+    CHARACTERS - the reader's own remediation note, adopted as mandate):
+    the old body was a bare ``_JAVA_UNICODE_ESCAPE_RE.finditer(text)`` -
+    no eligibility check at all, so it fired on EVERY raw ``\\uXXXX``-
+    shaped substring regardless of what preceded the backslash. JLS 3.3
+    is explicit that a backslash is only eligible to START a Unicode
+    escape when it is NOT itself "cancelled" by an even-length run of
+    backslashes immediately before it (a Unicode escape is defined
+    ``\\ UnicodeMarker HexDigit{4}`` - a SINGLE literal backslash, never
+    two): a raw run of ``N`` consecutive backslashes followed by a real
+    ``u+`` marker and 4 hex digits is a real escape (using the run's OWN
+    LAST backslash) only when ``N`` is ODD; an EVEN-length run is ``N/2``
+    ordinary, literal backslash pairs with NOTHING eligible to combine
+    with the marker that follows - m1's own reproducer (reviewer-3,
+    javac-verified): ``\\\\u002f`` (two literal backslashes) is NOT an
+    escape at all, a false alarm the old bare-regex body raised on
+    legal escaping-utility code (e.g. a string building literal
+    ``\\uXXXX`` TEXT as DATA, never meant to be translated itself).
+    Implemented as an actual left-to-right scan over raw backslash RUNS
+    (never a single regex - eligibility depends on how many backslashes
+    came before, a count a regex cannot condition a later match on
+    without a fixed-width lookbehind, and a run here is unbounded) -
+    each run's length decides eligibility BEFORE ever attempting to
+    match the marker+hex half (``_UNICODE_ESCAPE_MARKER_AND_HEX_RE``,
+    see its own docstring for the ``u+`` grammar fix), consuming the
+    whole recognized escape as one unit exactly once (never re-examining
+    hex digits as though they could themselves start a new backslash
+    run - they cannot, none of ``0-9a-fA-F`` is ``\\``)."""
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] != "\\":
+            i += 1
+            continue
+        run_start = i
+        while i < n and text[i] == "\\":
+            i += 1
+        if (i - run_start) % 2 == 0:
+            # An EVEN-length backslash run: every backslash in it is an
+            # ordinary literal backslash (they cancel in literal pairs,
+            # JLS 3.3) - NONE is eligible to combine with a following
+            # marker. `i` already sits right after the whole run.
+            continue
+        eligible_backslash_pos = i - 1
+        match = _UNICODE_ESCAPE_MARKER_AND_HEX_RE.match(text, i)
+        if match is None:
+            continue
+        i = match.end()
         decoded = chr(int(match.group(1), 16))
         if decoded in _STRUCTURAL_UNICODE_ESCAPE_CHARS:
-            return decoded, match.start()
+            return decoded, eligible_backslash_pos
     return None
+
+
+#: MICRO-ROUND 50 (Cluster 3): deliberately NOT widened to the ``u+``/
+#: eligibility-aware grammar `_structural_unicode_escape_detected` above
+#: now uses - that fix is about raw-source JLS 3.3 TRANSLATION (which
+#: characters a real compiler would decode BEFORE tokenizing, over text
+#: this adapter has not yet delimited); this one decodes an escape
+#: INSIDE a string/char literal `_strip_comments_and_strings` has
+#: ALREADY correctly delimited (JLS 3.10.6/3.10.7), a later, different
+#: phase where a real compiler has already resolved any translation-
+#: time ambiguity - a single literal ``u`` is what a real compiler's own
+#: OUTPUT of that earlier phase always contains by the time this
+#: function ever sees it (translation never leaves a multi-``u`` marker
+#: behind for a later phase to find).
+_JAVA_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
 
 
 def _decode_java_string_escapes(raw: str) -> str:
