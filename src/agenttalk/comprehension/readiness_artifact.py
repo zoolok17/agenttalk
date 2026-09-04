@@ -366,9 +366,10 @@ _READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
     "encoding_undecodable": _WHOLE_FILE_EVIDENCE_GAP_CHECKS,
     # MICRO-ROUND 49 (forty-third cold read, M5, judged): a raw source
     # containing a `\uXXXX` escape that decodes to a structural
-    # character (/, *, ", or a newline - see java.py's own
-    # `_structural_unicode_escape_detected` docstring) means this
-    # adapter's own lexing may disagree with a real compiler's - the
+    # character (six members, closed - see java.py's own
+    # `_STRUCTURAL_UNICODE_ESCAPE_CHARS`/`_structural_unicode_escape_
+    # detected` docstrings) means this adapter's own lexing may
+    # disagree with a real compiler's - the
     # SAME genuine whole-file evidence gap `parse_failed`/`encoding_
     # undecodable` already are, never a narrower fact (the risk is not
     # scoped to any one declared type - a smuggled comment delimiter
@@ -457,26 +458,48 @@ _READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
     # units are constructed completely normally), but "this reason's
     # only emitter attributes it to a SYNTHETIC, fabricated qualified_
     # name that can never match any REAL unit's own qualified_name."
-    # Each of these five web.xml/modules-identity reasons anchors itself
-    # to a made-up marker string specifically so it never gets
-    # broadcast file-wide either (only a bare `qualified_name=None`
-    # problem does that, per `worker_problem_reasons_by_path`'s own
-    # `None`-gated construction in scan_pipeline.py) - `duplicate_
-    # descriptor_name`/`descriptor_name_without_class`/`undeclared_
+    # Each of these five web.xml/modules-identity reasons anchors its
+    # OWN `JavaAdapterProblem.qualified_name` to a made-up marker string
+    # specifically so it never gets broadcast file-wide either (only a
+    # bare `qualified_name=None` problem does that, per `worker_problem_
+    # reasons_by_path`'s own `None`-gated construction in scan_
+    # pipeline.py) - `descriptor_name_without_class`/`undeclared_
     # descriptor_name` anchor to `f"{relative_path}#{name}"`;
     # `duplicate_route_target` anchors to `f"{relative_path}#duplicate_
     # route_target#{url_pattern}"` (both by DESIGN, per their own
     # emission-site comments: "there are two real owners involved and
     # no single one to anchor to... a real qualified_name here would
-    # broadcast this reason file-wide"). `duplicate_qualified_name`
-    # never even reaches `adapter_problem_reasons` at all - it is
-    # published exclusively via `ModuleRecord.conflict_kind`/
-    # `conflict_id`, a wholly separate field this module's own conflict-
-    # override loop (below) consults directly, never through this
-    # table. PROVEN, not merely argued: constructed all five reproducer
-    # shapes end to end and measured `modules.json`'s own units for a
-    # match - zero, for every one, confirming none can ever be consulted
-    # by a real unit today. Mapped to the SAME narrower entry_points_
+    # broadcast this reason file-wide").
+    #
+    # `duplicate_descriptor_name` is the one member with a SECOND, live
+    # anchor alongside its own dead `f"{relative_path}#{name}"` problem-
+    # qualified_name above: `java.py`'s own `descriptor_name_conflicts`
+    # list (populated at the SAME emission site) records the REAL
+    # measured anchor format `f"{relative_path}#servlet#{name}"` (or
+    # `#filter#{name}` for a `<filter>` collision) - this is what
+    # `modules_artifact.py`'s own `_populate_descriptor_name_conflicts`
+    # actually hashes into a real `ModuleRecord.conflict_id` whenever at
+    # least one of the colliding names' candidate classes resolves
+    # in-scan. That path stamps a REAL unit's own `conflict_kind` field
+    # directly - same live/bypasses-this-table shape `duplicate_
+    # qualified_name` below has - so `duplicate_descriptor_name` being
+    # dead via THIS table (`adapter_problem_reasons`) does not mean the
+    # reason itself never reaches a real unit; it means this specific,
+    # table-keyed path never does, while the separate conflict_kind path
+    # (anchored at `#servlet#`/`#filter#`, not the bare `#{name}` cited
+    # above) already does today.
+    #
+    # `duplicate_qualified_name` never even reaches `adapter_problem_
+    # reasons` at all - it is published exclusively via `ModuleRecord.
+    # conflict_kind`/`conflict_id`, a wholly separate field this
+    # module's own conflict-override loop (below) consults directly,
+    # never through this table. PROVEN, not merely argued: constructed
+    # all five reproducer shapes end to end and measured `modules.json`
+    # 's own units for a match on THIS table's own `adapter_problem_
+    # reasons` path - zero, for every one, confirming none can ever be
+    # consulted BY THAT PATH today (`duplicate_descriptor_name`'s own,
+    # separate `conflict_kind` path is a different question, answered
+    # above). Mapped to the SAME narrower entry_points_
     # mapped/feature_linked destination `route_annotation_unassociated`/
     # `route_value_unrecoverable` above already use (the closest live
     # analogue for what each WOULD mean if a future round ever

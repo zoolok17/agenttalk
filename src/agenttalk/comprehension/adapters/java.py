@@ -2012,8 +2012,26 @@ _JAVA_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
 #: shares that property, so the set is closed again, this time for real.
 _STRUCTURAL_UNICODE_ESCAPE_CHARS = frozenset({"/", "*", '"', "\n", "\r", "\\"})
 
+#: MICRO-ROUND 49c (reviewer-3's ask): a short, human-readable label per
+#: member of the closed set above, for the published problem detail -
+#: naming the ACTUAL decoded character that fired, rather than
+#: enumerating all six every time, keeps the load-bearing, per-instance
+#: distinguishing datum short enough to survive `bounded_detail`'s own
+#: 200-character bound regardless of which member fired or how far into
+#: the file it sits (measured: every member's full sentence still
+#: truncates past 200 chars, but the datum itself - which one, and at
+#: what line - always lands well inside the surviving prefix).
+_STRUCTURAL_UNICODE_ESCAPE_DESCRIPTIONS = {
+    "/": "'/' (a comment-delimiter half)",
+    "*": "'*' (a comment-delimiter half)",
+    '"': "a quote (a literal delimiter)",
+    "\n": "a newline",
+    "\r": "a carriage return",
+    "\\": "a backslash (an escape introducer)",
+}
 
-def _structural_unicode_escape_detected(text: str) -> bool:
+
+def _structural_unicode_escape_detected(text: str) -> tuple[str, int] | None:
     """MICRO-ROUND 49 (M5, judged - detect-and-degrade, not a decoder):
     a `\\uXXXX` escape (JLS 3.3 - decoded in a TRANSLATION step BEFORE
     tokenization, so a real compiler sees its DECODED character, never
@@ -2037,11 +2055,18 @@ def _structural_unicode_escape_detected(text: str) -> bool:
     acted on; the caller records a bounded, degrading problem and
     leaves this file's own claims as visible but not confidently
     trustworthy, rather than building a full unicode-escape-aware
-    lexer for a shape real-world source uses vanishingly rarely."""
+    lexer for a shape real-world source uses vanishingly rarely.
+
+    MICRO-ROUND 49c: returns the first match's decoded character and its
+    RAW-text offset (``None`` if no member of the set was found), rather
+    than a bare bool - the caller uses this to name a concrete, real
+    instance (which character, at which line) in the published detail
+    instead of a fixed, and now-stale-on-arrival, enumeration."""
     for match in _JAVA_UNICODE_ESCAPE_RE.finditer(text):
-        if chr(int(match.group(1), 16)) in _STRUCTURAL_UNICODE_ESCAPE_CHARS:
-            return True
-    return False
+        decoded = chr(int(match.group(1), 16))
+        if decoded in _STRUCTURAL_UNICODE_ESCAPE_CHARS:
+            return decoded, match.start()
+    return None
 
 
 def _decode_java_string_escapes(raw: str) -> str:
@@ -3222,20 +3247,38 @@ def parse_java_source(
     # file's own claims are not confidently trustworthy), not narrowed
     # to any one unit, the same broadcast shape `parse_failed` already
     # has via `worker_problem_reasons_by_path`.
-    if _structural_unicode_escape_detected(text):
+    structural_escape = _structural_unicode_escape_detected(text)
+    if structural_escape is not None:
         # degrades_run is decided at the WORKER level (worker.py defaults
         # every adapter problem to degrading unless explicitly named as
         # an exception) - JavaAdapterProblem itself carries no such
         # field; this reason code is not one of the named exceptions,
         # so it degrades by default, correctly.
+        #
+        # MICRO-ROUND 49c (reviewer-3's ask): the fixed four-character
+        # enumeration this sentence used to carry ("/, *, ", or a
+        # newline") went FALSE the moment 49b added the backslash as a
+        # fifth-and-sixth-covering member - a published record that
+        # cited a closed list not containing the character that
+        # actually fired. Naming the REAL decoded character (and its
+        # line) per instance is both more honest and shorter than
+        # growing the enumeration to six members - `newline_offsets`
+        # is safe to reuse here even though the match itself was found
+        # by scanning raw `text`: `_strip_comments_and_strings` (see its
+        # own docstring) preserves length, offsets, and every newline,
+        # so a raw-text offset and a sanitized-text offset name the
+        # same source position.
+        decoded_char, offset = structural_escape
+        line = _line_at(newline_offsets, offset)
+        description = _STRUCTURAL_UNICODE_ESCAPE_DESCRIPTIONS[decoded_char]
         problems.append(JavaAdapterProblem(
             reason_code="source_uses_structural_unicode_escapes",
             detail=bounded_detail(
-                "this file's raw source contains a \\uXXXX escape that decodes to a "
-                "structural character (/, *, \", or a newline) - JLS 3.3 decodes unicode "
-                "escapes in a translation step BEFORE tokenization, so a real compiler may "
-                "lex this file differently than this adapter's own sanitizer does (a "
-                "smuggled comment delimiter, or a hidden line break) - this file's own "
+                f"this file's raw source at line {line} contains a \\uXXXX escape "
+                f"that decodes to {description} - JLS 3.3 decodes unicode escapes "
+                "in a translation step BEFORE tokenization, so a real compiler may "
+                "lex this file differently than this adapter's own sanitizer, "
+                "which never decodes escapes before lexing - this file's own "
                 "claims are not confidently trustworthy"),
         ))
 

@@ -443,6 +443,22 @@ _RECOGNIZED_BUILD_OUTPUT_RESOURCE_POSITIONS = (
 #: feature than the poison rule's own "don't falsely blame this content
 #: for an unrelated registry miss" scope). Filed as a follow-up, not
 #: fixed here.
+#:
+#: MICRO-ROUND 49c (reviewer-3's own prescribed fix DIRECTION for that
+#: follow-up, recorded here so a future round does not have to re-derive
+#: it): the correct shape is TARGET-level, never region-level - "an
+#: unresolved import stays unresolved when the excluded region contains
+#: a path matching THAT IMPORT's OWN fully-qualified name" (i.e. resolve
+#: the specific import against the excluded tree's own generated
+#: content, not against a blanket "trust everything under this prefix"
+#: rule). Explicitly do NOT solve this by extending ``_RECOGNIZED_
+#: GENERATED_SOURCE_POSITIONS`` with one more literal prefix - that
+#: widens the SAME unconditional, un-targeted exemption every ``.java``
+#: found there already gets, this time for a directory an annotation
+#: processor could equally well leave EMPTY or PARTIAL on a given build
+#: - degrading every annotation-processor build's own poison coverage
+#: to catch the common case, the identical over-wide-exemption dilution
+#: round 16 already named and rejected once for a different position.
 def _sits_under_a_recognized_generated_output_position(
     relative_to_excluded_root: str, *, is_java_source: bool,
 ) -> bool:

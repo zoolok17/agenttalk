@@ -4036,12 +4036,23 @@ def _assert_reason_never_attaches_to_a_real_unit(outcome, reason_code: str) -> N
 
 def test_duplicate_descriptor_name_never_attaches_to_a_real_unit(java_repo: Path) -> None:
     """MICRO-ROUND 49b (F3, settle - reviewer-3's own round-48-KeyError-
-    class hunt): duplicate_descriptor_name anchors its own problem to a
+    class hunt): duplicate_descriptor_name anchors its own PROBLEM to a
     SYNTHETIC qualified_name (f"{relative_path}#{name}") by design (two
     real owners, no single one to anchor to) - never a real unit's own
-    qualified_name, never None (which would broadcast file-wide instead).
-    Proven, not merely argued: constructed the exact reproducer and
-    measured modules.json's own units for a match - zero."""
+    qualified_name, never None (which would broadcast file-wide instead),
+    so it never reaches a real unit via `adapter_problem_reasons`/this
+    readiness table. This fixture deliberately names two candidate
+    classes (com.acme.A/B) that do NOT exist in java_repo, so neither
+    resolves in-scan and NEITHER path attaches - `duplicate_descriptor_
+    name` also has a SEPARATE, live anchor (f"{relative_path}#servlet#
+    {name}", the REAL measured format `_populate_descriptor_name_
+    conflicts` hashes into a real `conflict_id`) that DOES stamp a real
+    unit's own `conflict_kind` whenever at least one candidate class
+    resolves in-scan - a different, already-live question this fixture
+    does not exercise and this test does not claim to settle. Proven,
+    not merely argued, for the table path only: constructed the exact
+    reproducer and measured modules.json's own units for a match on
+    `adapter_problem_reasons` - zero."""
     (java_repo / "WEB-INF").mkdir(parents=True, exist_ok=True)
     (java_repo / "WEB-INF" / "web.xml").write_text(
         "<web-app>\n"
