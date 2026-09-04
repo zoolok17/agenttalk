@@ -306,6 +306,14 @@ problem rather than two silently merged units.
 - bounded summary counts for units, edges, features, entry points, readiness
   states, exclusions, unsupported files, generated/vendor handling, resource
   omissions, conflicts, and problems.
+- the privacy audit trail this run acted under: `vcs_privacy` disposition,
+  VCS kind, the matched ignore rule when one exists, and `work_id` - the
+  operator-supplied work item ID bound to an attended
+  `--acknowledge-unignored-private-store` override, when one was used.
+  `work_id` is persisted VERBATIM (declared, PR-B micro-round 47c):
+  sanitizing it would damage the very binding it records, so an operator
+  who passes a path or environment value in `--work-id` leaks it into this
+  durable artifact - the CLI flag's own help text carries the same caution.
 
 NAMED LIMIT (declared and CLOSED, PR-B round 47, B1 - THE WORST FAILURE
 SHAPE): a `.gitmodules` submodule boundary is parsed via a real `git config -f

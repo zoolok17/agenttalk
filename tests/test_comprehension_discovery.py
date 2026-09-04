@@ -784,9 +784,19 @@ def test_enumerate_scope_a_genuinely_degrading_problem_still_nulls_the_fingerpri
     # omission (the same resource_limit shape every other cap in this
     # module raises) - simpler to trigger deterministically here than
     # monkeypatching OS-level directory permissions.
+    #
+    # MICRO-ROUND 47c (CI red, portability): single-char directory names
+    # ("a", not "d{i}") - 202 levels of "d{i}" grows to "d200"/"d201" (4
+    # chars) per component, pushing this fixture's own worst-case
+    # absolute path (runner temp prefix + 202 components) past macOS's
+    # PATH_MAX (1024) and failing os.mkdir with OSError 63 in SETUP,
+    # before any assertion ever ran, on all four macOS CI legs (Linux's
+    # 4096 and Windows's long-path-enabled limit both had headroom to
+    # spare). 202 levels of "/a" is ~404 bytes - comfortably under 1000
+    # even with a ~100-byte CI runner temp prefix.
     current = tmp_path
-    for i in range(discovery.MAX_NESTING_DEPTH + 2):
-        current = current / f"d{i}"
+    for _ in range(discovery.MAX_NESTING_DEPTH + 2):
+        current = current / "a"
     current.mkdir(parents=True)
     comp_dir = _comprehension_dir(tmp_path)
     result = discovery.enumerate_scope(tmp_path, comp_dir)

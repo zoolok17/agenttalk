@@ -14197,7 +14197,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cscan.add_argument(
         "--work-id",
-        help="Work item ID bound to an attended --acknowledge-unignored-private-store run.")
+        # MICRO-ROUND 47c (reviewer part 3's own note-level find, DECLARE
+        # disposition): persisted VERBATIM into scan.json (correctly so -
+        # sanitizing would damage the very binding this value records),
+        # but nothing told the operator it lands in a durable artifact.
+        # Declared here, at the one surface an operator actually sees
+        # before typing it.
+        help="Work item ID bound to an attended --acknowledge-unignored-private-store run. "
+             "Persisted verbatim into scan.json - do not put paths or environment values here.")
     cscan.add_argument(
         "--acknowledge-unignored-private-store", action="store_true",
         dest="acknowledge_unignored_private_store",
