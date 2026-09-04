@@ -766,6 +766,85 @@ def test_process_paths_does_not_flag_a_normal_web_xml_with_a_real_mapping(
     assert result.problems == []
 
 
+def test_process_paths_two_annotations_declaring_the_same_servlet_name_conflict_regardless_of_order(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 2, M1 BLOCKER, wrong-data - the round-19b
+    walk-order-owner class, a new mechanism): two DIFFERENT classes both
+    declare @WebServlet(name="dup") - before this fix, a plain
+    dict.update() in this function's own cross-file accumulation
+    silently picked whichever file this run's own relative_paths order
+    happened to visit LAST as the sole owner, with the published owner
+    FLIPPING depending on that order alone. The XML twin (two <servlet>
+    blocks disagreeing) already conflicts via duplicate_descriptor_name
+    ("no declaration is authoritative by execution order") - proven here
+    that BOTH orderings of the identical two annotation-only files now
+    produce the IDENTICAL conflict, byte-for-byte (candidate labels are
+    always sorted before publication), never a silently-flipped single
+    winner."""
+    (tmp_path / "A.java").write_text(
+        "package p;\n@WebServlet(name = \"dup\", urlPatterns = {\"/dup\"})\n"
+        "public class A extends HttpServlet {\n}\n", encoding="utf-8")
+    (tmp_path / "B.java").write_text(
+        "package p;\n@WebServlet(name = \"dup\", urlPatterns = {\"/dup\"})\n"
+        "public class B extends HttpServlet {\n}\n", encoding="utf-8")
+    (tmp_path / "WEB-INF").mkdir()
+    (tmp_path / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>dup</servlet-name>\n"
+        "    <url-pattern>/dup</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8")
+
+    forward = worker.process_paths(tmp_path, ["A.java", "B.java", "WEB-INF/web.xml"])
+    backward = worker.process_paths(tmp_path, ["B.java", "A.java", "WEB-INF/web.xml"])
+
+    forward_problems = forward.java_results["WEB-INF/web.xml"]["problems"]
+    backward_problems = backward.java_results["WEB-INF/web.xml"]["problems"]
+    forward_conflict = next(
+        p for p in forward_problems if p["reason_code"] == "duplicate_descriptor_name")
+    backward_conflict = next(
+        p for p in backward_problems if p["reason_code"] == "duplicate_descriptor_name")
+    assert forward_conflict["detail"] == backward_conflict["detail"]
+    assert "p.A" in forward_conflict["detail"] and "p.B" in forward_conflict["detail"]
+
+
+def test_process_paths_two_annotations_declaring_the_same_filter_name_conflict_regardless_of_order(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 2, M1's own @WebFilter twin) - identical
+    shape, the filter mechanism the servlet fix above shares."""
+    (tmp_path / "A.java").write_text(
+        "package p;\n@WebFilter(filterName = \"dup\", urlPatterns = {\"/dup\"})\n"
+        "public class A implements Filter {\n}\n", encoding="utf-8")
+    (tmp_path / "B.java").write_text(
+        "package p;\n@WebFilter(filterName = \"dup\", urlPatterns = {\"/dup\"})\n"
+        "public class B implements Filter {\n}\n", encoding="utf-8")
+    (tmp_path / "WEB-INF").mkdir()
+    (tmp_path / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <filter-mapping>\n"
+        "    <filter-name>dup</filter-name>\n"
+        "    <url-pattern>/dup</url-pattern>\n"
+        "  </filter-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8")
+
+    forward = worker.process_paths(tmp_path, ["A.java", "B.java", "WEB-INF/web.xml"])
+    backward = worker.process_paths(tmp_path, ["B.java", "A.java", "WEB-INF/web.xml"])
+
+    forward_problems = forward.java_results["WEB-INF/web.xml"]["problems"]
+    backward_problems = backward.java_results["WEB-INF/web.xml"]["problems"]
+    forward_conflict = next(
+        p for p in forward_problems if p["reason_code"] == "duplicate_descriptor_name")
+    backward_conflict = next(
+        p for p in backward_problems if p["reason_code"] == "duplicate_descriptor_name")
+    assert forward_conflict["detail"] == backward_conflict["detail"]
+    assert "p.A" in forward_conflict["detail"] and "p.B" in forward_conflict["detail"]
+
+
 def test_process_paths_web_xml_route_publishes_a_paired_route_edge_f4(
     tmp_path: Path,
 ) -> None:

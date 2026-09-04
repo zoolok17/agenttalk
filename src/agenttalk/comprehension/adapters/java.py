@@ -6322,7 +6322,7 @@ def _resolve_descriptor_declarations(
 
 def _servlet_class_by_name(
     sanitized: str, structural: str, text: str,
-    *, annotation_declared_names: dict[str, str] | None = None,
+    *, annotation_declared_names: dict[str, list[str]] | None = None,
 ) -> tuple[_DescriptorRegistry, list[int]]:
     """FIX ROUND 17 (thirteenth cold read, CR13-2 MAJOR, wrong-data):
     web.xml's own ``<servlet>`` element (``<servlet-name>``/
@@ -6372,7 +6372,26 @@ def _servlet_class_by_name(
     declared identically both ways still resolves cleanly, and a name
     declared DIFFERENTLY by an annotation and an XML ``<servlet>`` block
     correctly conflicts through the SAME existing mechanism - no special
-    case needed for either shape."""
+    case needed for either shape.
+
+    MICRO-ROUND 50 (Cluster 2, M1 BLOCKER, wrong-data): widened from
+    name -> ONE qualified_name to name -> a LIST of every qualified_name
+    this run's own annotations declared for it - the caller
+    (``worker.py``) used to collapse duplicate annotation-declared names
+    to a single winner via a plain ``dict.update()`` BEFORE this
+    function, or its own conflict machinery, ever saw more than one
+    candidate: two DIFFERENT classes both declaring
+    ``@WebServlet(name="dup")`` published whichever one this run's own
+    filesystem walk happened to visit LAST as the sole owner, silently,
+    with the published owner flipping depending on directory
+    enumeration order - the identical "walk order decides a published
+    fact" class round 19b already closed once for a different mechanism.
+    Every occurrence is now injected as its OWN declaration (one call
+    below per list entry, not per name) - two disagreeing classes for
+    one name naturally produce 2+ distinct labels, which
+    ``_resolve_descriptor_declarations`` already conflicts, EXACTLY the
+    same "no declaration is authoritative by execution order" outcome
+    the XML ``<servlet>`` twin already gets for the identical shape."""
     declarations: dict[str, list[_DescriptorDeclaration]] = {}
     name_undecodable: list[int] = []
     for block_match in _SERVLET_BLOCK_RE.finditer(structural):
@@ -6466,11 +6485,12 @@ def _servlet_class_by_name(
                 class_value=None, jsp_path=None, class_undecodable=False,
                 block_start=block_match.start(),
             ))
-    for name, qualified_name in (annotation_declared_names or {}).items():
-        declarations.setdefault(name, []).append(_DescriptorDeclaration(
-            class_value=qualified_name, jsp_path=None, class_undecodable=False,
-            block_start=-1,
-        ))
+    for name, qualified_names in (annotation_declared_names or {}).items():
+        for qualified_name in qualified_names:
+            declarations.setdefault(name, []).append(_DescriptorDeclaration(
+                class_value=qualified_name, jsp_path=None, class_undecodable=False,
+                block_start=-1,
+            ))
     return _resolve_descriptor_declarations(declarations), name_undecodable
 
 
@@ -6535,9 +6555,14 @@ _ERROR_PAGE_BLOCK_RE = _structural_block_pattern("error-page")
 
 def _filter_class_by_name(
     sanitized: str, structural: str, text: str,
-    *, annotation_declared_names: dict[str, str] | None = None,
+    *, annotation_declared_names: dict[str, list[str]] | None = None,
 ) -> tuple[_DescriptorRegistry, list[int]]:
-    """FIX ROUND 21b (THE MAJOR's own web.xml-symmetry follow-through):
+    """MICRO-ROUND 50 (Cluster 2, M1's own filter twin): see
+    ``_servlet_class_by_name``'s own docstring for why
+    ``annotation_declared_names`` is a name -> LIST-of-qualified-names
+    mapping, not a single winner.
+
+    FIX ROUND 21b (THE MAJOR's own web.xml-symmetry follow-through):
     web.xml's own ``<filter>`` element (``<filter-name>``/
     ``<filter-class>`` pair), joined below against ``<filter-mapping>``'s
     own filter-name - the exact same join ``_servlet_class_by_name``
@@ -6605,11 +6630,12 @@ def _filter_class_by_name(
                 class_value=decoded_class.strip() if not class_blank else None,
                 jsp_path=None, class_undecodable=class_blank, block_start=block_match.start(),
             ))
-    for name, qualified_name in (annotation_declared_names or {}).items():
-        declarations.setdefault(name, []).append(_DescriptorDeclaration(
-            class_value=qualified_name, jsp_path=None, class_undecodable=False,
-            block_start=-1,
-        ))
+    for name, qualified_names in (annotation_declared_names or {}).items():
+        for qualified_name in qualified_names:
+            declarations.setdefault(name, []).append(_DescriptorDeclaration(
+                class_value=qualified_name, jsp_path=None, class_undecodable=False,
+                block_start=-1,
+            ))
     return _resolve_descriptor_declarations(declarations), name_undecodable
 
 
@@ -6729,8 +6755,8 @@ DUPLICATE_ROUTE_TARGET_CAVEAT = (
 def parse_web_xml(
     relative_path: str, text: str,
     *,
-    annotation_declared_servlet_names: dict[str, str] | None = None,
-    annotation_declared_filter_names: dict[str, str] | None = None,
+    annotation_declared_servlet_names: dict[str, list[str]] | None = None,
+    annotation_declared_filter_names: dict[str, list[str]] | None = None,
 ) -> tuple[
     list[JavaEntryPointClaim], list[JavaAdapterProblem], list[JavaEdgeClaim],
     list[tuple[str, list[str]]],
@@ -6754,6 +6780,14 @@ def parse_web_xml(
     instantiable class that annotation decorates - both now resolve
     through :func:`_servlet_class_by_name`/:func:`_filter_class_by_name`
     directly, no separate mechanism needed.
+
+    MICRO-ROUND 50 (Cluster 2, M1 BLOCKER): widened from name ->
+    qualified_name to name -> a LIST of every qualified_name declared
+    for it - see ``_servlet_class_by_name``'s own docstring for why (two
+    DIFFERENT classes annotating the identical name must both reach the
+    conflict machinery, never have ``worker.py``'s own accumulation
+    silently pick a walk-order-dependent winner before either registry
+    function ever sees more than one candidate).
 
     FIX ROUND 27 (twenty-third cold read, F4, mechanism confirmed): a
     web.xml-declared route/filter published a real ENTRY POINT but no

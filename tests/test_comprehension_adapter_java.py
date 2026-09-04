@@ -6575,7 +6575,7 @@ def test_parse_web_xml_a_mapping_naming_an_annotation_only_servlet_resolves_to_i
 """
     entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
         "WEB-INF/web.xml", web_xml,
-        annotation_declared_servlet_names={"Checkout": "com.acme.CheckoutServlet"})
+        annotation_declared_servlet_names={"Checkout": ["com.acme.CheckoutServlet"]})
     assert len(entry_points) == 1
     assert entry_points[0].qualified_name == "com.acme.CheckoutServlet"
     assert not any(p.reason_code == "undeclared_descriptor_name" for p in problems)
@@ -6592,7 +6592,7 @@ def test_parse_web_xml_a_mapping_naming_an_annotation_only_filter_resolves_to_it
 """
     entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
         "WEB-INF/web.xml", web_xml,
-        annotation_declared_filter_names={"Auth": "com.acme.AuthFilter"})
+        annotation_declared_filter_names={"Auth": ["com.acme.AuthFilter"]})
     assert len(entry_points) == 1
     assert entry_points[0].qualified_name == "com.acme.AuthFilter"
     assert not any(p.reason_code == "undeclared_descriptor_name" for p in problems)
@@ -6612,7 +6612,7 @@ def test_parse_web_xml_a_genuinely_undeclared_name_control_still_flags():
 """
     entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
         "WEB-INF/web.xml", web_xml,
-        annotation_declared_servlet_names={"Checkout": "com.acme.CheckoutServlet"})
+        annotation_declared_servlet_names={"Checkout": ["com.acme.CheckoutServlet"]})
     assert entry_points[0].qualified_name == "WEB-INF/web.xml#Ghost"
     assert any(p.reason_code == "undeclared_descriptor_name" for p in problems)
 
@@ -6637,7 +6637,42 @@ def test_parse_web_xml_a_name_declared_differently_by_xml_and_annotation_conflic
 """
     _entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
         "WEB-INF/web.xml", web_xml,
-        annotation_declared_servlet_names={"Checkout": "com.acme.AnnotationCheckoutServlet"})
+        annotation_declared_servlet_names={"Checkout": ["com.acme.AnnotationCheckoutServlet"]})
+    assert any(p.reason_code == "duplicate_descriptor_name" for p in problems)
+
+
+def test_parse_web_xml_two_annotation_only_servlets_declaring_the_same_name_conflict():
+    """MICRO-ROUND 50 (Cluster 2, M1 BLOCKER, wrong-data): TWO different
+    classes both declaring @WebServlet(name="dup") - no XML <servlet>
+    element involved at all - must conflict through the SAME mechanism
+    as two disagreeing XML declarations, never silently resolve to
+    whichever one this run's own annotation_declared_servlet_names list
+    happens to carry first or last."""
+    web_xml = """<web-app>
+  <servlet-mapping>
+    <servlet-name>dup</servlet-name>
+    <url-pattern>/dup</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    _entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
+        "WEB-INF/web.xml", web_xml,
+        annotation_declared_servlet_names={"dup": ["com.acme.A", "com.acme.B"]})
+    assert any(p.reason_code == "duplicate_descriptor_name" for p in problems)
+
+
+def test_parse_web_xml_two_annotation_only_filters_declaring_the_same_name_conflict():
+    """MICRO-ROUND 50 (Cluster 2, M1's own @WebFilter twin)."""
+    web_xml = """<web-app>
+  <filter-mapping>
+    <filter-name>dup</filter-name>
+    <url-pattern>/dup</url-pattern>
+  </filter-mapping>
+</web-app>
+"""
+    _entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
+        "WEB-INF/web.xml", web_xml,
+        annotation_declared_filter_names={"dup": ["com.acme.A", "com.acme.B"]})
     assert any(p.reason_code == "duplicate_descriptor_name" for p in problems)
 
 

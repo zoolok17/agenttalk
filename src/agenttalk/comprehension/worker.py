@@ -527,8 +527,19 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
     # loop finishes (below) - by then this dict is fully populated
     # regardless of the original iteration order, and every .java file
     # is still read and parsed exactly once.
-    annotation_declared_servlet_names: dict[str, str] = {}
-    annotation_declared_filter_names: dict[str, str] = {}
+    # MICRO-ROUND 50 (Cluster 2, M1 BLOCKER, wrong-data): widened from
+    # name -> ONE qualified_name (a plain ``dict.update()`` below used to
+    # silently pick whichever .java file this run's own walk happened to
+    # visit LAST as the sole owner of a duplicated @WebServlet/@WebFilter
+    # name) to name -> a LIST of every qualified_name declared for it -
+    # see java.py's own ``_servlet_class_by_name`` docstring for why this
+    # is what lets its conflict machinery see (and correctly conflict) a
+    # name TWO DIFFERENT classes both declare via annotations alone, the
+    # same "no declaration is authoritative by execution order" outcome
+    # its XML <servlet>/<filter> twin already gets for the identical
+    # shape.
+    annotation_declared_servlet_names: dict[str, list[str]] = {}
+    annotation_declared_filter_names: dict[str, list[str]] = {}
     deferred_web_xml: list[tuple[str, bytes]] = []
 
     # MICRO-ROUND 49 (M2 MAJOR, wrong-data): a small, cheap pre-scan for
@@ -717,8 +728,15 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                 # across every .java file this run scans - see this
                 # function's own docstring for why web.xml's own
                 # processing is deferred to see the FULL set.
-                annotation_declared_servlet_names.update(result.web_servlet_declared_names)
-                annotation_declared_filter_names.update(result.web_filter_declared_names)
+                #
+                # MICRO-ROUND 50 (Cluster 2, M1 BLOCKER): appends rather
+                # than a plain dict.update() - see the accumulator's own
+                # docstring above for why a walk-order-dependent single
+                # winner must never be picked here.
+                for name, qualified_name in result.web_servlet_declared_names.items():
+                    annotation_declared_servlet_names.setdefault(name, []).append(qualified_name)
+                for name, qualified_name in result.web_filter_declared_names.items():
+                    annotation_declared_filter_names.setdefault(name, []).append(qualified_name)
                 # BLOCKER 1b (fifth cold read, fix round 8): a parse that
                 # SUCCEEDS but extracts ZERO units used to count as
                 # positive adapter evidence with no problem recorded at
