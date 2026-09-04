@@ -6544,6 +6544,67 @@ def _resolve_descriptor_declarations(
     )
 
 
+def annotation_only_descriptor_conflicts(
+    annotation_declared_names: dict[str, list[str]], *, element: str,
+) -> tuple[list[JavaAdapterProblem], list[tuple[str, list[str]]]]:
+    """MICRO-NOD 50c (F1, completeness - reviewer-3's own "the feature's
+    own stated population" finding): the descriptor-independent twin of
+    :func:`_servlet_class_by_name`'s/:func:`_filter_class_by_name`'s own
+    conflict detection below - for the DOMINANT modern shape (an
+    annotation-only, descriptor-less Servlet 3.0+ app, no web.xml at
+    all), neither of those two functions ever runs, since nothing calls
+    :func:`parse_web_xml` when this run's own scan finds no web.xml at
+    all - two ``@WebServlet(name="dup")`` classes with disagreeing
+    qualified names then published complete/0 silence, even though the
+    identical two classes plus an EMPTY ``<web-app/>`` already correctly
+    conflict (the annotation-injection path into the XML registry
+    already worked; only the case with NO registry to inject INTO at
+    all was unreachable).
+
+    Runs PURELY over the accumulated annotation registry - the SAME
+    declarations -> :func:`_resolve_descriptor_declarations` conflict
+    resolution the XML-anchored twin already uses, with no XML content
+    at all (every declaration's own ``block_start`` is ``-1``, the
+    identical synthetic marker the XML-anchored injection already uses
+    for an annotation-sourced declaration - see that function's own
+    docstring). ``element`` is ``"servlet"`` or ``"filter"`` (matches
+    the anchor shape :func:`_servlet_class_by_name`'s/
+    :func:`_filter_class_by_name`'s own ``descriptor_name_conflicts``
+    already use, so the SAME :func:`modules_artifact._populate_
+    descriptor_name_conflicts` machinery stamps a real ``conflict_id``
+    on the real candidate classes here too, with no second, parallel
+    stamping mechanism needed).
+
+    Returns ``(problems, descriptor_name_conflicts)`` - the caller
+    (``worker.py``) is responsible for attributing each problem to a
+    worker-level record (there is no single file to anchor to - the
+    same "two real owners involved" reasoning the XML-anchored twin's
+    own synthetic ``qualified_name`` already uses, one level up)."""
+    declarations: dict[str, list[_DescriptorDeclaration]] = {}
+    for name, qualified_names in annotation_declared_names.items():
+        for qualified_name in qualified_names:
+            declarations.setdefault(name, []).append(_DescriptorDeclaration(
+                class_value=qualified_name, jsp_path=None, class_undecodable=False,
+                block_start=-1,
+            ))
+    registry = _resolve_descriptor_declarations(declarations)
+    problems: list[JavaAdapterProblem] = []
+    descriptor_name_conflicts: list[tuple[str, list[str]]] = []
+    for name, candidate_labels in sorted(registry.conflicts.items()):
+        problems.append(JavaAdapterProblem(
+            reason_code="duplicate_descriptor_name",
+            detail=bounded_detail(
+                f"two or more @Web{element.capitalize()} annotations declare the "
+                f"identical name={name!r} with no <{element}> descriptor element at "
+                f"all - disagreeing declarations ({', '.join(candidate_labels)}) - no "
+                "declaration is authoritative by execution order"),
+            qualified_name=f"<no descriptor>#{name}",
+        ))
+        descriptor_name_conflicts.append(
+            (f"<no descriptor>#{element}#{name}", candidate_labels))
+    return problems, descriptor_name_conflicts
+
+
 def _servlet_class_by_name(
     sanitized: str, structural: str, text: str,
     *, annotation_declared_names: dict[str, list[str]] | None = None,

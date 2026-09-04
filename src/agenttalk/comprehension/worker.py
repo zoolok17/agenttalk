@@ -78,6 +78,16 @@ def _rel_is_under_deployment_root(rel: str, deployment_root: str) -> bool:
     return rel_posix == deployment_root or rel_posix.startswith(f"{deployment_root}/")
 
 
+#: MICRO-NOD 50c (F1): the WorkerProblem attribution for an annotation-
+#: only descriptor-name conflict (see java_adapter.annotation_only_
+#: descriptor_conflicts) - there is no single web.xml (or any other
+#: file) to blame for a conflict between two ANNOTATIONS, the identical
+#: "two real owners involved, no single one to anchor to" reasoning the
+#: XML-anchored twin's own synthetic qualified_name already uses, one
+#: level up (WorkerProblem.relative_path is a required, non-Optional
+#: field, unlike JavaAdapterProblem.qualified_name - this sentinel is
+#: never a real, reachable path on any platform).
+_NO_DESCRIPTOR_SENTINEL_PATH = "<no descriptor>"
 _ADAPTER_EXTENSIONS = {".java": java_adapter}
 _ADAPTER_HANDLED_XML_BASENAMES = frozenset({"pom.xml", "web.xml"})
 #: FIX ROUND 16 (twelfth cold read, B4 BLOCKER, wrong-data): INVERTED
@@ -441,6 +451,14 @@ class WorkerResult:
     #: dependency) that must be visible without driving the run to
     #: degraded the way a real problem does.
     exclusions: dict[str, int] = field(default_factory=dict)
+    #: MICRO-NOD 50c (F1, completeness): descriptor-name conflicts found
+    #: PURELY over the annotation registry when this run's own scan found
+    #: NO web.xml at all (java_adapter.annotation_only_descriptor_
+    #: conflicts's own return value, aggregated across servlet+filter) -
+    #: the SAME shape/consumer as each web.xml JavaFileResult's own
+    #: per-file ``descriptor_name_conflicts`` field, just not anchored to
+    #: any one file, so it lives at the WorkerResult level instead.
+    descriptor_name_conflicts: list[tuple[str, list[str]]] = field(default_factory=list)
 
 
 def _decode_text_or_flag_undecodable(
@@ -1164,9 +1182,39 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                            "web.xml shape, not a legitimately empty descriptor",
                 ))
 
+    # MICRO-NOD 50c (F1 BLOCKER, completeness): a descriptor-independent
+    # trigger for the SAME duplicate-annotation-name conflict detection
+    # `deferred_web_xml`'s own loop above already runs whenever a
+    # web.xml exists - see java_adapter.annotation_only_descriptor_
+    # conflicts's own docstring for why this population (annotation-
+    # only, no web.xml at all) was previously silent. Only when NO
+    # web.xml was found at all: when one exists, parse_web_xml already
+    # sees the FULL registry (worker.py always passes the complete
+    # accumulated dict regardless of file order) and already correctly
+    # detects the identical conflict - running this too would publish
+    # the SAME conflict twice, under two different synthetic anchors.
+    descriptor_name_conflicts: list[tuple[str, list[str]]] = []
+    if not deferred_web_xml:
+        for element, registry in (
+            ("servlet", annotation_declared_servlet_names),
+            ("filter", annotation_declared_filter_names),
+        ):
+            annotation_problems, annotation_conflicts = (
+                java_adapter.annotation_only_descriptor_conflicts(registry, element=element)
+            )
+            for adapter_problem in annotation_problems:
+                problems.append(WorkerProblem(
+                    reason_code=adapter_problem.reason_code,
+                    relative_path=_NO_DESCRIPTOR_SENTINEL_PATH,
+                    detail=adapter_problem.detail,
+                    qualified_name=adapter_problem.qualified_name,
+                ))
+            descriptor_name_conflicts.extend(annotation_conflicts)
+
     return WorkerResult(
         schema_version=WORKER_SCHEMA_VERSION, file_claims=claims, problems=problems,
         java_results=java_results, exclusions=exclusions,
+        descriptor_name_conflicts=descriptor_name_conflicts,
     )
 
 
@@ -1202,6 +1250,15 @@ def _result_to_json(result: WorkerResult) -> dict[str, Any]:
         # round-trip - see test_worker_result_json_round_trip_preserves_
         # every_field, the reviewer's repro made permanent.
         "java_results": result.java_results,
+        # MICRO-NOD 50c (F1): every WorkerResult field must round-trip
+        # across the real sanitized-worker subprocess boundary - see
+        # reviewer-3's own B-1 finding right above (java_results) for
+        # why this is not merely a style nit; a field silently dropped
+        # here means the REAL worker path loses it while every in-
+        # process test calling process_paths() directly never would.
+        "descriptor_name_conflicts": [
+            [anchor, list(candidates)] for anchor, candidates in result.descriptor_name_conflicts
+        ],
     }
 
 
@@ -1232,11 +1289,16 @@ def _result_from_json(payload: Any) -> WorkerResult:
         ]
         java_results = dict(payload.get("java_results", {}))
         exclusions = dict(payload.get("exclusions", {}))
+        descriptor_name_conflicts = [
+            (anchor, list(candidates))
+            for anchor, candidates in payload.get("descriptor_name_conflicts", [])
+        ]
     except (KeyError, TypeError) as exc:
         raise WorkerError(f"worker output is malformed: {exc}") from exc
     return WorkerResult(
         schema_version=WORKER_SCHEMA_VERSION, file_claims=claims, problems=problems,
         java_results=java_results, exclusions=exclusions,
+        descriptor_name_conflicts=descriptor_name_conflicts,
     )
 
 

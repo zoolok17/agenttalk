@@ -85,7 +85,33 @@ class StagingReclaimFailed(ComprehensionError):
     on-this-host directory an operator must clear by hand (the SAME
     manual-intervention shape a permanently unrecoverable scan.lock
     already has via ``--recover-stale-lock``) until a future round
-    measures this as a common-enough gap to justify the new surface."""
+    measures this as a common-enough gap to justify the new surface.
+
+    MICRO-NOD 50c (F4, clarified - reviewer-3 could not reach this path
+    with a REAL undeletable-directory OS reproduction; its shape got
+    correct RETENTION plus a fresh staging dir alongside it instead):
+    RETENTION (``_classify_one_staging_dir`` returning ``"retain"``,
+    never attempting a delete at all) is the NORMAL outcome for the
+    overwhelming majority of ambiguous/live/unverifiable owners - no
+    deletion is ever ATTEMPTED for those, so there is nothing here for
+    an OS-level failure to interrupt. This exception fires ONLY for the
+    narrower, rarer shape: the owner was already independently PROVEN
+    DEAD (``process_observation`` reports "dead", making the directory
+    eligible for automatic reclaim in the first place) and the deletion
+    attempt ``shutil.rmtree`` then makes ANYWAY fails at the OS level -
+    a dead owner whose OWN files somehow remain locked/undeletable
+    (a lingering handle from a different process, a stuck network
+    share, an antivirus scan in progress, ...), not merely "a live
+    process is still using this directory" (that case never reaches a
+    delete attempt at all - it is retained instead, correctly, by the
+    check immediately above this one in the classify function).
+    ``test_comprehension_staging.py::test_reclaim_raises_a_named_
+    refusal_when_the_directory_cannot_be_deleted`` exercises this exact
+    narrower shape directly (monkeypatching ``process_observation`` to
+    report "dead" AND ``shutil.rmtree`` to fail, independently - the
+    real-world OS combination this simulates is genuinely rarer than an
+    ordinary locked-file-held-by-a-live-process case, which is why a
+    live reproduction attempt naturally lands on retention instead)."""
 
     reason_code = "comprehension_staging_reclaim_failed"
 

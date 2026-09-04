@@ -397,15 +397,21 @@ def test_enumerate_scope_a_properties_file_under_target_classes_stays_silent(
 def test_enumerate_scope_a_groovy_file_under_target_classes_stays_silent(
     tmp_path: Path,
 ) -> None:
-    """MICRO-ROUND 50 (Cluster 1, B5, the judged exclusion): unlike
-    .java/.kt/.scala, a real Groovy build commonly ships raw ``.groovy``
-    files LOADED AT RUNTIME FROM THE CLASSPATH (Grails, Jenkins Job DSL,
-    Spock config scripts, ...), never compiled ahead of time - a
-    legitimate resource-copy target this producer cannot distinguish
-    from "stray compiled-away source" without executing the build.
-    Deliberately excluded from the narrower JVM-compiled-source set (see
-    ``_JVM_COMPILED_SOURCE_EXTENSIONS``'s own docstring) - stays exempt,
-    unchanged by this round's fix."""
+    """MICRO-ROUND 50 (Cluster 1, B5, the judged exclusion). MICRO-NOD
+    50c (F3, reviewer-3's own row-relabel correction): this is a
+    PREVALENCE-judged tradeoff, not a structural fact like .java/.kt/
+    .scala's own airtight "always compiled away" claim - a real Grails
+    application genuinely COMPILES its own .groovy application source
+    ahead of time (groovyc), the exact "stray compiled-away source"
+    shape this exemption exists to catch, so this fixture's own
+    ``Config.groovy`` COULD be real, hidden, compiled application code.
+    Excluded anyway because the identical extension also ships, just as
+    commonly, as a raw runtime-loaded classpath script (Jenkins Job DSL,
+    Spock config scripts, ...) this producer cannot tell apart without
+    executing the build - accepted as a named, judged risk (the round-16
+    dilution reasoning), never a claim that the compiled-application-
+    source shape cannot exist here. See ``_JVM_COMPILED_SOURCE_
+    EXTENSIONS``'s own docstring for the full tradeoff."""
     classes_dir = tmp_path / "target" / "classes"
     classes_dir.mkdir(parents=True)
     (classes_dir / "Config.groovy").write_text(

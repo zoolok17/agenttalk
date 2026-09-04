@@ -3327,6 +3327,173 @@ def test_run_scan_a_duplicate_servlet_name_with_conflicting_classes_publishes_a_
             assert signal["reason_code"] == "duplicate_descriptor_name"
 
 
+def test_run_scan_a_duplicate_annotation_only_servlet_name_with_no_descriptor_at_all_conflicts(
+    java_repo: Path,
+) -> None:
+    """MICRO-NOD 50c (F1 BLOCKER, completeness - reviewer-3's own "the
+    feature's own stated population" finding): two @WebServlet(name=
+    "dup") classes with DISAGREEING qualified names, and NO web.xml at
+    all anywhere in the scan, used to publish complete/0 silence - the
+    identical two classes plus an EMPTY <web-app/> already correctly
+    conflicted (the annotation-injection path into the XML registry
+    already worked), but annotation-only, descriptor-less Servlet 3.0+
+    apps (the DOMINANT modern shape, and exactly the population
+    "annotation-declared names" describes) never reached the conflict
+    machinery at all, since nothing ever called parse_web_xml. Reproduced
+    exactly as measured: conflict now recorded, naming both candidates,
+    both classes share a conflict_id, both report entry_points_mapped/
+    feature_linked unknown - never a confident negative for either,
+    never silence on a "complete" run."""
+    import json
+
+    web_dir = java_repo / "src" / "main" / "java" / "com" / "acme" / "web"
+    web_dir.mkdir(parents=True)
+    (web_dir / "ServletA.java").write_text(
+        "package com.acme.web;\n"
+        "@WebServlet(name = \"dup\", urlPatterns = {\"/a\"})\n"
+        "public class ServletA extends HttpServlet {\n}\n",
+        encoding="utf-8")
+    (web_dir / "ServletB.java").write_text(
+        "package com.acme.web;\n"
+        "@WebServlet(name = \"dup\", urlPatterns = {\"/b\"})\n"
+        "public class ServletB extends HttpServlet {\n}\n",
+        encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matching = [p for p in problems_doc["problems"] if p["reason_code"] == "duplicate_descriptor_name"]
+    assert len(matching) == 1
+    assert "com.acme.web.ServletA" in matching[0]["detail"]
+    assert "com.acme.web.ServletB" in matching[0]["detail"]
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    servlet_a = next(u for u in modules_doc["units"] if u["display_name"] == "ServletA")
+    servlet_b = next(u for u in modules_doc["units"] if u["display_name"] == "ServletB")
+    assert servlet_a["conflict_id"] is not None
+    assert servlet_a["conflict_id"] == servlet_b["conflict_id"]
+    assert servlet_a["conflict_kind"] == "duplicate_descriptor_name"
+    assert servlet_b["conflict_kind"] == "duplicate_descriptor_name"
+
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    for unit_id in (servlet_a["unit_id"], servlet_b["unit_id"]):
+        for check in ("entry_points_mapped", "feature_linked"):
+            signal = next(
+                s for s in readiness_doc["signals"]
+                if s["unit_id"] == unit_id and s["check"] == check)
+            assert signal["stored_status"] == "unknown"
+            assert signal["reason_code"] == "duplicate_descriptor_name"
+
+
+def test_run_scan_the_identical_annotation_only_conflict_with_an_empty_descriptor_is_unchanged(
+    java_repo: Path,
+) -> None:
+    """MICRO-NOD 50c (F1's own control - the reviewer's own comparison
+    point): the IDENTICAL two-class conflict above, but with a genuinely
+    EMPTY <web-app/> also present, must publish the SAME outcome -
+    proving the new descriptor-independent trigger correctly steps ASIDE
+    once a real web.xml exists (parse_web_xml already handles this case
+    correctly; running the new path too would publish the same conflict
+    twice, under two different synthetic anchors)."""
+    import json
+
+    web_dir = java_repo / "src" / "main" / "java" / "com" / "acme" / "web"
+    web_dir.mkdir(parents=True)
+    (web_dir / "ServletA.java").write_text(
+        "package com.acme.web;\n"
+        "@WebServlet(name = \"dup\", urlPatterns = {\"/a\"})\n"
+        "public class ServletA extends HttpServlet {\n}\n",
+        encoding="utf-8")
+    (web_dir / "ServletB.java").write_text(
+        "package com.acme.web;\n"
+        "@WebServlet(name = \"dup\", urlPatterns = {\"/b\"})\n"
+        "public class ServletB extends HttpServlet {\n}\n",
+        encoding="utf-8")
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_text("<web-app/>\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matching = [p for p in problems_doc["problems"] if p["reason_code"] == "duplicate_descriptor_name"]
+    assert len(matching) == 1  # never two, from two different synthetic anchors
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    servlet_a = next(u for u in modules_doc["units"] if u["display_name"] == "ServletA")
+    servlet_b = next(u for u in modules_doc["units"] if u["display_name"] == "ServletB")
+    assert servlet_a["conflict_id"] == servlet_b["conflict_id"]
+    assert servlet_a["conflict_kind"] == "duplicate_descriptor_name"
+
+
+def test_run_scan_a_single_annotation_declared_servlet_name_with_no_descriptor_stays_silent(
+    java_repo: Path,
+) -> None:
+    """Control: exactly ONE class declaring @WebServlet(name="dup"), no
+    web.xml at all - must never be mistaken for a conflict (the
+    descriptor-independent trigger only fires on 2+ DISAGREEING
+    qualified names for the identical name)."""
+    import json
+
+    web_dir = java_repo / "src" / "main" / "java" / "com" / "acme" / "web"
+    web_dir.mkdir(parents=True)
+    (web_dir / "ServletA.java").write_text(
+        "package com.acme.web;\n"
+        "@WebServlet(name = \"dup\", urlPatterns = {\"/a\"})\n"
+        "public class ServletA extends HttpServlet {\n}\n",
+        encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    assert not any(p["reason_code"] == "duplicate_descriptor_name" for p in problems_doc["problems"])
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    servlet_a = next(u for u in modules_doc["units"] if u["display_name"] == "ServletA")
+    assert servlet_a["conflict_id"] is None
+
+
+def test_run_scan_a_servlet_and_filter_sharing_a_name_without_a_descriptor_never_cross_conflict(
+    java_repo: Path,
+) -> None:
+    """MICRO-NOD 50c (F1's own servlet/filter interplay probe - the
+    reviewer declared this partial): a @WebServlet AND a @WebFilter
+    sharing the identical name string ("dup") occupy SEPARATE Servlet-
+    spec namespaces (s8.2.3: servlet-name and filter-name are distinct
+    registries) - the descriptor-independent trigger runs the servlet
+    and filter registries independently (never comparing one against
+    the other), so this must never be mistaken for a conflict between
+    them, with no web.xml at all to fall back on either."""
+    import json
+
+    web_dir = java_repo / "src" / "main" / "java" / "com" / "acme" / "web"
+    web_dir.mkdir(parents=True)
+    (web_dir / "ServletA.java").write_text(
+        "package com.acme.web;\n"
+        "@WebServlet(name = \"dup\", urlPatterns = {\"/a\"})\n"
+        "public class ServletA extends HttpServlet {\n}\n",
+        encoding="utf-8")
+    (web_dir / "FilterA.java").write_text(
+        "package com.acme.web;\n"
+        "@WebFilter(filterName = \"dup\", urlPatterns = {\"/a\"})\n"
+        "public class FilterA implements Filter {\n}\n",
+        encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    assert not any(p["reason_code"] == "duplicate_descriptor_name" for p in problems_doc["problems"])
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    servlet_a = next(u for u in modules_doc["units"] if u["display_name"] == "ServletA")
+    filter_a = next(u for u in modules_doc["units"] if u["display_name"] == "FilterA")
+    assert servlet_a["conflict_id"] is None
+    assert filter_a["conflict_id"] is None
+
+
 def test_run_scan_a_descriptor_conflict_with_only_one_in_scan_candidate_reports_unknown(
     java_repo: Path,
 ) -> None:

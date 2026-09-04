@@ -466,20 +466,28 @@ _RECOGNIZED_BUILD_OUTPUT_RESOURCE_POSITIONS = (
 #: source-shaped resource: ``.java``/``.kt``/``.scala``.
 #:
 #: ``.groovy`` is DELIBERATELY EXCLUDED from this narrower set, despite
-#: being in ``_DEGRADABLE_EXCLUDED_EXTENSIONS`` - reviewer-3's own
-#: point, judged: unlike the other three, a real, common Groovy build
-#: shape (Grails, Jenkins Job DSL, Spock config scripts, ...) ships raw
-#: ``.groovy`` files that are LOADED AT RUNTIME FROM THE CLASSPATH,
-#: never compiled ahead of time - a legitimate resource-copy target this
-#: producer has no way to distinguish from "stray compiled-away source"
-#: without executing the build. Declaring `.java`/`.kt`/`.scala` (never
-#: legitimately a runtime-loaded script) poisons unconditionally is safe
-#: and closes the measured gap; additionally declaring `.groovy` would
-#: risk a NEW false-positive poison on an otherwise-correct, common
-#: build shape this round never measured - left exempted (as every
-#: extension outside this narrower set already is) until a future round
-#: measures the "stray real .groovy source under classes/" shape as a
-#: genuine, common gap worth the tradeoff.
+#: being in ``_DEGRADABLE_EXCLUDED_EXTENSIONS`` - MICRO-NOD 50c (F3,
+#: reviewer-3's own row-relabel correction): this is a PREVALENCE-
+#: judged TRADEOFF, not a structural fact the way the three included
+#: extensions (or the dot-prefix rule elsewhere in this module) are.
+#: Unlike ``.java``/``.kt``/``.scala`` - never legitimately anything BUT
+#: compiled-away source, a closed, airtight claim - ``.groovy`` is
+#: GENUINELY AMBIGUOUS: a real Grails application COMPILES its own
+#: ``.groovy`` application source ahead of time (groovyc), the exact
+#: "stray compiled-away source" shape this exemption exists to catch,
+#: so declaring ``.groovy`` here WOULD close a real, measurable gap, not
+#: a hypothetical one. It is excluded anyway because the SAME extension
+#: also ships, just as commonly, as a raw runtime-loaded classpath
+#: script (Jenkins Job DSL, Spock config scripts, ...) that this
+#: producer cannot distinguish from the compiled-application-source
+#: case without executing the build - widening the poison-triggering
+#: set to catch the real Grails shape risks the identical round-16
+#: DILUTION this producer already rejected once for a different
+#: position (a rule that fires on the common, legitimate case to catch
+#: a rarer real one dilutes its own signal). Accepted as a named,
+#: judged risk - not a claim that a hidden, compiled ``.groovy`` class
+#: cannot exist here - until a future round measures which shape is
+#: actually more common in practice and revisits the tradeoff.
 _JVM_COMPILED_SOURCE_EXTENSIONS = frozenset({".java", ".kt", ".scala"})
 #: NAMED RESIDUAL, not silently dropped: an EXPLODED WAR shape
 #: (``target/<artifactId>-<version>/WEB-INF/classes/``) is NOT covered -

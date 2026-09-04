@@ -275,7 +275,20 @@ def resolve_under_root(value: Any, *, root: Path, label: str = "path") -> Path:
     offending segment and a remedy — never silently followed, never
     resolved through. Only once every segment is proven reparse-point-
     free does the existing resolve-and-confine check run, now as a
-    genuine (not vacuous) final sanity net."""
+    genuine (not vacuous) final sanity net.
+
+    MICRO-NOD 50c (F2, reviewer-3's own sharpened attack, twice):
+    ``root`` and BELOW is this function's own entire jurisdiction — it
+    never inspects ``root``'s own ANCESTORS. A reparse point placed at
+    the store's own PARENT (junctioning ``.agenttalk`` itself, one level
+    above every ``root`` this function is ever called with) is a
+    DIFFERENT invariant's job: ``lock.acquire_scan_lock``'s own
+    ``root_binding_digest``/``PrivacyProofRootMismatch`` check (a
+    resolved-project-root identity bound into the privacy proof itself,
+    verified before any lock write) catches that one, not this function
+    - a future refactor of the privacy-binding check must not assume
+    this function's own segment walk already covers it, since it does
+    not and was never meant to."""
     rel = validate_relative_path(value, label=label)
     if path_is_reparse_point_or_symlink(root):
         raise EnvelopeError(

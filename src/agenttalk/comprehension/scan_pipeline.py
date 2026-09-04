@@ -993,6 +993,14 @@ def run_scan(
             for result in java_results.values()
             for conflict in result.descriptor_name_conflicts
         ]
+        # MICRO-NOD 50c (F1 BLOCKER, completeness): worker.py's own
+        # descriptor-independent trigger (java_adapter.annotation_only_
+        # descriptor_conflicts, run only when this scan found NO web.xml
+        # at all) - not anchored to any single file's own java_results
+        # entry, so it lives at the WorkerResult level instead and is
+        # folded in here, same downstream consumer (modules_artifact.
+        # build_modules) as the per-file ones above.
+        descriptor_name_conflicts += list(worker_result.descriptor_name_conflicts)
         modules = modules_artifact.build_modules(
             discovery_result, java_results,
             worker_problem_reasons_by_path=worker_problem_reasons_by_path,
@@ -3101,7 +3109,20 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
     digests (M2, cold-read PR-B fix round 3); the design's separate
     EXTERNAL-evidence-pointer revalidation step has nothing to revalidate
     yet in this slice (see module docstring) - ``external_revalidation``
-    is reported as an explicit, named gap rather than silently omitted."""
+    is reported as an explicit, named gap rather than silently omitted.
+
+    NAMED RESIDUAL (MICRO-NOD 50c, reviewer-3's own note, defensible):
+    this only ever reads and verifies the artifacts THIS run's own index
+    entry names - a FOREIGN file planted directly inside a published
+    ``runs/<scan_id>/`` directory (never referenced by any artifact's
+    own digest-summary entry, so never read, never digested, never
+    compared against anything) is invisible to every check here. This
+    producer's own privacy/integrity model is about proving the
+    artifacts it PUBLISHED were not tampered with after the fact, never
+    about detecting arbitrary extra content an operator (or another
+    process with filesystem access) chose to drop alongside them -
+    genuinely out of this function's own stated scope, not a gap in how
+    it does its job."""
     comprehension_dir = paths.comprehension_dir(Path(root).resolve() / ".agenttalk")
     index_doc, _digest = publish.read_current_index(comprehension_dir)
     if index_doc is None:
