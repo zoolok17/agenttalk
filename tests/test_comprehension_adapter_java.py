@@ -1205,6 +1205,74 @@ def test_an_unclosed_block_comment_is_detected_as_malformed_not_silently_truncat
     assert any(p.reason_code == "parse_failed" for p in result.problems)
 
 
+def _line_comment_terminator_fixture_lines() -> list[str]:
+    return [
+        "package p;",
+        "// a leading line comment",
+        "import java.util.List;",
+        "",
+        "@RestController",
+        "public class Service {",
+        '  @GetMapping("/one") void a() {}',
+        "  public static void main(String[] args) {",
+        "  }",
+        "}",
+    ]
+
+
+def test_a_cr_only_file_publishes_every_declaration_after_a_line_comment():
+    """MICRO-ROUND 49 (forty-third cold read, B3 BLOCKER, wrong-data):
+    JLS 3.4 makes a bare CR a legal LineTerminator on its own (javac
+    compiles a CR-only file) - the sanitizer's own `//` line-comment
+    scan used to search only for `\\n`, which a CR-only file never
+    contains at all, so the FIRST `//` comment's own terminator search
+    always returned -1 and blanked EVERY remaining character to EOF as
+    if it were still inside that one comment. Reproduced pre-fix
+    exactly as measured: everything after the first `//` silently
+    vanished - no import, no route, no main, and (unlike the malformed-
+    literal/malformed-comment shapes above) no problem recorded either,
+    since this was never treated as an unterminated construct at all."""
+    src = "\r".join(_line_comment_terminator_fixture_lines()) + "\r"
+    result = java.parse_java_source("Service.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.Service"]
+    assert _edges(result, "import") != []
+    assert [r.target for r in _edges(result, "route")] == ["GET /one"]
+    mains = [e for e in result.entry_points if e.kind == "cli_main"]
+    assert len(mains) == 1
+    assert mains[0].qualified_name == "p.Service"
+
+
+def test_a_crlf_file_publishes_every_declaration_after_a_line_comment_control():
+    """Control for the CR-only fix: CRLF (already worked pre-fix, since
+    a bare `\\n` search finds the `\\n` half of a CRLF pair too) must
+    keep working identically."""
+    src = "\r\n".join(_line_comment_terminator_fixture_lines()) + "\r\n"
+    result = java.parse_java_source("Service.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.Service"]
+    assert _edges(result, "import") != []
+    assert [r.target for r in _edges(result, "route")] == ["GET /one"]
+    mains = [e for e in result.entry_points if e.kind == "cli_main"]
+    assert len(mains) == 1
+
+
+def test_a_mixed_line_terminator_file_publishes_every_declaration_after_a_line_comment():
+    """Mixed-terminator control: a file whose lines end in CR, LF, and
+    CRLF in no consistent pattern (a legacy file re-saved across tools/
+    platforms without normalization) - every declaration after the
+    comment must still publish regardless of which terminator follows
+    THAT specific comment."""
+    lines = _line_comment_terminator_fixture_lines()
+    terminator_cycle = ["\n", "\r", "\r\n"]
+    terminators = [terminator_cycle[i % len(terminator_cycle)] for i in range(len(lines))]
+    src = "".join(line + term for line, term in zip(lines, terminators, strict=True))
+    result = java.parse_java_source("Service.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.Service"]
+    assert _edges(result, "import") != []
+    assert [r.target for r in _edges(result, "route")] == ["GET /one"]
+    mains = [e for e in result.entry_points if e.kind == "cli_main"]
+    assert len(mains) == 1
+
+
 def test_a_file_truncated_mid_class_with_no_unterminated_literal_still_reports_parse_failed():
     """M (cold-read PR-B fix round 47 completeness, "JUDGE this one
     seriously - borders wrong-data"): a file chopped off mid-declaration
@@ -3379,6 +3447,86 @@ def test_parse_maven_pom_excludes_plugin_scoped_dependencies():
     assert profile_scoped_count == 0
 
 
+def test_parse_maven_pom_dependency_with_exclusions_before_coordinates_still_extracts_its_own_identity():
+    """MICRO-ROUND 49 (forty-third cold read, B1 BLOCKER, wrong-data):
+    a <dependency>'s own <exclusions><exclusion><groupId>/<artifactId>
+    (one level deeper, same tag names) used to win a bare, unscoped
+    .search over the whole block body - Maven's own model is xs:all
+    (element order is never authoritative), so <exclusions> is legally
+    allowed to come BEFORE the dependency's own coordinate elements, and
+    that ordering made the EXCLUSION's own coordinate publish as this
+    dependency's own identity: the real spring-core edge vanished
+    entirely, replaced by a fabricated internal edge to org.slf4j:
+    slf4j-api. Reproduced pre-fix exactly as measured."""
+    pom = """<project>
+  <dependencies>
+    <dependency>
+      <exclusions>
+        <exclusion>
+          <groupId>org.slf4j</groupId>
+          <artifactId>slf4j-api</artifactId>
+        </exclusion>
+      </exclusions>
+      <groupId>org.springframework</groupId>
+      <artifactId>spring-core</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.springframework:spring-core"}
+
+
+def test_parse_maven_pom_dependency_with_exclusions_after_coordinates_control():
+    """Control for the fix above: the ORDINARY ordering (coordinates
+    first, exclusions last) already worked before this round and must
+    keep working identically - the fix must not narrow this case."""
+    pom = """<project>
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework</groupId>
+      <artifactId>spring-core</artifactId>
+      <exclusions>
+        <exclusion>
+          <groupId>org.slf4j</groupId>
+          <artifactId>slf4j-api</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.springframework:spring-core"}
+
+
+def test_parse_maven_pom_dependency_with_multiple_exclusions_before_coordinates():
+    """Order-permutation control: more than one <exclusion> nested
+    before the dependency's own coordinates - the fix must skip the
+    WHOLE <exclusions> subtree, not merely its first child."""
+    pom = """<project>
+  <dependencies>
+    <dependency>
+      <exclusions>
+        <exclusion>
+          <groupId>org.slf4j</groupId>
+          <artifactId>slf4j-api</artifactId>
+        </exclusion>
+        <exclusion>
+          <groupId>commons-logging</groupId>
+          <artifactId>commons-logging</artifactId>
+        </exclusion>
+      </exclusions>
+      <groupId>org.springframework</groupId>
+      <artifactId>spring-core</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.springframework:spring-core"}
+
+
 # ----------------------------------------------------------- @WebServlet / JAX-RS (route)
 
 def test_web_servlet_annotation_publishes_its_own_url_patterns_as_routes():
@@ -3416,6 +3564,68 @@ public class DispatcherServlet extends HttpServlet {
     result = java.parse_java_source("DispatcherServlet.java", src)
     routes = _edges(result, "route")
     assert [r.target for r in routes] == ["/api/*"]
+
+
+def test_web_servlet_annotation_with_nested_web_init_param_recovers_the_top_level_route():
+    """MICRO-ROUND 49 (forty-third cold read, B2 BLOCKER, wrong-data):
+    @WebServlet's own argument span can contain a NESTED @WebInitParam
+    annotation with its own value= attribute - a bare, unscoped scan for
+    value=/path=/urlPatterns= across the WHOLE span used to match the
+    init-param's own value (textually first) and publish it as the
+    servlet's own route instead of the real, top-level urlPatterns.
+    Reproduced pre-fix exactly as measured: the init-param value
+    ('/WEB-INF/spring.xml') published as the route, the real
+    '/realroute' never recovered at all."""
+    src = """
+package p;
+
+@WebServlet(initParams = @WebInitParam(name = "config", value = "/WEB-INF/spring.xml"), urlPatterns = "/realroute")
+public class DispatcherServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("DispatcherServlet.java", src)
+    routes = _edges(result, "route")
+    assert [r.target for r in routes] == ["/realroute"]
+    assert not any(p.reason_code == "route_value_unrecoverable" for p in result.problems)
+
+
+def test_web_servlet_annotation_with_only_a_nested_init_param_and_no_top_level_route_is_enrolled():
+    """MICRO-ROUND 49 (B2's other half): a @WebServlet declaring ONLY
+    initParams (no top-level value/urlPatterns at all) used to recover
+    a FALSE route from the nested @WebInitParam's own value - correctly
+    falls through to the existing startup_only_servlet enrolment now
+    (the same 'no mapping attribute at all' shape a name-only
+    @WebServlet already gets), never a fabricated route."""
+    src = """
+package p;
+
+@WebServlet(initParams = @WebInitParam(name = "config", value = "/WEB-INF/spring.xml"))
+public class ConfigLoaderServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("ConfigLoaderServlet.java", src)
+    routes = _edges(result, "route")
+    assert routes == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert "startup_only_servlet" in problem.detail
+
+
+def test_web_servlet_annotation_with_url_patterns_before_a_nested_init_param_order_permutation():
+    """Order-permutation control for B2: urlPatterns leading, initParams
+    trailing - the pre-fix bug was order-DEPENDENT (the nested value=
+    only won because it was textually first); this ordering already
+    happened to recover the right value before the fix and must keep
+    doing so identically after it."""
+    src = """
+package p;
+
+@WebServlet(urlPatterns = "/realroute", initParams = @WebInitParam(name = "config", value = "/WEB-INF/spring.xml"))
+public class DispatcherServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("DispatcherServlet.java", src)
+    routes = _edges(result, "route")
+    assert [r.target for r in routes] == ["/realroute"]
 
 
 def test_web_filter_annotation_publishes_its_own_url_patterns_as_a_distinct_filter_kind():

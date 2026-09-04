@@ -413,8 +413,22 @@ _TEST_NAME_SUFFIX = re.compile(r"(Test|Tests|IT)$")
 #: every test framework a real codebase might use.
 _TEST_FRAMEWORK_IMPORT_PREFIXES = ("org.junit", "junit.framework", "org.testng")
 
-_PACKAGE_RE = re.compile(r"(?m)^\s*package\s+([\w.]+)\s*;")
-_IMPORT_RE = re.compile(r"(?m)^\s*import\s+(static\s+)?([\w.]+(?:\.\*)?)\s*;")
+#: MICRO-ROUND 49 (forty-third cold read, B3 BLOCKER, wrong-data - the
+#: same CR-only-file assumption as `_next_line_terminator_or_eof`, a
+#: different site): `(?m)^` is `\n`-only in Python's own `re` module -
+#: it does NOT treat a bare CR as a line boundary for MULTILINE `^`,
+#: even though JLS 3.4 does. On a CR-only file, a `package`/`import`
+#: NOT on the file's own first line (i.e. every one after the first)
+#: sat behind a `^` that could never match there, silently vanishing -
+#: exactly the "same class of defect, a different site" the round-49
+#: audit's own mandate exists to catch. `(?:\A|(?<=[\r\n]))` recognizes
+#: string-start, LF, AND bare CR as a valid line-start position (a CRLF
+#: pair's own `\n` half still satisfies it too - unchanged for the
+#: ordinary case). Deliberately still LINE-anchored, not STATEMENT-
+#: anchored (an import not first on its own physical line is a
+#: SEPARATE, already-named carry - M1, this round - left alone here).
+_PACKAGE_RE = re.compile(r"(?:\A|(?<=[\r\n]))\s*package\s+([\w.]+)\s*;")
+_IMPORT_RE = re.compile(r"(?:\A|(?<=[\r\n]))\s*import\s+(static\s+)?([\w.]+(?:\.\*)?)\s*;")
 #: BLOCKER 1a (fifth cold read, fix round 8): the OLD single fixed-shape
 #: regex (`\b(class|interface|enum)\s+(\w+)(?:\s*<[^>{]*>)?(?:\s+
 #: extends\s+([\w.<>,\s]+?))?(?:\s+implements\s+([\w.<>,\s]+?))?\s*\{`)
@@ -1242,6 +1256,30 @@ def _find_unescaped_text_block_delimiter(text: str, start: int) -> int:
     return -1
 
 
+def _next_line_terminator_or_eof(text: str, pos: int) -> int:
+    """MICRO-ROUND 49 (forty-third cold read, B3 BLOCKER, wrong-data):
+    the index of the next JLS 3.4 LineTerminator (LF, CR, or the CR of a
+    CR LF pair - a bare CR is a legal terminator on its own; javac
+    compiles a CR-only file) at or after ``pos``, or ``len(text)`` if
+    none remains. A single shared chokepoint for "where does a `//`
+    line comment end" - used identically everywhere that question is
+    asked, so a CR-only file's own answer can never drift between two
+    independent implementations (the exact class of defect this file's
+    own `_java_string_literal_span` twin already shipped once - see its
+    own MICRO-ROUND 49/m1 fix). Previously each call site searched only
+    for ``\\n`` directly: on a CR-only file, that search never finds a
+    match at all, and the caller then blanks/skips EVERY remaining
+    character to EOF as "still inside the comment" - silently deleting
+    every declaration after the first ``//`` in the file."""
+    newline = text.find("\n", pos)
+    cr = text.find("\r", pos)
+    if newline == -1:
+        return len(text) if cr == -1 else cr
+    if cr == -1:
+        return newline
+    return min(newline, cr)
+
+
 def _strip_comments_and_strings(text: str) -> tuple[str, bool]:
     """Blanks comment and string/char literal CONTENT with spaces while
     preserving every newline and the overall length/offsets, so a later
@@ -1269,8 +1307,7 @@ def _strip_comments_and_strings(text: str) -> tuple[str, bool]:
     while i < n:
         ch = text[i]
         if ch == "/" and i + 1 < n and text[i + 1] == "/":
-            j = text.find("\n", i)
-            end = n if j == -1 else j
+            end = _next_line_terminator_or_eof(text, i)
             result.append(" " * (end - i))
             i = end
         elif ch == "/" and i + 1 < n and text[i + 1] == "*":
@@ -1781,6 +1818,44 @@ def _split_top_level_commas(text: str) -> list[str]:
     return parts
 
 
+def _top_level_paren_depth_matches(
+    pattern: re.Pattern[str], text: str, *, target_depth: int = 0,
+) -> list[re.Match[str]]:
+    """MICRO-ROUND 49 (forty-third cold read, B2 BLOCKER, wrong-data):
+    every ``pattern`` match in ``text`` whose OWN start position sits at
+    ``target_depth`` parens deep - depth 0 means "not inside ANY ``(...)``
+    in this text at all" (the ordinary case); a caller whose own ``text``
+    already includes its own wrapping ``(...)`` (e.g. an annotation's
+    argument span, which always starts at its own ``(``) passes
+    ``target_depth=1`` instead, since that outer paren pushes everything
+    directly inside it to depth 1, not 0 - see the caller's own comment
+    for why. A route/entry-point annotation's argument span can itself
+    contain a NESTED annotation with its own argument list (e.g.
+    ``@WebServlet(initParams=@WebInitParam(name=..., value="..."),
+    urlPatterns="...")``) - a bare, unscoped scan for
+    ``value=``/``path=``/``urlPatterns=`` across the WHOLE span finds the
+    nested annotation's own same-named attribute first (it is textually
+    earlier), and returns ITS value as if it were this annotation's own.
+    Depth-aware across parens only - the same bracket family
+    :func:`_split_top_level_commas` already walks for a single argument
+    list, applied here to filter matches instead of splitting text."""
+    depth = 0
+    depth_at_position = [0] * len(text)
+    for i, ch in enumerate(text):
+        if ch == "(":
+            depth_at_position[i] = depth
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            depth_at_position[i] = depth
+        else:
+            depth_at_position[i] = depth
+    return [
+        match for match in pattern.finditer(text)
+        if depth_at_position[match.start()] == target_depth
+    ]
+
+
 def _matching_open_paren(sanitized: str, close_pos: int) -> int | None:
     """Backward mirror of :func:`_matching_close_paren`: given
     ``sanitized[close_pos] == ')'``, returns the index of the ``(`` that
@@ -1978,10 +2053,32 @@ def _route_paths(
     up where it previously recovered a route. Every named match is now
     tried in turn, falling back to the positional literal only once none
     of them panned out - a strictly WIDER recovery than round 6's, never
-    narrower."""
+    narrower.
+
+    MICRO-ROUND 49 (forty-third cold read, B2 BLOCKER, wrong-data): the
+    named-attribute scan is now restricted to TOP-LEVEL matches only
+    (see :func:`_top_level_paren_depth_matches`) - it used to be a bare
+    ``finditer`` over the WHOLE argument span, which also matches a
+    NESTED annotation's own same-named attribute (e.g.
+    ``@WebServlet(initParams=@WebInitParam(name=..., value="/WEB-INF/
+    spring.xml"), urlPatterns="/real")`` recovered the init-param's own
+    ``value`` - textually first - as if it were the servlet's own
+    route, and a servlet with ONLY ``initParams`` and no top-level
+    value/urlPatterns at all recovered a route from the nested
+    attribute instead of correctly falling through to the existing
+    ``startup_only_servlet``/``unsupported_entry_point_shape``
+    enrolment for "no mapping at all"."""
     sanitized_segment = sanitized[group_start:group_end]
     unrecoverable = False
-    for match in _ROUTE_NAMED_ATTR_RE.finditer(sanitized_segment):
+    # target_depth=1, not 0: sanitized_segment always starts at the
+    # annotation's OWN opening "(" (see this function's own caller,
+    # _route_annotation_span) and ends at its matching ")", so this
+    # annotation's own top-level attributes sit one paren deep already -
+    # depth 0 inside this segment would mean "outside the annotation's
+    # own parens entirely," which never happens for a real match here.
+    for match in _top_level_paren_depth_matches(
+        _ROUTE_NAMED_ATTR_RE, sanitized_segment, target_depth=1,
+    ):
         values = _route_literal_list_at(original, group_start + match.end())
         if values is None:
             unrecoverable = True
@@ -2024,16 +2121,17 @@ def _skip_whitespace_and_comments(original: str, pos: int) -> int:
     very literal this function exists to recover consumed the literal
     too, an even worse regression than the bug being fixed). The
     comment's own end is instead re-derived directly from ``original``,
-    using the identical rule ``_strip_comments_and_strings`` itself
-    uses (next ``\\n``/EOF for ``//``, next ``*/``/EOF for ``/*``)."""
+    using the identical rule ``_strip_comments_and_strings`` itself uses
+    (``_next_line_terminator_or_eof`` for ``//``, next ``*/``/EOF for
+    ``/*``) - the SAME shared chokepoint, not a second independent
+    implementation of the same rule (MICRO-ROUND 49/B3's own lesson)."""
     n = len(original)
     while pos < n:
         if original[pos].isspace():
             pos += 1
             continue
         if original[pos] == "/" and pos + 1 < n and original[pos + 1] == "/":
-            j = original.find("\n", pos)
-            pos = n if j == -1 else j
+            pos = _next_line_terminator_or_eof(original, pos)
             continue
         if original[pos] == "/" and pos + 1 < n and original[pos + 1] == "*":
             j = original.find("*/", pos + 2)
@@ -4861,6 +4959,35 @@ def _enclosing_tag_stack(sanitized: str, before: int) -> list[str]:
     return stack
 
 
+def _direct_child_leaf_match(
+    pattern: re.Pattern[str], block_structural: str,
+) -> re.Match | None:
+    """MICRO-ROUND 49 (forty-third cold read, B1 BLOCKER, wrong-data):
+    the first ``pattern`` match inside ``block_structural`` that is a
+    DIRECT CHILD of the element whose body ``block_structural`` is -
+    never one nested a level deeper. ``block_structural`` is already
+    scoped to one element's own body (via ``_body_text``), so
+    ``_enclosing_tag_stack`` computed on the SLICE itself (never the
+    whole document) is empty exactly when no tag opened within the
+    slice is still open at that position - i.e. the match sits directly
+    in the body, not inside some other child element.
+
+    Exists because a ``<dependency>``'s own ``<groupId>``/``<artifactId>``
+    used to be found with a bare, unscoped ``.search`` over the WHOLE
+    block body - but Maven's own model is ``xs:all`` (element order is
+    never authoritative, the same fact ``_module_own_dependency_blocks``
+    already documents for THIS block's own boundary), and
+    ``<dependency>`` legally nests ``<exclusions><exclusion><groupId>/
+    <artifactId>`` one level deeper. An ``<exclusions>``-before-
+    coordinates ordering (legal) let that NESTED exclusion's own
+    coordinate win the flat search outright - published as this
+    dependency's own identity, inverting the real edge."""
+    for match in pattern.finditer(block_structural):
+        if not _enclosing_tag_stack(block_structural, match.start()):
+            return match
+    return None
+
+
 def _module_own_dependency_blocks(structural: str) -> list[re.Match]:
     """M1 (seventh cold read BLOCKER, wrong-data): ``parse_maven_pom``
     used to match every ``<dependency>`` block ANYWHERE in the file -
@@ -5015,8 +5142,11 @@ def pom_dependency_decode_problems(text: str) -> list[int]:
         block_sanitized = _body_text(sanitized, match)
         block_structural = _body_text(structural, match)
         block_text = _body_text(text, match)
-        group_match = _DEPENDENCY_GROUP_ID_RE.search(block_structural)
-        artifact_match = _DEPENDENCY_ARTIFACT_ID_RE.search(block_structural)
+        # MICRO-ROUND 49 (B1 BLOCKER): direct-child-scoped, not a bare
+        # .search - see _direct_child_leaf_match's own docstring for the
+        # <exclusions><exclusion><groupId>/<artifactId> shape this closes.
+        group_match = _direct_child_leaf_match(_DEPENDENCY_GROUP_ID_RE, block_structural)
+        artifact_match = _direct_child_leaf_match(_DEPENDENCY_ARTIFACT_ID_RE, block_structural)
         # FIX ROUND 38 (F2 BLOCKER): a comment interior to groupId/
         # artifactId's own value (blanked in block_sanitized, spliced
         # out of block_text) is decoded correctly now via
@@ -5423,8 +5553,11 @@ def parse_maven_pom(
         block_sanitized = _body_text(sanitized, match)
         block_structural = _body_text(structural, match)
         block_text = _body_text(text, match)
-        group_match = _DEPENDENCY_GROUP_ID_RE.search(block_structural)
-        artifact_match = _DEPENDENCY_ARTIFACT_ID_RE.search(block_structural)
+        # MICRO-ROUND 49 (B1 BLOCKER): direct-child-scoped, not a bare
+        # .search - see _direct_child_leaf_match's own docstring for the
+        # <exclusions><exclusion><groupId>/<artifactId> shape this closes.
+        group_match = _direct_child_leaf_match(_DEPENDENCY_GROUP_ID_RE, block_structural)
+        artifact_match = _direct_child_leaf_match(_DEPENDENCY_ARTIFACT_ID_RE, block_structural)
         if group_match is None or artifact_match is None:
             continue
         # FIX ROUND 24 (twentieth cold read, F4 MINOR, wrong-data): a
