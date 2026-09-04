@@ -467,6 +467,14 @@ _READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
     # reasons' own correct, narrower destination.
     "route_annotation_unassociated": frozenset({"entry_points_mapped", "feature_linked"}),
     "route_value_unrecoverable": frozenset({"entry_points_mapped", "feature_linked"}),
+    # MICRO-ROUND 49 (forty-third cold read, m2, judged): a @WebServlet/
+    # @WebFilter declaring BOTH value/path and urlPatterns (spec-illegal
+    # - the Servlet spec treats them as the same attribute) still
+    # publishes its best-effort, first-match route below - the same
+    # narrower destination as its two siblings above, never the whole-
+    # file evidence gap (this is a per-annotation ambiguity, not a
+    # whole-file read failure).
+    "route_annotation_conflicting_attributes": frozenset({"entry_points_mapped", "feature_linked"}),
     "cli_main_unrecognized": frozenset({"entry_points_mapped"}),
     # FIX ROUND 17 (thirteenth cold read, CR13-3 MAJOR, part (b) - THE
     # CLASS-CLOSER): a class carrying a recognized-but-unsupported
@@ -1079,6 +1087,16 @@ def _aggregate_file_signal_from_components(
 def _check_test_evidence_located(
     unit: ModuleRecord, is_tested: bool, has_inferred_pairing: bool,
 ) -> ReadinessSignal:
+    """MICRO-ROUND 49 (forty-third cold read, polish - cheap honesty):
+    this check answers whether this unit is the TARGET of a real or
+    inferred test-relation edge from some other unit - PAIRING evidence
+    (a test class exists and references this one), never COVERAGE
+    evidence (that test actually exercises this unit's own behavior at
+    runtime, or exercises any particular fraction of it). A ``satisfied``
+    signal here is honest about "a test was found that pairs with this
+    unit," never a claim this producer has no way to back - "this unit's
+    own behavior is actually tested."
+    """
     # FIX ROUND 14 (tenth cold read, CR10-7 MINOR, wrong-data - the
     # tautology half): a unit classified "test" used to satisfy THIS
     # check about ITSELF, which is meaningless - "test evidence located"

@@ -226,9 +226,23 @@ def resolve_under_root(value: Any, *, root: Path, label: str = "path") -> Path:
 
 
 def find_case_fold_collisions(paths: list[str]) -> list[tuple[str, str]]:
-    """Return every distinct pair of ``paths`` that collide once
-    case-folded — a scan problem (``case_collision``), never two silently
+    """Return one ``(first, second)`` pair for every OTHER path that
+    collides, once case-folded, with the FIRST path this scan sees at
+    that key — a scan problem (``case_collision``), never two silently
     merged units (design, "Common JSON envelope").
+
+    MICRO-ROUND 49 (forty-third cold read, polish): this docstring used
+    to claim "every distinct pair" - false for a genuine 3+-way
+    collision group (three paths sharing one case-folded key): ``seen[
+    key]`` is set once and never updated (below), so the SECOND and
+    THIRD paths both pair with the FIRST, never with each other - two
+    pairs returned for three colliding paths, not the three a literal
+    "every distinct pair" (full pairwise) reading would promise.
+    Anchoring every pair to the group's first-seen representative is
+    sufficient (collision is transitive - every member already shares
+    one edge to the anchor) and is what every caller already assumes
+    (see ``scan_pipeline.py``'s own round-42 comment on this exact
+    shape) - restated here as fact, not changed.
 
     FIX ROUND 36 (thirtieth cold read, F4 MAJOR, completeness): the key
     used to be ``casefold()`` alone — two Unicode NFC/NFD canonical-

@@ -1200,6 +1200,34 @@ class Controller {
     assert routes[0].target == "/api/textblock"
 
 
+def test_route_value_as_a_text_block_with_an_escaped_quote_before_the_real_closing_delimiter():
+    """MICRO-ROUND 49 (forty-third cold read, m1 MINOR, wrong-data): this
+    function's own docstring claims it "mirrors _strip_comments_and_
+    strings's OWN boundary-finding logic exactly" - true again after
+    this fix, false since round 48/F4 gave the SANITIZER's own text-
+    block branch escape awareness and left this, its documented twin,
+    on a bare `text.find('\"\"\"', ...)`. A legal JEP 378 escaped quote
+    (`\\"`) immediately followed by two more literal, unescaped quotes
+    (legal on their own - only a run of 3 is ambiguous with the
+    delimiter) reads as a premature closing delimiter pre-fix,
+    truncating the recovered route value before ever reaching the REAL
+    closing `\"\"\"` that follows. Reproduced pre-fix exactly as
+    measured."""
+    src = r'''
+package p;
+@RestController
+class Controller {
+    @RequestMapping(value = """
+        /api/x\"""y""")
+    void list() {}
+}
+'''
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == '/api/x"""y'
+
+
 def test_route_value_as_a_text_block_dedents_using_the_closing_delimiters_own_indentation():
     """LOW-3 (round 7c, reviewer-3 delta on 95d9cd8): the JLS text-block
     algorithm counts the CLOSING DELIMITER's own line toward the common
@@ -3899,6 +3927,76 @@ public class DispatcherServlet extends HttpServlet {
     assert [r.target for r in routes] == ["/api/*"]
 
 
+def test_web_servlet_with_both_value_and_url_patterns_records_a_conflict_problem():
+    """MICRO-ROUND 49 (forty-third cold read, m2 MINOR, judged - lean
+    RECORD): @WebServlet's own value/urlPatterns are the SAME attribute
+    under two names (the Servlet spec's own alias) - declaring BOTH is
+    spec-illegal input, silently dropping the second one @WebServlet's
+    own ordinary any-order handling was never designed to notice. Still
+    publishes its best-effort, first-match route (unchanged recovery),
+    but now also records the conflict rather than staying silent about
+    the malformed input."""
+    src = """
+package p;
+
+@WebServlet(value = "/first", urlPatterns = "/second")
+public class DispatcherServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("DispatcherServlet.java", src)
+    routes = _edges(result, "route")
+    assert [r.target for r in routes] == ["/first"]
+    problem = next(
+        p for p in result.problems if p.reason_code == "route_annotation_conflicting_attributes")
+    assert problem.qualified_name == "p.DispatcherServlet"
+
+
+def test_web_filter_with_both_value_and_url_patterns_records_a_conflict_problem():
+    """MICRO-ROUND 49 (m2's own @WebFilter twin)."""
+    src = """
+package p;
+
+@WebFilter(value = "/first", urlPatterns = "/second")
+public class AuthFilter implements Filter {
+}
+"""
+    result = java.parse_java_source("AuthFilter.java", src)
+    assert any(
+        p.reason_code == "route_annotation_conflicting_attributes" for p in result.problems)
+
+
+def test_web_servlet_with_only_url_patterns_never_records_a_conflict_problem():
+    """Control: the ordinary, non-conflicting case (only urlPatterns=,
+    no value=/path= at all) must never be mistaken for the spec-illegal
+    shape above."""
+    src = """
+package p;
+
+@WebServlet(urlPatterns = "/api/*")
+public class DispatcherServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("DispatcherServlet.java", src)
+    assert not any(
+        p.reason_code == "route_annotation_conflicting_attributes" for p in result.problems)
+
+
+def test_web_servlet_with_only_value_never_records_a_conflict_problem():
+    """Control: the ordinary, non-conflicting case (only value=, no
+    urlPatterns= at all) must never be mistaken for the spec-illegal
+    shape above."""
+    src = """
+package p;
+
+@WebServlet(value = "/api/*")
+public class DispatcherServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("DispatcherServlet.java", src)
+    assert not any(
+        p.reason_code == "route_annotation_conflicting_attributes" for p in result.problems)
+
+
 def test_web_servlet_annotation_with_nested_web_init_param_recovers_the_top_level_route():
     """MICRO-ROUND 49 (forty-third cold read, B2 BLOCKER, wrong-data):
     @WebServlet's own argument span can contain a NESTED @WebInitParam
@@ -5727,6 +5825,32 @@ public class OrderResource {
     assert "/api" in matching[0].detail
 
 
+def test_application_path_detail_names_the_jax_rs_only_scope_without_truncating():
+    """MICRO-ROUND 49 (forty-third cold read, polish): ROUTE_COMPOSITION_
+    CAVEAT covers BOTH a JAX-RS @ApplicationPath and a Spring
+    DispatcherServlet mapped off the bare '/' root, but this emitter
+    only ever fires for the JAX-RS half - without saying so, a reader
+    could mistake this ONE problem for the whole caveat being
+    surfaced. The added scoping clause must survive bounded_detail's
+    own 200-character bound, never be truncated away."""
+    from agenttalk.comprehension.errors import TRUNCATION_MARKER
+
+    src = """
+package p;
+
+@ApplicationPath("/api")
+public class RestConfig extends Application {
+}
+"""
+    result = java.parse_java_source("RestConfig.java", src)
+    matching = [p for p in result.problems if p.reason_code == "deployment_base_path_declared"]
+    assert len(matching) == 1
+    detail = matching[0].detail
+    assert not detail.endswith(TRUNCATION_MARKER)
+    assert "JAX-RS" in detail
+    assert "Spring" in detail
+
+
 def test_no_application_path_annotation_publishes_no_signal():
     """Control for the test above: a JAX-RS resource with no
     @ApplicationPath anywhere in the file must never publish
@@ -7480,6 +7604,35 @@ def test_two_servlet_mappings_on_the_genuinely_identical_pattern_still_get_the_r
     matching = [p for p in problems if p.reason_code == "duplicate_route_target"]
     assert len(matching) == 1
     assert "/mix/*" in matching[0].detail
+
+
+def test_duplicate_route_target_detail_keeps_the_colliding_owners_visible_under_a_long_pattern():
+    """MICRO-ROUND 49 (forty-third cold read, polish): the detail
+    template used to put the colliding owners (`described`) well past
+    ~60 characters of boilerplate prose - a long <url-pattern> (real:
+    a deep REST path) pushed them past bounded_detail's own 200-
+    character bound entirely, leaving a truncated detail that names
+    the pattern but not WHICH servlet-names actually collide, the one
+    fact a reader needs to resolve the conflict. Both distinguishers
+    (the pattern and the owners) now lead the template."""
+    long_pattern = "/" + "a" * 150
+    web_xml = (
+        "<web-app>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>s1</servlet-name>\n"
+        f"    <url-pattern>{long_pattern}</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>s2</servlet-name>\n"
+        f"    <url-pattern>{long_pattern}</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n"
+    )
+    _entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
+        "WEB-INF/web.xml", web_xml)
+    matching = [p for p in problems if p.reason_code == "duplicate_route_target"]
+    assert len(matching) == 1
+    assert "s1" in matching[0].detail
 
 
 # ------------------- round 41 (F5 MAJOR, completeness): a comment inside a route annotation

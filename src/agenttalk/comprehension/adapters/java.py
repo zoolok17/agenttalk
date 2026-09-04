@@ -1092,6 +1092,35 @@ def _route_method_attributes(sanitized_segment: str) -> list[str]:
 #: ``@WebServlet("/api/*")`` is still recovered via the existing
 #: positional-literal fallback below, unchanged.
 _ROUTE_NAMED_ATTR_RE = re.compile(r"\b(?:value|path|urlPatterns)\s*=")
+#: MICRO-ROUND 49 (forty-third cold read, m2 MINOR, judged - lean
+#: RECORD): ``@WebServlet``/``@WebFilter``'s own ``value``/``urlPatterns``
+#: are the SAME attribute under two names (the Servlet spec's own
+#: alias, never two independent ones) - declaring BOTH on one annotation
+#: is spec-illegal input. `_route_paths` already silently drops
+#: whichever one is not textually first (its own documented, correct
+#: behavior for the ORDINARY case - Spring allows any attribute order);
+#: this pair is different because the input itself is malformed, not
+#: merely ordered unusually - honest to record, cheap to detect (mere
+#: PRESENCE of both, not full literal recovery of both).
+_ROUTE_VALUE_OR_PATH_ATTR_RE = re.compile(r"\b(?:value|path)\s*=")
+_ROUTE_URL_PATTERNS_ATTR_RE = re.compile(r"\burlPatterns\s*=")
+
+
+def _route_annotation_conflicting_attributes(sanitized_segment: str) -> bool:
+    """MICRO-ROUND 49 (m2, judged): True when ``sanitized_segment`` (an
+    annotation's own argument span, including its wrapping parens - see
+    :func:`_route_paths`'s own ``target_depth=1`` comment for why)
+    declares a top-level ``value=``/``path=`` attribute TOGETHER WITH a
+    top-level ``urlPatterns=`` attribute - the ``@WebServlet(value=...,
+    urlPatterns=...)`` shape the Servlet spec never allows (the two
+    names are aliases for the SAME attribute, not independent ones)."""
+    has_value_or_path = bool(_top_level_paren_depth_matches(
+        _ROUTE_VALUE_OR_PATH_ATTR_RE, sanitized_segment, target_depth=1))
+    has_url_patterns = bool(_top_level_paren_depth_matches(
+        _ROUTE_URL_PATTERNS_ATTR_RE, sanitized_segment, target_depth=1))
+    return has_value_or_path and has_url_patterns
+
+
 # The segment always starts with the annotation's own opening "(" (see
 # _matching_close_paren's caller) - a bare positional literal is
 # recognized only when it leads the argument list.
@@ -2093,7 +2122,18 @@ def _java_string_literal_span(text: str, quote_pos: int) -> tuple[str, int] | No
     n = len(text)
     if text[quote_pos:quote_pos + 3] == '"""':
         content_start = quote_pos + 3
-        close = text.find('"""', content_start)
+        # MICRO-ROUND 49 (forty-third cold read, m1 MINOR, wrong-data):
+        # this docstring's own claim (above) went stale the moment round
+        # 48/F4 gave `_strip_comments_and_strings`'s own text-block
+        # branch escape awareness (`_find_unescaped_text_block_
+        # delimiter`) and left this, its documented twin, on the bare,
+        # non-escape-aware `text.find('"""', ...)` - a legal JEP 378
+        # escaped quote (`\"`) immediately before a real closing `"""`
+        # closed this early, truncating/fabricating the recovered
+        # literal and mis-positioning the returned end cursor for any
+        # following array element. Now the SAME chokepoint the
+        # sanitizer uses, restoring the "mirrors exactly" claim as fact.
+        close = _find_unescaped_text_block_delimiter(text, content_start)
         if close == -1:
             return None
         return _normalize_java_text_block(text[content_start:close]), close + 3
@@ -2972,9 +3012,20 @@ def _class_level_route_target(
 
 
 def _normalize_route_leading_slash(path: str) -> str:
-    """A published route target is always an absolute path. Shared by
-    :func:`_compose_route_path` (the prefix half) and its caller (a
-    STANDALONE method route with no class-level prefix at all) - LOW-2
+    """MICRO-ROUND 49 (forty-third cold read, polish): this docstring's
+    own opening claim used to be an unscoped "a published route target
+    is always an absolute path" - true for THIS function's own two
+    callers (Spring's composition family, below), never a whole-file
+    invariant this adapter enforces everywhere: @WebServlet/@WebFilter's
+    own `urlPatterns`/`value` publish their recovered literal directly
+    (`target=path`, no call through this function at all), so a
+    `urlPatterns` value genuinely lacking its own leading `/` publishes
+    exactly as written, unnormalized - restated narrowly, as fact.
+
+    Normalizes ONE Spring-composed route path (or path fragment) to
+    start with `/`. Shared by :func:`_compose_route_path` (the prefix
+    half) and its caller (a STANDALONE method route with no class-level
+    prefix at all) - LOW-2
     (round 7c, reviewer-3 delta on 95d9cd8): this normalization used to
     live ONLY inside composition, so a bare method-only route lacking
     its own leading ``/`` published exactly as written while an
@@ -3509,16 +3560,30 @@ def parse_java_source(
             close_pos = _matching_close_paren(sanitized, arg_pos)
             if close_pos is not None:
                 value = _route_paths(sanitized, text, arg_pos, close_pos + 1)
+        # MICRO-ROUND 49 (forty-third cold read, polish): named the
+        # scope explicitly - ROUTE_COMPOSITION_CAVEAT covers BOTH a
+        # JAX-RS @ApplicationPath AND a Spring DispatcherServlet mapped
+        # off the bare '/' root, but this emitter only ever fires for
+        # the JAX-RS half (there is no equivalent DispatcherServlet-
+        # mapping detection anywhere in this adapter) - without saying
+        # so, a reader seeing this problem could mistake it for the
+        # WHOLE caveat being surfaced, when the Spring half stays a
+        # purely-declared, never-detected gap. Kept lean (the original
+        # prose plus this clause together exceeded bounded_detail's own
+        # 200-character bound, which would have truncated away the very
+        # scoping clause being added here - the identical class of
+        # mistake this same round's own externality_suppressed fix
+        # already caught and corrected).
         if value:
             detail = bounded_detail(
                 f"@ApplicationPath({value[0]!r}) at line {line} declares a deployment-level "
-                "base path this producer does not compose into any published http_route - "
-                "see this run's own route_composition_caveat")
+                "base path (route_composition_caveat, JAX-RS half only - Spring "
+                "DispatcherServlet base-path composition is never detected either)")
         else:
             detail = bounded_detail(
                 f"@ApplicationPath at line {line} declares a deployment-level base path "
-                "(value not recovered as a literal) this producer does not compose into "
-                "any published http_route - see this run's own route_composition_caveat")
+                "(value not recovered as a literal) - route_composition_caveat, JAX-RS "
+                "half only; Spring is never detected either")
         problems.append(JavaAdapterProblem(
             reason_code="deployment_base_path_declared",
             detail=detail,
@@ -4039,6 +4104,24 @@ def parse_java_source(
                     sanitized, text, name_arg_pos, name_close_pos)
                 if declared_name is not None:
                     web_servlet_declared_names[declared_name] = target_type
+                # MICRO-ROUND 49 (m2 MINOR, judged): see
+                # _route_annotation_conflicting_attributes's own
+                # docstring - value=/path= together with urlPatterns=
+                # on one @WebServlet is spec-illegal input; recorded,
+                # not suppressed (the existing first-match-wins
+                # recovery below still runs and still publishes its
+                # best-effort route).
+                if _route_annotation_conflicting_attributes(
+                    sanitized[name_arg_pos:name_close_pos + 1],
+                ):
+                    problems.append(JavaAdapterProblem(
+                        reason_code="route_annotation_conflicting_attributes",
+                        detail=bounded_detail(f"a @WebServlet annotation at line {line} declares BOTH a "
+                               "value/path attribute and a urlPatterns attribute - the Servlet "
+                               "spec treats these as the SAME attribute under two names, never "
+                               "two independent ones; spec-illegal input"),
+                        qualified_name=target_type,
+                    ))
         _span_end, paths, _explicit_methods = _route_annotation_span(match)
         if paths is None:
             problems.append(JavaAdapterProblem(
@@ -4160,6 +4243,19 @@ def parse_java_source(
                     sanitized, text, name_arg_pos, name_close_pos)
                 if declared_name is not None:
                     web_filter_declared_names[declared_name] = target_type
+                # MICRO-ROUND 49 (m2's own @WebFilter twin): see the
+                # identical @WebServlet check above.
+                if _route_annotation_conflicting_attributes(
+                    sanitized[name_arg_pos:name_close_pos + 1],
+                ):
+                    problems.append(JavaAdapterProblem(
+                        reason_code="route_annotation_conflicting_attributes",
+                        detail=bounded_detail(f"a @WebFilter annotation at line {line} declares BOTH a "
+                               "value/path attribute and a urlPatterns attribute - the Servlet "
+                               "spec treats these as the SAME attribute under two names, never "
+                               "two independent ones; spec-illegal input"),
+                        qualified_name=target_type,
+                    ))
         _span_end, paths, _explicit_methods = _route_annotation_span(match)
         if paths is None:
             problems.append(JavaAdapterProblem(
@@ -6983,11 +7079,23 @@ def parse_web_xml(
             continue
         described = ", ".join(
             f"{name} ({qualified})" for name, qualified in sorted(owner_entries))
+        # MICRO-ROUND 49 (forty-third cold read, polish): `described` -
+        # WHICH owners are colliding - is a second distinguishing datum
+        # alongside `url_pattern`, but sat well past the template's own
+        # boilerplate prose; a long `url_pattern` could push it beyond
+        # `bounded_detail`'s own MAX_PROBLEM_DETAIL_LENGTH, truncating
+        # the one fact a reader needs to actually resolve the conflict.
+        # (`problem_id` itself cannot collide here regardless - `url_
+        # pattern` is also carried, untruncated, in `qualified_name`,
+        # a separate hash input since round 37's own fix - this is a
+        # human-readability fix, not an id-collision one.) Both
+        # distinguishers now lead the template; the boilerplate
+        # explanation follows.
         problems.append(JavaAdapterProblem(
             reason_code="duplicate_route_target",
-            detail=bounded_detail(f"<url-pattern>{url_pattern}</url-pattern> is mapped by 2+ different "
-                   f"servlet-names ({described}) - undefined dispatch, no real container "
-                   "can serve the identical pattern from more than one owner at once"),
+            detail=bounded_detail(f"<url-pattern>{url_pattern}</url-pattern> ({described}): 2+ "
+                   "different servlet-names mapping the identical pattern - undefined dispatch, "
+                   "no real container can serve it from more than one owner at once"),
             qualified_name=f"{relative_path}#duplicate_route_target#{url_pattern}",
         ))
     # FIX ROUND 22 (eighteenth cold read, F3 MAJOR, wrong-data): a

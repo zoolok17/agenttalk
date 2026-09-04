@@ -9155,6 +9155,19 @@ def test_run_scan_a_truncated_peek_build_dir_silently_poisoned_now_degrades_visi
     assert slf4j_edge["resolution_state"] == "unresolved"
     assert slf4j_edge.get("target_external") is None
 
+    # MICRO-ROUND 49 (forty-third cold read, polish): this template's
+    # own two branches used to be 216/229 characters - ALWAYS past
+    # bounded_detail's 200-character bound, truncating away the entire
+    # "because of this root" consequence clause regardless of any
+    # variable data. Both branches now fit within bound - never ends
+    # with the truncation marker, and the consequence clause (moved to
+    # lead the template) survives intact.
+    from agenttalk.comprehension.errors import TRUNCATION_MARKER
+    poison_detail = next(p for p in poison_problems if p["path"] == "build")["detail"]
+    assert not poison_detail.endswith(TRUNCATION_MARKER)
+    assert "resolves unresolved" in poison_detail
+    assert "entry cap" in poison_detail
+
 
 def test_run_scan_a_normal_repo_with_target_full_of_class_files_keeps_confident_externals(
     java_repo: Path,
