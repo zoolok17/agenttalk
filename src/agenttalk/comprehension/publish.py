@@ -45,6 +45,7 @@ from .ceilings import enforce_artifact_ceilings, measure_staging_artifacts
 from .digests import sha256_file
 from .envelope import (
     EnvelopeError,
+    path_is_reparse_point_or_symlink,
     read_json_document,
     require_field,
     resolve_under_root,
@@ -177,14 +178,34 @@ def rename_staging_to_run(
             "lock does not own")
     scan_id = validate_scan_id(staging_handle.scan_id)
     comprehension_dir = lock_handle.path.parent
-    staging_root = _staging_dir(comprehension_dir).resolve()
-    staging_path = Path(staging_handle.path).resolve()
+    # MICRO-ROUND 50 (Cluster 0, B1 BLOCKER): the OLD check resolved
+    # `staging_root` FIRST, exactly the vacuous-by-construction pattern
+    # fixed in envelope.resolve_under_root's own round-50 docstring - a
+    # reparse point placed AT `.staging/` itself (between staging
+    # creation and this publish step) would be baked into `staging_root`
+    # before the confinement comparison ever ran, so `relative_to` would
+    # trivially pass no matter where the reparse point actually
+    # redirects. Checked BEFORE resolving anything, same as that fix.
+    staging_root = _staging_dir(comprehension_dir)
+    if path_is_reparse_point_or_symlink(staging_root):
+        raise StagingSourceEscapesRoot(
+            f"{staging_root} is a symlink or a directory reparse point/junction - "
+            "refusing to rename a directory through it; remove the reparse point and "
+            "retry")
+    staging_path = Path(staging_handle.path)
+    if path_is_reparse_point_or_symlink(staging_path):
+        raise StagingSourceEscapesRoot(
+            f"staging_handle.path {staging_path} is itself a symlink or a directory "
+            "reparse point/junction - refusing to rename it; remove the reparse point "
+            "and retry")
+    resolved_staging_root = staging_root.resolve()
+    resolved_staging_path = staging_path.resolve()
     try:
-        staging_path.relative_to(staging_root)
+        resolved_staging_path.relative_to(resolved_staging_root)
     except ValueError as exc:
         raise StagingSourceEscapesRoot(
             f"staging_handle.path {staging_handle.path} does not resolve under "
-            f"{staging_root} — refusing to rename a directory outside .staging/"
+            f"{resolved_staging_root} — refusing to rename a directory outside .staging/"
         ) from exc
     expected_prefix = f"{scan_id}-"
     nonce = (

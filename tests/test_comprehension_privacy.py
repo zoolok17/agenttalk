@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -318,6 +319,40 @@ def test_verify_store_ignored_passes_when_the_whole_store_is_ignored(tmp_path: P
     (store / "index.json").write_text("{}", encoding="utf-8")
     (store / "runs" / "scan-1" / "scan.json").write_text("{}", encoding="utf-8")
     privacy.verify_store_ignored(tmp_path, ".agenttalk/comprehension")  # must not raise
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows directory junctions only")
+def test_verify_store_ignored_refuses_a_junction_at_runs_rather_than_a_false_clean_proof(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 0, B1 BLOCKER): this asks git about the
+    NOMINAL ``.agenttalk/comprehension`` path via ``git ls-files``. If
+    ``runs/`` underneath it is a reparse point, the real published
+    content never lands where git is looking - git genuinely finds
+    nothing stageable there, so this used to return cleanly and the
+    caller published ``vcs_privacy: "ignored"``, a FALSE proof about the
+    exact property the whole design gates writing on (the six artifacts
+    physically sit outside the repository, entirely unprotected).
+    Reproduced: git sees an ordinary, empty (and therefore trivially
+    ignored) ``.agenttalk/comprehension/``, while ``runs/`` is a junction
+    to real content living outside the repository - proving the OLD
+    behavior would have returned cleanly here is the point of this test."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(".agenttalk/\n", encoding="utf-8")
+    _commit_all(tmp_path, "base")
+    store = tmp_path / ".agenttalk" / "comprehension"
+    store.mkdir(parents=True)
+    outside = tmp_path.parent / "outside-verify-store-ignored-junction-target"
+    outside.mkdir(exist_ok=True)
+    (outside / "scan-1").mkdir(exist_ok=True)
+    (outside / "scan-1" / "scan.json").write_text("{}", encoding="utf-8")
+    runs_dir = store / "runs"
+    subprocess.run(  # noqa: S603,S607  # nosec B603 B607
+        ["cmd", "/c", "mklink", "/J", str(runs_dir), str(outside)],
+        check=True, capture_output=True, text=True,
+    )
+    with pytest.raises(VcsPrivacyRefused, match="reparse point/junction"):
+        privacy.verify_store_ignored(tmp_path, ".agenttalk/comprehension")
 
 
 def test_verify_store_ignored_refuses_when_index_json_specifically_is_stageable(

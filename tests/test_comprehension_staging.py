@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess  # nosec B404 - invokes the real `mklink /J` binary to build a Windows
+                    # directory junction fixture; no shell, no untrusted input
+import sys
 from pathlib import Path
 
 import pytest
@@ -82,6 +85,54 @@ def test_traversal_scan_id_is_rejected_before_any_path_is_built(
     for path in project_root.rglob("*"):
         assert "escaped" not in path.name
     assert not (project_root.parent / "escaped").exists()
+    lockmod.release_scan_lock(lock)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows directory junctions only")
+def test_a_junction_at_staging_itself_is_refused_not_followed(
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult, tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 0, B1 BLOCKER, the worst finding of the
+    arc): a reparse point placed AT ``.staging/`` itself (never a file
+    beneath it) used to redirect the ENTIRE staging write outside the
+    pinned store root, silently - ``resolve_under_root``'s old confinement
+    check resolved ``root`` (here, ``.staging/``) FIRST, baking the
+    redirection into its own idea of "root" before ever comparing anything
+    against it, so the comparison could never catch what it was resolving
+    away. Reproduced verbatim: ``.staging`` is a junction to an external
+    directory before the very first ``create_staging_dir`` call ever
+    runs. Must refuse outright, and nothing may land at the junction's
+    real target - the whole point of the fix is that NO bytes ever reach
+    an unpinned location, not merely that the caller is told about it
+    afterward."""
+    outside = tmp_path.parent / "outside-staging-junction-target"
+    outside.mkdir(exist_ok=True)
+    junction = comprehension_dir / ".staging"
+    junction.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(  # noqa: S603,S607  # nosec B603 B607
+        ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+        check=True, capture_output=True, text=True,
+    )
+    lock = _lock(comprehension_dir, comprehension_privacy)
+    with pytest.raises(EnvelopeError, match="reparse point/junction"):
+        stg.create_staging_dir(scan_id="scan-1", lock_handle=lock)
+    assert list(outside.iterdir()) == []
+    lockmod.release_scan_lock(lock)
+
+
+def test_a_benign_staging_dir_with_no_junction_is_unaffected(
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 0, benign control): the round-50 reparse-
+    point check must never fire for an ORDINARY ``.staging/`` directory -
+    same assertions as the pre-existing
+    ``test_create_staging_dir_creates_directory_and_owner_json``, kept
+    here as the paired control for the junction test immediately above so
+    the two live side by side."""
+    lock = _lock(comprehension_dir, comprehension_privacy)
+    handle = stg.create_staging_dir(scan_id="scan-1", lock_handle=lock)
+    assert handle.path.is_dir()
+    assert handle.path.parent == comprehension_dir / ".staging"
     lockmod.release_scan_lock(lock)
 
 
@@ -259,6 +310,45 @@ def test_reclaim_retains_an_entry_that_resolves_outside_staging(tmp_path: Path) 
     report = stg.reclaim_abandoned_staging(tmp_path)
     assert report.reclaimed == []
     assert outside.exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows directory junctions only")
+def test_reclaim_never_deletes_through_a_junctioned_staging_root(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 0, B1-adjacent): the OLD check resolved
+    ``staging_root`` first (the same vacuous-by-construction pattern the
+    write path had) - a dead-owner-shaped directory found by iterating
+    THROUGH a junctioned ``.staging/`` could reach ``shutil.rmtree`` on
+    content entirely outside the pinned store. Every entry now retains
+    whenever ``staging_root`` itself is a reparse point, so nothing under
+    the junction's real target is ever deleted - forced DOWN the "would
+    reclaim" path with a real, matching host identity and a monkeypatched
+    ``process_observation`` reporting definitely dead (the same technique
+    ``test_reclaim_removes_a_definitely_dead_owners_staging_dir`` uses),
+    so a passing test here is attributable to the round-50 junction guard
+    and not merely an unrelated host/liveness mismatch."""
+    outside = tmp_path.parent / "outside-staging-reclaim-junction-target"
+    outside.mkdir(exist_ok=True)
+    dead_looking = outside / "scan-1-abcdef"
+    dead_looking.mkdir(exist_ok=True)
+    (dead_looking / "owner.json").write_text(
+        json.dumps({
+            "schema_version": 1, "scan_id": "scan-1", "owner_token": "tok",
+            "pid": 99999999, "host_identity": stg.host_identity(),
+            "created_at": "2020-01-01T00:00:00Z",
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(stg, "process_observation", lambda pid: ("dead", None))
+    junction = tmp_path / ".staging"
+    subprocess.run(  # noqa: S603,S607  # nosec B603 B607
+        ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+        check=True, capture_output=True, text=True,
+    )
+    report = stg.reclaim_abandoned_staging(tmp_path)
+    assert report.reclaimed == []
+    assert dead_looking.exists()
 
 
 # ----------------------------------------------------------- prune_staging

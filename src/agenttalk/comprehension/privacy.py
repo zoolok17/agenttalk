@@ -61,6 +61,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .digests import root_binding_digest
+from .envelope import path_is_reparse_point_or_symlink
 from .errors import VcsPrivacyRefused
 from .paths import INDEX_FILENAME, RELATIVE_COMPREHENSION_DIR, RUNS_DIRNAME, STAGING_DIRNAME
 
@@ -419,7 +420,46 @@ def verify_store_ignored(
     itself writes and removes, never client graph data - a ``.gitignore``
     matching everything BUT the lock's own name would otherwise brick
     every future publish on a file that is not the thing this guarantee
-    exists to protect."""
+    exists to protect.
+
+    MICRO-ROUND 50 (Cluster 0, B1 BLOCKER): this asks git about the
+    NOMINAL ``relative_store_dir`` path - if a reparse point sits
+    somewhere between ``root`` and that directory (the exact ``runs/``/
+    ``.staging/`` junction reproduced this round), the real bytes never
+    land where git is being asked to look, so git genuinely finds
+    nothing stageable there and this proof comes back clean even though
+    the actual published content sits entirely outside the repository,
+    unprotected by anything. The proof is only meaningful when the
+    RESOLVED destination is where git's answer was actually about -
+    walked segment by segment (root down to the store directory),
+    checked BEFORE any ``.resolve()`` call, same technique and same
+    fail-closed rationale as ``envelope.resolve_under_root``'s own
+    round-50 fix. A reparse point anywhere in that chain refuses
+    immediately, never trusting git's answer about a path that does not
+    denote where the content really is. Walks past ``relative_store_dir``
+    itself into its two known write targets (``runs/``, ``.staging/`` -
+    exactly what :func:`~.staging.create_staging_dir`/:func:`~.publish.
+    rename_staging_to_run` write into) too - git's own recursive listing
+    covers whatever is really there, but this proof is about whether
+    that RECURSION itself started from the real location, which a
+    reparse point one or two levels past ``relative_store_dir`` (never
+    caught by a check that only walks to ``relative_store_dir`` itself)
+    would already have falsified."""
+    for candidate in (
+        relative_store_dir,
+        f"{relative_store_dir}/{RUNS_DIRNAME}",
+        f"{relative_store_dir}/{STAGING_DIRNAME}",
+    ):
+        walked = root
+        for segment in candidate.split("/"):
+            walked = walked / segment
+            if path_is_reparse_point_or_symlink(walked):
+                raise VcsPrivacyRefused(
+                    f"{walked} is a symlink or a directory reparse point/junction - the "
+                    f"privacy proof for {relative_store_dir}/ would be about the wrong "
+                    "location; refusing rather than trusting git's answer about a path "
+                    "that does not denote where the content actually is", vcs_kind="git",
+                )
     result = _run_git(root, "ls-files", "--others", "--exclude-standard", "--", relative_store_dir)
     if result is None or result.returncode != 0:
         raise VcsPrivacyRefused(

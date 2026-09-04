@@ -12,7 +12,9 @@ project root, contains a NUL byte, or looks like a URL.
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat as stat_module
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
@@ -211,11 +213,83 @@ def validate_relative_path(value: Any, *, label: str = "path") -> str:
     return value
 
 
+def path_is_reparse_point_or_symlink(path: Path) -> bool:
+    """``True`` iff ``path`` EXISTS and is itself a symlink or (Windows)
+    directory reparse point (junction/mount point) — mirrors discovery.py's
+    own ``_boundary_kind`` (same ``lstat`` + ``FILE_ATTRIBUTE_REPARSE_
+    POINT`` technique, the attribute Windows Explorer/``dir`` use, so this
+    also catches reparse tags this module has never heard of, not just
+    symlinks and junctions by name).
+
+    A path that does not exist yet is NOT a reparse point (``False``,
+    never fail-closed here) — unlike a tree WALK over already-listed
+    dirents (where a vanished entry is a genuine TOCTOU race worth
+    treating conservatively), this function is also called on store paths
+    (``runs/``, ``.staging/``) that legitimately do not exist yet on a
+    project's very first scan; treating "not created yet" as "refuse"
+    would brick every first publish. Any OTHER ``OSError`` (permission
+    denied, etc.) IS treated as unverifiable and fails closed (``True``)
+    — the same asymmetry ``_boundary_kind`` draws between "confirmed
+    absent" and "could not be confirmed"."""
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    if stat_module.S_ISLNK(st.st_mode):
+        return True
+    if os.name == "nt" and st.st_file_attributes & stat_module.FILE_ATTRIBUTE_REPARSE_POINT:
+        return True
+    return False
+
+
 def resolve_under_root(value: Any, *, root: Path, label: str = "path") -> Path:
     """Syntactically validate, then prove the path resolves under ``root``
     on this filesystem (design: "paths resolving outside the project root
-    are rejected"). Raises :class:`EnvelopeError` either way."""
+    are rejected"). Raises :class:`EnvelopeError` either way.
+
+    MICRO-ROUND 50 (Cluster 0, B1 BLOCKER, the worst finding of the arc):
+    the OLD body called ``root.resolve()`` first, then checked ``(root /
+    rel).resolve()`` against THAT — a confinement proof that is vacuous
+    by construction the moment ``root`` (or an already-existing directory
+    between ``root`` and the target) is ITSELF a symlink or a Windows
+    directory reparse point/junction: resolving ``root`` FIRST bakes the
+    redirection into ``resolved_root`` itself, so the target's ``relative_
+    to(resolved_root)`` trivially succeeds even though the real bytes
+    land wherever the reparse point actually points, entirely outside the
+    project the caller believes ``root`` denotes. Reproduced exactly:
+    a reparse point placed AT ``.agenttalk/comprehension/runs`` (or
+    ``.staging``) redirected an entire published run outside the pinned
+    store root — six artifacts physically outside the repository, git
+    genuinely unaware of them, while this producer's own privacy proof
+    (asked about the NOMINAL store path, never the resolved destination —
+    see ``privacy.verify_store_ignored``'s own round-50 fix) published
+    ``vcs_privacy: "ignored"`` — a false proof about the exact property
+    the whole design gates writing on.
+
+    FIX, fail-closed: walk every path SEGMENT from ``root`` down to the
+    target BEFORE ever calling ``.resolve()`` on anything, checking each
+    already-existing one (``root`` itself included) with :func:`path_is_
+    reparse_point_or_symlink`. A hit refuses immediately, naming the
+    offending segment and a remedy — never silently followed, never
+    resolved through. Only once every segment is proven reparse-point-
+    free does the existing resolve-and-confine check run, now as a
+    genuine (not vacuous) final sanity net."""
     rel = validate_relative_path(value, label=label)
+    if path_is_reparse_point_or_symlink(root):
+        raise EnvelopeError(
+            f"{label} root {root} is a symlink or a directory reparse point/junction - "
+            "refusing to trust any path built under it; remove the reparse point (or "
+            "point the store at a real directory) and retry")
+    walked = root
+    for segment in rel.split("/")[:-1]:
+        walked = walked / segment
+        if path_is_reparse_point_or_symlink(walked):
+            raise EnvelopeError(
+                f"{label} {value!r} passes through {walked}, a symlink or a directory "
+                "reparse point/junction, before reaching its own target - refusing to "
+                "trust a path that crosses one; remove the reparse point and retry")
     resolved_root = root.resolve()
     resolved = (resolved_root / rel).resolve()
     try:

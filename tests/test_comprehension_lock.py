@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess  # nosec B404 - invokes the real `mklink /J` binary to build a Windows
+                    # directory junction fixture; no shell, no untrusted input
+import sys
 from pathlib import Path
 
 import pytest
@@ -476,6 +479,34 @@ def test_a_wrongly_shaped_comprehension_dir_is_rejected_even_at_a_proven_root(
             wrong_shape_dir, privacy=comprehension_privacy, predecessor_index_digest=None)
     assert not wrong_shape_dir.exists()
     assert not (comprehension_privacy_root / "unignored").exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows directory junctions only")
+def test_a_junctioned_agenttalk_directory_is_still_refused(
+    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 0, B1 control - reviewer-3's own point of
+    comparison): junctioning ``.agenttalk`` itself is ALREADY refused
+    today, by this exact function's own name-shape check
+    (``project_root_from_comprehension_dir`` - see the test immediately
+    above) or the root-binding proof mismatch it then trips - the round-
+    50 finding is specifically that the escape hole sits ONE LEVEL DOWN
+    (``runs/``/``.staging/``), never here. Locked as a permanent control
+    so a future change to either check cannot silently reopen the
+    ``.agenttalk``-level hole while this round's own fix only ever closes
+    the level-down one."""
+    outside = comprehension_privacy_root.parent / "outside-agenttalk-junction-target"
+    outside.mkdir(exist_ok=True)
+    junction = comprehension_privacy_root / ".agenttalk"
+    subprocess.run(  # noqa: S603,S607  # nosec B603 B607
+        ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+        check=True, capture_output=True, text=True,
+    )
+    comprehension_dir = junction / "comprehension"
+    with pytest.raises((InvalidComprehensionDir, PrivacyProofRootMismatch)):
+        lockmod.acquire_scan_lock(
+            comprehension_dir, privacy=comprehension_privacy, predecessor_index_digest=None)
+    assert list(outside.iterdir()) == []
 
 
 # ----------------------------------------------------------- finding 3 regression: no socket import

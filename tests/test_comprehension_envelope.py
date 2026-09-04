@@ -220,7 +220,15 @@ def test_resolve_under_root_rejects_a_path_that_escapes_via_symlink(tmp_path: Pa
         # dev machine, where that fixture's registry write itself fails
         # silently and this remains a graceful local skip.
         pytest.skip("symlink creation is not permitted in this environment")
-    with pytest.raises(EnvelopeError, match="outside the project root"):
+    # MICRO-ROUND 50 (Cluster 0, B1 BLOCKER): resolve_under_root now walks
+    # every segment between `root` and the target BEFORE resolving
+    # anything (a reparse point AT `root` itself used to be resolved
+    # away first, making the old "outside the project root" comparison
+    # vacuous - see the function's own round-50 docstring) - this exact
+    # symlink-in-the-middle shape is now caught one step earlier, with a
+    # message naming the crossed reparse point/symlink directly rather
+    # than the post-hoc "resolves outside" conclusion.
+    with pytest.raises(EnvelopeError, match="reparse point/junction"):
         env.resolve_under_root("escape/x", root=root)
 
 

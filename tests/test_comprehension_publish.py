@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess  # nosec B404 - invokes the real `mklink /J` binary to build a Windows
+                    # directory junction fixture; no shell, no untrusted input
+import sys
 from pathlib import Path
 
 import pytest
@@ -233,6 +236,79 @@ def test_rename_refuses_when_run_directory_already_exists(
     with pytest.raises(pub.RunDirectoryExists):
         pub.rename_staging_to_run(staging, lock)
     assert staging.path.exists()  # untouched
+    lockmod.release_scan_lock(lock)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows directory junctions only")
+def test_rename_refuses_a_junction_at_runs_itself_not_followed(
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 0, B1 BLOCKER, the worst finding of the
+    arc): a reparse point placed AT ``runs/`` itself (never a file
+    beneath it) used to redirect the ENTIRE published run outside the
+    pinned store root - ``resolve_under_root``'s old confinement check
+    (used by this function's own ``dst = resolve_under_root(scan_id,
+    root=_runs_dir(comprehension_dir), ...)`` call) resolved ``runs/``
+    FIRST, baking the redirection into its own idea of "root" before ever
+    comparing the target against it - the whole six-artifact run would
+    physically land at the junction's real target, with git and this
+    producer's own privacy proof both unaware of it. Reproduced verbatim:
+    ``runs`` is a junction to an external directory before the rename
+    ever runs. Must refuse outright; nothing may be created at the
+    junction's real target, and the staged content must stay exactly
+    where it was staged (never moved partway)."""
+    outside = comprehension_dir.parent.parent / "outside-runs-junction-target"
+    outside.mkdir(exist_ok=True)
+    lock, staging = _stage(comprehension_dir, comprehension_privacy, "scan-1")
+    runs_dir = comprehension_dir / "runs"
+    subprocess.run(  # noqa: S603,S607  # nosec B603 B607
+        ["cmd", "/c", "mklink", "/J", str(runs_dir), str(outside)],
+        check=True, capture_output=True, text=True,
+    )
+    # dst is built via resolve_under_root(scan_id, root=_runs_dir(...)) -
+    # a reparse point AT `runs/` itself is caught there, raising the
+    # shared EnvelopeError (not StagingSourceEscapesRoot, which guards
+    # the STAGING side of this same rename, checked earlier and unaware
+    # of anything past `dst`'s own construction).
+    with pytest.raises(pub.EnvelopeError, match="reparse point/junction"):
+        pub.rename_staging_to_run(staging, lock)
+    assert list(outside.iterdir()) == []
+    assert staging.path.exists()  # never moved
+    lockmod.release_scan_lock(lock)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows directory junctions only")
+def test_rename_refuses_when_staging_itself_becomes_a_junction_before_publish(
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 0, B1-adjacent, the TOCTOU half): even
+    though ``create_staging_dir`` itself now refuses a junctioned
+    ``.staging/`` at CREATION time, this function's own SEPARATE re-
+    confinement check (``staging_root = _staging_dir(...); ... resolve
+    and compare``, run fresh at PUBLISH time) used to have the identical
+    vacuous-by-construction flaw - it re-derives and re-resolves
+    ``staging_root`` itself rather than trusting the create-time proof,
+    so a reparse point installed AT ``.staging/`` in the gap BETWEEN
+    staging creation and this publish step would still slip past the OLD
+    code. Reproduced exactly: stage normally (``.staging/`` is an
+    ordinary directory when ``create_staging_dir`` ran), then replace
+    ``.staging/`` itself with a junction before ``rename_staging_to_run``
+    ever runs."""
+    lock, staging = _stage(comprehension_dir, comprehension_privacy, "scan-1")
+    outside = comprehension_dir.parent.parent / "outside-staging-toctou-junction-target"
+    outside.mkdir(exist_ok=True)
+    staging_root = comprehension_dir / ".staging"
+    real_content = outside / staging.path.name
+    staging.path.rename(real_content)  # move the real content out first...
+    staging_root.rmdir()  # ... then the now-empty .staging/ itself
+    subprocess.run(  # noqa: S603,S607  # nosec B603 B607
+        ["cmd", "/c", "mklink", "/J", str(staging_root), str(outside)],
+        check=True, capture_output=True, text=True,
+    )
+    with pytest.raises(pub.StagingSourceEscapesRoot, match="reparse point/junction"):
+        pub.rename_staging_to_run(staging, lock)
+    assert real_content.exists()  # never moved into runs/
+    assert not (comprehension_dir / "runs" / "scan-1").exists()
     lockmod.release_scan_lock(lock)
 
 

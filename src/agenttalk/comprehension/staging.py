@@ -42,6 +42,7 @@ from typing import Any
 from ..lifecycle_lock import process_observation
 from .envelope import (
     EnvelopeError,
+    path_is_reparse_point_or_symlink,
     read_json_document,
     resolve_under_root,
     validate_rfc3339_utc,
@@ -181,7 +182,24 @@ def _classify_one_staging_dir(
 ) -> tuple[str, str | None]:
     """Returns ``(disposition, retain_reason)``: disposition is
     ``"reclaim"`` or ``"retain"``; ``retain_reason`` is ``None`` only for
-    ``"reclaim"``."""
+    ``"reclaim"``.
+
+    MICRO-ROUND 50 (Cluster 0, B1-adjacent): the OLD check resolved
+    ``staging_root`` FIRST, the same vacuous-by-construction pattern
+    fixed in ``envelope.resolve_under_root`` - a reparse point AT
+    ``.staging/`` itself would be baked into the comparison root before
+    ``relative_to`` ever ran, so a dead-owner match found through it
+    could reach the ``shutil.rmtree`` below on content entirely outside
+    the pinned store. RETAINS (never raises - this runs at every lock
+    acquisition, before this module's own reclaim loop, with no
+    surrounding rollback for a raised exception here) whenever
+    ``staging_root`` or ``entry`` itself is a symlink/reparse point,
+    checked BEFORE any ``.resolve()`` call, mirroring every other
+    fail-closed check in this fix."""
+    if path_is_reparse_point_or_symlink(staging_root):
+        return "retain", "staging root is a symlink or a directory reparse point/junction"
+    if path_is_reparse_point_or_symlink(entry):
+        return "retain", "entry is itself a symlink or a directory reparse point/junction"
     resolved = entry.resolve()
     try:
         resolved.relative_to(staging_root.resolve())
