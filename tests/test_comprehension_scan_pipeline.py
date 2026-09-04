@@ -2567,6 +2567,142 @@ def test_run_scan_a_web_xml_servlet_class_with_a_src_test_duplicate_degrades_end
     features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
     assert not any(e["name"] == "/dup-abs/*" for e in features_doc["entry_points"])
 
+    # MICRO-ROUND 47b (F2, the PARTIAL half of 0a): this docstring already
+    # claimed "across all five artifacts" but only ever asserted on
+    # problems.json/features.json (plus scan.json's own summary) -
+    # modules.json and readiness.json (the one most able to diverge
+    # independently: entry_points_mapped=unknown has its own mechanism,
+    # never guaranteed by the descriptor-suppression checks above alone)
+    # were both missing. Added so the claim is actually true.
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    servlet_unit = next(
+        u for u in modules_doc["units"] if u["display_name"] == "AbstractServlet")
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    entry_points_mapped = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == servlet_unit["unit_id"] and s["check"] == "entry_points_mapped"
+    )
+    assert entry_points_mapped["stored_status"] == "unknown"
+
+
+@pytest.mark.parametrize("swap_order", [False, True])
+def test_run_scan_a_mixed_duplicate_descriptor_target_publishes_its_own_descriptor_problem(
+    java_repo: Path, swap_order: bool,
+) -> None:
+    """MICRO-ROUND 47b (F1, the OVERTURNED half of 0b, .cr41-solshapes-
+    mixed end-to-end): a duplicate FQN where one declaration is concrete/
+    instantiable and the other is abstract - compute_descriptor_
+    registrability_verdicts's own MIXED branch (dependencies_artifact.py)
+    already builds a detail stating the duplicate declarations DISAGREE
+    on instantiability so no confident owner exists, and features_
+    artifact.build_features's own suppression loop already turns ANY
+    suppressed verdict (single, all-duplicate-uninstantiable, OR mixed)
+    into a descriptor_registrability_problem unconditionally - the SAME
+    mechanism, the SAME reason_code (unsupported_entry_point_shape), one
+    branch, already shared with the all-uninstantiable cell right beside
+    it. This end-to-end truth-table entry proves it reaches problems.json
+    for BOTH declaration orders, not just the isolated verdict text."""
+    import json
+
+    web_dir = java_repo / "src" / "main" / "java" / "com" / "acme" / "web"
+    web_dir.mkdir(parents=True)
+    test_dir = java_repo / "src" / "test" / "java" / "com" / "acme" / "web"
+    test_dir.mkdir(parents=True)
+    concrete_src = "package com.acme.web;\npublic class Mixed {\n}\n"
+    abstract_src = "package com.acme.web;\npublic abstract class Mixed {\n}\n"
+    if swap_order:
+        (web_dir / "Mixed.java").write_text(abstract_src, encoding="utf-8")
+        (test_dir / "Mixed.java").write_text(concrete_src, encoding="utf-8")
+    else:
+        (web_dir / "Mixed.java").write_text(concrete_src, encoding="utf-8")
+        (test_dir / "Mixed.java").write_text(abstract_src, encoding="utf-8")
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name>mixed</servlet-name>\n"
+        "    <servlet-class>com.acme.web.Mixed</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>mixed</servlet-name>\n"
+        "    <url-pattern>/mixed/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["status"] == "degraded"
+    assert "unsupported_entry_point_shape" in scan_doc["degraded_by"]
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    descriptor_problem = next(
+        p for p in problems_doc["problems"]
+        if p["qualified_name"] == "com.acme.web.Mixed"
+        and p["reason_code"] == "unsupported_entry_point_shape")
+    assert "descriptor_route_on_uninstantiable_class" in descriptor_problem["detail"]
+    assert "disagree on instantiability" in descriptor_problem["detail"]
+    assert "no confident owner exists" in descriptor_problem["detail"]
+
+    features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
+    assert not any(e["name"] == "/mixed/*" for e in features_doc["entry_points"])
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    assert not any(e["route_kind"] is not None for e in dependencies_doc["edges"])
+
+
+def test_run_scan_an_annotation_suppressed_route_agrees_across_all_five_artifacts(
+    java_repo: Path,
+) -> None:
+    """MICRO-ROUND 47b (F2, the annotation-family twin the mandate
+    asked for): the web.xml descriptor family's own all-five-artifacts
+    agreement lock (test_run_scan_a_web_xml_servlet_class_naming_an_
+    abstract_class_degrades_end_to_end, above) has no ANNOTATION-family
+    twin - @WebServlet/@WebFilter/Spring/JAX-RS all self-suppress at the
+    java.py adapter level (before result.entry_points is ever built,
+    never routed through the shared descriptor-registrability verdict
+    at all), so the agreement claim ("every artifact agrees this route
+    was never served") deserves its own independent end-to-end lock,
+    never assumed to hold just because the descriptor family's own lock
+    does."""
+    import json
+
+    web_dir = java_repo / "src" / "main" / "java" / "com" / "acme" / "web"
+    web_dir.mkdir(parents=True)
+    (web_dir / "BaseServlet.java").write_text(
+        "package com.acme.web;\n\n"
+        "@WebServlet(\"/api\")\n"
+        "public abstract class BaseServlet extends HttpServlet {\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["status"] == "degraded"
+    assert "unsupported_entry_point_shape" in scan_doc["degraded_by"]
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    descriptor_problem = next(
+        p for p in problems_doc["problems"]
+        if p["qualified_name"] == "com.acme.web.BaseServlet")
+    assert descriptor_problem["reason_code"] == "unsupported_entry_point_shape"
+    assert "webservlet_on_uninstantiable_class" in descriptor_problem["detail"]
+
+    features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
+    assert not any(e["name"] == "/api" for e in features_doc["entry_points"])
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    assert not any(e["route_kind"] is not None for e in dependencies_doc["edges"])
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    servlet_unit = next(
+        u for u in modules_doc["units"] if u["display_name"] == "BaseServlet")
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    entry_points_mapped = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == servlet_unit["unit_id"] and s["check"] == "entry_points_mapped"
+    )
+    assert entry_points_mapped["stored_status"] == "unknown"
+
     dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
     assert not any(e["route_kind"] is not None for e in dependencies_doc["edges"])
 

@@ -1951,8 +1951,17 @@ def test_compute_descriptor_registrability_verdicts_suppresses_a_mixed_duplicate
     verdict = verdicts["com.acme.Mixed"]
     assert verdict.suppress is True
     assert "descriptor_route_on_uninstantiable_class" in verdict.detail
-    assert "conflicting declarations" in verdict.detail
-    assert "cannot know which one a container actually loads" in verdict.detail
+    assert "disagree on instantiability" in verdict.detail
+    assert "no confident owner exists" in verdict.detail
+    # MICRO-ROUND 47b (F1 MAJOR - THE MARKER'S OWN PLACEMENT): the
+    # reason-code marker must survive errors.bounded_detail's own
+    # MAX_PROBLEM_DETAIL_LENGTH (200) truncation once this reaches
+    # problems.json - the ORIGINAL wording put it at the very end,
+    # silently losing it on every real run (see test_run_scan_a_mixed_
+    # duplicate_descriptor_target_publishes_its_own_descriptor_problem's
+    # own end-to-end proof in test_comprehension_scan_pipeline.py).
+    from agenttalk.comprehension.errors import MAX_PROBLEM_DETAIL_LENGTH
+    assert "descriptor_route_on_uninstantiable_class" in verdict.detail[:MAX_PROBLEM_DETAIL_LENGTH]
 
 
 def test_build_dependencies_never_builds_a_route_edge_for_a_suppressed_descriptor_target(

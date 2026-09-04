@@ -300,11 +300,24 @@ def compute_descriptor_registrability_verdicts(
                 # FIX ROUND 47 (B2 BLOCKER): every duplicate declaration
                 # sharing this name is uninstantiable - a CERTAIN claim
                 # regardless of which one a container actually loads.
+                #
+                # MICRO-ROUND 47b (F1 - THE MARKER'S OWN PLACEMENT):
+                # `descriptor_route_on_uninstantiable_class` - the one
+                # token that ties this detail back to the registrability
+                # family's own shared reason-code vocabulary - moved
+                # right after `qualified_name` (round 41's own rule: a
+                # detail's distinguishing datum must sit within
+                # bounded_detail's own MAX_PROBLEM_DETAIL_LENGTH). It
+                # previously sat mid-sentence, still within bounds here
+                # by chance - unified with the mixed branch below, whose
+                # own longer explanation pushed the IDENTICAL marker
+                # past that bound entirely.
                 detail = (
-                    f"a <servlet-class>/<filter-class> names {qualified_name}, which resolves "
-                    f"to {len(units)} duplicate declarations, every one of which is "
-                    "uninstantiable (descriptor_route_on_uninstantiable_class) - no matter "
-                    "which declaration a container actually loads, it can never serve this route"
+                    f"a <servlet-class>/<filter-class> names {qualified_name} "
+                    "(descriptor_route_on_uninstantiable_class), which resolves to "
+                    f"{len(units)} duplicate declarations, every one of which is "
+                    "uninstantiable - no matter which declaration a container actually "
+                    "loads, it can never serve this route"
                 )
             verdicts[qualified_name] = DescriptorRegistrabilityVerdict(suppress=True, detail=detail)
         else:
@@ -316,13 +329,34 @@ def compute_descriptor_registrability_verdicts(
             # the same "ambiguous, never confidently pick one" honesty
             # every other duplicate-qualified-name situation already
             # gets in this producer.
+            #
+            # MICRO-ROUND 47b (F1 MAJOR, wrong-data - THE OVERTURNED
+            # HALF OF 0b): this detail's own full text is 385 characters
+            # - `_problem_record`'s own `bounded_detail` call truncates
+            # every problem detail to MAX_PROBLEM_DETAIL_LENGTH (200)
+            # before it is ever published, and the ORIGINAL wording put
+            # `descriptor_route_on_uninstantiable_class` at the very
+            # END of the sentence (after the "at least one is
+            # uninstantiable..." explanation) - past the 200-char
+            # truncation point, every real run's own published problem
+            # for this cell silently lost the one token connecting it to
+            # the registrability family's own shared vocabulary, leaving
+            # only the unrelated `duplicate_qualified_name` conflict
+            # record nearby (a fact about the NAME, never the ROUTE) for
+            # a reader to infer the connection from. Round 41's own rule
+            # ("every problem detail template must place its own
+            # distinguishing datum within the first MAX_PROBLEM_DETAIL_
+            # LENGTH characters") was violated by this one template -
+            # moved the marker right after `qualified_name`, the SAME
+            # placement the all-uninstantiable branch above now uses,
+            # so it always survives truncation regardless of how long
+            # the explanation clause that follows happens to be.
             detail = (
-                f"a <servlet-class>/<filter-class> names {qualified_name}, which resolves to "
-                f"{len(units)} duplicate, conflicting declarations - at least one is "
-                "uninstantiable and at least one may be servable, and this producer cannot "
-                "know which one a container actually loads (descriptor_route_on_uninstantiable_"
-                "class) - suppressed rather than publishing a confident served route this run "
-                "cannot actually confirm"
+                f"a <servlet-class>/<filter-class> names {qualified_name} "
+                "(descriptor_route_on_uninstantiable_class) - "
+                f"{len(units)} duplicate declarations disagree on instantiability, so no "
+                "confident owner exists and this producer refuses to publish a served route "
+                "it cannot confirm"
             )
             verdicts[qualified_name] = DescriptorRegistrabilityVerdict(suppress=True, detail=detail)
     return verdicts
