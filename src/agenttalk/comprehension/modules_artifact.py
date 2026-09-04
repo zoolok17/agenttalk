@@ -947,6 +947,52 @@ def _attribute_cross_file_entry_point_reasons(
     return updated
 
 
+def attribute_case_fold_collision_reasons(
+    records: list[ModuleRecord], reason_by_path: dict[str, str],
+) -> list[ModuleRecord]:
+    """FIX ROUND 48 (forty-second cold read, F2 MAJOR, wrong-data, dead
+    code since round 36 - .cr42-nfc): ``case_collision``/``unicode_
+    normalization_collision`` are both registered in ``readiness_
+    artifact._READINESS_CHECKS_BY_REASON_CODE`` as whole-file-evidence-
+    gap reasons (every one of the five checks that reason feeds must
+    report ``unknown``, never a confident answer computed over evidence
+    this run cannot actually trust) - but the mapping was UNREACHABLE:
+    ``scan_pipeline.py`` computed ``find_case_fold_collisions`` only
+    for a ``problems.json`` row, never fed the result back into either
+    colliding unit's own ``adapter_problem_reasons`` before ``readiness_
+    artifact.build_readiness`` ever consulted it. A run degraded by
+    ``unicode_normalization_collision`` published BOTH colliding units'
+    own signals as a confident ``satisfied``/``adapter_understood`` -
+    the exact "check-not-read" class this round's own dispatch named:
+    registered in the reason-code table, never actually attached to a
+    unit by any real producer.
+
+    ``reason_by_path`` maps EVERY colliding path (both members of each
+    pair - envelope/`problem_id` anchoring reasons only ever named the
+    SECOND-seen path in the published `problems.json` row; readiness
+    has no such anchor-uniqueness constraint, and BOTH files' own
+    identities are equally unproven by a collision) to its own
+    reason_code (``case_collision`` or ``unicode_normalization_
+    collision``, matching ``is_pure_case_fold_collision``'s own
+    per-pair choice). Merges onto every record - file or component -
+    whose own ``paths`` includes a colliding path, the same merge shape
+    ``_attribute_cross_file_entry_point_reasons`` already establishes."""
+    if not reason_by_path:
+        return records
+    updated: list[ModuleRecord] = []
+    for record in records:
+        extra = [reason_by_path[p] for p in record.paths if p in reason_by_path]
+        if not extra:
+            updated.append(record)
+            continue
+        merged = sorted({*record.adapter_problem_reasons, *extra})
+        updated.append(replace(
+            record, adapter_problem_reasons=merged,
+            adapter_problem_reason=merged[0] if merged else None,
+        ))
+    return updated
+
+
 def _populate_duplicate_qualified_name_conflicts(records: list[ModuleRecord]) -> list[ModuleRecord]:
     """FIX ROUND 16 (twelfth cold read, B1 BLOCKER, wrong-data): two
     in-scan classes declaring the IDENTICAL fully-qualified name (routine

@@ -1192,6 +1192,52 @@ def test_run_scan_reports_a_case_collision_between_two_enumerated_paths(
     assert len(collisions) == 1
     assert collisions[0]["path"] == "src/main/java/p/APP.JAVA"
 
+    # FIX ROUND 48 (forty-second cold read, F2 MAJOR, wrong-data, dead
+    # code since round 36 - .cr42-nfc): case_collision is registered in
+    # readiness_artifact._READINESS_CHECKS_BY_REASON_CODE as a whole-
+    # file-evidence-gap reason (source_understood among them), but
+    # nothing ever fed it into either colliding unit's own
+    # adapter_problem_reasons before this fix - both units (the real
+    # "App.java" AND the injected "APP.JAVA") must report
+    # source_understood as unknown, never a confident satisfied/
+    # adapter_understood computed over evidence this run cannot
+    # actually trust which file it came from.
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    colliding_unit_ids = {
+        u["unit_id"] for u in modules_doc["units"]
+        if "case_collision" in u["adapter_problem_reasons"]
+    }
+    assert len(colliding_unit_ids) == 4  # file + component, both paths
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    source_understood_signals = {
+        s["unit_id"]: s for s in readiness_doc["signals"] if s["check"] == "source_understood"
+    }
+    for unit_id in colliding_unit_ids:
+        assert source_understood_signals[unit_id]["stored_status"] == "unknown"
+        assert "case_collision" in source_understood_signals[unit_id]["reason_code"]
+
+
+def test_run_scan_a_non_colliding_file_keeps_a_confident_source_understood_control(
+    java_repo: Path,
+) -> None:
+    """Control for the case-fold/unicode-normalization readiness-wiring
+    fix above: an ordinary run with no colliding path at all must keep
+    reporting a confident source_understood for its own real class,
+    proving the fix does not overreact to every unit."""
+    import json
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    app_unit = next(u for u in modules_doc["units"] if u["display_name"] == "App")
+    assert app_unit["adapter_problem_reasons"] == []
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    signal = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == app_unit["unit_id"] and s["check"] == "source_understood"
+    )
+    assert signal["stored_status"] == "satisfied"
+
 
 def test_run_scan_reports_a_unicode_normalization_collision_not_a_false_case_collision(
     java_repo: Path, monkeypatch,
@@ -1252,6 +1298,31 @@ def test_run_scan_reports_a_unicode_normalization_collision_not_a_false_case_col
     # current (shortened again) template text.
     assert not collisions[0]["detail"].endswith("...(truncated)")
     assert collisions[0]["detail"].endswith("e.g. accents)")
+
+    # FIX ROUND 48 (F2 MAJOR, wrong-data, .cr42-nfc): the same readiness-
+    # wiring fix as the plain case-fold test above - BOTH colliding
+    # units (the NFC- and NFD-spelled paths, neither of which is a real
+    # readable file here) must report source_understood as unknown with
+    # the collision reason, never a confident answer.
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    colliding_unit_ids = {
+        u["unit_id"] for u in modules_doc["units"]
+        if "unicode_normalization_collision" in u["adapter_problem_reasons"]
+    }
+    assert len(colliding_unit_ids) == 2
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    source_understood_signals = {
+        s["unit_id"]: s for s in readiness_doc["signals"] if s["check"] == "source_understood"
+    }
+    for unit_id in colliding_unit_ids:
+        # NOTE: these two paths are also genuinely unreadable (neither
+        # exists on disk with real content) - both parse_failed AND
+        # unicode_normalization_collision apply, and only one reason
+        # surfaces as the signal's own displayed reason_code; the
+        # correctness property this fix owns is stored_status itself
+        # (already the honest "unknown" either way), not which of the
+        # two equally-disqualifying reasons happens to be shown.
+        assert source_understood_signals[unit_id]["stored_status"] == "unknown"
 
     scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
     assert "unicode_normalization_collision" in scan_doc["degraded_by"]
@@ -8816,3 +8887,4 @@ def test_problem_record_is_idempotent_on_an_already_bounded_detail():
     already_bounded = bounded_detail("a short detail " + "z" * 300)
     record = scan_pipeline._problem_record("externality_suppressed", "pom.xml", already_bounded)
     assert record["detail"] == already_bounded
+

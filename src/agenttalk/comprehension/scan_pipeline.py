@@ -955,6 +955,32 @@ def run_scan(
             binary_excluded_code_bearing_digests=binary_excluded_code_bearing_digests,
             descriptor_name_conflicts=descriptor_name_conflicts,
         )
+        # FIX ROUND 48 (forty-second cold read, F2 MAJOR, wrong-data,
+        # dead code since round 36 - .cr42-nfc): case_collision/
+        # unicode_normalization_collision are both registered in
+        # readiness_artifact._READINESS_CHECKS_BY_REASON_CODE as
+        # whole-file-evidence-gap reasons, but the mapping was
+        # UNREACHABLE - find_case_fold_collisions used to run only much
+        # later (below), feeding nothing but a problems.json row, never
+        # either colliding unit's own adapter_problem_reasons before
+        # build_readiness (right below) ever consulted it. Computed here
+        # instead, before readiness runs, and merged onto BOTH colliding
+        # units (see attribute_case_fold_collision_reasons's own
+        # docstring for why both, not just the second-seen path the
+        # published problem row itself anchors on) - the SAME
+        # `case_collisions` value is reused, unchanged, by the
+        # problems.json construction further down.
+        case_collisions = find_case_fold_collisions(relative_paths)
+        _case_fold_reason_by_path: dict[str, str] = {}
+        for _first, _second in case_collisions:
+            _reason = (
+                "case_collision" if is_pure_case_fold_collision(_first, _second)
+                else "unicode_normalization_collision"
+            )
+            _case_fold_reason_by_path[_first] = _reason
+            _case_fold_reason_by_path[_second] = _reason
+        modules = modules_artifact.attribute_case_fold_collision_reasons(
+            modules, _case_fold_reason_by_path)
         # M7 (cold-read, PR-B fix round 3): discovery already computed
         # each file's own content digest - dependencies_artifact.py and
         # features_artifact.py's producers carried source_digest=None
@@ -1491,9 +1517,11 @@ def run_scan(
         # callers - the same dead-code shape round 3's M9 found for
         # parse_web_xml. Two paths that collide once case-folded (a real
         # risk once a run crosses to/from a case-insensitive filesystem)
-        # is a named problem code the design itself expects; it was never
-        # actually emitted anywhere in the pipeline.
-        case_collisions = find_case_fold_collisions(relative_paths)
+        # is a named problem code the design itself expects. `case_
+        # collisions` itself is now computed earlier (see FIX ROUND 48's
+        # own comment above, near build_modules) so its own reason codes
+        # can reach readiness before build_readiness runs - reused here,
+        # unchanged, for the problems.json row construction below.
 
         # FIX ROUND 16 (twelfth cold read, B1 BLOCKER, part 3): one
         # problem per DISTINCT conflict_id (never per colliding unit -
