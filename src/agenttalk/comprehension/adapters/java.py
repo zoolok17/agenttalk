@@ -1183,6 +1183,27 @@ class JavaFileResult:
     descriptor_name_conflicts: list[tuple[str, list[str]]] = field(default_factory=list)
 
 
+def _find_unescaped_text_block_delimiter(text: str, start: int) -> int:
+    """FIX ROUND 48 (forty-second cold read, F4 MINOR, wrong-data): the
+    first UNESCAPED ``\"\"\"`` at or after ``start``, or ``-1`` if none -
+    a backslash and the character immediately following it are always
+    consumed together as one unit (the same escape-pairing the plain-
+    string branch in ``_strip_comments_and_strings`` already applies),
+    so an escaped quote (``\\"``) sitting right before two more literal
+    quote characters is never mistaken for the block's own real closing
+    delimiter."""
+    n = len(text)
+    k = start
+    while k < n:
+        if text[k] == "\\" and k + 1 < n:
+            k += 2
+            continue
+        if text[k:k + 3] == '"""':
+            return k
+        k += 1
+    return -1
+
+
 def _strip_comments_and_strings(text: str) -> tuple[str, bool]:
     """Blanks comment and string/char literal CONTENT with spaces while
     preserving every newline and the overall length/offsets, so a later
@@ -1224,7 +1245,26 @@ def _strip_comments_and_strings(text: str) -> tuple[str, bool]:
             i = end
         elif ch == '"':
             if text[i:i + 3] == '"""':
-                j = text.find('"""', i + 3)
+                # FIX ROUND 48 (forty-second cold read, F4 MINOR, wrong-
+                # data, .cr42-textblock): a bare ``text.find('"""', ...)``
+                # has NO escape awareness - a legal JEP 378 escaped quote
+                # (``\"``) inside a text block's own content can sit
+                # immediately before two more literal quote characters,
+                # and the naive search reads that three-quote SEQUENCE as
+                # the block's own closing delimiter even though its first
+                # quote is escaped and not a delimiter at all. Closing the
+                # block early there leaves everything genuinely still
+                # inside it (the real remaining content, up to and past
+                # the block's own REAL closing delimiter) misread as
+                # ordinary Java source - any stray quote/apostrophe in
+                # that leftover content then reads as its own unterminated
+                # literal, cascading into `malformed=True` ("unterminated
+                # literal") for a file that is fully legal Java. Mirrors
+                # the plain-string branch's own escape-skipping loop
+                # (immediately below): a backslash and the character it
+                # escapes are consumed as one unit, never independently
+                # re-examined as a potential delimiter character.
+                j = _find_unescaped_text_block_delimiter(text, i + 3)
                 if j == -1:
                     malformed = True
                 end = n if j == -1 else j + 3

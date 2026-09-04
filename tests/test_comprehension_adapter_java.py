@@ -1233,6 +1233,80 @@ def test_a_file_truncated_mid_class_with_no_unterminated_literal_still_reports_p
     assert "closing brace was never found" in truncation_problems[0].detail
 
 
+def test_a_text_block_with_an_escaped_triple_quote_does_not_close_early(
+) -> None:
+    """FIX ROUND 48 (forty-second cold read, F4 MINOR, wrong-data, .cr42-
+    textblock): the text-block closing-delimiter search used a bare
+    ``text.find('\"\"\"', ...)`` with no escape awareness - a legal JEP
+    378 escaped quote (``\\"``) sitting right before two more literal
+    quote characters (a real way to embed a literal triple-quote
+    sequence inside a text block's own content) made the naive search
+    close the block EARLY, right there, even though its first quote is
+    escaped and this is not really a delimiter at all. Everything
+    genuinely still inside the block (up to and past its own REAL
+    closing delimiter) is then misread as ordinary Java source - the
+    real closing ``\"\"\"`` reads as a brand-new text-block OPENER with
+    no closer of its own anywhere else in the file, cascading into a
+    FALSE parse_failed ('unterminated literal') for a file that is
+    fully legal Java."""
+    src = (
+        "package p;\n"
+        "class Controller {\n"
+        '    String s = """\n'
+        '        Say \\"""Hi\n'
+        '        """;\n'
+        "    void list() {}\n"
+        "}\n"
+    )
+    sanitized, malformed = java._strip_comments_and_strings(src)
+    assert malformed is False
+    result = java.parse_java_source("Controller.java", src)
+    assert result.units[0].qualified_name == "p.Controller"
+    assert not any(p.reason_code == "parse_failed" for p in result.problems)
+
+
+def test_a_text_block_with_a_trailing_backslash_before_its_own_closing_delimiter(
+) -> None:
+    """FIX ROUND 48 (F4 MINOR, JEP 378 escape battery): a text block
+    whose own content ends with an escaped backslash (``\\\\``)
+    immediately before the real closing delimiter - the escape-pairing
+    fix must consume the backslash pair as one unit and still correctly
+    recognize the REAL closing ``\"\"\"`` that follows, never skip past
+    it looking for a second one that does not exist."""
+    src = (
+        "package p;\n"
+        "class Controller {\n"
+        '    String s = """\n'
+        "        a path separator: \\\\\n"
+        '        """;\n'
+        "}\n"
+    )
+    sanitized, malformed = java._strip_comments_and_strings(src)
+    assert malformed is False
+    result = java.parse_java_source("Controller.java", src)
+    assert result.units[0].qualified_name == "p.Controller"
+
+
+def test_a_text_block_with_a_lone_escaped_quote_mid_block_is_unaffected() -> None:
+    """FIX ROUND 48 (F4 MINOR, JEP 378 escape battery): the common,
+    simple case - a single escaped quote (``\\"``) mid-block, nowhere
+    near the real closing delimiter - must be completely unaffected by
+    the escape-aware search (it always was; this locks the common case
+    alongside the two edge cases above)."""
+    src = (
+        "package p;\n"
+        "class Controller {\n"
+        '    String s = """\n'
+        '        she said \\"hi\\" to me\n'
+        '        """;\n'
+        "}\n"
+    )
+    sanitized, malformed = java._strip_comments_and_strings(src)
+    assert malformed is False
+    result = java.parse_java_source("Controller.java", src)
+    assert result.units[0].qualified_name == "p.Controller"
+
+
 def test_sixteen_valid_literal_and_comment_shapes_are_never_flagged_malformed():
     """FIX ROUND 15 (F5 regression battery): the reviewer explicitly
     verified 16 valid literal/comment shapes all sanitize correctly -
