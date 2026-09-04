@@ -258,6 +258,36 @@ def test_enumerate_scope_a_real_repo_root_build_output_dir_stays_silent(
     assert result.poisoning_excluded_roots == []
 
 
+def test_enumerate_scope_a_built_checkouts_target_classes_stays_silent(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 49 (forty-third cold read, C1, wrong-data): unlike
+    ``target/generated-sources/`` above (build-tool-GENERATED source),
+    ``target/classes/`` holds resources COPIED byte-identical from
+    ``src/main/resources`` by the build's own resource-processing step -
+    a `.sql`/`.jsp` there has no code-generation angle at all, but was
+    NOT a recognized position before this round, so the single most
+    ordinary repo state (anyone who ran a build before committing)
+    poisoned this producer's entire externality surface for a shape
+    with zero suspicious content."""
+    classes_dir = tmp_path / "target" / "classes"
+    classes_dir.mkdir(parents=True)
+    (classes_dir / "schema.sql").write_text("CREATE TABLE t (id INT);\n", encoding="utf-8")
+    comp_dir = _comprehension_dir(tmp_path)
+
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+
+    assert not any(f.relative_path.endswith("schema.sql") for f in result.files)
+    assert any(
+        e["category"] == "generated_or_vendor" and e["path"] == "target"
+        for e in result.excluded_roots
+    )
+    assert result.degraded is False
+    assert not any(p["reason_code"] == "excluded_region_contains_code" for p in result.problems)
+    assert result.excluded_region_may_contain_target is False
+    assert result.poisoning_excluded_roots == []
+
+
 def test_enumerate_scope_a_code_bearing_file_outside_the_generated_position_still_poisons(
     tmp_path: Path,
 ) -> None:
@@ -306,6 +336,34 @@ def test_enumerate_scope_a_vendor_dir_with_real_code_poisons_without_degrading(
     )
     assert result.degraded is False
     assert result.excluded_region_may_contain_target is True
+
+
+def test_a_poison_status_flip_inside_an_excluded_region_changes_the_fingerprint(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 49 (forty-third cold read, C2, judged): a file added
+    entirely inside an already-excluded vendor region does not, by
+    itself, change whole_scope_fingerprint (FINGERPRINT_CAVEAT's own
+    accepted residual) - but if that file flips whether the region
+    POISONS externality resolution, real published dependency-
+    resolution facts change while the fingerprint used to report no
+    change at all. Two scans of the identical directory, differing
+    ONLY in whether the vendor dir's own file is code-bearing, must now
+    produce DIFFERENT fingerprints."""
+    root_a = tmp_path / "a"
+    (root_a / "vendor" / "some-module").mkdir(parents=True)
+    (root_a / "vendor" / "some-module" / "README.txt").write_text("notes\n", encoding="utf-8")
+    result_a = discovery.enumerate_scope(root_a, _comprehension_dir(root_a))
+    assert result_a.poisoning_excluded_roots == []
+
+    root_b = tmp_path / "b"
+    (root_b / "vendor" / "some-module").mkdir(parents=True)
+    (root_b / "vendor" / "some-module" / "Widget.java").write_text(
+        "package com.acme;\nclass Widget {}\n", encoding="utf-8")
+    result_b = discovery.enumerate_scope(root_b, _comprehension_dir(root_b))
+    assert any(r["path"] == "vendor" for r in result_b.poisoning_excluded_roots)
+
+    assert result_a.whole_scope_fingerprint != result_b.whole_scope_fingerprint
 
 
 def test_enumerate_scope_an_ant_style_build_dir_with_only_binaries_stays_silent(
@@ -598,6 +656,40 @@ def test_exclusion_category_exempts_a_secret_shaped_directory_inside_a_recognize
     assert "src/main/java/com/ex/credentials/Handler.java" in {
         f.relative_path for f in result.files}
     assert result.exclusions.get("secret", 0) == 0
+    # MICRO-ROUND 49 (forty-third cold read, C3, completeness - the
+    # visibility half): admitted via the exemption, but never silently -
+    # a per-run problem records exactly this fact.
+    matching = [
+        p for p in result.problems
+        if p["reason_code"] == "secret_shaped_path_admitted_via_source_root_exemption"]
+    assert len(matching) == 1
+    assert matching[0]["path"] == "src/main/java/com/ex/credentials"
+
+
+def test_dot_prefixed_secret_literal_stays_excluded_even_inside_a_recognized_source_root(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 49 (forty-third cold read, C3, wrong-data): the round-
+    48 source-root exemption above is OVER-WIDE for the seven DOT-
+    PREFIXED secret literals - unlike ``credentials``, a dot-prefixed
+    name (``.env``) can never be a legal Java package segment, so the
+    "coincidental domain package" reasoning the exemption exists for
+    never applies to one. A ``.env`` directory sitting under a
+    recognized source root (``src/main/resources/``) is exactly as much
+    a secrets store as one at the repo root - excluded regardless,
+    reproduced pre-fix exactly as measured (published as a unit)."""
+    env_dir = tmp_path / "src" / "main" / "resources" / ".env"
+    env_dir.mkdir(parents=True)
+    (env_dir / "production").write_bytes(b"DB_PASSWORD=hunter2\n")
+    (tmp_path / "src" / "main" / "java" / "p").mkdir(parents=True)
+    (tmp_path / "src" / "main" / "java" / "p" / "App.java").write_bytes(b"package p;\nclass App {}\n")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert "src/main/resources/.env/production" not in {f.relative_path for f in result.files}
+    assert result.exclusions.get("secret", 0) == 1
+    assert not any(
+        p["reason_code"] == "secret_shaped_path_admitted_via_source_root_exemption"
+        for p in result.problems)
 
 
 def test_enumerate_scope_a_secret_shaped_directory_hiding_code_poisons_externality(

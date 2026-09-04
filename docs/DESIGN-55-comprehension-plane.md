@@ -516,6 +516,21 @@ same-file test-framework import as corroboration before trusting a bare
 `test/` segment that lightly, and only the adapter's own per-file
 `_classify` call has that per-file import evidence available.
 
+**NAMED LIMIT (declared, PR-B round 49, C8):** the `classification` field's own
+row above lists `generated` and `vendor` alongside the three values this
+producer's implementation actually publishes (`production`, `test`,
+`infrastructure`) - measured: `generated`/`vendor` can never appear on a
+published unit's own `classification` in this implementation. A path this
+producer would recognize as generated/vendor content
+(`_GENERATED_VENDOR_DIR_NAMES` - `target`, `build`, `dist`, `vendor`, `out`,
+`.next`) is excluded OUTRIGHT at discovery time - it never reaches
+`modules_artifact.build_modules` at all, so no `ModuleRecord` (and therefore no
+`classification`) is ever computed for it; a unit's own classification is only
+ever assigned to a file this run actually kept and read. Left named here for a
+consumer that parses this field expecting either value to appear, rather than
+silently letting the gap between this table's own aspiration and the
+implementation be independently rediscovered.
+
 Renaming a unit changes its path-derived ID. Matching a rename by content hash
 may appear in a future S4 two-run projection as a candidate, but it must not
 silently rewrite identity. This keeps references auditable and avoids false

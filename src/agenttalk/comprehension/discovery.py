@@ -377,8 +377,41 @@ def _excluded_directory_contains_a_code_bearing_file(directory: Path) -> tuple[b
 #: that shape - it still fires independently whenever a pom's own
 #: declared ``<module>`` path resolves into the excluded region,
 #: regardless of what this peek alone concluded.
+#: MICRO-ROUND 49 (forty-third cold read, C1, wrong-data): the four
+#: positions above only ever cover build-tool-GENERATED SOURCE (a real
+#: .java the build tool itself wrote) - the round-21 comment's own
+#: stated goal ("any compiled repo at all") is measurably narrower than
+#: the shape it names: a ``target/classes/`` (Maven) or ``build/
+#: classes/``/``build/resources/`` (Gradle) tree holds COPIED, not
+#: generated, resources (``.sql``/``.jsp``/etc. copied byte-identical
+#: from ``src/main/resources`` by the build's own resource-processing
+#: step) - not covered by any position above, so the SINGLE MOST
+#: ORDINARY repo state (anyone who ran a build before committing, or
+#: checked in a ``target/``/``build/`` directory) poisoned externality
+#: resolution for a resource shape with no code-generation angle at
+#: all. Extended to the compiled-output positions BOTH major build
+#: tools name unambiguously: Maven's own ``classes/``/``test-classes/``
+#: (a single compiled+resource-copy tree, no separate resources
+#: position), Gradle's own ``resources/``/``test-resources/`` (kept
+#: separate from its own ``classes/``). Same narrow-by-construction
+#: guard as the four positions above (never a coincidental domain
+#: package - a package would need to be positioned EXACTLY at ``target/
+#: classes/...``/``build/resources/...``, the build tool's own output
+#: root, to collide, not merely share a name somewhere else in the
+#: tree).
+#:
+#: NAMED RESIDUAL, not silently dropped: an EXPLODED WAR shape
+#: (``target/<artifactId>-<version>/WEB-INF/classes/``) is NOT covered -
+#: the artifact-id/version segment is per-project, dynamic, and this
+#: mechanism is a closed, static prefix list (round 21's own "CLOSED,
+#: PROVISIONAL... not chasing exhaustiveness" standard), never a glob
+#: engine. A code-bearing resource copy inside an exploded WAR's own
+#: ``WEB-INF/classes/`` still counts as poisoning evidence today -
+#: correctly conservative (never masking a genuinely misplaced real
+#: file), left for a future round if measured as a real, common gap.
 _RECOGNIZED_GENERATED_OUTPUT_POSITIONS = (
     "generated-sources/", "generated-test-sources/", "generated/",
+    "classes/", "test-classes/", "resources/", "test-resources/",
 )
 
 
@@ -471,6 +504,31 @@ def _matches_any_secret_pattern(name: str) -> bool:
     return any(
         fnmatch.fnmatchcase(folded, pattern.casefold()) for pattern in _SECRET_FILE_PATTERNS
     )
+
+
+#: MICRO-ROUND 49 (forty-third cold read, C3, wrong-data): every EXACT-
+#: LITERAL (never a glob - ``*``/``?`` excluded) entry in
+#: ``_SECRET_FILE_PATTERNS`` that is itself dot-prefixed - derived, never
+#: hand-duplicated, so this can never drift from the pattern set it is
+#: computed from. A dot-prefixed name can NEVER be a legal Java package
+#: segment (a package identifier cannot start with ``.`` - the SAME fact
+#: ``_HARD_EXCLUDE_DIR_NAMES``'s own docstring already relies on for
+#: ``.git``/``.svn``), so round 48's own source-root exemption (below -
+#: "a domain package coincidentally named like the exclusion category" -
+#: real for ``credentials``, which IS a legal package segment) can never
+#: legitimately apply to one of these seven: a ``.env`` directory sitting
+#: under ``src/main/resources`` is exactly as much a secrets store as one
+#: at the repo root, never first-party source the exemption was built to
+#: protect.
+_DOT_PREFIXED_SECRET_LITERALS = frozenset(
+    pattern for pattern in _SECRET_FILE_PATTERNS
+    if pattern.startswith(".") and "*" not in pattern and "?" not in pattern
+)
+
+
+def _matches_a_dot_prefixed_secret_literal(name: str) -> bool:
+    folded = name.casefold()
+    return any(folded == pattern.casefold() for pattern in _DOT_PREFIXED_SECRET_LITERALS)
 
 
 #: FIX ROUND 37 (F2 BLOCKER, part 3 - the calibration rule): kept in
@@ -909,6 +967,17 @@ def _exclusion_category(name: str, relative_path: str, *, is_dir: bool) -> str |
         # category at all (see the poison-gate fix below), an import
         # resolving into it published a CONFIDENT third-party dependency
         # for what was actually unscanned first-party code.
+        # MICRO-ROUND 49 (forty-third cold read, C3, wrong-data): the
+        # guard above is OVER-WIDE for the seven DOT-PREFIXED secret
+        # literals (see ``_DOT_PREFIXED_SECRET_LITERALS``'s own
+        # docstring) - a dot-prefixed name can never be a legal Java
+        # package segment, so the "coincidental domain package" reasoning
+        # this guard exists for never applies to one. Checked FIRST,
+        # unconditionally (no source-root exemption at all): a ``.env``
+        # directory is excluded EVERYWHERE, the same as ``.git``/``.svn``
+        # already are via ``_HARD_EXCLUDE_DIR_NAMES``.
+        if _matches_a_dot_prefixed_secret_literal(name):
+            return "secret"
         if _matches_any_secret_pattern(name) and not _is_inside_a_recognized_source_root(
             relative_path,
         ):
@@ -1093,6 +1162,17 @@ FINGERPRINT_CAVEAT = (
     "either gap - it already reads the file's own bytes before excluding "
     "it, so its own content_digest already makes the fingerprint sensitive "
     "to a content change there.\n\n"
+    "MICRO-ROUND 49 (forty-third cold read, C2, judged): a file added "
+    "entirely inside an already-excluded generated/vendor region still does "
+    "not change the fingerprint by itself (the residual above, unchanged) - "
+    "but if that file changes whether the region POISONS externality "
+    "resolution (a real, published dependency-resolution/status fact), the "
+    "fingerprint now DOES change too: this run's own poisoning_excluded_"
+    "roots decision (which regions actually poisoned, and why) is folded "
+    "into the fingerprint input directly, so a poison-status flip can never "
+    "leave the fingerprint reporting 'no change' while genuinely-different "
+    "facts publish - the one consequence of this residual serious enough to "
+    "close rather than merely declare.\n\n"
     "FIX ROUND 47 (forty-first cold read, M7 MAJOR, corrected): the "
     "resource_limit_oversized and resource_limit_total_bytes categories "
     "were PREVIOUSLY described here as having their own fingerprint-"
@@ -1343,6 +1423,33 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                                     "degrades_run": True,
                                 })
                     continue
+                # MICRO-ROUND 49 (forty-third cold read, C3, completeness
+                # - the visibility half): `category` is None here means
+                # this directory was NOT excluded - but a secret-shaped
+                # name (never one of the seven dot-prefixed literals,
+                # which are now excluded unconditionally above and can
+                # never reach this point) could still have been ADMITTED
+                # via the source-root exemption rather than genuinely
+                # not secret-shaped at all. Recorded, not silently
+                # walked as if this producer never noticed the name -
+                # the same "declared, not hidden" discipline every other
+                # judged exemption in this module already follows.
+                # Never degrading: this is the exemption working exactly
+                # as designed (a real domain package, not a secrets
+                # store), not a problem with the run's own evidence.
+                elif _matches_any_secret_pattern(entry.name) and _is_inside_a_recognized_source_root(
+                    relative,
+                ):
+                    problems.append({
+                        "reason_code": "secret_shaped_path_admitted_via_source_root_exemption",
+                        "path": relative,
+                        "detail": f"{entry.name!r} matches this producer's own secret-file "
+                                  "exclusion pattern set, but sits inside a recognized source "
+                                  "root and is not one of the dot-prefixed literals that can "
+                                  "never be a legal package segment - admitted as ordinary "
+                                  "content rather than excluded",
+                        "degrades_run": False,
+                    })
                 if relative in submodule_boundaries:
                     boundaries.append(
                         BoundaryEntry(relative_path=relative, boundary_kind="submodule"))
@@ -1583,6 +1690,27 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                 (entry["path"], entry["category"], entry.get("content_digest"))
                 for entry in excluded_roots
                 if entry["category"] in non_hard_excluded_categories
+            ),
+            # MICRO-ROUND 49 (forty-third cold read, C2, judged): a file
+            # ADDED entirely inside an ALREADY-excluded generated/vendor
+            # region changes nothing above (FINGERPRINT_CAVEAT's own
+            # accepted residual - the region's own category tally is
+            # unchanged, no per-file bytes are read) - but that same
+            # added file can flip whether this region POISONS
+            # externality resolution (crossing `_excluded_directory_
+            # contains_a_code_bearing_file`'s own True/False boundary),
+            # which changes REAL, published dependency-resolution facts
+            # (dependencies_artifact.py's own registry-miss handling)
+            # and this run's own status, with the fingerprint reporting
+            # no change at all - a "same fingerprint, different facts"
+            # contradiction a future freshness check over this field
+            # would trust wrongly. `poisoning_excluded_roots` (already
+            # computed, below) is exactly the poison DECISION's own
+            # output - folded in directly rather than re-deriving a
+            # parallel signal, so a poison flip is guaranteed to flip
+            # the fingerprint too.
+            "poisoning_excluded_roots": sorted(
+                (entry["path"], entry["trigger"]) for entry in poisoning_excluded_roots
             ),
         }
         fingerprint = hashlib.sha256(

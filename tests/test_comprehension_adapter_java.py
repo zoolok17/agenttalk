@@ -4166,6 +4166,47 @@ def test_web_xml_listener_is_enrolled_attributed_to_its_own_listener_class():
     assert entry_points == []
 
 
+def test_web_xml_welcome_file_list_is_enrolled_not_confidently_absent():
+    """MICRO-ROUND 49 (forty-third cold read, C5, completeness): a
+    <welcome-file-list> - a real, recognized Servlet-spec entry-point
+    mechanism (the container's own default-document list) - used to
+    publish nothing at all. Now enrolled as unsupported_entry_point_
+    shape, the same declared-not-modeled treatment <listener> already
+    has; no qualified_name to attribute to (a welcome file is a static
+    filename, never a Java class)."""
+    web_xml = """<web-app>
+  <welcome-file-list>
+    <welcome-file>index.html</welcome-file>
+  </welcome-file-list>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
+        "WEB-INF/web.xml", web_xml)
+    matching = [p for p in problems if p.reason_code == "unsupported_entry_point_shape"]
+    assert len(matching) == 1
+    assert "welcome" in matching[0].detail.lower()
+    assert matching[0].qualified_name is None
+    assert entry_points == []
+
+
+def test_web_xml_error_page_is_enrolled_not_confidently_absent():
+    """MICRO-ROUND 49 (C5's own <error-page> twin)."""
+    web_xml = """<web-app>
+  <error-page>
+    <error-code>404</error-code>
+    <location>/404.html</location>
+  </error-page>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
+        "WEB-INF/web.xml", web_xml)
+    matching = [p for p in problems if p.reason_code == "unsupported_entry_point_shape"]
+    assert len(matching) == 1
+    assert "error-page" in matching[0].detail.lower()
+    assert matching[0].qualified_name is None
+    assert entry_points == []
+
+
 def test_web_xml_filter_with_no_filter_class_falls_back_to_the_synthetic_owner():
     """FIX ROUND 21b: companion negative case for the now-modeled
     <filter>/<filter-mapping> pair - a malformed/incomplete <filter>
@@ -7220,6 +7261,48 @@ def test_the_two_self_referential_properties_still_expand_for_the_own_identity_p
     pom = "<project><groupId>com.acme</groupId><artifactId>core</artifactId></project>"
     units, _edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
     assert [u.qualified_name for u in units] == ["com.acme:core"]
+
+
+def test_project_parent_groupid_expands_even_when_the_projects_own_groupid_comes_first():
+    """MICRO-ROUND 49 (forty-third cold read, C6, wrong-data - the same
+    class as B1): `_own_and_parent_group_ids` used to `break` the
+    instant it found the project's own top-level <groupId> - Maven's
+    own schema does not require <parent> to precede it (xs:all, same
+    reasoning as B1's own <exclusions> fix), so a pom declaring its own
+    <groupId> BEFORE <parent> (legal, if unusual) never even reached
+    the later <parent><groupId> match: ${project.parent.groupId}
+    silently never expanded, even though a real <parent> block existed.
+    Reproduced pre-fix exactly as measured."""
+    pom = (
+        "<project>"
+        "<groupId>com.acme</groupId>"
+        "<artifactId>core</artifactId>"
+        "<parent><groupId>com.acme.parent</groupId><artifactId>root</artifactId></parent>"
+        "<dependencies><dependency>"
+        "<groupId>${project.parent.groupId}</groupId><artifactId>shared</artifactId>"
+        "</dependency></dependencies>"
+        "</project>"
+    )
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"com.acme.parent:shared"}
+
+
+def test_project_parent_groupid_expands_when_parent_comes_first_control():
+    """Control for the fix above: the ordinary ordering (<parent> before
+    the project's own <groupId>) already worked and must keep working
+    identically."""
+    pom = (
+        "<project>"
+        "<parent><groupId>com.acme.parent</groupId><artifactId>root</artifactId></parent>"
+        "<groupId>com.acme</groupId>"
+        "<artifactId>core</artifactId>"
+        "<dependencies><dependency>"
+        "<groupId>${project.parent.groupId}</groupId><artifactId>shared</artifactId>"
+        "</dependency></dependencies>"
+        "</project>"
+    )
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"com.acme.parent:shared"}
 
 
 def test_pom_a_visible_artifactid_containing_a_zero_width_space_is_unaffected():

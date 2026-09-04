@@ -242,6 +242,20 @@ _CONFIDENT_INFRASTRUCTURE_BASENAMES = frozenset({
     # stated rule exactly. An ARBITRARY ``.properties`` file does not (see
     # that rule's own restatement below).
     "gradle.properties", "gradle-wrapper.properties", "local.properties",
+    # MICRO-ROUND 49 (forty-third cold read, C7, wrong-data): the wrapper
+    # SCRIPT (gradlew) and its own config (gradle.properties) were
+    # already here, but the build script itself was measured missing -
+    # `build.gradle` classified `[]` while its own wrapper classified
+    # `infrastructure`. Satisfies this set's own stated rule exactly
+    # the same way its two siblings already do: MANDATED by Gradle's own
+    # convention (a build script's own filename is not a project choice),
+    # independent of this run ever reading its content (no Gradle
+    # adapter exists in this producer - its role is unambiguous from the
+    # name alone). Named residual, not silently expanded: the identical
+    # Kotlin-DSL (`build.gradle.kts`) and multi-module (`settings.gradle`/
+    # `settings.gradle.kts`) siblings are NOT added here - out of the
+    # round's own explicit scope, left for a future round's own sweep.
+    "build.gradle",
 })
 #: ``.sh``/``.bash`` (round 23's own ratified ``release.sh`` shape,
 #: reconfirmed here rather than regressed): a shell script is essentially

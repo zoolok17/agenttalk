@@ -258,6 +258,10 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     # its own worker.py conversion site - purely informational, never a
     # sign anything was actually missed from this run.
     "deployment_base_path_declared": "warning",
+    # MICRO-ROUND 49 (C3, completeness - the visibility half): same
+    # bucket as its non-degrading sibling above - the exemption working
+    # as designed, recorded rather than silent.
+    "secret_shaped_path_admitted_via_source_root_exemption": "warning",
     # FIX ROUND 17 (thirteenth cold read, CR13-3 MAJOR, part (b) - THE
     # CLASS-CLOSER): a recognized-but-unsupported route-like annotation
     # (JAX-WS's own @WebMethod) - under-claimed evidence, the same
@@ -3027,6 +3031,44 @@ def _verify_artifact_digests(
     if digests.run_content_digest(declared_artifacts) != scan_doc.get("content_digest"):
         raise ComprehensionError(
             "scan.json's run-level content_digest does not match its declared artifacts")
+    # MICRO-ROUND 49 (forty-third cold read, C4, completeness): scan.json's
+    # own problem_count/status/degraded_by summary fields were only ever
+    # checked for PRESENCE (_SCAN_JSON_REQUIRED_BODY_FIELDS) - unlike
+    # record_counts above (round 47's own fix), never cross-checked
+    # against problems.json's own actual content. A tampered scan.json
+    # declaring e.g. status="complete"/problem_count=0 over a
+    # problems.json that genuinely holds problems, or a degraded_by entry
+    # naming a reason code with no real problem record to back it, passed
+    # every check here. Tamper-only, deliberately: this does not
+    # recompute WHICH reason codes are degrading (that closed exemption
+    # list - deployment_base_path_declared, duplicate_route_target's own
+    # conditional exception - is this module's own internal policy, not
+    # published data a validator should re-derive) - it only proves
+    # problem_count/degraded_by/status are honest ABOUT problems.json's
+    # own actual, already-verified content.
+    problems_doc = raw_docs["problems.json"]
+    actual_problems = problems_doc.get("problems", [])
+    declared_problem_count = require_field(scan_doc, "problem_count", doc_name="scan.json")
+    if declared_problem_count != len(actual_problems):
+        raise ComprehensionError(
+            f"scan.json's problem_count ({declared_problem_count}) does not match the "
+            f"{len(actual_problems)} problem(s) actually present in problems.json"
+        )
+    actual_reason_codes = {p.get("reason_code") for p in actual_problems}
+    declared_degraded_by = set(require_field(scan_doc, "degraded_by", doc_name="scan.json"))
+    unbacked_reasons = sorted(declared_degraded_by - actual_reason_codes)
+    if unbacked_reasons:
+        raise ComprehensionError(
+            f"scan.json's degraded_by names reason code(s) {unbacked_reasons} with no "
+            "matching problem record in problems.json to back them"
+        )
+    declared_status = require_field(scan_doc, "status", doc_name="scan.json")
+    if declared_status == "degraded" and not declared_degraded_by:
+        raise ComprehensionError(
+            'scan.json declares status="degraded" but its own degraded_by is empty')
+    if declared_status == "complete" and declared_degraded_by:
+        raise ComprehensionError(
+            'scan.json declares status="complete" but its own degraded_by is non-empty')
 
 
 def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
@@ -3098,12 +3140,19 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
         # here too, so the claim is complete for every check `invalid`
         # actually depends on, not just the ones present when this
         # sentence was last written.
+        # MICRO-ROUND 49 (forty-third cold read, C4, THE SENTENCE AUDIT
+        # again): `invalid` is now also driven by problem_count/
+        # degraded_by/status disagreeing with problems.json's own actual
+        # content (_verify_artifact_digests, above) - folded in here too,
+        # the same discipline round 47's own audit already established.
         detail = (
             "all artifacts verified: schema, envelope identity, scan_id consistency, "
             "per-artifact/run-level content digests, declared record counts against "
-            "actual on-disk records, cross-artifact unit/entry-point/feature/signal/"
-            "readiness-summary reference integrity, module path confinement, and "
-            "problem/unit/edge/entry-point/feature/signal id collision-freedom"
+            "actual on-disk records, scan.json's own problem_count/degraded_by/status "
+            "against problems.json's actual content, cross-artifact unit/entry-point/"
+            "feature/signal/readiness-summary reference integrity, module path "
+            "confinement, and problem/unit/edge/entry-point/feature/signal id "
+            "collision-freedom"
         )
         # Round 7c (reviewer-3 delta on 95d9cd8): valid:true's own detail
         # sentence claimed "all artifacts verified" even when scan.json's

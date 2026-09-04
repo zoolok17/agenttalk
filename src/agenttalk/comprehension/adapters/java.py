@@ -5653,7 +5653,15 @@ def _own_and_parent_group_ids(
     ``parse_maven_pom``) does not need this distinction - an
     unresolvable self-reference there simply leaves the property
     unexpanded, never a false registry hit either way - so it ignores
-    this third value."""
+    this third value.
+
+    MICRO-ROUND 49 (forty-third cold read, C6, wrong-data): ORDER-
+    INDEPENDENT - Maven's own schema does not require ``<parent>`` to
+    precede the project's own ``<groupId>`` (the same ``xs:all``
+    reasoning round 49's own B1 fix already established for
+    ``<exclusions>``), so this scan never stops early the instant it
+    finds the project-level one; it keeps scanning for the ``<parent>``
+    block's own groupId regardless of which came first in the file."""
     group_id = parent_group_id = None
     project_group_id_declared_but_broken = False
     # FIX ROUND 38 (F2 BLOCKER): a comment interior to this leaf's own
@@ -5673,9 +5681,22 @@ def _own_and_parent_group_ids(
     # about for a genuine decode failure), and simply left unset for
     # the parent level (the safe "no usable parent groupId" default,
     # identical to a genuinely absent <parent> block).
+    # MICRO-ROUND 49 (forty-third cold read, C6, wrong-data - the same
+    # class as B1): the OLD `break` on the first `["project"]` match
+    # stopped this whole scan the instant the project's own <groupId>
+    # was found - Maven's own schema does not mandate <parent> come
+    # BEFORE the project's own <groupId> (xs:all, the same order-
+    # independence B1's own fix already established for <exclusions>),
+    # so a pom declaring its own <groupId> textually first never even
+    # reached the LATER <parent><groupId> match: parent_group_id stayed
+    # None, and ${project.parent.groupId} silently never expanded, even
+    # though a real <parent> block existed. Never breaks early now -
+    # keeps scanning for the parent's groupId regardless of where the
+    # project's own one appeared; `group_id is None` (not `break`) is
+    # what keeps the project-level field itself first-wins, unchanged.
     for match in _DEPENDENCY_GROUP_ID_RE.finditer(sanitized):
         stack = _enclosing_tag_stack(structural, match.start())
-        if stack == ["project"]:
+        if stack == ["project"] and group_id is None and not project_group_id_declared_but_broken:
             decoded = _decode_xml_leaf(_body_text(sanitized, match), _body_text(text, match))
             if not _is_blank_identity(decoded):
                 # FIX ROUND 41 (F1+F2, THE STRUCTURAL CURE): raw, never
@@ -5684,7 +5705,7 @@ def _own_and_parent_group_ids(
                 group_id = decoded.strip()
             else:
                 project_group_id_declared_but_broken = True
-            break
+            continue
         if stack == ["project", "parent"] and parent_group_id is None:
             decoded = _decode_xml_leaf(_body_text(sanitized, match), _body_text(text, match))
             if not _is_blank_identity(decoded):
@@ -6401,6 +6422,19 @@ _LISTENER_BLOCK_RE = _structural_block_pattern("listener")
 #: listener beyond the bare fact one exists - but decoded consistently
 #: with every other class-name leaf all the same).
 _LISTENER_CLASS_RE = _leaf_value_pattern("listener-class")
+#: MICRO-ROUND 49 (forty-third cold read, C5, completeness): a
+#: <welcome-file-list> (the ordered default-document list a container
+#: consults when a directory URL carries no filename of its own) and an
+#: <error-page> (a status-code/exception-type to <location> mapping) are
+#: both recognized, real Servlet-spec entry-point mechanisms this
+#: producer does not model - like <listener> above, enrolled-only:
+#: neither one names a real Java class this producer could publish a
+#: route/filter/entry-point owner for (a welcome file is a static
+#: resource name, not a class; an error page's own <location> is too),
+#: so there is nothing the declared-only bar would let either publish
+#: beyond the bare fact that the shape exists.
+_WELCOME_FILE_LIST_BLOCK_RE = _structural_block_pattern("welcome-file-list")
+_ERROR_PAGE_BLOCK_RE = _structural_block_pattern("error-page")
 
 
 def _filter_class_by_name(
@@ -7410,6 +7444,32 @@ def parse_web_xml(
                    "does not model - no entry point published, but not confidently absent "
                    "either"),
             qualified_name=qualified_name,
+        ))
+    # MICRO-ROUND 49 (forty-third cold read, C5, completeness): a
+    # <welcome-file-list> - see _WELCOME_FILE_LIST_BLOCK_RE's own
+    # comment for why this stays enrolled-only. No qualified_name to
+    # attribute to (the shape names static default-document filenames,
+    # never a Java class) - file-wide, the same broadcast shape a
+    # whole-file parse problem already uses.
+    for block_match in _WELCOME_FILE_LIST_BLOCK_RE.finditer(structural):
+        problems.append(JavaAdapterProblem(
+            reason_code="unsupported_entry_point_shape",
+            detail=bounded_detail(f"a <welcome-file-list> declared at line "
+                   f"{_line_at(newline_offsets, block_match.start())} names a recognized "
+                   "entry-point mechanism (web_xml_welcome_file_list) this adapter does "
+                   "not model - no entry point published, but not confidently absent "
+                   "either"),
+        ))
+    # MICRO-ROUND 49 (C5's own <error-page> twin): same enrolled-only
+    # treatment - an <error-page>'s own <location> is a static resource
+    # path, never a Java class either.
+    for block_match in _ERROR_PAGE_BLOCK_RE.finditer(structural):
+        problems.append(JavaAdapterProblem(
+            reason_code="unsupported_entry_point_shape",
+            detail=bounded_detail(f"an <error-page> declared at line "
+                   f"{_line_at(newline_offsets, block_match.start())} names a recognized "
+                   "entry-point mechanism (web_xml_error_page) this adapter does not "
+                   "model - no entry point published, but not confidently absent either"),
         ))
     return entry_points, problems, edges, descriptor_name_conflicts
 

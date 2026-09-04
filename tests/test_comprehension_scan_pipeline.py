@@ -6710,7 +6710,11 @@ def test_validate_run_success_detail_names_the_record_count_and_reference_checks
     module path confinement (round 32), problem_id/id-family collision-
     freedom (rounds 36/38/39), and readiness-summary reference integrity
     (M11, this round) were all checks `invalid` actually depended on but
-    this sentence never named."""
+    this sentence never named.
+
+    MICRO-ROUND 49 (forty-third cold read, C4, THE SENTENCE AUDIT
+    again): the new problem_count/degraded_by/status-vs-problems.json
+    cross-check folded into this same sentence."""
     scan_pipeline.run_scan(java_repo)
     result = scan_pipeline.validate_run(java_repo)
     assert result["valid"] is True
@@ -6720,6 +6724,8 @@ def test_validate_run_success_detail_names_the_record_count_and_reference_checks
     assert "readiness-summary" in result["detail"]
     assert "path confinement" in result["detail"]
     assert "collision-freedom" in result["detail"]
+    assert "problem_count" in result["detail"]
+    assert "degraded_by" in result["detail"]
 
 
 def test_validate_run_catches_an_artifact_whose_own_scan_id_does_not_match_the_run(
@@ -7380,6 +7386,78 @@ def test_validate_run_catches_a_record_counts_map_that_disagrees_with_its_own_ar
     assert "record_counts" in result["detail"]
 
 
+def _tamper_scan_json_top_level_field(java_repo: Path, outcome, mutate) -> None:
+    """Shared isolation technique for the three tests below - hand-edit
+    ONE top-level scan.json field, then re-sign scan.json's own byte_
+    sha256/content_digest anchor in index.json so the pre-existing
+    anchor-mismatch check never fires first and masks the new
+    consistency check being exercised, the same isolation the record_
+    counts test above already establishes."""
+    import json
+
+    scan_path = outcome.run_dir / "scan.json"
+    doc = json.loads(scan_path.read_text(encoding="utf-8"))
+    mutate(doc)
+    canonical_bytes = scan_pipeline.digests.canonical_json_bytes(doc)
+    scan_path.write_bytes(canonical_bytes)
+    comp_dir = scan_pipeline.paths.comprehension_dir(java_repo / ".agenttalk")
+    index_path = scan_pipeline.paths.index_path(comp_dir)
+    index_doc = json.loads(index_path.read_text(encoding="utf-8"))
+    for run_summary in index_doc["runs"]:
+        if run_summary["scan_id"] == outcome.scan_id:
+            run_summary["scan_json_byte_sha256"] = scan_pipeline.digests.sha256_bytes(canonical_bytes)
+            run_summary["scan_json_content_digest"] = scan_pipeline.digests.canonical_content_digest(doc)
+    index_path.write_text(json.dumps(index_doc), encoding="utf-8")
+
+
+def test_validate_run_catches_a_problem_count_that_disagrees_with_problems_json(
+    java_repo: Path,
+) -> None:
+    """MICRO-ROUND 49 (forty-third cold read, C4, completeness): scan.
+    json's own problem_count was only ever validated for PRESENCE, never
+    cross-checked against problems.json's own actual record count the
+    way record_counts already is above."""
+    outcome = scan_pipeline.run_scan(java_repo)
+    _tamper_scan_json_top_level_field(
+        java_repo, outcome, lambda doc: doc.__setitem__("problem_count", doc["problem_count"] + 1))
+
+    result = scan_pipeline.validate_run(java_repo)
+    assert result["valid"] is False
+    assert "problem_count" in result["detail"]
+
+
+def test_validate_run_catches_a_degraded_by_reason_with_no_backing_problem(
+    java_repo: Path,
+) -> None:
+    """MICRO-ROUND 49 (C4's own degraded_by twin): a degraded_by entry
+    naming a reason code with no matching problem record in problems.
+    json at all - fabricated, never backed by real evidence - passed
+    every check before this round."""
+    outcome = scan_pipeline.run_scan(java_repo)
+    _tamper_scan_json_top_level_field(
+        java_repo, outcome,
+        lambda doc: doc.__setitem__(
+            "degraded_by", sorted({*doc["degraded_by"], "no_such_reason_code_exists"})))
+
+    result = scan_pipeline.validate_run(java_repo)
+    assert result["valid"] is False
+    assert "degraded_by" in result["detail"]
+
+
+def test_validate_run_catches_a_status_degraded_by_inconsistency(java_repo: Path) -> None:
+    """MICRO-ROUND 49 (C4's own status twin): status="degraded" declared
+    over a genuinely empty degraded_by - internally inconsistent, never
+    checked against problems.json's own honest (empty, for this clean
+    fixture) content before this round."""
+    outcome = scan_pipeline.run_scan(java_repo)
+    _tamper_scan_json_top_level_field(
+        java_repo, outcome, lambda doc: doc.__setitem__("status", "degraded"))
+
+    result = scan_pipeline.validate_run(java_repo)
+    assert result["valid"] is False
+    assert "status" in result["detail"]
+
+
 def test_validate_run_catches_a_loaded_artifact_silently_dropped_from_scan_jsons_declared_list(
     java_repo: Path,
 ) -> None:
@@ -7879,6 +7957,25 @@ def test_run_scan_the_properties_basename_split_end_to_end(
     modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
     record = next(r for r in modules_doc["units"] if basename in r["paths"])
     assert record["classification"] == expected_classification
+
+
+def test_run_scan_build_gradle_classifies_infrastructure_end_to_end(java_repo: Path) -> None:
+    """MICRO-ROUND 49 (forty-third cold read, C7, wrong-data): the
+    wrapper SCRIPT (gradlew) and its own config (gradle.properties)
+    were already confident infrastructure, but the build script itself
+    - `build.gradle` - measured classification `[]`, an inconsistency
+    with no code/description reconcile needed since it satisfies
+    `_CONFIDENT_INFRASTRUCTURE_BASENAMES`'s own stated rule exactly the
+    same way its two siblings already do."""
+    import json
+
+    (java_repo / "build.gradle").write_text(
+        "plugins {\n    id 'java'\n}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    record = next(r for r in modules_doc["units"] if "build.gradle" in r["paths"])
+    assert record["classification"] == ["infrastructure"]
 
 
 def test_scan_json_declares_the_route_composition_caveat(java_repo: Path) -> None:
@@ -9226,6 +9323,43 @@ def test_run_scan_a_compiled_repo_with_generated_sources_keeps_confident_externa
     generated_dir.mkdir(parents=True)
     (generated_dir / "ConsumerMapperImpl.java").write_text(
         "package p;\nclass ConsumerMapperImpl {}\n", encoding="utf-8")
+    (java_repo / "src" / "main" / "java" / "p" / "Consumer.java").write_text(
+        "package p;\nimport org.apache.commons.lang3.StringUtils;\nclass Consumer {}\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    import_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "import"
+        and r.get("target_external") == "org.apache.commons.lang3.StringUtils")
+    assert import_edge["resolution_state"] == "resolved"
+
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["externality_suppressed"] is False
+    assert scan_doc["externality_suppressed_roots"] == []
+
+
+def test_run_scan_a_built_checkouts_target_classes_keeps_confident_externals(
+    java_repo: Path,
+) -> None:
+    """MICRO-ROUND 49 (forty-third cold read, C1, wrong-data, end to
+    end): unlike target/generated-sources/ above (build-tool-GENERATED
+    source), target/classes/ holds resources COPIED byte-identical from
+    src/main/resources by the build's own resource-processing step - a
+    real .sql/.jsp there has no code-generation angle at all, but this
+    position was NOT recognized before this round, so the single most
+    ordinary repo state (anyone who ran a build before committing)
+    poisoned this run's entire externality surface for a copy of
+    content this run ALREADY read at its own real source-root path."""
+    import json
+
+    classes_dir = java_repo / "target" / "classes"
+    classes_dir.mkdir(parents=True)
+    (classes_dir / "schema.sql").write_text("CREATE TABLE t (id INT);\n", encoding="utf-8")
     (java_repo / "src" / "main" / "java" / "p" / "Consumer.java").write_text(
         "package p;\nimport org.apache.commons.lang3.StringUtils;\nclass Consumer {}\n",
         encoding="utf-8",
