@@ -575,6 +575,101 @@ def test_enumerate_scope_excludes_a_secret_shaped_directory_name_not_just_files(
     assert result.exclusions.get("secret") == 1
 
 
+def test_exclusion_category_exempts_a_secret_shaped_directory_inside_a_recognized_source_root(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 48 (forty-second cold read, F1 BLOCKER leg 1, wrong-data
+    - the round-16 pattern): a directory literally named ``credentials``
+    (one of ``_SECRET_FILE_PATTERNS``'s own exact-literal entries) is
+    ALSO a plausible ordinary Java package segment (``com/ex/
+    credentials``) - one sitting inside an established ``src/main/
+    java/...`` tree is real, hand-written source, not a credentials
+    store, the same "domain package coincidentally named like the
+    exclusion category" shape round 16 already fixed once for
+    generated/vendor directory names. Without the source-root guard,
+    this package silently vanished from the inventory with no code-
+    bearing/poison signal at all (see the poison-gate test below)."""
+    pkg_dir = tmp_path / "src" / "main" / "java" / "com" / "ex" / "credentials"
+    pkg_dir.mkdir(parents=True)
+    (pkg_dir / "Handler.java").write_text(
+        "package com.ex.credentials;\nclass Handler {}\n", encoding="utf-8")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert "src/main/java/com/ex/credentials/Handler.java" in {
+        f.relative_path for f in result.files}
+    assert result.exclusions.get("secret", 0) == 0
+
+
+def test_enumerate_scope_a_secret_shaped_directory_hiding_code_poisons_externality(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 48 (forty-second cold read, F1 BLOCKER legs 2+3,
+    wrong-data, .cr42-secretdir): a directory named from the secret set,
+    NOT inside a recognized source root (so genuinely excluded as
+    "secret"), hiding real code one level deeper - round 20's own poison
+    gate used to be `if category == "generated_or_vendor":`, blind to
+    the "secret" category round 47 introduced, so this excluded
+    directory's own code-bearing content never poisoned this run's
+    externality confidence at all. Inverted to a category PROPERTY
+    (`_DIRECTORY_CATEGORIES_THAT_CANNOT_HIDE_FIRST_PARTY_CODE`) so
+    "secret" (and any future widened category) is poison-eligible by
+    default."""
+    credentials_dir = tmp_path / "credentials"
+    nested = credentials_dir / "src" / "main" / "java" / "com" / "ex"
+    nested.mkdir(parents=True)
+    (nested / "Foo.java").write_text("package com.ex;\nclass Foo {}\n", encoding="utf-8")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert result.exclusions.get("secret") == 1
+    assert result.excluded_region_may_contain_target is True
+    assert any(p["path"] == "credentials" for p in result.poisoning_excluded_roots)
+    # credentials/ itself sits under no bare `src/` segment (the src
+    # scaffolding is nested DEEPER, invisible once pruned at this
+    # boundary) - poisons externality but does not itself degrade,
+    # parity with an equivalent generated/vendor exclusion at this
+    # exact same position.
+    assert not any(p["reason_code"] == "excluded_region_contains_code" for p in result.problems)
+
+
+def test_enumerate_scope_a_secret_shaped_directory_hiding_code_under_a_bare_src_root_degrades(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 48 (F1 BLOCKER legs 2+3, parity with the existing
+    generated/vendor degrade path): the SAME excluded-directory shape
+    as above, but positioned so its OWN relative path sits under a bare,
+    uncarved `src/` segment - the identical Ant-legacy position
+    `excluded_region_contains_code` already degrades for a generated/
+    vendor exclusion. Proves the widened poison gate did not just add
+    the poison flag but also inherited the existing degrade trigger for
+    the "secret" category, unchanged."""
+    secret_dir = tmp_path / "app" / "src" / "credentials"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "Foo.java").write_text("package com.ex;\nclass Foo {}\n", encoding="utf-8")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert result.exclusions.get("secret") == 1
+    assert result.fingerprint_complete is False
+    matching = [p for p in result.problems if p["reason_code"] == "excluded_region_contains_code"]
+    assert len(matching) == 1
+    assert "'secret'-category" in matching[0]["detail"]
+
+
+def test_enumerate_scope_an_empty_secret_shaped_directory_does_not_poison(tmp_path: Path) -> None:
+    """Control: the same excluded-as-secret directory position as the
+    poisoning test above, but genuinely empty (no code-bearing content)
+    - excluded, but never poisons and never degrades, proving the fix
+    does not overreact to every secret-shaped directory exclusion."""
+    credentials_dir = tmp_path / "credentials"
+    credentials_dir.mkdir()
+    (credentials_dir / "readme.txt").write_text("nothing to see here\n", encoding="utf-8")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert result.exclusions.get("secret") == 1
+    assert result.excluded_region_may_contain_target is False
+    assert result.poisoning_excluded_roots == []
+    assert result.problems == []
+
+
 def test_enumerate_scope_excludes_a_credentials_json_service_account_key(tmp_path: Path) -> None:
     """FIX ROUND 41 (thirty-fifth cold read, F7 POLISH, completeness): the
     bare ``credentials`` literal (an AWS-CLI-style file) was already

@@ -114,6 +114,25 @@ _DEPENDENCY_CACHE_DIR_NAMES = frozenset({
     "node_modules", ".m2", ".gradle", "__pycache__", ".venv", "venv", ".tox",
     ".mypy_cache", ".pytest_cache",
 })
+#: FIX ROUND 48 (forty-second cold read, F1 BLOCKER - THE STRUCTURAL
+#: FIX): the round-20 poison gate used to be ``if category ==
+#: "generated_or_vendor":`` - an enumerated equality naming exactly one
+#: directory-exclusion category, silently blind to a category added
+#: later (round 47's own "secret" directory-name matching). Inverted:
+#: this is the small, CLOSED set of categories that structurally can
+#: NEVER hold first-party code (excluded by directory NAME alone,
+#: never walked or peeked, by construction of `_exclusion_category`
+#: itself) - every other directory-exclusion category is poison-
+#: eligible BY DEFAULT, so a future widened category never has to be
+#: separately remembered here. `hard_excluded` (`.git`/`.agenttalk`)
+#: and `vcs` (`.hg`/`.svn`) are VCS/tooling-internal state, never a
+#: package a build could ever place first-party source under; `
+#: dependency_cache` (`node_modules`/`.m2`/etc) is third-party-package-
+#: manager state by construction of the directory NAME itself - peeking
+#: any of the three would be both expensive and pointless.
+_DIRECTORY_CATEGORIES_THAT_CANNOT_HIDE_FIRST_PARTY_CODE = frozenset({
+    "hard_excluded", "vcs", "dependency_cache",
+})
 #: FIX ROUND 37 (thirty-first cold read, F9 LOW, carry - folded into F2's
 #: own case policy): unlike F2's own secret-file PATTERN matching (now
 #: deliberately case-insensitive, identically on every platform - see
@@ -511,7 +530,22 @@ SECRET_PATTERNS_CAVEAT = (
     "producer never reads excluded content and genuinely cannot tell "
     "whether one of these five extensions was real, code-bearing "
     "content or ordinary config without reading what this exclusion "
-    "rule exists specifically to never read."
+    "rule exists specifically to never read. Widened (FIX ROUND 47, "
+    "completeness): secret-pattern matching also governs DIRECTORY "
+    "names, not just files - a directory literally named .env or "
+    "credentials is excluded, subtree and all, the same safe direction. "
+    "A secret-shaped directory name sitting inside a recognized source "
+    "root (src/main/java and its siblings) is exempted first (FIX ROUND "
+    "48, the round-16 pattern: a plausible domain package coincidentally "
+    "matching a secret pattern, e.g. com/ex/credentials, is real source, "
+    "not a credentials store) - a directory genuinely excluded as "
+    "secret is peeked the same way a generated/vendor exclusion already "
+    "is: code-bearing content found there both poisons this run's own "
+    "externality confidence run-wide and, when it sits under an "
+    "unrecognized bare src/ root, degrades the run visibly "
+    "(excluded_region_contains_code/excluded_region_peek_truncated) - "
+    "never a silent, confident external claim for what is actually "
+    "unscanned first-party code."
 )
 _BINARY_SNIFF_BYTES = 8192
 _PLATFORM_PROBE_RELATIVE_DIR = f"{RELATIVE_COMPREHENSION_DIR}/.platform-probe"
@@ -837,7 +871,27 @@ def _exclusion_category(name: str, relative_path: str, *, is_dir: bool) -> str |
         # second, parallel notion of "secret-shaped"), so a secret-shaped
         # directory name is excluded, subtree and all, the same safe
         # direction this producer already takes for a secret-shaped file.
-        if _matches_any_secret_pattern(name):
+        #
+        # FIX ROUND 48 (forty-second cold read, F1 BLOCKER, wrong-data -
+        # .cr42-secretdir): unlike the generated/vendor directory-name
+        # check three lines above, this had NO ``_is_inside_a_recognized_
+        # source_root`` guard - the round-16 pattern, applied here for
+        # the first time. Several of `_SECRET_FILE_PATTERNS`'s own
+        # entries (``credentials``, in particular) are also plausible
+        # ordinary Java package segments (``com/ex/credentials``) - one
+        # sitting inside an established ``src/main/java/...`` tree is
+        # real, hand-written source, not a credentials store, the exact
+        # "domain package coincidentally named like the exclusion
+        # category" shape round 16 already fixed once for generated/
+        # vendor names. Without this guard, that package silently
+        # vanished from the inventory AND from externality-safety at
+        # once: with no code-bearing/poison signal for the "secret"
+        # category at all (see the poison-gate fix below), an import
+        # resolving into it published a CONFIDENT third-party dependency
+        # for what was actually unscanned first-party code.
+        if _matches_any_secret_pattern(name) and not _is_inside_a_recognized_source_root(
+            relative_path,
+        ):
             return "secret"
         return None
     if _matches_any_secret_pattern(name):
@@ -1174,19 +1228,40 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                     # src/main/java/...``) has NO src segment in the
                     # excluded root's OWN path (only arbitrarily deeper,
                     # never recorded), so F4's own narrow boundary alone
-                    # can never see it. Scoped to the generated_or_vendor
-                    # CATEGORY specifically (never dependency-cache/vcs/
-                    # hard-excluded, which structurally can never hold
-                    # first-party code by the SAME reasoning discovery
-                    # already excludes them by name without walking, and
-                    # peeking a real node_modules/.m2 would be both
-                    # expensive and pointless). F4's OWN degradation
-                    # STAYS gated to the ratified src-ancestry boundary
-                    # (unchanged, below) - only the run-wide POISON flag
-                    # (consumed by dependencies_artifact.py to decide
-                    # whether a registry miss may ever publish a
-                    # confident external claim) widens to run-wide.
-                    if category == "generated_or_vendor":
+                    # can never see it. F4's OWN degradation STAYS gated
+                    # to the ratified src-ancestry boundary (unchanged,
+                    # below) - only the run-wide POISON flag (consumed by
+                    # dependencies_artifact.py to decide whether a
+                    # registry miss may ever publish a confident external
+                    # claim) widens to run-wide.
+                    #
+                    # FIX ROUND 48 (forty-second cold read, F1 BLOCKER,
+                    # wrong-data - THE STRUCTURAL FIX, .cr42-secretdir):
+                    # this used to be ``if category ==
+                    # "generated_or_vendor":`` - an ENUMERATED EQUALITY
+                    # naming exactly one directory-exclusion category.
+                    # Round 47 widened secret-pattern matching to
+                    # directory names (a genuinely new directory-
+                    # exclusion category) without ever touching this
+                    # gate - a secret-shaped directory hiding real code
+                    # got NEITHER the poison flag NOR a degrading
+                    # problem, so an import resolving into it published
+                    # a CONFIDENT third-party dependency for what was
+                    # actually unscanned first-party code, directly
+                    # contradicting SECRET_PATTERNS_CAVEAT's own promise
+                    # ("never silently... recorded and the run
+                    # degrades"). Inverted to a PROPERTY of the category
+                    # instead: ``_DIRECTORY_CATEGORIES_THAT_CANNOT_HIDE_
+                    # FIRST_PARTY_CODE`` names the SMALL, closed set that
+                    # structurally never holds first-party code (vcs/
+                    # dependency-cache/hard-excluded - excluded by NAME
+                    # alone, never peeked, the reasoning this code's own
+                    # comment already stated) - every OTHER directory-
+                    # exclusion category (generated_or_vendor, secret,
+                    # and any future one) is poison-eligible BY DEFAULT,
+                    # so the NEXT widened category can never repeat this
+                    # silently.
+                    if category not in _DIRECTORY_CATEGORIES_THAT_CANNOT_HIDE_FIRST_PARTY_CODE:
                         contains_code, peek_truncated = (
                             _excluded_directory_contains_a_code_bearing_file(entry)
                         )
@@ -1202,11 +1277,12 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                                 problems.append({
                                     "reason_code": "excluded_region_contains_code",
                                     "path": relative,
-                                    "detail": "a generated/vendor-named directory nested under "
-                                              "an unrecognized bare src/ root contains at least "
-                                              "one adapter-handled or tier-2 code-bearing file - "
-                                              "excluded from the inventory as if it were build "
-                                              "output, but this content is genuinely unread code",
+                                    "detail": f"a {category!r}-category excluded directory "
+                                              "nested under an unrecognized bare src/ root "
+                                              "contains at least one adapter-handled or tier-2 "
+                                              "code-bearing file - excluded from the inventory "
+                                              "as if it could never hold first-party code, but "
+                                              "this content is genuinely unread code",
                                     "degrades_run": True,
                                 })
                             elif peek_truncated:
@@ -1224,11 +1300,12 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                                 problems.append({
                                     "reason_code": "excluded_region_peek_truncated",
                                     "path": relative,
-                                    "detail": "a generated/vendor-named directory nested under "
-                                              "an unrecognized bare src/ root exceeded this "
-                                              f"run's {_MAX_EXCLUDED_DIRECTORY_PEEK_ENTRIES}-"
-                                              "entry peek cap before a code-bearing file could "
-                                              "be confirmed present or absent - not confidently "
+                                    "detail": f"a {category!r}-category excluded directory "
+                                              "nested under an unrecognized bare src/ root "
+                                              "exceeded this run's "
+                                              f"{_MAX_EXCLUDED_DIRECTORY_PEEK_ENTRIES}-entry "
+                                              "peek cap before a code-bearing file could be "
+                                              "confirmed present or absent - not confidently "
                                               "either",
                                     "degrades_run": True,
                                 })
