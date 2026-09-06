@@ -2398,6 +2398,44 @@ def test_run_scan_a_bare_reference_outside_either_enclosing_scope_is_genuinely_a
         outer1_inner["unit_id"], outer2_inner["unit_id"]}
 
 
+def test_run_scan_a_fake_custom_annotation_package_never_fabricates_a_spring_route(
+    java_repo: Path,
+) -> None:
+    """MICRO-NOD 50b (F4 MAJOR, cross-vendor read, wrong-data,
+    reproduced verbatim - the reader's own three-file fixture): a
+    genuinely self-contained, real Java shape - a fixture-LOCAL
+    "custom" package declares its own @RestController/@GetMapping
+    annotation TYPES (zero Spring anywhere on this classpath at all),
+    and an unrelated controller class uses them, explicitly qualified.
+    Recognition matching on the last segment alone used to fabricate a
+    confident GET /fake route, evidence_class declared, from code that
+    could not possibly mean Spring - the "custom" prefix is a real,
+    different (if contrived) package, not a Spring one. End to end:
+    zero routes published anywhere in this scan."""
+    custom_dir = java_repo / "src" / "main" / "java" / "custom"
+    custom_dir.mkdir(parents=True)
+    (custom_dir / "RestController.java").write_text(
+        "package custom;\npublic @interface RestController {\n}\n", encoding="utf-8")
+    (custom_dir / "GetMapping.java").write_text(
+        "package custom;\npublic @interface GetMapping {\n  String value();\n}\n",
+        encoding="utf-8")
+    app_dir = java_repo / "src" / "main" / "java" / "app"
+    app_dir.mkdir(parents=True)
+    (app_dir / "FakeController.java").write_text(
+        "package app;\n"
+        "@custom.RestController\n"
+        "public class FakeController {\n"
+        "  @custom.GetMapping(\"/fake\")\n"
+        "  public void handler() {\n  }\n"
+        "}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    import json
+
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    assert [e for e in dependencies_doc["edges"] if e["relation"] == "route"] == []
+
+
 def test_run_scan_a_real_junit_test_calling_the_target_reports_test_evidence_located_satisfied(
     java_repo: Path,
 ) -> None:

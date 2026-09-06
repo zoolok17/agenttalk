@@ -3170,6 +3170,109 @@ public class Controller {
     assert result.problems == []
 
 
+def test_a_fake_explicitly_qualified_route_annotation_never_fabricates_a_route():
+    """MICRO-NOD 50b (F4 MAJOR, cross-vendor read, wrong-data, reproduced
+    verbatim): recognition used to match a fully-qualified annotation on
+    its LAST SEGMENT alone, regardless of what package preceded it - a
+    fixture-local, user-defined @custom.RestController/@custom.
+    GetMapping (zero Spring anywhere) fabricated a confident GET /fake
+    route, evidence_class declared, on code that never used the
+    framework at all. An explicitly-qualified annotation must now name
+    one of that annotation's own REAL package prefixes or it does not
+    match at all."""
+    src = """
+package app;
+
+@custom.RestController
+public class FakeController {
+    @custom.GetMapping("/fake")
+    public void handler() {}
+}
+"""
+    result = java.parse_java_source("FakeController.java", src)
+    assert _edges(result, "route") == []
+
+
+def test_a_fake_explicitly_qualified_web_servlet_never_fabricates_a_route():
+    """MICRO-NOD 50b (F4 MAJOR, swept to the servlet family): the same
+    fake-package shape for @WebServlet - never a real javax.servlet.
+    annotation/jakarta.servlet.annotation prefix, so never a servlet
+    route either."""
+    src = """
+package app;
+
+@custom.WebServlet("/fake")
+public class FakeServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("FakeServlet.java", src)
+    assert _edges(result, "route") == []
+
+
+def test_a_genuinely_qualified_route_annotation_still_composes():
+    """MICRO-NOD 50b (F4 MAJOR, genuine-Spring control): the REAL
+    package prefix must still be recognized exactly as before - only a
+    WRONG prefix is newly rejected, never a real one."""
+    src = """
+package app;
+
+@org.springframework.web.bind.annotation.RestController
+public class RealController {
+    @org.springframework.web.bind.annotation.GetMapping("/real")
+    public void handler() {}
+}
+"""
+    result = java.parse_java_source("RealController.java", src)
+    assert [r.target for r in _edges(result, "route")] == ["GET /real"]
+
+
+def test_a_bare_route_annotation_with_a_real_import_still_composes():
+    """MICRO-NOD 50b (F4 MAJOR, simple-name-with-import control): a
+    bare (unqualified) annotation backed by a real Spring import is
+    unaffected either way - recognized exactly as before this round."""
+    src = """
+package app;
+
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.GetMapping;
+
+@RestController
+public class RealController {
+    @GetMapping("/real")
+    public void handler() {}
+}
+"""
+    result = java.parse_java_source("RealController.java", src)
+    assert [r.target for r in _edges(result, "route")] == ["GET /real"]
+
+
+def test_a_bare_route_annotation_with_no_import_at_all_is_a_judged_limit_still_recognized():
+    """MICRO-NOD 50b (F4, simple-name-without-import JUDGED shape - a
+    declared decision, not a bug): requiring import/scope corroboration
+    for every BARE annotation match site-wide would suppress this
+    producer's own dominant, longstanding coarse-S1-evidence
+    recognition shape (this module already trusts a bare name the
+    identical way everywhere else) - real, compiling Spring/JAX-RS code
+    always carries the import or a wildcard import (the annotation is
+    never in the same package as user code), so the false-positive risk
+    a bare, import-free match poses in PRACTICE is vanishingly small,
+    unlike the EXPLICITLY-mis-qualified case this round actually fixes.
+    Locks the CURRENT, judged behavior - not a claim it could not be
+    reconsidered with real corroboration data in a future round (see
+    _annotation_qualifier_is_recognized's own NAMED LIMIT)."""
+    src = """
+package app;
+
+@RestController
+public class RealController {
+    @GetMapping("/real")
+    public void handler() {}
+}
+"""
+    result = java.parse_java_source("RealController.java", src)
+    assert [r.target for r in _edges(result, "route")] == ["GET /real"]
+
+
 def test_class_level_constant_reference_value_is_unrecoverable_not_an_empty_prefix():
     """B1 shape 2: a class-level route annotation whose value is a
     CONSTANT REFERENCE (not a literal) used to silently register NO

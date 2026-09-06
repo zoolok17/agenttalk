@@ -709,6 +709,92 @@ _MAIN_PARAM_FULL_RE = re.compile(r"\A\s*" + _MAIN_PARAM_RE + r"\s*\Z")
 _MAIN_PARAM_LEADING_TYPE_RE = re.compile(
     r"\A" + _MAIN_PARAM_PREFIX + r"((?:java\.lang\.)?[A-Za-z_$][\w$]*)")
 _MAIN_STRING_TYPE_SPELLINGS = frozenset({"String", "java.lang.String"})
+#: MICRO-NOD 50b (F4 MAJOR, cross-vendor read, wrong-data, THE ROOT
+#: CAUSE): every framework-annotation regex in this module recognizes a
+#: FULLY-QUALIFIED spelling by matching on the dotted name's LAST
+#: SEGMENT alone (round 11's own "de-enumerate" fix, see
+#: ``_ROUTE_ANNOTATION_RE``'s own comment) - deliberately, so a REAL
+#: fully-qualified spelling (``@org.springframework.web.bind.annotation.
+#: RestController``) is recognized the same as the bare name. But
+#: nothing ever checked WHICH package preceded the last segment: a
+#: fixture-local, user-defined ``@custom.RestController``/``@custom.
+#: GetMapping`` (zero Spring anywhere in the classpath this fixture
+#: implies) matched exactly as confidently as the real Spring
+#: annotation, fabricating a served route, evidence_class ``declared``,
+#: on code that never used the framework at all.
+#:
+#: This is the closed set of REAL package prefixes this producer
+#: recognizes for each framework annotation SIMPLE name it matches
+#: anywhere in this module - both the historical ``javax.*`` and the
+#: Jakarta-namespace-migrated ``jakarta.*`` spelling are accepted
+#: wherever the real ecosystem shipped both (Servlet/JAX-RS/EJB/
+#: WebSocket, all migrated by Jakarta EE 9). Consulted only when an
+#: annotation match IS explicitly qualified (a dot precedes the last
+#: segment) - see :func:`_annotation_qualifier_is_recognized`.
+_FRAMEWORK_ANNOTATION_PACKAGES: dict[str, tuple[str, ...]] = {
+    "RequestMapping": ("org.springframework.web.bind.annotation",),
+    "GetMapping": ("org.springframework.web.bind.annotation",),
+    "PostMapping": ("org.springframework.web.bind.annotation",),
+    "PutMapping": ("org.springframework.web.bind.annotation",),
+    "DeleteMapping": ("org.springframework.web.bind.annotation",),
+    "PatchMapping": ("org.springframework.web.bind.annotation",),
+    "Path": ("javax.ws.rs", "jakarta.ws.rs"),
+    "ApplicationPath": ("javax.ws.rs", "jakarta.ws.rs"),
+    "GET": ("javax.ws.rs", "jakarta.ws.rs"),
+    "POST": ("javax.ws.rs", "jakarta.ws.rs"),
+    "PUT": ("javax.ws.rs", "jakarta.ws.rs"),
+    "DELETE": ("javax.ws.rs", "jakarta.ws.rs"),
+    "HEAD": ("javax.ws.rs", "jakarta.ws.rs"),
+    "OPTIONS": ("javax.ws.rs", "jakarta.ws.rs"),
+    "PATCH": ("javax.ws.rs", "jakarta.ws.rs"),
+    "Controller": ("org.springframework.stereotype",),
+    "RestController": ("org.springframework.web.bind.annotation",),
+    "Component": ("org.springframework.stereotype",),
+    "Service": ("org.springframework.stereotype",),
+    "Repository": ("org.springframework.stereotype",),
+    "WebServlet": ("javax.servlet.annotation", "jakarta.servlet.annotation"),
+    "WebFilter": ("javax.servlet.annotation", "jakarta.servlet.annotation"),
+    "WebListener": ("javax.servlet.annotation", "jakarta.servlet.annotation"),
+    "WebMethod": ("javax.jws", "jakarta.jws"),
+    "Scheduled": ("org.springframework.scheduling.annotation",),
+    "KafkaListener": ("org.springframework.kafka.annotation",),
+    "RabbitListener": ("org.springframework.amqp.rabbit.annotation",),
+    "JmsListener": ("org.springframework.jms.annotation",),
+    "MessageDriven": ("javax.ejb", "jakarta.ejb"),
+    "Remote": ("javax.ejb", "jakarta.ejb"),
+    "ServerEndpoint": ("javax.websocket.server", "jakarta.websocket.server"),
+}
+
+
+def _annotation_qualifier_is_recognized(match_text: str) -> bool:
+    """MICRO-NOD 50b (F4 MAJOR): ``match_text`` is a full ``@[qualifier.]
+    Name`` regex match against one of this module's own framework-
+    annotation recognizers. A BARE match (no dot before the name) is
+    unconditionally accepted - unaffected by this round: requiring
+    import/scope corroboration for the bare-name case site-wide would
+    suppress this producer's own dominant, longstanding coarse-S1-
+    evidence recognition shape (matching by name, the same trust this
+    whole module already places in every other annotation/keyword
+    match), a MUCH broader behavior change than the reproduced bug
+    actually calls for - JUDGED, not chased, a NAMED LIMIT (declared)
+    for a future round to reconsider with real corroboration data, not
+    guessed here.
+
+    An EXPLICITLY-QUALIFIED match (a dot present) is accepted ONLY when
+    the qualifier is one of that annotation's own REAL, closed package
+    prefixes (``_FRAMEWORK_ANNOTATION_PACKAGES``) - never merely
+    matching the LAST segment regardless of what precedes it. A name
+    this table does not enumerate at all is rejected defensively (it
+    should never happen - every recognized simple name in this module
+    is listed - but failing closed here is free and correct either
+    way)."""
+    body = match_text[1:]  # strip the leading "@"
+    qualifier, dot, name = body.rpartition(".")
+    if not dot:
+        return True
+    return qualifier in _FRAMEWORK_ANNOTATION_PACKAGES.get(name, ())
+
+
 _ROUTE_ANNOTATIONS = (
     "RequestMapping", "GetMapping", "PostMapping", "PutMapping",
     "DeleteMapping", "PatchMapping",
@@ -3192,7 +3278,12 @@ def _class_registrability(
             is_record = keyword_match.group(1) == "record"
     trivia = sanitized[declaration_start:header_start]
     is_abstract = _ABSTRACT_MODIFIER_RE.search(trivia) is not None
-    has_stereotype = _SPRING_STEREOTYPE_ANNOTATION_RE.search(trivia) is not None
+    # MICRO-NOD 50b (F4 MAJOR): a match on the last segment alone is not
+    # enough - see _annotation_qualifier_is_recognized's own docstring.
+    has_stereotype = any(
+        _annotation_qualifier_is_recognized(m.group(0))
+        for m in _SPRING_STEREOTYPE_ANNOTATION_RE.finditer(trivia)
+    )
     # FIX ROUND 46 (fortieth cold read, F1 MAJOR): the SAME trivia span
     # ``is_abstract`` already searches carries the ``static`` modifier
     # too, when present - the one input this function's own caller needs
@@ -3829,6 +3920,12 @@ def parse_java_source(
     # runtime behavior would be a wrong-data bug, strictly worse than
     # today's honest silence on this one attribute.
     for match in _ROUTE_ANNOTATION_RE.finditer(sanitized):
+        # MICRO-NOD 50b (F4 MAJOR): a match on the last segment alone is
+        # not enough - see _annotation_qualifier_is_recognized's own
+        # docstring (a fixture-local @custom.RequestMapping, zero Spring
+        # anywhere, must never fabricate a route).
+        if not _annotation_qualifier_is_recognized(match.group(0)):
+            continue
         _span_end, paths, _explicit_methods, spring_conflict = _route_annotation_span(match)
         target_type = _class_level_route_target(match.start(), class_header_associations)
         if target_type is None:
@@ -3885,6 +3982,10 @@ def parse_java_source(
     # above - @ApplicationPath is not itself a route-composition
     # annotation, just a single fact worth naming when genuinely present.
     for match in _APPLICATION_PATH_ANNOTATION_RE.finditer(sanitized):
+        # MICRO-NOD 50b (F4 MAJOR): see _annotation_qualifier_is_
+        # recognized's own docstring.
+        if not _annotation_qualifier_is_recognized(match.group(0)):
+            continue
         line = _line_at(newline_offsets, match.start())
         enclosing = _enclosing_qualified_name(match.start(), types, primary_qualified)
         arg_pos = match.end()
@@ -3943,6 +4044,10 @@ def parse_java_source(
     # see _jax_rs_verb_by_path_annotation_start's own docstring.
     jax_rs_stack_verb_by_annotation_start = _jax_rs_verb_by_path_annotation_start(sanitized)
     for match in _ROUTE_ANNOTATION_RE.finditer(sanitized):
+        # MICRO-NOD 50b (F4 MAJOR): see _annotation_qualifier_is_
+        # recognized's own docstring.
+        if not _annotation_qualifier_is_recognized(match.group(0)):
+            continue
         line = _line_at(newline_offsets, match.start())
         enclosing = _enclosing_qualified_name(match.start(), types, primary_qualified)
         span_end, paths, explicit_methods, spring_conflict = _route_annotation_span(match)
@@ -4396,6 +4501,10 @@ def parse_java_source(
     # Spring/JAX-RS loop above already established, never a separate,
     # laxer standard for this family.
     for match in _WEB_SERVLET_ANNOTATION_RE.finditer(sanitized):
+        # MICRO-NOD 50b (F4 MAJOR): see _annotation_qualifier_is_
+        # recognized's own docstring - swept to the servlet family too.
+        if not _annotation_qualifier_is_recognized(match.group(0)):
+            continue
         line = _line_at(newline_offsets, match.start())
         target_type = _class_level_route_target(match.start(), class_header_associations)
         if target_type is None:
@@ -4554,6 +4663,10 @@ def parse_java_source(
     # relation for a URL-pattern-shaped association, entry-point kind
     # aside.
     for match in _WEB_FILTER_ANNOTATION_RE.finditer(sanitized):
+        # MICRO-NOD 50b (F4 MAJOR): see _annotation_qualifier_is_
+        # recognized's own docstring.
+        if not _annotation_qualifier_is_recognized(match.group(0)):
+            continue
         line = _line_at(newline_offsets, match.start())
         target_type = _class_level_route_target(match.start(), class_header_associations)
         if target_type is None:
@@ -4772,6 +4885,10 @@ def parse_java_source(
             # advance monotonically instead.
             previous_span_end = span_end if previous_span_end is None else max(previous_span_end, span_end)
         for verb_match in _JAX_RS_VERB_ANNOTATION_RE.finditer(sanitized):
+            # MICRO-NOD 50b (F4 MAJOR): see _annotation_qualifier_is_
+            # recognized's own docstring - swept to the JAX-RS family.
+            if not _annotation_qualifier_is_recognized(verb_match.group(0)):
+                continue
             enclosing = _enclosing_qualified_name(verb_match.start(), types, primary_qualified)
             if enclosing not in jax_rs_path_classes:
                 continue
@@ -4860,6 +4977,10 @@ def parse_java_source(
     # falls through to a confident "no entry point" negative on the
     # class it decorates. See UNSUPPORTED_ENTRY_POINT_SHAPES.
     for match in _WEB_METHOD_ANNOTATION_RE.finditer(sanitized):
+        # MICRO-NOD 50b (F4 MAJOR): see _annotation_qualifier_is_
+        # recognized's own docstring.
+        if not _annotation_qualifier_is_recognized(match.group(0)):
+            continue
         line = _line_at(newline_offsets, match.start())
         enclosing = _enclosing_qualified_name(match.start(), types, primary_qualified)
         problems.append(JavaAdapterProblem(
@@ -4877,6 +4998,13 @@ def parse_java_source(
     # UNSUPPORTED_ENTRY_POINT_SHAPES for the annotation-set judgment.
     for shape_name, pattern, label, is_class_level in _UNENROLLED_ENTRY_POINT_FAMILIES:
         for match in pattern.finditer(sanitized):
+            # MICRO-NOD 50b (F4 MAJOR): see _annotation_qualifier_is_
+            # recognized's own docstring - swept to every declared-gap
+            # family here too (a wrong qualifier would mislabel an
+            # unrelated annotation as "a recognized @Scheduled..." etc.,
+            # a lower-severity but still real precision gap).
+            if not _annotation_qualifier_is_recognized(match.group(0)):
+                continue
             line = _line_at(newline_offsets, match.start())
             if is_class_level:
                 enclosing = _class_level_route_target(match.start(), class_header_associations)
