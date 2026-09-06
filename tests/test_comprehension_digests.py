@@ -101,6 +101,49 @@ def test_canonical_content_digest_strips_generation_identity_at_any_depth() -> N
         dg.canonical_content_digest(other_capture_time)
 
 
+def _fake_scan_json(
+    scan_id: str, generated_at: str, started_at: str, completed_at: str,
+) -> dict:
+    return {
+        "schema_version": 1,
+        "artifact_type": "agenttalk.comprehension.scan",
+        "scan_id": scan_id,
+        "generated_at": generated_at,
+        "started_at": started_at,
+        "completed_at": completed_at,
+        "status": "complete",
+        "problem_count": 0,
+        "whole_scope_fingerprint": "deadbeef",
+        "fingerprint_complete": True,
+    }
+
+
+def test_canonical_content_digest_strips_started_at_and_completed_at_from_a_fixed_scan_json_shape() -> None:
+    """Round 8's own MAJOR 3 added started_at/completed_at to
+    GENERATION_IDENTITY_KEYS. This test ONLY proves the strip mechanism
+    on a hand-built, fixed scan.json SHAPE - it cannot and does not
+    prove run-to-run determinism of a REAL scan.json (that fixture has
+    no "artifacts" list, the exact field round 9's own MAJOR 3 found
+    still varying between two real scans via artifacts[].byte_sha256,
+    which this fixture cannot exercise). round 8's version of this test
+    was named as if it verified real determinism and did not - renamed
+    to what it actually checks (a fixed shape's serialization), per the
+    sixth cold read's ROUND 9b ask. The real verifier is
+    test_scan_json_content_digest_is_stable_across_two_real_content_
+    identical_scans in test_comprehension_scan_pipeline.py, which runs
+    the real pipeline twice and compares the real, on-disk documents."""
+    first = _fake_scan_json(
+        "20260826T091530Z-a1b2c3d4", "2026-08-26T09:15:30Z",
+        "2026-08-26T09:15:28Z", "2026-08-26T09:15:30Z")
+    second = _fake_scan_json(
+        "20260826T092000Z-e5f6a7b8", "2026-08-26T09:20:00Z",
+        "2026-08-26T09:19:57Z", "2026-08-26T09:20:00Z")
+    assert first["scan_id"] != second["scan_id"]
+    assert first["started_at"] != second["started_at"]
+    assert first["completed_at"] != second["completed_at"]
+    assert dg.canonical_content_digest(first) == dg.canonical_content_digest(second)
+
+
 def test_canonical_content_digest_respects_a_caller_supplied_strip_set() -> None:
     doc_a = {"a": 1, "custom_generation_field": "one"}
     doc_b = {"a": 1, "custom_generation_field": "two"}
@@ -151,3 +194,99 @@ def test_root_binding_digest_never_leaks_the_input_verbatim() -> None:
     digest = dg.root_binding_digest("/home/dev/super-secret-project-name")
     assert "super-secret-project-name" not in digest
     assert len(digest) == 64  # hex-encoded sha256
+
+
+# ----------------------------------------------------------- deterministic record IDs
+
+def test_unit_id_is_deterministic_and_path_order_independent() -> None:
+    a = dg.unit_id(kind="file", paths=["b.java", "a.java"], qualified_name=None)
+    b = dg.unit_id(kind="file", paths=["a.java", "b.java"], qualified_name=None)
+    assert a == b
+
+
+def test_unit_id_differs_by_kind_path_or_qualified_name() -> None:
+    base = dg.unit_id(kind="file", paths=["a.java"], qualified_name=None)
+    assert base != dg.unit_id(kind="component", paths=["a.java"], qualified_name=None)
+    assert base != dg.unit_id(kind="file", paths=["b.java"], qualified_name=None)
+    assert base != dg.unit_id(kind="file", paths=["a.java"], qualified_name="p.A")
+
+
+def test_edge_id_is_deterministic() -> None:
+    a = dg.edge_id(from_unit_id="u1", relation="import", target="java.util.List", phase="runtime")
+    b = dg.edge_id(from_unit_id="u1", relation="import", target="java.util.List", phase="runtime")
+    assert a == b
+
+
+def test_edge_id_differs_by_relation() -> None:
+    a = dg.edge_id(from_unit_id="u1", relation="import", target="x", phase="runtime")
+    b = dg.edge_id(from_unit_id="u1", relation="invoke", target="x", phase="runtime")
+    assert a != b
+
+
+def test_entry_point_id_is_deterministic() -> None:
+    a = dg.entry_point_id(kind="cli_main", owning_unit_id="u1", name="main")
+    b = dg.entry_point_id(kind="cli_main", owning_unit_id="u1", name="main")
+    assert a == b
+
+
+def test_feature_id_is_unit_order_independent() -> None:
+    a = dg.feature_id(label="checkout", unit_ids=["u2", "u1"])
+    b = dg.feature_id(label="checkout", unit_ids=["u1", "u2"])
+    assert a == b
+
+
+def test_signal_id_differs_by_policy_version() -> None:
+    a = dg.signal_id(unit_id="u1", check="deps_resolved", policy_version=1)
+    b = dg.signal_id(unit_id="u1", check="deps_resolved", policy_version=2)
+    assert a != b
+
+
+def test_conflict_id_is_claim_order_independent() -> None:
+    a = dg.conflict_id(conflict_kind="unit_kind", anchor="p.Foo", claim_digests=["d2", "d1"])
+    b = dg.conflict_id(conflict_kind="unit_kind", anchor="p.Foo", claim_digests=["d1", "d2"])
+    assert a == b
+
+
+def test_problem_id_is_deterministic() -> None:
+    a = dg.problem_id(reason_code="parse_failed", path="p/Foo.java", detail="x")
+    b = dg.problem_id(reason_code="parse_failed", path="p/Foo.java", detail="x")
+    assert a == b
+
+
+def test_problem_id_differs_by_reason_code_path_or_detail() -> None:
+    base = dg.problem_id(reason_code="parse_failed", path="p/Foo.java", detail="x")
+    assert dg.problem_id(reason_code="resource_limit", path="p/Foo.java", detail="x") != base
+    assert dg.problem_id(reason_code="parse_failed", path="p/Bar.java", detail="x") != base
+    assert dg.problem_id(reason_code="parse_failed", path="p/Foo.java", detail="y") != base
+
+
+def test_problem_id_differs_by_qualified_name() -> None:
+    """FIX ROUND 37 (thirty-first cold read, F1 BLOCKER - availability):
+    qualified_name now feeds the hash too - two records sharing an
+    identical (reason_code, path, detail) but naming a DIFFERENT class
+    must publish different ids; this is the structural fix for the 19
+    coupling sites the reader's own AST sweep found (a source-line-only
+    discriminator collides when two same-kind declarations share one
+    line - an ordinary minified/one-line web.xml with two <listener>
+    elements, for instance)."""
+    base = dg.problem_id(
+        reason_code="unsupported_entry_point_shape", path="web.xml", detail="x",
+        qualified_name="p.FooListener")
+    other_class = dg.problem_id(
+        reason_code="unsupported_entry_point_shape", path="web.xml", detail="x",
+        qualified_name="p.BarListener")
+    unattributed = dg.problem_id(
+        reason_code="unsupported_entry_point_shape", path="web.xml", detail="x")
+    assert other_class != base
+    assert unattributed != base
+    assert unattributed != other_class
+
+
+def test_problem_id_unattributed_is_stable_and_distinct_from_a_literal_empty_name() -> None:
+    """None (never attributed) hashes as the empty string, deterministic
+    across calls, and distinct in EFFECT from a real qualified_name -
+    the empty-string encoding is an internal implementation choice, not
+    a claim that "" is a legitimate qualified name."""
+    a = dg.problem_id(reason_code="parse_failed", path="p/Foo.java", detail="x")
+    b = dg.problem_id(reason_code="parse_failed", path="p/Foo.java", detail="x", qualified_name=None)
+    assert a == b

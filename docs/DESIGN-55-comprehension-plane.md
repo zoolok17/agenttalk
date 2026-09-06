@@ -265,12 +265,19 @@ The canonical content digest is the SHA-256 of a specified canonical JSON
 projection. That projection removes `scan_id`, `generated_at`, capture times,
 lock/owner tokens, and any other generation identity; it retains schema
 versions, source-scope identity, platform identity, adapter/configuration
-versions, record IDs, record content, problem codes, and ordering. `scan.json`
-computes its run-level `content_digest` from the ordered tuple of artifact type,
-schema version, record count, and artifact content digest. Comparing this one
-field answers whether two generations are content-equivalent. Manifest and
-exact-byte digests still authenticate the concrete generation and normally
-differ between rescans.
+versions, record IDs, record content, problem codes, and ordering.
+`scan.json` computes its own run-level `content_digest` from the ordered
+tuple of artifact type, schema version, record count, and artifact content
+digest - taken over exactly the FIVE artifacts this slice's own producers
+emit (`modules.json`, `dependencies.json`, `features.json`, `readiness.json`,
+`problems.json`; corrected, PR-B round 45, C1 - the sentence previously read
+as if this covered artifacts generically, an overclaim against this slice's
+own closed producer set). `scan.json` itself is deliberately excluded from
+this tuple - it is the SUMMARY of these five artifacts, not a sixth entry in
+its own digest; a self-referential digest has no fixed point. Comparing this
+one field answers whether two generations are content-equivalent. Manifest
+and exact-byte digests still authenticate the concrete generation and
+normally differ between rescans.
 
 All persisted paths use project-relative POSIX spelling. Absolute paths,
 `..` segments, NULs, URL-like values, and paths resolving outside the project
@@ -299,6 +306,62 @@ problem rather than two silently merged units.
 - bounded summary counts for units, edges, features, entry points, readiness
   states, exclusions, unsupported files, generated/vendor handling, resource
   omissions, conflicts, and problems.
+- the privacy audit trail this run acted under: `vcs_privacy` disposition,
+  VCS kind, the matched ignore rule when one exists, and `work_id` - the
+  operator-supplied work item ID bound to an attended
+  `--acknowledge-unignored-private-store` override, when one was used.
+  `work_id` is persisted VERBATIM (declared, PR-B micro-round 47c):
+  sanitizing it would damage the very binding it records, so an operator
+  who passes a path or environment value in `--work-id` leaks it into this
+  durable artifact - the CLI flag's own help text carries the same caution.
+
+NAMED LIMIT (declared and CLOSED, PR-B round 47, B1 - THE WORST FAILURE
+SHAPE): a `.gitmodules` submodule boundary is parsed via a real `git config -f
+<file> --list` subprocess call (the same git binary the privacy layer already
+shells out to), restricted to `submodule.*.path` keys - never a hand-rolled
+text parse of the file's own contents. A hand-rolled parse is a SECOND,
+independently-maintained grammar for a format git itself already owns, and
+the two grammars silently diverged in both directions: an unrelated
+`[core] path = ...` key (real, common git config, no section scope in the
+old parse) fabricated a submodule boundary that DELETED the real directory
+from the inventory; a quoted, trailing-slash, or trailing-comment path value
+(all real, legal git-config spellings) was read by git but produced no
+boundary at all, LEAKING a genuine external submodule's own source as
+first-party units. Delegating to git's own parser closes both directions at
+once - unquoting, comment-stripping, and section scoping all come from git,
+never re-derived. A missing/erroring `git` binary (a real, if rare,
+possibility - this call needs only the binary on PATH, never a real `.git`
+worktree at the scanned root) gets the SAME fail-open, degrading-problem
+treatment this producer already gives an unreadable or undecodable
+`.gitmodules` file - never a silent empty boundary set.
+
+`scan.json`'s `unsupported_relations`, `unsupported_invoke_shapes`,
+`unsupported_entry_point_shapes`, and `entry_point_kinds` are a STATIC
+CAPABILITY DECLARATION - the named, enumerated set of recognized-but-unmodeled
+shapes (the first three) or recognized, closed, meaning-bearing values (the
+fourth) this producer VERSION carries, published unconditionally on every run
+regardless of whether that run actually contains a matching shape or kind.
+These four fields answer "what can this version publish, and what does it
+mean," never "did this run hit one" - but only `unsupported_entry_point_shapes`
+and `entry_point_kinds` also surface a per-run INSTANCE of that answer
+elsewhere: an entry point published against one of `UNSUPPORTED_ENTRY_POINT_
+SHAPES`'s own named shapes gets its own `problems.json` record (`reason_code=
+unsupported_entry_point_shape`, this class's own `qualified_name`), and every
+published entry point already carries its own `kind` value directly as a
+`features.json` field (round 21c: a consumer reading it - e.g. `"http_filter"`
+- needs a declared meaning to know it is deliberately excluded from a "served
+route" count, not merely a differently-spelled synonym for `"http_route"`).
+`unsupported_relations` and `unsupported_invoke_shapes` are declared ONLY as
+static facts - a reactor's own `<modules>` aggregator entry (the `"include"`
+member) and a constructor-call or field-injected collaborator call (the two
+`UNSUPPORTED_INVOKE_SHAPES` members) never produce a per-run instance record
+anywhere (round 30 F2, twenty-sixth cold read): every constructor call and
+every field-injected call in every file would flood `problems.json` for no
+addressable action, so this producer deliberately does not instance-track
+either family - `problems.json`/`features.json` can never answer "did this
+run hit an unsupported relation/invoke shape," only the static fields above
+can (a weaker, different answer: "this version's own recognized-but-unmodeled
+vocabulary includes this shape," not "this run actually has one").
 
 The whole-scope fingerprint is wider than the set of files selected into a pack.
 A new file therefore changes it even when no old selected-path digest changes.
@@ -319,11 +382,66 @@ Examples are `unsupported_language`, `parse_failed`, `path_excluded`,
 reason because that failure publishes no `problems.json`.
 
 A run is `degraded` if an enabled adapter fails, an input budget truncates the
-scope, or part of the selected source is unsupported. Ordinary unresolved
-dependencies and readiness blockers are domain findings and do not by
-themselves make the scan command fail. A fatal configuration, confinement, or
-publication error publishes no run. Exceeding the durable-artifact ceiling also
-publishes no run; it does not truncate the inventory and call the result valid.
+scope, or part of the selected source is unsupported *and code-bearing* (see
+"Unsupported-language degradation is tiered, not binary" below). Ordinary
+unresolved dependencies and readiness blockers are domain findings and do not
+by themselves make the scan command fail. A fatal configuration, confinement,
+or publication error publishes no run. Exceeding the durable-artifact ceiling
+also publishes no run; it does not truncate the inventory and call the result
+valid.
+
+#### Unsupported-language degradation is tiered, not binary
+
+An amendment (task #55 slice-1 PR-B, fix rounds 16-17): the plain reading above
+- *any* unsupported file degrades the run - was measured against real
+repositories and does not hold: an ordinary Spring Boot repository scanned
+`degraded` over its own Maven wrapper, its CI configuration, and its
+`LICENSE` file. An unsupported extension resolves through THREE tiers, not
+two:
+
+1. **Adapter-handled** - a bundled adapter recognizes the language and parses
+   it normally. Not part of this section.
+2. **Recognized code-bearing, unsupported** - a CLOSED, PROVISIONAL list of
+   extensions this producer has no adapter for yet. Membership is decided by
+   ONE criterion: the extension names NEVER-INCIDENTAL application or
+   database estate - a file with this extension is ALWAYS real,
+   migration-relevant source in an ordinary Java repository, never a routine
+   helper/tooling/asset script that merely happens to share the same
+   language (a repository-wide `scripts/release.py` helper or a webapp's own
+   static `app.js` asset are both routine and common, and FAILED this
+   criterion on measurement - removed after initially being added on the
+   weaker "any real programming language" reading). Every file matching this
+   tier is recorded in `problems.json` (`unsupported_language`) AND degrades
+   the run - the same standard a fresh migration reader applies ("would a
+   reader say the inventory missed something they needed?" - the reader
+   test a reviewer's own delta first established, reused unchanged for this
+   tier). The current membership is a source-code fact, not a design fact -
+   see `worker.py`'s own `_DEGRADING_CODE_EXTENSIONS` constant (and its
+   neighboring criterion comment) for the list actually enforced; this
+   section describes the RULE that constant must satisfy, not an inline copy
+   of its contents, which would drift out of sync with the code the moment
+   either changes independently.
+3. **Everything else non-benign** - any extension neither adapter-handled,
+   on a closed BENIGN allowlist (documentation, plain text, lockfiles,
+   images), nor on the tier-2 list above. Still recorded in `problems.json`
+   (never silently dropped - a file's mere absence from the closed
+   recognized-code-bearing list is not evidence that it is tooling, only
+   that this producer has not yet been taught to recognize it as
+   application code) but does NOT degrade the run - a build/tooling/
+   infrastructure/configuration file (`Dockerfile`, a Maven wrapper script,
+   CI YAML, `.properties`/`.yml` application configuration) is not "missed
+   application code" the same way an unrecognized JVM-language source file
+   is, even though this producer cannot parse either one.
+
+The tier-2 list is explicitly PROVISIONAL and expected to GROW (and
+occasionally SHRINK, on the identical criterion, per measurement) as this
+producer is measured against more real, polyglot repositories - an absent
+entry under-claims degradation for a real application language this list has
+not yet caught up to, but (per tier 3's own guarantee) never silently
+vanishes the file from `problems.json` entirely. Changing the list is a
+narrow, low-risk change (one frozenset entry plus a regression test); judged
+not to require a design amendment of its own each time a reviewer ratifies a
+change.
 
 ### Fact provenance and canonical merge
 
@@ -369,6 +487,7 @@ Each unit record contains:
 | `unit_id` | Deterministic SHA-256 ID over unit kind, normalized path, and qualified name. |
 | `kind` | Closed adapter vocabulary such as `service`, `package`, `module`, `component`, or `file`. |
 | `display_name` | Bounded derived or declared label; never a source excerpt. |
+| `qualified_name` | Declared/derived identity string (a Java-style dotted name, or a pom `groupId:artifactId` coordinate), when the adapter has one; `null` for a bare file unit. Unlike `display_name`, this is the field other records exact-match/registry-compare against for the rest of the same run - see the bounded-consumption note below for why it is never per-field truncated the way `display_name` is. |
 | `language` | Detected language or `unknown`. |
 | `paths` | Sorted relative source paths that make up the unit. |
 | `source_digests` | Per-path hashes used as direct staleness evidence; they do not replace the whole-scope fingerprint. |
@@ -378,10 +497,78 @@ Each unit record contains:
 | `conflict_id` | Optional stable link shared by incompatible claims. |
 | `evidence` | Bounded local evidence pointers. |
 
+**NAMED LIMIT (declared, PR-B round 45, F1):** a `test` classification driven
+by path alone recognizes a closed, provisional set of test-source-root
+conventions - Maven's own `src/test/`, Maven's `src/it/` (the
+failsafe/invoker-plugin integration-test convention, added this round), and a
+bare top-level `tests?/` - matched case-insensitively (round 37's own F4 "one
+case policy": lowercase before matching, extended here to close a real gap -
+this producer already records the default platform as case-insensitive, so
+`src/Test/` and `src/test/` name the identical directory and must not be
+classified differently). This case-fold applies to path matching only; it is
+never applied to a Java identifier check (the `Test`/`Tests`/`IT` simple-name
+suffix), since Java identifiers are case-sensitive by language rule regardless
+of platform. A MODULE-LOCAL bare `test/` segment not anchored under `src/` or
+the repository root (an Ant-style layout such as `svc/test/Foo.java`) is
+deliberately NOT recognized by the path-only classifiers (`modules_artifact.py`
+and the worker's own descriptor gate) - round 15's own rule already requires a
+same-file test-framework import as corroboration before trusting a bare
+`test/` segment that lightly, and only the adapter's own per-file
+`_classify` call has that per-file import evidence available.
+
+**NAMED LIMIT (declared, PR-B round 49, C8):** the `classification` field's own
+row above lists `generated` and `vendor` alongside the three values this
+producer's implementation actually publishes (`production`, `test`,
+`infrastructure`) - measured: `generated`/`vendor` can never appear on a
+published unit's own `classification` in this implementation. A path this
+producer would recognize as generated/vendor content
+(`_GENERATED_VENDOR_DIR_NAMES` - `target`, `build`, `dist`, `vendor`, `out`,
+`.next`) is excluded OUTRIGHT at discovery time - it never reaches
+`modules_artifact.build_modules` at all, so no `ModuleRecord` (and therefore no
+`classification`) is ever computed for it; a unit's own classification is only
+ever assigned to a file this run actually kept and read. Left named here for a
+consumer that parses this field expecting either value to appear, rather than
+silently letting the gap between this table's own aspiration and the
+implementation be independently rediscovered.
+
 Renaming a unit changes its path-derived ID. Matching a rename by content hash
 may appear in a future S4 two-run projection as a candidate, but it must not
 silently rewrite identity. This keeps references auditable and avoids false
 rename certainty.
+
+**Bounded consumption, per-field (invariant 8, amended - PR-B round 42):**
+a *label* field (`display_name` here; `dependencies.json`'s own
+`target_external`) is a terminal, never-re-hashed, never-re-looked-up display
+value - it is truncated per-field with a visible marker, the same discipline a
+route/filter name already used. A *living identity* field (`qualified_name`
+here; a pom coordinate published through `target_external` before this round's
+own reconciliation was a case of this too, now corrected) is exact-matched and
+conflict-detected against for the rest of the same run - truncating it
+per-field would let two genuinely different declared identities collide
+whenever they share a long common prefix, exactly the class of bug PR-B's own
+round 41 fixed for a route target and round 42 fixed for a reactor-module path.
+`qualified_name` therefore publishes RAW and UNBOUNDED, deliberately, with no
+per-field ceiling of its own - the only backstop for a pathological value is
+invariant 8's own WHOLE-ARTIFACT ceiling (16 MiB / 100,000 records), which
+refuses to publish the run at all rather than silently truncating an identity.
+This is a declared, accepted residual, not an oversight: a per-field identity
+ceiling was considered and rejected, since any such ceiling reintroduces
+exactly the collision class both rounds just closed.
+
+**Decision record - raw bytes in a durable identity field (PR-B round 42,
+F4, no code change):** because `qualified_name` publishes raw, it may carry a
+real bidi/invisible/control character byte-for-byte into `modules.json`/
+`dependencies.json` (a `duplicate_qualified_name`/`conflict_id` claim keys on
+the exact same raw value, so escaping it here would only reopen the identity
+question this section just closed). This is safe for the durable artifact
+itself (bounded UTF-8 JSON, never rendered directly) but NOT safe for a
+consumer that prints it - `agenttalk comprehension report --json` already
+serializes with `ensure_ascii`, so the CLI's own JSON output is inert; the
+#208 migration-UI contract already requires every *displayed* label to be
+escaped before rendering. Recorded here as the accepted division of
+responsibility: this plane's own durable artifacts carry raw bytes by design;
+any consumer that renders one to a human must escape it itself, the same
+obligation it already has for any other free-text field.
 
 ## Artifact 2: dependency edges
 
@@ -392,8 +579,13 @@ derived by report/UI code so they cannot drift from the edge set.
 Each edge contains:
 
 - a deterministic `edge_id` and `from_unit_id`;
-- a target union: internal `unit_id`, normalized external package/system name,
-  or an explicit unresolved identifier;
+- a target union: internal `unit_id`; a bounded, displayed external
+  package/system name label (`target_external` - see Artifact 1's own
+  per-field bounded-consumption note; `edge_id` itself is always computed
+  from the raw, unbounded value, never this label), or - when
+  `relation == "route"` - the route pattern (`relation` is the
+  discriminator a consumer dispatches on); or an explicit unresolved
+  identifier;
 - a closed relation from the coarse slice-1 vocabulary: `import`, `include`,
   `inherit`, `invoke`, `route`, `data`, `configuration`, `build`, or `test`;
 - phase (`runtime`, `build`, `test`, or `migration`) and optionality;
@@ -414,6 +606,101 @@ unsupported or unknown rather than emitting empty-looking facts. `persists`,
 `retries`, `cleans_up`, and `observed_at_runtime` require the S3 runtime/state
 producer and are invalid in a slice-1 artifact. No static adapter may mint
 `runtime_observed` evidence.
+
+NAMED LIMIT (declared, PR-B round 43): a `route`-relation edge's own pattern
+is composed only from class-level + method-level annotations (Spring's
+`@RequestMapping` family, JAX-RS's `@Path`). A deployment-level base path a
+container or framework prepends at runtime - JAX-RS's own `@ApplicationPath`,
+or a non-root `DispatcherServlet` `<servlet-mapping>` - is never composed in;
+the java adapter has no static, one-class-owns-one-prefix fact linking a
+discovered route back to the specific application/servlet class that
+ultimately dispatches it (unlike class-level `@RequestMapping`/`@Path`, that
+association is runtime container wiring). A published route may therefore
+not be the full path actually served. Publishing a guessed prefix would risk
+a confident, wrong route; this stays a named gap rather than either a guess
+or a silent omission.
+
+NAMED LIMIT (declared, PR-B round 45, C2 - judged, not chased): a
+class-level `@RequestMapping`'s own `method = RequestMethod.X` restriction
+(Spring's own less-common idiom of scoping every handler contained in a
+class to one or more HTTP verbs at the class level) is recognized by the
+same parse the method-level `method = ...` attribute already is, but never
+composed down onto a contained method-level route that declares no `method =`
+of its own - symmetric to the base-path limit just above, and judged the
+same way: composing it is not the "genuinely cheap" case that would justify
+a fix, since Spring's own precise inheritance semantics for this composition
+are exactly the framework-behavior uncertainty this producer's own
+under-claim-over-guess bar exists to stay out of.
+
+NAMED LIMIT (declared and CLOSED, PR-B round 44 + micro-round 44b - THE
+REGISTRABILITY MATRIX): a class-level route annotation used to publish
+regardless of whether the class it decorates can ever actually be the thing
+a container/framework instantiates and dispatches a request to. Closed for
+Spring's own family (an interface or abstract class is "not served through
+this class alone" - an implementing/subclass bean may serve it, Spring's own
+merged-annotation lookup searches both - and a concrete class with no
+recognized stereotype annotation anywhere in this file is "not provably a
+bean from this file", never "never a bean", since a separate XML `<bean>`
+declaration could still register it), for `@WebServlet`/`@WebFilter` (an
+interface or abstract class here is provably "never served" - a container
+only instantiates concrete classes, and neither annotation is inherited,
+Servlet spec), and - closed by micro-round 44b, on reviewer-3's own measured
+HOLD - for JAX-RS's own `@Path` on an interface or abstract class too: JSR-370
+s3.6 grants JAX-RS resource classes their own annotation-inheritance rule (a
+concrete implementer/subclass inherits a superinterface's/superclass's own
+`@Path`), so the route's own EXISTENCE is exactly as defensible as Spring's -
+but the OWNER (the interface/abstract type itself) is wrong, and no concrete
+implementor may exist anywhere in-scan at all. Given Spring's own inheritance
+rule already earns the WEAKER "not through this class alone" treatment
+(never the `@WebServlet`-style "never served" claim, which would be wrong
+here - JAX-RS's own inheritance rule is real, unlike `@WebServlet`'s), JAX-RS
+gets the identical weaker treatment, closing the round-25 abstract-`@Path`
+carry (folded into "Named decisions and residuals" as N5 at round 27) for
+good. Unlike Spring, JAX-RS needs no separate stereotype annotation - a
+class-level `@Path` is itself sufficient registration evidence for a
+concrete class, so only type-kind (interface/abstract vs. concrete) governs
+this family, never a missing-stereotype cell. Micro-round 44b additionally
+closed an ENUM cell the matrix keyed past (it keys on type-kind + stereotype
+presence, not instantiability): an enum is never instantiated the ordinary
+way and, unlike an interface/abstract class, no other class can ever extend
+one - a provably stronger "never registered" claim for both the Spring and
+JAX-RS families, folded into each family's own existing enrolled shape.
+
+NAMED LIMIT (declared and CLOSED, PR-B round 45 - THE MATRIX'S OWN MISSING
+COLUMN): a web.xml `<servlet-class>`/`<filter-class>` is a THIRD, STILL
+STRONGER registrability claim than any annotation family above - a descriptor
+explicitly names ONE specific class for the container to instantiate, with no
+implementor-may-serve escape an interface/abstract annotation target still
+has (Spring/JAX-RS's own weaker claim, above). This could not be decided at
+parse time (a single web.xml file's own parse cannot see another file's own
+declared class), so `JavaUnitClaim` now carries each declared type's own
+`is_interface`/`is_abstract`/`is_enum` (round 44's own `_class_registrability`
+facts, threaded through) and `features_artifact.build_features` - the one
+place a descriptor's `qualified_name` already resolves cross-file - consults
+it: an in-scan interface/abstract/enum target suppresses the route/filter
+entirely (never published) and records `unsupported_entry_point_shape`
+(`descriptor_route_on_uninstantiable_class`), degrading the run and
+re-attributing the reason onto the resolved class's own `modules.json` record
+via the SAME cross-file mechanism the web.xml `<listener>` case already
+established (`modules_artifact._attribute_cross_file_entry_point_reasons`). A
+descriptor naming a class NOT in this run's own scan (the normal real-world
+case - a jar-shipped servlet/filter base class) keeps publishing unchanged -
+this producer has no type-kind evidence for a class it never parsed, and
+suppressing over evidence that never existed would be exactly the wrong
+direction to be wrong in; ARGUED, not chased, whether an explicit
+unknowability caveat is needed here beyond the existing honest-external-case
+precedent (`test_web_xml_entry_point_still_owned_by_the_file_when_the_class_
+is_out_of_scan`'s own established shape) - no new caveat added this round.
+
+NAMED LIMIT (declared, MICRO-ROUND 44b): registrability checks cover type
+kind (interface/abstract/enum) and Spring stereotype presence only -
+constructor accessibility and other finer instantiability constraints (a
+concrete `@WebServlet` class whose only constructor is private, which a
+container can never invoke either, was reviewer-3's own measured example)
+are not modeled; this single-file, syntactic-only adapter does not track
+constructor declarations or their own access modifiers at all. A declared
+gap rather than a guessed pass/fail, per this producer's own "under-claim
+over guess" bar.
 
 The scanner never invents an internal target because names look similar.
 Ambiguous resolution creates an unresolved edge with candidates. Dynamic
@@ -471,10 +758,43 @@ evidence can support:
 - source is included and understood by an adapter;
 - direct internal dependencies are resolved or explicitly marked dynamic;
 - externally visible entry points are mapped;
-- the unit is linked to a confirmed feature or explicitly classified shared;
+- the unit is linked to a confirmed feature (`feature_linked`);
 - build/test or characterization evidence is located, otherwise unknown;
 - statically visible external integration, configuration, and data boundaries
   are identified, otherwise unknown.
+
+NAMED LIMIT (reconciled, PR-B round 43, N2; premise CORRECTED, PR-B round 44,
+F4): this list used to also read "... or explicitly classified shared" for
+the `feature_linked` bullet - no "shared" classification value exists
+anywhere in this implementation, and `readiness_artifact._check_feature_
+linked` has no bypass for it (or for anything else) - a unit with zero
+linked features always reports `unsatisfied`/`no_feature_link`, regardless
+of what kind of code it is. The aspiration was never built, and the design
+text describing it as already-covered was reconciled to match, rather than
+left for a reader to discover only by diffing prose against code.
+
+Round 43's own reconciliation additionally OVERCLAIMED the vocabulary
+itself as "`production`/`test` only" - FALSE: `infrastructure` is a real,
+already-published third value (`_is_confident_infrastructure_path`,
+`modules_artifact.py`; this table's own row above already lists it).
+`_check_feature_linked` also already receives the FULL classified
+`ModuleRecord` at its own call site - no new plumbing is needed to supply
+classification to it, only a policy decision to consult it. But
+`infrastructure` is not necessarily the SAME concept the original "shared"
+wording meant - `infrastructure` names non-code build/tooling/doc files
+(`Dockerfile`, `README`, a CI YAML) that already get a full six-signal
+readiness row as a named, accepted noise source (see "Named decisions and
+residuals" - round 20's own P4/round 16's own N4), where "shared" more
+plausibly meant a genuine CODE unit (an internal shared library/utility
+class used by several features) that classification alone does not
+currently distinguish from any other `production` unit. Left open (not
+decided this round): whether `infrastructure`-classified units should
+bypass `feature_linked` (folding into the existing P4/N4 noise carry, not a
+new one), and whether a SEPARATE "shared code" concept is worth building at
+all - the latter would still need its own classification value, its own
+producer, and a definition of what counts as "shared" this scan can
+actually evidence; the former needs only a policy decision plus a small
+code change, since every other precondition already exists.
 
 The immutable artifact stores `stored_assessment_state`: `assessed`,
 `needs_evidence`, `blocked`, or `not_applicable`. Any required scan-time blocker
@@ -528,6 +848,16 @@ cryptographically true.
 ## Scan behavior
 
 One scan follows this fixed pipeline:
+
+FIX ROUND 29 (twenty-fifth cold read, task #55 slice-1 PR-B, F8a polish,
+declare-not-silently-simplify): step 1's own "initialized project root"
+wording is NOT enforced this slice - `scan` never checks that `.agenttalk/`
+was created via `agenttalk init` first; it resolves whatever root the
+caller names (or the bus's own root-discovery walk finds) and creates
+`.agenttalk/comprehension/` under it either way, initialized or not.
+Requiring real init here is a repo-wide bus concern wider than this one
+command - declared rather than enforced this slice (see `scan --help`'s
+own description).
 
 1. Resolve the initialized project root and load/validate local configuration.
 2. Prove the private-store VCS disposition or obtain the attended per-run
@@ -600,7 +930,20 @@ The v1 surface stays migration-shaped and read-mostly:
 | `agenttalk comprehension validate` | Perform full-run integrity validation and separately revalidate external evidence pointers for one run or the latest run. Supports `--json`. |
 | `agenttalk comprehension prune --staging` | Reclaim only definitely abandoned, unpublished staging directories. It never deletes runs or packs. |
 
-Examples of the proposed syntax, not runnable in rev 2:
+Examples of the proposed syntax. FIX ROUND 28 (task #55 slice-1 PR-B,
+twenty-fourth cold read, F11, completeness): by this round `scan`/
+`status`/`report`/`validate`/`prune` are fully wired as a real, tested
+`agenttalk comprehension <verb>` CLI (`cli.py`'s `cmd_comprehension`,
+~1230 tests across `test_comprehension_cli.py`/`test_comprehension_
+scan_pipeline.py`) - not merely as direct Python entry points behind an
+unbuilt shell surface. `pack` remains the later increment named in
+`comprehension --help`'s own description (its example line below is not
+runnable - no `pack` subcommand is registered at all), and `--scope`/
+`--exclude`/`--config` narrowing remains the not-implemented-this-slice
+gap `scan --help` already declares (round 26's own F5 - the `scan` line
+below is not runnable as shown either, since `--scope`/`--exclude` are
+not registered arguments); `status`/`report`/`validate` below ARE
+runnable exactly as shown:
 
 ```text
 agenttalk comprehension scan --scope src/legacy --scope tests/characterization
@@ -617,7 +960,10 @@ validated run use agenttalk's ordinary command-error exit. The CLI must never
 turn “findings exist” into a scripting failure unless a later, explicit policy
 command is designed for that purpose.
 
-`report --json` is the stable automation contract. Human output may evolve.
+`report --json` is the stable automation contract. Human output may evolve
+(`cmd_comprehension`'s own docstring already declares this slice's `report`
+human mode prints the identical JSON projection, byte-for-byte - round 26's
+own F6).
 `validate` does not repair or rewrite an immutable run. V1 has no arbitrary
 graph query, multi-run `diff`, contract-inventory query, background watcher,
 auto-rescan daemon, managed export command, or published-data delete command.
@@ -788,6 +1134,13 @@ preflight:
    risk, operator, time, and eventual scan ID. Scripts and wrappers cannot supply
    the acknowledgement.
 
+After publication fully completes, the plane asks git once, directly, what is
+actually stageable across the whole private store (`git ls-files --others
+--exclude-standard`) rather than enumerating any directory by hand, refusing
+and rolling back the just-published run if anything is - a `.gitignore`
+change landing after that one call returns is outside this guarantee by
+construction, the irreducible instant every check-then-act leaves.
+
 V1 defines **export** as deliberately moving any raw artifact, report, pack,
 query descriptor, path/symbol list, or graph-derived file outside the private
 store; staging it in VCS and serving it beyond loopback are also export. V1 has
@@ -844,18 +1197,26 @@ network-denied design and cannot weaken this boundary.
 
 ## Freshness, admission, and failure behavior
 
-Freshness is a read-time projection with exactly three values. It is computed
-against the scan's whole-scope fingerprint, never only the paths returned in a
-pack:
+Freshness is a read-time projection with **four** values (amended, PR-B round
+42, F6 - see the note below the table for why three was never quite honest).
+It is computed against the scan's whole-scope fingerprint, never only the
+paths returned in a pack:
 
 | Value | Exact condition |
 | --- | --- |
 | `current` | The run is valid; the current enumeration completed under the same root, platform/path policy, scope/configuration, and adapter identities; its whole-scope fingerprint equals the stored fingerprint; and every selected source pointer still matches. |
 | `stale` | At least one selected input path is proven changed or deleted, or the caller requested an exact VCS revision that is proven different. Direct proof of staleness wins even if the whole-scope fingerprint also differs. |
 | `unknown` | Re-enumeration is incomplete or errors; root/platform/configuration/adapter identity differs; the scan's scope fingerprint was incomplete; or the whole-scope fingerprint differs without direct selected-path proof. A newly added or changed unselected path therefore yields `unknown` because its relevance cannot be decided from the old pack. |
+| `not_evaluated` | Freshness evaluation was never attempted for this projection at all (no comparison was run, successfully or otherwise) - distinct from `unknown`, which always means a comparison WAS attempted and could not reach a decided answer. Slice 1's own `report`/`status` publish this value today, since config.json-driven freshness evaluation is not implemented yet (a named, deferred decision elsewhere in this document). |
 
 No scope-level mismatch can produce `current`. A status of `unknown` is not a
-weaker spelling of fresh. The result, reason code, current fingerprint when
+weaker spelling of fresh. `not_evaluated` is not a weaker spelling of `unknown`
+either - forcing every not-yet-evaluated case into `unknown` would erase the
+real distinction between "we checked and could not tell" and "we never
+checked," a strictly less honest merge this producer declines to make; PR-C's
+own freshness-evaluation work removes most `not_evaluated` occurrences by
+actually running the comparison, not by reclassifying the ones that remain
+into `unknown`. The result, reason code, current fingerprint when
 available, and evaluation time appear together; the immutable pack is not
 rewritten. Dispatch requires `current` unless the attended work-item waiver
 defined above exists.

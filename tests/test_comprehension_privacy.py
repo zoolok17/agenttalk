@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -93,6 +94,65 @@ def test_no_plane_output_is_written_on_refusal(tmp_path: Path) -> None:
     assert not (tmp_path / ".agenttalk").exists()
 
 
+# --------------------- FIX ROUND 32 (twenty-eighth cold read, F1 BLOCKER):
+# a single probe at one synthetic depth generalizes its one answer to the
+# whole store - these prove the multi-probe rewrite closes both measured
+# defeat shapes while leaving the genuinely-safe and genuinely-refused
+# shapes unchanged.
+
+def test_shapeA_broad_rule_still_proven_ignored(tmp_path: Path) -> None:
+    """Control: a genuinely safe, broad rule ignores every probe for
+    real - unaffected by the multi-probe rewrite."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(".agenttalk/\n", encoding="utf-8")
+    _commit_all(tmp_path, "base")
+    result = privacy.run_privacy_preflight(tmp_path)
+    assert result.vcs_privacy == "ignored"
+
+
+def test_shapeB_unrelated_rule_still_refused(tmp_path: Path) -> None:
+    """Control: a rule that ignores nothing under the comprehension dir
+    stays refused exactly as before."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text("build/\n*.log\n", encoding="utf-8")
+    _commit_all(tmp_path, "base")
+    with pytest.raises(VcsPrivacyRefused):
+        privacy.run_privacy_preflight(tmp_path)
+
+
+def test_probe_negate_reinclusion_idiom_now_refused(tmp_path: Path) -> None:
+    """A git re-inclusion idiom (ignore everything under .agenttalk/, then
+    re-include comprehension/runs/**) made the OLD single ``.privacy-probe/
+    probe.json`` sentinel come back "ignored" while the REAL published
+    artifacts under runs/** stayed un-ignored and stageable by
+    ``git add -A``. The multi-probe rewrite must now refuse - the runs/
+    probe proves un-ignored."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(
+        ".agenttalk/**\n"
+        "!.agenttalk/comprehension/\n"
+        "!.agenttalk/comprehension/runs/\n"
+        "!.agenttalk/comprehension/runs/**\n",
+        encoding="utf-8")
+    _commit_all(tmp_path, "base")
+    with pytest.raises(VcsPrivacyRefused):
+        privacy.run_privacy_preflight(tmp_path)
+
+
+def test_probe_shapeC_rule_scoped_to_old_probe_dir_now_refused(tmp_path: Path) -> None:
+    """A rule matching ONLY the OLD probe's own private subdirectory
+    unlocked the write under the single-probe mechanism (it never touched
+    index.json/runs//.staging). The multi-probe rewrite no longer probes
+    that path at all (only index.json / runs / .staging), so this rule
+    proves nothing and every real probe proves un-ignored."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(
+        "/.agenttalk/**/.privacy-probe/\n", encoding="utf-8")
+    _commit_all(tmp_path, "base")
+    with pytest.raises(VcsPrivacyRefused):
+        privacy.run_privacy_preflight(tmp_path)
+
+
 # ----------------------------------------------------------- already tracked (refuse even if ignored later)
 
 def test_refuses_when_comprehension_dir_is_already_tracked(tmp_path: Path) -> None:
@@ -133,6 +193,18 @@ def test_refuses_with_no_vcs_kind_when_there_is_no_git_repo(tmp_path: Path) -> N
     assert exc_info.value.vcs_kind == "none"
 
 
+def test_not_a_git_worktree_message_never_leaks_the_absolute_root(tmp_path: Path) -> None:
+    """FIX ROUND 14 (tenth cold read, CR10-12 polish): this message
+    reaches the CLI's plain stderr output - the one place in this whole
+    plane that used to name the raw absolute local root next to a
+    projection family that otherwise never persists one (scan.json's
+    root_binding is a one-way digest specifically to avoid this)."""
+    with pytest.raises(VcsPrivacyRefused) as exc_info:
+        privacy.run_privacy_preflight(tmp_path)
+    assert str(tmp_path) not in str(exc_info.value)
+    assert tmp_path.name in str(exc_info.value)
+
+
 # ----------------------------------------------------------- acknowledge_unignored_private_store
 
 def test_acknowledge_records_acknowledged_unignored_for_git(tmp_path: Path) -> None:
@@ -164,6 +236,46 @@ def test_acknowledge_carries_through_the_matched_rule_when_provided(tmp_path: Pa
     assert result.matched_rule == ".gitignore:1:build/"
 
 
+# --------------------- MICRO-ROUND 28b (R4): shared pairing predicate
+
+def test_pairing_message_when_acknowledge_true_and_no_work_id() -> None:
+    message = privacy.acknowledge_requires_work_id_message(
+        acknowledge_unignored=True, work_id=None)
+    assert message is not None
+    assert "--work-id" in message
+
+
+def test_pairing_message_when_acknowledge_true_and_empty_work_id() -> None:
+    message = privacy.acknowledge_requires_work_id_message(
+        acknowledge_unignored=True, work_id="")
+    assert message is not None
+
+
+def test_pairing_message_when_acknowledge_true_and_whitespace_only_work_id() -> None:
+    """FIX ROUND 30 (twenty-sixth cold read, F5 polish, wrong-data): a
+    whitespace-only work_id ("   ") used to pass this guard - a bare
+    truthiness check treats any non-empty string as fine, and a string
+    of only whitespace IS non-empty. --run's own identical shape
+    (_resolve_run_id, round 29's own F7) already refuses whitespace-
+    only explicitly; mirrored here."""
+    message = privacy.acknowledge_requires_work_id_message(
+        acknowledge_unignored=True, work_id="   ")
+    assert message is not None
+    assert "--work-id" in message
+
+
+def test_pairing_message_is_none_when_acknowledge_true_and_work_id_present() -> None:
+    assert privacy.acknowledge_requires_work_id_message(
+        acknowledge_unignored=True, work_id="migrate-checkout") is None
+
+
+def test_pairing_message_is_none_when_acknowledge_false_regardless_of_work_id() -> None:
+    assert privacy.acknowledge_requires_work_id_message(
+        acknowledge_unignored=False, work_id=None) is None
+    assert privacy.acknowledge_requires_work_id_message(
+        acknowledge_unignored=False, work_id="w1") is None
+
+
 def test_direct_construction_of_preflight_result_is_rejected() -> None:
     """reviewer-1 cold-read finding 1 on PR-A, rq-6cc5560b62f6: the dataclass
     must not be publicly constructible despite its docstring claim."""
@@ -172,3 +284,313 @@ def test_direct_construction_of_preflight_result_is_rejected() -> None:
             vcs_privacy="ignored", vcs_kind="git", matched_rule=None, work_id=None,
             root_binding="deadbeef",
         )
+
+
+# --------------------- FIX ROUND 34 (reviewer-3's re-delta on round 33's
+# own R1 fix - THE HOLE): verify_store_ignored, the store-wide ground-truth
+# check that replaces per-directory enumeration entirely.
+
+def test_preflight_still_refuses_a_static_index_json_only_reinclusion(tmp_path: Path) -> None:
+    """Regression control (dispatch item 3): the PREFLIGHT's own probe
+    already names the real ``index.json`` path literally (see
+    ``_PRIVACY_PROBE_RELATIVE_PATHS``), so a STATIC rule (present from
+    the very start, unlike the round 34 MID-RUN flip shapes above) that
+    re-includes only ``index.json`` was already caught before round 34
+    and must stay caught - round 34 only widens the POST-publish
+    guarantee, it never narrows the preflight's own existing reach."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(
+        ".agenttalk/**\n"
+        "!.agenttalk/comprehension/\n"
+        "!.agenttalk/comprehension/index.json\n",
+        encoding="utf-8",
+    )
+    _commit_all(tmp_path, "base")
+    with pytest.raises(VcsPrivacyRefused):
+        privacy.run_privacy_preflight(tmp_path)
+
+
+def test_verify_store_ignored_passes_when_the_whole_store_is_ignored(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(".agenttalk/\n", encoding="utf-8")
+    _commit_all(tmp_path, "base")
+    store = tmp_path / ".agenttalk" / "comprehension"
+    (store / "runs" / "scan-1").mkdir(parents=True)
+    (store / "index.json").write_text("{}", encoding="utf-8")
+    (store / "runs" / "scan-1" / "scan.json").write_text("{}", encoding="utf-8")
+    privacy.verify_store_ignored(tmp_path, ".agenttalk/comprehension")  # must not raise
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows directory junctions only")
+def test_verify_store_ignored_refuses_a_junction_at_runs_rather_than_a_false_clean_proof(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 0, B1 BLOCKER): this asks git about the
+    NOMINAL ``.agenttalk/comprehension`` path via ``git ls-files``. If
+    ``runs/`` underneath it is a reparse point, the real published
+    content never lands where git is looking - git genuinely finds
+    nothing stageable there, so this used to return cleanly and the
+    caller published ``vcs_privacy: "ignored"``, a FALSE proof about the
+    exact property the whole design gates writing on (the six artifacts
+    physically sit outside the repository, entirely unprotected).
+    Reproduced: git sees an ordinary, empty (and therefore trivially
+    ignored) ``.agenttalk/comprehension/``, while ``runs/`` is a junction
+    to real content living outside the repository - proving the OLD
+    behavior would have returned cleanly here is the point of this test."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(".agenttalk/\n", encoding="utf-8")
+    _commit_all(tmp_path, "base")
+    store = tmp_path / ".agenttalk" / "comprehension"
+    store.mkdir(parents=True)
+    outside = tmp_path.parent / "outside-verify-store-ignored-junction-target"
+    outside.mkdir(exist_ok=True)
+    (outside / "scan-1").mkdir(exist_ok=True)
+    (outside / "scan-1" / "scan.json").write_text("{}", encoding="utf-8")
+    runs_dir = store / "runs"
+    subprocess.run(  # noqa: S603,S607  # nosec B603 B607
+        ["cmd", "/c", "mklink", "/J", str(runs_dir), str(outside)],
+        check=True, capture_output=True, text=True,
+    )
+    with pytest.raises(VcsPrivacyRefused, match="reparse point/junction"):
+        privacy.verify_store_ignored(tmp_path, ".agenttalk/comprehension")
+
+
+def test_verify_store_ignored_refuses_when_index_json_specifically_is_stageable(
+    tmp_path: Path,
+) -> None:
+    """The reader's own THE HOLE shape: a rule re-including ONLY
+    index.json (never touching runs/**) still makes it stageable - the
+    whole-store check must catch this exactly as it catches a runs/**
+    leak, since it never enumerates by directory at all."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(
+        ".agenttalk/**\n"
+        "!.agenttalk/comprehension/\n"
+        "!.agenttalk/comprehension/index.json\n",
+        encoding="utf-8",
+    )
+    _commit_all(tmp_path, "base")
+    store = tmp_path / ".agenttalk" / "comprehension"
+    (store / "runs" / "scan-1").mkdir(parents=True)
+    (store / "index.json").write_text("{}", encoding="utf-8")
+    (store / "runs" / "scan-1" / "scan.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(VcsPrivacyRefused, match="index.json"):
+        privacy.verify_store_ignored(tmp_path, ".agenttalk/comprehension")
+
+
+def test_verify_store_ignored_refuses_on_an_unanticipated_new_file(tmp_path: Path) -> None:
+    """The class-closure proof: a file NO enumeration ever anticipated
+    (never named by any probe, any prior fix, or any test fixture) must
+    still be caught, because this check never enumerates anything - it
+    asks git what is stageable, period."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(
+        ".agenttalk/**\n"
+        "!.agenttalk/comprehension/\n"
+        "!.agenttalk/comprehension/a-file-nobody-named.txt\n",
+        encoding="utf-8",
+    )
+    _commit_all(tmp_path, "base")
+    store = tmp_path / ".agenttalk" / "comprehension"
+    store.mkdir(parents=True)
+    (store / "index.json").write_text("{}", encoding="utf-8")
+    (store / "a-file-nobody-named.txt").write_text("surprise", encoding="utf-8")
+    with pytest.raises(VcsPrivacyRefused, match="a-file-nobody-named.txt"):
+        privacy.verify_store_ignored(tmp_path, ".agenttalk/comprehension")
+
+
+def test_verify_store_ignored_refusal_names_every_stageable_path_up_to_a_bound(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 35b (reviewer-3 delta on `32a5fa6`, informed consent):
+    the refusal used to name only the total count plus ONE exemplar path
+    (`stageable[0]`) - an operator deciding whether to consent to a
+    multi-path exposure could not see the rest of what would be exposed.
+    Now lists the full set, still bounded (never unbounded, the same
+    discipline every other path list in this artifact family already
+    follows) rather than truncated to one."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(
+        ".agenttalk/**\n"
+        "!.agenttalk/comprehension/\n"
+        "!.agenttalk/comprehension/index.json\n"
+        "!.agenttalk/comprehension/leak-*.json\n",
+        encoding="utf-8",
+    )
+    _commit_all(tmp_path, "base")
+    store = tmp_path / ".agenttalk" / "comprehension"
+    store.mkdir(parents=True)
+    (store / "index.json").write_text("{}", encoding="utf-8")
+    leaked_names = [f"leak-{i:02d}.json" for i in range(25)]
+    for name in leaked_names:
+        (store / name).write_text("{}", encoding="utf-8")
+    with pytest.raises(VcsPrivacyRefused) as excinfo:
+        privacy.verify_store_ignored(tmp_path, ".agenttalk/comprehension")
+    message = str(excinfo.value)
+    assert "26 path(s)" in message
+    # "index.json" sorts before every "leak-*" name, occupying one of the
+    # first 20 named slots itself - the remaining 19 are leak-00..leak-18.
+    combined_sorted = sorted([*leaked_names, "index.json"])
+    for name in combined_sorted[:20]:
+        assert name in message
+    assert "...and 6 more" in message
+    for name in combined_sorted[20:]:
+        assert name not in message
+
+
+def test_verify_store_ignored_excludes_scan_lock_from_stageability(tmp_path: Path) -> None:
+    """FIX ROUND 35 (twenty-ninth cold read, F2 MAJOR part (b), JUDGE -
+    taken, .cr29-deadend verbatim): a .gitignore matching everything BUT
+    scan.lock's own name (the scanner's own transient process-identity
+    file, still on disk at the exact moment this check runs, held until
+    publication fully completes) must never brick a publish on process
+    metadata that was never client graph data to begin with."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(
+        ".agenttalk/**\n"
+        "!.agenttalk/comprehension/\n"
+        "!.agenttalk/comprehension/scan.lock\n",
+        encoding="utf-8",
+    )
+    _commit_all(tmp_path, "base")
+    store = tmp_path / ".agenttalk" / "comprehension"
+    (store / "runs" / "scan-1").mkdir(parents=True)
+    (store / "index.json").write_text("{}", encoding="utf-8")
+    (store / "scan.lock").write_text("{}", encoding="utf-8")
+    privacy.verify_store_ignored(  # must not raise
+        tmp_path, ".agenttalk/comprehension",
+        exclude_relative_paths=frozenset({".agenttalk/comprehension/scan.lock"}),
+    )
+
+
+def test_verify_store_ignored_still_refuses_a_real_leak_alongside_the_lock(
+    tmp_path: Path,
+) -> None:
+    """Companion control: the lock's own exclusion must never widen into
+    a blanket pass - a REAL leaked artifact alongside the (excluded)
+    lock still refuses."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(
+        ".agenttalk/**\n"
+        "!.agenttalk/comprehension/\n"
+        "!.agenttalk/comprehension/scan.lock\n"
+        "!.agenttalk/comprehension/index.json\n",
+        encoding="utf-8",
+    )
+    _commit_all(tmp_path, "base")
+    store = tmp_path / ".agenttalk" / "comprehension"
+    store.mkdir(parents=True)
+    (store / "index.json").write_text("{}", encoding="utf-8")
+    (store / "scan.lock").write_text("{}", encoding="utf-8")
+    with pytest.raises(VcsPrivacyRefused, match="index.json"):
+        privacy.verify_store_ignored(
+            tmp_path, ".agenttalk/comprehension",
+            exclude_relative_paths=frozenset({".agenttalk/comprehension/scan.lock"}),
+        )
+
+
+def test_verify_store_ignored_fails_closed_when_not_a_git_repo(tmp_path: Path) -> None:
+    """A genuine git query failure (no repository at all here) must
+    refuse, never silently treat "the query broke" as "nothing is
+    stageable" - fail-closed, the same discipline every other check in
+    this module already follows."""
+    store = tmp_path / ".agenttalk" / "comprehension"
+    store.mkdir(parents=True)
+    (store / "index.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(VcsPrivacyRefused):
+        privacy.verify_store_ignored(tmp_path, ".agenttalk/comprehension")
+
+
+# ----------------------------------------------------------- global excludesFile (M8/M9)
+
+def _configure_repo_scoped_excludes_file(root: Path, excludes_file: Path) -> None:
+    """A REPO-scoped (never --global) core.excludesFile override - the
+    identical resolution shape a real, mainstream global ~/.gitignore
+    produces (an absolute path OUTSIDE the scanned root), reproduced
+    without touching this test host's own actual global git config at
+    all."""
+    _git(root, "config", "core.excludesFile", str(excludes_file))
+
+
+def test_check_ignore_one_negation_via_global_excludes_file_is_not_ignored(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 47 (forty-first cold read, M8 MAJOR, wrong-data,
+    .cr41-globalneg2): `git check-ignore -v`'s own text output is
+    `<source>:<linenum>:<pattern>\\t<pathname>` - the OLD parse split
+    this on `:` at most twice, which SILENTLY MIS-PARSES the moment
+    `<source>` itself contains a colon. A global `core.excludesFile`
+    resolves to an ABSOLUTE path - on Windows, always containing a
+    colon right after the drive letter - so the negation guard (does
+    the extracted pattern start with `!`) read the WRONG field
+    entirely and never fired: a genuine re-inclusion pattern
+    (`!important.log`) was read as an ordinary ignore rule, reporting
+    "ignored" for a path git itself says is NOT ignored. Fixed via
+    `-z --stdin` (NUL-separated fields, never ambiguous regardless of
+    what characters the source path contains)."""
+    _init_repo(tmp_path)
+    excludes_dir = tmp_path.parent / f"{tmp_path.name}-global-excludes"
+    excludes_dir.mkdir(exist_ok=True)
+    excludes_file = excludes_dir / "gitignore-global-test.txt"
+    excludes_file.write_text("*.log\n!important.log\n", encoding="utf-8")
+    _configure_repo_scoped_excludes_file(tmp_path, excludes_file)
+    (tmp_path / "important.log").write_text("keep me", encoding="utf-8")
+    (tmp_path / "debug.log").write_text("noise", encoding="utf-8")
+    _commit_all(tmp_path, "base")
+
+    not_ignored = privacy._check_ignore_one(tmp_path, "important.log")  # noqa: SLF001
+    assert not_ignored == (False, None)
+
+    ignored = privacy._check_ignore_one(tmp_path, "debug.log")  # noqa: SLF001
+    assert ignored is not None
+    assert ignored[0] is True
+
+
+def test_check_ignore_one_global_excludes_file_matched_rule_never_leaks_the_absolute_path(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 47 (M9 MAJOR, wrong-data - invariant 3, the sibling
+    FIELD, .cr41-globaltilde): scan.json's own privacy.matched_rule
+    used to persist the ABSOLUTE path of a global core.excludesFile
+    verbatim - which, on any real developer machine, embeds the OS
+    username in the home-directory portion of the path (round 14's own
+    environment-value rule was applied to the REFUSAL MESSAGE, never
+    swept to this sibling published FIELD). Reduced to its own basename
+    only when the source is absolute; an in-repo `.gitignore` (already
+    relative in git's own output) is unaffected."""
+    _init_repo(tmp_path)
+    excludes_dir = tmp_path.parent / f"{tmp_path.name}-global-excludes2"
+    excludes_dir.mkdir(exist_ok=True)
+    excludes_file = excludes_dir / "gitignore-global-test.txt"
+    excludes_file.write_text("*.secret\n", encoding="utf-8")
+    _configure_repo_scoped_excludes_file(tmp_path, excludes_file)
+    (tmp_path / "creds.secret").write_text("x", encoding="utf-8")
+    _commit_all(tmp_path, "base")
+
+    result = privacy._check_ignore_one(tmp_path, "creds.secret")  # noqa: SLF001
+    assert result is not None
+    is_ignored, matched_rule = result
+    assert is_ignored is True
+    assert matched_rule is not None
+    # Never the absolute path, never the parent directory (which embeds
+    # this test host's own real absolute temp-dir location) - only the
+    # excludes file's own basename survives.
+    assert str(excludes_dir) not in matched_rule
+    assert excludes_file.name in matched_rule
+
+
+def test_check_ignore_one_in_repo_gitignore_source_is_unaffected(tmp_path: Path) -> None:
+    """FIX ROUND 47 (M9 control): an ordinary in-repo `.gitignore` is
+    already relative in git's own output - never touched by the
+    absolute-path-to-basename reduction."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text("*.tmp\n", encoding="utf-8")
+    (tmp_path / "scratch.tmp").write_text("x", encoding="utf-8")
+    _commit_all(tmp_path, "base")
+
+    result = privacy._check_ignore_one(tmp_path, "scratch.tmp")  # noqa: SLF001
+    assert result is not None
+    is_ignored, matched_rule = result
+    assert is_ignored is True
+    assert matched_rule is not None
+    assert matched_rule.startswith(".gitignore:")

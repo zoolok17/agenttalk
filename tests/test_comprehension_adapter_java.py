@@ -1,0 +1,8348 @@
+"""#55 slice-1 PR-B item 3: the bundled Java adapter
+(DESIGN-55-comprehension-plane.md, Artifact 2's closed relation vocabulary;
+approved PR-B plan item-3 relation-scope decision, 2026-08-27). Small,
+synthetic fixtures only - not the target client's own codebase itself,
+kept fast and hermetic.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from agenttalk.comprehension.adapters import java
+
+
+def _edges(result: java.JavaFileResult, relation: str) -> list[java.JavaEdgeClaim]:
+    return [e for e in result.edges if e.relation == relation]
+
+
+# ----------------------------------------------------------- package / imports
+
+def test_extracts_package_and_imports():
+    src = """
+package com.example.app;
+
+import java.util.List;
+import static java.util.Collections.emptyList;
+import com.example.other.*;
+
+class Foo {
+}
+"""
+    result = java.parse_java_source("com/example/app/Foo.java", src)
+    imports = _edges(result, "import")
+    targets = {e.target for e in imports}
+    assert targets == {"java.util.List", "java.util.Collections.emptyList", "com.example.other.*"}
+    assert all(e.evidence_class == "extracted" for e in imports)
+    assert result.units[0].qualified_name == "com.example.app.Foo"
+
+    # D-1 (reviewer-3, PR-B delta review round 2): a plain import gets a
+    # shot at exact internal resolution. N5 (fourth cold read, fix round
+    # 6): a static import's target is a member path - not itself a shot
+    # at exact resolution, but its TYPE PREFIX is - java.util.Collections
+    # (not itself in-scan here) still classifies external once resolved.
+    # A wildcard NON-static import names a package, never a single type,
+    # so it gets its own target_kind (FIX ROUND 16, twelfth cold read,
+    # B3 BLOCKER) rather than plain "external" - dependencies_artifact.py
+    # still checks whether the package itself is in-scan before ever
+    # publishing a confident external claim.
+    by_target = {e.target: e for e in imports}
+    assert by_target["java.util.List"].target_kind == "internal_exact_or_external"
+    assert (
+        by_target["java.util.Collections.emptyList"].target_kind
+        == "internal_static_import_exact_or_external"
+    )
+    assert by_target["com.example.other.*"].target_kind == "external_wildcard_import"
+
+
+def test_import_edge_is_file_scoped_not_attributed_to_the_first_declared_type():
+    """FIX ROUND 14 (tenth cold read, CR10-1 MAJOR): an import is a
+    FILE-scoped Java fact - every type in the file sees it, regardless
+    of which one actually uses it. Publishing it against the FIRST
+    declared type (the old behavior) fabricated a type-scoped claim: a
+    public-class-plus-package-private-helper file (the everyday legacy
+    shape) credited the FIRST class with the helper's own dependency (a
+    false edge) while the helper itself published none at all. The
+    import edge's own from_qualified_name must never equal either
+    declared type's qualified name - dependencies_artifact.py's exact-
+    match-or-file-unit fallback then routes it to the FILE unit."""
+    src = """
+package p;
+import java.util.List;
+public class Service {
+}
+class ServiceCache {
+}
+"""
+    result = java.parse_java_source("p/Service.java", src)
+    imports = _edges(result, "import")
+    assert len(imports) == 1
+    assert imports[0].from_qualified_name not in {"p.Service", "p.ServiceCache"}
+
+
+def test_import_inside_a_comment_is_not_extracted():
+    src = """
+package p;
+// import java.util.List;
+/* import java.util.Map; */
+class Foo {}
+"""
+    result = java.parse_java_source("Foo.java", src)
+    assert _edges(result, "import") == []
+
+
+def test_two_imports_on_one_physical_line_both_extract():
+    """MICRO-ROUND 49 (forty-third cold read, M1 MAJOR, wrong-data):
+    _IMPORT_RE used to be LINE-anchored - `import java.util.List;
+    import java.util.Map;` on ONE physical line is ordinary, legal Java
+    (a semicolon ends a statement, never a newline), but the SECOND
+    import there sat behind neither a line-start nor a statement-start
+    anchor and was silently dropped. Reproduced pre-fix exactly as
+    measured: only the first of the two imports was ever extracted."""
+    src = "package p;\nimport java.util.List; import java.util.Map;\nclass Foo {}\n"
+    result = java.parse_java_source("Foo.java", src)
+    assert {e.target for e in _edges(result, "import")} == {"java.util.List", "java.util.Map"}
+
+
+def test_an_import_naming_a_dollar_sign_type_is_not_dropped():
+    """MICRO-NOD 50b (F2 MAJOR): "$" is a legal Java identifier
+    character (JLS 3.8) - the same charset gap _PACKAGE_RE had (see
+    the package/inherit repro in test_comprehension_scan_pipeline.py)
+    applies to _IMPORT_RE: "import com.acme.Cash$Flow;" used to be
+    dropped entirely (the segment charset stopped at "$", leaving
+    "Flow;" unconsumed right where "\\s*;" was required)."""
+    src = "package p;\nimport com.acme.Cash$Flow;\nclass Foo {}\n"
+    result = java.parse_java_source("Foo.java", src)
+    assert {e.target for e in _edges(result, "import")} == {"com.acme.Cash$Flow"}
+
+
+def test_an_import_sharing_a_line_with_another_still_corroborates_test_classification():
+    """MICRO-ROUND 49 (M1's own real-world consequence): a real JUnit
+    test class whose `import org.junit.Test;` happens to share a
+    physical line with another import used to lose that import
+    entirely - classifying `production` (not `test`) AND separately
+    reporting no test-framework evidence at all, two false artifacts
+    from the one dropped match."""
+    src = "package p;\nimport java.util.List; import org.junit.Test;\nclass FooTest {\n}\n"
+    result = java.parse_java_source("p/FooTest.java", src)
+    imports = {e.target for e in _edges(result, "import")}
+    assert imports == {"java.util.List", "org.junit.Test"}
+    assert result.units[0].classification == "test"
+
+
+# ----------------------------------------------------------- types / nesting
+
+def test_extracts_a_nested_class_with_correct_qualified_name():
+    src = """
+package com.example;
+
+class Outer {
+    class Inner {
+    }
+}
+"""
+    result = java.parse_java_source("com/example/Outer.java", src)
+    names = {u.qualified_name for u in result.units}
+    assert names == {"com.example.Outer", "com.example.Outer.Inner"}
+
+
+def test_a_type_nested_three_deep_gets_an_uncorrupted_qualified_name():
+    """M-4 (third cold read, fix round 5): a depth-2 nested type's
+    container_prefix (one stack entry) happens to look correct even with
+    the OLD ``".".join(all stack entries)`` bug, since joining a single
+    entry with nothing is a no-op - the bug is invisible exactly where
+    the old test stopped. At depth 3, Innermost's prefix used to
+    concatenate BOTH Outer's and Inner's already-fully-qualified names
+    together: "com.acme.Outer.com.acme.Outer.Inner.Innermost", not
+    "com.acme.Outer.Inner.Innermost"."""
+    src = """
+package com.acme;
+
+class Outer {
+    class Inner {
+        class Innermost {
+        }
+    }
+}
+"""
+    result = java.parse_java_source("com/acme/Outer.java", src)
+    names = {u.qualified_name for u in result.units}
+    assert names == {
+        "com.acme.Outer", "com.acme.Outer.Inner", "com.acme.Outer.Inner.Innermost",
+    }
+
+
+def test_a_type_nested_four_deep_gets_an_uncorrupted_qualified_name():
+    """M-4: depth 4 compounds the same corruption further at every
+    additional level if the bug is present at all - a second, deeper
+    data point confirming the fix holds beyond the minimum repro."""
+    src = """
+package com.acme;
+
+class A {
+    class B {
+        class C {
+            class D {
+            }
+        }
+    }
+}
+"""
+    result = java.parse_java_source("com/acme/A.java", src)
+    names = {u.qualified_name for u in result.units}
+    assert names == {
+        "com.acme.A", "com.acme.A.B", "com.acme.A.B.C", "com.acme.A.B.C.D",
+    }
+
+
+def test_class_name_inside_a_string_literal_is_not_extracted_as_a_type():
+    src = """
+package p;
+class Real {
+    String s = "class Fake { }";
+}
+"""
+    result = java.parse_java_source("Real.java", src)
+    names = {u.qualified_name for u in result.units}
+    assert names == {"p.Real"}
+
+
+# ----------------------------------------------------------- inherit
+
+def test_extends_and_implements_produce_inherit_edges():
+    src = """
+package p;
+class Foo extends BaseThing implements Runnable, java.io.Closeable {
+}
+"""
+    result = java.parse_java_source("Foo.java", src)
+    inherit = _edges(result, "inherit")
+    targets = {e.target for e in inherit}
+    assert targets == {"BaseThing", "Runnable", "java.io.Closeable"}
+    assert all(e.evidence_class == "extracted" for e in inherit)
+
+
+def test_interface_extends_multiple_interfaces():
+    src = """
+package p;
+interface Combo extends Foo, Bar {
+}
+"""
+    result = java.parse_java_source("Combo.java", src)
+    inherit = _edges(result, "inherit")
+    assert {e.target for e in inherit} == {"Foo", "Bar"}
+
+
+def test_a_wildcard_bound_in_implements_with_no_own_extends_clause_fabricates_nothing():
+    """MICRO-ROUND 49 (forty-third cold read, 49-M6, wrong-data - the
+    extractor structural audit's own new finding): _HEADER_EXTENDS_RE
+    used to be a bare, unscoped .search over the WHOLE clause zone -
+    `implements List<? extends Number>` has no class-level `extends`
+    clause of its own, but the wildcard bound's own "extends" was the
+    only one in the zone, and with no implements/permits AHEAD of IT,
+    the lazy capture ran to end-of-clause, fabricating an inherit edge
+    to a nonexistent type `Number>`. Reproduced pre-fix exactly as
+    measured. Now correctly produces no inherit edge for a nonexistent
+    superclass - only the real Comparable implements edge."""
+    src = """
+package p;
+class A implements Comparable<? extends Number> {
+}
+"""
+    result = java.parse_java_source("A.java", src)
+    inherit = _edges(result, "inherit")
+    targets = {e.target for e in inherit}
+    assert "Number>" not in targets
+    assert not any(">" in t for t in targets)
+    assert targets == {"Comparable"}
+
+
+def test_a_real_extends_clause_alongside_an_implements_wildcard_bound_still_resolves():
+    """Control for the fix above: a class with BOTH a real extends
+    clause AND an implements list carrying a wildcard bound, in the
+    SAME header - the truncation must not cut off the real extends
+    clause, which always comes first in JLS grammar."""
+    src = """
+package p;
+class A extends BaseThing implements Comparable<? extends Number> {
+}
+"""
+    result = java.parse_java_source("A.java", src)
+    inherit = _edges(result, "inherit")
+    targets = {e.target for e in inherit}
+    assert "BaseThing" in targets
+    assert "Comparable" in targets
+    assert not any(">" in t for t in targets)
+
+
+def test_the_class_own_extends_clause_may_itself_carry_a_wildcard_bound():
+    """Control: the class's OWN extends clause (no implements at all)
+    legitimately contains a wildcard bound - this is the FIRST
+    "extends" in the zone, the real one, and must still resolve to the
+    real supertype base name, never truncated or confused with the
+    wildcard's own inner "extends"."""
+    src = """
+package p;
+class A extends java.util.ArrayList<? extends Number> {
+}
+"""
+    result = java.parse_java_source("A.java", src)
+    inherit = _edges(result, "inherit")
+    assert {e.target for e in inherit} == {"java.util.ArrayList"}
+
+
+def test_an_interface_extending_multiple_parents_with_a_wildcard_bound_in_the_first():
+    """Control: an interface's own multi-parent extends list, wildcard
+    bound in the FIRST parent - both parents must still resolve, base
+    names only, never a fabricated third target from the bound."""
+    src = """
+package p;
+interface Combo extends Comparable<? extends Number>, java.io.Closeable {
+}
+"""
+    result = java.parse_java_source("Combo.java", src)
+    inherit = _edges(result, "inherit")
+    targets = {e.target for e in inherit}
+    assert targets == {"Comparable", "java.io.Closeable"}
+
+
+# ------------------------------------------------- BLOCKER 1a header battery
+# (fifth cold read, fix round 8): _TYPE_HEADER_RE (the old, single fixed-
+# shape regex) could not match a bounded/intersection generic parameter
+# list, a sealed+permits header, or a record declaration - an unmatched
+# header dropped the type SILENTLY: zero units, status complete,
+# problem_count 0, on a file this adapter never actually understood. Each
+# case below is exactly one of the reviewer's battery shapes; every one
+# must extract a real unit, never silently zero.
+
+def test_bounded_generic_type_parameter_is_extracted():
+    src = """
+package p;
+class Box<T extends Comparable<T>> {
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Box.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.Box"]
+
+
+def test_intersection_bounded_generic_type_parameter_is_extracted():
+    src = """
+package p;
+class Pair<T extends Number & Comparable<T>> {
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Pair.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.Pair"]
+
+
+def test_sealed_class_with_permits_is_extracted():
+    src = """
+package p;
+public sealed class Shape permits Circle, Square {
+    void list() {}
+}
+final class Circle extends Shape {}
+final class Square extends Shape {}
+"""
+    result = java.parse_java_source("Shape.java", src)
+    assert {u.qualified_name for u in result.units} == {"p.Shape", "p.Circle", "p.Square"}
+    inherit = _edges(result, "inherit")
+    assert {e.target for e in inherit if e.from_qualified_name == "p.Circle"} == {"Shape"}
+
+
+def test_record_declaration_is_extracted():
+    src = """
+package p;
+record Point(int x, int y) implements Comparable<Point> {
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Point.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.Point"]
+    inherit = _edges(result, "inherit")
+    assert {e.target for e in inherit} == {"Comparable"}
+
+
+def test_generic_record_declaration_is_extracted():
+    src = """
+package p;
+record Pair<A, B>(A first, B second) {
+}
+"""
+    result = java.parse_java_source("Pair.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.Pair"]
+
+
+# --------------------------------------- MINOR 4 (sixth cold read, fix round
+# 9): "record" is a CONTEXTUAL keyword - unlike class/interface/enum (fully
+# reserved), it remains legal as an ordinary identifier. The keyword+
+# identifier anchor previously accepted "record" followed by any word as a
+# declaration regardless of context, most concretely: a parameter/variable
+# literally named "record" immediately followed by the "instanceof" operator
+# published a phantom unit named "instanceof". A real record declaration
+# always has a component parameter list (even an empty one); requiring it
+# closes this false-positive family without narrowing real record support.
+
+def test_record_used_as_a_parameter_name_before_instanceof_is_not_a_phantom_type():
+    src = """
+package p;
+class Controller {
+    void process(Object record) {
+        if (record instanceof String s) {
+            System.out.println(s);
+        }
+    }
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.Controller"]
+
+
+def test_record_used_as_a_local_variable_name_before_instanceof_is_not_a_phantom_type():
+    src = """
+package p;
+class Controller {
+    void process() {
+        Object record = compute();
+        if (record instanceof String) { }
+    }
+    Object compute() { return null; }
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.Controller"]
+
+
+def test_record_used_as_a_field_name_is_not_a_phantom_type():
+    src = """
+package p;
+class Controller {
+    private Object record;
+    void use() {
+        Object x = record;
+    }
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.Controller"]
+
+
+def test_record_used_as_an_instanceof_pattern_variable_name_is_not_a_phantom_type():
+    """Java 16+ instanceof pattern variables can be named "record" too
+    (still just an ordinary identifier position)."""
+    src = """
+package p;
+class Controller {
+    void process(Object obj) {
+        if (obj instanceof String record) {
+            System.out.println(record);
+        }
+    }
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.Controller"]
+
+
+def test_class_literal_followed_by_instanceof_is_not_a_phantom_type():
+    """BLOCKER, second report (sixth cold read, fix round 9b): round 9's
+    own fix tightened the "record" anchor (a mandatory component list)
+    but left a DIFFERENT, also real variant open - a CLASS LITERAL
+    (`Foo.class`) is valid Java grammar in any expression position (e.g.
+    `String.class instanceof Object`), and "class" there is followed by
+    whitespace then an ordinary identifier ("instanceof") - the SAME
+    shape a real declaration has. This is the reviewer's own reported
+    shape, reproduced exactly (not a cousin): a class-literal
+    `instanceof` check inside a normal method body published a phantom
+    unit named "instanceof"."""
+    src = """
+package p;
+class Controller {
+    void check() {
+        if (String.class instanceof Object) {
+            System.out.println("weird");
+        }
+    }
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.Controller"]
+
+
+def test_class_level_request_mapping_composes_on_a_bounded_generic_controller():
+    """The end-to-end proving case: a class-level route prefix on a
+    header shape the OLD regex could not match must still compose with
+    its method-level route - not publish the prefix as its own served
+    entry point (the exact pre-M5 wrong shape an unmatched header used
+    to reproduce)."""
+    src = """
+package p;
+
+@RequestMapping("/api/base")
+@RestController
+public class Controller<T extends Comparable<T>> {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /api/base/list"
+
+
+def test_a_file_with_zero_extracted_types_publishes_no_route_or_entry_point_claims():
+    """BLOCKER (sixth cold read, fix round 9): route/entry-point emission
+    never consulted whether the file actually yielded any types - a file
+    that degrades honestly (zero units, no_types_extracted, unknown,
+    degraded) still published the class-level route prefix as its own
+    invocable route and the method value as the whole route, declared-
+    class, as stable entry-point IDs, all attributed to a SYNTHESIZED
+    fallback owner that names no real unit at all.
+
+    Proven with valid Java this adapter cannot see the body of: the
+    language decodes \\uXXXX unicode escapes BEFORE lexing (real javac
+    compiles this fine - a class body delimited by \\u007B/\\u007D braces
+    instead of literal `{`/`}`), but this adapter's sanitizer does not
+    decode them, so its own brace-matching never finds the type's body
+    at all - zero units - while every OTHER extraction loop (route
+    annotations included) keeps scanning the surrounding text
+    regardless. Must now publish zero edges/entry points from this file,
+    not launder them under a synthesized owner."""
+    backslash = chr(92)
+    open_brace = backslash + "u007B"
+    close_brace = backslash + "u007D"
+    src = (
+        "package p;\n"
+        '@RequestMapping("/api/orders")\n'
+        "public class Controller " + open_brace + "\n"
+        '    @GetMapping("/list")\n'
+        "    void list() " + open_brace + close_brace + "\n"
+        + close_brace + "\n"
+    )
+    result = java.parse_java_source("Controller.java", src)
+    assert result.units == []
+    assert result.edges == []
+    assert result.entry_points == []
+
+
+def test_an_escaped_comment_delimiter_records_a_structural_unicode_escape_problem():
+    """MICRO-ROUND 49 (forty-third cold read, M5, judged - detect-and-
+    degrade): JLS 3.3 decodes \\uXXXX escapes in a translation step
+    BEFORE tokenization - a real compiler sees `\\u002F\\u002A` as `/*`,
+    the start of a real comment, but this adapter's own sanitizer never
+    decodes unicode escapes before lexing, so it reads the SAME six
+    characters as ordinary code. This adapter does not attempt to
+    decode-and-relex (a named limit) - it detects the risk and degrades
+    the file's own claims instead of silently trusting either
+    reading."""
+    backslash = chr(92)
+    escaped_comment_open = backslash + "u002F" + backslash + "u002A"
+    src = (
+        "package p;\n"
+        "public class Real {\n"
+        "  " + escaped_comment_open + " looks like code to javac, a comment to nobody here */\n"
+        "  void m() {}\n"
+        "}\n"
+    )
+    result = java.parse_java_source("Real.java", src)
+    assert any(p.reason_code == "source_uses_structural_unicode_escapes" for p in result.problems)
+
+
+def test_an_escaped_newline_records_a_structural_unicode_escape_problem():
+    """MICRO-ROUND 49 (M5's own escaped-newline shape): `\\u000A` decodes
+    to a real line terminator - a real compiler sees two physical
+    lines where this adapter's own `//` comment scan sees one, so a
+    declaration meant to follow the escaped newline could be silently
+    swallowed as trailing comment text (or the reverse)."""
+    backslash = chr(92)
+    escaped_newline = backslash + "u000A"
+    src = (
+        "package p;\n"
+        "public class Real {\n"
+        "  // a comment" + escaped_newline + "import java.util.List;\n"
+        "  void m() {}\n"
+        "}\n"
+    )
+    result = java.parse_java_source("Real.java", src)
+    assert any(p.reason_code == "source_uses_structural_unicode_escapes" for p in result.problems)
+
+
+def test_a_unicode_escaped_backslash_before_a_quote_records_a_structural_unicode_escape_problem():
+    """MICRO-ROUND 49b (F2 MAJOR, reviewer-3's own javac-verified proof):
+    \\u005c decodes to a literal backslash - immediately before a real
+    quote, the decoded pair \\" is JLS 3.10.6's own escaped-quote
+    sequence (a real compiler reads the string/char literal as
+    CONTINUING past it, to a later real closing quote), while this
+    adapter's own sanitizer sees six ordinary raw characters followed
+    by an unescaped quote and closes the literal right there - the two
+    disagree about where the literal ends, the same class of risk the
+    other five structural characters already cover, smuggled via the
+    ESCAPE MECHANISM itself. Reviewer verified with javac 1.8: legal,
+    compiles to two real classes. The backslash itself was missing from
+    the closed set - reproduced pre-fix exactly as reported (silent,
+    the judge trusting its own wrong reading)."""
+    backslash = chr(92)
+    quote = chr(34)
+    src = (
+        "package p;\n"
+        "public class Real {\n"
+        "  String s = " + quote + "abc" + backslash + "u005c" + quote + ";\n"
+        "  void m() {}\n"
+        "}\n"
+    )
+    result = java.parse_java_source("Real.java", src)
+    assert any(p.reason_code == "source_uses_structural_unicode_escapes" for p in result.problems)
+
+
+def test_an_ordinary_unicode_escape_never_flags_a_structural_problem():
+    """Control: a harmless \\uXXXX escape that decodes to an ORDINARY
+    character (a plain letter, no lexical significance) must never be
+    mistaken for the structural shape above - the whole point is the
+    CLOSED set of characters that change lexing, never "any escape"."""
+    backslash = chr(92)
+    escaped_a = backslash + "u0041"  # 'A' - lexically inert
+    src = (
+        "package p;\n"
+        "public class Real {\n"
+        "  String s = \"" + escaped_a + "\";\n"
+        "  void m() {}\n"
+        "}\n"
+    )
+    result = java.parse_java_source("Real.java", src)
+    assert not any(p.reason_code == "source_uses_structural_unicode_escapes" for p in result.problems)
+
+
+def test_a_file_with_no_unicode_escapes_at_all_never_flags_a_structural_problem():
+    src = "package p;\npublic class Real {\n  void m() {}\n}\n"
+    result = java.parse_java_source("Real.java", src)
+    assert not any(p.reason_code == "source_uses_structural_unicode_escapes" for p in result.problems)
+
+
+def test_an_even_backslash_run_before_a_u_marker_is_not_an_escape_at_all():
+    """MICRO-ROUND 50 (Cluster 3, m1, reviewer-3's own javac-verified
+    proof): JLS 3.3 - a Unicode escape is `\\` UnicodeMarker HexDigit{4},
+    a SINGLE literal backslash. An EVEN-length run of consecutive
+    backslashes immediately before a `u+`+hex marker is `run/2` ordinary,
+    literal backslash PAIRS - none of them is eligible to combine with
+    the marker, so `\\\\u002f` (two literal backslashes) is legal
+    escaping-UTILITY code (e.g. a helper building literal `\\uXXXX` TEXT
+    as DATA) that a real compiler never translates at all - the OLD
+    bare-regex body raised a false alarm on this exact legal shape,
+    treating every raw `\\uXXXX`-shaped substring as an escape
+    regardless of what preceded the backslash."""
+    backslash = chr(92)
+    two_backslashes_then_marker = backslash * 2 + "u002f"  # legal, NOT an escape
+    src = (
+        "package p;\n"
+        "public class Real {\n"
+        "  String s = \"" + two_backslashes_then_marker + "\";\n"
+        "  void m() {}\n"
+        "}\n"
+    )
+    result = java.parse_java_source("Real.java", src)
+    assert not any(p.reason_code == "source_uses_structural_unicode_escapes" for p in result.problems)
+
+
+def test_an_odd_backslash_run_before_a_u_marker_is_still_a_real_escape():
+    """Control for m1 above: an ODD-length run (three backslashes) -
+    the first two cancel as one literal pair, the third is genuinely
+    eligible and combines with the marker that follows, exactly as a
+    single backslash would. Must still be detected."""
+    backslash = chr(92)
+    three_backslashes_then_marker = backslash * 3 + "u002f"  # real escape (decodes to '/')
+    src = (
+        "package p;\n"
+        "public class Real {\n"
+        "  String s = \"" + three_backslashes_then_marker + "\";\n"
+        "  void m() {}\n"
+        "}\n"
+    )
+    result = java.parse_java_source("Real.java", src)
+    assert any(p.reason_code == "source_uses_structural_unicode_escapes" for p in result.problems)
+
+
+def test_a_multi_u_marker_unicode_escape_is_detected():
+    """MICRO-ROUND 50 (Cluster 3, M2 BLOCKER, wrong-data): JLS 3.3's own
+    UnicodeMarker production is `u | UnicodeMarker u` - ONE OR MORE `u`
+    characters, spec-legal and accepted by every real compiler. The OLD
+    single-`u` regex bypassed this whole detection gate SILENTLY for any
+    escape spelled with 2+ `u`s - reproduced here with `\\uu000a` (two
+    `u`s), which decodes to a real newline exactly as `\\u000a` does."""
+    backslash = chr(92)
+    escaped_newline_multi_u = backslash + "uu000A"
+    src = (
+        "package p;\n"
+        "public class Real {\n"
+        "  // a comment" + escaped_newline_multi_u + "import java.util.List;\n"
+        "  void m() {}\n"
+        "}\n"
+    )
+    result = java.parse_java_source("Real.java", src)
+    assert any(p.reason_code == "source_uses_structural_unicode_escapes" for p in result.problems)
+
+
+def test_an_escaped_single_quote_records_a_structural_unicode_escape_problem():
+    """MICRO-ROUND 50 (Cluster 3, M3 BLOCKER, wrong-data): round 49b's
+    own "closed, this time for real" claim was still false - `'`
+    (U+0027, the char-literal delimiter, its own dedicated branch in
+    this adapter's sanitizer) was missing from the closed set. A
+    `\\u0027` decodes to a real single quote BEFORE this adapter's own
+    sanitizer ever runs - exactly the same smuggled-delimiter risk the
+    comment/string-delimiter members already cover, just for the char-
+    literal shape."""
+    backslash = chr(92)
+    escaped_quote = backslash + "u0027"
+    src = (
+        "package p;\n"
+        "public class Real {\n"
+        "  String s = \"" + escaped_quote + "\";\n"
+        "  void m() {}\n"
+        "}\n"
+    )
+    result = java.parse_java_source("Real.java", src)
+    assert any(p.reason_code == "source_uses_structural_unicode_escapes" for p in result.problems)
+
+
+#: Per-character trigger fixtures for the derivation-lock test below - a
+#: bare "*" never opens anything on its own (only "/*" together does), so
+#: this cannot be a single generic "ch + stuff + ch" template; each
+#: member's own REAL triggering shape is named explicitly instead.
+_SANITIZER_DELIMITER_TRIGGER_FIXTURES = {
+    "/": "a//b\nc",
+    "*": "a/*b*/c",
+    '"': 'a"b"c',
+    "'": "a'b'c",
+}
+
+
+def test_structural_unicode_escape_chars_is_derived_from_the_sanitizers_own_delimiters():
+    """MICRO-ROUND 50 (Cluster 3, the derivation-lock test - the reader's
+    own mandate: "the closed set claim should either be derived from the
+    sanitizer's own delimiter set or dropped"). Proves all three parts of
+    the derivation are real, not merely declared:
+
+    (1) every character in `_SANITIZER_DELIMITER_CHARS` genuinely
+    participates in triggering a special (blanked) region in
+    `_strip_comments_and_strings` - directly invoking the sanitizer on
+    its own real triggering shape, rather than trusting the constant's
+    own name.
+    (2) the trigger fixture table above covers the WHOLE set, both
+    directions - nothing in the real set goes untested, and the table
+    never tests a character the real set does not actually contain.
+    (3) `_STRUCTURAL_UNICODE_ESCAPE_CHARS` is a proper superset of
+    `_SANITIZER_DELIMITER_CHARS`, with EXACTLY the three additional,
+    independently-justified members (the two line terminators and the
+    escape-introducer backslash) - never a fourth, undocumented member
+    quietly re-introducing manual enumeration."""
+    assert set(_SANITIZER_DELIMITER_TRIGGER_FIXTURES) == java._SANITIZER_DELIMITER_CHARS
+    for ch, fixture in _SANITIZER_DELIMITER_TRIGGER_FIXTURES.items():
+        sanitized, _malformed = java._strip_comments_and_strings(fixture)
+        assert sanitized != fixture, (
+            f"{ch!r} is in _SANITIZER_DELIMITER_CHARS but its own trigger fixture "
+            f"{fixture!r} was not treated specially by _strip_comments_and_strings")
+    assert java._STRUCTURAL_UNICODE_ESCAPE_CHARS == (
+        java._SANITIZER_DELIMITER_CHARS | {"\n", "\r", "\\"})
+
+
+# ----------------------------------------------------------- test classification + relation
+
+def test_test_suffixed_class_is_classified_test_and_produces_a_test_edge():
+    src = """
+package p;
+class FooTest {
+}
+"""
+    result = java.parse_java_source("src/test/java/p/FooTest.java", src)
+    assert result.units[0].classification == "test"
+    test_edges = _edges(result, "test")
+    assert len(test_edges) == 1
+    assert test_edges[0].target == "Foo"
+    assert test_edges[0].phase == "test"
+
+
+def test_src_test_path_classifies_as_test_even_without_naming_convention():
+    src = "package p;\nclass Helper {\n}\n"
+    result = java.parse_java_source("src/test/java/p/Helper.java", src)
+    assert result.units[0].classification == "test"
+
+
+def test_ordinary_class_is_classified_production():
+    src = "package p;\nclass Widget {\n}\n"
+    result = java.parse_java_source("src/main/java/p/Widget.java", src)
+    assert result.units[0].classification == "production"
+
+
+def test_a_production_class_ending_in_it_without_corroboration_stays_production():
+    """FIX ROUND 14 (tenth cold read, CR10-7 MINOR, wrong-data, verbatim
+    shape): _TEST_NAME_SUFFIX matches any name ending in "IT" (meant for
+    JUnit's own "OrderServiceIT" integration-test convention) - so an
+    entirely ordinary production class named AUDIT, in src/main/java,
+    with no test-framework import anywhere in the file, used to publish
+    as unit_type=test with a FABRICATED test edge to the nonexistent
+    stripped-suffix target "AUD". A name-suffix hit without CORROBORATING
+    evidence (a test source root, or a test-framework import) must stay
+    production and emit no test edge at all."""
+    src = "package p;\npublic class AUDIT {\n}\n"
+    result = java.parse_java_source("src/main/java/p/AUDIT.java", src)
+    assert result.units[0].classification == "production"
+    assert _edges(result, "test") == []
+
+
+def test_a_name_suffix_hit_with_a_test_framework_import_corroborates_test_classification():
+    """FIX ROUND 14 (CR10-7 control): a name-suffix hit alongside a real
+    test-framework import (JUnit) IS corroborated evidence - even
+    outside a test source root, this must still classify test and emit
+    its test edge, the same as before this fix for the legitimate case."""
+    src = "package p;\nimport org.junit.Test;\nclass FooIT {\n}\n"
+    result = java.parse_java_source("src/it/java/p/FooIT.java", src)
+    assert result.units[0].classification == "test"
+    test_edges = _edges(result, "test")
+    assert len(test_edges) == 1
+    assert test_edges[0].target == "Foo"
+
+
+def test_a_bare_test_package_segment_without_corroboration_stays_production():
+    """FIX ROUND 15 (eleventh cold read, F3 MAJOR, wrong-data, verbatim
+    shape): the PATH heuristic classified a bare "/test/" segment with NO
+    corroboration at all - the same bug class CR10-7 already fixed for
+    the NAME heuristic, left standing for the path one.
+    src/main/java/com/lab/test/TestOrder.java (a package literally named
+    "test", common in lab/QA-domain legacy code) used to publish
+    classification=[test] on a complete run with zero supporting
+    evidence. A bare /test/ segment NOT under the build-convention
+    src/test/ root, with no test-framework import either, must stay
+    production."""
+    src = "package com.lab.test;\npublic class TestOrder {\n}\n"
+    result = java.parse_java_source("src/main/java/com/lab/test/TestOrder.java", src)
+    assert result.units[0].classification == "production"
+
+
+def test_src_test_java_still_classifies_as_test_with_no_further_corroboration():
+    """FIX ROUND 15 (F3 control): the real build-convention root
+    (src/test/java) IS sufficient evidence entirely on its own - that's
+    what it actually means for Maven/Gradle, not a guess."""
+    src = "package p;\npublic class Helper {\n}\n"
+    result = java.parse_java_source("src/test/java/p/Helper.java", src)
+    assert result.units[0].classification == "test"
+
+
+def test_a_corroborated_bare_test_segment_still_classifies_as_test():
+    """FIX ROUND 15 (F3 control): a bare /test/ segment WITH a same-file
+    test-framework import is corroborated the same way the name
+    heuristic already is - still classifies test, not silently lost by
+    the tightened path rule."""
+    src = "package com.lab.test;\nimport org.junit.Test;\npublic class OrderProbe {\n}\n"
+    result = java.parse_java_source("src/main/java/com/lab/test/OrderProbe.java", src)
+    assert result.units[0].classification == "test"
+
+
+def test_a_repository_root_test_directory_is_sufficient_alone():
+    """FIX ROUND 15b (reviewer-3's MINOR 2, measured on an Ant layout): a
+    REPOSITORY-ROOT test/ directory is a build convention exactly like
+    src/test (the classic pre-Maven Ant project layout) - sufficient
+    alone, no test-framework import needed."""
+    src = "package com.acme;\npublic class TestFixtures {\n}\n"
+    result = java.parse_java_source("test/com/acme/TestFixtures.java", src)
+    assert result.units[0].classification == "test"
+
+
+def test_a_package_segment_literally_named_test_still_stays_production():
+    """FIX ROUND 15b control: the root-anchoring in MINOR 2 must not
+    reopen the exact hole F3 closed - a test SEGMENT declared inside a
+    package path (not the repository root itself) still needs
+    corroboration, or stays production."""
+    src = "package com.lab.test;\npublic class TestOrder {\n}\n"
+    result = java.parse_java_source("com/lab/test/TestOrder.java", src)
+    assert result.units[0].classification == "production"
+
+
+def test_an_upper_case_src_test_path_classifies_as_test_with_no_corroboration(
+) -> None:
+    """FIX ROUND 45 (thirty-ninth cold read, F1 MAJOR, wrong-data,
+    .cr39-casetest): `_classify`'s own test-source-root check matched
+    `_TEST_SOURCE_ROOT_SEGMENT` (a lowercase-only pattern) against the
+    RAW path, never lower-cased - on a case-insensitive filesystem
+    (Windows/default-macOS), ``src/Test/...`` and ``src/test/...`` name
+    the identical directory, yet only the second spelling was ever
+    recognized as sufficient evidence alone. Round 37's own F4 "one
+    case policy" (lowercase before matching) closes this the same way
+    it already closed worker.py's own dispatch."""
+    src = "package p;\nclass Helper {\n}\n"
+    result = java.parse_java_source("src/Test/java/p/Helper.java", src)
+    assert result.units[0].classification == "test"
+
+
+def test_a_src_it_path_classifies_as_test_with_no_corroboration() -> None:
+    """FIX ROUND 45 (F1 MAJOR, .cr39-testroots): Maven's own ``src/it/``
+    (the failsafe/invoker-plugin integration-test convention) is a real
+    test source root, sufficient alone exactly like ``src/test/`` - not
+    previously recognized by `_TEST_SOURCE_ROOT_SEGMENT`."""
+    src = "package p;\nclass Helper {\n}\n"
+    result = java.parse_java_source("src/it/java/p/Helper.java", src)
+    assert result.units[0].classification == "test"
+
+
+def test_a_src_iterations_path_without_corroboration_stays_production() -> None:
+    """FIX ROUND 45 (F1 MAJOR, .cr39-testroots, negative control): a
+    ``src/iterations/`` package segment must not be mistaken for
+    ``src/it/`` - the widened pattern requires a trailing ``/``
+    immediately after ``it``, so this stays production without
+    corroboration, exactly as before the widening."""
+    src = "package p;\nclass Helper {\n}\n"
+    result = java.parse_java_source("src/iterations/java/p/Helper.java", src)
+    assert result.units[0].classification == "production"
+
+
+def test_a_name_suffix_hit_under_an_upper_case_src_test_root_still_produces_a_test_edge(
+) -> None:
+    """FIX ROUND 45 (F1 MAJOR, wrong-data, fourth real call site): the
+    name-suffix test-edge corroboration check (FIX ROUND 14/15's own
+    ``_TEST_NAME_SUFFIX`` + source-root fallback, at the nested-type
+    loop) has its OWN separate `_TEST_SOURCE_ROOT_SEGMENT.search(...)`
+    call, matched against the raw path exactly like `_classify`'s own
+    pre-fix bug - case-folded here too, so a same-file suffix hit under
+    ``src/Test/...`` (no test-framework import at all) still corroborates
+    and produces the test edge, not silently dropped by case alone."""
+    src = "package p;\nclass FooTest {\n}\n"
+    result = java.parse_java_source("src/Test/java/p/FooTest.java", src)
+    assert result.units[0].classification == "test"
+    test_edges = _edges(result, "test")
+    assert len(test_edges) == 1
+    assert test_edges[0].target == "Foo"
+
+
+# ----------------------------------------------------------- invoke
+
+def test_qualified_call_resolves_against_an_import():
+    src = """
+package p;
+import java.util.Collections;
+class Foo {
+    void run() {
+        Collections.emptyList();
+    }
+}
+"""
+    result = java.parse_java_source("Foo.java", src)
+    invoke = _edges(result, "invoke")
+    assert len(invoke) == 1
+    assert invoke[0].target == "java.util.Collections"
+    # Second cold read, B-1 (fix round 4): an import-mediated call gets the
+    # SAME target_kind an import edge itself gets (internal_exact_or_
+    # external) - java.util.Collections isn't declared in-scan, so it
+    # still resolves external at the dependencies_artifact layer (see
+    # test_comprehension_dependencies_artifact.py's coverage of that), but
+    # the adapter must never hand out a confident "external" stamp before
+    # the registry has even had a chance to look.
+    assert invoke[0].target_kind == "internal_exact_or_external"
+    assert invoke[0].evidence_class == "extracted"
+
+
+def test_qualified_call_against_a_locally_declared_type_is_an_internal_candidate():
+    src = """
+package p;
+class Helper {
+    static void doWork() {}
+}
+class Foo {
+    void run() {
+        Helper.doWork();
+    }
+}
+"""
+    result = java.parse_java_source("Foo.java", src)
+    invoke = _edges(result, "invoke")
+    assert any(e.target == "Helper" and e.target_kind == "internal_candidate" for e in invoke)
+
+
+def test_an_all_caps_qualifier_mints_no_invoke_edge():
+    """FIX ROUND 19 (fifteenth cold read, F8 MINOR, JUDGE - taken):
+    LOG.info(...) - a static field access (private static final Logger
+    LOG = ...), never a type-qualified call - used to mint an invoke
+    edge treating the field as if it were a locally-declared/import-
+    unresolved TYPE, since LOG's own uppercase-leading shape looks
+    exactly like a type reference to the regex. Java's own ALL_CAPS
+    constant-naming convention is now recognized as a heuristic and
+    skipped entirely - no edge minted - for a qualifier that is neither
+    locally declared nor import-recognized."""
+    src = """
+package p;
+class Foo {
+    private static final Logger LOG = LoggerFactory.getLogger(Foo.class);
+    void run() {
+        LOG.info("hello");
+    }
+}
+"""
+    result = java.parse_java_source("Foo.java", src)
+    invoke = _edges(result, "invoke")
+    assert not any(e.target == "LOG" for e in invoke)
+
+
+def test_an_all_caps_locally_declared_type_still_mints_an_invoke_edge():
+    """Companion negative case for the F8 JUDGE - the ALL_CAPS skip
+    applies ONLY to a qualifier neither locally declared nor import-
+    recognized; a genuine locally-declared type that happens to be
+    spelled ALL_CAPS (unusual, but legal) must still resolve normally,
+    unaffected."""
+    src = """
+package p;
+class CONSTANTS {
+    static void reload() {}
+}
+class Foo {
+    void run() {
+        CONSTANTS.reload();
+    }
+}
+"""
+    result = java.parse_java_source("Foo.java", src)
+    invoke = _edges(result, "invoke")
+    assert any(e.target == "CONSTANTS" and e.target_kind == "internal_candidate" for e in invoke)
+
+
+def test_qualified_call_written_fully_qualified_captures_the_full_dotted_qualifier():
+    """FIX ROUND 13 (ninth cold read, CR9-1 BLOCKER): a call deliberately
+    written fully qualified - the legacy-vs-rewrite migration idiom this
+    plane exists to inventory, e.g. `com.acme.legacy.OrderService.lookup(
+    )` disambiguating two same-simple-name classes - used to lose its own
+    package prefix entirely (only the last dotted segment was captured),
+    then get silently REWRITTEN via whichever import happened to bind
+    that bare simple name, publishing a dependency on the WRONG class.
+    The qualifier must now carry the full dotted spelling the source
+    wrote, verbatim - never an import rewrite."""
+    src = """
+package p;
+import com.acme.v2.OrderService;
+class MigrationBridge {
+    void run() {
+        com.acme.legacy.OrderService.lookup();
+    }
+}
+"""
+    result = java.parse_java_source("MigrationBridge.java", src)
+    invoke = _edges(result, "invoke")
+    assert len(invoke) == 1
+    assert invoke[0].target == "com.acme.legacy.OrderService"
+    # Never "internal_exact_or_external" (the import-rewrite path) - a
+    # dotted qualifier is inline-FQN evidence, exact-match-or-unresolved
+    # only, the same discipline round 12 applies to inherit/test. FIX
+    # ROUND 14 (CR10-2): invoke now shares "internal_candidate" with
+    # inherit/test - one ladder, one target_kind, for all three.
+    assert invoke[0].target_kind == "internal_candidate"
+
+
+def test_qualified_call_with_a_package_prefixed_nested_type_captures_the_whole_chain():
+    """FIX ROUND 13b (reviewer-3's B2 BLOCKER on round 13): the FIRST cut
+    of the CR9-1 fix required the prefix segments to be lowercase-led
+    (package-shaped) - so a package-prefixed NESTED type reference
+    (`com.acme.Outer.Inner.x()`) still reduced to its bare tail "Inner"
+    (since "Outer", capitalized, broke the all-lowercase prefix match),
+    which then met the same bare-keyed import table CR9-1 closed one
+    door on - CR9-1's exact mechanism through a second door. The
+    qualifier must capture the FULL chain regardless of segment case."""
+    src = """
+package p;
+import com.wrong.Inner;
+class Foo {
+    void run() {
+        com.acme.Outer.Inner.x();
+    }
+}
+"""
+    result = java.parse_java_source("Foo.java", src)
+    invoke = _edges(result, "invoke")
+    assert len(invoke) == 1
+    assert invoke[0].target == "com.acme.Outer.Inner"
+    # FIX ROUND 14 (CR10-2): invoke now shares "internal_candidate" with
+    # inherit/test - one ladder, one target_kind, for all three.
+    assert invoke[0].target_kind == "internal_candidate"
+
+
+def test_lowercase_qualifier_still_produces_no_invoke_edge():
+    """FIX ROUND 13b (B2 control): a plain lowercase-led qualifier
+    (an ordinary local variable/field reference, never a type) must
+    still produce no invoke edge at all - the widened prefix must not
+    overshoot into treating instance-qualified calls as type-qualified
+    ones."""
+    src = """
+package p;
+class Foo {
+    void run() {
+        myClass.call();
+    }
+}
+"""
+    result = java.parse_java_source("Foo.java", src)
+    assert _edges(result, "invoke") == []
+
+
+def test_qualified_call_with_an_unusual_capitalized_package_segment_keeps_the_full_spelling():
+    """FIX ROUND 13b (B2 control): an unusual but legal identifier
+    spelling (a capitalized package segment, "Com") must not be
+    silently truncated either - the full source spelling is retained
+    verbatim, unresolved, never a guessed/truncated variant."""
+    src = """
+package p;
+class Foo {
+    void run() {
+        Com.acme.Foo.call();
+    }
+}
+"""
+    result = java.parse_java_source("Foo.java", src)
+    invoke = _edges(result, "invoke")
+    assert len(invoke) == 1
+    assert invoke[0].target == "Com.acme.Foo"
+
+
+def test_static_imported_member_qualifier_resolves_to_the_owning_class():
+    """FIX ROUND 13 (ninth cold read, CR9-5 MINOR, wrong-data): a
+    static-imported member used bare as an invoke qualifier
+    (`import static com.acme.Config.LOGGER;` then `LOGGER.info(...)`)
+    used to publish the invoke edge against the UNSPLIT member path
+    ("com.acme.Config.LOGGER"), while the import edge on the same line
+    correctly resolves to the owning class - two edges in one run
+    contradicting each other about the same in-scan file. The invoke
+    qualifier must resolve to the OWNING CLASS, the same normalization
+    the import edge itself already applies."""
+    src = """
+package p;
+import static com.acme.Config.LOGGER;
+class Foo {
+    void run() {
+        LOGGER.info("x");
+    }
+}
+"""
+    result = java.parse_java_source("Foo.java", src)
+    invoke = next(e for e in _edges(result, "invoke") if e.target == "com.acme.Config")
+    assert invoke.target_kind == "internal_exact_or_external"
+
+
+def test_invoke_edge_is_attributed_to_the_enclosing_type_not_the_first_declared_type():
+    src = """
+package p;
+class Helper {
+    static void doWork() {}
+}
+class Foo {
+    void run() {
+        Helper.doWork();
+    }
+}
+"""
+    result = java.parse_java_source("Foo.java", src)
+    invoke = next(e for e in _edges(result, "invoke") if e.target == "Helper")
+    # Note 10 (second cold read, fix round 4): the call is textually inside
+    # Foo.run(), not Helper (the FIRST declared type in the file) - a file
+    # with more than one top-level type must attribute the edge to the type
+    # whose body actually contains the call, not always to the first one.
+    assert invoke.from_qualified_name == "p.Foo"
+
+
+def test_route_edge_and_entry_point_are_attributed_to_the_enclosing_type():
+    src = """
+package p;
+@RestController
+class Other {
+}
+@RestController
+class Controller {
+    @RequestMapping("/api/widgets")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert routes[0].from_qualified_name == "p.Controller"
+    http_entry_points = [e for e in result.entry_points if e.kind == "http_route"]
+    assert http_entry_points[0].qualified_name == "p.Controller"
+
+
+# ----------------------------------------------------------- route (declared only)
+
+def test_request_mapping_with_literal_path_produces_a_declared_route():
+    src = """
+package p;
+@RestController
+class Controller {
+    @RequestMapping("/api/widgets")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "/api/widgets"
+    assert routes[0].evidence_class == "declared"
+    assert routes[0].target_kind == "external_route"
+    http_entry_points = [e for e in result.entry_points if e.kind == "http_route"]
+    assert len(http_entry_points) == 1
+    assert http_entry_points[0].name == "/api/widgets"
+
+
+def test_get_mapping_value_attribute_is_recovered():
+    src = """
+package p;
+@RestController
+class Controller {
+    @GetMapping(value = "/api/widgets/{id}")
+    void get() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    # M-5 (third cold read, fix round 5): a verb-specific annotation's own
+    # HTTP method is now folded into the route's identity.
+    assert routes[0].target == "GET /api/widgets/{id}"
+
+
+def test_get_and_post_on_the_same_path_produce_distinct_route_targets():
+    """M-5 (third cold read, fix round 5): a GET and a POST handler on the
+    identical path are two different code paths to a migration reader -
+    without the HTTP method folded into the route's own identity, both
+    produced the SAME target string, and downstream (features_artifact.py)
+    the SAME entry_point_id for two genuinely distinct entry points."""
+    src = """
+package p;
+@RestController
+class Controller {
+    @GetMapping("/orders")
+    void list() {}
+
+    @PostMapping("/orders")
+    void create() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    targets = {r.target for r in routes}
+    assert targets == {"GET /orders", "POST /orders"}
+
+
+def test_request_mapping_finds_value_even_when_a_different_attribute_comes_first():
+    """M8 (cold-read, PR-B fix round 3): the FIRST string literal in the
+    argument list is not necessarily the route path - Spring allows any
+    attribute order. Reproduced pre-fix: `produces` before `value` yielded
+    an http_route named "application/json", with the real "/orders" route
+    absent entirely."""
+    src = """
+package p;
+@RestController
+class Controller {
+    @RequestMapping(produces = "application/json", value = "/orders")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "/orders"
+
+
+def test_route_value_after_a_nested_call_argument_is_not_truncated_away():
+    """N10 (third cold read, fix round 5): the old ``\\([^)]*\\)`` regex
+    captured up to the FIRST ``)`` found ANYWHERE in the argument list -
+    an earlier attribute containing its OWN nested call
+    (``someHelper(x, y)``) closed that regex's capture right after its
+    own paren, silently losing every attribute after it, including the
+    real ``value`` this whole mechanism exists to find. Reproduced
+    pre-fix: this fell back to the bare annotation label
+    ("p.Controller#RequestMapping"), with "/api/widgets" entirely lost."""
+    src = """
+package p;
+@RestController
+class Controller {
+    @RequestMapping(produces = someHelper(x, y), value = "/api/widgets")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "/api/widgets"
+
+
+def test_route_value_ignores_a_commented_out_line_before_the_live_one():
+    """B1 (fourth cold read, fix round 6): value extraction used to match
+    the ORIGINAL (unsanitized) text directly - a commented-out `value =`
+    line is live text to that match, so it won outright over the real
+    one below it, publishing dead code as declared-class evidence AND as
+    the entry point's own stable ID. Reproduced pre-fix: this returned
+    "/v1/legacy-removed" (the commented-out value), never "/v2/orders"."""
+    src = """
+package p;
+@RestController
+class Controller {
+    @RequestMapping(
+        // value = "/v1/legacy-removed"
+        value = "/v2/orders"
+    )
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "/v2/orders"
+
+
+def test_route_value_ignores_a_block_comment_before_the_live_attribute():
+    """B1 (fourth cold read, fix round 6): same class as the line-comment
+    case, via a block comment wedged directly in the argument list."""
+    src = """
+package p;
+@RestController
+class Controller {
+    @GetMapping(/* value = "/OLD" */ value = "/NEW")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /NEW"
+
+
+def test_route_value_with_an_escaped_quote_is_not_truncated():
+    """B1 (fourth cold read, fix round 6), closing the KNOWN ISSUE named
+    in round 5's PR description: an escaped quote inside the route value
+    used to truncate the captured content at the escape (the old
+    `[^"]*` capture has no concept of escaping). _java_string_literal_content
+    reuses _strip_comments_and_strings's own escaped-quote skip, so the
+    literal's FULL content is now recovered.
+
+    Minor 6 (fifth cold read, fix round 7): round 6 published the RAW
+    source spelling (`\\"`, backslash included - two characters) as the
+    route's target and stable ID, rather than the ONE character it
+    actually represents at runtime. Asserting exact equality (not a
+    substring check, which cannot distinguish a correctly-decoded value
+    from a malformed/raw one) against the properly UNESCAPED value."""
+    src = r"""
+package p;
+@RestController
+class Controller {
+    @RequestMapping(value = "/api/\"quoted\"/thing")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == '/api/"quoted"/thing'
+
+
+def test_route_value_as_a_text_block_is_recovered():
+    """B1 (fourth cold read, fix round 6): a Java 15+ triple-quoted text
+    block is a different string-literal shape entirely (delimited by
+    `\"\"\"`, not a single `"`) - _java_string_literal_content handles it
+    the same way _strip_comments_and_strings already does when
+    sanitizing, so this is recovered rather than mis-parsed as an empty
+    or truncated ordinary literal.
+
+    Minor 6 (fifth cold read, fix round 7): round 6 published the RAW
+    substring between the `\"\"\"` markers - leading newline and
+    indentation included - rather than Java's own incidental-whitespace-
+    stripped value (JEP 378). Asserting EXACT equality (a substring
+    check cannot distinguish the correctly-normalized value from a
+    malformed one that merely happens to contain it)."""
+    src = '''
+package p;
+@RestController
+class Controller {
+    @RequestMapping(value = """
+        /api/textblock""")
+    void list() {}
+}
+'''
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "/api/textblock"
+
+
+def test_route_value_as_a_text_block_with_an_escaped_quote_before_the_real_closing_delimiter():
+    """MICRO-ROUND 49 (forty-third cold read, m1 MINOR, wrong-data): this
+    function's own docstring claims it "mirrors _strip_comments_and_
+    strings's OWN boundary-finding logic exactly" - true again after
+    this fix, false since round 48/F4 gave the SANITIZER's own text-
+    block branch escape awareness and left this, its documented twin,
+    on a bare `text.find('\"\"\"', ...)`. A legal JEP 378 escaped quote
+    (`\\"`) immediately followed by two more literal, unescaped quotes
+    (legal on their own - only a run of 3 is ambiguous with the
+    delimiter) reads as a premature closing delimiter pre-fix,
+    truncating the recovered route value before ever reaching the REAL
+    closing `\"\"\"` that follows. Reproduced pre-fix exactly as
+    measured."""
+    src = r'''
+package p;
+@RestController
+class Controller {
+    @RequestMapping(value = """
+        /api/x\"""y""")
+    void list() {}
+}
+'''
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == '/api/x"""y'
+
+
+def test_route_value_as_a_text_block_dedents_using_the_closing_delimiters_own_indentation():
+    """LOW-3 (round 7c, reviewer-3 delta on 95d9cd8): the JLS text-block
+    algorithm counts the CLOSING DELIMITER's own line toward the common
+    minimal indentation even though that line is blank - an earlier
+    version excluded it (only non-blank lines counted), diverging from
+    javac exactly when the delimiter's own line is indented LESS than
+    every content line. Here the delimiter sits at 6 spaces while both
+    content lines sit at 8 - each published line must retain exactly the
+    2-space difference, not be fully dedented to zero."""
+    src = '''
+package p;
+@RestController
+class Controller {
+    @RequestMapping(value = """
+        line1
+        line2
+      """)
+    void list() {}
+}
+'''
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    # FIX ROUND 41 (thirty-fifth cold read, F1+F2, THE STRUCTURAL CURE):
+    # the dedent still produces a real embedded newline internally - the
+    # CLAIM itself now carries it RAW (escaping moved to display-write
+    # in dependencies_artifact.py; see bounded_route_target's own
+    # docstring for why an extraction-time transform is never applied
+    # to an identity-bearing claim field again).
+    assert routes[0].target == "/  line1\n  line2"
+
+
+def test_route_value_with_a_bidi_override_or_line_separator_is_stored_raw():
+    """FIX ROUND 41 (thirty-fifth cold read, F1+F2, THE STRUCTURAL
+    CURE): a RIGHT-TO-LEFT OVERRIDE (U+202E, the classic "Trojan Source"
+    spoofing character) and a Unicode LINE SEPARATOR (U+2028) are no
+    longer escaped by the adapter itself - escaping moved to display-
+    write (see `test_comprehension_dependencies_artifact.py`'s own
+    escape-set battery for the published, escaped form). The CLAIM the
+    adapter emits carries them RAW, unconditionally - this is what
+    `entry_point_id`/`edge_id` now hash, and what a future producer
+    consuming the claim directly must expect."""
+    rtl_override = chr(0x202E)
+    line_separator = chr(0x2028)
+    src = (
+        "package p;\n"
+        "@RestController\n"
+        "class Controller {\n"
+        f'  @GetMapping("/api{rtl_override}evil{line_separator}end")\n'
+        "  void list() {}\n"
+        "}\n"
+    )
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == f"GET /api{rtl_override}evil{line_separator}end"
+
+
+def test_route_value_with_an_arabic_letter_mark_is_stored_raw():
+    """FIX ROUND 41 (F1+F2, THE STRUCTURAL CURE): U+061C ARABIC LETTER
+    MARK is no longer escaped by the adapter itself - see the bidi/line-
+    separator test above for the full reasoning."""
+    alm = chr(0x061C)
+    src = (
+        "package p;\n"
+        "@RestController\n"
+        "class Controller {\n"
+        f'  @GetMapping("/api{alm}end")\n'
+        "  void list() {}\n"
+        "}\n"
+    )
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == f"GET /api{alm}end"
+
+
+def test_route_value_with_a_c1_control_character_nel_is_stored_raw():
+    """FIX ROUND 41 (F1+F2, THE STRUCTURAL CURE): the C1 control block
+    (U+0080-U+009F, including U+0085 NEL) is no longer escaped by the
+    adapter itself - see the bidi/line-separator test above for the
+    full reasoning."""
+    nel = chr(0x0085)
+    src = (
+        "package p;\n"
+        "@RestController\n"
+        "class Controller {\n"
+        f'  @GetMapping("/api{nel}end")\n'
+        "  void list() {}\n"
+        "}\n"
+    )
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == f"GET /api{nel}end"
+
+
+def test_route_value_with_invisible_format_characters_is_stored_raw():
+    """FIX ROUND 41 (F1+F2, THE STRUCTURAL CURE): ZERO WIDTH SPACE
+    (U+200B), SOFT HYPHEN (U+00AD), WORD JOINER (U+2060), and ZERO WIDTH
+    NO-BREAK SPACE (U+FEFF) are no longer escaped by the adapter itself
+    - see the bidi/line-separator test above for the full reasoning
+    (the non-injective escape of exactly these characters is what let
+    two genuinely different routes collide on entry_point_id/edge_id in
+    the first place, round 40's own F1+F2 finding - the claim itself
+    must carry the real character, never its escaped spelling, for the
+    id to be trustworthy)."""
+    zwsp = chr(0x200B)
+    shy = chr(0x00AD)
+    word_joiner = chr(0x2060)
+    zwnbsp = chr(0xFEFF)
+    src = (
+        "package p;\n"
+        "@RestController\n"
+        "class Controller {\n"
+        f'  @GetMapping("/api{zwsp}{shy}mid{word_joiner}dle{zwnbsp}end")\n'
+        "  void list() {}\n"
+        "}\n"
+    )
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == f"GET /api{zwsp}{shy}mid{word_joiner}dle{zwnbsp}end"
+
+
+# ----------------------------------------------------------- malformed java (round 15 F5)
+
+def test_an_unterminated_char_literal_is_detected_as_malformed_not_silently_truncated():
+    """FIX ROUND 15 (eleventh cold read, F5 MAJOR, wrong-data, cr11-fx10
+    verbatim): genuinely malformed Java (an unterminated char literal)
+    made the sanitizer blank the rest of the file silently - PathUtil
+    (declared BEFORE the malformed literal) still publishes, but
+    FileController (declared after, with two routes) vanishes with NO
+    problem recorded, and because PathUtil alone means units is
+    non-empty, the zero-types guard never fires either. The sanitizer
+    now detects it reached EOF still inside the unterminated literal and
+    reports it."""
+    src = (
+        "package p;\n"
+        "class PathUtil {\n"
+        "  char bad = '\n"
+        "class FileController {\n"
+        '  @GetMapping("/one") void a() {}\n'
+        '  @GetMapping("/two") void b() {}\n'
+        "}\n"
+    )
+    result = java.parse_java_source("Mixed.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.PathUtil"]
+    assert _edges(result, "route") == []
+    assert any(p.reason_code == "parse_failed" for p in result.problems)
+
+
+def test_an_unclosed_block_comment_is_detected_as_malformed_not_silently_truncated():
+    """FIX ROUND 15 (F5 MAJOR, wrong-data): the second reviewer-verified
+    trigger shape - an unclosed /* block comment swallows the rest of
+    the file the same way an unterminated char literal does."""
+    src = (
+        "package p;\n"
+        "class PathUtil {\n"
+        "}\n"
+        "/* comment that never closes\n"
+        "class FileController {\n"
+        '  @GetMapping("/one") void a() {}\n'
+        "}\n"
+    )
+    result = java.parse_java_source("Mixed2.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.PathUtil"]
+    assert _edges(result, "route") == []
+    assert any(p.reason_code == "parse_failed" for p in result.problems)
+
+
+def _line_comment_terminator_fixture_lines() -> list[str]:
+    return [
+        "package p;",
+        "// a leading line comment",
+        "import java.util.List;",
+        "",
+        "@RestController",
+        "public class Service {",
+        '  @GetMapping("/one") void a() {}',
+        "  public static void main(String[] args) {",
+        "  }",
+        "}",
+    ]
+
+
+def test_a_cr_only_file_publishes_every_declaration_after_a_line_comment():
+    """MICRO-ROUND 49 (forty-third cold read, B3 BLOCKER, wrong-data):
+    JLS 3.4 makes a bare CR a legal LineTerminator on its own (javac
+    compiles a CR-only file) - the sanitizer's own `//` line-comment
+    scan used to search only for `\\n`, which a CR-only file never
+    contains at all, so the FIRST `//` comment's own terminator search
+    always returned -1 and blanked EVERY remaining character to EOF as
+    if it were still inside that one comment. Reproduced pre-fix
+    exactly as measured: everything after the first `//` silently
+    vanished - no import, no route, no main, and (unlike the malformed-
+    literal/malformed-comment shapes above) no problem recorded either,
+    since this was never treated as an unterminated construct at all."""
+    src = "\r".join(_line_comment_terminator_fixture_lines()) + "\r"
+    result = java.parse_java_source("Service.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.Service"]
+    assert _edges(result, "import") != []
+    assert [r.target for r in _edges(result, "route")] == ["GET /one"]
+    mains = [e for e in result.entry_points if e.kind == "cli_main"]
+    assert len(mains) == 1
+    assert mains[0].qualified_name == "p.Service"
+
+
+def test_a_crlf_file_publishes_every_declaration_after_a_line_comment_control():
+    """Control for the CR-only fix: CRLF (already worked pre-fix, since
+    a bare `\\n` search finds the `\\n` half of a CRLF pair too) must
+    keep working identically."""
+    src = "\r\n".join(_line_comment_terminator_fixture_lines()) + "\r\n"
+    result = java.parse_java_source("Service.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.Service"]
+    assert _edges(result, "import") != []
+    assert [r.target for r in _edges(result, "route")] == ["GET /one"]
+    mains = [e for e in result.entry_points if e.kind == "cli_main"]
+    assert len(mains) == 1
+
+
+def test_a_mixed_line_terminator_file_publishes_every_declaration_after_a_line_comment():
+    """Mixed-terminator control: a file whose lines end in CR, LF, and
+    CRLF in no consistent pattern (a legacy file re-saved across tools/
+    platforms without normalization) - every declaration after the
+    comment must still publish regardless of which terminator follows
+    THAT specific comment."""
+    lines = _line_comment_terminator_fixture_lines()
+    terminator_cycle = ["\n", "\r", "\r\n"]
+    terminators = [terminator_cycle[i % len(terminator_cycle)] for i in range(len(lines))]
+    src = "".join(line + term for line, term in zip(lines, terminators, strict=True))
+    result = java.parse_java_source("Service.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.Service"]
+    assert _edges(result, "import") != []
+    assert [r.target for r in _edges(result, "route")] == ["GET /one"]
+    mains = [e for e in result.entry_points if e.kind == "cli_main"]
+    assert len(mains) == 1
+
+
+def test_a_file_truncated_mid_class_with_no_unterminated_literal_still_reports_parse_failed():
+    """M (cold-read PR-B fix round 47 completeness, "JUDGE this one
+    seriously - borders wrong-data"): a file chopped off mid-declaration
+    - no unterminated string/comment at all, every token before the cut
+    is perfectly well-formed - never set `malformed` (a purely LEXICAL
+    detector), so it published FileController as an ordinary unit with
+    NO signal that its own body never actually closed. _extract_types's
+    own `stack` is left non-empty at loop end for exactly this case -
+    now surfaced as a parse_failed problem naming the truncated type,
+    the same class of fact the unterminated-literal/comment cases above
+    already surface, just at brace-structure granularity."""
+    src = (
+        "package p;\n"
+        "class PathUtil {\n"
+        "}\n"
+        "class FileController {\n"
+        '  @GetMapping("/one") void a() {}\n'
+    )
+    result = java.parse_java_source("Truncated.java", src)
+    assert {u.qualified_name for u in result.units} == {"p.PathUtil", "p.FileController"}
+    truncation_problems = [
+        p for p in result.problems
+        if p.reason_code == "parse_failed" and p.qualified_name == "p.FileController"
+    ]
+    assert len(truncation_problems) == 1
+    assert "closing brace was never found" in truncation_problems[0].detail
+
+
+def test_a_text_block_with_an_escaped_triple_quote_does_not_close_early(
+) -> None:
+    """FIX ROUND 48 (forty-second cold read, F4 MINOR, wrong-data, .cr42-
+    textblock): the text-block closing-delimiter search used a bare
+    ``text.find('\"\"\"', ...)`` with no escape awareness - a legal JEP
+    378 escaped quote (``\\"``) sitting right before two more literal
+    quote characters (a real way to embed a literal triple-quote
+    sequence inside a text block's own content) made the naive search
+    close the block EARLY, right there, even though its first quote is
+    escaped and this is not really a delimiter at all. Everything
+    genuinely still inside the block (up to and past its own REAL
+    closing delimiter) is then misread as ordinary Java source - the
+    real closing ``\"\"\"`` reads as a brand-new text-block OPENER with
+    no closer of its own anywhere else in the file, cascading into a
+    FALSE parse_failed ('unterminated literal') for a file that is
+    fully legal Java."""
+    src = (
+        "package p;\n"
+        "class Controller {\n"
+        '    String s = """\n'
+        '        Say \\"""Hi\n'
+        '        """;\n'
+        "    void list() {}\n"
+        "}\n"
+    )
+    sanitized, malformed = java._strip_comments_and_strings(src)
+    assert malformed is False
+    result = java.parse_java_source("Controller.java", src)
+    assert result.units[0].qualified_name == "p.Controller"
+    assert not any(p.reason_code == "parse_failed" for p in result.problems)
+
+
+def test_a_text_block_with_a_trailing_backslash_before_its_own_closing_delimiter(
+) -> None:
+    """FIX ROUND 48 (F4 MINOR, JEP 378 escape battery): a text block
+    whose own content ends with an escaped backslash (``\\\\``)
+    immediately before the real closing delimiter - the escape-pairing
+    fix must consume the backslash pair as one unit and still correctly
+    recognize the REAL closing ``\"\"\"`` that follows, never skip past
+    it looking for a second one that does not exist."""
+    src = (
+        "package p;\n"
+        "class Controller {\n"
+        '    String s = """\n'
+        "        a path separator: \\\\\n"
+        '        """;\n'
+        "}\n"
+    )
+    sanitized, malformed = java._strip_comments_and_strings(src)
+    assert malformed is False
+    result = java.parse_java_source("Controller.java", src)
+    assert result.units[0].qualified_name == "p.Controller"
+
+
+def test_a_text_block_with_a_lone_escaped_quote_mid_block_is_unaffected() -> None:
+    """FIX ROUND 48 (F4 MINOR, JEP 378 escape battery): the common,
+    simple case - a single escaped quote (``\\"``) mid-block, nowhere
+    near the real closing delimiter - must be completely unaffected by
+    the escape-aware search (it always was; this locks the common case
+    alongside the two edge cases above)."""
+    src = (
+        "package p;\n"
+        "class Controller {\n"
+        '    String s = """\n'
+        '        she said \\"hi\\" to me\n'
+        '        """;\n'
+        "}\n"
+    )
+    sanitized, malformed = java._strip_comments_and_strings(src)
+    assert malformed is False
+    result = java.parse_java_source("Controller.java", src)
+    assert result.units[0].qualified_name == "p.Controller"
+
+
+def test_sixteen_valid_literal_and_comment_shapes_are_never_flagged_malformed():
+    """FIX ROUND 15 (F5 regression battery): the reviewer explicitly
+    verified 16 valid literal/comment shapes all sanitize correctly -
+    the trigger is malformed input only. Every legal shape here must
+    report malformed=False; none of them ends a comment/string/char
+    construct exactly at EOF without a closing marker."""
+    valid_sources = [
+        "class A { }",  # no literals/comments at all
+        "class A { } // trailing line comment, no newline",
+        "class A { } // trailing line comment\n",
+        "class A { /* a block comment */ }",
+        "class A { /** a javadoc comment */ }",
+        "class A { /* multi\nline\ncomment */ }",
+        'class A { String s = "hello"; }',
+        'class A { String s = ""; }',
+        r'class A { String s = "esc\"aped"; }',
+        r'class A { String s = "trailing backslash-backslash\\"; }',
+        "class A { char c = 'x'; }",
+        r"class A { char c = '\''; }",
+        r"class A { char c = '\\'; }",
+        'class A { String s = """\n  text block\n  """; }',
+        'class A { String s = """already closed""" + "more"; }',
+        "class A { int x = 1; /* trailing comment at very end */ }",
+    ]
+    assert len(valid_sources) == 16
+    for src in valid_sources:
+        _sanitized, malformed = java._strip_comments_and_strings(src)
+        assert malformed is False, f"wrongly flagged malformed: {src!r}"
+
+
+def test_standalone_method_route_without_a_leading_slash_is_normalized_like_a_composed_one():
+    """LOW-2 (round 7c, reviewer-3 delta on 95d9cd8): leading-slash
+    normalization previously lived ONLY inside _compose_route_path (the
+    class-prefix half) - a STANDALONE method route (no class-level
+    prefix at all) with no leading ``/`` of its own published exactly as
+    written, while an otherwise-identical route composed with even an
+    empty class prefix got normalized. Two spellings for the same served
+    path depending on something the route itself has no say over."""
+    src = """
+package p;
+@RestController
+class Controller {
+    @GetMapping("list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /list"
+
+
+def test_request_mapping_path_attribute_is_recovered_ahead_of_an_unrelated_literal():
+    src = """
+package p;
+@RestController
+class Controller {
+    @RequestMapping(method = "GET", path = "/orders")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert routes[0].target == "/orders"
+
+
+def test_two_request_mappings_on_one_path_distinguished_by_method_attribute_do_not_coalesce():
+    """N2 (fifth cold read, fix round 8): a plain @RequestMapping's own
+    method = RequestMethod.X attribute was never parsed at all - two
+    @RequestMapping routes on the SAME path, differing only by this
+    attribute, both published with no method prefix (unlike
+    @GetMapping/@PostMapping, which fold their own verb implicitly) and
+    silently coalesced into ONE entry point by round 5's own coalescing
+    rule - correct for a genuine duplicate, wrong here since these are
+    two different handlers."""
+    src = """
+package p;
+@RestController
+class Controller {
+    @RequestMapping(value = "/orders", method = RequestMethod.GET)
+    void list() {}
+
+    @RequestMapping(value = "/orders", method = RequestMethod.POST)
+    void create() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert {r.target for r in routes} == {"GET /orders", "POST /orders"}
+    http_entry_points = [e for e in result.entry_points if e.kind == "http_route"]
+    assert {e.name for e in http_entry_points} == {"GET /orders", "POST /orders"}
+
+
+def test_route_value_recovery_continues_past_a_non_literal_named_attribute_match():
+    """Minor 5 (fifth cold read, fix round 7): round 6 took only the
+    FIRST value|path attribute-name match and required an IMMEDIATELY
+    following literal - a non-literal path attribute (here, a call
+    expression) ahead of the real, literal value attribute made the
+    whole function give up where it previously recovered a route (a
+    coverage narrowing versus pre-round-6 behavior). Recovery must
+    continue searching past the non-literal match instead."""
+    src = """
+package p;
+@RestController
+class Controller {
+    @RequestMapping(path = someExpr(), value = "/orders")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "/orders"
+
+
+def test_route_target_is_recovered_verbatim_regardless_of_size():
+    """invariant 3 (design: "must not store... string-literal bodies")
+    is now the PUBLISHED display field's own concern, not the claim's -
+    FIX ROUND 41 (thirty-fifth cold read, F1+F2, THE STRUCTURAL CURE):
+    an oversized literal used to be truncated at EXTRACTION time,
+    silently making the CLAIM's own `target` (an `edge_id` input) a
+    lossy projection of what was actually declared - two genuinely
+    different, sufficiently-long routes sharing a common prefix
+    collided. The claim now carries the value VERBATIM, whatever its
+    size; `dependencies_artifact.py` bounds it only at the one point it
+    is actually serialized for display (see
+    `test_comprehension_dependencies_artifact.py`'s own length-bound
+    battery)."""
+    from agenttalk.comprehension.adapters.java import _MAX_ROUTE_TARGET_LENGTH
+
+    oversized = "/" + ("x" * (_MAX_ROUTE_TARGET_LENGTH + 50))
+    src = f"""
+package p;
+@RestController
+class Controller {{
+    @RequestMapping("{oversized}")
+    void list() {{}}
+}}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert routes[0].target == oversized
+
+
+def test_a_route_annotation_with_an_embedded_newline_publishes_the_raw_control_character():
+    """FIX ROUND 20 (sixteenth cold read, P1 JUDGE, taken): a Java text
+    block can carry a RAW newline directly inside a string literal
+    (JEP 378) - the annotation's own escapes decode per Java semantics
+    (Minor 6, round 7), so this legitimately decodes to a route value
+    containing an actual control character.
+
+    CORRECTED (round 41, thirty-fifth cold read, F1+F2, THE STRUCTURAL
+    CURE): this used to assert the CLAIM's own `target` was already
+    escaped (`\\n` -> `\\\\n`) - escaping a raw control character is a
+    real, necessary discipline for a PUBLISHED name (hostile to
+    problems.json/dependencies.json/features.json, a CLI table, a
+    future UI), but doing it at extraction time made the claim itself a
+    lossy display projection, exactly the F1+F2 hazard. The claim now
+    carries the real control character; `dependencies_artifact.py`
+    escapes it only when actually publishing a display field."""
+    src = '''
+package p;
+@RestController
+class Controller {
+    @RequestMapping("""
+/orders
+/more
+""")
+    void list() {}
+}
+'''
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert "\n" in routes[0].target
+    assert "\\n" not in routes[0].target
+
+
+def test_bare_request_mapping_with_no_path_still_produces_a_named_route():
+    src = """
+package p;
+@RestController
+class Controller {
+    @RequestMapping
+    void handle() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "p.Controller#RequestMapping"
+
+
+def test_class_level_request_mapping_composes_with_a_method_level_route():
+    """M5 (fourth cold read, fix round 6; fixture corrected fifth cold
+    read, fix round 7): a class-level @RequestMapping prefix and a
+    method-level route value used to publish as two INDEPENDENT routes -
+    the method's own published value was a bare fragment of the actually
+    -served path ("/list" published, "/api/orders/list" actually
+    served) in the field named for the whole route. Composition is
+    Spring's own declared semantics, not inference. The bare class-level
+    annotation itself (no method mapping of its own) must not ALSO
+    publish as its own route.
+
+    Round 7: the header carries a modifier (``public``) deliberately -
+    round 6's own fixture used a BARE ``class Controller {`` with no
+    modifier, which accidentally never exercised the walk's failure mode
+    (the type header's match position sits AFTER any modifier keyword;
+    round 6's walk only skipped whitespace and bare annotations, landing
+    short of the header - and silently failing - on every MODIFIED
+    declaration, i.e. almost every real one). A bare declaration cannot
+    prove this fix; this one can and does."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+@RestController
+public class Controller {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /api/orders/list"
+    http_entry_points = [e for e in result.entry_points if e.kind == "http_route"]
+    assert len(http_entry_points) == 1
+    assert http_entry_points[0].name == "GET /api/orders/list"
+
+
+def test_class_level_request_mapping_on_an_interface_is_not_served_through_it_alone():
+    """M5 (fifth cold read, fix round 7): the type header regex matches
+    ``class``, ``interface``, or ``enum`` alike, and Spring's own
+    declared composition semantics compute the SAME composed path for
+    an interface carrying a class-level mapping.
+
+    CORRECTED (round 44, thirty-eighth cold read, F1 BLOCKER - THE
+    REGISTRABILITY MATRIX): this test used to assert the composed
+    value published as a REAL, served route - wrong. An interface is
+    never itself the thing Spring instantiates as a bean; the mapping
+    is only genuinely served through an implementing, registered
+    bean (Spring's own merged-annotation lookup does search
+    interfaces) - a materially weaker claim than "this class serves
+    this route." No route is published; the enrolled shape
+    (spring_route_on_unregistered_class) records why, exactly like
+    JAX-RS's own round-43 N3 sibling."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+public interface Controller {
+    @GetMapping("/list")
+    void list();
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.Controller"
+    assert "spring_route_on_unregistered_class" in problem.detail
+    assert "INTERFACE" in problem.detail
+
+
+def test_class_level_request_mapping_on_an_abstract_class_is_not_served_through_it_alone():
+    """FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER, .cr38-
+    stereotype - THE REGISTRABILITY MATRIX): an ABSTRACT class is never
+    itself instantiated as a Spring bean - only a CONCRETE subclass can
+    be - so a class-level @RequestMapping on one is not served through
+    it alone either, the same weaker claim as the interface sibling
+    above (a concrete subclass MAY inherit the mapping, unlike
+    @WebServlet's own provably-stronger "never" claim below)."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+@RestController
+public abstract class Controller {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.Controller"
+    assert "spring_route_on_unregistered_class" in problem.detail
+    assert "ABSTRACT" in problem.detail
+
+
+def test_class_level_request_mapping_with_no_stereotype_found_in_file_is_not_served():
+    """FIX ROUND 44 (F1 BLOCKER, .cr38-stereotype): a CONCRETE class
+    with a class-level @RequestMapping but no recognized Spring
+    stereotype (@Controller/@RestController/@Component/@Service/
+    @Repository) ANYWHERE in this file is not provably a registered
+    bean - a separate XML <bean> declaration this single-file producer
+    cannot see could still register it, so the disposition is "not
+    provably a bean from this file," never "never a bean" (see
+    _class_registrability's own docstring)."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+public class Controller {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.Controller"
+    assert "spring_route_on_unregistered_class" in problem.detail
+    assert "no Spring stereotype" in problem.detail
+
+
+def test_class_level_request_mapping_with_a_stereotype_on_a_concrete_class_still_publishes():
+    """FIX ROUND 44 (F1 BLOCKER, .cr38-stereotype control): the ONE
+    genuinely serveable cell of the registrability matrix - a CONCRETE
+    class carrying a recognized Spring stereotype annotation - must
+    keep publishing exactly as before; round 44's own new gate must
+    never suppress the case it was designed to leave alone."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+@RestController
+public class Controller {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /api/orders/list"
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+
+
+def test_a_spring_route_on_an_enum_is_never_a_registered_bean():
+    """MICRO-ROUND 44b (reviewer-3's own item-2 construction, F2 - a
+    cell the registrability matrix keyed past, since it keys on
+    type-kind + stereotype, not instantiability): an ENUM carrying
+    @RestController and its own route methods still published a
+    confident served route - a container/Spring never instantiates an
+    enum the ordinary way (`new EnumType()`); its instances are the
+    fixed, compiler-generated set of declared constants, and unlike an
+    interface/abstract class, no OTHER class can ever extend an enum
+    (Java forbids it) - a PROVABLY stronger "never registered" claim,
+    not the weaker "not through this class alone" wording the
+    interface/abstract cells get."""
+    src = """
+package p;
+
+@RestController
+public enum OrderMode {
+    FAST, SLOW;
+
+    @GetMapping("/orders")
+    public void list() {}
+}
+"""
+    result = java.parse_java_source("OrderMode.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.OrderMode"
+    assert "spring_route_on_unregistered_class" in problem.detail
+    assert "ENUM" in problem.detail
+    assert "never instantiated" in problem.detail
+
+
+def test_a_jax_rs_path_on_an_enum_is_never_a_registered_resource():
+    """MICRO-ROUND 44b (F2, JAX-RS sibling): the same enum
+    unreachability, for a class-level @Path instead of a Spring
+    stereotype - folded into the SAME jax_rs_route_on_unregistered_class
+    shape as the interface/abstract cells (the actionable fact is the
+    same), but worded separately since, unlike interface/abstract, no
+    implementing resource class could ever exist for an enum either."""
+    src = """
+package p;
+
+@Path("/api/orders")
+public enum OrderResource {
+    FAST, SLOW;
+
+    @GET
+    @Path("/list")
+    public void list() {}
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.OrderResource"
+    assert "jax_rs_route_on_unregistered_class" in problem.detail
+    assert "an ENUM" in problem.detail
+
+
+def test_a_concrete_subclass_of_an_abstract_mapped_controller_publishes_nothing_of_its_own():
+    """FIX ROUND 44 (F1 BLOCKER, concrete-subclass-of-abstract control):
+    this single-file, syntactic-only producer has no inheritance
+    resolution - a concrete subclass of an abstract, mapped controller
+    is never linked back to the abstract class's own annotation (the
+    abstract class's own route stays suppressed, unchanged; the
+    subclass, having no route annotation of its own, publishes
+    nothing) - never a fabricated inference that the subclass serves
+    the parent's route."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+@RestController
+public abstract class BaseController {
+    @GetMapping("/list")
+    void list() {}
+}
+
+public class OrderController extends BaseController {
+}
+"""
+    result = java.parse_java_source("OrderController.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.BaseController"
+    assert "ABSTRACT" in problem.detail
+
+
+def test_web_servlet_on_an_abstract_class_is_never_served():
+    """FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER, .cr38-servlet
+    - THE REGISTRABILITY MATRIX): a servlet container only ever
+    instantiates a CONCRETE class, and @WebServlet is not inherited by
+    a subclass (Servlet spec) - unlike Spring's own merged-annotation
+    lookup, this is a PROVABLY stronger "never served" claim, not the
+    weaker "not through this class alone" wording the Spring family
+    gets."""
+    src = """
+package p;
+
+@WebServlet("/api")
+public abstract class BaseServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("BaseServlet.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.BaseServlet"
+    assert "webservlet_on_uninstantiable_class" in problem.detail
+    assert "ABSTRACT" in problem.detail
+    assert "never served" in problem.detail
+
+
+def test_web_servlet_on_an_interface_is_never_served():
+    """FIX ROUND 44 (F1 BLOCKER, .cr38-servlet): the interface sibling
+    of the abstract-class case above - a servlet container never
+    instantiates an interface either."""
+    src = """
+package p;
+
+@WebServlet("/api")
+public interface ApiServlet {
+}
+"""
+    result = java.parse_java_source("ApiServlet.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.ApiServlet"
+    assert "webservlet_on_uninstantiable_class" in problem.detail
+    assert "an INTERFACE" in problem.detail
+
+
+def test_web_servlet_on_a_concrete_class_still_publishes():
+    """FIX ROUND 44 (F1 BLOCKER, .cr38-servlet control): the genuinely
+    serveable cell - a concrete @WebServlet class must keep publishing
+    exactly as before."""
+    src = """
+package p;
+
+@WebServlet("/api")
+public class ApiServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("ApiServlet.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "/api"
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+
+
+def test_web_servlet_with_only_a_private_constructor_still_publishes_a_declared_gap():
+    """MICRO-ROUND 44b (reviewer-3's own item-2 construction, F2 -
+    declared, not fixed): a concrete @WebServlet class whose ONLY
+    constructor is private can never be instantiated by a servlet
+    container either - the same unreachability question as F1's own
+    interface/abstract/enum cells - but this single-file, syntactic-
+    only adapter tracks no constructor declarations or their own access
+    modifiers at all, so there is no cheap, existing fact to check this
+    against (unlike type-kind, which the header parse already sees).
+    Judged: declare the gap (module docstring + design doc), do not
+    guess a pass/fail. This is a REGRESSION LOCK proving today's
+    (unchanged, declared-gap) output - a future round adding
+    constructor tracking should update this test deliberately, not
+    discover the behavior changed by accident."""
+    src = """
+package p;
+
+@WebServlet("/api")
+public class ApiServlet extends HttpServlet {
+    private ApiServlet() {}
+}
+"""
+    result = java.parse_java_source("ApiServlet.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "/api"
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+
+
+def test_web_filter_on_an_abstract_class_is_never_served():
+    """FIX ROUND 44 (thirty-eighth cold read, F1 BLOCKER - THE LESSON
+    APPLIED): @WebFilter shares @WebServlet's own shape exactly (an
+    existing code comment already says so) - round 44's own explicit
+    lesson is that a round establishing a registrability principle must
+    enumerate every sibling shape it governs, not just the one or two
+    fixtures a cold read happened to name. Fixed here in the SAME
+    round rather than leaving it for the next cold read to find."""
+    src = """
+package p;
+
+@WebFilter("/api/*")
+public abstract class BaseFilter implements Filter {
+}
+"""
+    result = java.parse_java_source("BaseFilter.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.BaseFilter"
+    assert "webservlet_on_uninstantiable_class" in problem.detail
+    assert "ABSTRACT" in problem.detail
+
+
+def test_web_filter_on_a_concrete_class_still_publishes():
+    """FIX ROUND 44 (F1 BLOCKER, @WebFilter control): the genuinely
+    serveable cell - a concrete @WebFilter class must keep publishing
+    exactly as before."""
+    src = """
+package p;
+
+@WebFilter("/api/*")
+public class ApiFilter implements Filter {
+}
+"""
+    result = java.parse_java_source("ApiFilter.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "/api/*"
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+
+
+def test_web_servlet_on_an_enum_is_never_instantiated():
+    """FIX ROUND 45 (thirty-ninth cold read, F3 MINOR, wrong-data,
+    .cr39-enumservlet - a cell-drop the matrix itself exists to
+    prevent): round 44b closed the enum cell for Spring and JAX-RS but
+    `_uninstantiable_class_problem`'s own signature never accepted
+    `is_enum` at all, so the SAME enum decorated with @WebServlet
+    instead still published complete/0 in the identical probe where
+    its own @Path/@RestController sibling correctly suppressed."""
+    src = """
+package p;
+
+@WebServlet("/api")
+public enum ApiServlet {
+    A, B;
+}
+"""
+    result = java.parse_java_source("ApiServlet.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.ApiServlet"
+    assert "webservlet_on_uninstantiable_class" in problem.detail
+    assert "an ENUM" in problem.detail
+
+
+def test_web_filter_on_an_enum_is_never_instantiated():
+    """FIX ROUND 45 (F3 MINOR, .cr39-enumservlet, @WebFilter sibling):
+    the same cell-drop, for @WebFilter instead of @WebServlet."""
+    src = """
+package p;
+
+@WebFilter("/api/*")
+public enum ApiFilter {
+    A, B;
+}
+"""
+    result = java.parse_java_source("ApiFilter.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.ApiFilter"
+    assert "webservlet_on_uninstantiable_class" in problem.detail
+    assert "an ENUM" in problem.detail
+
+
+def test_spring_route_on_a_non_static_member_class_is_unregistered():
+    """FIX ROUND 46 (fortieth cold read, F1 MAJOR - THE MATRIX'S OWN
+    MISSING DIMENSION, .cr40-matrix /n-nonstatic): a concrete
+    non-static (instance) MEMBER class - its own constructor takes an
+    implicit reference to its enclosing instance, so Spring's own
+    `isIndependent()` component-scan filter excludes it - still
+    published complete/0, since the matrix keyed on type-kind +
+    stereotype only, never declaration context. Suppressed now with the
+    SAME weaker "not through this class alone" claim the missing-
+    stereotype cell already earns (a manually-registered bean instance
+    is a real escape this single-file producer cannot rule out)."""
+    src = """
+package p;
+
+class Outer {
+    @RestController
+    class Inner {
+        @GetMapping("/n-nonstatic")
+        void handle() {}
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.Outer.Inner"
+    assert "spring_route_on_unregistered_class" in problem.detail
+    assert "NON-STATIC MEMBER" in problem.detail
+
+
+def test_spring_route_on_a_static_nested_class_is_unaffected():
+    """FIX ROUND 46 (F1 MAJOR, .cr40-matrix /n-static-ok control): a
+    STATIC nested class remains exactly as instantiable as a top-level
+    one - `container_prefix` non-empty alone was never sufficient for
+    is_non_static_member, only non-empty AND not `static`. Must keep
+    publishing exactly as before."""
+    src = """
+package p;
+
+class Outer {
+    @RestController
+    static class Inner {
+        @GetMapping("/n-static-ok")
+        void handle() {}
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].from_qualified_name == "p.Outer.Inner"
+
+
+def test_spring_route_on_a_class_nested_inside_an_interface_is_unaffected():
+    """FIX ROUND 47 (forty-first cold read, M1 MAJOR, wrong-data - THE
+    CONTAINER DIMENSION, .cr41-ifacenest /in-iface): JLS 9.5 - every
+    member type declared inside an INTERFACE is implicitly static,
+    regardless of whether it writes `static` itself (nobody does, since
+    it is redundant - the identical reasoning round 46's own record/
+    annotation-type fix already established for the MEMBER's own kind,
+    now applied to the CONTAINER's kind instead). Round 46's own
+    `is_non_static_member` looked only at the member's own `static`
+    modifier, never at what kind of type contains it - a real, common
+    idiom (a default-method helper class nested inside an interface)
+    was misread as a non-static member and wrongly suppressed, dropping
+    a real, servable route."""
+    src = """
+package p;
+
+interface Outer {
+    @RestController
+    class Inner {
+        @GetMapping("/in-iface")
+        void handle() {}
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].from_qualified_name == "p.Outer.Inner"
+
+
+def test_spring_route_on_a_class_nested_inside_an_annotation_type_is_unaffected():
+    """FIX ROUND 47 (M1 MAJOR, .cr41-ifacenest /in-anno): the annotation-
+    type sibling of the interface case above - JLS 9.6 makes an
+    annotation type itself a special kind of interface, so JLS 9.5's
+    own implicit-static rule for interface members applies identically."""
+    src = """
+package p;
+
+@interface Outer {
+    @RestController
+    class Inner {
+        @GetMapping("/in-anno")
+        void handle() {}
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+
+
+def test_spring_route_on_a_non_static_member_of_an_ordinary_class_is_still_unregistered():
+    """FIX ROUND 47 (M1 MAJOR, .cr41-ifacenest /inner-bad control): the
+    container-kind fix must not over-correct - a member nested inside
+    an ORDINARY CLASS (never an interface/annotation type) is still a
+    genuine non-static member when it carries no `static` of its own,
+    and must keep suppressing exactly as round 46 already established."""
+    src = """
+package p;
+
+class Outer {
+    @RestController
+    class Inner {
+        @GetMapping("/inner-bad")
+        void handle() {}
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.Outer.Inner"
+    assert "NON-STATIC MEMBER" in problem.detail
+
+
+def test_jax_rs_route_on_a_non_static_member_class_is_unregistered():
+    """FIX ROUND 46 (F1 MAJOR, .cr40-inner GET /bad-res/y): the JAX-RS
+    sibling - a non-static member resource class's only constructor
+    still takes an implicit enclosing-instance argument, so a
+    container's reflective no-arg construction can never invoke it
+    either. Same weaker "not through this class alone" claim JAX-RS's
+    own interface/abstract cell already earns (a manually-registered
+    resource instance is a real escape this producer cannot see)."""
+    src = """
+package p;
+
+class Outer {
+    @Path("/bad-res")
+    class Inner {
+        @GET
+        @Path("y")
+        void get() {}
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.Outer.Inner"
+    assert "jax_rs_route_on_unregistered_class" in problem.detail
+    assert "NON-STATIC MEMBER" in problem.detail
+
+
+def test_jax_rs_route_on_a_static_nested_class_is_unaffected():
+    """FIX ROUND 46 (F1 MAJOR, .cr40-inner control): a static nested
+    JAX-RS resource class must keep publishing exactly as before."""
+    src = """
+package p;
+
+class Outer {
+    @Path("/good-res")
+    static class Inner {
+        @GET
+        @Path("y")
+        void get() {}
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].from_qualified_name == "p.Outer.Inner"
+
+
+def test_web_servlet_on_a_non_static_member_class_is_never_instantiated():
+    """FIX ROUND 46 (F1 MAJOR, .cr40-inner /bad-servlet): a servlet
+    container instantiates via reflective `getConstructor().
+    newInstance()`, which requires a public no-arg constructor - a
+    non-static member class's only constructor takes an implicit
+    enclosing-instance argument (no no-arg constructor exists, period,
+    unlike Spring/JAX-RS's own manual-registration escape) - the
+    STRONG claim, same shape @WebServlet's own interface/abstract/enum
+    cells already get."""
+    src = """
+package p;
+
+class Outer {
+    @WebServlet("/bad-servlet")
+    class Inner {
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.Outer.Inner"
+    assert "webservlet_on_uninstantiable_class" in problem.detail
+    assert "NON-STATIC MEMBER" in problem.detail
+
+
+def test_web_filter_on_a_non_static_member_class_is_never_instantiated():
+    """FIX ROUND 46 (F1 MAJOR, .cr40-inner /bad-filter): the @WebFilter
+    sibling of the @WebServlet non-static-member case above."""
+    src = """
+package p;
+
+class Outer {
+    @WebFilter("/bad-filter")
+    class Inner {
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.Outer.Inner"
+    assert "webservlet_on_uninstantiable_class" in problem.detail
+    assert "NON-STATIC MEMBER" in problem.detail
+
+
+def test_web_servlet_on_a_static_nested_class_is_unaffected():
+    """FIX ROUND 46 (F1 MAJOR, .cr40-inner control): a static nested
+    @WebServlet class must keep publishing exactly as before - proves
+    is_non_static_member correctly gates off for the shared
+    `_uninstantiable_class_problem` helper too, not just Spring/JAX-RS."""
+    src = """
+package p;
+
+class Outer {
+    @WebServlet("/good-servlet")
+    static class Inner {
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].from_qualified_name == "p.Outer.Inner"
+
+
+def test_spring_route_on_a_nested_record_without_the_static_keyword_is_unaffected():
+    """FIX ROUND 46 (F1 MAJOR, regression lock): a nested `record` is
+    IMPLICITLY static by JLS rule - nobody writes the redundant
+    `static` keyword on one - so `container_prefix` non-empty AND no
+    literal `static` modifier must NOT be misread as a non-static
+    member here; a record is concrete and fully instantiable
+    regardless of nesting, unaffected by declaration context at all.
+    `_class_registrability`'s own `is_static` counts an interface/enum/
+    record/annotation-type declaration as static unconditionally,
+    exactly for this reason."""
+    src = """
+package p;
+
+class Outer {
+    @RestController
+    record Inner(String id) {
+        @GetMapping("/n-record-ok")
+        void handle() {}
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].from_qualified_name == "p.Outer.Inner"
+
+
+def test_spring_route_on_a_method_local_class_is_never_instantiated():
+    """FIX ROUND 46 (F1 MAJOR, .cr40-local /local-route): a class
+    declared INSIDE a method body (a local class) is unnameable/
+    unreferenceable from anywhere outside its own declaring method - no
+    separate XML `<bean>` declaration (the escape every other "not
+    through this class alone" cell leans on) could ever name it either,
+    so it earns the SAME stronger "never instantiated" wording the enum
+    cell already does, not the weaker hedge."""
+    src = """
+package p;
+
+class Outer {
+    void register() {
+        @RestController
+        class LocalCtrl {
+            @GetMapping("/local-route")
+            void handle() {}
+        }
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.Outer.LocalCtrl"
+    assert "spring_route_on_unregistered_class" in problem.detail
+    assert "LOCAL class" in problem.detail
+
+
+def test_jax_rs_route_on_a_method_local_class_is_never_instantiated():
+    """FIX ROUND 46 (F1 MAJOR, .cr40-local sibling): the JAX-RS twin of
+    the method-local case above - a method-level @Path is required here
+    (unlike the bare-verb dominant idiom) so a route actually composes
+    and reaches this producer's own registrability check at all; the
+    verb-only-no-composed-route shape is already suppressed by the
+    pre-existing, unrelated jax_rs_verb_only_method class-closer."""
+    src = """
+package p;
+
+class Outer {
+    void register() {
+        @Path("/local-res")
+        class LocalResource {
+            @GET
+            @Path("y")
+            void get() {}
+        }
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.Outer.LocalResource"
+    assert "jax_rs_route_on_unregistered_class" in problem.detail
+    assert "LOCAL class" in problem.detail
+
+
+def test_web_servlet_on_a_method_local_class_is_never_instantiated():
+    """FIX ROUND 46 (F1 MAJOR, .cr40-local sibling): the @WebServlet
+    twin of the method-local case above, exercising the shared
+    `_uninstantiable_class_problem` helper's own local-class branch."""
+    src = """
+package p;
+
+class Outer {
+    void register() {
+        @WebServlet("/local-servlet")
+        class LocalServlet {
+        }
+    }
+}
+"""
+    result = java.parse_java_source("Outer.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.Outer.LocalServlet"
+    assert "webservlet_on_uninstantiable_class" in problem.detail
+    assert "LOCAL class" in problem.detail
+
+
+def test_method_level_route_with_no_class_level_mapping_is_unchanged():
+    """M5 (fourth cold read, fix round 6): a class with no class-level
+    route annotation at all must publish the method's own route exactly
+    as before - composition only applies when a class-level prefix
+    genuinely exists."""
+    src = """
+package p;
+@RestController
+class Controller {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /list"
+
+
+def test_class_level_request_mapping_with_a_valueless_method_annotation_uses_the_prefix_alone():
+    """M5 composition note (fifth cold read, fix round 7): a bare
+    ``@GetMapping`` (no value of its own) inside a prefixed class still
+    serves the class's own prefix in Spring - round 6 gated composition
+    on the method having its own literal, so a valueless method
+    annotation fell through to the synthetic ``Type#Annotation``
+    fallback and LOST the class prefix entirely rather than publishing
+    it alone."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+@RestController
+public class Controller {
+    @GetMapping
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /api/orders"
+
+
+def test_class_level_request_mapping_prefix_without_a_leading_slash_still_composes():
+    """M5 composition note (fifth cold read, fix round 7): a class-level
+    prefix lacking its own leading ``/`` (unusual but syntactically
+    valid) must still compose into an absolute-looking route, not a
+    relative fragment."""
+    src = """
+package p;
+
+@RequestMapping("orders")
+@RestController
+public final class Controller {
+    @GetMapping("list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /orders/list"
+
+
+def test_class_level_request_mapping_survives_a_stacked_annotation_with_nested_parens():
+    """M5 composition note (fifth cold read, fix round 7): a stacked
+    annotation between the route annotation and the type header may
+    carry its OWN nested-paren argument (e.g. a static-method-call
+    default) - the walk must skip it depth-aware, exactly like
+    _matching_close_paren already does for the route annotation's own
+    arguments, not give up and silently drop the composition."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+@ConditionalOnProperty(name = "x", havingValue = String.valueOf(true))
+@RestController
+public class Controller {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /api/orders/list"
+
+
+# ------------------------------------ B1 (sixth cold read, fix round 10):
+# the composition-walk class recurred a THIRD time (round 6 M5, round 7
+# B1, now this) - each fix enumerated the trivia grammar and the next
+# ordinary shape fell outside it. Structural order: anchor BACKWARD from
+# each extracted type header instead of walking forward across an
+# enumerated grammar - these are the reviewer's own two proving cases.
+
+def test_class_level_request_mapping_survives_a_fully_qualified_stacked_annotation():
+    """Proving case (a): a FULLY-QUALIFIED stacked annotation - the dot in
+    ``org.springframework...`` stopped the old forward walk's bare ``@\\w+``
+    match, resurrecting the phantom prefix-as-route bug."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+@org.springframework.stereotype.Component
+public class Controller {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /api/orders/list"
+    assert result.problems == []
+
+
+def test_a_unicode_leading_letter_annotation_is_a_declared_limit_not_recognized():
+    """MICRO-NOD 50b (F2, judged charset policy - the reader's own
+    Unicode-identifier note): the JLS (3.8) permits any Unicode
+    identifier-start character to lead a Java identifier, so
+    ``@ΔeltaMapping`` (a leading Greek capital delta) is legal Java
+    - but every annotation-matching regex in this module anchors its
+    first character to the ASCII ``[A-Za-z_$]`` class, a deliberate,
+    declared limit judged NOT worth widening (see ``_ANY_ANNOTATION_
+    RE``'s own comment): unlike a package/type/import name (which this
+    same module already tolerates for free via a plain ``\\w`` charset,
+    proven below), a non-ASCII-lettered ANNOTATION name is exotic to
+    the point of being unobserved in real Java code. This locks the
+    CURRENT, judged behavior - not a claim that it could not be
+    reconsidered."""
+    src = """
+package p;
+
+@ΔeltaMapping("/api/orders")
+public class Controller {
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert _edges(result, "route") == []
+    # The SAME file's package/type handling is unaffected - only the
+    # annotation family declines this identifier shape.
+    assert result.units[0].qualified_name == "p.Controller"
+
+
+def test_class_level_request_mapping_survives_a_non_sealed_modifier():
+    """Proving case (b): the ``non-sealed`` modifier - the hyphen stopped
+    the old forward walk's enumerated-keyword identifier match."""
+    src = """
+package p;
+
+sealed interface Shape permits Controller {}
+
+@RequestMapping("/api/orders")
+@RestController
+public non-sealed class Controller implements Shape {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /api/orders/list"
+    assert result.problems == []
+
+
+def test_cannot_associate_route_annotation_is_suppressed_with_a_problem_not_published():
+    """Fail-safe direction (fix round 10, the class-closer): when
+    association still cannot be established for a class-level-looking
+    route annotation - here, a stray statement terminator breaks the
+    declaration-trivia span backward anchoring requires - the outcome
+    must be suppression + a named problem, NEVER the annotation's own
+    literal value published as if it were a complete route."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders");
+@RestController
+public class Controller {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    # The real method-level route still gets published - uncomposed,
+    # since the broken class-level annotation never registers a prefix -
+    # but the broken annotation's OWN literal is never published as a
+    # route in its own right, and the enclosing class name is untouched.
+    assert [r.target for r in routes] == ["GET /list"]
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "route_annotation_unassociated"
+    assert "could not be confidently associated" in result.problems[0].detail
+
+
+# --------------------------------------- round 10b (reviewer-3 delta on round
+# 10): @interface is a legitimate non-route context - suppress WITHOUT the
+# false problem (the same shape package-info.java/module-info.java already
+# get in worker.py).
+
+def test_route_annotation_on_a_public_annotation_type_declaration_is_silent():
+    """Realistic spelling 1: `public @interface` with modifiers/other
+    stacked annotations in between - exactly how Spring itself defines
+    @GetMapping et al. Suppression is correct (a meta-annotation
+    declaration serves no route of its own); a problem record is not -
+    this is a documented, common idiom, not an unforeseen shape."""
+    src = """
+package p;
+
+@Target(java.lang.annotation.ElementType.METHOD)
+@Retention(java.lang.annotation.RetentionPolicy.RUNTIME)
+@RequestMapping(method = RequestMethod.GET)
+public @interface GetMapping2 {
+    String value() default "";
+}
+"""
+    result = java.parse_java_source("GetMapping2.java", src)
+    assert _edges(result, "route") == []
+    assert result.problems == []
+    assert [u.qualified_name for u in result.units] == ["p.GetMapping2"]
+
+
+def test_route_annotation_on_a_bare_annotation_type_declaration_is_silent():
+    """Realistic spelling 2: a bare `@interface`, no modifier, the route
+    annotation directly stacked with nothing else in between."""
+    src = """
+package p;
+
+@RequestMapping(method = RequestMethod.POST)
+@interface PostMapping2 {
+}
+"""
+    result = java.parse_java_source("PostMapping2.java", src)
+    assert _edges(result, "route") == []
+    assert result.problems == []
+    assert [u.qualified_name for u in result.units] == ["p.PostMapping2"]
+
+
+def test_annotation_type_declaration_still_yields_exactly_one_unit():
+    """Round 10c checkpoint question (does treating @interface as a
+    first-class extracted header ADD a unit to modules.json?): no - an
+    annotation-type declaration was ALREADY extracted as a unit before
+    this round (only its route-annotation ASSOCIATION changed here), and
+    it remains an honest component unit: a genuinely declared type in
+    the file, migration-relevant the same as any other declared type."""
+    src = """
+package p;
+public @interface GetMapping2 {
+    String value() default "";
+}
+"""
+    result = java.parse_java_source("GetMapping2.java", src)
+    assert len(result.units) == 1
+    assert result.units[0].qualified_name == "p.GetMapping2"
+
+
+# ------------------------------------------ round 10c (reviewer-3 delta on
+# round 10b): make @interface a first-class extracted header (span starting
+# at its own `@`) instead of a nearest-following-extracted-header proximity
+# exemption - the exemption had no adjacency requirement, so when the
+# genuinely-offending declaration was itself unmatchable (absent from the
+# extracted list), the old test skipped past it to an UNRELATED @interface
+# later in the file and wrongly exempted it (visibility loss: the fail-safe's
+# problem record went missing exactly where it should have fired).
+
+def test_route_annotation_before_an_unmatchable_header_still_flags_even_with_a_later_interface():
+    """The leak battery, ordering 1: a genuinely-offending route
+    annotation (stacked on a class whose OWN header is unmatchable - an
+    unterminated generic bound our depth-aware scanner cannot close, so
+    it never reaches the extracted types list at all) must still be
+    flagged as unassociated, REGARDLESS of an unrelated @interface
+    declared later in the same file. Round 10b's proximity exemption
+    would have wrongly skipped past the missing header to this later,
+    unrelated @interface and silently exempted it."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+public class Controller<T extends Comparable<T {
+    @GetMapping("/list")
+    void list() {}
+}
+
+@interface Unrelated {
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert _edges(result, "route") == []
+    assert len(result.problems) == 2
+    assert all(p.reason_code == "route_annotation_unassociated" for p in result.problems)
+    assert all("could not be confidently associated" in p.detail for p in result.problems)
+    assert [u.qualified_name for u in result.units] == ["p.Unrelated"]
+
+
+def test_route_annotation_before_an_unmatchable_header_flags_with_a_later_ordinary_interface():
+    """The normal-interface discriminator (unmatchable-header control):
+    an ordinary (non-annotation) `interface` declared later in the file
+    must never be mistaken for an `@interface` and must never suppress
+    the problem - only a REAL annotation-type declaration's own leading
+    `@` does that. Isolates that the problem fires because of the
+    unmatchable header itself, not merely because a later type happens
+    to exist."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+public class Controller<T extends Comparable<T {
+    @GetMapping("/list")
+    void list() {}
+}
+
+interface Unrelated {
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert _edges(result, "route") == []
+    assert len(result.problems) == 2
+    assert all(p.reason_code == "route_annotation_unassociated" for p in result.problems)
+    assert all("could not be confidently associated" in p.detail for p in result.problems)
+    assert [u.qualified_name for u in result.units] == ["p.Unrelated"]
+
+
+def test_two_same_line_unassociated_route_annotations_get_distinct_problem_ids():
+    """FIX ROUND 38 (thirty-second cold read, F3 MINOR, .cr32-coalesce,
+    wrong-data): two unassociated route annotations on the SAME source
+    line (an unterminated generic bound, both annotations stacked before
+    it) used to publish byte-identical details (`detail` names only
+    `{line}`, `qualified_name` is None for this reason code) - the exact
+    same-id-different-content-looking shape round 36's own coalescer
+    exists to merge, except here the two records genuinely ARE distinct
+    facts (two separate annotations, two separate suppressions), so
+    merging them UNDERSTATES problem_count - the coalescer's own
+    justification ("never overstate") inverted. Fixed by adding the
+    annotation's own absolute offset (unique per match) to the detail,
+    the same class of fix round 37's own F1 used for problem_id itself,
+    one level up."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders") @GetMapping("/list") public class Controller<T extends Comparable<T {
+    void list() {}
+}
+
+@interface Unrelated {
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert len(result.problems) == 2
+    assert all(p.reason_code == "route_annotation_unassociated" for p in result.problems)
+    details = [p.detail for p in result.problems]
+    assert len(set(details)) == 2, "two distinct annotations must publish two distinct details"
+
+
+def test_one_unassociated_route_annotation_publishes_exactly_one_problem():
+    """FIX ROUND 38 (F3 MINOR, control): a single unassociated route
+    annotation must still publish exactly one problem - the offset
+    added above is a distinguishing datum for genuine multiplicity,
+    never a reason to fragment or duplicate the ordinary single case."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders") public class Controller<T extends Comparable<T {
+    void list() {}
+}
+
+@interface Unrelated {
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "route_annotation_unassociated"
+
+
+def test_route_value_multi_element_array_publishes_every_element():
+    """MAJOR 1 (sixth cold read, fix round 10): a declared multi-value
+    route array used to publish only its first path, silently dropping
+    every other declared route."""
+    src = """
+package p;
+@RestController
+class Controller {
+    @GetMapping({"/list", "/all"})
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert {r.target for r in routes} == {"GET /list", "GET /all"}
+    http_entry_points = {e.name for e in result.entry_points if e.kind == "http_route"}
+    assert http_entry_points == {"GET /list", "GET /all"}
+
+
+def test_multi_value_class_prefix_composes_every_prefix_element():
+    """MAJOR 1 (sixth cold read, fix round 10): a multi-value class-level
+    prefix composes EVERY element against each method-level route, not
+    just the first."""
+    src = """
+package p;
+
+@RequestMapping({"/a", "/b"})
+@RestController
+public class Controller {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert {r.target for r in routes} == {"GET /a/list", "GET /b/list"}
+
+
+def test_braced_multi_value_method_attribute_does_not_coalesce_two_handlers():
+    """N4 fold-in (sixth cold read, fix round 10): the array-literal
+    shorthand also applies to a @RequestMapping's own ``method = {...}``
+    attribute - the old regex read only the first RequestMethod.X inside
+    it, silently re-coalescing two distinct handlers into one."""
+    src = """
+package p;
+@RestController
+class Controller {
+    @RequestMapping(value = "/thing", method = {RequestMethod.GET, RequestMethod.POST})
+    void thing() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert {r.target for r in routes} == {"GET /thing", "POST /thing"}
+
+
+# --------------------------------------------- round 11 (seventh cold read):
+# the route pipeline has THREE stages - recognize the annotation, associate
+# it, recover its value. Round 10 de-enumerated ASSOCIATION only; recognition
+# was still six enumerated simple names (a fully-qualified route annotation
+# was invisible), and value recovery was literal-only (a constant reference,
+# a concatenation, or a qualified method spelling silently composed against
+# an implicit EMPTY value instead of being treated as unknown).
+
+def test_fully_qualified_class_level_request_mapping_still_composes():
+    """B1 shape 1: a fully-qualified class-level @RequestMapping used to
+    be invisible to recognition entirely - no prefix ever registered,
+    so the method published as a bare fragment (GET /list for a served
+    /api/orders/list)."""
+    src = """
+package p;
+
+@org.springframework.web.bind.annotation.RequestMapping("/api/orders")
+@RestController
+public class Controller {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert [r.target for r in routes] == ["GET /api/orders/list"]
+    assert result.problems == []
+
+
+def test_both_annotations_fully_qualified_still_composes():
+    """B1 shape 5: when BOTH the class-level and method-level annotations
+    are fully qualified, recognition used to see neither - zero entry
+    points, completely silent (no problem either, since an annotation
+    that is never recognized at all never reaches the fail-safe)."""
+    src = """
+package p;
+
+@org.springframework.web.bind.annotation.RequestMapping("/api/orders")
+@RestController
+public class Controller {
+    @org.springframework.web.bind.annotation.GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert [r.target for r in routes] == ["GET /api/orders/list"]
+    assert result.problems == []
+
+
+def test_a_fake_explicitly_qualified_route_annotation_never_fabricates_a_route():
+    """MICRO-NOD 50b (F4 MAJOR, cross-vendor read, wrong-data, reproduced
+    verbatim): recognition used to match a fully-qualified annotation on
+    its LAST SEGMENT alone, regardless of what package preceded it - a
+    fixture-local, user-defined @custom.RestController/@custom.
+    GetMapping (zero Spring anywhere) fabricated a confident GET /fake
+    route, evidence_class declared, on code that never used the
+    framework at all. An explicitly-qualified annotation must now name
+    one of that annotation's own REAL package prefixes or it does not
+    match at all."""
+    src = """
+package app;
+
+@custom.RestController
+public class FakeController {
+    @custom.GetMapping("/fake")
+    public void handler() {}
+}
+"""
+    result = java.parse_java_source("FakeController.java", src)
+    assert _edges(result, "route") == []
+
+
+def test_a_fake_explicitly_qualified_web_servlet_never_fabricates_a_route():
+    """MICRO-NOD 50b (F4 MAJOR, swept to the servlet family): the same
+    fake-package shape for @WebServlet - never a real javax.servlet.
+    annotation/jakarta.servlet.annotation prefix, so never a servlet
+    route either."""
+    src = """
+package app;
+
+@custom.WebServlet("/fake")
+public class FakeServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("FakeServlet.java", src)
+    assert _edges(result, "route") == []
+
+
+def test_a_genuinely_qualified_route_annotation_still_composes():
+    """MICRO-NOD 50b (F4 MAJOR, genuine-Spring control): the REAL
+    package prefix must still be recognized exactly as before - only a
+    WRONG prefix is newly rejected, never a real one."""
+    src = """
+package app;
+
+@org.springframework.web.bind.annotation.RestController
+public class RealController {
+    @org.springframework.web.bind.annotation.GetMapping("/real")
+    public void handler() {}
+}
+"""
+    result = java.parse_java_source("RealController.java", src)
+    assert [r.target for r in _edges(result, "route")] == ["GET /real"]
+
+
+def test_a_bare_route_annotation_with_a_real_import_still_composes():
+    """MICRO-NOD 50b (F4 MAJOR, simple-name-with-import control): a
+    bare (unqualified) annotation backed by a real Spring import is
+    unaffected either way - recognized exactly as before this round."""
+    src = """
+package app;
+
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.GetMapping;
+
+@RestController
+public class RealController {
+    @GetMapping("/real")
+    public void handler() {}
+}
+"""
+    result = java.parse_java_source("RealController.java", src)
+    assert [r.target for r in _edges(result, "route")] == ["GET /real"]
+
+
+def test_a_bare_route_annotation_with_no_import_at_all_is_a_judged_limit_still_recognized():
+    """MICRO-NOD 50b (F4, simple-name-without-import JUDGED shape - a
+    declared decision, not a bug): requiring import/scope corroboration
+    for every BARE annotation match site-wide would suppress this
+    producer's own dominant, longstanding coarse-S1-evidence
+    recognition shape (this module already trusts a bare name the
+    identical way everywhere else) - real, compiling Spring/JAX-RS code
+    always carries the import or a wildcard import (the annotation is
+    never in the same package as user code), so the false-positive risk
+    a bare, import-free match poses in PRACTICE is vanishingly small,
+    unlike the EXPLICITLY-mis-qualified case this round actually fixes.
+    Locks the CURRENT, judged behavior - not a claim it could not be
+    reconsidered with real corroboration data in a future round (see
+    _annotation_qualifier_is_recognized's own NAMED LIMIT)."""
+    src = """
+package app;
+
+@RestController
+public class RealController {
+    @GetMapping("/real")
+    public void handler() {}
+}
+"""
+    result = java.parse_java_source("RealController.java", src)
+    assert [r.target for r in _edges(result, "route")] == ["GET /real"]
+
+
+def test_class_level_constant_reference_value_is_unrecoverable_not_an_empty_prefix():
+    """B1 shape 2: a class-level route annotation whose value is a
+    CONSTANT REFERENCE (not a literal) used to silently register NO
+    prefix at all (indistinguishable from a genuinely valueless
+    annotation) - the method then published as a bare, uncomposed
+    fragment. The fail-safe must suppress the whole class's routes and
+    name why, not guess an empty prefix."""
+    src = """
+package p;
+
+@RequestMapping(ApiPaths.ORDERS)
+public class Controller {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert _edges(result, "route") == []
+    # FIX ROUND 20 (sixteenth cold read, M3 MAJOR, wrong-data): the
+    # class-level annotation's OWN unrecoverable value now also records
+    # its own problem (attributed to the class), alongside the existing
+    # method-level fail-safe that fires because the class's own prefix
+    # is unrecoverable - two DISTINCT facts about the same class, both
+    # visible, never just the method-level half.
+    assert len(result.problems) == 2
+    assert all(p.reason_code == "route_value_unrecoverable" for p in result.problems)
+    assert any(
+        "could not be recovered as a literal" in p.detail and p.qualified_name == "p.Controller"
+        for p in result.problems
+    )
+    # FIX ROUND 35 (twenty-ninth cold read, F10 LOW, wrong-data): the
+    # METHOD-level fail-safe (the "incomplete fragment" half, fired
+    # because the class's own prefix is unrecoverable) used to carry
+    # qualified_name=None even though the owning class is known - both
+    # problems about this same class must now attribute it.
+    assert all(p.qualified_name == "p.Controller" for p in result.problems)
+
+
+def test_class_level_string_concatenation_is_unrecoverable_not_a_fabricated_fragment():
+    """B1 shape 3: a class-level value built from STRING CONCATENATION
+    used to silently recover only its FIRST literal segment (the parser
+    has no concept of `+` at all) - "/api" + "/orders" registered just
+    "/api" as the prefix, composing with the method's own "/list" into
+    "GET /api/list", a path the application never actually serves. A
+    fabrication worse than a bare fragment - must be unrecoverable, not
+    a truncated guess."""
+    src = """
+package p;
+
+@RequestMapping("/api" + "/orders")
+public class Controller {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert _edges(result, "route") == []
+    # FIX ROUND 20 (sixteenth cold read, M3 MAJOR, wrong-data): same as
+    # the constant-reference shape above - the class-level annotation's
+    # own unrecoverable value now records its own problem too.
+    assert len(result.problems) == 2
+    assert all(p.reason_code == "route_value_unrecoverable" for p in result.problems)
+
+
+def test_method_level_constant_reference_value_is_unrecoverable_not_the_bare_class_prefix():
+    """B1 shape 4: a METHOD-level route annotation whose own value is a
+    constant reference used to fall into the "genuinely valueless"
+    composition branch (an empty method value), publishing the CLASS's
+    own prefix alone as if it were the method's complete route - this is
+    the exact blind spot a "no value" check cannot see: can't-read and
+    doesn't-exist must never collapse to the same outcome."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+public class Controller {
+    @GetMapping(SomeConstants.LIST)
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert _edges(result, "route") == []
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "route_value_unrecoverable"
+    assert "could not be recovered as a literal" in result.problems[0].detail
+    # FIX ROUND 35 (twenty-ninth cold read, F10 LOW, wrong-data): this
+    # JAX-RS/Spring method-level fail-safe now attributes the owning
+    # type too, same as its @WebServlet twin already did - a consumer
+    # used to see qualified_name=None here even though the enclosing
+    # class is known.
+    assert result.problems[0].qualified_name == "p.Controller"
+
+
+def test_route_array_with_one_unrecoverable_element_is_unrecoverable_not_truncated():
+    """The same silent-truncation risk as string concatenation, but for
+    the array-literal shorthand: a mix of a real literal and a constant
+    reference must never publish just the literal element(s) as if the
+    array held only those."""
+    src = """
+package p;
+class Controller {
+    @GetMapping({"/list", SOME_CONST})
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert _edges(result, "route") == []
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "route_value_unrecoverable"
+    # FIX ROUND 35 (F10 LOW, wrong-data): same owning-type attribution.
+    assert result.problems[0].qualified_name == "p.Controller"
+
+
+def test_genuinely_valueless_method_annotation_still_composes_the_prefix_alone():
+    """The blind spot the reviewer named: a bare @GetMapping with
+    genuinely NO value at all is legitimate (Spring's own "serves the
+    prefix alone" semantics) and must still compose normally - never
+    conflated with the can't-read case above, which looks similar
+    (both end up "no method-level literal") but means something
+    completely different."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+@RestController
+public class Controller {
+    @GetMapping
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert [r.target for r in routes] == ["GET /api/orders"]
+    assert result.problems == []
+
+
+def test_static_imported_bare_method_constant_does_not_coalesce_two_handlers():
+    """N1: a static-imported bare enum constant (`method = GET`, no
+    `RequestMethod.` qualifier present in the source at all) used to go
+    unrecognized, silently coalescing with a differently-qualified
+    sibling into one identical, method-less target."""
+    src = """
+package p;
+@RestController
+class Controller {
+    @RequestMapping(value = "/thing", method = GET)
+    void getThing() {}
+    @RequestMapping(value = "/thing", method = POST)
+    void postThing() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert {r.target for r in routes} == {"GET /thing", "POST /thing"}
+
+
+def test_fully_qualified_method_constant_does_not_coalesce_two_handlers():
+    """N1: a fully-qualified `method = org...RequestMethod.X` spelling
+    used to go unrecognized the same way (the old regex required the
+    literal substring "RequestMethod." positioned immediately after
+    `method =`, which a package-qualified spelling never satisfies)."""
+    src = """
+package p;
+@RestController
+class Controller {
+    @RequestMapping(value = "/thing", method = org.springframework.web.bind.annotation.RequestMethod.GET)
+    void getThing() {}
+    @RequestMapping(value = "/thing", method = RequestMethod.POST)
+    void postThing() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert {r.target for r in routes} == {"GET /thing", "POST /thing"}
+
+
+def test_non_enum_method_value_never_publishes_as_an_invented_http_verb():
+    """FIX ROUND 13 (ninth cold read, CR9-4 MINOR, wrong-data): a
+    non-enum method= value (a random constant, not one of Spring's
+    closed RequestMethod constants) used to publish VERBATIM as if it
+    were a real HTTP verb - method=HttpConstants.READ_METHOD yielded
+    entry point "READ_METHOD /api/orders", a verb this tool invented.
+    The invalid token is dropped, falling back to the bare,
+    method-unknown path - the same legitimate state a plain
+    @RequestMapping with no method attribute already publishes, never a
+    suppressed route (the path itself is genuine, correctly-recovered
+    evidence)."""
+    src = """
+package p;
+@RestController
+class Controller {
+    @RequestMapping(value = "/api/orders", method = HttpConstants.READ_METHOD)
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert [r.target for r in routes] == ["/api/orders"]
+    assert result.problems == []
+
+
+def test_request_method_values_array_index_is_also_validated():
+    """CR9-4: the same non-enum discipline applies to EVERY recovered
+    token in a multi-value method={...} attribute, not just a bare
+    single value."""
+    src = """
+package p;
+@RestController
+class Controller {
+    @RequestMapping(value = "/api/orders", method = RequestMethod.values()[0])
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    # Whatever bare token(s) the recovery regex pulls out of this
+    # non-constant expression, none is a real RequestMethod constant -
+    # all dropped, same bare-path fallback as the single-value case.
+    assert [r.target for r in routes] == ["/api/orders"]
+    assert result.problems == []
+
+
+# ----------------------------------------------------------- CR9-3: produces/consumes-only mapping
+
+def test_get_mapping_with_only_a_produces_attribute_still_composes_the_prefix():
+    """FIX ROUND 13 (ninth cold read, CR9-3 MAJOR, completeness):
+    @GetMapping(produces="application/json") with NO value/path
+    attribute at all is ordinary Spring - it serves the class's own
+    prefix, exactly like a bare @GetMapping. The mere PRESENCE of an
+    unrelated named attribute must never flip this into the
+    unrecoverable-value case (there is no value expression here to fail
+    to recover in the first place)."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+@RestController
+public class Controller {
+    @GetMapping(produces = "application/json")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert [r.target for r in routes] == ["GET /api/orders"]
+    assert result.problems == []
+
+
+def test_post_mapping_with_consumes_and_produces_still_composes_the_prefix():
+    """CR9-3: more than one unrelated named attribute ahead of a
+    genuinely absent value/path must not change the outcome."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+@RestController
+public class Controller {
+    @PostMapping(consumes = "application/json", produces = "application/json")
+    void create() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert [r.target for r in routes] == ["POST /api/orders"]
+    assert result.problems == []
+
+
+def test_get_mapping_produces_only_alongside_a_genuinely_unrecoverable_value_stays_suppressed():
+    """CR9-3 must not overcorrect: an attribute that IS an attempted
+    value/path but unreadable (a constant reference) must still suppress
+    the route as unrecoverable - only a DIFFERENT-named-attribute-only
+    shape is legitimately valueless."""
+    src = """
+package p;
+class Controller {
+    @GetMapping(value = SomeConstants.LIST, produces = "application/json")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert _edges(result, "route") == []
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "route_value_unrecoverable"
+
+
+# ----------------------------------------------------------- entry points
+
+def test_main_method_is_a_cli_main_entry_point():
+    src = """
+package p;
+class App {
+    public static void main(String[] args) {
+    }
+}
+"""
+    result = java.parse_java_source("App.java", src)
+    mains = [e for e in result.entry_points if e.kind == "cli_main"]
+    assert len(mains) == 1
+    assert mains[0].qualified_name == "p.App"
+
+
+def test_no_main_method_means_no_cli_main_entry_point():
+    src = "package p;\nclass Widget {\n}\n"
+    result = java.parse_java_source("Widget.java", src)
+    assert [e for e in result.entry_points if e.kind == "cli_main"] == []
+
+
+#: FIX ROUND 13 (ninth cold read, CR9-2 MAJOR): the reviewer's own 9-row
+#: legal-spelling matrix for `public static void main` - 3 rows the old
+#: single-token-sequence regex already matched (anchors, must stay
+#: green), 6 it silently missed (must now be detected). Every row is a
+#: real, compiler-legal Java main signature.
+_MAIN_SIGNATURE_MATRIX = [
+    ("baseline", "public static void main(String[] args)"),
+    ("varargs", "public static void main(String... args)"),
+    ("modifier order swapped", "static public void main(String[] args)"),
+    ("C-style array after the param name", "public static void main(String args[])"),
+    ("final parameter", "public static void main(final String[] args)"),
+    ("fully-qualified java.lang.String", "public static void main(java.lang.String[] args)"),
+    ("no space before the array brackets", "public static void main(String []args)"),
+    ("extra synchronized modifier", "public synchronized static void main(String[] args)"),
+    ("synchronized between static and void", "public static synchronized void main(String[] args)"),
+    # FIX ROUND 13b (reviewer-3's B1 BLOCKER on round 13): the round-13
+    # "total for the legal grammar" claim was false - these five legal
+    # spellings were still silently missed.
+    ("annotation before the modifiers", "@Deprecated\n    public static void main(String[] args)"),
+    ("annotation interleaved between modifiers", "public @Deprecated static void main(String[] args)"),
+    ("type-parameter section (JLS 8.4, never actually generic in valid "
+     "use, but the grammar allows the token)",
+     "public static <T> void main(String[] args)"),
+    ("JSR-308 annotation before the parameter type", "public static void main(@NotNull String[] args)"),
+    ("JSR-308 annotation on the array itself", "public static void main(String @NotNull [] args)"),
+]
+
+
+@pytest.mark.parametrize("shape_name,signature", _MAIN_SIGNATURE_MATRIX)
+def test_main_signature_matrix_every_legal_spelling_is_detected(shape_name, signature):
+    src = f"package p;\nclass App {{\n    {signature} {{\n    }}\n}}\n"
+    result = java.parse_java_source("App.java", src)
+    mains = [e for e in result.entry_points if e.kind == "cli_main"]
+    assert len(mains) == 1, f"shape not detected: {shape_name} ({signature!r})"
+    assert mains[0].qualified_name == "p.App"
+    assert result.problems == []
+
+
+def test_main_without_both_public_and_static_is_not_a_cli_main_entry_point():
+    """De-enumerating to "public and static, any order, any other
+    modifiers alongside" must not overshoot into treating ANY modifier
+    combination as main - a package-private or instance `main` (missing
+    `public`, or missing `static`) is not a JVM entry point at all. This
+    shape IS fully recognized by the strict matcher (just confidently
+    rejected for a missing modifier), so it must never publish the
+    round-13b class-closer's "unrecognized" problem either - a
+    structurally-understood, JLS-certain negative, not an unparseable one."""
+    for signature in (
+        "static void main(String[] args)",         # missing public
+        "public void main(String[] args)",          # missing static
+        "void main(String[] args)",                  # missing both
+    ):
+        src = f"package p;\nclass App {{\n    {signature} {{\n    }}\n}}\n"
+        result = java.parse_java_source("App.java", src)
+        assert [e for e in result.entry_points if e.kind == "cli_main"] == [], signature
+        assert result.problems == [], signature
+
+
+def test_unrecognized_main_like_shape_degrades_to_a_named_problem_not_silence():
+    """FIX ROUND 13b (reviewer-3's B1 class-closer): a method literally
+    named main, returning void, whose overall shape the strict matcher
+    could not recognize AT ALL must never silently vanish into a
+    confident "no entry point" - it degrades to a named, visible
+    problem instead, since it MIGHT be a legal spelling this adapter
+    still does not cover. A bare, non-array String parameter is
+    String-TYPED (so round 13c's JLS-certain wrong-TYPE check does not
+    apply) but matches no recognized array/varargs form either - the
+    genuine spelling-variant uncertainty this class-closer exists for,
+    not a JLS-certain wrong-arity/wrong-type shape."""
+    src = """
+package p;
+class App {
+    public static void main(String args) {
+    }
+}
+"""
+    result = java.parse_java_source("App.java", src)
+    assert [e for e in result.entry_points if e.kind == "cli_main"] == []
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "cli_main_unrecognized"
+    assert "did not match" in result.problems[0].detail
+    assert result.problems[0].qualified_name == "p.App"
+
+
+def test_jls_certain_wrong_signature_shapes_are_silent_never_unrecognized():
+    """FIX ROUND 13c (reviewer-3's MILDER ask): main(int[]), main(), and
+    main(String[], int) are JLS-CERTAIN negatives - the JVM entry-point
+    signature is EXACTLY one String[]/varargs parameter, so a wrong
+    arity or a plainly-wrong base type can never be the entry point
+    regardless of modifiers. These must classify with the private/non-
+    static certain-negative branch (silent, no problem) - "unknown" is
+    reserved for shapes this adapter genuinely could not classify."""
+    for signature in (
+        "public static void main(int[] args)",           # wrong base type
+        "public static void main()",                       # wrong arity (zero)
+        "public static void main(String[] args, int extra)",  # wrong arity (two)
+    ):
+        src = f"package p;\nclass App {{\n    {signature} {{\n    }}\n}}\n"
+        result = java.parse_java_source("App.java", src)
+        assert [e for e in result.entry_points if e.kind == "cli_main"] == [], signature
+        assert result.problems == [], signature
+
+
+def test_second_top_level_type_with_its_own_main_gets_its_own_cli_main_entry_point():
+    src = """
+package p;
+class First {
+    public static void main(String[] args) {
+    }
+}
+class Second {
+    public static void main(String[] args) {
+    }
+}
+"""
+    result = java.parse_java_source("Multi.java", src)
+    mains = {e.qualified_name for e in result.entry_points if e.kind == "cli_main"}
+    # Note 10 (second cold read, fix round 4): a single re.search kept only
+    # the FIRST main method in the whole file - a second top-level type's
+    # own main was silently dropped as an entry point entirely.
+    assert mains == {"p.First", "p.Second"}
+
+
+def test_unrecognized_main_problem_is_attributed_only_to_its_own_enclosing_type():
+    """FIX ROUND 13c (reviewer-3's part 1 on round 13b): a
+    cli_main_unrecognized problem used to be a plain file-level record
+    with no owning type at all - broadcast (by modules_artifact.py's
+    generic wiring) onto EVERY declared type in the file. In a 3-class
+    file where only the THIRD has a main-like method, Alpha and Beta
+    must carry no attribution at all; only Gamma does."""
+    src = """
+package p;
+class Alpha {
+}
+class Beta {
+}
+class Gamma {
+    public static void main(String args) {
+    }
+}
+"""
+    result = java.parse_java_source("Multi.java", src)
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "cli_main_unrecognized"
+    assert result.problems[0].qualified_name == "p.Gamma"
+
+
+# ----------------------------------------------------------- pom.xml (build)
+
+def test_parse_maven_pom_extracts_dependency_build_edges():
+    pom = """<project>
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework</groupId>
+      <artifactId>spring-core</artifactId>
+      <version>5.0.0</version>
+    </dependency>
+    <dependency>
+      <groupId>junit</groupId>
+      <artifactId>junit</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.springframework:spring-core", "junit:junit"}
+    assert profile_scoped_count == 0
+    assert all(e.relation == "build" for e in edges)
+    assert all(e.evidence_class == "declared" for e in edges)
+    assert all(e.phase == "build" and e.optional is False for e in edges)
+
+
+def test_parse_maven_pom_reads_optional_and_test_scope_instead_of_asserting_defaults():
+    """M3 (fourth cold read, fix round 6): <optional>/<scope> were read
+    past and discarded - every edge asserted optional:false, phase:build
+    as a positive fact regardless of what the pom actually declared.
+    Reproduced pre-fix: an optional=true, scope=test dependency still
+    published optional:false, phase:build."""
+    pom = """<project>
+  <dependencies>
+    <dependency>
+      <groupId>org.mockito</groupId>
+      <artifactId>mockito-core</artifactId>
+      <scope>test</scope>
+      <optional>true</optional>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework</groupId>
+      <artifactId>spring-core</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    edges = {e.target: e for e in java.parse_maven_pom("pom.xml", pom)[1]}
+    mockito = edges["org.mockito:mockito-core"]
+    assert mockito.optional is True
+    assert mockito.phase == "test"
+    spring = edges["org.springframework:spring-core"]
+    assert spring.optional is False
+    assert spring.phase == "build"
+
+
+def test_parse_maven_pom_ignores_a_commented_out_dependency():
+    """M-1 (second cold read, fix round 4): a dependency block inside an
+    XML comment must not publish as evidence_class=declared alongside a
+    live one - commented-out dependencies are common in legacy poms."""
+    pom = """<project>
+  <dependencies>
+    <!--
+    <dependency>
+      <groupId>commented</groupId>
+      <artifactId>out-dependency</artifactId>
+    </dependency>
+    -->
+    <dependency>
+      <groupId>org.springframework</groupId>
+      <artifactId>spring-core</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.springframework:spring-core"}
+    assert profile_scoped_count == 0
+
+
+def test_parse_maven_pom_excludes_dependency_management_entries():
+    """M1 (seventh cold read MAJOR, wrong-data): reviewer's proving test -
+    one dependencyManagement entry (a parent/BOM pom can carry dozens;
+    these are NOT dependencies of this module) plus one real entry must
+    publish exactly one edge, naming the real one."""
+    pom = """<project>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.acme</groupId>
+        <artifactId>bom-managed-dep</artifactId>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>real-dep</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"com.acme:real-dep"}
+    # M1 (round 11b): managed-scoped exclusion is cost-free (never the
+    # module's own graph) - never counted.
+    assert profile_scoped_count == 0
+
+
+def test_parse_maven_pom_counts_profile_scoped_dependencies():
+    """M1: a <profile>'s own dependencies are conditionally active, not
+    unconditional direct dependencies of the module - excluded from the
+    edges (named decision), never published undifferentiated alongside
+    real ones.
+
+    Round 11c (reviewer-3 delta on round 11b, VEHICLE CHANGE): a profile
+    CAN be active by default, so its dependency is a potentially live
+    one - the exclusion must be visible, but as a named exclusion COUNT
+    (scan.json's existing idiom), never a run-degrading problem the way
+    round 11b's own fix made it (Maven profiles are common enough that a
+    large share of real repos would scan degraded permanently over a
+    DECLARED, deliberate scope limitation)."""
+    pom = """<project>
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>real-dep</artifactId>
+    </dependency>
+  </dependencies>
+  <profiles>
+    <profile>
+      <dependencies>
+        <dependency>
+          <groupId>com.acme</groupId>
+          <artifactId>profile-dep</artifactId>
+        </dependency>
+      </dependencies>
+    </profile>
+  </profiles>
+</project>
+"""
+    _units, edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"com.acme:real-dep"}
+    assert profile_scoped_count == 1
+
+
+def test_parse_maven_pom_with_only_managed_and_plugin_scoped_dependencies_is_silent():
+    """Round 11b/11c: the reviewer's own second test shape - managed and
+    plugin exclusion is judged cost-free (never the module's own
+    dependency graph), so a pom containing ONLY those two (no
+    profile-scoped dependency at all) must yield no count."""
+    pom = """<project>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.acme</groupId>
+        <artifactId>bom-managed-dep</artifactId>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+  <build>
+    <plugins>
+      <plugin>
+        <dependencies>
+          <dependency>
+            <groupId>com.acme</groupId>
+            <artifactId>plugin-dep</artifactId>
+          </dependency>
+        </dependencies>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+"""
+    _units, edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert edges == []
+    assert profile_scoped_count == 0
+
+
+def test_parse_maven_pom_excludes_plugin_scoped_dependencies():
+    """M1: a <plugin>'s own dependencies are the BUILD TOOL's, not the
+    module's - excluded (named decision), never published
+    undifferentiated alongside real ones."""
+    pom = """<project>
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>real-dep</artifactId>
+    </dependency>
+  </dependencies>
+  <build>
+    <plugins>
+      <plugin>
+        <dependencies>
+          <dependency>
+            <groupId>com.acme</groupId>
+            <artifactId>plugin-dep</artifactId>
+          </dependency>
+        </dependencies>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+"""
+    _units, edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"com.acme:real-dep"}
+    # M1 (round 11b): plugin-scoped exclusion is cost-free (the build
+    # tool's own dependency, never the module's) - never counted.
+    assert profile_scoped_count == 0
+
+
+def test_parse_maven_pom_dependency_with_exclusions_before_coordinates_still_extracts_its_own_identity():
+    """MICRO-ROUND 49 (forty-third cold read, B1 BLOCKER, wrong-data):
+    a <dependency>'s own <exclusions><exclusion><groupId>/<artifactId>
+    (one level deeper, same tag names) used to win a bare, unscoped
+    .search over the whole block body - Maven's own model is xs:all
+    (element order is never authoritative), so <exclusions> is legally
+    allowed to come BEFORE the dependency's own coordinate elements, and
+    that ordering made the EXCLUSION's own coordinate publish as this
+    dependency's own identity: the real spring-core edge vanished
+    entirely, replaced by a fabricated internal edge to org.slf4j:
+    slf4j-api. Reproduced pre-fix exactly as measured."""
+    pom = """<project>
+  <dependencies>
+    <dependency>
+      <exclusions>
+        <exclusion>
+          <groupId>org.slf4j</groupId>
+          <artifactId>slf4j-api</artifactId>
+        </exclusion>
+      </exclusions>
+      <groupId>org.springframework</groupId>
+      <artifactId>spring-core</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.springframework:spring-core"}
+
+
+def test_parse_maven_pom_dependency_with_exclusions_after_coordinates_control():
+    """Control for the fix above: the ORDINARY ordering (coordinates
+    first, exclusions last) already worked before this round and must
+    keep working identically - the fix must not narrow this case."""
+    pom = """<project>
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework</groupId>
+      <artifactId>spring-core</artifactId>
+      <exclusions>
+        <exclusion>
+          <groupId>org.slf4j</groupId>
+          <artifactId>slf4j-api</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.springframework:spring-core"}
+
+
+def test_parse_maven_pom_dependency_with_multiple_exclusions_before_coordinates():
+    """Order-permutation control: more than one <exclusion> nested
+    before the dependency's own coordinates - the fix must skip the
+    WHOLE <exclusions> subtree, not merely its first child."""
+    pom = """<project>
+  <dependencies>
+    <dependency>
+      <exclusions>
+        <exclusion>
+          <groupId>org.slf4j</groupId>
+          <artifactId>slf4j-api</artifactId>
+        </exclusion>
+        <exclusion>
+          <groupId>commons-logging</groupId>
+          <artifactId>commons-logging</artifactId>
+        </exclusion>
+      </exclusions>
+      <groupId>org.springframework</groupId>
+      <artifactId>spring-core</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.springframework:spring-core"}
+
+
+# ----------------------------------------------------------- @WebServlet / JAX-RS (route)
+
+def test_web_servlet_annotation_publishes_its_own_url_patterns_as_routes():
+    """FIX ROUND 17 (thirteenth cold read, CR13-3 MAJOR, wrong-data, part
+    (a)): @WebServlet published NO entry point and NO problem at all -
+    the enumerated-recognizer class, entry-point edition. Unlike
+    @RequestMapping, it is not composable - the annotation decorates the
+    class directly and its own urlPatterns ARE the complete route(s)."""
+    src = """
+package p;
+
+@WebServlet(urlPatterns = {"/api/*", "/legacy/*"})
+public class DispatcherServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("DispatcherServlet.java", src)
+    routes = _edges(result, "route")
+    assert sorted(r.target for r in routes) == ["/api/*", "/legacy/*"]
+    http_entry_points = [e for e in result.entry_points if e.kind == "http_route"]
+    assert sorted(e.name for e in http_entry_points) == ["/api/*", "/legacy/*"]
+    assert all(e.qualified_name == "p.DispatcherServlet" for e in http_entry_points)
+
+
+def test_web_servlet_annotation_is_suppressed_when_metadata_complete():
+    """MICRO-ROUND 49 (forty-third cold read, M2 MAJOR, wrong-data):
+    Servlet 3.0 s8.1 - once the effective web.xml declares metadata-
+    complete="true", the container MUST NOT scan @WebServlet at all.
+    Reproduced pre-fix exactly as measured: this annotation's own
+    urlPatterns published as a live route/entry point regardless,
+    complete/0, on a half-migrated legacy app (a frozen, metadata-
+    complete descriptor plus still-present but now-inert annotations -
+    this producer's own target scenario)."""
+    src = """
+package p;
+
+@WebServlet(urlPatterns = {"/api/*"})
+public class DispatcherServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("DispatcherServlet.java", src, metadata_complete=True)
+    assert _edges(result, "route") == []
+    assert [e for e in result.entry_points if e.kind == "http_route"] == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert "metadata-complete" in problem.detail
+    assert problem.qualified_name == "p.DispatcherServlet"
+
+
+def test_web_servlet_annotation_control_metadata_complete_absent():
+    """Control for the fix above: metadata_complete=False (the default,
+    ordinary case - the attribute absent or false) must keep publishing
+    the route exactly as before this round."""
+    src = """
+package p;
+
+@WebServlet(urlPatterns = {"/api/*"})
+public class DispatcherServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("DispatcherServlet.java", src, metadata_complete=False)
+    assert [r.target for r in _edges(result, "route")] == ["/api/*"]
+
+
+def test_web_filter_annotation_is_suppressed_when_metadata_complete():
+    """MICRO-ROUND 49 (M2's own @WebFilter twin): the identical Servlet
+    3.0 s8.1 rule applies to @WebFilter unchanged."""
+    src = """
+package p;
+
+@WebFilter(urlPatterns = {"/api/*"})
+public class AuthFilter implements Filter {
+}
+"""
+    result = java.parse_java_source("AuthFilter.java", src, metadata_complete=True)
+    assert _edges(result, "route") == []
+    assert [e for e in result.entry_points if e.kind == "http_filter"] == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert "metadata-complete" in problem.detail
+
+
+def test_spring_route_annotation_is_never_suppressed_by_metadata_complete():
+    """MICRO-ROUND 49 (M2's own scoping control): metadata-complete is a
+    SERVLET-annotation-family concept (Servlet 3.0 s8.1 names exactly
+    @WebServlet/@WebFilter/@WebListener) - Spring's own @RequestMapping
+    family is scanned by Spring itself, never the servlet container, so
+    it is entirely unaffected regardless of metadata-complete."""
+    src = """
+package p;
+
+@RestController
+public class UserController {
+  @GetMapping("/users") void list() {}
+}
+"""
+    result = java.parse_java_source("UserController.java", src, metadata_complete=True)
+    assert [r.target for r in _edges(result, "route")] == ["GET /users"]
+
+
+def test_jax_rs_route_annotation_is_never_suppressed_by_metadata_complete():
+    """MICRO-ROUND 49 (M2's own scoping control, JAX-RS twin): JAX-RS's
+    own @Path/@GET etc. are scanned by the JAX-RS runtime, never the
+    servlet container's own annotation scan - unaffected by metadata-
+    complete for the identical reason as the Spring control above."""
+    src = """
+package p;
+
+@Path("/users")
+public class UserResource {
+  @GET
+  @Path("/list")
+  public String list() { return ""; }
+}
+"""
+    result = java.parse_java_source("UserResource.java", src, metadata_complete=True)
+    assert len(_edges(result, "route")) == 1
+
+
+def test_web_servlet_name_attribute_is_recorded_for_the_cross_file_join():
+    """MICRO-ROUND 49 (forty-third cold read, M3 MAJOR, wrong-data): a
+    @WebServlet's own `name=` attribute, published on JavaFileResult
+    for worker.py's own cross-file join into a web.xml's declared_names
+    registry (Servlet spec s8.2.3 - one shared namespace). Includes the
+    startup-only shape (name declared, no url mapping at all) - the
+    name is still real and joinable even though this file alone
+    publishes no route for it."""
+    src = """
+package p;
+
+@WebServlet(name = "Checkout", urlPatterns = {"/checkout"})
+public class CheckoutServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("CheckoutServlet.java", src)
+    assert result.web_servlet_declared_names == {"Checkout": "p.CheckoutServlet"}
+
+
+def test_web_servlet_name_only_startup_shape_still_records_the_name():
+    src = """
+package p;
+
+@WebServlet(name = "InitOnly")
+public class InitServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("InitServlet.java", src)
+    assert result.web_servlet_declared_names == {"InitOnly": "p.InitServlet"}
+
+
+def test_web_filter_name_attribute_is_recorded_for_the_cross_file_join():
+    """MICRO-ROUND 49 (M3's own @WebFilter twin).
+
+    MICRO-ROUND 50 (Cluster 1, B3 BLOCKER, wrong-data): this fixture used
+    to spell ``name = "Auth"`` - @WebFilter has NO ``name`` attribute at
+    all (spec: ``filterName``) - so this test only ever exercised
+    already-non-compiling Java, and the false-positive match it measured
+    (round 49's own regex read ``name=`` as an ordinary ATTRIBUTE, never
+    checking it was one @WebFilter actually declares) silently never
+    fired on any REAL @WebFilter, which spells the SAME concept
+    ``filterName=`` instead. Fixed to the real, compiling attribute
+    name - reviewer-3 verified with javac 1.8 that ``name = "Auth"`` on
+    a real @WebFilter is a compile error (no such element)."""
+    src = """
+package p;
+
+@WebFilter(filterName = "Auth", urlPatterns = {"/secure/*"})
+public class AuthFilter implements Filter {
+}
+"""
+    result = java.parse_java_source("AuthFilter.java", src)
+    assert result.web_filter_declared_names == {"Auth": "p.AuthFilter"}
+
+
+def test_web_filter_name_attribute_is_never_read_only_filtername_is():
+    """MICRO-ROUND 50 (Cluster 1, B3 BLOCKER control): @WebFilter has no
+    ``name`` attribute at all (spec: ``filterName``) - this reads as an
+    ordinary, lexically-inert identifier, never a registration name, and
+    must never populate the cross-file join registry. This exact shape
+    (``name = "Auth"`` on a real @WebFilter) is a compile error under a
+    real javac - the fixture exists only to prove this producer's own
+    reading, never to claim it is legal Java."""
+    src = """
+package p;
+
+@WebFilter(name = "Auth", urlPatterns = {"/secure/*"})
+public class AuthFilter implements Filter {
+}
+"""
+    result = java.parse_java_source("AuthFilter.java", src)
+    assert result.web_filter_declared_names == {}
+
+
+def test_web_servlet_without_a_name_attribute_records_nothing():
+    """Control: the ordinary, name-absent case must never fabricate an
+    entry in the cross-file join registry."""
+    src = """
+package p;
+
+@WebServlet(urlPatterns = {"/checkout"})
+public class CheckoutServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("CheckoutServlet.java", src)
+    assert result.web_servlet_declared_names == {}
+
+
+def test_web_servlet_name_is_not_recorded_when_metadata_complete():
+    """MICRO-ROUND 49 (M2/M3 interaction): once the effective descriptor
+    sets metadata-complete=true, the container does not scan THIS
+    annotation at all - its own name= is exactly as inert as its own
+    urlPatterns=, so it must not join the cross-file registry either."""
+    src = """
+package p;
+
+@WebServlet(name = "Checkout", urlPatterns = {"/checkout"})
+public class CheckoutServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("CheckoutServlet.java", src, metadata_complete=True)
+    assert result.web_servlet_declared_names == {}
+
+
+def test_web_servlet_annotation_recovers_a_bare_positional_value():
+    """@WebServlet("/api/*") - the bare positional form, no named
+    urlPatterns/value attribute at all - still recovered via the
+    existing positional-literal fallback."""
+    src = """
+package p;
+
+@WebServlet("/api/*")
+public class DispatcherServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("DispatcherServlet.java", src)
+    routes = _edges(result, "route")
+    assert [r.target for r in routes] == ["/api/*"]
+
+
+def test_web_servlet_with_both_value_and_url_patterns_records_a_conflict_problem():
+    """MICRO-ROUND 49 (forty-third cold read, m2 MINOR, judged - lean
+    RECORD): @WebServlet's own value/urlPatterns are the SAME attribute
+    under two names (the Servlet spec's own alias) - declaring BOTH is
+    spec-illegal input, silently dropping the second one @WebServlet's
+    own ordinary any-order handling was never designed to notice. Still
+    publishes its best-effort, first-match route (unchanged recovery),
+    but now also records the conflict rather than staying silent about
+    the malformed input."""
+    src = """
+package p;
+
+@WebServlet(value = "/first", urlPatterns = "/second")
+public class DispatcherServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("DispatcherServlet.java", src)
+    routes = _edges(result, "route")
+    assert [r.target for r in routes] == ["/first"]
+    problem = next(
+        p for p in result.problems if p.reason_code == "route_annotation_conflicting_attributes")
+    assert problem.qualified_name == "p.DispatcherServlet"
+
+
+def test_web_filter_with_both_value_and_url_patterns_records_a_conflict_problem():
+    """MICRO-ROUND 49 (m2's own @WebFilter twin)."""
+    src = """
+package p;
+
+@WebFilter(value = "/first", urlPatterns = "/second")
+public class AuthFilter implements Filter {
+}
+"""
+    result = java.parse_java_source("AuthFilter.java", src)
+    assert any(
+        p.reason_code == "route_annotation_conflicting_attributes" for p in result.problems)
+
+
+def test_spring_get_mapping_with_disagreeing_value_and_path_records_a_conflict_problem():
+    """MICRO-ROUND 50 (Cluster 4, m2, judged - the round-49 m2 judge's
+    own argument, applied to Spring): Spring's value/path are @AliasFor
+    MIRRORS of the SAME attribute - a real application refuses to start
+    (AnnotationConfigurationException) when they disagree. Still
+    publishes its best-effort route (unchanged recovery - whichever
+    attribute _route_paths finds first in the source text), but now also
+    records the conflict."""
+    src = """
+package p;
+@RestController
+class Controller {
+    @GetMapping(value = "/a", path = "/b")
+    void get() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert [r.target for r in routes] == ["GET /a"]
+    problem = next(
+        p for p in result.problems if p.reason_code == "route_annotation_conflicting_attributes")
+    assert problem.qualified_name == "p.Controller"
+
+
+def test_spring_class_level_request_mapping_with_disagreeing_value_and_path_conflicts():
+    """MICRO-ROUND 50 (Cluster 4, m2's own class-level twin) - the
+    identical conflict, declared on a class-level @RequestMapping
+    (a composition prefix, not a route by itself)."""
+    src = """
+package p;
+@RequestMapping(value = "/a", path = "/b")
+@RestController
+class Controller {
+    @RequestMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    problem = next(
+        p for p in result.problems if p.reason_code == "route_annotation_conflicting_attributes")
+    assert problem.qualified_name == "p.Controller"
+
+
+def test_spring_get_mapping_with_agreeing_value_and_path_never_records_a_conflict_problem():
+    """Control: Spring accepts value=/path= declared TOGETHER as long as
+    they agree (redundant, but consistent) - must never be mistaken for
+    the disagreeing shape above."""
+    src = """
+package p;
+@RestController
+class Controller {
+    @GetMapping(value = "/a", path = "/a")
+    void get() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert not any(
+        p.reason_code == "route_annotation_conflicting_attributes" for p in result.problems)
+
+
+def test_spring_get_mapping_with_only_value_never_records_a_conflict_problem():
+    """Control: the ordinary, non-conflicting case (only value=, no
+    path= at all) must never be mistaken for the disagreeing shape
+    above."""
+    src = """
+package p;
+@RestController
+class Controller {
+    @GetMapping(value = "/a")
+    void get() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert not any(
+        p.reason_code == "route_annotation_conflicting_attributes" for p in result.problems)
+
+
+def test_web_servlet_with_only_url_patterns_never_records_a_conflict_problem():
+    """Control: the ordinary, non-conflicting case (only urlPatterns=,
+    no value=/path= at all) must never be mistaken for the spec-illegal
+    shape above."""
+    src = """
+package p;
+
+@WebServlet(urlPatterns = "/api/*")
+public class DispatcherServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("DispatcherServlet.java", src)
+    assert not any(
+        p.reason_code == "route_annotation_conflicting_attributes" for p in result.problems)
+
+
+def test_web_servlet_with_only_value_never_records_a_conflict_problem():
+    """Control: the ordinary, non-conflicting case (only value=, no
+    urlPatterns= at all) must never be mistaken for the spec-illegal
+    shape above."""
+    src = """
+package p;
+
+@WebServlet(value = "/api/*")
+public class DispatcherServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("DispatcherServlet.java", src)
+    assert not any(
+        p.reason_code == "route_annotation_conflicting_attributes" for p in result.problems)
+
+
+def test_web_servlet_annotation_with_nested_web_init_param_recovers_the_top_level_route():
+    """MICRO-ROUND 49 (forty-third cold read, B2 BLOCKER, wrong-data):
+    @WebServlet's own argument span can contain a NESTED @WebInitParam
+    annotation with its own value= attribute - a bare, unscoped scan for
+    value=/path=/urlPatterns= across the WHOLE span used to match the
+    init-param's own value (textually first) and publish it as the
+    servlet's own route instead of the real, top-level urlPatterns.
+    Reproduced pre-fix exactly as measured: the init-param value
+    ('/WEB-INF/spring.xml') published as the route, the real
+    '/realroute' never recovered at all."""
+    src = """
+package p;
+
+@WebServlet(initParams = @WebInitParam(name = "config", value = "/WEB-INF/spring.xml"), urlPatterns = "/realroute")
+public class DispatcherServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("DispatcherServlet.java", src)
+    routes = _edges(result, "route")
+    assert [r.target for r in routes] == ["/realroute"]
+    assert not any(p.reason_code == "route_value_unrecoverable" for p in result.problems)
+
+
+def test_web_servlet_annotation_with_only_a_nested_init_param_and_no_top_level_route_is_enrolled():
+    """MICRO-ROUND 49 (B2's other half): a @WebServlet declaring ONLY
+    initParams (no top-level value/urlPatterns at all) used to recover
+    a FALSE route from the nested @WebInitParam's own value - correctly
+    falls through to the existing startup_only_servlet enrolment now
+    (the same 'no mapping attribute at all' shape a name-only
+    @WebServlet already gets), never a fabricated route."""
+    src = """
+package p;
+
+@WebServlet(initParams = @WebInitParam(name = "config", value = "/WEB-INF/spring.xml"))
+public class ConfigLoaderServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("ConfigLoaderServlet.java", src)
+    routes = _edges(result, "route")
+    assert routes == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert "startup_only_servlet" in problem.detail
+
+
+def test_web_servlet_annotation_with_url_patterns_before_a_nested_init_param_order_permutation():
+    """Order-permutation control for B2: urlPatterns leading, initParams
+    trailing - the pre-fix bug was order-DEPENDENT (the nested value=
+    only won because it was textually first); this ordering already
+    happened to recover the right value before the fix and must keep
+    doing so identically after it."""
+    src = """
+package p;
+
+@WebServlet(urlPatterns = "/realroute", initParams = @WebInitParam(name = "config", value = "/WEB-INF/spring.xml"))
+public class DispatcherServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("DispatcherServlet.java", src)
+    routes = _edges(result, "route")
+    assert [r.target for r in routes] == ["/realroute"]
+
+
+def test_web_filter_annotation_publishes_its_own_url_patterns_as_a_distinct_filter_kind():
+    """FIX ROUND 21 (seventeenth cold read, CR17-3 MAJOR, wrong-data -
+    JUDGE, taken): @WebFilter shares @WebServlet's own shape exactly
+    (class-level, not composable, urlPatterns IS the complete
+    intercepted pattern) - contained enough to MODEL, unlike
+    @WebListener (a lifecycle callback, enrolled as unsupported
+    instead, see the companion test below).
+
+    FIX ROUND 21b (reviewer-3's re-delta, THE MAJOR, wrong-data,
+    OVERTURNS round 21's own kind="http_route" choice): a filter
+    INTERCEPTS, it does not SERVE - publishing kind="http_route" made
+    an app with one served endpoint plus one filter inventory as TWO
+    served routes, byte-identically. Now kind="http_filter" - the URL
+    pattern still survives as real migration information (the route
+    edge below, and the entry point's own name), just under a kind that
+    is never confused with a served route."""
+    src = """
+package p;
+
+@WebFilter(urlPatterns = {"/api/*", "/secure/*"})
+public class AuthFilter implements Filter {
+}
+"""
+    result = java.parse_java_source("AuthFilter.java", src)
+    routes = _edges(result, "route")
+    assert sorted(r.target for r in routes) == ["/api/*", "/secure/*"]
+    assert not any(e.kind == "http_route" for e in result.entry_points)
+    filter_entry_points = [e for e in result.entry_points if e.kind == "http_filter"]
+    assert sorted(e.name for e in filter_entry_points) == ["/api/*", "/secure/*"]
+    assert all(e.qualified_name == "p.AuthFilter" for e in filter_entry_points)
+
+
+def test_web_listener_annotation_is_enrolled_not_confidently_absent():
+    """FIX ROUND 21 (CR17-3 MAJOR, wrong-data): @WebListener has no URL
+    pattern of its own to model - a lifecycle callback, not a routable
+    request handler - so it gets the class-closer treatment
+    (unsupported_entry_point_shape), never a confident negative."""
+    src = """
+package p;
+
+@WebListener
+public class AppLifecycleListener implements ServletContextListener {
+}
+"""
+    result = java.parse_java_source("AppLifecycleListener.java", src)
+    assert any(
+        p.reason_code == "unsupported_entry_point_shape"
+        and p.qualified_name == "p.AppLifecycleListener"
+        for p in result.problems
+    )
+    assert not any(e.kind == "http_route" for e in result.entry_points)
+
+
+def test_web_xml_filter_is_modeled_as_http_filter_attributed_to_its_own_filter_class():
+    """FIX ROUND 21 (CR17-3 MAJOR, wrong-data): a web.xml <filter> - the
+    direct XML twin of <servlet> - used to publish nothing at all.
+
+    FIX ROUND 21b (reviewer-3's re-delta, THE MAJOR's own web.xml-
+    symmetry question, taken - OVERTURNS round 21's own enroll-only
+    choice): <servlet>/<servlet-mapping> already models at this exact
+    fidelity (CR13-2, round 17) - leaving <filter>/<filter-mapping>
+    enrolled-only was the identical two-opposite-answers contradiction
+    the reviewer raised for @WebFilter, just for the XML shape instead
+    of the annotation. Now MODELED, joined against <filter-mapping>'s
+    own filter-name the same way a servlet-mapping already joins
+    <servlet-class>, published as kind="http_filter" - never
+    "http_route", a filter intercepts, it does not serve."""
+    web_xml = """<web-app>
+  <filter>
+    <filter-name>auth</filter-name>
+    <filter-class>com.acme.web.AuthFilter</filter-class>
+  </filter>
+  <filter-mapping>
+    <filter-name>auth</filter-name>
+    <url-pattern>/*</url-pattern>
+  </filter-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in problems)
+    assert not any(e.kind == "http_route" for e in entry_points)
+    filter_entry_points = [e for e in entry_points if e.kind == "http_filter"]
+    assert len(filter_entry_points) == 1
+    assert filter_entry_points[0].qualified_name == "com.acme.web.AuthFilter"
+    assert filter_entry_points[0].name == "/*"
+
+
+def test_web_xml_listener_is_enrolled_attributed_to_its_own_listener_class():
+    """FIX ROUND 21 (CR17-3 MAJOR, wrong-data): a web.xml <listener> -
+    the direct XML twin of @WebListener - used to publish nothing at
+    all. Now enrolled as unsupported_entry_point_shape, attributed to
+    its own <listener-class>."""
+    web_xml = """<web-app>
+  <listener>
+    <listener-class>com.acme.web.AppLifecycleListener</listener-class>
+  </listener>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert any(
+        p.reason_code == "unsupported_entry_point_shape"
+        and p.qualified_name == "com.acme.web.AppLifecycleListener"
+        for p in problems
+    )
+    assert entry_points == []
+
+
+def test_web_xml_welcome_file_list_is_enrolled_not_confidently_absent():
+    """MICRO-ROUND 49 (forty-third cold read, C5, completeness): a
+    <welcome-file-list> - a real, recognized Servlet-spec entry-point
+    mechanism (the container's own default-document list) - used to
+    publish nothing at all. Now enrolled as unsupported_entry_point_
+    shape, the same declared-not-modeled treatment <listener> already
+    has; no qualified_name to attribute to (a welcome file is a static
+    filename, never a Java class)."""
+    web_xml = """<web-app>
+  <welcome-file-list>
+    <welcome-file>index.html</welcome-file>
+  </welcome-file-list>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
+        "WEB-INF/web.xml", web_xml)
+    matching = [p for p in problems if p.reason_code == "unsupported_entry_point_shape"]
+    assert len(matching) == 1
+    assert "welcome" in matching[0].detail.lower()
+    assert matching[0].qualified_name is None
+    assert entry_points == []
+
+
+def test_web_xml_error_page_is_enrolled_not_confidently_absent():
+    """MICRO-ROUND 49 (C5's own <error-page> twin)."""
+    web_xml = """<web-app>
+  <error-page>
+    <error-code>404</error-code>
+    <location>/404.html</location>
+  </error-page>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
+        "WEB-INF/web.xml", web_xml)
+    matching = [p for p in problems if p.reason_code == "unsupported_entry_point_shape"]
+    assert len(matching) == 1
+    assert "error-page" in matching[0].detail.lower()
+    assert matching[0].qualified_name is None
+    assert entry_points == []
+
+
+def test_web_xml_filter_with_no_filter_class_falls_back_to_the_synthetic_owner():
+    """FIX ROUND 21b: companion negative case for the now-modeled
+    <filter>/<filter-mapping> pair - a malformed/incomplete <filter>
+    (no <filter-class>) is simply not in ``_filter_class_by_name``'s own
+    mapping, so its <filter-mapping> falls back to the synthetic
+    ``{relative_path}#{filter_name}`` owner, the exact same accepted
+    asymmetry an unmatched <servlet-mapping> already has (round 17's own
+    CR13-2 docstring) - never a silent drop, still published."""
+    web_xml = """<web-app>
+  <filter>
+    <filter-name>auth</filter-name>
+  </filter>
+  <filter-mapping>
+    <filter-name>auth</filter-name>
+    <url-pattern>/*</url-pattern>
+  </filter-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in problems)
+    filter_entry_points = [e for e in entry_points if e.kind == "http_filter"]
+    assert len(filter_entry_points) == 1
+    assert filter_entry_points[0].qualified_name == "WEB-INF/web.xml#auth"
+    assert filter_entry_points[0].name == "/*"
+
+
+def test_web_xml_filter_mapping_by_servlet_name_is_enrolled_not_silent():
+    """FIX ROUND 22 (eighteenth cold read, F3 MAJOR, wrong-data): a
+    <filter-mapping> naming a <servlet-name> instead of a <url-pattern>
+    (a real, DTD-valid dispatch alternative) used to publish nothing at
+    all - a NAMED LIMIT comment that was itself the defect. Now enrolled
+    as unsupported_entry_point_shape (servlet_name_scoped_filter),
+    attributed to the filter's own resolved class."""
+    web_xml = """<web-app>
+  <filter>
+    <filter-name>auth</filter-name>
+    <filter-class>com.acme.web.AuthFilter</filter-class>
+  </filter>
+  <filter-mapping>
+    <filter-name>auth</filter-name>
+    <servlet-name>orders</servlet-name>
+  </filter-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert entry_points == []
+    matching = [
+        p for p in problems
+        if p.reason_code == "unsupported_entry_point_shape"
+        and p.qualified_name == "com.acme.web.AuthFilter"
+    ]
+    assert len(matching) == 1
+    assert "servlet_name_scoped_filter" in matching[0].detail
+
+
+def test_web_xml_startup_only_servlet_with_no_mapping_is_enrolled_not_silent():
+    """FIX ROUND 22 (F3 MAJOR, wrong-data): a <servlet> carrying
+    <load-on-startup> but never named by any <servlet-mapping> (the
+    standard startup-only servlet idiom) used to publish nothing at
+    all. Now enrolled, attributed to its own <servlet-class>. An
+    unrelated MAPPED servlet in the same file is unaffected."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>init</servlet-name>
+    <servlet-class>com.acme.web.InitServlet</servlet-class>
+    <load-on-startup>1</load-on-startup>
+  </servlet>
+  <servlet>
+    <servlet-name>orders</servlet-name>
+    <servlet-class>com.acme.web.OrdersServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>orders</servlet-name>
+    <url-pattern>/orders</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert len(entry_points) == 1
+    assert entry_points[0].qualified_name == "com.acme.web.OrdersServlet"
+    matching = [
+        p for p in problems
+        if p.reason_code == "unsupported_entry_point_shape"
+        and p.qualified_name == "com.acme.web.InitServlet"
+    ]
+    assert len(matching) == 1
+    assert "startup_only_servlet" in matching[0].detail
+
+
+def test_web_servlet_annotation_startup_only_no_url_is_enrolled_not_silent():
+    """FIX ROUND 22 (F3 MAJOR, wrong-data): @WebServlet(name=...,
+    loadOnStartup=1) with no value/urlPatterns attribute at all (the
+    annotation-form startup-only idiom) used to fall through the paths
+    loop zero times - no entry point, no problem. Now enrolled. A
+    normal @WebServlet with a real URL in the same run is unaffected."""
+    src = """
+package p;
+
+@WebServlet(name = "init", loadOnStartup = 1)
+public class InitServlet extends HttpServlet {
+}
+
+@WebServlet("/orders")
+public class OrdersServlet extends HttpServlet {
+}
+"""
+    result = java.parse_java_source("Servlets.java", src)
+    http_routes = [e for e in result.entry_points if e.kind == "http_route"]
+    assert len(http_routes) == 1
+    assert http_routes[0].qualified_name == "p.OrdersServlet"
+    matching = [
+        p for p in result.problems
+        if p.reason_code == "unsupported_entry_point_shape" and p.qualified_name == "p.InitServlet"
+    ]
+    assert len(matching) == 1
+    assert "startup_only_servlet" in matching[0].detail
+
+
+def test_web_filter_annotation_servlet_names_only_is_enrolled_not_silent():
+    """FIX ROUND 22 (F3 MAJOR, wrong-data): @WebFilter(servletNames=
+    {...}) with no value/urlPatterns attribute at all used to fall
+    through the paths loop zero times - no entry point, no problem.
+    Now enrolled."""
+    src = """
+package p;
+
+@WebFilter(servletNames = {"orders"})
+public class OrdersAuthFilter implements Filter {
+}
+"""
+    result = java.parse_java_source("OrdersAuthFilter.java", src)
+    assert result.entry_points == []
+    matching = [
+        p for p in result.problems
+        if p.reason_code == "unsupported_entry_point_shape"
+        and p.qualified_name == "p.OrdersAuthFilter"
+    ]
+    assert len(matching) == 1
+    assert "servlet_name_scoped_filter" in matching[0].detail
+
+
+# --------------------------------------------------- round 23 F1/F2 (web.xml/pom attribute tolerance + XML decode)
+
+def test_web_xml_structural_tag_matrix_tolerates_attributes_prefixes_and_whitespace():
+    """FIX ROUND 23 (nineteenth cold read, F1 BLOCKER, wrong-data): every
+    structural web.xml regex anchored on the BARE literal tag - a legal
+    <servlet id="...">, a namespace-prefixed <j:servlet-mapping>, or
+    whitespace/newlines inside the tag (<servlet\\n id="x">) matched
+    NOTHING, so the whole descriptor published nothing at all - the
+    DEFAULT OUTPUT shape of IBM RAD/WSAD tooling (an id attribute on
+    every structural element), exactly the WebSphere-era estate this
+    scanner targets. c1/c8 are bare-tag controls that already worked;
+    c2-c7 each isolate one tolerance gap."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>c1</servlet-name>
+    <servlet-class>com.C1</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>c1</servlet-name>
+    <url-pattern>/c1</url-pattern>
+  </servlet-mapping>
+  <servlet id="Servlet_2">
+    <servlet-name>c2</servlet-name>
+    <servlet-class>com.C2</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>c2</servlet-name>
+    <url-pattern>/c2</url-pattern>
+  </servlet-mapping>
+  <j:servlet-mapping>
+    <servlet-name>c3</servlet-name>
+    <url-pattern>/c3</url-pattern>
+  </j:servlet-mapping>
+  <servlet
+      id="Servlet_7">
+    <servlet-name>c7</servlet-name>
+    <servlet-class>com.C7</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>c7</servlet-name>
+    <url-pattern>/c7</url-pattern>
+  </servlet-mapping>
+  <filter id="Filter_1">
+    <filter-name>c6</filter-name>
+    <filter-class>com.C6Filter</filter-class>
+  </filter>
+  <filter-mapping>
+    <filter-name>c6</filter-name>
+    <url-pattern>/c6</url-pattern>
+  </filter-mapping>
+  <listener id="Listener_1">
+    <listener-class>com.C6Listener</listener-class>
+  </listener>
+  <servlet-mapping >
+    <servlet-name>c8</servlet-name>
+    <url-pattern>/c8</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern["/c1"] == "com.C1"
+    assert routes_by_pattern["/c2"] == "com.C2"
+    assert routes_by_pattern["/c3"] == "WEB-INF/web.xml#c3"
+    assert routes_by_pattern["/c7"] == "com.C7"
+    assert routes_by_pattern["/c6"] == "com.C6Filter"
+    assert routes_by_pattern["/c8"] == "WEB-INF/web.xml#c8"
+    listener_problems = [
+        p for p in problems
+        if p.reason_code == "unsupported_entry_point_shape" and p.qualified_name == "com.C6Listener"
+    ]
+    assert len(listener_problems) == 1
+
+
+def test_web_xml_attribute_bearing_servlet_filter_and_listener_end_to_end():
+    """FIX ROUND 23 (F1 BLOCKER): the reader's own .cr19-webxmlattr
+    shape - a servlet, a filter, and a listener, each with an id
+    attribute on its own structural tag, all published/enrolled in the
+    SAME run."""
+    web_xml = """<web-app>
+  <servlet id="s1">
+    <servlet-name>admin</servlet-name>
+    <servlet-class>com.acme.AdminServlet</servlet-class>
+  </servlet>
+  <servlet-mapping id="m1">
+    <servlet-name>admin</servlet-name>
+    <url-pattern>/admin/*</url-pattern>
+  </servlet-mapping>
+  <filter id="f1">
+    <filter-name>auth</filter-name>
+    <filter-class>com.acme.AuthFilter</filter-class>
+  </filter>
+  <filter-mapping id="fm1">
+    <filter-name>auth</filter-name>
+    <url-pattern>/*</url-pattern>
+  </filter-mapping>
+  <listener id="l1">
+    <listener-class>com.acme.AppListener</listener-class>
+  </listener>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: (e.qualified_name, e.kind) for e in entry_points}
+    assert routes_by_pattern["/admin/*"] == ("com.acme.AdminServlet", "http_route")
+    assert routes_by_pattern["/*"] == ("com.acme.AuthFilter", "http_filter")
+    assert any(
+        p.reason_code == "unsupported_entry_point_shape"
+        and p.qualified_name == "com.acme.AppListener"
+        for p in problems
+    )
+
+
+def test_parse_maven_pom_dependency_with_an_attribute_on_its_own_tag():
+    """FIX ROUND 23 (F1 BLOCKER): the reader's own .cr19-pomattr shape -
+    _DEPENDENCY_BLOCK_RE had the identical bare-tag anchor as web.xml's
+    own regexes; a <dependency id="x"> silently dropped the entire
+    dependency."""
+    pom = """<project>
+  <dependencies>
+    <dependency id="x">
+      <groupId>org.springframework</groupId>
+      <artifactId>spring-core</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.springframework:spring-core"}
+
+
+def test_web_xml_url_pattern_cdata_and_entity_decoding():
+    """FIX ROUND 23 (F1(d) + F2 MAJOR, wrong-data): a CDATA-wrapped
+    <url-pattern> published nothing at all (F1(d)); an XML entity
+    reference (&#47;, &amp;) published VERBATIM as the literal escape
+    sequence instead of the character it names (F2) - a real route
+    /c5/x published as the false string /c5&#47;x. Both now decode to
+    the real value; the reader's own .cr19-xml shape
+    (&#47;admin&amp;danger -> /admin&danger) and the &#10; composition
+    with the EXISTING control-char sanitizer (must come out escaped,
+    never a raw embedded newline)."""
+    web_xml = """<web-app>
+  <servlet-mapping>
+    <servlet-name>s4</servlet-name>
+    <url-pattern><![CDATA[/c4]]></url-pattern>
+  </servlet-mapping>
+  <servlet-mapping>
+    <servlet-name>s5</servlet-name>
+    <url-pattern>/c5&#47;x</url-pattern>
+  </servlet-mapping>
+  <servlet-mapping>
+    <servlet-name>sxml</servlet-name>
+    <url-pattern>&#47;admin&amp;danger</url-pattern>
+  </servlet-mapping>
+  <servlet-mapping>
+    <servlet-name>snl</servlet-name>
+    <url-pattern>/nl&#10;end</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    names = {e.name for e in entry_points}
+    assert "/c4" in names
+    assert "/c5/x" in names
+    assert "/admin&danger" in names
+    # FIX ROUND 41 (thirty-fifth cold read, F1+F2, THE STRUCTURAL CURE):
+    # the decoded entity is a REAL newline now, carried raw in the
+    # claim - control-char escaping moved to display-write (see
+    # test_comprehension_dependencies_artifact.py's own escape-set
+    # battery for the published, escaped "/nl\\nend" form).
+    assert "/nl\nend" in names
+    # FIX ROUND 29 (F9c JUDGE): none of s4/s5/sxml/snl is backed by a
+    # <servlet> element - orthogonal to this test's own CDATA/entity
+    # decoding concern, but now correctly recorded as its own
+    # undeclared_descriptor_name problem, one per distinct ghost name,
+    # rather than the stale "fully clean run" this test asserted before
+    # that gap was named.
+    assert {p.reason_code for p in problems} == {"undeclared_descriptor_name"}
+    assert {p.qualified_name for p in problems} == {
+        "WEB-INF/web.xml#s4", "WEB-INF/web.xml#s5",
+        "WEB-INF/web.xml#sxml", "WEB-INF/web.xml#snl",
+    }
+    # M (cold-read PR-B fix round 47 completeness): the detail must also
+    # say a real server cannot register this mapping at all - never
+    # just "published against the synthetic owner" with no hint that it
+    # is unlikely to ever actually dispatch.
+    assert all("real server cannot register it" in p.detail for p in problems)
+
+
+def test_web_xml_url_pattern_with_an_undefined_entity_is_unrecoverable():
+    """FIX ROUND 23 (F2 MAJOR): an entity reference this producer has no
+    general-entity table for (a custom DTD-declared entity) must never
+    publish a guessed or partially-decoded value - routed to the
+    existing route_value_unrecoverable honesty instead."""
+    web_xml = """<web-app>
+  <servlet-mapping>
+    <servlet-name>sbad</servlet-name>
+    <url-pattern>/bad&undefined;end</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert entry_points == []
+    matching = [p for p in problems if p.reason_code == "route_value_unrecoverable"]
+    assert len(matching) == 1
+
+
+# --------------------------------------------------- micro-round 23b R1 (leaf tolerance) / R2 (split CDATA)
+
+def test_web_xml_fully_prefixed_descriptor_still_publishes_the_route():
+    """MICRO-ROUND 23b (reviewer-3 delta on `4a4038b`, R1 - the F1
+    BLOCKER's own shape, narrowed but not closed): round 23's own fix
+    tolerated a namespace prefix on the CONTAINER tags only
+    (<servlet>/<servlet-mapping>) - a REAL fully-prefixed descriptor (a
+    single namespace applied to every element, the WebSphere/JAXB-
+    generated shape) also prefixes every LEAF value element
+    (<servlet-name>/<servlet-class>/<url-pattern>), which still had a
+    bare-tag-only regex and matched nothing - the container matched,
+    then found no leaf inside it, publishing zero entry points and zero
+    problems over a genuinely fully-mapped servlet."""
+    web_xml = """<j:web-app>
+  <j:servlet>
+    <j:servlet-name>full</j:servlet-name>
+    <j:servlet-class>com.C</j:servlet-class>
+  </j:servlet>
+  <j:servlet-mapping>
+    <j:servlet-name>full</j:servlet-name>
+    <j:url-pattern>/full</j:url-pattern>
+  </j:servlet-mapping>
+</j:web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern["/full"] == "com.C"
+    assert problems == []
+
+
+def test_web_xml_attribute_bearing_leaf_element_still_publishes():
+    """MICRO-ROUND 23b (R1): an attribute on a LEAF element's own tag
+    (<url-pattern id="u1">), not just on a container tag - the same
+    tolerance gap, one level down."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name id="n1">leaf</servlet-name>
+    <servlet-class>com.Leaf</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>leaf</servlet-name>
+    <url-pattern id="u1">/leaf</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern["/leaf"] == "com.Leaf"
+
+
+def test_parse_maven_pom_fully_prefixed_dependency_still_publishes_the_edge():
+    """MICRO-ROUND 23b (R1): the reviewer's own pom-side repro -
+    <x:dependency><x:groupId>...<x:artifactId>... - the container tag
+    already tolerated the prefix (round 23's own F1), but groupId/
+    artifactId did not, so the edge never published at all."""
+    pom = """<project>
+  <dependencies>
+    <x:dependency>
+      <x:groupId>org.springframework</x:groupId>
+      <x:artifactId>spring-core</x:artifactId>
+    </x:dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.springframework:spring-core"}
+
+
+def test_parse_maven_pom_dependency_groupid_with_xml_space_attribute():
+    """MICRO-ROUND 23b (R1): a <groupId xml:space="preserve"> - a legal
+    attribute on a leaf value element, the same class of gap as the
+    <url-pattern id="u1"> case above, restated for pom.xml."""
+    pom = """<project>
+  <dependencies>
+    <dependency>
+      <groupId xml:space="preserve">org.springframework</groupId>
+      <artifactId>spring-core</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.springframework:spring-core"}
+
+
+# --------------------------------------------------- fix round 24 F1 (tag-stack local-name fix, .cr20-pomns)
+
+def test_a_fully_namespace_prefixed_pom_still_registers_its_own_coordinate_and_edge():
+    """FIX ROUND 24 (twentieth cold read, F1 BLOCKER, wrong-data,
+    .cr20-pomns): every pom-coordinate gate (`_project_own_coordinate`/
+    `_own_and_parent_group_ids`) tests `_enclosing_tag_stack(...) ==
+    ["project"]` - `_XML_TAG_RE` captured a namespace PREFIX as the tag
+    name (`<x:project>` recorded as `"x"`, never `"project"`), so a
+    fully-prefixed pom (namespace-identical to a plain one) silently
+    failed every one of these checks: no own coordinate registered, no
+    dependency edge published, even though the container-level regexes
+    (already prefix-tolerant since round 23) matched fine. Fixed by
+    making `_XML_TAG_RE` capture the LOCAL name regardless of an
+    optional namespace prefix - the identical tolerance standard 23b's
+    own leaf/container patterns already established, applied to the
+    tag-stack tracker every pom-coordinate consumer shares."""
+    pom = """<x:project xmlns:x="http://maven.apache.org/POM/4.0.0">
+  <x:groupId>org.prefixed</x:groupId>
+  <x:artifactId>prefixed-lib</x:artifactId>
+  <x:dependencies>
+    <x:dependency>
+      <x:groupId>org.other</x:groupId>
+      <x:artifactId>other-lib</x:artifactId>
+    </x:dependency>
+  </x:dependencies>
+</x:project>
+"""
+    units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {u.qualified_name for u in units} == {"org.prefixed:prefixed-lib"}
+    assert {e.target for e in edges} == {"org.other:other-lib"}
+
+
+def test_a_fully_namespace_prefixed_pom_still_declares_its_reactor_modules():
+    """FIX ROUND 24 (F1 BLOCKER, .cr20-pomns): `declared_reactor_module_
+    paths` scopes its own `<modules>` match to `_enclosing_tag_stack(...)
+    == ["project"]` too - the same tag-stack blindness silently made the
+    reactor rule's own backstop inert for a prefixed aggregator pom (no
+    modules ever recovered, so a vendored/excluded prefixed module would
+    never trip the reactor rule's own unresolved-not-external
+    protection)."""
+    pom = """<x:project xmlns:x="http://maven.apache.org/POM/4.0.0">
+  <x:groupId>org.prefixed</x:groupId>
+  <x:artifactId>prefixed-aggregator</x:artifactId>
+  <x:packaging>pom</x:packaging>
+  <x:modules>
+    <x:module>legacy-core</x:module>
+    <x:module>legacy-web</x:module>
+  </x:modules>
+</x:project>
+"""
+    assert java.declared_reactor_module_paths(pom) == ["legacy-core", "legacy-web"]
+
+
+def test_web_xml_prefixed_descriptor_regression_stays_green_after_tag_stack_fix():
+    """FIX ROUND 24 (F1 BLOCKER): the tag-stack fix touches a shared
+    regex `_enclosing_tag_stack` alone consumes - web.xml's own
+    structural/leaf tolerance (23b's own fix) never calls
+    `_enclosing_tag_stack` at all, so this is a pure regression control,
+    not a new mechanism."""
+    web_xml = """<j:web-app>
+  <j:servlet>
+    <j:servlet-name>full</j:servlet-name>
+    <j:servlet-class>com.C</j:servlet-class>
+  </j:servlet>
+  <j:servlet-mapping>
+    <j:servlet-name>full</j:servlet-name>
+    <j:url-pattern>/full</j:url-pattern>
+  </j:servlet-mapping>
+</j:web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern["/full"] == "com.C"
+    assert problems == []
+
+
+def test_web_xml_split_cdata_url_pattern_is_unrecoverable():
+    """MICRO-ROUND 23b (reviewer-3's own MINOR, wrong-data): TWO CDATA
+    sections in one <url-pattern> value (a legal escape-trick shape,
+    used to embed a literal "]]>") made the decoder backtrack past the
+    first section's real closing marker and stitch together a string
+    the descriptor never actually contains
+    (<![CDATA[/a]]>b<![CDATA[c]]> decoded to "/a]]>b<![CDATA[c").
+    Refused as unrecoverable instead of publishing that wrong value."""
+    web_xml = """<web-app>
+  <servlet-mapping>
+    <servlet-name>ssplit</servlet-name>
+    <url-pattern><![CDATA[/a]]>b<![CDATA[c]]></url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert entry_points == []
+    matching = [p for p in problems if p.reason_code == "route_value_unrecoverable"]
+    assert len(matching) == 1
+    # FIX ROUND 24 (twentieth cold read, F3 MINOR, wrong-data): this
+    # refusal's own detail used to hard-code "a <url-pattern> ... contains
+    # an undefined XML entity reference" - a false, DEFINITE claim for
+    # THIS shape, which has no entity in it at all (the same None
+    # return, from a different cause, one hard-coded message). The new
+    # message names entity references as one POSSIBLE cause among
+    # several this producer refuses to guess through, never asserting
+    # this specific value definitely contains one.
+    assert "contains an undefined XML entity reference" not in matching[0].detail
+
+
+def test_web_xml_mixed_content_cdata_url_pattern_is_unrecoverable():
+    """FIX ROUND 24 (twentieth cold read, F2 MAJOR, wrong-data): a CDATA
+    section adjacent to plain text in the SAME value
+    (<url-pattern>/mix<![CDATA[ed]]>/*</url-pattern>, real route
+    /mixed/*) is a THIRD shape neither the wholly-wrapped decode nor the
+    split-section refusal caught - it fell through to the no-'&' early
+    return, publishing the literal CDATA markers verbatim
+    ('/mix<![CDATA[ed]]>/*'). Refused as unrecoverable instead."""
+    web_xml = """<web-app>
+  <servlet-mapping>
+    <servlet-name>smixed</servlet-name>
+    <url-pattern>/mix<![CDATA[ed]]>/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert entry_points == []
+    matching = [p for p in problems if p.reason_code == "route_value_unrecoverable"]
+    assert len(matching) == 1
+    assert not any("<![CDATA[" in e.name for e in entry_points)
+
+
+def test_web_xml_wholly_wrapped_cdata_url_pattern_still_decodes():
+    """Companion control (FIX ROUND 24 F2): a single, WHOLLY-wrapped
+    CDATA value (round 23's own control shape) must stay decoded, not
+    swept into the new mixed-content refusal."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>swhole</servlet-name>
+    <servlet-class>p.Whole</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>swhole</servlet-name>
+    <url-pattern><![CDATA[/whole]]></url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert {e.name for e in entry_points} == {"/whole"}
+    assert problems == []
+
+
+def test_a_cdata_wrapped_pom_dependency_groupid_publishes_the_edge_not_silence():
+    """FIX ROUND 24 (twentieth cold read, F4 MINOR, wrong-data): a CDATA-
+    wrapped <groupId> could not even be MATCHED by the old [^<]+? body
+    (CDATA content starts with its own literal <), so the whole
+    dependency block silently vanished - complete/0 problems/no edge at
+    all over a genuinely declared dependency. Widened to DOTALL + decode
+    via _decode_xml_text - the edge now publishes correctly."""
+    pom = """<project>
+  <dependencies>
+    <dependency>
+      <groupId><![CDATA[org.springframework]]></groupId>
+      <artifactId>spring-core</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.springframework:spring-core"}
+
+
+def test_a_split_cdata_pom_dependency_groupid_is_flagged_not_silent():
+    """FIX ROUND 24 (F4 MINOR): a groupId whose own CDATA cannot be
+    decoded (the split-CDATA shape, same refuse-over-guess choice as
+    url-pattern) must not silently vanish - pom_dependency_decode_
+    problems surfaces its own line number so worker.py can record a
+    real problem instead."""
+    pom = """<project>
+  <dependencies>
+    <dependency>
+      <groupId><![CDATA[org.a]]>b<![CDATA[c]]></groupId>
+      <artifactId>spring-core</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert edges == []
+    assert java.pom_dependency_decode_problems(pom) == [3]
+
+
+def test_a_cdata_wrapped_servlet_class_joins_the_real_route_owner():
+    """FIX ROUND 24 (twentieth cold read, F5 MINOR, wrong-data): a CDATA-
+    wrapped <servlet-class> could not be matched by the old [^<]+? body
+    either, silently dropping this servlet from _servlet_class_by_name's
+    own join - the mapped route's owner mis-attributed to the synthetic
+    web.xml#name placeholder instead of the real class. Widened +
+    decoded - the real class now joins correctly."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>admin</servlet-name>
+    <servlet-class><![CDATA[com.acme.AdminServlet]]></servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>admin</servlet-name>
+    <url-pattern>/admin/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern["/admin/*"] == "com.acme.AdminServlet"
+    assert problems == []
+
+
+def test_an_undecodable_servlet_class_is_flagged_not_silently_misattributed():
+    """FIX ROUND 24 (F5 MINOR): a <servlet-class> present but undecodable
+    (split CDATA) must not silently fall back to the synthetic owner
+    with no problem recorded - a real class this producer could not
+    recover is a different fact from a genuinely absent one."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>admin</servlet-name>
+    <servlet-class><![CDATA[com.a]]>b<![CDATA[cme.Admin]]></servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>admin</servlet-name>
+    <url-pattern>/admin/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern["/admin/*"] == "WEB-INF/web.xml#admin"
+    matching = [p for p in problems if p.reason_code == "route_value_unrecoverable"]
+    assert any(p.qualified_name == "WEB-INF/web.xml#admin" for p in matching)
+
+
+# --------------------------------------------------- fix round 25 F1+F2+F3 (CDATA invisible to structural XML)
+
+_POM_DESCRIPTION_MATRIX = [
+    ("A_no_description", ""),
+    ("B_plain_text", "<description>Plain text, no markup at all.</description>"),
+    ("C_balanced_tag", "<description><![CDATA[some <b>bold</b> text]]></description>"),
+    ("D_unbalanced_br", "<description><![CDATA[some text <br> more text]]></description>"),
+    ("E_unbalanced_p", "<description><![CDATA[some text <p> more text]]></description>"),
+    ("F_self_closing_br", "<description><![CDATA[some text <br/> more text]]></description>"),
+]
+
+
+@pytest.mark.parametrize("case_name,description_xml", _POM_DESCRIPTION_MATRIX)
+def test_pom_description_cdata_never_corrupts_the_tag_stack(case_name, description_xml):
+    """FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE, F1 BLOCKER,
+    .cr21-pomcdata, wrong-data): the STRUCTURAL XML layer
+    (_XML_TAG_RE/_enclosing_tag_stack) never blanked CDATA - a pom's own
+    <description> CDATA containing an unbalanced HTML tag (<br> - common
+    in legacy pom descriptions) permanently corrupted the tag stack
+    (push with no pop), so every subsequent gate testing ==["project"]
+    failed: both real dependencies vanished and <modules> vanished (the
+    reactor backstop silently disabled). The reader's own 6-case
+    mutation matrix: A/B/C/F are all fine even before this fix (no
+    unbalanced tag to corrupt anything); D and E are the ones that
+    actually reproduce the corruption. All six must publish identically
+    correctly after this fix - the fix must not merely dodge the two
+    failing cases, it must make the mechanism itself CDATA-blind."""
+    pom = f"""<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <packaging>pom</packaging>
+  {description_xml}
+  <dependencies>
+    <dependency><groupId>org.a</groupId><artifactId>a</artifactId></dependency>
+    <dependency><groupId>org.b</groupId><artifactId>b</artifactId></dependency>
+  </dependencies>
+  <modules>
+    <module>core</module>
+  </modules>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.a:a", "org.b:b"}, case_name
+    assert java.declared_reactor_module_paths(pom) == ["core"], case_name
+
+
+def test_pom_description_cdata_c_style_snippet_never_pushes_a_phantom_tag():
+    """FIX ROUND 25 (F1 BLOCKER): a C-style code snippet in CDATA
+    (``i<n;i++``) reads as an unclosed ``<n`` tag to a naive scanner -
+    the same phantom-tag-push corruption as the HTML case, a different
+    real-world source (a pom documenting a code example)."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <description><![CDATA[for (int i = 0; i<n; i++) { doWork(i); }]]></description>
+  <dependencies>
+    <dependency><groupId>org.a</groupId><artifactId>a</artifactId></dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.a:a"}
+
+
+def test_pom_description_cdata_does_not_hide_the_pom_s_own_coordinate():
+    """FIX ROUND 25 (F1 BLOCKER, .cr21-pomcdata): the reader verified
+    BOTH element orderings - Maven's own conventional order registers
+    the project coordinate BEFORE the description, which is why round
+    24's own F1b positive-evidence gate stayed silent over this bug (a
+    real coordinate WAS registered) - but a corrupted tag stack still
+    hides everything textually AFTER the description (dependencies,
+    modules), which is the actual, measured defect."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <description><![CDATA[some text <br> more text]]></description>
+  <dependencies>
+    <dependency><groupId>org.a</groupId><artifactId>a</artifactId></dependency>
+  </dependencies>
+</project>
+"""
+    units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {u.qualified_name for u in units} == {"com.acme:root"}
+    assert {e.target for e in edges} == {"org.a:a"}
+
+
+def test_a_split_cdata_project_own_coordinate_is_flagged_not_silent():
+    """FIX ROUND 35 (twenty-ninth cold read, F1 BLOCKER, wrong-data, .cr29-
+    xmlent variant - split CDATA): the project-level groupId's own value
+    cannot be decoded (split-CDATA shape) - the coordinate must be treated
+    as ABSENT (no unit published, never a raw undecoded string), and
+    pom_own_coordinate_decode_problems must surface its own line number so
+    worker.py can record a real, visible problem instead of silence -
+    exactly the same treatment the sibling dependency site already gets."""
+    pom = """<project>
+  <groupId><![CDATA[com.a]]>b<![CDATA[cme]]></groupId>
+  <artifactId>root</artifactId>
+</project>
+"""
+    units, _edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert units == []
+    assert java.pom_own_coordinate_decode_problems(pom) == [2]
+
+
+def test_an_undefined_entity_project_own_coordinate_is_flagged_not_silent():
+    """FIX ROUND 35 (F1 BLOCKER, .cr29-xmlent verbatim - undefined-entity
+    asymmetry): the reader's own measured asymmetry - the dependency site
+    already records dependency_value_unrecoverable and degrades for an
+    undefined entity reference; the own-coordinate site used to publish
+    "com.acme:bad&undefinedent;name" SILENTLY. Now symmetric: treated as
+    absent, own line surfaced."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>bad&undefinedent;name</artifactId>
+</project>
+"""
+    units, _edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert units == []
+    assert java.pom_own_coordinate_decode_problems(pom) == [3]
+
+
+def test_an_undecodable_project_own_coordinate_never_falls_back_to_parent():
+    """Companion control: when the project-level groupId is PRESENT but
+    undecodable, the <parent> block's own groupId must never be silently
+    substituted in its place - `_own_and_parent_group_ids` breaks at the
+    first project-level match regardless of its own decodability, the
+    same "this IS the real element, not merely absent" reasoning an
+    undecodable <dependency> groupId already gets."""
+    pom = """<project>
+  <parent><groupId>com.other</groupId><artifactId>other-parent</artifactId>
+    <version>1.0</version></parent>
+  <groupId><![CDATA[com.a]]>b<![CDATA[cme]]></groupId>
+  <artifactId>root</artifactId>
+</project>
+"""
+    units, _edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert units == []  # never falls back to "com.other:root"
+
+
+def test_web_xml_description_cdata_does_not_fabricate_a_route():
+    """FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE, F2 BLOCKER,
+    .cr21-webinj, wrong-data): a web.xml <description> CDATA that
+    DOCUMENTS a long-removed mapping (a real, common shape - "this used
+    to map /legacy/* to LegacyServlet") published it as a LIVE route -
+    a fabricated entry point, since the structural block regexes never
+    understood CDATA and matched the documented example text as if it
+    were real markup."""
+    web_xml = """<web-app>
+  <description><![CDATA[
+    This app used to have:
+    <servlet-mapping>
+      <servlet-name>legacy</servlet-name>
+      <url-pattern>/legacy/*</url-pattern>
+    </servlet-mapping>
+    but that servlet was removed in 2019.
+  ]]></description>
+  <servlet-mapping>
+    <servlet-name>real</servlet-name>
+    <url-pattern>/real/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    names = {e.name for e in entry_points}
+    assert "/legacy/*" not in names
+    assert names == {"/real/*"}
+
+
+def test_pom_description_cdata_does_not_fabricate_a_dependency_edge():
+    """FIX ROUND 25 (twenty-first cold read, THE ROOT CAUSE, F3 MAJOR,
+    .cr21-pominj, lower field realism but the threat model says scanned
+    content is untrusted): a pom <description> CDATA containing a
+    LITERAL, premature "</description>" closing tag (still perfectly
+    inert CDATA text - the section has not reached its own real "]]>"
+    yet) makes a naive, CDATA-blind tag-stack scanner pop "description"
+    off the stack early, so the injected markup that follows (still
+    textually INSIDE the CDATA) reads as sitting directly at
+    ["project"] level once the stack is corrupted - publishing a
+    fabricated resolved dependency edge for content that was never
+    really declared anywhere in the document."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <description><![CDATA[
+    </description>
+    <dependencies>
+      <dependency><groupId>com.fake</groupId><artifactId>injected</artifactId></dependency>
+    </dependencies>
+  ]]></description>
+  <dependencies>
+    <dependency><groupId>org.real</groupId><artifactId>real-lib</artifactId></dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.real:real-lib"}
+
+
+# --------------------------------------------------- fix round 25 F4+F5+F8 (servlet-name/filter-name decode discipline)
+
+def test_web_xml_a_cdata_wrapped_servlet_name_publishes_not_silence():
+    """FIX ROUND 25 (twenty-first cold read, F4 MAJOR, wrong-data,
+    .cr21-mixedname): <servlet-name>/<filter-name> were left OFF round
+    24's decode-or-record discipline - a CDATA-wrapped servlet-name made
+    the match None and the whole mapping loop silently `continue`d:
+    PlainServlet's own /plain mapping (no CDATA) published normally
+    while HiddenServlet - genuinely MAPPED to /hidden in the SAME
+    descriptor - got the confident not_applicable/no_entry_point
+    negative, problems=[], complete. Now decodes correctly and /hidden
+    publishes with its real owner, exactly like /plain."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>Plain</servlet-name>
+    <servlet-class>com.acme.PlainServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>Plain</servlet-name>
+    <url-pattern>/plain</url-pattern>
+  </servlet-mapping>
+  <servlet>
+    <servlet-name>Hidden</servlet-name>
+    <servlet-class>com.acme.HiddenServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name><![CDATA[Hidden]]></servlet-name>
+    <url-pattern>/hidden</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern["/plain"] == "com.acme.PlainServlet"
+    assert routes_by_pattern["/hidden"] == "com.acme.HiddenServlet"
+    assert problems == []
+
+
+def test_web_xml_an_undecodable_servlet_name_records_a_problem_not_silence():
+    """FIX ROUND 25 (F4 MAJOR): a servlet-name that IS present but
+    genuinely undecodable (split CDATA) must record a real problem
+    instead of the whole mapping vanishing with zero visibility."""
+    web_xml = """<web-app>
+  <servlet-mapping>
+    <servlet-name><![CDATA[Hid]]>d<![CDATA[en]]></servlet-name>
+    <url-pattern>/hidden</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert entry_points == []
+    matching = [p for p in problems if p.reason_code == "route_value_unrecoverable"]
+    assert len(matching) == 1
+    assert "servlet-mapping" in matching[0].detail
+
+
+def test_web_xml_a_cdata_wrapped_filter_name_publishes_not_silence():
+    """FIX ROUND 25 (F4 MAJOR): the filter twin of the servlet-mapping
+    case above."""
+    web_xml = """<web-app>
+  <filter>
+    <filter-name>Plain</filter-name>
+    <filter-class>com.acme.PlainFilter</filter-class>
+  </filter>
+  <filter-mapping>
+    <filter-name>Plain</filter-name>
+    <url-pattern>/plain</url-pattern>
+  </filter-mapping>
+  <filter>
+    <filter-name>Hidden</filter-name>
+    <filter-class>com.acme.HiddenFilter</filter-class>
+  </filter>
+  <filter-mapping>
+    <filter-name><![CDATA[Hidden]]></filter-name>
+    <url-pattern>/hidden</url-pattern>
+  </filter-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern["/plain"] == "com.acme.PlainFilter"
+    assert routes_by_pattern["/hidden"] == "com.acme.HiddenFilter"
+    assert problems == []
+
+
+def test_web_xml_an_undecodable_filter_name_records_a_problem_not_silence():
+    """FIX ROUND 25 (F4 MAJOR): the filter twin of the undecodable-name
+    control above."""
+    web_xml = """<web-app>
+  <filter-mapping>
+    <filter-name><![CDATA[Hid]]>d<![CDATA[en]]></filter-name>
+    <url-pattern>/hidden</url-pattern>
+  </filter-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert entry_points == []
+    matching = [p for p in problems if p.reason_code == "route_value_unrecoverable"]
+    assert len(matching) == 1
+    assert "filter-mapping" in matching[0].detail
+
+
+def test_web_xml_an_undecodable_name_only_descriptor_still_degrades():
+    """FIX ROUND 25 (F4 MAJOR, .cr21-enc, whole-file-gate control): a
+    web.xml whose ONLY mapping has an undecodable name must still
+    surface a real problem (never a complete, zero-problem run) - the
+    24b whole-file gate alone cannot be relied on once a per-mapping
+    problem is recorded instead, but the run must stay visibly
+    degraded either way."""
+    web_xml = """<web-app>
+  <servlet-mapping>
+    <servlet-name><![CDATA[a]]>b<![CDATA[c]]></servlet-name>
+    <url-pattern>/x</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert entry_points == []
+    assert problems != []
+
+
+# --------------------------------------------------- micro-round 25b (block-side name decode; @WebFilter twin)
+
+def test_web_xml_an_undecodable_servlet_name_in_the_servlet_block_records_a_problem():
+    """MICRO-ROUND 25b (reviewer-3 delta on `5aa5c09`, item 1, R3 BLOCK-
+    SIDE GAP): a <servlet-name> present but UNDECODABLE inside the
+    <servlet> BLOCK itself (not the mapping) fell back silently to the
+    synthetic file owner with NO problem - an honest under-claim owner,
+    but indistinguishable from the genuinely-nameless case, exactly
+    what this whole mechanism exists to separate. The mapping's own
+    plain-text servlet-name still publishes (falling back to the
+    synthetic owner, since the <servlet> declaration never joins), but
+    a problem must now record WHY the real owner could not be
+    resolved."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name><![CDATA[s]]>x<![CDATA[]]></servlet-name>
+    <servlet-class>com.acme.Hidden</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>s</servlet-name>
+    <url-pattern>/h2</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern["/h2"] == "WEB-INF/web.xml#s"
+    matching = [p for p in problems if p.reason_code == "route_value_unrecoverable"]
+    assert any("<servlet>" in p.detail and "<servlet-name>" in p.detail for p in matching)
+
+
+def test_web_xml_an_undecodable_filter_name_in_the_filter_block_records_a_problem():
+    """MICRO-ROUND 25b (item 1, R3 BLOCK-SIDE GAP): the filter twin of
+    the servlet-block case above."""
+    web_xml = """<web-app>
+  <filter>
+    <filter-name><![CDATA[f]]>x<![CDATA[]]></filter-name>
+    <filter-class>com.acme.Hidden</filter-class>
+  </filter>
+  <filter-mapping>
+    <filter-name>f</filter-name>
+    <url-pattern>/h2</url-pattern>
+  </filter-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern["/h2"] == "WEB-INF/web.xml#f"
+    matching = [p for p in problems if p.reason_code == "route_value_unrecoverable"]
+    assert any("<filter>" in p.detail and "<filter-name>" in p.detail for p in matching)
+
+
+def test_web_xml_a_wholly_wrapped_servlet_name_in_the_block_still_decodes_and_joins():
+    """MICRO-ROUND 25b (item 1): companion control - a WHOLLY-wrapped
+    (not split/mixed) CDATA servlet-name in the <servlet> block decodes
+    cleanly and joins normally, publishing the REAL class as owner."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name><![CDATA[s]]></servlet-name>
+    <servlet-class>com.acme.RealClass</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>s</servlet-name>
+    <url-pattern>/ok</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern["/ok"] == "com.acme.RealClass"
+    assert problems == []
+
+
+def test_web_xml_a_genuinely_nameless_servlet_block_stays_silent():
+    """MICRO-ROUND 25b (item 1): companion control - a <servlet> block
+    with NO <servlet-name> at all (genuinely absent, not undecodable)
+    must stay silent, the existing, unchanged, already-accepted
+    behavior - never conflated with the new undecodable case."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-class>com.acme.NoName</servlet-class>
+  </servlet>
+</web-app>
+"""
+    _entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert problems == []
+
+
+def test_web_filter_annotation_with_servlet_names_records_the_dropped_half():
+    """MICRO-ROUND 25b (item 2, F5 ANNOTATION TWIN): @WebFilter(
+    urlPatterns={"/a"}, servletNames={"s1"}) published the pattern
+    route and recorded NOTHING for the dropped servletNames half - the
+    XML spelling (<filter-mapping> with both <url-pattern> and
+    <servlet-name>, round 25's own F5) now records this, but its
+    annotation twin did not - the exact XML-vs-annotation asymmetry
+    class round 21 already rejected on. Now records the same
+    unsupported_entry_point_shape instance for the annotation spelling
+    too."""
+    src = """
+package p;
+
+@WebFilter(urlPatterns = {"/a"}, servletNames = {"s1"})
+public class MixedFilter implements Filter {}
+"""
+    result = java.parse_java_source("MixedFilter.java", src)
+    assert any(e.name == "/a" for e in result.entry_points)
+    assert any(
+        p.reason_code == "unsupported_entry_point_shape" and "servletNames" in p.detail
+        for p in result.problems
+    )
+
+
+def test_web_filter_annotation_with_only_url_patterns_stays_clean():
+    """MICRO-ROUND 25b (item 2): companion control - a @WebFilter with
+    ONLY urlPatterns (no servletNames scoping at all) must stay clean,
+    the ordinary healthy case."""
+    src = """
+package p;
+
+@WebFilter(urlPatterns = {"/a"})
+public class PlainFilter implements Filter {}
+"""
+    result = java.parse_java_source("PlainFilter.java", src)
+    assert any(e.name == "/a" for e in result.entry_points)
+    assert result.problems == []
+
+
+def test_a_cdata_wrapped_pom_module_publishes_the_reactor_path():
+    """FIX ROUND 25 (twenty-first cold read, F8, wrong-data): <module>
+    was left off round 24's decode-or-record discipline - a CDATA-
+    wrapped module path used to match nothing at all, silently dropping
+    the whole reactor entry."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <packaging>pom</packaging>
+  <modules>
+    <module><![CDATA[core]]></module>
+  </modules>
+</project>
+"""
+    assert java.declared_reactor_module_paths(pom) == ["core"]
+
+
+def test_a_self_closed_top_level_modules_never_declares_a_profile_s_own_reactor_entry():
+    """FIX ROUND 43 (thirty-seventh cold read, F1 BLOCKER, .cr37-
+    selfclose-mod, wrong-data - THE SELF-CLOSING TAG DEFECT): a self-
+    closing ``<modules/>`` used to match as an OPENING tag (the shared
+    ``[^>]*>`` prefix freely absorbs the trailing ``/``), and with no
+    body of its own, the lazy/DOTALL capture scanned FORWARD to the
+    NEXT ``</modules>`` anywhere in the document - here, a PROFILE's
+    own conditionally-active module list - fabricating a phantom
+    UNCONDITIONAL reactor member out of a declaration this producer's
+    own "declare the module's own facts, not a conditional
+    activation's" rule (see this function's own docstring) explicitly
+    excludes. Now a self-closed ``<modules/>`` is an explicit, empty
+    element - it has no children to yield, so the profile's own list is
+    never even reached through it."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <modules/>
+  <profiles>
+    <profile>
+      <modules>
+        <module>only-active-in-profile</module>
+      </modules>
+    </profile>
+  </profiles>
+</project>
+"""
+    assert java.declared_reactor_module_paths(pom) == []
+
+
+def test_a_self_closed_top_level_modules_with_a_space_before_the_slash_is_the_same_empty_element():
+    """FIX ROUND 43 (.cr37-selfclose-space): the ``<modules />`` spelling
+    (whitespace before the self-closing ``/``) must be recognized
+    identically to ``<modules/>`` - a real, common XML formatting
+    choice, not a different shape."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <modules />
+  <profiles>
+    <profile>
+      <modules>
+        <module>only-active-in-profile</module>
+      </modules>
+    </profile>
+  </profiles>
+</project>
+"""
+    assert java.declared_reactor_module_paths(pom) == []
+
+
+def test_a_profile_s_own_declared_modules_alone_is_still_correctly_excluded():
+    """FIX ROUND 43 (.cr37-selfclose-ctl, control): the SAME profile-
+    only ``<modules>`` list, with NO self-closed top-level ``<modules/>``
+    anywhere in the document at all - this producer's existing, pre-
+    round-43 exclusion of profile-scoped modules must stay unchanged.
+    Distinguishes "the exclusion rule itself" (already correct) from
+    "the self-closing defect that used to bypass it" (round 43's own
+    fix)."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <profiles>
+    <profile>
+      <modules>
+        <module>only-active-in-profile</module>
+      </modules>
+    </profile>
+  </profiles>
+</project>
+"""
+    assert java.declared_reactor_module_paths(pom) == []
+
+
+def test_a_self_closed_top_level_dependencies_never_publishes_a_profile_s_own_dependency_as_direct():
+    """FIX ROUND 43 (thirty-seventh cold read, F1 BLOCKER, .cr37-
+    selfclose-dep, wrong-data): the SAME self-closing defect as the
+    ``<modules/>`` case above, for ``<dependencies/>`` - a self-closed
+    top-level ``<dependencies/>`` used to swallow forward into a
+    PROFILE's own ``<dependencies>`` block, publishing that profile-
+    scoped dependency as an unconditional, direct edge (round 11's own
+    M1 exclusion, bypassed). The profile's own dependency is still
+    correctly counted as profile-scoped (never lost, never fabricated
+    as direct)."""
+    pom = """<project>
+  <dependencies/>
+  <profiles>
+    <profile>
+      <dependencies>
+        <dependency>
+          <groupId>com.acme</groupId>
+          <artifactId>only-in-profile</artifactId>
+        </dependency>
+      </dependencies>
+    </profile>
+  </profiles>
+</project>
+"""
+    _units, edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert edges == []
+    assert profile_scoped_count == 1
+
+
+def test_a_self_closed_top_level_dependencies_and_modules_combined():
+    """FIX ROUND 43 (.cr37-selfclose, combined): both self-closing
+    defects (``<dependencies/>`` and ``<modules/>``) in ONE pom, each
+    followed by a profile's own conditionally-active list of the same
+    kind - neither published as an unconditional, top-level
+    declaration."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <modules/>
+  <dependencies/>
+  <profiles>
+    <profile>
+      <modules>
+        <module>only-active-in-profile</module>
+      </modules>
+      <dependencies>
+        <dependency>
+          <groupId>com.acme</groupId>
+          <artifactId>only-in-profile</artifactId>
+        </dependency>
+      </dependencies>
+    </profile>
+  </profiles>
+</project>
+"""
+    assert java.declared_reactor_module_paths(pom) == []
+    _units, edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert edges == []
+    assert profile_scoped_count == 1
+
+
+def test_an_ordinary_pom_with_no_self_closed_elements_is_unaffected():
+    """FIX ROUND 43 (.cr37-pom, control): a completely ordinary pom -
+    real open/close ``<modules>``/``<dependencies>``, no self-closing
+    tag anywhere - must publish exactly as it always has. Round 43's
+    fix must never change behavior for a well-formed document that
+    never exercises the self-closing branch at all."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <modules>
+    <module>core</module>
+  </modules>
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>core</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    assert java.declared_reactor_module_paths(pom) == ["core"]
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert [e.target for e in edges] == ["com.acme:core"]
+
+
+def test_a_cdata_wrapped_pom_optional_and_scope_decode_correctly():
+    """FIX ROUND 25 (F8, wrong-data): <optional>/<scope> were left off
+    round 24's decode-or-record discipline too - a CDATA-wrapped value
+    used to match nothing at all, silently falling back to the default
+    (optional: false, phase: build) rather than the real declared value."""
+    pom = """<project>
+  <dependencies>
+    <dependency>
+      <groupId>org.a</groupId>
+      <artifactId>a</artifactId>
+      <optional><![CDATA[true]]></optional>
+      <scope><![CDATA[test]]></scope>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    edge = next(e for e in edges if e.target == "org.a:a")
+    assert edge.optional is True
+    assert edge.phase == "test"
+
+
+def test_web_xml_filter_mapping_with_both_url_pattern_and_servlet_name_enrolls_the_dropped_half():
+    """FIX ROUND 25 (twenty-first cold read, F5 MINOR, completeness):
+    a <filter-mapping> with BOTH <url-pattern> AND <servlet-name>
+    publishes the patterns and drops the servlet-name half with NO
+    enrolled instance at all (the problem previously recorded only when
+    url_pattern_matches was empty) - scan.json declares the
+    servlet_name_scoped_filter shape but this run's own instance never
+    surfaced. Now records the instance whenever a servlet-name scoping
+    is present-and-dropped, even alongside published patterns."""
+    web_xml = """<web-app>
+  <filter-mapping>
+    <filter-name>mixed</filter-name>
+    <url-pattern>/mixed/*</url-pattern>
+    <servlet-name>SomeServlet</servlet-name>
+  </filter-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert {e.name for e in entry_points} == {"/mixed/*"}
+    matching = [p for p in problems if p.reason_code == "unsupported_entry_point_shape"]
+    assert any("servlet_name_scoped_filter" in p.detail for p in matching)
+
+
+def test_jax_rs_path_composes_class_and_method_level_like_spring_request_mapping():
+    """FIX ROUND 17 (CR13-3 MAJOR, part (a)): JAX-RS's own @Path composes
+    EXACTLY like a plain @RequestMapping already does - a class-level
+    @Path is a prefix, and a method-level @Path composes against it.
+
+    CORRECTED (round 39, thirty-third cold read, F3 MAJOR, wrong-data -
+    confident false positive): this test used to assert the composed
+    value published as a REAL, served http_route with the verb left
+    unknown - measured wrong. A method-level @Path with NO verb
+    designator of its own (no sibling @GET/@POST) is JAX-RS's own SUB-
+    RESOURCE-LOCATOR idiom (JSR-339): it never handles a request
+    directly, it returns another resource object the container keeps
+    dispatching into. Publishing it as a confident served http_route
+    was the false positive; no entry point is published for it now, and
+    the enrolled-but-unmodeled shape (jax_rs_sub_resource_locator)
+    records a real problem instead, attributed to the class."""
+    src = """
+package p;
+
+@Path("/orders")
+public class OrderResource {
+    @Path("/list")
+    public void list() {}
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    assert _edges(result, "route") == []
+    assert not any(e.kind == "http_route" for e in result.entry_points)
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.OrderResource"
+    assert "/orders/list" in problem.detail
+
+
+def test_jax_rs_verb_only_methods_get_the_class_closer_not_a_silent_negative():
+    """FIX ROUND 17b (reviewer-3's rejection of round 17, THE MAJOR):
+    the DOMINANT real-world JAX-RS idiom - a class-level @Path with
+    verb-only methods (@GET/@POST, no method-level @Path of their own) -
+    used to silently produce ZERO entry points AND zero problems, the
+    class landing on the confident negative entry_points_mapped=
+    not_applicable/no_entry_point, while @WebMethod (built the exact
+    same round) correctly reported unknown/unsupported_entry_point_shape.
+    The reviewer's own OrderResource shape: no route composes (verb-only
+    methods are not recognized - the named limit), so the class must now
+    get the SAME class-closer treatment."""
+    src = """
+package p;
+
+@Path("/orders")
+public class OrderResource {
+    @GET
+    public void list() {}
+
+    @POST
+    public void create() {}
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    assert not any(e.kind == "http_route" for e in result.entry_points)
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.OrderResource"
+    # FIX ROUND 41 (thirty-fifth cold read, F6 POLISH): 11 of the 12
+    # UNSUPPORTED_ENTRY_POINT_SHAPES already name their own vocabulary
+    # token parenthetically in their detail - jax_rs_verb_only_method
+    # was the missing one.
+    assert "jax_rs_verb_only_method" in problem.detail
+
+
+def test_two_zero_route_jax_rs_classes_in_one_file_get_distinct_details():
+    """MICRO-ROUND 36b (reviewer-3 delta on `0d8d6c9`, THE COUPLING
+    DEFECT): `problem_id` hashes (reason_code, path, detail) -
+    `qualified_name` is NOT an input. This loop's own detail never named
+    the class, only the enclosing FILE - two DIFFERENT @Path classes in
+    the SAME file (legal, ordinary Java), both hitting this same
+    zero-route verb-only-idiom branch, produced byte-identical details
+    and therefore one shared problem_id despite being two genuinely
+    distinct facts - round 36's own new collision detector then
+    correctly refused to publish the whole scan. The class name is now
+    IN the detail (the same fix the reactor sites already apply with
+    their own module path), so two classes in one file get two
+    genuinely distinct records."""
+    src = """
+package p;
+
+@Path("/orders")
+class OrderResource {
+    @GET
+    public void list() {}
+}
+
+@Path("/items")
+class ItemResource {
+    @GET
+    public void list() {}
+}
+"""
+    result = java.parse_java_source("Resources.java", src)
+    problems = [p for p in result.problems if p.reason_code == "unsupported_entry_point_shape"]
+    assert {p.qualified_name for p in problems} == {"p.OrderResource", "p.ItemResource"}
+    assert len({p.detail for p in problems}) == 2
+    assert all(p.qualified_name in p.detail for p in problems)
+
+
+def test_jax_rs_path_with_a_real_method_level_route_is_not_flagged_the_class_closer():
+    """Companion negative case - the reviewer's own ItemResource row: a
+    class-level @Path with a REAL method-level @Path composing against
+    it must stay satisfied, never get the class-closer treatment
+    reserved for a class where nothing ever composed.
+
+    CORRECTED (round 39, F3 MAJOR): a bare method-level @Path with no
+    verb of its own is now recognized as a sub-resource locator, never
+    a real route (see the sibling test above) - this "real route"
+    control now needs an actual verb designator (@GET) to stay a real,
+    served route at all."""
+    src = """
+package p;
+
+@Path("/items")
+public class ItemResource {
+    @GET
+    @Path("/list")
+    public void list() {}
+}
+"""
+    result = java.parse_java_source("ItemResource.java", src)
+    assert any(e.kind == "http_route" for e in result.entry_points)
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+
+
+def test_a_jax_rs_method_path_with_no_class_level_path_is_not_a_root_resource():
+    """FIX ROUND 43 (thirty-seventh cold read, N3, wrong-data - judged,
+    suppress): a class with NO class-level @Path is never a JAX-RS root
+    resource at all (JSR-370 s3.1: "root resource classes ... are
+    annotated with @Path") - its own method-level @Path is unreachable
+    on its own (it could only ever matter as a sub-resource returned by
+    ANOTHER resource's own locator method, a cross-file relationship
+    this single-file producer cannot trace). The STANDALONE-method-
+    route branch used to compose this unconditionally, correct for
+    Spring (no class-level @RequestMapping required there) but never
+    re-examined for JAX-RS specifically - a confident false-positive
+    http_route for a class that cannot actually serve one."""
+    src = """
+package p;
+
+public class OrderResource {
+    @GET
+    @Path("/orders")
+    public void list() {}
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    assert not any(e.kind == "http_route" for e in result.entry_points)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.OrderResource"
+    assert "jax_rs_method_path_without_root_resource" in problem.detail
+
+
+def test_a_class_level_path_on_a_jax_rs_interface_is_not_served_through_it_alone():
+    """MICRO-ROUND 44b (reviewer-3's own measured HOLD on round 44):
+    a class-level @Path DOES exist here (unlike the no-root-resource
+    shape above) but the class it decorates is an INTERFACE - reviewer-3
+    measured this publishing a confident served route, owned by the
+    interface itself, complete/0. The route's own EXISTENCE is
+    defensible (JAX-RS's own annotation-inheritance rule, JSR-370 s3.6,
+    means an implementing, registered concrete resource class DOES
+    inherit the mapping) but the OWNER is wrong (an interface never
+    itself serves a request) and complete/0 asserts a certainty this
+    producer does not have (no concrete implementor may exist anywhere
+    in-scan at all - in this fixture, none does). The SAME weaker "not
+    through this class alone" claim the Spring cell already earns
+    applies here too - reviewer-3's own explicit instruction: NOT
+    @WebServlet's own stronger "never served" claim, which would be
+    wrong for JAX-RS specifically (its own spec grants inheritance,
+    unlike @WebServlet). Closes the round-25 abstract-@Path carry
+    (folded into N5 at round 27)."""
+    src = """
+package p;
+
+@Path("/api/orders")
+public interface OrderResource {
+    @GET
+    @Path("/list")
+    void list();
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.OrderResource"
+    assert "jax_rs_route_on_unregistered_class" in problem.detail
+    assert "an INTERFACE" in problem.detail
+
+
+def test_a_class_level_path_on_an_abstract_jax_rs_class_is_not_served_through_it_alone():
+    """MICRO-ROUND 44b (reviewer-3's own measured HOLD): the abstract-
+    class sibling of the interface case above - the exact round-25
+    abstract-@Path carry (folded into N5 at round 27), now closed by
+    this same fix rather than left open indefinitely."""
+    src = """
+package p;
+
+@Path("/api/orders")
+public abstract class OrderResource {
+    @GET
+    @Path("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    assert _edges(result, "route") == []
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.OrderResource"
+    assert "jax_rs_route_on_unregistered_class" in problem.detail
+    assert "ABSTRACT" in problem.detail
+
+
+def test_a_class_level_path_on_a_concrete_jax_rs_class_still_publishes():
+    """MICRO-ROUND 44b (reviewer-3's own measured HOLD, control): the
+    genuinely serveable cell - a concrete class-level @Path resource
+    must keep publishing exactly as before. Unlike Spring, JAX-RS needs
+    no separate stereotype annotation - a class-level @Path is itself
+    sufficient registration evidence for a concrete class."""
+    src = """
+package p;
+
+@Path("/api/orders")
+public class OrderResource {
+    @GET
+    @Path("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /api/orders/list"
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+
+
+def test_a_spring_method_mapping_with_no_class_level_mapping_still_publishes_the_route():
+    """FIX ROUND 43 (N3, Spring-parity control): the SAME standalone
+    shape (no class-level route annotation, a real method-level one)
+    for SPRING must keep publishing exactly as it always has - the
+    round 43 fix is JAX-RS-specific (gated on ``match.group(1) ==
+    "Path"``), never touching Spring's own genuinely valid standalone-
+    method-route shape."""
+    src = """
+package p;
+
+@RestController
+public class OrderController {
+    @GetMapping("/orders")
+    public void list() {}
+}
+"""
+    result = java.parse_java_source("OrderController.java", src)
+    assert any(e.kind == "http_route" for e in result.entry_points)
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+
+
+def test_an_application_path_prefix_is_never_composed_into_a_published_route():
+    """FIX ROUND 43 (thirty-seventh cold read, F5 MAJOR, .cr37-apppath,
+    completeness - declared, not fixed): a JAX-RS @ApplicationPath on
+    the application's own root class is a DEPLOYMENT-level base path
+    the container prepends to every @Path at runtime - this producer
+    has no static, one-class-owns-one-prefix fact linking a discovered
+    resource back to the SPECIFIC Application subclass that ultimately
+    serves it (unlike class-level @Path, which composition already
+    handles), so it is deliberately never composed in. A published
+    "/orders/list" may, in the real deployed application, actually be
+    served at "/api/orders/list" - a NAMED LIMIT now (see this
+    producer's own capability description and the design doc's own
+    Artifact-2 section), not a silent, undeclared gap. This output is
+    UNCHANGED from before round 43 - only the honesty of its scope
+    changed."""
+    src = """
+package p;
+
+@ApplicationPath("/api")
+public class RestConfig extends Application {
+}
+
+@Path("/orders")
+public class OrderResource {
+    @GET
+    @Path("/list")
+    public void list() {}
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    route = next(e for e in result.entry_points if e.kind == "http_route")
+    assert route.name == "GET /orders/list"
+
+
+def test_an_application_path_annotation_publishes_a_non_degrading_informational_signal():
+    """MICRO-ROUND 48b (F2, reviewer-3's own reasoning-overturn): round
+    43/45's own deferral cited round-45 C2's VOLUME justification, which
+    does not apply to @ApplicationPath (it appears at most once or twice
+    in a whole application) - the reactor rule's own precedent (publish
+    per-run on comparable positive evidence) applies instead. This is
+    the SAME source as the composition-is-unaffected test above - only
+    the NEW signal is asserted here, since that test already locks the
+    unaffected route composition."""
+    src = """
+package p;
+
+@ApplicationPath("/api")
+public class RestConfig extends Application {
+}
+
+@Path("/orders")
+public class OrderResource {
+    @GET
+    @Path("/list")
+    public void list() {}
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    matching = [p for p in result.problems if p.reason_code == "deployment_base_path_declared"]
+    assert len(matching) == 1
+    assert matching[0].qualified_name == "p.RestConfig"
+    assert "/api" in matching[0].detail
+
+
+def test_application_path_detail_names_the_jax_rs_only_scope_without_truncating():
+    """MICRO-ROUND 49 (forty-third cold read, polish): ROUTE_COMPOSITION_
+    CAVEAT covers BOTH a JAX-RS @ApplicationPath and a Spring
+    DispatcherServlet mapped off the bare '/' root, but this emitter
+    only ever fires for the JAX-RS half - without saying so, a reader
+    could mistake this ONE problem for the whole caveat being
+    surfaced. The added scoping clause must survive bounded_detail's
+    own 200-character bound, never be truncated away."""
+    from agenttalk.comprehension.errors import TRUNCATION_MARKER
+
+    src = """
+package p;
+
+@ApplicationPath("/api")
+public class RestConfig extends Application {
+}
+"""
+    result = java.parse_java_source("RestConfig.java", src)
+    matching = [p for p in result.problems if p.reason_code == "deployment_base_path_declared"]
+    assert len(matching) == 1
+    detail = matching[0].detail
+    assert not detail.endswith(TRUNCATION_MARKER)
+    assert "JAX-RS" in detail
+    assert "Spring" in detail
+
+
+def test_no_application_path_annotation_publishes_no_signal():
+    """Control for the test above: a JAX-RS resource with no
+    @ApplicationPath anywhere in the file must never publish
+    `deployment_base_path_declared` - the signal fires only on genuine
+    presence, never as a guess or a blanket per-file note."""
+    src = """
+package p;
+
+@Path("/orders")
+public class OrderResource {
+    @GET
+    @Path("/list")
+    public void list() {}
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    assert not any(p.reason_code == "deployment_base_path_declared" for p in result.problems)
+
+
+def test_jax_rs_path_with_no_verb_marker_and_no_method_level_path_is_a_confident_negative():
+    """FIX ROUND 36 (thirtieth cold read, F3 MAJOR, wrong-data,
+    NoMethodPath verbatim): the round-17b class-closer above used to
+    fire for EVERY zero-route @Path class, asserting "JAX-RS's own
+    verb-only method idiom ... is not recognized" as the cause even for
+    a class with ZERO verb annotations and zero handler methods at all
+    (an abstract/base/locator-holder class - a genuine JAX-RS sub-
+    resource-locator possibility this producer cannot see through
+    either way) - a fabricated cause, degrading a run where nothing was
+    actually missed. This class-level @Path composes to nothing
+    recognizable and has no verb marker anywhere in it either - the
+    confident negative is correct here: no entry point, no problem."""
+    src = """
+package p;
+
+@Path("/locator")
+public class LocatorResource {
+    public Object delegate() {
+        return null;
+    }
+}
+"""
+    result = java.parse_java_source("LocatorResource.java", src)
+    assert not any(e.kind == "http_route" for e in result.entry_points)
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+
+
+def test_a_mixed_jax_rs_class_gets_the_class_closer_for_its_uncomposed_verb_method():
+    """FIX ROUND 18 (fourteenth cold read, F2 MAJOR, wrong-data): the
+    reader's own repro - the DOMINANT real REST shape, a collection GET
+    (verb-only, no method-level @Path) alongside an item GET (@GET
+    PLUS its own @Path, composing normally). Round 17b's class-closer
+    only fired when a class produced ZERO routes at all - this class
+    produces ONE real route (get()) and used to publish
+    entry_points_mapped SATISFIED even though list()'s route is
+    genuinely missing from the inventory. The composed route must
+    still publish (the marker mechanism never suppresses a real one),
+    AND the class must now also get the named problem."""
+    src = """
+package p;
+
+@Path("/orders")
+public class OrderResource {
+    @GET
+    public void list() {}
+
+    @GET
+    @Path("/{id}")
+    public void get() {}
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    routes = _edges(result, "route")
+    # FIX ROUND 32 (F2 BLOCKER): get()'s own @GET now folds into the
+    # published target - this route was never bare "/orders/{id}", it
+    # just used to publish as if it were (see that fix).
+    assert [r.target for r in routes] == ["GET /orders/{id}"]
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.OrderResource"
+    # FIX ROUND 41 (F6 POLISH): the mixed-class sibling of the zero-route
+    # loop's own missing-token fix.
+    assert "jax_rs_verb_only_method" in problem.detail
+
+
+def test_two_mixed_jax_rs_classes_in_one_file_get_distinct_details():
+    """MICRO-ROUND 36b: the identical coupling defect in the MIXED-class
+    closer branch (a class with at least one real composed route PLUS
+    an uncomposed verb-only method elsewhere in it) - same fix, same
+    proof: two classes in one file must publish two distinct records."""
+    src = """
+package p;
+
+@Path("/orders")
+class OrderResource {
+    @GET
+    public void list() {}
+
+    @GET
+    @Path("/{id}")
+    public void get() {}
+}
+
+@Path("/items")
+class ItemResource {
+    @GET
+    public void list() {}
+
+    @GET
+    @Path("/{id}")
+    public void get() {}
+}
+"""
+    result = java.parse_java_source("Resources.java", src)
+    problems = [p for p in result.problems if p.reason_code == "unsupported_entry_point_shape"]
+    assert {p.qualified_name for p in problems} == {"p.OrderResource", "p.ItemResource"}
+    assert len({p.detail for p in problems}) == 2
+    assert all(p.qualified_name in p.detail for p in problems)
+
+
+def test_a_mixed_jax_rs_class_with_an_intervening_annotation_still_composes():
+    """The verb marker's own annotation stack must tolerate an
+    intervening, unrelated annotation (@Produces is common between a
+    verb designator and its own @Path) - never mistaking it for a
+    stack break that would falsely orphan a method whose route DID
+    compose."""
+    src = """
+package p;
+
+@Path("/orders")
+public class OrderResource {
+    @GET
+    @Produces("application/json")
+    @Path("/{id}")
+    public void get() {}
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+
+
+def test_the_annotation_stack_cursor_advances_monotonically_past_nested_swagger_annotations():
+    """FIX ROUND 18b (reviewer-3's pre-verified MAJOR on round 18's F2):
+    _ANY_ANNOTATION_RE also matches an annotation NESTED inside another
+    annotation's own argument list (@ApiResponses({@ApiResponse(...)}) -
+    the normal Swagger-documented JAX-RS shape) - finditer resumes
+    scanning right after the outer annotation's own NAME (before its
+    parens), walks straight into that argument list, and finds the
+    nested one as a separate match. The stack-grouping walk assigned
+    previous_span_end UNCONDITIONALLY, so this nested match's own
+    (smaller) span REGRESSED the cursor backward into the middle of the
+    outer annotation's own parens - the next real annotation then saw
+    the outer's own trailing "})" in the gap and incorrectly started a
+    new stack, corrupting stack membership for every annotation that
+    follows in the WHOLE FILE, not just one method: a fully mapped
+    resource could publish its own route AND still get flagged
+    unsupported_entry_point_shape. previous_span_end now advances
+    monotonically (never regresses).
+
+    Four rows in ONE file, sharing one cursor across all of them - the
+    exact cross-boundary corruption this bug caused: (1) Swagger order A
+    (@GET, then the nested-Swagger annotation, then @Path - the nested
+    annotation SANDWICHED between the marker and its own @Path) stays
+    clean; (2) Swagger order B (the mirror image - @Path, then the
+    nested annotation, then @GET) stays clean; (3) the mixed class
+    (round 18's own F2 shape) still gets flagged; (4) the intervening-
+    @Produces bridge (the companion test above) still stays clean."""
+    src = """
+package p;
+
+@Path("/swagger-a")
+public class SwaggerOrderA {
+    @GET
+    @ApiResponses({@ApiResponse(code = 200, message = "OK")})
+    @Path("/{id}")
+    public void get() {}
+}
+
+@Path("/swagger-b")
+public class SwaggerOrderB {
+    @Path("/{id}")
+    @ApiResponses({@ApiResponse(code = 200, message = "OK")})
+    @GET
+    public void get() {}
+}
+
+@Path("/mixed")
+public class MixedResource {
+    @GET
+    public void list() {}
+
+    @GET
+    @Path("/{id}")
+    public void get() {}
+}
+
+@Path("/bridge")
+public class BridgeResource {
+    @GET
+    @Produces("application/json")
+    @Path("/{id}")
+    public void get() {}
+}
+"""
+    result = java.parse_java_source("Resources.java", src)
+    flagged = {
+        p.qualified_name for p in result.problems if p.reason_code == "unsupported_entry_point_shape"
+    }
+    assert flagged == {"p.MixedResource"}
+
+
+def test_the_annotation_stack_tolerates_a_modifier_keyword_between_annotations():
+    """FIX ROUND 19 (fifteenth cold read, F6 MINOR, wrong-data - degrades
+    a healthy run): mirrors the reader's own ``.cr15-d`` ReportResource
+    shape - the JLS permits a modifier and an annotation to interleave
+    in either order (``public @GET String one()`` is exactly as legal
+    as ``@GET public String one()``). The stack-grouping walk treated
+    ANY non-whitespace content between two annotations as a break, so a
+    modifier keyword sitting between a verb marker and its own @Path
+    incorrectly split them into separate stacks - a FULLY MAPPED
+    resource got the false coverage-gap problem, unknown, and degraded.
+    Tolerated the same way an intervening unrelated annotation already
+    is. A true positive (the mixed-class shape, no modifier involved)
+    must stay flagged, unaffected."""
+    src = """
+package p;
+
+@Path("/reports")
+public class ReportResource {
+    @GET
+    public @Path("/{id}") String one() { return null; }
+}
+
+@Path("/mixed")
+public class MixedResource {
+    @GET
+    public void list() {}
+
+    @GET
+    @Path("/{id}")
+    public void get() {}
+}
+"""
+    result = java.parse_java_source("Resources.java", src)
+    flagged = {
+        p.qualified_name for p in result.problems if p.reason_code == "unsupported_entry_point_shape"
+    }
+    assert flagged == {"p.MixedResource"}
+
+
+def test_a_route_annotation_on_a_field_publishes_nothing():
+    """FIX ROUND 20 (sixteenth cold read, m1 MINOR, wrong-data): mirrors
+    the reader's own .cr16-l field shape - a route annotation is only
+    ever legal (JAX-RS/Spring) on a method, never a field. Used to
+    publish a full, confident entry point + edge + feature + satisfied
+    anyway, since nothing checked WHAT kind of member the annotation
+    actually decorates. The missing precondition is structural (this
+    does not compile as real JAX-RS/Spring) - publishes nothing, the
+    same confident "no route here" a class with no route annotation at
+    all correctly gets."""
+    src = """
+package p;
+
+public class OrderResource {
+    @GetMapping("/orders")
+    private String route;
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    assert _edges(result, "route") == []
+    assert not any(e.kind == "http_route" for e in result.entry_points)
+    assert result.problems == []
+
+
+def test_a_route_annotation_on_an_abstract_interface_method_still_associates():
+    """Companion control case for m1 - an interface's own abstract method
+    (no body, just a bare parameter list then `;`) is still a genuine
+    METHOD declaration, not a field, and must still REACH composition -
+    never silently vanish with zero trace the way a field-misread would.
+
+    CORRECTED TWICE. Round 44 (F1, THE REGISTRABILITY MATRIX) first
+    re-based this on JAX-RS instead of Spring, since Spring started
+    suppressing any route on an interface and a body-less method is
+    inherently that exact shape. MICRO-ROUND 44b (reviewer-3's own
+    measured HOLD) then closed the JAX-RS interface/abstract residual
+    too - a class-level @Path plus a body-less interface method is NOW
+    suppressed as `jax_rs_route_on_unregistered_class` the same way.
+    Since a body-less method can ONLY exist in an interface or an
+    abstract class - the very two shapes registrability now suppresses
+    for both families - no annotation-composed fixture can prove m1 by
+    PUBLISHING anymore; the strongest available proof is that the
+    annotation reached the SUPPRESSION at all (one real problem,
+    attributed to this class) rather than m1 wrongly reading it as a
+    field and dropping it with NO trace whatsoever (zero problems, zero
+    entry points, silence)."""
+    src = """
+package p;
+
+@Path("/api")
+public interface OrderApi {
+    @GET
+    @Path("/orders")
+    String list();
+}
+"""
+    result = java.parse_java_source("OrderApi.java", src)
+    assert _edges(result, "route") == []
+    assert len(result.problems) == 1
+    problem = result.problems[0]
+    assert problem.qualified_name == "p.OrderApi"
+    assert problem.reason_code == "unsupported_entry_point_shape"
+    assert "jax_rs_route_on_unregistered_class" in problem.detail
+
+
+def test_web_method_annotation_is_the_named_class_closer_not_a_silent_negative():
+    """FIX ROUND 17 (CR13-3 MAJOR, part (b) - THE CLASS-CLOSER): a route-
+    like annotation family this adapter recognizes as a routing
+    mechanism but has not modeled (JAX-WS's own @WebMethod) must publish
+    a NAMED problem, attributed to its own enclosing type - never
+    silently fall through to a confident "no entry point" negative."""
+    src = """
+package p;
+
+public class OrderEndpoint {
+    @WebMethod
+    public void placeOrder() {}
+}
+"""
+    result = java.parse_java_source("OrderEndpoint.java", src)
+    assert not any(e.kind == "http_route" for e in result.entry_points)
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert problem.qualified_name == "p.OrderEndpoint"
+
+
+def test_five_unenrolled_entry_point_families_get_the_named_class_closer():
+    """FIX ROUND 19 (fifteenth cold read, F3 MAJOR, wrong-data): mirrors
+    the reader's own ``.cr15-f`` five-family shape - @Scheduled,
+    @KafkaListener, @MessageDriven, an EJB @Remote component, and
+    @ServerEndpoint all used to publish the confident
+    not_applicable/no_entry_point negative on an otherwise complete run.
+    The same class-closer treatment @WebMethod already gets, enrolled
+    for all five, each under its own named shape."""
+    src = """
+package p;
+
+public class JobRunner {
+    @Scheduled(fixedRate = 5000)
+    public void cleanup() {}
+}
+
+public class OrderEventConsumer {
+    @KafkaListener(topics = "orders")
+    public void onOrder(String message) {}
+}
+
+@MessageDriven
+public class OrderMdb {
+}
+
+@Remote
+public class BillingService {
+}
+
+@ServerEndpoint("/chat")
+public class ChatEndpoint {
+}
+"""
+    result = java.parse_java_source("Various.java", src)
+    problems_by_class = {
+        p.qualified_name: p for p in result.problems if p.reason_code == "unsupported_entry_point_shape"
+    }
+    assert set(problems_by_class) == {
+        "p.JobRunner", "p.OrderEventConsumer", "p.OrderMdb", "p.BillingService", "p.ChatEndpoint",
+    }
+    assert "spring_scheduled" in problems_by_class["p.JobRunner"].detail
+    assert "kafka_listener" in problems_by_class["p.OrderEventConsumer"].detail
+    assert "jms_message_driven" in problems_by_class["p.OrderMdb"].detail
+    assert "ejb_remote_component" in problems_by_class["p.BillingService"].detail
+    assert "websocket_server_endpoint" in problems_by_class["p.ChatEndpoint"].detail
+
+
+def test_a_plain_class_with_none_of_the_five_families_stays_not_applicable():
+    """Companion negative case - an ordinary class with no recognized
+    entry-point annotation at all must stay the confident
+    not_applicable/no_entry_point negative, unaffected."""
+    src = """
+package p;
+
+public class PlainService {
+    public void doWork() {}
+}
+"""
+    result = java.parse_java_source("PlainService.java", src)
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+
+
+def test_a_local_only_stateless_ejb_is_not_flagged_as_a_remote_component():
+    """Companion negative case for the ejb_remote_component JUDGE - a
+    purely LOCAL @Stateless session bean (no @Remote alongside it) has
+    no external entry point at all; the existing confident negative is
+    already correct for it and must stay unaffected."""
+    src = """
+package p;
+
+@Stateless
+public class LocalOnlyService {
+}
+"""
+    result = java.parse_java_source("LocalOnlyService.java", src)
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in result.problems)
+
+
+# ----------------------------------------------------------- web.xml (route)
+
+def test_web_app_declares_metadata_complete_true():
+    web_xml = '<web-app metadata-complete="true"><servlet></servlet></web-app>'
+    assert java.web_app_declares_metadata_complete(web_xml) is True
+
+
+def test_web_app_declares_metadata_complete_absent_control():
+    """Control: the ordinary, attribute-absent case (Servlet 3.0 s8.1's
+    own default is false) must never be mistaken for true."""
+    web_xml = "<web-app><servlet></servlet></web-app>"
+    assert java.web_app_declares_metadata_complete(web_xml) is False
+
+
+def test_web_app_declares_metadata_complete_false_explicit_control():
+    web_xml = '<web-app metadata-complete="false"><servlet></servlet></web-app>'
+    assert java.web_app_declares_metadata_complete(web_xml) is False
+
+
+def test_web_app_declares_metadata_complete_ignores_a_leaf_elsewhere_in_the_document():
+    """Scoping control: the attribute is read from the root <web-app>'s
+    OWN opening tag only - a leaf element elsewhere in the descriptor
+    that happens to contain the literal text must never be mistaken for
+    the real, root-level declaration."""
+    web_xml = (
+        '<web-app><description>see metadata-complete="true" in the wiki</description>'
+        "<servlet></servlet></web-app>"
+    )
+    assert java.web_app_declares_metadata_complete(web_xml) is False
+
+
+def test_web_app_declares_metadata_complete_single_quoted_attribute():
+    web_xml = "<web-app metadata-complete='true'><servlet></servlet></web-app>"
+    assert java.web_app_declares_metadata_complete(web_xml) is True
+
+
+def test_parse_web_xml_extracts_servlet_mapping_routes():
+    web_xml = """<web-app>
+  <servlet-mapping>
+    <servlet-name>dispatcher</servlet-name>
+    <url-pattern>/api/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert len(entry_points) == 1
+    assert entry_points[0].name == "/api/*"
+    assert entry_points[0].kind == "http_route"
+    assert entry_points[0].evidence_class == "declared"
+
+
+def test_parse_web_xml_ignores_a_commented_out_servlet_mapping():
+    """M-1 (second cold read, fix round 4): same fix as parse_maven_pom -
+    a servlet-mapping inside an XML comment must not publish as a route."""
+    web_xml = """<web-app>
+  <!--
+  <servlet-mapping>
+    <servlet-name>disabled</servlet-name>
+    <url-pattern>/disabled/*</url-pattern>
+  </servlet-mapping>
+  -->
+  <servlet-mapping>
+    <servlet-name>dispatcher</servlet-name>
+    <url-pattern>/api/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert [e.name for e in entry_points] == ["/api/*"]
+
+
+def test_parse_web_xml_captures_every_url_pattern_in_one_servlet_mapping():
+    """FIX ROUND 15 (eleventh cold read, F1 MAJOR, wrong-data): a single
+    <servlet-mapping> may carry SEVERAL <url-pattern> children (legal,
+    and legacy apps routinely do it) - only the FIRST used to publish,
+    the rest silently vanished with no problem recorded. Reviewer's own
+    cr11-fx2 shape verbatim: /legacy/*, /old/*, *.do in one mapping."""
+    web_xml = """<web-app>
+  <servlet-mapping>
+    <servlet-name>legacy</servlet-name>
+    <url-pattern>/legacy/*</url-pattern>
+    <url-pattern>/old/*</url-pattern>
+    <url-pattern>*.do</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert sorted(e.name for e in entry_points) == ["*.do", "/legacy/*", "/old/*"]
+    assert len({e.qualified_name for e in entry_points}) == 1
+    assert all(e.kind == "http_route" and e.evidence_class == "declared" for e in entry_points)
+
+
+def test_parse_web_xml_a_servlet_mapping_route_publishes_a_paired_route_edge():
+    """FIX ROUND 27 (twenty-third cold read, F4, mechanism confirmed,
+    .cr23-routesym): a web.xml-declared route published a real entry
+    point but no matching `route`-relation edge, unlike every
+    annotation-based route - one document reported 4 route/filter
+    entry points and dependency_summary.routes: 2. Every published
+    servlet-mapping route must now ALSO emit its own paired edge, one
+    per url-pattern, with the identical owner/target/line."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>dispatcher</servlet-name>
+    <servlet-class>com.acme.web.DispatcherServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>dispatcher</servlet-name>
+    <url-pattern>/api/*</url-pattern>
+    <url-pattern>/api2/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _problems, edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert len(entry_points) == 2
+    assert len(edges) == 2
+    for edge in edges:
+        assert edge.relation == "route"
+        assert edge.target_kind == "external_route"
+        assert edge.from_qualified_name == "com.acme.web.DispatcherServlet"
+        assert edge.evidence_class == "declared"
+    assert sorted(e.target for e in edges) == ["/api/*", "/api2/*"]
+    assert sorted(e.name for e in entry_points) == sorted(e.target for e in edges)
+
+
+def test_parse_web_xml_a_filter_mapping_route_publishes_a_paired_route_edge():
+    """FIX ROUND 27 (F4, mechanism confirmed): the filter twin of the
+    servlet-mapping case above - @WebFilter's own annotation path
+    already emits this pairing for a filter entry point, the XML
+    <filter-mapping> shape must match it at the same fidelity."""
+    web_xml = """<web-app>
+  <filter>
+    <filter-name>auth</filter-name>
+    <filter-class>com.acme.web.AuthFilter</filter-class>
+  </filter>
+  <filter-mapping>
+    <filter-name>auth</filter-name>
+    <url-pattern>/secure/*</url-pattern>
+  </filter-mapping>
+</web-app>
+"""
+    entry_points, _problems, edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert len(entry_points) == 1
+    assert len(edges) == 1
+    assert edges[0].relation == "route"
+    # FIX ROUND 29 (F4 MAJOR, completeness): target_kind now distinguishes
+    # a filter's own edge from a served route's - see dependencies_
+    # artifact.DependencyRecord.route_kind's own docstring.
+    assert edges[0].target_kind == "external_filter"
+    assert edges[0].from_qualified_name == "com.acme.web.AuthFilter"
+    assert edges[0].target == "/secure/*"
+    assert entry_points[0].kind == "http_filter"
+
+
+def test_parse_web_xml_links_a_mapping_to_its_declared_servlet_class():
+    """FIX ROUND 17 (thirteenth cold read, CR13-2 MAJOR, wrong-data):
+    <servlet-class> was NEVER read at all - twice carried as an M5/M7
+    fast-follow, now the actual fix. A <servlet> element's own
+    servlet-name/servlet-class pair, joined against <servlet-mapping>'s
+    identical servlet-name, must give the mapped route its real
+    implementing class as the entry point's own qualified_name -
+    features_artifact.build_features already resolves an entry point's
+    owner through an exact qualified_name match against the SAME
+    registry every other producer's units build through; no further
+    plumbing needed once the real class name is published here."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>dispatcher</servlet-name>
+    <servlet-class>com.acme.web.DispatcherServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>dispatcher</servlet-name>
+    <url-pattern>/api/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert len(entry_points) == 1
+    assert entry_points[0].qualified_name == "com.acme.web.DispatcherServlet"
+
+
+def test_parse_web_xml_falls_back_to_the_synthetic_owner_with_no_matching_servlet():
+    """Companion negative case: a <servlet-mapping> with no matching
+    <servlet> element (malformed, or genuinely absent) keeps the OLD
+    synthetic {relative_path}#{servlet_name} placeholder - the fix only
+    closes the specific case where a real <servlet-class> exists and was
+    simply never read."""
+    web_xml = """<web-app>
+  <servlet-mapping>
+    <servlet-name>legacy</servlet-name>
+    <url-pattern>/legacy/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert entry_points[0].qualified_name == "WEB-INF/web.xml#legacy"
+
+
+def test_parse_web_xml_a_mapping_naming_an_annotation_only_servlet_resolves_to_its_class():
+    """MICRO-ROUND 49 (forty-third cold read, M3 MAJOR, wrong-data):
+    Servlet spec s8.2.3 - servlet names share ONE namespace regardless
+    of whether they are declared via XML or an annotation. A <servlet-
+    mapping> naming a servlet that is declared ONLY by a real, in-scan
+    @WebServlet(name=...) annotation (no matching <servlet> element at
+    all) used to get a FALSE undeclared_descriptor_name (degrading the
+    run) and its route mis-attributed to web.xml's own FILE unit -
+    reproduced pre-fix exactly as measured. Now resolves directly to
+    the annotation-declaring class, and no problem is recorded."""
+    web_xml = """<web-app>
+  <servlet-mapping>
+    <servlet-name>Checkout</servlet-name>
+    <url-pattern>/checkout</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
+        "WEB-INF/web.xml", web_xml,
+        annotation_declared_servlet_names={"Checkout": ["com.acme.CheckoutServlet"]})
+    assert len(entry_points) == 1
+    assert entry_points[0].qualified_name == "com.acme.CheckoutServlet"
+    assert not any(p.reason_code == "undeclared_descriptor_name" for p in problems)
+
+
+def test_parse_web_xml_a_mapping_naming_an_annotation_only_filter_resolves_to_its_class():
+    """MICRO-ROUND 49 (M3's own @WebFilter twin)."""
+    web_xml = """<web-app>
+  <filter-mapping>
+    <filter-name>Auth</filter-name>
+    <url-pattern>/secure/*</url-pattern>
+  </filter-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
+        "WEB-INF/web.xml", web_xml,
+        annotation_declared_filter_names={"Auth": ["com.acme.AuthFilter"]})
+    assert len(entry_points) == 1
+    assert entry_points[0].qualified_name == "com.acme.AuthFilter"
+    assert not any(p.reason_code == "undeclared_descriptor_name" for p in problems)
+
+
+def test_parse_web_xml_a_genuinely_undeclared_name_control_still_flags():
+    """Control for the fix above: a <servlet-mapping> naming something
+    declared NOWHERE (not in web.xml's own <servlet> blocks, not in any
+    annotation this run scanned) must keep reporting undeclared_
+    descriptor_name exactly as before this round."""
+    web_xml = """<web-app>
+  <servlet-mapping>
+    <servlet-name>Ghost</servlet-name>
+    <url-pattern>/ghost</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
+        "WEB-INF/web.xml", web_xml,
+        annotation_declared_servlet_names={"Checkout": ["com.acme.CheckoutServlet"]})
+    assert entry_points[0].qualified_name == "WEB-INF/web.xml#Ghost"
+    assert any(p.reason_code == "undeclared_descriptor_name" for p in problems)
+
+
+def test_parse_web_xml_a_name_declared_differently_by_xml_and_annotation_conflicts():
+    """MICRO-ROUND 49 (M3's own conflict control - the .cr43-double
+    shape, unchanged behavior): a name declared via a REAL <servlet>
+    element AND, disagreeing, via an annotation - the SAME conflict
+    machinery that already handles two disagreeing XML declarations
+    (round 30's own F1) must catch this cross-source disagreement too,
+    never silently pick one side."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>Checkout</servlet-name>
+    <servlet-class>com.acme.XmlCheckoutServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>Checkout</servlet-name>
+    <url-pattern>/checkout</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    _entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
+        "WEB-INF/web.xml", web_xml,
+        annotation_declared_servlet_names={"Checkout": ["com.acme.AnnotationCheckoutServlet"]})
+    assert any(p.reason_code == "duplicate_descriptor_name" for p in problems)
+
+
+def test_parse_web_xml_two_annotation_only_servlets_declaring_the_same_name_conflict():
+    """MICRO-ROUND 50 (Cluster 2, M1 BLOCKER, wrong-data): TWO different
+    classes both declaring @WebServlet(name="dup") - no XML <servlet>
+    element involved at all - must conflict through the SAME mechanism
+    as two disagreeing XML declarations, never silently resolve to
+    whichever one this run's own annotation_declared_servlet_names list
+    happens to carry first or last."""
+    web_xml = """<web-app>
+  <servlet-mapping>
+    <servlet-name>dup</servlet-name>
+    <url-pattern>/dup</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    _entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
+        "WEB-INF/web.xml", web_xml,
+        annotation_declared_servlet_names={"dup": ["com.acme.A", "com.acme.B"]})
+    assert any(p.reason_code == "duplicate_descriptor_name" for p in problems)
+
+
+def test_parse_web_xml_two_annotation_only_filters_declaring_the_same_name_conflict():
+    """MICRO-ROUND 50 (Cluster 2, M1's own @WebFilter twin)."""
+    web_xml = """<web-app>
+  <filter-mapping>
+    <filter-name>dup</filter-name>
+    <url-pattern>/dup</url-pattern>
+  </filter-mapping>
+</web-app>
+"""
+    _entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
+        "WEB-INF/web.xml", web_xml,
+        annotation_declared_filter_names={"dup": ["com.acme.A", "com.acme.B"]})
+    assert any(p.reason_code == "duplicate_descriptor_name" for p in problems)
+
+
+def test_parse_web_xml_url_pattern_is_recovered_verbatim_regardless_of_size():
+    """FIX ROUND 13 (ninth cold read, CR9-6, judged completeness): a
+    url-pattern published VERBATIM, UNBOUNDED, while every Java route
+    target is already length-bounded (invariant 3) - routed through the
+    same per-field bounding discipline.
+
+    CORRECTED (round 41, thirty-fifth cold read, F1+F2, THE STRUCTURAL
+    CURE): that per-field bounding discipline moved from EXTRACTION to
+    DISPLAY-WRITE - bounding a route value at extraction made the CLAIM
+    itself (an `entry_point_id`/`edge_id` input) a lossy projection,
+    letting two genuinely different oversized patterns collide. The
+    claim now carries the value verbatim, whatever its size; see
+    test_comprehension_features_artifact.py's own length-bound battery
+    for the published, bounded display form."""
+    from agenttalk.comprehension.adapters.java import _MAX_ROUTE_TARGET_LENGTH
+
+    oversized = "/" + ("x" * (_MAX_ROUTE_TARGET_LENGTH + 50))
+    web_xml = f"""<web-app>
+  <servlet-mapping>
+    <servlet-name>dispatcher</servlet-name>
+    <url-pattern>{oversized}</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert entry_points[0].name == oversized
+
+
+def test_parse_maven_pom_group_and_artifact_id_are_recovered_verbatim_regardless_of_size():
+    """FIX ROUND 13 (CR9-6): same per-field bounding discipline applied
+    to a pom's own groupId/artifactId - a hostile or merely enormous pom
+    used to publish either verbatim, unbounded.
+
+    CORRECTED (round 41, thirty-fifth cold read, F1+F2 BLOCKER, wrong-
+    data - THE STRUCTURAL CURE): CR9-6's own reasoning was the bug - a
+    pom coordinate is an IDENTITY field (this edge's own `target`, exact-
+    matched against the in-scan registry, and an `edge_id` input), not
+    free display text like a route name. Bounding it here let two
+    genuinely different, >200-char-prefix-sharing dependency coordinates
+    coalesce into ONE resolved edge with zero signal - the reader's own
+    measured F1 finding. JUDGED (round 41): a qualified-name-shaped
+    identity field is never bounded, at extraction OR display - unlike a
+    route/filter name, which is bounded only at display-write (see
+    `bounded_route_target`'s own docstring for the judged line this
+    producer now draws between the two)."""
+    from agenttalk.comprehension.adapters.java import _MAX_ROUTE_TARGET_LENGTH
+
+    oversized_group = "g" * (_MAX_ROUTE_TARGET_LENGTH + 50)
+    pom = (
+        "<project><dependencies><dependency>"
+        f"<groupId>{oversized_group}</groupId><artifactId>spring-core</artifactId>"
+        "</dependency></dependencies></project>"
+    )
+    _units, edges, _profile_count = java.parse_maven_pom("pom.xml", pom)
+    assert len(edges) == 1
+    assert edges[0].target == f"{oversized_group}:spring-core"
+
+
+# ----------------------------------------- F3 MAJOR (round 18): parent groupId fallback
+
+def test_parse_maven_pom_registers_a_unit_using_a_groupid_inherited_from_parent():
+    """FIX ROUND 18 (fourteenth cold read, F3 MAJOR, wrong-data): a child
+    pom that inherits its groupId from its own <parent> block (the
+    standard, common Maven reactor spelling) used to register no unit at
+    all - round 17's own NAMED LIMIT called this a safe under-claim, but
+    the reviewer states it is actually an OVER-claim: a sibling's
+    dependency edge on that child publishes a confident resolved/
+    external, not an honest unresolved. Now registers the unit using the
+    parent's groupId, paired with the pom's own (never-inherited)
+    artifactId."""
+    pom = (
+        "<project>"
+        "<parent><groupId>com.acme</groupId><artifactId>acme-parent</artifactId>"
+        "<version>1.0</version></parent>"
+        "<artifactId>acme-core</artifactId>"
+        "</project>"
+    )
+    units, _edges, _profile_count = java.parse_maven_pom("acme-core/pom.xml", pom)
+    assert len(units) == 1
+    assert units[0].qualified_name == "com.acme:acme-core"
+    assert units[0].simple_name == "acme-core"
+
+
+def test_parse_maven_pom_prefers_its_own_explicit_groupid_over_parents():
+    """The existing explicit-groupId case must stay green, unchanged -
+    an own project-level <groupId> always wins over a <parent>'s,
+    regardless of textual order in the file."""
+    pom = (
+        "<project>"
+        "<parent><groupId>com.acme</groupId><artifactId>acme-parent</artifactId>"
+        "<version>1.0</version></parent>"
+        "<groupId>com.acme.override</groupId>"
+        "<artifactId>acme-core</artifactId>"
+        "</project>"
+    )
+    units, _edges, _profile_count = java.parse_maven_pom("acme-core/pom.xml", pom)
+    assert len(units) == 1
+    assert units[0].qualified_name == "com.acme.override:acme-core"
+
+
+def test_parse_maven_pom_registers_no_unit_for_a_pom_with_neither_groupid_nor_parent():
+    """A pathological pom with NEITHER an explicit project-level groupId
+    NOR a readable <parent> still registers no unit at all - unchanged
+    from before this round; this adapter has no basis to invent an
+    identity for it. (Whether a dependent's edge on such a coordinate
+    should be classified `unresolved` rather than `external` is a
+    separate, open registry-policy question left for reviewer-3 - see
+    the PR description.)"""
+    pom = "<project><artifactId>acme-core</artifactId></project>"
+    units, _edges, _profile_count = java.parse_maven_pom("acme-core/pom.xml", pom)
+    assert units == []
+
+
+# ----------------------------------------------------------- xml root sniff (round 14b)
+
+def test_sniff_xml_root_element_recognizes_spring_beans():
+    assert java.sniff_xml_root_element(
+        "<beans><bean id=\"x\" class=\"y\"/></beans>") == "beans"
+
+
+def test_sniff_xml_root_element_recognizes_logback_configuration():
+    assert java.sniff_xml_root_element(
+        "<configuration><root level=\"INFO\"/></configuration>") == "configuration"
+
+
+def test_sniff_xml_root_element_recognizes_checkstyle_module():
+    assert java.sniff_xml_root_element("<module name=\"Checker\"></module>") == "module"
+
+
+def test_sniff_xml_root_element_skips_the_prolog_and_comments():
+    text = (
+        "<?xml version=\"1.0\"?>\n"
+        "<!-- a leading comment with a <fake/> tag inside it -->\n"
+        "<beans/>\n"
+    )
+    assert java.sniff_xml_root_element(text) == "beans"
+
+
+def test_sniff_xml_root_element_strips_a_namespace_prefix():
+    assert java.sniff_xml_root_element("<b:beans xmlns:b=\"x\"/>") == "beans"
+
+
+def test_sniff_xml_root_element_returns_none_when_undeterminable():
+    assert java.sniff_xml_root_element("not actually xml at all") is None
+
+
+# ------------------------------------------------- xml root sniff hostile inputs (round 14c)
+
+def test_sniff_xml_root_element_ignores_a_fake_beans_tag_inside_a_processing_instruction():
+    """FIX ROUND 14c (reviewer-3's own real-file repro, pulled forward):
+    a PI's raw content is not markup at all - a literal "<beans" living
+    inside one (`<?custom-pi <beans> ?>`) must never be read as the real
+    root, or problems.json ends up asserting a root the source never
+    actually declared."""
+    text = "<?custom-pi <beans> ?>\n<cfg/>\n"
+    assert java.sniff_xml_root_element(text) == "cfg"
+
+
+def test_sniff_xml_root_element_ignores_a_fake_beans_tag_inside_a_doctype_entity_value():
+    """FIX ROUND 14c: a DOCTYPE internal subset's <!ENTITY> replacement
+    text is not markup either - blanking the WHOLE doctype declaration
+    (including its internal subset), offset-preserving, keeps this from
+    ever being read as the real root."""
+    text = (
+        "<!DOCTYPE cfg [\n"
+        "  <!ENTITY foo \"<beans>fake</beans>\">\n"
+        "]>\n"
+        "<cfg/>\n"
+    )
+    assert java.sniff_xml_root_element(text) == "cfg"
+
+
+def test_sniff_xml_root_element_returns_none_for_an_unterminated_comment():
+    """FIX ROUND 14c: an unterminated comment (no matching --> anywhere)
+    is malformed input - everything from that point on cannot be
+    trusted, so a <beans> tag living "inside" it must never be read as
+    a real root. Fails toward record-only (None), the safe side."""
+    text = "<!-- unterminated comment containing <beans\n<cfg/>\n"
+    assert java.sniff_xml_root_element(text) is None
+
+
+def test_sniff_xml_root_element_is_case_sensitive():
+    """FIX ROUND 14c (reviewer-3's micro-note): XML element names are
+    case-sensitive - the sniff itself must never fold case, so a caller
+    comparing against an exact expected spelling gets an honest answer."""
+    assert java.sniff_xml_root_element("<BEANS/>") == "BEANS"
+    assert java.sniff_xml_root_element("<BEANS/>") != "beans"
+
+
+def test_sniff_xml_root_element_recognizes_the_spring_dtd_form_doctype_as_beans():
+    """FIX ROUND 14c: the DOCTYPE blanking must not blank PAST the
+    doctype into the real root that follows it - Spring's own classic
+    DTD-form beans file (a real, common shape) is the regression that
+    proves the bounded [^\\[>]/[^>] character classes cannot cross the
+    declaration's own closing '>'."""
+    text = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<!DOCTYPE beans PUBLIC \"-//SPRING//DTD BEAN 2.0//EN\" "
+        "\"http://www.springframework.org/dtd/spring-beans-2.0.dtd\">\n"
+        "<beans><bean id=\"x\" class=\"y\"/></beans>\n"
+    )
+    assert java.sniff_xml_root_element(text) == "beans"
+
+
+# ----------------------------------------------------------- honest gaps
+
+def test_unsupported_relations_are_named_not_silently_omitted():
+    """FIX ROUND 29 (twenty-fifth cold read, F9a note): "include" is part
+    of dependencies_artifact.CLOSED_RELATIONS's own closed vocabulary
+    but this adapter never actually emits it - a pom's own <parent>
+    coordinate and a reactor's own <modules><module> aggregator entries
+    are exactly the two shapes it would cover. Declared, not silently
+    absent from this same static-capability tuple."""
+    assert java.UNSUPPORTED_RELATIONS == ("data", "configuration", "include")
+
+
+def test_unsupported_invoke_shapes_are_named_not_silently_omitted():
+    """FIX ROUND 14 (tenth cold read, CR10-3 JUDGE): a constructor call
+    (`new OrderNotFound(id)`) produces no invoke edge - a sub-shape gap
+    within the otherwise-supported "invoke" relation, not a whole
+    deferred relation, so it gets its own narrower, equally explicit
+    enumeration rather than silence.
+
+    FIX ROUND 29 (F9b note, declare): a field-injected collaborator call
+    (`@Autowired`/`@Inject` field, then `fooService.doThing()`) is the
+    same class of gap - a lowercase-led, instance-qualified call this
+    invoke extractor cannot see - folded in as "instance_qualified_call"
+    alongside its sibling."""
+    assert java.UNSUPPORTED_INVOKE_SHAPES == (
+        "constructor_call", "instance_qualified_call")
+
+
+def test_a_constructor_call_produces_no_invoke_edge():
+    result = java.parse_java_source(
+        "OrderService.java",
+        "package p;\nclass OrderService {\n"
+        "  void run() { throw new OrderNotFound(1); }\n"
+        "}\n",
+    )
+    assert not any(e.relation == "invoke" for e in result.edges)
+
+
+def test_a_field_injected_collaborator_call_produces_no_invoke_edge():
+    """FIX ROUND 29 (F9b note, declare): a real DI-wired collaborator
+    (`@Autowired private OrderService orderService;`, then
+    `orderService.place(...)` elsewhere in the class) is called through
+    a lowercase-led instance qualifier - the same
+    "instance_qualified_call" gap `UNSUPPORTED_INVOKE_SHAPES` now names,
+    not a type-qualified call this extractor can resolve."""
+    result = java.parse_java_source(
+        "OrderController.java",
+        "package p;\nclass OrderController {\n"
+        "  @Autowired private OrderService orderService;\n"
+        "  void run() { orderService.place(1); }\n"
+        "}\n",
+    )
+    assert not any(e.relation == "invoke" for e in result.edges)
+
+
+# ----------------------------------------------------------- line lookup perf (M11)
+
+def test_line_at_matches_naive_line_counting_for_every_offset():
+    text = "line1\nline2\nline3\nline4\n"
+    offsets = java._newline_offsets(text)
+    for probe in range(len(text)):
+        assert java._line_at(offsets, probe) == text.count("\n", 0, probe) + 1
+
+
+def test_parsing_a_large_file_completes_well_under_a_generous_bound():
+    """M11 (cold-read, PR-B fix round 3): _line_at previously recomputed a
+    line count from offset 0 on EVERY call - once per import, per type,
+    per invocation, per route match - making the adapter's total cost
+    quadratic in file size (measured pre-fix: 0.27 MiB in 0.79s, 0.53 MiB
+    in 3.02s, 1.07 MiB in 12.33s, ~4x per doubling; the 64 MiB per-file cap
+    extrapolates to hours). A generous bound here (not a tight benchmark,
+    to avoid CI flakiness) would fail hard under the old quadratic
+    behavior but comfortably passes under the fixed O(n) + O(log n)-per-
+    lookup behavior - this file parses in well under a second locally."""
+    import time
+
+    many_imports = "".join(f"import p.C{i};\n" for i in range(20_000))
+    source = "package p;\n" + many_imports + "class Big {}\n"
+    start = time.monotonic()
+    result = java.parse_java_source("Big.java", source)
+    elapsed = time.monotonic() - start
+    assert len(_edges(result, "import")) == 20_000
+    assert elapsed < 5.0, f"parsing took {elapsed:.2f}s - possible quadratic regression"
+
+
+# --------------------------------------------------- fix round 26 F1 (comment-vs-CDATA document order)
+
+def test_split_xml_comments_and_cdata_a_comment_marker_inside_cdata_never_swallows_real_markup():
+    """FIX ROUND 26 (twenty-second cold read, F1 BLOCKER, .cr22-
+    cdatacomment, wrong-data): _strip_xml_comments used to run on the
+    RAW text BEFORE _blank_cdata_sections ever ran, so a literal
+    "<!--" living inside a <description>'s own CDATA content started a
+    comment match that swallowed real markup up to the NEXT "-->"
+    anywhere in the file - here, the whole real <dependencies> block.
+    The unified, order-aware scanner must recognize the "<!--" as inert
+    CDATA text (never a real comment opening) and leave the real
+    dependency block intact."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <description><![CDATA[see <!-- the readme for details ]]></description>
+  <dependencies>
+    <dependency><groupId>org.real</groupId><artifactId>real-lib</artifactId></dependency>
+  </dependencies>
+</project>
+-->
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.real:real-lib"}
+
+
+def test_split_xml_comments_and_cdata_a_comment_marker_inside_cdata_web_xml_route_survives():
+    """FIX ROUND 26 (F1 BLOCKER, .cr22-cdatacomment-web2): the web.xml
+    twin - a stray "<!--" inside a <description>'s CDATA must not mask
+    a live route declared later in the same file."""
+    web_xml = """<web-app>
+  <description><![CDATA[migrated from <!-- the old dispatcher ]]></description>
+  <servlet-mapping>
+    <servlet-name>beta</servlet-name>
+    <url-pattern>/beta/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+-->
+"""
+    entry_points, _problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert {e.name for e in entry_points} == {"/beta/*"}
+
+
+def test_split_xml_comments_and_cdata_a_cdata_marker_inside_a_real_comment_stays_inert():
+    """FIX ROUND 26 (F1 BLOCKER, the symmetric ordering control): a
+    literal "<![CDATA[" living inside a REAL XML comment is comment
+    text, never the start of a genuine CDATA section - a comment
+    documenting the CDATA idiom itself (e.g. in a template/example)
+    must not accidentally open a CDATA span that swallows whatever
+    follows the comment's own real "-->"."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <!-- example: wrap free text like <![CDATA[ this -->
+  <dependencies>
+    <dependency><groupId>org.real</groupId><artifactId>real-lib</artifactId></dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.real:real-lib"}
+
+
+def test_split_xml_comments_and_cdata_matches_the_old_two_pass_behavior_on_ordinary_input():
+    """FIX ROUND 26 (F1 BLOCKER, regression control): on ordinary,
+    non-adversarial XML (a ratified pom description/CDATA shape from
+    round 25's own matrix), the new single ordered scan must produce
+    the identical (sanitized, structural) pair the old two independent
+    passes already produced - the fix changes only the ADVERSARIAL
+    ordering case, never the common one."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <!-- a plain, unremarkable comment -->
+  <description><![CDATA[some <b>bold</b> text]]></description>
+  <dependencies>
+    <dependency><groupId>org.a</groupId><artifactId>a</artifactId></dependency>
+  </dependencies>
+</project>
+"""
+    sanitized, structural = java._split_xml_comments_and_cdata(pom)
+    assert "<dependency>" in sanitized
+    assert "<dependency>" in structural
+    assert "<![CDATA[" in sanitized
+    assert "<![CDATA[" not in structural
+    assert len(sanitized) == len(pom)
+    assert len(structural) == len(pom)
+
+
+def test_split_xml_comments_and_cdata_an_unterminated_comment_blanks_to_eof():
+    """FIX ROUND 26 (F1 BLOCKER): the fail-safe direction for a genuinely
+    malformed, unterminated comment is unchanged from the old passes -
+    blank through to EOF, never read whatever text happens to follow."""
+    text = "before<!-- never closed"
+    sanitized, structural = java._split_xml_comments_and_cdata(text)
+    assert sanitized.strip() == "before"
+    assert structural.strip() == "before"
+    assert len(sanitized) == len(text)
+
+
+def test_a_pom_processing_instruction_never_publishes_a_phantom_dependency():
+    """MICRO-NOD 50b (F1 BLOCKER, cross-vendor read, wrong-data,
+    reproduced verbatim): a processing instruction was never recognized
+    by the shared comment/CDATA chokepoint at all - markup-shaped text
+    inside a <?audit ...?> PI (well-formed per the XML spec: a PI's own
+    content is opaque application data, never real markup) published as
+    a REAL <dependency> block, resolving a phantom external coordinate
+    (phantom:invented) on a complete/0-problems run. The PI is now
+    blanked exactly like a comment; only the real dependency survives."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <dependencies>
+    <?audit <dependency><groupId>phantom</groupId><artifactId>invented</artifactId></dependency>?>
+    <dependency><groupId>org.real</groupId><artifactId>real-lib</artifactId></dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.real:real-lib"}
+    assert "phantom:invented" not in {e.target for e in edges}
+
+
+def test_a_pom_processing_instruction_leaves_a_real_dependency_around_it_untouched():
+    """MICRO-NOD 50b (F1 BLOCKER, real-element control): a PI sitting
+    between two real <dependency> blocks must not blank, truncate, or
+    otherwise disturb either of them - only the PI's own span is ever
+    touched."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <dependencies>
+    <dependency><groupId>org.before</groupId><artifactId>before-lib</artifactId></dependency>
+    <?audit generated 2026-09-01T00:00:00Z by legacy-tool?>
+    <dependency><groupId>org.after</groupId><artifactId>after-lib</artifactId></dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.before:before-lib", "org.after:after-lib"}
+
+
+def test_a_web_xml_processing_instruction_never_publishes_a_phantom_route():
+    """MICRO-NOD 50b (F1 BLOCKER, cross-vendor read, wrong-data,
+    reproduced verbatim): the web.xml twin of the pom finding - a
+    <?audit ...?> PI containing a well-formed <servlet>/<servlet-mapping>
+    pair published a phantom /phantom route, entry point, and servlet
+    unit on a complete/0-problems run. The PI is now blanked; no entry
+    point is published from its content at all."""
+    web_xml = """<web-app>
+  <?audit <servlet><servlet-name>ghost</servlet-name>
+    <servlet-class>com.acme.web.PhantomServlet</servlet-class></servlet>
+    <servlet-mapping><servlet-name>ghost</servlet-name>
+    <url-pattern>/phantom</url-pattern></servlet-mapping>?>
+</web-app>
+"""
+    entry_points, _problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert entry_points == []
+    assert "/phantom" not in {e.name for e in entry_points}
+
+
+def test_a_web_xml_processing_instruction_leaves_a_real_route_around_it_untouched():
+    """MICRO-NOD 50b (F1 BLOCKER, real-element control): a PI sitting
+    beside a real <servlet-mapping> must not mask the live route."""
+    web_xml = """<web-app>
+  <?audit generated 2026-09-01T00:00:00Z by legacy-tool?>
+  <servlet-mapping>
+    <servlet-name>beta</servlet-name>
+    <url-pattern>/beta/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert {e.name for e in entry_points} == {"/beta/*"}
+
+
+def test_a_processing_instruction_containing_comment_shaped_text_blanks_as_one_span():
+    """MICRO-NOD 50b (F1 BLOCKER, interaction shape): a PI's own content
+    may legally contain comment-shaped text ("<!--"/"-->") - the PI is
+    still recognized as ONE span through to its own real "?>" terminator
+    (whichever marker occurs FIRST wins, per _split_xml_comments_and_
+    cdata's own document-order discipline), never split into a shorter
+    PI plus a spurious separate "comment" that would then hunt for the
+    next "-->" anywhere else in the file and swallow real markup past
+    the PI's own end."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <dependencies>
+    <?audit note: <!-- an internal aside --> phantom:
+    <dependency><groupId>phantom</groupId>
+    <artifactId>invented</artifactId></dependency>?>
+    <dependency><groupId>org.real</groupId><artifactId>real-lib</artifactId></dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.real:real-lib"}
+
+
+# ------------------------------- fix round 38 F2 (a comment interior to a leaf value corrupts its own decode)
+
+def test_splice_comment_spans_removes_a_comment_and_leaves_comment_free_text_untouched():
+    """FIX ROUND 38 (thirty-second cold read, F2 BLOCKER, wrong-data):
+    the new splice primitive itself - a comment interior to a string is
+    removed (never blanked, unlike _split_xml_comments_and_cdata's own
+    structural-scan blanking), concatenating the text around it exactly
+    the way an XML text node does; comment-free text is returned
+    unchanged (the common, overwhelming case, no marker to splice)."""
+    assert java._splice_comment_spans("mod<!--internal build tag-->b") == "modb"
+    assert java._splice_comment_spans("/a<!--x-->b") == "/ab"
+    assert java._splice_comment_spans("ordinary text, no comment") == "ordinary text, no comment"
+    # A comment-shaped "<!--" living inside this SAME value's own CDATA
+    # content is not a comment - left alone, CDATA markers intact for
+    # _decode_xml_text's own subsequent CDATA unwrap.
+    assert (
+        java._splice_comment_spans("<![CDATA[see <!-- the readme]]>")
+        == "<![CDATA[see <!-- the readme]]>"
+    )
+
+
+def test_web_xml_url_pattern_with_an_interior_comment_splices_it_out():
+    """FIX ROUND 38 (thirty-second cold read, F2 BLOCKER, .cr32-xmlleaf,
+    wrong-data): a comment interior to a <url-pattern>'s own value
+    (/a<!--x-->b) used to publish the entry point's own name as literal
+    blanked whitespace ("/a        b") instead of the spec-correct,
+    concatenated value ("/ab") a real container would actually serve -
+    the boundary already refused the sibling CDATA/entity-unrecoverable
+    shapes; a plain interior comment fell through uncaught. Comment
+    BEFORE/AFTER the live value (not interior to it) is unaffected,
+    already covered by the round-4/6 annotation-side controls and the
+    round-26 CDATA-vs-comment ordering controls above."""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
+        "WEB-INF/web.xml",
+        "<web-app>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>a</servlet-name>\n"
+        "    <url-pattern>/a<!--internal routing note-->b</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+    )
+    assert [e.name for e in entry_points] == ["/ab"]
+    assert not any(p.reason_code == "route_value_unrecoverable" for p in problems)
+
+
+def test_pom_dependency_coordinate_with_an_interior_comment_splices_it_out():
+    """FIX ROUND 38 (thirty-second cold read, F2 BLOCKER, .cr32-xmlleaf,
+    wrong-data): the pom twin - a comment interior to a <dependency>'s
+    own <artifactId> (cmt<!--x-->lib) used to publish the edge's own
+    target coordinate as literal blanked whitespace ("org.cmt:cmt
+    lib"), a string that could never resolve against any real registry
+    entry, silently vanishing a real dependency edge (a genuinely
+    undecodable groupId/artifactId already surfaces as a visible
+    problem via pom_dependency_decode_problems - this shape used to
+    reach neither branch: not decoded correctly, not flagged as
+    undecodable either, simply absent)."""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom(
+        "pom.xml",
+        "<project><groupId>com.acme</groupId><artifactId>root</artifactId>"
+        "<dependencies><dependency>"
+        "<groupId>org.cmt</groupId><artifactId>cmt<!--internal build tag-->lib</artifactId>"
+        "</dependency></dependencies></project>",
+    )
+    build_edges = [e for e in edges if e.relation == "build"]
+    assert [e.target for e in build_edges] == ["org.cmt:cmtlib"]
+    assert java.pom_dependency_decode_problems(
+        "<project><groupId>com.acme</groupId><artifactId>root</artifactId>"
+        "<dependencies><dependency>"
+        "<groupId>org.cmt</groupId><artifactId>cmt<!--internal build tag-->lib</artifactId>"
+        "</dependency></dependencies></project>",
+    ) == []
+
+
+# ------------------------------------------------------- micro-round 38b (empty-after-splice, THE BLOCKER)
+
+def test_pom_comment_only_groupid_does_not_publish_a_bogus_coordinate():
+    """MICRO-ROUND 38b (reviewer-3 delta on `740a856`, THE BLOCKER,
+    wrong-data): <groupId><!--TODO--></groupId> is WELL-FORMED XML
+    ("inherited from parent" comments are what people write) yielding
+    the empty string after splice - which `_decode_xml_leaf` correctly
+    decodes, but publishing an empty groupId as a REAL, present value
+    produces the bogus coordinate ":core" (a coordinate that cannot
+    exist). Must publish NO unit for this pom's own coordinate, and
+    record it via the existing unrecoverable path (never silently)."""
+    pom = (
+        "<project><groupId><!--TODO--></groupId><artifactId>core</artifactId></project>"
+    )
+    units, _edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert units == []
+    assert not any(":core" in u.qualified_name for u in units)
+    assert java.pom_own_coordinate_decode_problems(pom) != []
+
+
+def test_pom_whitespace_only_groupid_does_not_publish_a_bogus_coordinate():
+    """MICRO-ROUND 38b (THE BLOCKER, whitespace-only control): a
+    <groupId> containing only whitespace (no comment at all) must land
+    identically to the comment-only case above - both are "empty after
+    decode," not two different shapes."""
+    pom = "<project><groupId>   </groupId><artifactId>core</artifactId></project>"
+    units, _edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert units == []
+    assert not any(":core" in u.qualified_name for u in units)
+    assert java.pom_own_coordinate_decode_problems(pom) != []
+
+
+def test_pom_genuinely_empty_groupid_lands_identically_to_comment_only():
+    """MICRO-ROUND 38b (THE BLOCKER, spelling-parity check): a
+    genuinely empty <groupId></groupId> and a comment-only one must
+    publish IDENTICALLY (both absent, both flagged) - the splice must
+    not create a NEW, divergent path to "empty" that the genuinely-
+    empty spelling does not also reach."""
+    empty_pom = "<project><groupId></groupId><artifactId>core</artifactId></project>"
+    comment_pom = "<project><groupId><!--TODO--></groupId><artifactId>core</artifactId></project>"
+    empty_units, _e, _p = java.parse_maven_pom("pom.xml", empty_pom)
+    comment_units, _e2, _p2 = java.parse_maven_pom("pom.xml", comment_pom)
+    assert empty_units == comment_units == []
+    assert java.pom_own_coordinate_decode_problems(empty_pom) != []
+    assert java.pom_own_coordinate_decode_problems(comment_pom) != []
+
+
+def test_two_modules_with_comment_only_groupid_and_the_same_artifactid_do_not_collide():
+    """MICRO-ROUND 38b (THE BLOCKER, the two-modules-collide shape):
+    before this fix, two DIFFERENT modules each declaring a comment-
+    only <groupId> and the identical <artifactId> both published the
+    SAME bogus coordinate (":artifactId") - a real identity collision
+    between two otherwise-unrelated modules, purely from two empty
+    groupIds coinciding. Neither module registers a coordinate unit at
+    all now, so there is nothing to collide on."""
+    pom_a = "<project><groupId><!--x--></groupId><artifactId>shared</artifactId></project>"
+    pom_b = "<project><groupId><!--y--></groupId><artifactId>shared</artifactId></project>"
+    units_a, _ea, _pa = java.parse_maven_pom("modA/pom.xml", pom_a)
+    units_b, _eb, _pb = java.parse_maven_pom("modB/pom.xml", pom_b)
+    assert units_a == units_b == []
+
+
+def test_pom_zero_width_space_only_artifactid_does_not_publish_a_bogus_coordinate():
+    """FIX ROUND 39 (thirty-third cold read, F4 LOW, .cr33-zwsp,
+    wrong-data): `_is_blank_identity` used `str.strip()` alone, which
+    only removes Unicode WHITESPACE - a ZERO WIDTH SPACE (U+200B) is an
+    invisible-FORMAT character, not whitespace, so an artifactId
+    containing only one escaped this gate and published a bogus
+    "com.acme:\\u200b"-shaped coordinate while the comment-only and
+    genuinely-empty spellings of the SAME (to any renderer) value
+    correctly refused - three identically-rendering spellings
+    diverged. Reuses _UNICODE_INVISIBLE_FORMAT_CHARS (the same closed
+    set the route-name escape choke point already uses for the
+    identical "renders as nothing" hazard, round 35's own F7)."""
+    zero_width_space = chr(0x200B)  # ZERO WIDTH SPACE - invisible-format, not whitespace
+    pom = (
+        "<project><groupId>com.acme</groupId>"
+        f"<artifactId>{zero_width_space}</artifactId></project>"
+    )
+    units, _edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert units == []
+    assert java.pom_own_coordinate_decode_problems(pom) != []
+
+
+def test_a_self_closed_project_level_groupid_never_swallows_a_dependency_s_own_coordinate():
+    """FIX ROUND 43 (thirty-seventh cold read, F2 BLOCKER, .cr37-coord,
+    wrong-data - THE SELF-CLOSING TAG DEFECT): a self-closed project-
+    level ``<groupId/>`` used to match as an opening tag and its lazy
+    body scanned FORWARD to the NEXT ``</groupId>`` ANYWHERE in the
+    document-wide scan ``_own_and_parent_group_ids``/
+    ``pom_own_coordinate_decode_problems`` both run - here, a
+    dependency's own ``<groupId>``, several elements later. The
+    fabricated "value" was raw, unrelated XML markup (everything
+    between the two tags, including the dependency's own artifactId
+    and surrounding structure), and the dependency's own real
+    ``<groupId>`` match VANISHED from the scan entirely (its own start
+    position lay inside the text the phantom match had already
+    consumed).
+
+    Judged disposition (per the ``<parent/>``/comment-only-groupId fail-
+    safe precedent already established for "present but blank"): a
+    self-closed leaf is present with an EMPTY value, exactly as
+    undecodable as a comment-only or whitespace-only one - refused via
+    the EXISTING ``project_group_id_declared_but_broken``/
+    ``_is_blank_identity`` machinery, no new disposition needed. The
+    dependency's own coordinate, no longer swallowed, resolves
+    normally."""
+    pom = """<project>
+  <groupId/>
+  <artifactId>core</artifactId>
+  <dependencies>
+    <dependency>
+      <groupId>com.other</groupId>
+      <artifactId>lib</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert units == []
+    assert not any(":core" in u.qualified_name for u in units)
+    assert [e.target for e in edges] == ["com.other:lib"]
+    assert java.pom_own_coordinate_decode_problems(pom) != []
+
+
+def test_a_self_closed_project_level_artifactid_never_swallows_a_dependency_s_own_coordinate():
+    """FIX ROUND 43 (.cr37-coord-artifactId, F2 BLOCKER): the SAME
+    defect as the groupId case above, for the project's own
+    ``<artifactId/>`` - it must not swallow forward into a
+    dependency's own ``<artifactId>``, corrupting or losing both."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId/>
+  <dependencies>
+    <dependency>
+      <groupId>com.other</groupId>
+      <artifactId>lib</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert units == []
+    assert [e.target for e in edges] == ["com.other:lib"]
+    assert java.pom_own_coordinate_decode_problems(pom) != []
+
+
+def test_a_self_closed_parent_groupid_is_the_same_safe_absent_default_as_a_missing_parent():
+    """FIX ROUND 43 (.cr37-coord-parent, control): a self-closed
+    ``<parent><groupId/></parent>`` must land on the SAME safe "no
+    usable parent groupId" default a genuinely absent ``<parent>``
+    block already gets - never a crash, never a swallowed neighbor,
+    and (unlike the project-level case) no ``declared_but_broken``
+    problem either, since a missing/blank PARENT groupId is not this
+    pom's own coordinate being broken - it simply has no inherited
+    fallback."""
+    pom = """<project>
+  <parent>
+    <groupId/>
+    <artifactId>parent-core</artifactId>
+  </parent>
+  <artifactId>child</artifactId>
+  <dependencies>
+    <dependency>
+      <groupId>com.other</groupId>
+      <artifactId>lib</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert units == []
+    assert [e.target for e in edges] == ["com.other:lib"]
+
+
+def test_an_unresolvable_property_in_the_own_groupid_never_registers_a_fabricated_identity():
+    """FIX ROUND 43 (thirty-seventh cold read, F3 MAJOR, .cr37-
+    coordprop, wrong-data): the SAME "${" HARD RULE
+    ``dependencies_artifact._classify_registry_miss`` already applies
+    to a DEPENDENCY's own unexpandable target property (see
+    ``test_an_unexpandable_pom_property_dependency_stays_unresolved_
+    spelling_retained`` in the dependencies-artifact test file) now
+    applies to this pom's OWN identity too - an unresolved
+    ``${custom.prop}`` (not one of the two self-referential properties
+    this producer can expand from the same file) left in the own
+    ``<groupId>`` must never register a coordinate that cannot exist
+    (``${custom.prop}:core``). No unit at all - the same honest
+    non-claim the dependency-target side already produces for this
+    exact shape, never a false positive on either side."""
+    pom = """<project>
+  <groupId>${custom.prop}</groupId>
+  <artifactId>core</artifactId>
+</project>
+"""
+    units, _edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert units == []
+    assert not any("${custom.prop}" in u.qualified_name for u in units)
+
+
+def test_the_two_self_referential_properties_still_expand_for_the_own_identity_path():
+    """FIX ROUND 43 (F3 MAJOR, expansion control): round 43's own new
+    "${" guard on the identity path must never catch the TWO self-
+    referential properties this producer already expands elsewhere
+    (``${project.groupId}``/``${project.parent.groupId}`` in a
+    DEPENDENCY's own target - see the dependencies-artifact test
+    file's own ``test_a_project_groupid_property_dependency_expands_
+    and_resolves_internal``) - those are resolved against THIS SAME
+    module's own already-parsed groupId before publication, never left
+    as a literal, unresolved ``${`` string in the first place, so this
+    guard never has occasion to fire for them. A plain, real groupId
+    (no property at all) must keep registering exactly as it always
+    has."""
+    pom = "<project><groupId>com.acme</groupId><artifactId>core</artifactId></project>"
+    units, _edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert [u.qualified_name for u in units] == ["com.acme:core"]
+
+
+def test_project_parent_groupid_expands_even_when_the_projects_own_groupid_comes_first():
+    """MICRO-ROUND 49 (forty-third cold read, C6, wrong-data - the same
+    class as B1): `_own_and_parent_group_ids` used to `break` the
+    instant it found the project's own top-level <groupId> - Maven's
+    own schema does not require <parent> to precede it (xs:all, same
+    reasoning as B1's own <exclusions> fix), so a pom declaring its own
+    <groupId> BEFORE <parent> (legal, if unusual) never even reached
+    the later <parent><groupId> match: ${project.parent.groupId}
+    silently never expanded, even though a real <parent> block existed.
+    Reproduced pre-fix exactly as measured."""
+    pom = (
+        "<project>"
+        "<groupId>com.acme</groupId>"
+        "<artifactId>core</artifactId>"
+        "<parent><groupId>com.acme.parent</groupId><artifactId>root</artifactId></parent>"
+        "<dependencies><dependency>"
+        "<groupId>${project.parent.groupId}</groupId><artifactId>shared</artifactId>"
+        "</dependency></dependencies>"
+        "</project>"
+    )
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"com.acme.parent:shared"}
+
+
+def test_project_parent_groupid_expands_when_parent_comes_first_control():
+    """Control for the fix above: the ordinary ordering (<parent> before
+    the project's own <groupId>) already worked and must keep working
+    identically."""
+    pom = (
+        "<project>"
+        "<parent><groupId>com.acme.parent</groupId><artifactId>root</artifactId></parent>"
+        "<groupId>com.acme</groupId>"
+        "<artifactId>core</artifactId>"
+        "<dependencies><dependency>"
+        "<groupId>${project.parent.groupId}</groupId><artifactId>shared</artifactId>"
+        "</dependency></dependencies>"
+        "</project>"
+    )
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"com.acme.parent:shared"}
+
+
+def test_pom_a_visible_artifactid_containing_a_zero_width_space_is_unaffected():
+    """FIX ROUND 39 (F4 LOW, control): the fix above must not treat a
+    REAL, visible identity value merely CONTAINING an invisible
+    character as blank - only a value consisting ENTIRELY of
+    whitespace/invisible characters is blank; what matters here is that
+    a unit is published at all, never that this one is blank.
+
+    CORRECTED (round 41, thirty-fifth cold read, F1+F2, THE STRUCTURAL
+    CURE): this used to assert the published coordinate escapes the
+    embedded invisible character to its visible ``\\u200b`` text form -
+    a pom coordinate is an IDENTITY field, never escaped/bounded at
+    all (see `bounded_route_target`'s own docstring) - the real
+    character is published raw."""
+    artifact_id = "re" + chr(0x200B) + "al"  # a real value merely CONTAINING one, not blank
+    pom = (
+        f"<project><groupId>com.acme</groupId><artifactId>{artifact_id}</artifactId></project>"
+    )
+    units, _edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert [u.qualified_name for u in units] == [f"com.acme:{artifact_id}"]
+    assert java.pom_own_coordinate_decode_problems(pom) == []
+
+
+def test_pom_bidi_control_char_only_artifactid_does_not_publish_a_bogus_coordinate():
+    """FIX ROUND 40 (thirty-fourth cold read, Part A F3 LOW, .cr34-bidi,
+    wrong-data): the twin of the ZWSP test above, but for the OTHER
+    closed set - `_is_blank_identity` used to consult only
+    _UNICODE_INVISIBLE_FORMAT_CHARS, missing _UNICODE_DIRECTIONAL_AND_
+    LINE_CONTROL_CHARS - a lone LEFT-TO-RIGHT MARK (U+200E) is neither
+    whitespace nor invisible-format, yet renders as nothing (the
+    identical hazard the invisible-format set exists to close), so an
+    artifactId containing only one still escaped this gate and
+    published a bogus "com.acme:\\u200e"-shaped coordinate."""
+    lrm = chr(0x200E)  # LEFT-TO-RIGHT MARK - bidi control, not whitespace/invisible-format
+    pom = (
+        "<project><groupId>com.acme</groupId>"
+        f"<artifactId>{lrm}</artifactId></project>"
+    )
+    units, _edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert units == []
+    assert java.pom_own_coordinate_decode_problems(pom) != []
+
+
+def test_pom_a_visible_artifactid_containing_a_bidi_control_char_is_unaffected():
+    """FIX ROUND 40 (Part A F3 LOW, control): the fix above must not
+    treat a REAL, visible identity value merely CONTAINING a bidi
+    control character as blank - only a value consisting ENTIRELY of
+    whitespace/invisible-format/bidi-control characters is blank.
+
+    CORRECTED (round 41, thirty-fifth cold read, F1+F2, THE STRUCTURAL
+    CURE): same correction as the ZWSP control test above - a pom
+    coordinate is an IDENTITY field, published raw, never escaped."""
+    lrm = chr(0x200E)
+    artifact_id = "re" + lrm + "al"  # a real value merely CONTAINING one, not blank
+    pom = (
+        f"<project><groupId>com.acme</groupId><artifactId>{artifact_id}</artifactId></project>"
+    )
+    units, _edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert [u.qualified_name for u in units] == [f"com.acme:{artifact_id}"]
+    assert java.pom_own_coordinate_decode_problems(pom) == []
+
+
+def test_web_xml_comment_only_url_pattern_still_publishes_the_context_root():
+    """MICRO-ROUND 38b (THE BLOCKER, url-pattern is the OTHER edge):
+    unlike a coordinate/name, an empty <url-pattern> is servlet-spec-
+    LEGAL (round 25's own micro-round 25b F6 ruling) - a comment-only
+    one must keep publishing the SAME empty context-root value a
+    genuinely empty one already does, never be treated as
+    unrecoverable."""
+    empty_entry_points, empty_problems, _e, _c = java.parse_web_xml(
+        "web.xml",
+        "<web-app><servlet-mapping><servlet-name>a</servlet-name>"
+        "<url-pattern></url-pattern></servlet-mapping></web-app>",
+    )
+    comment_entry_points, comment_problems, _e2, _c2 = java.parse_web_xml(
+        "web.xml",
+        "<web-app><servlet-mapping><servlet-name>a</servlet-name>"
+        "<url-pattern><!--root--></url-pattern></servlet-mapping></web-app>",
+    )
+    assert [e.name for e in empty_entry_points] == [e.name for e in comment_entry_points] == [""]
+    assert not any(p.reason_code == "route_value_unrecoverable" for p in empty_problems)
+    assert not any(p.reason_code == "route_value_unrecoverable" for p in comment_problems)
+
+
+def test_web_xml_comment_only_servlet_name_does_not_publish_a_bogus_route():
+    """MICRO-ROUND 38b (THE BLOCKER, the servlet-name twin of the pom
+    coordinate collision): a comment-only <servlet-name> used to
+    resolve to a REAL in-scan class via a shared "" dict key - two
+    otherwise-unrelated blank-named declarations would silently
+    resolve to each other. Must publish no entry point at all, and
+    record it via the existing unrecoverable path."""
+    entry_points, problems, _edges, _c = java.parse_web_xml(
+        "WEB-INF/web.xml",
+        "<web-app>\n"
+        "  <servlet>\n"
+        "    <servlet-name><!--x--></servlet-name>\n"
+        "    <servlet-class>com.acme.RealClass</servlet-class>\n"
+        "  </servlet>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name><!--x--></servlet-name>\n"
+        "    <url-pattern>/x</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+    )
+    assert entry_points == []
+    assert any(p.reason_code == "route_value_unrecoverable" for p in problems)
+
+
+# --------------------------------------------------- fix round 26 F2 (block-interior leaf searches unpaired)
+
+def test_web_xml_a_cdata_description_before_servlet_name_does_not_steal_the_class_join():
+    """FIX ROUND 26 (twenty-second cold read, F2 BLOCKER, .cr22-webdesc3,
+    wrong-data): web-app 2.4/2.5 legally places <description> BEFORE
+    <servlet-name> - a CDATA description quoting a fake, retired
+    servlet-name/servlet-class pair used to WIN the block-interior
+    search's first-match race (it ran directly on a CDATA-preserving
+    slice, with no context check at all), fabricating an owner for a
+    servlet that was never really declared. The real CheckoutServlet
+    must resolve, and the fake RetiredServlet must never appear
+    anywhere in the published entry points."""
+    web_xml = """<web-app>
+  <servlet>
+    <description><![CDATA[<servlet-name>FakeName</servlet-name><servlet-class>com.oldvendor.RetiredServlet</servlet-class>]]></description>
+    <servlet-name>CheckoutServlet</servlet-name>
+    <servlet-class>com.acme.CheckoutServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>CheckoutServlet</servlet-name>
+    <url-pattern>/checkout</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern == {"/checkout": "com.acme.CheckoutServlet"}
+    assert "com.oldvendor.RetiredServlet" not in {e.qualified_name for e in entry_points}
+    assert problems == []
+
+
+def test_web_xml_a_cdata_description_in_the_mapping_does_not_fabricate_a_servlet_name():
+    """FIX ROUND 26 (F2 BLOCKER, .cr22-webdesc, wrong-data): the same
+    attack against <servlet-mapping>'s own <description>/<servlet-name>
+    ordering - a fabricated servlet-name must never steal the join away
+    from the real, later-declared name in the same mapping block, which
+    would otherwise leave the REAL servlet with a confident
+    no_entry_point/no_feature_link negative."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>CheckoutServlet</servlet-name>
+    <servlet-class>com.acme.CheckoutServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <description><![CDATA[<servlet-name>Fake</servlet-name>]]></description>
+    <servlet-name>CheckoutServlet</servlet-name>
+    <url-pattern>/checkout</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern == {"/checkout": "com.acme.CheckoutServlet"}
+    assert problems == []
+
+
+def test_web_xml_a_cdata_description_does_not_fabricate_a_load_on_startup_problem():
+    """FIX ROUND 26 (F2 BLOCKER, .cr22-webdesc2, wrong-data): a CDATA
+    description quoting a fake <load-on-startup> (a servlet that is
+    genuinely NOT startup-only, and NOT unmapped) must never trigger
+    the startup_only_servlet enrolled-gap problem - and the sibling
+    filter-mapping half of the same fixture must still join correctly."""
+    web_xml = """<web-app>
+  <servlet>
+    <description><![CDATA[<load-on-startup>1</load-on-startup>]]></description>
+    <servlet-name>Ordinary</servlet-name>
+    <servlet-class>com.acme.OrdinaryServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>Ordinary</servlet-name>
+    <url-pattern>/ordinary</url-pattern>
+  </servlet-mapping>
+  <filter>
+    <description><![CDATA[<filter-name>Fake</filter-name>]]></description>
+    <filter-name>RealFilter</filter-name>
+    <filter-class>com.acme.RealFilter</filter-class>
+  </filter>
+  <filter-mapping>
+    <filter-name>RealFilter</filter-name>
+    <url-pattern>/real</url-pattern>
+  </filter-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern["/ordinary"] == "com.acme.OrdinaryServlet"
+    assert routes_by_pattern["/real"] == "com.acme.RealFilter"
+    assert not any(p.reason_code == "unsupported_entry_point_shape" for p in problems)
+
+
+def test_pom_a_cdata_description_in_a_dependency_block_does_not_fabricate_optional_or_scope():
+    """FIX ROUND 26 (F2 BLOCKER, sweep to pom.xml's own block-interior
+    searches): a <dependency> element has no legal <description> child,
+    but the interior optional/scope leaf searches must still be located
+    against the CDATA-blanked block, not a raw, CDATA-preserving slice -
+    regression control mirroring the web.xml attack shape one producer
+    over."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <dependencies>
+    <dependency>
+      <groupId>org.real</groupId>
+      <artifactId>real-lib</artifactId>
+      <optional><![CDATA[<scope>test</scope>]]>false</optional>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert len(edges) == 1
+    assert edges[0].phase == "build"
+    assert edges[0].optional is False
+
+
+def test_web_xml_a_wholly_cdata_wrapped_servlet_name_still_decodes_in_the_block():
+    """FIX ROUND 26 (F2 BLOCKER, regression control): a servlet-name that
+    is wholly (not adversarially) CDATA-wrapped inside the <servlet>
+    block itself must still decode and join correctly - the F2 fix
+    (searching the CDATA-blanked block slice) must not break the F4
+    decode-or-record discipline round 25 already established for this
+    same block."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name><![CDATA[Checkout]]></servlet-name>
+    <servlet-class><![CDATA[com.acme.CheckoutServlet]]></servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>Checkout</servlet-name>
+    <url-pattern>/checkout</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    routes_by_pattern = {e.name: e.qualified_name for e in entry_points}
+    assert routes_by_pattern == {"/checkout": "com.acme.CheckoutServlet"}
+    assert problems == []
+
+
+def test_jax_rs_sub_resource_locator_detail_is_length_bounded_not_published_verbatim():
+    """FIX ROUND 40 (thirty-fourth cold read, Part A F4 LOW, .cr34-detail,
+    completeness): the sub-resource-locator detail composed above joins
+    EVERY distinct composed route into the message verbatim
+    (`', '.join(composed)`) - with a long class-level @Path and a long
+    method-level @Path (each independently bounded to
+    _MAX_ROUTE_TARGET_LENGTH, but never the CONCATENATION of the two),
+    the reader measured this specific site publishing a 2558-character
+    detail, unbounded like every other adapter-composed detail= string
+    in this module before this round's own AST-located sweep wrapped
+    all 38 unwrapped sites in errors.bounded_detail. Now every one -
+    this site included - truncates the same way _bounded_route_target
+    already does for a published route name."""
+    from agenttalk.comprehension.errors import MAX_PROBLEM_DETAIL_LENGTH
+
+    long_prefix = "/orders" + "p" * 190
+    long_suffix = "/list" + "s" * 190
+    src = f"""
+package p;
+
+@Path("{long_prefix}")
+public class OrderResource {{
+    @Path("{long_suffix}")
+    public void list() {{}}
+}}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert len(problem.detail) <= MAX_PROBLEM_DETAIL_LENGTH + len("...(truncated)")
+    assert problem.detail.endswith("...(truncated)")
+
+
+def test_jax_rs_custom_verb_annotation_gets_the_honest_either_way_wording():
+    """FIX ROUND 40 (thirty-fourth cold read, Part A F5 MAJOR, .cr34-jaxrs,
+    wrong-data - detail-proves-cause): the sub-resource-locator detail
+    used to assert "it never handles a request directly" for EVERY
+    no-recognized-verb method - false for a project-defined custom verb
+    (JAX-RS's own @HttpMethod meta-annotation idiom, e.g. a local WebDAV
+    @LOCK annotation - never one of this producer's own recognized
+    @GET/@POST/... names), which IS a real, if unrecognized, verb
+    designator. Syntactically this producer sees only "some other
+    annotation in the stack besides @Path" - indistinguishable, without
+    cross-file resolution, from an unrelated annotation - so the detail
+    must cover both possibilities rather than assert the locator cause
+    as proven."""
+    src = """
+package p;
+
+@Path("/orders")
+public class OrderResource {
+    @LOCK
+    @Path("/list")
+    public void list() {}
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    assert _edges(result, "route") == []
+    assert not any(e.kind == "http_route" for e in result.entry_points)
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert "no RECOGNIZED verb" in problem.detail
+    assert "unrecognized custom verb" in problem.detail
+    assert "never handles a request directly" not in problem.detail
+
+
+def test_jax_rs_a_bare_path_method_with_no_other_annotation_still_names_the_locator_idiom():
+    """FIX ROUND 40 (Part A F5, control): the true bare-locator case (no
+    other annotation at all in the method's own stack) keeps naming the
+    sub-resource-locator idiom by name in the detail - the wording widen
+    above must not lose the useful, still-true half of the old claim."""
+    src = """
+package p;
+
+@Path("/orders")
+public class OrderResource {
+    @Path("/list")
+    public void list() {}
+}
+"""
+    result = java.parse_java_source("OrderResource.java", src)
+    problem = next(p for p in result.problems if p.reason_code == "unsupported_entry_point_shape")
+    assert "jax_rs_sub_resource_locator" in problem.detail
+
+
+def test_two_genuinely_different_url_patterns_sharing_a_200_char_prefix_do_not_false_positive():
+    """FIX ROUND 41 (thirty-fifth cold read, Part A F3 MAJOR, .cr35-
+    duproute2, wrong-data): `route_pattern_owners` (the duplicate_route_
+    target grouping dict) used to key on the DISPLAY (bounded) value,
+    one line above the site round 40 threaded the raw value into the
+    published claims - so two genuinely DIFFERENT url-patterns sharing a
+    >200-char prefix (truncating to the identical bounded string) got a
+    FALSE duplicate_route_target problem, internally contradictory with
+    the same run's own entry-point ids correctly saying the two patterns
+    differ. Fixed as a side effect of round 41's own structural cure
+    (url_pattern is the raw value everywhere now, so this dict keys on
+    it correctly)."""
+    prefix = "/" + "x" * 200
+    web_xml = (
+        "<web-app>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>a</servlet-name>\n"
+        f"    <url-pattern>{prefix}A</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>b</servlet-name>\n"
+        f"    <url-pattern>{prefix}B</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n"
+    )
+    entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
+        "WEB-INF/web.xml", web_xml)
+    assert {e.name for e in entry_points} == {prefix + "A", prefix + "B"}
+    assert not any(p.reason_code == "duplicate_route_target" for p in problems)
+
+
+def test_two_servlet_mappings_on_the_genuinely_identical_pattern_still_get_the_real_problem():
+    """FIX ROUND 41 (Part A F3, control): the true duplicate case (both
+    mappings name the SAME, ordinary, short pattern) must still fire
+    duplicate_route_target - the fix above only narrows the false
+    positive, it must not also suppress the genuine one."""
+    web_xml = (
+        "<web-app>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>a</servlet-name>\n"
+        "    <url-pattern>/mix/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>b</servlet-name>\n"
+        "    <url-pattern>/mix/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n"
+    )
+    _entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
+        "WEB-INF/web.xml", web_xml)
+    matching = [p for p in problems if p.reason_code == "duplicate_route_target"]
+    assert len(matching) == 1
+    assert "/mix/*" in matching[0].detail
+
+
+def test_duplicate_route_target_detail_keeps_the_colliding_owners_visible_under_a_long_pattern():
+    """MICRO-ROUND 49 (forty-third cold read, polish): the detail
+    template used to put the colliding owners (`described`) well past
+    ~60 characters of boilerplate prose - a long <url-pattern> (real:
+    a deep REST path) pushed them past bounded_detail's own 200-
+    character bound entirely, leaving a truncated detail that names
+    the pattern but not WHICH servlet-names actually collide, the one
+    fact a reader needs to resolve the conflict. Both distinguishers
+    (the pattern and the owners) now lead the template."""
+    long_pattern = "/" + "a" * 150
+    web_xml = (
+        "<web-app>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>s1</servlet-name>\n"
+        f"    <url-pattern>{long_pattern}</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>s2</servlet-name>\n"
+        f"    <url-pattern>{long_pattern}</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n"
+    )
+    _entry_points, problems, _edges, _descriptor_name_conflicts = java.parse_web_xml(
+        "WEB-INF/web.xml", web_xml)
+    matching = [p for p in problems if p.reason_code == "duplicate_route_target"]
+    assert len(matching) == 1
+    assert "s1" in matching[0].detail
+
+
+# ------------------- round 41 (F5 MAJOR, completeness): a comment inside a route annotation
+
+@pytest.mark.parametrize("annotation", [
+    '@RequestMapping(value = /* legacy */ "/users")',
+    '@RequestMapping(/* legacy */ "/users")',
+    '@RequestMapping("/users" /* trailing */)',
+    '@RequestMapping(value = "/users" /* trailing */)',
+    '@RequestMapping({/* first */ "/users"})',
+    '@RequestMapping(\n        value = "/users" // trailing line comment\n    )',
+])
+def test_a_comment_in_any_realistic_position_around_a_route_literal_still_publishes_it(annotation):
+    """FIX ROUND 41 (thirty-fifth cold read, Part A F5 MAJOR, completeness
+    - the Java-annotation analogue of round 38's own XML comment splice):
+    a comment sitting between the named/positional anchor and the real
+    literal, or between the literal and the annotation's own closing
+    paren, used to make the literal reader give up at the comment's own
+    first character (neither whitespace nor a literal start) - silently
+    suppressing a REAL, cleanly-declared, served route as
+    "unrecoverable." `/* TODO */`-style comments inside an annotation's
+    argument list are realistic legacy code, not a contrived edge case.
+    All six placements here must publish the identical route, unaffected
+    by where the comment sits."""
+    src = f"""
+package p;
+@RestController
+class Controller {{
+    {annotation}
+    void list() {{}}
+}}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert result.problems == []
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "/users"
+
+
+def test_cr35_real_a_trailing_legacy_comment_does_not_suppress_a_post_route():
+    """FIX ROUND 41 (Part A F5, .cr35-real): the reader's own concrete
+    repro - a POST route whose own literal is followed by a trailing
+    legacy comment inside the annotation's argument list."""
+    src = """
+package p;
+@RestController
+class AdminController {
+    @PostMapping(value = "/admin/users" /* legacy, pre-2019 endpoint */)
+    void create() {}
+}
+"""
+    result = java.parse_java_source("AdminController.java", src)
+    assert result.problems == []
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "POST /admin/users"
+
+
+def test_a_comment_does_not_rescue_a_genuine_constant_reference():
+    """FIX ROUND 41 (Part A F5, control): the comment-skip fix must not
+    widen recovery to a genuinely non-literal value - a constant
+    reference beside a comment must still refuse exactly as it always
+    has."""
+    src = """
+package p;
+class Controller {
+    @GetMapping(/* not a literal */ SomeConstants.LIST)
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert _edges(result, "route") == []
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "route_value_unrecoverable"
+
+
+def test_a_comment_does_not_rescue_a_genuine_string_concatenation():
+    """FIX ROUND 41 (Part A F5, control): a comment beside a
+    concatenation expression must still refuse - the comment-skip fix
+    only ever tolerates a comment AROUND an otherwise-clean literal,
+    never past a `+` that signals more content follows."""
+    src = """
+package p;
+class Controller {
+    @GetMapping(/* comment */ "/a" + "/b")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert _edges(result, "route") == []
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "route_value_unrecoverable"

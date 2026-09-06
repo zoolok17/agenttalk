@@ -14,14 +14,18 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess  # nosec B404 - invokes the real `mklink /J` binary to build a Windows
+                    # directory junction fixture; no shell, no untrusted input
+import sys
 from pathlib import Path
 
 import pytest
 
 from agenttalk.comprehension import lock as lockmod
+from agenttalk.comprehension import privacy as privacymod
 from agenttalk.comprehension import publish as pub
 from agenttalk.comprehension import staging as stg
-from agenttalk.comprehension.errors import ComprehensionError
+from agenttalk.comprehension.errors import ComprehensionError, VcsPrivacyRefused
 from agenttalk.comprehension.privacy import PrivacyPreflightResult
 
 
@@ -98,6 +102,37 @@ def test_index_runs_list_is_bounded(tmp_path: Path, monkeypatch) -> None:
         _doc, digest = pub.read_current_index(tmp_path)
     doc, _digest = pub.read_current_index(tmp_path)
     assert [r["scan_id"] for r in doc["runs"]] == ["scan-4", "scan-3", "scan-2"]
+
+
+def test_publish_index_cas_refuses_a_prior_index_missing_runs_instead_of_crashing(
+    tmp_path: Path,
+) -> None:
+    """MAJOR 2 (fifth cold read, fix round 8): the WRITE path
+    (_build_successor_index) read a PRIOR index.json's own "runs" field
+    with a raw, unguarded subscript - a malformed-but-envelope-valid
+    prior index.json missing "runs" (envelope validation only requires
+    schema_version/artifact_type/scan_id/generated_at, never index.json's
+    OWN fields) raised an untyped KeyError in the middle of publishing a
+    brand-new, otherwise-healthy scan, rather than the same typed
+    refusal a malformed document gets everywhere else in this package."""
+    index_path = tmp_path / "index.json"
+    malformed = {
+        "schema_version": pub.INDEX_SCHEMA_VERSION,
+        "artifact_type": pub.INDEX_ARTIFACT_TYPE,
+        "scan_id": "scan-0",
+        "generated_at": "2026-01-01T00:00:00Z",
+        "latest_scan_id": "scan-0",
+        "predecessor_digest": None,
+        # "runs" deliberately omitted.
+    }
+    index_path.write_text(json.dumps(malformed), encoding="utf-8")
+    _doc, digest = pub.read_current_index(tmp_path)
+
+    with pytest.raises(ComprehensionError, match="runs"):
+        pub.publish_index_cas(
+            tmp_path, scan_id="scan-1", run_summary={"scan_id": "scan-1"},
+            predecessor_index_digest=digest,
+        )
 
 
 # ----------------------------------------------------------- ownership cross-check (finding 2)
@@ -202,6 +237,341 @@ def test_rename_refuses_when_run_directory_already_exists(
         pub.rename_staging_to_run(staging, lock)
     assert staging.path.exists()  # untouched
     lockmod.release_scan_lock(lock)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows directory junctions only")
+def test_rename_refuses_a_junction_at_runs_itself_not_followed(
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 0, B1 BLOCKER, the worst finding of the
+    arc): a reparse point placed AT ``runs/`` itself (never a file
+    beneath it) used to redirect the ENTIRE published run outside the
+    pinned store root - ``resolve_under_root``'s old confinement check
+    (used by this function's own ``dst = resolve_under_root(scan_id,
+    root=_runs_dir(comprehension_dir), ...)`` call) resolved ``runs/``
+    FIRST, baking the redirection into its own idea of "root" before ever
+    comparing the target against it - the whole six-artifact run would
+    physically land at the junction's real target, with git and this
+    producer's own privacy proof both unaware of it. Reproduced verbatim:
+    ``runs`` is a junction to an external directory before the rename
+    ever runs. Must refuse outright; nothing may be created at the
+    junction's real target, and the staged content must stay exactly
+    where it was staged (never moved partway)."""
+    outside = comprehension_dir.parent.parent / "outside-runs-junction-target"
+    outside.mkdir(exist_ok=True)
+    lock, staging = _stage(comprehension_dir, comprehension_privacy, "scan-1")
+    runs_dir = comprehension_dir / "runs"
+    subprocess.run(  # noqa: S603,S607  # nosec B603 B607
+        ["cmd", "/c", "mklink", "/J", str(runs_dir), str(outside)],
+        check=True, capture_output=True, text=True,
+    )
+    # dst is built via resolve_under_root(scan_id, root=_runs_dir(...)) -
+    # a reparse point AT `runs/` itself is caught there, raising the
+    # shared EnvelopeError (not StagingSourceEscapesRoot, which guards
+    # the STAGING side of this same rename, checked earlier and unaware
+    # of anything past `dst`'s own construction).
+    with pytest.raises(pub.EnvelopeError, match="reparse point/junction"):
+        pub.rename_staging_to_run(staging, lock)
+    assert list(outside.iterdir()) == []
+    assert staging.path.exists()  # never moved
+    lockmod.release_scan_lock(lock)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows directory junctions only")
+def test_rename_refuses_when_staging_itself_becomes_a_junction_before_publish(
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 0, B1-adjacent, the TOCTOU half): even
+    though ``create_staging_dir`` itself now refuses a junctioned
+    ``.staging/`` at CREATION time, this function's own SEPARATE re-
+    confinement check (``staging_root = _staging_dir(...); ... resolve
+    and compare``, run fresh at PUBLISH time) used to have the identical
+    vacuous-by-construction flaw - it re-derives and re-resolves
+    ``staging_root`` itself rather than trusting the create-time proof,
+    so a reparse point installed AT ``.staging/`` in the gap BETWEEN
+    staging creation and this publish step would still slip past the OLD
+    code. Reproduced exactly: stage normally (``.staging/`` is an
+    ordinary directory when ``create_staging_dir`` ran), then replace
+    ``.staging/`` itself with a junction before ``rename_staging_to_run``
+    ever runs."""
+    lock, staging = _stage(comprehension_dir, comprehension_privacy, "scan-1")
+    outside = comprehension_dir.parent.parent / "outside-staging-toctou-junction-target"
+    outside.mkdir(exist_ok=True)
+    staging_root = comprehension_dir / ".staging"
+    real_content = outside / staging.path.name
+    staging.path.rename(real_content)  # move the real content out first...
+    staging_root.rmdir()  # ... then the now-empty .staging/ itself
+    subprocess.run(  # noqa: S603,S607  # nosec B603 B607
+        ["cmd", "/c", "mklink", "/J", str(staging_root), str(outside)],
+        check=True, capture_output=True, text=True,
+    )
+    with pytest.raises(pub.StagingSourceEscapesRoot, match="reparse point/junction"):
+        pub.rename_staging_to_run(staging, lock)
+    assert real_content.exists()  # never moved into runs/
+    assert not (comprehension_dir / "runs" / "scan-1").exists()
+    lockmod.release_scan_lock(lock)
+
+
+# --------------------- FIX ROUND 34 (reviewer-3's re-delta on round 33's
+# own R1 fix - THE HOLE): round 33's own ground-truth check only ever
+# enumerated runs/<scan_id>/ - index.json (written by the OTHER publish
+# step, at the store root) sat outside its reach. Replaced by ONE store-
+# wide check (no enumeration anywhere) run after BOTH publish steps
+# complete, with rollback of both the run directory AND index.json.
+
+def test_publish_run_store_wide_check_passes_when_still_ignored(
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """Regression control: the store-wide check must not spuriously
+    refuse an ordinary publish when the comprehension dir is still
+    genuinely ignored exactly as the preflight proved."""
+    lock, staging = _stage(comprehension_dir, comprehension_privacy, "scan-1")
+    pub.publish_run(
+        staging_handle=staging, lock_handle=lock,
+        run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None,
+        record_counts=_COUNTS, privacy_result=comprehension_privacy,
+    )
+    assert (comprehension_dir / "runs" / "scan-1").is_dir()
+    assert (comprehension_dir / "index.json").exists()
+
+
+def test_publish_run_store_wide_check_refuses_and_rolls_back_mid_run_gitignore_removal(
+    comprehension_privacy_root: Path, comprehension_dir: Path,
+    comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """The preflight proved ``.agenttalk/`` ignored at lock-acquisition
+    time, but a ``.gitignore`` removal DURING the run (a TOCTOU-shaped gap)
+    must still be caught - checked once, after both publish steps
+    complete. On refusal, the just-published run directory AND index.json
+    are both rolled back - nothing is left stageable anywhere in the
+    store."""
+    lock, staging = _stage(comprehension_dir, comprehension_privacy, "scan-1")
+    (comprehension_privacy_root / ".gitignore").unlink()
+    with pytest.raises(VcsPrivacyRefused):
+        pub.publish_run(
+            staging_handle=staging, lock_handle=lock,
+            run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None,
+            record_counts=_COUNTS, privacy_result=comprehension_privacy,
+        )
+    assert not staging.path.exists()  # renamed away, never restored
+    assert not (comprehension_dir / "runs" / "scan-1").exists()  # rolled back
+    assert not (comprehension_dir / "index.json").exists()  # first-ever publish: removed, not restored
+    assert not lock.path.exists()  # still released despite the refusal (design step 3)
+
+
+def test_publish_run_store_wide_check_refuses_defeat_1_filename_specific_reinclusion(
+    comprehension_privacy_root: Path, comprehension_dir: Path,
+    comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """Round 32's own DEFEAT 1 (reviewer-3's delta): a rule re-including a
+    real artifact filename specifically ("modules.json") - the store-wide
+    check asks git directly what is stageable, never enumerates a
+    directory by hand, so it catches this the same way it catches
+    everything else."""
+    (comprehension_privacy_root / ".gitignore").write_text(
+        ".agenttalk/**\n"
+        "!.agenttalk/comprehension/\n"
+        "!.agenttalk/comprehension/runs/\n"
+        "!.agenttalk/comprehension/runs/scan-1/\n"
+        "!.agenttalk/comprehension/runs/scan-1/modules.json\n",
+        encoding="utf-8",
+    )
+    lock = lockmod.acquire_scan_lock(
+        comprehension_dir, privacy=comprehension_privacy, predecessor_index_digest=None)
+    staging = stg.create_staging_dir(scan_id="scan-1", lock_handle=lock)
+    (staging.path / "scan.json").write_text("hello", encoding="utf-8")
+    (staging.path / "modules.json").write_text("leaked", encoding="utf-8")
+    with pytest.raises(VcsPrivacyRefused):
+        pub.publish_run(
+            staging_handle=staging, lock_handle=lock,
+            run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None,
+            record_counts={"scan.json": 1, "modules.json": 1}, privacy_result=comprehension_privacy,
+        )
+    assert not (comprehension_dir / "runs" / "scan-1").exists()  # rolled back
+
+
+def test_publish_run_store_wide_check_refuses_defeat_2_scan_id_shape_reinclusion(
+    comprehension_privacy_root: Path, comprehension_dir: Path,
+    comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """Round 32's own DEFEAT 2 (reviewer-3's delta, THE WORST one): a rule
+    keyed on the REAL scan-id's own shape (a date-prefixed pattern,
+    ``runs/2026*/``) - the store-wide check has no probe id to defeat at
+    all. Uses a realistic, date-shaped scan_id (unlike this file's own
+    bare "scan-1" convention elsewhere) so the shape-keyed rule has
+    something real to match against."""
+    real_scan_id = "20260901T120000000000Z-a1b2c3d4"
+    (comprehension_privacy_root / ".gitignore").write_text(
+        ".agenttalk/**\n"
+        "!.agenttalk/comprehension/\n"
+        "!.agenttalk/comprehension/runs/\n"
+        "!.agenttalk/comprehension/runs/2026*/\n"
+        "!.agenttalk/comprehension/runs/2026*/**\n",
+        encoding="utf-8",
+    )
+    lock = lockmod.acquire_scan_lock(
+        comprehension_dir, privacy=comprehension_privacy, predecessor_index_digest=None)
+    staging = stg.create_staging_dir(scan_id=real_scan_id, lock_handle=lock)
+    (staging.path / "scan.json").write_text("hello", encoding="utf-8")
+    with pytest.raises(VcsPrivacyRefused):
+        pub.publish_run(
+            staging_handle=staging, lock_handle=lock,
+            run_summary={"scan_id": real_scan_id}, predecessor_index_digest=None,
+            record_counts={"scan.json": 1}, privacy_result=comprehension_privacy,
+        )
+    assert not (comprehension_dir / "runs" / real_scan_id).exists()  # rolled back
+
+
+def test_publish_run_store_wide_check_refuses_defeat_3_index_json_only_reinclusion(
+    comprehension_privacy_root: Path, comprehension_dir: Path,
+    comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """THE HOLE round 34 itself closes: a rule re-including ONLY
+    index.json (never touching runs/**) leaked it under round 33's own
+    check, since that check only ever enumerated ``runs/<scan_id>/`` -
+    index.json is written by the OTHER publish step, at the store root,
+    never inside that directory. Asserts the FULL rollback contract: the
+    run directory is removed, the PRE-write index.json bytes are restored
+    byte-exact (there was already a published generation before this
+    attempt), and a real ``git ls-files --others --exclude-standard``
+    query against the whole store proves NOTHING is left stageable
+    afterward - not just a disposition check, the actual ground truth."""
+    import subprocess
+
+    lock1, staging1 = _stage(comprehension_dir, comprehension_privacy, "scan-1")
+    pub.publish_run(
+        staging_handle=staging1, lock_handle=lock1,
+        run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None,
+        record_counts=_COUNTS, privacy_result=comprehension_privacy,
+    )
+    prior_index_bytes = (comprehension_dir / "index.json").read_bytes()
+    _doc, predecessor_digest = pub.read_current_index(comprehension_dir)
+
+    (comprehension_privacy_root / ".gitignore").write_text(
+        ".agenttalk/**\n"
+        "!.agenttalk/comprehension/\n"
+        "!.agenttalk/comprehension/index.json\n",
+        encoding="utf-8",
+    )
+    lock2, staging2 = _stage(comprehension_dir, comprehension_privacy, "scan-2")
+    with pytest.raises(VcsPrivacyRefused, match="index.json"):
+        pub.publish_run(
+            staging_handle=staging2, lock_handle=lock2,
+            run_summary={"scan_id": "scan-2"}, predecessor_index_digest=predecessor_digest,
+            record_counts=_COUNTS, privacy_result=comprehension_privacy,
+        )
+    assert not (comprehension_dir / "runs" / "scan-2").exists()  # rolled back
+    assert (comprehension_dir / "runs" / "scan-1").exists()  # the OLD generation is untouched
+    assert (comprehension_dir / "index.json").read_bytes() == prior_index_bytes  # byte-exact restore
+
+    # The refused attempt's own residual exposure (never the operator's own
+    # still-broken .gitignore, a separate real-world problem outside this
+    # fix's scope) - restore the good rule and prove nothing is left over
+    # from the rolled-back scan-2 attempt.
+    (comprehension_privacy_root / ".gitignore").write_text(".agenttalk/\n", encoding="utf-8")
+    result = subprocess.run(
+        ["git", "-C", str(comprehension_privacy_root), "ls-files", "--others",
+         "--exclude-standard", "--", ".agenttalk/comprehension"],
+        capture_output=True, text=True, encoding="utf-8", check=True,
+    )
+    assert result.stdout.strip() == ""  # git add -A would stage nothing from the store
+
+
+def test_publish_run_does_not_brick_when_only_scan_lock_is_stageable(
+    comprehension_privacy_root: Path, comprehension_dir: Path,
+    comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """FIX ROUND 35 (twenty-ninth cold read, F2 MAJOR part (b), JUDGE -
+    taken, .cr29-deadend verbatim): a .gitignore matching everything BUT
+    scan.lock's own name (the scanner's own transient process-identity
+    file, still on disk when the store-wide check runs, before publish_
+    run's own finally releases it) must not brick an otherwise-genuinely-
+    private publish - the lock is process metadata, never client data."""
+    (comprehension_privacy_root / ".gitignore").write_text(
+        ".agenttalk/**\n"
+        "!.agenttalk/comprehension/\n"
+        "!.agenttalk/comprehension/scan.lock\n",
+        encoding="utf-8",
+    )
+    lock, staging = _stage(comprehension_dir, comprehension_privacy, "scan-1")
+    pub.publish_run(
+        staging_handle=staging, lock_handle=lock,
+        run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None,
+        record_counts=_COUNTS, privacy_result=comprehension_privacy,
+    )
+    assert (comprehension_dir / "runs" / "scan-1").is_dir()
+
+
+def test_publish_run_store_wide_check_refuses_on_an_unanticipated_new_file(
+    comprehension_privacy_root: Path, comprehension_dir: Path,
+    comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """The class-closure proof: a file no enumeration ever anticipated
+    (dropped directly into the store, never named by any probe or any
+    prior fix) must still be caught - the store-wide check never
+    enumerates anything, it asks git what is stageable, period."""
+    (comprehension_privacy_root / ".gitignore").write_text(
+        ".agenttalk/**\n"
+        "!.agenttalk/comprehension/\n"
+        "!.agenttalk/comprehension/a-file-nobody-named.txt\n",
+        encoding="utf-8",
+    )
+    lock, staging = _stage(comprehension_dir, comprehension_privacy, "scan-1")
+    (comprehension_dir / "a-file-nobody-named.txt").write_text("surprise", encoding="utf-8")
+    with pytest.raises(VcsPrivacyRefused, match="a-file-nobody-named.txt"):
+        pub.publish_run(
+            staging_handle=staging, lock_handle=lock,
+            run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None,
+            record_counts=_COUNTS, privacy_result=comprehension_privacy,
+        )
+    assert not (comprehension_dir / "runs" / "scan-1").exists()  # rolled back
+
+
+def test_publish_run_store_wide_check_skipped_for_acknowledged_unignored_disposition(
+    comprehension_privacy_root: Path, comprehension_dir: Path,
+) -> None:
+    """An operator who explicitly ACKNOWLEDGED an unignored store already
+    accepted this exact risk for this one run - the store-wide check only
+    applies to the automatic "ignored" disposition and must not
+    spuriously re-refuse a publish that was never claiming "ignored" in
+    the first place."""
+    acknowledged = privacymod.acknowledge_unignored_private_store(
+        comprehension_privacy_root, vcs_kind="git", work_id="w1")
+    (comprehension_privacy_root / ".gitignore").unlink()  # genuinely unignored
+    lock, staging = _stage(comprehension_dir, acknowledged, "scan-1")
+    pub.publish_run(
+        staging_handle=staging, lock_handle=lock,
+        run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None,
+        record_counts=_COUNTS, privacy_result=acknowledged,
+    )
+    assert (comprehension_dir / "runs" / "scan-1").is_dir()
+
+
+def test_rename_has_no_privacy_parameter_and_publish_run_still_works_without_one(
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """FIX ROUND 34: ``rename_staging_to_run`` no longer takes a
+    ``privacy_result`` at all (the whole-store check lives solely in
+    ``publish_run`` now) - tests exercising the rename mechanics alone
+    still need construct nothing privacy-related."""
+    lock, staging = _stage(comprehension_dir, comprehension_privacy, "scan-1")
+    result = pub.rename_staging_to_run(staging, lock)
+    assert result == comprehension_dir / "runs" / "scan-1"
+    lockmod.release_scan_lock(lock)
+
+
+def test_publish_run_store_wide_check_skipped_when_no_privacy_result_passed(
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """``privacy_result`` is optional (default ``None``) precisely so tests
+    exercising ``publish_run`` alone need not construct one."""
+    lock, staging = _stage(comprehension_dir, comprehension_privacy, "scan-1")
+    pub.publish_run(
+        staging_handle=staging, lock_handle=lock,
+        run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None,
+        record_counts=_COUNTS,
+    )
+    assert (comprehension_dir / "runs" / "scan-1").is_dir()
 
 
 # ----------------------------------------------------------- crash injection
@@ -336,8 +706,48 @@ def test_read_current_index_matches_the_published_digest(
     )
     doc, digest = pub.read_current_index(comprehension_dir)
     assert doc["latest_scan_id"] == "scan-1"
-    from agenttalk.comprehension.digests import canonical_content_digest
-    assert digest == canonical_content_digest(doc)
+    # M6 (cold-read PR-B fix round 47): the CAS digest is an EXACT-BYTE
+    # digest of index.json's own on-disk bytes now, never
+    # canonical_content_digest (which strips scan_id and would blind the
+    # CAS to exactly the edit it exists to catch — see
+    # test_read_current_index_digest_changes_when_only_a_stripped_
+    # generation_identity_field_changes below).
+    from agenttalk.comprehension.digests import sha256_file
+    assert digest == sha256_file(comprehension_dir / "index.json")
+
+
+def test_read_current_index_digest_changes_when_only_a_stripped_generation_identity_field_changes(
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """M6 (cold-read PR-B fix round 47, BLOCKER): the CAS precondition used
+    to be ``canonical_content_digest(doc)``, which strips
+    ``GENERATION_IDENTITY_KEYS`` (including ``scan_id``) at every nesting
+    depth before hashing — so a concurrent hand-edit that changed ONLY a
+    stored run entry's own ``scan_id`` (a stripped field, and simultaneously
+    the CAS's own anchor/identity key) would leave the canonical digest
+    unchanged and silently pass the CAS check, even though index.json's
+    bytes genuinely differ. Reproduces the exact mechanism: publish once,
+    capture the digest, hand-edit only the stored run entry's ``scan_id``
+    on disk, and prove the digest now DOES change (byte-level, never blind
+    to a stripped-field-only edit)."""
+    lock, staging = _stage(comprehension_dir, comprehension_privacy, "scan-1")
+    pub.publish_run(
+        staging_handle=staging, lock_handle=lock,
+        run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None, record_counts=_COUNTS,
+    )
+    _doc, digest_before = pub.read_current_index(comprehension_dir)
+    index_path = comprehension_dir / "index.json"
+    doc = json.loads(index_path.read_text(encoding="utf-8"))
+    doc["runs"][0]["scan_id"] = "scan-1-tampered"
+    index_path.write_text(
+        json.dumps(doc, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    _doc, digest_after = pub.read_current_index(comprehension_dir)
+    assert digest_after != digest_before
+    with pytest.raises(pub.IndexCasConflict):
+        pub.publish_index_cas(
+            comprehension_dir, scan_id="scan-2", run_summary={"scan_id": "scan-2"},
+            predecessor_index_digest=digest_before,
+        )
 
 
 # ----------------------------------------------------------- Windows sharing-violation fixture

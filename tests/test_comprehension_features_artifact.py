@@ -1,0 +1,796 @@
+"""#55 slice-1 PR-B item 6: features.json record assembly
+(DESIGN-55-comprehension-plane.md, Artifact 3)."""
+
+from __future__ import annotations
+
+from agenttalk.comprehension import dependencies_artifact as da
+from agenttalk.comprehension import features_artifact as fa
+from agenttalk.comprehension.adapters import java as java_adapter
+
+
+def _parse(relative_path: str, source: str) -> java_adapter.JavaFileResult:
+    return java_adapter.parse_java_source(relative_path, source)
+
+
+def _build_features_with_verdicts(results: dict[str, java_adapter.JavaFileResult]):
+    """FIX ROUND 47 (forty-first cold read, B2+B3+M2 - THE DESCRIPTOR
+    FAMILY): the descriptor registrability verdict is now computed
+    UPSTREAM (``dependencies_artifact.compute_descriptor_registrability_
+    verdicts``, called once in scan_pipeline.py before either artifact
+    builder runs) rather than rebuilt inside ``build_features`` itself -
+    mirrors that same upstream-then-inherit shape at the unit-test level."""
+    verdicts = da.compute_descriptor_registrability_verdicts(results)
+    return fa.build_features(results, descriptor_registrability_verdicts=verdicts)
+
+
+def test_a_main_method_produces_one_candidate_feature_with_one_entry_point():
+    results = {"App.java": _parse(
+        "App.java",
+        "package p;\nclass App {\n  public static void main(String[] args) {}\n}\n",
+    )}
+    entry_points, features, _problems = fa.build_features(results)
+    assert len(entry_points) == 1
+    assert entry_points[0].kind == "cli_main"
+    assert len(features) == 1
+    assert features[0].state == "candidate"
+    assert features[0].origin == "detected"
+    assert features[0].label == "App"
+    assert entry_points[0].feature_ids == [features[0].feature_id]
+
+
+def test_source_digest_is_populated_from_file_digests():
+    """M7 (cold-read, PR-B fix round 3): every producer here carried
+    source_digest=None unconditionally - the design's per-fact producer
+    identity, source content digest included, was never actually
+    populated even though the digest was already available upstream."""
+    results = {"App.java": _parse(
+        "App.java",
+        "package p;\nclass App {\n  public static void main(String[] args) {}\n}\n",
+    )}
+    entry_points, features, _problems = fa.build_features(
+        results, file_digests={"App.java": "deadbeef"})
+    assert entry_points[0].producers[0]["source_digest"] == "deadbeef"
+    assert features[0].producers[0]["source_digest"] == "deadbeef"
+
+
+def test_source_digest_defaults_to_none_without_file_digests():
+    results = {"App.java": _parse(
+        "App.java",
+        "package p;\nclass App {\n  public static void main(String[] args) {}\n}\n",
+    )}
+    entry_points, features, _problems = fa.build_features(results)
+    assert entry_points[0].producers[0]["source_digest"] is None
+
+
+def test_web_xml_entry_point_gets_a_clean_label_not_the_file_extension():
+    """Note 4 (second cold read, fix round 4): web.xml's synthetic
+    qualified_name (f"{relative_path}#{servlet_name}") is not a dotted
+    Java type name - splitting on "." landed in the middle of the file
+    path's own ".xml" extension, producing a garbage label like
+    "xml#legacy" instead of the actual servlet name."""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = java_adapter.parse_web_xml(
+        "WEB-INF/web.xml",
+        "<web-app>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>legacy</servlet-name>\n"
+        "    <url-pattern>/legacy/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+    )
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
+    }
+    entry_point_records, features, _problems = fa.build_features(results)
+    assert len(features) == 1
+    assert features[0].label == "legacy"
+    # FIX ROUND 37 (thirty-first cold read, F5 MAJOR, wrong-data,
+    # declared control): a web.xml servlet-mapping entry point's own
+    # evidence_class is "declared" (an explicit descriptor declaration,
+    # no source-code inference involved) - producers[].basis must match
+    # it, never the hardcoded "extracted" every producer used to publish
+    # regardless.
+    assert entry_point_records[0].evidence_class == "declared"
+    assert entry_point_records[0].producers[0]["basis"] == "declared"
+    assert features[0].producers[0]["basis"] == "declared"
+
+
+def test_web_xml_entry_point_owner_is_the_real_servlet_class_when_declared():
+    """FIX ROUND 17 (thirteenth cold read, CR13-2 MAJOR, wrong-data): a
+    mapped route whose <servlet-class> IS declared and resolves to a
+    real in-scan unit must be owned by that class, not the web.xml
+    file - features_artifact.build_features already resolves an entry
+    point's owner through an exact qualified_name match; parse_web_xml
+    now publishes the real class name, so no further plumbing is
+    needed here."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>dispatcher</servlet-name>
+    <servlet-class>com.acme.web.DispatcherServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>dispatcher</servlet-name>
+    <url-pattern>/api/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = (
+        java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml))
+    servlet_source = (
+        "package com.acme.web;\nclass DispatcherServlet {\n}\n"
+    )
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
+        "com/acme/web/DispatcherServlet.java": java_adapter.parse_java_source(
+            "com/acme/web/DispatcherServlet.java", servlet_source),
+    }
+    entry_point_records, features, _problems = fa.build_features(results)
+    servlet_unit_id = fa.digests.unit_id(
+        kind="component", paths=["com/acme/web/DispatcherServlet.java"],
+        qualified_name="com.acme.web.DispatcherServlet",
+    )
+    assert len(entry_point_records) == 1
+    assert entry_point_records[0].owning_unit_id == servlet_unit_id
+    assert len(features) == 1
+    assert features[0].label == "DispatcherServlet"
+    assert features[0].unit_ids == [servlet_unit_id]
+
+
+def test_web_xml_entry_point_owner_resolves_when_the_servlet_class_has_an_interior_comment():
+    """FIX ROUND 38 (thirty-second cold read, F2 BLOCKER, .cr32-svclass,
+    wrong-data): a comment interior to a <servlet-class>'s own value
+    (Sv<!--x-->One) used to publish the owner's own qualified_name as
+    the corrupted, blanked-whitespace spelling ("com.acme.Sv        One")
+    - which can never exact-match the REAL in-scan class com.acme.
+    SvOne, detaching the route from its real owner (falls back to the
+    file, per the companion test below) and handing the real class a
+    confident no_entry_point negative on an otherwise complete run, zero
+    problems. The twin of test_web_xml_entry_point_owner_is_the_real_
+    servlet_class_when_declared above, with an interior comment spliced
+    out of the class value instead of a clean one."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>one</servlet-name>
+    <servlet-class>com.acme.Sv<!--internal build tag-->One</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>one</servlet-name>
+    <url-pattern>/one/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = (
+        java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml))
+    assert entry_points[0].qualified_name == "com.acme.SvOne"
+    servlet_source = "package com.acme;\nclass SvOne {\n}\n"
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
+        "com/acme/SvOne.java": java_adapter.parse_java_source(
+            "com/acme/SvOne.java", servlet_source),
+    }
+    entry_point_records, features, _problems = fa.build_features(results)
+    servlet_unit_id = fa.digests.unit_id(
+        kind="component", paths=["com/acme/SvOne.java"], qualified_name="com.acme.SvOne",
+    )
+    assert len(entry_point_records) == 1
+    assert entry_point_records[0].owning_unit_id == servlet_unit_id
+    assert len(features) == 1
+    assert features[0].unit_ids == [servlet_unit_id]
+
+
+def test_web_xml_servlet_class_naming_an_abstract_class_is_suppressed_and_reported():
+    """FIX ROUND 45 (thirty-ninth cold read, F2 MAJOR - THE MATRIX'S OWN
+    MISSING COLUMN, .cr39-descabs): a web.xml <servlet-class> naming a
+    real, in-scan ABSTRACT class - a container can never instantiate it,
+    the STRONGEST of the three registrability claims this producer
+    models (a descriptor names ONE specific class, no implementor-may-
+    serve escape) - used to publish a confident served route anyway, on
+    a complete/0-problem run, because JavaUnitClaim carried no type-kind
+    at all and registrability was never consulted outside java.py's own
+    single-file parse. Now suppressed (no entry point, no feature) and
+    reported via descriptor_registrability_problems (unsupported_entry_
+    point_shape, descriptor_route_on_uninstantiable_class)."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>abs</servlet-name>
+    <servlet-class>com.acme.web.AbstractServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>abs</servlet-name>
+    <url-pattern>/abs/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = (
+        java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml))
+    servlet_source = "package com.acme.web;\npublic abstract class AbstractServlet {\n}\n"
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
+        "com/acme/web/AbstractServlet.java": java_adapter.parse_java_source(
+            "com/acme/web/AbstractServlet.java", servlet_source),
+    }
+    entry_point_records, features, problems = _build_features_with_verdicts(results)
+    assert entry_point_records == []
+    assert features == []
+    assert len(problems) == 1
+    assert problems[0].relative_path == "WEB-INF/web.xml"
+    assert problems[0].qualified_name == "com.acme.web.AbstractServlet"
+    assert "descriptor_route_on_uninstantiable_class" in problems[0].detail
+    assert "ABSTRACT" in problems[0].detail
+
+
+def test_web_xml_filter_class_naming_an_interface_is_suppressed_and_reported():
+    """FIX ROUND 45 (F2 MAJOR, .cr39-descabs sibling): the identical gap
+    for a <filter-class> naming an INTERFACE, via a real <filter>/
+    <filter-mapping> pair - the http_filter kind sibling of the servlet
+    case above."""
+    web_xml = """<web-app>
+  <filter>
+    <filter-name>iface</filter-name>
+    <filter-class>com.acme.web.FilterApi</filter-class>
+  </filter>
+  <filter-mapping>
+    <filter-name>iface</filter-name>
+    <url-pattern>/iface/*</url-pattern>
+  </filter-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = (
+        java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml))
+    filter_source = "package com.acme.web;\npublic interface FilterApi {\n}\n"
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
+        "com/acme/web/FilterApi.java": java_adapter.parse_java_source(
+            "com/acme/web/FilterApi.java", filter_source),
+    }
+    entry_point_records, features, problems = _build_features_with_verdicts(results)
+    assert entry_point_records == []
+    assert features == []
+    assert len(problems) == 1
+    assert problems[0].qualified_name == "com.acme.web.FilterApi"
+    assert "descriptor_route_on_uninstantiable_class" in problems[0].detail
+    assert "an INTERFACE" in problems[0].detail
+
+
+def test_web_xml_servlet_class_naming_an_enum_is_suppressed_and_reported():
+    """FIX ROUND 45 (F2 MAJOR, .cr39-descabs sibling): an ENUM gets the
+    identical STRONGEST-claim treatment - no other class can ever
+    extend an enum, so a descriptor naming one is exactly as
+    uninstantiable as naming an interface/abstract class."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>e</servlet-name>
+    <servlet-class>com.acme.web.EnumServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>e</servlet-name>
+    <url-pattern>/e/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = (
+        java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml))
+    servlet_source = "package com.acme.web;\npublic enum EnumServlet {\n  A, B;\n}\n"
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
+        "com/acme/web/EnumServlet.java": java_adapter.parse_java_source(
+            "com/acme/web/EnumServlet.java", servlet_source),
+    }
+    entry_point_records, features, problems = _build_features_with_verdicts(results)
+    assert entry_point_records == []
+    assert features == []
+    assert len(problems) == 1
+    assert problems[0].qualified_name == "com.acme.web.EnumServlet"
+    assert "an ENUM" in problems[0].detail
+
+
+def test_web_xml_servlet_class_naming_a_concrete_class_is_unaffected_by_f2():
+    """FIX ROUND 45 (F2 MAJOR, .cr39-descabs control): the ordinary,
+    dominant case - a <servlet-class> naming a real CONCRETE class -
+    must keep publishing exactly as before, never suppressed. The twin
+    of test_web_xml_entry_point_owner_is_the_real_servlet_class_when_
+    declared above, asserting the new problems list stays empty too."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>dispatcher</servlet-name>
+    <servlet-class>com.acme.web.DispatcherServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>dispatcher</servlet-name>
+    <url-pattern>/api/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = (
+        java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml))
+    servlet_source = "package com.acme.web;\nclass DispatcherServlet {\n}\n"
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
+        "com/acme/web/DispatcherServlet.java": java_adapter.parse_java_source(
+            "com/acme/web/DispatcherServlet.java", servlet_source),
+    }
+    entry_point_records, features, problems = _build_features_with_verdicts(results)
+    assert len(entry_point_records) == 1
+    assert len(features) == 1
+    assert problems == []
+
+
+def test_web_xml_servlet_class_naming_an_abstract_class_not_in_scan_still_publishes():
+    """FIX ROUND 45 (F2 MAJOR, .cr39-descabs control): a <servlet-class>
+    naming a class this run cannot see at all (a jar-shipped abstract
+    base servlet, the normal real-world case for a framework-provided
+    class) must keep the existing file-owner fallback publication
+    unchanged - this producer cannot know that class's own type-kind
+    without it being in-scan, and guessing suppression over evidence
+    that never existed would be exactly the wrong direction to be
+    wrong in."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>abs</servlet-name>
+    <servlet-class>com.framework.AbstractDispatchServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>abs</servlet-name>
+    <url-pattern>/abs/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = (
+        java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml))
+    results = {"WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points)}
+    entry_point_records, features, problems = _build_features_with_verdicts(results)
+    assert len(entry_point_records) == 1
+    assert len(features) == 1
+    assert problems == []
+
+
+def test_web_xml_servlet_class_binary_spelling_resolves_a_non_static_member_class():
+    """FIX ROUND 46 (fortieth cold read, F2 MAJOR, wrong-data - THE
+    DESCRIPTOR GATE IS BLIND TO THE BINARY SPELLING, .cr40-desc): a
+    real servlet container requires the JVM's own binary class name
+    (`com.acme.Host$NestedAbs`) in <servlet-class> for a nested class -
+    never the source-dotted spelling (`com.acme.Host.NestedAbs`) this
+    adapter's own `qualified_name` always publishes. An exact string
+    match against the registry never fired for ANY nested class this
+    way - the route silently fell back to the web.xml FILE unit while
+    the SAME run's own readiness signal said the real class has
+    no_entry_point, two artifacts making opposite claims. Now resolves
+    (exact-then-translated) and, since NestedAbs is non-static member,
+    is ALSO suppressed by round 46's own F1 dimension."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>abs</servlet-name>
+    <servlet-class>com.acme.Host$NestedAbs</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>abs</servlet-name>
+    <url-pattern>/nested-abs</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = (
+        java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml))
+    host_source = "package com.acme;\nclass Host {\n  class NestedAbs {\n  }\n}\n"
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
+        "com/acme/Host.java": java_adapter.parse_java_source("com/acme/Host.java", host_source),
+    }
+    entry_point_records, features, problems = _build_features_with_verdicts(results)
+    assert entry_point_records == []
+    assert features == []
+    assert len(problems) == 1
+    assert problems[0].qualified_name == "com.acme.Host.NestedAbs"
+    assert "descriptor_route_on_uninstantiable_class" in problems[0].detail
+    assert "NON-STATIC MEMBER" in problems[0].detail
+
+
+def test_web_xml_filter_class_binary_spelling_resolves_a_non_static_member_class():
+    """FIX ROUND 46 (F2 MAJOR, .cr40-desc sibling): the <filter-class>
+    twin of the binary-spelling case above."""
+    web_xml = """<web-app>
+  <filter>
+    <filter-name>abs</filter-name>
+    <filter-class>com.acme.Host$NestedAbs</filter-class>
+  </filter>
+  <filter-mapping>
+    <filter-name>abs</filter-name>
+    <url-pattern>/nested-iface</url-pattern>
+  </filter-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = (
+        java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml))
+    host_source = "package com.acme;\nclass Host {\n  class NestedAbs {\n  }\n}\n"
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
+        "com/acme/Host.java": java_adapter.parse_java_source("com/acme/Host.java", host_source),
+    }
+    entry_point_records, features, problems = _build_features_with_verdicts(results)
+    assert entry_point_records == []
+    assert features == []
+    assert len(problems) == 1
+    assert problems[0].qualified_name == "com.acme.Host.NestedAbs"
+    assert "descriptor_route_on_uninstantiable_class" in problems[0].detail
+
+
+def test_web_xml_servlet_class_dot_spelled_still_resolves_the_identical_class():
+    """FIX ROUND 46 (F2 MAJOR, .cr40-desc dot-spelled control): the
+    ALREADY-source-dotted spelling of the identical nested class must
+    keep resolving exactly as it always has (this was never broken -
+    an exact string match already succeeds for it) - proving both
+    spellings of "this class" converge on the SAME suppression."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>abs</servlet-name>
+    <servlet-class>com.acme.Host.NestedAbs</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>abs</servlet-name>
+    <url-pattern>/nested-abs-dotted</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = (
+        java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml))
+    host_source = "package com.acme;\nclass Host {\n  class NestedAbs {\n  }\n}\n"
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
+        "com/acme/Host.java": java_adapter.parse_java_source("com/acme/Host.java", host_source),
+    }
+    entry_point_records, features, problems = _build_features_with_verdicts(results)
+    assert entry_point_records == []
+    assert len(problems) == 1
+    assert problems[0].qualified_name == "com.acme.Host.NestedAbs"
+
+
+def test_web_xml_entry_point_still_owned_by_the_file_when_the_class_is_out_of_scan():
+    """Companion: a <servlet-class> that IS declared but does not
+    resolve to any in-scan unit (out-of-scope compiled dependency, or
+    genuinely missing from this scan) must keep the web.xml file as
+    owner - the same safe fallback an unresolved synthetic name already
+    got - never a confident claim about a class this run cannot see."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>dispatcher</servlet-name>
+    <servlet-class>com.acme.web.DispatcherServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>dispatcher</servlet-name>
+    <url-pattern>/api/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = (
+        java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml))
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
+    }
+    entry_point_records, features, _problems = fa.build_features(results)
+    file_unit_id = fa._java_file_unit_id("WEB-INF/web.xml")
+    assert len(entry_point_records) == 1
+    assert entry_point_records[0].owning_unit_id == file_unit_id
+    # The class name is still visible - the feature label names it,
+    # rather than only the bare servlet-name string.
+    assert features[0].label == "DispatcherServlet"
+
+
+def test_two_out_of_scan_classes_sharing_a_simple_name_get_distinct_feature_ids():
+    """FIX ROUND 39 (thirty-third cold read, F1 BLOCKER, .cr33-fid,
+    wrong-data): `feature_id = hash(label, unit_ids=[owner])` - for an
+    OUT-OF-SCAN class, `label` is the SIMPLE name and `owner` is the
+    SAME synthetic file-fallback unit, so two jar-shipped classes
+    sharing a simple name in different packages (two `LoginServlet`s -
+    utterly ordinary) produced two DIFFERENT features sharing ONE id.
+    `qualified_name` (the claim's own full dotted name) is exactly the
+    distinguishing datum `group_key` already uses to keep the two
+    feature groups apart - now threaded into feature_id itself too."""
+    web_xml_a = """<web-app>
+  <servlet>
+    <servlet-name>a</servlet-name>
+    <servlet-class>com.vendor.pkg1.LoginServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>a</servlet-name>
+    <url-pattern>/a/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    web_xml_b = """<web-app>
+  <servlet>
+    <servlet-name>b</servlet-name>
+    <servlet-class>com.vendor.pkg2.LoginServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>b</servlet-name>
+    <url-pattern>/b/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points_a, _p1, _e1, _c1 = java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml_a)
+    entry_points_b, _p2, _e2, _c2 = java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml_b)
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(
+            entry_points=[*entry_points_a, *entry_points_b]),
+    }
+    entry_point_records, features, _problems = fa.build_features(results)
+    assert len(entry_point_records) == 2
+    assert len(features) == 2
+    feature_ids = {f.feature_id for f in features}
+    assert len(feature_ids) == 2, "two distinct classes must not share one feature_id"
+    assert {f.label for f in features} == {"LoginServlet"}
+    claimed_ids = {ep_id for f in features for ep_id in f.entry_point_ids}
+    assert claimed_ids == {e.entry_point_id for e in entry_point_records}
+
+
+def test_three_out_of_scan_classes_sharing_a_simple_name_across_servlet_and_filter_kinds():
+    """FIX ROUND 39 (F1 BLOCKER, .cr33-fid3, wrong-data): the third
+    reader fixture proves `kind` was not discriminated either - a
+    `<filter>` and a `<servlet>`, both out-of-scan, sharing a simple
+    name, collided on feature_id the identical way two servlets did.
+    `kind` is threaded into feature_id now too."""
+    web_xml_servlet = """<web-app>
+  <servlet>
+    <servlet-name>a</servlet-name>
+    <servlet-class>com.vendor.pkg1.Shared</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>a</servlet-name>
+    <url-pattern>/a/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    web_xml_filter = """<web-app>
+  <filter>
+    <filter-name>b</filter-name>
+    <filter-class>com.vendor.pkg2.Shared</filter-class>
+  </filter>
+  <filter-mapping>
+    <filter-name>b</filter-name>
+    <url-pattern>/b/*</url-pattern>
+  </filter-mapping>
+</web-app>
+"""
+    entry_points_servlet, _p1, _e1, _c1 = java_adapter.parse_web_xml(
+        "WEB-INF/web.xml", web_xml_servlet)
+    entry_points_filter, _p2, _e2, _c2 = java_adapter.parse_web_xml(
+        "WEB-INF/web.xml", web_xml_filter)
+    assert entry_points_servlet[0].kind != entry_points_filter[0].kind
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(
+            entry_points=[*entry_points_servlet, *entry_points_filter]),
+    }
+    entry_point_records, features, _problems = fa.build_features(results)
+    assert len(entry_point_records) == 2
+    assert len(features) == 2
+    assert len({f.feature_id for f in features}) == 2, (
+        "a servlet and a filter sharing a simple name must not share a feature_id")
+
+
+def test_two_servlet_mappings_in_one_web_xml_produce_two_features_not_one():
+    """FIX ROUND 14 (tenth cold read, CR10-8 MINOR, wrong-data): a
+    web.xml with two <servlet-mapping> entries has no real declared-type
+    owner for either claim, so both fell back to the SAME file unit - and
+    grouping by owning_unit_id alone then collapsed them into ONE feature
+    labelled after whichever servlet happened to be first, silently
+    folding the second servlet's identity under the wrong name. Each
+    independent file-fallback claim must get its own feature."""
+    entry_points, _web_problems, _edges, _descriptor_name_conflicts = java_adapter.parse_web_xml(
+        "WEB-INF/web.xml",
+        "<web-app>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "    <url-pattern>/api/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>legacy</servlet-name>\n"
+        "    <url-pattern>/legacy/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+    )
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
+    }
+    entry_point_records, features, _problems = fa.build_features(results)
+    assert len(entry_point_records) == 2
+    assert len(features) == 2
+    assert sorted(f.label for f in features) == ["dispatcher", "legacy"]
+    # each feature owns exactly its own entry point, not both
+    for feature in features:
+        assert len(feature.entry_point_ids) == 1
+        owned = next(
+            ep for ep in entry_point_records if ep.entry_point_id == feature.entry_point_ids[0])
+        assert owned.name == ("/api/*" if feature.label == "dispatcher" else "/legacy/*")
+
+
+def test_two_routes_on_the_same_controller_group_into_one_feature():
+    source = (
+        "package p;\n@RestController\nclass Controller {\n"
+        '  @GetMapping("/api/widgets")\n  void list() {}\n'
+        '  @PostMapping("/api/widgets")\n  void create() {}\n'
+        "}\n"
+    )
+    results = {"Controller.java": _parse("Controller.java", source)}
+    entry_points, features, _problems = fa.build_features(results)
+    assert len(entry_points) == 2
+    assert len(features) == 1
+    assert sorted(features[0].entry_point_ids) == sorted(e.entry_point_id for e in entry_points)
+
+
+def test_get_and_post_on_the_same_path_are_two_distinct_entry_points_not_a_duplicate_id():
+    """M-5 (third cold read, fix round 5): GET and POST on the identical
+    path used to compute the SAME entry_point_id (the HTTP method was not
+    part of its identity) - the sibling test above only ever counted RAW
+    entry-point records, which stayed 2 either way, so it never actually
+    proved the two entry points were DISTINCT rather than a duplicate
+    primary key published twice. Two methods on one route are two entry
+    points to a migration reader, never collapsed into one."""
+    source = (
+        "package p;\n@RestController\nclass Controller {\n"
+        '  @GetMapping("/orders")\n  void list() {}\n'
+        '  @PostMapping("/orders")\n  void create() {}\n'
+        "}\n"
+    )
+    results = {"Controller.java": _parse("Controller.java", source)}
+    entry_points, features, _problems = fa.build_features(results)
+    ids = [e.entry_point_id for e in entry_points]
+    assert len(ids) == len(set(ids)), "two distinct routes published the SAME entry_point_id"
+    assert {e.name for e in entry_points} == {"GET /orders", "POST /orders"}
+    assert sorted(features[0].entry_point_ids) == sorted(ids)
+
+
+def test_duplicate_entry_point_claims_coalesce_to_one_record_with_merged_producers():
+    """M-5 (third cold read, fix round 5): two claims that genuinely
+    normalize to the SAME entry_point_id (kind+owning_unit_id+name) must
+    coalesce to one record with merged producers - the same merge rule
+    dependencies_artifact.py's edge coalescing already applies (M6, round
+    3) - never publish a duplicate "primary key" twice, and never list
+    the same ID twice on the owning feature."""
+    claim = java_adapter.JavaEntryPointClaim(
+        qualified_name="p.App", kind="cli_main", name="main", line=3, evidence_class="extracted")
+    result = java_adapter.JavaFileResult(
+        units=[java_adapter.JavaUnitClaim(
+            relative_path="App.java", qualified_name="p.App", simple_name="App",
+            line=1, classification="production",
+        )],
+        entry_points=[claim, claim],
+    )
+    entry_points, features, _problems = fa.build_features(
+        {"App.java": result}, file_digests={"App.java": "deadbeef"})
+    assert len(entry_points) == 1
+    assert len(features[0].entry_point_ids) == 1
+    # FIX ROUND 37 (thirty-first cold read, F5 MAJOR, wrong-data): this
+    # claim's own evidence_class is "extracted" - producers[].basis must
+    # match it exactly, never a hardcoded literal that happens to agree
+    # here but not for a "declared"/"inferred" claim elsewhere.
+    assert entry_points[0].producers[0]["basis"] == "extracted"
+    assert features[0].producers[0]["basis"] == "extracted"
+    assert len(entry_points[0].producers) == 1
+
+
+def test_entry_points_on_different_classes_produce_separate_features():
+    results = {
+        "App.java": _parse(
+            "App.java", "package p;\nclass App {\n  public static void main(String[] a) {}\n}\n"),
+        "Controller.java": _parse(
+            "Controller.java",
+            'package p;\n@RestController\nclass Controller {\n  @GetMapping("/x")\n  void get() {}\n}\n',
+        ),
+    }
+    entry_points, features, _problems = fa.build_features(results)
+    assert len(features) == 2
+    assert {f.label for f in features} == {"App", "Controller"}
+
+
+def test_confirmed_labels_promote_feature_state():
+    results = {"App.java": _parse(
+        "App.java", "package p;\nclass App {\n  public static void main(String[] a) {}\n}\n")}
+    _entry_points, features, _problems = fa.build_features(results, confirmed_labels=frozenset({"App"}))
+    assert features[0].state == "confirmed"
+
+
+def test_unconfirmed_label_stays_candidate():
+    results = {"App.java": _parse(
+        "App.java", "package p;\nclass App {\n  public static void main(String[] a) {}\n}\n")}
+    _entry_points, features, _problems = fa.build_features(results, confirmed_labels=frozenset({"SomeOther"}))
+    assert features[0].state == "candidate"
+
+
+def test_no_entry_points_means_no_features():
+    results = {"Widget.java": _parse("Widget.java", "package p;\nclass Widget {}\n")}
+    entry_points, features, _problems = fa.build_features(results)
+    assert entry_points == []
+    assert features == []
+
+
+def test_ids_are_deterministic_across_two_builds():
+    results = {"App.java": _parse(
+        "App.java", "package p;\nclass App {\n  public static void main(String[] a) {}\n}\n")}
+    first_ep, first_f, _problems = fa.build_features(results)
+    second_ep, second_f, _problems = fa.build_features(results)
+    assert {e.entry_point_id for e in first_ep} == {e.entry_point_id for e in second_ep}
+    assert {f.feature_id for f in first_f} == {f.feature_id for f in second_f}
+
+
+def test_to_json_sorts_id_lists():
+    results = {"App.java": _parse(
+        "App.java", "package p;\nclass App {\n  public static void main(String[] a) {}\n}\n")}
+    entry_points, features, _problems = fa.build_features(results)
+    payload = features[0].to_json()
+    assert payload["entry_point_ids"] == sorted(payload["entry_point_ids"])
+    assert entry_points[0].to_json()["feature_ids"] == [features[0].feature_id]
+
+
+def test_a_single_oversized_url_pattern_is_bounded_and_id_sensitive_past_the_bound():
+    """FIX ROUND 40 (thirty-fourth cold read, Part A F1+F2, .cr34-trunc,
+    contrast control): the twin of dependencies_artifact's own collision
+    test, but with only ONE oversized route each time (no collision
+    partner) - the ordinary, common truncation case must keep
+    publishing the SAME bounded, marker-suffixed display name it always
+    has (round 13's own CR9-6 fix), while entry_point_id is now
+    sensitive to a change PAST the 200-char bound - proving the id is
+    genuinely computed from the raw value, not merely re-deriving the
+    same truncated string two different ways."""
+    prefix = "/" + "x" * 199
+
+    def _build(pattern: str):
+        web_xml = """<web-app>
+  <servlet>
+    <servlet-name>a</servlet-name>
+    <servlet-class>com.acme.web.SoloServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>a</servlet-name>
+    <url-pattern>%s</url-pattern>
+  </servlet-mapping>
+</web-app>
+""" % pattern
+        entry_points, _p, _e, _c = java_adapter.parse_web_xml("WEB-INF/web.xml", web_xml)
+        results = {"WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points)}
+        return fa.build_features(results)
+
+    entry_points_a, _features_a, _problems_a = _build(prefix + "A" * 60)
+    entry_points_b, _features_b, _problems_b = _build(prefix + "B" * 60)
+    assert len(entry_points_a) == len(entry_points_b) == 1
+    name_a, name_b = entry_points_a[0].name, entry_points_b[0].name
+    assert name_a == name_b, "both oversized patterns must truncate to the identical display name"
+    assert name_a.endswith("...(truncated)")
+    assert entry_points_a[0].entry_point_id != entry_points_b[0].entry_point_id, (
+        "entry_point_id must still differ past the truncation bound for a single, "
+        "non-colliding oversized route"
+    )
+
+
+def test_a_real_newline_and_its_own_literal_backslash_n_spelling_publish_distinct_names():
+    """FIX ROUND 42 (thirty-sixth cold read, F2 MINOR, .cr36-amb/.cr36-
+    amb2, wrong-data): `_sanitize_route_name_control_chars` (the display-
+    write escape choke point) was itself NON-INJECTIVE - it escapes a
+    real newline to the literal two-character text ``\\n``, but never
+    escaped a literal backslash character itself, so a route ALREADY
+    containing that exact literal spelling (a route named with a real
+    backslash followed by the letter "n", not a real newline) passed
+    through unchanged and published the IDENTICAL name - complete/0,
+    no duplicate_route_target (round 41's own F3 correctly groups on
+    the raw, pre-escape value, so the collision is invisible to that
+    check too). Fixed by escaping a literal backslash FIRST, to two
+    literal backslashes - a spelling no other escape in this function
+    ever produces, so it can never collide with a real control
+    character's own escape."""
+    real_newline_source = (
+        "package p;\n@RestController\nclass Amb {\n"
+        '  @GetMapping("/orders\\n/more")\n  void list() {}\n}\n'
+    )
+    literal_backslash_n_source = (
+        "package p;\n@RestController\nclass Amb2 {\n"
+        r'  @GetMapping("/orders\\n/more")' "\n  void list() {}\n}\n"
+    )
+    real_newline_result = _parse("Amb.java", real_newline_source)
+    literal_result = _parse("Amb2.java", literal_backslash_n_source)
+    assert "\n" in real_newline_result.edges[0].target
+    assert "\\" in literal_result.edges[0].target and "\n" not in literal_result.edges[0].target
+
+    entry_points_a, _f, _problems = fa.build_features({"Amb.java": real_newline_result})
+    entry_points_b, _f, _problems = fa.build_features({"Amb2.java": literal_result})
+    assert entry_points_a[0].name != entry_points_b[0].name, (
+        "a real newline and its own literal backslash-n spelling must not publish "
+        "the identical escaped display name"
+    )
+
