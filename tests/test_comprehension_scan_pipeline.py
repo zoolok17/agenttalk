@@ -2206,6 +2206,64 @@ def test_run_scan_a_servlet_subclass_via_import_reports_dependencies_resolved_sa
     assert dependencies_resolved["stored_status"] == "satisfied"
 
 
+def test_run_scan_a_dollar_sign_class_name_registers_correctly_and_its_inherit_reference_resolves(
+    java_repo: Path,
+) -> None:
+    """MICRO-NOD 50b (F2 MAJOR, cross-vendor read, wrong-data,
+    reproduced verbatim): "$" is a legal Java identifier character (JLS
+    3.8) - "class Cash$Flow" used to register under the truncated,
+    NONEXISTENT qualified name "p.Cash" (the type-name anchor's own
+    "\\w+" capture stops at "$"), and a SEPARATE class in the same file
+    extending "Cash$Flow" by its real name published an unresolved
+    inherit edge, even though the real type genuinely lives in the same
+    scan - the registry never held the correct name to match against.
+    End to end: the real name registers, and the inherit edge to it
+    resolves."""
+    (java_repo / "src" / "main" / "java" / "p" / "CashFlow.java").write_text(
+        "package p;\n"
+        "class Other extends Cash$Flow {\n}\n"
+        "class Cash$Flow {\n}\n",
+        encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    import json
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+
+    cash_flow_unit = next(u for u in modules_doc["units"] if u["display_name"] == "Cash$Flow")
+    assert cash_flow_unit["qualified_name"] == "p.Cash$Flow"
+    other_unit = next(u for u in modules_doc["units"] if u["display_name"] == "Other")
+
+    other_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "inherit" and r["from_unit_id"] == other_unit["unit_id"]
+    )
+    assert other_edge["resolution_state"] == "resolved"
+    assert other_edge["target_unit_id"] == cash_flow_unit["unit_id"]
+
+
+def test_run_scan_a_dollar_sign_package_segment_is_not_missed_entirely(java_repo: Path) -> None:
+    """MICRO-NOD 50b (F2 MAJOR, cross-vendor read, wrong-data,
+    reproduced verbatim): "package p$sub;" used to be missed ENTIRELY -
+    "$" is not in the package-segment charset "[\\w.]+", so the required
+    "\\s*;" right after the truncated match never lined up and the whole
+    package statement failed to match, silently falling every type in
+    the file into the default package. Now recognized; the type
+    registers under its real, dollar-containing package."""
+    dollar_pkg_dir = java_repo / "src" / "main" / "java" / "p$sub"
+    dollar_pkg_dir.mkdir(parents=True)
+    (dollar_pkg_dir / "Widget.java").write_text(
+        "package p$sub;\nclass Widget {\n}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    import json
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    widget_unit = next(u for u in modules_doc["units"] if u["display_name"] == "Widget")
+    assert widget_unit["qualified_name"] == "p$sub.Widget"
+
+
 def test_run_scan_a_real_junit_test_calling_the_target_reports_test_evidence_located_satisfied(
     java_repo: Path,
 ) -> None:

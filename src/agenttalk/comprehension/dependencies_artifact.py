@@ -167,23 +167,44 @@ def resolve_descriptor_qualified_name(qualified_name: str, registry: dict[str, A
     can never legitimately separate PACKAGE segments, so this
     translation is always safe).
 
-    MICRO-ROUND 46b (reviewer-3's own delta on `6d7882e`, corrected):
-    the exact-match branch is UNREACHABLE for this producer's own
-    in-scan registries specifically - ``_TYPE_NAME_ANCHOR_RE``'s own
-    ``\\w+`` identifier capture can never include a ``$`` character in
-    the first place, so no qualified_name this adapter ever computes
-    contains one; translation is what actually decides every real
-    resolution here. Kept anyway as harmless, correct defensive
-    behavior for a hypothetical non-source-derived registry (or a
-    future identifier capture widened to accept ``$``) - never load-
-    bearing for THIS producer's own callers today. If translation ever
-    produces a name that collides with an ALREADY-declared different
-    class of the identical dotted spelling, this function does not
-    arbitrate that either way - the caller's own PRE-EXISTING duplicate-
-    qualified-name conflict machinery already handles two units sharing
-    one name honestly (a stamped conflict, dependent signals reported
-    unknown), the same mechanism any other same-name collision already
-    goes through, never a silent pick here.
+    MICRO-ROUND 46b (reviewer-3's own delta on `6d7882e`, since
+    OVERTURNED - see MICRO-NOD 50b below): AT THE TIME, the exact-match
+    branch was unreachable for this producer's own in-scan registries -
+    ``_TYPE_NAME_ANCHOR_RE``'s own ``\\w+`` identifier capture could
+    never include a ``$`` character, so no qualified_name this adapter
+    computed ever contained one; translation alone decided every real
+    resolution here.
+
+    MICRO-NOD 50b (F2 MAJOR, cross-vendor read, wrong-data): that
+    premise no longer holds - ``_TYPE_NAME_ANCHOR_RE`` now accepts
+    ``$`` (a legal Java identifier character, JLS 3.8: a SOURCE-level
+    class genuinely named ``Cash$Flow`` is real, legal Java, entirely
+    unrelated to a binary nesting separator), so this adapter's own
+    ``qualified_name`` values CAN now contain a literal, source-declared
+    ``$``. The exact-match branch is therefore reachable for real: when
+    an in-scan class is genuinely named with a literal ``$``, a
+    descriptor spelling it identically hits the EXACT branch and
+    resolves to that real class directly, never falling through to a
+    translated guess that might otherwise have matched a DIFFERENT,
+    genuinely-nested class of the coincidentally-identical dotted
+    spelling - the deliberate, already-documented priority order above
+    (exact spelling always outranks a translated one), now doing real
+    work instead of being unreachable defensive code. If translation
+    ever produces a name that collides with an ALREADY-declared
+    different class of the identical dotted spelling, this function
+    does not arbitrate that either way - the caller's own PRE-EXISTING
+    duplicate-qualified-name conflict machinery already handles two
+    units sharing one name honestly (a stamped conflict, dependent
+    signals reported unknown), the same mechanism any other same-name
+    collision already goes through, never a silent pick here. Verified:
+    a literal-dollar top-level class and a genuinely-nested class of the
+    coincidentally-identical dotted spelling can coexist in one scan
+    without colliding in ``by_qualified_name`` (they are always
+    naturally distinct strings - a top-level class's own simple name
+    can never contain a literal ``.``, only a nesting join ever
+    produces one, so the two spellings can never collide as REGISTERED
+    keys; only a descriptor's own LOOKUP value can name either, and the
+    exact-first order above picks the one it actually named).
 
     Returns the registry KEY that should be looked up (``qualified_
     name`` itself, unresolved either way, when neither form is present

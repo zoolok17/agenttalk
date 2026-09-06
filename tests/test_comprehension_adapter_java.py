@@ -104,6 +104,18 @@ def test_two_imports_on_one_physical_line_both_extract():
     assert {e.target for e in _edges(result, "import")} == {"java.util.List", "java.util.Map"}
 
 
+def test_an_import_naming_a_dollar_sign_type_is_not_dropped():
+    """MICRO-NOD 50b (F2 MAJOR): "$" is a legal Java identifier
+    character (JLS 3.8) - the same charset gap _PACKAGE_RE had (see
+    the package/inherit repro in test_comprehension_scan_pipeline.py)
+    applies to _IMPORT_RE: "import com.acme.Cash$Flow;" used to be
+    dropped entirely (the segment charset stopped at "$", leaving
+    "Flow;" unconsumed right where "\\s*;" was required)."""
+    src = "package p;\nimport com.acme.Cash$Flow;\nclass Foo {}\n"
+    result = java.parse_java_source("Foo.java", src)
+    assert {e.target for e in _edges(result, "import")} == {"com.acme.Cash$Flow"}
+
+
 def test_an_import_sharing_a_line_with_another_still_corroborates_test_classification():
     """MICRO-ROUND 49 (M1's own real-world consequence): a real JUnit
     test class whose `import org.junit.Test;` happens to share a
@@ -2793,6 +2805,34 @@ public class Controller {
     assert len(routes) == 1
     assert routes[0].target == "GET /api/orders/list"
     assert result.problems == []
+
+
+def test_a_unicode_leading_letter_annotation_is_a_declared_limit_not_recognized():
+    """MICRO-NOD 50b (F2, judged charset policy - the reader's own
+    Unicode-identifier note): the JLS (3.8) permits any Unicode
+    identifier-start character to lead a Java identifier, so
+    ``@ΔeltaMapping`` (a leading Greek capital delta) is legal Java
+    - but every annotation-matching regex in this module anchors its
+    first character to the ASCII ``[A-Za-z_$]`` class, a deliberate,
+    declared limit judged NOT worth widening (see ``_ANY_ANNOTATION_
+    RE``'s own comment): unlike a package/type/import name (which this
+    same module already tolerates for free via a plain ``\\w`` charset,
+    proven below), a non-ASCII-lettered ANNOTATION name is exotic to
+    the point of being unobserved in real Java code. This locks the
+    CURRENT, judged behavior - not a claim that it could not be
+    reconsidered."""
+    src = """
+package p;
+
+@ΔeltaMapping("/api/orders")
+public class Controller {
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert _edges(result, "route") == []
+    # The SAME file's package/type handling is unaffected - only the
+    # annotation family declines this identifier shape.
+    assert result.units[0].qualified_name == "p.Controller"
 
 
 def test_class_level_request_mapping_survives_a_non_sealed_modifier():

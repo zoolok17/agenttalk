@@ -428,7 +428,16 @@ _TEST_FRAMEWORK_IMPORT_PREFIXES = ("org.junit", "junit.framework", "org.testng")
 #: the compilation unit's own FIRST statement (nothing but comments can
 #: precede it) - line-anchoring it is not a defect, so it keeps this
 #: narrower anchor unchanged.
-_PACKAGE_RE = re.compile(r"(?:\A|(?<=[\r\n]))\s*package\s+([\w.]+)\s*;")
+#:
+#: MICRO-NOD 50b (F2 MAJOR, cross-vendor read, wrong-data): ``$`` is a
+#: legal Java identifier character (JLS 3.8) - a package segment named
+#: ``p$sub`` was matched by ``[\w.]+`` only as far as ``p`` (``$`` is
+#: not in ``\w``), leaving ``$sub;`` unconsumed right where ``\s*;`` was
+#: required next; since neither whitespace nor ``;`` followed, the WHOLE
+#: match failed and the file's package was missed ENTIRELY (every type
+#: in it fell into the default package). ``$`` is now in the segment
+#: charset alongside ``\w``/``.``.
+_PACKAGE_RE = re.compile(r"(?:\A|(?<=[\r\n]))\s*package\s+([\w$.]+)\s*;")
 #: MICRO-ROUND 49 (forty-third cold read, M1 MAJOR, wrong-data): `import`
 #: WAS still line-anchored like `_PACKAGE_RE` above (round 49's own B3
 #: fix only widened which characters count as "line start", never
@@ -447,7 +456,12 @@ _PACKAGE_RE = re.compile(r"(?:\A|(?<=[\r\n]))\s*package\s+([\w.]+)\s*;")
 #: string-start/line-start alternatives, so an import immediately
 #: following another statement's own closing `;` (on the same physical
 #: line) is recognized exactly the same as one that starts a fresh line.
-_IMPORT_RE = re.compile(r"(?:\A|(?<=[\r\n;]))\s*import\s+(static\s+)?([\w.]+(?:\.\*)?)\s*;")
+#:
+#: MICRO-NOD 50b (F2 MAJOR): ``$`` added to the segment charset, the
+#: same reason and the same failure shape as ``_PACKAGE_RE`` above - an
+#: ``import com.acme.Cash$Flow;`` naming a real, legally-dollar-signed
+#: type must not be dropped the same way a package declaration was.
+_IMPORT_RE = re.compile(r"(?:\A|(?<=[\r\n;]))\s*import\s+(static\s+)?([\w$.]+(?:\.\*)?)\s*;")
 #: BLOCKER 1a (fifth cold read, fix round 8): the OLD single fixed-shape
 #: regex (`\b(class|interface|enum)\s+(\w+)(?:\s*<[^>{]*>)?(?:\s+
 #: extends\s+([\w.<>,\s]+?))?(?:\s+implements\s+([\w.<>,\s]+?))?\s*\{`)
@@ -474,7 +488,21 @@ _IMPORT_RE = re.compile(r"(?:\A|(?<=[\r\n;]))\s*import\s+(static\s+)?([\w.]+(?:\
 #: technique _matching_close_paren already uses for an annotation's own
 #: argument list, rather than asking one fixed-shape regex to describe
 #: everything between a type's name and its body in one shot.
-_TYPE_NAME_ANCHOR_RE = re.compile(r"\b(class|interface|enum|record)\s+(\w+)")
+#:
+#: MICRO-NOD 50b (F2 MAJOR, cross-vendor read, wrong-data, THE ROOT
+#: CAUSE): ``$`` is a legal Java identifier character (JLS 3.8) -
+#: ``class Cash$Flow`` was captured by ``(\w+)`` only as far as
+#: ``Cash`` (``$`` is not in ``\w``); the depth-aware header walk that
+#: follows this anchor does not itself validate the name, so it
+#: silently accepted the leftover ``$Flow`` as if it were unremarkable
+#: trailing header text and kept walking to the real body brace,
+#: registering the type under the WRONG, truncated name (a nonexistent
+#: ``p.Cash`` component) - and, separately, breaking every reference
+#: TO the real ``Cash$Flow`` (an ``extends``/``implements`` naming it
+#: elsewhere in the same file) resolves against, since the registry
+#: never held the correct name to match against at all. ``$`` is now in
+#: the name charset alongside ``\w``.
+_TYPE_NAME_ANCHOR_RE = re.compile(r"\b(class|interface|enum|record)\s+([\w$]+)")
 #: Applied only to the CLAUSE ZONE _extract_types isolates (the text
 #: between a type's own generic-parameter list/record-component list and
 #: its body brace) - by that point a type parameter's own bound (which
@@ -950,6 +978,32 @@ _JAX_RS_VERB_ANNOTATION_RE = re.compile(
 #: used only to group textually-adjacent annotations into the same
 #: "stack" (see ``_verb_marker_has_sibling_path``) - never itself a
 #: route/entry-point recognizer.
+#:
+#: NAMED LIMIT (declared, MICRO-NOD 50b F2, judged not chased - the
+#: reader's own Unicode-identifier note): every identifier-shaped
+#: character class in this module - this one included - anchors its
+#: FIRST character to ``[A-Za-z_$]``, ASCII letters plus ``_``/``$``.
+#: The JLS (3.8) actually permits any Unicode character for which
+#: ``Character.isJavaIdentifierStart`` is true as an identifier's own
+#: first character - a class literally named e.g. ``Δelta``
+#: (Greek capital delta) is legal Java, and this producer is
+#: INCONSISTENT about it: ``_PACKAGE_RE``/``_IMPORT_RE``/
+#: ``_TYPE_NAME_ANCHOR_RE`` above tolerate it for free (their charset is
+#: plain ``\\w``, and Python's ``\\w`` already matches most Unicode
+#: letters under the default Unicode flavor) - but this family's own
+#: ASCII-anchored first-character class does not, so an annotation,
+#: route-value, or modifier keyword spelled with a leading non-ASCII
+#: letter silently fails to match here even though the SAME file's
+#: package/type/import handling would have accepted it. Judged, not
+#: widened: a non-ASCII-first-lettered ANNOTATION name is exotic to the
+#: point of being unobserved in real Java code (unlike the round-16
+#: ``.groovy`` dilution tradeoff, this is not even a live population
+#: this producer's own real-world targets are known to use) - widening
+#: every one of this family's own regexes to accept an arbitrary
+#: Unicode identifier-start character would require re-auditing each
+#: for correctness against reserved punctuation/combining marks, a
+#: large change for a shape not encountered in practice. Accepted as a
+#: named, declared limit until a real occurrence is ever measured.
 _ANY_ANNOTATION_RE = re.compile(r"@(?:[A-Za-z_$][\w$]*\.)*([A-Za-z_$][\w$]*)")
 #: FIX ROUND 19 (fifteenth cold read, F6 MINOR, wrong-data - degrades a
 #: healthy run): the JLS permits a modifier and an annotation on a

@@ -1835,18 +1835,24 @@ def test_resolve_descriptor_qualified_name_translates_a_dollar_spelled_binary_na
 
 
 def test_resolve_descriptor_qualified_name_prefers_an_exact_match_over_translation():
-    """FIX ROUND 46 (F2 MAJOR); corrected MICRO-ROUND 46b (reviewer-3's
-    own delta): the exact-match-first branch this asserts is defensive,
-    harmless behavior for a HYPOTHETICAL non-source-derived registry -
-    it is UNREACHABLE for this producer's own real registries, since
-    `_TYPE_NAME_ANCHOR_RE`'s own `\\w+` identifier capture can never
-    include a `$` character, so no qualified_name this adapter computes
-    ever contains one; translation is what decides every real
-    resolution here. Locks the exact-first ORDERING as a unit-level
-    contract regardless, so a future change to this function cannot
-    silently invert it without this test noticing."""
+    """FIX ROUND 46 (F2 MAJOR); corrected MICRO-ROUND 46b, then
+    OVERTURNED by MICRO-NOD 50b (F2 MAJOR, cross-vendor read): this
+    exact-match-first branch was believed unreachable for this
+    producer's own real registries (`_TYPE_NAME_ANCHOR_RE`'s identifier
+    capture could never include a `$`) - MICRO-NOD 50b widened that
+    capture to admit `$` (a legal Java identifier character, JLS 3.8),
+    so a real, source-declared `Cash$Flow`-shaped class now CAN sit in
+    this same registry alongside a genuinely-nested class of the
+    coincidentally-identical dotted spelling - exactly the "literal-$
+    name vs translated nested name" collision MICRO-NOD 50b's own
+    dispatch asked to be verified. This test already reproduces that
+    exact registry shape and locks the correct outcome: the literal
+    spelling's OWN exact match wins, never the other class's translated
+    guess - both entries stay independently reachable by their own
+    correct descriptor spelling, no silent misattribution either way."""
     registry = {"com.acme.Foo$Bar": "literal-unit", "com.acme.Foo.Bar": "nested-unit"}
     assert da.resolve_descriptor_qualified_name("com.acme.Foo$Bar", registry) == "com.acme.Foo$Bar"
+    assert da.resolve_descriptor_qualified_name("com.acme.Foo.Bar", registry) == "com.acme.Foo.Bar"
 
 
 def test_resolve_descriptor_qualified_name_leaves_an_unresolvable_name_unchanged():
