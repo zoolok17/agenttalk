@@ -2264,6 +2264,140 @@ def test_run_scan_a_dollar_sign_package_segment_is_not_missed_entirely(java_repo
     assert widget_unit["qualified_name"] == "p$sub.Widget"
 
 
+_TWO_SAME_SIMPLE_NAME_NESTED_TYPES_SOURCE = (
+    "package p;\n"
+    "class Outer1 {\n"
+    "  class Inner {\n  }\n"
+    "  class Sub extends Inner {\n  }\n"
+    "}\n"
+    "class Outer2 {\n"
+    "  class Inner {\n  }\n"
+    "  class Sub extends Inner {\n  }\n"
+    "}\n"
+)
+
+_TWO_SAME_SIMPLE_NAME_NESTED_TYPES_SOURCE_REORDERED = (
+    "package p;\n"
+    "class Outer2 {\n"
+    "  class Inner {\n  }\n"
+    "  class Sub extends Inner {\n  }\n"
+    "}\n"
+    "class Outer1 {\n"
+    "  class Inner {\n  }\n"
+    "  class Sub extends Inner {\n  }\n"
+    "}\n"
+)
+
+
+def test_run_scan_two_same_simple_name_nested_types_each_resolve_inherit_to_their_own_enclosing_scope(
+    java_repo: Path,
+) -> None:
+    """MICRO-NOD 50b (F3 MAJOR, cross-vendor read, wrong-data,
+    reproduced verbatim): the file-wide simple-name registry used to be
+    a plain {simple_name: qualified_name} dict, LAST-WINS - two
+    same-simple-name nested types ("Inner", once under Outer1 and once
+    under Outer2) collapsed to whichever one this file's own units
+    happened to list LAST, so at least one of the two "extends Inner"
+    edges below resolved to the WRONG Inner with confidence "high" (a
+    silent, confident wrong-data pick, not an honest tie). Per JLS 6.3,
+    each nested Sub's own bare "Inner" reference must resolve to the
+    Inner declared in ITS OWN enclosing Outer, never the other one."""
+    (java_repo / "src" / "main" / "java" / "p" / "Types.java").write_text(
+        _TWO_SAME_SIMPLE_NAME_NESTED_TYPES_SOURCE, encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    import json
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    units_by_qualified_name = {u["qualified_name"]: u for u in modules_doc["units"]}
+    outer1_sub = units_by_qualified_name["p.Outer1.Sub"]
+    outer2_sub = units_by_qualified_name["p.Outer2.Sub"]
+    outer1_inner = units_by_qualified_name["p.Outer1.Inner"]
+    outer2_inner = units_by_qualified_name["p.Outer2.Inner"]
+
+    outer1_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "inherit" and r["from_unit_id"] == outer1_sub["unit_id"]
+    )
+    outer2_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "inherit" and r["from_unit_id"] == outer2_sub["unit_id"]
+    )
+    assert outer1_edge["resolution_state"] == "resolved"
+    assert outer1_edge["target_unit_id"] == outer1_inner["unit_id"]
+    assert outer2_edge["resolution_state"] == "resolved"
+    assert outer2_edge["target_unit_id"] == outer2_inner["unit_id"]
+
+
+def test_run_scan_two_same_simple_name_nested_types_resolve_the_same_regardless_of_declaration_order(
+    java_repo: Path,
+) -> None:
+    """MICRO-NOD 50b (F3 MAJOR, cross-vendor read, wrong-data,
+    reproduced verbatim): the reader's own control - reordering an
+    UNRELATED declaration (here, which Outer comes first in the file)
+    used to FLIP which Inner every "extends Inner" edge resolved to,
+    since the last-wins dict's own winner depended on extraction order,
+    never on scope. The byte-identical fixture, only reordered, must
+    resolve to the IDENTICAL correct targets as the original order."""
+    (java_repo / "src" / "main" / "java" / "p" / "Types.java").write_text(
+        _TWO_SAME_SIMPLE_NAME_NESTED_TYPES_SOURCE_REORDERED, encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    import json
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    units_by_qualified_name = {u["qualified_name"]: u for u in modules_doc["units"]}
+    outer1_sub = units_by_qualified_name["p.Outer1.Sub"]
+    outer2_sub = units_by_qualified_name["p.Outer2.Sub"]
+    outer1_inner = units_by_qualified_name["p.Outer1.Inner"]
+    outer2_inner = units_by_qualified_name["p.Outer2.Inner"]
+
+    outer1_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "inherit" and r["from_unit_id"] == outer1_sub["unit_id"]
+    )
+    outer2_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "inherit" and r["from_unit_id"] == outer2_sub["unit_id"]
+    )
+    assert outer1_edge["target_unit_id"] == outer1_inner["unit_id"]
+    assert outer2_edge["target_unit_id"] == outer2_inner["unit_id"]
+
+
+def test_run_scan_a_bare_reference_outside_either_enclosing_scope_is_genuinely_ambiguous(
+    java_repo: Path,
+) -> None:
+    """MICRO-NOD 50b (F3 MAJOR, genuine-ambiguity shape): a THIRD class,
+    nested in NEITHER Outer1 nor Outer2, also extends the bare name
+    "Inner" - no enclosing scope of its own contains either candidate,
+    so this is a genuine tie: reported ambiguous with both real
+    candidates, never a silent pick either way."""
+    (java_repo / "src" / "main" / "java" / "p" / "Types.java").write_text(
+        _TWO_SAME_SIMPLE_NAME_NESTED_TYPES_SOURCE
+        + "class Outsider extends Inner {\n}\n",
+        encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    import json
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    units_by_qualified_name = {u["qualified_name"]: u for u in modules_doc["units"]}
+    outsider = units_by_qualified_name["p.Outsider"]
+    outer1_inner = units_by_qualified_name["p.Outer1.Inner"]
+    outer2_inner = units_by_qualified_name["p.Outer2.Inner"]
+
+    outsider_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "inherit" and r["from_unit_id"] == outsider["unit_id"]
+    )
+    assert outsider_edge["resolution_state"] == "ambiguous"
+    assert set(outsider_edge["candidate_unit_ids"]) == {
+        outer1_inner["unit_id"], outer2_inner["unit_id"]}
+
+
 def test_run_scan_a_real_junit_test_calling_the_target_reports_test_evidence_located_satisfied(
     java_repo: Path,
 ) -> None:

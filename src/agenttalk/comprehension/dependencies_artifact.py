@@ -458,10 +458,73 @@ def _exact_qualified_lookup(target: str, by_qualified_name: dict[str, str]) -> s
     return by_qualified_name.get(target)
 
 
+def _local_scope_ancestors(qualified_name: str) -> list[str]:
+    """MICRO-NOD 50b (F3 MAJOR): every lexical scope that encloses
+    ``qualified_name``'s own declaration, INNERMOST first - the type
+    itself, then each dot-stripped ancestor prefix, up to (and
+    including) the bare top-level/package segment. JLS 6.3's own
+    enclosing-scope chain for a nested type: a member declared directly
+    inside ANY of these is visible to code declared at ``qualified_
+    name`` itself, the inner ones shadowing the outer ones of the same
+    name (JLS 6.4.1)."""
+    ancestors = [qualified_name]
+    current = qualified_name
+    while "." in current:
+        current = current.rsplit(".", 1)[0]
+        ancestors.append(current)
+    return ancestors
+
+
+def _resolve_local_simple_name_candidates(
+    candidates: list[str], from_qualified_name: str,
+) -> list[str]:
+    """MICRO-NOD 50b (F3 MAJOR, cross-vendor read, wrong-data): scope-
+    aware disambiguation for a bare simple name declared by 2+ types in
+    the SAME file - ``candidates`` is never empty (the caller only
+    invokes this after confirming the simple name has at least one
+    same-file declaration).
+
+    The prior behavior built a single ``{simple_name: qualified_name}``
+    dict via a plain dict comprehension over the file's own units - the
+    LAST declaration of a repeated simple name silently overwrote every
+    earlier one, so two same-simple-name nested types under DIFFERENT
+    enclosing types resolved every ``extends``/``implements`` reference
+    to whichever one happened to be extracted last (an artifact of
+    SOURCE ORDER, not scope), and reordering an unrelated declaration
+    elsewhere in the file - shifting extraction order - silently FLIPPED
+    which target every such edge resolved to.
+
+    Fixed per JLS 6.3: the candidate declared in the CLOSEST enclosing
+    scope of ``from_qualified_name`` wins (walking outward from
+    ``from_qualified_name`` itself, per :func:`_local_scope_ancestors`)
+    - "all same-file" is never "equally visible" (JLS 6.3's own point).
+    Only when NO candidate sits in any enclosing scope at all does this
+    fall back to the file-wide candidate set: a single survivor there
+    (e.g. two mutually-visible TOP-LEVEL classes, which need no nesting
+    relationship to see each other) still resolves cleanly, but 2+
+    survivors are a genuine, unresolved tie - returned as-is, NEVER
+    narrowed to a silent pick, so the caller reports ``ambiguous`` with
+    every real candidate rather than a confident guess."""
+    if len(candidates) == 1:
+        return candidates
+    for ancestor in _local_scope_ancestors(from_qualified_name):
+        scoped = [c for c in candidates if c.rsplit(".", 1)[0] == ancestor]
+        if scoped:
+            # Two SIBLING types nested directly in the identical
+            # enclosing scope can never legally share one simple name
+            # (a Java compile error) - `scoped` is a singleton for any
+            # genuinely well-formed file; a real tie here means this
+            # file's own claims are already not trustworthy that far,
+            # surfaced as a tie rather than an arbitrary pick either way.
+            return sorted(scoped)
+    return sorted(candidates)
+
+
 def _resolve_internal_candidate(
     target: str, by_qualified_name: dict[str, str], by_simple_name: dict[str, list[str]],
-    duplicate_qualified_names: set[str], *, local_qualified_by_simple: dict[str, str],
+    duplicate_qualified_names: set[str], *, local_qualified_by_simple: dict[str, list[str]],
     import_qualified_by_simple: dict[str, str], package: str | None,
+    from_qualified_name: str,
     unit_ids_by_qualified_name: dict[str, list[str]] | None = None,
 ) -> tuple[str, str | None, str | None, str | None, list[str] | None]:
     """Returns ``(resolution_state, target_unit_id, target_unresolved,
@@ -534,7 +597,13 @@ def _resolve_internal_candidate(
         return "unresolved", None, target, None, None
 
     if target in local_qualified_by_simple:
-        exact = _exact_qualified_lookup(local_qualified_by_simple[target], by_qualified_name)
+        scoped = _resolve_local_simple_name_candidates(
+            local_qualified_by_simple[target], from_qualified_name)
+        if len(scoped) > 1:
+            candidate_unit_ids = sorted(
+                uid for q in scoped for uid in unit_ids_by_qualified_name.get(q, []))
+            return "ambiguous", None, target, None, candidate_unit_ids
+        exact = _exact_qualified_lookup(scoped[0], by_qualified_name)
         if exact is not None:
             return "resolved", exact, None, "high", None
 
@@ -574,8 +643,10 @@ def _resolve_internal_candidate(
 
 
 def _bare_head_qualified_name(
-    head: str, by_qualified_name: dict[str, str], *, local_qualified_by_simple: dict[str, str],
+    head: str, by_qualified_name: dict[str, str], *,
+    local_qualified_by_simple: dict[str, list[str]],
     import_qualified_by_simple: dict[str, str], package: str | None,
+    from_qualified_name: str,
 ) -> str | None:
     """FIX ROUND 14 (tenth cold read, CR10-3 MAJOR): resolves a BARE
     (single-segment) name to its REAL, full qualified name via the same
@@ -586,9 +657,21 @@ def _bare_head_qualified_name(
     :func:`_resolve_internal_candidate_chain` to re-attach a dotted
     chain's remaining segments onto the HEAD's own real qualified name
     (never the bare head alone) when checking whether a longer prefix
-    is a genuine NESTED type."""
+    is a genuine NESTED type.
+
+    MICRO-NOD 50b (F3 MAJOR): same-file resolution is now scope-aware
+    (:func:`_resolve_local_simple_name_candidates`) - a genuine tie
+    (2+ candidates, none in ``from_qualified_name``'s own enclosing
+    scope) returns ``None`` here, same as any other miss: the caller
+    falls through to the ordinary bare-name ladder for the head alone,
+    which reports the tie itself as a real ``ambiguous`` outcome rather
+    than this function silently narrowing it first."""
     if head in local_qualified_by_simple:
-        candidate = local_qualified_by_simple[head]
+        scoped = _resolve_local_simple_name_candidates(
+            local_qualified_by_simple[head], from_qualified_name)
+        if len(scoped) > 1:
+            return None
+        candidate = scoped[0]
         if _exact_qualified_lookup(candidate, by_qualified_name) is not None:
             return candidate
         return None
@@ -606,8 +689,9 @@ def _bare_head_qualified_name(
 
 def _resolve_internal_candidate_chain(
     target: str, by_qualified_name: dict[str, str], by_simple_name: dict[str, list[str]],
-    duplicate_qualified_names: set[str], *, local_qualified_by_simple: dict[str, str],
+    duplicate_qualified_names: set[str], *, local_qualified_by_simple: dict[str, list[str]],
     import_qualified_by_simple: dict[str, str], package: str | None,
+    from_qualified_name: str,
     unit_ids_by_qualified_name: dict[str, list[str]] | None = None,
 ) -> tuple[str, str | None, str | None, str | None, list[str] | None]:
     """FIX ROUND 14 (tenth cold read, CR10-3 MAJOR): a dotted invoke
@@ -640,12 +724,14 @@ def _resolve_internal_candidate_chain(
             target, by_qualified_name, by_simple_name, duplicate_qualified_names,
             local_qualified_by_simple=local_qualified_by_simple,
             import_qualified_by_simple=import_qualified_by_simple, package=package,
+            from_qualified_name=from_qualified_name,
             unit_ids_by_qualified_name=unit_ids_by_qualified_name,
         )
     segments = target.split(".")
     head_qualified = _bare_head_qualified_name(
         segments[0], by_qualified_name, local_qualified_by_simple=local_qualified_by_simple,
         import_qualified_by_simple=import_qualified_by_simple, package=package,
+        from_qualified_name=from_qualified_name,
     )
     for i in range(len(segments), 1, -1):
         prefix_as_written = ".".join(segments[:i])
@@ -669,6 +755,7 @@ def _resolve_internal_candidate_chain(
         segments[0], by_qualified_name, by_simple_name, duplicate_qualified_names,
         local_qualified_by_simple=local_qualified_by_simple,
         import_qualified_by_simple=import_qualified_by_simple, package=package,
+        from_qualified_name=from_qualified_name,
         unit_ids_by_qualified_name=unit_ids_by_qualified_name,
     )
     if state == "resolved":
@@ -924,7 +1011,18 @@ def build_dependencies(
 
     for path, result in java_results.items():
         source_digest = file_digests.get(path)
-        local_qualified_by_simple = {u.simple_name: u.qualified_name for u in result.units}
+        # MICRO-NOD 50b (F3 MAJOR, cross-vendor read, wrong-data): a
+        # plain dict comprehension keyed by simple_name is LAST-WINS -
+        # two same-simple-name nested types declared in this SAME file
+        # (under different enclosing types) used to silently collapse
+        # to whichever one this file's own `result.units` happened to
+        # list last, an artifact of extraction order, never of scope;
+        # every list here (never a single winner) lets
+        # _resolve_local_simple_name_candidates apply JLS 6.3's own
+        # lexical-scope priority instead.
+        local_qualified_by_simple: dict[str, list[str]] = {}
+        for u in result.units:
+            local_qualified_by_simple.setdefault(u.simple_name, []).append(u.qualified_name)
         # F1 BLOCKER (eighth cold read): the file's OWN import evidence -
         # a plain, non-static, non-wildcard import binds a bare simple
         # name to exactly one fully-qualified spelling, in THIS file only.
@@ -1064,7 +1162,7 @@ def _java_lang_known_external(target_unresolved: str | None) -> str | None:
 def _edge_claim_to_record(
     edge: java_adapter.JavaEdgeClaim, *, from_unit_id: str, source_digest: str | None,
     by_qualified_name: dict[str, str], by_simple_name: dict[str, list[str]],
-    duplicate_qualified_names: set[str], local_qualified_by_simple: dict[str, str],
+    duplicate_qualified_names: set[str], local_qualified_by_simple: dict[str, list[str]],
     import_qualified_by_simple: dict[str, str], package: str | None,
     degraded_paths: frozenset[str], unit_ids_by_qualified_name: dict[str, list[str]],
     externality_poisoned: bool = False,
@@ -1087,6 +1185,7 @@ def _edge_claim_to_record(
                 edge.target, by_qualified_name, by_simple_name, duplicate_qualified_names,
                 local_qualified_by_simple=local_qualified_by_simple,
                 import_qualified_by_simple=import_qualified_by_simple, package=package,
+                from_qualified_name=edge.from_qualified_name,
                 unit_ids_by_qualified_name=unit_ids_by_qualified_name,
             )
         )
