@@ -160,7 +160,7 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
             anchor = "--to-request <request_id from the header above>"
         # #201: the wrapper-declared draft channel. Works in EVERY sandbox —
         # a child whose harness statically rejects or approval-gates shell
-        # commands (the JAWS claude seat: 5/5 turns undeliverable) can still
+        # commands (the dogfood claude seat: 5/5 turns undeliverable) can still
         # answer with nothing but its structured Write tool; the wrapper
         # validates and publishes the draft with exact thread correlation.
         reply_draft = record.get("reply_draft")
