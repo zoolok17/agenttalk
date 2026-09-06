@@ -7268,6 +7268,106 @@ def test_split_xml_comments_and_cdata_an_unterminated_comment_blanks_to_eof():
     assert len(sanitized) == len(text)
 
 
+def test_a_pom_processing_instruction_never_publishes_a_phantom_dependency():
+    """MICRO-NOD 50b (F1 BLOCKER, cross-vendor read, wrong-data,
+    reproduced verbatim): a processing instruction was never recognized
+    by the shared comment/CDATA chokepoint at all - markup-shaped text
+    inside a <?audit ...?> PI (well-formed per the XML spec: a PI's own
+    content is opaque application data, never real markup) published as
+    a REAL <dependency> block, resolving a phantom external coordinate
+    (phantom:invented) on a complete/0-problems run. The PI is now
+    blanked exactly like a comment; only the real dependency survives."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <dependencies>
+    <?audit <dependency><groupId>phantom</groupId><artifactId>invented</artifactId></dependency>?>
+    <dependency><groupId>org.real</groupId><artifactId>real-lib</artifactId></dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.real:real-lib"}
+    assert "phantom:invented" not in {e.target for e in edges}
+
+
+def test_a_pom_processing_instruction_leaves_a_real_dependency_around_it_untouched():
+    """MICRO-NOD 50b (F1 BLOCKER, real-element control): a PI sitting
+    between two real <dependency> blocks must not blank, truncate, or
+    otherwise disturb either of them - only the PI's own span is ever
+    touched."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <dependencies>
+    <dependency><groupId>org.before</groupId><artifactId>before-lib</artifactId></dependency>
+    <?audit generated 2026-09-01T00:00:00Z by legacy-tool?>
+    <dependency><groupId>org.after</groupId><artifactId>after-lib</artifactId></dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.before:before-lib", "org.after:after-lib"}
+
+
+def test_a_web_xml_processing_instruction_never_publishes_a_phantom_route():
+    """MICRO-NOD 50b (F1 BLOCKER, cross-vendor read, wrong-data,
+    reproduced verbatim): the web.xml twin of the pom finding - a
+    <?audit ...?> PI containing a well-formed <servlet>/<servlet-mapping>
+    pair published a phantom /phantom route, entry point, and servlet
+    unit on a complete/0-problems run. The PI is now blanked; no entry
+    point is published from its content at all."""
+    web_xml = """<web-app>
+  <?audit <servlet><servlet-name>ghost</servlet-name>
+    <servlet-class>com.acme.web.PhantomServlet</servlet-class></servlet>
+    <servlet-mapping><servlet-name>ghost</servlet-name>
+    <url-pattern>/phantom</url-pattern></servlet-mapping>?>
+</web-app>
+"""
+    entry_points, _problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert entry_points == []
+    assert "/phantom" not in {e.name for e in entry_points}
+
+
+def test_a_web_xml_processing_instruction_leaves_a_real_route_around_it_untouched():
+    """MICRO-NOD 50b (F1 BLOCKER, real-element control): a PI sitting
+    beside a real <servlet-mapping> must not mask the live route."""
+    web_xml = """<web-app>
+  <?audit generated 2026-09-01T00:00:00Z by legacy-tool?>
+  <servlet-mapping>
+    <servlet-name>beta</servlet-name>
+    <url-pattern>/beta/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points, _problems, _edges, _descriptor_name_conflicts = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert {e.name for e in entry_points} == {"/beta/*"}
+
+
+def test_a_processing_instruction_containing_comment_shaped_text_blanks_as_one_span():
+    """MICRO-NOD 50b (F1 BLOCKER, interaction shape): a PI's own content
+    may legally contain comment-shaped text ("<!--"/"-->") - the PI is
+    still recognized as ONE span through to its own real "?>" terminator
+    (whichever marker occurs FIRST wins, per _split_xml_comments_and_
+    cdata's own document-order discipline), never split into a shorter
+    PI plus a spurious separate "comment" that would then hunt for the
+    next "-->" anywhere else in the file and swallow real markup past
+    the PI's own end."""
+    pom = """<project>
+  <groupId>com.acme</groupId>
+  <artifactId>root</artifactId>
+  <dependencies>
+    <?audit note: <!-- an internal aside --> phantom:
+    <dependency><groupId>phantom</groupId>
+    <artifactId>invented</artifactId></dependency>?>
+    <dependency><groupId>org.real</groupId><artifactId>real-lib</artifactId></dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.real:real-lib"}
+
+
 # ------------------------------- fix round 38 F2 (a comment interior to a leaf value corrupts its own decode)
 
 def test_splice_comment_spans_removes_a_comment_and_leaves_comment_free_text_untouched():

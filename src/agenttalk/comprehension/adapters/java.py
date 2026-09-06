@@ -5024,19 +5024,37 @@ def parse_java_source(
 #: fully stripped before the CDATA pass ever ran), but a single ordered
 #: scan closes both directions uniformly rather than leaving one
 #: implicitly correct by accident of pass order.
-_XML_COMMENT_OR_CDATA_START_RE = re.compile(r"<!--|<!\[CDATA\[")
+#:
+#: MICRO-NOD 50b (F1 BLOCKER, cross-vendor read, wrong-data): a
+#: processing instruction (``<?audit ... ?>``) was NEVER recognized here
+#: at all - only ``sniff_xml_root_element`` ever blanked PIs, and only
+#: for its own narrow root-detection purpose, never at this shared
+#: chokepoint every OTHER consumer (pom extraction, descriptor
+#: extraction) actually scans through. Per the XML spec a PI's own raw
+#: content is never markup - it is opaque application data - but this
+#: module's structural regexes do not know that, so markup-shaped text
+#: inside one (``<?audit <dependency>...</dependency>?>``,
+#: ``<?audit <servlet>...</servlet>?>``) published as REAL structural
+#: facts on well-formed, complete/0 input: a phantom dependency, a
+#: phantom servlet+mapping+route+entry-point+feature. A PI is now a
+#: third recognized marker, blanked the identical way a comment is (in
+#: BOTH ``sanitized`` and ``structural`` - a PI can never legally carry a
+#: real leaf's decoded text content the way CDATA can, so there is no
+#: reason to preserve it raw in ``sanitized``).
+_XML_COMMENT_OR_CDATA_START_RE = re.compile(r"<!--|<!\[CDATA\[|<\?")
 
 
 def _split_xml_comments_and_cdata(text: str) -> tuple[str, str]:
-    """Single LEFT-TO-RIGHT pass recognizing XML comments and CDATA
-    sections in DOCUMENT ORDER - replaces the old two-independent-passes
-    ``_strip_xml_comments``/``_blank_cdata_sections`` (FIX ROUND 26,
-    twenty-second cold read, F1 BLOCKER - see
+    """Single LEFT-TO-RIGHT pass recognizing XML comments, CDATA
+    sections, and processing instructions in DOCUMENT ORDER - replaces
+    the old two-independent-passes ``_strip_xml_comments``/
+    ``_blank_cdata_sections`` (FIX ROUND 26, twenty-second cold read, F1
+    BLOCKER; PI recognition added MICRO-NOD 50b, F1 BLOCKER - see
     ``_XML_COMMENT_OR_CDATA_START_RE``'s own comment for the exact
-    exploit this closes).
+    exploits this closes).
 
-    Returns ``(sanitized, structural)``: ``sanitized`` blanks comment
-    content only, offset-preserving, leaving CDATA markers and content
+    Returns ``(sanitized, structural)``: ``sanitized`` blanks comment and
+    PI content, offset-preserving, leaving CDATA markers and content
     intact (the source every real leaf VALUE is still recovered from, by
     offset, for ``_decode_xml_text``); ``structural`` additionally blanks
     every CDATA section too (the source every STRUCTURAL scan - the
@@ -5044,14 +5062,14 @@ def _split_xml_comments_and_cdata(text: str) -> tuple[str, str]:
     two-string discipline this module already established, now built
     from one ordered scan instead of two independently-blind ones.
 
-    Whichever marker - ``<!--`` or ``<![CDATA[`` - occurs FIRST at the
-    current scan position wins and is treated as that construct through
-    to its own matching terminator (``-->``/``]]>``); the scan then
-    resumes immediately after that terminator, never re-entering the
-    span just consumed looking for the OTHER marker type. An unterminated
-    comment or CDATA section (no closing marker before EOF) blanks
-    through to EOF, the same fail-safe direction the old two passes
-    already took for an unterminated comment."""
+    Whichever marker - ``<!--``, ``<![CDATA[``, or ``<?`` - occurs FIRST
+    at the current scan position wins and is treated as that construct
+    through to its own matching terminator (``-->``/``]]>``/``?>``); the
+    scan then resumes immediately after that terminator, never
+    re-entering the span just consumed looking for another marker type.
+    An unterminated comment, CDATA section, or PI (no closing marker
+    before EOF) blanks through to EOF, the same fail-safe direction the
+    old passes already took for an unterminated comment."""
     sanitized_parts: list[str] = []
     structural_parts: list[str] = []
     i = 0
@@ -5070,6 +5088,16 @@ def _split_xml_comments_and_cdata(text: str) -> tuple[str, str]:
             end = text.find("-->", marker.end())
             end = n if end == -1 else end + 3
             segment = text[marker.start():end]
+            blanked = "".join(c if c == "\n" else " " for c in segment)
+            sanitized_parts.append(blanked)
+            structural_parts.append(blanked)
+        elif marker.group(0) == "<?":
+            end = text.find("?>", marker.end())
+            end = n if end == -1 else end + 2
+            segment = text[marker.start():end]
+            # A PI can never legally carry a real leaf's own decoded text
+            # (unlike CDATA) - blanked in BOTH strings, the same
+            # offset-preserving idiom the comment branch above uses.
             blanked = "".join(c if c == "\n" else " " for c in segment)
             sanitized_parts.append(blanked)
             structural_parts.append(blanked)
@@ -5335,15 +5363,23 @@ def _splice_comment_spans(raw: str) -> str:
     a container), the same way this producer already concatenates around
     every OTHER construct it strips.
 
-    Splices (never blanks) every comment span out of ``raw`` - the true,
-    unblanked original text at this exact leaf's own offset, never
+    Splices (never blanks) every comment or PI span out of ``raw`` - the
+    true, unblanked original text at this exact leaf's own offset, never
     ``sanitized`` - reusing ``_split_xml_comments_and_cdata``'s own
-    document-order comment/CDATA recognition so a comment-shaped
-    ``<!--`` living inside this SAME leaf's own CDATA content is
-    correctly left alone (CDATA content is literal; a comment marker
-    inside it is not a comment), never misread as a second comment. A
-    leaf with no comment at all (the overwhelming common case) returns
-    ``raw`` unchanged - no marker is found, nothing is spliced."""
+    document-order comment/CDATA/PI recognition so a comment- or PI-shaped
+    marker living INSIDE this SAME leaf's own CDATA content is correctly
+    left alone (CDATA content is literal; a marker inside it is not the
+    construct it looks like), never misread as a second comment/PI. A
+    leaf with no comment or PI at all (the overwhelming common case)
+    returns ``raw`` unchanged - no marker is found, nothing is spliced.
+
+    MICRO-NOD 50b (F1 BLOCKER): a PI splices exactly like a comment - a
+    processing instruction is, the same as a comment, never part of an
+    element's own text content (XML text nodes concatenate around it,
+    ``mod<?p?>b`` IS ``modb``), so ``sanitized`` now blanks it too (see
+    ``_split_xml_comments_and_cdata``), which means a PI intersecting a
+    leaf's raw span reaches this function exactly the way a comment
+    already did."""
     parts: list[str] = []
     i = 0
     n = len(raw)
@@ -5357,11 +5393,16 @@ def _splice_comment_spans(raw: str) -> str:
             end = raw.find("-->", marker.end())
             end = n if end == -1 else end + 3
             # SPLICE: the comment's own span (markers and content alike)
-            # is dropped entirely here, never blanked - this is the one
-            # spot in this module where a comment's own bytes are
-            # actually removed rather than replaced with equal-length
-            # whitespace, since this string is never used for offset-
-            # dependent structural scanning again, only decoded.
+            # is dropped entirely here, never blanked - this is one of
+            # the two spots in this module where a comment's/PI's own
+            # bytes are actually removed rather than replaced with
+            # equal-length whitespace, since this string is never used
+            # for offset-dependent structural scanning again, only
+            # decoded.
+        elif marker.group(0) == "<?":
+            end = raw.find("?>", marker.end())
+            end = n if end == -1 else end + 2
+            # SPLICE, same reasoning as the comment branch above.
         else:
             end = raw.find("]]>", marker.end())
             end = n if end == -1 else end + 3
