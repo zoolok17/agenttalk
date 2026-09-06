@@ -19,9 +19,10 @@ than implying that this design produces them. The reconciled companion baseline
 is commit `8b064acd0419813b1f28df34159e468a18f9fd4f` on
 `docs/55-priorart-requirements`.
 
-The original JAWS Plateau 1 retrospective is not present in this repository or
-its reachable history. This design therefore does not claim JAWS application,
-language, component, or business-flow coverage. It uses checked-in task and
+The original dogfood migration's Plateau 1 retrospective is not present in
+this repository or its reachable history. This design therefore does not
+claim coverage of the dogfood target's application, language, component, or
+business-flow. It uses checked-in task and
 agenttalk design evidence plus the companion requirements document. It also
 makes no Graphify compatibility or dependency decision; that belongs to the
 companion document and a separately reviewed spike.
@@ -570,7 +571,7 @@ measurement against a representative legacy corpus. That evidence pins the
 exact corpus revision/content fingerprint, platform and path policy, file-count
 and size distribution, cold and warm scan/freshness timings, peak memory, and
 cap-hit outcome. The implementation plan cannot present these unmeasured values
-as a proven JAWS-scale budget.
+as a proven dogfood-scale budget.
 
 Until that measurement is accepted, treat the provisional values as fail-closed
 guards. If a scan reaches an entry, per-file, or hashed-byte limit, narrow the

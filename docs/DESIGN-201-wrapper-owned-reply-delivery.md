@@ -2,12 +2,13 @@
 
 Status: rev 2 — restructured after adversarial design review (approve-with-changes,
 3 blockers). Author: claude-agenttalk-lead · 2026-08-21.
-Field basis: JAWS dry-run retro (jaws-legacy `docs/dryrun/RETRO.md`, finding 1).
+Field basis: the dogfood migration's dry-run retrospective (the dogfood target
+repo's `docs/dryrun/RETRO.md`, finding 1).
 
 ## Problem
 
 A wrapped child delivers replies by running an `agenttalk reply` subprocess in
-its own shell. That channel fails as a class: the claude-wrapped JAWS seat
+its own shell. That channel fails as a class: the claude-wrapped dogfood seat
 could not deliver a bus reply in 5 of 5 work turns (static command validation
 + unanswerable interactive approvals), the codex seat's first reply died on
 missing `AGENTTALK_SELF`, and the claude adapter cannot even report that a
@@ -17,8 +18,8 @@ dead-letter into files that are indistinguishable on the bus from a dead agent.
 ## Review verdict that reshaped rev 1 → rev 2
 
 The rev 1 design put wrapper-owned delivery inside the commit-gate
-(owed-action) path. The adversarial review verified against the JAWS ledger
-that **the commit gate was inactive for the entire dry run** (no
+(owed-action) path. The adversarial review verified against the dogfood
+migration's ledger that **the commit gate was inactive for the entire dry run** (no
 `POLICY_ENV` policy file → `PolicySnapshot.inactive` → zero obligations
 admitted): every one of the motivating failures went through the FREEFORM
 branch rev 1 had scoped out. Rev 1 also had three blocker defects in its
@@ -138,8 +139,8 @@ explicitly.
 - A seat that can neither run bus commands NOR write files cannot reply;
   PR-3's preflight exists to catch that seat before work is dispatched.
   (The draft dir lives under the store's `.agenttalk/state/`, i.e. inside
-  the project root the wrapped child is normally granted — the JAWS claude
-  seat's `--add-dir <root>` covers it — but PR-3's write probe must verify
+  the project root the wrapped child is normally granted — the dogfood
+  claude seat's `--add-dir <root>` covers it — but PR-3's write probe must verify
   this per seat rather than assume it.)
 - Typed multi-field responses (review-result, proposal-response, consult
   replies needing `consult=true`+`round`, NA responses needing
@@ -191,5 +192,5 @@ explicitly.
 PR-1 changes child-visible instructions for every freeform turn (fleet-wide
 blast radius — review R4): the CLI channel remains fully supported, so a
 mixed fleet (old prompts cached in resumed sessions) is safe. Ship as a
-minor release; JAWS-pattern smoke (one wrapped claude seat, one codex seat)
+minor release; dogfood-pattern smoke (one wrapped claude seat, one codex seat)
 before tagging.
