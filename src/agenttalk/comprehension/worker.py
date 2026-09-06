@@ -1211,6 +1211,45 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                 ))
             descriptor_name_conflicts.extend(annotation_conflicts)
 
+    # MICRO-NOD 50b (F5 MAJOR, cross-vendor read, wrong-data): a
+    # main(String[] args) recognized via the BARE "String" spelling
+    # (java_adapter.JavaEntryPointClaim.uses_unqualified_string_param)
+    # is not actually a JVM launcher entry point at all when a real
+    # String-named type is declared ANYWHERE in-scan in the SAME
+    # package - JLS 6.4.1 shadowing means every bare "String" reference
+    # in that package's own scope names the LOCAL type, never
+    # java.lang.String, regardless of which FILE declares either the
+    # shadowing type or the main method. java_adapter.parse_java_source
+    # parses one file at a time and cannot see this on its own; this is
+    # the one place - same as MICRO-NOD 50c's own descriptor-conflict
+    # fold-in above - that sees every file in the run together. An
+    # explicitly java.lang.String-qualified main (uses_unqualified_
+    # string_param False) is never reconsidered here - a fully-qualified
+    # name is never shadowable.
+    packages_with_string_shadow: set[str] = set()
+    for file_payload in java_results.values():
+        for unit in file_payload.get("units", ()):
+            qualified_name = unit.get("qualified_name", "")
+            if unit.get("simple_name") == "String" and "." in qualified_name:
+                packages_with_string_shadow.add(qualified_name.rsplit(".", 1)[0])
+    if packages_with_string_shadow:
+        for file_payload in java_results.values():
+            entry_points = file_payload.get("entry_points", [])
+            if not entry_points:
+                continue
+            kept_entry_points = []
+            for entry_point in entry_points:
+                qualified_name = entry_point.get("qualified_name", "")
+                package = qualified_name.rsplit(".", 1)[0] if "." in qualified_name else None
+                if (
+                    entry_point.get("kind") == "cli_main"
+                    and entry_point.get("uses_unqualified_string_param")
+                    and package in packages_with_string_shadow
+                ):
+                    continue
+                kept_entry_points.append(entry_point)
+            file_payload["entry_points"] = kept_entry_points
+
     return WorkerResult(
         schema_version=WORKER_SCHEMA_VERSION, file_claims=claims, problems=problems,
         java_results=java_results, exclusions=exclusions,

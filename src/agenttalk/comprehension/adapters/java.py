@@ -652,8 +652,18 @@ _MAIN_PARAM_PREFIX = r"(?:(?:final\b|" + _MAIN_ANNOTATION + r")\s*)*"
 #: An annotation run allowed directly on the array level itself (JSR-308
 #: - ``String @NotNull [] args``), between the type and the brackets.
 _MAIN_ARRAY_ANNOTATIONS = r"(?:" + _MAIN_ANNOTATION + r"\s*)*"
+#: MICRO-NOD 50b (F5 MAJOR): the ``java.lang.`` prefix is now CAPTURED
+#: (group 1) rather than merely matched - the caller (the main-header
+#: loop below) needs to know whether the recognized ``String`` spelling
+#: was explicitly qualified (never subject to shadowing - a fully-
+#: qualified name always names the real ``java.lang.String`` regardless
+#: of any local/same-package declaration of the same simple name) or
+#: bare (a genuinely ambiguous spelling under JLS 6.4.1 shadowing,
+#: resolved by :func:`_annotation_qualifier_is_recognized`'s own sibling
+#: reasoning - see ``uses_unqualified_string_param`` on
+#: ``JavaEntryPointClaim``).
 _MAIN_PARAM_RE = (
-    _MAIN_PARAM_PREFIX + r"(?:java\.lang\.)?String"
+    _MAIN_PARAM_PREFIX + r"(java\.lang\.)?String"
     r"(?:\s*" + _MAIN_ARRAY_ANNOTATIONS + r"\[\s*\]\s*[A-Za-z_$][\w$]*"  # String[] args / String @X [] args
     r"|\s+[A-Za-z_$][\w$]*\s*" + _MAIN_ARRAY_ANNOTATIONS + r"\[\s*\]"    # String args[]  (C-style)
     r"|\s*\.\.\.\s*[A-Za-z_$][\w$]*"                                     # String... args
@@ -1470,6 +1480,22 @@ class JavaEntryPointClaim:
     name: str
     line: int | None
     evidence_class: str
+    #: MICRO-NOD 50b (F5 MAJOR, cross-vendor read, wrong-data): only
+    #: ever ``True`` for ``kind == "cli_main"`` - ``main(String[] args)``
+    #: recognized via the BARE ``String`` spelling (never ``java.lang.
+    #: String`` explicitly), which JLS 6.4.1 shadowing can make refer to
+    #: a DIFFERENT, package-local ``String`` type instead of ``java.lang.
+    #: String`` - undecidable from this single file alone whenever the
+    #: shadowing type is declared in ANOTHER file of the same package.
+    #: This single-file adapter cannot rule that out (it has no cross-
+    #: file visibility); ``worker.process_paths`` - which DOES see every
+    #: file in the run together - retracts the entry point after the
+    #: fact whenever a real ``String``-named type is found anywhere in
+    #: the SAME package. An explicitly ``java.lang.String``-qualified
+    #: main is never shadowable at all (a fully-qualified name always
+    #: names the real class), so it always publishes with this ``False``
+    #: and is never reconsidered.
+    uses_unqualified_string_param: bool = False
 
 
 @dataclass(frozen=True)
@@ -5062,12 +5088,24 @@ def parse_java_source(
             ))
             continue
         params = _split_top_level_commas(sanitized[header_match.end():close_pos])
-        if len(params) == 1 and _MAIN_PARAM_FULL_RE.match(params[0]) is not None:
+        param_match = _MAIN_PARAM_FULL_RE.match(params[0]) if len(params) == 1 else None
+        if param_match is not None:
             modifiers = header_match.group(1).split()
             if "public" in modifiers and "static" in modifiers:
+                # MICRO-NOD 50b (F5 MAJOR): group 1 is the (java.lang.)?
+                # prefix - None when the recognized String spelling was
+                # BARE, meaning JLS 6.4.1 shadowing could make it refer
+                # to a different, package-local String type instead of
+                # java.lang.String. Not decidable from this one file
+                # alone (see JavaEntryPointClaim.uses_unqualified_
+                # string_param's own docstring) - published here either
+                # way; worker.process_paths retracts it after the fact
+                # if a real, in-scan String type shares this class's own
+                # package, in ANY file.
                 entry_points.append(JavaEntryPointClaim(
                     qualified_name=enclosing, kind="cli_main", name="main",
                     line=line, evidence_class="extracted",
+                    uses_unqualified_string_param=param_match.group(1) is None,
                 ))
             # else: the exact JVM signature, recognized, confidently
             # missing a required modifier - a JLS-certain negative,

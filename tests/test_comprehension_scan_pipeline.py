@@ -2436,6 +2436,88 @@ def test_run_scan_a_fake_custom_annotation_package_never_fabricates_a_spring_rou
     assert [e for e in dependencies_doc["edges"] if e["relation"] == "route"] == []
 
 
+def _cli_main_owning_unit_ids(outcome, java_repo: Path) -> set[str]:
+    import json
+
+    features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
+    return {e["owning_unit_id"] for e in features_doc["entry_points"] if e["kind"] == "cli_main"}
+
+
+def test_run_scan_a_same_file_string_shadow_suppresses_the_bare_main_entry_point(
+    java_repo: Path,
+) -> None:
+    """MICRO-NOD 50b (F5 MAJOR, cross-vendor read, wrong-data, reproduced
+    verbatim): main(String[] args) used to publish cli_main even when a
+    package-local class String {} shadows java.lang.String - per JLS
+    6.4.1, the parameter's real type is p.String[], never java.lang.
+    String[], so this is NOT a launcher entry point at all. End to end:
+    no cli_main is published for this class once its own package
+    declares a String type (here, in the SAME file)."""
+    (java_repo / "src" / "main" / "java" / "p" / "ShadowLauncher.java").write_text(
+        "package p;\n"
+        "class String {\n}\n"
+        "public class ShadowLauncher {\n"
+        "  public static void main(String[] args) {\n  }\n"
+        "}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    import json
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    shadow_launcher = next(
+        u for u in modules_doc["units"] if u["qualified_name"] == "p.ShadowLauncher")
+    assert shadow_launcher["unit_id"] not in _cli_main_owning_unit_ids(outcome, java_repo)
+
+
+def test_run_scan_an_explicit_java_lang_string_main_is_kept_despite_a_package_string_shadow(
+    java_repo: Path,
+) -> None:
+    """MICRO-NOD 50b (F5 MAJOR, explicit-java.lang control): a fully-
+    qualified java.lang.String[] parameter is never shadowable (a
+    fully-qualified name always names the real class) - kept exactly
+    as before, even in the identical package as a real String type."""
+    (java_repo / "src" / "main" / "java" / "p" / "RealLauncher.java").write_text(
+        "package p;\n"
+        "class String {\n}\n"
+        "public class RealLauncher {\n"
+        "  public static void main(java.lang.String[] args) {\n  }\n"
+        "}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    import json
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    real_launcher = next(
+        u for u in modules_doc["units"] if u["qualified_name"] == "p.RealLauncher")
+    assert real_launcher["unit_id"] in _cli_main_owning_unit_ids(outcome, java_repo)
+
+
+def test_run_scan_a_same_package_different_file_string_shadow_suppresses_the_bare_main(
+    java_repo: Path,
+) -> None:
+    """MICRO-NOD 50b (F5 MAJOR, cross-vendor read, wrong-data): JLS
+    6.4.1 package-level shadowing does not care which FILE declares the
+    shadowing type - a String type declared in a DIFFERENT file of the
+    SAME package shadows java.lang.String for every other file's own
+    bare "String" references too. The single-file adapter cannot see
+    this on its own; the cross-file worker-level pass must catch it."""
+    (java_repo / "src" / "main" / "java" / "p" / "OtherFileLauncher.java").write_text(
+        "package p;\n"
+        "public class OtherFileLauncher {\n"
+        "  public static void main(String[] args) {\n  }\n"
+        "}\n", encoding="utf-8")
+    (java_repo / "src" / "main" / "java" / "p" / "StringShadowType.java").write_text(
+        "package p;\nclass String {\n}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    import json
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    other_file_launcher = next(
+        u for u in modules_doc["units"] if u["qualified_name"] == "p.OtherFileLauncher")
+    assert other_file_launcher["unit_id"] not in _cli_main_owning_unit_ids(outcome, java_repo)
+
+
 def test_run_scan_a_real_junit_test_calling_the_target_reports_test_evidence_located_satisfied(
     java_repo: Path,
 ) -> None:
