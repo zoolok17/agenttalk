@@ -132,7 +132,31 @@ verifiable from any single record and should not be cited as a precise figure.
 
 ---
 
-## 5. Residuals and declared limitations
+## 5. Decision record
+
+**Primary record: this document.** Unlike every other citation in this dossier, the
+decision below has no upstream GitHub artifact to chase — it was made in the
+operator's direct steering channel, not posted as a PR/issue comment. This entry
+*is* the record, not a pointer to one. A reviewer who needs more than what is written
+here has nowhere else to look; that is stated plainly rather than implied by a
+missing citation.
+
+| Field | Value |
+|-------|-------|
+| Date | 2026-09-06 |
+| Decision | End the unbounded adversarial-read loop. Fix the external cross-vendor read's findings, plus one confirmation review. Merge with declared limits (the limitations register, §6 below) and the incremental extraction replacement committed as the next slice (issue [#141](https://github.com/zoolok17/agenttalk/issues/141)). |
+| Alternatives considered | Continue the unbounded read loop indefinitely; replace the extraction layer before merging (block the merge on issue #141's work landing first). |
+| Decided by | Project steering (recorded here by the lead; no individual names). |
+
+This decision is the reason the round history in §4 has an end at all — the process
+described in §7 and §8 of `docs/DEVELOPMENT-METHODOLOGY.md` (confirmation vs. gate;
+direction-of-error triage) does not itself specify a stopping point for an unbounded
+review loop. That stopping point is a judgment call, made once, here, by the party
+that owns the risk — not a mechanical output of the review process itself.
+
+---
+
+## 6. Residuals and declared limitations
 
 The full, current register lives at
 [`docs/COMPREHENSION-LIMITATIONS.md`](../COMPREHENSION-LIMITATIONS.md) — this dossier
@@ -171,7 +195,7 @@ here as a gap, not silently omitted or asserted anyway.
 
 ---
 
-## 6. Reproduction instructions
+## 7. Reproduction instructions
 
 ```text
 git checkout 9b8b385d5e1d81e8c8905da9bbeb6171a9a34861   # squash-merge commit
