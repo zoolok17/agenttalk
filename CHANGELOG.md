@@ -9,6 +9,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.87.0] - 2026-09-07
+
+Theme: **the comprehension producer ships — a static inventory plane for
+legacy repositories, plus a confidentiality hardening pass across the
+project's own tracked content.**
+
+Field basis: PR #132 (task #55, slice 1), ~50 rounds of adversarial
+self-review plus an independent cross-vendor read that surfaced 223
+review comments, all triaged and dispositioned; PR #140, a project-wide
+sweep for inadvertent client-identifying strings in tracked content.
+
+### Added
+
+- **The comprehension producer (#55, slice 1).** A new, privacy-scoped
+  static-analysis plane: point it at a local checkout and it discovers
+  files (respecting excludes, secret-pattern and generated/vendor
+  detection, symlink/reparse-point confinement, and per-file/per-scan
+  byte and entry ceilings), extracts a coarse, evidence-only inventory of
+  a Java/Maven/Servlet codebase (declared types, package/import/inherit/
+  invoke/build/test/route relations, HTTP and CLI entry points), and
+  publishes it as a set of deterministic, digest-verified JSON artifacts
+  (modules, dependencies, features, readiness, problems) under a run
+  directory, gated behind an attended privacy preflight (a real VCS
+  ignore-check, never a guess) and an exclusive scan lock. Every claim
+  this producer cannot confidently make is a declared, machine-readable
+  gap (a named problem or caveat) rather than a silent omission or a
+  guessed fact - `docs/COMPREHENSION-LIMITATIONS.md` is the full,
+  three-source register of what is and is not covered this slice, and
+  names which limits the accepted incremental extraction-layer
+  replacement (tracked in issue #141) is expected to retire.
+- New CLI surface (`agenttalk comprehension scan|status|report|validate|
+  prune`) and supporting lock/staging/publish machinery for the
+  producer's own run lifecycle (crash-safe staging, abandoned-run
+  reclamation, cross-run artifact envelope verification).
+
+### Fixed
+
+- **Eight wrong-data findings from the independent cross-vendor review**
+  (MICRO-NOD 50b, F1-F8), each verified against a real reproduction
+  before being fixed and mutation-verified after: XML processing
+  instructions were not blanked at the shared preprocessing chokepoint
+  (a phantom dependency/route could be smuggled through a well-formed
+  `<?...?>`); `$` (a legal Java identifier character) was dropped from
+  package/import/type-declaration matching; a same-file, same-simple-name
+  inherit reference resolved by declaration order instead of lexical
+  scope; an explicitly-qualified framework annotation matched on its last
+  dotted segment alone, regardless of the actual package; `main(String[])`
+  published a launcher entry point even when shadowed by a package-local
+  `String` type; a nested type's same-package-sibling resolution derived
+  its own enclosing type's name as if it were a package (a confirmed
+  wrong resolution across two files sharing a duplicated class name);
+  dependency edges from test-source files were published as production
+  (`runtime`-phase) dependencies; two Maven `<dependency>` blocks
+  declaring the identical coordinate with disagreeing `<optional>`/
+  `<scope>` metadata silently coalesced or over-published instead of
+  recording the conflict.
+- **Confidentiality hardening (#140).** A project-wide sweep genericized
+  inadvertent client-identifying references across tracked docs, source
+  comments, and tests; a tripwire (#216) now catches a reintroduced
+  reference before it lands.
+
 ## [0.86.0] - 2026-08-26
 
 Theme: **the console tells the truth about risk — and the comprehension plane design is frozen.**
