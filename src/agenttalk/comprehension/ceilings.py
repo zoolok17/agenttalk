@@ -11,7 +11,7 @@ DESIGN-55-comprehension-plane.md, "Validation tiers and size ceilings":
     normal read path.
 
 These constants are PROVISIONAL per the design's own "Scan behavior"
-section pending a measured Amperian corpus run (PR-B's exit gate) — this
+section pending a measured client-corpus run (PR-B's exit gate) — this
 module enforces whatever the constants say, not a claim that these exact
 numbers are final.
 
@@ -94,6 +94,16 @@ def measure_staging_artifacts(
             raise ArtifactLimitExceeded(
                 f"{path.name} is a symlink - a staged artifact must be a real file, "
                 "never a link that could resolve outside the private staging tree")
+        # M (cold-read PR-B fix round 47 completeness): a directory
+        # entry directly inside staging_dir is silently skipped, never
+        # measured or refused - deliberate, not an oversight: this
+        # function's own docstring already states v1's staging layout is
+        # flat (no producer this slice ever creates a subdirectory here),
+        # so nothing legitimate is ever hidden by this skip; it exists
+        # only so a hypothetical stray subdirectory can never crash
+        # is_file()/stat() below rather than because subdirectories are
+        # an expected, load-bearing shape this function chooses to
+        # ignore.
         if not path.is_file():
             continue
         if path.name not in record_counts:
@@ -118,6 +128,29 @@ def measure_staging_artifacts(
     return measurements
 
 
+#: Note 6 (second cold read, fix round 4): refusal messages previously
+#: said "narrow --scope and rescan" - no such flag exists this slice
+#: (config.json parsing / --scope / --exclude narrowing is a named,
+#: deferred gap - see scan_pipeline.py's own module docstring). Naming a
+#: nonexistent remedy is worse than naming none; this states what IS
+#: actually true and actionable this slice.
+#:
+#: N1 (fifth cold read, fix round 8): "--root" is the GLOBAL flag (added
+#: by launch_admission.add_agenttalk_launch_arguments to the top-level
+#: parser, before subparsers) - it must precede the "comprehension"
+#: subcommand itself (empirically verified: `agenttalk --root <path>
+#: comprehension scan` works; `agenttalk comprehension scan --root
+#: <path>` fails with "unrecognized arguments", since comprehension's
+#: own subparser defines no --root of its own). Bare "--root" invited a
+#: reader to place it after the subcommand instead - named explicitly
+#: here so this refusal's own remedy actually works if followed.
+_NARROW_SCOPE_HINT = (
+    "this slice has no --scope/--exclude narrowing yet - point the global --root at a "
+    "smaller project (e.g. `agenttalk --root <path> comprehension scan` - --root must "
+    "precede the comprehension subcommand), or split the scan"
+)
+
+
 def enforce_artifact_ceilings(measurements: list[ArtifactMeasurement]) -> None:
     """Raises :class:`ArtifactLimitExceeded` on the FIRST ceiling any
     measurement or the run total crosses — per-artifact ceilings first
@@ -127,21 +160,18 @@ def enforce_artifact_ceilings(measurements: list[ArtifactMeasurement]) -> None:
         if m.byte_count > PER_ARTIFACT_BYTES_MAX:
             raise ArtifactLimitExceeded(
                 f"{m.name} is {m.byte_count} bytes, exceeding the "
-                f"{PER_ARTIFACT_BYTES_MAX}-byte per-artifact ceiling — narrow "
-                "--scope and rescan")
+                f"{PER_ARTIFACT_BYTES_MAX}-byte per-artifact ceiling — {_NARROW_SCOPE_HINT}")
         if m.record_count > PER_ARTIFACT_RECORDS_MAX:
             raise ArtifactLimitExceeded(
                 f"{m.name} has {m.record_count} records, exceeding the "
-                f"{PER_ARTIFACT_RECORDS_MAX}-record per-artifact ceiling — narrow "
-                "--scope and rescan")
+                f"{PER_ARTIFACT_RECORDS_MAX}-record per-artifact ceiling — {_NARROW_SCOPE_HINT}")
     total_bytes = sum(m.byte_count for m in measurements)
     if total_bytes > RUN_BYTES_MAX:
         raise ArtifactLimitExceeded(
             f"this run's durable artifacts total {total_bytes} bytes, exceeding "
-            f"the {RUN_BYTES_MAX}-byte whole-run ceiling — narrow --scope and rescan")
+            f"the {RUN_BYTES_MAX}-byte whole-run ceiling — {_NARROW_SCOPE_HINT}")
     total_records = sum(m.record_count for m in measurements)
     if total_records > RUN_RECORDS_MAX:
         raise ArtifactLimitExceeded(
             f"this run's durable artifacts total {total_records} records, "
-            f"exceeding the {RUN_RECORDS_MAX}-record whole-run ceiling — narrow "
-            "--scope and rescan")
+            f"exceeding the {RUN_RECORDS_MAX}-record whole-run ceiling — {_NARROW_SCOPE_HINT}")

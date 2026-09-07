@@ -6,13 +6,161 @@ fixture; tests that need just a plain temp dir use `tmp_path` directly.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from agenttalk.store import Store
+
+_SYMLINK_DEVMODE_SUBKEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock"
+_SYMLINK_DEVMODE_VALUE = "AllowDevelopmentWithoutDevicePrivilege"
+#: Dedicated, repo-specific opt-in - required IN ADDITION to CI/
+#: GITHUB_ACTIONS (C-1a, reviewer-3 PR-B delta review round 2): those two
+#: platform variables are also set by common local Actions emulators
+#: (e.g. `act`), which would otherwise mutate a maintainer's real machine
+#: - exactly the outcome this gate exists to prevent. Same dedicated-
+#: opt-in-variable pattern test_comprehension_network_deny.py already
+#: uses for its own OS-mutating tests; set explicitly only in the CI
+#: job(s) that need the symlink tests to execute (tests.yml's Windows leg).
+_SYMLINK_DEVMODE_AUTH_VAR = "AGENTTALK_AUTHORIZE_SYMLINK_DEVMODE"
+
+#: Sentinel for "reading the prior value failed unexpectedly" (C-1b) -
+#: distinct from `None`, which means "confirmed absent".
+_READ_FAILED = object()
+
+
+def _symlink_devmode_authorized() -> bool:
+    return (
+        os.environ.get("CI", "").lower() == "true"
+        and os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+        and os.environ.get(_SYMLINK_DEVMODE_AUTH_VAR) == "1"
+    )
+
+
+def _windows_symlink_devmode_session(winreg_module=None):
+    """The core setup/restore generator, factored out of the pytest
+    fixture below so it can be driven directly (with a fake ``winreg_module``
+    substitute) by ``test_conftest_windows_symlink_devmode.py`` without
+    needing a real elevated Windows box or a real GitHub Actions run to
+    prove the enable/restore logic itself is correct.
+
+    Exactly one ``yield`` on every path (required for a generator-based
+    pytest fixture) - setup runs before it, teardown/restore after."""
+    if sys.platform != "win32" or not _symlink_devmode_authorized():
+        yield
+        return
+    winreg = winreg_module
+    if winreg is None:
+        import winreg  # noqa: PLC0414 - shadows the parameter name deliberately
+
+    try:
+        key = winreg.CreateKeyEx(
+            winreg.HKEY_LOCAL_MACHINE, _SYMLINK_DEVMODE_SUBKEY,
+            0, winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE,
+        )
+    except OSError:
+        yield
+        return
+
+    wrote = False
+    try:
+        try:
+            prior_value, prior_type = winreg.QueryValueEx(key, _SYMLINK_DEVMODE_VALUE)
+        except FileNotFoundError:
+            prior_value, prior_type = None, None
+        except OSError:
+            # C-1b (reviewer-3, PR-B delta review round 2): an unexpected
+            # read failure here (not "value absent", something else) means
+            # nothing has been written yet - degrade to a graceful no-op
+            # exactly like the neighbouring CreateKeyEx failure path above,
+            # never error the whole test session over it.
+            prior_value = _READ_FAILED
+        if prior_value is not _READ_FAILED:
+            try:
+                winreg.SetValueEx(key, _SYMLINK_DEVMODE_VALUE, 0, winreg.REG_DWORD, 1)
+                wrote = True
+            except OSError:
+                pass
+    finally:
+        winreg.CloseKey(key)
+
+    yield
+
+    if not wrote:
+        return
+
+    try:
+        restore_key = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE, _SYMLINK_DEVMODE_SUBKEY, 0, winreg.KEY_SET_VALUE)
+    except OSError as exc:
+        print(  # noqa: T201 - disclosed best-effort restore failure, never swallowed
+            f"WARNING: could not reopen {_SYMLINK_DEVMODE_SUBKEY} to restore "
+            f"{_SYMLINK_DEVMODE_VALUE} to its prior state: {exc}")
+        return
+    try:
+        if prior_value is None:
+            try:
+                winreg.DeleteValue(restore_key, _SYMLINK_DEVMODE_VALUE)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                print(  # noqa: T201
+                    f"WARNING: could not delete {_SYMLINK_DEVMODE_VALUE} to restore its "
+                    f"prior absent state: {exc}")
+        else:
+            try:
+                winreg.SetValueEx(restore_key, _SYMLINK_DEVMODE_VALUE, 0, prior_type, prior_value)
+            except OSError as exc:
+                print(  # noqa: T201
+                    f"WARNING: could not restore {_SYMLINK_DEVMODE_VALUE} to its prior "
+                    f"value {prior_value!r}: {exc}")
+    finally:
+        winreg.CloseKey(restore_key)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _enable_windows_symlink_creation_without_elevation():
+    """C-1 / #213 (lead's PR-B fix-round dispatch, 2026-08-27, corrected
+    per the lead's follow-up, 2026-08-27): four comprehension tests create
+    a symlink to prove a boundary guard, and skip when that fails - a debt
+    several PR-A/PR-B reviewers flagged as a "fast-follow: run CI's
+    Windows job with Developer Mode (or an elevated runner)" so this
+    executes instead of silently skipping.
+
+    Sets the same registry policy the Settings app's "Developer Mode"
+    toggle sets (``AllowDevelopmentWithoutDevicePrivilege``), which lets an
+    unprivileged process create a symlink without
+    ``SeCreateSymbolicLinkPrivilege`` - takes effect immediately, no
+    reboot.
+
+    STRICTLY gated on actually running under GitHub Actions (``CI=true``
+    and ``GITHUB_ACTIONS=true``) AND this repo's own dedicated opt-in
+    variable (``AGENTTALK_AUTHORIZE_SYMLINK_DEVMODE=1``, set explicitly
+    only in the CI job(s) that need these tests to execute) - the same
+    dedicated-opt-in-variable discipline test_comprehension_network_deny.py
+    uses for its own OS-mutating tests. A local run, even an elevated one
+    on a maintainer's real machine, MUST NOT mutate a machine-global
+    registry policy as a side effect of running the test suite - that was
+    the lead's first correction to this fixture. The dedicated variable is
+    a SECOND correction (C-1a): ``CI``/``GITHUB_ACTIONS`` alone are also
+    set by common local Actions emulators (e.g. `act`), which would
+    otherwise trip the same unwanted mutation on a maintainer's machine.
+
+    Restores whatever this exact value was before this session touched it
+    (absent, or some other value) once the session ends - best-effort,
+    with a disclosed warning printed if the restore itself fails, never
+    silently swallowed. Disposable hosted runners make the restore largely
+    moot in practice, but this fixture must still be correct on every
+    machine it could actually run on. See
+    ``_windows_symlink_devmode_session`` for the actual logic and
+    ``test_conftest_windows_symlink_devmode.py`` for its direct,
+    fake-winreg-backed unit tests.
+    """
+    yield from _windows_symlink_devmode_session()
 
 
 @pytest.fixture

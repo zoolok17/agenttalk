@@ -31,6 +31,7 @@ import contextlib
 import ctypes
 import json
 import os
+import shutil
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -39,7 +40,12 @@ from typing import Any
 
 from ..lifecycle_lock import ProcessIdentity, process_identity, process_observation
 from .digests import root_binding_digest
-from .envelope import EnvelopeError, read_json_document, validate_rfc3339_utc
+from .envelope import (
+    EnvelopeError,
+    path_is_reparse_point_or_symlink,
+    read_json_document,
+    validate_rfc3339_utc,
+)
 from .errors import PrivacyProofRootMismatch, ScanLockContended, ScanLockUnrecoverable
 from .paths import lock_path as _lock_path
 from .paths import project_root_from_comprehension_dir
@@ -238,8 +244,23 @@ def _classify_and_maybe_reclaim(path: Path) -> None:
     if record["host_identity"] != host_identity():
         # A lock recorded on a different host can never be proven dead from
         # here (design: "an unverifiable or remote-looking owner").
+        # FIX ROUND 26 (twenty-second cold read, F8, wrong-data): the
+        # generic "run --recover-stale-lock" remedy is misleading here -
+        # the flag CAN force-clear this record (it removes the file on
+        # trust), but it cannot verify anything about a foreign host's
+        # own process state, so re-running it alone does not help if
+        # that host keeps re-acquiring the lock. States the real remedy
+        # (independently confirm the other host's scan is gone) instead.
         raise ScanLockUnrecoverable(
-            f"scan.lock was recorded on a different host ({record['host_identity']!r})")
+            f"scan.lock was recorded on a different host ({record['host_identity']!r})",
+            remedy=(
+                "--recover-stale-lock can force-clear this record, but it cannot verify "
+                "a foreign host's process state at all - confirm independently that the "
+                f"scan on host {record['host_identity']!r} is genuinely gone before "
+                "relying on it; re-running the flag alone will not help if that host "
+                "keeps re-acquiring the lock"
+            ),
+        )
     status, observed = process_observation(record["pid"])
     if status == "dead":
         with contextlib.suppress(FileNotFoundError):
@@ -370,16 +391,107 @@ def release_scan_lock(handle: ScanLockHandle) -> None:
     os.remove(handle.path)
 
 
-def recover_stale_lock(comprehension_dir: Path) -> None:
-    """Attended-only override: unconditionally clear an existing scan.lock.
+def _remove_lock_path_regardless_of_shape(path: Path) -> None:
+    """MICRO-ROUND 50 (Cluster 5, directory-shaped scan.lock BLOCKER):
+    ``os.remove(path)`` alone only ever handles the ORDINARY case (an
+    existing plain file, or none at all - the design's own assumed
+    shape). If ``scan.lock`` has somehow become a DIRECTORY (an operator
+    mistake, a prior bug elsewhere, ...), ``os.remove()`` refuses it
+    outright (``IsADirectoryError``/``PermissionError``, depending on
+    platform) - ``--recover-stale-lock``'s own advertised job ("clears
+    an existing scan.lock") silently could not be done for this one
+    shape, contradicting its own help text with an unhandled crash
+    instead of the recovery it promises.
 
-    This function performs no attendance check itself — proving an
-    interactive terminal and explicit operator confirmation is the CLI's
-    job (PR-B's ``--recover-stale-lock`` flag). By the time this is called,
-    the operator has already confirmed the prior scan is gone; this is the
-    single place that acts on that confirmation, so PR-B's CLI has exactly
-    one internal call to make.
-    """
-    path = _lock_path(comprehension_dir)
+    Never followed through a reparse point/symlink to delete real
+    content living elsewhere (the exact class of risk round 50's own
+    Cluster 0 fix closed for ``runs/``/``.staging/``) - a reparse point/
+    symlink is removed as ITSELF, platform-specific (a POSIX symlink via
+    ``os.remove`` never follows it regardless of what it points to; a
+    Windows directory JUNCTION specifically requires ``os.rmdir``
+    instead - ``os.remove`` refuses a directory-attributed path on
+    Windows even when it is a junction, not a real directory). An
+    ordinary directory (no reparse point at all) is removed with
+    ``shutil.rmtree`` - correctly recovering the shape ``os.remove``
+    alone never could."""
+    if path_is_reparse_point_or_symlink(path):
+        if os.name == "nt":
+            os.rmdir(path)
+        else:
+            os.remove(path)
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+        return
     with contextlib.suppress(FileNotFoundError):
         os.remove(path)
+
+
+def recover_stale_lock(comprehension_dir: Path) -> dict | None:
+    """Attended-only override: clears an existing scan.lock — UNLESS its
+    recorded owner is a provably live, same-host, same-process match, in
+    which case this REFUSES outright (``ScanLockContended``, the exact
+    same live-contention refusal an ordinary acquire attempt already
+    raises for the identical evidence).
+
+    FIX ROUND 21 (seventeenth cold read, CR17-1 BLOCKER, safety
+    contract): this function used to clear the lock UNCONDITIONALLY,
+    with no check of who (or whether anyone) held it - a live local
+    owner is not "stale" by any reading of the design ("A lock is
+    reclaimed automatically only when the recorded local process
+    identity is definitely dead; an unverifiable or remote-looking
+    owner requires the explicit attended --recover-stale-lock action" -
+    a PROVABLY LIVE local owner is neither dead nor unverifiable, so
+    this override was never meant to reach it at all). Recovery is for
+    a dead, unverifiable, or remote-looking owner only - reuses the
+    exact same liveness evidence ``_classify_and_maybe_reclaim`` already
+    computes for the ordinary (non-override) acquire path, so a live
+    local owner is refused here the identical way it would be refused
+    there.
+
+    This function still performs no ATTENDANCE check itself - proving an
+    interactive terminal and explicit operator confirmation remains the
+    CLI's own job (PR-B's ``--recover-stale-lock`` flag). Returns the
+    previous lock record (so the caller can record a forced-recovery
+    trace - CR17-1's own part 3) or ``None`` when there was no lock to
+    clear at all (a no-op recovery attempt is not itself notable).
+
+    FIX ROUND 21b (reviewer-3's re-delta, MINOR 1, wrong-data): a forced
+    recovery over a MALFORMED/unreadable record used to return ``None``
+    - identical to the genuine "no lock file at all" no-op - so the
+    caller's own forced-recovery trace (CR17-1's part 3, above) silently
+    recorded NOTHING for the one case that is MORE safety-relevant than
+    an ordinary dead-owner reclaim, not less: this run could not verify
+    who (if anyone) held the lock, or when, before clearing it anyway.
+    Now returns a sentinel record (``pid``/``acquired_at`` both ``None``,
+    ``record_unreadable`` ``True``) instead, so the caller can still
+    build a trace - naming the pid as unknown rather than fabricating
+    one - and distinguish this case from an ordinary dead-owner clear."""
+    path = _lock_path(comprehension_dir)
+    if not path.exists():
+        return None
+    record_unreadable = False
+    try:
+        record = _read_lock_record(path)
+    except ScanLockUnrecoverable:
+        # A malformed/unreadable record can never be proven to name a
+        # live owner either - safe to treat as clearable, the same fail
+        # side the design's own dead/unverifiable/remote-looking list
+        # already covers. No liveness record to check against, so no
+        # further evidence is available to refuse on.
+        record = None
+        record_unreadable = True
+    if record is not None and record["host_identity"] == host_identity():
+        status, observed = process_observation(record["pid"])
+        if status == "alive":
+            recorded = record["process_identity"]
+            if (
+                observed is not None
+                and observed.scheme == recorded["scheme"]
+                and observed.value == recorded["value"]
+            ):
+                raise ScanLockContended(record)
+    _remove_lock_path_regardless_of_shape(path)
+    if record_unreadable:
+        return {"pid": None, "acquired_at": None, "record_unreadable": True}
+    return record

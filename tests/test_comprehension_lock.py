@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess  # nosec B404 - invokes the real `mklink /J` binary to build a Windows
+                    # directory junction fixture; no shell, no untrusted input
+import sys
 from pathlib import Path
 
 import pytest
@@ -225,6 +228,31 @@ def test_different_host_identity_is_unrecoverable_even_if_pid_matches(
     assert stale.path.exists()
 
 
+def test_different_host_refusal_states_the_actual_remedy_not_just_rerun_the_flag(
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
+) -> None:
+    """FIX ROUND 26 (twenty-second cold read, F8, wrong-data): the
+    generic "run --recover-stale-lock" remedy is misleading for a
+    foreign-host owner - a caller who already supplied the flag and hit
+    this again (the other host keeps re-acquiring) was told the exact
+    same advice as if they had never run it. The message must instead
+    name the actual remedy: confirm independently that the OTHER host's
+    scan is genuinely gone - the flag cannot verify a foreign host's own
+    process state at all."""
+    monkeypatch.setattr(lockmod, "host_identity", lambda: "host-a")
+    lockmod.acquire_scan_lock(
+        comprehension_dir, privacy=comprehension_privacy, predecessor_index_digest=None)
+    monkeypatch.setattr(lockmod, "host_identity", lambda: "host-b")
+    with pytest.raises(ScanLockUnrecoverable) as exc_info:
+        lockmod.acquire_scan_lock(
+            comprehension_dir, privacy=comprehension_privacy,
+            predecessor_index_digest=None)
+    message = str(exc_info.value)
+    assert "confirm" in message.lower()
+    assert "host-a" in message
+    assert "cannot verify" in message.lower()
+
+
 # ----------------------------------------------------------- malformed lock record
 
 @pytest.mark.parametrize("raw", [
@@ -276,28 +304,113 @@ def test_release_refuses_if_lock_file_is_gone(
 
 # ----------------------------------------------------------- recover_stale_lock (attended-only)
 
-def test_recover_stale_lock_clears_an_existing_lock_unconditionally(
+def test_recover_stale_lock_refuses_a_provably_live_local_owner(
     comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
-    """recover_stale_lock performs NO liveness check — it is the attended
-    override, called only after a human has already confirmed the prior
-    scan is gone (design: the CLI flag requires attendance; this function
-    is what it calls once attendance is proven)."""
+    """FIX ROUND 21 (seventeenth cold read, CR17-1 BLOCKER, safety
+    contract): recover_stale_lock used to clear ANY lock unconditionally,
+    with no liveness check at all - a live local owner is never "stale"
+    by the design's own wording ("A lock is reclaimed automatically only
+    when the recorded local process identity is definitely dead... an
+    unverifiable or remote-looking owner requires the explicit attended
+    --recover-stale-lock action" - a PROVABLY LIVE owner is neither).
+    This lock is acquired by THIS SAME test process (a real, live,
+    same-host, same-identity owner by construction) - recovery must
+    refuse it exactly the way an ordinary contended acquire already
+    does, never silently clear it."""
+    live = lockmod.acquire_scan_lock(
+        comprehension_dir, privacy=comprehension_privacy,
+        predecessor_index_digest=None)
+    assert live.path.exists()
+    with pytest.raises(ScanLockContended):
+        lockmod.recover_stale_lock(comprehension_dir)
+    assert live.path.exists()  # never deleted - refused before clearing
+    lockmod.release_scan_lock(live)
+
+
+def test_recover_stale_lock_clears_a_dead_owners_lock(
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
+) -> None:
+    """The attended override's own real job: a dead owner's lock is safe
+    to clear - returns the previous record (for the caller's own forced-
+    recovery trace) and the file is actually gone afterward."""
     stale = lockmod.acquire_scan_lock(
         comprehension_dir, privacy=comprehension_privacy,
         predecessor_index_digest=None)
-    assert stale.path.exists()
-    lockmod.recover_stale_lock(comprehension_dir)
+    monkeypatch.setattr(lockmod, "process_observation", lambda pid: ("dead", None))
+    previous = lockmod.recover_stale_lock(comprehension_dir)
     assert not stale.path.exists()
+    assert previous is not None
+    assert previous["pid"] == stale.pid
     fresh = lockmod.acquire_scan_lock(
         comprehension_dir, privacy=comprehension_privacy,
         predecessor_index_digest=None)
     lockmod.release_scan_lock(fresh)
 
 
+def test_recover_stale_lock_clears_an_unverifiable_owners_lock(
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
+) -> None:
+    """The other half of "dead, unverifiable, or remote-looking" - a
+    same-PID-but-different-process-identity match (PID reuse) can never
+    prove death, but it is exactly the unverifiable case the attended
+    override exists for, and must still be clearable."""
+    stale = lockmod.acquire_scan_lock(
+        comprehension_dir, privacy=comprehension_privacy,
+        predecessor_index_digest=None)
+    different_identity = ProcessIdentity(
+        scheme=stale.process_identity.scheme, value=stale.process_identity.value + "-reused")
+    monkeypatch.setattr(
+        lockmod, "process_observation", lambda pid: ("alive", different_identity))
+    previous = lockmod.recover_stale_lock(comprehension_dir)
+    assert not stale.path.exists()
+    assert previous is not None
+
+
 def test_recover_stale_lock_on_an_absent_lock_is_a_silent_no_op(tmp_path: Path) -> None:
-    lockmod.recover_stale_lock(tmp_path)  # must not raise
+    assert lockmod.recover_stale_lock(tmp_path) is None  # must not raise
     assert not (tmp_path / "scan.lock").exists()
+
+
+def test_recover_stale_lock_clears_a_directory_shaped_lock(tmp_path: Path) -> None:
+    """MICRO-ROUND 50 (Cluster 5, directory-shaped scan.lock BLOCKER):
+    ``os.remove()`` alone refuses a directory outright - ``scan.lock``
+    somehow being a directory (an operator mistake, a prior bug
+    elsewhere, ...) used to make this function's own advertised job
+    ("clears an existing scan.lock") crash with an unhandled OSError
+    instead, directly contradicting ScanLockUnrecoverable's own remedy
+    text (\"run --recover-stale-lock\") which promised this would work."""
+    tmp_path.mkdir(exist_ok=True)
+    lock_path = tmp_path / "scan.lock"
+    (lock_path / "nested").mkdir(parents=True)  # non-empty, the harder case
+    previous = lockmod.recover_stale_lock(tmp_path)
+    assert not lock_path.exists()
+    assert previous == {"pid": None, "acquired_at": None, "record_unreadable": True}
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows directory junctions only")
+def test_recover_stale_lock_clears_a_junctioned_lock_without_touching_its_target(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 5, directory-shaped scan.lock - the
+    reparse-point half): a JUNCTIONED scan.lock must be removed as
+    ITSELF (os.rmdir, never os.remove, which refuses a directory-
+    attributed path on Windows even for a junction) - never followed
+    through to delete the real content it points to, the exact class of
+    risk round 50's own Cluster 0 fix closed for runs/.staging."""
+    outside = tmp_path.parent / "outside-scan-lock-junction-target"
+    outside.mkdir(exist_ok=True)
+    (outside / "real_content.txt").write_bytes(b"do not delete me\n")
+    lock_path = tmp_path / "scan.lock"
+    subprocess.run(  # noqa: S603,S607  # nosec B603 B607
+        ["cmd", "/c", "mklink", "/J", str(lock_path), str(outside)],
+        check=True, capture_output=True, text=True,
+    )
+    previous = lockmod.recover_stale_lock(tmp_path)
+    assert not lock_path.exists()  # the junction itself is gone
+    assert outside.exists()  # its real target is untouched
+    assert (outside / "real_content.txt").read_bytes() == b"do not delete me\n"
+    assert previous == {"pid": None, "acquired_at": None, "record_unreadable": True}
 
 
 # ----------------------------------------------------------- host_identity()
@@ -409,6 +522,34 @@ def test_a_wrongly_shaped_comprehension_dir_is_rejected_even_at_a_proven_root(
     assert not (comprehension_privacy_root / "unignored").exists()
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows directory junctions only")
+def test_a_junctioned_agenttalk_directory_is_still_refused(
+    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 0, B1 control - reviewer-3's own point of
+    comparison): junctioning ``.agenttalk`` itself is ALREADY refused
+    today, by this exact function's own name-shape check
+    (``project_root_from_comprehension_dir`` - see the test immediately
+    above) or the root-binding proof mismatch it then trips - the round-
+    50 finding is specifically that the escape hole sits ONE LEVEL DOWN
+    (``runs/``/``.staging/``), never here. Locked as a permanent control
+    so a future change to either check cannot silently reopen the
+    ``.agenttalk``-level hole while this round's own fix only ever closes
+    the level-down one."""
+    outside = comprehension_privacy_root.parent / "outside-agenttalk-junction-target"
+    outside.mkdir(exist_ok=True)
+    junction = comprehension_privacy_root / ".agenttalk"
+    subprocess.run(  # noqa: S603,S607  # nosec B603 B607
+        ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+        check=True, capture_output=True, text=True,
+    )
+    comprehension_dir = junction / "comprehension"
+    with pytest.raises((InvalidComprehensionDir, PrivacyProofRootMismatch)):
+        lockmod.acquire_scan_lock(
+            comprehension_dir, privacy=comprehension_privacy, predecessor_index_digest=None)
+    assert list(outside.iterdir()) == []
+
+
 # ----------------------------------------------------------- finding 3 regression: no socket import
 
 def test_comprehension_package_imports_no_socket_or_network_module() -> None:
@@ -417,6 +558,18 @@ def test_comprehension_package_imports_no_socket_or_network_module() -> None:
     imports anywhere in ``agenttalk.comprehension`` — a static per-file
     import scan, closing the CHANNEL (the whole package), not merely the
     one ``lock.py`` instance the reviewer reproduced against.
+
+    ``platform`` is banned here too (PR-B item 2, lead's follow-on after
+    the item-2 checkpoint): empirically confirmed TWICE now — once fixing
+    ``lock.host_identity()``, once independently in
+    ``discovery.detect_platform_identity()`` — that
+    ``platform.node()``/``platform.machine()``/``platform.system()`` ALL
+    transitively import and use ``socket`` on Windows (CPython's
+    ``platform.uname()`` builds the whole tuple, node/hostname included,
+    as one cached unit even when only one other field is read). Banning
+    the whole module here closes the CLASS so a third call site can never
+    reopen it silently; this package's socket-free platform/architecture
+    detection lives in ``ctypes``/``os.uname()`` instead.
     """
     import ast
     import importlib
@@ -425,7 +578,7 @@ def test_comprehension_package_imports_no_socket_or_network_module() -> None:
     banned = {
         "socket", "ssl", "http", "http.client", "urllib", "urllib.request",
         "urllib3", "requests", "ftplib", "smtplib", "telnetlib", "asyncio",
-        "socketserver", "xmlrpc",
+        "socketserver", "xmlrpc", "platform",
     }
     package = importlib.import_module("agenttalk.comprehension")
     package_dir = pathlib.Path(package.__file__).parent
@@ -437,6 +590,31 @@ def test_comprehension_package_imports_no_socket_or_network_module() -> None:
                 names = [alias.name for alias in node.names]
             elif isinstance(node, ast.ImportFrom):
                 names = [node.module] if node.module else []
+            elif isinstance(node, ast.Call):
+                # N9 (fourth cold read, fix round 6): the static Import/
+                # ImportFrom scan above is blind to the DYNAMIC import
+                # spellings - importlib.import_module("socket") and
+                # __import__("socket") are ordinary function calls, not
+                # import statements at all, and would sail straight
+                # through the check above even though they achieve
+                # exactly what it exists to ban. Only a literal string
+                # argument can be checked statically; anything else
+                # (a computed module name) is a residual this static
+                # scan cannot see either way, same as any static analysis.
+                is_import_module_call = (
+                    isinstance(node.func, ast.Attribute) and node.func.attr == "import_module"
+                )
+                is_dunder_import_call = (
+                    isinstance(node.func, ast.Name) and node.func.id == "__import__"
+                )
+                if not (is_import_module_call or is_dunder_import_call) or not node.args:
+                    continue
+                first_arg = node.args[0]
+                names = (
+                    [first_arg.value]
+                    if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str)
+                    else []
+                )
             else:
                 continue
             for name in names:

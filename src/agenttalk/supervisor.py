@@ -736,7 +736,7 @@ _AGENTTALK_SUBCOMMANDS = frozenset(
     "request-restart commit-gate request-launch wrap "
     "_internal-check-wrap-dispatch dead-letter managed-lead-loop supervise "
     "deadman reply tail start serve dashboard reset doctor gateway hmac-init "
-    "capacity install-skills codex-config".split()
+    "capacity install-skills codex-config comprehension".split()
 )
 _LAUNCHER_DERIVED_PRIOR_SOURCES = {"launch_child_provenance"}
 _DIAGNOSTIC_COUNTERS = (

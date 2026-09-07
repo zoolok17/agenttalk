@@ -170,6 +170,42 @@ def test_escalate_scan_lock_unrecoverable_wires_the_errors_detail(tmp_path: Path
     assert "pid 4242 is alive but its identity does not match" in body
 
 
+def test_escalate_scan_lock_unrecoverable_carries_the_real_cross_host_remedy(
+    tmp_path: Path,
+) -> None:
+    """MICRO-ROUND 50 (Cluster 4, m4 BLOCKER, wrong-data): FIX ROUND 26
+    corrected the misleading generic "run --recover-stale-lock" remedy
+    on ScanLockUnrecoverable's own str() representation for a cross-host
+    lock (that flag alone cannot verify a foreign host's process state) -
+    but this escalation route used to wire only `error.detail` (the bare
+    fact, with NO remedy text at all) into the durable, operator-facing
+    message, silently losing the very correction round 26 made. The
+    call-site-specific remedy (naming the OTHER host, and explicitly
+    warning that re-running the flag alone will not help) must now
+    reach the durable record, not just a transient stderr print."""
+    store = _make_store(tmp_path)
+    store.set_operator_facing("lead")
+    error = ScanLockUnrecoverable(
+        "scan.lock was recorded on a different host ('other-host')",
+        remedy=(
+            "--recover-stale-lock can force-clear this record, but it cannot verify "
+            "a foreign host's process state at all - confirm independently that the "
+            "scan on host 'other-host' is genuinely gone before relying on it; "
+            "re-running the flag alone will not help if that host keeps re-acquiring "
+            "the lock"
+        ),
+    )
+    result = esc.escalate_scan_lock_unrecoverable(store, sender="alpha", error=error)
+    import json
+    files = list((store.dir / "messages").glob("*.json"))
+    (msg_path,) = [p for p in files if json.loads(p.read_text(encoding="utf-8"))["id"]
+                   == result.message_id]
+    body = json.loads(msg_path.read_text(encoding="utf-8"))["body"]
+    assert "scan.lock was recorded on a different host" in body
+    assert "cannot verify a foreign host's process state" in body
+    assert "re-running the flag alone will not help" in body
+
+
 def test_escalate_vcs_privacy_refused_wires_the_errors_detail_and_work_id(
     tmp_path: Path,
 ) -> None:

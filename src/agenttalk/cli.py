@@ -2015,6 +2015,371 @@ def cmd_check(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def _comprehension_root(args: argparse.Namespace) -> Path:
+    return Path(args.root).resolve() if getattr(args, "root", None) else find_root()
+
+
+def _comprehension_confirm_attended(prompt_lines: list[str]) -> bool:
+    """DESIGN-55-comprehension-plane.md: the attended overrides require
+    "an interactive terminal" and "explicit confirmation" - checked here,
+    never assumed. Requires BOTH stdin and stdout to be a real terminal
+    (a script piping stdin, or output redirected to a file, is not an
+    attended operator) and never satisfiable by a headless/scripted
+    invocation (design: "Scripts and wrappers cannot supply the
+    acknowledgement")."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+    for line in prompt_lines:
+        print(line)
+    try:
+        response = input("Type 'yes' to confirm, anything else to abort: ")
+    except EOFError:
+        return False
+    return response.strip().lower() == "yes"
+
+
+def _comprehension_escalate(
+    args: argparse.Namespace, *, action: str, error: Exception, work_id: str | None = None,
+) -> int:
+    """Headless fallback when an attended action is needed but no
+    interactive terminal is available: escalate to the operator instead of
+    blocking forever or silently proceeding (design: "Scripts and wrappers
+    cannot supply the acknowledgement"). Reuses PR-A's
+    comprehension.escalation module, which mirrors cmd_escalate's own
+    routing."""
+    from agenttalk.comprehension import escalation
+
+    sender = os.environ.get("AGENTTALK_SELF")
+    if not sender:
+        sys.stderr.write(
+            f"agenttalk: {error}\n"
+            "agenttalk: no interactive terminal for attended confirmation, and no "
+            "AGENTTALK_SELF set to escalate to the operator instead\n"
+        )
+        return 2
+    try:
+        store = _get_store(args, must_exist=False)
+        if action == "recover-stale-lock":
+            result = escalation.escalate_scan_lock_unrecoverable(store, sender=sender, error=error)
+        else:
+            result = escalation.escalate_vcs_privacy_refused(
+                store, sender=sender, error=error, work_id=work_id)
+    except Exception as exc:  # noqa: BLE001 - escalation itself must never crash the CLI
+        sys.stderr.write(f"agenttalk: {error}\nagenttalk: escalation also failed: {exc}\n")
+        return 2
+    sys.stderr.write(
+        f"agenttalk: attended confirmation required for {action}; escalated to "
+        f"{result.recipient} (request {result.request_id})\n"
+    )
+    return 2
+
+
+def _print_scan_json_integrity_if_not_verified(payload: dict) -> None:
+    """Round 7c (reviewer-3 delta on 95d9cd8): the round-7b "unverified"
+    integrity state (an aged-out or never-recorded scan.json anchor)
+    existed ONLY in the JSON payload - status's default human output
+    printed a normal-looking healthy run, and validate's printed
+    valid:true with no caution anywhere a human actually looks, even
+    with a falsified fingerprint/completeness and the anchor keys
+    removed. Printed on default human output ONLY when not verified -
+    no new noise on the happy (verified) path."""
+    integrity = payload.get("scan_json_integrity") or {}
+    if integrity.get("state") != "verified":
+        print(f"scan_json_integrity: {integrity.get('state')} ({integrity.get('reason_code')})")
+
+
+def _comprehension_recover_stale_lock_and_rescan(
+    args: argparse.Namespace, root: Path, exc: Exception, *,
+    acknowledge_unignored: bool = False, work_id: str | None = None,
+):
+    """FIX ROUND 21 (seventeenth cold read, CR17-1 BLOCKER, safety
+    contract): shared by both the plain-scan path and the privacy-
+    override retry path - each reaches here only after a genuine
+    ``ScanLockUnrecoverable`` (the lock is dead-but-unconfirmable,
+    unverifiable, or remote-looking; a LIVE local owner never reaches
+    this function at all - ``ScanLockContended`` refuses it outright,
+    unconditionally, before this is ever called). ``--recover-stale-
+    lock`` is consulted HERE, for the first time, exactly once - never
+    threaded into an initial attempt the way it used to be. Returns a
+    ``ScanOutcome`` on success, or an ``int`` exit code for the caller
+    to return directly."""
+    from agenttalk.comprehension import scan_pipeline
+    from agenttalk.comprehension.errors import ComprehensionError
+
+    if not args.recover_stale_lock:
+        sys.stderr.write(f"agenttalk: {exc}\n")
+        return 2
+    confirmed = _comprehension_confirm_attended([
+        f"ATTENDED ACTION: recover-stale-lock at {root}",
+        exc.detail,
+        "This clears the existing scan.lock - a live owner is refused outright instead, "
+        "never reaching this prompt.",
+    ])
+    if not confirmed:
+        return _comprehension_escalate(args, action="recover-stale-lock", error=exc)
+    try:
+        return scan_pipeline.run_scan(
+            root, acknowledge_unignored=acknowledge_unignored, work_id=work_id,
+            recover_stale_lock=True)
+    except ComprehensionError as exc2:
+        sys.stderr.write(f"agenttalk: {exc2}\n")
+        return 2
+
+
+def cmd_comprehension(args: argparse.Namespace) -> int:
+    """Local, offline static comprehension inventory (task #55 slice-1).
+    Scope simplifications this slice (named, not silent): no config.json
+    parsing yet (no --scope/--exclude narrowing, no declared feature
+    confirmation); `report`'s human-readable mode prints the same JSON
+    projection as --json (a friendlier rendering is a later refinement,
+    per the design: "report --json is the stable automation contract.
+    Human output may evolve")."""
+    from agenttalk.comprehension import scan_pipeline
+    from agenttalk.comprehension.ceilings import ArtifactLimitExceeded
+    from agenttalk.comprehension.errors import (
+        ComprehensionError,
+        ScanLockContended,
+        ScanLockUnrecoverable,
+    )
+    from agenttalk.comprehension.privacy import (
+        VcsPrivacyRefused,
+        acknowledge_requires_work_id_message,
+    )
+
+    action = getattr(args, "comprehension_cmd", None)
+    if action is None:
+        sys.stderr.write(
+            "agenttalk: comprehension requires a subcommand "
+            "(scan/status/report/validate/prune)\n")
+        return 2
+
+    root = _comprehension_root(args)
+
+    if action == "scan":
+        # FIX ROUND 28 (twenty-fourth cold read, F9, wrong-refusal-
+        # timing): the --work-id pairing check below used to live ONLY
+        # inside the `except VcsPrivacyRefused` branch - reached only
+        # when the first, unacknowledged scan_pipeline.run_scan(root)
+        # attempt actually hit a privacy refusal. Against a repo with no
+        # privacy issue at all, --acknowledge-unignored-private-store
+        # with no --work-id silently proceeded to a normal, successful
+        # scan - the invalid flag pairing was never even evaluated. The
+        # pairing is a property of the arguments themselves, never of
+        # what the first attempt happens to find - checked first here,
+        # unconditionally, before scan_pipeline.run_scan is ever called.
+        #
+        # MICRO-ROUND 28b (reviewer-3 delta on `02c6b30`, R4, taken): the
+        # predicate itself is now shared with scan_pipeline.py's own
+        # `_obtain_privacy` (privacy.acknowledge_requires_work_id_
+        # message) - see that function's own docstring for why THIS call
+        # site stays separate rather than being unified with it (CR17-1's
+        # own load-bearing two-attempt lock/privacy ordering: this
+        # action's first scan_pipeline.run_scan(root) call deliberately
+        # never forwards acknowledge_unignored, so a live lock refusal is
+        # never masked by a flag meant only for the privacy question).
+        pairing_error = acknowledge_requires_work_id_message(
+            acknowledge_unignored=args.acknowledge_unignored_private_store,
+            work_id=args.work_id)
+        if pairing_error is not None:
+            sys.stderr.write(f"agenttalk: {pairing_error}\n")
+            return 2
+        outcome = None
+        try:
+            # FIX ROUND 21 (seventeenth cold read, CR17-1 BLOCKER, safety
+            # contract): the FIRST attempt never passes the raw CLI flag
+            # straight through - an ordinary dead-owner lock is already
+            # reclaimed automatically inside acquire_scan_lock, with no
+            # override needed at all; passing the flag here unconditionally
+            # used to clear ANY lock (live or dead) before that machinery
+            # ever ran, defeating ScanLockContended's own live-owner
+            # refusal entirely. The override is only ever consulted below,
+            # after a genuine ScanLockUnrecoverable (dead-but-unconfirmable/
+            # unverifiable/remote-looking) proves recovery is actually the
+            # right question to ask.
+            outcome = scan_pipeline.run_scan(root)
+        except VcsPrivacyRefused as exc:
+            if not args.acknowledge_unignored_private_store:
+                sys.stderr.write(f"agenttalk: {exc}\n")
+                return 2
+            # --work-id is already guaranteed present here - the upfront
+            # pairing guard above refuses before this try block is ever
+            # entered otherwise.
+            confirmed = _comprehension_confirm_attended([
+                f"ATTENDED ACTION: acknowledge-unignored-private-store at {root}",
+                "The private comprehension store is not proven ignored by your VCS.",
+                "Proceeding risks staging it via a plain `git add -A`.",
+                f"Bound work item: {args.work_id}",
+            ])
+            if not confirmed:
+                return _comprehension_escalate(
+                    args, action="acknowledge-unignored-private-store", error=exc,
+                    work_id=args.work_id)
+            try:
+                outcome = scan_pipeline.run_scan(
+                    root, acknowledge_unignored=True, work_id=args.work_id)
+            except ScanLockUnrecoverable as exc2:
+                outcome = _comprehension_recover_stale_lock_and_rescan(
+                    args, root, exc2, acknowledge_unignored=True, work_id=args.work_id)
+                if isinstance(outcome, int):
+                    return outcome
+            except ComprehensionError as exc2:
+                sys.stderr.write(f"agenttalk: {exc2}\n")
+                return 2
+        except ScanLockContended as exc:
+            # A live, provably-same-host, provably-same-process owner is
+            # never "stale" - refused outright regardless of whether
+            # --recover-stale-lock was passed (CR17-1's own fix part 1).
+            sys.stderr.write(f"agenttalk: {exc}\n")
+            return 2
+        except ScanLockUnrecoverable as exc:
+            outcome = _comprehension_recover_stale_lock_and_rescan(args, root, exc)
+            if isinstance(outcome, int):
+                return outcome
+        except (ArtifactLimitExceeded, ComprehensionError) as exc:
+            sys.stderr.write(f"agenttalk: {exc}\n")
+            return 2
+        if outcome is None:
+            return 2
+        payload = {
+            "scan_id": outcome.scan_id, "status": outcome.status, "run_dir": str(outcome.run_dir),
+        }
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            print(f"scan_id: {outcome.scan_id}")
+            print(f"status:  {outcome.status}")
+            print(f"run_dir: {outcome.run_dir}")
+        return 0
+
+    if action == "status":
+        try:
+            payload = scan_pipeline.get_status(root, run_id=args.run)
+        except scan_pipeline.NotScanned:
+            if args.json:
+                print(json.dumps({"status": "not_scanned"}, indent=2))
+            else:
+                print("status: not_scanned")
+            return 0
+        except ComprehensionError as exc:
+            sys.stderr.write(f"agenttalk: {exc}\n")
+            return 2
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            # N5 (seventh cold read, fix round 11): this used to print
+            # latest_scan_id unconditionally - with `--run <older-id>`,
+            # human output named the wrong run (the repo's LATEST scan,
+            # never the one actually being reported this call). scan_id
+            # is the reported run's own id - the same field `validate`'s
+            # human output already prints correctly.
+            print(f"scan_id:  {payload['scan_id']}")
+            print(f"status:   {payload['status']}")
+            print(f"problems: {payload['problem_count']}")
+            # MICRO-ROUND 50 (Cluster 5, status parity BLOCKER): the SAME
+            # round-7c/round-29 parity precedent immediately below
+            # (default human output must not tell a strictly LESS honest
+            # story than --json, which already carries both fields
+            # unconditionally) had not actually been applied to these
+            # two - boundary_count (a real, if partial, source-coverage
+            # gap signal) and degraded_by (literally the answer to "why
+            # is this degraded," the single most useful field for a
+            # degraded run) were both --json-only until now, even though
+            # this exact precedent was already established for
+            # artifact_integrity_hint right below.
+            print(f"boundaries: {payload['boundary_count']}")
+            print(f"degraded_by: {', '.join(payload['degraded_by']) or '(none)'}")
+            _print_scan_json_integrity_if_not_verified(payload)
+            # FIX ROUND 29 (twenty-fifth cold read, F8b polish): the
+            # round-7c parity precedent (default human output must not
+            # tell a strictly LESS honest story than --json, which
+            # already carries this field unconditionally) - artifact_
+            # integrity_hint existed only in --json output, never in the
+            # default human rendering a caller most commonly sees.
+            print(f"hint:     {payload['artifact_integrity_hint']}")
+        return 0
+
+    if action == "report":
+        try:
+            payload = scan_pipeline.get_report(
+                root, run_id=args.run, unit_id=args.unit_id, feature_id=args.feature_id,
+                readiness_state=args.readiness_state, dependencies_only=args.dependencies_only,
+            )
+        except (scan_pipeline.NotScanned, ComprehensionError) as exc:
+            sys.stderr.write(f"agenttalk: {exc}\n")
+            return 2
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    if action == "validate":
+        try:
+            payload = scan_pipeline.validate_run(root, run_id=args.run)
+        # N2 (third cold read, fix round 5): this caught NotScanned only -
+        # a malformed index.json (or any other typed ComprehensionError
+        # validate_run's own read path can raise) surfaced as an unhandled
+        # traceback instead of the same typed, actionable stderr message
+        # every sibling action (status/report) already gives.
+        except (scan_pipeline.NotScanned, ComprehensionError) as exc:
+            sys.stderr.write(f"agenttalk: {exc}\n")
+            return 2
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            print(f"scan_id: {payload['scan_id']}")
+            print(f"valid:   {payload['valid']}")
+            print(f"detail:  {payload['detail']}")
+            _print_scan_json_integrity_if_not_verified(payload)
+        return 0 if payload["valid"] else 1
+
+    if action == "prune":
+        # M-5 (second cold read, PR-B fix round 4): the design's own
+        # command table names `agenttalk comprehension prune --staging`
+        # ("Reclaim only definitely abandoned, unpublished staging
+        # directories. It never deletes runs or packs.") and staging.py's
+        # own docstring already claimed this call site existed - neither
+        # the automatic (lock-acquisition) nor the manual (this command)
+        # remedy actually existed until this fix.
+        if not args.staging:
+            sys.stderr.write("agenttalk: comprehension prune requires --staging\n")
+            return 2
+        from agenttalk.comprehension import paths as comprehension_paths
+        from agenttalk.comprehension import staging as staging_mod
+
+        comprehension_dir = comprehension_paths.comprehension_dir(root / ".agenttalk")
+        # MICRO-ROUND 50 (Cluster 5, concurrent prune): prune_staging's
+        # own reclaim can now raise a typed StagingReclaimFailed (an
+        # undeletable dead-owner directory - see staging.py's own
+        # docstring) - previously unhandled here, an ugly, unhandled
+        # traceback with no exit-code contract at all. The SAME typed-
+        # refusal-to-exit-2 pattern the `validate` action above already
+        # uses; a benign concurrent-reclaim RACE (this same directory
+        # already removed by the automatic lock-acquisition call site,
+        # or another `prune --staging` racing this one) is handled one
+        # level down, inside reclaim_abandoned_staging itself, and never
+        # reaches here as a failure at all.
+        try:
+            report = staging_mod.prune_staging(comprehension_dir)
+        except ComprehensionError as exc:
+            sys.stderr.write(f"agenttalk: {exc}\n")
+            return 2
+        payload = {
+            "reclaimed": report.reclaimed,
+            "retained": [{"name": name, "reason": reason} for name, reason in report.retained],
+        }
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            print(f"reclaimed: {len(report.reclaimed)}")
+            for name in report.reclaimed:
+                print(f"  - {name}")
+            print(f"retained:  {len(report.retained)}")
+            for name, reason in report.retained:
+                print(f"  - {name}: {reason}")
+        return 0
+
+    sys.stderr.write(f"agenttalk: unknown comprehension subcommand {action!r}\n")
+    return 2
+
+
 def cmd_gate(args: argparse.Namespace) -> int:
     """Manage lightweight assurance gates."""
     store = _get_store(args)
@@ -13808,6 +14173,130 @@ def build_parser() -> argparse.ArgumentParser:
     gwaive.add_argument("--date", help="Decision date (defaults to now).")
     gwaive.add_argument("--json", action="store_true", help="Emit the stored gate object.")
     gwaive.set_defaults(func=cmd_gate)
+
+    # ----- comprehension (task #55 slice-1: local static inventory) -----
+    # FIX ROUND 23 (nineteenth cold read, F9, completeness): the design's
+    # own CLI command table names SIX comprehension commands; this
+    # slice implements five (scan/status/report/validate/prune) - `pack`
+    # is a LATER increment (the design's own increment 3) with nothing
+    # declaring its absence anywhere a `--help` reader would see it.
+    #
+    # FIX ROUND 36 (thirtieth cold read, F6 LOW, completeness): `pack`
+    # got its own declaration above, but `/api/comprehension` (the
+    # design's own PR-D increment - the HTTP surface this same data
+    # would be served through) is EQUALLY unimplemented this slice and
+    # had no declaration anywhere a `--help` reader would see it either.
+    pcomp = sub.add_parser(
+        "comprehension",
+        help="Local, offline static comprehension inventory for one legacy repository (task #55).",
+        description="Local, offline static comprehension inventory for one legacy repository "
+                    "(task #55 slice-1). This slice implements scan/status/report/validate/"
+                    "prune - `pack` (bounded evidence-pack construction) is a later increment, "
+                    "not yet implemented. The `/api/comprehension` HTTP surface (PR-D's own "
+                    "increment) is equally not implemented this slice - every command here is "
+                    "CLI-only.",
+    )
+    pcomp.set_defaults(func=cmd_comprehension, comprehension_cmd=None)
+    compsub = pcomp.add_subparsers(dest="comprehension_cmd")
+
+    # FIX ROUND 26 (twenty-second cold read, F5 completeness): `pack` got
+    # an explicit later-increment declaration (see `pcomp`'s own
+    # description above) but `--scope`/`--exclude`/`--config` - equally
+    # design-promised for THIS command, per DESIGN-55's own scan
+    # narrowing/config.json parsing sections, and equally absent this
+    # slice - had no declaration anywhere a `--help` reader would see it.
+    cscan = compsub.add_parser(
+        "scan", help="Create and publish one immutable comprehension run.",
+        # FIX ROUND 29 (twenty-fifth cold read, F8a polish, declare-not-
+        # silently-simplify): the design's own step 1 says scan "resolves
+        # the INITIALIZED project root" - this slice never actually
+        # checks that .agenttalk/ was created via `agenttalk init` first,
+        # it simply writes .agenttalk/comprehension/ under whatever root
+        # resolves, initialized or not. Declared rather than enforced -
+        # requiring real init here is a repo-wide bus concern, wider than
+        # this one command, and out of scope for a lean fix.
+        description="Create and publish one immutable comprehension run. "
+                    "--scope/--exclude narrowing and --config (config.json parsing) are "
+                    "design-promised for this command but not implemented this slice - "
+                    "every scan walks the whole repository root with no narrowing or "
+                    "configuration overrides. This slice does not require the project root "
+                    "to already be initialized (`agenttalk init`) - it creates "
+                    ".agenttalk/comprehension/ under whatever root resolves either way.",
+    )
+    cscan.add_argument(
+        "--work-id",
+        # MICRO-ROUND 47c (reviewer part 3's own note-level find, DECLARE
+        # disposition): persisted VERBATIM into scan.json (correctly so -
+        # sanitizing would damage the very binding this value records),
+        # but nothing told the operator it lands in a durable artifact.
+        # Declared here, at the one surface an operator actually sees
+        # before typing it.
+        help="Work item ID bound to an attended --acknowledge-unignored-private-store run. "
+             "Persisted verbatim into scan.json - do not put paths or environment values here.")
+    cscan.add_argument(
+        "--acknowledge-unignored-private-store", action="store_true",
+        dest="acknowledge_unignored_private_store",
+        help="Attended override: proceed for one run even though the private "
+             "comprehension store is not proven VCS-ignored. Requires an interactive "
+             "terminal, explicit confirmation, and --work-id.")
+    cscan.add_argument(
+        "--recover-stale-lock", action="store_true",
+        # FIX ROUND 21b (reviewer-3's re-delta, MINOR 2, wrong-data): this
+        # text still described CR17-1's own overturned unconditional-
+        # clear behavior after the fix - stale documentation advertising
+        # the exact unsafe semantics that were just removed.
+        help="Attended override: refuses if the existing scan.lock's recorded owner is "
+             "provably still alive on this host; otherwise clears a dead or unverifiable "
+             "owner's lock (with an attended confirmation prompt for the unverifiable case) "
+             "before scanning.")
+    cscan.add_argument("--json", action="store_true", help="Emit the scan outcome as JSON.")
+    cscan.set_defaults(func=cmd_comprehension)
+
+    cstatus = compsub.add_parser(
+        "status", help="Show the latest (or one named) comprehension run's summary.")
+    cstatus.add_argument("--run", help="Show this scan_id instead of the latest.")
+    cstatus.add_argument("--json", action="store_true")
+    cstatus.set_defaults(func=cmd_comprehension)
+
+    creport = compsub.add_parser(
+        "report", help="Answer fixed single-run migration questions from one comprehension run.",
+        # MICRO-ROUND 28b (reviewer-3 delta on `02c6b30`, R5, OVERTURNED
+        # RATIONALE): dropping this as "redundant with round-26 F6" was
+        # wrong - F6 declares this fact on `scan --help` alone, which
+        # says nothing about `report` itself; the design doc is not the
+        # CLI surface a `--help` reader actually sees. Mirrors `scan`'s
+        # own description= precedent above.
+        description="Answer fixed single-run migration questions from one comprehension run. "
+                    "Human output prints the identical validated projection --json emits, "
+                    "byte-for-byte - a friendlier rendering is a later refinement, deliberately "
+                    "not built this slice.")
+    creport.add_argument("--run", help="Report on this scan_id instead of the latest.")
+    creport.add_argument("--unit", dest="unit_id", help="Filter to one unit ID.")
+    creport.add_argument("--feature", dest="feature_id", help="Filter to one feature ID.")
+    creport.add_argument(
+        "--readiness", dest="readiness_state",
+        help="Filter to units with this assessment_state.")
+    creport.add_argument(
+        "--dependencies", action="store_true", dest="dependencies_only",
+        help="Report only the dependency-edge view.")
+    creport.add_argument("--json", action="store_true", help="Emit the validated projection.")
+    creport.set_defaults(func=cmd_comprehension)
+
+    cvalidate = compsub.add_parser(
+        "validate", help="Perform full-run integrity validation for one comprehension run.")
+    cvalidate.add_argument("--run", help="Validate this scan_id instead of the latest.")
+    cvalidate.add_argument("--json", action="store_true")
+    cvalidate.set_defaults(func=cmd_comprehension)
+
+    cprune = compsub.add_parser(
+        "prune",
+        help="Reclaim only definitely abandoned, unpublished staging directories. "
+             "Never deletes runs or packs.")
+    cprune.add_argument(
+        "--staging", action="store_true",
+        help="Required: names what this command prunes (staging only, this slice).")
+    cprune.add_argument("--json", action="store_true")
+    cprune.set_defaults(func=cmd_comprehension)
 
     # ----- close (assurance P2 milestone/release close; advisory, opt-in) -----
     pclose = sub.add_parser(

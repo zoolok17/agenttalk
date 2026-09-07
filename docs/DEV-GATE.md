@@ -49,6 +49,12 @@ agenttalk dev-gate [--profile release]
   12-leg set can produce `complete: true`.
 - `--evidence` and `--temp-root` must resolve outside both the candidate worktree and `AGENTTALK_ROOT`. Defaults
   use the system temporary directory. Pytest basetemps are short children of that external run directory.
+- The same rule applies when running `pytest` directly (not via `agenttalk dev-gate`), e.g. for a targeted
+  `tests/test_comprehension_*.py` pass: pass `--basetemp` pointing OUTSIDE any Git worktree, never a path nested
+  inside one. Several comprehension-plane privacy tests require a genuine "no real Git repository present"
+  precondition (they assert refusal/behavior specific to the absence of `.git`) - a basetemp placed inside a
+  worktree puts every test's own temp directory underneath a real repository root instead, breaking that
+  precondition and producing false-red failures unrelated to the change under test.
 
 Exit status `0` means the requested scope passed. Status `1` means a complete execution produced blocking
 check evidence. Status `2` means a preflight, schema, binding, or invocation error blocked execution; when an

@@ -35,25 +35,31 @@ import contextlib
 import json
 import os
 import re
+import shutil
 import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .ceilings import enforce_artifact_ceilings, measure_staging_artifacts
-from .digests import canonical_content_digest
+from .digests import sha256_file
 from .envelope import (
     EnvelopeError,
+    path_is_reparse_point_or_symlink,
     read_json_document,
+    require_field,
     resolve_under_root,
     validate_envelope,
     validate_scan_id,
 )
-from .errors import ComprehensionError, StagingSourceEscapesRoot
+from .errors import ComprehensionError, StagingSourceEscapesRoot, VcsPrivacyRefused
 from .lock import ScanLockHandle, release_scan_lock
+from .paths import LOCK_FILENAME, RELATIVE_COMPREHENSION_DIR
 from .paths import index_path as _index_path
+from .paths import project_root_from_comprehension_dir
 from .paths import runs_dir as _runs_dir
 from .paths import staging_dir as _staging_dir
+from .privacy import PrivacyPreflightResult, verify_store_ignored
 from .staging import _OWNER_FILENAME, StagingHandle, _validate_owner_doc
 
 INDEX_SCHEMA_VERSION = 1
@@ -150,6 +156,20 @@ def rename_staging_to_run(
     RE-DERIVED from the ``owner.json`` actually on disk at that confined
     path (never from the handle's claimed fields) — all three raise
     :class:`~.errors.StagingSourceEscapesRoot`.
+
+    FIX ROUND 34 (reviewer-3's re-delta on round 33's own R1 fix - THE
+    HOLE): this function no longer takes a ``privacy_result`` or performs
+    any privacy check of its own. Round 33's own per-directory ground-
+    truth check (enumerate ``dst``'s real files, verify each) reached
+    everything renamed here, but publication's OTHER step
+    (:func:`publish_index_cas`, which writes ``index.json`` at the STORE
+    ROOT, never inside this directory) was outside its reach - the same
+    "forgot something" class as round 32's own sentinel defeats, a third
+    time. The privacy guarantee is now ONE store-wide check
+    (:func:`_verify_store_ignored_or_rollback`), run by :func:`publish_run`
+    ONLY after BOTH publish steps fully complete - see that function's own
+    docstring. No enumeration of any directory happens here or there
+    anymore; nothing to fall out of date.
     """
     if staging_handle.owner_token != lock_handle.owner_token:
         raise StagingOwnershipMismatch(
@@ -158,14 +178,34 @@ def rename_staging_to_run(
             "lock does not own")
     scan_id = validate_scan_id(staging_handle.scan_id)
     comprehension_dir = lock_handle.path.parent
-    staging_root = _staging_dir(comprehension_dir).resolve()
-    staging_path = Path(staging_handle.path).resolve()
+    # MICRO-ROUND 50 (Cluster 0, B1 BLOCKER): the OLD check resolved
+    # `staging_root` FIRST, exactly the vacuous-by-construction pattern
+    # fixed in envelope.resolve_under_root's own round-50 docstring - a
+    # reparse point placed AT `.staging/` itself (between staging
+    # creation and this publish step) would be baked into `staging_root`
+    # before the confinement comparison ever ran, so `relative_to` would
+    # trivially pass no matter where the reparse point actually
+    # redirects. Checked BEFORE resolving anything, same as that fix.
+    staging_root = _staging_dir(comprehension_dir)
+    if path_is_reparse_point_or_symlink(staging_root):
+        raise StagingSourceEscapesRoot(
+            f"{staging_root} is a symlink or a directory reparse point/junction - "
+            "refusing to rename a directory through it; remove the reparse point and "
+            "retry")
+    staging_path = Path(staging_handle.path)
+    if path_is_reparse_point_or_symlink(staging_path):
+        raise StagingSourceEscapesRoot(
+            f"staging_handle.path {staging_path} is itself a symlink or a directory "
+            "reparse point/junction - refusing to rename it; remove the reparse point "
+            "and retry")
+    resolved_staging_root = staging_root.resolve()
+    resolved_staging_path = staging_path.resolve()
     try:
-        staging_path.relative_to(staging_root)
+        resolved_staging_path.relative_to(resolved_staging_root)
     except ValueError as exc:
         raise StagingSourceEscapesRoot(
             f"staging_handle.path {staging_handle.path} does not resolve under "
-            f"{staging_root} — refusing to rename a directory outside .staging/"
+            f"{resolved_staging_root} — refusing to rename a directory outside .staging/"
         ) from exc
     expected_prefix = f"{scan_id}-"
     nonce = (
@@ -193,12 +233,14 @@ def rename_staging_to_run(
     dst.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if not _is_windows():
         os.rename(staging_handle.path, dst)
+        _strip_owner_file(dst)
         return dst
     deadline = time.monotonic() + _RENAME_RETRY_TIMEOUT_SECONDS
     delay = 0.01
     while True:
         try:
             os.rename(staging_handle.path, dst)
+            _strip_owner_file(dst)
             return dst
         except PermissionError as exc:
             if time.monotonic() >= deadline:
@@ -210,24 +252,59 @@ def rename_staging_to_run(
             delay = min(delay * 2, 0.25)
 
 
+def _strip_owner_file(run_dir: Path) -> None:
+    """M4 (cold-read, PR-B fix round 3): ``owner.json`` (host identity,
+    PID, and the lock's owner token) repeats the writer lock's own
+    identity so an abandoned ``.staging/`` directory can be reclaimed
+    (staging.py) - it is never scan CONTENT, and must not survive into
+    the published, immutable ``runs/<scan_id>/`` directory it just got
+    renamed into whole. Removing it here, immediately after the rename
+    succeeds, is the one place both the POSIX and Windows-retry paths
+    converge, so there is no second call site to keep in sync."""
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(run_dir / _OWNER_FILENAME)
+
+
 def read_current_index(comprehension_dir: Path) -> tuple[dict | None, str | None]:
-    """Returns ``(index_doc, content_digest)`` — ``(None, None)`` when no
-    index has ever been published yet. A caller captures the digest at lock
+    """Returns ``(index_doc, digest)`` — ``(None, None)`` when no index has
+    ever been published yet. A caller captures the digest at lock
     acquisition time as the CAS precondition for the publish that follows.
-    """
+
+    M6 (cold-read PR-B fix round 47): ``digest`` is an EXACT-BYTE digest of
+    ``index.json``'s own on-disk bytes (``digests.sha256_file``), never
+    ``canonical_content_digest`` — the CAS exists to detect ANY concurrent
+    modification to this file, but ``canonical_content_digest`` deliberately
+    strips ``GENERATION_IDENTITY_KEYS`` (which includes ``scan_id`` -
+    simultaneously the very field ``_build_successor_index`` uses to locate
+    a run's own entry). A concurrent writer that changed only a stripped
+    field (e.g. hand-edited ``scan_id`` on a stored run entry) would
+    silently pass the old, content-digest-based CAS check even though the
+    file's bytes genuinely differ - the anchor was strippable by an edit
+    the CAS exists to catch. ``canonical_content_digest`` itself is
+    unchanged and stays correct for its own content-equivalence callers
+    (scan.json's declared ``content_digest``, the per-artifact verification
+    in ``_verify_artifact_digests``/``_scan_json_anchor_state``) - none of
+    those compare across a read-modify-write gap the way this CAS does."""
     path = _index_path(comprehension_dir)
     if not path.exists():
         return None, None
     doc = read_json_document(path)
     validate_envelope(doc, artifact_type=INDEX_ARTIFACT_TYPE, schema_version=INDEX_SCHEMA_VERSION)
-    return doc, canonical_content_digest(doc)
+    return doc, sha256_file(path)
 
 
 def _build_successor_index(
     prior_doc: dict | None, *, scan_id: str, run_summary: dict,
     predecessor_digest: str | None, now: datetime | None,
 ) -> dict:
-    prior_runs = list(prior_doc["runs"]) if prior_doc else []
+    # MAJOR 2 (fifth cold read, fix round 8): the WRITE path is exposed
+    # to the exact same malformed-document risk every READ path already
+    # guards against - a prior index.json missing its own "runs" key
+    # (envelope-valid otherwise) raised an untyped KeyError here, in the
+    # middle of publishing a brand-new, otherwise-healthy scan, rather
+    # than the same typed refusal a malformed document gets everywhere
+    # else in this package.
+    prior_runs = list(require_field(prior_doc, "runs", doc_name="index.json")) if prior_doc else []
     runs = ([dict(run_summary)] + prior_runs)[:_INDEX_RUNS_MAX]
     return {
         "schema_version": INDEX_SCHEMA_VERSION,
@@ -311,6 +388,109 @@ def _replace_with_windows_retry(src: Path, dst: Path) -> None:
     os.replace(src, dst)
 
 
+def _read_index_bytes_if_exists(comprehension_dir: Path) -> bytes | None:
+    """FIX ROUND 34: captures ``index.json``'s exact PRE-write bytes
+    before :func:`publish_index_cas` overwrites it, so a later privacy
+    rollback can restore them byte-for-byte rather than reconstruct a
+    document. ``None`` means no index has ever been published yet (the
+    very first publish) — a rollback then DELETES the just-written index
+    rather than "restoring" a file that never existed."""
+    try:
+        return _index_path(comprehension_dir).read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def _restore_index_bytes(path: Path, content: bytes) -> None:
+    """FIX ROUND 34: writes ``content`` to a sibling temp file and swaps
+    it in atomically — the identical durable-write idiom
+    :func:`publish_index_cas` itself already uses, applied in reverse."""
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=".rollback.tmp", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        _replace_with_windows_retry(tmp_path, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp_path)
+        raise
+
+
+def _verify_store_ignored_or_rollback(
+    *, comprehension_dir: Path, run_dir: Path, privacy_result: PrivacyPreflightResult | None,
+    prior_index_bytes: bytes | None,
+) -> None:
+    """FIX ROUND 34 (reviewer-3's re-delta on round 33's own R1 fix - THE
+    HOLE): publication is TWO steps - :func:`rename_staging_to_run`
+    (``runs/<scan_id>/``) and :func:`publish_index_cas` (``index.json``,
+    at the STORE ROOT). Round 33's own ground-truth check only ever
+    enumerated the first step's own directory - ``index.json``, written
+    by the SECOND step, was never in that enumeration, covered only by
+    the demoted, one-time, pre-scan preflight. A mid-run ``.gitignore``
+    flip re-including ONLY ``index.json`` therefore leaked it while
+    ``runs/**`` stayed correctly refused - the mechanism worked
+    everywhere it reached; ``index.json`` sat outside its reach.
+
+    RETIRES THE CLASS (reviewer-3's own prescription, taken - the lean
+    fold): called ONCE, here in the orchestrator, after BOTH publish
+    steps above have fully completed - never a per-step check that some
+    future third publish step could just as easily fall outside of
+    again. Delegates to :func:`privacy.verify_store_ignored`, which asks
+    git about the WHOLE store directly (no enumeration of any directory,
+    by this function or that one) - covering ``index.json``, every
+    ``runs/<id>/`` artifact, and any file a future slice adds under this
+    same store, with nothing to remember to include.
+
+    On refusal: removes the just-published run directory (``run_dir``)
+    exactly as round 33's own rollback did, AND restores ``index.json``
+    to its exact pre-write bytes (``prior_index_bytes``, captured by the
+    caller BEFORE :func:`publish_index_cas` ran) - or, when this was the
+    very first publish ever (no prior index existed), removes the just-
+    written index.json entirely rather than "restoring" a file that
+    never existed. Neither rollback widens the exposure window: the run's
+    own content already sat in ``.staging/`` regardless of this check,
+    and the successor index was only ever swapped in by an atomic
+    replace - reversing that swap is the same class of operation, not a
+    new one.
+
+    Gated on the ``"ignored"`` disposition exactly as round 33's own
+    check was - an attended ``acknowledged_unignored``/``no_vcs_
+    acknowledged`` override already accepted this exact risk and must
+    never be re-refused here.
+
+    MICRO-ROUND 34b (reviewer-3's re-delta, declared): see
+    :func:`privacy.verify_store_ignored`'s own docstring for the
+    irreducible one-git-call-wide instant this call cannot see past."""
+    if privacy_result is None or privacy_result.vcs_privacy != "ignored":
+        return
+    root = project_root_from_comprehension_dir(comprehension_dir)
+    # FIX ROUND 35 (twenty-ninth cold read, F2 MAJOR part (b), JUDGE -
+    # taken): scan.lock is still on disk at this exact point (this
+    # function runs before publish_run's own `finally: release_scan_
+    # lock(...)`) - it is the scanner's own transient process-identity
+    # file, never client graph data, so it is excluded BY NAME from the
+    # stageability question - see verify_store_ignored's own docstring.
+    lock_relative_path = f"{RELATIVE_COMPREHENSION_DIR}/{LOCK_FILENAME}"
+    try:
+        verify_store_ignored(
+            root, RELATIVE_COMPREHENSION_DIR,
+            exclude_relative_paths=frozenset({lock_relative_path}),
+        )
+    except VcsPrivacyRefused:
+        shutil.rmtree(run_dir, ignore_errors=False)
+        index_path = _index_path(comprehension_dir)
+        if prior_index_bytes is None:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(index_path)
+        else:
+            _restore_index_bytes(index_path, prior_index_bytes)
+        raise
+
+
 def publish_run(
     *,
     staging_handle: StagingHandle,
@@ -319,6 +499,7 @@ def publish_run(
     predecessor_index_digest: str | None,
     now: datetime | None = None,
     record_counts: dict[str, int] | None = None,
+    privacy_result: PrivacyPreflightResult | None = None,
 ) -> dict:
     """The ordinary end-to-end orchestrator: enforce the durable-artifact
     ceilings, rename, CAS-write the index, then always release the lock —
@@ -345,6 +526,18 @@ def publish_run(
     ``ceilings.measure_staging_artifacts``), it does not count as 0
     records. The byte ceiling is always measured directly from disk
     regardless and can never be skipped this way.
+
+    ``privacy_result``: FIX ROUND 34 (reviewer-3's re-delta on round 33's
+    own R1 fix - THE HOLE) - no longer forwarded to
+    :func:`rename_staging_to_run` (which no longer takes one at all).
+    Instead, immediately after BOTH publish steps below fully complete,
+    :func:`_verify_store_ignored_or_rollback` asks git ONCE about the
+    WHOLE store (never an enumeration of either step's own directory,
+    which is exactly the class of gap that let ``index.json`` - written
+    by step 2, never step 1's own directory - escape round 33's own
+    per-directory check). On refusal, both the just-published run
+    directory AND the just-replaced ``index.json`` are rolled back before
+    the exception propagates.
     """
     try:
         if (
@@ -357,10 +550,17 @@ def publish_run(
         measurements = measure_staging_artifacts(
             staging_handle.path, record_counts=record_counts or {})
         enforce_artifact_ceilings(measurements)
-        rename_staging_to_run(staging_handle, lock_handle)
-        return publish_index_cas(
-            lock_handle.path.parent, scan_id=staging_handle.scan_id, run_summary=run_summary,
+        comprehension_dir = lock_handle.path.parent
+        run_dir = rename_staging_to_run(staging_handle, lock_handle)
+        prior_index_bytes = _read_index_bytes_if_exists(comprehension_dir)
+        index = publish_index_cas(
+            comprehension_dir, scan_id=staging_handle.scan_id, run_summary=run_summary,
             predecessor_index_digest=predecessor_index_digest, now=now,
         )
+        _verify_store_ignored_or_rollback(
+            comprehension_dir=comprehension_dir, run_dir=run_dir, privacy_result=privacy_result,
+            prior_index_bytes=prior_index_bytes,
+        )
+        return index
     finally:
         release_scan_lock(lock_handle)

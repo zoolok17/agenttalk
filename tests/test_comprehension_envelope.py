@@ -212,15 +212,23 @@ def test_resolve_under_root_rejects_a_path_that_escapes_via_symlink(tmp_path: Pa
         # unprivileged process can only create a symlink with Developer
         # Mode enabled (or SeCreateSymbolicLinkPrivilege granted) — without
         # it, symlink_to() raises OSError [WinError 1314] and this test
-        # SKIPS. The design lists symlink/root-escape as required increment-1
-        # evidence and treats Windows as a first-class platform, so on a
-        # default (non-Developer-Mode) Windows runner this specific evidence
-        # is UNVERIFIED, not merely "covered elsewhere" — a green run here
-        # does not by itself demonstrate this guard on Windows. Tracked as a
-        # fast-follow: run CI's Windows job with Developer Mode (or an
-        # elevated runner) so this executes instead of skipping.
+        # SKIPS. C-1 / #213 (PR-B fix round): conftest.py's session-scoped
+        # `_enable_windows_symlink_creation_without_elevation` fixture now
+        # enables Developer Mode on hosted Windows CI runners (which run
+        # elevated already), so this executes there instead of skipping.
+        # This branch only still fires on a genuinely non-elevated local
+        # dev machine, where that fixture's registry write itself fails
+        # silently and this remains a graceful local skip.
         pytest.skip("symlink creation is not permitted in this environment")
-    with pytest.raises(EnvelopeError, match="outside the project root"):
+    # MICRO-ROUND 50 (Cluster 0, B1 BLOCKER): resolve_under_root now walks
+    # every segment between `root` and the target BEFORE resolving
+    # anything (a reparse point AT `root` itself used to be resolved
+    # away first, making the old "outside the project root" comparison
+    # vacuous - see the function's own round-50 docstring) - this exact
+    # symlink-in-the-middle shape is now caught one step earlier, with a
+    # message naming the crossed reparse point/symlink directly rather
+    # than the post-hoc "resolves outside" conclusion.
+    with pytest.raises(EnvelopeError, match="reparse point/junction"):
         env.resolve_under_root("escape/x", root=root)
 
 
@@ -245,3 +253,44 @@ def test_find_case_fold_collisions_ignores_exact_duplicates() -> None:
     a record listed twice); this helper only reports a CASE-FOLD collision
     between two DISTINCT spellings."""
     assert env.find_case_fold_collisions(["src/Foo.java", "src/Foo.java"]) == []
+
+
+def test_find_case_fold_collisions_finds_an_nfc_nfd_normalization_variant_pair() -> None:
+    """FIX ROUND 36 (thirtieth cold read, F4 MAJOR, completeness, .cr30-
+    uni verbatim): a bare casefold() never normalizes composition - a
+    precomposed 'é' (U+00E9, NFC) and 'e' + a combining acute accent
+    (U+0065 U+0301, NFD) casefold to DIFFERENT strings even though they
+    render as the visually identical name, the exact ambiguity this
+    detector exists to catch (platform_identity's own unicode_
+    normalizing: false already admits both forms coexist). Unit-tested
+    directly against the detector, per the reader's own caveat: a real
+    filesystem's own case-fold/normalization behavior (NTFS especially)
+    is not something this test relies on or asserts about."""
+    import unicodedata
+
+    nfc = unicodedata.normalize("NFC", "src/Café.java")
+    nfd = unicodedata.normalize("NFD", "src/Café.java")
+    assert nfc != nfd  # the two spellings really are distinct code-point sequences
+    collisions = env.find_case_fold_collisions([nfc, nfd, "src/bar.java"])
+    assert collisions == [(nfc, nfd)]
+
+
+def test_find_case_fold_collisions_plain_ascii_control_is_unaffected() -> None:
+    """Companion control: an ordinary plain-ASCII case-fold collision
+    (no Unicode normalization variance involved at all) is unaffected by
+    the widened NFC-normalizing key."""
+    collisions = env.find_case_fold_collisions(["src/Foo.java", "src/foo.java"])
+    assert collisions == [("src/Foo.java", "src/foo.java")]
+
+
+def test_is_pure_case_fold_collision_distinguishes_the_two_causes() -> None:
+    """FIX ROUND 36 (F4 MAJOR): the per-pair cause check a caller needs
+    to publish a TRUTHFUL detail - "case-folds identically" is true for
+    an ordinary case-only pair, but FALSE for a pair that only collides
+    once Unicode-normalized (nothing differs by case at all)."""
+    import unicodedata
+
+    nfc = unicodedata.normalize("NFC", "Café.java")
+    nfd = unicodedata.normalize("NFD", "Café.java")
+    assert env.is_pure_case_fold_collision("Foo.java", "foo.java") is True
+    assert env.is_pure_case_fold_collision(nfc, nfd) is False

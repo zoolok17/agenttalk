@@ -31,6 +31,13 @@ jobs:
     env:
       PYTHONPATH: ${{ github.workspace }}/src
       PYTHONDONTWRITEBYTECODE: '1'
+      # C-1a (reviewer-3, PR-B delta review round 2): tests/conftest.py's
+      # Windows-symlink-devmode fixture requires this dedicated,
+      # repo-specific opt-in IN ADDITION to the CI/GITHUB_ACTIONS platform
+      # variables (which a local Actions emulator can also set) before it
+      # will mutate this runner's registry - set explicitly only here, the
+      # one job whose Windows leg needs those symlink tests to execute.
+      AGENTTALK_AUTHORIZE_SYMLINK_DEVMODE: ${{ matrix.os.id == 'windows' && '1' || '' }}
     # Per-OS ceiling: the two pytest runs (source + wheel) are each capped at
     # 2700s in dev-gate.json, so a single leg's pytest budget alone is 90 min.
     # The Windows runner's slow filesystem + costly process/venv creation push
