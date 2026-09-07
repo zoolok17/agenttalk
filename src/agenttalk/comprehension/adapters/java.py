@@ -6518,7 +6518,7 @@ def parse_maven_pom(
             return parent_group_id
         return value
 
-    edges = []
+    dependency_declarations: list[tuple[str, bool, str, int]] = []
     for match in _module_own_dependency_blocks(structural):
         # FIX ROUND 26 (twenty-second cold read, F2 BLOCKER, wrong-data):
         # every interior leaf search below now runs against
@@ -6601,14 +6601,120 @@ def parse_maven_pom(
             if scope_match is not None else None)
         scope = scope_decoded.strip().lower() if scope_decoded is not None else None
         phase = "test" if scope == "test" else "build"
-        edges.append(JavaEdgeClaim(
-            from_qualified_name=from_name, relation="build",
-            target=f"{group_id}:{artifact_id}",
-            target_kind="internal_pom_coordinate_or_external",
-            evidence_class="declared", line=_line_at(newline_offsets, match.start()), phase=phase,
-            optional=optional,
+        dependency_declarations.append((
+            f"{group_id}:{artifact_id}", optional, phase,
+            _line_at(newline_offsets, match.start()),
         ))
+    # MICRO-NOD 50b (F8 MAJOR, reviewer-3's own B15 flip - "fix, not
+    # reword"): two module-own <dependency> blocks may declare the
+    # IDENTICAL coordinate with DISAGREEING <optional>/<scope> metadata -
+    # a real, Maven-3.9.11-buildable (warning only, never a build
+    # failure) pom shape, not a hypothetical. `edge_id` (digests.py) does
+    # not hash `optional` at all, so a disagreeing-<optional> pair
+    # collided by construction and silently coalesced to whichever
+    # declaration's own value happened to survive _coalesce_by_edge_id's
+    # first-seen merge, no record; `edge_id` DOES hash `phase`, so a
+    # disagreeing-<scope> pair never collided at all - TWO edges
+    # published (test AND build), each looking like an independently
+    # real dependency, when the pom actually contains ONE ambiguous,
+    # disagreeing declaration. Grouping by coordinate here, before any
+    # edge is built, closes BOTH shapes uniformly: a genuinely repeated,
+    # BYTE-IDENTICAL declaration (same optional AND same phase) still
+    # coalesces exactly as before (the established, judged never-
+    # overstate-a-repeated-fact rule - real edge_id collision downstream,
+    # unchanged); a DISAGREEING pair publishes exactly ONE edge - the
+    # first declaration's own values, not a guess at which one Maven
+    # would "really" resolve to, just never TWO edges asserting two
+    # independently-real relationships that do not both exist (this
+    # producer's own explicit design line: "never invent an internal
+    # target/edge because it looks plausible"). See
+    # pom_duplicate_dependency_conflicts's own docstring for the paired
+    # problem record this producer publishes alongside, naming every
+    # disagreeing claim - a conflict is always DECLARED here, never
+    # silently resolved either way.
+    declarations_by_target: dict[str, list[tuple[bool, str, int]]] = {}
+    for target, optional, phase, line in dependency_declarations:
+        declarations_by_target.setdefault(target, []).append((optional, phase, line))
+    edges: list[JavaEdgeClaim] = []
+    for target, declarations in declarations_by_target.items():
+        distinct = {(optional, phase) for optional, phase, _line in declarations}
+        emit = declarations[:1] if len(distinct) > 1 else declarations
+        for optional, phase, line in emit:
+            edges.append(JavaEdgeClaim(
+                from_qualified_name=from_name, relation="build", target=target,
+                target_kind="internal_pom_coordinate_or_external",
+                evidence_class="declared", line=line, phase=phase, optional=optional,
+            ))
     return units, edges, _count_profile_scoped_dependencies(structural)
+
+
+def pom_duplicate_dependency_conflicts(text: str) -> list[JavaAdapterProblem]:
+    """MICRO-NOD 50b (F8 MAJOR, reviewer-3's own B15 flip): the paired
+    problem record for the disagreeing-duplicate coordinate shape
+    ``parse_maven_pom`` itself now suppresses down to one edge for (see
+    that function's own docstring immediately above its own coordinate-
+    grouping loop) - a SEPARATE, additive call, the same established
+    pattern ``pom_dependency_decode_problems``/``declared_reactor_
+    module_paths`` already use rather than growing ``parse_maven_pom``'s
+    own fixed return arity (28+ existing call sites already unpack it
+    positionally).
+
+    Returns one :class:`JavaAdapterProblem` per module-own coordinate
+    declared 2+ times with DISAGREEING ``<optional>``/``<scope>``
+    metadata - never for a genuinely repeated, byte-identical
+    declaration (that stays silent, the established never-overstate-a-
+    repeated-fact rule ``parse_maven_pom`` already applies elsewhere).
+    Named, not silently resolved: a reader of this problem sees BOTH
+    disagreeing claims, in declaration order, rather than only the one
+    ``parse_maven_pom`` happened to keep as its own published edge."""
+    sanitized, structural = _split_xml_comments_and_cdata(text)
+    declarations: list[tuple[str, bool, str]] = []
+    for match in _module_own_dependency_blocks(structural):
+        block_sanitized = _body_text(sanitized, match)
+        block_structural = _body_text(structural, match)
+        block_text = _body_text(text, match)
+        group_match = _direct_child_leaf_match(_DEPENDENCY_GROUP_ID_RE, block_structural)
+        artifact_match = _direct_child_leaf_match(_DEPENDENCY_ARTIFACT_ID_RE, block_structural)
+        if group_match is None or artifact_match is None:
+            continue
+        group_decoded = _decode_xml_leaf(
+            _body_text(block_sanitized, group_match), _body_text(block_text, group_match))
+        artifact_decoded = _decode_xml_leaf(
+            _body_text(block_sanitized, artifact_match), _body_text(block_text, artifact_match))
+        if _is_blank_identity(group_decoded) or _is_blank_identity(artifact_decoded):
+            continue
+        optional_match = _DEPENDENCY_OPTIONAL_RE.search(block_structural)
+        optional_decoded = (
+            _decode_xml_leaf(
+                _body_text(block_sanitized, optional_match), _body_text(block_text, optional_match))
+            if optional_match is not None else None)
+        optional = optional_decoded is not None and optional_decoded.strip().lower() == "true"
+        scope_match = _DEPENDENCY_SCOPE_RE.search(block_structural)
+        scope_decoded = (
+            _decode_xml_leaf(
+                _body_text(block_sanitized, scope_match), _body_text(block_text, scope_match))
+            if scope_match is not None else None)
+        scope = scope_decoded.strip().lower() if scope_decoded is not None else None
+        phase = "test" if scope == "test" else "build"
+        declarations.append((f"{group_decoded.strip()}:{artifact_decoded.strip()}", optional, phase))
+    declarations_by_target: dict[str, list[tuple[bool, str]]] = {}
+    for target, optional, phase in declarations:
+        declarations_by_target.setdefault(target, []).append((optional, phase))
+    problems: list[JavaAdapterProblem] = []
+    for target, claims in declarations_by_target.items():
+        if len(set(claims)) <= 1:
+            continue
+        claim_labels = ", ".join(f"optional={o}/scope={p}" for o, p in claims)
+        problems.append(JavaAdapterProblem(
+            reason_code="duplicate_dependency_coordinate",
+            detail=bounded_detail(
+                f"the module-own coordinate {target} is declared {len(claims)} times with "
+                f"disagreeing <optional>/<scope> metadata ({claim_labels}) - a real Maven pom "
+                "shape (a build warns, never fails); only the first declaration's own values "
+                "are published as the one edge, this problem names every disagreeing claim"),
+            qualified_name=target,
+        ))
+    return problems
 
 
 #: FIX ROUND 15 (eleventh cold read, F1 MAJOR, wrong-data): a single

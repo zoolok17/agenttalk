@@ -9938,6 +9938,47 @@ def test_run_scan_a_pom_with_an_unrecoverable_own_coordinate_poisons_externality
     assert build_edge.get("target_external") is None
 
 
+def test_run_scan_a_pom_with_disagreeing_duplicate_dependency_metadata_publishes_one_edge_and_a_conflict(
+    java_repo: Path,
+) -> None:
+    """MICRO-NOD 50b (F8 MAJOR, reviewer-3's own B15 flip, reproduced
+    verbatim, end to end): two module-own <dependency> blocks declaring
+    the identical coordinate with disagreeing <scope> used to publish
+    TWO edges (test and build), each looking like an independently real
+    dependency, with no record of the disagreement - a real, Maven-
+    3.9.11-buildable (warning only) pom shape. Exactly one edge now
+    publishes, paired with a named, degrading conflict problem."""
+    import json
+
+    (java_repo / "pom.xml").write_text(
+        "<project><groupId>com.acme</groupId><artifactId>root</artifactId>"
+        "<dependencies>"
+        "<dependency><groupId>org.acme</groupId><artifactId>lib</artifactId>"
+        "<scope>test</scope></dependency>"
+        "<dependency><groupId>org.acme</groupId><artifactId>lib</artifactId>"
+        "</dependency>"
+        "</dependencies></project>",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    lib_edges = [
+        e for e in dependencies_doc["edges"]
+        if e["relation"] == "build"
+        and (e.get("target_external") == "org.acme:lib" or e.get("target_unresolved") == "org.acme:lib")
+    ]
+    assert len(lib_edges) == 1
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    conflict_problems = [
+        p for p in problems_doc["problems"] if p["reason_code"] == "duplicate_dependency_coordinate"]
+    assert len(conflict_problems) == 1
+    assert conflict_problems[0]["path"] == "pom.xml"
+
+
 def test_run_scan_two_undecodable_coordinates_in_one_pom_get_distinct_suppression_ids(
     java_repo: Path,
 ) -> None:

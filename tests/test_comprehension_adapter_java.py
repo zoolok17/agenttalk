@@ -4920,6 +4920,79 @@ def test_parse_maven_pom_dependency_with_an_attribute_on_its_own_tag():
     assert {e.target for e in edges} == {"org.springframework:spring-core"}
 
 
+def test_a_duplicate_dependency_coordinate_with_disagreeing_optional_publishes_one_edge_and_a_conflict():
+    """MICRO-NOD 50b (F8 MAJOR, reviewer-3's own B15 flip, reproduced
+    verbatim): two module-own <dependency> blocks declare the IDENTICAL
+    coordinate with DISAGREEING <optional> - a real, Maven-3.9.11-
+    buildable (warning only) pom shape. edge_id does not hash `optional`
+    at all, so this used to collide by construction and silently
+    coalesce to whichever declaration's own value happened to survive
+    the first-seen merge, with no record of the disagreement. Exactly
+    ONE edge now publishes (never a silent guess at which is "right",
+    never two), paired with a named conflict record listing both
+    claims."""
+    pom = """<project>
+  <dependencies>
+    <dependency><groupId>org.acme</groupId><artifactId>lib</artifactId><optional>true</optional></dependency>
+    <dependency><groupId>org.acme</groupId><artifactId>lib</artifactId><optional>false</optional></dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert len(edges) == 1
+    assert edges[0].target == "org.acme:lib"
+
+    problems = java.pom_duplicate_dependency_conflicts(pom)
+    assert len(problems) == 1
+    assert problems[0].reason_code == "duplicate_dependency_coordinate"
+    assert problems[0].qualified_name == "org.acme:lib"
+
+
+def test_a_duplicate_dependency_coordinate_with_disagreeing_scope_publishes_one_edge_not_two():
+    """MICRO-NOD 50b (F8 MAJOR, reviewer-3's own B15 flip, reproduced
+    verbatim): the reader's own OTHER shape - disagreeing <scope>
+    (test vs build) changes `phase`, which edge_id DOES hash, so the two
+    declarations never collided at all: TWO edges published (test AND
+    build), each looking like an independently real dependency, when the
+    pom actually contains one ambiguous, disagreeing declaration. Must
+    publish exactly ONE edge, paired with the same named conflict."""
+    pom = """<project>
+  <dependencies>
+    <dependency><groupId>org.acme</groupId><artifactId>lib</artifactId><scope>test</scope></dependency>
+    <dependency><groupId>org.acme</groupId><artifactId>lib</artifactId></dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert len(edges) == 1
+    assert edges[0].target == "org.acme:lib"
+
+    problems = java.pom_duplicate_dependency_conflicts(pom)
+    assert len(problems) == 1
+    assert problems[0].reason_code == "duplicate_dependency_coordinate"
+
+
+def test_a_byte_identical_duplicate_dependency_coordinate_still_coalesces_silently():
+    """MICRO-NOD 50b (F8 MAJOR, control): a genuinely repeated, BYTE-
+    IDENTICAL declaration (same optional, same scope) is not a conflict
+    at all - the established never-overstate-a-repeated-fact rule still
+    applies, no problem published, and the two edges still coalesce
+    downstream via the identical edge_id exactly as before this fix."""
+    pom = """<project>
+  <dependencies>
+    <dependency><groupId>org.acme</groupId><artifactId>lib</artifactId></dependency>
+    <dependency><groupId>org.acme</groupId><artifactId>lib</artifactId></dependency>
+  </dependencies>
+</project>
+"""
+    _units, edges, _profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.acme:lib"}
+    assert len(edges) == 2
+    assert all(e.optional is False and e.phase == "build" for e in edges)
+
+    assert java.pom_duplicate_dependency_conflicts(pom) == []
+
+
 def test_web_xml_url_pattern_cdata_and_entity_decoding():
     """FIX ROUND 23 (F1(d) + F2 MAJOR, wrong-data): a CDATA-wrapped
     <url-pattern> published nothing at all (F1(d)); an XML entity

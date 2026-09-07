@@ -848,6 +848,15 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                 # pom_own_coordinate_decode_problems's own docstring.
                 undecodable_own_coordinate_lines = (
                     java_adapter.pom_own_coordinate_decode_problems(text))
+                # MICRO-NOD 50b (F8 MAJOR): same reasoning, same
+                # established pattern - a module-own coordinate declared
+                # twice with disagreeing <optional>/<scope> metadata used
+                # to silently coalesce (or silently double-publish) with
+                # no record; parse_maven_pom's own edges are now
+                # suppressed to one per disagreeing coordinate, and this
+                # separate call names the conflict.
+                duplicate_dependency_conflicts = (
+                    java_adapter.pom_duplicate_dependency_conflicts(text))
             except Exception as exc:  # noqa: BLE001 - a producer bug must degrade, never abort the scan
                 problems.append(WorkerProblem(
                     reason_code="parse_failed", relative_path=rel,
@@ -928,6 +937,17 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                                "contains XML constructs this producer does not decode - "
                                "this pom's own coordinate is treated as absent rather than "
                                "published with a guessed value",
+                    ))
+                # MICRO-NOD 50b (F8 MAJOR, reviewer-3's own B15 flip): a
+                # module-own coordinate declared twice with disagreeing
+                # <optional>/<scope> metadata - see pom_duplicate_
+                # dependency_conflicts's own docstring for why exactly one
+                # edge (never zero, never both) is the honest published
+                # form; this is the paired, named problem record.
+                for adapter_problem in duplicate_dependency_conflicts:
+                    problems.append(WorkerProblem(
+                        reason_code=adapter_problem.reason_code, relative_path=rel,
+                        detail=adapter_problem.detail, qualified_name=adapter_problem.qualified_name,
                     ))
         elif rel_name_lower == "web.xml" and (
             Path(rel).parent.name.lower() != "web-inf"

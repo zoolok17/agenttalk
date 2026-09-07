@@ -218,6 +218,12 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     # descriptor file, never a cross-file FQN collision) but the same
     # "recorded, degrading" bucket.
     "duplicate_descriptor_name": "warning",
+    # MICRO-NOD 50b (F8 MAJOR, reviewer-3's own B15 flip): a pom's own
+    # module-level <dependency> coordinate declared 2+ times with
+    # disagreeing <optional>/<scope> metadata - a real, Maven-buildable
+    # (warning only) pom shape; recorded, degrading, the same bucket
+    # every other duplicate-declaration reason code above already uses.
+    "duplicate_dependency_coordinate": "warning",
     # FIX ROUND 29 (twenty-fifth cold read, F9c JUDGE): a web.xml
     # <servlet-mapping>/<filter-mapping> naming a servlet-name/
     # filter-name that NO <servlet>/<filter> element declares at all -
