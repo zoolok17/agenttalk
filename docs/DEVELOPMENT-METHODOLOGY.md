@@ -115,10 +115,16 @@ reliable as any other untested assumption — which is to say, not reliable at a
 and a test suite that only ever gets easier to pass, never proven to actually
 discriminate correct from incorrect behavior, degrades into decoration.
 
-*(A concrete instance of this project's own carry ledger — the running record of every
-known limitation, when it was raised, and its current disposition — lives in a plain
-tracked file with a fixed schema: what, why, where, current status. Auditors can read
-it directly rather than reconstructing it from commit messages.)*
+*(This project does not yet have a single, standing, project-wide carry ledger file —
+that remains an open item, not a shipped mechanism. What exists today is a worked,
+PR-scoped instance of the same idea: `docs/COMPREHENSION-LIMITATIONS.md`, a limitations
+register a specific change's own close-out committed, with a fixed per-row schema
+(limit, honest behavior when hit, locking test, and — specific to that register — a
+migration-retirement column) and every row triaged by the direction its error could
+take, see §8 below. Auditors can read it directly. Promoting this pattern from
+"one PR's own close-out artifact" to "the project's standing, continuously-renewed
+ledger §9 describes" is itself a named, open gap — not one this aside is entitled to
+claim closed.)*
 
 ---
 
@@ -185,7 +191,80 @@ assumption this document is entitled to make on the record's behalf.
 
 ---
 
-## 7. The carry ledger
+## 7. Confirmation is not a gate
+
+Design review, cold reads, ratification passes, and any automated reviewer's comments
+are **confirmation**: evidence that informs a merge decision. Only the automated,
+fail-closed pipeline (§10) is the **gate**: the mechanism with actual authority to
+block a merge. The two are not interchangeable, in either direction:
+
+- A change can accumulate extensive, positive confirmation — many rounds of review, a
+  large volume of automated-reviewer comments, several independent cold reads finding
+  nothing new — and still be correctly held by the gate over something none of that
+  confirmation activity happened to probe. Volume of confirmation is not itself
+  evidence of the gate's outcome.
+- A gate passing does not retroactively upgrade a claim that confirmation never
+  independently checked. "CI is green" answers "did the automated checks the team
+  already thought to write all pass," not "has every claim this change makes been
+  verified" — those are different questions, and only the second one is what a
+  cold read or ratification pass exists to answer.
+
+A concrete instance of the first case: PR #132's own review record includes a named,
+automated reviewer's 223-comment sweep (a large confirmation signal) *and* a separate
+sequence of unbriefed cold reads reaching at least a 44th round — two independent
+confirmation channels, neither one the gate itself, both feeding findings into fix
+rounds that the gate then re-checked (see
+[`docs/verification/PR-132-dossier.md`](verification/PR-132-dossier.md) §4).
+
+**Why:** conflating "reviewed a lot" with "gated" is exactly how a change that got
+plenty of attention still ships a defect nobody's automated check was looking for — the
+volume of confirmation activity is not a proxy for gate coverage, and treating it as
+one lets a heavily-discussed change skip the one check that actually has the authority
+to say no.
+
+---
+
+## 8. Direction-of-error triage
+
+Not every finding that describes a real gap deserves the same response. Before a
+finding is dispositioned (fixed now, registered as a residual, or dismissed), it is
+triaged by **the direction its error takes if it fires**:
+
+- **Wrong-data-capable** — the system could publish, assert, or act on something false
+  *with the same confidence as something true*, and a consumer has no way to tell the
+  difference from the output alone. This direction is never merely registered: per §5,
+  any confirmed instance blocks the merge, regardless of how narrow or rare its trigger
+  is, because a wrong-but-confident answer is worse than a system that visibly refuses.
+- **Safe-direction** — the worst case is a miss, a refusal, an "unknown," or an
+  under-report — the system can fail to say something true, or decline to answer, but
+  it cannot assert something false as if it were confirmed. This direction is eligible
+  to be accepted as a declared, registered residual (§9) rather than fixed immediately,
+  because a consumer who gets nothing is not a consumer who was misled.
+- **Cosmetic / polish** — no data-correctness consequence either direction (naming,
+  display formatting, cost/ordering). Registered for completeness, never blocking.
+
+Classification is by the *mechanism*, not by a guess at how likely the trigger is: a
+finding that requires a contrived, adversarial input to fire is still wrong-data-capable
+(and still blocks) if that is the direction its error takes when it does fire; a finding
+that is common but can only ever produce a safe miss is still eligible to be a
+registered residual. Likelihood informs priority; it does not change the bucket.
+
+A concrete, worked instance of this triage at scale: PR #132's own 223-comment sweep
+sorted 31 distinct findings into exactly these three buckets (3 wrong-data-capable, all
+three fixed before merge; 20 safe-direction, registered; 8 cosmetic, registered) — see
+[`docs/COMPREHENSION-LIMITATIONS.md`](COMPREHENSION-LIMITATIONS.md) for the full,
+per-finding triage with its reasoning shown for each row, not just its bucket.
+
+**Why:** treating every finding as equally mergeable-or-not either blocks on things
+that can never actually mislead anyone (wasting the scarce attention a real
+wrong-data risk needs), or — the more dangerous failure — lets a low-severity-looking
+finding through without noticing it sits in the one direction that must never ship,
+because severity and direction are different axes and a triage that only tracks
+severity conflates them.
+
+---
+
+## 9. The carry ledger
 
 Every known limitation — something the team knows is imperfect, deferred, or
 explicitly out of scope for now — is named in one place, with what it is, why it
@@ -204,7 +283,7 @@ described at its original, smaller severity).
 
 ---
 
-## 8. Continuous integration as the gate
+## 10. Continuous integration as the gate
 
 The single authority for "this change is safe to merge" is a machine-run, fail-closed
 pipeline — never a person's local run, and never a person's assertion that they ran
@@ -218,7 +297,7 @@ something. The pipeline:
   every change, with the target that every one of them **votes** on the merge
   decision rather than merely logging a finding for someone to read later. Where a
   scanner was adopted before that wiring was complete, any of its findings that do
-  not yet gate the merge are named as an open carry-ledger item (§7) with an owner
+  not yet gate the merge are named as an open carry-ledger item (§9) with an owner
   and a target date — never silently treated as passing just because the job's exit
   code was green;
 - has no local escape hatch: a check that can be skipped with a flag is not a gate,
@@ -240,7 +319,7 @@ exactly where regressions that "worked on my machine" live.
 
 ---
 
-## 9. The release ritual
+## 11. The release ritual
 
 Shipping is a deliberate act with its own checklist, not something that happens because
 the gate went green:
@@ -265,7 +344,7 @@ done, is what keeps that asymmetry from being exploited by rushing the last step
 
 ---
 
-## 10. What this methodology assumes, and what it costs
+## 12. What this methodology assumes, and what it costs
 
 None of the above is free. A design panel costs reviewer-time before a single line of
 code exists. Unbriefed cold reads cost the time of someone re-deriving context that
@@ -279,8 +358,10 @@ could have caught it here.
 A third-party auditor should expect to find: a written design contract for anything
 non-trivial; a recorded tier and ratifier for that contract; at least one independent,
 unbriefed review on the exact shipped revision for product-facing change, with
-positively-verified findings; a second reviewer's ratification of judgment calls; a
-carry ledger with re-measured (not merely repeated) entries; a gate that is a machine
-decision, not a person's word; and a release record that names its own evidence. Where
-any of those is missing for a specific change, that is itself a finding, not a reason
-to lower the bar for the next one.
+positively-verified findings; a second reviewer's ratification of judgment calls;
+every open finding triaged by the direction its error takes, with any
+wrong-data-capable one fixed rather than merely registered; a carry ledger with
+re-measured (not merely repeated) entries; a gate that is a machine decision, not a
+person's word or a volume of confirmation activity; and a release record that names
+its own evidence. Where any of those is missing for a specific change, that is itself
+a finding, not a reason to lower the bar for the next one.
