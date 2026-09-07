@@ -1560,6 +1560,18 @@ class JavaFileResult:
     #: this cross-file join needs).
     web_servlet_declared_names: dict[str, str] = field(default_factory=dict)
     web_filter_declared_names: dict[str, str] = field(default_factory=dict)
+    #: MICRO-NOD 50b (F6 BLOCKER, cross-vendor read, wrong-data): this
+    #: FILE's own real, declared package (``_PACKAGE_RE``'s own match,
+    #: ``None`` for the default package) - the one and only correct
+    #: source for a same-package-sibling resolution rung. Before this,
+    #: dependencies_artifact.py derived "package" by rsplitting an
+    #: EDGE's own (possibly nested) ``from_qualified_name`` on its last
+    #: dot, which is only ever correct for a TOP-LEVEL declaring type;
+    #: for a nested one, the result is that type's own immediate
+    #: ENCLOSING type's qualified name, not a package at all - see the
+    #: real bug that fabricated string caused, at the call site in
+    #: dependencies_artifact.py.
+    package: str | None = None
 
 
 def _find_unescaped_text_block_delimiter(text: str, start: int) -> int:
@@ -5218,11 +5230,12 @@ def parse_java_source(
         # published artifacts. The suppression lives here, at the one
         # place this function actually returns its result, not as a
         # filter a future caller could forget to apply.
-        return JavaFileResult(units=[], edges=[], entry_points=[], problems=[])
+        return JavaFileResult(units=[], edges=[], entry_points=[], problems=[], package=package)
     return JavaFileResult(
         units=units, edges=edges, entry_points=entry_points, problems=problems,
         web_servlet_declared_names=web_servlet_declared_names,
         web_filter_declared_names=web_filter_declared_names,
+        package=package,
     )
 
 
@@ -8167,6 +8180,7 @@ def file_result_to_json(result: JavaFileResult) -> dict[str, Any]:
         ],
         "web_servlet_declared_names": dict(result.web_servlet_declared_names),
         "web_filter_declared_names": dict(result.web_filter_declared_names),
+        "package": result.package,
     }
 
 
@@ -8183,4 +8197,5 @@ def file_result_from_json(payload: dict[str, Any]) -> JavaFileResult:
         ],
         web_servlet_declared_names=dict(payload.get("web_servlet_declared_names", {})),
         web_filter_declared_names=dict(payload.get("web_filter_declared_names", {})),
+        package=payload.get("package"),
     )

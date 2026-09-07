@@ -2518,6 +2518,94 @@ def test_run_scan_a_same_package_different_file_string_shadow_suppresses_the_bar
     assert other_file_launcher["unit_id"] not in _cli_main_owning_unit_ids(outcome, java_repo)
 
 
+def test_run_scan_a_nested_types_inherit_edge_never_resolves_to_an_unrelated_files_sibling(
+    java_repo: Path,
+) -> None:
+    """MICRO-NOD 50b (F6 BLOCKER, cross-vendor read, wrong-data,
+    reproduced verbatim): the same-package-sibling resolution rung used
+    to derive "package" by rsplitting the EDGE's own from_qualified_name
+    on its last dot - correct only for a TOP-LEVEL declaring type, but
+    for a NESTED one (qualified_name dot-joined the identical way as a
+    package) it fabricated the enclosing TYPE's own qualified name as if
+    it were a real package. Reproduced: a src/main class nested three
+    deep references a bare name genuinely undeclared anywhere in that
+    file; a src/test copy of the SAME top-level class name (a real,
+    already-anticipated duplicate-qualified-name shape) happens to
+    declare a real, identically-nested, but semantically UNRELATED
+    sibling of that same name - the fabricated "package" string
+    collided with it, publishing a confident but WRONG resolution to
+    the unrelated test-tree class. Must publish an honest unresolved
+    instead."""
+    (java_repo / "src" / "main" / "java" / "p" / "Outer.java").write_text(
+        "package p;\n"
+        "class Outer {\n"
+        "  class Middle {\n"
+        "    class Sub extends Helper {\n"
+        "    }\n"
+        "  }\n"
+        "}\n", encoding="utf-8")
+    test_dir = java_repo / "src" / "test" / "java" / "p"
+    test_dir.mkdir(parents=True)
+    (test_dir / "Outer.java").write_text(
+        "package p;\n"
+        "class Outer {\n"
+        "  class Middle {\n"
+        "    class Helper {\n"
+        "    }\n"
+        "  }\n"
+        "}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    import json
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    sub_unit = next(
+        u for u in modules_doc["units"] if u["qualified_name"] == "p.Outer.Middle.Sub")
+    inherit_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "inherit" and r["from_unit_id"] == sub_unit["unit_id"]
+    )
+    assert inherit_edge["resolution_state"] == "unresolved"
+    assert inherit_edge["target_unresolved"] == "Helper"
+
+
+def test_run_scan_a_nested_types_inherit_edge_still_resolves_a_genuine_top_level_sibling(
+    java_repo: Path,
+) -> None:
+    """MICRO-NOD 50b (F6 BLOCKER, regression control - the rung this fix
+    must keep working): a type nested three deep referencing a bare name
+    that genuinely IS a real, same-package TOP-LEVEL sibling (declared in
+    a different file) must still resolve via the package-sibling rung -
+    proving the fix uses the file's own REAL package, not merely that it
+    stops the wrong match above."""
+    (java_repo / "src" / "main" / "java" / "p" / "Outer2.java").write_text(
+        "package p;\n"
+        "class Outer2 {\n"
+        "  class Middle {\n"
+        "    class Sub extends TopSibling {\n"
+        "    }\n"
+        "  }\n"
+        "}\n", encoding="utf-8")
+    (java_repo / "src" / "main" / "java" / "p" / "TopSibling.java").write_text(
+        "package p;\nclass TopSibling {\n}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    import json
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    units_by_qn = {u["qualified_name"]: u for u in modules_doc["units"]}
+    sub_unit = units_by_qn["p.Outer2.Middle.Sub"]
+    top_sibling_unit = units_by_qn["p.TopSibling"]
+    inherit_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "inherit" and r["from_unit_id"] == sub_unit["unit_id"]
+    )
+    assert inherit_edge["resolution_state"] == "resolved"
+    assert inherit_edge["target_unit_id"] == top_sibling_unit["unit_id"]
+
+
 def test_run_scan_a_real_junit_test_calling_the_target_reports_test_evidence_located_satisfied(
     java_repo: Path,
 ) -> None:

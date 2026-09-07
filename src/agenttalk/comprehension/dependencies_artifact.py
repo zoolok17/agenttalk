@@ -1054,10 +1054,26 @@ def build_dependencies(
                 by_qualified_name.get(edge.from_qualified_name)
                 or file_unit_id_by_path[path]
             )
-            package = (
-                edge.from_qualified_name.rsplit(".", 1)[0]
-                if "." in edge.from_qualified_name else None
-            )
+            # MICRO-NOD 50b (F6 BLOCKER, cross-vendor read, wrong-data):
+            # this used to rsplit the EDGE's own from_qualified_name on
+            # its last dot - correct only for a top-level declaring type
+            # (qualified_name = package + "." + simple_name), but for a
+            # NESTED type (qualified_name = enclosing.qualified_name +
+            # "." + simple_name, dot-joined the identical way) it silently
+            # fabricated the enclosing TYPE's own qualified name as if it
+            # were a package. Reproduced: a src/main class nested three
+            # deep, referencing a bare name genuinely undeclared in that
+            # file, resolved with confidence "medium" to an UNRELATED
+            # src/test class's own identically-nested sibling - two
+            # separate files' own top-level types sharing one duplicate
+            # name (already a real, anticipated shape elsewhere in this
+            # module) made the fabricated "package.candidate" string
+            # collide with a REAL, different unit. `result.package` is
+            # this FILE's own actual declared package (or None for the
+            # default package) - correct for every edge in the file,
+            # nested or not, never derived by guessing from a single
+            # qualified name's own dot count.
+            package = result.package
             record = _edge_claim_to_record(
                 edge, from_unit_id=from_unit_id, source_digest=source_digest,
                 by_qualified_name=by_qualified_name, by_simple_name=by_simple_name,
