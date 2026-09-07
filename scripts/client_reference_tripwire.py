@@ -137,6 +137,22 @@ def _is_word_char(ch: str) -> bool:
     return ch.isalnum()
 
 
+def _read_text_or_none(path: Path) -> str | None:
+    """Read `path` as STRICT UTF-8 text, or None if it isn't decodable as
+    such (a binary asset - PNG, PDF, etc). Deliberately never falls back to
+    `errors="replace"`: replacement characters turn arbitrary binary noise
+    into pseudo-text, which is both a meaningless scan target (a hit inside
+    an image is not a real finding) and a genuine correctness hazard - a
+    stray byte sequence can decode into a Unicode character that changes
+    length under `.lower()` (e.g. U+0130), which `find_hits`' offset math
+    assumes never happens for the text it is given. Binary tracked assets
+    are simply out of scope for a text-content tripwire."""
+    try:
+        return path.read_text(encoding="utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return None
+
+
 def find_hits(text: str, config: TripwireConfig, salt: bytes) -> list[Hit]:
     """Scan `text` for any substring whose salted hash is in the denylist.
 
@@ -154,7 +170,10 @@ def find_hits(text: str, config: TripwireConfig, salt: bytes) -> list[Hit]:
 
     Line/column are 1-based, computed on the ORIGINAL (not lowercased) text
     so a report can point a human at the exact spot without this function
-    ever needing to hand back the matched substring itself.
+    ever needing to hand back the matched substring itself. (A handful of
+    Unicode characters change length under .lower(), which can shift a
+    reported line/column slightly for text located after one - a cosmetic
+    imprecision only; it never affects whether a match is detected.)
     """
     hits: list[Hit] = []
     lower = text.lower()
@@ -171,10 +190,18 @@ def find_hits(text: str, config: TripwireConfig, salt: bytes) -> list[Hit]:
         return line_idx + 1, offset - line_starts[line_idx] + 1
 
     def _boundary_aligned(start: int, length: int) -> bool:
-        if start > 0 and _is_word_char(text[start - 1]):
+        # Check adjacency in `lower`'s OWN coordinate space, never `text`'s:
+        # a handful of Unicode characters (e.g. U+0130 "I WITH DOT ABOVE")
+        # change length under .lower(), so `lower` and `text` are not
+        # always the same length or position-aligned. isalnum() gives the
+        # same answer regardless of case, so checking `lower` instead of
+        # `text` here changes nothing about which matches count, while
+        # keeping every index valid by construction (both bounds are < n,
+        # `lower`'s own length).
+        if start > 0 and _is_word_char(lower[start - 1]):
             return False
         end = start + length
-        if end < n and _is_word_char(text[end]):
+        if end < n and _is_word_char(lower[end]):
             return False
         return True
 
@@ -257,10 +284,12 @@ def _cmd_check(args: argparse.Namespace) -> int:
         else:
             path = Path(file_arg)
             try:
-                text = path.read_text(encoding="utf-8", errors="replace")
+                text = _read_text_or_none(path)
             except OSError as exc:
                 sys.stderr.write(f"client-reference-tripwire: cannot read {file_arg}: {exc}\n")
                 continue
+            if text is None:
+                continue  # binary/non-UTF-8 content - not a scannable text surface
             label = file_arg
         hits = dedupe_overlapping(find_hits(text, config, salt))
         if hits:
@@ -362,10 +391,12 @@ def _cmd_check_tree(args: argparse.Namespace) -> int:
     for rel_path in _git_tracked_files(repo):
         path = repo / rel_path
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
+            text = _read_text_or_none(path)
         except OSError as exc:
             sys.stderr.write(f"client-reference-tripwire: cannot read {rel_path}: {exc}\n")
             continue
+        if text is None:
+            continue  # binary/non-UTF-8 tracked asset - not a scannable text surface
         hits = dedupe_overlapping(find_hits(text, config, salt))
         if hits:
             any_hits = True

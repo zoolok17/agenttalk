@@ -152,6 +152,28 @@ def test_dedupe_keeps_two_separate_occurrences_separate():
     assert len(hits) == 2
 
 
+def test_find_hits_does_not_crash_on_a_length_changing_lowercase_character():
+    """Regression (found live, via check-tree's CI run against this repo's
+    own tracked binary assets read with errors='replace'): U+0130 ("I WITH
+    DOT ABOVE") lowercases to a TWO-character string ("i" + a combining
+    dot), so `text` and `text.lower()` are not always the same length.
+    `_boundary_aligned` used to bound an index into `text` by `len(lower)`,
+    which could run past the end of the (shorter) original `text` and
+    raise IndexError. This has nothing to do with the denylist match
+    itself - any text containing this character anywhere must not crash
+    the scan, clean or not."""
+    config = _config()
+    text = "clean prose İ with no denylisted content at all"
+    assert tripwire.find_hits(text, config, SALT_A) == []  # must not raise
+
+
+def test_find_hits_still_detects_a_match_near_a_length_changing_character():
+    config = _config()
+    text = "İ fixtureword right after the odd character"
+    hits = tripwire.find_hits(text, config, SALT_A)
+    assert len(hits) >= 1
+
+
 # ------------------------------------------------------------------ resolve_salt
 
 def test_resolve_salt_prefers_env_over_local_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -362,6 +384,32 @@ def test_check_tree_ignores_untracked_content(tmp_path: Path):
     _git(repo, "add", "notes.txt")
     _git(repo, "commit", "-q", "-m", "clean base")
     (repo / "scratch.txt").write_text("mentions fixtureword but is untracked\n", encoding="utf-8")
+
+    result = _run_cli(["--denylist", str(denylist), "--local-salt-file", str(salt_file),
+                       "check-tree", "--repo", str(repo)])
+    assert result.returncode == tripwire.EXIT_CLEAN, result.stdout + result.stderr
+
+
+def test_check_tree_skips_binary_tracked_assets_without_crashing(tmp_path: Path):
+    """Regression: a tracked binary file (PNG/PDF/etc) must be SKIPPED, not
+    fed through the text matcher via a lossy errors='replace' decode -
+    that path is what produced a live CI crash (see
+    test_find_hits_does_not_crash_on_a_length_changing_lowercase_character)
+    once the full-tree scan started reading this repo's own tracked binary
+    assets. A binary file must never make the scan a HIT or a crash."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    denylist = repo / "denylist.json"
+    tripwire.save_denylist(_config(), denylist)
+    salt_file = repo / "salt"
+    salt_file.write_text("test-salt-alpha", encoding="utf-8")
+
+    (repo / "notes.txt").write_text("clean\n", encoding="utf-8")
+    # A minimal PNG-like binary blob - invalid UTF-8, never real content.
+    (repo / "image.bin").write_bytes(bytes(range(256)) * 4)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "clean text plus a tracked binary asset")
 
     result = _run_cli(["--denylist", str(denylist), "--local-salt-file", str(salt_file),
                        "check-tree", "--repo", str(repo)])
