@@ -775,6 +775,45 @@ def test_ordinary_class_is_classified_production():
     assert result.units[0].classification == "production"
 
 
+def test_a_class_under_src_test_publishes_every_edge_as_test_phase_not_runtime():
+    """MICRO-NOD 50b (F7 MAJOR, cross-vendor read, wrong-data): every
+    import/inherit/invoke edge from a file used to hardcode
+    phase="runtime" unconditionally, regardless of whether the file
+    itself sits under a recognized test source root - a literal false
+    fact in the published dependency graph for any class living under
+    src/test (this producer's own output is read directly for migration
+    decisions; a test-only edge mislabeled "runtime" overstates the
+    real production dependency surface)."""
+    src = (
+        "package p;\n"
+        "import java.util.List;\n"
+        "class Helper extends Base {\n"
+        "}\n"
+    )
+    result = java.parse_java_source("src/test/java/p/Helper.java", src)
+    import_edges = _edges(result, "import")
+    inherit_edges = _edges(result, "inherit")
+    assert len(import_edges) == 1 and import_edges[0].phase == "test"
+    assert len(inherit_edges) == 1 and inherit_edges[0].phase == "test"
+
+
+def test_a_class_under_src_main_still_publishes_every_edge_as_runtime_phase():
+    """MICRO-NOD 50b (F7 MAJOR, regression control): an ordinary
+    production-source file is unaffected - every edge still publishes
+    phase="runtime", exactly as before this round."""
+    src = (
+        "package p;\n"
+        "import java.util.List;\n"
+        "class Helper extends Base {\n"
+        "}\n"
+    )
+    result = java.parse_java_source("src/main/java/p/Helper.java", src)
+    import_edges = _edges(result, "import")
+    inherit_edges = _edges(result, "inherit")
+    assert len(import_edges) == 1 and import_edges[0].phase == "runtime"
+    assert len(inherit_edges) == 1 and inherit_edges[0].phase == "runtime"
+
+
 def test_a_production_class_ending_in_it_without_corroboration_stays_production():
     """FIX ROUND 14 (tenth cold read, CR10-7 MINOR, wrong-data, verbatim
     shape): _TEST_NAME_SUFFIX matches any name ending in "IT" (meant for
@@ -6856,6 +6895,28 @@ def test_parse_web_xml_a_filter_mapping_route_publishes_a_paired_route_edge():
     assert edges[0].from_qualified_name == "com.acme.web.AuthFilter"
     assert edges[0].target == "/secure/*"
     assert entry_points[0].kind == "http_filter"
+
+
+def test_parse_web_xml_a_descriptor_under_src_test_publishes_its_route_edge_as_test_phase():
+    """MICRO-NOD 50b (F7 MAJOR): the web.xml twin of the same fix - a
+    descriptor declared under a recognized test source root is exactly
+    as real a "test" edge as a .java file's own, never hardcoded
+    "runtime"."""
+    web_xml = """<web-app>
+  <servlet>
+    <servlet-name>dispatcher</servlet-name>
+    <servlet-class>com.acme.web.DispatcherServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>dispatcher</servlet-name>
+    <url-pattern>/api/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    _entry_points, _problems, edges, _descriptor_name_conflicts = java.parse_web_xml(
+        "src/test/resources/WEB-INF/web.xml", web_xml)
+    assert len(edges) == 1
+    assert edges[0].phase == "test"
 
 
 def test_parse_web_xml_links_a_mapping_to_its_declared_servlet_class():

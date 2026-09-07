@@ -3499,6 +3499,25 @@ def parse_java_source(
     newline_offsets = _newline_offsets(sanitized)
     package_match = _PACKAGE_RE.search(sanitized)
     package = package_match.group(1) if package_match else None
+    # MICRO-NOD 50b (F7 MAJOR, cross-vendor read, wrong-data): every
+    # import/inherit/invoke edge from this file used to hardcode
+    # ``phase="runtime"`` unconditionally - a class declared under this
+    # repo's own recognized test source root (the SAME ``_TEST_SOURCE_
+    # ROOT_SEGMENT`` check the naming-convention "test" relation edge
+    # below already uses for corroboration) published every one of its
+    # own edges as a "runtime" (production) dependency, never "test" -
+    # a literal false fact in the published dependency graph for any
+    # class living under src/test (or equivalent), not merely a missing
+    # classification: this producer's own output is read directly for
+    # migration decisions, and a test-only edge mislabeled "runtime"
+    # overstates the real production dependency surface. Computed once
+    # per file (an edge's own phase depends only on WHICH FILE declared
+    # it, never on the specific relation), reused at every edge
+    # construction site below instead of six independent literals.
+    edge_phase = (
+        "test" if _TEST_SOURCE_ROOT_SEGMENT.search(relative_path.replace("\\", "/").lower())
+        else "runtime"
+    )
 
     imports = []
     # FIX ROUND 13 (ninth cold read, CR9-5): stores (target, is_static) -
@@ -3703,7 +3722,7 @@ def parse_java_source(
         edges.append(JavaEdgeClaim(
             from_qualified_name=file_scope_qualified, relation="import", target=target,
             target_kind=target_kind,
-            evidence_class="extracted", line=line, phase="runtime",
+            evidence_class="extracted", line=line, phase=edge_phase,
         ))
 
     for qualified, simple, _container, brace_pos, extends, implements_raw, _end, _il in types:
@@ -3715,7 +3734,7 @@ def parse_java_source(
                     edges.append(JavaEdgeClaim(
                         from_qualified_name=qualified, relation="inherit", target=base,
                         target_kind="internal_candidate", evidence_class="extracted",
-                        line=line, phase="runtime",
+                        line=line, phase=edge_phase,
                     ))
         if implements_raw:
             for name in _split_type_list(implements_raw):
@@ -3724,7 +3743,7 @@ def parse_java_source(
                     edges.append(JavaEdgeClaim(
                         from_qualified_name=qualified, relation="inherit", target=base,
                         target_kind="internal_candidate", evidence_class="extracted",
-                        line=line, phase="runtime",
+                        line=line, phase=edge_phase,
                     ))
         # FIX ROUND 14 (CR10-7 MINOR, wrong-data): a bare name-suffix
         # match is not corroborating evidence on its own (see
@@ -3837,7 +3856,7 @@ def parse_java_source(
             from_qualified_name=_enclosing_qualified_name(match.start(), types, primary_qualified),
             relation="invoke", target=qualifier,
             target_kind=target_kind, evidence_class="extracted",
-            line=_line_at(newline_offsets, match.start()), phase="runtime",
+            line=_line_at(newline_offsets, match.start()), phase=edge_phase,
         ))
 
     def _route_annotation_span(
@@ -4523,7 +4542,7 @@ def parse_java_source(
             edges.append(JavaEdgeClaim(
                 from_qualified_name=enclosing, relation="route", target=target,
                 target_kind="external_route", evidence_class="declared",
-                line=line, phase="runtime",
+                line=line, phase=edge_phase,
             ))
             entry_points.append(JavaEntryPointClaim(
                 qualified_name=enclosing, kind="http_route",
@@ -4667,7 +4686,7 @@ def parse_java_source(
             edges.append(JavaEdgeClaim(
                 from_qualified_name=target_type, relation="route", target=path,
                 target_kind="external_route", evidence_class="declared",
-                line=line, phase="runtime",
+                line=line, phase=edge_phase,
             ))
             entry_points.append(JavaEntryPointClaim(
                 qualified_name=target_type, kind="http_route",
@@ -4859,7 +4878,7 @@ def parse_java_source(
             edges.append(JavaEdgeClaim(
                 from_qualified_name=target_type, relation="route", target=path,
                 target_kind="external_filter", evidence_class="declared",
-                line=line, phase="runtime",
+                line=line, phase=edge_phase,
             ))
             entry_points.append(JavaEntryPointClaim(
                 qualified_name=target_type, kind="http_filter",
@@ -7478,6 +7497,15 @@ def parse_web_xml(
     # now come from ONE ordered scan - see `_split_xml_comments_and_cdata`.
     sanitized, structural = _split_xml_comments_and_cdata(text)
     newline_offsets = _newline_offsets(sanitized)
+    # MICRO-NOD 50b (F7 MAJOR): this web.xml's own route edges get the
+    # identical test-source phase treatment parse_java_source's own
+    # edges do - see that function's own edge_phase comment for the
+    # reasoning; a descriptor declared under a recognized test source
+    # root is exactly as real a "test" edge as a .java file's own.
+    edge_phase = (
+        "test" if _TEST_SOURCE_ROOT_SEGMENT.search(relative_path.replace("\\", "/").lower())
+        else "runtime"
+    )
     descriptor_name_conflicts: list[tuple[str, list[str]]] = []
     servlet_registry, servlet_name_undecodable = _servlet_class_by_name(
         sanitized, structural, text, annotation_declared_names=annotation_declared_servlet_names)
@@ -7755,7 +7783,7 @@ def parse_web_xml(
                 from_qualified_name=owner_qualified_name, relation="route",
                 target=url_pattern, target_kind="external_route",
                 evidence_class="declared",
-                line=_line_at(newline_offsets, absolute_offset), phase="runtime",
+                line=_line_at(newline_offsets, absolute_offset), phase=edge_phase,
             ))
             entry_points.append(JavaEntryPointClaim(
                 qualified_name=owner_qualified_name, kind="http_route",
@@ -8083,7 +8111,7 @@ def parse_web_xml(
                 from_qualified_name=owner_qualified_name, relation="route",
                 target=url_pattern, target_kind="external_filter",
                 evidence_class="declared",
-                line=_line_at(newline_offsets, absolute_offset), phase="runtime",
+                line=_line_at(newline_offsets, absolute_offset), phase=edge_phase,
             ))
             entry_points.append(JavaEntryPointClaim(
                 qualified_name=owner_qualified_name, kind="http_filter",
