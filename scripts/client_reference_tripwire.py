@@ -12,11 +12,14 @@ from that text with the same salt and looks for a hash match - so the
 denylist is useless to anyone who does not already separately have the
 salt, while still being fully committed, diffable, and versioned.
 
-This module is the ONE shared code path for both callers (a local
-pre-commit hook and the CI workflow step) - see `scripts/pre-commit` and
-`.github/workflows/security.yml`. The two callers differ only in how they
+This module is the ONE shared code path for all callers - a local
+pre-commit hook (diff-scoped, staged-vs-HEAD) and two CI workflow steps
+(diff-scoped, PR base..head; and full-tree, every tracked file's content
+on every push/PR) - see `scripts/githooks/pre-commit` and
+`.github/workflows/security.yml`. The callers differ only in how they
 interpret this module's exit codes (see EXIT_* below and the module
-docstring in each caller), not in how the check itself runs.
+docstring in each caller) and which subcommand they invoke, not in how
+the check itself runs.
 
 Deliberately stdlib-only: no new dependency for a repo-hygiene tool.
 """
@@ -323,6 +326,58 @@ def _git_added_lines(base: str, head: str, repo: Path) -> str:
     return "\n".join(added)
 
 
+def _git_tracked_files(repo: Path) -> list[str]:
+    """Every TRACKED file path (repo-relative), via `git ls-files` - never a
+    directory walk, so an untracked/gitignored file (e.g. the local salt
+    file itself, or a scratch artifact) is never scanned or reported on."""
+    out = subprocess.run(  # noqa: S603,S607  # nosec B603 B607
+        ["git", "-C", str(repo), "ls-files", "-z"],
+        capture_output=True, text=True, check=True,
+    )
+    return [p for p in out.stdout.split("\0") if p]
+
+
+def _cmd_check_tree(args: argparse.Namespace) -> int:
+    """Check the FULL CONTENT of every tracked file at the current checkout -
+    not just an added-lines diff. This is the complement to `check-diff`:
+    a diff scan only ever sees what one push/PR newly adds, so a string
+    that entered the tree before the tripwire existed (or via a path the
+    diff scan does not cover, e.g. a squash/rebase that folds history)
+    would never be caught by `check-diff` alone. Run on every push and PR
+    alongside the diff scan (see .github/workflows/security.yml) so master
+    itself is always the ground truth, not just its deltas."""
+    salt = resolve_salt(Path(args.local_salt_file))
+    if salt is None:
+        sys.stderr.write(
+            "client-reference-tripwire: SALT UNAVAILABLE - this check did not run.\n")
+        return EXIT_SALT_UNAVAILABLE
+    try:
+        config = load_denylist(Path(args.denylist))
+    except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        sys.stderr.write(f"client-reference-tripwire: cannot load denylist: {exc}\n")
+        return EXIT_SALT_UNAVAILABLE
+
+    repo = Path(args.repo)
+    any_hits = False
+    for rel_path in _git_tracked_files(repo):
+        path = repo / rel_path
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            sys.stderr.write(f"client-reference-tripwire: cannot read {rel_path}: {exc}\n")
+            continue
+        hits = dedupe_overlapping(find_hits(text, config, salt))
+        if hits:
+            any_hits = True
+            for h in hits:
+                print(f"{rel_path}:{h.line}:{h.column}: denylisted content detected "
+                     f"({h.length} chars) - see the file to identify it; "
+                     "never paste the match into a report.")
+    if any_hits:
+        print("client-reference-tripwire: full-tree scan found denylisted content.")
+    return EXIT_HIT if any_hits else EXIT_CLEAN
+
+
 def _cmd_check_diff(args: argparse.Namespace) -> int:
     """Check only the ADDED lines between two refs - the shape both the
     pre-commit hook (staged vs HEAD) and the CI step (PR base vs head) use."""
@@ -361,6 +416,11 @@ def main(argv: list[str] | None = None) -> int:
     p_diff.add_argument("--repo", default=".",
                         help="Repo root to diff in (never implied by cwd).")
     p_diff.set_defaults(func=_cmd_check_diff)
+
+    p_tree = sub.add_parser("check-tree", help="Check the full content of every tracked file.")
+    p_tree.add_argument("--repo", default=".",
+                        help="Repo root to scan in (never implied by cwd).")
+    p_tree.set_defaults(func=_cmd_check_tree)
 
     p_build = sub.add_parser("build", help="Operator-only: rebuild the denylist from raw strings.")
     p_build.add_argument("strings", nargs="*")

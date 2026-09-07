@@ -94,3 +94,33 @@ jobs:
               exit 1
               ;;
           esac
+      - name: Check the full tracked tree for denylisted client references
+        env:
+          AGENTTALK_TRIPWIRE_SALT: ${{ secrets.AGENTTALK_TRIPWIRE_SALT }}
+          IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == true }}
+        run: |
+          set +e
+          python scripts/client_reference_tripwire.py check-tree --repo .
+          status=$?
+          set -e
+          case "$status" in
+            0)
+              echo "client-reference-tripwire (full tree): clean."
+              ;;
+            1)
+              echo "::error::client-reference-tripwire (full tree): denylisted content detected in tracked files - see the step output above for file/line; this blocks the merge."
+              exit 1
+              ;;
+            2)
+              if [ "$IS_FORK_PR" = "true" ]; then
+                echo "::error::client-reference-tripwire (full tree): HOLD - the salt secret is not exposed to fork-PR runs (GitHub's own security model). This check did NOT run and cannot be treated as a pass. A maintainer with repo secret access must re-run this job (workflow_dispatch, or by pulling the branch into a same-repo branch) before merging."
+              else
+                echo "::error::client-reference-tripwire (full tree): HOLD - the salt secret is unavailable in this run (AGENTTALK_TRIPWIRE_SALT is unset). This check did NOT run and cannot be treated as a pass. Provision the repo secret before merging."
+              fi
+              exit 1
+              ;;
+            *)
+              echo "::error::client-reference-tripwire (full tree): unexpected exit status $status - treating as a HOLD, not a pass."
+              exit 1
+              ;;
+          esac

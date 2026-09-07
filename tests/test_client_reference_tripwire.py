@@ -304,6 +304,89 @@ def test_check_diff_flags_a_newly_introduced_occurrence(tmp_path: Path):
     assert result.returncode == tripwire.EXIT_HIT, result.stdout + result.stderr
 
 
+# ------------------------------------------------------------------ CLI: check-tree
+
+def test_check_tree_clean_repo_exits_clean(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    denylist = repo / "denylist.json"
+    tripwire.save_denylist(_config(), denylist)
+    salt_file = repo / "salt"
+    salt_file.write_text("test-salt-alpha", encoding="utf-8")
+
+    (repo / "notes.txt").write_text("nothing suspicious here\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "clean base")
+
+    result = _run_cli(["--denylist", str(denylist), "--local-salt-file", str(salt_file),
+                       "check-tree", "--repo", str(repo)])
+    assert result.returncode == tripwire.EXIT_CLEAN, result.stdout + result.stderr
+
+
+def test_check_tree_flags_an_occurrence_anywhere_in_tracked_history_not_just_a_diff(tmp_path: Path):
+    """check-tree's whole point: a string committed BEFORE the tripwire
+    existed (so no diff would ever re-surface it) must still be caught by
+    scanning the tree's current full content, not just deltas."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    denylist = repo / "denylist.json"
+    tripwire.save_denylist(_config(), denylist)
+    salt_file = repo / "salt"
+    salt_file.write_text("test-salt-alpha", encoding="utf-8")
+
+    (repo / "old.txt").write_text("this old file mentions fixtureword\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "long-predates the tripwire")
+
+    result = _run_cli(["--denylist", str(denylist), "--local-salt-file", str(salt_file),
+                       "check-tree", "--repo", str(repo)])
+    assert result.returncode == tripwire.EXIT_HIT, result.stdout + result.stderr
+    assert "fixtureword" not in result.stdout  # never echo the match
+    assert "fixtureword" not in result.stderr
+
+
+def test_check_tree_ignores_untracked_content(tmp_path: Path):
+    """Only TRACKED files are in scope - an untracked scratch file (or the
+    gitignored local salt file itself) must never be scanned or reported."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    denylist = repo / "denylist.json"
+    tripwire.save_denylist(_config(), denylist)
+    salt_file = repo / "salt"
+    salt_file.write_text("test-salt-alpha", encoding="utf-8")
+
+    (repo / "notes.txt").write_text("clean\n", encoding="utf-8")
+    _git(repo, "add", "notes.txt")
+    _git(repo, "commit", "-q", "-m", "clean base")
+    (repo / "scratch.txt").write_text("mentions fixtureword but is untracked\n", encoding="utf-8")
+
+    result = _run_cli(["--denylist", str(denylist), "--local-salt-file", str(salt_file),
+                       "check-tree", "--repo", str(repo)])
+    assert result.returncode == tripwire.EXIT_CLEAN, result.stdout + result.stderr
+
+
+def test_check_tree_salt_unavailable_is_never_confused_with_clean(tmp_path: Path,
+                                                                   monkeypatch: pytest.MonkeyPatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    denylist = repo / "denylist.json"
+    tripwire.save_denylist(_config(), denylist)
+    (repo / "notes.txt").write_text("clean\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "clean base")
+
+    monkeypatch.delenv(tripwire.SALT_ENV_VAR, raising=False)
+    result = _run_cli(["--denylist", str(denylist),
+                       "--local-salt-file", str(repo / "does-not-exist"),
+                       "check-tree", "--repo", str(repo)])
+    assert result.returncode == tripwire.EXIT_SALT_UNAVAILABLE
+    assert "SALT UNAVAILABLE" in result.stderr
+
+
 # ------------------------------------------------------ pre-commit hook (shell)
 
 _HOOK_PATH = Path(__file__).resolve().parents[1] / "scripts" / "githooks" / "pre-commit"
