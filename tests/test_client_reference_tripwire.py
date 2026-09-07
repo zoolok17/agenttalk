@@ -508,3 +508,21 @@ def test_precommit_hook_fails_open_when_salt_is_absent(tmp_path: Path):
     assert "salt not configured locally" in result.stderr
 
 
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required for the hook test")
+def test_precommit_hook_allows_a_truly_empty_staged_set(tmp_path: Path):
+    """Regression: the hook's array of staged files can be genuinely EMPTY
+    (an --allow-empty commit, or any commit that stages nothing matching
+    --diff-filter=ACM). This is the exact path a bash-3.2-only bug (a
+    portability regression found live via macOS CI, not caught by any
+    prior test - all three above always stage f.txt) would hide in: a
+    zero-element array under `set -u` is where old-bash array handling
+    historically misbehaves. Must not crash or block."""
+    repo = _hook_repo(tmp_path)
+    (repo / ".agenttalk-tripwire-salt").write_text("test-salt-alpha", encoding="utf-8")
+    result = subprocess.run(  # noqa: S603,S607  # nosec B603 B607 - test-only fixed argv
+        ["git", "commit", "-q", "--allow-empty", "-m", "nothing staged"],
+        cwd=repo, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
