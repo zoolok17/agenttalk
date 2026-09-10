@@ -30,6 +30,15 @@ def _init_repo(repo: Path) -> None:
     _git(repo, "init", "-q", "-b", "master")
     _git(repo, "config", "user.email", "test@example.com")
     _git(repo, "config", "user.name", "Test")
+    # Repo-local, before the first commit: a modern git can start detached
+    # background maintenance on commit, which creates and deletes
+    # `.git/objects/maintenance.lock` - a file this fixture's own
+    # `task_dir.rglob("*")` + `_backdate` pattern can list and then fail to
+    # stamp (already gone), or whose creation/deletion can itself refresh
+    # mtimes inside a tree these tests are deliberately backdating to look
+    # stale. Disabled so every commit in this file is fully synchronous.
+    _git(repo, "config", "maintenance.auto", "false")
+    _git(repo, "config", "gc.auto", "0")
     (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
     _git(repo, "add", "tracked.txt")
     _git(repo, "commit", "-q", "-m", "initial")
@@ -80,6 +89,24 @@ def _win32_set_reparse_point_mtime(path: Path, unix_stamp: float) -> None:
             raise OSError(f"SetFileTime failed for {path}: {ctypes.get_last_error()}")
     finally:
         ctypes.windll.kernel32.CloseHandle(handle)
+
+
+def _backdate_tree(root: Path, days: float) -> None:
+    """Backdate every entry in `root`'s tree, then `root` itself. Skips a
+    path that no longer exists by the time its turn comes: git's own
+    background maintenance (started detached on a commit, on a modern
+    git) creates and deletes files like
+    `.git/objects/maintenance.lock` - one can be listed by `rglob` and
+    gone by the time this loop reaches it, which must not fail the
+    fixture (`maintenance.auto`/`gc.auto` are disabled in `_init_repo`
+    for the same reason; this is the defense-in-depth half of that
+    fix)."""
+    for p in sorted(root.rglob("*"), reverse=True):
+        try:
+            _backdate(p, days)
+        except FileNotFoundError:
+            continue
+    _backdate(root, days)
 
 
 def _make_junction(link: Path, target: Path) -> bool:
@@ -814,9 +841,7 @@ def test_r1f_git_working_detached_worktree_nested_in_stale_task_survives(tmp_pat
     # Backdate the whole nested tree so the OUTER task directory reads as
     # stale by newest-mtime, exactly like a review checkout nobody has
     # touched in a while but that still carries uncommitted work.
-    for p in sorted(task_dir.rglob("*"), reverse=True):
-        _backdate(p, 10)
-    _backdate(task_dir, 10)
+    _backdate_tree(task_dir, 10)
 
     cfg = janitor.JanitorConfig(
         repo=repo, scratch_root=scratch_root, keep_days=3, tmp_keep_days=1,
@@ -848,9 +873,7 @@ def test_r1g_git_unresolvable_branch_worktree_nested_in_stale_task_survives(tmp_
     wt = task_dir / "wt-branch"
     _git(repo, "worktree", "add", "-q", "-b", "feature-nested", str(wt), "master")
     (wt / "precious.txt").write_text("do not lose me", encoding="utf-8")
-    for p in sorted(task_dir.rglob("*"), reverse=True):
-        _backdate(p, 10)
-    _backdate(task_dir, 10)
+    _backdate_tree(task_dir, 10)
 
     real_which = janitor.shutil.which
 
@@ -1032,9 +1055,7 @@ def test_p1_foreign_clones_worktree_nested_in_stale_task_survives(tmp_path):
     wt = task_dir / "wt-abc"
     _git(repo_b, "worktree", "add", "-q", "--detach", str(wt), "master")
     (wt / "precious.txt").write_text("do not lose me", encoding="utf-8")
-    for p in sorted(task_dir.rglob("*"), reverse=True):
-        _backdate(p, 10)
-    _backdate(task_dir, 10)
+    _backdate_tree(task_dir, 10)
 
     cfg = janitor.JanitorConfig(
         repo=repo_a, scratch_root=scratch_root, keep_days=3, tmp_keep_days=1,
@@ -1067,9 +1088,7 @@ def test_p1c_own_clones_worktree_in_same_layout_goes_through_the_normal_gate(tmp
     wt = task_dir / "wt-abc"
     _git(repo_b, "worktree", "add", "-q", "--detach", str(wt), "master")
     (wt / "precious.txt").write_text("do not lose me", encoding="utf-8")
-    for p in sorted(task_dir.rglob("*"), reverse=True):
-        _backdate(p, 10)
-    _backdate(task_dir, 10)
+    _backdate_tree(task_dir, 10)
 
     cfg = janitor.JanitorConfig(
         repo=repo_b, scratch_root=scratch_root, keep_days=3, tmp_keep_days=1,
@@ -1099,9 +1118,7 @@ def test_p2_standalone_clone_nested_in_stale_task_survives(tmp_path):
     clone = task_dir / "standalone-clone"
     _init_repo(clone)
     (clone / "uncommitted.txt").write_text("do not lose me", encoding="utf-8")
-    for p in sorted(task_dir.rglob("*"), reverse=True):
-        _backdate(p, 10)
-    _backdate(task_dir, 10)
+    _backdate_tree(task_dir, 10)
 
     cfg = janitor.JanitorConfig(
         repo=repo, scratch_root=scratch_root, keep_days=3, tmp_keep_days=1,
@@ -1138,9 +1155,7 @@ def test_p3_clean_detached_worktree_with_unreachable_head_survives(tmp_path):
     (wt / "extra.txt").write_text("local commit content", encoding="utf-8")
     _git(wt, "add", "extra.txt")
     _git(wt, "commit", "-q", "-m", "local commit on no branch")
-    for p in sorted(task_dir.rglob("*"), reverse=True):
-        _backdate(p, 10)
-    _backdate(task_dir, 10)
+    _backdate_tree(task_dir, 10)
 
     cfg = janitor.JanitorConfig(
         repo=repo, scratch_root=scratch_root, keep_days=3, tmp_keep_days=1,
@@ -1479,9 +1494,7 @@ def test_p8c_clean_detached_worktree_at_branch_tip_in_stale_task_is_removed(tmp_
     task_dir.mkdir(parents=True)
     wt = task_dir / "wt-clean-detached-reachable"
     _git(repo, "worktree", "add", "-q", "--detach", str(wt), "master")
-    for p in sorted(task_dir.rglob("*"), reverse=True):
-        _backdate(p, 10)
-    _backdate(task_dir, 10)
+    _backdate_tree(task_dir, 10)
 
     cfg = janitor.JanitorConfig(
         repo=repo, scratch_root=scratch_root, keep_days=3, tmp_keep_days=1,
@@ -1496,3 +1509,90 @@ def test_p8c_clean_detached_worktree_at_branch_tip_in_stale_task_is_removed(tmp_
 
     janitor.apply(cfg, report)
     assert not task_dir.exists()  # removed - nothing here needed protecting
+
+
+# ------------------------------------------------ refs/remotes crediting (round 8)
+
+
+def test_p8_worktree_at_remote_only_commit_is_removed(tmp_path):
+    """Round-8 R1: worktree_head_reachable credits refs/remotes on
+    purpose - a review worktree detached at a fetched PR head (Rule 2's
+    own recommended form) is routinely reachable ONLY via a remote-
+    tracking ref until it lands on a local branch. A clean detached
+    worktree of exactly such a commit must remain removable, not be
+    refused just because no LOCAL branch or tag contains it."""
+    origin = tmp_path / "origin"
+    _init_repo(origin)
+    (origin / "remote-only.txt").write_text("remote commit", encoding="utf-8")
+    _git(origin, "add", "remote-only.txt")
+    _git(origin, "commit", "-q", "-m", "remote-only commit")
+
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    _git(repo, "remote", "add", "origin", str(origin))
+    _git(repo, "fetch", "-q", "origin")
+
+    scratch_root = tmp_path / "atk-scratch"
+    task_dir = scratch_root / "dev-9" / "old-review-remote-only"
+    task_dir.mkdir(parents=True)
+    wt = task_dir / "wt-remote-only"
+    _git(repo, "worktree", "add", "-q", "--detach", str(wt), "origin/master")
+    _backdate_tree(task_dir, 10)
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=scratch_root, keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    report = janitor.build_report(cfg)
+    assert wt not in set(report.dirty_worktrees)  # clean
+    assert janitor.worktree_branch(wt) in janitor._NEVER_AUTO_COMMIT_BRANCHES_SENTINELS
+    assert janitor.worktree_head_reachable(wt) is True  # only refs/remotes/origin/* contains it
+
+    janitor.apply(cfg, report)
+    assert not task_dir.exists()  # removed - reachable via the remote-tracking ref
+
+
+def test_p8f_local_fixup_on_remote_only_worktree_is_refused(tmp_path):
+    """Companion to P8: a LOCAL fixup commit made on top of that same
+    detached checkout is reachable from NOTHING (not even refs/remotes,
+    since the fixup itself was never pushed anywhere) - the refs/remotes
+    crediting must not paper over a genuinely local-only commit. Guards
+    the dangerous direction if the credited ref set is ever widened
+    further."""
+    origin = tmp_path / "origin"
+    _init_repo(origin)
+    (origin / "remote-only.txt").write_text("remote commit", encoding="utf-8")
+    _git(origin, "add", "remote-only.txt")
+    _git(origin, "commit", "-q", "-m", "remote-only commit")
+
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    _git(repo, "remote", "add", "origin", str(origin))
+    _git(repo, "fetch", "-q", "origin")
+
+    scratch_root = tmp_path / "atk-scratch"
+    task_dir = scratch_root / "dev-9" / "old-review-remote-fixup"
+    task_dir.mkdir(parents=True)
+    wt = task_dir / "wt-remote-fixup"
+    _git(repo, "worktree", "add", "-q", "--detach", str(wt), "origin/master")
+    (wt / "fixup.txt").write_text("local fixup", encoding="utf-8")
+    _git(wt, "add", "fixup.txt")
+    _git(wt, "commit", "-q", "-m", "local fixup on top of the remote-only commit")
+    _backdate_tree(task_dir, 10)
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=scratch_root, keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    report = janitor.build_report(cfg)
+    assert wt not in set(report.dirty_worktrees)  # clean - the fixup IS committed
+    assert janitor.worktree_head_reachable(wt) is False  # the fixup itself is nowhere else
+
+    janitor.apply(cfg, report)
+    assert wt.exists()
+    assert (wt / "fixup.txt").exists()
+    assert task_dir.exists()

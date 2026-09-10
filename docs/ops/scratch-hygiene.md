@@ -188,6 +188,27 @@ allow-listed name family.
 candidates exist outside the scratch root, so this doesn't need to be
 checked by hand.
 
+**Cost.** The ownership check (the `.git`-in-tree walk above) runs for
+every directory candidate, including every registered worktree under
+`.worktrees/` - a full checkout, not just its metadata - on every
+`agenttalk janitor` run and therefore every `agenttalk doctor` run too.
+Measured at roughly 1.8x the walk time of a build without it, on a
+20,000-file stale task in one synthetic benchmark. Fine for ordinary
+task/scratch sizes; worth revisiting (e.g. one shared walk instead of a
+separate one per check) if `doctor` latency becomes noticeable on a
+much larger tree.
+
+**`refs/remotes` breadth.** A remote-tracking ref added from a
+LOCAL-PATH remote (another seat's clone, added as a `git remote`) counts
+toward reachability too. That local remote's own object store can later
+be pruned or deleted, and a subsequent `fetch --prune` would drop the
+only pointer keeping such a commit "reachable" as far as this check is
+concerned. In the ordinary case - a real server remote (GitHub, etc.) -
+the commit still exists upstream regardless of what happens locally, so
+this is not a local data-loss path; it is called out here as a known
+edge case of a local-only setup, not because it needs a different
+default today.
+
 ## Rule 4: cleanup is part of "done"
 
 A batch is not closed until the janitor report is empty (or its leftovers
