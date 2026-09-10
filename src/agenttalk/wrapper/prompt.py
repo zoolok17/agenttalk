@@ -52,6 +52,12 @@ _DEFAULT_RULES = (
     "\n"
     + _BUS_COMMAND_CONTRACT +
     "\n"
+    "SCRATCH: temporary work (pytest base-temps, review worktrees, service data "
+    "directories, probe outputs) goes under $AGENTTALK_SCRATCH (or "
+    "`agenttalk scratch root --for <you> --task <id>` if unset) and nowhere else - "
+    "never the repo root, .worktrees/, or the OS temp dir. A close-out that created "
+    "scratch reports \"scratch removed\" or names what is kept and why.\n"
+    "\n"
     "CLASSIFY by kind + meta and act, replying on the correct thread via the "
     "correlation_id (request_id or broadcast_id):\n"
     "- review-request: review READ-ONLY (do not modify the sender's files); reply "

@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Per-seat scratch root + janitor (#148).** `agenttalk scratch root
+  --for <agent> [--task <id>]` resolves and creates
+  `<scratch_root>/<agent>/<task>` (configurable via `.agenttalk/config.json`'s
+  `"scratch"` key; default a sibling `atk-scratch/` next to the project
+  root - unconfigured projects get the default, nothing breaks). Wrapped
+  agents receive it pre-resolved as `$AGENTTALK_SCRATCH`, and the
+  dispatch envelope now states the rule. `agenttalk janitor [--apply]
+  [--keep-days N]` is a cross-platform, config-driven port of the
+  project's own validated `cleanup-scratch.ps1`: report mode (default)
+  lists scratch-family candidates and dirty registered worktrees;
+  `--apply` WIP-commits dirty worktrees on their own branch (never the
+  default branch), removes allow-listed paths, prunes stale worktree
+  registrations, and reports removals that fail (e.g. sandbox-restricted
+  ACLs on Windows) as `FAILED` with an elevated re-run hint rather than
+  silently skipping them. `agenttalk doctor` warns when registered
+  worktrees or scratch families exist outside the scratch root. See
+  `docs/ops/scratch-hygiene.md`.
+
 ## [0.87.0] - 2026-09-07
 
 Theme: **the comprehension producer ships — a static inventory plane for

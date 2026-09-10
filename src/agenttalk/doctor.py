@@ -23,6 +23,7 @@ from pathlib import Path
 from agenttalk import __version__
 from agenttalk import codex_config as cxc
 from agenttalk import install_skills as iskl
+from agenttalk import janitor as janitormod
 from agenttalk import signing as _signing
 from agenttalk import supervisor as sup
 from agenttalk import powershell_host as psh
@@ -136,6 +137,12 @@ def run(project_root: Path | None = None) -> Report:
     artifact_check = _check_powershell_artifacts(store)
     if artifact_check is not None:
         report.checks.append(artifact_check)
+    # Scratch hygiene (#148) runs UNCONDITIONALLY, like multi-store detection:
+    # scratch root resolution works without an initialized store, so the
+    # warning should too.
+    scratch_check = _check_scratch_hygiene(root)
+    if scratch_check is not None:
+        report.checks.append(scratch_check)
     # Config-dependent checks are gated on a LOADABLE config: `_check_init`
     # already reports a corrupt config as an `error` (e.g. an active∩retired
     # overlap, #19), so running these would just re-raise the same
@@ -1383,6 +1390,41 @@ def _check_identity_registry(store: Store) -> Check:
         details=(f"{len(active)} active, {len(retired)} retired "
                  f"(tombstones permanent; history stays valid)"),
         data=data)
+
+
+def _check_scratch_hygiene(project_root: Path) -> Check | None:
+    """Registered worktrees or scratch-family sprawl outside the scratch
+    root (#148). Runs unconditionally - scratch resolution needs no init.
+    """
+    try:
+        cfg = janitormod.JanitorConfig.load(project_root)
+        candidates = janitormod.find_candidates(cfg)
+        registered = janitormod.get_registered_worktrees(project_root)
+    except OSError:
+        return None
+    outside_worktrees = [
+        w for w in registered
+        if w != project_root and cfg.scratch_root not in w.parents
+    ]
+    # "scratch-stale" candidates already live under the scratch root (just
+    # past keep_days) - not sprawl outside it, so they don't count here.
+    outside_candidates = [c for c in candidates if c.reason != "scratch-stale"]
+    if not outside_worktrees and not outside_candidates:
+        return None
+    parts = []
+    if outside_worktrees:
+        parts.append(f"{len(outside_worktrees)} registered worktree(s) outside the scratch root")
+    if outside_candidates:
+        parts.append(f"{len(outside_candidates)} scratch-family candidate(s) outside the scratch root")
+    return Check(
+        name="scratch_hygiene",
+        status="warn",
+        details="; ".join(parts) + f" (scratch root: {cfg.scratch_root})",
+        fix="run `agenttalk janitor` to report, `agenttalk janitor --apply` to clean up",
+        data={"outside_worktrees": len(outside_worktrees),
+              "outside_candidates": len(outside_candidates),
+              "scratch_root": str(cfg.scratch_root)},
+    )
 
 
 def _check_store_hygiene(store: Store) -> Check:
