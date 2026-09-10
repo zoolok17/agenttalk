@@ -455,3 +455,166 @@ def test_p6b_failed_junction_removal_never_escalates_into_the_target(tmp_path, m
     for call in calls:
         exe_name = Path(call[0]).stem.lower()
         assert exe_name not in escalation_tools
+
+
+# --------------------------------------------------------------- R1/R2/R3/N1
+
+
+def test_r1_refusing_precommit_hook_refuses_not_silently_loses_work(tmp_path):
+    """A pre-commit hook that exits non-zero must refuse the WIP commit,
+    not silently report success while the change is lost (reviewer-3 R1)."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    hooks_dir = repo / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    hook = hooks_dir / "pre-commit"
+    hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    hook.chmod(0o755)
+    wt = repo / ".worktrees" / "wt-hook"
+    _git(repo, "worktree", "add", "-q", "-b", "feature-hook", str(wt), "master")
+    (wt / "precious.txt").write_text("do not lose me", encoding="utf-8")
+
+    result = janitor.wip_commit_dirty_worktree(wt, default_branches=["master", "main"])
+    assert result.refused is True
+    assert "REFUSED" in result.message
+    assert (wt / "precious.txt").exists()
+    assert (wt / "precious.txt").read_text(encoding="utf-8") == "do not lose me"
+
+
+def test_r1_refusing_precommit_hook_apply_preserves_the_worktree(tmp_path):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    hooks_dir = repo / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    hook = hooks_dir / "pre-commit"
+    hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    hook.chmod(0o755)
+    wt = repo / ".worktrees" / "wt-hook"
+    _git(repo, "worktree", "add", "-q", "-b", "feature-hook", str(wt), "master")
+    (wt / "precious.txt").write_text("do not lose me", encoding="utf-8")
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=tmp_path / "atk-scratch", keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    report = janitor.build_report(cfg)
+    assert wt in set(report.dirty_worktrees)
+    janitor.apply(cfg, report)
+    assert wt.exists()
+    assert (wt / "precious.txt").exists()
+    assert (wt / "precious.txt").read_text(encoding="utf-8") == "do not lose me"
+
+
+def test_r2_temp_root_directory_aged_by_newest_nested_file_not_own_mtime(tree):
+    """The P3 flaw, recurring in the shared temp root: a directory whose
+    OWN mtime is old but whose nested file was written moments ago must
+    not be classified stale."""
+    live_old_dir = tree["tmp_root"] / "pytest-of-liveold"
+    nested = live_old_dir / "case0"
+    nested.mkdir(parents=True)
+    _backdate(live_old_dir, 5)
+    _backdate(nested, 5)
+    (nested / "live.txt").write_text("fresh", encoding="utf-8")
+
+    candidates, _ = janitor.find_candidates(tree["cfg"])
+    paths = {c.path for c in candidates}
+    assert live_old_dir not in paths
+
+
+def test_r2_apply_preserves_live_nested_file_in_old_tmp_directory(tree):
+    live_old_dir = tree["tmp_root"] / "pytest-of-liveold2"
+    nested = live_old_dir / "case0"
+    nested.mkdir(parents=True)
+    _backdate(live_old_dir, 5)
+    _backdate(nested, 5)
+    (nested / "live.txt").write_text("fresh", encoding="utf-8")
+
+    report = janitor.build_report(tree["cfg"])
+    janitor.apply(tree["cfg"], report)
+    assert (nested / "live.txt").exists()
+
+
+def test_r3_posix_symlink_directory_removes_link_not_target(tmp_path):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    real_target_dir = tmp_path / "real-target-dir"
+    real_target_dir.mkdir()
+    (real_target_dir / "precious.txt").write_text("do not delete", encoding="utf-8")
+    link_dir = repo / ".review-symlink"
+    try:
+        os.symlink(real_target_dir, link_dir, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink privilege/support not available in this environment")
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=tmp_path / "atk-scratch", keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    report = janitor.build_report(cfg)
+    janitor.apply(cfg, report)
+    assert (real_target_dir / "precious.txt").exists()
+    assert not os.path.lexists(link_dir)
+
+
+def test_r3_posix_symlink_file_removes_link_not_target(tmp_path):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    real_target_file = tmp_path / "real-target-file.txt"
+    real_target_file.write_text("do not delete", encoding="utf-8")
+    link_file = repo / ".review-symlink.md"
+    try:
+        os.symlink(real_target_file, link_file)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink privilege/support not available in this environment")
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=tmp_path / "atk-scratch", keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    report = janitor.build_report(cfg)
+    janitor.apply(cfg, report)
+    assert real_target_file.exists()
+    assert not os.path.lexists(link_file)
+
+
+@pytest.mark.skipif(platform.system() != "Windows", reason="NTFS junctions are Windows-only")
+def test_n1_link_above_candidate_is_itself_the_candidate_not_walked_through(tmp_path):
+    """scratch_root/<agent> as a junction: the agent entry itself must be
+    treated as a candidate (never entered) - matching the repo-root
+    pass's handling of a link, not silently walked through to whatever
+    is behind it."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    scratch_root = tmp_path / "atk-scratch"
+    scratch_root.mkdir()
+    real_agent_dir = tmp_path / "real-agent-dir"
+    task_dir = real_agent_dir / "old-task"
+    task_dir.mkdir(parents=True)
+    _backdate(task_dir, 10)
+    (task_dir / "keep.txt").write_text("behind the link", encoding="utf-8")
+    agent_link = scratch_root / "dev-2"
+    if not _make_junction(agent_link, real_agent_dir):
+        pytest.skip("could not create a junction in this environment")
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=scratch_root, keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    candidates, _ = janitor.find_candidates(cfg)
+    paths = {c.path for c in candidates}
+    assert agent_link in paths  # the link itself is the candidate
+    assert task_dir not in paths  # never walked through it
+
+    report = janitor.build_report(cfg)
+    janitor.apply(cfg, report)
+    assert not os.path.lexists(agent_link)  # the link is gone
+    assert task_dir.exists()  # the target behind it was never touched
+    assert (task_dir / "keep.txt").exists()

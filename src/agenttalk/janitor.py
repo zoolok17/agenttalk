@@ -163,7 +163,7 @@ def is_link_like(path: Path) -> bool:
     `st_file_attributes` carries `FILE_ATTRIBUTE_REPARSE_POINT` (0x400) for
     BOTH symlinks and junctions. Candidates must NEVER be resolved through
     this - a link is removed as the link itself, never followed into its
-    target (Codex xhigh finding P6A/P6B: `Path.resolve()` follows symlinks
+    target (reviewer-3 finding P6A/P6B: `Path.resolve()` follows symlinks
     on POSIX too, and un-guarded escalation mirrors an empty dir INTO a
     junction's target instead of refusing it).
     """
@@ -224,7 +224,7 @@ def get_registered_worktrees(repo: Path) -> list[Path]:
 def is_dirty_worktree(path: Path) -> bool:
     """True if the worktree has ANY uncommitted change - tracked or
     untracked. An untracked file left behind by a `.worktrees/` removal is
-    real, unrecovered work (Codex xhigh finding P2); it is no longer
+    real, unrecovered work (reviewer-3 finding P2); it is no longer
     excluded from "dirty" the way a purely cosmetic ignored-file diff
     would be."""
     if not (path / ".git").exists():
@@ -302,10 +302,24 @@ def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[Path]]:
             # machine-wide, not owned the way the repo root/scratch root
             # are, so age is the load-bearing safety check for EVERY
             # entry, not an extra filter on top of a type restriction.
-            try:
-                entry_mtime = os.lstat(entry).st_mtime
-            except OSError:
-                continue
+            # A DIRECTORY entry is aged by the newest mtime anywhere in
+            # its tree, not its own top-level mtime (reviewer-3 R2 - the
+            # exact P3 flaw, recurring here): a directory's own mtime
+            # does not change when a file nested inside it is written. A
+            # link or a plain file has no nested tree, so lstat is
+            # already correct/complete for those.
+            if is_link_like(entry) or not entry.is_dir():
+                try:
+                    entry_mtime = os.lstat(entry).st_mtime
+                except OSError:
+                    continue
+            else:
+                entry_mtime, terr = _newest_mtime_in_tree(entry, at_least=cutoff)
+                if terr is not None:
+                    access_errors.append(terr)
+                    continue
+                if entry_mtime is None:
+                    continue
             if entry_mtime >= cutoff:
                 continue
             add(entry, "tmp")
@@ -316,12 +330,22 @@ def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[Path]]:
         if err is not None:
             access_errors.append(err)
         for agent_dir in agent_entries:
+            # reviewer-3 N1: a link ABOVE a candidate must not be walked
+            # through either - treat a link-like agent/task entry as a
+            # candidate in its own right (matching the repo-root pass),
+            # never recurse into what it points at.
+            if is_link_like(agent_dir):
+                add(agent_dir, "scratch-stale")
+                continue
             if not agent_dir.is_dir():
                 continue
             task_entries, terr = _safe_iterdir(agent_dir)
             if terr is not None:
                 access_errors.append(terr)
             for task_dir in task_entries:
+                if is_link_like(task_dir):
+                    add(task_dir, "scratch-stale")
+                    continue
                 if not task_dir.is_dir():
                     continue
                 # Staleness is the NEWEST mtime anywhere in the tree, not
@@ -330,7 +354,7 @@ def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[Path]]:
                 # directly inside it, NOT when a file three levels down is
                 # edited - live work under an old task directory would
                 # otherwise be misclassified as stale and deleted.
-                newest, nerr = _newest_mtime_in_tree(task_dir)
+                newest, nerr = _newest_mtime_in_tree(task_dir, at_least=cutoff)
                 if nerr:
                     access_errors.append(nerr)
                 if newest is not None and newest < cutoff:
@@ -339,14 +363,24 @@ def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[Path]]:
     return out, access_errors
 
 
-def _newest_mtime_in_tree(root: Path) -> tuple[float | None, Path | None]:
+def _newest_mtime_in_tree(
+    root: Path, *, at_least: float | None = None
+) -> tuple[float | None, Path | None]:
     """The newest mtime of `root` itself or anything nested under it.
     Returns (None, error_path) if any nested directory could not be
-    listed, rather than silently under-counting staleness."""
+    listed, rather than silently under-counting staleness.
+
+    `at_least`: if given, the caller only cares whether the tree is AT
+    LEAST this fresh (e.g. "not stale" - past some cutoff), not the exact
+    maximum - the walk returns as soon as it finds an entry that alone
+    already clears the threshold, capping cost on a very large tree
+    (reviewer-3 N4: doctor calls this on every scratch task on every run)."""
     try:
         newest = os.lstat(root).st_mtime
     except OSError:
         return None, root
+    if at_least is not None and newest >= at_least:
+        return newest, None
     entries, err = _safe_iterdir(root)
     if err is not None:
         return None, err
@@ -356,9 +390,8 @@ def _newest_mtime_in_tree(root: Path) -> tuple[float | None, Path | None]:
                 newest = max(newest, os.lstat(entry).st_mtime)
             except OSError:
                 pass
-            continue
-        if entry.is_dir():
-            sub_newest, sub_err = _newest_mtime_in_tree(entry)
+        elif entry.is_dir():
+            sub_newest, sub_err = _newest_mtime_in_tree(entry, at_least=at_least)
             if sub_err is not None:
                 return None, sub_err
             if sub_newest is not None:
@@ -368,6 +401,8 @@ def _newest_mtime_in_tree(root: Path) -> tuple[float | None, Path | None]:
                 newest = max(newest, os.lstat(entry).st_mtime)
             except OSError:
                 pass
+        if at_least is not None and newest >= at_least:
+            return newest, None
     return newest, None
 
 
@@ -433,12 +468,21 @@ class WipCommitResult:
 def wip_commit_dirty_worktree(path: Path, *, default_branches: list[str]) -> WipCommitResult:
     """Commit ALL changes (tracked and untracked - P2) as a WIP commit on
     the worktree's own branch. Refuses (no commit, and the caller must not
-    remove the directory either) if the worktree is on a default branch OR
-    is a detached HEAD (P1): a WIP commit made on a detached HEAD is
-    reachable from no ref and becomes an unreachable object the moment the
-    directory is removed - recoverable only until the next `git gc`, i.e.
-    not really preserved. `--detach` is the ops doc's OWN recommended form
-    for a review worktree, so this is not a corner case."""
+    remove the directory either) if:
+    - the worktree is on a default branch OR is a detached HEAD (P1): a WIP
+      commit made on a detached HEAD is reachable from no ref and becomes
+      an unreachable object the moment the directory is removed -
+      recoverable only until the next `git gc`, i.e. not really preserved.
+      `--detach` is the ops doc's OWN recommended form for a review
+      worktree, so this is not a corner case.
+    - `git` cannot be resolved, `git add -A` fails, `git commit` fails (a
+      refusing pre-commit hook, `commit.gpgsign` without a key, no
+      configured user identity - reviewer-3 R1), or the worktree is STILL
+      dirty after the commit supposedly succeeded. Never `--no-verify`: a
+      refusing hook should keep the work, not be bypassed. Every one of
+      these previously fell through silently - `check=False` on both git
+      calls, no return-code check, always reporting "WIP committed" while
+      apply() went on to remove the (still uncommitted) directory."""
     branch = worktree_branch(path)
     if branch in default_branches or branch in _NEVER_AUTO_COMMIT_BRANCHES_SENTINELS:
         label = branch or "an unresolvable HEAD"
@@ -447,14 +491,39 @@ def wip_commit_dirty_worktree(path: Path, *, default_branches: list[str]) -> Wip
                      f"a default branch or a detached HEAD): {path}",
             refused=True,
         )
-    _run_git(path, "add", "-A")
-    stamp = datetime.datetime.now().isoformat(timespec="seconds")
     git = shutil.which("git")
-    if git is not None:
-        subprocess.run(  # nosec B603 - resolved executable, argv list
-            [git, "-C", str(path), "commit", "-q", "-m",
-             f"wip: preserve uncommitted worktree state before scratch cleanup ({stamp})"],
-            capture_output=True, text=True, check=False,
+    if git is None:
+        return WipCommitResult(
+            message=f"  REFUSED dirty worktree on {branch} (git not resolvable, cannot "
+                     f"commit): {path}",
+            refused=True,
+        )
+    add_result = subprocess.run(  # nosec B603 - resolved executable, argv list
+        [git, "-C", str(path), "add", "-A"], capture_output=True, text=True, check=False,
+    )
+    if add_result.returncode != 0:
+        return WipCommitResult(
+            message=f"  REFUSED dirty worktree on {branch} (git add -A failed, rc="
+                     f"{add_result.returncode}: {add_result.stderr.strip()}): {path}",
+            refused=True,
+        )
+    stamp = datetime.datetime.now().isoformat(timespec="seconds")
+    commit_result = subprocess.run(  # nosec B603 - resolved executable, argv list
+        [git, "-C", str(path), "commit", "-q", "-m",
+         f"wip: preserve uncommitted worktree state before scratch cleanup ({stamp})"],
+        capture_output=True, text=True, check=False,
+    )
+    if commit_result.returncode != 0:
+        return WipCommitResult(
+            message=f"  REFUSED dirty worktree on {branch} (git commit failed, rc="
+                     f"{commit_result.returncode}: {commit_result.stderr.strip()}): {path}",
+            refused=True,
+        )
+    if _run_git(path, "status", "--porcelain").strip():
+        return WipCommitResult(
+            message=f"  REFUSED dirty worktree on {branch} (still dirty after commit - "
+                     f"refusing to remove): {path}",
+            refused=True,
         )
     return WipCommitResult(message=f"  WIP committed on {branch}: {path}", refused=False)
 
@@ -465,13 +534,21 @@ def _make_tree_writable(path: Path) -> None:
     `shutil.rmtree` on a full clone hits PermissionError before it ever
     reaches the escalation branch - reviewer-3's teardown observation).
     Best-effort; a failure here just means the subsequent remove attempt
-    may also fail and fall through to escalation as before."""
+    may also fail and fall through to escalation as before.
+
+    A link entry is skipped ENTIRELY, not just left unrecursed into
+    (reviewer-3 N3): `os.chmod` follows symlinks by default on POSIX, so
+    chmod-ing a symlink candidate would silently change its TARGET's
+    mode - exactly the kind of reach-through-the-link this module exists
+    to prevent everywhere else."""
+    if is_link_like(path):
+        return
     try:
         current = os.stat(path, follow_symlinks=False).st_mode
         os.chmod(path, current | stat.S_IWRITE)
     except OSError:
         pass
-    if is_link_like(path) or not path.is_dir():
+    if not path.is_dir():
         return
     entries, _err = _safe_iterdir(path)
     for entry in entries:
@@ -500,7 +577,7 @@ def remove_stubborn(path: Path) -> str:
     remove fails. Returns one of: 'absent', 'removed', 'removed-after-acl',
     'removed-after-robocopy', 'FAILED'. Never raises."""
     link = is_link_like(path)
-    if not link and not path.exists():
+    if not link and not os.path.lexists(path):
         return "absent"
     if link:
         try:
@@ -512,14 +589,14 @@ def remove_stubborn(path: Path) -> str:
         # P6A/P6B mistake (deleting through the link, or mirroring an
         # empty directory INTO the target). A link that resists a plain
         # unlink is reported FAILED, full stop.
-        return "removed" if not path.exists() else "FAILED"
+        return "removed" if not os.path.lexists(path) else "FAILED"
 
     is_dir = path.is_dir()
     try:
         _rmtree(path)
     except OSError:
         pass
-    if not path.exists():
+    if not os.path.lexists(path):
         return "removed"
     if platform.system() != "Windows":
         return "FAILED"
@@ -544,7 +621,7 @@ def remove_stubborn(path: Path) -> str:
         _rmtree(path)
     except OSError:
         pass
-    if not path.exists():
+    if not os.path.lexists(path):
         return "removed-after-acl"
     if not is_dir:
         return "FAILED"  # the robocopy-mirror trick below only applies to directories
@@ -563,7 +640,7 @@ def remove_stubborn(path: Path) -> str:
         _rmtree(path)
     except OSError:
         pass
-    return "removed-after-robocopy" if not path.exists() else "FAILED"
+    return "removed-after-robocopy" if not os.path.lexists(path) else "FAILED"
 
 
 def apply(cfg: JanitorConfig, report: JanitorReport) -> str:

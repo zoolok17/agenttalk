@@ -1847,3 +1847,45 @@ def test_check_codex_config_warns_on_duplicate_tables(tmp_path: Path, monkeypatc
     assert chk.status == "warn"
     assert "duplicate" in chk.details.lower()
     assert "codex-config --enable" in chk.fix
+
+
+def test_check_scratch_hygiene_uses_configured_tmp_root_never_the_real_one(tmp_path: Path) -> None:
+    """#148 fix round: the scratch-hygiene check must scan the CONFIGURED
+    tmp_root, not silently fall through to the real OS temp directory in a
+    project that pins one - proves the check completes correctly and fast
+    against a small, controlled tree rather than the real (potentially
+    huge, unbounded) system temp root."""
+    proj = tmp_path / "proj"
+    (proj / ".agenttalk").mkdir(parents=True)
+    fake_tmp_root = tmp_path / "fake-tmp"
+    fake_tmp_root.mkdir()
+    (proj / ".agenttalk" / "config.json").write_text(
+        json.dumps({"agents": ["a", "b"], "scratch": {"tmp_root": str(fake_tmp_root)}}),
+        encoding="utf-8",
+    )
+    check = doctor._check_scratch_hygiene(proj)
+    assert check is None  # nothing to warn about in an empty, controlled tree
+
+
+def test_check_scratch_hygiene_warns_and_names_access_errors(tmp_path: Path, monkeypatch) -> None:
+    """#148 fix round R2/P5: an unlistable location surfaces through the
+    doctor check as a named warning, never silently swallowed (the
+    original bug this check exists to prevent) and never a raised
+    exception out of doctor.run()."""
+    proj = tmp_path / "proj"
+    (proj / ".agenttalk").mkdir(parents=True)
+    fake_tmp_root = tmp_path / "fake-tmp"
+    fake_tmp_root.mkdir()
+    (proj / ".agenttalk" / "config.json").write_text(
+        json.dumps({"agents": ["a", "b"], "scratch": {"tmp_root": str(fake_tmp_root)}}),
+        encoding="utf-8",
+    )
+
+    def _raise_iterdir(self):
+        raise PermissionError("simulated access denied")
+
+    monkeypatch.setattr(Path, "iterdir", _raise_iterdir)
+    result = doctor._check_scratch_hygiene(proj)
+    assert result is not None
+    assert result.status == "warn"
+    assert "could not be listed" in result.details

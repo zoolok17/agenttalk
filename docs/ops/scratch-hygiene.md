@@ -102,14 +102,23 @@ In order:
    older than `keep_days` - a directory's mtime does not change when a
    file nested inside it is edited). Reports, for every registered git
    worktree, whether it has ANY uncommitted change (tracked or
-   untracked). A location the janitor could not even list (e.g. an
-   ACL-denied directory) is reported as `FAILED to list`, never silently
-   skipped or swallowed.
+   untracked - but NOT ignored: `git status --porcelain` never lists an
+   ignored file, so a worktree whose only content is gitignored files is
+   not "dirty" and can be removed without a WIP commit). A location the
+   janitor could not even list (e.g. an ACL-denied directory) is reported
+   as `FAILED to list`, never silently skipped or swallowed.
 2. **`--apply`**: for each dirty worktree, commits ALL changes (tracked
    and untracked) as a WIP commit on the worktree's OWN branch - REFUSED
    OUTRIGHT (neither committed nor removed) on a default branch
-   (`master`/`main` by default, configurable) or a detached `HEAD`. A
-   detached-HEAD WIP commit would be reachable from no ref and become
+   (`master`/`main` by default, configurable), a detached `HEAD`, or if
+   the commit itself fails for any reason - `git` unresolvable, `git add`
+   or `git commit` returning a non-zero exit code (a refusing pre-commit
+   hook, `commit.gpgsign` without a key, no configured user identity), or
+   the worktree still showing as dirty immediately after the commit. A
+   directory is only ever removed once its worktree is confirmed CLEAN,
+   never on the strength of "the commit command was run" - never
+   `--no-verify`: a refusing hook should keep the work, not be bypassed.
+   A detached-HEAD WIP commit would be reachable from no ref and become
    effectively lost the moment its directory is removed, so a detached
    worktree is refused the same way a default-branch one is, even though
    `git worktree add --detach` is Rule 2's own recommended form for a
