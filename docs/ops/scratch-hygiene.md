@@ -133,10 +133,14 @@ In order:
    review worktree - commit it onto a real branch (or leave it) before
    closing the task if it must survive `--apply`. A CLEAN detached
    worktree is not automatically safe either: if its HEAD holds a commit
-   that no branch or tag contains (a reviewer's local fixup left on the
-   checkout, say), it is refused too, dirty or not - pruning a clean-
-   looking worktree like that would drop the only ref keeping that commit
-   reachable.
+   that no branch, tag, or remote-tracking ref contains, it is refused
+   too, dirty or not - pruning a clean-looking worktree like that would
+   drop the only ref keeping that commit reachable. Remote-tracking refs
+   count deliberately: Rule 2's own recommended review-worktree form is
+   routinely detached at a fetched PR head that lives only under
+   `refs/remotes/origin/*` until it lands on a local branch, and without
+   crediting that, an ordinary, disposable review checkout would be
+   refused on every single run for as long as it exists.
 
    A refusal applies in BOTH directions: a scratch task directory that
    itself looks stale by age but CONTAINS a refused worktree (exactly
@@ -147,17 +151,24 @@ In order:
    `.git` entry (a clone's own `.git` directory, or a worktree's gitdir
    FILE) that is not a registered worktree of THIS repository is refused
    outright - another seat's dirty worktree living under the shared
-   scratch root (Rule 1), or a standalone clone nobody registered
-   anywhere, is invisible to `git worktree list` here and gets exactly
-   the same protection as if it were. When git itself cannot be trusted
-   (unresolvable, or `worktree list` failing) the same refusal applies
-   even more broadly: any directory the janitor cannot ask git about at
-   all is refused if its own tree contains a `.git` entry anywhere, or
-   if any part of that tree could not even be listed - staleness age
-   never overrides either check. Removes the allow-listed candidates - a
-   symlink or junction candidate is removed AS THE LINK ITSELF; its
-   target (and anything behind it, `.git` or otherwise) is never
-   touched, entered, or overwritten. Runs `git worktree prune`.
+   scratch root (Rule 1), a standalone clone nobody registered anywhere,
+   or even this repository's OWN worktree if its `.git/worktrees/<name>`
+   admin entry has separately gone missing, is invisible to `git
+   worktree list` here and gets exactly the same protection as if it
+   were. This ownership check is NOT limited to the scratch root or the
+   repository root - it applies inside `.worktrees/` too: that location's
+   "every directory there is a candidate, regardless of name" design (see
+   Report mode, above) means the family filter is absent, not that
+   ownership stops mattering; an unregistered tree dropped there is
+   refused exactly like one found anywhere else. When git itself cannot
+   be trusted (unresolvable, or `worktree list` failing) the same
+   refusal applies even more broadly: any directory the janitor cannot
+   ask git about at all is refused if its own tree contains a `.git`
+   entry anywhere, or if any part of that tree could not even be listed
+   - staleness age never overrides either check. Removes the allow-listed
+   candidates - a symlink or junction candidate is removed AS THE LINK
+   ITSELF; its target (and anything behind it, `.git` or otherwise) is
+   never touched, entered, or overwritten. Runs `git worktree prune`.
 3. **Removals that fail** (e.g. sandbox-restricted ACLs on Windows, or a
    link that resists even a plain unlink): printed as `FAILED`, never
    silently skipped, with an elevated re-run hint (Windows only; the

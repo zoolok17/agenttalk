@@ -1310,3 +1310,189 @@ def test_r3_link_inside_candidate_is_never_descended_into(tmp_path, monkeypatch)
     assert not candidate.exists()  # the candidate itself IS removed
     assert other_wt.exists()  # but the link's target was never entered
     assert (other_wt / "precious.txt").exists()
+
+
+# ----------------------------------------------- .worktrees/ ownership (round 7)
+
+
+def test_p5_worktrees_dir_foreign_clones_dirty_worktree_survives(tmp_path):
+    """Round-7 R1: the ownership check must also apply to .worktrees/
+    entries - that pass adds EVERY directory found there regardless of
+    name, not just ones git actually recognizes. A worktree registered
+    to a DIFFERENT clone, dropped directly under repo A's own
+    .worktrees/, must not be removed just because repo A's own `worktree
+    list` has never heard of it."""
+    repo_a = tmp_path / "repo-a"
+    _init_repo(repo_a)
+    repo_b = tmp_path / "repo-b"
+    _init_repo(repo_b)
+
+    wt = repo_a / ".worktrees" / "wt-foreign"
+    _git(repo_b, "worktree", "add", "-q", "--detach", str(wt), "master")
+    (wt / "precious.txt").write_text("do not lose me", encoding="utf-8")
+
+    cfg = janitor.JanitorConfig(
+        repo=repo_a, scratch_root=tmp_path / "atk-scratch", keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    candidates, access_errors = janitor.find_candidates(cfg)
+    assert wt not in {c.path for c in candidates}
+    assert any(p == wt for p, _reason in access_errors)
+
+    report = janitor.build_report(cfg)
+    janitor.apply(cfg, report)
+    assert wt.exists()
+    assert (wt / "precious.txt").exists()
+
+
+def test_p6_worktrees_dir_standalone_clone_survives(tmp_path):
+    """Round-7 R1: a standalone clone (not any worktree at all) dropped
+    directly under .worktrees/ must survive too - "every directory there
+    is a candidate" is about the family filter being absent, not about
+    ownership being irrelevant."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    clone = repo / ".worktrees" / "standalone"
+    _init_repo(clone)
+    (clone / "uncommitted.txt").write_text("do not lose me", encoding="utf-8")
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=tmp_path / "atk-scratch", keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    candidates, access_errors = janitor.find_candidates(cfg)
+    assert clone not in {c.path for c in candidates}
+    assert any(p == clone for p, _reason in access_errors)
+
+    report = janitor.build_report(cfg)
+    janitor.apply(cfg, report)
+    assert clone.exists()
+    assert (clone / "uncommitted.txt").exists()
+
+
+def test_p7_own_worktree_with_missing_admin_entry_survives(tmp_path):
+    """Round-7 R1: this repo's OWN worktree, registered normally, whose
+    `.git/worktrees/<name>` admin entry has separately gone missing (git
+    no longer lists it at all) is exactly the "real, unrecovered work"
+    is_dirty_worktree's own docstring names - it must survive just like a
+    genuinely foreign tree, not be removed because git can no longer
+    vouch for it."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    wt = repo / ".worktrees" / "wt-orphaned-admin"
+    _git(repo, "worktree", "add", "-q", "-b", "feature-orphaned", str(wt), "master")
+    (wt / "precious.txt").write_text("do not lose me", encoding="utf-8")
+
+    # Simulate the admin entry vanishing: `git worktree list` no longer
+    # knows about it, but the worktree's own directory (and its .git
+    # gitdir-pointer FILE) is untouched.
+    admin_line = (wt / ".git").read_text(encoding="utf-8").strip()
+    assert admin_line.startswith("gitdir: ")
+    admin_dir = Path(admin_line[len("gitdir: "):])
+    shutil.rmtree(admin_dir)
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=tmp_path / "atk-scratch", keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    assert wt not in set(janitor.get_registered_worktrees(repo))  # git no longer lists it
+    candidates, access_errors = janitor.find_candidates(cfg)
+    assert wt not in {c.path for c in candidates}
+    assert any(p == wt for p, _reason in access_errors)
+
+    report = janitor.build_report(cfg)
+    janitor.apply(cfg, report)
+    assert wt.exists()
+    assert (wt / "precious.txt").exists()
+
+
+def test_mo3_trusted_discovery_refuses_unlistable_subtree(tmp_path, monkeypatch):
+    """R2/MO3: the TRUSTED-discovery ownership branch must also refuse on
+    an unlistable subtree (`if foreign or unlistable`), not just a
+    foreign .git - every existing unlistable-subtree cell runs under
+    UNTRUSTED discovery, so dropping `or unlistable` from the trusted
+    branch alone would stay green against them."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    candidate = repo / ".review-unlistable-trusted"
+    blocked = candidate / "unlistable"
+    blocked.mkdir(parents=True)
+
+    real_safe_iterdir = janitor._safe_iterdir
+
+    def _blocked_iterdir(path):
+        if path == blocked:
+            return [], (path, "simulated access denied")
+        return real_safe_iterdir(path)
+
+    monkeypatch.setattr(janitor, "_safe_iterdir", _blocked_iterdir)
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=tmp_path / "atk-scratch", keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    candidates, access_errors = janitor.find_candidates(cfg)
+    assert candidate not in {c.path for c in candidates}
+    assert any(p == candidate for p, _reason in access_errors)
+
+
+def test_mh2_reachability_check_failure_is_treated_as_unreachable(tmp_path, monkeypatch):
+    """R2/MH2: a `for-each-ref --contains` call that itself fails must be
+    read as unreachable (fail closed), not reachable - no other cell
+    makes the reachability check itself fail, so flipping this branch
+    alone would stay green."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    wt = repo / ".worktrees" / "wt-mh2"
+    _git(repo, "worktree", "add", "-q", "--detach", str(wt), "master")
+
+    real_run = janitor.subprocess.run
+
+    def _fail_for_each_ref(cmd, *args, **kwargs):
+        if "for-each-ref" in cmd and str(wt) in cmd:
+            return subprocess.CompletedProcess(cmd, 128, stdout="",
+                                                 stderr="fatal: simulated failure")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(janitor.subprocess, "run", _fail_for_each_ref)
+    assert janitor.worktree_head_reachable(wt) is False
+
+
+def test_p8c_clean_detached_worktree_at_branch_tip_in_stale_task_is_removed(tmp_path):
+    """R2/MH3 control: a clean detached worktree whose HEAD IS reachable
+    (checked out exactly at a branch tip, no extra commits) must still be
+    removable - dropping refs/heads from the reachability check would
+    refuse every detached worktree unconditionally, and nothing else
+    would notice."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    scratch_root = tmp_path / "atk-scratch"
+    task_dir = scratch_root / "dev-9" / "old-review-reachable"
+    task_dir.mkdir(parents=True)
+    wt = task_dir / "wt-clean-detached-reachable"
+    _git(repo, "worktree", "add", "-q", "--detach", str(wt), "master")
+    for p in sorted(task_dir.rglob("*"), reverse=True):
+        _backdate(p, 10)
+    _backdate(task_dir, 10)
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=scratch_root, keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    report = janitor.build_report(cfg)
+    assert wt not in set(report.dirty_worktrees)  # clean
+    assert janitor.worktree_branch(wt) in janitor._NEVER_AUTO_COMMIT_BRANCHES_SENTINELS
+    assert janitor.worktree_head_reachable(wt) is True  # exactly at master's tip
+
+    janitor.apply(cfg, report)
+    assert not task_dir.exists()  # removed - nothing here needed protecting

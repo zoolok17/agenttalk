@@ -341,17 +341,26 @@ def worktree_branch(path: Path) -> str | None:
 
 def worktree_head_reachable(path: Path) -> bool:
     """True if the worktree's HEAD commit is reachable from an existing
-    branch or tag (`git for-each-ref --contains HEAD refs/heads
-    refs/tags` is non-empty). False (unreachable) also if the check
-    itself could not be completed - fail closed: a detached HEAD whose
-    reachability this janitor cannot confirm is exactly the case that
-    must be protected, not assumed safe. Only meaningful for a DETACHED
-    worktree (`worktree_branch` returning `None` or the literal string
-    `"HEAD"` - git's own `rev-parse --abbrev-ref HEAD` prints "HEAD" for
-    a detached checkout, not an empty string) - a worktree checked out
-    onto a real branch is trivially reachable via that branch itself."""
+    branch, tag, or remote-tracking ref (`git for-each-ref --contains
+    HEAD refs/heads refs/tags refs/remotes` is non-empty). `refs/remotes`
+    is included deliberately: Rule 2's own recommended review-worktree
+    form (`git worktree add --detach <scratch>/wt-<sha> <sha>`) is
+    routinely detached at a fetched PR head that lives ONLY under
+    `refs/remotes/origin/*` until it lands on a local branch - without
+    it, that ordinary, disposable checkout would be refused on every
+    single run for as long as it exists (over-refusal, not data loss,
+    but it defeats the point of automated cleanup for the exact case the
+    docs recommend). False (unreachable) also if the check itself could
+    not be completed - fail closed: a detached HEAD whose reachability
+    this janitor cannot confirm is exactly the case that must be
+    protected, not assumed safe. Only meaningful for a DETACHED worktree
+    (`worktree_branch` returning `None` or the literal string `"HEAD"` -
+    git's own `rev-parse --abbrev-ref HEAD` prints "HEAD" for a detached
+    checkout, not an empty string) - a worktree checked out onto a real
+    branch is trivially reachable via that branch itself."""
     rc, out, _err = _run_git_checked(
-        path, "for-each-ref", "--contains", "HEAD", "refs/heads", "refs/tags",
+        path, "for-each-ref", "--contains", "HEAD",
+        "refs/heads", "refs/tags", "refs/remotes",
     )
     if rc != 0:
         return False
@@ -386,12 +395,16 @@ def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[tuple[Pat
             entry_mtime = os.lstat(path).st_mtime
         except OSError:
             return
-        # .worktrees/ entries are exempt: that pass already gates on
-        # discovery_ok itself (nothing is added from it at all when
-        # discovery can't be trusted), and every entry it DOES add is,
-        # by construction, a worktree of cfg.repo - re-walking it here
-        # would be redundant, not protective.
-        if reason != "worktrees-dir" and not is_link_like(path) and path.is_dir():
+        # No exemption for .worktrees/ entries: that pass adds EVERY
+        # directory found there regardless of name (see below), not just
+        # ones git actually knows about - an unregistered tree living
+        # there (another clone's worktree dropped in by hand, a
+        # standalone clone, or this repo's OWN worktree whose
+        # `.git/worktrees/<name>` admin entry was separately lost) is
+        # exactly as invisible to `get_registered_worktrees` as one
+        # found anywhere else, and the dirty/refuse gate in apply() only
+        # ever runs for entries git DOES still recognize as registered.
+        if not is_link_like(path) and path.is_dir():
             git_entries, unlistable = _find_git_entries(path)
             if not discovery_ok:
                 if git_entries or unlistable:
