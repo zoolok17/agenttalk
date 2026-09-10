@@ -736,7 +736,7 @@ _AGENTTALK_SUBCOMMANDS = frozenset(
     "request-restart commit-gate request-launch wrap "
     "_internal-check-wrap-dispatch dead-letter managed-lead-loop supervise "
     "deadman reply tail start serve dashboard reset doctor gateway hmac-init "
-    "capacity install-skills codex-config comprehension".split()
+    "capacity install-skills codex-config comprehension scratch janitor".split()
 )
 _LAUNCHER_DERIVED_PRIOR_SOURCES = {"launch_child_provenance"}
 _DIAGNOSTIC_COUNTERS = (
@@ -12860,7 +12860,16 @@ function Resolve-AgenttalkScratchRoot($agentName) {
   if ($SrcOnPyPath) { $env:PYTHONPATH = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
   try {
     $out = & $AgenttalkPython -m agenttalk --root $Root scratch root --for $agentName 2>$null
-    if ($LASTEXITCODE -eq 0 -and $out) { return ([string]$out).Trim() }
+    if ($LASTEXITCODE -ne 0 -or -not $out) { return $null }
+    # Reviewer-3 H5: $out can be an array of lines (multi-line stdout, e.g.
+    # stray output ahead of the real path) - take the LAST non-empty line,
+    # not the whole blob, and never trust it without confirming it is
+    # actually an existing directory before exporting it as an env var a
+    # child process will treat as a writable scratch root.
+    $lines = @($out) | Where-Object { $_ -and ([string]$_).Trim() }
+    if ($lines.Count -eq 0) { return $null }
+    $candidate = ([string]$lines[-1]).Trim()
+    if (Test-Path -LiteralPath $candidate -PathType Container) { return $candidate }
     return $null
   } catch {
     return $null

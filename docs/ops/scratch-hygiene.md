@@ -37,16 +37,24 @@ or the long form (any key may be omitted):
 {"scratch": {"root": "D:/custom/scratch/root", "keep_days": 3}}
 ```
 
-Resolve and create the per-agent/per-task directory with:
+Resolve and create it with:
 
 ```
-agenttalk scratch root --for <agent> [--task <id>]
+agenttalk scratch root --for <agent>              # the agent's OWN root: <scratch_root>/<agent>
+agenttalk scratch root --for <agent> --task <id>  # a task-scoped subdirectory: .../<agent>/<task>
 ```
 
-A wrapped agent also finds it pre-resolved in `$AGENTTALK_SCRATCH` (the
-wrapper exports the per-seat root at launch; a dispatch that predates this
-feature, or a project without a `"scratch"` config key, still works - the
-default root always resolves, config or not).
+A wrapped agent also finds the agent's own root pre-resolved in
+`$AGENTTALK_SCRATCH` (the wrapper exports it at launch; a dispatch that
+predates this feature, or a project without a `"scratch"` config key,
+still works - the default root always resolves, config or not). It is
+deliberately the AGENT root, not a task subdirectory: `$AGENTTALK_SCRATCH`
+lives for the whole supervised session, so pinning it to one task
+directory would make everything written there subject to that task's
+staleness window even while the seat is still actively using it (a real
+data-loss path measured during review - see the janitor's own staleness
+rule below). Scope further with `--task <id>` explicitly for anything
+that should age out on its own.
 
 Uses:
 - pytest: `--basetemp <scratch_root>/<seat>/<task-id>/pt`
@@ -81,28 +89,47 @@ agenttalk janitor --apply --keep-days 7    # override the scratch-root staleness
 In order:
 
 1. **Report mode** (default): lists scratch candidates under the
-   repository root, `.worktrees/`, the OS temp root (allow-listed name
-   families only, configurable), and the scratch root (past its
-   `keep_days` window), with counts and the oldest entries - and, for
-   every registered git worktree, whether it has uncommitted changes to
-   TRACKED files (an all-untracked worktree is not "dirty" in this
-   sense).
-2. **`--apply`**: for each dirty worktree, commits the tracked changes as
-   a WIP commit on the worktree's OWN branch - refused outright on a
-   default branch (`master`/`main` by default, configurable), never
-   auto-committed there. Removes the allow-listed candidates. Runs
+   repository root (allow-listed name families only, configurable),
+   `.worktrees/` (**every** directory there is a candidate, regardless of
+   name - that location IS the family, unlike the repository root), the
+   OS temp root (a narrower, case-SENSITIVE, directories-only,
+   age-windowed family list - the temp root is shared with every other
+   program on the machine, so it is treated far more conservatively than
+   the repository root), and the scratch root (a task directory whose
+   NEWEST file anywhere in its tree, not the directory's own mtime, is
+   older than `keep_days` - a directory's mtime does not change when a
+   file nested inside it is edited). Reports, for every registered git
+   worktree, whether it has ANY uncommitted change (tracked or
+   untracked). A location the janitor could not even list (e.g. an
+   ACL-denied directory) is reported as `FAILED to list`, never silently
+   skipped or swallowed.
+2. **`--apply`**: for each dirty worktree, commits ALL changes (tracked
+   and untracked) as a WIP commit on the worktree's OWN branch - REFUSED
+   OUTRIGHT (neither committed nor removed) on a default branch
+   (`master`/`main` by default, configurable) or a detached `HEAD`. A
+   detached-HEAD WIP commit would be reachable from no ref and become
+   effectively lost the moment its directory is removed, so a detached
+   worktree is refused the same way a default-branch one is, even though
+   `git worktree add --detach` is Rule 2's own recommended form for a
+   review worktree - commit it onto a real branch (or leave it) before
+   closing the task if it must survive `--apply`. Removes the allow-listed
+   candidates - a symlink or junction candidate is removed AS THE LINK
+   ITSELF; its target is never touched, entered, or overwritten. Runs
    `git worktree prune`.
-3. **Directories that refuse removal** (e.g. sandbox-restricted ACLs on
-   Windows): printed as `FAILED`, never silently skipped, with an
-   elevated re-run hint (Windows only; the escalation itself - taking
-   ownership and re-granting access - also only runs on Windows, and only
-   in `--apply`). The command is idempotent: re-running after fixing
+3. **Removals that fail** (e.g. sandbox-restricted ACLs on Windows, or a
+   link that resists even a plain unlink): printed as `FAILED`, never
+   silently skipped, with an elevated re-run hint (Windows only; the
+   escalation itself - taking ownership and re-granting access - also
+   only runs on Windows, only in `--apply`, and never against a
+   symlink/junction). The command is idempotent: re-running after fixing
    permissions removes what's left.
 
-The janitor never touches: `.agenttalk/` (the bus), tracked files, or a
+The janitor never touches: `.agenttalk/` (the bus), tracked files, a
 configured `"foreign"` folder under the temp root (`scratch.foreign` in
-config - reported and kept, never removed). It never removes a directory
-that doesn't match an allow-listed name family.
+config - reported and kept, never removed), or the target behind a
+symlink/junction candidate. Outside `.worktrees/` (where every directory
+is in scope), it never removes something that doesn't match an
+allow-listed name family.
 
 `agenttalk doctor` warns when registered worktrees or scratch-family
 candidates exist outside the scratch root, so this doesn't need to be

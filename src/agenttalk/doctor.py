@@ -1398,7 +1398,7 @@ def _check_scratch_hygiene(project_root: Path) -> Check | None:
     """
     try:
         cfg = janitormod.JanitorConfig.load(project_root)
-        candidates = janitormod.find_candidates(cfg)
+        candidates, access_errors = janitormod.find_candidates(cfg)
         registered = janitormod.get_registered_worktrees(project_root)
     except OSError:
         return None
@@ -1409,13 +1409,18 @@ def _check_scratch_hygiene(project_root: Path) -> Check | None:
     # "scratch-stale" candidates already live under the scratch root (just
     # past keep_days) - not sprawl outside it, so they don't count here.
     outside_candidates = [c for c in candidates if c.reason != "scratch-stale"]
-    if not outside_worktrees and not outside_candidates:
+    if not outside_worktrees and not outside_candidates and not access_errors:
         return None
     parts = []
     if outside_worktrees:
         parts.append(f"{len(outside_worktrees)} registered worktree(s) outside the scratch root")
     if outside_candidates:
         parts.append(f"{len(outside_candidates)} scratch-family candidate(s) outside the scratch root")
+    # #148 acceptance: a directory the janitor can't even list is reported
+    # as FAILED, never silently skipped - doctor must not swallow it either.
+    if access_errors:
+        parts.append(f"{len(access_errors)} location(s) could not be listed (permissions?): "
+                      + ", ".join(str(p) for p in access_errors))
     return Check(
         name="scratch_hygiene",
         status="warn",

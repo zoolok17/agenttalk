@@ -9426,12 +9426,18 @@ def cmd_capacity(args: argparse.Namespace) -> int:
 
 
 def cmd_scratch(args: argparse.Namespace) -> int:
-    """Resolve (and create) a seat's per-task scratch directory (#148)."""
+    """Resolve (and create) a seat's scratch directory (#148). With --task,
+    the task-scoped subdirectory; without it, the agent's own root (NOT a
+    "default" task subdirectory - a seat's long-lived scratch export must
+    not itself be subject to the task-level staleness window)."""
     root = Path(args.root).resolve() if getattr(args, "root", None) else find_root()
     if args.scratch_cmd == "root":
         agent = _resolve_self(args.agent, roster=None)
         try:
-            path = scratchmod.task_scratch_dir(root, agent, args.task)
+            if args.task:
+                path = scratchmod.task_scratch_dir(root, agent, args.task)
+            else:
+                path = scratchmod.agent_scratch_dir(root, agent)
         except ValueError as e:
             sys.stderr.write(f"agenttalk: {e}\n")
             return 2
@@ -15949,13 +15955,16 @@ def build_parser() -> argparse.ArgumentParser:
     scratchsub = pscratch.add_subparsers(dest="scratch_cmd")
     pscratch_root = scratchsub.add_parser(
         "root",
-        help="Resolve (and create) <scratch_root>/<agent>/<task>; prints the path. "
-             "scratch_root is .agenttalk/config.json's \"scratch\" key, or a sibling "
-             "atk-scratch/ next to the project root by default.",
+        help="Resolve (and create) the agent's scratch root <scratch_root>/<agent>, "
+             "or with --task the task-scoped <scratch_root>/<agent>/<task>; prints "
+             "the path. scratch_root is .agenttalk/config.json's \"scratch\" key, "
+             "or a sibling atk-scratch/ next to the project root by default.",
     )
     pscratch_root.add_argument("--for", dest="agent",
                                help="Agent name (default: $AGENTTALK_SELF)")
-    pscratch_root.add_argument("--task", help="Task id (default: \"default\")")
+    pscratch_root.add_argument("--task",
+                               help="Task id; scopes to <scratch_root>/<agent>/<task> "
+                                    "instead of the agent's own root")
     pscratch_root.set_defaults(func=cmd_scratch)
 
     pjanitor = sub.add_parser(
