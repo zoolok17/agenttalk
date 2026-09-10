@@ -32,8 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   anywhere in the tree, not the directory's own); and reports a removal
   that fails, or a location it could not even list, as `FAILED` with an
   elevated re-run hint, never silently skipped. The OS temp root gets a
-  narrower, case-sensitive, directories-only, age-windowed family list -
-  it is shared with every other program on the machine. `agenttalk
+  narrower, case-sensitive family list matching files and directories
+  alike, every entry individually gated by an age window - it is shared
+  with every other program on the machine. `agenttalk
   doctor` warns when registered worktrees, scratch families, or
   unlistable locations exist outside the scratch root. See
   `docs/ops/scratch-hygiene.md`.

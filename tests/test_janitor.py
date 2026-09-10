@@ -87,9 +87,11 @@ def tree(tmp_path):
     _backdate(old_matching_dir, 5)
     fresh_matching_dir = tmp_root / "pytest-of-inuse"
     fresh_matching_dir.mkdir()  # fresh mtime - inside the age window, must survive
-    old_matching_file = tmp_root / "pytest-of-notadir.log"
-    old_matching_file.write_text("log", encoding="utf-8")
+    old_matching_file = tmp_root / "surefire-report.txt"
+    old_matching_file.write_text("report", encoding="utf-8")
     _backdate(old_matching_file, 5)
+    fresh_matching_file = tmp_root / "surefire-inuse.txt"
+    fresh_matching_file.write_text("in progress", encoding="utf-8")  # fresh - must survive
     wrong_case_dir = tmp_root / "PYTEST-OF-WRONGCASE"
     wrong_case_dir.mkdir()
     _backdate(wrong_case_dir, 5)
@@ -120,7 +122,7 @@ def tree(tmp_path):
         tmp_root=tmp_root,
         repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
         repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES,
-        tmp_families=["pytest-of-*", "agenttalk-review-*"],
+        tmp_families=["pytest-of-*", "agenttalk-review-*", "surefire-*"],
         foreign=["agenttalk-review-keepme"],
         default_branches=["master", "main"],
     )
@@ -130,8 +132,8 @@ def tree(tmp_path):
         "scratch_root": scratch_root, "stale": stale,
         "live_but_old_dir": live_but_old_dir, "fresh": fresh,
         "old_matching_dir": old_matching_dir, "fresh_matching_dir": fresh_matching_dir,
-        "old_matching_file": old_matching_file, "wrong_case_dir": wrong_case_dir,
-        "foreign": foreign,
+        "old_matching_file": old_matching_file, "fresh_matching_file": fresh_matching_file,
+        "wrong_case_dir": wrong_case_dir, "foreign": foreign,
     }
 
 
@@ -189,11 +191,19 @@ def test_p4_temp_root_fresh_matching_dir_survives_age_window(tree):
     assert tree["fresh_matching_dir"] not in paths
 
 
-def test_p4_temp_root_matching_file_is_never_a_candidate(tree):
-    """Files are excluded from the temp root entirely - only directories."""
+def test_p4_temp_root_old_matching_file_is_a_candidate(tree):
+    """Files ARE eligible temp-root candidates (some real families, like a
+    Mockito boot log or a surefire report, are files, not directories) -
+    gated by the same age window as directories, never excluded by type."""
     candidates, _ = janitor.find_candidates(tree["cfg"])
     paths = {c.path for c in candidates}
-    assert tree["old_matching_file"] not in paths
+    assert tree["old_matching_file"] in paths
+
+
+def test_p4_temp_root_fresh_matching_file_survives_age_window(tree):
+    candidates, _ = janitor.find_candidates(tree["cfg"])
+    paths = {c.path for c in candidates}
+    assert tree["fresh_matching_file"] not in paths
 
 
 def test_p4_temp_root_matching_is_case_sensitive(tree):
@@ -215,12 +225,13 @@ def test_apply_keeps_foreign_folder_that_matches_a_family(tree):
     assert (tree["foreign"] / "important.txt").exists()
 
 
-def test_apply_removes_matching_non_foreign_old_tmp_dir(tree):
+def test_apply_removes_matching_non_foreign_old_tmp_entries(tree):
     report = janitor.build_report(tree["cfg"])
     janitor.apply(tree["cfg"], report)
     assert not tree["old_matching_dir"].exists()
+    assert not tree["old_matching_file"].exists()
     assert tree["fresh_matching_dir"].exists()
-    assert tree["old_matching_file"].exists()
+    assert tree["fresh_matching_file"].exists()
 
 
 # --------------------------------------------------------------------- P3

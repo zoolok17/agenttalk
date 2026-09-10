@@ -92,10 +92,12 @@ In order:
    repository root (allow-listed name families only, configurable),
    `.worktrees/` (**every** directory there is a candidate, regardless of
    name - that location IS the family, unlike the repository root), the
-   OS temp root (a narrower, case-SENSITIVE, directories-only,
-   age-windowed family list - the temp root is shared with every other
-   program on the machine, so it is treated far more conservatively than
-   the repository root), and the scratch root (a task directory whose
+   OS temp root (a narrower, case-SENSITIVE family list, matching files
+   and directories alike, every entry individually gated by an age window
+   - `tmp_keep_days`, comfortably longer than a normal task/gate duration
+   - the temp root is shared with every other program on the machine, so
+   it is treated far more conservatively than the repository root), and
+   the scratch root (a task directory whose
    NEWEST file anywhere in its tree, not the directory's own mtime, is
    older than `keep_days` - a directory's mtime does not change when a
    file nested inside it is edited). Reports, for every registered git

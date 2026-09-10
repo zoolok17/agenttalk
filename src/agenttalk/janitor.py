@@ -20,7 +20,7 @@ Config (optional, `.agenttalk/config.json`, key `"scratch"`, long form):
         "repo_dir_families": [...],       # fnmatch globs, repo root, directories
         "repo_file_families": [...],      # fnmatch globs, repo root, files
         "tmp_root": "...",                # default: the OS temp dir
-        "tmp_families": [...],            # fnmatch globs, temp root, DIRECTORIES only
+        "tmp_families": [...],            # fnmatch globs, temp root, age-gated per entry
         "foreign": [...],                 # exact names under tmp_root: report, never remove
         "default_branches": ["master", "main"]
       }
@@ -61,11 +61,16 @@ DEFAULT_REPO_FILE_FAMILIES = [
 # shared with every OTHER program on the machine, so a family here must be
 # specific enough not to collide with something real (reviewer-3 measured
 # 157 false-positive matches on the old, broader list, including a live
-# pytest run). Directories only - see find_candidates.
+# pytest run), and every match - file or directory - is still gated by
+# tmp_keep_days below (see find_candidates). No estate/project-specific
+# name belongs here (#148 requires the shipped defaults stay
+# project-agnostic) - a project's own real-boot/integration-test scratch
+# families belong in ITS OWN .agenttalk/config.json under
+# scratch.tmp_families, never in this list.
 DEFAULT_TMP_FAMILIES = [
     "pytest-of-*", "agenttalk-review-*", "agenttalk-reply-*",
     "agenttalk-gate-*", "agenttalk-probe-*", "agenttalk-wf-*",
-    "mockitoboot*", "backend-request-test-*", "surefire*",
+    "mockitoboot*", "surefire*",
 ]
 DEFAULT_TMP_KEEP_DAYS = 1
 # Never removed regardless of family match, even if a candidate happens to
@@ -291,13 +296,12 @@ def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[Path]]:
                 continue
             if not _matches_any(entry.name, cfg.tmp_families):
                 continue
-            # Directories only (P4): a matching FILE in the shared temp
-            # root (another program's log, e.g.) is not this janitor's to
-            # remove - and age-gated, since this root is shared machine-
-            # wide, not owned the way the repo root/scratch root are.
-            link = is_link_like(entry)
-            if not link and not entry.is_dir():
-                continue
+            # A match here (file OR directory - some real families, like
+            # a Mockito boot log or a surefire report, are files) is only
+            # a candidate once past tmp_keep_days: this root is shared
+            # machine-wide, not owned the way the repo root/scratch root
+            # are, so age is the load-bearing safety check for EVERY
+            # entry, not an extra filter on top of a type restriction.
             try:
                 entry_mtime = os.lstat(entry).st_mtime
             except OSError:
