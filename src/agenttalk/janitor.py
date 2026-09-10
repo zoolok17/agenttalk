@@ -265,6 +265,32 @@ def _worktrees_discovery_ok(repo: Path) -> tuple[bool, str]:
     return True, ""
 
 
+def _tree_contains_git_entry(root: Path) -> bool:
+    """True if `root`'s own tree contains a `.git` entry (a directory, for
+    an ordinary clone, or a file, for a worktree's gitdir pointer)
+    anywhere - an lstat-based walk, entirely independent of a runnable
+    git. Used when `_worktrees_discovery_ok` is False: git itself cannot
+    be trusted to say what is or isn't a worktree, so this is the
+    fallback signal that a directory candidate might be (or contain) one,
+    and must be refused rather than silently removed. NEVER follows a
+    symlink/junction - a link entry is checked for the name `.git` but
+    never descended into. Any entry this walk cannot itself list is
+    treated as "contains .git" too (conservative: an unreadable
+    subdirectory is exactly the kind of thing this fallback exists to
+    protect against, not a reason to assume it's safe)."""
+    entries, err = _safe_iterdir(root)
+    if err is not None:
+        return True
+    for entry in entries:
+        if entry.name == ".git":
+            return True
+        if is_link_like(entry):
+            continue
+        if entry.is_dir() and _tree_contains_git_entry(entry):
+            return True
+    return False
+
+
 def is_dirty_worktree(path: Path) -> bool:
     """True if the worktree has ANY uncommitted change - tracked or
     untracked - OR if `git status` itself could not be run/completed for
@@ -291,6 +317,11 @@ def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[tuple[Pat
     seen: set[str] = set()
     out: list[Candidate] = []
     access_errors: list[tuple[Path, str]] = []
+    # Computed ONCE: whether git's account of registered worktrees can be
+    # trusted at all. When it cannot, EVERY pass (not just .worktrees/)
+    # must refuse a directory candidate that might itself be, or contain,
+    # a worktree git can no longer tell us about.
+    discovery_ok, discovery_reason = _worktrees_discovery_ok(cfg.repo)
 
     def add(path: Path, reason: str) -> None:
         # NEVER path.resolve() - that follows symlinks (POSIX) and would
@@ -304,6 +335,15 @@ def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[tuple[Pat
             entry_mtime = os.lstat(path).st_mtime
         except OSError:
             return
+        if not discovery_ok and not is_link_like(path) and path.is_dir():
+            if _tree_contains_git_entry(path):
+                access_errors.append((
+                    path,
+                    "worktree discovery is not trusted (git unresolvable or "
+                    "`worktree list` failed) and this directory's tree contains "
+                    "a .git entry - refusing to remove",
+                ))
+                return
         seen.add(key)
         out.append(Candidate(path=path, mtime=entry_mtime, reason=reason))
 
@@ -335,7 +375,6 @@ def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[tuple[Pat
         # ever applied to it (git unresolvable, or `worktree list` itself
         # failing - a damaged `.git`, "detected dubious ownership").
         # Nothing under .worktrees/ is touched until discovery is trusted.
-        discovery_ok, discovery_reason = _worktrees_discovery_ok(cfg.repo)
         if not discovery_ok:
             access_errors.append((worktrees_dir, discovery_reason))
         else:
@@ -744,10 +783,19 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
             refused.add(w)
 
     def is_refused(path: Path) -> bool:
-        # A refused worktree's own directory, or anything under it, is never
-        # removed - uncommitted changes on a default branch or a detached
-        # HEAD must survive.
-        return any(path == r or r in path.parents for r in refused)
+        # A refused worktree's own directory, or anything under it, is
+        # never removed - uncommitted changes on a default branch or a
+        # detached HEAD must survive. The REVERSE direction matters just
+        # as much: a candidate that CONTAINS a refused worktree (a stale
+        # scratch task directory holding a `git worktree add --detach
+        # <scratch>/wt-<sha>` review checkout - the ops doc's own Rule 2
+        # layout) must also be refused, or the outer directory gets
+        # removed right after the REFUSED line prints, taking the
+        # supposedly-preserved worktree down with it.
+        for r in refused:
+            if path == r or r in path.parents or path in r.parents:
+                return True
+        return False
 
     summary: dict[str, int] = {}
     failed: list[Path] = []

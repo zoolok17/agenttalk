@@ -696,7 +696,7 @@ def test_n1_fresh_link_above_candidate_survives_the_age_window(tmp_path):
     assert os.path.lexists(agent_link)  # the fresh link survives
 
 
-# ------------------------------------------------------------- round 4: R1/N2
+# ------------------------------- fail-closed discovery / dangling-link lexists
 
 
 def test_r1_git_unresolvable_fails_closed_under_worktrees(tmp_path, monkeypatch):
@@ -789,3 +789,224 @@ def test_n2_dangling_link_removal_failure_reported_via_lexists_not_exists(tmp_pa
     result = janitor.remove_stubborn(link)
     assert result == "FAILED"
     assert os.path.lexists(link)  # the link itself is still there
+
+
+# --------------------------------- containment direction / fail-closed fallback
+
+
+def test_r1f_git_working_detached_worktree_nested_in_stale_task_survives(tmp_path):
+    """Round-5 containment fix: a scratch task directory that is itself
+    stale (by newest-mtime) but HOLDS a detached, dirty worktree (the ops
+    doc's own Rule 2 layout: `git worktree add --detach
+    <scratch>/wt-<sha>`) must not be removed out from under that worktree
+    just because the outer directory's own age check fires - staleness and
+    "protect uncommitted work" are separate signals, and a refusal on the
+    inner worktree must propagate to the outer candidate that contains
+    it."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    scratch_root = tmp_path / "atk-scratch"
+    task_dir = scratch_root / "dev-9" / "old-review"
+    task_dir.mkdir(parents=True)
+    wt = task_dir / "wt-abc"
+    _git(repo, "worktree", "add", "-q", "--detach", str(wt), "master")
+    (wt / "precious.txt").write_text("do not lose me", encoding="utf-8")
+    # Backdate the whole nested tree so the OUTER task directory reads as
+    # stale by newest-mtime, exactly like a review checkout nobody has
+    # touched in a while but that still carries uncommitted work.
+    for p in sorted(task_dir.rglob("*"), reverse=True):
+        _backdate(p, 10)
+    _backdate(task_dir, 10)
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=scratch_root, keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    report = janitor.build_report(cfg)
+    assert task_dir in {c.path for c in report.candidates}
+    assert wt in set(report.dirty_worktrees)
+    janitor.apply(cfg, report)
+    assert wt.exists()
+    assert (wt / "precious.txt").exists()
+    assert task_dir.exists()
+
+
+def test_r1g_git_unresolvable_branch_worktree_nested_in_stale_task_survives(tmp_path, monkeypatch):
+    """Round-5 fix, git-unresolvable side: even without git available to
+    identify what is or isn't a worktree, a stale-looking scratch task
+    directory whose tree contains a `.git` entry must be refused outright
+    (via the git-independent _tree_contains_git_entry fallback), not
+    removed as an ordinary stale candidate - the fallback substitutes for
+    the WIP-commit/refuse gate that discovery ordinarily provides."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    scratch_root = tmp_path / "atk-scratch"
+    task_dir = scratch_root / "dev-9" / "old-review2"
+    task_dir.mkdir(parents=True)
+    wt = task_dir / "wt-branch"
+    _git(repo, "worktree", "add", "-q", "-b", "feature-nested", str(wt), "master")
+    (wt / "precious.txt").write_text("do not lose me", encoding="utf-8")
+    for p in sorted(task_dir.rglob("*"), reverse=True):
+        _backdate(p, 10)
+    _backdate(task_dir, 10)
+
+    real_which = janitor.shutil.which
+
+    def _no_git(name, *args, **kwargs):
+        if name == "git":
+            return None
+        return real_which(name, *args, **kwargs)
+
+    monkeypatch.setattr(janitor.shutil, "which", _no_git)
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=scratch_root, keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    candidates, access_errors = janitor.find_candidates(cfg)
+    assert task_dir not in {c.path for c in candidates}
+    assert any(p == task_dir for p, _reason in access_errors)
+
+    report = janitor.build_report(cfg)
+    janitor.apply(cfg, report)
+    assert wt.exists()
+    assert (wt / "precious.txt").exists()
+    assert task_dir.exists()
+
+
+def test_r1h_git_unresolvable_repo_root_family_match_that_is_actually_a_worktree_survives(
+    tmp_path, monkeypatch
+):
+    """Cheap round-5 pin: a repo-root directory that HAPPENS to match an
+    ordinary family name (`.review-*`) but is actually a git worktree
+    survives even when git is unresolvable - the .git-in-tree fallback
+    guard applies uniformly across every pass, not just the scratch-root
+    one."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    wt = repo / ".review-fakewt"
+    _git(repo, "worktree", "add", "-q", "-b", "feature-fake", str(wt), "master")
+    (wt / "precious.txt").write_text("do not lose me", encoding="utf-8")
+
+    real_which = janitor.shutil.which
+
+    def _no_git(name, *args, **kwargs):
+        if name == "git":
+            return None
+        return real_which(name, *args, **kwargs)
+
+    monkeypatch.setattr(janitor.shutil, "which", _no_git)
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=tmp_path / "atk-scratch", keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    candidates, access_errors = janitor.find_candidates(cfg)
+    assert wt not in {c.path for c in candidates}
+    assert any(p == wt for p, _reason in access_errors)
+
+    report = janitor.build_report(cfg)
+    janitor.apply(cfg, report)
+    assert wt.exists()
+    assert (wt / "precious.txt").exists()
+
+
+def test_mb_git_status_failure_is_dirty_not_clean(tmp_path, monkeypatch):
+    """A worktree whose `git status --porcelain` itself fails (a corrupted
+    index, a lock file left behind by a crashed process) must be treated
+    as dirty, not clean - matching the module's fail-closed rule
+    everywhere else discovery can't be trusted (same style as the existing
+    rc=128 `worktree list` mutation, applied to the status call)."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    wt = repo / ".worktrees" / "wt-statusfail"
+    _git(repo, "worktree", "add", "-q", "-b", "feature-statusfail", str(wt), "master")
+
+    real_run = janitor.subprocess.run
+
+    def _fail_status(cmd, *args, **kwargs):
+        if "status" in cmd and "--porcelain" in cmd:
+            return subprocess.CompletedProcess(cmd, 128, stdout="",
+                                                 stderr="fatal: simulated status failure")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(janitor.subprocess, "run", _fail_status)
+    assert janitor.is_dirty_worktree(wt) is True
+
+
+def test_mc_commit_succeeds_but_postcommit_status_fails_is_refused_and_kept(tmp_path, monkeypatch):
+    """A WIP commit whose `git commit` call itself succeeds but whose
+    immediate post-commit `git status --porcelain` confirmation fails must
+    still refuse - an unconfirmed "clean" is not a confirmed one, and
+    apply() must not remove (or report success for) a worktree on the
+    strength of an unverified commit."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    wt = repo / ".worktrees" / "wt-mc"
+    _git(repo, "worktree", "add", "-q", "-b", "feature-mc", str(wt), "master")
+    (wt / "new-file.txt").write_text("new", encoding="utf-8")
+
+    real_run = janitor.subprocess.run
+
+    def _fail_status_for_wt(cmd, *args, **kwargs):
+        if "status" in cmd and "--porcelain" in cmd and str(wt) in cmd:
+            return subprocess.CompletedProcess(cmd, 128, stdout="",
+                                                 stderr="fatal: simulated status failure")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(janitor.subprocess, "run", _fail_status_for_wt)
+
+    result = janitor.wip_commit_dirty_worktree(wt, default_branches=["master", "main"])
+    assert result.refused is True
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=tmp_path / "atk-scratch", keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    report = janitor.build_report(cfg)
+    assert wt in set(report.dirty_worktrees)
+    janitor.apply(cfg, report)
+    assert wt.exists()
+    assert (wt / "new-file.txt").exists()
+
+
+@pytest.mark.skipif(platform.system() != "Windows", reason="NTFS junctions are Windows-only")
+def test_me_fresh_task_level_link_survives_the_age_window(tmp_path):
+    """The agent-level fresh-junction protection (N1) has a task-level
+    sibling: scratch_root/<agent>/<task> can itself be a junction (a task
+    relocated onto another volume, or linked from a different clone) just
+    as much as scratch_root/<agent> can - the age gate must apply there
+    too, not just one level up."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    scratch_root = tmp_path / "atk-scratch"
+    agent_dir = scratch_root / "dev-4"
+    agent_dir.mkdir(parents=True)
+    real_task_dir = tmp_path / "real-task-dir-fresh"
+    real_task_dir.mkdir()
+    task_link = agent_dir / "task-fresh"
+    if not _make_junction(task_link, real_task_dir):
+        pytest.skip("could not create a junction in this environment")
+    # Deliberately NOT backdated - this link is fresh.
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=scratch_root, keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    candidates, _ = janitor.find_candidates(cfg)
+    paths = {c.path for c in candidates}
+    assert task_link not in paths
+
+    report = janitor.build_report(cfg)
+    janitor.apply(cfg, report)
+    assert os.path.lexists(task_link)  # the fresh link survives

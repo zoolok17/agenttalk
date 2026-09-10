@@ -123,10 +123,18 @@ In order:
    worktree is refused the same way a default-branch one is, even though
    `git worktree add --detach` is Rule 2's own recommended form for a
    review worktree - commit it onto a real branch (or leave it) before
-   closing the task if it must survive `--apply`. Removes the allow-listed
-   candidates - a symlink or junction candidate is removed AS THE LINK
-   ITSELF; its target is never touched, entered, or overwritten. Runs
-   `git worktree prune`.
+   closing the task if it must survive `--apply`. A refusal applies in
+   BOTH directions: a scratch task directory that itself looks stale by
+   age but CONTAINS a refused worktree (exactly Rule 2's own recommended
+   `<scratch>/wt-<sha>` layout, nested a level or two under a task
+   directory) is refused right along with it, not removed out from under
+   the worktree the moment the refusal line prints. When git itself
+   cannot be trusted (unresolvable, or `worktree list` failing) even a
+   directory the janitor cannot ask git about is refused if its own tree
+   contains a `.git` entry anywhere - staleness age never overrides that.
+   Removes the allow-listed candidates - a symlink or junction candidate
+   is removed AS THE LINK ITSELF; its target is never touched, entered,
+   or overwritten. Runs `git worktree prune`.
 3. **Removals that fail** (e.g. sandbox-restricted ACLs on Windows, or a
    link that resists even a plain unlink): printed as `FAILED`, never
    silently skipped, with an elevated re-run hint (Windows only; the
