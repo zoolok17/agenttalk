@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import platform
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -34,9 +35,51 @@ def _init_repo(repo: Path) -> None:
     _git(repo, "commit", "-q", "-m", "initial")
 
 
-def _backdate(path: Path, days: float) -> None:
+def _backdate(path: Path, days: float, *, follow_symlinks: bool = True) -> None:
     stamp = time.time() - days * 86400
-    os.utime(path, (stamp, stamp))
+    if follow_symlinks or platform.system() != "Windows":
+        os.utime(path, (stamp, stamp), follow_symlinks=follow_symlinks)
+        return
+    # os.utime's follow_symlinks=False is unimplemented on this platform
+    # (NotImplementedError), and the default (follow_symlinks=True) sets
+    # a Windows junction's TARGET mtime, not the link's own - confirmed
+    # empirically. The reliable way to set a reparse point's OWN mtime is
+    # the Win32 API directly: open it WITHOUT following
+    # (FILE_FLAG_OPEN_REPARSE_POINT) and set its time via SetFileTime.
+    _win32_set_reparse_point_mtime(path, stamp)
+
+
+def _win32_set_reparse_point_mtime(path: Path, unix_stamp: float) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    class _FILETIME(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+
+    GENERIC_WRITE = 0x40000000
+    FILE_SHARE_READ = 0x1
+    FILE_SHARE_WRITE = 0x2
+    OPEN_EXISTING = 3
+    FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+    EPOCH_AS_FILETIME = 116444736000000000  # 1601-01-01 -> 1970-01-01, in 100ns units
+    HUNDREDS_OF_NANOSECONDS = 10000000
+
+    create_file = ctypes.windll.kernel32.CreateFileW
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        str(path), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, None,
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, None,
+    )
+    if handle in (0, -1):
+        raise OSError(f"CreateFileW failed for {path}: {ctypes.get_last_error()}")
+    try:
+        ft_value = int(unix_stamp * HUNDREDS_OF_NANOSECONDS) + EPOCH_AS_FILETIME
+        filetime = _FILETIME(ft_value & 0xFFFFFFFF, ft_value >> 32)
+        if not ctypes.windll.kernel32.SetFileTime(handle, None, None, ctypes.byref(filetime)):
+            raise OSError(f"SetFileTime failed for {path}: {ctypes.get_last_error()}")
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
 
 
 def _make_junction(link: Path, target: Path) -> bool:
@@ -311,12 +354,12 @@ def test_p5_unlistable_directory_reported_as_failed_not_raised(tree, monkeypatch
 
     def _blocked_iterdir(path):
         if path == blocked:
-            return [], path
+            return [], (path, "simulated access denied")
         return real_safe_iterdir(path)
 
     monkeypatch.setattr(janitor, "_safe_iterdir", _blocked_iterdir)
     candidates, errors = janitor.find_candidates(tree["cfg"])
-    assert blocked in errors
+    assert blocked in [p for p, _reason in errors]
 
 
 def test_p5_build_report_never_raises_and_surfaces_access_errors(tree, monkeypatch):
@@ -457,12 +500,12 @@ def test_p6b_failed_junction_removal_never_escalates_into_the_target(tmp_path, m
         assert exe_name not in escalation_tools
 
 
-# --------------------------------------------------------------- R1/R2/R3/N1
+# ---------------- unchecked commit failure / nested temp staleness / links ---
 
 
 def test_r1_refusing_precommit_hook_refuses_not_silently_loses_work(tmp_path):
     """A pre-commit hook that exits non-zero must refuse the WIP commit,
-    not silently report success while the change is lost (reviewer-3 R1)."""
+    not silently report success while the change is lost."""
     repo = tmp_path / "repo"
     _init_repo(repo)
     hooks_dir = repo / ".git" / "hooks"
@@ -584,11 +627,11 @@ def test_r3_posix_symlink_file_removes_link_not_target(tmp_path):
 
 
 @pytest.mark.skipif(platform.system() != "Windows", reason="NTFS junctions are Windows-only")
-def test_n1_link_above_candidate_is_itself_the_candidate_not_walked_through(tmp_path):
-    """scratch_root/<agent> as a junction: the agent entry itself must be
-    treated as a candidate (never entered) - matching the repo-root
-    pass's handling of a link, not silently walked through to whatever
-    is behind it."""
+def test_n1_old_link_above_candidate_is_itself_the_candidate_not_walked_through(tmp_path):
+    """scratch_root/<agent> as a junction, older than keep_days: the agent
+    entry itself must be treated as a candidate (never entered) -
+    matching the repo-root pass's handling of a link, not silently
+    walked through to whatever is behind it."""
     repo = tmp_path / "repo"
     _init_repo(repo)
     scratch_root = tmp_path / "atk-scratch"
@@ -601,6 +644,7 @@ def test_n1_link_above_candidate_is_itself_the_candidate_not_walked_through(tmp_
     agent_link = scratch_root / "dev-2"
     if not _make_junction(agent_link, real_agent_dir):
         pytest.skip("could not create a junction in this environment")
+    _backdate(agent_link, 10, follow_symlinks=False)
 
     cfg = janitor.JanitorConfig(
         repo=repo, scratch_root=scratch_root, keep_days=3, tmp_keep_days=1,
@@ -618,3 +662,130 @@ def test_n1_link_above_candidate_is_itself_the_candidate_not_walked_through(tmp_
     assert not os.path.lexists(agent_link)  # the link is gone
     assert task_dir.exists()  # the target behind it was never touched
     assert (task_dir / "keep.txt").exists()
+
+
+@pytest.mark.skipif(platform.system() != "Windows", reason="NTFS junctions are Windows-only")
+def test_n1_fresh_link_above_candidate_survives_the_age_window(tmp_path):
+    """The same link-as-candidate handling above must still respect
+    keep_days: a junction created moments ago (an operator's scratch
+    relocation, or a seat's live task link) is not yet a candidate just
+    because it is link-like."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    scratch_root = tmp_path / "atk-scratch"
+    scratch_root.mkdir()
+    real_agent_dir = tmp_path / "real-agent-dir-fresh"
+    real_agent_dir.mkdir()
+    agent_link = scratch_root / "dev-3"
+    if not _make_junction(agent_link, real_agent_dir):
+        pytest.skip("could not create a junction in this environment")
+    # Deliberately NOT backdated - this link is fresh.
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=scratch_root, keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    candidates, _ = janitor.find_candidates(cfg)
+    paths = {c.path for c in candidates}
+    assert agent_link not in paths
+
+    report = janitor.build_report(cfg)
+    janitor.apply(cfg, report)
+    assert os.path.lexists(agent_link)  # the fresh link survives
+
+
+# ------------------------------------------------------------- round 4: R1/N2
+
+
+def test_r1_git_unresolvable_fails_closed_under_worktrees(tmp_path, monkeypatch):
+    """git missing must not be read as "zero worktrees registered" - a
+    dirty, unrecognized worktree under .worktrees/ would otherwise be
+    removed as a plain candidate, with no WIP-commit-or-refuse gate ever
+    applied to it."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    wt = repo / ".worktrees" / "wt-orphan"
+    _git(repo, "worktree", "add", "-q", "-b", "feature-orphan", str(wt), "master")
+    (wt / "precious.txt").write_text("do not lose me", encoding="utf-8")
+
+    real_which = janitor.shutil.which
+
+    def _no_git(name, *args, **kwargs):
+        if name == "git":
+            return None
+        return real_which(name, *args, **kwargs)
+
+    monkeypatch.setattr(janitor.shutil, "which", _no_git)
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=tmp_path / "atk-scratch", keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    candidates, access_errors = janitor.find_candidates(cfg)
+    assert wt not in {c.path for c in candidates}
+    assert any(p == (repo / ".worktrees") for p, _reason in access_errors)
+
+    report = janitor.build_report(cfg)
+    text = janitor.apply(cfg, report)
+    assert wt.exists()
+    assert (wt / "precious.txt").exists()
+    assert "FAILED to list" in text
+
+
+def test_r1_worktree_list_failure_fails_closed_under_worktrees(tmp_path, monkeypatch):
+    """The same fail-closed behaviour when git IS resolvable but `worktree
+    list` itself exits non-zero (a damaged .git, "detected dubious
+    ownership", etc.) - discovery cannot tell that apart from "no
+    worktrees", so it must not treat it that way."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    wt = repo / ".worktrees" / "wt-orphan2"
+    _git(repo, "worktree", "add", "-q", "-b", "feature-orphan2", str(wt), "master")
+    (wt / "precious.txt").write_text("do not lose me", encoding="utf-8")
+
+    real_run = janitor.subprocess.run
+
+    def _fail_worktree_list(cmd, *args, **kwargs):
+        if len(cmd) >= 3 and cmd[1] == "-C" and "worktree" in cmd and "list" in cmd:
+            return subprocess.CompletedProcess(cmd, 128, stdout="", stderr="fatal: simulated failure")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(janitor.subprocess, "run", _fail_worktree_list)
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=tmp_path / "atk-scratch", keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    candidates, access_errors = janitor.find_candidates(cfg)
+    assert wt not in {c.path for c in candidates}
+    assert any(p == (repo / ".worktrees") for p, _reason in access_errors)
+
+
+@pytest.mark.skipif(platform.system() != "Windows", reason="NTFS junctions are Windows-only")
+def test_n2_dangling_link_removal_failure_reported_via_lexists_not_exists(tmp_path, monkeypatch):
+    """A dangling link (its target deleted out from under it) whose own
+    unlink fails must be reported FAILED - `path.exists()` would follow
+    the (now-broken) link and read False, misreporting "removed" even
+    though the link itself is still on disk."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    target = tmp_path / "target-to-vanish"
+    target.mkdir()
+    link = repo / ".review-danglink"
+    if not _make_junction(link, target):
+        pytest.skip("could not create a junction in this environment")
+    shutil.rmtree(target)  # the link is now dangling
+
+    def _always_fail(path):
+        raise OSError("simulated stubborn dangling link")
+
+    monkeypatch.setattr(janitor, "_rmtree", _always_fail)
+    result = janitor.remove_stubborn(link)
+    assert result == "FAILED"
+    assert os.path.lexists(link)  # the link itself is still there

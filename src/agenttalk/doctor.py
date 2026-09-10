@@ -1419,8 +1419,8 @@ def _check_scratch_hygiene(project_root: Path) -> Check | None:
     # #148 acceptance: a directory the janitor can't even list is reported
     # as FAILED, never silently skipped - doctor must not swallow it either.
     if access_errors:
-        parts.append(f"{len(access_errors)} location(s) could not be listed (permissions?): "
-                      + ", ".join(str(p) for p in access_errors))
+        parts.append(f"{len(access_errors)} location(s) could not be listed or trusted: "
+                      + ", ".join(f"{p} ({reason})" for p, reason in access_errors))
     return Check(
         name="scratch_hygiene",
         status="warn",

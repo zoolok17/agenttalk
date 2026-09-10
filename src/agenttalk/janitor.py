@@ -135,11 +135,13 @@ class JanitorReport:
     registered_worktrees: list[Path]
     dirty_worktrees: list[Path]
     foreign_kept: list[Path]
-    # Discovery locations that could not even be LISTED (e.g. an ACL-denied
-    # directory) - #148's acceptance is "reported as FAILED, never silently
-    # skipped", so these surface exactly like a removal failure, not a
-    # crash and not a swallowed exception.
-    access_errors: list[Path]
+    # Discovery locations that could not even be LISTED or TRUSTED (an
+    # ACL-denied directory, or a .worktrees/ pass that had to fail closed
+    # because git itself was unresolvable or unreliable there) - #148's
+    # acceptance is "reported as FAILED, never silently skipped", so
+    # these surface exactly like a removal failure, not a crash and not
+    # a swallowed exception. Each entry names WHY, not just WHERE.
+    access_errors: list[tuple[Path, str]]
 
 
 def _is_excluded_name(name: str) -> bool:
@@ -177,15 +179,16 @@ def is_link_like(path: Path) -> bool:
     return bool(getattr(st, "st_file_attributes", 0) & reparse_point)
 
 
-def _safe_iterdir(path: Path) -> tuple[list[Path], Path | None]:
+def _safe_iterdir(path: Path) -> tuple[list[Path], tuple[Path, str] | None]:
     """List `path`'s entries, or (on ANY OSError - permission denial,
     a vanished directory mid-scan, etc.) return an empty list plus the
-    path that failed, instead of raising out of discovery or silently
-    returning nothing. The caller surfaces the failure path as FAILED."""
+    path and reason that failed, instead of raising out of discovery or
+    silently returning nothing. The caller surfaces the failure as
+    FAILED, with the reason quoted."""
     try:
         return sorted(path.iterdir()), None
-    except OSError:
-        return [], path
+    except OSError as exc:
+        return [], (path, str(exc))
 
 
 def _resolve_system_tool(name: str) -> str | None:
@@ -201,19 +204,43 @@ def _resolve_system_tool(name: str) -> str | None:
     return str(candidate) if candidate.is_file() else None
 
 
-def _run_git(repo: Path, *args: str) -> str:
+def _run_git_checked(repo: Path, *args: str) -> tuple[int | None, str, str]:
+    """Run git, returning (returncode, stdout, stderr). returncode is
+    `None` if git itself is unresolvable - callers that need to
+    distinguish "genuinely nothing to report" from "could not even run
+    git" must check this, not just parse stdout. A prior version of this
+    module returned "" for both cases from a single stdout-only helper,
+    and every caller (worktree discovery, dirty-status checks, the
+    post-commit clean confirmation) silently treated an unrunnable git
+    the same as a successful, empty answer - the exact mechanism that let
+    a live, dirty, untracked-file-holding worktree be removed with no
+    refusal printed anywhere."""
     git = shutil.which("git")
     if git is None:
-        return ""
+        return None, "", "git is not resolvable"
     result = subprocess.run(  # nosec B603 - resolved executable, argv list
         [git, "-C", str(repo), *args],
         capture_output=True, text=True, check=False,
     )
-    return result.stdout
+    return result.returncode, result.stdout, result.stderr
+
+
+def _run_git(repo: Path, *args: str) -> str:
+    """Best-effort stdout only - for call sites where a failure is
+    genuinely harmless (e.g. the final `worktree prune`, or `git add`
+    before a commit whose own result is checked separately)."""
+    _rc, out, _err = _run_git_checked(repo, *args)
+    return out
 
 
 def get_registered_worktrees(repo: Path) -> list[Path]:
-    out = _run_git(repo, "worktree", "list", "--porcelain")
+    """Best-effort: returns `[]` if git is unresolvable or the command
+    fails, the same as "no worktrees registered" to THIS function's own
+    callers (a dirty-worktree count and doctor's outside-scratch-root
+    warning, neither of which removes anything on the strength of this
+    result alone). Candidate discovery under `.worktrees/` does NOT use
+    this function for that reason - see `_worktrees_discovery_ok`."""
+    _rc, out, _err = _run_git_checked(repo, "worktree", "list", "--porcelain")
     worktrees = []
     for line in out.splitlines():
         if line.startswith("worktree "):
@@ -221,15 +248,38 @@ def get_registered_worktrees(repo: Path) -> list[Path]:
     return worktrees
 
 
+def _worktrees_discovery_ok(repo: Path) -> tuple[bool, str]:
+    """Whether candidate discovery under `.worktrees/` can trust git's
+    account of what is registered there. False means git is unresolvable,
+    or `worktree list` itself failed (a damaged `.git`, "detected dubious
+    ownership", etc.) - in either case candidate discovery must leave
+    EVERYTHING under `.worktrees/` alone rather than reading the failure
+    as "zero worktrees registered" and removing every directory there as
+    an ordinary, unregistered candidate with no WIP-commit-or-refuse gate
+    ever applied to it."""
+    rc, _out, err = _run_git_checked(repo, "worktree", "list", "--porcelain")
+    if rc is None:
+        return False, "git is not resolvable"
+    if rc != 0:
+        return False, f"git worktree list failed, rc={rc}: {err.strip()}"
+    return True, ""
+
+
 def is_dirty_worktree(path: Path) -> bool:
     """True if the worktree has ANY uncommitted change - tracked or
-    untracked. An untracked file left behind by a `.worktrees/` removal is
-    real, unrecovered work (reviewer-3 finding P2); it is no longer
-    excluded from "dirty" the way a purely cosmetic ignored-file diff
-    would be."""
+    untracked - OR if `git status` itself could not be run/completed for
+    it. An untracked file left behind by a `.worktrees/` removal is real,
+    unrecovered work; it is no longer excluded from "dirty" the way a
+    purely cosmetic ignored-file diff would be. Failing to determine the
+    status at all is treated as dirty, not clean - it routes the worktree
+    through the WIP-commit-or-refuse gate instead of silently letting an
+    unconfirmed one through as "nothing to do here"."""
     if not (path / ".git").exists():
         return False
-    return bool(_run_git(path, "status", "--porcelain").strip())
+    rc, out, _err = _run_git_checked(path, "status", "--porcelain")
+    if rc != 0:
+        return True
+    return bool(out.strip())
 
 
 def worktree_branch(path: Path) -> str | None:
@@ -237,10 +287,10 @@ def worktree_branch(path: Path) -> str | None:
     return out or None
 
 
-def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[Path]]:
+def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[tuple[Path, str]]]:
     seen: set[str] = set()
     out: list[Candidate] = []
-    access_errors: list[Path] = []
+    access_errors: list[tuple[Path, str]] = []
 
     def add(path: Path, reason: str) -> None:
         # NEVER path.resolve() - that follows symlinks (POSIX) and would
@@ -276,15 +326,28 @@ def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[Path]]:
 
     worktrees_dir = cfg.repo / ".worktrees"
     if worktrees_dir.is_dir():
-        entries, err = _safe_iterdir(worktrees_dir)
-        if err is not None:
-            access_errors.append(err)
-        for entry in entries:
-            # Every directory (or dir-like link) under .worktrees/ is a
-            # candidate regardless of name - this location IS the family;
-            # no separate name-family filter applies here.
-            if is_link_like(entry) or entry.is_dir():
-                add(entry, "worktrees-dir")
+        # FAIL CLOSED: candidate discovery here must be able to trust
+        # git's own account of what is registered under .worktrees/ - a
+        # directory this janitor cannot ask git about is NOT the same as
+        # "not a worktree", and reading it that way is exactly how a
+        # live, dirty, unregistered-in-its-own-eyes worktree used to be
+        # removed as a plain candidate with no WIP-commit-or-refuse gate
+        # ever applied to it (git unresolvable, or `worktree list` itself
+        # failing - a damaged `.git`, "detected dubious ownership").
+        # Nothing under .worktrees/ is touched until discovery is trusted.
+        discovery_ok, discovery_reason = _worktrees_discovery_ok(cfg.repo)
+        if not discovery_ok:
+            access_errors.append((worktrees_dir, discovery_reason))
+        else:
+            entries, err = _safe_iterdir(worktrees_dir)
+            if err is not None:
+                access_errors.append(err)
+            for entry in entries:
+                # Every directory (or dir-like link) under .worktrees/ is a
+                # candidate regardless of name - this location IS the
+                # family; no separate name-family filter applies here.
+                if is_link_like(entry) or entry.is_dir():
+                    add(entry, "worktrees-dir")
 
     if cfg.tmp_root.is_dir():
         cutoff = datetime.datetime.now().timestamp() - cfg.tmp_keep_days * 86400
@@ -303,11 +366,12 @@ def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[Path]]:
             # are, so age is the load-bearing safety check for EVERY
             # entry, not an extra filter on top of a type restriction.
             # A DIRECTORY entry is aged by the newest mtime anywhere in
-            # its tree, not its own top-level mtime (reviewer-3 R2 - the
-            # exact P3 flaw, recurring here): a directory's own mtime
-            # does not change when a file nested inside it is written. A
-            # link or a plain file has no nested tree, so lstat is
-            # already correct/complete for those.
+            # its tree, not its own top-level mtime: a directory's own
+            # mtime does not change when a file nested inside it is
+            # written, so a live file three levels down inside an
+            # apparently-old top-level directory would otherwise be
+            # deleted. A link or a plain file has no nested tree, so
+            # lstat is already correct/complete for those.
             if is_link_like(entry) or not entry.is_dir():
                 try:
                     entry_mtime = os.lstat(entry).st_mtime
@@ -330,12 +394,22 @@ def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[Path]]:
         if err is not None:
             access_errors.append(err)
         for agent_dir in agent_entries:
-            # reviewer-3 N1: a link ABOVE a candidate must not be walked
-            # through either - treat a link-like agent/task entry as a
-            # candidate in its own right (matching the repo-root pass),
-            # never recurse into what it points at.
+            # A link ABOVE a candidate must not be walked through either -
+            # a link-like agent/task entry is a candidate in its own
+            # right (matching the repo-root pass), never recursed into.
+            # It still needs its OWN age check against the same cutoff
+            # first, though: a fresh junction (an operator's scratch
+            # relocation, or a seat's live task link, age 0s) must not be
+            # removed just because it happens to be link-like - only
+            # once it is actually older than keep_days, exactly like
+            # every other scratch-root candidate.
             if is_link_like(agent_dir):
-                add(agent_dir, "scratch-stale")
+                try:
+                    link_mtime = os.lstat(agent_dir).st_mtime
+                except OSError:
+                    continue
+                if link_mtime < cutoff:
+                    add(agent_dir, "scratch-stale")
                 continue
             if not agent_dir.is_dir():
                 continue
@@ -344,7 +418,12 @@ def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[Path]]:
                 access_errors.append(terr)
             for task_dir in task_entries:
                 if is_link_like(task_dir):
-                    add(task_dir, "scratch-stale")
+                    try:
+                        link_mtime = os.lstat(task_dir).st_mtime
+                    except OSError:
+                        continue
+                    if link_mtime < cutoff:
+                        add(task_dir, "scratch-stale")
                     continue
                 if not task_dir.is_dir():
                     continue
@@ -365,20 +444,23 @@ def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[Path]]:
 
 def _newest_mtime_in_tree(
     root: Path, *, at_least: float | None = None
-) -> tuple[float | None, Path | None]:
+) -> tuple[float | None, tuple[Path, str] | None]:
     """The newest mtime of `root` itself or anything nested under it.
-    Returns (None, error_path) if any nested directory could not be
-    listed, rather than silently under-counting staleness.
+    Returns (None, (error_path, reason)) if any nested directory could
+    not be listed, rather than silently under-counting staleness.
 
     `at_least`: if given, the caller only cares whether the tree is AT
     LEAST this fresh (e.g. "not stale" - past some cutoff), not the exact
     maximum - the walk returns as soon as it finds an entry that alone
     already clears the threshold, capping cost on a very large tree
-    (reviewer-3 N4: doctor calls this on every scratch task on every run)."""
+    (this function runs once per scratch task on every `agenttalk
+    doctor`/`janitor` invocation, so an unbounded walk scales with the
+    total size of every task directory, not just the ones near the
+    staleness boundary)."""
     try:
         newest = os.lstat(root).st_mtime
-    except OSError:
-        return None, root
+    except OSError as exc:
+        return None, (root, str(exc))
     if at_least is not None and newest >= at_least:
         return newest, None
     entries, err = _safe_iterdir(root)
@@ -443,10 +525,9 @@ def format_report(report: JanitorReport, cfg: JanitorConfig, *, apply: bool) -> 
     for f in report.foreign_kept:
         lines.append(f"  FOREIGN (kept) {f}")
     if report.access_errors:
-        lines.append(f"FAILED to list ({len(report.access_errors)}) - "
-                      "not silently skipped, permissions likely need fixing:")
-        for p in report.access_errors:
-            lines.append(f"  {p}")
+        lines.append(f"FAILED to list ({len(report.access_errors)}) - not silently skipped:")
+        for p, reason in report.access_errors:
+            lines.append(f"  {p}: {reason}")
     if not apply:
         oldest = sorted(report.candidates, key=lambda c: c.mtime)[:15]
         for c in oldest:
@@ -477,8 +558,8 @@ def wip_commit_dirty_worktree(path: Path, *, default_branches: list[str]) -> Wip
       worktree, so this is not a corner case.
     - `git` cannot be resolved, `git add -A` fails, `git commit` fails (a
       refusing pre-commit hook, `commit.gpgsign` without a key, no
-      configured user identity - reviewer-3 R1), or the worktree is STILL
-      dirty after the commit supposedly succeeded. Never `--no-verify`: a
+      configured user identity), or the worktree is STILL dirty after
+      the commit supposedly succeeded. Never `--no-verify`: a
       refusing hook should keep the work, not be bypassed. Every one of
       these previously fell through silently - `check=False` on both git
       calls, no return-code check, always reporting "WIP committed" while
@@ -519,7 +600,14 @@ def wip_commit_dirty_worktree(path: Path, *, default_branches: list[str]) -> Wip
                      f"{commit_result.returncode}: {commit_result.stderr.strip()}): {path}",
             refused=True,
         )
-    if _run_git(path, "status", "--porcelain").strip():
+    status_rc, status_out, status_err = _run_git_checked(path, "status", "--porcelain")
+    if status_rc != 0:
+        return WipCommitResult(
+            message=f"  REFUSED dirty worktree on {branch} (could not confirm clean after "
+                     f"commit, git status rc={status_rc}: {status_err.strip()}): {path}",
+            refused=True,
+        )
+    if status_out.strip():
         return WipCommitResult(
             message=f"  REFUSED dirty worktree on {branch} (still dirty after commit - "
                      f"refusing to remove): {path}",
@@ -536,9 +624,9 @@ def _make_tree_writable(path: Path) -> None:
     Best-effort; a failure here just means the subsequent remove attempt
     may also fail and fall through to escalation as before.
 
-    A link entry is skipped ENTIRELY, not just left unrecursed into
-    (reviewer-3 N3): `os.chmod` follows symlinks by default on POSIX, so
-    chmod-ing a symlink candidate would silently change its TARGET's
+    A link entry is skipped ENTIRELY, not just left unrecursed into:
+    `os.chmod` follows symlinks by default on POSIX, so chmod-ing a
+    symlink candidate would silently change its TARGET's
     mode - exactly the kind of reach-through-the-link this module exists
     to prevent everywhere else."""
     if is_link_like(path):
