@@ -1010,3 +1010,303 @@ def test_me_fresh_task_level_link_survives_the_age_window(tmp_path):
     report = janitor.build_report(cfg)
     janitor.apply(cfg, report)
     assert os.path.lexists(task_link)  # the fresh link survives
+
+
+# --------------------------------------------- shared-root ownership (round 6)
+
+
+def test_p1_foreign_clones_worktree_nested_in_stale_task_survives(tmp_path):
+    """Round-6 R1: every seat shares one scratch root (Rule 1), and each
+    seat's review worktree belongs to ITS OWN clone (Rule 2) - a worktree
+    registered to a DIFFERENT clone is, to cfg.repo's own `worktree list`,
+    invisible. A batch --apply pointed at repo A must not delete repo B's
+    dirty worktree just because repo A has never heard of it."""
+    repo_a = tmp_path / "repo-a"
+    _init_repo(repo_a)
+    repo_b = tmp_path / "repo-b"
+    _init_repo(repo_b)
+
+    scratch_root = tmp_path / "atk-scratch"
+    task_dir = scratch_root / "dev-9" / "old-review"
+    task_dir.mkdir(parents=True)
+    wt = task_dir / "wt-abc"
+    _git(repo_b, "worktree", "add", "-q", "--detach", str(wt), "master")
+    (wt / "precious.txt").write_text("do not lose me", encoding="utf-8")
+    for p in sorted(task_dir.rglob("*"), reverse=True):
+        _backdate(p, 10)
+    _backdate(task_dir, 10)
+
+    cfg = janitor.JanitorConfig(
+        repo=repo_a, scratch_root=scratch_root, keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    candidates, access_errors = janitor.find_candidates(cfg)
+    assert task_dir not in {c.path for c in candidates}
+    assert any(p == task_dir for p, _reason in access_errors)
+
+    report = janitor.build_report(cfg)
+    janitor.apply(cfg, report)
+    assert wt.exists()
+    assert (wt / "precious.txt").exists()
+    assert task_dir.exists()
+
+
+def test_p1c_own_clones_worktree_in_same_layout_goes_through_the_normal_gate(tmp_path):
+    """Control for P1: the identical layout, but the janitor is pointed at
+    the worktree's OWN clone this time - proves the ownership check does
+    not over-refuse a legitimate case; the existing detached-HEAD refusal
+    (not the new ownership check) is what keeps it."""
+    repo_b = tmp_path / "repo-b"
+    _init_repo(repo_b)
+
+    scratch_root = tmp_path / "atk-scratch"
+    task_dir = scratch_root / "dev-9" / "old-review-control"
+    task_dir.mkdir(parents=True)
+    wt = task_dir / "wt-abc"
+    _git(repo_b, "worktree", "add", "-q", "--detach", str(wt), "master")
+    (wt / "precious.txt").write_text("do not lose me", encoding="utf-8")
+    for p in sorted(task_dir.rglob("*"), reverse=True):
+        _backdate(p, 10)
+    _backdate(task_dir, 10)
+
+    cfg = janitor.JanitorConfig(
+        repo=repo_b, scratch_root=scratch_root, keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    report = janitor.build_report(cfg)
+    assert task_dir in {c.path for c in report.candidates}  # not refused at add()-time
+    assert wt in set(report.dirty_worktrees)  # it IS cfg.repo's own registered worktree
+    janitor.apply(cfg, report)
+    assert wt.exists()
+    assert (wt / "precious.txt").exists()
+    assert task_dir.exists()
+
+
+def test_p2_standalone_clone_nested_in_stale_task_survives(tmp_path):
+    """Round-6 R1: a standalone clone (its own `git init`, not any repo's
+    worktree) nested inside a stale scratch task must survive too - the
+    ownership check is "is this even a git tree this janitor knows about",
+    not just "is it registered to MY clone specifically"."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    scratch_root = tmp_path / "atk-scratch"
+    task_dir = scratch_root / "dev-9" / "old-review-standalone"
+    task_dir.mkdir(parents=True)
+    clone = task_dir / "standalone-clone"
+    _init_repo(clone)
+    (clone / "uncommitted.txt").write_text("do not lose me", encoding="utf-8")
+    for p in sorted(task_dir.rglob("*"), reverse=True):
+        _backdate(p, 10)
+    _backdate(task_dir, 10)
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=scratch_root, keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    candidates, access_errors = janitor.find_candidates(cfg)
+    assert task_dir not in {c.path for c in candidates}
+    assert any(p == task_dir for p, _reason in access_errors)
+
+    report = janitor.build_report(cfg)
+    janitor.apply(cfg, report)
+    assert clone.exists()
+    assert (clone / "uncommitted.txt").exists()
+    assert task_dir.exists()
+
+
+def test_p3_clean_detached_worktree_with_unreachable_head_survives(tmp_path):
+    """Round-6 R2: only DIRTY worktrees reached the refuse gate before - a
+    CLEAN detached worktree holding a local commit reachable from no
+    branch or tag (a reviewer's fixup, or a mutation-test commit, left on
+    a `git worktree add --detach` checkout with no further edits since) is
+    otherwise removed along with its task, and the final `worktree prune`
+    drops its HEAD - the commit becomes unreachable garbage, exactly the
+    loss a detached WIP commit is already refused to avoid."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    scratch_root = tmp_path / "atk-scratch"
+    task_dir = scratch_root / "dev-9" / "old-review-unreachable"
+    task_dir.mkdir(parents=True)
+    wt = task_dir / "wt-clean-detached"
+    _git(repo, "worktree", "add", "-q", "--detach", str(wt), "master")
+    (wt / "extra.txt").write_text("local commit content", encoding="utf-8")
+    _git(wt, "add", "extra.txt")
+    _git(wt, "commit", "-q", "-m", "local commit on no branch")
+    for p in sorted(task_dir.rglob("*"), reverse=True):
+        _backdate(p, 10)
+    _backdate(task_dir, 10)
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=scratch_root, keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    report = janitor.build_report(cfg)
+    assert wt not in set(report.dirty_worktrees)  # clean - status --porcelain is empty
+    # git prints "HEAD" (not empty) for a detached rev-parse --abbrev-ref
+    assert janitor.worktree_branch(wt) in janitor._NEVER_AUTO_COMMIT_BRANCHES_SENTINELS
+    assert janitor.worktree_head_reachable(wt) is False  # on no branch or tag
+
+    janitor.apply(cfg, report)
+    assert wt.exists()
+    assert task_dir.exists()
+    unreachable_sha = subprocess.run(
+        ["git", "-C", str(wt), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    rev_list = subprocess.run(
+        ["git", "-C", str(repo), "rev-list", "--all"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert unreachable_sha in rev_list
+
+
+def test_r3_unlistable_subdirectory_counts_as_containing_git(tmp_path, monkeypatch):
+    """R3: an unlistable subdirectory inside a tree must count as
+    "contains .git" (conservative fail-closed), not "no .git found here" -
+    pins the exact branch of the walk a code-level mutation would leave
+    uncaught by every existing cell (none of which makes a nested
+    subdirectory unlistable)."""
+    root = tmp_path / "root"
+    blocked = root / "unlistable"
+    blocked.mkdir(parents=True)
+
+    real_safe_iterdir = janitor._safe_iterdir
+
+    def _blocked_iterdir(path):
+        if path == blocked:
+            return [], (path, "simulated access denied")
+        return real_safe_iterdir(path)
+
+    monkeypatch.setattr(janitor, "_safe_iterdir", _blocked_iterdir)
+    assert janitor._tree_contains_git_entry(root) is True
+    found, unlistable = janitor._find_git_entries(root)
+    assert found == []
+    assert unlistable is True
+
+
+def test_r3_unlistable_nested_subdir_at_repo_root_is_refused(tmp_path, monkeypatch):
+    """The same property, end to end through find_candidates() at the
+    repo-root pass (no age gate there, so this isolates the git-in-tree
+    check from the staleness walk's own, unrelated error handling)."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    candidate = repo / ".review-deep"
+    blocked = candidate / "unlistable"
+    blocked.mkdir(parents=True)
+
+    real_which = janitor.shutil.which
+
+    def _no_git(name, *args, **kwargs):
+        if name == "git":
+            return None
+        return real_which(name, *args, **kwargs)
+
+    monkeypatch.setattr(janitor.shutil, "which", _no_git)
+
+    real_safe_iterdir = janitor._safe_iterdir
+
+    def _blocked_iterdir(path):
+        if path == blocked:
+            return [], (path, "simulated access denied")
+        return real_safe_iterdir(path)
+
+    monkeypatch.setattr(janitor, "_safe_iterdir", _blocked_iterdir)
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=tmp_path / "atk-scratch", keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    candidates, access_errors = janitor.find_candidates(cfg)
+    assert candidate not in {c.path for c in candidates}
+    assert any(p == candidate for p, _reason in access_errors)
+
+
+def test_r3_clone_git_directory_under_untrusted_discovery_is_refused(tmp_path, monkeypatch):
+    """R3: `.git` as a DIRECTORY (an ordinary clone), not just a
+    worktree's gitdir FILE, must be recognized by the walk - every
+    existing untrusted-discovery cell used a worktree gitfile only,
+    leaving this branch uncaught."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    candidate = repo / ".review-clone"
+    _init_repo(candidate)  # a standalone clone - .git is a DIRECTORY here
+    (candidate / "extra.txt").write_text("do not lose me", encoding="utf-8")
+
+    real_which = janitor.shutil.which
+
+    def _no_git(name, *args, **kwargs):
+        if name == "git":
+            return None
+        return real_which(name, *args, **kwargs)
+
+    monkeypatch.setattr(janitor.shutil, "which", _no_git)
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=tmp_path / "atk-scratch", keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    candidates, access_errors = janitor.find_candidates(cfg)
+    assert candidate not in {c.path for c in candidates}
+    assert any(p == candidate for p, _reason in access_errors)
+
+
+@pytest.mark.skipif(platform.system() != "Windows", reason="NTFS junctions are Windows-only")
+def test_r3_link_inside_candidate_is_never_descended_into(tmp_path, monkeypatch):
+    """R3: a link inside a candidate's tree pointing at something that
+    holds `.git` must never be descended into - the candidate proceeds
+    normally (removed, since it is otherwise an ordinary eligible
+    candidate) and whatever the link points at is left completely alone,
+    matching every other "never follow a link" guarantee in this
+    module."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    other_repo = tmp_path / "other-repo-with-dirty-wt"
+    _init_repo(other_repo)
+    other_wt = other_repo / ".worktrees" / "wt-elsewhere"
+    _git(other_repo, "worktree", "add", "-q", "--detach", str(other_wt), "master")
+    (other_wt / "precious.txt").write_text("do not lose me", encoding="utf-8")
+
+    real_which = janitor.shutil.which
+
+    def _no_git(name, *args, **kwargs):
+        if name == "git":
+            return None
+        return real_which(name, *args, **kwargs)
+
+    monkeypatch.setattr(janitor.shutil, "which", _no_git)
+
+    candidate = repo / ".review-withlink"
+    candidate.mkdir()
+    link = candidate / "elsewhere"
+    if not _make_junction(link, other_wt):
+        pytest.skip("could not create a junction in this environment")
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=tmp_path / "atk-scratch", keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    candidates, access_errors = janitor.find_candidates(cfg)
+    # The candidate itself proceeds - the link inside it is never entered,
+    # so its tree does not "contain .git" as far as this janitor can see.
+    assert candidate in {c.path for c in candidates}
+    assert not any(p == candidate for p, _reason in access_errors)
+
+    report = janitor.build_report(cfg)
+    janitor.apply(cfg, report)
+    assert not candidate.exists()  # the candidate itself IS removed
+    assert other_wt.exists()  # but the link's target was never entered
+    assert (other_wt / "precious.txt").exists()

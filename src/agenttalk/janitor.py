@@ -265,30 +265,56 @@ def _worktrees_discovery_ok(repo: Path) -> tuple[bool, str]:
     return True, ""
 
 
-def _tree_contains_git_entry(root: Path) -> bool:
-    """True if `root`'s own tree contains a `.git` entry (a directory, for
-    an ordinary clone, or a file, for a worktree's gitdir pointer)
-    anywhere - an lstat-based walk, entirely independent of a runnable
-    git. Used when `_worktrees_discovery_ok` is False: git itself cannot
-    be trusted to say what is or isn't a worktree, so this is the
-    fallback signal that a directory candidate might be (or contain) one,
-    and must be refused rather than silently removed. NEVER follows a
-    symlink/junction - a link entry is checked for the name `.git` but
-    never descended into. Any entry this walk cannot itself list is
-    treated as "contains .git" too (conservative: an unreadable
-    subdirectory is exactly the kind of thing this fallback exists to
-    protect against, not a reason to assume it's safe)."""
+def _find_git_entries(root: Path) -> tuple[list[Path], bool]:
+    """Every `.git` entry (a directory, for an ordinary clone, or a file,
+    for a worktree's gitdir pointer) anywhere in `root`'s own tree, plus
+    whether any nested subdirectory could not even be listed - an
+    lstat-based walk, entirely independent of a runnable git. NEVER
+    follows a symlink/junction - a link entry is checked for the name
+    `.git` but never descended into, so whatever it points at is
+    invisible to this walk either way. An unlistable subdirectory is
+    reported via the second return value rather than raising or being
+    silently read as "nothing here" (conservative: an unreadable
+    subdirectory is exactly the kind of thing this walk exists to guard
+    against, not a reason to assume it's safe)."""
+    found: list[Path] = []
     entries, err = _safe_iterdir(root)
     if err is not None:
-        return True
+        return found, True
+    unlistable = False
     for entry in entries:
         if entry.name == ".git":
-            return True
+            found.append(entry)
+            continue
         if is_link_like(entry):
             continue
-        if entry.is_dir() and _tree_contains_git_entry(entry):
-            return True
-    return False
+        if entry.is_dir():
+            sub_found, sub_unlistable = _find_git_entries(entry)
+            found.extend(sub_found)
+            unlistable = unlistable or sub_unlistable
+    return found, unlistable
+
+
+def _tree_contains_git_entry(root: Path) -> bool:
+    """True if `root`'s own tree contains a `.git` entry anywhere, OR a
+    nested subdirectory could not be listed - see `_find_git_entries`.
+    Used when `_worktrees_discovery_ok` is False: git itself cannot be
+    trusted to say what is or isn't a worktree, so this is the fallback
+    signal that a directory candidate might be (or contain) one, and must
+    be refused rather than silently removed."""
+    found, unlistable = _find_git_entries(root)
+    return bool(found) or unlistable
+
+
+def _git_entry_belongs_to_registered_worktree(git_entry: Path, registered: list[Path]) -> bool:
+    """True if `git_entry` (a `.git` file or directory found somewhere
+    inside a candidate's tree) is the `.git` of a worktree this janitor
+    already knows is registered to `cfg.repo` - the owning worktree root
+    is always `git_entry`'s parent, whether `.git` is a gitdir-pointer
+    FILE (a linked worktree) or a DIRECTORY (an ordinary clone/the main
+    worktree)."""
+    owner = git_entry.parent
+    return any(owner == r for r in registered)
 
 
 def is_dirty_worktree(path: Path) -> bool:
@@ -313,15 +339,40 @@ def worktree_branch(path: Path) -> str | None:
     return out or None
 
 
+def worktree_head_reachable(path: Path) -> bool:
+    """True if the worktree's HEAD commit is reachable from an existing
+    branch or tag (`git for-each-ref --contains HEAD refs/heads
+    refs/tags` is non-empty). False (unreachable) also if the check
+    itself could not be completed - fail closed: a detached HEAD whose
+    reachability this janitor cannot confirm is exactly the case that
+    must be protected, not assumed safe. Only meaningful for a DETACHED
+    worktree (`worktree_branch` returning `None` or the literal string
+    `"HEAD"` - git's own `rev-parse --abbrev-ref HEAD` prints "HEAD" for
+    a detached checkout, not an empty string) - a worktree checked out
+    onto a real branch is trivially reachable via that branch itself."""
+    rc, out, _err = _run_git_checked(
+        path, "for-each-ref", "--contains", "HEAD", "refs/heads", "refs/tags",
+    )
+    if rc != 0:
+        return False
+    return bool(out.strip())
+
+
 def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[tuple[Path, str]]]:
     seen: set[str] = set()
     out: list[Candidate] = []
     access_errors: list[tuple[Path, str]] = []
     # Computed ONCE: whether git's account of registered worktrees can be
-    # trusted at all. When it cannot, EVERY pass (not just .worktrees/)
-    # must refuse a directory candidate that might itself be, or contain,
-    # a worktree git can no longer tell us about.
+    # trusted at all, and (when it can) what IS registered to cfg.repo.
+    # Every directory candidate outside .worktrees/ is checked against
+    # this regardless of discovery - the earlier version only ran the
+    # `.git`-in-tree guard when discovery was UNTRUSTED, which is
+    # backwards for a worktree registered to some OTHER clone (every seat
+    # shares one scratch root - Rule 1) or a standalone clone: git being
+    # perfectly resolvable for cfg.repo says nothing about whether a
+    # tree elsewhere under the shared root belongs to it.
     discovery_ok, discovery_reason = _worktrees_discovery_ok(cfg.repo)
+    registered_worktrees = get_registered_worktrees(cfg.repo) if discovery_ok else []
 
     def add(path: Path, reason: str) -> None:
         # NEVER path.resolve() - that follows symlinks (POSIX) and would
@@ -335,15 +386,36 @@ def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[tuple[Pat
             entry_mtime = os.lstat(path).st_mtime
         except OSError:
             return
-        if not discovery_ok and not is_link_like(path) and path.is_dir():
-            if _tree_contains_git_entry(path):
-                access_errors.append((
-                    path,
-                    "worktree discovery is not trusted (git unresolvable or "
-                    "`worktree list` failed) and this directory's tree contains "
-                    "a .git entry - refusing to remove",
-                ))
-                return
+        # .worktrees/ entries are exempt: that pass already gates on
+        # discovery_ok itself (nothing is added from it at all when
+        # discovery can't be trusted), and every entry it DOES add is,
+        # by construction, a worktree of cfg.repo - re-walking it here
+        # would be redundant, not protective.
+        if reason != "worktrees-dir" and not is_link_like(path) and path.is_dir():
+            git_entries, unlistable = _find_git_entries(path)
+            if not discovery_ok:
+                if git_entries or unlistable:
+                    access_errors.append((
+                        path,
+                        "worktree discovery is not trusted (git unresolvable or "
+                        "`worktree list` failed) and this directory's tree contains "
+                        "a .git entry - refusing to remove",
+                    ))
+                    return
+            else:
+                foreign = [
+                    g for g in git_entries
+                    if not _git_entry_belongs_to_registered_worktree(g, registered_worktrees)
+                ]
+                if foreign or unlistable:
+                    access_errors.append((
+                        path,
+                        "this directory's tree contains a .git entry that is not a "
+                        "registered worktree of this repository (another clone's "
+                        "worktree, a standalone clone, or an unlistable "
+                        "subdirectory) - refusing to remove",
+                    ))
+                    return
         seen.add(key)
         out.append(Candidate(path=path, mtime=entry_mtime, reason=reason))
 
@@ -780,6 +852,24 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
         result = wip_commit_dirty_worktree(w, default_branches=cfg.default_branches)
         lines.append(result.message)
         if result.refused:
+            refused.add(w)
+
+    # A worktree can be CLEAN and still hold a commit reachable from no
+    # branch or tag - a reviewer's local fixup, or a mutation-test commit,
+    # made on a `git worktree add --detach` checkout (Rule 2's own
+    # recommended form) with no further changes since. Only dirty
+    # worktrees reach the loop above; this one covers every registered
+    # worktree regardless of dirty state, so a clean-but-unreachable one
+    # is refused too - `worktree prune` below would otherwise drop its
+    # HEAD, turning that commit into unreachable garbage recoverable only
+    # until the next `git gc`, exactly the loss a detached WIP commit is
+    # already refused to avoid.
+    for w in report.registered_worktrees:
+        if w == cfg.repo or w in refused or not w.exists():
+            continue
+        if worktree_branch(w) in _NEVER_AUTO_COMMIT_BRANCHES_SENTINELS and not worktree_head_reachable(w):
+            lines.append(f"  REFUSED detached worktree with unreachable HEAD "
+                         f"(would become unreachable garbage on prune): {w}")
             refused.add(w)
 
     def is_refused(path: Path) -> bool:
