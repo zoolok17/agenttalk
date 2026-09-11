@@ -50,6 +50,8 @@ from agenttalk import checkpoint as checkpoint_mod
 from agenttalk import deadman as deadman_mod
 from agenttalk import ephemeral as eph
 from agenttalk import domains as dom
+from agenttalk import janitor as janitormod
+from agenttalk import scratch as scratchmod
 from agenttalk import transcript as tx
 from agenttalk import codex_config as cxc
 from agenttalk import doctor as dr
@@ -9423,6 +9425,42 @@ def cmd_capacity(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_scratch(args: argparse.Namespace) -> int:
+    """Resolve (and create) a seat's scratch directory (#148). With --task,
+    the task-scoped subdirectory; without it, the agent's own root (NOT a
+    "default" task subdirectory - a seat's long-lived scratch export must
+    not itself be subject to the task-level staleness window)."""
+    root = Path(args.root).resolve() if getattr(args, "root", None) else find_root()
+    if args.scratch_cmd == "root":
+        agent = _resolve_self(args.agent, roster=None)
+        try:
+            if args.task:
+                path = scratchmod.task_scratch_dir(root, agent, args.task)
+            else:
+                path = scratchmod.agent_scratch_dir(root, agent)
+        except ValueError as e:
+            sys.stderr.write(f"agenttalk: {e}\n")
+            return 2
+        print(str(path))
+        return 0
+    sys.stderr.write("agenttalk: scratch: choose a subcommand (root)\n")
+    return 2
+
+
+def cmd_janitor(args: argparse.Namespace) -> int:
+    """Report (default) or clean up (--apply) scratch sprawl (#148)."""
+    root = Path(args.root).resolve() if getattr(args, "root", None) else find_root()
+    cfg = janitormod.JanitorConfig.load(root)
+    if args.keep_days is not None:
+        cfg.keep_days = args.keep_days
+    report = janitormod.build_report(cfg)
+    if args.apply:
+        print(janitormod.apply(cfg, report))
+    else:
+        print(janitormod.format_report(report, cfg, apply=False))
+    return 0
+
+
 def cmd_install_skills(args: argparse.Namespace) -> int:
     if args.devkit_only:
         claude = codex = False
@@ -15908,6 +15946,42 @@ def build_parser() -> argparse.ArgumentParser:
     gw_clear_hold.set_defaults(func=cmd_gateway)
     gw_run = gwsub.add_parser("run", help=argparse.SUPPRESS)
     gw_run.set_defaults(func=cmd_gateway)
+
+    pscratch = sub.add_parser(
+        "scratch",
+        help="Per-seat scratch root (#148): where temporary work goes so it "
+             "never sprawls into the repo root, .worktrees/, or the OS temp dir.",
+    )
+    scratchsub = pscratch.add_subparsers(dest="scratch_cmd")
+    pscratch_root = scratchsub.add_parser(
+        "root",
+        help="Resolve (and create) the agent's scratch root <scratch_root>/<agent>, "
+             "or with --task the task-scoped <scratch_root>/<agent>/<task>; prints "
+             "the path. scratch_root is .agenttalk/config.json's \"scratch\" key, "
+             "or a sibling atk-scratch/ next to the project root by default.",
+    )
+    pscratch_root.add_argument("--for", dest="agent",
+                               help="Agent name (default: $AGENTTALK_SELF)")
+    pscratch_root.add_argument("--task",
+                               help="Task id; scopes to <scratch_root>/<agent>/<task> "
+                                    "instead of the agent's own root")
+    pscratch_root.set_defaults(func=cmd_scratch)
+
+    pjanitor = sub.add_parser(
+        "janitor",
+        help="Report (default) or clean up (--apply) scratch sprawl: config-driven "
+             "allow-listed name families in the repo root, .worktrees/, the OS temp "
+             "root, and stale per-agent scratch directories (#148).",
+    )
+    pjanitor.add_argument("--apply", action="store_true",
+                          help="WIP-commit dirty registered worktrees on their own "
+                               "branch (never the default branch), remove allow-listed "
+                               "paths, and prune stale worktree registrations. Default "
+                               "is report-only.")
+    pjanitor.add_argument("--keep-days", type=int, default=None,
+                          help="Override the scratch-root staleness window "
+                               "(default: config's scratch.keep_days, else 3)")
+    pjanitor.set_defaults(func=cmd_janitor)
 
     ph = sub.add_parser(
         "hmac-init",

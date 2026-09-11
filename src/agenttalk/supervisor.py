@@ -736,7 +736,7 @@ _AGENTTALK_SUBCOMMANDS = frozenset(
     "request-restart commit-gate request-launch wrap "
     "_internal-check-wrap-dispatch dead-letter managed-lead-loop supervise "
     "deadman reply tail start serve dashboard reset doctor gateway hmac-init "
-    "capacity install-skills codex-config comprehension".split()
+    "capacity install-skills codex-config comprehension scratch janitor".split()
 )
 _LAUNCHER_DERIVED_PRIOR_SOURCES = {"launch_child_provenance"}
 _DIAGNOSTIC_COUNTERS = (
@@ -12848,6 +12848,35 @@ function Set-AgenttalkEnvironmentMapEntry($entries, [string]$name, $value) {
   }
   $entries[$target] = $value
 }
+function Resolve-AgenttalkScratchRoot($agentName) {
+  # #148: the per-seat scratch root the wrapper exports as AGENTTALK_SCRATCH.
+  # Shells out to the already-tested `agenttalk scratch root` resolution
+  # (single source of truth with scratch.py's config-reading logic) rather
+  # than re-implementing it here. Best-effort: any failure - misconfigured
+  # config.json, an unexpected interpreter error - returns $null and the
+  # caller simply does not set the variable; a launch NEVER fails because
+  # this optional convenience lookup failed.
+  $savedPP = $env:PYTHONPATH
+  if ($SrcOnPyPath) { $env:PYTHONPATH = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
+  try {
+    $out = & $AgenttalkPython -m agenttalk --root $Root scratch root --for $agentName 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $out) { return $null }
+    # Reviewer-3 H5: $out can be an array of lines (multi-line stdout, e.g.
+    # stray output ahead of the real path) - take the LAST non-empty line,
+    # not the whole blob, and never trust it without confirming it is
+    # actually an existing directory before exporting it as an env var a
+    # child process will treat as a writable scratch root.
+    $lines = @($out) | Where-Object { $_ -and ([string]$_).Trim() }
+    if ($lines.Count -eq 0) { return $null }
+    $candidate = ([string]$lines[-1]).Trim()
+    if (Test-Path -LiteralPath $candidate -PathType Container) { return $candidate }
+    return $null
+  } catch {
+    return $null
+  } finally {
+    if ($null -eq $savedPP) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $savedPP }
+  }
+}
 function Open-AgenttalkProcessHandle($procId) {
   if (-not $procId) { return $null }
   # SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION. The
@@ -14439,6 +14468,8 @@ function Launch($name, $plan, $codexHome, $acceptedAdmission = $null) {
   $applied = [hashtable]::new([StringComparer]::Ordinal)
   $applied['AGENTTALK_ROOT'] = $Root
   $applied['AGENTTALK_PY'] = $AgenttalkPython
+  $scratchRoot = Resolve-AgenttalkScratchRoot $name
+  if ($scratchRoot) { $applied['AGENTTALK_SCRATCH'] = $scratchRoot }
   if ($SrcOnPyPath) { $applied['PYTHONPATH'] = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
   if ($codexHome) { $applied['CODEX_HOME'] = $codexHome }  # per-agent isolated home
   # Deliberately case-insensitive - see Start-WrapperProcess's own $window
@@ -14564,6 +14595,8 @@ function Launch-Spec($name, $spec, $codexHome, $acceptedAdmission = $null) {
   $applied = [hashtable]::new([StringComparer]::Ordinal)
   $applied['AGENTTALK_ROOT'] = $Root
   $applied['AGENTTALK_PY'] = $AgenttalkPython
+  $scratchRoot = Resolve-AgenttalkScratchRoot $name
+  if ($scratchRoot) { $applied['AGENTTALK_SCRATCH'] = $scratchRoot }
   if ($SrcOnPyPath) {
     $applied['PYTHONPATH'] = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH
   }

@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Per-seat scratch root + janitor (#148).** `agenttalk scratch root
+  --for <agent>` resolves and creates the agent's own scratch root
+  `<scratch_root>/<agent>`; `--task <id>` scopes to a task subdirectory
+  instead. `scratch_root` is configurable via `.agenttalk/config.json`'s
+  `"scratch"` key; default a sibling `atk-scratch/` next to the project
+  root - unconfigured projects get the default, nothing breaks. Wrapped
+  agents receive the agent root pre-resolved as `$AGENTTALK_SCRATCH`
+  (never a task subdirectory - see `docs/ops/scratch-hygiene.md`), and
+  the dispatch envelope now states the rule. `agenttalk janitor [--apply]
+  [--keep-days N]` is a cross-platform, config-driven port of the
+  project's own validated `cleanup-scratch.ps1`: report mode (default)
+  lists scratch-family candidates and dirty registered worktrees (ANY
+  uncommitted change, tracked or untracked); `--apply` WIP-commits dirty
+  worktrees on their own branch, REFUSING outright (neither committed nor
+  removed) a worktree on a default branch or a detached `HEAD`; removes
+  allow-listed paths - a symlink/junction candidate is removed as the
+  link itself, never through it into its target; prunes stale worktree
+  registrations (scratch staleness measured from the newest mtime
+  anywhere in the tree, not the directory's own); and reports a removal
+  that fails, or a location it could not even list, as `FAILED` with an
+  elevated re-run hint, never silently skipped. The OS temp root gets a
+  narrower, case-sensitive family list matching files and directories
+  alike, every entry individually gated by an age window - it is shared
+  with every other program on the machine. `agenttalk
+  doctor` warns when registered worktrees, scratch families, or
+  unlistable locations exist outside the scratch root. See
+  `docs/ops/scratch-hygiene.md`.
+
 ## [0.87.0] - 2026-09-07
 
 Theme: **the comprehension producer ships — a static inventory plane for
