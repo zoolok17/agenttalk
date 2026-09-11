@@ -81,7 +81,7 @@ agent is never mistaken for stuck.
 ## 2. Prerequisites
 
 - agenttalk installed and a store initialized in your project
-  (`agenttalk init --here --agents ...`). See the README quickstart.
+  (`agenttalk init --here --agents ...`). See the README's Quick setup.
 - PowerShell Core 7+ on Windows. Stable 7.4+ is recommended. Stable
   7.0-7.3 and prereleases run with warnings; Windows PowerShell 5.1 is
   unsupported and refused.
