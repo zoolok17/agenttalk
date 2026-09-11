@@ -217,9 +217,9 @@ Open a second CLI — from the other vendor, so the two agents don't
 share a training lineage, with `AGENTTALK_SELF` set in that terminal —
 in the same project root and tell it:
 
-> We use agenttalk in this project. Give yourself a unique name, add
-> yourself to the roster as a developer, then wait for the lead to
-> contact you.
+> We use agenttalk in this project. Add yourself to the roster as a
+> developer using the name already in your AGENTTALK_SELF, then wait
+> for the lead to contact you.
 
 It runs `agenttalk roster add <name> --role developer`, then drops into
 listen mode: `/agenttalk.listen` on Claude, `$agenttalk-listen` on
@@ -343,11 +343,13 @@ unit, and `comprehension report`/`status` query one run at a time.
 Feature and unit ids are deterministic hashes over each item's kind,
 path, and qualified name — not run-specific — so **rescanning the same
 paths** is directly comparable: an unchanged file re-derives the same
-id, and the diff between two runs' id sets shows exactly what changed.
-A file move, a package or class rename, or a framework change re-keys
-every id derived from it, so a real stack migration's diff reads as
-matched removals-plus-additions, not silent reappearance — explain
-each one, the same way section 4 already treats a rename or split (see
+id, and the diff between two runs' id sets shows which ids appeared or
+disappeared — not what changed inside them, since no content goes into
+an id, only kind/path/name. A file move, a package or class rename, or
+a framework change re-keys every id derived from it, so a real stack
+migration's diff reads as removals and additions you pair up yourself,
+not silent reappearance — explain each one, the same way section 4
+already treats a rename or split (see
 [§4](#4-in-depth-how-a-migration-works)). Set equality is surface
 accounting, not behavioral evidence; it says nothing about whether a
 feature still works. (A built-in cross-run comparison command is not
