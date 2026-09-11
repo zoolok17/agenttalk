@@ -1,137 +1,268 @@
 # agenttalk
 
-A small, file-backed bus that lets coding-agent CLIs — **Claude Code**
-and **Codex**, a pair or a named team — **talk to each other directly**
-and work on the same repo. No daemon, just files.
-
-At its core it's still exactly that: two agents messaging each other so an
-implementer and a reviewer collaborate without you copy-pasting between
-windows. Around that core it has grown to meet real multi-agent work —
-named teams (roles, groups, broadcast, a lead/liaison), operator-safety
-primitives (escalation, supersede/rescind, pre-action checks, epochs),
-24/7 unattended supervision that auto-restarts agents *with their context
-intact*, a shared ownership/domain registry, and a lightweight
-review-assurance layer (gates + typed evidence). **The essence is
-unchanged; the surface area grew.**
-
-Agents share a project-local `.agenttalk/` directory; every message
-becomes a small JSON file. Each CLI runs in its own terminal window so
-you see the full conversation as it happens. A markdown transcript is
-exported on session end.
-
-## Capabilities at a glance
-
-| Layer | What it gives you |
-| --- | --- |
-| **Talk directly** | `send`/`reply` point-to-point or `broadcast` fan-out; every message is a JSON file both terminals see. |
-| **Review handoffs** | the `/agenttalk.handoff` and `/agenttalk.consult` skills (`$agenttalk-…` on Codex) plus the `agenttalk propose` command — fresh cross-review by an agent that didn't write the code. |
-| **Named teams** | roles, groups, a `lead`/operator-liaison; `escalate` routes decisions to one human voice. |
-| **Operator-safety** | supersede/`rescind`, pre-action `check`, epoch barriers — stale or rescinded requests can't quietly close. |
-| **24/7 supervision** | auto-restart agents *with their session intact* across outages; a progress wrapper (`wrap`) that also delivers replies for harness-blocked seats, rejoins interrupted turns, and fails loudly with a remedy instead of retrying silently. |
-| **Shared ownership** | a `domain` registry mapping repo areas to owners/reviewers. |
-| **Assurance** | `gate` HOLD/GO state + typed review evidence, so unsafe closure is hard. |
-
-The first row is the whole essence; everything else is opt-in.
-
-## Documentation
-
-Start with [docs/AGENTTALK-NEW-USER-MANUAL.md](docs/AGENTTALK-NEW-USER-MANUAL.md)
-for a concept-first onboarding manual. A generated PDF is available at
-[docs/AGENTTALK-NEW-USER-MANUAL.pdf](docs/AGENTTALK-NEW-USER-MANUAL.pdf).
-For operator-facing procedures and examples, use
-[docs/USER-MANUAL.md](docs/USER-MANUAL.md). The other canonical docs are:
-
-- [docs/AGENT-MANUAL.md](docs/AGENT-MANUAL.md) - role-keyed operating guide
-  for agents.
-- [docs/DESIGN.md](docs/DESIGN.md) - architecture, rationale, and decision
-  history.
-- [docs/ROADMAP.md](docs/ROADMAP.md) - product roadmap.
-- [docs/ASSURANCE.md](docs/ASSURANCE.md) - release attestation and gate
-  evidence.
-- [docs/ISSUES.md](docs/ISSUES.md) - living tracker.
-- [docs/QWEN-OVH-TRIAL.md](docs/QWEN-OVH-TRIAL.md) - operator runbook for
-  the watched, cooperative Qwen-on-OVH trial.
-- [CHANGELOG.md](CHANGELOG.md) - release history.
-- [SECURITY.md](SECURITY.md) - security posture and trust model.
+1. [Quick intro](#1-quick-intro)
+2. [Quick setup](#2-quick-setup)
+3. [Use cases](#3-use-cases)
+4. [In depth: how a migration works](#4-in-depth-how-a-migration-works)
+5. [Technical reference and FAQ](#5-technical-reference-and-faq)
 
 ---
 
-## The minimal start (just tell the agent)
+## 1. Quick intro
 
-You don't have to pre-declare a roster or learn any commands to get an agent
-onto the bus. If a project already has agenttalk initialized and the skills
-installed (the one-time setup in the [TL;DR](#tldr--getting-started) below),
-just start a fresh CLI and tell the agent, in plain language:
+agenttalk is a small, file-backed message bus that lets coding-agent
+CLIs — Claude Code and Codex, a pair or a named team — talk to each
+other directly and work on the same repo. There is no daemon and no
+server: every message is a JSON file under a project-local
+`.agenttalk/` directory, and each CLI runs in its own terminal window
+so you watch the full conversation as it happens.
 
-> We use agenttalk in this project. Give yourself a unique name, add yourself
-> to the roster as a developer (or reviewer), then wait for the lead to contact
-> you.
+### Why a bus instead of copy-paste
 
-The agent reads its agenttalk skill, picks a name, runs `agenttalk roster add
-<name> --role developer`, and drops into listen mode (`/agenttalk.listen`).
-That's the whole entry gate — the lead (or you) drives it from there. **Roles
-are free-form labels**, so `developer`, `reviewer`, `tester`, or anything else
-you name works.
+The default way to get a second opinion from another agent is to copy
+a diff out of one chat window and paste it into another, then copy the
+review back. agenttalk removes the copy-paste: one agent sends a
+message, the other wakes up, does the work, and replies. You stay in
+the loop the whole time and can interrupt either side whenever you
+want.
 
-**Starting the human-facing lead** is the same move from the other side — tell
-one CLI:
+### Vendor diversity is a review property, not a preference
 
-> We use agenttalk in this project. Add yourself as the human-facing lead, then
-> check whether the team is up and running.
+agenttalk treats "which vendor implemented this" and "which vendor
+reviews it" as independent choices. Claude-implements-Codex-reviews
+and Codex-implements-Claude-reviews are equally supported, and nothing
+about the bus favors either direction. The reason to pair different
+model vendors, rather than running two instances of the same one, is
+that a reviewer with a different training lineage is less likely to
+share the first agent's blind spots. The bus is symmetric; which agent
+plays which part on a given task is your call.
 
-It picks a name, runs `agenttalk roster add <name> --role lead` and `agenttalk
-roster set-operator-facing <name>` (so it's the single agent you talk to and
-where escalations route), reads its `/agenttalk.lead` skill, then runs `agenttalk
-roster` / `status` / `sync` to see who's online — and coordinates the team from
-there.
+### What grows around that core
 
-The precise setup below — `init --agents ...` and explicit roster/role/group
-commands — is for when you want names and structure pinned up front. It is *not*
-a prerequisite.
+The two-agent handoff is the whole essence, and it stays simple:
+`send`/`reply`, or the `/agenttalk.handoff` skill, for one agent to
+hand work to another and block on the answer. Everything else is
+opt-in, added to support real multi-agent work once a pair grows into
+a team or runs unattended:
+
+- **Named teams** — roles, groups, a lead/operator-liaison identity,
+  and `broadcast` fan-out to a role or group.
+- **Operator safety** — supersede/rescind so a stale request can't
+  quietly get actioned, pre-action `check`, and epoch barriers.
+- **24/7 supervision** — a background monitor that restarts agents
+  across provider outages or stuck turns, and a progress wrapper
+  (`agenttalk wrap`) that resumes the agent's actual session context
+  rather than starting the turn over.
+- **Shared ownership** — a `domain` registry mapping repo areas to
+  owners, reviewers, and curators, with a scoped `lane` deliver-gate
+  built on top of it.
+- **Durable memory** — an `onboarding` ledger for what the team learned
+  about a codebase before touching it, and a `knowledge` layer for
+  pointer notes and lessons that outlive any one session.
+- **Assurance** — a `gate` HOLD/GO state plus typed review evidence, so
+  a milestone can't close on the strength of an unreviewed claim.
+- **A read-only dashboard** — a local web console (`agenttalk serve` /
+  `agenttalk dashboard`) for watching roster, threads, and obligations
+  without joining the bus yourself.
+
+### Local-first, no egress
+
+agenttalk itself makes no network calls. The bus is files on disk; the
+only network traffic is whatever the underlying agent CLI (Claude
+Code, Codex) already makes to its own provider. The bundled dashboard
+binds to loopback only and has no flag to expose it — reach it from
+another machine over an SSH tunnel if you need to, not by opening the
+port.
+
+### What agenttalk is not
+
+- **Not a model.** agenttalk doesn't call any model API itself and has
+  no opinion on which model a CLI uses — it only moves messages between
+  whatever agent CLIs you start. The intelligence is entirely in the
+  agents; the bus just lets them talk.
+- **Not an IDE plugin.** There's no editor integration to install.
+  agenttalk is a CLI-level bus: it works with whatever terminal or
+  editor-embedded terminal you already run your agent CLIs in.
+- **Not a hosted service.** No account, no server to sign up for, no
+  cloud component. Everything lives in your project's `.agenttalk/`
+  directory on your own machine.
+- **Not a task queue.** There's no central scheduler deciding what
+  runs next; agents decide what to do and message each other about it.
+  If you want an explicit "what's next" driver, pair agenttalk with a
+  workflow tool such as spec-kitty — agenttalk carries the wake
+  signal, the workflow tool remains the source of truth for state.
+- **Not a replacement for git.** Nothing here manages branches, merges,
+  or history. `lane` and `domain` gate *who may deliver what*, using
+  git diffs as evidence; they don't perform the merge.
+- **Not a multi-machine system.** Both agents are expected to share one
+  project directory on one machine (or a directory synced by a
+  mechanism you already trust). There's no transport, no server
+  process, and no attempt to solve distributed consensus.
 
 ---
 
-## TL;DR — getting started
+## 2. Quick setup
+
+### Install (tag-pinned)
 
 ```powershell
-# one-time install (canonical, tag-pinned)
 python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.87.0"
 agenttalk install-skills          # installs bus skills + the dev-discipline devkit
-
-# in your project root, once per project
-agenttalk init --here --agents claude,codex
-agenttalk codex-config --enable   # lets Codex call agenttalk from its sandbox
 ```
 
-A one-window project is valid too: initialize with `--agents claude` or
-`--agents codex`, set only `AGENTTALK_SELF`, and add peers later. Until then,
-commands that need another agent require an explicit `--to` and cannot infer a
-peer.
+Pin to a released tag (`@v0.87.0` above, or whatever the current
+release is) rather than a branch — the CLI surface and message schema
+can change between releases, and a tag keeps every agent in a project
+talking the same protocol version.
 
-Open one terminal per active agent at the project root:
+`agenttalk install-skills` writes Claude Code's bus commands under
+`~/.claude/commands` and Codex's under `~/.codex/skills` by default;
+pass `--claude-only` or `--codex-only` to install just one side, or
+`--dry-run` to preview without writing.
 
-### For spec-kitty missions (the canonical workflow)
+### Initialize a project
 
-- **Terminal A (Claude Code).** `/agenttalk.sk-loop <mission-slug>`
-- **Terminal B (Codex).** `$agenttalk-sk-loop <mission-slug>`
+Once per project, from the project root, with the actual names you'll
+use in each terminal (not the generic `claude`/`codex` default — see
+the next section for why):
 
-Each loop calls `spec-kitty next --agent <self>` to decide what to do
-next, does the implement or review work in the persistent window, then
-sends a tiny `kind=wake` message to the peer so they react instantly.
-Both agents keep full context across all WPs — important for catching
-cross-WP regressions a fresh subprocess reviewer would miss. spec-kitty
-remains the source of truth for state; agenttalk is just a wake signal.
+```powershell
+agenttalk init --here --agents claude-dev,codex-rev
+agenttalk codex-config --enable   # see "Let Codex call agenttalk" below
+```
 
-### For ad-hoc cross-agent messaging (not spec-kitty)
+`init --here` is shorthand for `init --path .`; it writes
+`.agenttalk/config.json` with the roster you named.
 
-- **Terminal A (Claude).** `/agenttalk.handoff` (send + block on reply),
-  `/agenttalk.consult` (confer with peer before answering you),
-  `/agenttalk.propose` (ask the peer to accept/reject/counter a
-  concrete solution), `/agenttalk.lead` (coordinate a named team), or
-  `/agenttalk.send` (fire and forget).
-- **Terminal B (Codex).** `$agenttalk-listen` (wait/respond loop).
+A one-window project is valid too: initialize with a single agent name
+and add peers later with `agenttalk roster add`.
 
-On restart or rejoin, confirm identity and inbox state before acting:
+### Give each terminal its identity
+
+Every `agenttalk` command needs to know which agent it's running as.
+Set `AGENTTALK_SELF` in each terminal **before** starting the CLI, so
+every bus command that CLI runs (directly or through a skill) resolves
+to the right identity automatically:
+
+```powershell
+# Terminal A (PowerShell)
+$env:AGENTTALK_SELF = 'claude-dev'
+claude
+
+# Terminal B (PowerShell)
+$env:AGENTTALK_SELF = 'codex-rev'
+codex
+```
+
+```bash
+# Terminal A (bash)
+export AGENTTALK_SELF=claude-dev
+claude
+
+# Terminal B (bash)
+export AGENTTALK_SELF=codex-rev
+codex
+```
+
+This matters even for the self-guided flow below: an agent that "picks
+its own name" still needs `AGENTTALK_SELF` set in its terminal (or an
+explicit `--from <name>` on every bus command it runs) — without one of
+the two, its commands silently fall back to a default identity instead
+of failing loudly, which can route messages to or from the wrong agent
+with no error. `agenttalk init` prints this same reminder after it
+runs; don't skip it.
+
+### Let Codex call agenttalk
+
+`agenttalk codex-config --enable` writes a per-project block into
+Codex's own `~/.codex/config.toml`:
+
+```toml
+trust_level = "trusted"
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+```
+
+This is broader than just agenttalk: it removes Codex's approval
+prompts for **every** command it runs in this project, not only bus
+commands, and grants workspace-write sandbox access. Without it, Codex
+prompts for approval on each `agenttalk` invocation, which breaks
+unattended listen loops. Consent to this knowingly — check the current
+state with `agenttalk codex-config --status`, and undo it with
+`agenttalk codex-config --disable` (this keeps `trust_level`, only
+clearing `approval_policy`/`sandbox_mode`).
+
+### Start one agent as a self-guiding lead
+
+You don't have to pre-declare a roster or learn commands to get the
+first agent onto the bus. Start a fresh CLI — with `AGENTTALK_SELF` set
+in that terminal, as above — in the project root and tell it, in plain
+language:
+
+> We use agenttalk in this project. Add yourself as the human-facing
+> lead, then check whether the team is up and running.
+
+The agent reads its bus skill, picks a name (matching the
+`AGENTTALK_SELF` you set, or its own choice if you left it unset —
+which the identity note above explains why to avoid), runs `agenttalk
+roster add <name> --role lead` and `agenttalk roster set-operator-facing
+<name>` (so it becomes the one agent you talk to, and the one
+escalations route to), then runs `agenttalk roster` / `agenttalk
+status` / `agenttalk sync` to see who else is online. From there it
+coordinates the rest of the team on your behalf.
+
+### Add a second agent of another vendor
+
+Open a second CLI — from the other vendor, so the two agents don't
+share a training lineage, with `AGENTTALK_SELF` set in that terminal —
+in the same project root and tell it:
+
+> We use agenttalk in this project. Add yourself to the roster as a
+> developer using the name already in your AGENTTALK_SELF, then wait
+> for the lead to contact you.
+
+It runs `agenttalk roster add <name> --role developer`, then drops into
+listen mode: `/agenttalk.listen` on Claude, `$agenttalk-listen` on
+Codex. **Roles are free-form labels** — `developer`, `reviewer`,
+`tester`, or anything else you name works; the CLI doesn't special-case
+any particular string.
+
+If you'd rather wire this up yourself instead of talking the agents
+through it:
+
+```powershell
+agenttalk roster add claude-dev --role developer
+agenttalk roster add codex-rev --role reviewer
+agenttalk roster
+```
+
+If a CLI was already open when you ran `agenttalk install-skills`,
+restart it — skills are loaded at startup, so an already-running
+session won't see newly installed ones.
+
+### First review round
+
+With both agents up, ask the lead (or either agent directly) to hand
+off a piece of work and block on the reply. On Claude:
+
+> Implement <task>, then use /agenttalk.handoff to send it to
+> <the other agent> for review.
+
+On Codex, the equivalent skill is hyphenated: `$agenttalk-handoff`.
+Both wrap the same underlying commands — Claude's dotted names
+(`agenttalk.send`, `agenttalk.listen`, `agenttalk.handoff`, ...) and
+Codex's hyphenated names (`agenttalk-send`, `agenttalk-listen`,
+`agenttalk-handoff`, ...) are two spellings of identical behavior.
+
+Under the hood this is one `agenttalk send --kind review-request` (or
+the handoff skill, which wraps `send` and then waits) from the
+implementer, a wake for the reviewer's listen loop, and an `agenttalk
+reply` back. Watch both terminals — each shows the full exchange as it
+happens, since `send` prints to the sender's stdout and the receiver's
+`wait` prints the same message on the other side.
+
+To check in on a rejoined or idle session without re-explaining
+context, run:
 
 ```powershell
 agenttalk roster
@@ -139,20 +270,112 @@ agenttalk status
 agenttalk sync --for <agent>
 ```
 
-`sync` summarizes roster identity, open request threads, recent unread
-FYI traffic, terminal decisions, and deterministic next-action hints.
-For a known thread, use a scoped wait to wake only on that thread
-without advancing the global inbox cursor:
+`sync` summarizes roster identity, open request threads, unread
+traffic, and deterministic next-action hints — it's the fastest way
+for an agent (or you) to answer "what's outstanding right now."
+
+### What's next
+
+This covers a working pair with one review round. For fan-out to a
+whole team, unattended 24/7 operation, shared ownership over repo
+areas, and the full command reference, see [Use
+cases](#3-use-cases) and the [Technical
+reference](#5-technical-reference-and-faq).
+
+---
+
+## 3. Use cases
+
+Four shapes cover most projects that adopt agenttalk. Each is a
+starting point, not a fixed track — teams mix and match as the work
+changes.
+
+### Ad hoc: a quick implement-then-review loop
+
+The smallest useful shape: one agent implements, another reviews, no
+pre-declared roster. Tell a fresh CLI the [minimal-start
+instructions](#start-one-agent-as-a-self-guiding-lead), or
+wire it up directly:
 
 ```powershell
-agenttalk wait --for <agent> --to-request <request-id>
+agenttalk roster add claude-dev --role developer
+agenttalk roster add codex-rev --role reviewer
 ```
 
-Both terminals show every message as it flies past. When you're done:
-`agenttalk end --from claude --reason "done"` writes a markdown
-transcript under `.agenttalk/sessions/`.
+Then hand off with `/agenttalk.handoff` (send + block on reply) or
+`/agenttalk.consult` (confer with the peer before answering you), and
+let the reviewer's `/agenttalk.listen` loop pick it up. This is the
+right shape for a single feature, a bug fix, or any task where you
+don't need named teams, gates, or unattended operation — just a fast,
+observable second opinion from a different model vendor.
 
-For a team, initialize with unique names and then add roles/groups:
+### Migrating an old codebase (the flagship use case)
+
+agenttalk was built for exactly this: a legacy codebase nobody fully
+trusts yet, worked by more than one agent over more than one session,
+where the risk isn't writing code — it's writing code against a wrong
+belief about what the old code does.
+
+Three features compose for this:
+
+- **`agenttalk onboarding`** is a durable ledger for the first pass:
+  agents record which segments of the codebase they read, claims they
+  believe (with evidence pointers), drift between docs and actual
+  behavior, and open unknowns — optionally marked `--blocking` so a
+  migration step can't quietly proceed past an unanswered question.
+  This is evidence capture, not an analyzer: it doesn't decide what's
+  true, it makes sure disagreements and gaps are visible instead of
+  silently assumed away.
+- **`agenttalk domain`** turns "who owns this part of the legacy tree"
+  into a checkable registry instead of tribal knowledge, so a second
+  agent joining mid-migration can ask `domain check-path` instead of
+  guessing.
+- **`agenttalk lane`** gates *delivering* a change against that
+  registry: a lane is a scoped assignment (a domain subset, a base
+  SHA, a target ref), and `lane check` computes the actual diff,
+  checks it against domain bounds and other active lanes, and runs a
+  real merge check — HOLD or GO, never an inferred "probably clean."
+
+A fourth command, **`agenttalk comprehension`**, gives a migration
+surface accounting instead of a guess: `comprehension scan` builds a
+local, offline, immutable inventory of the repository by feature and
+unit, and `comprehension report`/`status` query one run at a time.
+Feature and unit ids are deterministic hashes over each item's kind,
+path, and qualified name — not run-specific — so **rescanning the same
+paths** is directly comparable: an unchanged file re-derives the same
+id, and the diff between two runs' id sets shows which ids appeared or
+disappeared — not what changed inside them, since no content goes into
+an id, only kind/path/name. A file move, a package or class rename, or
+a framework change re-keys every id derived from it, so a real stack
+migration's diff reads as removals and additions you pair up yourself,
+not silent reappearance — explain each one, the same way section 4
+already treats a rename or split (see
+[§4](#4-in-depth-how-a-migration-works)). Set equality is surface
+accounting, not behavioral evidence; it says nothing about whether a
+feature still works. (A built-in cross-run comparison command is not
+yet shipped — you diff the two runs' id sets yourself today.)
+
+Together, this gives a migration a paper trail: what was read before
+it was changed, who owns the part being touched, a deliver gate that
+composes with `close`/`gate` review evidence instead of trusting a
+change is safe because nobody objected, and a surface-level accounting
+of what moved, was added, or was removed. See [Technical
+reference](#5-technical-reference-and-faq) for the full command
+tables, and [§4](#4-in-depth-how-a-migration-works) for the method in
+full.
+
+### Greenfield: spec, plan, build, with review from round one
+
+For a new project, there's no legacy-belief risk to guard against, so
+the emphasis shifts to keeping a growing team's roles straight from
+the start, and getting review into the loop before the first feature
+lands rather than after. If you're driving work from a spec/plan tool
+such as spec-kitty, agenttalk's `sk-loop` skills (`/agenttalk.sk-loop`
+for Claude, `$agenttalk-sk-loop` for Codex) call `spec-kitty next
+--agent <self>` to decide what's next, do the work, and send a small
+wake message so the peer reacts instantly — spec-kitty stays the
+source of truth for state, agenttalk is just the wake signal. Without
+a spec tool, wire up roles directly:
 
 ```powershell
 agenttalk init --here --agents claude-dev,codex-dev,claude-rev,codex-rev,claude-lead
@@ -163,1971 +386,543 @@ agenttalk roster set-group reviewers claude-rev,codex-rev
 agenttalk roster --json
 ```
 
-Use role-suffixed names for clarity. The default `claude,codex` pair
-remains valid and needs no roles or groups.
+Route implementation handoffs to a reviewer that didn't write the
+code (fresh review), and use `agenttalk broadcast --to-group reviewers
+--kind question` for anything the whole review group should weigh in
+on. A `domains.json` is worth authoring early here too — it's cheap to
+write against a codebase you're still designing, and it means the
+`lane` deliver-gate is available from the first PR instead of being
+retrofitted later.
 
-> **Naming convention:** Claude Code uses dotted skill names
-> (`agenttalk.send`, `agenttalk.listen`, `agenttalk.handoff`,
-> `agenttalk.consult`, `agenttalk.propose`, `agenttalk.lead`,
-> `agenttalk.sk-loop`) and
-> Codex uses hyphenated names
-> (`agenttalk-send`, `agenttalk-listen`, `agenttalk-handoff`,
-> `agenttalk-consult`, `agenttalk-propose`, `agenttalk-lead`,
-> `agenttalk-sk-loop`).
-> Behaviour is identical; only the slash-command spelling differs.
+### Operating an existing project day to day
 
----
-
-## Why this exists
-
-The usual cross-agent workflow is:
-
-1. You ask one agent to implement a feature.
-2. You copy the diff into the other agent and ask for a review.
-3. You copy the review back into the first.
-4. Repeat.
-
-`agenttalk` removes the copy/paste. The implementer runs
-`/agenttalk.handoff` to ping the peer. The peer (in listen mode) wakes,
-reviews the work, and replies. The implementer wakes on the reply and
-either ships or iterates. Both terminals display every message. You stay
-in the loop and interrupt whenever you want.
-
-Which agent plays implementer vs. reviewer is your call — agenttalk is
-symmetric. Claude-implements-Codex-reviews and Codex-implements-Claude-
-reviews are equally supported; in a spec-kitty mission, spec-kitty
-assigns the part per WP and the sk-loop skills follow.
+Once a project is past its initial migration or greenfield push, the
+steady-state pattern is mostly `agenttalk sync` and `agenttalk status`
+at the start of a session, ordinary handoffs for day-to-day changes,
+and `agenttalk gate` / `agenttalk close` around anything release-shaped.
+For a project that needs to keep working unattended — overnight,
+across an outage, or simply longer than you want to watch a terminal —
+add the supervisor and the `agenttalk wrap` progress wrapper so agents
+restart with their session context intact instead of starting over.
+See [docs/supervisor-tutorial.md](docs/supervisor-tutorial.md) for the
+supervisor quick start, and [Technical
+reference](#5-technical-reference-and-faq) for the assurance-gate
+command tables.
 
 ---
 
-## Install
+## 4. In depth: how a migration works
 
-**End users (canonical, tag-pinned):**
+This section is for a team planning a migration of an existing application.
+It explains how to preserve behavior while changing the stack beneath it.
 
-```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.87.0"
-```
+A migration needs more than a successful build on newer dependencies.
+You need an account of what existed, what changed, and how each claim was checked.
+Agenttalk helps the team share that account and coordinate independent work.
+The team remains responsible for the measurements and the release decision.
 
-Pin to a specific tag so you control upgrades. Replace the tag with
-whatever's listed on the [releases page](https://github.com/zoolok17/agenttalk/releases).
-Check what you have with `agenttalk --version`.
+### Start with a map of the application
 
-**Contributors (editable clone):**
+Before changing a legacy application, freeze an identifiable baseline revision.
+Capture the application surface while its original behavior is still available.
+Keep the source revision, scan inputs, and extraction limitations with the map.
 
-```powershell
-git clone https://github.com/zoolok17/agenttalk.git
-cd agenttalk
-python -m pip install -e ".[dev]"   # includes pytest + build
-```
+Three inventories answer different questions:
 
-The editable install means code changes are picked up live without
-re-running pip.
+| Inventory | Question it helps answer |
+|---|---|
+| Features | Which user-visible capabilities must survive? |
+| Entry points | Where can requests, jobs, messages, or other inputs enter? |
+| Calls and dependencies | Which collaborators and data operations does the code rely on? |
 
-Before proposing a repository change, install `dev-gate-requirements.txt` into both direct local gate
-interpreters (CPython 3.10 and 3.14) and run the committed `agenttalk dev-gate`
-command. See the [development gate reference](docs/DEV-GATE.md) for CI-leg,
-aggregate, and evidence details.
+The comprehension producer supplies a bounded static inventory for supported inputs.
+It records candidate features, recognized entry points, and coarse dependencies.
+It also exposes exclusions, unsupported shapes, and unresolved relationships.
+The team supplements those results where the application exceeds the adapter's scope.
 
-Either path puts an `agenttalk` script on your PATH. The package is
-stdlib-only (no third-party runtime deps) and requires Python 3.10+.
+A feature inventory is not automatically a complete list of business capabilities.
+A static call inventory is not a complete runtime call graph.
+Scheduled work, framework binding, and indirect calls need particular care.
+Read the [comprehension limitations](docs/COMPREHENSION-LIMITATIONS.md)
+before treating an empty result as proof that a mechanism does not exist.
 
-Install the bundled agent skills once per user:
+At each slice close, capture the integrated revision again.
+Compare the feature and entry-point identities with the baseline identities.
+Equal totals alone are insufficient: one removed feature can hide behind one addition.
+Compare the actual sets and explain every addition, removal, rename, or split.
 
-```powershell
-agenttalk install-skills
-```
+Byte-identical sorted identity lists establish equality of those lists.
+They support a claim that the captured surface remains accounted for one-to-one.
+They do not prove that each feature still behaves correctly.
+Behavioral tests and independent review supply that separate evidence.
 
-By default this installs two skill families:
+Keep comparisons meaningful by recording scope and extractor versions.
+A changed parser can alter an inventory even when application code is unchanged.
+Keep source-byte identity separate from normalized inventory identity.
+Capture metadata can differ between two scans of the same source.
 
-- The agenttalk bus skills for cross-agent collaboration:
-  `~/.claude/commands/agenttalk.*.md` for Claude Code and
-  `~/.codex/skills/agenttalk-*/SKILL.md` for Codex.
-- The dev-discipline devkit, shared by both agents:
-  `craft-code`, `test-coverage`, `review-code`, `write-docs`, and
-  `review-docs` under both `~/.claude/skills/` and `~/.codex/skills/`.
-- The **assurance review/test pack** (also part of the devkit):
-  `review-failure-injection`, `review-contract-drift`,
-  `review-release-readiness`, `system-review-protocol`, and `tester-qa`.
-  These are generic review/tester skills that PRODUCE the typed
-  `review-result` evidence + `risk_class` the assurance close consumes
-  (see "Milestone/release close" and "Specialist sign-off by risk
-  class"), so a reviewer or tester can sign off through `agenttalk close`.
-  agenttalk ships the generic skeletons + the evidence/honesty rules; the
-  PROJECT supplies the domain checklists, `.agenttalk/signoffs.json` risk
-  policy, and CI gates (e.g. Android a11y/device/GL stays project
-  content). Two rules are baked into every skill: `tests_executed` is what
-  you actually RAN (real command + result, or a CI run id), never a
-  claim — release-blocking evidence anchors to an `automation_ci` gate;
-  and a skill proposes a `risk_class` but never decides the close's risk
-  (the lead-owned risk inventory is authoritative for routing).
+The team performs the cross-revision reconciliation as part of this method.
+Automatic multi-run fact comparison and richer runtime joins are planned
+but not yet tracked by a dedicated issue. The
+[comprehension design](docs/DESIGN-55-comprehension-plane.md)
+describes those boundaries; its proposed surfaces are not an implementation checklist.
 
-Use `agenttalk install-skills --no-devkit` to install only the bus
-skills, or `agenttalk install-skills --devkit-only` to refresh only the
-devkit. `--claude-only` and `--codex-only` scope the bus skills only;
-the devkit is shared unless you pass `--no-devkit`. Existing edited
-files are preserved unless you pass `--force`; use `--dry-run --force`
-to preview overwrites first. Restart Claude Code and Codex after
-installing or refreshing skills.
+The current Java extraction layer has documented parsing and binding limits.
+Its parser replacement is planned in
+[the extraction upgrade](https://github.com/zoolok17/agenttalk/issues/141).
+A scan completing does not erase those limits or certify migration readiness.
 
-**Upgrading to v0.43.0+ (skill frontmatter migration):** the bundled
-skills now carry currency frontmatter (`reviewed-against`, plus
-`category` / `evidence-profile` on devkit skills). After upgrading,
-`agenttalk doctor` will show the devkit as **stale** (your installed copies
-predate the migration). Refresh with `agenttalk install-skills
---devkit-only --force` to adopt the new bundled skills; preview first with
-`agenttalk install-skills --devkit-only --dry-run --force` if you have local
-skill edits you want to keep.
+### Measure a baseline before changing behavior
 
-If you also want Codex to call agenttalk from inside its sandbox, run
-this once per project root:
+The baseline register connects the inventory to observations.
+Each in-scope behavior gets a reproducible case before the implementation changes.
+Include failure behavior, not only successful requests.
 
-```powershell
-agenttalk codex-config --enable
-```
+Useful cases cover responses, authorization decisions, persisted values,
+session transitions, scheduled work, and interactions with external systems.
+Choose the cases from the application's actual entry points and call sites.
+Record what remains unmeasured instead of giving it an implied pass.
 
-It writes a per-project block to `~/.codex/config.toml` granting
-`approval_policy = "never"` and `sandbox_mode = "workspace-write"` for
-that project only. Reverse it with `agenttalk codex-config --disable`.
+Each register entry identifies the behavior, revision, input, and expected result.
+It links the observed result to retained evidence.
+It also names the owner of any unresolved decision.
+
+Keep original observations when later measurements supersede them.
+An appended correction explains why the current interpretation changed.
+Deleting the earlier result would hide the path by which the team learned it was wrong.
+
+“Pre-existing” is a measured attribution, not an excuse or a guess from a diff.
+Run the same probe at the migration base and the candidate revision.
+If the mechanism is older, also run it at the original application baseline.
+Quote the revision and result beside the attribution.
+
+Positive controls matter when comparing different generations of a stack.
+A login that fails because an old driver cannot query a new server
+does not prove that the old authorization rules safely deny an attacker.
+Record the incompatibility separately from the permission being tested.
+
+When a compatible historical environment is required, identify that qualification.
+When the older implementation lacks the mechanism, report the comparison unavailable.
+A skipped case or a compilation failure is not a passing behavioral baseline.
+An inherited defect still needs a fix or an explicit owner disposition.
+
+### Turn guardrails into a living contract
+
+Guardrails state the boundaries within which the migration may run.
+They cover source identity, test isolation, data ownership, evidence, and cleanup.
+They also identify actions reserved for the operator.
+
+Give each rule a stable identifier, a reason, and a way to check it.
+Link an incident to the rule that prevents its recurrence.
+A rule without an observable check is easy to repeat and difficult to enforce.
+
+Keep related rules together:
+
+| Family | Evidence the team needs |
+|---|---|
+| Source identity | The exact revision and any temporary probe changes |
+| Test sensitivity | A known fault makes the intended assertion fail |
+| Environment isolation | Owned services, fresh data, and identified toolchains |
+| External effects | Network boundaries and actions that remain prohibited |
+| Artifact integrity | Fresh outputs and comparisons against recorded inputs |
+| Cleanup | Owned processes stopped and temporary work accounted for |
+
+The register carries project-specific measurements.
+Reusable documentation explains the method without carrying client identities,
+private machine details, account names, or internal work identifiers.
+Generated structure can also be sensitive even when it contains no source text.
+
+The [development methodology](docs/DEVELOPMENT-METHODOLOGY.md)
+explains the reasoning behind mutation checks, cold reads, and retained limitations.
+These practices require explicit execution records.
+Describing a practice does not prove that a particular run followed it.
+
+### Prove that the tests can detect the fault
+
+For a defect fix, first demonstrate the failure with a focused behavioral case.
+Apply the fix and demonstrate the expected result.
+Then temporarily remove the mechanism that makes the fix work.
+
+The associated assertion must fail for the intended reason.
+A compilation error or an unrelated connection failure does not validate that assertion.
+Restore the mechanism and confirm the case passes again.
+
+Target the decision being protected, not merely a nearby line of code.
+Removing a compare-and-set condition should expose a stale writer in its own case.
+Two threads serialized by a shared lock cannot establish a multi-process guarantee.
+The test must create the competing history that the mechanism is meant to reject.
+
+Inspect the inputs that cross a test seam.
+A fake database that ignores its query can keep passing after a filter is removed.
+An assertion about an exit status can miss a false statement in the result payload.
+Check the decision, its data, and the positive controls together.
+
+Keep the mutation, command, observed failure, and restored result together.
+That record lets another reviewer reproduce the claim without trusting its author.
+Small deterministic cases make later fix rounds cheaper to verify.
+
+### Build slices that can be closed independently
+
+A slice is a bounded change with a defined acceptance bar.
+Its steps have owners, dependencies, and concrete proof obligations.
+Separate a database compatibility question from an application rewrite when possible.
+Separate a source change from the deployment action that may eventually use it.
+
+Authors work in isolated branches or workspaces.
+Each proof travels with an identifiable revision and its evidence.
+The lead integrates the reviewed steps into one candidate revision.
+
+Integration is another boundary to test.
+Passing step branches do not establish that their combination is correct.
+Shared configuration, dependency resolution, and initialization order can change there.
+Even a final configuration value or packaging edit belongs in the reviewed diff.
+
+Before a long run, the worker sends a checkpoint with the actual inputs.
+The checkpoint identifies the revision, environment, planned check, and evidence location.
+It is a progress record, not a result.
+The worker retains the exit status and delivery receipt when the work finishes.
+
+### Keep the acceptance bar and the cold sweep separate
+
+The acceptance bar repeats the agreed checks against the integrated revision.
+It can cover clean builds, tests, packaged contents, and isolated smoke checks.
+It answers whether the candidate satisfies the contracts already encoded in that bar.
+
+The cold sweep starts from the same frozen revision with a different question:
+which claims or failure paths has the team not adequately tested?
+The reviewer reads the diff and runs independent probes without an expected verdict.
+Use a different model vendor to add another source of independent judgment.
+
+Keep the reviewer separate from the author of the affected change.
+Provide scope and safety constraints without leading with the implementer's conclusions.
+Withhold the other review's verdict until both independent records are complete.
+Model diversity supports independence; it does not replace evidence.
+
+Record the acceptance result and the cold-sweep verdict side by side.
+A green bar can coexist with a rejected sweep because they test different claims.
+For example, an existing suite may pass while a new stale-state probe exposes a fault.
+
+When that happens, retain both results and reopen the affected slice.
+Assign each finding a fix, an owner decision, or a justified residual disposition.
+Reintegrate the fixes and repeat the affected probes at the new revision.
+Recheck the acceptance bar required by the changed scope.
+
+A release remains a separate authorized action.
+The [assurance policy](docs/ASSURANCE.md) explains the project's release evidence
+and review requirements in more detail.
+Neither a scan nor a favorable review is permission to deploy.
+
+### Record which way each error points
+
+Severity and direction answer different questions.
+Severity describes the impact; direction describes what the system gets wrong.
+Record both when deciding whether a finding blocks the slice.
+
+| Direction | Example consequence |
+|---|---|
+| False grant | A caller receives access it should not have |
+| False completion | Work is marked finished before its effects succeed |
+| False classification | Stale state causes the wrong transition |
+| Refusal or unknown | The system visibly declines to make an unsupported claim |
+
+A visible refusal still has an availability cost that needs an owner.
+It is different from silently returning a confident but false result.
+Renew accepted limitations by measurement at the current close.
+Retire them with evidence rather than quietly removing their register entries.
+
+### Route models deliberately
+
+One concrete fleet pattern uses a mid-tier model for workers, a
+stronger model for the reviewer, and a different vendor at its highest
+reasoning effort for the closing cold sweep on each slice. This is a
+selected operating profile, not an agenttalk-enforced default — see
+the routing table in the [agent operating manual](docs/AGENT-MANUAL.md)
+for concrete model/effort choices.
+
+Keep the model profile stable enough to preserve useful working context.
+Change effort when the task's risk or observed difficulty warrants it.
+Do not turn routine coordination into an expensive review task by default.
+
+The [agent operating manual](docs/AGENT-MANUAL.md)
+explains effective model selection and session resets.
+An effective model or effort change can reset a wrapped conversation.
+Choose provider-supported profiles and record the settings used for important reviews.
+
+### Keep execution inside the agreed boundary
+
+Use project-local toolchains with recorded versions and build inputs.
+Give every test service an owned endpoint and a fresh data directory.
+Verify the actual process and listener before allowing a test to use them.
+
+Under a local migration policy, production systems remain out of reach.
+Deployment scripts and descriptors may be read or edited for review.
+They are not executed, including purported dry runs or tool-based validation.
+The owner receives a separate deployment checklist and its remaining prerequisites.
+
+Disable unwanted startup telemetry before starting a component.
+Use network controls and capture evidence to check the boundary when needed.
+A disabled setting alone does not establish a history of zero connection attempts.
+Record earlier unobserved traffic as unobserved rather than retroactively attesting it.
+
+The local bus and static scanner do not make a coding model's session offline.
+Model-provider access needs its own approved privacy and hosting arrangement.
+Apply the migration's network policy to child processes and application libraries too.
+
+Place temporary output in an owned task area.
+Make child processes inherit that location and verify where they actually write.
+Check files as well as directories when auditing temporary artifacts.
+The [scratch hygiene guide](docs/ops/scratch-hygiene.md) explains cleanup ownership.
+
+At close, preserve the evidence that must outlive the workspace.
+Stop only the services whose ownership was established for the run.
+Remove disposable work and report anything deliberately retained.
+Cleanup is part of the proof, not an unrecorded chore after it.
+
+### Feed the next slice with what this one taught you
+
+End the work record with a tooling note, even when there was no friction.
+Describe an observed cost or failure with evidence that another person can inspect.
+Useful notes include delayed delivery, ambiguous status, quoting problems,
+and cleanup checks that produced misleading results.
+
+The lead turns recurring friction into an issue with an owner and a testable outcome.
+A reviewed implementation then turns that lesson into a tool or stronger check.
+Retest the triggering case before calling the improvement complete.
+An issue or a retrospective note alone is not a shipped feature.
+
+Carry accepted lessons into the next slice's briefing and guardrails.
+Keep their evidence and scope so the next team can decide whether they still apply.
+The migration then improves both the application and the method used to change it.
 
 ---
 
-## One-time setup (per project)
+## 5. Technical reference and FAQ
 
-From your project root:
+This is a map of the CLI surface and the gotchas that don't fit
+naturally into setup or use-case prose. It intentionally doesn't
+duplicate the deeper docs — follow the links at the end for full
+detail on any one area.
 
-```powershell
-agenttalk init --here --agents claude,codex
-```
+### Command reference by category
 
-The roster must contain at least one agent. For a single-agent start, use
-`agenttalk init --here --agents claude` or `--agents codex`; set only
-`AGENTTALK_SELF` until another roster member is added.
+Every command below is a real, currently-shipping subcommand
+(`python -m agenttalk <cmd> --help`); flags shown are the ones most
+relevant day to day, not exhaustive lists — run `--help` on any
+command for the full set.
 
-This creates `.agenttalk/` with:
-
-```
-.agenttalk/
-  config.json          session + agent roster
-  messages/<id>.json   one file per message (chronologically sorted)
-  state/<agent>.cursor last message id each agent has globally acknowledged
-  state/<agent>.threadstate.json per-request seen/closed state for scoped
-                       waits (created lazily on first `wait --to-request` /
-                       `ack --to-request`, not at init)
-  sessions/            markdown/jsonl transcripts written by `agenttalk end`
-```
-
-Slash commands and Agent Skills are installed globally (one-time, not
-per project) via `agenttalk install-skills` — see the [Install](#install)
-section.
-
----
-
-## Workflows
-
-Open one terminal per active agent at the project root.
-
-### Spec-kitty missions — `sk-loop` (recommended)
-
-If you're running a spec-kitty mission, the persistent loop drives the
-implement → review cycle automatically using `spec-kitty next` as the
-state machine and a tiny `kind=wake` message for low-latency handoff.
-
-```text
-Terminal A (Claude):   /agenttalk.sk-loop <mission-slug>
-Terminal B (Codex):    $agenttalk-sk-loop <mission-slug>
-```
-
-Both windows stay alive for the whole mission, accumulating full
-context across every WP. Roles are symmetric — spec-kitty assigns
-implement vs review per WP based on your `.kittify/config.yaml`.
-
-### Ad-hoc cross-agent collaboration — `listen` + `handoff`
-
-When agents are working together outside a spec-kitty mission (organic
-work split, second opinions, cross-reviews of each other's work):
-
-```text
-Terminal A (Claude):   /agenttalk.listen          (passive: wait for messages)
-Terminal B (Codex):    $agenttalk-listen          (passive: wait for messages)
-```
-
-Either side, when they finish a chunk and want it reviewed:
-
-```text
-/agenttalk.handoff       (Claude)  — bundles send + wait
-$agenttalk-handoff       (Codex)
-```
-
-The handoff includes structured meta — `request_id`, `base_sha`,
-`head_sha` — and a body template (Goal / Files changed / How to verify
-/ Focus areas / Known caveats). The receiver mode-detects: if the
-meta has a `mission` or `wp_id`, it runs the spec-kitty review path;
-otherwise it does an ad-hoc cross-review of the named scope.
-
-### First-class proposals — `propose`
-
-Use proposals when you want a named agent to decide on a concrete
-solution before either agent proceeds:
-
-```text
-Terminal A (Claude):   /agenttalk.propose
-Terminal B (Codex):    $agenttalk-propose
-```
-
-The CLI command is `agenttalk propose`. It writes `kind=proposal`,
-auto-mints `meta.request_id=pp-...` if missing, and prints the
-proposal id unless `--quiet`. The proposal body should contain:
-
-```text
-## Problem
-## Proposed solution
-## Alternatives considered
-## Tradeoffs
-## Decision requested
-```
-
-The target responds with:
-
-```powershell
-agenttalk reply --kind proposal-response --meta status=accepted -m "..."
-```
-
-Use `status=rejected` or `status=countered` instead when appropriate.
-A counter closes the old proposal with `status=countered`, then opens a
-fresh proposal with `agenttalk propose --in-reply-to <old-request-id>`.
-Proposals do **not** bypass the split-work rule: if a proposal assigns
-implementation ownership outside spec-kitty, the agents must ask you
-first, and every implemented piece still needs a read-only cross-review.
-
-### Teams, groups, and the fresh-review workflow
-
-Use unique names when several agents are active in the same project.
-The common team pattern is:
-
-```text
-claude-dev   implementation Claude
-codex-dev    implementation Codex
-claude-rev   fresh-review Claude
-codex-rev    fresh-review Codex
-claude-lead  optional coordinator
-```
-
-Roles are informational labels shown by `agenttalk roster` and
-`agenttalk status`; groups are named subsets used by broadcast:
-
-```powershell
-agenttalk roster add claude-rev --role reviewer --group reviewers
-agenttalk roster set-role codex-dev implementer
-agenttalk roster set-group devs claude-dev,codex-dev
-agenttalk roster set-group reviewers claude-rev,codex-rev
-agenttalk roster
-```
-
-The original `claude,codex` pair still works. In a team, each terminal
-sets `AGENTTALK_SELF` to its unique name. `AGENTTALK_PEER` is only a
-default point-to-point partner; skills ask for or infer an explicit
-target when more than one agent could receive a message.
-
-For fresh review, send implementation handoffs to a reviewer that did
-not write the code:
-
-```powershell
-agenttalk send --from claude-dev --to codex-rev --kind review-request `
-  --meta request_id=rq-... --meta base_sha=<sha> --meta head_sha=<sha> `
-  -m "<Goal / Files changed / How to verify / Focus areas>"
-```
-
-### Broadcast and groups
-
-`agenttalk broadcast` fans out one message per recipient. It does not
-create a shared channel and it does not alter per-agent cursors:
-
-```powershell
-agenttalk broadcast --from claude-lead --to-group reviewers --kind question `
-  --subject "API naming check" `
-  -m "Please answer with approve / concern and one sentence of rationale."
-```
-
-The command mints a `broadcast_id` like `b-...` and stores it as both
-`meta.broadcast_id` and `meta.request_id` on each recipient copy.
-Recipients answer the sender with:
-
-```powershell
-agenttalk reply --to-request b-... -m "concern: ..."
-```
-
-Broadcast `message` and `note` are FYI fan-out. Broadcast `question`
-is tracked by `agenttalk threads`: the sender sees responded/pending
-recipients, and each recipient sees an owed inbound question until
-they reply. There is no special reply-all primitive in this release;
-a follow-up to the same audience is a new `agenttalk broadcast`.
-
-### Reply routing and dry-run
-
-`agenttalk reply` resolves an anchor from `--to-id`, `--to-request`,
-or the most recent received message for the sender. It replies to the
-anchor's sender and echoes the anchor's `request_id` unless you
-explicitly set another `request_id`. For broadcast threads, the anchor
-sender is the thread originator, not every recipient and not
-necessarily the agent who later needs second-hand context.
-
-Use `--dry-run` before sending when several threads are open or when
-broadcast routing is easy to misread:
-
-```powershell
-agenttalk reply --from codex-rev --to-request b-... --kind message --dry-run
-```
-
-Dry-run resolves `--to-id`, `--to-request`, or the last received
-message, prints the would-be recipient, request id, and kind, and
-sends nothing.
-
-### Lead role
-
-The bundled `/agenttalk.lead` and `$agenttalk-lead` skills describe a
-human-facing coordinator role. A lead can decompose work, send
-point-to-point assignments, broadcast questions to groups, track
-pending responses with `agenttalk threads`, and report the result to
-you.
-
-The lead does **not** spawn worker processes. Start each worker in its
-own terminal or use a thin external launcher. The lead also does not
-replace spec-kitty: inside a spec-kitty mission, `spec-kitty next`
-assigns WPs and lanes, while the lead only coordinates around that
-state.
-
-A lead is a coordinator, not an authority boundary. A reviewer reports
-findings; an implementer changes their owned files; spec-kitty or the
-human decides lane state. A "liaison" is only the current contact for
-a thread or workstream. After a restart, a lead, reviewer, or liaison
-must re-derive state from the repository, the operator, `agenttalk
-sync`, `agenttalk threads`, and (inside spec-kitty) `spec-kitty next`;
-do not assert stale HOLD/GO decisions from prose in an old message.
-
-### Advisory capacity
-
-For operators coordinating long or parallel runs, `agenttalk capacity`
-lets each agent self-publish a coarse local headroom snapshot so a
-lead can plan work around both 5-hour/weekly rate-limit pressure and
-context-window compaction risk:
-
-```powershell
-# run in each agent window to publish that agent's own local signal
-agenttalk capacity refresh --for codex
-
-# run from the lead window to view published team snapshots
-agenttalk capacity
-```
-
-This signal is strictly advisory. Missing, stale, or unknown capacity
-must never block protocol progress or decide whether a review is valid.
-Use it as a planning hint: steer long work away from a near-cap agent,
-prefer short/interruptible tasks when a reset is soon, avoid assigning
-large context-heavy work to an agent near compaction, and tell the
-operator when every plausible owner is low, near compaction, stale, or
-unknown.
-
-Agents publish only normalized metadata under `.agenttalk/state/`:
-rate-limit percent used, reset epochs, budget window lengths,
-context-window percent used, context window size/current context tokens,
-source, confidence, and non-secret plan labels. They do not publish raw
-session files, prompts, auth paths, token bodies, account ids, or local
-provider paths.
-
-On Codex, `agenttalk capacity refresh --source codex` reads the local
-`~/.codex/sessions/**/rollout-*.jsonl` files, prefers the current
-`CODEX_THREAD_ID` when present, and takes the last record carrying
-`payload.rate_limits` and/or context data in `payload.info`. Codex
-context fill uses
-`info.last_token_usage.input_tokens / info.model_context_window * 100`;
-it does not use cumulative `total_token_usage`.
-
-On Claude Code, `agenttalk capacity refresh --source claude` reads
-`~/.claude/statusline-last-input.json`, which must be kept fresh by a
-Claude status line dump. Either enable `CC_STATUSLINE_DEBUG=1` if your
-Claude Code build writes that debug input file, or configure a status
-line script that writes the latest status-line input JSON to that path.
-The JSON may carry rate-limit data in `rate_limits.five_hour` and
-`rate_limits.seven_day`, context data in `context_window`, or both.
-Context data uses `context_window.used_percentage`,
-`context_window.context_window_size`, and input-side
-`context_window.current_usage` token counts.
-
-### Ending the session
-
-```powershell
-agenttalk end --from claude --reason "feature shipped"
-```
-
-This sends an `end` message to the other agent (breaking its listen
-loop) and writes `transcript-<session_id>.md` under
-`.agenttalk/sessions/`.
-
----
-
-## Agent identity, roles, and groups
-
-Agent names are **safe identifiers** — alphanumeric plus dot,
-underscore, or hyphen, starting with an alphanumeric, max 64 chars.
-This restriction exists because names are interpolated into
-`.agenttalk/state/<name>.cursor` (and similar) filenames; anything
-that could escape that directory (path separators, `..`, leading
-punctuation, quotes, whitespace) is rejected.
-
-The default pair is `claude` and `codex`, but you can run two Claudes,
-two Codexes, or a larger team by giving every participant a distinct
-name like `claude-dev`, `codex-dev`, `claude-rev`, and `codex-rev`.
-Role-suffixed names make transcripts and thread output easier to
-scan.
-
-Each terminal declares which agent it is via env vars. In a two-agent
-pair, `AGENTTALK_PEER` can name the default recipient. In a larger
-team, set `AGENTTALK_SELF` in every terminal and pass explicit
-`--to <agent>`, `--to-group <group>`, or `--all` when the recipient is
-not obvious:
-
-```powershell
-# Terminal A
-$env:AGENTTALK_SELF = 'claude-a'
-$env:AGENTTALK_PEER = 'claude-b'
-
-# Terminal B
-$env:AGENTTALK_SELF = 'claude-b'
-$env:AGENTTALK_PEER = 'claude-a'
-```
-
-```bash
-# Terminal A
-export AGENTTALK_SELF=claude-a AGENTTALK_PEER=claude-b
-
-# Terminal B
-export AGENTTALK_SELF=claude-b AGENTTALK_PEER=claude-a
-```
-
-Initialize with matching names:
-
-```powershell
-agenttalk init --here --agents claude-a,claude-b
-```
-
-For team metadata, use roster admin commands:
-
-```powershell
-agenttalk roster add claude-rev --role reviewer --group reviewers
-agenttalk roster add codex-rev --role reviewer --group reviewers
-agenttalk roster set-role claude-dev implementer
-agenttalk roster set-group devs claude-dev,codex-dev
-agenttalk roster --json
-```
-
-`all` is an implicit reserved group containing the whole roster. Roles
-are informational; groups are used by broadcast fan-out.
-
-All `agenttalk` commands accept `--from`/`--to`/`--for` flags as
-overrides. If the flags are absent, the CLI uses the env vars; if
-**both** are absent the CLI exits with a clear error pointing you at
-either the flag or the env var. The CLI does NOT silently assume
-`claude`/`codex` — those defaults live only in the bundled skill
-files (so an LLM running `/agenttalk.send` without env set still
-works for the canonical pair).
-
-The CLI also validates the resolved name against the roster: a typo
-like `AGENTTALK_SELF=claud` exits 2 rather than silently operating
-on a phantom mailbox. And it rejects self-mail (`SELF == PEER`).
-
-When your `.agenttalk/` directory is not under the current working
-directory, pass `--root` as a **global option before the subcommand**:
-
-```powershell
-agenttalk --root D:\Projects\example sync --for claude-dev
-```
-
-Do not put it after the subcommand (`agenttalk sync --root ...`);
-subcommands do not parse global options there.
-
-`agenttalk init` prints concrete env-setup commands at the end of its
-output for 2-agent rosters. For larger teams, use `agenttalk roster`
-as the source of truth and set each terminal's `AGENTTALK_SELF`
-explicitly.
-
-### Env caveat for LLM tool-call contexts
-
-When you set `AGENTTALK_SELF` in your terminal profile or your shell
-RC, every child process inherits it — including `agenttalk`
-subprocesses spawned by the LLM, so things "just work".
-
-But env vars set INSIDE an LLM tool call (e.g., `$env:AGENTTALK_SELF =
-'claude-a'` in one PowerShell tool call) may NOT persist into the next
-tool call, because each tool call is often a fresh shell process. The
-bundled skill files resolve identity inside each tool call's shell, so
-this is transparent in practice — but if you write your own
-automation, set env in the parent shell or pass explicit
-`--from`/`--to`/`--for` flags.
-
-### Windows-safe command bodies
-
-Inline `-m "..."` is fine for short text, but it is fragile for
-multi-line bodies, apostrophes, backslashes, and Windows paths. Prefer
-`--file <path>` for saved text, or pipe a here-string to `--file -`
-for stdin on body-bearing commands such as `send`, `reply`,
-`propose`, and `broadcast`:
-
-```powershell
-@'
-## Goal
-Review the changed files.
-
-## Path
-D:\Projects\example\src\agenttalk
-'@ | agenttalk send --from claude-dev --to codex-rev --kind review-request `
-  --meta request_id=rq-docs-001 `
-  --meta root=D:\Projects\example `
-  --file -
-```
-
-For commands where you deliberately use `-m`, put the body in a
-here-string variable first:
-
-```powershell
-$body = @'
-short but path-heavy body: D:\Projects\example\src
-'@
-
-agenttalk reply --from codex-rev --to-request rq-docs-001 `
-  -m $body
-```
-
-Use `--meta key=value` for machine-readable roots, paths, request ids,
-and routing data; keep prose bodies for human context. That prevents
-backslash/control-character mangling from turning paths into different
-strings.
-
----
-
-## Splitting implementation work between agents
-
-Outside a spec-kitty mission, the skills tell each agent **not to
-split implementation work with the peer without first asking you**.
-The user invoked them to do a task; the peer is for review or specific
-delegated subtasks, not for unilaterally carving up the work.
-First-class proposals follow the same rule: a `kind=proposal` can
-recommend a concrete plan, but it cannot assign ownership between
-agents unless you have approved that split.
-
-When you DO want them to split (e.g., "Claude does the frontend, Codex
-does the backend"):
-
-1. Say so explicitly. Each agent confirms the ownership boundaries via
-   a `kind=note` message.
-2. **Every implemented piece is then cross-reviewed** — the
-   implementer of one chunk sends `kind=review-request` to the peer,
-   who reviews read-only and replies with `kind=review-result`. This
-   is mandatory in the skill bodies, not optional.
-3. The implementer of each piece fixes their own blockers. Reviews
-   never silently patch peer code.
-
-In a spec-kitty mission, ignore the above — spec-kitty's state machine
-assigns implement/review per WP, and the sk-loop skills do the right
-thing automatically.
-
----
-
-## Pre-answer consults — letting agents confer before responding
-
-Sometimes you ask one agent a question and you want the other to
-pressure-test the draft answer before it lands. The `/agenttalk.consult`
-(`$agenttalk-consult` on Codex) skill does exactly that:
-
-1. The receiving agent drafts an answer in private.
-2. Sends the draft + its uncertainty to the peer via `kind=question`
-   with `meta.consult=true`.
-3. The peer reads it, critiques (blocking objections, missing
-   assumptions, alternative recommendation), and replies with `agree
-   / disagree / qualified-agree`.
-4. The receiving agent synthesizes a concise final answer naming
-   agreement, disagreement, and its recommendation. The peer never
-   answers you directly and never modifies files.
-
-When agents auto-trigger it (per the bundled skill bodies):
-
-- **Always:** when you explicitly ask ("ask codex", "discuss first",
-  "get a second opinion").
-- **Default:** high-impact ambiguous calls — architecture,
-  requirements, security tradeoffs, data-loss risk, irreversible
-  workflow decisions, expensive implementation direction.
-- **Skipped:** trivial questions, syntax, status updates, bounded
-  reviews (those use `/agenttalk.handoff`), or anything the agent is
-  confident about that you haven't asked for a second opinion on.
-
-The freshness check (heartbeat older than ~5 min) suppresses the
-consult and the agent tells you the peer wasn't listening so it
-answered on its own. Default consult wait is 180 s, much shorter
-than work-item handoffs — consults are interactive.
-
-Cost: each consult is a full round-trip, so latency and tokens roughly
-double for that exchange. Worth it for real decisions, wasteful for
-trivia — the skill bodies have explicit guidance on when to fire.
-
----
-
-## Cost notes — listen mode is not free
-
-> All numbers below are **rough estimates as of 2026-05**. Model pricing
-> changes; treat these as order-of-magnitude guidance, not invoices.
-
-`agenttalk wait` itself uses no model tokens — it's a Python subprocess
-polling the filesystem. But every time the subprocess returns to the
-LLM (either with a real message OR after the timeout fires), the agent
-re-reads the conversation context and decides what to do. That's the
-token cost driver.
-
-### Order-of-magnitude estimates
-
-Assuming a 30k-token conversation context and Claude Opus 4.7 pricing
-(~$15/M input, ~$75/M output; cached reads ~$1.50/M):
-
-| Mode | Wait timeout | Idle wake-ups / hour | Per-agent idle cost |
-| --- | --- | --- | --- |
-| `/agenttalk.listen` (default 1800s) | 30 min | ~2 | ~$0.90/hour (cache cold each wake) |
-| `/agenttalk.sk-loop` (30s) | 30 sec | ~120 | ~$5/hour (cached, within 5 min TTL) |
-
-Two agents listening in parallel roughly double that idle cost; N
-agents roughly multiply it by N. Real messages are handled immediately
-regardless of timeout (the subprocess returns the instant a message
-file lands), so the table is **idle cost only**; actual conversation
-rounds add their own per-message cost.
-
-Codex has its own pricing model but the same architecture applies — a
-short wait timeout means more idle wake-ups, each re-reading the
-conversation. Configure accordingly.
-
-### Why sk-loop pays more
-
-The sk-loop's short timeout is doing real work: every cycle it ALSO
-re-runs `spec-kitty next` to self-heal cases where the peer changed
-state without sending a wake. Pure listen has no such second source,
-so the long timeout is free observability.
-
-### Reducing cost further
-
-- `agenttalk wait --heartbeat-interval 0` disables heartbeat writes
-  (saves trivial disk IO; no token impact).
-- `agenttalk wait --timeout 0` blocks forever. Cheaper still — only
-  real messages wake the LLM. Tradeoff: no safety-net liveness loop
-  if the subprocess hangs.
-- For long idle periods, just have the agent exit the loop and tell
-  you when you're ready to resume. The `kind=end` message gracefully
-  stops the other side.
-
----
-
-## Domains: a shared ownership registry (experimental, 0.31.0)
-
-A **domain** is a named slice of the repo with owners, reviewers,
-curators, and a set of owned globs — declared once in a project-local
-registry at `.agenttalk/domains.json`. It is the shared spine that
-upcoming **lane** (diff-bounds / deliver gates) and **knowledge**
-features will hang off, so they reference one ownership model instead of
-inventing their own.
-
-0.31.0 ships the **foundation**: the registry plus read-only inspection
-and validation. There is no mutation command yet — you author
-`domains.json` by hand. The **lane** deliver-gate builds on it (0.36.0,
-see below); the knowledge layer lands later.
-
-A minimal registry (owner/reviewer/curator refs are objects keyed by
-`agents`, `groups`, or `roles`, resolved against your roster):
-
-```json
-{
-  "schema_version": 1,
-  "domains": {
-    "cli": {
-      "title": "CLI surface",
-      "owners": { "groups": ["devs"] },
-      "reviewers": { "roles": ["reviewer"] },
-      "curators": { "agents": ["claude"] },
-      "owned_globs": ["src/agenttalk/cli.py", "tests/test_cli.py"],
-      "description": "The argparse command surface"
-    }
-  },
-  "shared_paths": [
-    {
-      "glob": "pyproject.toml",
-      "category": "package-metadata",
-      "requires": "shared-lease-or-lead-approval",
-      "default_reviewers": { "roles": ["reviewer"] }
-    }
-  ]
-}
-```
-
-Then inspect it:
-
-```text
-$ agenttalk domain validate
-domain registry: valid (1 domains, 1 shared paths)
-  hash: 4e74e0e5...
-
-$ agenttalk domain list
-domains (1)  hash=4e74e0e5...
-  cli  CLI surface (2 owned globs)
-
-$ agenttalk domain check-path src/agenttalk/cli.py pyproject.toml docs/foo.md
-src/agenttalk/cli.py: owned  domains=cli; casefold=true
-pyproject.toml: UNOWNED  shared=pyproject.toml[package-metadata:shared-lease-or-lead-approval]; casefold=true
-docs/foo.md: UNOWNED  casefold=true
-```
-
-- **`validate`** checks structure and resolves every ref against the
-  roster; **`list`** summarizes domains; **`show <id>`** prints one domain
-  with resolved owners/reviewers/curators; **`check-path <paths...>`**
-  classifies repo-relative paths as owned / unowned / shared (with
-  `--case-sensitive` / `--case-insensitive`).
-- The **registry hash** is a stable, key-order-independent digest — the
-  staleness keystone the later lane/knowledge phases stamp into their
-  records, so a registry change can flag dependent state.
-
-`domains.json` lives outside `messages/` and `state/`, so `agenttalk
-reset` preserves it like config rather than clearing it as active bus
-state.
-
-### Lanes: a scoped deliver-gate (0.36.0)
-
-A **lane** is an active, scoped assignment built on the domain registry:
-one assignee works a subset of a domain (repo-relative path **prefixes**)
-from a base SHA toward a target ref. `agenttalk lane
-{assign,check,deliver,status,approve-shared}` then gates *delivering* that
-work.
-
-`lane assign --id L --domain D --assignee A --base BASE --target REF
-[--path PREFIX …]` records the lane in `.agenttalk/state/lanes.json`
-(active coordination state — `reset` clears it, with a warning, and never
-touches the delivery artifacts below), resolving base/target to full SHAs
-and stamping the current epoch + registry hash. Assign runs under a lock
-and **fails closed** if the path subset overlaps another active lane.
-
-`lane check --id L [--head H]` is read-only and prints `HOLD`/`GO` with
-stable codes, exiting `0`=GO / `3`=HOLD (composing with `gate check` and
-`close check`). The verdict is a pure function over resolved evidence: it
-computes the changed paths from `git diff --name-status -z -M -C
-base..head`, classifies each **written** path against the domain registry
-using the **same segment-aware matcher** as domains (so `src/foo` covers
-`src/foo/x` but not `src/foobar`), checks overlap against other active
-lanes, runs `git merge-tree --write-tree` against the *current* target
-head as the conflict authority (a conflict or a degraded/unavailable
-result HOLDs — it never infers clean), checks epoch/registry staleness,
-and consumes `gates.check_gates(scope="lane:<id>")`. A rename's old path
-is in-bounds-checked (it's removed); a copy's source is evidence-only.
-Hold codes: `stale_epoch`, `stale_registry`, `diff_unavailable`,
-`diff_parse_error`, `casefold_collision`, `out_of_bounds_path`,
-`unowned_path`, `domain_overlap_path`, `shared_path_missing_approval`,
-`shared_path_wrong_approval`, `active_lane_overlap`, `merge_conflict`,
-`merge_unknown_degraded`, `gate_hold`.
-
-`lane deliver --id L` is a recoverable two-phase publication. It first writes a
-signed `prepared` artifact under `.agenttalk/lane-deliveries/.prepared/`; that
-file is deliberately non-consumable. It then checkpoints the lane generation,
-immutable instance, candidate head, terminal evaluation, and a
-`publish_pending` transaction. Only after the terminal inputs are rebound and
-the final artifact is marked `committed` can close or gate consumers accept it.
-Retry the same `lane deliver` after an interrupted save or publication: the
-command resumes the bound transaction rather than creating a second delivery.
-
-Worktree teardown is a later checkpoint. A committed delivery remains valid
-while `cleanup_pending` or `cleanup_failed` is visible; retrying delivery (or
-the scoped cleanup path) can finish teardown. Expensive Git evaluation and
-worktree removal do not hold the broad config lock. A shared path still needs
-`lane approve-shared --id L --path P --reason ...` from an authorized reviewer
-before GO.
-
-Release-class lanes require a provisioned worktree. `--no-worktree` is limited
-to an explicitly `--advisory` lane with a recorded waiver reason. That record
-is audit context only: it does not trust mutable role labels, does not prove
-isolation, and cannot satisfy release isolation.
-
-Like gates and close, lanes are **advisory, point-in-time coordination**:
-a GO means "as of the current target head your work is in bounds and
-merges cleanly," not a file lock, a Git/OS authorization, or a guarantee
-the real merge stays clean later. Lanes **consume** gate state and never
-set it. Core ships the schema, segment-aware bounds, diff parsing, the
-pure verdict, and the artifact shape; the project supplies `domains.json`,
-shared-path policy, lane ids/assignees/targets/subsets, and required
-gates.
-
-### Onboarding: project analysis before implementation
-
-`agenttalk onboarding {create,list,show,state,record}` is a native ledger for
-the first pass over a new project or an existing codebase. It records what the
-team inspected before it starts changing code:
-
-- **segments**: codebase areas or documentation areas assigned for reading
-- **claims**: bounded statements the team believes, with source/evidence refs
-- **drift**: documentation/code/runtime mismatches and their disposition
-- **unknowns**: questions that are still open, optionally marked blocking
-
-The ledger is evidence capture, not an analyzer and not proof of consensus. It
-does not decide whether code or docs are "true"; agents record observed
-evidence, disagreements, and open questions. Runs live under
-`.agenttalk/onboarding/<run-id>/events.jsonl` as append-only JSONL. The reader
-skips malformed lines, reports problems, and keeps valid records visible.
-
-Example:
-
-```text
-$ agenttalk onboarding create --id ob-api --from claude-lead --title "API onboarding" --base-ref main
-$ agenttalk onboarding record --id ob-api --from codex-dev --kind segment --key cli --status accepted --summary "CLI parser and README command reference mapped." --path src/agenttalk/cli.py --path README.md
-$ agenttalk onboarding record --id ob-api --from codex-review --kind drift --key docs.cli.reference --status open --segment cli --source docs --confidence medium --summary "README command table may lag parser help."
-$ agenttalk onboarding record --id ob-api --from codex-test --kind unknown --key release.owner --status open --blocking --summary "Need operator confirmation of the release owner."
-$ agenttalk onboarding show --id ob-api
-```
-
-The Team Console exposes this through the **Onboarding** view and
-`GET /api/onboarding`. The dashboard projection is read-only and pointer-first:
-bounded summaries, paths, refs, counts, and problem rows, never raw bus message
-bodies, prompt blocks, full command output, or copied source.
-
-### Knowledge: durable pointer notes and lessons (0.38.0, lessons 0.70.0, wrapped exposure 0.71.0, dashboard learning 0.72.0)
-
-`agenttalk knowledge {publish,curate,pull,search,onboard}` is durable,
-pointer-shaped project memory hung off the domain registry. A **note**
-preserves the small piece of insight that is NOT in the artifact (a seam,
-a gotcha, a decision + rationale); its **anchor** points to the code or
-thread that is. Consumers treat every note body as untrusted data and
-reverify the anchor before acting. Notes live append-only in
-`.agenttalk/knowledge/notes.jsonl` (preserved by `reset`, like
-`domains.json`); the current view is the latest valid event per
-`(domain_id, key)`.
-
-**Capture is open, curation is gated.** Any active agent
-`knowledge publish --domain D --type seam|gotcha|decision|pointer --key K
---anchor-kind path --path … -m "the insight"` records an *uncurated* note
-(byte-capped — the body is the insight, never a copy of the anchor). A
-domain owner/curator (or a lead override) then `knowledge curate
-verify|retract`s it. By default, `knowledge pull`, `search`, and `onboard`
-show **both** curated pointer notes and accepted lessons; `--type` requests one
-kind explicitly, while `--scope` or `--tags` implies lesson-only retrieval.
-`--include-uncurated` and `--include-stale` widen the view. Treat every note or
-lesson body as untrusted advisory data: reverify its evidence or anchor before
-acting; it never grants authority.
-
-Mixed JSON uses the versioned `knowledge-view-v1` envelope with separate
-`notes`, `lessons`, pre-limit `totals`, `truncation`, and ledger `problems`.
-Existing explicit `--type ... --json` shapes remain compatible. Use
-`--output-schema legacy --json` only for a caller that still needs the old
-pointer-only array. Pull caps lessons at five but not notes; onboard caps notes
-at 20 and lessons at five; search is unbounded unless `--limit` caps lessons.
-Filters and search run before those caps, and zero is a valid limit.
-
-**Lessons are a note type, not a second store.** `knowledge publish --type
-lesson --domain process --key K --scope review --trigger TEXT
---evidence-ref REF --review-after YYYY-MM-DD --expires-at YYYY-MM-DD -m TEXT`
-captures a proposed process lesson in the same `notes.jsonl`. The reserved
-virtual domain `process` is curated by the operator-facing liaison or active
-lead; a lesson can also use a real code domain when domain owners/curators
-should own the acceptance decision. If the registry defines a real domain named
-`process`, that real domain wins: lessons published to `process` are curated by
-that domain's owners/curators, and the virtual liaison/lead authority applies
-only when no real `process` domain is registered. Verification moves a lesson from
-`proposed` to `accepted`; `curate retract --reason ...` retires it. Default
-`knowledge pull --type lesson` and `sync` consume only accepted, not-expired,
-not-retired, not-superseded lessons. The virtual `process` domain is lesson-only;
-non-lesson notes require a real registered domain. Lesson pulls default to five rows
-(`--limit` adjusts this), and `onboard --exclude-lessons` opts out of its default
-lesson section (`--include-lessons` remains as a deprecated no-op).
-`--include-uncurated` shows proposals;
-`--include-stale` shows expired, retired, or superseded lessons with reasons.
-
-New publish/curate/retract events bind the normalized effective-domain
-definition. Editing some other domain is only a caution; editing this note's
-domain makes it stale until a curator verifies it again. Legacy events that
-predate scoped hashes remain readable with a `legacy_unscoped_registry_freshness`
-caution. Curate/retract also bind the current prior event and immutable payload, so
-a malformed or non-causal row cannot replace or hide valid history. The registry
-recheck coordinates supported writers that use the shared lock; a manual edit that
-bypasses the lock still fails closed because the scoped hash makes the event stale.
-
-`agenttalk sync --for A` includes a capped **Lessons to check** section when
-active lessons match the current work context. Process-scope lessons rank
-first, then the inferred scope (review/test/release/docs/craft/security),
-review-due lessons, and newest accepted lessons. This is advisory memory, not
-authorization: it informs the agent before acting, never blocks a command.
-Repeatedly useful lessons should be promoted into skills, tests, gates, or
-docs; the ledger is the capture-and-review path, not the final home.
-
-Wrapped agents get the same advisory lesson context automatically. For
-`wrap --loop`, the wrapper computes accepted lessons for the inbound message
-and injects a **Lessons to check** section into the one-turn prompt; the child
-model is still forbidden from running `sync`, `threads`, `drain`, `recv`,
-`wait`, or `ack`. When at least one lesson is handed to the child prompt, the
-wrapper appends a pointer-only exposure event to
-`.agenttalk/knowledge/lesson-exposures.jsonl`: agent, message/request ids,
-context scope/tags, lesson keys/refs, lesson fingerprints, and a prompt-block
-hash. The event proves the operational chain (accepted -> matched ->
-surfaced), not cognition or compliance, and malformed exposure lines are
-skipped like malformed knowledge lines.
-
-The Team Console exposes the same audit trail in the **Learning** view and
-`GET /api/learning`. The default view shows accepted, active lessons only:
-what was captured, who published it, who curated it, the owner/evidence/anchor
-metadata, how often it was surfaced to wrapped agents, and recent exposure
-pointers. Proposed, stale, retired, or superseded lessons stay out of the
-default "accepted lessons" view and are available through explicit API status
-filters for diagnostics. Exposure rows remain pointer-only and never include
-raw bus message bodies, prompt blocks, or child CLI output.
-
-**Staleness is anchor-relative**, not HEAD-relative — the make-or-break
-rule, so an unrelated commit doesn't empty the layer. A note is
-*hard-stale* (excluded by default) when its anchor actually changed
-between `verified_against_sha` and HEAD (`git diff --name-status` on the
-anchor path, the reachable-SHA check, anchor disappeared, domain/registry
-hash changed, retracted) — and fails closed to stale when git can't
-determine it. A moved HEAD with an *unchanged* anchor is a **caution**
-(`verified_sha_not_head`), shown but not excluded; uncurated and weak
-symbol evidence are cautions too. `roster --expertise` derives expertise
-from domain owners/reviewers/curators + lane-delivery history + curated
-note authors (raw uncurated note counts are gameable volume and excluded).
-
-The reader is fail-safe (skips torn/invalid lines, surfaced in `doctor`,
-never hiding a valid note); writes take the shared store lock. Core ships
-the schema, anchor-relative staleness, JSONL contract, and CLI; the
-project supplies `domains.json`, note keys/content, and curation
-decisions. No vector search, mandatory index, auto-ingest, or code/doc
-mirroring.
-
----
-
-### Operator attention queue (0.56.0)
-
-`agenttalk attention` is one ranked, read-only view of everything that
-currently needs a human: pending `needs_operator` escalations,
-config-blocked holds, dead letters, gate/close HOLDs, unarmed lead-loops,
-and nondismissible configured/ephemeral process-tree HOLDs. It **derives**
-the view from cheap state reads — it creates no
-work object and adds no message kind — so a degraded source becomes a
-bounded warning row rather than blanking the queue, and the default path
-does no `git`/lane recompute. `agenttalk attention --stats` (add `--json`
-for machine output) reports derived counts — what surfaced active by source,
-what has been dispositioned, and the oldest active dwell — so you can see what
-the queue is routing. It adds no reads beyond the attention-queue collector and
-does not inspect message-body content (the collector validates message
-envelopes; the counts derive only from the collected item metadata). The stats
-view carries the same degraded-input warnings as the queue (a torn disposition
-log or a missing liaison), so a partial read never looks complete.
-
-**Escalations can carry typed decision fields.** `agenttalk escalate`
-takes `--decision`, `--why`, `--option` (repeatable), `--recommendation`,
-`--risk-if-ignored`, `--risk-severity`, `--confidence`, `--priority`,
-`--needed-by`, and `--affected`, stored as a canonical nested
-`meta.attention` block. Validation is strict at the CLI boundary (a
-malformed field exits 2 and sends nothing); the reader is fail-safe (an
-unparseable block downgrades to an untyped item with a warning, never
-hiding the escalation).
-
-**Dispositions make a decision stick.** The operator-facing liaison (or the
-sole lead) runs `agenttalk attention defer|dismiss|answered-elsewhere
---item <id> --reason <text>` (`defer` also needs `--until <ISO>`); authority
-resolves from `--from`/`$AGENTTALK_SELF`, no `--by`. Dispositions are
-**snapshot-bound** — they hide an item only while its identifying *content*
-is unchanged, so a different fault for the same agent, or an expired defer,
-resurfaces automatically. `dismiss` is refused for blocking sources
-(`needs_operator`, `dead_letter`, non-advisory holds): blockers get
-repaired, answered, or deferred, never silenced. `--all` /
-`--include-deferred` / `--include-dismissed` / `--include-resolved` widen
-the view.
-
-**Dead letters get a distinct `resolve`.** `agenttalk dead-letter resolve
---agent A --id ID --reason ...` records that a poison message was handled
-out-of-band, **preserving** the payload and dropping it from the default
-`dead-letter list`, the doctor warning, and the attention queue. The
-central disposition log is authoritative (a best-effort `.resolved.json`
-sidecar aids copied sinks). If the wrapper also spawned a matching
-operator-facing "dead-letter notice" escalation, `resolve` answers that
-notice thread with an audit stamp so it no longer lingers as phantom current
-work. `dead-letter requeue --force-resolved --reason` reopens a resolved
-item, audited. `dead-letter purge --resolved --from <liaison>` archives
-resolved payloads and sidecars under `.agenttalk/dead-letter-archive/` when
-you want them out of the live sink. Archived rows are no longer requeueable by
-the live `dead-letter requeue` command unless you restore the archived files to
-the sink.
-
-`requeue` and `resolve` are complementary, not the same: **`requeue`
-re-injects a fresh copy** (new id, own fresh attempt count) so the work gets
-another try, but it **preserves the original in the sink** — so a
-requeued-but-not-resolved dead letter *keeps showing* in `dead-letter list`,
-`doctor`, and the attention queue. That is deliberate: we never auto-quiet a
-poison message (it could hide a real unhandled failure). Once you have
-actually handled it, run `dead-letter resolve --reason …` to quiet it.
-Typical flow: `list` → `show` (inspect) → `requeue` (retry) → `resolve`
-(when done) -> optional `purge --resolved` (archive old resolved evidence).
-
-Dispositions live append-only in `.agenttalk/attention/dispositions.jsonl`
-(latest-valid per item + action-family, fsync under the store lock,
-skip-invalid on read with torn lines surfaced in `doctor`, preserved by
-`reset`). v1 has no bulk/group dispositions and dedupe is display-only.
-
----
-
-## Unattended operation: the supervisor and the wrapper
-
-Everything above assumes you're at the keyboard, one terminal per agent.
-agenttalk can also run agents **unattended** — a background monitor that
-keeps named agents alive across provider outages, rate-limit windows, and
-stuck turns, and restarts them **with their session context intact** so
-they resume the branch they were on and the turn they were mid-way
-through.
-
-> **Full walkthrough: [docs/supervisor-tutorial.md](docs/supervisor-tutorial.md)** —
-> scaffold, fill the config, run the monitor, wrap an agent, and trigger a
-> restart-with-context, step by step. It also covers **migrating an
-> existing project in and out of supervision** (it's additive and
-> reversible — no data migration, no re-init).
-
-Four ideas carry it:
-
-- **Health authority follows the launch mode.** Manual listeners use the
-  activity `heartbeat`. Wrapped listeners also publish a strict lifecycle
-  record: only validated idle is `HEALTHY_IDLE`, and active work requires
-  an independently discovered real CLI brain plus adapter progress.
-  Unknown child evidence is non-green and never automatic kill authority.
-- **The supervisor is an external monitor, not a daemon.** `agenttalk
-  supervise --report`/`--plan` are read-only derivations; a generated
-  `supervisor.ps1` polls the plan and does the launching/relaunching/
-  scoped-killing. The bus stays just files.
-- **A seat fails loudly and recovers honestly** (0.84.0-0.86.0). The
-  wrapper itself publishes a child's reply draft when the child's harness
-  blocks the reply command, so every seat can answer. A turn killed by the
-  per-turn watchdog is redelivered as an explicit *interruption* — the child
-  is told to resume rather than redo, its partial draft is preserved, and
-  repeated kills back off and then dead-letter with the preserved work
-  named. A child that consistently refuses to start (untrusted or non-git
-  workspace, broken auth) parks as `config_blocked` with the concrete
-  operator fix instead of burning silent retries, and a zero-output
-  one-shot `wrap` refuses loudly with remedies instead of exiting empty.
-- **Every restart resumes the agent's session**, so a relaunched agent
-  still knows what it was doing — via a pinned id for manual Claude
-  (`--resume <id>`), `resume --last` in its `CODEX_HOME` for manual Codex,
-  or the wrapper's own persisted id/`thread_id` for wrapped agents. The
-  tutorial spells out all four paths.
-
-For durable unattended listening, use a supervised `agenttalk wrap
---loop` process as the documented default. A manual chat-window listener
-is best-effort: host CLI behavior, context compaction, and terminal
-lifecycle can interrupt the wait loop. This matters most for Claude Code,
-where in-window background waits can be reaped; unattended Claude agents
-should be wrapped. Codex manual listening is a tolerable stopgap when a
-human is watching, but the honest unattended pattern is still the
-wrapper. Listening and wakes affect latency, not correctness state:
-queued messages stay durable, and `sync` / `threads` rebuild obligations
-after a restart.
-
-Quick start:
-
-```powershell
-agenttalk supervise --init                 # scaffold .agenttalk/supervisor.{json,ps1}
-$pwshPath = (agenttalk supervise --select-pwsh | ConvertFrom-Json).path
-# fill in supervisor.json: per-agent launch command, cwd, cli
-agenttalk supervise --install-activity-hook  # Claude heartbeat + checkpoint hooks
-agenttalk supervise --install-activity-hook --interactive-for claude  # same hooks, liaison fallback
-& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor.ps1
-agenttalk supervise --bootstrap-check       # verify roster + wrapped Claude/Codex liveness
-agenttalk request-restart --for codex-dev  # bounce an agent on demand (resumes its session)
-```
-
-The Windows supervisor requires **PowerShell Core 7+**. Stable 7.4+ is
-recommended; stable 7.0-7.3 runs with an end-of-life warning, prereleases warn,
-and Windows PowerShell 5.1 is refused. To use a portable or nonstandard host,
-select it explicitly with `agenttalk supervise --select-pwsh --pwsh
-"C:\absolute\path\pwsh.exe"`; the explicit candidate is validated once and
-never falls back to another installation.
-
-After upgrading agenttalk, stop the claimed supervisor, wait for its process to
-exit, and run `agenttalk supervise --refresh-scripts`. Refresh preserves the
-existing `supervisor.json` byte-for-byte and leaves runtime state alone. The four
-generated files are replaced individually, not as one atomic group; every entry
-point detects a partial/stale set, and rerunning refresh converges.
-
-`--bootstrap-check` is the ready-to-assign preflight. It emits JSON and
-checks that roster names are not just inert identities: an operator-facing
-liaison exists, supervisor agents are in the roster, wrapped Claude/Codex
-commands include explicit `--root`, launch placeholders are gone, managed
-agents have fresh heartbeats, and stale roster-only names are called out so
-you can supervise, retire, or deliberately ignore them.
-
-On Windows, supervised agents launch hidden by default to keep unattended fleets
-from opening a console per agent. Set top-level `"window_style": "minimized"` or
-`"normal"` in `.agenttalk/supervisor.json` to change the default, or set
-`window_style` inside an agent block (or ephemeral reviewer profile) to override
-one agent. Valid values are `hidden`, `minimized`, and `normal`; invalid values
-fall back to `hidden` with a supervisor warning. For wrapped agents, hidden mode
-also tells the wrapper to spawn its CLI child without a visible console.
-
-An agent becomes stuck-recoverable in one of two ways: a normal
-`/agenttalk.listen` agent **with the activity hook installed**, or an
-agent run **through the progress wrapper**. Until an agent can confirm
-"stuck" (hook or wrapper), a stale heartbeat is **warn-only — never a
-kill**, so an un-instrumented agent is never mistaken for stuck.
-The ordinary activity hook is identity-neutral and stamps whichever
-agent is in `AGENTTALK_SELF`; use it for managed/manual agents launched
-with that environment. For the human's interactive Claude liaison window,
-install `agenttalk supervise --install-activity-hook --interactive-for
-<lead>` so the hook has an explicit fallback identity when
-`AGENTTALK_SELF` is absent. Non-liaison interactive windows should not
-use the fallback form; set `AGENTTALK_SELF` instead.
-
-### The progress wrapper — visibility + working-turn heartbeat
-
-`agenttalk wrap` runs an agent through a per-CLI structured-stream
-adapter that gives you three things a bare supervised process can't:
-
-- **visibility** — it echoes the agent's stream to the console
-  (token/thinking deltas for Claude; item-level events for Codex), so a
-  background agent isn't a black box;
-- **a working-turn heartbeat** — it heartbeats while the agent is
-  *working*, not just idling, so a long honest turn never looks stuck;
-- **degraded-output detection** — a confirmed garble-then-silence can
-  request a self-restart.
-
-```powershell
-# long-running supervised wrapper: idle on the bus, drive one turn per inbound message
-agenttalk wrap --for codex-dev --cli codex --loop -- `
-  "C:\path\to\codex.exe" -a never -s workspace-write -C "D:\Projects\example"
-```
-
-A wrapped agent is instrumented by construction (no activity hook
-needed) and owns session continuity end-to-end, so a supervisor relaunch
-re-runs the identical command and reload-resumes the session. It also
-publishes one strict `wrapper-runtime.json` turn-lifecycle record. Only a
-validated idle record can be `HEALTHY_IDLE`; an active turn must have an
-independently discovered CLI brain and recent real adapter progress.
-Missing, malformed, or ambiguous evidence is `CLI_CHILD_UNKNOWN`, never a
-fresh-heartbeat green or automatic kill authority. For hands-off durable
-listening, wrapping is the documented default. Manual
-`/agenttalk.listen` remains supported for interactive work, and a Codex
-chat window is a tolerable supervised-by-human stopgap, but it is not a
-daemon.
-
-Owned-tree validation runs before restart-marker and child-liveness policy.
-Therefore, an invalid or truncated owned tree is
-`PROCESS_TREE_INVALID`/`PROCESS_TREE_TRUNCATED`, not
-`CLI_CHILD_UNKNOWN`, and the pending restart marker remains unconsumed.
-
-Each supervisor poll also projects the wrapper's owned process tree into a
-strict, 64-entry state record. The wrapper PID/start, runtime generation, and
-launch nonce must agree across supervisor state, `wrapper-runtime.json`, and
-the live wrapper; the nonce is re-read from the live command line. Parent/start
-edges establish descendant ownership, while process names can only label an
-already-owned row. The closed role set is `wrapper`, `cli_launcher`,
-`cli_brain`, `tool_descendant`, and the reserved `detached_gate_runner`. Current
-discovery never infers the reserved role from a process name or command line;
-without registration bound to the job's exact PID/start plus the owning
-wrapper's generation and launch nonce, a gate-shaped job remains
-`tool_descendant`, and the role label alone grants no teardown authority. This
-release only reserves the label; #121 still owns detached execution, watchdog
-exclusion, and durable SHA-bound terminal evidence for every result, including
-timeout and kill. Only a complete tree feeds the existing leaves-first
-`Stop-Tree`. An invalid or truncated tree holds all automatic teardown and
-creates a nondismissible item in
-`agenttalk attention` and the dashboard. That item tells the operator to
-inspect the complete tree and verify every PID/start identity plus the live
-launch nonce before an attended teardown. Invalid/truncated evidence is sticky:
-an ordinary smaller poll cannot clear it; only an operator-attended ownership
-reset can revoke it, and the following launch must earn a new wrapper
-generation and complete tree. One-shot ephemeral reviewers use this same
-authority path and persist the freshly revalidated tree before `Stop-Tree`.
-
-On Windows, `cli_launcher_lifetime` is a nullable all-or-nothing certificate.
-When present, it contains positive decimal creation/exit FILETIMEs from
-`GetProcessTimes`, with creation strictly before exit. Authoritative
-`complete`/`absent` Windows tree entries require a positive decimal
-`start_filetime`. `invalid`/`truncated` HOLD entries may retain null so their
-failure evidence stays readable, but null grants no identity authority. Linux
-boot-ID/start-ticks tokens are exact without FILETIME. If a prior identity
-recorded an exact FILETIME, a current row with that field missing is ambiguous.
-A complete prior tree can bridge an exited intermediate process only for the
-same wrapper generation and launch nonce, using the exact previously recorded
-child identity and parent edge. New or reparented descendants make the tree
-invalid.
-
-If a snapshot proves every identity from a previously complete tree absent or
-definitively recycled, the supervisor retains those rows as a generation-bound
-`absent` certificate with no kill authority. Unreadable identity evidence or a
-late child edge rooted at any recorded PID blocks relaunch. Upgrading an older
-wrapped state is operator-attended. Leave `supervisor.kill` present, stop the
-supervisor, verify the strict instance marker is absent, and verify/stop the
-complete old wrapper tree by PID/start. Before stopping the wrapper, re-read
-`--supervisor-launch-nonce` from its live command line and verify it matches the
-recorded nonce. If the wrapper is no longer live enough to re-read that nonce,
-do not supply the acknowledgement; use manual repair. Copy the current source
-hash from `agenttalk attention`, then run:
-
-```powershell
-agenttalk supervise --reset-process-tree-ownership --from <liaison> `
-  --for <agent> --hold-source-hash <64hex> `
-  --verified-launch-nonce <verified-launch-nonce> `
-  --acknowledge-no-live-supervisor `
-  --acknowledge-owned-processes-stopped `
-  --reason "attended owned-tree migration"
-```
-
-The command refuses a stale hash, missing/mismatched nonce, live or
-unverifiable recorded identity, invalid/mismatched strict runtime wrapper
-PID/start/generation, non-liaison actor, live instance marker, missing kill
-switch, or noncanonical state path. It only revokes stale ownership evidence
-and writes a bounded audit record; it never kills or launches. The same atomic
-state update records the exact retired runtime digest plus its
-PID/start/generation/nonce boundary. The unchanged sidecar therefore cannot
-recreate the old HOLD before restart; any changed or new-generation runtime
-record still follows normal fail-closed adoption. If a replacement launcher is
-recorded before its new runtime observation appears, the old sidecar cannot
-hide it: a live or unprovable replacement identity remains HOLD. Keep the
-supervisor host stopped, remove `supervisor.kill`, refresh and validate
-generated scripts, queue the restart, then resume the supervisor so the next
-launch earns a new generation and tree. (`--refresh-scripts` deliberately
-refuses while the kill switch exists.) If the hold has no nonce or reset
-evidence, the command refuses and manual state repair is required. Legacy
-`managed_pids` and brain identities remain bounded diagnostic evidence in the
-nondismissible HOLD until the attended reset commits. Automatic teardown
-authority returns only after the new generation earns a complete tree.
-
-**Bounded work heartbeat (wrapped Claude).** The wrapper still runs a
-bounded ticker during each turn for coordination visibility. Those timer
-ticks do not advance `progress_sequence` and therefore cannot make a
-dead or wedged CLI child healthy. Only accepted CLI adapter events count
-as turn progress. Autonomous stall recovery also requires two confirming
-polls and a configured threshold at or above the resolved per-CLI turn
-watchdog deadline plus its safety margin; an invalid or unresolved floor
-cannot authorize recovery. The ticker is default-ON for wrapped Claude
-(`wrap --loop`, `--lead-loop`) and default-OFF for wrapped Codex and
-`--one-shot`. Configure it per agent (or globally) in
-`supervisor.json`: `"work_heartbeat": {"enabled": true,
-"interval_seconds": 30, "max_turn_seconds": 900}`. Guards fail visibly
-at launch (config-blocked hold) — a non-positive/non-numeric value, or an
-interval above `min(60, stuck_after/3)` without
-`allow_high_interval=true`, is refused, never silently coerced. A
-best-effort diagnostics record lands in
-`state/work-heartbeat/<agent>.json` for doctor/status forensics; the
-supervisor does not read it.
-
-Supervisor state is persisted as `supervisor-state.json` with a validated
-`.bak` generation. Readers prefer a valid primary, fall back to a valid backup
-without rewriting a corrupt primary, and fail closed when both copies are
-invalid. Heartbeats farther in the future than the configured skew allowance
-cannot establish freshness; timestamps within that bounded allowance can.
-
-Wrapper waiting markers are generation-bound. Each loop writes a unique token
-and clears the marker only when its token still matches, so an exiting old
-wrapper cannot erase a replacement's live marker.
-
-On Windows, the per-turn watchdog no longer launches `taskkill.exe`; verified
-targets use `os.kill(pid, signal.SIGTERM)`, which maps to abrupt process
-termination rather than graceful SIGTERM handling. This eliminates the
-`taskkill.exe` subprocess path that produced the reported popup. The production
-reporter's desktop-heap exhaustion diagnosis is plausible but is not an
-upstream-confirmed root cause. Windows snapshot and start-time helpers still
-run CIM through the validated selected Core host; selection/TTL/native-identity
-ambiguity returns no snapshot and therefore no kill. PID reuse remains possible
-after the recheck, and the leaf-first snapshot operation is not an atomic tree kill.
-Those limitations are follow-up hardening, not blockers for this narrow fix.
-
-Protected agents — the operator-facing liaison and every active
-`role=lead` — are **never auto-killed** (warn/note only), and a manual
-`request-restart` of one needs `--force-protected`; if that protected agent
-still has a fresh heartbeat, the operator-facing requester must also pass
-`--acknowledge-live-protected-kill`.
-
----
-
-## CLI reference
+**Messaging**
 
 | Command | What it does |
 | --- | --- |
-| `agenttalk init [--here] [--agents A,B]` | Create `.agenttalk/` in the current dir. Refuses to create a **nested store** when one exists up-tree (0.14.0) — `--force` for a deliberate sandbox. |
-| `agenttalk roster [--json]` | Show agents, roles, group memberships, and the resolved current identity. |
-| `agenttalk roster add <name> [--role R] [--group G]...` / `remove <name> [--force]` / `set-role <name> <role>` / `set-group <group> <a,b,c>` | Deliberate roster/group admin operations. Groups are validated roster subsets; `all` is implicit and reserved. 0.16.0: `add` refuses a retired-tombstone name; `remove` is refused by default with a retire hint — `--force` removes anyway and warns that history-read breaks (no tombstone — re-addable). |
-| `agenttalk roster retire <name> [--reason R]` / `rename <old> <new> [--drain-check] [--reason R]` / `forward <retired> --to <live> --to-request RID [--from A]` | Identity lifecycle (0.16.0, #19). `retire` makes a **permanent tombstone** (can't send, name never re-bound, history stays valid). `rename` = retire `<old>`→tombstone + add `<new>`, carrying over role/group/operator-facing; `--drain-check` refuses while work is owed to/from `<old>`. `forward` redirects a single owed request to a live agent, transcript-visible. |
-| `agenttalk barrier bump --from A --scope global [-m REASON] [--json]` | Fire a **global epoch barrier** (0.16.0, #19): one meta-marked message whose id becomes the new epoch, marking everything before it as a previous epoch. Any active member may bump (trusted-team global-stall lever). Tracked openers after it record `epoch_at_send` automatically. |
-| `agenttalk domain [--json] {list,show <id>,check-path <paths...>,validate}` | Inspect the project's **domain registry** (`.agenttalk/domains.json`, 0.31.0). `list` = domains + registry hash; `show <id>` = one domain with resolved owner/reviewer/curator refs; `check-path <paths...>` = classify repo-relative paths as owned/unowned/shared (`--case-sensitive`/`--case-insensitive`); `validate` = structure + ref resolution. Read-only foundation for upcoming lane/knowledge features; author `domains.json` by hand for now. |
-| `agenttalk onboarding {create,list,show,state,record}` | Track a new-project or existing-codebase analysis pass before implementation. Runs live under `.agenttalk/onboarding/<run-id>/events.jsonl` and record bounded segments, claims, drift, and unknowns with pointer evidence. Evidence tracking only: not an analyzer or consensus proof. |
-| `agenttalk whoami [--for A] [--json]` | Show effective root, resolved self and peer, roster membership, role/groups, unread count, and owed-thread count. Warns when identity is unresolved or not in the roster, which is often a wrong `--root` or env issue. |
-| `agenttalk status` | Show roster, per-agent cursor, unread count, and **actionable warnings**: never-acked unread, soft-deadlocks, unconsumed correlated replies, and stale outbound threads. |
-| `agenttalk threads [--for A] [--all] [--json]` | Derive request/reply thread state from validated messages. Default view shows actionable rows only (`reply-waiting`, `owed-inbound`, `open-outbound`); `--all` includes `closed`. 0.16.0: open rows in `--json` carry read-only `next_owner` / `next_action` (`reply`/`read-reply`/`await-reply`/`answer-operator`) — who owes the next move, a pure projection of state. |
-| `agenttalk sync --for A [--lesson-tag TAG] [--json]` | Rejoin digest for manual/rejoining agents: show identity, roster, actionable threads grouped by request id, terminal decisions, recent unread non-action messages, deterministic next-action hints, and a capped advisory `Lessons to check` section when accepted lessons match the work context. Pure derivation; no cursor, threadstate, or lesson-exposure writes. Wrapped agents receive matched lessons through the wrapper prompt path instead. |
-| `agenttalk capacity [show\|refresh] [--for A] [--source auto\|claude\|codex] [--threshold N] [--context-threshold N] [--reset-soon-min N] [--statusline-path PATH] [--sessions-dir PATH]` | Advisory headroom snapshots. `refresh` reads the caller's local Claude/Codex signal and publishes a normalized snapshot for `A`; `show` (the default) prints the team's published 5-hour/weekly usage, context-window fill, stale/unknown confidence, and near-cap/reset-soon/near-compaction flags. Never gates progress. |
-| `agenttalk avatar list\|set\|clear\|set-operator\|clear-operator` | Display-avatar preferences. Choices are allowlisted ids, never filenames or URLs. The shaped avatar families (`hexagon-*`, `oval-muted-*`, `oval-vivid-*`, `rounded-square-*`, `star-*`, `triangle-*`) are opt-in self-select variety via `agenttalk avatar set <shape>-<name> --from <self>`; role defaults stay on the original circular robot/operator avatars. |
-| `agenttalk send --from A --to B [--kind K] [--subject S] [--meta k=v] [--await-reply] (-m TEXT \| --file PATH \| --file -)` | Drop a message into the bus. `--file -` reads the body from stdin. `review-request`, `question`, and `proposal` without `--meta request_id=...` get one minted + printed; `wake` gets a `wk-` correlation id minted the same way but does **not** open a thread (0.24.0); `review-result` and `proposal-response` without one warn (soft, exit 0). `--await-reply` is managed-wrapper-only and records an explicit across-turn wait for an opener. |
-| `agenttalk await-cancel --from A --token TOKEN` | Conditionally clear one wrapped `--await-reply` marker. A stale or wrong token clears nothing and exits 3. |
-| `agenttalk broadcast --from A (--to-group G \| --all) [--kind message\|note\|question] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| --file -) [--print-id] [--quiet]` | Fan out one message per recipient, excluding the sender. Mints `broadcast_id=b-...`, stores it as `meta.broadcast_id` and `meta.request_id`, and prints the recipient list unless quiet. 0.15.0: `--to-role <role>` targets every member holding a role (frozen into each copy at send time); a PARTIAL fan-out exits **5** with a delivered/missed manifest — recover with `--resume <bid>` or rescind. |
-| `agenttalk propose [--from A] [--to B] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| --file -) [--in-reply-to ID] [--print-id] [--quiet]` | Send a first-class `proposal`. Auto-mints `meta.request_id=pp-...` if absent and prints `(proposal id: pp-...)` unless quiet. `--in-reply-to` sets `meta.in_reply_to` for counters. |
-| `agenttalk recv --for A [--ack] [--since ID] [-n N] [--include-control]` | **Peek** at queued messages — does NOT move the cursor unless `--ack`. `-n` / `--limit` returns at most N surfaced messages and bounds an acknowledged page. Plain `recv` that prints messages emits a hint pointing at `drain`. Hides `composing` pings by default; `--include-control` surfaces them. |
-| `agenttalk drain --for A [-n N] [--include-control]` | **Consume**: print unread messages and advance the cursor only through records successfully written and flushed. Use `-n` / `--limit` for a bounded page. An unbounded drain to a pipe is refused; an unbounded terminal or regular-file redirect remains allowed. Same path as `recv --ack`. |
-| `agenttalk wait --for A [--to-request RID] [--kind K] [--timeout 120] [--no-ack] [--grace 2] [--composing-extend 120] [--max-poll-interval 2.0] [--refuse-stacked-wait]` | Plain wait blocks until a new real message arrives, prints it, and advances the global cursor unless `--no-ack`. Scoped wait (`--to-request` and/or `--kind`) returns only matching addressed messages, advances only the per-thread `seen_msg_id`, and never advances the global cursor. A scoped wait on a rescinded request wakes immediately with **exit 3** (0.14.0). Idle polling backs off from `--interval` up to `--max-poll-interval` (reset on activity; set `<= --interval` to disable). `--refuse-stacked-wait` exits **6** instead of warning when a live duplicate waiter already holds the mailbox; an older scoped wait also exits **6** with a stderr superseded diagnostic when a newer same-thread waiter replaces it. |
-| `agenttalk composing --from A [--to-request RID] [-m "still drafting"]` | Send a `composing` ping so the peer's `wait` extends its deadline. Use periodically while you draft a long reply. The peer's `wait` consumes these as deadline-extension signals — they do NOT surface as a returned reply. With `--to-request` (0.14.0) the peer is derived from the thread, and a **reply-in-flight** marker shows up in their `threads`/`sync`. |
-| `agenttalk ack --for A [--id ID] [--to-request RID]` | Without `--to-request`, manually move an agent's global cursor forward. With `--to-request`, manually close that request thread for A and record the latest seen matching message without touching the global cursor. |
-| `agenttalk rescind --from A --to-request RID [--to-id MSG] [-m REASON]` | Mark a tracked request you opened as **no-longer-current** (0.14.0). Transcript-visible; the thread becomes `closed-superseded`, a peer blocked in `wait --to-request` wakes with exit 3, and `check` reports superseded. Requester-only. Prefer this over a prose "ignore my last message". |
-| `agenttalk check --for A --to-request RID [--epoch] [--json]` | **Pre-action currentness gate** (0.14.0): prints `current`/`superseded`/`unknown`, exits 0/3/4. Run it immediately before any irreversible action tied to a request — exit 3 is a hard stop. Read-only; a local `ack` never masks a rescind. 0.16.0 `--epoch` also checks the global epoch: exit **3** if the request predates the latest barrier (previous-epoch, or a pre-epoch opener to re-ask). Adds an additive `epoch` object to `--json`. |
-| `agenttalk escalate --from A (-m TEXT \| --file -) [--to X]` | Route an operator question to the **liaison**, falling back to the single `role=lead` agent when no liaison is configured (0.24.0). Resolution: `--to` → liaison → sole lead → refuse. Mints an `esc-` request_id (printed as `request_id=<id>`); refuses (exit 2) only when none of those resolve, with a remediation naming both `set-operator-facing` and `set-role … lead`. |
-| `agenttalk roster set-operator-facing <name>` / `--clear` | Designate the ONE agent the human operator talks to directly (0.14.0). Advisory routing metadata, single slot — "two liaisons" is unrepresentable. |
-| `agenttalk prune --invalid [--dry-run] [--json]` | Quarantine invalid message files into `.agenttalk/quarantine/` (0.15.0) — move-only and **recoverable** (restore = move the file back); the selection is exactly what status reports as INVALID; valid files untouched by construction. |
-| `agenttalk transcript [--format md\|jsonl] [--out PATH]` | Export the full conversation. |
-| `agenttalk end --from A [--reason ...]` | Notify the other agent(s) and write the transcript. In a team, sends `end` to every other roster member. |
-| `agenttalk release --from A (--to B \| --to-group G \| --all) [-m reason]` | Signal an agent (or team) to **stand down and exit its listen loop** — distinct from `end`: no transcript export, and the agent may be restarted later. A listener exits ONLY on `kind=release` or `kind=end`; a prose "done for now" never stops it. A single `--to` opens no thread (no `request_id`/`broadcast_id`); `--to-group`/`--all` fan out the same signal (re-run to retry any missed — no `--resume`). Authoritative only from the `operator_facing`/sole-`lead` sender; the command warns otherwise and the listen skill reports-and-ignores an unauthorized release. |
-| `agenttalk reset [--archive]` | Clear **active bus and compact-resume state** (messages + cursors + heartbeats + checkpoints); preserves historical transcripts under `.agenttalk/sessions/` so past exports aren't lost. Bumps `session_id`. With `--archive`, instead moves **everything** (messages + state + checkpoints + sessions) under `.agenttalk/archived/<old_session>/`. Preserves config (roster) either way. |
-| `agenttalk supervise (--init \| --refresh-scripts \| --select-pwsh \| --repair-instance-marker \| --reset-process-tree-ownership \| --report \| --plan \| --bootstrap-check \| --install-activity-hook \| --clear-restart)` | Thin support for the **external agent supervisor** (24/7 outage auto-restart + stuck-recovery). `--init` scaffolds the operator config plus four generated Windows artifacts; `--refresh-scripts` regenerates only those artifacts and preserves config/runtime state. `--select-pwsh [--pwsh ABSOLUTE_PATH]` records the validated PowerShell Core 7+ host used by start/task/watchdog boundaries. `--repair-instance-marker --quarantine --acknowledge-no-live-supervisor` is the explicit invalid-marker recovery. `agenttalk supervise --reset-process-tree-ownership --from L --for A --hold-source-hash HASH --verified-launch-nonce NONCE --acknowledge-no-live-supervisor --acknowledge-owned-processes-stopped --reason TEXT` records an attended ownership boundary only for the liaison/sole lead, with the kill switch present, no live marker, a current Attention hash/nonce, and every recorded PID/start proven gone or recycled; it never kills or launches. `--report`/`--plan` emit the read-only liveness JSON and shared action plan; `--bootstrap-check` verifies the roster, operator-facing lead, supervisor config, wrapped launch invariants, explicit wrapped `--root`, and fresh heartbeats. Manual listeners use heartbeat freshness; wrapped listeners additionally require a strict runtime phase plus an independently discovered CLI brain and real adapter progress. `--install-activity-hook` merges Claude's identity-neutral heartbeat `PostToolUse` plus checkpoint `PreCompact` and `SessionStart/compact` project hooks; Codex modes write only the heartbeat hook to `.codex/hooks.json`. Protected agents are never auto-killed. |
-| `agenttalk checkpoint (save\|resume) [--for A]` / `checkpoint show [--for A] [--json]` | Preserve, reload, or inspect deterministic external state around context compaction. Claude hook installation saves on `PreCompact` and injects the latest summary on `SessionStart/compact`; latest state is under `.agenttalk/checkpoints/` and `reset` clears it. See the user manual for hook and identity contracts. |
-| `agenttalk wrap --for A --cli claude\|codex [--loop] [--no-render] [--from S] [--min-interval N] -- <real-exe> <base-args>` | Run agent `A` through the **progress wrapper** (0.30.0): a per-CLI structured-stream adapter giving **visibility** (echoes the agent's stream — token/thinking deltas for Claude, item-level events for Codex; `--no-render` to silence), a **working-turn heartbeat** (stays fresh while the agent works, not just idles), and **degraded-output detection** (confirmed garble-then-silence can request a self-restart, recorded as `--from`). `--loop` makes it the long-running **supervised** wrapper: it owns the idle bus-wait + heartbeat and drives the CLI **one turn per inbound message**, persisting+reloading the Codex `thread_id`/Claude `session-id` so a relaunch reload-resumes. Each inbound wrapped turn also receives matching accepted lessons as advisory prompt context and records pointer-only exposure telemetry after prompt handoff. The real CLI exe + its base args go after `--`; the wrapper appends the per-turn session/stream args. For durable unattended listening, this is the documented default; manual `/agenttalk.listen` is best-effort for interactive use. |
-| `agenttalk request-restart --for A [--from L] [--reason ...] [--force-protected] [--acknowledge-live-protected-kill]` | Queue a **manual** restart of agent `A`: writes an atomic, request-id-scoped `state/<A>.restart-request` marker the supervisor relaunches (resuming the session) from and clears. Healthy idle agents are eligible for manual restart at the next supervisor poll. Restarting a protected agent requires `--force-protected`; if that protected agent still has a fresh heartbeat, the operator-facing requester must also pass `--acknowledge-live-protected-kill`. |
-| `agenttalk heartbeat [--for A] [--min-interval 5]` | Stamp this agent's **activity heartbeat** (the supervisor's stuck signal). Wire as a Claude PostToolUse / Codex hook so it's stamped at **tool boundaries** (PostToolUse) **plus** the wait-loop heartbeat while idle — so it stays fresh whether the agent is waiting or running tools, and goes stale only when the model is genuinely stuck. Hook identity resolves from `--for`, then `AGENTTALK_SELF`; the installer uses the hook-only fallback form for the operator-facing interactive liaison. Choose `stuck_after_seconds` generously for the longest expected no-tool model/API turn or long-running tool call; production configs may need a larger value than the 120s default. **Throttled** — a no-op if the heartbeat is younger than `--min-interval`, so the per-tool-call hook costs almost nothing. |
-| `agenttalk compact [--dry-run] [--keep-count N] [--keep-age-days D] [--json]` | Bound live-store growth by archiving a **safe prefix** of old messages (`id < keep_floor`) into the cold `.agenttalk/archived/compacted/` dir. `keep_floor` is the MIN of: the lowest active cursor (never archive a message unread by an active recipient), the current epoch barrier, the earliest message of any **protected** thread (owed-inbound / reply-waiting / open-outbound / closed-superseded — kept whole), and a keep-tail (`keep_count` newest + everything younger than `keep_age_days`). Any undeterminable component fails safe to **archive nothing**. Never archives invalid files (they stay for `prune`/`doctor`). Diagnostics name which component capped the floor; `--dry-run` plans without moving. |
-| `agenttalk hmac-init [--force]` | Generate the HMAC signing key for this project. Stored outside `.agenttalk/` (per-user config dir). The key's existence at the path-derived per-user location automatically activates signature enforcement — there's no config flag to flip. Override the default key path with `AGENTTALK_HMAC_KEY_FILE`. See `SECURITY.md`. |
-| `agenttalk reply [--from A] [--to-id MSG_ID \| --to-request REQUEST_ID] [--kind K] [--subject S] [--meta k=v] [--await-reply] (-m TEXT \| --file PATH \| --file -) [--dry-run]` | Reply to the most recent received message, or anchor to a specific received message/thread. Auto-derives recipient and echoes the anchor's `request_id`; explicit `--meta request_id=...` wins. `--dry-run` prints the resolved recipient, request id, and kind without sending. A reply that opens a new thread (`review-request` or `proposal`) mints a fresh id instead of echoing. Managed-wrapper `--await-reply` is valid only for such counter-openers. 0.15.0: `--na` sends a not-applicable response — closes your obligation, displayed as (n/a); refused on review-request/proposal threads. |
-| `agenttalk tail [--from-start] [--interval S] [--timeout S]` | Passive monitor: stream all messages as they arrive. Does **not** advance cursors or write heartbeats — safe to run in a third terminal alongside two active agents. `--from-start` replays existing messages first. |
-| `agenttalk serve [--port P] [--host H] [--access-log]` | Start a **read-only** local web dashboard at `http://127.0.0.1:8765/` for browsing the message log in a real browser. **Loopback-only by design** — only `127.0.0.1`, `::1`, and `localhost` are accepted; there is no flag to expose it elsewhere (SSH-tunnel `localhost:<port>` from another machine if needed). HTML output is escaped, strict CSP, `GET`/`HEAD` only, peer-IP check on every method. JSON at `/api/status` and `/api/messages` for scripting. 0.17.0: the same server also serves `/dashboard` (the obligation view) and `/api/state`; a port that can't be bound now exits **2** with a `--port 0` hint instead of a raw traceback. See `SECURITY.md`. |
-| `agenttalk dashboard [--port P] [--store PATH]... [--access-log]` | The **obligation dashboard** (0.17.0): who owes what, whose turn it is, and the next action — per agent, per open thread, with mission/WP tags and epoch staleness. Same read-only loopback-only server as `serve`, landing on `http://127.0.0.1:8765/dashboard`; auto-refreshes state every ~2 s. Repeat `--store <project-root>` to watch **several projects in one tab** (each path is the project root itself — no upward search; an uninitialized path shows as a degraded panel, not an error). No `--host` option exists on this spelling. `GET /api/state` (`schema_version: 1`) is the envelope data for scripting; `GET /api/learning` returns the selected root's accepted lesson ledger plus pointer-only exposure telemetry; `GET /api/onboarding` returns selected-root onboarding runs and bounded evidence pointers. |
-| `agenttalk install-skills [--claude-only\|--codex-only] [--no-devkit\|--devkit-only] [--force] [--dry-run]` | Copy bundled bus skills to `~/.claude/commands/` and `~/.codex/skills/`, and by default copy the shared dev-discipline devkit (`craft-code`, `test-coverage`, `review-code`, `write-docs`, `review-docs`) to both `~/.claude/skills/` and `~/.codex/skills/`. `--claude-only` and `--codex-only` scope only the bus skills; use `--no-devkit` to skip the shared devkit. Idempotent — preserves your local edits unless `--force`; use `--dry-run --force` to preview overwrites. |
-| `agenttalk codex-config [--enable\|--disable\|--status]` | Manage per-project sandbox/trust block in `~/.codex/config.toml` so Codex can call agenttalk from inside its sandbox. |
-| `agenttalk doctor [--json]` | Health check: store initialized, bus skills installed + in sync, devkit absent/in sync/stale state surfaced, Codex sandbox block configured, heartbeats fresh. Per the global exit-code contract, exit 2 on any error; warnings exit 0 with the warning state visible in output. |
-| `agenttalk status --json` | Structured status output for automation (consult freshness, external tooling). Same data as plain `status` plus `invalid_messages[]`, `warnings[]`, per-agent `waiting` / `waiting_stale`, and thread-derived warning state (additive — existing keys unchanged). |
-| `agenttalk --version` | Print the installed version. |
-
-### Assurance gates and approved review evidence
-
-Use `agenttalk gate {set,list,check,waive}` to manage lightweight
-assurance state in `.agenttalk/gates.json`. Required gates default to
-empty until a project opts in. `gate check` prints top-line `GO` or
-`HOLD`; it exits 3 when an unwaived `severity=blocker` gate is `red` or
-`unknown`. A blocker gate can be set `green` only with
-`--evidence-source automation_ci`; operator waivers must use `gate waive`,
-which records the operator, date, reason, scope, and expiration.
-
-Use `agenttalk check --for A --to-request RID --gates` immediately
-before release, merge, tag, or milestone-close actions that must respect
-gate state. It keeps the existing currentness/rescind behavior and adds
-a `HOLD` failure when gates block. With `--json`, the output includes an
-additive `gates` object.
-
-A `review-result` with `--meta status=approved` must include typed
-evidence metadata: `risk_class`, `release_blocker`,
-`tests_referenced`, `tests_executed`, `evidence` or `artifacts`, and
-`residual_risk`. Use `na_reason` when any field is `n/a`. A lightweight
-approval can use `risk_class=none`, `release_blocker=no`, `n/a` evidence
-fields, and a short `na_reason`.
-
-Response statuses are exact enums. `review-result` accepts
-`approved|rejected|needs-info`; only `approved` and `rejected` are terminal.
-`proposal-response` accepts `accepted|rejected|countered`, all terminal. A
-mixed-version message with no status remains readable but nonterminal; a
-present unknown or wrong-typed status is refused on write and skipped on read.
-
-### Milestone/release close (`agenttalk close`)
-
-`agenttalk close {open,ack,draft,counter decide,check,publish,reopen,list,show}`
-aggregates the assurance signals above — gate state, typed review evidence,
-and named-gate-bound remediation — into one auditable `HOLD`/`GO` verdict for a
-frozen revision, gathered from a declared set of required review **lenses** and
-published by a lead. State is a per-close atomic JSON file in
-`.agenttalk/closes/<id>.json`. It is **opt-in** (no required lenses or gates by
-default) and **advisory**: like gates, agenttalk authenticates the sender but
-does not enforce identity, so close records *who acted* and is a strong release
-signal + audit trail, never an enforced lock. The bus carries the evidence text;
-the close file stores pointers, not copies. Every update of an existing close
-is serialized by close id and compares both a monotonically increasing
-`generation` and an immutable `instance_id`. A stale writer, a missing token,
-or a delete/recreate ABA therefore fails closed and must reload. Creation is
-exclusive; `open --force` performs a locked replacement with a new instance.
-Legacy records are upgraded under that same lock and are never overwritten by
-an unchecked compatibility path.
-
-`close open --id ID --scope release --revision REF --lens NAME --allow NAME:AGENT`
-freezes `REF` to a full SHA via git (a dirty worktree needs `--dirty-artifact`
-or stays `HOLD` on revision) and declares the required lenses. `--allow
-NAME:AGENT` authorizes an agent, `--allow NAME:@ROLE` a role; an ack from anyone
-else is `HOLD` (`unauthorized_lens_ack`) unless a lead records `--override`.
-
-`close ack --id ID --lens NAME --status accept|counter|na` records a lens
-verdict. `accept` reuses the 0.32.0 typed evidence (`--risk-class`,
-`--release-blocker`, `--tests-executed`, `--evidence`, …); `na` needs a
-`--reason`; `counter` raises a finding that holds the lens until the lead
-decides it with `close counter decide --decision accept|reject --reason …`.
-Accepting a counter records a remediation item; a `--blocker` remediation **must
-name a `--gate`**, and `GO` then requires that gate green from `automation_ci`
-or an operator waiver — gates remain the single resolution authority (close
-never creates or mutates gates).
-
-`close check --id ID` prints `HOLD`/`GO` with stable hold codes and exits
-`0`=GO / `3`=HOLD, matching `gate check` so they compose in automation. The
-verdict is a pure function over (close record, gate check): `GO` requires a
-well-formed record on a frozen, clean (or dirty-with-artifact) revision, a gate
-`GO`, every required lens satisfied by an authorized non-stale ack, every
-counter decided, and every accepted blocker remediation resolved by its gate. A
-revision change stales prior acks (they reviewed different code).
-When reopen changes the revision, it also clears the prior dirty-worktree
-artifact so evidence for the old revision cannot be reused.
-
-`close publish --id ID --from LEAD --verdict go|hold` records the terminal
-snapshot; a `go` is refused unless `check` is `GO`. Post-publish acks are
-rejected until a lead runs `close reopen`, so a close is stale-proof **without**
-a team-wide epoch bump. The global epoch is audit-only at open; only an explicit
-`close publish --verdict go --bump-barrier` recomputes gate, sign-off, and
-worktree evidence while holding the cooperating close serialization boundary,
-then persists GO with a barrier binding containing close id, instance id,
-revision, and generation. Sending the barrier and stamping its epoch are
-recoverable steps. If either fails, retry the identical publish command: it
-finds the uniquely matching validated barrier and stamps it, or sends exactly
-one when absent. Duplicate matching barriers or changed bindings fail closed.
-This is an idempotent recovery protocol, not one ACID transaction across the
-close file and message bus. A `hold` never bumps the barrier.
-
-### Specialist sign-off by risk class (`agenttalk close signoffs`)
-
-`agenttalk close signoffs {plan,apply,override}` turns the close's explicit
-lenses into review **sign-offs routed from the risk classes in play**. It is
-opt-in (no `.agenttalk/signoffs.json` policy = zero derived signoffs) and, like
-everything in `close`, **advisory**: it counts who signed and whether the
-required counts are met; it is not an access-control boundary.
-
-The project owns the policy in `.agenttalk/signoffs.json`: per risk class, a list
-of signoff sets `{id, required_count, candidates: {agents, groups, roles},
-use_default_reviewers, include_domain_reviewers, allow_na, countable_statuses,
-override_counts}`, plus `defaults.reviewers` and `allow_unmapped`. The core
-**validates** the policy and the risk-class strings (the envelope `none`,
-`unknown`, `release`, `device`, `accessibility`, `security`, `performance`,
-`persistence`, `docs-contract`, `quality`, plus `project:...` extensions) but
-never **decides** a change's risk —
-the lead/project supplies the close's risk inventory.
-
-Policy flags `use_default_reviewers`, `include_domain_reviewers`, `allow_na`,
-and `override_counts` must be literal JSON booleans; strings such as `"false"`
-are invalid. Every `counter_id` must be unique across the entire close, even
-when counters come from different lenses.
-
-`close open … --derive-signoffs --risk-class X` (or `close signoffs apply`)
-freezes the route: it records the policy hash, the risk-inventory hash, and the
-revision, derives first-class `required_signoffs`, and generates `required:false`
-signoff lens slots. Changed paths default to `git diff --name-only
-<base>..<revision>` (the frozen revision; `--changed-path` is an audited
-override). Crucially it **freezes the route inputs, not the people**: candidate
-refsets resolve against the *current* roster/groups/roles (and, additively, the
-matched domains' `reviewers` from `domains.json`) at check time, so a reviewer
-added or removed later is honored without reopening; only a policy / risk /
-revision change raises `stale_signoff_route` until you re-apply.
-
-A set is satisfied by enough **distinct, currently-qualifying** acks (`close ack
---lens <generated-id>`): one agent cannot satisfy `required_count=2` with two
-acks, a non-candidate ack is refused, `na` counts only when the set sets
-`allow_na` (and carries a reason), a `counter` does not count unless listed in
-`countable_statuses`, and a lead `--override` ack does not count unless the set
-sets `override_counts`. `close check` adds the stable HOLD codes
-`missing_required_signoff`, `unroutable_required_signoff`, `invalid_signoff_policy`,
-`unmapped_required_risk`, and `stale_signoff_route` (still exit 0=GO / 3=HOLD). An
-unroutable or otherwise blocked set has exactly one escape: `close signoffs
-override --set ID --from LEAD --reason …` (close-lead authority; recorded and
-audited, never counted as a specialist sign-off).
-
-The verdict stays **pure**: the CLI does all the I/O (load the policy, resolve
-refsets against roster/domains, run `git diff`, hash the route) and hands
-`compute_verdict` a resolved evaluation; the core only counts. Rubric content,
-automatic specialist discovery, and risk inference from code remain out of scope.
-
-### Ephemeral evidence reviewers
-
-`agenttalk request-launch --from LEAD --profile PROFILE --skill SKILL --revision REF
-[-m PROMPT | --file PATH] [--path P ...]` queues an evidence-only adversarial
-review for the external supervisor. The command freezes `REF` to a full 40-char
-SHA and writes a data-only marker at
-`.agenttalk/state/launch-requests/<request_id>.json`.
-
-The supervisor must opt in with `ephemeral_reviewers.enabled=true` in
-`.agenttalk/supervisor.json`. It validates the marker before claim: strict
-requester authority (operator-facing agent, else the sole active `role=lead`;
-no zero-lead fallback), allowed profile/skill/role/groups, prompt-size cap,
-rate/concurrency caps, and optional `current_revision` staleness. Denied markers
-are archived and are not retried forever.
-
-Accepted markers roster a fresh `adversary-*` identity, send it one
-`review-request`, launch `agenttalk wrap --loop --one-shot --to-request <id>`,
-and retire the identity immediately after terminal evidence, failure, or timeout.
-The wrapper gets a fresh prompt/session/home in v1; this is prompt/session
-freshness, not hard OS isolation. Reviewed code and marker prompts are untrusted
-data.
-
-Completion is evidence-only: `review-result status=approved` can support a gate
-but is never a counted signoff, `status=rejected` is a counter/remediation
-signal, and `needs-info`, malformed output, or no typed result keeps the request
-on HOLD.
-
-### Rejoining a session with `sync`
-
-Use `agenttalk sync --for A` before an agent acts after a restart,
-context compaction, or long idle period. It is read-only: it derives a
-digest from roster data, validated messages, global cursor state, and
-per-thread `threadstate.json`, but does not acknowledge anything.
-
-The digest separates actionable thread work from recent FYI traffic.
-It groups request/reply threads by `request_id`, shows whether `A`
-owes action or is waiting on someone else, includes recent terminal
-results such as `review-result` and `proposal-response`, and prints
-deterministic command hints such as `reply --to-request`,
-`wait --to-request`, `ack --to-request`, or `drain` when the next
-step is mechanically knowable. Use `--json` for automation.
-
-### Reading the inbox: peek vs consume
-
-A single rule prevents the cursor footgun that caused a two-agent
-deadlock in practice (issue #5):
-
-- **`recv` peeks.** It prints what's queued but does **not** move your
-  cursor, so the same messages re-print every call and `unread` climbs.
-  Good for a quick look; never build polling on top of it.
-- **`drain` (or `recv --ack`) consumes.** It prints unread *and*
-  advances the cursor to newest. This is the "I've read these, don't
-  show them again" operation.
-- **Bound consuming reads at the source.** Use `agenttalk drain --for A
-  -n 5` (or `recv --ack --limit 5`) instead of piping an unbounded
-  consuming read through `head`. An unbounded consuming read exits 2
-  when stdout is a pipe, before printing or moving the cursor. A regular
-  file redirect such as `agenttalk drain --for A > inbox.txt` remains
-  allowed because the file retains the complete output stream.
-- **`wait` consumes one real message.** It blocks, returns the next
-  real message, and advances the cursor past it (`--no-ack` to opt out).
-- **Scoped `wait` is thread-local.** `wait --to-request <id>` and
-  `wait --kind <kind>` return only matching addressed messages. They
-  advance only the per-thread `seen_msg_id` pointer so the same scoped
-  wait can progress, but they do not advance the global cursor or
-  mark the thread handled.
-- **`--since ID` inspects history** without touching the cursor.
-- **`ack --to-request <id>` closes a handled thread manually.** It is
-  the escape hatch for off-contract replies or already-handled work
-  and does not advance the global cursor.
-
-If you ever find yourself comparing message timestamps to a baseline to
-detect "new" activity, stop — that's the footgun. Use `drain` / the
-cursor instead. `agenttalk status` will warn if an agent has unread
-with a never-set cursor, and flag a soft-deadlock if both agents are
-blocked in `wait` at the same time.
-
-### Tracking request/reply threads
-
-`agenttalk threads --for A` derives open request/reply state from
-validated messages only. It tracks messages that carry
-`meta.request_id`.
-
-Openers:
-- `review-request`
-- `question`
-- `proposal`
-
-Expected responses:
-- `review-request` -> `review-result`
-- `proposal` -> `proposal-response`
-- `question` -> any non-control response from the expected
-  counterparty with the same `request_id`
-
-Broadcast questions use the same `request_id` for every fan-out copy
-and also carry `meta.broadcast_id` plus `meta.audience`. From the
-broadcaster's perspective, the thread stays open until every recipient
-has responded and those responses have been consumed. From a
-recipient's perspective, their copy is an owed inbound question until
-they answer it with `agenttalk reply --to-request <b-id> ...`.
-
-`agenttalk ack --for A --to-request <request_id>` is a manual closure
-override for A's view of a handled thread. It records the latest seen
-matching message in `.agenttalk/state/<agent>.threadstate.json` and
-marks the thread closed without advancing A's global cursor. This is
-useful when a response was semantically handled but did not match the
-strict review/proposal response kind, or when an agent has already
-handled a thread after a restart.
-
-Thread states from `--for A`'s perspective:
-- `reply-waiting`: a correlated response addressed to `A` is newer
-  than `A`'s global cursor; consume it with `drain`, plain `wait`,
-  or targeted `wait --to-request <id>`.
-- `owed-inbound`: the ball is on `A`; either the peer's opener has no
-  response from `A`, or a consumed `review-result status=needs-info`
-  bounced the ball back.
-- `open-outbound`: the ball is on the peer; `A`'s opener has no
-  response, or `A` sent `needs-info` and is awaiting the peer's info.
-- Broadcast `open-outbound`: the broadcaster is waiting on one or
-  more pending recipients. Output shows responded/pending counts and
-  names.
-- `closed`: a terminal correlated response exists (`review-result`
-  `approved|rejected`, `proposal-response` `accepted|rejected|countered`, any
-  non-control question answer), or a local ack closed the view. `needs-info`
-  remains nonterminal and moves the ball back.
-
-Default output shows only actionable rows. `--all` includes closed
-threads. `--json` emits:
-
-```json
-{
-  "agent": "<me>",
-  "threads": [
-    {
-      "request_id": "rq-...",
-      "opener_kind": "review-request",
-      "subject": "WP ready",
-      "peer": "claude",
-      "role": "opener",
-      "state": "open-outbound",
-      "age_seconds": 42,
-      "last_msg_id": "20260602-...",
-      "unread": false
-    }
-  ],
-  "counts": {
-    "reply-waiting": 0,
-    "owed-inbound": 0,
-    "open-outbound": 1,
-    "closed": 0
-  }
-}
-```
-
-Message `--kind` values are validated against a fixed vocabulary
-(`store.KNOWN_KINDS`); unknown kinds are rejected at write time so a
-typo can't produce a "sent" message the receiver will silently skip:
-
-- `message` — generic chat
-- `note` — informational
-- `question` — needs a reply before the other side proceeds
-- `review-request` — "please review this scope"
-- `review-result` — "I reviewed; here's my verdict" (use `--meta status=approved|rejected|needs-info`)
-- `proposal` — "I propose this concrete solution; accept, reject, or counter"
-- `proposal-response` — verdict on a proposal (use `--meta status=accepted|rejected|countered`)
-- `wake` — state-change signal for sk-loop (low-latency peer wake)
-- `end` — terminate the listen loop on the other side
-- `composing` — control-plane: "I'm still drafting a real reply, hold the line." Consumed by `agenttalk wait` as a deadline-extension signal; never returned as a reply. Hidden from `recv` by default. Send via `agenttalk composing` (preferred) or `send --kind composing`.
-
-For `review-result`, `status=approved` also requires typed evidence
-metadata; see "Assurance gates and approved review evidence" above.
-
-Adding a new kind requires updating `KNOWN_KINDS` in
-`src/agenttalk/store.py` *and* documenting it here + in the skill
-bodies. Receivers silently skip messages with unknown kinds (see
-`SECURITY.md`).
-
-### Rescinding a request — supersession and the `check` gate (0.14.0)
-
-A tracked request can become wrong after it is sent (new data, a HOLD,
-a changed plan). Prose cannot fix that: the bus has no idea your "ignore
-my last message" relates to the earlier thread, a blocked `wait` will not
-wake for it, and an executor that already read the request will still act.
-
-`agenttalk rescind --from A --to-request RID -m "<why>"` is the
-first-class cancel: requester-only, transcript-visible, and correlated.
-Derivation flips the thread to `closed-superseded` for every participant
-(the FIRST qualifying rescind decides; later duplicates are audit-only),
-a peer blocked in `wait --to-request RID` wakes immediately with a
-`RESCINDED` banner and **exit 3**, and `sync` flags rescinded threads the
-agent has not yet consumed. A re-ask after a rescind needs a fresh
-request_id — same contract as manual `ack` closure. A manual `ack` keeps
-its own `closed` label (you said you handled it), but it never masks the
-fact: `check` answers from the validated log alone.
-
-The race no inbox primitive can close: the executor drained the request
-minutes ago and is about to act — no waiting, no reading. That is what
-`agenttalk check --for A --to-request RID` is for: run it **immediately
-before any irreversible action** tied to a request. Exit 0 = current,
-act. Exit 3 = superseded — hard stop (the output names who rescinded,
-when, and why). Exit 4 = unknown id — treat as stale. The bundled skills
-encode this contract; it is the operator-safety barrier from the
-production HOLD/fire incident.
-
-### The operator liaison — one voice to the human (0.14.0)
-
-In a team where one human operates several agent windows, designate ONE
-agent as the operator channel: `agenttalk roster set-operator-facing
-<name>`. Workers that need a human decision then run `agenttalk escalate
---from W -m "<decision, options, recommendation>"` instead of asking the
-human at their own window. The escalation is an ordinary tracked question
-(meta `needs_operator=true`, `esc-` request_id, printed as
-`request_id=<id>` for the follow-up `wait --to-request`); it is routed to
-the liaison automatically and refuses loudly (exit 2) when no liaison is
-configured — an escalation that lands nowhere is exactly the silent
-failure this kills. The liaison's `sync` shows pending escalations under
-**OPERATOR INPUT NEEDED**; answering on the same request_id (optionally
-`--meta operator_answer=true`) clears them.
-
-Honest scope: this is **advisory routing metadata**, not enforcement —
-the bus cannot control what a human types into which window (see
-SECURITY.md). `doctor` warns when the designation is missing-but-needed,
-stale, or points at a pruned agent.
-
-### Root resolution and `AGENTTALK_ROOT` (0.14.0)
-
-The bus root resolves with strict precedence: **`--root` flag >
-`AGENTTALK_ROOT` env var > upward walk from CWD** to the first
-`.agenttalk/`. A pinned root (flag or env) that has no store fails
-loudly — it never falls back to the walk, so a typo cannot silently
-route a window to a different store. `init` refuses to create a nested
-store when one already exists up-tree (the production split-brain was
-exactly two `init`s at different depths); `doctor` names every store on
-the path and leads with `root:` — as does `whoami`. Pin the root per
-shell with `$env:AGENTTALK_ROOT = '<project root>'` and every window
-agrees by construction.
-
-### Role audiences and honest n/a replies (0.15.0)
-
-`agenttalk broadcast --to-role reviewer --kind question -m "fresh eyes?"`
-fans out to every roster member whose ROLE is `reviewer` — no
-hand-curated group needed. The audience is **frozen into each copy at
-send time** (`audience_kind`/`audience_resolved`/`batch_total` meta):
-change the roles map afterwards and historical obligations do not move,
-because thread derivation only ever reads the copies themselves.
-
-When a broadcast question genuinely does not concern you,
-`agenttalk reply --to-request <bid> --na` closes your obligation with a
-structured not-applicable response. The asker sees `na=[you]` instead of
-mistaking it for a substantive answer — and nobody placeholder-acks or
-goes silent. NA is refused on review-request/proposal threads (those
-contracts need `review-result` / `proposal-response`).
-
-### Broadcast delivery accounting (0.15.0)
-
-Fan-out has no multi-file atomicity on a local filesystem, so agenttalk
-is honest instead: every copy carries the batch facts, and a mid-batch
-failure prints `delivered=[...]` / `missed=[...]` and exits **5**.
-Recovery is one command — `agenttalk broadcast --resume <bid>` re-sends
-the missing copies from the frozen originals (broadcaster-only) — or
-rescind the thread to void it. Until resolved, `status` warns
-`incomplete fan-out` naming the missed members.
-
-### Quarantine — recoverable store hygiene (0.15.0)
-
-`agenttalk prune --invalid` moves every file the INVALID report names
-into `.agenttalk/quarantine/`. Move-only: never overwritten (collisions
-get a timestamp suffix), never deleted by the tool, restore = move the
-file back into `messages/`. Selection is the SAME validation gate walk
-status/doctor use, path-paired at scan time, so a valid file can never
-be selected. Use `--dry-run` to inspect first; `doctor` shows
-invalid/quarantined counts.
-
-### The obligation dashboard (0.17.0)
-
-spec-kitty's kanban shows the *task* layer; `agenttalk dashboard` shows
-the *conversation/obligation* layer of the bus itself — and works
-without spec-kitty. One browser tab answers: which agents are alive
-(heartbeat age), who has unread backlog, who is composing, which
-threads are open, **whose court the ball is in** (`next_owner`) and
-what the move is (`next_action`), plus mission/WP tags when messages
-carry them in meta and epoch staleness after a `barrier bump`.
-
-```powershell
-# one project (current root):
-agenttalk dashboard
-
-# two live sessions, one tab:
-agenttalk dashboard --store D:\proj\band-a --store D:\proj\band-b
-```
-
-For automation, `GET /api/state` returns the same aggregate as
-versioned JSON (`schema_version: 1`): an array of root objects, each
-fully namespaced (no cross-root merging), with per-root `errors` as
-data — one corrupt store renders as a degraded panel while the others
-stay live. Each root carries a stable path-derived `project_id`; the display
-label is not a write-routing key. Selected-root Team Console responses return
-`root_info` with `project_id`, label, and full path. GET routes may omit `root`
-to select `root[0]` and may accept a unique display label as a legacy
-best-effort selector. A blank, repeated, unknown, or ambiguous GET selector
-returns HTTP 400 `bad_root`.
-
-Writes are stricter. When several roots are served, POST `/api/intent` and
-`/api/lead-chat` require exactly one explicit full `?root=<project_id>`; label
-fallback and omission are forbidden. Omission is accepted only in single-root
-mode.
-Blank, repeated, unknown, ambiguous, or non-full selectors return HTTP 400
-`bad_root` before any mutation.
-Thread rows carry subjects and derived fields only, never message bodies; raw
-thread bodies are available through the selected-root `/api/thread/<id>` and
-lead-chat transcript surfaces. If a watched project contains `kitty-specs/`,
-the panel lists its missions — detection is filesystem-only, agenttalk
-never imports spec-kitty.
-
-The top bar always shows current project and path context, even for a single
-watched root. If CSS ellipsizes the path visually, its complete value remains
-available through the element text, title, and accessibility label. Duplicate
-basenames receive stable project-id suffixes. A selector change pushes the
-selected `project_id` into browser history; Back and Forward restore that
-project and refetch its root-bound feeds. Every actual project change clears
-root-bound drill-ins, caches, the action session, queued-answer text, and the
-generic and lead-chat composer drafts. Every asynchronous payload is checked
-against the selected id, so a late response from the previous project is
-discarded. The id is routing and display state, not authentication or
-cross-root security.
-
-The loopback story is unchanged and non-negotiable: no auth, no
-remote-bind flag on any spelling — SSH-tunnel the port if you need it
-from another machine.
-
-The Team Console lead-chat panel lets the local operator send a direct
-message to the configured lead from the authenticated dashboard request
-only. That path is gated by loopback, the dashboard session, and CSRF,
-then records the operator identity as an auditable bus assertion. It is
-not a cryptographic boundary against a fully privileged local process
-that can write raw message files or inspect process memory; the generic
-intent queue cannot authorize an operator-sender message.
-
-For lead-chat reachability, the operator-facing lead must be actively
-listening in an `agenttalk wait` or listen loop, wrapped, or refreshed by
-the interactive activity hook so its heartbeat stays fresh. The
-interactive hook is a heartbeat path, not a staleness exemption: when the
-heartbeat is stale or missing, lead-chat still correctly reports the lead
-as away instead of queueing into an unreachable listener.
-
-The **Learning** panel is read-only. It shows accepted active lessons by
-default, with the lesson text, trigger, publisher, curator, owner, evidence,
-anchor metadata, exposure count, and recent wrapper exposure pointers. It
-labels exposure as "surfaced" rather than "applied": the wrapper can prove an
-accepted lesson was matched and handed to a child prompt, but only later review,
-tests, or explicit evidence can prove the outcome followed it.
-
-**0.19.0 polish.** The `/dashboard` view now renders a **hierarchical
-team layout** — the operator-facing liaison (or a lead-ish role) on top,
-developer-ish roles grouped left, reviewer-ish right (classified from the
-roster's `role`/`operator_facing`, client-side) — with an **agent card**
-per member showing last-seen, **messages sent/received**, how many
-threads it **owes**, and a composing badge. Below the roster, a
-**who-talks-to-whom** conversation panel lists message traffic as
-directed `from → to (count)` pairs. A **Refresh** button pulls fresh
-state on demand and an **auto-refresh toggle** (on by default) turns the
-~2 s polling on/off without reloading the page. For automation,
-`/api/state` gains additive keys (`schema_version` stays `1`): per-agent
-`sent`/`received` and a per-root `edges` array (`{from,to,count}`, top
-50, with `edges_truncated`/`edge_limit` when capped). Stats are
-**bus-native only** — agenttalk never imports spec-kitty or reads token
-usage; it shows what the message store actually contains.
-
-### One window per agent (and the clock-agreement caveat)
-
-Two operating assumptions are worth stating plainly (0.18.0):
-
-- **One consumer per agent.** Each agent is meant to run in exactly one
-  consuming window per store. Cursor and threadstate file writes are atomic,
-  but their surrounding read-modify-write sequences are not cross-process
-  serialized. Duplicate consumers are **unsupported**: they can lose cursor or
-  threadstate updates, execute the same inbound work, and produce conflicting
-  replies before either advances state. 0.18.0 *warns* when
-  `agenttalk wait` detects another live process already waiting as the same
-  agent (advisory, best-effort — it never blocks and never changes the exit
-  code), and `agenttalk doctor` reports the current waiter's PID. It does
-  **not** enforce single-writer locking — the warning is a guardrail, not a
-  guarantee. Pass `--refuse-stacked-wait` to turn that warning into a hard
-  **exit 6** (refuse to arm a duplicate loop); a confirmed-dead waiter's
-  ghost marker is reaped at arm, and `wait` also warns when more than 8
-  live waiters share one store (leftover loops from old sessions). If a newer
-  scoped wait for the same request arms, the older scoped wait exits **6** with
-  `superseded` on stderr rather than later reporting a misleading timeout.
-  Wrapper-owned waiting markers also carry a unique generation token; an old
-  wrapper clears its marker only if the token still matches, so teardown cannot
-  erase a replacement wrapper's marker.
-- **Idle waiters back off.** `agenttalk wait` adaptively grows its poll
-  interval from `--interval` up to `--max-poll-interval` (default 2.0s)
-  while the bus is quiet, resetting to `--interval` the instant a message,
-  composing, or rescind lands — so an idle bus polls near-zero without
-  delaying a live reply by more than the cap. Set `--max-poll-interval`
-  `<=` `--interval` to disable (fixed-interval polling).
-- **Compaction bounds growth, and is lossy-by-design for *closed* history.**
-  `agenttalk compact` moves a safe prefix of old messages into the cold
-  `archived/compacted/` dir, which is **never read back** (same contract as
-  `reset --archive`). It is engineered to be safe for everything *live* —
-  it never archives a message unread by an active recipient, the epoch
-  barrier, any protected (non-closed) thread's messages, or invalid files,
-  so `current_epoch`, `threads`/`sync`, `wait`-on-rescind, and delivery are
-  byte-for-byte unchanged across a compaction. The deliberate trade-off is
-  the **retention boundary**: once an old *closed/resolved* request's
-  messages are cold-archived, that request is no longer derivable, so a
-  later `check --to-request <old-closed-id>` can return **unknown (exit 4)**
-  rather than reconstructing its historical verdict. This is safe and
-  fail-closed (unknown, never a wrong answer), but it is *not* byte-identical
-  history — compaction trades cold closed-thread history for a bounded live
-  store. Automatic compaction at `wait`-arm is **off by default**
-  (`compact.enabled=false`); when enabled it only fires above
-  `compact.trigger_threshold` live messages and is throttled by
-  `compact.min_interval_seconds`. Tune retention with `compact.keep_count`
-  (default 1000) and `compact.keep_age_days` (default 30); the manual
-  `agenttalk compact` command runs regardless of the enable flag.
-- **Synced stores assume clock agreement.** Message ids are
-  timestamp-prefixed and delivery order is a lexical compare of ids. If you
-  sync one `.agenttalk/` across machines whose clocks disagree, a
-  future-dated id from the fast machine can mis-order or hide later messages
-  from the slow one. 0.18.0 rejects malformed (wrong-shape) ids, but a
-  well-formed *future-dated* id from clock skew is not caught — keep the
-  machines' clocks in agreement (e.g. NTP).
-
-### Exit codes
-
-Stable across releases — skill bodies and external automation can
-rely on these:
+| `send` | Point-to-point message. `--kind`, `--to`, `--await-reply`. |
+| `reply` | Answer the latest (or a specific, via `--to-id`/`--to-request`) received message. `--na` for a non-substantive close. |
+| `broadcast` | Fan-out to `--to-group`/`--to-role`/`--all`; `--resume` recovers a partial fan-out. |
+| `wait` | Block for the next message. `--to-request` scopes to one thread; `--timeout 0` waits forever. |
+| `recv` / `drain` | Read without blocking; `drain` consumes everything currently queued. |
+| `threads` | List open request/reply obligations. |
+| `sync` | Roster + open threads + next-action digest for one agent. |
+| `ack` | Advance a cursor (global or `--to-request` scoped) without replying. |
+| `whoami` | Resolve identity from env/config. |
+| `tail` | Follow recent messages. |
+| `compact` | Archive a safe prefix of old messages into cold storage. |
+| `transcript` | Export the session so far as markdown. |
+| `end` | Close a session and write the transcript. |
+
+**Identity and roster**
+
+| Command | What it does |
+| --- | --- |
+| `roster add` | Add an agent (idempotent). `--role`, `--group`, `--unique` (refuse if the name is already live). |
+| `roster remove` / `retire` | `remove` is refused by default; `retire` tombstones permanently and keeps history valid. |
+| `roster rename` | Retire the old name, add the new one, carry over role/groups. |
+| `roster set-role` / `set-group` | Assign a free-form role label; define a group's membership. |
+| `roster set-operator-facing` | Designate the single agent the human talks to directly. `--clear` to unset. |
+| `roster set-trust-class` | Opt-in non-authority model trust metadata. |
+| `avatar` | Per-agent display avatar for the dashboard. |
+| `domain` | `{validate,list,show,check-path}` — read-only inspection of the ownership registry. |
+
+**Review and assurance**
+
+| Command | What it does |
+| --- | --- |
+| `gate {set,list,check,waive}` | Lightweight `HOLD`/`GO` assurance state; `check` exits 3 on an unwaived blocker. |
+| `close {open,ack,draft,counter,check,publish,reopen,list,show}` | Aggregates gates + typed review evidence into one milestone/release verdict. |
+| `close signoffs {plan,apply,override}` | Derives specialist sign-off routing by risk class. |
+| `check` | Pre-action HOLD/GO check, optionally `--gates`-aware. |
+| `lane {assign,check,deliver,status,approve-shared}` | Scoped deliver-gate: bounds a change against the domain registry and other active lanes. |
+| `onboarding {create,list,show,state,record}` | Durable first-pass ledger: segments, claims, drift, unknowns. |
+| `comprehension {scan,status,report,validate,prune}` | Offline static comprehension inventory (features, units) for one legacy repository; `pack` and the HTTP surface are planned, not yet built. |
+| `knowledge {publish,curate,pull,search,onboard}` | Durable pointer notes and lessons hung off the domain registry. |
+| `dev-gate` | Build + test evidence a `review-request`/`review-result` can point to: source and wheel, per Python minor, aggregated across CI legs. |
+
+A `review-request` (`send --kind review-request`) is an ordinary
+message with `base_sha`/`head_sha` meta and a body naming what changed,
+how to verify, and where to focus. A `review-result` with `--meta
+status=approved` must carry typed evidence: `risk_class`,
+`release_blocker`, `tests_referenced`, `tests_executed`,
+`evidence`/`artifacts`, and `residual_risk` (or `na_reason` for any
+field that's `n/a`). `close ack --status accept` reuses that same
+typed-evidence shape at the milestone level.
+
+**Operator-facing and safety**
+
+| Command | What it does |
+| --- | --- |
+| `escalate` | Route a question to the operator-facing liaison. |
+| `attention` | Operator attention queue. |
+| `rescind` | Supersede a request so a stale answer can't quietly close it. |
+| `barrier` | Epoch barrier operations. |
+| `relay` | Relay between agents/liaison. |
+| `prune` | Housekeeping over stale state. |
+| `release` | Stand an agent (or group/all) down, with a required `-m` reason; `--relay-human` vs `--emergency`. |
+
+**Lifecycle and unattended operation**
+
+| Command | What it does |
+| --- | --- |
+| `wrap` | Structured-stream adapter around a CLI child: visibility, working-turn heartbeat, degraded-output detection. `--loop` for supervised long-running mode, `--one-shot` for a single turn. |
+| `supervisor` | Read-only status over the supervisor's own state file. |
+| `supervise` | Scaffold (`--init`), preflight (`--bootstrap-check`), and script-refresh (`--refresh-scripts`) operations for the external monitor. |
+| `dead-letter {list,show,requeue,resolve,purge}` | Messages that exhausted automatic retry. |
+| `managed-lead-loop {set,clear,list}` | Configure which identities may run the leased lead-loop controller. |
+| `deadman` | Threshold check for unresponsive agents. |
+| `checkpoint {save,resume,show}` | Capture/restore context headroom, git state, and actionable threads across a compaction. |
+| `heartbeat` | Stamp liveness; `--hook` mode never blocks a tool call. |
+| `request-restart` | Bounce one agent on demand; resumes its session. |
+| `request-launch` | Request a fresh ephemeral agent for a profile/skill/revision. |
+| `commit-gate {status,reset}` | Per-agent breaker state and authenticated reset. |
+
+**Workspace hygiene and setup**
+
+| Command | What it does |
+| --- | --- |
+| `init` | `--here`/`--path`, `--agents`, `--force` (config only, not messages). |
+| `scratch root` | Resolve/create `<scratch_root>/<agent>[/<task>]`. |
+| `janitor` | Report (default) or `--apply` cleanup: WIP-commits dirty **registered worktrees** on their own branch (never the default branch, never a detached HEAD), removes allow-listed scratch paths, and prunes stale worktree registrations; `--keep-days`. |
+| `doctor` | Health check; `--json` for automation. |
+| `reset` | Clear active bus state; `--archive` preserves it instead of deleting. |
+| `capacity {show,refresh}` | Publish/read context-window budget so a team can see who's near compaction. |
+| `codex-config` | `--enable`/`--disable`/`--status` for Codex sandbox approval settings. |
+| `install-skills` | Install bus skills (and the dev-discipline devkit) for Claude and/or Codex. |
+| `hmac-init` | Provision HMAC signing material. |
+| `gateway` | `{init,start,stop,status,...}` — multi-agent process gateway lifecycle. |
+
+**Dashboards**
+
+| Command | What it does |
+| --- | --- |
+| `serve` | Single-project read-only web view. Loopback-only (`127.0.0.1`/`::1`/`localhost`); no flag exposes it beyond that. |
+| `dashboard` | Same server, multi-root obligation view under `/dashboard`. `--store` is repeatable. |
+
+### Messaging-system internals
+
+- **No daemon.** The bus is files under `.agenttalk/`; nothing has to
+  stay running for messages to persist.
+- **One JSON file per message**, prepared and atomically published
+  under a store lock, so writers never race on a single message.
+- **Global cursor plus per-thread state.** Reading the plain inbox
+  advances a global cursor; a scoped `wait --to-request` advances only
+  that thread's own `seen_msg_id`, so working one request doesn't
+  consume unrelated traffic.
+- **Polling, not watchers.** `wait` polls at `--interval` (default
+  0.3s) and backs off adaptively up to `--max-poll-interval` while the
+  bus is idle, resetting the instant new activity lands.
+- **Both terminals show both halves.** `send` prints to the sender's
+  stdout; the receiver's `wait` prints the same message on the other
+  side. `.agenttalk/messages/` is the durable source of truth either
+  way.
+- **No transport.** Both agents are expected to share one project
+  directory on one machine (or a directory synced by a mechanism you
+  already trust) — there's no server process bridging machines.
+
+### Windows notes
+
+- The supervisor requires **PowerShell Core 7+** (7.4+ recommended;
+  7.0–7.3 runs with an end-of-life warning; Windows PowerShell 5.1 is
+  refused). Select a specific `pwsh.exe` explicitly with `agenttalk
+  supervise --select-pwsh --pwsh "<absolute path>"` if you need a
+  portable or nonstandard host.
+- Inline `-m "..."` bodies are fragile for multi-line text,
+  apostrophes, backslashes, and Windows paths. Prefer `--file <path>`,
+  or pipe a PowerShell here-string to `--file -`, for `send`, `reply`,
+  `propose`, and `broadcast` bodies.
+- Supervised agents launch hidden by default on Windows so an
+  unattended fleet doesn't open one console per agent. Set
+  `"window_style": "minimized"` or `"normal"` in `supervisor.json`
+  (top-level or per-agent) to change that.
+
+### FAQ
+
+**Why did my env var not take effect in the next tool call?**
+Env vars set *inside* an LLM tool call (for example `$env:AGENTTALK_SELF
+= 'claude-a'` in one PowerShell call) may not persist into the next
+tool call, since each call can be a fresh shell process. Set env vars
+in the parent shell/profile instead, or pass explicit
+`--from`/`--to`/`--for` flags. The bundled skills already resolve
+identity inside each tool call, so this mostly matters for
+hand-rolled automation.
+
+**Can two windows listen as the same agent?**
+Not supported. Each agent is meant to run in exactly one consuming
+window per store; a duplicate can lose cursor/thread-state updates or
+produce conflicting replies. `wait` warns (advisory, never blocking)
+when it detects a live duplicate waiter, and `agenttalk doctor` reports
+the current waiter's PID. Pass `--refuse-stacked-wait` to make that a
+hard exit 6 instead of a warning.
+
+**Does compaction lose history?**
+`agenttalk compact` never archives anything unread, protected, or
+still-open — live state is byte-for-byte unaffected. What it does
+trade away is *closed* thread history: once an old, resolved request's
+messages are cold-archived, `check --to-request <that-id>` can return
+unknown (exit 4) rather than reconstructing the old verdict. That's a
+deliberate, fail-closed boundary (unknown, never wrong), not silent
+data loss.
+
+**What happens if two machines' clocks disagree?**
+Message ids are timestamp-prefixed and delivery order is a lexical
+compare of ids. A well-formed but future-dated id from a fast machine's
+clock skew can mis-order or hide later messages from a slower one.
+Keep synced machines' clocks in agreement (NTP) if you sync one
+`.agenttalk/` store across machines.
+
+**Exit codes** (stable across releases — safe for skills and external
+automation to depend on):
 
 | Code | Meaning |
 | --- | --- |
 | `0` | Success. For `wait`: a message was received. |
-| `1` | Reserved for `agenttalk wait` timeout (no new messages within `--timeout`). Loop skills should treat this as "keep waiting", not as an error. |
-| `2` | Usage error: missing/invalid identity (`--from`/`--to`/`--for` or `AGENTTALK_SELF`/`AGENTTALK_PEER`), unsafe agent name, identity not in roster, self-mail attempt, malformed `--meta`, corrupt config, missing `.agenttalk/`. 0.17.0: also a `serve`/`dashboard` bind failure (port in use / OS-denied) — with a `--port 0` remediation hint. Always prints a remediation hint to stderr. |
-| `5` | Partial broadcast fan-out: some copies written, some failed (see the delivered/missed manifest; `--resume`). 0.18.0: a frozen recipient retired *after* a partial fan-out is reported under `dropped` and skipped — it no longer traps `--resume` at a permanent exit 5; an all-retired remainder resolves to exit 0. |
-| `6` | `agenttalk wait` duplicate-wait class: `--refuse-stacked-wait` refused to stack on a live mailbox owner, or an older scoped wait was superseded by a newer same-thread waiter. Superseded waits print a stderr diagnostic and do not consume messages, advance cursors, or mark the thread seen. |
+| `1` | `wait` timeout — treat as "keep waiting," not an error. A few other commands also return `1` for a not-found/blocked case (e.g. `attention show` on an unknown item, `checkpoint show` with no checkpoint, `wrap` on a config-blocked launch) or an uncaught error — check the command's own output to tell those apart from a `wait` timeout. |
+| `2` | Usage error: bad/missing identity, unsafe name, corrupt config, missing `.agenttalk/`, or a `serve`/`dashboard` bind failure. |
+| `3` | The request was superseded/rescinded, or `close`/`gate`/`lane` check is `HOLD`. |
+| `4` | Unknown request id (`check`). |
+| `5` | Partial broadcast fan-out — see the delivered/missed manifest, or `--resume`. |
+| `6` | `wait` duplicate-wait class: `--refuse-stacked-wait` refusal, or superseded by a newer same-thread waiter. |
 | `130` | `SIGINT` (Ctrl-C). |
 
----
+### Versioning and releases
 
+agenttalk follows [Semantic Versioning](https://semver.org/) and keeps
+a [Keep a Changelog](https://keepachangelog.com/)-formatted
+`CHANGELOG.md`. Install a specific tag (`@v0.87.0`, or whatever the
+current release is) rather than a branch, since the CLI surface and
+message schema can change between releases. `agenttalk dev-gate
+--profile release` is the release-evidence gate itself: it builds the
+package, runs tests against both source and the built wheel per
+supported Python minor, and (via `--ci-leg`/`--aggregate`) combines
+per-CI-leg evidence into one authoritative verdict that `close`/`gate`
+can consume.
 
-0.14.0 additions: **3** = the request was superseded/rescinded
-(`check`, and a scoped `wait --to-request` waking on a rescind);
-**4** = unknown request id (`check`); **5** = PARTIAL broadcast fan-out (0.15.0 — some copies written, some failed; see the delivered/missed manifest); **6** = `wait` duplicate-wait class (`--refuse-stacked-wait` or superseded same-thread waiter). Exit 1 remains *exclusively* the
-`wait` timeout; 2 remains usage/refusal.
+### Further reading
 
-## How terminals see messages
+This reference deliberately stays shallow. For more:
 
-Each `send` writes the message file **and** prints the rendered message
-to the sender's stdout. The receiver's `wait` (running in another
-terminal) picks up the same file and prints it on that side. So both
-terminals show both halves of the exchange - and the full conversation
-is on disk in `.agenttalk/messages/` as the source of truth.
-
-Broadcast is fan-out, not a shared channel. `agenttalk broadcast`
-writes one ordinary message per recipient, all with the same
-`broadcast_id` / `request_id`. Broadcast does not alter per-agent
-cursors; recipients read it through the same global or scoped wait
-paths as any other addressed message.
-
-The transcript exporter walks `messages/` in id order (which is
-chronological) and renders it as markdown.
-
----
-
-## Design notes
-
-- **No daemon.** Just files. Survives reboots, terminal crashes, agent
-  restarts.
-- **Message publication avoids append contention.** One JSON file per message
-  is prepared and atomically published under the cooperating store lock.
-  Append-only ledgers are separate JSONL surfaces: their owning modules
-  serialize appends, fsync complete records, and readers isolate a malformed
-  physical line without hiding later valid events.
-- **Global cursor plus per-thread state.** Plain inbox reading lists
-  messages newer than the agent's global cursor; global ack moves that
-  cursor. Scoped waits use additive per-thread `seen_msg_id` /
-  `closed` state so an agent can work one request without consuming
-  unrelated inbox traffic.
-- **Polling, not watchers.** `wait` polls every 0.3s. Good enough for
-  human-paced agent collaboration, works identically on Windows and
-  POSIX, no extra dependencies.
-- **No transport assumptions.** Both agents must run on the same machine
-  (or share the project directory via any sync mechanism you already
-  trust). That's the deliberate constraint that keeps the design tiny.
-
----
-
-## When to ask the human
-
-The listen-loop skill instructs each agent to stop and ask the human if
-it hits something it can't decide alone (ambiguous review feedback,
-unexpected test failure, scope creep). The human can also send a message
-into the bus manually:
-
-```powershell
-agenttalk send --from human --to claude -m "stop, I want to change the spec"
-```
-
-`human` is not in the default agent roster — add it at init time with
-`--agents claude,codex,human` if you want this.
+- [docs/AGENTTALK-NEW-USER-MANUAL.md](docs/AGENTTALK-NEW-USER-MANUAL.md) — concept-first onboarding.
+- [docs/USER-MANUAL.md](docs/USER-MANUAL.md) — operator-facing procedures and examples.
+- [docs/AGENT-MANUAL.md](docs/AGENT-MANUAL.md) — role-keyed operating guide for agents.
+- [docs/DESIGN.md](docs/DESIGN.md) — architecture, rationale, and decision history.
+- [docs/ASSURANCE.md](docs/ASSURANCE.md) — release attestation and gate evidence in depth.
+- [docs/supervisor-tutorial.md](docs/supervisor-tutorial.md) — full supervisor/wrapper walkthrough, including migrating an existing project in and out of supervision.
+- [CHANGELOG.md](CHANGELOG.md) — release history.
+- [SECURITY.md](SECURITY.md) — security posture and trust model.
+- [docs/README-ARCHIVE-2026-09.md](docs/README-ARCHIVE-2026-09.md) — the pre-rewrite README, kept for reference (superseded, not maintained).
