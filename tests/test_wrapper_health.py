@@ -437,6 +437,60 @@ def test_health_writer_parked_surfaces_blocked_state_with_resolved_request_id(
     assert raw["msg_id"] == "20990101-000000-000000-HEAL"
 
 
+def test_health_writer_idle_surfaces_unresolved_reply_refusal(tmp_path: Path) -> None:
+    # #162: an idle seat sitting on an unresolved refused reply must not read as
+    # a plain "idle_waiting" - a disk check on every idle tick (not a value
+    # threaded synchronously through the turn that produced it), so this
+    # catches the refusal on ANY later poll, regardless of which internal
+    # commit path handled the original turn.
+    from agenttalk import reply_refusals
+    from agenttalk.wrapper.health import WrapperHealthWriter
+
+    s = _store(tmp_path)
+    w = WrapperHealthWriter(s, "beta", "claude", mode="wrapper-loop")
+    w.idle()
+    assert s.read_health("beta", ttl_seconds=999999)["reason_code"] == "idle_waiting"
+
+    reply_refusals.record_reply_refusal(
+        s, agent="beta", original_message_id="20990101-000000-000000-RFSD",
+        original_from="alpha", intended_kind="message",
+        reason="OSError: publication lock timeout",
+        draft_path=str(tmp_path / "draft.refused.md"),
+        correlation={"request_id": "q-162"}, at=hm.now_iso(),
+    )
+    w.idle()
+    view = s.read_health("beta", ttl_seconds=999999)
+    assert view["reason_code"] == "reply_refused"
+    assert view["state"] == hm.STATE_IDLE_WAITING   # still an idle STATE, just a distinct reason
+
+    # Resolving the refusal clears the override - back to the plain default.
+    reply_refusals.resolve_reply_refusal(
+        s, "beta", "20990101-000000-000000-RFSD", reason="requeued by hand",
+        sender="alpha", at=hm.now_iso(),
+    )
+    w.idle()
+    assert s.read_health("beta", ttl_seconds=999999)["reason_code"] == "idle_waiting"
+
+
+def test_health_writer_idle_explicit_reason_code_is_never_clobbered(tmp_path: Path) -> None:
+    # #162: the disk check only overrides the DEFAULT "idle_waiting" - an
+    # explicit caller-supplied reason_code must pass through unchanged even
+    # with an unresolved refusal sitting in the sink.
+    from agenttalk import reply_refusals
+    from agenttalk.wrapper.health import WrapperHealthWriter
+
+    s = _store(tmp_path)
+    reply_refusals.record_reply_refusal(
+        s, agent="beta", original_message_id="20990101-000000-000000-RFS2",
+        original_from="alpha", intended_kind="message", reason="boom",
+        draft_path=str(tmp_path / "draft2.refused.md"),
+        correlation={}, at=hm.now_iso(),
+    )
+    w = WrapperHealthWriter(s, "beta", "claude", mode="wrapper-loop")
+    w.idle(reason_code="turn_spawned")
+    assert s.read_health("beta", ttl_seconds=999999)["reason_code"] == "turn_spawned"
+
+
 def test_health_json_never_contains_message_or_output_content(tmp_path: Path) -> None:
     s = _store(tmp_path)
     secret = "SECRET_HEALTH_LEAK_74f78b"  # gitleaks:allow

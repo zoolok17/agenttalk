@@ -104,7 +104,29 @@ class WrapperHealthWriter:
     def idle(self, *, reason_code: str = "idle_waiting") -> None:
         self._request_id = None
         self._msg_id = None
+        if reason_code == "idle_waiting" and self._has_unresolved_reply_refusal():
+            # #162: an idle seat sitting on an UNRESOLVED refused reply is not
+            # the same signal as a genuinely quiet idle seat - a disk check
+            # (not a value threaded synchronously through the turn that
+            # produced it) so this catches the refusal on EVERY idle tick
+            # that follows, regardless of which internal commit path handled
+            # that turn or how many polls separate the two events. Only
+            # overrides the DEFAULT reason - an explicit caller-supplied
+            # reason_code (e.g. "turn_spawned") is never clobbered.
+            reason_code = "reply_refused"
         self._write(health_model.STATE_IDLE_WAITING, reason_code=reason_code, force=True)
+
+    def _has_unresolved_reply_refusal(self) -> bool:
+        try:
+            from agenttalk import reply_refusals
+            for item in reply_refusals.list_reply_refusals(self.store, self.agent):
+                mid = item.get("original_message_id")
+                if isinstance(mid, str) and not reply_refusals.is_resolved(
+                        self.store, self.agent, mid):
+                    return True
+        except Exception:  # noqa: BLE001 - advisory health must not crash the wrapper
+            return False
+        return False
 
     def turn_start(self, record: dict[str, Any] | None) -> None:
         record = record if isinstance(record, dict) else {}

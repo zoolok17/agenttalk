@@ -414,6 +414,123 @@ def test_loop_idle_stamps_heartbeat(tmp_path) -> None:
     assert s.read_heartbeat("beta") is not None   # idle kept the heartbeat fresh
 
 
+# --------------------------------------------- #162: refused reply -> visible health, not silent
+
+def test_refused_reply_draft_commits_the_turn_but_records_the_refusal(
+    tmp_path, monkeypatch,
+) -> None:
+    # #162: a wrapper-refused reply draft must NOT change the turn's own outcome
+    # (freeform replies are not obligatory - the inbound message was still
+    # handled) - same observable turn-commit behavior as before #162 on this
+    # axis. What DOES change: _deliver_reply_draft returns the reason_code
+    # ("reply_refused") instead of always None, and a queryable sink record
+    # exists afterward (WrapperHealthWriter.idle's own disk check, covered in
+    # test_wrapper_health.py, is what turns this into a visible health signal
+    # on the NEXT idle tick - not synchronous within this same turn, since the
+    # legacy/no-commit-gate commit path this test exercises doesn't call
+    # on_health_idle again until the loop goes idle).
+    s = _store(tmp_path)
+    s.set_role("alpha", "lead")  # so the notification has somewhere to route
+    m = s.send(sender="alpha", recipient="beta", kind="question", body="q?")
+
+    def boom(**kwargs):
+        raise OSError("publication lock timeout")
+
+    monkeypatch.setattr(s, "send_operation", boom)
+
+    def drive(rec):
+        Path(rec["reply_draft"]["path"]).write_text("good answer", encoding="utf-8")
+        return True  # the TURN itself succeeded - only the draft publish failed
+
+    turns = loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                          max_turns=1)
+    # The turn committed normally - a refused FREEFORM reply is not a turn
+    # failure. Same observable outcome as before #162 on this axis.
+    assert turns == 1
+    assert s.cursor("beta") == m.id
+    # The refusal is queryable, not silently lost.
+    from agenttalk import reply_refusals
+    items = reply_refusals.list_reply_refusals(s, "beta")
+    assert len(items) == 1
+    assert items[0]["original_message_id"] == m.id
+    assert not reply_refusals.is_resolved(s, "beta", m.id)
+
+
+def test_deliver_reply_draft_returns_the_reason_code_directly(
+    tmp_path, monkeypatch,
+) -> None:
+    # #162: _deliver_reply_draft's own return value, unit-level (no full loop
+    # poll/turn-counting semantics in the way).
+    s = _store(tmp_path)
+    s.set_role("alpha", "lead")
+    m = s.send(sender="alpha", recipient="beta", kind="question", body="q?")
+
+    def boom(**kwargs):
+        raise OSError("publication lock timeout")
+
+    monkeypatch.setattr(s, "send_operation", boom)
+    record = loop._with_reply_draft(
+        s, "beta", {"id": m.id, "from": "alpha", "kind": "question", "meta": {}})
+    Path(record["reply_draft"]["path"]).write_text("good answer", encoding="utf-8")
+    reason_code = loop._deliver_reply_draft(s, "beta", record)
+    assert reason_code == "reply_refused"
+
+
+def test_refused_reply_draft_notifies_the_lead(tmp_path, monkeypatch) -> None:
+    # #162: the notification is sent AS THE AFFECTED SEAT, addressed to the
+    # LEAD always (never the original intended recipient, who has no context
+    # to act on it), carrying the reason, the draft path and the original
+    # correlation id.
+    s = _store(tmp_path)
+    s.set_role("alpha", "lead")
+    m = s.send(sender="alpha", recipient="beta", kind="question", body="q?",
+               meta={"request_id": "q-162"})
+
+    def boom(**kwargs):
+        raise OSError("publication lock timeout")
+
+    monkeypatch.setattr(s, "send_operation", boom)
+
+    def drive(rec):
+        Path(rec["reply_draft"]["path"]).write_text("good answer", encoding="utf-8")
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1)
+    notices = [msg for msg in s.messages_for("alpha") if msg.sender == "beta"]
+    assert len(notices) == 1
+    notice = notices[0]
+    assert notice.meta.get("reply_refusal") == "true"
+    assert notice.meta.get("needs_operator") == "true"
+    assert notice.meta.get("rr_original_message_id") == m.id
+    assert notice.meta.get("rr_correlation_request_id") == "q-162"
+    assert "publication lock timeout" in notice.body
+    assert m.id in notice.body
+
+
+def test_refused_reply_draft_does_not_notify_itself(tmp_path, monkeypatch) -> None:
+    # #162: if the refusing seat is ALSO the only resolvable lead, the notice
+    # cannot route to itself (mirrors _dead_letter_notifier's own guard) - no
+    # message is sent; doctor's own reply-refusal check surfaces this LOUD
+    # instead (covered in test_doctor.py), never a silent self-notice.
+    s = _store(tmp_path)
+    s.set_role("beta", "lead")  # beta is both the refusing seat and the sole lead
+    s.send(sender="alpha", recipient="beta", kind="question", body="q?")
+
+    def boom(**kwargs):
+        raise OSError("publication lock timeout")
+
+    monkeypatch.setattr(s, "send_operation", boom)
+
+    def drive(rec):
+        Path(rec["reply_draft"]["path"]).write_text("good answer", encoding="utf-8")
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1)
+    assert [msg for msg in s.messages_for("alpha") if msg.sender == "beta"] == []
+
+
 # ------------------------------------------- #58: config-blocked park visibility + re-probe
 
 def _config_blocked_drive():
