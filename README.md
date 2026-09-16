@@ -714,8 +714,9 @@ command for the full set.
 
 | Command | What it does |
 | --- | --- |
-| `send` | Point-to-point message. `--kind`, `--to`, `--await-reply`. |
-| `reply` | Answer the latest (or a specific, via `--to-id`/`--to-request`) received message. `--na` for a non-substantive close. |
+| `send` | Point-to-point message. `--kind`, `--to`, `--await-reply`. `--kind task`/`rescind`/`end` are refused here — use their dedicated commands. |
+| `task` | A lead work order (#163). Gated at write time: sender must be the roster's sole `role=lead` or its `operator_facing` liaison (live config, not the caller's claim); refuses if any other roster member's last-advertised version predates task-kind support unless `--force`. Recipient replies `reply --kind task-response --meta status=accepted\|declined\|done`. |
+| `reply` | Answer the latest (or a specific, via `--to-id`/`--to-request`) received message. `--na` for a non-substantive close (rejected on `review-request`/`proposal`/`task` threads, which need a typed response). |
 | `broadcast` | Fan-out to `--to-group`/`--to-role`/`--all`; `--resume` recovers a partial fan-out. |
 | `wait` | Block for the next message. `--to-request` scopes to one thread; `--timeout 0` waits forever. |
 | `recv` / `drain` | Read without blocking; `drain` consumes everything currently queued. |

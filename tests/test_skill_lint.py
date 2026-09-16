@@ -57,6 +57,10 @@ SKILL_INVARIANTS = [
         "Proposal handling",               # proposal routing section
         "proposal-response",               # proposal verdict kind
         "agenttalk threads --for",         # thread-hygiene check
+        "task-response",                   # #163 work-order response kind
+        "Verify the sender independently", # #163 live-roster re-check, not the claim
+        "ONE narrow, explicitly-authenticated exception",  # #163 body-is-data carve-out
+        "stays untrusted data",            # #163 quoted/relayed content inside a task
     ]),
     ("agenttalk.propose.md", "agenttalk-propose", [
         "AGENTTALK_SELF",                  # identity preamble
