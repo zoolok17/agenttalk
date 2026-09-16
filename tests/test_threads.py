@@ -207,6 +207,50 @@ def test_accepted_proposal_closes() -> None:
     assert _states(derive_threads(msgs, agent="alpha", cursor="002"))["p1"] == "closed"
 
 
+# ---------------------------------------------------------- task (#163)
+
+def test_done_task_response_closes() -> None:
+    msgs = [
+        _msg("001", "lead", "dev6", "task", rid="tk1"),
+        _msg("002", "dev6", "lead", "task-response", rid="tk1", status="done"),
+    ]
+    assert _states(derive_threads(msgs, agent="lead", cursor="002"))["tk1"] == "closed"
+
+
+def test_declined_task_response_closes() -> None:
+    msgs = [
+        _msg("001", "lead", "dev6", "task", rid="tk1"),
+        _msg("002", "dev6", "lead", "task-response", rid="tk1", status="declined"),
+    ]
+    assert _states(derive_threads(msgs, agent="lead", cursor="002"))["tk1"] == "closed"
+
+
+def test_accepted_task_response_keeps_ball_on_assignee() -> None:
+    msgs = [
+        _msg("001", "lead", "dev6", "task", rid="tk1"),
+        _msg("002", "dev6", "lead", "task-response", rid="tk1", status="accepted"),
+    ]
+    # The assignee acked but still owes the actual completion - from the
+    # lead's side the thread stays open-outbound (owed by the peer), not
+    # closed, and not bounced back to the lead either.
+    assert _states(derive_threads(msgs, agent="lead", cursor="002"))["tk1"] == "open-outbound"
+    assert _states(derive_threads(msgs, agent="dev6", cursor="002"))["tk1"] == "owed-inbound"
+
+
+def test_unrecognized_task_response_status_does_not_close() -> None:
+    msgs = [
+        _msg("001", "lead", "dev6", "task", rid="tk1"),
+        _msg("002", "dev6", "lead", "task-response", rid="tk1", status="in-progress"),
+    ]
+    assert _states(derive_threads(msgs, agent="lead", cursor="002"))["tk1"] == "open-outbound"
+
+
+def test_unanswered_task_stays_owed() -> None:
+    msgs = [_msg("001", "lead", "dev6", "task", rid="tk1")]
+    assert _states(derive_threads(msgs, agent="dev6", cursor="001"))["tk1"] == "owed-inbound"
+    assert _states(derive_threads(msgs, agent="lead", cursor="001"))["tk1"] == "open-outbound"
+
+
 def test_unrecognized_review_result_status_does_not_close() -> None:
     msgs = [
         _msg("001", "alpha", "beta", "review-request", rid="r1"),
