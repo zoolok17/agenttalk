@@ -166,6 +166,36 @@ def preserve_refused_draft(draft_path: Path) -> Path | None:
     return target
 
 
+def refused_reason_path(draft_path: Path) -> Path:
+    """The observable sidecar path for a refused draft's reason (#162).
+
+    Derived from the LIVE draft path (before any rename), same convention as
+    :func:`preserve_refused_draft` - both are simple ``with_suffix`` siblings of
+    the original ``<id>.md``, so writing this sidecar never collides with the
+    live draft and needs no ordering relative to the rename.
+    """
+    return draft_path.with_suffix(".refused.reason.txt")
+
+
+def write_refused_reason(draft_path: Path, reason: str) -> Path | None:
+    """Best-effort write of the refusal reason beside the draft (#162).
+
+    Called BEFORE the draft is renamed to ``.refused.md`` - the reason sidecar
+    and the preserved draft are independent siblings of the same original
+    stem, so this can run in either order relative to
+    :func:`preserve_refused_draft`. Never raises: a failure to record the
+    reason must not turn a refusal into a crash - the ``.refused.md`` file
+    (with no explanation) is still strictly better than nothing, matching
+    this module's existing never-raise convention throughout.
+    """
+    target = refused_reason_path(draft_path)
+    try:
+        target.write_text(reason, encoding="utf-8")
+    except OSError:
+        return None
+    return target
+
+
 def preserve_interrupted_draft(draft_path: Path) -> Path | None:
     """Rename an interrupted attempt's leftover draft to ``.interrupted.md``.
 
@@ -207,6 +237,26 @@ def read_reply_draft(draft_path: Path) -> str | None:
     return body
 
 
+def _classify_unreadable_draft(draft_path: Path) -> str:
+    """Diagnostic-only re-derivation of which :func:`read_reply_draft` check
+    failed (#162) - never the source of truth for behavior, only for the
+    refusal-reason sidecar text. Order matches ``read_reply_draft`` exactly."""
+    try:
+        if draft_path.is_symlink():
+            return "draft path is a symlink, not a plain file"
+        if not draft_path.is_file():
+            return "draft path is not a regular file"
+        size = draft_path.stat().st_size
+        if size > MAX_DRAFT_BYTES:
+            return f"draft is {size} bytes, over the {MAX_DRAFT_BYTES}-byte bound"
+        body = draft_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError, ValueError) as e:
+        return f"draft unreadable: {type(e).__name__}: {e}"
+    if not body.strip():
+        return "draft is empty (whitespace-only)"
+    return "draft was readable - refusal reason undetermined"  # pragma: no cover - defensive
+
+
 def deliver_draft_reply(
     store: "Store",
     *,
@@ -229,6 +279,14 @@ def deliver_draft_reply(
         return None
     body = read_reply_draft(draft_path)
     if body is None:
+        # #162: a malformed record (checked above) is not a draft refusal - no
+        # draft was ever declared to have failed. An unreadable/invalid DRAFT
+        # (the only way execution reaches here with draft_path meaningful) is,
+        # so it earns a reason - re-derive WHICH read_reply_draft check failed
+        # for the sidecar text; read_reply_draft's own contract (a bare body-or-
+        # None) is untouched, this is diagnostic-only and never changes behavior.
+        if draft_path.exists():
+            write_refused_reason(draft_path, _classify_unreadable_draft(draft_path))
         return None
     kind = "message"
     record_meta = record.get("meta") if isinstance(record.get("meta"), dict) else {}
@@ -260,12 +318,15 @@ def deliver_draft_reply(
             operation_nonce=nonce,
             operation_digest=digest,
         )
-    except Exception:  # noqa: BLE001 - refusal contract: the caller preserves
+    except Exception as e:  # noqa: BLE001 - refusal contract: the caller preserves
         # ValueError (nonce/validator) AND operational failures (publication
         # lock timeout, I/O): returning None routes ALL of them into the
         # caller's observable refused-draft preservation instead of a silent
         # drop. In-process durable retry of publish failures is PR-2 scope
-        # (the captured-operation machinery).
+        # (the captured-operation machinery). #162: the reason is no longer
+        # discarded here - write it beside the draft BEFORE returning, so the
+        # caller's rename-to-.refused.md never races an unwritten sidecar.
+        write_refused_reason(draft_path, f"{type(e).__name__}: {e}")
         return None
     try:
         draft_path.unlink(missing_ok=True)
