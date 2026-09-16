@@ -2231,6 +2231,208 @@ def test_make_drive_classifies_failures_for_dead_letter(tmp_path) -> None:
     assert o_denied.ok is False and o_denied.failure_class == loop.CLASS_CONFIG_BLOCKED
 
 
+# ------------------- #145: rate-limit spawn/never-started failures survive as CLASS_INFRA
+
+def test_make_drive_raw_spawn_rate_limit_text_classifies_infra(tmp_path) -> None:
+    # #145 item (1): the RAW spawn-time OSError path (no JSON ever parsed, so no
+    # structured fact can exist even in principle) must recognize a rate-limit-
+    # flavored exception message and classify CLASS_INFRA, symmetric with the
+    # mid-stream ADAPTER_ERROR path's structured-fact handling above.
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+
+    def _boom(a, i):
+        raise OSError("spawn failed: 429 too many requests, usage limit reached")
+
+    drive = run.make_drive(_store(tmp_path), "beta", "claude",
+                           session.SessionState(cli="claude", claude_session_id="s1"),
+                           ["claude"], spawn=_boom, clock=lambda: 0.0, render=False)
+    o = drive(rec)
+    assert o.ok is False and o.failure_class == loop.CLASS_INFRA, o.summary
+
+
+def test_make_drive_raw_spawn_non_rate_limit_error_stays_config_blocked_or_ambiguous(
+    tmp_path,
+) -> None:
+    # #145 regression guard: a raw spawn OSError with NO rate-limit vocabulary must
+    # NOT be swept into CLASS_INFRA - genuinely fatal spawn errors keep their existing
+    # classification untouched (config_blocked for a recognized cause; here, a
+    # deliberately unrecognized one stays ambiguous, exactly as before this fix).
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+
+    def _boom(a, i):
+        raise OSError("some unrelated local I/O failure")
+
+    drive = run.make_drive(_store(tmp_path), "beta", "claude",
+                           session.SessionState(cli="claude", claude_session_id="s1"),
+                           ["claude"], spawn=_boom, clock=lambda: 0.0, render=False)
+    o = drive(rec)
+    assert o.ok is False and o.failure_class == loop.CLASS_AMBIGUOUS, o.summary
+
+
+def test_make_drive_near_instant_exit_with_rate_limit_prose_classifies_infra(
+    tmp_path,
+) -> None:
+    # #145 item (2): the wrap-loop-survival incidents' actual shape - the child
+    # exits in well under a second, printing PLAIN PROSE (not JSON) before any
+    # adapter ever runs, so sig["started"] is False and no structured fact can
+    # ever form. reviewer-3's scrutiny: this prose is captured today via
+    # _run_one's own discarded-output-tail mechanism (stderr is merged into
+    # stdout by _ProcStream, and non-JSON lines are captured with
+    # discarded=True) - it just was never FED to the classifier. This proves it
+    # now reaches the classifier and CLASS_INFRA, not the generic "never
+    # started" ambiguous class.
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    drive = run.make_drive(
+        _store(tmp_path), "beta", "claude",
+        session.SessionState(cli="claude", claude_session_id="s1"),
+        ["claude"],
+        spawn=lambda a, i: ["Claude AI usage limit reached. Your limit will reset "
+                            "at 3pm (America/Los_Angeles)."],
+        clock=lambda: 0.0, render=False,
+    )
+    o = drive(rec)
+    assert o.ok is False and o.failure_class == loop.CLASS_INFRA, o.summary
+    assert not o.summary.startswith(loop.NEVER_STARTED_SUMMARY_PREFIX)
+
+
+def test_make_drive_near_instant_exit_without_rate_limit_text_keeps_205_guard(
+    tmp_path,
+) -> None:
+    # #145 item (4): the #205 "second consecutive never-started promotes to
+    # CLASS_CONFIG_BLOCKED" guard must NOT loosen for a genuinely unrecognized
+    # near-instant exit (no rate-limit vocabulary anywhere) - it keeps producing
+    # the exact CLASS_AMBIGUOUS + NEVER_STARTED_SUMMARY_PREFIX signature the loop's
+    # own promotion logic (_is_never_started_failure) matches on.
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    drive = run.make_drive(
+        _store(tmp_path), "beta", "claude",
+        session.SessionState(cli="claude", claude_session_id="s1"),
+        ["claude"],
+        spawn=lambda a, i: ["some unrecognized diagnostic banner, no JSON at all"],
+        clock=lambda: 0.0, render=False,
+    )
+    o = drive(rec)
+    assert o.ok is False and o.failure_class == loop.CLASS_AMBIGUOUS
+    assert o.summary.startswith(loop.NEVER_STARTED_SUMMARY_PREFIX)
+    assert loop._is_never_started_failure(o.failure_class, o.summary)
+
+
+def test_make_drive_mid_session_claude_rate_limit_event_reaches_infra(tmp_path) -> None:
+    # #145 item (3): the 7m53s mid-session incident shape - the child DID start
+    # (sig["started"] is True) before a rate-limit signal ends the turn. reviewer-3's
+    # own expectation: a genuine Claude rate_limit_event (structured, retryable)
+    # already reaches CLASS_INFRA through the EXISTING structured branch - proven
+    # here, unchanged by this fix.
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    drive = run.make_drive(
+        _store(tmp_path), "beta", "claude",
+        session.SessionState(cli="claude", claude_session_id="s1"),
+        ["claude"],
+        spawn=lambda a, i: [
+            json.dumps({"type": "stream_event", "event": {"type": "message_start"}}),
+            json.dumps({
+                "type": "rate_limit_event",
+                "rate_limit_info": {"status": "throttled", "rateLimitType": "requests"},
+            }),
+        ],
+        clock=lambda: 0.0, render=False,
+    )
+    o = drive(rec)
+    assert o.ok is False and o.failure_class == loop.CLASS_INFRA, o.summary
+
+
+def test_make_drive_mid_session_claude_structured_result_status_reaches_infra(
+    tmp_path,
+) -> None:
+    # #145 item (3), the second structured shape: a genuine Claude "result" turn
+    # with is_error=True and a 429/529/5xx api_error_status - also already
+    # CLASS_INFRA via the existing structured branch, unchanged by this fix.
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    drive = run.make_drive(
+        _store(tmp_path), "beta", "claude",
+        session.SessionState(cli="claude", claude_session_id="s1"),
+        ["claude"],
+        spawn=lambda a, i: [
+            json.dumps({"type": "stream_event", "event": {"type": "message_start"}}),
+            json.dumps({"type": "result", "is_error": True,
+                       "result": "usage limit reached", "api_error_status": 429}),
+        ],
+        clock=lambda: 0.0, render=False,
+    )
+    o = drive(rec)
+    assert o.ok is False and o.failure_class == loop.CLASS_INFRA, o.summary
+
+
+def test_make_drive_mid_session_unstructured_text_stays_ambiguous_deliberately(
+    tmp_path,
+) -> None:
+    # #145 item (3), the deliberately-NOT-extended case: a mid-session terminal
+    # failure that DID parse as valid JSON (an adapter ran) but carries no
+    # recognized structured status stays CLASS_AMBIGUOUS - this fix does not touch
+    # this branch (see the code comment at its call site). This is the SAME
+    # scenario the pre-existing codex "rate limit exceeded" case in
+    # test_make_drive_classifies_failures_for_dead_letter covers; asserted again
+    # here, explicitly, as a codex-#145-boundary regression guard.
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    drive = run.make_drive(
+        _store(tmp_path), "beta", "codex",
+        session.SessionState(cli="codex"),
+        ["codex"],
+        spawn=lambda a, i: _failed_turn_lines("rate limit exceeded, please slow down"),
+        clock=lambda: 0.0, render=False,
+    )
+    o = drive(rec)
+    assert o.ok is False and o.failure_class == loop.CLASS_AMBIGUOUS, o.summary
+
+
+def test_wrap_loop_survives_repeated_rate_limit_spawn_failures_then_succeeds(
+    tmp_path,
+) -> None:
+    # #145 item (4)(a) - the end-to-end survival proof: a rate-limit-shaped
+    # near-instant spawn failure (the 0.29s/2.81s incident shape) repeats N times,
+    # then a real turn succeeds. The loop must NEVER dispose/dead-letter/park the
+    # message across the failures (CLASS_INFRA retries indefinitely short of the
+    # infra-exhaustion ceiling, unlike CLASS_AMBIGUOUS/CLASS_CONFIG_BLOCKED), and
+    # the eventual success must commit normally.
+    s = _store(tmp_path)
+    msg = s.send(sender="alpha", recipient="beta", body="task")
+    calls = {"n": 0}
+    N = 4
+
+    def spawn(argv, stdin):
+        calls["n"] += 1
+        if calls["n"] <= N:
+            return ["Claude AI usage limit reached. Your limit will reset at 3pm."]
+        return [
+            json.dumps({"type": "stream_event", "event": {"type": "message_start"}}),
+            json.dumps({"type": "stream_event", "event": {"type": "message_stop"}}),
+        ]
+
+    drive = run.make_drive(
+        s, "beta", "claude", session.SessionState(cli="claude", claude_session_id="s1"),
+        ["claude"], spawn=spawn, clock=lambda: 0.0, render=False,
+    )
+    parked: list = []
+    loop.run_loop(
+        s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=N + 2, k_poison=0, k_escalate=0,
+        on_health_parked=lambda rec, reason: parked.append((rec.get("id"), reason)),
+    )
+    assert calls["n"] == N + 1                       # N failures, then the success
+    assert parked == []                              # never parked/config-blocked
+    assert s.dead_lettered_count("beta") == 0         # never dead-lettered/disposed
+    assert s.cursor("beta") == msg.id                 # the eventual success committed
+    rec_final = s.attempt_record("beta", msg.id)
+    assert rec_final is None or rec_final.get("last_failure_class") != loop.CLASS_CONFIG_BLOCKED
+
+
 def test_agenttalk_runtime_path_preflight_classifies_install_and_source_paths(
     tmp_path,
 ) -> None:
