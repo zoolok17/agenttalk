@@ -497,6 +497,167 @@ def test_publish_exception_preserves_the_draft(tmp_path, monkeypatch) -> None:
     assert refused.read_text(encoding="utf-8") == "good answer"
 
 
+# ---------------------------------------- #162: the refusal REASON is no longer discarded
+
+
+def _reason_path_for(s, agent, inbound_id) -> Path:
+    return reply_transport.reply_draft_path(s, agent, inbound_id).with_suffix(
+        ".refused.reason.txt")
+
+
+def test_refusal_reason_sidecar_for_operational_exception(tmp_path, monkeypatch) -> None:
+    # #162 class (a)/(b): an operational failure inside send_operation (lock
+    # timeout, I/O) must leave a diagnosable reason beside the preserved draft,
+    # not just the bytes - reply_transport.py's own except-Exception no longer
+    # discards the exception.
+    s = _store(tmp_path)
+    q = s.send(sender="alpha", recipient="beta", kind="question", body="q?")
+
+    def boom(**kwargs):
+        raise TimeoutError("wrapper operation publication lock timed out after 10.0s")
+
+    monkeypatch.setattr(s, "send_operation", boom)
+
+    def drive(rec):
+        Path(rec["reply_draft"]["path"]).write_text("good answer", encoding="utf-8")
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1)
+    reason = _reason_path_for(s, "beta", q.id)
+    assert reason.exists()
+    text = reason.read_text(encoding="utf-8")
+    assert "TimeoutError" in text
+    assert "lock timed out" in text
+
+
+def test_refusal_reason_sidecar_for_validation_error(tmp_path, monkeypatch) -> None:
+    # #162 class (a): a ValueError raised by send_operation's own validators
+    # (nonce/digest/roster conflicts) is a DIFFERENT exception class than an
+    # operational failure - the sidecar preserves which one, verbatim.
+    s = _store(tmp_path)
+    q = s.send(sender="alpha", recipient="beta", kind="question", body="q?")
+
+    def boom(**kwargs):
+        raise ValueError("operation nonce was already used with a different payload")
+
+    monkeypatch.setattr(s, "send_operation", boom)
+
+    def drive(rec):
+        Path(rec["reply_draft"]["path"]).write_text("good answer", encoding="utf-8")
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1)
+    text = _reason_path_for(s, "beta", q.id).read_text(encoding="utf-8")
+    assert text == "ValueError: operation nonce was already used with a different payload"
+
+
+def test_refusal_reason_sidecar_for_oversize_draft(tmp_path) -> None:
+    # #162 class (c): no exception is raised for an oversize draft (it's
+    # rejected by read_reply_draft's own size check) - the sidecar must still
+    # explain WHY, diagnostic-only, never changing read_reply_draft's contract.
+    s = _store(tmp_path)
+    q = s.send(sender="alpha", recipient="beta", kind="question", body="q?")
+
+    def drive(rec):
+        Path(rec["reply_draft"]["path"]).write_text(
+            "x" * (reply_transport.MAX_DRAFT_BYTES + 1), encoding="utf-8")
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1)
+    text = _reason_path_for(s, "beta", q.id).read_text(encoding="utf-8")
+    assert "over the" in text and "byte bound" in text
+
+
+def test_refusal_reason_sidecar_for_empty_draft(tmp_path) -> None:
+    # #162 class (e): a whitespace-only draft.
+    s = _store(tmp_path)
+    q = s.send(sender="alpha", recipient="beta", kind="question", body="q?")
+
+    def drive(rec):
+        Path(rec["reply_draft"]["path"]).write_text("   \n\t", encoding="utf-8")
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1)
+    text = _reason_path_for(s, "beta", q.id).read_text(encoding="utf-8")
+    assert text == "draft is empty (whitespace-only)"
+
+
+def test_refusal_reason_sidecar_for_undecodable_draft(tmp_path) -> None:
+    # #162 class (d): a draft that isn't valid UTF-8.
+    s = _store(tmp_path)
+    q = s.send(sender="alpha", recipient="beta", kind="question", body="q?")
+
+    def drive(rec):
+        Path(rec["reply_draft"]["path"]).write_bytes(b"\xff\xfe not valid utf-8 \x80\x81")
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1)
+    text = _reason_path_for(s, "beta", q.id).read_text(encoding="utf-8")
+    assert text.startswith("draft unreadable:")
+
+
+def test_successful_publish_leaves_no_reason_sidecar(tmp_path) -> None:
+    # Negative case: a normal, successful draft delivery must not leave any
+    # #162 artifact behind - the sidecar is refusal-only.
+    s = _store(tmp_path)
+    q = s.send(sender="alpha", recipient="beta", kind="question", body="q?")
+
+    def drive(rec):
+        Path(rec["reply_draft"]["path"]).write_text("good answer", encoding="utf-8")
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1)
+    assert len(_reply_inbox(s, "alpha")) == 1
+    assert not _reason_path_for(s, "beta", q.id).exists()
+
+
+def test_lock_timeout_during_publish_leaves_no_partial_message(tmp_path, monkeypatch) -> None:
+    # #162 review ask: a TimeoutError raised inside send_operation must not
+    # produce a "total failure" notice while a PARTIAL artifact (an actually-
+    # published message) exists on disk. Traced send_operation's own body
+    # (store.py): the exclusive lock on operation-publication.lock is
+    # acquired BEFORE anything is written - _record_operation_intent_locked
+    # and self.send() both run INSIDE the `with self._exclusive_lock(...)`
+    # block. A TimeoutError can therefore only originate from ACQUIRING that
+    # lock, which happens before the `with` block's body ever runs - by
+    # construction, no intent record and no message can exist yet when this
+    # exception fires. This test documents that property directly (the
+    # dispatch's own "if it does not [have a partial-write path], a test that
+    # documents the all-or-nothing property is enough"), rather than
+    # asserting it can never regress from inside send_operation itself.
+    s = _store(tmp_path)
+    q = s.send(sender="alpha", recipient="beta", kind="question", body="q?")
+
+    real_exclusive_lock = s._exclusive_lock
+
+    def timing_out_lock(lock, *, timeout=10.0, **kwargs):
+        if lock.name == "operation-publication.lock":
+            raise TimeoutError(f"timed out waiting for {lock}")
+        return real_exclusive_lock(lock, timeout=timeout, **kwargs)
+
+    monkeypatch.setattr(s, "_exclusive_lock", timing_out_lock)
+
+    def drive(rec):
+        Path(rec["reply_draft"]["path"]).write_text("good answer", encoding="utf-8")
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1)
+    # No message was published at all - not a partial artifact, not a full one.
+    assert _reply_inbox(s, "alpha") == []
+    assert list(s.messages_dir.glob("*.json")) == [
+        p for p in s.messages_dir.glob("*.json") if p.stem == q.id
+    ]
+    text = _reason_path_for(s, "beta", q.id).read_text(encoding="utf-8")
+    assert "TimeoutError" in text
+
+
 # ---------------------------------------- #202 D5: preserve the interrupted draft
 
 def test_interrupted_draft_never_published_and_gcd_on_clean_no_reply_commit(

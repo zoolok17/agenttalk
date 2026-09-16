@@ -238,18 +238,88 @@ def _with_reply_draft(store, agent: str, record: dict) -> dict:
     return decorated
 
 
-def _deliver_reply_draft(store, agent: str, record: dict) -> None:
+def _notify_reply_refusal(store, *, agent: str, record: dict, draft: Path,
+                          reason_path: Path) -> None:
+    """#162: record + escalate one refused reply draft. Best-effort, never raises
+    (the caller's own refusal-preservation contract must not depend on this).
+
+    Sender is the AFFECTED SEAT itself (the wrapper already publishes on the
+    seat's behalf in the normal draft-delivery case - a synthetic wrapper
+    identity would be a new category outside the roster trust model).
+    Recipient is always the lead (``operator_facing`` liaison, else the sole
+    lead) - the ORIGINAL intended recipient has no context that a reply was
+    coming and cannot act on this notice, mirroring
+    :func:`agenttalk.cli._dead_letter_notifier`'s own target resolution.
+    """
+    try:
+        from agenttalk import reply_refusals
+
+        inbound_id = record.get("id")
+        if not isinstance(inbound_id, str) or not inbound_id:
+            return
+        target = store.operator_facing() or store.sole_lead()
+        if not target or target == agent:
+            return  # unroutable - doctor's _check_reply_refused surfaces this LOUD
+        try:
+            reason = reason_path.read_text(encoding="utf-8")
+        except OSError:
+            reason = "(refusal reason unavailable - the sidecar itself could not be read)"
+        original_from = record.get("from")
+        record_meta = record.get("meta") if isinstance(record.get("meta"), dict) else {}
+        correlation = {
+            k: record_meta[k] for k in ("request_id", "broadcast_id")
+            if isinstance(record_meta.get(k), str)
+        }
+        refused_draft_path = draft.with_suffix(".refused.md")
+        recorded_path = reply_refusals.record_reply_refusal(
+            store, agent=agent, original_message_id=inbound_id,
+            original_from=str(original_from) if original_from else "",
+            intended_kind="message", reason=reason,
+            draft_path=str(refused_draft_path), correlation=correlation,
+            at=_iso_now(),
+        )
+        body = (
+            f"[reply-refusal] agent {agent} could not publish its reply to message "
+            f"{inbound_id} from {original_from} - the draft was written but the "
+            f"wrapper's publish step refused it. Reason: {reason}  "
+            f"Draft: {refused_draft_path}  "
+            f"Inspect: agenttalk reply-refusal show --agent {agent} --id {inbound_id}"
+        )
+        meta = {
+            "needs_operator": "true",
+            "reply_refusal": "true",
+            "rr_original_message_id": inbound_id,
+            "rr_draft_path": str(refused_draft_path),
+            "rr_record_path": str(recorded_path),
+            "request_id": "esc-" + uuid.uuid4().hex[:12],
+        }
+        if "request_id" in correlation:
+            meta["rr_correlation_request_id"] = correlation["request_id"]
+        if "broadcast_id" in correlation:
+            meta["rr_correlation_broadcast_id"] = correlation["broadcast_id"]
+        store.send(sender=agent, recipient=target, kind="question",
+                   subject="reply-refusal notice", body=body, meta=meta)
+    except Exception:  # noqa: BLE001 - a notification must never crash the loop
+        return
+
+
+def _deliver_reply_draft(store, agent: str, record: dict) -> str | None:
     """Publish a child-written freeform draft after a CLEAN turn.
 
-    Refusals are silent by contract: freeform replies are not obligatory, so
-    a missing/invalid draft must leave the turn disposition byte-identical
-    to today. The landed-check first makes the two channels race-free — a
-    capable child that ran `agenttalk reply` itself published strictly
-    before this end-of-turn call, and then the draft is only residue.
+    Refusals are silent by contract WITH RESPECT TO THE TURN'S OWN OUTCOME:
+    freeform replies are not obligatory, so a missing/invalid draft must leave
+    the turn disposition byte-identical to today (see the module-level
+    ``except Exception: return`` below - unchanged). #162: a refusal is no
+    longer silent with respect to HEALTH - this now returns a reason_code
+    (``"reply_refused"``) the caller threads into the next ``on_health_idle``
+    call, instead of always ``None``. The landed-check first makes the two
+    channels race-free — a capable child that ran `agenttalk reply` itself
+    published strictly before this end-of-turn call, and then the draft is
+    only residue.
     """
     declared = record.get("reply_draft")
     if not isinstance(declared, dict) or not declared.get("path"):
-        return
+        return None
     draft = Path(str(declared["path"]))
     try:
         if not draft.is_file():
@@ -292,8 +362,18 @@ def _deliver_reply_draft(store, agent: str, record: dict) -> None:
             # encoding, publish failure). The turn still commits, so without
             # a trace the answer would vanish exactly like the dead-letter
             # dotfiles #201 exists to fix. Preserve the bytes observably.
+            reason_path = reply_transport.refused_reason_path(draft)
             reply_transport.preserve_refused_draft(draft)
-        elif published is not None:
+            # #162: beyond preserving the bytes, make the refusal ACTIONABLE -
+            # a queryable sink record plus a real notice to the lead, since a
+            # silent-but-preserved file still requires the lead to "detect it
+            # by hand" (the issue's own framing). Never lets a notification
+            # failure change this function's own never-raise contract - the
+            # whole block is already inside this function's outer try/except.
+            _notify_reply_refusal(store, agent=agent, record=record, draft=draft,
+                                   reason_path=reason_path)
+            return "reply_refused"
+        if published is not None:
             # cold-review FIX 6: a real reply just landed for this head, so any
             # earlier <id>.interrupted.md leftover (recovered progress from a
             # PRIOR interrupted attempt on the same id) is now moot - GC it so it
@@ -465,7 +545,7 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
              pre_commit: Callable[[], None] | None = None,
              manage_waiting: bool = True,
              cadence: Callable[[], CadenceResult] | None = None,
-             on_health_idle: Callable[[], None] | None = None,
+             on_health_idle: Callable[..., None] | None = None,
              on_health_parked: Callable[[dict, str], None] | None = None,
              on_runtime_idle: Callable[[], None] | None = None,
              on_runtime_dead_letter: Callable[[dict], None] | None = None,
@@ -587,7 +667,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                     stamp: Callable[[], None],
                     pre_commit: Callable[[], None] | None,
                     cadence: Callable[[], CadenceResult] | None,
-                    on_health_idle: Callable[[], None] | None,
+                    on_health_idle: Callable[..., None] | None,
                     on_health_parked: Callable[[dict, str], None] | None,
                     on_runtime_idle: Callable[[], None] | None,
                     on_runtime_dead_letter: Callable[[dict], None] | None,
@@ -1587,8 +1667,9 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         # through the same proof machinery as a child-delivered reply. A dirty
         # outcome (watchdog kill, nonzero exit) never publishes — a truncated
         # draft must not become the agent's authoritative answer.
+        draft_reason_code = None
         if outcome.ok:
-            _deliver_reply_draft(store, agent, record)
+            draft_reason_code = _deliver_reply_draft(store, agent, record)
         if commit_gate is not None and legacy_gate_resolution is not None:
             landed = commit_gate.resolve_landed_response(record)
             if landed.proof is not None:
@@ -1600,7 +1681,10 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 ):
                     stamp()
                     if on_health_idle is not None:
-                        on_health_idle()
+                        if draft_reason_code is not None:
+                            on_health_idle(reason_code=draft_reason_code)
+                        else:
+                            on_health_idle()
                     last_hb = clock()
                     _maybe_refresh_capacity(last_hb)
                     fail_sleep = idle_interval
@@ -1856,7 +1940,7 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                   sleep: Callable[[float], None], max_turns: int | None,
                   max_polls: int | None, max_wall: float | None,
                   stamp: Callable[[], None] | None = None,
-                  on_health_idle: Callable[[], None] | None = None,
+                  on_health_idle: Callable[..., None] | None = None,
                   on_runtime_idle: Callable[[], None] | None = None,
                   commit_gate=None) -> int:
     """SCOPED one-shot loop for an ephemeral reviewer (see run_loop). Receives only
@@ -2321,8 +2405,9 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                     reply_transport.preserve_interrupted_draft(live_draft)
         # #201: same wrapper-owned draft delivery as _run_continuous — the
         # one-shot path must not strand a sandbox-blocked child's answer.
+        draft_reason_code = None
         if outcome.ok:
-            _deliver_reply_draft(store, agent, record)
+            draft_reason_code = _deliver_reply_draft(store, agent, record)
         if commit_gate is not None and legacy_gate_resolution is not None:
             landed = commit_gate.resolve_landed_response(record)
             if landed.proof is not None:
@@ -2334,7 +2419,10 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                 ):
                     _stamp()
                     if on_health_idle is not None:
-                        on_health_idle()
+                        if draft_reason_code is not None:
+                            on_health_idle(reason_code=draft_reason_code)
+                        else:
+                            on_health_idle()
                     last_hb = clock()
                     fail_sleep = idle_interval
                     turns += 1

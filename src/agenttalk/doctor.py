@@ -192,6 +192,9 @@ def run(project_root: Path | None = None) -> Report:
         dl_check = _check_dead_letter(store)
         if dl_check is not None:  # additive: absent unless dead-letters exist
             report.checks.append(dl_check)
+        rr_check = _check_reply_refused(store)
+        if rr_check is not None:  # additive: absent unless unresolved reply-refusals exist
+            report.checks.append(rr_check)
         ad_check = _check_attention_dispositions(store)
         if ad_check is not None:  # additive: absent unless torn disposition lines exist
             report.checks.append(ad_check)
@@ -986,6 +989,62 @@ def _check_attention_dispositions(store) -> Check | None:
                  fix="inspect .agenttalk/attention/dispositions.jsonl; the log is append-only "
                      "+ skip-invalid, so a torn tail is safe but worth noting",
                  data={"problems": problems})
+
+
+def _check_reply_refused(store) -> Check | None:
+    """#162: surface wrapper-refused reply drafts; absent when there are none
+    unresolved. WARN that a freeform reply was written but never published
+    (recoverable via `reply-refusal show` + a manual re-publish), and go to a
+    LOUD ERROR when refusals exist but NO escalation target resolves
+    (operator_facing / sole_lead both unset, or the only resolvable target IS
+    the refusing seat itself) - mirrors `_check_dead_letter`'s own escalation
+    logic exactly, but against the SEPARATE reply-refusals sink (a refused
+    reply is an outbound publish failure, not a poison inbound message - see
+    `reply_refusals.py`'s own module docstring for why the two sinks are not
+    the same thing)."""
+    try:
+        from agenttalk import reply_refusals
+        items = reply_refusals.list_reply_refusals(store)
+    except Exception as e:  # noqa: BLE001 - doctor never crashes
+        return Check(name="reply_refused", status="warn",
+                     details=f"could not scan the reply-refusals sink: {e}")
+    unresolved = [
+        m for m in items
+        if not reply_refusals.is_resolved(store, m.get("_agent"), m.get("original_message_id"))
+    ]
+    if not unresolved:
+        return None
+    n = len(unresolved)
+    summary = "; ".join(
+        f"{m.get('_agent')}/{m.get('original_message_id')} "
+        f"(reason={(m.get('reason') or '')[:40]})" for m in unresolved[:5])
+    target = store.operator_facing() or store.sole_lead()
+    rr_agents = sorted({m.get("_agent") for m in unresolved if m.get("_agent")})
+    self_only = [a for a in rr_agents if target == a]
+    data = {"count": n, "messages": unresolved}
+    if target is None or self_only:
+        if target is None:
+            why = ("NO escalation target resolves (no operator_facing liaison and no sole "
+                   "lead) - the reply-refusal notice cannot route.")
+        else:
+            why = (f"the only escalation target ({target}) is the refusing agent itself "
+                   f"for {', '.join(self_only)} - an agent cannot escalate to itself, so "
+                   "the notice does not route.")
+        return Check(
+            name="reply_refused", status="error",
+            details=f"{n} unresolved reply-refusal(s) but {why} " + summary,
+            fix=("Set a DIFFERENT liaison (`agenttalk roster --set-operator-facing "
+                 "<other-agent>`) or add a second non-refusing lead, then review "
+                 "`agenttalk reply-refusal list`."),
+            data=data)
+    return Check(
+        name="reply_refused", status="warn",
+        details=(f"{n} unresolved reply-refusal(s) (a child wrote a reply, the wrapper's "
+                 f"own publish step refused it, the draft is preserved). {summary}"),
+        fix="Review with `agenttalk reply-refusal list`; `reply-refusal show --agent A "
+            "--id ID` for the reason, draft path and a re-publish recipe; "
+            "`reply-refusal resolve --reason ...` once handled to quiet this warning.",
+        data=data)
 
 
 def _drop_resolved_dead_letters(store, items: list) -> list:
