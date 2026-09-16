@@ -39,6 +39,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unlistable locations exist outside the scratch root. See
   `docs/ops/scratch-hygiene.md`.
 
+- **Interim progress notes that don't end a turn (#164).** A wrapped turn
+  ends once the model sends its correlated reply and stops generating - a
+  seat posting a mid-work status update via `agenttalk reply` was killing
+  its own in-flight background work (an hour-long test bar, a CI poll).
+  `agenttalk progress --from <seat> --to-id <id> -m "..."` posts an
+  advisory status update instead: a new `progress` kind (joins `composing`
+  in the control plane - never opens or derives a thread, never counts as
+  a reply to the opener, `wait` never returns it, `recv` hides it by
+  default), unlike `composing` not gated to an owed-inbound thread. Best-
+  effort stamps the sender's own health snapshot with a `progress_note`
+  reason code + timestamp (never the note's text - the health schema
+  stays content-free); `agenttalk status` shows a
+  `progress="<text>" (<age>)` fragment on a working agent's line, reading
+  the actual message rather than health.json, and it disappears once the
+  agent goes idle again. See `docs/DESIGN-164-interim-progress-note.md`;
+  the file-draft channel for shell-less seats is an explicit fast-follow,
+  not part of this change.
+
 ## [0.87.0] - 2026-09-07
 
 Theme: **the comprehension producer ships — a static inventory plane for
