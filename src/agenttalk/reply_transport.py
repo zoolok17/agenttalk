@@ -285,7 +285,10 @@ def deliver_draft_reply(
         # so it earns a reason - re-derive WHICH read_reply_draft check failed
         # for the sidecar text; read_reply_draft's own contract (a bare body-or-
         # None) is untouched, this is diagnostic-only and never changes behavior.
-        if draft_path.exists():
+        if draft_path.exists() or draft_path.is_symlink():
+            # #162 review nit: a dangling symlink returns False from exists()
+            # (it follows the link) but True from is_symlink() - without the
+            # second check, a dangling-symlink draft would leave no sidecar.
             write_refused_reason(draft_path, _classify_unreadable_draft(draft_path))
         return None
     kind = "message"
