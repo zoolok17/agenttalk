@@ -152,8 +152,32 @@ explicitly.
   the extension inherits both them and the never-raise contract.
 - A REFUSED draft (oversize/encoding/publish failure) on a committing turn
   is preserved as `<id>.refused.md` beside the draft dir — observable and
-  operator-recoverable, but not yet surfaced in status/health; wiring a
-  refusal signal into the wrapper lifecycle log is fast-follow scope.
+  operator-recoverable. **#162 (fast-follow, landed)**: the refusal reason
+  itself is no longer discarded — `deliver_draft_reply`'s own
+  `except Exception` now writes it to a `<id>.refused.reason.txt` sidecar
+  before returning, and a SEPARATE sink (`reply_refusals.py`, deliberately
+  NOT the poison-inbound `Store.dead_letter()` path — see that module's own
+  docstring for why the two are not the same failure domain) records the
+  refusal and notifies the lead directly (sender = the affected seat,
+  recipient = `operator_facing` else `sole_lead`, carrying the reason, draft
+  path and original correlation id). `WrapperHealthWriter.idle()` checks
+  that sink on every idle tick and surfaces `reason_code="reply_refused"`
+  instead of the generic `"idle_waiting"` default whenever the seat has an
+  unresolved entry — a disk check, not a value threaded synchronously
+  through the turn that produced it, so it catches the refusal on ANY later
+  poll regardless of which internal `wrapper/loop.py` commit path handled
+  the original turn. `doctor`'s `_check_reply_refused` and `status`'s own
+  `reply-refused: N` summary line surface it the same way `_check_dead_letter`
+  and `dead_lettered_count` already do for the poison-inbound sink.
+  Operator commands: `agenttalk reply-refusal list/show/resolve` (`show`
+  prints a ready-to-run re-publish recipe: `agenttalk reply --from <seat>
+  --to-id <original-id> --file <preserved-draft-path>` — the draft's bytes
+  are never lost, only its automatic publication failed). Resolution is
+  sidecar-only (not integrated with the central `attention/dispositions.jsonl`
+  log `dead-letter resolve` uses) — a deliberate first-cut scope choice, not
+  an oversight; unifying the two resolution mechanisms is a further
+  fast-follow if the two failure domains turn out to want the same audit
+  trail in practice.
 - Draft-dir hygiene: delivered drafts are unlinked on publish, stale drafts
   are unlinked at next decoration, refused drafts are preserved by design;
   drafts for records disposed WITHOUT a later redelivery linger until then.

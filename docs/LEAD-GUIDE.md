@@ -116,6 +116,17 @@ skips opening a browser.
   `docs/supervisor-tutorial.md` §10 for safe teardown and known limits.
 - **A worker keeps dying:** check `agenttalk dead-letter list` — a poison
   message is quarantined after repeated failures rather than looping forever.
+- **A seat looks idle but you expected a report** (a fresh commit or file
+  change, no message on the bus): this is not necessarily "the seat went
+  quiet" — check `agenttalk status` for a `reply-refused: N` line, or
+  `agenttalk doctor` for a `reply_refused` WARN, first. The child DID write
+  an answer; the wrapper's own publish step refused it (a lock timeout, a
+  transient I/O error). `agenttalk reply-refusal show --agent <seat> --id
+  <original-message-id>` prints the reason, the preserved draft's path, and
+  a ready-to-run re-publish recipe (`agenttalk reply --from <seat> --to-id
+  <id> --file <path>`) — nothing is lost, it just never sent itself.
+  `reply-refusal resolve --agent <seat> --id <id> --reason ...` (liaison/
+  sole-lead only) clears the WARN once handled.
 
 Go deeper: `docs/supervisor-tutorial.md` §6-§7, §10.
 
