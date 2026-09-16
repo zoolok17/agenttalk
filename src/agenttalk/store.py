@@ -495,7 +495,31 @@ KNOWN_KINDS = frozenset({
     # auditable. Added in 0.14.0 (issue #12 — the launch-HOLD/fire
     # crossing from the 2026-06-05 production retro).
     "rescind",
+    # Lead work-order pair (issue #163): `task` is the ONLY kind whose
+    # body the wrapper's own "body is data" rule carves an execution
+    # exception for — a lead-assigned instruction, not a data payload —
+    # and it is the ONLY kind gated at write time by sender role (see
+    # `cmd_task`/`agenttalk task`: sender must be `sole_lead()` or
+    # `operator_facing()`, checked against the LIVE roster, not the
+    # message's own claim). `task-response` is the paired reply,
+    # carrying `meta.status=accepted|declined|done` like the
+    # `review-result`/`proposal-response` pairs already do (see
+    # `gates.RESPONSE_STATUS_ENUMS`). Added in 0.88.0.
+    "task",
+    "task-response",
 })
+
+# The first agenttalk release whose KNOWN_KINDS includes "task"/
+# "task-response" (issue #163). An older receiver's own (older)
+# KNOWN_KINDS silently skips a `task` message at read time — see
+# `Message.validate`'s docstring above and the write-time check in
+# `Store.send` below — so `cmd_task` refuses to open a `task` thread
+# while any roster member's last-advertised `agenttalk_version`
+# (`health.json`'s `agenttalk_version` field, stamped every wrapper
+# turn) is older than this, or was never advertised at all (never a
+# silent assumption of support). `--force` overrides, printing exactly
+# who will not see the message.
+TASK_KIND_MIN_VERSION = (0, 88)
 
 # Kinds the bus uses to signal flow control rather than carry agent
 # content. They are still persisted (so transcripts and the dashboard
@@ -507,7 +531,7 @@ CONTROL_KINDS = frozenset({"composing"})
 # truth shared by thread derivation (threads.py) and rescind validation
 # (`validate_rescind`) — store.py cannot import threads.py (threads
 # imports store), so the constant lives here and threads re-exports it.
-OPENER_KINDS = frozenset({"review-request", "question", "proposal"})
+OPENER_KINDS = frozenset({"review-request", "question", "proposal", "task"})
 
 # Reply-in-flight marker entries older than this are ignored by readers.
 # Deliberately equal to the wait loop's cumulative composing-extension cap
