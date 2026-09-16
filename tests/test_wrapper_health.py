@@ -491,6 +491,51 @@ def test_health_writer_idle_explicit_reason_code_is_never_clobbered(tmp_path: Pa
     assert s.read_health("beta", ttl_seconds=999999)["reason_code"] == "turn_spawned"
 
 
+# ------------------------------------------------------- health.stamp_progress (#164)
+#
+# Called directly by the one-shot `agenttalk progress` CLI process (there is
+# no live WrapperHealthWriter instance to reuse for a plain subprocess
+# invocation) - a pure read-modify-write helper, tested standalone here.
+
+def test_stamp_progress_annotates_a_working_snapshot() -> None:
+    raw = hm.build_snapshot(
+        agent="beta", cli="claude", mode="continuous",
+        state=hm.STATE_WORKING_TURN, since="2026-01-01T00:00:00Z",
+        request_id="q-1", msg_id="m-1", reason_code="turn_spawned",
+    )
+    updated = hm.stamp_progress(raw, now="2026-01-01T00:05:00Z")
+    assert updated is not None
+    assert updated["reason_code"] == hm.REASON_PROGRESS_NOTE == "progress_note"
+    assert updated["last_progress_at"] == "2026-01-01T00:05:00Z"
+    # Everything else about the in-flight turn is preserved, not reset.
+    assert updated["state"] == hm.STATE_WORKING_TURN
+    assert updated["since"] == "2026-01-01T00:00:00Z"
+    assert updated["request_id"] == "q-1"
+    assert updated["msg_id"] == "m-1"
+
+
+def test_stamp_progress_works_for_working_silent_too() -> None:
+    raw = hm.build_snapshot(agent="beta", cli="codex", mode="wrapped",
+                            state=hm.STATE_WORKING_SILENT, since="2026-01-01T00:00:00Z")
+    updated = hm.stamp_progress(raw)
+    assert updated is not None
+    assert updated["state"] == hm.STATE_WORKING_SILENT
+
+
+def test_stamp_progress_is_noop_outside_a_working_state() -> None:
+    for state in (hm.STATE_IDLE_WAITING, hm.STATE_STUCK_SUSPECTED,
+                 hm.STATE_CRASHED_OR_EXITED, hm.STATE_UNKNOWN):
+        raw = hm.build_snapshot(agent="beta", cli="claude", mode="continuous",
+                                state=state, since="2026-01-01T00:00:00Z")
+        assert hm.stamp_progress(raw) is None
+
+
+def test_stamp_progress_is_noop_for_missing_or_malformed_input() -> None:
+    assert hm.stamp_progress(None) is None
+    assert hm.stamp_progress({}) is None
+    assert hm.stamp_progress("not a dict") is None
+
+
 def test_health_json_never_contains_message_or_output_content(tmp_path: Path) -> None:
     s = _store(tmp_path)
     secret = "SECRET_HEALTH_LEAK_74f78b"  # gitleaks:allow

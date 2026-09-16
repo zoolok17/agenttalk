@@ -242,6 +242,30 @@ def test_question_closed_by_plain_message() -> None:
     assert _states(derive_threads(msgs, agent="alpha", cursor="002"))["q1"] == "closed"
 
 
+def test_progress_note_never_closes_a_question_thread() -> None:
+    """#164: a progress note carrying the SAME request_id as an open question
+    must not be misread as the terminal answer, even addressed responder ->
+    requester exactly like the real answer in test_question_closed_by_plain_
+    message above. `progress` is a CONTROL_KIND for this exact reason (the
+    question-opener rule below closes on ANY non-control response)."""
+    msgs = [
+        _msg("001", "alpha", "beta", "question", rid="q1"),
+        _msg("002", "beta", "alpha", "progress", rid="q1"),
+    ]
+    a = derive_threads(msgs, agent="alpha", cursor="002", now=_BASE)
+    assert a[0].state == "open-outbound"  # still waiting on the real answer
+    b = derive_threads(msgs, agent="beta", cursor="002", now=_BASE)
+    assert b[0].state == "owed-inbound"  # beta still owes alpha the real answer
+
+
+def test_progress_note_never_opens_its_own_thread() -> None:
+    """A progress note is not an OPENER_KIND, so a group whose only message
+    is a progress note derives no thread at all for anyone."""
+    msgs = [_msg("001", "beta", "alpha", "progress", rid="p1")]
+    assert derive_threads(msgs, agent="alpha", cursor="001") == []
+    assert derive_threads(msgs, agent="beta", cursor="001") == []
+
+
 # ----------------------------------- expected-response map is enforced
 
 def test_generic_message_does_not_close_review_request() -> None:
