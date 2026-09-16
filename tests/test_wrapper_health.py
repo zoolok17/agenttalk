@@ -437,6 +437,24 @@ def test_health_writer_parked_surfaces_blocked_state_with_resolved_request_id(
     assert raw["msg_id"] == "20990101-000000-000000-HEAL"
 
 
+def test_health_writer_stamps_agenttalk_version(tmp_path: Path) -> None:
+    # #163: the roster-version gate for `agenttalk task` reads this field
+    # off each peer's health.json (no subprocess probe needed) - it must be
+    # the REAL running package version, and survive the read_health()
+    # normalize round-trip, not just the raw write.
+    from agenttalk import __version__
+    from agenttalk.wrapper.health import WrapperHealthWriter
+
+    s = _store(tmp_path)
+    w = WrapperHealthWriter(s, "beta", "claude", mode="wrapper-loop")
+    w.idle()
+
+    raw = s.read_health_raw("beta")
+    assert raw["agenttalk_version"] == __version__
+    view = s.read_health("beta", ttl_seconds=999999)
+    assert view["agenttalk_version"] == __version__
+
+
 def test_health_json_never_contains_message_or_output_content(tmp_path: Path) -> None:
     s = _store(tmp_path)
     secret = "SECRET_HEALTH_LEAK_74f78b"  # gitleaks:allow

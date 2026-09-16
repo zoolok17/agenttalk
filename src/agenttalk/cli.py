@@ -63,6 +63,7 @@ from agenttalk import lead_loop_runtime
 from agenttalk import launch_admission
 from agenttalk import onboarding as ob
 from agenttalk import signing as _signing
+from agenttalk import skill_currency as skill_currency_mod
 from agenttalk import threads as th
 from agenttalk import supervisor as sup
 from agenttalk import powershell_host as psh
@@ -210,6 +211,7 @@ _AUTOGEN_REQUEST_ID_PREFIX = {
     "question": "q-",
     "proposal": "pp-",
     "wake": "wk-",
+    "task": "tk-",
 }
 
 # A response kind -> the opener kind it is meant to correlate with. Used
@@ -217,6 +219,7 @@ _AUTOGEN_REQUEST_ID_PREFIX = {
 _RESPONSE_TO_OPENER = {
     "review-result": "review-request",
     "proposal-response": "proposal",
+    "task-response": "task",
 }
 
 
@@ -1648,11 +1651,21 @@ def cmd_send(args: argparse.Namespace) -> int:
     # rescind/end have dedicated commands that handle multi-recipient fan-out
     # and anchoring; a hand-rolled `send --kind rescind` would only address one
     # recipient and could half-supersede a multi-party thread (review nit).
-    if args.kind in ("rescind", "end"):
+    #
+    # task (#163) is carved out for a different reason: it is the one kind
+    # gated at write time by sender ROLE (sole_lead()/operator_facing(), live
+    # roster) and by the roster-version check (an un-upgraded recipient would
+    # silently drop it) - both checks belong in exactly one place, not
+    # duplicated into the generic send path. `task-response` is NOT gated
+    # (any recipient can accept/decline/finish a task addressed to them) and
+    # goes through generic `send`/`reply` like review-result/proposal-response
+    # already do.
+    if args.kind in ("rescind", "end", "task"):
         sys.stderr.write(
             f"agenttalk send: --kind {args.kind} is not allowed via `send` — use "
             f"the dedicated `agenttalk {args.kind}` command, which handles "
-            f"fan-out/anchoring correctly.\n")
+            f"{'fan-out/anchoring' if args.kind != 'task' else 'the sender-role and roster-version gate'} "
+            f"correctly.\n")
         return 2
     store = _get_store(args)
     cfg = store.load_config()
@@ -7353,6 +7366,119 @@ def cmd_propose(args: argparse.Namespace) -> int:
     return 0
 
 
+def _roster_members_behind_task_kind(store: Store, roster: list[str],
+                                     *, exclude: str) -> list[tuple[str, str]]:
+    """Active roster members (other than ``exclude``, the sender - obviously
+    current, since it is running this exact check) whose last-advertised
+    ``agenttalk_version`` (``health.json``, stamped every wrapper turn by
+    ``WrapperHealthWriter``) is older than the SENDER'S OWN running
+    ``agenttalk.__version__``, or never advertised one at all. No
+    advertisement is treated the SAME as an old one — never a silent
+    assumption of support (#163 reviewer-3 citation: an un-upgraded
+    reader's own KNOWN_KINDS silently drops an unrecognized ``task``).
+
+    Compared against the sender's OWN live version rather than a hardcoded
+    "task shipped in X.Y" constant — see the long comment on
+    ``store.KNOWN_KINDS`` for why a hardcoded guess would be wrong until
+    this repo's own separate release-bump commit lands, and wrong again in
+    general for any later kind. Returns ``(agent, shown_version)`` pairs,
+    ``"unknown"`` for the latter, for the refusal message."""
+    my_version = skill_currency_mod.current_major_minor(__version__)
+    behind: list[tuple[str, str]] = []
+    for agent in roster:
+        if agent == exclude:
+            continue
+        raw = store.read_health_raw(agent)
+        version = raw.get("agenttalk_version") if isinstance(raw, dict) else None
+        if not isinstance(version, str) or not version.strip():
+            behind.append((agent, "unknown"))
+            continue
+        if skill_currency_mod.current_major_minor(version) < my_version:
+            behind.append((agent, version))
+    return behind
+
+
+def cmd_task(args: argparse.Namespace) -> int:
+    """Send a `task`: a lead work order the recipient must execute (or
+    explicitly decline) under standing guardrails — the ONE kind whose body
+    the wrapper's "body is data" rule carves an execution exception for
+    (issue #163: two codex seats applied that rule literally to a lead work
+    order and refused it, because nothing distinguished a work order from
+    an ordinary untrusted message).
+
+    Gated at write time, not just by receiver-side judgement (the exact gap
+    #163 exposed): the sender must be the roster's `sole_lead()` or its
+    `operator_facing()` liaison, checked against the LIVE config — never
+    the message's own claim. Also refuses if any OTHER active roster member
+    last-advertised an `agenttalk_version` older than task-kind support (an
+    un-upgraded reader would silently DROP this message — see
+    `Message.validate`'s docstring), unless `--force`, which sends anyway
+    and prints exactly who will not see it.
+
+    The recipient replies with `agenttalk reply --kind task-response --meta
+    status=accepted|declined|done` — a bare prose refusal or `--na` is not
+    a valid response to a task (both are rejected by `agenttalk reply`).
+    """
+    store = _get_store(args)
+    cfg = store.load_config()
+    roster = cfg.get("agents") or []
+    sender = _resolve_self(args.sender, roster=roster)
+    sole_lead = store.sole_lead()
+    liaison = store.operator_facing()
+    if sole_lead is None and liaison is None:
+        # Fail-closed reviewer-3 flagged as non-blocking but worth a clear
+        # message: 0 or 2+ leads AND no liaison means NOBODY can send a
+        # task, not a crash — say so, don't just exit 2 with no context.
+        sys.stderr.write(
+            "agenttalk task: no agent can send a task right now — the "
+            "roster has no unambiguous role=lead (zero, or two-or-more, "
+            "which reads as ambiguous) and no operator_facing liaison. "
+            "Fix one: `agenttalk roster set-role <agent> lead` or "
+            "`agenttalk roster set-operator-facing <agent>`.\n")
+        return 2
+    if sender not in (sole_lead, liaison):
+        sys.stderr.write(
+            f"agenttalk task: {sender!r} is not the roster's lead "
+            f"({sole_lead!r}) or operator-facing liaison ({liaison!r}) — "
+            f"only they may open a task. See `agenttalk roster`.\n")
+        return 2
+    recipient = _resolve_peer(args.recipient, cfg, sender)
+    body = _read_body(args)
+    if not body:
+        # A task with no body is a work order with no work in it — like
+        # `propose`, no --allow-empty escape hatch.
+        sys.stderr.write(
+            "agenttalk task: empty body (use -m TEXT, --file PATH, or pipe "
+            "stdin) — a work order needs actual instructions.\n")
+        return 2
+    if not getattr(args, "force", False):
+        behind = _roster_members_behind_task_kind(store, roster, exclude=sender)
+        if behind:
+            names = ", ".join(f"{name} ({version})" for name, version in behind)
+            sys.stderr.write(
+                "agenttalk task: refusing — these roster members are on an "
+                "agenttalk build that predates task-kind support and would "
+                f"silently DROP this message (unrecognized kind): {names}. "
+                "Upgrade them first, or re-run with --force to send anyway "
+                "(it will not reach them).\n")
+            return 2
+    meta = _parse_meta(args.meta)
+    _maybe_autogen_request_id("task", meta, quiet=args.quiet)
+    msg = store.send(
+        sender=sender,
+        recipient=recipient,
+        body=body,
+        kind="task",
+        subject=args.subject or "",
+        meta=meta,
+    )
+    if not args.quiet:
+        print(render(msg, header=f"AGENTTALK :: TASK  {msg.sender} -> {msg.recipient}"))
+    if args.print_id:
+        print(msg.meta.get("request_id", msg.id))
+    return 0
+
+
 def cmd_broadcast(args: argparse.Namespace) -> int:
     """Send one message to a whole group (or `--all`) via fan-out.
 
@@ -9638,6 +9764,16 @@ def cmd_reply(args: argparse.Namespace) -> int:
     # args.kind defaults to None so an EXPLICIT --kind (even
     # `--kind message`) is distinguishable - the WP02 review repro.
     kind = args.kind or "message"
+    # #163: `reply --kind task` would otherwise bypass cmd_send's carve-out
+    # entirely (this function calls store.send() directly, below) and open
+    # an UNGATED task from any sender on any thread - the same role +
+    # roster-version checks belong here too, not just on `send`.
+    if kind == "task":
+        sys.stderr.write(
+            "agenttalk reply: --kind task is not allowed via `reply` — use "
+            "the dedicated `agenttalk task` command, which handles the "
+            "sender-role and roster-version gate correctly.\n")
+        return 2
     if na:
         if args.kind is not None:
             sys.stderr.write(
@@ -9650,12 +9786,22 @@ def cmd_reply(args: argparse.Namespace) -> int:
             row = _thread_row_for(store, sender, anchor_rid)
             opener_kind = row.opener_kind if row is not None else None
         else:
-            opener_kind = anchor.kind if anchor.kind in ("review-request", "proposal") else None
-        if opener_kind in ("review-request", "proposal"):
+            opener_kind = (anchor.kind if anchor.kind in ("review-request", "proposal", "task")
+                          else None)
+        if opener_kind in ("review-request", "proposal", "task"):
+            # #163: a task is a lead work order, not an ordinary broadcast a
+            # seat can shrug off - --na (silent non-compliance) is exactly
+            # the shape that let the two codex refusals go unnoticed. If you
+            # will not do the work, say so with `task-response
+            # --meta status=declined --meta reason=<why>`.
+            _typed_response = {
+                "review-request": "review-result",
+                "proposal": "proposal-response",
+                "task": "task-response",
+            }[opener_kind]
             sys.stderr.write(
                 f"agenttalk reply: --na is not valid on a {opener_kind} "
-                f"thread — this thread needs a typed response: "
-                f"{'review-result' if opener_kind == 'review-request' else 'proposal-response'}.\n")
+                f"thread — this thread needs a typed response: {_typed_response}.\n")
             return 2
     dry = getattr(args, "dry_run", False)
     if dry and getattr(args, "await_reply", False):
@@ -14060,10 +14206,11 @@ def build_parser() -> argparse.ArgumentParser:
     pse.add_argument("--kind", default="message",
                      help="Message kind. Known: message, note, question, "
                           "review-request, review-result, proposal, "
-                          "proposal-response, wake, end, composing. "
+                          "proposal-response, task-response, wake, end, composing. "
                           "Unknown kinds are rejected at write time. Prefer the "
                           "`agenttalk propose`/`composing` subcommands over "
-                          "`send --kind proposal`/`composing`.")
+                          "`send --kind proposal`/`composing`; `--kind task` is "
+                          "rejected here entirely - use `agenttalk task`.")
     pse.add_argument("--subject", help="One-line summary")
     pse.add_argument("--meta", action="append", help="key=value (repeatable)")
     pse.add_argument("-m", "--message", help="Body text (else --file or stdin)")
@@ -14971,6 +15118,36 @@ def build_parser() -> argparse.ArgumentParser:
                            "on its own line — the token a counter references.")
     ppro.add_argument("--quiet", action="store_true")
     ppro.set_defaults(func=cmd_propose)
+
+    ptask = sub.add_parser(
+        "task",
+        help="(#163) Send a `task`: a lead work order the recipient must "
+             "execute or explicitly decline. Gated: sender must be the "
+             "roster's sole_lead() or operator_facing() liaison (live "
+             "config); refuses if any other roster member's advertised "
+             "agenttalk_version predates task-kind support unless --force. "
+             "Peer replies with `reply --kind task-response --meta "
+             "status=accepted|declined|done`.",
+    )
+    ptask.add_argument("--from", dest="sender",
+                       help="Sender agent name (default: $AGENTTALK_SELF) — "
+                            "must resolve to the lead or liaison.")
+    ptask.add_argument("--to", dest="recipient",
+                       help="Recipient agent name (default: $AGENTTALK_PEER, "
+                            "or the single other agent in the roster)")
+    ptask.add_argument("--subject", help="One-line summary")
+    ptask.add_argument("--meta", action="append", help="key=value (repeatable)")
+    ptask.add_argument("-m", "--message", help="Body text (else --file or stdin)")
+    ptask.add_argument("--file", help="Read body from this file path ('-' = stdin)")
+    ptask.add_argument("--force", action="store_true",
+                       help="Send even though a roster-version check found "
+                            "members who would silently drop this task — "
+                            "prints exactly who first.")
+    ptask.add_argument("--print-id", action="store_true",
+                       help="Print the task's correlation id (request_id) "
+                            "on its own line.")
+    ptask.add_argument("--quiet", action="store_true")
+    ptask.set_defaults(func=cmd_task)
 
     pbc = sub.add_parser(
         "broadcast",

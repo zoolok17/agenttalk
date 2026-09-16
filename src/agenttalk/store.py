@@ -504,22 +504,28 @@ KNOWN_KINDS = frozenset({
     # message's own claim). `task-response` is the paired reply,
     # carrying `meta.status=accepted|declined|done` like the
     # `review-result`/`proposal-response` pairs already do (see
-    # `gates.RESPONSE_STATUS_ENUMS`). Added in 0.88.0.
+    # `gates.RESPONSE_STATUS_ENUMS`).
+    #
+    # An older receiver's own (older) KNOWN_KINDS silently skips a `task`
+    # message at read time — see `Message.validate`'s docstring above and
+    # the write-time check in `Store.send` below — so `cmd_task` refuses
+    # to open a `task` thread while any OTHER roster member's
+    # last-advertised `agenttalk_version` (`health.json`, stamped every
+    # wrapper turn) is older than the SENDER'S OWN running version, or was
+    # never advertised at all (never a silent assumption of support).
+    # Deliberately compared against the sender's live `__version__`, not a
+    # hardcoded "introduced in X.Y" constant here: this repo bumps
+    # `__version__` in its own dedicated release commit, separate from the
+    # feature PR that adds a kind (see git log on `src/agenttalk/__init__.py`
+    # — "release: vX.Y.Z" commits), so a constant guessing the eventual
+    # release number would be wrong until that bump lands, AND wrong again
+    # for the general case if some later kind ships in a version other than
+    # anyone predicted. "No peer may be older than me" is always correct by
+    # construction — I am running the code that defines `task`. See
+    # `cli._roster_members_behind_task_kind`.
     "task",
     "task-response",
 })
-
-# The first agenttalk release whose KNOWN_KINDS includes "task"/
-# "task-response" (issue #163). An older receiver's own (older)
-# KNOWN_KINDS silently skips a `task` message at read time — see
-# `Message.validate`'s docstring above and the write-time check in
-# `Store.send` below — so `cmd_task` refuses to open a `task` thread
-# while any roster member's last-advertised `agenttalk_version`
-# (`health.json`'s `agenttalk_version` field, stamped every wrapper
-# turn) is older than this, or was never advertised at all (never a
-# silent assumption of support). `--force` overrides, printing exactly
-# who will not see the message.
-TASK_KIND_MIN_VERSION = (0, 88)
 
 # Kinds the bus uses to signal flow control rather than carry agent
 # content. They are still persisted (so transcripts and the dashboard

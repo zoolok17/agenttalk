@@ -116,6 +116,7 @@ def build_snapshot(
     reason_code: str | None = None,
     source: str = "wrapper",
     warnings: list[str] | None = None,
+    agenttalk_version: str | None = None,
 ) -> dict[str, Any]:
     """Build the on-disk schema, omitting unsafe optional ids.
 
@@ -143,6 +144,15 @@ def build_snapshot(
     mid = _safe_id(msg_id)
     if mid is not None:
         snap["msg_id"] = mid
+    # #163: the running package version, so a roster-wide gate (e.g.
+    # `agenttalk task`'s write-time check) can tell whether a peer's build
+    # recognizes a kind added after theirs, without spawning a subprocess
+    # probe. Optional/additive like request_id/msg_id above — an older
+    # writer's snapshot simply lacks the field, read as "unknown" by any
+    # consumer, never a crash.
+    av = _safe_token(agenttalk_version)
+    if av is not None:
+        snap["agenttalk_version"] = av
     return snap
 
 
@@ -223,6 +233,7 @@ def normalize(
         reason_code=raw.get("reason_code"),
         source=raw.get("source") or "wrapper",
         warnings=_safe_warnings(raw.get("warnings")),
+        agenttalk_version=raw.get("agenttalk_version"),
     )
     out["age_seconds"] = round(age, 3)
     out["stale"] = False

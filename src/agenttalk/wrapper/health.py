@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from agenttalk import __version__
 from agenttalk import health as health_model
 from agenttalk.correlation import resolve_request_id
 
@@ -94,6 +95,7 @@ class WrapperHealthWriter:
             reason_code=reason_code,
             source="wrapper",
             warnings=warnings or [],
+            agenttalk_version=__version__,
         )
         try:
             self.store.write_health(self.agent, snap)
