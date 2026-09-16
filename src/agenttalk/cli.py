@@ -649,6 +649,7 @@ def _gather_status(store: Store) -> dict:
     ]
     quarantined = store.quarantined_count()
     dead_lettered = _unresolved_dead_letter_count(store)
+    reply_refused = _unresolved_reply_refusal_count(store)
     signing_enforced = store.signing_enforced()
     # project_id is path-derived; surfaces here for diagnostics
     project_id = store.project_id()
@@ -706,6 +707,8 @@ def _gather_status(store: Store) -> dict:
         payload["quarantined"] = quarantined  # additive: absent when zero
     if dead_lettered:
         payload["dead_lettered_count"] = dead_lettered  # additive: absent when zero
+    if reply_refused:
+        payload["reply_refused_count"] = reply_refused  # additive: absent when zero
     if lead_chat.get("request_id"):
         payload["lead_chat"] = lead_chat
     if signing_enforced:
@@ -1367,6 +1370,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     if payload.get("dead_lettered_count"):
         print(f"dead-letter: {payload['dead_lettered_count']} poison message(s) "
               "(see `agenttalk dead-letter list`; recoverable via requeue)")
+    if payload.get("reply_refused_count"):
+        print(f"reply-refused: {payload['reply_refused_count']} refused reply draft(s) "
+              "(see `agenttalk reply-refusal list`; draft bytes preserved, resolvable)")
     for a in payload["agents"]:
         cursor = a["cursor"] or "(none)"
         if a["heartbeat"] is None:
@@ -12237,6 +12243,21 @@ def _unresolved_dead_letter_count(store: Store, agent: str | None = None) -> int
         return store.dead_lettered_count(agent)
 
 
+def _unresolved_reply_refusal_count(store: Store, agent: str | None = None) -> int:
+    """#162: the `status` summary-line counterpart of doctor's own
+    `_check_reply_refused` - same sink, same resolved-awareness, a cheap
+    count only (no escalation-routing analysis; that stays doctor's job)."""
+    try:
+        from agenttalk import reply_refusals
+        items = reply_refusals.list_reply_refusals(store, agent)
+        return sum(
+            1 for m in items
+            if not reply_refusals.is_resolved(store, m.get("_agent"), m.get("original_message_id"))
+        )
+    except Exception:  # noqa: BLE001 - a status summary must never crash on a read failure
+        return 0
+
+
 def _is_listed_dead_letter(store: Store, agent: str, msg_id: str) -> bool:
     """SECURITY guard (reviewer-2 F5): the --id must be an EXACT message_id currently in the
     agent's sink. Blocks a path-traversal id (e.g. ..\\..\\config) from reaching ANY payload
@@ -12672,6 +12693,92 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
               "(new id, own fresh attempt count; original evidence preserved in the sink)")
         return 0
     sys.stderr.write("agenttalk dead-letter: expected list, show, requeue, resolve, or purge.\n")
+    return 2
+
+
+def cmd_reply_refusal(args: argparse.Namespace) -> int:
+    """#162: inspect + resolve wrapper-refused reply drafts. SEPARATE from
+    `dead-letter` (that path moves a POISON INBOUND message and advances the
+    cursor; a refused reply is an OUTBOUND publish failure - the inbound
+    message was handled fine, nothing here is ever moved). A simpler sink than
+    dead-letter's own: resolution is a sidecar file only, not the central
+    attention/disposition log dead-letter integrates with - a deliberate scope
+    choice for this first cut, not an oversight."""
+    from agenttalk import reply_refusals
+
+    store = _get_store(args)
+    action = getattr(args, "reply_refusal_cmd", None)
+    if action == "list":
+        items = reply_refusals.list_reply_refusals(store, getattr(args, "agent", None))
+        show_resolved = getattr(args, "resolved", False)
+        show_all = getattr(args, "all", False)
+        if not show_all:
+            items = [
+                m for m in items
+                if reply_refusals.is_resolved(
+                    store, m.get("_agent"), m.get("original_message_id")) == show_resolved
+            ]
+        if getattr(args, "json", False):
+            print(json.dumps(items, indent=2))
+            return 0
+        if not items:
+            print("reply-refusal: none")
+            return 0
+        print(f"reply-refusal ({len(items)}):")
+        for m in items:
+            print(f"  {m.get('_agent')}/{m.get('original_message_id')}  "
+                  f"from={m.get('original_from')} kind={m.get('intended_kind')} "
+                  f"reason={(m.get('reason') or '')[:60]}")
+        if not show_resolved:
+            print("  tip: `agenttalk reply-refusal show --agent A --id ID` for the full "
+                  "reason + draft path; `resolve --reason ...` once handled to quiet it.")
+        return 0
+    if action == "show":
+        if not (getattr(args, "agent", None) and getattr(args, "id", None)):
+            sys.stderr.write("agenttalk reply-refusal show: --agent and --id are required.\n")
+            return 2
+        record = reply_refusals.read_reply_refusal(store, args.agent, args.id)
+        if record is None:
+            sys.stderr.write(
+                f"agenttalk reply-refusal show: no reply-refusal {args.agent}/{args.id}.\n")
+            return 2
+        resolved = reply_refusals.is_resolved(store, args.agent, args.id)
+        out = {"record": record, "resolved": resolved}
+        if getattr(args, "json", False):
+            print(json.dumps(out, indent=2))
+            return 0
+        print(json.dumps(record, indent=2))
+        print(f"---- resolved: {resolved} ----")
+        print(f"reason: {record.get('reason')}")
+        print(f"draft path: {record.get('draft_path')}")
+        print("---- re-publish recipe (run as the affected seat) ----")
+        print(f"agenttalk reply --from {args.agent} --to-id {record.get('original_message_id')} "
+              f"--file {record.get('draft_path')}")
+        return 0
+    if action == "resolve":
+        if not (getattr(args, "agent", None) and getattr(args, "id", None)):
+            sys.stderr.write("agenttalk reply-refusal resolve: --agent and --id are required.\n")
+            return 2
+        reason = getattr(args, "reason", None)
+        if not reason or not reason.strip():
+            sys.stderr.write("agenttalk reply-refusal resolve: --reason is required.\n")
+            return 2
+        actor = _resolve_disposition_actor(store, args)
+        if actor is None:
+            sys.stderr.write(
+                "agenttalk reply-refusal resolve: only the operator-facing liaison "
+                "(or the sole lead) may resolve; resolve --from/$AGENTTALK_SELF.\n")
+            return 2
+        try:
+            reply_refusals.resolve_reply_refusal(
+                store, args.agent, args.id, reason=reason, sender=actor,
+                evidence=getattr(args, "evidence", None), at=_attn_now_iso())
+        except FileNotFoundError as e:
+            sys.stderr.write(f"agenttalk reply-refusal resolve: {e}\n")
+            return 2
+        print(f"resolved reply-refusal {args.agent}/{args.id}")
+        return 0
+    sys.stderr.write("agenttalk reply-refusal: expected list, show, or resolve.\n")
     return 2
 
 
@@ -15606,6 +15713,41 @@ def build_parser() -> argparse.ArgumentParser:
     dlp.add_argument("--dry-run", action="store_true")
     dlp.add_argument("--json", action="store_true")
     dlp.set_defaults(func=cmd_dead_letter, dead_letter_cmd="purge")
+
+    prr = sub.add_parser(
+        "reply-refusal",
+        help="Inspect + resolve wrapper-refused reply drafts (#162): the child wrote "
+             "an answer, but the wrapper's own publish step refused it. SEPARATE from "
+             "`dead-letter` (that path is for a POISON INBOUND message; a refused "
+             "reply is an OUTBOUND publish failure - nothing is moved here).",
+    )
+    prr.set_defaults(func=cmd_reply_refusal, reply_refusal_cmd=None)
+    rrsub = prr.add_subparsers(dest="reply_refusal_cmd")
+    rrl = rrsub.add_parser("list", help="List refused replies (unresolved by default).")
+    rrl.add_argument("--agent", help="Limit to one agent (default: all).")
+    rrl.add_argument("--json", action="store_true")
+    rrl.add_argument("--resolved", action="store_true", help="Show RESOLVED entries only.")
+    rrl.add_argument("--all", action="store_true", help="Show resolved + unresolved.")
+    rrl.set_defaults(func=cmd_reply_refusal)
+    rrs = rrsub.add_parser("show", help="Show one refusal's reason, draft path and "
+                                        "re-publish recipe.")
+    rrs.add_argument("--agent", required=True)
+    rrs.add_argument("--id", required=True, help="The ORIGINAL inbound message id "
+                                                  "the refused reply was answering.")
+    rrs.add_argument("--json", action="store_true")
+    rrs.set_defaults(func=cmd_reply_refusal)
+    rrr = rrsub.add_parser(
+        "resolve",
+        help="Operator decision: mark a refused reply handled (record preserved; "
+             "removes it from the default list and clears the health WARN).")
+    rrr.add_argument("--agent", required=True)
+    rrr.add_argument("--id", required=True)
+    rrr.add_argument("--reason", required=True, help="Required non-empty reason.")
+    rrr.add_argument("--evidence", help="Optional pointer to where it was handled.")
+    rrr.add_argument("--from", dest="sender",
+                     help="Actor (default $AGENTTALK_SELF); must resolve to the liaison "
+                          "or sole lead.")
+    rrr.set_defaults(func=cmd_reply_refusal)
 
     pmll = sub.add_parser(
         "managed-lead-loop",
