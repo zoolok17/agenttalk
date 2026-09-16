@@ -2054,13 +2054,19 @@ def test_task_refuses_when_recipient_advertises_no_version_at_all(
 
 
 def test_task_force_sends_anyway_past_the_version_gate(
-    store: Store, store_root: Path,
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
 ) -> None:
     store.set_role("alpha", "lead")
     store.write_health("beta", {"agenttalk_version": "0.80.0"})
     rc = _run(["task", "--from", "alpha", "--to", "beta", "--force", "-m", "go"], store_root)
     assert rc == 0
     assert store.messages_for("beta")[-1].kind == "task"
+    # reviewer-3 (PR #165): --force must still print exactly who will not
+    # see the message, matching its own docstring/help/CHANGELOG claim -
+    # not silently skip the computation just because it isn't blocking.
+    err = capsys.readouterr().err
+    assert "--force" in err
+    assert "beta (0.80.0)" in err
 
 
 def test_task_ignores_senders_own_stale_health_for_the_version_gate(

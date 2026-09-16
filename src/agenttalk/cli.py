@@ -7451,10 +7451,10 @@ def cmd_task(args: argparse.Namespace) -> int:
             "agenttalk task: empty body (use -m TEXT, --file PATH, or pipe "
             "stdin) — a work order needs actual instructions.\n")
         return 2
-    if not getattr(args, "force", False):
-        behind = _roster_members_behind_task_kind(store, roster, exclude=sender)
-        if behind:
-            names = ", ".join(f"{name} ({version})" for name, version in behind)
+    behind = _roster_members_behind_task_kind(store, roster, exclude=sender)
+    if behind:
+        names = ", ".join(f"{name} ({version})" for name, version in behind)
+        if not getattr(args, "force", False):
             sys.stderr.write(
                 "agenttalk task: refusing — these roster members are on an "
                 "agenttalk build that predates task-kind support and would "
@@ -7462,6 +7462,15 @@ def cmd_task(args: argparse.Namespace) -> int:
                 "Upgrade them first, or re-run with --force to send anyway "
                 "(it will not reach them).\n")
             return 2
+        # --force: still compute and print who will not see it (a
+        # non-blocking advisory) before sending anyway - reviewer-3's
+        # finding: the code must match its own docstring/help/CHANGELOG
+        # claim that --force "prints exactly who will not see the
+        # message," not just silently override the refusal.
+        sys.stderr.write(
+            f"agenttalk task: --force — sending anyway. These roster members "
+            f"will NOT see it (agenttalk build predates task-kind support): "
+            f"{names}.\n")
     meta = _parse_meta(args.meta)
     _maybe_autogen_request_id("task", meta, quiet=args.quiet)
     msg = store.send(
