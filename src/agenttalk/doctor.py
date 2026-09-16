@@ -1027,7 +1027,7 @@ def _check_declined_lead_tasks(store: Store) -> Check | None:
             ths = _th.derive_threads(
                 messages, agent=a, cursor=store.cursor(a) or "",
                 closed_rids=closed, retired=set(store.retired_agents()))
-        except Exception:  # noqa: BLE001 - best-effort; never crash doctor
+        except Exception:  # noqa: BLE001, S112  # nosec - best-effort; never crash doctor
             continue
         for t in ths:
             if (t.opener_kind == "task" and t.role == "opener"
