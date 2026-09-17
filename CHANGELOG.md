@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.89.0] - 2026-09-17
+
+Theme: **the last field fixes before the freeze - what the first
+modernization programme's own review rounds found in the fixes it
+motivated, plus a verified store backup as safety for the comparison
+rerun.**
+
+Field basis: the same programme as 0.88.0, one day later. Two of the
+four entries were found by reviewers reading the 0.88.0 fixes (#169 from
+the #145 read, #170 from diagnosing red lanes on the 0.88.0 pull
+requests); the runtime build procedure was written by building the
+v0.88.0 runtime itself; the backup increment is the first slice of #156
+(store loss), shipped now so that a store wipe during the blind
+comparison rerun is recoverable. agenttalk is frozen at this release for
+the duration of that rerun. Backup is declared as safety, not as part of
+the treatment being compared.
+
 ### Added
 
 - **`agenttalk backup` (#156 increment 1).** The bus store (`.agenttalk/`)
@@ -57,9 +74,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   separate `_run_one` closure for the managed lead-loop's synthetic
   cadence turns, and that copy's non-JSON handling was a bare `continue`
   with no capture at all - the same failure shape on a cadence RESUME
-  attempt still fell to the generic ambiguous class, which the #205 guard
-  can promote to a sticky `config_blocked` park on the second consecutive
-  occurrence. The capture/finalize closures are now a single shared
+  attempt still fell to the generic ambiguous class, so the cadence loop
+  applied its own generic failure backoff instead of the infra-classed
+  bounded backoff the seat path gets (the #205 sticky-park guard belongs
+  to the seat path and is not involved here; cadence returns a bool and
+  keeps its separate backoff). The capture/finalize closures are now a single shared
   factory (`_child_output_capture`, called by both `_run_one`s) instead
   of two hand-duplicated copies, so this class of drift cannot recur
   independently on either path again.

@@ -2250,7 +2250,11 @@ def test_task_ignores_senders_own_stale_health_for_the_version_gate(
     # The sender is obviously current (it is running this exact check) - its
     # own possibly-absent/stale health.json must never self-block a task.
     store.set_role("alpha", "lead")
-    store.write_health("beta", {"agenttalk_version": "0.88.0"})
+    # The peer advertises the CURRENT package version: the gate compares
+    # against the sender's own running major.minor, so a literal pin here
+    # would go red on every release bump (it did on 0.89.0).
+    from agenttalk import __version__
+    store.write_health("beta", {"agenttalk_version": __version__})
     rc = _run(["task", "--from", "alpha", "--to", "beta", "-m", "go"], store_root)
     assert rc == 0
 
