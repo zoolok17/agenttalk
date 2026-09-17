@@ -204,6 +204,12 @@ def run(project_root: Path | None = None) -> Report:
         lead_check = _check_lead_unarmed(store)
         if lead_check is not None:  # additive: absent unless a lead-loop concern exists
             report.checks.append(lead_check)
+        task_avail = _check_task_kind_availability(store)
+        if task_avail is not None:  # additive: absent unless no agent can send a task
+            report.checks.append(task_avail)
+        declined_tasks = _check_declined_lead_tasks(store)
+        if declined_tasks is not None:  # additive: absent unless a declined/stale task exists
+            report.checks.append(declined_tasks)
     return report
 
 
@@ -941,6 +947,117 @@ def _check_lead_unarmed(store) -> Check | None:
              "lead/liaison warning is advisory: run the heartbeat hook so armed-vs-idle "
              "is distinguishable, or migrate it to a managed lead-loop."),
         data=data)
+
+
+def _check_task_kind_availability(store: Store) -> Check | None:
+    """(#163) WARN when nobody in the roster can send a `task` right now -
+    zero or 2+ leads (ambiguous - see ``Store.sole_lead()``'s own
+    fail-closed doc) AND no ``operator_facing`` liaison. ``agenttalk task``
+    already reports this at the point of use with a clear message
+    (reviewer-3's non-blocking note); doctor surfaces it ambiently too, so
+    it is visible before anyone tries to send one. Absent when a lead or
+    liaison exists, or the roster is empty."""
+    try:
+        cfg = store.load_config()
+    except Exception:  # noqa: BLE001 - doctor never crashes
+        return None
+    roster = cfg.get("agents", []) or []
+    if not roster:
+        return None
+    if store.sole_lead() is not None or store.operator_facing() is not None:
+        return None
+    roles = cfg.get("roles") or {}
+    lead_count = sum(1 for a in roster
+                     if isinstance(roles.get(a), str) and roles[a].casefold() == "lead")
+    reason = (f"{lead_count} agents hold role=lead (ambiguous)" if lead_count > 1
+             else "no agent holds role=lead")
+    return Check(
+        name="task_kind_availability",
+        status="warn",
+        details=f"no agent can send a `task` work order right now - {reason}, and no "
+                f"operator_facing liaison is configured.",
+        fix="`agenttalk roster set-role <agent> lead` or "
+            "`agenttalk roster set-operator-facing <agent>`.",
+    )
+
+
+# (#163) task threads open-outbound/reply-waiting past this age are treated
+# as unanswered for `_check_declined_lead_tasks` - the failure mode the
+# issue was opened over (a work order neither accepted, declined, nor done,
+# with nothing structured recording that it was ever seen). Deliberately
+# the SAME number as the composing-extension cap (cli._COMPOSING_MAX_EXTEND
+# _SECONDS) and store.COMPOSING_INTENT_STALE_SECONDS: if a genuinely-working
+# assignee could not have held a waiter open past this horizon via
+# `composing` pings, a task should not look silently fine past it either.
+_STALE_TASK_SECONDS = 1800.0
+
+
+def _check_declined_lead_tasks(store: Store) -> Check | None:
+    """(#163) Surface task-response outcomes doctor could not see at all
+    before this kind existed.
+
+    ``declined`` is informational (WARN, not ERROR) - an assignee said no
+    with a reason, the system working as designed. A `task` thread with NO
+    `task-response` past ``_STALE_TASK_SECONDS`` is the actual failure mode
+    #163 was opened over (ERROR): neither accepted, declined, nor done -
+    and worth naming plainly, the two codex refusals that opened this issue
+    were plain PROSE in an ordinary reply, invisible to any structured scan
+    like this one; this check is what a `task-response` contract makes
+    possible going forward, not a retroactive fix for messages that predate
+    it. Absent when there is nothing to report."""
+    from . import threads as _th
+    try:
+        messages = store.valid_messages()
+        roster = store.load_config().get("agents", []) or []
+    except Exception:  # noqa: BLE001 - doctor never crashes
+        return None
+    declined = [
+        {
+            "request_id": (m.meta or {}).get("request_id"),
+            "from": m.sender,
+            "to": m.recipient,
+            "reason": (m.meta or {}).get("reason"),
+        }
+        for m in messages
+        if m.kind == "task-response" and (m.meta or {}).get("status") == "declined"
+    ]
+    stale: list[dict] = []
+    seen_rids: set[str] = set()
+    for a in roster:
+        try:
+            closed = {rid for rid, e in store.read_threadstate(a).items()
+                     if isinstance(e, dict) and e.get("closed") is True}
+            ths = _th.derive_threads(
+                messages, agent=a, cursor=store.cursor(a) or "",
+                closed_rids=closed, retired=set(store.retired_agents()))
+        except Exception:  # noqa: BLE001, S112  # nosec - best-effort; never crash doctor
+            continue
+        for t in ths:
+            if (t.opener_kind == "task" and t.role == "opener"
+                    and t.state in ("open-outbound", "reply-waiting")
+                    and t.request_id not in seen_rids
+                    and (t.age_seconds or 0.0) >= _STALE_TASK_SECONDS):
+                seen_rids.add(t.request_id)
+                stale.append({"request_id": t.request_id, "from": a, "to": t.peer,
+                             "age_seconds": round(t.age_seconds or 0.0, 1)})
+    if not declined and not stale:
+        return None
+    details = []
+    if stale:
+        details.append(
+            f"{len(stale)} task(s) unanswered past {_STALE_TASK_SECONDS:.0f}s - "
+            f"neither accepted, declined, nor done")
+    if declined:
+        details.append(f"{len(declined)} task(s) declined")
+    return Check(
+        name="declined_lead_tasks",
+        status="error" if stale else "warn",
+        details="; ".join(details),
+        fix="Review stale task threads via `agenttalk threads` - a silent "
+            "non-response to a lead task is the exact failure #163 was "
+            "opened to catch.",
+        data={"stale": stale, "declined": declined},
+    )
 
 
 def _check_dead_letter_escalations(store) -> Check | None:

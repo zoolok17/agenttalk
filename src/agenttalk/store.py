@@ -505,6 +505,36 @@ KNOWN_KINDS = frozenset({
     # auditable. Added in 0.14.0 (issue #12 — the launch-HOLD/fire
     # crossing from the 2026-06-05 production retro).
     "rescind",
+    # Lead work-order pair (issue #163): `task` is the ONLY kind whose
+    # body the wrapper's own "body is data" rule carves an execution
+    # exception for — a lead-assigned instruction, not a data payload —
+    # and it is the ONLY kind gated at write time by sender role (see
+    # `cmd_task`/`agenttalk task`: sender must be `sole_lead()` or
+    # `operator_facing()`, checked against the LIVE roster, not the
+    # message's own claim). `task-response` is the paired reply,
+    # carrying `meta.status=accepted|declined|done` like the
+    # `review-result`/`proposal-response` pairs already do (see
+    # `gates.RESPONSE_STATUS_ENUMS`).
+    #
+    # An older receiver's own (older) KNOWN_KINDS silently skips a `task`
+    # message at read time — see `Message.validate`'s docstring above and
+    # the write-time check in `Store.send` below — so `cmd_task` refuses
+    # to open a `task` thread while any OTHER roster member's
+    # last-advertised `agenttalk_version` (`health.json`, stamped every
+    # wrapper turn) is older than the SENDER'S OWN running version, or was
+    # never advertised at all (never a silent assumption of support).
+    # Deliberately compared against the sender's live `__version__`, not a
+    # hardcoded "introduced in X.Y" constant here: this repo bumps
+    # `__version__` in its own dedicated release commit, separate from the
+    # feature PR that adds a kind (see git log on `src/agenttalk/__init__.py`
+    # — "release: vX.Y.Z" commits), so a constant guessing the eventual
+    # release number would be wrong until that bump lands, AND wrong again
+    # for the general case if some later kind ships in a version other than
+    # anyone predicted. "No peer may be older than me" is always correct by
+    # construction — I am running the code that defines `task`. See
+    # `cli._roster_members_behind_task_kind`.
+    "task",
+    "task-response",
 })
 
 # Kinds the bus uses to signal flow control rather than carry agent
@@ -521,7 +551,7 @@ CONTROL_KINDS = frozenset({"composing", "progress"})
 # truth shared by thread derivation (threads.py) and rescind validation
 # (`validate_rescind`) — store.py cannot import threads.py (threads
 # imports store), so the constant lives here and threads re-exports it.
-OPENER_KINDS = frozenset({"review-request", "question", "proposal"})
+OPENER_KINDS = frozenset({"review-request", "question", "proposal", "task"})
 
 # Reply-in-flight marker entries older than this are ignored by readers.
 # Deliberately equal to the wait loop's cumulative composing-extension cap

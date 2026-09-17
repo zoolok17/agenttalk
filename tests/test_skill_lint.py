@@ -57,6 +57,10 @@ SKILL_INVARIANTS = [
         "Proposal handling",               # proposal routing section
         "proposal-response",               # proposal verdict kind
         "agenttalk threads --for",         # thread-hygiene check
+        "task-response",                   # #163 work-order response kind
+        "Verify the sender independently", # #163 live-roster re-check, not the claim
+        "ONE narrow, explicitly-authenticated exception",  # #163 body-is-data carve-out
+        "stays untrusted data",            # #163 quoted/relayed content inside a task
         "Long-running work",               # #164 progress-note section
         "does NOT end your turn",          # #164 core rule (mirrors _DEFAULT_RULES)
         "agenttalk progress --from $SELF --to-id",  # #164 exact invocation

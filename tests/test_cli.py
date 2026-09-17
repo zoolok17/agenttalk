@@ -2113,6 +2113,148 @@ def test_propose_empty_body_errors(store_root: Path) -> None:
     _run_expect_exit(["propose", "--from", "alpha", "--to", "beta"], store_root, 2)
 
 
+# ============================ #163: task work orders ========================
+
+def _mark_current(store: Store, agent: str) -> None:
+    """Stamp `agent`'s health.json with a current agenttalk_version, so the
+    roster-version gate (which fails CLOSED on no-advertisement) does not
+    block a happy-path test that isn't about that gate."""
+    from agenttalk import __version__
+    store.write_health(agent, {"agenttalk_version": __version__})
+
+
+def test_task_from_sole_lead_mints_tk_id_and_task_kind(
+    store: Store, store_root: Path,
+) -> None:
+    store.set_role("alpha", "lead")
+    _mark_current(store, "beta")
+    rc = _run(["task", "--from", "alpha", "--to", "beta", "-m", "rename the field"],
+              store_root)
+    assert rc == 0
+    msg = store.messages_for("beta")[-1]
+    assert msg.kind == "task"
+    assert msg.meta.get("request_id", "").startswith("tk-")
+
+
+def test_task_from_operator_facing_liaison_succeeds(
+    store: Store, store_root: Path,
+) -> None:
+    # No role=lead at all - the operator_facing liaison alone is enough,
+    # mirroring the existing release-kind precedent.
+    store.set_operator_facing("alpha")
+    _mark_current(store, "beta")
+    rc = _run(["task", "--from", "alpha", "--to", "beta", "-m", "go"], store_root)
+    assert rc == 0
+    assert store.messages_for("beta")[-1].kind == "task"
+
+
+def test_task_from_non_lead_non_liaison_refuses(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    store.set_role("alpha", "lead")
+    # beta is neither the lead nor the liaison.
+    _run_expect_exit(["task", "--from", "beta", "--to", "alpha", "-m", "go"], store_root, 2)
+    assert "is not the roster's lead" in capsys.readouterr().err
+
+
+def test_task_no_lead_and_no_liaison_refuses_with_clear_message(
+    store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    # Fresh roster: no role=lead, no operator_facing - reviewer-3's
+    # non-blocking note: must be a clear message, not a bare exit 2.
+    _run_expect_exit(["task", "--from", "alpha", "--to", "beta", "-m", "go"], store_root, 2)
+    err = capsys.readouterr().err
+    assert "no agent can send a task" in err
+    assert "set-role" in err and "set-operator-facing" in err
+
+
+def test_send_kind_task_rejected_even_from_lead(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    store.set_role("alpha", "lead")
+    _run_expect_exit(
+        ["send", "--from", "alpha", "--to", "beta", "--kind", "task", "-m", "go"],
+        store_root, 2)
+    assert "agenttalk task" in capsys.readouterr().err
+
+
+def test_reply_kind_task_rejected(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    store.set_role("alpha", "lead")
+    _run(["send", "--from", "beta", "--to", "alpha", "-m", "hi"], store_root)
+    _run_expect_exit(
+        ["reply", "--from", "alpha", "--kind", "task", "-m", "go"], store_root, 2)
+    assert "agenttalk task" in capsys.readouterr().err
+
+
+def test_task_response_is_not_gated_and_closes_thread(
+    store: Store, store_root: Path,
+) -> None:
+    # Unlike `task` itself, `task-response` goes through generic send/reply
+    # like review-result/proposal-response already do - any recipient can
+    # accept/decline/finish a task addressed to them.
+    store.set_role("alpha", "lead")
+    _mark_current(store, "beta")
+    _run(["task", "--from", "alpha", "--to", "beta", "-m", "go"], store_root)
+    rid = store.messages_for("beta")[-1].meta["request_id"]
+    rc = _run(["reply", "--from", "beta", "--kind", "task-response",
+               "--meta", "status=declined", "--meta", "reason=out of scope",
+               "-m", "not doing this"], store_root)
+    assert rc == 0
+    resp = store.messages_for("alpha")[-1]
+    assert resp.kind == "task-response"
+    assert resp.meta["status"] == "declined"
+    assert resp.meta["request_id"] == rid
+
+
+def test_task_refuses_when_recipient_advertises_old_version(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    store.set_role("alpha", "lead")
+    store.write_health("beta", {"agenttalk_version": "0.80.0"})
+    _run_expect_exit(["task", "--from", "alpha", "--to", "beta", "-m", "go"], store_root, 2)
+    err = capsys.readouterr().err
+    assert "beta (0.80.0)" in err
+    assert "--force" in err
+
+
+def test_task_refuses_when_recipient_advertises_no_version_at_all(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    store.set_role("alpha", "lead")
+    store.write_health("beta", {"state": "idle_waiting"})  # no agenttalk_version key
+    _run_expect_exit(["task", "--from", "alpha", "--to", "beta", "-m", "go"], store_root, 2)
+    assert "beta (unknown)" in capsys.readouterr().err
+
+
+def test_task_force_sends_anyway_past_the_version_gate(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    store.set_role("alpha", "lead")
+    store.write_health("beta", {"agenttalk_version": "0.80.0"})
+    rc = _run(["task", "--from", "alpha", "--to", "beta", "--force", "-m", "go"], store_root)
+    assert rc == 0
+    assert store.messages_for("beta")[-1].kind == "task"
+    # reviewer-3 (PR #165): --force must still print exactly who will not
+    # see the message, matching its own docstring/help/CHANGELOG claim -
+    # not silently skip the computation just because it isn't blocking.
+    err = capsys.readouterr().err
+    assert "--force" in err
+    assert "beta (0.80.0)" in err
+
+
+def test_task_ignores_senders_own_stale_health_for_the_version_gate(
+    store: Store, store_root: Path,
+) -> None:
+    # The sender is obviously current (it is running this exact check) - its
+    # own possibly-absent/stale health.json must never self-block a task.
+    store.set_role("alpha", "lead")
+    store.write_health("beta", {"agenttalk_version": "0.88.0"})
+    rc = _run(["task", "--from", "alpha", "--to", "beta", "-m", "go"], store_root)
+    assert rc == 0
+
+
 def test_send_question_autogen_q_request_id(
     store: Store, store_root: Path, capsys: pytest.CaptureFixture,
 ) -> None:

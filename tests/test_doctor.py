@@ -1397,6 +1397,87 @@ def test_doctor_escalation_target_absent_for_solo(tmp_path: Path) -> None:
     assert _esc_check(doctor.run(tmp_path)) is None
 
 
+# ============================ #163: task work orders ========================
+
+def _task_avail_check(report):
+    return next((c for c in report.checks if c.name == "task_kind_availability"), None)
+
+
+def _declined_tasks_check(report):
+    return next((c for c in report.checks if c.name == "declined_lead_tasks"), None)
+
+
+def test_doctor_task_kind_availability_warns_with_no_lead_no_liaison(tmp_path: Path) -> None:
+    Store(tmp_path).init(["alpha", "beta"])
+    chk = _task_avail_check(doctor.run(tmp_path))
+    assert chk is not None and chk.status == "warn"
+    assert "no agent holds role=lead" in chk.details
+    assert "set-role" in chk.fix and "set-operator-facing" in chk.fix
+
+
+def test_doctor_task_kind_availability_absent_with_lead(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    s.set_role("alpha", "lead")
+    assert _task_avail_check(doctor.run(tmp_path)) is None
+
+
+def test_doctor_task_kind_availability_absent_with_liaison(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    s.set_operator_facing("alpha")
+    assert _task_avail_check(doctor.run(tmp_path)) is None
+
+
+def test_doctor_declined_lead_tasks_absent_with_no_task_threads(tmp_path: Path) -> None:
+    Store(tmp_path).init(["alpha", "beta"])
+    assert _declined_tasks_check(doctor.run(tmp_path)) is None
+
+
+def test_doctor_declined_lead_tasks_warns_on_declined_fixture(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    s.set_role("alpha", "lead")
+    opener = s.send(sender="alpha", recipient="beta", body="do X", kind="task",
+                    subject="", meta={"request_id": "tk-fixture-1"})
+    s.send(sender="beta", recipient="alpha", body="not doing this",
+          kind="task-response",
+          meta={"request_id": opener.meta["request_id"], "status": "declined",
+                "reason": "out of scope"})
+    chk = _declined_tasks_check(doctor.run(tmp_path))
+    assert chk is not None and chk.status == "warn"
+    assert "1 task(s) declined" in chk.details
+    assert chk.data["declined"][0]["reason"] == "out of scope"
+    assert chk.data["stale"] == []
+
+
+def test_doctor_declined_lead_tasks_errors_on_unanswered_past_staleness(
+    tmp_path: Path,
+) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    s.set_role("alpha", "lead")
+    s.send(sender="alpha", recipient="beta", body="do X", kind="task",
+          meta={"request_id": "tk-fixture-2"})
+    # Backdate the opener's own on-disk message ts well past the staleness
+    # window instead of monkeypatching time - `derive_threads` computes
+    # age off the message's own timestamp. Exactly one message exists at
+    # this point (the opener, no response yet).
+    path = next(s.messages_dir.glob("*.json"))
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    old_ts = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat().replace(
+        "+00:00", "Z")
+    raw["ts"] = old_ts
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    chk = _declined_tasks_check(doctor.run(tmp_path))
+    assert chk is not None and chk.status == "error"
+    assert "unanswered past" in chk.details
+    assert chk.data["stale"][0]["request_id"] == "tk-fixture-2"
+    assert chk.data["stale"][0]["from"] == "alpha"
+
+
 # ----- 0.55.1: supervised-codex L4 observability -----------------------
 
 def _write_supervisor(store: Store, agents: dict) -> None:

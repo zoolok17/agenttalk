@@ -44,6 +44,24 @@ def test_prompt_assembly_includes_message_and_rules() -> None:
     assert "REJOIN CONTEXT" in p2 and "roster: a,b" in p2 and "custom rules" in p2
 
 
+def test_prompt_renders_sender_is_lead_fact_when_provided() -> None:
+    # #163: sender_is_lead is a FACT the caller already computed against the
+    # live roster - the function only renders it, never re-derives it, so
+    # both true/false must show and the line must vanish entirely when the
+    # caller has no store context (existing tests above with no kwarg).
+    rec = {"from": "lead", "kind": "task", "body": "rename the field",
+           "correlation_id": "tk-1", "request_id": "tk-1", "broadcast_id": None}
+    p_true = prompt.assemble_turn_prompt(rec, sender_is_lead=True)
+    assert "sender_is_lead: true" in p_true
+    assert "- task: see the SENDER_IS_LEAD FACT header line" in p_true
+
+    p_false = prompt.assemble_turn_prompt(rec, sender_is_lead=False)
+    assert "sender_is_lead: false" in p_false
+
+    p_omitted = prompt.assemble_turn_prompt(rec)
+    assert "sender_is_lead" not in p_omitted
+
+
 def test_prompt_gives_exact_reply_invocation_for_ordinary_thread() -> None:
     # A wrapped model fumbled `agenttalk reply` flags (--to / --request-id / --body)
     # and inline multi-line -m bodies, burning a turn without a reply. The prompt must
@@ -1670,6 +1688,57 @@ def test_make_drive_injects_lesson_context_and_records_exposure(tmp_path) -> Non
     assert "body" not in event["lessons"][0]
     assert event["prompt_block_sha256"]
     assert event["turn_id"].startswith("turn-")
+
+
+def test_make_drive_recomputes_sender_is_lead_from_live_roster_mid_session(
+    tmp_path,
+) -> None:
+    # #163 reviewer-3: a lead handoff MID-SESSION, then a new task, must
+    # render the NEW lead as sender_is_lead=true and the OLD one as false -
+    # proving the fact is re-resolved from the live roster every turn, not
+    # cached from session start (the roster-and-context-lifecycle lesson:
+    # resolve at act-time, inside the wrapped turn). beta is the driven
+    # agent throughout (its own session never resets); alpha starts as
+    # lead, gamma takes over mid-session.
+    s = _store(tmp_path)
+    s.add_agent("gamma", role="worker")
+    s.set_role("alpha", "lead")
+    st = session.SessionState(cli="codex")
+    spawned: list[tuple[list[str], str | None]] = []
+
+    def fake_spawn(argv, stdin):
+        spawned.append((argv, stdin))
+        return _codex_turn_lines()
+
+    drive = run.make_drive(s, "beta", "codex", st, ["codex"], spawn=fake_spawn,
+                           clock=lambda: 0.0, render=False)
+    rec_from_alpha = {"id": "msg-1", "from": "alpha", "to": "beta", "kind": "task",
+                      "subject": "task 1", "body": "do X",
+                      "correlation_id": "tk-1", "request_id": "tk-1",
+                      "broadcast_id": None, "meta": {"request_id": "tk-1"}}
+    outcome1 = drive(rec_from_alpha)
+    assert outcome1.ok is True
+    assert "sender_is_lead: true" in (spawned[0][1] or "")
+
+    # Handoff: alpha is demoted, gamma becomes the new sole lead.
+    s.set_role("alpha", "worker")
+    s.set_role("gamma", "lead")
+
+    rec_from_gamma = {"id": "msg-2", "from": "gamma", "to": "beta", "kind": "task",
+                      "subject": "task 2", "body": "do Y",
+                      "correlation_id": "tk-2", "request_id": "tk-2",
+                      "broadcast_id": None, "meta": {"request_id": "tk-2"}}
+    outcome2 = drive(rec_from_gamma)
+    assert outcome2.ok is True
+    assert "sender_is_lead: true" in (spawned[1][1] or "")
+
+    rec_from_old_lead = {"id": "msg-3", "from": "alpha", "to": "beta", "kind": "task",
+                         "subject": "task 3", "body": "do Z",
+                         "correlation_id": "tk-3", "request_id": "tk-3",
+                         "broadcast_id": None, "meta": {"request_id": "tk-3"}}
+    outcome3 = drive(rec_from_old_lead)
+    assert outcome3.ok is True
+    assert "sender_is_lead: false" in (spawned[2][1] or "")
 
 
 def test_make_drive_renders_malicious_lesson_as_advisory_data(tmp_path) -> None:

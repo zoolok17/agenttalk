@@ -38,10 +38,15 @@ CORE_RISK_CLASSES = frozenset({
 RESPONSE_STATUS_ENUMS = {
     "review-result": frozenset({"approved", "rejected", "needs-info"}),
     "proposal-response": frozenset({"accepted", "rejected", "countered"}),
+    # #163: "accepted" is a non-terminal ack (work in progress, more to
+    # follow - like review-result's "needs-info"); "declined" and "done"
+    # are terminal. A bare prose refusal is not a valid task-response.
+    "task-response": frozenset({"accepted", "declined", "done"}),
 }
 TERMINAL_RESPONSE_STATUSES = {
     "review-result": frozenset({"approved", "rejected"}),
     "proposal-response": RESPONSE_STATUS_ENUMS["proposal-response"],
+    "task-response": frozenset({"declined", "done"}),
 }
 
 _SAFE_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")

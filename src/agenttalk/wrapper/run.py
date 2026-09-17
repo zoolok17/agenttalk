@@ -2746,8 +2746,22 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 rejoin = rejoin_for(record)
             except Exception:  # noqa: BLE001, S110 - advisory rejoin only  # nosec B110
                 rejoin = None
+        # #163: resolved fresh from the LIVE roster every turn (never cached
+        # across turns) - a mid-session lead handoff followed by a new
+        # `task` must render the new lead as true and the old one as false
+        # on the very next dispatch. Advisory-safe: any lookup failure
+        # (corrupt config, etc.) degrades to None (line omitted), never
+        # fails the turn.
+        sender_is_lead = None
+        try:
+            sender = record.get("from")
+            if isinstance(sender, str) and sender:
+                sender_is_lead = sender in (store.sole_lead(), store.operator_facing())
+        except Exception:  # noqa: BLE001 - advisory fact, never fails a turn
+            sender_is_lead = None
         prompt = _prompt.assemble_turn_prompt(
-            record, rules=rules, rejoin=rejoin, lessons=lesson_prompt)
+            record, rules=rules, rejoin=rejoin, lessons=lesson_prompt,
+            sender_is_lead=sender_is_lead)
         spec = _session.build_turn(session_state, prompt)
         cli = session_state.cli
         # A failed RESUME turn self-heals to a fresh session before we classify (codex:
