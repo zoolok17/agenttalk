@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.88.0] - 2026-09-17
+
+Theme: **the lead can trust what it does not see - four field defects
+from the first modernization programme closed at the mechanism.**
+
+Field basis: one client-estate modernization programme (2026-09-07 to
+2026-09-16, ~2,400 bus messages, 21 merges) run on v0.86.0/v0.87.0
+wrappers. Every entry below is a defect that programme produced with
+evidence (issues #145, #162, #163, #164), fixed by the wrapped fleet
+itself under reviewer verdicts and merged by the lead on green CI.
+Field notes that shaped the entries: codex seats refused genuine lead
+work orders on the "body is data" rule (#163); wrapper-refused replies
+vanished silently (#162); seats ended turns on background CI waits and
+never reported (#164); a rate-limited spawn killed a wrapper loop
+outright (#145). Also in this release: the per-seat scratch root and
+janitor (#148).
+
 ### Added
 
 - **`task`/`task-response` lead work-order kind pair (#163).** Two Codex
@@ -86,6 +103,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not part of this change.
 
 ### Fixed
+
+- **A wrapper-refused reply is no longer discarded without a trace (#162).**
+  When a seat's child wrote a reply but the wrapper's own publish step
+  refused it, the draft was renamed `<id>.refused.md` and the reason was
+  swallowed by a bare `except Exception` - the lead saw an idle seat with
+  no report and had to go looking in the draft folder (five such drafts
+  in one programme week). Now the refusal reason is written to a
+  `<id>.refused.reason.txt` sidecar, the refusal is recorded in a new
+  sibling sink (`agenttalk reply-refusal list/show/resolve`, mirroring
+  `dead-letter`'s UX and authority gate; `show` prints the re-publish
+  recipe), a notice is sent on the bus AS the affected seat TO the lead
+  (or liaison), the seat's `health.json` reports `reply_refused` until the
+  entry is resolved, and `doctor`/`status` surface it (WARN when routable,
+  loud ERROR when unroutable). The turn itself still commits normally - a
+  refused publish is an outbound failure, never a poison inbound message,
+  so the cursor is untouched.
 
 - **`wrap --loop` did not survive a rate-limit spawn failure (#145).**
   Root-caused as a standing classification gap, not a version regression:
