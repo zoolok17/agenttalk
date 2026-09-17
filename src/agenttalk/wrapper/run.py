@@ -109,6 +109,23 @@ _INFRA_ERROR_MARKERS = (
     # rate window. ("quota" + "usage limit" are already infra markers above.)
     "per minute", "per day", "per hour", "tokens per", "tpm", "daily token",
 )
+# #145: a NARROW, HIGH-CONFIDENCE subset of the above, trusted as CLASS_INFRA on TEXT
+# ALONE - unlike _INFRA_ERROR_MARKERS (which is deliberately never authoritative without
+# a structured CLI status/rate-limit fact; see the comment above it). This narrower set
+# exists for the one place where no structured fact can EVER be available in principle:
+# a launch-time failure before the child has emitted a single parseable JSON line (a
+# spawn-time OSError, or a child that exits in well under a second printing only prose -
+# the wrap-loop-survival incidents this fixes: 0.29s/2.81s child lifetimes, no TURN_STARTED
+# event, so no adapter ever ran to produce a structured fact at all). Deliberately excludes
+# every generic/broad marker from the legacy list above (timeouts, connection/network,
+# 401/403/auth, 5xx, WAF/proxy) - those have real false-positive risk on raw pre-JSON text
+# and already have their own dedicated classifiers elsewhere; only phrasing that is
+# essentially unambiguous evidence of a rate/usage/quota limit is trusted here.
+_UNSTRUCTURED_RATE_LIMIT_MARKERS = (
+    "rate limit", "rate_limit", "ratelimit", "too many requests",
+    "usage limit", "quota", "overloaded", "429", "529",
+    "per minute", "per day", "per hour", "tokens per", "tpm", "daily token",
+)
 _STRUCTURED_API_INFRA_STATUSES = frozenset({429, 529})
 _STRUCTURED_AUTH_STATUSES = frozenset({401, 403})
 _STRUCTURED_AUTH_MARKERS = (
@@ -1154,6 +1171,17 @@ def _looks_like_infra(text: str | None) -> bool:
     return any(m in t for m in _INFRA_ERROR_MARKERS)
 
 
+def _looks_like_unstructured_rate_limit(*texts: str | None) -> bool:
+    """#145: True if ANY of ``texts`` matches the narrow, high-confidence rate-limit
+    vocabulary - see :data:`_UNSTRUCTURED_RATE_LIMIT_MARKERS` for why this one is
+    trusted without a structured fact, unlike :func:`_looks_like_infra`."""
+    for text in texts:
+        t = (text or "").lower()
+        if any(m in t for m in _UNSTRUCTURED_RATE_LIMIT_MARKERS):
+            return True
+    return False
+
+
 def _int_status(value: object) -> int | None:
     if isinstance(value, bool):
         return None
@@ -2089,9 +2117,22 @@ def _classify_drive_failure(
     if isinstance(setup_failure, dict):
         return CLASS_CONFIG_BLOCKED, setup_failure.get("summary") or "deterministic setup failure"
     structured = _structured_infra_summary(sig)
+    # #145: the discarded (non-JSON) child output tail - the ONLY place a spawn-time
+    # or launch-time rate-limit message can ever surface, since the child never got
+    # far enough to emit a parseable event. Computed once, reused by every branch
+    # below that has no structured fact to lean on.
+    discarded_text = _child_output_tail_text(sig.get("discarded_output_tail"))
     if sig.get("error"):
         if structured:
             return CLASS_INFRA, structured
+        # #145 (raw spawn-time OSError path, symmetric with the mid-stream
+        # ADAPTER_ERROR path below): no JSON ever parsed here, so no structured
+        # fact can exist even for a genuine rate-limit spawn failure - fall back to
+        # the narrow, high-confidence text vocabulary instead of defaulting straight
+        # to ambiguous. Config-blocked causes (missing CLI, bad args, exec denied)
+        # are unaffected - they are classified earlier via sig["config_blocked"].
+        if _looks_like_unstructured_rate_limit(sig.get("error"), discarded_text):
+            return CLASS_INFRA, f"unstructured rate-limit text at spawn: {sig['error']}"
         return CLASS_AMBIGUOUS, f"turn error without structured infra status: {sig['error']}"
     if sig.get("terminal"):
         text = sig.get("terminal_text") or ""
@@ -2104,6 +2145,18 @@ def _classify_drive_failure(
             return CLASS_INFRA, structured
         if _looks_like_content_poison(text):
             return CLASS_POISON, f"terminal content-poison: {text[:160]}"
+        # #145 note (deliberately NOT extended here): a mid-session rate-limit
+        # message that parsed as valid JSON but carries no recognized structured
+        # status stays CLASS_AMBIGUOUS, unchanged - a real adapter DID run for this
+        # event (unlike the pre-JSON cases above/below, where no adapter could ever
+        # run), so trusting bare text here would also loosen codex's own turn.failed
+        # text (e.g. "rate limit exceeded") which is deliberately kept ambiguous
+        # (test_make_drive_classifies_failures_for_dead_letter) since codex never
+        # populates a structured fact at all. A genuine Claude usage-limit hit is
+        # expected to surface via the structured branch just above (see the #145
+        # test proving this for both the rate_limit_event and result/status shapes);
+        # widen THIS branch only with real evidence of a Claude payload that carries
+        # no structured status at all.
         if not sig.get("structured_errors") and _looks_like_infra(text):
             return CLASS_AMBIGUOUS, f"terminal ambiguous infra-like text: {text[:160]}"
         return CLASS_AMBIGUOUS, (f"terminal failure, unrecognized cause: {text[:160]}"
@@ -2120,8 +2173,21 @@ def _classify_drive_failure(
             return CLASS_AMBIGUOUS, ("partial stream: started, never completed "
                                      "(poison or an unrecognized drop after the handshake)")
         return CLASS_AMBIGUOUS, f"nonzero child exit (rc={sig.get('rc')}) after start"
+    # #145: the child exited before emitting even a TURN_STARTED event - the exact
+    # shape of the wrap-loop-survival incidents this fixes (0.29s/2.81s child
+    # lifetimes). No adapter ever ran, so this is the LAST chance to recognize a
+    # rate-limit spawn failure from raw prose before it falls to the generic
+    # "never started" ambiguous class below - which the loop's own #205 rule
+    # promotes to a STICKY CLASS_CONFIG_BLOCKED on the second consecutive
+    # occurrence. A sustained rate-limit window reproduces this shape on every
+    # retry, so without this check the second attempt already locks the message
+    # out of the (already-correct) CLASS_INFRA bounded-backoff path entirely.
+    if _looks_like_unstructured_rate_limit(discarded_text):
+        return CLASS_INFRA, f"unstructured rate-limit text before start: {discarded_text[:160]}"
     # The loop promotes the SECOND consecutive result carrying this prefix to
     # CLASS_CONFIG_BLOCKED (#205) - keep the summary bound to the shared constant.
+    # #145: reaching here means no rate-limit text was found either - the #205
+    # guard is UNCHANGED for this genuinely-unrecognized case (never loosened).
     return CLASS_AMBIGUOUS, (
         f"{NEVER_STARTED_SUMMARY_PREFIX} (rc={sig.get('rc')}, no clear signal)")
 

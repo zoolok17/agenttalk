@@ -38,7 +38,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   doctor` warns when registered worktrees, scratch families, or
   unlistable locations exist outside the scratch root. See
   `docs/ops/scratch-hygiene.md`.
-
 - **Interim progress notes that don't end a turn (#164).** A wrapped turn
   ends once the model sends its correlated reply and stops generating - a
   seat posting a mid-work status update via `agenttalk reply` was killing
@@ -56,6 +55,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agent goes idle again. See `docs/DESIGN-164-interim-progress-note.md`;
   the file-draft channel for shell-less seats is an explicit fast-follow,
   not part of this change.
+
+### Fixed
+
+- **`wrap --loop` did not survive a rate-limit spawn failure (#145).**
+  Root-caused as a standing classification gap, not a version regression:
+  `git log`/`git diff` between the two release tags this was first
+  reported against found zero behavior changes in the wrapper's own
+  spawn/classification code (independently re-verified). The real gap: a
+  turn that fails before any adapter ever parses a JSON line - a raw
+  spawn-time `OSError`, or a child that exits in well under a second
+  printing only prose - can never produce a structured CLI fact, so it
+  fell to the generic ambiguous classification; two such consecutive
+  results already promote to a sticky `config_blocked` park (the #205
+  guard), which a sustained rate-limit window reproduces on the very next
+  retry. Both pre-JSON paths now recognize a narrow, high-confidence
+  rate-limit/usage-limit/quota text vocabulary and classify
+  `known_global_infra` instead, landing on the existing bounded
+  backoff-and-retry path (unchanged) rather than the sticky park. A
+  mid-session failure that already carries a structured fact (a real
+  Claude `rate_limit_event` or a 429/529/5xx API status) was already
+  handled correctly and is unchanged; a mid-session failure with no
+  structured fact at all is deliberately left as-is, to avoid loosening
+  an existing, intentional cross-CLI conservatism guard. Genuinely fatal
+  spawn errors (missing CLI, bad arguments, permission denied) are
+  unaffected - they classify `config_blocked` exactly as before.
 
 ## [0.87.0] - 2026-09-07
 
