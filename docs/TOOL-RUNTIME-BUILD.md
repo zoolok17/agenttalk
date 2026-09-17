@@ -64,19 +64,48 @@ the `build` package this needs is already a declared project dependency
 from a wrapped agent's own seat clone, and never touching any running
 wrapper):
 
-1. **Export the exact tag into a clean, disposable location** - do not
-   reuse a live seat checkout or the main checkout's own working directory:
+1. **Fetch the tag, then export it into a clean, disposable location** - do
+   not reuse a live seat checkout or the main checkout's own working
+   directory. A seat clone will not have a just-published release tag yet:
    ```
+   git fetch origin --tags
    git worktree add --detach <clean-tmp-dir> vN
    ```
-2. **Build the wheel** from that clean export:
+   **Record the exported commit SHA from the export itself, not from the
+   tag ref directly** - `vN` is normally an *annotated* tag, and a bare
+   `git rev-parse vN` returns the **tag object's own SHA**, not the commit
+   it points to (confirmed directly while building v0.88.0: `git rev-parse
+   v0.88.0` returned a different value than the actual merge commit).
+   `git worktree add` itself resolves this correctly (the export's `HEAD`
+   lands on the right commit either way), but recording the SHA needs one
+   of:
    ```
+   git -C <clean-tmp-dir> rev-parse HEAD
+   ```
+   or, without exporting first:
+   ```
+   git rev-parse vN^{commit}
+   ```
+2. **Build the wheel** from that clean export. This does **not** require
+   the target runtime's own interpreter - the wheel this project builds is
+   `py3-none-any` (pure Python, backend-built by `hatchling`; confirmed
+   from the existing v0.87.0 install's own `WHEEL` file: `Tag:
+   py3-none-any`, `Generator: hatchling 1.32.0`, `Root-Is-Purelib: true`),
+   so any reasonably current Python with the `build` package installed can
+   run this step. Do not `pip install build` into anything persistent for
+   a one-off build - use a disposable, isolated venv instead (the `build`
+   package is already a declared project dev-dependency,
+   `pyproject.toml`: `dev = ["pytest>=8.0", "build>=1.2"]`, so this is the
+   only place it needs to be installed at all):
+   ```
+   <some-python> -m venv <disposable-builder-venv>
+   <disposable-builder-venv>\Scripts\python.exe -m pip install "build>=1.2"
    cd <clean-tmp-dir>
-   python -m build --wheel
+   <disposable-builder-venv>\Scripts\python.exe -m build --wheel
    ```
-   This produces `dist/agenttalk-N-py3-none-any.whl` (confirmed tag/format
-   from the existing v0.87.0 install's own `WHEEL` file: `Tag: py3-none-any`,
-   `Generator: hatchling 1.32.0`, `Root-Is-Purelib: true`).
+   This produces `dist/agenttalk-N-py3-none-any.whl`. Delete
+   `<disposable-builder-venv>` once the wheel exists - it is not part of
+   the runtime and should not be kept around.
 3. **Choose and record the interpreter.** Read every existing runtime's own
    `pyvenv.cfg` before choosing - do not assume:
 
