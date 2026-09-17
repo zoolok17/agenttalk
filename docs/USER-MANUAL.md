@@ -1159,7 +1159,7 @@ This is a compact operator map, not a full argparse dump. Use
 | --- | --- | --- |
 | Setup | `init`, `install-skills`, `codex-config`, `doctor`, `whoami` | Create a store, install skills, enable Codex sandbox calls, verify health and identity. |
 | Identity | `roster`, `roster add`, `roster set-role`, `roster set-group`, `roster set-operator-facing`, `roster retire`, `roster rename` | Manage names, roles, groups, and the human liaison. |
-| Messaging | `send`, `reply`, `broadcast`, `propose`, `composing`, `rescind` | Start, answer, fan out, negotiate, show in-flight drafting, or supersede tracked work. |
+| Messaging | `send`, `reply`, `broadcast`, `propose`, `composing`, `progress`, `rescind` | Start, answer, fan out, negotiate, show in-flight drafting, post an interim status without ending your turn, or supersede tracked work. |
 | Reading | `recv`, `drain`, `wait`, `sync`, `threads`, `status`, `tail` | Read inboxes, block for new work, rejoin after restart, inspect obligations, or passively monitor. |
 | Operator routing | `escalate`, `attention`, `relay` | Route human decisions, inspect the attention queue, and carry operator answers or commands through the bus. |
 | Safety checks | `check`, `barrier`, `gate`, `close` | Check request currentness, mark epochs, manage gates, and aggregate HOLD/GO release evidence. |

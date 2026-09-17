@@ -127,6 +127,13 @@ skips opening a browser.
   <id> --file <path>`) — nothing is lost, it just never sent itself.
   `reply-refusal resolve --agent <seat> --id <id> --reason ...` (liaison/
   sole-lead only) clears the WARN once handled.
+- **A worker is mid-turn on something long** (a test bar, a CI poll, a
+  multi-step build): `agenttalk status` shows a `progress="<text>" (<age>)`
+  suffix on that worker's line while it is in a working health state — the
+  worker's own interim status update (`agenttalk progress`), not something
+  you have to ask for. It is purely advisory (no doctor check, nothing to
+  resolve) and disappears once the worker goes idle again. A worker that
+  posts one is still working — do not treat it as an answer or a stall.
 
 Go deeper: `docs/supervisor-tutorial.md` §6-§7, §10.
 
