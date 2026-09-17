@@ -156,6 +156,52 @@ def build_snapshot(
     return snap
 
 
+# #164: the reason code a just-sent `agenttalk progress` note stamps onto the
+# sender's OWN health snapshot — distinct from `progress_event` (adapter
+# stream liveness, wrapper/events.py) so a reader can tell "the CLI adapter
+# emitted a stream event" from "the seat deliberately told the lead
+# something". No note TEXT is ever recorded here (see build_snapshot's own
+# docstring) — the text lives only in the bus message itself.
+REASON_PROGRESS_NOTE = "progress_note"
+
+
+def stamp_progress(raw: Any, *, now: str | None = None) -> dict[str, Any] | None:
+    """Return an updated snapshot recording a progress note, or None.
+
+    Called directly by the (stateless, one-shot) ``agenttalk progress`` CLI
+    process, not by a live ``WrapperHealthWriter`` — there is no wrapper
+    instance to hold onto for a plain subprocess invocation. Reads the
+    CURRENT on-disk snapshot's own state/since/cli/mode/ids and only
+    ever ANNOTATES last_progress_at + reason_code; it never fabricates a
+    working state and is a no-op (returns None) when the agent has no
+    existing health record or that record is not currently a working one —
+    a progress note posted with no turn in flight has nothing to annotate.
+    """
+    if not isinstance(raw, dict):
+        return None
+    state = raw.get("state")
+    if state not in (STATE_WORKING_TURN, STATE_WORKING_SILENT):
+        return None
+    agent = raw.get("agent")
+    if not isinstance(agent, str) or not agent:
+        return None
+    stamp = now or now_iso()
+    return build_snapshot(
+        agent=agent,
+        cli=raw.get("cli"),
+        mode=raw.get("mode"),
+        state=state,
+        updated_at=stamp,
+        since=raw.get("since"),
+        last_progress_at=stamp,
+        request_id=raw.get("request_id"),
+        msg_id=raw.get("msg_id"),
+        reason_code=REASON_PROGRESS_NOTE,
+        source=raw.get("source") or "wrapper",
+        warnings=raw.get("warnings"),
+    )
+
+
 def unknown(agent: str, warning: str) -> dict[str, Any]:
     snap = build_snapshot(
         agent=agent,

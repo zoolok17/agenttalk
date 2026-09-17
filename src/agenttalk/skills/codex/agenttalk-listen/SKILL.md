@@ -486,6 +486,16 @@ iteration:
   (repeat roughly every 2 minutes). It extends the peer's scoped wait AND
   shows "(reply in flight)" in their threads/sync, preventing crossing
   messages. Prefer it over a hand-built `--meta request_id=...`.
+- **Long-running work (#164).** If a message needs real time (a
+  long test bar, polling CI, a multi-step build), do NOT post an interim
+  status via the reply command — replying is how you tell yourself the
+  message is answered, and you will then stop, killing any of that turn's
+  own background work still running. Instead run
+  `python -m agenttalk progress --from $SELF --to-id <id> -m "..."` as many
+  times as useful. A progress note does NOT end your turn, does NOT close
+  or advance anything (it never opens or derives a thread, and never
+  counts as a reply to the opener), and does NOT mean you are done — keep
+  working. Only your final reply ends your turn.
 
 Escalations arrive as ordinary `question` messages carrying
 `meta.needs_operator=true` — if you are the liaison, handle them with the

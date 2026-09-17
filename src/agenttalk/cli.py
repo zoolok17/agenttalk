@@ -26,6 +26,7 @@ from pathlib import Path
 
 from agenttalk import __version__
 from agenttalk import avatars as avatar_mod
+from agenttalk import health as health_schema
 from agenttalk import store as store_mod
 from agenttalk.display import render
 from agenttalk.store import (
@@ -525,6 +526,42 @@ class _LeadLoopLeaseLost(Exception):
     stale."""
 
 
+# #164: health states that mean "a turn is currently in flight" — the only
+# window in which a stale/superseded progress note is worth surfacing. A
+# resolved-aware convention (same as #162's reply-refused summary): once the
+# agent goes idle again, its last progress note stops showing.
+_WORKING_HEALTH_STATES = frozenset({"working_turn", "working_silent"})
+
+
+def _last_progress_note_for(agent_msgs: list[Message], health: dict) -> dict | None:
+    """The most recent `kind=progress` note `agent` sent during ITS CURRENT
+    turn, or None. Reads the actual bus message for the free-text body —
+    health.json itself never carries note text (#164's hard schema
+    constraint) — bounded to messages sent no earlier than the turn's own
+    `since` so a note from a PRIOR, already-finished turn never lingers."""
+    if health.get("state") not in _WORKING_HEALTH_STATES:
+        return None
+    since = health_schema.parse_iso(health.get("since"))
+    if since is None:
+        return None
+    candidates = [
+        m for m in agent_msgs
+        if m.kind == "progress" and (health_schema.parse_iso(m.ts) or since) >= since
+    ]
+    if not candidates:
+        return None
+    latest = max(candidates, key=lambda m: m.id)
+    at = health_schema.parse_iso(latest.ts)
+    age_seconds = (
+        (datetime.now(timezone.utc) - at).total_seconds() if at is not None else None
+    )
+    return {
+        "text": latest.body,
+        "at": latest.ts,
+        "age_seconds": round(age_seconds, 3) if age_seconds is not None else None,
+    }
+
+
 def _gather_status(store: Store) -> dict:
     """Build the structured status payload shared by both output modes."""
     cfg = store.load_config()
@@ -544,8 +581,10 @@ def _gather_status(store: Store) -> dict:
     )
     msgs = [m for m, _ in scanned]  # same shape/order as store.all_messages()
     by_recipient: dict[str, list[Message]] = {}
+    by_sender: dict[str, list[Message]] = {}
     for m in valid:
         by_recipient.setdefault(m.recipient, []).append(m)
+        by_sender.setdefault(m.sender, []).append(m)
     # Resolve the lead-loop heartbeat window from supervisor.json (if present) so the
     # status view uses the SAME threshold as the steal path - never the 120s default
     # for a wrapped agent (WP1 contract; avoids armed/heartbeat_stale skew).
@@ -601,6 +640,7 @@ def _gather_status(store: Store) -> dict:
         # of a fresh per-agent disk re-scan (#184).
         agent_msgs = by_recipient.get(a, [])
         unread = agent_msgs if not cursor else [m for m in agent_msgs if m.id > cursor]
+        last_progress_note = _last_progress_note_for(by_sender.get(a, []), health)
         row = {
             "name": a,
             "role": roles.get(a),
@@ -614,6 +654,8 @@ def _gather_status(store: Store) -> dict:
             "waiting": waiting,
             "waiting_stale": waiting_stale,
         }
+        if last_progress_note is not None:
+            row["last_progress_note"] = last_progress_note
         sup_row = supervisor_rows.get(a)
         if isinstance(sup_row, dict):
             decision = sup_row.get("decision")
@@ -1408,6 +1450,12 @@ def cmd_status(args: argparse.Namespace) -> int:
                 seen += f"/{_format_age(h_age)}"
         if dec:
             seen += f" supervisor={dec.get('state', '?')}/{dec.get('action', '?')}"
+        lpn = a.get("last_progress_note")
+        if isinstance(lpn, dict) and isinstance(lpn.get("text"), str):
+            text = lpn["text"].splitlines()[0][:60] if lpn["text"] else ""
+            age = lpn.get("age_seconds")
+            age_str = _format_age(age) if isinstance(age, (int, float)) else "unknown age"
+            seen += f' progress="{text}" ({age_str})'
         role = f" role={a['role']}" if a.get("role") else ""
         of = " [operator-facing]" if a.get("operator_facing") else ""
         print(f"  {a['name']:<10}{role}{of} cursor={cursor:<32} unread={a['unread']:<3} {seen}")
@@ -1855,6 +1903,64 @@ def cmd_composing(args: argparse.Namespace) -> int:
         print(f"(composing operation already recorded: id={msg.id})")
     elif not args.quiet:
         print(f"(composing ping sent: {sender} -> {recipient}; id={msg.id})")
+    return 0
+
+
+def cmd_progress(args: argparse.Namespace) -> int:
+    """Post an interim status update on a message you are still working (#164).
+
+    Purely advisory and repeatable — unlike `reply`, sending one does NOT
+    close, commit, or otherwise end your turn; only your eventual
+    `agenttalk reply` does. Structurally: `progress` is a CONTROL_KIND (never
+    opens/derives a thread, `wait` never returns it as an answer, `recv`
+    hides it from the default inbox view) and deliberately never echoes
+    `in_reply_to`/`request_id`/`broadcast_id`, so it can never be mistaken
+    for the real reply by `reply_transport.landed_reply_exists` or by
+    `threads.py`'s opener-response classification. Unlike `composing`, this
+    is NOT gated to an owed-inbound thread — post one about any message
+    addressed to you, at any point, as many times as useful. Best-effort
+    also stamps the sender's own advisory health snapshot with a
+    `progress_note` reason code + timestamp (never the note's text — the
+    health schema carries no free-form content); a failure to do so never
+    fails the actual send.
+    """
+    store = _get_store(args)
+    cfg = store.load_config()
+    roster = cfg.get("agents") or []
+    sender = _resolve_self(args.sender, roster=roster)
+    to_id = args.to_id
+    inbox = store.messages_for(sender)  # validated + addressed to me
+    anchor = next((m for m in inbox if m.id == to_id), None)
+    if anchor is None:
+        sys.stderr.write(
+            f"agenttalk progress: --to-id {to_id} not found: no validated "
+            f"message with that id is addressed to {sender}.\n")
+        return 2
+    recipient = anchor.sender
+    body = _read_body(args)
+    if not body and not getattr(args, "allow_empty", False):
+        sys.stderr.write(
+            "agenttalk progress: empty body (use -m TEXT, --file PATH, pipe "
+            "stdin, or --allow-empty)\n")
+        return 2
+    meta = _parse_meta(args.meta)
+    # #164: deliberately NOT echoing in_reply_to/request_id/broadcast_id —
+    # see the docstring above. `progress_for` is a plain, non-magic id
+    # pointer used only by `status`'s progress-note render, never by any
+    # correlation/dedupe/thread-derivation logic.
+    meta.setdefault("progress_for", to_id)
+    msg = store.send(
+        sender=sender, recipient=recipient, body=body, kind="progress",
+        subject=args.subject or "progress", meta=meta,
+    )
+    try:
+        updated = health_schema.stamp_progress(store.read_health_raw(sender))
+        if updated is not None:
+            store.write_health(sender, updated)
+    except Exception:  # noqa: BLE001, S110  # nosec - advisory only, must never fail the send
+        pass
+    if not args.quiet:
+        print(f"(progress note sent: {sender} -> {recipient}; id={msg.id})")
     return 0
 
 
@@ -14385,6 +14491,31 @@ def build_parser() -> argparse.ArgumentParser:
                             "the line')")
     pcomp.add_argument("--quiet", action="store_true")
     pcomp.set_defaults(func=cmd_composing)
+
+    pprog = sub.add_parser(
+        "progress",
+        help="Post an interim status update on a message you are still "
+             "working, WITHOUT ending your turn (#164) — only your eventual "
+             "`agenttalk reply` does that. Purely advisory: never opens or "
+             "derives a thread, never counts as the reply. Post one, or "
+             "several, any time you have something useful to report.",
+    )
+    pprog.add_argument("--from", dest="sender",
+                       help="Sender agent name (default: $AGENTTALK_SELF)")
+    pprog.add_argument("--to-id", dest="to_id", required=True,
+                       help="The message id you are still working (must be "
+                            "a validated message addressed to you). The "
+                            "note is sent back to that message's sender.")
+    pprog.add_argument("--subject",
+                       help="One-line summary (default: 'progress')")
+    pprog.add_argument("--meta", action="append",
+                       help="key=value (repeatable)")
+    pprog.add_argument("-m", "--message", help="Body text")
+    pprog.add_argument("--file", help="Read body from PATH ('-' for stdin)")
+    pprog.add_argument("--allow-empty", action="store_true",
+                       help="Permit an empty body")
+    pprog.add_argument("--quiet", action="store_true")
+    pprog.set_defaults(func=cmd_progress)
 
     presc = sub.add_parser(
         "rescind",

@@ -573,6 +573,68 @@ def test_status_human_output_unchanged_for_no_heartbeat(
     assert "(no heartbeat)" in out
 
 
+def test_status_shows_last_progress_note_while_working(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """#164: status surfaces the seat's own most recent progress note (text
+    read from the actual bus message, never from health.json) while its
+    health state is a working one."""
+    s = Store(store_root)
+    since = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    s.write_health("beta", hm.build_snapshot(
+        agent="beta", cli="claude", mode="continuous",
+        state=hm.STATE_WORKING_TURN, since=since, reason_code="turn_spawned",
+    ))
+    _run(["send", "--from", "alpha", "--to", "beta", "-m", "do the thing"], store_root)
+    mid = Store(store_root).all_messages()[0].id
+    _run(["progress", "--from", "beta", "--to-id", mid,
+          "-m", "checking the 3rd file now"], store_root)
+    capsys.readouterr()
+    _run(["status"], store_root)
+    out = capsys.readouterr().out
+    beta_line = next(line for line in out.splitlines() if line.strip().startswith("beta"))
+    assert 'progress="checking the 3rd file now"' in beta_line
+
+    _run(["status", "--json"], store_root)
+    payload = json.loads(capsys.readouterr().out)
+    beta_row = next(a for a in payload["agents"] if a["name"] == "beta")
+    assert beta_row["last_progress_note"]["text"] == "checking the 3rd file now"
+    assert isinstance(beta_row["last_progress_note"]["age_seconds"], (int, float))
+
+
+def test_status_progress_note_absent_once_idle(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Once the seat's health returns to idle_waiting, an EARLIER turn's
+    progress note stops showing (resolved-aware, same convention as #162's
+    reply-refused summary)."""
+    s = Store(store_root)
+    _run(["send", "--from", "alpha", "--to", "beta", "-m", "do the thing"], store_root)
+    mid = Store(store_root).all_messages()[0].id
+    s.write_health("beta", hm.build_snapshot(
+        agent="beta", cli="claude", mode="continuous",
+        state=hm.STATE_WORKING_TURN, since="2026-01-01T00:00:00Z",
+        reason_code="turn_spawned",
+    ))
+    _run(["progress", "--from", "beta", "--to-id", mid, "-m", "in progress"],
+         store_root)
+    s.write_health("beta", hm.build_snapshot(
+        agent="beta", cli="claude", mode="continuous",
+        state=hm.STATE_IDLE_WAITING, since=datetime.now(timezone.utc)
+        .isoformat().replace("+00:00", "Z"), reason_code="idle_waiting",
+    ))
+    capsys.readouterr()
+    _run(["status"], store_root)
+    out = capsys.readouterr().out
+    assert "in progress" not in out
+    _run(["status", "--json"], store_root)
+    payload = json.loads(capsys.readouterr().out)
+    beta_row = next(a for a in payload["agents"] if a["name"] == "beta")
+    assert "last_progress_note" not in beta_row
+
+
 def test_status_human_output_primary_health_is_strict_verdict_when_present(
     store_root: Path,
     capsys: pytest.CaptureFixture,
@@ -1219,6 +1281,119 @@ def test_composing_subcommand_default_body(
     assert rc == 0
     msgs = Store(store_root).all_messages()
     assert msgs[0].body.startswith("still drafting")
+
+
+# -------------------------------------------------------------- cmd_progress (#164)
+
+def test_progress_subcommand_writes_progress_kind(store_root: Path) -> None:
+    inbound = _run(["send", "--from", "alpha", "--to", "beta", "-m", "do the thing"],
+                    store_root)
+    assert inbound == 0
+    mid = Store(store_root).all_messages()[0].id
+    rc = _run(["progress", "--from", "beta", "--to-id", mid,
+               "-m", "still working, 3/10 done"], store_root)
+    assert rc == 0
+    msgs = Store(store_root).all_messages()
+    note = msgs[-1]
+    assert note.kind == "progress"
+    assert note.sender == "beta"
+    assert note.recipient == "alpha"
+    assert note.body == "still working, 3/10 done"
+    assert note.meta.get("progress_for") == mid
+    # #164: must never look like a real reply to the two mechanisms that
+    # decide whether a turn's answer landed / a thread closed.
+    assert "in_reply_to" not in note.meta
+    assert "request_id" not in note.meta
+
+
+def test_progress_is_ungated_unlike_composing(store_root: Path) -> None:
+    """Unlike `composing --to-request` (refused off an owed-inbound thread),
+    `progress --to-id` works for ANY validated message addressed to the
+    sender, with no thread-state gate at all."""
+    _run(["send", "--from", "alpha", "--to", "beta", "-m", "fyi, no reply owed"],
+         store_root)
+    mid = Store(store_root).all_messages()[0].id
+    rc = _run(["progress", "--from", "beta", "--to-id", mid, "-m", "noted"],
+              store_root)
+    assert rc == 0
+
+
+def test_progress_to_id_not_addressed_to_sender_is_refused(
+    store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    _run(["send", "--from", "alpha", "--to", "beta", "-m", "hi"], store_root)
+    mid = Store(store_root).all_messages()[0].id
+    # gamma never received this message - not in this store's roster either,
+    # but the anchor lookup itself is what must refuse it.
+    rc = _run(["progress", "--from", "alpha", "--to-id", mid, "-m", "noted"],
+              store_root)
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "not found" in err
+
+
+def test_progress_never_satisfies_landed_reply_exists(store_root: Path) -> None:
+    """The wrapper's own dedupe guard (#201) must never treat a progress
+    note as the freeform reply it is waiting to publish."""
+    from agenttalk import reply_transport
+    _run(["send", "--from", "alpha", "--to", "beta", "-m", "do the thing"],
+         store_root)
+    record = Store(store_root).all_messages()[0]
+    mid = record.id
+    _run(["progress", "--from", "beta", "--to-id", mid, "-m", "still going"],
+         store_root)
+    store = Store(store_root)
+    assert reply_transport.landed_reply_exists(
+        store, agent="beta",
+        record={"id": mid, "from": "alpha", "meta": {}},
+    ) is False
+
+
+def test_recv_hides_progress_by_default(store_root: Path, capsys: pytest.CaptureFixture) -> None:
+    _run(["send", "--from", "alpha", "--to", "beta", "-m", "do the thing"], store_root)
+    mid = Store(store_root).all_messages()[0].id
+    _run(["progress", "--from", "beta", "--to-id", mid, "-m", "working on it"],
+         store_root)
+    rc = _run(["recv", "--for", "alpha"], store_root)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "working on it" not in out
+
+
+def test_progress_stamps_health_reason_code_not_text(store_root: Path) -> None:
+    """#164: health.json records the reason code + timestamp, NEVER the
+    note's own free text (health.py's schema is explicitly content-free)."""
+    store = Store(store_root)
+    snap = hm.build_snapshot(agent="beta", cli="claude", mode="continuous",
+                             state=hm.STATE_WORKING_TURN, since="2026-01-01T00:00:00Z",
+                             reason_code="turn_spawned")
+    store.write_health("beta", snap)
+    _run(["send", "--from", "alpha", "--to", "beta", "-m", "do the thing"], store_root)
+    mid = Store(store_root).all_messages()[0].id
+    _run(["progress", "--from", "beta", "--to-id", mid, "-m", "secret status text"],
+         store_root)
+    raw = store.read_health_raw("beta")
+    assert raw["reason_code"] == "progress_note"
+    assert raw["last_progress_at"] is not None
+    assert raw["since"] == "2026-01-01T00:00:00Z"  # unchanged - same turn
+    assert "secret status text" not in json.dumps(raw)
+
+
+def test_progress_health_stamp_is_noop_when_idle(store_root: Path) -> None:
+    """A progress note posted with no turn in flight (idle_waiting, or no
+    health record at all) leaves health.json untouched - nothing to
+    annotate."""
+    store = Store(store_root)
+    snap = hm.build_snapshot(agent="beta", cli="claude", mode="continuous",
+                             state=hm.STATE_IDLE_WAITING, since="2026-01-01T00:00:00Z",
+                             reason_code="idle_waiting")
+    store.write_health("beta", snap)
+    _run(["send", "--from", "alpha", "--to", "beta", "-m", "do the thing"], store_root)
+    mid = Store(store_root).all_messages()[0].id
+    _run(["progress", "--from", "beta", "--to-id", mid, "-m", "hello"], store_root)
+    raw = store.read_health_raw("beta")
+    assert raw["reason_code"] == "idle_waiting"
+    assert raw["last_progress_at"] is None
 
 
 # ------------------------------------------------------------- cmd_recv: control filter

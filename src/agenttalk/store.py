@@ -486,6 +486,16 @@ KNOWN_KINDS = frozenset({
     # they do not surface as a returned reply. Added in 0.8.0 to fix
     # "reply landed seconds after wait timed out" sharp-edge.
     "composing",
+    # #164: an interim status update a seat may post WHILE still working a
+    # turn, without ending it — the answer to "a wrapped turn ends at its
+    # first reply, so a status update kills the seat's own in-flight
+    # background work". Purely advisory: never opens/derives a thread
+    # (CONTROL_KINDS below), never satisfies a landed-reply check, never
+    # touches any cursor. Distinct from `composing` (a content-free
+    # drafting ping gated to the responder's own owed-inbound thread) —
+    # a progress note carries free text and any seat may send one at any
+    # time about any message it is handling.
+    "progress",
     # A requester marks one of its own tracked requests as no-longer-
     # current. Correlated via meta.request_id (+ optional
     # meta.target_msg_id); thread derivation reports the thread as
@@ -531,7 +541,11 @@ KNOWN_KINDS = frozenset({
 # content. They are still persisted (so transcripts and the dashboard
 # can show them for audit), but `agenttalk wait` does not return them
 # as a reply and `agenttalk recv` filters them out of the default view.
-CONTROL_KINDS = frozenset({"composing"})
+# #164: `progress` joins `composing` here for the SAME structural reason
+# (threads.py's question-opener rule closes a thread on ANY non-control
+# response) — a progress note addressed back to a question's asker must
+# never be misread as the terminal answer.
+CONTROL_KINDS = frozenset({"composing", "progress"})
 
 # Kinds that OPEN a trackable request/reply thread. Single source of
 # truth shared by thread derivation (threads.py) and rescind validation
