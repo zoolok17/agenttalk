@@ -744,7 +744,20 @@ def _validate_runtime_environment(
     return item
 
 
-def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, Any]:
+MAX_CHECK_LOG_BYTES = 16 * 1024 * 1024
+
+
+def _read_check_log(path: Path) -> bytes:
+    with path.open("rb") as handle:
+        content = handle.read(MAX_CHECK_LOG_BYTES + 1)
+    if len(content) > MAX_CHECK_LOG_BYTES:
+        raise GateBlock("check_log_size_exceeded", f"check log exceeds {MAX_CHECK_LOG_BYTES} bytes: {path}")
+    return content
+
+
+def validate_run_artifact(
+    artifact: Any, manifest: dict[str, Any], *, bundle_root: Path | None = None,
+) -> dict[str, Any]:
     """Validate a run artifact and every proof required by its declared plan."""
 
     record = _require_object(artifact, "artifact")
@@ -988,9 +1001,26 @@ def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, 
         tool = _require_object(item["tool"], f"checks[{index}].tool")
         _require_artifact_fields(tool, {"path", "version"}, f"checks[{index}].tool")
         log = _require_object(item["log"], f"checks[{index}].log")
-        _require_artifact_fields(log, {"path", "sha256"}, f"checks[{index}].log")
+        # Historical evidence remains readable; newly written bundles include the relative link.
+        log_fields = {"path", "sha256"}
+        if "artifact_path" in log:
+            log_fields.add("artifact_path")
+            if log["artifact_path"] != f"logs/{check_id}.log":
+                raise GateBlock("evidence_schema_invalid", f"checks[{index}].log.artifact_path is malformed")
+        _require_artifact_fields(log, log_fields, f"checks[{index}].log")
         if not _is_absolute_path_text(log["path"]) or not _is_hash(log["sha256"], 64):
             raise GateBlock("evidence_schema_invalid", f"checks[{index}].log is malformed")
+        if "artifact_path" in log:
+            if bundle_root is None:
+                raise GateBlock("evidence_log_invalid", "bundle root required for collected logs")
+            try:
+                collected = bundle_root / log["artifact_path"]
+                if not collected.resolve().is_relative_to(bundle_root.resolve()):
+                    raise GateBlock("evidence_log_invalid", f"log escapes bundle: {check_id}")
+                if sha256_bytes(_read_check_log(collected)) != log["sha256"]:
+                    raise GateBlock("evidence_log_invalid", f"collected log hash mismatch: {check_id}")
+            except OSError as exc:
+                raise GateBlock("evidence_log_invalid", f"cannot read collected log {check_id}: {exc}") from exc
         if item["status"] == "pass":
             if (
                 not isinstance(item["exit_code"], int)
@@ -1213,9 +1243,24 @@ def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, 
 
 
 def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str, Any]) -> str:
-    """Write one normalized run artifact and validate the bytes read back."""
+    """Collect complete check logs beside the normalized, roundtrip-validated JSON."""
 
-    validate_run_artifact(artifact, manifest)
+    validate_run_artifact(artifact, manifest, bundle_root=path.parent)
+    for check in artifact["checks"]:
+        log = check["log"]
+        relative = f"logs/{check['id']}.log"
+        destination = path.parent / relative
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            source = Path(log["path"])
+            content = _read_check_log(source)
+            if source.resolve() != destination.resolve():
+                destination.write_bytes(content)
+            if _sha256_file(destination) != log["sha256"]:
+                raise GateBlock("evidence_log_collection_failed", f"log hash changed for {check['id']}")
+        except OSError as exc:
+            raise GateBlock("evidence_log_collection_failed", f"cannot collect log for {check['id']}: {exc}") from exc
+        log["artifact_path"] = relative
     payload = json.dumps(artifact, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
     try:
         write_text(path, payload, encoding="utf-8", newline="\n")
@@ -1225,7 +1270,7 @@ def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str,
         raise GateBlock("evidence_write_failed", f"cannot write and read evidence {path}: {exc}") from exc
     if raw != payload.encode("utf-8"):
         raise GateBlock("evidence_roundtrip_mismatch", "evidence bytes changed during durable write")
-    validate_run_artifact(loaded, manifest)
+    validate_run_artifact(loaded, manifest, bundle_root=path.parent)
     return sha256_bytes(raw)
 
 
@@ -1400,10 +1445,17 @@ def aggregate_leg_artifacts(
     artifacts: list[dict[str, Any]],
     current_binding: CandidateBinding,
     input_sha256_by_leg: dict[str, str] | None = None,
+    bundle_roots: dict[str, Path] | None = None,
 ) -> dict[str, Any]:
     validated = validate_manifest(manifest)
     expected = expected_ci_legs(validated, profile)
-    validated_artifacts = [validate_run_artifact(artifact, validated) for artifact in artifacts]
+    validated_artifacts = [
+        validate_run_artifact(
+            artifact, validated,
+            bundle_root=(bundle_roots or {}).get(artifact.get("ci_leg")) if isinstance(artifact, dict) else None,
+        )
+        for artifact in artifacts
+    ]
     legs = [artifact["ci_leg"] for artifact in validated_artifacts]
     duplicates = sorted({leg for leg in legs if leg is not None and legs.count(leg) > 1})
     if duplicates:
@@ -1818,7 +1870,9 @@ def source_environment(base: dict[str, str], source_root: Path) -> dict[str, str
 
 def _log_tail(path: Path, limit: int = 2000) -> str:
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        with path.open("rb") as handle:
+            handle.seek(max(0, path.stat().st_size - limit * 4))
+            text = handle.read(limit * 4).decode("utf-8", errors="replace")
     except OSError:
         return ""
     return text[-limit:]
@@ -1882,6 +1936,9 @@ def run_command(
             log_path.write_text(f"{type(exc).__name__}: {exc}\n", encoding="utf-8")
         except OSError:
             pass
+    if log_path.exists() and log_path.stat().st_size > MAX_CHECK_LOG_BYTES:
+        status = "error"
+        reason_code = "check_log_size_exceeded"
     return CommandOutcome(
         argv=tuple(str(item) for item in argv),
         returncode=returncode,
@@ -3782,6 +3839,7 @@ def execute_aggregate(
     files = sorted(path for path in input_dir.rglob("*.json") if path.resolve() != output_path)
     artifacts: list[dict[str, Any]] = []
     digests: dict[str, str] = {}
+    bundle_roots: dict[str, Path] = {}
     observed_legs: list[dict[str, Any]] = []
     problem: GateBlock | None = None
     if not files:
@@ -3792,7 +3850,7 @@ def execute_aggregate(
         try:
             raw = path.read_bytes()
             artifact = json.loads(raw.decode("utf-8"))
-            validated = validate_run_artifact(artifact, manifest)
+            validated = validate_run_artifact(artifact, manifest, bundle_root=path.parent)
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, GateBlock) as exc:
             detail = exc.detail if isinstance(exc, GateBlock) else str(exc)
             problem = GateBlock("aggregate_input_invalid", f"{path}: {detail}")
@@ -3803,6 +3861,7 @@ def execute_aggregate(
             break
         digest = sha256_bytes(raw)
         digests[leg] = digest
+        bundle_roots[leg] = path.parent
         artifacts.append(validated)
         observed_legs.append(
             {
@@ -3820,6 +3879,7 @@ def execute_aggregate(
                 artifacts,
                 binding,
                 input_sha256_by_leg=digests,
+                bundle_roots=bundle_roots,
             )
         except GateBlock as exc:
             problem = exc

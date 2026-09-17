@@ -1137,6 +1137,7 @@ def test_write_run_evidence_is_normalized_and_roundtrip_validated(tmp_path: Path
     manifest = dev_gate.validate_manifest(_manifest())
     artifact = _leg_artifact(manifest, "macos/3.13")
     evidence = tmp_path / "evidence.json"
+    _write_check_logs(artifact, tmp_path / "runner")
 
     digest = dev_gate.write_run_evidence(evidence, artifact, manifest)
 
@@ -1145,6 +1146,165 @@ def test_write_run_evidence_is_normalized_and_roundtrip_validated(tmp_path: Path
     assert digest == dev_gate.sha256_bytes(raw)
     assert json.loads(raw) == artifact
     assert os.path.isabs(artifact["checks"][0]["log"]["path"])
+    for check in artifact["checks"]:
+        log = check["log"]
+        assert log["artifact_path"] == f"logs/{check['id']}.log"
+        collected = evidence.parent / log["artifact_path"]
+        assert collected.read_bytes() == Path(log["path"]).read_bytes()
+        assert dev_gate.sha256_bytes(collected.read_bytes()) == log["sha256"]
+
+
+def _write_check_logs(artifact: dict, directory: Path) -> None:
+    directory.mkdir()
+    for check in artifact["checks"]:
+        path = directory / f"{check['id']}.log"
+        path.write_text(f"Output for {check['id']}\n", encoding="utf-8")
+        check["log"] = {"path": str(path.resolve()), "sha256": dev_gate.sha256_bytes(path.read_bytes())}
+
+
+def test_historical_evidence_without_artifact_path_still_validates() -> None:
+    manifest = _manifest()
+    artifact = _leg_artifact(manifest, "linux/3.10")
+    assert all(set(check["log"]) == {"path", "sha256"} for check in artifact["checks"])
+    assert dev_gate.validate_run_artifact(artifact, manifest) == artifact
+
+
+@pytest.mark.parametrize("damage", ["missing", "changed"])
+def test_aggregate_reverifies_collected_logs(tmp_path: Path, damage: str) -> None:
+    manifest = _manifest()
+    binding = _binding(manifest, root=_gate_repo(tmp_path))
+    artifacts = []
+    roots = {}
+    for index, leg in enumerate(dev_gate.expected_ci_legs(manifest)):
+        artifact = _leg_artifact(manifest, leg)
+        _write_check_logs(artifact, tmp_path / f"runner-{index}")
+        evidence = tmp_path / f"leg-{index}" / "evidence.json"
+        dev_gate.write_run_evidence(evidence, artifact, manifest)
+        artifacts.append(json.loads(evidence.read_text(encoding="utf-8")))
+        roots[leg] = evidence.parent
+    dev_gate.aggregate_leg_artifacts(manifest, "release", artifacts, binding, bundle_roots=roots)
+    with pytest.raises(dev_gate.GateBlock, match="bundle root required"):
+        dev_gate.aggregate_leg_artifacts(manifest, "release", artifacts, binding)
+    log = roots[artifacts[-1]["ci_leg"]] / artifacts[-1]["checks"][-1]["log"]["artifact_path"]
+    if damage == "missing":
+        log.unlink()
+    else:
+        log.write_text("post-upload corruption", encoding="utf-8")
+    with pytest.raises(dev_gate.GateBlock, match="evidence_log_invalid"):
+        dev_gate.aggregate_leg_artifacts(manifest, "release", artifacts, binding, bundle_roots=roots)
+
+
+def test_collection_rejects_oversize_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest = _manifest()
+    artifact = _leg_artifact(manifest, "linux/3.10")
+    _write_check_logs(artifact, tmp_path / "runner")
+    monkeypatch.setattr(dev_gate, "MAX_CHECK_LOG_BYTES", 64)
+    log = artifact["checks"][0]["log"]
+    Path(log["path"]).write_bytes(b"x" * 65)
+    log["sha256"] = dev_gate.sha256_bytes(b"x" * 65)
+    evidence = tmp_path / "bundle" / "evidence.json"
+    with pytest.raises(dev_gate.GateBlock, match="check_log_size_exceeded"):
+        dev_gate.write_run_evidence(evidence, artifact, manifest)
+    assert not evidence.exists()
+    assert not (evidence.parent / "logs" / f"{artifact['checks'][0]['id']}.log").exists()
+
+
+def test_oversize_process_output_blocks_even_when_process_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dev_gate, "MAX_CHECK_LOG_BYTES", 64)
+    outcome = dev_gate.run_command(
+        check_id="oversize", argv=[sys.executable, "-c", "print('x' * 65)"],
+        cwd=tmp_path, env=dict(os.environ), timeout_seconds=30, logs_dir=tmp_path / "logs",
+    )
+    assert outcome.returncode == 0
+    assert outcome.status == "error"
+    assert outcome.reason_code == "check_log_size_exceeded"
+
+
+@pytest.mark.parametrize("relative", ["../outside.log", "/absolute.log", "logs/wrong-check.log"])
+def test_evidence_rejects_invalid_artifact_log_reference(relative: str) -> None:
+    manifest = _manifest()
+    artifact = _leg_artifact(manifest, "linux/3.10")
+    artifact["checks"][0]["log"]["artifact_path"] = relative
+
+    with pytest.raises(dev_gate.GateBlock, match="artifact_path is malformed"):
+        dev_gate.validate_run_artifact(artifact, manifest)
+
+
+@pytest.mark.parametrize("damage", ["missing", "changed"])
+def test_evidence_collection_rejects_unavailable_or_changed_log(tmp_path: Path, damage: str) -> None:
+    manifest = _manifest()
+    artifact = _leg_artifact(manifest, "linux/3.10")
+    _write_check_logs(artifact, tmp_path / "runner")
+    path = Path(artifact["checks"][-1]["log"]["path"])
+    if damage == "missing":
+        path.unlink()
+    else:
+        path.write_text("changed since recording", encoding="utf-8")
+    evidence = tmp_path / "bundle" / "dev-gate-evidence.json"
+
+    with pytest.raises(dev_gate.GateBlock, match="evidence_log_collection_failed"):
+        dev_gate.write_run_evidence(evidence, artifact, manifest)
+    assert not evidence.exists()
+
+
+@pytest.mark.parametrize("timed_out", [False, True], ids=["multiple-failures", "timeout"])
+def test_collected_pytest_log_preserves_full_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timed_out: bool,
+) -> None:
+    manifest = _manifest()
+    artifact = _leg_artifact(manifest, "linux/3.10")
+    _write_check_logs(artifact, tmp_path / "runner")
+    test_file = tmp_path / "test_product.py"
+    test_file.write_text(
+        "import sys\n"
+        "def test_first():\n"
+        "    print('product stdout first')\n"
+        "    raise AssertionError('first assertion sentinel')\n"
+        "def test_second():\n"
+        "    print('product stdout second ' + 'x' * 6000)\n"
+        "    print('product stderr second', file=sys.stderr)\n"
+        "    raise AssertionError('second assertion sentinel')\n",
+        encoding="utf-8",
+    )
+    if timed_out:
+        # Deterministic timeout at the process boundary, with output already on disk.
+        def timeout(argv, **kwargs):
+            kwargs["stdout"].write("product stdout before timeout\nproduct stderr before timeout\n")
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        monkeypatch.setattr(dev_gate.subprocess, "run", timeout)
+    outcome = dev_gate.run_command(
+        check_id="pytest-source-py310",
+        argv=[sys.executable, "-m", "pytest", "-q", "-rN", "-p", "no:cacheprovider", str(test_file)],
+        cwd=tmp_path, env={**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"},
+        timeout_seconds=30, logs_dir=tmp_path / "runner",
+    )
+    assert outcome.status == ("timeout" if timed_out else "fail")
+    check = next(c for c in artifact["checks"] if c["id"] == "pytest-source-py310")
+    check.update(status=outcome.status, exit_code=outcome.returncode, reason_code=outcome.reason_code,
+                 diagnostic=outcome.diagnostic, argv=list(outcome.argv))
+    check["log"] = {"path": str(outcome.log_path), "sha256": dev_gate.sha256_bytes(outcome.log_path.read_bytes())}
+    artifact.update(verdict="block", blockers=dev_gate._blockers_for_checks(artifact["checks"]))
+    artifact["summary"].update(passed=len(artifact["checks"]) - 1, blocked=1)
+    evidence = tmp_path / "bundle" / "dev-gate-evidence.json"
+
+    dev_gate.write_run_evidence(evidence, artifact, manifest)
+
+    uploaded = json.loads(evidence.read_text(encoding="utf-8"))
+    for record in uploaded["checks"]:
+        assert (evidence.parent / record["log"]["artifact_path"]).is_file()
+    content = (evidence.parent / check["log"]["artifact_path"]).read_text(encoding="utf-8")
+    if timed_out:
+        assert "product stdout before timeout" in content
+        assert "product stderr before timeout" in content
+        assert "timed out after 30s" in content
+    else:
+        for marker in ("first assertion sentinel", "second assertion sentinel",
+                       "product stdout first", "product stdout second", "product stderr second"):
+            assert marker in content
+        assert "first assertion sentinel" not in check["diagnostic"]
+        assert len(check["diagnostic"]) <= 2000
 
 
 def test_aggregate_evidence_roundtrips_with_exact_leg_input_digests(tmp_path: Path) -> None:
