@@ -115,4 +115,12 @@ to `logs/<check-id>.log` in the same artifact. This file contains the complete c
 stdout/stderr, including pytest's captured product output and output written before a
 timeout; `diagnostic` is only a 2,000-character summary. The original absolute runner
 `log.path` and `log.sha256` remain provenance fields; the collected file must match that
-hash or evidence writing fails. Older JSON artifacts may lack the relative link.
+hash at collection and again when the downloaded bundle is read for aggregation;
+missing or changed logs block the aggregate. Older JSON artifacts may lack the relative link.
+
+Each collected check log is limited to 16 MiB. Larger logs block with
+`check_log_size_exceeded`, rather than silently omitting assertion output. Collection
+reads at most the limit plus one byte and does not copy an oversized log; command
+completion also marks oversized output as an error. This is an evidence acceptance
+limit, not a live subprocess disk quota: raw runner output can exceed it before the
+command completes or times out. No truncated log is accepted as complete evidence.

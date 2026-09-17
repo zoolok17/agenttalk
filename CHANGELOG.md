@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dev-gate leg artifacts now include every referenced check log beside the evidence
   JSON, with an artifact-relative link and verified hash. Red lanes retain all
   assertion output, captured stdout/stderr, and output emitted before a check times out (#170).
+  Aggregation rechecks collected log existence and hashes; logs over 16 MiB block
+  evidence collection rather than being silently truncated.
 
 ## [0.88.0] - 2026-09-17
 

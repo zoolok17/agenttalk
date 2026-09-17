@@ -1162,6 +1162,66 @@ def _write_check_logs(artifact: dict, directory: Path) -> None:
         check["log"] = {"path": str(path.resolve()), "sha256": dev_gate.sha256_bytes(path.read_bytes())}
 
 
+def test_historical_evidence_without_artifact_path_still_validates() -> None:
+    manifest = _manifest()
+    artifact = _leg_artifact(manifest, "linux/3.10")
+    assert all(set(check["log"]) == {"path", "sha256"} for check in artifact["checks"])
+    assert dev_gate.validate_run_artifact(artifact, manifest) == artifact
+
+
+@pytest.mark.parametrize("damage", ["missing", "changed"])
+def test_aggregate_reverifies_collected_logs(tmp_path: Path, damage: str) -> None:
+    manifest = _manifest()
+    binding = _binding(manifest, root=_gate_repo(tmp_path))
+    artifacts = []
+    roots = {}
+    for index, leg in enumerate(dev_gate.expected_ci_legs(manifest)):
+        artifact = _leg_artifact(manifest, leg)
+        _write_check_logs(artifact, tmp_path / f"runner-{index}")
+        evidence = tmp_path / f"leg-{index}" / "evidence.json"
+        dev_gate.write_run_evidence(evidence, artifact, manifest)
+        artifacts.append(json.loads(evidence.read_text(encoding="utf-8")))
+        roots[leg] = evidence.parent
+    dev_gate.aggregate_leg_artifacts(manifest, "release", artifacts, binding, bundle_roots=roots)
+    with pytest.raises(dev_gate.GateBlock, match="bundle root required"):
+        dev_gate.aggregate_leg_artifacts(manifest, "release", artifacts, binding)
+    log = roots[artifacts[-1]["ci_leg"]] / artifacts[-1]["checks"][-1]["log"]["artifact_path"]
+    if damage == "missing":
+        log.unlink()
+    else:
+        log.write_text("post-upload corruption", encoding="utf-8")
+    with pytest.raises(dev_gate.GateBlock, match="evidence_log_invalid"):
+        dev_gate.aggregate_leg_artifacts(manifest, "release", artifacts, binding, bundle_roots=roots)
+
+
+def test_collection_rejects_oversize_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest = _manifest()
+    artifact = _leg_artifact(manifest, "linux/3.10")
+    _write_check_logs(artifact, tmp_path / "runner")
+    monkeypatch.setattr(dev_gate, "MAX_CHECK_LOG_BYTES", 64)
+    log = artifact["checks"][0]["log"]
+    Path(log["path"]).write_bytes(b"x" * 65)
+    log["sha256"] = dev_gate.sha256_bytes(b"x" * 65)
+    evidence = tmp_path / "bundle" / "evidence.json"
+    with pytest.raises(dev_gate.GateBlock, match="check_log_size_exceeded"):
+        dev_gate.write_run_evidence(evidence, artifact, manifest)
+    assert not evidence.exists()
+    assert not (evidence.parent / "logs" / f"{artifact['checks'][0]['id']}.log").exists()
+
+
+def test_oversize_process_output_blocks_even_when_process_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dev_gate, "MAX_CHECK_LOG_BYTES", 64)
+    outcome = dev_gate.run_command(
+        check_id="oversize", argv=[sys.executable, "-c", "print('x' * 65)"],
+        cwd=tmp_path, env=dict(os.environ), timeout_seconds=30, logs_dir=tmp_path / "logs",
+    )
+    assert outcome.returncode == 0
+    assert outcome.status == "error"
+    assert outcome.reason_code == "check_log_size_exceeded"
+
+
 @pytest.mark.parametrize("relative", ["../outside.log", "/absolute.log", "logs/wrong-check.log"])
 def test_evidence_rejects_invalid_artifact_log_reference(relative: str) -> None:
     manifest = _manifest()
