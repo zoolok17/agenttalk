@@ -2367,6 +2367,49 @@ def test_make_drive_near_instant_exit_with_rate_limit_prose_classifies_infra(
     assert not o.summary.startswith(loop.NEVER_STARTED_SUMMARY_PREFIX)
 
 
+# ----------- #169: the SAME #145 capture must reach a CADENCE turn's classifier too
+
+def test_make_cadence_drive_near_instant_exit_with_rate_limit_prose_classifies_infra(
+    tmp_path, monkeypatch,
+) -> None:
+    # #169: make_cadence_drive's own _run_one closure had NO _capture_child_output
+    # call at all - a rate-limit banner on a CADENCE turn's non-JSON stdout was
+    # dropped before _classify_drive_failure ever saw it (the #145/#167 fix only
+    # reached the wrapped-seat path, make_drive). Classification only runs on a
+    # cadence RESUME attempt (the resume-continuity ledger's whole reason to call
+    # _classify_drive_failure at all) - turns=1 + a set thread_id forces codex's
+    # build_turn to choose the resume shape (["exec", "resume", ...]), matching
+    # cadence_drive's own attempted_resume check.
+    s = _store(tmp_path)
+    st = session.SessionState(cli="codex", codex_thread_id="t1",
+                              resume_available=True, turns=1)
+    captured: dict = {}
+    real_classify = run._classify_drive_failure
+
+    def _spy(sig, **kw):
+        result = real_classify(sig, **kw)
+        captured["sig"] = sig
+        captured["result"] = result
+        return result
+
+    monkeypatch.setattr(run, "_classify_drive_failure", _spy)
+    cd = run.make_cadence_drive(
+        s, "beta", "codex", st, ["codex"],
+        spawn=lambda a, i: ["Rate limit exceeded. Please try again later."],
+        clock=lambda: 0.0, render=False,
+    )
+    ok = cd({"agent": "beta"}, [{"type": "dead_letter"}])
+    assert ok is False
+    assert "result" in captured, "classification never ran - attempted_resume was False"
+    failure_class, summary = captured["result"]
+    assert failure_class == loop.CLASS_INFRA, summary
+    assert not summary.startswith(loop.NEVER_STARTED_SUMMARY_PREFIX)
+    # the discarded-output capture is what MADE the classification possible -
+    # assert it directly, not just the downstream verdict.
+    tail_text = run._child_output_tail_text(captured["sig"].get("discarded_output_tail"))
+    assert "Rate limit exceeded" in tail_text
+
+
 def test_make_drive_near_instant_exit_without_rate_limit_text_keeps_205_guard(
     tmp_path,
 ) -> None:
