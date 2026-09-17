@@ -57,6 +57,9 @@ SKILL_INVARIANTS = [
         "Proposal handling",               # proposal routing section
         "proposal-response",               # proposal verdict kind
         "agenttalk threads --for",         # thread-hygiene check
+        "Long-running work",               # #164 progress-note section
+        "does NOT end your turn",          # #164 core rule (mirrors _DEFAULT_RULES)
+        "agenttalk progress --from $SELF --to-id",  # #164 exact invocation
     ]),
     ("agenttalk.propose.md", "agenttalk-propose", [
         "AGENTTALK_SELF",                  # identity preamble
