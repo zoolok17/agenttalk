@@ -4400,3 +4400,40 @@ def test_roster_add_with_role_lead_demotes_prior(tmp_path: Path) -> None:
     _run(["roster", "set-role", "alpha", "lead"], root)
     _run(["roster", "add", "delta", "--role", "lead"], root)
     assert Store(root).sole_lead() == "delta"
+
+
+# =========================== #156 increment 1: backup =======================
+
+def test_backup_writes_snapshot_and_prints_manifest_path(
+    store: Store, store_root: Path, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+) -> None:
+    monkeypatch.setenv("AGENTTALK_RECOVERY_DIR", str(tmp_path / "recovery"))
+    rc = _run(["backup"], store_root)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "agenttalk: backup written to" in out
+    assert "manifest:" in out
+    assert "hash:" in out
+
+
+def test_backup_json_output_is_machine_readable(
+    store: Store, store_root: Path, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+) -> None:
+    monkeypatch.setenv("AGENTTALK_RECOVERY_DIR", str(tmp_path / "recovery"))
+    rc = _run(["backup", "--json"], store_root)
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["project_id"] == store.project_id()
+    assert Path(payload["manifest_path"]).is_file()
+    assert payload["file_count"] > 0
+
+
+def test_backup_refuses_uninitialized_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+) -> None:
+    monkeypatch.setenv("AGENTTALK_RECOVERY_DIR", str(tmp_path / "recovery"))
+    empty_root = tmp_path / "never-initialized"
+    empty_root.mkdir()
+    _run_expect_exit(["backup"], empty_root, 2)
