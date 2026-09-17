@@ -108,3 +108,11 @@ version, manifest blob/digest, and logical plan digest and that the current chec
 
 CI uploads every leg artifact even when its gate command blocks. The always-run aggregate converts a crashed
 or evidence-less leg into an incomplete blocking artifact instead of silently reducing the matrix.
+
+To investigate a red lane, download its `dev-gate-leg-<os>-<python>` artifact and open
+`dev-gate-evidence.json`. For each failing check, follow `checks[].log.artifact_path`
+to `logs/<check-id>.log` in the same artifact. This file contains the complete combined
+stdout/stderr, including pytest's captured product output and output written before a
+timeout; `diagnostic` is only a 2,000-character summary. The original absolute runner
+`log.path` and `log.sha256` remain provenance fields; the collected file must match that
+hash or evidence writing fails. Older JSON artifacts may lack the relative link.

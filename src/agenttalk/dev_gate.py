@@ -988,7 +988,13 @@ def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, 
         tool = _require_object(item["tool"], f"checks[{index}].tool")
         _require_artifact_fields(tool, {"path", "version"}, f"checks[{index}].tool")
         log = _require_object(item["log"], f"checks[{index}].log")
-        _require_artifact_fields(log, {"path", "sha256"}, f"checks[{index}].log")
+        # Historical evidence remains readable; newly written bundles include the relative link.
+        log_fields = {"path", "sha256"}
+        if "artifact_path" in log:
+            log_fields.add("artifact_path")
+            if log["artifact_path"] != f"logs/{check_id}.log":
+                raise GateBlock("evidence_schema_invalid", f"checks[{index}].log.artifact_path is malformed")
+        _require_artifact_fields(log, log_fields, f"checks[{index}].log")
         if not _is_absolute_path_text(log["path"]) or not _is_hash(log["sha256"], 64):
             raise GateBlock("evidence_schema_invalid", f"checks[{index}].log is malformed")
         if item["status"] == "pass":
@@ -1213,9 +1219,23 @@ def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, 
 
 
 def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str, Any]) -> str:
-    """Write one normalized run artifact and validate the bytes read back."""
+    """Collect complete check logs beside the normalized, roundtrip-validated JSON."""
 
     validate_run_artifact(artifact, manifest)
+    for check in artifact["checks"]:
+        log = check["log"]
+        relative = f"logs/{check['id']}.log"
+        destination = path.parent / relative
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            source = Path(log["path"])
+            if source.resolve() != destination.resolve():
+                shutil.copyfile(source, destination)
+            if _sha256_file(destination) != log["sha256"]:
+                raise GateBlock("evidence_log_collection_failed", f"log hash changed for {check['id']}")
+        except OSError as exc:
+            raise GateBlock("evidence_log_collection_failed", f"cannot collect log for {check['id']}: {exc}") from exc
+        log["artifact_path"] = relative
     payload = json.dumps(artifact, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
     try:
         write_text(path, payload, encoding="utf-8", newline="\n")

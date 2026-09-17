@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Dev-gate leg artifacts now include every referenced check log beside the evidence
+  JSON, with an artifact-relative link and verified hash. Red lanes retain all
+  assertion output, captured stdout/stderr, and output emitted before a check times out (#170).
+
 ## [0.88.0] - 2026-09-17
 
 Theme: **the lead can trust what it does not see - four field defects

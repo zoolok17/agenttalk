@@ -38,6 +38,13 @@ def test_ci_evidence_actions_and_gitleaks_archive_are_immutable() -> None:
     assert "if: always()" in workflow
 
 
+def test_leg_upload_includes_the_json_and_its_sibling_logs() -> None:
+    workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")
+    leg = workflow.split("  dev-gate-aggregate:")[0]
+    assert '--evidence "${{ runner.temp }}/dev-gate-evidence/dev-gate-evidence.json"' in leg
+    assert "path: ${{ runner.temp }}/dev-gate-evidence/\n" in leg
+
+
 def test_security_workflow_contains_only_declared_codeql_exception() -> None:
     workflow = Path(".github/workflows/security.yml").read_text(encoding="utf-8")
 
