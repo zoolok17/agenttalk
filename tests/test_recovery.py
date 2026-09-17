@@ -90,6 +90,113 @@ def test_backup_refuses_uninitialized_store(tmp_path: Path) -> None:
         recovery.create_backup(s, dest_root=tmp_path / "recovery")
 
 
+def test_backup_excludes_every_lock_artifact_the_store_can_create(tmp_path: Path) -> None:
+    """reviewer-3's PR #177 finding: a hand-maintained exclusion list missed
+    several `_exclusive_lock`-class marker files (operation-publication.lock,
+    the per-agent waiting/awaiting/lead-loop-lease locks - one of which,
+    `lead-loop-lease.lock`, wasn't even in the reviewer's own list). Covers
+    both shapes a lock leaves on disk: (a) every hidden `.generation` guard,
+    produced by a normal clean acquire-then-release of every lock the real
+    store API exposes (`_exclusive_lock`'s own `finally` unlinks the BARE
+    marker on a clean release - the guard is the only thing that persists);
+    (b) a BARE marker left behind the way a crashed holder leaves one -
+    `_exclusive_lock`'s own docstring documents this as "ownerless legacy
+    crash remnants" - reproduced the same way reviewer-3's own executed
+    proof did (writing the file directly, since forcing a real mid-acquire
+    crash isn't practical in a unit test). Then backs up and asserts, for
+    every one of these files: it still shows hardlink count 1 on the LIVE
+    store afterward (the actual failure mode - a hardlinked marker breaks
+    every future acquisition of that lock), and its name never appears in
+    the manifest. Exercises `store.is_lock_or_guard_artifact` transitively
+    through `recovery._is_lock_artifact` - must go red if recovery.py ever
+    reverts to its own separate hand list instead of that shared
+    predicate (verified manually: reverting to the pre-fix six-name list
+    makes this test fail on the missed bare names below)."""
+    store_root = tmp_path / "project"
+    dest_root = tmp_path / "recovery"
+    s = _store(store_root)
+
+    # (a) Clean acquire/release of every lock the real store API exposes -
+    # leaves every .generation guard behind.
+    with s.config_lock():
+        pass
+    with s.coverage_transaction_lock():
+        pass
+    with s.coverage_handoff_lock():
+        pass
+    with s._supervisor_lifecycle_lock():
+        pass
+    with s._powershell_selection_lock():
+        pass
+    with s._waiting_lock("alpha"):
+        pass
+    with s._awaiting_lock("alpha"):
+        pass
+    with s._lead_loop_lease_lock("alpha"):
+        pass
+    with s._exclusive_lock(s.state_dir / "operation-publication.lock",
+                           what="wrapper operation publication"):
+        pass
+    with s._retirement_lock():
+        pass
+    with s._message_publication_lock():
+        pass
+
+    # (b) Simulate a crashed holder for every BARE marker name that a
+    # clean release removes - this is the actual shape reviewer-3's
+    # executed proof used, and the actual gap the old hand list had.
+    bare_marker_paths = [
+        s.dir / "config.lock",
+        s.dir / "supervisor-lifecycle.lock",
+        s.dir / "powershell-host.lock",
+        s.dir / "assurance" / "coverage.lock",
+        s.dir / "assurance" / "coverage-handoff.lock",
+        s.state_dir / "operation-publication.lock",
+        s.state_dir / "alpha.waiting.lock",
+        s.awaiting_dir / "alpha.lock",
+        s.state_dir / "alpha.lead-loop-lease.lock",
+    ]
+    for p in bare_marker_paths:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text('{"pid": 999999, "protocol": "o_excl_v2", '
+                     '"generation": "dead", "at": "2020-01-01T00:00:00Z"}',
+                     encoding="utf-8")
+
+    # Enumerate the files we EXPECT to be lock artifacts independently of
+    # `recovery._is_lock_artifact` (the function under test) - every
+    # ".generation" guard on disk (a name shape store.py itself reserves
+    # for exactly this, not something recovery.py invented) plus the bare
+    # markers this test wrote directly. A circular enumeration (asking the
+    # function under test what IT thinks counts) is exactly how the
+    # original version of this test stayed green despite the gap reviewer-3
+    # found - it never catches a name the predicate itself is missing.
+    generation_guards = [p for p in store_root.rglob(".*.generation") if p.is_file()]
+    expected_lock_paths = generation_guards + bare_marker_paths
+    assert len(generation_guards) >= 11, sorted(p.name for p in generation_guards)
+    for p in expected_lock_paths:
+        assert p.is_file(), p  # every path this test itself created
+
+    # The function under test must classify every one of them as a lock
+    # artifact - this is the assertion that actually fails under the old
+    # hand list, for the bare marker names it never enumerated.
+    misclassified = [p.name for p in expected_lock_paths if not recovery._is_lock_artifact(p.name)]
+    assert misclassified == [], (
+        f"recovery._is_lock_artifact fails to recognize: {misclassified} - "
+        f"these would be hardlinked/copied into a backup and alias a live lock"
+    )
+
+    result = recovery.create_backup(s, dest_root=dest_root)
+
+    for p in expected_lock_paths:
+        assert p.stat().st_nlink == 1, (
+            f"{p.name}: hardlink count changed - a live acquisition of this "
+            f"lock would now fail with 'unsafe lock path'"
+        )
+    manifest_names = {Path(rel).name for rel in result.files}
+    aliased = manifest_names & {p.name for p in expected_lock_paths}
+    assert aliased == set(), f"lock artifact(s) leaked into the backup: {aliased}"
+
+
 # ------------------------------------------------------------------ self-check
 
 def test_backup_self_check_catches_a_tampered_staged_file(

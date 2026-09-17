@@ -29,12 +29,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   copy on filesystems without hardlink support. Lock/guard marker files
   are excluded from every snapshot (hardlinking or copying one risks
   aliasing a live lock's inode and breaking future acquisitions on the
-  live store). Self-verifies every file's hash before publishing and
-  stages under a temp name, renamed into place only once complete, so a
-  killed backup never leaves a directory that looks whole. See
-  `docs/backup.md` for exactly what this does and does not guarantee.
-  Restore, vanished-store detection, and archive-out-of-tree
-  (increments 2-4) are designed but deferred to a later release.
+  live store) - recognized via `store.is_lock_or_guard_artifact`, the
+  lock module's own exported naming-convention predicate, not a
+  hand-maintained list in the backup code (review fix: an earlier hand
+  list missed several `_exclusive_lock`-class marker files). Self-
+  verifies every file's hash before publishing and stages under a temp
+  name, renamed into place only once complete, so a killed backup never
+  leaves a directory that looks whole. See `docs/BACKUP.md` for exactly
+  what this does and does not guarantee. Restore, vanished-store
+  detection, and archive-out-of-tree (increments 2-4) are designed but
+  deferred to a later release.
 
 ## [0.88.0] - 2026-09-17
 

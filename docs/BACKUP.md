@@ -100,8 +100,14 @@ will be able to pick a specific one or default to the latest.
   hardlinked, not copied) - hardlinking one would let a stale backup
   break every future acquisition of that same lock on the LIVE store
   (this codebase's own generation-guard locks refuse to run if their
-  guard file's hardlink count isn't exactly 1). A restored store creates
-  fresh lock files on first use; it never needs the old ones.
+  guard file's hardlink count isn't exactly 1). Recognized via
+  `store.is_lock_or_guard_artifact` - the lock module's own exported
+  naming-convention predicate (every current and future lock follows a
+  `.lock`/`.generation`-suffixed name, plus two legacy bare exceptions),
+  not a separately hand-maintained list in the backup code, so a new
+  lock added to `store.py` is covered automatically rather than needing
+  a matching edit here. A restored store creates fresh lock files on
+  first use; it never needs the old ones.
 - **This command does not restore, delete-protect, or detect a vanished
   store.** Those are #156 increments 2-4, designed (see the issue) but
   deferred to a later release. Today, `agenttalk backup` only writes the

@@ -72,6 +72,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import _atomic
+from . import store as _store_mod
 from . import __version__
 
 RECOVERY_MANIFEST_SCHEMA_VERSION = 1
@@ -83,31 +84,24 @@ MANIFEST_FILENAME = "manifest.json"
 # these would not just corrupt the SNAPSHOT's own view of the lock; it would
 # make every FUTURE acquisition on the LIVE store fail with "unsafe lock
 # path" for as long as the backup (which is never deleted automatically)
-# keeps the alias alive. Worse on Windows: the guard this module itself
-# holds for the fence duration (message-publication) is byte-locked, so even
-# a plain copy of it fails with a sharing-violation PermissionError while
-# held - confirmed empirically, not just reasoned about. Lock/guard files
-# are pure runtime coordination state, never durable data a restore needs
-# (a fresh one is created on next use), so they are SKIPPED from the
-# snapshot entirely rather than hardlinked or copied. Bare marker names are
-# the known `_lock_generation_guard` callers (store.py: config.lock,
-# supervisor-lifecycle.lock, powershell-host.lock, retirement,
-# message-publication) plus supervisor.instance.lock (a separate OS-lock
-# primitive, excluded out of the same caution). Every guard's own hidden
-# file is named ``.<lock-name>.generation`` (store.py:1362) - matched by
-# suffix so a future new lock is covered without another edit here.
-_LOCK_ARTIFACT_NAMES = frozenset({
-    "config.lock",
-    "supervisor-lifecycle.lock",
-    "powershell-host.lock",
-    "supervisor.instance.lock",
-    "retirement",
-    "message-publication",
-})
-
-
-def _is_lock_artifact(name: str) -> bool:
-    return name in _LOCK_ARTIFACT_NAMES or name.endswith(".generation")
+# keeps the alias alive. Worse on Windows: a guard this module itself holds
+# for the fence duration (message-publication) is byte-locked, so even a
+# plain copy of it fails with a sharing-violation PermissionError while held
+# - confirmed empirically, not just reasoned about. Lock/guard files are
+# pure runtime coordination state, never durable data a restore needs (a
+# fresh one is created on next use), so they are SKIPPED from the snapshot
+# entirely rather than hardlinked or copied.
+#
+# The name predicate itself is NOT hand-maintained here (reviewer-3's PR
+# #177 finding: a hand list here missed several `_exclusive_lock`-class
+# marker files - operation-publication.lock, per-agent waiting/awaiting/
+# lead-loop-lease locks - none individually tested, one of them reproduced
+# the live wedge in an executed proof). ``store.is_lock_or_guard_artifact``
+# is the single source of truth store.py's own lock code is defined next
+# to, covering every current lock by naming convention (suffix-based, so a
+# FUTURE lock is covered by construction) rather than needing a matching
+# edit here every time a new lock is added.
+_is_lock_artifact = _store_mod.is_lock_or_guard_artifact
 
 
 def default_recovery_dir() -> Path:

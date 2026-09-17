@@ -191,6 +191,35 @@ def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
     return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
 
 
+# Every marker file `_exclusive_lock`/`_lock_generation_guard` create follows
+# one of two shapes: a bare lock/marker name ending in ".lock" (the
+# convention every call site added since 0.6.0 follows - config.lock,
+# coverage.lock, coverage-handoff.lock, supervisor-lifecycle.lock,
+# powershell-host.lock, operation-publication.lock, "<agent>.waiting.lock",
+# "<agent>.lock" under awaiting_dir, "<agent>.lead-loop-lease.lock"), or one
+# of two legacy bare names that predate that convention (retirement,
+# message-publication). Every hidden generation-guard file is named
+# ".<lock-name>.generation" (see _lock_generation_guard, just above). Public
+# and exported (not a leading-underscore private) specifically so code
+# OUTSIDE this class that walks the store's directory tree - today,
+# agenttalk.recovery's backup snapshot - can recognize and exclude these
+# WITHOUT its own hand-maintained list that a future new lock can silently
+# miss: _validate_lock_file_stat (above) requires hardlink count == 1 on
+# every acquisition, so hardlinking (or, on Windows, even copying one while
+# held - a byte-locked file - see recovery.py) one of these into a snapshot
+# that outlives the backup can permanently wedge the LIVE store's own
+# locking. New locks in this file should keep using a ".lock"-suffixed name
+# so they are covered by construction; do not add a new bare name here.
+LOCK_ARTIFACT_SUFFIXES = (".lock", ".generation")
+_LEGACY_BARE_LOCK_ARTIFACT_NAMES = frozenset({"retirement", "message-publication"})
+
+
+def is_lock_or_guard_artifact(name: str) -> bool:
+    """True if ``name`` (a bare filename, not a path) is one of this
+    store's own lock/guard marker files."""
+    return name.endswith(LOCK_ARTIFACT_SUFFIXES) or name in _LEGACY_BARE_LOCK_ARTIFACT_NAMES
+
+
 def _file_revision(info: os.stat_result) -> tuple[int, int, int, int]:
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
 
