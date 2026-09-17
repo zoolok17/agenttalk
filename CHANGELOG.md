@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`agenttalk backup` (#156 increment 1).** The bus store (`.agenttalk/`)
+  lives entirely inside the project tree, so `rm -rf .agenttalk` /
+  `Remove-Item -Recurse` / a routine `git clean -fdx` destroys every
+  message, the roster, and archived cold storage in one shot with no
+  warning. `agenttalk backup` writes a verified, out-of-tree snapshot to a
+  per-user recovery directory keyed by project identity (`signing
+  .project_id_for_root` - reused, already audited, survives delete/
+  recreate at the same path; same per-user base directory as
+  `hmac-init`'s keys, overridable via `AGENTTALK_RECOVERY_DIR`), printing
+  the manifest path and hash. Fences writers only around a hardlink-based
+  clone (`os.link` per file - directory-entry creation, bounded by file
+  count, not store size), releases the fence, then hashes and writes the
+  manifest against the now-static clone unlocked - deliberately NOT a
+  fence around the whole operation, which would reproduce issue #154's
+  lock-timeout-under-contention at snapshot scale. Falls back to a byte
+  copy on filesystems without hardlink support. Lock/guard marker files
+  are excluded from every snapshot (hardlinking or copying one risks
+  aliasing a live lock's inode and breaking future acquisitions on the
+  live store). Self-verifies every file's hash before publishing and
+  stages under a temp name, renamed into place only once complete, so a
+  killed backup never leaves a directory that looks whole. See
+  `docs/backup.md` for exactly what this does and does not guarantee.
+  Restore, vanished-store detection, and archive-out-of-tree
+  (increments 2-4) are designed but deferred to a later release.
+
 ## [0.88.0] - 2026-09-17
 
 Theme: **the lead can trust what it does not see - four field defects

@@ -64,6 +64,7 @@ from agenttalk import lead_loop_runtime
 from agenttalk import launch_admission
 from agenttalk import onboarding as ob
 from agenttalk import signing as _signing
+from agenttalk import recovery as recovery_mod
 from agenttalk import skill_currency as skill_currency_mod
 from agenttalk import threads as th
 from agenttalk import supervisor as sup
@@ -9584,6 +9585,44 @@ def cmd_hmac_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_backup(args: argparse.Namespace) -> int:
+    """Write a verified out-of-tree snapshot of the store (#156 increment 1).
+
+    See `agenttalk.recovery` for the full design (identity, location,
+    fencing). This command only resolves the store, calls
+    `recovery.create_backup`, and reports the result - all the interesting
+    logic lives in that module so it can be reused by `doctor`/`status`
+    (#156 increment 3) without CLI plumbing in the way.
+    """
+    store = _get_store(args)
+    try:
+        result = recovery_mod.create_backup(store)
+    except (OSError, ValueError, FileNotFoundError) as e:
+        sys.stderr.write(f"agenttalk backup: {e}\n")
+        return 2
+    if args.json:
+        print(json.dumps({
+            "project_id": result.project_id,
+            "destination": str(result.destination),
+            "manifest_path": str(result.manifest_path),
+            "manifest_hash": result.manifest_hash,
+            "file_count": result.file_count,
+            "total_bytes": result.total_bytes,
+            "hardlink_used": result.hardlink_used,
+            "sequence_at_snapshot": result.sequence_at_snapshot,
+            "fence_seconds": result.fence_seconds,
+        }, ensure_ascii=False))
+        return 0
+    print(f"agenttalk: backup written to {result.destination}")
+    print(f"  manifest:   {result.manifest_path}")
+    print(f"  hash:       {result.manifest_hash}")
+    print(f"  files:      {result.file_count} ({result.total_bytes} bytes)")
+    print(f"  mode:       {'hardlink' if result.hardlink_used else 'copy (no hardlink support)'}")
+    print(f"  sequence:   {result.sequence_at_snapshot}")
+    print(f"  fence:      {result.fence_seconds:.3f}s")
+    return 0
+
+
 def _reset_in_minutes(epoch: object) -> int | None:
     if not isinstance(epoch, (int, float)) or isinstance(epoch, bool):
         return None
@@ -16454,6 +16493,18 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Overwrite an existing key. Every message signed with "
                          "the old key becomes unverifiable.")
     ph.set_defaults(func=cmd_hmac_init)
+
+    pbk = sub.add_parser(
+        "backup",
+        help="(#156) Write a verified out-of-tree snapshot of the store to "
+             "the per-user recovery directory (same base as hmac-init's "
+             "keys dir), keyed by project identity - survives `rm -rf "
+             ".agenttalk` / `git clean -fdx`. Briefly fences writers for a "
+             "hardlink clone only (bounded by file count, not store size), "
+             "then hashes and writes the manifest unlocked.",
+    )
+    pbk.add_argument("--json", action="store_true", help="Machine-readable output.")
+    pbk.set_defaults(func=cmd_backup)
 
     pcap = sub.add_parser(
         "capacity",

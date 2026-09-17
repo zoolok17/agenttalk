@@ -806,6 +806,7 @@ typed-evidence shape at the milestone level.
 | `codex-config` | `--enable`/`--disable`/`--status` for Codex sandbox approval settings. |
 | `install-skills` | Install bus skills (and the dev-discipline devkit) for Claude and/or Codex. |
 | `hmac-init` | Provision HMAC signing material. |
+| `backup` | (#156) Write a verified out-of-tree snapshot of the store, keyed by project identity; `--json`. See [docs/BACKUP.md](docs/BACKUP.md). |
 | `gateway` | `{init,start,stop,status,...}` — multi-agent process gateway lifecycle. |
 
 **Dashboards**
@@ -924,6 +925,7 @@ This reference deliberately stays shallow. For more:
 - [docs/DESIGN.md](docs/DESIGN.md) — architecture, rationale, and decision history.
 - [docs/ASSURANCE.md](docs/ASSURANCE.md) — release attestation and gate evidence in depth.
 - [docs/supervisor-tutorial.md](docs/supervisor-tutorial.md) — full supervisor/wrapper walkthrough, including migrating an existing project in and out of supervision.
+- [docs/BACKUP.md](docs/BACKUP.md) — what `agenttalk backup` guarantees and does not.
 - [CHANGELOG.md](CHANGELOG.md) — release history.
 - [SECURITY.md](SECURITY.md) — security posture and trust model.
 - [docs/README-ARCHIVE-2026-09.md](docs/README-ARCHIVE-2026-09.md) — the pre-rewrite README, kept for reference (superseded, not maintained).
