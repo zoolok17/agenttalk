@@ -2245,6 +2245,75 @@ def _child_output_tail_text(tail: object) -> str:
     return "\n".join(parts)
 
 
+def _child_output_capture(sig: dict) -> tuple[Callable[..., None], Callable[[], None]]:
+    """Build ONE turn's child-output-tail capture pair: ``(capture, finalize)``.
+
+    Shared by ``make_drive``'s and ``make_cadence_drive``'s ``_run_one`` (#169) -
+    before this both closures were hand-duplicated, and the cadence copy was
+    missing entirely, so a rate-limit banner on a CADENCE turn's non-JSON stdout
+    was dropped before ``_classify_drive_failure`` ever saw it (the #145 fix,
+    PR #167, only reached the wrapped-seat path). ``capture`` records every raw
+    stdout line into the bounded/redacted tail, and additionally into a SEPARATE
+    "discarded" tail when the line failed JSON parsing - the discarded tail is
+    the ONLY place a spawn-time or launch-time rate-limit message can ever
+    surface, since the child never got far enough to emit a parseable event
+    (``_classify_drive_failure``'s ``discarded_output_tail`` read, #145).
+    ``finalize`` writes both bounded tails into ``sig`` - call it on every return
+    path, exactly once each, before the caller reads ``sig`` for classification.
+    """
+    child_output_lines: list[dict[str, str]] = []
+    child_output_truncated = False
+    discarded_output_lines: list[dict[str, str]] = []
+    discarded_output_truncated = False
+
+    def _capture_child_output(
+        stream_name: str,
+        text: object,
+        *,
+        discarded: bool = False,
+    ) -> None:
+        nonlocal child_output_truncated, discarded_output_truncated
+        tail = normalize_child_output_tail({
+            "truncated": child_output_truncated,
+            "lines": [*child_output_lines, {"stream": stream_name, "text": text}],
+        })
+        if tail is None:
+            return
+        child_output_lines[:] = tail["lines"]
+        child_output_truncated = tail.get("truncated") is True
+        if not discarded:
+            return
+        diagnostic_tail = normalize_child_output_tail({
+            "truncated": discarded_output_truncated,
+            "lines": [
+                *discarded_output_lines,
+                {"stream": stream_name, "text": text},
+            ],
+        })
+        if diagnostic_tail is None:
+            return
+        discarded_output_lines[:] = diagnostic_tail["lines"]
+        discarded_output_truncated = (
+            diagnostic_tail.get("truncated") is True
+        )
+
+    def _finalize_child_output() -> None:
+        tail = normalize_child_output_tail({
+            "truncated": child_output_truncated,
+            "lines": child_output_lines,
+        })
+        if tail is not None:
+            sig["child_output_tail"] = tail
+        diagnostic_tail = normalize_child_output_tail({
+            "truncated": discarded_output_truncated,
+            "lines": discarded_output_lines,
+        })
+        if diagnostic_tail is not None:
+            sig["discarded_output_tail"] = diagnostic_tail
+
+    return _capture_child_output, _finalize_child_output
+
+
 def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str], *,
                sender: str | None = None, min_interval: float = 5.0,
                render: bool = True, rules: str | None = None,
@@ -2494,8 +2563,6 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                "discarded_output_tail": None,
                "produced_model_output": False, "result_num_turns": None,
                "lesson_exposure_error": None}
-        child_output_lines: list[dict[str, str]] = []
-        child_output_truncated = False
         runtime_started = False
 
         def _finish_runtime() -> None:
@@ -2504,53 +2571,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                     "success" if sig["ok"] else "failed"
                 )
 
-        discarded_output_lines: list[dict[str, str]] = []
-        discarded_output_truncated = False
-
-        def _capture_child_output(
-            stream_name: str,
-            text: object,
-            *,
-            discarded: bool = False,
-        ) -> None:
-            nonlocal child_output_truncated, discarded_output_truncated
-            tail = normalize_child_output_tail({
-                "truncated": child_output_truncated,
-                "lines": [*child_output_lines, {"stream": stream_name, "text": text}],
-            })
-            if tail is None:
-                return
-            child_output_lines[:] = tail["lines"]
-            child_output_truncated = tail.get("truncated") is True
-            if not discarded:
-                return
-            diagnostic_tail = normalize_child_output_tail({
-                "truncated": discarded_output_truncated,
-                "lines": [
-                    *discarded_output_lines,
-                    {"stream": stream_name, "text": text},
-                ],
-            })
-            if diagnostic_tail is None:
-                return
-            discarded_output_lines[:] = diagnostic_tail["lines"]
-            discarded_output_truncated = (
-                diagnostic_tail.get("truncated") is True
-            )
-
-        def _finalize_child_output() -> None:
-            tail = normalize_child_output_tail({
-                "truncated": child_output_truncated,
-                "lines": child_output_lines,
-            })
-            if tail is not None:
-                sig["child_output_tail"] = tail
-            diagnostic_tail = normalize_child_output_tail({
-                "truncated": discarded_output_truncated,
-                "lines": discarded_output_lines,
-            })
-            if diagnostic_tail is not None:
-                sig["discarded_output_tail"] = diagnostic_tail
+        _capture_child_output, _finalize_child_output = _child_output_capture(sig)
 
         nonlocal preflight_ok
         if preflight is not None and not preflight_ok:
@@ -3031,7 +3052,9 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
         sig = {"ok": False, "started": False, "completed": False, "terminal": False,
                "retryable": False, "rc": None, "error": None, "terminal_text": "",
                "config_blocked": False, "config_blocked_text": "", "bus_failure": None,
-               "setup_failure": None}
+               "setup_failure": None,
+               "child_output_tail": None, "discarded_output_tail": None}
+        _capture_child_output, _finalize_child_output = _child_output_capture(sig)
         nonlocal preflight_ok
         if preflight is not None and not preflight_ok:
             blocked = preflight()
@@ -3051,11 +3074,18 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
             for line in stream:
                 s = line.strip()
                 if not s:
+                    _capture_child_output("stdout", line)
                     continue
                 try:
                     raw = json.loads(s)
                 except (ValueError, TypeError):
+                    # #169: the SAME capture the wrapped-seat path uses (#145/#167) -
+                    # a near-instant exit with a rate-limit banner never parses as
+                    # JSON, so this discarded tail is the only place
+                    # _classify_drive_failure can ever see it for a cadence turn.
+                    _capture_child_output("stdout", line, discarded=True)
                     continue
+                _capture_child_output("stdout", line)
                 _session.observe_event(session_state, raw)
                 for ev in mapper(raw):
                     if ev.type == EventType.TURN_STARTED:
@@ -3083,6 +3113,12 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                             sig["setup_failure"] = setup_failure
                     engine.process(ev, clock())
         except OSError as exc:
+            _capture_child_output(
+                "stderr",
+                f"{type(exc).__name__}: {exc}",
+                discarded=True,
+            )
+            _finalize_child_output()
             blocked = _spawn_config_blocked_summary(argv, exc)
             if blocked:
                 sig["config_blocked"] = True
@@ -3095,6 +3131,7 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
             return sig
         rc = getattr(stream, "returncode", None)
         sig["rc"] = rc
+        _finalize_child_output()
         sig["ok"] = (
             sig["completed"]
             and not sig["terminal"]

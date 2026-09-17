@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A cadence turn's rate-limit banner was dropped before classification
+  (#169).** The #145 fix (0.88.0) taught `make_drive`'s `_run_one` to
+  capture every non-JSON stdout line into a `discarded_output_tail` so a
+  near-instant exit printing only rate-limit prose could still reach
+  `_classify_drive_failure` and land on `known_global_infra` (bounded
+  backoff) instead of the generic "never started" ambiguous class. It
+  only reached the wrapped-SEAT path: `make_cadence_drive` has its own,
+  separate `_run_one` closure for the managed lead-loop's synthetic
+  cadence turns, and that copy's non-JSON handling was a bare `continue`
+  with no capture at all - the same failure shape on a cadence RESUME
+  attempt still fell to the generic ambiguous class, which the #205 guard
+  can promote to a sticky `config_blocked` park on the second consecutive
+  occurrence. The capture/finalize closures are now a single shared
+  factory (`_child_output_capture`, called by both `_run_one`s) instead
+  of two hand-duplicated copies, so this class of drift cannot recur
+  independently on either path again.
+
 ## [0.88.0] - 2026-09-17
 
 Theme: **the lead can trust what it does not see - four field defects
