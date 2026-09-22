@@ -30,7 +30,7 @@ def _make_qwen_wrap_store(tmp_path) -> Store:
                 "qwen-dev-1": {
                     "backend_profile": "ovh-qwen",
                     "cli": "claude",
-                    "model": "Qwen3.5-397B-A17B",
+                    "model": "Qwen3.8-27B",
                     "trust_class": "external-worker",
                     "wrapped": True,
                 },
@@ -121,11 +121,11 @@ def test_gateway_cli_initializes_once_and_controls_manual_hold(
         "canary-verify",
         "1" * 32,
         "--dashboard-delta-eur",
-        "0.00096",
+        "0.00067",
     ]) == 0
     canary = json.loads(capsys.readouterr().out)
     assert canary["accepted"] is True
-    assert canary["expected_micro_eur"] == 960
+    assert canary["expected_micro_eur"] == 670
 
 
 def test_gateway_cli_runtime_rebind_routes_candidate_and_prints_result(
@@ -621,7 +621,7 @@ def test_qwen_wrap_worker_spend_preflight_allows_accepted_canary(
         input_tokens=1_000,
         output_tokens=100,
     )
-    ledger.verify_dashboard_canary("1" * 32, observed_delta_micro_eur=960)
+    ledger.verify_dashboard_canary("1" * 32, observed_delta_micro_eur=670)
 
     def status_projection(_root):
         return _worker_gateway_projection(ledger)

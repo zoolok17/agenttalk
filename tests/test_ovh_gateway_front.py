@@ -786,10 +786,10 @@ def test_forged_well_formed_child_capability_never_reaches_provider(tmp_path) ->
         assert front.ledger.status()["unresolved"] == []
 
 
-def test_front_refuses_ninth_child_call_without_provider_transport(tmp_path) -> None:
-    assert gateway.CHILD_TURN_MAX_CALLS == 8
+def test_front_refuses_call_past_the_max_calls_cap_without_provider_transport(tmp_path) -> None:
+    assert gateway.CHILD_TURN_MAX_CALLS == 64
     with FakeUpstream() as upstream, RunningFront(tmp_path, upstream) as front:
-        for _ in range(8):
+        for _ in range(gateway.CHILD_TURN_MAX_CALLS):
             status, _ = front.request(path="/v1/messages?beta=true")
             assert status == 200
 
@@ -797,7 +797,7 @@ def test_front_refuses_ninth_child_call_without_provider_transport(tmp_path) -> 
 
         assert status == 403
         assert b"ATGW_CHILD_TURN_CAP_EXCEEDED" in body
-        assert len(upstream.requests) == 8
+        assert len(upstream.requests) == gateway.CHILD_TURN_MAX_CALLS
         assert front.ledger.status()["unresolved"] == []
 
 

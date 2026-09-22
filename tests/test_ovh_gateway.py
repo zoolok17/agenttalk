@@ -88,25 +88,25 @@ def downgrade_to_v1_without_child_caps(ledger: SpendLedger) -> None:
 
 def test_exact_price_policy_and_charge_fixture() -> None:
     assert POLICY_CURRENCY == "EUR"
-    assert INPUT_RATE_MICRO_EUR == 600_000
-    assert OUTPUT_RATE_MICRO_EUR == 3_600_000
-    assert RESERVE_INPUT_RATE_MICRO_EUR == 720_000
-    assert RESERVE_OUTPUT_RATE_MICRO_EUR == 4_320_000
+    assert INPUT_RATE_MICRO_EUR == 400_000
+    assert OUTPUT_RATE_MICRO_EUR == 2_700_000
+    assert RESERVE_INPUT_RATE_MICRO_EUR == 480_000
+    assert RESERVE_OUTPUT_RATE_MICRO_EUR == 3_240_000
     assert MAX_CONTEXT_TOKENS == 262_144
     assert MAX_OUTPUT_TOKENS == 4_096
     assert TRIAL_CUTOFF_MICRO_EUR == 25_000_000
     assert SOFT_STOP_MICRO_EUR == 20_000_000
     assert EXTERNAL_CEILING_MICRO_EUR == 100_000_000
     assert CANARY_TOLERANCE_BPS == 1_000
-    assert settlement_cost_micro_eur(1_000, 100) == 960
-    assert reservation_cost_micro_eur() == 206_439
+    assert settlement_cost_micro_eur(1_000, 100) == 670
+    assert reservation_cost_micro_eur() == 139_102
     assert len(price_policy_hash()) == 64
     assert gateway.child_cap_policy() == {
-        "schema_version": 1,
-        "max_calls": 8,
-        "max_micro_eur": 500_000,
-        "max_seconds": 300,
-        "reservation_micro_eur": 206_439,
+        "schema_version": 2,
+        "max_calls": 64,
+        "max_micro_eur": 3_000_000,
+        "max_seconds": 1_800,
+        "reservation_micro_eur": 139_102,
     }
     assert len(gateway.child_cap_policy_hash()) == 64
 
@@ -230,8 +230,8 @@ def test_opening_balance_is_bound_seeded_and_surfaced(tmp_path) -> None:
         output_tokens=100,
     )
     status = ledger.status()
-    assert status["current_committed_micro_eur"] == 580_960
-    assert status["current_trial_committed_micro_eur"] == 960
+    assert status["current_committed_micro_eur"] == 580_670
+    assert status["current_trial_committed_micro_eur"] == 670
 
 
 def test_opening_balance_external_envelope_blocks_init_and_readiness(tmp_path) -> None:
@@ -275,7 +275,7 @@ def test_opening_balance_external_envelope_blocks_init_and_readiness(tmp_path) -
 def test_reserve_then_settle_commits_exact_actual(tmp_path) -> None:
     ledger = make_ledger(tmp_path)
     reservation = ledger.reserve("1" * 32)
-    assert reservation.reserved_micro_eur == 206_439
+    assert reservation.reserved_micro_eur == 139_102
     assert ledger.status()["ready"] is False
 
     result = ledger.settle(
@@ -284,10 +284,10 @@ def test_reserve_then_settle_commits_exact_actual(tmp_path) -> None:
         input_tokens=1_000,
         output_tokens=100,
     )
-    assert result["actual_micro_eur"] == 960
+    assert result["actual_micro_eur"] == 670
     status = ledger.status()
     assert status["ready"] is True
-    assert status["current_committed_micro_eur"] == 960
+    assert status["current_committed_micro_eur"] == 670
     assert status["unresolved"] == []
 
 
@@ -299,7 +299,7 @@ def test_child_turn_call_cap_is_durable_and_fail_closed(tmp_path) -> None:
         request_id="q-child-cap",
         issuer_token=TEST_CHILD_CAP_ISSUER,
     )
-    assert credential.expires_at == "2026-07-15T12:05:00.000000Z"
+    assert credential.expires_at == "2026-07-15T12:30:00.000000Z"
 
     for ordinal in range(gateway.CHILD_TURN_MAX_CALLS):
         attempt_id = f"{ordinal + 1:032x}"
@@ -332,11 +332,12 @@ def test_child_turn_call_cap_is_durable_and_fail_closed(tmp_path) -> None:
 def test_child_turn_mint_is_refused_while_held_and_gets_a_full_window_after_clear(
     tmp_path,
 ) -> None:
-    # #63: a child turn opened UNDER a hold burns its 300s wall-time ceiling while the
-    # gateway cannot spend, so it is (near-)expired the instant the hold clears (the live
-    # incident: a held-gateway turn that expired mid-work and surfaced as a misleading
-    # config_blocked "budget exhausted"). Mint must refuse while held (no doomed turn),
-    # and mint fresh with a FULL window measured from now once the hold clears.
+    # #63: a child turn opened UNDER a hold burns its wall-time ceiling (300s when this
+    # regression was pinned, 1800s under the current dev caps) while the gateway cannot
+    # spend, so it is (near-)expired the instant the hold clears (the live incident: a
+    # held-gateway turn that expired mid-work and surfaced as a misleading config_blocked
+    # "budget exhausted"). Mint must refuse while held (no doomed turn), and mint fresh
+    # with a FULL window measured from now once the hold clears.
     clock = Clock(datetime(2026, 7, 15, 12, tzinfo=timezone.utc))
     ledger = make_ledger(tmp_path, clock)
     ledger.place_hold(reason="operator hold between paid tests")
@@ -358,8 +359,8 @@ def test_child_turn_mint_is_refused_while_held_and_gets_a_full_window_after_clea
         request_id="q-held",
         issuer_token=TEST_CHILD_CAP_ISSUER,
     )
-    # Full 300s window from 12:05 (the clear), NOT a stale window that started at 12:00.
-    assert credential.expires_at == "2026-07-15T12:10:00.000000Z"
+    # Full 1800s window from 12:05 (the clear), NOT a stale window that started at 12:00.
+    assert credential.expires_at == "2026-07-15T12:35:00.000000Z"
 
 
 def test_child_turn_mint_is_refused_while_a_prior_attempt_is_unresolved(tmp_path) -> None:
@@ -407,7 +408,17 @@ def test_child_turn_cost_cap_and_scope_isolation(tmp_path) -> None:
         request_id="same-request",
         issuer_token=TEST_CHILD_CAP_ISSUER,
     )
-    for ordinal in range(2):
+    # Settle enough full-context/full-output attempts to push cumulative exposure to
+    # just short of the cap, so the NEXT reservation (worst-case, at
+    # reservation_cost_micro_eur()) is the one that tips over CHILD_TURN_MAX_MICRO_EUR -
+    # derived from the live constants rather than a hardcoded count, so this stays
+    # correct whenever the tariff or caps change.
+    per_settle = settlement_cost_micro_eur(MAX_CONTEXT_TOKENS, MAX_OUTPUT_TOKENS)
+    calls_to_cap = (
+        gateway.CHILD_TURN_MAX_MICRO_EUR - reservation_cost_micro_eur()
+    ) // per_settle + 1
+    assert calls_to_cap < gateway.CHILD_TURN_MAX_CALLS  # cost ceiling must bite first
+    for ordinal in range(calls_to_cap):
         attempt_id = f"{ordinal + 1:032x}"
         ledger.reserve_for_child(attempt_id, capability=first.token)
         ledger.settle(
@@ -417,7 +428,7 @@ def test_child_turn_cost_cap_and_scope_isolation(tmp_path) -> None:
             output_tokens=MAX_OUTPUT_TOKENS,
         )
     with pytest.raises(gateway.ChildTurnCapExceeded, match="cost ceiling"):
-        ledger.reserve_for_child("3" * 32, capability=first.token)
+        ledger.reserve_for_child("ff" * 16, capability=first.token)
 
     # A different immutable inbound message gets an independent bucket even when
     # request_id repeats; another child is independent too.
@@ -786,7 +797,7 @@ def test_settle_does_not_depend_on_a_fallible_post_commit_barrier(tmp_path) -> N
         output_tokens=100,
     )
 
-    assert result["actual_micro_eur"] == 960
+    assert result["actual_micro_eur"] == 670
     assert ledger.status()["ready"] is True
 
 
@@ -1019,11 +1030,11 @@ def test_dashboard_canary_enforces_nonzero_delta_and_numeric_tolerance(tmp_path)
 
     accepted = ledger.verify_dashboard_canary(
         "1" * 32,
-        observed_delta_micro_eur=1_056,
+        observed_delta_micro_eur=737,
     )
     assert accepted["accepted"] is True
-    assert accepted["expected_micro_eur"] == 960
-    assert accepted["tolerance_micro_eur"] == 96
+    assert accepted["expected_micro_eur"] == 670
+    assert accepted["tolerance_micro_eur"] == 67
 
     other = make_ledger(tmp_path / "zero")
     other.reserve("2" * 32)
@@ -1071,7 +1082,7 @@ def test_dashboard_canary_gates_worker_spend_readiness_until_accepted(tmp_path) 
     assert cleared["worker_spend_ready"] is False
     assert cleared["worker_spend_errors"] == ["dashboard_canary_mismatch"]
 
-    ledger.verify_dashboard_canary("1" * 32, observed_delta_micro_eur=960)
+    ledger.verify_dashboard_canary("1" * 32, observed_delta_micro_eur=670)
     accepted = ledger.status()
     assert accepted["ready"] is True
     assert accepted["dashboard_canary"]["status"] == "accepted"
@@ -1088,7 +1099,7 @@ def test_dashboard_canary_readiness_rejects_stale_attempt_policy_binding(tmp_pat
         input_tokens=1_000,
         output_tokens=100,
     )
-    ledger.verify_dashboard_canary("1" * 32, observed_delta_micro_eur=960)
+    ledger.verify_dashboard_canary("1" * 32, observed_delta_micro_eur=670)
     with sqlite3.connect(ledger.db_path) as conn:
         conn.execute(
             "UPDATE attempts SET policy_hash='stale' WHERE attempt_id=?",
