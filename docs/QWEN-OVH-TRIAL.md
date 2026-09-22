@@ -145,6 +145,62 @@ the schema-version bump. New values: `price_policy_hash` =
 `child_cap_policy_hash` =
 `47d62e620e762af37b404d22919c89d7739baf8efce4ca6cfc451ca8b159fc14`.
 
+### item 9: a fresh session id after a failed fresh turn
+
+Root cause of the "every retry died on a broken pipe" symptom above: a
+FAILED fresh (`--session-id`, not `--resume`) claude turn still leaves the
+CLI's session transcript file on disk - the file is created the moment the
+process spawns, whether or not the turn completes. `make_drive()`'s
+`drive()` closure only reset the session id on a failed `--resume` turn
+(after the existing K=2 session-attributable ledger); a failed FRESH turn
+left `state.turns == 0` and the same `claude_session_id`, so the next
+`build_turn()` call reused `--session-id` with that same, now-already-
+created id - which the CLI refuses ("session already exists"), a spawn/
+pipe failure with no useful diagnostic, masking the real error.
+
+Fix (`wrapper/run.py`, `make_drive()`): reuse the existing
+`session.reset_claude_session()` (mints a new uuid4, clears
+`resume_available`) from the failure fallthrough when `cli == "claude"`,
+the turn was NOT a `--resume` attempt, and the failure isn't
+`CLASS_CONFIG_BLOCKED` (no spawn happened, no session file exists, nothing
+to reset). Unlike the resume path's K=2 ceiling, a fresh-turn failure
+mints a new id after just ONE failure - a fresh-turn failure is already
+attributable to this specific spawn, not global session pressure.
+
+Scoped to `make_drive()` only, not `make_cadence_drive()`: `ovh-qwen` does
+not support `wrap --lead-loop` (see "One-Time Morning Setup" / the
+backend-profile guardrail above), so the cadence path is architecturally
+unreachable for this backend and was deliberately left untouched.
+
+### item 10: close the ledger child turn on dead-letter dispose
+
+A durable message's child turn (`SpendLedger.open_child_turn`, keyed on
+`(agent, message_id)`) is designed to stay `'open'` and accumulate call/
+cost exposure across every retry of that SAME message - that's the whole
+point of the per-message envelope. But once a message is dead-lettered
+(the loop's cursor has advanced past it; it will not be retried through
+the normal path again), the row was left `'open'` for up to
+`CHILD_TURN_MAX_SECONDS` (86400s/24h) with nothing left to do.
+
+Fix: `SpendLedger.close_child_turn()` (`ovh_gateway.py`, next to
+`open_child_turn`) eagerly transitions an OPEN row to `'expired'` with a
+caller-supplied reason - state-machine-safe (a no-op unless the row is
+currently `'open'`; never invents a state outside the schema's
+`CHECK ('open','capped','expired')`). `wrapper/run.py`'s new
+`close_ovh_child_turn_on_dead_letter()` calls it for the `ovh-qwen`
+backend profile only, wired into `cli.py`'s existing
+`on_runtime_dead_letter` hook alongside `runtime_writer.dead_letter()`.
+Best-effort: a `GatewayError` (held/misconfigured/uninitialized gateway)
+is swallowed, since the dispose has already succeeded and the cursor has
+already advanced by the time this runs.
+
+Deliberately scoped to dead-letter ONLY, never an ordinary attempt
+failure the wrapper intends to retry: closing on every failure would turn
+the very next legitimate retry of the SAME message into a permanent
+`ChildTurnCapExceeded`/`config_blocked` dead end, since `child_turns` has
+no way to reopen a fresh row for an existing `(agent, message_id)` key
+once closed.
+
 ## Fixed Trial Policy
 
 - Provider route: Claude Code -> `127.0.0.1:4000` -> LiteLLM on

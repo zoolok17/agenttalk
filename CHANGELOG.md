@@ -52,6 +52,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   headroom, for both a zero opening balance and the docs' own EUR 0.58
   fixture). `price_policy_hash` and `child_cap_policy_hash` both change
   again as a result.
+- **OVH/Qwen gateway: a dead-lettered message's child turn stayed 'open'
+  for up to 24h with nothing left to do.** `child_turns` is keyed on
+  `(agent, message_id)` and deliberately accumulates call/cost exposure
+  across every retry of the SAME message - but once a message is
+  dead-lettered it will not be retried through the normal path again, so
+  the row just burned its wall-time ceiling for no reason. New
+  `SpendLedger.close_child_turn()` eagerly expires an OPEN row (no-op
+  otherwise); `wrapper/run.py`'s `close_ovh_child_turn_on_dead_letter()`
+  calls it from `cli.py`'s dead-letter dispose hook, best-effort
+  (a ledger hiccup here never blocks disposal). Deliberately scoped to
+  dead-letter only, never an ordinary retryable attempt failure - closing
+  on every failure would turn the next legitimate retry into a permanent
+  cap-exceeded dead end.
 
 ### Fixed
 
@@ -67,6 +80,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   installed venv's source, since only the former is actually read
   per-call), so reasoning folds into content text and no thinking block
   is ever emitted.
+- **Wrapper: a failed fresh claude turn reused a session id the CLI had
+  already created a transcript file for, so every retry died on a
+  broken pipe.** `make_drive()` only reset the session id after a failed
+  `--resume` turn; a failed FRESH (`--session-id`) turn left the same id
+  in place, and the CLI refuses `--session-id` for a file that already
+  exists. Now a failed fresh turn mints a new session id immediately
+  (after one failure, not the resume path's K=2), mirroring the existing
+  resume self-heal. Scoped to `make_drive()`; `make_cadence_drive()` is
+  unreachable for `ovh-qwen` (no `wrap --lead-loop` support).
 
 ## [0.89.0] - 2026-09-17
 
