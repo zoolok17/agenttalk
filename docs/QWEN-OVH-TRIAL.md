@@ -27,6 +27,16 @@ endpoint and its `Qwen3.8-27B` deployment:
   Fail-closed semantics are unchanged: the first ceiling a turn reaches
   still ends it, and later calls in that turn are still refused before
   transport.
+- Operator-set spend cap raised: trial cutoff EUR 25 -> EUR 95, soft stop
+  EUR 20 -> EUR 90 (external account ceiling stays EUR 100 - see "Fixed
+  Trial Policy" below for why the cutoff is EUR 95, not a bare EUR 100:
+  `SpendLedger.initialize`'s own envelope check
+  (`opening_micro_eur + TRIAL_CUTOFF_MICRO_EUR +
+  reservation_cost_micro_eur() <= EXTERNAL_CEILING_MICRO_EUR`) needs real
+  headroom below the ceiling for any nonzero opening balance to init at
+  all - EUR 95 leaves ~EUR 4.86, comfortably covering a small top-up;
+  the operator's initial run itself observes EUR 0 usage for the period,
+  so it clears this with room to spare either way).
 
 Both `price_policy_hash` and `child_cap_policy_hash` change as a direct
 result (they hash the values above). **This invalidates every previously
@@ -90,12 +100,18 @@ the mismatch above since there is nothing to mismatch against yet.
 - Maximum one wrapped child turn: 64 provider calls, EUR 3.00 of settled or
   reserved exposure, and 1800 seconds from its first durable opening. The first
   reached ceiling closes that turn; later calls are refused before transport.
-- Trial cutoff: EUR 25; operator soft stop: EUR 20.
+- Trial cutoff: EUR 95; operator soft stop: EUR 90.
 - External account ceiling: EUR 100. Initialization and readiness require the
-  operator-observed opening balance plus the EUR 25 trial cutoff plus one
-  maximum reservation to remain within this ceiling. Every admission also
-  checks cumulative committed spend across all UTC periods plus unresolved
-  reservations against the same EUR 100 ceiling.
+  operator-observed opening balance plus the EUR 95 trial cutoff plus one
+  maximum reservation to remain within this ceiling - not a bare EUR 100
+  cutoff, because that check (`SpendLedger.initialize`'s
+  `_assert_external_envelope`) needs headroom for one worst-case
+  reservation (currently EUR 0.139102) on top of any nonzero opening
+  balance; EUR 95 leaves ~EUR 4.86 of margin, which the trial's own
+  per-period cutoff check (below) still bounds monthly spend against once
+  a ledger is running. Every admission also checks cumulative committed
+  spend across all UTC periods plus unresolved reservations against the
+  same EUR 100 ceiling - the true, absolute lifetime hard stop.
 - Provider attempts: one. LiteLLM, router, and front retries are disabled.
 
 The policy hash is persisted in the install marker, ledger, config manifest,

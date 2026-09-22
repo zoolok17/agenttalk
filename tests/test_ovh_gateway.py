@@ -94,8 +94,8 @@ def test_exact_price_policy_and_charge_fixture() -> None:
     assert RESERVE_OUTPUT_RATE_MICRO_EUR == 3_240_000
     assert MAX_CONTEXT_TOKENS == 262_144
     assert MAX_OUTPUT_TOKENS == 4_096
-    assert TRIAL_CUTOFF_MICRO_EUR == 25_000_000
-    assert SOFT_STOP_MICRO_EUR == 20_000_000
+    assert TRIAL_CUTOFF_MICRO_EUR == 95_000_000
+    assert SOFT_STOP_MICRO_EUR == 90_000_000
     assert EXTERNAL_CEILING_MICRO_EUR == 100_000_000
     assert CANARY_TOLERANCE_BPS == 1_000
     assert settlement_cost_micro_eur(1_000, 100) == 670

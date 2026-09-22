@@ -19,7 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   EUR 0.40/M input, EUR 2.70/M output (was 0.60 / 3.60); reservation
   stays tariff+20%. Development child-turn caps raised: 8 -> 64 provider
   calls, 300 -> 1800 seconds, EUR 0.50 -> EUR 3.00 per turn; fail-closed
-  semantics unchanged. `price_policy_hash`, `child_cap_policy_hash`, and
+  semantics unchanged. Operator spend cap raised: trial cutoff EUR 25 ->
+  EUR 95, soft stop EUR 20 -> EUR 90 (external ceiling stays EUR 100;
+  cutoff is EUR 95 rather than a bare EUR 100 because
+  `SpendLedger.initialize`'s envelope check needs headroom below the
+  ceiling for one worst-case reservation plus any nonzero opening
+  balance - confirmed against the actual test suite, not just the zero-
+  balance case: a naive EUR 99.80 cutoff left only ~EUR 0.06 of headroom
+  and broke every test/fixture using a realistic small opening balance).
+  `price_policy_hash`, `child_cap_policy_hash`, and
   `CHILD_CAP_SCHEMA_VERSION` (1 -> 2) all change as a result, which
   invalidates every previously accepted dashboard canary and blocks
   `gateway reconfigure` against a pre-existing install (it is scoped to
