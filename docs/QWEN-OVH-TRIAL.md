@@ -91,6 +91,60 @@ A brand-new install (no prior `.agenttalk/gateway` state) just follows
 "One-Time Morning Setup" below unchanged - `init` was never going to hit
 the mismatch above since there is nothing to mismatch against yet.
 
+## 2026-09-22 caps removed by operator decision; the 95/100 EUR ledger envelope is the only limit
+
+Operator decision, 16:45Z: the wrapped qwen coding turn died twice on
+trial-policy caps, not on the model itself - once on the 1800s wall clock
+(46 calls in, still in setup) and once on the 4096-token per-call output
+cap (a code-writing response overran it once reasoning was folded into
+text). Both times the wrapper re-spawned the *same* session id, whose
+transcript file already ended in the API error; the CLI refuses
+`--session-id` for a file that already exists, so every retry died on a
+broken pipe and the message dead-lettered after three attempts (see items
+9-10 below for the actual wrapper fix). The operator's call: remove the
+trial-policy caps below the ledger envelope entirely - "let it show what
+it can do; the only cap is the 100 euro limit."
+
+- `MAX_OUTPUT_TOKENS`: 4096 -> 32768. Not confirmed as the model's actual
+  output ceiling from any local LiteLLM/OVH data - no `Qwen3.8-27B` entry
+  exists in this venv's model database for any provider; the closest OVH
+  entry is a different model generation. Using the lead's own fallback
+  value, stated here rather than silently assumed. `CLAUDE_CODE_MAX_OUTPUT_TOKENS`
+  (`OVH_QWEN_CLAUDE_MAX_OUTPUT` in `wrapper/run.py`) is kept pinned equal
+  to it, 32768 - it was drifted from the gateway's own cap before this
+  change (the code forced 4096, not the previously-documented 2048; both
+  now read the same constant).
+- `CHILD_TURN_MAX_CALLS`: 64 -> 100000. `CHILD_TURN_MAX_SECONDS`: 1800 ->
+  86400 (24h). `CHILD_TURN_MAX_MICRO_EUR`: EUR 3.00 -> EUR 95.00, equal to
+  the trial cutoff - so the ledger's own trial-cutoff/external-ceiling
+  checks are the only spend limits a turn can actually hit; the per-turn
+  call/cost/wall-time caps above are now wide enough that they exist only
+  as a fail-closed backstop, never the live-run reason. `CHILD_CAP_SCHEMA_VERSION`
+  bumps 2 -> 3 (the schema embeds these values directly), so an existing
+  ledger's stored schema version now mismatches and blocks until it is
+  re-initialized under the new caps, the same fail-closed pattern as the
+  1 -> 2 bump.
+- The larger `MAX_OUTPUT_TOKENS` makes `reservation_cost_micro_eur()`
+  grow (reserve rates apply across the full `MAX_CONTEXT_TOKENS`/
+  `MAX_OUTPUT_TOKENS` worst case): EUR 0.139102 -> EUR 0.231999.
+  `TRIAL_CUTOFF_MICRO_EUR` did **not** need to move for this - the
+  envelope check (`opening + 95_000_000 + reservation_cost_micro_eur() <=
+  100_000_000`) still holds at the new, larger reservation cost, for both
+  a zero opening balance and the docs' own EUR 0.58 fixture, with
+  comfortable headroom either way (confirmed directly, not assumed - see
+  "Fixed Trial Policy" below for the exact margin).
+
+Both hashes change: `price_policy_hash` because `MAX_OUTPUT_TOKENS` and
+the derived `worst_case_micro_eur` are part of `price_policy()`'s own
+`reservation` sub-object (confirmed directly, not assumed, after nearly
+repeating the same "unaffected" mistake corrected in an earlier commit on
+this branch - checked the actual dict this time); `child_cap_policy_hash`
+via `max_calls`/`max_micro_eur`/`max_seconds`/`reservation_micro_eur` and
+the schema-version bump. New values: `price_policy_hash` =
+`6df40ecdf2c22a9d06a73c2b2d7090b40d722d590e04237b19c903cb034dd5c2`;
+`child_cap_policy_hash` =
+`47d62e620e762af37b404d22919c89d7739baf8efce4ca6cfc451ca8b159fc14`.
+
 ## Fixed Trial Policy
 
 - Provider route: Claude Code -> `127.0.0.1:4000` -> LiteLLM on
@@ -100,12 +154,16 @@ the mismatch above since there is nothing to mismatch against yet.
   output tokens.
 - Reservation rates: the tariff plus 20%, EUR 0.48/M input tokens and EUR
   3.24/M output tokens.
-- Gateway maximum output: 4096 tokens; the wrapped Claude child is additionally
-  forced to `CLAUDE_CODE_MAX_OUTPUT_TOKENS=2048`. Maximum input context: 262144
-  tokens. Maximum public request body: 512 KiB.
-- Maximum one-attempt reservation: EUR 0.139102.
-- Maximum one wrapped child turn: 64 provider calls, EUR 3.00 of settled or
-  reserved exposure, and 1800 seconds from its first durable opening. The first
+- Gateway maximum output: 32768 tokens (not confirmed as the model's
+  documented ceiling from local data - see the 2026-09-22 caps section
+  above); the wrapped Claude child's `CLAUDE_CODE_MAX_OUTPUT_TOKENS` is
+  pinned equal to it, 32768. Maximum input context: 262144 tokens.
+  Maximum public request body: 512 KiB.
+- Maximum one-attempt reservation: EUR 0.231999.
+- Maximum one wrapped child turn: 100000 provider calls, EUR 95.00 of
+  settled or reserved exposure (equal to the trial cutoff below - the
+  ledger's own cutoff/ceiling are the only limits a turn can actually
+  hit), and 86400 seconds (24h) from its first durable opening. The first
   reached ceiling closes that turn; later calls are refused before transport.
 - Trial cutoff: EUR 95; operator soft stop: EUR 90.
 - External account ceiling: EUR 100. Initialization and readiness require the
@@ -113,8 +171,8 @@ the mismatch above since there is nothing to mismatch against yet.
   maximum reservation to remain within this ceiling - not a bare EUR 100
   cutoff, because that check (`SpendLedger.initialize`'s
   `_assert_external_envelope`) needs headroom for one worst-case
-  reservation (currently EUR 0.139102) on top of any nonzero opening
-  balance; EUR 95 leaves ~EUR 4.86 of margin, which the trial's own
+  reservation (currently EUR 0.231999) on top of any nonzero opening
+  balance; EUR 95 leaves ~EUR 4.77 of margin, which the trial's own
   per-period cutoff check (below) still bounds monthly spend against once
   a ledger is running. Every admission also checks cumulative committed
   spend across all UTC periods plus unresolved reservations against the

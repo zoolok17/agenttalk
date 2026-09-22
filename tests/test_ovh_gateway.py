@@ -93,20 +93,20 @@ def test_exact_price_policy_and_charge_fixture() -> None:
     assert RESERVE_INPUT_RATE_MICRO_EUR == 480_000
     assert RESERVE_OUTPUT_RATE_MICRO_EUR == 3_240_000
     assert MAX_CONTEXT_TOKENS == 262_144
-    assert MAX_OUTPUT_TOKENS == 4_096
+    assert MAX_OUTPUT_TOKENS == 32_768
     assert TRIAL_CUTOFF_MICRO_EUR == 95_000_000
     assert SOFT_STOP_MICRO_EUR == 90_000_000
     assert EXTERNAL_CEILING_MICRO_EUR == 100_000_000
     assert CANARY_TOLERANCE_BPS == 1_000
     assert settlement_cost_micro_eur(1_000, 100) == 670
-    assert reservation_cost_micro_eur() == 139_102
+    assert reservation_cost_micro_eur() == 231_999
     assert len(price_policy_hash()) == 64
     assert gateway.child_cap_policy() == {
-        "schema_version": 2,
-        "max_calls": 64,
-        "max_micro_eur": 3_000_000,
-        "max_seconds": 1_800,
-        "reservation_micro_eur": 139_102,
+        "schema_version": 3,
+        "max_calls": 100_000,
+        "max_micro_eur": 95_000_000,
+        "max_seconds": 86_400,
+        "reservation_micro_eur": 231_999,
     }
     assert len(gateway.child_cap_policy_hash()) == 64
 
@@ -281,7 +281,7 @@ def test_opening_balance_external_envelope_blocks_init_and_readiness(tmp_path) -
 def test_reserve_then_settle_commits_exact_actual(tmp_path) -> None:
     ledger = make_ledger(tmp_path)
     reservation = ledger.reserve("1" * 32)
-    assert reservation.reserved_micro_eur == 139_102
+    assert reservation.reserved_micro_eur == 231_999
     assert ledger.status()["ready"] is False
 
     result = ledger.settle(
@@ -297,7 +297,14 @@ def test_reserve_then_settle_commits_exact_actual(tmp_path) -> None:
     assert status["unresolved"] == []
 
 
-def test_child_turn_call_cap_is_durable_and_fail_closed(tmp_path) -> None:
+def test_child_turn_call_cap_is_durable_and_fail_closed(tmp_path, monkeypatch) -> None:
+    # CHILD_TURN_MAX_CALLS is 100_000 under the envelope-only caps (item 8) -
+    # looping that many real reserve/settle cycles would make this test
+    # impractically slow without exercising any different code path. Patch
+    # the cap down for just this test, BEFORE make_ledger()/initialize() so
+    # the stored child_cap_policy_hash is computed and verified consistently
+    # against the same (patched) value throughout.
+    monkeypatch.setattr(gateway, "CHILD_TURN_MAX_CALLS", 3)
     ledger = make_ledger(tmp_path)
     credential = ledger.open_child_turn(
         agent="qwen-dev-1",
@@ -305,7 +312,7 @@ def test_child_turn_call_cap_is_durable_and_fail_closed(tmp_path) -> None:
         request_id="q-child-cap",
         issuer_token=TEST_CHILD_CAP_ISSUER,
     )
-    assert credential.expires_at == "2026-07-15T12:30:00.000000Z"
+    assert credential.expires_at == "2026-07-16T12:00:00.000000Z"  # +86400s (24h)
 
     for ordinal in range(gateway.CHILD_TURN_MAX_CALLS):
         attempt_id = f"{ordinal + 1:032x}"
@@ -339,8 +346,8 @@ def test_child_turn_mint_is_refused_while_held_and_gets_a_full_window_after_clea
     tmp_path,
 ) -> None:
     # #63: a child turn opened UNDER a hold burns its wall-time ceiling (300s when this
-    # regression was pinned, 1800s under the current dev caps) while the gateway cannot
-    # spend, so it is (near-)expired the instant the hold clears (the live incident: a
+    # regression was pinned, 86400s/24h under the current envelope-only caps) while the
+    # gateway cannot spend, so it is (near-)expired the instant the hold clears (the live incident: a
     # held-gateway turn that expired mid-work and surfaced as a misleading config_blocked
     # "budget exhausted"). Mint must refuse while held (no doomed turn), and mint fresh
     # with a FULL window measured from now once the hold clears.
@@ -365,8 +372,8 @@ def test_child_turn_mint_is_refused_while_held_and_gets_a_full_window_after_clea
         request_id="q-held",
         issuer_token=TEST_CHILD_CAP_ISSUER,
     )
-    # Full 1800s window from 12:05 (the clear), NOT a stale window that started at 12:00.
-    assert credential.expires_at == "2026-07-15T12:35:00.000000Z"
+    # Full 86400s (24h) window from 12:05 (the clear), NOT a stale window that started at 12:00.
+    assert credential.expires_at == "2026-07-16T12:05:00.000000Z"
 
 
 def test_child_turn_mint_is_refused_while_a_prior_attempt_is_unresolved(tmp_path) -> None:
@@ -406,7 +413,22 @@ def test_child_turn_mint_requires_non_inherited_controller_issuer(tmp_path) -> N
         assert conn.execute("SELECT COUNT(*) FROM child_turns").fetchone()[0] == 0
 
 
-def test_child_turn_cost_cap_and_scope_isolation(tmp_path) -> None:
+def test_child_turn_cost_cap_and_scope_isolation(tmp_path, monkeypatch) -> None:
+    # Under the envelope-only caps (item 8) CHILD_TURN_MAX_MICRO_EUR
+    # (95_000_000) equals TRIAL_CUTOFF_MICRO_EUR - by design, so that the
+    # ledger's own cutoff/ceiling are the only limits a turn can actually
+    # hit live. That means pushing one child turn's real settled spend up
+    # to ITS OWN cost ceiling also exhausts the whole trial's cutoff at
+    # very nearly the same point (they're both bounded by the same
+    # cumulative committed total), so "trial spend cutoff would be
+    # exceeded" fires instead of the per-turn "cost ceiling" this test
+    # means to isolate - and doing it for real would also mean ~490 real
+    # settle cycles. Patch the per-turn cap down, decoupled from the trial
+    # cutoff, before initialize() so the committed child_cap_policy_hash
+    # matches throughout, and the underlying cost-ceiling code path (still
+    # real, still live for any deployment where the two caps differ) stays
+    # covered without needing the two numbers to collide.
+    monkeypatch.setattr(gateway, "CHILD_TURN_MAX_MICRO_EUR", 500_000)
     ledger = make_ledger(tmp_path)
     first = ledger.open_child_turn(
         agent="qwen-dev-1",
@@ -700,6 +722,11 @@ def test_child_capability_is_hash_only_and_global_rejection_consumes_no_slot(
 def test_child_turn_last_slot_race_never_exceeds_ceiling(
     tmp_path, monkeypatch
 ) -> None:
+    # Same rationale as test_child_turn_call_cap_is_durable_and_fail_closed:
+    # CHILD_TURN_MAX_CALLS is 100_000 under the envelope-only caps (item 8);
+    # patch it down before initialize() so the stored/verified
+    # child_cap_policy_hash stays consistent and the fill-loop stays fast.
+    monkeypatch.setattr(gateway, "CHILD_TURN_MAX_CALLS", 3)
     ledger = make_ledger(tmp_path)
     credential = ledger.open_child_turn(
         agent="qwen-dev-1",

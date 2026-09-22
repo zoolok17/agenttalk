@@ -90,7 +90,7 @@ def test_ovh_qwen_child_environment_starts_from_allowlist(tmp_path, monkeypatch)
     assert "ANTHROPIC_AUTH_TOKEN" not in env
     assert "front-token" not in env.values()
     assert env["ANTHROPIC_MODEL"] == "Qwen3.8-27B"
-    assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "4096"
+    assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "32768"
     assert env["MAX_THINKING_TOKENS"] == "0"
     assert env["CLAUDE_CONFIG_DIR"] == str(
         (tmp_path / ".agenttalk" / "gateway" / "claude-profile").resolve()

@@ -35,17 +35,23 @@ OUTPUT_RATE_MICRO_EUR = 2_700_000
 RESERVE_INPUT_RATE_MICRO_EUR = 480_000
 RESERVE_OUTPUT_RATE_MICRO_EUR = 3_240_000
 MAX_CONTEXT_TOKENS = 262_144
-MAX_OUTPUT_TOKENS = 4_096
+# Not confirmed from local LiteLLM/OVH data: no "Qwen3.8-27B" entry exists in
+# this venv's model_prices_and_context_window_backup.json for any provider,
+# let alone ovhcloud specifically - the closest OVH entry (ovhcloud/Qwen3-32B,
+# a different model generation) shows max_output_tokens=32000 tied 1:1 to its
+# own max_input_tokens, not a documented output sub-ceiling. Using the
+# lead's own fallback value per their explicit instruction.
+MAX_OUTPUT_TOKENS = 32_768
 TRIAL_CUTOFF_MICRO_EUR = 95_000_000
 SOFT_STOP_MICRO_EUR = 90_000_000
 EXTERNAL_CEILING_MICRO_EUR = 100_000_000
 CANARY_TOLERANCE_BPS = 1_000
 LEDGER_SCHEMA_VERSION = 2
 INSTALL_MARKER_SCHEMA_VERSION = 1
-CHILD_CAP_SCHEMA_VERSION = 2
-CHILD_TURN_MAX_CALLS = 64
-CHILD_TURN_MAX_MICRO_EUR = 3_000_000
-CHILD_TURN_MAX_SECONDS = 1_800
+CHILD_CAP_SCHEMA_VERSION = 3
+CHILD_TURN_MAX_CALLS = 100_000
+CHILD_TURN_MAX_MICRO_EUR = 95_000_000
+CHILD_TURN_MAX_SECONDS = 86_400
 BACKEND_PROFILE = "ovh-qwen"
 EXTERNAL_WORKER = "external-worker"
 PUBLIC_HOST = "127.0.0.1"

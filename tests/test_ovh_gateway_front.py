@@ -13,6 +13,7 @@ import pytest
 
 from agenttalk import ovh_gateway as gateway
 from agenttalk.ovh_gateway import (
+    MAX_OUTPUT_TOKENS,
     MAX_REQUEST_BYTES,
     MODEL_ALIAS,
     SpendLedger,
@@ -676,7 +677,15 @@ def test_front_forwards_capped_claude_beta_query_and_rich_body_intact(
         }
 
 
-def test_beta_rich_body_and_child_cap_exhaustion_survive_front_restart(tmp_path) -> None:
+def test_beta_rich_body_and_child_cap_exhaustion_survive_front_restart(
+    tmp_path, monkeypatch
+) -> None:
+    # CHILD_TURN_MAX_CALLS is 100_000 under the envelope-only caps (item 8) -
+    # looping that many real front HTTP round trips would make this test
+    # impractically slow. Patch it down before either RunningFront/ledger is
+    # created, so the child_cap_policy_hash committed to disk here and the
+    # one verified on restart stay consistent throughout.
+    monkeypatch.setattr(gateway, "CHILD_TURN_MAX_CALLS", 3)
     completion_budget = CompletionBudget(latch=_FRONT_TIMEOUT_LATCH)
     with FakeUpstream() as upstream:
         with RunningFront(
@@ -786,8 +795,15 @@ def test_forged_well_formed_child_capability_never_reaches_provider(tmp_path) ->
         assert front.ledger.status()["unresolved"] == []
 
 
-def test_front_refuses_call_past_the_max_calls_cap_without_provider_transport(tmp_path) -> None:
-    assert gateway.CHILD_TURN_MAX_CALLS == 64
+def test_front_refuses_call_past_the_max_calls_cap_without_provider_transport(
+    tmp_path, monkeypatch
+) -> None:
+    assert gateway.CHILD_TURN_MAX_CALLS == 100_000
+    # 100_000 real front HTTP round trips is impractical for a unit test and
+    # exercises no different code path than a small cap; patch it down
+    # before the ledger initializes so the committed child_cap_policy_hash
+    # stays consistent for the whole test.
+    monkeypatch.setattr(gateway, "CHILD_TURN_MAX_CALLS", 3)
     with FakeUpstream() as upstream, RunningFront(tmp_path, upstream) as front:
         for _ in range(gateway.CHILD_TURN_MAX_CALLS):
             status, _ = front.request(path="/v1/messages?beta=true")
@@ -829,7 +845,9 @@ def test_request_policy_rejects_wrong_model_and_output_limit_before_reserve(tmp_
     with FakeUpstream() as upstream, RunningFront(tmp_path, upstream) as front:
         status, _ = front.request(body={"model": "other", "max_tokens": 10})
         assert status == 422
-        status, _ = front.request(body={"model": MODEL_ALIAS, "max_tokens": 4_097})
+        status, _ = front.request(
+            body={"model": MODEL_ALIAS, "max_tokens": MAX_OUTPUT_TOKENS + 1}
+        )
         assert status == 422
         status, _ = front.request(body={
             "model": MODEL_ALIAS,

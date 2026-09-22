@@ -33,6 +33,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `gateway reconfigure` against a pre-existing install (it is scoped to
   endpoint-only changes) - see `docs/QWEN-OVH-TRIAL.md`'s "2026-09-22
   endpoint change" section for the required re-init sequence and why.
+- **OVH/Qwen gateway: trial-policy caps removed by operator decision -
+  the 95/100 EUR ledger envelope is the only limit.** Field evidence: the
+  wrapped qwen coding turn died twice on trial-policy caps, not the
+  model (once on the 1800s wall clock mid-setup, once on the 4096-token
+  per-call output cap once reasoning was folded into text), and the
+  wrapper's session-id reuse after those failures turned each into a
+  dead-lettered message (see below). `MAX_OUTPUT_TOKENS` 4096 -> 32768
+  (not confirmed as the model's documented ceiling from local data -
+  stated, not assumed); `CLAUDE_CODE_MAX_OUTPUT_TOKENS` pinned equal to
+  it. `CHILD_TURN_MAX_CALLS` 64 -> 100000, `CHILD_TURN_MAX_SECONDS` 1800
+  -> 86400, `CHILD_TURN_MAX_MICRO_EUR` EUR 3.00 -> EUR 95.00 (equal to
+  the trial cutoff, so the ledger's own cutoff/ceiling are the only
+  spend limits a turn can actually hit). `CHILD_CAP_SCHEMA_VERSION`
+  2 -> 3. `reservation_cost_micro_eur()` grows with the larger output
+  cap: EUR 0.139102 -> EUR 0.231999; `TRIAL_CUTOFF_MICRO_EUR` did not
+  need to move for this (confirmed the envelope still holds, with
+  headroom, for both a zero opening balance and the docs' own EUR 0.58
+  fixture). `price_policy_hash` and `child_cap_policy_hash` both change
+  again as a result.
 
 ### Fixed
 
