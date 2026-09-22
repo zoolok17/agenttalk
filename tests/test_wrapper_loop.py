@@ -4104,6 +4104,43 @@ def test_make_drive_claude_missing_conversation_rotates_to_fresh_session(tmp_pat
     assert "--resume" not in calls[2]
 
 
+def test_make_drive_claude_failed_fresh_turn_mints_a_new_id_before_next_spawn(
+    tmp_path,
+) -> None:
+    # Field defect (2026-09-22): the FIRST turn (a fresh --session-id, not a
+    # --resume) died mid-stream with a real API error; the CLI already creates
+    # that session's transcript file the moment it spawns, so a retry that
+    # reuses the SAME id via --session-id is refused ("session already
+    # exists") - every subsequent attempt then died the same way, dead-
+    # lettering the message after three broken-pipe retries. A failed fresh
+    # turn must mint a NEW id immediately (unlike the resume path's K=2
+    # ceiling above, which only applies to --resume failures), so the very
+    # next spawn gets a clean session.
+    calls = []
+
+    def spawn(argv, stdin):
+        calls.append(list(argv))
+        if len(calls) == 1:
+            return _claude_fail_lines("boom mid-stream")
+        return _claude_ok_lines()
+
+    state = session.SessionState(cli="claude", claude_session_id="sess-1", turns=0)
+    drive = run.make_drive(_store(tmp_path), "beta", "claude", state, ["claude"],
+                           spawn=spawn, clock=lambda: 0.0, render=False)
+
+    first = drive(_claude_rec())
+    assert first.ok is False
+    assert "--session-id" in calls[0] and "sess-1" in calls[0]
+    assert state.claude_session_id != "sess-1"          # fresh id minted after ONE failure
+    assert state.resume_available is False
+    fresh_id = state.claude_session_id
+
+    second = drive(_claude_rec())
+    assert second.ok is True
+    assert "--session-id" in calls[1] and "--resume" not in calls[1]
+    assert fresh_id in calls[1]                          # the SAME fresh id, not another new one
+
+
 def test_make_drive_claude_prompt_too_long_on_resume_is_not_message_poison(tmp_path) -> None:
     # Resume-scoped session pressure never classifies the message as poison on the
     # first failed resume; it must go through the B4 resume ledger.

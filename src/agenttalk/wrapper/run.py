@@ -2928,6 +2928,20 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             health_writer.unknown()
             raise
         health_writer.failure(sig, failure_class)
+        # A FAILED fresh (--session-id, not --resume) claude turn: the CLI already
+        # created that session's transcript file the moment it spawned, whether or
+        # not the turn completed - re-spawning with the SAME id next time gets
+        # refused ("session already exists"), which is a spawn/pipe failure with no
+        # useful diagnostic, not the original failure. Mint a fresh id now so the
+        # next spawn (a retry of the same durable record, or the next turn) gets a
+        # clean session, mirroring the existing resume->fresh self-heal above.
+        # CLASS_CONFIG_BLOCKED means the child never spawned (a preflight refusal,
+        # same special-casing the resume branch above already gives it) - no
+        # session file exists, so there is nothing to reset.
+        if cli == "claude" and not attempted_resume and failure_class != CLASS_CONFIG_BLOCKED:
+            _session.reset_claude_session(session_state, "fresh_session_turn_failed")
+            if persist is not None:
+                persist(session_state)
         # WATCHDOG-RECOVERY ONLY (narrow path): the hung tool tree was killed and the
         # wrapper is alive + ready for the next turn, so re-stamp a fresh heartbeat (undoing
         # the clear above) - otherwise the supervisor would ALSO relaunch a healthy wrapper.
