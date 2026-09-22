@@ -413,6 +413,114 @@ def test_child_turn_mint_requires_non_inherited_controller_issuer(tmp_path) -> N
         assert conn.execute("SELECT COUNT(*) FROM child_turns").fetchone()[0] == 0
 
 
+def test_close_child_turn_expires_an_open_turn_and_blocks_reopen(tmp_path) -> None:
+    # Item 10: the wrapper closes a durable message's child turn as soon as it
+    # dead-letters (will never retry that SAME (agent, message_id) scope again),
+    # instead of leaving it 'open' to burn out its own CHILD_TURN_MAX_SECONDS
+    # (86400s/24h) wall clock for nothing.
+    ledger = make_ledger(tmp_path)
+    ledger.open_child_turn(
+        agent="qwen-dev-1",
+        message_id="20260719-120000-000000-dl",
+        request_id="q-dl",
+        issuer_token=TEST_CHILD_CAP_ISSUER,
+    )
+    ledger.close_child_turn(
+        agent="qwen-dev-1",
+        message_id="20260719-120000-000000-dl",
+        reason="dead_letter",
+        issuer_token=TEST_CHILD_CAP_ISSUER,
+    )
+    row = ledger.status()["active_child_turns"][0]
+    assert row["state"] == "expired"
+    assert row["reason"] == "dead_letter"
+
+    with pytest.raises(gateway.ChildTurnCapExceeded, match="dead_letter"):
+        ledger.open_child_turn(
+            agent="qwen-dev-1",
+            message_id="20260719-120000-000000-dl",
+            request_id="q-dl",
+            issuer_token=TEST_CHILD_CAP_ISSUER,
+        )
+
+
+def test_close_child_turn_is_a_noop_for_never_opened_or_already_terminal(
+    tmp_path, monkeypatch,
+) -> None:
+    ledger = make_ledger(tmp_path)
+    # Never opened: closing it must not fabricate a row (a dead-letter dispose for
+    # a message whose open_child_turn itself failed, e.g. under a hold, must stay
+    # a harmless no-op, not raise or invent state).
+    ledger.close_child_turn(
+        agent="qwen-dev-1",
+        message_id="never-opened",
+        reason="dead_letter",
+        issuer_token=TEST_CHILD_CAP_ISSUER,
+    )
+    with sqlite3.connect(ledger.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM child_turns").fetchone()[0] == 0
+
+    # Already terminal (capped via the call ceiling, patched down to 1 so this
+    # doesn't need a real cost-cap run): closing again must not overwrite the
+    # ORIGINAL reason - the first terminal transition is the one worth keeping
+    # for diagnosis.
+    monkeypatch.setattr(gateway, "CHILD_TURN_MAX_CALLS", 1)
+    ledger2 = SpendLedger(
+        tmp_path / "ledger2.sqlite3",
+        tmp_path / "install2.json",
+        now=ledger.now,
+    )
+    ledger2.initialize(
+        opening_micro_eur=0,
+        opening_evidence=TEST_OPENING_EVIDENCE,
+        generation="b" * 32,
+        child_cap_issuer_token=TEST_CHILD_CAP_ISSUER,
+    )
+    credential = ledger2.open_child_turn(
+        agent="qwen-dev-1",
+        message_id="already-capped",
+        request_id="q-cap",
+        issuer_token=TEST_CHILD_CAP_ISSUER,
+    )
+    ledger2.reserve_for_child("1" * 32, capability=credential.token)
+    ledger2.settle(
+        "1" * 32, model=MODEL_ALIAS, input_tokens=1_000, output_tokens=100,
+    )
+    with pytest.raises(gateway.ChildTurnCapExceeded, match="call ceiling"):
+        ledger2.reserve_for_child("2" * 32, capability=credential.token)
+    row_before = ledger2.status()["active_child_turns"][0]
+    assert row_before["state"] == "capped" and "call ceiling" in row_before["reason"]
+
+    ledger2.close_child_turn(
+        agent="qwen-dev-1",
+        message_id="already-capped",
+        reason="dead_letter",
+        issuer_token=TEST_CHILD_CAP_ISSUER,
+    )
+    row_after = ledger2.status()["active_child_turns"][0]
+    assert row_after["state"] == "capped"
+    assert "call ceiling" in row_after["reason"]  # untouched, not overwritten
+
+
+def test_close_child_turn_requires_matching_issuer(tmp_path) -> None:
+    ledger = make_ledger(tmp_path)
+    ledger.open_child_turn(
+        agent="qwen-dev-1",
+        message_id="wrong-issuer",
+        request_id="q-issuer",
+        issuer_token=TEST_CHILD_CAP_ISSUER,
+    )
+    with pytest.raises(gateway.ChildTurnCapBlocked, match="issuer"):
+        ledger.close_child_turn(
+            agent="qwen-dev-1",
+            message_id="wrong-issuer",
+            reason="dead_letter",
+            issuer_token="atgw-" + "x" * 43,
+        )
+    row = ledger.status()["active_child_turns"][0]
+    assert row["state"] == "open"  # rejected mint attempt left the turn untouched
+
+
 def test_child_turn_cost_cap_and_scope_isolation(tmp_path, monkeypatch) -> None:
     # Under the envelope-only caps (item 8) CHILD_TURN_MAX_MICRO_EUR
     # (95_000_000) equals TRIAL_CUTOFF_MICRO_EUR - by design, so that the

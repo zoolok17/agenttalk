@@ -1259,6 +1259,65 @@ class SpendLedger:
                 raise
         return ChildTurnCredential(token, agent, message_id, expires_at)
 
+    def close_child_turn(
+        self,
+        *,
+        agent: str,
+        message_id: str,
+        reason: str,
+        issuer_token: str | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        """Close (expire) an OPEN child turn immediately, instead of leaving it to run
+        out its own CHILD_TURN_MAX_SECONDS wall clock. Call this only when the caller
+        is DONE driving a durable message and will not retry the SAME (agent,
+        message_id) scope again (e.g. a dead-letter dispose) - never on an ordinary
+        attempt failure the caller intends to retry, since retries of the SAME message
+        deliberately reuse and accumulate against the SAME open turn (its PRIMARY KEY
+        is (agent, message_id); there is no way to reopen a fresh one for an existing
+        key once closed). State-machine-safe: a no-op unless the row is currently
+        'open' - closing an already-capped/expired turn, or one that was never opened,
+        does nothing (mirrors the lazy terminal transitions in open_child_turn /
+        reserve_for_child; this just makes the SAME transition eager instead of lazy
+        rather than inventing a new state outside the schema's CHECK constraint)."""
+        agent = self._validate_child_scope(agent, name="agent", limit=128)
+        message_id = self._validate_child_scope(
+            message_id, name="message_id", limit=256
+        )
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("a close reason is required")
+        current = (now or self.now()).astimezone(timezone.utc)
+        issuer_hash = self._child_cap_issuer_hash(issuer_token)
+        timestamp = _iso_utc(current)
+        with self._connect() as conn:
+            self._begin(conn)
+            try:
+                marker = self._marker()
+                metadata = self._verify_metadata(conn, marker)
+                if self._child_cap_feature_state(conn, metadata) != "ready":
+                    raise ChildTurnCapBlocked("child turn cap feature is not installed")
+                if not hmac.compare_digest(
+                    metadata["child_cap_issuer_sha256"], issuer_hash
+                ):
+                    raise ChildTurnCapBlocked("child turn issuer credential is invalid")
+                self._validate_child_cap_clock(conn, current)
+                row = conn.execute(
+                    "SELECT state FROM child_turns WHERE agent=? AND message_id=?",
+                    (agent, message_id),
+                ).fetchone()
+                if row is not None and row["state"] == "open":
+                    conn.execute(
+                        """
+                        UPDATE child_turns SET state='expired', reason=?, updated_at=?
+                        WHERE agent=? AND message_id=?
+                        """,
+                        (reason, timestamp, agent, message_id),
+                    )
+                self._commit(conn)
+            except Exception:
+                self._rollback(conn)
+                raise
+
     def _advance_period_if_valid(
         self,
         conn: sqlite3.Connection,

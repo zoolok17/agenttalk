@@ -2314,6 +2314,47 @@ def _child_output_capture(sig: dict) -> tuple[Callable[..., None], Callable[[], 
     return _capture_child_output, _finalize_child_output
 
 
+def close_ovh_child_turn_on_dead_letter(
+    agent: str,
+    record: dict,
+    *,
+    backend_profile: str | None,
+    profile_env: dict | None,
+) -> None:
+    """Item 10: a dead-lettered message will NOT be retried through the normal
+    (non-operator) path - the cursor has already advanced past it - so its ledger
+    child turn (opened by ``open_child_turn`` above, keyed by this SAME agent +
+    message id) should not linger 'open' for up to CHILD_TURN_MAX_SECONDS (86400s,
+    24h) with nothing left to do. Deliberately called ONLY at dead-letter, never on
+    an ordinary attempt failure the caller intends to retry: retries of the SAME
+    durable message reuse and accumulate against the SAME open child turn by design
+    (``child_turns`` is keyed on (agent, message_id) with no way to reopen a fresh
+    row for an existing key), so closing on every failed attempt would turn the
+    very next legitimate retry into a permanent ChildTurnCapExceeded/config_blocked
+    dead end instead of the transient failure it actually is.
+
+    Best-effort: disposal has already succeeded and the cursor has already moved by
+    the time this runs, so a ledger hiccup here (a held/misconfigured/uninitialized
+    gateway) must never surface as an error - it just means the stale row waits out
+    its own wall-time ceiling as before this fix existed."""
+    if backend_profile != "ovh-qwen":
+        return
+    message_id = record.get("id")
+    if not isinstance(message_id, str) or not message_id:
+        return
+    from agenttalk.ovh_gateway import GatewayError, SpendLedger
+
+    try:
+        SpendLedger().close_child_turn(
+            agent=agent,
+            message_id=message_id,
+            reason="dead_letter",
+            issuer_token=str((profile_env or {}).get("ANTHROPIC_AUTH_TOKEN") or ""),
+        )
+    except GatewayError:
+        pass
+
+
 def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str], *,
                sender: str | None = None, min_interval: float = 5.0,
                render: bool = True, rules: str | None = None,
