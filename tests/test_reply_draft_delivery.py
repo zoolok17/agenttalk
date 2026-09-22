@@ -277,6 +277,93 @@ def test_wake_kind_gets_the_draft_channel(tmp_path) -> None:
     assert (msg.meta or {}).get("in_reply_to") == w.id
 
 
+def test_task_kind_gets_the_draft_channel(tmp_path) -> None:
+    # #wrapper-reply-channels increment A: the field bug this fixes - a
+    # task-kind draft written out of message-kind habit sat unpublished
+    # because loop.py never decorated `record["reply_draft"]` for kind=task.
+    # A seat that cannot run shell commands must be able to answer a task
+    # the same way it answers a question/message/wake.
+    s = _store(tmp_path)
+    s.set_role("alpha", "lead")
+    t = s.send(sender="alpha", recipient="beta", kind="task", body="do X",
+               meta={"request_id": "tk-1"})
+
+    def drive(rec):
+        assert isinstance(rec.get("reply_draft"), dict)
+        Path(rec["reply_draft"]["path"]).write_text("done", encoding="utf-8")
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1)
+    (msg,) = _reply_inbox(s, "alpha")
+    assert msg.body == "done"
+    assert msg.kind == "task-response"     # not the plain "message" every
+                                            # other draft-channel kind gets
+    assert (msg.meta or {}).get("request_id") == "tk-1"
+    assert (msg.meta or {}).get("in_reply_to") == t.id
+
+
+def test_task_kind_cli_reply_wins_draft_left_in_place_with_superseded_sidecar(
+    tmp_path,
+) -> None:
+    # A capable child that both ran `agenttalk reply --kind task-response`
+    # itself AND wrote the draft (habit from a message-kind turn): the
+    # wrapper's landed-check must not double-post a second task-response on
+    # the same thread. Unlike question/message/wake (draft silently
+    # unlinked, unchanged), a task draft is left in place with a sidecar so
+    # the race is observable, not silent.
+    s = _store(tmp_path)
+    s.set_role("alpha", "lead")
+    t = s.send(sender="alpha", recipient="beta", kind="task", body="do X",
+               meta={"request_id": "tk-2"})
+
+    def drive(rec):
+        s.send(sender="beta", recipient="alpha", kind="task-response",
+               body="cli answer",
+               meta={"in_reply_to": rec["id"], "request_id": "tk-2"})
+        Path(rec["reply_draft"]["path"]).write_text(
+            "draft answer", encoding="utf-8")
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1)
+    replies = _reply_inbox(s, "alpha")
+    assert [(m.kind, m.body) for m in replies] == [("task-response", "cli answer")]
+    draft_path = reply_transport.reply_draft_path(s, "beta", t.id)
+    assert draft_path.is_file()            # left alone, NOT deleted
+    assert draft_path.read_text(encoding="utf-8") == "draft answer"
+    sidecar = reply_transport.superseded_sidecar_path(draft_path)
+    assert sidecar.is_file()
+    assert "superseded" in sidecar.read_text(encoding="utf-8")
+
+
+def test_task_kind_refusal_sidecar_still_applies(tmp_path) -> None:
+    # The generic refusal-sidecar contract (#162) is shared code, untouched
+    # by the kind-specific publish/supersede logic - an oversize task draft
+    # must still be refused observably, exactly like every other kind.
+    s = _store(tmp_path)
+    s.set_role("alpha", "lead")
+    t = s.send(sender="alpha", recipient="beta", kind="task", body="do X",
+               meta={"request_id": "tk-3"})
+
+    def drive(rec):
+        Path(rec["reply_draft"]["path"]).write_text(
+            "x" * (reply_transport.MAX_DRAFT_BYTES + 1), encoding="utf-8")
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1)
+    # No task-response landed (the oversize draft was refused, not
+    # published) - deliberately not asserting the WHOLE inbox is empty:
+    # alpha is the lead here (required to send the task itself), so the
+    # refusal also fires a `_notify_reply_refusal` notice from beta to
+    # alpha (#162) - a second, EXPECTED beta->alpha message unrelated to
+    # this test's own subject. The sidecar is the definitive proof.
+    assert "task-response" not in [m.kind for m in _reply_inbox(s, "alpha")]
+    text = _reason_path_for(s, "beta", t.id).read_text(encoding="utf-8")
+    assert "over the" in text and "byte bound" in text
+
+
 def test_consult_questions_are_excluded_from_the_draft_channel(tmp_path) -> None:
     # Cold review major 1: a consult reply must echo consult=true + round meta
     # the draft channel cannot carry — offering it would give the child two

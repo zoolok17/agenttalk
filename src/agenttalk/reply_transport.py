@@ -27,6 +27,24 @@ _THREAD_OPENING_REPLY_KINDS = ("review-request", "proposal")
 # Draft bound mirrors the owed-action transport bound (obligations.py).
 MAX_DRAFT_BYTES = 1024 * 1024
 
+# #wrapper-reply-channels increment A: the outbound kind the draft channel
+# publishes as, keyed by the INBOUND record's own kind. Every kind not listed
+# here (question/message/wake) keeps the original kind=message publish - only
+# `task` gets a typed pairing (`task-response`), matching what a CLI
+# `agenttalk reply --kind task-response` would set for the same thread. This
+# is intentionally a narrow, explicit map rather than a passthrough of the
+# inbound kind: widening the draft channel to an arbitrary typed response
+# (review-result, proposal-response) needs evidence/status meta the draft
+# channel still cannot carry (see module docstring), so those stay excluded
+# at the loop.py decoration gate (`_REPLY_DRAFT_KINDS`) rather than mapped
+# here to an unreachable no-op.
+DRAFT_REPLY_KIND = {"task": "task-response"}
+
+
+def draft_reply_kind_for(inbound_kind: object) -> str:
+    """The outbound kind a draft-channel publish uses for one inbound kind."""
+    return DRAFT_REPLY_KIND.get(inbound_kind, "message")
+
 
 def echo_reply_correlation(
     meta: dict,
@@ -196,6 +214,45 @@ def write_refused_reason(draft_path: Path, reason: str) -> Path | None:
     return target
 
 
+def superseded_sidecar_path(draft_path: Path) -> Path:
+    """The observable sidecar recording that a draft was superseded (#wrapper-
+    reply-channels increment A) by a reply that landed via the OTHER channel
+    (typically a CLI `agenttalk reply`) before the wrapper's end-of-turn
+    draft-delivery check ran for the same thread.
+
+    Task-kind drafts only: publishing over an already-landed reply would
+    double-post a task-response on the same thread, so the wrapper does not
+    publish here — but silently deleting the draft (the existing behavior for
+    question/message/wake, unchanged) would erase the only visible trace that
+    two channels raced on the same task. This sidecar makes that race
+    observable without double-posting. The draft itself is left at its LIVE
+    path untouched (unlike a refusal, which renames it away) — an operator
+    inspecting the thread sees both the landed CLI reply and the
+    superseded draft side by side.
+    """
+    return draft_path.with_suffix(".superseded.md")
+
+
+def write_superseded_note(draft_path: Path, *, at: str) -> Path | None:
+    """Best-effort write of the supersession note beside the LIVE draft.
+
+    Never raises: exactly like :func:`write_refused_reason`, a failure to
+    record the note must not turn a race into a crash.
+    """
+    target = superseded_sidecar_path(draft_path)
+    note = (
+        f"superseded at {at}: a reply for this thread already landed via the "
+        "other channel (typically a CLI `agenttalk reply`) before the "
+        "wrapper's end-of-turn draft-delivery check ran. This draft was left "
+        "unpublished, in place, to avoid double-posting."
+    )
+    try:
+        target.write_text(note, encoding="utf-8")
+    except OSError:
+        return None
+    return target
+
+
 def preserve_interrupted_draft(draft_path: Path) -> Path | None:
     """Rename an interrupted attempt's leftover draft to ``.interrupted.md``.
 
@@ -291,7 +348,7 @@ def deliver_draft_reply(
             # second check, a dangling-symlink draft would leave no sidecar.
             write_refused_reason(draft_path, _classify_unreadable_draft(draft_path))
         return None
-    kind = "message"
+    kind = draft_reply_kind_for(record.get("kind"))
     record_meta = record.get("meta") if isinstance(record.get("meta"), dict) else {}
     meta: dict = {}
     echo_reply_correlation(

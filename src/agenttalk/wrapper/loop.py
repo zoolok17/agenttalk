@@ -164,11 +164,30 @@ def _as_outcome(ret: object) -> DriveOutcome:
 # reply is a plain message get a wrapper-declared draft file the child can
 # answer through with nothing but its structured Write tool — the fix for
 # seats whose harness statically rejects or approval-gates shell commands.
-# Typed-response threads (review-request/proposal) are excluded: their
-# closure requires a typed kind the draft channel does not carry yet.
 # `wake` is included: it is an ordinary driven kind whose wk- request id is
 # minted precisely so a plain message reply can correlate.
-_REPLY_DRAFT_KINDS = frozenset({"question", "message", "wake"})
+#
+# `task` is included (#wrapper-reply-channels increment A, fixing the field
+# bug where a task-kind draft written out of message-kind habit sat
+# unpublished — loop.py never decorated `record["reply_draft"]` for this
+# kind, so a child that wrote to the deterministic draft path anyway had no
+# indication its reply never landed). Publication uses
+# `reply_transport.draft_reply_kind_for` to pick `task-response` rather than
+# the plain `message` every other kind here gets.
+#
+# `review-request`/`proposal` remain excluded: their typed responses need
+# evidence/status meta (see `gates.validate_review_result_evidence`) the
+# draft channel still cannot carry, so decorating them would let a draft
+# close the thread with the wrong kind. `task-response`'s own optional
+# `status` meta has the same gap (a draft-published task-response can never
+# carry it — see reply_transport.DRAFT_REPLY_KIND's own docstring) but,
+# unlike review-result, a status-less task-response is an ALREADY-VALID
+# reply shape (`gates.validate_response_status` treats a missing status as
+# merely non-terminal, not invalid) — the same limitation a bare CLI
+# `agenttalk reply --kind task-response` (no `--meta status=...`) already
+# has today. See STEP-WRAPPER-REPLY-CHANNELS-A.md for the full enumeration
+# of what threads.py's ball-tracking does with a status-less task-response.
+_REPLY_DRAFT_KINDS = frozenset({"question", "message", "wake", "task"})
 
 
 def _interrupted_draft_path(store, agent: str, msg_id: object) -> Path | None:
@@ -340,10 +359,19 @@ def _deliver_reply_draft(store, agent: str, record: dict) -> str | None:
                     pass
             return
         if reply_transport.landed_reply_exists(store, agent=agent, record=record):
-            try:
-                draft.unlink(missing_ok=True)
-            except OSError:
-                pass
+            if record.get("kind") == "task":
+                # #wrapper-reply-channels increment A: a task-response draft
+                # racing an already-landed CLI reply on the same thread must
+                # not double-post — but silently deleting it (like the
+                # unlink below, unchanged for question/message/wake) would
+                # erase the only trace the race happened. Leave the LIVE
+                # draft in place and write an observable sidecar instead.
+                reply_transport.write_superseded_note(draft, at=_iso_now())
+            else:
+                try:
+                    draft.unlink(missing_ok=True)
+                except OSError:
+                    pass
             # P2-6: the reply already landed via the direct channel - GC the
             # <id>.interrupted.md sibling here too (previously only done on the
             # deliver_draft_reply success path below), or it survives forever.
