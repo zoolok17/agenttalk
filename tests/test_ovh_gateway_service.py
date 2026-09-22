@@ -721,7 +721,7 @@ def test_status_requires_attested_runtime_front_and_internal_liveliness(
         input_tokens=1_000,
         output_tokens=100,
     )
-    ledger.verify_dashboard_canary("1" * 32, observed_delta_micro_eur=960)
+    ledger.verify_dashboard_canary("1" * 32, observed_delta_micro_eur=670)
     accepted = gateway_status(
         root,
         commands=commands,

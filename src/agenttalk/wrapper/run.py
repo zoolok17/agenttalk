@@ -65,7 +65,7 @@ _WRAPPER_LOG_ENV_NAMES = {
     "AGENTTALK_WRAPPER_LOG_SEGMENTS",
     "AGENTTALK_WRAPPER_LOG_NONCE",
 }
-OVH_QWEN_CLAUDE_MAX_OUTPUT = "4096"
+OVH_QWEN_CLAUDE_MAX_OUTPUT = "32768"
 _BENIGN_PIPE_TEARDOWN_ERRNOS = {errno.EINVAL, errno.EPIPE}
 _WATCHDOG_STREAM_POLL_SECONDS = 0.05
 _WATCHDOG_STREAM_READ_BYTES = 64 * 1024
@@ -487,9 +487,9 @@ def _child_env(
             raise ValueError("ovh-qwen requires the pinned loopback gateway URL")
         if not injected.get("ANTHROPIC_AUTH_TOKEN"):
             raise ValueError("ovh-qwen requires an injected front token")
-        if injected.get("ANTHROPIC_MODEL") not in {None, "Qwen3.5-397B-A17B"}:
+        if injected.get("ANTHROPIC_MODEL") not in {None, "Qwen3.8-27B"}:
             raise ValueError("ovh-qwen requires the pinned model alias")
-        injected["ANTHROPIC_MODEL"] = "Qwen3.5-397B-A17B"
+        injected["ANTHROPIC_MODEL"] = "Qwen3.8-27B"
         if injected.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS") not in {
             None,
             OVH_QWEN_CLAUDE_MAX_OUTPUT,
@@ -2314,6 +2314,47 @@ def _child_output_capture(sig: dict) -> tuple[Callable[..., None], Callable[[], 
     return _capture_child_output, _finalize_child_output
 
 
+def close_ovh_child_turn_on_dead_letter(
+    agent: str,
+    record: dict,
+    *,
+    backend_profile: str | None,
+    profile_env: dict | None,
+) -> None:
+    """Item 10: a dead-lettered message will NOT be retried through the normal
+    (non-operator) path - the cursor has already advanced past it - so its ledger
+    child turn (opened by ``open_child_turn`` above, keyed by this SAME agent +
+    message id) should not linger 'open' for up to CHILD_TURN_MAX_SECONDS (86400s,
+    24h) with nothing left to do. Deliberately called ONLY at dead-letter, never on
+    an ordinary attempt failure the caller intends to retry: retries of the SAME
+    durable message reuse and accumulate against the SAME open child turn by design
+    (``child_turns`` is keyed on (agent, message_id) with no way to reopen a fresh
+    row for an existing key), so closing on every failed attempt would turn the
+    very next legitimate retry into a permanent ChildTurnCapExceeded/config_blocked
+    dead end instead of the transient failure it actually is.
+
+    Best-effort: disposal has already succeeded and the cursor has already moved by
+    the time this runs, so a ledger hiccup here (a held/misconfigured/uninitialized
+    gateway) must never surface as an error - it just means the stale row waits out
+    its own wall-time ceiling as before this fix existed."""
+    if backend_profile != "ovh-qwen":
+        return
+    message_id = record.get("id")
+    if not isinstance(message_id, str) or not message_id:
+        return
+    from agenttalk.ovh_gateway import GatewayError, SpendLedger
+
+    try:
+        SpendLedger().close_child_turn(
+            agent=agent,
+            message_id=message_id,
+            reason="dead_letter",
+            issuer_token=str((profile_env or {}).get("ANTHROPIC_AUTH_TOKEN") or ""),
+        )
+    except GatewayError:
+        pass
+
+
 def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str], *,
                sender: str | None = None, min_interval: float = 5.0,
                render: bool = True, rules: str | None = None,
@@ -2928,6 +2969,20 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             health_writer.unknown()
             raise
         health_writer.failure(sig, failure_class)
+        # A FAILED fresh (--session-id, not --resume) claude turn: the CLI already
+        # created that session's transcript file the moment it spawned, whether or
+        # not the turn completed - re-spawning with the SAME id next time gets
+        # refused ("session already exists"), which is a spawn/pipe failure with no
+        # useful diagnostic, not the original failure. Mint a fresh id now so the
+        # next spawn (a retry of the same durable record, or the next turn) gets a
+        # clean session, mirroring the existing resume->fresh self-heal above.
+        # CLASS_CONFIG_BLOCKED means the child never spawned (a preflight refusal,
+        # same special-casing the resume branch above already gives it) - no
+        # session file exists, so there is nothing to reset.
+        if cli == "claude" and not attempted_resume and failure_class != CLASS_CONFIG_BLOCKED:
+            _session.reset_claude_session(session_state, "fresh_session_turn_failed")
+            if persist is not None:
+                persist(session_state)
         # WATCHDOG-RECOVERY ONLY (narrow path): the hung tool tree was killed and the
         # wrapper is alive + ready for the next turn, so re-stamp a fresh heartbeat (undoing
         # the clear above) - otherwise the supervisor would ALSO relaunch a healthy wrapper.

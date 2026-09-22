@@ -11607,6 +11607,15 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             return wloop.CadenceResult(ran=True, ok=True, drove_turn=True)
 
         cadence_hook = _cadence
+
+    def _on_runtime_dead_letter(record: dict) -> None:
+        runtime_writer.dead_letter(message_id=record.get("id"))
+        # item 10: a dead-lettered message will not be retried, so its ovh-qwen
+        # child turn should not linger 'open' for up to CHILD_TURN_MAX_SECONDS.
+        wrapper_run.close_ovh_child_turn_on_dead_letter(
+            agent, record, backend_profile=backend_profile, profile_env=profile_env,
+        )
+
     try:
         from .wrapper.obligations import DetectionCommitGate
 
@@ -11649,11 +11658,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             on_health_idle=health_writer.idle,
             on_health_parked=health_writer.parked,  # #58: config-blocked park is visible, not a frozen 'idle'
             on_runtime_idle=runtime_writer.idle,
-            on_runtime_dead_letter=(
-                lambda record: runtime_writer.dead_letter(
-                    message_id=record.get("id")
-                )
-            ),
+            on_runtime_dead_letter=_on_runtime_dead_letter,
             capacity_refresh=capacity_refresh,
             wrapper_generation=wrapper_generation,
             commit_gate=commit_gate,

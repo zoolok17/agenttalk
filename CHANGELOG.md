@@ -9,6 +9,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **OVH/Qwen gateway moved to `Qwen3.8-27B` on OVH's unified endpoint.**
+  `MODEL_ALIAS` -> `Qwen3.8-27B`; `DEFAULT_API_BASE` ->
+  `https://oai.endpoints.kepler.ai.cloud.ovh.net/v1` (the model is now
+  selected by name in the request body, not a per-model hostname).
+  Tariff re-pinned from the OVH catalog observed 2026-09-22: settlement
+  EUR 0.40/M input, EUR 2.70/M output (was 0.60 / 3.60); reservation
+  stays tariff+20%. Development child-turn caps raised: 8 -> 64 provider
+  calls, 300 -> 1800 seconds, EUR 0.50 -> EUR 3.00 per turn; fail-closed
+  semantics unchanged. Operator spend cap raised: trial cutoff EUR 25 ->
+  EUR 95, soft stop EUR 20 -> EUR 90 (external ceiling stays EUR 100;
+  cutoff is EUR 95 rather than a bare EUR 100 because
+  `SpendLedger.initialize`'s envelope check needs headroom below the
+  ceiling for one worst-case reservation plus any nonzero opening
+  balance - confirmed against the actual test suite, not just the zero-
+  balance case: a naive EUR 99.80 cutoff left only ~EUR 0.06 of headroom
+  and broke every test/fixture using a realistic small opening balance).
+  `price_policy_hash`, `child_cap_policy_hash`, and
+  `CHILD_CAP_SCHEMA_VERSION` (1 -> 2) all change as a result, which
+  invalidates every previously accepted dashboard canary and blocks
+  `gateway reconfigure` against a pre-existing install (it is scoped to
+  endpoint-only changes) - see `docs/QWEN-OVH-TRIAL.md`'s "2026-09-22
+  endpoint change" section for the required re-init sequence and why.
+- **OVH/Qwen gateway: trial-policy caps removed by operator decision -
+  the 95/100 EUR ledger envelope is the only limit.** Field evidence: the
+  wrapped qwen coding turn died twice on trial-policy caps, not the
+  model (once on the 1800s wall clock mid-setup, once on the 4096-token
+  per-call output cap once reasoning was folded into text), and the
+  wrapper's session-id reuse after those failures turned each into a
+  dead-lettered message (see below). `MAX_OUTPUT_TOKENS` 4096 -> 32768
+  (not confirmed as the model's documented ceiling from local data -
+  stated, not assumed); `CLAUDE_CODE_MAX_OUTPUT_TOKENS` pinned equal to
+  it. `CHILD_TURN_MAX_CALLS` 64 -> 100000, `CHILD_TURN_MAX_SECONDS` 1800
+  -> 86400, `CHILD_TURN_MAX_MICRO_EUR` EUR 3.00 -> EUR 95.00 (equal to
+  the trial cutoff, so the ledger's own cutoff/ceiling are the only
+  spend limits a turn can actually hit). `CHILD_CAP_SCHEMA_VERSION`
+  2 -> 3. `reservation_cost_micro_eur()` grows with the larger output
+  cap: EUR 0.139102 -> EUR 0.231999; `TRIAL_CUTOFF_MICRO_EUR` did not
+  need to move for this (confirmed the envelope still holds, with
+  headroom, for both a zero opening balance and the docs' own EUR 0.58
+  fixture). `price_policy_hash` and `child_cap_policy_hash` both change
+  again as a result.
+- **OVH/Qwen gateway: a dead-lettered message's child turn stayed 'open'
+  for up to 24h with nothing left to do.** `child_turns` is keyed on
+  `(agent, message_id)` and deliberately accumulates call/cost exposure
+  across every retry of the SAME message - but once a message is
+  dead-lettered it will not be retried through the normal path again, so
+  the row just burned its wall-time ceiling for no reason. New
+  `SpendLedger.close_child_turn()` eagerly expires an OPEN row (no-op
+  otherwise); `wrapper/run.py`'s `close_ovh_child_turn_on_dead_letter()`
+  calls it from `cli.py`'s dead-letter dispose hook, best-effort
+  (a ledger hiccup here never blocks disposal). Deliberately scoped to
+  dead-letter only, never an ordinary retryable attempt failure - closing
+  on every failure would turn the next legitimate retry into a permanent
+  cap-exceeded dead end.
+
+### Fixed
+
+- **OVH/Qwen gateway: a streamed turn with interleaved reasoning could
+  abort the CLI.** Qwen3.8-27B emits reasoning content; the gateway's
+  LiteLLM instance mapped it to Anthropic thinking blocks in the
+  `/v1/messages` passthrough, and the CLI rejected the stream ("API
+  Error: Content block is not a thinking block") when a thinking delta
+  landed out of order mid-turn - observed live, not in a test.
+  `merge_reasoning_content_in_choices: true` added to the rendered
+  LiteLLM config, on the model's own `litellm_params` (a per-deployment
+  field, not a `litellm_settings` module default - verified against the
+  installed venv's source, since only the former is actually read
+  per-call), so reasoning folds into content text and no thinking block
+  is ever emitted.
+- **Wrapper: a failed fresh claude turn reused a session id the CLI had
+  already created a transcript file for, so every retry died on a
+  broken pipe.** `make_drive()` only reset the session id after a failed
+  `--resume` turn; a failed FRESH (`--session-id`) turn left the same id
+  in place, and the CLI refuses `--session-id` for a file that already
+  exists. Now a failed fresh turn mints a new session id immediately
+  (after one failure, not the resume path's K=2), mirroring the existing
+  resume self-heal. Scoped to `make_drive()`; `make_cadence_drive()` is
+  unreachable for `ovh-qwen` (no `wrap --lead-loop` support).
+
 ## [0.89.0] - 2026-09-17
 
 Theme: **the last field fixes before the freeze - what the first

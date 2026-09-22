@@ -55,15 +55,19 @@ from .redaction import redact_diagnostic_text
 
 TASK_SCHEMA_VERSION = 1
 RUNTIME_SCHEMA_VERSION = 2
-# PINNED upstream (#38). The gateway will only ever call this exact base — it is
-# a code constant, never a caller/runtime argument (a runtime-injectable base
-# would be an SSRF/exfiltration lever). To change it: edit this line (reviewed
-# via PR) then run `agenttalk gateway reconfigure` (re-renders the config +
-# rebinds the manifest, ledger-preserving). LiteLLM's openai provider POSTs
-# {api_base}/chat/completions, so this terminates at the level above that.
-# If the operator-gated live test 404s on the route, the fallback base is the
-# bare "https://qwen-3-5-397b.endpoints.kepler.ai.cloud.ovh.net/api/openai_compat".
-DEFAULT_API_BASE = "https://qwen-3-5-397b.endpoints.kepler.ai.cloud.ovh.net/api/openai_compat/v1"
+# PINNED upstream (#38, updated 2026-09-22 for the Qwen3.8-27B move). The
+# gateway will only ever call this exact base — it is a code constant, never
+# a caller/runtime argument (a runtime-injectable base would be an
+# SSRF/exfiltration lever). To change it: edit this line (reviewed via PR)
+# then run `agenttalk gateway reconfigure` (re-renders the config + rebinds
+# the manifest, ledger-preserving) — note a price-policy change (as this one
+# was) also requires re-accepting the dashboard canary; `reconfigure` alone
+# refuses when the ledger's price_policy_hash no longer matches. LiteLLM's
+# openai provider POSTs {api_base}/chat/completions, so this terminates at
+# the level above that. Unlike the old per-model host, this is OVH's unified
+# OpenAI-compatible endpoint — the model is selected by name in the request
+# body (MODEL_ALIAS), so there is no per-model fallback base to fall back to.
+DEFAULT_API_BASE = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"
 STOP_TIMEOUT_SECONDS = 30.0
 LITELLM_READINESS_TIMEOUT_SECONDS = 120.0
 LITELLM_RUNTIME_PROBE_TIMEOUT_SECONDS = 120.0

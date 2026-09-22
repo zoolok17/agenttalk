@@ -3236,7 +3236,7 @@ def test_supervise_bootstrap_check_accepts_constrained_ovh_qwen_profile(
     qwen.pop("env")
     qwen.update({
         "backend_profile": "ovh-qwen",
-        "model": "Qwen3.5-397B-A17B",
+        "model": "Qwen3.8-27B",
         "trust_class": "external-worker",
     })
     _write_supervisor_config(s, {"qwen-dev-1": qwen})
@@ -3272,7 +3272,7 @@ def test_supervise_bootstrap_check_rejects_uncapped_qwen_lead_loop(
     )
     qwen.update({
         "backend_profile": "ovh-qwen",
-        "model": "Qwen3.5-397B-A17B",
+        "model": "Qwen3.8-27B",
         "trust_class": "external-worker",
     })
     _write_supervisor_config(s, {"qwen-dev-1": qwen})
@@ -3307,7 +3307,7 @@ def test_supervise_bootstrap_check_rejects_ambient_provider_key_for_qwen(
     qwen.pop("env")
     qwen.update({
         "backend_profile": "ovh-qwen",
-        "model": "Qwen3.5-397B-A17B",
+        "model": "Qwen3.8-27B",
         "trust_class": "external-worker",
     })
     _write_supervisor_config(s, {"qwen-dev-1": qwen})

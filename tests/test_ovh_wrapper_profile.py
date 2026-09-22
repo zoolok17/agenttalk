@@ -89,8 +89,8 @@ def test_ovh_qwen_child_environment_starts_from_allowlist(tmp_path, monkeypatch)
     assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:4000"
     assert "ANTHROPIC_AUTH_TOKEN" not in env
     assert "front-token" not in env.values()
-    assert env["ANTHROPIC_MODEL"] == "Qwen3.5-397B-A17B"
-    assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "4096"
+    assert env["ANTHROPIC_MODEL"] == "Qwen3.8-27B"
+    assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "32768"
     assert env["MAX_THINKING_TOKENS"] == "0"
     assert env["CLAUDE_CONFIG_DIR"] == str(
         (tmp_path / ".agenttalk" / "gateway" / "claude-profile").resolve()
@@ -333,6 +333,95 @@ def test_qwen_spawner_never_launches_when_capability_issue_fails(
     assert outcome.ok is False
     assert outcome.failure_class == CLASS_CONFIG_BLOCKED
     assert "capability unavailable" in outcome.summary
+
+
+def test_close_ovh_child_turn_on_dead_letter_closes_the_durable_message_scope(
+    monkeypatch,
+) -> None:
+    # Item 10: the dead-letter dispose (loop.py's on_runtime_dead_letter hook, wired
+    # in cli.py) closes the ovh-qwen child turn for the record that was just
+    # disposed, using the SAME agent/message_id/issuer_token shape as the mint call
+    # above - the message will not be retried through the normal path again, so the
+    # ledger row should not linger 'open' for up to CHILD_TURN_MAX_SECONDS (24h).
+    closed: list[dict[str, str]] = []
+
+    class FakeLedger:
+        def close_child_turn(self, **scope):
+            closed.append(scope)
+
+    monkeypatch.setattr(ovh_gateway, "SpendLedger", FakeLedger)
+
+    run.close_ovh_child_turn_on_dead_letter(
+        "qwen-dev-1",
+        {"id": "immutable-message-id"},
+        backend_profile="ovh-qwen",
+        profile_env={"ANTHROPIC_AUTH_TOKEN": "master-front-token"},
+    )
+
+    assert closed == [
+        {
+            "agent": "qwen-dev-1",
+            "message_id": "immutable-message-id",
+            "reason": "dead_letter",
+            "issuer_token": "master-front-token",
+        }
+    ]
+
+
+def test_close_ovh_child_turn_on_dead_letter_is_a_noop_off_profile_or_without_id(
+    monkeypatch,
+) -> None:
+    def must_not_construct(*_args, **_kwargs):
+        raise AssertionError("SpendLedger constructed for a non-ovh-qwen profile")
+
+    monkeypatch.setattr(ovh_gateway, "SpendLedger", must_not_construct)
+
+    # Not the ovh-qwen backend: never touches the ledger.
+    run.close_ovh_child_turn_on_dead_letter(
+        "codex-dev-1",
+        {"id": "some-message-id"},
+        backend_profile=None,
+        profile_env=None,
+    )
+    run.close_ovh_child_turn_on_dead_letter(
+        "codex-dev-1",
+        {"id": "some-message-id"},
+        backend_profile="codex-default",
+        profile_env=None,
+    )
+    # ovh-qwen, but the record carries no usable immutable message id.
+    run.close_ovh_child_turn_on_dead_letter(
+        "qwen-dev-1",
+        {},
+        backend_profile="ovh-qwen",
+        profile_env={"ANTHROPIC_AUTH_TOKEN": "master-front-token"},
+    )
+    run.close_ovh_child_turn_on_dead_letter(
+        "qwen-dev-1",
+        {"id": ""},
+        backend_profile="ovh-qwen",
+        profile_env={"ANTHROPIC_AUTH_TOKEN": "master-front-token"},
+    )
+
+
+def test_close_ovh_child_turn_on_dead_letter_swallows_a_ledger_hiccup(
+    monkeypatch,
+) -> None:
+    # Best-effort: disposal already succeeded and the cursor already advanced by
+    # the time this runs, so a held/misconfigured/uninitialized gateway must not
+    # surface as an error out of a dead-letter notification path.
+    class BrokenLedger:
+        def close_child_turn(self, **_scope):
+            raise ovh_gateway.LedgerBlocked("gateway is not initialized")
+
+    monkeypatch.setattr(ovh_gateway, "SpendLedger", BrokenLedger)
+
+    run.close_ovh_child_turn_on_dead_letter(
+        "qwen-dev-1",
+        {"id": "immutable-message-id"},
+        backend_profile="ovh-qwen",
+        profile_env={"ANTHROPIC_AUTH_TOKEN": "master-front-token"},
+    )
 
 
 def test_ovh_qwen_profile_rejects_unpinned_gateway_or_extra_env(tmp_path) -> None:
