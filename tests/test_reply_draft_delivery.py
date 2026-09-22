@@ -301,6 +301,76 @@ def test_task_kind_gets_the_draft_channel(tmp_path) -> None:
                                             # other draft-channel kind gets
     assert (msg.meta or {}).get("request_id") == "tk-1"
     assert (msg.meta or {}).get("in_reply_to") == t.id
+    # #wrapper-reply-channels increment A2: a draft-published task-response
+    # defaults to status=done - the draft channel carries no way to say
+    # "accepted, still working", so answering through it IS declaring done.
+    assert (msg.meta or {}).get("status") == "done"
+
+
+def test_a2_task_thread_closes_on_both_sides_and_doctor_raises_nothing(tmp_path) -> None:
+    # reviewer-3's own cold-review finding on increment A (a sharper form of
+    # A's own flagged limitation): drove the FULL pipeline (task sent, a
+    # wrapper turn that only writes the draft, then threads.derive_threads
+    # from BOTH sides) and found the thread stayed open-outbound for the
+    # sender and owed-inbound for the responder - a status-less task-response
+    # is not "non-terminal", it is UNCLASSIFIED by threads._classify_event's
+    # own opener_kind=="task" branch (returns None: neither "ball" nor
+    # "terminal"). doctor.py's staleness check then raised a false ERROR
+    # "neither accepted, declined, nor done" on a task the responder HAD
+    # already answered, through the very channel A exists to make reliable.
+    # A2 (status=done by default) must close this on both sides and doctor
+    # must raise nothing - proven here directly, not just by inspecting the
+    # published message's own meta as the extended test above already does.
+    from agenttalk import doctor, threads as th
+
+    s = _store(tmp_path)
+    s.set_role("alpha", "lead")
+    s.send(sender="alpha", recipient="beta", kind="task", body="do X",
+           meta={"request_id": "tk-a2"})
+
+    def drive(rec):
+        Path(rec["reply_draft"]["path"]).write_text("done", encoding="utf-8")
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1)
+
+    messages = s.valid_messages()
+    alpha_threads = {
+        t.request_id: t for t in
+        th.derive_threads(messages, agent="alpha", cursor=s.cursor("alpha") or "")
+    }
+    beta_threads = {
+        t.request_id: t for t in
+        th.derive_threads(messages, agent="beta", cursor=s.cursor("beta") or "")
+    }
+    # Before A2: alpha (opener) = "open-outbound" forever, beta (responder) =
+    # "owed-inbound" forever - reviewer-3's own reported shape, reproduced
+    # and confirmed by this test before the fix landed. After A2:
+    assert alpha_threads["tk-a2"].role == "opener"
+    # "reply-waiting" (NOT "open-outbound"): the terminal task-response WAS
+    # recognized - alpha simply hasn't read/acked it yet in this test (its
+    # own cursor never advanced), which is the correct, ordinary state for
+    # a fresh, unread-but-terminal reply, not a bug.
+    assert alpha_threads["tk-a2"].state == "reply-waiting"
+    assert beta_threads["tk-a2"].role == "responder"
+    assert beta_threads["tk-a2"].state == "closed"
+
+    # Once alpha reads it (cursor advances past the task-response), BOTH
+    # sides show "closed" - completing what "both sides see the thread
+    # closed" means end to end.
+    alpha_threads_read = {
+        t.request_id: t for t in
+        th.derive_threads(messages, agent="alpha",
+                          cursor=alpha_threads["tk-a2"].last_msg_id)
+    }
+    assert alpha_threads_read["tk-a2"].state == "closed"
+
+    # doctor's own staleness check, called directly (not synthesizing its
+    # internals) - must find nothing to report, matching the "absent when
+    # there is nothing to report" contract _check_declined_lead_tasks
+    # documents for itself.
+    assert doctor._check_declined_lead_tasks(s) is None
 
 
 def test_task_kind_cli_reply_wins_draft_left_in_place_with_superseded_sidecar(

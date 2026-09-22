@@ -105,6 +105,80 @@ Grepped `"task-response"` across `src/agenttalk/` (excluding the CLI's own `cmd_
    (`store.py`) and `threads.py`'s own classification (point 3 above) — no separate assumption to
    enumerate.
 
+## Increment A2 (reviewer-3 cold-review HOLD, fixed in-round)
+
+reviewer-3's own cold read of A2 confirmed all of A's own reported counts, then drove the FULL
+pipeline (task sent, a wrapper turn that only writes the draft, then `threads.derive_threads` from
+BOTH the sender's and the responder's own perspective) and found this: the thread stayed
+`open-outbound` for the sender and `owed-inbound` for the responder, and `doctor.py`'s staleness
+check raised a FALSE `ERROR "neither accepted, declined, nor done"` 30 minutes after a task was
+already answered through the very channel A fixes. This is the exact limitation point 3 above
+flagged — "the lead-side thread view will keep showing the thread as still-owed-with-no-progress" —
+reviewer-3's own run gave it a name and a blast radius (a false doctor ERROR) severe enough that the
+lead decided to fix it in-round rather than carry it forward as a residual.
+
+**The fix**: `reply_transport.deliver_draft_reply` now sets `meta["status"] = "done"` whenever the
+resolved outbound `kind == "task-response"` (i.e. whenever the inbound record's own kind is
+`"task"`) — built right after `echo_reply_correlation`, before the digest/nonce (confirmed
+`operation_payload_digest` does not cover `status` at all, so this ordering has no digest-parity
+consequence). Rationale, stated plainly: a seat that answers a task by writing its draft is
+declaring the task **done** — that is the channel's own semantics. The draft channel carries no
+typed `--meta` at all, so it has no way to express "accepted, still working" (`status=accepted`,
+which keeps the ball with the responder) — a seat that needs that shape must use the CLI path
+instead (`agenttalk reply --kind task-response --meta status=accepted`), unaffected by this change
+(A2 only touches the draft-channel function, never `cmd_reply`).
+
+**Enumerated readers of `task-response`'s `meta.status`**, exactly as the lead's own HOLD asked:
+
+1. **`threads.py:100-104`** (`_classify_event`, `opener_kind == "task"`) — the root cause reviewer-3
+   found. `status` absent -> returns `None` (UNCLASSIFIED, not merely "non-terminal" — neither
+   `("ball", responder)` nor `("terminal", None)`), which is why the thread state computation never
+   even reached its own terminal-vs-ball branching for a status-less reply. `status="done"` (now
+   the draft-channel default) -> `("terminal", None)`, exactly the same as an equivalent CLI
+   `--meta status=done` reply already produced. `status="accepted"` (CLI-only, A2 does not produce
+   this) -> `("ball", responder)`, the "acknowledged, still on the hook" shape — untouched.
+2. **`doctor.py:995-1049`** (`_check_declined_lead_tasks`, the staleness check reviewer-3's run
+   triggered) — flags a thread where, from the OPENER's own `derive_threads` view,
+   `state in ("open-outbound", "reply-waiting")` AND `age_seconds >= 1800`. Before A2: a status-less
+   task-response left the opener's view at `open-outbound` forever (see point 1), so ANY task
+   answered only through the draft channel would eventually trip this exact false ERROR, precisely
+   as reviewer-3 reproduced. After A2: `_classify_event` reaches `terminal=True`, and the opener's
+   state becomes `reply-waiting` (fresh, unread reply — see the test below) or `closed` (once read)
+   — NEITHER is `open-outbound`, and `reply-waiting` only re-triggers staleness if the reply itself
+   sits unread for 30+ minutes (a genuinely separate, correct concern: an unread reply IS worth
+   surfacing eventually, same as it always was for every other kind).
+3. **`gates.py:41-49`** (`RESPONSE_STATUS_ENUMS`/`TERMINAL_RESPONSE_STATUSES`) — `"done"` was
+   already a member of both sets (A's own enumeration already noted this); A2 does not add or
+   change any enum membership, it only makes the draft channel actually SET the field.
+   `validate_response_status` (already shared with the CLI path via `deliver_draft_reply`) accepts
+   `status="done"` for `kind="task-response"` with no error — confirmed by the new passing test.
+4. **`store.py:540-566`** (`KNOWN_KINDS`'s own documentation comment) — states the canonical
+   contract task-response replies "should" carry `meta.status=accepted|declined|done`. A2 makes the
+   draft channel's own output MEET that documented contract for the first time (previously it met
+   neither `accepted` nor `declined` nor `done` — it carried no status key at all); no code change
+   needed here, the comment was already correct, only the draft channel's own behavior was not
+   living up to it.
+5. **The lead-side thread view** (`cli.py:1287`, `cmd_threads` — "the did-the-reviewer-ever-respond
+   answer") — calls the exact same `threads.derive_threads` as points 1/2 above, with no
+   task-specific logic of its own; its default view hides `closed` threads and shows everything in
+   `ACTIONABLE_STATES = (reply-waiting, owed-inbound, open-outbound)`. Before A2 a draft-answered
+   task would show as `open-outbound` in this view FOREVER (indistinguishable from "never
+   answered"); after A2 it shows as `reply-waiting` (an unread reply exists — correct, actionable:
+   "here is an answer to read") until the lead's own cursor advances past it, then it drops off the
+   default view entirely like any other answered thread.
+
+**Test** (`tests/test_reply_draft_delivery.py::test_a2_task_thread_closes_on_both_sides_and_doctor_raises_nothing`,
+41 lines): drives a real task through `loop.run_loop` with a draft-only responder (reviewer-3's own
+repro shape), then calls `threads.derive_threads` from BOTH sides directly and
+`doctor._check_declined_lead_tasks` directly (not synthesized) — confirms the opener's own view is
+`reply-waiting` (not `open-outbound`), the responder's own view is `closed` (not `owed-inbound`),
+the opener's view becomes `closed` too once its cursor advances past the reply, and the doctor
+check returns `None` (nothing to report). Also extended the existing
+`test_task_kind_gets_the_draft_channel` with a direct `meta.get("status") == "done"` assertion on
+the published message. Full run: `test_reply_draft_delivery.py` 43/43 (was 42, +1 new +1 extended),
+`test_doctor.py -k "declined_lead_tasks or task_response"` 3/3, `test_threads.py -k task` 5/5.
+`ruff check` + `py_compile` clean.
+
 ## Confidentiality sweep
 
 `grep -riE "amperian|jaws"` over this file and `git diff origin/master` for this increment - 0

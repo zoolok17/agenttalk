@@ -396,6 +396,24 @@ def deliver_draft_reply(
     echo_reply_correlation(
         meta, anchor_id=inbound_id, anchor_meta=record_meta, kind=kind,
     )
+    if kind == "task-response":
+        # #wrapper-reply-channels increment A2 (reviewer-3 cold-review
+        # finding on A): the draft channel carries no typed --meta at all,
+        # so a draft-published task-response could never set status -
+        # threads.py's own classifier (opener_kind == "task") then returns
+        # None for a status-less reply (neither "ball" nor "terminal"), so
+        # the thread stayed open-outbound for the sender and owed-inbound
+        # for the responder FOREVER, and doctor.py's staleness check raised
+        # a false "neither accepted, declined, nor done" ERROR 30 minutes
+        # later - on a task the responder HAD already answered, through the
+        # very channel A exists to make reliable. A seat that answers a
+        # task by writing its draft is declaring the task done - that is
+        # the channel's own semantics (it carries no way to say "in
+        # progress, more to come" - see DRAFT_REPLY_KIND's own docstring).
+        # A seat that needs to keep the task open (an --meta status=accepted
+        # acknowledgment, still on the hook) must use the CLI path instead;
+        # the draft channel does not support that shape.
+        meta["status"] = "done"
     nonce = secrets.token_hex(16)
     digest = operation_digest_for(
         meta, operation="terminal", body=body, kind=kind, recipient=requester,
