@@ -2317,6 +2317,7 @@ def _child_output_capture(sig: dict) -> tuple[Callable[..., None], Callable[[], 
 def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str], *,
                sender: str | None = None, min_interval: float = 5.0,
                render: bool = True, rules: str | None = None,
+               reply_shell: str = "powershell",
                clock: Callable[[], float] = time.monotonic,
                spawn: Callable[[list[str], str | None], Iterable[str]] | None = None,
                agenttalk_preflight: Callable[[], str | None] | None = None,
@@ -2782,7 +2783,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             sender_is_lead = None
         prompt = _prompt.assemble_turn_prompt(
             record, rules=rules, rejoin=rejoin, lessons=lesson_prompt,
-            sender_is_lead=sender_is_lead)
+            sender_is_lead=sender_is_lead, shell=reply_shell)
         spec = _session.build_turn(session_state, prompt)
         cli = session_state.cli
         # A failed RESUME turn self-heals to a fresh session before we classify (codex:
@@ -2949,6 +2950,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
 def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: list[str], *,
                        sender: str | None = None, min_interval: float = 5.0,
                        render: bool = True, rules: str | None = None,
+                       reply_shell: str = "powershell",
                        clock: Callable[[], float] = time.monotonic,
                        spawn: Callable[[list[str], str | None], Iterable[str]] | None = None,
                        agenttalk_preflight: Callable[[], str | None] | None = None,
@@ -3144,7 +3146,8 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
         return sig
 
     def cadence_drive(snapshot: dict, items: list) -> bool:
-        prompt = _prompt.assemble_cadence_prompt(snapshot, items, rules=rules)
+        prompt = _prompt.assemble_cadence_prompt(
+            snapshot, items, rules=rules, shell=reply_shell)
         spec = _session.build_turn(session_state, prompt)
         cli_name = session_state.cli
         attempted_resume = ((cli_name == "codex" and "resume" in spec.args)

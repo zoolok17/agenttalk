@@ -62,6 +62,53 @@ def test_prompt_renders_sender_is_lead_fact_when_provided() -> None:
     assert "sender_is_lead" not in p_omitted
 
 
+def test_prompt_default_shell_is_powershell_unchanged() -> None:
+    # #wrapper-reply-channels increment B: the default (no shell kwarg, every
+    # existing caller before this increment) must stay byte-identical to the
+    # PowerShell form the prompt always rendered.
+    rec = {"from": "alpha", "to": "beta", "kind": "message", "body": "hi",
+           "id": "m-1", "correlation_id": "c-1", "request_id": "c-1",
+           "broadcast_id": None}
+    p = prompt.assemble_turn_prompt(rec)
+    assert '& "$env:AGENTTALK_PY" -m agenttalk reply' in p
+    assert '"$AGENTTALK_PY" -m agenttalk' not in p     # no bare bash form
+
+
+def test_prompt_bash_shell_rewrites_every_invocation() -> None:
+    rec = {"from": "alpha", "to": "beta", "kind": "message", "body": "hi",
+           "id": "m-1", "correlation_id": "c-1", "request_id": "c-1",
+           "broadcast_id": None}
+    p = prompt.assemble_turn_prompt(rec, shell="bash")
+    assert '"$AGENTTALK_PY" -m agenttalk reply' in p
+    assert '$env:AGENTTALK_PY' not in p     # PowerShell env-var syntax gone
+    assert '& "' not in p                   # PowerShell call operator gone
+    # Every invocation this prompt renders, not just the reply command - the
+    # substitution is a single mechanical pass over the WHOLE assembled text.
+    assert p.count('"$AGENTTALK_PY" -m agenttalk') >= 5
+
+
+def test_task_kind_prompt_states_task_response_kind_explicitly() -> None:
+    # message/question/wake share one generic CLI-form paragraph; task now
+    # gets its own, naming --kind task-response explicitly (the field bug:
+    # a plain `agenttalk reply` with no --kind on a task thread silently
+    # publishes as kind=message, not the task-response the thread needs).
+    rec = {"from": "lead", "to": "beta", "kind": "task", "body": "do X",
+           "id": "tk-1", "correlation_id": "tk-1", "request_id": "tk-1",
+           "broadcast_id": None, "reply_draft": {"path": "X:/drafts/tk-1.md"}}
+    p = prompt.assemble_turn_prompt(rec)
+    assert "This is a task thread: your reply MUST be a typed CLI reply" in p
+    assert "--kind task-response" in p
+    assert "X:/drafts/tk-1.md" in p
+    assert "typed task-response" in p        # draft-channel note names it too
+    assert "--meta status=declined --meta reason=<why>" in p
+
+    # A non-task kind must NOT pick up any of this task-specific text.
+    other = dict(rec, kind="message")
+    p_other = prompt.assemble_turn_prompt(other)
+    assert "This is a task thread" not in p_other
+    assert "--kind task-response" not in p_other
+
+
 def test_prompt_gives_exact_reply_invocation_for_ordinary_thread() -> None:
     # A wrapped model fumbled `agenttalk reply` flags (--to / --request-id / --body)
     # and inline multi-line -m bodies, burning a turn without a reply. The prompt must
@@ -202,6 +249,17 @@ def test_cadence_prompt_has_bus_contract_and_no_bare_send_commands() -> None:
         r"(?<!-m )\bagenttalk (reply|send|escalate|composing|check)\b",
         p,
     )
+
+
+def test_cadence_prompt_respects_shell_param() -> None:
+    # #wrapper-reply-channels increment B: the cadence (proactive-sweep)
+    # prompt shares the same rewrite as an ordinary turn prompt - a
+    # PowerShell-only cadence rules block would leave a bash-shelled seat's
+    # cadence sweep just as broken as its ordinary turns were.
+    p = prompt.assemble_cadence_prompt(
+        {"agent": "beta"}, [{"kind": "outbound_reminder"}], shell="bash")
+    assert '"$AGENTTALK_PY" -m agenttalk reply' in p
+    assert '$env:AGENTTALK_PY' not in p
 
 
 # --------------------------------------------------------------- session

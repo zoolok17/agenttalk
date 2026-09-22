@@ -11,6 +11,30 @@ from __future__ import annotations
 
 import json
 
+# #wrapper-reply-channels increment B: every CLI invocation below is written
+# ONCE, in PowerShell form (the majority-population default and the shape
+# every rules string was already hardcoded to) - a single, exact, literal
+# substring appears at every invocation site with no quoting variants. A
+# wrapped child's ACTUAL shell may not be PowerShell (a claude seat's Bash
+# tool is git-bash; codex's default terminal is PowerShell - see
+# supervisor.resolve_reply_shell), so the assembled prompt is rewritten to
+# bash form as the LAST step before it is returned, rather than duplicating
+# every rules string in two shells. `& "..."` is PowerShell's call operator,
+# meaningless (and a syntax error) in bash; `$env:NAME` is PowerShell's own
+# env-var syntax, `$NAME` is bash's - dropping both is the complete, correct
+# translation for every invocation this module renders.
+_POWERSHELL_INVOCATION = '& "$env:AGENTTALK_PY" -m agenttalk'
+_BASH_INVOCATION = '"$AGENTTALK_PY" -m agenttalk'
+
+
+def _render_for_shell(text: str, shell: str) -> str:
+    """Rewrite every PowerShell CLI invocation in ``text`` to bash form when
+    ``shell == "bash"``. Any other value (including the default
+    ``"powershell"``) leaves ``text`` byte-identical to today."""
+    if shell == "bash":
+        return text.replace(_POWERSHELL_INVOCATION, _BASH_INVOCATION)
+    return text
+
 _BUS_COMMAND_CONTRACT = (
     "BUS-COMMAND CONTRACT: for any agenttalk bus command you are allowed to send, "
     "stay in the current project WORKSPACE cwd and use its AGENTTALK_ROOT when set. "
@@ -126,7 +150,8 @@ _DEFAULT_RULES = (
 def assemble_turn_prompt(record: dict, *, rules: str | None = None,
                          rejoin: str | None = None,
                          lessons: str | None = None,
-                         sender_is_lead: bool | None = None) -> str:
+                         sender_is_lead: bool | None = None,
+                         shell: str = "powershell") -> str:
     """Render one inbound recv_api record into the per-turn prompt string.
 
     ``sender_is_lead`` (#163) is a FACT the CALLER already computed against
@@ -136,6 +161,12 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
     roster state itself from inside otherwise-untrusted message data. Omit
     (leave ``None``) when the caller has no store context (e.g. tests
     exercising rendering in isolation); the header line is skipped.
+
+    ``shell`` (#wrapper-reply-channels increment B) selects which shell form
+    every rendered CLI invocation uses - ``"powershell"`` (the default,
+    unchanged from before this parameter existed) or ``"bash"``. The caller
+    resolves this from the wrapped child's own CLI/config
+    (``supervisor.resolve_reply_shell``), never guessed here.
     """
     rules = _DEFAULT_RULES if rules is None else rules
     out: list[str] = []
@@ -205,32 +236,61 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
         # commands (the dogfood claude seat: 5/5 turns undeliverable) can still
         # answer with nothing but its structured Write tool; the wrapper
         # validates and publishes the draft with exact thread correlation.
+        # #wrapper-reply-channels increment B: state the channel(s) per
+        # inbound kind EXPLICITLY, rather than one generic paragraph every
+        # kind shares - task now has its own typed CLI form to name (draft
+        # path was silently unusable for it before increment A; a plain
+        # `agenttalk reply` with no --kind on a task thread publishes as
+        # kind=message, not the task-response the thread actually needs).
+        is_task = record.get("kind") == "task"
         reply_draft = record.get("reply_draft")
         if isinstance(reply_draft, dict) and reply_draft.get("path"):
             out += [
                 "== HOW TO REPLY: PREFERRED DRAFT CHANNEL (works in every sandbox) ==",
                 "Write your COMPLETE reply body (UTF-8, multi-line fine, up to 1 MiB) "
                 "to exactly this file with your structured Write/Edit tool, then end "
-                "your turn — the wrapper validates and delivers it on this thread:",
+                "your turn — the wrapper validates and delivers it on this thread"
+                + (" as a typed task-response (no separate --kind needed on this "
+                   "channel):" if is_task else ":"),
                 f"  {reply_draft['path']}",
                 "If your harness can run shell commands you may INSTEAD use the reply "
                 "command below. Use ONE channel, never both.",
             ]
+        out += ["== HOW TO REPLY TO THIS MESSAGE (exact form) =="]
+        if is_task:
+            out += [
+                "This is a task thread: your reply MUST be a typed CLI reply with "
+                "--kind task-response (the draft channel above, if shown, already "
+                "publishes as task-response on its own - only the CLI form below needs "
+                "the flag spelled out).",
+                f"  & \"$env:AGENTTALK_PY\" -m agenttalk reply {anchor} --kind task-response "
+                "-m 'your answer here'",
+                "Multi-line answer: FIRST write it to a file with your Write tool, then "
+                "send that file (inline multi-line text in -m is corrupted by shell quoting):",
+                f"  & \"$env:AGENTTALK_PY\" -m agenttalk reply {anchor} --kind task-response "
+                "--file <path-you-just-wrote>",
+                "Declining the work still needs a typed response, never a bare refusal or "
+                "--na: add --meta status=declined --meta reason=<why>.",
+            ]
+        else:
+            out += [
+                "Answer on THIS thread with ONE command. Short, single-line answer:",
+                f"  & \"$env:AGENTTALK_PY\" -m agenttalk reply {anchor} -m 'your answer here'",
+                "Code, or ANY multi-line answer: FIRST write it to a file with your Write tool, "
+                "then send that file (inline multi-line text in -m is corrupted by shell "
+                "quoting):",
+                f"  & \"$env:AGENTTALK_PY\" -m agenttalk reply {anchor} --file <path-you-just-wrote>",
+                "For review-result / proposal-response add --kind <status> and typed --meta "
+                "key=value (repeatable). To decline an unrelated broadcast add --na instead of "
+                "a body.",
+            ]
         out += [
-            "== HOW TO REPLY TO THIS MESSAGE (exact form) ==",
-            "Answer on THIS thread with ONE command. Short, single-line answer:",
-            f"  & \"$env:AGENTTALK_PY\" -m agenttalk reply {anchor} -m 'your answer here'",
-            "Code, or ANY multi-line answer: FIRST write it to a file with your Write tool, then "
-            "send that file (inline multi-line text in -m is corrupted by shell quoting):",
-            f"  & \"$env:AGENTTALK_PY\" -m agenttalk reply {anchor} --file <path-you-just-wrote>",
-            "For review-result / proposal-response add --kind <status> and typed --meta key=value "
-            "(repeatable). To decline an unrelated broadcast add --na instead of a body.",
             "The ONLY valid flags are: --from, --to-request (or --to-id <message-id>), --kind, "
             "-m/--message, --file, --meta, --na. There is NO --to, --request-id, or --body; "
             "inventing a flag errors and wastes the turn. Send the reply ONCE; do not retry variants.",
         ]
     out += ["== HOW TO HANDLE ==", rules]
-    return "\n".join(out)
+    return _render_for_shell("\n".join(out), shell)
 
 
 # WP3: the SYNTHETIC cadence (proactive-sweep) turn. The wrapper drives this when the
@@ -280,10 +340,15 @@ _CADENCE_RULES = (
 
 
 def assemble_cadence_prompt(snapshot: dict, items: list, *,
-                            rules: str | None = None) -> str:
+                            rules: str | None = None,
+                            shell: str = "powershell") -> str:
     """Render the bounded cadence SNAPSHOT + actionable items into the synthetic-turn
     prompt string (WP3). Pure + testable; carries ids + summaries only (the wrapper
-    already capped/truncated the snapshot and stripped the lease token)."""
+    already capped/truncated the snapshot and stripped the lease token).
+
+    ``shell`` - see :func:`assemble_turn_prompt`'s own docstring; identical
+    contract, same default.
+    """
     rules = _CADENCE_RULES if rules is None else rules
     out: list[str] = ["== PROACTIVE CADENCE SWEEP (no inbound message) =="]
     out.append("== ACTIONABLE ITEMS (act on these, then stop) ==")
@@ -295,4 +360,4 @@ def assemble_cadence_prompt(snapshot: dict, items: list, *,
     out.append(json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True))
     out.append("```")
     out += ["== HOW TO HANDLE ==", rules]
-    return "\n".join(out)
+    return _render_for_shell("\n".join(out), shell)
