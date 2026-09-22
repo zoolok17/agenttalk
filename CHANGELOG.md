@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **OVH/Qwen gateway moved to `Qwen3.8-27B` on OVH's unified endpoint.**
+  `MODEL_ALIAS` -> `Qwen3.8-27B`; `DEFAULT_API_BASE` ->
+  `https://oai.endpoints.kepler.ai.cloud.ovh.net/v1` (the model is now
+  selected by name in the request body, not a per-model hostname).
+  Tariff re-pinned from the OVH catalog observed 2026-09-22: settlement
+  EUR 0.40/M input, EUR 2.70/M output (was 0.60 / 3.60); reservation
+  stays tariff+20%. Development child-turn caps raised: 8 -> 64 provider
+  calls, 300 -> 1800 seconds, EUR 0.50 -> EUR 3.00 per turn; fail-closed
+  semantics unchanged. `price_policy_hash`, `child_cap_policy_hash`, and
+  `CHILD_CAP_SCHEMA_VERSION` (1 -> 2) all change as a result, which
+  invalidates every previously accepted dashboard canary and blocks
+  `gateway reconfigure` against a pre-existing install (it is scoped to
+  endpoint-only changes) - see `docs/QWEN-OVH-TRIAL.md`'s "2026-09-22
+  endpoint change" section for the required re-init sequence and why.
+
 ## [0.89.0] - 2026-09-17
 
 Theme: **the last field fixes before the freeze - what the first

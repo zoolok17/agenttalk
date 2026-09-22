@@ -9,21 +9,86 @@ read or modify the gateway state, tokens, key, or spend ledger. The controls
 below bound accidental and crash-driven use; they do not defend against a
 hostile same-user process.
 
+## 2026-09-22 endpoint change
+
+Moved from the old per-model host to OVH's unified OpenAI-compatible
+endpoint and its `Qwen3.8-27B` deployment:
+
+- Model alias: `Qwen3.5-397B-A17B` -> `Qwen3.8-27B`.
+- API base: the old per-model host -> `https://oai.endpoints.kepler.ai.cloud.ovh.net/v1`
+  (the model is now selected by name in the request body, not by hostname).
+- Tariff (OVH catalog, observed 2026-09-22): settlement EUR 0.40/M input,
+  EUR 2.70/M output (was 0.60 / 3.60); reservation stays tariff+20% (EUR
+  0.48/M input, EUR 3.24/M output). `MAX_CONTEXT_TOKENS` unchanged at
+  262144. Maximum one-attempt reservation is now EUR 0.139102 (was
+  0.206439).
+- Development child-turn caps raised: 8 -> 64 provider calls, 300 -> 1800
+  seconds, EUR 0.50 -> EUR 3.00 of settled/reserved exposure per turn.
+  Fail-closed semantics are unchanged: the first ceiling a turn reaches
+  still ends it, and later calls in that turn are still refused before
+  transport.
+
+Both `price_policy_hash` and `child_cap_policy_hash` change as a direct
+result (they hash the values above). **This invalidates every previously
+accepted dashboard canary and every existing install's manifest**, not just
+the ledger's child-cap gate:
+
+- `canary-verify` binds to a `settled` attempt whose stored `policy_hash`
+  equals the *current* `price_policy_hash()` (`ovh_gateway.py`,
+  `SpendLedger.canary_verify` and the dashboard-canary read path) - a
+  canary accepted under the old tariff can never satisfy that check again,
+  by design.
+- `agenttalk gateway reconfigure` is scoped to an **endpoint-only** change:
+  `_reconfigure_endpoint_locked` refuses with `gateway install manifest
+  price policy mismatch` whenever the existing install manifest's
+  `price_policy_hash` (frozen at `init` time) no longer matches the
+  running code's `price_policy_hash()` - which is exactly this change,
+  confirmed by reading that guard, not assumed. `SpendLedger.initialize`
+  is equally strict the other way: it refuses over an existing ledger
+  (`installation_state() != "absent"`), so there is no in-place
+  price-policy migration for the ledger either.
+
+So, for an install that predates this change, `reconfigure` alone does
+**not** apply it - the operator instead reruns the full one-time setup
+against fresh state (same as any other tariff update), then re-accepts the
+canary:
+
+```powershell
+agenttalk gateway stop --timeout 30
+# Back up/remove the existing .agenttalk/gateway config+manifest and the
+# %LOCALAPPDATA%\agenttalk-ovh ledger/marker before re-init - `init` refuses
+# to run over any of them. Preserve the removed ledger for reconciliation
+# records; its balance becomes the new --opening-eur evidence.
+agenttalk gateway init --litellm-executable C:\path\to\litellm.exe `
+  --opening-eur <observed OVH dashboard balance> `
+  --opening-evidence "OVH AI Endpoints dashboard, observed 2026-09-22"
+agenttalk gateway task-install
+agenttalk gateway start
+agenttalk gateway status
+agenttalk doctor
+# Then the Live Acceptance step below, mandatory again under the new hash:
+agenttalk gateway canary-verify ATTEMPT_ID --dashboard-delta-eur OBSERVED_DELTA
+```
+
+A brand-new install (no prior `.agenttalk/gateway` state) just follows
+"One-Time Morning Setup" below unchanged - `init` was never going to hit
+the mismatch above since there is nothing to mismatch against yet.
+
 ## Fixed Trial Policy
 
 - Provider route: Claude Code -> `127.0.0.1:4000` -> LiteLLM on
   `127.0.0.1:4001` -> OVH OpenAI Chat Completions.
-- Model: `Qwen3.5-397B-A17B` only.
-- Settlement rates: OVH's EUR tariff, EUR 0.60/M input tokens and EUR 3.60/M
+- Model: `Qwen3.8-27B` only.
+- Settlement rates: OVH's EUR tariff, EUR 0.40/M input tokens and EUR 2.70/M
   output tokens.
-- Reservation rates: the tariff plus 20%, EUR 0.72/M input tokens and EUR
-  4.32/M output tokens.
+- Reservation rates: the tariff plus 20%, EUR 0.48/M input tokens and EUR
+  3.24/M output tokens.
 - Gateway maximum output: 4096 tokens; the wrapped Claude child is additionally
   forced to `CLAUDE_CODE_MAX_OUTPUT_TOKENS=2048`. Maximum input context: 262144
   tokens. Maximum public request body: 512 KiB.
-- Maximum one-attempt reservation: EUR 0.206439.
-- Maximum one wrapped child turn: 8 provider calls, EUR 0.50 of settled or
-  reserved exposure, and 300 seconds from its first durable opening. The first
+- Maximum one-attempt reservation: EUR 0.139102.
+- Maximum one wrapped child turn: 64 provider calls, EUR 3.00 of settled or
+  reserved exposure, and 1800 seconds from its first durable opening. The first
   reached ceiling closes that turn; later calls are refused before transport.
 - Trial cutoff: EUR 25; operator soft stop: EUR 20.
 - External account ceiling: EUR 100. Initialization and readiness require the
@@ -139,7 +204,7 @@ Claude executable tail:
 {
   "cli": "claude",
   "wrapped": true,
-  "model": "Qwen3.5-397B-A17B",
+  "model": "Qwen3.8-27B",
   "backend_profile": "ovh-qwen",
   "trust_class": "external-worker"
 }
@@ -270,7 +335,7 @@ agenttalk gateway canary-verify ATTEMPT_ID --dashboard-delta-eur OBSERVED_DELTA
 ```
 
 The delta must be nonzero and within 10% of the ledger's tariff-derived
-settlement. The deterministic 1000-input/100-output fixture settles to 960
-micro-EUR, so its tolerance is 96 micro-EUR. The command persists the numeric
+settlement. The deterministic 1000-input/100-output fixture settles to 670
+micro-EUR, so its tolerance is 67 micro-EUR. The command persists the numeric
 comparison; zero or out-of-tolerance deltas set a durable
 `dashboard_canary_mismatch` hold and return nonzero before the worker launches.
