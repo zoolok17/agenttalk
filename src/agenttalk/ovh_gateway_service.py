@@ -23,10 +23,13 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from .ovh_gateway import (
+    EXTERNAL_CEILING_MICRO_EUR,
     INTERNAL_HOST,
     INTERNAL_PORT,
     PUBLIC_HOST,
     PUBLIC_PORT,
+    SOFT_STOP_MICRO_EUR,
+    TRIAL_CUTOFF_MICRO_EUR,
     GatewayConfigError,
     LedgerBlocked,
     LedgerHold,
@@ -884,6 +887,9 @@ def initialize_install(
     ledger: SpendLedger | None = None,
     front_token_path: Path | None = None,
     internal_token_path: Path | None = None,
+    trial_cutoff_micro_eur: int = TRIAL_CUTOFF_MICRO_EUR,
+    soft_stop_micro_eur: int = SOFT_STOP_MICRO_EUR,
+    external_ceiling_micro_eur: int = EXTERNAL_CEILING_MICRO_EUR,
 ) -> dict:
     """One-time state setup. It intentionally does not activate a task or key."""
     root = canonical_project_root(root)
@@ -898,6 +904,9 @@ def initialize_install(
             ledger=ledger,
             front_token_path=front_token_path,
             internal_token_path=internal_token_path,
+            trial_cutoff_micro_eur=trial_cutoff_micro_eur,
+            soft_stop_micro_eur=soft_stop_micro_eur,
+            external_ceiling_micro_eur=external_ceiling_micro_eur,
         )
 
 
@@ -911,6 +920,9 @@ def _initialize_install_locked(
     ledger: SpendLedger | None,
     front_token_path: Path | None,
     internal_token_path: Path | None,
+    trial_cutoff_micro_eur: int = TRIAL_CUTOFF_MICRO_EUR,
+    soft_stop_micro_eur: int = SOFT_STOP_MICRO_EUR,
+    external_ceiling_micro_eur: int = EXTERNAL_CEILING_MICRO_EUR,
 ) -> dict:
     if api_base != DEFAULT_API_BASE:
         raise GatewayConfigError("gateway install requires the pinned OVH API base")
@@ -935,6 +947,9 @@ def _initialize_install_locked(
         opening_micro_eur=opening_micro_eur,
         opening_evidence=opening_evidence,
         child_cap_issuer_token=front_token,
+        trial_cutoff_micro_eur=trial_cutoff_micro_eur,
+        soft_stop_micro_eur=soft_stop_micro_eur,
+        external_ceiling_micro_eur=external_ceiling_micro_eur,
     )
     _durable_write_bytes(
         config_path,

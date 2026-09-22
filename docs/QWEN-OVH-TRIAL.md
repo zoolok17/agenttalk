@@ -239,6 +239,46 @@ The policy hash is persisted in the install marker, ledger, config manifest,
 runtime marker, readiness result, and status output. A mismatch blocks startup
 or transport.
 
+## Envelope at Init
+
+The trial cutoff, soft-stop, and external ceiling above are `agenttalk gateway
+init` parameters, not fixed module constants: `--cutoff-eur`, `--soft-stop-eur`,
+and `--ceiling-eur`, each in EUR (up to six decimal places, same parsing as
+`--opening-eur`). Their defaults are exactly the EUR 95/90/100 figures documented
+above, so an unchanged `init` invocation produces the identical `price_policy_hash`
+it always has. This lets two independent gateway installs on two different hosts
+share one operator-level spend allocation without either one's code changing -
+for example, an Ubuntu VM gateway capped at `--cutoff-eur 40` alongside a desktop
+gateway left at the default (effectively EUR 95), together never exceeding the
+EUR 100 external ceiling each install still enforces on its own. There is no
+cross-ledger accounting: each installation's ledger is independent and enforces
+only its own envelope; keeping two installs' cutoffs from summing past a shared
+comfort level is the operator's own arithmetic when choosing `--cutoff-eur` for
+each one, the same way the desktop figures above were chosen.
+
+`init` validates `soft-stop < cutoff <= ceiling` and refuses (`PolicyBlocked`) a
+malformed envelope before any state is written. The chosen envelope is pinned
+into the ledger's metadata under the same hash discipline as everything else in
+"Fixed Trial Policy": a different envelope is a different `price_policy_hash`,
+so an existing install's `reconfigure`/`runtime-rebind`/`start` all continue to
+refuse a mismatch rather than silently reinterpreting an old ledger under new
+numbers. Changing the envelope of an existing install means the same re-init
+procedure as any other price-policy change (see "2026-09-22 endpoint change"
+above): stop the gateway, remove the existing `.agenttalk/gateway` state and the
+`%LOCALAPPDATA%\agenttalk-ovh` (or, on Linux, `~/.local/share/agenttalk-ovh`)
+ledger/marker, then re-run `init` with the new `--cutoff-eur`/`--soft-stop-eur`/
+`--ceiling-eur` and re-accept the canary.
+
+The per-turn cost cap (`CHILD_TURN_MAX_MICRO_EUR` in "Fixed Trial Policy") is not
+an independent `init` flag: by design it is always set equal to whichever cutoff
+was chosen (EUR 40 for `--cutoff-eur 40`, EUR 95 for the default), so the
+ledger's own cutoff/ceiling stay the only limits a turn can actually hit live,
+exactly as before. `agenttalk gateway status` prints the resolved envelope for
+the running install (`trial_cutoff_micro_eur`, `soft_stop_micro_eur`,
+`external_ceiling_micro_eur`, and, once the child-turn cap feature is ready
+(`child_cap_ready: true` - already the case right after a fresh `init`),
+`child_turn_max_micro_eur`) alongside the existing `policy_hash` field.
+
 ## Boundaries
 
 The public front accepts only `POST /v1/messages` or the Claude Code compatibility
@@ -318,6 +358,66 @@ directory. The provider key, gateway tokens, spend ledger, and bounded child
 log remain under `%LOCALAPPDATA%\agenttalk-ovh`.
 Status and doctor use only the local liveliness route; they do not call OVH or
 spend money.
+
+## Linux Host
+
+The gateway runs on a Linux host too, behind the exact same `agenttalk
+gateway ...` CLI verbs used above. The service backend is selected
+automatically by `sys.platform` - there is no separate Linux CLI or flag.
+Instead of a Windows Scheduled Task, `task-install`/`start`/`stop` drive a
+systemd **user** unit at
+`~/.config/systemd/user/agenttalk-qwen-gateway-<id>.service` (the same
+project-identity digest the Windows task name already uses) via
+`systemctl --user enable|start|stop`. The secret directory is unchanged:
+`default_secret_dir()` already resolves to `~/.local/share/agenttalk-ovh` on
+Linux (`LOCALAPPDATA` is unset, so it falls back to `~/.local/share`) - put
+the OVH key at `~/.local/share/agenttalk-ovh/api_key.txt` there instead of
+under `%LOCALAPPDATA%`.
+
+A systemd **user** unit only runs while its user has an active login session
+(or a lingering one). This project deliberately does not run
+`loginctl enable-linger` for the operator - that is a host-level decision
+with its own effect on the account beyond this gateway, so it is documented
+here, not executed by any `agenttalk` command:
+
+```bash
+loginctl enable-linger "$(whoami)"
+```
+
+Run that once on a fresh VM, as the same user that will run the gateway, if
+the gateway should stay up across logout/reboot without a live session.
+
+### Fresh VM install
+
+Exact operator commands for a fresh Ubuntu VM, using a project-local
+virtualenv and a `--cutoff-eur 40` envelope (see "Envelope at Init" above)
+so this VM's own spend stays inside its own EUR 40 share of the operator's
+overall allocation:
+
+```bash
+python -m venv .venv
+.venv/bin/pip install /path/to/agenttalk-*.whl
+.venv/bin/agenttalk gateway init \
+  --litellm-executable /path/to/litellm \
+  --opening-eur 0 \
+  --opening-evidence "OVH AI Endpoints dashboard, observed <date>" \
+  --cutoff-eur 40
+.venv/bin/agenttalk gateway cap-install
+.venv/bin/agenttalk gateway task-install
+.venv/bin/agenttalk gateway start
+.venv/bin/agenttalk gateway status
+```
+
+`cap-install` (documented under "Spend and Failure Semantics") is included
+above for parity with an existing schema-v1 ledger being migrated onto a new
+host; a fresh `init` already creates a ledger with the child-turn cap feature
+active (`gateway status`'s `child_cap_ready` is `true` immediately after
+`init`), so on a genuinely fresh VM install it is a harmless, idempotent
+confirmation, not a required activation step. Everything after `init`
+(`cap-install`, `task-install`, `start`, `status`, `stop`, `reconfigure`,
+`runtime-rebind`, `hold`/`clear-hold`, `reconcile`, `canary-verify`) is
+identical to the Windows walkthrough above; only the underlying service
+backend differs.
 
 ## Wrapped Worker Configuration
 

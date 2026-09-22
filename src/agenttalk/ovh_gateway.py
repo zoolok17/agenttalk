@@ -132,8 +132,22 @@ def reservation_cost_micro_eur() -> int:
     )
 
 
-def price_policy() -> dict:
-    """Canonical non-secret policy object whose digest binds persisted state."""
+def price_policy(
+    *,
+    trial_cutoff_micro_eur: int = TRIAL_CUTOFF_MICRO_EUR,
+    soft_stop_micro_eur: int = SOFT_STOP_MICRO_EUR,
+    external_ceiling_micro_eur: int = EXTERNAL_CEILING_MICRO_EUR,
+) -> dict:
+    """Canonical non-secret policy object whose digest binds persisted state.
+
+    The three envelope figures are parameters, not bare constants: each
+    ledger pins its OWN chosen envelope at ``initialize()`` time (operator
+    ``gateway init --cutoff-eur``/``--soft-stop-eur``/``--ceiling-eur``), and
+    every caller after that reads the envelope back from that ledger's own
+    metadata, never from the module defaults below - the defaults exist only
+    so that an unchanged call site (and an unchanged CLI invocation) keeps
+    producing today's hash.
+    """
     return {
         "schema_version": 1,
         "model": MODEL_ALIAS,
@@ -153,9 +167,9 @@ def price_policy() -> dict:
             "max_output_tokens": MAX_OUTPUT_TOKENS,
             "worst_case_micro_eur": reservation_cost_micro_eur(),
         },
-        "trial_cutoff_micro_eur": TRIAL_CUTOFF_MICRO_EUR,
-        "soft_stop_micro_eur": SOFT_STOP_MICRO_EUR,
-        "external_ceiling_micro_eur": EXTERNAL_CEILING_MICRO_EUR,
+        "trial_cutoff_micro_eur": trial_cutoff_micro_eur,
+        "soft_stop_micro_eur": soft_stop_micro_eur,
+        "external_ceiling_micro_eur": external_ceiling_micro_eur,
         "dashboard_canary": {
             "requires_nonzero_delta": True,
             "tolerance_basis_points": CANARY_TOLERANCE_BPS,
@@ -163,27 +177,50 @@ def price_policy() -> dict:
     }
 
 
-def price_policy_hash() -> str:
+def price_policy_hash(
+    *,
+    trial_cutoff_micro_eur: int = TRIAL_CUTOFF_MICRO_EUR,
+    soft_stop_micro_eur: int = SOFT_STOP_MICRO_EUR,
+    external_ceiling_micro_eur: int = EXTERNAL_CEILING_MICRO_EUR,
+) -> str:
     encoded = json.dumps(
-        price_policy(), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        price_policy(
+            trial_cutoff_micro_eur=trial_cutoff_micro_eur,
+            soft_stop_micro_eur=soft_stop_micro_eur,
+            external_ceiling_micro_eur=external_ceiling_micro_eur,
+        ),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
-def child_cap_policy() -> dict:
-    """Canonical separately-versioned child-turn admission policy."""
+def child_cap_policy(*, child_turn_max_micro_eur: int = CHILD_TURN_MAX_MICRO_EUR) -> dict:
+    """Canonical separately-versioned child-turn admission policy.
+
+    ``child_turn_max_micro_eur`` is a parameter for the same reason the three
+    ``price_policy`` envelope figures are: it is chosen once per ledger (by
+    default, equal to that ledger's own trial cutoff) and read back from
+    metadata thereafter, never from the module default below.
+    """
     return {
         "schema_version": CHILD_CAP_SCHEMA_VERSION,
         "max_calls": CHILD_TURN_MAX_CALLS,
-        "max_micro_eur": CHILD_TURN_MAX_MICRO_EUR,
+        "max_micro_eur": child_turn_max_micro_eur,
         "max_seconds": CHILD_TURN_MAX_SECONDS,
         "reservation_micro_eur": reservation_cost_micro_eur(),
     }
 
 
-def child_cap_policy_hash() -> str:
+def child_cap_policy_hash(
+    *, child_turn_max_micro_eur: int = CHILD_TURN_MAX_MICRO_EUR
+) -> str:
     encoded = json.dumps(
-        child_cap_policy(), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        child_cap_policy(child_turn_max_micro_eur=child_turn_max_micro_eur),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -422,17 +459,54 @@ class SpendLedger:
         return value
 
     @staticmethod
-    def _assert_external_envelope(opening_micro_eur: int) -> None:
+    def _assert_external_envelope(
+        opening_micro_eur: int,
+        *,
+        trial_cutoff_micro_eur: int,
+        external_ceiling_micro_eur: int,
+    ) -> None:
         projected = (
             opening_micro_eur
-            + TRIAL_CUTOFF_MICRO_EUR
+            + trial_cutoff_micro_eur
             + reservation_cost_micro_eur()
         )
-        if projected > EXTERNAL_CEILING_MICRO_EUR:
+        if projected > external_ceiling_micro_eur:
             raise PolicyBlocked(
                 "opening balance plus trial cutoff and one reservation exceeds "
                 "the external account ceiling"
             )
+
+    @staticmethod
+    def _validated_envelope(
+        trial_cutoff_micro_eur: object,
+        soft_stop_micro_eur: object,
+        external_ceiling_micro_eur: object,
+    ) -> tuple[int, int, int]:
+        parsed: dict[str, int] = {}
+        for name, value in (
+            ("cutoff", trial_cutoff_micro_eur),
+            ("soft-stop", soft_stop_micro_eur),
+            ("ceiling", external_ceiling_micro_eur),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise PolicyBlocked(f"envelope {name} must be a non-negative integer")
+            parsed[name] = value
+        if not parsed["soft-stop"] < parsed["cutoff"] <= parsed["ceiling"]:
+            raise PolicyBlocked(
+                "envelope must satisfy soft-stop < cutoff <= ceiling"
+            )
+        return parsed["cutoff"], parsed["soft-stop"], parsed["ceiling"]
+
+    @staticmethod
+    def _parse_envelope_int(metadata: dict[str, str], key: str) -> int:
+        raw = metadata.get(key)
+        try:
+            value = int(raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError) as exc:
+            raise LedgerBlocked(f"ledger metadata {key} is invalid") from exc
+        if str(value) != raw or value < 0:
+            raise LedgerBlocked(f"ledger metadata {key} is invalid")
+        return value
 
     def initialize(
         self,
@@ -441,6 +515,10 @@ class SpendLedger:
         opening_evidence: str,
         generation: str | None = None,
         child_cap_issuer_token: str | None = None,
+        trial_cutoff_micro_eur: int = TRIAL_CUTOFF_MICRO_EUR,
+        soft_stop_micro_eur: int = SOFT_STOP_MICRO_EUR,
+        external_ceiling_micro_eur: int = EXTERNAL_CEILING_MICRO_EUR,
+        child_turn_max_micro_eur: int | None = None,
     ) -> dict:
         if self.installation_state() != "absent":
             raise LedgerBlocked(
@@ -449,7 +527,32 @@ class SpendLedger:
         opening_micro_eur = self._opening_amount(opening_micro_eur)
         opening_evidence = self._opening_evidence(opening_evidence)
         issuer_hash = self._child_cap_issuer_hash(child_cap_issuer_token)
-        self._assert_external_envelope(opening_micro_eur)
+        trial_cutoff_micro_eur, soft_stop_micro_eur, external_ceiling_micro_eur = (
+            self._validated_envelope(
+                trial_cutoff_micro_eur, soft_stop_micro_eur, external_ceiling_micro_eur
+            )
+        )
+        # By design (unchanged from the historical single-envelope constants):
+        # the per-turn cap defaults to the chosen trial cutoff, so the
+        # ledger's own cutoff/ceiling stay the only limits a turn can hit
+        # live. A caller MAY decouple it explicitly (e.g. a test that wants
+        # to reach the per-turn ceiling without exhausting the whole trial
+        # cutoff first) - the CLI never does.
+        if child_turn_max_micro_eur is None:
+            child_turn_max_micro_eur = trial_cutoff_micro_eur
+        elif (
+            not isinstance(child_turn_max_micro_eur, int)
+            or isinstance(child_turn_max_micro_eur, bool)
+            or child_turn_max_micro_eur < 0
+        ):
+            raise PolicyBlocked(
+                "envelope child turn cap must be a non-negative integer"
+            )
+        self._assert_external_envelope(
+            opening_micro_eur,
+            trial_cutoff_micro_eur=trial_cutoff_micro_eur,
+            external_ceiling_micro_eur=external_ceiling_micro_eur,
+        )
         now = self.now().astimezone(timezone.utc)
         observed_at = _iso_utc(now)
         opening_period = _period(now)
@@ -467,11 +570,15 @@ class SpendLedger:
                 values = {
                     "schema_version": str(LEDGER_SCHEMA_VERSION),
                     "generation": generation,
-                    "price_policy_hash": price_policy_hash(),
+                    "price_policy_hash": price_policy_hash(
+                        trial_cutoff_micro_eur=trial_cutoff_micro_eur,
+                        soft_stop_micro_eur=soft_stop_micro_eur,
+                        external_ceiling_micro_eur=external_ceiling_micro_eur,
+                    ),
                     "currency": POLICY_CURRENCY,
-                    "trial_cutoff_micro_eur": str(TRIAL_CUTOFF_MICRO_EUR),
-                    "soft_stop_micro_eur": str(SOFT_STOP_MICRO_EUR),
-                    "external_ceiling_micro_eur": str(EXTERNAL_CEILING_MICRO_EUR),
+                    "trial_cutoff_micro_eur": str(trial_cutoff_micro_eur),
+                    "soft_stop_micro_eur": str(soft_stop_micro_eur),
+                    "external_ceiling_micro_eur": str(external_ceiling_micro_eur),
                     "opening_micro_eur": str(opening_micro_eur),
                     "opening_evidence": opening_evidence,
                     "opening_observed_at": observed_at,
@@ -481,7 +588,10 @@ class SpendLedger:
                     "last_accepted_period": opening_period,
                     "service_hold": "",
                     "child_cap_schema_version": str(CHILD_CAP_SCHEMA_VERSION),
-                    "child_cap_policy_hash": child_cap_policy_hash(),
+                    "child_cap_policy_hash": child_cap_policy_hash(
+                        child_turn_max_micro_eur=child_turn_max_micro_eur
+                    ),
+                    "child_turn_max_micro_eur": str(child_turn_max_micro_eur),
                     "child_cap_issuer_sha256": issuer_hash,
                 }
                 conn.execute("BEGIN IMMEDIATE")
@@ -501,7 +611,11 @@ class SpendLedger:
                 "schema_version": INSTALL_MARKER_SCHEMA_VERSION,
                 "ledger_schema_version": LEDGER_SCHEMA_VERSION,
                 "generation": generation,
-                "price_policy_hash": price_policy_hash(),
+                "price_policy_hash": price_policy_hash(
+                    trial_cutoff_micro_eur=trial_cutoff_micro_eur,
+                    soft_stop_micro_eur=soft_stop_micro_eur,
+                    external_ceiling_micro_eur=external_ceiling_micro_eur,
+                ),
                 "opening_micro_eur": opening_micro_eur,
                 "opening_evidence_sha256": evidence_hash,
                 "opening_observed_at": observed_at,
@@ -622,11 +736,20 @@ class SpendLedger:
                 if ledger_schema_version is None
                 else ledger_schema_version
             ),
-            "price_policy_hash": price_policy_hash(),
         }
         for key, value in expected.items():
             if marker.get(key) != value:
                 raise LedgerBlocked(f"ledger install marker {key} mismatch")
+        # price_policy_hash depends on this ledger's own chosen envelope,
+        # which is not known yet at this point (the database metadata - the
+        # envelope's authority - has not been opened). Validate shape here;
+        # _verify_metadata cross-checks this value against the database's
+        # own recomputed hash once the envelope is readable.
+        marker_policy_hash = marker.get("price_policy_hash")
+        if not isinstance(marker_policy_hash, str) or not re.fullmatch(
+            r"[a-f0-9]{64}", marker_policy_hash
+        ):
+            raise LedgerBlocked("ledger install marker price_policy_hash mismatch")
         generation = marker.get("generation")
         if not isinstance(generation, str) or not _ATTEMPT_ID_RE.fullmatch(generation):
             raise LedgerBlocked("ledger install marker generation is invalid")
@@ -695,15 +818,35 @@ class SpendLedger:
                 else ledger_schema_version
             ),
             "generation": marker["generation"],
-            "price_policy_hash": price_policy_hash(),
             "currency": POLICY_CURRENCY,
-            "trial_cutoff_micro_eur": str(TRIAL_CUTOFF_MICRO_EUR),
-            "soft_stop_micro_eur": str(SOFT_STOP_MICRO_EUR),
-            "external_ceiling_micro_eur": str(EXTERNAL_CEILING_MICRO_EUR),
         }
         for key, value in expected.items():
             if metadata.get(key) != value:
                 raise LedgerBlocked(f"ledger metadata {key} mismatch")
+        # The envelope (trial cutoff / soft-stop / external ceiling) is
+        # chosen once at init and stored here - never compared against the
+        # current module defaults, which would wrongly reject a deliberately
+        # non-default install (e.g. a 40 EUR VM envelope). Its
+        # price_policy_hash IS recomputed from the STORED envelope plus the
+        # live (non-envelope) pricing constants, so a genuine repricing of
+        # rates/margins/token limits still fails closed; only the envelope
+        # choice itself is exempt from "must match live code" - a different
+        # envelope requires re-init, never a silent match against whatever
+        # the CLI's current default happens to be.
+        stored_cutoff = self._parse_envelope_int(metadata, "trial_cutoff_micro_eur")
+        stored_soft_stop = self._parse_envelope_int(metadata, "soft_stop_micro_eur")
+        stored_ceiling = self._parse_envelope_int(metadata, "external_ceiling_micro_eur")
+        if not stored_soft_stop < stored_cutoff <= stored_ceiling:
+            raise LedgerBlocked("ledger metadata envelope is invalid")
+        recomputed_hash = price_policy_hash(
+            trial_cutoff_micro_eur=stored_cutoff,
+            soft_stop_micro_eur=stored_soft_stop,
+            external_ceiling_micro_eur=stored_ceiling,
+        )
+        if metadata.get("price_policy_hash") != recomputed_hash:
+            raise LedgerBlocked("ledger metadata price_policy_hash mismatch")
+        if marker.get("price_policy_hash") != recomputed_hash:
+            raise LedgerBlocked("ledger install marker price_policy_hash mismatch")
         _parse_utc(metadata.get("initialized_at"))
         _parse_utc(metadata.get("last_accepted_utc"))
         if not _PERIOD_RE.fullmatch(metadata.get("last_accepted_period", "")):
@@ -717,7 +860,11 @@ class SpendLedger:
             raise LedgerBlocked("ledger opening balance is invalid")
         try:
             opening_evidence = self._opening_evidence(metadata.get("opening_evidence"))
-            self._assert_external_envelope(opening_micro_eur)
+            self._assert_external_envelope(
+                opening_micro_eur,
+                trial_cutoff_micro_eur=stored_cutoff,
+                external_ceiling_micro_eur=stored_ceiling,
+            )
         except (ValueError, PolicyBlocked) as exc:
             raise LedgerBlocked("ledger opening balance envelope is invalid") from exc
         observed_at = metadata.get("opening_observed_at")
@@ -788,7 +935,7 @@ class SpendLedger:
                 or canary_attempt["state"] != "settled"
                 or int(canary_attempt["actual_micro_eur"] or 0) != expected
                 or canary_attempt["model"] != MODEL_ALIAS
-                or canary_attempt["policy_hash"] != price_policy_hash()
+                or canary_attempt["policy_hash"] != recomputed_hash
             ):
                 raise LedgerBlocked("dashboard canary attempt binding is invalid")
         return metadata
@@ -822,7 +969,16 @@ class SpendLedger:
             return "absent"
         if schema_value != str(CHILD_CAP_SCHEMA_VERSION):
             raise LedgerBlocked("child cap schema version is missing or mismatched")
-        if policy_value != child_cap_policy_hash():
+        # child_turn_max_micro_eur is this ledger's own pinned envelope value
+        # (default: equal to its trial cutoff) - never the live module
+        # default, for the same reason price_policy_hash is recomputed from
+        # the stored envelope in _verify_metadata rather than compared to it.
+        child_turn_max_micro_eur = self._parse_envelope_int(
+            metadata, "child_turn_max_micro_eur"
+        )
+        if policy_value != child_cap_policy_hash(
+            child_turn_max_micro_eur=child_turn_max_micro_eur
+        ):
             raise LedgerBlocked("child cap policy hash is missing or mismatched")
         if not isinstance(issuer_value, str) or not re.fullmatch(
             r"[a-f0-9]{64}", issuer_value
@@ -869,7 +1025,7 @@ class SpendLedger:
                OR max_calls != ? OR max_micro_eur != ?
             LIMIT 1
             """,
-            (CHILD_TURN_MAX_CALLS, CHILD_TURN_MAX_MICRO_EUR),
+            (CHILD_TURN_MAX_CALLS, child_turn_max_micro_eur),
         ).fetchone()
         if invalid_turn is not None:
             raise LedgerBlocked("child cap turn policy binding is invalid")
@@ -914,7 +1070,7 @@ class SpendLedger:
             return {
                 "installed": False,
                 "schema_version": CHILD_CAP_SCHEMA_VERSION,
-                "policy_hash": child_cap_policy_hash(),
+                "policy_hash": metadata["child_cap_policy_hash"],
             }
         if marker_version != 1:
             raise LedgerBlocked("child cap install requires ledger schema v1 or v2")
@@ -952,6 +1108,15 @@ class SpendLedger:
                         )
                     state = self._child_cap_feature_state(conn, metadata)
                     if state == "absent":
+                        # By design, a migrating ledger's per-turn cap equals
+                        # ITS OWN already-pinned trial cutoff (same default a
+                        # fresh v2 init would choose) - never today's live
+                        # module default, which could differ from what this
+                        # ledger's envelope has actually been since its own
+                        # init.
+                        migrated_child_turn_max_micro_eur = self._parse_envelope_int(
+                            metadata, "trial_cutoff_micro_eur"
+                        )
                         self._create_child_cap_schema(conn)
                         conn.executemany(
                             "INSERT INTO metadata(key, value) VALUES (?, ?)",
@@ -960,7 +1125,16 @@ class SpendLedger:
                                     "child_cap_schema_version",
                                     str(CHILD_CAP_SCHEMA_VERSION),
                                 ),
-                                ("child_cap_policy_hash", child_cap_policy_hash()),
+                                (
+                                    "child_cap_policy_hash",
+                                    child_cap_policy_hash(
+                                        child_turn_max_micro_eur=migrated_child_turn_max_micro_eur
+                                    ),
+                                ),
+                                (
+                                    "child_turn_max_micro_eur",
+                                    str(migrated_child_turn_max_micro_eur),
+                                ),
                                 ("child_cap_issuer_sha256", issuer_hash),
                             ),
                         )
@@ -1005,10 +1179,15 @@ class SpendLedger:
         migrated_marker = dict(marker)
         migrated_marker["ledger_schema_version"] = LEDGER_SCHEMA_VERSION
         _durable_write_json(self.marker_path, migrated_marker)
+        # Re-verify fresh rather than reusing the in-memory `metadata` snapshot
+        # above: in the "absent" branch that snapshot predates the very INSERT
+        # that added child_cap_policy_hash, so it would not have the key.
+        with self._connect() as conn:
+            final_metadata = self._verify_metadata(conn, self._marker())
         return {
             "installed": True,
             "schema_version": CHILD_CAP_SCHEMA_VERSION,
-            "policy_hash": child_cap_policy_hash(),
+            "policy_hash": final_metadata["child_cap_policy_hash"],
         }
 
     @staticmethod
@@ -1184,6 +1363,9 @@ class SpendLedger:
                     raise LedgerHold("gateway has a durable accounting hold")
                 if self._unresolved(conn):
                     raise LedgerHold("an unresolved provider attempt blocks new transport")
+                child_turn_max_micro_eur = self._parse_envelope_int(
+                    metadata, "child_turn_max_micro_eur"
+                )
                 row = conn.execute(
                     "SELECT * FROM child_turns WHERE agent=? AND message_id=?",
                     (agent, message_id),
@@ -1201,7 +1383,7 @@ class SpendLedger:
                             message_id,
                             request_id,
                             CHILD_TURN_MAX_CALLS,
-                            CHILD_TURN_MAX_MICRO_EUR,
+                            child_turn_max_micro_eur,
                             timestamp,
                             expires_at,
                             timestamp,
@@ -1378,13 +1560,23 @@ class SpendLedger:
             if period == metadata["opening_period"]
             else 0
         )
-        if projected > opening_allowance + TRIAL_CUTOFF_MICRO_EUR:
+        # Both figures are THIS ledger's own pinned envelope (metadata,
+        # verified by _verify_metadata), never the live module defaults -
+        # a 40 EUR VM install must be held to its own 40 EUR cutoff, not
+        # whatever today's code-default cutoff happens to be.
+        trial_cutoff_micro_eur = self._parse_envelope_int(
+            metadata, "trial_cutoff_micro_eur"
+        )
+        external_ceiling_micro_eur = self._parse_envelope_int(
+            metadata, "external_ceiling_micro_eur"
+        )
+        if projected > opening_allowance + trial_cutoff_micro_eur:
             raise PolicyBlocked("trial spend cutoff would be exceeded")
         cumulative_row = conn.execute(
             "SELECT COALESCE(SUM(committed_micro_eur), 0) FROM periods"
         ).fetchone()
         cumulative_projected = int(cumulative_row[0]) + unresolved_total + reserve
-        if cumulative_projected > EXTERNAL_CEILING_MICRO_EUR:
+        if cumulative_projected > external_ceiling_micro_eur:
             raise PolicyBlocked("external ceiling would be exceeded")
         try:
             conn.execute(
@@ -1398,7 +1590,7 @@ class SpendLedger:
                     attempt_id,
                     period,
                     model,
-                    price_policy_hash(),
+                    metadata["price_policy_hash"],
                     reserve,
                     timestamp,
                     timestamp,
@@ -1842,6 +2034,7 @@ class SpendLedger:
         with self._connect() as conn:
             self._begin(conn)
             try:
+                metadata = self._verify_metadata(conn, self._marker())
                 row = conn.execute(
                     "SELECT * FROM attempts WHERE attempt_id=?", (attempt_id,)
                 ).fetchone()
@@ -1851,7 +2044,7 @@ class SpendLedger:
                 if (
                     row["state"] != "settled"
                     or row["model"] != MODEL_ALIAS
-                    or row["policy_hash"] != price_policy_hash()
+                    or row["policy_hash"] != metadata["price_policy_hash"]
                     or expected <= 0
                 ):
                     raise LedgerBlocked(
@@ -1986,9 +2179,15 @@ class SpendLedger:
                 "generation": metadata["generation"],
                 "policy_hash": metadata["price_policy_hash"],
                 "currency": metadata["currency"],
-                "trial_cutoff_micro_eur": TRIAL_CUTOFF_MICRO_EUR,
-                "soft_stop_micro_eur": SOFT_STOP_MICRO_EUR,
-                "external_ceiling_micro_eur": EXTERNAL_CEILING_MICRO_EUR,
+                "trial_cutoff_micro_eur": self._parse_envelope_int(
+                    metadata, "trial_cutoff_micro_eur"
+                ),
+                "soft_stop_micro_eur": self._parse_envelope_int(
+                    metadata, "soft_stop_micro_eur"
+                ),
+                "external_ceiling_micro_eur": self._parse_envelope_int(
+                    metadata, "external_ceiling_micro_eur"
+                ),
                 "opening_micro_eur": opening_micro_eur,
                 "opening_evidence": metadata["opening_evidence"],
                 "opening_observed_at": metadata["opening_observed_at"],
@@ -2008,10 +2207,14 @@ class SpendLedger:
                     CHILD_CAP_SCHEMA_VERSION if child_cap_state == "ready" else None
                 ),
                 "child_cap_policy_hash": (
-                    child_cap_policy_hash() if child_cap_state == "ready" else None
+                    metadata["child_cap_policy_hash"] if child_cap_state == "ready" else None
                 ),
                 "child_turn_max_calls": CHILD_TURN_MAX_CALLS,
-                "child_turn_max_micro_eur": CHILD_TURN_MAX_MICRO_EUR,
+                "child_turn_max_micro_eur": (
+                    self._parse_envelope_int(metadata, "child_turn_max_micro_eur")
+                    if child_cap_state == "ready"
+                    else None
+                ),
                 "child_turn_max_seconds": CHILD_TURN_MAX_SECONDS,
                 "active_child_turns": active_child_turns,
                 "ready": accounting_ready,

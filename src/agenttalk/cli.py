@@ -9459,6 +9459,9 @@ def cmd_gateway(args: argparse.Namespace) -> int:
                 litellm_executable=args.litellm_executable,
                 opening_micro_eur=args.opening_micro_eur,
                 opening_evidence=args.opening_evidence,
+                trial_cutoff_micro_eur=args.cutoff_micro_eur,
+                soft_stop_micro_eur=args.soft_stop_micro_eur,
+                external_ceiling_micro_eur=args.ceiling_micro_eur,
             )
         elif action == "task-install":
             service.load_install_manifest(store.root)
@@ -16371,6 +16374,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--opening-evidence",
         required=True,
         help="Short source and observed-at description for the opening balance.",
+    )
+    from agenttalk import ovh_gateway as _gateway_defaults
+
+    gw_init.add_argument(
+        "--cutoff-eur",
+        dest="cutoff_micro_eur",
+        type=_micro_eur_arg,
+        default=_gateway_defaults.TRIAL_CUTOFF_MICRO_EUR,
+        help=(
+            "Trial spend cutoff in EUR for this gateway's own envelope "
+            "(default: today's pinned value; an unchanged invocation is unchanged)."
+        ),
+    )
+    gw_init.add_argument(
+        "--soft-stop-eur",
+        dest="soft_stop_micro_eur",
+        type=_micro_eur_arg,
+        default=_gateway_defaults.SOFT_STOP_MICRO_EUR,
+        help="Soft-stop warning threshold in EUR; must be below --cutoff-eur.",
+    )
+    gw_init.add_argument(
+        "--ceiling-eur",
+        dest="ceiling_micro_eur",
+        type=_micro_eur_arg,
+        default=_gateway_defaults.EXTERNAL_CEILING_MICRO_EUR,
+        help="Hard external account ceiling in EUR; must be at or above --cutoff-eur.",
     )
     gw_init.set_defaults(func=cmd_gateway)
     gw_task = gwsub.add_parser("task-install", help="Install or verify the project task.")
