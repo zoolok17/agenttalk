@@ -8786,8 +8786,8 @@ def bootstrap_check(store: Store, *, now_epoch: float,
                     errors.append("cli must be claude")
                 if cfg_agent.get("wrapped") is not True:
                     errors.append("wrapped must be true")
-                if cfg_agent.get("model") != "Qwen3.5-397B-A17B":
-                    errors.append("model must be Qwen3.5-397B-A17B")
+                if cfg_agent.get("model") != "Qwen3.8-27B":
+                    errors.append("model must be Qwen3.8-27B")
                 if trust_class != "external-worker" or roster_trust != "external-worker":
                     errors.append("supervisor and roster trust_class must be external-worker")
                 if cfg_agent.get("env"):

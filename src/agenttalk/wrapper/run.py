@@ -487,9 +487,9 @@ def _child_env(
             raise ValueError("ovh-qwen requires the pinned loopback gateway URL")
         if not injected.get("ANTHROPIC_AUTH_TOKEN"):
             raise ValueError("ovh-qwen requires an injected front token")
-        if injected.get("ANTHROPIC_MODEL") not in {None, "Qwen3.5-397B-A17B"}:
+        if injected.get("ANTHROPIC_MODEL") not in {None, "Qwen3.8-27B"}:
             raise ValueError("ovh-qwen requires the pinned model alias")
-        injected["ANTHROPIC_MODEL"] = "Qwen3.5-397B-A17B"
+        injected["ANTHROPIC_MODEL"] = "Qwen3.8-27B"
         if injected.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS") not in {
             None,
             OVH_QWEN_CLAUDE_MAX_OUTPUT,
