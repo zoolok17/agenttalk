@@ -118,10 +118,16 @@ def test_litellm_config_is_single_model_callback_free_and_chat_completions() -> 
     assert rendered.count("store: false") == 2
     assert "max_retries: 0" in rendered
     assert "num_retries: 0" in rendered
-    litellm_settings = rendered.split("litellm_settings:\n", 1)[1].split(
-        "router_settings:\n", 1
-    )[0]
+    model_litellm_params, litellm_settings = rendered.split("litellm_settings:\n", 1)
+    litellm_settings = litellm_settings.split("router_settings:\n", 1)[0]
     assert "use_chat_completions_url_for_anthropic_messages: true" in litellm_settings
+    # merge_reasoning_content_in_choices is a per-deployment LiteLLMParamsTypedDict
+    # field (litellm_params, same family as store/max_retries), not a
+    # litellm_settings module-level default - the installed venv has no code
+    # path that reads a module-global for it, only litellm_params read
+    # per-call by CustomStreamWrapper. It belongs on the model, not here.
+    assert "merge_reasoning_content_in_choices: true" in model_litellm_params
+    assert "merge_reasoning_content_in_choices" not in litellm_settings
     assert "callback" not in rendered
     assert "/v1/responses" not in rendered
 

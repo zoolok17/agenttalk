@@ -2000,7 +2000,22 @@ def child_capability_from_header(header: str | None) -> str | None:
 
 
 def render_litellm_config(*, api_base: str) -> str:
-    """Render the single-model, callback-free LiteLLM trial configuration."""
+    """Render the single-model, callback-free LiteLLM trial configuration.
+
+    ``merge_reasoning_content_in_choices`` is a per-deployment field
+    (``LiteLLMParamsTypedDict`` in this venv's ``litellm/types/router.py``,
+    same family as ``store``/``max_retries`` above it), not a
+    ``litellm_settings`` module-level default - the installed venv has no
+    code path reading a module-global ``litellm.merge_reasoning_content_in_choices``,
+    only ``litellm_params.merge_reasoning_content_in_choices`` read per-call
+    by ``streaming_handler.py``'s ``CustomStreamWrapper``. Placed under
+    ``litellm_params`` for that reason. It folds Qwen3.8-27B's reasoning
+    content into the regular content text before it ever reaches the
+    Anthropic-passthrough adapter's text/tool_use/thinking state machine, so
+    no thinking content block is emitted - the CLI otherwise aborts a
+    streamed turn with "Content block is not a thinking block" when a
+    thinking delta lands out of order.
+    """
     if not isinstance(api_base, str) or not api_base.startswith(("https://", "http://")):
         raise ValueError("api_base must be an explicit HTTP(S) URL")
     return (
@@ -2014,6 +2029,7 @@ def render_litellm_config(*, api_base: str) -> str:
         "      extra_body:\n"
         "        store: false\n"
         "      max_retries: 0\n"
+        "      merge_reasoning_content_in_choices: true\n"
         "litellm_settings:\n"
         "  drop_params: true\n"
         "  num_retries: 0\n"

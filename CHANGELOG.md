@@ -34,6 +34,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   endpoint-only changes) - see `docs/QWEN-OVH-TRIAL.md`'s "2026-09-22
   endpoint change" section for the required re-init sequence and why.
 
+### Fixed
+
+- **OVH/Qwen gateway: a streamed turn with interleaved reasoning could
+  abort the CLI.** Qwen3.8-27B emits reasoning content; the gateway's
+  LiteLLM instance mapped it to Anthropic thinking blocks in the
+  `/v1/messages` passthrough, and the CLI rejected the stream ("API
+  Error: Content block is not a thinking block") when a thinking delta
+  landed out of order mid-turn - observed live, not in a test.
+  `merge_reasoning_content_in_choices: true` added to the rendered
+  LiteLLM config, on the model's own `litellm_params` (a per-deployment
+  field, not a `litellm_settings` module default - verified against the
+  installed venv's source, since only the former is actually read
+  per-call), so reasoning folds into content text and no thinking block
+  is ever emitted.
+
 ## [0.89.0] - 2026-09-17
 
 Theme: **the last field fixes before the freeze - what the first

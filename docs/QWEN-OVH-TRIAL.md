@@ -37,6 +37,13 @@ endpoint and its `Qwen3.8-27B` deployment:
   all - EUR 95 leaves ~EUR 4.86, comfortably covering a small top-up;
   the operator's initial run itself observes EUR 0 usage for the period,
   so it clears this with room to spare either way).
+- Field defect fix: Qwen3.8-27B's reasoning content is now folded into
+  content text (`merge_reasoning_content_in_choices: true` on the
+  deployment); thinking blocks are never forwarded to the CLI. Without
+  it, an interleaved reasoning delta mid-stream could land on the
+  Anthropic-passthrough adapter's state machine while it wasn't
+  expecting a thinking block, and the CLI aborted the turn with "API
+  Error: Content block is not a thinking block".
 
 Both `price_policy_hash` and `child_cap_policy_hash` change as a direct
 result (they hash the values above). **This invalidates every previously
