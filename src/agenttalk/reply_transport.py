@@ -111,6 +111,48 @@ def reply_draft_path(store: "Store", agent: str, inbound_id: str) -> Path:
     return store.state_dir / "reply-drafts" / agent / f"{inbound_id}.md"
 
 
+def reply_draft_dir(store: "Store", agent: str) -> Path:
+    """The directory holding every draft (live + sidecars) for one agent."""
+    return store.state_dir / "reply-drafts" / agent
+
+
+def stray_reply_drafts(
+    store: "Store", agent: str, *, exclude_id: str | None = None,
+) -> list[Path]:
+    """Live draft files in ``agent``'s own directory that do NOT belong to
+    ``exclude_id`` (#wrapper-reply-channels increment C).
+
+    Each turn writes its own deterministic ``<id>.md`` (see
+    ``loop._with_reply_draft``) and a successful delivery unlinks it — so any
+    OTHER live ``.md`` file surviving here was orphaned by a PAST turn that
+    committed without ever delivering it. "Live" excludes every sidecar this
+    module already tracks (``.refused.md``, ``.refused.reason.txt``,
+    ``.superseded.md``, ``.interrupted.md``, ``.stray-notified.txt`` below) —
+    those are already-accounted-for outcomes, not silent loss. Matched by
+    ``len(path.suffixes) == 1`` (only the trailing ``.md``): every sidecar
+    above has a second suffix (``.refused``, ``.superseded``, ...) that a
+    bare ``<id>.md`` never does, since message ids never themselves contain
+    a literal dot.
+    """
+    directory = reply_draft_dir(store, agent)
+    try:
+        candidates = sorted(directory.glob("*.md"))
+    except OSError:
+        return []
+    return [
+        path for path in candidates
+        if len(path.suffixes) == 1 and path.stem != exclude_id
+    ]
+
+
+def stray_draft_notified_path(draft_path: Path) -> Path:
+    """The dedup sidecar recording that a stray draft was already reported to
+    the lead once (#wrapper-reply-channels increment C) - an ongoing stray
+    still counts toward the health-warnings list on every subsequent tick,
+    but the ACTIVE bus notice fires only once per file, not once per turn."""
+    return draft_path.with_suffix(".stray-notified.txt")
+
+
 def landed_reply_exists(store: "Store", *, agent: str, record: dict) -> bool:
     """True when a validated reply from `agent` to this record already landed.
 

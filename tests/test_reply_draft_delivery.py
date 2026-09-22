@@ -897,3 +897,97 @@ def test_successful_draft_delivery_unlinks_the_preserved_interrupted_draft(tmp_p
     assert not preserved.exists()              # GC'd once the real reply landed
     (msg,) = _reply_inbox(s, "alpha")
     assert msg.body == "the real answer"
+
+
+# ---------------------------------------------------------- stray-draft audit
+
+def test_stray_reply_drafts_finds_orphans_excludes_sidecars_and_current(tmp_path) -> None:
+    # #wrapper-reply-channels increment C: a bare <id>.md is a LIVE,
+    # never-delivered draft; every sidecar suffix (.refused.md/.reason.txt,
+    # .superseded.md, .interrupted.md) is an already-accounted-for outcome,
+    # not silent loss - and the CURRENT turn's own id is never "stray"
+    # relative to itself.
+    s = _store(tmp_path)
+    directory = reply_transport.reply_draft_dir(s, "beta")
+    directory.mkdir(parents=True)
+    (directory / "old-1.md").write_text("orphaned answer 1", encoding="utf-8")
+    (directory / "old-2.md").write_text("orphaned answer 2", encoding="utf-8")
+    (directory / "current.md").write_text("this turn's own live draft", encoding="utf-8")
+    (directory / "old-3.refused.md").write_text("x", encoding="utf-8")
+    (directory / "old-3.refused.reason.txt").write_text("x", encoding="utf-8")
+    (directory / "old-4.superseded.md").write_text("x", encoding="utf-8")
+    (directory / "old-5.interrupted.md").write_text("x", encoding="utf-8")
+
+    strays = reply_transport.stray_reply_drafts(s, "beta", exclude_id="current")
+    assert sorted(p.stem for p in strays) == ["old-1", "old-2"]
+
+    # No exclude_id (e.g. a health-tick scan unrelated to any specific turn):
+    # "current" now counts too - the caller decides what "current" means.
+    all_live = reply_transport.stray_reply_drafts(s, "beta")
+    assert sorted(p.stem for p in all_live) == ["current", "old-1", "old-2"]
+
+
+def test_report_stray_reply_drafts_notifies_once_but_keeps_reporting(tmp_path) -> None:
+    # First scan: notifies the lead once per orphan and returns a warning
+    # label per orphan. Second scan (nothing changed): the SAME warnings
+    # still come back (an ongoing stray is still a live problem), but no
+    # second notice fires - re-notifying every tick for the same
+    # never-cleaned file would be noise, not signal.
+    s = _store(tmp_path)
+    s.set_role("alpha", "lead")            # sole_lead() resolves alpha as the notify target
+    directory = reply_transport.reply_draft_dir(s, "beta")
+    directory.mkdir(parents=True)
+    (directory / "orphan-1.md").write_text("lost answer", encoding="utf-8")
+
+    warnings_1 = loop._report_stray_reply_drafts(s, "beta", {"id": "current-turn"})
+    assert warnings_1 == ["stray_reply_draft:orphan-1"]
+    (notice,) = [m for m in s.messages_for("alpha") if m.sender == "beta"]
+    assert notice.kind == "question" and "stray" in notice.subject
+    assert "orphan-1" in notice.body
+    assert (notice.meta or {}).get("stray_reply_draft") == "true"
+
+    warnings_2 = loop._report_stray_reply_drafts(s, "beta", {"id": "current-turn"})
+    assert warnings_2 == ["stray_reply_draft:orphan-1"]     # still reported
+    still_only_one = [m for m in s.messages_for("alpha") if m.sender == "beta"]
+    assert len(still_only_one) == 1                          # NOT re-notified
+
+
+def test_current_turn_delivery_unaffected_by_an_unrelated_past_orphan(tmp_path) -> None:
+    # The exact sequence the real call sites use (_deliver_reply_draft then
+    # _report_stray_reply_drafts, both keyed off the same record - see
+    # run_loop's own commit_gate branch): an orphan left by some EARLIER,
+    # already-committed turn (simulated directly on disk, exactly the shape
+    # #201's "nothing else ever revisits a head once it commits clean"
+    # describes) must be reported WITHOUT disturbing the current turn's own,
+    # unrelated delivery.
+    s = _store(tmp_path)
+    s.set_role("alpha", "lead")
+    directory = reply_transport.reply_draft_dir(s, "beta")
+    directory.mkdir(parents=True)
+    (directory / "orphaned-turn-id.md").write_text(
+        "a reply that never got published", encoding="utf-8")
+
+    q = s.send(sender="alpha", recipient="beta", kind="question", body="q?",
+               meta={"request_id": "q-unrelated"})
+    record = loop._with_reply_draft(
+        s, "beta",
+        {"id": q.id, "from": "alpha", "kind": "question", "meta": {"request_id": "q-unrelated"}},
+    )
+    Path(record["reply_draft"]["path"]).write_text(
+        "this turn's own answer", encoding="utf-8")
+
+    draft_reason_code = loop._deliver_reply_draft(s, "beta", record)
+    warnings = loop._report_stray_reply_drafts(s, "beta", record)
+
+    assert draft_reason_code is None            # a clean publish, no refusal
+    assert warnings == ["stray_reply_draft:orphaned-turn-id"]
+    # Two messages land: the current turn's own reply, AND the stray-draft
+    # notice this same call triggered (alpha is also the notify target here)
+    # - assert on the actual reply specifically, not inbox length.
+    replies_to_q = [m for m in _reply_inbox(s, "alpha") if m.meta.get("in_reply_to") == q.id]
+    (reply,) = replies_to_q
+    assert reply.body == "this turn's own answer"
+    # The orphan itself is untouched - still there for an operator to inspect,
+    # exactly what "leave it, don't lose it" means for this increment.
+    assert (directory / "orphaned-turn-id.md").read_text(encoding="utf-8") == (
+        "a reply that never got published")
