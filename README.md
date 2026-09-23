@@ -106,11 +106,11 @@ port.
 ### Install (tag-pinned)
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.89.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.90.0"
 agenttalk install-skills          # installs bus skills + the dev-discipline devkit
 ```
 
-Pin to a released tag (`@v0.89.0` above, or whatever the current
+Pin to a released tag (`@v0.90.0` above, or whatever the current
 release is) rather than a branch — the CLI surface and message schema
 can change between releases, and a tag keeps every agent in a project
 talking the same protocol version.
@@ -906,7 +906,7 @@ automation to depend on):
 
 agenttalk follows [Semantic Versioning](https://semver.org/) and keeps
 a [Keep a Changelog](https://keepachangelog.com/)-formatted
-`CHANGELOG.md`. Install a specific tag (`@v0.89.0`, or whatever the
+`CHANGELOG.md`. Install a specific tag (`@v0.90.0`, or whatever the
 current release is) rather than a branch, since the CLI surface and
 message schema can change between releases. `agenttalk dev-gate
 --profile release` is the release-evidence gate itself: it builds the

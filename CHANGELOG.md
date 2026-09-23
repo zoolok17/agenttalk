@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.90.0] - 2026-09-23
+
+Theme: **the Qwen3.8-27B move, landed - the watched OVH gateway now runs
+the field-updated endpoint and tariff with its trial-policy caps removed
+down to the ledger envelope itself, plus the two wrapper fixes that
+surfaced while running it live.**
+
+Field basis: twelve commits on the same watched-trial gateway programme
+as 0.88.0/0.89.0. The endpoint/tariff/cap-envelope work (items 3, 5, 6,
+7, 8) is a field-driven follow-on to the 0.89.0 freeze; the two wrapper
+fixes (items 9, 10) were found by running a real wrapped Qwen coding
+turn against the new caps and tracing the dead-lettered-message failure
+mode it hit twice. `docs/QWEN-OVH-TRIAL.md` was updated commit-by-commit
+alongside the code, not after the fact.
+
 ### Changed
 
 - **OVH/Qwen gateway moved to `Qwen3.8-27B` on OVH's unified endpoint.**
@@ -89,6 +104,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (after one failure, not the resume path's K=2), mirroring the existing
   resume self-heal. Scoped to `make_drive()`; `make_cadence_drive()` is
   unreachable for `ovh-qwen` (no `wrap --lead-loop` support).
+
+### Docs
+
+- `docs/QWEN-OVH-TRIAL.md` gained the "2026-09-22 endpoint change" and
+  "2026-09-22 caps removed by operator decision" sections (the tariff/
+  envelope/cap rationale above, plus the required re-init sequence for
+  an existing install) and items 9-10 (the two wrapper fixes above),
+  including a same-day correction to an earlier claim in that same doc
+  that `price_policy_hash` was unaffected by the operator spend-cap
+  change - it was not, and the doc now says so.
 
 ## [0.89.0] - 2026-09-17
 
