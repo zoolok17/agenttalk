@@ -181,6 +181,7 @@ the published message. Full run: `test_reply_draft_delivery.py` 43/43 (was 42, +
 
 ## Confidentiality sweep
 
-`grep -riE "amperian|jaws"` over this file and `git diff origin/master` for this increment - 0
-hits. This repo (`agenttalk`) is public on GitHub; no client name, credential, or hostname belongs
-in any of its tracked content regardless of hit count, and none is present.
+`grep -riE '<protected-1>|<protected-2>'` (the two protected strings of the local confidentiality
+rule) over this file and `git diff origin/master` for this increment - 0 hits. This repo
+(`agenttalk`) is public on GitHub; no client name, credential, or hostname belongs in any of its
+tracked content regardless of hit count, and none is present.

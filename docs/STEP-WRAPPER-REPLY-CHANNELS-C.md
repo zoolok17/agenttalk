@@ -80,5 +80,6 @@ branch is dead code worth removing, or a real second path that deserves its own 
 
 ## Confidentiality sweep
 
-`grep -riE "amperian|jaws"` over this file and the increment's own diff — 0 hits. Public GitHub
-repo; no client name, credential, or hostname belongs in any tracked content regardless.
+`grep -riE '<protected-1>|<protected-2>'` (the two protected strings of the local confidentiality
+rule) over this file and the increment's own diff — 0 hits. Public GitHub repo; no client name,
+credential, or hostname belongs in any tracked content regardless.
