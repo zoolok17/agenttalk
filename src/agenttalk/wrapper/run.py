@@ -2783,7 +2783,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             sender_is_lead = None
         prompt = _prompt.assemble_turn_prompt(
             record, rules=rules, rejoin=rejoin, lessons=lesson_prompt,
-            sender_is_lead=sender_is_lead, shell=reply_shell)
+            sender_is_lead=sender_is_lead, reply_shell=reply_shell)
         spec = _session.build_turn(session_state, prompt)
         cli = session_state.cli
         # A failed RESUME turn self-heals to a fresh session before we classify (codex:
@@ -3147,7 +3147,7 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
 
     def cadence_drive(snapshot: dict, items: list) -> bool:
         prompt = _prompt.assemble_cadence_prompt(
-            snapshot, items, rules=rules, shell=reply_shell)
+            snapshot, items, rules=rules, reply_shell=reply_shell)
         spec = _session.build_turn(session_state, prompt)
         cli_name = session_state.cli
         attempted_resume = ((cli_name == "codex" and "resume" in spec.args)

@@ -14,11 +14,13 @@ with empty output and no message written — the reply was lost with no visible 
    ONCE, in PowerShell form — confirmed by grep to be a single, exact, literal substring
    (`& "$env:AGENTTALK_PY" -m agenttalk`) with zero quoting variants across all 20 occurrences.
    Rather than duplicate every rules string in two shells, `_render_for_shell` rewrites the WHOLE
-   assembled prompt as the last step before it returns: `shell == "bash"` replaces every occurrence
-   with `"$AGENTTALK_PY" -m agenttalk` (drops PowerShell's `& ` call operator, entirely meaningless
-   — a syntax error, in fact — in bash; drops `$env:` for bash's own plain `$` env-var syntax).
-   `assemble_turn_prompt` and `assemble_cadence_prompt` both gained a `shell: str = "powershell"`
-   parameter (default preserves today's exact output byte-for-byte for every existing caller).
+   assembled prompt as the last step before it returns: `reply_shell == "bash"` replaces every
+   occurrence with `"$AGENTTALK_PY" -m agenttalk` (drops PowerShell's `& ` call operator, entirely
+   meaningless — a syntax error, in fact — in bash; drops `$env:` for bash's own plain `$` env-var
+   syntax). `assemble_turn_prompt` and `assemble_cadence_prompt` both gained a
+   `reply_shell: str = "powershell"` parameter (default preserves today's exact output byte-for-byte
+   for every existing caller; named `reply_shell` rather than the shorter `shell` from the start of
+   this record's own history — see the dev-gate note below for why).
 2. **Per-kind explicit reply-channel text** (`prompt.py`, same function). Previously every kind
    sharing the draft channel (question/message/wake, and now task per increment A) got one generic
    paragraph. A task inbound now gets its own "HOW TO REPLY TO THIS MESSAGE" text: the CLI form
@@ -60,18 +62,46 @@ turn.
 - `test_supervisor.py`: 3 new (`resolve_reply_shell` default-by-CLI; per-agent/global precedence;
   an invalid value at one level falls through rather than sticking).
 - `test_wrapper_loop.py`: 3 new (`assemble_turn_prompt`'s default stays byte-identical to the
-  PowerShell-only behavior every existing caller relies on; `shell="bash"` rewrites every
+  PowerShell-only behavior every existing caller relies on; `reply_shell="bash"` rewrites every
   invocation, confirmed by both presence of the bash form and absence of `$env:AGENTTALK_PY`/
   `& "` anywhere in the output; the task-kind prompt states `--kind task-response` explicitly and
-  a non-task kind picks up none of that text) + 1 new (`assemble_cadence_prompt` respects `shell`
-  too, guarding against the cadence path silently staying PowerShell-only while the ordinary turn
-  path got fixed).
+  a non-task kind picks up none of that text) + 1 new (`assemble_cadence_prompt` respects
+  `reply_shell` too, guarding against the cadence path silently staying PowerShell-only while the
+  ordinary turn path got fixed).
 - Full run: `test_reply_draft_delivery.py` 39/39 (unaffected — draft-channel mechanics untouched by
   B), `test_wrapper_loop.py -k "prompt or cadence"` 15/15, `test_supervisor.py -k "reply_shell or
   window_style or resolve_stuck_after or resolve_dead_letter"` 7/7, `test_stub_agent_canary.py`
   (spot-check on an unrelated `make_drive` caller, confirming the new keyword-only defaulted param
   is a true no-op for existing callers) 7/7. `ruff check` and `py_compile` clean on every touched
   file (`prompt.py`, `run.py`, `supervisor.py`, `cli.py`).
+
+## Dev-gate follow-up: `shell` renamed to `reply_shell` everywhere
+
+PR #189's ruff and bandit lanes went red on every lane after the pytest legs turned green: ruff
+`S604` and bandit `B604` both flag ANY call with a truthy keyword argument literally named `shell`
+as a subprocess `shell=True` risk — by NAME alone, regardless of what the called function actually
+does. `assemble_turn_prompt`/`assemble_cadence_prompt` (and the private `_render_for_shell` helper
+they call) originally took a parameter named `shell`; `wrapper/run.py`'s own two call sites and two
+`test_wrapper_loop.py` test call sites all invoked them with `shell=` as an explicit keyword,
+tripping both scanners even though this module spawns no subprocess at all — a real-looking finding
+by design (neither scanner reads the callee's own body, only the call-site syntax), so the fix is a
+rename, never a `nosec`/`noqa` suppression (a suppression on a real-looking finding is exactly what
+the tripwire must keep catching).
+
+Renamed `shell` -> `reply_shell` in every signature and every call site that used it as a keyword:
+`prompt.py`'s `assemble_turn_prompt`, `assemble_cadence_prompt`, and `_render_for_shell` (the last
+one is called positionally, so it was never itself flagged, but renamed anyway for consistency
+since its own body still reads the parameter by name); `run.py`'s two `_prompt.assemble_*` call
+sites; the two `test_wrapper_loop.py` fixtures that called either function with `shell=`. Nothing
+in `loop.py` or `supervisor.py` ever used a `shell=` keyword call (confirmed by a repo-wide grep) —
+both already used `reply_shell` throughout, from this increment's own original naming at that
+layer. `resolve_reply_shell` itself (`supervisor.py`) was never affected; its own parameters are
+`config`/`cfg_agent`/`cli`, never `shell`.
+
+`ruff check src tests`: all checks passed. `bandit -q -r src`: 0 issues (Undefined/Low/Medium/High
+all 0). Full run: `test_wrapper_loop.py -k "prompt or cadence"` 15/15, `test_supervisor.py -k
+reply_shell` 3/3, `test_reply_draft_delivery.py` + `test_threads.py` 117/117 (unaffected, spot-
+checked as a broader regression net since both files import `prompt`/`run` transitively).
 
 ## Confidentiality sweep
 

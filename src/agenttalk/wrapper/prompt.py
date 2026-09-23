@@ -27,11 +27,18 @@ _POWERSHELL_INVOCATION = '& "$env:AGENTTALK_PY" -m agenttalk'
 _BASH_INVOCATION = '"$AGENTTALK_PY" -m agenttalk'
 
 
-def _render_for_shell(text: str, shell: str) -> str:
+def _render_for_shell(text: str, reply_shell: str) -> str:
     """Rewrite every PowerShell CLI invocation in ``text`` to bash form when
-    ``shell == "bash"``. Any other value (including the default
-    ``"powershell"``) leaves ``text`` byte-identical to today."""
-    if shell == "bash":
+    ``reply_shell == "bash"``. Any other value (including the default
+    ``"powershell"``) leaves ``text`` byte-identical to today.
+
+    Parameter named ``reply_shell``, not ``shell`` (#189 dev-gate: ruff S604
+    / bandit B604 flag ANY call with a truthy keyword argument literally
+    named ``shell`` as a subprocess ``shell=True`` risk, by name alone,
+    regardless of what the called function actually does - this module
+    spawns no subprocess at all, but the bare name still trips both
+    scanners on every call site that uses it as a keyword)."""
+    if reply_shell == "bash":
         return text.replace(_POWERSHELL_INVOCATION, _BASH_INVOCATION)
     return text
 
@@ -151,7 +158,7 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
                          rejoin: str | None = None,
                          lessons: str | None = None,
                          sender_is_lead: bool | None = None,
-                         shell: str = "powershell") -> str:
+                         reply_shell: str = "powershell") -> str:
     """Render one inbound recv_api record into the per-turn prompt string.
 
     ``sender_is_lead`` (#163) is a FACT the CALLER already computed against
@@ -162,11 +169,15 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
     (leave ``None``) when the caller has no store context (e.g. tests
     exercising rendering in isolation); the header line is skipped.
 
-    ``shell`` (#wrapper-reply-channels increment B) selects which shell form
-    every rendered CLI invocation uses - ``"powershell"`` (the default,
-    unchanged from before this parameter existed) or ``"bash"``. The caller
-    resolves this from the wrapped child's own CLI/config
-    (``supervisor.resolve_reply_shell``), never guessed here.
+    ``reply_shell`` (#wrapper-reply-channels increment B; named ``reply_shell``
+    not ``shell`` - #189 dev-gate: ruff S604 / bandit B604 flag any call
+    with a truthy keyword argument literally named ``shell`` as a
+    subprocess ``shell=True`` risk, by name alone, regardless of what the
+    called function does) selects which shell form every rendered CLI
+    invocation uses - ``"powershell"`` (the default, unchanged from before
+    this parameter existed) or ``"bash"``. The caller resolves this from
+    the wrapped child's own CLI/config (``supervisor.resolve_reply_shell``),
+    never guessed here.
     """
     rules = _DEFAULT_RULES if rules is None else rules
     out: list[str] = []
@@ -290,7 +301,7 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
             "inventing a flag errors and wastes the turn. Send the reply ONCE; do not retry variants.",
         ]
     out += ["== HOW TO HANDLE ==", rules]
-    return _render_for_shell("\n".join(out), shell)
+    return _render_for_shell("\n".join(out), reply_shell)
 
 
 # WP3: the SYNTHETIC cadence (proactive-sweep) turn. The wrapper drives this when the
@@ -341,13 +352,13 @@ _CADENCE_RULES = (
 
 def assemble_cadence_prompt(snapshot: dict, items: list, *,
                             rules: str | None = None,
-                            shell: str = "powershell") -> str:
+                            reply_shell: str = "powershell") -> str:
     """Render the bounded cadence SNAPSHOT + actionable items into the synthetic-turn
     prompt string (WP3). Pure + testable; carries ids + summaries only (the wrapper
     already capped/truncated the snapshot and stripped the lease token).
 
-    ``shell`` - see :func:`assemble_turn_prompt`'s own docstring; identical
-    contract, same default.
+    ``reply_shell`` - see :func:`assemble_turn_prompt`'s own docstring;
+    identical contract, same default, same reason for the name.
     """
     rules = _CADENCE_RULES if rules is None else rules
     out: list[str] = ["== PROACTIVE CADENCE SWEEP (no inbound message) =="]
@@ -360,4 +371,4 @@ def assemble_cadence_prompt(snapshot: dict, items: list, *,
     out.append(json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True))
     out.append("```")
     out += ["== HOW TO HANDLE ==", rules]
-    return _render_for_shell("\n".join(out), shell)
+    return _render_for_shell("\n".join(out), reply_shell)

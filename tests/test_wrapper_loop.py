@@ -78,7 +78,7 @@ def test_prompt_bash_shell_rewrites_every_invocation() -> None:
     rec = {"from": "alpha", "to": "beta", "kind": "message", "body": "hi",
            "id": "m-1", "correlation_id": "c-1", "request_id": "c-1",
            "broadcast_id": None}
-    p = prompt.assemble_turn_prompt(rec, shell="bash")
+    p = prompt.assemble_turn_prompt(rec, reply_shell="bash")
     assert '"$AGENTTALK_PY" -m agenttalk reply' in p
     assert '$env:AGENTTALK_PY' not in p     # PowerShell env-var syntax gone
     assert '& "' not in p                   # PowerShell call operator gone
@@ -257,7 +257,7 @@ def test_cadence_prompt_respects_shell_param() -> None:
     # PowerShell-only cadence rules block would leave a bash-shelled seat's
     # cadence sweep just as broken as its ordinary turns were.
     p = prompt.assemble_cadence_prompt(
-        {"agent": "beta"}, [{"kind": "outbound_reminder"}], shell="bash")
+        {"agent": "beta"}, [{"kind": "outbound_reminder"}], reply_shell="bash")
     assert '"$AGENTTALK_PY" -m agenttalk reply' in p
     assert '$env:AGENTTALK_PY' not in p
 
