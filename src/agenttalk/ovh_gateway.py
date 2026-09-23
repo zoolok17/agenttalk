@@ -1108,35 +1108,51 @@ class SpendLedger:
                         )
                     state = self._child_cap_feature_state(conn, metadata)
                     if state == "absent":
-                        # By design, a migrating ledger's per-turn cap equals
-                        # ITS OWN already-pinned trial cutoff (same default a
-                        # fresh v2 init would choose) - never today's live
-                        # module default, which could differ from what this
-                        # ledger's envelope has actually been since its own
-                        # init.
-                        migrated_child_turn_max_micro_eur = self._parse_envelope_int(
-                            metadata, "trial_cutoff_micro_eur"
+                        # A genuinely pre-envelope v1 ledger never chose an
+                        # envelope at all - it has no child_turn_max_micro_eur
+                        # key, and the live module default IS the right
+                        # source for it (this migration predates any
+                        # custom-envelope choice a v1 ledger could ever have
+                        # made). But a ledger that already went through
+                        # THIS feature's own initialize() and only had its
+                        # child-cap-specific keys stripped (e.g. a test
+                        # fixture simulating "v1") already has this key -
+                        # reuse it rather than re-deriving and re-inserting,
+                        # which would collide with the existing row (the
+                        # actual bug behind PR #188's red: an unconditional
+                        # INSERT here raised sqlite3.IntegrityError: UNIQUE
+                        # constraint failed on metadata.key).
+                        existing_child_turn_max = raw_metadata.get(
+                            "child_turn_max_micro_eur"
                         )
+                        if existing_child_turn_max is None:
+                            migrated_child_turn_max_micro_eur = CHILD_TURN_MAX_MICRO_EUR
+                        else:
+                            migrated_child_turn_max_micro_eur = self._parse_envelope_int(
+                                raw_metadata, "child_turn_max_micro_eur"
+                            )
                         self._create_child_cap_schema(conn)
+                        metadata_rows = [
+                            (
+                                "child_cap_schema_version",
+                                str(CHILD_CAP_SCHEMA_VERSION),
+                            ),
+                            (
+                                "child_cap_policy_hash",
+                                child_cap_policy_hash(
+                                    child_turn_max_micro_eur=migrated_child_turn_max_micro_eur
+                                ),
+                            ),
+                            ("child_cap_issuer_sha256", issuer_hash),
+                        ]
+                        if existing_child_turn_max is None:
+                            metadata_rows.append((
+                                "child_turn_max_micro_eur",
+                                str(migrated_child_turn_max_micro_eur),
+                            ))
                         conn.executemany(
                             "INSERT INTO metadata(key, value) VALUES (?, ?)",
-                            (
-                                (
-                                    "child_cap_schema_version",
-                                    str(CHILD_CAP_SCHEMA_VERSION),
-                                ),
-                                (
-                                    "child_cap_policy_hash",
-                                    child_cap_policy_hash(
-                                        child_turn_max_micro_eur=migrated_child_turn_max_micro_eur
-                                    ),
-                                ),
-                                (
-                                    "child_turn_max_micro_eur",
-                                    str(migrated_child_turn_max_micro_eur),
-                                ),
-                                ("child_cap_issuer_sha256", issuer_hash),
-                            ),
+                            metadata_rows,
                         )
                     else:
                         if not hmac.compare_digest(

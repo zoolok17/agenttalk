@@ -886,6 +886,35 @@ def test_child_cap_migration_refuses_unresolved_attempt_without_partial_upgrade(
         assert child_tables == []
 
 
+def test_child_cap_migration_of_a_pre_envelope_v1_ledger_pins_the_default_envelope(
+    tmp_path,
+) -> None:
+    # A genuinely pre-envelope v1 ledger (downgrade_to_v1_without_child_caps
+    # strips child_turn_max_micro_eur along with the other child-cap keys,
+    # simulating a ledger that predates this feature entirely - it never
+    # chose an envelope, so it has no opinion on its own per-turn cap) must
+    # migrate with the LIVE module default as its child-turn cap: the
+    # migration is the one place that default is the right source (PR #188's
+    # own red: an earlier version of this migration unconditionally
+    # re-inserted the key and collided with one a test ledger already had
+    # from its own post-envelope initialize()).
+    ledger = make_ledger(tmp_path)
+    downgrade_to_v1_without_child_caps(ledger)
+
+    installed = ledger.install_child_caps(issuer_token=TEST_CHILD_CAP_ISSUER)
+
+    assert installed["installed"] is True
+    assert installed["policy_hash"] == gateway.child_cap_policy_hash()
+    with sqlite3.connect(ledger.db_path) as conn:
+        assert conn.execute(
+            "SELECT value FROM metadata WHERE key='child_turn_max_micro_eur'"
+        ).fetchone()[0] == str(gateway.CHILD_TURN_MAX_MICRO_EUR)
+    status = ledger.status()
+    assert status["child_cap_ready"] is True
+    assert status["child_cap_policy_hash"] == gateway.child_cap_policy_hash()
+    assert status["child_turn_max_micro_eur"] == gateway.CHILD_TURN_MAX_MICRO_EUR
+
+
 def test_child_cap_migration_recovers_after_marker_projection_failure(
     tmp_path, monkeypatch
 ) -> None:
