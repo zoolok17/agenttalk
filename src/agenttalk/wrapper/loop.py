@@ -164,11 +164,30 @@ def _as_outcome(ret: object) -> DriveOutcome:
 # reply is a plain message get a wrapper-declared draft file the child can
 # answer through with nothing but its structured Write tool — the fix for
 # seats whose harness statically rejects or approval-gates shell commands.
-# Typed-response threads (review-request/proposal) are excluded: their
-# closure requires a typed kind the draft channel does not carry yet.
 # `wake` is included: it is an ordinary driven kind whose wk- request id is
 # minted precisely so a plain message reply can correlate.
-_REPLY_DRAFT_KINDS = frozenset({"question", "message", "wake"})
+#
+# `task` is included (#wrapper-reply-channels increment A, fixing the field
+# bug where a task-kind draft written out of message-kind habit sat
+# unpublished — loop.py never decorated `record["reply_draft"]` for this
+# kind, so a child that wrote to the deterministic draft path anyway had no
+# indication its reply never landed). Publication uses
+# `reply_transport.draft_reply_kind_for` to pick `task-response` rather than
+# the plain `message` every other kind here gets.
+#
+# `review-request`/`proposal` remain excluded: their typed responses need
+# evidence/status meta (see `gates.validate_review_result_evidence`) the
+# draft channel still cannot carry, so decorating them would let a draft
+# close the thread with the wrong kind. `task-response`'s own optional
+# `status` meta has the same gap (a draft-published task-response can never
+# carry it — see reply_transport.DRAFT_REPLY_KIND's own docstring) but,
+# unlike review-result, a status-less task-response is an ALREADY-VALID
+# reply shape (`gates.validate_response_status` treats a missing status as
+# merely non-terminal, not invalid) — the same limitation a bare CLI
+# `agenttalk reply --kind task-response` (no `--meta status=...`) already
+# has today. See STEP-WRAPPER-REPLY-CHANNELS-A.md for the full enumeration
+# of what threads.py's ball-tracking does with a status-less task-response.
+_REPLY_DRAFT_KINDS = frozenset({"question", "message", "wake", "task"})
 
 
 def _interrupted_draft_path(store, agent: str, msg_id: object) -> Path | None:
@@ -303,6 +322,79 @@ def _notify_reply_refusal(store, *, agent: str, record: dict, draft: Path,
         return
 
 
+def _notify_stray_reply_draft(store, *, agent: str, draft: Path) -> None:
+    """#wrapper-reply-channels increment C: tell the lead about ONE orphaned
+    draft. Best-effort, never raises - mirrors :func:`_notify_reply_refusal`'s
+    own never-raise contract and target resolution exactly (same reasoning:
+    the ORIGINAL intended recipient has no context a reply was ever coming).
+
+    Fires ONCE per file (the caller checks/writes the dedup sidecar before
+    calling this) - an ongoing stray still counts toward the health-warnings
+    list on every subsequent tick (the caller's own job), but re-notifying
+    the lead every single tick for the same never-cleaned file would be
+    noise, not signal.
+    """
+    try:
+        inbound_id = draft.stem
+        target = store.operator_facing() or store.sole_lead()
+        if not target or target == agent:
+            return  # unroutable - same fail-open as the refusal notice
+        body = (
+            f"[stray-draft] agent {agent} has an orphaned reply draft for message "
+            f"{inbound_id} that was never delivered by any turn - the turn that "
+            "wrote it committed without ever publishing it, and nothing has "
+            "revisited it since. Draft: " + str(draft) + "  "
+            "This is exactly the failure mode #201/#wrapper-reply-channels increment A "
+            "closed for kind=task; a stray draft for another kind may signal a similar "
+            "gap, or simply an attempt that was superseded by a CLI reply without this "
+            "increment's own dedupe recognizing it. Inspect the file directly - its "
+            "content is the child's own unpublished answer."
+        )
+        meta = {
+            "needs_operator": "true",
+            "stray_reply_draft": "true",
+            "srd_message_id": inbound_id,
+            "srd_draft_path": str(draft),
+            "request_id": "esc-" + uuid.uuid4().hex[:12],
+        }
+        store.send(sender=agent, recipient=target, kind="question",
+                   subject="stray reply draft notice", body=body, meta=meta)
+    except Exception:  # noqa: BLE001 - a notification must never crash the loop
+        return
+
+
+def _report_stray_reply_drafts(store, agent: str, record: dict) -> list[str]:
+    """Scan + (best-effort, once-per-file) notify for orphaned drafts other
+    than the CURRENT turn's own (#wrapper-reply-channels increment C).
+
+    Disk-based on EVERY call, like :meth:`health.WrapperHealthWriter.
+    _has_unresolved_reply_refusal` - robust to which internal commit path
+    produced the orphan and to a wrapper restart between the orphaning turn
+    and this scan. Returns one short label per CURRENTLY stray file (for the
+    caller to thread into the health-warnings list), regardless of whether
+    THIS call is the one that notified it or a prior call already did.
+    """
+    current_id = record.get("id")
+    current_id = current_id if isinstance(current_id, str) else None
+    try:
+        strays = reply_transport.stray_reply_drafts(
+            store, agent, exclude_id=current_id)
+    except Exception:  # noqa: BLE001 - advisory, never fails the turn
+        return []
+    warnings: list[str] = []
+    for draft in strays:
+        warnings.append(f"stray_reply_draft:{draft.stem}")
+        notified_path = reply_transport.stray_draft_notified_path(draft)
+        if notified_path.exists():
+            continue
+        _notify_stray_reply_draft(store, agent=agent, draft=draft)
+        try:
+            notified_path.write_text(_iso_now(), encoding="utf-8")
+        except OSError:
+            pass  # best-effort dedupe only - a missed write just re-notifies next tick
+    return warnings
+
+
 def _deliver_reply_draft(store, agent: str, record: dict) -> str | None:
     """Publish a child-written freeform draft after a CLEAN turn.
 
@@ -340,10 +432,19 @@ def _deliver_reply_draft(store, agent: str, record: dict) -> str | None:
                     pass
             return
         if reply_transport.landed_reply_exists(store, agent=agent, record=record):
-            try:
-                draft.unlink(missing_ok=True)
-            except OSError:
-                pass
+            if record.get("kind") == "task":
+                # #wrapper-reply-channels increment A: a task-response draft
+                # racing an already-landed CLI reply on the same thread must
+                # not double-post — but silently deleting it (like the
+                # unlink below, unchanged for question/message/wake) would
+                # erase the only trace the race happened. Leave the LIVE
+                # draft in place and write an observable sidecar instead.
+                reply_transport.write_superseded_note(draft, at=_iso_now())
+            else:
+                try:
+                    draft.unlink(missing_ok=True)
+                except OSError:
+                    pass
             # P2-6: the reply already landed via the direct channel - GC the
             # <id>.interrupted.md sibling here too (previously only done on the
             # deliver_draft_reply success path below), or it survives forever.
@@ -1668,8 +1769,13 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         # outcome (watchdog kill, nonzero exit) never publishes — a truncated
         # draft must not become the agent's authoritative answer.
         draft_reason_code = None
+        stray_draft_warnings: list[str] = []
         if outcome.ok:
             draft_reason_code = _deliver_reply_draft(store, agent, record)
+            # #wrapper-reply-channels increment C: disk-based on every clean
+            # turn, regardless of THIS turn's own kind - a stray from a past
+            # turn must surface even while the current turn is unrelated.
+            stray_draft_warnings = _report_stray_reply_drafts(store, agent, record)
         if commit_gate is not None and legacy_gate_resolution is not None:
             landed = commit_gate.resolve_landed_response(record)
             if landed.proof is not None:
@@ -1681,10 +1787,27 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 ):
                     stamp()
                     if on_health_idle is not None:
+                        # #wrapper-reply-channels increment C follow-up: only
+                        # widen the call with `warnings=` when there is
+                        # actually something to report. Every existing
+                        # on_health_idle fixture across the test suite (4
+                        # found, all `lambda: ...`, zero-arg) relied on the
+                        # PRE-increment-C call shape (`on_health_idle()` /
+                        # `on_health_idle(reason_code=...)`) being exactly
+                        # preserved on the overwhelmingly common no-stray
+                        # turn - unconditionally passing `warnings=[]` broke
+                        # that shape for every one of them
+                        # (test_owed_action_detection.py's own two failures,
+                        # PR #189's red lanes). `Callable[..., None]` is a
+                        # type hint, never enforced at runtime - it does not
+                        # protect a narrower real callback from an added
+                        # kwarg it was never written to accept.
+                        health_kwargs: dict = {}
                         if draft_reason_code is not None:
-                            on_health_idle(reason_code=draft_reason_code)
-                        else:
-                            on_health_idle()
+                            health_kwargs["reason_code"] = draft_reason_code
+                        if stray_draft_warnings:
+                            health_kwargs["warnings"] = stray_draft_warnings
+                        on_health_idle(**health_kwargs)
                     last_hb = clock()
                     _maybe_refresh_capacity(last_hb)
                     fail_sleep = idle_interval
@@ -2406,8 +2529,14 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
         # #201: same wrapper-owned draft delivery as _run_continuous — the
         # one-shot path must not strand a sandbox-blocked child's answer.
         draft_reason_code = None
+        stray_draft_warnings: list[str] = []
         if outcome.ok:
             draft_reason_code = _deliver_reply_draft(store, agent, record)
+            # #wrapper-reply-channels increment C: same disk-based scan as
+            # the continuous loop - one-shot invocations are exactly the
+            # shape (a fresh process per turn) most likely to strand a draft
+            # across a restart with no later turn to notice it otherwise.
+            stray_draft_warnings = _report_stray_reply_drafts(store, agent, record)
         if commit_gate is not None and legacy_gate_resolution is not None:
             landed = commit_gate.resolve_landed_response(record)
             if landed.proof is not None:
@@ -2419,10 +2548,15 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                 ):
                     _stamp()
                     if on_health_idle is not None:
+                        # See the continuous-loop branch's own comment above
+                        # (same fix, same reason: only widen the call when
+                        # there is actually something to report).
+                        health_kwargs: dict = {}
                         if draft_reason_code is not None:
-                            on_health_idle(reason_code=draft_reason_code)
-                        else:
-                            on_health_idle()
+                            health_kwargs["reason_code"] = draft_reason_code
+                        if stray_draft_warnings:
+                            health_kwargs["warnings"] = stray_draft_warnings
+                        on_health_idle(**health_kwargs)
                     last_hb = clock()
                     fail_sleep = idle_interval
                     turns += 1

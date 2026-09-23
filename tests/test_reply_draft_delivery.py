@@ -277,6 +277,163 @@ def test_wake_kind_gets_the_draft_channel(tmp_path) -> None:
     assert (msg.meta or {}).get("in_reply_to") == w.id
 
 
+def test_task_kind_gets_the_draft_channel(tmp_path) -> None:
+    # #wrapper-reply-channels increment A: the field bug this fixes - a
+    # task-kind draft written out of message-kind habit sat unpublished
+    # because loop.py never decorated `record["reply_draft"]` for kind=task.
+    # A seat that cannot run shell commands must be able to answer a task
+    # the same way it answers a question/message/wake.
+    s = _store(tmp_path)
+    s.set_role("alpha", "lead")
+    t = s.send(sender="alpha", recipient="beta", kind="task", body="do X",
+               meta={"request_id": "tk-1"})
+
+    def drive(rec):
+        assert isinstance(rec.get("reply_draft"), dict)
+        Path(rec["reply_draft"]["path"]).write_text("done", encoding="utf-8")
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1)
+    (msg,) = _reply_inbox(s, "alpha")
+    assert msg.body == "done"
+    assert msg.kind == "task-response"     # not the plain "message" every
+                                            # other draft-channel kind gets
+    assert (msg.meta or {}).get("request_id") == "tk-1"
+    assert (msg.meta or {}).get("in_reply_to") == t.id
+    # #wrapper-reply-channels increment A2: a draft-published task-response
+    # defaults to status=done - the draft channel carries no way to say
+    # "accepted, still working", so answering through it IS declaring done.
+    assert (msg.meta or {}).get("status") == "done"
+
+
+def test_a2_task_thread_closes_on_both_sides_and_doctor_raises_nothing(tmp_path) -> None:
+    # reviewer-3's own cold-review finding on increment A (a sharper form of
+    # A's own flagged limitation): drove the FULL pipeline (task sent, a
+    # wrapper turn that only writes the draft, then threads.derive_threads
+    # from BOTH sides) and found the thread stayed open-outbound for the
+    # sender and owed-inbound for the responder - a status-less task-response
+    # is not "non-terminal", it is UNCLASSIFIED by threads._classify_event's
+    # own opener_kind=="task" branch (returns None: neither "ball" nor
+    # "terminal"). doctor.py's staleness check then raised a false ERROR
+    # "neither accepted, declined, nor done" on a task the responder HAD
+    # already answered, through the very channel A exists to make reliable.
+    # A2 (status=done by default) must close this on both sides and doctor
+    # must raise nothing - proven here directly, not just by inspecting the
+    # published message's own meta as the extended test above already does.
+    from agenttalk import doctor, threads as th
+
+    s = _store(tmp_path)
+    s.set_role("alpha", "lead")
+    s.send(sender="alpha", recipient="beta", kind="task", body="do X",
+           meta={"request_id": "tk-a2"})
+
+    def drive(rec):
+        Path(rec["reply_draft"]["path"]).write_text("done", encoding="utf-8")
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1)
+
+    messages = s.valid_messages()
+    alpha_threads = {
+        t.request_id: t for t in
+        th.derive_threads(messages, agent="alpha", cursor=s.cursor("alpha") or "")
+    }
+    beta_threads = {
+        t.request_id: t for t in
+        th.derive_threads(messages, agent="beta", cursor=s.cursor("beta") or "")
+    }
+    # Before A2: alpha (opener) = "open-outbound" forever, beta (responder) =
+    # "owed-inbound" forever - reviewer-3's own reported shape, reproduced
+    # and confirmed by this test before the fix landed. After A2:
+    assert alpha_threads["tk-a2"].role == "opener"
+    # "reply-waiting" (NOT "open-outbound"): the terminal task-response WAS
+    # recognized - alpha simply hasn't read/acked it yet in this test (its
+    # own cursor never advanced), which is the correct, ordinary state for
+    # a fresh, unread-but-terminal reply, not a bug.
+    assert alpha_threads["tk-a2"].state == "reply-waiting"
+    assert beta_threads["tk-a2"].role == "responder"
+    assert beta_threads["tk-a2"].state == "closed"
+
+    # Once alpha reads it (cursor advances past the task-response), BOTH
+    # sides show "closed" - completing what "both sides see the thread
+    # closed" means end to end.
+    alpha_threads_read = {
+        t.request_id: t for t in
+        th.derive_threads(messages, agent="alpha",
+                          cursor=alpha_threads["tk-a2"].last_msg_id)
+    }
+    assert alpha_threads_read["tk-a2"].state == "closed"
+
+    # doctor's own staleness check, called directly (not synthesizing its
+    # internals) - must find nothing to report, matching the "absent when
+    # there is nothing to report" contract _check_declined_lead_tasks
+    # documents for itself.
+    assert doctor._check_declined_lead_tasks(s) is None
+
+
+def test_task_kind_cli_reply_wins_draft_left_in_place_with_superseded_sidecar(
+    tmp_path,
+) -> None:
+    # A capable child that both ran `agenttalk reply --kind task-response`
+    # itself AND wrote the draft (habit from a message-kind turn): the
+    # wrapper's landed-check must not double-post a second task-response on
+    # the same thread. Unlike question/message/wake (draft silently
+    # unlinked, unchanged), a task draft is left in place with a sidecar so
+    # the race is observable, not silent.
+    s = _store(tmp_path)
+    s.set_role("alpha", "lead")
+    t = s.send(sender="alpha", recipient="beta", kind="task", body="do X",
+               meta={"request_id": "tk-2"})
+
+    def drive(rec):
+        s.send(sender="beta", recipient="alpha", kind="task-response",
+               body="cli answer",
+               meta={"in_reply_to": rec["id"], "request_id": "tk-2"})
+        Path(rec["reply_draft"]["path"]).write_text(
+            "draft answer", encoding="utf-8")
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1)
+    replies = _reply_inbox(s, "alpha")
+    assert [(m.kind, m.body) for m in replies] == [("task-response", "cli answer")]
+    draft_path = reply_transport.reply_draft_path(s, "beta", t.id)
+    assert draft_path.is_file()            # left alone, NOT deleted
+    assert draft_path.read_text(encoding="utf-8") == "draft answer"
+    sidecar = reply_transport.superseded_sidecar_path(draft_path)
+    assert sidecar.is_file()
+    assert "superseded" in sidecar.read_text(encoding="utf-8")
+
+
+def test_task_kind_refusal_sidecar_still_applies(tmp_path) -> None:
+    # The generic refusal-sidecar contract (#162) is shared code, untouched
+    # by the kind-specific publish/supersede logic - an oversize task draft
+    # must still be refused observably, exactly like every other kind.
+    s = _store(tmp_path)
+    s.set_role("alpha", "lead")
+    t = s.send(sender="alpha", recipient="beta", kind="task", body="do X",
+               meta={"request_id": "tk-3"})
+
+    def drive(rec):
+        Path(rec["reply_draft"]["path"]).write_text(
+            "x" * (reply_transport.MAX_DRAFT_BYTES + 1), encoding="utf-8")
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1)
+    # No task-response landed (the oversize draft was refused, not
+    # published) - deliberately not asserting the WHOLE inbox is empty:
+    # alpha is the lead here (required to send the task itself), so the
+    # refusal also fires a `_notify_reply_refusal` notice from beta to
+    # alpha (#162) - a second, EXPECTED beta->alpha message unrelated to
+    # this test's own subject. The sidecar is the definitive proof.
+    assert "task-response" not in [m.kind for m in _reply_inbox(s, "alpha")]
+    text = _reason_path_for(s, "beta", t.id).read_text(encoding="utf-8")
+    assert "over the" in text and "byte bound" in text
+
+
 def test_consult_questions_are_excluded_from_the_draft_channel(tmp_path) -> None:
     # Cold review major 1: a consult reply must echo consult=true + round meta
     # the draft channel cannot carry — offering it would give the child two
@@ -810,3 +967,97 @@ def test_successful_draft_delivery_unlinks_the_preserved_interrupted_draft(tmp_p
     assert not preserved.exists()              # GC'd once the real reply landed
     (msg,) = _reply_inbox(s, "alpha")
     assert msg.body == "the real answer"
+
+
+# ---------------------------------------------------------- stray-draft audit
+
+def test_stray_reply_drafts_finds_orphans_excludes_sidecars_and_current(tmp_path) -> None:
+    # #wrapper-reply-channels increment C: a bare <id>.md is a LIVE,
+    # never-delivered draft; every sidecar suffix (.refused.md/.reason.txt,
+    # .superseded.md, .interrupted.md) is an already-accounted-for outcome,
+    # not silent loss - and the CURRENT turn's own id is never "stray"
+    # relative to itself.
+    s = _store(tmp_path)
+    directory = reply_transport.reply_draft_dir(s, "beta")
+    directory.mkdir(parents=True)
+    (directory / "old-1.md").write_text("orphaned answer 1", encoding="utf-8")
+    (directory / "old-2.md").write_text("orphaned answer 2", encoding="utf-8")
+    (directory / "current.md").write_text("this turn's own live draft", encoding="utf-8")
+    (directory / "old-3.refused.md").write_text("x", encoding="utf-8")
+    (directory / "old-3.refused.reason.txt").write_text("x", encoding="utf-8")
+    (directory / "old-4.superseded.md").write_text("x", encoding="utf-8")
+    (directory / "old-5.interrupted.md").write_text("x", encoding="utf-8")
+
+    strays = reply_transport.stray_reply_drafts(s, "beta", exclude_id="current")
+    assert sorted(p.stem for p in strays) == ["old-1", "old-2"]
+
+    # No exclude_id (e.g. a health-tick scan unrelated to any specific turn):
+    # "current" now counts too - the caller decides what "current" means.
+    all_live = reply_transport.stray_reply_drafts(s, "beta")
+    assert sorted(p.stem for p in all_live) == ["current", "old-1", "old-2"]
+
+
+def test_report_stray_reply_drafts_notifies_once_but_keeps_reporting(tmp_path) -> None:
+    # First scan: notifies the lead once per orphan and returns a warning
+    # label per orphan. Second scan (nothing changed): the SAME warnings
+    # still come back (an ongoing stray is still a live problem), but no
+    # second notice fires - re-notifying every tick for the same
+    # never-cleaned file would be noise, not signal.
+    s = _store(tmp_path)
+    s.set_role("alpha", "lead")            # sole_lead() resolves alpha as the notify target
+    directory = reply_transport.reply_draft_dir(s, "beta")
+    directory.mkdir(parents=True)
+    (directory / "orphan-1.md").write_text("lost answer", encoding="utf-8")
+
+    warnings_1 = loop._report_stray_reply_drafts(s, "beta", {"id": "current-turn"})
+    assert warnings_1 == ["stray_reply_draft:orphan-1"]
+    (notice,) = [m for m in s.messages_for("alpha") if m.sender == "beta"]
+    assert notice.kind == "question" and "stray" in notice.subject
+    assert "orphan-1" in notice.body
+    assert (notice.meta or {}).get("stray_reply_draft") == "true"
+
+    warnings_2 = loop._report_stray_reply_drafts(s, "beta", {"id": "current-turn"})
+    assert warnings_2 == ["stray_reply_draft:orphan-1"]     # still reported
+    still_only_one = [m for m in s.messages_for("alpha") if m.sender == "beta"]
+    assert len(still_only_one) == 1                          # NOT re-notified
+
+
+def test_current_turn_delivery_unaffected_by_an_unrelated_past_orphan(tmp_path) -> None:
+    # The exact sequence the real call sites use (_deliver_reply_draft then
+    # _report_stray_reply_drafts, both keyed off the same record - see
+    # run_loop's own commit_gate branch): an orphan left by some EARLIER,
+    # already-committed turn (simulated directly on disk, exactly the shape
+    # #201's "nothing else ever revisits a head once it commits clean"
+    # describes) must be reported WITHOUT disturbing the current turn's own,
+    # unrelated delivery.
+    s = _store(tmp_path)
+    s.set_role("alpha", "lead")
+    directory = reply_transport.reply_draft_dir(s, "beta")
+    directory.mkdir(parents=True)
+    (directory / "orphaned-turn-id.md").write_text(
+        "a reply that never got published", encoding="utf-8")
+
+    q = s.send(sender="alpha", recipient="beta", kind="question", body="q?",
+               meta={"request_id": "q-unrelated"})
+    record = loop._with_reply_draft(
+        s, "beta",
+        {"id": q.id, "from": "alpha", "kind": "question", "meta": {"request_id": "q-unrelated"}},
+    )
+    Path(record["reply_draft"]["path"]).write_text(
+        "this turn's own answer", encoding="utf-8")
+
+    draft_reason_code = loop._deliver_reply_draft(s, "beta", record)
+    warnings = loop._report_stray_reply_drafts(s, "beta", record)
+
+    assert draft_reason_code is None            # a clean publish, no refusal
+    assert warnings == ["stray_reply_draft:orphaned-turn-id"]
+    # Two messages land: the current turn's own reply, AND the stray-draft
+    # notice this same call triggered (alpha is also the notify target here)
+    # - assert on the actual reply specifically, not inbox length.
+    replies_to_q = [m for m in _reply_inbox(s, "alpha") if m.meta.get("in_reply_to") == q.id]
+    (reply,) = replies_to_q
+    assert reply.body == "this turn's own answer"
+    # The orphan itself is untouched - still there for an operator to inspect,
+    # exactly what "leave it, don't lose it" means for this increment.
+    assert (directory / "orphaned-turn-id.md").read_text(encoding="utf-8") == (
+        "a reply that never got published")

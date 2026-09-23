@@ -770,6 +770,40 @@ _DIAGNOSTIC_COUNTERS = (
 )
 
 
+# Shells the wrapper knows how to render its "HOW TO REPLY" CLI invocations in
+# (#wrapper-reply-channels increment B - field facts: a claude seat's Bash
+# tool runs git-bash, a `& "$env:AGENTTALK_PY" ...` PowerShell invocation
+# rendered unconditionally for every wrapped seat produced two parse errors
+# on the ACTUAL child shell before a third attempt returned exit 0 with no
+# message sent). Per-CLI default reflects each tool's OWN shell on Windows
+# today: claude's Bash tool is git-bash (POSIX), codex's default terminal is
+# PowerShell, qwen's own developer seat also runs bash (the field-fact case
+# that nested `powershell -Command` inside `bash eval` and hit two parse
+# errors is exactly a qwen seat wrongly TOLD to use the PowerShell form).
+_REPLY_SHELLS = frozenset({"bash", "powershell"})
+_REPLY_SHELL_DEFAULT_BY_CLI = {"claude": "bash", "codex": "powershell", "qwen": "bash"}
+
+
+def resolve_reply_shell(config: dict, cfg_agent: dict, *, cli: str) -> str:
+    """Resolve which shell form the wrapper renders its CLI-invocation prose
+    in. Per-agent ``reply_shell`` wins over the global setting, which wins
+    over the per-CLI default (mirrors :func:`resolve_window_style`'s own
+    per-agent -> global -> default chain). An invalid value at either level
+    is never coerced into a false positive - it is simply ignored in favor
+    of the next source, falling all the way through to the CLI default
+    rather than rendering an invocation the child's actual shell cannot
+    parse.
+    """
+    config = config if isinstance(config, dict) else {}
+    cfg_agent = cfg_agent if isinstance(cfg_agent, dict) else {}
+    default = _REPLY_SHELL_DEFAULT_BY_CLI.get(cli, "powershell")
+    for src in (cfg_agent, config):
+        raw = src.get("reply_shell")
+        if isinstance(raw, str) and raw.strip().lower() in _REPLY_SHELLS:
+            return raw.strip().lower()
+    return default
+
+
 def resolve_window_style(config: dict, cfg_agent: dict) -> tuple[str, str | None]:
     """Resolve the supervised Windows launch style.
 

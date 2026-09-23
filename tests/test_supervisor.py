@@ -2871,6 +2871,37 @@ def test_window_style_resolution_default_global_agent_and_invalid() -> None:
     assert "defaulting to hidden" in warning
 
 
+def test_resolve_reply_shell_default_by_cli() -> None:
+    # #wrapper-reply-channels increment B: claude/qwen's Bash tool is
+    # git-bash, codex's default terminal is PowerShell - no config at all
+    # falls through to the per-CLI default, not one hardcoded shell.
+    assert sup.resolve_reply_shell({}, {}, cli="claude") == "bash"
+    assert sup.resolve_reply_shell({}, {}, cli="qwen") == "bash"
+    assert sup.resolve_reply_shell({}, {}, cli="codex") == "powershell"
+    assert sup.resolve_reply_shell({}, {}, cli="some-future-cli") == "powershell"
+
+
+def test_resolve_reply_shell_global_and_per_agent_override() -> None:
+    # Global overrides the CLI default; per-agent overrides global - same
+    # precedence chain as resolve_window_style.
+    assert sup.resolve_reply_shell(
+        {"reply_shell": "bash"}, {}, cli="codex") == "bash"
+    assert sup.resolve_reply_shell(
+        {"reply_shell": "bash"}, {"reply_shell": "powershell"},
+        cli="claude") == "powershell"
+
+
+def test_resolve_reply_shell_invalid_value_falls_through_to_default() -> None:
+    # An invalid value at either level is not coerced into a false positive -
+    # it is ignored, falling all the way through to the CLI default, never
+    # to a value that would render an invocation the child's shell can't run.
+    assert sup.resolve_reply_shell(
+        {"reply_shell": "zsh"}, {}, cli="claude") == "bash"
+    assert sup.resolve_reply_shell(
+        {"reply_shell": "bash"}, {"reply_shell": "zsh"},
+        cli="codex") == "bash"          # invalid per-agent falls through to global
+
+
 def test_plan_carries_resolved_window_style_and_visible_warning() -> None:
     cfg = {
         "window_style": "normal",

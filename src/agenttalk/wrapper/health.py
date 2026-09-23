@@ -103,7 +103,8 @@ class WrapperHealthWriter:
         except Exception:  # noqa: BLE001 - advisory health must not stop the wrapper
             return
 
-    def idle(self, *, reason_code: str = "idle_waiting") -> None:
+    def idle(self, *, reason_code: str = "idle_waiting",
+             warnings: list[str] | None = None) -> None:
         self._request_id = None
         self._msg_id = None
         if reason_code == "idle_waiting" and self._has_unresolved_reply_refusal():
@@ -116,7 +117,15 @@ class WrapperHealthWriter:
             # overrides the DEFAULT reason - an explicit caller-supplied
             # reason_code (e.g. "turn_spawned") is never clobbered.
             reason_code = "reply_refused"
-        self._write(health_model.STATE_IDLE_WAITING, reason_code=reason_code, force=True)
+        # #wrapper-reply-channels increment C: `warnings` is the caller's own
+        # already-computed stray-reply-draft labels (loop._report_stray_
+        # reply_drafts, called once per clean turn right after draft
+        # delivery) - unlike the refusal check above, this is NOT re-derived
+        # here, since the caller already paid for the disk scan this same
+        # tick and a second independent scan would just double the I/O for
+        # no new information.
+        self._write(health_model.STATE_IDLE_WAITING, reason_code=reason_code,
+                    warnings=warnings, force=True)
 
     def _has_unresolved_reply_refusal(self) -> bool:
         try:

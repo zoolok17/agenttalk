@@ -11333,7 +11333,8 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                     backend_profile: str | None = None,
                     profile_env: dict[str, str] | None = None,
                     supervisor_launch_nonce: str | None = None,
-                    lifecycle_log: object | None = None) -> int:
+                    lifecycle_log: object | None = None,
+                    reply_shell: str = "powershell") -> int:
     """The long-running supervised wrapper loop (design C): own the idle bus-wait +
     heartbeat, drive the CLI ONE turn per inbound message in structured-stream mode
     (session continuity owned here), then return to the wait. Runs until killed -
@@ -11463,6 +11464,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             store, agent, cli, state, base_argv, sender=sender,
             min_interval=min_interval, render=render, heartbeat=heartbeat,
             persist=lambda st: wsession.save_session(store, agent, st),
+            reply_shell=reply_shell,
             turn_watchdog=turn_watchdog,
             health_writer=health_writer,
             runtime_writer=runtime_writer,
@@ -11542,6 +11544,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             store, agent, cli, state, base_argv, sender=sender,
             min_interval=min_interval, render=render, heartbeat=heartbeat,
             persist=lambda st: wsession.save_session(store, agent, st),
+            reply_shell=reply_shell,
             runtime_writer=runtime_writer,
             work_heartbeat=work_heartbeat,
             lifecycle_log=lifecycle_log,
@@ -12228,6 +12231,9 @@ def _cmd_wrap_with_logging(args: argparse.Namespace) -> int:
             return _handle_launch_config_blocked(
                 store, agent, args.cli, mode=whb_mode,
                 min_interval=args.min_interval, summary=summary)
+        # #wrapper-reply-channels increment B: per-agent -> global -> per-CLI
+        # default, same precedence chain as the dead-letter caps above.
+        reply_shell = _sup.resolve_reply_shell(sup_cfg, cfg_agent, cli=args.cli)
         return _wrap_loop_mode(
             store,
             agent,
@@ -12268,6 +12274,7 @@ def _cmd_wrap_with_logging(args: argparse.Namespace) -> int:
                 "_wrapper_lifecycle_log",
                 None,
             ),
+            reply_shell=reply_shell,
         )
     try:
         return wrapper_run.run_wrapper(
