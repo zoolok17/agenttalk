@@ -9,6 +9,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.91.0] - 2026-09-23
+
+Theme: **the gateway grows a Linux host and a configurable spend
+envelope; the wrapper's reply-channel work closes the loop on task
+replies lost in the field.**
+
+Field basis: two PRs since 0.90.0. #188 (gateway) adds a Linux systemd
+`--user` service backend alongside the existing Windows scheduled-task
+one, and turns the ledger's spend envelope (cutoff/soft-stop/ceiling)
+into an `agenttalk gateway init` parameter instead of a module
+constant, plus a same-day follow-up fixing a v1-ledger migration
+collision the change surfaced. #189 (wrapper) traces three field-lost
+task replies to the draft-reply channel excluding `kind=task`, and
+lands the fix plus four follow-on increments a reviewer's cold read
+and dev-gate both caught.
+
+### Gateway
+
+- **Linux systemd `--user` service backend.** Task-install/start/stop/
+  status now have a Linux implementation (a unit at
+  `~/.config/systemd/user/agenttalk-qwen-gateway-<id>.service`, driven
+  via `systemctl --user`) alongside the existing Windows `schtasks`
+  one, selected by `sys.platform`. `loginctl enable-linger` is
+  documented in `docs/QWEN-OVH-TRIAL.md`'s new "Linux Host" section,
+  never executed by any agenttalk command. Kill-switch, ledger, and
+  readiness-poll logic stay fully shared across both platforms; only
+  the registration query/match step dispatches per platform.
+- **Spend envelope is now an `agenttalk gateway init` parameter, not a
+  module constant.** New `--cutoff-eur` / `--soft-stop-eur` /
+  `--ceiling-eur` flags (defaults match today's values, so an
+  unchanged invocation produces the same `price_policy_hash`); the
+  chosen envelope is pinned into the ledger's own metadata and
+  validated (`soft-stop < cutoff <= ceiling`) at init. Policy-hash
+  verification now recomputes from the ledger's STORED envelope rather
+  than the live module defaults, so a deliberately non-default install
+  is never wrongly rejected for disagreeing with the CLI's current
+  default.
+- **Fixed:** a v1-ledger migration collided on `child_turn_max_micro_eur`
+  when that key was already present in metadata (`UNIQUE constraint
+  failed`). The migration now reuses an already-present value as-is and
+  only falls back to the live module default for a genuinely
+  pre-envelope v1 ledger that never had the key at all.
+
+### Wrapper
+
+- **Fixed: task-kind replies were silently dropped by the draft-reply
+  channel.** The draft-kind allowlist excluded `kind=task`, so a child
+  that wrote its answer to the draft path (out of message-kind habit)
+  had the reply vanish with the turn still marked success - three lost
+  replies traced in the field. Task drafts now publish as
+  `task-response`, default `meta.status=done` (the draft channel
+  cannot express "accepted, still working"), and a landed CLI reply
+  for the same thread supersedes a stale draft observably (a
+  `.superseded.md` sidecar) instead of silently overwriting it.
+- **Fixed: the reply CLI form in wrapper prompts was always rendered
+  for PowerShell**, even for a seat whose actual shell is bash - a
+  nested-shell quoting failure produced a lost reply with no visible
+  error. Prompts are now assembled once in PowerShell form and
+  rewritten to bash as a last step when the seat's resolved shell
+  calls for it, with per-agent / per-CLI-default / global precedence.
+  The parameter for this was originally named `shell`; renamed to
+  `reply_shell` everywhere after ruff/bandit flagged every call site as
+  a `shell=True` subprocess risk by keyword name alone, even though
+  this code spawns no subprocess.
+- **Added: a stray-draft audit.** Nothing previously revisited the
+  drafts directory after its owning turn committed, so an orphaned
+  draft (the root cause of the three field-lost replies above) stayed
+  invisible. A surviving un-suffixed draft is now detected on every
+  turn; a dedup sidecar limits the bus notice to once per file while
+  the stray still counts toward wrapper health warnings on every later
+  scan. The orphaned draft itself is left untouched.
+
+### Docs
+
+- `docs/QWEN-OVH-TRIAL.md` gained "Envelope at Init" and "Linux Host"
+  sections (the latter with the exact fresh-VM install sequence: venv,
+  wheel install, `gateway init --cutoff-eur`, cap-install, task-install,
+  start, status). The wrapper reply-channel work above is recorded in
+  its own STEP records, including a same-PR fix scrubbing two
+  protected strings that had been spelled out literally inside a
+  confidentiality-sweep grep command in those records - the rule from
+  here on is placeholder only, never by value, including inside quoted
+  commands.
+
+### Known limitations
+
+- The gateway's soft-stop value is stored, hashed, and shown by
+  `gateway status`, but nothing currently checks live spend against it
+  to block a turn or raise a warning - only the trial cutoff and
+  external ceiling are enforced.
+- `doctor`'s staleness check treats any task reply left unread by the
+  lead for 30 minutes as stale, including one the lead simply hasn't
+  gotten to yet - it cannot distinguish "genuinely lost" from "sitting
+  in a busy lead's queue".
+
 ## [0.90.0] - 2026-09-23
 
 Theme: **the Qwen3.8-27B move, landed - the watched OVH gateway now runs
