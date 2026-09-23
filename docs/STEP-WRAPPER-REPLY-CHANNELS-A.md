@@ -104,6 +104,24 @@ Grepped `"task-response"` across `src/agenttalk/` (excluding the CLI's own `cmd_
    logic: none found. The ledger treats task threads generically through `OPENER_KINDS`
    (`store.py`) and `threads.py`'s own classification (point 3 above) — no separate assumption to
    enumerate.
+6. **`tests/test_owed_action_detection.py`** — MISSED by this original enumeration (added after
+   PR #189's dev-gate went red on all 12 lanes: 2 failed, 6758 passed, both
+   `test_inactive_policy_landed_review_result_overrides_false_config_blocked[continuous|scoped]`).
+   This file is a reader of `loop.run_loop`'s own `on_health_idle` calling convention, not of
+   `record["reply_draft"]` or `task-response`'s `meta.status` directly — the actual regression was
+   increment C's own change (both `_deliver_reply_draft`-adjacent call sites started passing a new
+   `warnings=` kwarg to `on_health_idle` UNCONDITIONALLY, including the overwhelmingly common
+   no-stray-draft turn), not anything A/A2 touched. Four test fixtures across the whole suite
+   construct `on_health_idle` as a zero-argument `lambda: ...` (this file plus three in
+   `test_wrapper_loop.py`) — `Callable[..., None]`, `run_loop`'s own type hint for the parameter, is
+   never enforced at runtime and does not protect a narrower real callback from an added kwarg it
+   was never written to accept. Fixed in `loop.py`: `warnings=` is now only included in the call
+   when `stray_draft_warnings` is actually non-empty, preserving the exact pre-increment-C call
+   shape (`on_health_idle()` / `on_health_idle(reason_code=...)`) for the common case every one of
+   those four fixtures depends on. Full detail, including which two tests failed and the exact
+   traceback line, lives in this branch's own commit history (one fix commit, cause + counts
+   reported alongside it) rather than duplicated in `STEP-WRAPPER-REPLY-CHANNELS-C.md`, since the
+   fix is in code C already touches, not new code of its own.
 
 ## Increment A2 (reviewer-3 cold-review HOLD, fixed in-round)
 

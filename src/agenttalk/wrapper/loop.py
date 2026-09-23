@@ -1787,11 +1787,27 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 ):
                     stamp()
                     if on_health_idle is not None:
+                        # #wrapper-reply-channels increment C follow-up: only
+                        # widen the call with `warnings=` when there is
+                        # actually something to report. Every existing
+                        # on_health_idle fixture across the test suite (4
+                        # found, all `lambda: ...`, zero-arg) relied on the
+                        # PRE-increment-C call shape (`on_health_idle()` /
+                        # `on_health_idle(reason_code=...)`) being exactly
+                        # preserved on the overwhelmingly common no-stray
+                        # turn - unconditionally passing `warnings=[]` broke
+                        # that shape for every one of them
+                        # (test_owed_action_detection.py's own two failures,
+                        # PR #189's red lanes). `Callable[..., None]` is a
+                        # type hint, never enforced at runtime - it does not
+                        # protect a narrower real callback from an added
+                        # kwarg it was never written to accept.
+                        health_kwargs: dict = {}
                         if draft_reason_code is not None:
-                            on_health_idle(reason_code=draft_reason_code,
-                                          warnings=stray_draft_warnings)
-                        else:
-                            on_health_idle(warnings=stray_draft_warnings)
+                            health_kwargs["reason_code"] = draft_reason_code
+                        if stray_draft_warnings:
+                            health_kwargs["warnings"] = stray_draft_warnings
+                        on_health_idle(**health_kwargs)
                     last_hb = clock()
                     _maybe_refresh_capacity(last_hb)
                     fail_sleep = idle_interval
@@ -2532,11 +2548,15 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                 ):
                     _stamp()
                     if on_health_idle is not None:
+                        # See the continuous-loop branch's own comment above
+                        # (same fix, same reason: only widen the call when
+                        # there is actually something to report).
+                        health_kwargs: dict = {}
                         if draft_reason_code is not None:
-                            on_health_idle(reason_code=draft_reason_code,
-                                          warnings=stray_draft_warnings)
-                        else:
-                            on_health_idle(warnings=stray_draft_warnings)
+                            health_kwargs["reason_code"] = draft_reason_code
+                        if stray_draft_warnings:
+                            health_kwargs["warnings"] = stray_draft_warnings
+                        on_health_idle(**health_kwargs)
                     last_hb = clock()
                     fail_sleep = idle_interval
                     turns += 1
