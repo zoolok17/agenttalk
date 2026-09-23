@@ -71,11 +71,12 @@ def downgrade_to_v1_without_child_caps(ledger: SpendLedger) -> None:
         conn.execute("DROP TABLE child_capabilities")
         conn.execute("DROP TABLE child_turns")
         conn.execute(
-            "DELETE FROM metadata WHERE key IN (?, ?, ?)",
+            "DELETE FROM metadata WHERE key IN (?, ?, ?, ?)",
             (
                 "child_cap_schema_version",
                 "child_cap_policy_hash",
                 "child_cap_issuer_sha256",
+                "child_turn_max_micro_eur",
             ),
         )
         conn.execute(
@@ -109,6 +110,123 @@ def test_exact_price_policy_and_charge_fixture() -> None:
         "reservation_micro_eur": 231_999,
     }
     assert len(gateway.child_cap_policy_hash()) == 64
+    # The default (unchanged) invocation must keep producing today's hash -
+    # pinned literally so any accidental change to the envelope defaults, the
+    # policy dict shape, or the hashing itself is caught here first.
+    assert price_policy_hash() == (
+        "6df40ecdf2c22a9d06a73c2b2d7090b40d722d590e04237b19c903cb034dd5c2"
+    )
+
+
+def test_price_policy_hash_differs_between_envelopes() -> None:
+    default_hash = price_policy_hash()
+    custom_hash = price_policy_hash(
+        trial_cutoff_micro_eur=40_000_000,
+        soft_stop_micro_eur=35_000_000,
+        external_ceiling_micro_eur=100_000_000,
+    )
+    assert custom_hash != default_hash
+    assert len(custom_hash) == 64
+    # A different envelope is a different policy hash, full stop - re-deriving
+    # it twice from the same inputs must be stable (it is a pure function).
+    assert custom_hash == price_policy_hash(
+        trial_cutoff_micro_eur=40_000_000,
+        soft_stop_micro_eur=35_000_000,
+        external_ceiling_micro_eur=100_000_000,
+    )
+
+
+def _init_ledger_with_envelope(
+    tmp_path: Path,
+    name: str,
+    *,
+    trial_cutoff_micro_eur: int,
+    soft_stop_micro_eur: int,
+    external_ceiling_micro_eur: int,
+    opening_micro_eur: int = 0,
+) -> SpendLedger:
+    ledger = SpendLedger(
+        tmp_path / f"{name}.sqlite3",
+        tmp_path / f"{name}-install.json",
+        now=Clock(datetime(2026, 7, 15, 12, tzinfo=timezone.utc)),
+    )
+    ledger.initialize(
+        opening_micro_eur=opening_micro_eur,
+        opening_evidence=TEST_OPENING_EVIDENCE,
+        generation="a" * 32,
+        child_cap_issuer_token=TEST_CHILD_CAP_ISSUER,
+        trial_cutoff_micro_eur=trial_cutoff_micro_eur,
+        soft_stop_micro_eur=soft_stop_micro_eur,
+        external_ceiling_micro_eur=external_ceiling_micro_eur,
+    )
+    return ledger
+
+
+def test_envelope_at_init_validates_soft_stop_below_cutoff_at_or_below_ceiling(
+    tmp_path,
+) -> None:
+    with pytest.raises(PolicyBlocked, match="soft-stop < cutoff <= ceiling"):
+        _init_ledger_with_envelope(
+            tmp_path,
+            "bad-soft-stop",
+            trial_cutoff_micro_eur=40_000_000,
+            soft_stop_micro_eur=40_000_000,  # not strictly below cutoff
+            external_ceiling_micro_eur=100_000_000,
+        )
+    with pytest.raises(PolicyBlocked, match="soft-stop < cutoff <= ceiling"):
+        _init_ledger_with_envelope(
+            tmp_path,
+            "bad-ceiling",
+            trial_cutoff_micro_eur=40_000_000,
+            soft_stop_micro_eur=35_000_000,
+            external_ceiling_micro_eur=39_000_000,  # below cutoff
+        )
+
+
+def test_smaller_envelope_refuses_a_reservation_the_default_envelope_admits(
+    tmp_path,
+) -> None:
+    # A VM-scale 40 EUR envelope and the desktop's 95 EUR default, both
+    # started from a zero opening balance (so init's own envelope-safety
+    # check - opening + cutoff + one reservation <= ceiling - passes for
+    # both), then both pushed to the SAME already-committed spend just under
+    # the narrow envelope's own cutoff: the same next reservation must be
+    # admitted under the wide envelope and refused under the narrow one.
+    narrow = _init_ledger_with_envelope(
+        tmp_path,
+        "vm-envelope",
+        trial_cutoff_micro_eur=40_000_000,
+        soft_stop_micro_eur=35_000_000,
+        external_ceiling_micro_eur=100_000_000,
+    )
+    wide = _init_ledger_with_envelope(
+        tmp_path,
+        "desktop-envelope",
+        trial_cutoff_micro_eur=TRIAL_CUTOFF_MICRO_EUR,
+        soft_stop_micro_eur=SOFT_STOP_MICRO_EUR,
+        external_ceiling_micro_eur=EXTERNAL_CEILING_MICRO_EUR,
+    )
+    committed_micro_eur = 39_800_000  # just under the 40 EUR cutoff
+    for ledger in (narrow, wide):
+        with sqlite3.connect(ledger.db_path) as conn:
+            conn.execute(
+                "UPDATE periods SET committed_micro_eur=? WHERE period='2026-07'",
+                (committed_micro_eur,),
+            )
+
+    with pytest.raises(PolicyBlocked, match="trial spend cutoff would be exceeded"):
+        narrow.reserve("1" * 32)
+
+    reservation = wide.reserve("2" * 32)
+    assert reservation.reserved_micro_eur == reservation_cost_micro_eur()
+
+    narrow_status = narrow.status()
+    assert narrow_status["trial_cutoff_micro_eur"] == 40_000_000
+    assert narrow_status["policy_hash"] != price_policy_hash(
+        trial_cutoff_micro_eur=TRIAL_CUTOFF_MICRO_EUR,
+        soft_stop_micro_eur=SOFT_STOP_MICRO_EUR,
+        external_ceiling_micro_eur=EXTERNAL_CEILING_MICRO_EUR,
+    )
 
 
 def test_litellm_config_is_single_model_callback_free_and_chat_completions() -> None:
@@ -521,7 +639,7 @@ def test_close_child_turn_requires_matching_issuer(tmp_path) -> None:
     assert row["state"] == "open"  # rejected mint attempt left the turn untouched
 
 
-def test_child_turn_cost_cap_and_scope_isolation(tmp_path, monkeypatch) -> None:
+def test_child_turn_cost_cap_and_scope_isolation(tmp_path) -> None:
     # Under the envelope-only caps (item 8) CHILD_TURN_MAX_MICRO_EUR
     # (95_000_000) equals TRIAL_CUTOFF_MICRO_EUR - by design, so that the
     # ledger's own cutoff/ceiling are the only limits a turn can actually
@@ -531,13 +649,26 @@ def test_child_turn_cost_cap_and_scope_isolation(tmp_path, monkeypatch) -> None:
     # cumulative committed total), so "trial spend cutoff would be
     # exceeded" fires instead of the per-turn "cost ceiling" this test
     # means to isolate - and doing it for real would also mean ~490 real
-    # settle cycles. Patch the per-turn cap down, decoupled from the trial
-    # cutoff, before initialize() so the committed child_cap_policy_hash
-    # matches throughout, and the underlying cost-ceiling code path (still
-    # real, still live for any deployment where the two caps differ) stays
+    # settle cycles. Pass an explicit, decoupled child_turn_max_micro_eur to
+    # initialize() (envelope-at-init, item 9/10: this is no longer a module
+    # constant a test can monkeypatch - it is chosen once at init and pinned
+    # into the ledger) so the committed child_cap_policy_hash matches
+    # throughout, and the underlying cost-ceiling code path (still real,
+    # still live for any deployment where the two caps differ) stays
     # covered without needing the two numbers to collide.
-    monkeypatch.setattr(gateway, "CHILD_TURN_MAX_MICRO_EUR", 500_000)
-    ledger = make_ledger(tmp_path)
+    child_turn_max_micro_eur = 500_000
+    ledger = SpendLedger(
+        tmp_path / "ledger.sqlite3",
+        tmp_path / "install.json",
+        now=Clock(datetime(2026, 7, 15, 12, tzinfo=timezone.utc)),
+    )
+    ledger.initialize(
+        opening_micro_eur=0,
+        opening_evidence=TEST_OPENING_EVIDENCE,
+        generation="a" * 32,
+        child_cap_issuer_token=TEST_CHILD_CAP_ISSUER,
+        child_turn_max_micro_eur=child_turn_max_micro_eur,
+    )
     first = ledger.open_child_turn(
         agent="qwen-dev-1",
         message_id="message-a",
@@ -546,12 +677,12 @@ def test_child_turn_cost_cap_and_scope_isolation(tmp_path, monkeypatch) -> None:
     )
     # Settle enough full-context/full-output attempts to push cumulative exposure to
     # just short of the cap, so the NEXT reservation (worst-case, at
-    # reservation_cost_micro_eur()) is the one that tips over CHILD_TURN_MAX_MICRO_EUR -
+    # reservation_cost_micro_eur()) is the one that tips over the per-turn cap -
     # derived from the live constants rather than a hardcoded count, so this stays
-    # correct whenever the tariff or caps change.
+    # correct whenever the tariff changes.
     per_settle = settlement_cost_micro_eur(MAX_CONTEXT_TOKENS, MAX_OUTPUT_TOKENS)
     calls_to_cap = (
-        gateway.CHILD_TURN_MAX_MICRO_EUR - reservation_cost_micro_eur()
+        child_turn_max_micro_eur - reservation_cost_micro_eur()
     ) // per_settle + 1
     assert calls_to_cap < gateway.CHILD_TURN_MAX_CALLS  # cost ceiling must bite first
     for ordinal in range(calls_to_cap):
@@ -753,6 +884,35 @@ def test_child_cap_migration_refuses_unresolved_attempt_without_partial_upgrade(
             "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'child_%'"
         ).fetchall()
         assert child_tables == []
+
+
+def test_child_cap_migration_of_a_pre_envelope_v1_ledger_pins_the_default_envelope(
+    tmp_path,
+) -> None:
+    # A genuinely pre-envelope v1 ledger (downgrade_to_v1_without_child_caps
+    # strips child_turn_max_micro_eur along with the other child-cap keys,
+    # simulating a ledger that predates this feature entirely - it never
+    # chose an envelope, so it has no opinion on its own per-turn cap) must
+    # migrate with the LIVE module default as its child-turn cap: the
+    # migration is the one place that default is the right source (PR #188's
+    # own red: an earlier version of this migration unconditionally
+    # re-inserted the key and collided with one a test ledger already had
+    # from its own post-envelope initialize()).
+    ledger = make_ledger(tmp_path)
+    downgrade_to_v1_without_child_caps(ledger)
+
+    installed = ledger.install_child_caps(issuer_token=TEST_CHILD_CAP_ISSUER)
+
+    assert installed["installed"] is True
+    assert installed["policy_hash"] == gateway.child_cap_policy_hash()
+    with sqlite3.connect(ledger.db_path) as conn:
+        assert conn.execute(
+            "SELECT value FROM metadata WHERE key='child_turn_max_micro_eur'"
+        ).fetchone()[0] == str(gateway.CHILD_TURN_MAX_MICRO_EUR)
+    status = ledger.status()
+    assert status["child_cap_ready"] is True
+    assert status["child_cap_policy_hash"] == gateway.child_cap_policy_hash()
+    assert status["child_turn_max_micro_eur"] == gateway.CHILD_TURN_MAX_MICRO_EUR
 
 
 def test_child_cap_migration_recovers_after_marker_projection_failure(

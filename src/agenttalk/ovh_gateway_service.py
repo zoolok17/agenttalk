@@ -11,6 +11,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 import re
+import shlex
 import signal
 import socket
 import subprocess  # nosec B404 - fixed schtasks/LiteLLM argv lists; shell is never used
@@ -22,10 +23,13 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from .ovh_gateway import (
+    EXTERNAL_CEILING_MICRO_EUR,
     INTERNAL_HOST,
     INTERNAL_PORT,
     PUBLIC_HOST,
     PUBLIC_PORT,
+    SOFT_STOP_MICRO_EUR,
+    TRIAL_CUTOFF_MICRO_EUR,
     GatewayConfigError,
     LedgerBlocked,
     LedgerHold,
@@ -79,6 +83,10 @@ LITELLM_LOG_RECORD_MAX_BYTES = 64 * 1024
 MAX_TASK_RESTARTS = 3
 TASK_RESTART_INTERVAL = "PT1M"
 TASK_PREFIX = "agenttalk-qwen-gateway"
+# Linux backend (systemd --user). Mirrors MAX_TASK_RESTARTS/TASK_RESTART_INTERVAL:
+# StartLimitBurst=MAX_TASK_RESTARTS within StartLimitIntervalSec=60 ("PT1M").
+SYSTEMD_START_LIMIT_INTERVAL_SEC = 60
+SYSTEMD_RESTART_SEC = 5
 _TASK_NS = "http://schemas.microsoft.com/windows/2004/02/mit/task"
 _LITELLM_VERSION_LINE = re.compile(
     rb"LiteLLM: Current Version = [0-9A-Za-z][0-9A-Za-z.!+_-]{0,127}"
@@ -439,6 +447,114 @@ class TaskCommands:
             raise GatewayConfigError("gateway task stop failed")
 
 
+def default_systemd_unit_dir() -> Path:
+    return Path.home() / ".config" / "systemd" / "user"
+
+
+def systemd_unit_path(unit_name: str) -> Path:
+    return default_systemd_unit_dir() / f"{unit_name}.service"
+
+
+def _linux_service_argv(project_root: str) -> list[str]:
+    return ["-m", "agenttalk", "--root", project_root, "gateway", "run"]
+
+
+def render_systemd_unit(identity: TaskIdentity) -> str:
+    argv = [identity.execute, *_linux_service_argv(identity.project_root)]
+    exec_start = " ".join(shlex.quote(part) for part in argv)
+    return (
+        "[Unit]\n"
+        "Description=agenttalk watched Qwen gateway\n"
+        f"StartLimitIntervalSec={SYSTEMD_START_LIMIT_INTERVAL_SEC}\n"
+        f"StartLimitBurst={MAX_TASK_RESTARTS}\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"ExecStart={exec_start}\n"
+        f"WorkingDirectory={identity.working_directory}\n"
+        "Restart=on-failure\n"
+        f"RestartSec={SYSTEMD_RESTART_SEC}\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+
+
+def systemd_unit_matches(unit_text: str, identity: TaskIdentity) -> bool:
+    # We are the only writer of this file (render_systemd_unit is a pure,
+    # deterministic function of identity) so byte-equality is both simpler
+    # and stricter than parsing the unit back — any hand edit or foreign
+    # unit at the expected path is correctly refused as non-matching, the
+    # same "never overwrite, only accept byte-equivalent" discipline
+    # task_xml_matches applies to the Windows Task Scheduler XML.
+    return unit_text == render_systemd_unit(identity)
+
+
+class SystemdUserCommands:
+    """Narrow injectable wrapper around ``systemctl --user`` (Linux backend)."""
+
+    def run(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(  # nosec B603  # noqa: S603
+                argv,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise GatewayConfigError("gateway systemd command failed") from exc
+
+    def query_unit(self, unit_name: str) -> str | None:
+        try:
+            return systemd_unit_path(unit_name).read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise GatewayConfigError("gateway systemd unit is unreadable") from exc
+
+    def install(self, unit_name: str, unit_text: str) -> None:
+        path = systemd_unit_path(unit_name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _durable_write_bytes(path, unit_text.encode("utf-8"))
+        result = self.run(["systemctl", "--user", "daemon-reload"])
+        if result.returncode != 0:
+            raise GatewayConfigError("gateway systemd daemon-reload failed")
+        result = self.run(["systemctl", "--user", "enable", unit_name])
+        if result.returncode != 0:
+            raise GatewayConfigError("gateway systemd unit enable failed")
+
+    def start(self, unit_name: str) -> None:
+        result = self.run(["systemctl", "--user", "start", unit_name])
+        if result.returncode != 0:
+            raise GatewayConfigError("gateway systemd unit start failed")
+
+    def stop(self, unit_name: str) -> None:
+        result = self.run(["systemctl", "--user", "stop", unit_name])
+        if result.returncode not in {0, 1}:
+            raise GatewayConfigError("gateway systemd unit stop failed")
+
+
+def _default_commands() -> "TaskCommands | SystemdUserCommands":
+    return TaskCommands() if sys.platform == "win32" else SystemdUserCommands()
+
+
+def _query_registration(
+    commands: "TaskCommands | SystemdUserCommands", identity: TaskIdentity
+) -> str | None:
+    if isinstance(commands, SystemdUserCommands):
+        return commands.query_unit(identity.task_name)
+    return commands.query_xml(identity.task_name)
+
+
+def _registration_matches(
+    commands: "TaskCommands | SystemdUserCommands", existing: str, identity: TaskIdentity
+) -> bool:
+    if isinstance(commands, SystemdUserCommands):
+        return systemd_unit_matches(existing, identity)
+    return task_xml_matches(existing, identity)
+
+
 class RuntimeProbeCommands:
     """Run one bounded candidate probe inside an owned process tree."""
 
@@ -668,11 +784,23 @@ class RuntimeProbeCommands:
 def install_task(
     root: str | os.PathLike[str],
     *,
-    commands: TaskCommands | None = None,
+    commands: "TaskCommands | SystemdUserCommands | None" = None,
     execute: str | os.PathLike[str] = sys.executable,
     principal: str | None = None,
 ) -> dict:
-    commands = commands or TaskCommands()
+    commands = commands or _default_commands()
+    if isinstance(commands, SystemdUserCommands):
+        return _install_task_linux(root, commands=commands, execute=execute)
+    return _install_task_windows(root, commands=commands, execute=execute, principal=principal)
+
+
+def _install_task_windows(
+    root: str | os.PathLike[str],
+    *,
+    commands: TaskCommands,
+    execute: str | os.PathLike[str],
+    principal: str | None,
+) -> dict:
     identity = expected_task_identity(root, execute=execute, principal=principal)
     existing = commands.query_xml(identity.task_name)
     if existing is not None:
@@ -698,6 +826,36 @@ def install_task(
     registered = commands.query_xml(identity.task_name)
     if registered is None or not task_xml_matches(registered, identity):
         raise GatewayConfigError("registered gateway task failed identity verification")
+    _durable_write_json(task_identity_path(root), asdict(identity))
+    return {"installed": True, "changed": True, **asdict(identity)}
+
+
+def _install_task_linux(
+    root: str | os.PathLike[str],
+    *,
+    commands: SystemdUserCommands,
+    execute: str | os.PathLike[str],
+) -> dict:
+    identity = expected_task_identity(root, execute=execute)
+    existing = commands.query_unit(identity.task_name)
+    if existing is not None:
+        if not systemd_unit_matches(existing, identity):
+            raise GatewayConfigError("refusing to replace a foreign or mismatched gateway unit")
+        _durable_write_json(task_identity_path(root), asdict(identity))
+        return {"installed": True, "changed": False, **asdict(identity)}
+    unit_text = render_systemd_unit(identity)
+    try:
+        commands.install(identity.task_name, unit_text)
+    except GatewayConfigError:
+        # Same never-overwrite race discipline as the Windows path above.
+        raced = commands.query_unit(identity.task_name)
+        if raced is None or not systemd_unit_matches(raced, identity):
+            raise
+        _durable_write_json(task_identity_path(root), asdict(identity))
+        return {"installed": True, "changed": False, **asdict(identity)}
+    registered = commands.query_unit(identity.task_name)
+    if registered is None or not systemd_unit_matches(registered, identity):
+        raise GatewayConfigError("registered gateway unit failed identity verification")
     _durable_write_json(task_identity_path(root), asdict(identity))
     return {"installed": True, "changed": True, **asdict(identity)}
 
@@ -729,6 +887,9 @@ def initialize_install(
     ledger: SpendLedger | None = None,
     front_token_path: Path | None = None,
     internal_token_path: Path | None = None,
+    trial_cutoff_micro_eur: int = TRIAL_CUTOFF_MICRO_EUR,
+    soft_stop_micro_eur: int = SOFT_STOP_MICRO_EUR,
+    external_ceiling_micro_eur: int = EXTERNAL_CEILING_MICRO_EUR,
 ) -> dict:
     """One-time state setup. It intentionally does not activate a task or key."""
     root = canonical_project_root(root)
@@ -743,6 +904,9 @@ def initialize_install(
             ledger=ledger,
             front_token_path=front_token_path,
             internal_token_path=internal_token_path,
+            trial_cutoff_micro_eur=trial_cutoff_micro_eur,
+            soft_stop_micro_eur=soft_stop_micro_eur,
+            external_ceiling_micro_eur=external_ceiling_micro_eur,
         )
 
 
@@ -756,6 +920,9 @@ def _initialize_install_locked(
     ledger: SpendLedger | None,
     front_token_path: Path | None,
     internal_token_path: Path | None,
+    trial_cutoff_micro_eur: int = TRIAL_CUTOFF_MICRO_EUR,
+    soft_stop_micro_eur: int = SOFT_STOP_MICRO_EUR,
+    external_ceiling_micro_eur: int = EXTERNAL_CEILING_MICRO_EUR,
 ) -> dict:
     if api_base != DEFAULT_API_BASE:
         raise GatewayConfigError("gateway install requires the pinned OVH API base")
@@ -780,6 +947,9 @@ def _initialize_install_locked(
         opening_micro_eur=opening_micro_eur,
         opening_evidence=opening_evidence,
         child_cap_issuer_token=front_token,
+        trial_cutoff_micro_eur=trial_cutoff_micro_eur,
+        soft_stop_micro_eur=soft_stop_micro_eur,
+        external_ceiling_micro_eur=external_ceiling_micro_eur,
     )
     _durable_write_bytes(
         config_path,
@@ -1542,20 +1712,20 @@ def run_service(
 def stop_task(
     root: str | os.PathLike[str],
     *,
-    commands: TaskCommands | None = None,
+    commands: "TaskCommands | SystemdUserCommands | None" = None,
     timeout_seconds: float = STOP_TIMEOUT_SECONDS,
 ) -> dict:
-    commands = commands or TaskCommands()
+    commands = commands or _default_commands()
     root = canonical_project_root(root)
     identity = expected_task_identity(root)
-    existing = commands.query_xml(identity.task_name)
+    existing = _query_registration(commands, identity)
     if existing is None:
         if _service_absent(root):
             return {"stopped": True, "task_present": False}
         raise GatewayConfigError(
             "gateway task is absent but runtime state or a loopback port remains occupied"
         )
-    if not task_xml_matches(existing, identity):
+    if not _registration_matches(commands, existing, identity):
         raise GatewayConfigError("refusing to stop a foreign or mismatched gateway task")
     kill = kill_switch_path(root)
     kill.parent.mkdir(parents=True, exist_ok=True)
@@ -1577,11 +1747,11 @@ def stop_task(
 def start_task(
     root: str | os.PathLike[str],
     *,
-    commands: TaskCommands | None = None,
+    commands: "TaskCommands | SystemdUserCommands | None" = None,
     ledger: SpendLedger | None = None,
     readiness_timeout_seconds: float = 30.0,
 ) -> dict:
-    commands = commands or TaskCommands()
+    commands = commands or _default_commands()
     root = canonical_project_root(root)
     load_install_manifest(root)
     ledger = ledger or SpendLedger()
@@ -1591,10 +1761,10 @@ def start_task(
     if not ledger_status["child_cap_ready"]:
         raise LedgerBlocked("gateway child turn cap is not structurally ready")
     identity = expected_task_identity(root)
-    existing = commands.query_xml(identity.task_name)
+    existing = _query_registration(commands, identity)
     if existing is None:
         raise GatewayConfigError("gateway task is not installed")
-    if not task_xml_matches(existing, identity):
+    if not _registration_matches(commands, existing, identity):
         raise GatewayConfigError("refusing to start a foreign or mismatched gateway task")
     current = gateway_status(root, commands=commands, ledger=ledger)
     if {"child_cap_issuer_mismatch", "front_token_unavailable"} & set(
@@ -1622,13 +1792,13 @@ def start_task(
 def gateway_status(
     root: str | os.PathLike[str],
     *,
-    commands: TaskCommands | None = None,
+    commands: "TaskCommands | SystemdUserCommands | None" = None,
     ledger: SpendLedger | None = None,
     front_token_path: Path | None = None,
     internal_token_path: Path | None = None,
 ) -> dict:
     """Return an allowlisted, non-secret service projection."""
-    commands = commands or TaskCommands()
+    commands = commands or _default_commands()
     root = canonical_project_root(root)
     ledger = ledger or SpendLedger()
     result = {
@@ -1667,14 +1837,14 @@ def gateway_status(
         result["errors"].append("ledger_blocked")
     try:
         identity = expected_task_identity(root)
-        task_xml = commands.query_xml(identity.task_name)
+        task_xml = _query_registration(commands, identity)
         try:
             stored_identity = json.loads(task_identity_path(root).read_text(encoding="utf-8"))
         except (OSError, ValueError):
             stored_identity = None
         result["task_identity_ok"] = (
             task_xml is not None
-            and task_xml_matches(task_xml, identity)
+            and _registration_matches(commands, task_xml, identity)
             and stored_identity == asdict(identity)
         )
         if not result["task_identity_ok"]:

@@ -24,6 +24,7 @@ from agenttalk.ovh_gateway import (
 )
 from agenttalk.ovh_gateway_service import (
     MAX_TASK_RESTARTS,
+    SystemdUserCommands,
     TaskCommands,
     _safe_gateway_environment,
     expected_task_identity,
@@ -34,11 +35,13 @@ from agenttalk.ovh_gateway_service import (
     kill_switch_path,
     litellm_config_path,
     project_task_name,
+    render_systemd_unit,
     render_task_xml,
     run_service,
     runtime_marker_path,
     start_task,
     stop_task,
+    systemd_unit_matches,
     task_identity_path,
     task_xml_matches,
 )
@@ -70,6 +73,37 @@ class RacingInstallCommands(FakeCommands):
 
     def install(self, task_name: str, _xml_path: Path) -> None:
         self.tasks[task_name] = render_task_xml(self.identity)
+        raise GatewayConfigError("concurrent installer won")
+
+
+class FakeSystemdCommands(SystemdUserCommands):
+    """Fakes ``systemctl --user`` exactly as FakeCommands fakes ``schtasks``."""
+
+    def __init__(self) -> None:
+        self.units: dict[str, str] = {}
+        self.stopped: list[str] = []
+        self.started: list[str] = []
+
+    def query_unit(self, unit_name: str) -> str | None:
+        return self.units.get(unit_name)
+
+    def install(self, unit_name: str, unit_text: str) -> None:
+        self.units[unit_name] = unit_text
+
+    def stop(self, unit_name: str) -> None:
+        self.stopped.append(unit_name)
+
+    def start(self, unit_name: str) -> None:
+        self.started.append(unit_name)
+
+
+class RacingInstallSystemdCommands(FakeSystemdCommands):
+    def __init__(self, identity) -> None:
+        super().__init__()
+        self.identity = identity
+
+    def install(self, unit_name: str, _unit_text: str) -> None:
+        self.units[unit_name] = render_systemd_unit(self.identity)
         raise GatewayConfigError("concurrent installer won")
 
 
@@ -239,6 +273,52 @@ def test_concurrent_exact_task_installer_converges_without_overwrite(tmp_path) -
     assert result["installed"] is True
     assert result["changed"] is False
     assert task_xml_matches(commands.tasks[identity.task_name], identity)
+
+
+def test_systemd_unit_pins_expected_exec_start_and_restart_policy(tmp_path) -> None:
+    identity = expected_task_identity(tmp_path, execute=tmp_path / "python3")
+    unit = render_systemd_unit(identity)
+    assert systemd_unit_matches(unit, identity)
+    assert unit.count("ExecStart=") == 1
+    assert unit.count("[Service]") == 1
+    assert f"StartLimitBurst={MAX_TASK_RESTARTS}" in unit
+    assert "Restart=on-failure" in unit
+    assert "-m agenttalk --root" in unit
+    assert "gateway run" in unit
+    assert "OVH_KEY" not in unit
+    assert "api_key" not in unit
+
+
+def test_linux_install_is_idempotent_and_refuses_foreign_unit(tmp_path) -> None:
+    commands = FakeSystemdCommands()
+    execute = tmp_path / "python3"
+    execute.write_bytes(b"")
+    identity = expected_task_identity(tmp_path, execute=execute)
+
+    result = install_task(tmp_path, commands=commands, execute=execute)
+    assert result["changed"] is True
+    assert task_identity_path(tmp_path).is_file()
+    result = install_task(tmp_path, commands=commands, execute=execute)
+    assert result["changed"] is False
+
+    commands.units[identity.task_name] = render_systemd_unit(
+        expected_task_identity(tmp_path, execute=tmp_path / "other-python3")
+    )
+    with pytest.raises(GatewayConfigError, match="foreign or mismatched"):
+        install_task(tmp_path, commands=commands, execute=execute)
+
+
+def test_linux_concurrent_exact_unit_installer_converges_without_overwrite(tmp_path) -> None:
+    execute = tmp_path / "python3"
+    execute.write_bytes(b"")
+    identity = expected_task_identity(tmp_path, execute=execute)
+    commands = RacingInstallSystemdCommands(identity)
+
+    result = install_task(tmp_path, commands=commands, execute=execute)
+
+    assert result["installed"] is True
+    assert result["changed"] is False
+    assert systemd_unit_matches(commands.units[identity.task_name], identity)
 
 
 def test_exclusive_bind_probe_refuses_occupied_listener() -> None:
@@ -593,6 +673,26 @@ def test_operator_stop_uses_gateway_kill_switch_before_bounded_task_end(tmp_path
     assert commands.stopped == [identity.task_name]
 
 
+def test_linux_operator_stop_uses_gateway_kill_switch_before_bounded_unit_stop(tmp_path) -> None:
+    commands = FakeSystemdCommands()
+    identity = expected_task_identity(tmp_path)
+    commands.units[identity.task_name] = render_systemd_unit(identity)
+    result = stop_task(tmp_path, commands=commands, timeout_seconds=0)
+    assert result == {"stopped": True, "forced": True, "task_present": True}
+    assert kill_switch_path(tmp_path).read_text(encoding="ascii") == "operator-stop\n"
+    assert commands.stopped == [identity.task_name]
+
+
+def test_linux_status_reports_absent_unit_before_any_install(tmp_path) -> None:
+    ledger = SpendLedger(
+        tmp_path / "spend" / "ledger.sqlite3", tmp_path / "spend" / "install.json"
+    )
+    status = gateway_status(tmp_path, commands=FakeSystemdCommands(), ledger=ledger)
+    assert status["task_identity_ok"] is False
+    assert "task_identity_invalid" in status["errors"]
+    assert status["ready"] is False
+
+
 def test_task_action_and_status_artifacts_contain_no_secret_values(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("OVH_KEY", "provider-key")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key")
@@ -904,6 +1004,41 @@ def test_start_is_idempotent_when_attested_service_is_already_ready(
         internal_token_path=tmp_path / "secrets" / "internal.txt",
     )
     commands = FakeCommands()
+    install_task(root, commands=commands)
+    monkeypatch.setattr(
+        service,
+        "gateway_status",
+        lambda *_args, **_kwargs: {"ready": True, "errors": []},
+    )
+
+    result = start_task(root, commands=commands, ledger=ledger)
+
+    assert result == {
+        "started": False,
+        "ready": True,
+        "task_name": project_task_name(root),
+    }
+    assert commands.started == []
+
+
+def test_linux_start_is_idempotent_when_attested_service_is_already_ready(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "project"
+    ledger = SpendLedger(tmp_path / "spend" / "ledger.sqlite3", tmp_path / "spend" / "install.json")
+    executable = tmp_path / "litellm.exe"
+    executable.write_bytes(b"fake")
+    initialize_install(
+        root,
+        litellm_executable=executable,
+        opening_micro_eur=0,
+        opening_evidence="test dashboard, observed 2026-07-16",
+        ledger=ledger,
+        front_token_path=tmp_path / "secrets" / "front.txt",
+        internal_token_path=tmp_path / "secrets" / "internal.txt",
+    )
+    commands = FakeSystemdCommands()
     install_task(root, commands=commands)
     monkeypatch.setattr(
         service,
