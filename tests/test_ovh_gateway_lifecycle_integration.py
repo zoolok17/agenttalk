@@ -11,7 +11,11 @@ import time
 import pytest
 
 from agenttalk import ovh_gateway_service as service
-from agenttalk.ovh_gateway import SpendLedger
+from agenttalk.ovh_gateway import (
+    SpendLedger,
+    default_install_marker_path,
+    default_ledger_path,
+)
 
 
 pytestmark = [
@@ -319,13 +323,16 @@ def _write_runtime_shim(path: Path, script_path: Path) -> None:
     )
 
 
-def _initialize_gateway(tmp_path: Path):
+def _initialize_gateway(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     root = tmp_path / "project"
     old_runtime = tmp_path / "old-runtime" / "litellm.exe"
     old_runtime.parent.mkdir(parents=True)
     old_runtime.write_bytes(b"old runtime")
-    ledger_db = tmp_path / "spend" / "ledger.sqlite3"
-    ledger_install = tmp_path / "spend" / "install.json"
+    # The rebind/reconfigure children and the in-process manifest reads resolve
+    # the ledger by default; point that default at this test's own ledger.
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    ledger_db = default_ledger_path()
+    ledger_install = default_install_marker_path()
     ledger = SpendLedger(ledger_db, ledger_install)
     front_token = tmp_path / "secrets" / "front.txt"
     internal_token = tmp_path / "secrets" / "internal.txt"
@@ -355,9 +362,10 @@ def _assert_ports_free() -> None:
 
 def test_real_process_rebind_serializes_reconfigure_without_stale_manifest_write(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _assert_ports_free()
-    root, _, _, _, _, _ = _initialize_gateway(tmp_path)
+    root, _, _, _, _, _ = _initialize_gateway(tmp_path, monkeypatch)
     config_path = service.litellm_config_path(root)
     manifest_path = service.install_manifest_path(root)
     stale_config = service.render_litellm_config(
@@ -432,6 +440,7 @@ def test_real_process_rebind_serializes_reconfigure_without_stale_manifest_write
 
 def test_real_process_service_startup_excludes_rebind_until_sockets_are_owned(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _assert_ports_free()
     (
@@ -441,7 +450,7 @@ def test_real_process_service_startup_excludes_rebind_until_sockets_are_owned(
         ledger_install,
         front_token,
         internal_token,
-    ) = _initialize_gateway(tmp_path)
+    ) = _initialize_gateway(tmp_path, monkeypatch)
     provider_key = tmp_path / "secrets" / "provider.txt"
     provider_key.write_text("provider-secret\n", encoding="utf-8")
     candidate_script = tmp_path / "candidate.py"

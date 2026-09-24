@@ -2116,6 +2116,21 @@ class SpendLedger:
                 self._rollback(conn)
                 raise
 
+    def policy_hashes(self) -> dict:
+        """The ledger's own verified policy hashes (what ``gateway init`` returns).
+
+        ``child_cap_policy_hash`` is None until the child caps are installed.
+        """
+        with self._connect() as conn:
+            metadata = self._metadata(conn)
+            ready = self._child_cap_feature_state(conn, metadata) == "ready"
+            return {
+                "price_policy_hash": metadata["price_policy_hash"],
+                "child_cap_policy_hash": (
+                    metadata["child_cap_policy_hash"] if ready else None
+                ),
+            }
+
     def status(self) -> dict:
         with self._connect() as conn:
             marker = self._marker()

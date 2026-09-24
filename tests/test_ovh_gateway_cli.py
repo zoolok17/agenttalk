@@ -248,10 +248,8 @@ def test_gateway_cli_runtime_rebind_final_probe_copy_failure_is_named_unknown(
     old_runtime = tmp_path / "old-runtime" / "litellm.exe"
     old_runtime.parent.mkdir()
     old_runtime.write_bytes(b"old runtime")
-    ledger = SpendLedger(
-        tmp_path / "spend" / "ledger.sqlite3",
-        tmp_path / "spend" / "install.json",
-    )
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    ledger = SpendLedger(default_ledger_path(), default_install_marker_path())
     ovh_gateway_service.initialize_install(
         root,
         litellm_executable=old_runtime,

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -35,6 +36,7 @@ from agenttalk.ovh_gateway_service import (
     kill_switch_path,
     litellm_config_path,
     project_task_name,
+    registration_identity,
     render_systemd_unit,
     render_task_xml,
     run_service,
@@ -45,6 +47,25 @@ from agenttalk.ovh_gateway_service import (
     task_identity_path,
     task_xml_matches,
 )
+
+
+class _DefaultEnvelopeLedger:
+    """Stands in for a ledger initialised at the module-default envelope."""
+
+    def policy_hashes(self) -> dict:
+        return {
+            "price_policy_hash": price_policy_hash(),
+            "child_cap_policy_hash": child_cap_policy_hash(),
+        }
+
+
+_DEFAULT_LEDGER = _DefaultEnvelopeLedger()
+
+
+@pytest.fixture(autouse=True)
+def _never_reach_the_live_ledger(tmp_path_factory, monkeypatch) -> None:
+    # A bare SpendLedger() resolves to the host's real ledger via LOCALAPPDATA.
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path_factory.mktemp("no-live-appdata")))
 
 
 class FakeCommands(TaskCommands):
@@ -177,6 +198,7 @@ def test_task_xml_pins_one_least_privilege_action_and_bounded_restart(tmp_path) 
         tmp_path,
         execute=tmp_path / "python.exe",
         principal="DOMAIN\\operator",
+        ledger=_DEFAULT_LEDGER,
     )
     xml = render_task_xml(identity)
     assert task_xml_matches(xml, identity)
@@ -193,6 +215,7 @@ def test_task_xml_matches_sid_normalized_scheduler_fixture(tmp_path, monkeypatch
         tmp_path,
         execute=tmp_path / "python.exe",
         principal="DOMAIN\\operator",
+        ledger=_DEFAULT_LEDGER,
     )
     sid = "S-1-5-21-111-222-333-1001"
     scheduler_xml = render_task_xml(identity).replace(
@@ -211,7 +234,7 @@ def test_task_xml_matches_sid_normalized_scheduler_fixture(tmp_path, monkeypatch
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows account SID lookup")
 def test_current_windows_principal_round_trips_as_scheduler_sid(tmp_path) -> None:
-    identity = expected_task_identity(tmp_path)
+    identity = expected_task_identity(tmp_path, ledger=_DEFAULT_LEDGER)
     sid = service._resolve_principal_sid(identity.principal)
     assert sid is not None
     assert sid.startswith("S-1-")
@@ -227,13 +250,14 @@ def test_install_is_idempotent_and_refuses_foreign_task(tmp_path) -> None:
     commands = FakeCommands()
     execute = tmp_path / "python.exe"
     execute.write_bytes(b"")
-    identity = expected_task_identity(tmp_path, execute=execute, principal="D\\u")
+    identity = expected_task_identity(tmp_path, execute=execute, principal="D\\u", ledger=_DEFAULT_LEDGER)
 
     result = install_task(
         tmp_path,
         commands=commands,
         execute=execute,
         principal="D\\u",
+        ledger=_DEFAULT_LEDGER,
     )
     assert result["changed"] is True
     assert task_identity_path(tmp_path).is_file()
@@ -242,11 +266,12 @@ def test_install_is_idempotent_and_refuses_foreign_task(tmp_path) -> None:
         commands=commands,
         execute=execute,
         principal="D\\u",
+        ledger=_DEFAULT_LEDGER,
     )
     assert result["changed"] is False
 
     commands.tasks[identity.task_name] = render_task_xml(
-        expected_task_identity(tmp_path, execute=tmp_path / "other.exe", principal="D\\u")
+        expected_task_identity(tmp_path, execute=tmp_path / "other.exe", principal="D\\u", ledger=_DEFAULT_LEDGER)
     )
     with pytest.raises(GatewayConfigError, match="foreign or mismatched"):
         install_task(
@@ -254,13 +279,14 @@ def test_install_is_idempotent_and_refuses_foreign_task(tmp_path) -> None:
             commands=commands,
             execute=execute,
             principal="D\\u",
+            ledger=_DEFAULT_LEDGER,
         )
 
 
 def test_concurrent_exact_task_installer_converges_without_overwrite(tmp_path) -> None:
     execute = tmp_path / "python.exe"
     execute.write_bytes(b"")
-    identity = expected_task_identity(tmp_path, execute=execute, principal="D\\u")
+    identity = expected_task_identity(tmp_path, execute=execute, principal="D\\u", ledger=_DEFAULT_LEDGER)
     commands = RacingInstallCommands(identity)
 
     result = install_task(
@@ -268,6 +294,7 @@ def test_concurrent_exact_task_installer_converges_without_overwrite(tmp_path) -
         commands=commands,
         execute=execute,
         principal="D\\u",
+        ledger=_DEFAULT_LEDGER,
     )
 
     assert result["installed"] is True
@@ -276,7 +303,7 @@ def test_concurrent_exact_task_installer_converges_without_overwrite(tmp_path) -
 
 
 def test_systemd_unit_pins_expected_exec_start_and_restart_policy(tmp_path) -> None:
-    identity = expected_task_identity(tmp_path, execute=tmp_path / "python3")
+    identity = expected_task_identity(tmp_path, execute=tmp_path / "python3", ledger=_DEFAULT_LEDGER)
     unit = render_systemd_unit(identity)
     assert systemd_unit_matches(unit, identity)
     assert unit.count("ExecStart=") == 1
@@ -293,28 +320,28 @@ def test_linux_install_is_idempotent_and_refuses_foreign_unit(tmp_path) -> None:
     commands = FakeSystemdCommands()
     execute = tmp_path / "python3"
     execute.write_bytes(b"")
-    identity = expected_task_identity(tmp_path, execute=execute)
+    identity = expected_task_identity(tmp_path, execute=execute, ledger=_DEFAULT_LEDGER)
 
-    result = install_task(tmp_path, commands=commands, execute=execute)
+    result = install_task(tmp_path, commands=commands, execute=execute, ledger=_DEFAULT_LEDGER)
     assert result["changed"] is True
     assert task_identity_path(tmp_path).is_file()
-    result = install_task(tmp_path, commands=commands, execute=execute)
+    result = install_task(tmp_path, commands=commands, execute=execute, ledger=_DEFAULT_LEDGER)
     assert result["changed"] is False
 
     commands.units[identity.task_name] = render_systemd_unit(
-        expected_task_identity(tmp_path, execute=tmp_path / "other-python3")
+        expected_task_identity(tmp_path, execute=tmp_path / "other-python3", ledger=_DEFAULT_LEDGER)
     )
     with pytest.raises(GatewayConfigError, match="foreign or mismatched"):
-        install_task(tmp_path, commands=commands, execute=execute)
+        install_task(tmp_path, commands=commands, execute=execute, ledger=_DEFAULT_LEDGER)
 
 
 def test_linux_concurrent_exact_unit_installer_converges_without_overwrite(tmp_path) -> None:
     execute = tmp_path / "python3"
     execute.write_bytes(b"")
-    identity = expected_task_identity(tmp_path, execute=execute)
+    identity = expected_task_identity(tmp_path, execute=execute, ledger=_DEFAULT_LEDGER)
     commands = RacingInstallSystemdCommands(identity)
 
-    result = install_task(tmp_path, commands=commands, execute=execute)
+    result = install_task(tmp_path, commands=commands, execute=execute, ledger=_DEFAULT_LEDGER)
 
     assert result["installed"] is True
     assert result["changed"] is False
@@ -665,7 +692,7 @@ def test_litellm_readiness_fails_immediately_when_process_exits() -> None:
 
 def test_operator_stop_uses_gateway_kill_switch_before_bounded_task_end(tmp_path) -> None:
     commands = FakeCommands()
-    identity = expected_task_identity(tmp_path)
+    identity = registration_identity(tmp_path)
     commands.tasks[identity.task_name] = render_task_xml(identity)
     result = stop_task(tmp_path, commands=commands, timeout_seconds=0)
     assert result == {"stopped": True, "forced": True, "task_present": True}
@@ -675,7 +702,7 @@ def test_operator_stop_uses_gateway_kill_switch_before_bounded_task_end(tmp_path
 
 def test_linux_operator_stop_uses_gateway_kill_switch_before_bounded_unit_stop(tmp_path) -> None:
     commands = FakeSystemdCommands()
-    identity = expected_task_identity(tmp_path)
+    identity = registration_identity(tmp_path)
     commands.units[identity.task_name] = render_systemd_unit(identity)
     result = stop_task(tmp_path, commands=commands, timeout_seconds=0)
     assert result == {"stopped": True, "forced": True, "task_present": True}
@@ -696,7 +723,7 @@ def test_linux_status_reports_absent_unit_before_any_install(tmp_path) -> None:
 def test_task_action_and_status_artifacts_contain_no_secret_values(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("OVH_KEY", "provider-key")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key")
-    identity = expected_task_identity(tmp_path)
+    identity = registration_identity(tmp_path)
     text = render_task_xml(identity)
     assert "provider-key" not in text
     assert "anthropic-key" not in text
@@ -765,8 +792,8 @@ def test_status_requires_attested_runtime_front_and_internal_liveliness(
         internal_token_path=internal_token,
     )
     commands = FakeCommands()
-    install_task(root, commands=commands)
-    manifest = service.load_install_manifest(root)
+    install_task(root, commands=commands, ledger=ledger)
+    manifest = service.load_install_manifest(root, ledger=ledger)
     start = service._process_start_token(os.getpid())
     runtime = {
         "schema_version": service.RUNTIME_SCHEMA_VERSION,
@@ -927,7 +954,7 @@ def test_start_waits_for_attested_readiness(tmp_path, monkeypatch) -> None:
     )
     ledger.place_hold(reason="start watched service before enabling paid proof")
     commands = FakeCommands()
-    install_task(root, commands=commands)
+    install_task(root, commands=commands, ledger=ledger)
     monkeypatch.setattr(service, "exclusive_bind_probe", lambda _host, _port: None)
     statuses = iter([
         {"ready": False, "errors": ["runtime_marker_missing"]},
@@ -970,7 +997,7 @@ def test_start_refuses_child_cap_issuer_mismatch_before_task_start(
         internal_token_path=tmp_path / "secrets" / "internal.txt",
     )
     commands = FakeCommands()
-    install_task(root, commands=commands)
+    install_task(root, commands=commands, ledger=ledger)
     monkeypatch.setattr(
         service,
         "gateway_status",
@@ -1004,7 +1031,7 @@ def test_start_is_idempotent_when_attested_service_is_already_ready(
         internal_token_path=tmp_path / "secrets" / "internal.txt",
     )
     commands = FakeCommands()
-    install_task(root, commands=commands)
+    install_task(root, commands=commands, ledger=ledger)
     monkeypatch.setattr(
         service,
         "gateway_status",
@@ -1039,7 +1066,7 @@ def test_linux_start_is_idempotent_when_attested_service_is_already_ready(
         internal_token_path=tmp_path / "secrets" / "internal.txt",
     )
     commands = FakeSystemdCommands()
-    install_task(root, commands=commands)
+    install_task(root, commands=commands, ledger=ledger)
     monkeypatch.setattr(
         service,
         "gateway_status",
@@ -1058,7 +1085,7 @@ def test_linux_start_is_idempotent_when_attested_service_is_already_ready(
 
 def test_forced_stop_removes_only_stale_marker_after_both_sockets_are_free(tmp_path) -> None:
     commands = FakeCommands()
-    identity = expected_task_identity(tmp_path)
+    identity = registration_identity(tmp_path)
     commands.tasks[identity.task_name] = render_task_xml(identity)
     runtime_marker_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
     runtime_marker_path(tmp_path).write_text("stale", encoding="utf-8")
@@ -1128,15 +1155,17 @@ def test_runtime_rebind_changes_only_manifest_executable_and_preserves_install_a
     tmp_path,
     monkeypatch,
 ) -> None:
-    root, old_runtime, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    root, old_runtime, ledger, _, _ = _install_for_runtime_rebind(tmp_path)
     candidate = tmp_path / "unusual runtime" / "launcher.shim"
     candidate.parent.mkdir()
     candidate.write_bytes(b"capable shim")
     execute = tmp_path / "agenttalk-python.exe"
     execute.write_bytes(b"python")
     commands = FakeCommands()
-    install_task(root, commands=commands, execute=execute, principal="D\\u")
-    identity = expected_task_identity(root, execute=execute, principal="D\\u")
+    install_task(root, commands=commands, execute=execute, principal="D\\u", ledger=ledger)
+    identity = expected_task_identity(
+        root, execute=execute, principal="D\\u", ledger=ledger
+    )
     registered_before = commands.tasks[identity.task_name]
     before_files = _file_snapshot(tmp_path)
     manifest_path = service.install_manifest_path(root)
@@ -1148,6 +1177,7 @@ def test_runtime_rebind_changes_only_manifest_executable_and_preserves_install_a
         root,
         litellm_executable=candidate,
         probe_commands=probe,
+        ledger=ledger,
     )
 
     manifest_after = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1170,7 +1200,7 @@ def test_runtime_rebind_changes_only_manifest_executable_and_preserves_install_a
         litellm_config_path(root).read_bytes()
     ).hexdigest()
     assert manifest_after["price_policy_hash"] == price_policy_hash()
-    assert service.load_install_manifest(root) == manifest_after
+    assert service.load_install_manifest(root, ledger=ledger) == manifest_after
     assert result == {
         "runtime_rebound": True,
         "changed": True,
@@ -1191,7 +1221,7 @@ def test_runtime_rebind_repairs_missing_outgoing_runtime_without_probing_it(
     tmp_path,
     monkeypatch,
 ) -> None:
-    root, old_runtime, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    root, old_runtime, ledger, _, _ = _install_for_runtime_rebind(tmp_path)
     old_runtime.unlink()
     candidate = tmp_path / "new-runtime.exe"
     candidate.write_bytes(b"working")
@@ -1202,6 +1232,7 @@ def test_runtime_rebind_repairs_missing_outgoing_runtime_without_probing_it(
         root,
         litellm_executable=candidate,
         probe_commands=probe,
+        ledger=ledger,
     )
 
     assert result["runtime_rebound"] is True
@@ -1212,7 +1243,7 @@ def test_runtime_rebind_probes_only_candidate_not_unusable_outgoing_runtime(
     tmp_path,
     monkeypatch,
 ) -> None:
-    root, old_runtime, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    root, old_runtime, ledger, _, _ = _install_for_runtime_rebind(tmp_path)
     candidate = tmp_path / "working-runtime.exe"
     candidate.write_bytes(b"working")
     probe = FakeRuntimeProbeCommands()
@@ -1222,6 +1253,7 @@ def test_runtime_rebind_probes_only_candidate_not_unusable_outgoing_runtime(
         root,
         litellm_executable=candidate,
         probe_commands=probe,
+        ledger=ledger,
     )
 
     assert old_runtime.is_file()
@@ -1234,7 +1266,7 @@ def test_runtime_rebind_refuses_running_gateway_before_candidate_probe(
     tmp_path,
     monkeypatch,
 ) -> None:
-    root, _, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    root, _, ledger, _, _ = _install_for_runtime_rebind(tmp_path)
     candidate = tmp_path / "missing-runtime.exe"
     probe = FakeRuntimeProbeCommands(error=AssertionError("probe must not run"))
     monkeypatch.setattr(service, "_both_sockets_free", lambda: False)
@@ -1245,6 +1277,7 @@ def test_runtime_rebind_refuses_running_gateway_before_candidate_probe(
             root,
             litellm_executable=candidate,
             probe_commands=probe,
+            ledger=ledger,
         )
 
     assert probe.calls == []
@@ -1281,7 +1314,7 @@ def test_runtime_rebind_refuses_candidate_without_mutating_install(
     case,
     expected_reason,
 ) -> None:
-    root, _, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    root, _, ledger, _, _ = _install_for_runtime_rebind(tmp_path)
     candidate = tmp_path / "candidate-runtime.exe"
     if case != "missing":
         candidate.write_bytes(b"candidate")
@@ -1302,6 +1335,7 @@ def test_runtime_rebind_refuses_candidate_without_mutating_install(
             root,
             litellm_executable=candidate,
             probe_commands=probe,
+            ledger=ledger,
         )
 
     message = str(exc_info.value)
@@ -1342,7 +1376,7 @@ def test_runtime_rebind_reader_thread_failure_is_retryable_unknown(
     monkeypatch,
     failure_at,
 ) -> None:
-    root, _, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    root, _, ledger, _, _ = _install_for_runtime_rebind(tmp_path)
     candidate = tmp_path / "candidate-runtime"
     candidate.write_bytes(b"candidate")
     candidate_started = tmp_path / "candidate.started"
@@ -1392,7 +1426,7 @@ def test_runtime_rebind_reader_thread_failure_is_retryable_unknown(
     before = _file_snapshot(tmp_path)
 
     with pytest.raises(service.LiteLLMRuntimeProbeUnknown) as exc_info:
-        service.rebind_runtime(root, litellm_executable=candidate)
+        service.rebind_runtime(root, litellm_executable=candidate, ledger=ledger)
 
     assert exc_info.value.reason_code == "litellm_runtime_probe_unknown"
     assert exc_info.value.retryable is True
@@ -1416,7 +1450,7 @@ def test_runtime_rebind_refuses_invalid_bound_manifest_before_probe(
     monkeypatch,
     corruption,
 ) -> None:
-    root, _, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    root, _, ledger, _, _ = _install_for_runtime_rebind(tmp_path)
     candidate = tmp_path / "candidate-runtime.exe"
     candidate.write_bytes(b"candidate")
     manifest_path = service.install_manifest_path(root)
@@ -1437,6 +1471,7 @@ def test_runtime_rebind_refuses_invalid_bound_manifest_before_probe(
             root,
             litellm_executable=candidate,
             probe_commands=probe,
+            ledger=ledger,
         )
 
     assert probe.calls == []
@@ -1447,7 +1482,7 @@ def test_runtime_rebind_same_path_reprobes_and_is_byte_idempotent(
     tmp_path,
     monkeypatch,
 ) -> None:
-    root, old_runtime, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    root, old_runtime, ledger, _, _ = _install_for_runtime_rebind(tmp_path)
     probe = FakeRuntimeProbeCommands()
     monkeypatch.setattr(service, "_both_sockets_free", lambda: True)
     before = _file_snapshot(tmp_path)
@@ -1456,6 +1491,7 @@ def test_runtime_rebind_same_path_reprobes_and_is_byte_idempotent(
         root,
         litellm_executable=old_runtime,
         probe_commands=probe,
+        ledger=ledger,
     )
 
     assert result["changed"] is False
@@ -1467,7 +1503,7 @@ def test_runtime_rebind_accepts_valid_identity_without_path_shape_rules(
     tmp_path,
     monkeypatch,
 ) -> None:
-    root, _, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    root, _, ledger, _, _ = _install_for_runtime_rebind(tmp_path)
     candidate = tmp_path / "odd path" / "launcher.with-unfamiliar-suffix"
     candidate.parent.mkdir()
     candidate.write_bytes(b"shim")
@@ -1478,6 +1514,7 @@ def test_runtime_rebind_accepts_valid_identity_without_path_shape_rules(
         root,
         litellm_executable=candidate,
         probe_commands=probe,
+        ledger=ledger,
     )
 
     assert result["litellm_executable"] == str(candidate.resolve())
@@ -1487,7 +1524,7 @@ def test_runtime_rebind_accepts_symlinked_launcher_when_host_supports_it(
     tmp_path,
     monkeypatch,
 ) -> None:
-    root, _, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    root, _, ledger, _, _ = _install_for_runtime_rebind(tmp_path)
     target = tmp_path / "runtime-target.exe"
     target.write_bytes(b"working")
     candidate = tmp_path / "runtime-link.exe"
@@ -1502,6 +1539,7 @@ def test_runtime_rebind_accepts_symlinked_launcher_when_host_supports_it(
         root,
         litellm_executable=candidate,
         probe_commands=probe,
+        ledger=ledger,
     )
 
     assert result["litellm_executable"] == str(target.resolve())
@@ -1520,8 +1558,10 @@ def test_runtime_rebind_keeps_registered_task_bytes_but_run_uses_new_manifest_ru
     execute = tmp_path / "agenttalk-python.exe"
     execute.write_bytes(b"python")
     commands = FakeCommands()
-    identity = expected_task_identity(root, execute=execute, principal="D\\u")
-    install_task(root, commands=commands, execute=execute, principal="D\\u")
+    identity = expected_task_identity(
+        root, execute=execute, principal="D\\u", ledger=ledger
+    )
+    install_task(root, commands=commands, execute=execute, principal="D\\u", ledger=ledger)
     registered_before = commands.tasks[identity.task_name]
     task_xml = service.gateway_state_dir(root) / "task.xml"
     task_xml_before = task_xml.read_bytes()
@@ -1531,6 +1571,7 @@ def test_runtime_rebind_keeps_registered_task_bytes_but_run_uses_new_manifest_ru
         root,
         litellm_executable=candidate,
         probe_commands=FakeRuntimeProbeCommands(),
+        ledger=ledger,
     )
     provider_key = tmp_path / "secrets" / "provider.txt"
     provider_key.write_text("provider-secret\n", encoding="utf-8")
@@ -1571,13 +1612,13 @@ def test_runtime_rebind_real_probe_rejects_zero_exit_non_litellm_executable(
     tmp_path,
     monkeypatch,
 ) -> None:
-    root, _, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    root, _, ledger, _, _ = _install_for_runtime_rebind(tmp_path)
     candidate = Path(os.environ["COMSPEC"])
     monkeypatch.setattr(service, "_both_sockets_free", lambda: True)
     before = _file_snapshot(tmp_path)
 
     with pytest.raises(GatewayConfigError, match="litellm_runtime_probe_failed"):
-        service.rebind_runtime(root, litellm_executable=candidate)
+        service.rebind_runtime(root, litellm_executable=candidate, ledger=ledger)
 
     assert _file_snapshot(tmp_path) == before
 
@@ -1589,7 +1630,7 @@ def test_runtime_rebind_real_probe_accepts_relative_forwarding_shim_with_odd_pat
     monkeypatch,
     suffix,
 ) -> None:
-    root, _, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    root, _, ledger, _, _ = _install_for_runtime_rebind(tmp_path)
     candidate = _write_windows_litellm_identity_shim(
         tmp_path / "runtime path & Unicode Ω",
         suffix=suffix,
@@ -1601,6 +1642,7 @@ def test_runtime_rebind_real_probe_accepts_relative_forwarding_shim_with_odd_pat
     result = service.rebind_runtime(
         root,
         litellm_executable=relative_candidate,
+        ledger=ledger,
     )
 
     assert result["litellm_executable"] == str(candidate.resolve())
@@ -1611,7 +1653,7 @@ def test_runtime_rebind_real_probe_timeout_tears_down_candidate_descendants(
     tmp_path,
     monkeypatch,
 ) -> None:
-    root, _, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    root, _, ledger, _, _ = _install_for_runtime_rebind(tmp_path)
     runtime_dir = tmp_path / "timeout runtime"
     runtime_dir.mkdir()
     ready = runtime_dir / "child.ready"
@@ -1654,7 +1696,7 @@ sentinel.write_text(\"survived\", encoding=\"ascii\")
     manifest_before = service.install_manifest_path(root).read_bytes()
 
     with pytest.raises(GatewayConfigError, match="litellm_runtime_probe_unknown"):
-        service.rebind_runtime(root, litellm_executable=candidate)
+        service.rebind_runtime(root, litellm_executable=candidate, ledger=ledger)
 
     assert ready.is_file(), "fixture never proved that the descendant started"
     release.write_text("release", encoding="ascii")
@@ -1670,7 +1712,7 @@ def test_runtime_rebind_real_probe_rejects_oversized_untrusted_output(
     tmp_path,
     monkeypatch,
 ) -> None:
-    root, _, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    root, _, ledger, _, _ = _install_for_runtime_rebind(tmp_path)
     runtime_dir = tmp_path / "noisy runtime"
     runtime_dir.mkdir()
     implementation = runtime_dir / "noisy.py"
@@ -1683,14 +1725,14 @@ def test_runtime_rebind_real_probe_rejects_oversized_untrusted_output(
     monkeypatch.setattr(service, "_both_sockets_free", lambda: True)
 
     with pytest.raises(GatewayConfigError, match="litellm_runtime_probe_failed"):
-        service.rebind_runtime(root, litellm_executable=candidate)
+        service.rebind_runtime(root, litellm_executable=candidate, ledger=ledger)
 
 
 def test_runtime_rebind_compare_and_swap_refuses_candidate_manifest_mutation(
     tmp_path,
     monkeypatch,
 ) -> None:
-    root, _, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    root, _, ledger, _, _ = _install_for_runtime_rebind(tmp_path)
     candidate = tmp_path / "candidate-runtime.exe"
     candidate.write_bytes(b"candidate")
     manifest_path = service.install_manifest_path(root)
@@ -1709,6 +1751,7 @@ def test_runtime_rebind_compare_and_swap_refuses_candidate_manifest_mutation(
             root,
             litellm_executable=candidate,
             probe_commands=FakeRuntimeProbeCommands(side_effect=mutate_manifest),
+            ledger=ledger,
         )
 
     assert manifest_path.read_bytes() == mutated["bytes"]
@@ -1719,7 +1762,7 @@ def test_runtime_rebind_serializes_supported_reconfigure_before_manifest_write(
     tmp_path,
     monkeypatch,
 ) -> None:
-    root, _, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    root, _, ledger, _, _ = _install_for_runtime_rebind(tmp_path)
     candidate = _write_windows_litellm_identity_shim(tmp_path / "race runtime")
     manifest_path = service.install_manifest_path(root)
     before_candidate_write = threading.Event()
@@ -1741,13 +1784,13 @@ def test_runtime_rebind_serializes_supported_reconfigure_before_manifest_write(
 
     def do_rebind() -> None:
         try:
-            service.rebind_runtime(root, litellm_executable=candidate)
+            service.rebind_runtime(root, litellm_executable=candidate, ledger=ledger)
         except BaseException as exc:  # noqa: BLE001 - asserted across the thread boundary
             errors["rebind"] = exc
 
     def do_reconfigure() -> None:
         try:
-            service.reconfigure_endpoint(root)
+            service.reconfigure_endpoint(root, ledger=ledger)
         except BaseException as exc:  # noqa: BLE001 - asserted across the thread boundary
             errors["reconfigure"] = exc
         finally:
@@ -1770,7 +1813,7 @@ def test_runtime_rebind_serializes_supported_reconfigure_before_manifest_write(
     assert not reconfigure_thread.is_alive()
     assert interleaved is False
     assert errors == {}
-    manifest = service.load_install_manifest(root)
+    manifest = service.load_install_manifest(root, ledger=ledger)
     assert manifest["litellm_executable"] == str(candidate.resolve())
     assert manifest["litellm_config_sha256"] == hashlib.sha256(
         litellm_config_path(root).read_bytes()
@@ -1872,6 +1915,7 @@ def test_runtime_rebind_waits_for_service_startup_then_refuses_owned_sockets(
                 root,
                 litellm_executable=candidate,
                 probe_commands=FakeRuntimeProbeCommands(),
+                ledger=ledger,
             )
         except BaseException as exc:  # noqa: BLE001 - asserted across the thread boundary
             errors["rebind"] = exc
@@ -1900,7 +1944,7 @@ def test_runtime_rebind_waits_for_service_startup_then_refuses_owned_sockets(
     assert isinstance(errors.get("rebind"), GatewayConfigError)
     assert "while the gateway is running" in str(errors["rebind"])
     assert "run" not in errors
-    assert service.load_install_manifest(root)["litellm_executable"] == str(
+    assert service.load_install_manifest(root, ledger=ledger)["litellm_executable"] == str(
         old_runtime.resolve()
     )
 
@@ -1926,7 +1970,7 @@ def test_reconfigure_rebinds_config_and_manifest_and_preserves_ledger_and_tokens
     front_before = front_token.read_bytes()
     internal_before = internal_token.read_bytes()
 
-    result = service.reconfigure_endpoint(root)
+    result = service.reconfigure_endpoint(root, ledger=ledger)
 
     assert result["reconfigured"] is True
     assert result["changed"] is True
@@ -1936,7 +1980,7 @@ def test_reconfigure_rebinds_config_and_manifest_and_preserves_ledger_and_tokens
     ).encode("utf-8")
     assert cfg.read_bytes() == expected_cfg
     assert result["config_sha256"] == hashlib.sha256(expected_cfg).hexdigest()
-    reloaded = service.load_install_manifest(root)
+    reloaded = service.load_install_manifest(root, ledger=ledger)
     assert reloaded["litellm_config_sha256"] == result["config_sha256"]
     # Ledger marker + both tokens are byte-for-byte untouched.
     assert install_json.read_bytes() == ledger_before
@@ -1951,7 +1995,7 @@ def test_reconfigure_refuses_while_gateway_running(tmp_path, monkeypatch) -> Non
     root, _, _ = _install_for_reconfigure(tmp_path, ledger)
     monkeypatch.setattr(service, "_both_sockets_free", lambda: False)
     with pytest.raises(GatewayConfigError, match="while the gateway is running"):
-        service.reconfigure_endpoint(root)
+        service.reconfigure_endpoint(root, ledger=ledger)
 
 
 def test_reconfigure_requires_existing_install(tmp_path) -> None:
@@ -1966,8 +2010,261 @@ def test_reconfigure_is_idempotent_on_a_fresh_install(tmp_path, monkeypatch) -> 
     )
     root, _, _ = _install_for_reconfigure(tmp_path, ledger)
     # A fresh install already renders the pinned base, so reconfigure is a no-op.
-    first = service.reconfigure_endpoint(root)
+    first = service.reconfigure_endpoint(root, ledger=ledger)
     assert first["changed"] is False
-    second = service.reconfigure_endpoint(root)
+    second = service.reconfigure_endpoint(root, ledger=ledger)
     assert second["changed"] is False
     assert second["config_sha256"] == first["config_sha256"]
+
+
+NON_DEFAULT_ENVELOPE = {
+    "trial_cutoff_micro_eur": 40_000_000,
+    "soft_stop_micro_eur": 36_000_000,
+    "external_ceiling_micro_eur": 60_000_000,
+}
+
+
+def _install_at_envelope(tmp_path, name, **envelope):
+    base = tmp_path / name
+    root = base / "project"
+    ledger = SpendLedger(base / "spend" / "ledger.sqlite3", base / "spend" / "install.json")
+    base.mkdir(parents=True)
+    executable = base / "litellm.exe"
+    executable.write_bytes(b"fake")
+    front_token = base / "secrets" / "front.txt"
+    internal_token = base / "secrets" / "internal.txt"
+    result = initialize_install(
+        root,
+        litellm_executable=executable,
+        opening_micro_eur=580_000,
+        opening_evidence="test dashboard, observed 2026-07-16",
+        ledger=ledger,
+        front_token_path=front_token,
+        internal_token_path=internal_token,
+        **envelope,
+    )
+    return root, ledger, front_token, internal_token, result
+
+
+def _capture_runtime_marker(monkeypatch, root, ledger, front_token, internal_token, key):
+    captured: dict[str, dict] = {}
+
+    class FakeProcess:
+        pid = os.getpid()
+        stdout = io.StringIO("")
+
+        def poll(self):
+            return None
+
+        def terminate(self) -> None:
+            return
+
+        def kill(self) -> None:
+            return
+
+        def wait(self, timeout=None) -> int:
+            return 0
+
+    class FakeServer:
+        def serve_forever(self, **_kwargs) -> None:
+            captured["marker"] = json.loads(
+                runtime_marker_path(root).read_text(encoding="utf-8")
+            )
+
+        def shutdown(self) -> None:
+            return
+
+        def server_close(self) -> None:
+            return
+
+    class FakeFront:
+        def __init__(self, _config, _ledger) -> None:
+            return
+
+        def make_server(self):
+            return FakeServer()
+
+        def drain(self, _timeout) -> bool:
+            return True
+
+    key.parent.mkdir(parents=True, exist_ok=True)
+    key.write_text("provider-secret\n", encoding="utf-8")
+    with monkeypatch.context() as scoped:
+        scoped.setattr(service, "exclusive_bind_probe", lambda _host, _port: None)
+        scoped.setattr(service, "_wait_liveliness", lambda _front, _process: None)
+        scoped.setattr(service, "GatewayFront", FakeFront)
+        rc = run_service(
+            root,
+            ledger=ledger,
+            key_path=key,
+            front_token_path=front_token,
+            internal_token_path=internal_token,
+            child_log_path=key.parent / "litellm.log",
+            popen=lambda *_args, **_kwargs: FakeProcess(),
+        )
+    assert rc == 0
+    return captured["marker"]
+
+
+def test_non_default_envelope_binds_the_ledger_hash_in_every_service_artifact(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.delenv("OVH_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    root, ledger, front_token, internal_token, result = _install_at_envelope(
+        tmp_path, "custom", **NON_DEFAULT_ENVELOPE
+    )
+    ledger_hashes = ledger.policy_hashes()
+    ledger_price_hash = ledger_hashes["price_policy_hash"]
+    ledger_cap_hash = ledger_hashes["child_cap_policy_hash"]
+    assert ledger_price_hash == result["price_policy_hash"]
+    assert ledger_price_hash != price_policy_hash()
+    assert ledger_cap_hash != child_cap_policy_hash()
+
+    manifest = json.loads(service.install_manifest_path(root).read_text(encoding="utf-8"))
+    assert manifest["price_policy_hash"] == ledger_price_hash
+    assert service.load_install_manifest(root, ledger=ledger) == manifest
+
+    commands = FakeCommands()
+    installed = install_task(root, commands=commands, ledger=ledger)
+    stored_identity = json.loads(task_identity_path(root).read_text(encoding="utf-8"))
+    assert installed["price_policy_hash"] == ledger_price_hash
+    assert stored_identity["price_policy_hash"] == ledger_price_hash
+    assert expected_task_identity(root, ledger=ledger).price_policy_hash == ledger_price_hash
+
+    marker = _capture_runtime_marker(
+        monkeypatch,
+        root,
+        ledger,
+        front_token,
+        internal_token,
+        tmp_path / "custom" / "k" / "key.txt",
+    )
+    assert marker["price_policy_hash"] == ledger_price_hash
+    assert marker["child_cap_policy_hash"] == ledger_cap_hash
+
+    service._durable_write_json(runtime_marker_path(root), marker)
+    monkeypatch.setattr(
+        service,
+        "exclusive_bind_probe",
+        lambda _host, _port: (_ for _ in ()).throw(GatewayConfigError("occupied")),
+    )
+    monkeypatch.setattr(service.GatewayFront, "internal_liveliness", lambda _self: True)
+    monkeypatch.setattr(service, "_public_front_attested", lambda: True)
+    status = gateway_status(
+        root,
+        commands=commands,
+        ledger=ledger,
+        front_token_path=front_token,
+        internal_token_path=internal_token,
+    )
+    assert status["ready"] is True
+    assert status["price_policy_hash"] == ledger_price_hash
+    assert status["child_cap_policy_hash"] == ledger_cap_hash
+    assert status["price_policy_hash"] == status["ledger"]["policy_hash"]
+    assert status["runtime"]["price_policy_hash"] == ledger_price_hash
+    assert status["runtime"]["child_cap_policy_hash"] == ledger_cap_hash
+
+    stale_marker = dict(marker, price_policy_hash=price_policy_hash())
+    service._durable_write_json(runtime_marker_path(root), stale_marker)
+    stale = gateway_status(
+        root,
+        commands=commands,
+        ledger=ledger,
+        front_token_path=front_token,
+        internal_token_path=internal_token,
+    )
+    assert "runtime_marker_invalid" in stale["errors"]
+    assert stale["ready"] is False
+
+
+def test_default_envelope_install_is_byte_identical_to_the_module_defaults(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.delenv("OVH_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    root, ledger, front_token, internal_token, result = _install_at_envelope(
+        tmp_path, "default"
+    )
+    assert result["price_policy_hash"] == price_policy_hash()
+    assert ledger.policy_hashes() == {
+        "price_policy_hash": price_policy_hash(),
+        "child_cap_policy_hash": child_cap_policy_hash(),
+    }
+    manifest = json.loads(service.install_manifest_path(root).read_text(encoding="utf-8"))
+    assert manifest["price_policy_hash"] == price_policy_hash()
+    commands = FakeCommands()
+    install_task(root, commands=commands, ledger=ledger)
+    stored_identity = json.loads(task_identity_path(root).read_text(encoding="utf-8"))
+    assert stored_identity == asdict(expected_task_identity(root, ledger=_DEFAULT_LEDGER))
+    assert stored_identity["price_policy_hash"] == price_policy_hash()
+    marker = _capture_runtime_marker(
+        monkeypatch,
+        root,
+        ledger,
+        front_token,
+        internal_token,
+        tmp_path / "default" / "k" / "key.txt",
+    )
+    assert marker["price_policy_hash"] == price_policy_hash()
+    assert marker["child_cap_policy_hash"] == child_cap_policy_hash()
+
+
+def test_manifest_and_task_written_under_one_envelope_fail_against_another_ledger(
+    tmp_path, monkeypatch
+) -> None:
+    root, default_ledger, front_token, internal_token, _ = _install_at_envelope(
+        tmp_path, "default"
+    )
+    commands = FakeCommands()
+    install_task(root, commands=commands, ledger=default_ledger)
+    other = SpendLedger(
+        tmp_path / "other" / "ledger.sqlite3", tmp_path / "other" / "install.json"
+    )
+    other.initialize(
+        opening_micro_eur=580_000,
+        opening_evidence="test dashboard, observed 2026-07-16",
+        child_cap_issuer_token=front_token.read_text(encoding="utf-8").strip(),
+        **NON_DEFAULT_ENVELOPE,
+    )
+    assert other.policy_hashes()["price_policy_hash"] != price_policy_hash()
+
+    with pytest.raises(GatewayConfigError, match="price policy mismatch"):
+        service.load_install_manifest(root, ledger=other)
+    before = _file_snapshot(root)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(service, "_both_sockets_free", lambda: True)
+        # A changed pinned endpoint would be rewritten if the refusal came too late.
+        scoped.setattr(service, "DEFAULT_API_BASE", "https://fresh.example/v1")
+        with pytest.raises(GatewayConfigError, match="price policy mismatch"):
+            service.reconfigure_endpoint(root, ledger=other)
+        assert _file_snapshot(root) == before
+        with pytest.raises(GatewayConfigError, match="price policy mismatch"):
+            service.rebind_runtime(
+                root, litellm_executable=tmp_path / "default" / "litellm.exe", ledger=other
+            )
+        assert _file_snapshot(root) == before
+    assert service.load_install_manifest(root, ledger=default_ledger)
+
+    status = gateway_status(
+        root,
+        commands=commands,
+        ledger=other,
+        front_token_path=front_token,
+        internal_token_path=internal_token,
+    )
+    assert "install_manifest_invalid" in status["errors"]
+    assert "task_identity_invalid" in status["errors"]
+    assert status["task_identity_ok"] is False
+    assert status["price_policy_hash"] == other.policy_hashes()["price_policy_hash"]
+
+
+def test_status_reports_no_policy_hash_when_the_ledger_is_unavailable(tmp_path) -> None:
+    ledger = SpendLedger(
+        tmp_path / "spend" / "ledger.sqlite3", tmp_path / "spend" / "install.json"
+    )
+    status = gateway_status(tmp_path, commands=FakeCommands(), ledger=ledger)
+    assert status["price_policy_hash"] is None
+    assert status["child_cap_policy_hash"] is None
+    assert "ledger_blocked" in status["errors"]
+    assert status["task_identity_ok"] is False

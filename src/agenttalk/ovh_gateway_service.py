@@ -36,13 +36,11 @@ from .ovh_gateway import (
     SpendLedger,
     _durable_write_bytes,
     _durable_write_json,
-    child_cap_policy_hash,
     default_front_token_path,
     default_internal_token_path,
     default_key_path,
     default_secret_dir,
     generate_token,
-    price_policy_hash,
     read_secret_file,
     render_litellm_config,
     write_secret_file,
@@ -206,11 +204,46 @@ def _task_arguments(root: Path) -> str:
     return f'-m agenttalk --root "{root}" gateway run'
 
 
+def _ledger_policy_hashes(ledger: SpendLedger | None) -> dict:
+    return (ledger or SpendLedger()).policy_hashes()
+
+
 def expected_task_identity(
     root: str | os.PathLike[str],
     *,
     execute: str | os.PathLike[str] = sys.executable,
     principal: str | None = None,
+    ledger: SpendLedger | None = None,
+) -> TaskIdentity:
+    """The identity a registered task must match, bound to the ledger's own policy hash."""
+    return _task_identity(
+        root,
+        execute=execute,
+        principal=principal,
+        policy_hash=_ledger_policy_hashes(ledger)["price_policy_hash"],
+    )
+
+
+def registration_identity(
+    root: str | os.PathLike[str],
+    *,
+    execute: str | os.PathLike[str] = sys.executable,
+    principal: str | None = None,
+) -> TaskIdentity:
+    """Identity for matching a registration only; deliberately ledger-independent.
+
+    The policy hash is not part of the rendered task/unit, so operator stop must
+    keep working when the ledger is blocked. Never persist or compare this one.
+    """
+    return _task_identity(root, execute=execute, principal=principal, policy_hash="")
+
+
+def _task_identity(
+    root: str | os.PathLike[str],
+    *,
+    execute: str | os.PathLike[str],
+    principal: str | None,
+    policy_hash: str,
 ) -> TaskIdentity:
     project = canonical_project_root(root)
     resolved_execute = str(Path(execute).resolve())
@@ -227,7 +260,7 @@ def expected_task_identity(
         public_port=PUBLIC_PORT,
         internal_host=INTERNAL_HOST,
         internal_port=INTERNAL_PORT,
-        price_policy_hash=price_policy_hash(),
+        price_policy_hash=policy_hash,
     )
 
 
@@ -787,11 +820,14 @@ def install_task(
     commands: "TaskCommands | SystemdUserCommands | None" = None,
     execute: str | os.PathLike[str] = sys.executable,
     principal: str | None = None,
+    ledger: SpendLedger | None = None,
 ) -> dict:
     commands = commands or _default_commands()
     if isinstance(commands, SystemdUserCommands):
-        return _install_task_linux(root, commands=commands, execute=execute)
-    return _install_task_windows(root, commands=commands, execute=execute, principal=principal)
+        return _install_task_linux(root, commands=commands, execute=execute, ledger=ledger)
+    return _install_task_windows(
+        root, commands=commands, execute=execute, principal=principal, ledger=ledger
+    )
 
 
 def _install_task_windows(
@@ -800,8 +836,11 @@ def _install_task_windows(
     commands: TaskCommands,
     execute: str | os.PathLike[str],
     principal: str | None,
+    ledger: SpendLedger | None,
 ) -> dict:
-    identity = expected_task_identity(root, execute=execute, principal=principal)
+    identity = expected_task_identity(
+        root, execute=execute, principal=principal, ledger=ledger
+    )
     existing = commands.query_xml(identity.task_name)
     if existing is not None:
         if not task_xml_matches(existing, identity):
@@ -835,8 +874,9 @@ def _install_task_linux(
     *,
     commands: SystemdUserCommands,
     execute: str | os.PathLike[str],
+    ledger: SpendLedger | None,
 ) -> dict:
-    identity = expected_task_identity(root, execute=execute)
+    identity = expected_task_identity(root, execute=execute, ledger=ledger)
     existing = commands.query_unit(identity.task_name)
     if existing is not None:
         if not systemd_unit_matches(existing, identity):
@@ -963,7 +1003,7 @@ def _initialize_install_locked(
             "litellm_executable": str(executable),
             "litellm_config": str(config_path),
             "litellm_config_sha256": config_hash,
-            "price_policy_hash": price_policy_hash(),
+            "price_policy_hash": marker["price_policy_hash"],
             "public_bind": f"{PUBLIC_HOST}:{PUBLIC_PORT}",
             "internal_bind": f"{INTERNAL_HOST}:{INTERNAL_PORT}",
         },
@@ -984,7 +1024,9 @@ def _initialize_install_locked(
     }
 
 
-def reconfigure_endpoint(root: str | os.PathLike[str]) -> dict:
+def reconfigure_endpoint(
+    root: str | os.PathLike[str], *, ledger: SpendLedger | None = None
+) -> dict:
     """Re-render the LiteLLM config to the PINNED ``DEFAULT_API_BASE`` and rebind
     the install manifest's config hash — WITHOUT touching the spend ledger, the
     tokens, or the registered task.
@@ -1003,10 +1045,10 @@ def reconfigure_endpoint(root: str | os.PathLike[str]) -> dict:
     """
     root = canonical_project_root(root)
     with _gateway_lifecycle_lock(root, "reconfigure"):
-        return _reconfigure_endpoint_locked(root)
+        return _reconfigure_endpoint_locked(root, ledger)
 
 
-def _reconfigure_endpoint_locked(root: Path) -> dict:
+def _reconfigure_endpoint_locked(root: Path, ledger: SpendLedger | None) -> dict:
     config_path = litellm_config_path(root)
     manifest_path = install_manifest_path(root)
     missing = [p.name for p in (config_path, manifest_path) if not p.exists()]
@@ -1033,7 +1075,7 @@ def _reconfigure_endpoint_locked(root: Path) -> dict:
     ):
         if manifest.get(key) != expected:
             raise GatewayConfigError(f"gateway install manifest {key} mismatch")
-    if manifest.get("price_policy_hash") != price_policy_hash():
+    if manifest.get("price_policy_hash") != _ledger_policy_hashes(ledger)["price_policy_hash"]:
         raise GatewayConfigError("gateway install manifest price policy mismatch")
     executable = Path(str(manifest.get("litellm_executable") or "")).resolve()
     if not executable.is_file():
@@ -1052,7 +1094,7 @@ def _reconfigure_endpoint_locked(root: Path) -> dict:
     manifest["litellm_config_sha256"] = config_hash
     _durable_write_json(manifest_path, manifest)
     # Confirm the rewritten manifest validates against the freshly rendered config.
-    load_install_manifest(root)
+    load_install_manifest(root, ledger=ledger)
     return {
         "reconfigured": True,
         "api_base": DEFAULT_API_BASE,
@@ -1097,10 +1139,11 @@ def _validate_install_manifest(
     value: object,
     *,
     require_litellm_executable: bool,
+    ledger: SpendLedger | None,
 ) -> dict:
     if not isinstance(value, dict) or value.get("schema_version") != 1:
         raise GatewayConfigError("gateway install manifest schema mismatch")
-    if value.get("price_policy_hash") != price_policy_hash():
+    if value.get("price_policy_hash") != _ledger_policy_hashes(ledger)["price_policy_hash"]:
         raise GatewayConfigError("gateway install manifest price policy mismatch")
     expected_binds = {
         "public_bind": f"{PUBLIC_HOST}:{PUBLIC_PORT}",
@@ -1128,10 +1171,12 @@ def _read_install_manifest(
     root: str | os.PathLike[str],
     *,
     require_litellm_executable: bool,
+    ledger: SpendLedger | None = None,
 ) -> dict:
     value, _ = _read_install_manifest_snapshot(
         root,
         require_litellm_executable=require_litellm_executable,
+        ledger=ledger,
     )
     return value
 
@@ -1140,6 +1185,7 @@ def _read_install_manifest_snapshot(
     root: str | os.PathLike[str],
     *,
     require_litellm_executable: bool,
+    ledger: SpendLedger | None = None,
 ) -> tuple[dict, bytes]:
     path = install_manifest_path(root)
     try:
@@ -1152,13 +1198,16 @@ def _read_install_manifest_snapshot(
             root,
             value,
             require_litellm_executable=require_litellm_executable,
+            ledger=ledger,
         ),
         raw,
     )
 
 
-def load_install_manifest(root: str | os.PathLike[str]) -> dict:
-    return _read_install_manifest(root, require_litellm_executable=True)
+def load_install_manifest(
+    root: str | os.PathLike[str], *, ledger: SpendLedger | None = None
+) -> dict:
+    return _read_install_manifest(root, require_litellm_executable=True, ledger=ledger)
 
 
 def _runtime_rebind_command(root: Path, executable: Path) -> str:
@@ -1218,6 +1267,7 @@ def rebind_runtime(
     *,
     litellm_executable: str | os.PathLike[str],
     probe_commands: RuntimeProbeCommands | None = None,
+    ledger: SpendLedger | None = None,
 ) -> dict:
     """Verify and rebind the stopped gateway to a replacement LiteLLM runtime."""
     root = canonical_project_root(root)
@@ -1226,6 +1276,7 @@ def rebind_runtime(
             root,
             litellm_executable=litellm_executable,
             probe_commands=probe_commands,
+            ledger=ledger,
         )
 
 
@@ -1234,6 +1285,7 @@ def _rebind_runtime_locked(
     *,
     litellm_executable: str | os.PathLike[str],
     probe_commands: RuntimeProbeCommands | None,
+    ledger: SpendLedger | None,
 ) -> dict:
     config_path = litellm_config_path(root)
     manifest_path = install_manifest_path(root)
@@ -1254,6 +1306,7 @@ def _rebind_runtime_locked(
     manifest, manifest_snapshot = _read_install_manifest_snapshot(
         root,
         require_litellm_executable=False,
+        ledger=ledger,
     )
     executable = Path(litellm_executable).resolve()
     remedy = _runtime_rebind_command(root, executable)
@@ -1292,11 +1345,12 @@ def _rebind_runtime_locked(
         root,
         next_manifest,
         require_litellm_executable=True,
+        ledger=ledger,
     )
     changed = previous != str(executable)
     if changed:
         _durable_write_json(manifest_path, next_manifest)
-        load_install_manifest(root)
+        load_install_manifest(root, ledger=ledger)
     return {
         "runtime_rebound": True,
         "changed": changed,
@@ -1365,7 +1419,14 @@ def _service_absent(root: str | os.PathLike[str]) -> bool:
     return sockets_free and not marker.exists()
 
 
-def _runtime_projection(root: Path, manifest: dict, *, front_token_sha256: str) -> dict:
+def _runtime_projection(
+    root: Path,
+    manifest: dict,
+    *,
+    front_token_sha256: str,
+    price_policy_hash: str | None,
+    child_cap_policy_hash: str | None,
+) -> dict:
     path = runtime_marker_path(root)
     try:
         marker = json.loads(path.read_text(encoding="utf-8"))
@@ -1376,8 +1437,8 @@ def _runtime_projection(root: Path, manifest: dict, *, front_token_sha256: str) 
     expected = {
         "schema_version": RUNTIME_SCHEMA_VERSION,
         "task_name": project_task_name(root),
-        "price_policy_hash": price_policy_hash(),
-        "child_cap_policy_hash": child_cap_policy_hash(),
+        "price_policy_hash": price_policy_hash,
+        "child_cap_policy_hash": child_cap_policy_hash,
         "config_sha256": manifest["litellm_config_sha256"],
         "public_bind": f"{PUBLIC_HOST}:{PUBLIC_PORT}",
         "internal_bind": f"{INTERNAL_HOST}:{INTERNAL_PORT}",
@@ -1557,7 +1618,7 @@ def run_service(
         internal_token = read_secret_file(
             internal_token_path or default_internal_token_path()
         )
-        manifest = load_install_manifest(root)
+        manifest = load_install_manifest(root, ledger=ledger)
         configured_executable = str(Path(manifest["litellm_executable"]).resolve())
         if (
             litellm_executable is not None
@@ -1621,8 +1682,8 @@ def run_service(
                 "litellm_pid": int(process.pid),
                 "litellm_start": _process_start_token(int(process.pid)),
                 "task_name": project_task_name(root),
-                "price_policy_hash": price_policy_hash(),
-                "child_cap_policy_hash": child_cap_policy_hash(),
+                "price_policy_hash": ledger_status["policy_hash"],
+                "child_cap_policy_hash": ledger_status["child_cap_policy_hash"],
                 "config_sha256": manifest["litellm_config_sha256"],
                 "public_bind": f"{PUBLIC_HOST}:{PUBLIC_PORT}",
                 "internal_bind": f"{INTERNAL_HOST}:{INTERNAL_PORT}",
@@ -1717,7 +1778,7 @@ def stop_task(
 ) -> dict:
     commands = commands or _default_commands()
     root = canonical_project_root(root)
-    identity = expected_task_identity(root)
+    identity = registration_identity(root)
     existing = _query_registration(commands, identity)
     if existing is None:
         if _service_absent(root):
@@ -1753,14 +1814,14 @@ def start_task(
 ) -> dict:
     commands = commands or _default_commands()
     root = canonical_project_root(root)
-    load_install_manifest(root)
     ledger = ledger or SpendLedger()
+    load_install_manifest(root, ledger=ledger)
     ledger_status = ledger.status()
     # Starting the inert service under HOLD is safer than clearing spend
     # protection merely to recover its stable fail-closed listener.
     if not ledger_status["child_cap_ready"]:
         raise LedgerBlocked("gateway child turn cap is not structurally ready")
-    identity = expected_task_identity(root)
+    identity = expected_task_identity(root, ledger=ledger)
     existing = _query_registration(commands, identity)
     if existing is None:
         raise GatewayConfigError("gateway task is not installed")
@@ -1805,8 +1866,8 @@ def gateway_status(
         "schema_version": 1,
         "project_root": str(root),
         "task_name": project_task_name(root),
-        "price_policy_hash": price_policy_hash(),
-        "child_cap_policy_hash": child_cap_policy_hash(),
+        "price_policy_hash": None,
+        "child_cap_policy_hash": None,
         "ambient_provider_keys_absent": not any(
             os.environ.get(key) for key in ("OVH_KEY", "ANTHROPIC_API_KEY")
         ),
@@ -1821,14 +1882,16 @@ def gateway_status(
     }
     manifest: dict | None = None
     try:
-        manifest = load_install_manifest(root)
+        manifest = load_install_manifest(root, ledger=ledger)
         result["install_manifest_ok"] = True
         result["config_sha256"] = manifest["litellm_config_sha256"]
-    except GatewayConfigError:
+    except (GatewayConfigError, LedgerBlocked, LedgerHold):
         result["errors"].append("install_manifest_invalid")
     try:
         result["ledger"] = ledger.status()
         result["ledger_ok"] = True
+        result["price_policy_hash"] = result["ledger"]["policy_hash"]
+        result["child_cap_policy_hash"] = result["ledger"]["child_cap_policy_hash"]
         result["worker_spend_ready"] = result["ledger"]["worker_spend_ready"]
         result["worker_spend_errors"] = list(
             result["ledger"]["worker_spend_errors"]
@@ -1836,14 +1899,21 @@ def gateway_status(
     except (LedgerBlocked, LedgerHold):
         result["errors"].append("ledger_blocked")
     try:
-        identity = expected_task_identity(root)
+        ledger_policy_hash = result["price_policy_hash"]
+        identity = _task_identity(
+            root,
+            execute=sys.executable,
+            principal=None,
+            policy_hash=ledger_policy_hash or "",
+        )
         task_xml = _query_registration(commands, identity)
         try:
             stored_identity = json.loads(task_identity_path(root).read_text(encoding="utf-8"))
         except (OSError, ValueError):
             stored_identity = None
         result["task_identity_ok"] = (
-            task_xml is not None
+            ledger_policy_hash is not None
+            and task_xml is not None
             and _registration_matches(commands, task_xml, identity)
             and stored_identity == asdict(identity)
         )
@@ -1873,6 +1943,8 @@ def gateway_status(
                 root,
                 manifest,
                 front_token_sha256=front_token_hash,
+                price_policy_hash=result["price_policy_hash"],
+                child_cap_policy_hash=result["child_cap_policy_hash"],
             )
             result["runtime_marker_present"] = True
         except GatewayConfigError:
