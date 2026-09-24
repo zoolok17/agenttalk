@@ -104,13 +104,23 @@ Not hash computations, but they carry the value and were traced:
 
 There is no in-code migration and no command that rewrites the stored hashes in place. An install made
 on 0.91.0 with a non-default `--cutoff-eur` / `--soft-stop-eur` / `--ceiling-eur` is upgraded to 0.91.1
-by re-initialising it:
+by re-initialising it. This is the one runbook for re-initialising an existing install; the same sequence
+applies to any other price-policy change that `reconfigure` cannot apply (for example a tariff change),
+and `docs/QWEN-OVH-TRIAL.md` points here instead of repeating it.
 
 1. Stop the gateway (`gateway stop`) and confirm both loopback ports are free. Run the stop with the
    runtime (Python interpreter) that registered the task, i.e. the OLD one. The registered task or unit
    names that interpreter, and `stop` matches the registration against the interpreter it is running
    under, so `gateway stop` from a different (new) runtime refuses with "refusing to stop a foreign or
-   mismatched gateway task".
+   mismatched gateway task". If the old runtime is already gone (for example its virtual environment was
+   deleted), do not unregister the task first: with the task absent, `gateway stop` succeeds only when
+   the gateway is already down, and otherwise refuses ("gateway task is absent but runtime state or a
+   loopback port remains occupied"). Instead create an empty file named `gateway.kill` in the project's
+   `.agenttalk/gateway/` directory. The running gateway checks for that file every quarter of a second
+   and shuts down cleanly when it appears (the same file `gateway stop` writes); its runtime marker
+   (`runtime.json`) is removed as it exits. Wait until both loopback ports are free and `runtime.json`
+   is gone, then continue. `gateway start` deletes the file later. (This route is read from the code,
+   `run_service`'s monitor and `actions_enabled`, and has not been exercised on a live host.)
 2. Copy the ledger to a backup and verify the copy (size and hash). Then MOVE, not copy, the originals
    aside: the ledger database `ledger.sqlite3` and its install marker `install.json` (both in the
    `agenttalk-ovh-spend` directory under the user's local application-data directory; move any
@@ -127,8 +137,9 @@ by re-initialising it:
    principal) is what the current interpreter would register (on Linux the unit must be identical to the
    one it would render), so a task naming the old interpreter is refused with "refusing to replace a
    foreign or mismatched gateway task" (Linux: "... gateway unit"). The task name is the `task_name` shown by
-   `gateway status`. On Windows, unregister the scheduled task by that name
-   (`Unregister-ScheduledTask -TaskName <task_name> -Confirm:$false`). On Linux, run
+   `gateway status`. On Windows, unregister the scheduled task by that name (substitute the real name
+   for `<task_name>`): from any shell, `schtasks.exe /Delete /TN <task_name> /F`; in PowerShell,
+   `Unregister-ScheduledTask -TaskName '<task_name>' -Confirm:$false`. On Linux, run
    `systemctl --user disable <task_name>.service`, delete the unit file
    `~/.config/systemd/user/<task_name>.service`, and run `systemctl --user daemon-reload`. If the
    interpreter path is unchanged, skip this step: `task-install` then accepts the registered task and
@@ -138,12 +149,32 @@ by re-initialising it:
    `gateway start` waits about 30 seconds for readiness, and a cold first start can take longer (the
    first LiteLLM import is slow). A non-zero exit from the first `start` therefore does not mean the
    gateway failed to start: it may still come up. Do not rerun `start` straight away. A second `start`
-   probes the loopback ports before it does anything, and fails with "gateway port 127.0.0.1:4000 is
-   already occupied" if the first gateway is up (or coming up) on them. Wait, read `gateway status`,
-   and retry `start` only if the gateway is not running.
-6. Run the dashboard canary (`gateway canary-verify`) and check `gateway status`. After a re-init a
-   fresh ledger has no canary, so `worker_spend_ready` stays false with `dashboard_canary_absent` in
-   `worker_spend_errors` until a canary is run and accepted. Wrapped seats refuse to start until then.
+   first checks `gateway status`: if the gateway is already `ready` it does nothing and exits 0. If it is
+   not yet ready, `start` checks the loopback ports, and fails with "gateway port 127.0.0.1:4000 is
+   already occupied" when the first gateway has bound them but is not ready yet (the case seen in the
+   field). Only if nothing is listening yet does it ask the task scheduler to start the task again.
+   So wait, read `gateway status`, and retry `start` only if the gateway is not running, meaning
+   `ready` is false and `public_listener_present` is false. `gateway status` exits non-zero whenever
+   `ready` is false, but still prints its JSON.
+6. Run the dashboard canary and check `gateway status`. After a re-init a fresh ledger has no canary,
+   so `worker_spend_ready` stays false with `dashboard_canary_absent` in `worker_spend_errors` until a
+   canary is run and accepted. `agenttalk wrap` for an `ovh-qwen` seat refuses to start until then (it
+   records a `config_blocked` hold citing `dashboard_canary_absent`); seats on other backends are
+   unaffected. The canary is `agenttalk gateway canary-verify ATTEMPT_ID --dashboard-delta-eur
+   OBSERVED_DELTA`, and both values come from the "Live Acceptance" step in `docs/QWEN-OVH-TRIAL.md`:
+   - `ATTEMPT_ID`: no command prints it. The gateway creates one per provider call and records it in the
+     ledger's `attempts` table. After running the acceptance turn, list the settled attempts from the
+     ledger database (read-only), for example with Python's `sqlite3` module opened with
+     `file:<path to ledger.sqlite3>?mode=ro` and `uri=True`, running
+     `SELECT attempt_id, state, actual_micro_eur, admitted_at FROM attempts WHERE state='settled'
+     ORDER BY admitted_at DESC`, and use the id of the acceptance call. The query was run against a
+     throwaway ledger; the 1000-input/100-output fixture settles to `actual_micro_eur` 670.
+   - `OBSERVED_DELTA`: the change the operator sees on the OVH dashboard for that call, in EUR. It must be
+     nonzero and within 10% of the attempt's `actual_micro_eur`. A zero or out-of-tolerance delta records a
+     mismatch and sets a durable `dashboard_canary_mismatch` hold, which then needs an explicit
+     `gateway clear-hold` and a fresh accepted canary (see `docs/QWEN-OVH-TRIAL.md`). If the
+     dashboard has not yet shown the charge, wait until it does before running `canary-verify`; do not
+     submit a zero.
    Once it is accepted, expect `ready` and `worker_spend_ready` true, and the `price_policy_hash`
    printed by `init` equal to the one in `status`, the manifest and `task-identity.json`.
 

@@ -25,9 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before retrying, since a second `start` fails with "gateway port
   127.0.0.1:4000 is already occupied". It also states that after a re-init
   `worker_spend_ready` stays false with `dashboard_canary_absent` until a
-  dashboard canary is accepted, and wrapped seats refuse to start until
-  then. The 0.91.1 Upgrade bullet below is superseded in these respects by
-  that section.
+  dashboard canary is accepted, and `ovh-qwen` wrapped seats refuse to
+  start until then. It also gives the canary's `ATTEMPT_ID` source (the
+  ledger's `attempts` table) and dashboard-delta rules, and a route for
+  when the old runtime is already gone (the `gateway.kill` file).
+  `docs/QWEN-OVH-TRIAL.md` now points to that section instead of carrying
+  a second re-init runbook. The 0.91.1 Upgrade bullet below is superseded
+  in these respects by that section.
 
 ## [0.91.1] - 2026-09-24
 
