@@ -93,9 +93,12 @@ Not hash computations, but they carry the value and were traced:
   manifest, task identity, runtime marker and status are byte-identical to before.
 - **Existing installs made at a non-default envelope on v0.91.0 already hold a default-envelope hash in
   `install-manifest.json` and `task-identity.json`.** After this fix those fail the manifest check
-  (`install_manifest_invalid`). This change includes no in-code migration (decided by the lead); see
-  "Upgrade path" below. The same install's running gateway also holds a runtime marker written with the
-  default hash, so `gateway status` reports `runtime_marker_invalid` until it is restarted.
+  (`install_manifest_invalid`), and the stale `task-identity.json` also fails
+  (`task_identity_invalid`). `gateway status` then reports `runtime_marker_missing`, not
+  `runtime_marker_invalid`: the runtime marker is only compared when the manifest is valid, so a marker
+  that is present on disk is reported missing. That is a consequence of the invalid manifest, not a
+  second fault. This change includes no in-code migration (decided by the lead); see "Upgrade path"
+  below.
 
 ## Upgrade path for a 0.91.0 install at a non-default envelope
 
@@ -104,16 +107,25 @@ on 0.91.0 with a non-default `--cutoff-eur` / `--soft-stop-eur` / `--ceiling-eur
 by re-initialising it:
 
 1. Stop the gateway (`gateway stop`) and confirm both loopback ports are free.
-2. Back up the ledger (the whole spend directory: database and install marker), and move the old
-   `.agenttalk/gateway/` state files and the gateway token files aside rather than deleting them.
-   `gateway init` refuses to replace existing state, so they must be out of the way.
+2. Copy the ledger to a backup and verify the copy (size and hash). Then MOVE, not copy, the originals
+   aside: the ledger database `ledger.sqlite3` and its install marker `install.json` (both in the
+   `agenttalk-ovh-spend` directory under the user's local application-data directory; move any
+   `ledger.sqlite3-journal` with them), the project's `.agenttalk/gateway/litellm.yaml` and
+   `install-manifest.json`, and the two gateway token files `front_token.txt` and `internal_token.txt`
+   (in the `agenttalk-ovh` directory in the same place). Leave `api_key.txt` where it is; `init` does not
+   touch it. `gateway init` refuses while the ledger database or its marker exists (the ledger must be
+   fully absent, not just backed up), or while the config, manifest or either token file exists, so
+   copying alone is not enough. Keep the moved files rather than deleting them. `task-identity.json`
+   needs no move: `task-install` over the still-registered task rewrites it with the new hash.
 3. `gateway init` with the current OVH dashboard figure as the opening balance and the envelope wanted.
 4. `gateway cap-install`, `gateway task-install`, `gateway start`.
 5. Run the dashboard canary (`gateway canary-verify`) and check `gateway status`: `ready` and
    `worker_spend_ready` true, and the `price_policy_hash` printed by `init` equal to the one in `status`,
    the manifest and `task-identity.json`.
 
-Consequence to expect: this starts a new ledger, so spend history stays only in the backup. An install
+Consequence to expect: this starts a new ledger, so spend history stays only in the backup. The ledger,
+the secret directory and the tokens resolve from per-user default paths, so they belong to the host, not
+to one project: re-initialising resets them for every project on that host that uses the gateway. An install
 at the default envelope needs none of this; its hashes were already the ledger's.
 
 ## Tests
