@@ -92,7 +92,7 @@ def bundle(case, *, build_exit=0, tool_value=3):
 
 def attach(case):
     return command(case, "acceptance", "attach", "--id", "attempt",
-                   "--file", str(case["inputs"] / "bundle.json"))
+                   "--from", "lead", "--file", str(case["inputs"] / "bundle.json"))
 
 
 def check(case, capsys):
@@ -400,10 +400,162 @@ def test_acceptance_explicit_partition_assignment_reused(case):
 
 
 def test_acceptance_conflicting_partition_assignment_refused(case, capsys):
-    assert open_attempt(case, "--lens", "acceptance-run-bar", "--allow", "acceptance-run-bar:runner-b") == 2
-    assert "acceptance_policy_invalid" in check(case, capsys)
+    assert open_attempt(case, "--lens", "acceptance-run-bar", "--allow", "acceptance-run-bar:runner-b") == 3
+    assert "acceptance_policy_invalid" in capsys.readouterr().err
+    assert not close.close_path(case["store"], "attempt").exists()
 
 
 def test_acceptance_nonregular_input_refused(tmp_path):
     with pytest.raises(acceptance.AcceptanceError, match="regular file"):
         acceptance.prepare(Store(tmp_path / "bus"), tmp_path, tmp_path, "f" * 40, "milestone")
+
+
+def test_acceptance_old_engine_schema_guard_rejects_route(case):
+    assert open_attempt(case) == 0
+    record = close.load_close(case["store"], "attempt")
+    # The pre-change _is_wellformed rule immediately rejects every version != 1.
+    assert record["schema_version"] != 1
+    assert close._is_wellformed(record)
+    del record["acceptance_route"]
+    assert not close._is_wellformed(record)
+
+
+def test_acceptance_truncated_existing_blob_names_recovery_path(case):
+    data = (case["inputs"] / "plan.json").read_bytes()
+    path = case["store"].dir / "acceptance" / "sha256" / hashlib.sha256(data).hexdigest()
+    path.parent.mkdir(parents=True)
+    path.write_bytes(data[:10])
+    with pytest.raises(acceptance.AcceptanceError) as error:
+        acceptance.prepare(case["store"], case["inputs"] / "plan.json", case["project"],
+                           case["sha"], "milestone")
+    assert str(path) in str(error.value)
+    assert path.read_bytes() == data[:10]
+
+
+def test_acceptance_interrupted_retention_never_installs_partial_digest(case, monkeypatch):
+    data = (case["inputs"] / "plan.json").read_bytes()
+    path = case["store"].dir / "acceptance" / "sha256" / hashlib.sha256(data).hexdigest()
+
+    def fail_fsync(_):
+        assert not path.exists()
+        raise OSError("interrupted before publication")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(acceptance.os, "fsync", fail_fsync)
+        with pytest.raises(OSError):
+            acceptance.prepare(case["store"], case["inputs"] / "plan.json", case["project"],
+                               case["sha"], "milestone")
+    assert not path.exists()
+    assert open_attempt(case) == 0
+
+
+def test_acceptance_attach_attributes_event_and_advisory_authority(case, capsys, monkeypatch):
+    assert open_attempt(case) == 0
+    bundle(case)
+    monkeypatch.setattr(cli, "_close_lead_set", lambda _: {"lead"})
+    monkeypatch.setattr(cli, "_iso_now", lambda: "2026-09-24T14:00:00Z")
+    assert command(case, "acceptance", "attach", "--id", "attempt", "--from", "runner-a",
+                   "--file", str(case["inputs"] / "bundle.json")) == 0
+    assert "not a recognized close lead" in capsys.readouterr().err
+    record = close.load_close(case["store"], "attempt")
+    route = record["acceptance_route"]
+    assert route["attached_by"] == "runner-a"
+    assert route["attached_at"] == "2026-09-24T14:00:00Z"
+    assert record["events"][-1] == {"event": "acceptance:attach", "by": "runner-a",
+                                     "at": route["attached_at"], "bundle_hash": route["bundle_hash"]}
+
+
+def test_acceptance_runner_dirty_after_run_rejected(case):
+    assert open_attempt(case) == 0
+    data = bundle(case)
+    data["runs"][0]["status_after"] = " M source.txt"
+    write_json(case["inputs"] / "bundle.json", data)
+    assert attach(case) == 2
+    assert close.load_close(case["store"], "attempt")["acceptance_route"]["bundle_hash"] is None
+
+
+def test_acceptance_observed_boolean_is_not_exit_code(case, capsys):
+    case["plan"]["rows"][0]["expected"] = 1
+    write_json(case["inputs"] / "plan.json", case["plan"])
+    assert open_attempt(case) == 0
+    bundle(case, build_exit=True)
+    assert attach(case) == 0
+    assert "acceptance_policy_invalid" in check(case, capsys)
+
+
+def test_acceptance_raw_other_run_same_partition_holds(case, capsys):
+    assert open_attempt(case) == 0
+    data = bundle(case)
+    extra = dict(data["runs"][0], id="other-run")
+    data["runs"].append(extra)
+    artifact = data["artifacts"][0]
+    raw_path = case["inputs"] / artifact["path"]
+    raw = json.loads(raw_path.read_text())
+    raw["run_id"] = extra["id"]
+    artifact["sha256"] = write_json(raw_path, raw)
+    write_json(case["inputs"] / "bundle.json", data)
+    assert attach(case) == 0
+    assert "acceptance_row_unbound" in check(case, capsys)
+
+
+@pytest.mark.parametrize("malformed", ["value", "json", "missing", "digest"])
+def test_acceptance_malformed_informational_keeps_gating_outcome(case, capsys, malformed):
+    case["plan"]["rows"][1].update(policy="informational", comparator="exact-failure-set", expected=[])
+    write_json(case["inputs"] / "plan.json", case["plan"])
+    assert open_attempt(case) == 0
+    data = bundle(case, build_exit=1, tool_value="not-a-list")
+    if malformed == "json":
+        raw = case["inputs"] / data["artifacts"][1]["path"]
+        raw.write_bytes(b"{")
+        data["artifacts"][1]["sha256"] = hashlib.sha256(b"{").hexdigest()
+        write_json(case["inputs"] / "bundle.json", data)
+    assert attach(case) == 0
+    retained = case["store"].dir / "acceptance" / "sha256" / data["artifacts"][1]["sha256"]
+    if malformed == "missing":
+        retained.unlink()
+    elif malformed == "digest":
+        retained.write_bytes(b"corrupt")
+    assert "acceptance_row_failed" in check(case, capsys)
+    snapshot = acceptance.resolve(case["store"], close.load_close(case["store"], "attempt"))
+    assert snapshot["outcomes"][0]["passed"] is False
+    assert snapshot["outcomes"][1]["passed"] is None
+    assert snapshot["outcomes"][1]["error"]
+    assert snapshot["holds"] == []
+
+
+def test_acceptance_incompatible_lens_does_not_burn_id(case):
+    assert open_attempt(case, "--lens", "acceptance-run-bar") == 3
+    assert not close.close_path(case["store"], "attempt").exists()
+    assert open_attempt(case) == 0
+
+
+def test_acceptance_single_repo_names_dirty_runtime_paths(case, capsys):
+    case["store"] = Store(case["project"])
+    case["store"].init(["lead", "runner-a", "runner-b"])
+    assert open_attempt(case) == 3
+    assert ".agenttalk/config.json" in capsys.readouterr().err
+    (case["project"] / ".gitignore").write_text(".agenttalk/\n", encoding="utf-8")
+    git(case["project"], "add", ".gitignore")
+    git(case["project"], "commit", "-qm", "ignore runtime")
+    case["sha"] = git(case["project"], "rev-parse", "HEAD")
+    assert open_attempt(case) == 0
+
+
+def test_acceptance_observed_failure_overflow_is_row_failure(case, capsys):
+    case["plan"]["rows"][0].update(comparator="exact-failure-set", expected=[])
+    write_json(case["inputs"] / "plan.json", case["plan"])
+    assert open_attempt(case) == 0
+    bundle(case, build_exit=[f"failure-{i}" for i in range(257)])
+    assert attach(case) == 0
+    codes = check(case, capsys)
+    assert "acceptance_row_failed" in codes
+    assert "acceptance_policy_invalid" not in codes
+
+
+def test_acceptance_freeze_timestamp_is_actual_freeze(case, monkeypatch):
+    times = iter(["2026-09-24T14:00:00Z", "2026-09-24T14:00:01Z"])
+    monkeypatch.setattr(cli, "_iso_now", lambda: next(times))
+    assert open_attempt(case) == 0
+    record = close.load_close(case["store"], "attempt")
+    assert record["opened_at"] == "2026-09-24T14:00:00Z"
+    assert record["acceptance_route"]["frozen_at"] == "2026-09-24T14:00:01Z"

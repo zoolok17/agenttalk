@@ -52,7 +52,10 @@ def _text(value, label):
 
 
 def _id(value):
-    return close.validate_close_id(value)
+    try:
+        return close.validate_close_id(value)
+    except close.CloseError as exc:
+        raise AcceptanceError("acceptance_policy_invalid", str(exc)) from exc
 
 
 def _digest(value):
@@ -154,19 +157,25 @@ def _hash(data):
 
 
 def _retain(store, data):
-    """Copy before referencing; never replace existing content-addressed bytes."""
+    """Publish complete bytes exclusively; interrupted writes never occupy a digest."""
     digest = _hash(data)
     path = _path(store.dir, f"acceptance/sha256/{digest}")
     path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".pending-{uuid.uuid4().hex}")
     try:
-        with path.open("xb") as stream:
+        with temporary.open("xb") as stream:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-    except FileExistsError:
-        pass
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            pass
+    finally:
+        temporary.unlink(missing_ok=True)
     if _read(path) != data:
-        _fail("retained bytes differ from their digest", "acceptance_record_missing")
+        _fail(f"retained bytes differ from their digest at {path}; quarantine this blob before retrying",
+              "acceptance_record_missing")
     return digest
 
 
@@ -252,19 +261,25 @@ def verify_project(repo, revision):
     sha = git("rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}")
     if not _SHA.fullmatch(sha) or git("rev-parse", "HEAD") != sha:
         _fail("project HEAD must equal the verified SHA", "acceptance_project_unverified")
-    if git("status", "--porcelain", "--untracked-files=all"):
-        _fail("acceptance project checkout is dirty", "acceptance_project_unverified")
+    dirty = git("status", "--porcelain", "--untracked-files=all")
+    if dirty:
+        lines = dirty.splitlines()
+        details = "\n".join(lines[:20])
+        if len(lines) > 20:
+            details += f"\n... {len(lines) - 20} more entries"
+        _fail(f"acceptance project checkout is dirty:\n{details}", "acceptance_project_unverified")
     return {"locator": str(repo), "revision": sha, "tree": git("rev-parse", f"{sha}^{{tree}}"),
             "roots": sorted(git("rev-list", "--max-parents=0", sha).splitlines())}
 
 
-def prepare(store, plan_file, project_repo, revision, scope):
+def prepare(store, plan_file, project_repo, revision, scope, lenses=()):
     """Validate before opening; immutable copies cannot clear a close on their own."""
     path = Path(plan_file).absolute()
     plan_bytes = _read(_path(path.parent, path.name))
     plan = validate_plan(decode(plan_bytes))
     if plan["scope"] != scope:
         _fail("plan scope differs from close scope")
+    partition_lenses(plan, lenses)
     registry_bytes = _read(_path(path.parent, plan["registry_ref"]))
     validate_registry(decode(registry_bytes))
     if _hash(registry_bytes) != plan["registry_digest"]:
@@ -274,7 +289,27 @@ def prepare(store, plan_file, project_repo, revision, scope):
             "project": project, "plan": plan}
 
 
-def freeze(store, close_id, prepared):
+def partition_lenses(plan, lenses):
+    """Check explicit assignments before creation and again when freezing."""
+    result = list(lenses)
+    existing = {lens["id"]: lens for lens in result}
+    if len(existing) != len(result):
+        _fail("duplicate close lens id")
+    for partition in plan["partitions"]:
+        lens = close.validate_lens_spec({"id": "acceptance-run-" + partition["id"],
+                                        "allowed_agents": partition["agents"]})
+        if lens["id"] in existing:
+            actual = existing[lens["id"]]
+            if (not actual.get("required") or actual.get("allowed_roles") or actual.get("allowed_groups")
+                    or actual.get("signoff_set_id")
+                    or set(actual.get("allowed_agents", [])) != set(lens["allowed_agents"])):
+                _fail("declared partition lens differs from the frozen plan")
+        else:
+            result.append(lens)
+    return result
+
+
+def freeze(store, close_id, prepared, at):
     """Complete the pending route under the existing instance/generation transaction."""
     with close.close_transaction(store, close_id) as transaction:
         record = transaction.record
@@ -289,23 +324,9 @@ def freeze(store, close_id, prepared):
                  "instance_id": record["instance_id"], "project_id": plan["project_id"],
                  "revision": record["revision"], "project": prepared["project"],
                  "plan_hash": prepared["plan_hash"], "registry_hash": prepared["registry_hash"],
-                 "bundle_hash": None, "frozen_by": record["opened_by"], "frozen_at": record["opened_at"]}
-        lenses = []
-        for partition in plan["partitions"]:
-            lenses.append(close.validate_lens_spec({"id": "acceptance-run-" + partition["id"],
-                                                   "allowed_agents": partition["agents"]}))
-        existing = {lens["id"]: lens for lens in record["required_lenses"]}
-        if len(existing) != len(record["required_lenses"]):
-            _fail("duplicate close lens id")
-        for lens in lenses:
-            if lens["id"] in existing:
-                actual = existing[lens["id"]]
-                if (not actual.get("required") or actual.get("allowed_roles") or actual.get("allowed_groups")
-                        or actual.get("signoff_set_id")
-                        or set(actual.get("allowed_agents", [])) != set(lens["allowed_agents"])):
-                    _fail("declared partition lens differs from the frozen plan")
-            else:
-                record["required_lenses"].append(lens)
+                 "bundle_hash": None, "frozen_by": record["opened_by"], "frozen_at": at,
+                 "attached_by": None, "attached_at": None}
+        record["required_lenses"] = partition_lenses(plan, record["required_lenses"])
         record["acceptance_route"] = route
         transaction.commit()
     return record
@@ -316,7 +337,7 @@ def _route(record):
     if not isinstance(route, dict) or route.get("pending"):
         _fail("acceptance route is absent or pending")
     _object(route, "schema_version attempt_id instance_id project_id revision project plan_hash "
-            "registry_hash bundle_hash frozen_by frozen_at", "acceptance route")
+            "registry_hash bundle_hash frozen_by frozen_at attached_by attached_at", "acceptance route")
     _version(route["schema_version"])
     _id(route["attempt_id"])
     _id(route["project_id"])
@@ -324,6 +345,12 @@ def _route(record):
     _digest(route["registry_hash"])
     if route["bundle_hash"] is not None:
         _digest(route["bundle_hash"])
+        _text(route["attached_by"], "attached_by")
+        _text(route["attached_at"], "attached_at")
+    elif route["attached_by"] is not None or route["attached_at"] is not None:
+        _fail("attachment attribution without a bundle")
+    _text(route["frozen_by"], "frozen_by")
+    _text(route["frozen_at"], "frozen_at")
     if route["instance_id"] != record.get("instance_id") or route["revision"] != record.get("revision"):
         _fail("route instance/revision is stale", "acceptance_row_unbound")
     _object(route["project"], "locator revision tree roots", "project")
@@ -380,7 +407,9 @@ def _bundle(bundle, record, route, plan):
     return rows, artifacts
 
 
-def attach(store, close_id, bundle_file):
+def attach(store, close_id, bundle_file, *, by, at):
+    _text(by, "attached_by")
+    _text(at, "attached_at")
     path = Path(bundle_file).absolute()
     data = _read(_path(path.parent, path.name))
     bundle = decode(data)
@@ -406,6 +435,8 @@ def attach(store, close_id, bundle_file):
         for raw in captured:
             _retain(store, raw)
         route["bundle_hash"] = _retain(store, data)
+        route.update(attached_by=by, attached_at=at)
+        close._event(record, "acceptance:attach", by, at, bundle_hash=route["bundle_hash"])
         transaction.commit()
     return route["bundle_hash"]
 
@@ -420,6 +451,9 @@ def _compare(row, raw):
             _fail("observed exit code is not an integer")
         return observed == expected
     if row["comparator"] == "exact-failure-set":
+        # A bounded expected set cannot equal an observed set beyond that bound.
+        if isinstance(observed, list) and len(observed) > MAX_ITEMS:
+            return False
         return set(_strings(observed, "observed failure IDs")) == set(expected)
     # JSON canonical comparison distinguishes true from 1, including nested values.
     return json.dumps(observed, sort_keys=True) == json.dumps(expected, sort_keys=True)
@@ -439,22 +473,36 @@ def resolve(store, record):
         raw_results = {}
         total = 0
         for artifact in artifacts.values():
-            data = _retained(store, artifact["sha256"])
-            total += len(data)
-            if total > MAX_TOTAL_BYTES:
-                _fail("retained bundle exceeds total byte limit")
-            raw_results[artifact["id"]] = decode(data)
+            try:
+                data = _retained(store, artifact["sha256"])
+                total += len(data)
+                raw_results[artifact["id"]] = decode(data)
+            except (OSError, AcceptanceError) as exc:
+                raw_results[artifact["id"]] = exc
+        if total > MAX_TOTAL_BYTES:
+            _fail("retained bundle exceeds total byte limit")
         outcomes = []
+        holds = []
         for row in plan["rows"]:
-            raw = raw_results[row["artifact"]]
-            _object(raw, "schema_version run_id revision values", "raw result")
-            _version(raw["schema_version"])
-            if raw["revision"] != record["revision"] or raw["run_id"] != rows[row["id"]]["run_id"]:
-                _fail("raw result belongs to another run/revision", "acceptance_row_unbound")
-            if not isinstance(raw["values"], dict):
-                _fail("raw result values must be an object")
-            outcomes.append({"id": row["id"], "policy": row["policy"], "passed": _compare(row, raw)})
-        return {"holds": [], "outcomes": outcomes}
+            outcome = {"id": row["id"], "policy": row["policy"], "passed": None}
+            try:
+                raw = raw_results[row["artifact"]]
+                if isinstance(raw, Exception):
+                    raise raw
+                _object(raw, "schema_version run_id revision values", "raw result")
+                _version(raw["schema_version"])
+                if raw["revision"] != record["revision"] or raw["run_id"] != rows[row["id"]]["run_id"]:
+                    _fail("raw result belongs to another run/revision", "acceptance_row_unbound")
+                if not isinstance(raw["values"], dict):
+                    _fail("raw result values must be an object")
+                outcome["passed"] = _compare(row, raw)
+            except (AcceptanceError, OSError) as exc:
+                code = getattr(exc, "code", "acceptance_record_missing")
+                outcome["error"] = {"code": code, "detail": str(exc)}
+                if row["policy"] == "gating":
+                    holds.append((code, f"row {row['id']}: {exc}"))
+            outcomes.append(outcome)
+        return {"holds": holds, "outcomes": outcomes}
     except AcceptanceError as exc:
         return {"holds": [(exc.code, str(exc))], "outcomes": []}
     except (OSError, ValueError, TypeError, KeyError, RecursionError) as exc:

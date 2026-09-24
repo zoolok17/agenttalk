@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Acceptance increment 1a freezes project-bound plans and retains evidence for
+  built-in comparisons; it remains HOLD-only pending later trust checks.
+  Acceptance closes use schema 2 so older engines reject them. Evidence blobs
+  publish atomically, attachments record actor/time and an event, and malformed
+  informational rows preserve other outcomes. See the
+  [implementation record](docs/STEP-ACCEPTANCE-INC1.md) for compatibility,
+  advisory authority, storage and targeted verification details.
+
 ## [0.91.0] - 2026-09-23
 
 Theme: **the gateway grows a Linux host and a configurable spend

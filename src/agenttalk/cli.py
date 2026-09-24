@@ -3534,7 +3534,8 @@ def cmd_close(args: argparse.Namespace) -> int:
                     raise close_mod.CloseError(
                         "acceptance requires --project-repo and forbids force/dirty overrides")
                 prepared = acceptance.prepare(
-                    store, args.acceptance_plan, args.project_repo, args.revision, args.scope)
+                    store, args.acceptance_plan, args.project_repo, args.revision, args.scope,
+                    _close_lens_specs(args))
                 revision, kind = prepared["project"]["revision"], "sha"
             else:
                 if getattr(args, "project_repo", None):
@@ -3563,6 +3564,7 @@ def cmd_close(args: argparse.Namespace) -> int:
         record["worktree_isolation"] = _close_worktree_eval(store, record)
         if prepared:
             # A crash before the freeze transaction must leave a HOLD-only close.
+            record["schema_version"] = close_mod.ACCEPTANCE_SCHEMA_VERSION
             record["acceptance_route"] = {"pending": True}
         if not clean and not args.dirty_artifact:
             sys.stderr.write(
@@ -3574,6 +3576,8 @@ def cmd_close(args: argparse.Namespace) -> int:
             if rc != 0:
                 return rc
         try:
+            if prepared:
+                acceptance.partition_lenses(prepared["plan"], record["required_lenses"])
             path = close_mod.close_path(store, close_id)
             if not args.force and path.exists():
                 sys.stderr.write(
@@ -3592,12 +3596,13 @@ def cmd_close(args: argparse.Namespace) -> int:
             else:
                 close_mod.create_close(store, record)
             if prepared:
-                record = acceptance.freeze(store, close_id, prepared)
+                record = acceptance.freeze(store, close_id, prepared, _iso_now())
         except (close_mod.CloseConflict, TimeoutError) as e:
             return _close_conflict_result("open", e)
         except close_mod.CloseError as e:
-            sys.stderr.write(f"agenttalk close open: {e}\n")
-            return 2
+            code = getattr(e, "code", None)
+            sys.stderr.write(f"agenttalk close open: {code or 'invalid_input'}: {e}\n")
+            return 3 if code else 2
         if getattr(args, "json", False):
             print(json.dumps(record, indent=2))
         else:
@@ -3612,8 +3617,10 @@ def cmd_close(args: argparse.Namespace) -> int:
 
     if action == "acceptance":
         from agenttalk import acceptance
+        actor = _resolve_self(getattr(args, "actor", None), roster=roster)
+        _check_close_authority(store, actor, "acceptance attach")
         try:
-            digest = acceptance.attach(store, args.id, args.file)
+            digest = acceptance.attach(store, args.id, args.file, by=actor, at=_iso_now())
         except (close_mod.CloseConflict, TimeoutError) as e:
             return _close_conflict_result("acceptance attach", e)
         except (close_mod.CloseError, OSError, ValueError, TypeError, KeyError) as e:
@@ -14870,6 +14877,7 @@ def build_parser() -> argparse.ArgumentParser:
     cattach = cacceptsub.add_parser("attach", help="Copy and bind an immutable bundle and its raw artifacts.")
     cattach.add_argument("--id", required=True)
     cattach.add_argument("--file", required=True)
+    cattach.add_argument("--from", dest="actor", help="Actor binding evidence (advisory close authority).")
     cattach.set_defaults(func=cmd_close)
 
     csign = csub.add_parser("signoffs", help="P3: derive/inspect specialist sign-offs.")

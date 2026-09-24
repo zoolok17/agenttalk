@@ -747,7 +747,7 @@ command for the full set.
 | Command | What it does |
 | --- | --- |
 | `gate {set,list,check,waive}` | Lightweight `HOLD`/`GO` assurance state; `check` exits 3 on an unwaived blocker. |
-| `close {open,ack,draft,counter,check,publish,reopen,list,show}` | Aggregates gates + typed review evidence into one milestone/release verdict. |
+| `close {open,ack,draft,counter,check,publish,reopen,acceptance attach,list,show}` | Aggregates gates + typed review evidence into one milestone/release verdict. Acceptance open adds `--acceptance-plan PLAN --project-repo PROJECT`; attach takes `--file BUNDLE --from ACTOR`. The [increment 1a contract](docs/STEP-ACCEPTANCE-INC1.md) is HOLD-only. |
 | `close signoffs {plan,apply,override}` | Derives specialist sign-off routing by risk class. |
 | `check` | Pre-action HOLD/GO check, optionally `--gates`-aware. |
 | `lane {assign,check,deliver,status,approve-shared}` | Scoped deliver-gate: bounds a change against the domain registry and other active lanes. |

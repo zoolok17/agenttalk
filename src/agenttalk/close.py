@@ -42,6 +42,7 @@ from agenttalk.coverage_contract import COVERAGE_GATE_NAMES, coverage_profile_fr
 from agenttalk.gates import CORE_RISK_CLASSES, is_valid_risk_class
 
 SCHEMA_VERSION = 1
+ACCEPTANCE_SCHEMA_VERSION = 2
 DIRNAME = "closes"
 
 # A close moves through these statuses; `published` is terminal (HOLD or GO).
@@ -455,7 +456,8 @@ def _ack_authorized(ack: dict, lens: dict) -> bool:
 def _is_wellformed(record: object) -> bool:
     if not isinstance(record, dict):
         return False
-    if record.get("schema_version") != SCHEMA_VERSION:
+    expected_version = ACCEPTANCE_SCHEMA_VERSION if "acceptance_route" in record else SCHEMA_VERSION
+    if type(record.get("schema_version")) is not int or record["schema_version"] != expected_version:
         return False
     generation = record.get("generation", 0)
     if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
