@@ -9,6 +9,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.91.1] - 2026-09-24
+
+Theme: **the gateway's service layer now binds its manifest, task
+identity, runtime marker and status to the ledger's own envelope hash,
+not the default envelope's - the field fix for the 0.91.0 spend envelope
+at init.**
+
+Field basis: one PR (#191) on the 0.91.0 envelope change. A gateway
+initialised at a non-default envelope had `gateway init` print the
+ledger's `price_policy_hash`, while `gateway task-install` recorded the
+default-envelope hash in the task identity and the install manifest held
+it too. Every service-layer site agreed with the others, so the gateway
+reported ready and the ledger itself still enforced the real envelope on
+reservations, but nothing bound the manifest, task or runtime identity to
+the ledger's actual policy, and `gateway status` reported a hash that was
+not the ledger's. The 0.91.0 enumeration of readers had covered
+`ovh_gateway.py` only.
+
+### Gateway
+
+- **Fixed: the service layer hashed the default envelope at ten sites.**
+  `ovh_gateway_service.py` called `price_policy_hash()` /
+  `child_cap_policy_hash()` with no arguments. Every site now reads the
+  ledger's own verified hashes through a new `SpendLedger.policy_hashes()`
+  (the value `gateway init` prints and `status` reports): the init
+  manifest, the task identity, manifest validation (including the
+  reconfigure pre-write check and the rebind snapshot and reload), the
+  runtime marker's expected and written values, and `gateway status`. A
+  manifest or task identity written under one envelope now fails its check
+  against a ledger with another. `install_task`, `load_install_manifest`,
+  `reconfigure_endpoint` and `rebind_runtime` take an optional `ledger=`
+  keyword; the CLI is unchanged. `stop_task` uses a ledger-independent
+  registration identity, so operator stop still works with a blocked
+  ledger. `gateway status` with no usable ledger reports null policy
+  hashes rather than a default hash that is not the ledger's.
+
+### Docs
+
+- `docs/STEP-ENVELOPE-SERVICE-READERS.md` records every service-layer
+  reader of the two hashes and the upgrade path below.
+
+### Upgrade
+
+- **An install made on 0.91.0 at a non-default envelope must be
+  re-initialised.** Its `install-manifest.json` and `task-identity.json`
+  hold the default-envelope hash, so on 0.91.1 `gateway status` reports
+  `install_manifest_invalid` (and `runtime_marker_invalid` until the
+  service restarts). There is no in-code migration: stop the gateway, back
+  up the ledger and move the old gateway state aside, then `gateway init`,
+  `cap-install`, `task-install`, `start` and the dashboard canary, as set
+  out in `docs/STEP-ENVELOPE-SERVICE-READERS.md`. This starts a new
+  ledger; spend history stays in the backup. An install at the default
+  envelope needs nothing: its hashes were already the ledger's.
+
 ## [0.91.0] - 2026-09-23
 
 Theme: **the gateway grows a Linux host and a configurable spend
