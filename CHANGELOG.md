@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Acceptance 1b corrections require exact operator approval for gating assertion
+  amendments at any revision and retain the original failure as a policy change.
+  Successors cannot shrink author/runner exclusions; partition accepts bind the
+  attached bundle. Open-attempt checks and GO publication use live verification;
+  terminal checks explicitly report historical evaluation. Parent snapshots use
+  digest references instead of embedding the parent's final snapshot.
+
 - Acceptance increment 1b adds cooperative reproduction, attempt/policy-bound
   acknowledgments, immutable successors, historical Git-object verification and
   operator-origin scope reductions that preserve failed evidence. Complete

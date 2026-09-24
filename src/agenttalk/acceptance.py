@@ -595,7 +595,8 @@ def evaluate(snapshot):
 
 def ack_binding(record):
     route = record.get("acceptance_route") or {}
-    return {key: route.get(key) for key in ("instance_id", "attempt_id", "revision", "plan_hash", "registry_hash")}
+    return {key: route.get(key) for key in
+            ("instance_id", "attempt_id", "revision", "plan_hash", "registry_hash", "bundle_hash")}
 
 
 def _ack_bindings(record, plan, holds):

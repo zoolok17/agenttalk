@@ -60,9 +60,9 @@ def open_attempt(case, *extra):
                    "--project-repo", str(case["project"]), *extra)
 
 
-def accept_all(case):
+def accept_all(case, close_id="attempt"):
     for partition in case["plan"]["partitions"]:
-        assert command(case, "ack", "--id", "attempt", "--lens", "acceptance-run-" + partition["id"],
+        assert command(case, "ack", "--id", close_id, "--lens", "acceptance-run-" + partition["id"],
                        "--from", partition["agents"][0], "--status", "accept", "--risk-class", "quality",
                        "--release-blocker", "no", "--tests-referenced", "synthetic",
                        "--tests-executed", "synthetic", "--residual-risk", "increment incomplete",
@@ -633,6 +633,10 @@ def snapshot(case):
     return acceptance.resolve(case["store"], close.load_close(case["store"], "attempt"))
 
 
+def retained_parent(case, result):
+    return acceptance.decode(acceptance._retained(case["store"], result["parent"]["record_hash"]))
+
+
 def publish_hold(case):
     assert command(case, "publish", "--id", "attempt", "--from", "lead", "--verdict", "hold",
                    "--reason", "preserve this attempt") == 3
@@ -730,6 +734,8 @@ def test_acceptance_historical_attempt_reads_objects_after_checkout_moves(case_v
     assert "acceptance_row_failed" in codes
     assert "acceptance_project_unverified" not in codes
     assert close.close_path(case["store"], "attempt").read_bytes() == original
+    assert command(case, "check", "--id", "attempt", "--json") == 3
+    assert json.loads(capsys.readouterr().out)["acceptance_evaluation"] == "historical; not GO-publication eligibility"
 
 
 def test_acceptance_attach_requires_live_clean_candidate(case_v2):
@@ -759,9 +765,9 @@ def test_acceptance_successor_preserves_hold(case_v2):
     assert successor(case) == 0
     child = complete_child(case)
     assert "acceptance_plan_stale" in {c for c, _ in child["holds"]}
-    assert child["outcomes"][0]["passed"] is True
-    assert child["parent"]["final"]["verdict"] == "HOLD"
-    assert child["parent"]["final"]["acceptance_snapshot"]["outcomes"][0]["passed"] is False
+    assert child["outcomes"][0]["passed"] is None
+    assert child["parent"]["verdict"] == "HOLD"
+    assert retained_parent(case, child)["final"]["acceptance_snapshot"]["outcomes"][0]["passed"] is False
     assert close.close_path(case["store"], "attempt").read_bytes() == before
     assert command(case, "publish", "--id", "next", "--from", "lead", "--verdict", "hold") == 3
     # Unapproved same-SHA policy movement must not disappear in a later successor.
@@ -846,7 +852,7 @@ def test_acceptance_operator_scope_reduction_preserves_failure_and_reports_reduc
     assert child["outcomes"][0]["passed"] is None
     assert child["outcomes"][0]["original_outcome"]["passed"] is False
     assert "acceptance_scope_reduction_unapproved" not in {c for c, _ in child["holds"]}
-    assert child["parent"]["final"]["acceptance_snapshot"]["outcomes"][0]["passed"] is False
+    assert retained_parent(case_v2, child)["final"]["acceptance_snapshot"]["outcomes"][0]["passed"] is False
 
 
 def test_acceptance_unapproved_scope_reduction_remains_hold(case_v2):
@@ -952,7 +958,7 @@ def test_acceptance_new_revision_successor_preserves_historical_failure(case_v2)
     assert successor(case) == 0
     child = complete_child(case)
     assert child["outcomes"][0]["passed"] is True
-    assert child["parent"]["final"]["acceptance_snapshot"]["outcomes"][0]["passed"] is False
+    assert retained_parent(case, child)["final"]["acceptance_snapshot"]["outcomes"][0]["passed"] is False
     assert "acceptance_project_unverified" not in {code for code, _ in child["holds"]}
 
 
@@ -1035,3 +1041,222 @@ def test_acceptance_reopen_flags_require_successor(case_v2, capsys):
                    "--acceptance-plan", str(case_v2["inputs"] / "plan.json")) == 2
     assert "require --successor" in capsys.readouterr().err
     assert close.close_path(case_v2["store"], "attempt").read_bytes() == before
+
+
+@pytest.mark.parametrize("new_revision", [False, True])
+def test_acceptance_gating_amendment_requires_operator_at_any_revision(case_v2, new_revision):
+    case = case_v2
+    assert open_attempt(case) == 0
+    bundle_v2(case, build_exit=1)
+    assert attach(case) == 0
+    publish_hold(case)
+    if new_revision:
+        (case["project"] / "source.txt").write_text("another revision", encoding="utf-8")
+        git(case["project"], "commit", "-qam", "synthetic change")
+        case["sha"] = git(case["project"], "rev-parse", "HEAD")
+    case["plan"]["rows"][0]["expected"] = 1
+    write_json(case["inputs"] / "plan.json", case["plan"])
+    assert successor(case) == 0
+    complete_child(case)
+    accept_all(case, "next")
+    result = acceptance.resolve(case["store"], close.load_close(case["store"], "next"))
+    assert "acceptance_category_moved_unreviewed" in {code for code, _ in result["holds"]}
+    # This is a direct policy hold, independent of the staged cold-review hold.
+    assert result["outcomes"][0]["passed"] is None
+    assert result["outcomes"][0]["original_outcome"]["passed"] is False
+    # A later source revision cannot launder an earlier unapproved amendment.
+    assert command(case, "publish", "--id", "next", "--from", "lead", "--verdict", "hold") == 3
+    (case["project"] / "source.txt").write_text("third revision", encoding="utf-8")
+    git(case["project"], "commit", "-qam", "synthetic follow-up")
+    case["sha"] = git(case["project"], "rev-parse", "HEAD")
+    assert successor(case, parent="next", new_id="third") == 0
+    third = complete_child(case, "third")
+    assert "acceptance_category_moved_unreviewed" in {code for code, _ in third["holds"]}
+    assert third["outcomes"][0]["passed"] is None
+    assert third["outcomes"][0]["original_outcome"]["passed"] is False
+
+
+@pytest.mark.parametrize("sender,tamper", [("operator", None), ("lead", None), ("operator", "old"),
+                                         ("operator", "new"), ("operator", "expired")])
+def test_acceptance_exact_operator_policy_amendment_preserves_failure(case_v2, sender, tamper):
+    from agenttalk import acceptance_history as history
+    case = case_v2
+    assert open_attempt(case) == 0
+    bundle_v2(case, build_exit=1)
+    assert attach(case) == 0
+    publish_hold(case)
+    parent = close.load_close(case["store"], "attempt")
+    old_plan = deepcopy(case["plan"])
+    (case["project"] / "source.txt").write_text("next revision", encoding="utf-8")
+    git(case["project"], "commit", "-qam", "synthetic change")
+    case["sha"] = git(case["project"], "rev-parse", "HEAD")
+    case["plan"]["rows"][0]["expected"] = 1
+    plan_hash = write_json(case["inputs"] / "plan.json", case["plan"])
+    change = {"rows": ["build"], "reason": "correct the assertion", "alternatives": ["retain old assertion"],
+              "impact": "policy changed, original failure remains", "owner": "owner",
+              "expires_at": "2000-01-01T00:00:00Z" if tamper == "expired" else "9999-01-01T00:00:00Z",
+              "cause": "policy-amendment", "evidence": [parent["acceptance_route"]["bundle_hash"]],
+              "decision_ref": "pending", "changes": deepcopy(history.assertion_changes(old_plan, case["plan"]))}
+    if tamper in {"old", "new"}:
+        change["changes"]["build"][tamper]["expected"] = 9
+    message = case["store"].send(sender=sender, recipient="lead", kind="message",
+                                 body=json.dumps(history.approval_payload(parent, "next", plan_hash, change)),
+                                 _allow_reserved_sender=sender == "operator")
+    change["decision_ref"] = message.id
+    path = case["inputs"] / "amendment.json"
+    write_json(path, change)
+    rc = successor(case, reduction=path)
+    if sender != "operator" or tamper == "expired":
+        assert rc == 2
+        return
+    assert rc == 0
+    result = complete_child(case)
+    codes = {code for code, _ in result["holds"]}
+    assert ("acceptance_category_moved_unreviewed" in codes) == (tamper is not None)
+    assert result["report_label"] == "policy amended"
+    assert result["outcomes"][0]["passed"] is None
+    assert result["outcomes"][0]["comparison_passed"] is True
+    assert result["outcomes"][0]["original_outcome"]["passed"] is False
+    # Expiry remains an evaluation requirement after the approval was retained.
+    if tamper is None:
+        from datetime import datetime, timezone
+        from unittest.mock import patch
+        with patch.object(history, "_now", return_value=datetime.max.replace(tzinfo=timezone.utc)):
+            expired = acceptance.resolve(case["store"], close.load_close(case["store"], "next"))
+        assert "acceptance_category_moved_unreviewed" in {code for code, _ in expired["holds"]}
+
+
+@pytest.mark.parametrize("field", ["authors", "runners"])
+def test_acceptance_successor_cannot_shrink_independence_lists(case_v2, field):
+    assert open_attempt(case_v2) == 0
+    bundle_v2(case_v2)
+    assert attach(case_v2) == 0
+    publish_hold(case_v2)
+    if field == "authors":
+        case_v2["plan"]["authors"] = ["another-author"]
+    else:
+        case_v2["plan"]["partitions"][0]["agents"] = ["runner-b"]
+    write_json(case_v2["inputs"] / "plan.json", case_v2["plan"])
+    assert successor(case_v2) == 0
+    result = complete_child(case_v2)
+    assert any(code == "acceptance_lens_not_independent" and "successor" in detail
+               for code, detail in result["holds"])
+
+
+def test_acceptance_pre_attachment_accepts_are_stale(case_v2, capsys):
+    assert open_attempt(case_v2) == 0
+    accept_all(case_v2)
+    bundle_v2(case_v2)
+    assert attach(case_v2) == 0
+    assert "acceptance_lens_not_independent" in check(case_v2, capsys)
+    accept_all(case_v2)
+    assert check(case_v2, capsys) == {"acceptance_cold_missing"}
+
+
+def test_acceptance_live_check_matches_go_publish(case_v2, capsys):
+    assert open_attempt(case_v2) == 0
+    bundle_v2(case_v2)
+    assert attach(case_v2) == 0
+    accept_all(case_v2)
+    (case_v2["project"] / "source.txt").write_text("dirty", encoding="utf-8")
+    assert "acceptance_project_unverified" in check(case_v2, capsys)
+    assert command(case_v2, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go") == 3
+    assert "acceptance_project_unverified" in capsys.readouterr().out
+
+
+def test_acceptance_parent_snapshot_is_digest_reference(case_v2):
+    assert open_attempt(case_v2) == 0
+    bundle_v2(case_v2)
+    assert attach(case_v2) == 0
+    publish_hold(case_v2)
+    assert successor(case_v2) == 0
+    child = complete_child(case_v2)
+    assert set(child["parent"]) == {"close_id", "record_hash", "verdict"}
+    assert retained_parent(case_v2, child)["final"]["verdict"] == "HOLD"
+
+
+def test_acceptance_duplicate_reproduction_holds(case_v2, capsys):
+    assert open_attempt(case_v2) == 0
+    data = bundle_v2(case_v2)
+    duplicate = deepcopy(data["reproductions"][0])
+    duplicate["id"] = "second-reproduction"
+    data["reproductions"].append(duplicate)
+    write_json(case_v2["inputs"] / "bundle.json", data)
+    assert attach(case_v2) == 0
+    assert "acceptance_trust_unresolved" in check(case_v2, capsys)
+
+
+def test_acceptance_reproduction_dirty_after_holds(case_v2, capsys):
+    assert open_attempt(case_v2) == 0
+    data = bundle_v2(case_v2)
+    data["reproductions"][0]["status_after"] = " M source.txt"
+    write_json(case_v2["inputs"] / "bundle.json", data)
+    assert attach(case_v2) == 0
+    assert "acceptance_project_unverified" in check(case_v2, capsys)
+
+
+def test_acceptance_allowed_runner_override_holds(case_v2, capsys):
+    assert open_attempt(case_v2) == 0
+    bundle_v2(case_v2)
+    assert attach(case_v2) == 0
+    accept_all(case_v2)
+    # The CLI ignores --override from a non-lead, even an allowed runner.
+    # Exercise a recorded override through the state transition used by writers.
+    with close.close_transaction(case_v2["store"], "attempt") as tx:
+        previous = tx.record["lens_acks"]["acceptance-run-bar"]
+        close.apply_ack(tx.record, lens_id="acceptance-run-bar", agent="runner-a", status="accept",
+                        from_role=None, at=previous["at"], evidence=previous["evidence"], override=True)
+        tx.commit()
+    assert "acceptance_lens_not_independent" in check(case_v2, capsys)
+
+
+def test_acceptance_reproduction_cannot_reuse_original_run_id(case_v2, capsys):
+    assert open_attempt(case_v2) == 0
+    data = bundle_v2(case_v2)
+    data["reproductions"][0]["id"] = data["runs"][0]["id"]
+    write_json(case_v2["inputs"] / "bundle.json", data)
+    assert attach(case_v2) == 2
+    assert "reproduction run reference is invalid" in capsys.readouterr().err
+
+
+def test_acceptance_operator_message_embedded_id_must_match(case_v2):
+    assert open_attempt(case_v2) == 0
+    bundle_v2(case_v2)
+    assert attach(case_v2) == 0
+    publish_hold(case_v2)
+    path = reduction_input(case_v2)
+    decision = json.loads(path.read_text())["decision_ref"]
+    message_path = case_v2["store"].messages_dir / (decision + ".json")
+    message = json.loads(message_path.read_text())
+    message["id"] = "different-id"
+    write_json(message_path, message)
+    assert successor(case_v2, reduction=path) == 2
+
+
+def test_acceptance_resolver_rechecks_derived_project_id(case_v2):
+    assert open_attempt(case_v2) == 0
+    bundle_v2(case_v2)
+    assert attach(case_v2) == 0
+    record = close.load_close(case_v2["store"], "attempt")
+    route = record["acceptance_route"]
+    plan = deepcopy(case_v2["plan"])
+    plan["project_id"] = "foreign-project"
+    route["project_id"] = plan["project_id"]
+    route["plan_hash"] = acceptance._retain(case_v2["store"], json.dumps(plan).encode())
+    result = acceptance.resolve(case_v2["store"], record)
+    assert "acceptance_project_unverified" in {code for code, _ in result["holds"]}
+
+
+def test_acceptance_ancestry_depth_cap_holds(case_v2):
+    from agenttalk import acceptance_history as history
+    assert open_attempt(case_v2) == 0
+    bundle_v2(case_v2)
+    assert attach(case_v2) == 0
+    publish_hold(case_v2)
+    assert successor(case_v2) == 0
+    complete_child(case_v2)
+    child = close.load_close(case_v2["store"], "next")
+    # Exercise the boundary with real retained parent/policy bytes.
+    history.evaluate(case_v2["store"], child, case_v2["plan"], {"holds": [], "outcomes": []}, depth=31)
+    with pytest.raises(acceptance.AcceptanceError, match="ancestry exceeds"):
+        history.evaluate(case_v2["store"], child, case_v2["plan"], {"holds": [], "outcomes": []}, depth=32)

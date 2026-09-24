@@ -248,6 +248,105 @@ All pytest commands ran foreground with `PYTHONPATH=<CLONE>/src`, `PYTHONDONTWRI
 
 Scratch is retained in the private `acceptance-inc1a` task directory for the cold reader, with `1b`-named fixtures and M18 probe/log. No reviewer workspace was modified. F9, final cold/vendor enforcement and complete check/publish integration remain for 1c; no broad suite or release GO is claimed.
 
+## 1b correction — policy amendments across revisions
+
+Base: `58a5abd`. This section supersedes the earlier 1b descriptions where noted.
+Audience: implementers and cold reviewers checking the successor contract.
+
+Every change to an existing gating assertion (including its partition, comparator,
+expected value, field or artifact) now requires reserved-operator approval at any
+source revision. An unapproved change adds `acceptance_category_moved_unreviewed`,
+independently of the staged cold-review hold; descendants retain this hold. A new
+SHA never makes changed policy into evidence that the original assertion passed.
+Same-SHA unapproved changes also retain `acceptance_plan_stale`.
+
+The existing `--scope-reduction FILE` input accepts `cause:policy-amendment` with
+the existing reason, alternatives, impact, owner, expiry, retained evidence and
+decision reference, plus `changes:{ROW_ID:{old:OLD_ROW,new:NEW_ROW}}`. Both rows
+are complete plan row objects. `rows` must exactly equal the changed gating IDs.
+The operator message remains `approval_payload(parent, NEW, plan_hash, input)`;
+canonical typed JSON equality binds that exact diff, predecessor attempt,
+successor ID and entire new plan. A mismatched, absent, expired or lead-origin
+approval cannot clear the policy hold. Policy changes and gating-to-informational
+reductions must use separate successor attempts; one approval cannot blur them.
+
+New retained amendments use schema 2 and add the computed `assertion_changes` map;
+evaluation recomputes and checks it. Existing schema-1 amendments are read with
+the same cross-revision policy checks, so the older bypass stays HOLD. Outcomes
+for changed assertions use `disposition:policy-amended`, `passed:null`, retained
+`original_outcome`, and separate `comparison_passed`, with report label **policy
+amended**. A failed amended gating comparison still HOLDs. Descendants preserve
+the original outcome and amendment label; ancestral approvals are revalidated.
+
+Authors must be a superset of the predecessor's declarations; each existing
+partition must retain its prior allowed runner set. Removing either adds a direct
+`acceptance_lens_not_independent` hold, inherited by descendants. This deliberately
+offers no operator override for erasing independence exclusions. Partition ack
+bindings add `bundle_hash`: pre-attachment accepts and prior-format bindings are
+stale and must be refreshed after attach.
+
+Open-attempt `close check` and GO publish resolve acceptance once with live
+candidate verification. HOLD publication retains historical evaluation, so a
+moved checkout cannot erase a failing terminal record. A terminal `close check`
+labels itself `historical; not GO-publication eligibility` in text and the JSON
+`acceptance_evaluation` field. The live label is `live candidate`. Existing
+published records still cannot be republished without a successor. F9's lock
+duration and final integration work remain 1c; no stronger filesystem race claim.
+
+Parent snapshot summaries now contain only `close_id`, `record_hash` and
+`verdict`; the full final remains reachable through the retained record digest.
+Inherited scope summaries likewise store only that digest, avoiding recursive
+snapshot embedding. Existing parent blobs remain readable without rewriting.
+Ancestry still caps at 32 links and retained JSON at 1 MiB. Do not deepen a shallow
+checkout or replace it during an attempt: root-set identity is frozen; changes
+HOLD. A full-history checkout avoids the shallow-boundary ambiguity.
+
+### Correction reader inventory
+
+| Changed surface | Existing readers and assumptions |
+| --- | --- |
+| Amendment schema/diff and approval input | `successor`, history `evaluate`, `_reduction`, `_approval`, `approval_payload`; CLI successor/reopen pass the same file. Exact fields dispatch by amendment version; typed diff comparison; operator producers bind the full new input. Older 1b history readers reject schema 2; 1a/0.91 engines retain their earlier rejection guards. |
+| Bundle-bound ack | `close.apply_ack` writes through `acceptance.ack_binding`; `_ack_bindings` checks equality. `compute_verdict`, `_ack_authorized`, `_evaluate_signoffs`, `_signoff_signers`, show/list preserve or ignore the extension. No ordinary-close ack change. |
+| Author/runner sets | Plan validation, partition-lens generation, `_bundle`, `_reproduce`, successor and history evaluation. Existing per-attempt checks remain; history adds monotonic exclusions. |
+| Parent and inherited snapshot summaries | History `evaluate` was the only reader of nested snapshots; it reads full retained parent records. CLI publish stores the resolver result; show emits it. `record_publish`, `_published_close_holds`, attention and barrier validation read outer final fields, not nested parent summaries. |
+| Outcome disposition and null pass | Acceptance `evaluate` holds only on explicit false and consumes direct history holds. History carries labels/original outcomes; CLI final storage/show preserve them. No consumer may interpret `comparison_passed` as the original row's pass. |
+| Live resolver option / check label | `_build_dod_eval`, CLI check/publish, acceptance `resolve`. Default helper callers retain historical semantics; open check and GO publish select live once. Existing `compute_verdict` and ordinary-close output retain their contracts; extra label applies only to acceptance check output. |
+
+### Finding dispositions
+
+Test names below are in `tests/test_acceptance.py`, prefixed `test_acceptance_`.
+
+| Finding | Disposition | Test / evidence |
+| --- | --- | --- |
+| M1 policy bypass across SHAs | FIXED; exact operator amendment binding, original failure preserved, direct hold independent of cold. | `gating_amendment_requires_operator_at_any_revision`, `exact_operator_policy_amendment_preserves_failure`, existing same-SHA/history tests |
+| M2 shrinking independence lists | FIXED; monotonic authors and runner sets, inherited direct hold. | `successor_cannot_shrink_independence_lists` |
+| M3 pre-attach accept | FIXED; bundle digest in ack binding. | `pre_attachment_accepts_are_stale` |
+| M4 reproducer self-attestation | DEFER to 1c's independence lenses; add an attempt/bundle-bound reproducer acknowledgment before removing the cold hold. Current cooperative declarations remain insufficient for production GO. | No self-attestation claim in this correction. |
+| M5 successor forks | DEFER to 1c; choose fork discovery/reporting or an exclusive successor reservation with crash recovery alongside final close integration. Current API permits siblings; no single-successor guarantee. | Reviewer probe accepted as limitation; no changed behavior. |
+| M6 Mb/Mc/Md/Mn | ADDED missing regression tests. | `duplicate_reproduction_holds`, `reproduction_dirty_after_holds`, `allowed_runner_override_holds`, `reproduction_cannot_reuse_original_run_id` |
+| M6 Me/Mg/Mi | ADDED depth, embedded approval identity and resolution identity tests. | `ancestry_depth_cap_holds`, `operator_message_embedded_id_must_match`, `resolver_rechecks_derived_project_id` |
+| M7 inherited reduction approval | DEFER renewal semantics to 1c before production GO: current descendants inherit the approved narrowed scope with original label and ancestral expiry. Decide renewal per revision/attempt with the lead; this correction does not claim per-attempt renewal. | Existing `scope_approval_expiry_survives_successor_chain`; staged cold hold remains. |
+| N1 recursive final growth | FIXED with digest summaries; full final retained separately in parent record. | `parent_snapshot_is_digest_reference`, history tests resolve the digest |
+| N2 check/publish mismatch | FIXED for open candidates; terminal history explicitly labeled; one resolve per invocation. | `live_check_matches_go_publish`, `historical_attempt_reads_objects_after_checkout_moves` |
+| N3 shallow history | DOCUMENTED limitation; do not deepen/replace checkout during attempt. | Existing identity mismatch holds; no shallow-clone support expansion claimed. |
+
+### Correction evidence
+
+All pytest runs used foreground execution, `PYTHONPATH=<CLONE>/src`,
+`PYTHONDONTWRITEBYTECODE=1`, isolated task scratch and `-p no:cacheprovider`.
+
+- Failing-first `python -m pytest tests/test_acceptance.py -q -k gating_amendment_requires_operator --basetemp <SCRATCH>/pytest-1b-correction-red -p no:cacheprovider`: **2 failed, 116 deselected**, specifically because `acceptance_category_moved_unreviewed` was absent at both unchanged and new source SHA.
+- First acceptance run: **132 passed, 1 skipped, 2 failed**. Fixed an aliased tamper fixture; corrected the override probe to use `close.apply_ack(override=True)` for an allowed runner, since the CLI ignores that flag from non-leads. No authority check was relaxed.
+- Focused follow-up with `-k "exact_operator_policy or allowed_runner_override or successor_preserves_hold or gating_amendment or scope_approval_expiry"`: **10 passed, 125 deselected**.
+- Final bar: `python -m pytest tests/test_acceptance.py tests/test_close.py tests/test_close_signoffs.py tests/test_gates.py -q --basetemp <SCRATCH>/pytest-1b-correction-final -p no:cacheprovider`: **469 passed, 1 skipped** in 199.60 seconds. The skip remains host-restricted symlink creation.
+- Isolated source copies, one named test per mutation: **Mb, Mc, Md, Mn, Me, Mg, Mi all KILLED**, each with one failing test. Repository source was not mutated. Logs and copies retained under private task scratch, `correction-mutants-88f96d7e`.
+- Targeted Ruff on the three changed production files and acceptance tests passed. Successor CLI help, whitespace, the seven-file scope and byte-identical accepted design were checked. Privacy sweep detected **8/8 positive controls, zero matches** in added public content.
+
+Scratch is retained in the private `acceptance-inc1a` task directory: correction
+fixtures, failing-first stores and seven mutant logs/copies support the delta
+read. No reviewer workspace was modified. No broad-suite or production-GO claim;
+the final cold hold, M4/M5/M7 decisions and F9 remain for 1c.
+
 ## 1c — awaiting lead acknowledgment and cold verdict
 
 Not started. Record final independence, publish parity and the complete integration fixture here after 1b is accepted.

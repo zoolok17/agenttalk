@@ -2960,7 +2960,7 @@ def _build_signoff_eval(store, record: dict):
             "active_agents": active}
 
 
-def _build_dod_eval(store, record: dict):
+def _build_dod_eval(store, record: dict, *, acceptance_live=None):
     """Resolve the #60 Definition-of-Done evidence (IMPURE) into the bundle
     :func:`close.evaluate_dod` consumes (PURE). ``None`` when the close's scope has no DoD
     requirements (byte-identical to pre-#60). Fails closed via ``policy_error`` on a malformed
@@ -2984,7 +2984,7 @@ def _build_dod_eval(store, record: dict):
         bundle["knowledge"] = _resolve_dod_knowledge(store, dims["knowledge"], record)
     if "acceptance" in dims:
         from agenttalk import acceptance
-        bundle["acceptance"] = acceptance.resolve(store, record)
+        bundle["acceptance"] = acceptance.resolve(store, record, live=acceptance_live)
     return bundle
 
 
@@ -3790,8 +3790,12 @@ def cmd_close(args: argparse.Namespace) -> int:
         rec = record if isinstance(record, dict) else {}
         signoff_eval = _build_signoff_eval(store, rec) if isinstance(record, dict) else None
         worktree_eval = _close_worktree_eval(store, rec) if isinstance(record, dict) else None
-        dod_eval = _build_dod_eval(store, rec) if isinstance(record, dict) else None
+        dod_eval = (_build_dod_eval(store, rec, acceptance_live=rec.get("status") != close_mod.PUBLISHED)
+                    if isinstance(record, dict) else None)
         result = close_mod.compute_verdict(rec, gate_check, signoff_eval, worktree_eval, dod_eval)
+        if "acceptance_route" in rec:
+            result["acceptance_evaluation"] = ("historical; not GO-publication eligibility"
+                                               if rec.get("status") == close_mod.PUBLISHED else "live candidate")
         if getattr(args, "json", False):
             print(json.dumps({**result, "gate_verdict": gate_check["verdict"],
                               "signoff_policy": (None if signoff_eval is None
@@ -3800,6 +3804,8 @@ def cmd_close(args: argparse.Namespace) -> int:
                               "worktree_isolation": worktree_eval}, indent=2))
         else:
             _print_verdict(args.id, result)
+            if "acceptance_evaluation" in result:
+                print("acceptance evaluation: " + result["acceptance_evaluation"])
         return 0 if result["verdict"] == close_mod.VERDICT_GO else 3
 
     if action == "publish":
@@ -3844,10 +3850,7 @@ def cmd_close(args: argparse.Namespace) -> int:
                         store.root, scope=record.get("gate_scope"))
                     signoff_eval = _build_signoff_eval(store, record)
                     worktree_eval = _close_worktree_eval(store, record)
-                    dod_eval = _build_dod_eval(store, record)
-                    if verdict == close_mod.VERDICT_GO and "acceptance_route" in record:
-                        from agenttalk import acceptance
-                        dod_eval["acceptance"] = acceptance.resolve(store, record, live=True)
+                    dod_eval = _build_dod_eval(store, record, acceptance_live=verdict == close_mod.VERDICT_GO)
                     record["worktree_isolation"] = worktree_eval
                     result = close_mod.compute_verdict(
                         record, gate_check, signoff_eval, worktree_eval, dod_eval)
