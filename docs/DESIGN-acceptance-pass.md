@@ -1,80 +1,220 @@
-# Acceptance pass design
+# Acceptance pass design v2
 
-**Audience:** agenttalk contributors and project leads designing a final acceptance check for major work. This note proposes a capability; the commands and records below are not implemented.
+**Status:** proposal, 2026-09-24; supersedes the design at `031162a`. Origin: the final-acceptance work order (public issue link pending). None of the acceptance additions below is shipped.
+**Audience:** contributors and project leads deciding how to build a final acceptance check. This is a design explanation and implementation contract, not an operator runbook.
 
-## Problem and boundary
+## Purpose
 
-Internal tests and reviews can agree with each other and still miss a defect in a plain build, an independently exercised interface, or the test harness itself. A hand-run pass on a legacy Java/AngularJS migration exposed all three kinds of gap. Agenttalk should make the final check reproducible, independently observed, and auditable for any project.
+Internal tests and reviews can agree and still miss defects in a plain build, an independently exercised interface, or the test harness. A hand-run pass on a legacy Java/AngularJS migration motivated this capability. The public examples below are synthetic.
 
-An acceptance pass runs against one frozen, clean revision after the normal implementation, CI, and review gates. It does not replace those gates, grant deployment authority, or claim that a scanner proves correctness. It verifies a declared behavioral bar and runs independent tools with explicit baselines, then asks a reviewer who has not seen the expected results to challenge the outcome.
+An acceptance pass checks a declared behavioral bar and independent tool measurements on a verified project revision, then reconciles an independent cold sweep. It supplements implementation, CI and review gates; it grants no deployment authority. Preserve the separation described in [Keep the acceptance bar and the cold sweep separate](../README.md#keep-the-acceptance-bar-and-the-cold-sweep-separate).
 
-## Concepts and records
+Extend `close`; do not create a competing `accept` verdict lifecycle. Acquisition, execution and evidence loading are outside the pure verdict function. Acceptance adds holds to the existing close result; it cannot clear another dimension's hold.
 
-| Concept | Proposed meaning |
+## Verified substrate and integration
+
+The following facts were checked against source at `031162a` and installed CLI 0.91.0 help. Function names are the durable references; line numbers are not assumed stable.
+
+| Existing behavior | Consequence for this proposal |
 | --- | --- |
-| Acceptance revision | The full commit SHA frozen by `close open`; all runs, baselines, and reviewer evidence bind to it. Changing the SHA invalidates the pass. |
-| Acceptance bar | A versioned list of behavioral items. Each item specifies a runnable command or observation, expected outcome, evidence artifact, owner, and whether it gates GO. A plain build and test command belong here even when CI already ran them. |
-| Tool registry entry | Tool name and stack, independent property checked, exact version, source/provenance and SHA-256 of the staged artifact, offline acquisition instructions, command template, result parser, gating or informational policy, and baseline rule. |
-| Cold sweep | A reviewer from a different vendor or team receives only the SHA, scope, and safety guardrails. The acceptance brief, expected counts, and first runner's results are withheld until the reviewer records independent observations. |
-| Residual | A bounded finding with owner, impact, evidence, disposition, follow-up and blocking status. An unresolved blocker cannot be relabeled as an informational observation. |
-| Acceptance record | One machine-readable pass record binding the close ID, revision, plan/registry hashes, bar rows, tool rows, cold-sweep pointer, residuals, and computed HOLD/GO inputs. Human-readable reports may link to it. |
+| [`compute_verdict`, `evaluate_dod`](../src/agenttalk/close.py) are pure; [`_build_dod_eval`](../src/agenttalk/cli.py) loads evidence. `close` does not auto-create or mutate gates. | Add a DoD `acceptance` dimension and its I/O resolver, returning direct holds; emit no acceptance gate. |
+| `load_dod_policy` rejects duplicate keys, oversized input and unsupported dimensions; `derive_required_dod` selects dimensions live by scope. Supported dimensions are currently assurance, coverage and knowledge. | Extend that validator explicitly. An older engine must reject a policy requiring acceptance, not ignore it. |
+| [`set_gate`](../src/agenttalk/gates.py) permits green blockers with caller-selected `automation_ci` and evidence references. `waive_gate` accepts operator free text. Ordinary `check_gates` does not compare revisions; required gate names apply project-wide. | Neither the label nor a scoped required gate authenticates this pass. No gate-waiver fallback clears acceptance. |
+| DoD assurance/coverage check revision, scope and configured freshness, and refuse waivers; assurance does not read artifact contents. | Reuse the DoD seam, not the assurance dimension's gate-only evidence contract. |
+| Close actor/lens checks are advisory; `--from` and role claims are not proof of identity. Ordinary lens checking does not dereference `--evidence`; `apply_ack` replaces the previous ack for that lens. | Evidence validation and independence are new acceptance checks. Allocate one run lens per partition, not one shared ack slot. |
+| `_resolve_revision` resolves in `store.root` and also accepts an unverifiable full SHA. `_worktree_clean` examines that root. | Verify the project repository separately; a clean bus store does not prove a clean runner checkout. |
+| `reopen` clears `final`; events retain only small event metadata. Same-SHA reopen does not stale ordinary acks. | Preserve immutable attempts, and bind acceptance acks to attempt identity as well as revision. |
+| `close_transaction` protects writes with generation/instance checks; signoff routes freeze hashes and detect stale inputs. | Freeze an authoritative acceptance route atomically; use generation for writes, instance/attempt for durable binding. |
+| Release-class scopes require lane evidence or `--non-lane-isolation-not-asserted`. `_close_lens_specs` splits `--allow` at the first colon. | Keep isolation handling explicit; use lens IDs such as `acceptance-run-bar`, avoiding colon-bearing IDs in this CLI syntax. |
 
-Each row records the exact executed command, exit status, tool version, timestamp, artifact digest and path, expected and observed values, baseline revision and value, comparison rule, and verdict. The record distinguishes `pass`, `fail`, `not-run`, and `informational`; a missing artifact is `not-run`, never `pass`. It also records the measured scope, such as operations covered or files scanned, so an unchanged count from a narrowed run cannot pass unnoticed.
+Proposed policy fragment (not runnable today): `{"schema_version":1,"scopes":{"milestone":{"acceptance":{"required":true}}}}` in `dod.json`. Both a live requirement and an already-frozen acceptance route force evaluation: removing the live dimension must not bypass an open pass. Invalid or unsupported policy holds. Closes without either remain unchanged.
 
-## Fit with existing agenttalk machinery
+Proposed CLI additions are `close open --acceptance-plan <PLAN> --project-repo <PROJECT>` and `close acceptance attach --id <ID> --file <BUNDLE>`. Open verifies the commit in the declared project and freezes the route; attach validates and transactionally references an immutable bundle. These names are sketches, not existing flags. `check` and `publish` both load, hash and evaluate the same bound evidence snapshot; GO publish revalidates under the close transaction and refuses concurrent replacement or changed bytes.
 
-**Recommendation:** extend `agenttalk close`, rather than create a second final-verdict command. `close open` already freezes a full SHA, binds required lenses to authorized actors, and stales acknowledgments when the revision changes. `close check` already combines lenses and gates into HOLD/GO; `close publish` records the lead's terminal decision. The existing `assurance-scan` remains an evidence producer, and its artifacts may supply tool rows, but it does not approve the pass.
+## Trust and evidence ownership
 
-Proposed additions are a project-owned acceptance plan and tool registry, a validated acceptance record, and an acceptance evaluator invoked by `close check`. A possible CLI shape is `close open ... --acceptance-plan PATH`, followed by `close acceptance record --id ID --file PATH`; these names are design sketches. Opening freezes the plan and registry hashes. The evaluator checks row completeness, revision binding, baseline rules, and cold-sweep presence before it allows GO. The integrator and cold reviewer acknowledge separate required `acceptance-run` and `acceptance-cold` lenses with typed evidence pointers. The lead drafts and publishes the same close already used for milestones.
+Today the substrate provides label-trust, not authenticated CI provenance or authenticated operator exceptions. [Assurance policy](ASSURANCE.md) already prohibits lead self-waiver. `_github_actions_evidence` in [assurance.py](../src/agenttalk/assurance.py) checks CI environment and repository facts; it is not an authenticated local execution witness. Do not describe a signed copy of seat-authored JSON as observed execution.
 
-The acceptance evaluator should emit an automation-attested, revision-bound blocker gate for the declared acceptance scope. This matters because current `gate set` accepts a blocker gate as green only with `automation_ci` evidence; a seat's `local_command` claim cannot turn it green. The runner may execute locally and offline, but a trusted project automation adapter must validate and attest its artifacts before setting that gate. Until that adapter exists, the close remains HOLD for gating acceptance; an operator may use the existing explicit, expiring waiver path. Accepted blocker remediations continue to reference named gates, as `close` already requires. The acceptance record points to evidence; it does not copy logs into the close JSON.
+The proposed minimum profile uses a lead/operator-controlled verifier outside runner write access. It reads retained raw bytes, verifies digests/bindings and recomputes outcomes using built-in or pinned comparators; it ignores seat-provided verdicts. For deterministic gating measurements, a distinct cold reviewer independently reproduces them after committing initial cold observations, retaining their own raw evidence and normalized result. Unreproduced gating evidence holds in this profile. Nondeterministic rows need a predeclared statistical policy and independent samples, or remain informational.
 
-Rejected alternative: a separate `agenttalk accept` command with its own GO/HOLD lifecycle. That would duplicate revision staleness, gate checks, counter resolution, publishing, and barrier behavior, allowing two competing final answers for the same work. A thin `accept` alias could be considered later for ergonomics, backed by the same close record.
+This catches inconsistent claims and unilateral fabrication only under the declared separate-access, non-collusion assumption. Agent names alone do not enforce that assumption; hostile runner/lead collusion is outside this profile. LD1 below chooses whether this cooperative profile may produce GO or authenticated verifier provenance is required before production GO. Until selected, real passes hold with `acceptance_trust_unresolved`; fixture tests may select an explicit profile. Cryptographic provenance, if required, binds issuer authorization, close instance, attempt, project, SHA and every policy/evidence digest, with expiry and replay rejection. Even then independent observation/reproduction is required to establish execution.
 
-## Project tool registry and offline use
+No acceptance failure can be erased with `gate waive`, a lead override, or a green gate label. A policy exception must preserve the original facts and be evaluated as scope reduction under LD2, never become a fabricated pass.
 
-A project declares stack profiles and selected tools in a versioned `.agenttalk/acceptance-tools.json` (proposed path). A plan selects specific registry entry IDs and marks each gating or informational before the revision is frozen. Selection is risk-based; no default tool list is silently required for every project. Typical **examples**, subject to project validation and pinned versions, are:
+## Versioned records
 
-| Stack | Independent free-tool examples | Possible signal |
+All records are strict UTF-8 JSON with integer `schema_version`; reject duplicate keys, unknown fields/enums, duplicate IDs, non-finite numbers and unresolved references. Required fields below are marked R; conditional fields C are required when the named condition holds. Arrays may be empty only where the plan permits that absence. Hashes are SHA-256 of exact retained bytes; Git blob IDs are stored separately. Readers enforce configured byte/count limits before loading.
+
+| Record | Required fields and types |
+| --- | --- |
+| Plan | R: `plan_id:string`, `project_id:string`, `scope:string`, `authors:string[]`, `partitions:object[]`, `rows:object[]`, `registry_digest:hash`, `trust_profile:string`, `cold_policy:object`, `retention:object`, `amendment_parent:hash/null`. Each partition has ID, row IDs, owner and allowed runner agents. |
+| Frozen route in close | R: `attempt_id:string`, `instance_id:string`, `project:object`, `revision:full SHA`, `verification:verified`, `plan_hash:hash`, `registry_hash:hash`, `bundle_ref:string`, `frozen_by:string`, `frozen_at:timestamp`. C: `parent_attempt_ref:string` after the first attempt. No cached verdict is authoritative. |
+| Project identity | R: stable project ID, root commit, object-format identifier, private local checkout locator, and verified commit/tree IDs. Optional sanitized canonical remote identity; never require credentials or a public remote. Unsupported object formats and unverifiable commits hold. |
+| Registry entry | R: `id:string`, `kind:toolchain/checker/service`, exact version, artifact digest, cache-relative location, provenance object, dependency/snapshot pins, command template, offline policy and failure policy. C: comparator/parser/config/normalizer pins for measurement tools. |
+| Bundle | R: close ID, instance ID, attempt ID, project ID, acceptance revision, plan/registry hashes, environment, `runs:object[]`, `rows:object[]`, evidence manifest, cold record, residual ledger, decisions. C: parent bundle digest and amendments for successor attempts. |
+| Environment | R: planned and observed runtime/compiler/package-manager/service banners, OS, locale/timezone, relevant environment/config digests, writable scratch/cache-overlay policy, time/resource limits. Row overrides are explicit and hashed. |
+| Run | R: `run_id`, runner, partition, execution SHA, cwd relative to checkout, `preconditions[]`, `steps[]`, worktree HEAD/status before and after, start/end times, environment reference, offline proof, outputs. Each ordered step stores planned/executed argv, status, nullable exit code, output refs and timestamps; deviations retain decision refs. |
+| Row definition | R: stable row/category IDs, partition, assertion/comparator, `policy:gating/informational`, expected result, expected scope, input declaration, required/optional artifacts, effort and rerun policy. C: baseline, approved movement rule and command constraints where relevant. A row belongs to exactly one partition. |
+| Row observation | R: row ID, run/step refs, `derived_from[]`, execution SHA, target acceptance SHA, measured scope, observed values, comparison result, disposition/reason, residual refs. Run refs, execution SHA and measurements are explicitly null for unexecuted deferred/NA rows. C: baseline comparison, movement, deviation and carry proof. Record-only hygiene rows bind a bundle content manifest digest instead of a source run. |
+| Cold record | R: assigned actor/team/vendor, session/context identity, delivery manifest, prior-knowledge/exposure declaration, initial observation digest and commitment event, later reveal/reconciliation events, blind spots, reproduction refs and decision refs. |
+| Residual | R: ID, originating row/finding, owner, impact, evidence, blocking boolean, disposition, follow-up, due/revisit condition. C: addressed handoff and receiving acknowledgment for another partition's finding; an unresolved blocking residual holds. |
+
+Plans and registries are immutable external-policy snapshots in the project-owned, gitignored `.agenttalk/acceptance/<attempt-id>/` bundle, not implicitly versioned files in an ignored directory. A project may import tracked templates, but frozen bytes and append-only amendments are authoritative. The amendment ledger sits outside the hashed plan payload and links old/new snapshot hashes; no payload contains its own digest. Open reserves a bundle reference; until attachment resolves it, record-missing holds. Close stores pointers and hashes, not raw logs. Long-lived artifacts bind instance/attempt, not the changing close generation; attachments use expected generation and instance for concurrency control.
+
+Required raw evidence is copied at capture time, before any later clean/build step, into a content-addressed retained evidence area outside scratch: `.agenttalk/acceptance/evidence/sha256/<DIGEST>`, or an explicitly configured private workspace store. Verify copied bytes and readability before cleanup; a digest of deleted bytes is insufficient. Resolve paths under approved roots, reject traversal/symlink escape, and never execute an arbitrary command supplied by a result artifact. Pin executable adapters in policy and run them with resource limits.
+
+Retention lasts through the declared audit window and any unresolved follow-up; missing evidence during that window makes revalidation HOLD. Restrict writes to retained bundles, keep per-attempt manifests, and produce a separately sanitized public summary only on explicit publication. Records and evidence are private workspace artifacts and pointers, never automatically published.
+
+## Vocabulary and evaluation
+
+Do not mix execution, policy and disposition in one verdict enum. The generated human template uses these same schema fields.
+
+| Axis | Values and meaning |
+| --- | --- |
+| Execution | `completed`, `not-run`, `error`, `timeout`; keep each raw exit code, including nonzero exits. For assurance imports preserve producer statuses such as `skipped-network-disabled`, `error-required-tool`, `timeout-required`, mapped explicitly to these execution facts. |
+| Comparison | `pass`, `fail`, `unmeasured`, `incomparable`, `new-category`, `scope-narrowed`. A nonzero exit may be expected for a findings tool; a plain build's exit assertion remains independent. |
+| Policy | `gating` or `informational` per assertion/category, not just per tool. Informational measurements do not themselves block but cannot conceal a blocking finding or missing required record. |
+| Disposition | `satisfied`, `open`, `deferred`, `not-applicable`, `moved`, `carried`; separate `deviation` object if executed steps differ. A disposition never overwrites raw execution/comparison. |
+| Freshness | `current` or `stale`; successor attempts start stale. `carried` requires the proof below, and retains the original execution SHA. |
+
+`expected` has `kind:literal/derived/exact-failure-set/first-measurement`, typed value (nullable only for first measurement), and `source` containing prior record/revision, derivation artifact, or the explicit absence of prior measurement. Exact failure sets compare stable test IDs, not counts: both a new and a vanished member flag. Derived totals cite their inputs and formula; changing test selection never silently changes an expected number.
+
+One run can feed several assertions; one assertion can depend on several ordered steps. Dependency failure or lost required evidence propagates to dependent assertions. Recovery steps preserve failed attempts and may satisfy a measurement assertion without satisfying the original plain-build assertion. An optional artifact must have been optional before execution. Deferred/not-applicable rows cite decisions without inventing exit codes or evidence; unavailable gating rows hold unless LD2 explicitly permits a successor scope reduction.
+
+Command deviations record planned versus actual argv/scope, reason, impact, approver distinct from the runner and decision reference. Approval alone cannot relax a frozen assertion. Plain-build constraints explicitly forbid undeclared profile, selection and skip flags. If safety requires a narrower planned command, disclose its excluded scope; do not describe it as a full unfiltered build. Flake policy fixes isolation, maximum attempts, stopping rule and acceptance rule before execution; retain every attempt, never retry until green.
+
+Baseline objects record `revision`, per-category values, measurement reference and `kind:measured-live/committed-file-only/inherited/absent`, source lineage and distance from the current revision. Calling a finding pre-existing requires the quoted baseline revision and exact category value from a comparable measurement. A first live measurement is unmeasured until reviewed; it cannot claim fresh findings are pre-existing. A failing first measurement remains open and needs disposition/fix. Comparing two committed files is not a fresh measurement.
+
+Pin parser, comparator, normalizer, config and baseline by project-relative path, baseline revision, Git blob ID and SHA-256. Load pinned blobs from that revision (for example via `git show`), never mutable working-tree files. Compare those pins to the acceptance tree: movement requires a record with old/new values and hashes, category delta, file/rule/commit trace, cause, impact, non-runner approver and decision. Changing a baseline file to match the result is not independent evidence.
+
+Comparability requires equal rule/tool versions, counting basis, target and expected scope, environment pins and stochastic effort (budget, seed, stop reason). Apply the named, pinned normalizer to both sides. Per-category count ratchets with traces support high-volume tools; fingerprint deltas remain available where appropriate. Totals cannot hide category regressions. Unknown categories, narrowed scope and threshold failures are distinct results. Compute changed-area versus measured-tool-scope from the project diff and declared module/build dependencies; excluded expected scope holds a gating row and generates an owned coverage residual.
+
+`moved` is satisfiable only under a movement rule frozen before observation and independent approval of its trace; the raw comparator failure remains visible. Otherwise an expected-value/threshold change is a policy amendment, not a green result. Byte-level comparisons require a repeated-build reproducibility control before interpreting a delta; if unstable, use a predeclared semantic normalizer or report incomparable. Sampling variance is evidence for a proposed policy change, not permission to reclassify after seeing results.
+
+The [assurance scanner](../src/agenttalk/assurance.py) already has a manifest, tool statuses and reviewed baseline deltas. Import its artifacts rather than replacing it; pin its manifest/baseline and retain warnings about changes in the scanned range. Acceptance adds offline provenance, per-category count comparisons, scope/effort and independent reproduction. It does not turn scanner results into proof of correctness.
+
+## Offline execution and close-out
+
+The operator stages approved tools, toolchains, services, dependencies and advisory snapshots before dispatch. Record source coordinates, exact versions, retrieval time, digests, trusted checksum/signature source and declared freshness. A checksum from the same untrusted download page is provenance, not independent verification. Selection is risk-based; no universal tool catalogue or silently substituted tool is required.
+
+Agenttalk cannot itself disable a seat's network. Each registry entry declares either externally enforced egress denial with explicitly owned loopback services allowed, or a tested offline-proof recipe. Record positive-control/cache-hit markers and real-fetch markers at sufficient verbosity, not merely an absence of downloads. A missing package, hash mismatch, expired snapshot, attempted fetch or absent proof records not-run/fail under the fixed policy; it never triggers acquisition during the pass.
+
+Preconditions include observed version banners, isolated scratch and writable cache overlays, fresh service data directories and socket ownership by the started PID. Record start/stop by PID and verify teardown/port release. The runner checkout must have matching HEAD and empty `git status --porcelain` before and after each row; outputs go outside it. Multi-row runs capture these checks at row boundaries and copy evidence before destructive steps.
+
+Required close-out assertions check retained evidence readability, scratch removal (or approved retention), owned services stopped, ports released and a confidentiality sweep over the final record set with a positive control. Record-hygiene checks target a sealed content manifest excluding the hygiene result itself, avoiding a self-hash cycle. Missing hygiene evidence holds; raw private evidence never becomes public simply because the close is published.
+
+## Attempts, amendments and independence
+
+Choose one close ID per attempt, with `parent_attempt_ref` and immutable bundle snapshots. Never use `open --force` to roll attempts. Preserve the complete prior HOLD/final snapshot, blockers, residuals, acks and evidence before creating a successor. Existing `reopen` remains available for ordinary closes; acceptance-enabled reopen must archive first and create a linked successor through the same helper, refusing if preservation fails. The prior close remains terminal.
+
+| Trigger | Required transition |
+| --- | --- |
+| New source SHA | Verify project commit/cleanliness, create successor attempt, mark all rows stale, require fresh partition/cold acks. Increment 1 reruns every gating row. |
+| Same-SHA plan/registry change | Preserve old attempt and append amendment `{prev_hash,new_hash,at,actor,reason,cause,decision_ref,observed_before}`. New attempt and fresh acks even at identical code SHA. |
+| Expected value, classification or baseline policy changed after a failure | Cannot clear that failure at the same SHA under the default rule; new code revision and reviewed amendment are required. LD2 determines whether explicit scope reduction is an exception. |
+| Add a precondition or residual | Append an amendment and regenerate plan/registry hashes as applicable; preserve before/after bytes and evidence, never silently edit the freeze. |
+| Carry request (increment 3+) | Evaluator computes proof; reviewer approves impact analysis. Record original run/SHA, target SHA, checked inputs/hashes and decision; never restamp execution. |
+| Unblinded reviewer follows a fix | Record remediation review/delta coverage, not a second first-exposure sweep. LD3 sets when a fresh reviewer is required. |
+
+Carry requires identical resolved input trees/blobs at both SHAs, including the system under test, transitive/shared build files, module outputs, configs, toolchain/environment, comparator and baseline pins, and unchanged registry hash. Unknown dependencies force rerun. Whole-tree build/test rows rerun on every new SHA; failed/fixed assertions, moved comparator/baseline consumers and all rows after a registry-hash change rerun. The scope declaration covers application inputs, not merely an unchanged harness.
+
+Allocate one required lens per run partition, e.g. `acceptance-run-bar` and `acceptance-run-tools`, plus `acceptance-cold`. Explicit `--allow LENS:AGENT` assignments must resolve to cold candidates disjoint from all runner allow-lists and declared change authors. Acceptance requires attempt-bound evidence from every partition; ordinary `na` or `--override` cannot bypass it. Distinct actor identity is required; vendor/team diversity and fresh cold review are governed by LD3.
+
+Cold delivery contains only verified SHA/project, scope and reviewed safety constraints. Store withheld plan, counts, baselines and results outside the reviewer's readable workspace. Retain a manifest of delivered/accessibly exposed resources and digests, session identity, expectation-leakage review and prior knowledge, including memory/lessons and earlier bus exposure. Scan the entire delivered brief, including guardrails, against expected tokens/counts/verdicts from the frozen plan; a match requires review before delivery, not automatic removal of safety instructions. Permit requests for additional staged tools before reveal; operator supplies verified packages offline without sending expected outcomes. Record cache/tool-selection bias and any safety text that necessarily reveals expectations.
+
+The reviewer commits the initial report digest in an ordered event before unblinding; later report bytes must match. Retain access/transcript evidence where available, then record reveal and reconciliation. Ordering and access separation are auditable procedural controls, not proof of absence of prior knowledge. A contaminated reviewer can provide a useful review but cannot claim a fresh blind sweep. Gaps become explicit residuals or holds under the selected policy.
+
+## Check and publish contract
+
+The I/O resolver reads the frozen plan/registry, bundle, required raw artifacts and pinned comparator inputs; verifies size, digest, project/instance/attempt/SHA binding and actor assignments; computes comparisons, scope/carry proofs and cold commitments. The pure acceptance dimension folds that validated bundle into stable holds. Unsupported comparator/disposition types hold until implemented. Runner-written `pass` strings and lens acknowledgments cannot substitute for this evaluation.
+
+Increment 1 supports built-in exit-code, exact-value and exact-failure-set assertions over retained structured execution evidence and reproduced outputs. It reads content as well as hashes; custom parsers/count ratchets wait until increment 3. Supported complete passes can produce GO under a selected trust profile; all other passes remain HOLD. This is a bounded claim, not general acceptance of arbitrary JSON.
+
+| Proposed stable hold code | Trigger |
+| --- | --- |
+| `acceptance_policy_invalid` | Invalid schema, unsupported capability/profile, missing live required route, or inconsistent policy. |
+| `acceptance_trust_unresolved` | No approved trust profile or required verifier/witness provenance missing. |
+| `acceptance_project_unverified` | Wrong project, unresolved commit, wrong runner HEAD, dirty checkout or missing verification. |
+| `acceptance_plan_stale` | Frozen plan/registry hash differs from retained bytes or attempted in-place amendment. |
+| `acceptance_record_missing` | No valid attached bundle or a required artifact is absent/unreadable/digest-mismatched. |
+| `acceptance_row_unbound` | Wrong instance/attempt/revision, stale row, or invalid carry/dependency proof. |
+| `acceptance_row_failed` | Gating assertion fails, is incomparable, or has an undispositioned deviation/precondition failure. |
+| `acceptance_row_not_run` | Gating execution/measurement missing, deferred or unsupported; no valid scope-reduction decision. |
+| `acceptance_scope_narrowed` | A gating row's measured scope misses declared expected scope. |
+| `acceptance_category_moved_unreviewed` | Unknown category or movement lacks the required independent disposition. |
+| `acceptance_baseline_unpinned` | Comparator/baseline/normalizer provenance or pin verification is missing. |
+| `acceptance_lens_not_independent` | Missing partition acknowledgment, overlapping cold/run/author assignments or policy independence failure. |
+| `acceptance_cold_missing` | Missing initial commitment, reveal/reconciliation or required reproduction; ordering/digest mismatch. |
+| `acceptance_residual_open` | Blocking residual, unrouted cross-partition finding or required decision expired. |
+| `acceptance_hygiene_incomplete` | Offline/isolation/retention/cleanup/confidentiality evidence missing or failed. |
+
+Existing lens, counter, remediation, gate, lane and DoD holds still apply. Accepted blocker counters retain the existing named-remediation-gate requirement; clearing that gate cannot clear an acceptance row or residual. HOLD publication records owners and next actions. GO publication must enumerate informational, deferred, moved, carried and accepted-residual rows, not hide them behind a single green total. A release barrier remains a separate deliberate action.
+
+## Synthetic worked fixture
+
+The following JSON is a row-field excerpt, not a complete runnable bundle. `<SHA>`, `<HASH>` and `<DECISION>` are placeholders. One completed run emits nonzero exit 2 and named findings; assertions classify the build and measurement separately.
+
+```json
+{"run_id":"run-1","execution_sha":"<SHA>","step_exit":2,
+ "rows":[
+  {"id":"bar.build","policy":"gating","expected":{"kind":"literal","value":0},"observed":2,"comparison":"fail","disposition":"open"},
+  {"id":"tool.known","policy":"gating","expected":{"kind":"exact-failure-set","value":["case-a","case-b"]},"observed":["case-a","case-b"],"comparison":"pass","disposition":"satisfied"},
+  {"id":"tool.new","policy":"informational","observed":{"category-c":1},"comparison":"new-category","disposition":"open"},
+  {"id":"tool.optional","policy":"informational","run_id":null,"comparison":"unmeasured","disposition":"deferred","decision_ref":"<DECISION>"}
+ ],"required_output":{"ref":"<RETAINED-ARTIFACT>","sha256":"<HASH>"}}
+```
+
+Attempt `sample-a1` remains HOLD for `bar.build`; the new category needs a finding disposition. Removing the required output adds `acceptance_record_missing` even with all lens accepts. Fixing the build creates `sample-a2` with parent `sample-a1`; old executions remain stale until rerun or mechanically carried. A separate recovery invocation cannot erase the original failure. The schema also represents ordered recovery, exact known-failure sets, deferred tools, deviations, baseline movements, first measurements and record-only hygiene without collapsing them into `pass`.
+
+## Buildable increments and acceptance tests
+
+Tests below are implementation acceptance criteria, not tests claimed to exist or to have run for this design. Each increment includes fixtures and generated human templates from the schema. No template-only increment may advertise acceptance GO.
+
+1. **Evidence-reading DoD dimension and attempts.** Implement strict schema, project verification, route/attachment transaction, retained artifacts, built-in assertions, partition identities, basic cold commitment/reproduction, immutable successors, direct holds and check/publish parity. Choose LD1 before enabling real GO. Tests: `test_acceptance_acks_without_bundle_hold`; `test_acceptance_tampered_raw_result_holds_with_accept_acks`; `test_acceptance_complete_supported_fixture_go`; `test_acceptance_publish_rechecks_changed_bytes`; `test_acceptance_foreign_unverifiable_sha_holds`; `test_acceptance_same_sha_policy_change_stales_acks`; `test_acceptance_successor_preserves_hold`; `test_acceptance_two_partitions_keep_both_acks`; `test_acceptance_gate_label_and_waiver_cannot_clear`; `test_acceptance_deleted_live_policy_cannot_bypass_route`; `test_acceptance_replaced_instance_rejects_bundle`; `test_acceptance_unsupported_comparator_holds`.
+2. **Registry and offline preflight.** Validate staged checker/toolchain/service pins, transitive packages, snapshots, provenance, templates, offline-proof recipes and bounded verifier inputs; do not download or launch tools in preflight. Tests: `test_preflight_changed_byte_or_missing_dependency_fails`; `test_preflight_expired_snapshot_holds`; `test_preflight_offline_positive_control_required`; `test_preflight_loopback_allowed_egress_denied`; `test_preflight_toolchain_drift_holds`; `test_preflight_path_escape_rejected`.
+3. **Harness, comparison and carry.** Add controlled ordered execution, pinned adapters/normalizers, count/category baselines, shared-run dependencies, movement/flake/effort rules, impact proofs, amended plans and routed residuals. Tests: `test_new_category_holds_despite_lower_total`; `test_exact_failure_set_rejects_same_count_different_ids`; `test_pinned_baseline_ignores_edited_worktree`; `test_baseline_movement_requires_independent_decision`; `test_first_measurement_cannot_claim_preexisting`; `test_narrow_scope_holds_against_expected_scope`; `test_recovery_preserves_original_failure`; `test_clean_step_cannot_destroy_retained_output`; `test_flake_attempts_and_budget_preserved`; `test_carry_checks_application_and_transitive_inputs`; `test_registry_change_forces_rerun`; `test_byte_comparison_requires_reproducibility_control`.
+4. **Controlled cold delivery and final audit.** Automate separated delivery, tool requests, commit/reveal, access/exposure records, policy-selected diversity/freshness, hygiene and sanitized reporting; basic cold evidence was already required in increment 1. Tests: `test_reveal_before_commit_holds`; `test_cold_report_digest_mismatch_holds`; `test_exposed_reviewer_cannot_claim_fresh_sweep`; `test_extra_tool_request_preserves_blind`; `test_scope_reduction_preserves_failed_attempt`; `test_cleanup_keeps_required_evidence`; `test_confidentiality_positive_control_and_no_auto_publish`.
+
+The increment-1 integration fixture opens an isolated project close with explicit `--lens acceptance-run-bar`, `--lens acceptance-cold`, distinct `--allow` assignments and full verified SHA. For milestone scope it supplies a lane artifact or explicitly uses the existing non-lane declaration; row cleanliness remains separately enforced. It attaches a failing supported bundle, records typed accepts (`risk_class`, `release_blocker`, tests referenced/executed, residual risk and evidence), drafts a conclusion and asserts `close check` exits 3 **because the artifact-derived row fails**, then publishes HOLD with its full retained snapshot. A successor complete fixture must check GO/exit 0 and publish GO without a barrier. Counter fixtures exercise decision/remediation and ensure ordinary holds remain additive. The proposed open/attach operations require increment-1 code; no existing-command recipe can enforce this today.
+
+## Design-round disposition
+
+Reader keys: A = Sonnet, B = Astra, C = Opus. B/S/C/Q refer to each reader's blocking/should/could/question numbering; C's integration answer is I1. Duplicate findings are merged below; subtopics with different dispositions remain separate. Totals: **30 ACCEPTED, 2 REJECTED, 3 LEAD DECISION**.
+
+| ID | Finding and readers | Disposition and location/reason/options |
 | --- | --- | --- |
-| Java | SpotBugs with FindSecBugs, PMD, Checkstyle, `jdeps`, PIT | Bytecode defects, source rules, JDK dependency use, mutation resistance |
-| JS/TS | ESLint, TypeScript compiler, Knip, Playwright | Static errors, unused exports/dependencies, browser behavior |
-| Python | Ruff, mypy, Bandit, pip-audit, Hypothesis | Lint/type/security findings, dependency advisories, property-based behavior |
-| HTTP API, if present | Schemathesis | Live contract and schema conformance |
-
-The project chooses tools that add a signal independent of its own tests. A tool already used in CI can still run in the final pass if it is run fresh on the frozen SHA and its scope is stated; merely citing an old CI badge is insufficient. Proprietary or unavailable tools are optional, never silently substituted.
-
-The lead or operator acquires distributions, plugins, language packages, and advisory data into a project-local cache before dispatch. They record source URL or package coordinates, version, license if relevant, retrieval time, SHA-256, and the checksum's trusted source. A checksum copied only from the same untrusted download page is provenance, not independent verification; where possible verify a vendor signature or independently published digest. Registry commands reference cache-relative paths and enforce offline package-manager flags or network denial. Seats receive read-only access to the staged cache and run with network access disabled; **no seat downloads during acceptance**. A missing artifact, checksum mismatch, stale advisory snapshot under a declared freshness rule, or attempted network fetch produces `not-run` or `fail` evidence according to the predeclared policy, never an unrecorded skip.
-
-## Flow
-
-1. **Lead defines the pass.** Choose the milestone scope, acceptance bar, tool entries, baseline revision and rule per row, gating/informational classification, independent reviewer, and residual owners. Write the versioned acceptance plan and tool registry; open a close on the intended SHA with `acceptance-run` and `acceptance-cold` as required lenses. Records: plan, registry, close record with plan/registry hashes.
-2. **Operator stages tools.** Download approved packages and any data snapshots into the local cache, verify digests/signatures, and hand the seats a cache manifest. Records: acquisition manifest with provenance, hashes, versions, and cache-relative locations.
-3. **Integrator seat runs the bar.** Use a clean checkout at the frozen SHA and isolated scratch/services. Execute each behavioral item and selected tool offline, capture the exact command and raw evidence, compare each category against its named baseline, and check actual coverage/scope. Records: signed or automation-attested run artifact, row results, evidence manifest and digests, proposed residuals. A failed plain build remains a failed bar row even if a specialized test profile passes.
-4. **Cold reviewer seat sweeps independently.** Receive only SHA, scope, and safety guardrails; choose checks without the plan or first results, record commands, observations, and potential blind spots, then unblind for reconciliation. Records: time-stamped cold-sweep report and typed `acceptance-cold` lens acknowledgment or counter. The reviewer does not edit the integrator's results.
-5. **Lead reconciles and closes.** Compare both accounts, route defects to owners, require a new revision and fresh pass for fixes, and bind accepted residuals to follow-up records. Record the integrator's `acceptance-run` acknowledgment, resolve counters and blocker gates, run `close check`, draft the conclusion, and publish HOLD or GO. Records: final acceptance record, residual ledger, close draft, and published close snapshot. A GO barrier is a separate deliberate release action.
-
-## Failure and baseline rules
-
-- A gating bar row fails on an unmet outcome, missing or stale evidence, wrong SHA, narrowed scope, or an unrun required command. A gating tool fails if its declared comparator fails, the tool cannot execute, or a new finding category appears without disposition. An informational row records the same facts but does not itself block GO; its classification cannot change after the plan is frozen without reopening.
-- Baselines compare like with like: same tool and rule versions, category definition, target scope, and counting method. Report current and baseline numbers per category. A red cell is called **pre-existing** only when the baseline revision and its exact number are quoted and the current observation is comparable. An overall total cannot hide a new category or a category regression. A category increase needs a named cause and either remediation or an explicit, reviewed baseline movement; explanation alone does not make a failing comparator green.
-- A first live run has no measured baseline. It establishes one after review; it cannot retroactively claim that fresh failures were pre-existing. A comparison that checks two committed baseline files against each other does not substitute for comparing fresh output against the baseline. A passing tool whose configured target excludes the changed area proves only the configured scope; record the coverage gap as a residual.
-- `close check` holds on any gating failure, missing cold sweep, unexplained category movement, unresolved reviewer counter, open blocker remediation, or blocker gate that is red/unknown. The lead may publish HOLD with owners and next actions. GO requires every gating item satisfied on the frozen SHA, the cold sweep reconciled, and any allowed nonblocking residual documented with owner, impact, and follow-up. Operator waivers remain explicit and auditable under existing gate policy.
-- A fix creates a new SHA. Reopen the close, invalidate prior acceptance rows and lens acknowledgments, and rerun affected checks plus any check whose comparability may have changed. Retain the earlier HOLD record and evidence for the audit trail.
-
-## Shippable increments
-
-1. **Manual template and close binding.** Add a documented acceptance plan and human-readable record template using existing close lenses and gates. Demo: one frozen SHA, two lens acknowledgments, and a published HOLD with evidence pointers.
-2. **Registry validation and offline preflight.** Validate schema, tool pins, digests, cache presence, and command placeholders without executing tools. Demo: a valid staged tool passes preflight; a changed byte or missing package fails.
-3. **Run artifact and comparison evaluator.** Capture exact commands, outputs and scope; compare category baselines and emit a machine-readable acceptance record with a trusted automation adapter for the blocker gate. Demo: a new category or narrower scope yields HOLD even when the overall count improves.
-4. **Cold-sweep and close integration.** Enforce withheld brief delivery, independent reviewer evidence, unblinding/reconciliation, and revision staleness in `close check`. Demo: GO on a complete frozen pass, then HOLD after reopening at a new SHA.
-
-## Questions for the design review
-
-Codex Astra and a Sonnet reviewer should challenge these choices:
-
-1. What is the smallest trustworthy automation boundary that can attest offline seat runs as `automation_ci` gate evidence without letting a seat self-certify a blocker as green?
-2. Should the acceptance plan and registry hashes live in the close record, an acceptance sidecar, or both, given the close's generation and instance checks?
-3. How much of a pass must rerun after a revision change to preserve independence without making a large tool matrix impractical?
-4. What evidence can prove the cold reviewer received no expectations before submitting its first observations, beyond a recorded delivery and unblinding sequence?
-5. Should a project be allowed to mark an unavailable tool informational after it was initially gating, and if so which operator decision and reopened record make that change visible?
+| D01 | Extend close through DoD, with pure evaluation and frozen route (A B2/Q2; B direction/Q2; C I1/Q2). | ACCEPTED — Verified substrate and integration; Versioned records; Check and publish contract. |
+| D02 | Label-trust, advisory identity, evidence-pointer limits and waiver bypass (A B1; B S1; C S9/S10). | ACCEPTED — Verified substrate and integration; Trust and evidence ownership remove the waiver fallback. |
+| LD1 | Trust boundary and timing of production GO (A Q1/B3; B Q1/S1; C Q1/S9). | LEAD DECISION<br>Option A: allow evidence recomputation plus separate-access two-party reproduction under an explicit cooperative trust profile (recommended).<br>Option B: require authenticated, authorized verifier provenance and independent observed execution before any production GO. |
+| D03 | Honest first increment, reading evidence rather than acks (A B3; B B1; C increment critique). | ACCEPTED — Check and publish contract; increment 1 includes bounded comparisons and an artifact-driven HOLD/GO fixture. |
+| D04 | Keep increment 1 template-only, relying on manually red ordinary gates (B B1/closing recipe; C S9). | REJECTED — Cannot provide the requested evidence-derived GO/HOLD. The buildable fixture requires the new dimension, with no acceptance gate/scoping recipe. |
+| D05 | Acceptance as a CI-labelled gate inside DoD (C I1). | REJECTED — DoD is the right seam, but gate-label-only evaluation still fails to read evidence and authenticate execution; use direct holds. |
+| D06 | Separate execution/policy/comparison/disposition; category IDs and deferred/NA absence (A B3/vocabulary/C1; B B2; C C1/schema). | ACCEPTED — Versioned records and Vocabulary and evaluation define orthogonal fields and honest absence. |
+| D07 | Multi-step/shared runs, dependencies, recovery and lost/optional evidence (A vocabulary; B B2; C S2). | ACCEPTED — Run/row schemas; Vocabulary and evaluation; Synthetic worked fixture. |
+| D08 | Planned/executed deviations and plain-command constraints (A vocabulary/C2; B B2; C S3). | ACCEPTED — Vocabulary and evaluation preserves failure and requires independent deviation decisions. |
+| D09 | Structured expectations, exact failure sets, derived values and expected scope (A C1/S4/vocabulary; B B2/S3; C S7). | ACCEPTED — Expected-result and comparability rules; named exact-set/scope tests. |
+| D10 | Baseline source, first measurements, committed-only provenance and distance (A C4/vocabulary; B B2/S3; C retained strengths). | ACCEPTED — Baseline objects and first-measurement rules. |
+| D11 | Pin comparator/baseline/config at prior revision and detect self-waiver (A S1/B2; B S3; C S5). | ACCEPTED — Pinned blob loading and assurance import rules. |
+| D12 | Per-category movements need traces and non-runner approval (A vocabulary; B S3; C S6). | ACCEPTED — Movement records and predeclared movement-rule limits retain raw failures. |
+| D13 | Normalization, count basis, stochastic scope/budget/seed and variance (A vocabulary; B S3; C C3/S4). | ACCEPTED — Comparability and movement rules apply one pinned normalizer to both sides. |
+| D14 | Carry-forward is mechanical, preserves old SHA and covers application dependencies (A S6/Q3; B B3/Q3; C B3/Q3). | ACCEPTED — Attempts, amendments and independence; full gating rerun initially, checked carry in increment 3. |
+| D15 | Immutable history, same-SHA attempts, no forced replacement (A S2/Q2; B B3/Q2; C S11/Q2). | ACCEPTED — Linked close IDs, preserved snapshots and instance/attempt binding. |
+| D16 | Append-only plan amendments and observed-before rule (A S4/Q2; B B3/Q5; C S4). | ACCEPTED — Amendment transition table and explicit external-policy snapshot scheme. |
+| LD2 | Unavailable gating tool or measured variance justifies scope reduction (A Q5/S4; B Q5; C Q5). | LEAD DECISION<br>Option A: keep gating classification immutable and HOLD until satisfied (recommended).<br>Option B: allow an authenticated operator-approved successor scope reduction with reason, alternatives, impact, owner, expiry and original failure preserved; report reduced scope, never a tool pass. |
+| D17 | Project SHA/cleanliness must be verified in the actual checkout (A S8; C B1). | ACCEPTED — Project identity, verified substrate and increment-1 foreign-repo test. |
+| D18 | Release-scope lane declaration and executable binding limits (A S8; B B1; C schema mapping). | ACCEPTED — Verified CLI constraints and increment-1 integration fixture. |
+| D19 | One lens per runner partition, cold allow-list disjoint from runners/authors (A S3; B C1/Q3; C S1). | ACCEPTED — Attempts, amendments and independence; hyphenated lens IDs fit current CLI parsing. |
+| D20 | Evidence retention outside scratch, copy before clean, restricted raw/public summary (A S5/C5; B S2; C B4). | ACCEPTED — Versioned records and Offline execution and close-out. |
+| D21 | Preconditions, environment, services, PID ownership, limits and hygiene (A S5; B S2; C C5). | ACCEPTED — Run/environment fields and per-row pre/post/teardown assertions. |
+| D22 | Offline proof rather than unenforceable network claim; loopback exception (A S5; B S2; C S12). | ACCEPTED — Offline policy, positive controls and explicit external enforcement boundary. |
+| D23 | Registry covers toolchains and services, not only checkers (A S7; C C5). | ACCEPTED — Registry kinds, environment pins and preflight drift test. |
+| D24 | Reuse assurance manifest/statuses/baseline warnings and separate bar/cold sweep (A B2). | ACCEPTED — Purpose, Vocabulary and evaluation and assurance import paragraph. |
+| D25 | Mechanical changed-area versus measured/expected tool scope (A C3; B S3; C S7/Q3). | ACCEPTED — Comparability and carry rules use project diff plus module/build dependencies. |
+| D26 | Cleanup/confidentiality positive controls as record-targeted assertions (A C5; C C2). | ACCEPTED — Offline execution and close-out defines sealed manifest target and no automatic publication. |
+| D27 | Cross-runner residual needs addressed handoff (A C6). | ACCEPTED — Residual schema and acceptance_residual_open hold. |
+| D28 | Flake retries must be planned and every attempt retained (C S8). | ACCEPTED — Vocabulary and evaluation; increment-3 flake test. |
+| D29 | Repeated-build control for nondeterministic byte manifests (C C4). | ACCEPTED — Comparability/reproducibility rule and increment-3 test. |
+| D30 | Cold delivery, leakage, tool requests, commitment/reveal and procedural limits (A Q4; B Q4; C S13/Q4). | ACCEPTED — Attempts, amendments and independence; separate initial observations from reproduction. |
+| LD3 | Required diversity and cold-review freshness after changes (A Q3/Q4; B Q3/Q4; C S13/Q3). | LEAD DECISION<br>Option A: require disjoint actors, prefer vendor/team diversity and allow disclosed delta review after unblinding (recommended).<br>Option B: require vendor/team diversity and a fresh unexposed reviewer for every changed-SHA attempt; unavailability holds. |
+| D31 | Proposal status, origin, schemas, hold codes and worked example instead of catalogue (A C7/closing additions; B C1/closing additions; C closing additions). | ACCEPTED — Header, field/transition/hold tables, synthetic fixture and named tests; examples disclose placeholder-only provenance. |
+| D32 | Hashes authoritative in close, sidecar bodies, generation versus identity, publish recheck (A Q2; B Q2; C Q2). | ACCEPTED — Verified substrate, Versioned records and Check and publish contract. |
