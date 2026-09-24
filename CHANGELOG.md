@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Acceptance increment 1c adds schema-3 final cold commitments and reconciliation,
+  retained delivery evidence, distinct reviewer/access and vendor checks, and
+  attempt-bound reproducer/reviewer accepts. Complete supported cooperative
+  evidence can now GO. Parent audit views list all successor alternatives;
+  unapproved coverage loss requires recovery through a new root close.
+
 - Acceptance coverage follows protected measurement targets across all retained
   ancestors, regardless of row names, splits, merges or informational hops.
   Weakened or removed coverage requires exact operator approval for each attempt;

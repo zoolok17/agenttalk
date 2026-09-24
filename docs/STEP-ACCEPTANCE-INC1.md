@@ -545,6 +545,150 @@ Scratch is retained in the private task directory for delta review: red/green
 stores, `round3-mutants-6dc66cb3` source copies/logs and verification helpers.
 No reviewer workspace or unrelated untracked files were changed.
 
-## 1c — awaiting lead acknowledgment and cold verdict
+## 1c — final cold review and supported cooperative GO
 
-Not started. Record final independence, publish parity and the complete integration fixture here after 1b is accepted.
+Base: `93184c6`, accepted for 1c by the lead. This section supersedes earlier
+HOLD-only staging statements for **schema 3**; schemas 1 and 2 still cannot GO.
+The accepted design copy remains byte-identical. The user workflow and complete
+field reference are in [ACCEPTANCE.md](ACCEPTANCE.md).
+
+### Decisions and bounded implementation
+
+Plans, routes and bundles use version 3 for the final-review workflow. The plan
+adds `cold_policy` (reviewer, available-vendor roster snapshot, absence disclosure).
+The route adds immutable `cold_commit_hash` and `cold_reconcile_hash`. The ordinary
+close record remains schema 2, so old ordinary-close engines reject it. Earlier
+acceptance engines reject route version 3; no migration can silently grant GO.
+
+The reviewer alone can submit `close acceptance cold --phase commit` before
+attachment, then `--phase reconcile` after attachment. Initial reports bind
+instance/attempt/revision/project/policy hashes, reviewer/context, authorship and
+exposure declarations, leakage review, separate-access evidence, delivered-resource
+hashes, observations and blind spots. Reports and delivered bytes are copied into
+retention and rehashed on evaluation. Delivery permits source, safety, toolchain
+and access evidence; the plan, expected values and author claims remain withheld.
+The delivery projection and actual access are cooperative attestations, not
+cryptographic proof that a particular person read a complete checkout. This
+increment does not implement automatic expectation-token scanning or whole-repo
+packaging; the reviewer explicitly attests leakage review and discloses limitations.
+
+Reconciliation binds both immutable report and bundle hashes, records reveal,
+and dispositions every initial observation. Commit, attach and reconcile events
+must occur once in that order with matching actor/hash attribution. A blocking
+observation left open contributes `acceptance_residual_open`. The final reviewer
+must differ from every declared author, allowed runner, verifier and reproducer,
+with a different declared access identity. A known unblinded ancestor reviewer
+cannot be made fresh by changing its context string; delta work is permitted but
+does not satisfy the final sweep. A fresh actor is needed on the final successor.
+
+The frozen available-vendor roster must include all participants. When another
+vendor is available, reproducer vendor differs from its original runner and the
+cold reviewer's vendor differs from all authors/actual runners. This is conservative
+for mixed-vendor author teams, which may require another vendor. With one vendor,
+absence disclosure is required and retained; actor/access separation still applies.
+Availability is declared by the assignment, not inferred from runtime package names.
+
+M4 is closed by required `acceptance-repro-<reproduction-id>` lenses installed
+transactionally during attachment. Every declared reproducer attests its own
+evidence. `acceptance-cold` is frozen from the plan. All schema-3 accepts bind both
+cold hashes as well as attempt, revision, policy and bundle; pre-reconciliation
+accepts are stale. Another actor, `na` or `--override` cannot substitute.
+
+M5 uses the permitted **audit-view** option: `close show` adds
+`acceptance_successors`, listing every fully linked child (open or published),
+its status and verdict. The parent is never rewritten. A pending failed creation
+has no frozen parent link and cannot GO; sibling enumeration is not an exclusive
+reservation and does not prohibit alternatives. Unreadable linked records fail
+the audit rather than silently hiding an alternative.
+
+M7/N4 are **DECIDED by the lead**: retain exact per-attempt re-approval. An
+unapproved coverage loss permanently holds all descendants, even after restoration.
+**Recovery is a new root close**, with complete evidence and an eligible fresh
+reviewer. Prior attempts remain in the store; no restoring-successor exception
+was added. The user guide and README state this rule.
+
+F9 disposition: retain the existing per-close publication critical section.
+GO performs one live acceptance resolution and persists exactly that snapshot;
+it does not reuse a prior check or run a second resolver. Moving Git/evidence
+reads outside that lock would enlarge the stale-record window. Git subprocesses
+retain their existing individual 10-second timeout; a slow checkout can still
+hold the lock longer than another writer's default lock timeout. That unmeasured
+latency optimization is deferred to the acquisition/performance work, not presented
+as fixed. The existing cross-file evidence-writer race documented in CLI issue
+comments also remains: the close lock is not a filesystem-wide evidence mutex.
+Cooperative immutable retention and immediate revalidation are the bounded claim.
+
+### Reader inventory
+
+| Changed item | Every existing reader/producer class and its assumption |
+| --- | --- |
+| Plan schema 3 / `cold_policy` | `validate_plan`, `prepare`, `_policy`, `partition_lenses`, `freeze`; history successor/evaluation and coverage history read the validated policy. CLI open/signoff lens derivation must agree with frozen allowed actors. The new cold validator requires exact keys and bounded lists. |
+| Route schema 3 / cold hashes | `_route`, `_policy`, `_bundle`, attach, resolve, history successor/evaluation, coverage ancestry, `ack_binding`; close `_is_wellformed` still requires close schema 2 for any acceptance route. CLI open/attach/check/publish/reopen/show carry it. Force/reopen remain refused; successors reset both phases and remove inherited dynamic reviewer/reproducer lenses. |
+| Bundle version 3 / dynamic reproducer lenses | `_bundle`, attach, `_reproduce`, history retained-bundle checks. Bundle fields otherwise match version 2. `apply_ack`, `_ack_authorized`, `_evaluate_signoffs`, `_signoff_signers`, `compute_verdict` see ordinary required lenses. Signoff-derived sets do not own these lenses. |
+| Extended `lens_acks[*].acceptance_binding` | `close.apply_ack` writes version 2 or 3 bindings; acceptance partition and cold/reproduction validators compare exactly. Ordinary ack/signoff/verdict/show readers ignore extra binding keys. Earlier schemas keep their old binding keys. |
+| Cold retained report schemas and events | New `submit/validate_initial/validate_reconciliation/evaluate` produce/read reports; `_retain/_retained` enforce bytes. Existing `_event`, close transactions and show serialize events; ordinary verdict logic does not infer evidence from event labels. |
+| `cold_checked`, `cold`, direct holds in resolved snapshot | `acceptance.evaluate` alone lifts the staged cold hold when verified; `close.evaluate_dod/compute_verdict` remain additive. `_build_dod_eval` has check/publish callers only. `record_publish` stores this same snapshot; show/list and history can read it. Attention `_published_close_holds` and barrier consumers still read outer final verdict/revision fields. |
+| `acceptance_successors` in show output | CLI show adds a read-only projection via history `successors`; `load_close/list_close_ids` plus retained parent identity enumerate children. It is not persisted and is not a verdict input. Ordinary show output is unchanged. |
+| Unknown comparator rejection | Coverage `predicate`, called by `group/history/changes`; both creation and evaluation fail closed. Future comparator additions must provide semantics and update tests. Future registry command/provenance references must also enter target identity; not implemented by this built-in-only slice. |
+| Other engines / documentation | Older route validators reject version 3; schemas 1/2 retain cold HOLD. CLI help, README command table and the new guide describe cold phases. No accepted design bytes or ordinary gate/DoD policy fields changed. |
+
+### Requirement-to-test mapping
+
+Names below omit the `test_acceptance_` prefix.
+
+| Requirement / review finding | Test |
+| --- | --- |
+| N1 reduction cannot approve replacement; added FIRST | `reduction_cannot_authorize_replacement_coverage[unavailable-tool/measured-variance]` |
+| N3 explicit comparator support | `coverage_comparators_are_explicit` |
+| N2 pruning and unrelated outcome annotation | `strongest_pruning_has_canonical_approval_shape`; `amendment_keeps_unrelated_outcome_passed` |
+| Final cold authorship/claims/prior exposure | `final_cold_rejects_author_or_claims_exposure`; `final_cold_actor_must_be_disjoint` |
+| Required vendor diversity / absence disclosure | `available_second_vendor_required_otherwise_absence_disclosed` |
+| M4 reproducer self-attestation; fresh bindings | `final_attestations_are_required_and_bound` |
+| Cold event order, digest, actor and binding integrity | `cold_commitment_tampering_holds`; `cold_phases_reject_wrong_actor_and_late_commit` |
+| Separate access, withheld plan and retained delivery | `cold_delivery_access_and_retention` |
+| Delta reviewer cannot supply final sweep after reveal | `unblinded_delta_reviewer_cannot_be_final_cold` |
+| Cold residual and ordinary counter stay additive | `cold_blocking_residual_is_additive`; `complete_cold_cannot_clear_ordinary_counter` |
+| Supported complete GO | `complete_supported_fixture_go` |
+| Changed retained bytes block publish | `publish_rechecks_changed_bytes` |
+| F9 single live resolution, exact saved snapshot | `publish_resolves_once_and_saves_that_snapshot` |
+| Increment-1 integration: artifact HOLD, snapshot, complete successor GO | `increment_one_integration_hold_then_successor_go` |
+| M5 all successor alternatives visible | `parent_audit_lists_all_successor_alternatives` |
+| M7/N4 restoration stays held; new root recovers | `unapproved_lineage_requires_new_root`, plus existing per-attempt renewal/expiry regressions |
+
+### 1c validation evidence
+
+N1 was the first edit and first execution: **2 passed, 171 deselected**. An initial
+focused integration run passed **16 tests, 173 deselected**. A subsequent full run
+was intentionally interrupted when the cold delivery design review required
+retained source/access resources and withheld plan contents; that partial run is
+not counted as green evidence. The final full command uses a fresh scratch root.
+
+Six isolated source mutations were caught: reduction cause guard, unknown comparator
+fallback, strongest pruning, annotation of unrelated targets, reproducer's own
+bound accept, and known ancestor exposure. Copies and per-test logs are retained
+under the private task scratch `inc1c-mutants-1caec917`; repository source was never
+mutated. This includes the previously surviving N1/Cj, N2/Cf and N2/Cp guards.
+
+Final foreground command, with `PYTHONPATH=<CLONE>/src` and
+`PYTHONDONTWRITEBYTECODE=1`:
+
+```text
+python -m pytest tests/test_acceptance.py tests/test_close.py tests/test_close_signoffs.py tests/test_gates.py -q --basetemp <SCRATCH>/pytest-1c-final -p no:cacheprovider
+```
+
+Result: **544 passed, 1 skipped** in 378.26 seconds (209 acceptance cases plus
+335 existing close/signoff/gate cases passed). The skip remains host-restricted
+symlink creation. No attention test execution is claimed for this implementation
+round. Targeted Ruff on the six touched production modules and the acceptance
+test module passed. `close acceptance cold --help` was executed from the source
+checkout and agrees with the guide. Whitespace, eleven-file scope, branch and
+unchanged design-copy checks passed. Privacy sweep: **8/8 positive controls,
+zero added-content matches**, including both new files.
+
+Scratch remains under the private acceptance task directory for review: the
+initial/final fixture stores, isolated mutation copies/logs and verification
+script. No reviewer workspace or unrelated untracked directory was modified.
+
+The lead must commission the final whole-increment cold sweep by an uninvolved,
+unexposed reviewer before any PR. This implementation handoff does not substitute
+for that review or grant merge/release authority.

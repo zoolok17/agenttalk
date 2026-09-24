@@ -1,8 +1,8 @@
 """Acceptance evidence resolver and additive pure verdict checks.
 
 The resolver performs I/O; evaluate() only consumes its validated snapshot.
-Schema 2 supports cooperative reproduction. Final cold eligibility remains an
-explicit HOLD until increment 1c; no standalone verdict or execution provenance.
+Schema 3 adds a committed final cold sweep and cooperative actor attestations.
+Older schemas remain HOLD-only; no cryptographic execution provenance is claimed.
 """
 
 from __future__ import annotations
@@ -197,16 +197,20 @@ def _retained(store, digest):
 
 
 def validate_plan(plan):
+    cold = isinstance(plan, dict) and plan.get("schema_version") == 3
     _object(plan, "schema_version plan_id project_id scope authors partitions rows registry_ref "
-            "registry_digest trust_profile", "plan")
-    _version(plan["schema_version"], (1, 2))
+            "registry_digest trust_profile" + (" cold_policy" if cold else ""), "plan")
+    _version(plan["schema_version"], (1, 2, 3))
+    if plan["schema_version"] == 3:
+        from agenttalk.acceptance_cold import policy
+        policy(plan["cold_policy"])
     for key in ("plan_id", "project_id", "scope"):
         _id(plan[key])
     _digest(plan["registry_digest"])
     _text(plan["registry_ref"], "registry_ref")
     if plan["trust_profile"] != "cooperative":
         _fail("unsupported acceptance trust profile")
-    _strings(plan["authors"], "authors", nonempty=plan["schema_version"] == 2)
+    _strings(plan["authors"], "authors", nonempty=plan["schema_version"] >= 2)
     partitions = _indexed(plan["partitions"], "partitions")
     if not partitions:
         _fail("plan requires partitions")
@@ -301,7 +305,7 @@ def prepare(store, plan_file, project_repo, revision, scope, lenses=()):
     if _hash(registry_bytes) != plan["registry_digest"]:
         _fail("registry differs from plan pin", "acceptance_plan_stale")
     project = verify_project(project_repo, revision)
-    if plan["schema_version"] == 2 and plan["project_id"] != project_id(project):
+    if plan["schema_version"] >= 2 and plan["project_id"] != project_id(project):
         _fail(f"project_id must be {project_id(project)} for this Git root set", "acceptance_project_unverified")
     return {"plan_hash": _retain(store, plan_bytes), "registry_hash": _retain(store, registry_bytes),
             "project": project, "plan": plan}
@@ -313,9 +317,11 @@ def partition_lenses(plan, lenses):
     existing = {lens["id"]: lens for lens in result}
     if len(existing) != len(result):
         _fail("duplicate close lens id")
-    for partition in plan["partitions"]:
-        lens = close.validate_lens_spec({"id": "acceptance-run-" + partition["id"],
-                                        "allowed_agents": partition["agents"]})
+    assignments = [("acceptance-run-" + p["id"], p["agents"]) for p in plan["partitions"]]
+    if plan["schema_version"] == 3:
+        assignments.append(("acceptance-cold", [plan["cold_policy"]["reviewer"]]))
+    for lens_id, actors in assignments:
+        lens = close.validate_lens_spec({"id": lens_id, "allowed_agents": actors})
         if lens["id"] in existing:
             actual = existing[lens["id"]]
             if (not actual.get("required") or actual.get("allowed_roles") or actual.get("allowed_groups")
@@ -344,9 +350,11 @@ def freeze(store, close_id, prepared, at):
                  "plan_hash": prepared["plan_hash"], "registry_hash": prepared["registry_hash"],
                  "bundle_hash": None, "frozen_by": record["opened_by"], "frozen_at": at,
                  "attached_by": None, "attached_at": None}
-        if plan["schema_version"] == 2:
-            route.update(schema_version=2, parent_record_hash=prepared.get("parent_record_hash"),
+        if plan["schema_version"] >= 2:
+            route.update(schema_version=plan["schema_version"], parent_record_hash=prepared.get("parent_record_hash"),
                          amendment_hash=prepared.get("amendment_hash"))
+        if plan["schema_version"] == 3:
+            route.update(cold_commit_hash=None, cold_reconcile_hash=None)
         record["required_lenses"] = partition_lenses(plan, record["required_lenses"])
         record["acceptance_route"] = route
         transaction.commit()
@@ -357,11 +365,16 @@ def _route(record):
     route = record.get("acceptance_route")
     if not isinstance(route, dict) or route.get("pending"):
         _fail("acceptance route is absent or pending")
-    extra = " parent_record_hash amendment_hash" if route.get("schema_version") == 2 else ""
+    extra = " parent_record_hash amendment_hash" if route.get("schema_version") in (2, 3) else ""
+    if route.get("schema_version") == 3:
+        extra += " cold_commit_hash cold_reconcile_hash"
+        for key in ("cold_commit_hash", "cold_reconcile_hash"):
+            if route.get(key) is not None:
+                _digest(route[key])
     _object(route, "schema_version attempt_id instance_id project_id revision project plan_hash "
             "registry_hash bundle_hash frozen_by frozen_at attached_by attached_at" + extra, "acceptance route")
-    _version(route["schema_version"], (1, 2))
-    if route["schema_version"] == 2:
+    _version(route["schema_version"], (1, 2, 3))
+    if route["schema_version"] >= 2:
         if (route["parent_record_hash"] is None) != (route["amendment_hash"] is None):
             _fail("successor requires both parent record and amendment")
         if route["parent_record_hash"] is not None:
@@ -399,7 +412,7 @@ def _policy(store, record):
 
 
 def _bundle(bundle, record, route, plan):
-    modern = route["schema_version"] == 2
+    modern = route["schema_version"] >= 2
     _object(bundle, "schema_version close_id instance_id attempt_id project_id revision plan_hash "
             "registry_hash runs rows artifacts" + (" verifier_access reproductions" if modern else ""), "bundle")
     _version(bundle["schema_version"], (route["schema_version"],))
@@ -473,6 +486,9 @@ def attach(store, close_id, bundle_file, *, by, at):
         if route["bundle_hash"] is not None:
             _fail("attempt already has an immutable bundle")
         _, artifacts = _bundle(bundle, record, route, plan)
+        if route["schema_version"] == 3:
+            from agenttalk.acceptance_cold import reproduction_lenses
+            reproduction_lenses(record, bundle)
         captured = []
         total = len(data)
         for artifact in artifacts.values():
@@ -522,7 +538,7 @@ def resolve(store, record, *, live=False):
                                  live=live or route["schema_version"] == 1)
         if project != route["project"]:
             _fail("project identity changed", "acceptance_project_unverified")
-        if route["schema_version"] == 2 and route["project_id"] != project_id(project):
+        if route["schema_version"] >= 2 and route["project_id"] != project_id(project):
             _fail("project ID differs from verified root identity", "acceptance_project_unverified")
         if route["bundle_hash"] is None:
             _fail("acceptance bundle missing", "acceptance_record_missing")
@@ -561,12 +577,15 @@ def resolve(store, record, *, live=False):
                     holds.append((code, f"row {row['id']}: {exc}"))
             outcomes.append(outcome)
         snapshot = {"holds": holds, "outcomes": outcomes}
-        if route["schema_version"] == 2:
+        if route["schema_version"] >= 2:
             from agenttalk import acceptance_history
             snapshot["trust_checked"] = True
             snapshot["reproductions"] = _reproduce(store, record, plan, bundle, rows, artifacts, holds)
             _ack_bindings(record, plan, holds)
             acceptance_history.evaluate(store, record, plan, snapshot)
+            if route["schema_version"] == 3:
+                from agenttalk import acceptance_cold
+                acceptance_cold.evaluate(store, record, plan, bundle, snapshot)
         return snapshot
     except AcceptanceError as exc:
         snapshot["holds"].append((exc.code, str(exc)))
@@ -582,8 +601,8 @@ def evaluate(snapshot):
     holds = []
     if not isinstance(snapshot, dict) or not snapshot.get("trust_checked"):
         holds.append(("acceptance_trust_unresolved", "cooperative verification/reproduction evidence missing"))
-    else:
-        holds.append(("acceptance_cold_missing", "increment 1b does not yet enforce final cold review"))
+    elif not snapshot.get("cold_checked"):
+        holds.append(("acceptance_cold_missing", "eligible final cold review missing"))
     if not isinstance(snapshot, dict):
         return holds + [("acceptance_record_missing", "acceptance evaluation missing")]
     holds.extend(snapshot.get("holds", []))
@@ -595,8 +614,10 @@ def evaluate(snapshot):
 
 def ack_binding(record):
     route = record.get("acceptance_route") or {}
-    return {key: route.get(key) for key in
-            ("instance_id", "attempt_id", "revision", "plan_hash", "registry_hash", "bundle_hash")}
+    keys = ["instance_id", "attempt_id", "revision", "plan_hash", "registry_hash", "bundle_hash"]
+    if route.get("schema_version") == 3:
+        keys.extend(["cold_commit_hash", "cold_reconcile_hash"])
+    return {key: route.get(key) for key in keys}
 
 
 def _ack_bindings(record, plan, holds):

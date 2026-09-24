@@ -3628,6 +3628,11 @@ def cmd_close(args: argparse.Namespace) -> int:
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
         _check_close_authority(store, actor, "acceptance " + args.acceptance_cmd)
         try:
+            if args.acceptance_cmd == "cold":
+                from agenttalk.acceptance_cold import submit
+                digest = submit(store, args.id, args.file, phase=args.phase, by=actor, at=_iso_now())
+                print(f"cold {args.phase} retained for {args.id}: {digest}")
+                return 0
             if args.acceptance_cmd == "successor":
                 from agenttalk.acceptance_history import successor
                 if not all((args.acceptance_plan, args.project_repo, args.revision, args.reason)):
@@ -3939,6 +3944,9 @@ def cmd_close(args: argparse.Namespace) -> int:
 
     if action == "show":
         record = close_mod.load_close(store, args.id)
+        if "acceptance_route" in record:
+            from agenttalk.acceptance_history import successors
+            record["acceptance_successors"] = successors(store, record)
         print(json.dumps(record, indent=2))
         return 0
 
@@ -14915,6 +14923,14 @@ def build_parser() -> argparse.ArgumentParser:
     csucc.add_argument("--scope-reduction", help="Structured amendment with an actual operator decision reference.")
     csucc.add_argument("--from", dest="actor")
     csucc.set_defaults(func=cmd_close)
+
+    ccold = cacceptsub.add_parser(
+        "cold", help="Assigned reviewer commits cold observations, then reconciles after reveal.")
+    ccold.add_argument("--id", required=True)
+    ccold.add_argument("--phase", choices=["commit", "reconcile"], required=True)
+    ccold.add_argument("--file", required=True)
+    ccold.add_argument("--from", dest="actor", required=True)
+    ccold.set_defaults(func=cmd_close)
 
     csign = csub.add_parser("signoffs", help="P3: derive/inspect specialist sign-offs.")
     csignsub = csign.add_subparsers(dest="signoffs_cmd")

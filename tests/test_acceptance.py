@@ -1481,13 +1481,13 @@ def test_acceptance_target_coverage_reshape_table(case_v2, reshape, hold):
         assert not codes
 
 
-def target_approval(case, parent_id, child_id):
+def target_approval(case, parent_id, child_id, *, cause="policy-amendment"):
     from agenttalk import acceptance_history as history
     parent = close.load_close(case["store"], parent_id)
     changes = coverage.changes(coverage.history(case["store"], parent), case["plan"])
     approval = {"rows": list(changes), "changes": changes, "reason": "reviewed coverage change",
                 "alternatives": ["restore all coverage"], "impact": "reduced protection", "owner": "owner",
-                "expires_at": "9999-01-01T00:00:00Z", "cause": "policy-amendment",
+                "expires_at": "9999-01-01T00:00:00Z", "cause": cause,
                 "evidence": [parent["acceptance_route"]["bundle_hash"]], "decision_ref": "pending"}
     plan_hash = write_json(case["inputs"] / "plan.json", case["plan"])
     message = case["store"].send(sender="operator", recipient="lead", kind="message",
@@ -1579,3 +1579,391 @@ def test_acceptance_duplicate_list_is_not_stronger_failure_set_coverage():
     candidate = {"kind": "exact-json", "expected": ["a", "a"]}
     obligation = {"kind": "failure-set", "expected": ["a"]}
     assert not coverage.implies(candidate, obligation)
+
+
+@pytest.mark.parametrize("cause", ["unavailable-tool", "measured-variance"])
+def test_acceptance_reduction_cannot_authorize_replacement_coverage(case_v2, cause):
+    case = case_v2
+    assert open_attempt(case) == 0
+    bundle_v2(case, build_exit=1)
+    assert attach(case) == 0
+    publish_hold(case)
+    case["plan"]["rows"][0]["expected"] = 1
+    approval = target_approval(case, "attempt", "next", cause=cause)
+    assert successor(case, reduction=approval) == 0
+    result = complete_child(case)
+    assert "acceptance_category_moved_unreviewed" in {c for c, _ in result["holds"]}
+
+
+@pytest.fixture
+def case_v3(case_v2):
+    case = case_v2
+    case["plan"]["schema_version"] = 3
+    case["plan"]["cold_policy"] = {
+        "reviewer": "cold", "absence_disclosure": "",
+        "roster": [{"actor": actor, "vendor": vendor} for actor, vendor in
+                   [("lead", "alpha"), ("author", "alpha"), ("runner-a", "alpha"),
+                    ("runner-b", "alpha"), ("reproducer", "beta"), ("cold", "beta")]]}
+    write_json(case["inputs"] / "plan.json", case["plan"])
+    return case
+
+
+def cold_phase(case, phase, close_id="attempt", *, change=None, actor="cold"):
+    from agenttalk import acceptance_cold
+    record = close.load_close(case["store"], close_id)
+    route = record["acceptance_route"]
+    if phase == "commit":
+        manifest = []
+        for kind, contents in [("source", (case["project"] / "source.txt").read_bytes()),
+                               ("access", b"separate cold seat access")]:
+            resource = case["inputs"] / ("cold-" + kind + ".txt")
+            resource.write_bytes(contents)
+            manifest.append({"kind": kind, "path": resource.name, "sha256": hashlib.sha256(contents).hexdigest()})
+        data = {"schema_version": 1, "binding": acceptance_cold.binding(record),
+                "reviewer": case["plan"]["cold_policy"]["reviewer"], "context_id": "fresh-context",
+                "claims_exposed": False, "authored_in_scope": False,
+                "prior_exposure": False, "leakage_reviewed": True,
+                "access_id": "cold-seat", "access_evidence": manifest[1]["sha256"],
+                "delivery_manifest": manifest, "observations": [], "blind_spots": []}
+    else:
+        data = {"schema_version": 1, "commit_hash": route["cold_commit_hash"],
+                "bundle_hash": route["bundle_hash"], "revealed": True, "findings": []}
+    if change:
+        data.update(change)
+    path = case["inputs"] / (phase + ".json")
+    write_json(path, data)
+    return command(case, "acceptance", "cold", "--id", close_id, "--phase", phase,
+                   "--file", str(path), "--from", actor)
+
+
+def ack_lens(case, lens, actor, close_id="attempt", *extra):
+    return command(case, "ack", "--id", close_id, "--lens", lens, "--from", actor,
+                   "--status", "accept", "--risk-class", "quality", "--release-blocker", "no",
+                   "--tests-referenced", "synthetic", "--tests-executed", "synthetic",
+                   "--residual-risk", "cooperative declarations", "--evidence", "retained evidence", *extra)
+
+
+def final_accepts(case, data, close_id="attempt"):
+    accept_all(case, close_id)
+    for rep in data["reproductions"]:
+        assert ack_lens(case, "acceptance-repro-" + rep["id"], rep["actor"], close_id) == 0
+    assert ack_lens(case, "acceptance-cold", case["plan"]["cold_policy"]["reviewer"], close_id) == 0
+
+
+def complete_v3(case, *, close_id="attempt", build_exit=0):
+    reviewer = case["plan"]["cold_policy"]["reviewer"]
+    assert cold_phase(case, "commit", close_id, actor=reviewer) == 0
+    data = bundle_v2(case, build_exit=build_exit)
+    record = close.load_close(case["store"], close_id)
+    data.update(schema_version=3, close_id=close_id,
+                **{k: record["acceptance_route"][k] for k in
+                   ("instance_id", "attempt_id", "revision", "plan_hash", "registry_hash", "project_id")})
+    write_json(case["inputs"] / "bundle.json", data)
+    assert command(case, "acceptance", "attach", "--id", close_id, "--from", "lead",
+                   "--file", str(case["inputs"] / "bundle.json")) == 0
+    assert cold_phase(case, "reconcile", close_id, actor=reviewer) == 0
+    final_accepts(case, data, close_id)
+    return data
+
+
+def assign_fresh_cold(case, actor):
+    case["plan"]["cold_policy"]["reviewer"] = actor
+    case["plan"]["cold_policy"]["roster"].append({"actor": actor, "vendor": "beta"})
+    cfg = case["store"].load_config()
+    cfg["agents"].append(actor)
+    write_json(case["store"].dir / "config.json", cfg)
+    write_json(case["inputs"] / "plan.json", case["plan"])
+
+
+def test_acceptance_complete_supported_fixture_go(case_v3, capsys):
+    case = case_v3
+    assert open_attempt(case, "--lens", "acceptance-run-bar", "--allow", "acceptance-run-bar:runner-a",
+                        "--lens", "acceptance-cold", "--allow", "acceptance-cold:cold") == 0
+    complete_v3(case)
+    capsys.readouterr()
+    assert command(case, "check", "--id", "attempt", "--json") == 0
+    assert json.loads(capsys.readouterr().out)["verdict"] == "GO"
+    assert command(case, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go") == 0
+    saved = close.load_close(case["store"], "attempt")["final"]
+    assert saved["acceptance_snapshot"]["cold_checked"] is True
+    assert saved["close_result"]["verdict"] == "GO"
+
+
+@pytest.mark.parametrize("field", ["claims_exposed", "authored_in_scope", "prior_exposure"])
+def test_acceptance_final_cold_rejects_author_or_claims_exposure(case_v3, field):
+    assert open_attempt(case_v3) == 0
+    assert cold_phase(case_v3, "commit", change={field: True}) == 2
+    assert close.load_close(case_v3["store"], "attempt")["acceptance_route"]["cold_commit_hash"] is None
+
+
+@pytest.mark.parametrize("mode", ["required", "missing-disclosure", "disclosed"])
+def test_acceptance_available_second_vendor_required_otherwise_absence_disclosed(case_v3, capsys, mode):
+    case = case_v3
+    policy = case["plan"]["cold_policy"]
+    for entry in policy["roster"]:
+        if mode != "required" or entry["actor"] == "cold":
+            entry["vendor"] = "alpha"
+    if mode == "disclosed":
+        policy["absence_disclosure"] = "Only one vendor available for this frozen assignment."
+    write_json(case["inputs"] / "plan.json", case["plan"])
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    if mode == "disclosed":
+        assert command(case, "check", "--id", "attempt") == 0
+        assert snapshot(case)["cold"]["absence_disclosure"] == policy["absence_disclosure"]
+    else:
+        assert "acceptance_lens_not_independent" in check(case, capsys)
+
+
+@pytest.mark.parametrize("missing", ["reproducer", "cold", "reconcile", "wrong-actor", "override"])
+def test_acceptance_final_attestations_are_required_and_bound(case_v3, capsys, missing):
+    case = case_v3
+    assert open_attempt(case) == 0
+    data = complete_v3(case)
+    with close.close_transaction(case["store"], "attempt") as tx:
+        key = "acceptance-repro-" + data["reproductions"][0]["id"]
+        if missing == "cold":
+            tx.record["lens_acks"].pop("acceptance-cold")
+        elif missing == "reconcile":
+            tx.record["acceptance_route"]["cold_reconcile_hash"] = None
+        elif missing == "reproducer":
+            tx.record["lens_acks"].pop(key)
+        elif missing == "wrong-actor":
+            tx.record["lens_acks"][key]["from"] = "lead"
+        else:
+            tx.record["lens_acks"][key]["override"] = True
+        tx.commit()
+    assert {"acceptance_cold_missing", "acceptance_lens_not_independent"} & check(case, capsys)
+
+
+def test_acceptance_publish_rechecks_changed_bytes(case_v3, capsys):
+    case = case_v3
+    assert open_attempt(case) == 0
+    data = complete_v3(case)
+    assert command(case, "check", "--id", "attempt") == 0
+    path = case["store"].dir / "acceptance" / "sha256" / data["artifacts"][0]["sha256"]
+    path.write_bytes(b"changed after check")
+    assert command(case, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go") == 3
+    assert close.load_close(case["store"], "attempt")["status"] == "open"
+
+
+def test_acceptance_increment_one_integration_hold_then_successor_go(case_v3, capsys):
+    case = case_v3
+    assert open_attempt(case, "--lens", "acceptance-run-bar", "--allow", "acceptance-run-bar:runner-a",
+                        "--lens", "acceptance-cold", "--allow", "acceptance-cold:cold") == 0
+    complete_v3(case, build_exit=1)
+    assert command(case, "draft", "--id", "attempt", "--from", "lead", "-m", "artifact failure retained") == 0
+    codes = check(case, capsys)
+    assert "acceptance_row_failed" in codes
+    assert "acceptance_cold_missing" not in codes
+    publish_hold(case)
+    parent = close.load_close(case["store"], "attempt")
+    assert parent["final"]["acceptance_snapshot"]["outcomes"][0]["passed"] is False
+    assign_fresh_cold(case, "cold-next")
+    assert successor(case) == 0
+    complete_v3(case, close_id="next")
+    assert command(case, "check", "--id", "next") == 0
+    assert command(case, "publish", "--id", "next", "--from", "lead", "--verdict", "go") == 0
+    assert close.load_close(case["store"], "attempt") == parent
+
+
+def test_acceptance_parent_audit_lists_all_successor_alternatives(case_v2, capsys):
+    assert open_attempt(case_v2) == 0
+    bundle_v2(case_v2)
+    assert attach(case_v2) == 0
+    publish_hold(case_v2)
+    assert successor(case_v2, new_id="first") == 0
+    assert successor(case_v2, new_id="second") == 0
+    capsys.readouterr()
+    assert command(case_v2, "show", "--id", "attempt") == 0
+    children = json.loads(capsys.readouterr().out)["acceptance_successors"]
+    assert {item["close_id"] for item in children} == {"first", "second"}
+    assert all(item["status"] == "open" for item in children)
+
+
+def test_acceptance_coverage_comparators_are_explicit():
+    for comparator in acceptance.COMPARATORS:
+        expected = [] if comparator == "exact-failure-set" else 0
+        assert coverage.predicate({"comparator": comparator, "expected": expected})
+    with pytest.raises(acceptance.AcceptanceError, match="unsupported coverage comparator"):
+        coverage.predicate({"comparator": "future-at-most", "expected": 0})
+
+
+def test_acceptance_strongest_pruning_has_canonical_approval_shape():
+    exact = {"kind": "exact-json", "expected": ["a", "b"]}
+    weaker = {"kind": "failure-set", "expected": ["a", "b"]}
+    assert coverage.strongest([weaker, exact, weaker]) == [exact]
+
+
+@pytest.mark.parametrize("change", ["report-bytes", "event-order", "context-replay", "binding", "reporter"])
+def test_acceptance_cold_commitment_tampering_holds(case_v3, capsys, change):
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    with close.close_transaction(case["store"], "attempt") as tx:
+        route = tx.record["acceptance_route"]
+        if change == "report-bytes":
+            (case["store"].dir / "acceptance" / "sha256" / route["cold_commit_hash"]).write_bytes(b"tampered")
+        elif change == "event-order":
+            tx.record["events"].reverse()
+        elif change == "context-replay":
+            route["cold_reconcile_hash"] = route["cold_commit_hash"]
+        elif change == "binding":
+            tx.record["lens_acks"]["acceptance-cold"]["acceptance_binding"]["cold_commit_hash"] = "f" * 64
+        else:
+            next(e for e in tx.record["events"] if e["event"] == "acceptance:cold-commit")["by"] = "lead"
+        tx.commit()
+    assert check(case, capsys)
+    assert command(case, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go") == 3
+
+
+@pytest.mark.parametrize("actor", ["author", "runner-a", "lead", "reproducer"])
+def test_acceptance_final_cold_actor_must_be_disjoint(case_v3, capsys, actor):
+    case = case_v3
+    case["plan"]["cold_policy"]["reviewer"] = actor
+    write_json(case["inputs"] / "plan.json", case["plan"])
+    assert open_attempt(case) == 0
+    assert cold_phase(case, "commit", actor=actor) == 0
+    data = bundle_v2(case)
+    data["schema_version"] = 3
+    write_json(case["inputs"] / "bundle.json", data)
+    assert attach(case) == 0
+    assert cold_phase(case, "reconcile", actor=actor) == 0
+    final_accepts(case, data)
+    assert "acceptance_lens_not_independent" in check(case, capsys)
+
+
+def test_acceptance_cold_phases_reject_wrong_actor_and_late_commit(case_v3):
+    case = case_v3
+    assert open_attempt(case) == 0
+    assert cold_phase(case, "commit", actor="lead") == 2
+    assert cold_phase(case, "reconcile") == 2
+    data = bundle_v2(case)
+    data["schema_version"] = 3
+    write_json(case["inputs"] / "bundle.json", data)
+    assert attach(case) == 0
+    assert cold_phase(case, "commit") == 2
+
+
+@pytest.mark.parametrize("disposition", ["open", "resolved"])
+def test_acceptance_cold_blocking_residual_is_additive(case_v3, capsys, disposition):
+    case = case_v3
+    assert open_attempt(case) == 0
+    assert cold_phase(case, "commit", change={"observations": [
+        {"id": "finding", "blocking": True, "evidence": "independent observation"}]}) == 0
+    data = bundle_v2(case)
+    data["schema_version"] = 3
+    write_json(case["inputs"] / "bundle.json", data)
+    assert attach(case) == 0
+    assert cold_phase(case, "reconcile", change={"findings": [
+        {"id": "finding", "disposition": disposition, "evidence": "reviewer reconciliation"}]}) == 0
+    final_accepts(case, data)
+    if disposition == "open":
+        assert "acceptance_residual_open" in check(case, capsys)
+    else:
+        assert command(case, "check", "--id", "attempt") == 0
+
+
+def test_acceptance_publish_resolves_once_and_saves_that_snapshot(case_v3, monkeypatch):
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    original = acceptance.resolve
+    snapshots = []
+
+    def capture(store, record, **kwargs):
+        assert kwargs["live"] is True
+        result = original(store, record, **kwargs)
+        snapshots.append(deepcopy(result))
+        return result
+
+    monkeypatch.setattr(acceptance, "resolve", capture)
+    assert command(case, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go") == 0
+    assert len(snapshots) == 1
+    assert close.load_close(case["store"], "attempt")["final"]["acceptance_snapshot"] == snapshots[0]
+
+
+def test_acceptance_unapproved_lineage_requires_new_root(case_v3, capsys):
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    publish_hold(case)
+    case["plan"]["rows"][0]["expected"] = 1
+    write_json(case["inputs"] / "plan.json", case["plan"])
+    assert successor(case, new_id="lost") == 0
+    complete_v3(case, close_id="lost", build_exit=1)
+    assert command(case, "publish", "--id", "lost", "--from", "lead", "--verdict", "hold") == 3
+    case["plan"]["rows"][0]["expected"] = 0
+    write_json(case["inputs"] / "plan.json", case["plan"])
+    assert successor(case, parent="lost", new_id="restored") == 0
+    complete_v3(case, close_id="restored")
+    result = acceptance.resolve(case["store"], close.load_close(case["store"], "restored"))
+    assert "acceptance_category_moved_unreviewed" in {c for c, _ in result["holds"]}
+    assert command(case, "publish", "--id", "restored", "--from", "lead", "--verdict", "go") == 3
+    assign_fresh_cold(case, "cold-root")
+    assert open_attempt(case, "--id", "new-root") == 0
+    complete_v3(case, close_id="new-root")
+    assert command(case, "check", "--id", "new-root") == 0
+
+
+def test_acceptance_amendment_keeps_unrelated_outcome_passed(case_v2):
+    case = case_v2
+    assert open_attempt(case) == 0
+    bundle_v2(case, build_exit=1)
+    assert attach(case) == 0
+    publish_hold(case)
+    case["plan"]["rows"][0]["expected"] = 1
+    approval = target_approval(case, "attempt", "next")
+    assert successor(case, reduction=approval) == 0
+    result = complete_child(case)
+    assert result["outcomes"][0]["passed"] is None
+    assert result["outcomes"][1]["passed"] is True
+    assert "disposition" not in result["outcomes"][1]
+
+
+def test_acceptance_unblinded_delta_reviewer_cannot_be_final_cold(case_v3, capsys):
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    publish_hold(case)
+    assert successor(case) == 0
+    complete_v3(case, close_id="next")
+    result = acceptance.resolve(case["store"], close.load_close(case["store"], "next"))
+    assert "acceptance_cold_missing" in {c for c, _ in result["holds"]}
+
+
+@pytest.mark.parametrize("change", ["shared-access", "leaked-plan", "missing-delivery"])
+def test_acceptance_cold_delivery_access_and_retention(case_v3, capsys, change):
+    case = case_v3
+    assert open_attempt(case) == 0
+    if change == "shared-access":
+        assert cold_phase(case, "commit", change={"access_id": "verifier"}) == 0
+    elif change == "leaked-plan":
+        assert cold_phase(case, "commit", change={"delivery_manifest": [
+            {"kind": "plan", "path": "plan.json", "sha256": "f" * 64}]}) == 2
+        return
+    else:
+        assert cold_phase(case, "commit") == 0
+    data = bundle_v2(case)
+    data["schema_version"] = 3
+    write_json(case["inputs"] / "bundle.json", data)
+    assert attach(case) == 0
+    assert cold_phase(case, "reconcile") == 0
+    final_accepts(case, data)
+    if change == "missing-delivery":
+        route = close.load_close(case["store"], "attempt")["acceptance_route"]
+        initial = acceptance.decode(acceptance._retained(case["store"], route["cold_commit_hash"]))
+        digest = initial["delivery_manifest"][0]["sha256"]
+        (case["store"].dir / "acceptance" / "sha256" / digest).unlink()
+    codes = check(case, capsys)
+    assert {"acceptance_record_missing", "acceptance_lens_not_independent"} & codes
+
+
+def test_acceptance_complete_cold_cannot_clear_ordinary_counter(case_v3, capsys):
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    assert command(case, "ack", "--id", "attempt", "--lens", "acceptance-run-bar", "--from", "runner-a",
+                   "--status", "counter", "--counter", "ordinary", "--finding", "unfixed obligation") == 0
+    assert command(case, "check", "--id", "attempt") == 3
+    assert command(case, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go") == 3

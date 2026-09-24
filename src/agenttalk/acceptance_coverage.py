@@ -23,6 +23,8 @@ def target_id(row):
 def predicate(row):
     if row["comparator"] == "exact-failure-set":
         return {"kind": "failure-set", "expected": sorted(set(row["expected"]))}
+    if row["comparator"] not in {"exit-code", "exact-value"}:
+        A._fail("unsupported coverage comparator")
     # Both exact-value and exit-code accept precisely this typed integer when
     # expected is an integer. Neither accepts true or a floating-point spelling.
     return {"kind": "exact-json", "expected": row["expected"]}

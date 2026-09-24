@@ -21,6 +21,22 @@ def _now():
     return datetime.now(timezone.utc)
 
 
+def successors(store, parent):
+    """Read-only audit of every sibling, including open alternatives, by parent attempt."""
+    result = []
+    identity = parent["acceptance_route"].get("attempt_id")
+    for close_id in close.list_close_ids(store):
+        child = close.load_close(store, close_id)
+        digest = (child.get("acceptance_route") or {}).get("parent_record_hash")
+        if digest is None:
+            continue
+        retained = A.decode(A._retained(store, digest))
+        if retained["acceptance_route"]["attempt_id"] == identity:
+            result.append({"close_id": close_id, "status": child["status"],
+                           "verdict": (child.get("final") or {}).get("verdict")})
+    return result
+
+
 def _reduction(value):
     fields = "rows reason alternatives impact owner expires_at cause evidence decision_ref"
     A._object(value, fields + " changes", "scope reduction / policy amendment")
@@ -82,7 +98,7 @@ def successor(store, *, parent_id, close_id, plan_file, project_repo, revision, 
     with close.close_transaction(store, parent_id) as transaction:
         parent = deepcopy(transaction.record)
         route, old_plan = A._policy(store, parent)
-        if route["schema_version"] != 2 or parent["status"] != close.PUBLISHED:
+        if route["schema_version"] not in (2, 3) or parent["status"] != close.PUBLISHED:
             A._fail("successor requires a published schema-2 acceptance parent")
         if not isinstance((parent.get("final") or {}).get("acceptance_snapshot"), dict):
             A._fail("parent lacks its published evidence snapshot", "acceptance_record_missing")
@@ -94,7 +110,8 @@ def successor(store, *, parent_id, close_id, plan_file, project_repo, revision, 
                for code, _ in original["holds"]):
             A._fail("parent evidence cannot be preserved", "acceptance_record_missing")
         prepared = A.prepare(store, plan_file, project_repo, revision, parent["scope"])
-        if prepared["plan"]["schema_version"] != 2 or prepared["plan"]["project_id"] != old_plan["project_id"]:
+        if (prepared["plan"]["schema_version"] < route["schema_version"]
+                or prepared["plan"]["project_id"] != old_plan["project_id"]):
             A._fail("successor must retain verified project identity", "acceptance_project_unverified")
         reduction = None
         approval_hash = None
@@ -125,7 +142,9 @@ def successor(store, *, parent_id, close_id, plan_file, project_repo, revision, 
         # acks and unchanged frozen specialist routes cannot silently waive them.
         old_partition_ids = {"acceptance-run-" + p["id"] for p in old_plan["partitions"]}
         record["required_lenses"] = [lens for lens in record["required_lenses"]
-                                      if lens["id"] not in old_partition_ids]
+                                      if lens["id"] not in old_partition_ids
+                                      and lens["id"] != "acceptance-cold"
+                                      and not lens["id"].startswith("acceptance-repro-")]
         A.partition_lenses(prepared["plan"], record["required_lenses"])
         close._event(record, "acceptance:successor", by, at, parent_record_hash=prepared["parent_record_hash"],
                      amendment_hash=prepared["amendment_hash"])
