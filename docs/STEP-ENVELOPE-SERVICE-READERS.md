@@ -93,10 +93,28 @@ Not hash computations, but they carry the value and were traced:
   manifest, task identity, runtime marker and status are byte-identical to before.
 - **Existing installs made at a non-default envelope on v0.91.0 already hold a default-envelope hash in
   `install-manifest.json` and `task-identity.json`.** After this fix those fail the manifest check
-  (`install_manifest_invalid`) until the manifest is rewritten. This change does not include a migration;
-  it is called out for the lead's decision (see the reply). The same install's running gateway also holds
-  a runtime marker written with the default hash, so `gateway status` reports `runtime_marker_invalid`
-  until the service is restarted on the fixed code.
+  (`install_manifest_invalid`). This change includes no in-code migration (decided by the lead); see
+  "Upgrade path" below. The same install's running gateway also holds a runtime marker written with the
+  default hash, so `gateway status` reports `runtime_marker_invalid` until it is restarted.
+
+## Upgrade path for a 0.91.0 install at a non-default envelope
+
+There is no in-code migration and no command that rewrites the stored hashes in place. An install made
+on 0.91.0 with a non-default `--cutoff-eur` / `--soft-stop-eur` / `--ceiling-eur` is upgraded to 0.91.1
+by re-initialising it:
+
+1. Stop the gateway (`gateway stop`) and confirm both loopback ports are free.
+2. Back up the ledger (the whole spend directory: database and install marker), and move the old
+   `.agenttalk/gateway/` state files and the gateway token files aside rather than deleting them.
+   `gateway init` refuses to replace existing state, so they must be out of the way.
+3. `gateway init` with the current OVH dashboard figure as the opening balance and the envelope wanted.
+4. `gateway cap-install`, `gateway task-install`, `gateway start`.
+5. Run the dashboard canary (`gateway canary-verify`) and check `gateway status`: `ready` and
+   `worker_spend_ready` true, and the `price_policy_hash` printed by `init` equal to the one in `status`,
+   the manifest and `task-identity.json`.
+
+Consequence to expect: this starts a new ledger, so spend history stays only in the backup. An install
+at the default envelope needs none of this; its hashes were already the ledger's.
 
 ## Tests
 
