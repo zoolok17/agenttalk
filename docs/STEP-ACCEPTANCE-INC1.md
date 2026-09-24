@@ -155,9 +155,98 @@ The original seventeen reader groups above remain applicable. These additions co
 
 Residuals: authority remains advisory, same-user filesystem races remain outside the trust claim, and historical checkout/lock-duration issues are explicitly deferred above. No acceptance GO or release readiness is claimed.
 
-## 1b — awaiting lead acknowledgment and cold verdict
+## 1b — cooperative evidence and immutable successors
 
-Not started. Record its reader inventory, decisions and executed tests here after 1a is accepted.
+Base: `11939ff`; authorized after the cold delta read accepted 1a. The sections above describe the 1a contracts and their correction history; this section defines the additional version-2 sidecar contract. The enclosing close stays schema 2. The accepted design remains byte-identical.
+
+**Boundary:** all original and reproduced gating comparisons are recomputed from retained raw results. A complete cooperative fixture now clears `acceptance_trust_unresolved`, but still HOLDs on `acceptance_cold_missing`: final cold eligibility and vendor requirements remain 1c. No gate label, waiver, NA or override clears these direct holds. Schema-1 sidecars retain the earlier HOLD-only behavior; they do not silently acquire 1b semantics.
+
+### Versioned inputs and transitions
+
+Version-2 plans keep the same field set as version 1, require nonempty `authors`, and use a derived `project_id`: `git-` plus the first sixty hex characters of SHA-256 over Python's sorted-key JSON encoding of `{object_format:sha1, roots:<sorted verified root commits>}`. `acceptance.project_id(acceptance.verify_project(PROJECT, SHA))` computes it. Forks sharing that root set intentionally share identity; this is neither a remote-URL identity nor proof of authorship. SHA-1 is the supported Git object format. Verification binds the actual commit/tree/root set; private locator, tree and revision remain in the frozen route. Declared authors cannot be verifier or reproducer. Final cold author exclusions remain 1c.
+
+| Record | Version-2 additions / rules |
+| --- | --- |
+| Route | `schema_version:2`; nullable `parent_record_hash` and `amendment_hash`, both absent as null for a first attempt or both digests for a successor. Existing instance/attempt/plan/registry bindings stay strict. |
+| Bundle | `schema_version:2`, `verifier_access:{id,evidence}`, `reproductions:[]`. Evidence is an artifact ID in the retained manifest, not an external pointer. |
+| Original run | Adds nonempty `access_id`. Existing original actor, partition, SHA and before/after checks remain. |
+| Reproduction | `id`, `source_run`, `actor`, `access_id`, `access_evidence`, `revision`, `head_before`, `head_after`, `status_before`, `status_after`, `rows:[{id,artifact}]`. Exactly one reproduction per run serving a gating row, with every gating assertion from that run present and recomputed. Raw envelopes remain schema 1 and bind the reproduction's own run ID and project SHA. |
+| Access / verifier | Attacher must currently be the configured lead, operator-facing liaison or reserved operator, and must differ from all original runners and authors. Reproducer differs from all original runners, authors and attacher. Verifier and reproduction access IDs differ from all runner access IDs and each other; retained access evidence must be nonempty. These are cooperative declarations with evidence, not authenticated access or execution provenance. CLI attach still records advisory-authority warnings; evaluation enforces the additional HOLD. |
+| Ack | Adds `acceptance_binding:{instance_id,attempt_id,revision,plan_hash,registry_hash}` when written for a version-2 route. Every partition requires a current allowed actor's ACCEPT without override. Copying an old ack, even at the same SHA, remains stale. |
+| Published `final` | Adds the freshly resolved `acceptance_snapshot` and complete `close_result`. Parent record retention preserves final HOLD, comparisons, acks, counters, remediation and evidence references. |
+| Amendment | Schema 1; parent close/attempt, successor close ID, old/new plan and registry hashes, actor/time/reason, source-change or policy-change cause, `observed_before` parent-record digest, nullable reduction and retained operator approval digest. |
+
+Command signatures (uppercase operands are placeholders):
+
+```text
+agenttalk close acceptance successor --parent OLD --id NEW --acceptance-plan PLAN --project-repo PROJECT --revision SHA --from ACTOR --reason REASON [--scope-reduction REDUCTION]
+agenttalk close reopen --id OLD --successor NEW --acceptance-plan PLAN --project-repo PROJECT --revision SHA --from ACTOR --reason REASON [--scope-reduction REDUCTION]
+```
+
+Both call the same successor helper. The parent must already be published and use version-2 sidecars. Its complete record and amendment are retained before exclusive child creation. The original remains terminal and unchanged. Child starts with a new instance/attempt, no acks, no draft/final and no signoff overrides; counters, remediation, non-acceptance lens requirements and specialist routes remain. Unresolved parent counters add direct holds even if a child partition later accepts. Child freeze uses the same pending marker/transaction as open. A failure after creation may leave a HOLD-only pending child; no automatic rollback or history deletion. `--force` remains refused.
+
+Historical version-2 check/HOLD publication verifies commit/tree/roots from the Git object database without requiring live HEAD or cleanliness. The checkout must still exist with those objects. Open, attach and GO publish require matching clean live HEAD. A new revision can therefore be evaluated while the old attempt retains its real failing comparison. F9's publish-lock contention/revalidation work stays in 1c; no timing improvement is claimed here.
+
+### Operator scope reduction
+
+Reduction file fields: `rows`, `reason`, nonempty `alternatives`, `impact`, `owner`, timezone-aware future `expires_at`, `cause:unavailable-tool/measured-variance`, nonempty retained evidence digest list and `decision_ref`. The reference resolves an actual message in the existing store from `Store.operator_identity()`, the reserved operator principal, never the lead or a free-text operator name. The message body must equal the structured object returned by `acceptance_history.approval_payload(parent, NEW, new_plan_hash, reduction)`: schema 1, predecessor attempt, reserved successor close ID, new plan hash, and the complete reduction except its self-referential message ID. The approval message bytes are retained and hashed. The exclusive successor ID plus predecessor attempt and exact policy hash bind the approval; this is cooperative origin checking, not cryptographic authentication.
+
+Only gating-to-informational changes preserving the entire original assertion qualify. Missing, substituted or expired approval holds; missing/corrupt parent evidence holds. An approval's evidence references retain the measured variance/unavailability evidence; the operator assesses the stated cause and alternatives. No automated statistical inference is claimed. Original failure and raw evidence remain in the retained parent. Reports explicitly say **reduced scope**; affected outcomes have `disposition:scope-narrowed`, `passed:null`, the original outcome and separately recomputed `comparison_passed`. They are never promoted to a satisfied tool row. Later successors retain that label and recheck ancestral approvals, including expiry. Ancestry is bounded at 32 links and each retained JSON artifact remains subject to the 1 MiB limit; deeper/larger histories HOLD.
+
+At the same SHA, changing an existing assertion's comparator, expected value, field or artifact cannot erase its history: `acceptance_plan_stale` persists through subsequent same-SHA successors. Typed canonical JSON comparisons distinguish booleans from numbers. A new source revision requires fresh runs, reproduced results and acknowledgments. There is no carry optimization. Plan/registry changes always create a fresh attempt, even at identical SHA.
+
+### Existing readers of added or widened fields
+
+The 1a inventories still apply. This commit traced the following existing reader chains; the history module itself has no pre-existing readers.
+
+| Field / surface | Existing readers and assumptions | 1b disposition |
+| --- | --- | --- |
+| Plan/route/bundle schema versions | `acceptance._version`, `validate_plan`, `_route`, `_policy`, `_bundle`, `prepare`, `freeze`, `attach`, `resolve`; CLI open/attach/check/publish; whole-record persistence | Explicit 1/2 dispatch with exact fields per version; registry and raw-result schemas stay 1. Older engines reject the enclosing schema or unsupported route, as before. |
+| `authors`, `project_id`, project locator/roots/tree/revision | `validate_plan`, `prepare`, `verify_project`, `_policy`, `_bundle`, `resolve`; CLI `_build_dod_eval` | Version 2 derives project identity and checks verifier/reproducer author exclusions. Historical read uses object identity; live operations retain clean-HEAD checks. |
+| Run and artifact maps | `_bundle`, `attach`, `resolve`, `_compare`, retained-file readers | Manifest includes reproduced raw results and access evidence, under existing byte/count/path bounds. Raw run binding and strict integer comparisons apply to reproduced measurements. |
+| `lens_acks` | `close.apply_ack`, `compute_verdict`, `_ack_authorized`, `_evaluate_signoffs`, `_signoff_signers`; CLI ack/show | Existing ordinary ack semantics remain; version-2 writes add attempt/policy binding, acceptance resolution requires fresh allowed ACCEPT without override. Specialist readers preserve/ignore the extension. |
+| `final` extension | `close.record_publish`, `reopen`; CLI publish/list/show, `_published_close_holds`; `attention.close_hold_items` | Existing verdict/revision projections remain; extra snapshots are audit data consumed by successor validation. Acceptance reopen routes to a new ID, ordinary reopen unchanged. |
+| Route through transitions | `load_close`, `_is_wellformed`, `create_close`, `CloseTransaction`, `_write_close`, `save_close`, `replace_close`; CLI open/reopen | Parent never rewritten by successor helper; exclusive child and checked freeze reuse existing transaction semantics. No force replacement. |
+| `counters`, `remediation_items`, specialist routes | `compute_verdict`, `decide_counter`, `_evaluate_signoffs`, `apply_signoffs` | Copy obligations, clear acks/overrides; add direct unresolved-parent-counter holds to prevent clearing a counter by resetting its ack. |
+| Resolver snapshot/outcomes | `acceptance.evaluate`; CLI `_build_dod_eval`, check/publish | `trust_checked` means version-2 resolution ran, not that trust passed. Missing rows retain their diagnostic without false failed-recomputation text. Scope reduction uses explicit disposition, original outcome and report label; final cold HOLD remains. |
+| Operator message/config | `Store.operator_identity`, `messages_dir`, published message envelope readers | Read-only lookup by validated ID, reserved sender and exact body binding, retained approval bytes; no bus cursor or new decision lifecycle. Existing producers need the exact approval body, not a new message kind. |
+| Blob publication | `_retain`, `_retained`, prepare/attach/freeze/resolver | Non-FileExists hard-link errors fall back to complete atomic replacement; visible corrupted blobs still name their quarantine path. This covers retained evidence only: existing store locks have their own filesystem requirements. `.pending-*` crash remnants and unreferenced digests are never auto-pruned. |
+| CLI/documentation | close parser, `cmd_close`, `_check_close_authority`, README command table | Add successor and reopen flags; authority helper stays advisory, evaluator applies cooperative verifier restrictions. Private JSON snapshots remain private output, not sanitized public reports. |
+
+### Carried findings and named tests
+
+All names below are in `tests/test_acceptance.py` with prefix `test_acceptance_`.
+
+| Finding / requirement | Disposition | Test |
+| --- | --- | --- |
+| Every comparison / reproduction | Implemented; full production GO still waits for 1c cold sweep. | `cooperative_go_requires_every_comparison_and_run_reproduction` |
+| Separate actors/access | Implemented. | `reproduction_same_actor_or_shared_access_holds`, `verifier_must_not_be_runner_or_author`, `unrecognized_verifier_cannot_satisfy_trust` |
+| Operator reduction | Implemented with original failure/report preservation, exact typed approval binding and ancestral expiry. | `scope_reduction_lead_only_or_expired_approval_holds`, `operator_scope_reduction_preserves_failure_and_reports_reduced_scope`, `unapproved_scope_reduction_remains_hold`, `scope_approval_expiry_survives_successor_chain`, `scope_approval_exact_binding_required` |
+| Immutable attempts / direct holds | Implemented, including copied counters and same-SHA typed movement. | `successor_preserves_hold`, `same_sha_policy_change_stales_acks`, `same_sha_typed_expected_change_holds`, `successor_keeps_parent_counter_obligation`, `gate_label_and_waiver_cannot_clear`, `na_and_override_cannot_satisfy_partition` |
+| F8 / C2 historical identity | Implemented. | `historical_attempt_reads_objects_after_checkout_moves`, `new_revision_successor_preserves_historical_failure`, `attach_requires_live_clean_candidate`, `go_publish_requires_live_candidate` |
+| Authors / project ID | Implemented as cooperative declarations plus verified root identity. | `verifier_must_not_be_runner_or_author`, `reproduction_same_actor_or_shared_access_holds`, `project_id_cannot_name_unrelated_repository` |
+| C1 verifier outside runners | Implemented; configured lead/operator plus actor/access checks. | `verifier_must_not_be_runner_or_author`, `unrecognized_verifier_cannot_satisfy_trust` |
+| C3 repeated policy retention | Implemented explicit regression. | `successor_reretains_identical_policy`, `reopen_creates_linked_successor` |
+| N1 hard-link fallback | Implemented for evidence retention; existing store lock requirements unchanged. | `hard_link_unavailable_falls_back_atomically` |
+| N2 unmeasured double report | Fixed; unreadable evidence diagnostics identify digest, not an OS path. | `missing_gating_bytes_is_unmeasured_not_failed`, `failed_trust_keeps_gating_comparison` |
+| N3 attribution branch coverage | Added regression and mutation check. | `attribution_without_bundle_holds` |
+| N4 crash remnants | Documented by name; no unrequested cleanup policy. | Existing interrupted-retention regression; no crash-pruning claim. |
+| F9 publish lock duration | Remains deferred to 1c as directed. | Not measured; check/publish parity work remains. |
+
+### Executed 1b evidence
+
+All pytest commands ran foreground with `PYTHONPATH=<CLONE>/src`, `PYTHONDONTWRITEBYTECODE=1`, isolated `<SCRATCH>/pytest-1b-*` basetemps and `-p no:cacheprovider`.
+
+- Failing-first `tests/test_acceptance.py -k "hard_link_unavailable or missing_gating_bytes or attribution_without"`: **2 failed, 1 passed, 74 deselected**. N1/N2 reproduced; N3's existing guard passed before its mutation check.
+- First acceptance run: **96 passed, 1 skipped, 3 failed**. Fixture defects: hard-link injection also affected the store lock, author absent from roster, and missing required gate evidence. Fixed fixtures; no product behavior was weakened. Second acceptance run: **104 passed, 1 skipped**.
+- Combined bar: `python -m pytest tests/test_acceptance.py tests/test_close.py tests/test_close_signoffs.py tests/test_gates.py -q --basetemp <SCRATCH>/pytest-1b-final -p no:cacheprovider`: **442 passed, 1 skipped**.
+- Final typed-value review added five cases and strict JSON comparison checks. `tests/test_acceptance.py -k "typed_expected or scope_approval_exact or operator_scope_reduction or scope_approval_expiry"`, fresh basetemp: **7 passed, 106 deselected**.
+- Final CLI/route review added three cases and guards. `tests/test_acceptance.py -k "go_publish_requires or malformed_route_ack or reopen_flags_require or reopen_creates or same_sha_policy_change"`, fresh basetemp: **5 passed, 111 deselected**.
+- Distinct final coverage across those runs: **115 acceptance passes, 1 skipped; 335 existing close/signoff/gate passes** (**450 passes** total). This is aggregate executed coverage; the final eight added cases were targeted runs, not part of the earlier combined command. The skip remains host-restricted symlink creation.
+- M18, deleting the attribution-without-bundle guard in an isolated source copy: **1 failed**, killed by `attribution_without_bundle_holds`. Mutation log and source copy retained; repository source was never mutated.
+- Targeted Ruff covers acceptance, acceptance_history, close, CLI and the acceptance test module. Successor/reopen CLI help, whitespace checks, documentation links and design-byte equality were checked. Privacy sweep uses positive controls before push.
+
+Scratch is retained in the private `acceptance-inc1a` task directory for the cold reader, with `1b`-named fixtures and M18 probe/log. No reviewer workspace was modified. F9, final cold/vendor enforcement and complete check/publish integration remain for 1c; no broad suite or release GO is claimed.
 
 ## 1c — awaiting lead acknowledgment and cold verdict
 

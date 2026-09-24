@@ -1,8 +1,8 @@
-"""Acceptance increment 1a: bounded evidence inputs, never a standalone verdict.
+"""Acceptance evidence resolver and additive pure verdict checks.
 
 The resolver performs I/O; evaluate() only consumes its validated snapshot.
-Cooperative reproduction and final cold eligibility are not shipped in 1a, so
-even otherwise complete evidence has a direct acceptance_trust_unresolved hold.
+Schema 2 supports cooperative reproduction. Final cold eligibility remains an
+explicit HOLD until increment 1c; no standalone verdict or execution provenance.
 """
 
 from __future__ import annotations
@@ -64,8 +64,8 @@ def _digest(value):
     return value
 
 
-def _version(value):
-    if type(value) is not int or value != 1:
+def _version(value, supported=(1,)):
+    if type(value) is not int or value not in supported:
         _fail("unsupported acceptance schema_version")
 
 
@@ -171,6 +171,13 @@ def _retain(store, data):
             os.link(temporary, path)
         except FileExistsError:
             pass
+        except OSError:
+            # Digest identity makes complete replacement idempotent on filesystems
+            # without hard links. Keep the existing-corruption refusal when visible.
+            if path.exists() and _read(path) != data:
+                _fail(f"retained bytes differ from their digest at {path}; quarantine this blob before retrying",
+                      "acceptance_record_missing")
+            os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
     if _read(path) != data:
@@ -180,7 +187,10 @@ def _retain(store, data):
 
 
 def _retained(store, digest):
-    data = _read(_path(store.dir, f"acceptance/sha256/{_digest(digest)}"))
+    try:
+        data = _read(_path(store.dir, f"acceptance/sha256/{_digest(digest)}"))
+    except OSError as exc:
+        raise AcceptanceError("acceptance_record_missing", f"retained evidence {digest} unreadable") from exc
     if _hash(data) != digest:
         _fail("retained evidence digest mismatch", "acceptance_record_missing")
     return data
@@ -189,14 +199,14 @@ def _retained(store, digest):
 def validate_plan(plan):
     _object(plan, "schema_version plan_id project_id scope authors partitions rows registry_ref "
             "registry_digest trust_profile", "plan")
-    _version(plan["schema_version"])
+    _version(plan["schema_version"], (1, 2))
     for key in ("plan_id", "project_id", "scope"):
         _id(plan[key])
     _digest(plan["registry_digest"])
     _text(plan["registry_ref"], "registry_ref")
     if plan["trust_profile"] != "cooperative":
         _fail("unsupported acceptance trust profile")
-    _strings(plan["authors"], "authors")
+    _strings(plan["authors"], "authors", nonempty=plan["schema_version"] == 2)
     partitions = _indexed(plan["partitions"], "partitions")
     if not partitions:
         _fail("plan requires partitions")
@@ -239,7 +249,7 @@ def validate_registry(registry):
     return registry
 
 
-def verify_project(repo, revision):
+def verify_project(repo, revision, *, live=True):
     """No fallback to a caller's unverifiable SHA; git must verify this checkout."""
     repo = Path(repo).resolve()
     # Ambient Git redirection must not let the bus checkout answer for the project.
@@ -259,9 +269,9 @@ def verify_project(repo, revision):
     if Path(git("rev-parse", "--show-toplevel")).resolve() != repo:
         _fail("project locator must name the checkout root", "acceptance_project_unverified")
     sha = git("rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}")
-    if not _SHA.fullmatch(sha) or git("rev-parse", "HEAD") != sha:
+    if not _SHA.fullmatch(sha) or (live and git("rev-parse", "HEAD") != sha):
         _fail("project HEAD must equal the verified SHA", "acceptance_project_unverified")
-    dirty = git("status", "--porcelain", "--untracked-files=all")
+    dirty = git("status", "--porcelain", "--untracked-files=all") if live else ""
     if dirty:
         lines = dirty.splitlines()
         details = "\n".join(lines[:20])
@@ -270,6 +280,12 @@ def verify_project(repo, revision):
         _fail(f"acceptance project checkout is dirty:\n{details}", "acceptance_project_unverified")
     return {"locator": str(repo), "revision": sha, "tree": git("rev-parse", f"{sha}^{{tree}}"),
             "roots": sorted(git("rev-list", "--max-parents=0", sha).splitlines())}
+
+
+def project_id(project):
+    """Cooperative stable identity for the supported SHA-1 object graph."""
+    payload = json.dumps({"object_format": "sha1", "roots": project["roots"]}, sort_keys=True).encode()
+    return "git-" + _hash(payload)[:60]
 
 
 def prepare(store, plan_file, project_repo, revision, scope, lenses=()):
@@ -285,6 +301,8 @@ def prepare(store, plan_file, project_repo, revision, scope, lenses=()):
     if _hash(registry_bytes) != plan["registry_digest"]:
         _fail("registry differs from plan pin", "acceptance_plan_stale")
     project = verify_project(project_repo, revision)
+    if plan["schema_version"] == 2 and plan["project_id"] != project_id(project):
+        _fail(f"project_id must be {project_id(project)} for this Git root set", "acceptance_project_unverified")
     return {"plan_hash": _retain(store, plan_bytes), "registry_hash": _retain(store, registry_bytes),
             "project": project, "plan": plan}
 
@@ -326,6 +344,9 @@ def freeze(store, close_id, prepared, at):
                  "plan_hash": prepared["plan_hash"], "registry_hash": prepared["registry_hash"],
                  "bundle_hash": None, "frozen_by": record["opened_by"], "frozen_at": at,
                  "attached_by": None, "attached_at": None}
+        if plan["schema_version"] == 2:
+            route.update(schema_version=2, parent_record_hash=prepared.get("parent_record_hash"),
+                         amendment_hash=prepared.get("amendment_hash"))
         record["required_lenses"] = partition_lenses(plan, record["required_lenses"])
         record["acceptance_route"] = route
         transaction.commit()
@@ -336,9 +357,16 @@ def _route(record):
     route = record.get("acceptance_route")
     if not isinstance(route, dict) or route.get("pending"):
         _fail("acceptance route is absent or pending")
+    extra = " parent_record_hash amendment_hash" if route.get("schema_version") == 2 else ""
     _object(route, "schema_version attempt_id instance_id project_id revision project plan_hash "
-            "registry_hash bundle_hash frozen_by frozen_at attached_by attached_at", "acceptance route")
-    _version(route["schema_version"])
+            "registry_hash bundle_hash frozen_by frozen_at attached_by attached_at" + extra, "acceptance route")
+    _version(route["schema_version"], (1, 2))
+    if route["schema_version"] == 2:
+        if (route["parent_record_hash"] is None) != (route["amendment_hash"] is None):
+            _fail("successor requires both parent record and amendment")
+        if route["parent_record_hash"] is not None:
+            _digest(route["parent_record_hash"])
+            _digest(route["amendment_hash"])
     _id(route["attempt_id"])
     _id(route["project_id"])
     _digest(route["plan_hash"])
@@ -365,15 +393,16 @@ def _policy(store, record):
     except (OSError, AcceptanceError) as exc:
         raise AcceptanceError("acceptance_plan_stale", "frozen plan/registry invalid or missing") from exc
     if (plan["registry_digest"] != route["registry_hash"] or plan["project_id"] != route["project_id"]
-            or plan["scope"] != record["scope"]):
+            or plan["scope"] != record["scope"] or plan["schema_version"] != route["schema_version"]):
         _fail("frozen policy binding mismatch", "acceptance_plan_stale")
     return route, plan
 
 
 def _bundle(bundle, record, route, plan):
+    modern = route["schema_version"] == 2
     _object(bundle, "schema_version close_id instance_id attempt_id project_id revision plan_hash "
-            "registry_hash runs rows artifacts", "bundle")
-    _version(bundle["schema_version"])
+            "registry_hash runs rows artifacts" + (" verifier_access reproductions" if modern else ""), "bundle")
+    _version(bundle["schema_version"], (route["schema_version"],))
     for key in ("instance_id", "attempt_id", "project_id", "revision", "plan_hash", "registry_hash"):
         if bundle[key] != route[key]:
             _fail(f"bundle {key} mismatch", "acceptance_row_unbound")
@@ -382,7 +411,10 @@ def _bundle(bundle, record, route, plan):
     partitions = {p["id"]: p for p in plan["partitions"]}
     runs = _indexed(bundle["runs"], "runs")
     for run in runs.values():
-        _object(run, "id partition actor revision head_before head_after status_before status_after", "run")
+        _object(run, "id partition actor revision head_before head_after status_before status_after"
+                + (" access_id" if modern else ""), "run")
+        if modern:
+            _text(run["access_id"], "runner access_id")
         if run["partition"] not in partitions or run["actor"] not in partitions[run["partition"]]["agents"]:
             _fail("runner not assigned to partition", "acceptance_lens_not_independent")
         if any(run[k] != record["revision"] for k in ("revision", "head_before", "head_after")):
@@ -398,7 +430,25 @@ def _bundle(bundle, record, route, plan):
         if row["run_id"] not in runs or runs[row["run_id"]]["partition"] != definitions[row["id"]]["partition"]:
             _fail("row refers to wrong run/partition", "acceptance_row_unbound")
     artifacts = _indexed(bundle["artifacts"], "artifacts")
-    if set(artifacts) != {r["artifact"] for r in definitions.values()}:
+    expected_artifacts = {r["artifact"] for r in definitions.values()}
+    if modern:
+        verifier = _object(bundle["verifier_access"], "id evidence", "verifier access")
+        _text(verifier["id"], "verifier access id")
+        expected_artifacts.add(_id(verifier["evidence"]))
+        for rep in _indexed(bundle["reproductions"], "reproductions").values():
+            _object(rep, "id source_run actor access_id access_evidence revision head_before head_after "
+                    "status_before status_after rows", "reproduction")
+            for key in ("actor", "access_id"):
+                _text(rep[key], key)
+            if rep["id"] in runs or rep["source_run"] not in runs:
+                _fail("reproduction run reference is invalid", "acceptance_row_unbound")
+            expected_artifacts.add(_id(rep["access_evidence"]))
+            for obs in _indexed(rep["rows"], "reproduced rows").values():
+                _object(obs, "id artifact", "reproduced row")
+                if obs["id"] not in rows or rows[obs["id"]]["run_id"] != rep["source_run"]:
+                    _fail("reproduction row belongs to another run", "acceptance_row_unbound")
+                expected_artifacts.add(_id(obs["artifact"]))
+    if set(artifacts) != expected_artifacts:
         _fail("artifact manifest differs from plan", "acceptance_record_missing")
     for artifact in artifacts.values():
         _object(artifact, "id path sha256", "artifact")
@@ -418,6 +468,8 @@ def attach(store, close_id, bundle_file, *, by, at):
         if record["status"] == close.PUBLISHED:
             _fail("cannot attach to a published close")
         route, plan = _policy(store, record)
+        if verify_project(route["project"]["locator"], record["revision"]) != route["project"]:
+            _fail("project changed before attachment", "acceptance_project_unverified")
         if route["bundle_hash"] is not None:
             _fail("attempt already has an immutable bundle")
         _, artifacts = _bundle(bundle, record, route, plan)
@@ -459,13 +511,19 @@ def _compare(row, raw):
     return json.dumps(observed, sort_keys=True) == json.dumps(expected, sort_keys=True)
 
 
-def resolve(store, record):
+def resolve(store, record, *, live=False):
     """Read and verify immutable inputs; return a snapshot for the pure DoD fold."""
+    snapshot = {"holds": [], "outcomes": []}
     try:
         route, plan = _policy(store, record)
-        project = verify_project(route["project"]["locator"], record["revision"])
+        # Schema-1 records preserve their original strict-live contract. Schema 2
+        # reads historical objects; open, attach and GO publish check live state.
+        project = verify_project(route["project"]["locator"], record["revision"],
+                                 live=live or route["schema_version"] == 1)
         if project != route["project"]:
             _fail("project identity changed", "acceptance_project_unverified")
+        if route["schema_version"] == 2 and route["project_id"] != project_id(project):
+            _fail("project ID differs from verified root identity", "acceptance_project_unverified")
         if route["bundle_hash"] is None:
             _fail("acceptance bundle missing", "acceptance_record_missing")
         bundle = decode(_retained(store, route["bundle_hash"]))
@@ -502,21 +560,107 @@ def resolve(store, record):
                 if row["policy"] == "gating":
                     holds.append((code, f"row {row['id']}: {exc}"))
             outcomes.append(outcome)
-        return {"holds": holds, "outcomes": outcomes}
+        snapshot = {"holds": holds, "outcomes": outcomes}
+        if route["schema_version"] == 2:
+            from agenttalk import acceptance_history
+            snapshot["trust_checked"] = True
+            snapshot["reproductions"] = _reproduce(store, record, plan, bundle, rows, artifacts, holds)
+            _ack_bindings(record, plan, holds)
+            acceptance_history.evaluate(store, record, plan, snapshot)
+        return snapshot
     except AcceptanceError as exc:
-        return {"holds": [(exc.code, str(exc))], "outcomes": []}
+        snapshot["holds"].append((exc.code, str(exc)))
+        return snapshot
     except (OSError, ValueError, TypeError, KeyError, RecursionError) as exc:
-        return {"holds": [("acceptance_record_missing", f"unreadable acceptance evidence: {type(exc).__name__}")],
-                "outcomes": []}
+        snapshot["holds"].append(("acceptance_record_missing",
+                                  f"unreadable acceptance evidence: {type(exc).__name__}"))
+        return snapshot
 
 
 def evaluate(snapshot):
     """Pure; caller-provided ack/gate labels never resolve acceptance evidence."""
-    holds = [("acceptance_trust_unresolved", "increment 1a does not yet enforce reproduction/final cold review")]
+    holds = []
+    if not isinstance(snapshot, dict) or not snapshot.get("trust_checked"):
+        holds.append(("acceptance_trust_unresolved", "cooperative verification/reproduction evidence missing"))
+    else:
+        holds.append(("acceptance_cold_missing", "increment 1b does not yet enforce final cold review"))
     if not isinstance(snapshot, dict):
         return holds + [("acceptance_record_missing", "acceptance evaluation missing")]
     holds.extend(snapshot.get("holds", []))
     for row in snapshot.get("outcomes", []):
-        if row["policy"] == "gating" and not row["passed"]:
+        if row["policy"] == "gating" and row["passed"] is False:
             holds.append(("acceptance_row_failed", f"gating row {row['id']} failed recomputation"))
     return holds
+
+
+def ack_binding(record):
+    route = record.get("acceptance_route") or {}
+    return {key: route.get(key) for key in ("instance_id", "attempt_id", "revision", "plan_hash", "registry_hash")}
+
+
+def _ack_bindings(record, plan, holds):
+    for partition in plan["partitions"]:
+        ack = record["lens_acks"].get("acceptance-run-" + partition["id"], {})
+        if (ack.get("acceptance_binding") != ack_binding(record) or ack.get("status") != close.ACCEPT
+                or ack.get("override") or ack.get("from") not in partition["agents"]):
+            holds.append(("acceptance_lens_not_independent", f"partition {partition['id']} needs a fresh bound accept"))
+
+
+def _reproduce(store, record, plan, bundle, rows, artifacts, holds):
+    """Recompute original and reproduced assertions; never trust submitted verdicts."""
+    route = record["acceptance_route"]
+    runs = {run["id"]: run for run in bundle["runs"]}
+    runners = {run["actor"] for run in runs.values()}
+    authors = set(plan["authors"])
+    verifier = route["attached_by"]
+    authorities = {store.sole_lead(), store.operator_facing()}
+    try:
+        authorities.add(store.operator_identity())
+    except ValueError:
+        pass
+    if verifier not in authorities:
+        holds.append(("acceptance_trust_unresolved", "verifier is not the configured lead/operator"))
+    access = bundle["verifier_access"]
+    runner_access = {run["access_id"] for run in runs.values()}
+    if verifier in runners | authors or access["id"] in runner_access:
+        holds.append(("acceptance_trust_unresolved", "verifier must be separate from runners and authors"))
+    if not _retained(store, artifacts[access["evidence"]]["sha256"]).strip():
+        _fail("verifier separate-access evidence is empty", "acceptance_trust_unresolved")
+    results = []
+    gating = [row for row in plan["rows"] if row["policy"] == "gating"]
+    for run_id in sorted({rows[row["id"]]["run_id"] for row in gating}):
+        required = [row for row in gating if rows[row["id"]]["run_id"] == run_id]
+        matches = [rep for rep in bundle["reproductions"] if rep["source_run"] == run_id]
+        if len(matches) != 1:
+            holds.append(("acceptance_trust_unresolved", f"run {run_id} requires exactly one reproduction"))
+            continue
+        rep = matches[0]
+        try:
+            if (rep["actor"] in runners | authors | {verifier}
+                    or rep["access_id"] in runner_access | {access["id"]}):
+                _fail("reproduction actor/access is not separate", "acceptance_trust_unresolved")
+            if any(rep[k] != record["revision"] for k in ("revision", "head_before", "head_after")):
+                _fail("reproduction revision differs", "acceptance_row_unbound")
+            if rep["status_before"] != "" or rep["status_after"] != "":
+                _fail("reproduction checkout is dirty", "acceptance_project_unverified")
+            if not _retained(store, artifacts[rep["access_evidence"]]["sha256"]).strip():
+                _fail("reproduction access evidence missing", "acceptance_trust_unresolved")
+            observations = {obs["id"]: obs for obs in rep["rows"]}
+            for row in required:
+                if row["id"] not in observations:
+                    _fail("gating comparison not reproduced", "acceptance_trust_unresolved")
+                artifact = artifacts[observations[row["id"]]["artifact"]]
+                raw = decode(_retained(store, artifact["sha256"]))
+                _object(raw, "schema_version run_id revision values", "reproduction raw result")
+                _version(raw["schema_version"])
+                if raw["run_id"] != rep["id"] or raw["revision"] != record["revision"]:
+                    _fail("reproduced raw result is unbound", "acceptance_row_unbound")
+                if not isinstance(raw["values"], dict):
+                    _fail("reproduction values must be an object")
+                passed = _compare(row, raw)
+                results.append({"run_id": run_id, "row_id": row["id"], "actor": rep["actor"], "passed": passed})
+                if not passed:
+                    holds.append(("acceptance_row_failed", f"reproduction of {row['id']} failed recomputation"))
+        except AcceptanceError as exc:
+            holds.append((exc.code, f"reproduction {rep['id']}: {exc}"))
+    return results

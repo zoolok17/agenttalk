@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Acceptance increment 1b adds cooperative reproduction, attempt/policy-bound
+  acknowledgments, immutable successors, historical Git-object verification and
+  operator-origin scope reductions that preserve failed evidence. Complete
+  cooperative evidence still HOLDs pending increment 1c's final cold-review
+  enforcement. Retention has an atomic fallback when hard linking evidence fails;
+  unmeasured gating rows no longer claim failed recomputation.
+
 - Acceptance increment 1a freezes project-bound plans and retains evidence for
   built-in comparisons; it remains HOLD-only pending later trust checks.
   Acceptance closes use schema 2 so older engines reject them. Evidence blobs

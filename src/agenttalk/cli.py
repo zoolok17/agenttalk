@@ -3523,6 +3523,14 @@ def cmd_close(args: argparse.Namespace) -> int:
     store = _get_store(args)
     action = getattr(args, "close_cmd", None)
     roster = store.load_config().get("agents") or []
+    if action == "reopen" and getattr(args, "successor", None):
+        args.parent, args.id = args.id, args.successor
+        args.acceptance_cmd = "successor"
+        action = "acceptance"
+    elif action == "reopen" and any(getattr(args, key, None) for key in
+                                    ("acceptance_plan", "project_repo", "scope_reduction", "reason")):
+        sys.stderr.write("agenttalk close reopen: acceptance amendment flags require --successor\n")
+        return 2
 
     if action == "open":
         close_id = close_mod.validate_close_id(args.id)
@@ -3618,8 +3626,17 @@ def cmd_close(args: argparse.Namespace) -> int:
     if action == "acceptance":
         from agenttalk import acceptance
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
-        _check_close_authority(store, actor, "acceptance attach")
+        _check_close_authority(store, actor, "acceptance " + args.acceptance_cmd)
         try:
+            if args.acceptance_cmd == "successor":
+                from agenttalk.acceptance_history import successor
+                if not all((args.acceptance_plan, args.project_repo, args.revision, args.reason)):
+                    raise close_mod.CloseError("successor requires plan, project, revision and amendment reason")
+                record = successor(store, parent_id=args.parent, close_id=args.id, plan_file=args.acceptance_plan,
+                                   project_repo=args.project_repo, revision=args.revision, by=actor, at=_iso_now(),
+                                   reason=args.reason, reduction_file=args.scope_reduction)
+                print(f"opened acceptance successor {record['close_id']} of {args.parent}")
+                return 0
             digest = acceptance.attach(store, args.id, args.file, by=actor, at=_iso_now())
         except (close_mod.CloseConflict, TimeoutError) as e:
             return _close_conflict_result("acceptance attach", e)
@@ -3828,6 +3845,9 @@ def cmd_close(args: argparse.Namespace) -> int:
                     signoff_eval = _build_signoff_eval(store, record)
                     worktree_eval = _close_worktree_eval(store, record)
                     dod_eval = _build_dod_eval(store, record)
+                    if verdict == close_mod.VERDICT_GO and "acceptance_route" in record:
+                        from agenttalk import acceptance
+                        dod_eval["acceptance"] = acceptance.resolve(store, record, live=True)
                     record["worktree_isolation"] = worktree_eval
                     result = close_mod.compute_verdict(
                         record, gate_check, signoff_eval, worktree_eval, dod_eval)
@@ -3843,6 +3863,9 @@ def cmd_close(args: argparse.Namespace) -> int:
                         record, verdict=verdict, by=actor, at=_iso_now(),
                         reason=args.reason or "", gate_check=gate_check,
                         residual_risk=args.residual_risk, barrier_epoch=None)
+                    if "acceptance_route" in record:
+                        record["final"]["acceptance_snapshot"] = dod_eval.get("acceptance")
+                        record["final"]["close_result"] = result
                     if verdict == close_mod.VERDICT_GO and args.bump_barrier:
                         record["final"]["barrier_binding"] = (
                             _new_close_barrier_binding(record))
@@ -14879,6 +14902,16 @@ def build_parser() -> argparse.ArgumentParser:
     cattach.add_argument("--file", required=True)
     cattach.add_argument("--from", dest="actor", help="Actor binding evidence (advisory close authority).")
     cattach.set_defaults(func=cmd_close)
+    csucc = cacceptsub.add_parser("successor", help="Preserve a published acceptance parent and open a fresh attempt.")
+    csucc.add_argument("--id", required=True)
+    csucc.add_argument("--parent", required=True)
+    csucc.add_argument("--acceptance-plan", required=True)
+    csucc.add_argument("--project-repo", required=True)
+    csucc.add_argument("--revision", required=True)
+    csucc.add_argument("--reason", required=True)
+    csucc.add_argument("--scope-reduction", help="Structured amendment with an actual operator decision reference.")
+    csucc.add_argument("--from", dest="actor")
+    csucc.set_defaults(func=cmd_close)
 
     csign = csub.add_parser("signoffs", help="P3: derive/inspect specialist sign-offs.")
     csignsub = csign.add_subparsers(dest="signoffs_cmd")
@@ -14979,6 +15012,11 @@ def build_parser() -> argparse.ArgumentParser:
     creopen.add_argument("--id", required=True)
     creopen.add_argument("--from", dest="actor", help="Agent reopening.")
     creopen.add_argument("--revision", help="New ref/SHA (changing it stales prior lens acks).")
+    creopen.add_argument("--successor", help="New ID for a published acceptance attempt; preserves the parent.")
+    creopen.add_argument("--acceptance-plan")
+    creopen.add_argument("--project-repo")
+    creopen.add_argument("--reason")
+    creopen.add_argument("--scope-reduction")
     creopen.set_defaults(func=cmd_close)
 
     clist = csub.add_parser("list", help="List closes.")

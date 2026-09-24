@@ -1678,6 +1678,10 @@ def apply_ack(record: dict, *, lens_id: str, status: str, agent: str,
         "evidence": evidence or {}, "reason": reason, "counter_id": counter_id,
         "override": bool(override),
     }
+    route = record.get("acceptance_route")
+    if isinstance(route, dict) and route.get("schema_version") == 2:
+        from agenttalk.acceptance import ack_binding
+        record["lens_acks"][lens_id]["acceptance_binding"] = ack_binding(record)
     if status == COUNTER:
         record["counters"][counter_id] = {
             "counter_id": counter_id, "lens": lens_id, "raised_by": agent,
@@ -1770,7 +1774,8 @@ def reopen(record: dict, *, by: str, at: str, revision: str | None = None,
     acks are STALE by construction (compute_verdict compares ack.revision to the
     record revision), so we just update the revision and let the verdict re-flag."""
     if "acceptance_route" in record:
-        raise CloseError("acceptance successors are not supported in increment 1a; preserve this attempt")
+        raise CloseError("acceptance reopen requires --successor and a new plan/project/revision; "
+                         "preserve this attempt")
     record["status"] = REOPENED
     record["final"] = None
     if revision is not None:
