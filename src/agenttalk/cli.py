@@ -2970,6 +2970,8 @@ def _build_dod_eval(store, record: dict):
     if err:
         return {"policy_present": True, "policy_error": err, "required_dimensions": {}}
     dims = close_mod.derive_required_dod(policy, record.get("scope"))["dimensions"]
+    if "acceptance_route" in record:
+        dims["acceptance"] = {"required": True}
     if not dims:
         return None
     bundle = {"policy_present": policy is not None, "policy_error": None,
@@ -2980,6 +2982,9 @@ def _build_dod_eval(store, record: dict):
         bundle["coverage"] = _resolve_dod_coverage_gate(store, dims["coverage"], record)
     if "knowledge" in dims:
         bundle["knowledge"] = _resolve_dod_knowledge(store, dims["knowledge"], record)
+    if "acceptance" in dims:
+        from agenttalk import acceptance
+        bundle["acceptance"] = acceptance.resolve(store, record)
     return bundle
 
 
@@ -3235,6 +3240,9 @@ def _signoff_risk_inventory(args, store, record: dict) -> list[dict]:
     revision = record.get("revision")
     paths = list(getattr(args, "changed_path", None) or [])
     path_source = "manual"
+    if "acceptance_route" in record and not paths:
+        raise close_na_error("acceptance signoff routing requires explicit --changed-path; "
+                             "the store repository may differ from the verified project")
     if not paths:
         base = getattr(args, "base", None) or f"{revision}^"
         rc, out = _git(store.root, ["diff", "--name-only", f"{base}..{revision}"])
@@ -3518,12 +3526,28 @@ def cmd_close(args: argparse.Namespace) -> int:
 
     if action == "open":
         close_id = close_mod.validate_close_id(args.id)
+        prepared = None
         try:
-            revision, kind = _resolve_revision(store.root, args.revision)
+            if getattr(args, "acceptance_plan", None):
+                from agenttalk import acceptance
+                if not args.project_repo or args.force or args.allow_dirty or args.dirty_artifact:
+                    raise close_mod.CloseError(
+                        "acceptance requires --project-repo and forbids force/dirty overrides")
+                prepared = acceptance.prepare(
+                    store, args.acceptance_plan, args.project_repo, args.revision, args.scope)
+                revision, kind = prepared["project"]["revision"], "sha"
+            else:
+                if getattr(args, "project_repo", None):
+                    raise close_mod.CloseError("--project-repo requires --acceptance-plan")
+                revision, kind = _resolve_revision(store.root, args.revision)
         except close_mod.CloseError as e:
-            sys.stderr.write(f"agenttalk close open: {e}\n")
+            code = getattr(e, "code", None)
+            sys.stderr.write(f"agenttalk close open: {code or 'invalid_input'}: {e}\n")
+            return 3 if code else 2
+        except (OSError, ValueError, TypeError, KeyError) as e:
+            sys.stderr.write(f"agenttalk close open: invalid acceptance input: {e}\n")
             return 2
-        clean = _worktree_clean(store.root)
+        clean = True if prepared else _worktree_clean(store.root)
         if clean is None:  # git could not report; trust the explicit flags
             clean = not bool(args.dirty_artifact) if not args.allow_dirty else False
         opener = _resolve_self(getattr(args, "actor", None), roster=roster)
@@ -3537,6 +3561,9 @@ def cmd_close(args: argparse.Namespace) -> int:
             non_lane_isolation_not_asserted=bool(
                 getattr(args, "non_lane_isolation_not_asserted", False)))
         record["worktree_isolation"] = _close_worktree_eval(store, record)
+        if prepared:
+            # A crash before the freeze transaction must leave a HOLD-only close.
+            record["acceptance_route"] = {"pending": True}
         if not clean and not args.dirty_artifact:
             sys.stderr.write(
                 "agenttalk close open: WARNING - worktree is dirty and no "
@@ -3564,6 +3591,8 @@ def cmd_close(args: argparse.Namespace) -> int:
                 )
             else:
                 close_mod.create_close(store, record)
+            if prepared:
+                record = acceptance.freeze(store, close_id, prepared)
         except (close_mod.CloseConflict, TimeoutError) as e:
             return _close_conflict_result("open", e)
         except close_mod.CloseError as e:
@@ -3580,6 +3609,18 @@ def cmd_close(args: argparse.Namespace) -> int:
 
     if action == "signoffs":
         return _cmd_close_signoffs(args, store, roster)
+
+    if action == "acceptance":
+        from agenttalk import acceptance
+        try:
+            digest = acceptance.attach(store, args.id, args.file)
+        except (close_mod.CloseConflict, TimeoutError) as e:
+            return _close_conflict_result("acceptance attach", e)
+        except (close_mod.CloseError, OSError, ValueError, TypeError, KeyError) as e:
+            sys.stderr.write(f"agenttalk close acceptance: {getattr(e, 'code', 'invalid_input')}: {e}\n")
+            return 2
+        print(f"acceptance bundle attached to {args.id}: {digest}")
+        return 0
 
     if action == "ack":
         agent = _resolve_self(getattr(args, "actor", None), roster=roster)
@@ -3870,7 +3911,7 @@ def cmd_close(args: argparse.Namespace) -> int:
 
     sys.stderr.write(
         "agenttalk close: expected open, ack, draft, counter, check, publish, "
-        "reopen, list, or show.\n")
+        "reopen, acceptance attach, list, or show.\n")
     return 2
 
 
@@ -14799,6 +14840,8 @@ def build_parser() -> argparse.ArgumentParser:
     copen.add_argument("--scope", required=True, help="Close scope, e.g. release.")
     copen.add_argument("--gate-scope", help="Gate scope to check (default: --scope).")
     copen.add_argument("--revision", required=True, help="Ref or SHA; frozen to a full SHA via git.")
+    copen.add_argument("--acceptance-plan", help="Freeze a strict acceptance plan (increment 1a: HOLD only).")
+    copen.add_argument("--project-repo", help="Actual project checkout to verify for acceptance.")
     copen.add_argument("--lens", action="append", help="Required lens id (repeatable).")
     copen.add_argument("--optional-lens", action="append", help="Optional lens id (repeatable).")
     copen.add_argument("--allow", action="append",
@@ -14821,6 +14864,13 @@ def build_parser() -> argparse.ArgumentParser:
     copen.add_argument("--base", help="P3: diff base for changed paths (default revision^).")
     copen.add_argument("--json", action="store_true", help="Emit the opened record.")
     copen.set_defaults(func=cmd_close)
+
+    caccept = csub.add_parser("acceptance", help="Attach retained acceptance evidence (increment 1a).")
+    cacceptsub = caccept.add_subparsers(dest="acceptance_cmd", required=True)
+    cattach = cacceptsub.add_parser("attach", help="Copy and bind an immutable bundle and its raw artifacts.")
+    cattach.add_argument("--id", required=True)
+    cattach.add_argument("--file", required=True)
+    cattach.set_defaults(func=cmd_close)
 
     csign = csub.add_parser("signoffs", help="P3: derive/inspect specialist sign-offs.")
     csignsub = csign.add_subparsers(dest="signoffs_cmd")

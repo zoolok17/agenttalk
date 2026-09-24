@@ -105,7 +105,7 @@ DOD_DIRNAME = "dod.json"
 # dimension the engine cannot enforce is a policy error (you must not be able to require what
 # cannot be checked - a silent soft-pass is exactly the failure this gate exists to prevent).
 # inc-1: assurance only. inc-2 adds knowledge; inc-3 adds coverage + a depth-signoff dimension.
-_DOD_SUPPORTED_DIMENSIONS = frozenset({"assurance", "coverage", "knowledge"})
+_DOD_SUPPORTED_DIMENSIONS = frozenset({"assurance", "coverage", "knowledge", "acceptance"})
 _KNOWLEDGE_NOTE_TYPES = frozenset({"decision", "gotcha", "lesson", "pointer", "seam"})
 # The DoD knowledge dimension only counts DELIBERATE, human-authored knowledge (a lesson, a
 # gotcha, a decision) as evidence that "what we learned was written down". seam/pointer are
@@ -810,6 +810,10 @@ def validate_dod_policy(raw: object) -> dict:
                 norm[dim] = _validate_dod_coverage_spec(spec, scope_name)
             elif dim == "knowledge":
                 norm[dim] = _validate_dod_knowledge_spec(spec, scope_name)
+            elif dim == "acceptance":
+                if not isinstance(spec, dict) or set(spec) != {"required"} or spec["required"] is not True:
+                    raise CloseError("dod acceptance requires exactly {required: true}")
+                norm[dim] = {"required": True}
         key = str(scope_name).lower()
         if key in scopes:
             # two scope names that collide after lowercasing are ambiguous -> fail closed.
@@ -979,17 +983,25 @@ def evaluate_dod(record: dict, dod_eval: dict | None) -> list[tuple[str, str]]:
         "age_days": float|None, "max_age_days": int|None,
       } | None,
     }
-    ``None`` ⇒ [] (the scope has no DoD requirements)."""
+    ``None`` ⇒ [] unless a frozen acceptance route requires evaluation."""
+    from agenttalk import acceptance
+
+    # A frozen (even pending/malformed) route survives removal of live policy.
+    route_required = "acceptance_route" in record
+    out: list[tuple[str, str]] = []
+    if route_required:
+        out.extend(acceptance.evaluate(dod_eval.get("acceptance") if isinstance(dod_eval, dict) else None))
     if dod_eval is None:
-        return []
+        return out
     if not isinstance(dod_eval, dict):
-        return [(HOLD_INVALID_DOD_POLICY, "dod evaluation bundle is malformed")]
+        return out + [(HOLD_INVALID_DOD_POLICY, "dod evaluation bundle is malformed")]
     if dod_eval.get("policy_error"):
-        return [(HOLD_INVALID_DOD_POLICY, str(dod_eval["policy_error"]))]
+        return out + [(HOLD_INVALID_DOD_POLICY, str(dod_eval["policy_error"]))]
     required = dod_eval.get("required_dimensions") or {}
     if not required:
-        return []
-    out: list[tuple[str, str]] = []
+        return out
+    if "acceptance" in required and not route_required:
+        out.extend(acceptance.evaluate(dod_eval.get("acceptance")))
     if "assurance" in required:
         out.extend(_evaluate_dod_assurance(record, dod_eval.get("assurance")))
     if "coverage" in required:
@@ -1545,6 +1557,8 @@ def replace_close(store, record: dict, *, expected_generation: int | None,
         if not path.exists():
             raise CloseConflict(f"close {close_id!r} no longer exists; reload before retrying")
         current = load_close(store, close_id)
+        if "acceptance_route" in current or "acceptance_route" in record:
+            raise CloseError("acceptance attempts cannot be replaced with --force")
         _require_current_tokens(
             current, close_id=close_id,
             expected_generation=expected_generation,
@@ -1753,6 +1767,8 @@ def reopen(record: dict, *, by: str, at: str, revision: str | None = None,
     """Reopen a published close (operator). If the revision changed, prior lens
     acks are STALE by construction (compute_verdict compares ack.revision to the
     record revision), so we just update the revision and let the verdict re-flag."""
+    if "acceptance_route" in record:
+        raise CloseError("acceptance successors are not supported in increment 1a; preserve this attempt")
     record["status"] = REOPENED
     record["final"] = None
     if revision is not None:
