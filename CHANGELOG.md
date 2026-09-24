@@ -9,9 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- Acceptance re-gating compares a row against its most recent retained gating
-  definition, even across informational edits. Changed assertions require exact
-  operator approval; identical restoration and first-time gating do not.
+- Acceptance coverage follows protected measurement targets across all retained
+  ancestors, regardless of row names, splits, merges or informational hops.
+  Weakened or removed coverage requires exact operator approval for each attempt;
+  equivalent or provably stronger coverage does not. Target-based amendments use
+  schema 3 and preserve ancestor outcomes even when the original row is absent.
 
 - Acceptance 1b corrections require exact operator approval for gating assertion
   amendments at any revision and retain the original failure as a policy change.

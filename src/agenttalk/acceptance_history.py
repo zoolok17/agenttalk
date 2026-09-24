@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 
 from agenttalk import acceptance as A, close
+from agenttalk import acceptance_coverage as coverage
 
 
 def _bytes(value):
@@ -22,10 +23,9 @@ def _now():
 
 def _reduction(value):
     fields = "rows reason alternatives impact owner expires_at cause evidence decision_ref"
-    policy = isinstance(value, dict) and value.get("cause") == "policy-amendment"
-    A._object(value, fields + (" changes" if policy else ""), "scope reduction / policy amendment")
-    if policy and not isinstance(value["changes"], dict):
-        A._fail("policy amendment changes must map row IDs to old/new assertions")
+    A._object(value, fields + " changes", "scope reduction / policy amendment")
+    if not isinstance(value["changes"], dict):
+        A._fail("amendment changes must map protected targets to old/new coverage")
     A._strings(value["rows"], "reduced rows", nonempty=True)
     A._strings(value["alternatives"], "alternatives", nonempty=True)
     A._strings(value["evidence"], "scope reduction evidence", nonempty=True)
@@ -72,34 +72,6 @@ def _approval(store, data, parent, successor_id, plan_hash, reduction):
         A._retained(store, digest)
 
 
-def latest_gating_rows(store, record):
-    """Find the nearest retained gating definition, skipping informational edits."""
-    rows = {}
-    for depth in range(33):
-        route, plan = A._policy(store, record)
-        for row in plan["rows"]:
-            if row["policy"] == "gating":
-                rows.setdefault(row["id"], row)
-        digest = route.get("parent_record_hash")
-        if digest is None:
-            return rows
-        if depth == 32:
-            A._fail("acceptance ancestry exceeds supported depth")
-        record = A.decode(A._retained(store, digest))
-
-
-def assertion_changes(old_plan, plan, *, gating_rows=None):
-    """Bind changed assertions to their most recent gating definitions."""
-    new_rows = {row["id"]: row for row in plan["rows"]}
-    immediate_gating = {row["id"] for row in old_plan["rows"] if row["policy"] == "gating"}
-    if gating_rows is None:
-        gating_rows = {row["id"]: row for row in old_plan["rows"] if row["policy"] == "gating"}
-    return {row["id"]: {"old": row, "new": new_rows[row["id"]]}
-            for row in gating_rows.values() if row["id"] in new_rows
-            and (new_rows[row["id"]]["policy"] == "gating" or row["id"] in immediate_gating)
-            and _bytes(dict(new_rows[row["id"]], policy="gating")) != _bytes(row)}
-
-
 def successor(store, *, parent_id, close_id, plan_file, project_repo, revision, by, at, reason,
               reduction_file=None):
     """Preserve a terminal parent before exclusively creating a linked attempt."""
@@ -114,6 +86,8 @@ def successor(store, *, parent_id, close_id, plan_file, project_repo, revision, 
             A._fail("successor requires a published schema-2 acceptance parent")
         if not isinstance((parent.get("final") or {}).get("acceptance_snapshot"), dict):
             A._fail("parent lacks its published evidence snapshot", "acceptance_record_missing")
+        # A child adds one link; refuse before creation rather than burning its ID.
+        protected = coverage.history(store, parent, max_links=coverage.MAX_LINKS - 1)
         # Confirm retained evidence remains readable before preserving the parent.
         original = A.resolve(store, parent)
         if any(code in {"acceptance_record_missing", "acceptance_project_unverified"}
@@ -132,15 +106,14 @@ def successor(store, *, parent_id, close_id, plan_file, project_repo, revision, 
             approval_hash = A._retain(store, data)
         prepared["parent_record_hash"] = A._retain(store, _bytes(parent))
         cause = "source-change" if parent["revision"] != prepared["project"]["revision"] else "policy-change"
-        amendment = {"schema_version": 2, "parent_close_id": parent_id,
+        amendment = {"schema_version": 3, "parent_close_id": parent_id,
                      "parent_attempt_id": route["attempt_id"], "successor_close_id": close_id,
                      "prev_plan_hash": route["plan_hash"], "new_plan_hash": prepared["plan_hash"],
                      "prev_registry_hash": route["registry_hash"], "new_registry_hash": prepared["registry_hash"],
                      "by": by, "at": at, "reason": reason, "cause": cause,
                      "observed_before": prepared["parent_record_hash"], "reduction": reduction,
                      "approval_hash": approval_hash,
-                     "assertion_changes": assertion_changes(old_plan, prepared["plan"],
-                                                            gating_rows=latest_gating_rows(store, parent))}
+                     "assertion_changes": coverage.changes(protected, prepared["plan"])}
         prepared["amendment_hash"] = A._retain(store, _bytes(amendment))
         record = deepcopy(parent)
         record.update(close_id=close_id, instance_id=None, generation=0, status=close.OPEN,
@@ -165,15 +138,15 @@ def evaluate(store, record, plan, snapshot, *, depth=0):
     route = record["acceptance_route"]
     if route["parent_record_hash"] is None:
         return
-    if depth >= 32:
+    if depth >= coverage.MAX_LINKS:
         A._fail("acceptance ancestry exceeds supported depth")
     parent = A.decode(A._retained(store, route["parent_record_hash"]))
     amendment = A.decode(A._retained(store, route["amendment_hash"]))
     version = amendment.get("schema_version") if isinstance(amendment, dict) else None
     A._object(amendment, "schema_version parent_close_id parent_attempt_id successor_close_id prev_plan_hash "
               "new_plan_hash prev_registry_hash new_registry_hash by at reason cause observed_before "
-              "reduction approval_hash" + (" assertion_changes" if version == 2 else ""), "amendment")
-    A._version(version, (1, 2))
+              "reduction approval_hash" + (" assertion_changes" if version in (2, 3) else ""), "amendment")
+    A._version(version, (1, 2, 3))
     old_route, old_plan = A._policy(store, parent)
     old_bundle = A.decode(A._retained(store, old_route["bundle_hash"]))
     _, old_artifacts = A._bundle(old_bundle, parent, old_route, old_plan)
@@ -186,21 +159,6 @@ def evaluate(store, record, plan, snapshot, *, depth=0):
         "acceptance_lens_not_independent"})
     if parent["revision"] == record["revision"]:
         snapshot["holds"].extend(h for h in inherited["holds"] if h[0] == "acceptance_plan_stale")
-    if inherited.get("report_label"):
-        snapshot["report_label"] = inherited["report_label"]
-        snapshot["inherited_scope_reduction"] = {"record_hash": route["parent_record_hash"]}
-        prior_rows = {row["id"]: row for row in inherited["outcomes"]}
-        for outcome in snapshot["outcomes"]:
-            prior = prior_rows.get(outcome["id"], {})
-            disposition = prior.get("disposition")
-            if (disposition == "policy-amended"
-                    or (disposition == "scope-narrowed" and outcome["policy"] == "informational")):
-                outcome["original_outcome"] = prior["original_outcome"]
-                outcome["comparison_passed"] = (outcome["passed"] if outcome["passed"] is not None
-                                                else outcome.get("comparison_passed"))
-                if disposition == "policy-amended" and outcome["policy"] == "gating" and outcome["passed"] is False:
-                    snapshot["holds"].append(("acceptance_row_failed", f"amended row {outcome['id']} failed"))
-                outcome.update(passed=None, disposition=disposition, report_label=prior["report_label"])
     if (parent["status"] != close.PUBLISHED or amendment["parent_close_id"] != parent["close_id"]
             or amendment["parent_attempt_id"] != old_route["attempt_id"]
             or amendment["successor_close_id"] != record["close_id"]
@@ -225,61 +183,43 @@ def evaluate(store, record, plan, snapshot, *, depth=0):
         current = record["counters"].get(cid)
         if not isinstance(current, dict) or current.get("decision") == close.COUNTER_PENDING:
             snapshot["holds"].append(("acceptance_residual_open", f"parent counter {cid} remains unresolved"))
-    old_rows = {r["id"]: r for r in old_plan["rows"]}
-    new_rows = {r["id"]: r for r in plan["rows"]}
-    reduced = {key for key, old in old_rows.items() if old["policy"] == "gating"
-               and (key not in new_rows or new_rows[key]["policy"] != "gating")}
+    protected = coverage.history(store, parent)
+    changes = coverage.changes(protected, plan)
     reduction = amendment["reduction"]
-    changes = assertion_changes(old_plan, plan, gating_rows=latest_gating_rows(store, parent))
-    if version == 2 and _bytes(amendment["assertion_changes"]) != _bytes(changes):
-        A._fail("retained assertion diff differs from plans", "acceptance_category_moved_unreviewed")
-    policy_approval = reduction is not None and reduction.get("cause") == "policy-amendment"
-    approved_changes = False
-    if changes or policy_approval:
+    if version == 3 and _bytes(amendment["assertion_changes"]) != _bytes(changes):
+        A._fail("retained target coverage differs from plans", "acceptance_category_moved_unreviewed")
+    approved = False
+    if changes or reduction is not None:
         try:
-            if (not policy_approval or set(reduction["rows"]) != set(changes)
-                    or _bytes(reduction["changes"]) != _bytes(changes) or reduced):
-                A._fail("operator must approve the exact gating assertion changes")
+            if (reduction is None or set(_reduction(reduction)["rows"]) != set(changes)
+                    or _bytes(reduction["changes"]) != _bytes(changes)):
+                A._fail("operator must approve the exact protected-target coverage changes")
+            if reduction["cause"] != "policy-amendment" and any(c["new"] for c in changes.values()):
+                A._fail("scope reduction cannot authorize replacement gating assertions")
             _approval(store, A._retained(store, amendment["approval_hash"]), parent,
                       record["close_id"], route["plan_hash"], reduction)
-            approved_changes = True
+            approved = True
         except (A.AcceptanceError, KeyError, TypeError, ValueError) as exc:
             snapshot["holds"].append(("acceptance_category_moved_unreviewed", str(exc)))
-        snapshot["report_label"] = "policy amended"
-        originals = {r["id"]: r for r in parent["final"]["acceptance_snapshot"]["outcomes"]}
+            if any(not change["new"] for change in changes.values()):
+                snapshot["holds"].append(("acceptance_scope_reduction_unapproved", str(exc)))
+            if parent["revision"] == record["revision"]:
+                snapshot["holds"].append(("acceptance_plan_stale", "same-SHA coverage loss is unapproved"))
+    snapshot["coverage_changes"] = {}
+    definitions = {r["id"]: r for r in plan["rows"]}
+    for key, change in changes.items():
+        sources = protected[key]["sources"]
+        originals = [s["outcome"] for s in sources if s["outcome"]]
+        original = next((o for o in originals if o.get("passed") is False), originals[0] if originals else {})
+        missing = not change["new"]
+        label = "reduced scope" if missing else "policy amended"
+        snapshot["report_label"] = "reduced scope" if missing else snapshot.get("report_label", label)
+        snapshot["coverage_changes"][key] = dict(change, approved=approved, report_label=label, sources=sources)
         for outcome in snapshot["outcomes"]:
-            if outcome["id"] in changes:
-                if outcome["passed"] is False:
-                    snapshot["holds"].append(("acceptance_row_failed", f"amended row {outcome['id']} failed"))
-                observed = outcome["passed"] if outcome["passed"] is not None else outcome.get("comparison_passed")
-                original = originals[outcome["id"]]
-                outcome.update(original_outcome=original.get("original_outcome", original), comparison_passed=observed,
-                               passed=None, disposition="policy-amended", report_label="policy amended")
-    if reduced or (reduction is not None and not policy_approval):
-        try:
-            if reduction is None or set(_reduction(reduction)["rows"]) != reduced:
-                A._fail("scope reduction rows differ", "acceptance_scope_reduction_unapproved")
-            _approval(store, A._retained(store, amendment["approval_hash"]), parent, record["close_id"],
-                      route["plan_hash"], reduction)
-            for key in reduced:
-                if key not in new_rows or _bytes(dict(new_rows[key], policy="gating")) != _bytes(old_rows[key]):
-                    A._fail("scope reduction must preserve the original assertion",
-                            "acceptance_scope_reduction_unapproved")
-            snapshot["report_label"] = "reduced scope"
-            snapshot["scope_reduction"] = reduction
-            original_rows = {row["id"]: row for row in parent["final"]["acceptance_snapshot"]["outcomes"]}
-            for outcome in snapshot["outcomes"]:
-                if outcome["id"] in reduced:
-                    outcome["original_outcome"] = original_rows[outcome["id"]]
-                    outcome["comparison_passed"] = outcome["passed"]
-                    outcome.update(passed=None, disposition="scope-narrowed", report_label="reduced scope")
-        except (A.AcceptanceError, TypeError, ValueError) as exc:
-            snapshot["holds"].append(("acceptance_scope_reduction_unapproved", str(exc)))
-    if parent["revision"] == record["revision"]:
-        for key, old in old_rows.items():
-            if old["policy"] != "gating" or key in reduced or (approved_changes and key in changes):
+            if coverage.target_id(definitions[outcome["id"]]) != key:
                 continue
-            fields = ("comparator", "expected", "artifact", "field")
-            if key not in new_rows or _bytes({k: new_rows[key][k] for k in fields}) != _bytes(
-                    {k: old[k] for k in fields}):
-                snapshot["holds"].append(("acceptance_plan_stale", f"same-SHA assertion change cannot clear {key}"))
+            if outcome["policy"] == "gating" and outcome["passed"] is False:
+                snapshot["holds"].append(("acceptance_row_failed", f"amended row {outcome['id']} failed"))
+            observed = outcome["passed"] if outcome["passed"] is not None else outcome.get("comparison_passed")
+            outcome.update(original_outcome=original, comparison_passed=observed, passed=None,
+                           disposition="scope-narrowed" if missing else "policy-amended", report_label=label)

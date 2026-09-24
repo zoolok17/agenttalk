@@ -7,7 +7,7 @@ import subprocess
 
 import pytest
 
-from agenttalk import acceptance, cli, close
+from agenttalk import acceptance, acceptance_coverage as coverage, cli, close
 from agenttalk.store import Store
 
 
@@ -815,7 +815,9 @@ def reduction_input(case, *, sender="operator", expires="9999-01-01T00:00:00Z"):
     old_bundle = acceptance.decode(acceptance._retained(case["store"], parent["acceptance_route"]["bundle_hash"]))
     case["plan"]["rows"][0]["policy"] = "informational"
     plan_hash = write_json(case["inputs"] / "plan.json", case["plan"])
-    reduction = {"rows": ["build"], "reason": "time-budget dependent metric", "alternatives": ["fixed effort"],
+    changes = coverage.changes(coverage.history(case["store"], parent), case["plan"])
+    reduction = {"rows": list(changes), "changes": changes,
+                 "reason": "time-budget dependent metric", "alternatives": ["fixed effort"],
                  "impact": "measurement no longer gates", "owner": "owner", "expires_at": expires,
                  "cause": "measured-variance", "evidence": [old_bundle["artifacts"][0]["sha256"]],
                  "decision_ref": "pending"}
@@ -1089,24 +1091,25 @@ def test_acceptance_exact_operator_policy_amendment_preserves_failure(case_v2, s
     assert attach(case) == 0
     publish_hold(case)
     parent = close.load_close(case["store"], "attempt")
-    old_plan = deepcopy(case["plan"])
     (case["project"] / "source.txt").write_text("next revision", encoding="utf-8")
     git(case["project"], "commit", "-qam", "synthetic change")
     case["sha"] = git(case["project"], "rev-parse", "HEAD")
     case["plan"]["rows"][0]["expected"] = 1
     plan_hash = write_json(case["inputs"] / "plan.json", case["plan"])
-    change = {"rows": ["build"], "reason": "correct the assertion", "alternatives": ["retain old assertion"],
+    changes = coverage.changes(coverage.history(case["store"], parent), case["plan"])
+    target = coverage.target_id(case["plan"]["rows"][0])
+    change = {"rows": list(changes), "reason": "correct the assertion", "alternatives": ["retain old assertion"],
               "impact": "policy changed, original failure remains", "owner": "owner",
               "expires_at": "2000-01-01T00:00:00Z" if tamper == "expired" else "9999-01-01T00:00:00Z",
               "cause": "policy-amendment", "evidence": [parent["acceptance_route"]["bundle_hash"]],
-              "decision_ref": "pending", "changes": deepcopy(history.assertion_changes(old_plan, case["plan"]))}
+              "decision_ref": "pending", "changes": deepcopy(changes)}
     if tamper in {"old", "new"}:
-        change["changes"]["build"][tamper]["expected"] = 9
+        change["changes"][target][tamper][0]["expected"] = 9
     if tamper == "rows":
         change["rows"] = ["tool"]
     body = deepcopy(history.approval_payload(parent, "next", plan_hash, change))
     if tamper in {"boolean-body", "float-body"}:
-        body["reduction"]["changes"]["build"]["new"]["expected"] = True if tamper == "boolean-body" else 1.0
+        body["reduction"]["changes"][target]["new"][0]["expected"] = True if tamper == "boolean-body" else 1.0
     message = case["store"].send(sender=sender, recipient="lead", kind="message",
                                  body=json.dumps(body),
                                  _allow_reserved_sender=sender == "operator")
@@ -1134,7 +1137,7 @@ def test_acceptance_exact_operator_policy_amendment_preserves_failure(case_v2, s
         assert successor(case, parent="next", new_id="third") == 0
         result = complete_child(case, "third", build_exit=9)
     codes = {code for code, _ in result["holds"]}
-    assert ("acceptance_category_moved_unreviewed" in codes) == (tamper in {"old", "new", "rows"})
+    assert ("acceptance_category_moved_unreviewed" in codes) == (tamper in {"old", "new", "rows", "descendant-failure"})
     assert result["report_label"] == "policy amended"
     assert result["outcomes"][0]["passed"] is None
     failing = tamper in {"child-failure", "descendant-failure"}
@@ -1308,7 +1311,8 @@ def test_acceptance_regating_compares_last_gating_ancestor(case_v2, expected, ap
         (case["project"] / "source.txt").write_text("informational revision", encoding="utf-8")
         git(case["project"], "commit", "-qam", "synthetic informational change")
         case["sha"] = git(case["project"], "rev-parse", "HEAD")
-        assert successor(case, parent=parent, new_id="info") == 0
+        renewal = target_approval(case, parent, "info")
+        assert successor(case, parent=parent, new_id="info", reduction=renewal) == 0
         complete_child(case, "info")
         assert command(case, "publish", "--id", "info", "--from", "lead", "--verdict", "hold") == 3
         parent = "info"
@@ -1321,11 +1325,12 @@ def test_acceptance_regating_compares_last_gating_ancestor(case_v2, expected, ap
     if approved:
         from agenttalk import acceptance_history as history
         parent_record = close.load_close(case["store"], parent)
-        change = {"rows": ["build"], "reason": "reviewed regating policy", "alternatives": ["restore baseline"],
+        changes = coverage.changes(coverage.group([original_row]), case["plan"])
+        change = {"rows": list(changes), "reason": "reviewed regating policy", "alternatives": ["restore baseline"],
                   "impact": "amended assertion", "owner": "owner", "expires_at": "9999-01-01T00:00:00Z",
                   "cause": "policy-amendment", "evidence": [parent_record["acceptance_route"]["bundle_hash"]],
                   "decision_ref": "pending",
-                  "changes": {"build": {"old": original_row, "new": deepcopy(case["plan"]["rows"][0])}}}
+                  "changes": changes}
         message = case["store"].send(sender="operator", recipient="lead", kind="message",
                                      body=json.dumps(
                                          history.approval_payload(parent_record, "regated", plan_hash, change)),
@@ -1362,3 +1367,215 @@ def test_acceptance_never_gating_row_can_enter_without_amendment(case_v2):
     assert "acceptance_category_moved_unreviewed" not in {code for code, _ in result["holds"]}
     assert "acceptance_plan_stale" not in {code for code, _ in result["holds"]}
     assert result["outcomes"][0]["passed"] is True
+
+
+def attach_current_plan(case, close_id):
+    record = close.load_close(case["store"], close_id)
+    route = record["acceptance_route"]
+    data = {key: route[key] for key in ("instance_id", "attempt_id", "project_id", "revision",
+                                       "plan_hash", "registry_hash")}
+    data.update(schema_version=2, close_id=close_id, runs=[], rows=[], artifacts=[], reproductions=[],
+                verifier_access={"id": "verifier", "evidence": "access"})
+    proof = case["inputs"] / "access.txt"
+    proof.write_text("Synthetic separate access evidence", encoding="utf-8")
+    data["artifacts"].append({"id": "access", "path": proof.name,
+                              "sha256": hashlib.sha256(proof.read_bytes()).hexdigest()})
+    for partition in case["plan"]["partitions"]:
+        rows = [r for r in case["plan"]["rows"] if r["partition"] == partition["id"]]
+        run_id = "run-" + partition["id"]
+        data["runs"].append({"id": run_id, "partition": partition["id"], "actor": partition["agents"][0],
+                              "access_id": "seat-" + partition["id"], "revision": case["sha"],
+                              "head_before": case["sha"], "head_after": case["sha"],
+                              "status_before": "", "status_after": ""})
+        rep_id = "reproduce-" + run_id
+        data["reproductions"].append({"id": rep_id, "source_run": run_id, "actor": "reproducer",
+                                      "access_id": "reproduction-seat", "access_evidence": "access",
+                                      "revision": case["sha"], "head_before": case["sha"], "head_after": case["sha"],
+                                      "status_before": "", "status_after": "",
+                                      "rows": [{"id": r["id"], "artifact": "reproduced-" + r["artifact"]}
+                                               for r in rows]})
+        values = {}
+        for row in rows:
+            values.setdefault(row["artifact"], {}).setdefault(row["field"], row["expected"])
+            data["rows"].append({"id": row["id"], "run_id": run_id})
+        for aid, observed in values.items():
+            for prefix, rid in (("", run_id), ("reproduced-", rep_id)):
+                name = prefix + aid
+                digest = write_json(case["inputs"] / (name + ".json"),
+                                    {"schema_version": 1, "run_id": rid, "revision": case["sha"], "values": observed})
+                data["artifacts"].append({"id": name, "path": name + ".json", "sha256": digest})
+    write_json(case["inputs"] / "bundle.json", data)
+    assert command(case, "acceptance", "attach", "--id", close_id, "--from", "lead",
+                   "--file", str(case["inputs"] / "bundle.json")) == 0
+
+
+@pytest.mark.parametrize("reshape,hold", [
+    ("rename", False), ("rename-weaken", True), ("split-equivalent", False),
+    ("split-strengthen", False), ("split-targets", True), ("merge-equivalent", False),
+    ("merge-drop-conjunct", True), ("merge-targets", True), ("move-partition", True),
+    ("move-artifact", True), ("move-field", True), ("comparator-equivalent", False),
+    ("comparator-strengthen", False), ("comparator-weaken", True),
+    ("informational-rename-weaken", True), ("informational-restore", False),
+    ("delete", True), ("informational-only", True), ("new-target", False),
+])
+def test_acceptance_target_coverage_reshape_table(case_v2, reshape, hold):
+    from agenttalk import acceptance_history as history
+    case = case_v2
+    build = case["plan"]["rows"][0]
+    if reshape in {"comparator-strengthen", "comparator-weaken"}:
+        build.update(comparator="exact-failure-set" if reshape == "comparator-strengthen" else "exact-value",
+                     field="failures", expected=["synthetic-failure"])
+    if reshape in {"merge-equivalent", "merge-drop-conjunct"}:
+        case["plan"]["rows"].append(dict(build, id="duplicate", expected=0 if reshape == "merge-equivalent" else 1))
+    write_json(case["inputs"] / "plan.json", case["plan"])
+    assert open_attempt(case) == 0
+    attach_current_plan(case, "attempt")
+    publish_hold(case)
+    parent = "attempt"
+    if reshape.startswith("informational-") and reshape != "informational-only":
+        reduction = reduction_input(case)
+        assert successor(case, reduction=reduction) == 0
+        attach_current_plan(case, "next")
+        assert command(case, "publish", "--id", "next", "--from", "lead", "--verdict", "hold") == 3
+        parent = "next"
+    if reshape in {"rename", "rename-weaken", "informational-rename-weaken"}:
+        build.update(id="renamed", policy="gating", expected=1 if hold else 0)
+    elif reshape in {"split-equivalent", "split-strengthen"}:
+        case["plan"]["rows"].append(dict(build, id="extra", expected=1 if reshape == "split-strengthen" else 0))
+    elif reshape == "split-targets":
+        build["artifact"] = "split-one"
+        case["plan"]["rows"].append(dict(build, id="extra", artifact="split-two"))
+    elif reshape.startswith("merge-"):
+        case["plan"]["rows"] = [r for r in case["plan"]["rows"] if r["id"] != "duplicate"]
+        if reshape == "merge-targets":
+            case["plan"]["rows"][1]["policy"] = "informational"
+    elif reshape == "move-partition":
+        case["plan"]["rows"].append(dict(build, id="placeholder", artifact="placeholder", policy="informational"))
+        build["partition"] = "tools"
+    elif reshape == "move-artifact":
+        build["artifact"] = "different-artifact"
+    elif reshape == "move-field":
+        build.update(field="different_field", comparator="exact-value")
+    elif reshape.startswith("comparator-"):
+        build["comparator"] = "exact-failure-set" if reshape == "comparator-weaken" else "exact-value"
+    elif reshape == "informational-restore":
+        build["policy"] = "gating"
+    elif reshape == "delete":
+        case["plan"]["rows"] = [r for r in case["plan"]["rows"] if r["id"] != "build"]
+        case["plan"]["rows"].append(dict(build, id="placeholder", artifact="placeholder", policy="informational"))
+    elif reshape == "informational-only":
+        build["policy"] = "informational"
+    elif reshape == "new-target":
+        case["plan"]["rows"].append(dict(build, id="extra", artifact="extra"))
+    write_json(case["inputs"] / "plan.json", case["plan"])
+    assert successor(case, parent=parent, new_id="reshaped") == 0
+    record = close.load_close(case["store"], "reshaped")
+    result = {"holds": [], "outcomes": [{"id": r["id"], "policy": r["policy"], "passed": True}
+                                          for r in case["plan"]["rows"]]}
+    # The policy evaluator is independent of run/reproduction readiness; the real
+    # parent store and retained plans exercise its ancestry and approval inputs.
+    history.evaluate(case["store"], record, case["plan"], result)
+    codes = {code for code, _ in result["holds"]}
+    assert ("acceptance_category_moved_unreviewed" in codes) == hold
+    if not hold:
+        assert not codes
+
+
+def target_approval(case, parent_id, child_id):
+    from agenttalk import acceptance_history as history
+    parent = close.load_close(case["store"], parent_id)
+    changes = coverage.changes(coverage.history(case["store"], parent), case["plan"])
+    approval = {"rows": list(changes), "changes": changes, "reason": "reviewed coverage change",
+                "alternatives": ["restore all coverage"], "impact": "reduced protection", "owner": "owner",
+                "expires_at": "9999-01-01T00:00:00Z", "cause": "policy-amendment",
+                "evidence": [parent["acceptance_route"]["bundle_hash"]], "decision_ref": "pending"}
+    plan_hash = write_json(case["inputs"] / "plan.json", case["plan"])
+    message = case["store"].send(sender="operator", recipient="lead", kind="message",
+                                 body=json.dumps(history.approval_payload(parent, child_id, plan_hash, approval)),
+                                 _allow_reserved_sender=True)
+    approval["decision_ref"] = message.id
+    path = case["inputs"] / (child_id + "-approval.json")
+    write_json(path, approval)
+    return path
+
+
+def test_acceptance_approved_target_deletion_and_renamed_return_keep_ancestor_failure(case_v2):
+    case = case_v2
+    assert open_attempt(case) == 0
+    bundle_v2(case, build_exit=1)
+    assert attach(case) == 0
+    publish_hold(case)
+    original = deepcopy(case["plan"]["rows"][0])
+    case["plan"]["rows"][0].update(id="placeholder", artifact="placeholder", policy="informational")
+    approval = target_approval(case, "attempt", "deleted")
+    assert successor(case, new_id="deleted", reduction=approval) == 0
+    attach_current_plan(case, "deleted")
+    result = acceptance.resolve(case["store"], close.load_close(case["store"], "deleted"))
+    key = coverage.target_id(original)
+    assert result["coverage_changes"][key]["new"] == []
+    assert result["coverage_changes"][key]["approved"] is True
+    assert result["coverage_changes"][key]["sources"][0]["outcome"]["passed"] is False
+    assert result["report_label"] == "reduced scope"
+    assert "acceptance_category_moved_unreviewed" not in {c for c, _ in result["holds"]}
+    assert command(case, "publish", "--id", "deleted", "--from", "lead", "--verdict", "hold") == 3
+    case["plan"]["rows"][0] = dict(original, id="renamed", expected=1)
+    approval = target_approval(case, "deleted", "returned")
+    assert successor(case, parent="deleted", new_id="returned", reduction=approval) == 0
+    attach_current_plan(case, "returned")
+    result = acceptance.resolve(case["store"], close.load_close(case["store"], "returned"))
+    assert "acceptance_category_moved_unreviewed" not in {c for c, _ in result["holds"]}
+    assert "acceptance_record_missing" not in {c for c, _ in result["holds"]}
+    assert result["outcomes"][0]["passed"] is None
+    assert result["outcomes"][0]["original_outcome"]["passed"] is False
+
+
+def test_acceptance_target_history_depth_is_bounded_before_child_creation(case_v2, capsys):
+    assert open_attempt(case_v2) == 0
+    bundle_v2(case_v2)
+    assert attach(case_v2) == 0
+    publish_hold(case_v2)
+    record = close.load_close(case_v2["store"], "attempt")
+    # Isolate the retained-parent walk with real validated plans and digests;
+    # deeper amendment validation must not run before the depth refusal.
+    for _ in range(32):
+        digest = acceptance._retain(case_v2["store"], json.dumps(record).encode())
+        record["acceptance_route"].update(parent_record_hash=digest, amendment_hash=digest)
+    assert coverage.history(case_v2["store"], record)
+    excessive = json.loads(json.dumps(record))
+    digest = acceptance._retain(case_v2["store"], json.dumps(record).encode())
+    excessive["acceptance_route"].update(parent_record_hash=digest, amendment_hash=digest)
+    with pytest.raises(acceptance.AcceptanceError, match="ancestry exceeds"):
+        coverage.history(case_v2["store"], excessive)
+    write_json(close.close_path(case_v2["store"], "attempt"), record)
+    assert successor(case_v2) == 2
+    assert "ancestry exceeds" in capsys.readouterr().err
+    assert not close.close_path(case_v2["store"], "next").exists()
+
+
+def test_acceptance_strongest_target_coverage_survives_approved_weakening(case_v2):
+    case = case_v2
+    case["plan"]["rows"][0].update(comparator="exact-value", field="failures", expected=["a", "b"])
+    write_json(case["inputs"] / "plan.json", case["plan"])
+    assert open_attempt(case) == 0
+    attach_current_plan(case, "attempt")
+    publish_hold(case)
+    case["plan"]["rows"][0]["comparator"] = "exact-failure-set"
+    approval = target_approval(case, "attempt", "weaker")
+    assert successor(case, new_id="weaker", reduction=approval) == 0
+    attach_current_plan(case, "weaker")
+    assert command(case, "publish", "--id", "weaker", "--from", "lead", "--verdict", "hold") == 3
+    # Returning to the strongest historical predicate is free; merely renaming
+    # the approved weaker predicate still needs this attempt's exact approval.
+    parent = close.load_close(case["store"], "weaker")
+    protected = coverage.history(case["store"], parent)
+    assert coverage.changes(protected, case["plan"])
+    case["plan"]["rows"][0].update(id="restored", comparator="exact-value")
+    assert not coverage.changes(protected, case["plan"])
+
+
+def test_acceptance_duplicate_list_is_not_stronger_failure_set_coverage():
+    # The raw failure-set comparator rejects duplicate IDs, whereas exact-value
+    # accepts this exact list; implication must not silently ignore that rule.
+    candidate = {"kind": "exact-json", "expected": ["a", "a"]}
+    obligation = {"kind": "failure-set", "expected": ["a"]}
+    assert not coverage.implies(candidate, obligation)

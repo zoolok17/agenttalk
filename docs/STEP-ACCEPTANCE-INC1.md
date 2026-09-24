@@ -416,6 +416,135 @@ M4 reproducer acknowledgment, M5 fork visibility/reservation, M7 scope-renewal
 semantics and F9 publish lock duration remain mandatory 1c exit conditions before
 the unconditional cold hold can be lifted. No 1c implementation is included here.
 
+## 1b correction 3 — protected-target coverage (pre-implementation plan)
+
+Base: `6878381`. The following enumeration was recorded before changing code.
+Audience: implementers and cold reviewers. It supersedes row-ID policy identity.
+
+A protected target is `(partition, artifact, field)`. Comparator scope is the
+predicate over that field, not part of target identity: changing a comparator
+must not invent a fresh target. Row IDs are labels. All distinct ancestral gating
+predicates contribute obligations for the target; their conjunction is the
+strongest retained coverage. Incomparable predicates are retained, never ordered
+by numeric expected value. A candidate covers a target when its gating conjunction
+provably implies every ancestral predicate. Matching predicates are equivalent;
+adding constraints strengthens coverage. Typed exact-value and integer exit-code
+equality are equivalent for the same integer. Exact JSON string-list equality
+implies exact-failure-set equality for the same set; the reverse is weaker.
+Other comparator/value changes are incomparable and require approval.
+
+| Reshape | Expected outcome without a new operator approval |
+| --- | --- |
+| Rename / new ID, same target and predicate | No amendment hold. |
+| Rename / new ID, different equality value | `acceptance_category_moved_unreviewed` HOLD. |
+| Split into duplicate equivalent predicates on the same target | No amendment hold. |
+| Split by retaining the old predicate and adding a constraint | No amendment hold; measured contradictions still fail. |
+| Split by replacing a target with different targets | HOLD for lost original coverage. |
+| Merge equivalent predicates on one target | No amendment hold. |
+| Merge distinct targets, or drop a distinct conjunct | HOLD for uncovered obligation. |
+| Move partition, artifact or field | HOLD for lost original target, even if the new target passes. |
+| Comparator change with proven equivalence | No amendment hold. |
+| Comparator change to a provably narrower predicate | No amendment hold. |
+| Comparator change to a wider/incomparable predicate | HOLD. |
+| Informational hop, then rename and weaken | HOLD against ancestral target coverage. |
+| Informational hop, then restore identical coverage | No amendment hold. |
+| Delete target / leave only informational coverage | HOLD; exact operator approval may authorize the omission. |
+| Introduce a genuinely new target | No amendment hold; normal execution and independence checks still apply. |
+
+Approval binds the exact target obligations and new gating coverage, predecessor,
+successor and plan hash using the existing reserved-operator message mechanism.
+Absent coverage remains visible as a target-level audit entry with original
+outcomes sourced from the ancestors that carried its gating predicates. Depth
+checks must reject an over-limit successor before creating its close ID and must
+raise explicitly on walk exhaustion. Table-driven tests will pin the amendment
+code for coverage loss and permit identical/strengthened coverage.
+
+### Implemented contract and decisions
+
+`acceptance_coverage` owns the common target grouping, conservative implication,
+retained-history walk and coverage diff used by successor creation and evaluation.
+There is no row-ID fallback. The walk retains the conjunction of all historical
+gating predicates, removing only predicates implied by another retained predicate.
+The proof deliberately recognizes only equality and the exact-list to failure-set
+implication described above; the list must satisfy the failure-set comparator's
+size, string and uniqueness constraints. A numerically larger equality value is
+not stronger. Unproven implications require approval. Contradictory predicates
+remain obligations; the ordinary artifact comparisons prevent them producing GO.
+
+Amendment schema **3** retains the field name `assertion_changes`, but its keys are
+`target-<SHA256>` identifiers derived from canonical `(partition, artifact, field)`
+objects. Each value contains `target`, `old` and `new` predicate lists; an empty
+`new` list means removal of gating coverage. Approval `rows` now names exactly
+these target identifiers, and `changes` must equal that complete diff. Both
+scope reductions and policy amendments supply `changes`. Existing operator
+origin, typed payload, predecessor/successor/plan binding, evidence and expiry
+checks remain mandatory. A tool/variance reduction authorizes only missing
+coverage; replacement predicates require cause `policy-amendment`.
+
+This supersedes correction 2's tightening/reversion friction: equivalent or
+provably stronger coverage, including restoration of the strongest historical
+predicate, needs no new approval. Conversely, approval does not erase historical
+obligations. **Each successor that still weakens coverage needs its own exact
+approval**, even if its parent had approval. This is the conservative renewal
+choice implied by comparing every candidate to strongest retained coverage;
+it replaces inherited approval reuse. Expired approvals still re-hold ancestry.
+M7's product decision remains visible for the lead's 1c review; changing this
+renewal rule requires an explicit alternative with tests before GO is enabled.
+
+Snapshots add `coverage_changes`, including missing targets with no current row,
+approval status, report label and ancestor source projections. Each source names
+its close/attempt/plan/row and original comparison outcome; full evidence remains
+in the retained close. No nested final snapshot is copied. Current rows are
+matched by target, so renamed rows cannot claim that the original assertion
+passed. Failed amended comparisons still contribute a direct row hold before
+their `passed` value becomes null. Original failure selection searches the
+retained gating ancestors rather than indexing the immediate parent's rows.
+
+History supports at most 32 parent links. Successor creation reserves one link
+for the child and rejects overflow before close creation. Exhaustion raises
+explicitly, with no implicit `None` or immediate-parent fallback.
+
+Previously written schema-1/2 amendments are read and their coverage recomputed;
+old row-based approvals do not authorize the new target diff and therefore HOLD.
+No automatic migration or re-signing is performed. Older branch engines reject
+schema-3 amendments; installed ordinary-close engines retain the schema-2 close
+guard. The unconditional cold hold is unchanged in this correction.
+
+### Reader inventory and finding dispositions
+
+Earlier sections are chronological records; this section supersedes their
+row-ID comparison, row-based approval and inherited-renewal contracts.
+
+| Changed surface / finding | Readers and disposition | Regression |
+| --- | --- | --- |
+| B1: protected target and predicate comparison | `successor` and history `evaluate` now share `coverage.history/changes`; removed `latest_gating_rows/assertion_changes` helpers have no remaining code callers. FIXED structurally, including removal and comparator moves. | `target_coverage_reshape_table`, 19 cases matching the enumeration above. |
+| Strongest historical coverage | Retained route/plan readers `_policy`, `_retained`, `decode` feed the walk. Approval never replaces older obligations. | `strongest_target_coverage_survives_approved_weakening`; `duplicate_list_is_not_stronger_failure_set_coverage`. |
+| B2 and depth off-by-one | `successor` refuses over-limit children before `create_close`; recursive history `evaluate` and coverage walk use the same 32-link bound. FIXED now. | `target_history_depth_is_bounded_before_child_creation`. |
+| Missing immediate-parent original outcome | History evaluation reads ancestor source projections and publishes target-level audit entries, including deleted targets. FIXED now. | `approved_target_deletion_and_renamed_return_keep_ancestor_failure`. |
+| Amendment schema 3 / approval `rows` and `changes` | `_reduction`, `_approval`, `approval_payload`, `successor`, history `evaluate`; CLI successor and reopen forward the file unchanged. Test approval producers now emit exact target diffs. Prior row approvals fail closed; other engines reject schema 3. | Existing exact-operator tamper/expiry/origin tests, target deletion/re-entry and table cases. |
+| `final.acceptance_snapshot.coverage_changes` and outcome annotations | `acceptance.resolve/evaluate`, CLI check/publish/show/list and `record_publish` carry the snapshot. `attention._published_close_holds`, barrier readers and ordinary close consumers use outer verdict/revision fields; no change to those fields or callers. History reads compact ancestor outcome fields only. | Existing close/signoff/gate regressions plus target audit regression. Attention suites were not rerun in this round. |
+| A2 redundant Nc guard | Old row-specific combined-reduction branch removed in the structural rewrite. No standalone mutation claim for the retired branch. | Unified target approval shape and scope-only-removal check replace it. |
+| Renewal and expiry | Conservative per-attempt target approval, as described above; no expiry relaxation. M4 reproducer attestation, M5 fork handling and F9 publish lock remain 1c exit criteria. | Informational-hop fixtures renew approval; unchanged weakened descendant without renewal HOLDs. |
+
+No CLI flag, route, ack-binding or accepted design-note byte changed. The README
+links this staged contract; CHANGELOG describes target-based amendments.
+
+### Correction 3 evidence
+
+Foreground commands used `PYTHONPATH=<CLONE>/src`, `PYTHONDONTWRITEBYTECODE=1`
+and isolated task scratch, with `-p no:cacheprovider` throughout.
+
+- Required red: `python -m pytest tests/test_acceptance.py -q -k target_coverage_reshape_table --basetemp <SCRATCH>/pytest-1b-round3-red -p no:cacheprovider`: **10 failed, 9 passed, 148 deselected**. This was before production changes.
+- Initial focused post-fix run: table plus policy-amendment, re-gating and expiry selections: **35 passed, 2 failed, 130 deselected**. The 19-case table passed; two informational-hop fixtures needed explicit per-attempt renewal and were corrected without relaxing the coverage rule.
+- Final bar: `python -m pytest tests/test_acceptance.py tests/test_close.py tests/test_close_signoffs.py tests/test_gates.py -q --basetemp <SCRATCH>/pytest-1b-round3-final -p no:cacheprovider`: **505 passed, 1 skipped** in 295.60 seconds. The skip remains host-restricted symlink creation.
+- The depth test was subsequently reordered to check explicit overflow refusal before CLI creation. Its focused rerun: **1 passed, 170 deselected**. Production code did not change after the full bar.
+- Six isolated source mutations were caught: discard ancestry, ignore missing targets, accept arbitrary implications, return `None` on depth exhaustion, discard stronger ancestral predicates and accept duplicate-list implication. Five initially failed their named assertion; depth initially failed through an unexpected exception. After the test reorder, the depth mutant fails specifically with **DID NOT RAISE AcceptanceError** (**1 failed, 170 deselected**). No invalid collection or setup run is counted as a kill.
+- Targeted Ruff on `acceptance_coverage.py`, `acceptance_history.py` and `test_acceptance.py` passed. Whitespace, five-file scope, branch and unchanged accepted design checks passed. The privacy sweep detected **8/8 positive controls and zero added-content matches**, including the new coverage module.
+
+Scratch is retained in the private task directory for delta review: red/green
+stores, `round3-mutants-6dc66cb3` source copies/logs and verification helpers.
+No reviewer workspace or unrelated untracked files were changed.
+
 ## 1c — awaiting lead acknowledgment and cold verdict
 
 Not started. Record final independence, publish parity and the complete integration fixture here after 1b is accepted.
