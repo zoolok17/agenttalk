@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Docs
+
+- **The 0.91.0 -> 0.91.1 gateway upgrade path gained three steps found in
+  the field (Windows host).** `docs/STEP-ENVELOPE-SERVICE-READERS.md`'s
+  "Upgrade path" now says: (1) run `gateway stop` with the runtime that
+  registered the task, because a stop from a different interpreter refuses
+  with "refusing to stop a foreign or mismatched gateway task"; (2) if the
+  interpreter path changes, unregister the old scheduled task (Linux: the
+  `systemd --user` unit) before `gateway task-install`, which otherwise
+  refuses the still-registered task, and the earlier claim that
+  `task-install` simply rewrites `task-identity.json` holds only when the
+  interpreter is unchanged; (3) a slow first `gateway start` can exit
+  non-zero while the gateway still comes up, so read `gateway status`
+  before retrying, since a second `start` fails with "gateway port
+  127.0.0.1:4000 is already occupied". It also states that after a re-init
+  `worker_spend_ready` stays false with `dashboard_canary_absent` until a
+  dashboard canary is accepted, and wrapped seats refuse to start until
+  then. The 0.91.1 Upgrade bullet below is superseded in these respects by
+  that section.
+
 ## [0.91.1] - 2026-09-24
 
 Theme: **the gateway's service layer now binds its manifest, task

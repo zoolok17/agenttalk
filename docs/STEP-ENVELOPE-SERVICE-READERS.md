@@ -106,7 +106,11 @@ There is no in-code migration and no command that rewrites the stored hashes in 
 on 0.91.0 with a non-default `--cutoff-eur` / `--soft-stop-eur` / `--ceiling-eur` is upgraded to 0.91.1
 by re-initialising it:
 
-1. Stop the gateway (`gateway stop`) and confirm both loopback ports are free.
+1. Stop the gateway (`gateway stop`) and confirm both loopback ports are free. Run the stop with the
+   runtime (Python interpreter) that registered the task, i.e. the OLD one. The registered task or unit
+   names that interpreter, and `stop` matches the registration against the interpreter it is running
+   under, so `gateway stop` from a different (new) runtime refuses with "refusing to stop a foreign or
+   mismatched gateway task".
 2. Copy the ledger to a backup and verify the copy (size and hash). Then MOVE, not copy, the originals
    aside: the ledger database `ledger.sqlite3` and its install marker `install.json` (both in the
    `agenttalk-ovh-spend` directory under the user's local application-data directory; move any
@@ -116,12 +120,32 @@ by re-initialising it:
    touch it. `gateway init` refuses while the ledger database or its marker exists (the ledger must be
    fully absent, not just backed up), or while the config, manifest or either token file exists, so
    copying alone is not enough. Keep the moved files rather than deleting them. `task-identity.json`
-   needs no move: `task-install` over the still-registered task rewrites it with the new hash.
-3. `gateway init` with the current OVH dashboard figure as the opening balance and the envelope wanted.
-4. `gateway cap-install`, `gateway task-install`, `gateway start`.
-5. Run the dashboard canary (`gateway canary-verify`) and check `gateway status`: `ready` and
-   `worker_spend_ready` true, and the `price_policy_hash` printed by `init` equal to the one in `status`,
-   the manifest and `task-identity.json`.
+   needs no move.
+3. If the runtime that will run the gateway is a different interpreter from the one that registered the
+   task (a new virtual environment or Python path), unregister the old task now. `task-install` accepts
+   an already-registered task only when its action (interpreter, arguments, working directory and
+   principal) is what the current interpreter would register (on Linux the unit must be identical to the
+   one it would render), so a task naming the old interpreter is refused with "refusing to replace a
+   foreign or mismatched gateway task" (Linux: "... gateway unit"). The task name is the `task_name` shown by
+   `gateway status`. On Windows, unregister the scheduled task by that name
+   (`Unregister-ScheduledTask -TaskName <task_name> -Confirm:$false`). On Linux, run
+   `systemctl --user disable <task_name>.service`, delete the unit file
+   `~/.config/systemd/user/<task_name>.service`, and run `systemctl --user daemon-reload`. If the
+   interpreter path is unchanged, skip this step: `task-install` then accepts the registered task and
+   rewrites `task-identity.json` with the new hash.
+4. `gateway init` with the current OVH dashboard figure as the opening balance and the envelope wanted.
+5. `gateway cap-install`, `gateway task-install`, `gateway start`.
+   `gateway start` waits about 30 seconds for readiness, and a cold first start can take longer (the
+   first LiteLLM import is slow). A non-zero exit from the first `start` therefore does not mean the
+   gateway failed to start: it may still come up. Do not rerun `start` straight away. A second `start`
+   probes the loopback ports before it does anything, and fails with "gateway port 127.0.0.1:4000 is
+   already occupied" if the first gateway is up (or coming up) on them. Wait, read `gateway status`,
+   and retry `start` only if the gateway is not running.
+6. Run the dashboard canary (`gateway canary-verify`) and check `gateway status`. After a re-init a
+   fresh ledger has no canary, so `worker_spend_ready` stays false with `dashboard_canary_absent` in
+   `worker_spend_errors` until a canary is run and accepted. Wrapped seats refuse to start until then.
+   Once it is accepted, expect `ready` and `worker_spend_ready` true, and the `price_policy_hash`
+   printed by `init` equal to the one in `status`, the manifest and `task-identity.json`.
 
 Consequence to expect: this starts a new ledger, so spend history stays only in the backup. The ledger,
 the secret directory and the tokens resolve from per-user default paths, so they belong to the host, not
