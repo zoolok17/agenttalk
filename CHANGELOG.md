@@ -32,11 +32,12 @@ not the ledger's. The 0.91.0 enumeration of readers had covered
 - **Fixed: the service layer hashed the default envelope at ten sites.**
   `ovh_gateway_service.py` called `price_policy_hash()` /
   `child_cap_policy_hash()` with no arguments. Every site now reads the
-  ledger's own verified hashes through a new `SpendLedger.policy_hashes()`
-  (the value `gateway init` prints and `status` reports): the init
-  manifest, the task identity, manifest validation (including the
-  reconfigure pre-write check and the rebind snapshot and reload), the
-  runtime marker's expected and written values, and `gateway status`. A
+  ledger's own verified hashes (the value `gateway init` prints), through
+  a new `SpendLedger.policy_hashes()` or, where the ledger status is
+  already in hand, `status()`: the init manifest, the task identity,
+  manifest validation (including the reconfigure pre-write check and the
+  rebind snapshot and reload), the runtime marker's expected and written
+  values, and `gateway status`. A
   manifest or task identity written under one envelope now fails its check
   against a ledger with another. `install_task`, `load_install_manifest`,
   `reconfigure_endpoint` and `rebind_runtime` take an optional `ledger=`
@@ -55,12 +56,18 @@ not the ledger's. The 0.91.0 enumeration of readers had covered
 - **An install made on 0.91.0 at a non-default envelope must be
   re-initialised.** Its `install-manifest.json` and `task-identity.json`
   hold the default-envelope hash, so on 0.91.1 `gateway status` reports
-  `install_manifest_invalid` (and `runtime_marker_invalid` until the
-  service restarts). There is no in-code migration: stop the gateway, back
-  up the ledger and move the old gateway state aside, then `gateway init`,
-  `cap-install`, `task-install`, `start` and the dashboard canary, as set
-  out in `docs/STEP-ENVELOPE-SERVICE-READERS.md`. This starts a new
-  ledger; spend history stays in the backup. An install at the default
+  `install_manifest_invalid` and `task_identity_invalid`, plus
+  `runtime_marker_missing` (a consequence, not a second fault: the runtime
+  marker is not compared while the manifest is invalid). There is no
+  in-code migration: stop the gateway, copy the ledger to a backup and
+  verify the copy, then MOVE the ledger database (`ledger.sqlite3`) and
+  its install marker (`install.json`) out of the spend directory, along
+  with the old gateway config and manifest and the two gateway token
+  files, because `gateway init` refuses while any of them exists. Then
+  `gateway init`, `cap-install`, `task-install`, `start` and the dashboard
+  canary, as set out in `docs/STEP-ENVELOPE-SERVICE-READERS.md`. This
+  starts a new ledger; spend history stays in the backup. The ledger and
+  tokens are per host, not per project. An install at the default
   envelope needs nothing: its hashes were already the ledger's.
 
 ## [0.91.0] - 2026-09-23
