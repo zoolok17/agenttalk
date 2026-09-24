@@ -651,11 +651,11 @@ def successor(case, *, parent="attempt", new_id="next", reduction=None):
     return command(case, *args)
 
 
-def complete_child(case, child="next"):
+def complete_child(case, child="next", *, build_exit=None):
     # Existing fixture helpers name 'attempt'; redirect only the synthetic input
     # builder's close lookup and CLI ID, leaving persisted identities untouched.
     parent = close.load_close(case["store"], child)
-    data = bundle_v2(case, build_exit=case["plan"]["rows"][0]["expected"])
+    data = bundle_v2(case, build_exit=case["plan"]["rows"][0]["expected"] if build_exit is None else build_exit)
     data.update(close_id=child, **{k: parent["acceptance_route"][k] for k in
                                 ("instance_id", "attempt_id", "project_id", "revision", "plan_hash", "registry_hash")})
     write_json(case["inputs"] / "bundle.json", data)
@@ -1077,7 +1077,10 @@ def test_acceptance_gating_amendment_requires_operator_at_any_revision(case_v2, 
 
 
 @pytest.mark.parametrize("sender,tamper", [("operator", None), ("lead", None), ("operator", "old"),
-                                         ("operator", "new"), ("operator", "expired")])
+                                         ("operator", "new"), ("operator", "expired"),
+                                         ("operator", "boolean-body"), ("operator", "float-body"),
+                                         ("operator", "child-failure"), ("operator", "descendant-failure"),
+                                         ("operator", "rows"), ("operator", "retained-diff")])
 def test_acceptance_exact_operator_policy_amendment_preserves_failure(case_v2, sender, tamper):
     from agenttalk import acceptance_history as history
     case = case_v2
@@ -1099,23 +1102,45 @@ def test_acceptance_exact_operator_policy_amendment_preserves_failure(case_v2, s
               "decision_ref": "pending", "changes": deepcopy(history.assertion_changes(old_plan, case["plan"]))}
     if tamper in {"old", "new"}:
         change["changes"]["build"][tamper]["expected"] = 9
+    if tamper == "rows":
+        change["rows"] = ["tool"]
+    body = deepcopy(history.approval_payload(parent, "next", plan_hash, change))
+    if tamper in {"boolean-body", "float-body"}:
+        body["reduction"]["changes"]["build"]["new"]["expected"] = True if tamper == "boolean-body" else 1.0
     message = case["store"].send(sender=sender, recipient="lead", kind="message",
-                                 body=json.dumps(history.approval_payload(parent, "next", plan_hash, change)),
+                                 body=json.dumps(body),
                                  _allow_reserved_sender=sender == "operator")
     change["decision_ref"] = message.id
     path = case["inputs"] / "amendment.json"
     write_json(path, change)
     rc = successor(case, reduction=path)
-    if sender != "operator" or tamper == "expired":
+    if sender != "operator" or tamper in {"expired", "boolean-body", "float-body"}:
         assert rc == 2
         return
     assert rc == 0
-    result = complete_child(case)
+    if tamper == "retained-diff":
+        with close.close_transaction(case["store"], "next") as tx:
+            route = tx.record["acceptance_route"]
+            amendment = acceptance.decode(acceptance._retained(case["store"], route["amendment_hash"]))
+            amendment["assertion_changes"] = {}
+            route["amendment_hash"] = acceptance._retain(case["store"], json.dumps(amendment).encode())
+            tx.commit()
+    result = complete_child(case, build_exit=9 if tamper == "child-failure" else 1)
+    if tamper == "retained-diff":
+        assert "acceptance_category_moved_unreviewed" in {code for code, _ in result["holds"]}
+        return
+    if tamper == "descendant-failure":
+        assert command(case, "publish", "--id", "next", "--from", "lead", "--verdict", "hold") == 3
+        assert successor(case, parent="next", new_id="third") == 0
+        result = complete_child(case, "third", build_exit=9)
     codes = {code for code, _ in result["holds"]}
-    assert ("acceptance_category_moved_unreviewed" in codes) == (tamper is not None)
+    assert ("acceptance_category_moved_unreviewed" in codes) == (tamper in {"old", "new", "rows"})
     assert result["report_label"] == "policy amended"
     assert result["outcomes"][0]["passed"] is None
-    assert result["outcomes"][0]["comparison_passed"] is True
+    failing = tamper in {"child-failure", "descendant-failure"}
+    assert result["outcomes"][0]["comparison_passed"] is not failing
+    if failing:
+        assert "acceptance_row_failed" in codes
     assert result["outcomes"][0]["original_outcome"]["passed"] is False
     # Expiry remains an evaluation requirement after the approval was retained.
     if tamper is None:
@@ -1260,3 +1285,80 @@ def test_acceptance_ancestry_depth_cap_holds(case_v2):
     history.evaluate(case_v2["store"], child, case_v2["plan"], {"holds": [], "outcomes": []}, depth=31)
     with pytest.raises(acceptance.AcceptanceError, match="ancestry exceeds"):
         history.evaluate(case_v2["store"], child, case_v2["plan"], {"holds": [], "outcomes": []}, depth=32)
+
+
+@pytest.mark.parametrize("expected,approved", [(0, False), (1, False), (1, True)])
+@pytest.mark.parametrize("informational_hop", [False, True])
+def test_acceptance_regating_compares_last_gating_ancestor(case_v2, expected, approved, informational_hop):
+    case = case_v2
+    original_row = deepcopy(case["plan"]["rows"][0])
+    assert open_attempt(case) == 0
+    bundle_v2(case, build_exit=1)
+    assert attach(case) == 0
+    publish_hold(case)
+    reduction = reduction_input(case)
+    assert successor(case, reduction=reduction) == 0
+    complete_child(case)
+    assert command(case, "publish", "--id", "next", "--from", "lead", "--verdict", "hold") == 3
+    parent = "next"
+    if informational_hop:
+        # Informational rows may evolve; the immediate parent is not the baseline.
+        case["plan"]["rows"][0]["expected"] = 1
+        write_json(case["inputs"] / "plan.json", case["plan"])
+        (case["project"] / "source.txt").write_text("informational revision", encoding="utf-8")
+        git(case["project"], "commit", "-qam", "synthetic informational change")
+        case["sha"] = git(case["project"], "rev-parse", "HEAD")
+        assert successor(case, parent=parent, new_id="info") == 0
+        complete_child(case, "info")
+        assert command(case, "publish", "--id", "info", "--from", "lead", "--verdict", "hold") == 3
+        parent = "info"
+    case["plan"]["rows"][0].update(policy="gating", expected=expected)
+    plan_hash = write_json(case["inputs"] / "plan.json", case["plan"])
+    (case["project"] / "source.txt").write_text("regated revision", encoding="utf-8")
+    git(case["project"], "commit", "-qam", "synthetic regate")
+    case["sha"] = git(case["project"], "rev-parse", "HEAD")
+    approval_file = None
+    if approved:
+        from agenttalk import acceptance_history as history
+        parent_record = close.load_close(case["store"], parent)
+        change = {"rows": ["build"], "reason": "reviewed regating policy", "alternatives": ["restore baseline"],
+                  "impact": "amended assertion", "owner": "owner", "expires_at": "9999-01-01T00:00:00Z",
+                  "cause": "policy-amendment", "evidence": [parent_record["acceptance_route"]["bundle_hash"]],
+                  "decision_ref": "pending",
+                  "changes": {"build": {"old": original_row, "new": deepcopy(case["plan"]["rows"][0])}}}
+        message = case["store"].send(sender="operator", recipient="lead", kind="message",
+                                     body=json.dumps(
+                                         history.approval_payload(parent_record, "regated", plan_hash, change)),
+                                     _allow_reserved_sender=True)
+        change["decision_ref"] = message.id
+        approval_file = case["inputs"] / "regating-approval.json"
+        write_json(approval_file, change)
+    assert successor(case, parent=parent, new_id="regated", reduction=approval_file) == 0
+    complete_child(case, "regated")
+    accept_all(case, "regated")
+    result = acceptance.resolve(case["store"], close.load_close(case["store"], "regated"))
+    codes = {code for code, _ in result["holds"]}
+    if expected == 1:
+        assert ("acceptance_category_moved_unreviewed" in codes) is not approved
+        assert result["outcomes"][0]["passed"] is None
+        assert result["outcomes"][0]["original_outcome"]["passed"] is False
+    else:
+        assert "acceptance_category_moved_unreviewed" not in codes
+        assert "acceptance_plan_stale" not in codes
+        assert result["outcomes"][0]["passed"] is True
+
+
+def test_acceptance_never_gating_row_can_enter_without_amendment(case_v2):
+    case_v2["plan"]["rows"][0]["policy"] = "informational"
+    write_json(case_v2["inputs"] / "plan.json", case_v2["plan"])
+    assert open_attempt(case_v2) == 0
+    bundle_v2(case_v2, build_exit=1)
+    assert attach(case_v2) == 0
+    publish_hold(case_v2)
+    case_v2["plan"]["rows"][0].update(policy="gating", expected=1)
+    write_json(case_v2["inputs"] / "plan.json", case_v2["plan"])
+    assert successor(case_v2) == 0
+    result = complete_child(case_v2)
+    assert "acceptance_category_moved_unreviewed" not in {code for code, _ in result["holds"]}
+    assert "acceptance_plan_stale" not in {code for code, _ in result["holds"]}
+    assert result["outcomes"][0]["passed"] is True

@@ -347,6 +347,75 @@ fixtures, failing-first stores and seven mutant logs/copies support the delta
 read. No reviewer workspace was modified. No broad-suite or production-GO claim;
 the final cold hold, M4/M5/M7 decisions and F9 remain for 1c.
 
+## 1b correction 2 — gating history across informational attempts
+
+Base: `fcaff36`; A1 is fixed before 1c. Audience: implementers and delta reviewers.
+For every row gating in the new plan, successor creation and evaluation now find
+the most recent gating definition in retained ancestry. Informational definitions
+never replace that baseline, even if they change the assertion or span multiple
+attempts. The existing 32-link ancestry bound and retained-byte verification apply
+to this lookup. No live parent edit or new mutable index is introduced.
+
+The exact operator-approved diff uses that gating definition as `old`, and the
+new row as `new`. Missing approval still produces the direct
+`acceptance_category_moved_unreviewed` hold independently of cold review. The
+original failed outcome is retained through informational attempts. Restoring the
+identical gating assertion needs no policy amendment; a row that has never gated
+can enter gating without this amendment requirement. A change to a prior gating
+assertion needs approval even if it tightens policy or reverts an approved
+weakening. Same-SHA checks no longer mistake informational-only evolution for a
+gating assertion change; re-entering gating still checks retained history.
+
+Amendment schema and approval fields remain unchanged. Previously written diffs
+that omit a re-gating change fail recomputation with the same direct amendment
+hold. This correction does not lift the cold hold or relax approval expiry.
+Policy-amendment approvals continue to expire and re-hold descendants when
+rechecked; that conservative contract is retained explicitly. Permanent policy
+approval semantics would require a lead decision and tests before changing it.
+
+### Reader inventory and dispositions
+
+| Surface / finding | Disposition and existing reader assumptions | Test / evidence |
+| --- | --- | --- |
+| A1 / computed `assertion_changes` | FIXED. `successor` writes and history `evaluate` recomputes the same ancestor-aware map. `assertion_changes` accepts an optional gating map; existing direct callers default to the immediate plan. Operator payload producers must supply the most recent gating row. CLI successor/reopen still pass the same file; `_approval` binds the entire exact diff. Older engines either compute a different diff and HOLD, or retain their unconditional cold hold. | `regating_compares_last_gating_ancestor`: direct and extra informational hop; changed unapproved HOLD, identical restoration, exact ancestor-bound approval. |
+| Never-gating row / same-SHA movement | FIXED distinction. History evaluation limits the same-SHA assertion guard to prior gating rows; `acceptance.evaluate` and CLI still consume direct holds. | `never_gating_row_can_enter_without_amendment` |
+| A2 Nl / Nk | Added regressions for failed approved amended rows and unchanged descendants. These holds must remain because history marks outcomes `passed:null`. | `exact_operator_policy_amendment_preserves_failure[operator-child-failure]` and `[operator-descendant-failure]` |
+| A2 Nh | Added typed-body approval cases; `true` and `1.0` cannot substitute for integer `1` despite Python equality. | Same test, `[operator-boolean-body]` and `[operator-float-body]` |
+| A2 Ni / Nb | Added retained-diff corruption and mismatched approved row-set cases. | Same test, `[operator-retained-diff]` and `[operator-rows]` |
+| A2 Nc redundant combined-reduction guard | Retained; isolated mutation coverage deferred. The independent scope-reduction assertion-preservation check also rejects this combination. No GO or unique protection attributed to this redundant branch. | Existing reduction preservation tests; no mutation kill claimed for Nc. |
+| Approval cause diagnostic | FIXED to name all three allowed causes, including policy-amendment. Strict shape errors still use the object validator. | Targeted lint and source inspection. |
+| Tightening / reversion friction | DOCUMENTED: any changed gating assertion needs approval, in either direction. | Existing same-SHA and changed-assertion tests. |
+| Policy amendment expiry | RETAIN conservative current behavior; permanent approval is a product decision. | Existing exact-operator amendment expiry check and ancestral approval validation. |
+
+`latest_gating_rows` reads existing route parent hashes and retained plan rows;
+it creates no record fields. `_policy` validates those reads. Existing final,
+attention, barrier, ack and CLI output readers are unchanged. Original-outcome
+projection unwraps an informational predecessor's preserved outcome; consumers
+remain history `evaluate`, pure acceptance `evaluate`, and CLI final storage/show.
+
+### Correction 2 evidence
+
+Failing-first A1 run: **2 failed, 2 passed, 135 deselected**. Both changed re-gating
+paths lacked `acceptance_category_moved_unreviewed`; both identical restorations
+passed. Focused post-fix run: **13 passed, 130 deselected**.
+
+All commands used foreground execution, `PYTHONPATH=<CLONE>/src`,
+`PYTHONDONTWRITEBYTECODE=1` and isolated task scratch.
+
+- Red: `python -m pytest tests/test_acceptance.py -q -k regating_compares_last --basetemp <SCRATCH>/pytest-1b-round2-red -p no:cacheprovider` (counts above).
+- Focus: same module with `-k "regating_compares_last or exact_operator_policy"`, fresh `pytest-1b-round2-focus` basetemp (counts above).
+- Final: `python -m pytest tests/test_acceptance.py tests/test_close.py tests/test_close_signoffs.py tests/test_gates.py -q --basetemp <SCRATCH>/pytest-1b-round2-final -p no:cacheprovider`: **482 passed, 1 skipped** in 249.01 seconds. The skip remains host-restricted symlink creation.
+- Isolated source copies: A1 (discard ancestry at both diff call sites), Nl, Nk, Nh, Ni and Nb each produced **one failing named regression**, all six **KILLED**. Nc is explicitly excluded from this claim. Copies and logs are retained under `round2-mutants-918d5452`; repository source was not mutated.
+- Targeted Ruff on `acceptance_history.py` and `test_acceptance.py`, whitespace, four-file scope and unchanged accepted design checks passed. Privacy sweep detected **8/8 positive controls, zero added-content matches** before push.
+
+Scratch is retained in the private `acceptance-inc1a` task directory: `round2`
+fixtures, red/green stores, mutation sources/logs and the verification scripts for
+delta review. No reviewer workspace or unrelated untracked files were changed.
+
+M4 reproducer acknowledgment, M5 fork visibility/reservation, M7 scope-renewal
+semantics and F9 publish lock duration remain mandatory 1c exit conditions before
+the unconditional cold hold can be lifted. No 1c implementation is included here.
+
 ## 1c — awaiting lead acknowledgment and cold verdict
 
 Not started. Record final independence, publish parity and the complete integration fixture here after 1b is accepted.

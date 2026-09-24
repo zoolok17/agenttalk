@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Acceptance re-gating compares a row against its most recent retained gating
+  definition, even across informational edits. Changed assertions require exact
+  operator approval; identical restoration and first-time gating do not.
+
 - Acceptance 1b corrections require exact operator approval for gating assertion
   amendments at any revision and retain the original failure as a policy change.
   Successors cannot shrink author/runner exclusions; partition accepts bind the

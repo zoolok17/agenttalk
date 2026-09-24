@@ -35,7 +35,7 @@ def _reduction(value):
         A._text(value[key], key)
     A._id(value["decision_ref"])
     if value["cause"] not in {"unavailable-tool", "measured-variance", "policy-amendment"}:
-        A._fail("scope reduction requires unavailable tool or measured variance",
+        A._fail("unsupported approval cause: expected unavailable-tool, measured-variance or policy-amendment",
                 "acceptance_scope_reduction_unapproved")
     try:
         expiry = datetime.fromisoformat(value["expires_at"].replace("Z", "+00:00"))
@@ -72,11 +72,31 @@ def _approval(store, data, parent, successor_id, plan_hash, reduction):
         A._retained(store, digest)
 
 
-def assertion_changes(old_plan, plan):
-    """Bind the full old/new gating assertion, including partition and identity."""
+def latest_gating_rows(store, record):
+    """Find the nearest retained gating definition, skipping informational edits."""
+    rows = {}
+    for depth in range(33):
+        route, plan = A._policy(store, record)
+        for row in plan["rows"]:
+            if row["policy"] == "gating":
+                rows.setdefault(row["id"], row)
+        digest = route.get("parent_record_hash")
+        if digest is None:
+            return rows
+        if depth == 32:
+            A._fail("acceptance ancestry exceeds supported depth")
+        record = A.decode(A._retained(store, digest))
+
+
+def assertion_changes(old_plan, plan, *, gating_rows=None):
+    """Bind changed assertions to their most recent gating definitions."""
     new_rows = {row["id"]: row for row in plan["rows"]}
+    immediate_gating = {row["id"] for row in old_plan["rows"] if row["policy"] == "gating"}
+    if gating_rows is None:
+        gating_rows = {row["id"]: row for row in old_plan["rows"] if row["policy"] == "gating"}
     return {row["id"]: {"old": row, "new": new_rows[row["id"]]}
-            for row in old_plan["rows"] if row["policy"] == "gating" and row["id"] in new_rows
+            for row in gating_rows.values() if row["id"] in new_rows
+            and (new_rows[row["id"]]["policy"] == "gating" or row["id"] in immediate_gating)
             and _bytes(dict(new_rows[row["id"]], policy="gating")) != _bytes(row)}
 
 
@@ -119,7 +139,8 @@ def successor(store, *, parent_id, close_id, plan_file, project_repo, revision, 
                      "by": by, "at": at, "reason": reason, "cause": cause,
                      "observed_before": prepared["parent_record_hash"], "reduction": reduction,
                      "approval_hash": approval_hash,
-                     "assertion_changes": assertion_changes(old_plan, prepared["plan"])}
+                     "assertion_changes": assertion_changes(old_plan, prepared["plan"],
+                                                            gating_rows=latest_gating_rows(store, parent))}
         prepared["amendment_hash"] = A._retain(store, _bytes(amendment))
         record = deepcopy(parent)
         record.update(close_id=close_id, instance_id=None, generation=0, status=close.OPEN,
@@ -209,7 +230,7 @@ def evaluate(store, record, plan, snapshot, *, depth=0):
     reduced = {key for key, old in old_rows.items() if old["policy"] == "gating"
                and (key not in new_rows or new_rows[key]["policy"] != "gating")}
     reduction = amendment["reduction"]
-    changes = assertion_changes(old_plan, plan)
+    changes = assertion_changes(old_plan, plan, gating_rows=latest_gating_rows(store, parent))
     if version == 2 and _bytes(amendment["assertion_changes"]) != _bytes(changes):
         A._fail("retained assertion diff differs from plans", "acceptance_category_moved_unreviewed")
     policy_approval = reduction is not None and reduction.get("cause") == "policy-amendment"
@@ -231,7 +252,8 @@ def evaluate(store, record, plan, snapshot, *, depth=0):
                 if outcome["passed"] is False:
                     snapshot["holds"].append(("acceptance_row_failed", f"amended row {outcome['id']} failed"))
                 observed = outcome["passed"] if outcome["passed"] is not None else outcome.get("comparison_passed")
-                outcome.update(original_outcome=originals[outcome["id"]], comparison_passed=observed,
+                original = originals[outcome["id"]]
+                outcome.update(original_outcome=original.get("original_outcome", original), comparison_passed=observed,
                                passed=None, disposition="policy-amended", report_label="policy amended")
     if reduced or (reduction is not None and not policy_approval):
         try:
@@ -255,7 +277,7 @@ def evaluate(store, record, plan, snapshot, *, depth=0):
             snapshot["holds"].append(("acceptance_scope_reduction_unapproved", str(exc)))
     if parent["revision"] == record["revision"]:
         for key, old in old_rows.items():
-            if key in reduced or (approved_changes and key in changes):
+            if old["policy"] != "gating" or key in reduced or (approved_changes and key in changes):
                 continue
             fields = ("comparator", "expected", "artifact", "field")
             if key not in new_rows or _bytes({k: new_rows[key][k] for k in fields}) != _bytes(
