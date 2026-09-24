@@ -692,3 +692,90 @@ script. No reviewer workspace or unrelated untracked directory was modified.
 The lead must commission the final whole-increment cold sweep by an uninvolved,
 unexposed reviewer before any PR. This implementation handoff does not substitute
 for that review or grant merge/release authority.
+
+## 1c correction — actor provenance and change-wide freshness
+
+Base: `6c82647`. Lead findings M1–M7 are dispositioned below. Earlier sections are
+historical; this section supersedes their role-specific exclusion, lineage-only
+exposure and fail-whole-show behavior. No serialized route/report schema changes.
+
+### Structural rule and identity
+
+`acceptance_audit.provenance` walks the attempt and retained lineage. It interprets
+attribution keys (`by`, `from`, `actor`, `owner`, `*_by`, `authors`, `agents`) across
+record lifecycle metadata, declared participants, execution/reproduction records,
+amendments and the event ledger. The exclusion set is derived once from that
+provenance; there is no independently maintained opener/freezer/attacher list.
+New event names require no exclusion update. New schema attribution must use this
+grammar or explicitly extend it alongside its reader inventory.
+
+For the current attempt, events before the first cold commitment are participation
+evidence. For ancestors, all events predate the child's sweep and are considered.
+Recorded lifecycle actors and declared execution participants remain excluded.
+Passive roster/lens assignments and post-commit current review/ack actions do not
+make a reviewer its own forbidden predecessor. The 32-link bound remains enforced.
+
+M4 change identity is conservative: same verified `project_id` and either the same
+revision or intersecting `(partition, artifact, field)` targets. `check_prior_exposure`
+scans stored closes and retained ancestors; a prior reveal by the assigned reviewer
+before the current commitment HOLDs even across a new root. Later reveals do not
+retroactively disqualify an earlier sweep merely because it was checked again.
+Corrupt/unreadable history makes eligibility unverifiable and HOLDs; diagnostic show
+separately returns healthy records plus errors. Retained local history is the scope
+of this audit; external/unrecorded knowledge is still declared under LD1.
+
+### Dispositions and regression coverage
+
+Names omit `test_acceptance_`.
+
+| Finding | Disposition | Test |
+| --- | --- | --- |
+| M1 structural actor exclusion | FIXED with shared provenance, including arbitrary event and amendment actors. Required pre-fix table produced **7 failed, 4 passed, 210 deselected**; all seven bypasses were observed before production edits. | `every_recorded_actor_is_excluded_from_final_cold`, 11 role cases; `plan_opener_and_distinct_attacher_cannot_review` covers the real configured-liaison scenario without vendor/authority masking. |
+| M4 fresh reviewer across new roots | FIXED with project plus source/target identity and ordered reveal evidence. | `new_root_cannot_reuse_unblinded_reviewer[same-revision/same-targets-new-revision]`; existing fresh-actor recovery remains green. |
+| M6 attachment ordering | FIXED: schema-3 attach refuses missing cold commitment before retaining/mutating bundle or lenses, leaving the attempt retryable. | `cold_phases_reject_wrong_actor_and_late_commit` verifies byte-identical record on refusal and successful commit/attach retry. |
+| M5 diagnostic show on corruption | FIXED: skip failing entries, report their close ID/error in `acceptance_successors_error`, retain healthy parent/children output. | `show_reports_corruption_without_hiding_record[unrelated-close/child-parent]`. |
+| M2 withheld content | FIXED minimum content check: reject delivered digests matching the attempt/ancestry's policy, registry, bundle, amendment, parent records or result artifacts, at submission and reevaluation. Exact-byte identity only. Re-encoding/excerpts/prose expectations and physical separation of the shared private content store remain bounded residuals documented in the guide. | `withheld_plan_digest_cannot_be_mislabelled[source/safety/toolchain/access]`. |
+| M3 roster truth/completeness beyond participants | COOPERATIVE-PROFILE RESIDUAL per lead: availability and labels are plan-writer declarations, not authenticated store metadata; may be relabelled across attempts. Hardened-profile work, no stronger enforcement claimed. | Existing declared-roster diversity tests; guide explicitly distinguishes participant validation from active-seat roster truth. |
+| K3 attached actor isolation | Covered without the earlier vendor masking. | Configured-liaison test above. |
+| K20 pre-reconciliation accepts | Covered by actual early runner/reproducer accepts, later reconcile and cold accept, then fresh accepts. | `pre_reconciliation_accepts_are_stale`. |
+| K19 source/access presence, K18 kind allowlist | Covered with otherwise-valid reports so each guard independently matters. | `delivery_guards_each_refuse_otherwise_valid_report[missing-source/mismatched-access/unknown-kind]`. |
+| K8 reproduction vendor, K23 participant roster | Covered independently of cold-vendor and KeyError paths. | `reproduction_must_use_available_second_vendor`; `monoculture_roster_must_include_participants`. |
+| K11 unique events, K22 dynamic lenses | Added tests despite redundant protections. | `duplicate_attach_commitment_event_holds`; `attach_installs_reproducer_lenses`. |
+| Reviewer self-disposition of findings | Bounded cooperative residual now explicit in guide; full owner/lead ledger is not claimed by this slice. | Existing blocking-observation and ordinary-counter tests remain. |
+| Cold command's lead-authority warning | Removed irrelevant advisory lead check for cold phases; assigned-reviewer enforcement in `submit` remains mandatory. | Existing wrong-actor rejection plus CLI cold tests. |
+
+### Reader inventory
+
+| Surface | Existing readers and assumptions |
+| --- | --- |
+| Actor attribution and pre-commit event prefix | New audit consumes `load_close`, `_policy`, retained parent/amendment/bundle bytes and their existing actor fields. Existing producers `new_close/freeze/attach/_event/apply_ack/set_draft/record_publish/successor` are unchanged in shape. Passive assignments are not actor actions. Cold `evaluate` alone consumes the derived exclusion set. |
+| Change-wide exposure scan | `list_close_ids/load_close`, `_policy`, coverage `target_id` and retained ancestry are read-only inputs. Cold `evaluate` invokes it before allowing final review. Ordinary close readers do not gain this scan. No mutable cached exposure verdict or new persisted index is introduced. |
+| Withheld digest audit | Cold `submit` and `evaluate` share the audit; `_retain/_retained` retain their limits/hash checks. Current/ancestral route hashes and bundle artifacts supply protected identities. |
+| Attach sequencing | CLI acceptance attach, `acceptance.attach` and transactional close readers see a refusal before any route/lens write. Existing bundle validation and attachment-event schema are unchanged. |
+| `successors` return shape | Only CLI show calls this helper; updated together to unpack children and errors. `acceptance_successors_error` is a non-persisted output key, not a verdict field. Existing show JSON readers must tolerate this additional diagnostic key. |
+| Cold command authority dispatch | CLI retains `_resolve_self`; cold `submit` enforces assigned reviewer. Attach/successor still use the prior advisory lead helper. |
+| Other engines and snapshot consumers | Route/report/bundle/ack schemas remain version 3/1/3/current. Older pre-1c engines still reject version 3. The pre-correction 1c engine lacks these new policy checks and must not be used for final eligibility; the cooperative system cannot force a same-user engine upgrade. `acceptance.evaluate`, pure DoD/verdict, final/attention/barrier readers retain their field contracts. |
+
+### Correction evidence
+
+Required red command: `python -m pytest tests/test_acceptance.py -q -k every_recorded_actor --basetemp <SCRATCH>/pytest-1c-correction-red -p no:cacheprovider`.
+Result **7 failed, 4 passed, 210 deselected**. Focused post-fix actor/workflow run:
+**15 passed, 206 deselected**. New guard selection: **16 passed, 221 deselected**.
+All runs use foreground execution, `PYTHONPATH=<CLONE>/src` and private task scratch.
+
+Final bar: `python -m pytest tests/test_acceptance.py tests/test_close.py tests/test_close_signoffs.py tests/test_gates.py -q --basetemp <SCRATCH>/pytest-1c-correction-final -p no:cacheprovider`
+→ **573 passed, 1 skipped** in 444.51 seconds (238 acceptance + 335 ordinary close
+checks; host-restricted symlink skip). Attention suites were not rerun in this
+correction; their readers and persisted final field contracts are unchanged.
+
+Nine isolated source-copy mutations were executed against the corresponding
+regressions: **K3, K20, K19, K18, K8, K23, K11, K22 and M4 all KILLED**. Each run
+executed tests and produced an asserted behavioral failure, not a collection error.
+The runner and individual logs are retained under private task scratch
+`inc1c-correction-mutants-3d27b2dc`; production sources were never mutated in place.
+
+`python -m ruff check --no-cache src/agenttalk/acceptance.py src/agenttalk/acceptance_audit.py src/agenttalk/acceptance_cold.py src/agenttalk/acceptance_history.py src/agenttalk/cli.py tests/test_acceptance.py`
+→ all checks passed. Privacy verification checks eight positive controls and all
+added content, the exact nine-file scope, branch, accepted design bytes and
+`git diff --check`. Basetemps and mutation evidence are retained for the delta
+review. No PR or release is authorized by this correction's completion.

@@ -3626,7 +3626,8 @@ def cmd_close(args: argparse.Namespace) -> int:
     if action == "acceptance":
         from agenttalk import acceptance
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
-        _check_close_authority(store, actor, "acceptance " + args.acceptance_cmd)
+        if args.acceptance_cmd != "cold":
+            _check_close_authority(store, actor, "acceptance " + args.acceptance_cmd)
         try:
             if args.acceptance_cmd == "cold":
                 from agenttalk.acceptance_cold import submit
@@ -3946,7 +3947,10 @@ def cmd_close(args: argparse.Namespace) -> int:
         record = close_mod.load_close(store, args.id)
         if "acceptance_route" in record:
             from agenttalk.acceptance_history import successors
-            record["acceptance_successors"] = successors(store, record)
+            children, errors = successors(store, record)
+            record["acceptance_successors"] = children
+            if errors:
+                record["acceptance_successors_error"] = errors
         print(json.dumps(record, indent=2))
         return 0
 

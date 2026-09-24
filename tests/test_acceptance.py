@@ -1628,7 +1628,9 @@ def cold_phase(case, phase, close_id="attempt", *, change=None, actor="cold"):
     else:
         data = {"schema_version": 1, "commit_hash": route["cold_commit_hash"],
                 "bundle_hash": route["bundle_hash"], "revealed": True, "findings": []}
-    if change:
+    if callable(change):
+        change(data)
+    elif change:
         data.update(change)
     path = case["inputs"] / (phase + ".json")
     write_json(path, data)
@@ -1841,6 +1843,10 @@ def test_acceptance_cold_phases_reject_wrong_actor_and_late_commit(case_v3):
     data = bundle_v2(case)
     data["schema_version"] = 3
     write_json(case["inputs"] / "bundle.json", data)
+    before = close.load_close(case["store"], "attempt")
+    assert attach(case) == 2
+    assert close.load_close(case["store"], "attempt") == before
+    assert cold_phase(case, "commit") == 0
     assert attach(case) == 0
     assert cold_phase(case, "commit") == 2
 
@@ -1967,3 +1973,208 @@ def test_acceptance_complete_cold_cannot_clear_ordinary_counter(case_v3, capsys)
                    "--status", "counter", "--counter", "ordinary", "--finding", "unfixed obligation") == 0
     assert command(case, "check", "--id", "attempt") == 3
     assert command(case, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go") == 3
+
+
+@pytest.mark.parametrize("role", ["opener", "freezer", "attacher", "author", "runner", "reproducer",
+                                  "event", "ancestor-opener", "ancestor-freezer", "ancestor-event", "amender"])
+def test_acceptance_every_recorded_actor_is_excluded_from_final_cold(case_v3, role):
+    case = case_v3
+    ancestor = role.startswith("ancestor-") or role == "amender"
+    if ancestor:
+        assign_fresh_cold(case, "first-cold")
+    if role == "author":
+        case["plan"]["authors"].append("cold")
+    if role == "runner":
+        case["plan"]["partitions"][0]["agents"].append("cold")
+    write_json(case["inputs"] / "plan.json", case["plan"])
+    assert open_attempt(case) == 0
+    with close.close_transaction(case["store"], "attempt") as tx:
+        if role.endswith("opener"):
+            tx.record["opened_by"] = "cold"
+        elif role.endswith("freezer"):
+            tx.record["acceptance_route"]["frozen_by"] = "cold"
+        elif role.endswith("event"):
+            close._event(tx.record, "custom:preparation", "cold", "2026-01-01T00:00:00Z")
+        tx.commit()
+    complete_v3(case)
+    target = "attempt"
+    if ancestor:
+        publish_hold(case)
+        case["plan"]["cold_policy"]["reviewer"] = "cold"
+        write_json(case["inputs"] / "plan.json", case["plan"])
+        assert successor(case) == 0
+        if role == "amender":
+            with close.close_transaction(case["store"], "next") as tx:
+                route = tx.record["acceptance_route"]
+                amendment = acceptance.decode(acceptance._retained(case["store"], route["amendment_hash"]))
+                amendment["by"] = "cold"
+                route["amendment_hash"] = acceptance._retain(case["store"], json.dumps(amendment).encode())
+                tx.commit()
+        complete_v3(case, close_id="next")
+        target = "next"
+    record = close.load_close(case["store"], target)
+    route, plan = acceptance._policy(case["store"], record)
+    data = acceptance.decode(acceptance._retained(case["store"], route["bundle_hash"]))
+    if role == "attacher":
+        record["acceptance_route"]["attached_by"] = "cold"
+    if role == "reproducer":
+        data["reproductions"][0]["actor"] = "cold"
+    # Isolate actor provenance from vendor, authority and unrelated ordinary holds.
+    from agenttalk import acceptance_cold
+    with pytest.raises(acceptance.AcceptanceError) as error:
+        acceptance_cold.evaluate(case["store"], record, plan, data, {"holds": [], "outcomes": []})
+    assert error.value.code == "acceptance_lens_not_independent"
+
+
+@pytest.mark.parametrize("change", ["same-revision", "same-targets-new-revision"])
+def test_acceptance_new_root_cannot_reuse_unblinded_reviewer(case_v3, change):
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    publish_hold(case)
+    if change == "same-targets-new-revision":
+        (case["project"] / "source.txt").write_text("another revision", encoding="utf-8")
+        git(case["project"], "add", ".")
+        git(case["project"], "commit", "-qm", "new revision same protected targets")
+        case["sha"] = git(case["project"], "rev-parse", "HEAD")
+    assert open_attempt(case, "--id", "new-root") == 0
+    complete_v3(case, close_id="new-root")
+    result = acceptance.resolve(case["store"], close.load_close(case["store"], "new-root"))
+    assert "acceptance_cold_missing" in {c for c, _ in result["holds"]}
+    assert command(case, "publish", "--id", "new-root", "--from", "lead", "--verdict", "go") == 3
+
+
+@pytest.mark.parametrize("damage", ["unrelated-close", "child-parent"])
+def test_acceptance_show_reports_corruption_without_hiding_record(case_v2, capsys, damage):
+    case = case_v2
+    assert open_attempt(case) == 0
+    bundle_v2(case)
+    assert attach(case) == 0
+    publish_hold(case)
+    assert successor(case) == 0
+    if damage == "unrelated-close":
+        close.close_path(case["store"], "junk").write_text("invalid JSON", encoding="utf-8")
+    else:
+        digest = close.load_close(case["store"], "next")["acceptance_route"]["parent_record_hash"]
+        (case["store"].dir / "acceptance" / "sha256" / digest).unlink()
+    capsys.readouterr()
+    assert command(case, "show", "--id", "attempt") == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["close_id"] == "attempt"
+    assert shown["acceptance_successors_error"][0]["close_id"] == ("junk" if damage == "unrelated-close" else "next")
+    if damage == "unrelated-close":
+        assert shown["acceptance_successors"][0]["close_id"] == "next"
+
+
+@pytest.mark.parametrize("kind", ["source", "safety", "toolchain", "access"])
+def test_acceptance_withheld_plan_digest_cannot_be_mislabelled(case_v3, kind):
+    case = case_v3
+    assert open_attempt(case) == 0
+
+    def add_withheld(data):
+        data["delivery_manifest"].append({"kind": kind, "path": "plan.json",
+                                          "sha256": data["binding"]["plan_hash"]})
+
+    assert cold_phase(case, "commit", change=add_withheld) == 2
+    assert close.load_close(case["store"], "attempt")["acceptance_route"]["cold_commit_hash"] is None
+
+
+@pytest.mark.parametrize("invalid", ["unknown-kind", "missing-source", "mismatched-access"])
+def test_acceptance_delivery_guards_each_refuse_otherwise_valid_report(case_v3, invalid):
+    case = case_v3
+    assert open_attempt(case) == 0
+
+    def damage(data):
+        if invalid == "unknown-kind":
+            data["delivery_manifest"].append(dict(data["delivery_manifest"][0], kind="author-claims"))
+        elif invalid == "missing-source":
+            data["delivery_manifest"] = [d for d in data["delivery_manifest"] if d["kind"] != "source"]
+        else:
+            data["access_evidence"] = "f" * 64
+
+    assert cold_phase(case, "commit", change=damage) == 2
+
+
+def test_acceptance_pre_reconciliation_accepts_are_stale(case_v3, capsys):
+    case = case_v3
+    assert open_attempt(case) == 0
+    assert cold_phase(case, "commit") == 0
+    data = bundle_v2(case)
+    data["schema_version"] = 3
+    write_json(case["inputs"] / "bundle.json", data)
+    assert attach(case) == 0
+    final_accepts(case, data)
+    assert cold_phase(case, "reconcile") == 0
+    assert ack_lens(case, "acceptance-cold", "cold") == 0
+    assert "acceptance_lens_not_independent" in check(case, capsys)
+    final_accepts(case, data)
+    assert command(case, "check", "--id", "attempt") == 0
+
+
+def test_acceptance_reproduction_must_use_available_second_vendor(case_v3, capsys):
+    case = case_v3
+    next(e for e in case["plan"]["cold_policy"]["roster"] if e["actor"] == "reproducer")["vendor"] = "alpha"
+    write_json(case["inputs"] / "plan.json", case["plan"])
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    assert "acceptance_lens_not_independent" in check(case, capsys)
+
+
+def test_acceptance_monoculture_roster_must_include_participants(case_v3, capsys):
+    case = case_v3
+    policy = case["plan"]["cold_policy"]
+    policy["roster"] = [dict(e, vendor="alpha") for e in policy["roster"] if e["actor"] != "reproducer"]
+    policy["absence_disclosure"] = "Only one vendor available."
+    write_json(case["inputs"] / "plan.json", case["plan"])
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    assert "acceptance_lens_not_independent" in check(case, capsys)
+
+
+def test_acceptance_duplicate_attach_commitment_event_holds(case_v3, capsys):
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    with close.close_transaction(case["store"], "attempt") as tx:
+        event = next(e for e in tx.record["events"] if e["event"] == "acceptance:attach")
+        tx.record["events"].insert(1, deepcopy(event))
+        tx.commit()
+    assert "acceptance_cold_missing" in check(case, capsys)
+
+
+def test_acceptance_attach_installs_reproducer_lenses(case_v3):
+    case = case_v3
+    assert open_attempt(case) == 0
+    assert cold_phase(case, "commit") == 0
+    data = bundle_v2(case)
+    data["schema_version"] = 3
+    write_json(case["inputs"] / "bundle.json", data)
+    assert attach(case) == 0
+    lenses = {lens["id"]: lens for lens in close.load_close(case["store"], "attempt")["required_lenses"]}
+    for rep in data["reproductions"]:
+        assert lenses["acceptance-repro-" + rep["id"]]["allowed_agents"] == [rep["actor"]]
+
+
+@pytest.mark.parametrize("reviewer", ["lead", "liaison"])
+def test_acceptance_plan_opener_and_distinct_attacher_cannot_review(case_v3, reviewer):
+    case = case_v3
+    cfg = case["store"].load_config()
+    cfg["agents"].append("liaison")
+    cfg["operator_facing"] = "liaison"
+    write_json(case["store"].dir / "config.json", cfg)
+    policy = case["plan"]["cold_policy"]
+    policy["reviewer"] = reviewer
+    policy["roster"].append({"actor": "liaison", "vendor": "beta"})
+    next(e for e in policy["roster"] if e["actor"] == "lead")["vendor"] = "beta"
+    write_json(case["inputs"] / "plan.json", case["plan"])
+    assert open_attempt(case) == 0
+    assert cold_phase(case, "commit", actor=reviewer) == 0
+    data = bundle_v2(case)
+    data["schema_version"] = 3
+    write_json(case["inputs"] / "bundle.json", data)
+    assert command(case, "acceptance", "attach", "--id", "attempt", "--from", "liaison",
+                   "--file", str(case["inputs"] / "bundle.json")) == 0
+    assert cold_phase(case, "reconcile", actor=reviewer) == 0
+    final_accepts(case, data)
+    # Valid different vendor and configured verifier isolate actor exclusion.
+    assert {c for c, _ in snapshot(case)["holds"]} == {"acceptance_lens_not_independent"}

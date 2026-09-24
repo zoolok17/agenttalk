@@ -23,18 +23,21 @@ def _now():
 
 def successors(store, parent):
     """Read-only audit of every sibling, including open alternatives, by parent attempt."""
-    result = []
+    result, errors = [], []
     identity = parent["acceptance_route"].get("attempt_id")
     for close_id in close.list_close_ids(store):
-        child = close.load_close(store, close_id)
-        digest = (child.get("acceptance_route") or {}).get("parent_record_hash")
-        if digest is None:
-            continue
-        retained = A.decode(A._retained(store, digest))
-        if retained["acceptance_route"]["attempt_id"] == identity:
-            result.append({"close_id": close_id, "status": child["status"],
-                           "verdict": (child.get("final") or {}).get("verdict")})
-    return result
+        try:
+            child = close.load_close(store, close_id)
+            digest = (child.get("acceptance_route") or {}).get("parent_record_hash")
+            if digest is None:
+                continue
+            retained = A.decode(A._retained(store, digest))
+            if retained["acceptance_route"]["attempt_id"] == identity:
+                result.append({"close_id": close_id, "status": child["status"],
+                               "verdict": (child.get("final") or {}).get("verdict")})
+        except (close.CloseError, OSError, ValueError, TypeError, KeyError) as exc:
+            errors.append({"close_id": close_id, "error": str(exc)})
+    return result, errors
 
 
 def _reduction(value):

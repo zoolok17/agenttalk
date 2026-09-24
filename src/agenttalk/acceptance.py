@@ -481,6 +481,8 @@ def attach(store, close_id, bundle_file, *, by, at):
         if record["status"] == close.PUBLISHED:
             _fail("cannot attach to a published close")
         route, plan = _policy(store, record)
+        if route["schema_version"] == 3 and route["cold_commit_hash"] is None:
+            _fail("commit initial cold observations before attachment", "acceptance_cold_missing")
         if verify_project(route["project"]["locator"], record["revision"]) != route["project"]:
             _fail("project changed before attachment", "acceptance_project_unverified")
         if route["bundle_hash"] is not None:

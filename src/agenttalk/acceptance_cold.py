@@ -3,6 +3,7 @@
 from pathlib import Path
 
 from agenttalk import acceptance as A, close
+from agenttalk import acceptance_audit as audit
 
 
 def policy(value):
@@ -96,6 +97,7 @@ def submit(store, close_id, report_file, *, phase, by, at):
             if route["bundle_hash"] is not None:
                 A._fail("initial cold observations must precede bundle attachment", "acceptance_cold_missing")
             validate_initial(value, tx.record, plan)
+            audit.check_delivery(store, tx.record, value["delivery_manifest"])
             total = len(data)
             for item in value["delivery_manifest"]:
                 resource = A._read(A._path(path.parent, item["path"]))
@@ -138,6 +140,7 @@ def evaluate(store, record, plan, bundle, snapshot):
         A._fail("final cold commitment/reconciliation missing", "acceptance_cold_missing")
     initial = A.decode(A._retained(store, route["cold_commit_hash"]))
     observations = validate_initial(initial, record, plan)
+    audit.check_delivery(store, record, initial["delivery_manifest"])
     total = 0
     for item in initial["delivery_manifest"]:
         resource = A._retained(store, item["sha256"])
@@ -147,23 +150,8 @@ def evaluate(store, record, plan, bundle, snapshot):
     reconciliation = A.decode(A._retained(store, route["cold_reconcile_hash"]))
     findings = validate_reconciliation(reconciliation, route, observations)
     reviewer = plan["cold_policy"]["reviewer"]
-    # A recorded reveal is positive evidence of exposure; a new context string
-    # cannot make that same actor a fresh final reviewer on a descendant.
-    parent_hash = route["parent_record_hash"]
-    for _ in range(32):
-        if parent_hash is None:
-            break
-        parent = A.decode(A._retained(store, parent_hash))
-        parent_route, parent_plan = A._policy(store, parent)
-        if parent_route.get("cold_reconcile_hash") and parent_plan["cold_policy"]["reviewer"] == reviewer:
-            A._fail("reviewer was already unblinded in this lineage", "acceptance_cold_missing")
-        parent_hash = parent_route.get("parent_record_hash")
-    else:
-        if parent_hash is not None:
-            A._fail("cold ancestry exceeds supported depth")
-    excluded = set(plan["authors"]) | {route["attached_by"]}
-    excluded.update(actor for partition in plan["partitions"] for actor in partition["agents"])
-    excluded.update(rep["actor"] for rep in bundle["reproductions"])
+    audit.check_prior_exposure(store, record, plan, reviewer)
+    excluded, _ = audit.provenance(store, record, bundle)
     if reviewer in excluded:
         A._fail("final cold actor is not independent", "acceptance_lens_not_independent")
     access_ids = {bundle["verifier_access"]["id"]} | {r["access_id"] for r in bundle["runs"]}
@@ -171,7 +159,9 @@ def evaluate(store, record, plan, bundle, snapshot):
     if initial["access_id"] in access_ids:
         A._fail("final cold access is shared with execution/verifier", "acceptance_lens_not_independent")
     vendors = policy(plan["cold_policy"])
-    participants = excluded | {reviewer}
+    participants = audit.actors({"authors": plan["authors"], "partitions": plan["partitions"],
+                                 "runs": bundle["runs"], "reproductions": bundle["reproductions"],
+                                 "attached_by": route["attached_by"]}) | {reviewer}
     if not participants.issubset(vendors):
         A._fail("available-vendor snapshot omits a participant", "acceptance_lens_not_independent")
     diverse = len(set(vendors.values())) > 1

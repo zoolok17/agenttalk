@@ -40,6 +40,12 @@ distinct actors and access remain required. The current rule conservatively
 requires the final reviewer's vendor to differ from every author/actual-runner
 vendor. Mixed-vendor author teams may therefore need another available vendor.
 
+**Cooperative-profile residual:** the plan writer supplies availability and vendor
+labels. The tool checks declared participant completeness, not the entire active
+seat roster or authenticated vendor metadata. Labels can change between attempts.
+Authenticated availability/vendor identity belongs to the future hardened profile;
+the current checks do not establish that the declaration is truthful.
+
 Open with `close open --acceptance-plan PLAN --project-repo PROJECT --revision SHA`.
 Supply the usual ID, scope and actor, plus lane evidence or the existing explicit
 non-lane declaration for milestone/release scopes. The plan adds partition lenses
@@ -78,12 +84,24 @@ evidence. The schema-3 execution bundle otherwise has the schema-2 reproduction
 shape, with its version changed to `3`. Attachment adds one reproducer lens per
 declared reproduction, named `acceptance-repro-<reproduction-id>`.
 
+Attachment before commitment is refused without changing the attempt; commit the
+report and retry attachment on the same ID. Delivery hashes cannot match withheld
+plan, registry, bundle, amendment, ancestor-record or result-artifact hashes under
+another resource label. This exact-byte check does not detect excerpts, re-encoded
+JSON or expectation leakage in arbitrary prose; leakage review remains a declared
+cooperative control. The private content store contains both withheld policy and
+delivered resources. It does not enforce filesystem read isolation: operators must
+keep the reviewer's workspace/access separate from that shared store.
+
 ## Reconcile and attest
 
 After reveal, the same reviewer submits JSON with `schema_version:1`, exact
 `commit_hash` and `bundle_hash`, `revealed:true`, and `findings`. Each finding is
 `{id,disposition,evidence}`, with disposition `open` or `resolved`; every initial
 observation must appear exactly once. Unresolved blocking observations HOLD.
+In this bounded cooperative slice the reviewer classifies and reconciles its own
+observations. This is not the full owner/lead-disposition residual ledger from the
+design; ordinary close counters and remediation remain available for that workflow.
 
 ```text
 agenttalk close acceptance cold --id PASS --phase reconcile --file RECONCILIATION.json --from cold-reviewer
@@ -110,6 +128,22 @@ actor and amendment reason. It preserves the terminal parent and clears accepts
 and cold phases. `close show --id PARENT` lists all linked alternatives, including
 open successors. A reviewer already unblinded in this lineage may do a delta
 review, but cannot supply the descendant's final cold sweep; assign a fresh actor.
+Unreadable unrelated closes or child links appear in `acceptance_successors_error`
+alongside the healthy parent and any discoverable children; they do not hide the
+parent from the diagnostic view.
+
+Eligibility derives from recorded actor provenance, not a short list of roles.
+Opening/freezing the plan, attaching evidence, authorship, runner/reproducer
+participation, amendment authorship, or any earlier recorded event excludes an
+actor from the final cold sweep. Current review-phase events are not themselves
+disqualifying; prior ancestor events are. Exposure is checked across root closes
+as well: in the same verified project, the same revision **or overlapping protected
+targets** identify related work. A reveal before the current cold commitment
+disqualifies that reviewer even with a new root or context name. This conservative
+target-overlap rule also covers a new revision with the same measurement targets.
+The check depends on retained local close history; absent external history remains
+a cooperative declaration. An unreadable history record HOLDs eligibility because
+prior exposure cannot be established reliably, while `close show` still diagnoses it.
 
 Coverage is tracked by `(partition, artifact, field)` across all retained ancestry.
 Renaming, splitting or merging rows cannot erase the strongest historical gating

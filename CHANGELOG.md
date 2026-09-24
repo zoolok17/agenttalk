@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Acceptance cold eligibility now audits recorded actor provenance and prior
+  exposure across roots for the same source or protected targets. Mislabelled
+  withheld evidence is rejected by digest; premature attachment is retryable,
+  and corrupt unrelated records no longer hide the parent's audit view.
+
 - Acceptance increment 1c adds schema-3 final cold commitments and reconciliation,
   retained delivery evidence, distinct reviewer/access and vendor checks, and
   attempt-bound reproducer/reviewer accepts. Complete supported cooperative
