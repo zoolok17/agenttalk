@@ -1486,6 +1486,15 @@ class Store:
     @contextlib.contextmanager
     def _exclusive_lock(self, lock: Path, *, timeout: float = 10.0,
                         poll: float = 0.05, what: str = "lock"):
+        from agenttalk import lock_order
+
+        with lock_order.hold(self.dir, lock):
+            with self._exclusive_lock_unordered(lock, timeout=timeout, poll=poll, what=what):
+                yield
+
+    @contextlib.contextmanager
+    def _exclusive_lock_unordered(self, lock: Path, *, timeout: float = 10.0,
+                                  poll: float = 0.05, what: str = "lock"):
         """Hold a legacy-compatible O_EXCL marker across a critical section.
 
         Current clients serialize stale recovery and owner release with an
@@ -1812,6 +1821,7 @@ class Store:
             what="PowerShell host selection lock",
         )
 
+    @contextlib.contextmanager
     def _retirement_lock(self, *, timeout: float = 10.0, poll: float = 0.005):
         """Serialize roster retirement against final message publication.
 
@@ -1819,13 +1829,17 @@ class Store:
         creation, metadata fsync, or unlink cost. The durable payload is already
         prepared before this narrow critical section begins.
         """
-        return self._lock_generation_guard(
+        from agenttalk import lock_order
+
+        with lock_order.hold(self.dir, self.dir / "retirement"), self._lock_generation_guard(
             self.dir / "retirement",
             deadline=time.monotonic() + timeout,
             poll=poll,
             what="retirement/message publication",
-        )
+        ):
+            yield
 
+    @contextlib.contextmanager
     def _message_publication_lock(
         self,
         *,
@@ -1833,12 +1847,15 @@ class Store:
         poll: float = 0.005,
     ):
         """Linearize every canonical message publication with dispatch replay."""
-        return self._lock_generation_guard(
+        from agenttalk import lock_order
+
+        with lock_order.hold(self.dir, self.dir / "message-publication"), self._lock_generation_guard(
             self.dir / "message-publication",
             deadline=time.monotonic() + timeout,
             poll=poll,
             what="message publication",
-        )
+        ):
+            yield
 
     @property
     def _message_publication_order_path(self) -> Path:
@@ -2368,7 +2385,7 @@ class Store:
         """Remove an agent from the roster, its role, and all group
         memberships. External workers become permanent tombstones; ordinary
         force-removed identities retain the historical re-addable behavior."""
-        with self._retirement_lock(), self._config_lock():
+        with self._config_lock(), self._retirement_lock():
             cfg = self.load_config()
             roster = list(cfg.get("agents", []))
             was_external = (
@@ -2911,7 +2928,7 @@ class Store:
         ``renamed_to`` links a rename's tombstone to its successor (set by
         :meth:`rename_agent`). Refuses a name that is not currently active.
         """
-        with self._retirement_lock(), self._config_lock():
+        with self._config_lock(), self._retirement_lock():
             cfg = self.load_config()
             active = cfg.get("agents", []) or []
             if name not in active:
@@ -2942,7 +2959,7 @@ class Store:
         referencing ``old`` stays valid; ``old`` is non-rebindable (FR-002/005/006).
         """
         validate_agent_name(new)
-        with self._retirement_lock(), self._config_lock():
+        with self._config_lock(), self._retirement_lock():
             cfg = self.load_config()
             active = cfg.get("agents", []) or []
             if old not in active:
@@ -6144,7 +6161,7 @@ class Store:
         data = dict(payload)
         data.setdefault("state", _eph.STATE_QUEUED)
         self._launch_state_rank(data["state"])
-        with self._retirement_lock(), self._config_lock():
+        with self._config_lock(), self._retirement_lock():
             path = self._launch_request_path(rid)
             path.parent.mkdir(parents=True, exist_ok=True)
             try:

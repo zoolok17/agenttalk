@@ -1520,3 +1520,103 @@ Ruff passed on all nine touched Python files. Privacy: 8/8 positive controls,
 zero added-content matches; twelve-file scope, unchanged design and
 `git diff --check` verified. Scratch `r6-*` logs/stores and `verify-r6.py` remain
 for re-review; reviewer evidence files are unchanged. No PR, merge or release.
+
+## R7 correction: publication, retirement and the complete lock order
+
+Base: `dc88cd8`. R1–R6 remain unchanged. The R6 config/close order omitted the
+persistent bus retirement mutex. Remove, retire, rename and launch-request
+writes held retirement before asking for config/acceptance, while a publishing
+close held acceptance before its barrier send asked for retirement. This was a
+timeout-bounded cycle: the verdict could be saved as GO while barrier stamping
+returned conflict. The retained sweeper probe reproduced it before edits:
+**1 failed, 2 deselected**, 4.86 seconds; the retry restored the barrier.
+
+The four callers now acquire config (and therefore acceptance) **before**
+retirement. Final message principal validation remains serialized with roster
+mutation. `Store._exclusive_lock`, retirement and message-publication entry
+points check ranks before waiting; unknown store locks default to an independent
+leaf rank and cannot call back into acceptance/config. Generation guard recovery
+and on-disk ownership formats are unchanged. No rescan or evidence exclusion
+was used to break the cycle.
+
+The complete [lock-order inventory](LOCK-ORDER.md) assigns ranks to coverage
+transaction/handoff; supervisor lifecycle/PowerShell/instance; lane reset,
+transaction and cleanup; wrapper operation publication; acceptance; close-ID;
+config; lane integrity secret; retirement; canonical message publication;
+wrapper ledger and proof-health; lead-loop lease, waiting and awaiting; ID and
+ownership-generation leaves. It also identifies the separate comprehension
+scan, gateway lifecycle and process-local guard implementations and their
+outer/leaf positions. Gate/knowledge/signoff paths have no extra lock family.
+The source acquisition census is pinned in tests so added sites require review.
+
+Failing-first repository evidence: the real barrier/removal regression and
+retirement-to-config refusal both failed before the change (**2 failed**, 4.61
+seconds). The fixed focused run passed **22 tests**, 4.65 seconds: the complete
+ascending store-rank walk, each adjacent inversion, explicit retirement/config
+inversion and concurrent publication/removal with a durable barrier on the first
+attempt. The new schedule observes the remover reaching acceptance acquisition;
+it does not demand that the remover own retirement while publication owns an
+earlier rank. The sweeper's original ownership-wait hook would require the very
+reverse acquisition that the correction removes.
+
+R8 disposition: retained as a documented contention trade-off. Lane worktree
+add/remove still holds config/acceptance while Git runs, normally up to 30
+seconds plus teardown versus a close writer's 10-second wait. Close conflict is
+retryable after lane work completes; coordinate lane maintenance before final
+publication for first-try success. Moving Git outside the transaction needs
+generation revalidation and is deferred. The guide and lock-order reference
+state this contract; no performance or throughput guarantee is claimed.
+
+The first broad run completed with **993 passed, 5 skipped, 1 failed** (380.34
+seconds). Its single failure was the existing replaced-parent coverage-lock
+test: rank lookup resolved a junction before the ownership validator could
+raise its established IO error. Rank classification now uses the requested
+lexical path; the ownership layer still performs reparse/integrity checks. The
+first wrapper run completed with **320 passed, 4 skipped, 3 failed** (140.38
+seconds); those failures were diagnostic regex mismatches in deliberate reverse
+lock probes. Immediate inversion refusal now keeps the existing readable
+message-publication label. Neither run is represented as green. All affected
+suites were rerun after these fixes.
+
+The static inventory regression covers 199 logical acquisition call sites
+across sixteen modules, while the runtime table walks every store rank and
+rejects each adjacent inversion. Ownership generation primitives remain leaves
+of the already ranked lock; the raw implementation has one allowed caller, the
+ranked wrapper. No production/test source was edited during running suites.
+
+The retained reviewer run completed with **21 passed, 1 failed, 1 deselected**
+(124.96 seconds). Its failure is the old per-ID-timeout injector: one thread
+holds a raw close-ID lock, then asks for acceptance and another ID. That is now
+the explicitly forbidden reverse order. The replacement lifecycle regression
+holds the simulated competing ID lock in a separate thread and retains both
+assertions: the busy ID times out without retaining acceptance, and another ID
+can proceed. The original reviewer file remains unchanged and its failure is
+not counted as a passing test. The deselected original R7 hook requires the
+removed retirement-before-acceptance ordering; its real-CLI scenario is covered
+by the failing-first repository regression instead.
+
+Final executed validation (foreground, `PYTHONPATH=<W>/src`, bytecode disabled,
+assigned scratch `<S>`, `-p no:cacheprovider`):
+
+```text
+python -m pytest tests/test_store.py tests/test_concurrency.py tests/test_lanes.py tests/test_supervisor_lifecycle.py tests/test_coverage_producer.py tests/test_close.py tests/test_gates.py tests/test_close_signoffs.py tests/test_lock_order.py tests/test_owed_action_detection.py -q --basetemp <S>/r7-final -p no:cacheprovider
+```
+
+**1318 passed, 9 skipped**, 504.13 seconds, one completed invocation. After this
+run, only the separate-thread lifecycle regression was added; the entire
+lock-order file plus the real barrier-cycle case then passed **24 tests** in
+7.28 seconds (`<S>/r7-order-final.log`). Production code was unchanged.
+
+The acceptance publication/barrier/successor/lock/enumeration/transaction
+selection passed **30 tests, 505 deselected**, 131.43 seconds
+(`<S>/r7-acceptance.log`). Supervisor/external-worker/ephemeral-reviewer
+launch-request/retire/rename/remove selection passed **45 tests, 918 deselected**,
+15.69 seconds (`<S>/r7-writers.log`). Reviewer evidence and its old-harness
+qualification are recorded above; the R8 slow-lane exclusion/retry and crash
+controls passed in that run. No full repository, full acceptance-suite or
+performance run is claimed.
+
+Ruff passed on all four touched Python files. Privacy: 8/8 positive controls,
+zero added-content matches; eight-file scope, unchanged design and whitespace
+verified. Assigned scratch `r7-*` logs/stores and `verify-r7.py` are retained for
+re-review. Reviewer files remain unchanged. No PR, merge or release.

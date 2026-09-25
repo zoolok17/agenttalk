@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Order roster retirement after acceptance/config locking so release-barrier
+  publication cannot deadlock against removal, retirement, rename or launch
+  requests. Check store lock ranks before waiting and document lane contention.
+
 - Extend acceptance publication serialization to gate APIs, knowledge appends,
   configuration and administrative config writers. Enforce acceptance-writer,
   close-ID, then config lock order; gate contention returns HOLD/conflict.

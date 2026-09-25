@@ -359,8 +359,11 @@ ordinary close writes; it avoids a classification gap when acceptance is first
 attached. Gate writes, knowledge publish/curation/retraction, and configuration
 transactions also take this outer lock. Signoff apply/override/ack writes use
 close transactions. Lock order is **acceptance writer → close-ID (when needed) →
-configuration**; starting a close transaction while holding the configuration
-lock is refused. A gate writer that times out returns HOLD/conflict (exit 3).
+configuration → retirement → message publication → wrapper ledger**. Outer
+coverage/lane/supervisor and inner leaf locks are included in the complete
+[package lock order](LOCK-ORDER.md). Reverse store acquisitions fail before
+waiting; starting a close transaction while holding configuration is refused.
+A gate writer that times out returns HOLD/conflict (exit 3).
 External bus stores still require cooperative disclosure.
 
 Gate set (including status, severity, scope, required/optional and evidence
@@ -373,6 +376,12 @@ configuration-backed signoff authority and supported config init/reset writes.
 Static signoff, DoD and domain policy files have no mutation command; edit them
 only while publication is quiescent. Direct filesystem edits do not acquire
 runtime locks.
+
+Lane worktree add/remove can retain the shared lock during Git execution
+(normally up to 30 seconds plus teardown), longer than a close writer's normal
+10-second wait. A competing close can return conflict; retry after lane work
+finishes. Coordinate lane maintenance before final publication when first-try
+success is required. Locks do not promise throughput or future evidence freshness.
 
 Audit enumeration is strict. Unreadable, missing or partly enumerated local
 history produces `acceptance_audit_unavailable`, even when individual known files

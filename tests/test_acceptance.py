@@ -3318,3 +3318,49 @@ def test_acceptance_audit_enumeration_unavailable_is_named_hold(case_v3, monkeyp
     children, errors = acceptance_history.successors(case["store"], close.load_close(case["store"], "attempt"))
     assert children == []
     assert errors and "acceptance_audit_unavailable" in errors[0]["error"]
+
+
+def test_acceptance_barrier_and_retirement_have_no_lock_cycle(case_v3, monkeypatch):
+    import contextlib
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    c = case_v3
+    c["store"].add_agent("spare")
+    assert open_attempt(c) == 0
+    complete_v3(c)
+    main_thread = threading.get_ident()
+    waiting = threading.Event()
+    original_writer = close._acceptance_writer_lock
+    original_retirement = Store._retirement_lock
+    original_barrier = cli._ensure_close_release_barrier
+    future = []
+
+    @contextlib.contextmanager
+    def writer(store, *, timeout):
+        if threading.get_ident() != main_thread:
+            waiting.set()
+        with original_writer(store, timeout=timeout):
+            yield
+
+    @contextlib.contextmanager
+    def retirement(store, *, timeout=10.0, poll=0.005):
+        with original_retirement(store, timeout=0.3 if threading.get_ident() == main_thread else 5,
+                                 poll=poll):
+            yield
+
+    monkeypatch.setattr(close, "_acceptance_writer_lock", writer)
+    monkeypatch.setattr(Store, "_retirement_lock", retirement)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        def barrier(store, tx, *, actor):
+            future.append(pool.submit(store.remove_agent, "spare"))
+            assert waiting.wait(5)
+            return original_barrier(store, tx, actor=actor)
+
+        monkeypatch.setattr(cli, "_ensure_close_release_barrier", barrier)
+        result = command(c, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go",
+                         "--bump-barrier")
+        future[0].result(timeout=5)
+    assert result == 0
+    assert close.load_close(c["store"], "attempt")["final"]["barrier_epoch"] is not None
+    assert "spare" not in c["store"].load_config()["agents"]
