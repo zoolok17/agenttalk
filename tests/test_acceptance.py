@@ -3,6 +3,7 @@
 from copy import deepcopy
 import hashlib
 import json
+import shutil
 import subprocess
 
 import pytest
@@ -22,16 +23,12 @@ def git(root, *args):
 
 
 @pytest.fixture
-def case(tmp_path):
+def case(tmp_path, acceptance_project_template):
     project = tmp_path / "project"
-    project.mkdir()
-    git(project, "init", "-q")
-    git(project, "config", "user.name", "Synthetic Author")
-    git(project, "config", "user.email", "synthetic@example.invalid")
-    (project / "source.txt").write_text("synthetic source\n", encoding="utf-8")
-    git(project, "add", ".")
-    git(project, "commit", "-qm", "synthetic fixture")
-    sha = git(project, "rev-parse", "HEAD")
+    template, sha = acceptance_project_template
+    # Copy the complete object database/index/config, without hardlinks or
+    # alternates: corruption, branch and config probes remain test-local.
+    shutil.copytree(template, project)
     store = Store(tmp_path / "bus")
     store.init(["lead", "runner-a", "runner-b", "cold"])
     inputs = tmp_path / "inputs"
@@ -596,9 +593,9 @@ def test_acceptance_attribution_without_bundle_holds(case, capsys):
 
 
 @pytest.fixture
-def case_v2(case):
+def case_v2(case, acceptance_project_identity):
     case["plan"]["schema_version"] = 2
-    case["plan"]["project_id"] = acceptance.project_id(acceptance.verify_project(case["project"], case["sha"]))
+    case["plan"]["project_id"] = acceptance_project_identity
     write_json(case["inputs"] / "plan.json", case["plan"])
     cfg = case["store"].load_config()
     cfg["operator_identity"] = "operator"
@@ -1631,12 +1628,12 @@ def test_acceptance_reduction_cannot_authorize_replacement_coverage(case_v2, cau
 
 
 @pytest.fixture
-def case_v3(case_v2):
+def case_v3(case_v2, acceptance_candidate_template):
     case = case_v2
     base = case["sha"]
-    (case["project"] / "source.txt").write_text("synthetic candidate\n", encoding="utf-8")
-    git(case["project"], "commit", "-qam", "candidate from verified base")
-    case["sha"] = git(case["project"], "rev-parse", "HEAD")
+    template, case["sha"] = acceptance_candidate_template
+    case["project"] = case["project"].with_name("candidate")
+    shutil.copytree(template, case["project"])
     case["plan"]["schema_version"] = 3
     case["plan"]["cold_policy"] = {
         "reviewer": "cold", "absence_disclosure": "", "change_base": base,

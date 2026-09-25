@@ -588,6 +588,7 @@ def validate_raw(raw, revision, run_id):
         _fail("raw result values must be an object")
 
 
+@acceptance_git.operation
 def resolve(store, record, *, live=False):
     """Read and verify immutable inputs; return a snapshot for the pure DoD fold."""
     snapshot = {"holds": [], "outcomes": []}
