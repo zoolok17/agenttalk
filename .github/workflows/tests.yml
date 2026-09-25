@@ -39,7 +39,9 @@ jobs:
       # one job whose Windows leg needs those symlink tests to execute.
       AGENTTALK_AUTHORIZE_SYMLINK_DEVMODE: ${{ matrix.os.id == 'windows' && '1' || '' }}
     # Per-OS ceiling: the two pytest runs (source + wheel) are each capped at
-    # 2700s in dev-gate.json, so a single leg's pytest budget alone is 90 min.
+    # 5400s in dev-gate.json. Measured 2026-09-25 with the acceptance suite:
+    # Windows pytest takes ~55-65 min per run (~2h10 per leg; each acceptance
+    # test spawns ~70 git processes), so the Windows ceiling is 180 min.
     # The Windows runner's slow filesystem + costly process/venv creation push
     # its wall time up to that ceiling, leaving no headroom for setup and the
     # other per-leg checks — the leg is then killed by duration, not by a test
@@ -55,7 +57,7 @@ jobs:
             timeout_minutes: 90
           - id: windows
             runner: windows-latest
-            timeout_minutes: 120
+            timeout_minutes: 180
           - id: macos
             runner: macos-latest
             timeout_minutes: 90
