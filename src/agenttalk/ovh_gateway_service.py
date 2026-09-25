@@ -21,6 +21,7 @@ import time
 import xml.etree.ElementTree as ET  # nosec B405 - bounded local Task Scheduler XML  # nosemgrep
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Mapping
 
 from .ovh_gateway import (
     EXTERNAL_CEILING_MICRO_EUR,
@@ -46,6 +47,12 @@ from .ovh_gateway import (
     write_secret_file,
 )
 from .ovh_gateway_front import CONFIG_ERROR_CODE, PUBLIC_ROUTE, FrontConfig, GatewayFront
+from .ovh_gateway_reasoning import (
+    ReasoningParamError,
+    ReasoningStripLog,
+    ReasoningValue,
+    validate_reasoning_params,
+)
 from .lifecycle_lock import (
     CrossProcessLifecycleLock,
     LifecycleLockContended,
@@ -930,8 +937,10 @@ def initialize_install(
     trial_cutoff_micro_eur: int = TRIAL_CUTOFF_MICRO_EUR,
     soft_stop_micro_eur: int = SOFT_STOP_MICRO_EUR,
     external_ceiling_micro_eur: int = EXTERNAL_CEILING_MICRO_EUR,
+    reasoning_params: Mapping[str, ReasoningValue] | None = None,
 ) -> dict:
     """One-time state setup. It intentionally does not activate a task or key."""
+    reasoning_params = validate_reasoning_params(reasoning_params)
     root = canonical_project_root(root)
     root.mkdir(parents=True, exist_ok=True)
     with _gateway_lifecycle_lock(root, "initialize"):
@@ -947,6 +956,7 @@ def initialize_install(
             trial_cutoff_micro_eur=trial_cutoff_micro_eur,
             soft_stop_micro_eur=soft_stop_micro_eur,
             external_ceiling_micro_eur=external_ceiling_micro_eur,
+            reasoning_params=reasoning_params,
         )
 
 
@@ -963,6 +973,7 @@ def _initialize_install_locked(
     trial_cutoff_micro_eur: int = TRIAL_CUTOFF_MICRO_EUR,
     soft_stop_micro_eur: int = SOFT_STOP_MICRO_EUR,
     external_ceiling_micro_eur: int = EXTERNAL_CEILING_MICRO_EUR,
+    reasoning_params: Mapping[str, ReasoningValue] | None = None,
 ) -> dict:
     if api_base != DEFAULT_API_BASE:
         raise GatewayConfigError("gateway install requires the pinned OVH API base")
@@ -993,21 +1004,23 @@ def _initialize_install_locked(
     )
     _durable_write_bytes(
         config_path,
-        render_litellm_config(api_base=api_base).encode("utf-8"),
+        render_litellm_config(
+            api_base=api_base, reasoning_params=reasoning_params
+        ).encode("utf-8"),
     )
     config_hash = hashlib.sha256(config_path.read_bytes()).hexdigest()
-    _durable_write_json(
-        install_manifest_path(root),
-        {
-            "schema_version": 1,
-            "litellm_executable": str(executable),
-            "litellm_config": str(config_path),
-            "litellm_config_sha256": config_hash,
-            "price_policy_hash": marker["price_policy_hash"],
-            "public_bind": f"{PUBLIC_HOST}:{PUBLIC_PORT}",
-            "internal_bind": f"{INTERNAL_HOST}:{INTERNAL_PORT}",
-        },
-    )
+    manifest_value = {
+        "schema_version": 1,
+        "litellm_executable": str(executable),
+        "litellm_config": str(config_path),
+        "litellm_config_sha256": config_hash,
+        "price_policy_hash": marker["price_policy_hash"],
+        "public_bind": f"{PUBLIC_HOST}:{PUBLIC_PORT}",
+        "internal_bind": f"{INTERNAL_HOST}:{INTERNAL_PORT}",
+    }
+    if reasoning_params:
+        manifest_value["reasoning_params"] = dict(reasoning_params)
+    _durable_write_json(install_manifest_path(root), manifest_value)
     write_secret_file(front_path, front_token)
     write_secret_file(internal_path, generate_token())
     return {
@@ -1025,11 +1038,21 @@ def _initialize_install_locked(
 
 
 def reconfigure_endpoint(
-    root: str | os.PathLike[str], *, ledger: SpendLedger | None = None
+    root: str | os.PathLike[str],
+    *,
+    ledger: SpendLedger | None = None,
+    reasoning_params: Mapping[str, ReasoningValue] | None = None,
+    clear_reasoning_params: bool = False,
 ) -> dict:
     """Re-render the LiteLLM config to the PINNED ``DEFAULT_API_BASE`` and rebind
     the install manifest's config hash — WITHOUT touching the spend ledger, the
     tokens, or the registered task.
+
+    The route's fixed reasoning parameters (``reasoning_params``) are part of the
+    rendered config and are kept in the manifest: given, they replace the stored
+    set; ``clear_reasoning_params`` empties it; otherwise the stored set is
+    re-rendered unchanged. They are not part of the price policy, so changing
+    them needs neither a re-init nor a new canary.
 
     This is how a code-reviewed endpoint change (a new ``DEFAULT_API_BASE``) is
     applied to an EXISTING install. ``initialize_install`` refuses to replace
@@ -1043,12 +1066,23 @@ def reconfigure_endpoint(
     loaded the previous config into memory. The caller must ``stop`` first; the
     new endpoint takes effect on the next ``start``.
     """
+    if clear_reasoning_params and reasoning_params:
+        raise GatewayConfigError("clear and set reasoning parameters are mutually exclusive")
+    requested = None if reasoning_params is None else validate_reasoning_params(reasoning_params)
     root = canonical_project_root(root)
     with _gateway_lifecycle_lock(root, "reconfigure"):
-        return _reconfigure_endpoint_locked(root, ledger)
+        return _reconfigure_endpoint_locked(
+            root, ledger, requested=requested, clear=clear_reasoning_params
+        )
 
 
-def _reconfigure_endpoint_locked(root: Path, ledger: SpendLedger | None) -> dict:
+def _reconfigure_endpoint_locked(
+    root: Path,
+    ledger: SpendLedger | None,
+    *,
+    requested: dict[str, ReasoningValue] | None = None,
+    clear: bool = False,
+) -> dict:
     config_path = litellm_config_path(root)
     manifest_path = install_manifest_path(root)
     missing = [p.name for p in (config_path, manifest_path) if not p.exists()]
@@ -1085,13 +1119,30 @@ def _reconfigure_endpoint_locked(root: Path, ledger: SpendLedger | None) -> dict
     if Path(str(manifest.get("litellm_config") or "")).resolve() != config_path.resolve():
         raise GatewayConfigError("gateway install manifest config path mismatch")
     previous_hash = manifest.get("litellm_config_sha256")
-    # Re-render from the PINNED constant only (never a caller argument).
+    if clear:
+        params: dict[str, ReasoningValue] = {}
+    elif requested is not None:
+        params = requested
+    else:
+        try:
+            params = validate_reasoning_params(manifest.get("reasoning_params"))
+        except ReasoningParamError as exc:
+            raise GatewayConfigError(
+                "gateway install manifest reasoning parameters are invalid"
+            ) from exc
+    # Re-render from the PINNED constant only (never a caller-supplied base).
     _durable_write_bytes(
         config_path,
-        render_litellm_config(api_base=DEFAULT_API_BASE).encode("utf-8"),
+        render_litellm_config(
+            api_base=DEFAULT_API_BASE, reasoning_params=params
+        ).encode("utf-8"),
     )
     config_hash = hashlib.sha256(config_path.read_bytes()).hexdigest()
     manifest["litellm_config_sha256"] = config_hash
+    if params:
+        manifest["reasoning_params"] = dict(params)
+    else:
+        manifest.pop("reasoning_params", None)
     _durable_write_json(manifest_path, manifest)
     # Confirm the rewritten manifest validates against the freshly rendered config.
     load_install_manifest(root, ledger=ledger)
@@ -1102,6 +1153,7 @@ def _reconfigure_endpoint_locked(root: Path, ledger: SpendLedger | None) -> dict
         "config_sha256": config_hash,
         "previous_config_sha256": previous_hash,
         "changed": previous_hash != config_hash,
+        "reasoning_params": dict(params),
     }
 
 
@@ -1145,6 +1197,13 @@ def _validate_install_manifest(
         raise GatewayConfigError("gateway install manifest schema mismatch")
     if value.get("price_policy_hash") != _ledger_policy_hashes(ledger)["price_policy_hash"]:
         raise GatewayConfigError("gateway install manifest price policy mismatch")
+    if "reasoning_params" in value:
+        try:
+            validate_reasoning_params(value["reasoning_params"])
+        except ReasoningParamError as exc:
+            raise GatewayConfigError(
+                "gateway install manifest reasoning parameters are invalid"
+            ) from exc
     expected_binds = {
         "public_bind": f"{PUBLIC_HOST}:{PUBLIC_PORT}",
         "internal_bind": f"{INTERNAL_HOST}:{INTERNAL_PORT}",
@@ -1670,6 +1729,9 @@ def run_service(
             FrontConfig(public_token=front_token, internal_token=internal_token),
             ledger,
         )
+        front.reasoning_observer = ReasoningStripLog(
+            gateway_state_dir(root) / "reasoning-stripped.jsonl"
+        ).record
         _wait_liveliness(front, process)
         server = front.make_server()
         marker_path = runtime_marker_path(root)
@@ -1885,6 +1947,7 @@ def gateway_status(
         manifest = load_install_manifest(root, ledger=ledger)
         result["install_manifest_ok"] = True
         result["config_sha256"] = manifest["litellm_config_sha256"]
+        result["reasoning_params"] = dict(manifest.get("reasoning_params") or {})
     except (GatewayConfigError, LedgerBlocked, LedgerHold):
         result["errors"].append("install_manifest_invalid")
     try:

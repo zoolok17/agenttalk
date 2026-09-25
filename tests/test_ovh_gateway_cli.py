@@ -658,3 +658,95 @@ def test_qwen_wrap_worker_spend_preflight_allows_accepted_canary(
 
     assert rc == 0
     assert len(token_reads) == 1
+
+
+def _cli_init_args(root, executable, *extra) -> list[str]:
+    return [
+        "--root",
+        str(root),
+        "gateway",
+        "init",
+        "--litellm-executable",
+        str(executable),
+        "--opening-eur",
+        "0.58",
+        "--opening-evidence",
+        "OVH AI Endpoints dashboard, observed 2026-07-16 morning",
+        *extra,
+    ]
+
+
+def test_gateway_cli_init_records_reasoning_params_and_reconfigure_edits_them(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    root = tmp_path / "project"
+    Store(root).init(["lead"])
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    monkeypatch.setattr(ovh_gateway_service, "_both_sockets_free", lambda: True)
+    executable = tmp_path / "litellm.exe"
+    executable.write_bytes(b"fake")
+
+    assert cli.main(_cli_init_args(
+        root,
+        executable,
+        "--reasoning-param",
+        "reasoning_effort=low",
+        "--reasoning-param",
+        "chat_template_kwargs.enable_thinking=false",
+    )) == 0
+    capsys.readouterr()
+    manifest_path = ovh_gateway_service.install_manifest_path(root)
+    assert json.loads(manifest_path.read_text(encoding="utf-8"))["reasoning_params"] == {
+        "chat_template_kwargs.enable_thinking": False,
+        "reasoning_effort": "low",
+    }
+
+    assert cli.main(["--root", str(root), "gateway", "reconfigure"]) == 0
+    kept = json.loads(capsys.readouterr().out)
+    assert kept["changed"] is False and kept["reasoning_params"]["reasoning_effort"] == "low"
+
+    assert cli.main([
+        "--root", str(root), "gateway", "reconfigure", "--reasoning-param", "reasoning_effort=high",
+    ]) == 0
+    replaced = json.loads(capsys.readouterr().out)
+    assert replaced["reasoning_params"] == {"reasoning_effort": "high"}
+    assert 'reasoning_effort: "high"' in ovh_gateway_service.litellm_config_path(
+        root
+    ).read_text(encoding="utf-8")
+
+    assert cli.main(["--root", str(root), "gateway", "reconfigure", "--no-reasoning-param"]) == 0
+    cleared = json.loads(capsys.readouterr().out)
+    assert cleared["reasoning_params"] == {}
+    assert "reasoning_params" not in json.loads(manifest_path.read_text(encoding="utf-8"))
+
+
+def test_gateway_cli_rejects_a_bad_reasoning_param_without_creating_state(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    root = tmp_path / "project"
+    Store(root).init(["lead"])
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    executable = tmp_path / "litellm.exe"
+    executable.write_bytes(b"fake")
+
+    rc = cli.main(_cli_init_args(root, executable, "--reasoning-param", "model=other"))
+
+    assert rc == 2
+    assert "reserved" in capsys.readouterr().err
+    assert not ovh_gateway_service.install_manifest_path(root).exists()
+
+
+def test_gateway_cli_reconfigure_flags_are_mutually_exclusive(tmp_path, capsys) -> None:
+    root = tmp_path / "project"
+    Store(root).init(["lead"])
+    with pytest.raises(SystemExit) as exc:
+        cli.main([
+            "--root", str(root), "gateway", "reconfigure",
+            "--reasoning-param", "reasoning_effort=low", "--no-reasoning-param",
+        ])
+    assert exc.value.code == 2
+    capsys.readouterr()

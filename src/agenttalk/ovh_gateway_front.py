@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import json
 import socket
@@ -29,7 +30,15 @@ from .ovh_gateway import (
     SpendLedger,
     child_capability_from_header,
 )
+from .ovh_gateway_reasoning import (
+    ReasoningStats,
+    SseReasoningStripper,
+    strip_reasoning_json,
+)
 
+# A non-streaming reply is buffered to strip reasoning; past this size it is
+# forwarded as-is rather than held in memory.
+_MAX_BUFFERED_JSON_BYTES = 8 * 1024 * 1024
 
 PUBLIC_ROUTE = "/v1/messages"
 # Allowlisted content types the front will echo from the internal upstream into
@@ -80,6 +89,7 @@ class FrontConfig:
     internal_port: int = INTERNAL_PORT
     request_timeout_seconds: float = 120.0
     max_request_bytes: int = MAX_REQUEST_BYTES
+    strip_reasoning: bool = True
 
     def validate(self) -> None:
         if self.public_host != PUBLIC_HOST or self.internal_host != INTERNAL_HOST:
@@ -197,11 +207,13 @@ class GatewayFront:
         ledger: SpendLedger,
         *,
         connection_factory: Callable[..., http.client.HTTPConnection] = http.client.HTTPConnection,
+        reasoning_observer: Callable[[str, ReasoningStats], None] | None = None,
     ) -> None:
         config.validate()
         self.config = config
         self.ledger = ledger
         self.connection_factory = connection_factory
+        self.reasoning_observer = reasoning_observer
         self._permit = threading.BoundedSemaphore(1)
         self._server: ThreadingHTTPServer | None = None
 
@@ -419,12 +431,66 @@ class GatewayFront:
             handler.end_headers()
             public_response_started = True
             usage = StreamUsage()
+            # Usage is always read from the UNFILTERED upstream bytes, so the
+            # ledger settles on the provider's real reasoning-inclusive counts
+            # while the CLI never receives (and so never re-sends) reasoning.
+            stripper = (
+                SseReasoningStripper()
+                if self.config.strip_reasoning and content_type.startswith("text/event-stream")
+                else None
+            )
+            json_parts: list[bytes] | None = (
+                []
+                if self.config.strip_reasoning and content_type.startswith("application/json")
+                else None
+            )
+            json_size = 0
+            json_stats = ReasoningStats()
+            failed_stripper: SseReasoningStripper | None = None
             while True:
                 chunk = response.read(16 * 1024)
                 if not chunk:
                     break
                 usage.feed(chunk)
-                handler.wfile.write(chunk)
+                if json_parts is not None:
+                    json_size += len(chunk)
+                    if json_size <= _MAX_BUFFERED_JSON_BYTES:
+                        json_parts.append(chunk)
+                        continue
+                    for held in json_parts:
+                        handler.wfile.write(held)
+                    json_parts = None
+                    handler.wfile.write(chunk)
+                    handler.wfile.flush()
+                    continue
+                forwarded = chunk
+                if stripper is not None:
+                    try:
+                        forwarded = stripper.feed(chunk)
+                    except Exception:  # noqa: BLE001 - fail open on the strip only
+                        stripper.stats.failed = True
+                        forwarded = chunk
+                        failed_stripper = stripper
+                        stripper = None
+                if forwarded:
+                    handler.wfile.write(forwarded)
+                    handler.wfile.flush()
+            if stripper is not None:
+                try:
+                    tail = stripper.finish()
+                except Exception:  # noqa: BLE001 - fail open on the strip only
+                    stripper.stats.failed = True
+                    tail = b""
+                if tail:
+                    handler.wfile.write(tail)
+                    handler.wfile.flush()
+            if json_parts is not None:
+                held = b"".join(json_parts)
+                try:
+                    body_out, json_stats = strip_reasoning_json(held)
+                except Exception:  # noqa: BLE001 - fail open on the strip only
+                    body_out, json_stats = held, ReasoningStats(failed=True)
+                handler.wfile.write(body_out)
                 handler.wfile.flush()
             model, input_tokens, output_tokens = usage.finish()
             self.ledger.settle(
@@ -433,6 +499,12 @@ class GatewayFront:
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
             )
+            live = stripper or failed_stripper
+            stripped = live.stats if live is not None else json_stats
+            if stripped and self.reasoning_observer is not None:
+                # Diagnostics never affect accounting or the response.
+                with contextlib.suppress(Exception):
+                    self.reasoning_observer(attempt_id, stripped)
         except (BrokenPipeError, ConnectionResetError, TimeoutError, socket.timeout):
             self._mark_uncertain(attempt_id, "stream disconnect or timeout")
             if not public_response_started and not handler.wfile.closed:
@@ -442,6 +514,13 @@ class GatewayFront:
                     pass
         except (OSError, http.client.HTTPException, LedgerBlocked, LedgerHold):
             self._mark_uncertain(attempt_id, "transport or settlement failure")
+            if not public_response_started and not handler.wfile.closed:
+                try:
+                    handler._stable_error(502, INFRA_ERROR_CODE)  # type: ignore[attr-defined]
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+        except Exception:  # noqa: BLE001 - last resort: no path may leave a bare 'reserved'
+            self._mark_uncertain(attempt_id, "unexpected response-path failure")
             if not public_response_started and not handler.wfile.closed:
                 try:
                     handler._stable_error(502, INFRA_ERROR_CODE)  # type: ignore[attr-defined]

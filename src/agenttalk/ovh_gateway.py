@@ -22,7 +22,9 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable, Iterator, Mapping
+
+from .ovh_gateway_reasoning import ReasoningValue, render_extra_body_lines
 
 
 MODEL_ALIAS = "Qwen3.8-27B"
@@ -2298,25 +2300,32 @@ def child_capability_from_header(header: str | None) -> str | None:
     return token if _CHILD_CAPABILITY_RE.fullmatch(token) else None
 
 
-def render_litellm_config(*, api_base: str) -> str:
+def render_litellm_config(
+    *,
+    api_base: str,
+    reasoning_params: Mapping[str, ReasoningValue] | None = None,
+) -> str:
     """Render the single-model, callback-free LiteLLM trial configuration.
 
-    ``merge_reasoning_content_in_choices`` is a per-deployment field
-    (``LiteLLMParamsTypedDict`` in this venv's ``litellm/types/router.py``,
-    same family as ``store``/``max_retries`` above it), not a
-    ``litellm_settings`` module-level default - the installed venv has no
-    code path reading a module-global ``litellm.merge_reasoning_content_in_choices``,
-    only ``litellm_params.merge_reasoning_content_in_choices`` read per-call
-    by ``streaming_handler.py``'s ``CustomStreamWrapper``. Placed under
-    ``litellm_params`` for that reason. It folds Qwen3.8-27B's reasoning
-    content into the regular content text before it ever reaches the
-    Anthropic-passthrough adapter's text/tool_use/thinking state machine, so
-    no thinking content block is emitted - the CLI otherwise aborts a
-    streamed turn with "Content block is not a thinking block" when a
-    thinking delta lands out of order.
+    Reasoning is deliberately NOT merged into the reply text
+    (``merge_reasoning_content_in_choices``): merged reasoning is ordinary
+    assistant text to the Claude CLI, which re-sends it as input on every later
+    call of the tool loop. LiteLLM instead emits typed ``thinking`` content
+    blocks, and the front removes those before the CLI sees them
+    (``ovh_gateway_reasoning.SseReasoningStripper``), so reasoning is never
+    carried forward and cannot trip the CLI's thinking-block state machine.
+
+    ``reasoning_params`` are fixed request parameters for the route (for
+    example ``reasoning_effort=low``), validated by
+    ``ovh_gateway_reasoning`` and rendered under the deployment's
+    ``extra_body``. ``extra_body`` is used because LiteLLM passes it through
+    verbatim, whereas a top-level ``litellm_params`` key is silently dropped
+    (``drop_params: true``) for a model LiteLLM does not know supports it.
+    With no parameters the ``extra_body`` block is exactly ``store: false``.
     """
     if not isinstance(api_base, str) or not api_base.startswith(("https://", "http://")):
         raise ValueError("api_base must be an explicit HTTP(S) URL")
+    extra_body = render_extra_body_lines(reasoning_params, indent="        ")
     return (
         "model_list:\n"
         f"  - model_name: {MODEL_ALIAS}\n"
@@ -2327,8 +2336,8 @@ def render_litellm_config(*, api_base: str) -> str:
         "      store: false\n"
         "      extra_body:\n"
         "        store: false\n"
+        f"{extra_body}"
         "      max_retries: 0\n"
-        "      merge_reasoning_content_in_choices: true\n"
         "litellm_settings:\n"
         "  drop_params: true\n"
         "  num_retries: 0\n"

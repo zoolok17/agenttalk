@@ -2268,3 +2268,124 @@ def test_status_reports_no_policy_hash_when_the_ledger_is_unavailable(tmp_path) 
     assert status["child_cap_policy_hash"] is None
     assert "ledger_blocked" in status["errors"]
     assert status["task_identity_ok"] is False
+
+
+# ---------------------------------------------------- reasoning parameters
+
+
+def test_init_with_reasoning_params_renders_them_and_records_them_in_the_manifest(
+    tmp_path,
+) -> None:
+    root, ledger, _front, _internal, _result = _install_at_envelope(
+        tmp_path, "rp", reasoning_params={"reasoning_effort": "low"}
+    )
+    config = litellm_config_path(root).read_text(encoding="utf-8")
+    assert 'reasoning_effort: "low"' in config
+    assert "merge_reasoning_content_in_choices" not in config
+    manifest = json.loads(service.install_manifest_path(root).read_text(encoding="utf-8"))
+    assert manifest["reasoning_params"] == {"reasoning_effort": "low"}
+    status = gateway_status(root, commands=FakeCommands(), ledger=ledger)
+    assert status["reasoning_params"] == {"reasoning_effort": "low"}
+
+
+def test_default_install_has_no_reasoning_params_anywhere(tmp_path) -> None:
+    root, ledger, _front, _internal, _result = _install_at_envelope(tmp_path, "rp0")
+    config = litellm_config_path(root).read_text(encoding="utf-8")
+    assert "reasoning" not in config
+    manifest = json.loads(service.install_manifest_path(root).read_text(encoding="utf-8"))
+    assert "reasoning_params" not in manifest
+    assert gateway_status(root, commands=FakeCommands(), ledger=ledger)["reasoning_params"] == {}
+
+
+def test_init_refuses_an_invalid_reasoning_param_before_creating_any_state(tmp_path) -> None:
+    from agenttalk.ovh_gateway_reasoning import ReasoningParamError
+
+    base = tmp_path / "bad"
+    executable = tmp_path / "litellm.exe"
+    executable.write_bytes(b"fake")
+    ledger = SpendLedger(base / "spend" / "ledger.sqlite3", base / "spend" / "install.json")
+    with pytest.raises(ReasoningParamError):
+        initialize_install(
+            base / "project",
+            litellm_executable=executable,
+            opening_micro_eur=580_000,
+            opening_evidence="test dashboard, observed 2026-07-16",
+            ledger=ledger,
+            front_token_path=base / "secrets" / "front.txt",
+            internal_token_path=base / "secrets" / "internal.txt",
+            reasoning_params={"model": "other"},
+        )
+    assert not (base / "project").exists()
+    assert ledger.installation_state() == "absent"
+
+
+def _reconfigure_root(tmp_path, monkeypatch, **params):
+    monkeypatch.setattr(service, "_both_sockets_free", lambda: True)
+    root, ledger, _front, _internal, _result = _install_at_envelope(tmp_path, "rc", **params)
+    return root, ledger
+
+
+def test_reconfigure_keeps_the_stored_reasoning_params_when_none_are_given(
+    tmp_path, monkeypatch
+) -> None:
+    root, ledger = _reconfigure_root(
+        tmp_path, monkeypatch, reasoning_params={"reasoning_effort": "low"}
+    )
+    before = litellm_config_path(root).read_bytes()
+    result = service.reconfigure_endpoint(root, ledger=ledger)
+    assert result["changed"] is False
+    assert result["reasoning_params"] == {"reasoning_effort": "low"}
+    assert litellm_config_path(root).read_bytes() == before
+
+
+def test_reconfigure_replaces_then_clears_reasoning_params_without_touching_the_ledger(
+    tmp_path, monkeypatch
+) -> None:
+    root, ledger = _reconfigure_root(tmp_path, monkeypatch)
+    marker_path = tmp_path / "rc" / "spend" / "install.json"
+    marker_before = marker_path.read_bytes()
+    default_config = litellm_config_path(root).read_bytes()
+
+    changed = service.reconfigure_endpoint(
+        root, ledger=ledger, reasoning_params={"chat_template_kwargs.enable_thinking": False}
+    )
+    assert changed["changed"] is True
+    config = litellm_config_path(root).read_text(encoding="utf-8")
+    assert "chat_template_kwargs:\n          enable_thinking: false\n" in config
+    manifest = service.load_install_manifest(root, ledger=ledger)
+    assert manifest["reasoning_params"] == {"chat_template_kwargs.enable_thinking": False}
+
+    cleared = service.reconfigure_endpoint(root, ledger=ledger, clear_reasoning_params=True)
+    assert cleared["changed"] is True and cleared["reasoning_params"] == {}
+    assert litellm_config_path(root).read_bytes() == default_config
+    assert "reasoning_params" not in service.load_install_manifest(root, ledger=ledger)
+    assert marker_path.read_bytes() == marker_before  # no re-init, no new canary
+
+
+def test_reconfigure_refuses_setting_and_clearing_reasoning_params_together(
+    tmp_path, monkeypatch
+) -> None:
+    root, ledger = _reconfigure_root(tmp_path, monkeypatch)
+    with pytest.raises(GatewayConfigError, match="mutually exclusive"):
+        service.reconfigure_endpoint(
+            root,
+            ledger=ledger,
+            reasoning_params={"reasoning_effort": "low"},
+            clear_reasoning_params=True,
+        )
+
+
+def test_a_tampered_manifest_reasoning_param_fails_closed(tmp_path, monkeypatch) -> None:
+    root, ledger = _reconfigure_root(
+        tmp_path, monkeypatch, reasoning_params={"reasoning_effort": "low"}
+    )
+    manifest_path = service.install_manifest_path(root)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["reasoning_params"] = {"model": "other"}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(GatewayConfigError, match="reasoning parameters are invalid"):
+        service.load_install_manifest(root, ledger=ledger)
+    with pytest.raises(GatewayConfigError, match="reasoning parameters are invalid"):
+        service.reconfigure_endpoint(root, ledger=ledger)
+    status = gateway_status(root, commands=FakeCommands(), ledger=ledger)
+    assert "install_manifest_invalid" in status["errors"]
