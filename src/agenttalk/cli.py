@@ -3820,7 +3820,10 @@ def cmd_close(args: argparse.Namespace) -> int:
         verdict = close_mod.VERDICT_GO if args.verdict == "go" else close_mod.VERDICT_HOLD
         barrier_epoch = None
         try:
-            # The per-close lock spans reload, all impure evaluations, verdict derivation,
+            # The store-wide close-writer lock, then the per-close lock, span reload,
+            # the complete acceptance source audit through durable commit. Another
+            # close cannot create or change an obligation inside that interval.
+            # The per-close lock also spans all impure evaluations, verdict derivation,
             # persistence, and the optional barrier stamp - and evidence is resolved immediately
             # before the write (nothing but in-memory record mutation sits between the resolve at
             # `_build_dod_eval`/`compute_verdict` and `transaction.commit`), keeping the exposure

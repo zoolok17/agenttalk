@@ -347,3 +347,22 @@ A later retained terminal version supersedes the unfinished version for this
 prerequisite; both versions' evidence stays retained. A previously clean check
 does not authorize publication against a now-incomplete source set. Already
 published records remain immutable; this check governs each new GO decision.
+
+All close writers in the local store share one writer lock, acquired before the
+per-close lock. GO holds both from reload and source discovery through durable
+publication. Opening another attempt, recording a counter, submitting a cold
+report, or saving any other close mutation must wait or return a conflict while
+publication owns the lock. If that writer completes first, publication sees its
+obligations and refuses a stale candidate. If publication completes first, a
+later writer cannot retroactively change its decision. This also serializes
+ordinary close writes; it avoids a classification gap when acceptance is first
+attached. Gate, knowledge and signoff stores retain their separate locking rules
+(issues 66/31); external bus stores still require cooperative disclosure.
+
+Audit enumeration is strict. Unreadable, missing or partly enumerated local
+history produces `acceptance_audit_unavailable`, even when individual known files
+remain readable. Restore access to the complete closes directory and retry;
+replacing unavailable history with an empty directory discards evidence.
+`close show` keeps displaying the requested record and reports the enumeration
+failure in `acceptance_successors_error`. A genuinely empty readable directory
+is distinct from unavailable history.

@@ -34,7 +34,9 @@ from decimal import Decimal
 import hashlib
 import json
 import math
+import os
 import re
+import threading
 import uuid
 from typing import Any
 
@@ -1375,13 +1377,43 @@ def close_instance_id(record: dict) -> str | None:
     return instance_id
 
 
+_writer_locks = threading.local()
+
+
+@contextlib.contextmanager
+def _acceptance_writer_lock(store, *, timeout: float):
+    """Serialize close writers in this store, including GO's entire audit/commit.
+
+    All closes participate so classification or conversion cannot bypass the
+    boundary. Only this outer lock is reentrant, for successor creation inside
+    the parent's transaction; per-ID locks still reject nested same-ID writes.
+    Thread-local ownership includes the PID so a fork cannot inherit ownership.
+    """
+    key = (os.getpid(), os.path.normcase(str(store.dir.resolve())))
+    held = getattr(_writer_locks, "held", None)
+    if held is None:
+        held = _writer_locks.held = set()
+    if key in held:
+        yield
+        return
+    with store._exclusive_lock(store.dir / ".acceptance-write.lock", timeout=timeout,
+                               what="acceptance store writer lock"):
+        held.add(key)
+        try:
+            yield
+        finally:
+            held.remove(key)
+
+
+@contextlib.contextmanager
 def _close_update_lock(store, close_id: str, *, timeout: float):
     lock_path = closes_dir(store) / f".{validate_close_id(close_id)}.lock"
-    return store._exclusive_lock(
+    with _acceptance_writer_lock(store, timeout=timeout), store._exclusive_lock(
         lock_path,
         timeout=timeout,
         what=f"close {close_id!r} update lock (another agent may be updating it)",
-    )
+    ):
+        yield
 
 
 def _write_close(path, record: dict) -> None:
@@ -1633,11 +1665,16 @@ def save_close(store, record: dict, *, expected_generation: int | None = None,
     return next_generation
 
 
-def list_close_ids(store) -> list[str]:
+def list_close_ids(store, *, strict: bool = False) -> list[str]:
+    """Enumerate completely or raise; only non-audit callers may omit the directory."""
     d = closes_dir(store)
-    if not d.exists():
+    try:
+        with os.scandir(d) as entries:
+            return sorted(entry.name[:-5] for entry in entries if entry.name.lower().endswith(".json"))
+    except FileNotFoundError:
+        if strict:
+            raise
         return []
-    return sorted(p.stem for p in d.glob("*.json"))
 
 
 # ----------------------------------------------- pure state transitions

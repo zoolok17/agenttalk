@@ -162,7 +162,14 @@ def project_attempts(store, record):
     """Read project history once per audit, failing closed on unknown identities."""
     route = record["acceptance_route"]
     seen = set()
-    for close_id in close.list_close_ids(store):
+    try:
+        close_ids = close.list_close_ids(store, strict=True)
+    except OSError as exc:
+        A._fail(f"acceptance audit unavailable at {close.closes_dir(store)}: {exc}; "
+                "restore readable access to the complete closes directory and retry; "
+                "do not replace unavailable history with an empty directory",
+                "acceptance_audit_unavailable")
+    for close_id in close_ids:
         if close_id == record["close_id"]:
             continue
         try:

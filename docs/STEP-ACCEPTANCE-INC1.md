@@ -1315,3 +1315,109 @@ Ruff on the two touched Python files passed. Privacy: 8/8 positive controls and
 zero added-content matches; exact five-file scope, unchanged design and
 `git diff --check` passed. Scratch test stores, logs and isolated mutation copies
 are retained for the sweeper's re-check; reviewer scratch remains unchanged.
+
+## R4/R5 correction: serialized publication and strict enumeration
+
+Base: `b815565`. The local authoritative store now serializes every close writer
+against acceptance GO's complete audit and durable commit. No second rescan was
+added. The shared lock uses the existing store lock implementation, including
+its owner/generation handling; lock order is store writer lock, then close-ID
+lock. All closes participate to avoid an unlocked classification/conversion
+window. Contention returns the existing CLI conflict result (3), with no close-record write.
+This deliberately serializes ordinary close writes too.
+
+Writer inventory: `create_close`, `save_close`, `replace_close`,
+`upgrade_legacy_close`, and `close_transaction` all enter `_close_update_lock`.
+The transaction holds the outer lock before reload until its context exits,
+including `CloseTransaction.commit` and `_write_close`. This covers CLI open,
+ack/counter/remediation, draft, publish/reopen, acceptance freeze/attach, cold
+commit/reconcile, and successor creation. Successor creation can nest another
+close's transaction in the same thread, so only the outer store lock is
+reentrant (keyed by process, thread and resolved store path). The per-ID lock
+remains non-reentrant. Separate processes and threads cannot inherit ownership.
+Exceptions unwind both locks. Separate stores retain independent locks.
+
+Enumeration inventory from searching `acceptance*.py` and `close.py` for
+`glob/rglob/listdir/walk/iterdir/scandir/list_close_ids`:
+
+| Site | Use | Failure behavior |
+| --- | --- | --- |
+| `close.list_close_ids` | Shared physical closes-directory enumeration | Fully materializes `os.scandir`; propagates permission and partial-iteration errors. Strict callers also propagate missing-directory errors. Ordinary callers may still list a never-created directory as empty. |
+| `acceptance_audit.project_attempts` | Exposure audit plus obligation capture and live discovery | Calls strict enumeration; converts any enumeration IO failure to `acceptance_audit_unavailable` with directory and restore-access remedy. No partial source set is used. |
+| `acceptance_history.successors` | Read-only `close show` diagnostic | Calls strict enumeration; returns a named error alongside the requested close instead of hiding it. |
+
+No other filesystem enumeration sites were found in the acceptance modules.
+Coverage, cold and hygiene readers follow explicit retained hashes; obligation
+capture and discovery both use `project_attempts`. Their retained-byte checks
+remain in force. Named-file readability does not substitute for a complete audit.
+
+The sweeper's original R4/R5 selection failed before the change: **2 failed,
+1 passed, 2 deselected** (13.18 seconds), specifically unsafe GO in the race and
+directory-denial cases. Four new committed regressions also failed first
+(**4 failed, 528 deselected**, 16.06 seconds).
+
+The race probe's scheduling contract requires a precise distinction. Its
+synchronous pre-commit hook waits for the child to complete while A owns its
+publication lock. Under serialization that child cannot complete successfully;
+the original assertion `child.returncode == 0` is incompatible with the required
+lock. The committed two-process regression retains that scheduling point and
+requires the child CLI open to return conflict (3) and create no record. A can
+then commit GO safely; the child can open after release. In the writer-first
+ordering, existing later/sibling obligation tests and the unchanged sweeper
+finite-recovery control require HOLD. No successful obligation write can occur
+between A's audit and commit. This is mutual exclusion, not a second rescan or a
+claim that a future writer retroactively invalidates a completed GO.
+
+The unchanged race probe was also executed after the fix: **1 failed** in 19.15
+seconds, now at its `child.returncode == 0` setup assumption. The child's CLI
+open printed `HOLD - concurrent close update conflict` for the shared writer
+lock, so it never recorded B's counter and A never reached its durable commit.
+This is not counted as a passing test; the replacement regression above checks
+the valid serialized outcome explicitly. Its log is retained as
+`<S>/r45-original-race-after.log` for the sweeper.
+
+| Requirement | Executed regression |
+| --- | --- |
+| R4: second process cannot write after audit/before durable GO | `test_acceptance_publish_excludes_second_process_writer_through_commit` |
+| R4: all five persistence APIs use the boundary | `test_all_close_writers_share_store_serialization` (five rows) |
+| R4: nested successor, same-ID exclusion, exception release, separate stores | `test_close_store_lock_nested_successor_exception_and_store_scope` |
+| R4: source already changed before GO must HOLD | Existing publication-rescan test, ordering table and unchanged sweeper finite-recovery probe |
+| R5: permission, missing-directory and partial enumeration | `test_acceptance_audit_enumeration_unavailable_is_named_hold` (three rows; check and publish, no mutation, show error) |
+| R5: genuinely empty readable history | `test_close_strict_enumeration_distinguishes_empty_from_missing` |
+
+Focused results: **5 passed, 527 deselected** (29.28 seconds) for acceptance
+serialization/enumeration and the existing rescan-lock test; **7 passed,
+249 deselected** (1.98 seconds) for persistence APIs and strict listing.
+The sweeper's other four probes ran unchanged: **4 passed, 1 deselected**
+(20.65 seconds), covering unreadable named records/directories, concurrent
+requests followed by finite recovery, and external-store boundaries. Reviewer
+probe files remain unchanged.
+
+The local close-record invariant does not serialize gate, knowledge or signoff
+stores (their existing separate-lock limitation remains tracked by issues 66/31),
+direct filesystem tampering, or undisclosed external bus history. Route/report/
+bundle/ack schemas and CLI flags are unchanged. Required re-review: the final
+sweeper's concurrency/persistence and fail-closed IO lenses. Validation results
+for the complete targeted run follow below.
+
+All fifteen earlier sweeper probes also passed unchanged (**15 passed**, 83.52
+seconds). Two in-memory mutations were killed without changing working source:
+removing the store lock failed all five writer API rows; restoring `glob` failed
+the named audit-denial regression. The unmutated versions passed in the focused
+runs above. Logs and scripts remain in assigned scratch for re-review.
+
+Final command, foreground with `PYTHONPATH=<W>/src`, bytecode disabled and
+isolated assigned scratch:
+
+```text
+python -m pytest tests/test_acceptance.py tests/test_close.py tests/test_close_signoffs.py tests/test_gates.py -q --basetemp <S>/r45-regression -p no:cacheprovider
+```
+
+Result: **873 passed, 1 skipped in 2130.08 seconds (35m30s)**, in one completed
+invocation on the final production/test source. The skip is host-restricted
+symlink creation. The durable log is `<S>/r45-regression.log`. No full-repository
+suite or performance result is claimed. Ruff passed on all six touched Python
+files. Privacy: 8/8 positive controls, zero added-content matches; nine-file
+scope, unchanged design and `git diff --check` verified. Scratch `r45-*` stores,
+logs and `mutate-r45.py` are retained for the sweeper; reviewer scratch remains
+unchanged. No PR, merge or release is part of this correction.

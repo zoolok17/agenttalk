@@ -3186,3 +3186,82 @@ def test_acceptance_schema3_cannot_attach_without_required_hygiene(case_v3, fiel
 def test_acceptance_pure_go_fold_requires_hygiene():
     assert "acceptance_record_missing" in {code for code, _ in acceptance.evaluate(
         {"trust_checked": True, "cold_checked": True, "holds": [], "outcomes": []})}
+
+
+def test_acceptance_publish_excludes_second_process_writer_through_commit(case_v3, monkeypatch):
+    """Publisher-first order: a child cannot record an obligation before GO commits."""
+    import os
+    import sys
+
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    assign_fresh_cold(case, "late-reviewer")
+    original = close.CloseTransaction.commit
+    observed = []
+
+    def commit(tx):
+        if tx.close_id == "attempt" and (tx.record.get("final") or {}).get("verdict") == "GO":
+            code = '''import json, sys
+from agenttalk import cli
+p = json.loads(sys.argv[1])
+sys.exit(cli.main(['--root', p['root'], 'close', 'open', '--id', 'late',
+    '--from', 'lead', '--scope', 'milestone', '--revision', p['sha'],
+    '--non-lane-isolation-not-asserted', '--acceptance-plan', p['plan'],
+    '--project-repo', p['project']]))
+'''
+            payload = {"root": str(case["store"].root), "sha": case["sha"],
+                       "plan": str(case["inputs"] / "plan.json"), "project": str(case["project"])}
+            child = subprocess.run([sys.executable, "-c", code, json.dumps(payload)],
+                                   env=dict(os.environ, AGENTTALK_ROOT=payload["root"], AGENTTALK_SELF="lead"),
+                                   capture_output=True, text=True, timeout=30)
+            observed.append(child.returncode)
+            assert child.returncode == 3, child.stdout + child.stderr
+            assert not close.close_path(case["store"], "late").exists()
+        return original(tx)
+
+    monkeypatch.setattr(close.CloseTransaction, "commit", commit)
+    assert command(case, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go") == 0
+    assert observed == [3]
+    # The same real writer succeeds after the durable GO and lock release.
+    assert open_attempt(case, "--id", "late") == 0
+
+
+@pytest.mark.parametrize("fault", ["denied", "missing", "partial"])
+def test_acceptance_audit_enumeration_unavailable_is_named_hold(case_v3, monkeypatch, fault):
+    import os
+    from pathlib import Path
+
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    original = os.scandir
+
+    class Partial:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def __iter__(self):
+            with original(close.closes_dir(case["store"])) as entries:
+                yield next(entries)
+            raise PermissionError("injected partial enumeration")
+
+    def scandir(path):
+        if Path(path) == close.closes_dir(case["store"]):
+            if fault == "partial":
+                return Partial()
+            raise (PermissionError if fault == "denied" else FileNotFoundError)("injected unavailable audit")
+        return original(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    result = snapshot(case)
+    assert "acceptance_audit_unavailable" in {code for code, _ in result["holds"]}
+    assert command(case, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go") == 3
+    assert close.load_close(case["store"], "attempt")["final"] is None
+    from agenttalk import acceptance_history
+    children, errors = acceptance_history.successors(case["store"], close.load_close(case["store"], "attempt"))
+    assert children == []
+    assert errors and "acceptance_audit_unavailable" in errors[0]["error"]

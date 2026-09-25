@@ -65,6 +65,79 @@ def _codes(result: dict) -> set[str]:
 
 # --------------------------------------------------------------- pure: GO
 
+
+@pytest.mark.parametrize("writer", ["create", "save", "transaction", "replace", "upgrade"])
+def test_all_close_writers_share_store_serialization(tmp_path, writer):
+    store = Store(tmp_path)
+    store.init(["lead"])
+    first = _satisfied()
+    close.create_close(store, first)
+    second = _satisfied()
+    second["close_id"] = "second"
+    if writer != "create":
+        close.create_close(store, second)
+    if writer == "upgrade":
+        second.pop("generation")
+        second.pop("instance_id")
+        close.close_path(store, "second").write_text(json.dumps(second), encoding="utf-8")
+
+    def write():
+        if writer == "create":
+            close.create_close(store, second, lock_timeout=0.05)
+        elif writer == "save":
+            close.save_close(store, second, expected_generation=second["generation"],
+                             expected_instance_id=second["instance_id"], lock_timeout=0.05)
+        elif writer == "transaction":
+            with close.close_transaction(store, "second", lock_timeout=0.05) as tx:
+                tx.commit()
+        elif writer == "replace":
+            replacement = _satisfied()
+            replacement["close_id"] = "second"
+            close.replace_close(store, replacement, expected_generation=second["generation"],
+                                expected_instance_id=second["instance_id"], lock_timeout=0.05)
+        else:
+            close.upgrade_legacy_close(store, "second", lock_timeout=0.05)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with close.close_transaction(store, "c1"):
+            with pytest.raises(TimeoutError, match="acceptance store writer lock"):
+                pool.submit(write).result(timeout=5)
+        pool.submit(write).result(timeout=5)
+
+
+def test_close_store_lock_nested_successor_exception_and_store_scope(tmp_path):
+    store = Store(tmp_path / "one")
+    other = Store(tmp_path / "two")
+    for target in (store, other):
+        target.init(["lead"])
+        close.create_close(target, _satisfied())
+    with pytest.raises(ValueError, match="abort"):
+        with close.close_transaction(store, "c1"):
+            child = _satisfied()
+            child["close_id"] = "child"
+            close.create_close(Store(store.root), child)
+            with close.close_transaction(store, "child") as tx:
+                tx.commit()
+            # Reentrancy is only for the outer store lock, never the ID lock.
+            with pytest.raises(TimeoutError):
+                with close.close_transaction(store, "c1", lock_timeout=0.01):
+                    pytest.fail("same-ID lock unexpectedly reentered")
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                pool.submit(close.create_close, other, dict(_satisfied(), close_id="other-child")).result(timeout=5)
+            raise ValueError("abort")
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(close.create_close, store, dict(_satisfied(), close_id="after-abort")).result(timeout=5)
+
+
+def test_close_strict_enumeration_distinguishes_empty_from_missing(tmp_path):
+    store = Store(tmp_path)
+    store.init(["lead"])
+    assert close.list_close_ids(store) == []
+    with pytest.raises(FileNotFoundError):
+        close.list_close_ids(store, strict=True)
+    close.closes_dir(store).mkdir()
+    assert close.list_close_ids(store, strict=True) == []
+
 def test_satisfied_close_is_go() -> None:
     result = close.compute_verdict(_satisfied(), _gate_go())
     assert result["verdict"] == close.VERDICT_GO

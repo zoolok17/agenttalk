@@ -25,7 +25,12 @@ def successors(store, parent):
     """Read-only audit of every sibling, including open alternatives, by parent attempt."""
     result, errors = [], []
     identity = parent["acceptance_route"].get("attempt_id")
-    for close_id in close.list_close_ids(store):
+    try:
+        close_ids = close.list_close_ids(store, strict=True)
+    except OSError as exc:
+        return result, [{"error": f"acceptance_audit_unavailable: {close.closes_dir(store)}: {exc}; "
+                        "restore readable access to the complete closes directory and retry"}]
+    for close_id in close_ids:
         try:
             child = close.load_close(store, close_id)
             digest = (child.get("acceptance_route") or {}).get("parent_record_hash")
