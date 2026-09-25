@@ -520,7 +520,11 @@ def test_acceptance_malformed_informational_keeps_gating_outcome(case, capsys, m
     assert snapshot["outcomes"][0]["passed"] is False
     assert snapshot["outcomes"][1]["passed"] is None
     assert snapshot["outcomes"][1]["error"]
-    assert snapshot["holds"] == []
+    if malformed == "value":
+        assert snapshot["holds"] == []
+    else:
+        code = "acceptance_policy_invalid" if malformed == "json" else "acceptance_record_missing"
+        assert code in {c for c, _ in snapshot["holds"]}
 
 
 def test_acceptance_incompatible_lens_does_not_burn_id(case):
@@ -625,8 +629,39 @@ def bundle_v2(case, **kwargs):
                                       "revision": case["sha"], "head_before": case["sha"], "head_after": case["sha"],
                                       "status_before": "", "status_after": "",
                                       "rows": [{"id": row["id"], "artifact": aid}]})
+    if case["plan"]["schema_version"] == 3:
+        data["schema_version"] = 3
+        hygiene_bundle(case, data)
     write_json(case["inputs"] / "bundle.json", data)
     return data
+
+
+def hygiene_bundle(case, data):
+    """Synthetic cooperative records, never a claim these fixtures executed tools."""
+    from agenttalk import acceptance_hygiene as hygiene
+    data.setdefault("recovery_approvals", [])
+    data["hygiene"] = "hygiene"
+    data["artifacts"] = [a for a in data["artifacts"] if not a["id"].startswith("hygiene")]
+
+    def artifact(aid, value):
+        value.update(schema_version=1, binding=hygiene.binding(data))
+        digest = write_json(case["inputs"] / (aid + ".json"), value)
+        data["artifacts"].append({"id": aid, "path": aid + ".json", "sha256": digest})
+
+    for run in data["runs"] + data["reproductions"]:
+        run["environment"] = "hygiene-env-" + run["id"]
+        run["offline_proof"] = "hygiene-offline-" + run["id"]
+        artifact(run["environment"], {"run_id": run["id"], "version_banners": ["synthetic version 1"],
+                 "scratch": "isolated scratch", "cache_overlay": "fresh overlay", "service_data": "fresh data",
+                 "scratch_isolated": True, "cache_overlay_fresh": True, "service_data_fresh": True,
+                 "outputs_outside_checkout": True, "services": []})
+        artifact(run["offline_proof"], {"run_id": run["id"], "mode": "external-denial", "egress_denied": True,
+                 "owned_loopback_only": True, "positive_control": True, "attempted_fetch": False,
+                 "evidence": "synthetic external denial and owned-loopback control log"})
+    artifact("hygiene", {"sealed_manifest": hygiene.execution_manifest(data),
+             "bundle_digest": hygiene.execution_digest(data), "retained_readable": True, "scratch_removed": True,
+             "services_stopped": True, "ports_released": True,
+             "confidentiality": {"positive_control": True, "matches": [], "evidence": "synthetic scan log"}})
 
 
 def snapshot(case):
@@ -1636,6 +1671,16 @@ def cold_phase(case, phase, close_id="attempt", *, change=None, actor="cold"):
         change(data)
     elif change:
         data.update(change)
+    if phase == "reconcile":
+        from agenttalk import acceptance_hygiene
+        if route["bundle_hash"] and route["cold_commit_hash"]:
+            manifest, digest = acceptance_hygiene.final_manifest(case["store"], route, data)
+        else:
+            # Deliberately premature reports must reach the CLI ordering guard.
+            manifest, digest = [], "0" * 64
+        data["closeout"] = {"sealed_manifest": manifest, "report_digest": digest,
+                            "confidentiality": {"positive_control": True, "matches": [],
+                                                "evidence": "synthetic final record sweep"}}
     path = case["inputs"] / (phase + ".json")
     write_json(path, data)
     return command(case, "acceptance", "cold", "--id", close_id, "--phase", phase,
@@ -1656,7 +1701,7 @@ def final_accepts(case, data, close_id="attempt"):
     assert ack_lens(case, "acceptance-cold", case["plan"]["cold_policy"]["reviewer"], close_id) == 0
 
 
-def complete_v3(case, *, close_id="attempt", build_exit=0):
+def complete_v3(case, *, close_id="attempt", build_exit=0, amend=None):
     reviewer = case["plan"]["cold_policy"]["reviewer"]
     assert cold_phase(case, "commit", close_id, actor=reviewer) == 0
     data = bundle_v2(case, build_exit=build_exit)
@@ -1664,6 +1709,9 @@ def complete_v3(case, *, close_id="attempt", build_exit=0):
     data.update(schema_version=3, close_id=close_id,
                 **{k: record["acceptance_route"][k] for k in
                    ("instance_id", "attempt_id", "revision", "plan_hash", "registry_hash", "project_id")})
+    hygiene_bundle(case, data)
+    if amend:
+        amend(data)
     write_json(case["inputs"] / "bundle.json", data)
     assert command(case, "acceptance", "attach", "--id", close_id, "--from", "lead",
                    "--file", str(case["inputs"] / "bundle.json")) == 0
@@ -1913,7 +1961,8 @@ def test_acceptance_unapproved_lineage_requires_new_root(case_v3, capsys):
     assign_fresh_cold(case, "cold-root")
     assert open_attempt(case, "--id", "new-root") == 0
     complete_v3(case, close_id="new-root")
-    assert command(case, "check", "--id", "new-root") == 0
+    # Recovery resets procedural lineage, not the accumulated assertions.
+    assert command(case, "check", "--id", "new-root") == 3
 
 
 def test_acceptance_amendment_keeps_unrelated_outcome_passed(case_v2):
@@ -2494,3 +2543,251 @@ def test_acceptance_change_base_verified_before_creation(case_v3, base):
     write_json(case["inputs"] / "plan.json", case["plan"])
     assert open_attempt(case) == 3
     assert not close.close_path(case["store"], "attempt").exists()
+
+
+def test_acceptance_recovery_root_preserves_failed_obligation(case_v3):
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case, build_exit=1)
+    publish_hold(case)
+    case["plan"]["rows"][0]["expected"] = 1
+    assign_fresh_cold(case, "fresh-root-reviewer")
+    assert open_attempt(case, "--id", "recovery") == 0
+    complete_v3(case, close_id="recovery", build_exit=1)
+    result = acceptance.resolve(case["store"], close.load_close(case["store"], "recovery"))
+    assert "acceptance_category_moved_unreviewed" in {c for c, _ in result["holds"]}
+    assert command(case, "publish", "--id", "recovery", "--from", "lead", "--verdict", "go") == 3
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+def test_acceptance_informational_required_artifact_integrity_holds(case_v3, damage):
+    case = case_v3
+    case["plan"]["rows"][1]["policy"] = "informational"
+    write_json(case["inputs"] / "plan.json", case["plan"])
+    assert open_attempt(case) == 0
+    data = complete_v3(case)
+    artifact = next(a for a in data["artifacts"] if a["id"] == "tool")
+    path = case["store"].dir / "acceptance" / "sha256" / artifact["sha256"]
+    if damage == "missing":
+        path.unlink()
+    else:
+        path.write_bytes(b"corrupt retained measurement")
+    assert "acceptance_record_missing" in {c for c, _ in snapshot(case)["holds"]}
+    assert command(case, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go") == 3
+
+
+@pytest.mark.parametrize("rewrite", ["same-sha", "rebase", "squash", "different"])
+def test_acceptance_recovery_obligations_follow_change_table(case_v3, rewrite):
+    case = case_v3
+    base = case["sha"]
+    commits = []
+    for name in ("first.txt", "second.txt"):
+        (case["project"] / name).write_text("reviewed change\n", encoding="utf-8")
+        git(case["project"], "add", name)
+        git(case["project"], "commit", "-qm", "reviewed change part")
+        commits.append(git(case["project"], "rev-parse", "HEAD"))
+    case["sha"] = commits[-1]
+    case["plan"]["cold_policy"]["change_base"] = base
+    write_json(case["inputs"] / "plan.json", case["plan"])
+    assert open_attempt(case) == 0
+    complete_v3(case, build_exit=1)
+    publish_hold(case)
+    if rewrite != "same-sha":
+        git(case["project"], "branch", "original", case["sha"])
+        git(case["project"], "checkout", "--detach", base)
+        (case["project"] / "base.txt").write_text("base update\n", encoding="utf-8")
+        git(case["project"], "add", "base.txt")
+        git(case["project"], "commit", "-qm", "base update")
+        new_base = git(case["project"], "rev-parse", "HEAD")
+        if rewrite == "rebase":
+            git(case["project"], "rebase", "--onto", new_base, base, "original")
+        elif rewrite == "squash":
+            git(case["project"], "merge", "--squash", commits[-1])
+            git(case["project"], "commit", "-qm", "same diff squashed")
+        else:
+            (case["project"] / "different.txt").write_text("different change\n", encoding="utf-8")
+            git(case["project"], "add", "different.txt")
+            git(case["project"], "commit", "-qm", "different change")
+        case["sha"] = git(case["project"], "rev-parse", "HEAD")
+        case["plan"]["cold_policy"]["change_base"] = new_base
+    # Disjoint labels must not hide a same-content obligation; genuinely
+    # different history/content also needs disjoint targets to be independent.
+    for row in case["plan"]["rows"]:
+        row["id"] += "-new"
+        row["artifact"] += "-new"
+    case["plan"]["rows"][0]["expected"] = 1
+    assign_fresh_cold(case, "new-reviewer")
+    assert open_attempt(case, "--id", "recovery") == 0
+    complete_v3(case, close_id="recovery", build_exit=1)
+    result = acceptance.resolve(case["store"], close.load_close(case["store"], "recovery"))
+    blocked = rewrite != "different"
+    assert ("acceptance_category_moved_unreviewed" in {c for c, _ in result["holds"]}) is blocked
+    if blocked:
+        sources = result["related_obligations"][0]["protected"].values()
+        assert any(s["outcome"].get("passed") is False for p in sources for s in p["sources"])
+    assert command(case, "publish", "--id", "recovery", "--from", "lead", "--verdict", "go") == (3 if blocked else 0)
+
+
+@pytest.mark.parametrize("resolution", ["passing", "approved", "tampered", "expired", "lead"])
+def test_acceptance_recovery_requires_original_pass_or_exact_operator_approval(case_v3, resolution):
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case, build_exit=1)
+    publish_hold(case)
+    original = close.load_close(case["store"], "attempt")
+    if resolution != "passing":
+        case["plan"]["rows"][0]["expected"] = 1
+    assign_fresh_cold(case, "fresh-root")
+    approval_path = target_approval(case, "attempt", "recovery") if resolution != "passing" else None
+    assert open_attempt(case, "--id", "recovery") == 0
+
+    def approve(data):
+        if not approval_path:
+            return
+        reduction = json.loads(approval_path.read_text())
+        raw = (case["store"].messages_dir / (reduction["decision_ref"] + ".json")).read_bytes()
+        if resolution == "lead":
+            message = json.loads(raw)
+            message["from"] = "lead"
+            raw = json.dumps(message).encode()
+            (case["store"].messages_dir / (reduction["decision_ref"] + ".json")).write_bytes(raw)
+        if resolution == "tampered":
+            reduction["changes"][next(iter(reduction["changes"]))]["new"][0]["expected"] = 2
+        path = case["inputs"] / "operator.json"
+        path.write_bytes(raw)
+        data["recovery_approvals"] = [{"prior_attempt_id": original["acceptance_route"]["attempt_id"],
+                                       "reduction": reduction, "approval_artifact": "operator"}]
+        data["artifacts"].append({"id": "operator", "path": path.name, "sha256": hashlib.sha256(raw).hexdigest()})
+        hygiene_bundle(case, data)
+
+    complete_v3(case, close_id="recovery", build_exit=0 if resolution == "passing" else 1, amend=approve)
+    if resolution == "expired":
+        # Expiry is rechecked at GO time, not just when attachment succeeds.
+        from agenttalk import acceptance_history
+        from datetime import datetime, timezone
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(acceptance_history, "_now", lambda: datetime.max.replace(tzinfo=timezone.utc))
+            assert command(case, "publish", "--id", "recovery", "--from", "lead", "--verdict", "go") == 3
+        return
+    result = acceptance.resolve(case["store"], close.load_close(case["store"], "recovery"))
+    assert close.load_close(case["store"], "attempt") == original
+    if resolution == "approved":
+        assert result["outcomes"][0]["original_outcome"]["passed"] is False
+        assert result["outcomes"][0]["disposition"] == "policy-amended"
+    assert command(case, "publish", "--id", "recovery", "--from", "lead", "--verdict", "go") == (
+        0 if resolution in {"passing", "approved"} else 3)
+
+
+def test_acceptance_ld3_reproducer_can_never_be_final_cold_even_after_commit(case_v3):
+    case = case_v3
+    assert open_attempt(case) == 0
+    assert cold_phase(case, "commit") == 0
+    data = bundle_v2(case)
+    for rep in data["reproductions"]:
+        rep["actor"] = "cold"
+    hygiene_bundle(case, data)
+    write_json(case["inputs"] / "bundle.json", data)
+    assert attach(case) == 0
+    assert cold_phase(case, "reconcile") == 0
+    final_accepts(case, data)
+    assert "acceptance_lens_not_independent" in {c for c, _ in snapshot(case)["holds"]}
+
+
+@pytest.mark.parametrize("fault", ["environment", "offline", "fetch", "positive-control", "cleanup",
+                                  "manifest", "confidentiality", "replay", "reproduction", "service", "isolation"])
+def test_acceptance_hygiene_evidence_required_for_go(case_v3, fault):
+    case = case_v3
+    assert open_attempt(case) == 0
+
+    def damage(data):
+        run = data["reproductions"][0] if fault == "reproduction" else data["runs"][0]
+        aid = (run["environment"] if fault in {"environment", "service", "isolation"} else
+               run["offline_proof"] if fault in {"offline", "fetch", "positive-control", "reproduction"} else "hygiene")
+        artifact = next(a for a in data["artifacts"] if a["id"] == aid)
+        path = case["inputs"] / artifact["path"]
+        value = json.loads(path.read_text())
+        if fault == "environment":
+            value["version_banners"] = []
+        elif fault == "isolation":
+            value["cache_overlay_fresh"] = False
+        elif fault in {"offline", "reproduction"}:
+            value["egress_denied"] = False
+        elif fault == "fetch":
+            value["attempted_fetch"] = True
+        elif fault == "positive-control":
+            value["positive_control"] = False
+        elif fault == "service":
+            value["services"] = [{"pid": 123, "ports": [12345], "owned": True, "stopped": False,
+                                   "ports_released": False, "evidence": "service remains running"}]
+        elif fault == "cleanup":
+            value["scratch_removed"] = False
+        elif fault == "manifest":
+            value["sealed_manifest"] = []
+        elif fault == "confidentiality":
+            value["confidentiality"]["positive_control"] = False
+        else:
+            value["binding"]["attempt_id"] = "another-attempt"
+        artifact["sha256"] = write_json(path, value)
+        # Re-seal the manifest around deliberately invalid run evidence, so its
+        # own guard, not merely a changed manifest, must refuse publication.
+        if aid != "hygiene":
+            from agenttalk import acceptance_hygiene as hygiene
+            proof = next(a for a in data["artifacts"] if a["id"] == "hygiene")
+            value = json.loads((case["inputs"] / proof["path"]).read_text())
+            value.update(sealed_manifest=hygiene.execution_manifest(data), bundle_digest=hygiene.execution_digest(data))
+            proof["sha256"] = write_json(case["inputs"] / proof["path"], value)
+
+    complete_v3(case, amend=damage)
+    result = snapshot(case)
+    assert not result.get("hygiene_checked")
+    assert result["holds"]
+    assert command(case, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go") == 3
+
+
+@pytest.mark.parametrize("fault", ["manifest", "report", "positive-control", "match", "missing-artifact"])
+def test_acceptance_final_sealed_closeout_is_rechecked(case_v3, fault):
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    assert snapshot(case)["hygiene_checked"] is True
+    with close.close_transaction(case["store"], "attempt") as tx:
+        route = tx.record["acceptance_route"]
+        value = acceptance.decode(acceptance._retained(case["store"], route["cold_reconcile_hash"]))
+        if fault == "manifest":
+            value["closeout"]["sealed_manifest"] = []
+        elif fault == "report":
+            value["closeout"]["report_digest"] = "0" * 64
+        elif fault == "positive-control":
+            value["closeout"]["confidentiality"]["positive_control"] = False
+        elif fault == "match":
+            value["closeout"]["confidentiality"]["matches"] = ["unresolved sensitive content"]
+        else:
+            bundle = acceptance.decode(acceptance._retained(case["store"], route["bundle_hash"]))
+            artifact = next(a for a in bundle["artifacts"] if a["id"] == "hygiene")
+            (case["store"].dir / "acceptance" / "sha256" / artifact["sha256"]).unlink()
+        route["cold_reconcile_hash"] = acceptance._retain(case["store"], json.dumps(value).encode())
+        for event in tx.record["events"]:
+            if event["event"] == "acceptance:cold-reconcile":
+                event["report_hash"] = route["cold_reconcile_hash"]
+        for ack in tx.record["lens_acks"].values():
+            ack["acceptance_binding"] = acceptance.ack_binding(tx.record)
+        tx.commit()
+    assert command(case, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go") == 3
+
+
+@pytest.mark.parametrize("field", ["hygiene", "environment", "offline_proof"])
+def test_acceptance_schema3_cannot_attach_without_required_hygiene(case_v3, field):
+    case = case_v3
+    assert open_attempt(case) == 0
+    assert cold_phase(case, "commit") == 0
+    data = bundle_v2(case)
+    (data if field == "hygiene" else data["runs"][0]).pop(field)
+    write_json(case["inputs"] / "bundle.json", data)
+    before = close.load_close(case["store"], "attempt")
+    assert attach(case) == 2
+    assert close.load_close(case["store"], "attempt") == before
+
+
+def test_acceptance_pure_go_fold_requires_hygiene():
+    assert "acceptance_record_missing" in {code for code, _ in acceptance.evaluate(
+        {"trust_checked": True, "cold_checked": True, "holds": [], "outcomes": []})}

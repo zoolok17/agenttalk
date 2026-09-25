@@ -995,3 +995,97 @@ in added content; exact seven-file scope, branch, accepted design bytes and
 `git diff --check` verified. Task gates returned GO. Basetemps, mutation runner,
 logs/source copies and verifier are retained for the final reviewer. No PR or
 release; the lead orders the independent final cold sweep after this handoff.
+
+## Final independent sweep correction — obligations and hygiene
+
+The independent sweep found a root-reset bypass and two missing enforcement
+requirements. This entry supersedes the earlier statements that a new root clears
+all obligations and that informational evidence errors never gate. The accepted
+design changes only its contradictory reviewer/reproducer sentence to the lead's
+final LD3 ruling: disjoint actors, including after commitment.
+
+| Finding | Disposition / enforced behavior |
+| --- | --- |
+| Blocker: fresh root loses failed assertions | Fixed. Project history scanning and the same ancestry/whole-change patch-ID/target identity are shared by reviewer exposure and obligation recovery. Earlier related attempts contribute all strongest gating predicates and compact original outcomes. A new root clears inherited procedural holds only. |
+| Same SHA, rebased or squashed change | Renaming every target does not remove obligations. A fresh reviewer and new root still HOLD `acceptance_category_moved_unreviewed` without the exact operator amendment. |
+| Different history/content and disjoint targets | No inherited obligations; the complete supported fixture can publish GO. |
+| Recovery authorization | Bundle `recovery_approvals` references each prior attempt and an actual operator-message artifact. It uses the existing LD2 exact payload, origin, expiry, target-set and predicate checks. Restoring original assertions and passing them needs no exception. Approved weakened rows retain original failure and `policy-amended`; approvals are per attempt. |
+| Major: missing execution/offline/hygiene evidence | Fixed with required schema-3 run/reproduction environment and offline-proof artifacts, execution close-out and final reconciliation close-out. The closed shapes and sealed-manifest encoding are in ACCEPTANCE.md. |
+| Major: informational artifact deletion/corruption | Fixed. Required artifact retention is checked for every manifest entry; raw-result shape/binding failures HOLD independently of assertion policy. Informational comparison failure remains non-gating. |
+| Minor: cold reviewer reproduces after commit | Lead ruling retained: LD3 actors are disjoint for the entire pass. A specifically named ordered regression enforces it. The guide states the design-text override. |
+| NIT: obsolete CLI help | Open/acceptance help now describes schema-3 cooperative GO and current operations. |
+
+The obligation scan reads earlier attempts, including open attempts with frozen
+plans, and excludes the current retained lineage already checked by the existing
+amendment evaluator. Later-created attempts do not retroactively taint an earlier
+pass. Source protections are conservative: every retained gating predicate is
+preserved, including contradictory predicates introduced by an unapproved attempt;
+restoring only one side then needs an exact amendment. Historical failures remain
+visible even when current original assertions pass. The same existing project
+corruption and unverifiable-identity refusals apply to both audits. Deliberately
+removing history or fabricating a new project/change identity remains outside the
+documented cooperative profile; it is not an authorized recovery procedure.
+
+Minimal supported hygiene profile: externally enforced egress denial with an
+owned-loopback restriction and a positive control; no attempted fetch; retained
+version banners, isolated scratch/cache/service-data descriptions and per-service
+PID/socket/teardown evidence; all scratch removed, owned services stopped and ports
+released. Recipe-only offline evidence and approved scratch retention are not yet
+supported, so they cannot GO. Evidence is bound to the attempt and each original
+or reproduction run. The execution manifest excludes only its hygiene result.
+The final evidence projection includes the initial delivery, revealed execution
+set, retained lineage and reconciled findings, with the final close-out result
+excluded to avoid a cycle. Acknowledgments/publication are subsequent derived
+metadata, outside that source-evidence projection. Retention is rechecked at
+publication. These records enforce evidence presence, shape and binding in LD1's
+cooperative model; no authenticated sandbox or confidential-content detector is
+claimed. Vendor availability, actual access separation and truthful execution
+remain the previously documented cooperative residuals.
+
+Readers changed together: `_bundle`/attach/resolve, the pure verdict fold, cold
+reconciliation validation, test bundle/report producers and the user guide. New
+schema-3 fields make older development engines reject the closed bundle/report
+shapes. Schema-1/2 routes remain HOLD-only; ordinary closes retain their contract.
+The coverage approval evaluator is shared by linked amendments and recovery roots.
+No route, acknowledgment or ordinary final-envelope schema was relaxed.
+
+Failing-first evidence: the new-root weakening and missing/corrupt informational
+artifact regressions each failed on the unmodified engine: **3 failed, 273
+deselected**. The observed hold sets were empty in all three cases. The first
+post-fix selection (original regressions, complete GO and content-identity table)
+passed **9 tests**, 267 deselected. Further results are recorded below after the
+final foreground regression and privacy checks.
+
+### Executed verification for the final-sweep correction
+
+All pytest commands ran in the feature worktree with `PYTHONPATH=<WORKTREE>/src`,
+bytecode disabled, foreground processes, private assigned `<SCRATCH>` basetemps
+and `-p no:cacheprovider`.
+
+| Command / selection | Observed result |
+| --- | --- |
+| `python -m pytest tests/test_acceptance.py -q -k 'recovery_root_preserves_failed_obligation or informational_required_artifact_integrity' --basetemp <SCRATCH>/final-red -p no:cacheprovider` before production edits | 3 failed, 273 deselected: all three unsafe hold sets were empty. |
+| `python -m pytest tests/test_acceptance.py -q -k 'recovery_root_preserves_failed_obligation or informational_required_artifact_integrity or complete_supported_fixture_go or rewritten_change_identity_table' --basetemp <SCRATCH>/final-target1 -p no:cacheprovider` | 9 passed, 267 deselected. |
+| `python -m pytest tests/test_acceptance.py -q -k 'recovery_obligations_follow_change or recovery_requires_original or ld3_reproducer or hygiene_evidence or final_sealed_closeout or unapproved_lineage_requires_new_root' --basetemp <SCRATCH>/final-target2 -p no:cacheprovider` | 26 passed, 275 deselected. |
+| `python -m pytest tests/test_acceptance.py tests/test_close.py tests/test_close_signoffs.py tests/test_gates.py -q --basetemp <SCRATCH>/final-regression -p no:cacheprovider` | 636 passed, 1 skipped, 4 failed in 708.05 seconds. Three failures were superseded expectations that malformed/missing informational records have no direct hold. One was the test helper constructing a manifest before deliberately submitting a premature reconciliation. |
+| `python -m pytest tests/test_acceptance.py -q -k 'malformed_informational or cold_phases_reject_wrong_actor or rewritten_change_identity_table or complete_supported_fixture_go or final_sealed_closeout' --basetemp <SCRATCH>/final-corrected -p no:cacheprovider` after correcting those test expectations/helper | 16 passed, 290 deselected in 63.72 seconds, including all four failures and adjacent GO/identity/manifest paths. |
+
+The broad run and corrected selection together validate **640 distinct passing
+cases and one host-restricted symlink skip**. This is not a claim that a second
+full green command was run: no behavioral production correction was needed after
+the broad run, so only the affected expectations/helper and adjacent paths were
+rerun. Source changes afterward were indentation/help-line formatting only.
+Attention suites and a full-repository run were not repeated.
+
+Five isolated source-copy mutations all produced behavioral assertion failures:
+removing the recovery obligation audit, offline positive control, scratch cleanup,
+confidentiality positive control, and pure-fold hygiene guard. Runner
+`mutate-final.py` and logs/source copies in `final-mutants-f836f7b3` remain under
+private task scratch. No production source was mutated by that runner.
+
+`python -m ruff check --no-cache src/agenttalk/acceptance.py src/agenttalk/acceptance_audit.py src/agenttalk/acceptance_history.py src/agenttalk/acceptance_hygiene.py src/agenttalk/acceptance_cold.py src/agenttalk/cli.py tests/test_acceptance.py`
+passes. Two initial long help lines were wrapped. The privacy verifier checks all
+added content with eight positive controls, exact twelve-file scope, branch,
+whitespace, and design bytes permitting only the authorized LD3 sentence change.
+All scratch from this correction is retained for the sweeper's recheck; no reviewer
+scratch was modified. No PR, merge or release is part of this work order.

@@ -66,7 +66,7 @@ def validate_initial(value, record, plan):
 
 
 def validate_reconciliation(value, route, observations):
-    A._object(value, "schema_version commit_hash bundle_hash revealed findings", "cold reconciliation")
+    A._object(value, "schema_version commit_hash bundle_hash revealed findings closeout", "cold reconciliation")
     A._version(value["schema_version"])
     if (value["commit_hash"] != route["cold_commit_hash"] or value["bundle_hash"] != route["bundle_hash"]
             or value["revealed"] is not True):

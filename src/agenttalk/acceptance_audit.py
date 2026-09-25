@@ -152,15 +152,10 @@ def change_identity(project, plan):
     return {"base": base, "revision": revision, "patch_id": fields[0].decode("ascii")}
 
 
-def check_prior_exposure(store, record, plan, reviewer):
-    """Exclude prior reveals for related source history or targets, across roots."""
+def project_attempts(store, record):
+    """Read project history once per audit, failing closed on unknown identities."""
     route = record["acceptance_route"]
-    commits = [e for e in record["events"] if e.get("event") == "acceptance:cold-commit"]
-    if len(commits) != 1:
-        A._fail("cold commitment event missing or ambiguous", "acceptance_cold_missing")
-    committed = _time(commits[0]["at"])
-    current_change = change_identity(route["project"], plan)
-    targets = {coverage.target_id(row) for row in plan["rows"]}
+    seen = set()
     for close_id in close.list_close_ids(store):
         try:
             # Read identity before traversing policy/artifacts of another project.
@@ -179,19 +174,44 @@ def check_prior_exposure(store, record, plan, reviewer):
                     "the unreadable close file outside .agenttalk/closes after preserving it for operator review "
                     "(quarantine removes its exposure evidence)", "acceptance_cold_missing")
         for prior, prior_route, prior_plan in history:
-            if (prior_route["attempt_id"] == route["attempt_id"]
-                    or prior_route["project_id"] != route["project_id"]
-                    or not prior_route.get("cold_reconcile_hash")):
-                continue
-            if prior_plan["cold_policy"]["reviewer"] != reviewer:
-                continue
-            same_change = (related_revisions(route["project"], prior["revision"], record["revision"]) or
-                           bool(targets & {coverage.target_id(row) for row in prior_plan["rows"]}) or
-                           current_change["patch_id"] == change_identity(
-                               dict(route["project"], revision=prior["revision"]), prior_plan)["patch_id"])
-            if same_change:
-                reveals = [e for e in prior["events"] if e.get("event") == "acceptance:cold-reconcile"]
-                if not reveals or any(_time(e["at"]) < committed for e in reveals):
-                    A._fail("reviewer was unblinded for this change, including another root",
-                            "acceptance_cold_missing")
+            identity = prior_route["attempt_id"]
+            if identity not in seen and prior_route["project_id"] == route["project_id"]:
+                seen.add(identity)
+                yield prior, prior_route, prior_plan
+
+
+def same_change(record, plan, prior, prior_plan):
+    """Labels only add to the shared ancestry/content identity rule."""
+    project = record["acceptance_route"]["project"]
+    if related_revisions(project, prior["revision"], record["revision"]):
+        return True
+    if {coverage.target_id(r) for r in plan["rows"]} & {coverage.target_id(r) for r in prior_plan["rows"]}:
+        return True
+    # Older HOLD-only plans cannot prove a disjoint whole-change boundary.
+    if "cold_policy" not in prior_plan:
+        A._fail("prior change boundary unavailable", "acceptance_cold_missing")
+    return change_identity(project, plan)["patch_id"] == change_identity(
+        dict(project, revision=prior["revision"]), prior_plan)["patch_id"]
+
+
+def check_prior_exposure(store, record, plan, reviewer):
+    """Exclude prior reveals for related source history or targets, across roots."""
+    route = record["acceptance_route"]
+    commits = [e for e in record["events"] if e.get("event") == "acceptance:cold-commit"]
+    if len(commits) != 1:
+        A._fail("cold commitment event missing or ambiguous", "acceptance_cold_missing")
+    committed = _time(commits[0]["at"])
+    current_change = change_identity(route["project"], plan)
+    for prior, prior_route, prior_plan in project_attempts(store, record):
+        if (prior_route["attempt_id"] == route["attempt_id"]
+                or prior_route["project_id"] != route["project_id"]
+                or not prior_route.get("cold_reconcile_hash")):
+            continue
+        if prior_plan["cold_policy"]["reviewer"] != reviewer:
+            continue
+        if same_change(record, plan, prior, prior_plan):
+            reveals = [e for e in prior["events"] if e.get("event") == "acceptance:cold-reconcile"]
+            if not reveals or any(_time(e["at"]) < committed for e in reveals):
+                A._fail("reviewer was unblinded for this change, including another root",
+                        "acceptance_cold_missing")
     return current_change

@@ -14885,7 +14885,8 @@ def build_parser() -> argparse.ArgumentParser:
     copen.add_argument("--scope", required=True, help="Close scope, e.g. release.")
     copen.add_argument("--gate-scope", help="Gate scope to check (default: --scope).")
     copen.add_argument("--revision", required=True, help="Ref or SHA; frozen to a full SHA via git.")
-    copen.add_argument("--acceptance-plan", help="Freeze a strict acceptance plan (increment 1a: HOLD only).")
+    copen.add_argument("--acceptance-plan",
+                       help="Freeze a strict acceptance plan; schema 3 supports verified cooperative GO.")
     copen.add_argument("--project-repo", help="Actual project checkout to verify for acceptance.")
     copen.add_argument("--lens", action="append", help="Required lens id (repeatable).")
     copen.add_argument("--optional-lens", action="append", help="Optional lens id (repeatable).")
@@ -14910,7 +14911,8 @@ def build_parser() -> argparse.ArgumentParser:
     copen.add_argument("--json", action="store_true", help="Emit the opened record.")
     copen.set_defaults(func=cmd_close)
 
-    caccept = csub.add_parser("acceptance", help="Attach retained acceptance evidence (increment 1a).")
+    caccept = csub.add_parser("acceptance",
+                            help="Attach acceptance evidence, record cold review, or create a successor.")
     cacceptsub = caccept.add_subparsers(dest="acceptance_cmd", required=True)
     cattach = cacceptsub.add_parser("attach", help="Copy and bind an immutable bundle and its raw artifacts.")
     cattach.add_argument("--id", required=True)

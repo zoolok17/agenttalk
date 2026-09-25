@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Acceptance recovery roots retain related-change gating obligations and original
+  failures; weaker coverage requires the same exact reserved-operator amendment.
+  Schema-3 GO now requires bound environment, offline enforcement, cleanup and
+  sealed-manifest confidentiality evidence. Required artifact integrity HOLDs
+  regardless of comparison policy. Final cold reviewers and reproducers must be
+  disjoint even after cold commitment; CLI help describes the current workflow.
+
 - Acceptance cold-review freshness also compares Git stable patch IDs of the whole
   diff from required, verified `cold_policy.change_base`, catching equivalent
   rebases, squashes and cherry-picks. Deliberate identity/content evasion is an
@@ -28,7 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retained delivery evidence, distinct reviewer/access and vendor checks, and
   attempt-bound reproducer/reviewer accepts. Complete supported cooperative
   evidence can now GO. Parent audit views list all successor alternatives;
-  unapproved coverage loss requires recovery through a new root close.
+  unapproved coverage loss requires recovery through a new root close while
+  retaining the change's protected obligations.
 
 - Acceptance coverage follows protected measurement targets across all retained
   ancestors, regardless of row names, splits, merges or informational hops.

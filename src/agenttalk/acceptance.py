@@ -416,8 +416,10 @@ def _policy(store, record):
 
 def _bundle(bundle, record, route, plan):
     modern = route["schema_version"] >= 2
+    final = route["schema_version"] == 3
     _object(bundle, "schema_version close_id instance_id attempt_id project_id revision plan_hash "
-            "registry_hash runs rows artifacts" + (" verifier_access reproductions" if modern else ""), "bundle")
+            "registry_hash runs rows artifacts" + (" verifier_access reproductions" if modern else "")
+            + (" recovery_approvals hygiene" if final else ""), "bundle")
     _version(bundle["schema_version"], (route["schema_version"],))
     for key in ("instance_id", "attempt_id", "project_id", "revision", "plan_hash", "registry_hash"):
         if bundle[key] != route[key]:
@@ -428,7 +430,7 @@ def _bundle(bundle, record, route, plan):
     runs = _indexed(bundle["runs"], "runs")
     for run in runs.values():
         _object(run, "id partition actor revision head_before head_after status_before status_after"
-                + (" access_id" if modern else ""), "run")
+                + (" access_id" if modern else "") + (" environment offline_proof" if final else ""), "run")
         if modern:
             _text(run["access_id"], "runner access_id")
         if run["partition"] not in partitions or run["actor"] not in partitions[run["partition"]]["agents"]:
@@ -453,7 +455,7 @@ def _bundle(bundle, record, route, plan):
         expected_artifacts.add(_id(verifier["evidence"]))
         for rep in _indexed(bundle["reproductions"], "reproductions").values():
             _object(rep, "id source_run actor access_id access_evidence revision head_before head_after "
-                    "status_before status_after rows", "reproduction")
+                    "status_before status_after rows" + (" environment offline_proof" if final else ""), "reproduction")
             for key in ("actor", "access_id"):
                 _text(rep[key], key)
             if rep["id"] in runs or rep["source_run"] not in runs:
@@ -464,6 +466,18 @@ def _bundle(bundle, record, route, plan):
                 if obs["id"] not in rows or rows[obs["id"]]["run_id"] != rep["source_run"]:
                     _fail("reproduction row belongs to another run", "acceptance_row_unbound")
                 expected_artifacts.add(_id(obs["artifact"]))
+    if final:
+        expected_artifacts.add(_id(bundle["hygiene"]))
+        for run in bundle["runs"] + bundle["reproductions"]:
+            expected_artifacts.update(_id(run[k]) for k in ("environment", "offline_proof"))
+        seen = set()
+        for item in _items(bundle["recovery_approvals"], "recovery approvals"):
+            _object(item, "prior_attempt_id reduction approval_artifact", "recovery approval")
+            _text(item["prior_attempt_id"], "prior attempt")
+            if item["prior_attempt_id"] in seen:
+                _fail("duplicate recovery approval")
+            seen.add(item["prior_attempt_id"])
+            expected_artifacts.add(_id(item["approval_artifact"]))
     if set(artifacts) != expected_artifacts:
         _fail("artifact manifest differs from plan", "acceptance_record_missing")
     for artifact in artifacts.values():
@@ -507,6 +521,15 @@ def attach(store, close_id, bundle_file, *, by, at):
         # A failure leaves only unreferenced blobs; no partial bundle can become current.
         for raw in captured:
             _retain(store, raw)
+        if route["schema_version"] == 3:
+            # Approval evidence must come from the reserved operator's actual
+            # bus record, not a caller-authored file with a claimed sender.
+            for item in bundle["recovery_approvals"]:
+                from agenttalk.acceptance_history import _reduction
+                reduction = _reduction(item["reduction"])
+                actual = _read(_path(store.messages_dir, reduction["decision_ref"] + ".json"))
+                if _hash(actual) != artifacts[item["approval_artifact"]]["sha256"]:
+                    _fail("recovery approval differs from operator record", "acceptance_scope_reduction_unapproved")
         route["bundle_hash"] = _retain(store, data)
         route.update(attached_by=by, attached_at=at)
         close._event(record, "acceptance:attach", by, at, bundle_hash=route["bundle_hash"])
@@ -550,20 +573,28 @@ def resolve(store, record, *, live=False):
         bundle = decode(_retained(store, route["bundle_hash"]))
         rows, artifacts = _bundle(bundle, record, route, plan)
         raw_results = {}
+        integrity_holds = []
         total = 0
         for artifact in artifacts.values():
             try:
                 data = _retained(store, artifact["sha256"])
                 total += len(data)
-                raw_results[artifact["id"]] = decode(data)
+                # Non-measurement evidence may be plain text. Retention is
+                # mandatory for every artifact; JSON shape belongs to its reader.
+                try:
+                    raw_results[artifact["id"]] = decode(data)
+                except AcceptanceError as exc:
+                    raw_results[artifact["id"]] = exc
             except (OSError, AcceptanceError) as exc:
                 raw_results[artifact["id"]] = exc
+                integrity_holds.append(("acceptance_record_missing", f"artifact {artifact['id']}: {exc}"))
         if total > MAX_TOTAL_BYTES:
             _fail("retained bundle exceeds total byte limit")
         outcomes = []
-        holds = []
+        holds = integrity_holds
         for row in plan["rows"]:
             outcome = {"id": row["id"], "policy": row["policy"], "passed": None}
+            comparing = False
             try:
                 raw = raw_results[row["artifact"]]
                 if isinstance(raw, Exception):
@@ -574,11 +605,13 @@ def resolve(store, record, *, live=False):
                     _fail("raw result belongs to another run/revision", "acceptance_row_unbound")
                 if not isinstance(raw["values"], dict):
                     _fail("raw result values must be an object")
+                comparing = True
                 outcome["passed"] = _compare(row, raw)
             except (AcceptanceError, OSError) as exc:
                 code = getattr(exc, "code", "acceptance_record_missing")
                 outcome["error"] = {"code": code, "detail": str(exc)}
-                if row["policy"] == "gating":
+                if (not comparing or row["policy"] == "gating"
+                        or code in {"acceptance_record_missing", "acceptance_row_unbound"}):
                     holds.append((code, f"row {row['id']}: {exc}"))
             outcomes.append(outcome)
         snapshot = {"holds": holds, "outcomes": outcomes}
@@ -589,8 +622,10 @@ def resolve(store, record, *, live=False):
             _ack_bindings(record, plan, holds)
             acceptance_history.evaluate(store, record, plan, snapshot)
             if route["schema_version"] == 3:
-                from agenttalk import acceptance_cold
+                from agenttalk import acceptance_cold, acceptance_hygiene
+                acceptance_history.related_obligations(store, record, plan, bundle, snapshot)
                 acceptance_cold.evaluate(store, record, plan, bundle, snapshot)
+                acceptance_hygiene.evaluate(store, record, bundle, snapshot)
         return snapshot
     except AcceptanceError as exc:
         snapshot["holds"].append((exc.code, str(exc)))
@@ -608,6 +643,8 @@ def evaluate(snapshot):
         holds.append(("acceptance_trust_unresolved", "cooperative verification/reproduction evidence missing"))
     elif not snapshot.get("cold_checked"):
         holds.append(("acceptance_cold_missing", "eligible final cold review missing"))
+    elif not snapshot.get("hygiene_checked"):
+        holds.append(("acceptance_record_missing", "bound execution and final hygiene evidence missing"))
     if not isinstance(snapshot, dict):
         return holds + [("acceptance_record_missing", "acceptance evaluation missing")]
     holds.extend(snapshot.get("holds", []))

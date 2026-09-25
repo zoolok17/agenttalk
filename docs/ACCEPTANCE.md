@@ -110,8 +110,8 @@ agenttalk close acceptance attach --id PASS --file BUNDLE.json --from lead
 
 Commit must precede attachment. Only the assigned reviewer may submit a cold
 phase. The initial report and all delivered bytes become immutable retained
-evidence. The schema-3 execution bundle otherwise has the schema-2 reproduction
-shape, with its version changed to `3`. Attachment adds one reproducer lens per
+evidence. Schema-3 bundles extend the schema-2 reproduction shape with required
+execution hygiene and recovery approvals, described below. Attachment adds one reproducer lens per
 declared reproduction, named `acceptance-repro-<reproduction-id>`.
 
 Attachment before commitment is refused without changing the attempt; commit the
@@ -129,6 +129,7 @@ After reveal, the same reviewer submits JSON with `schema_version:1`, exact
 `commit_hash` and `bundle_hash`, `revealed:true`, and `findings`. Each finding is
 `{id,disposition,evidence}`, with disposition `open` or `resolved`; every initial
 observation must appear exactly once. Unresolved blocking observations HOLD.
+Reconciliation also requires the sealed `closeout` record described below.
 In this bounded cooperative slice the reviewer classifies and reconciles its own
 observations. This is not the full owner/lead-disposition residual ledger from the
 design; ordinary close counters and remediation remain available for that workflow.
@@ -208,4 +209,83 @@ Reports preserve the original failure as reduced scope or policy amended.
 **An unapproved coverage loss permanently HOLDs its lineage. Recovery requires a
 new root close**, complete evidence and an eligible fresh reviewer. Restoring
 coverage or adding approval in a later successor does not erase the earlier
-unapproved change. The previous attempts and their failures remain in the store.
+unapproved change. A new root resets procedural lineage only: **protected
+obligations follow the change**. Earlier related attempts are found using the
+same verified project, ancestry, whole-change patch ID and additional target
+overlap rules used for reviewer exposure. Their strongest gating assertions and
+original outcomes remain in `related_obligations`, even when the recovery passes.
+Deleting, renaming or weakening a target needs fresh exact operator approval;
+changing the close ID or reviewer supplies no authorization. Earlier attempts
+remain unchanged. As with lineage coverage, retaining all historical gating
+predicates is conservative: contradictory historical assertions require an
+explicit amendment, even if one assertion was introduced in an unapproved attempt.
+
+Every schema-3 bundle contains `recovery_approvals` (an empty list if none).
+Each entry is `{prior_attempt_id,reduction,approval_artifact}`. `reduction` uses
+the existing exact target-keyed LD2 shape. The operator message body is the
+existing `approval_payload(prior, new_close_id, frozen_plan_hash, reduction)`;
+its `parent_attempt_id` identifies the prior obligation, not a procedural parent.
+Put the actual reserved-operator message bytes in `approval_artifact`, an ordinary
+`{id,path,sha256}` bundle artifact. Attachment checks those bytes against the bus
+message at `decision_ref`. Evaluation rechecks origin, expiry, plan/attempt binding,
+approved target set and full old/new predicates. An approval for one prior attempt
+does not approve another; unused or duplicate references are refused. Approved
+losses retain original outcomes and the `policy-amended`/`scope-narrowed` label.
+Unchanged original assertions may pass without approval. No implicit approvals
+carry to a successor or another recovery root.
+
+The final reviewer and every reproducer must be **different actors**, even if
+reproduction happens after the reviewer commits initial observations. This is the
+lead's final LD3 ruling; it supersedes the earlier design sentence permitting a
+cold reviewer to reproduce after commitment.
+
+## Retain execution and close-out hygiene
+
+Schema 3 requires this closed cooperative evidence contract. Missing, extra,
+misbound or unreadable records HOLD; schemas 1/2 remain HOLD-only. Earlier
+development schema-3 bundles without these fields are unsupported and must be
+rebuilt. The verifier checks evidence, not the truth of a same-user execution
+attestation. Offline tool acquisition and automatic harness execution remain later
+increments. This bounded slice supports externally enforced egress denial;
+recipe-only offline claims and retained scratch are unsupported and HOLD.
+
+Each original run **and reproduction** adds `environment` and `offline_proof`,
+artifact IDs in the bundle manifest. Their JSON records have `schema_version:1`,
+`binding` containing the bundle's exact instance/attempt/project/revision/plan and
+registry identities, and the exact `run_id`.
+
+| Record | Other required fields |
+| --- | --- |
+| Environment | Nonempty `version_banners` string list; nonempty `scratch`, `cache_overlay`, `service_data` descriptions; `scratch_isolated:true`, `cache_overlay_fresh:true`, `service_data_fresh:true`, `outputs_outside_checkout:true`; `services` list. |
+| Owned service | `{pid,ports,owned,stopped,ports_released,evidence}`. PID is positive, ports are valid integers, all three booleans are true, and evidence describes start/stop and socket checks. An empty service list declares no services. |
+| Offline proof | `mode:"external-denial"`, `egress_denied:true`, `owned_loopback_only:true`, `positive_control:true`, `attempted_fetch:false`, and nonempty `evidence` retaining the enforcement/control log. |
+
+The bundle adds `hygiene`, an artifact ID for a JSON execution close-out. That
+record has `schema_version:1`, the same `binding`, `sealed_manifest`,
+`bundle_digest`, `retained_readable:true`, `scratch_removed:true`,
+`services_stopped:true`, `ports_released:true`, and `confidentiality`.
+`confidentiality` is exactly `{positive_control:true,matches:[],evidence:TEXT}`;
+retain the executed scan/control evidence, not just a pass label.
+
+The execution `sealed_manifest` is the sorted unique SHA-256 list of every bundle
+artifact except the hygiene result itself, plus the frozen plan and registry.
+`bundle_digest` hashes canonical JSON of the bundle with only that hygiene artifact
+entry removed. Canonical JSON uses sorted keys, UTF-8, `ensure_ascii=False` and
+Python JSON's default separators (the same encoding as coverage approvals).
+Excluding the result avoids a self-hash cycle while binding all run definitions,
+observations, artifact references and recovery approvals.
+
+Reconciliation adds `closeout:{sealed_manifest,report_digest,confidentiality}`.
+Its manifest seals the current plan, registry, bundle, every execution artifact,
+initial cold report/delivered resources and retained lineage records/artifacts.
+Its `report_digest` hashes canonical reconciliation JSON with `closeout` omitted;
+the sweep thus covers the revealed findings without hashing its own result.
+The implementation's `acceptance_hygiene.final_manifest` defines this evidence
+projection. The later acknowledgment/publication envelope is derived metadata,
+not an additional source artifact in this sealed set. All sealed retained bytes
+are re-read at GO publication. `hygiene_checked` is required in the resolved
+verdict snapshot; a cold pass alone is insufficient.
+
+Comparison policy does not relax evidence integrity. An informational measurement
+may fail its assertion without gating, but its required artifact must exist, match
+its digest, parse as the closed raw-result schema and bind the right run/revision.

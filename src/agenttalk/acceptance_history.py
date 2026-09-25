@@ -210,6 +210,13 @@ def evaluate(store, record, plan, snapshot, *, depth=0):
     reduction = amendment["reduction"]
     if version == 3 and _bytes(amendment["assertion_changes"]) != _bytes(changes):
         A._fail("retained target coverage differs from plans", "acceptance_category_moved_unreviewed")
+    apply_coverage(store, record, plan, snapshot, parent, protected, reduction, amendment["approval_hash"])
+
+
+def apply_coverage(store, record, plan, snapshot, parent, protected, reduction, approval_hash):
+    """The same exact LD2 approval and outcome rules apply inside and across roots."""
+    route = record["acceptance_route"]
+    changes = coverage.changes(protected, plan)
     approved = False
     if changes or reduction is not None:
         try:
@@ -218,7 +225,7 @@ def evaluate(store, record, plan, snapshot, *, depth=0):
                 A._fail("operator must approve the exact protected-target coverage changes")
             if reduction["cause"] != "policy-amendment" and any(c["new"] for c in changes.values()):
                 A._fail("scope reduction cannot authorize replacement gating assertions")
-            _approval(store, A._retained(store, amendment["approval_hash"]), parent,
+            _approval(store, A._retained(store, approval_hash), parent,
                       record["close_id"], route["plan_hash"], reduction)
             approved = True
         except (A.AcceptanceError, KeyError, TypeError, ValueError) as exc:
@@ -227,7 +234,7 @@ def evaluate(store, record, plan, snapshot, *, depth=0):
                 snapshot["holds"].append(("acceptance_scope_reduction_unapproved", str(exc)))
             if parent["revision"] == record["revision"]:
                 snapshot["holds"].append(("acceptance_plan_stale", "same-SHA coverage loss is unapproved"))
-    snapshot["coverage_changes"] = {}
+    snapshot.setdefault("coverage_changes", {})
     definitions = {r["id"]: r for r in plan["rows"]}
     for key, change in changes.items():
         sources = protected[key]["sources"]
@@ -245,3 +252,32 @@ def evaluate(store, record, plan, snapshot, *, depth=0):
             observed = outcome["passed"] if outcome["passed"] is not None else outcome.get("comparison_passed")
             outcome.update(original_outcome=original, comparison_passed=observed, passed=None,
                            disposition="scope-narrowed" if missing else "policy-amended", report_label=label)
+
+
+def related_obligations(store, record, plan, bundle, snapshot):
+    """A new procedural root cannot reset the protection owed to the same change."""
+    from agenttalk import acceptance_audit as audit
+    lineage_ids = {route["attempt_id"] for _, route, _ in audit.lineage(store, record)}
+    approvals = {a["prior_attempt_id"]: a for a in bundle["recovery_approvals"]}
+    artifacts = {a["id"]: a for a in bundle["artifacts"]}
+    consumed = set()
+    snapshot["related_obligations"] = []
+    for prior, route, prior_plan in audit.project_attempts(store, record):
+        if (route["attempt_id"] in lineage_ids or
+                audit._time(prior["opened_at"]) >= audit._time(record["opened_at"])):
+            continue
+        if not audit.same_change(record, plan, prior, prior_plan):
+            continue
+        protected = coverage.history(store, prior)
+        entry = approvals.get(route["attempt_id"])
+        reduction = entry["reduction"] if entry else None
+        digest = artifacts[entry["approval_artifact"]]["sha256"] if entry else None
+        if entry:
+            consumed.add(route["attempt_id"])
+        # Preserved source projections retain failed outcomes even when current
+        # coverage passes. Procedural lineage holds do not poison a recovery root.
+        snapshot["related_obligations"].append({"close_id": prior["close_id"],
+            "attempt_id": route["attempt_id"], "protected": protected})
+        apply_coverage(store, record, plan, snapshot, prior, protected, reduction, digest)
+    if set(approvals) != consumed:
+        A._fail("recovery approval references no prior related attempt", "acceptance_category_moved_unreviewed")
