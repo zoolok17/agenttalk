@@ -2,7 +2,7 @@
 
 from datetime import datetime
 import os
-import subprocess
+import subprocess  # nosec B404 - fixed Git argv lists; shell is never used
 
 from agenttalk import acceptance as A, acceptance_coverage as coverage, close, gates
 
@@ -104,7 +104,7 @@ def _git(project, *args, data=None):
     env = {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_")}
     env["GIT_NO_REPLACE_OBJECTS"] = "1"
     try:
-        return subprocess.run(["git", "-C", project["locator"], *args], capture_output=True,
+        return subprocess.run(["git", "-C", project["locator"], *args], capture_output=True,  # noqa: S603,S607  # nosec B603 B607
                               input=data, timeout=10, env=env)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise A.AcceptanceError("acceptance_cold_missing", "source identity Git unavailable") from exc

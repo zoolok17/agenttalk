@@ -14,7 +14,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
-import subprocess
+import subprocess  # nosec B404 - fixed Git argv lists; shell is never used
 import uuid
 
 from agenttalk import close
@@ -261,7 +261,7 @@ def verify_project(repo, revision, *, live=True):
 
     def git(*args):
         try:
-            result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
+            result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,  # noqa: S603,S607  # nosec B603 B607
                                     text=True, encoding="utf-8", errors="replace", timeout=10, env=env)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise AcceptanceError("acceptance_project_unverified", "project Git unavailable") from exc
