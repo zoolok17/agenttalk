@@ -9,11 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
 - Reduce acceptance Git process overhead with command-local metadata/history
   reuse, compatible batched queries, and copied session test repositories (#198).
   Live HEAD/dirty checks and retained-evidence validation remain in place.
   Disable automatic Git maintenance before template commits so repository
   copies cannot race with detached maintenance; limit CLI caching to `close`.
+
+## [0.92.0] - 2026-09-25
+
+Theme: **cooperative acceptance passes on `close`, and the OVH/Qwen
+gateway stops re-sending model reasoning as input.**
+
+### Added
+
+- **Cooperative acceptance passes on `close` (#197).** A close can now
+  freeze an acceptance plan, collect runner evidence bundles, require
+  cold review, and hold the verdict at HOLD until the plan's rows pass and
+  only then allow GO. It is opt-in: it runs only when a close is opened with
+  `close open --acceptance-plan`. The bullets below are its increments.
 
 - Order roster retirement after acceptance/config locking so release-barrier
   publication cannot deadlock against removal, retirement, rename or launch
@@ -95,6 +110,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [implementation record](docs/STEP-ACCEPTANCE-INC1.md) for compatibility,
   advisory authority, storage and targeted verification details.
 
+- **`gateway init` / `gateway reconfigure --reasoning-param NAME=VALUE`
+  (repeatable) and `reconfigure --no-reasoning-param`.** A fixed,
+  validated reasoning request parameter for the route, rendered under the
+  deployment's `extra_body` (LiteLLM passes that through verbatim; a
+  top-level key is silently dropped by `drop_params`), recorded in the
+  install manifest and shown by `gateway status`. Default: none, and the
+  rendered `extra_body` is exactly `store: false`. The grammar is closed
+  (names such as `model`, `messages`, `store`, `max_tokens` are refused).
+  Not part of the price policy: no re-init and no new canary.
+
 ### Changed
 
 - **OVH/Qwen gateway: reasoning is no longer re-sent as input.** The
@@ -117,26 +142,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removed per attempt, plus `empty`, `stop_reason`, `misplaced` and
   `failed`, in `.agenttalk/gateway/reasoning-stripped.jsonl` (no content).
 
-### Added
-
-- **`gateway init` / `gateway reconfigure --reasoning-param NAME=VALUE`
-  (repeatable) and `reconfigure --no-reasoning-param`.** A fixed,
-  validated reasoning request parameter for the route, rendered under the
-  deployment's `extra_body` (LiteLLM passes that through verbatim; a
-  top-level key is silently dropped by `drop_params`), recorded in the
-  install manifest and shown by `gateway status`. Default: none, and the
-  rendered `extra_body` is exactly `store: false`. The grammar is closed
-  (names such as `model`, `messages`, `store`, `max_tokens` are refused).
-  Not part of the price policy: no re-init and no new canary.
-
 ### Upgrade
 
-- An existing install keeps its old config (with the merge fold) until
-  `gateway stop`, `gateway reconfigure`, `gateway start`; the front's
-  stripping is a no-op until then. No ledger backup, re-init or canary
-  is needed, and the task interpreter is unchanged. See
-  `docs/STEP-QWEN-REASONING.md` for the OVH parameter probe and the
-  before/after measurement protocol.
+- **Acceptance needs no migration and is opt-in.** It runs only for a close
+  opened with `close open --acceptance-plan <plan> --project-repo <repo>`
+  (the open refuses `--force` and dirty-worktree overrides for such a
+  close); without those flags `close` behaves exactly as before and
+  ordinary closes stay schema 1. There is no store migration and no
+  configuration change. Acceptance closes use schema 2, which engines
+  older than this release reject as malformed (checked against 0.91.0), so
+  upgrade every seat that shares the store before anyone opens one.
+- **A gateway operator on 0.91.1 (OVH/Qwen)** applies the reasoning change
+  with no re-init, no ledger backup and no new canary (the price policy
+  hash is unchanged, so the accepted canary stays valid). The task
+  interpreter must stay the same: upgrade the package in place in the
+  runtime that registered the task. Until step 3 an existing install keeps
+  its old config (with the merge fold) and the front's stripping is a
+  no-op.
+  1. `agenttalk gateway stop`; confirm both loopback ports are free
+     (`agenttalk gateway status`: `public_listener_present` false).
+  2. Install 0.92.0 into that same runtime.
+  3. `agenttalk gateway reconfigure` (add `--reasoning-param NAME=VALUE`
+     only after the one-call OVH probe in `docs/STEP-QWEN-REASONING.md`
+     section 5 has found the parameter). `changed` should be `true`.
+  4. `agenttalk gateway start`; after a slow first start read
+     `agenttalk gateway status` before retrying.
+  5. `agenttalk gateway status`: `ready` and `worker_spend_ready` true,
+     `config_sha256` changed, `reasoning_params` as expected.
+  6. Run one seat turn and check that
+     `.agenttalk/gateway/reasoning-stripped.jsonl` gains a line per attempt
+     that reasoned; no lines is a finding, not success.
+  If the interpreter path changes, unregister the old task first as in
+  `docs/STEP-ENVELOPE-SERVICE-READERS.md` "Upgrade path". Rollback and the
+  before/after cost-per-card measurement protocol are in
+  `docs/STEP-QWEN-REASONING.md` sections 4 and 6.
+- **A gateway installed on 0.91.0 at a non-default envelope** still needs the
+  0.91.1 re-initialisation first (see [0.91.1] below); that re-init renders
+  the new config, so step 3 is then already done.
+- Installs that do not use the ovh-qwen gateway need nothing for the
+  gateway part.
+
+### CI
+
+- The pytest check cap is now 5400 s (`dev-gate.json`, was 3600) and the
+  Windows job ceiling is 180 min (was 120; Linux and macOS stay at 90),
+  because the acceptance suite roughly doubled Windows test time (on master
+  the Windows source run took 44 min; the acceptance tests each spawn about
+  70 git processes). Reducing the git spawns is follow-up issue #198.
 
 ### Docs
 
