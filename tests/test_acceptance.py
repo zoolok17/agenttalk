@@ -1598,9 +1598,13 @@ def test_acceptance_reduction_cannot_authorize_replacement_coverage(case_v2, cau
 @pytest.fixture
 def case_v3(case_v2):
     case = case_v2
+    base = case["sha"]
+    (case["project"] / "source.txt").write_text("synthetic candidate\n", encoding="utf-8")
+    git(case["project"], "commit", "-qam", "candidate from verified base")
+    case["sha"] = git(case["project"], "rev-parse", "HEAD")
     case["plan"]["schema_version"] = 3
     case["plan"]["cold_policy"] = {
-        "reviewer": "cold", "absence_disclosure": "",
+        "reviewer": "cold", "absence_disclosure": "", "change_base": base,
         "roster": [{"actor": actor, "vendor": vendor} for actor, vendor in
                    [("lead", "alpha"), ("author", "alpha"), ("runner-a", "alpha"),
                     ("runner-b", "alpha"), ("reproducer", "beta"), ("cold", "beta")]]}
@@ -2369,3 +2373,124 @@ def test_acceptance_monoculture_roster_includes_attacher(case_v3):
     assert open_attempt(case) == 0
     complete_v3(case)
     assert "acceptance_lens_not_independent" in {c for c, _ in snapshot(case)["holds"]}
+
+
+@pytest.mark.parametrize("rewrite,blocked", [("rebase", True), ("squash", True), ("cherry-pick", True),
+                                             ("different", False), ("unverifiable", True)])
+def test_acceptance_rewritten_change_identity_table(case_v3, monkeypatch, rewrite, blocked):
+    case = case_v3
+    base = case["sha"]
+    changes = []
+    for name in ("change-a.txt", "change-b.txt"):
+        (case["project"] / name).write_text("reviewed change\n", encoding="utf-8")
+        git(case["project"], "add", name)
+        git(case["project"], "commit", "-qm", "part of reviewed change")
+        changes.append(git(case["project"], "rev-parse", "HEAD"))
+    case["sha"] = changes[-1]
+    case["plan"]["cold_policy"]["change_base"] = base
+    write_json(case["inputs"] / "plan.json", case["plan"])
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    publish_hold(case)
+    git(case["project"], "branch", "reviewed", changes[-1])
+    git(case["project"], "checkout", "--detach", base)
+    (case["project"] / "new-base.txt").write_text("base moved\n", encoding="utf-8")
+    git(case["project"], "add", "new-base.txt")
+    git(case["project"], "commit", "-qm", "new base")
+    new_base = git(case["project"], "rev-parse", "HEAD")
+    if rewrite == "rebase":
+        git(case["project"], "rebase", "--onto", new_base, base, "reviewed")
+    elif rewrite == "squash":
+        git(case["project"], "merge", "--squash", changes[-1])
+        git(case["project"], "commit", "-qm", "same change squashed")
+    elif rewrite == "different":
+        (case["project"] / "different.txt").write_text("different change\n", encoding="utf-8")
+        git(case["project"], "add", "different.txt")
+        git(case["project"], "commit", "-qm", "different change")
+    else:
+        git(case["project"], "cherry-pick", *changes)
+    case["sha"] = git(case["project"], "rev-parse", "HEAD")
+    case["plan"]["cold_policy"]["change_base"] = new_base
+    for row in case["plan"]["rows"]:
+        row["id"] += "x"
+        row["artifact"] += "x"
+    write_json(case["inputs"] / "plan.json", case["plan"])
+    assert open_attempt(case, "--id", "rewritten") == 0
+    complete_v3(case, close_id="rewritten")
+    if rewrite == "unverifiable":
+        run = subprocess.run
+
+        def unavailable(args, **kwargs):
+            if "patch-id" in args:
+                return subprocess.CompletedProcess(args, 128, b"", b"patch-id unavailable")
+            return run(args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", unavailable)
+    result = acceptance.resolve(case["store"], close.load_close(case["store"], "rewritten"))
+    assert ("acceptance_cold_missing" in {c for c, _ in result["holds"]}) is blocked
+    assert command(case, "publish", "--id", "rewritten", "--from", "lead", "--verdict", "go") == (3 if blocked else 0)
+
+
+@pytest.mark.parametrize("fault", ["shallow", "abbreviated"])
+def test_acceptance_ancestry_preconditions_fail_closed(case_v3, monkeypatch, fault):
+    from agenttalk import acceptance_audit
+    case = case_v3
+    run = subprocess.run
+    if fault == "shallow":
+        def shallow(args, **kwargs):
+            if "--is-shallow-repository" in args:
+                return subprocess.CompletedProcess(args, 0, b"true\n", b"")
+            return run(args, **kwargs)
+        monkeypatch.setattr(subprocess, "run", shallow)
+    earlier = case["sha"][:7] if fault == "abbreviated" else case["sha"]
+    with pytest.raises(acceptance.AcceptanceError) as exc:
+        acceptance_audit.related_revisions({"locator": str(case["project"])}, earlier, case["sha"])
+    assert exc.value.code == "acceptance_cold_missing"
+
+
+def test_acceptance_ancestry_ignores_replace_graft(case_v3):
+    from agenttalk import acceptance_audit
+    case = case_v3
+    base = case["plan"]["cold_policy"]["change_base"]
+    git(case["project"], "replace", "--graft", case["sha"])
+    assert acceptance_audit.related_revisions({"locator": str(case["project"])}, base, case["sha"])
+
+
+def test_acceptance_unreadable_gate_attribution_holds(case_v3):
+    from agenttalk import gates
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    gates.gates_path(case["store"].root).write_text("unreadable", encoding="utf-8")
+    assert "acceptance_cold_missing" in {c for c, _ in snapshot(case)["holds"]}
+
+
+def test_acceptance_later_gate_metadata_and_evidence_do_not_taint_commit(case_v3):
+    from agenttalk import gates
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    gates.set_gate(case["store"].root, name="later-gate", status="green", severity="info",
+                   scope="global", actor="cold", evidence_source="manual_review", evidence=["later activity"])
+    assert snapshot(case)["holds"] == []
+
+
+@pytest.mark.parametrize("base", ["missing", "abbreviated", "unknown", "candidate", "unrelated"])
+def test_acceptance_change_base_verified_before_creation(case_v3, base):
+    case = case_v3
+    if base == "missing":
+        case["plan"]["cold_policy"].pop("change_base")
+    elif base == "unrelated":
+        head = case["sha"]
+        git(case["project"], "checkout", "--detach", case["plan"]["cold_policy"]["change_base"])
+        (case["project"] / "other-base.txt").write_text("other history", encoding="utf-8")
+        git(case["project"], "add", "other-base.txt")
+        git(case["project"], "commit", "-qm", "unrelated base")
+        case["plan"]["cold_policy"]["change_base"] = git(case["project"], "rev-parse", "HEAD")
+        git(case["project"], "checkout", "--detach", head)
+    else:
+        case["plan"]["cold_policy"]["change_base"] = {
+            "abbreviated": case["sha"][:7], "unknown": "f" * 40, "candidate": case["sha"]}[base]
+    write_json(case["inputs"] / "plan.json", case["plan"])
+    assert open_attempt(case) == 3
+    assert not close.close_path(case["store"], "attempt").exists()

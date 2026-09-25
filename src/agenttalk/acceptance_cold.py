@@ -7,7 +7,9 @@ from agenttalk import acceptance_audit as audit
 
 
 def policy(value):
-    A._object(value, "reviewer roster absence_disclosure", "cold policy")
+    A._object(value, "reviewer roster absence_disclosure change_base", "cold policy")
+    if not isinstance(value["change_base"], str) or not A._SHA.fullmatch(value["change_base"]):
+        A._fail("cold policy change_base must be a full commit SHA")
     A._text(value["reviewer"], "cold reviewer")
     roster = {}
     for entry in A._items(value["roster"], "available vendor roster", nonempty=True):
@@ -150,7 +152,7 @@ def evaluate(store, record, plan, bundle, snapshot):
     reconciliation = A.decode(A._retained(store, route["cold_reconcile_hash"]))
     findings = validate_reconciliation(reconciliation, route, observations)
     reviewer = plan["cold_policy"]["reviewer"]
-    audit.check_prior_exposure(store, record, plan, reviewer)
+    change = audit.check_prior_exposure(store, record, plan, reviewer)
     excluded, _ = audit.provenance(store, record, bundle)
     if reviewer in excluded:
         A._fail("final cold actor is not independent", "acceptance_lens_not_independent")
@@ -196,5 +198,6 @@ def evaluate(store, record, plan, bundle, snapshot):
             holds.append(("acceptance_residual_open", f"cold finding {key} remains open"))
     snapshot["cold_checked"] = True
     snapshot["cold"] = {"reviewer": reviewer, "context_id": initial["context_id"],
+                        "change_identity": change,
                         "commit_hash": route["cold_commit_hash"], "reconcile_hash": route["cold_reconcile_hash"],
                         "absence_disclosure": plan["cold_policy"]["absence_disclosure"], "findings": findings}

@@ -307,6 +307,9 @@ def prepare(store, plan_file, project_repo, revision, scope, lenses=()):
     project = verify_project(project_repo, revision)
     if plan["schema_version"] >= 2 and plan["project_id"] != project_id(project):
         _fail(f"project_id must be {project_id(project)} for this Git root set", "acceptance_project_unverified")
+    if plan["schema_version"] == 3:
+        from agenttalk.acceptance_audit import change_identity
+        change_identity(project, plan)
     return {"plan_hash": _retain(store, plan_bytes), "registry_hash": _retain(store, registry_bytes),
             "project": project, "plan": plan}
 

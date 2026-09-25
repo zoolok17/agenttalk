@@ -882,3 +882,116 @@ R12's redundant inner lineage check is explicitly excluded from this claim.
 in added content; five-file scope, branch, accepted design bytes and
 `git diff --check` verified. Task gates returned GO. Scratch basetemps, source copies,
 mutation logs and verifier are retained for the delta reviewer; no PR or release.
+
+## 1c correction 3 — whole-change patch identity and settled cooperative boundary
+
+Base: `79323ff`. This final correction adds content identity alongside source
+ancestry, within verified project identity. The lead explicitly excludes deliberate
+fabrication of project identity and changes that deliberately alter content identity
+from the cooperative profile. This is a threat-model boundary, not a claim that
+intent can be detected. Authenticated reviewer identity and signed change identity
+are the hardened-profile remedy; neither is implemented in this slice.
+
+### Content identity contract
+
+Schema-3 `cold_policy` now requires `change_base`, a full commit SHA identifying
+the boundary before the whole change. `prepare` verifies both base and candidate
+as commits in the verified project repository and verifies base ancestry before
+creating a close. There is no implicit last-commit fallback. Missing/abbreviated
+bases, absent commit objects, unrelated bases, empty diffs and shallow histories
+fail closed. A root-only candidate without an existing base is unsupported.
+
+The identity is Git `patch-id --stable` of one aggregate base-to-candidate diff,
+not a list of individual commit IDs. Diff options explicitly disable external
+diffs, text conversion, rename heuristics and color, and request full binary/index
+data with fixed prefixes/context and algorithm. Patch bytes are passed directly
+to Git; no shell pipeline, executable supplied by a caller or generated temporary
+patch file is used. The diff has the existing 16 MiB acceptance limit; each Git
+subprocess retains a ten-second timeout. Ambient Git redirection is removed and
+replace objects are disabled for both ancestry and content reads.
+
+The frozen plan hash binds the declared base. Evaluation recomputes the current
+whole-change identity even when no earlier exposure exists. For a prior reveal
+by the same reviewer in the same project, either direction of Git ancestry,
+overlapping protected targets, or equal aggregate patch IDs establishes the same
+change. Unknown patch identity is never treated as independent. A successful cold
+snapshot gains `change_identity: {base, revision, patch_id}` and publication retains
+that resolved snapshot. Stable patch IDs deliberately ignore whitespace/line
+numbers: equivalent formatting variants may be conservatively identified together;
+this is not authenticated change identity. Contract reference:
+[Git patch-id documentation](https://git-scm.com/docs/git-patch-id).
+
+Rebase/cherry-pick copies must declare their new verified base before the copied
+range; a squash declares the base before the same aggregate diff. The tool verifies
+objects and ancestry, not the semantic honesty of a writer's declared boundary.
+Fabricated project identity, a deliberately misleading boundary or changed diff
+identity remain explicit cooperative residuals. Existing same-project scoping and
+the operator-visible corrupt-record repair/quarantine policy are unchanged.
+
+### Required table and other findings
+
+`rewritten_change_identity_table` ran on the old implementation first:
+**4 failed, 1 passed, 258 deselected** in 21.75 seconds. Failures were the pinned
+exposure HOLD assertion after complete real CLI workflows, not setup errors.
+The prior attempt contains two commits; every new plan relabels all row/artifact
+IDs to isolate content identity from target matching.
+
+| Table row | Expected outcome |
+| --- | --- |
+| Actual `git rebase --onto` of the two-commit change | HOLD `acceptance_cold_missing`; GO publication refused |
+| Actual squash of the same aggregate diff | Same HOLD and refusal |
+| Actual cherry-pick of both commits onto another branch base | Same HOLD and refusal |
+| Genuinely different diff on an unrelated branch, disjoint targets | No exposure hold; complete workflow publishes GO |
+| Git patch-ID computation fails | HOLD `acceptance_cold_missing`; GO publication refused |
+
+| Finding | Disposition / test (omit `test_acceptance_`) |
+| --- | --- |
+| N1' content-equivalent rewritten history | FIXED by aggregate patch identity; table above. Source ancestry and target-overlap checks remain additive. |
+| Deliberate identity/content evasion | OUT OF SCOPE per lead LD1 decision; user guide states limits and authenticated/signed identity remedy. No claim that fabricated new project identities or altered content IDs are detected. |
+| Verified multi-commit base | `change_base_verified_before_creation[missing/abbreviated/unknown/candidate/unrelated]`: invalid or empty boundaries leave no close behind. |
+| S1 shallow guard | `ancestry_preconditions_fail_closed[shallow]` isolates the guard before Git could independently refuse ancestry. |
+| S4 replace-object guard | `ancestry_ignores_replace_graft` creates a real Git graft that hides the parent unless replacement lookup is disabled. |
+| S5 full-SHA guard | `ancestry_preconditions_fail_closed[abbreviated]` uses a resolvable abbreviation, so Git itself would accept the missing guard. |
+| S12 unreadable gate state | `unreadable_gate_attribution_holds` checks the cold snapshot directly, independently of ordinary gate holds. |
+| S8/S9 pre-cutoff filters | `later_gate_metadata_and_evidence_do_not_taint_commit` covers both latest metadata and evidence after the cold commitment. Both stricter mutants are killed. |
+| Global gate over-blocking | Conservative recorded global participation remains excluded, including bots. Stated in the guide; no claim that overwritten historical actors remain available. |
+| Oversized/unreadable close audit | Retain the 1 MiB JSON limit and fail-closed refusal with existing close/path/repair remedy; bounded availability trade-off. |
+| Git cost under check/publish | Unmeasured per-store scaling retained as a residual: patch comparison adds object/diff/hash reads to matching prior exposures. Per-command timeouts and diff byte cap are not an overall store-scan budget. No performance claim. |
+| Quarantine | Operator must preserve the file and record the decision; removal loses exposure evidence and cannot prove freshness. Guide updated. |
+
+### Reader and compatibility inventory
+
+| Changed contract | Producers/readers |
+| --- | --- |
+| Required `cold_policy.change_base` | Written by the plan author; strict `acceptance_cold.policy` validates shape/SHA through plan validation and vendor-policy reading. `acceptance.prepare` verifies Git objects/ancestry/nonempty aggregate diff before creation; `_policy` rereads retained plan shape; successor calls the same prepare path. Freeze, report bindings, bundle bindings and accepts already pin the plan hash and therefore its base. |
+| Git identity helpers | Audit `_git` is shared by ancestry and content; `check_prior_exposure` recomputes current and matching prior identities from immutable commit objects at the verified locator. Delivery/provenance callers otherwise retain their contracts. No ref, HEAD or checkout writes. |
+| `cold.change_identity` snapshot member | Cold evaluation produces it; resolve, CLI check and publish carry it; terminal `final.acceptance_snapshot` retains it. Attention/barrier readers consume outer final fields and remain unchanged. |
+| Earlier development engines | Strict previous cold-policy readers reject the new required field; this engine rejects prior schema-3 plans lacking it. Fail closed both ways, no automatic migration for this unreleased format. Schema-1/2 plans and routes retain their prior HOLD-only behavior; released/pre-1c engines still reject schema 3. No route/bundle/ack schema or CLI flag changes. |
+
+### Executed evidence
+
+Foreground runs use `PYTHONPATH=<CLONE>/src`, bytecode disabled, and assigned private
+`<SCRATCH>` basetemps. Required red command:
+`python -m pytest tests/test_acceptance.py -q -k rewritten_change_identity_table --basetemp <SCRATCH>/pytest-1c-round3-red -p no:cacheprovider`
+→ **4 failed, 1 passed, 258 deselected**. Post-fix rewrite/ancestry/complete-GO
+selection: **11 passed, 252 deselected** in 56.25 seconds. New guard/base selection:
+**10 passed, 263 deselected** in 11.26 seconds.
+
+Final command: `python -m pytest tests/test_acceptance.py tests/test_close.py tests/test_close_signoffs.py tests/test_gates.py -q --basetemp <SCRATCH>/pytest-1c-round3-final -p no:cacheprovider`
+→ **607 passed, 1 skipped** in 574.32 seconds (272 acceptance + 335 ordinary close
+checks). Skip: host-restricted symlink creation. Attention suites were not rerun;
+their outer persisted-final contracts remain unchanged.
+
+Nine isolated source-copy mutants were executed: **S1, S4, S5, S12, S8, S9,
+patch-match, base-ancestry and whole-diff all KILLED**. The last mutant substitutes
+the final commit's parent for the declared aggregate base; the squash case kills
+it. Every result contains executed behavioral assertion failures, not collection
+errors. Logs and copied sources remain in private task scratch
+`inc1c-round3-mutants-453c7bf6`; the production checkout was never mutated in place.
+
+`python -m ruff check --no-cache src/agenttalk/acceptance.py src/agenttalk/acceptance_audit.py src/agenttalk/acceptance_cold.py tests/test_acceptance.py`
+→ all checks passed. Privacy verification: eight positive controls, zero matches
+in added content; exact seven-file scope, branch, accepted design bytes and
+`git diff --check` verified. Task gates returned GO. Basetemps, mutation runner,
+logs/source copies and verifier are retained for the final reviewer. No PR or
+release; the lead orders the independent final cold sweep after this handoff.

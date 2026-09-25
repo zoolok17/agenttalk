@@ -21,6 +21,7 @@ plan fields and this additional `cold_policy` object:
 ```json
 {
   "reviewer": "cold-reviewer",
+  "change_base": "0123456789abcdef0123456789abcdef01234567",
   "roster": [
     {"actor": "author", "vendor": "vendor-a"},
     {"actor": "runner", "vendor": "vendor-a"},
@@ -31,6 +32,15 @@ plan fields and this additional `cold_policy` object:
   "absence_disclosure": ""
 }
 ```
+
+Replace the illustrative `change_base` with the full commit SHA immediately before
+the complete change under review. Git must verify it as an ancestor of the candidate.
+For a multi-commit change, pin the base before the first commit, not the final
+commit's parent. The frozen plan hash binds this base. Missing/abbreviated bases,
+unknown commits, unrelated bases, empty diffs and shallow histories are refused;
+this workflow requires a nonempty change with an existing base commit. There is
+no automatic last-commit fallback. Earlier development schema-3 plans lacking
+`change_base` fail closed; this unreleased format has no automatic migration.
 
 The roster is the available-vendor snapshot at assignment, not a list trimmed to
 the preferred participants. Include every author, allowed runner, verifier,
@@ -53,6 +63,18 @@ when their update/evidence predates the cold commitment. This uses recorded
 Gate state is mutable, not an immutable actor journal: overwritten updates without
 retained evidence, removed gates, and activity elsewhere remain cooperative
 disclosures. Two roster names for one person cannot be detected automatically.
+Global gate participation is deliberately conservative: even a bot that only set
+an unrelated global gate before the commitment is excluded while that attribution
+remains recorded.
+
+**Cooperative-profile boundary:** these checks catch accidental reuse for related
+source history or the same whole-change content within the verified project
+identity. Deliberately fabricating a replacement project identity, changing the
+declared change boundary, or rewriting the diff so its content identity differs
+is outside this profile. The tool cannot distinguish intent behind those actions.
+The hardened-profile remedy is authenticated reviewer identity and signed change
+identity, not additional Git heuristics. Keep an operator record of any history
+repair or quarantine; removing a close is not proof of reviewer independence.
 
 Open with `close open --acceptance-plan PLAN --project-repo PROJECT --revision SHA`.
 Supply the usual ID, scope and actor, plus lane evidence or the existing explicit
@@ -149,13 +171,22 @@ as well: in the same verified project, Git checks whether either source revision
 is an ancestor of the other. **Related source history identifies the same change
 regardless of row, artifact, field or partition labels.** Overlapping protected
 targets can additionally identify related work, but relabelling cannot erase
-source ancestry. A reveal before the current cold commitment
+source ancestry. Git's stable patch ID of the **whole diff from the frozen,
+verified `change_base`** also identifies the same change after rebasing,
+squashing or cherry-picking that diff. Patch IDs are recomputed from Git objects,
+not accepted from the plan writer. The successful cold snapshot records the base,
+candidate revision and patch ID. A reveal before the current cold commitment
 disqualifies that reviewer even with a new root or context name. This conservative
 rule covers a new fix revision even with entirely renamed measurement targets.
-Sibling branches with neither revision ancestral to the other and disjoint targets
-do not establish exposure to the same change. Missing objects, Git errors or shallow
+Sibling branches with neither revision ancestral to the other, disjoint targets
+and different whole-change patch IDs do not establish exposure to the same change.
+Missing objects, Git/patch-ID errors or shallow
 history cannot establish independence and HOLD; use the complete verified project
 repository and restore missing commit objects before retrying.
+The diff is limited to 16 MiB. Stable patch IDs ignore whitespace and line numbers,
+so they can conservatively identify equivalent formatting variants as the same
+change; they are not a cryptographic identity proof. See
+[Git's patch-ID contract](https://git-scm.com/docs/git-patch-id).
 The check depends on retained local close history; absent external history remains
 a cooperative declaration. Records with a readable different-project identity are
 skipped before their policy/ancestor blobs are traversed. An unreadable same-project

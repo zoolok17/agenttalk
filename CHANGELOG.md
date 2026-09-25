@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Acceptance cold-review freshness also compares Git stable patch IDs of the whole
+  diff from required, verified `cold_policy.change_base`, catching equivalent
+  rebases, squashes and cherry-picks. Deliberate identity/content evasion is an
+  explicit cooperative-profile residual; base and patch ID appear in cold snapshots.
+
 - Acceptance cold-review freshness follows verified Git ancestry across recovery
   roots even after targets are renamed. Corrupt-history refusals identify repair
   options and skip readable other-project records; relevant gate attribution now

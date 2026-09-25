@@ -93,31 +93,63 @@ def _time(value):
     return result
 
 
-def related_revisions(project, earlier, later):
-    """Only Git can establish ancestry; absence of evidence is not independence."""
+def _git(project, *args, data=None):
+    """Read real objects, with identical Git environment for ancestry and content."""
     env = {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_")}
     env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    try:
+        return subprocess.run(["git", "-C", project["locator"], *args], capture_output=True,
+                              input=data, timeout=10, env=env)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise A.AcceptanceError("acceptance_cold_missing", "source identity Git unavailable") from exc
 
-    def git(*args):
-        try:
-            return subprocess.run(["git", "-C", project["locator"], *args], capture_output=True,
-                                  text=True, timeout=10, env=env)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise A.AcceptanceError("acceptance_cold_missing", "source ancestry Git unavailable") from exc
 
-    if not all(isinstance(sha, str) and A._SHA.fullmatch(sha) for sha in (earlier, later)):
+def _complete_history(project, *revisions):
+    if not all(isinstance(sha, str) and A._SHA.fullmatch(sha) for sha in revisions):
         A._fail("source ancestry requires verified commit identities", "acceptance_cold_missing")
-    shallow = git("rev-parse", "--is-shallow-repository")
-    if shallow.returncode or shallow.stdout.strip() != "false":
+    shallow = _git(project, "rev-parse", "--is-shallow-repository")
+    if shallow.returncode or shallow.stdout.strip() != b"false":
         A._fail("source ancestry requires complete project history", "acceptance_cold_missing")
+
+
+def related_revisions(project, earlier, later):
+    """Only Git can establish ancestry; absence of evidence is not independence."""
+    _complete_history(project, earlier, later)
     for first, second in ((earlier, later), (later, earlier)):
-        result = git("merge-base", "--is-ancestor", first, second)
+        result = _git(project, "merge-base", "--is-ancestor", first, second)
         if result.returncode == 0:
             return True
         if result.returncode != 1:
             A._fail("source ancestry cannot be verified; restore the project's commit objects",
                     "acceptance_cold_missing")
     return False
+
+
+def change_identity(project, plan):
+    """Stable patch-id of the complete frozen base-to-candidate diff."""
+    base = plan["cold_policy"]["change_base"]
+    revision = project["revision"]
+    _complete_history(project, base, revision)
+    for sha in (base, revision):
+        verified = _git(project, "rev-parse", "--verify", "--end-of-options", sha + "^{commit}")
+        if verified.returncode or verified.stdout.strip() != sha.encode("ascii"):
+            A._fail("change base/candidate commit cannot be verified", "acceptance_cold_missing")
+    ancestor = _git(project, "merge-base", "--is-ancestor", base, revision)
+    if ancestor.returncode:
+        A._fail("change_base must be a verified ancestor of the candidate", "acceptance_cold_missing")
+    diff = _git(project, "-c", "diff.algorithm=myers", "-c", "diff.indentHeuristic=false",
+                "diff", "--binary", "--full-index", "--no-renames", "--no-ext-diff", "--no-textconv",
+                "--no-color", "--src-prefix=a/", "--dst-prefix=b/", "--line-prefix=", "--unified=3",
+                "--submodule=short", "--ignore-submodules=none", base, revision, "--")
+    if diff.returncode or not diff.stdout or len(diff.stdout) > A.MAX_TOTAL_BYTES:
+        A._fail("whole change diff is unavailable, empty or exceeds the acceptance byte limit",
+                "acceptance_cold_missing")
+    result = _git(project, "-c", "patchid.verbatim=false", "patch-id", "--stable", data=diff.stdout)
+    fields = result.stdout.split()
+    if (result.returncode or len(fields) != 2 or
+            any(len(field) != 40 or any(c not in b"0123456789abcdef" for c in field) for field in fields)):
+        A._fail("whole change patch-id cannot be verified", "acceptance_cold_missing")
+    return {"base": base, "revision": revision, "patch_id": fields[0].decode("ascii")}
 
 
 def check_prior_exposure(store, record, plan, reviewer):
@@ -127,6 +159,7 @@ def check_prior_exposure(store, record, plan, reviewer):
     if len(commits) != 1:
         A._fail("cold commitment event missing or ambiguous", "acceptance_cold_missing")
     committed = _time(commits[0]["at"])
+    current_change = change_identity(route["project"], plan)
     targets = {coverage.target_id(row) for row in plan["rows"]}
     for close_id in close.list_close_ids(store):
         try:
@@ -153,9 +186,12 @@ def check_prior_exposure(store, record, plan, reviewer):
             if prior_plan["cold_policy"]["reviewer"] != reviewer:
                 continue
             same_change = (related_revisions(route["project"], prior["revision"], record["revision"]) or
-                           bool(targets & {coverage.target_id(row) for row in prior_plan["rows"]}))
+                           bool(targets & {coverage.target_id(row) for row in prior_plan["rows"]}) or
+                           current_change["patch_id"] == change_identity(
+                               dict(route["project"], revision=prior["revision"]), prior_plan)["patch_id"])
             if same_change:
                 reveals = [e for e in prior["events"] if e.get("event") == "acceptance:cold-reconcile"]
                 if not reveals or any(_time(e["at"]) < committed for e in reveals):
                     A._fail("reviewer was unblinded for this change, including another root",
                             "acceptance_cold_missing")
+    return current_change
