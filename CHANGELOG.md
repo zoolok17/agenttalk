@@ -24,8 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   settles on the provider's reasoning-inclusive counts. While reasoning
   is dropped the front emits Anthropic `ping` events so the CLI's stream
   idle watchdogs never see dead air. Non-streaming replies are stripped
-  too. The front records blocks and characters removed per attempt in
-  `.agenttalk/gateway/reasoning-stripped.jsonl` (no content).
+  too. The strip fails open at every level (any internal error forwards
+  the reply raw and settles on the unfiltered usage; a last-resort handler
+  marks the attempt `uncertain`), so it can never leave an attempt
+  `reserved` and block the route. The front records blocks and characters
+  removed per attempt, plus `empty`, `stop_reason`, `misplaced` and
+  `failed`, in `.agenttalk/gateway/reasoning-stripped.jsonl` (no content).
 
 ### Added
 

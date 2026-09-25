@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from agenttalk import ovh_gateway as gateway
+from agenttalk import ovh_gateway_front as front_module
 from agenttalk.ovh_gateway import (
     MAX_OUTPUT_TOKENS,
     MAX_REQUEST_BYTES,
@@ -1324,3 +1325,140 @@ def test_a_failing_reasoning_observer_never_affects_settlement_or_the_reply(tmp_
     status = front.ledger.status()
     assert status["unresolved"] == []
     assert status["current_committed_micro_eur"] == settlement_cost_micro_eur(50, 30)
+
+
+# --------------------------------------- the strip can never leave a bare 'reserved'
+
+
+def _assert_settled_and_open(front: GatewayFront) -> None:
+    status = front.ledger.status()
+    assert status["unresolved"] == []
+    assert status["current_committed_micro_eur"] == settlement_cost_micro_eur(50, 30)
+
+
+def test_a_lone_surrogate_after_reasoning_still_settles_and_forwards_the_whole_reply(
+    tmp_path,
+) -> None:
+    from test_ovh_gateway_reasoning import _thinking_then_text
+
+    raw = _thinking_then_text("ok \ud83d")
+    front = _direct_front(tmp_path, _FakeConnection(_ChunkedResponse(raw)))
+    handler = _FakeHandler()
+
+    front._proxy(handler, b"{}", capability=_direct_capability(front))
+
+    assert handler.status == 200
+    sent = handler.wfile.getvalue()
+    assert sent.endswith(b'"type": "message_stop"}\n\n')
+    assert b"ud83d" in sent
+    _assert_settled_and_open(front)
+    # The next call is not blocked by an unresolved attempt.
+    assert front.ledger.open_child_turn(
+        agent="qwen-dev-2", message_id="next", request_id="q-next",
+        issuer_token=TEST_CHILD_CAP_ISSUER,
+    ).token
+
+
+def test_an_internal_stripper_error_fails_open_and_settles_exactly(tmp_path, monkeypatch) -> None:
+    raw = _reasoning_stream()
+    front = _direct_front(tmp_path, _FakeConnection(_ChunkedResponse(raw)))
+    handler = _FakeHandler()
+    observed: list[object] = []
+    front.reasoning_observer = lambda _attempt, stats: observed.append(stats)
+
+    def boom(self, block, terminator):
+        raise RuntimeError("stripper bug")
+
+    monkeypatch.setattr(front_module.SseReasoningStripper, "_process", boom)
+
+    front._proxy(handler, b"{}", capability=_direct_capability(front))
+
+    assert handler.wfile.getvalue() == raw  # unstripped, but complete
+    _assert_settled_and_open(front)
+    assert len(observed) == 1 and observed[0].failed is True
+
+
+def test_an_exception_escaping_the_stripper_call_fails_open_and_settles_exactly(
+    tmp_path, monkeypatch
+) -> None:
+    raw = _reasoning_stream()
+    front = _direct_front(tmp_path, _FakeConnection(_ChunkedResponse(raw)))
+    handler = _FakeHandler()
+    observed: list[object] = []
+    front.reasoning_observer = lambda _attempt, stats: observed.append(stats)
+
+    def boom(self, chunk):
+        raise RuntimeError("stripper bug")
+
+    monkeypatch.setattr(front_module.SseReasoningStripper, "feed", boom)
+
+    front._proxy(handler, b"{}", capability=_direct_capability(front))
+
+    assert handler.wfile.getvalue() == raw
+    _assert_settled_and_open(front)
+    assert len(observed) == 1 and observed[0].failed is True
+
+
+def test_a_json_strip_exception_fails_open_and_settles_exactly(tmp_path, monkeypatch) -> None:
+    body = json.dumps({
+        "type": "message", "role": "assistant", "model": MODEL_ALIAS,
+        "content": [
+            {"type": "thinking", "thinking": "private", "signature": ""},
+            {"type": "text", "text": "answer"},
+        ],
+        "usage": {"input_tokens": 50, "output_tokens": 30},
+    }).encode()
+    front = _direct_front(
+        tmp_path, _FakeConnection(_ChunkedResponse(body, content_type="application/json"))
+    )
+    handler = _FakeHandler()
+
+    def boom(_body: bytes):
+        raise RuntimeError("strip bug")
+
+    monkeypatch.setattr(front_module, "strip_reasoning_json", boom)
+
+    front._proxy(handler, b"{}", capability=_direct_capability(front))
+
+    assert handler.wfile.getvalue() == body
+    _assert_settled_and_open(front)
+
+
+def test_any_unexpected_response_path_error_marks_the_attempt_uncertain_never_reserved(
+    tmp_path, monkeypatch
+) -> None:
+    front = _direct_front(tmp_path, _FakeConnection(_ChunkedResponse(_reasoning_stream())))
+    handler = _FakeHandler()
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(front.ledger, "settle", boom)
+
+    front._proxy(handler, b"{}", capability=_direct_capability(front))
+
+    unresolved = front.ledger.status()["unresolved"]
+    assert [row["state"] for row in unresolved] == ["uncertain"]
+
+
+def test_a_non_streaming_reply_past_the_buffer_bound_is_forwarded_whole(
+    tmp_path, monkeypatch
+) -> None:
+    body = json.dumps({
+        "type": "message", "role": "assistant", "model": MODEL_ALIAS,
+        "content": [
+            {"type": "thinking", "thinking": "private " * 20, "signature": ""},
+            {"type": "text", "text": "answer"},
+        ],
+        "usage": {"input_tokens": 50, "output_tokens": 30},
+    }).encode()
+    monkeypatch.setattr(front_module, "_MAX_BUFFERED_JSON_BYTES", 40)
+    front = _direct_front(
+        tmp_path, _FakeConnection(_ChunkedResponse(body, content_type="application/json", size=16))
+    )
+    handler = _FakeHandler()
+
+    front._proxy(handler, b"{}", capability=_direct_capability(front))
+
+    assert handler.wfile.getvalue() == body  # held prefix and the rest, unstripped, in order
+    _assert_settled_and_open(front)

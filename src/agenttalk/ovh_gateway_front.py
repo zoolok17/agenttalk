@@ -446,6 +446,7 @@ class GatewayFront:
             )
             json_size = 0
             json_stats = ReasoningStats()
+            failed_stripper: SseReasoningStripper | None = None
             while True:
                 chunk = response.read(16 * 1024)
                 if not chunk:
@@ -462,17 +463,33 @@ class GatewayFront:
                     handler.wfile.write(chunk)
                     handler.wfile.flush()
                     continue
-                forwarded = stripper.feed(chunk) if stripper is not None else chunk
+                forwarded = chunk
+                if stripper is not None:
+                    try:
+                        forwarded = stripper.feed(chunk)
+                    except Exception:  # noqa: BLE001 - fail open on the strip only
+                        stripper.stats.failed = True
+                        forwarded = chunk
+                        failed_stripper = stripper
+                        stripper = None
                 if forwarded:
                     handler.wfile.write(forwarded)
                     handler.wfile.flush()
             if stripper is not None:
-                tail = stripper.finish()
+                try:
+                    tail = stripper.finish()
+                except Exception:  # noqa: BLE001 - fail open on the strip only
+                    stripper.stats.failed = True
+                    tail = b""
                 if tail:
                     handler.wfile.write(tail)
                     handler.wfile.flush()
             if json_parts is not None:
-                body_out, json_stats = strip_reasoning_json(b"".join(json_parts))
+                held = b"".join(json_parts)
+                try:
+                    body_out, json_stats = strip_reasoning_json(held)
+                except Exception:  # noqa: BLE001 - fail open on the strip only
+                    body_out, json_stats = held, ReasoningStats(failed=True)
                 handler.wfile.write(body_out)
                 handler.wfile.flush()
             model, input_tokens, output_tokens = usage.finish()
@@ -482,7 +499,8 @@ class GatewayFront:
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
             )
-            stripped = stripper.stats if stripper is not None else json_stats
+            live = stripper or failed_stripper
+            stripped = live.stats if live is not None else json_stats
             if stripped and self.reasoning_observer is not None:
                 # Diagnostics never affect accounting or the response.
                 with contextlib.suppress(Exception):
@@ -496,6 +514,13 @@ class GatewayFront:
                     pass
         except (OSError, http.client.HTTPException, LedgerBlocked, LedgerHold):
             self._mark_uncertain(attempt_id, "transport or settlement failure")
+            if not public_response_started and not handler.wfile.closed:
+                try:
+                    handler._stable_error(502, INFRA_ERROR_CODE)  # type: ignore[attr-defined]
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+        except Exception:  # noqa: BLE001 - last resort: no path may leave a bare 'reserved'
+            self._mark_uncertain(attempt_id, "unexpected response-path failure")
             if not public_response_started and not handler.wfile.closed:
                 try:
                     handler._stable_error(502, INFRA_ERROR_CODE)  # type: ignore[attr-defined]

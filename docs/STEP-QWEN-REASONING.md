@@ -126,18 +126,32 @@ wrapper before and after.
   `redacted_thinking` blocks, every `thinking_delta` and `signature_delta` (even one that lands on a text block,
   the historical out-of-order abort), and renumbers the remaining blocks so indices stay consecutive. Everything else,
   including `message_start`, `message_delta` (usage) and `message_stop`, is forwarded byte-for-byte. It is
-  chunk-boundary independent, accepts LF and CRLF framing, and fails open: an unparsable event is forwarded, and
-  an event over 1 MiB switches the rest of the stream to raw passthrough.
+  chunk-boundary independent, accepts LF and CRLF framing, and is byte-safe for any string (renumbered events are
+  re-serialised with ASCII escapes, so even a lone UTF-16 surrogate in a delta cannot raise).
+- **The strip can never leave an attempt unresolved.** It fails open at every level: an unparsable event is
+  forwarded; an event over 1 MiB switches the rest of the stream to raw passthrough; any internal error in the
+  stripper or in the JSON strip switches to raw passthrough and is recorded (`failed`); and the front guards each
+  call to the stripper so even an exception escaping it forwards the chunk raw. Usage is parsed separately from the
+  unfiltered bytes, so accounting stays exact whichever path ran. As a last resort, any other unexpected exception on
+  the response path marks the attempt `uncertain` and returns the stable error if nothing was sent yet, so a new code
+  path can never leave a bare `reserved` attempt that blocks the route.
 - While events are being dropped and nothing has been forwarded for 15 seconds, a standard `ping` event is
   emitted so the client never sees dead air. The real CLI was run against a stream with pings and renumbered
   blocks and completed normally.
 - Usage is read from the unfiltered upstream bytes, so the ledger still settles on the provider's real,
   reasoning-inclusive token counts. Reasoning is still paid for once as output; it is no longer paid for again
   as input on every later call.
-- Non-streaming replies are buffered (up to 8 MiB) and stripped the same way.
+- Non-streaming replies are buffered (up to 8 MiB, past which the reply is forwarded unstripped) and stripped the
+  same way.
 - The front writes `reasoning-stripped.jsonl` in the gateway state directory: attempt id, block count and
-  character count per attempt, no content, rotated at 1 MiB. Divide characters by about four for tokens.
-  `FrontConfig.strip_reasoning` (default on) switches stripping off.
+  character count per attempt, no content, rotated at 1 MiB. Divide characters by about four for tokens. Extra
+  fields: `empty` (true when no text or tool call survived, that is the reply was only reasoning) with its
+  `stop_reason`; `misplaced` (non-thinking deltas that arrived on a thinking block and were lost); `failed` (the
+  strip errored and the rest of the reply went out raw).
+- `FrontConfig.strip_reasoning` exists for tests only. `run_service` does not expose it, and it is not a safe
+  operator switch: with the merge fold gone, LiteLLM can emit a thinking delta on a text block when one chunk spans
+  the end of reasoning (observed through the real LiteLLM), which is the historical abort shape; only the strip
+  removes it.
 
 **(b) A fixed, configurable reasoning parameter.** `gateway init` and `gateway reconfigure` take
 `--reasoning-param NAME=VALUE` (repeatable); `reconfigure --no-reasoning-param` removes them. They are rendered
@@ -170,7 +184,8 @@ runtime that registered the task), otherwise follow the unregister step in
 `docs/STEP-ENVELOPE-SERVICE-READERS.md`.
 
 1. Take the "before" measurement for the card (section 6).
-2. `agenttalk gateway stop` and confirm both loopback ports are free.
+2. `agenttalk gateway stop` (it reports success only once the runtime marker is gone and both loopback sockets
+   are bindable). Check afterwards with `agenttalk gateway status`: `public_listener_present` must be false.
 3. Install the release that contains this change into the same runtime.
 4. `agenttalk gateway reconfigure` (add `--reasoning-param NAME=VALUE` once the probe in section 5 has found the
    parameter). This re-renders the config without the merge fold, rebinds the manifest's config hash, and touches
@@ -182,8 +197,11 @@ runtime that registered the task), otherwise follow the unregister step in
    reasoned. No lines means either the model did not reason or LiteLLM did not emit thinking blocks: treat that as a
    finding, not success.
 
-Rollback: `agenttalk gateway stop`, reinstall the previous release, `agenttalk gateway reconfigure`,
-`agenttalk gateway start`. The previous release re-renders the merge fold and ignores the extra manifest key.
+Rollback: `agenttalk gateway stop`; with this release still installed, `agenttalk gateway reconfigure
+--no-reasoning-param` (so the manifest no longer records a parameter the previous release cannot render); reinstall
+the previous release; `agenttalk gateway reconfigure` (it re-renders the merge fold); `agenttalk gateway start`.
+If the manifest key is left behind, the previous release ignores it, but `gateway status` on this release would
+report a parameter that is not in the config until the next `reconfigure`.
 
 ## 5. Finding the OVH reasoning parameter (one bounded probe)
 
@@ -247,6 +265,12 @@ percentile). The strip log gives the reasoning volume directly: characters divid
 - Mutation-verified: reverting each of thinking-block removal, index renumbering, thinking-delta removal, fail-open,
   ping emission, JSON stripping, front stripping (stream and JSON), observer isolation, the merge fold, `extra_body`
   placement, the reserved-name check, stored-parameter retention and the manifest validation makes a new test fail.
+  The fail-open round added, each verified the same way: ASCII-safe re-serialisation (stream and JSON), the total
+  `feed` and total JSON strip, the front's guards around both, the last-resort handler, the `misplaced`, `empty`
+  and `stop_reason` records, and the 8 MiB non-streaming overflow path (prefix kept, threshold honoured).
+- Fail-open tests: a lone surrogate after a thinking block, an internal stripper error, an exception escaping the
+  stripper call, a JSON strip exception, an unexpected ledger error, each leaving no `reserved` attempt and (except
+  the last, which marks the attempt `uncertain`) settling exactly.
 
 ## 8. Limits and what was not verified
 
@@ -255,6 +279,21 @@ percentile). The strip log gives the reasoning volume directly: characters divid
   `content` instead, neither the old fold nor this strip touches it, and the strip log stays empty (step 7).
 - The CLI's idle watchdogs were found in the bundle but their defaults were not determined; pings are a
   precaution. The CLI accepted a stream with pings in a loopback run.
+- A reply that is only reasoning (for example it hit `max_tokens` while thinking) now reaches the CLI as an empty
+  message; before, the partial reasoning arrived as text. On `end_turn` a wrapped seat fails the same way as
+  before, but on `max_tokens` the CLI's continuation starts from zero and can hit the cap again (at most 32,768
+  output tokens per call, bounded by the child-turn cap). It has not been seen: the largest baseline output is 18,711
+  on the desktop and 31,709 on the VM. The strip log's `empty` and `stop_reason` make it visible.
+- Through LiteLLM 1.91.3 a chunk that carries both `reasoning_content` and `content` loses its content part under
+  both the old and the new config (the old fold replaced it; now the chunk becomes a thinking delta only). How often
+  OVH emits such a chunk is unknown.
+- Qwen3-family chat templates may keep prior `reasoning_content` for assistant turns after the last user message
+  (inside a tool loop). The strip removes it entirely, so multi-step tool use might need more calls; the section 6
+  protocol compares calls per card and will show it. (Low confidence: recalled, not checked.)
+- `gateway status` reports the `reasoning_params` recorded in the manifest, not what the config file carries. A
+  check on load that the config equals the render of the stored parameters was considered and not added: it would
+  make an upgraded-but-not-reconfigured install fail closed, contradicting the documented upgrade property that the
+  old config keeps working until `reconfigure`. The rollback order above avoids the drift instead.
 - The size of the saving depends on the reasoning share of output, which the ledger cannot show; section 1 gives the
   bounds and the strip log will give the figure.
 - The VM baseline is aggregates only; its per-turn shape and carry-forward slope were not computed.

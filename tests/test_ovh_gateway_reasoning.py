@@ -425,7 +425,10 @@ def test_strip_log_appends_content_free_lines_and_rotates(tmp_path, monkeypatch)
     log.record("a" * 32, ReasoningStats(blocks=2, chars=900))
     row = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
     assert row["attempt_id"] == "a" * 32 and row["blocks"] == 2 and row["chars"] == 900
-    assert set(row) == {"ts", "attempt_id", "blocks", "chars"}
+    assert set(row) == {
+        "ts", "attempt_id", "blocks", "chars", "empty", "stop_reason", "misplaced", "failed",
+    }
+    assert row["empty"] is False and row["failed"] is False
     monkeypatch.setattr(ReasoningStripLog, "MAX_BYTES", 10)
     log.record("b" * 32, ReasoningStats(blocks=1, chars=5))
     assert path.with_name(path.name + ".1").is_file()
@@ -493,3 +496,125 @@ def test_ping_uses_the_streams_line_endings_and_never_carries_usage() -> None:
     assert out == b'event: ping\r\ndata: {"type": "ping"}\r\n\r\n'
     tail = stripper.feed(_sse(_stop(0), MESSAGE_DELTA, MESSAGE_STOP, eol="\r\n"))
     assert _sse(MESSAGE_DELTA, eol="\r\n") in tail  # usage passes untouched
+
+
+# ------------------------------------------- fail-open, surrogates, diagnostics
+
+
+def _thinking_then_text(text: str) -> bytes:
+    return _sse(
+        MESSAGE_START,
+        _start(0), _delta(0, "text_delta", text="a"), _stop(0),
+        _start(1, "thinking"), _delta(1, "thinking_delta", thinking="hmm"), _stop(1),
+        _start(2), _delta(2, "text_delta", text=text), _stop(2),
+        {**MESSAGE_DELTA, "delta": {"stop_reason": "end_turn"}}, MESSAGE_STOP,
+    )
+
+
+def test_a_lone_surrogate_after_a_thinking_block_is_forwarded_without_raising() -> None:
+    # A lone UTF-16 surrogate decodes to a str that ensure_ascii=False could not
+    # encode as UTF-8; the rewrite must stay byte-safe for any string.
+    stripper = SseReasoningStripper()
+    out = stripper.feed(_thinking_then_text("ok \ud83d")) + stripper.finish()
+    assert not stripper.stats.failed
+    text = [e["delta"]["text"] for e in _events(out) if e["type"] == "content_block_delta"]
+    assert text == ["a", "ok \ud83d"]
+    assert [e["index"] for e in _events(out) if e["type"] == "content_block_start"] == [0, 1]
+
+
+def test_non_ascii_text_survives_renumbering_exactly() -> None:
+    stripper = SseReasoningStripper()
+    out = stripper.feed(_thinking_then_text("héllo ✓ \U0001f600")) + stripper.finish()
+    text = [e["delta"]["text"] for e in _events(out) if e["type"] == "content_block_delta"]
+    assert text[-1] == "héllo ✓ \U0001f600"
+    out.decode("ascii")  # renumbered events are plain ASCII escapes
+
+
+def test_json_reply_with_a_lone_surrogate_is_stripped_without_raising() -> None:
+    body = json.dumps({
+        "type": "message", "role": "assistant", "stop_reason": "end_turn",
+        "content": [
+            {"type": "thinking", "thinking": "private", "signature": ""},
+            {"type": "text", "text": "ok \ud83d"},
+        ],
+        "usage": {"input_tokens": 5, "output_tokens": 3},
+    }).encode()
+    out, stats = strip_reasoning_json(body)
+    assert not stats.failed and stats.blocks == 1
+    assert json.loads(out)["content"] == [{"type": "text", "text": "ok \ud83d"}]
+
+
+def test_an_internal_stripper_error_switches_to_raw_passthrough_and_is_recorded(
+    monkeypatch,
+) -> None:
+    raw = _sse(*TOOL_STREAM_EVENTS)
+    stripper = SseReasoningStripper()
+
+    def boom(self, block, terminator):
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(SseReasoningStripper, "_process", boom)
+    first, rest = raw[:100], raw[100:]
+    out = stripper.feed(first)
+    out += stripper.feed(rest) + stripper.finish()
+    assert out == raw  # nothing lost, nothing held: the whole reply is forwarded raw
+    assert stripper.stats.failed and bool(stripper.stats)
+
+
+def test_json_strip_error_returns_the_original_body_and_records_it(monkeypatch) -> None:
+    body = json.dumps({
+        "type": "message", "content": [{"type": "thinking", "thinking": "x"}],
+    }).encode()
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(reasoning.json, "dumps", boom)
+    out, stats = strip_reasoning_json(body)
+    assert out == body and stats.failed
+
+
+def test_a_reply_that_is_only_reasoning_is_flagged_empty_with_its_stop_reason() -> None:
+    raw = _sse(
+        MESSAGE_START,
+        _start(0, "thinking"), _delta(0, "thinking_delta", thinking="endless"), _stop(0),
+        {**MESSAGE_DELTA, "delta": {"stop_reason": "max_tokens"}}, MESSAGE_STOP,
+    )
+    stripper = SseReasoningStripper()
+    stripper.feed(raw)
+    stripper.finish()
+    assert stripper.stats.empty is True and stripper.stats.stop_reason == "max_tokens"
+
+    with_text = SseReasoningStripper()
+    with_text.feed(_thinking_then_text("real answer"))
+    with_text.finish()
+    assert with_text.stats.empty is False and with_text.stats.stop_reason == "end_turn"
+
+    with_tool = SseReasoningStripper()
+    with_tool.feed(_sse(*TOOL_STREAM_EVENTS))
+    with_tool.finish()
+    assert with_tool.stats.empty is False
+
+
+def test_json_reply_that_is_only_reasoning_is_flagged_empty() -> None:
+    body = json.dumps({
+        "type": "message", "stop_reason": "max_tokens",
+        "content": [{"type": "thinking", "thinking": "endless"}],
+    }).encode()
+    _, stats = strip_reasoning_json(body)
+    assert stats.empty is True and stats.stop_reason == "max_tokens"
+
+
+def test_content_delivered_on_a_dropped_thinking_block_is_counted_not_lost_silently() -> None:
+    raw = _sse(
+        MESSAGE_START,
+        _start(0, "thinking"),
+        _delta(0, "thinking_delta", thinking="t"),
+        _delta(0, "text_delta", text="answer on the wrong block"),
+        _delta(0, "input_json_delta", partial_json="{}"),
+        _stop(0),
+        {**MESSAGE_DELTA, "delta": {"stop_reason": "end_turn"}}, MESSAGE_STOP,
+    )
+    stripper = SseReasoningStripper()
+    stripper.feed(raw)
+    assert stripper.stats.misplaced == 2 and bool(stripper.stats)

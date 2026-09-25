@@ -159,9 +159,16 @@ PING_INTERVAL_SECONDS = 15.0
 class ReasoningStats:
     blocks: int = 0
     chars: int = 0
+    # Non-thinking deltas that arrived on a dropped thinking block and were lost.
+    misplaced: int = 0
+    # No text or tool call survived the strip (a reply that was only reasoning).
+    empty: bool = False
+    stop_reason: str | None = None
+    # The strip hit an internal error and forwarded the rest of the reply raw.
+    failed: bool = False
 
     def __bool__(self) -> bool:
-        return bool(self.blocks or self.chars)
+        return bool(self.blocks or self.chars or self.misplaced or self.failed)
 
 
 class SseReasoningStripper:
@@ -172,6 +179,9 @@ class SseReasoningStripper:
     ``index`` is renumbered so the kept blocks stay contiguous. If a single event
     exceeds ``MAX_EVENT_BYTES`` the filter stops filtering and forwards raw
     bytes from then on, so a parsing surprise can never stall or corrupt a turn.
+    ``feed`` is total: any internal error switches to raw passthrough (recorded in
+    ``stats.failed``) instead of propagating, so the front can always settle the
+    attempt from the unfiltered usage it parses separately.
 
     While reasoning is being dropped the client would otherwise see no bytes at
     all for the whole reasoning stretch, and the Claude CLI has stream-idle
@@ -192,6 +202,7 @@ class SseReasoningStripper:
         self._map: dict[int, int] = {}
         self._next = 0
         self._passthrough = False
+        self._has_content = False
         self._ping_interval = ping_interval
         self._clock = clock
         self._last_out = clock()
@@ -218,16 +229,25 @@ class SseReasoningStripper:
             return bytes(chunk)
         self._buffer.extend(chunk)
         out = bytearray()
-        while True:
-            found = self._boundary(self._buffer)
-            if found is None:
-                break
-            at, size = found
-            block = bytes(self._buffer[: at + size])
-            del self._buffer[: at + size]
-            out.extend(self._process(block, block[at:]))
-        if len(self._buffer) > MAX_EVENT_BYTES:
+        block = b""
+        try:
+            while True:
+                found = self._boundary(self._buffer)
+                if found is None:
+                    break
+                at, size = found
+                block = bytes(self._buffer[: at + size])
+                del self._buffer[: at + size]
+                out.extend(self._process(block, block[at:]))
+                block = b""
+            if len(self._buffer) > MAX_EVENT_BYTES:
+                self._passthrough = True
+                out.extend(self._buffer)
+                self._buffer.clear()
+        except Exception:  # noqa: BLE001 - fail open, never stall the route
             self._passthrough = True
+            self.stats.failed = True
+            out.extend(block)
             out.extend(self._buffer)
             self._buffer.clear()
         if out:
@@ -237,6 +257,7 @@ class SseReasoningStripper:
     def finish(self) -> bytes:
         rest = bytes(self._buffer)
         self._buffer.clear()
+        self.stats.empty = not self._has_content
         return rest
 
     def _process(self, block: bytes, terminator: bytes) -> bytes:
@@ -264,6 +285,8 @@ class SseReasoningStripper:
                     self._dropped.add(index)
                 self.stats.blocks += 1
                 return self._after_drop(terminator)
+            if isinstance(start, dict) and start.get("type") == "tool_use":
+                self._has_content = True
             if isinstance(index, int):
                 new_index = self._next
                 self._next += 1
@@ -279,7 +302,12 @@ class SseReasoningStripper:
                     self.stats.chars += len(thinking)
                 return self._after_drop(terminator)
             if isinstance(index, int) and index in self._dropped:
+                self.stats.misplaced += 1
                 return self._after_drop(terminator)
+            if isinstance(delta, dict) and (
+                delta.get("text") or delta.get("partial_json")
+            ):
+                self._has_content = True
             if isinstance(index, int) and index in self._map:
                 return self._rewrite(
                     block, lines, data_at, obj, self._map[index], eol, terminator
@@ -294,6 +322,10 @@ class SseReasoningStripper:
                     block, lines, data_at, obj, self._map.pop(index), eol, terminator
                 )
             return block
+        if kind == "message_delta":
+            delta = obj.get("delta")
+            if isinstance(delta, dict) and isinstance(delta.get("stop_reason"), str):
+                self.stats.stop_reason = delta["stop_reason"]
         return block
 
     @staticmethod
@@ -310,7 +342,9 @@ class SseReasoningStripper:
             return block
         obj = dict(obj)
         obj["index"] = new_index
-        payload = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+        # Default ASCII escaping: byte-safe for any string, including a lone
+        # surrogate that ensure_ascii=False could not encode as UTF-8.
+        payload = json.dumps(obj, separators=(",", ":"))
         rebuilt: list[str] = []
         for i, line in enumerate(lines):
             if i == data_at[0]:
@@ -321,27 +355,39 @@ class SseReasoningStripper:
 
 
 def strip_reasoning_json(body: bytes) -> tuple[bytes, ReasoningStats]:
-    """Remove thinking blocks from a non-streaming Anthropic message."""
+    """Remove thinking blocks from a non-streaming Anthropic message.
+
+    Total: on any error the original body is returned and ``stats.failed`` is set.
+    """
     stats = ReasoningStats()
     try:
         obj = json.loads(body.decode("utf-8"))
+        if not isinstance(obj, dict) or not isinstance(obj.get("content"), list):
+            return body, stats
+        kept = []
+        for block in obj["content"]:
+            if isinstance(block, dict) and block.get("type") in THINKING_BLOCK_TYPES:
+                stats.blocks += 1
+                thinking = block.get("thinking")
+                if isinstance(thinking, str):
+                    stats.chars += len(thinking)
+                continue
+            kept.append(block)
+        if not stats:
+            return body, stats
+        stats.empty = not any(
+            isinstance(block, dict)
+            and (block.get("type") == "tool_use" or block.get("text"))
+            for block in kept
+        )
+        if isinstance(obj.get("stop_reason"), str):
+            stats.stop_reason = obj["stop_reason"]
+        obj["content"] = kept
+        return json.dumps(obj, separators=(",", ":")).encode("utf-8"), stats
     except (UnicodeDecodeError, ValueError):
-        return body, stats
-    if not isinstance(obj, dict) or not isinstance(obj.get("content"), list):
-        return body, stats
-    kept = []
-    for block in obj["content"]:
-        if isinstance(block, dict) and block.get("type") in THINKING_BLOCK_TYPES:
-            stats.blocks += 1
-            thinking = block.get("thinking")
-            if isinstance(thinking, str):
-                stats.chars += len(thinking)
-            continue
-        kept.append(block)
-    if not stats:
-        return body, stats
-    obj["content"] = kept
-    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8"), stats
+        return body, ReasoningStats()
+    except Exception:  # noqa: BLE001 - fail open, never stall the route
+        return body, ReasoningStats(failed=True)
 
 
 class ReasoningStripLog:
@@ -360,6 +406,10 @@ class ReasoningStripLog:
                 "attempt_id": attempt_id,
                 "blocks": stats.blocks,
                 "chars": stats.chars,
+                "empty": stats.empty,
+                "stop_reason": stats.stop_reason,
+                "misplaced": stats.misplaced,
+                "failed": stats.failed,
             },
             separators=(",", ":"),
         )
