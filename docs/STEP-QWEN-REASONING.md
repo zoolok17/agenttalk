@@ -11,8 +11,8 @@ fake server for the Claude CLI, and the runtime's own LiteLLM against a fake Ope
 Source: an SQLite online backup of the desktop ledger taken from a read-only connection on 2026-09-25,
 queried as a copy. Only aggregates are recorded; turns are anonymised in first-call order. One attempt was
 still `reserved` (a call in flight when the copy was taken) and is excluded. All 452 attempts carry the
-current price policy, so the whole history is under the EUR 0.40 / 2.70 per 1M tariff. The VM ledger's numbers
-are to be added by the lead.
+current price policy, so the whole history is under the EUR 0.40 / 2.70 per 1M tariff. The VM ledger's
+aggregates, supplied by the lead from a read-only query, are in a second table after the desktop figures.
 
 | Measure | Value |
 |---|---|
@@ -39,7 +39,26 @@ are to be added by the lead.
 | T8 | 89 | 5,820,723 | 70,835 | 2.520 | 0.076 | 8,280 | 1 |
 | T9 | 35 | 2,945,725 | 53,170 | 1.322 | 0.109 | 12,301 | 1 |
 
-**Is output carried forward as input?** Yes, on this data. Regressing the growth in input between consecutive
+**VM ledger (aggregates only, supplied by the lead).** No per-turn table and no carry-forward regression were
+available for it.
+
+| Measure | VM | Desktop |
+|---|---|---|
+| Settled calls | 920 | 451 |
+| Settled cost | EUR 32.14 | EUR 15.29 |
+| Input tokens / output tokens | 71.92M / 1,248K (input 98.3% of tokens) | 34.06M / 617K (98.2%) |
+| Output share of cost (at 0.40 / 2.70, derived) | 10.5% | 10.9% |
+| Input per call, p50 / p90 | 76.1K / 125.1K | 76.7K / 116.7K |
+| Output per call, p50 / p90 / p99 / max | 375 / 2,811 / 14,575 / 31,709 | 506 / 3,151 / 13,985 / 18,711 |
+| Calls with more than 8K output | 40 (4.3% of calls), 45.6% of output tokens | 14 (3.1%), 27.8% |
+
+The two hosts agree on the shape: input is 98% of tokens and a call carries about 76K input at the median.
+The VM has the heavier output tail: nearly half its output tokens sit in the 4% of calls above 8K, and its largest
+call (31,709 tokens) is about 3% below the 32,768 output pin. That is where reasoning is most likely to
+concentrate, so the VM should benefit at least as much as the desktop from the strip; its carry-forward exposure
+was not computed and should be measured with the strip log after the change.
+
+**Is output carried forward as input?** Yes, on the desktop data. Regressing the growth in input between consecutive
 calls of one turn on the previous call's output tokens gives a slope of 0.957 (correlation 0.884, 433 pairs).
 After a call with more than 8K of output the next call's input grew by a median 11,046 tokens against a median
 10,334 tokens of output (10 pairs). If output were not carried forward the growth would track tool results only.
@@ -238,4 +257,4 @@ percentile). The strip log gives the reasoning volume directly: characters divid
   precaution. The CLI accepted a stream with pings in a loopback run.
 - The size of the saving depends on the reasoning share of output, which the ledger cannot show; section 1 gives the
   bounds and the strip log will give the figure.
-- The VM ledger baseline is still to be supplied.
+- The VM baseline is aggregates only; its per-turn shape and carry-forward slope were not computed.
