@@ -17,7 +17,7 @@ import stat
 import subprocess  # nosec B404 - fixed Git argv lists; shell is never used
 import uuid
 
-from agenttalk import close
+from agenttalk import acceptance_git, close
 
 MAX_BYTES = 1024 * 1024
 MAX_ITEMS = 256
@@ -270,10 +270,31 @@ def verify_project(repo, revision, *, live=True):
         return result.stdout.strip()
 
     _text(revision, "revision")
-    if Path(git("rev-parse", "--show-toplevel")).resolve() != repo:
-        _fail("project locator must name the checkout root", "acceptance_project_unverified")
-    sha = git("rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}")
-    if not _SHA.fullmatch(sha) or (live and git("rev-parse", "HEAD") != sha):
+    head = None
+
+    def metadata():
+        nonlocal head
+        # --verify still receives exactly one revision and --end-of-options
+        # still precedes caller input. Split from the right for roots containing
+        # newlines; --show-toplevel is emitted before the verified object ID.
+        root, _, sha = git("rev-parse", "--show-toplevel", "--verify", "--end-of-options",
+                           f"{revision}^{{commit}}").rpartition("\n")
+        if Path(root.strip()).resolve() != repo:
+            _fail("project locator must name the checkout root", "acceptance_project_unverified")
+        if not _SHA.fullmatch(sha):
+            _fail("project HEAD must equal the verified SHA", "acceptance_project_unverified")
+        if live:
+            head, _, tree = git("rev-parse", "HEAD", f"{sha}^{{tree}}").partition("\n")
+        else:
+            tree = git("rev-parse", f"{sha}^{{tree}}")
+        return {"locator": str(repo), "revision": sha, "tree": tree,
+                "roots": sorted(git("rev-list", "--max-parents=0", sha).splitlines())}
+
+    # Only full object IDs are stable cache keys. Symbolic refs must resolve
+    # afresh; HEAD and dirty state are checked at EVERY original live boundary.
+    key = ("project", str(repo), revision, tuple(sorted(env.items())))
+    project = acceptance_git.read_once(key, metadata) if _SHA.fullmatch(revision) else metadata()
+    if live and (head if head is not None else git("rev-parse", "HEAD")) != project["revision"]:
         _fail("project HEAD must equal the verified SHA", "acceptance_project_unverified")
     dirty = git("status", "--porcelain", "--untracked-files=all") if live else ""
     if dirty:
@@ -282,8 +303,7 @@ def verify_project(repo, revision, *, live=True):
         if len(lines) > 20:
             details += f"\n... {len(lines) - 20} more entries"
         _fail(f"acceptance project checkout is dirty:\n{details}", "acceptance_project_unverified")
-    return {"locator": str(repo), "revision": sha, "tree": git("rev-parse", f"{sha}^{{tree}}"),
-            "roots": sorted(git("rev-list", "--max-parents=0", sha).splitlines())}
+    return project
 
 
 def project_id(project):

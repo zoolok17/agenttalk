@@ -16793,7 +16793,9 @@ def main(argv: list[str] | None = None) -> int:
         # Handle --here on init
         if getattr(args, "cmd", None) == "init" and getattr(args, "here", False) and not args.path:
             args.path = str(Path.cwd())
-        return args.func(args)
+        from agenttalk.acceptance_git import command_scope
+        with command_scope():
+            return args.func(args)
     except KeyboardInterrupt:
         sys.stderr.write("\nagenttalk: interrupted\n")
         return 130
