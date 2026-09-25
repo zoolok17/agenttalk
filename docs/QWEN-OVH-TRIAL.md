@@ -66,26 +66,15 @@ the ledger's child-cap gate:
   price-policy migration for the ledger either.
 
 So, for an install that predates this change, `reconfigure` alone does
-**not** apply it - the operator instead reruns the full one-time setup
-against fresh state (same as any other tariff update), then re-accepts the
-canary:
-
-```powershell
-agenttalk gateway stop --timeout 30
-# Back up/remove the existing .agenttalk/gateway config+manifest and the
-# %LOCALAPPDATA%\agenttalk-ovh ledger/marker before re-init - `init` refuses
-# to run over any of them. Preserve the removed ledger for reconciliation
-# records; its balance becomes the new --opening-eur evidence.
-agenttalk gateway init --litellm-executable C:\path\to\litellm.exe `
-  --opening-eur <observed OVH dashboard balance> `
-  --opening-evidence "OVH AI Endpoints dashboard, observed 2026-09-22"
-agenttalk gateway task-install
-agenttalk gateway start
-agenttalk gateway status
-agenttalk doctor
-# Then the Live Acceptance step below, mandatory again under the new hash:
-agenttalk gateway canary-verify ATTEMPT_ID --dashboard-delta-eur OBSERVED_DELTA
-```
+**not** apply it - the operator instead re-initialises the install against
+fresh state (same as any other tariff update) and re-accepts the canary. The
+single runbook for that is the "Upgrade path" section of
+`docs/STEP-ENVELOPE-SERVICE-READERS.md` (stop with the runtime that registered
+the task, back up and move the ledger and old gateway state aside, unregister
+the task if the interpreter changed, `init`, `cap-install`, `task-install`,
+`start`, then the Live Acceptance canary below); it is not repeated here.
+Preserve the removed ledger for reconciliation records; its balance becomes the
+new `--opening-eur` evidence.
 
 A brand-new install (no prior `.agenttalk/gateway` state) just follows
 "One-Time Morning Setup" below unchanged - `init` was never going to hit
@@ -264,10 +253,9 @@ so an existing install's `reconfigure`/`runtime-rebind`/`start` all continue to
 refuse a mismatch rather than silently reinterpreting an old ledger under new
 numbers. Changing the envelope of an existing install means the same re-init
 procedure as any other price-policy change (see "2026-09-22 endpoint change"
-above): stop the gateway, remove the existing `.agenttalk/gateway` state and the
-`%LOCALAPPDATA%\agenttalk-ovh` (or, on Linux, `~/.local/share/agenttalk-ovh`)
-ledger/marker, then re-run `init` with the new `--cutoff-eur`/`--soft-stop-eur`/
-`--ceiling-eur` and re-accept the canary.
+above): follow the "Upgrade path" section of
+`docs/STEP-ENVELOPE-SERVICE-READERS.md`, running `init` with the new
+`--cutoff-eur`/`--soft-stop-eur`/`--ceiling-eur`, and re-accept the canary.
 
 The per-turn cost cap (`CHILD_TURN_MAX_MICRO_EUR` in "Fixed Trial Policy") is not
 an independent `init` flag: by design it is always set equal to whichever cutoff
