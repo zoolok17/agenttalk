@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Reduce acceptance Git process overhead with command-local metadata/history
+  reuse, compatible batched queries, and copied session test repositories (#198).
+  Live HEAD/dirty checks and retained-evidence validation remain in place.
+
 - Order roster retirement after acceptance/config locking so release-barrier
   publication cannot deadlock against removal, retirement, rename or launch
   requests. Check store lock ranks before waiting and document lane contention.
