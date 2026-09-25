@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Acceptance cold-review freshness follows verified Git ancestry across recovery
+  roots even after targets are renamed. Corrupt-history refusals identify repair
+  options and skip readable other-project records; relevant gate attribution now
+  contributes to reviewer independence.
+
 - Acceptance cold eligibility now audits recorded actor provenance and prior
   exposure across roots for the same source or protected targets. Mislabelled
   withheld evidence is rejected by digest; premature attachment is retryable,

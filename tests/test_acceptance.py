@@ -2178,3 +2178,194 @@ def test_acceptance_plan_opener_and_distinct_attacher_cannot_review(case_v3, rev
     final_accepts(case, data)
     # Valid different vendor and configured verifier isolate actor exclusion.
     assert {c for c, _ in snapshot(case)["holds"]} == {"acceptance_lens_not_independent"}
+
+
+@pytest.mark.parametrize("history,blocked", [("descendant", True), ("ancestor", True),
+                                             ("unrelated", False), ("unverifiable", True)])
+def test_acceptance_relabelled_recovery_uses_source_ancestry(case_v3, monkeypatch, history, blocked):
+    case = case_v3
+    base = case["sha"]
+    (case["project"] / "source.txt").write_text("first branch", encoding="utf-8")
+    git(case["project"], "commit", "-qam", "first branch")
+    case["sha"] = git(case["project"], "rev-parse", "HEAD")
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    publish_hold(case)
+    if history in {"unrelated", "ancestor"}:
+        git(case["project"], "checkout", "--detach", base)
+    if history != "ancestor":
+        (case["project"] / "source.txt").write_text("recovery branch", encoding="utf-8")
+        git(case["project"], "commit", "-qam", "recovery branch")
+    case["sha"] = git(case["project"], "rev-parse", "HEAD")
+    for row in case["plan"]["rows"]:
+        row["id"] += "x"
+        row["artifact"] += "x"
+    write_json(case["inputs"] / "plan.json", case["plan"])
+    assert open_attempt(case, "--id", "recovery") == 0
+    complete_v3(case, close_id="recovery")
+    if history == "unverifiable":
+        run = subprocess.run
+
+        def unavailable(args, **kwargs):
+            if "merge-base" in args:
+                return subprocess.CompletedProcess(args, 128, "", "object unavailable")
+            return run(args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", unavailable)
+    result = acceptance.resolve(case["store"], close.load_close(case["store"], "recovery"))
+    assert ("acceptance_cold_missing" in {c for c, _ in result["holds"]}) is blocked
+    assert command(case, "publish", "--id", "recovery", "--from", "lead", "--verdict", "go") == (3 if blocked else 0)
+
+
+@pytest.mark.parametrize("damage", ["unknown-project", "same-project", "different-project"])
+def test_acceptance_exposure_corruption_scoped_with_remedy(case_v3, damage):
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    path = close.close_path(case["store"], "junk")
+    if damage == "unknown-project":
+        path.write_text("broken JSON", encoding="utf-8")
+    else:
+        rec = close.load_close(case["store"], "attempt")
+        rec["acceptance_route"]["plan_hash"] = "f" * 64
+        if damage == "different-project":
+            rec["acceptance_route"]["project_id"] = "git-" + "a" * 60
+        write_json(path, rec)
+    result = snapshot(case)
+    if damage == "different-project":
+        assert result["holds"] == []
+    else:
+        message = next(msg for code, msg in result["holds"] if code == "acceptance_cold_missing")
+        assert "junk" in message and str(path) in message
+        assert "quarantine" in message and "trusted backup" in message
+
+
+@pytest.mark.parametrize("scope", ["milestone", "global", "remediation", "unrelated"])
+def test_acceptance_gate_actor_provenance(case_v3, scope):
+    from agenttalk import gates
+    case = case_v3
+    assert open_attempt(case) == 0
+    if scope == "remediation":
+        with close.close_transaction(case["store"], "attempt") as tx:
+            tx.record["remediation_items"]["repair"] = {"gate": "reviewed-gate", "owner": "lead"}
+            tx.commit()
+    gates.set_gate(case["store"].root, name="reviewed-gate", status="green", severity="info",
+                   scope=scope, actor="cold", evidence_source="manual_review")
+    complete_v3(case)
+    holds = {c for c, _ in snapshot(case)["holds"]}
+    assert ("acceptance_lens_not_independent" in holds) is (scope != "unrelated")
+
+
+def test_acceptance_gate_retains_earlier_evidence_actor(case_v3):
+    from agenttalk import gates
+    case = case_v3
+    assert open_attempt(case) == 0
+    gates.set_gate(case["store"].root, name="reviewed-gate", status="green", severity="info",
+                   scope="milestone", actor="cold", evidence_source="manual_review", evidence=["reviewed inputs"])
+    gates.set_gate(case["store"].root, name="reviewed-gate", status="green", severity="info",
+                   scope="milestone", actor="lead", evidence_source="manual_review")
+    complete_v3(case)
+    assert "acceptance_lens_not_independent" in {c for c, _ in snapshot(case)["holds"]}
+
+
+def test_acceptance_ancestor_bundle_actor_without_ack_is_excluded(case_v3):
+    case = case_v3
+    assign_fresh_cold(case, "first-cold")
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    with close.close_transaction(case["store"], "attempt") as tx:
+        route = tx.record["acceptance_route"]
+        data = acceptance.decode(acceptance._retained(case["store"], route["bundle_hash"]))
+        data["reproductions"][0]["actor"] = "cold"
+        route["bundle_hash"] = acceptance._retain(case["store"], json.dumps(data).encode())
+        tx.commit()
+    publish_hold(case)
+    case["plan"]["cold_policy"]["reviewer"] = "cold"
+    write_json(case["inputs"] / "plan.json", case["plan"])
+    assert successor(case) == 0
+    complete_v3(case, close_id="next")
+    from agenttalk import acceptance_cold
+    rec = close.load_close(case["store"], "next")
+    route, plan = acceptance._policy(case["store"], rec)
+    data = acceptance.decode(acceptance._retained(case["store"], route["bundle_hash"]))
+    with pytest.raises(acceptance.AcceptanceError) as exc:
+        acceptance_cold.evaluate(case["store"], rec, plan, data, {"holds": []})
+    assert exc.value.code == "acceptance_lens_not_independent"
+
+
+def test_acceptance_ancestor_raw_artifact_is_withheld(case_v3):
+    case = case_v3
+    assert open_attempt(case) == 0
+    data = complete_v3(case)
+    publish_hold(case)
+    assign_fresh_cold(case, "fresh")
+    assert successor(case) == 0
+    artifact = data["artifacts"][0]
+
+    def leak(report):
+        report["delivery_manifest"].append({"kind": "safety", "path": artifact["path"], "sha256": artifact["sha256"]})
+
+    assert cold_phase(case, "commit", "next", actor="fresh", change=leak) == 2
+
+
+def test_acceptance_evaluation_rechecks_withheld_delivery(case_v3):
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    with close.close_transaction(case["store"], "attempt") as tx:
+        route = tx.record["acceptance_route"]
+        initial = acceptance.decode(acceptance._retained(case["store"], route["cold_commit_hash"]))
+        initial["delivery_manifest"].append({"kind": "safety", "path": "plan.json", "sha256": route["plan_hash"]})
+        route["cold_commit_hash"] = acceptance._retain(case["store"], json.dumps(initial).encode())
+        reconcile = acceptance.decode(acceptance._retained(case["store"], route["cold_reconcile_hash"]))
+        reconcile["commit_hash"] = route["cold_commit_hash"]
+        route["cold_reconcile_hash"] = acceptance._retain(case["store"], json.dumps(reconcile).encode())
+        for event in tx.record["events"]:
+            if event["event"] in {"acceptance:cold-commit", "acceptance:cold-reconcile"}:
+                phase = event["event"].split("-")[-1]
+                event["report_hash"] = route["cold_" + phase + "_hash"]
+        for ack in tx.record["lens_acks"].values():
+            ack["acceptance_binding"] = acceptance.ack_binding(tx.record)
+        tx.commit()
+    assert "acceptance_cold_missing" in {c for c, _ in snapshot(case)["holds"]}
+
+
+def test_acceptance_later_reveal_does_not_taint_earlier_commit(case_v3):
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    assert open_attempt(case, "--id", "later") == 0
+    complete_v3(case, close_id="later")
+    assert snapshot(case)["holds"] == []
+
+
+def test_acceptance_owner_provenance_excludes_reviewer(case_v3):
+    case = case_v3
+    assert open_attempt(case) == 0
+    with close.close_transaction(case["store"], "attempt") as tx:
+        tx.record["remediation_items"]["repair"] = {"owner": "cold"}
+        tx.commit()
+    complete_v3(case)
+    assert "acceptance_lens_not_independent" in {c for c, _ in snapshot(case)["holds"]}
+
+
+def test_acceptance_exposure_requires_one_commit_event(case_v3):
+    from agenttalk import acceptance_audit
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    rec = close.load_close(case["store"], "attempt")
+    rec["events"].append(deepcopy(next(e for e in rec["events"] if e["event"] == "acceptance:cold-commit")))
+    with pytest.raises(acceptance.AcceptanceError, match="ambiguous"):
+        acceptance_audit.check_prior_exposure(case["store"], rec, case["plan"], "cold")
+
+
+def test_acceptance_monoculture_roster_includes_attacher(case_v3):
+    case = case_v3
+    policy = case["plan"]["cold_policy"]
+    policy["roster"] = [dict(e, vendor="alpha") for e in policy["roster"] if e["actor"] != "lead"]
+    policy["absence_disclosure"] = "Only one vendor available."
+    write_json(case["inputs"] / "plan.json", case["plan"])
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    assert "acceptance_lens_not_independent" in {c for c, _ in snapshot(case)["holds"]}

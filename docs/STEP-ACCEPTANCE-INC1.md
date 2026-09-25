@@ -779,3 +779,106 @@ The runner and individual logs are retained under private task scratch
 added content, the exact nine-file scope, branch, accepted design bytes and
 `git diff --check`. Basetemps and mutation evidence are retained for the delta
 review. No PR or release is authorized by this correction's completion.
+
+## 1c correction 2 — source ancestry, scoped audit and gate actors
+
+Base: `d1110a2`. This section supersedes the prior correction's revision-equality
+or target-overlap definition of related work. The lead's recovery rule remains:
+unapproved coverage loss poisons its lineage, recovery requires a new root, and
+operator approvals are per attempt. A new root does not erase prior exposure.
+
+### N1 source identity and required red table
+
+Within the same verified project identity, Git's `merge-base --is-ancestor` in
+both directions determines whether revisions are related. Either direction is
+enough. Target overlap may add exposure, never subtract ancestry. Comparisons use
+the verified project locator and full commit identities; ambient Git redirection
+is removed and replace objects disabled. Git errors/timeouts, missing objects or
+shallow history cannot establish independence and fail closed with
+`acceptance_cold_missing`. Neither a new SHA nor changing every measurement label
+can clear exposure to ancestral work. Each Git subprocess has a ten-second bound.
+
+`relabelled_recovery_uses_source_ancestry` ran before production edits:
+**3 failed, 1 passed, 239 deselected** (15.87 seconds), with failures at the pinned
+cold hold assertion, not collection/setup errors.
+
+| Prior/current source relationship; all targets renamed | Expected |
+| --- | --- |
+| Current descends from previously revealed revision | HOLD `acceptance_cold_missing`; GO publish refused |
+| Current is ancestor of previously revealed revision | Same HOLD and refusal |
+| Sibling branches; neither revision ancestral to the other; targets disjoint | No exposure hold; complete fixture publishes GO |
+| Git ancestry cannot be verified | HOLD `acceptance_cold_missing`; GO publish refused |
+
+### Findings and test mapping
+
+Names below omit `test_acceptance_`.
+
+| Finding | Disposition and evidence |
+| --- | --- |
+| N1 ancestry instead of writer labels | FIXED, four-case table above exercises real project history and an injected Git error. |
+| N2 corrupt history and project scope | FIXED. Read project identity before traversing a record's policy/ancestors. Readable different-project records are skipped; unknown/same-project corruption still HOLDs. Error names close ID/path and trusted-backup restoration or operator quarantine outside `.agenttalk/closes`, explicitly warning that quarantine removes exposure evidence. `exposure_corruption_scoped_with_remedy[unknown-project/same-project/different-project]`. |
+| N3 external gate attribution | FIXED for reliable recorded data. `provenance` reads `gates.load_gate_state`, includes applicable scope/global gates and remediation-named gates, and interprets their update/evidence attribution with the same actor grammar. Pre-commit updates and retained evidence count; later updates do not retroactively taint a sweep. Unreadable gate state HOLDs. `gate_actor_provenance[milestone/global/remediation/unrelated]` uses metadata without evidence; `gate_retains_earlier_evidence_actor` isolates earlier evidence after another actor updates the gate. |
+| N4 R8 ancestor bundle actors | `ancestor_bundle_actor_without_ack_is_excluded` isolates an actor recorded only in an ancestor reproduction, without its own acknowledgment. |
+| N4 R10 result-artifact digests | `ancestor_raw_artifact_is_withheld` rejects a parent's raw result delivered as safety input. |
+| N4 R19 evaluation-time delivery recheck | `evaluation_rechecks_withheld_delivery` installs a consistently rehashed report, reconciliation, events and accepts containing forbidden plan bytes; no stale-binding guard masks the delivery check. |
+| N4 R2 owner grammar | `owner_provenance_excludes_reviewer` isolates a remediation owner without an attribution event. |
+| N4 R14 unique cold commitment | `exposure_requires_one_commit_event` directly exercises the exposure reader's ambiguity rejection, independently of the later event-order check. |
+| N4 R21 attacher in vendor participants | `monoculture_roster_includes_attacher` isolates an omitted attacher without diverse-vendor KeyError masking. |
+| N4 R13 later reveal ordering | Added despite stricter-mutant direction: `later_reveal_does_not_taint_earlier_commit` keeps an earlier completed sweep eligible after another root reveals. |
+| N4 R12 project identity scope | Project isolation is tested by N2's different-project case. The inner lineage project guard is retained defensively: removing it alone is redundant for valid same-project ancestry after the outer identity filter and successor project binding. No claim that this single redundant mutant is killed. |
+| N5 canonical-JSON leakage check | Deferred as the reviewer-accepted exact-byte-only bound. Re-encoding, whitespace, excerpts and prose can evade content identity; this is explicitly documented, not represented as an automated expectation scan. |
+| Interim binaries / identity aliases | No schema bump: released/pre-1c engines still reject supported schema 3; earlier development commits lack later policy checks and must not decide final eligibility. Distinct roster names for the same person remain a cooperative disclosure. |
+
+Gate records are mutable current state, with retained evidence entries where
+present; there is no complete immutable gate actor journal. Removed gates,
+overwritten attribution without evidence, changed scope, and other unrecorded bus
+activity remain cooperative-profile residuals beside declared roster truth.
+No gate is written by this audit. Authenticating roster/vendor/person identity
+or adding an immutable bus-wide activity ledger belongs to the hardened profile.
+
+### Changed-reader inventory
+
+Only `acceptance_audit.py` changes production behavior. Cold `submit` and cold
+`evaluate` remain its callers. `related_revisions` reads the project's Git object
+graph; it never executes supplied commands, updates refs, fetches or changes HEAD.
+`check_prior_exposure` reads close JSON for project scoping before validated
+`load_close`/retained-policy traversal. Diagnostic show retains the prior
+nonfatal `acceptance_successors_error` behavior. Gate attribution consumes the
+existing `load_gate_state` normalization/error contract, `updated_by/updated_at`
+and evidence `by/at`, plus close `gate_scope` and remediation gate names.
+No serialized route, report, bundle, acknowledgment, final, attention or barrier
+field changes. No CLI flags or public mutation commands change.
+
+### Executed correction evidence
+
+All pytest runs are foreground with `PYTHONPATH=<CLONE>/src`, bytecode disabled,
+and private assigned `<SCRATCH>` basetemps. Required red command:
+`python -m pytest tests/test_acceptance.py -q -k relabelled_recovery --basetemp <SCRATCH>/pytest-1c-round2-red -p no:cacheprovider`
+→ **3 failed, 1 passed, 239 deselected**. Focused new regressions after the fix:
+**18 passed, 239 deselected** in 45.79 seconds.
+
+After separating gate metadata/evidence cases, the final five-test gate selection
+passed: **5 passed, 253 deselected** in 10.86 seconds. The four scope tests now have
+no evidence entries, so `updated_by` is tested independently; the added fifth case
+tests preserved evidence independently of the current updater.
+
+Regression bar: `python -m pytest tests/test_acceptance.py tests/test_close.py tests/test_close_signoffs.py tests/test_gates.py -q --basetemp <SCRATCH>/pytest-1c-round2-final -p no:cacheprovider`
+→ **591 passed, 1 skipped** in 488.62 seconds (256 acceptance + 335 ordinary close
+checks). The skip is host-restricted symlink creation. This bar started before the
+one additional gate-evidence test and the metadata-only refinement; those final
+test changes are covered by the separate five-test selection above. Production
+code was unchanged throughout both runs. Attention suites were not rerun; their
+persisted final reader contracts are unchanged.
+
+Isolated source-copy mutations: **12/12 KILLED**. R8, R10, R13, R19, R2, R14, R21,
+N1 (remove ancestry), N2 (remove outer project filter), N3 (remove gate attribution)
+are retained in `inc1c-round2-mutants-6025c027`. The two independent gate-update and
+gate-evidence mutants are retained in `inc1c-round2-mutants-2f07d5b0`. Each executed
+tests and failed a behavioral assertion; no collection-error result is counted.
+R12's redundant inner lineage check is explicitly excluded from this claim.
+
+`python -m ruff check --no-cache src/agenttalk/acceptance_audit.py tests/test_acceptance.py`
+→ all checks passed. Private verification: eight positive controls, zero matches
+in added content; five-file scope, branch, accepted design bytes and
+`git diff --check` verified. Task gates returned GO. Scratch basetemps, source copies,
+mutation logs and verifier are retained for the delta reviewer; no PR or release.

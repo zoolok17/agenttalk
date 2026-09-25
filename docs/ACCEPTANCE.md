@@ -46,6 +46,14 @@ seat roster or authenticated vendor metadata. Labels can change between attempts
 Authenticated availability/vendor identity belongs to the future hardened profile;
 the current checks do not establish that the declaration is truthful.
 
+Gate attribution is also read from the bus: actors on gates in the close's scope
+(including global gates), or gates named by remediation, count as participants
+when their update/evidence predates the cold commitment. This uses recorded
+`updated_by` and evidence attribution, including retained earlier evidence entries.
+Gate state is mutable, not an immutable actor journal: overwritten updates without
+retained evidence, removed gates, and activity elsewhere remain cooperative
+disclosures. Two roster names for one person cannot be detected automatically.
+
 Open with `close open --acceptance-plan PLAN --project-repo PROJECT --revision SHA`.
 Supply the usual ID, scope and actor, plus lane evidence or the existing explicit
 non-lane declaration for milestone/release scopes. The plan adds partition lenses
@@ -137,13 +145,25 @@ Opening/freezing the plan, attaching evidence, authorship, runner/reproducer
 participation, amendment authorship, or any earlier recorded event excludes an
 actor from the final cold sweep. Current review-phase events are not themselves
 disqualifying; prior ancestor events are. Exposure is checked across root closes
-as well: in the same verified project, the same revision **or overlapping protected
-targets** identify related work. A reveal before the current cold commitment
+as well: in the same verified project, Git checks whether either source revision
+is an ancestor of the other. **Related source history identifies the same change
+regardless of row, artifact, field or partition labels.** Overlapping protected
+targets can additionally identify related work, but relabelling cannot erase
+source ancestry. A reveal before the current cold commitment
 disqualifies that reviewer even with a new root or context name. This conservative
-target-overlap rule also covers a new revision with the same measurement targets.
+rule covers a new fix revision even with entirely renamed measurement targets.
+Sibling branches with neither revision ancestral to the other and disjoint targets
+do not establish exposure to the same change. Missing objects, Git errors or shallow
+history cannot establish independence and HOLD; use the complete verified project
+repository and restore missing commit objects before retrying.
 The check depends on retained local close history; absent external history remains
-a cooperative declaration. An unreadable history record HOLDs eligibility because
-prior exposure cannot be established reliably, while `close show` still diagnoses it.
+a cooperative declaration. Records with a readable different-project identity are
+skipped before their policy/ancestor blobs are traversed. An unreadable same-project
+record, or one whose identity cannot be read, HOLDs eligibility. The refusal names
+the close and path: restore that record and retained blobs from a trusted backup,
+or preserve and quarantine the unreadable close outside `.agenttalk/closes` for
+operator review. Quarantine removes its exposure evidence; it is not proof of an
+independent reviewer. `close show` remains available to diagnose the store.
 
 Coverage is tracked by `(partition, artifact, field)` across all retained ancestry.
 Renaming, splitting or merging rows cannot erase the strongest historical gating
