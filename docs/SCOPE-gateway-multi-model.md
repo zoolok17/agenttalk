@@ -11,11 +11,17 @@ could cut cost several times over if quality holds; we want to trial one on one 
 
 ## Summary and recommendation
 
+0. **Do the reasoning-effort lever first (section R).** It is config-only, applies with `gateway stop`,
+   `gateway reconfigure`, `gateway start` (no re-init, no new ledger, no new canary), carries no format risk
+   because the model is unchanged, and may cut both output cost and, if reasoning is re-sent as history
+   (very likely under our reasoning-merge setting, testable on existing ledger data at no spend), the
+   input bill. One correction: the seats pin max output at 32768 in this code, not 4096, so the 29.6K-token
+   call was inside the pin.
 1. Today nothing about the model is configurable: the alias, the four rates, the context and output
    limits are module constants (`ovh_gateway.py:28-44`) read at about a dozen sites, and the wrapper and
    supervisor each carry their own literal `"Qwen3.8-27B"` (`wrapper/run.py:490-492`, `supervisor.py:8823`).
    A trial on a cheaper model therefore needs code, not just a re-init.
-2. Recommended: **option A2**, "one model per install, chosen at `gateway init`". It is the same move
+2. Recommended for the model trial itself: **option A2**, "one model per install, chosen at `gateway init`". It is the same move
    `12cc78a` made for the spend envelope: a vetted table of model profiles, `gateway init --model <alias>`,
    the choice pinned into the ledger and its hash, and every reader (front, reserve, settle, canary,
    LiteLLM config, wrapper, supervisor) reading the stored profile instead of a constant. Effort **M**.
@@ -29,10 +35,120 @@ could cut cost several times over if quality holds; we want to trial one on one 
    per host (section 0), so one host runs one model at a time, and every model switch on a host is a
    re-init that starts a new ledger. I am inferring from #194 that a second gateway exists (its wording
    is "two gateways"); please confirm which host that is.
-6. Suggested first candidate: `qwen3-coder-30b-a3b-instruct`. It is non-reasoning (avoids the uncapped
-   thinking-token behaviour in #194 item 4 and the reasoning-merge workaround), the same family as today's
-   model, and about 7x cheaper on the input-dominated mix at the quoted list prices. `gpt-oss-120b` is a
-   reasoning model with a probably smaller context window and is a second choice.
+6. Both candidates carry tool-call format risk that our stack does not check (section 4b). Any model trial
+   is gated by a cheap tiered smoke test: a local, no-spend harness extension, then about 30 scripted
+   requests (about one cent), then the real CLI on a synthetic repo, then the real card.
+7. Suggested first candidate, conditional on the smoke test: `qwen3-coder-30b-a3b-instruct`. It is
+   non-reasoning (so no reasoning-merge behaviour and no thinking-token spend), the same family as today's model,
+   and about 7x cheaper on the input-dominated mix at the quoted list prices. But the reported tool-call format
+   problems (section 4b) hit exactly this model behind LiteLLM-style proxies, so it is a candidate only if it
+   passes Tier 1 on OVH's deployment; if it fails, that is a cheap, decisive answer. `gpt-oss-120b` is a
+   reasoning model that depends on the harmony format, with a probably smaller context window and a poor
+   independent SWE-bench reproduction (as reported to me, unverified); it is a second choice, and R may well
+   beat both on cost at no format risk.
+
+## R. Reasoning effort on Qwen3.8-27B: the cheapest lever, do it first
+
+Report to weigh: the model defaults to a very high reasoning effort and overthinks (one trivial task spent
+about 22K reasoning tokens), and one call billed 29.6K output tokens. Output is priced 6.75 times input
+(EUR 2.70 vs 0.40 per 1M), so a long reasoning run is the one place output cost can dominate a call.
+
+**A correction to check first.** #194 item 4 says the seats pin max output at 4096. In this code the pin is
+**32768**: `OVH_QWEN_CLAUDE_MAX_OUTPUT = "32768"` (`wrapper/run.py:68`, enforced at `:493-499`), the front's cap
+is the same figure (`ovh_gateway.py:44`, `ovh_gateway_front.py:315-321`), and 0.90.0 raised it from 4096
+(CHANGELOG 0.90.0). A 29.6K-token call is therefore inside the pin, not a breach of it, and "thinking tokens
+are uncapped by `max_tokens`" is not needed to explain it: on OpenAI-compatible servers the completion cap
+normally includes reasoning tokens. Either the 4096 figure predates 0.90.0, or that one request carried its own
+smaller `max_tokens`. The ledger cannot say which, because it stores tokens but not the requested `max_tokens`
+(`attempts` columns, `ovh_gateway.py:658-672`). Recording it is one of the riders in section 4.
+
+### R.1 What the path does today (code)
+
+- The seat child env pins `MAX_THINKING_TOKENS=0` (`wrapper/run.py:501`) and the output cap above; nothing else
+  about reasoning is set. A per-seat `reasoning_effort` in supervisor config becomes `claude --effort <E>`
+  (`cli.py:11169`; allowed values `low medium high xhigh max`, `supervisor.py:2451`). The ovh-qwen
+  bootstrap check does not forbid it (`supervisor.py:8823-8849`), and I have not seen it set for these seats.
+- The front forwards the client's JSON body unchanged, rejecting only a fixed list of routing and credential keys
+  (`ovh_gateway_front.py:51-63`) and any `max_tokens` above the pin. It neither injects nor blocks a
+  reasoning or `thinking` parameter.
+- The LiteLLM deployment sets `extra_body: {store: false}`, `merge_reasoning_content_in_choices: true`, and,
+  globally, `drop_params: true` (`ovh_gateway.py:2322-2334`). Nothing lowers reasoning, so the model runs at
+  whatever default OVH's serving applies.
+
+### R.2 Levers, cheapest first
+
+1. **Server-side default in the LiteLLM deployment (config only).** Add a fixed parameter to the rendered
+   `litellm_params` (the same place `extra_body` already lives, `ovh_gateway.py:2322-2331`). Candidate forms,
+   none confirmed for OVH: a top-level `reasoning_effort` (`low`/`medium`/`high`); or a Qwen-family thinking
+   switch or budget passed through `extra_body` (for example `chat_template_kwargs` with `enable_thinking`,
+   a convention of common Qwen3 serving stacks). Which name OVH's endpoint accepts for this model is not in the
+   repo; it has to come from OVH's model card or a probe. Two cautions. `drop_params: true` makes LiteLLM
+   silently drop a top-level parameter it considers unsupported for the provider, so a probe must compare
+   reasoning tokens, not just check for an error; `extra_body` is passed through verbatim but an unknown key
+   may be ignored or rejected by the server. And "off" is riskier than "low" on a hybrid model: try `low` first.
+   **This needs no re-init.** The price policy hash does not cover the LiteLLM config; `gateway reconfigure`
+   re-renders the config from code and rebinds the manifest's config hash, preserving ledger, tokens and task,
+   and its only ledger check is that the manifest's price hash still equals the ledger's
+   (`ovh_gateway_service.py:1027-1090`). So: code change, then `gateway stop`, `gateway reconfigure`,
+   `gateway start`. No new ledger, no new canary. Effort **S**.
+2. **Client-side, seat config only.** Set the seat's `reasoning_effort` (lever exists today, no code). What the
+   CLI then sends to a non-Anthropic base URL, and whether the pinned LiteLLM turns it into anything OVH honours,
+   is unverified. Both can be checked with no spend: point the CLI at a local fake server and read the request
+   body it sends with and without `--effort`; then run that body through the real LiteLLM against a fake
+   upstream and read the translated request. The second half is exactly what
+   `tests/test_ovh_litellm_conformance.py` does (opt-in via `AGENTTALK_TEST_LITELLM_EXE`; it asserts on
+   `upstream.requests[0]`, `:410-424`). Changing a seat's effective effort resets its wrapped session, so use a
+   dedicated seat name for the comparison.
+3. **Cap output.** Lower `CLAUDE_CODE_MAX_OUTPUT_TOKENS` and `MAX_OUTPUT_TOKENS`. Crude: a hit cap truncates
+   a tool call mid-argument, which is worse than long reasoning. It also changes the price policy hash
+   (`ovh_gateway.py:167`, the reservation), so it is a re-init. Not recommended as the first move.
+4. **Prompt-side switches** (a soft "no think" token) are not viable: the CLI's system prompt is not ours.
+
+### R.3 Are reasoning tokens re-sent as input on later calls?
+
+Very likely yes under our configuration, and it is worth more than the reasoning's own output cost.
+
+- Mechanism: `merge_reasoning_content_in_choices: true` folds the model's reasoning into ordinary content
+  text, so that no thinking block is ever emitted (the docstring at `ovh_gateway.py:2301-2320`; it exists
+  because a thinking block arriving out of order aborted the CLI). The CLI therefore receives the reasoning as
+  assistant text. The Messages protocol carries prior assistant content in every later request of the tool loop,
+  so that text becomes input on each following call until the CLI compacts. This is inferred from the design, not
+  measured.
+- Size: reasoning of 22K tokens emitted at call k and re-sent for the next 50 calls is about 1.1M input tokens,
+  EUR 0.44 at EUR 0.40 per 1M, against EUR 0.059 for producing it once. That is roughly 7 times the direct output
+  cost. It also grows the request body toward the 512 KiB cap (22K tokens is on the order of 90 KB), which is
+  #194 item 1's failure: reasoning inflates both the bill and the odds of a 413.
+- **Test it without spend, on data we already have.** Each attempt row has `input_tokens` and `output_tokens`, and
+  `child_attempts` gives the call order inside a card (agent, message id, ordinal). For consecutive calls in one
+  child turn compute `input(k+1) - input(k)` and compare it with `output(k)`. If reasoning is re-sent, the
+  difference tracks `output(k)` plus the tool result (slope near 1 across calls with large `output(k)`); if not, it
+  tracks only the tool result. Drop compaction points (negative deltas). Run it on a verified backup copy of the
+  ledger, never the live database.
+- If confirmed, the levers are: produce less (R.2), or stop merging reasoning into history. The second is not a
+  config switch I can point to: it would mean discarding reasoning in LiteLLM (an option I have not found) or
+  rewriting the SSE stream in the front (`StreamUsage` already parses it, `ovh_gateway_front.py:103-155`, but
+  today the chunks are copied verbatim). Effort **M**, with real risk. Vendor guidance for this family is
+  commonly to keep earlier reasoning out of the history; that is recalled, not checked.
+
+### R.4 Measuring the effect on cost per card
+
+The unit is the child turn (agent, message id), which is one card message. Nothing needs to be added to measure
+the baseline:
+
+1. **Baseline first, zero spend.** On a backup copy of the ledger, per child turn: number of calls, total input,
+   total output, total `actual_micro_eur`, the share of cost that is output, the largest single-call output, and
+   the number of calls with output above about 8K. This sizes the lever before any change: if reasoning-heavy
+   calls are a small share of spend, the lever is worth little and the model swap matters more.
+2. **Protocol micro-benchmark, cents.** A fixed set of about ten prompts of varying difficulty through the real
+   front with a synthetic child capability (so the spend is ledgered), default versus lowered effort, five runs
+   each. Compare output tokens per call and answer quality on the easy ones. On Qwen3.8-27B this is on the
+   order of EUR 0.1 to 0.3.
+3. **One real card with the lever on**, compared with the baseline distribution: cost per card, output tokens
+   per call at median, 90th percentile and maximum, calls per card (a lower effort can mean more steps), whether
+   the card was accepted, and dead letters. Accept the lever if cost per card falls meaningfully with no drop in
+   acceptance. One card is noisy; treat the baseline distribution, not a single twin card, as the comparator.
+4. Riders that make this measurable going forward: store the requested `max_tokens` per attempt, and store
+   reasoning tokens if the upstream usage exposes them (whether it does through this path is unverified).
 
 ## 0. What is pinned today
 
@@ -248,19 +364,86 @@ first trial hour.
 | 1. 512 KiB request cap vs the CLI compacting late (`ovh_gateway.py:63`; `ovh_gateway_front.py:294`) | Yes: the safe compaction point depends on the model's window, and the cap is roughly 128K tokens (at about 4 bytes per token, a rough figure), so it binds before a 256K window and about at a 128K one | **Yes**, the profile-env part: carry the window and a compaction threshold in the profile, and classify a gateway 413 as its own named class. Also a cost lever: 98% of spend is re-sent input, so earlier compaction cuts cost independent of the model. Treat it as a separate trial variable, since it changes quality |
 | 2. One request at a time (`ovh_gateway_front.py:205`) | No | No. Separate work, size L; a cheaper model does not fix seats bouncing |
 | 3. Runner exits when LiteLLM dies, no record why (`ovh_gateway_service.py` `run_service` monitor) | No, but a new model will produce new failure modes | **Yes, the small part only**: capture LiteLLM's exit status and stderr tail into the log. A supervised restart is separate |
-| 4. No per-attempt wall clock; billed output above the requested maximum | Yes for reasoning models (uncapped thinking tokens) | **Partly**: record when settled output exceeds the requested `max_tokens` (S). The wall clock is separate. Note the interaction with `ovh_gateway.py:1861-1866`: a candidate with a smaller max output than 32768 makes a legitimate long reply `uncertain`, which holds the gateway, so the profile's limits must be right |
+| 4. No per-attempt wall clock; billed output above the requested maximum | Yes for reasoning models (uncapped thinking tokens) | **Partly**: record the requested `max_tokens` per attempt and when settled output exceeds it, plus a content-free request-shape record (S; needed by sections R and 4b). The wall clock is separate. Note the interaction with `ovh_gateway.py:1861-1866`: a candidate with a smaller max output than 32768 makes a legitimate long reply `uncertain`, which holds the gateway, so the profile's limits must be right |
+
+## 4b. Detecting tool-call format failures early and cheaply
+
+Research findings to weigh (from the request; I have not verified them): `qwen3-coder-30b-a3b` has recurring
+tool-call format problems behind LiteLLM and Claude-Code-style proxies (array arguments arriving as strings, XML
+tool calls that are not parsed, `read_file` loops) whose fixes needed chat-template or tool-parser patches;
+`gpt-oss-120b` depends on OpenAI's harmony format, and an independent SWE-bench reproduction reported about
+10% against the vendor's 62%.
+
+What that means for our path:
+
+- **Nothing in our stack checks tool-call structure.** The front parses only usage and the response model out of
+  the stream (`ovh_gateway_front.py:103-155`) and copies the rest. LiteLLM translates OpenAI `tool_calls` to
+  Anthropic `tool_use`. A model that writes its tool call as XML text arrives as plain text and no tool runs; an
+  array argument sent as a string arrives as a `tool_use` whose input has the wrong type, the CLI's tool
+  validation rejects it, and the model retries. Each of these burns input tokens and surfaces late, mid-card,
+  looking like a dull model rather than a format fault.
+- **The fix lives server-side** (OVH's serving template and tool parser), so we cannot patch it. The only
+  lever is selection: reject a model whose deployment fails the checks below. Adding argument repair in the
+  proxy is possible in principle but the gateway is deliberately callback-free (`ovh_gateway.py:2301`), and a
+  silent repair would hide the very signal we need.
+- Format checks do not measure competence. A model can emit perfect tool calls and still solve little (the
+  harmony-format report is about scaffold sensitivity), so a small competence check is needed too.
+
+A tiered gate, each tier cheaper than the next and blocking it:
+
+**Tier 0, no spend, local.** Extend the LiteLLM conformance harness (`tests/test_ovh_litellm_conformance.py`:
+the real LiteLLM against a fake OpenAI upstream, opt-in) with canned upstream replies in each malformed shape:
+arguments whose array field is a JSON string, a tool call written as XML in `content`, harmony markers in
+`content`, empty content with `finish_reason: stop`. Read what LiteLLM emits toward the CLI in each case. This
+does not test the model; it shows which failures our stack passes through untouched and which it turns into a
+hard error, so we know what Tier 1 must look for.
+
+**Tier 1, protocol smoke test, pennies (operator-run, about 30 requests).** A short script that sends
+Claude-Code-shaped requests through the real front on a synthetic, throwaway child capability, so the spend is
+ledgered and the front, LiteLLM and OVH are all in the loop. Use the tool definitions the CLI actually sends
+(Read, Edit, Grep, Bash, and one with an array parameter and one with a nested object). Cases: a scalar-argument
+call; an array argument; a nested object; two parallel calls; a tool-result round trip followed by a final answer;
+one request with about 30K tokens of context. Repeat each five times, since output is not deterministic.
+Assertions per response:
+
+- the stream parses and ends with `message_stop`;
+- every `tool_use` input is valid JSON and matches the tool's `input_schema` including types (an array is an
+  array, not a string), and `stop_reason` is `tool_use` when a call was expected;
+- no text block contains `<tool_call>`, `<function=`, `<parameter=`, or harmony markers such as `<|channel|>`;
+- no thinking block, `usage` present and nonzero, and the response `model` equals the requested alias (settlement
+  requires it, `ovh_gateway.py:1826-1828`, else the attempt goes `uncertain` and the gateway holds).
+
+Pass bar: at least 95% of cases clean. Cost at the quoted candidate list prices is about EUR 0.0003 per request,
+so the whole tier is around one cent; on Qwen3.8-27B as the reference it is around EUR 0.07. Run the reference
+model through the same script so a harness bug is not blamed on the candidate.
+
+**Tier 2, real client on a synthetic repo, tens of cents.** The real Claude CLI against the gateway, on a
+three-file throwaway repository, with three scripted prompts (read and summarise; edit one function; grep then
+edit across two files) and a hard step cap. Automated checks: the edit applies and the tests pass, the number of
+tool calls stays under a bound, and no identical tool call with identical arguments repeats more than twice (a
+`read_file`-style loop detector). Run reference and candidate. Expected cost is EUR 0.05 to 0.3 per model.
+
+**Tier 3, the real bounded card**, only after Tiers 0 to 2 pass. Give the trial host a small envelope at init
+(`gateway init --cutoff-eur`, for example a few EUR): the per-turn cap defaults to the cutoff, so a runaway loop
+is stopped by the ledger, not by the operator noticing (`12cc78a`; per-turn cap and cutoff, `ovh_gateway.py:541-542`). Watch `gateway status` active-turn exposure during the card.
+
+Add to the riders in section 4: a bounded, content-free per-attempt request record (top-level keys, requested
+`max_tokens`, whether a `thinking` field was present, tool count) so a format or loop problem is diagnosable
+after the fact without logging prompts.
 
 ## 5. Recommendation, estimates and operator steps
 
 | Option | Effort | What it buys | Main risk |
 |---|---|---|---|
+| **R reasoning-effort lever on the current model** | **S (about 1-2 days including the no-spend probes)** | the cheapest cost cut, no model risk; sizes the model swap before it is paid for | the OVH parameter name is unknown; `drop_params` can hide a dropped key |
 | A1 swap constants on a branch | S (about 1 day) | fastest answer on one host | off-release build, drifting literals, throwaway |
 | **A2 profile at init** | **M (about 3-5 days including review rounds)** | the trial, a permanent per-install model choice, and the foundation for B | missed reader; needs an enumerated-readers record and mutation-verified tests |
 | B multi-model one ledger | L (about 2-3 weeks) | several models on one host, one envelope | ledger schema migration, per-model canary, two hash forms |
 | Riders (section 4: compaction knob, LiteLLM exit capture, output-over-max record) | S each | diagnostics and a cost lever for the trial | none of note |
 
-Recommendation: A2 plus the three small riders, then the trial on the second gateway host with a dedicated
-seat, first candidate `qwen3-coder-30b-a3b-instruct`. Decide on B only after the trial says the cheaper
+Recommendation: R first, with the no-spend baseline and re-send analysis (R.3, R.4), which also says how much a
+model swap is still worth. Then, if it is, A2 plus the riders, then the trial on the second gateway host with a dedicated
+seat, first candidate `qwen3-coder-30b-a3b-instruct` only after it passes the Tier 0-2 gate in section 4b. Decide on B only after the trial says the cheaper
 model is worth running at all; B's extra machinery does not help answer that.
 
 Suggested trial gate, so the decision is not vibes: same bounded card as a Qwen3.8-27B reference run, count
@@ -269,6 +452,9 @@ of tool-call failures, number of compactions and dead letters, ledger spend per 
 Operator steps (re-inits are operator-run; the STEP record's "Upgrade path" in
 `docs/STEP-ENVELOPE-SERVICE-READERS.md` is the one runbook and applies unchanged):
 
+- **R**: after the code change ships, `gateway stop`, `gateway reconfigure`, `gateway start` (read `gateway
+  status` after a slow first start); no ledger backup, no re-init, no canary; run the R.4 micro-benchmark
+  through a synthetic capability; keep the previous config to revert with another `reconfigure`.
 - **A1 / A2**: verify the model id and EUR prices (section 3); install the build on the trial host; stop with
   the runtime that registered the task; copy and verify the ledger backup, then move the ledger, install
   marker, old gateway state and the two token files aside; unregister the task if the interpreter changed;
@@ -288,4 +474,8 @@ Operator steps (re-inits are operator-run; the STEP record's "Upgrade path" in
 - The OVH dashboard's spend resolution (decides whether the canary can observe a cheap call).
 - The CLI's environment variable for its compaction threshold, on the installed CLI version.
 - Whether the response `model` for a candidate equals the requested id (decides whether settlement works).
+- Which reasoning parameter OVH accepts for Qwen3.8-27B, and what the CLI sends with and without `--effort`.
+- Whether reasoning really is re-sent as input (R.3 gives the no-spend test).
+- The tool-call format reports for both candidates (taken from the request, not checked), and whether OVH's
+  deployments carry the parser fixes.
 - The USD list prices came from the request and are a third-party index, not OVH.
