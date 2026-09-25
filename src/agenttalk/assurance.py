@@ -3929,6 +3929,8 @@ def _is_agenttalk_created_untracked_path(root: Path, relative: str) -> bool:
         "config.json",
         "config.lock",
         ".config.lock.generation",
+        ".acceptance-write.lock",
+        "..acceptance-write.lock.generation",
         "assurance/coverage.lock",
         "assurance/.coverage.lock.generation",
         "assurance/coverage-handoff.lock",

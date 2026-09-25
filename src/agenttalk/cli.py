@@ -2509,6 +2509,14 @@ def cmd_comprehension(args: argparse.Namespace) -> int:
 
 
 def cmd_gate(args: argparse.Namespace) -> int:
+    try:
+        return _cmd_gate(args)
+    except TimeoutError as exc:
+        sys.stderr.write(f"agenttalk gate: HOLD - concurrent obligation write conflict: {exc}. Retry.\n")
+        return 3
+
+
+def _cmd_gate(args: argparse.Namespace) -> int:
     """Manage lightweight assurance gates."""
     store = _get_store(args)
     action = getattr(args, "gate_cmd", None)
@@ -2960,7 +2968,7 @@ def _build_signoff_eval(store, record: dict):
             "active_agents": active}
 
 
-def _build_dod_eval(store, record: dict):
+def _build_dod_eval(store, record: dict, *, acceptance_live=None):
     """Resolve the #60 Definition-of-Done evidence (IMPURE) into the bundle
     :func:`close.evaluate_dod` consumes (PURE). ``None`` when the close's scope has no DoD
     requirements (byte-identical to pre-#60). Fails closed via ``policy_error`` on a malformed
@@ -2970,6 +2978,8 @@ def _build_dod_eval(store, record: dict):
     if err:
         return {"policy_present": True, "policy_error": err, "required_dimensions": {}}
     dims = close_mod.derive_required_dod(policy, record.get("scope"))["dimensions"]
+    if "acceptance_route" in record:
+        dims["acceptance"] = {"required": True}
     if not dims:
         return None
     bundle = {"policy_present": policy is not None, "policy_error": None,
@@ -2980,6 +2990,9 @@ def _build_dod_eval(store, record: dict):
         bundle["coverage"] = _resolve_dod_coverage_gate(store, dims["coverage"], record)
     if "knowledge" in dims:
         bundle["knowledge"] = _resolve_dod_knowledge(store, dims["knowledge"], record)
+    if "acceptance" in dims:
+        from agenttalk import acceptance
+        bundle["acceptance"] = acceptance.resolve(store, record, live=acceptance_live)
     return bundle
 
 
@@ -3235,6 +3248,9 @@ def _signoff_risk_inventory(args, store, record: dict) -> list[dict]:
     revision = record.get("revision")
     paths = list(getattr(args, "changed_path", None) or [])
     path_source = "manual"
+    if "acceptance_route" in record and not paths:
+        raise close_na_error("acceptance signoff routing requires explicit --changed-path; "
+                             "the store repository may differ from the verified project")
     if not paths:
         base = getattr(args, "base", None) or f"{revision}^"
         rc, out = _git(store.root, ["diff", "--name-only", f"{base}..{revision}"])
@@ -3515,15 +3531,40 @@ def cmd_close(args: argparse.Namespace) -> int:
     store = _get_store(args)
     action = getattr(args, "close_cmd", None)
     roster = store.load_config().get("agents") or []
+    if action == "reopen" and getattr(args, "successor", None):
+        args.parent, args.id = args.id, args.successor
+        args.acceptance_cmd = "successor"
+        action = "acceptance"
+    elif action == "reopen" and any(getattr(args, key, None) for key in
+                                    ("acceptance_plan", "project_repo", "scope_reduction", "reason")):
+        sys.stderr.write("agenttalk close reopen: acceptance amendment flags require --successor\n")
+        return 2
 
     if action == "open":
         close_id = close_mod.validate_close_id(args.id)
+        prepared = None
         try:
-            revision, kind = _resolve_revision(store.root, args.revision)
+            if getattr(args, "acceptance_plan", None):
+                from agenttalk import acceptance
+                if not args.project_repo or args.force or args.allow_dirty or args.dirty_artifact:
+                    raise close_mod.CloseError(
+                        "acceptance requires --project-repo and forbids force/dirty overrides")
+                prepared = acceptance.prepare(
+                    store, args.acceptance_plan, args.project_repo, args.revision, args.scope,
+                    _close_lens_specs(args))
+                revision, kind = prepared["project"]["revision"], "sha"
+            else:
+                if getattr(args, "project_repo", None):
+                    raise close_mod.CloseError("--project-repo requires --acceptance-plan")
+                revision, kind = _resolve_revision(store.root, args.revision)
         except close_mod.CloseError as e:
-            sys.stderr.write(f"agenttalk close open: {e}\n")
+            code = getattr(e, "code", None)
+            sys.stderr.write(f"agenttalk close open: {code or 'invalid_input'}: {e}\n")
+            return 3 if code else 2
+        except (OSError, ValueError, TypeError, KeyError) as e:
+            sys.stderr.write(f"agenttalk close open: invalid acceptance input: {e}\n")
             return 2
-        clean = _worktree_clean(store.root)
+        clean = True if prepared else _worktree_clean(store.root)
         if clean is None:  # git could not report; trust the explicit flags
             clean = not bool(args.dirty_artifact) if not args.allow_dirty else False
         opener = _resolve_self(getattr(args, "actor", None), roster=roster)
@@ -3537,6 +3578,10 @@ def cmd_close(args: argparse.Namespace) -> int:
             non_lane_isolation_not_asserted=bool(
                 getattr(args, "non_lane_isolation_not_asserted", False)))
         record["worktree_isolation"] = _close_worktree_eval(store, record)
+        if prepared:
+            # A crash before the freeze transaction must leave a HOLD-only close.
+            record["schema_version"] = close_mod.ACCEPTANCE_SCHEMA_VERSION
+            record["acceptance_route"] = {"pending": True}
         if not clean and not args.dirty_artifact:
             sys.stderr.write(
                 "agenttalk close open: WARNING - worktree is dirty and no "
@@ -3547,6 +3592,8 @@ def cmd_close(args: argparse.Namespace) -> int:
             if rc != 0:
                 return rc
         try:
+            if prepared:
+                acceptance.partition_lenses(prepared["plan"], record["required_lenses"])
             path = close_mod.close_path(store, close_id)
             if not args.force and path.exists():
                 sys.stderr.write(
@@ -3564,11 +3611,14 @@ def cmd_close(args: argparse.Namespace) -> int:
                 )
             else:
                 close_mod.create_close(store, record)
+            if prepared:
+                record = acceptance.freeze(store, close_id, prepared, _iso_now())
         except (close_mod.CloseConflict, TimeoutError) as e:
             return _close_conflict_result("open", e)
         except close_mod.CloseError as e:
-            sys.stderr.write(f"agenttalk close open: {e}\n")
-            return 2
+            code = getattr(e, "code", None)
+            sys.stderr.write(f"agenttalk close open: {code or 'invalid_input'}: {e}\n")
+            return 3 if code else 2
         if getattr(args, "json", False):
             print(json.dumps(record, indent=2))
         else:
@@ -3580,6 +3630,35 @@ def cmd_close(args: argparse.Namespace) -> int:
 
     if action == "signoffs":
         return _cmd_close_signoffs(args, store, roster)
+
+    if action == "acceptance":
+        from agenttalk import acceptance
+        actor = _resolve_self(getattr(args, "actor", None), roster=roster)
+        if args.acceptance_cmd != "cold":
+            _check_close_authority(store, actor, "acceptance " + args.acceptance_cmd)
+        try:
+            if args.acceptance_cmd == "cold":
+                from agenttalk.acceptance_cold import submit
+                digest = submit(store, args.id, args.file, phase=args.phase, by=actor, at=_iso_now())
+                print(f"cold {args.phase} retained for {args.id}: {digest}")
+                return 0
+            if args.acceptance_cmd == "successor":
+                from agenttalk.acceptance_history import successor
+                if not all((args.acceptance_plan, args.project_repo, args.revision, args.reason)):
+                    raise close_mod.CloseError("successor requires plan, project, revision and amendment reason")
+                record = successor(store, parent_id=args.parent, close_id=args.id, plan_file=args.acceptance_plan,
+                                   project_repo=args.project_repo, revision=args.revision, by=actor, at=_iso_now(),
+                                   reason=args.reason, reduction_file=args.scope_reduction)
+                print(f"opened acceptance successor {record['close_id']} of {args.parent}")
+                return 0
+            digest = acceptance.attach(store, args.id, args.file, by=actor, at=_iso_now())
+        except (close_mod.CloseConflict, TimeoutError) as e:
+            return _close_conflict_result("acceptance attach", e)
+        except (close_mod.CloseError, OSError, ValueError, TypeError, KeyError) as e:
+            sys.stderr.write(f"agenttalk close acceptance: {getattr(e, 'code', 'invalid_input')}: {e}\n")
+            return 2
+        print(f"acceptance bundle attached to {args.id}: {digest}")
+        return 0
 
     if action == "ack":
         agent = _resolve_self(getattr(args, "actor", None), roster=roster)
@@ -3725,8 +3804,12 @@ def cmd_close(args: argparse.Namespace) -> int:
         rec = record if isinstance(record, dict) else {}
         signoff_eval = _build_signoff_eval(store, rec) if isinstance(record, dict) else None
         worktree_eval = _close_worktree_eval(store, rec) if isinstance(record, dict) else None
-        dod_eval = _build_dod_eval(store, rec) if isinstance(record, dict) else None
+        dod_eval = (_build_dod_eval(store, rec, acceptance_live=rec.get("status") != close_mod.PUBLISHED)
+                    if isinstance(record, dict) else None)
         result = close_mod.compute_verdict(rec, gate_check, signoff_eval, worktree_eval, dod_eval)
+        if "acceptance_route" in rec:
+            result["acceptance_evaluation"] = ("historical; not GO-publication eligibility"
+                                               if rec.get("status") == close_mod.PUBLISHED else "live candidate")
         if getattr(args, "json", False):
             print(json.dumps({**result, "gate_verdict": gate_check["verdict"],
                               "signoff_policy": (None if signoff_eval is None
@@ -3735,6 +3818,8 @@ def cmd_close(args: argparse.Namespace) -> int:
                               "worktree_isolation": worktree_eval}, indent=2))
         else:
             _print_verdict(args.id, result)
+            if "acceptance_evaluation" in result:
+                print("acceptance evaluation: " + result["acceptance_evaluation"])
         return 0 if result["verdict"] == close_mod.VERDICT_GO else 3
 
     if action == "publish":
@@ -3743,21 +3828,12 @@ def cmd_close(args: argparse.Namespace) -> int:
         verdict = close_mod.VERDICT_GO if args.verdict == "go" else close_mod.VERDICT_HOLD
         barrier_epoch = None
         try:
-            # The per-close lock spans reload, all impure evaluations, verdict derivation,
-            # persistence, and the optional barrier stamp - and evidence is resolved immediately
-            # before the write (nothing but in-memory record mutation sits between the resolve at
-            # `_build_dod_eval`/`compute_verdict` and `transaction.commit`), keeping the exposure
-            # minimal. It is NOT airtight (#66): the per-close lock does NOT exclude EVIDENCE
-            # mutators (`gate set`/`gate waive`, `knowledge retract`, signoff writes) - those live
-            # under the config lock, a separate mutex - and `commit` itself does a cross-file
-            # read+write (`load_close` -> `_write_close`). So an evidence mutation landing in that
-            # window can leave a persisted GO whose evidence has since changed. This is a narrow
-            # KNOWN, documented race tracked by #66/#31 (no enforced serialization invariant
-            # excludes the evidence mutators today); full closure needs one enforced lock spanning
-            # every evidence writer + this commit, and a stale-GO detector - both ride the #31
-            # close-provenance envelope. Do NOT restore the
-            # earlier "no ack/counter can invalidate a GO between check and write" claim; it was
-            # false (proven by a real-CLI repro that persisted GO against a gate set red mid-publish).
+            # Lock order: acceptance writer -> close-ID -> config (if needed).
+            # Close, gate, knowledge and config-backed signoff writers all join
+            # the outer lock; keep it from discovery through durable GO and the
+            # optional barrier stamp. External/manual file edits do not join this
+            # protocol. Time-based expiry is evaluated at the decision's clock
+            # time; publication is not a promise of future evidence freshness.
             with close_mod.close_transaction(store, args.id) as transaction:
                 record = transaction.record
                 if record.get("status") == close_mod.PUBLISHED:
@@ -3779,7 +3855,7 @@ def cmd_close(args: argparse.Namespace) -> int:
                         store.root, scope=record.get("gate_scope"))
                     signoff_eval = _build_signoff_eval(store, record)
                     worktree_eval = _close_worktree_eval(store, record)
-                    dod_eval = _build_dod_eval(store, record)
+                    dod_eval = _build_dod_eval(store, record, acceptance_live=verdict == close_mod.VERDICT_GO)
                     record["worktree_isolation"] = worktree_eval
                     result = close_mod.compute_verdict(
                         record, gate_check, signoff_eval, worktree_eval, dod_eval)
@@ -3795,6 +3871,9 @@ def cmd_close(args: argparse.Namespace) -> int:
                         record, verdict=verdict, by=actor, at=_iso_now(),
                         reason=args.reason or "", gate_check=gate_check,
                         residual_risk=args.residual_risk, barrier_epoch=None)
+                    if "acceptance_route" in record:
+                        record["final"]["acceptance_snapshot"] = dod_eval.get("acceptance")
+                        record["final"]["close_result"] = result
                     if verdict == close_mod.VERDICT_GO and args.bump_barrier:
                         record["final"]["barrier_binding"] = (
                             _new_close_barrier_binding(record))
@@ -3865,12 +3944,18 @@ def cmd_close(args: argparse.Namespace) -> int:
 
     if action == "show":
         record = close_mod.load_close(store, args.id)
+        if "acceptance_route" in record:
+            from agenttalk.acceptance_history import successors
+            children, errors = successors(store, record)
+            record["acceptance_successors"] = children
+            if errors:
+                record["acceptance_successors_error"] = errors
         print(json.dumps(record, indent=2))
         return 0
 
     sys.stderr.write(
         "agenttalk close: expected open, ack, draft, counter, check, publish, "
-        "reopen, list, or show.\n")
+        "reopen, acceptance attach, list, or show.\n")
     return 2
 
 
@@ -14809,6 +14894,9 @@ def build_parser() -> argparse.ArgumentParser:
     copen.add_argument("--scope", required=True, help="Close scope, e.g. release.")
     copen.add_argument("--gate-scope", help="Gate scope to check (default: --scope).")
     copen.add_argument("--revision", required=True, help="Ref or SHA; frozen to a full SHA via git.")
+    copen.add_argument("--acceptance-plan",
+                       help="Freeze a strict acceptance plan; schema 3 supports verified cooperative GO.")
+    copen.add_argument("--project-repo", help="Actual project checkout to verify for acceptance.")
     copen.add_argument("--lens", action="append", help="Required lens id (repeatable).")
     copen.add_argument("--optional-lens", action="append", help="Optional lens id (repeatable).")
     copen.add_argument("--allow", action="append",
@@ -14831,6 +14919,33 @@ def build_parser() -> argparse.ArgumentParser:
     copen.add_argument("--base", help="P3: diff base for changed paths (default revision^).")
     copen.add_argument("--json", action="store_true", help="Emit the opened record.")
     copen.set_defaults(func=cmd_close)
+
+    caccept = csub.add_parser("acceptance",
+                            help="Attach acceptance evidence, record cold review, or create a successor.")
+    cacceptsub = caccept.add_subparsers(dest="acceptance_cmd", required=True)
+    cattach = cacceptsub.add_parser("attach", help="Copy and bind an immutable bundle and its raw artifacts.")
+    cattach.add_argument("--id", required=True)
+    cattach.add_argument("--file", required=True)
+    cattach.add_argument("--from", dest="actor", help="Actor binding evidence (advisory close authority).")
+    cattach.set_defaults(func=cmd_close)
+    csucc = cacceptsub.add_parser("successor", help="Preserve a published acceptance parent and open a fresh attempt.")
+    csucc.add_argument("--id", required=True)
+    csucc.add_argument("--parent", required=True)
+    csucc.add_argument("--acceptance-plan", required=True)
+    csucc.add_argument("--project-repo", required=True)
+    csucc.add_argument("--revision", required=True)
+    csucc.add_argument("--reason", required=True)
+    csucc.add_argument("--scope-reduction", help="Structured amendment with an actual operator decision reference.")
+    csucc.add_argument("--from", dest="actor")
+    csucc.set_defaults(func=cmd_close)
+
+    ccold = cacceptsub.add_parser(
+        "cold", help="Assigned reviewer commits cold observations, then reconciles after reveal.")
+    ccold.add_argument("--id", required=True)
+    ccold.add_argument("--phase", choices=["commit", "reconcile"], required=True)
+    ccold.add_argument("--file", required=True)
+    ccold.add_argument("--from", dest="actor", required=True)
+    ccold.set_defaults(func=cmd_close)
 
     csign = csub.add_parser("signoffs", help="P3: derive/inspect specialist sign-offs.")
     csignsub = csign.add_subparsers(dest="signoffs_cmd")
@@ -14931,6 +15046,11 @@ def build_parser() -> argparse.ArgumentParser:
     creopen.add_argument("--id", required=True)
     creopen.add_argument("--from", dest="actor", help="Agent reopening.")
     creopen.add_argument("--revision", help="New ref/SHA (changing it stales prior lens acks).")
+    creopen.add_argument("--successor", help="New ID for a published acceptance attempt; preserves the parent.")
+    creopen.add_argument("--acceptance-plan")
+    creopen.add_argument("--project-repo")
+    creopen.add_argument("--reason")
+    creopen.add_argument("--scope-reduction")
     creopen.set_defaults(func=cmd_close)
 
     clist = csub.add_parser("list", help="List closes.")

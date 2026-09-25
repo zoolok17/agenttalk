@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from functools import wraps
 from datetime import datetime, time, timezone
 from pathlib import Path
 from typing import Any
@@ -75,6 +76,19 @@ def load_gate_state(root: Path) -> dict:
         return _state_load_error(str(e))
 
 
+def _serialized_write(function):
+    """Cover direct gate APIs as well as callers already holding config.lock."""
+    @wraps(function)
+    def write(root, *args, **kwargs):
+        from agenttalk import close
+        from agenttalk.store import Store
+
+        with close._acceptance_writer_lock(Store(root), timeout=10.0):
+            return function(root, *args, **kwargs)
+    return write
+
+
+@_serialized_write
 def write_gate_state(root: Path, state: dict) -> None:
     state = {
         "schema_version": SCHEMA_VERSION,
@@ -84,6 +98,7 @@ def write_gate_state(root: Path, state: dict) -> None:
     _atomic_write_text(gates_path(root), json.dumps(state, indent=2, ensure_ascii=False))
 
 
+@_serialized_write
 def set_gate(
     root: Path,
     *,
@@ -176,6 +191,7 @@ def set_gate(
     return gate
 
 
+@_serialized_write
 def waive_gate(
     root: Path,
     *,

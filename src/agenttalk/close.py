@@ -34,7 +34,9 @@ from decimal import Decimal
 import hashlib
 import json
 import math
+import os
 import re
+import threading
 import uuid
 from typing import Any
 
@@ -42,6 +44,7 @@ from agenttalk.coverage_contract import COVERAGE_GATE_NAMES, coverage_profile_fr
 from agenttalk.gates import CORE_RISK_CLASSES, is_valid_risk_class
 
 SCHEMA_VERSION = 1
+ACCEPTANCE_SCHEMA_VERSION = 2
 DIRNAME = "closes"
 
 # A close moves through these statuses; `published` is terminal (HOLD or GO).
@@ -105,7 +108,7 @@ DOD_DIRNAME = "dod.json"
 # dimension the engine cannot enforce is a policy error (you must not be able to require what
 # cannot be checked - a silent soft-pass is exactly the failure this gate exists to prevent).
 # inc-1: assurance only. inc-2 adds knowledge; inc-3 adds coverage + a depth-signoff dimension.
-_DOD_SUPPORTED_DIMENSIONS = frozenset({"assurance", "coverage", "knowledge"})
+_DOD_SUPPORTED_DIMENSIONS = frozenset({"assurance", "coverage", "knowledge", "acceptance"})
 _KNOWLEDGE_NOTE_TYPES = frozenset({"decision", "gotcha", "lesson", "pointer", "seam"})
 # The DoD knowledge dimension only counts DELIBERATE, human-authored knowledge (a lesson, a
 # gotcha, a decision) as evidence that "what we learned was written down". seam/pointer are
@@ -455,7 +458,8 @@ def _ack_authorized(ack: dict, lens: dict) -> bool:
 def _is_wellformed(record: object) -> bool:
     if not isinstance(record, dict):
         return False
-    if record.get("schema_version") != SCHEMA_VERSION:
+    expected_version = ACCEPTANCE_SCHEMA_VERSION if "acceptance_route" in record else SCHEMA_VERSION
+    if type(record.get("schema_version")) is not int or record["schema_version"] != expected_version:
         return False
     generation = record.get("generation", 0)
     if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
@@ -810,6 +814,10 @@ def validate_dod_policy(raw: object) -> dict:
                 norm[dim] = _validate_dod_coverage_spec(spec, scope_name)
             elif dim == "knowledge":
                 norm[dim] = _validate_dod_knowledge_spec(spec, scope_name)
+            elif dim == "acceptance":
+                if not isinstance(spec, dict) or set(spec) != {"required"} or spec["required"] is not True:
+                    raise CloseError("dod acceptance requires exactly {required: true}")
+                norm[dim] = {"required": True}
         key = str(scope_name).lower()
         if key in scopes:
             # two scope names that collide after lowercasing are ambiguous -> fail closed.
@@ -979,17 +987,25 @@ def evaluate_dod(record: dict, dod_eval: dict | None) -> list[tuple[str, str]]:
         "age_days": float|None, "max_age_days": int|None,
       } | None,
     }
-    ``None`` ⇒ [] (the scope has no DoD requirements)."""
+    ``None`` ⇒ [] unless a frozen acceptance route requires evaluation."""
+    from agenttalk import acceptance
+
+    # A frozen (even pending/malformed) route survives removal of live policy.
+    route_required = "acceptance_route" in record
+    out: list[tuple[str, str]] = []
+    if route_required:
+        out.extend(acceptance.evaluate(dod_eval.get("acceptance") if isinstance(dod_eval, dict) else None))
     if dod_eval is None:
-        return []
+        return out
     if not isinstance(dod_eval, dict):
-        return [(HOLD_INVALID_DOD_POLICY, "dod evaluation bundle is malformed")]
+        return out + [(HOLD_INVALID_DOD_POLICY, "dod evaluation bundle is malformed")]
     if dod_eval.get("policy_error"):
-        return [(HOLD_INVALID_DOD_POLICY, str(dod_eval["policy_error"]))]
+        return out + [(HOLD_INVALID_DOD_POLICY, str(dod_eval["policy_error"]))]
     required = dod_eval.get("required_dimensions") or {}
     if not required:
-        return []
-    out: list[tuple[str, str]] = []
+        return out
+    if "acceptance" in required and not route_required:
+        out.extend(acceptance.evaluate(dod_eval.get("acceptance")))
     if "assurance" in required:
         out.extend(_evaluate_dod_assurance(record, dod_eval.get("assurance")))
     if "coverage" in required:
@@ -1361,13 +1377,64 @@ def close_instance_id(record: dict) -> str | None:
     return instance_id
 
 
+_writer_locks = threading.local()
+
+
+def _writer_key(store):
+    return os.getpid(), os.path.normcase(str(store.dir.resolve()))
+
+
+@contextlib.contextmanager
+def _acceptance_config_scope(store):
+    """Record the innermost lock rank, so config -> close cannot deadlock."""
+    key = _writer_key(store)
+    held = getattr(_writer_locks, "config", None)
+    if held is None:
+        held = _writer_locks.config = set()
+    held.add(key)
+    try:
+        yield
+    finally:
+        held.remove(key)
+
+
+@contextlib.contextmanager
+def _acceptance_writer_lock(store, *, timeout: float):
+    """Serialize close writers in this store, including GO's entire audit/commit.
+
+    All closes participate so classification or conversion cannot bypass the
+    boundary. Only this outer lock is reentrant, for successor creation inside
+    the parent's transaction; per-ID locks still reject nested same-ID writes.
+    Thread-local ownership includes the PID so a fork cannot inherit ownership.
+    """
+    key = _writer_key(store)
+    held = getattr(_writer_locks, "held", None)
+    if held is None:
+        held = _writer_locks.held = set()
+    if key in held:
+        yield
+        return
+    with store._exclusive_lock(store.dir / ".acceptance-write.lock", timeout=timeout,
+                               what="acceptance store writer lock"):
+        held.add(key)
+        try:
+            yield
+        finally:
+            held.remove(key)
+
+
+@contextlib.contextmanager
 def _close_update_lock(store, close_id: str, *, timeout: float):
+    if _writer_key(store) in getattr(_writer_locks, "config", set()):
+        raise CloseConflict("lock order requires acceptance writer -> close-ID -> config; "
+                            "finish the config transaction before starting a close transaction")
     lock_path = closes_dir(store) / f".{validate_close_id(close_id)}.lock"
-    return store._exclusive_lock(
+    with _acceptance_writer_lock(store, timeout=timeout), store._exclusive_lock(
         lock_path,
         timeout=timeout,
         what=f"close {close_id!r} update lock (another agent may be updating it)",
-    )
+    ):
+        yield
 
 
 def _write_close(path, record: dict) -> None:
@@ -1545,6 +1612,8 @@ def replace_close(store, record: dict, *, expected_generation: int | None,
         if not path.exists():
             raise CloseConflict(f"close {close_id!r} no longer exists; reload before retrying")
         current = load_close(store, close_id)
+        if "acceptance_route" in current or "acceptance_route" in record:
+            raise CloseError("acceptance attempts cannot be replaced with --force")
         _require_current_tokens(
             current, close_id=close_id,
             expected_generation=expected_generation,
@@ -1617,11 +1686,16 @@ def save_close(store, record: dict, *, expected_generation: int | None = None,
     return next_generation
 
 
-def list_close_ids(store) -> list[str]:
+def list_close_ids(store, *, strict: bool = False) -> list[str]:
+    """Enumerate completely or raise; only non-audit callers may omit the directory."""
     d = closes_dir(store)
-    if not d.exists():
+    try:
+        with os.scandir(d) as entries:
+            return sorted(entry.name[:-5] for entry in entries if entry.name.lower().endswith(".json"))
+    except FileNotFoundError:
+        if strict:
+            raise
         return []
-    return sorted(p.stem for p in d.glob("*.json"))
 
 
 # ----------------------------------------------- pure state transitions
@@ -1662,6 +1736,10 @@ def apply_ack(record: dict, *, lens_id: str, status: str, agent: str,
         "evidence": evidence or {}, "reason": reason, "counter_id": counter_id,
         "override": bool(override),
     }
+    route = record.get("acceptance_route")
+    if isinstance(route, dict) and route.get("schema_version") in (2, 3):
+        from agenttalk.acceptance import ack_binding
+        record["lens_acks"][lens_id]["acceptance_binding"] = ack_binding(record)
     if status == COUNTER:
         record["counters"][counter_id] = {
             "counter_id": counter_id, "lens": lens_id, "raised_by": agent,
@@ -1753,6 +1831,9 @@ def reopen(record: dict, *, by: str, at: str, revision: str | None = None,
     """Reopen a published close (operator). If the revision changed, prior lens
     acks are STALE by construction (compute_verdict compares ack.revision to the
     record revision), so we just update the revision and let the verdict re-flag."""
+    if "acceptance_route" in record:
+        raise CloseError("acceptance reopen requires --successor and a new plan/project/revision; "
+                         "preserve this attempt")
     record["status"] = REOPENED
     record["final"] = None
     if revision is not None:

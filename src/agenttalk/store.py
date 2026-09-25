@@ -34,6 +34,7 @@ import uuid
 import warnings
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 from pathlib import Path
 
 from agenttalk import health as _health
@@ -51,6 +52,17 @@ else:
 logger = logging.getLogger(__name__)
 
 DIRNAME = ".agenttalk"
+
+
+def _acceptance_mutation(method):
+    """Serialize administrative/direct writers that do not use config.lock."""
+    @wraps(method)
+    def write(self, *args, **kwargs):
+        from agenttalk import close
+
+        with close._acceptance_writer_lock(self, timeout=10.0):
+            return method(self, *args, **kwargs)
+    return write
 
 RESTART_REQUEST_READ_STATUS_KEY = "_agenttalk_restart_request_status"
 RESTART_REQUEST_UNUSABLE = "unusable"
@@ -1023,6 +1035,14 @@ class Store:
         return self.config_path.exists()
 
     def init(self, agents: list[str], *, force: bool = False) -> dict:
+        # Initialization is also a supported new-project operation. Create only
+        # its root before acquiring the writer marker; all state stays locked.
+        validate_agent_roster(agents)
+        self.root.mkdir(parents=True, exist_ok=True)
+        return self._initialize(agents, force=force)
+
+    @_acceptance_mutation
+    def _initialize(self, agents: list[str], *, force: bool = False) -> dict:
         validate_agent_roster(agents)
         if self.initialized() and not force:
             return self.load_config()
@@ -1152,6 +1172,7 @@ class Store:
                 _atomic_write_text(cur, "")
         return cfg
 
+    @_acceptance_mutation
     def reset(self, *, archive: bool = False) -> tuple[dict, Path | None]:
         """Clear active bus state (messages, cursors, heartbeats);
         start a new session.
@@ -1357,6 +1378,7 @@ class Store:
 
     # ------------------------------------------------------- team / roster
 
+    @_acceptance_mutation
     def _write_config(self, cfg: dict) -> None:
         _atomic_write_text(self.config_path, json.dumps(cfg, indent=2))
 
@@ -1464,6 +1486,15 @@ class Store:
     @contextlib.contextmanager
     def _exclusive_lock(self, lock: Path, *, timeout: float = 10.0,
                         poll: float = 0.05, what: str = "lock"):
+        from agenttalk import lock_order
+
+        with lock_order.hold(self.dir, lock):
+            with self._exclusive_lock_unordered(lock, timeout=timeout, poll=poll, what=what):
+                yield
+
+    @contextlib.contextmanager
+    def _exclusive_lock_unordered(self, lock: Path, *, timeout: float = 10.0,
+                                  poll: float = 0.05, what: str = "lock"):
         """Hold a legacy-compatible O_EXCL marker across a critical section.
 
         Current clients serialize stale recovery and owner release with an
@@ -1648,18 +1679,25 @@ class Store:
 
     @contextlib.contextmanager
     def _config_lock(self, *, timeout: float = 10.0, poll: float = 0.05):
-        """Hold a versioned exclusive config read-modify-write transaction."""
+        """Hold acceptance-writer then config locks for a versioned transaction.
+
+        Config writers include gates, knowledge, roster and domain/refset changes
+        consumed by acceptance/DoD/signoffs. Joining at this boundary prevents a
+        new config writer from silently bypassing acceptance publication.
+        """
+        from agenttalk import close
+
         self._ensure_plain_lock_directory(
             self.dir,
             what="AgentTalk runtime lock directory",
         )
         lock = self.dir / "config.lock"
-        with self._exclusive_lock(
+        with close._acceptance_writer_lock(self, timeout=timeout), self._exclusive_lock(
             lock,
             timeout=timeout,
             poll=poll,
             what="config lock (another agent may be mid roster-admin)",
-        ):
+        ), close._acceptance_config_scope(self):
             yield self._advance_config_lock_generation(
                 lock,
                 timeout=timeout,
@@ -1783,6 +1821,7 @@ class Store:
             what="PowerShell host selection lock",
         )
 
+    @contextlib.contextmanager
     def _retirement_lock(self, *, timeout: float = 10.0, poll: float = 0.005):
         """Serialize roster retirement against final message publication.
 
@@ -1790,13 +1829,17 @@ class Store:
         creation, metadata fsync, or unlink cost. The durable payload is already
         prepared before this narrow critical section begins.
         """
-        return self._lock_generation_guard(
+        from agenttalk import lock_order
+
+        with lock_order.hold(self.dir, self.dir / "retirement"), self._lock_generation_guard(
             self.dir / "retirement",
             deadline=time.monotonic() + timeout,
             poll=poll,
             what="retirement/message publication",
-        )
+        ):
+            yield
 
+    @contextlib.contextmanager
     def _message_publication_lock(
         self,
         *,
@@ -1804,12 +1847,15 @@ class Store:
         poll: float = 0.005,
     ):
         """Linearize every canonical message publication with dispatch replay."""
-        return self._lock_generation_guard(
+        from agenttalk import lock_order
+
+        with lock_order.hold(self.dir, self.dir / "message-publication"), self._lock_generation_guard(
             self.dir / "message-publication",
             deadline=time.monotonic() + timeout,
             poll=poll,
             what="message publication",
-        )
+        ):
+            yield
 
     @property
     def _message_publication_order_path(self) -> Path:
@@ -2339,7 +2385,7 @@ class Store:
         """Remove an agent from the roster, its role, and all group
         memberships. External workers become permanent tombstones; ordinary
         force-removed identities retain the historical re-addable behavior."""
-        with self._retirement_lock(), self._config_lock():
+        with self._config_lock(), self._retirement_lock():
             cfg = self.load_config()
             roster = list(cfg.get("agents", []))
             was_external = (
@@ -2882,7 +2928,7 @@ class Store:
         ``renamed_to`` links a rename's tombstone to its successor (set by
         :meth:`rename_agent`). Refuses a name that is not currently active.
         """
-        with self._retirement_lock(), self._config_lock():
+        with self._config_lock(), self._retirement_lock():
             cfg = self.load_config()
             active = cfg.get("agents", []) or []
             if name not in active:
@@ -2913,7 +2959,7 @@ class Store:
         referencing ``old`` stays valid; ``old`` is non-rebindable (FR-002/005/006).
         """
         validate_agent_name(new)
-        with self._retirement_lock(), self._config_lock():
+        with self._config_lock(), self._retirement_lock():
             cfg = self.load_config()
             active = cfg.get("agents", []) or []
             if old not in active:
@@ -6115,7 +6161,7 @@ class Store:
         data = dict(payload)
         data.setdefault("state", _eph.STATE_QUEUED)
         self._launch_state_rank(data["state"])
-        with self._retirement_lock(), self._config_lock():
+        with self._config_lock(), self._retirement_lock():
             path = self._launch_request_path(rid)
             path.parent.mkdir(parents=True, exist_ok=True)
             try:

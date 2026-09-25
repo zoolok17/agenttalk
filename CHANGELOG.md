@@ -9,6 +9,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Order roster retirement after acceptance/config locking so release-barrier
+  publication cannot deadlock against removal, retirement, rename or launch
+  requests. Check store lock ranks before waiting and document lane contention.
+
+- Extend acceptance publication serialization to gate APIs, knowledge appends,
+  configuration and administrative config writers. Enforce acceptance-writer,
+  close-ID, then config lock order; gate contention returns HOLD/conflict.
+
+- Serialize all local close writers with acceptance GO discovery and durable
+  publication. Strict history enumeration now HOLDs with
+  `acceptance_audit_unavailable` on missing, unreadable or partial audit storage;
+  diagnostic `close show` preserves its record and reports the audit error.
+
+- Recheck every related attempt at GO publication, including later-created and
+  sibling attempts. New or changed source records invalidate the frozen evidence
+  catalog and require a fresh capture/review; opening order grants no exemption.
+
+- Acceptance recovery now retains complete source records and inherits pending
+  review counters, blocking cold findings, remediation gates and review
+  requirements through one obligation fold. Required source bytes are revalidated
+  and included in final sealed evidence; unknown substantive holds require a
+  reviewed disposition instead of disappearing at a new root.
+
+- Acceptance recovery roots retain related-change gating obligations and original
+  failures; weaker coverage requires the same exact reserved-operator amendment.
+  Schema-3 GO now requires bound environment, offline enforcement, cleanup and
+  sealed-manifest confidentiality evidence. Required artifact integrity HOLDs
+  regardless of comparison policy. Final cold reviewers and reproducers must be
+  disjoint even after cold commitment; CLI help describes the current workflow.
+
+- Acceptance cold-review freshness also compares Git stable patch IDs of the whole
+  diff from required, verified `cold_policy.change_base`, catching equivalent
+  rebases, squashes and cherry-picks. Deliberate identity/content evasion is an
+  explicit cooperative-profile residual; base and patch ID appear in cold snapshots.
+
+- Acceptance cold-review freshness follows verified Git ancestry across recovery
+  roots even after targets are renamed. Corrupt-history refusals identify repair
+  options and skip readable other-project records; relevant gate attribution now
+  contributes to reviewer independence.
+
+- Acceptance cold eligibility now audits recorded actor provenance and prior
+  exposure across roots for the same source or protected targets. Mislabelled
+  withheld evidence is rejected by digest; premature attachment is retryable,
+  and corrupt unrelated records no longer hide the parent's audit view.
+
+- Acceptance increment 1c adds schema-3 final cold commitments and reconciliation,
+  retained delivery evidence, distinct reviewer/access and vendor checks, and
+  attempt-bound reproducer/reviewer accepts. Complete supported cooperative
+  evidence can now GO. Parent audit views list all successor alternatives;
+  unapproved coverage loss requires recovery through a new root close while
+  retaining the change's protected obligations.
+
+- Acceptance coverage follows protected measurement targets across all retained
+  ancestors, regardless of row names, splits, merges or informational hops.
+  Weakened or removed coverage requires exact operator approval for each attempt;
+  equivalent or provably stronger coverage does not. Target-based amendments use
+  schema 3 and preserve ancestor outcomes even when the original row is absent.
+
+- Acceptance 1b corrections require exact operator approval for gating assertion
+  amendments at any revision and retain the original failure as a policy change.
+  Successors cannot shrink author/runner exclusions; partition accepts bind the
+  attached bundle. Open-attempt checks and GO publication use live verification;
+  terminal checks explicitly report historical evaluation. Parent snapshots use
+  digest references instead of embedding the parent's final snapshot.
+
+- Acceptance increment 1b adds cooperative reproduction, attempt/policy-bound
+  acknowledgments, immutable successors, historical Git-object verification and
+  operator-origin scope reductions that preserve failed evidence. Complete
+  cooperative evidence still HOLDs pending increment 1c's final cold-review
+  enforcement. Retention has an atomic fallback when hard linking evidence fails;
+  unmeasured gating rows no longer claim failed recomputation.
+
+- Acceptance increment 1a freezes project-bound plans and retains evidence for
+  built-in comparisons; it remains HOLD-only pending later trust checks.
+  Acceptance closes use schema 2 so older engines reject them. Evidence blobs
+  publish atomically, attachments record actor/time and an event, and malformed
+  informational rows preserve other outcomes. See the
+  [implementation record](docs/STEP-ACCEPTANCE-INC1.md) for compatibility,
+  advisory authority, storage and targeted verification details.
+
 ### Changed
 
 - **OVH/Qwen gateway: reasoning is no longer re-sent as input.** The
