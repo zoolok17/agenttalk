@@ -27,6 +27,12 @@ def acceptance_project_template(tmp_path_factory):
                                        stderr=subprocess.STDOUT).decode().strip()
 
     git("init", "-q")
+    # Disable automatic writers before the first commit. check_output waits for
+    # each foreground Git command; neither this template nor its candidate copy
+    # may leave detached maintenance changing .git while copytree reads it.
+    git("config", "gc.auto", "0")
+    git("config", "maintenance.auto", "false")
+    git("config", "gc.autoDetach", "false")
     git("config", "user.name", "Synthetic Author")
     git("config", "user.email", "synthetic@example.invalid")
     (project / "source.txt").write_text("synthetic source\n", encoding="utf-8")
@@ -48,6 +54,7 @@ def acceptance_candidate_template(acceptance_project_template, tmp_path_factory)
     template, _ = acceptance_project_template
     project = tmp_path_factory.mktemp("acceptance-candidate-template") / "project"
     shutil.copytree(template, project)
+    # The copied config already disables maintenance before this commit too.
     (project / "source.txt").write_text("synthetic candidate\n", encoding="utf-8")
     subprocess.check_output(["git", "-C", str(project), "commit", "-qam", "candidate from verified base"],
                             stderr=subprocess.STDOUT)

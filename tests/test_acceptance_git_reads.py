@@ -1,6 +1,7 @@
 """Git process budget and live-state safety at the real CLI boundary."""
 
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 import test_acceptance as fixtures
@@ -9,6 +10,82 @@ from agenttalk import acceptance
 from test_acceptance import command, git, open_attempt
 
 case = fixtures.case
+
+
+@pytest.mark.parametrize("template_name", ["acceptance_project_template", "acceptance_candidate_template"])
+def test_templates_disable_automatic_maintenance(request, template_name):
+    project, _ = request.getfixturevalue(template_name)
+    for key, expected in (("gc.auto", "0"), ("maintenance.auto", "false"), ("gc.autoDetach", "false")):
+        assert git(project, "config", "--get", key) == expected
+
+
+def test_templates_disable_maintenance_before_any_commit(tmp_path_factory, monkeypatch):
+    import conftest
+    original = subprocess.check_output
+    commits = []
+
+    def checked(args, *a, **kw):
+        if args[3] == "commit":
+            for key, expected in (("gc.auto", b"0"), ("maintenance.auto", b"false"),
+                                  ("gc.autoDetach", b"false")):
+                assert original(args[:3] + ["config", "--get", key]).strip() == expected
+            commits.append(args)
+        return original(args, *a, **kw)
+
+    monkeypatch.setattr(subprocess, "check_output", checked)
+    base = conftest.acceptance_project_template.__wrapped__(tmp_path_factory)
+    conftest.acceptance_candidate_template.__wrapped__(base, tmp_path_factory)
+    assert len(commits) == 2
+
+
+@pytest.mark.parametrize("cmd, expected_reads", [("close", 1), ("serve", 2)])
+def test_cli_metadata_scope_is_limited_to_close(monkeypatch, cmd, expected_reads):
+    from agenttalk import cli
+    from agenttalk.acceptance_git import read_once
+    reads = []
+
+    def handler(args):
+        for _ in range(2):
+            read_once("probe", lambda: reads.append("read"))
+        return 0
+
+    args = SimpleNamespace(cmd=cmd, func=handler)
+    monkeypatch.setattr(cli, "build_parser", lambda: SimpleNamespace(parse_args=lambda argv: args))
+    assert cli.main([]) == 0
+    assert len(reads) == expected_reads
+
+
+def test_project_locator_must_name_checkout_root(case):
+    sub = case["project"] / "sub"
+    sub.mkdir()
+    with pytest.raises(acceptance.AcceptanceError, match="project locator must name the checkout root") as error:
+        acceptance.verify_project(sub, case["sha"])
+    assert error.value.code == "acceptance_project_unverified"
+
+
+def test_resolver_reuses_enclosing_cli_command_scope(case, monkeypatch):
+    assert open_attempt(case) == 0
+    original_resolve = acceptance.resolve
+    original_run = subprocess.run
+    metadata_reads = []
+    resolved = []
+
+    def counted(args, *a, **kw):
+        if "--show-toplevel" in args:
+            metadata_reads.append(args)
+        return original_run(args, *a, **kw)
+
+    def resolve(*args, **kwargs):
+        acceptance.verify_project(case["project"], case["sha"])
+        result = original_resolve(*args, **kwargs)
+        resolved.append(result)
+        return result
+
+    monkeypatch.setattr(subprocess, "run", counted)
+    monkeypatch.setattr(acceptance, "resolve", resolve)
+    assert command(case, "check", "--id", "attempt", "--json") == 3
+    assert resolved
+    assert len(metadata_reads) == 1
 
 
 def test_command_reads_project_metadata_once_but_rechecks_live_state(case, monkeypatch):

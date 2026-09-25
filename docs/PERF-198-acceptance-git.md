@@ -9,7 +9,7 @@ sample measurements, not a prediction of the complete Windows CI job time.
 
 ## Scope and verification semantics
 
-Each CLI invocation owns a fresh context-local cache. A direct
+Each `close` CLI invocation owns a fresh context-local cache. A direct
 `acceptance.resolve()` call also owns a scope unless it is already inside one.
 Only Git metadata and history-query results are reused. Cache keys distinguish
 the repository, revision/query and environment. Nested CLI calls get independent
@@ -175,3 +175,21 @@ acceptance test functions and parameterizations were unchanged.
 No full-repository suite or CI wall-time guarantee is claimed. Further process
 reduction remains a follow-up; it must preserve mutable-state and Git failure
 checks rather than merely hide work from the counter.
+
+## Template maintenance correction
+
+The measurements above describe commit `5bb28bb`. A subsequent Linux CI run
+found a template-copy race with Git's detached automatic maintenance. Template
+setup now sets `gc.auto=0`, `maintenance.auto=false` and `gc.autoDetach=false`
+before the first commit. The candidate inherits those settings before its
+commit. Every setup command runs synchronously; automatic maintenance is never
+started by those commits, so there is no detached writer to wait for before
+copying. No lock files are ignored. This adds three config processes per session;
+the earlier repeated timings have not been remeasured for this correction.
+
+The correction also limits CLI caching to `close` commands. Its targeted run
+passed **296 tests** (Git-read regressions, the CI-failing acceptance case,
+schema-3 hygiene cases and CLI tests). New tests check both templates' settings
+and inspect them before each commit. The checkout-root and enclosing-scope tests
+each kill their corresponding in-memory mutant. Linux CI remains the check for
+the original platform-specific race; the local run was on Windows/Python 3.10.
