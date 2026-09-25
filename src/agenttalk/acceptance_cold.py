@@ -27,7 +27,7 @@ def policy(value):
 def binding(record):
     route = record["acceptance_route"]
     return {key: route[key] for key in
-            ("instance_id", "attempt_id", "revision", "project_id", "plan_hash", "registry_hash")}
+            ("instance_id", "attempt_id", "revision", "project_id", "plan_hash", "registry_hash", "obligations_hash")}
 
 
 def validate_initial(value, record, plan):

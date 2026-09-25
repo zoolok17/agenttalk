@@ -1089,3 +1089,155 @@ added content with eight positive controls, exact twelve-file scope, branch,
 whitespace, and design bytes permitting only the authorized LD3 sentence change.
 All scratch from this correction is retained for the sweeper's recheck; no reviewer
 scratch was modified. No PR, merge or release is part of this work order.
+
+## Recovery obligations: structural correction (R1, R2)
+
+Inventory recorded before implementation, from DESIGN acceptance rows, attempts,
+residual ledger and GO conditions, and the ordinary/acceptance verdict folds:
+
+| Obligation | Recovery resolution |
+| --- | --- |
+| Gating predicates, failed/unmeasured comparisons, removed or weakened coverage | Current passing evidence for retained coverage, or the exact existing LD2 approval; original outcomes remain visible. |
+| Pending partition/final review counters | Existing reviewed counter disposition; accepting a blocker requires its remediation and green named gate. |
+| Blocking cold findings, including an unreconciled blocking observation | Materialize a source-bound counter; use the same reviewed disposition/remediation path. |
+| Accepted blocker remediation and named gates | Preserve counter/remediation and require the named gate, independently of fresh acceptance acknowledgments. |
+| Required but absent/invalid/expired operator approval | Recompute the complete protected coverage and revalidate the exact per-attempt LD2 approval. A general counter disposition cannot waive it. |
+| Missing/corrupt required retained records, artifacts and bindings | Re-read the retained source evidence closure. Restore the exact bytes; a disposition cannot waive integrity. Seal the source records and closure in final close-out. |
+| Ordinary review lenses, signoff/risk routing and gate scope | Preserve requirements; obtain fresh eligible acknowledgments and current gate/signoff evaluation. |
+| Execution, project, independence, offline and hygiene prerequisites | Fresh bound evidence is required by the normal evaluator; any recorded unresolved substantive hold not represented above becomes a reviewed counter, so unknown hold kinds cannot disappear. |
+| DoD assurance/coverage/knowledge, isolation and other ordinary holds | Current ordinary checks remain additive; recorded unresolved holds require reviewed disposition when not otherwise represented. |
+| Procedural cold freshness, stale acknowledgments and inherited lineage poison | Fresh procedural lineage and evidence are allowed; this never removes the substantive records above. |
+| Complete prior attempt and verifiable source identity | Preserve the terminal prior record, as a normal successor requires; reverify its commit/tree/roots. Recapture updated history in a fresh attempt. |
+
+Implementation boundary: one recovery inheritance fold uses retained complete
+source records for both linked successors and new roots. It carries structured
+obligations, rather than trusting a cached acceptance outcome alone. Existing
+counter decisions are the reviewed-disposition mechanism; no new waiver API.
+The table will cross every substantive representation with same SHA, rebase,
+squash and different change. Related changes HOLD until their resolution;
+unrelated history/content with disjoint targets adds no inherited obligation.
+
+Implementation: `acceptance_obligations.inherit` is the common capture/evaluation
+fold for schema-3 successors and recovery roots. A new mandatory
+`obligations_hash` retains a catalog of complete source-close hashes. The catalog
+is bounded to 256 source records including transitive parent/recovery sources;
+overflow, missing bytes and malformed bindings fail closed. Source plans,
+registries, bundles, all artifacts, cold reports/deliveries, amendment/approval
+records and referenced reduction evidence join the final sealed manifest.
+Execution hygiene is checked even for a source not yet published, so a recorded
+cleanup/offline failure cannot evade inheritance by omitting the final snapshot.
+
+Review counters are keyed by original attempt/kind/id, preventing close-local
+counter-ID reuse from merging different defects. Cold findings normalize to this
+same ordinary counter representation. Copied reviewed decisions remain evidence;
+new decisions require matching counter events and are bound in the reconciliation
+digest. Accepted blockers use the existing ordinary remediation-gate fold.
+Unrecognized saved HOLD codes become counters by default; comparison/LD2,
+integrity, cold freshness and current acknowledgment checks have explicit existing
+resolvers. Conflicting inherited lens definitions or remediation IDs refuse
+instead of choosing one silently. Scope/risk/signoff requirements cannot shrink.
+
+Contract readers: freeze produces the catalog; `_route` requires its digest;
+`ack_binding` and cold `binding` include it; the shared inheritance fold reads it;
+cold provenance includes source actors and withheld bytes; final hygiene seals
+the evidence closure and inherited dispositions. The CLI counter workflow is
+unchanged. Ordinary close schema and pure verdict code are unchanged. Older
+development schema-3 routes lacking the catalog fail closed, and older engines
+reject the new exact route/report fields. Schemas 1/2 remain HOLD-only. Design
+bytes are unchanged in this correction.
+
+The single `recovery_obligations_follow_change_table` enumerates the following
+representations. Each row runs at identical SHA, on a rebase, on a squash and on
+different history/content with disjoint targets. Expected results are HOLD for
+the first three and no inherited HOLD for the fourth; current ordinary gates
+still apply independently.
+
+| Table case | Concrete obligation exercised |
+| --- | --- |
+| coverage | Removed original gating target and its failed comparison. |
+| approval | Changed gating predicate without exact operator authorization. |
+| counter | Pending partition review counter (R1 real-CLI reproduction). |
+| cold | Blocking committed cold observation reconciled open (R1 real-CLI reproduction). |
+| final-review | Pending counter raised on the final cold review lens. |
+| remediation | Accepted blocker with an unresolved named repair gate. |
+| gate | Named prior blocker gate, independently of row predicates. |
+| missing / corrupt | Prior failed result deleted/corrupted after sealing (R2). |
+| hygiene | Prior execution close-out records incomplete scratch cleanup. |
+| offline | Prior execution records failed egress enforcement. |
+| review-requirement | Required extra review lens absent from the new request. |
+| routing | Recorded specialist/risk requirement. |
+| dod | Recorded missing assurance evidence. |
+| isolation | Recorded worktree isolation failure. |
+| unknown | Future substantive HOLD code, defaulting to reviewed disposition. |
+| unfinished-source | Prior attempt has not preserved its terminal snapshot; recapture after publishing HOLD. |
+
+The last four ordinary/future representations inject a saved verdict/requirement
+record to test the consumer, independently of their existing producer suites.
+The counter, cold finding, integrity, execution and gate cases use real CLI or
+normal gate producers. Different-change gate tests remove the shared live gate
+to isolate inheritance; they do not claim that different changes bypass live
+gate requirements. Separate tests exercise ordinary counter resolution in both
+root and linked recovery, exact LD2 approvals, retained-source deletion, pre-open
+loss of prior raw evidence, post-check loss, decision events and disposition-seal
+staleness.
+
+Self-review added three failing-first edge probes in private scratch. An
+unfinished prior attempt was accepted, loss of a cherry-picked source commit was
+not rechecked, and an exact copy of the newly captured full close was not yet in
+the cold withheld set. All three are now pinned in committed tests (unfinished
+source is the seventeenth table row). The Git-object probe first hit Windows'
+read-only file bit; after correcting that fixture it failed specifically on the
+missing required HOLD. No reviewer scratch or production source was mutated by
+these probes. Source Git verification and terminal-state checks use the latest
+retained version per attempt, while sealing retains every source version.
+An additional positive test recaptures completed source history and reaches GO.
+
+Cooperative limits remain explicit: ordinary reviewed counter/remediation
+evidence uses its existing text/event contract; arbitrary text references are
+not fetched as files. Every schema-declared retained digest is verified and
+sealed. Authenticated actors, signed change identities and semantic detection
+of re-encoded expectation leakage remain the previously accepted hardened-profile
+work. Generic reviewed disposition never waives digest/binding failure or LD2.
+
+Final self-review also exercised recovery through a verified clone after the old
+checkout retires. Its initial probe failed because source verification used the
+old locator. Verification now uses the current verified repository and compares
+every retained commit/tree/root identity; missing historical objects still HOLD.
+The new positive test also publishes GO, rather than checking the helper alone.
+
+### Executed verification for structural recovery
+
+All commands ran foreground from the feature worktree with `PYTHONPATH=<W>/src`,
+bytecode disabled and `-p no:cacheprovider`. Basetemps and logs are under the
+assigned private `<S>` scratch root. No production store or reviewer scratch was
+modified. Selections below refer to `tests/test_acceptance.py`.
+
+| Command / selection | Result |
+| --- | --- |
+| `python -m pytest ... -q -k 'recovery_obligations_follow_change_table and same-sha' --basetemp <S>/structural-red` before production edits | 4 failed, 1 passed, 317 deselected: counter, cold, missing and corrupt paths lacked HOLD; existing coverage control passed. |
+| Same selection, `<S>/structural-target1` | 5 passed, 317 deselected. |
+| `-k 'recovery_obligations_follow_change_table or inherited_review_requires or recovery_seals or recovery_requires_original'`, `<S>/structural-target2` | 53 passed, 297 deselected. |
+| `python -m pytest tests/test_acceptance.py tests/test_close.py tests/test_close_signoffs.py tests/test_gates.py -q --basetemp <S>/structural-regression` | 712 passed, 1 skipped, 1 failed in 1179.48 seconds. The old ancestor-actor fixture rewrote its bundle without rebinding its cold report; corrected to construct the valid bundle before attachment. All 335 ordinary close/signoff/gate tests passed. |
+| `-k 'ancestor_bundle_actor_without_ack or captured_source_record or recovery_rechecks_prior_commit or unfinished-source or recovery_refuses_new_findings'`, `<S>/structural-edges-green` | 8 passed, 377 deselected, including the corrected ancestor fixture. |
+| `python -m pytest tests/test_acceptance.py -q --basetemp <S>/structural-final-acceptance` | 384 passed, 1 skipped, 1 failed in 1196.21 seconds. All 68 obligation-table cases passed. The new recapture test expected exit 0 from a successfully published HOLD with exit 3; corrected to assert both exit 3 and the terminal record. |
+| Private current-clone probe before locator fix | 1 failed, 3 deselected: valid current clone incorrectly held when the old checkout was retired. |
+| `python <S>/mutate-structural.py` on final production source | 7/7 killed: counter inheritance, cold finding inheritance, source-evidence reread, unknown-HOLD inheritance, disposition seal, historical Git verification, terminal-source requirement. Isolated source copies only; retained in `<S>/structural-mutants-98b41b52`. |
+
+The intermediate `<S>/structural-target3` run had 27 passes and one fixture
+failure: source-file deletion preceded a helper that still needed the source.
+Moving that deletion after fixture construction preserves the intended test.
+The symlink skip is host-restricted creation, not an unexecuted GO assertion.
+No full-repository or performance result is claimed.
+
+Final-source follow-up:
+`python -m pytest tests/test_acceptance.py -q -k 'recovery_can_recapture or recovery_uses_current or recovery_rechecks_prior_commit or recovery_requires_original or inherited_review_requires or recovery_seals or recovery_dispositions' --basetemp <S>/structural-final-targeted -p no:cacheprovider`
+passed **19 tests, 368 deselected** in 117.73 seconds. This reruns the corrected
+recapture assertion, adds the verified-clone positive, and exercises historical
+object refusal, exact approvals, reviewed dispositions and source sealing after
+the locator change. Across the full runs and corrected/new-case follow-ups,
+**386 distinct acceptance tests and 335 ordinary tests passed; 1 skipped**.
+This is aggregate evidence, not a claim that one final combined command ran green.
+Ruff on all seven touched Python files passed. The eight-control privacy check,
+ten-file scope check, unchanged-design comparison and `git diff --check` passed.
+Scratch logs, failing-first probes and isolated mutation copies are retained under
+`<S>` for the sweeper's re-check; no reviewer evidence was changed.

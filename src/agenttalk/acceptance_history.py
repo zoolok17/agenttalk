@@ -201,7 +201,7 @@ def evaluate(store, record, plan, snapshot, *, depth=0):
     partitions = {p["id"]: set(p["agents"]) for p in plan["partitions"]}
     if any(not set(p["agents"]).issubset(partitions.get(p["id"], set())) for p in old_plan["partitions"]):
         snapshot["holds"].append(("acceptance_lens_not_independent", "successor reduced declared runner set"))
-    for cid in parent["counters"]:
+    for cid in parent["counters"] if route["schema_version"] < 3 else ():
         current = record["counters"].get(cid)
         if not isinstance(current, dict) or current.get("decision") == close.COUNTER_PENDING:
             snapshot["holds"].append(("acceptance_residual_open", f"parent counter {cid} remains unresolved"))
@@ -255,29 +255,5 @@ def apply_coverage(store, record, plan, snapshot, parent, protected, reduction, 
 
 
 def related_obligations(store, record, plan, bundle, snapshot):
-    """A new procedural root cannot reset the protection owed to the same change."""
-    from agenttalk import acceptance_audit as audit
-    lineage_ids = {route["attempt_id"] for _, route, _ in audit.lineage(store, record)}
-    approvals = {a["prior_attempt_id"]: a for a in bundle["recovery_approvals"]}
-    artifacts = {a["id"]: a for a in bundle["artifacts"]}
-    consumed = set()
-    snapshot["related_obligations"] = []
-    for prior, route, prior_plan in audit.project_attempts(store, record):
-        if (route["attempt_id"] in lineage_ids or
-                audit._time(prior["opened_at"]) >= audit._time(record["opened_at"])):
-            continue
-        if not audit.same_change(record, plan, prior, prior_plan):
-            continue
-        protected = coverage.history(store, prior)
-        entry = approvals.get(route["attempt_id"])
-        reduction = entry["reduction"] if entry else None
-        digest = artifacts[entry["approval_artifact"]]["sha256"] if entry else None
-        if entry:
-            consumed.add(route["attempt_id"])
-        # Preserved source projections retain failed outcomes even when current
-        # coverage passes. Procedural lineage holds do not poison a recovery root.
-        snapshot["related_obligations"].append({"close_id": prior["close_id"],
-            "attempt_id": route["attempt_id"], "protected": protected})
-        apply_coverage(store, record, plan, snapshot, prior, protected, reduction, digest)
-    if set(approvals) != consumed:
-        A._fail("recovery approval references no prior related attempt", "acceptance_category_moved_unreviewed")
+    from agenttalk import acceptance_obligations
+    acceptance_obligations.inherit(store, record, plan, bundle=bundle, snapshot=snapshot)

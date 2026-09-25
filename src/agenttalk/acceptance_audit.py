@@ -43,7 +43,13 @@ def provenance(store, record, bundle=None):
         A._fail("cold gate attribution unavailable; repair .agenttalk/gates.json", "acceptance_cold_missing")
     commits = [e for e in record["events"] if e.get("event") == "acceptance:cold-commit"]
     cutoff = _time(commits[0]["at"]) if commits else None
-    for depth, (attempt, route, plan) in enumerate(lineage(store, record)):
+    history = list(lineage(store, record))
+    if record["acceptance_route"].get("obligations_hash"):
+        from agenttalk import acceptance_obligations
+        retained = acceptance_obligations.sources(store, record["acceptance_route"])
+        withheld.update(digest for digest, _, _, _ in retained)
+        history.extend((prior, route, plan) for _, prior, route, plan in retained)
+    for depth, (attempt, route, plan) in enumerate(history):
         # Passive lens/roster assignments and post-commit acknowledgments do not
         # establish pre-sweep participation. Actions are sourced from the ledger.
         lifecycle = {k: v for k, v in attempt.items() if k not in
@@ -157,6 +163,8 @@ def project_attempts(store, record):
     route = record["acceptance_route"]
     seen = set()
     for close_id in close.list_close_ids(store):
+        if close_id == record["close_id"]:
+            continue
         try:
             # Read identity before traversing policy/artifacts of another project.
             raw = A.decode(A._read(close.close_path(store, close_id)))

@@ -278,8 +278,11 @@ observations, artifact references and recovery approvals.
 Reconciliation adds `closeout:{sealed_manifest,report_digest,confidentiality}`.
 Its manifest seals the current plan, registry, bundle, every execution artifact,
 initial cold report/delivered resources and retained lineage records/artifacts.
-Its `report_digest` hashes canonical reconciliation JSON with `closeout` omitted;
-the sweep thus covers the revealed findings without hashing its own result.
+Its `report_digest` hashes canonical `{report,dispositions}` JSON: `report` is the
+reconciliation with `closeout` omitted; `dispositions` contains source-bound
+inherited counters and their referenced remediation items on the current close.
+The sweep covers revealed findings and reviewed resolutions without hashing its
+own result. Changing a disposition after reconciliation makes the seal stale.
 The implementation's `acceptance_hygiene.final_manifest` defines this evidence
 projection. The later acknowledgment/publication envelope is derived metadata,
 not an additional source artifact in this sealed set. All sealed retained bytes
@@ -289,3 +292,52 @@ verdict snapshot; a cold pass alone is insufficient.
 Comparison policy does not relax evidence integrity. An informational measurement
 may fail its assertion without gating, but its required artifact must exist, match
 its digest, parse as the closed raw-result schema and bind the right run/revision.
+
+## Resolve obligations inherited by a recovery root
+
+A new close ID provides a fresh procedural attempt. It retains substantive
+obligations from prior attempts of the same change, including counters and cold
+findings outside the measured assertions. Related means the same verified project
+with related revisions, the same whole-change patch ID, or overlapping targets.
+Different history/content with disjoint targets does not inherit obligations.
+
+At freeze, schema 3 retains the complete prior close records and binds their
+catalog through `acceptance_route.obligations_hash`. The catalog also follows
+earlier recovery catalogs and linked parents (at most 256 source records).
+Missing catalog/source bytes or required source artifacts HOLD. These bytes,
+including original failed results, join the final sealed manifest and are read
+again at publication. The original source commit/tree/root identity must still
+verify in the current verified repository, even after rebase or cherry-pick. The
+old checkout may be retired when its source objects remain available there.
+Deleting an old close file does not delete its retained
+obligations. Earlier development schema-3 routes without this field fail closed;
+there is no migration that discards their history.
+
+`close show` exposes inherited review counters with stable `ob-...` IDs and an
+`obligation_source` identifying the originating attempt and finding. Blocking cold
+observations without a resolved reconciliation become counters too. Decide them
+using the ordinary lead workflow, before staging the fresh cold review:
+
+```text
+agenttalk close counter decide --id RECOVERY --counter OB_ID --from LEAD --decision reject --reason "Reviewed evidence disproves this finding"
+agenttalk close counter decide --id RECOVERY --counter OB_ID --from LEAD --decision accept --reason "Confirmed defect" --rem-owner OWNER --rem-fix "Repair description" --rem-verification "Executed verification" --blocker --gate REPAIR_GATE
+```
+
+An accepted blocker still requires its named remediation gate to be green or
+validly waived. A fresh accept acknowledgment does not decide a counter. Existing
+non-acceptance review requirements and gate scope remain required; restore any
+reported signoff/risk requirements and regenerate the ordinary signoff route.
+Unknown saved substantive HOLD codes conservatively become review counters.
+Recorded hygiene failures therefore require reviewed resolution, even when the
+new execution's hygiene passes. Generic counter decisions cannot waive missing
+source bytes or the separate exact LD2 authorization for weaker gating coverage.
+
+This remains cooperative reviewed disposition, not authenticated proof that a
+lead's explanation is true. Source records are frozen as observed when the new
+attempt opens. If an earlier related attempt changes afterward, evaluation
+refuses the stale recovery catalog; create a fresh attempt to capture its new
+findings and decisions. As with a linked successor, preserve a terminal prior
+record: publish an unfinished prior attempt as HOLD before opening the recovery.
+A later retained terminal version supersedes the unfinished version for this
+prerequisite; both versions' evidence stays retained. Later-created attempts do not retroactively invalidate
+an earlier attempt's frozen history.

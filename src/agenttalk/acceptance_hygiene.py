@@ -1,6 +1,6 @@
 """Bound cooperative execution and close-out evidence; never an execution witness."""
 
-from agenttalk import acceptance as A
+from agenttalk import acceptance as A, close
 from agenttalk.acceptance_coverage import canonical
 
 
@@ -26,8 +26,12 @@ def final_manifest(store, route, reconciliation):
     initial = A.decode(A._retained(store, route["cold_commit_hash"]))
     report = {k: v for k, v in reconciliation.items() if k != "closeout"}
     digests = {a["sha256"] for a in bundle["artifacts"]}
+    for approval in bundle["recovery_approvals"]:
+        digests.update(approval["reduction"]["evidence"])
     digests.update(a["sha256"] for a in initial["delivery_manifest"])
     digests.update(route[k] for k in ("plan_hash", "registry_hash", "bundle_hash", "cold_commit_hash"))
+    from agenttalk import acceptance_obligations
+    digests.update(acceptance_obligations.evidence(store, route))
     # Parent/amendment records are part of the final evidence set as well.
     from agenttalk import acceptance_audit
     if route.get("parent_record_hash"):
@@ -41,7 +45,12 @@ def final_manifest(store, route, reconciliation):
             if old_route.get("cold_commit_hash"):
                 old_initial = A.decode(A._retained(store, old_route["cold_commit_hash"]))
                 digests.update(a["sha256"] for a in old_initial["delivery_manifest"])
-    return sorted(digests), A._hash(canonical(report))
+    current = close.load_close(store, bundle["close_id"])
+    counters = {cid: value for cid, value in current["counters"].items() if "obligation_source" in value}
+    remedies = {value.get("remediation_id") for value in counters.values()}
+    decisions = {"counters": counters, "remediation_items": {
+        rid: value for rid, value in current["remediation_items"].items() if rid in remedies}}
+    return sorted(digests), A._hash(canonical({"report": report, "dispositions": decisions}))
 
 
 def confidentiality(value):
@@ -52,7 +61,8 @@ def confidentiality(value):
     A._text(value["evidence"], "confidentiality sweep evidence")
 
 
-def evaluate(store, record, bundle, snapshot):
+def execution(store, bundle):
+    """Validate original execution evidence independently of the review envelope."""
     artifacts = {a["id"]: a for a in bundle["artifacts"]}
 
     def read(artifact_id, fields):
@@ -102,6 +112,11 @@ def evaluate(store, record, bundle, snapshot):
            ("retained_readable", "scratch_removed", "services_stopped", "ports_released")):
         A._fail("execution cleanup/readability evidence incomplete", "acceptance_record_missing")
     confidentiality(hygiene["confidentiality"])
+    return artifacts[bundle["hygiene"]]["sha256"]
+
+
+def evaluate(store, record, bundle, snapshot):
+    execution_hash = execution(store, bundle)
     route = record["acceptance_route"]
     reconciliation = A.decode(A._retained(store, route["cold_reconcile_hash"]))
     final = reconciliation["closeout"]
@@ -113,5 +128,5 @@ def evaluate(store, record, bundle, snapshot):
         A._retained(store, digest)
     confidentiality(final["confidentiality"])
     snapshot["hygiene_checked"] = True
-    snapshot["hygiene"] = {"execution": artifacts[bundle["hygiene"]]["sha256"], "sealed_manifest": manifest,
+    snapshot["hygiene"] = {"execution": execution_hash, "sealed_manifest": manifest,
                            "report_digest": report_digest}

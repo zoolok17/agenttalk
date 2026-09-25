@@ -2325,12 +2325,13 @@ def test_acceptance_ancestor_bundle_actor_without_ack_is_excluded(case_v3):
     case = case_v3
     assign_fresh_cold(case, "first-cold")
     assert open_attempt(case) == 0
-    complete_v3(case)
-    with close.close_transaction(case["store"], "attempt") as tx:
-        route = tx.record["acceptance_route"]
-        data = acceptance.decode(acceptance._retained(case["store"], route["bundle_hash"]))
+    def earlier_reproducer(data):
         data["reproductions"][0]["actor"] = "cold"
-        route["bundle_hash"] = acceptance._retain(case["store"], json.dumps(data).encode())
+        hygiene_bundle(case, data)
+    data = complete_v3(case, amend=earlier_reproducer)
+    with close.close_transaction(case["store"], "attempt") as tx:
+        tx.record["lens_acks"].pop("acceptance-repro-" + data["reproductions"][0]["id"])
+        tx.record["events"] = [event for event in tx.record["events"] if event.get("by") != "cold"]
         tx.commit()
     publish_hold(case)
     case["plan"]["cold_policy"]["reviewer"] = "cold"
@@ -2577,7 +2578,11 @@ def test_acceptance_informational_required_artifact_integrity_holds(case_v3, dam
 
 
 @pytest.mark.parametrize("rewrite", ["same-sha", "rebase", "squash", "different"])
-def test_acceptance_recovery_obligations_follow_change_table(case_v3, rewrite):
+@pytest.mark.parametrize("obligation", ["coverage", "counter", "cold", "missing", "corrupt",
+                                        "remediation", "hygiene", "gate", "final-review", "unknown",
+                                        "approval", "review-requirement", "routing", "dod", "isolation", "offline",
+                                        "unfinished-source"])
+def test_acceptance_recovery_obligations_follow_change_table(case_v3, rewrite, obligation):
     case = case_v3
     base = case["sha"]
     commits = []
@@ -2590,8 +2595,68 @@ def test_acceptance_recovery_obligations_follow_change_table(case_v3, rewrite):
     case["plan"]["cold_policy"]["change_base"] = base
     write_json(case["inputs"] / "plan.json", case["plan"])
     assert open_attempt(case) == 0
-    complete_v3(case, build_exit=1)
-    publish_hold(case)
+    if obligation == "cold":
+        assert cold_phase(case, "commit", change={"observations": [
+            {"id": "defect", "blocking": True, "evidence": "unresolved source defect"}]}) == 0
+        prior_bundle = bundle_v2(case)
+        assert attach(case) == 0
+        assert cold_phase(case, "reconcile", change={"findings": [
+            {"id": "defect", "disposition": "open", "evidence": "still broken"}]}) == 0
+        final_accepts(case, prior_bundle)
+    else:
+        def bad_cleanup(data):
+            if obligation == "hygiene":
+                artifact = next(a for a in data["artifacts"] if a["id"] == "hygiene")
+                path = case["inputs"] / artifact["path"]
+                value = json.loads(path.read_text())
+                value["scratch_removed"] = False
+                artifact["sha256"] = write_json(path, value)
+            if obligation == "offline":
+                from agenttalk import acceptance_hygiene
+                aid = data["runs"][0]["offline_proof"]
+                artifact = next(a for a in data["artifacts"] if a["id"] == aid)
+                path = case["inputs"] / artifact["path"]
+                value = json.loads(path.read_text())
+                value["egress_denied"] = False
+                artifact["sha256"] = write_json(path, value)
+                proof = next(a for a in data["artifacts"] if a["id"] == "hygiene")
+                path = case["inputs"] / proof["path"]
+                value = json.loads(path.read_text())
+                value.update(sealed_manifest=acceptance_hygiene.execution_manifest(data),
+                             bundle_digest=acceptance_hygiene.execution_digest(data))
+                proof["sha256"] = write_json(path, value)
+        prior_bundle = complete_v3(case, build_exit=1 if obligation in {"coverage", "missing", "corrupt"} else 0,
+                                   amend=bad_cleanup)
+    if obligation in {"counter", "remediation", "final-review"}:
+        lens, actor = (("acceptance-cold", "cold") if obligation == "final-review"
+                       else ("acceptance-run-bar", "runner-a"))
+        assert command(case, "ack", "--id", "attempt", "--lens", lens, "--from", actor,
+                       "--status", "counter", "--counter", "unfixed", "--finding", "unresolved defect") == 0
+    if obligation == "remediation":
+        assert command(case, "counter", "decide", "--id", "attempt", "--counter", "unfixed", "--from", "lead",
+                       "--decision", "accept", "--reason", "confirmed", "--rem-owner", "lead", "--rem-fix", "repair",
+                       "--rem-verification", "rerun", "--blocker", "--gate", "repair-proof") == 0
+    if obligation == "gate":
+        from agenttalk import gates
+        gates.set_gate(case["store"].root, name="repair-proof", status="red", severity="blocker",
+                       scope="milestone", actor="lead", evidence_source="manual_review")
+    if obligation == "review-requirement":
+        with close.close_transaction(case["store"], "attempt") as tx:
+            tx.record["required_lenses"].append(close.validate_lens_spec(
+                {"id": "acceptance-extra-review", "allowed_agents": ["runner-a"], "required": True}))
+            tx.commit()
+    if obligation != "unfinished-source":
+        publish_hold(case)
+    if obligation in {"unknown", "dod", "isolation", "routing"}:
+        # Exercise recorded ordinary obligation representations independently
+        # of the existing signoff/DoD/isolation producer suites.
+        with close.close_transaction(case["store"], "attempt") as tx:
+            code = {"unknown": "future_blocker", "dod": "missing_assurance_evidence",
+                    "isolation": "worktree_isolation_unverified", "routing": "missing_required_signoff"}[obligation]
+            tx.record["final"]["close_result"]["holds"].append({"code": code, "detail": "unresolved obligation"})
+            if obligation == "routing":
+                tx.record["risk_inventory"] = [{"risk_class": "quality", "source": "review", "affected_paths": []}]
+            tx.commit()
     if rewrite != "same-sha":
         git(case["project"], "branch", "original", case["sha"])
         git(case["project"], "checkout", "--detach", base)
@@ -2612,17 +2677,37 @@ def test_acceptance_recovery_obligations_follow_change_table(case_v3, rewrite):
         case["plan"]["cold_policy"]["change_base"] = new_base
     # Disjoint labels must not hide a same-content obligation; genuinely
     # different history/content also needs disjoint targets to be independent.
-    for row in case["plan"]["rows"]:
-        row["id"] += "-new"
-        row["artifact"] += "-new"
-    case["plan"]["rows"][0]["expected"] = 1
+    if obligation == "coverage" or rewrite == "different":
+        for row in case["plan"]["rows"]:
+            row["id"] += "-new"
+            row["artifact"] += "-new"
+    if obligation in {"coverage", "approval"}:
+        case["plan"]["rows"][0]["expected"] = 1
     assign_fresh_cold(case, "new-reviewer")
+    if rewrite == "different" and obligation == "gate":
+        from agenttalk import gates
+        # Remove the shared live gate so this case isolates inheritance only.
+        state_path = case["store"].dir / "gates.json"
+        state = json.loads(state_path.read_text())
+        state["gates"].pop("repair-proof")
+        write_json(state_path, state)
     assert open_attempt(case, "--id", "recovery") == 0
-    complete_v3(case, close_id="recovery", build_exit=1)
+    complete_v3(case, close_id="recovery", build_exit=1 if obligation in {"coverage", "approval"} else 0)
+    if obligation in {"missing", "corrupt"}:
+        artifact = next(a for a in prior_bundle["artifacts"] if a["id"] == "build")
+        path = case["store"].dir / "acceptance" / "sha256" / artifact["sha256"]
+        if obligation == "missing":
+            path.unlink()
+        else:
+            path.write_bytes(b"damaged prior evidence")
     result = acceptance.resolve(case["store"], close.load_close(case["store"], "recovery"))
     blocked = rewrite != "different"
-    assert ("acceptance_category_moved_unreviewed" in {c for c, _ in result["holds"]}) is blocked
-    if blocked:
+    code = ("acceptance_category_moved_unreviewed" if obligation in {"coverage", "approval"} else
+            "acceptance_record_missing" if obligation in {"missing", "corrupt"} else
+            "acceptance_plan_stale" if obligation == "unfinished-source" else "acceptance_residual_open")
+    if obligation not in {"remediation", "review-requirement"}:
+        assert (code in {c for c, _ in result["holds"]}) is blocked
+    if blocked and obligation == "coverage":
         sources = result["related_obligations"][0]["protected"].values()
         assert any(s["outcome"].get("passed") is False for p in sources for s in p["sources"])
     assert command(case, "publish", "--id", "recovery", "--from", "lead", "--verdict", "go") == (3 if blocked else 0)
@@ -2676,6 +2761,220 @@ def test_acceptance_recovery_requires_original_pass_or_exact_operator_approval(c
         assert result["outcomes"][0]["disposition"] == "policy-amended"
     assert command(case, "publish", "--id", "recovery", "--from", "lead", "--verdict", "go") == (
         0 if resolution in {"passing", "approved"} else 3)
+
+
+@pytest.mark.parametrize("kind", ["counter", "cold"])
+@pytest.mark.parametrize("linked", [False, True])
+def test_acceptance_inherited_review_requires_bound_disposition(case_v3, kind, linked):
+    case = case_v3
+    assert open_attempt(case) == 0
+    if kind == "counter":
+        complete_v3(case)
+        assert command(case, "ack", "--id", "attempt", "--lens", "acceptance-run-bar", "--from", "runner-a",
+                       "--status", "counter", "--counter", "unfixed", "--finding", "known defect") == 0
+    else:
+        assert cold_phase(case, "commit", change={"observations": [
+            {"id": "defect", "blocking": True, "evidence": "known defect"}]}) == 0
+        data = bundle_v2(case)
+        assert attach(case) == 0
+        assert cold_phase(case, "reconcile", change={"findings": [
+            {"id": "defect", "disposition": "open", "evidence": "not repaired"}]}) == 0
+        final_accepts(case, data)
+    publish_hold(case)
+    original = close.load_close(case["store"], "attempt")
+    assign_fresh_cold(case, "fresh")
+    assert (successor(case) if linked else open_attempt(case, "--id", "next")) == 0
+    current = close.load_close(case["store"], "next")
+    cid = next(k for k, v in current["counters"].items() if v.get("obligation_source", {}).get("kind") == kind)
+    # Decide before the cold commit, so the actor and all claims are attributed.
+    assert command(case, "counter", "decide", "--id", "next", "--counter", cid, "--from", "lead",
+                   "--decision", "reject", "--reason", "reviewed reproduction disproves the finding") == 0
+    complete_v3(case, close_id="next")
+    result = acceptance.resolve(case["store"], close.load_close(case["store"], "next"))
+    assert result["holds"] == []
+    assert command(case, "publish", "--id", "next", "--from", "lead", "--verdict", "go") == 0
+    assert close.load_close(case["store"], "attempt") == original
+
+
+@pytest.mark.parametrize("damage", [None, "raw", "source", "catalog"])
+def test_acceptance_recovery_seals_and_rechecks_source_closure(case_v3, damage):
+    case = case_v3
+    assert open_attempt(case) == 0
+    prior_bundle = complete_v3(case, build_exit=1)
+    publish_hold(case)
+    original = close.load_close(case["store"], "attempt")
+    assign_fresh_cold(case, "fresh")
+    assert open_attempt(case, "--id", "next") == 0
+    complete_v3(case, close_id="next")
+    current = close.load_close(case["store"], "next")
+    result = acceptance.resolve(case["store"], current)
+    assert result["holds"] == []
+    manifest = result["hygiene"]["sealed_manifest"]
+    raw = next(a["sha256"] for a in prior_bundle["artifacts"] if a["id"] == "build")
+    source = result["related_obligations"][0]["record_hash"]
+    catalog = current["acceptance_route"]["obligations_hash"]
+    assert {raw, source, catalog, original["acceptance_route"]["bundle_hash"]}.issubset(manifest)
+    assert acceptance.decode(acceptance._retained(case["store"], source)) == original
+    if damage:
+        digest = {"raw": raw, "source": source, "catalog": catalog}[damage]
+        (case["store"].dir / "acceptance" / "sha256" / digest).unlink()
+    assert command(case, "publish", "--id", "next", "--from", "lead", "--verdict", "go") == (3 if damage else 0)
+
+
+def test_acceptance_recovery_lost_raw_before_open_refuses_closeout(case_v3):
+    from agenttalk import acceptance_hygiene
+    case = case_v3
+    assert open_attempt(case) == 0
+    prior_bundle = complete_v3(case, build_exit=1)
+    publish_hold(case)
+    digest = next(a["sha256"] for a in prior_bundle["artifacts"] if a["id"] == "build")
+    (case["store"].dir / "acceptance" / "sha256" / digest).unlink()
+    assign_fresh_cold(case, "fresh")
+    assert open_attempt(case, "--id", "next") == 0
+    assert cold_phase(case, "commit", "next", actor="fresh") == 0
+    data = bundle_v2(case)
+    current = close.load_close(case["store"], "next")
+    data.update(close_id="next", **{k: current["acceptance_route"][k] for k in
+                                   ("attempt_id", "instance_id", "plan_hash", "registry_hash")})
+    hygiene_bundle(case, data)
+    write_json(case["inputs"] / "bundle.json", data)
+    assert command(case, "acceptance", "attach", "--id", "next", "--from", "lead",
+                   "--file", str(case["inputs"] / "bundle.json")) == 0
+    current = close.load_close(case["store"], "next")
+    with pytest.raises(acceptance.AcceptanceError, match=digest):
+        acceptance_hygiene.final_manifest(case["store"], current["acceptance_route"], {})
+    result = acceptance.resolve(case["store"], current)
+    assert any(code == "acceptance_record_missing" and digest in detail for code, detail in result["holds"])
+    assert command(case, "publish", "--id", "next", "--from", "lead", "--verdict", "go") == 3
+
+
+@pytest.mark.parametrize("tamper", ["no-event", "after-seal", "source-deleted"])
+def test_acceptance_recovery_dispositions_are_bound_to_sources_and_seal(case_v3, tamper):
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    assert command(case, "ack", "--id", "attempt", "--lens", "acceptance-run-bar", "--from", "runner-a",
+                   "--status", "counter", "--counter", "unfixed", "--finding", "known defect") == 0
+    publish_hold(case)
+    assign_fresh_cold(case, "fresh")
+    assert open_attempt(case, "--id", "next") == 0
+    cid = next(iter(close.load_close(case["store"], "next")["counters"]))
+    if tamper == "no-event":
+        with close.close_transaction(case["store"], "next") as tx:
+            tx.record["counters"][cid].update(decision="rejected", decided_by="lead",
+                decided_at=tx.record["opened_at"], decision_reason="unrecorded decision")
+            tx.commit()
+    complete_v3(case, close_id="next")
+    if tamper == "source-deleted":
+        # The source file's removal cannot erase the captured defect.
+        close.close_path(case["store"], "attempt").unlink()
+    if tamper == "after-seal":
+        assert command(case, "counter", "decide", "--id", "next", "--counter", cid, "--from", "lead",
+                       "--decision", "reject", "--reason", "late disposition") == 0
+    result = acceptance.resolve(case["store"], close.load_close(case["store"], "next"))
+    assert ("acceptance_row_unbound" if tamper == "after-seal" else "acceptance_residual_open") in {
+        code for code, _ in result["holds"]}
+    assert command(case, "publish", "--id", "next", "--from", "lead", "--verdict", "go") == 3
+
+
+def test_acceptance_recovery_refuses_new_findings_on_an_earlier_attempt(case_v3):
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    assign_fresh_cold(case, "fresh")
+    assert open_attempt(case, "--id", "next") == 0
+    complete_v3(case, close_id="next")
+    assert command(case, "ack", "--id", "attempt", "--lens", "acceptance-run-bar", "--from", "runner-a",
+                   "--status", "counter", "--counter", "late-finding", "--finding", "newly recorded defect") == 0
+    result = acceptance.resolve(case["store"], close.load_close(case["store"], "next"))
+    assert "acceptance_plan_stale" in {code for code, _ in result["holds"]}
+    assert command(case, "publish", "--id", "next", "--from", "lead", "--verdict", "go") == 3
+
+
+def test_acceptance_recovery_rechecks_prior_commit_objects(case_v3):
+    case = case_v3
+    old = case["sha"]
+    base = case["plan"]["cold_policy"]["change_base"]
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    publish_hold(case)
+    git(case["project"], "checkout", "--detach", base)
+    (case["project"] / "base-update.txt").write_text("different base\n", encoding="utf-8")
+    git(case["project"], "add", "base-update.txt")
+    git(case["project"], "commit", "-qm", "base update")
+    case["plan"]["cold_policy"]["change_base"] = git(case["project"], "rev-parse", "HEAD")
+    git(case["project"], "cherry-pick", old)
+    case["sha"] = git(case["project"], "rev-parse", "HEAD")
+    assign_fresh_cold(case, "fresh")
+    assert open_attempt(case, "--id", "next") == 0
+    complete_v3(case, close_id="next")
+    # This commit is not in the new HEAD's ancestry: checking only current HEAD
+    # would miss its loss. Git creates read-only loose objects on Windows.
+    obj = case["project"] / ".git" / "objects" / old[:2] / old[2:]
+    obj.chmod(0o600)
+    obj.unlink()
+    result = acceptance.resolve(case["store"], close.load_close(case["store"], "next"))
+    assert "acceptance_project_unverified" in {code for code, _ in result["holds"]}
+    assert command(case, "publish", "--id", "next", "--from", "lead", "--verdict", "go") == 3
+
+
+def test_acceptance_captured_source_record_is_withheld(case_v3):
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    publish_hold(case)
+    assign_fresh_cold(case, "fresh")
+    assert open_attempt(case, "--id", "next") == 0
+    route = close.load_close(case["store"], "next")["acceptance_route"]
+    digest = acceptance.decode(acceptance._retained(case["store"], route["obligations_hash"]))[0]
+    (case["inputs"] / "source-record.json").write_bytes(acceptance._retained(case["store"], digest))
+
+    def leak(report):
+        report["delivery_manifest"].append({"kind": "safety", "path": "source-record.json", "sha256": digest})
+
+    assert cold_phase(case, "commit", "next", actor="fresh", change=leak) == 2
+
+
+def test_acceptance_recovery_can_recapture_completed_source_history(case_v3):
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    assign_fresh_cold(case, "fresh")
+    assert open_attempt(case, "--id", "next") == 0
+    complete_v3(case, close_id="next")
+    publish_hold(case)
+    assert command(case, "publish", "--id", "next", "--from", "lead", "--verdict", "hold",
+                   "--reason", "recapture completed source history") == 3
+    assert close.load_close(case["store"], "next")["status"] == close.PUBLISHED
+    assign_fresh_cold(case, "fresh-again")
+    assert open_attempt(case, "--id", "recovery") == 0
+    complete_v3(case, close_id="recovery")
+    assert command(case, "publish", "--id", "recovery", "--from", "lead", "--verdict", "go") == 0
+
+
+def test_acceptance_recovery_uses_current_verified_repository(case_v3, monkeypatch):
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case, build_exit=1)
+    publish_hold(case)
+    old = close.load_close(case["store"], "attempt")["acceptance_route"]["project"]["locator"]
+    current = case["project"].parent / "current-project"
+    git(case["project"], "clone", "-q", str(case["project"]), str(current))
+    case["project"] = current
+    assign_fresh_cold(case, "fresh")
+    assert open_attempt(case, "--id", "next") == 0
+    complete_v3(case, close_id="next")
+    original_verify = acceptance.verify_project
+
+    def verify(repo, revision, **kwargs):
+        if str(repo) == old:
+            raise acceptance.AcceptanceError("acceptance_project_unverified", "old checkout retired")
+        return original_verify(repo, revision, **kwargs)
+
+    monkeypatch.setattr(acceptance, "verify_project", verify)
+    result = acceptance.resolve(case["store"], close.load_close(case["store"], "next"))
+    assert result["holds"] == []
+    assert command(case, "publish", "--id", "next", "--from", "lead", "--verdict", "go") == 0
 
 
 def test_acceptance_ld3_reproducer_can_never_be_final_cold_even_after_commit(case_v3):

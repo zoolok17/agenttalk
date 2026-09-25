@@ -357,9 +357,12 @@ def freeze(store, close_id, prepared, at):
             route.update(schema_version=plan["schema_version"], parent_record_hash=prepared.get("parent_record_hash"),
                          amendment_hash=prepared.get("amendment_hash"))
         if plan["schema_version"] == 3:
-            route.update(cold_commit_hash=None, cold_reconcile_hash=None)
+            route.update(cold_commit_hash=None, cold_reconcile_hash=None, obligations_hash=None)
         record["required_lenses"] = partition_lenses(plan, record["required_lenses"])
         record["acceptance_route"] = route
+        if plan["schema_version"] == 3:
+            from agenttalk import acceptance_obligations
+            acceptance_obligations.inherit(store, record, plan, capture=True)
         transaction.commit()
     return record
 
@@ -370,7 +373,8 @@ def _route(record):
         _fail("acceptance route is absent or pending")
     extra = " parent_record_hash amendment_hash" if route.get("schema_version") in (2, 3) else ""
     if route.get("schema_version") == 3:
-        extra += " cold_commit_hash cold_reconcile_hash"
+        extra += " cold_commit_hash cold_reconcile_hash obligations_hash"
+        _digest(route.get("obligations_hash"))
         for key in ("cold_commit_hash", "cold_reconcile_hash"):
             if route.get(key) is not None:
                 _digest(route[key])
@@ -555,6 +559,15 @@ def _compare(row, raw):
     return json.dumps(observed, sort_keys=True) == json.dumps(expected, sort_keys=True)
 
 
+def validate_raw(raw, revision, run_id):
+    _object(raw, "schema_version run_id revision values", "raw result")
+    _version(raw["schema_version"])
+    if raw["revision"] != revision or raw["run_id"] != run_id:
+        _fail("raw result belongs to another run/revision", "acceptance_row_unbound")
+    if not isinstance(raw["values"], dict):
+        _fail("raw result values must be an object")
+
+
 def resolve(store, record, *, live=False):
     """Read and verify immutable inputs; return a snapshot for the pure DoD fold."""
     snapshot = {"holds": [], "outcomes": []}
@@ -599,12 +612,7 @@ def resolve(store, record, *, live=False):
                 raw = raw_results[row["artifact"]]
                 if isinstance(raw, Exception):
                     raise raw
-                _object(raw, "schema_version run_id revision values", "raw result")
-                _version(raw["schema_version"])
-                if raw["revision"] != record["revision"] or raw["run_id"] != rows[row["id"]]["run_id"]:
-                    _fail("raw result belongs to another run/revision", "acceptance_row_unbound")
-                if not isinstance(raw["values"], dict):
-                    _fail("raw result values must be an object")
+                validate_raw(raw, record["revision"], rows[row["id"]]["run_id"])
                 comparing = True
                 outcome["passed"] = _compare(row, raw)
             except (AcceptanceError, OSError) as exc:
@@ -658,7 +666,7 @@ def ack_binding(record):
     route = record.get("acceptance_route") or {}
     keys = ["instance_id", "attempt_id", "revision", "plan_hash", "registry_hash", "bundle_hash"]
     if route.get("schema_version") == 3:
-        keys.extend(["cold_commit_hash", "cold_reconcile_hash"])
+        keys.extend(["cold_commit_hash", "cold_reconcile_hash", "obligations_hash"])
     return {key: route.get(key) for key in keys}
 
 

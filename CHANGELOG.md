@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Acceptance recovery now retains complete source records and inherits pending
+  review counters, blocking cold findings, remediation gates and review
+  requirements through one obligation fold. Required source bytes are revalidated
+  and included in final sealed evidence; unknown substantive holds require a
+  reviewed disposition instead of disappearing at a new root.
+
 - Acceptance recovery roots retain related-change gating obligations and original
   failures; weaker coverage requires the same exact reserved-operator amendment.
   Schema-3 GO now requires bound environment, offline enforcement, cleanup and
