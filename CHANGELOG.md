@@ -89,7 +89,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [implementation record](docs/STEP-ACCEPTANCE-INC1.md) for compatibility,
   advisory authority, storage and targeted verification details.
 
+### Changed
+
+- **OVH/Qwen gateway: reasoning is no longer re-sent as input.** The
+  LiteLLM config no longer sets `merge_reasoning_content_in_choices`:
+  merged reasoning is ordinary assistant text to the Claude CLI, which
+  re-sends it on every later call of the tool loop (on the desktop ledger,
+  input growth between consecutive calls tracks the previous call's output
+  with slope 0.96, and output carried forward is up to 57% of all input
+  tokens). LiteLLM now emits typed `thinking` blocks and the front strips
+  them (and `thinking_delta` / `signature_delta`, even when misplaced)
+  before the CLI sees them, renumbering the remaining blocks; usage,
+  tool calls and text pass through unchanged, and the ledger still
+  settles on the provider's reasoning-inclusive counts. While reasoning
+  is dropped the front emits Anthropic `ping` events so the CLI's stream
+  idle watchdogs never see dead air. Non-streaming replies are stripped
+  too. The strip fails open at every level (any internal error forwards
+  the reply raw and settles on the unfiltered usage; a last-resort handler
+  marks the attempt `uncertain`), so it can never leave an attempt
+  `reserved` and block the route. The front records blocks and characters
+  removed per attempt, plus `empty`, `stop_reason`, `misplaced` and
+  `failed`, in `.agenttalk/gateway/reasoning-stripped.jsonl` (no content).
+
+### Added
+
+- **`gateway init` / `gateway reconfigure --reasoning-param NAME=VALUE`
+  (repeatable) and `reconfigure --no-reasoning-param`.** A fixed,
+  validated reasoning request parameter for the route, rendered under the
+  deployment's `extra_body` (LiteLLM passes that through verbatim; a
+  top-level key is silently dropped by `drop_params`), recorded in the
+  install manifest and shown by `gateway status`. Default: none, and the
+  rendered `extra_body` is exactly `store: false`. The grammar is closed
+  (names such as `model`, `messages`, `store`, `max_tokens` are refused).
+  Not part of the price policy: no re-init and no new canary.
+
+### Upgrade
+
+- An existing install keeps its old config (with the merge fold) until
+  `gateway stop`, `gateway reconfigure`, `gateway start`; the front's
+  stripping is a no-op until then. No ledger backup, re-init or canary
+  is needed, and the task interpreter is unchanged. See
+  `docs/STEP-QWEN-REASONING.md` for the OVH parameter probe and the
+  before/after measurement protocol.
+
 ### Docs
+
+- `docs/STEP-QWEN-REASONING.md`: zero-spend baseline from the desktop
+  ledger, what the Claude CLI 2.1.282 sends (it sends `output_config.effort`
+  high even with thinking disabled) and what LiteLLM 1.91.3 drops (all
+  client effort and thinking fields; only `extra_body` reaches OVH), the
+  change, operator steps and the measurement protocol.
 
 - **The 0.91.0 -> 0.91.1 gateway upgrade path gained three steps found in
   the field (Windows host).** `docs/STEP-ENVELOPE-SERVICE-READERS.md`'s

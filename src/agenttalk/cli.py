@@ -9534,6 +9534,7 @@ def cmd_gateway(args: argparse.Namespace) -> int:
     """Manage the loopback-only watched OVH/Qwen trial gateway."""
     from agenttalk import ovh_gateway as gateway
     from agenttalk import ovh_gateway_service as service
+    from agenttalk.ovh_gateway_reasoning import parse_reasoning_params
 
     store = _get_store(args)
     action = args.gateway_action
@@ -9547,6 +9548,7 @@ def cmd_gateway(args: argparse.Namespace) -> int:
                 trial_cutoff_micro_eur=args.cutoff_micro_eur,
                 soft_stop_micro_eur=args.soft_stop_micro_eur,
                 external_ceiling_micro_eur=args.ceiling_micro_eur,
+                reasoning_params=parse_reasoning_params(args.reasoning_param),
             )
         elif action == "task-install":
             service.load_install_manifest(store.root)
@@ -9556,7 +9558,15 @@ def cmd_gateway(args: argparse.Namespace) -> int:
         elif action == "stop":
             result = service.stop_task(store.root, timeout_seconds=args.timeout)
         elif action == "reconfigure":
-            result = service.reconfigure_endpoint(store.root)
+            result = service.reconfigure_endpoint(
+                store.root,
+                reasoning_params=(
+                    parse_reasoning_params(args.reasoning_param)
+                    if args.reasoning_param
+                    else None
+                ),
+                clear_reasoning_params=bool(args.no_reasoning_param),
+            )
         elif action == "runtime-rebind":
             result = service.rebind_runtime(
                 store.root,
@@ -16528,6 +16538,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=_gateway_defaults.EXTERNAL_CEILING_MICRO_EUR,
         help="Hard external account ceiling in EUR; must be at or above --cutoff-eur.",
     )
+    gw_init.add_argument(
+        "--reasoning-param",
+        dest="reasoning_param",
+        action="append",
+        metavar="NAME=VALUE",
+        help=(
+            "Fixed reasoning request parameter for the route, repeatable "
+            "(for example reasoning_effort=low or chat_template_kwargs.enable_thinking=false). "
+            "Default: none."
+        ),
+    )
     gw_init.set_defaults(func=cmd_gateway)
     gw_task = gwsub.add_parser("task-install", help="Install or verify the project task.")
     gw_task.set_defaults(func=cmd_gateway)
@@ -16544,6 +16565,20 @@ def build_parser() -> argparse.ArgumentParser:
             "Re-render config to the pinned endpoint + rebind the manifest "
             "(ledger/token-preserving; the gateway must be stopped first)."
         ),
+    )
+    gw_reconfigure_reasoning = gw_reconfigure.add_mutually_exclusive_group()
+    gw_reconfigure_reasoning.add_argument(
+        "--reasoning-param",
+        dest="reasoning_param",
+        action="append",
+        metavar="NAME=VALUE",
+        help="Replace the route's fixed reasoning request parameters (repeatable).",
+    )
+    gw_reconfigure_reasoning.add_argument(
+        "--no-reasoning-param",
+        dest="no_reasoning_param",
+        action="store_true",
+        help="Remove all fixed reasoning request parameters.",
     )
     gw_reconfigure.set_defaults(func=cmd_gateway)
     gw_runtime_rebind = gwsub.add_parser(
