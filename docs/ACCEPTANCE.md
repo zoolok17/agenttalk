@@ -356,8 +356,23 @@ publication owns the lock. If that writer completes first, publication sees its
 obligations and refuses a stale candidate. If publication completes first, a
 later writer cannot retroactively change its decision. This also serializes
 ordinary close writes; it avoids a classification gap when acceptance is first
-attached. Gate, knowledge and signoff stores retain their separate locking rules
-(issues 66/31); external bus stores still require cooperative disclosure.
+attached. Gate writes, knowledge publish/curation/retraction, and configuration
+transactions also take this outer lock. Signoff apply/override/ack writes use
+close transactions. Lock order is **acceptance writer → close-ID (when needed) →
+configuration**; starting a close transaction while holding the configuration
+lock is refused. A gate writer that times out returns HOLD/conflict (exit 3).
+External bus stores still require cooperative disclosure.
+
+Gate set (including status, severity, scope, required/optional and evidence
+changes), waive (including expiry changes), and direct gate-state replacement
+all participate. There is no separate clear/delete/expire command: clearing a
+gate is a status/requirement update or explicit state replacement; waiver expiry
+is computed at decision time without writing state. Publication does not promise
+that evidence will remain fresh afterward. The same boundary protects live
+configuration-backed signoff authority and supported config init/reset writes.
+Static signoff, DoD and domain policy files have no mutation command; edit them
+only while publication is quiescent. Direct filesystem edits do not acquire
+runtime locks.
 
 Audit enumeration is strict. Unreadable, missing or partly enumerated local
 history produces `acceptance_audit_unavailable`, even when individual known files

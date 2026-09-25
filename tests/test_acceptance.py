@@ -3227,6 +3227,59 @@ sys.exit(cli.main(['--root', p['root'], 'close', 'open', '--id', 'late',
     assert open_attempt(case, "--id", "late") == 0
 
 
+@pytest.mark.parametrize("ordering", ["writer-first", "publisher-first"])
+def test_acceptance_inherited_gate_writer_is_serialized(case_v3, monkeypatch, ordering):
+    import os
+    import sys
+    from agenttalk import gates
+
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    gates.set_gate(case["store"].root, name="repair-proof", status="red", severity="blocker",
+                   scope="milestone", actor="lead", evidence_source="manual_review")
+    publish_hold(case)
+    assert "repair-proof" in close.load_close(case["store"], "attempt")["final"]["blockers"]
+    gates.set_gate(case["store"].root, name="repair-proof", status="green", severity="blocker",
+                   scope="milestone", actor="lead", evidence_source="automation_ci", evidence=["CI proof"])
+    assign_fresh_cold(case, "fresh-reviewer")
+    assert open_attempt(case, "--id", "recovery") == 0
+    complete_v3(case, close_id="recovery")
+    code = '''import sys
+from agenttalk import cli
+sys.exit(cli.main(['--root', sys.argv[1], 'gate', 'set', '--name', 'repair-proof',
+    '--status', 'red', '--severity', 'blocker', '--scope', 'milestone', '--from', 'lead',
+    '--evidence-source', 'manual_review', '--reason', 'Repair failed']))
+'''
+
+    def writer():
+        return subprocess.run([sys.executable, "-c", code, str(case["store"].root)], capture_output=True,
+                              text=True, timeout=30, env=dict(os.environ,
+                              AGENTTALK_ROOT=str(case["store"].root), AGENTTALK_SELF="lead"))
+
+    original = close.CloseTransaction.commit
+    observed = []
+
+    def commit(tx):
+        if tx.close_id == "recovery" and (tx.record.get("final") or {}).get("verdict") == "GO":
+            child = writer()
+            assert child.returncode == 3, child.stdout + child.stderr
+            assert gates.check_gates(case["store"].root, scope="milestone")["verdict"] == "GO"
+            observed.append(True)
+        return original(tx)
+
+    if ordering == "writer-first":
+        assert writer().returncode == 0
+        assert command(case, "publish", "--id", "recovery", "--from", "lead", "--verdict", "go") == 3
+        assert close.load_close(case["store"], "recovery")["final"] is None
+    else:
+        monkeypatch.setattr(close.CloseTransaction, "commit", commit)
+        assert command(case, "publish", "--id", "recovery", "--from", "lead", "--verdict", "go") == 0
+        assert observed == [True]
+        assert writer().returncode == 0
+    assert gates.check_gates(case["store"].root, scope="milestone")["verdict"] == "HOLD"
+
+
 @pytest.mark.parametrize("fault", ["denied", "missing", "partial"])
 def test_acceptance_audit_enumeration_unavailable_is_named_hold(case_v3, monkeypatch, fault):
     import os

@@ -34,6 +34,7 @@ import uuid
 import warnings
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 from pathlib import Path
 
 from agenttalk import health as _health
@@ -51,6 +52,17 @@ else:
 logger = logging.getLogger(__name__)
 
 DIRNAME = ".agenttalk"
+
+
+def _acceptance_mutation(method):
+    """Serialize administrative/direct writers that do not use config.lock."""
+    @wraps(method)
+    def write(self, *args, **kwargs):
+        from agenttalk import close
+
+        with close._acceptance_writer_lock(self, timeout=10.0):
+            return method(self, *args, **kwargs)
+    return write
 
 RESTART_REQUEST_READ_STATUS_KEY = "_agenttalk_restart_request_status"
 RESTART_REQUEST_UNUSABLE = "unusable"
@@ -1023,6 +1035,14 @@ class Store:
         return self.config_path.exists()
 
     def init(self, agents: list[str], *, force: bool = False) -> dict:
+        # Initialization is also a supported new-project operation. Create only
+        # its root before acquiring the writer marker; all state stays locked.
+        validate_agent_roster(agents)
+        self.root.mkdir(parents=True, exist_ok=True)
+        return self._initialize(agents, force=force)
+
+    @_acceptance_mutation
+    def _initialize(self, agents: list[str], *, force: bool = False) -> dict:
         validate_agent_roster(agents)
         if self.initialized() and not force:
             return self.load_config()
@@ -1152,6 +1172,7 @@ class Store:
                 _atomic_write_text(cur, "")
         return cfg
 
+    @_acceptance_mutation
     def reset(self, *, archive: bool = False) -> tuple[dict, Path | None]:
         """Clear active bus state (messages, cursors, heartbeats);
         start a new session.
@@ -1357,6 +1378,7 @@ class Store:
 
     # ------------------------------------------------------- team / roster
 
+    @_acceptance_mutation
     def _write_config(self, cfg: dict) -> None:
         _atomic_write_text(self.config_path, json.dumps(cfg, indent=2))
 
@@ -1648,18 +1670,25 @@ class Store:
 
     @contextlib.contextmanager
     def _config_lock(self, *, timeout: float = 10.0, poll: float = 0.05):
-        """Hold a versioned exclusive config read-modify-write transaction."""
+        """Hold acceptance-writer then config locks for a versioned transaction.
+
+        Config writers include gates, knowledge, roster and domain/refset changes
+        consumed by acceptance/DoD/signoffs. Joining at this boundary prevents a
+        new config writer from silently bypassing acceptance publication.
+        """
+        from agenttalk import close
+
         self._ensure_plain_lock_directory(
             self.dir,
             what="AgentTalk runtime lock directory",
         )
         lock = self.dir / "config.lock"
-        with self._exclusive_lock(
+        with close._acceptance_writer_lock(self, timeout=timeout), self._exclusive_lock(
             lock,
             timeout=timeout,
             poll=poll,
             what="config lock (another agent may be mid roster-admin)",
-        ):
+        ), close._acceptance_config_scope(self):
             yield self._advance_config_lock_generation(
                 lock,
                 timeout=timeout,

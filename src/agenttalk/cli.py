@@ -2509,6 +2509,14 @@ def cmd_comprehension(args: argparse.Namespace) -> int:
 
 
 def cmd_gate(args: argparse.Namespace) -> int:
+    try:
+        return _cmd_gate(args)
+    except TimeoutError as exc:
+        sys.stderr.write(f"agenttalk gate: HOLD - concurrent obligation write conflict: {exc}. Retry.\n")
+        return 3
+
+
+def _cmd_gate(args: argparse.Namespace) -> int:
     """Manage lightweight assurance gates."""
     store = _get_store(args)
     action = getattr(args, "gate_cmd", None)
@@ -3820,24 +3828,12 @@ def cmd_close(args: argparse.Namespace) -> int:
         verdict = close_mod.VERDICT_GO if args.verdict == "go" else close_mod.VERDICT_HOLD
         barrier_epoch = None
         try:
-            # The store-wide close-writer lock, then the per-close lock, span reload,
-            # the complete acceptance source audit through durable commit. Another
-            # close cannot create or change an obligation inside that interval.
-            # The per-close lock also spans all impure evaluations, verdict derivation,
-            # persistence, and the optional barrier stamp - and evidence is resolved immediately
-            # before the write (nothing but in-memory record mutation sits between the resolve at
-            # `_build_dod_eval`/`compute_verdict` and `transaction.commit`), keeping the exposure
-            # minimal. It is NOT airtight (#66): the per-close lock does NOT exclude EVIDENCE
-            # mutators (`gate set`/`gate waive`, `knowledge retract`, signoff writes) - those live
-            # under the config lock, a separate mutex - and `commit` itself does a cross-file
-            # read+write (`load_close` -> `_write_close`). So an evidence mutation landing in that
-            # window can leave a persisted GO whose evidence has since changed. This is a narrow
-            # KNOWN, documented race tracked by #66/#31 (no enforced serialization invariant
-            # excludes the evidence mutators today); full closure needs one enforced lock spanning
-            # every evidence writer + this commit, and a stale-GO detector - both ride the #31
-            # close-provenance envelope. Do NOT restore the
-            # earlier "no ack/counter can invalidate a GO between check and write" claim; it was
-            # false (proven by a real-CLI repro that persisted GO against a gate set red mid-publish).
+            # Lock order: acceptance writer -> close-ID -> config (if needed).
+            # Close, gate, knowledge and config-backed signoff writers all join
+            # the outer lock; keep it from discovery through durable GO and the
+            # optional barrier stamp. External/manual file edits do not join this
+            # protocol. Time-based expiry is evaluated at the decision's clock
+            # time; publication is not a promise of future evidence freshness.
             with close_mod.close_transaction(store, args.id) as transaction:
                 record = transaction.record
                 if record.get("status") == close_mod.PUBLISHED:

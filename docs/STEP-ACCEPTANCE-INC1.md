@@ -1421,3 +1421,102 @@ files. Privacy: 8/8 positive controls, zero added-content matches; nine-file
 scope, unchanged design and `git diff --check` verified. Scratch `r45-*` stores,
 logs and `mutate-r45.py` are retained for the sweeper; reviewer scratch remains
 unchanged. No PR, merge or release is part of this correction.
+
+## R6 correction: live gate, knowledge and signoff obligation writers
+
+Base: `5eb28f4`. This supersedes the R4/R5 exclusion of gate/knowledge/signoff
+writers. Gates are inherited substantive obligations; knowledge can satisfy a
+DoD requirement, and required signoffs are inherited with live candidate/refset
+resolution. All supported writers of these records now join the same acceptance
+store lock. No new rescan or second publication mutex was introduced.
+
+| Writer / operation | Serialization boundary |
+| --- | --- |
+| `gates.set_gate` | Shared lock over validation, read, mutation and durable write; covers status, severity, scope, required/optional, reason and evidence changes. |
+| `gates.waive_gate` | Shared lock over read/mutate/write, including waiver dates, scope and expiry. |
+| `gates.write_gate_state` | Shared lock for direct replacement, including removal/clearing. Nested calls from set/waive reenter only the shared outer lock. |
+| CLI gate set/waive | Config transaction acquires the shared lock first; core API also protects direct callers. Timeout returns HOLD/conflict (3), without gate mutation. |
+| Assurance coverage producer / invalidation finalizer | Existing config transaction now joins the shared lock before its gate comparison/write; direct core calls are protected too. |
+| Gate clear/delete/expire | No separate mutation API or CLI command exists. Status/optional changes and state replacement are covered above. Expiry is a read-time clock predicate, not a writer. |
+| Knowledge publish, curate, retract, recurate | CLI holds the shared/config transaction; both `append_event` and the durable `write_event_locked` helper join the shared lock. Knowledge affects `_resolve_dod_knowledge`, so it is not excluded. |
+| Signoff apply/override and bound acknowledgments | Persist in close records through the existing shared-lock close transaction. They can carry inherited review obligations. |
+| Roster/group/refset authority and configuration transactions | `Store._config_lock` and its public alias acquire the shared lock first, covering current and future config-backed writers. |
+| Direct config replacement, init/force-init, reset/archive | Explicit shared-lock wrappers cover these administrative paths as well; reset cannot remove bus evidence mid-publication. Fresh project-root creation precedes locking; state mutations do not. |
+
+Static `signoffs.json`, DoD and domain-registry policy files are operator-edited;
+there is no supported policy-writing API/command to wrap. Supported signoff
+record mutations and configuration-backed candidate resolution are protected.
+Manual policy edits require a quiescent publisher, as documented. Direct file
+tampering and separate bus stores remain outside runtime lock discovery.
+
+One order is enforced: **acceptance writer → close-ID, if needed → config**.
+The shared lock remains process/thread/store scoped and reentrant for nested
+successor/core API work. Per-ID and config locks remain non-reentrant. A config
+scope marks the innermost rank; attempts to start a close transaction there raise
+`CloseConflict` before acquiring a per-ID lock. Close publication may acquire
+config after its ID lock (for example barrier work). Gate/config-only writers
+skip the ID rank. The lock-order test observes physical lock acquisition and
+checks the permitted sequence plus explicit reverse-order refusal. The config
+transaction generation protocol is unchanged.
+
+Failing-first evidence: the unchanged inherited-gate sweeper probe failed at
+unsafe GO (**1 failed, 3 deselected**, 7.99 seconds); nine initial writer/order
+regressions failed before implementation (**9 failed, 40 deselected**, 1.76
+seconds). The writer table additionally covers direct config replacement and
+init/reset so administrative paths cannot evade the common boundary.
+
+The first broader run exposed a fresh-root setup regression: a newly protected
+init attempted to lock before its project directory existed. That invocation
+was stopped and is not claimed green. The fix creates only the project root
+before entering the protected initialization. The existing nested-successor/
+store-scope regression plus all gate tests then passed: **53 passed** in 3.33
+seconds. No production/test source was changed while a suite was running.
+
+| Requirement | Regression |
+| --- | --- |
+| R6, inherited blocker gate, both serial orders | `test_acceptance_inherited_gate_writer_is_serialized`: writer-first refuses GO; publisher-first refuses child gate mutation before durable GO and permits retry after release. Both passed (25.93 seconds). |
+| Gate APIs, CLI, knowledge and config writers | `test_obligation_writers_share_acceptance_lock`, eleven rows: each blocks behind publication and succeeds afterward. |
+| No opposite config/close acquisition | `test_obligation_lock_order_and_reverse_order_refusal`: physical sequence assertion plus immediate reverse-order conflict. |
+| Existing gate semantics | Complete gate suite, including corrupt-state refusal, required gates, scope, waiver/expiry and evidence rules. |
+| Existing shared-lock lifecycle | Prior close writer/exception/successor/store-scope tests and sweeper crash/ownerless/per-ID-timeout controls. |
+
+As with the accepted R4 probe adjustment, the original R6 hook synchronously
+waits for a successful child mutation while holding publication. Serialization
+requires refusing that child, not allowing it to commit red before GO. The new
+two-process table checks both valid orderings explicitly. Gate freshness is
+evaluated at the decision clock; locks do not stop time-based expiry or promise
+future freshness. Evidence remains bound and checked by the existing verdict
+paths. No schema or plan/report field changes were made.
+
+The broader affected-suite run then found ten failures (**901 passed, 5
+skipped**): two old lock-diagnostic expectations and eight assurance cases
+affected by the new persistent lock marker. The config unlock fault injection
+now enters the shared lock before targeting the config lock, preserving its
+original failure-path coverage. Contention expects the shared outer lock's
+diagnostic. Assurance recognizes only the exact shared marker and generation
+file as runtime outputs, using its existing filesystem identity checks; nearby
+unrecognized files remain source changes. This matters because initialization
+now creates the shared lock generation file even without acceptance activity.
+The full affected-suite command was rerun after these changes.
+
+Final executed checks (foreground, `PYTHONPATH=<W>/src`, bytecode disabled,
+assigned scratch and `-p no:cacheprovider`):
+
+```text
+python -m pytest tests/test_gates.py tests/test_close.py tests/test_close_signoffs.py tests/test_store.py tests/test_knowledge.py tests/test_store_validation_snapshot.py tests/test_concurrency.py tests/test_coverage_producer.py tests/test_domains.py -q --basetemp <S>/r6-regression-final -p no:cacheprovider
+```
+
+**911 passed, 5 skipped**, 187.52 seconds, in one completed invocation. The
+acceptance publication/successor/lock/enumeration/transaction selection passed
+**29 tests, 505 deselected**, 124.79 seconds (`<S>/r6-acceptance.log`). This
+includes the two new inherited-gate serialization cases. The unchanged prior
+reviewer regression/structural probes, adapted R4 serialization witness and
+three lock-lifecycle controls passed **19 tests, 1 deselected**, 103.01 seconds
+(`<S>/r6-reviewer.log`); the deselected case is the original R6 hook whose
+child-success assumption is superseded by the two-order table above. No full
+repository or full acceptance-suite run is claimed in this correction.
+
+Ruff passed on all nine touched Python files. Privacy: 8/8 positive controls,
+zero added-content matches; twelve-file scope, unchanged design and
+`git diff --check` verified. Scratch `r6-*` logs/stores and `verify-r6.py` remain
+for re-review; reviewer evidence files are unchanged. No PR, merge or release.

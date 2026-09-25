@@ -1208,7 +1208,10 @@ def write_event_locked(store, event: dict) -> None:
     a crash cannot lose a just-recorded note/curation. The CALLER must already hold
     ``store._config_lock()``. Append-only - never whole-file replace, so the reader's
     skip-invalid/torn-tail tolerance is preserved."""
-    append_record(notes_path(store), event)
+    from agenttalk import close
+
+    with close._acceptance_writer_lock(store, timeout=10.0):
+        append_record(notes_path(store), event)
 
 
 def append_event(store, event: dict) -> None:

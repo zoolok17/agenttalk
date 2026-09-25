@@ -34,6 +34,100 @@ def _run(argv: list[str], root: Path) -> int:
     return cli.main(["--root", str(root), *argv])
 
 
+@pytest.mark.parametrize("writer", ["set", "waive", "replace", "config", "knowledge", "knowledge-locked",
+                                  "cli-set", "cli-waive", "config-direct", "init", "reset"])
+def test_obligation_writers_share_acceptance_lock(tmp_path, monkeypatch, writer):
+    from concurrent.futures import ThreadPoolExecutor
+    from agenttalk import close, knowledge
+
+    root = _root(tmp_path)
+    store = Store(root)
+    original = close._acceptance_writer_lock
+    monkeypatch.setattr(close, "_acceptance_writer_lock", lambda s, timeout: original(s, timeout=0.05))
+
+    def write():
+        if writer == "set":
+            gates.set_gate(root, name="repair", status="red", severity="blocker", scope="global",
+                           actor="alpha", evidence_source="manual_review")
+        elif writer == "waive":
+            gates.waive_gate(root, name="repair", operator="operator", reason="reviewed", scope="global",
+                             expires="2099-01-01")
+        elif writer == "replace":
+            gates.write_gate_state(root, {"gates": {}, "required_gates": []})
+        elif writer == "config":
+            with store.config_lock(timeout=0.05):
+                pass
+        elif writer == "config-direct":
+            store._write_config(store.load_config())
+        elif writer == "init":
+            store.init(["alpha", "beta"], force=True)
+        elif writer == "reset":
+            store.reset()
+        elif writer.startswith("knowledge"):
+            method = knowledge.append_event if writer == "knowledge" else knowledge.write_event_locked
+            method(store, {"event": "synthetic-lock-test"})
+        elif writer == "cli-set":
+            return _run(["gate", "set", "--name", "repair", "--status", "red", "--from", "alpha"], root)
+        else:
+            return _run(["gate", "waive", "--name", "repair", "--operator", "operator", "--reason",
+                         "reviewed", "--scope", "global", "--expires", "2099-01-01"], root)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with original(store, timeout=1):
+            if writer.startswith("cli-"):
+                assert pool.submit(write).result(timeout=5) == 3
+            else:
+                with pytest.raises(TimeoutError, match="acceptance store writer lock"):
+                    pool.submit(write).result(timeout=5)
+        assert not gates.gates_path(root).exists()
+        assert not knowledge.notes_path(store).exists()
+        result = pool.submit(write).result(timeout=5)
+        if writer.startswith("cli-"):
+            assert result == 0
+
+
+def test_obligation_lock_order_and_reverse_order_refusal(tmp_path, monkeypatch):
+    import contextlib
+    from agenttalk import close, knowledge
+
+    store = Store(_root(tmp_path))
+    record = close.empty_close("attempt", scope="milestone", revision="a" * 40, revision_kind="sha",
+                               gate_scope="milestone", opened_by="alpha", opened_at="now", epoch_at_open=None,
+                               required_lenses=[], revision_clean=True, dirty_artifact=None,
+                               non_lane_isolation_not_asserted=True)
+    close.create_close(store, record)
+    original = Store._exclusive_lock
+    active, orders = [], []
+
+    @contextlib.contextmanager
+    def observe(self, path, **kwargs):
+        name = path.name
+        if name == "config.lock" or name == ".attempt.lock":
+            assert ".acceptance-write.lock" in active
+        if name == ".attempt.lock":
+            assert "config.lock" not in active
+        with original(self, path, **kwargs):
+            active.append(name)
+            orders.append(tuple(active))
+            try:
+                yield
+            finally:
+                active.pop()
+
+    monkeypatch.setattr(Store, "_exclusive_lock", observe)
+    with close.close_transaction(store, "attempt") as tx:
+        with store.config_lock():
+            gates.set_gate(store.root, name="repair", status="red", severity="blocker", scope="milestone",
+                           actor="alpha", evidence_source="manual_review")
+            knowledge.write_event_locked(store, {"event": "synthetic-lock-test"})
+        tx.commit()
+    assert (".acceptance-write.lock", ".attempt.lock", "config.lock") in orders
+    with store.config_lock():
+        with pytest.raises(close.CloseConflict, match="lock order"):
+            with close.close_transaction(store, "attempt", lock_timeout=0.05):
+                pytest.fail("config-before-close order admitted")
+
+
 @pytest.mark.parametrize(("kind", "status"), [
     ("review-result", "approved"),
     ("review-result", "rejected"),

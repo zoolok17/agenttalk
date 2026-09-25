@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Extend acceptance publication serialization to gate APIs, knowledge appends,
+  configuration and administrative config writers. Enforce acceptance-writer,
+  close-ID, then config lock order; gate contention returns HOLD/conflict.
+
 - Serialize all local close writers with acceptance GO discovery and durable
   publication. Strict history enumeration now HOLDs with
   `acceptance_audit_unavailable` on missing, unreadable or partial audit storage;

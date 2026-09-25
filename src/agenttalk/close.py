@@ -1380,6 +1380,24 @@ def close_instance_id(record: dict) -> str | None:
 _writer_locks = threading.local()
 
 
+def _writer_key(store):
+    return os.getpid(), os.path.normcase(str(store.dir.resolve()))
+
+
+@contextlib.contextmanager
+def _acceptance_config_scope(store):
+    """Record the innermost lock rank, so config -> close cannot deadlock."""
+    key = _writer_key(store)
+    held = getattr(_writer_locks, "config", None)
+    if held is None:
+        held = _writer_locks.config = set()
+    held.add(key)
+    try:
+        yield
+    finally:
+        held.remove(key)
+
+
 @contextlib.contextmanager
 def _acceptance_writer_lock(store, *, timeout: float):
     """Serialize close writers in this store, including GO's entire audit/commit.
@@ -1389,7 +1407,7 @@ def _acceptance_writer_lock(store, *, timeout: float):
     the parent's transaction; per-ID locks still reject nested same-ID writes.
     Thread-local ownership includes the PID so a fork cannot inherit ownership.
     """
-    key = (os.getpid(), os.path.normcase(str(store.dir.resolve())))
+    key = _writer_key(store)
     held = getattr(_writer_locks, "held", None)
     if held is None:
         held = _writer_locks.held = set()
@@ -1407,6 +1425,9 @@ def _acceptance_writer_lock(store, *, timeout: float):
 
 @contextlib.contextmanager
 def _close_update_lock(store, close_id: str, *, timeout: float):
+    if _writer_key(store) in getattr(_writer_locks, "config", set()):
+        raise CloseConflict("lock order requires acceptance writer -> close-ID -> config; "
+                            "finish the config transaction before starting a close transaction")
     lock_path = closes_dir(store) / f".{validate_close_id(close_id)}.lock"
     with _acceptance_writer_lock(store, timeout=timeout), store._exclusive_lock(
         lock_path,

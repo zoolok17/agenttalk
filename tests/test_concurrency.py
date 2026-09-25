@@ -106,7 +106,7 @@ def test_config_lock_times_out_while_another_holder_is_active(tmp_path: Path) ->
     holder.start()
     assert entered.wait(_SUCCESSFUL_CONFIG_LOCK_TIMEOUT)
     try:
-        with pytest.raises(TimeoutError, match="config lock"):
+        with pytest.raises(TimeoutError, match="acceptance store writer lock"):
             with s._config_lock(timeout=0.05, poll=0.005):
                 pass
     finally:
@@ -620,10 +620,16 @@ def test_config_lock_release_failure_is_surfaced(
     def fail_release(_fd: int) -> None:
         raise OSError("injected unlock failure")
 
-    monkeypatch.setattr(store_mod, "_release_file_lock", fail_release)
-    with pytest.raises(OSError, match="release.*config lock"):
-        with s._config_lock(timeout=_SUCCESSFUL_CONFIG_LOCK_TIMEOUT):
-            pass
+    from agenttalk import close
+
+    # Acquire the outer serialization boundary before injecting failure into
+    # the config lock, and restore release before leaving that outer lock.
+    with close._acceptance_writer_lock(s, timeout=_SUCCESSFUL_CONFIG_LOCK_TIMEOUT):
+        with monkeypatch.context() as patch:
+            patch.setattr(store_mod, "_release_file_lock", fail_release)
+            with pytest.raises(OSError, match="release.*config lock"):
+                with s._config_lock(timeout=_SUCCESSFUL_CONFIG_LOCK_TIMEOUT):
+                    pass
     assert not (s.dir / "config.lock").exists()
 
 
