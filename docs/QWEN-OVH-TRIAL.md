@@ -44,6 +44,10 @@ endpoint and its `Qwen3.8-27B` deployment:
   Anthropic-passthrough adapter's state machine while it wasn't
   expecting a thinking block, and the CLI aborted the turn with "API
   Error: Content block is not a thinking block".
+  **Superseded:** merged reasoning is ordinary assistant text to the CLI,
+  which re-sends it as input on every later call. Reasoning is now emitted
+  as typed thinking blocks and stripped by the front before the CLI sees
+  them; see "Reasoning handling" below and `docs/STEP-QWEN-REASONING.md`.
 
 Both `price_policy_hash` and `child_cap_policy_hash` change as a direct
 result (they hash the values above). **This invalidates every previously
@@ -189,6 +193,35 @@ the very next legitimate retry of the SAME message into a permanent
 `ChildTurnCapExceeded`/`config_blocked` dead end, since `child_turns` has
 no way to reopen a fresh row for an existing `(agent, message_id)` key
 once closed.
+
+## Reasoning handling
+
+The front removes the model's reasoning from the response before the Claude CLI
+receives it, so reasoning is paid for once as output and is not re-sent as input on
+every later call of the tool loop. Usage is still read from the provider's real
+reasoning-inclusive counts, so the ledger is unaffected. While reasoning is being
+dropped the front sends Anthropic `ping` events so the CLI never sees dead air. The
+front records how much was removed per attempt in
+`.agenttalk/gateway/reasoning-stripped.jsonl` (attempt id, blocks, characters; no
+content).
+
+The route can also carry a fixed reasoning request parameter, rendered under the
+deployment's `extra_body` (the only place LiteLLM passes it through; a top-level
+`litellm_params` key is silently dropped):
+
+```powershell
+agenttalk gateway reconfigure --reasoning-param reasoning_effort=low
+agenttalk gateway reconfigure --no-reasoning-param
+```
+
+`gateway init` accepts the same `--reasoning-param NAME=VALUE` (repeatable), and
+`gateway status` shows the effective `reasoning_params`. Names are lowercase letters,
+digits and underscores, optionally prefixed `chat_template_kwargs.`; values are `true`,
+`false`, a small integer or a short lowercase word. The parameter is not part of the
+price policy, so changing it needs `stop`, `reconfigure`, `start` but no re-init and no
+new canary. Which parameter OVH accepts for this model, how to find it with one bounded
+probe, and how to measure the effect on cost per card are in
+`docs/STEP-QWEN-REASONING.md`.
 
 ## Fixed Trial Policy
 

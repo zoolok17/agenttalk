@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import json
 import socket
@@ -29,7 +30,15 @@ from .ovh_gateway import (
     SpendLedger,
     child_capability_from_header,
 )
+from .ovh_gateway_reasoning import (
+    ReasoningStats,
+    SseReasoningStripper,
+    strip_reasoning_json,
+)
 
+# A non-streaming reply is buffered to strip reasoning; past this size it is
+# forwarded as-is rather than held in memory.
+_MAX_BUFFERED_JSON_BYTES = 8 * 1024 * 1024
 
 PUBLIC_ROUTE = "/v1/messages"
 # Allowlisted content types the front will echo from the internal upstream into
@@ -80,6 +89,7 @@ class FrontConfig:
     internal_port: int = INTERNAL_PORT
     request_timeout_seconds: float = 120.0
     max_request_bytes: int = MAX_REQUEST_BYTES
+    strip_reasoning: bool = True
 
     def validate(self) -> None:
         if self.public_host != PUBLIC_HOST or self.internal_host != INTERNAL_HOST:
@@ -197,11 +207,13 @@ class GatewayFront:
         ledger: SpendLedger,
         *,
         connection_factory: Callable[..., http.client.HTTPConnection] = http.client.HTTPConnection,
+        reasoning_observer: Callable[[str, ReasoningStats], None] | None = None,
     ) -> None:
         config.validate()
         self.config = config
         self.ledger = ledger
         self.connection_factory = connection_factory
+        self.reasoning_observer = reasoning_observer
         self._permit = threading.BoundedSemaphore(1)
         self._server: ThreadingHTTPServer | None = None
 
@@ -419,12 +431,49 @@ class GatewayFront:
             handler.end_headers()
             public_response_started = True
             usage = StreamUsage()
+            # Usage is always read from the UNFILTERED upstream bytes, so the
+            # ledger settles on the provider's real reasoning-inclusive counts
+            # while the CLI never receives (and so never re-sends) reasoning.
+            stripper = (
+                SseReasoningStripper()
+                if self.config.strip_reasoning and content_type.startswith("text/event-stream")
+                else None
+            )
+            json_parts: list[bytes] | None = (
+                []
+                if self.config.strip_reasoning and content_type.startswith("application/json")
+                else None
+            )
+            json_size = 0
+            json_stats = ReasoningStats()
             while True:
                 chunk = response.read(16 * 1024)
                 if not chunk:
                     break
                 usage.feed(chunk)
-                handler.wfile.write(chunk)
+                if json_parts is not None:
+                    json_size += len(chunk)
+                    if json_size <= _MAX_BUFFERED_JSON_BYTES:
+                        json_parts.append(chunk)
+                        continue
+                    for held in json_parts:
+                        handler.wfile.write(held)
+                    json_parts = None
+                    handler.wfile.write(chunk)
+                    handler.wfile.flush()
+                    continue
+                forwarded = stripper.feed(chunk) if stripper is not None else chunk
+                if forwarded:
+                    handler.wfile.write(forwarded)
+                    handler.wfile.flush()
+            if stripper is not None:
+                tail = stripper.finish()
+                if tail:
+                    handler.wfile.write(tail)
+                    handler.wfile.flush()
+            if json_parts is not None:
+                body_out, json_stats = strip_reasoning_json(b"".join(json_parts))
+                handler.wfile.write(body_out)
                 handler.wfile.flush()
             model, input_tokens, output_tokens = usage.finish()
             self.ledger.settle(
@@ -433,6 +482,11 @@ class GatewayFront:
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
             )
+            stripped = stripper.stats if stripper is not None else json_stats
+            if stripped and self.reasoning_observer is not None:
+                # Diagnostics never affect accounting or the response.
+                with contextlib.suppress(Exception):
+                    self.reasoning_observer(attempt_id, stripped)
         except (BrokenPipeError, ConnectionResetError, TimeoutError, socket.timeout):
             self._mark_uncertain(attempt_id, "stream disconnect or timeout")
             if not public_response_started and not handler.wfile.closed:

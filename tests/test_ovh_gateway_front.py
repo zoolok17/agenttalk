@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import http.client
 import io
 import json
@@ -1196,3 +1197,130 @@ def test_client_disconnect_retains_reservation_after_one_internal_attempt(tmp_pa
 
     assert connection.request_count == 1
     assert front.ledger.status()["unresolved"][0]["state"] == "uncertain"
+
+
+# ------------------------------------------------------ reasoning stripping
+
+
+class _ChunkedResponse(_FakeResponse):
+    def __init__(
+        self,
+        body: bytes,
+        *,
+        content_type: str = "text/event-stream",
+        size: int = 23,
+    ) -> None:
+        super().__init__(body)
+        self.content_type = content_type
+        self.size = size
+
+    def getheader(self, _name: str) -> str:
+        return self.content_type
+
+    def read(self, _size: int = -1) -> bytes:
+        chunk, self.body = self.body[: self.size], self.body[self.size :]
+        return chunk
+
+
+def _reasoning_stream() -> bytes:
+    from test_ovh_gateway_reasoning import TOOL_STREAM_EVENTS, _sse
+
+    return _sse(*TOOL_STREAM_EVENTS)
+
+
+def test_front_strips_reasoning_but_settles_on_the_provider_usage(tmp_path) -> None:
+    front = _direct_front(tmp_path, _FakeConnection(_ChunkedResponse(_reasoning_stream())))
+    handler = _FakeHandler()
+    observed: list[tuple[str, int, int]] = []
+    front.reasoning_observer = lambda attempt, stats: observed.append(
+        (attempt, stats.blocks, stats.chars)
+    )
+
+    front._proxy(handler, b"{}", capability=_direct_capability(front))
+
+    sent = handler.wfile.getvalue()
+    assert handler.status == 200
+    assert b"thinking" not in sent and b"I should read" not in sent
+    assert b'"Read"' in sent and b"file_path" in sent  # the tool call is intact
+    status = front.ledger.status()
+    assert status["unresolved"] == []
+    assert status["current_committed_micro_eur"] == settlement_cost_micro_eur(50, 30)
+    assert len(observed) == 1 and len(observed[0][0]) == 32
+    assert observed[0][1:] == (1, len("I should read the file. "))
+
+
+def test_front_forwards_reasoning_untouched_when_stripping_is_disabled(tmp_path) -> None:
+    raw = _reasoning_stream()
+    front = _direct_front(tmp_path, _FakeConnection(_ChunkedResponse(raw)))
+    front.config = dataclasses.replace(front.config, strip_reasoning=False)
+    handler = _FakeHandler()
+
+    front._proxy(handler, b"{}", capability=_direct_capability(front))
+
+    assert handler.wfile.getvalue() == raw
+    assert front.ledger.status()["current_committed_micro_eur"] == settlement_cost_micro_eur(50, 30)
+
+
+def test_front_leaves_a_reasoning_free_stream_byte_identical_and_reports_nothing(tmp_path) -> None:
+    from test_ovh_gateway_reasoning import (
+        MESSAGE_DELTA,
+        MESSAGE_START,
+        MESSAGE_STOP,
+        _delta,
+        _sse,
+        _start,
+        _stop,
+    )
+
+    raw = _sse(
+        MESSAGE_START,
+        _start(0), _delta(0, "text_delta", text="plain"), _stop(0),
+        {**MESSAGE_DELTA, "delta": {"stop_reason": "end_turn"}}, MESSAGE_STOP,
+    )
+    front = _direct_front(tmp_path, _FakeConnection(_ChunkedResponse(raw, size=5)))
+    handler = _FakeHandler()
+    observed: list[object] = []
+    front.reasoning_observer = lambda *args: observed.append(args)
+
+    front._proxy(handler, b"{}", capability=_direct_capability(front))
+
+    assert handler.wfile.getvalue() == raw
+    assert observed == []
+
+
+def test_front_strips_reasoning_from_a_non_streaming_reply(tmp_path) -> None:
+    body = json.dumps({
+        "type": "message", "role": "assistant", "model": MODEL_ALIAS,
+        "content": [
+            {"type": "thinking", "thinking": "private", "signature": ""},
+            {"type": "text", "text": "answer"},
+        ],
+        "usage": {"input_tokens": 50, "output_tokens": 30},
+    }).encode()
+    front = _direct_front(
+        tmp_path, _FakeConnection(_ChunkedResponse(body, content_type="application/json", size=17))
+    )
+    handler = _FakeHandler()
+
+    front._proxy(handler, b"{}", capability=_direct_capability(front))
+
+    sent = json.loads(handler.wfile.getvalue())
+    assert [block["type"] for block in sent["content"]] == ["text"]
+    assert front.ledger.status()["current_committed_micro_eur"] == settlement_cost_micro_eur(50, 30)
+
+
+def test_a_failing_reasoning_observer_never_affects_settlement_or_the_reply(tmp_path) -> None:
+    front = _direct_front(tmp_path, _FakeConnection(_ChunkedResponse(_reasoning_stream())))
+    handler = _FakeHandler()
+
+    def broken(_attempt: str, _stats: object) -> None:
+        raise RuntimeError("disk full")
+
+    front.reasoning_observer = broken
+
+    front._proxy(handler, b"{}", capability=_direct_capability(front))
+
+    assert handler.status == 200 and b"thinking" not in handler.wfile.getvalue()
+    status = front.ledger.status()
+    assert status["unresolved"] == []
+    assert status["current_committed_micro_eur"] == settlement_cost_micro_eur(50, 30)
