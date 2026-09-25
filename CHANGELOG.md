@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Recheck every related attempt at GO publication, including later-created and
+  sibling attempts. New or changed source records invalidate the frozen evidence
+  catalog and require a fresh capture/review; opening order grants no exemption.
+
 - Acceptance recovery now retains complete source records and inherits pending
   review counters, blocking cold findings, remediation gates and review
   requirements through one obligation fold. Required source bytes are revalidated

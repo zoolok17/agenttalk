@@ -333,11 +333,17 @@ new execution's hygiene passes. Generic counter decisions cannot waive missing
 source bytes or the separate exact LD2 authorization for weaker gating coverage.
 
 This remains cooperative reviewed disposition, not authenticated proof that a
-lead's explanation is true. Source records are frozen as observed when the new
-attempt opens. If an earlier related attempt changes afterward, evaluation
-refuses the stale recovery catalog; create a fresh attempt to capture its new
-findings and decisions. As with a linked successor, preserve a terminal prior
+lead's explanation is true. Obligations belong to the change at GO publication,
+regardless of attempt-open order. Source records are frozen as observed when the
+new attempt opens. Evaluation rescans every related attempt, including later-created
+roots and siblings; GO publication repeats that scan inside its close transaction.
+If a related source is new or changed, the frozen catalog is stale and GO is
+refused. Publish unfinished attempts as HOLD, then create a fresh attempt to
+capture their findings and decisions and repeat evidence collection and cold
+review. Evidence is never appended silently after its cold seal.
+As with a linked successor, preserve a terminal prior
 record: publish an unfinished prior attempt as HOLD before opening the recovery.
 A later retained terminal version supersedes the unfinished version for this
-prerequisite; both versions' evidence stays retained. Later-created attempts do not retroactively invalidate
-an earlier attempt's frozen history.
+prerequisite; both versions' evidence stays retained. A previously clean check
+does not authorize publication against a now-incomplete source set. Already
+published records remain immutable; this check governs each new GO decision.

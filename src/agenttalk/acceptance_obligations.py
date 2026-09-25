@@ -133,8 +133,7 @@ def inherit(store, record, plan, *, capture=False, bundle=None, snapshot=None):
     if capture:
         retained = []
         for prior, _old_route, old_plan in audit.project_attempts(store, record):
-            if (audit._time(prior["opened_at"]) < audit._time(record["opened_at"])
-                    and audit.same_change(record, plan, prior, old_plan)):
+            if audit.same_change(record, plan, prior, old_plan):
                 retained.append(A._retain(store, coverage.canonical(prior)))
         route["obligations_hash"] = A._retain(store, coverage.canonical(sorted(set(retained))))
     entries = sources(store, route)
@@ -194,10 +193,10 @@ def inherit(store, record, plan, *, capture=False, bundle=None, snapshot=None):
 
     frozen = {digest for digest, _, _, _ in entries}
     for prior, _, old_plan in audit.project_attempts(store, record):
-        if (audit._time(prior["opened_at"]) < audit._time(record["opened_at"])
-                and A._hash(coverage.canonical(prior)) not in frozen
+        if (A._hash(coverage.canonical(prior)) not in frozen
                 and audit.same_change(record, plan, prior, old_plan)):
-            A._fail("related attempt changed after recovery freeze; create a fresh attempt to retain its obligations",
+            A._fail("related attempt is new or changed since freeze; publish unfinished attempts as HOLD "
+                    "and create a fresh attempt to retain all obligations and repeat cold review",
                     "acceptance_plan_stale")
 
     # This check runs before cold review and the final hygiene fold. Missing

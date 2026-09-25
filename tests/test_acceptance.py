@@ -2384,13 +2384,18 @@ def test_acceptance_evaluation_rechecks_withheld_delivery(case_v3):
     assert "acceptance_cold_missing" in {c for c, _ in snapshot(case)["holds"]}
 
 
-def test_acceptance_later_reveal_does_not_taint_earlier_commit(case_v3):
+def test_acceptance_later_reveal_preserves_exposure_order_but_invalidates_obligations(case_v3):
+    from agenttalk import acceptance_audit
     case = case_v3
     assert open_attempt(case) == 0
     complete_v3(case)
     assert open_attempt(case, "--id", "later") == 0
     complete_v3(case, close_id="later")
-    assert snapshot(case)["holds"] == []
+    # A later reveal cannot change what this reviewer knew at commitment, but
+    # its new attempt still belongs to the publication-time obligation set.
+    acceptance_audit.check_prior_exposure(case["store"], close.load_close(case["store"], "attempt"),
+                                          case["plan"], "cold")
+    assert "acceptance_plan_stale" in {code for code, _ in snapshot(case)["holds"]}
 
 
 def test_acceptance_owner_provenance_excludes_reviewer(case_v3):
@@ -2578,11 +2583,12 @@ def test_acceptance_informational_required_artifact_integrity_holds(case_v3, dam
 
 
 @pytest.mark.parametrize("rewrite", ["same-sha", "rebase", "squash", "different"])
+@pytest.mark.parametrize("ordering", ["earlier", "later", "sibling"])
 @pytest.mark.parametrize("obligation", ["coverage", "counter", "cold", "missing", "corrupt",
                                         "remediation", "hygiene", "gate", "final-review", "unknown",
                                         "approval", "review-requirement", "routing", "dod", "isolation", "offline",
                                         "unfinished-source"])
-def test_acceptance_recovery_obligations_follow_change_table(case_v3, rewrite, obligation):
+def test_acceptance_recovery_obligations_follow_change_table(case_v3, rewrite, ordering, obligation):
     case = case_v3
     base = case["sha"]
     commits = []
@@ -2593,8 +2599,49 @@ def test_acceptance_recovery_obligations_follow_change_table(case_v3, rewrite, o
         commits.append(git(case["project"], "rev-parse", "HEAD"))
     case["sha"] = commits[-1]
     case["plan"]["cold_policy"]["change_base"] = base
-    write_json(case["inputs"] / "plan.json", case["plan"])
+    source = dict(case, plan=deepcopy(case["plan"]))
+    if rewrite != "same-sha":
+        git(case["project"], "branch", "original", case["sha"])
+        git(case["project"], "checkout", "--detach", base)
+        (case["project"] / "base.txt").write_text("base update\n", encoding="utf-8")
+        git(case["project"], "add", "base.txt")
+        git(case["project"], "commit", "-qm", "base update")
+        new_base = git(case["project"], "rev-parse", "HEAD")
+        if rewrite == "rebase":
+            git(case["project"], "rebase", "--onto", new_base, base, "original")
+        elif rewrite == "squash":
+            git(case["project"], "merge", "--squash", commits[-1])
+            git(case["project"], "commit", "-qm", "same diff squashed")
+        else:
+            (case["project"] / "different.txt").write_text("different change\n", encoding="utf-8")
+            git(case["project"], "add", "different.txt")
+            git(case["project"], "commit", "-qm", "different change")
+        case["sha"] = git(case["project"], "rev-parse", "HEAD")
+        case["plan"]["cold_policy"]["change_base"] = new_base
+    if obligation == "coverage" or rewrite == "different":
+        for row in case["plan"]["rows"]:
+            row["id"] += "-new"
+            row["artifact"] += "-new"
+    if obligation in {"coverage", "approval"}:
+        case["plan"]["rows"][0]["expected"] = 1
+    assign_fresh_cold(case, "new-reviewer")
+    recovery = case
+
+    def activate(selected):
+        git(selected["project"], "checkout", "--detach", selected["sha"])
+        write_json(selected["inputs"] / "plan.json", selected["plan"])
+
+    if ordering == "later":
+        activate(recovery)
+        assert open_attempt(recovery, "--id", "recovery") == 0
+    case = source
+    activate(case)
     assert open_attempt(case) == 0
+    if ordering == "sibling":
+        # Both roots exist before the source records its substantive finding.
+        activate(recovery)
+        assert open_attempt(recovery, "--id", "recovery") == 0
+        activate(case)
     if obligation == "cold":
         assert cold_phase(case, "commit", change={"observations": [
             {"id": "defect", "blocking": True, "evidence": "unresolved source defect"}]}) == 0
@@ -2657,33 +2704,8 @@ def test_acceptance_recovery_obligations_follow_change_table(case_v3, rewrite, o
             if obligation == "routing":
                 tx.record["risk_inventory"] = [{"risk_class": "quality", "source": "review", "affected_paths": []}]
             tx.commit()
-    if rewrite != "same-sha":
-        git(case["project"], "branch", "original", case["sha"])
-        git(case["project"], "checkout", "--detach", base)
-        (case["project"] / "base.txt").write_text("base update\n", encoding="utf-8")
-        git(case["project"], "add", "base.txt")
-        git(case["project"], "commit", "-qm", "base update")
-        new_base = git(case["project"], "rev-parse", "HEAD")
-        if rewrite == "rebase":
-            git(case["project"], "rebase", "--onto", new_base, base, "original")
-        elif rewrite == "squash":
-            git(case["project"], "merge", "--squash", commits[-1])
-            git(case["project"], "commit", "-qm", "same diff squashed")
-        else:
-            (case["project"] / "different.txt").write_text("different change\n", encoding="utf-8")
-            git(case["project"], "add", "different.txt")
-            git(case["project"], "commit", "-qm", "different change")
-        case["sha"] = git(case["project"], "rev-parse", "HEAD")
-        case["plan"]["cold_policy"]["change_base"] = new_base
-    # Disjoint labels must not hide a same-content obligation; genuinely
-    # different history/content also needs disjoint targets to be independent.
-    if obligation == "coverage" or rewrite == "different":
-        for row in case["plan"]["rows"]:
-            row["id"] += "-new"
-            row["artifact"] += "-new"
-    if obligation in {"coverage", "approval"}:
-        case["plan"]["rows"][0]["expected"] = 1
-    assign_fresh_cold(case, "new-reviewer")
+    case = recovery
+    activate(case)
     if rewrite == "different" and obligation == "gate":
         from agenttalk import gates
         # Remove the shared live gate so this case isolates inheritance only.
@@ -2691,7 +2713,8 @@ def test_acceptance_recovery_obligations_follow_change_table(case_v3, rewrite, o
         state = json.loads(state_path.read_text())
         state["gates"].pop("repair-proof")
         write_json(state_path, state)
-    assert open_attempt(case, "--id", "recovery") == 0
+    if ordering == "earlier":
+        assert open_attempt(case, "--id", "recovery") == 0
     complete_v3(case, close_id="recovery", build_exit=1 if obligation in {"coverage", "approval"} else 0)
     if obligation in {"missing", "corrupt"}:
         artifact = next(a for a in prior_bundle["artifacts"] if a["id"] == "build")
@@ -2702,15 +2725,88 @@ def test_acceptance_recovery_obligations_follow_change_table(case_v3, rewrite, o
             path.write_bytes(b"damaged prior evidence")
     result = acceptance.resolve(case["store"], close.load_close(case["store"], "recovery"))
     blocked = rewrite != "different"
-    code = ("acceptance_category_moved_unreviewed" if obligation in {"coverage", "approval"} else
+    code = ("acceptance_plan_stale" if ordering != "earlier" else
+            "acceptance_category_moved_unreviewed" if obligation in {"coverage", "approval"} else
             "acceptance_record_missing" if obligation in {"missing", "corrupt"} else
             "acceptance_plan_stale" if obligation == "unfinished-source" else "acceptance_residual_open")
     if obligation not in {"remediation", "review-requirement"}:
         assert (code in {c for c, _ in result["holds"]}) is blocked
-    if blocked and obligation == "coverage":
+    if blocked and obligation == "coverage" and ordering == "earlier":
         sources = result["related_obligations"][0]["protected"].values()
         assert any(s["outcome"].get("passed") is False for p in sources for s in p["sources"])
     assert command(case, "publish", "--id", "recovery", "--from", "lead", "--verdict", "go") == (3 if blocked else 0)
+
+
+@pytest.mark.parametrize("linked", [False, True], ids=["recovery-roots", "linked-siblings"])
+def test_acceptance_preopened_recovery_cannot_ignore_later_counter(case_v3, linked):
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case, build_exit=1)
+    publish_hold(case)
+    assign_fresh_cold(case, "reserved-reviewer")
+    reserved_plan = deepcopy(case["plan"])
+    assert (successor(case, new_id="reserved") if linked else open_attempt(case, "--id", "reserved")) == 0
+    assign_fresh_cold(case, "later-reviewer")
+    assert (successor(case, new_id="later") if linked else open_attempt(case, "--id", "later")) == 0
+    complete_v3(case, close_id="later")
+    assert command(case, "ack", "--id", "later", "--lens", "acceptance-run-bar", "--from", "runner-a",
+                   "--status", "counter", "--counter", "later-defect", "--finding", "unresolved parallel defect") == 0
+    assert command(case, "publish", "--id", "later", "--from", "lead", "--verdict", "hold",
+                   "--reason", "preserve parallel defect") == 3
+    case["plan"] = reserved_plan
+    write_json(case["inputs"] / "plan.json", case["plan"])
+    complete_v3(case, close_id="reserved")
+    before = close.load_close(case["store"], "reserved")
+    assert command(case, "publish", "--id", "reserved", "--from", "lead", "--verdict", "go") == 3
+    assert close.load_close(case["store"], "reserved") == before
+    assert close.load_close(case["store"], "later")["counters"]["later-defect"]["decision"] == "pending"
+
+
+def test_acceptance_publish_rescans_obligations_under_lock(case_v3, monkeypatch):
+    from agenttalk import acceptance_audit
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    assert snapshot(case)["holds"] == []
+    assign_fresh_cold(case, "later-reviewer")
+    assert open_attempt(case, "--id", "later") == 0
+    complete_v3(case, close_id="later")
+    assert command(case, "ack", "--id", "later", "--lens", "acceptance-run-bar", "--from", "runner-a",
+                   "--status", "counter", "--counter", "late", "--finding", "recorded after the clean check") == 0
+    scan = acceptance_audit.project_attempts
+    checked = []
+
+    def locked_scan(store, record):
+        if record["close_id"] == "attempt":
+            with pytest.raises(TimeoutError):
+                with close._close_update_lock(store, "attempt", timeout=0.01):
+                    pytest.fail("publication scan ran outside the close lock")
+            checked.append(True)
+        yield from scan(store, record)
+
+    monkeypatch.setattr(acceptance_audit, "project_attempts", locked_scan)
+    before = close.load_close(case["store"], "attempt")
+    assert command(case, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go") == 3
+    assert checked
+    assert close.load_close(case["store"], "attempt") == before
+
+
+@pytest.mark.parametrize("opened_at", ["2000-01-01T00:00:00Z", "same"])
+def test_acceptance_capture_does_not_filter_source_timestamps(case_v3, monkeypatch, opened_at):
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    assert command(case, "ack", "--id", "attempt", "--lens", "acceptance-run-bar", "--from", "runner-a",
+                   "--status", "counter", "--counter", "known", "--finding", "known before freeze") == 0
+    publish_hold(case)
+    if opened_at == "same":
+        opened_at = close.load_close(case["store"], "attempt")["opened_at"]
+    assign_fresh_cold(case, "fresh")
+    with monkeypatch.context() as patch:
+        patch.setattr(cli, "_iso_now", lambda: opened_at)
+        assert open_attempt(case, "--id", "recovery") == 0
+    recovered = close.load_close(case["store"], "recovery")
+    assert any(c["finding"] == "known before freeze" for c in recovered["counters"].values())
 
 
 @pytest.mark.parametrize("resolution", ["passing", "approved", "tampered", "expired", "lead"])

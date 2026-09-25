@@ -1241,3 +1241,77 @@ Ruff on all seven touched Python files passed. The eight-control privacy check,
 ten-file scope check, unchanged-design comparison and `git diff --check` passed.
 Scratch logs, failing-first probes and isolated mutation copies are retained under
 `<S>` for the sweeper's re-check; no reviewer evidence was changed.
+
+### R3 correction: obligations at publication, independent of opening order
+
+The lead's publish-time rule supersedes all earlier statements here that later
+attempts cannot invalidate a frozen source set. The eleven obligation families
+and seventeen concrete representations above remain unchanged. Their discovery
+has no opening-time exemption: every related attempt must appear in the frozen
+catalog at GO evaluation. A new or changed record invalidates the seal/review;
+the recovery is terminal HOLD records followed by a fresh capture and cold pass.
+No source bytes or decisions are appended to an already sealed review.
+
+The single obligation table now crosses 17 kinds x 4 identity relationships x
+3 orderings, for 204 cases. Identity relationships remain same SHA, rebase,
+squash and genuinely different history/content with disjoint targets.
+
+| Ordering | Setup | Related source result | Different-change result |
+| --- | --- | --- | --- |
+| earlier | Source records its obligation before publisher opens. | Existing obligation-specific HOLD. | No inherited HOLD. |
+| later | Publisher opens first; source opens and records its obligation afterward. | Stale catalog HOLD before GO. | No inherited HOLD. |
+| sibling | Both roots exist before source records its obligation; publisher froze an incomplete source snapshot. | Stale catalog HOLD before GO. | No inherited HOLD. |
+
+This ordering axis applies to coverage, approval, counter, cold, final-review,
+remediation, gate, missing, corrupt, hygiene, offline, review-requirement, routing,
+DoD, isolation, unknown future hold and unfinished-source representations. The
+table's siblings are concurrent roots; an additional real-CLI test exercises
+two linked successors of the same terminal parent as well as two recovery roots.
+The sweeper's exact preopened recovery scenario is included in that test.
+
+Additional tests pin equal/backdated open timestamps at capture and the rescan
+inside the existing close publication lock after an earlier clean check. Failed
+GO leaves the frozen route, cold seal and close record unchanged. Cold exposure
+still uses commitment-time knowledge: a later reveal cannot rewrite what a
+reviewer knew earlier, but its attempt must enter the obligation audit at publish.
+
+Failing-first: the three read-only sweeper probes each failed specifically because
+GO returned 0 instead of 3 (**3 failed, 4 deselected**, 23.65 seconds). The expanded
+table's later-counter case failed on the missing stale hold; sibling and unrelated
+controls passed (**1 failed, 3 passed, 519 deselected**, 25.96 seconds). All probe
+stores were isolated under assigned scratch; reviewer evidence was unchanged.
+
+The capture/publication regression selection also failed first: **5 failed, 523
+deselected** in 28.65 seconds. After removing both filters, the focused ordering,
+unrelated-change, exposure-order, linked-sibling and lock selection passed
+**18 tests, 510 deselected** in 110.77 seconds. Re-running the sweeper's unchanged
+`test_structural_probes.py` passed **7 tests** in 55.34 seconds, including all
+three original unsafe-GO cases and its four preservation/resolution controls.
+
+Two isolated source-copy mutations restore the capture-time and publication-time
+filters independently. Both are killed by the equal-timestamp capture and later
+counter table tests. Logs are retained in `<S>/r3-mutants-312f5bce`; the working
+source was never mutated by this check.
+
+Only the common inheritance fold changes production behavior. Freeze and
+`acceptance.resolve` retain their callers; publication invokes resolution again
+inside its existing per-close transaction. Route/report/bundle/ack shapes and
+ordinary close behavior are unchanged. The lock test establishes that boundary;
+it does not claim store-wide serialization of all gate/evidence writers (the
+existing CLI publish comment tracks that separate boundary under issues 66/31).
+
+Final combined command, foreground with `PYTHONPATH=<W>/src`, bytecode disabled
+and isolated assigned scratch:
+
+```text
+python -m pytest tests/test_acceptance.py tests/test_close.py tests/test_close_signoffs.py tests/test_gates.py -q --basetemp <S>/r3-regression -p no:cacheprovider
+```
+
+Result: **862 passed, 1 skipped in 2070.03 seconds**. All 204 table cases passed.
+The skip is host-restricted symlink creation. This is one completed combined run
+on the final production/test source, not an aggregate count. No full-repository
+or performance result is claimed. The detailed output is `<S>/r3-regression.log`.
+Ruff on the two touched Python files passed. Privacy: 8/8 positive controls and
+zero added-content matches; exact five-file scope, unchanged design and
+`git diff --check` passed. Scratch test stores, logs and isolated mutation copies
+are retained for the sweeper's re-check; reviewer scratch remains unchanged.
