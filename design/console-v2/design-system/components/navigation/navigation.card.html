@@ -1,0 +1,58 @@
+<!-- @dsCard group="Components" viewport="760x560" name="Navigation & graph" subtitle="NavRail + RelationshipGraph — light & dark" -->
+<!DOCTYPE html><html><head><meta charset="utf-8"><link rel="stylesheet" href="../../styles.css">
+<style>
+  body{margin:0;font-family:var(--font-body)}
+  .pane{padding:0;background:var(--canvas);color:var(--ink);display:flex;align-items:stretch;min-height:260px}
+  .graphwrap{flex:1;padding:16px;display:flex;align-items:center;justify-content:center;overflow:hidden}
+  .theme{font-family:var(--font-mono);font-size:10px;letter-spacing:.1em;color:var(--ink-4);text-transform:uppercase;padding:10px 18px 0;background:var(--canvas)}
+</style>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="../../_ds_bundle.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.23.6/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+  const findNS = (keys) => { for (const k of Object.getOwnPropertyNames(window)) { try { const v = window[k]; if (v && typeof v === 'object' && keys.every(n => typeof v[n] === 'function')) return v; } catch (e) {} } return {}; };
+  const NS = findNS(['NavRail','RelationshipGraph']);
+  const { NavRail, RelationshipGraph } = NS;
+  const items = [
+    { label:'Team overview', icon:'M3 3h7v7H3zM14 3h7v7h-7zM14 14h7v7h-7zM3 14h7v7H3z', active:true },
+    { label:'Conversations', icon:'M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z' },
+    { label:'Attention', icon:'M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0zM12 9v4M12 17h.01', badge:5 },
+    { label:'Sessions', icon:'M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z' },
+  ];
+  const legend = [
+    { label:'Working', color:'var(--ok)', count:5 },
+    { label:'Idle · waiting', color:'var(--warn)', count:2 },
+    { label:'Needs attention', color:'var(--attn)', count:2 },
+    { label:'Unknown', color:'var(--gray)', count:1 },
+  ];
+  const nodes = [
+    {id:'claude-lead',state:'working_turn'},{id:'claude-dev',state:'working_turn'},{id:'codex-dev',state:'working_silent'},
+    {id:'claude-rev',state:'idle_waiting'},{id:'codex-rev',state:'working_turn'},{id:'codex-infra',state:'rate_limited_or_outage'},
+    {id:'claude-arch',state:'stuck_suspected'},{id:'codex-scout',state:'unknown'},
+  ];
+  const edges = [
+    {from:'claude-dev',to:'codex-rev',weight:3,hot:true},{from:'codex-dev',to:'claude-rev',weight:2},
+    {from:'claude-arch',to:'codex-rev',weight:2},{from:'claude-lead',to:'codex-rev',weight:1},
+    {from:'codex-infra',to:'claude-lead',weight:1},{from:'codex-scout',to:'codex-rev',weight:1},
+  ];
+  const Demo = () => (
+    <div className="pane">
+      <NavRail items={items} legend={legend} />
+      <div className="graphwrap">
+        <RelationshipGraph nodes={nodes} edges={edges} width={420} height={300} />
+      </div>
+    </div>
+  );
+  const App = () => (
+    <div>
+      <div className="theme">Light</div><Demo/>
+      <div data-theme="dark"><div className="theme">Dark</div><Demo/></div>
+    </div>
+  );
+  ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body></html>
