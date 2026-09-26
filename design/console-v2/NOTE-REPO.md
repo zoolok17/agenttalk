@@ -19,3 +19,6 @@ The two lines in `prototype/Console Futures.dc.html` that contain `href="{{` car
 
 ## Notes from the lead
 The lead's four notes on the first v2 (the budget levels, a name that broke the shortener, stuck-card evidence without process data, and raising a limit) were answered by the designer in round 2. See `docs/02-DECISIONS.md` ("Round 2"). The updated name rule shortens all 15 real agent names correctly.
+
+## Correction for the build: raising a gateway limit
+In agenttalk a gateway's alert and cutoff are fixed when the gateway is initialised. Raising a limit means a re-init, which starts a fresh ledger (the old one is kept as a backup), not a command-line edit of a running gateway. The budget views must handle a ledger reset: carry the backed-up spend as an opening balance, so the account sum and the bill comparison stay correct. Otherwise the account bar would show a false "bill ahead of ledger" state after every raise.

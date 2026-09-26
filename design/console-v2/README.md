@@ -1,6 +1,6 @@
 # agenttalk Console — handoff v2 (decided direction)
 
-> **In this repository:** a trimmed copy, not the full handoff. See `NOTE-REPO.md` for what was left out and why, and `LICENSE-NOTES.md` for provenance and third-party terms.
+> **In this repository:** a trimmed copy, not the full handoff. The prototype pages need `prototype/support.js`, which is NOT included here, so the "serve the folder" steps below work only with the full handoff zip. The specs in `docs/` stand on their own. See `NOTE-REPO.md` for what was left out and why, and `LICENSE-NOTES.md` for provenance and third-party terms.
 
 **Build this:** *The Conversation* (board **3a**) as the whole console, with four themes (Midnight, Paper, Synthwave, Terminal), a phone layout (**3c**), a qwen budget meter (**3b**), and the rules in **3d**. This replaces the "pick a direction" open question from v1: the dev team's notes settled it (1d is the app, the 1a terminal look is one of its themes, keyboard shortcuts everywhere).
 
