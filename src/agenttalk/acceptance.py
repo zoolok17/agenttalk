@@ -54,8 +54,10 @@ def _text(value, label):
 def _id(value):
     try:
         return close.validate_close_id(value)
-    except close.CloseError as exc:
-        raise AcceptanceError("acceptance_policy_invalid", str(exc)) from exc
+    except close.CloseError:
+        pass
+    # IDs can be hostile or private. Do not echo them, including in a chain.
+    raise AcceptanceError("acceptance_policy_invalid", "invalid acceptance id") from None
 
 
 def _digest(value):

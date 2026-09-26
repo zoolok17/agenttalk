@@ -3,7 +3,10 @@
 from pathlib import Path
 from copy import deepcopy
 import json
+import os
 import socket
+import stat
+import traceback
 # Imported only to deny execution in the preflight-reader boundary test.
 import subprocess  # nosec B404
 
@@ -14,6 +17,92 @@ from agenttalk import acceptance as A, acceptance_registry as R
 HASH = "a" * 64
 
 
+def test_m1b_two_runtime_pins_require_exact_banners_and_environment_use(registry, plan):
+    java = registry["entries"][0]
+    java["expected_banner"] = "java 21.0.1"
+    node = dict(deepcopy(java), id="node", expected_banner="node 22.0.0")
+    registry["entries"].append(node)
+    java["dependencies"] = ["node"]
+    plan["environment"].update(runtime=["java", "node"], compiler=[], package_manager=[])
+    assert R.validate_plan(plan, registry) == plan
+    for value in (["java"], ["java", "python 3.1"], ["java", "java", "node"]):
+        broken = deepcopy(plan)
+        broken["environment"]["runtime"] = value
+        with pytest.raises(A.AcceptanceError):
+            R.validate_plan(broken, registry)
+    for banner in (None, "", 21):
+        node["expected_banner"] = banner
+        with pytest.raises(A.AcceptanceError):
+            R.validate_registry(registry)
+
+
+@pytest.mark.parametrize("path", ["COM0", "LPT0.txt", "COM\u00b9.dat", "LPT\u00b2", "COM\u00b3",
+                                  "CONIN$", "CONOUT$.txt", "nul .txt"])
+def test_m1b_reserved_devices(path):
+    with pytest.raises(A.AcceptanceError):
+        R.relative_path(path)
+
+
+@pytest.mark.parametrize("paths", [("a.dat", "a.dat/child"), ("A.DAT/child", "a.dat"),
+                                   ("\u00e9.dat", "e\u0301.dat")])
+def test_m1b_portable_path_collisions(registry, paths):
+    registry["files"][0]["path"], registry["files"][1]["path"] = paths
+    with pytest.raises(A.AcceptanceError):
+        R.validate_registry(registry)
+
+
+def test_m1b_long_id_diagnostic_is_bounded():
+    with pytest.raises(A.AcceptanceError) as error:
+        A._id("x" * 200_000)
+    assert len(str(error.value)) < 200
+    assert len("".join(traceback.format_exception(error.type, error.value, error.tb))) < 3000
+
+
+@pytest.mark.parametrize("field,replacement", [(1, None), (2, None), (0, stat.S_IFIFO | 0o600)])
+def test_m1b_opened_file_identity_must_match_lstat(tmp_path, registry, monkeypatch, field, replacement):
+    (tmp_path / "source.dat").write_bytes(b"{}")
+    original = os.fstat
+
+    def swapped(fd):
+        before = original(fd)
+        fields = list(before)
+        fields[field] = replacement if replacement is not None else fields[field] + 1
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(os, "fstat", swapped)
+    with pytest.raises(A.AcceptanceError, match="changed"):
+        R.read_declarative_inputs(tmp_path, registry)
+
+
+def test_m1b_os_error_traceback_hides_private_root(tmp_path, registry, monkeypatch):
+    (tmp_path / "source.dat").write_bytes(b"{}")
+
+    def denied(*args, **kwargs):
+        raise PermissionError("private-cache-locator")
+
+    monkeypatch.setattr(Path, "lstat", denied)
+    with pytest.raises(A.AcceptanceError) as error:
+        R.read_declarative_inputs(tmp_path, registry)
+    rendered = "".join(traceback.format_exception(error.type, error.value, error.tb))
+    assert "PermissionError: private-cache-locator" not in rendered
+    assert error.value.__context__ is None
+
+
+def test_m1b_large_distribution_has_small_expiring_manifest(registry):
+    registry["files"].append(pin("advisory-content"))
+    registry["files"][-1]["size"] = R.MAX_INPUT_BYTES * 100
+    manifest = pin("advisory-manifest", "snapshot")
+    manifest["distribution"] = {"id": "advisory-content", "sha256": HASH}
+    registry["files"].append(manifest)
+    registry["entries"][0]["snapshots"] = ["advisory-manifest"]
+    assert R.validate_registry(registry) == registry
+    for key, value in (("id", "missing"), ("id", "source"), ("sha256", "b" * 64)):
+        broken = deepcopy(registry)
+        broken["files"][-1]["distribution"][key] = value
+        with pytest.raises(A.AcceptanceError):
+            R.validate_registry(broken)
+
+
 def provenance():
     return {"source": "vendor:java:21.0.1", "retrieved_at": "2026-01-01T00:00:00Z",
             "checksum_source": "vendor:checksums", "independent_verification": False,
@@ -21,16 +110,20 @@ def provenance():
 
 
 def pin(fid, role="distribution"):
-    return {"id": fid, "role": role, "path": fid + ".dat", "sha256": HASH, "size": 2,
+    result = {"id": fid, "role": role, "path": fid + ".dat", "sha256": HASH, "size": 2,
             "expires_at": "2027-01-01T00:00:00Z" if role == "snapshot" else None,
             "version": "21.0.1" if role in ("distribution", "snapshot") else None,
             "provenance": provenance() if role in ("distribution", "snapshot") else None}
+    if role == "snapshot":
+        result["distribution"] = {"id": "jdk", "sha256": HASH}
+    return result
 
 
 @pytest.fixture
 def registry():
     return {"schema_version": 2, "files": [pin("jdk"), pin("source", "provenance")], "entries": [{
         "id": "java", "kind": "toolchain", "version": "21.0.1", "artifact": "jdk", "dependencies": [],
+        "expected_banner": "java 21.0.1",
         "inputs": [], "snapshots": [],
         "provenance": provenance(),
         "command": {"argv": ["{artifact}", "--version"], "cwd": "{checkout}", "inputs": [], "outputs": []},
@@ -42,8 +135,8 @@ def registry():
 
 @pytest.fixture
 def environment():
-    return {"schema_version": 1, "runtime": "java 21.0.1", "compiler": "javac 21.0.1",
-            "package_manager": None, "services": [], "os": "synthetic", "locale": "C", "timezone": "UTC",
+    return {"schema_version": 1, "runtime": ["java"], "compiler": [],
+            "package_manager": [], "services": [], "os": "synthetic", "locale": "C", "timezone": "UTC",
             "environment_digest": HASH, "config_digest": HASH, "scratch": "isolated",
             "cache_overlay": "fresh-writable", "service_data": "fresh", "time_limit_seconds": 60,
             "memory_limit_bytes": 1024, "row_overrides": []}
@@ -175,6 +268,7 @@ def test_registry_closed_fields_and_references(registry, path, value):
 def test_checker_pins_snapshots_and_independent_provenance(registry):
     entry = registry["entries"][0]
     entry["kind"] = "checker"
+    entry["expected_banner"] = None
     registry["files"].extend([pin("adapter", "adapter"), pin("config", "config"),
                               pin("advisories", "snapshot"), pin("verified", "verification")])
     entry["measurement"] = {"comparator": "adapter", "parser": "adapter", "config": "config", "normalizer": "adapter"}
@@ -217,6 +311,7 @@ def test_plan_one_direction_mapping_and_transitive_use(registry, plan):
     dependency["id"] = "dependency"
     registry["entries"].append(dependency)
     registry["entries"][0]["dependencies"] = ["dependency"]
+    plan["environment"]["runtime"].append("dependency")
     assert R.validate_plan(plan, registry) == plan
     registry["entries"][0]["dependencies"] = []
     with pytest.raises(A.AcceptanceError, match="unused registry entry"):
@@ -236,6 +331,7 @@ def test_plan_missing_dangling_duplicate_or_unused_refs_hold(plan, registry, ref
 def test_explicit_tool_free_plan_and_legacy_refusal(plan):
     registry = {"schema_version": 2, "files": [], "entries": []}
     plan["rows"][0]["registry_entries"] = []
+    plan["environment"]["runtime"] = []
     assert R.validate_plan(plan, registry) == plan
     with pytest.raises(A.AcceptanceError):
         A.validate_plan(plan)
@@ -299,16 +395,16 @@ def test_negative_proof_observations_are_data_not_schema_success(registry, obser
 
 def test_declarative_reader_never_reads_distribution_or_launches_tools(tmp_path, registry, monkeypatch):
     (tmp_path / "source.dat").write_bytes(b"{}")
-    original = Path.open
+    original = os.open
 
     def checked(path, *args, **kwargs):
-        assert path.name != "jdk.dat", "distribution was opened by declarative reader"
+        assert Path(path).name != "jdk.dat", "distribution was opened by declarative reader"
         return original(path, *args, **kwargs)
 
     def forbidden(*args, **kwargs):
         pytest.fail("preflight record reader attempted process/network execution")
 
-    monkeypatch.setattr(Path, "open", checked)
+    monkeypatch.setattr(os, "open", checked)
     monkeypatch.setattr(subprocess, "Popen", forbidden)
     monkeypatch.setattr(socket, "socket", forbidden)
     assert R.read_declarative_inputs(tmp_path, registry) == {"source": b"{}"}
@@ -379,7 +475,7 @@ def test_missing_root_and_permission_errors_do_not_expose_locator(tmp_path, regi
     def denied(*args, **kwargs):
         raise PermissionError(str(tmp_path / "sensitive"))
 
-    monkeypatch.setattr(Path, "open", denied)
+    monkeypatch.setattr(os, "open", denied)
     with pytest.raises(A.AcceptanceError) as error:
         R.read_declarative_inputs(tmp_path, registry)
     assert str(tmp_path) not in str(error.value)
@@ -396,7 +492,7 @@ def test_row_overrides_bind_rows_and_external_bytes(plan, registry):
 
 
 def test_service_environment_references_are_typed(plan, registry, observation):
-    plan["environment"]["services"] = [{"id": "java", "banner": "service v1"}]
+    plan["environment"].update(services=["java"], runtime=[])
     with pytest.raises(A.AcceptanceError):
         R.validate_plan(plan, registry)
     with pytest.raises(A.AcceptanceError):
@@ -404,3 +500,237 @@ def test_service_environment_references_are_typed(plan, registry, observation):
     registry["entries"][0]["kind"] = "service"
     R.validate_plan(plan, registry)
     R.validate_observation(observation, registry)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction semantics")
+def test_guard_m20_real_junction_above_staging_root(tmp_path):
+    target = tmp_path / "real"
+    (target / "cache").mkdir(parents=True)
+    (target / "cache" / "proof").write_bytes(b"ok")
+    junction = tmp_path / "junction"
+    # Fixed OS helper; both paths are isolated fixture directories, no staged tool.
+    result = subprocess.run(["cmd", "/c", "mklink", "/J", str(junction), str(target)],
+                            capture_output=True, check=False)  # nosec B603 B607
+    assert result.returncode == 0, result.stderr
+    with pytest.raises(A.AcceptanceError, match="link/reparse"):
+        R.staged_path(junction / "cache", "proof")
+
+
+@pytest.mark.parametrize("version", [True, 4.0, 3, 5])
+def test_guard_m69_plan_version(plan, registry, version):
+    plan["schema_version"] = version
+    with pytest.raises(A.AcceptanceError, match="schema_version"):
+        R.validate_plan(plan, registry)
+
+
+def test_guard_m55_snapshot_provenance(registry):
+    snapshot = pin("advisories", "snapshot")
+    snapshot["provenance"]["retrieved_at"] = "yesterday"
+    registry["files"].append(snapshot)
+    registry["entries"][0]["snapshots"] = ["advisories"]
+    with pytest.raises(A.AcceptanceError, match="UTC"):
+        R.validate_registry(registry)
+
+
+def test_guard_m29_unrequested_verification(registry):
+    for obj in (registry["entries"][0], registry["files"][0]):
+        obj["provenance"]["verification"] = "source"
+    with pytest.raises(A.AcceptanceError, match="independent_verification"):
+        R.validate_registry(registry)
+
+
+@pytest.mark.parametrize("field,value", [("version", "v1"), ("provenance", provenance())])
+def test_guard_m25_non_distribution_metadata(registry, field, value):
+    registry["files"][1][field] = value
+    with pytest.raises(A.AcceptanceError, match="only distributions/snapshots"):
+        R.validate_registry(registry)
+
+
+@pytest.mark.parametrize("outputs", [["xxxxxxxxxxsafe"], ["{scratch}/../escape"],
+                                     ["{scratch}/a", "{scratch}/a"]], ids=["M37", "M38", "M39"])
+def test_guard_template_outputs(registry, outputs):
+    registry["entries"][0]["command"]["outputs"] = outputs
+    with pytest.raises(A.AcceptanceError):
+        R.validate_registry(registry)
+
+
+def test_guard_m05_utc_requires_zero_padding():
+    with pytest.raises(A.AcceptanceError, match="canonical UTC"):
+        R.utc("2026-1-1T00:00:00Z")
+
+
+@pytest.mark.parametrize("field,value", [("version", "99"), ("provenance.source", "another-vendor")],
+                         ids=["M47", "M46"])
+def test_guard_artifact_entry_exact_agreement(registry, field, value):
+    change(registry["files"][0], field, value)
+    with pytest.raises(A.AcceptanceError, match="differs from its artifact"):
+        R.validate_registry(registry)
+
+
+def test_guard_m08_escaped_quote_does_not_hide_nesting(monkeypatch):
+    monkeypatch.setattr(R, "MAX_DEPTH", 1)
+    with pytest.raises(A.AcceptanceError, match="nesting"):
+        R.decode(b'["\\\"",[]]')
+
+
+def test_guard_m09_json_keys_count_towards_node_budget(monkeypatch):
+    monkeypatch.setattr(R, "MAX_NODES", 2)
+    with pytest.raises(A.AcceptanceError, match="node count"):
+        R.decode(b'{"key":0}')
+
+
+def test_guard_m12_decoder_requires_bytes():
+    with pytest.raises(A.AcceptanceError):
+        R.decode(bytearray(b"{}"))
+
+
+def test_guard_m14_pipe_in_relative_path():
+    with pytest.raises(A.AcceptanceError):
+        R.relative_path("a|b")
+
+
+def test_guard_m43_proof_marker_limit(registry):
+    registry["entries"][0]["offline"]["positive_control"] = "x" * (R.MAX_MARKER + 1)
+    with pytest.raises(A.AcceptanceError, match="marker exceeds"):
+        R.validate_registry(registry)
+
+
+def test_guard_m51_checker_config_role(registry):
+    entry = registry["entries"][0]
+    entry.update(kind="checker", expected_banner=None)
+    registry["files"].append(pin("adapter", "adapter"))
+    entry["measurement"] = dict.fromkeys(("comparator", "parser", "config", "normalizer"), "adapter")
+    with pytest.raises(A.AcceptanceError, match="wrong role"):
+        R.validate_registry(registry)
+
+
+@pytest.mark.parametrize("fault", ["M66", "M67"])
+def test_guard_override_limits(environment, monkeypatch, fault):
+    environment["row_overrides"] = [{"id": "build", "environment": {
+        "path": "override.json", "sha256": HASH, "size": 2}}]
+    if fault == "M67":
+        monkeypatch.setattr(R, "MAX_TOTAL_BYTES", 1)
+    with pytest.raises(A.AcceptanceError):
+        R.validate_environment(environment, overrides=fault != "M66")
+
+
+def test_guard_m70_registry_ref_portability(plan, registry):
+    plan["registry_ref"] = "../registry.json"
+    with pytest.raises(A.AcceptanceError):
+        R.validate_plan(plan, registry)
+
+
+@pytest.mark.parametrize("fault", ["M82", "M85", "M86", "M87"])
+def test_guard_observation_proof_contract(observation, registry, monkeypatch, fault):
+    proof = observation["entries"][0]["offline"]
+    if fault == "M82":
+        proof["mode"] = "assumed"
+    elif fault == "M87":
+        monkeypatch.setattr(R, "MAX_TOTAL_BYTES", 3)
+    else:
+        proof["endpoints"] = [{"host": "127.0.0.1", "port": 1,
+                               "pid": 0 if fault == "M85" else 1,
+                               "owned": 1 if fault == "M86" else True}]
+    with pytest.raises(A.AcceptanceError):
+        R.validate_observation(observation, registry)
+
+
+def test_guard_m90_non_regular_file_rejected_before_open(tmp_path, registry, monkeypatch):
+    source = tmp_path / "source.dat"
+    source.write_bytes(b"{}")
+    original = Path.stat
+
+    def nonregular(path, *args, **kwargs):
+        result = original(path, *args, **kwargs)
+        if path == source:
+            fields = list(result)
+            fields[0] = stat.S_IFIFO | 0o600
+            return os.stat_result(fields)
+        return result
+
+    monkeypatch.setattr(Path, "stat", nonregular)
+    # Isolate the regular-file guard from the separately tested path resolver.
+    monkeypatch.setattr(R, "staged_path", lambda root, relative: source)
+    with pytest.raises(A.AcceptanceError, match="must be a regular file"):
+        R.read_declarative_inputs(tmp_path, registry)
+
+
+def test_guard_m94_unreadable_file_has_unavailable_code(tmp_path, registry, monkeypatch):
+    (tmp_path / "source.dat").write_bytes(b"{}")
+
+    def denied(*args, **kwargs):
+        raise PermissionError("private-cache-locator")
+
+    monkeypatch.setattr(os, "open", denied)
+    with pytest.raises(A.AcceptanceError) as error:
+        R.read_declarative_inputs(tmp_path, registry)
+    assert error.value.code == "acceptance_preflight_unavailable"
+    assert error.value.__context__ is None
+
+
+def test_guard_m97_json_key_unicode():
+    with pytest.raises(A.AcceptanceError, match="invalid Unicode"):
+        R.decode(b'{"\\ud800":0}')
+
+
+def test_registry_role_and_kind_refuse_otherwise_valid_shape(registry):
+    unknown = pin("unknown", "provenance")
+    unknown["role"] = "unknown"
+    with pytest.raises(A.AcceptanceError, match="unsupported staged file role"):
+        R.file_pin(unknown)
+    registry["entries"][0].update(kind="unknown", expected_banner=None)
+    with pytest.raises(A.AcceptanceError, match="unsupported registry kind"):
+        R.validate_registry(registry)
+
+
+def test_whole_line_markers_may_contain_each_other(registry):
+    registry["entries"][0]["offline"].update(mode="offline-recipe", cache_hit="ok",
+                                             positive_control="cache ok", real_fetch="fetch ok")
+    assert R.validate_registry(registry) == registry
+
+
+@pytest.mark.parametrize("role", ["runtime", "compiler", "package_manager", "services"])
+def test_environment_role_count_boundary(environment, monkeypatch, role):
+    environment[role] = ["java", "node"]
+    monkeypatch.setattr(R, "MAX_ENTRIES", 2)
+    R.validate_environment(environment)
+    monkeypatch.setattr(R, "MAX_ENTRIES", 1)
+    with pytest.raises(A.AcceptanceError, match="bounded list"):
+        R.validate_environment(environment)
+
+
+def test_file_replaced_between_lstat_and_open_is_refused(tmp_path, registry, monkeypatch):
+    source = tmp_path / "source.dat"
+    source.write_bytes(b"{}")
+    original = os.open
+
+    def swapped(path, flags, *args, **kwargs):
+        assert Path(path) == source
+        source.rename(tmp_path / "previous.dat")
+        source.write_bytes(b"different")
+        return original(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", swapped)
+    with pytest.raises(A.AcceptanceError, match="changed"):
+        R.read_declarative_inputs(tmp_path, registry)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX FIFO/no-follow flags")
+@pytest.mark.parametrize("replacement", ["fifo", "link"])
+def test_posix_leaf_swap_never_blocks_or_follows(tmp_path, registry, monkeypatch, replacement):
+    source = tmp_path / "source.dat"
+    source.write_bytes(b"{}")
+    original = os.open
+
+    def swapped(path, flags, *args, **kwargs):
+        assert flags & os.O_NONBLOCK and flags & os.O_NOFOLLOW
+        source.rename(tmp_path / "previous.dat")
+        if replacement == "fifo":
+            os.mkfifo(source)
+        else:
+            source.symlink_to(tmp_path / "previous.dat")
+        return original(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", swapped)
+    with pytest.raises(A.AcceptanceError):
+        R.read_declarative_inputs(tmp_path, registry)

@@ -5,9 +5,11 @@ Distribution pins are never copied by the declarative-input reader (D1).
 """
 
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 import re
 import stat
+import unicodedata
 
 from agenttalk import acceptance as A
 
@@ -24,7 +26,7 @@ MAX_TOTAL_BYTES = A.MAX_TOTAL_BYTES
 ROLES = ("distribution", "manifest", "lockfile", "config", "proof-log", "banner",
          "provenance", "verification", "snapshot", "adapter")
 PLACEHOLDERS = ("{artifact}", "{checkout}", "{scratch}", "{cache_overlay}")
-_DEVICE = re.compile(r"(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?\Z", re.I)
+_DEVICE = re.compile(r"(?:con|prn|aux|nul|conin\$|conout\$|com[0-9¹²³]|lpt[0-9¹²³]) *?(?:\..*)?\Z", re.I)
 
 
 def _list(value, label, limit=MAX_FILES):
@@ -157,11 +159,15 @@ def staged_path(root, relative):
         return A._path(root, relative)
     except OSError:
         # Never include an OS exception's private locator in a public hold.
-        A._fail("staged input is unavailable", "acceptance_preflight_unavailable")
+        pass
+    raise A.AcceptanceError("acceptance_preflight_unavailable", "staged input is unavailable") from None
 
 
 def file_pin(pin):
-    A._object(pin, "id role path sha256 size expires_at version provenance", "staged file pin")
+    keys = "id role path sha256 size expires_at version provenance"
+    if isinstance(pin, dict) and pin.get("role") == "snapshot":
+        keys += " distribution"
+    A._object(pin, keys, "staged file pin")
     A._id(pin["id"])
     if pin["role"] not in ROLES:
         A._fail("unsupported staged file role")
@@ -176,6 +182,9 @@ def file_pin(pin):
         A._fail("only distributions/snapshots declare version and provenance")
     if pin["role"] == "snapshot":
         utc(pin["expires_at"])
+        A._object(pin["distribution"], "id sha256", "snapshot distribution pin")
+        A._id(pin["distribution"]["id"])
+        A._digest(pin["distribution"]["sha256"])
     elif pin["expires_at"] is not None:
         A._fail("only snapshots declare expires_at")
     return pin
@@ -247,10 +256,14 @@ def _offline_policy(value):
 
 def _entry(entry, files):
     A._object(entry, "id kind version artifact dependencies inputs snapshots provenance command offline "
-              "failure_policy measurement", "registry entry")
+              "failure_policy measurement expected_banner", "registry entry")
     A._id(entry["id"])
     if entry["kind"] not in ("checker", "toolchain", "service"):
         A._fail("unsupported registry kind")
+    if entry["kind"] in ("toolchain", "service"):
+        _text(entry["expected_banner"], "expected banner")
+    elif entry["expected_banner"] is not None:
+        A._fail("only toolchain/service entries declare expected_banner")
     # Exact, opaque versions: no discovery, semver matching or normalization.
     _text(entry["version"], "exact version")
     used = {_file_ref(files, entry["artifact"], ("distribution",))}
@@ -291,9 +304,9 @@ def validate_registry(value):
     total = 0
     for pin in files.values():
         file_pin(pin)
-        key = pin["path"].casefold()
-        if key in paths:
-            A._fail("duplicate portable staged path")
+        key = unicodedata.normalize("NFC", pin["path"]).casefold()
+        if any(key == p or key.startswith(p + "/") or p.startswith(key + "/") for p in paths):
+            A._fail("duplicate or conflicting portable staged path")
         paths.add(key)
         if pin["role"] != "distribution":
             total += pin["size"]
@@ -303,6 +316,11 @@ def validate_registry(value):
     for pin in files.values():
         if pin["role"] in ("distribution", "snapshot"):
             used.update(_provenance(pin["provenance"], files))
+        if pin["role"] == "snapshot":
+            ref = _file_ref(files, pin["distribution"]["id"], ("distribution",))
+            if pin["distribution"]["sha256"] != files[ref]["sha256"]:
+                A._fail("snapshot distribution digest differs from pin")
+            used.add(ref)
     edges = 0
     for entry in entries.values():
         used.update(_entry(entry, files))
@@ -334,9 +352,9 @@ def validate_environment(value, *, overrides=True):
               "environment_digest config_digest scratch cache_overlay service_data time_limit_seconds "
               "memory_limit_bytes row_overrides", "environment")
     A._version(value["schema_version"])
-    for key in ("runtime", "compiler", "package_manager"):
-        if value[key] is not None:
-            _text(value[key], key)
+    for key in ("runtime", "compiler", "package_manager", "services"):
+        _list(value[key], key, MAX_ENTRIES)
+        _refs(value[key], key)
     for key in ("os", "locale", "timezone"):
         _text(value[key], key)
     for key in ("environment_digest", "config_digest"):
@@ -346,9 +364,6 @@ def validate_environment(value, *, overrides=True):
         A._fail("unsupported scratch/cache/service-data policy")
     _integer(value["time_limit_seconds"], "time limit", 1, 86400)
     _integer(value["memory_limit_bytes"], "memory limit", 1, 2**40)
-    for service in _index(value["services"], "service banners", MAX_ENTRIES).values():
-        A._object(service, "id banner", "service banner")
-        _text(service["banner"], "service banner")
     rows = _index(value["row_overrides"], "row overrides", MAX_FILES)
     if rows and not overrides:
         A._fail("nested environment overrides are unsupported")
@@ -408,9 +423,15 @@ def policy(plan_bytes, registry_bytes):
 
 
 def _service_refs(environment, entries):
-    for service in environment["services"]:
-        if service["id"] not in entries or entries[service["id"]]["kind"] != "service":
-            A._fail("unresolved service environment reference")
+    seen = set()
+    for role in ("runtime", "compiler", "package_manager", "services"):
+        kind = "service" if role == "services" else "toolchain"
+        for ref in environment[role]:
+            if ref not in entries or entries[ref]["kind"] != kind or ref in seen:
+                A._fail("unresolved, mistyped or repeated environment entry reference")
+            seen.add(ref)
+    if seen != {key for key, entry in entries.items() if entry["kind"] in ("toolchain", "service")}:
+        A._fail("environment must reference every toolchain/service entry exactly once")
 
 
 def evidence_ref(value):
@@ -465,13 +486,35 @@ def read_declarative_inputs(root, registry):
         if pin["role"] == "distribution":
             continue
         path = staged_path(root, pin["path"])
+        data = None
         try:
-            if not stat.S_ISREG(path.stat().st_mode):
+            before = path.lstat()
+            if not stat.S_ISREG(before.st_mode):
                 A._fail("staged declarative input must be a regular file")
-            with path.open("rb") as stream:
-                data = stream.read(min(MAX_INPUT_BYTES, MAX_TOTAL_BYTES - total) + 1)
+            # NOFOLLOW refuses a substituted leaf link on POSIX. NONBLOCK keeps
+            # a substituted FIFO from hanging before fstat can reject its type.
+            flags = (os.O_RDONLY | getattr(os, "O_BINARY", 0)
+                     | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+            fd = os.open(path, flags)
+            try:
+                opened = os.fstat(fd)
+                # Windows lacks O_NOFOLLOW: also reject a leaf replaced by a
+                # link to the original inode, even when fstat identity matches.
+                after = path.lstat()
+                if (not stat.S_ISREG(opened.st_mode) or not stat.S_ISREG(after.st_mode)
+                        or getattr(after, "st_file_attributes", 0) & 1024
+                        or any(getattr(before, key, None) != getattr(current, key, None)
+                               for current in (opened, after) for key in ("st_dev", "st_ino", "st_mode"))):
+                    A._fail("staged declarative input changed while opening")
+                with os.fdopen(fd, "rb", closefd=False) as stream:
+                    data = stream.read(min(MAX_INPUT_BYTES, MAX_TOTAL_BYTES - total) + 1)
+            finally:
+                os.close(fd)
         except OSError:
-            A._fail("staged declarative input is unreadable", "acceptance_preflight_unavailable")
+            data = None
+        if data is None:
+            raise A.AcceptanceError("acceptance_preflight_unavailable",
+                                    "staged declarative input is unreadable") from None
         total += len(data)
         if len(data) > MAX_INPUT_BYTES or total > MAX_TOTAL_BYTES:
             A._fail("declarative input exceeds byte budget", "acceptance_record_missing")
