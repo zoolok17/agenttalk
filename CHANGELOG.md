@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Console v2 preview at `/v2` (pitch slice, step M1).** A second, read-only
+  document route beside the classic `/dashboard`: shell, theme engine (Midnight
+  styled; Paper, Synthwave and Terminal carry their variables), header with team
+  chips, and the agent-name shortener (`claude-agenttalk-frontend-dev` shows as
+  `fe-dev`). It serves three new allowlisted assets (`console2.css`,
+  `console2-model.js`, `console2.js`) under the unchanged console
+  Content-Security-Policy: system fonts, no inline style or script, bus content
+  only through `textContent`. The classic console gains a "New console" link and
+  `agenttalk dashboard` prints the `/v2` URL; `/` and `/dashboard` are unchanged.
+  Plan and open items: `docs/STEP-CONSOLE-V2-PITCH.md`.
+
 ### Changed
 
 - Reduce acceptance Git process overhead with command-local metadata/history

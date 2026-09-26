@@ -272,3 +272,45 @@ phone layout, inherited surfaces, self-hosted fonts. None of it is stubbed with 
   supervisor kill-switch clear.
 - **Q11 Node in CI.** The derivation tests need `node`. If CI runners do not guarantee it, do you want them
   mirrored in Python (the model is ~300 lines of plain logic) or accept the skip?
+
+## 11. M1 record (route, shell, theme engine, header, name shortener)
+
+Lead's answers to Q1-Q11 (2026-09-26): Q1 `/v2` plus the two links; Q2 `/` stays classic; Q3 no host name (a
+later label would be an operator-set config value, never `gethostname()`); Q4 stuck candidate + a sixth "down"
+state; Q5 show cards with "No evidence recorded"; Q6 per-browser "since you last looked"; Q7 one account per
+runtime; Q8 two offline banners; Q9 hexagon avatars already in master; Q10 read-only pitch; Q11 node tests with a
+skip. G2 kinds as proposed, G8 wording "last progress N min ago", G9 "reply status unknown" raises no card.
+
+Shipped:
+
+- `GET /v2` (`render_console2()`), same `_DASHBOARD_CSP` object as `/dashboard`; three literal keys in the static
+  allowlist; `agenttalk dashboard` prints `console v2 preview at <url>v2`; the classic topbar has a "New console"
+  link to the fixed path `/v2`. `/`, `/dashboard`, `console.js` behaviour: unchanged.
+- `console2.css`: four `:root[data-theme]` variable blocks (values from `tokens/themes.json`), system font stacks,
+  the 340 px rail grid, header and footer. Terminal flips only fonts and radii.
+- `console2-model.js` (pure): `shortName`, `parseAgentName`, `teamProject`, theme helpers.
+- `console2.js`: header (brand, team chips, theme choice, `?` button), `t` key, footer hint, theme persistence.
+- Tests: `tests/test_console2_web.py` (41 pass, 1 skip when `design/` is absent), `tests/console2_model.test.mjs`
+  (14), `tests/console2_render.test.mjs` (11), shared `tests/console2_harness.mjs` (runner + a recording DOM stub
+  that throws on any markup or style injection).
+
+Changed from the plan above, and why:
+
+1. **Team chips do one `GET /api/state` in M1** (the plan said data-free). The chips need the roots list; the
+   polling layer, freshness dot and needs count stay M2. A failed or malformed read shows a disabled "No team
+   data" / "Team" chip, nothing more.
+2. **Footer hints list only `t theme`.** Advertising `j k enter l / 1 2` before they work would be a false claim;
+   they arrive with the keyboard milestone. The `?` button is present and disabled until M4.
+3. **`shortName` with an empty `currentProject` keeps the project prefix** (rule 2: "in cross-team lists keep it
+   as a prefix"). The handoff's reference code drops nothing in that case; all nine reference cases still pass
+   verbatim. The only difference is the previously unspecified empty-context call.
+4. **Role words are looked up with an own-property check**, so a role named `constructor` or `toString` is left
+   alone (the reference code would return a function).
+5. **The classic link is six lines, not one** (element, `href`, `title`, append, plus one CSS rule).
+6. **The source lint also bans `method:` and `body:` in the v2 scripts.** It makes "read-only slice" a test: the
+   only request is `fetch('/api/state', {cache})`. It must be relaxed deliberately when the composer's send lands.
+7. **Paper carries the two contrast fixes the handoff recommends** (`dim #6B655B`, `accent #C9481F`) instead of
+   `themes.json`'s values; the token test pins the difference. Not reviewed.
+8. **CSS/JS tests strip comments before linting**, so comments can describe what is banned.
+
+Not done in M1 (as planned): the polling data layer, every derivation, stream, rail, states, keyboard overlay.
