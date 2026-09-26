@@ -171,3 +171,87 @@ All runs foreground with `PYTHONPATH=<worktree>/src`, `PYTHONDONTWRITEBYTECODE=1
 - Ruff and Bandit (B101 excluded for pytest assertions) are clean for both files.
 - Size: `work_board.py` 320 lines, tests 255, this record about 90. That is
   above the 350-500 estimate but below the 700-line split threshold.
+
+## B3b — adversarial reducer fixtures and cold-read corrections
+
+Base: B3a `222cb7d` merged with B2a-f `f0e6ea2` (merge `6f66de6`, documentation
+conflicts only), so `external_deliverable` and the reserved
+`assignee_model_vendors` map are the built contract. Contract: design/work-board
+`09b5429` sections 2 and 3, the B3b row in section 9, the codex B3a cold read
+(eight findings) and the lead's M3 ruling.
+
+Fixtures now publish through the real shared normalizer: the test `Bus`
+serves as the store that `work_tags.normalize` consults, so replies inherit
+tags, verdicts canonicalize, `supersedes` and external declarations are
+validated exactly as at publication. `raw=True` marks the only exceptions:
+malformed or pre-B2a history that validated reads still return. The
+publisher-owned vendor map is added after normalization, as B2b will.
+
+| Finding | Correction | Test |
+| --- | --- | --- |
+| 1 needs-info HOLD discarded | Native needs-info is a HOLD kept as verdict evidence. Rescinding the review closes the obligation but not the HOLD; only a successful replacement discharges it. | `test_f1_rescinded_needs_info_hold_is_not_erased_by_an_unrelated_go`, `test_hold_discharged_only_by_a_successful_replacement` |
+| 2 design author independent | Design purpose persists until a cycle has a build dispatch, so a linked fix keeps design authors in the builder set. An unlinked fix in a design cycle makes purpose unknown (blocker). | `test_f2_linked_design_fix_keeps_the_design_author_out_of_independent_review`, `test_unlinked_fix_in_a_design_cycle_leaves_purpose_unknown` |
+| 3 missing superseded opener | The supersession graph reports a missing target as row 2 "missing referenced opener", with foreign-item, cross-cycle, branching and cyclic edges likewise. | `test_f3_snapshot_missing_the_superseded_opener_is_unknown`, `test_historical_branching_cyclic_or_cross_cycle_supersession_is_unknown` |
+| 4 repository policy dropped | The policy is the whole declaration: repo, branch, target, gates and no-gates reason. Differing declared origins are "conflicting repository/check policies". | `test_f4_parallel_origins_with_different_repositories_conflict` |
+| 5 superseded success reused | Only the surviving end of each explicit chain can satisfy an execution obligation. A declined parallel execution needs its own replacement. | `test_f5_superseded_success_does_not_satisfy_a_declined_replacement`, `test_declined_parallel_execution_needs_its_own_replacement` |
+| 6 one-edge resolution | A FIX/HOLD resolves when the surviving end of its replacement chain is a complete GO. A pending end reads "awaiting replacement review". | `test_f6_replacement_chain_discharges_the_original_fix` |
+| 7 head conflict too late | Incomparable heads of surviving, non-rescinded reviews are a row 2 conflict before any activity row. A rescinded review pins no candidate. | `test_f7_pending_review_of_a_second_head_is_a_candidate_conflict_first`, `test_rescinded_review_does_not_pin_a_competing_candidate` |
+| 8 malformed numbers abort | All opener fields parse inside one guard. Malformed history makes only that item row 2 "malformed work metadata" with its opener IDs; other items reduce. | `test_f8_malformed_historical_numbers_are_a_per_item_unknown` |
+| M3 ruling | An external declaration conflicts only with a build/fix in the SAME cycle. A later seat-fix cycle is a normal build, still judged by the all-cycle builder set. | `test_external_deliverable_review_only_item_and_same_cycle_mixed_provenance`, `test_lead_ruling_m3_later_seat_fix_cycle_is_a_normal_build` |
+
+Also corrected here: row 3 now says **integrated without independent GO**
+when a merge bypassed independent review (design row 3: missing review evidence
+stays explicit); every item carries a `checks` key.
+
+Adversarial cases beyond the cold read:
+
+- Every ordering and writer-clock skew: 40 seeded shuffles per scenario give
+  identical output, and envelope IDs permuted with their links give identical
+  placements. Scenarios: ready, FIX, chain, fan-out, rescinded HOLD.
+- Fan-out: a group review needs every recipient's GO, and one FIX wins. A group
+  build needs every recipient.
+- Rescind/supersede interleavings: superseding is not cancelling; a rescinded
+  replacement revives nothing; a withdrawn replacement review returns the FIX to
+  a fix round.
+- Partial snapshots: a missing opener is row 2, and a missing reply is Queued,
+  never Ready.
+- Pre-B2a history: a done reply without verdict or `verdict_issue` is "verdict
+  missing", and a text `"false"` declaration is not external.
+
+Interpretations, for the delta read:
+
+- needs-info counts as a HOLD whatever its verdict field says. A later
+  terminal reply of the same obligation governs, because a closed thread cannot
+  precede its own needs-info.
+- Design purpose is judged per current cycle: no build dispatch keeps design
+  authors among builders. This is deliberately conservative for linked and
+  unlinked fixes alike.
+- Only declared policy tuples are compared. An origin that declares nothing is
+  not a conflict.
+
+### Executed validation
+
+All runs foreground with `PYTHONPATH=<worktree>/src`, `PYTHONDONTWRITEBYTECODE=1`,
+`python -B`, task-scratch TEMP/TMP/basetemps and `-q -p no:cacheprovider`.
+
+- The merge alone: reducer and work-tag tests **96 passed**. All 15 B3a tests
+  passed unchanged under real normalization.
+- Failing first (reviewer sequences, M3 ruling, new adversarial cases):
+  **11 failed, 19 passed**. The passing four (ordering/skew, both fan-outs,
+  partial snapshots) already held on B3a and remain as regression guards.
+- After the rewrite: **30 passed**. Four behaviour pins were then added after
+  implementation, with mutation proving they are load-bearing.
+- Two mutants survived and exposed real coverage gaps: B2a always stamps
+  `verdict_issue`, and text `"false"` history. Both are now pinned.
+- Final: `tests/test_work_board_reducer.py` **35 passed**. With
+  `tests/test_work_tags.py`: **116 passed** on Python 3.10.11. With
+  `tests/test_threads.py` too: **190 passed** on Python 3.14.6.
+- Mutation (committed first, restored through git, bytecode-free): **28/28
+  killed**. That covers the sixteen B3b corrections and edge guards plus the
+  twelve re-anchored B3a rules. The mutation script refuses to run on an
+  uncommitted tree.
+- Ruff and Bandit (B101 excluded) are clean; the deterministic test RNG is
+  annotated. `git diff --check` is clean.
+- Size (B3b only, over merge `6f66de6`): `work_board.py` +216/-116, tests
+  +331/-14, and this record. That is above the section 9 400-600 estimate
+  once the adversarial suite is counted, and below the split threshold for code.

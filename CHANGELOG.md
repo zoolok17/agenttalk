@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add the pure work-board reducer: validated envelopes become work items placed by
   the design's precedence rows from explicit correlation only, with a counted legacy
   group. No bodies, subjects or message-ID order are used; unknown is never green.
+  Adversarial hardening keeps needs-info HOLDs, follows explicit replacement chains,
+  compares whole repository/check policies and degrades malformed or partial history
+  to a per-item Unknown instead of a false Ready.
 
 - Validate and inherit external work declarations, reserve publisher-owned vendor
   metadata, and align both lead skills with the finalized work-board contract.
