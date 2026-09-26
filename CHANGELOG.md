@@ -9,8 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- Plan acceptance increment 2 registry and offline preflight; implementation is
-  pending lead approval (see `docs/STEP-ACCEPTANCE-INC2.md`).
+- Add isolated acceptance increment-2 strict registry/environment/proof record
+  readers and bounded declarative-input validation. CLI preflight and close
+  integration await later milestones; no new GO path is enabled. See
+  `docs/STEP-ACCEPTANCE-INC2.md` for limits and retention decisions.
 
 ### Changed
 

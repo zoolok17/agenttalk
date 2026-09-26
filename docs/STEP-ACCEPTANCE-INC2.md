@@ -1,9 +1,9 @@
 # Acceptance increment 2 plan
 
 **Audience:** maintainers and cold reviewers deciding the registry/offline-preflight
-implementation boundary. **Status:** step 0 proposal only; implementation awaits
-the lead's go. This is an explanation of the proposed work, not a shipped CLI
-reference or a claim of implemented checks.
+implementation boundary. **Status:** M1 record readers implemented for cold
+review; M2/M3 are not started. The lead approved the plan subject to D1–D6 below.
+This record distinguishes the isolated M1 API from future CLI/GO integration.
 
 Base: `fc21190f414d3a926ba8fd3aa405ab3691cfe1b7` (0.92.0).
 Branch: `feat/acceptance-inc2`.
@@ -12,6 +12,36 @@ LD1–LD3, the Registry entry/Environment rows and retention paragraphs, Offline
 execution and close-out, and Buildable increments item 2. Existing binding was
 checked against [the guide](ACCEPTANCE.md) and
 [increment 1's record](STEP-ACCEPTANCE-INC1.md).
+
+## Lead decisions
+
+The lead approved the plan in `tk-1b066cd1a42c`; unlisted proposals are accepted.
+These decisions override the corresponding original planning choices below.
+
+- **D1:** distributions are pinned by exact digest and cache-relative location,
+  never copied into retained evidence. Only bounded declarative inputs are
+  retained: manifests, lockfiles, configs, proof logs, banner captures, provenance
+  and verification records (including bounded advisory snapshots and declarative
+  adapter descriptions). An oversized declarative input HOLDs. Current candidates
+  verify live pins; unavailable historical cache entries display **artifact not
+  retained, pinned by digest**, a non-green status rather than a new failure or
+  fabricated pass of the original attempt.
+- **D2:** plan rows reference registry entry IDs, with explicit empty lists for
+  tool-free rows. Registry entries never reference rows. Reject dangling or
+  unused references; entries used transitively through dependencies count as used.
+- **D3:** M2 adds a read-only operator preflight command using the same evaluator,
+  proposed as `close acceptance preflight --plan PLAN --cache-root ROOT [--json]`.
+  It prints outcomes/codes, exits zero only when all required entries pass, and
+  writes no store data or close record.
+- **D4:** the private cache locator belongs only in private route/bundle records,
+  never a sanitized/public summary, publishable hold detail or changelog. M1's
+  input errors suppress OS path details; M2/M3 must test sanitized output too.
+- **D5:** M3 adds an operator staging walkthrough with synthetic pinned JDK,
+  checker jar and expiring snapshot, full registry/layout and success/failure
+  output. No downloads or real staged-tool launches in tests.
+- **D6:** stop after every milestone for a cold read. Final pre-merge review is a
+  cross-vendor Opus sweep; keep milestone diffs well below about 1,500 changed
+  lines excluding test tables. No PR before the final milestone's read.
 
 ## Invariant and existing integration
 
@@ -90,10 +120,10 @@ already accepted extension of the design.
 | --- | --- |
 | Compatibility with shipped registry v1/schema-3 passes | Add registry v2 with plan/route/bundle schema 4 for increment 2. Preserve explicit legacy evaluation; never claim a legacy pass performed preflight. A required-preflight policy rejects legacy routes. Old engines reject schema 4. No silent in-place migration or reinterpretation of frozen v1 bytes. |
 | Exact field names/nested records | M1 publishes a closed field/type table before implementing validators. Include every required Registry entry and Environment concept in the cited design rows. Every conditional absence is explicit, never an unknown-field escape hatch. Use exact versions, SHA-256 pins and typed references, not semver ranges or free-form executable policy. |
-| Which rows require which tools | Registry entries declare covered stable row IDs and typed dependency references, frozen by `registry_digest`. Validate all references and require each schema-4 run/row to declare its entry set. A tool-free row needs an explicit empty set; do not infer a universal tool catalogue. Pin/config/reference changes use normal successor/LD2 review. |
+| Which rows require which tools | D2 overrides the original bidirectional proposal: plan rows alone contain `registry_entries`. Empty is explicit. Validate references and dependency closure; reject unused entries. Registry remains reusable across plans. |
 | Cache root discovery and portable locations | Proposed `--acceptance-cache-root` at open names an explicitly approved private root; entries use only cache-relative regular-file paths. Store the private root locator in the route. No ambient PATH discovery, user cache guessing, URL opening, archive extraction or silent fallback. |
 | Transitive dependency completeness | Validate the declared finite dependency graph, all references and staged hashes; reject duplicate/conflicting pins, dangling edges and cycles for this increment. Retain package manifests/lockfiles as bounded inputs. Do not invoke a package manager or pretend declared closure proves an undeclared runtime dependency cannot exist. |
-| Large packages/directories and retention | Support explicitly enumerated regular files with per-file and aggregate byte limits, no glob/directory traversal as a manifest language. Retain required verified file bytes with their manifests, not only hashes; enforce limits before reads/copies. Oversized tool distributions are unsupported/HOLD until a bounded private evidence-store policy is agreed, never hash-only success. |
+| Large packages/directories and retention | D1 overrides full binary retention: distribution files are pinned and live-verified, never copied. Explicit bounded declarative files are retained; no glob/directory manifest language. Historical unavailable distributions have the visible non-green D1 status. |
 | Numeric limits | Start with existing strict-JSON and retained-byte limits; add explicit entry/file/dependency-edge/argv/proof-marker counts and depth limits in M1. Every limit is tested at the boundary. Do not raise global limits opportunistically for a large tool. Lead may adjust these bounds before implementation. |
 | Provenance versus trust | Require source coordinates, retrieval UTC time, exact digest/version, checksum/signature-source coordinates and explicit independent-verification status plus evidence reference. Coordinates are inert strings. Same-origin checksums are labelled provenance only. Do not run signature tools; retained cooperative verification evidence is checked for shape/binding, not promoted to cryptographic attestation. |
 | Freshness clock and expiry | Strict timezone-aware UTC timestamps, explicit snapshot `expires_at` and retrieval time; require retrieval <= observation <= decision time and decision time < expiry. Reject missing or inconsistent required freshness. Inject one decision clock per evaluation; re-evaluate at publish. No network time or implicit grace period. |
@@ -133,3 +163,136 @@ controls passed. No performance or GO claim.
 
 Await the lead's go or amendments to the proposal, especially schema-4/legacy
 policy, bounded full-file retention and the evidence-only offline-proof contract.
+
+## M1 implemented record contract
+
+The preceding step-0 evidence is historical. D1–D6 now settle its open decisions.
+M1 adds `acceptance_registry.py` with no callers in production CLI/verdict paths.
+`policy(plan_bytes, registry_bytes)` strictly decodes both inputs, validates the
+new policy and compares the registry's exact-byte hash to `registry_digest`.
+Legacy `acceptance.validate_plan`/`validate_registry` still reject these versions.
+No route schema has been enabled and M1 cannot create a new kind of GO.
+
+All fields below are required; nullable cases are explicit. Dictionaries reject
+extra fields. IDs follow existing acceptance ID rules; hashes are lowercase
+64-character SHA-256. Schema versions require actual integers, not booleans or
+floating-point equivalents. The byte decoder rejects duplicate keys at all
+levels, invalid UTF-8, BOMs, unpaired surrogates and non-finite numbers.
+
+| Record | Closed shape and interpretation |
+| --- | --- |
+| Registry v2 | `schema_version:2`, `entries:Entry[]`, `files:FilePin[]`. Empty lists are valid only together with explicitly tool-free plan rows. IDs are unique within each namespace. File paths are unique after case folding for portable staging. |
+| FilePin | `id, role, path, sha256, size, expires_at, version, provenance`. `size` is an integer byte count. `role` is distribution/manifest/lockfile/config/proof-log/banner/provenance/verification/snapshot/adapter. Distribution and snapshot require exact opaque `version` and a Provenance object; other roles require both null. Only snapshot has a UTC `expires_at`; others require null. All pins must be referenced. Package distributions are file pins in an entry's inputs, with their own version/provenance. |
+| Entry | `id, kind, version, artifact, dependencies, inputs, snapshots, provenance, command, offline, failure_policy, measurement`. Kind is toolchain/checker/service. Artifact references a distribution pin whose version/provenance must match this entry. Dependencies reference other entry IDs; inputs reference pinned files, including declared transitive package files; snapshots reference only snapshot pins. No row IDs. |
+| Provenance | `source, retrieved_at, checksum_source, independent_verification, record, verification`. Coordinates are inert nonempty strings. `record` references a provenance-role file. Independent verification is a strict boolean; true requires a verification-role file reference, false requires null. UTC retrieval time is mandatory. Same-source checksums remain provenance only; M1 does not authenticate claims. |
+| Command template | `argv:string[], cwd, inputs:FileID[], outputs:string[]`. First argv item is exactly `{artifact}`; cwd is `{checkout}`. Allowed whole-token placeholders are artifact/checkout/scratch/cache_overlay. The latter three also allow a safe relative suffix. Other tokens are scalar arguments with no braces, slash, backslash or colon. Outputs are unique `{scratch}/relative` paths. No shell grammar, substitution, path search or execution. |
+| Offline policy | `mode, positive_control, cache_hit, real_fetch`. Mode is external-denial/offline-recipe. Markers are distinct bounded literal strings, not regex/code. Offline-recipe requires cache_hit; external-denial requires it null. Policy describes expectations only; M2 interprets retained logs. |
+| Failure policy | Exactly `{unavailable:not-run, mismatch:fail, expired:not-run, absent_proof:not-run, attempted_fetch:fail}`. No caller-defined fallback/acquisition or success policy. |
+| Measurement pins | Checker requires `{comparator, parser, config, normalizer}` with adapter-role references for comparator/parser/normalizer and config-role for config. Other entry kinds require null. Adapters are bounded declarative descriptions in M1, never executable plugins. |
+| Environment v1 | `schema_version:1, runtime, compiler, package_manager, services, os, locale, timezone, environment_digest, config_digest, scratch, cache_overlay, service_data, time_limit_seconds, memory_limit_bytes, row_overrides`. Runtime/compiler/package_manager are exact banner strings or explicit null for absence. Services are unique `{id,banner}` records referencing service-kind entries. OS/locale/timezone are nonempty exact strings. Scratch/cache_overlay/service_data are respectively isolated/fresh-writable/fresh. Digests bind external environment/config inputs. |
+| Row override | `{id, environment:EvidenceRef}`; id references a plan row. The external environment bytes are pinned separately, preventing a self-hash cycle. Nested overrides in loaded override environments will be refused using `validate_environment(..., overrides=False)`. Loading/comparing these bytes is M2, not a M1 pass. |
+| Plan v4 | Existing schema-3 plan fields plus `environment:Environment`; every row adds `registry_entries:EntryID[]`. Validate the old plan rules on a copy projected to schema 3, preserving the original. Entry use includes reachable dependencies; reject any unused entry or dangling row/service/override reference. Do not guess undeclared tools. |
+| EvidenceRef | `{path, sha256, size}` for bounded declarative bytes relative to their approved input root. Shape validation does not substitute for later retained-byte validation. |
+| Observation v1 | `schema_version:1, registry_hash, observed_at, environment:Environment, entries:ObservedEntry[]`. Require exactly the registry entry-ID set; supplied data is separate from registry bytes to avoid circular hashes. M2 checks the hash and planned/observed equivalence; M3 wraps capture in attempt/run binding. |
+| ObservedEntry | `{id, version, banner:EvidenceRef, offline:OfflineProof}`. A mismatch is still a validly shaped observation; only the evaluator decides HOLD. |
+| OfflineProof | `{mode, egress_denied, positive_control, cache_hit, attempted_fetch, endpoints, log:EvidenceRef}`. Flags are strict booleans. Each endpoint is `{host,port,pid,owned}` with nonempty host, port 1–65535, positive PID and boolean owned. False controls, external hosts and attempted_fetch=true are valid observations, never a M1 success claim; their required HOLD semantics and evidence/log cross-checks belong to M2. |
+
+UTC timestamps use exactly `YYYY-MM-DDTHH:MM:SSZ`, rejecting offsets, fractions,
+invalid calendar dates and leap-second spelling. M1 checks representation only;
+M2 will compare retrieval/observation/expiry against one injected decision clock.
+Exact versions are opaque identifiers, not package constraints; no semantic
+version solver or implicit normalization is introduced.
+
+### Visible limits and path policy
+
+| Limit | M1 value |
+| --- | ---: |
+| Each JSON or retained declarative input | 1 MiB |
+| Aggregate registry declarative inputs / observation banner-and-log bytes | 16 MiB each |
+| Entries / observed entries / service banners / endpoints per proof | 64 each |
+| Files / plan rows / references per list / environment overrides | 256 each |
+| Total entry-dependency edges | 1,024 |
+| JSON nesting and entry dependency chain depth | 24 |
+| JSON nodes (including object keys) | 8,192 |
+| Argv items / output paths | 64 each |
+| Portable relative path | 512 characters |
+| Literal offline marker | 256 characters |
+| Other nonempty text | 4,096 characters |
+| Declared distribution byte count | 0 through signed 64-bit maximum (metadata only in M1) |
+| Time limit / memory limit | 1–86,400 seconds / 1 byte–1 TiB |
+
+JSON byte/depth/node limits are checked before allocating the parsed tree.
+Graph, reference and declared file budgets are checked before staged reads.
+`read_declarative_inputs` also limits actual reads per file and in aggregate,
+regardless of dishonest declared sizes. It reads only non-distribution roles and
+returns bytes; it performs no hashing verdict, retention write, acquisition,
+process spawn or socket operation. M2/M3 must verify hashes before using/retaining
+those bytes. Streaming live distribution hashing and its resource limits remain
+M2 work; signed-64 metadata support is not a promise to scan an arbitrary size.
+
+Paths use forward-slash relative components only. Reject empty/dot/parent
+components, drive/UNC/absolute syntax, backslashes, control characters, wildcard
+or stream syntax, Windows device names and trailing dots/spaces. Reject links
+and reparse points along the approved root's ancestors and the relative path;
+declarative reads require regular files. Public errors contain fixed descriptions,
+not OS exception text or the private root. As accepted, supported store locks do
+not protect against concurrent manual cache mutation; staging must be quiescent.
+
+### Existing and future reader inventory
+
+| Reader or writer | M1 disposition and M3 obligation |
+| --- | --- |
+| `acceptance.validate_plan`, `validate_registry`, `prepare`, `freeze`, `_route`, `_policy`, `_bundle`, `attach`, `resolve`, `ack_binding`, `evaluate` | Unchanged; old version gates reject v4/v2. M3 must dispatch explicitly, bind cache locator/preflight report, preserve legacy rules and require evaluated preflight in the pure fold. |
+| CLI `cmd_close` acceptance/check/publish branches, `_build_dod_eval` and release-barrier paths | Unchanged. M2's operator command will call the same standalone evaluator without Store construction/writes; M3 open/check/publish use transactional capture and the existing shared writer lock. |
+| `acceptance_history.successor`, `evaluate`, `apply_coverage`; `acceptance_coverage.history` and predicate/coverage comparisons | Unchanged. Carry row entry requirements and original preflight failures; route/schema changes cannot discard LD2 approval or protected coverage. |
+| `acceptance_obligations` source discovery/capture/evaluation/evidence | Unchanged. New report/input hashes must enter retained source projections and inherited substantive obligations independent of attempt-open order. Distributions get D1's explicit historical status, not fabricated retained bytes. |
+| `acceptance_audit.lineage`, `provenance`, `check_delivery`, exposure checks | Unchanged. Include new actor/evidence attribution and withheld hashes in history/cold checks; avoid delivering author preflight claims to a fresh cold reviewer. |
+| `acceptance_cold.policy`, `binding`, submit/reveal/reconcile/evaluate | Unchanged. Schema-4 binding and seal invalidation remain mandatory; new input/report hashes cannot be appended silently after commitment. |
+| `acceptance_hygiene.binding`, execution/final manifests, execution/evaluate | Unchanged. Manifest includes retained declarative inputs and reports, excludes binary content under D1 and never includes its own result hash. Run/reproduction environment/proof records remain bound. |
+| `close.evaluate_dod`, `compute_verdict`, persistence/transactions, `record_publish`, signoff/ack handling | Unchanged. Additive direct HOLDs, generation/instance binding and total lock order remain authoritative. No bypass through green gate labels or cached projections. |
+| CLI list/show/published holds, `attention.close_hold_items` and final/barrier consumers | Unchanged. Future sanitized outputs whitelist IDs/status/codes and omit cache locator. Raw private records remain explicitly private. |
+| `acceptance_git` command/operation scope | Unchanged. New staged-file or proof results are never memoized as immutable Git metadata. |
+| New `acceptance_registry` API | Called only by M1 tests at this milestone. Uses existing acceptance strict-object, ID/hash, decoder and path primitives; no legacy parser or persistence behavior changed. |
+
+Planned M3 envelopes: schema-4 route extends schema 3 with private `cache_root`
+and a retained `preflight_hash`; bundle carries its observation/report and input
+manifest references. Reports bind instance/attempt/project/revision/plan/registry
+without embedding their own hash. Exact envelope grammar and current-run binding
+will be recorded with M3 before enabling those readers. They are unsupported now.
+
+### M1 executed evidence
+
+The required `test_preflight_path_escape_rejected` first failed with **1 failed**
+(`DID NOT RAISE AcceptanceError`, 0.14 s), using the existing path helper through
+the new staging API. It models a linked ancestor above the approved root without
+requiring host symlink privileges. The new ancestor check makes it pass. A
+separate real-symlink case is skipped when the host denies symlink creation.
+
+Final foreground command, Python 3.10, `PYTHONPATH=<checkout>/src` and
+`PYTHONDONTWRITEBYTECODE=1`:
+
+```text
+py -3.10 -m pytest tests/test_acceptance_registry.py tests/test_acceptance_git_reads.py tests/test_acceptance.py::test_acceptance_acks_without_bundle_hold tests/test_acceptance.py::test_acceptance_invalid_plan_refused_before_close_creation tests/test_acceptance.py::test_acceptance_schema3_cannot_attach_without_required_hygiene -q -p no:cacheprovider --basetemp <scratch>/final
+```
+
+**160 passed, 1 skipped in 10.63 seconds**. The M1 file contains 132 cases, with
+131 passing and the host-restricted symlink skip. It uses synthetic files and no
+Git repositories. The selected existing integration cases use the session Git
+templates. No full suite, downloads, network requests or staged tools ran.
+
+```text
+py -3.10 -m ruff check --no-cache src/agenttalk/acceptance_registry.py tests/test_acceptance_registry.py
+py -3.10 -m bandit -q src/agenttalk/acceptance_registry.py
+py -3.10 -m bandit -q -s B101 tests/test_acceptance_registry.py
+```
+
+Ruff passed. Both Bandit invocations exited zero with no findings; the test scan
+excludes only intentional assertions. No subprocess code was added to production.
+Local links, required-test inventory, patch whitespace and the privacy sweep with
+positive controls passed before publication. Scratch logs and isolated fixture
+directories are retained for the cold read.
+
+M1 is ready for the milestone cold read, not acceptance GO. No M2
+evaluator/command, binary hashing, proof interpretation, sanitized summary,
+retention capture or M3 route/bundle integration is claimed. The remaining five
+named design tests must still be shown red before their M2 guards are built.
