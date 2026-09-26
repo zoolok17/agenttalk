@@ -121,6 +121,10 @@ SKILL_INVARIANTS = [
         "do NOT add `--origin-request`/`--origin-id`",  # fix 2: escalate stays executable
         "never a reply draft",             # fix 3: the verdict needs typed meta
         "stop dominates",                  # fix 5a: two challengers combine restrictively
+        "Combine only the ASSESSED verdicts",  # round 2: unassessed never joins the ordering
+        "never weakens an assessed verdict",   # round 2: a silent seat cannot erase a probe
+        "applies ONLY to the missing seat",    # round 2: availability judges the gap, not obligations
+        "send BOTH requests before returning to the wrapper",  # round 2: wrapped two-challenger order
         "reuses that challenge's VERDICT and DISPOSITION",  # fix 5b: reuse, not a blank pass
     ]),
     ("agenttalk.sk-loop.md", "agenttalk-sk-loop", [

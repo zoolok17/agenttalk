@@ -65,17 +65,19 @@ def _argv(command: str, twin: str, values: dict) -> list[str]:
     return shlex.split(command)
 
 
-def _pick(commands: list[str], sub: str, *, await_reply: bool | None = None) -> str:
+def _pick(commands: list[str], sub: str, *, await_reply: bool | None = None,
+          to: str | None = None) -> str:
     found = [c for c in commands
              if c.split("agenttalk ", 1)[1].startswith(sub + " ")
-             and (await_reply is None or ("--await-reply" in c) == await_reply)]
+             and (await_reply is None or ("--await-reply" in c) == await_reply)
+             and (to is None or f"--to {to} " in c)]
     assert len(found) == 1, (sub, await_reply, found)
     return found[0]
 
 
 def _store(tmp_path: Path) -> Store:
     store = Store(tmp_path)
-    store.init(["alpha", "beta", "liaison"])
+    store.init(["alpha", "beta", "gamma", "liaison"])
     assert cli.main(["--root", str(tmp_path), "roster", "set-operator-facing", "liaison"]) == 0
     return store
 
@@ -88,6 +90,9 @@ def _values(tmp_path: Path, rid: str, sender: str) -> dict:
     return {
         '"$SELF"': sender, "$SELF": sender,
         '"$REQ_ID"': rid, "$REQ_ID": rid, "$reqId": rid,
+        '"$REQ_A"': rid + "-a", "$REQ_A": rid + "-a", "$reqA": rid + "-a",
+        '"$REQ_B"': rid + "-b", "$REQ_B": rid + "-b", "$reqB": rid + "-b",
+        "<challenger-a>": "beta", "<challenger-b>": "gamma",
         "<challenger>": "beta", "<brief.md>": brief.as_posix(), "<verdict.md>": verdict.as_posix(),
         "<RID>": rid, "<verdict>": "stop", "<n>": "3", "--timeout 900": "--timeout 5",
     }
@@ -106,7 +111,7 @@ def test_unwrapped_examples_execute_end_to_end(tmp_path, monkeypatch, twin) -> N
 
     # The wrapped branch is REFUSED outside a wrapper turn - which is exactly why the
     # skill must branch (cold-read MAJOR 1: the old always-await send sent nothing).
-    assert _run(tmp_path, _pick(commands, "send", await_reply=True), twin,
+    assert _run(tmp_path, _pick(commands, "send", await_reply=True, to="<challenger>"), twin,
                 _values(tmp_path, rid, "alpha")) == 2
     assert not [m for m in store.valid_messages() if (m.meta or {}).get("request_id") == rid]
 
@@ -144,12 +149,41 @@ def test_wrapped_send_example_records_an_await_reply(tmp_path, monkeypatch, twin
     monkeypatch.delenv(wrapper_run.INBOUND_REQUEST_ID_ENV, raising=False)
     rid = "ch-wrapped-1"
 
-    assert _run(tmp_path, _pick(_commands(twin), "send", await_reply=True), twin,
+    assert _run(tmp_path, _pick(_commands(twin), "send", await_reply=True, to="<challenger>"), twin,
                 _values(tmp_path, rid, "alpha")) == 0
     records, problems = store.list_awaiting("alpha")
     assert problems == [] and [r["request_id"] for r in records] == [rid]
     (question,) = [m for m in store.valid_messages() if (m.meta or {}).get("request_id") == rid]
     assert question.meta["challenge"] == "true"
+
+
+@pytest.mark.parametrize("twin", sorted(TWINS))
+def test_wrapped_two_challenger_example_sends_both_before_yielding(
+    tmp_path, monkeypatch, twin,
+) -> None:
+    # Fix round 2: the two-challenger sequence is its own block - BOTH sends, with
+    # distinct ids, then `return` - so both correlations are awaited across turns.
+    text = TWINS[twin].read_text(encoding="utf-8").replace("\r\n", "\n")
+    block = text[text.index("--to <challenger-a>"):]
+    block = block[:block.index("```")]
+    assert block.index("--to <challenger-b>") < block.index("return")
+
+    store = _store(tmp_path)
+    generation = "two-challenger-generation"
+    store.write_waiting("alpha", {"agent": "alpha", "mode": "wrapper-loop",
+                                  "wait_token": generation, "wrapper_generation": generation})
+    monkeypatch.setenv(wrapper_run.WRAPPER_GENERATION_ENV, generation)
+    monkeypatch.delenv(wrapper_run.INBOUND_REQUEST_ID_ENV, raising=False)
+    commands = _commands(twin)
+    values = _values(tmp_path, "ch-two", "alpha")
+    for target in ("<challenger-a>", "<challenger-b>"):
+        assert _run(tmp_path, _pick(commands, "send", await_reply=True, to=target), twin, values) == 0
+    records, problems = store.list_awaiting("alpha")
+    assert problems == []
+    assert sorted(r["request_id"] for r in records) == ["ch-two-a", "ch-two-b"]
+    sent = {m.recipient: m.meta["request_id"] for m in store.valid_messages()
+            if (m.meta or {}).get("challenge") == "true"}
+    assert sent == {"beta": "ch-two-a", "gamma": "ch-two-b"}
 
 
 @pytest.mark.parametrize("twin", sorted(TWINS))

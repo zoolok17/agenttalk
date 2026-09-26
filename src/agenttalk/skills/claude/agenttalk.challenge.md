@@ -102,15 +102,41 @@ changes, or the cost grows by more than 25%.
    ```
    Do not dispatch the challenged work while its challenge is pending.
    **Two challengers** (only for money/security/irreversible work or an
-   initiative of 5+ work orders): send the SAME brief to two challengers
-   of different vendors, each with its own request id, and wait for BOTH.
-   Record both ids on the dispatch (`--meta challenge=<id-1>,<id-2>`) and
-   combine the verdicts so that **stop dominates** - the more restrictive
-   one wins, in this order: stop > replace > defer > unassessed > probe >
-   reshape > proceed. Partial timeout: A says `reshape`, B has not
-   answered after 15 minutes - B counts as `unassessed`, the combined
-   verdict is `unassessed`, and the work does not proceed on A alone. If A
-   says `stop`, stop already dominates; do not wait for B.
+   initiative of 5+ work orders): the SAME brief to two challengers of
+   different vendors, each with its OWN request id. This differs from the
+   single send above. Wrapped, send BOTH requests before returning to the
+   wrapper, then collect the two verdicts as their correlations arrive in
+   later turns (one per turn, in either order):
+   ```powershell
+   $reqA = "ch-$([guid]::NewGuid().ToString())"
+   $reqB = "ch-$([guid]::NewGuid().ToString())"
+   agenttalk send --from $SELF --to <challenger-a> --kind question `
+     --subject "challenge: <outcome in a few words>" `
+     --meta request_id=$reqA --meta challenge=true --meta round=1 `
+     --await-reply --file <brief.md>
+   agenttalk send --from $SELF --to <challenger-b> --kind question `
+     --subject "challenge: <outcome in a few words>" `
+     --meta request_id=$reqB --meta challenge=true --meta round=1 `
+     --await-reply --file <brief.md>
+   return
+   ```
+   Unwrapped, send both without `--await-reply`, then run the scoped wait
+   once per request id. Record both ids on the dispatch
+   (`--meta challenge=<id-1>,<id-2>`).
+   **Combine only the ASSESSED verdicts**; among them **stop dominates** -
+   the more restrictive one wins: stop > replace > defer > probe > reshape >
+   proceed. An `unassessed` or silent seat never weakens an assessed
+   verdict. The availability rule (step 6) applies ONLY to the missing
+   seat: it decides whether the work may go ahead on the other seat's
+   verdict alone, never whether that verdict's obligations still hold.
+   Worked example: A says `probe`; B replies `unassessed` (or is silent
+   after 15 minutes). The combined verdict is `probe` - the experiment is
+   still required before the work starts. B's gap is judged by step 6 for
+   B alone: money/security/irreversible work waits for B or escalates
+   before relying on A; other work may continue on A's `probe` with B
+   recorded as unavailable. If A says `stop`, stop dominates; do not wait
+   for B. Only when BOTH seats are unassessed or silent does the
+   single-seat availability rule decide the whole outcome.
 4. **Validate the verdict.** A malformed reply (bad verdict value,
    missing section or meta), a contaminated one (`exposed=yes`, or the
    challenger turns out to be involved) and a missing or late one all
@@ -145,6 +171,8 @@ changes, or the cost grows by more than 25%.
    after 15 minutes: money/security/irreversible work NEVER auto-proceeds
    (it waits or escalates). Other mandatory work may proceed with
    `challenge_disposition=unavailable`, listed visibly in the digest.
+   With two challengers this rule covers only a missing seat; it never
+   cancels what the other seat's assessed verdict requires (step 3).
 
 ## Challenger
 
