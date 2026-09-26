@@ -129,7 +129,7 @@
   // The project the roster belongs to: the known project that most ids start with,
   // else the most common first token, else ''. Ties resolve to the first seen.
   function teamProject(ids, knownProjects) {
-    var counts = {};
+    var counts = Object.create(null);
     var order = [];
     var list = ids || [];
     for (var i = 0; i < list.length; i++) {
@@ -603,10 +603,15 @@
 
   var STUCK_NOTE = 'Weaker evidence: process status isn’t visible yet, so Wait comes first.';
 
-  function cardOptions(item) {
+  // The options a card offers. Answering sends a message to the lead, which this slice does not
+  // do (read-only): a served option is shown, disabled, with the reason. `canAct` is the seam for
+  // the slice that will send (actions on, CSRF session, kill-switch clear).
+  function cardOptions(item, canAct) {
     var labels = Array.isArray(item.options) ? item.options.filter(function (o) { return typeof o === 'string' && o; }) : [];
     if (item.answerable === true && labels.length) {
-      return labels.map(function (label, i) { return { label: label, primary: i === 0, locked: null }; });
+      return labels.map(function (label, i) {
+        return { label: label, primary: i === 0, locked: canAct ? null : 'read-only' };
+      });
     }
     // Options are only served with --enable-actions; otherwise the answer is a CLI step.
     return [{ label: 'Answer', primary: true, locked: 'CLI only' }];
@@ -633,7 +638,7 @@
       evidenceNote: '',
       agent: agent, ageSeconds: age,
       ageLabel: age === null ? 'age unknown' : 'no deadline · waiting ' + fmtAge(age),
-      options: cardOptions(item), answerable: item.answerable === true, state: 'open'
+      options: cardOptions(item, ctx.canAct === true), answerable: item.answerable === true, state: 'open'
     };
   }
 
@@ -753,7 +758,7 @@
       greeting: { text: '', sub: '' }, lead: null,
       needs: { open: [], answered: [], deferredCount: 0, snoozed: [], stale: false, loaded: false, available: true },
       aside: { title: 'ALSO HAPPENING · NOT FOR YOU', rows: [], more: 0 }, since: null,
-      roster: { total: 0, summary: '', rows: [] }, usage: [],
+      roster: { total: 0, summary: '', rows: [] }, usage: [], chat: null, composer: null,
       chip: { label: label, freshness: 'loading', needsCount: null }
     };
 
@@ -803,7 +808,8 @@
       view.needs.stale = att.ok === false || (nowMs - attentionAsOf) / 1000 > ATTENTION_FRESH_S;
       (Array.isArray(att.items) ? att.items : []).forEach(function (item) {
         if (!isObj(item) || item.source === 'stuck') return;   // stuck cards are derived from health + evidence
-        var c = attentionCard(item, { nowMs: nowMs, attentionAsOfMs: attentionAsOf, project: project, teamIds: teamIds, known: known });
+        var c = attentionCard(item, { nowMs: nowMs, attentionAsOfMs: attentionAsOf, project: project, teamIds: teamIds,
+          known: known, canAct: input.canAct === true });
         if (item.severity === 'low' && item.source !== 'other') {
           lowRows.push({ title: c.title, detail: c.evidence || c.kind });
         } else {
@@ -815,7 +821,8 @@
     rows.forEach(function (r) {
       if (!r.stuck) return;
       var card = stuckCard(r);
-      var until = typeof (ui.snoozedUntil || {})[card.id] === 'number' ? ui.snoozedUntil[card.id] : null;
+      var snoozes = ui.snoozedUntil || {};
+      var until = hasOwn(snoozes, card.id) && typeof snoozes[card.id] === 'number' ? snoozes[card.id] : null;
       if (until !== null && until > nowMs) {
         view.needs.snoozed.push(card);
         snoozeRows.push({ title: r.short + ' · waiting', detail: 'Snoozed until ' + clockHM(until, tz) });
@@ -824,14 +831,17 @@
       }
     });
     cards.sort(compareCards);
+    // Card ids come from a feed: only OWN keys count ("__proto__" is an id, not an inherited flag).
     var deferred = ui.deferred || {};
     var answered = ui.answered || {};
+    function isDeferred(id) { return hasOwn(deferred, id) && !!deferred[id]; }
+    function isAnswered(id) { return hasOwn(answered, id) && !!answered[id]; }
     cards.forEach(function (c) {
-      if (answered[c.id]) { c.state = 'answered'; view.needs.answered.push(c); }
-      else if (deferred[c.id]) { view.needs.deferredCount += 1; }
+      if (isAnswered(c.id)) { c.state = 'answered'; view.needs.answered.push(c); }
+      else if (isDeferred(c.id)) { view.needs.deferredCount += 1; }
       else view.needs.open.push(c);
     });
-    view.needs.deferredCards = cards.filter(function (c) { return deferred[c.id] && !answered[c.id]; });
+    view.needs.deferredCards = cards.filter(function (c) { return isDeferred(c.id) && !isAnswered(c.id); });
     var openCount = view.needs.open.length;
     view.chip.needsCount = att && view.needs.available ? openCount : null;
 
@@ -860,6 +870,20 @@
       if (leadDown) {
         chatNotes.push({ kind: 'unavailable', text: 'The lead is unavailable' + (pl.detail ? ': ' + str(pl.detail, 160) : '') });
       }
+      // The thread: both sides of the lead chat, oldest first (the feed keeps the newest 100).
+      var operatorName = typeof pl.operator === 'string' ? pl.operator : '';
+      var thread = [];
+      msgs.forEach(function (m) {
+        if (!isObj(m) || typeof m.body !== 'string' || typeof m.from !== 'string') return;
+        var t = parseMs(m.ts);
+        thread.push({
+          id: typeof m.id === 'string' ? m.id : String(thread.length), side: m.from === operatorName ? 'you' : 'lead',
+          short: m.from === operatorName ? 'you' : shortName(m.from, project, teamIds, known),
+          body: str(m.body, LEAD_BODY_LIMIT), truncated: m.body.length > LEAD_BODY_LIMIT, atMs: t,
+          ageLabel: t === null ? '' : fmtAge(Math.max(0, (nowMs - t) / 1000)) + ' ago'
+        });
+      });
+      if (thread.length) view.chat = { messages: thread, lastId: thread[thread.length - 1].id };
       if (found || chatNotes.length) {
         var leadShort = leadName ? shortName(leadName, project, teamIds, known) : 'lead';
         var atMs = found ? parseMs(found.ts) : null;
@@ -901,6 +925,14 @@
       view.greeting = greetingFor('quiet', { idle: idle, total: rows.length });
     }
     view.stale = offline || view.needs.stale;
+    // The composer. This slice is read-only, so it is always disabled, and says why (the first
+    // reason that applies): the team is offline, the lead is unavailable, or the console cannot act.
+    var leadIsDown = !!(view.lead && view.lead.unavailable);
+    var composerReason = offline ? 'Paused \u2014 the lead can\u2019t receive while the team is offline.'
+      : (leadIsDown ? 'The lead is unavailable, so a message cannot be delivered.'
+        : 'Read-only: start the console with --enable-actions to message the lead.');
+    view.composer = { enabled: input.canAct === true && !offline && !leadIsDown,
+                      placeholder: 'Message the lead   ( / )', reason: input.canAct === true && !offline && !leadIsDown ? '' : composerReason };
 
     // --- "also happening" / "since you last looked" ----------------------------
     var aside = [];
@@ -941,8 +973,11 @@
     var byChat = isObj(input.chatByRoot) ? input.chatByRoot : {};
     var teams = (roots || []).map(function (r, i) {
       var id = isObj(r) && typeof r.project_id === 'string' ? r.project_id : '';
+      // Deferrals and snoozes belong to one team: uiFor(project_id) gives that team's local state.
+      var teamUi = typeof input.uiFor === 'function' ? input.uiFor(id) : input.ui;
       var v = buildTeamView({ nowMs: input.nowMs, generatedMs: input.generatedMs, root: r, fallbackLabel: 'Team ' + (i + 1),
-        attention: byAtt[id] || null, chat: byChat[id] || null, conn: input.conn, ui: input.ui, tz: input.tz });
+        attention: byAtt[id] || null, chat: byChat[id] || null, conn: input.conn, ui: teamUi, tz: input.tz,
+        canAct: input.canAct === true });
       return { key: id || 'idx:' + i, label: v.label, freshness: v.chip.freshness, needsCount: v.chip.needsCount,
                pressed: sel.index === i, index: i, view: v };
     });

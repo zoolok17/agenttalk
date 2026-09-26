@@ -62,7 +62,9 @@ export function makeDom() {
       this._text = '';
       this.nodeType = 1;
       this.style = {};   // CSSOM object: allowed under the console CSP (unlike a style attribute)
+      this.scrollTop = 0;
     }
+    get scrollHeight() { return 100 * (this.children.length + 1); }
     get textContent() {
       return this.children.length ? this.children.map((c) => c.textContent).join('') : this._text;
     }
@@ -74,6 +76,7 @@ export function makeDom() {
       }
       this.children = [];
       this._text = String(value);
+      this.scrollTop = 0;   // worst case for a scroller whose content was replaced: back to the top
     }
     contains(node) {
       if (node === this) return true;
@@ -101,7 +104,10 @@ export function makeDom() {
     addEventListener(type, fn) {
       (this.listeners[type] = this.listeners[type] || []).push(fn);
     }
-    click() { (this.listeners.click || []).forEach((fn) => fn({ target: this })); }
+    click() {
+      if (this.disabled) return;   // like a browser: a disabled control fires nothing
+      (this.listeners.click || []).forEach((fn) => fn({ target: this }));
+    }
   }
 
   class TextNode {

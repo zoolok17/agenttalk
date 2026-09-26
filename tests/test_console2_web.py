@@ -195,7 +195,7 @@ JS_BANNED = {
     "dynamic code": r"\beval\s*\(|new\s+Function\b|\bFunction\s*\(|set(?:Timeout|Interval)\s*\(\s*['\"`]",
     "inline style": r"setAttribute\(\s*['\"]style|\.cssText\b|\.style\s*=[^=]|['\"]style\s*=",
     "link or source from data": (
-        r"\.href\s*=|\.src\s*=|\.action\s*=|setAttribute\(\s*['\"](?:href|src|srcdoc|action|formaction)|"
+        r"\.href\s*=(?!=)|\.src\s*=(?!=)|\.action\s*=(?!=)|setAttribute\(\s*['\"](?:href|src|srcdoc|action|formaction)|"
         r"javascript:|data:text"
     ),
     "event handler attribute": r"\.on[a-z]+\s*=[^=]|setAttribute\(\s*['\"]on",
@@ -362,6 +362,20 @@ def test_font_stacks_are_system_fonts_only() -> None:
         assert not any(b in stack.lower() for b in banned), stack
 
 
+def test_stream_styling_uses_theme_variables_not_colour_literals() -> None:
+    css = _strip_css_comments(_read("console2.css"))
+    outside = re.sub(r":root(?:\[data-theme=\"[a-z]+\"\])?\s*\{[^}]*\}", "", css)
+    literals = set(re.findall(r"#[0-9A-Fa-f]{3,8}\b", outside))
+    assert literals <= {"#111"}, literals            # #111 is the badge ink on the warn colour
+    assert not re.search(r"\brgba?\(", outside), "colours come from the theme variables"
+
+
+def test_composer_is_pinned_to_the_bottom_of_the_stream() -> None:
+    css = _strip_css_comments(_read("console2.css"))
+    block = re.search(r"\.c2-composer\s*\{([^}]*)\}", css).group(1)
+    assert "position: sticky" in block and "bottom:" in block
+
+
 def test_layout_matches_the_spec_grid() -> None:
     css = _strip_css_comments(_read("console2.css"))
     assert "grid-template-columns: minmax(0, 1fr) 340px" in css
@@ -374,7 +388,10 @@ def test_layout_matches_the_spec_grid() -> None:
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not available")
 @pytest.mark.parametrize(
     "script",
-    ["console2_model.test.mjs", "console2_view.test.mjs", "console2_render.test.mjs", "console2_data.test.mjs"],
+    [
+        "console2_model.test.mjs", "console2_view.test.mjs", "console2_render.test.mjs",
+        "console2_data.test.mjs", "console2_stream.test.mjs",
+    ],
 )
 def test_console2_node_tests(script: str) -> None:
     r = subprocess.run(

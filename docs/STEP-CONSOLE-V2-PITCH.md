@@ -458,3 +458,50 @@ Lead's decision on the section 13 finding: go, additive only.
   four keys; derived outputs compared exactly), under a frozen clock, for both stale branches; the classic
   console does not read the fields. `tests/test_console2_health_writer.py` (8) now reads health through the real
   writer AND the real reader with a heartbeat, as `/api/state` does. `console2_view.test.mjs` +12.
+
+## 15. M3 record (the stream)
+
+Shipped in `console2.js`, `console2-model.js` and `console2.css` (Midnight styling from the theme variables; a test
+pins that no colour literal or `rgb()` is used outside the theme blocks):
+
+- Greeting and sub, the lead's latest message (avatar ring with two initials, body, who and when, plus the chat-feed
+  notes from M2b), needs-you cards, the deferred line, "also happening · not for you", "since you last looked",
+  the lead chat thread and the composer.
+- **Cards**: kind (tone colour), age ("no deadline · waiting 5h", or "14m" for a stuck card), serif title, the
+  EVIDENCE row (or "No evidence recorded"), the weaker-evidence note, options and "Later". Options are real
+  `<button>`s. A locked option is `disabled` with `aria-disabled` and a title that says why ("Answer · CLI only",
+  "Restart with context · CLI only"). An option the server served (only with `--enable-actions`) is shown with its
+  label, disabled, "· read-only": this slice does not send answers. `canAct` is the seam for the slice that will.
+  The only live options are **Wait 10 min** (a per-browser snooze) and **Later**.
+- **Later** is a per-browser defer that never dismisses: the card leaves the list, the greeting stops saying "All
+  quiet" ("Nothing new needs you. 1 item is deferred: still open, not dismissed."), and a
+  "N deferred · still open, not dismissed · show" button brings every deferred card of that team back. The team's
+  needs badge counts open cards only. Deferrals and snoozes are stored per team and card id
+  (`agenttalk.console2.later`), validated on load (numbers only, at most 500 entries, 30-day expiry, no
+  prototype keys), and still work for the session when storage is unavailable. **Wait 10 min** snoozes on the
+  server-anchored clock: the card comes back when the ten minutes are over and is listed as "waiting · Snoozed
+  until HH:MM" meanwhile.
+- **Chat thread**: both sides, yours right and the lead's left, in a bounded scroll box; scrolled to the end on the
+  first draw and when a NEW message arrives, otherwise left where the operator scrolled it. The stream also keeps its
+  own scroll position across redraws (the stub resets a container to the top when its content is replaced, so this
+  is tested against the worst case).
+- **Composer**: pinned to the bottom of the stream (`position: sticky`), input and Send disabled, with the reason
+  beside it: "Paused — the lead can't receive while the team is offline." (offline), "The lead is unavailable, ..."
+  or "Read-only: start the console with --enable-actions to message the lead.".
+
+Found and fixed while writing the card tests: card ids come from a feed, and the model looked deferrals and answers
+up with plain property access, so an id such as `__proto__` or `constructor` read as an inherited "truthy" flag and
+hid its card. Lookups now use own-property checks, and the stored maps have no prototype (`teamProject` counts too).
+Two tests pin it.
+
+Changed from the plan: the composer and the thread live inside `#c2-stream` (no shell change, no second scroll
+region); the avatar in the lead block is the two-letter ring, images arrive with the rail work (M4); "show" restores
+all deferred cards of the team rather than one at a time (the spec's "click restores"). The M2 "text only" data test
+was replaced by `console2_stream.test.mjs`, whose controls test lists exactly which controls may be enabled. The app
+harness (`console2_app.mjs`) was extracted from the data test so both suites share it.
+
+Tests: `console2_stream.test.mjs` (25: one per card kind and state, Later/show/persist/reload/per-team/junk
+storage, Wait and its expiry, the lead block, the thread and its scrolling, the composer, the enabled-controls
+list, hostile text), `console2_view.test.mjs` +8 (thread, composer, per-team state, prototype-key ids),
+`test_console2_web.py` +2 (colour literals, sticky composer). A headless-Edge screenshot of a seeded store at
+1240x780 (Midnight) was checked by eye; it is not part of the tests.

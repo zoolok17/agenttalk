@@ -52,8 +52,8 @@
     generatedMs: null,       // its generated_at
     anchor: null,            // { epochMs, perf }: server time at receipt + the monotonic clock then
     conn: { reachable: true, stalledPolls: 0, lastOkMs: null },
-    attention: {},           // project_id -> { ok, asOfMs, items }
-    chat: {},                // project_id -> { ok, asOfMs, payload }
+    attention: Object.create(null),   // project_id -> { ok, asOfMs, items }
+    chat: Object.create(null),        // project_id -> { ok, asOfMs, payload }
     cycle: 0
   };
   var ui = { deferred: {}, snoozedUntil: {}, answered: {}, lastVisitMs: null };
@@ -293,6 +293,73 @@
 
   // ----------------------------------------------------------------- stream
 
+  // "Later" and "Wait 10 min" are local to this browser: the server has no defer path. A card
+  // put off with Later stays open and counted (the deferred line, with a way back); nothing here
+  // ever dismisses anything. Maps are keyed by team, then card id, and have no prototype so an id
+  // such as "__proto__" from a feed is just a key.
+  var LATER_KEY = 'agenttalk.console2.later';
+  var LATER_MAX = 500;
+  var LATER_KEEP_MS = 30 * 24 * 3600e3;
+  var SNOOZE_MS = 10 * 60e3;
+  var later = { deferred: Object.create(null), snoozed: Object.create(null) };
+
+  function teamMap(table, key) {
+    if (!table[key]) table[key] = Object.create(null);
+    return table[key];
+  }
+
+  function cleanTable(raw, keepFrom) {
+    var out = Object.create(null);
+    var count = 0;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+    Object.keys(raw).forEach(function (team) {
+      var inner = raw[team];
+      if (!inner || typeof inner !== 'object' || Array.isArray(inner)) return;
+      Object.keys(inner).forEach(function (id) {
+        var v = inner[id];
+        if (count >= LATER_MAX || typeof v !== 'number' || !isFinite(v) || v < keepFrom) return;
+        teamMap(out, team)[id] = v;
+        count += 1;
+      });
+    });
+    return out;
+  }
+
+  function loadLater() {
+    var parsed = null;
+    try { parsed = JSON.parse(window.localStorage.getItem(LATER_KEY) || 'null'); } catch (e) { parsed = null; }
+    var now = Date.now();
+    later.deferred = cleanTable(parsed && parsed.deferred, now - LATER_KEEP_MS);
+    later.snoozed = cleanTable(parsed && parsed.snoozed, now - LATER_KEEP_MS);
+  }
+
+  function saveLater() {
+    try { window.localStorage.setItem(LATER_KEY, JSON.stringify(later)); } catch (e) { /* kept for this page only */ }
+  }
+
+  function uiFor(team) {
+    return { deferred: later.deferred[team] || Object.create(null), snoozedUntil: later.snoozed[team] || Object.create(null),
+             answered: {}, lastVisitMs: ui.lastVisitMs };
+  }
+
+  function deferCard(team, id) {
+    teamMap(later.deferred, team)[id] = nowMs();
+    saveLater();
+    renderAll();
+  }
+
+  function waitOnCard(team, id) {
+    teamMap(later.snoozed, team)[id] = nowMs() + SNOOZE_MS;
+    saveLater();
+    renderAll();
+  }
+
+  function restoreDeferred(team) {
+    later.deferred[team] = Object.create(null);
+    saveLater();
+    renderAll();
+  }
+
   function unknownTeamBox(teams) {
     var box = el('section', 'c2-unknown');
     box.setAttribute('aria-label', 'Unknown team');
@@ -313,17 +380,29 @@
 
   function banner(b) {
     var box = el('section', 'c2-banner is-' + b.kind);
+    box.setAttribute('role', 'status');
     box.appendChild(el('div', 'c2-banner-kicker', b.kicker));
     box.appendChild(el('div', 'c2-banner-text', b.message));
     return box;
+  }
+
+  // Two letters for the avatar ring ("LE" for the lead); images arrive with the rail work.
+  function initials(text) {
+    var letters = String(text || '').replace(/[^A-Za-z]/g, '');
+    return (letters.slice(0, 2) || '?').toUpperCase();
   }
 
   function leadBlock(lead) {
     var box = el('section', 'c2-lead');
     box.setAttribute('aria-label', 'Lead’s latest message');
     if (lead.body) {
-      box.appendChild(el('p', 'c2-lead-body', lead.body));
-      box.appendChild(el('div', 'c2-meta', lead.short + (lead.ageLabel ? ' · ' + lead.ageLabel : '')));
+      var row = el('div', 'c2-lead-row');
+      row.appendChild(el('span', 'c2-lead-avatar', initials(lead.short)));
+      var col = el('div', 'c2-lead-col');
+      col.appendChild(el('p', 'c2-lead-body', lead.body));
+      col.appendChild(el('div', 'c2-meta', lead.short + (lead.ageLabel ? ' · ' + lead.ageLabel : '')));
+      row.appendChild(col);
+      box.appendChild(row);
     }
     // What the chat feed is doing to that message: failed read, not refreshed, lead unavailable.
     (lead.notes || []).forEach(function (n) {
@@ -332,18 +411,27 @@
     return box;
   }
 
-  function optionsRow(options) {
-    var row = el('ul', 'c2-options');
-    options.forEach(function (o) {
-      var li = el('li', 'c2-option' + (o.primary ? ' is-primary' : '') + (o.locked ? ' is-locked' : ''),
-        o.label + (o.locked ? ' · ' + o.locked : ''));
-      row.appendChild(li);
-    });
-    return row;
+  // One option of a card. Locked ones are real disabled buttons that say why; the only live one
+  // is "Wait 10 min" (a local snooze). Nothing here can answer the lead or change any state.
+  function optionButton(option, team, card) {
+    var text = option.label + (option.locked ? ' · ' + option.locked : '');
+    var btn = el('button', 'c2-opt' + (option.primary ? ' is-primary' : '') + (option.locked ? ' is-locked' : ''), text);
+    btn.setAttribute('type', 'button');
+    if (option.locked) {
+      btn.disabled = true;
+      btn.setAttribute('aria-disabled', 'true');
+      btn.setAttribute('title', 'Not available here: ' + option.locked);
+    } else if (option.action === 'wait') {
+      on(btn, 'click', function () { waitOnCard(team, card.id); });
+    } else {
+      btn.disabled = true;   // an unlocked option without a local action is not something this slice does
+      btn.setAttribute('aria-disabled', 'true');
+      btn.setAttribute('title', 'Not available here: read-only');
+    }
+    return btn;
   }
 
-  // M2 draws a card as plain text so the data can be checked; M3 makes it a control.
-  function needsCard(card) {
+  function needsCard(card, team) {
     var box = el('article', 'c2-card tone-' + card.tone);
     var head = el('div', 'c2-card-head');
     head.appendChild(el('span', 'c2-kind', card.kind));
@@ -355,8 +443,23 @@
     ev.appendChild(el('span', card.evidenceMissing ? 'c2-evidence-text is-missing' : 'c2-evidence-text', card.evidenceText));
     box.appendChild(ev);
     if (card.evidenceNote) box.appendChild(el('div', 'c2-note', card.evidenceNote));
-    box.appendChild(optionsRow(card.options));
+    var actions = el('div', 'c2-actions');
+    card.options.forEach(function (o) { actions.appendChild(optionButton(o, team, card)); });
+    var laterBtn = el('button', 'c2-later', 'Later');
+    laterBtn.setAttribute('type', 'button');
+    laterBtn.setAttribute('title', 'Put this off in this browser. It stays open and counted.');
+    on(laterBtn, 'click', function () { deferCard(team, card.id); });
+    actions.appendChild(laterBtn);
+    box.appendChild(actions);
     return box;
+  }
+
+  function deferredLine(count, team) {
+    var btn = el('button', 'c2-deferred', count + ' deferred · still open, not dismissed · show');
+    btn.setAttribute('type', 'button');
+    btn.setAttribute('title', 'Bring the deferred items back');
+    on(btn, 'click', function () { restoreDeferred(team); });
+    return btn;
   }
 
   function asideBlock(title, rows, more) {
@@ -372,17 +475,65 @@
     return box;
   }
 
+  var thread = { node: null, lastId: null };   // the chat thread of the last draw
+
+  function chatThread(chat, savedTop) {
+    var box = el('section', 'c2-chat');
+    box.setAttribute('aria-label', 'Lead chat');
+    box.appendChild(el('div', 'c2-label', 'LEAD CHAT'));
+    var log = el('div', 'c2-thread');
+    log.setAttribute('role', 'log');
+    chat.messages.forEach(function (m) {
+      var msg = el('div', 'c2-msg is-' + m.side);
+      msg.appendChild(el('p', 'c2-bubble', m.body));
+      msg.appendChild(el('div', 'c2-meta', m.short + (m.ageLabel ? ' · ' + m.ageLabel : '')));
+      log.appendChild(msg);
+    });
+    box.appendChild(log);
+    // Scroll the thread to its end only when there is a NEW message (or this is the first
+    // draw); otherwise keep wherever the operator had scrolled it to.
+    thread.node = log;
+    if (thread.lastId !== chat.lastId) log.scrollTop = log.scrollHeight;
+    else if (typeof savedTop === 'number') log.scrollTop = savedTop;
+    thread.lastId = chat.lastId;
+    return box;
+  }
+
+  // The composer is present but never live in this slice: disabled, with the reason beside it.
+  function composerBox(composer) {
+    var box = el('div', 'c2-composer');
+    var row = el('div', 'c2-composer-row');
+    var input = el('input', 'c2-composer-input');
+    input.setAttribute('type', 'text');
+    input.setAttribute('placeholder', composer.placeholder);
+    input.setAttribute('aria-label', 'Message the lead');
+    input.disabled = !composer.enabled;
+    row.appendChild(input);
+    var send = el('button', 'c2-send', 'Send');
+    send.setAttribute('type', 'button');
+    send.disabled = !composer.enabled;
+    row.appendChild(send);
+    box.appendChild(row);
+    if (composer.reason) box.appendChild(el('div', 'c2-meta c2-composer-reason', composer.reason));
+    return box;
+  }
+
   function renderStream(shell) {
     var main = document.getElementById('c2-stream');
     if (!main) return;
+    var savedTop = main.scrollTop;
+    var savedThreadTop = thread.node ? thread.node.scrollTop : null;
+    thread.node = null;
     clear(main);
     if (shell.selection.status === 'unknown' && shell.teams.length) {
+      thread.lastId = null;
       main.appendChild(unknownTeamBox(shell.teams));
       return;
     }
     var v = shell.view;
     if (!v) {
       // No snapshot yet: either still loading or the very first read failed.
+      thread.lastId = null;
       if (!data.conn.reachable) {
         main.appendChild(banner(M.freshness({}, data.conn, nowMs()).banner));
       } else {
@@ -390,16 +541,19 @@
       }
       return;
     }
+    var team = v.key;
     if (v.banner) main.appendChild(banner(v.banner));
     if (v.greeting.text) main.appendChild(el('h1', 'c2-greeting', v.greeting.text));
     if (v.greeting.sub) main.appendChild(el('p', 'c2-sub', v.greeting.sub));
     if (v.lead) main.appendChild(leadBlock(v.lead));
-    v.needs.open.forEach(function (card) { main.appendChild(needsCard(card)); });
-    if (v.needs.deferredCount > 0) {
-      main.appendChild(el('div', 'c2-deferred', v.needs.deferredCount + ' deferred · still open, not dismissed'));
-    }
+    v.needs.open.forEach(function (card) { main.appendChild(needsCard(card, team)); });
+    if (v.needs.deferredCount > 0) main.appendChild(deferredLine(v.needs.deferredCount, team));
     if (v.aside.rows.length) main.appendChild(asideBlock(v.aside.title, v.aside.rows, v.aside.more));
     if (v.since && v.since.rows.length) main.appendChild(asideBlock(v.since.title, v.since.rows, 0));
+    if (v.chat) main.appendChild(chatThread(v.chat, savedThreadTop));
+    else thread.lastId = null;
+    if (v.composer) main.appendChild(composerBox(v.composer));
+    main.scrollTop = savedTop;
   }
 
   // ------------------------------------------------------------------- rail
@@ -467,7 +621,7 @@
   function renderAll() {
     var shell = M.buildShellView({
       roots: currentRoots(), attentionByRoot: data.attention, chatByRoot: data.chat, param: rootParam,
-      nowMs: nowMs(), generatedMs: data.generatedMs, conn: data.conn, ui: ui
+      nowMs: nowMs(), generatedMs: data.generatedMs, conn: data.conn, ui: ui, uiFor: uiFor, canAct: false
     });
     syncTeamChips(shell.teams);
     var app = document.getElementById('app');
@@ -649,6 +803,7 @@
 
   applyTheme(loadTheme());
   loadVisit();
+  loadLater();
   buildHeader();
   renderHints();
   on(document, 'keydown', onKey);

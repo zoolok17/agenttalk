@@ -5,72 +5,16 @@
 process.env.TZ = 'UTC';
 
 import assert from 'node:assert/strict';
-import {
-  createRunner, jsonResponse, loadConsole, makeDom, texts, walk,
-} from './console2_harness.mjs';
+import { createRunner } from './console2_harness.mjs';
 import {
   ATT_ITEM, NOW, agent, busyAgents, busyRecent, env, iso, root,
 } from './console2_fixtures.mjs';
+import {
+  HOSTILE, JSON_HANG, LEAD, PENDING, all, app, boot, chips, classOf, header, rail, server, stream, timeouts, under,
+} from './console2_app.mjs';
+import { texts, walk } from './console2_harness.mjs';
 
 const { test, run } = createRunner('console2 data layer');
-const HOSTILE = '<img src=x onerror=alert(1)>';
-const LEAD = 'claude-agenttalk-lead';
-const PENDING = { __pending: true };
-const JSON_HANG = { __jsonHang: true };
-const under = (ms) => ms < 5000;   // every timer except the 5 s request timeouts
-const timeouts = (ms) => ms === 5000;
-
-// A programmable server: state/attention/chat handlers may return a payload, a
-// {status} problem, or throw; every request is recorded.
-function server(o = {}) {
-  const calls = [];
-  const clock = { perf: 0 };   // shared with the page: the server's clock moves with it
-  const s = {
-    calls,
-    clock,
-    generated: o.generated || (() => new Date(NOW + clock.perf).toISOString()),
-    roots: o.roots || (() => [root({ project_id: 'proj-a', agents: busyAgents(), recent: busyRecent(), operator_facing: LEAD })]),
-    attention: o.attention || (() => ({ target_root_project_id: 'proj-a', items: [] })),
-    chat: o.chat || (() => ({ target_root_project_id: 'proj-a', available: true, lead: LEAD, messages: [] })),
-    down: false,
-    pendingState: false,   // /api/state never answers
-    inits: [],             // the init object of every request, in order
-    fetch(url, init) {
-      calls.push(url);
-      s.inits.push(init);
-      if (s.down) return Promise.reject(new Error('down'));
-      const u = new URL(url, 'http://x');
-      const id = u.searchParams.get('root') || '';
-      let payload;
-      if (u.pathname === '/api/state' && s.pendingState) return new Promise(() => {});
-      if (u.pathname === '/api/state') payload = { schema_version: 1, generated_at: s.generated(), roots: s.roots() };
-      else if (u.pathname === '/api/attention') payload = s.attention(id);
-      else if (u.pathname === '/api/lead-chat') payload = s.chat(id);
-      else return jsonResponse({}, 404);
-      if (payload && payload.__pending) return new Promise(() => {});                       // never settles
-      if (payload && payload.__jsonHang) return Promise.resolve({ ok: true, status: 200, json: () => new Promise(() => {}) });
-      if (payload && payload.__status) return jsonResponse({}, payload.__status);
-      return jsonResponse(payload);
-    },
-  };
-  return s;
-}
-
-async function boot(srv, opts = {}) {
-  const dom = makeDom();
-  const loaded = loadConsole({ dom, fetch: (u, i) => srv.fetch(u, i), clock: srv.clock, ...opts });
-  for (let i = 0; i < 12; i++) await new Promise((r) => setTimeout(r, 0));
-  return { dom, ...loaded };
-}
-
-const stream = (dom) => dom.document.getElementById('c2-stream');
-const rail = (dom) => dom.document.getElementById('c2-rail');
-const all = (node) => texts(node).join(' | ');
-const app = (dom) => dom.document.getElementById('app');
-const header = (dom) => dom.document.getElementById('c2-header');
-const classOf = (node, cls) => walk(node).filter((n) => (n.className || '').split(' ').includes(cls));
-const chips = (dom) => walk(header(dom)).filter((n) => n.getAttribute && n.getAttribute('data-c2-key') !== null);
-
 test('busy day end to end: greeting, cards with evidence, aside, usage windows, roster', async () => {
   const srv = server({
     attention: () => ({ target_root_project_id: 'proj-a', items: [
@@ -324,15 +268,6 @@ test('every data-bearing field is drawn as text: hostile input everywhere', asyn
     assert.ok(!Object.keys(node.attributes).some((k) => k.startsWith('on') || k === 'style' || k === 'href' || k === 'src'), node.tagName);
     assert.ok(/^[a-z0-9 _:-]*$/i.test(node.className), 'class names are fixed vocabulary: ' + node.className);
   }
-});
-
-test('there is no GO button and no control that could act in the page (M2 draws text only)', async () => {
-  const { dom } = await boot(server({ attention: () => ({ target_root_project_id: 'proj-a', items: [ATT_ITEM({ id: 'a', answerable: true, options: ['Keep it', 'Remove it'] })] }) }));
-  const page = [stream(dom), rail(dom), header(dom)].flatMap((n) => texts(n));
-  assert.ok(page.length > 10);
-  assert.ok(!page.some((t) => /GO/.test(t)), 'no GO');
-  const controls = [stream(dom), rail(dom)].flatMap((n) => walk(n)).filter((n) => ['BUTTON', 'INPUT', 'TEXTAREA', 'FORM', 'A'].includes(n.tagName));
-  assert.deepEqual(controls, []);
 });
 
 // ------------------------------------------------------- F1: hung requests

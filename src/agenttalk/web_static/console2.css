@@ -403,3 +403,154 @@ html, body {
 /* Stale data (offline or silent): last-known values stay, greyed. */
 .is-stale #c2-stream > :not(.c2-banner),
 .is-stale #c2-rail { opacity: .5; }
+
+/* ------------------------------------------------------ M3: the stream
+   Midnight is the reviewed theme; every colour and radius below comes from the theme
+   variables, so the other three carry it along (Terminal: radii 0, mono fonts). */
+
+#c2-stream > * { flex: none; }
+.c2-greeting { margin-top: 2px; }
+
+.c2-lead-row { display: flex; align-items: flex-start; gap: 10px; }
+.c2-lead-col { min-width: 0; }
+.c2-lead-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 30px;
+  height: 30px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--fg);
+  border: 2px solid var(--accent);
+  border-radius: var(--r-pill);
+}
+.c2-lead-note { margin-top: 8px; }
+
+/* Needs-you cards. */
+.c2-card { margin-top: 14px; }
+.c2-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
+.c2-opt {
+  appearance: none;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  padding: 6px 14px;
+  color: var(--fg);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  cursor: pointer;
+}
+.c2-opt.is-primary { color: var(--accent-ink); background: var(--accent); border-color: var(--accent); }
+.c2-opt:disabled { cursor: default; }
+.c2-opt.is-locked { opacity: .5; }
+.c2-later {
+  appearance: none;
+  font: inherit;
+  font-size: 12px;
+  padding: 6px 8px;
+  color: var(--dim);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+.c2-later:hover { color: var(--fg); }
+.c2-opt:focus-visible, .c2-later:focus-visible, .c2-deferred:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.c2-deferred {
+  appearance: none;
+  display: block;
+  margin-top: 12px;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--dim);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  text-align: left;
+}
+.c2-deferred:hover { color: var(--fg); }
+
+/* Lead chat thread: yours on the right, the lead's on the left. */
+.c2-chat { max-width: 700px; margin-top: 22px; }
+.c2-thread {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 320px;
+  margin-top: 8px;
+  padding-right: 4px;
+  overflow-y: auto;
+}
+.c2-msg { display: flex; flex-direction: column; gap: 3px; max-width: 85%; }
+.c2-msg.is-you { align-self: flex-end; align-items: flex-end; }
+.c2-bubble {
+  margin: 0;
+  padding: 9px 14px;
+  font-size: 14px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--fg);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px var(--r-card) var(--r-card) var(--r-card);
+}
+.c2-msg.is-you .c2-bubble {
+  color: var(--accent-ink);
+  background: var(--accent);
+  border-color: var(--accent);
+  border-radius: var(--r-card) 4px var(--r-card) var(--r-card);
+}
+:root[data-theme="terminal"] .c2-bubble { border-radius: 0; }
+
+/* Composer: pinned to the bottom of the stream, disabled in this slice with its reason. */
+.c2-composer {
+  position: sticky;
+  bottom: -14px;
+  max-width: 700px;
+  margin-top: 18px;
+  padding: 8px 0 14px;
+  background: var(--bg);
+}
+.c2-composer-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 6px 6px 14px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+}
+.c2-composer-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font: inherit;
+  font-size: 14.5px;
+  color: var(--fg);
+  background: transparent;
+  border: 0;
+  outline: 0;
+}
+.c2-composer-input:disabled, .c2-send:disabled { opacity: .5; cursor: not-allowed; }
+.c2-send {
+  appearance: none;
+  flex: none;
+  height: 40px;
+  padding: 0 16px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent-ink);
+  background: var(--accent);
+  border: 0;
+  border-radius: var(--r-btn);
+}
+.c2-composer-reason { margin-top: 6px; }

@@ -327,7 +327,7 @@ test('recovery: a fresh snapshot clears the banner', () => {
 const team = (o = {}) => M.buildTeamView({
   nowMs: NOW, generatedMs: NOW, root: root({ agents: busyAgents(), recent: busyRecent(), operator_facing: 'claude-agenttalk-lead', ...o.root }),
   attention: o.attention === undefined ? attention([]) : o.attention, chat: o.chat === undefined ? null : o.chat,
-  conn: o.conn || CONN_OK, ui: o.ui || {}, tz: TZ,
+  conn: o.conn || CONN_OK, ui: o.ui || {}, tz: TZ, canAct: o.canAct,
 });
 const escalation = (o) => ATT_ITEM({ source: 'escalation', ...o });
 
@@ -406,8 +406,12 @@ test('options: locked "CLI only" without actions; the served options when answer
   const ro = v.needs.open.find((c) => c.id === 'ro');
   const rw = v.needs.open.find((c) => c.id === 'rw');
   assert.deepEqual(ro.options.map((o) => [o.label, o.locked]), [['Answer', 'CLI only']]);
-  assert.deepEqual(rw.options.map((o) => [o.label, o.primary, o.locked]), [['Raise to 54', true, null], ['Keep 44', false, null]]);
+  assert.deepEqual(rw.options.map((o) => [o.label, o.primary, o.locked]),
+    [['Raise to 54', true, 'read-only'], ['Keep 44', false, 'read-only']], 'served options are shown, disabled: this slice is read-only');
   assert.equal(rw.answerable, true);
+  const live = team({ root: { agents: [agent('claude-agenttalk-lead')] }, canAct: true,
+    attention: attention([escalation({ id: 'rw', answerable: true, options: ['Raise to 54', 'Keep 44'] })]) });
+  assert.deepEqual(live.needs.open[0].options.map((o) => o.locked), [null, null], 'the seam for the slice that sends');
 });
 
 test('card ages keep growing after the attention read; unknown age says so', () => {
@@ -783,6 +787,87 @@ test('a team with idle agents whose health is stale (heartbeat newer) still read
     attention: attention([]), chat: null, conn: CONN_OK, ui: {}, tz: TZ });
   assert.equal(v.mode, 'quiet');
   assert.equal(v.greeting.sub.startsWith('Nothing needs you. 3 of 3 agents are idle'), true);
+});
+
+// ------------------------------------------------ M3: chat thread and composer
+
+const THREAD = [
+  { id: 'c1', from: 'operator', to: 'claude-agenttalk-lead', body: 'Any news?', ts: iso(900) },
+  { id: 'c2', from: 'claude-agenttalk-lead', to: 'operator', body: 'Three things need you.', ts: iso(600) },
+  { id: 'c3', from: 'operator', to: 'claude-agenttalk-lead', body: 'Thanks', ts: iso(60) },
+];
+
+test('the chat thread carries both sides, oldest first, with who and how long ago', () => {
+  const v = team({ chat: chat(THREAD) });
+  assert.deepEqual(v.chat.messages.map((m) => [m.id, m.side, m.short, m.body, m.ageLabel]), [
+    ['c1', 'you', 'you', 'Any news?', '15m ago'],
+    ['c2', 'lead', 'lead', 'Three things need you.', '10m ago'],
+    ['c3', 'you', 'you', 'Thanks', '1m ago'],
+  ]);
+  assert.equal(v.chat.lastId, 'c3');
+  assert.equal(v.lead.body, 'Three things need you.', 'the lead’s latest message is still picked out');
+});
+
+test('the thread skips malformed messages, bounds long bodies, and is absent when there is nothing', () => {
+  const v = team({ chat: chat([null, { from: 'operator' }, { body: 'no sender' }, { from: 'operator', body: 5 },
+    { id: 'ok', from: 'operator', body: 'x'.repeat(5000), ts: iso(1) }]) });
+  assert.deepEqual(v.chat.messages.map((m) => m.id), ['ok']);
+  assert.equal(v.chat.messages[0].body.length, 1200);
+  assert.equal(v.chat.messages[0].truncated, true);
+  assert.equal(team({ chat: chat([]) }).chat, null);
+  assert.equal(team({ chat: null }).chat, null);
+});
+
+test('a failed or stale chat read still shows the thread that was read', () => {
+  const v = team({ chat: { ok: false, asOfMs: NOW - 60e3, payload: { available: true, operator: 'operator', lead: 'claude-agenttalk-lead', messages: THREAD } } });
+  assert.equal(v.chat.messages.length, 3);
+});
+
+test('the composer is disabled in this slice and says why, first reason first', () => {
+  const online = team({ chat: chat(THREAD) });
+  assert.deepEqual([online.composer.enabled, online.composer.reason, online.composer.placeholder],
+    [false, 'Read-only: start the console with --enable-actions to message the lead.', 'Message the lead   ( / )']);
+  const offline = team({ chat: chat(THREAD), conn: { reachable: false, stalledPolls: 0, lastOkMs: NOW - 5000 } });
+  assert.equal(offline.composer.reason, 'Paused — the lead can’t receive while the team is offline.');
+  const down = team({ chat: chat(THREAD, { available: false, detail: 'gone' }) });
+  assert.equal(down.composer.reason, 'The lead is unavailable, so a message cannot be delivered.');
+  assert.equal(team({ chat: null }).composer.enabled, false);
+});
+
+test('the composer can only be enabled by canAct, and never while offline or with the lead unavailable', () => {
+  const on = team({ chat: chat(THREAD), canAct: true });
+  assert.deepEqual([on.composer.enabled, on.composer.reason], [true, '']);
+  assert.equal(team({ chat: chat(THREAD), canAct: true, conn: { reachable: false, lastOkMs: NOW } }).composer.enabled, false);
+  assert.equal(team({ chat: chat(THREAD, { available: false }), canAct: true }).composer.enabled, false);
+});
+
+test('deferrals and snoozes are per team: uiFor gives each team its own', () => {
+  const roots = [root({ project_id: 'a', agents: [agent('claude-agenttalk-lead')], recent: [env('x', 'y', 'message', 5)] }),
+    root({ label: 'second', project_id: 'b', agents: [agent('claude-second-lead')], recent: [env('x', 'y', 'message', 5)] })];
+  const item = escalation({ id: 'same-id' });
+  const shell = M.buildShellView({
+    roots, attentionByRoot: { a: attention([item]), b: attention([item]) }, chatByRoot: {}, param: '',
+    nowMs: NOW, generatedMs: NOW, conn: CONN_OK, ui: {}, tz: TZ,
+    uiFor: (id) => (id === 'a' ? { deferred: { 'same-id': NOW } } : {}),
+  });
+  assert.deepEqual(shell.teams.map((t) => [t.label, t.needsCount]), [['agenttalk', 0], ['second', 1]]);
+  assert.equal(shell.teams[0].view.needs.deferredCount, 1);
+});
+
+test('feed-supplied ids that look like prototype keys are ordinary ids for deferral, snooze and answers', () => {
+  const evil = ['__proto__', 'constructor', 'toString', 'hasOwnProperty'];
+  const items = attention(evil.map((id, i) => escalation({ id, title: 'T' + id, age: 100 + i })));
+  const plain = team({ root: { agents: [agent('claude-agenttalk-lead')] }, attention: items, ui: { deferred: {}, answered: {}, snoozedUntil: {} } });
+  assert.deepEqual(plain.needs.open.map((c) => c.id).sort(), evil.slice().sort(), 'nothing is hidden by an inherited key');
+  const some = team({ root: { agents: [agent('claude-agenttalk-lead')] }, attention: items, ui: { deferred: { constructor: 1 }, answered: { toString: 1 } } });
+  assert.deepEqual(some.needs.open.map((c) => c.id).sort(), ['__proto__', 'hasOwnProperty']);
+  assert.equal(some.needs.deferredCount, 1);
+  assert.deepEqual(some.needs.answered.map((c) => c.id), ['toString']);
+});
+
+test('an agent whose project token is a prototype key does not break the team project', () => {
+  assert.equal(M.teamProject(['claude-__proto__-lead', 'codex-__proto__-developer-1'], []), '__proto__');
+  assert.equal(M.shortName('claude-constructor-lead', 'constructor', [], []), 'lead');
 });
 
 run();
