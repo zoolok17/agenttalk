@@ -475,9 +475,11 @@ html, body {
 /* Stale data (offline or silent): last-known TEXT stays fully readable (N3 accessibility decision,
    step doc section 22: the design's blanket 50% greying, measured against the actual rendered page,
    put Midnight's dim-on-panel text at about 2.08:1 - a wash-out, not a legibility cue). Only
-   decorative elements dim: avatars and usage meters. The banner and every "as of" label were
-   already, and remain, full-strength - the stuck/offline signal is the words, never a colour alone. */
-.is-stale .c2-avatar,
+   decorative elements dim: the avatar IMAGE (never the badge - fix round 3, N3 narrowed: the runtime
+   letter is informational when a seat's configured runtime differs from its name, so it stays
+   full-strength even here) and usage meters. The banner and every "as of" label were already, and
+   remain, full-strength - the stuck/offline signal is the words, never a colour alone. */
+.is-stale .c2-avatar-img,
 .is-stale .c2-meter { opacity: .5; }
 
 /* ------------------------------------------------------ M3: the stream

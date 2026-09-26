@@ -158,15 +158,32 @@ def test_thread_scroll_and_focus_survive_redraws_in_a_real_browser(page) -> None
     assert after_later["tag"] == "BUTTON" and after_later["inStream"] is True, after_later
     # F2: the rail is reconciled in place too - the avatar <img> survives an ordinary redraw
     assert out["railImageKept"] is True, out
-    # M4b: the ? button opens the keyboard overlay, moves focus into it, and Escape closes it and
-    # returns focus to the button that opened it
-    assert out["overlayOpenAfterClick"] is True, out
-    assert out["focusInOverlayAfterClick"] is True, out
-    assert out["overlayClosedAfterEscape"] is True, out
-    assert out["focusBackOnKeysBtnAfterEscape"] is True, out
-    # M4b: one key path - j selects the first card, Enter focuses its first action
+    # M4b/R2: one key path (run first, focus still untouched from page load) - j selects the first
+    # card, Enter focuses its first action (Later)
     assert out["firstCardSelectedAfterJ"] is True, out
     after_enter = out["focusAfterEnterOnSelected"]
     assert after_enter["tag"] == "BUTTON" and after_enter["sameAsFirstCardLater"] is True, after_enter
+    # R2: a SECOND native Enter, now with focus natively on that Later button, must activate it (defer
+    # the card) - never be diverted back to "open the selection" again
+    assert out["secondEnterDeferredTheFocusedCard"] is True, out
+    # R2: a native Enter on a focused, unrelated interactive control (a theme button), with a card
+    # still selected, must activate THAT control - never get diverted to the selection shortcut
+    assert out["themeButtonKeptNativeEnter"] is True, out
+    # M4b: the ? button opens the keyboard overlay, moves focus into it
+    assert out["overlayOpenAfterClick"] is True, out
+    assert out["focusInOverlayAfterClick"] is True, out
+    # R1: native Tab and Shift+Tab are trapped on the overlay's one focusable control, never escaping
+    # to the page beneath (the "Classic view" link); the background is genuinely `inert` while open
+    assert out["focusAfterNativeTab"] is True, out
+    assert out["focusAfterNativeShiftTab"] is True, out
+    assert out["backgroundInertWhileOpen"] is True, out
+    # R1: a native Enter on the (correctly still-focused) Close button closes the dialog and never
+    # reaches the link outside it - the page never navigates away, and the background un-inerts
+    assert out["overlayClosedAfterNativeEnterOnClose"] is True, out
+    assert out["pathUnchangedAfterNativeEnter"] is True, out
+    assert out["backgroundInertRemovedAfterClose"] is True, out
+    # a native Escape still closes the overlay too, and returns focus to the button that opened it
+    assert out["overlayClosedAfterNativeEscape"] is True, out
+    assert out["focusBackOnKeysBtnAfterEscape"] is True, out
     # the page raised no exception and the console CSP blocked nothing
     assert out["problems"] == [], out["problems"]

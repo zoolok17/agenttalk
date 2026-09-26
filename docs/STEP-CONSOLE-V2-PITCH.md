@@ -618,7 +618,7 @@ open work, not a silent gap). Everything else in the M4 plan (rail avatars and b
 | Phone (< 1024px) | OUT OF SCOPE (05-SPEC-PHONE, a later card) |
 | All text ≥ 4.5:1 | Midnight VERIFIED, including the composited stale state (fix round 2, section 22): a computed WCAG contrast check over every text-token/background-token pair the CSS uses (M4a fix round, section 19), extended to prove the stale-state opacity rules never apply to a text-bearing class. Paper/Synthwave/Terminal remain out of scope (only Midnight is reviewed this pitch, section 3) |
 | Bus content rendered as text only | DONE throughout, tested repeatedly (including every M4 avatar/tooltip value) |
-| Keyboard map per 08; screen-reader focus order | Keyboard map + overlay, j/k/enter/l/1/2/esc/? DONE (M4b, section 20). Screen-reader focus order: keyboard focus itself still follows ordinary tab order and every focus-key mechanism from M3; the card *selection* (j/k) is a visual+behavioral cursor (`is-selected`) that does **not** carry `aria-selected`/`role="listbox"` semantics - flagged in section 21 for the lead, not silently claimed done |
+| Keyboard map per 08; screen-reader focus order | Keyboard map + overlay, j/k/enter/l/1/2/esc/? DONE (M4b, section 20). Modal focus is now genuinely contained (fix round 3, section 23): the overlay traps Tab/Shift+Tab and the background is `inert`, so focus and Enter-activation can never escape it. Enter is correctly scoped to the navigation context, never diverting a focused control's own native Enter (section 23, R2). Screen-reader focus order: keyboard focus itself still follows ordinary tab order and every focus-key mechanism from M3; the card *selection* (j/k) is a visual+behavioral cursor (`is-selected`) that does **not** carry `aria-selected`/`role="listbox"` semantics - flagged in section 21 for the lead, not silently claimed done |
 
 ### Screenshots (Midnight, live-shaped fixture data: a seeded store, real health/heartbeat files, real `web.serve_in_thread`)
 
@@ -853,3 +853,79 @@ ce2df7b:<path>`, swapped onto disk) and GREEN against the fix, for all three fin
 `console2_view` 92/92; `test_console2_web.py` 54 passed/3 skipped, `test_console2_browser.py`,
 `test_console2_health_writer.py`, `test_health_last_known.py` all green (73 passed/3 skipped total).
 `node --check` clean on both touched JS files; `ruff`/`bandit` clean on the touched Python test file.
+
+## 23. Fix round 3 record (N3 narrowed, R1 modal focus, R2 native Enter)
+
+The codex read of `4b16f09..debaaac` (M4b + fix round 2) closed N1 and N2 clean; this round is one
+narrowed finding on N3 and two new MAJOR findings from testing with real, native input in Edge -
+fixed on top of `debaaac`.
+
+- **N3 narrowed, the avatar fix round 2 shipped still dimmed the runtime badge.** `.is-stale
+  .c2-avatar { opacity: .5 }` (section 22) dims the WHOLE avatar box, including the
+  `.c2-avatar-badge` runtime letter nested inside it - a text-bearing descendant a selector-substring
+  check can't see, since the selector text never mentions "badge" at all; CSS opacity composites the
+  whole subtree regardless. Real Edge measured 2.60/2.82/2.47:1 for C/X/Q once dimmed. Fixed by
+  narrowing the selector to `.c2-avatar-img` only (never the box), so the badge - informational
+  whenever a seat's configured runtime differs from its name - stays full-strength even while stale.
+  The section-22 blocklist-style CSS test is replaced with an ALLOWLIST of exact selectors (every
+  `is-stale` rule that still carries `opacity` must target one of exactly `.is-stale .c2-avatar-img`,
+  `.is-stale .c2-meter`, `.c2-usage-row.is-stale .c2-meter`), since a blocklist of class-name
+  substrings cannot see a container rule dimming a nested descendant it never names. Tests:
+  `test_console2_web.py` +3 (the allowlist check itself; badge-text-on-fill contrast for all four
+  runtime colours at full opacity; a documentation check that the OLD whole-avatar dimming would have
+  failed contrast for the badge too, mirroring section 22's own composited-would-fail check).
+- **R1 (MAJOR), the keyboard overlay did not contain focus or make the background inert.** `onKey`
+  returned early for every key but `Escape`/`?` while the overlay was open - which stops nothing:
+  returning early from a JS listener does not cancel the browser's OWN default action for a key it
+  never called `preventDefault()` on. With native key events in real Edge: Shift+Tab left the dialog
+  entirely and reached the "Classic view" link beneath it, and Enter then navigated the page to
+  `/dashboard` while the overlay still believed itself open. **This is precisely the gap a
+  `dispatchEvent`-based check cannot see**: a synthetic `KeyboardEvent` only ever fires JS listeners,
+  never the browser's native Tab-focus-cycling or Enter-activates-a-focused-control defaults, so
+  M4b's own overlay tests (all `dispatchEvent`) passed throughout despite this. Fixed two ways: (1)
+  every background region (header, stream, rail, footer) is made genuinely `inert` (never a style
+  attribute - a plain boolean attribute, like `disabled`) while the overlay is open, so Tab and a
+  click are refused by the browser itself, not merely discouraged by JS; (2) `onKey` also explicitly
+  traps Tab/Shift+Tab on the overlay's own focusable set (today just Close) as a second, explicit line
+  of defence - the only one the node DOM stub can exercise, since it does not implement `inert`
+  semantics. Tests: `console2_render.test.mjs` +2 (inert toggles on open/close; Tab and Shift+Tab both
+  land back on Close, with `preventDefault` confirmed called). Real-browser check
+  (`console2_browser_check.mjs`/`test_console2_browser.py`), rewritten to drive Tab, Shift+Tab, Enter
+  and Escape with genuine CDP `Input.dispatchKeyEvent` calls (a `pressKey` helper) instead of
+  `dispatchEvent` - confirms native Tab/Shift+Tab both land on Close, the background is `inert` while
+  open, a native Enter on Close closes the dialog without navigating anywhere (`location.pathname`
+  unchanged) and un-inerts the background, and a native Escape still works too.
+- **R2 (MAJOR), Enter on a selected card stole native activation from real controls.** The Enter
+  handler fired whenever a card was selected, with no regard for what actually had focus: a second
+  Enter after the first had already moved focus onto the card's own Later button re-triggered "open
+  the selection" instead of letting the browser's native Enter-activates-a-focused-button default
+  click it - so two Enters, expected to defer a card, left it undeferred. The same unconditional
+  `preventDefault` could equally swallow Enter on a focused theme, team-chip or Retry button. Fixed by
+  scoping the shortcut to the navigation context: Enter only opens the selected card when the
+  currently focused element is not itself a native interactive control (button, link, input, select,
+  textarea) - exactly the case after `j`/`k`, which never call `.focus()` on anything themselves.
+  Whenever focus already sits on a real control, Enter is left alone and the browser's own default
+  activates it. Tests: `console2_stream.test.mjs` +1 (a native-shaped Enter dispatch, target set to
+  the now-focused Later button, must NOT be intercepted - `preventDefault` not called, focus
+  untouched). Real-browser check: with genuine CDP key events, a second native Enter on the focused
+  Later button now defers the card (two cards -> one), and a native Enter on a focused theme button
+  (with a card still selected) changes the theme and keeps focus there, never diverted back to the
+  selection shortcut.
+
+A note on the CDP mechanics: getting a native Enter to actually activate a focused `<button>` over
+`Input.dispatchKeyEvent` needed `type: 'keyDown'` (not `'rawKeyDown'`) plus a `text`/`unmodifiedText`
+of `'\r'` on the event - without it, Chromium accepted the event (listeners fired) but never ran the
+control's own default action, which would have silently made the R1/R2 real-browser checks pass for
+the wrong reason (nothing native ever actually fired). Confirmed by first reproducing that exact false
+pass, then fixing the dispatch and reproducing the true regression before applying either code fix.
+
+Red-then-green: every new/changed test confirmed RED against the pre-fix-round file (`git show
+debaaac:<path>`, swapped onto disk for the node suites; the same file swapped in for the real-browser
+check) and GREEN against the fix. Mutation-tested `setBackgroundInert` and the Tab-trap branch
+together (both disabled -> the real-browser check's Tab/inert assertions correctly failed) and
+`isInteractiveTarget` alone (short-circuited to `false` -> the R2 node test correctly failed). Full
+run: `console2_model` 17/17, `console2_render` 31/31, `console2_stream` 56/56, `console2_data` 44/44,
+`console2_view` 92/92; `test_console2_web.py` 56 passed/3 skipped, `test_console2_browser.py`
+(rewritten, native-input, green), `test_console2_health_writer.py`, `test_health_last_known.py` all
+green (75 passed/3 skipped total). `node --check` clean on both touched JS files; `ruff`/`bandit`
+clean on the touched Python test files.

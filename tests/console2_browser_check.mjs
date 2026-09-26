@@ -42,6 +42,29 @@ async function evaluate(expression) {
   return r.result.value;
 }
 
+// R1/R2: a synthetic `document.dispatchEvent(new KeyboardEvent(...))` only ever fires JS listeners -
+// it never triggers the browser's OWN default actions (Tab moving focus, Enter activating a focused
+// button or navigating a focused link). Those defaults are exactly what a focus trap and a
+// native-Enter carve-out have to survive, so this drives the real input pipeline over CDP instead.
+const KEYS = {
+  Tab: { code: 'Tab', keyCode: 9, key: 'Tab' },
+  Enter: { code: 'Enter', keyCode: 13, key: 'Enter' },
+  Escape: { code: 'Escape', keyCode: 27, key: 'Escape' },
+  '?': { code: 'Slash', keyCode: 191, key: '?', shift: true },
+  j: { code: 'KeyJ', keyCode: 74, key: 'j' },
+};
+
+async function pressKey(name, opts = {}) {
+  const k = KEYS[name];
+  const modifiers = (opts.shift || k.shift) ? 8 : 0;
+  const base = {
+    modifiers, windowsVirtualKeyCode: k.keyCode, nativeVirtualKeyCode: k.keyCode, code: k.code, key: k.key,
+    text: k.key === 'Enter' ? '\r' : undefined, unmodifiedText: k.key === 'Enter' ? '\r' : undefined,
+  };
+  await send('Input.dispatchKeyEvent', { type: 'keyDown', ...base });
+  await send('Input.dispatchKeyEvent', { type: 'keyUp', ...base });
+}
+
 try {
   await json('/json/version');
   const targets = await json('/json/list');
@@ -76,24 +99,69 @@ try {
   // (scoped to #c2-rail: the lead block in the stream has its own, already-reconciled, avatar)
   await evaluate(`(() => { window.__avatar = document.querySelector('#c2-rail .c2-avatar-img'); return !!window.__avatar; })()`);
 
-  // M4b: the ? button opens the keyboard overlay and moves focus into it; Escape closes it and
-  // returns focus to the button that opened it.
-  await evaluate(`(() => { document.querySelector('.c2-keybtn').click(); return true; })()`);
-  out.overlayOpenAfterClick = await evaluate(`document.getElementById('c2-keymap').className.indexOf('is-open') >= 0`);
-  out.focusInOverlayAfterClick = await evaluate(`document.activeElement.className === 'c2-overlay-close'`);
-  await evaluate(`(() => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); return true; })()`);
-  out.overlayClosedAfterEscape = await evaluate(`document.getElementById('c2-keymap').className.indexOf('is-open') < 0`);
-  out.focusBackOnKeysBtnAfterEscape = await evaluate(`document.activeElement === document.querySelector('.c2-keybtn')`);
-
-  // M4b: one key path - j selects the first card, Enter focuses its first action (Later, since
-  // these fixture cards carry no options at all).
-  await evaluate(`(() => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'j', bubbles: true })); return true; })()`);
+  // M4b/R2: one key path, run FIRST while focus is still untouched (document.body, from page load) -
+  // j selects the first card, Enter focuses its first action (Later, since these fixture cards carry
+  // no options at all).
+  await pressKey('j');
   out.firstCardSelectedAfterJ = await evaluate(
     `(() => { const c = document.querySelector('.c2-card'); return !!c && c.className.indexOf('is-selected') >= 0; })()`,
   );
-  await evaluate(`(() => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); return true; })()`);
+  await pressKey('Enter');
   out.focusAfterEnterOnSelected = await evaluate(`(() => { const a = document.activeElement;
     return { tag: a.tagName, cls: a.className, sameAsFirstCardLater: a === document.querySelector('.c2-card .c2-later') }; })()`);
+
+  // R2: focus is now natively ON that Later button (an interactive control) - a SECOND native Enter
+  // must activate it (defer the card), never be diverted back to "open the selection" again.
+  const cardsBefore = await evaluate(`document.querySelectorAll('.c2-card').length`);
+  await pressKey('Enter');
+  await sleep(200);
+  out.cardsAfterSecondEnter = await evaluate(`document.querySelectorAll('.c2-card').length`);
+  out.secondEnterDeferredTheFocusedCard = cardsBefore - out.cardsAfterSecondEnter === 1;
+
+  // R2: with a card selected, a native Enter on a focused, unrelated interactive control (a theme
+  // button) must activate THAT control, never get diverted to the selection shortcut.
+  await pressKey('j');   // select whatever card is left, so nav.selectedId is non-null again
+  await evaluate(`(() => { const b = [...document.querySelectorAll('.c2-seg button')]
+    .find((x) => x.textContent === 'Paper'); window.__paper = b; b.focus(); return document.activeElement === b; })()`);
+  await pressKey('Enter');
+  out.themeButtonKeptNativeEnter = await evaluate(
+    `document.documentElement.getAttribute('data-theme') === 'paper' && document.activeElement === window.__paper`,
+  );
+
+  // Return focus to a neutral point before the overlay/R1 checks below, exactly like an operator
+  // clicking elsewhere on the page - the overlay's own focus management is what is under test next,
+  // not whatever the Enter path above happened to leave focused.
+  await evaluate(`(() => { document.activeElement.blur(); return true; })()`);
+
+  // M4b: the ? button opens the keyboard overlay and moves focus into it; Escape closes it and
+  // returns focus to the button that opened it. Native key events throughout (see KEYS/pressKey).
+  await evaluate(`(() => { document.querySelector('.c2-keybtn').click(); return true; })()`);
+  out.overlayOpenAfterClick = await evaluate(`document.getElementById('c2-keymap').className.indexOf('is-open') >= 0`);
+  out.focusInOverlayAfterClick = await evaluate(`document.activeElement.className === 'c2-overlay-close'`);
+
+  // R1: Tab and Shift+Tab must never escape the modal overlay - with only one focusable control
+  // inside it (Close), both must land right back on it, never on the "Classic view" link beneath.
+  const pathBefore = await evaluate('location.pathname');
+  await pressKey('Tab');
+  out.focusAfterNativeTab = await evaluate(`document.activeElement.className === 'c2-overlay-close'`);
+  await pressKey('Tab', { shift: true });
+  out.focusAfterNativeShiftTab = await evaluate(`document.activeElement.className === 'c2-overlay-close'`);
+  out.backgroundInertWhileOpen = await evaluate(
+    `document.getElementById('c2-stream').hasAttribute('inert') && document.getElementById('c2-header').hasAttribute('inert')`,
+  );
+
+  // R1: a native Enter on the (correctly still-focused) Close button closes the dialog - it must
+  // never reach a link outside it and navigate away.
+  await pressKey('Enter');
+  out.overlayClosedAfterNativeEnterOnClose = await evaluate(`document.getElementById('c2-keymap').className.indexOf('is-open') < 0`);
+  out.pathUnchangedAfterNativeEnter = (await evaluate('location.pathname')) === pathBefore;
+  out.backgroundInertRemovedAfterClose = await evaluate(`!document.getElementById('c2-stream').hasAttribute('inert')`);
+
+  // Reopen and close with a native Escape too (both documented ways to close still work).
+  await evaluate(`(() => { document.querySelector('.c2-keybtn').click(); return true; })()`);
+  await pressKey('Escape');
+  out.overlayClosedAfterNativeEscape = await evaluate(`document.getElementById('c2-keymap').className.indexOf('is-open') < 0`);
+  out.focusBackOnKeysBtnAfterEscape = await evaluate(`document.activeElement === document.querySelector('.c2-keybtn')`);
 
   // F1: scroll up, let ordinary redraws happen (the fake server ages its cards on every read)
   await evaluate(`(() => { window.__thread = document.querySelector('.c2-thread'); window.__thread.scrollTop = 250; return true; })()`);

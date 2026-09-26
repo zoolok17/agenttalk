@@ -157,6 +157,39 @@ test('the ? button opens the keyboard overlay, moves focus into it, and Close re
   assert.equal(keysBtn.getAttribute('aria-pressed'), 'false');
 });
 
+// ---- R1: the overlay must contain focus and make the background inert
+
+const BACKGROUND_IDS = ['c2-header', 'c2-stream', 'c2-rail', 'c2-footer'];
+const backgroundRegions = (dom) => BACKGROUND_IDS.map((id) => dom.document.getElementById(id));
+
+test('R1: opening the overlay makes every background region inert; closing it restores them', async () => {
+  const { dom } = await boot();
+  backgroundRegions(dom).forEach((r) => assert.equal(r.hasAttribute('inert'), false, r.tagName));
+  buttons(header(dom)).find((b) => label(b) === '?').click();
+  backgroundRegions(dom).forEach((r) => assert.equal(r.hasAttribute('inert'), true, r.tagName));
+  buttons(overlay(dom)).find((b) => label(b) === 'Close').click();
+  backgroundRegions(dom).forEach((r) => assert.equal(r.hasAttribute('inert'), false, r.tagName));
+});
+
+test('R1: Tab and Shift+Tab inside the overlay are trapped on its one focusable control', async () => {
+  const { dom } = await boot();
+  dom.document.dispatch('keydown', { key: '?', target: { tagName: 'BODY' } });
+  const closeBtn = buttons(overlay(dom)).find((b) => label(b) === 'Close');
+  assert.equal(dom.document.activeElement, closeBtn);
+
+  let prevented = false;
+  dom.document.dispatch('keydown', { key: 'Tab', target: closeBtn, preventDefault: () => { prevented = true; } });
+  assert.equal(prevented, true, 'the browser default (moving focus onward) must be suppressed');
+  assert.equal(dom.document.activeElement, closeBtn, 'still trapped, not escaped to the page beneath');
+
+  prevented = false;
+  dom.document.dispatch('keydown', {
+    key: 'Tab', shiftKey: true, target: closeBtn, preventDefault: () => { prevented = true; },
+  });
+  assert.equal(prevented, true);
+  assert.equal(dom.document.activeElement, closeBtn);
+});
+
 test('the ? key toggles the overlay, and Escape closes it without touching anything else', async () => {
   const { dom } = await boot();
   dom.document.dispatch('keydown', { key: '?', target: { tagName: 'BODY' } });

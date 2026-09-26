@@ -326,19 +326,61 @@
     return box;
   }
 
+  // R1: the background regions, made `inert` (never a style attribute) while the overlay is open, so
+  // neither Tab nor a click can reach them at all - the browser itself refuses, the same way it
+  // refuses focus on a disabled control. `trapOverlayTab` below is a second, explicit line of
+  // defense for the same invariant (and the only one the node test harness can exercise).
+  var BACKGROUND_REGION_IDS = ['c2-header', 'c2-stream', 'c2-rail', 'c2-footer'];
+
+  function setBackgroundInert(makeInert) {
+    BACKGROUND_REGION_IDS.forEach(function (id) {
+      var node = document.getElementById(id);
+      if (!node) return;
+      if (makeInert) node.setAttribute('inert', ''); else node.removeAttribute('inert');
+    });
+  }
+
   // The overlay is chrome, not data: built once and only ever toggled by a CSS class, never rebuilt
-  // by a redraw. Opening it moves focus to its Close button; closing it returns focus to the `?`
-  // button that (or the key that) opened it - focus is never merely dropped to the page.
+  // by a redraw. Opening it moves focus to its Close button and makes the background inert; closing
+  // it restores the background and returns focus to the `?` button that (or the key that) opened it
+  // - focus is never merely dropped to the page.
   function setOverlayOpen(open) {
     nav.overlayOpen = open;
     if (chrome.overlay) chrome.overlay.className = 'c2-overlay' + (open ? ' is-open' : '');
     if (chrome.keysBtn) setPressed(chrome.keysBtn, open);
+    setBackgroundInert(open);
     if (open) {
       var closeBtn = chrome.overlay && firstByClass(chrome.overlay, 'c2-overlay-close');
       if (closeBtn && typeof closeBtn.focus === 'function') closeBtn.focus();
     } else if (chrome.keysBtn && typeof chrome.keysBtn.focus === 'function') {
       chrome.keysBtn.focus();
     }
+  }
+
+  // Every natively focusable control inside the overlay (not the stream's data-c2-focus convention -
+  // this is a plain, self-contained dialog). Today that is only Close; written generally in case the
+  // dialog ever grows a second control.
+  function overlayFocusables() {
+    if (!chrome.overlay) return [];
+    return descendants(chrome.overlay, []).filter(function (n) {
+      if (n.disabled) return false;
+      var tag = n.tagName;
+      return tag === 'BUTTON' || tag === 'A' || tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA';
+    });
+  }
+
+  // R1: Tab/Shift+Tab never leave the dialog. Stepping past either end wraps to the other; if focus
+  // is somehow already outside the dialog (defence in depth beyond `inert`), it is pulled back in.
+  function trapOverlayTab(ev) {
+    var items = overlayFocusables();
+    if (!items.length) { stop(ev); return; }
+    var first = items[0];
+    var last = items[items.length - 1];
+    var active = document.activeElement;
+    var inside = chrome.overlay && chrome.overlay.contains(active);
+    if (ev.shiftKey) {
+      if (!inside || active === first) { stop(ev); last.focus(); }
+    } else if (!inside || active === last) { stop(ev); first.focus(); }
   }
 
   var HINTS = [['t', 'theme'], ['j/k', 'select'], ['l', 'later'], ['?', 'keys']];
@@ -1160,18 +1202,32 @@
     if (input && typeof input.focus === 'function') input.focus();
   }
 
+  // R2: the j/k/Enter/l selection shortcuts belong to the navigation context (nothing interactive
+  // focused - typically the stream root or the page body after j/k, which never call .focus() on
+  // anything themselves). A focused native control keeps its own Enter: a focused Later, theme,
+  // team-chip or Retry button must activate itself, never be diverted back to "open the selection".
+  function isInteractiveTarget(target) {
+    if (!target || !target.tagName) return false;
+    var tag = String(target.tagName).toLowerCase();
+    return tag === 'button' || tag === 'a' || tag === 'input' || tag === 'select' || tag === 'textarea';
+  }
+
   function onKey(ev) {
     if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
     if (isTypingTarget(ev.target)) return;
     if (nav.overlayOpen) {
       if (ev.key === 'Escape' || ev.key === '?') { stop(ev); setOverlayOpen(false); }
-      return;   // the overlay is modal: no other key reaches the page while it is open
+      else if (ev.key === 'Tab') { trapOverlayTab(ev); }
+      return;   // the overlay is modal: every other key is native, e.g. Enter activating Close
     }
     if (ev.key === 't') { setTheme(M.nextTheme(theme)); return; }
     if (ev.key === '?') { stop(ev); setOverlayOpen(true); return; }
     if (ev.key === 'j') { stop(ev); moveSelection(1); return; }
     if (ev.key === 'k') { stop(ev); moveSelection(-1); return; }
-    if (ev.key === 'Enter') { if (nav.selectedId !== null) { stop(ev); openSelected(); } return; }
+    if (ev.key === 'Enter') {
+      if (nav.selectedId !== null && !isInteractiveTarget(ev.target)) { stop(ev); openSelected(); }
+      return;
+    }
     if (ev.key === 'l') { if (nav.selectedId !== null) { stop(ev); deferSelected(); } return; }
     if (ev.key === '/') { stop(ev); focusComposer(); return; }
     if (ev.key === '1') { stop(ev); pickTeam(0); return; }

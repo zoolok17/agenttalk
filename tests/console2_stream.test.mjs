@@ -644,6 +644,18 @@ test('M4b: Enter opens the selected card - focus goes to Later when it has no op
   assert.equal(focused.getAttribute('data-c2-focus'), 'proj-a|a|later');
 });
 
+test('R2: a native Enter on a focused interactive control is never diverted to "open the selection"', async () => {
+  const { dom } = await boot(twoCardsFor());
+  key(dom, 'j');
+  key(dom, 'Enter');
+  const laterA = dom.document.activeElement;
+  assert.equal(laterA.textContent, 'Later', 'focus is now on the card’s own Later button');
+  let prevented = false;
+  dom.document.dispatch('keydown', { key: 'Enter', target: laterA, preventDefault: () => { prevented = true; } });
+  assert.equal(prevented, false, 'the handler must get out of the way: this Enter belongs to the focused button');
+  assert.strictEqual(dom.document.activeElement, laterA, 'the handler touches neither the DOM nor focus here - activation is the browser’s job');
+});
+
 test('M4b: Enter skips a card’s locked options - there is no key that can reach a locked action', async () => {
   const { dom } = await boot(server({ roots: calm, ...att([
     ATT_ITEM({ id: 'a', answerable: true, options: ['Raise to 54 €', 'Keep 44 €'] }),

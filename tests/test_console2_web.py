@@ -436,13 +436,6 @@ def _composite(fg_hex: str, bg_hex: str, alpha: float) -> str:
 # background - a wash-out, not a legibility cue. The lead's call: last-known TEXT stays fully
 # readable; only decorative elements (avatars, usage meters) still dim. Recorded as an accessibility
 # deviation from the design's literal "50% greying" in the step doc (section 22).
-STALE_TEXT_CLASSES = (
-    "c2-agent-line", "c2-agent-name", "c2-usage-pct", "c2-usage-name", "c2-card-title",
-    "c2-evidence-text", "c2-meta", "c2-kind", "c2-age", "c2-note", "c2-rt", "c2-greeting", "c2-sub",
-    "c2-lead-body", "c2-bubble",
-)
-
-
 def test_the_designs_blanket_greying_would_have_failed_contrast_composited() -> None:
     midnight = _theme_blocks()["midnight"]
     # Documents the N3 finding precisely: --dim text at the design's 50% opacity, composited over
@@ -452,19 +445,57 @@ def test_the_designs_blanket_greying_would_have_failed_contrast_composited() -> 
     assert ratio < 3.0, (composited, round(ratio, 2))
 
 
-def test_stale_greying_dims_only_decorative_elements_never_readable_text() -> None:
+# N3 (fix round 3, narrowed): the app-wide stale rule dimmed the whole `.c2-avatar` box, including
+# the informational runtime-badge letter (C/X/Q) nested inside it - real Edge measured 2.60/2.82/2.47:1
+# for the three runtimes once the badge's own glyph-on-fill colours were ALSO composited at the
+# parent's 0.5 opacity. A selector-substring blocklist cannot see this: `.c2-avatar` never mentions
+# "badge" in its text, yet dims it anyway by simple CSS inheritance/compositing of the whole subtree.
+# So this is an ALLOWLIST of exact selectors instead: every `is-stale` rule that still declares an
+# `opacity` must target one of exactly these leaf, non-text elements - nothing broader.
+ALLOWED_STALE_OPACITY_SELECTORS = {
+    ".is-stale .c2-avatar-img",
+    ".is-stale .c2-meter",
+    ".c2-usage-row.is-stale .c2-meter",
+}
+
+
+def test_stale_greying_dims_only_an_allowlisted_set_of_decorative_selectors() -> None:
     css = _strip_css_comments(_read("console2.css"))
     stale_rules = re.findall(r"([^{}]*\bis-stale\b[^{}]*)\{([^}]*)\}", css)
     assert stale_rules, "expected at least the app-wide and per-window stale rules"
-    found_opacity = False
+    found = set()
     for selector, decls in stale_rules:
         if "opacity" not in decls:
             continue
-        found_opacity = True
-        for cls in STALE_TEXT_CLASSES:
-            assert cls not in selector, (selector, decls, cls)
-        assert (".c2-avatar" in selector) or (".c2-meter" in selector), (selector, decls)
-    assert found_opacity, "expected the stale rules to still dim something (avatars/meters)"
+        for part in selector.split(","):
+            part = part.strip()
+            assert part in ALLOWED_STALE_OPACITY_SELECTORS, (part, decls)
+            found.add(part)
+    assert found == ALLOWED_STALE_OPACITY_SELECTORS, found
+
+
+# The avatar's runtime-badge letter (bg-as-text on a runtime-coloured fill) at full opacity - it is
+# never dimmed by the stale state (checked above), so this is the contrast that actually applies.
+BADGE_TEXT_ON_FILL = [("bg", "dim"), ("bg", "rt-claude"), ("bg", "rt-codex"), ("bg", "rt-qwen")]
+
+
+def test_avatar_badge_text_meets_wcag_aa_contrast_undimmed_by_the_stale_state() -> None:
+    midnight = _theme_blocks()["midnight"]
+    for text_key, bg_key in BADGE_TEXT_ON_FILL:
+        ratio = _contrast(midnight[text_key], midnight[bg_key])
+        assert ratio >= 4.5, (text_key, bg_key, midnight[text_key], midnight[bg_key], round(ratio, 2))
+
+
+def test_the_badge_at_the_old_whole_avatar_opacity_would_have_failed_contrast() -> None:
+    # Documents the N3-narrowed finding: had the badge been dimmed along with the image (the old
+    # `.c2-avatar` rule), both its fill AND its own text colour would have composited toward the
+    # background at 0.5, reading well under 4.5:1 for every runtime - real Edge measured 2.60/2.82/2.47:1.
+    midnight = _theme_blocks()["midnight"]
+    for _text_key, bg_key in BADGE_TEXT_ON_FILL:
+        composited_bg = _composite(midnight[bg_key], midnight["panel"], 0.5)
+        composited_text = _composite(midnight["bg"], midnight["panel"], 0.5)
+        ratio = _contrast(composited_text, composited_bg)
+        assert ratio < 3.5, (bg_key, composited_text, composited_bg, round(ratio, 2))
 
 
 def test_terminal_changes_only_fonts_and_radii() -> None:
