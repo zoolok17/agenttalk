@@ -51,13 +51,15 @@ def _text(value, label):
     return value
 
 
-def _id(value):
+def _id(value, label="id"):
     try:
         return close.validate_close_id(value)
     except close.CloseError:
         pass
     # IDs can be hostile or private. Do not echo them, including in a chain.
-    raise AcceptanceError("acceptance_policy_invalid", "invalid acceptance id") from None
+    raise AcceptanceError("acceptance_policy_invalid",
+                          f"{label}: alphanumerics plus . _ -; at most 64 characters; "
+                          "start with alphanumeric") from None
 
 
 def _digest(value):
@@ -91,7 +93,7 @@ def _indexed(values, label):
     for value in _items(values, label):
         if not isinstance(value, dict):
             _fail(f"{label}: expected objects")
-        key = _id(value.get("id"))
+        key = _id(value.get("id"), f"{label}[{len(result)}].id")
         if key in result:
             _fail(f"{label}: duplicate id")
         result[key] = value

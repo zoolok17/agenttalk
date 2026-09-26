@@ -474,3 +474,32 @@ logs are retained under the M1b task scratch for the short delta read.
 M1b remains an uncalled reader milestone. M2 evaluation, expiry propagation,
 banner/log comparisons and operator command, and M3 schema dispatch/GO integration
 remain pending their respective authorization and cold reads.
+
+### M1c: delta-read fixes before M2
+
+The lead authorized M2 in `tk-8d776f7f6aa2`, with this small prerequisite commit.
+The non-regular-file test now patches `Path.lstat` directly, avoiding Python
+3.14's changed relationship between `stat` and `lstat`. New tests cover snapshot
+reference shape/role (N12/N13), cross-role duplicate and unknown entry IDs
+(N21/N22), checker banner prohibition (N06), post-open identity (N29) and descriptor
+closure on refusal (N35). Null/extra-field references and unknown IDs already
+produce structured refusals in the unmutated reader; the reported crashes arise
+when their guards are removed. Tests now distinguish those regressions.
+
+Invalid ID refusals remain value-free, now naming a caller-supplied field/position
+and the fixed ASCII alphanumerics plus `. _ -`, maximum-64-character rule, including
+the initial-alphanumeric requirement. The new diagnostic test failed first
+(1 failed, 197 deselected), then passed. Registry reference lists supply indices;
+shared indexed records supply record positions. This adds no input-value echo.
+
+Foreground `py -3.10 -m pytest tests/test_acceptance_registry.py -q -p no:cacheprovider`
+and the same command under `py -3.14`, each with its own scratch basetemp, both
+completed: **195 passed, 3 skipped** (0.46 s / 0.48 s). The skips are the existing
+host-restricted symlink and two POSIX leaf-swap cases. N27 (Windows post-open
+reparse substitution) lacks a deterministic real substitution witness; N33/N34
+(POSIX no-follow/nonblocking flags) are platform-limited on this Windows host.
+
+M2 mapping decision F6: import-time unsafe/racing policy files remain
+`acceptance_policy_invalid`. A staged file changing while opening during
+evaluation becomes `acceptance_preflight_unavailable`, with `not-run` and retry
+allowed. M2 uses an explicit evaluation boundary for this mapping.

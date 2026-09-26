@@ -63,8 +63,8 @@ def _index(values, label, limit):
 
 def _refs(values, label):
     _list(values, label)
-    for value in values:
-        A._id(value)
+    for index, value in enumerate(values):
+        A._id(value, f"{label}[{index}]")
     if len(set(values)) != len(values):
         A._fail(f"{label}: duplicate reference")
     return values
@@ -168,7 +168,7 @@ def file_pin(pin):
     if isinstance(pin, dict) and pin.get("role") == "snapshot":
         keys += " distribution"
     A._object(pin, keys, "staged file pin")
-    A._id(pin["id"])
+    A._id(pin["id"], "file pin.id")
     if pin["role"] not in ROLES:
         A._fail("unsupported staged file role")
     relative_path(pin["path"])
@@ -183,7 +183,7 @@ def file_pin(pin):
     if pin["role"] == "snapshot":
         utc(pin["expires_at"])
         A._object(pin["distribution"], "id sha256", "snapshot distribution pin")
-        A._id(pin["distribution"]["id"])
+        A._id(pin["distribution"]["id"], "snapshot.distribution.id")
         A._digest(pin["distribution"]["sha256"])
     elif pin["expires_at"] is not None:
         A._fail("only snapshots declare expires_at")
@@ -191,7 +191,7 @@ def file_pin(pin):
 
 
 def _file_ref(files, ref, roles):
-    A._id(ref)
+    A._id(ref, "file reference")
     if ref not in files or files[ref]["role"] not in roles:
         A._fail("unresolved file reference or wrong role")
     return ref
@@ -257,7 +257,7 @@ def _offline_policy(value):
 def _entry(entry, files):
     A._object(entry, "id kind version artifact dependencies inputs snapshots provenance command offline "
               "failure_policy measurement expected_banner", "registry entry")
-    A._id(entry["id"])
+    A._id(entry["id"], "entry.id")
     if entry["kind"] not in ("checker", "toolchain", "service"):
         A._fail("unsupported registry kind")
     if entry["kind"] in ("toolchain", "service"):

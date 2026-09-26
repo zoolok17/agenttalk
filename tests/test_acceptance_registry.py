@@ -638,7 +638,7 @@ def test_guard_observation_proof_contract(observation, registry, monkeypatch, fa
 def test_guard_m90_non_regular_file_rejected_before_open(tmp_path, registry, monkeypatch):
     source = tmp_path / "source.dat"
     source.write_bytes(b"{}")
-    original = Path.stat
+    original = Path.lstat
 
     def nonregular(path, *args, **kwargs):
         result = original(path, *args, **kwargs)
@@ -648,7 +648,7 @@ def test_guard_m90_non_regular_file_rejected_before_open(tmp_path, registry, mon
             return os.stat_result(fields)
         return result
 
-    monkeypatch.setattr(Path, "stat", nonregular)
+    monkeypatch.setattr(Path, "lstat", nonregular)
     # Isolate the regular-file guard from the separately tested path resolver.
     monkeypatch.setattr(R, "staged_path", lambda root, relative: source)
     with pytest.raises(A.AcceptanceError, match="must be a regular file"):
@@ -734,3 +734,77 @@ def test_posix_leaf_swap_never_blocks_or_follows(tmp_path, registry, monkeypatch
     monkeypatch.setattr(os, "open", swapped)
     with pytest.raises(A.AcceptanceError):
         R.read_declarative_inputs(tmp_path, registry)
+
+
+@pytest.mark.parametrize("reference", [None, {"id": "jdk", "sha256": HASH, "extra": 0}])
+def test_snapshot_reference_closed_shape(registry, reference):
+    manifest = pin("manifest", "snapshot")
+    manifest["distribution"] = reference
+    registry["files"].append(manifest)
+    registry["entries"][0]["snapshots"] = ["manifest"]
+    with pytest.raises(A.AcceptanceError, match="snapshot distribution pin"):
+        R.validate_registry(registry)
+
+
+def test_snapshot_reference_requires_distribution_role(registry):
+    manifest = pin("manifest", "snapshot")
+    manifest["distribution"] = {"id": "source", "sha256": HASH}
+    registry["files"].append(manifest)
+    registry["entries"][0]["snapshots"] = ["manifest"]
+    with pytest.raises(A.AcceptanceError, match="wrong role"):
+        R.validate_registry(registry)
+
+
+@pytest.mark.parametrize("fault", ["duplicate-role", "unknown-entry"])
+def test_environment_role_references_refuse_structurally(plan, registry, fault):
+    plan["environment"]["compiler"] = ["java" if fault == "duplicate-role" else "unknown"]
+    with pytest.raises(A.AcceptanceError, match="environment entry reference"):
+        R.validate_plan(plan, registry)
+
+
+def test_checker_forbids_banner_even_with_valid_measurement(registry):
+    registry["files"].extend([pin("adapter", "adapter"), pin("config", "config")])
+    registry["entries"][0].update(kind="checker", measurement={
+        "comparator": "adapter", "parser": "adapter", "normalizer": "adapter", "config": "config"})
+    with pytest.raises(A.AcceptanceError, match="expected_banner"):
+        R.validate_registry(registry)
+
+
+def test_post_open_lstat_identity_and_descriptor_close(tmp_path, registry, monkeypatch):
+    source = tmp_path / "source.dat"
+    source.write_bytes(b"{}")
+    original_open, original_stat = os.open, Path.lstat
+    descriptors = []
+
+    def opened(path, flags):
+        fd = original_open(path, flags)
+        descriptors.append(fd)
+        return fd
+
+    def replaced(path):
+        result = original_stat(path)
+        if path == source and descriptors:
+            fields = list(result)
+            fields[1] += 1
+            # Preserve Windows-only attributes used by the reader.
+            from types import SimpleNamespace
+            return SimpleNamespace(st_mode=result.st_mode, st_dev=result.st_dev,
+                                   st_ino=fields[1], st_file_attributes=0)
+        return result
+
+    monkeypatch.setattr(os, "open", opened)
+    monkeypatch.setattr(Path, "lstat", replaced)
+    with pytest.raises(A.AcceptanceError, match="changed"):
+        R.read_declarative_inputs(tmp_path, registry)
+    assert len(descriptors) == 1
+    with pytest.raises(OSError):
+        os.fstat(descriptors[0])
+
+
+def test_invalid_id_reports_safe_position_and_rule(registry):
+    registry["entries"][0]["dependencies"] = ["x" * 200_000]
+    with pytest.raises(A.AcceptanceError) as error:
+        R.validate_registry(registry)
+    assert "entry dependencies[0]" in str(error.value)
+    assert "alphanumerics plus . _ -; at most 64 characters" in str(error.value)
+    assert len(str(error.value)) < 200
