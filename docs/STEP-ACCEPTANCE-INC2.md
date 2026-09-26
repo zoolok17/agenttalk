@@ -997,3 +997,132 @@ All three isolated production source copies were compared with their recorded
 Git commits after restoration. Task scratch is retained for the cold read,
 including before/after logs, focused replay scripts, baseline and mutant outputs,
 and isolated pytest directories.
+
+### M3d delta read corrections
+
+Implementation commits: `e862183` (parent `cc52135`) and `736ad0a`. This round changes the
+protected predicate, prerequisite policy fold and publication scan eligibility.
+
+F1: protected schema-4 predicates now bind a digest per required registry entry,
+closing over its complete definition, dependency definitions transitively, all
+consumed file pins and inherited snapshot/provenance pins. This includes artifact
+digest/version, expected banner, command/offline policy and measurement adapters
+and configuration. Required-definition differences use the existing exact LD2
+policy-amendment approval, including same-ID replacements. A superset preserving
+every prior definition remains acceptable. History and related-root coverage use
+the retained registry, never a mutable current definition. Legacy predicates are
+unchanged. Missing registry context for a schema-4 predicate is refused.
+
+F2: the fresh evaluator's existing row associations now drive the close fold.
+Informational-only unavailable/mismatch/expired/unproven prerequisites remain
+visible without blocking GO. Missing/integrity records, offline violations,
+stale plans, unsafe paths and unclassified holds remain mandatory. Path-policy
+refusals carry a mandatory flag through hold deduplication; diagnostics are not
+parsed to decide policy. The standalone operator preflight still exits nonzero
+unless all required entries pass; it does not grant an acceptance verdict.
+
+Self-review found two more unsafe-path classifications within F2. Non-regular
+file refusals must remain mandatory when mapped to retryable not-run. A kernel
+`ELOOP` refusal from a link swap must retain its typed link classification rather
+than become ordinary optional unavailability. Both regressions failed before the
+fix. The stream reader raises the sanitized exception outside the original
+exception handler, preserving the private-path/context boundary. The ordinary
+missing/unreadable informational case remains non-blocking. Informational proof
+fixtures use distinct bytes, so deleting their retained banner cannot also damage
+a gating tool's banner and disguise the policy being tested.
+
+F3: only GO requests on unpublished closes prepare a staged scan. Explicit HOLD
+records that preflight was not requested, without asserting a pass or inventing
+an inherited failure. Published-close refusal and barrier retries perform no
+staged reads. A close that changes from published to open between the cheap
+read and lock still has no verified GO scan and fails closed.
+
+F4: tests cover all six final identity fields, retained banner/log/observed reads,
+retained size/hash/budget/debit checks, strict capsule refs, cold delivery through
+both the audit reader and actual fresh-reviewer CLI, preparation races, diagnostic
+codes/text, injected expiry and the coverage-superset case. Config and comparator
+tests re-point the measurement reference to a new lenient pin while preserving
+the original pin as an ordinary input, ensuring the intended amendment is tested.
+
+F5: the operator guide now requires every shared-store seat to upgrade before
+relying on schema-4 GO. An older engine can display the stored final GO while
+its own check fails closed. The guide also corrects the prior ID-only LD2 claim.
+
+#### M3d executed tests
+
+All tests used foreground pytest, `PYTHONPATH=<workspace>/src`,
+`PYTHONDONTWRITEBYTECODE=1`, `-q -p no:cacheprovider`, isolated task-scratch
+basetemps and synthetic staged files/session Git templates. No full suite,
+downloads or staged-tool execution occurred.
+
+| Check | Result |
+| --- | --- |
+| F1/F2/F3 regression selection before fixes, Python 3.10 | 8 failed, 3 passed, 77 deselected; 37.78 s. The approved case initially requires the new coverage API. |
+| First fix run of that selection | 10 passed, 1 failed; 42.28 s. The failure exposed a false inherited counter from using an unavailable-scan sentinel for HOLD. |
+| Corrected explicit-HOLD and Java-swap selection | 5 passed, 83 deselected; 23.95 s. Valid exact operator approval reaches GO. |
+| Expanded guard selection, Python 3.10 | 52 passed, 3 failed; 87.17 s. Corrected two invalid version test fixtures and an expected diagnostic spelling. |
+| Four increment-2 files, Python 3.10 | 472 passed, 1 failed, 3 skipped; 215.63 s. Existing LD2 unit caller needed the new registry argument. |
+| Same four files, Python 3.14 | 472 passed, 1 failed, 3 skipped; 198.37 s. Same caller-only failure. |
+| Corrected LD2 caller, Java/config/comparator swaps and cold-delivery CLI | 6 passed each: 34.14 s on 3.10, 34.11 s on 3.14. Assertions were preserved. |
+| Final retained-proof read-boundary assertion | 1 passed each: 4.72 s on 3.10, 6.50 s on 3.14. |
+| Distinct informational proof cases | 6 passed each: 23.07 s on 3.10, 22.64 s on 3.14. |
+| Non-regular-file and kernel link-swap regressions before fixes | Each failed once, 4.31 s each on 3.10. |
+| Unsafe-path, read-budget and metadata/race selection | 22 passed each: 38.94 s on 3.10, 36.55 s on 3.14. |
+| Final path classification and stream/privacy selection | 14 passed each: 29.27 s on 3.10, 27.51 s on 3.14. |
+| Shipped acceptance/close/signoff/gate selection | 152 passed, 737 deselected each: 210.09 s on 3.10, 202.82 s on 3.14. |
+| Unchanged reviewer Java-swap probe, Python 3.10 | Successor open and attach exit 0; unapproved GO publication exits 3. The first external-file invocation lacked the session fixture plugin and is excluded; the corrected invocation loads `conftest` explicitly. |
+
+The four files are `test_acceptance_registry.py`, `test_acceptance_preflight.py`,
+`test_acceptance_schema.py` and `test_acceptance_staging.py`. The shipped-path
+selection uses `test_acceptance.py test_close.py test_close_signoffs.py
+test_gates.py -k 'coverage or successor or scope_reduction or publish or legacy'`.
+Aggregate corrected evidence is **627 distinct passes and 3 platform skips per
+interpreter**: 475 increment-2 cases plus 152 shipped-path cases. This combines
+completed runs and their corrections; it is not one combined invocation.
+
+Ruff and Bandit pass all seven changed production modules; the changed test module
+passes Ruff and Bandit with pytest assertion rule B101 excluded. Existing nosec
+comment warnings are not findings. Whitespace passes. The patch privacy scan
+passes eight positive controls and finds zero matches.
+
+#### M3d mutation evidence
+
+The reviewer's `mutate_m3b.py` completed against isolated copies, with its original
+75 mutation definitions and original staging/schema selection. Both baselines
+were green: 48 passed/34 deselected at `cc52135`, and 102 passed/34 deselected
+at the `e862183` fix checkpoint. A sorting-only collection hook prioritized
+relevant tests; it changed neither selection nor assertions. The hook was added
+during the runs, so these timings are not performance comparisons.
+
+| Completed audit | Killed | Survived | Skipped, not results |
+| --- | ---: | ---: | ---: |
+| Before, `cc52135` | 34 | 40 | 1 |
+| After, `e862183` plus new gap tests | 54 | 17 | 4 |
+| Focused replay, 11 adapted/new mutations | 11 | 0 | 0 |
+
+The before skip is V2 (invalid Python after replacement). After skips are A2,
+V3 and C4 (changed source anchors), plus that same invalid V2. The first attempted
+after audit aborted at its baseline because the existing LD2 unit caller lacked
+the new registry argument. It is excluded; the completed rerun follows that
+caller correction without weakening an assertion.
+
+After-checkpoint survivors: L7, L8, L10, L11, L12, L21, L23, L25, L27, L32,
+S7, S17, U3, U4, V1, V2b and K2. L12 was then killed by the focused replay after
+adding a spy that forbids live reads of retained observed/banner/log inputs.
+V3's adapted replacement was also killed there. V1/V2b overlap the new definition
+map, which itself binds required IDs; the focused replay separately kills removal
+of definition binding and comparison. The other survivors remain explicit
+mutation-test gaps; no complete mutation-coverage claim is made.
+
+The focused baseline passed 34 cases (97 deselected). Its eleven killed mutations
+remove definition binding, dependency definitions, file definitions, definition
+comparison, informational folding, mandatory-code handling, mandatory-path
+handling, HOLD scan exclusion, GO scanning, adapted V3 and final L12. The broad
+after audit predates the final unsafe-path corrections in `736ad0a`; those have
+the independent red/green evidence above. Checkpoints are not conflated.
+
+All eleven audited production modules in each scratch copy were compared with
+their recorded Git commit after restoration: before matches `cc52135`; after and
+focused copies match `e862183`. Task scratch is retained for the delta read:
+`tk-111fc2ff3654` contains the before/after logs, focused replay and source copies,
+test outputs, privacy checker and isolated pytest directories. No PR was opened.
