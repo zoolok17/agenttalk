@@ -55,7 +55,8 @@ def read_input(path):
     return data
 
 
-def _read_pin(root, ref, budget, *, distribution=False, evidence=False, public_ref=None, capture=None):
+def _read_pin(root, ref, budget, *, distribution=False, evidence=False, public_ref=None, capture=None,
+              capture_role="pin"):
     public_ref = public_ref or ref.get("id", "preflight")
     limit = MAX_DISTRIBUTION_BYTES if distribution else R.MAX_INPUT_BYTES
     if ref["size"] > limit or ref["size"] > budget[0]:
@@ -87,7 +88,7 @@ def _read_pin(root, ref, budget, *, distribution=False, evidence=False, public_r
     data = None if distribution else b"".join(chunks)
     if capture is not None and data is not None:
         # Retain the bytes actually evaluated, including bounded mismatching evidence.
-        capture.append((public_ref, data))
+        capture.append((public_ref + ":" + capture_role, data))
     if size != ref["size"] or digest.hexdigest() != ref["sha256"]:
         return None, [hold(INTEGRITY if evidence else MISMATCH, "staged size or digest differs from pin", public_ref)]
     return data, []
@@ -127,10 +128,11 @@ def _offline(entry, observed, lines):
     return [{**error, "ref": entry["id"]} for error in errors]
 
 
-def _environment(environment, root, registry, budget, capture=None):
+def _environment(environment, root, registry, budget, capture=None, *, role="planned"):
     errors = []
     for row in environment["row_overrides"]:
-        data, issues = _read_pin(root, row["environment"], budget, evidence=True, public_ref=row["id"], capture=capture)
+        data, issues = _read_pin(root, row["environment"], budget, evidence=True, public_ref=row["id"],
+                                 capture=capture, capture_role=role)
         errors.extend(issues)
         if data is not None:
             try:
@@ -172,7 +174,8 @@ def evaluate(plan_bytes, registry_bytes, cache_root, *, observation_bytes=None, 
     proof_budget = [R.MAX_TOTAL_BYTES]
     common.extend(_environment(plan["environment"], cache_root, registry, [R.MAX_TOTAL_BYTES], capture))
     if observed is not None:
-        common.extend(_environment(observed["environment"], proof_root, registry, proof_budget, capture))
+        common.extend(_environment(observed["environment"], proof_root, registry, proof_budget,
+                                   capture, role="observed"))
     observation_time = R.utc(observed["observed_at"]) if observed is not None else now
     files, file_errors, manifests = {}, {}, []
     distribution_budget, declarative_budget = [MAX_SCAN_BYTES], [R.MAX_TOTAL_BYTES]
@@ -208,10 +211,10 @@ def evaluate(plan_bytes, registry_bytes, cache_root, *, observation_bytes=None, 
             if actual["version"] != entry["version"]:
                 issues.append(hold(MISMATCH, "observed entry version differs from pin", entry["id"]))
             banner, errors = _read_pin(proof_root, actual["banner"], proof_budget,
-                                      evidence=True, public_ref=entry["id"], capture=capture)
+                                      evidence=True, public_ref=entry["id"], capture=capture, capture_role="banner")
             issues.extend(errors)
             log, errors = _read_pin(proof_root, actual["offline"]["log"], proof_budget,
-                                   evidence=True, public_ref=entry["id"], capture=capture)
+                                   evidence=True, public_ref=entry["id"], capture=capture, capture_role="log")
             issues.extend(errors)
             try:
                 if banner is not None:

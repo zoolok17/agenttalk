@@ -332,8 +332,10 @@ def prepare(store, plan_file, project_repo, revision, scope, lenses=(), *, cache
     preflight = isinstance(raw, dict) and schema(raw.get("schema_version")).preflight
     if preflight:
         from agenttalk import acceptance_staging
-        prepared = acceptance_staging.prepare(store, path, cache_root)
-        plan = prepared["plan"]
+        from agenttalk import acceptance_registry as R
+        registry_bytes = _read(_path(path.parent, R.relative_path(raw.get("registry_ref"))))
+        plan, _ = R.policy(plan_bytes, registry_bytes)
+        prepared = None
     else:
         if cache_root is not None:
             _fail("cache root requires a schema-4 acceptance plan")
@@ -353,6 +355,10 @@ def prepare(store, plan_file, project_repo, revision, scope, lenses=(), *, cache
     if schema(plan["schema_version"]).cold:
         from agenttalk.acceptance_audit import change_identity
         change_identity(project, plan)
+    if preflight:
+        prepared = acceptance_staging.prepare(store, path, cache_root)
+        if prepared["plan"] != plan:
+            _fail("plan changed during preparation", "acceptance_plan_stale")
     if prepared is not None:
         return dict(prepared, project=project)
     return {"plan_hash": _retain(store, plan_bytes), "registry_hash": _retain(store, registry_bytes),

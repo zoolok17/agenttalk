@@ -72,6 +72,48 @@ def attachment(case, change=None, *, commit=True):
     return data
 
 
+def test_pending_freeze_ack_remains_unbound(candidate, monkeypatch):
+    from agenttalk import acceptance_staging as staging
+    def fail(*args, **kwargs):
+        raise OSError("injected retention failure")
+    monkeypatch.setattr(staging, "freeze", fail)
+    assert open_candidate(candidate) != 0
+    assert record(candidate)["acceptance_route"] == {"pending": True}
+    partition = candidate["plan"]["partitions"][0]
+    lens = "acceptance-run-" + partition["id"]
+    assert legacy.ack_lens(candidate, lens, partition["agents"][0]) == 0
+    assert "acceptance_binding" not in record(candidate)["lens_acks"][lens]
+
+
+@pytest.mark.parametrize("fault", ["scope", "lens", "project"])
+def test_invalid_open_does_not_hash(candidate, monkeypatch, fault):
+    calls = []
+    monkeypatch.setattr(P, "evaluate", lambda *a, **k: calls.append(True))
+    if fault == "scope":
+        candidate["plan"]["scope"] = "wrong"
+    elif fault == "project":
+        candidate["plan"]["project_id"] = "wrong"
+    else:
+        candidate["plan"]["partitions"][0]["agents"] = []
+    save(candidate)
+    assert open_candidate(candidate) != 0
+    assert calls == []
+
+
+@pytest.mark.parametrize("fault", ["cold", "second", "published"])
+def test_invalid_attach_does_not_hash(candidate, monkeypatch, fault):
+    assert open_candidate(candidate) == 0
+    attachment(candidate, commit=fault != "cold")
+    if fault == "second":
+        assert legacy.attach(candidate) == 0
+    elif fault == "published":
+        legacy.publish_hold(candidate)
+    calls = []
+    monkeypatch.setattr(P, "evaluate", lambda *a, **k: calls.append(True))
+    assert legacy.attach(candidate) != 0
+    assert calls == []
+
+
 @pytest.mark.parametrize("fault", [None, "missing", "changed", "expired", "absent-cache"])
 def test_schema4_open_freezes_bound_hold_without_acquisition(candidate, fault):
     if fault == "missing":
@@ -124,8 +166,9 @@ def test_schema4_attach_recomputes_and_retains_proof(candidate, fault):
     for item in value["inputs"]:
         assert len(A._retained(candidate["store"], item["sha256"])) == item["size"]
     refs = {i["ref"] for i in value["inputs"]}
-    assert "advisory-manifest" in refs
-    assert ("java" in refs) == (fault != "claimed-pass")
+    assert "advisory-manifest:pin" in refs
+    assert ("java:banner" in refs) == (fault != "claimed-pass")
+    assert ("java:log" in refs) == (fault != "claimed-pass")
     assert legacy.attach(candidate) != 0
 
 
@@ -247,12 +290,14 @@ def test_schema4_capsule_manifest_is_strict(candidate, fault):
 
 def test_schema4_route_changed_during_preflight_does_not_attach(candidate, monkeypatch, capsys):
     assert open_candidate(candidate) == 0
-    attachment(candidate, commit=False)
+    attachment(candidate)
     original = P.evaluate
 
     def cold_arrives(*args, **kwargs):
         report = original(*args, **kwargs)
-        assert legacy.cold_phase(candidate, "commit") == 0
+        with close.close_transaction(candidate["store"], "attempt") as transaction:
+            transaction.record["acceptance_route"]["cache_root"] += "/changed"
+            transaction.commit()
         return report
 
     monkeypatch.setattr(P, "evaluate", cold_arrives)
@@ -289,3 +334,85 @@ def test_legacy_prepare_keeps_scope_refusal_before_registry_read(case):
     (case["inputs"] / "registry.json").unlink()
     with pytest.raises(A.AcceptanceError, match="plan scope differs"):
         A.prepare(case["store"], case["inputs"] / "plan.json", case["project"], case["sha"], "milestone")
+
+
+def test_preflight_binding_and_ack_keys_are_literal(candidate):
+    from agenttalk import acceptance_staging as staging
+    assert open_candidate(candidate) == 0
+    assert set(staging.binding(record(candidate))) == {
+        "close_id", "instance_id", "attempt_id", "project_id", "revision", "plan_hash", "registry_hash"}
+    assert set(A.ack_binding(record(candidate))) == {
+        "instance_id", "attempt_id", "revision", "plan_hash", "registry_hash", "bundle_hash",
+        "cold_commit_hash", "cold_reconcile_hash", "obligations_hash", "environment_hash",
+        "preflight_open_hash", "preflight_attach_hash"}
+
+
+@pytest.mark.parametrize("fault", ["item-field", "inputs", "version", "observation"])
+def test_capture_nested_structure_and_observation_are_revalidated(candidate, fault):
+    from agenttalk import acceptance_staging as staging
+    assert open_candidate(candidate) == 0
+    attachment(candidate)
+    assert legacy.attach(candidate) == 0
+    value = capsule(candidate, "attach")
+    if fault == "item-field":
+        value["inputs"][0]["unexpected"] = True
+    elif fault == "inputs":
+        value["inputs"] = {}
+    elif fault == "version":
+        value["schema_version"] = 2
+    else:
+        value["observation_hash"] = "f" * 64
+    with close.close_transaction(candidate["store"], "attempt") as transaction:
+        transaction.record["acceptance_route"]["preflight_attach_hash"] = A._retain(
+            candidate["store"], staging.canonical(value))
+        transaction.commit()
+    with pytest.raises(A.AcceptanceError):
+        staging.pending_snapshot(candidate["store"], record(candidate))
+
+
+@pytest.mark.parametrize("fault", ["ref-field", "version"])
+def test_attachment_closed_ref_and_envelope_version(candidate, fault):
+    assert open_candidate(candidate) == 0
+    data = attachment(candidate, (lambda e: e.update(schema_version=2)) if fault == "version" else None)
+    if fault == "ref-field":
+        data["preflight_observation"]["unexpected"] = True
+        legacy.write_json(candidate["inputs"] / "bundle.json", data)
+    assert legacy.attach(candidate) == 2
+
+
+def test_preflight_attachment_refuses_legacy_route(case_v3):
+    from agenttalk import acceptance_staging as staging
+    assert legacy.open_attempt(case_v3) == 0
+    with pytest.raises(A.AcceptanceError, match="schema-4 route"):
+        staging.prepare_attachment(case_v3["store"], "attempt", case_v3["inputs"] / "bundle.json", {})
+
+
+def test_legacy_open_refuses_cache_argument(case_v3):
+    assert legacy.open_attempt(case_v3, "--cache-root", str(case_v3["inputs"])) != 0
+    assert not close.close_path(case_v3["store"], "attempt").exists()
+
+
+def test_project_input_link_keeps_typed_refusal(tmp_path, monkeypatch):
+    import stat
+    from types import SimpleNamespace
+    from pathlib import Path
+    monkeypatch.setattr(Path, "lstat", lambda self: SimpleNamespace(st_mode=stat.S_IFLNK, st_file_attributes=0))
+    with pytest.raises(A.LinkedPathError):
+        A._path(tmp_path, "plan.json")
+
+
+def test_capture_retains_both_environment_roles_and_banner(staged):
+    override = deepcopy(staged["plan"]["environment"])
+    ref = {"path": "override.json", "size": 0, "sha256": "a" * 64}
+    preflight.evidence(staged, ref, preflight.encoded(override))
+    for obj in (staged["plan"], staged["observation"]):
+        obj["environment"]["row_overrides"] = [{"id": "build", "environment": deepcopy(ref)}]
+    captured = []
+    assert preflight.run(staged, capture=captured)["status"] == "pass"
+    data = [raw for _, raw in captured]
+    assert data.count(preflight.encoded(override)) == 2
+    banner = staged["root"] / staged["observation"]["entries"][0]["banner"]["path"]
+    assert banner.read_bytes() in data
+    refs = [ref for ref, _ in captured]
+    assert len(set(refs)) == len(refs)
+    assert {"build:planned", "build:observed", "java:banner", "java:log"} <= set(refs)

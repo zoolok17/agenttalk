@@ -864,3 +864,20 @@ aggregate counts across two completed targeted invocations, not a full-suite run
 Patch whitespace passes. The added-line privacy sweep detects all eight positive
 controls and finds zero matches. The complete M3a diff remains below 1500 changed
 lines even including the test tables. M3a stops here for the lead's cold read.
+
+### M3c review corrections
+
+Pending or unversioned routes accept acknowledgements without acceptance bindings,
+as the shipped engine did after interrupted freezing. Scope, lens and project
+checks precede staged hashing; attachment eligibility is checked before hashing
+and again under the close transaction. Seven focused regressions produced six
+failures before the fix and seven passes after it. The route-change race now starts
+after a valid cold commitment and changes the private locator during evaluation.
+
+Captured references are unique and role-qualified: `pin-id:pin`, `entry:banner`,
+`entry:log`, `row:planned`, `row:observed`. Cache roots must be absolute and fully
+resolved; absent `--cache-root` has an explicit schema-4 diagnostic. The schema
+inventory scans all acceptance modules, close and CLI, tracking subscription,
+`get` and local aliases. Only close-envelope and DoD-policy version validators
+belong to separate namespaces. Literal binding-key and nested capsule tests cover
+the cold reader's identified gaps. M3b replaces the publication guard separately.

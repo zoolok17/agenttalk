@@ -1,11 +1,43 @@
 """Acceptance capability dispatch covers the M1 inventory without version fallbacks."""
 
 import ast
+import os
 from pathlib import Path
 
 import pytest
 
 from agenttalk import acceptance as A
+
+
+def raw_schema_comparisons(tree):
+    """Track raw version operands, including aliases; schema() consumes the taint."""
+    aliases = set()
+    def raw(node):
+        if isinstance(node, ast.Name):
+            return node.id in aliases or node.id == "schema_version"
+        if isinstance(node, ast.Subscript):
+            return isinstance(node.slice, ast.Constant) and node.slice.value == "schema_version"
+        return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get" and node.args and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == "schema_version")
+    assignments = [n for n in ast.walk(tree) if isinstance(n, (ast.Assign, ast.AnnAssign))]
+    for _ in range(len(assignments) + 1):
+        for node in assignments:
+            if raw(node.value):
+                for target in (node.targets if isinstance(node, ast.Assign) else [node.target]):
+                    if isinstance(target, ast.Name):
+                        aliases.add(target.id)
+    return [n for n in ast.walk(tree) if isinstance(n, ast.Compare)
+            and any(raw(operand) for operand in (n.left, *n.comparators))]
+
+
+@pytest.mark.parametrize("source", [
+    'if route["schema_version"] == 3: pass',
+    'if route.get("schema_version") == 3: pass',
+    'version = route.get("schema_version")\nalias = version\nif alias < 3: pass',
+])
+def test_inventory_detects_direct_get_and_local_alias(source):
+    assert raw_schema_comparisons(ast.parse(source))
 
 
 def test_known_capabilities_and_unknown_refusal():
@@ -47,10 +79,14 @@ def test_inventory_comparisons_use_one_refusing_dispatch():
             assert target is capabilities
             with pytest.raises(A.AcceptanceError):
                 target(5)
-        for comparison in (n for n in ast.walk(tree) if isinstance(n, ast.Compare)):
-            direct = [n for operand in (comparison.left, *comparison.comparators)
-                      for n in ([operand] if not isinstance(operand, ast.Call) else [])
-                      if isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Constant)
-                      and n.slice.value == "schema_version"]
-            # close envelope versions form a different namespace.
-            assert not direct or filename == "close.py", (filename, comparison.lineno)
+    with os.scandir(root) as entries:
+        files = [Path(e.path) for e in entries if
+                 (e.name.startswith("acceptance") and e.name.endswith(".py")) or e.name in ("close.py", "cli.py")]
+    for path in files:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        # These two close record namespaces are not acceptance plan versions.
+        exceptions = {"close.py": {"_is_wellformed", "validate_dod_policy"}}
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name in exceptions.get(path.name, set()):
+                continue
+            assert not raw_schema_comparisons(node), (path.name, getattr(node, "lineno", 0))

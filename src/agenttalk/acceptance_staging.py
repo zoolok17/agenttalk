@@ -19,7 +19,11 @@ def binding(record):
 
 
 def locator(value):
+    if value is None:
+        A._fail("--cache-root is required for a schema-4 plan")
     R._text(value, "cache root")
+    if not Path(value).is_absolute():
+        A._fail("--cache-root must be an absolute, fully resolved path")
     path = Path(value).absolute()
     if ".." in path.parts:
         A._fail("cache root must be a fully resolved locator")
@@ -54,6 +58,8 @@ def prepare(store, plan_file, cache_root):
 def retain_report(store, record, report, inputs, observation_hash=None):
     retained = []
     for ref, data in inputs:
+        if ref in {item["ref"] for item in retained}:
+            A._fail("duplicate retained input reference")
         retained.append({"ref": ref, "sha256": A._retain(store, data), "size": len(data)})
     capsule = {"schema_version": 1, "binding": binding(record), "report": report,
                "observation_hash": observation_hash, "inputs": retained}
@@ -94,6 +100,12 @@ def prepare_attachment(store, close_id, path, bundle):
     route, _ = A._policy(store, record)
     if not A.schema(route["schema_version"]).preflight:
         A._fail("preflight attachment requires a schema-4 route")
+    if record["status"] == close.PUBLISHED:
+        A._fail("cannot attach to a published close")
+    if route["cold_commit_hash"] is None:
+        A._fail("commit initial cold observations before attachment", "acceptance_cold_missing")
+    if route["bundle_hash"] is not None:
+        A._fail("attempt already has an immutable bundle")
     ref = bundle.get("preflight_observation")
     R.evidence_ref(ref)
     data = P.read_input(R.staged_path(path.parent, ref["path"]))
@@ -129,9 +141,17 @@ def pending_snapshot(store, record):
         A._fail("preflight capture binding differs", "acceptance_row_unbound")
     if capsule["observation_hash"] is not None:
         A._digest(capsule["observation_hash"])
+    seen = set()
     for item in R._list(capsule["inputs"], "retained inputs", 3 * R.MAX_FILES + 2 * R.MAX_ENTRIES):
         A._object(item, "ref sha256 size", "retained preflight input")
-        A._id(item["ref"], "retained input.ref")
+        ref = item["ref"]
+        if not isinstance(ref, str) or ref.count(":") != 1 or ref in seen:
+            A._fail("retained input.ref must be a unique role-qualified ID")
+        public_id, role = ref.split(":")
+        A._id(public_id, "retained input.ref")
+        if role not in {"pin", "planned", "observed", "banner", "log"}:
+            A._fail("invalid retained input role")
+        seen.add(ref)
         R._integer(item["size"], "retained input size", 0, R.MAX_INPUT_BYTES)
         if len(A._retained(store, item["sha256"])) != item["size"]:
             A._fail("retained preflight input size differs", P.INTEGRITY)

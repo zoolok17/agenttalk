@@ -1737,9 +1737,10 @@ def apply_ack(record: dict, *, lens_id: str, status: str, agent: str,
         "override": bool(override),
     }
     route = record.get("acceptance_route")
-    from agenttalk.acceptance import ack_binding, schema
-    if isinstance(route, dict) and schema(route.get("schema_version")).modern:
-        record["lens_acks"][lens_id]["acceptance_binding"] = ack_binding(record)
+    if isinstance(route, dict) and not route.get("pending") and "schema_version" in route:
+        from agenttalk.acceptance import ack_binding, schema
+        if schema(route["schema_version"]).modern:
+            record["lens_acks"][lens_id]["acceptance_binding"] = ack_binding(record)
     if status == COUNTER:
         record["counters"][counter_id] = {
             "counter_id": counter_id, "lens": lens_id, "raised_by": agent,
