@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`agenttalk.challenge` / `agenttalk-challenge` skill: challenge major work
+  before it starts.** A requester sends a blind brief (outcome, trigger,
+  size including the cost of doing nothing, constraints, pointers; never who
+  asked or the preferred answer) to an independent challenger (not the
+  proposer, planner or implementer; another vendor; a fresh context), who
+  replies with a typed verdict: proceed, reshape, probe, replace, defer, stop
+  or unassessed. Mandatory per initiative for major work (2+ work orders,
+  ~2 agent-hours, format/schema/public-CLI/shipped-skill changes, new
+  dependencies or data flows, money/security/irreversible steps, any
+  operator idea, unknown size); a malformed, contaminated or late verdict
+  counts as unassessed, never proceed; only the operator overrides a
+  replace/defer/stop verdict. The lead, propose and listen skills now route
+  through it (challenge meta on major dispatches, a Challenge section in
+  major proposals, operator ideas challenged before they become work).
+
 ### Changed
 
 - Reduce acceptance Git process overhead with command-local metadata/history

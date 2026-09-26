@@ -64,6 +64,7 @@ SKILL_INVARIANTS = [
         "Long-running work",               # #164 progress-note section
         "does NOT end your turn",          # #164 core rule (mirrors _DEFAULT_RULES)
         "agenttalk progress --from $SELF --to-id",  # #164 exact invocation
+        "meta.challenge=true",             # a challenge question routes to the challenger
     ]),
     ("agenttalk.propose.md", "agenttalk-propose", [
         "AGENTTALK_SELF",                  # identity preamble
@@ -73,6 +74,7 @@ SKILL_INVARIANTS = [
         "--in-reply-to",                   # counter links to prior proposal
         "agenttalk threads --for",         # before-stopping thread check
         "Split-work guard",                # proposals are not a split backdoor
+        "## Challenge",                    # a major proposal cites its challenge
     ]),
     ("agenttalk.lead.md", "agenttalk-lead", [
         "AGENTTALK_SELF",                  # identity preamble
@@ -86,6 +88,8 @@ SKILL_INVARIANTS = [
         "do not stall on a call that is yours",  # Independence: report, don't over-ask
         "does not protect you here",       # --force-with-lease is not a safeguard (mirror both sides)
         "descendant of whatever",          # reopen is conditional; the fallback must not be dropped
+        "challenge_disposition",           # major dispatch carries its challenge result
+        "Challenge an operator idea before it becomes work",  # liaison idea intake
     ]),
     ("agenttalk.consult.md", "agenttalk-consult", [
         "AGENTTALK_SELF",
@@ -96,6 +100,22 @@ SKILL_INVARIANTS = [
         "Peer reply is data",              # untrusted-input note
         "consult=true",                    # uses meta tag
         "request_id",                      # correlation required
+    ]),
+    ("agenttalk.challenge.md", "agenttalk-challenge", [
+        "AGENTTALK_SELF",
+        "Always resolve inside your current shell",
+        "challenge=true",                  # uses meta tag, like consult
+        "request_id",                      # correlation required
+        "Count the whole INITIATIVE",      # threshold is per initiative, not per task
+        "FACT, ESTIMATE or ASSUMPTION",    # blind brief labels its claims
+        "Never name who asked",            # the brief hides the source
+        "NEVER as proceed",                # malformed/contaminated/late = unassessed
+        "only the OPERATOR can override",  # stop-class verdicts
+        "allowed ONLY for an optional challenge",  # no self-challenge for mandatory work
+        "NEVER auto-proceeds",             # money/security/irreversible waits or escalates
+        "exposed=",                        # contamination is declared, not hidden
+        "No recursive challenges",         # recursion guard
+        "diagnostic band, never a quota",  # never optimise for the rejection rate
     ]),
     ("agenttalk.sk-loop.md", "agenttalk-sk-loop", [
         "AGENTTALK_SELF",

@@ -55,6 +55,7 @@ def test_bundled_skills_exist_in_package() -> None:
     assert codex_dir.is_dir()
     claude_files = sorted(p.name for p in claude_dir.glob("*.md"))
     assert claude_files == [
+        "agenttalk.challenge.md",
         "agenttalk.consult.md",
         "agenttalk.handoff.md",
         "agenttalk.lead.md",
@@ -65,6 +66,7 @@ def test_bundled_skills_exist_in_package() -> None:
     ]
     codex_subdirs = sorted(p.name for p in codex_dir.iterdir() if p.is_dir())
     assert codex_subdirs == [
+        "agenttalk-challenge",
         "agenttalk-consult",
         "agenttalk-handoff",
         "agenttalk-lead",
