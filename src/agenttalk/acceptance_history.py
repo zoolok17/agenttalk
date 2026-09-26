@@ -57,7 +57,7 @@ def _reduction(value):
         A._digest(digest)
     for key in ("reason", "impact", "owner", "expires_at", "decision_ref"):
         A._text(value[key], key)
-    A._id(value["decision_ref"])
+    A._id(value["decision_ref"], "reduction.decision_ref")
     if value["cause"] not in {"unavailable-tool", "measured-variance", "policy-amendment"}:
         A._fail("unsupported approval cause: expected unavailable-tool, measured-variance or policy-amendment",
                 "acceptance_scope_reduction_unapproved")
@@ -99,7 +99,7 @@ def _approval(store, data, parent, successor_id, plan_hash, reduction):
 def successor(store, *, parent_id, close_id, plan_file, project_repo, revision, by, at, reason,
               reduction_file=None):
     """Preserve a terminal parent before exclusively creating a linked attempt."""
-    A._id(close_id)
+    A._id(close_id, "successor.close_id")
     if close_id == parent_id:
         A._fail("a successor needs a different close ID")
     A._text(reason, "amendment reason")

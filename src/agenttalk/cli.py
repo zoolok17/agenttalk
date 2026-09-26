@@ -3525,6 +3525,42 @@ def _counter_decision_from_cli_spelling(spelling: str, close_mod) -> str:
     }[spelling]
 
 
+def cmd_acceptance_preflight(args: argparse.Namespace) -> int:
+    """Operator staging check; deliberately bypass Store discovery and construction."""
+    from agenttalk import acceptance as A, acceptance_preflight as P, acceptance_registry as R
+    try:
+        plan_path = Path(args.plan).absolute()
+        plan_bytes = P.read_input(plan_path)
+        plan = R.decode(plan_bytes)
+        if not isinstance(plan, dict):
+            A._fail("preflight plan must be an object")
+        registry_ref = R.relative_path(plan.get("registry_ref"))
+        registry_bytes = P.read_input(plan_path.parent / registry_ref)
+        observation_path = Path(args.observation).absolute() if args.observation else None
+        observation_bytes = P.read_input(observation_path) if observation_path is not None else None
+        result = P.evaluate(plan_bytes, registry_bytes, args.cache_root, observation_bytes=observation_bytes,
+                            proof_root=observation_path.parent if observation_path is not None else None)
+    except A.AcceptanceError as exc:
+        # Import messages are fixed/labelled; never print an OS locator or raw record.
+        detail = str(exc)[:256]
+        if "link" in detail or "reparse" in detail:
+            detail += "; pass fully resolved paths without links or reparse ancestors"
+        result = {"status": "not-run", "entries": [], "holds": [P.hold(exc.code, detail)]}
+    except (OSError, ValueError):
+        result = {"status": "not-run", "entries": [], "holds": [P.hold(P.UNAVAILABLE, P.ROOT_ADVICE)]}
+    if args.json:
+        print(json.dumps(result, sort_keys=True))
+    else:
+        print(f"preflight: {result['status']}")
+        for entry in result["entries"]:
+            print(f"  {entry['id']}: {entry['status']}")
+            for issue in entry["holds"]:
+                print(f"    {issue['code']}: {issue['detail']}")
+        for issue in result["holds"]:
+            print(f"  {issue['code']}: {issue['detail']}")
+    return 0 if result["status"] == "pass" else 3
+
+
 def cmd_close(args: argparse.Namespace) -> int:
     """Assurance P2 milestone/release close (advisory; see close.py)."""
     from agenttalk import close as close_mod
@@ -14923,6 +14959,14 @@ def build_parser() -> argparse.ArgumentParser:
     caccept = csub.add_parser("acceptance",
                             help="Attach acceptance evidence, record cold review, or create a successor.")
     cacceptsub = caccept.add_subparsers(dest="acceptance_cmd", required=True)
+    cpreflight = cacceptsub.add_parser("preflight",
+                                     help="Read-only staged pins and offline-proof check; never runs tools.")
+    cpreflight.add_argument("--plan", required=True)
+    cpreflight.add_argument("--cache-root", required=True, help="Fully resolved operator-staged directory.")
+    cpreflight.add_argument("--observation",
+                            help="Supplied observation JSON; evidence paths are relative to its directory.")
+    cpreflight.add_argument("--json", action="store_true")
+    cpreflight.set_defaults(func=cmd_acceptance_preflight)
     cattach = cacceptsub.add_parser("attach", help="Copy and bind an immutable bundle and its raw artifacts.")
     cattach.add_argument("--id", required=True)
     cattach.add_argument("--file", required=True)

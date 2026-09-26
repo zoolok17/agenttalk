@@ -5,6 +5,7 @@ Distribution pins are never copied by the declarative-input reader (D1).
 """
 
 from datetime import datetime, timezone
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import re
@@ -344,7 +345,36 @@ def validate_registry(value):
 
     for key in entries:
         visit(key, ())
+    consumed = entry_inputs(value)
+    for pin in files.values():
+        if pin["role"] == "snapshot" and not any(
+                pin["id"] in entry["snapshots"] and pin["distribution"]["id"] in consumed[entry["id"]]
+                for entry in entries.values()):
+            A._fail("snapshot must be listed by an entry consuming its distribution")
     return value
+
+
+def entry_inputs(registry):
+    """Input closure after graph validation; snapshots do not manufacture consumption."""
+    entries = {entry["id"]: entry for entry in registry["entries"]}
+    files = {pin["id"]: pin for pin in registry["files"]}
+    result = {}
+
+    def collect(key):
+        if key not in result:
+            inputs = _entry(entries[key], files)
+            for dep in entries[key]["dependencies"]:
+                inputs.update(collect(dep))
+            # Distribution/snapshot provenance is itself required evidence.
+            for ref in list(inputs):
+                if files[ref]["role"] in ("distribution", "snapshot"):
+                    inputs.update(_provenance(files[ref]["provenance"], files))
+            result[key] = inputs
+        return result[key]
+
+    for key in entries:
+        collect(key)
+    return result
 
 
 def validate_environment(value, *, overrides=True):
@@ -398,7 +428,12 @@ def validate_plan(value, registry):
         if not set(refs) <= entries.keys():
             A._fail("unresolved row registry reference")
         used.update(refs)
-    A.validate_plan(legacy)
+    # The legacy projection assumes hashable references/comparators. Malformed
+    # JSON must still refuse structurally at this new import boundary.
+    try:
+        A.validate_plan(legacy)
+    except (TypeError, KeyError):
+        raise A.AcceptanceError("acceptance_policy_invalid", "invalid projected plan field type") from None
     pending = list(used)
     while pending:
         for dep in entries[pending.pop()]["dependencies"]:
@@ -477,6 +512,39 @@ def validate_observation(value, registry):
     return value
 
 
+@contextmanager
+def staged_stream(root, relative):
+    """Open one verified regular file; callers bound reads and choose verdict mapping."""
+    path = staged_path(root, relative)
+    try:
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode):
+            A._fail("staged declarative input must be a regular file")
+        # NOFOLLOW refuses a substituted leaf link on POSIX. NONBLOCK keeps
+        # a substituted FIFO from hanging before fstat can reject its type.
+        flags = (os.O_RDONLY | getattr(os, "O_BINARY", 0)
+                 | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        fd = os.open(path, flags)
+        try:
+            opened = os.fstat(fd)
+            # Windows lacks O_NOFOLLOW: also reject a leaf replaced by a
+            # link to the original inode, even when fstat identity matches.
+            after = path.lstat()
+            if (not stat.S_ISREG(opened.st_mode) or not stat.S_ISREG(after.st_mode)
+                    or getattr(after, "st_file_attributes", 0) & 1024
+                    or any(getattr(before, key, None) != getattr(current, key, None)
+                           for current in (opened, after) for key in ("st_dev", "st_ino", "st_mode"))):
+                A._fail("staged declarative input changed while opening")
+            with os.fdopen(fd, "rb", closefd=False) as stream:
+                yield stream
+        finally:
+            os.close(fd)
+        return
+    except OSError:
+        pass
+    raise A.AcceptanceError("acceptance_preflight_unavailable", "staged input is unreadable") from None
+
+
 def read_declarative_inputs(root, registry):
     """Read bounded declarative bytes only; hash comparison/retention belongs to M2/M3."""
     validate_registry(registry)
@@ -485,36 +553,8 @@ def read_declarative_inputs(root, registry):
     for pin in registry["files"]:
         if pin["role"] == "distribution":
             continue
-        path = staged_path(root, pin["path"])
-        data = None
-        try:
-            before = path.lstat()
-            if not stat.S_ISREG(before.st_mode):
-                A._fail("staged declarative input must be a regular file")
-            # NOFOLLOW refuses a substituted leaf link on POSIX. NONBLOCK keeps
-            # a substituted FIFO from hanging before fstat can reject its type.
-            flags = (os.O_RDONLY | getattr(os, "O_BINARY", 0)
-                     | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
-            fd = os.open(path, flags)
-            try:
-                opened = os.fstat(fd)
-                # Windows lacks O_NOFOLLOW: also reject a leaf replaced by a
-                # link to the original inode, even when fstat identity matches.
-                after = path.lstat()
-                if (not stat.S_ISREG(opened.st_mode) or not stat.S_ISREG(after.st_mode)
-                        or getattr(after, "st_file_attributes", 0) & 1024
-                        or any(getattr(before, key, None) != getattr(current, key, None)
-                               for current in (opened, after) for key in ("st_dev", "st_ino", "st_mode"))):
-                    A._fail("staged declarative input changed while opening")
-                with os.fdopen(fd, "rb", closefd=False) as stream:
-                    data = stream.read(min(MAX_INPUT_BYTES, MAX_TOTAL_BYTES - total) + 1)
-            finally:
-                os.close(fd)
-        except OSError:
-            data = None
-        if data is None:
-            raise A.AcceptanceError("acceptance_preflight_unavailable",
-                                    "staged declarative input is unreadable") from None
+        with staged_stream(root, pin["path"]) as stream:
+            data = stream.read(min(MAX_INPUT_BYTES, MAX_TOTAL_BYTES - total) + 1)
         total += len(data)
         if len(data) > MAX_INPUT_BYTES or total > MAX_TOTAL_BYTES:
             A._fail("declarative input exceeds byte budget", "acceptance_record_missing")

@@ -95,6 +95,7 @@ def test_m1b_large_distribution_has_small_expiring_manifest(registry):
     manifest["distribution"] = {"id": "advisory-content", "sha256": HASH}
     registry["files"].append(manifest)
     registry["entries"][0]["snapshots"] = ["advisory-manifest"]
+    registry["entries"][0]["inputs"] = ["advisory-content"]
     assert R.validate_registry(registry) == registry
     for key, value in (("id", "missing"), ("id", "source"), ("sha256", "b" * 64)):
         broken = deepcopy(registry)

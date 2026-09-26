@@ -209,7 +209,7 @@ def validate_plan(plan):
         from agenttalk.acceptance_cold import policy
         policy(plan["cold_policy"])
     for key in ("plan_id", "project_id", "scope"):
-        _id(plan[key])
+        _id(plan[key], f"plan.{key}")
     _digest(plan["registry_digest"])
     _text(plan["registry_ref"], "registry_ref")
     if plan["trust_profile"] != "cooperative":
@@ -221,7 +221,7 @@ def validate_plan(plan):
     for partition in partitions.values():
         _object(partition, "id agents", "partition")
         _strings(partition["agents"], "agents", nonempty=True)
-        _id("acceptance-run-" + partition["id"])
+        _id("acceptance-run-" + partition["id"], "partition lens id")
     rows = _indexed(plan["rows"], "rows")
     if not rows:
         _fail("plan requires rows")
@@ -233,7 +233,7 @@ def validate_plan(plan):
             _fail("unsupported row policy")
         if row["comparator"] not in COMPARATORS:
             _fail("unsupported acceptance comparator")
-        _id(row["artifact"])
+        _id(row["artifact"], "row.artifact")
         _text(row["field"], "field")
         if row["comparator"] == "exit-code":
             if row["field"] != "exit_code" or type(row["expected"]) is not int:
@@ -411,8 +411,8 @@ def _route(record):
         if route["parent_record_hash"] is not None:
             _digest(route["parent_record_hash"])
             _digest(route["amendment_hash"])
-    _id(route["attempt_id"])
-    _id(route["project_id"])
+    _id(route["attempt_id"], "route.attempt_id")
+    _id(route["project_id"], "route.project_id")
     _digest(route["plan_hash"])
     _digest(route["registry_hash"])
     if route["bundle_hash"] is not None:
@@ -480,7 +480,7 @@ def _bundle(bundle, record, route, plan):
     if modern:
         verifier = _object(bundle["verifier_access"], "id evidence", "verifier access")
         _text(verifier["id"], "verifier access id")
-        expected_artifacts.add(_id(verifier["evidence"]))
+        expected_artifacts.add(_id(verifier["evidence"], "verifier.evidence"))
         for rep in _indexed(bundle["reproductions"], "reproductions").values():
             _object(rep, "id source_run actor access_id access_evidence revision head_before head_after "
                     "status_before status_after rows" + (" environment offline_proof" if final else ""), "reproduction")
@@ -488,16 +488,16 @@ def _bundle(bundle, record, route, plan):
                 _text(rep[key], key)
             if rep["id"] in runs or rep["source_run"] not in runs:
                 _fail("reproduction run reference is invalid", "acceptance_row_unbound")
-            expected_artifacts.add(_id(rep["access_evidence"]))
+            expected_artifacts.add(_id(rep["access_evidence"], "reproduction.access_evidence"))
             for obs in _indexed(rep["rows"], "reproduced rows").values():
                 _object(obs, "id artifact", "reproduced row")
                 if obs["id"] not in rows or rows[obs["id"]]["run_id"] != rep["source_run"]:
                     _fail("reproduction row belongs to another run", "acceptance_row_unbound")
-                expected_artifacts.add(_id(obs["artifact"]))
+                expected_artifacts.add(_id(obs["artifact"], "reproduction row.artifact"))
     if final:
-        expected_artifacts.add(_id(bundle["hygiene"]))
+        expected_artifacts.add(_id(bundle["hygiene"], "bundle.hygiene"))
         for run in bundle["runs"] + bundle["reproductions"]:
-            expected_artifacts.update(_id(run[k]) for k in ("environment", "offline_proof"))
+            expected_artifacts.update(_id(run[k], f"run.{k}") for k in ("environment", "offline_proof"))
         seen = set()
         for item in _items(bundle["recovery_approvals"], "recovery approvals"):
             _object(item, "prior_attempt_id reduction approval_artifact", "recovery approval")
@@ -505,7 +505,7 @@ def _bundle(bundle, record, route, plan):
             if item["prior_attempt_id"] in seen:
                 _fail("duplicate recovery approval")
             seen.add(item["prior_attempt_id"])
-            expected_artifacts.add(_id(item["approval_artifact"]))
+            expected_artifacts.add(_id(item["approval_artifact"], "recovery.approval_artifact"))
     if set(artifacts) != expected_artifacts:
         _fail("artifact manifest differs from plan", "acceptance_record_missing")
     for artifact in artifacts.values():

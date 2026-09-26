@@ -1,9 +1,10 @@
 # Acceptance increment 2 plan
 
 **Audience:** maintainers and cold reviewers deciding the registry/offline-preflight
-implementation boundary. **Status:** M1 record readers implemented for cold
-review; M2/M3 are not started. The lead approved the plan subject to D1–D6 below.
-This record distinguishes the isolated M1 API from future CLI/GO integration.
+implementation boundary. **Status:** M1/M1c readers and M2 read-only preflight
+implemented for cold review; M3 close/GO integration has not started. The lead
+approved the plan subject to D1–D6 below. Earlier milestone sections preserve
+their historical scope; the M2 section records the current operator surface.
 
 Base: `fc21190f414d3a926ba8fd3aa405ab3691cfe1b7` (0.92.0).
 Branch: `feat/acceptance-inc2`.
@@ -503,3 +504,137 @@ M2 mapping decision F6: import-time unsafe/racing policy files remain
 `acceptance_policy_invalid`. A staged file changing while opening during
 evaluation becomes `acceptance_preflight_unavailable`, with `not-run` and retry
 allowed. M2 uses an explicit evaluation boundary for this mapping.
+
+## M2: read-only evaluator and operator preflight
+
+Authority: `tk-8d776f7f6aa2`. M1c is commit `9b6d5d4`; its seven targeted
+reviewer mutations (N12/N13/N21/N22/N06/N29/N35) were all killed, with zero
+survivors or skipped mutations. M2 adds no acceptance GO path. The schema-dispatch
+helper/inventory walk remains M3's first commit, followed by route, retention and
+open/check/publish integration. Stop here for the required cold read.
+
+### Decisions and public contract
+
+- **F4 banner:** an expected literal must equal any complete captured line after
+  removing only its CR/LF terminator. No whitespace trimming, regex interpretation,
+  Unicode line-separator splitting or first-line restriction. Offline markers use
+  the same rule. Captures must decode as strict UTF-8.
+- **F3 freshness:** requiring a freshness manifest remains author-declared under
+  LD1. Every snapshot must bind a distribution's ID and digest, and at least one
+  entry must both list that snapshot and consume the distribution (possibly
+  transitively). Import refuses decorative/unconsumed bindings. Evaluation applies
+  the manifest's expiry and evidence failures to every consumer of its distribution.
+  Distributions without manifests remain valid, for example a pinned JDK.
+- **F6 races:** evaluation maps an unsafe or changing staged file to
+  `acceptance_preflight_unavailable` / `not-run`; retry is allowed. Policy import
+  retains `acceptance_policy_invalid`. Both use the same single-open, identity-
+  checked reader. Missing proof is non-green; no acquisition is attempted.
+- **D4/F9 privacy:** reports contain IDs, hashes, statuses and fixed diagnostics,
+  without cache locators, relative file paths, banners or proof-log content.
+  Unsafe-root messages tell the operator to pass a fully resolved path without
+  links or reparse ancestors, including aliased temporary roots and placeholders.
+  Caller-labelled ID errors state the fixed rule without printing submitted values.
+
+The operator stages files and captures observations separately, then runs:
+
+```text
+agenttalk close acceptance preflight --plan plan.json --cache-root staged --observation observation.json --json
+```
+
+The registry locator is relative to the plan's directory. Registry file pins and
+planned environment overrides are relative to the cache root. Banner/proof files
+and observed environment overrides are relative to the observation's directory.
+Omitting `--observation` reports missing proof when entries require it. Omitting
+`--json` prints readable entry statuses and hold codes. Exit 0 means every required
+entry passed this preflight; any failure/refusal returns 3. This is a staging check,
+not an acceptance verdict. The handler does not construct a Store, create a close,
+write evidence, invoke Git, open sockets or launch a staged tool.
+
+`acceptance_preflight.evaluate` accepts plan/registry bytes, a cache root, optional
+observation bytes/proof root and an injected UTC whole-second decision clock. The
+version-1 result contains plan/registry/observation hashes, decision time, aggregate
+status, per-entry/per-row holds, and per-file expected digest/size/status/retention
+classification. Distribution bytes are streamed and discarded, never copied into
+retained evidence. Declarative bytes are bounded reads; durable retention and the
+historical missing-cache display remain M3 work.
+
+| Condition | Code | Outcome |
+| --- | --- | --- |
+| Missing/unreadable/racing staged input or distribution read budget | `acceptance_preflight_unavailable` | not-run |
+| Pin, version, banner, chronology or environment mismatch | `acceptance_preflight_mismatch` | fail |
+| Snapshot expired at the decision instant | `acceptance_snapshot_expired` | not-run |
+| Absent positive control, recipe cache-hit proof or observation | `acceptance_offline_unproven` | not-run |
+| Attempted fetch, allowed external egress, external/unowned endpoint | `acceptance_offline_violation` | fail |
+| Corrupt/malformed supplied proof, invalid override, oversized declarative input | `acceptance_record_missing` | fail |
+| Observation bound to another registry | `acceptance_plan_stale` | fail |
+| Invalid imported policy | `acceptance_policy_invalid` | refusal |
+
+All registry pins, including distributions, are hashed at evaluation time within
+the read budgets. Every invocation rereads current bytes and reads the clock once.
+Expiry is inclusive (`decision >= expires_at`); provenance retrieval cannot follow
+the observation, and observation time cannot follow the decision. Planned and
+observed environment records compare exactly; referenced overrides must also have
+valid bytes and shapes. Dependency proof failures propagate to consumers and rows.
+The standalone operator command requires all required entries to pass even for an
+informational row; M3 will apply the existing row-policy fold for close decisions.
+
+External-denial and offline-recipe modes validate supplied evidence only. A positive
+control requires both its observation flag and exact log line; recipes additionally
+require the cache-hit flag and line. A fetch flag or exact fetch marker fails.
+Endpoints require literal loopback IP addresses and declared ownership; unresolved
+hostnames, scoped addresses, external addresses and unowned endpoints fail. These
+are cooperative declarations, not a network sandbox or process-ownership attestation.
+Provenance and adapter/config files are validated and digest-bound data, never run.
+
+Additional evaluator limits: 2 GiB per distribution, 8 GiB total distribution
+bytes, streaming chunks at most 1 MiB. Each declarative file and each imported
+plan/registry/observation record is at most 1 MiB. Registry declarative files,
+planned override evidence, and observed override/banner/proof evidence each have
+a separate 16 MiB aggregate budget. Exceeding a budget refuses green status;
+it never fetches, truncates into a successful proof, or launches a verifier.
+
+### Executed evidence
+
+The five design tests were written against an optimistic evaluator stub first.
+They produced **6 failed** assertions (changed-byte/missing-dependency is two
+cases), without setup or collection failures, before evaluator implementation:
+
+| Test | Red failure | Green / independent mutation |
+| --- | --- | --- |
+| `test_preflight_changed_byte_or_missing_dependency_fails` | missing refusal for changed/missing bytes | both pass; pin-check mutant killed |
+| `test_preflight_expired_snapshot_holds` | missing expired hold | passes; expiry mutant killed |
+| `test_preflight_offline_positive_control_required` | missing proof hold | passes; positive-control mutant killed |
+| `test_preflight_loopback_allowed_egress_denied` | external endpoint accepted | passes; endpoint mutant killed |
+| `test_preflight_toolchain_drift_holds` | changed banner accepted | passes; banner mutant killed |
+
+All five independent in-memory mutations were killed, zero survivors. Two further
+wrong-type plan cases first failed with `TypeError` and now give structured policy
+refusals. Additional tests cover multi-line banner matches/near-misses, exact-line
+markers, malformed/integrity evidence, dependency/expiry propagation, environment
+overrides, limits, clock boundaries, safe opening, privacy and CLI read-only behavior.
+The existing path-escape design test remains in the registry suite.
+
+Final foreground commands, each with a separate task-scratch `--basetemp`, source
+`PYTHONPATH` and `PYTHONDONTWRITEBYTECODE=1`:
+
+```text
+py -3.10 -m pytest tests/test_acceptance_preflight.py tests/test_acceptance_registry.py tests/test_acceptance_git_reads.py tests/test_acceptance.py::test_acceptance_acks_without_bundle_hold tests/test_acceptance.py::test_acceptance_invalid_plan_refused_before_close_creation tests/test_acceptance.py::test_acceptance_schema3_cannot_attach_without_required_hygiene -q -p no:cacheprovider
+py -3.14 -m pytest tests/test_acceptance_preflight.py tests/test_acceptance_registry.py tests/test_acceptance_git_reads.py tests/test_acceptance.py::test_acceptance_acks_without_bundle_hold tests/test_acceptance.py::test_acceptance_invalid_plan_refused_before_close_creation tests/test_acceptance.py::test_acceptance_schema3_cannot_attach_without_required_hygiene -q -p no:cacheprovider
+```
+
+Results: **281 passed, 3 skipped** on each interpreter (13.10 s / 13.71 s).
+Skips are the same host-restricted symlink and two POSIX-only cases described in
+M1c. Windows junction and the corrected non-regular-file test pass on both.
+No full-suite run, real download or staged-tool launch was performed.
+
+```text
+py -3.10 -m ruff check --no-cache src/agenttalk/acceptance.py src/agenttalk/acceptance_history.py src/agenttalk/acceptance_registry.py src/agenttalk/acceptance_preflight.py src/agenttalk/cli.py tests/test_acceptance_registry.py tests/test_acceptance_preflight.py
+py -3.10 -m bandit -q src/agenttalk/acceptance.py src/agenttalk/acceptance_history.py src/agenttalk/acceptance_registry.py src/agenttalk/acceptance_preflight.py src/agenttalk/cli.py
+py -3.10 -m bandit -q -s B101 tests/test_acceptance_registry.py tests/test_acceptance_preflight.py
+```
+
+All exit zero with no findings. Bandit emits existing suppression-comment warnings
+in acceptance/CLI; test assertions are intentionally excluded from B101.
+Task scratch is retained for review: red/green fixtures, M1c mutation copy/log,
+the five M2 mutation scripts/logs and isolated test roots. No private locator is
+included in public documentation or report output.

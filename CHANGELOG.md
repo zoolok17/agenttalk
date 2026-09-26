@@ -10,13 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - Add isolated acceptance increment-2 strict registry/environment/proof record
-  readers and bounded declarative-input validation. CLI preflight and close
-  integration await later milestones; no new GO path is enabled. See
+  readers and bounded declarative-input validation. Close integration awaits
+  a later milestone; no new GO path is enabled. See
   `docs/STEP-ACCEPTANCE-INC2.md` for limits and retention decisions.
 - Tighten increment-2 staged-input records with per-toolchain/service banner
   pins, explicit environment entry references, and expiring manifests for large
   distribution pins. Reject portable path collisions and additional reserved
   names; bound refusal diagnostics and verify file identity before reading.
+- Add read-only `close acceptance preflight` to check staged distribution and
+  declarative pins, snapshot expiry, exact environment/banner observations and
+  offline proof. Report per-entry outcomes without fetching or launching tools,
+  creating a close, or exposing private cache locators.
 
 ### Changed
 
