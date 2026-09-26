@@ -68,7 +68,7 @@
   // M4b: j/k select an open card by id, never by DOM position (a card that leaves the list must not
   // silently hand the selection to whatever now sits at the same index). Reset whenever the visible
   // team changes, so a stale id from a different team's stream is never carried over.
-  var nav = { selectedTeam: null, selectedId: null, overlayOpen: false };
+  var nav = { selectedTeam: null, selectedId: null, overlayOpen: false, overlayInvoker: null };
   var streamCardTeam = null;
   var streamCardIds = [];      // ids of the currently open cards, in display order, for streamCardTeam
 
@@ -342,18 +342,26 @@
 
   // The overlay is chrome, not data: built once and only ever toggled by a CSS class, never rebuilt
   // by a redraw. Opening it moves focus to its Close button and makes the background inert; closing
-  // it restores the background and returns focus to the `?` button that (or the key that) opened it
-  // - focus is never merely dropped to the page.
+  // it restores the background and returns focus to wherever it was invoked FROM (R4) - the header
+  // `?` button only when that is genuinely where focus was (e.g. a click on it), never as a blanket
+  // default that loses the operator's actual place (a focused Later button, say).
   function setOverlayOpen(open) {
     nav.overlayOpen = open;
     if (chrome.overlay) chrome.overlay.className = 'c2-overlay' + (open ? ' is-open' : '');
     if (chrome.keysBtn) setPressed(chrome.keysBtn, open);
-    setBackgroundInert(open);
     if (open) {
+      // Captured BEFORE the background goes inert: an inert ancestor forces its focused
+      // descendant to blur, so this must run first or the invoker would already be lost.
+      nav.overlayInvoker = document.activeElement;
+      setBackgroundInert(true);
       var closeBtn = chrome.overlay && firstByClass(chrome.overlay, 'c2-overlay-close');
       if (closeBtn && typeof closeBtn.focus === 'function') closeBtn.focus();
-    } else if (chrome.keysBtn && typeof chrome.keysBtn.focus === 'function') {
-      chrome.keysBtn.focus();
+    } else {
+      setBackgroundInert(false);
+      var invoker = nav.overlayInvoker;
+      nav.overlayInvoker = null;
+      var back = (invoker && invoker.isConnected && typeof invoker.focus === 'function') ? invoker : chrome.keysBtn;
+      if (back && typeof back.focus === 'function') back.focus();
     }
   }
 
@@ -573,6 +581,12 @@
   function needsCard(card, team, selected) {
     var box = el('article', 'c2-card tone-' + card.tone + (selected ? ' is-selected' : ''));
     box.setAttribute('data-c2-card', team + '|' + card.id);
+    // R3: the card itself is focusable (not in the natural Tab order - j/k and restoreFocus put
+    // focus here, never a stray Tab) and carries the same data-c2-focus convention as every other
+    // stream control, so an unrelated redraw's captureFocus/restoreFocus keeps it exactly as it
+    // would a button: what is highlighted (`is-selected`) is always what real focus is on, or inside.
+    box.setAttribute('tabindex', '-1');
+    box.setAttribute('data-c2-focus', team + '|' + card.id + '|card');
     var head = el('div', 'c2-card-head');
     head.appendChild(el('span', 'c2-kind', card.kind));
     head.appendChild(el('span', 'c2-age', card.ageLabel));
@@ -1164,6 +1178,11 @@
     var next = idx === -1 ? (delta > 0 ? 0 : ids.length - 1) : Math.max(0, Math.min(ids.length - 1, idx + delta));
     nav.selectedId = ids[next];
     renderAll();
+    // R3: focus moves WITH the selection, onto the card itself - never leaving it on a stale
+    // control from an earlier Enter, which is exactly what let a later Enter act on the wrong card.
+    var main = document.getElementById('c2-stream');
+    var card = main && findCard(main, nav.selectedId);
+    if (card && typeof card.focus === 'function') card.focus();
   }
 
   // Enter "opens" the selected card: focus moves to its first focusable action (an unlocked option,

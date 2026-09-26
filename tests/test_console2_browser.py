@@ -159,16 +159,26 @@ def test_thread_scroll_and_focus_survive_redraws_in_a_real_browser(page) -> None
     # F2: the rail is reconciled in place too - the avatar <img> survives an ordinary redraw
     assert out["railImageKept"] is True, out
     # M4b/R2: one key path (run first, focus still untouched from page load) - j selects the first
-    # card, Enter focuses its first action (Later)
+    # card (A), Enter focuses its first action (Later)
     assert out["firstCardSelectedAfterJ"] is True, out
     after_enter = out["focusAfterEnterOnSelected"]
     assert after_enter["tag"] == "BUTTON" and after_enter["sameAsFirstCardLater"] is True, after_enter
-    # R2: a SECOND native Enter, now with focus natively on that Later button, must activate it (defer
-    # the card) - never be diverted back to "open the selection" again
-    assert out["secondEnterDeferredTheFocusedCard"] is True, out
+    # R3: a second j must move real focus WITH the selection, onto card B itself - never left behind
+    # on card A's Later
+    assert out["secondJMovedFocusToCardB"] is True, out
+    # R2/R3: Enter opens B (the actually-highlighted card, an interactive control - its Later button);
+    # a second native Enter must defer B specifically, never A, never diverted back to the selection
+    assert out["focusAfterEnterOnB"]["tag"] == "BUTTON", out
+    assert out["cardsAfterSecondEnter"] == 1, out
+    assert out["remainingCardIsA"] is True, out
     # R2: a native Enter on a focused, unrelated interactive control (a theme button), with a card
     # still selected, must activate THAT control - never get diverted to the selection shortcut
     assert out["themeButtonKeptNativeEnter"] is True, out
+    # R4: closing help restores focus to wherever it was invoked from - here, a focused Later button -
+    # never a blanket default to the ? button
+    assert out["r4FocusInOverlay"] is True, out
+    assert out["r4FocusRestoredToInvoker"] is True, out
+    assert out["r4InvokerStillConnected"] is True, out
     # M4b: the ? button opens the keyboard overlay, moves focus into it
     assert out["overlayOpenAfterClick"] is True, out
     assert out["focusInOverlayAfterClick"] is True, out

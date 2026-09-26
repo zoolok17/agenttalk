@@ -690,6 +690,53 @@ test('M4b: "/" tries to focus the message box, which stays disabled - a browser 
   assert.equal(dom.document.activeElement, before, 'a disabled control cannot take focus');
 });
 
+// =============================================================================== fix round 4
+
+test('R3: j/k move real focus with the selection, onto the card itself - never left on a stale control', async () => {
+  const { dom } = await boot(twoCardsFor());
+  key(dom, 'j');
+  const cardA = cards(dom)[0];
+  assert.strictEqual(dom.document.activeElement, cardA, 'focus moved onto the newly selected card A');
+  key(dom, 'Enter');
+  const laterA = dom.document.activeElement;
+  assert.equal(laterA.textContent, 'Later');
+
+  key(dom, 'j');   // select card B
+  const cardB = cards(dom)[1];
+  assert.strictEqual(dom.document.activeElement, cardB, 'focus followed the selection to B, not left on A’s Later');
+
+  key(dom, 'Enter');
+  const laterB = dom.document.activeElement;
+  assert.equal(laterB.getAttribute('data-c2-focus'), 'proj-a|b|later', 'Enter opened B - the card that is actually highlighted');
+
+  key(dom, 'l');
+  assert.equal(cards(dom).length, 1, 'B - the highlighted, focused card - was deferred');
+  assert.equal(cards(dom)[0].getAttribute('data-c2-card'), 'proj-a|a', 'A is still on screen, untouched');
+});
+
+test('R3: k also moves focus with the selection', async () => {
+  const { dom } = await boot(twoCardsFor());
+  key(dom, 'k');   // starts from the last card with nothing selected
+  const cardB = cards(dom)[1];
+  assert.strictEqual(dom.document.activeElement, cardB);
+  key(dom, 'k');
+  const cardA = cards(dom)[0];
+  assert.strictEqual(dom.document.activeElement, cardA);
+});
+
+test('R4: closing help restores focus to wherever it was invoked from - here, a focused Later button', async () => {
+  const { dom } = await boot(twoCardsFor());
+  const laterA = classOf(cards(dom)[0], 'c2-later')[0];
+  laterA.focus();
+  assert.equal(dom.document.activeElement, laterA);
+  key(dom, '?');
+  const closeBtn = classOf(dom.document.getElementById('c2-keymap'), 'c2-overlay-close')[0];
+  assert.equal(dom.document.activeElement, closeBtn, 'focus moved into the dialog');
+  key(dom, 'Escape');
+  assert.equal(dom.document.activeElement, laterA, 'back on the Later button, not a blanket default to the ? button');
+  assert.equal(laterA.isConnected, true);
+});
+
 test('M4b: "1" and "2" switch team by key, exactly like clicking the chip', async () => {
   const twoTeams = () => [
     root({ project_id: 'proj-a', label: 'Alpha', agents: [agent(LEAD, { since: 3000 })], recent: [env(LEAD, 'x', 'message', 5)] }),

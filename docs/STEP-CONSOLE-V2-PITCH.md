@@ -618,7 +618,7 @@ open work, not a silent gap). Everything else in the M4 plan (rail avatars and b
 | Phone (< 1024px) | OUT OF SCOPE (05-SPEC-PHONE, a later card) |
 | All text ≥ 4.5:1 | Midnight VERIFIED, including the composited stale state (fix round 2, section 22): a computed WCAG contrast check over every text-token/background-token pair the CSS uses (M4a fix round, section 19), extended to prove the stale-state opacity rules never apply to a text-bearing class. Paper/Synthwave/Terminal remain out of scope (only Midnight is reviewed this pitch, section 3) |
 | Bus content rendered as text only | DONE throughout, tested repeatedly (including every M4 avatar/tooltip value) |
-| Keyboard map per 08; screen-reader focus order | Keyboard map + overlay, j/k/enter/l/1/2/esc/? DONE (M4b, section 20). Modal focus is now genuinely contained (fix round 3, section 23): the overlay traps Tab/Shift+Tab and the background is `inert`, so focus and Enter-activation can never escape it. Enter is correctly scoped to the navigation context, never diverting a focused control's own native Enter (section 23, R2). Screen-reader focus order: keyboard focus itself still follows ordinary tab order and every focus-key mechanism from M3; the card *selection* (j/k) is a visual+behavioral cursor (`is-selected`) that does **not** carry `aria-selected`/`role="listbox"` semantics - flagged in section 21 for the lead, not silently claimed done |
+| Keyboard map per 08; screen-reader focus order | Keyboard map + overlay, j/k/enter/l/1/2/esc/? DONE (M4b, section 20). Modal focus is now genuinely contained (fix round 3, section 23): the overlay traps Tab/Shift+Tab and the background is `inert`, so focus and Enter-activation can never escape it. Enter is correctly scoped to the navigation context, never diverting a focused control's own native Enter (section 23, R2). j/k now move real focus WITH the selection, onto the card itself, so the highlight and what Enter acts on can never point at two different cards (fix round 4, section 24, R3); closing help restores focus to wherever it was actually invoked from, never a blanket default (section 24, R4). Screen-reader focus order: keyboard focus itself still follows ordinary tab order and every focus-key mechanism from M3; the card *selection* (j/k) is now ALSO real DOM focus (not merely visual), which narrows but does not close the remaining gap - it still carries no `aria-selected`/`role="listbox"` semantics of its own - flagged in section 21 for the lead, not silently claimed done |
 
 ### Screenshots (Midnight, live-shaped fixture data: a seeded store, real health/heartbeat files, real `web.serve_in_thread`)
 
@@ -929,3 +929,66 @@ run: `console2_model` 17/17, `console2_render` 31/31, `console2_stream` 56/56, `
 (rewritten, native-input, green), `test_console2_health_writer.py`, `test_health_last_known.py` all
 green (75 passed/3 skipped total). `node --check` clean on both touched JS files; `ruff`/`bandit`
 clean on the touched Python test files.
+
+## 24. Fix round 4 record (R3 j/k focus, R4 help focus restore)
+
+The codex delta read closed N3, R1 and R2 with native-key evidence and found two more, both about
+where real DOM focus actually sits - fixed on top of `4865d40`.
+
+- **R3 (MAJOR), j/k moved the visual selection but left real focus behind on a stale control.**
+  `moveSelection` only ever toggled the `is-selected` class; it never touched
+  `document.activeElement`. R2's own fix (fix round 3) correctly lets a focused interactive control
+  keep its native Enter - which is exactly what made this visible: once Enter had focused card A's
+  Later button, a second `j` visually moved the highlight to card B while focus stayed on A's Later,
+  so the next Enter activated A (deferring the wrong card) instead of opening B. Fixed by making
+  each card itself focusable (`tabindex="-1"`, plus a `data-c2-focus` key with role `card` - the same
+  convention every other stream control already uses, so `captureFocus`/`restoreFocus` keep it in
+  place across an unrelated redraw exactly like a button) and having `moveSelection` focus the newly
+  selected card directly. Enter still "opens" a card by drilling into its first control (unchanged);
+  what changed is that `j`/`k` now first return focus to the card itself, so the highlight and real
+  focus can never point at two different cards. A `.c2-card:focus-visible` outline (accent-coloured,
+  matching every other control) was added so the browser's own focus ring is visible on a card,
+  pairing with - not fighting - the `is-selected` border.
+- **R4 (MINOR), closing help always focused the header `?` button, never wherever help was invoked
+  from.** `setOverlayOpen(false)` unconditionally focused `chrome.keysBtn`. Opening help with the `?`
+  *key* (not a click on the button) while, say, a Later button was focused, then closing it, lost the
+  operator's place - and fed directly into how R3 was reproduced. Fixed by capturing
+  `document.activeElement` as `nav.overlayInvoker` at the moment the overlay opens - BEFORE the
+  background goes `inert`, since an inert ancestor forces its focused descendant to blur - and
+  restoring focus to it on close if it is still connected (`isConnected`), else falling back to the
+  `?` button deliberately (the same fallback as before, now only used when there truly is nowhere
+  better to go, e.g. the invoker's card was itself removed while help was open).
+
+Tests, both in the real browser with genuine CDP key events (`console2_browser_check.mjs`), per the
+work order:
+- R3: the fixture's two escalation cards (oldest first: card-2 then card-1) are used to reproduce
+  the exact scenario - `j` selects card-2 (A), `Enter` focuses A's Later, a second `j` must move
+  focus onto card-1 (B) itself (checked by `data-c2-card` identity, not merely a class), `Enter`
+  opens B, and a second native `Enter` must defer B specifically - checked by asserting the
+  *remaining* card is still A's own `data-c2-card` key, not just a card count.
+- R4: a Later button is focused, `?` opens help (focus moves to Close, as before), a native `Escape`
+  closes it - focus must land back on that same Later button (`isConnected` too), never the `?`
+  button.
+
+Both are also pinned at the node level (`console2_render.test.mjs`, `console2_stream.test.mjs`),
+though the node DOM stub cannot show `inert`-driven blur, only that the invoker-capture/restore logic
+itself is wired correctly. Two pre-existing overlay tests in `console2_render.test.mjs` were also
+updated: one to explicitly focus the `?` button before clicking it (`Element.click()` does not itself
+focus its target the way a real pointer click does - neither in this DOM stub nor, it turns out, over
+CDP; the real-browser check needed the same explicit `.focus()` before every programmatic `.click()`
+on that button, once R4 started asking "who really invoked this"), and one whose old expectation
+("Escape always returns focus to the `?` button") was precisely the R4 bug and is now corrected to
+the genuinely-invoked-from element (`document.body`, in that specific test, since nothing had focus
+before the `?` key was pressed there).
+
+Red-then-green: every new/changed test confirmed RED against the pre-fix-round file (`git show
+4865d40:<path>`, swapped onto disk for the node suites and for the real-browser check) and GREEN
+against the fix; the real-browser R3 check usefully failed with a thrown exception under the old code
+(indexing a card that no longer existed, because the wrong one had been deferred) rather than a clean
+assertion - still valid, unambiguous red. Mutation-tested `moveSelection`'s focus call (disabled -> 2
+R3 tests red) and R4's invoker-restore fallback (short-circuited to always use `chrome.keysBtn` -> 1
+R4 node test and 1 pre-existing overlay test both correctly went red). Full run: `console2_model`
+17/17, `console2_render` 31/31, `console2_stream` 59/59, `console2_data` 44/44, `console2_view` 92/92;
+`test_console2_web.py` 56 passed/3 skipped, `test_console2_browser.py` (extended for R3/R4, green),
+`test_console2_health_writer.py`, `test_health_last_known.py` all green (75 passed/3 skipped total).
+`node --check` clean; `ruff`/`bandit` clean on the touched Python test file.

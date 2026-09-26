@@ -99,24 +99,38 @@ try {
   // (scoped to #c2-rail: the lead block in the stream has its own, already-reconciled, avatar)
   await evaluate(`(() => { window.__avatar = document.querySelector('#c2-rail .c2-avatar-img'); return !!window.__avatar; })()`);
 
-  // M4b/R2: one key path, run FIRST while focus is still untouched (document.body, from page load) -
-  // j selects the first card, Enter focuses its first action (Later, since these fixture cards carry
-  // no options at all).
+  // M4b/R2/R3: one key path, run FIRST while focus is still untouched (document.body, from page
+  // load) - j selects the first card (the fixture's two escalation cards, oldest first: card-2 then
+  // card-1), Enter focuses its first action (Later, since these fixture cards carry no options at all).
+  const cardKey = (i) => evaluate(`document.querySelectorAll('.c2-card')[${i}].getAttribute('data-c2-card')`);
   await pressKey('j');
   out.firstCardSelectedAfterJ = await evaluate(
     `(() => { const c = document.querySelector('.c2-card'); return !!c && c.className.indexOf('is-selected') >= 0; })()`,
   );
+  const cardAKey = await cardKey(0);
   await pressKey('Enter');
   out.focusAfterEnterOnSelected = await evaluate(`(() => { const a = document.activeElement;
     return { tag: a.tagName, cls: a.className, sameAsFirstCardLater: a === document.querySelector('.c2-card .c2-later') }; })()`);
 
-  // R2: focus is now natively ON that Later button (an interactive control) - a SECOND native Enter
-  // must activate it (defer the card), never be diverted back to "open the selection" again.
-  const cardsBefore = await evaluate(`document.querySelectorAll('.c2-card').length`);
+  // R3: a second j must move focus WITH the selection, onto card B itself - never left behind on
+  // card A's Later (which is exactly what let a later Enter act on the wrong, no-longer-highlighted
+  // card).
+  await pressKey('j');
+  const cardBKey = await cardKey(1);
+  out.focusAfterSecondJ = await evaluate(`(() => { const a = document.activeElement;
+    return { tag: a.tagName, cardKey: a.getAttribute('data-c2-card') }; })()`);
+  out.secondJMovedFocusToCardB = out.focusAfterSecondJ.tag === 'ARTICLE' && out.focusAfterSecondJ.cardKey === cardBKey;
+
+  // R2/R3: Enter now opens B (the actually-highlighted card); a second native Enter, with focus
+  // natively on B's Later, must defer B specifically - never A, and never be diverted back to
+  // "open the selection" again.
+  await pressKey('Enter');
+  out.focusAfterEnterOnB = await evaluate(`(() => { const a = document.activeElement;
+    return { tag: a.tagName, cls: a.className }; })()`);
   await pressKey('Enter');
   await sleep(200);
   out.cardsAfterSecondEnter = await evaluate(`document.querySelectorAll('.c2-card').length`);
-  out.secondEnterDeferredTheFocusedCard = cardsBefore - out.cardsAfterSecondEnter === 1;
+  out.remainingCardIsA = (await cardKey(0)) === cardAKey;
 
   // R2: with a card selected, a native Enter on a focused, unrelated interactive control (a theme
   // button) must activate THAT control, never get diverted to the selection shortcut.
@@ -128,6 +142,16 @@ try {
     `document.documentElement.getAttribute('data-theme') === 'paper' && document.activeElement === window.__paper`,
   );
 
+  // R4: closing help restores focus to wherever it was invoked from - here, a focused Later button -
+  // not a blanket default to the ? button.
+  await evaluate(`(() => { const b = document.querySelector('.c2-later'); window.__r4later = b; b.focus();
+    return document.activeElement === b; })()`);
+  await pressKey('?');
+  out.r4FocusInOverlay = await evaluate(`document.activeElement.className === 'c2-overlay-close'`);
+  await pressKey('Escape');
+  out.r4FocusRestoredToInvoker = await evaluate('document.activeElement === window.__r4later');
+  out.r4InvokerStillConnected = await evaluate('window.__r4later.isConnected');
+
   // Return focus to a neutral point before the overlay/R1 checks below, exactly like an operator
   // clicking elsewhere on the page - the overlay's own focus management is what is under test next,
   // not whatever the Enter path above happened to leave focused.
@@ -135,7 +159,9 @@ try {
 
   // M4b: the ? button opens the keyboard overlay and moves focus into it; Escape closes it and
   // returns focus to the button that opened it. Native key events throughout (see KEYS/pressKey).
-  await evaluate(`(() => { document.querySelector('.c2-keybtn').click(); return true; })()`);
+  // Element.click() does not reliably focus its target the way a real pointer click does, so this
+  // focuses it explicitly first - exactly what R4's invoker-capture then needs to see.
+  await evaluate(`(() => { const b = document.querySelector('.c2-keybtn'); b.focus(); b.click(); return true; })()`);
   out.overlayOpenAfterClick = await evaluate(`document.getElementById('c2-keymap').className.indexOf('is-open') >= 0`);
   out.focusInOverlayAfterClick = await evaluate(`document.activeElement.className === 'c2-overlay-close'`);
 
@@ -158,7 +184,7 @@ try {
   out.backgroundInertRemovedAfterClose = await evaluate(`!document.getElementById('c2-stream').hasAttribute('inert')`);
 
   // Reopen and close with a native Escape too (both documented ways to close still work).
-  await evaluate(`(() => { document.querySelector('.c2-keybtn').click(); return true; })()`);
+  await evaluate(`(() => { const b = document.querySelector('.c2-keybtn'); b.focus(); b.click(); return true; })()`);
   await pressKey('Escape');
   out.overlayClosedAfterNativeEscape = await evaluate(`document.getElementById('c2-keymap').className.indexOf('is-open') < 0`);
   out.focusBackOnKeysBtnAfterEscape = await evaluate(`document.activeElement === document.querySelector('.c2-keybtn')`);

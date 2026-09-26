@@ -146,6 +146,7 @@ test('the ? button opens the keyboard overlay, moves focus into it, and Close re
   const { dom } = await boot();
   const keysBtn = buttons(header(dom)).find((b) => label(b) === '?');
   assert.equal(overlayOpen(dom), false);
+  keysBtn.focus();   // a real click focuses its target first, like every other button in this suite
   keysBtn.click();
   assert.equal(overlayOpen(dom), true);
   assert.equal(keysBtn.getAttribute('aria-pressed'), 'true');
@@ -196,8 +197,10 @@ test('the ? key toggles the overlay, and Escape closes it without touching anyth
   assert.equal(overlayOpen(dom), true);
   dom.document.dispatch('keydown', { key: 'Escape', target: { tagName: 'BODY' } });
   assert.equal(overlayOpen(dom), false);
-  const keysBtn = buttons(header(dom)).find((b) => label(b) === '?');
-  assert.equal(dom.document.activeElement, keysBtn);
+  // R4: focus returns to wherever it was invoked FROM - here, nothing had focus (body), so it
+  // returns to body, not a blanket default to the ? button (which is a DIFFERENT scenario, covered
+  // by the test above where the ? button itself was focused when it was clicked).
+  assert.equal(dom.document.activeElement, dom.document.body);
 });
 
 test('the overlay lists every key it documents, in plain text', async () => {
