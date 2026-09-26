@@ -88,7 +88,7 @@ def submit(store, close_id, report_file, *, phase, by, at):
     value = A.decode(data)
     with close.close_transaction(store, close_id) as tx:
         route, plan = A._policy(store, tx.record)
-        if route["schema_version"] != 3 or tx.record["status"] == close.PUBLISHED:
+        if not A.schema(route["schema_version"]).cold or tx.record["status"] == close.PUBLISHED:
             A._fail("cold submission requires an open schema-3 attempt")
         if by != plan["cold_policy"]["reviewer"]:
             A._fail("only assigned reviewer may commit/reconcile", "acceptance_lens_not_independent")

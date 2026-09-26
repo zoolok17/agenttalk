@@ -18,6 +18,7 @@ import subprocess  # nosec B404 - fixed Git argv lists; shell is never used
 import uuid
 
 from agenttalk import acceptance_git, close
+from agenttalk.acceptance_schema import capabilities as schema
 
 MAX_BYTES = 1024 * 1024
 MAX_ITEMS = 256
@@ -208,11 +209,11 @@ def _retained(store, digest):
 
 
 def validate_plan(plan):
-    cold = isinstance(plan, dict) and plan.get("schema_version") == 3
+    cold = isinstance(plan, dict) and schema(plan.get("schema_version")).cold
     _object(plan, "schema_version plan_id project_id scope authors partitions rows registry_ref "
             "registry_digest trust_profile" + (" cold_policy" if cold else ""), "plan")
     _version(plan["schema_version"], (1, 2, 3))
-    if plan["schema_version"] == 3:
+    if schema(plan["schema_version"]).cold:
         from agenttalk.acceptance_cold import policy
         policy(plan["cold_policy"])
     for key in ("plan_id", "project_id", "scope"):
@@ -221,7 +222,7 @@ def validate_plan(plan):
     _text(plan["registry_ref"], "registry_ref")
     if plan["trust_profile"] != "cooperative":
         _fail("unsupported acceptance trust profile")
-    _strings(plan["authors"], "authors", nonempty=plan["schema_version"] >= 2)
+    _strings(plan["authors"], "authors", nonempty=schema(plan["schema_version"]).modern)
     partitions = _indexed(plan["partitions"], "partitions")
     if not partitions:
         _fail("plan requires partitions")
@@ -336,9 +337,9 @@ def prepare(store, plan_file, project_repo, revision, scope, lenses=()):
     if _hash(registry_bytes) != plan["registry_digest"]:
         _fail("registry differs from plan pin", "acceptance_plan_stale")
     project = verify_project(project_repo, revision)
-    if plan["schema_version"] >= 2 and plan["project_id"] != project_id(project):
+    if schema(plan["schema_version"]).modern and plan["project_id"] != project_id(project):
         _fail(f"project_id must be {project_id(project)} for this Git root set", "acceptance_project_unverified")
-    if plan["schema_version"] == 3:
+    if schema(plan["schema_version"]).cold:
         from agenttalk.acceptance_audit import change_identity
         change_identity(project, plan)
     return {"plan_hash": _retain(store, plan_bytes), "registry_hash": _retain(store, registry_bytes),
@@ -352,7 +353,7 @@ def partition_lenses(plan, lenses):
     if len(existing) != len(result):
         _fail("duplicate close lens id")
     assignments = [("acceptance-run-" + p["id"], p["agents"]) for p in plan["partitions"]]
-    if plan["schema_version"] == 3:
+    if schema(plan["schema_version"]).cold:
         assignments.append(("acceptance-cold", [plan["cold_policy"]["reviewer"]]))
     for lens_id, actors in assignments:
         lens = close.validate_lens_spec({"id": lens_id, "allowed_agents": actors})
@@ -384,14 +385,14 @@ def freeze(store, close_id, prepared, at):
                  "plan_hash": prepared["plan_hash"], "registry_hash": prepared["registry_hash"],
                  "bundle_hash": None, "frozen_by": record["opened_by"], "frozen_at": at,
                  "attached_by": None, "attached_at": None}
-        if plan["schema_version"] >= 2:
+        if schema(plan["schema_version"]).modern:
             route.update(schema_version=plan["schema_version"], parent_record_hash=prepared.get("parent_record_hash"),
                          amendment_hash=prepared.get("amendment_hash"))
-        if plan["schema_version"] == 3:
+        if schema(plan["schema_version"]).cold:
             route.update(cold_commit_hash=None, cold_reconcile_hash=None, obligations_hash=None)
         record["required_lenses"] = partition_lenses(plan, record["required_lenses"])
         record["acceptance_route"] = route
-        if plan["schema_version"] == 3:
+        if schema(plan["schema_version"]).cold:
             from agenttalk import acceptance_obligations
             acceptance_obligations.inherit(store, record, plan, capture=True)
         transaction.commit()
@@ -402,8 +403,8 @@ def _route(record):
     route = record.get("acceptance_route")
     if not isinstance(route, dict) or route.get("pending"):
         _fail("acceptance route is absent or pending")
-    extra = " parent_record_hash amendment_hash" if route.get("schema_version") in (2, 3) else ""
-    if route.get("schema_version") == 3:
+    extra = " parent_record_hash amendment_hash" if schema(route.get("schema_version")).modern else ""
+    if schema(route.get("schema_version")).cold:
         extra += " cold_commit_hash cold_reconcile_hash obligations_hash"
         _digest(route.get("obligations_hash"))
         for key in ("cold_commit_hash", "cold_reconcile_hash"):
@@ -412,7 +413,7 @@ def _route(record):
     _object(route, "schema_version attempt_id instance_id project_id revision project plan_hash "
             "registry_hash bundle_hash frozen_by frozen_at attached_by attached_at" + extra, "acceptance route")
     _version(route["schema_version"], (1, 2, 3))
-    if route["schema_version"] >= 2:
+    if schema(route["schema_version"]).modern:
         if (route["parent_record_hash"] is None) != (route["amendment_hash"] is None):
             _fail("successor requires both parent record and amendment")
         if route["parent_record_hash"] is not None:
@@ -444,14 +445,14 @@ def _policy(store, record):
     except (OSError, AcceptanceError) as exc:
         raise AcceptanceError("acceptance_plan_stale", "frozen plan/registry invalid or missing") from exc
     if (plan["registry_digest"] != route["registry_hash"] or plan["project_id"] != route["project_id"]
-            or plan["scope"] != record["scope"] or plan["schema_version"] != route["schema_version"]):
+            or plan["scope"] != record["scope"] or schema(plan["schema_version"]) != schema(route["schema_version"])):
         _fail("frozen policy binding mismatch", "acceptance_plan_stale")
     return route, plan
 
 
 def _bundle(bundle, record, route, plan):
-    modern = route["schema_version"] >= 2
-    final = route["schema_version"] == 3
+    modern = schema(route["schema_version"]).modern
+    final = schema(route["schema_version"]).cold
     _object(bundle, "schema_version close_id instance_id attempt_id project_id revision plan_hash "
             "registry_hash runs rows artifacts" + (" verifier_access reproductions" if modern else "")
             + (" recovery_approvals hygiene" if final else ""), "bundle")
@@ -533,14 +534,14 @@ def attach(store, close_id, bundle_file, *, by, at):
         if record["status"] == close.PUBLISHED:
             _fail("cannot attach to a published close")
         route, plan = _policy(store, record)
-        if route["schema_version"] == 3 and route["cold_commit_hash"] is None:
+        if schema(route["schema_version"]).cold and route["cold_commit_hash"] is None:
             _fail("commit initial cold observations before attachment", "acceptance_cold_missing")
         if verify_project(route["project"]["locator"], record["revision"]) != route["project"]:
             _fail("project changed before attachment", "acceptance_project_unverified")
         if route["bundle_hash"] is not None:
             _fail("attempt already has an immutable bundle")
         _, artifacts = _bundle(bundle, record, route, plan)
-        if route["schema_version"] == 3:
+        if schema(route["schema_version"]).cold:
             from agenttalk.acceptance_cold import reproduction_lenses
             reproduction_lenses(record, bundle)
         captured = []
@@ -556,7 +557,7 @@ def attach(store, close_id, bundle_file, *, by, at):
         # A failure leaves only unreferenced blobs; no partial bundle can become current.
         for raw in captured:
             _retain(store, raw)
-        if route["schema_version"] == 3:
+        if schema(route["schema_version"]).cold:
             # Approval evidence must come from the reserved operator's actual
             # bus record, not a caller-authored file with a claimed sender.
             for item in bundle["recovery_approvals"]:
@@ -608,10 +609,10 @@ def resolve(store, record, *, live=False):
         # Schema-1 records preserve their original strict-live contract. Schema 2
         # reads historical objects; open, attach and GO publish check live state.
         project = verify_project(route["project"]["locator"], record["revision"],
-                                 live=live or route["schema_version"] == 1)
+                                 live=live or not schema(route["schema_version"]).modern)
         if project != route["project"]:
             _fail("project identity changed", "acceptance_project_unverified")
-        if route["schema_version"] >= 2 and route["project_id"] != project_id(project):
+        if schema(route["schema_version"]).modern and route["project_id"] != project_id(project):
             _fail("project ID differs from verified root identity", "acceptance_project_unverified")
         if route["bundle_hash"] is None:
             _fail("acceptance bundle missing", "acceptance_record_missing")
@@ -655,13 +656,13 @@ def resolve(store, record, *, live=False):
                     holds.append((code, f"row {row['id']}: {exc}"))
             outcomes.append(outcome)
         snapshot = {"holds": holds, "outcomes": outcomes}
-        if route["schema_version"] >= 2:
+        if schema(route["schema_version"]).modern:
             from agenttalk import acceptance_history
             snapshot["trust_checked"] = True
             snapshot["reproductions"] = _reproduce(store, record, plan, bundle, rows, artifacts, holds)
             _ack_bindings(record, plan, holds)
             acceptance_history.evaluate(store, record, plan, snapshot)
-            if route["schema_version"] == 3:
+            if schema(route["schema_version"]).cold:
                 from agenttalk import acceptance_cold, acceptance_hygiene
                 acceptance_history.related_obligations(store, record, plan, bundle, snapshot)
                 acceptance_cold.evaluate(store, record, plan, bundle, snapshot)
@@ -697,7 +698,7 @@ def evaluate(snapshot):
 def ack_binding(record):
     route = record.get("acceptance_route") or {}
     keys = ["instance_id", "attempt_id", "revision", "plan_hash", "registry_hash", "bundle_hash"]
-    if route.get("schema_version") == 3:
+    if schema(route.get("schema_version")).cold:
         keys.extend(["cold_commit_hash", "cold_reconcile_hash", "obligations_hash"])
     return {key: route.get(key) for key in keys}
 

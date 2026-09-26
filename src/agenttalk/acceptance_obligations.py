@@ -113,7 +113,7 @@ def _review_obligations(store, prior, route):
         for observation in initial["observations"]:
             if observation["blocking"] and findings.get(observation["id"], {}).get("disposition") != "resolved":
                 result.append(_counter(prior, "cold", observation["id"], observation["evidence"], initial["reviewer"]))
-    if route.get("bundle_hash") and route["schema_version"] == 3:
+    if route.get("bundle_hash") and A.schema(route["schema_version"]).cold:
         from agenttalk import acceptance_hygiene
         try:
             acceptance_hygiene.execution(store, A.decode(A._retained(store, route["bundle_hash"])))
