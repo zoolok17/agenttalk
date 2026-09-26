@@ -64,15 +64,26 @@ test('the header chip shows freshness and the needs count', async () => {
   assert.deepEqual(parts, [['c2-dot is-live', ''], ['c2-chip-label', 'agenttalk'], ['c2-badge', '3']]);
 });
 
-test('time is anchored on generated_at: a wrong local clock changes nothing, elapsed time does', async () => {
+test('time is anchored on generated_at: a wrong local clock changes nothing, and while live elapsed time does advance it', async () => {
   const srv = server();
   const { dom, clock, fire } = await boot(srv);
   assert.ok(all(rail(dom)).includes('Idle · 40m'), 'idle since 40 min at the snapshot time');
-  // The state feed dies; only monotonic time passes.
+  // Still live: a minute-level redraw really does advance with elapsed monotonic time.
+  clock.perf += 120e3;
+  await fire();
+  assert.ok(all(rail(dom)).includes('Idle · 42m'), 'ages advance with elapsed time while live');
+  // The state feed dies; only monotonic time passes from here.
   srv.down = true;
   clock.perf += 120e3;
   await fire();
-  assert.ok(all(rail(dom)).includes('Idle · 42m'), 'ages advance with elapsed time');
+  // Offline: the lead's later call (M4a fix round) freezes every row's age at the last
+  // known-good reading instead of letting it keep ticking against a clock the data can't back.
+  const frozen = all(rail(dom));
+  assert.match(frozen, /as of \d\d:\d\d/);
+  assert.ok(!frozen.includes('Idle · 42m'), 'no longer the live-ticked reading either: this is a fresh, source-anchored freeze');
+  clock.perf += 120e3;
+  await fire();
+  assert.equal(all(rail(dom)), frozen, 'a second offline redraw shows the exact same frozen text: it does not keep advancing');
   assert.ok(all(stream(dom)).includes('CAN’T REACH THE CONSOLE SERVER'));
 });
 
@@ -189,6 +200,58 @@ test('focus on Retry now survives an ordinary redraw (the "ago" wording keeps ch
   assert.strictEqual(dom.document.activeElement, retry);
 });
 
+// ============================================================================= M4a fix round: F1
+
+test('F1: 20 Retry clicks while /api/state is hanging issue exactly one extra request, not 20', async () => {
+  const srv = server();
+  const { dom, fire } = await boot(srv);
+  srv.down = true;
+  await fire();                          // now offline, with a "Retry now" button
+  assert.ok(classOf(stream(dom), 'c2-retry')[0]);
+  srv.down = false;
+  srv.pendingState = true;                // from here, every /api/state hangs instead of answering
+  const before = srv.calls.filter((u) => u === '/api/state').length;
+  for (let i = 0; i < 20; i++) {
+    classOf(stream(dom), 'c2-retry')[0].click();
+    await new Promise((r) => setTimeout(r, 0));
+  }
+  assert.equal(srv.calls.filter((u) => u === '/api/state').length, before + 1, 'coalesced: at most one is ever outstanding');
+  // the hung request times out after 5 s and the loop's own cadence resumes normally afterwards
+  await fire(timeouts);
+  const afterTimeout = srv.calls.filter((u) => u === '/api/state').length;
+  srv.pendingState = false;
+  await fire(under);
+  assert.equal(srv.calls.filter((u) => u === '/api/state').length, afterTimeout + 1, 'the NEXT poll is a single ordinary request');
+});
+
+test('F1: clicking Retry while the loop’s own poll is outstanding does not start a second request', async () => {
+  const srv = server();
+  const { dom, clock, fire } = await boot(srv);
+  srv.down = true;
+  await fire();
+  srv.down = false;
+  srv.pendingState = true;
+  clock.perf += 2000;
+  await fire(under);                      // the loop's own 2 s tick issues one hanging request
+  const before = srv.calls.filter((u) => u === '/api/state').length;
+  classOf(stream(dom), 'c2-retry')[0].click();
+  classOf(stream(dom), 'c2-retry')[0].click();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(srv.calls.filter((u) => u === '/api/state').length, before, 'the clicks found a request already in flight and did nothing');
+});
+
+test('F1: whichever single request is in flight always applies (no stale completion can overwrite a newer one)', async () => {
+  const srv = server();
+  const { dom, fire } = await boot(srv);
+  srv.down = true;
+  await fire();
+  assert.equal(app(dom).className, 'is-stale');
+  srv.down = false;                       // recovered: the NEXT single-flight request will see this
+  classOf(stream(dom), 'c2-retry')[0].click();
+  await fire(under);
+  assert.equal(app(dom).className, '', 'the one request that actually ran reflects the true, current state');
+});
+
 test('the very first read failing says so instead of showing an empty page', async () => {
   const srv = server();
   srv.down = true;
@@ -295,13 +358,46 @@ test('the stream is not redrawn when nothing it shows has changed', async () => 
   const { dom, clock, fire } = await boot(srv);
   const first = stream(dom).children[0];
   const railFirst = rail(dom).children[0];
+  const rosterBefore = classOf(rail(dom), 'c2-roster')[0];
+  const rosterTextBefore = rosterBefore.textContent;
   clock.perf += 2000;
   await fire();
   assert.strictEqual(stream(dom).children[0], first, 'same node: no redraw, scroll position kept');
   assert.strictEqual(rail(dom).children[0], railFirst);
   clock.perf += 120e3;
   await fire();
-  assert.notStrictEqual(rail(dom).children[0], railFirst, 'a minute-level age change redraws');
+  const rosterAfter = classOf(rail(dom), 'c2-roster')[0];
+  assert.strictEqual(rosterAfter, rosterBefore, 'F2: reconciled in place - the section is kept, not rebuilt');
+  assert.notEqual(rosterAfter.textContent, rosterTextBefore, 'but a minute-level age change really did redraw its content');
+});
+
+// ============================================================================= M4a fix round: F2
+
+test('F2: the rail is reconciled in place - an avatar image is the same element across an age redraw', async () => {
+  const { dom, clock, fire } = await boot(server());
+  const before = classOf(rail(dom), 'c2-avatar-img');
+  assert.ok(before.length > 0);
+  clock.perf += 120e3;
+  await fire();
+  const after = classOf(rail(dom), 'c2-avatar-img');
+  assert.equal(after.length, before.length);
+  before.forEach((img, i) => assert.strictEqual(after[i], img, 'the same <img>, not torn down and recreated'));
+  // and the content genuinely did change (the roster line's age advanced), proving this is a real
+  // reconcile, not merely "nothing redrew"
+  const line = classOf(rail(dom), 'c2-agent-line').find((n) => n.textContent.includes('Idle'));
+  assert.ok(line && /\d+m/.test(line.textContent));
+});
+
+test('F2: usage rows and roster rows are also kept in place across an ordinary redraw', async () => {
+  const { dom, clock, fire } = await boot(server());
+  const usageBefore = classOf(rail(dom), 'c2-usage-row');
+  const agentBefore = classOf(rail(dom), 'c2-agent');
+  clock.perf += 120e3;
+  await fire();
+  const usageAfter = classOf(rail(dom), 'c2-usage-row');
+  const agentAfter = classOf(rail(dom), 'c2-agent');
+  usageBefore.forEach((n, i) => assert.strictEqual(usageAfter[i], n));
+  agentBefore.forEach((n, i) => assert.strictEqual(agentAfter[i], n));
 });
 
 test('chips rebuild when the set of teams changes and focus returns to the same team', async () => {

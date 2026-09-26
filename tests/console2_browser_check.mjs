@@ -72,12 +72,17 @@ try {
   // F1: first draw is scrolled to the end
   out.initial = await measure();
 
+  // F2: the rail's avatar <img> is reconciled in place, not torn down, across an ordinary redraw
+  // (scoped to #c2-rail: the lead block in the stream has its own, already-reconciled, avatar)
+  await evaluate(`(() => { window.__avatar = document.querySelector('#c2-rail .c2-avatar-img'); return !!window.__avatar; })()`);
+
   // F1: scroll up, let ordinary redraws happen (the fake server ages its cards on every read)
   await evaluate(`(() => { window.__thread = document.querySelector('.c2-thread'); window.__thread.scrollTop = 250; return true; })()`);
   await sleep(4500);
   out.afterRedraw = await measure();
   out.threadKept = await evaluate('window.__thread === document.querySelector(".c2-thread") && window.__thread.isConnected');
   out.redrawHappened = await evaluate(`(() => { const a = document.querySelector('.c2-age'); return a ? a.textContent : null; })()`);
+  out.railImageKept = await evaluate('window.__avatar === document.querySelector("#c2-rail .c2-avatar-img") && window.__avatar.isConnected');
 
   // F2: focus a Later button, let redraws happen, focus must stay put on the same element
   await evaluate(`(() => { const b = document.querySelector('.c2-later'); window.__later = b; b.focus();

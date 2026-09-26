@@ -378,6 +378,47 @@ def test_runtime_badge_colours_dark_and_paper_light() -> None:
         assert not set(rt) & set(blocks[name]), name
 
 
+# WCAG 2 relative luminance / contrast ratio (https://www.w3.org/TR/WCAG21/#dfn-relative-luminance).
+def _channel(c: int) -> float:
+    s = c / 255
+    return s / 12.92 if s <= 0.03928 else ((s + 0.055) / 1.055) ** 2.4
+
+
+def _luminance(hex_colour: str) -> float:
+    h = hex_colour.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return 0.2126 * _channel(r) + 0.7152 * _channel(g) + 0.0722 * _channel(b)
+
+
+def _contrast(a: str, b: str) -> float:
+    la, lb = _luminance(a), _luminance(b)
+    lighter, darker = max(la, lb), min(la, lb)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+# Only Midnight is styled and reviewed in this slice (see the CSS header). Pairs below are every
+# text-token-on-background-token combination the CSS actually uses to paint readable text (fg,
+# dim, serif, warn, bad, ok, info as `color`, over bg/panel/panel2 as `background`), plus
+# accent-ink on accent (the one token pair whose own name says "ink for this background").
+MIDNIGHT_TEXT_ON_BG = [
+    ("fg", "bg"), ("fg", "panel"), ("fg", "panel2"),
+    ("dim", "bg"), ("dim", "panel"), ("dim", "panel2"),
+    ("serif", "bg"), ("serif", "panel"),
+    ("warn", "panel"), ("warn", "panel2"),
+    ("bad", "panel"), ("bad", "panel2"),
+    ("ok", "panel"), ("ok", "panel2"),
+    ("info", "panel"), ("info", "panel2"),
+    ("accent-ink", "accent"),
+]
+
+
+def test_midnight_text_tokens_meet_wcag_aa_contrast_on_their_backgrounds() -> None:
+    midnight = _theme_blocks()["midnight"]
+    for text_key, bg_key in MIDNIGHT_TEXT_ON_BG:
+        ratio = _contrast(midnight[text_key], midnight[bg_key])
+        assert ratio >= 4.5, (text_key, bg_key, midnight[text_key], midnight[bg_key], round(ratio, 2))
+
+
 def test_terminal_changes_only_fonts_and_radii() -> None:
     blocks = _theme_blocks()
     layout_keys = {"font-ui", "font-serif", "r-card", "r-btn", "r-pill", "r-logo"}

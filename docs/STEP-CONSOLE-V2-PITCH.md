@@ -567,11 +567,16 @@ open work, not a silent gap). Everything else in the M4 plan (rail avatars and b
   style attribute) — the design's "no image, runtime letter in a box"; Paper and Synthwave still use the
   Midnight hexagon (out of scope: only Midnight is reviewed this pitch, per section 3). The lead's avatar
   carries the full name as its tooltip (06-RULES).
-- **Rail reconciled in place.** `renderRail` now uses the same off-document-build-then-`syncChildren` discipline
-  as the stream (M3 F1/F2), so an avatar image is not torn down and re-fetched every redraw merely because an
-  age label elsewhere changed. `src` was added to the reconcile's tracked attributes, so two different avatar
-  files at the same tree position are never mistaken for "the same node" (which would otherwise skip updating
-  the image).
+- **Rail reconciled in place — CORRECTED, this was not actually true of M4a as shipped.** This section
+  originally claimed `renderRail` used the same off-document-build-then-`syncChildren` discipline as the
+  stream (M3 F1/F2). It did not: a patch script used a plain, unchecked string replace for that one edit,
+  the replace silently failed to match, and the file was written with the old `clear(rail)` + rebuild-every-
+  redraw code unchanged, while every other edit in the same script succeeded and `node --check` and the
+  existing tests (which asserted no node identity in the rail) still passed. The M4a cold read (F2) caught
+  it — real avatar `<img>` elements were torn down and re-fetched on every ordinary age redraw. Fixed for
+  real in the M4a fix round (section 19): `renderRail` now reconciles via `syncChildren`, with `src` in the
+  tracked attributes so two different avatar files at the same tree position are never mistaken for the same
+  node, and node identity is now pinned by both a node test and the real-browser check.
 - **Retry.** Both offline banners now carry a "Retry now" button (`data-c2-focus` keyed, so it keeps focus like
   every other stream control): it stamps `conn.retriedAt` (server-anchored time) and polls `/api/state` at once,
   without waiting for the 2 s cadence. If the team is still not live once that read resolves, the banner adds
@@ -584,11 +589,10 @@ open work, not a silent gap). Everything else in the M4 plan (rail avatars and b
 - **Quiet/offline, otherwise:** confirmed already satisfied from M2/M3 — the banner, `is-stale` 50% greying
   (CSS class only, on `#app`, never a style attribute), the roster summary's "frozen · as of HH:MM", the
   per-window "as of" stamp on a stale usage row, and the composer's disabled state with its reason. Not changed
-  in M4a: per-row relative-age text (e.g. "Idle · 40m") keeps its wording while offline rather than being
-  rewritten to "as of HH:MM" — the design's literal "all timestamps become 'as of HH:MM'" is met at the level
-  the M4 plan's own cold-read check names ("the greying is CSS-class-only; no state is shown live when stale"),
-  not by rewriting every row's text; the last-known data is grey and stamped, never hidden or presented as
-  current. Flagged for the lead in section 18.
+  in M4a: per-row relative-age text (e.g. "Idle · 40m") kept its wording while offline rather than being
+  rewritten to "as of HH:MM". Flagged for the lead in section 18; decided and built in the M4a fix round
+  (section 19) — every row's age now freezes at the team's last known-good reading while offline and appends
+  "· as of HH:MM", rather than ticking against a clock the data can no longer back.
 
 ### Acceptance crosswalk (09-ACCEPTANCE, in-scope rows)
 
@@ -612,7 +616,7 @@ open work, not a silent gap). Everything else in the M4 plan (rail avatars and b
 | Names follow 06-RULES; full name in tooltip; passes `reference/name-shortener.js` tests | DONE — roster rows already set `title` to the full name (M2); the lead avatar's tooltip was the one gap, closed this round |
 | Avatars: silhouette per theme, runtime badge, never circle-cropped | Badge + never-cropped DONE. Silhouette per theme: Midnight DONE; Terminal correctly shows no image (badge fills the frame); Paper/Synthwave use the Midnight hexagon as a placeholder (out of scope: only Midnight is reviewed) |
 | Phone (< 1024px) | OUT OF SCOPE (05-SPEC-PHONE, a later card) |
-| All text ≥ 4.5:1 | NOT VERIFIED this round — no contrast measurement pass was run against the rendered Midnight page; flagged in section 18 |
+| All text ≥ 4.5:1 | Midnight VERIFIED (M4a fix round, section 19): a computed WCAG contrast check over every text-token/background-token pair the CSS actually uses. Paper/Synthwave/Terminal remain out of scope (only Midnight is reviewed this pitch, section 3) |
 | Bus content rendered as text only | DONE throughout, tested repeatedly (including every M4 avatar/tooltip value) |
 | Keyboard map per 08; screen-reader focus order | M4b |
 
@@ -646,18 +650,72 @@ caught by the static lint test even though the (mocked) allowlist itself was byp
 
 ## 18. Open items after M4a (for the lead)
 
+Status as of the M4a fix round (section 19): the rail-reconcile gap (F2), the lead runtime badge (F3), the
+Retry/single-flight discipline (F1), the offline literal-timestamps question, and the Midnight contrast pass
+are all resolved below. What is still genuinely open:
+
 - **M4b (deferred, not silently skipped):** keyboard map + overlay behind `?`, `j/k/enter/l` card navigation
   and selection styling, `/` focuses the composer, `1`/`2` switch team by key, `esc` closes the overlay or
   blurs the composer; extend `tests/console2_browser_check.mjs` to drive the overlay and to reproduce the
   offline banner reliably (a scenario the fixed-fixture stdlib test server does not yet support: it would need
   to flip live, mid-run, from a fresh snapshot to a stale one).
-- **Contrast:** no measurement pass has been run against the rendered Midnight page (06-RULES only measured
-  the *design tokens*). Recommend a pass before the pitch, and Paper before it is ever shown live (06-RULES
-  already flags Paper's `dim`/`accent` as under 4.5:1 in the original tokens; this build already uses the
-  fixed values, but that fix itself has not been re-measured against rendered text).
-- **Offline literal timestamps:** per-row relative-age wording is kept while offline rather than rewritten to
-  "as of HH:MM" (section 17). Tell me if the pitch needs the literal per-row rewrite; it's a model change
-  (`agentView` would need the freshness state threaded in), not just a rendering one.
 - **Paper/Synthwave avatars:** both show the Midnight hexagon today (no separate rounded-square/star assets
   are wired up, since only Midnight is reviewed this pitch). If the pitch demos those themes, say so and I'll
   scope wiring in the existing rounded-square/star files from `web_static/avatars/`.
+
+Resolved this round (see section 19 for detail):
+
+- **Contrast:** DONE. A computed WCAG contrast check now runs against the actual Midnight token values in
+  `console2.css` (`test_midnight_text_tokens_meet_wcag_aa_contrast_on_their_backgrounds`), covering every
+  text-token/background-token pair the CSS uses. Paper/Synthwave/Terminal remain out of scope this pitch.
+- **Offline literal timestamps:** DONE, per the lead's call — every roster row's age now freezes at the
+  team's last known-good reading while offline and appends "· as of HH:MM".
+- **Rail reconcile (F2), Retry single-flight (F1), lead runtime badge (F3):** DONE — see section 19.
+
+## 19. M4a fix round record (F1-F3, offline ages, contrast)
+
+- **F1, Retry bypassed the single-state-request discipline.** The 2 s poll loop and a manual Retry click each
+  called `getJson('/api/state')` independently, with no shared gate; 20 Retry clicks while the server was
+  unreachable left 20 requests outstanding, and whichever resolved last — not whichever was newest — won,
+  so a stale completion could overwrite a newer one (recovered → stale again), and could apply an
+  out-of-order snapshot the same way. Fixed by routing both call sites through one `pollOnce()`, gated on
+  `data.statePending` (at most one `/api/state` request ever in flight; a click or a tick that finds one
+  outstanding is coalesced, not queued or restarted) plus `data.stateSeq` (an independent belt-and-braces
+  check: a completion whose sequence number was superseded before it settled is discarded rather than
+  applied, in case that invariant is ever broken by a future change). `retryNow()` no longer issues its own
+  fetch; it stamps `conn.retriedAt` and calls `pollOnce()`.
+- **F2, the rail was not actually reconciled in place.** See the correction in section 17: M4a's own patch
+  script silently failed to land this edit. `renderRail` now builds off-document (`buildRail`) and reconciles
+  via `syncChildren`, the same discipline the stream has used since M3 F1/F2, with `src` in the tracked
+  attributes so two different avatar files at the same rail position are correctly seen as different nodes.
+- **F3, the lead's runtime badge ignored the configured runtime.** `view.lead` resolved runtime/avatar with
+  `runtimeOf({name: leadName})` / `avatarFile(leadName, null)` — a name-based guess — even when the lead's own
+  roster row (already resolved with the feed's real `cli`) was sitting in `rows`. A `cli: codex` lead with a
+  claude-shaped name showed the claude badge on the roster row and the codex badge... nowhere consistent.
+  Fixed: the lead's own roster row is looked up by name first; its `runtime`/`avatarFile` are used whenever
+  that row exists, and the name-based fallback applies only when no row exists for that name at all (an
+  unrecognised or cross-team lead).
+- **Offline ages freeze (the lead's call on the section 18 open question).** `buildTeamView` now computes
+  `freshness()` before the roster rows, and while offline (either truth: unreachable or silent) every row's
+  age is computed against `fresh.sourceAsOfMs` (the newest observed timestamp across the team) instead of the
+  live clock, so it freezes rather than keeps ticking against data that stopped arriving; each row's line
+  gains "· as of HH:MM" so a frozen reading is never presented as if it were current.
+- **Contrast.** A computed WCAG 2 contrast check (`test_midnight_text_tokens_meet_wcag_aa_contrast_on_their_backgrounds`
+  in `test_console2_web.py`) parses the Midnight token values directly out of `console2.css` and asserts
+  ≥ 4.5:1 for every text-token/background-token pair the stylesheet actually uses (`fg`/`dim`/`serif`/`warn`/
+  `bad`/`ok`/`info` as `color`, over `bg`/`panel`/`panel2` as `background`, plus `accent-ink` on `accent`).
+  Midnight passes today; the tightest pair is `dim` on `panel2` at 4.69:1.
+
+Tests. `console2_data`: +5 (F1 x3: 20 coalesced Retry clicks, a click racing the loop's own poll, the single
+in-flight request always wins), 2 pre-existing tests corrected (one asserted the F2 bug itself as intended
+behaviour; the offline time-anchoring test now also covers the freeze, proven by a second offline redraw
+producing byte-identical text). `console2_view`: +2 (F3: an explicit `cli`/name disagreement and a generic
+seat name; offline freeze: frozen vs ticking, both offline truths, "as of HH:MM"). Real-browser check
+(`console2_browser_check.mjs` / `test_console2_browser.py`): the rail's own avatar `<img>` (scoped to
+`#c2-rail`, distinct from the lead block's already-reconciled one in the stream) is now also captured and
+checked for identity across a redraw the fixture forces by inflating one agent's age every poll. Every new or
+corrected test was confirmed red against d351359 (or, for the browser check, against the pre-fix
+`console2.js` swapped in) and green against the fix. Full run: `console2_model` 17/17, `console2_render`
+25/25, `console2_stream` 42/42, `console2_data` 42/42, `console2_view` 90/90; `test_console2_web.py` 52
+passed/3 skipped, `test_console2_browser.py`, `test_console2_health_writer.py`, `test_health_last_known.py`
+all green.

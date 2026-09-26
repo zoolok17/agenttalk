@@ -54,7 +54,9 @@
     conn: { reachable: true, stalledPolls: 0, lastOkMs: null },
     attention: Object.create(null),   // project_id -> { ok, asOfMs, items }
     chat: Object.create(null),        // project_id -> { ok, asOfMs, payload }
-    cycle: 0
+    cycle: 0,
+    statePending: false,      // F1: at most one /api/state request in flight, ever
+    stateSeq: 0                // incremented only when a request is actually issued (belt and braces)
   };
   var ui = { deferred: {}, snoozedUntil: {}, answered: {}, lastVisitMs: null };
   var chrome = { teamSeg: null, themeButtons: [], chipKeys: [], chips: [] };
@@ -731,17 +733,19 @@
     return row;
   }
 
-  function renderRail(shell) {
-    var rail = document.getElementById('c2-rail');
-    if (!rail) return;
-    clear(rail);
+  // F2: built off-document, then reconciled into the live rail with the same syncChildren the
+  // stream uses (M3 F1/F2), so an avatar <img> is not torn down and re-fetched merely because an
+  // age label elsewhere in the rail changed. `src` is in TRACKED_ATTRS, so two different avatar
+  // files at the same tree position are correctly seen as different nodes, not silently kept.
+  function buildRail(shell) {
+    var out = el('div', 'c2-rail-body');
     var v = shell.view;
-    if (!v || v.mode === 'error' || v.mode === 'loading') return;
+    if (!v || v.mode === 'error' || v.mode === 'loading') return out;
     if (v.usage.length) {
       var usage = el('section', 'c2-usage');
       usage.appendChild(el('div', 'c2-label', 'USAGE WINDOWS'));
       v.usage.forEach(function (u) { usage.appendChild(usageRow(u)); });
-      rail.appendChild(usage);
+      out.appendChild(usage);
     }
     var team = el('section', 'c2-roster');
     var head = el('div', 'c2-roster-head');
@@ -749,7 +753,14 @@
     head.appendChild(el('span', 'c2-meta', v.roster.summary));
     team.appendChild(head);
     v.roster.rows.forEach(function (r) { team.appendChild(rosterRow(r)); });
-    rail.appendChild(team);
+    out.appendChild(team);
+    return out;
+  }
+
+  function renderRail(shell) {
+    var rail = document.getElementById('c2-rail');
+    if (!rail) return;
+    syncChildren(rail, buildRail(shell));
   }
 
   // ------------------------------------------------------------------ draw
@@ -937,7 +948,18 @@
 
   // One round: read the state, draw it at once, then start the feeds without waiting
   // for them. A feed that hangs delays neither the next state read nor any redraw.
+  //
+  // F1: the 2 s cadence (loop) and a manual Retry both call this SAME function, which is why a
+  // single `statePending` gate here is enough to make "at most one /api/state request ever
+  // outstanding" hold for both call sites at once - 20 Retry clicks while one is pending issue
+  // zero extra requests, they do not race, and a stale completion can never land after a newer
+  // one (there is never a newer one to race against). `stateSeq` is kept as a second, independent
+  // check: it can only ever disagree if that invariant is ever broken by a future change, at
+  // which point it discards the out-of-order result instead of applying it.
   function pollOnce() {
+    if (data.statePending) return Promise.resolve();
+    data.statePending = true;
+    var seq = ++data.stateSeq;
     var withOthers = data.cycle % OTHER_ATTENTION_EVERY === 0;
     data.cycle += 1;
     return getJson('/api/state').then(function (payload) {
@@ -947,14 +969,19 @@
       data.conn.reachable = false;   // keep the last good data, greyed and stamped
       return false;
     }).then(function (ok) {
+      data.statePending = false;
+      if (seq !== data.stateSeq) return;   // superseded: never apply an out-of-order completion
       renderAll();
       if (ok) pollFeeds(withOthers);
     });
   }
 
   // A manual retry: stamp the attempt time (in server-anchored time, so it prints correctly
-  // even while unreachable) and poll immediately, without waiting for the next 2 s tick.
+  // even while unreachable) and poll immediately, without waiting for the next 2 s tick. A click
+  // while a request (loop's or an earlier click's) is already outstanding is coalesced: it neither
+  // restamps the attempt nor issues a second request.
   function retryNow() {
+    if (data.statePending) return;
     data.conn.retriedAt = nowMs();
     pollOnce();
   }

@@ -511,6 +511,43 @@ test('the last known data stays visible while offline', () => {
   assert.equal(v.roster.rows.length, 9);
 });
 
+test('M4a fix round: offline, a roster row\u2019s age freezes at the last known-good reading and says "as of HH:MM"', () => {
+  const onlineRoot = { agents: busyAgents(), recent: busyRecent() };
+  const at = (nowMs, conn) => M.buildTeamView({ nowMs, generatedMs: NOW, root: root(onlineRoot),
+    attention: attention([]), chat: null, conn, ui: {}, tz: TZ });
+  const row = (v) => v.roster.rows.find((r) => r.short === 'dev-2');
+
+  // Online: the same agent's line keeps advancing as time passes (the control case).
+  const t0 = row(at(NOW, CONN_OK)).line;
+  const t1 = row(at(NOW + 180e3, CONN_OK)).line;
+  assert.notEqual(t0, t1, 'online, the age keeps ticking');
+  assert.ok(!t1.includes('as of'));
+
+  // Offline (unreachable): the line is identical at two different "now" instants, and says
+  // when it is as of - using the SAME reading fmtAge would have used online (source_as_of),
+  // not the moment the page happens to render.
+  const offConn = { reachable: false, stalledPolls: 0, lastOkMs: NOW };
+  const o0 = at(NOW + 60e3, offConn);
+  const o1 = at(NOW + 300e3, offConn);
+  const r0 = row(o0);
+  const r1 = row(o1);
+  assert.equal(r0.line, r1.line, 'frozen: no ticking while offline');
+  assert.match(r0.line, /as of \d\d:\d\d$/);
+  assert.ok(r0.line.startsWith('Working \u00b7 Implementing WP-15'), 'the frozen reading is the pre-outage data, not blanked or altered');
+  assert.equal(o0.roster.summary, o1.roster.summary, 'the roster summary (already "frozen \u00b7 as of ...") agrees');
+
+  // Silent (server answers, nothing has been written for 5+ minutes) freezes and labels the same way.
+  const staleRoot = root({ agents: busyAgents().map((a) => ({ ...a, last_seen: new Date(NOW - 360e3).toISOString(),
+    health: { ...a.health, updated_at: new Date(NOW - 360e3).toISOString() },
+    ...(a.capacity ? { capacity: { ...a.capacity, observed_at: new Date(NOW - 360e3).toISOString() } } : {}) })),
+    recent: [env('x', 'y', 'message', 360)] });
+  const s0 = M.buildTeamView({ nowMs: NOW + 60e3, generatedMs: NOW, root: staleRoot, attention: attention([]), chat: null, conn: CONN_OK, ui: {}, tz: TZ });
+  const s1 = M.buildTeamView({ nowMs: NOW + 240e3, generatedMs: NOW, root: staleRoot, attention: attention([]), chat: null, conn: CONN_OK, ui: {}, tz: TZ });
+  assert.equal(s0.banner.kind, 'silent');
+  assert.equal(row(s0).line, row(s1).line, 'silent also freezes');
+  assert.match(row(s0).line, /as of \d\d:\d\d$/);
+});
+
 test('attention problems are stated, not hidden: stale read, failed read, never loaded', () => {
   const stale = team({ attention: attention([escalation({ id: 'a' })], { asOfMs: NOW - 9000 }) });
   assert.equal(stale.needs.stale, true);
@@ -557,6 +594,31 @@ test('M4: the lead’s message carries an avatar file (from the model’s own cl
   assert.ok(M.AVATAR_FILES.indexOf(v.lead.avatarFile) >= 0);
   const other = team({ chat: chat([{ from: 'codex-agenttalk-lead', body: 'hi', ts: iso(1) }], { lead: 'codex-agenttalk-lead' }) });
   assert.equal(other.lead.runtime, 'codex');
+});
+
+test('M4b F3: the lead’s badge uses the roster row’s configured runtime, never a guess from the name', () => {
+  // A claude-NAMED lead whose feed row explicitly carries cli=codex (a rename, a misconfigured
+  // seat, or simply an operator-chosen name that does not match its runtime): the row wins.
+  const mismatched = M.buildTeamView({
+    nowMs: NOW, generatedMs: NOW, tz: TZ, conn: CONN_OK, ui: {},
+    root: root({ agents: [agent('claude-agenttalk-lead', { cli: 'codex', since: 60 })], operator_facing: 'claude-agenttalk-lead' }),
+    attention: attention([]), chat: chat([{ from: 'claude-agenttalk-lead', body: 'hi', ts: iso(1) }]),
+  });
+  assert.equal(mismatched.lead.runtime, 'codex');
+  assert.equal(mismatched.lead.avatarFile, mismatched.roster.rows[0].avatarFile, 'same row, same avatar, not recomputed from the name alone');
+
+  // A generic seat name (no runtime prefix at all) is still resolved from its row, not left blank.
+  const generic = M.buildTeamView({
+    nowMs: NOW, generatedMs: NOW, tz: TZ, conn: CONN_OK, ui: {},
+    root: root({ agents: [agent('mission-control', { cli: 'qwen', since: 60 })], operator_facing: 'mission-control' }),
+    attention: attention([]), chat: chat([{ from: 'mission-control', body: 'hi', ts: iso(1) }], { lead: 'mission-control' }),
+  });
+  assert.equal(generic.lead.runtime, 'qwen');
+
+  // No matching row at all (a cross-team or unrecognised lead name): falls back to the old,
+  // name-based guess - never blank, never crashing.
+  const noRow = team({ chat: chat([{ from: 'codex-agenttalk-lead', body: 'hi', ts: iso(1) }], { lead: 'codex-agenttalk-lead' }) });
+  assert.equal(noRow.lead.runtime, 'codex');
 });
 
 test('M4: AVATAR_FILES is exactly the ten hexagon motifs, and every roster avatarFile is one of them', () => {

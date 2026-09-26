@@ -59,7 +59,7 @@ def _iso(when: datetime) -> str:
     return when.isoformat().replace("+00:00", "Z")
 
 
-def _state(now: datetime) -> dict:
+def _state(now: datetime, grown: int = 0) -> dict:
     def agent(name: str, state: str, since_s: int) -> dict:
         return {
             "name": name, "cli": name.split("-")[0], "last_seen": _iso(now - timedelta(seconds=3)),
@@ -69,7 +69,11 @@ def _state(now: datetime) -> dict:
         }
     return {"schema_version": 1, "generated_at": _iso(now), "roots": [{
         "label": "browser", "path": "x", "project_id": PROJECT, "errors": [], "operator_facing": LEAD,
-        "agents": [agent(LEAD, "idle_waiting", 3000), agent("claude-agenttalk-developer-2", "idle_waiting", 2000)],
+        # the second agent's age is inflated by "grown" (like /api/attention below) so the roster's
+        # own rendered text really does change on every poll, exercising the rail render path -
+        # not merely relying on it being skipped because nothing in the view changed at all.
+        "agents": [agent(LEAD, "idle_waiting", 3000),
+                   agent("claude-agenttalk-developer-2", "idle_waiting", 2000 + grown)],
         "recent": [{"id": "1", "ts": _iso(now - timedelta(seconds=5)), "from": LEAD, "to": "operator",
                     "kind": "message", "subject": "s"}],
     }]}
@@ -98,7 +102,7 @@ def _handler(started: float):
                 ctype, data = web._STATIC_ASSETS[path[len("/static/"):]]
                 self._send(data, ctype, web._DEFAULT_CSP)
             elif path == "/api/state":
-                self._send(json.dumps(_state(now)).encode(), "application/json", web._DEFAULT_CSP)
+                self._send(json.dumps(_state(now, grown)).encode(), "application/json", web._DEFAULT_CSP)
             elif path == "/api/attention":
                 items = [{"id": f"card-{n}", "source": "escalation", "source_label": "ESCALATION", "severity": "high",
                           "title": f"Question {n}", "agent": None, "detail": "why it matters",
@@ -152,5 +156,7 @@ def test_thread_scroll_and_focus_survive_redraws_in_a_real_browser(page) -> None
     # F2: deferring the focused card moves focus to another control in the stream, never to <body>
     after_later = out["focusAfterLater"]
     assert after_later["tag"] == "BUTTON" and after_later["inStream"] is True, after_later
+    # F2: the rail is reconciled in place too - the avatar <img> survives an ordinary redraw
+    assert out["railImageKept"] is True, out
     # the page raised no exception and the console CSP blocked nothing
     assert out["problems"] == [], out["problems"]

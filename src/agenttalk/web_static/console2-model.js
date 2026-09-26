@@ -489,6 +489,10 @@
       var remembered = lk ? 'last known: ' + LAST_KNOWN_LABEL[lk.state] + ' (' + fmtAge(lk.age) + ' ago) · ' : '';
       setState('unknown', 'No fresh health · ' + remembered + (hbAge === null ? 'never seen' : 'last seen ' + fmtAge(hbAge)));
     }
+    // Offline: this row's age is frozen at the team's last known-good reading (ctx.nowMs was
+    // already computed against that reading, not the live clock), and says so - never a frozen
+    // number presented as if it were current.
+    if (ctx.asOfLabel) view.line += ' · as of ' + ctx.asOfLabel;
     return view;
   }
 
@@ -794,26 +798,33 @@
       return view;
     }
 
+    // --- freshness and the two banners (computed before the roster: a per-row age freezes at
+    // this same reading while offline, rather than ticking against a clock the data can't back) --
+    var fresh = freshness(root, input.conn, nowMs, tz);
+    view.freshness = fresh;
+    view.banner = fresh.banner;
+    view.chip.freshness = fresh.state;
+    var offline = fresh.banner !== null;
+
     // --- roster rows -----------------------------------------------------------
     var teamIds = agents.map(function (a) { return typeof a.name === 'string' ? a.name : ''; });
     var known = knownProjectsOf(root);
     var project = teamProject(teamIds, known);
     var recent = Array.isArray(root.recent) ? root.recent : [];
-    var ctx = { nowMs: nowMs, generatedMs: typeof input.generatedMs === 'number' ? input.generatedMs : null,
-                recent: recent, teamIds: teamIds, project: project, known: known, tz: tz };
+    // Offline (either truth): every row's ages are computed against the last known-good source
+    // time instead of the live clock, so they freeze rather than keep ticking against data that
+    // stopped arriving; each row also says so ("as of HH:MM"), never presenting a frozen number
+    // as if it were live.
+    var rowNowMs = (offline && typeof fresh.sourceAsOfMs === 'number') ? fresh.sourceAsOfMs : nowMs;
+    var ctx = { nowMs: rowNowMs, generatedMs: typeof input.generatedMs === 'number' ? input.generatedMs : null,
+                recent: recent, teamIds: teamIds, project: project, known: known, tz: tz,
+                asOfLabel: offline ? fresh.asOfLabel : null };
     var rows = agents.map(function (a) { return agentView(a, ctx); });
     var lead = typeof root.operator_facing === 'string' ? root.operator_facing : '';
     if (lead) {
       rows.sort(function (a, b) { return (a.name === lead ? 0 : 1) - (b.name === lead ? 0 : 1); });   // stable for the rest
     }
     var idle = rows.filter(function (r) { return r.state === 'idle'; }).length;
-
-    // --- freshness and the two banners ----------------------------------------
-    var fresh = freshness(root, input.conn, nowMs, tz);
-    view.freshness = fresh;
-    view.banner = fresh.banner;
-    view.chip.freshness = fresh.state;
-    var offline = fresh.banner !== null;
 
     // --- needs you -------------------------------------------------------------
     var att = isObj(input.attention) ? input.attention : null;
@@ -908,12 +919,21 @@
       if (found || chatNotes.length) {
         var leadShort = leadName ? shortName(leadName, project, teamIds, known) : 'lead';
         var atMs = found ? parseMs(found.ts) : null;
+        // F3: resolve the lead's OWN roster row first (it already carries the feed's real `cli`),
+        // so a configured runtime is never overridden by guessing from the agent's name; the
+        // name-based fallback (runtimeOf/avatarFile with no role) applies only when no row exists
+        // for this name at all (an unrecognised or cross-team lead).
+        var leadRow = null;
+        for (var lr = 0; lr < rows.length; lr++) {
+          if (rows[lr].name === leadName) { leadRow = rows[lr]; break; }
+        }
         view.lead = {
           name: leadName, short: leadShort, body: found ? str(found.body, LEAD_BODY_LIMIT) : '',
           truncated: found ? found.body.length > LEAD_BODY_LIMIT : false, atMs: atMs,
           ageLabel: atMs === null ? '' : fmtAge((nowMs - atMs) / 1000) + ' ago',
           unavailable: leadDown, detail: leadDown ? str(pl.detail, 160) : '', notes: chatNotes,
-          avatarFile: avatarFile(leadName, null), runtime: runtimeOf({ name: leadName })
+          avatarFile: leadRow ? leadRow.avatarFile : avatarFile(leadName, null),
+          runtime: (leadRow && leadRow.runtime) ? leadRow.runtime : runtimeOf({ name: leadName })
         };
       }
     }
