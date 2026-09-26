@@ -18,7 +18,8 @@ def binding(record):
     return {"close_id": record["close_id"], **{key: route[key] for key in BINDING_FIELDS.split()}}
 
 
-def locator(value):
+def locator_path(value):
+    """Validate cache-root syntax without probing a possibly historical cache."""
     if value is None:
         A._fail("--cache-root is required for a schema-4 plan")
     R._text(value, "cache root")
@@ -27,6 +28,11 @@ def locator(value):
     path = Path(value).absolute()
     if ".." in path.parts:
         A._fail("cache root must be a fully resolved locator")
+    return path
+
+
+def locator(value):
+    path = locator_path(value)
     try:
         R.staged_path(path, "preflight-probe")
     except A.LinkedPathError:
@@ -75,11 +81,8 @@ def freeze(store, record, prepared):
 
 
 def validate_route(route):
-    R._text(route["cache_root"], "private cache locator")
-    path = Path(route["cache_root"])
     # Syntax only: historical cache absence must not invalidate the original route.
-    if not path.is_absolute() or ".." in path.parts:
-        A._fail("private cache locator must be absolute without parent traversal")
+    locator_path(route["cache_root"])
     for key in ("environment_hash", "preflight_open_hash"):
         A._digest(route[key])
     if route["preflight_attach_hash"] is not None:
