@@ -1,6 +1,6 @@
 # A work board that moves itself
 
-Status: proposed v2 design for #207, 2026-09-26; replaces `d232eac`. Audience: implementers and cold readers.
+Status: proposed v3 design for #207, 2026-09-26; supersedes `6c1a049`. Audience: implementers and cold readers.
 This is an explanation and proposed contract, not shipped behavior. Design only; no production change.
 
 The operator decided: read-only, derived from agents' work, board before #206. Card detail becomes a
@@ -55,20 +55,32 @@ status/verdict: approved/GO, rejected/FIX or HOLD, needs-info/HOLD (nonterminal)
 
 Optional dispatch policy meta: work_repo, work_branch, work_target, required_gates (bounded JSON array of
 check keys), no_gates_reason (bounded text, incompatible with nonempty gates). Originating build/design task
-defines repository/check policy; replacements inherit it. Conflicting parallel policies are Unknown.
+defines repository/check policy; for an external-deliverable review-only item, its lead review dispatch defines
+that policy. Replacements inherit it. Conflicting parallel policies are Unknown.
 Reviews pin the same policy/candidate. Missing policy is unknown, not an empty list. One repo per item in v1;
 use separate related items for multi-repository deliverables. These are bus facts, not a second item database.
 
 ### Vendor source (F1)
 
-Default independence: **different_seat**, reviewer differs from every contributing builder for that candidate.
-Unknown builder attribution prevents verified independence. Unknown model vendor is **unverified**; CLI/name
+Default independence: **different_seat**. Builder set is EVERY recipient of a validated build/fix dispatch on
+the item, across all cycles, including superseded/declined dispatches; conservatively include design authors
+when reviewing a design-only cycle. The reviewer must be outside that set. No inference of contributions from
+Git authors, completion prose or head ancestry. Missing dispatch/recipient history prevents verified independence.
+For a review-only item, lead dispatch meta `external_deliverable=true` plus full work_head and repository/check
+policy supplies the deliverable fact without a fabricated build reply; show **external deliverable; authorship
+unverified**. With complete item history, independence is checked against the (possibly empty) bus builder set
+and labelled **different seat from recorded builders**, not independence from unknown external authors.
+Absent the explicit external declaration, no build evidence means Unknown. A later build/fix adds its recipient
+to the set and can invalidate an earlier GO's independence. Unknown model vendor is **unverified**; CLI/name
 cannot prove it. A separate CLI badge may describe transport but cannot certify cross-vendor review.
 
 Add operator-set config map `model_vendor: {agent_name: vendor}` alongside roster maps. Closed v1 values:
 anthropic|openai|alibaba|other|unverified; missing means unverified. Validate roster membership. Dispatch copies
-the assignee's value into reserved assignee_model_vendor; ordinary task meta cannot override it. Retain old
-dispatch snapshots after retirement/config changes. Label it operator-configured, not automatic attestation.
+the value into reserved `assignee_model_vendors`, a map keyed by exact recipients expanded at dispatch time.
+Group fan-out copies share that frozen map and request ID; each copy's recipient must occur in the map. Changes
+to group membership after dispatch never change the recipient obligation set or vendor map. Missing entries in
+legacy history are unverified; contradictory fan-out maps are Unknown. Ordinary task meta cannot override the
+map. Retain snapshots after retirement/config changes. Label it operator-configured, not automatic attestation.
 Choose config rather than launcher inference because routes vary and transport is misleading. Updating a
 model route requires updating config for subsequent tasks. Unknown vendor alone does not block different-seat
 review; automatic vendor attestation or mandatory cross-vendor policy is separate scope.
@@ -84,15 +96,36 @@ through existing attention. Idle health does not prove completion.
 Only original dispatch authority or current lead/liaison can replace. Validate target; reject self-links,
 cycles and ambiguous branching replacements. Old requests/verdicts remain history. Superseding running work
 does not cancel it: outstanding execution remains visible and blocks Ready until terminal or rescinded.
-Use existing rescind where cancellation is needed. Declined/rescinded work is closed-not-success, not a
+Use rescind where cancellation is needed, including the lead takeover extension below. Declined/rescinded work is closed-not-success, not a
 permanent blocker; successful replacement satisfies the surviving obligation. All-declined work cannot be
 Ready without a successful deliverable and independent review. Never pick latest(stage,round): parallel tasks
 can share both. Superseded FIX says awaiting replacement review until successor succeeds; unrelated FIX/HOLD
 remains unresolved. A late superseded reply is history/diagnostic, not approval of a replacement candidate.
 
 Typo repair: rescind mistaken dispatch and reissue correctly, optionally with informational corrects_request
-(NOT cross-item supersedes). Keep cancelled mistaken card in history. No fuzzy merge, signed-message edits
+(NOT cross-item supersedes). Keep cancelled mistaken dispatch in bus history, not a new board history feed.
+No fuzzy merge, signed-message edits
 or binding registry. Bulk repair is separate scope.
+
+**Outstanding execution (N4):** every design/build/fix recipient obligation starts outstanding at dispatch,
+even without an acknowledgement or fresh health. It ends only on a valid terminal done/declined reply or valid
+rescind. Accepted, silence, retirement, lost health and supersedes alone do not end it. Reviews have the same
+pending-recipient accounting as outstanding reviews. A queued task is therefore also outstanding execution;
+Queued describes evidence of activity, not exemption from Ready checks. Group completion needs all recipients.
+
+Existing rescind is requester-only. A separate B2c protocol slice proposes `rescind --as-lead`: only the CURRENT
+configured lead may use it for an earlier requester's task on this root, with an explicit reason and pinned
+opener ID. Ordinary responders/liaisons cannot self-promote. Dedicated publication validates the role and emits
+a reserved, signed authorization snapshot (actor, role=lead, project_id, opener_id, config digest); callers cannot
+supply/override that snapshot through generic send/meta/drafts. Persist the accepted authorization alongside the
+rescind envelope so later lead rotation cannot resurrect a cancelled task. Historical imports lacking verified
+authorization remain Unknown, not silently trusted. Reuse the existing publication/authentication trust boundary;
+the snapshot is an audited authorization decision, not an assertion that CLI-supplied role text proves authority.
+Thread reduction, check/scoped-wait supersession barriers, fan-out and attention must recognize the SAME accepted
+lead rescind, with skew-safe pinned causal linkage. This is real protocol cancellation, not board-only hiding,
+and does not kill a worker process. Exact-request health still reporting execution after cancellation remains an
+overlap warning and prevents Ready until it clears. Test old-lead task/new-lead cancellation, subsequent rotation,
+unauthorized/snapshot-spoof attempts, group recipients, unanswered dispatch and a still-running cancelled seat.
 
 ## 3. Causal reduction and precedence
 
@@ -141,7 +174,28 @@ Choose item-scoped gate NAMES, not a new history database: `wb.<work_item>.c<cyc
 Check keys: [a-z0-9-]{1,24}; full name obeys gates.py's 128-character cap. Require scope
 <project_id>/<item>/c<cycle>, revision equal to full candidate OID, plus existing validated green evidence.
 Missing revision NEVER satisfies the board. Item A/B cannot overwrite each other. New revision may overwrite
-same item's gate; old gate history is unavailable, not invented. Global gates retain existing meaning elsewhere.
+same item's gate; old gate history is unavailable, not invented. A satisfying record uses existing validated
+severity=blocker green evidence, not an advisory/warning record relabelled as a passed check.
+
+**Namespace isolation (N1), required before writing ANY wb. gate:** retain gates.json but change gates.py's
+selection boundary. An unscoped check excludes wb. names from BOTH required_gates and recorded-gate iteration;
+an explicitly non-board scope also excludes them. A board check selects only the dispatched required names
+under its exact item/cycle scope, then validates revision/evidence. Global gates remain the ordinary pre-merge
+barrier; the board does not replace them. Disallow adding wb. names to the root-wide required_gates configuration;
+legacy accidental entries are excluded with a visible configuration warning, not treated as global requirements.
+Both web and CLI gate-HOLD attention must consume the same filtered unscoped verdict (no raw-gates back door).
+A red wb.a.c2.unit cannot block item B's check --gates or generate team attention. Its failed check is visible on
+A's card; it is not automatically an operator incident. Malformed/unreadable gate STATE still fails closed.
+This is an intentional gates.py compatibility change, not a claim that current unscoped callers already isolate
+names. Reusing gate validation avoids a second check-evidence store; no isolation rollout, no wb. writers.
+
+Cleanup is explicit lead-side maintenance, NEVER a console GET: preview then remove exact wb. records for
+cancelled items or terminal cycles outside the seven-day display window, only if no active request references
+that cycle; remove accidental root required-list references in the same locked/atomic update. Preserve an audit
+summary of removed name/revision/status and leave all non-wb. gates unchanged. Reopening a pruned cycle requires
+fresh check evidence; missing records cannot become green. B6 includes this narrowly scoped cleanup command and
+tests red A/green B, missing/wrong revision, required-list contamination, both attention callers, ordinary global
+blockers, concurrent record update and dry-run/exact-prefix cleanup. CI/no_gates_reason remains the common path.
 
 CI usually runs elsewhere. Common explicit policy: required_gates=[] and no_gates_reason="CI tracked outside
 local gates". Ready says **independent GO; local checks not tracked (CI external)**, NEVER green CI or checks
@@ -178,31 +232,63 @@ five-week-old FIX. Failed archive refresh cannot yield complete board history; u
 board coverage globally. Archive/dedup rules need tests against actual archive_messages_below output.
 
 ONE per-root validated snapshot service supplies state and board. Refactor existing _validated_for_state behind
-it: state consumes active partition with existing semantics, board consumes active+compacted. Archive caching is
-inside that SAME service; no second scanner or independent validator. State must not replay compacted threads.
-Single refresh job/root, coalesced across clients; reuse unchanged file fingerprints and cached archive data.
-Directory fingerprints detect membership, not in-place edits: stat-check files and fully revalidate content and
-signatures at least every 60 s. Config/signing/retirement changes invalidate trust immediately. Compaction changes
-both partitions: mid-build membership change requires retry/incomplete coverage, not half a move as resolved.
-Publish snapshots atomically; observation interval is not an atomic bus transaction or merge authority.
+it: state consumes the active partition with existing semantics; board consumes that partition plus the selected
+archive dependency closure below. Archive indexing is inside that SAME service and validation boundary, not a
+second scanner. State must not replay compacted threads. Nothing changes delivery or archive retention.
 
-Warm refresh at most once per 5 s, outside handlers. Failure retains last-known data/errors, never stamps it fresh.
-Fresh workflow requires scan-start age <=15 s and complete required partitions. Active state can remain usable
-while archives fail; board exposes degradation. Preserve existing state consumers' error shapes and test parity.
-Slow refresh yields stale, not fake live latency. Input cap: 50,000 records/128 MiB source bytes per root; reaching
-either means capacity_exceeded, not silently complete prefix. Bound file reads before parsing; oversized records
-are coverage errors. One worker services roots fairly, cancellation/budget checks between files. No public
-cooperative iterator/cursor protocol. Measure on observed ~11,400 active records/60 MB plus archives, not a claimed
-25 ms full scan. Cache is disposable; errors never block message publication.
+**Incremental archive index (N2):** keep a disposable per-root SQLite cache under state/work-board-cache/, keyed
+by root identity, archive file identity/path, schema and trust generation. It stores file size/mtime_ns/ctime_ns,
+content digest, validation result and compact workflow fields: message/request/opener IDs, participants, item,
+cycle/stage/candidate, supersedes/terminal links and envelope provenance. Index request->files and item->requests;
+retain all-cycle builder membership and unresolved references. No bodies, manually editable item records or
+independent authoritative status: index/reducer summaries can always be rebuilt from envelopes. Use transactions
+and schema versioning; corruption discards the cache and exposes building/Unknown while rebuilding.
 
-GET /api/work-board?root=<id>: <=100 active cards, <=256 KiB, no cursor. Dated history uses from=<UTC-date>&to=<UTC-date>,
-max 31 days, same caps. Never age-filter away active work. Overflow reports truncated=true, known total and omitted
-count; no quiet/empty claim. >100 active cards requires later filtering/paging. Display sort is approximate event
-time+item key, not reducer order. History ranges use approximate last-work-event time and are labelled accordingly.
-Active means current cycle is not Done and is not wholly cancelled/declined without remaining work. Unknown
-items with missing evidence stay active; proven terminal/cancelled items remain available in dated history.
-Also include Done items whose last-work-event date is within seven UTC days, counted within the same response
-bounds. This approximate activity window is not a claim about merge time; dated history retains older Done items.
+Cold build discovers archives incrementally, at most 1,000 entries or 250 ms per worker slice (one bounded file
+validation may finish after the deadline). Check cancellation/budgets between files and yield fairly to active
+refreshes/other roots. Resume via internal disk checkpoints, never an HTTP cursor. The total archive is NOT
+subject to the live-evaluation 50k/128-MiB cap: do not materialize it in memory. Unchanged archived files are not
+reparsed or signature-checked every 60 s. Directory reconciliation discovers additions/removals; fingerprint
+change revalidates the affected envelope and invalidates dependent summaries. Trust/config/signing changes
+invalidate validation generation, even if file stats did not change. Full cold rebuild may take time; show
+building coverage and preserve independently usable /api/state rather than report an empty/quiet board.
+
+Directory fingerprints only detect membership. Background stat reconciliation covers archived files in bounded
+slices; a stat change causes a digest/content/signature recheck. Referenced archive files are stat-checked on
+each live refresh, so dependent freshness does not wait for an unrelated historical sweep. Index fingerprints
+are cache invalidation, not a tamper-proof trust mechanism: an actor able to rewrite files while preserving all
+fingerprints is outside that cache assumption; deleting the cache/explicit revalidation forces a content audit.
+The UI never offers that maintenance as a write action. Changes while indexing/compacting invalidate coverage
+until both partitions and the affected request closure reconcile; an active-to-archive move is not resolution.
+
+Select dependencies from validated active envelopes AND compact indexed workflow summaries, so an item entirely
+in archives but still unresolved/awaiting integration is not lost. Select every potentially active item and Done
+items in the seven-day activity window; follow all its request threads, opener/reply/rescind/supersedes links
+and all-cycle builder facts. Missing opener or ambiguous/missing index link means Unknown. Summaries cannot
+certify Ready/Done: rehydrate and revalidate selected evidence against its file/trust fingerprint before reduction.
+Unreferenced completed old threads remain index entries only, outside the live source budget. Reopening an item
+rehydrates its required old evidence, even if older than seven days. New/unindexed archives or unassignable
+corruption make coverage incomplete until classified, never silently excluded. A changed repo target invalidates
+affected integration summaries; unproved integration leaves the archived item potentially active.
+
+Warm active refresh at most once per 5 s, outside handlers, coalesced across clients. Fresh workflow requires
+live evaluation scan-start age <=15 s, current trust generation and complete selected dependencies/index discovery;
+an unfinished routine historical stat sweep alone does not invalidate already checked dependencies. Failure keeps
+last-known errors/data and stamps degradation, never fresh success. Preserve existing state error shapes/parity.
+Cap the deduplicated active partition PLUS selected archive closure at 50,000 envelopes/128 MiB source bytes per
+root; an oversized active workload still yields capacity_exceeded, but millions of unrelated closed archive
+envelopes do not. Bound individual file reads, disk queries and in-memory batches. Disk-full index failure yields
+unavailable/last-known with recovery guidance, not a permanently complete prefix. Cache/index writes are server
+observation maintenance, never changes to task state. HTTP polling performs no index rebuild or envelope reads.
+
+GET /api/work-board?root=<id>: <=100 cards, <=256 KiB, no cursor and NO dated-history endpoint in v1 (N7).
+Include active items plus Done with last-work-event date within seven UTC days. This is an approximate activity
+window, not a claim about merge time. Active means current cycle is not Done and is not wholly cancelled/declined
+without remaining work; Unknown items with missing evidence stay active. Never age-filter away active items.
+Older Done/cancelled records remain available through existing bus tools, not a new board history service.
+Overflow reports truncated=true, known total and omitted count; unknown totals are null with incomplete coverage.
+No quiet/empty claim on overflow. >100 included cards requires later filtering/paging. Display sort is approximate
+event time+item key, not reducer order. Show the seven-day scope in the UI.
 
 BOARD HTTP does O(returned-card-count) cached projection and zero message-file/Git/network reads. This is
 BOARD-scoped, not server-wide: explicit D1/#206 document GET may read one bounded blob. Poll visible board every
@@ -222,7 +308,9 @@ from reduction. Closed feed schema/fixture assertions belong in B6; no bus bodie
 
 ## 6. Needs-you, card and read-only detail
 
-Extract existing needs-you calculation once for stream/board. Escalate flags and build_attention publish exact
+B7 and B8 start only after console v2 is merged into master at an explicitly recorded SHA; neither edits or
+extracts code from the frontend seat's unmerged branch (N3). Extract the merged needs-you calculation once for
+stream/board. Escalate flags and build_attention publish exact
 validated item/cycle with sanitized source_refs. Resolve membership from escalation opener, not by pretending esc
 IDs are build IDs. Deduplicate attention/chat by escalation ID. Unlinked incidents remain team attention; do not
 spray a seat warning across its work. Stuck mapping requires fresh exact task correlation. Later/Wait defer local
@@ -281,14 +369,20 @@ Apply identical semantics to both shipped lead skills; platform-specific shell e
 > unknown legacy history. Use validated flags when available, equivalent --meta otherwise. Replacement builds AND
 > reviews carry supersedes=<old request id>; rescind still-running work when cancellation is needed. Similar
 > subjects never prove replacement.
+> A never-answered dispatch is outstanding too. For a previous lead's task use the reviewed lead-rescind path;
+> until that protocol lands, show the unresolved obligation rather than pretending replacement cancelled it.
 >
 > Pin candidate and approved repo alias before review. Dispatch intended parallel reads before interpreting GO:
 > the board knows only dispatched reviews. Reviews use GO/FIX/HOLD case-insensitively; design/build/fix use done.
 > Retire READY/NOT READY. Require existing typed terminal status too. Missing verdict is not success. GO/done is
 > not merged.
+> Review-only human/external work needs external_deliverable=true and an exact repository/candidate declaration.
+> Independence uses all recorded build/fix recipients on the item, across cycles, not just the latest author.
 >
 > Default to different-seat independence. Model vendor requires operator-configured model_vendor snapshotted at
 > dispatch, never cli/name. Unknown is unverified. Local gates need item-scoped names and exact candidate revision.
+> Group dispatch freezes a per-recipient vendor map. Do not create wb. gates until unscoped gate isolation lands;
+> never put wb. names in root required_gates. Prune obsolete board checks through explicit lead maintenance only.
 > Otherwise give no_gates_reason (often external CI); do not claim unseen CI verified.
 >
 > Escalate with --work-item/--work-cycle for common incident placement. Never clear FIX/HOLD through prose or an
@@ -304,26 +398,35 @@ B1 (registry) is removed. B3 is explicitly split; adversarial tests are required
 | Slice | Builder | Scope and acceptance | Estimated lines |
 |---|---|---|---:|
 | B2a | Python developer | Validated task tags, reply normalization, supersedes and lead skill. Invalid/conflicting metadata, missing verdict, retired vocabulary, draft/publication parity, declined replacement tests. | 400–600 |
-| B2b | Python developer | Operator model_vendor config/dispatch snapshot; escalation item flags and attention projection. Test qwen routed through claude, unverified vendor, reserved-field spoofing and exact escalation placement. | 250–400 |
+| B2b | Python developer | Operator model_vendor config/per-recipient dispatch map; escalation item flags and attention projection. Test mixed-vendor group fan-out, membership change, qwen routed through claude, unverified vendor, spoofing and exact escalation placement. | 250–400 |
+| B2c | Python protocol developer | Lead-authorized rescind with durable authorization; same semantics in publication, threads, check, wait and attention. Test lead rotation, old requester, spoofing, fan-out, unanswered tasks and post-cancellation running health. Separate compatibility review. | 400–650 |
 | B3a | Strong Python developer | Pure causal reducer and basic real-envelope fixtures. Each decision row, native thread classification parity, unknown and revision cases. | 350–500 |
-| B3b | Python developer/test specialist | Adversarial reducer fixtures and necessary corrections: shuffled/skewed IDs, parallel GO/FIX/HOLD, decline/re-dispatch, branching supersedes, cycle/head changes, merged-with-FIX, design completion and temporary Ready between reads. | 400–600 |
-| B4a | Python IO developer | Shared per-root validated-envelope snapshot serving state and board. Coalescing, active-state parity, trust invalidation, edited files, errors, source limits and no duplicate scans. | 350–550 |
-| B4b | Python IO developer | Archive partition in the SAME snapshot service. Closed FIX on a live item, suffixed archive filenames, duplicate/conflicting IDs, mid-compaction moves, missing/archived opener, tampering and excluded reset sessions. | 250–400 |
-| B6 | Python developer | Bounded board/history feeds and item gate adapter. Test overflow, old live items, root isolation, path redaction, parallel item gate names, absent revision and external-CI reason. No cursors. | 300–500 |
-| B7 | Frontend developer | Shared needs-you projection and incident identity. Stream/board parity, Later, resolved/stale/unmapped incidents, new turns and future plan-review object. | 200–350 |
-| B8 | Frontend developer after console M4 | Pure console model, keyed cards/detail/router and operator walkthrough. Real-envelope Node fixtures and browser focus/scroll/keyboard, GET/CSP, stale/Unknown, unknown merge/cost/findings. No document viewer. | 500–700 |
+| B3b | Python developer/test specialist | Adversarial reducer fixtures: shuffled/skewed IDs, parallel GO/FIX/HOLD, unanswered/declined replacement, group obligations, all-cycle builder set/external deliverable, supersession, head changes, merged-with-FIX, design completion and Ready between reads. | 400–600 |
+| B4a | Python IO developer | Shared per-root snapshot and incremental-index integration boundary. Coalescing, active-state parity, generation invalidation, selected-input budgets and no duplicate scanner. Test current-state availability during cold index work. | 450–650 |
+| B4b | Python IO developer | Disposable fingerprinted archive index in the SAME service. Bounded batches/checkpoints, request/item indexes, schema/trust invalidation, dedup/collision names, interrupted rebuild, compaction and disk-full. | 450–650 |
+| B4c | Python IO/test developer | Selected dependency hydration and scale fixtures. Entirely archived active item, old FIX, all-cycle builders, missing opener, reopened item, changed target, unrelated archive volume above live caps and actual active-cap overflow. | 200–300 |
+| B6a | Python developer | Bounded active-plus-seven-day-Done feed and item gate adapter/isolation. Test unscoped check --gates, BOTH attention paths, root requirements, cross-item red, exact revision, global blockers, truncation and external CI. No history endpoint/cursors. | 400–600 |
+| B6b | Python developer | Explicit lead-side board-gate cleanup, audited preview/atomic prune. Test exact names, terminal eligibility, referenced active cycle, concurrent update and retained non-board gates. | 200–300 |
+| B7 | Frontend developer AFTER console v2 merge to master | Shared needs-you projection and incident identity. Record merge SHA; stream/board parity, Later, resolved/stale/unmapped incidents, new turns and future plan-review object. | 200–350 |
+| B8 | Frontend developer AFTER console v2 merge to master | Pure console model, keyed cards/detail/router and operator walkthrough. Real-envelope Node fixtures and browser focus/scroll/keyboard, GET/CSP, stale/Unknown, unknown merge/cost/findings. No document viewer. | 500–700 |
 | B5 | Python developer, after first UI | Restricted local Git observer and integration evidence. Allowlist, hostile refs/env, no helper/network invocation, timeout, shallow history, missing objects and merged-with-FIX tests. | 300–500 |
 | D1 | Python + frontend, after B-series | Pinned document and copy-with-reference detail. Traversal/object/blob limits, safe rendering, exact reference/quote and clipboard fallback browser tests. | 500–700 |
 | D2 | Frontend, after D1 | Browser-local comparison baseline and bounded plain-text diff. First visit, reload, polling, storage failure, unavailable revisions and large diff tests. | 400–600 |
 | D3 | Frontend, after stable finding contract | Read-only finding marks with C2/C3 identity, supersession and anchor tests; provisional estimate pending that contract. | 450–700 |
 
-First UI (B2a–B4b, B6–B8) totals roughly 3,000–4,600 changed lines. B5 adds 300–500.
-This is a planning range, not an assurance that archive correctness fits the low end. B6 depends on B3a/B3b and
-B4a/B4b; first UI acceptance also needs B2a/B2b and B7. B5 may follow initial UI with merge explicitly Unknown.
+First UI (B2a–B4c, B6a/B6b–B8) totals roughly 4,200–6,300 changed lines. B5 adds 300–500.
+B4a is now 450–650; B6 total is 600–900 split into B6a/B6b; B7 remains 200–350 plus the merge prerequisite.
+This higher range explicitly prices N2 indexing and N4 cancellation instead of hiding them in a 700-line card.
+B2a/B2b/B3a/B3b can start now using their revised contracts; B2c is separately reviewed and must land before
+lead-cancellation acceptance. B6a depends on B3a/B3b and B4a/B4b/B4c; first UI acceptance also needs B2a/B2b/B2c,
+B6b and B7. B7/B8 wait for console v2 on master. B5 may follow initial UI with merge explicitly Unknown.
 D-series begins after B-series acceptance, including B5; none is hidden inside B8. Cost aggregation and PR imports
 are optional later slices, not unfinished first-board obligations.
 
-Performance acceptance uses at least 11,400 real-shaped active/archive envelopes, 500 historical items and 20 seats.
+Performance acceptance uses at least 11,705 active real-shaped envelopes (~36.4 MB), 500 historical items and
+20 seats; add >50,000 / >128-MiB UNRELATED completed archived envelopes without exhausting the live-input cap.
+Record cold index build separately from warm refresh; verify a one-file archive addition/change reparses only
+affected envelopes, trust change invalidates required evidence and repeated warm polls do not rehash all history.
 Measure warm board HTTP p95 below 50 ms on the recorded development machine, with zero source/Git reads per request.
 Record shared refresh duration, source bytes/reads and peak memory separately; the 50 ms target is NOT a full-scan
 budget. Concurrent state/board polling must coalesce refreshes; oversized or slow refreshes must expose incomplete
@@ -348,13 +451,21 @@ activity, scripted stakeholder demonstration or fictional root is required. Synt
 | F7 | ACCEPTED: causal references drive state; writer-clock IDs only break display ties; ambiguity stays Unknown (§3). |
 | F8 | ACCEPTED: proven integration can say Done while prominently preserving open FIX/HOLD and missing checks (§3–4). |
 | F9 | ACCEPTED: bounded allowlisted Git plumbing, disabled helpers/lazy fetching/replacements; no status/diff invocation (§4, §7). |
-| O1–O4 | ACCEPTED: no item registry/seal/amendment system, one shared snapshot, bounded list/history without cursors, supersedes metadata (§1–5). |
+| O1–O4 | ACCEPTED: no item registry/seal/amendment system, one shared snapshot, bounded list without cursors, supersedes metadata (§1–5). N7 further removes the dated-history feed. |
 | Sizing | ACCEPTED: separate reducer/adversarial tests, archive work and UI/Git phases; explicit total range (§9). |
 | C1–C9 | ACCEPTED as integration contract notes (§7); held #206 is not modified here. |
 | D1–D3 | ACCEPTED as separate follow-ons; read-only document/copy, local comparison and later stable finding marks (§7, §9). |
+| N1 | ACCEPTED: reserve wb. gates, exclude them from unscoped/non-board checks and both attention callers; explicit audited cleanup. Gates.py change is a rollout prerequisite (§4, B6a/B6b). |
+| N2 | ACCEPTED: incremental fingerprinted archive index; live budget counts active envelopes plus selected archived dependency closure, not all historical bodies (§5, B4a/B4b/B4c). |
+| N3 | ACCEPTED: B7 and B8 depend on a recorded console-v2 merge SHA on master (§6, §9). |
+| N4 | ACCEPTED: unanswered dispatch is outstanding; separately sized lead-authorized rescind changes actual bus barriers and survives lead rotation (§2, B2c). |
+| N5 | ACCEPTED: all-cycle build/fix recipient set, conservative design authors, and explicit external-deliverable provenance for review-only items (§2, B3b). |
+| N6 | ACCEPTED: reserved per-recipient vendor map frozen across group fan-out; missing/conflicting maps are unverified/Unknown (§2, B2b). |
+| N7 | ACCEPTED: v1 contains active items and seven-day Done only; no dated history endpoint (§5, B6a). |
 
 No disagreement with the binding decisions and no blocking operator question. The chosen archive approach costs an
-additional shared snapshot slice; it avoids changing retention semantics or losing evidence already compacted.
+an incremental-index slice plus dependency tests; it avoids changing retention semantics or losing evidence
+already compacted. A long-lived item can still exceed the selected-input budget; unrelated closed history cannot.
 Explicit supersession is preferred to latest(stage, round), which would silently erase parallel reviewers.
 The known trade-off of no registry/seal is visible temporary Ready between separately dispatched reviews; Ready is
 an observation, never a merge permission. Plausible slug typos require correction through ordinary bus work.
