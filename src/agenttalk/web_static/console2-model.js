@@ -331,6 +331,15 @@
     errored_ambiguous: 'Errored',
     crashed_or_exited: 'Crashed or exited'
   };
+  // What a stale health read says its agent last reported (health.normalize's last_known_*
+  // fields). Only these states are ever accepted; anything else is ignored as absent.
+  var LAST_KNOWN_LABEL = {
+    idle_waiting: 'idle', working_turn: 'working', working_silent: 'silent turn',
+    stuck_suspected: 'wrapper flagged a stall', rate_limited_or_outage: 'rate limited or outage',
+    degraded_output: 'degraded output', errored_poison: 'errored', errored_ambiguous: 'errored',
+    crashed_or_exited: 'crashed or exited'
+  };
+  var LAST_KNOWN_WORKING = { working_turn: true, working_silent: true, stuck_suspected: true };
   var TONE = { working: 'ok', busy: 'info', idle: 'dim', stuck: 'warn', capped: 'bad', down: 'bad', unknown: 'dim' };
 
   // Did this agent send anything since it woke? Read from the recent-envelope window:
@@ -374,28 +383,45 @@
     var hs = typeof h.state === 'string' ? h.state : 'unknown';
     if (h.stale === true) hs = 'unknown';
     var nowMs = ctx.nowMs;
+    // A stale read (older than the TTL, or than the heartbeat) is `unknown` but may carry
+    // what the snapshot last said. That is a memory, not a current state: it is only used
+    // to judge stuck-vs-busy, with the staleness stated in the evidence.
+    var lk = null;
+    if (hs === 'unknown' && typeof h.last_known_state === 'string' && hasOwn(LAST_KNOWN_LABEL, h.last_known_state)) {
+      var lkUpdated = parseMs(h.last_known_updated_at);
+      var lkSince = parseMs(h.last_known_since);
+      if (lkUpdated !== null && lkSince !== null) {
+        lk = { state: h.last_known_state, sinceMs: lkSince, progressMs: parseMs(h.last_known_progress_at),
+               updatedMs: lkUpdated, age: Math.max(0, (nowMs - lkUpdated) / 1000) };
+      }
+    }
+    var staleWorking = lk !== null && LAST_KNOWN_WORKING[lk.state] === true;
+    if (staleWorking) hs = lk.state;
     var short = shortName(name, ctx.project, ctx.teamIds, ctx.known);
 
     var hbAge = ageSeconds(agent.last_seen, nowMs);
     if (hbAge === null && typeof agent.last_seen_age_seconds === 'number' && ctx.generatedMs !== null) {
       hbAge = agent.last_seen_age_seconds + Math.max(0, (nowMs - ctx.generatedMs) / 1000);
     }
-    var sinceMs = parseMs(h.since);
+    var sinceMs = staleWorking ? lk.sinceMs : parseMs(h.since);
     var sinceAge = sinceMs === null ? null : Math.max(0, (nowMs - sinceMs) / 1000);
     // Inactivity counts from the CURRENT turn. The wrapper keeps last_progress_at across
     // idle and turn_start, so a value older than `since` (which is when this state began:
     // the turn start for a freshly spawned, still-silent turn) belongs to an earlier turn and
     // must not count. Progress noted inside the current state is used as it is.
-    var lpMs = parseMs(h.last_progress_at);
+    var lpMs = staleWorking ? lk.progressMs : parseMs(h.last_progress_at);
     var haveProgress = lpMs !== null && (sinceMs === null || lpMs >= sinceMs);
     var baselineMs = haveProgress ? lpMs : sinceMs;
+    // A stale working_turn wrote a snapshot on every adapter event: its last write is the last
+    // sign of activity, so that is where its silence began.
+    if (staleWorking && lk.state === 'working_turn') baselineMs = lk.updatedMs;
     var progAge = baselineMs === null ? null : Math.max(0, (nowMs - baselineMs) / 1000);
     var hbFresh = hbAge !== null && hbAge <= HEARTBEAT_FRESH_S;
 
     var view = {
       name: name, short: short, runtime: runtimeOf(agent), avatarFile: avatarFile(name, agent.role),
       state: 'unknown', tone: 'dim', line: '', cap: '', title: name,
-      candidate: false, stuck: null, aside: null
+      candidate: false, stuck: null, aside: null, healthStale: lk !== null
     };
 
     function setState(state, line) { view.state = state; view.tone = TONE[state]; view.line = line; }
@@ -405,36 +431,44 @@
     } else if (hs === 'working_turn' || hs === 'working_silent' || hs === 'stuck_suspected') {
       var reply = replyInfo(name, sinceMs, ctx.recent, nowMs);
       var progWord;
-      if (haveProgress) progWord = 'Last progress ' + fmtAge(progAge) + ' ago';
+      if (staleWorking) progWord = 'Health stale ' + fmtAge(lk.age) + ' (last known: ' + LAST_KNOWN_LABEL[lk.state] + ')';
+      else if (haveProgress) progWord = 'Last progress ' + fmtAge(progAge) + ' ago';
       else if (hs === 'stuck_suspected') progWord = 'Wrapper flagged a stall' + (progAge === null ? '' : ' ' + fmtAge(progAge) + ' ago');
       else progWord = 'No progress since the turn began' + (progAge === null ? '' : ' ' + fmtAge(progAge) + ' ago');
       var noMsg = reply.lastMessageAge === null ? '' : ' · no message for ' + fmtAge(reply.lastMessageAge);
       if (!hbFresh) {
         setState('unknown', 'Heartbeat ' + (hbAge === null ? 'missing' : 'stale ' + fmtAge(hbAge)) +
           ' · not judged stuck');
-      } else if (hs === 'working_turn') {
+      } else if (hs === 'working_turn' && !staleWorking) {
         var task = str(agent.task, 80);
         setState('working', 'Working' + (task ? ' · ' + task : '') + (sinceAge === null ? '' : ' · ' + fmtAge(sinceAge)));
       } else {
         // working_silent, or the wrapper's own stuck_suspected: a candidate when nothing
         // has moved for 10 minutes. A card needs the full evidence (see below).
         var quietLong = progAge !== null && progAge >= STUCK_AFTER_S;
-        view.candidate = hs === 'stuck_suspected' || quietLong;
+        view.candidate = (hs === 'stuck_suspected' && !staleWorking) || quietLong;
         if (quietLong && reply.replied === false) {
           var evidence = progWord + ' · no reply sent · heartbeat still fresh';
           setState('stuck', evidence);
           view.stuck = { evidence: evidence, progressAge: progAge };
-        } else if (view.candidate) {
-          var tail = reply.replied === true ? 'replied since it woke' : 'reply status unknown';
+        } else if (view.candidate || staleWorking) {
+          var tail = reply.replied === true ? 'replied since it woke'
+            : (reply.replied === false ? 'no reply sent' : 'reply status unknown');
           setState('busy', progWord + ' · ' + tail);
           view.aside = { title: short + ' is quiet',
-            detail: progWord + ' · ' + tail + ' · no card without more evidence' };
+            detail: progWord + ' · ' + tail + (quietLong ? ' · no card without more evidence'
+              : ' · no card before 10 min without activity') };
         } else {
           setState('busy', 'Quiet · ' + progWord.charAt(0).toLowerCase() + progWord.slice(1) + noMsg);
           view.aside = { title: short + ' is quiet, not stuck',
             detail: progWord + noMsg + ' · no card while progress moves' };
         }
       }
+    } else if (lk !== null && lk.state === 'idle_waiting' && hbFresh) {
+      // The health file is older than the heartbeat (the wrapper only writes health when a turn
+      // starts, progresses or ends), but its last word was idle and nothing newer exists: a turn
+      // starting would have written at once. The heartbeat says the wrapper is alive.
+      setState('idle', 'Idle \u00b7 ' + fmtAge(Math.max(0, (nowMs - lk.sinceMs) / 1000)));
     } else if (hs === 'rate_limited_or_outage') {
       var c = cappedLine(agent);
       var resetMs = typeof c.reset === 'number' && isFinite(c.reset) ? c.reset * 1000 : null;
@@ -446,7 +480,8 @@
       setState('down', DOWN_LABEL[hs] + (sinceAge === null ? '' : ' · ' + fmtAge(sinceAge)));
       view.aside = { title: short + ' is down', detail: view.line };
     } else {
-      setState('unknown', 'No fresh health · ' + (hbAge === null ? 'never seen' : 'last seen ' + fmtAge(hbAge)));
+      var remembered = lk ? 'last known: ' + LAST_KNOWN_LABEL[lk.state] + ' (' + fmtAge(lk.age) + ' ago) · ' : '';
+      setState('unknown', 'No fresh health · ' + remembered + (hbAge === null ? 'never seen' : 'last seen ' + fmtAge(hbAge)));
     }
     return view;
   }

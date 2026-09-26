@@ -29,6 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stays put in the header and `?root=` selects the team (an unknown one is
   stated, never replaced). Plan and open items: `docs/STEP-CONSOLE-V2-PITCH.md`.
 
+- **Health reads that are too old now say what they last reported.** A
+  snapshot older than the TTL, or older than the heartbeat by more than the
+  skew, still reads `state: unknown` with every existing field unchanged, and
+  additionally carries `last_known_state`, `last_known_since`,
+  `last_known_updated_at` and (when present) `last_known_progress_at`. Nothing
+  else changes for status, doctor, the supervisor or the classic console; the
+  v2 console uses the fields to tell a wedged silent turn from a healthy one.
+
 ### Changed
 
 - Reduce acceptance Git process overhead with command-local metadata/history

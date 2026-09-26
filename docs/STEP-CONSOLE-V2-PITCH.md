@@ -408,7 +408,7 @@ Changed from the plan, and why:
   are the same thing: keep the last items, mark the read failed (greeting "Can't read what needs you.", page
   greyed), and let the next good read replace them.
 
-### Finding from the F2 regression, not fixed here: the stuck card can rarely appear with today's health files
+### Finding from the F2 regression (resolved by M2c, section 14): the stuck card could rarely appear with today's health files
 
 `WrapperHealthWriter` writes on state changes and adapter events only; nothing refreshes the file during a
 silent turn. `Store.read_health` turns a snapshot older than 300 s into `unknown` and drops its state, `since` and
@@ -420,3 +420,41 @@ on the stale read (`health.normalize`, TTL branch: add `last_known: {state, sinc
 updated_at}` from the validated raw file; `state` stays `unknown`, `stale` stays true). The console would then
 treat "last known state working_silent, no health write for 10 min, heartbeat fresh, no reply" as the stuck
 evidence, which is exactly what a silent turn looks like. Not done: it changes a shared reader, so it needs a go.
+
+## 14. M2c record (additive `last_known_*` health fields)
+
+Lead's decision on the section 13 finding: go, additive only.
+
+- **Backend (`agenttalk/health.py`).** `normalize()` has two branches that return `unknown` for a snapshot that
+  validated but is too old: older than the TTL (`health_stale_ttl`) and older than the heartbeat by more than the
+  skew (`health_older_than_heartbeat`; the TTL check runs first, so this one covers roughly 30 s to 5 min).
+  Both now go through `_stale_unknown()`, which returns exactly `unknown(agent, warning)` and then appends
+  `last_known_state`, `last_known_since`, `last_known_updated_at` and, when the snapshot had one,
+  `last_known_progress_at`. The state is one of the validated `HEALTH_STATES`; the values are the snapshot's own
+  timestamps (no free text). `updated_at`, `since` and the rest stay None, `state` stays `unknown`, `stale` stays
+  true. The missing, invalid, future-dated and fresh branches are untouched.
+  I added `last_known_updated_at` to the three fields the decision named: "health stale N min" cannot be stated
+  without knowing when the health was last written.
+- **Why the heartbeat branch matters more than the TTL one.** The wrapper writes idle health once, when a turn
+  ends, and nothing during a silent turn, while the heartbeat keeps moving. With `/api/state` passing the
+  heartbeat, a snapshot goes `unknown` about 30 s after its last write. Before M2c that made every idle agent and
+  every silent turn read "No fresh health".
+- **Console v2 model.** With `last_known_*` present and a fresh heartbeat (<= 300 s): a remembered
+  `working_silent`, `stuck_suspected` or `working_turn` is judged by the same rule as a live one (10 minutes
+  without activity, no reply since the wake, fresh heartbeat), with the baseline `since` / progress noted inside
+  the turn / (for `working_turn`) the last write. Evidence reads "Health stale 15m (last known: silent turn) · no
+  reply sent · heartbeat still fresh"; Wait stays first and Restart stays locked. Before ten minutes the row is
+  `busy` with the same "Health stale ..." wording. A remembered `idle_waiting` with a live heartbeat is shown as
+  idle (a turn starting would have written at once), so a team of idle agents reads as a quiet team instead of
+  `unknown`; this goes one step beyond the decision and is easy to remove (one branch in `agentView`). Every
+  other remembered state stays `unknown`, labelled ("last known: crashed or exited (10m ago)"). Without a fresh
+  heartbeat nothing is judged. A remembered state outside the known set, or unparseable times, is ignored.
+  The line for a candidate with a known absence of replies now says "no reply sent" instead of "reply status
+  unknown" (the earlier wording understated what the window shows).
+- **Tests.** `tests/test_health_last_known.py` (10): the stale read equals `unknown()` on every existing key
+  (values and order), only the four new keys are added and only in the two stale branches, and the readers are
+  unchanged: `/api/state`, `/api/status`, `/api/attention`, `/api/lead-chat`, the supervisor report and plan and
+  `doctor` produce the same JSON as with the legacy reader (verbatim health dicts compared after stripping the
+  four keys; derived outputs compared exactly), under a frozen clock, for both stale branches; the classic
+  console does not read the fields. `tests/test_console2_health_writer.py` (8) now reads health through the real
+  writer AND the real reader with a heartbeat, as `/api/state` does. `console2_view.test.mjs` +12.

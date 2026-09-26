@@ -1,11 +1,17 @@
 """Writer-to-model regression for the console v2 stuck rule.
 
 The health files the console reads are written by the real ``WrapperHealthWriter`` and read back
-through the real ``Store.read_health``. ``WrapperHealthWriter`` keeps ``last_progress_at`` across
-``idle()`` and ``turn_start()``, so progress from an EARLIER turn is still in the file when a new
-turn begins. These tests drive that writer under a fake clock and feed the resulting rows to the
-node model (``agentView``): a turn that has just started must not be judged by the previous turn's
-progress. No hand-written health JSON is involved.
+through the real ``Store.read_health`` with a live heartbeat, exactly as ``/api/state`` does. The
+rows are then run through the node model (``agentView``). No hand-written health JSON is involved.
+
+Two real-writer facts drive these tests:
+
+* ``WrapperHealthWriter`` keeps ``last_progress_at`` across ``idle()`` and ``turn_start()``, so a new
+  turn must not be judged by an earlier turn's progress;
+* nothing refreshes the health file while a turn is silent (and idle health is written once, when the
+  turn ends), while the heartbeat keeps moving. The reader therefore turns the snapshot into ``unknown``
+  (older than the TTL, or older than the heartbeat by more than the skew) and, since M2c, adds
+  ``last_known_*`` so the console can still tell a wedged silent turn from a healthy one.
 """
 from __future__ import annotations
 
@@ -61,25 +67,21 @@ class Harness:
         self.store.write_health(AGENT, stamped)
 
     def evaluate(self, name: str, hh: int, mm: int, ss: int = 0, recent: list | None = None,
-                 ttl: float | None = None) -> None:
-        """Read the health the way /api/state does, at the evaluation time, with a fresh heartbeat.
+                 heartbeat_age: float | None = 20, ttl: float | None = None) -> None:
+        """Read the health the way /api/state does (with the agent's heartbeat) at the evaluation time.
 
-        ``ttl`` overrides the reader's 300 s freshness window. The default reader turns a snapshot
-        older than 300 s into ``unknown`` (see test_health_older_than_the_ttl_reads_unknown...), so
-        cases that need a snapshot older than five minutes to still carry its state pass a longer
-        window and say so in their name.
+        ``heartbeat_age`` seconds before the evaluation time (None = no heartbeat at all).
         """
         eval_time = NOON.replace(hour=hh, minute=mm, second=ss)
+        heartbeat = None if heartbeat_age is None else eval_time - timedelta(seconds=heartbeat_age)
         kwargs = {} if ttl is None else {"ttl_seconds": ttl}
-        health = self.store.read_health(AGENT, now_epoch=eval_time.timestamp(), **kwargs)
-        row = {
-            "name": AGENT,
-            "last_seen": self._iso(eval_time - timedelta(seconds=20)),
-            "last_seen_age_seconds": 20,
-            "health": health,
-        }
+        health = self.store.read_health(AGENT, now_epoch=eval_time.timestamp(), heartbeat=heartbeat, **kwargs)
+        row = {"name": AGENT, "health": health}
+        if heartbeat is not None:
+            row["last_seen"] = self._iso(heartbeat)
+            row["last_seen_age_seconds"] = heartbeat_age
         self.scenarios.append({"name": name, "evalMs": int(eval_time.timestamp() * 1000), "agent": row,
-                               "recent": recent or []})
+                               "recent": recent or [], "reason": health.get("reason_code")})
 
     def run(self, tmp_path: Path) -> dict:
         path = tmp_path / "scenarios.json"
@@ -95,6 +97,10 @@ class Harness:
 @pytest.fixture
 def h(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Harness:
     return Harness(tmp_path, monkeypatch)
+
+
+def _reason(h: Harness, name: str) -> str | None:
+    return next(s["reason"] for s in h.scenarios if s["name"] == name)
 
 
 def test_the_writer_really_keeps_progress_across_idle_and_a_new_turn(h: Harness) -> None:
@@ -120,15 +126,37 @@ def test_a_new_turn_is_not_stuck_because_of_the_previous_turns_progress(h: Harne
     h.at(11, 59, 55)
     h.writer.turn_start({"id": "m1", "request_id": "r1"})   # a new turn, five seconds ago
     h.evaluate("just_started", 12, 0, 0)
-    h.evaluate("still_quiet_9m", 12, 9, 0, ttl=3600)      # (longer reader window: see the TTL test)
-    h.evaluate("quiet_10m", 12, 10, 5, ttl=3600)           # 10 min 10 s since the turn began, nothing said
+    h.evaluate("quiet_9m", 12, 9, 0)
+    h.evaluate("quiet_10m", 12, 10, 5)     # 10 min 10 s since the turn began, nothing said
     out = h.run(tmp_path)
+    assert _reason(h, "just_started") == "turn_spawned"                           # the writer's own reason: fresh
     assert out["just_started"]["state"] == "busy"
     assert out["just_started"]["stuck"] is None
     assert out["just_started"]["line"] == "Quiet · no progress since the turn began 5s ago"
-    assert out["still_quiet_9m"]["state"] == "busy"
+    assert _reason(h, "quiet_9m") == "health_stale_ttl"                          # nothing wrote since
+    assert out["quiet_9m"]["state"] == "busy"
+    assert out["quiet_9m"]["line"] == "Health stale 9m (last known: silent turn) · no reply sent"
     assert out["quiet_10m"]["state"] == "stuck"
-    assert out["quiet_10m"]["stuck"].startswith("No progress since the turn began 10m ago")
+    assert out["quiet_10m"]["stuck"] == (
+        "Health stale 10m (last known: silent turn) · no reply sent · heartbeat still fresh")
+
+
+def test_a_wedged_silent_turn_is_judged_through_either_stale_branch(h: Harness, tmp_path: Path) -> None:
+    """Younger than the TTL but older than the heartbeat, and older than the TTL: both keep last_known_*."""
+    h.at(11, 45)
+    h.writer.turn_start({"id": "m1", "request_id": "r1"})
+    h.evaluate("by_heartbeat", 11, 47, 0)                         # 2 min: only the heartbeat says it is old
+    h.evaluate("by_ttl", 12, 0, 0)                                # 15 min: past the 300 s TTL
+    h.evaluate("no_heartbeat_row", 12, 0, 0, heartbeat_age=None)  # the same file, no heartbeat evidence
+    out = h.run(tmp_path)
+    assert _reason(h, "by_heartbeat") == "health_older_than_heartbeat"
+    assert _reason(h, "by_ttl") == "health_stale_ttl"
+    assert out["by_heartbeat"]["state"] == "busy"                 # stale, but only 2 minutes
+    assert out["by_heartbeat"]["line"] == "Health stale 2m (last known: silent turn) · no reply sent"
+    assert out["by_ttl"]["state"] == "stuck"
+    assert out["by_ttl"]["stuck"].startswith("Health stale 15m (last known: silent turn)")
+    assert out["no_heartbeat_row"]["state"] == "unknown"          # without a fresh heartbeat: not judged
+    assert out["no_heartbeat_row"]["stuck"] is None
 
 
 def test_progress_noted_inside_the_current_turn_counts(h: Harness, tmp_path: Path) -> None:
@@ -138,23 +166,30 @@ def test_progress_noted_inside_the_current_turn_counts(h: Harness, tmp_path: Pat
     h.note_progress()                  # `agenttalk progress`: state stays working_silent
     assert h.store.read_health_raw(AGENT)["state"] == "working_silent"
     h.evaluate("after_note_5m", 11, 50)
-    h.evaluate("after_note_13m", 11, 58, ttl=3600)
+    h.evaluate("after_note_13m", 11, 58)
     out = h.run(tmp_path)
     assert out["after_note_5m"]["state"] == "busy"
-    assert out["after_note_5m"]["line"].startswith("Quiet · last progress 5m ago")
+    assert out["after_note_5m"]["line"] == "Health stale 5m (last known: silent turn) · no reply sent"
     assert out["after_note_13m"]["state"] == "stuck"
-    assert out["after_note_13m"]["stuck"].startswith("Last progress 13m ago")
+    assert out["after_note_13m"]["stuck"].startswith("Health stale 13m (last known: silent turn)")
 
 
-def test_a_progress_event_moves_the_turn_to_working_and_never_stuck(h: Harness, tmp_path: Path) -> None:
+def test_a_working_turn_that_keeps_writing_is_working_and_one_that_went_quiet_is_flagged(
+    h: Harness, tmp_path: Path,
+) -> None:
     h.at(11, 40)
     h.writer.turn_start({"id": "m1", "request_id": "r1"})
     h.at(11, 41)
     h.progress()
-    h.evaluate("long_turn", 12, 0, ttl=3600)
+    h.at(11, 59, 50)
+    h.progress()                       # events kept arriving: health is fresh
+    h.evaluate("events_flowing", 12, 0, 0)
+    h.evaluate("quiet_19m", 12, 19, 0)  # ...and then no event for 19 minutes
     out = h.run(tmp_path)
-    assert out["long_turn"]["state"] == "working"
-    assert out["long_turn"]["stuck"] is None
+    assert out["events_flowing"]["state"] == "working"
+    assert out["events_flowing"]["stuck"] is None
+    assert out["quiet_19m"]["state"] == "stuck"
+    assert out["quiet_19m"]["stuck"].startswith("Health stale 19m (last known: working)")
 
 
 def test_a_watchdog_flag_counts_from_when_it_fired(h: Harness, tmp_path: Path) -> None:
@@ -166,29 +201,35 @@ def test_a_watchdog_flag_counts_from_when_it_fired(h: Harness, tmp_path: Path) -
     h.writer.failure({"watchdog": True}, None)    # the wrapper's own stall flag
     assert h.store.read_health_raw(AGENT)["state"] == "stuck_suspected"
     h.evaluate("just_flagged", 11, 50)
-    h.evaluate("flagged_15m", 12, 0, ttl=3600)
+    h.evaluate("flagged_15m", 12, 0)
     out = h.run(tmp_path)
-    assert out["just_flagged"]["state"] == "busy"        # a candidate, not yet a card
-    assert out["just_flagged"]["candidate"] is True
+    assert out["just_flagged"]["state"] == "busy"        # stale, but not yet ten minutes
     assert out["flagged_15m"]["state"] == "stuck"
-    assert out["flagged_15m"]["stuck"].startswith("Wrapper flagged a stall 15m ago")
+    assert out["flagged_15m"]["stuck"] == (
+        "Health stale 15m (last known: wrapper flagged a stall) · no reply sent · heartbeat still fresh")
 
 
-def test_health_older_than_the_ttl_reads_unknown_so_a_silent_turn_shows_no_card_by_default(
+def test_idle_health_written_at_turn_end_still_reads_idle_while_the_heartbeat_lives(
     h: Harness, tmp_path: Path,
 ) -> None:
-    """KNOWN LIMITATION, pinned so it is not forgotten (docs/STEP-CONSOLE-V2-PITCH.md section 13).
-
-    Nothing refreshes the health file while a turn is silent (the writer writes on state changes
-    and adapter events only), and the reader turns a snapshot older than 300 s into ``unknown``
-    with its state, ``since`` and ``last_progress_at`` dropped. A wedged turn therefore reads
-    "No fresh health" after five minutes, before the ten-minute stuck rule can be evaluated.
-    """
-    h.at(11, 45)
+    """Idle health is written once (turn end); the heartbeat keeps moving, so the reader calls it stale."""
+    h.at(11, 20)
     h.writer.turn_start({"id": "m1", "request_id": "r1"})
-    h.evaluate("silent_15m_default_ttl", 12, 0)
-    h.evaluate("silent_15m_long_ttl", 12, 0, ttl=3600)
+    h.at(11, 21)
+    h.writer.idle(reason_code="turn_completed")
+    h.evaluate("idle_40m", 12, 0, 0)
+    h.evaluate("idle_no_heartbeat", 12, 0, 0, heartbeat_age=900)
     out = h.run(tmp_path)
-    assert out["silent_15m_default_ttl"]["state"] == "unknown"
-    assert out["silent_15m_default_ttl"]["line"].startswith("No fresh health")
-    assert out["silent_15m_long_ttl"]["state"] == "stuck"
+    assert _reason(h, "idle_40m") == "health_stale_ttl"
+    assert out["idle_40m"]["state"] == "idle"
+    assert out["idle_40m"]["line"] == "Idle · 39m"
+    assert out["idle_no_heartbeat"]["state"] == "unknown"
+
+
+def test_no_heartbeat_evidence_is_never_stuck(h: Harness, tmp_path: Path) -> None:
+    h.at(11, 30)
+    h.writer.turn_start({"id": "m1", "request_id": "r1"})
+    h.evaluate("silent_no_heartbeat", 12, 0, 0, heartbeat_age=None)
+    out = h.run(tmp_path)
+    assert out["silent_no_heartbeat"]["state"] == "unknown"
+    assert out["silent_no_heartbeat"]["stuck"] is None

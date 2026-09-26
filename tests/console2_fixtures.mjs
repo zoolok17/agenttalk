@@ -99,3 +99,26 @@ export function busyRecent() {
     env('claude-agenttalk-reviewer-3', 'claude-agenttalk-lead', 'review-result', 3000),
   ];
 }
+
+// An agent whose health read is stale (older than the TTL, or than the heartbeat): the server
+// serves state 'unknown' plus last_known_* (health.normalize). o.lk = the last reported state
+// (null = a plain stale read with nothing remembered); o.since / o.updated / o.progress are ages.
+export function staleAgent(name, o = {}) {
+  const hb = o.hb === undefined ? 20 : o.hb;
+  const warning = o.warning || 'health_stale_ttl';
+  const a = {
+    name,
+    last_seen: iso(hb),
+    last_seen_age_seconds: hb,
+    health: { state: 'unknown', stale: true, advisory: true, updated_at: null, since: null, age_seconds: null,
+              warnings: [warning], reason_code: warning },
+  };
+  if (o.lk) {
+    const since = o.since === undefined ? 900 : o.since;
+    a.health.last_known_state = o.lk;
+    a.health.last_known_since = iso(since);
+    a.health.last_known_updated_at = iso(o.updated === undefined ? since : o.updated);
+    if (o.progress !== undefined && o.progress !== null) a.health.last_known_progress_at = iso(o.progress);
+  }
+  return a;
+}

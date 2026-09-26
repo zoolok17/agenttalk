@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { createRunner } from './console2_harness.mjs';
 import {
-  ATT_ITEM, CONN_OK, NOW, agent, attention, busyAgents, busyRecent, capacity, chat, env, epochIn, iso, root,
+  ATT_ITEM, CONN_OK, NOW, agent, attention, busyAgents, busyRecent, capacity, chat, env, epochIn, iso, root, staleAgent,
 } from './console2_fixtures.mjs';
 
 // Loaded as a CommonJS module in this realm (the model is pure), so returned arrays and
@@ -150,7 +150,7 @@ test('the wrapper\u2019s own stuck_suspected is a candidate, and a card only wit
   assert.equal(early.state, 'busy');
   assert.equal(early.candidate, true);
   assert.equal(early.stuck, null);
-  assert.equal(early.line, 'Last progress 3m ago · reply status unknown');
+  assert.equal(early.line, 'Last progress 3m ago · no reply sent');
   const evidenced = view(s({ since: 1800, progress: 840 }), { recent: WINDOW });
   assert.equal(evidenced.state, 'stuck');
 });
@@ -627,7 +627,7 @@ test('a watchdog flag counts from when the wrapper raised it, and says so', () =
   const flagged = (since, progress) => view(agent(NAME, { state: 'stuck_suspected', since, progress }), { recent: WINDOW });
   const early = flagged(120, 3000);
   assert.deepEqual([early.state, early.candidate], ['busy', true]);
-  assert.equal(early.line, 'Wrapper flagged a stall 2m ago · reply status unknown');
+  assert.equal(early.line, 'Wrapper flagged a stall 2m ago · no reply sent');
   const late = flagged(900, 3000);
   assert.equal(late.state, 'stuck');
   assert.equal(late.stuck.evidence, 'Wrapper flagged a stall 15m ago · no reply sent · heartbeat still fresh');
@@ -671,6 +671,118 @@ test('an unavailable lead is stated even when an older message exists (web.py em
 test('failed and unavailable together give both notes, failure first', () => {
   const v = chatWith({ ok: false, asOfMs: NOW - 30e3, payload: { available: false, detail: 'gone', lead: 'claude-agenttalk-lead', messages: [LEAD_MSG] } });
   assert.deepEqual(v.lead.notes.map((n) => n.kind), ['failed', 'unavailable']);
+});
+
+// ------------------------- M2c: a stale health read that remembers what it last said
+
+const sillyStale = (o) => staleAgent(NAME, o);
+const stale = (o, ctxOpts) => view(sillyStale(o), { recent: WINDOW, ...ctxOpts });
+
+test('a wedged silent turn past 10 minutes is a stuck card, with "health stale" evidence and Wait first', () => {
+  const v = stale({ lk: 'working_silent', since: 900 });
+  assert.equal(v.state, 'stuck');
+  assert.equal(v.healthStale, true);
+  assert.equal(v.stuck.evidence, 'Health stale 15m (last known: silent turn) · no reply sent · heartbeat still fresh');
+  assert.equal(v.stuck.progressAge, 900);
+  const t = M.buildTeamView({ nowMs: NOW, generatedMs: NOW, root: root({ agents: [sillyStale({ lk: 'working_silent', since: 900 })], recent: WINDOW }),
+    attention: attention([]), chat: null, conn: CONN_OK, ui: {}, tz: TZ });
+  const card = t.needs.open[0];
+  assert.deepEqual([card.kind, card.title, card.evidenceNote], ['LOOKS STUCK', 'dev-6 has gone quiet',
+    'Weaker evidence: process status isn’t visible yet, so Wait comes first.']);
+  assert.deepEqual(card.options.map((o) => [o.label, o.primary, o.locked]), [['Wait 10 min', true, null], ['Restart with context', false, 'CLI only']]);
+});
+
+test('stale + last known: the 10-minute boundary counts from the turn start (599 busy, 600 stuck)', () => {
+  assert.equal(stale({ lk: 'working_silent', since: 599 }).state, 'busy');
+  assert.equal(stale({ lk: 'working_silent', since: 600 }).state, 'stuck');
+  const busy = stale({ lk: 'working_silent', since: 240 });
+  assert.equal(busy.line, 'Health stale 4m (last known: silent turn) · no reply sent');
+  assert.equal(busy.aside.detail, 'Health stale 4m (last known: silent turn) · no reply sent · no card before 10 min without activity');
+  assert.equal(busy.stuck, null);
+});
+
+test('stale + last known: progress noted inside the turn counts, an earlier turn’s does not', () => {
+  assert.equal(stale({ lk: 'working_silent', since: 1200, progress: 300 }).state, 'busy');       // progress 5 min ago
+  assert.equal(stale({ lk: 'working_silent', since: 1200, progress: 700 }).state, 'stuck');      // 11+ min ago
+  assert.equal(stale({ lk: 'working_silent', since: 5, progress: 1800 }).state, 'busy');         // previous turn
+});
+
+test('stale + last known working_turn: its last write is when the silence began', () => {
+  const v = stale({ lk: 'working_turn', since: 3000, updated: 700 });
+  assert.equal(v.state, 'stuck');
+  assert.equal(v.stuck.evidence, 'Health stale 11m (last known: working) · no reply sent · heartbeat still fresh');
+  assert.equal(stale({ lk: 'working_turn', since: 3000, updated: 500 }).state, 'busy');
+  assert.equal(stale({ lk: 'working_turn', since: 3000, updated: 500 }).candidate, false);
+});
+
+test('stale + last known stuck_suspected counts from when the wrapper flagged it', () => {
+  const v = stale({ lk: 'stuck_suspected', since: 900 });
+  assert.equal(v.state, 'stuck');
+  assert.equal(v.stuck.evidence, 'Health stale 15m (last known: wrapper flagged a stall) · no reply sent · heartbeat still fresh');
+  assert.equal(stale({ lk: 'stuck_suspected', since: 200 }).state, 'busy');
+});
+
+test('stale + last known: a reply since the wake, or an unknown reply status, is never a card', () => {
+  const replied = stale({ lk: 'working_silent', since: 900 }, { recent: [env(NAME, 'x', 'message', 100)] });
+  assert.equal(replied.state, 'busy');
+  assert.equal(replied.line, 'Health stale 15m (last known: silent turn) · replied since it woke');
+  const full = Array.from({ length: 25 }, (_, i) => env('claude-agenttalk-lead', 'operator', 'message', 60 + i * 10));
+  const unknown = stale({ lk: 'working_silent', since: 900 }, { recent: full });
+  assert.equal(unknown.state, 'busy');
+  assert.equal(unknown.line, 'Health stale 15m (last known: silent turn) · reply status unknown');
+});
+
+test('stale + last known with a stale heartbeat is a freshness problem, not a stuck agent', () => {
+  const v = stale({ lk: 'working_silent', since: 900, hb: 400 });
+  assert.deepEqual([v.state, v.stuck], ['unknown', null]);
+  assert.equal(v.line, 'Heartbeat stale 6m · not judged stuck');
+  assert.equal(stale({ lk: 'working_silent', since: 900, hb: 300 }).state, 'stuck');
+  assert.equal(stale({ lk: 'working_silent', since: 900, hb: 301 }).state, 'unknown');
+});
+
+test('stale + last known idle with a live heartbeat is still idle; without one it is unknown', () => {
+  const v = stale({ lk: 'idle_waiting', since: 2400 });
+  assert.deepEqual([v.state, v.tone, v.line, v.healthStale], ['idle', 'dim', 'Idle · 40m', true]);
+  const dead = stale({ lk: 'idle_waiting', since: 2400, hb: 900 });
+  assert.equal(dead.state, 'unknown');
+  assert.equal(dead.line, 'No fresh health · last known: idle (40m ago) · last seen 15m');
+});
+
+test('stale + last known in any other state stays unknown, and says what it last reported', () => {
+  const v = stale({ lk: 'crashed_or_exited', since: 600 });
+  assert.deepEqual([v.state, v.stuck], ['unknown', null]);
+  assert.equal(v.line, 'No fresh health · last known: crashed or exited (10m ago) · last seen 20s');
+  assert.equal(stale({ lk: 'rate_limited_or_outage', since: 600 }).state, 'unknown');
+});
+
+test('last_known_* is ignored unless valid: junk state, missing or unparseable times, a fresh health read', () => {
+  assert.equal(stale({ lk: 'bogus_state', since: 900 }).line, 'No fresh health · last seen 20s');
+  assert.equal(stale({ lk: '<img src=x onerror=alert(1)>', since: 900 }).state, 'unknown');
+  const noTimes = sillyStale({ lk: 'working_silent', since: 900 });
+  noTimes.health.last_known_updated_at = 'nope';
+  assert.equal(view(noTimes, { recent: WINDOW }).state, 'unknown');
+  const noSince = sillyStale({ lk: 'working_silent', since: 900 });
+  delete noSince.health.last_known_since;
+  assert.equal(view(noSince, { recent: WINDOW }).state, 'unknown');
+  // a fresh read never consults last_known_*
+  const fresh = agent(NAME, { state: 'idle_waiting', since: 60 });
+  fresh.health.last_known_state = 'working_silent';
+  fresh.health.last_known_since = iso(5000);
+  fresh.health.last_known_updated_at = iso(5000);
+  assert.equal(view(fresh).state, 'idle');
+});
+
+test('without last_known_* a stale read is exactly what it was: unknown, no card', () => {
+  const plain = sillyStale({ lk: null });
+  assert.deepEqual([view(plain).state, view(plain).line], ['unknown', 'No fresh health · last seen 20s']);
+});
+
+test('a team with idle agents whose health is stale (heartbeat newer) still reads as a quiet team', () => {
+  const agents = ['a', 'b', 'c'].map((x) => staleAgent('claude-agenttalk-developer-' + x.charCodeAt(0), { lk: 'idle_waiting', since: 3000 }));
+  const v = M.buildTeamView({ nowMs: NOW, generatedMs: NOW, root: root({ agents, recent: [env('x', 'y', 'message', 10)] }),
+    attention: attention([]), chat: null, conn: CONN_OK, ui: {}, tz: TZ });
+  assert.equal(v.mode, 'quiet');
+  assert.equal(v.greeting.sub.startsWith('Nothing needs you. 3 of 3 agents are idle'), true);
 });
 
 run();
