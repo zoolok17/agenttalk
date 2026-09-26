@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add the pure work-board reducer: validated envelopes become work items placed by
+  the design's precedence rows from explicit correlation only, with a counted legacy
+  group. No bodies, subjects or message-ID order are used; unknown is never green.
+
 - Validate work-item task flags and equivalent metadata, normalize correlated
   reply verdicts without inferring missing verdicts, and validate explicit
   build/review replacements. Align both lead skills with the work-item protocol.
