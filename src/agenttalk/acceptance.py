@@ -324,24 +324,37 @@ def project_id(project):
     return "git-" + _hash(payload)[:60]
 
 
-def prepare(store, plan_file, project_repo, revision, scope, lenses=()):
+def prepare(store, plan_file, project_repo, revision, scope, lenses=(), *, cache_root=None):
     """Validate before opening; immutable copies cannot clear a close on their own."""
     path = Path(plan_file).absolute()
     plan_bytes = _read(_path(path.parent, path.name))
-    plan = validate_plan(decode(plan_bytes))
+    raw = decode(plan_bytes)
+    preflight = isinstance(raw, dict) and schema(raw.get("schema_version")).preflight
+    if preflight:
+        from agenttalk import acceptance_staging
+        prepared = acceptance_staging.prepare(store, path, cache_root)
+        plan = prepared["plan"]
+    else:
+        if cache_root is not None:
+            _fail("cache root requires a schema-4 acceptance plan")
+        plan = validate_plan(raw)
+        prepared = None
     if plan["scope"] != scope:
         _fail("plan scope differs from close scope")
     partition_lenses(plan, lenses)
-    registry_bytes = _read(_path(path.parent, plan["registry_ref"]))
-    validate_registry(decode(registry_bytes))
-    if _hash(registry_bytes) != plan["registry_digest"]:
-        _fail("registry differs from plan pin", "acceptance_plan_stale")
+    if not preflight:
+        registry_bytes = _read(_path(path.parent, plan["registry_ref"]))
+        validate_registry(decode(registry_bytes))
+        if _hash(registry_bytes) != plan["registry_digest"]:
+            _fail("registry differs from plan pin", "acceptance_plan_stale")
     project = verify_project(project_repo, revision)
     if schema(plan["schema_version"]).modern and plan["project_id"] != project_id(project):
         _fail(f"project_id must be {project_id(project)} for this Git root set", "acceptance_project_unverified")
     if schema(plan["schema_version"]).cold:
         from agenttalk.acceptance_audit import change_identity
         change_identity(project, plan)
+    if prepared is not None:
+        return dict(prepared, project=project)
     return {"plan_hash": _retain(store, plan_bytes), "registry_hash": _retain(store, registry_bytes),
             "project": project, "plan": plan}
 
@@ -392,6 +405,9 @@ def freeze(store, close_id, prepared, at):
             route.update(cold_commit_hash=None, cold_reconcile_hash=None, obligations_hash=None)
         record["required_lenses"] = partition_lenses(plan, record["required_lenses"])
         record["acceptance_route"] = route
+        if schema(plan["schema_version"]).preflight:
+            from agenttalk import acceptance_staging
+            acceptance_staging.freeze(store, record, prepared)
         if schema(plan["schema_version"]).cold:
             from agenttalk import acceptance_obligations
             acceptance_obligations.inherit(store, record, plan, capture=True)
@@ -410,9 +426,14 @@ def _route(record):
         for key in ("cold_commit_hash", "cold_reconcile_hash"):
             if route.get(key) is not None:
                 _digest(route[key])
+    if schema(route.get("schema_version")).preflight:
+        from agenttalk import acceptance_staging
+        extra += " " + acceptance_staging.ROUTE_FIELDS
     _object(route, "schema_version attempt_id instance_id project_id revision project plan_hash "
             "registry_hash bundle_hash frozen_by frozen_at attached_by attached_at" + extra, "acceptance route")
-    _version(route["schema_version"], (1, 2, 3))
+    _version(route["schema_version"], (1, 2, 3, 4))
+    if schema(route["schema_version"]).preflight:
+        acceptance_staging.validate_route(route)
     if schema(route["schema_version"]).modern:
         if (route["parent_record_hash"] is None) != (route["amendment_hash"] is None):
             _fail("successor requires both parent record and amendment")
@@ -440,8 +461,13 @@ def _route(record):
 def _policy(store, record):
     route = _route(record)
     try:
-        plan = validate_plan(decode(_retained(store, route["plan_hash"])))
-        validate_registry(decode(_retained(store, route["registry_hash"])))
+        plan_bytes, registry_bytes = _retained(store, route["plan_hash"]), _retained(store, route["registry_hash"])
+        if schema(route["schema_version"]).preflight:
+            from agenttalk import acceptance_staging
+            plan = acceptance_staging.policy(store, route, plan_bytes, registry_bytes)
+        else:
+            plan = validate_plan(decode(plan_bytes))
+            validate_registry(decode(registry_bytes))
     except (OSError, AcceptanceError) as exc:
         raise AcceptanceError("acceptance_plan_stale", "frozen plan/registry invalid or missing") from exc
     if (plan["registry_digest"] != route["registry_hash"] or plan["project_id"] != route["project_id"]
@@ -455,8 +481,12 @@ def _bundle(bundle, record, route, plan):
     final = schema(route["schema_version"]).cold
     _object(bundle, "schema_version close_id instance_id attempt_id project_id revision plan_hash "
             "registry_hash runs rows artifacts" + (" verifier_access reproductions" if modern else "")
-            + (" recovery_approvals hygiene" if final else ""), "bundle")
+            + (" recovery_approvals hygiene" if final else "")
+            + (" preflight_observation" if schema(route["schema_version"]).preflight else ""), "bundle")
     _version(bundle["schema_version"], (route["schema_version"],))
+    if schema(route["schema_version"]).preflight:
+        from agenttalk import acceptance_registry
+        acceptance_registry.evidence_ref(bundle["preflight_observation"])
     for key in ("instance_id", "attempt_id", "project_id", "revision", "plan_hash", "registry_hash"):
         if bundle[key] != route[key]:
             _fail(f"bundle {key} mismatch", "acceptance_row_unbound")
@@ -529,6 +559,11 @@ def attach(store, close_id, bundle_file, *, by, at):
     path = Path(bundle_file).absolute()
     data = _read(_path(path.parent, path.name))
     bundle = decode(data)
+    staging = None
+    if isinstance(bundle, dict) and schema(bundle.get("schema_version")).preflight:
+        from agenttalk import acceptance_staging
+        # Hash staged distributions before taking the store-wide writer lock.
+        staging = acceptance_staging.prepare_attachment(store, close_id, path, bundle)
     with close.close_transaction(store, close_id) as transaction:
         record = transaction.record
         if record["status"] == close.PUBLISHED:
@@ -566,6 +601,8 @@ def attach(store, close_id, bundle_file, *, by, at):
                 actual = _read(_path(store.messages_dir, reduction["decision_ref"] + ".json"))
                 if _hash(actual) != artifacts[item["approval_artifact"]]["sha256"]:
                     _fail("recovery approval differs from operator record", "acceptance_scope_reduction_unapproved")
+        if schema(route["schema_version"]).preflight:
+            route["preflight_attach_hash"] = acceptance_staging.attach(store, record, staging)
         route["bundle_hash"] = _retain(store, data)
         route.update(attached_by=by, attached_at=at)
         close._event(record, "acceptance:attach", by, at, bundle_hash=route["bundle_hash"])
@@ -606,6 +643,9 @@ def resolve(store, record, *, live=False):
     snapshot = {"holds": [], "outcomes": []}
     try:
         route, plan = _policy(store, record)
+        if schema(route["schema_version"]).preflight:
+            from agenttalk import acceptance_staging
+            return acceptance_staging.pending_snapshot(store, record)
         # Schema-1 records preserve their original strict-live contract. Schema 2
         # reads historical objects; open, attach and GO publish check live state.
         project = verify_project(route["project"]["locator"], record["revision"],
@@ -700,6 +740,8 @@ def ack_binding(record):
     keys = ["instance_id", "attempt_id", "revision", "plan_hash", "registry_hash", "bundle_hash"]
     if schema(route.get("schema_version")).cold:
         keys.extend(["cold_commit_hash", "cold_reconcile_hash", "obligations_hash"])
+    if schema(route.get("schema_version")).preflight:
+        keys.extend(["environment_hash", "preflight_open_hash", "preflight_attach_hash"])
     return {key: route.get(key) for key in keys}
 
 

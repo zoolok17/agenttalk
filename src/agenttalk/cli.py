@@ -3589,11 +3589,11 @@ def cmd_close(args: argparse.Namespace) -> int:
                         "acceptance requires --project-repo and forbids force/dirty overrides")
                 prepared = acceptance.prepare(
                     store, args.acceptance_plan, args.project_repo, args.revision, args.scope,
-                    _close_lens_specs(args))
+                    _close_lens_specs(args), cache_root=getattr(args, "cache_root", None))
                 revision, kind = prepared["project"]["revision"], "sha"
             else:
-                if getattr(args, "project_repo", None):
-                    raise close_mod.CloseError("--project-repo requires --acceptance-plan")
+                if getattr(args, "project_repo", None) or getattr(args, "cache_root", None):
+                    raise close_mod.CloseError("--project-repo/--cache-root requires --acceptance-plan")
                 revision, kind = _resolve_revision(store.root, args.revision)
         except close_mod.CloseError as e:
             code = getattr(e, "code", None)
@@ -14935,6 +14935,7 @@ def build_parser() -> argparse.ArgumentParser:
     copen.add_argument("--acceptance-plan",
                        help="Freeze a strict acceptance plan; schema 3 supports verified cooperative GO.")
     copen.add_argument("--project-repo", help="Actual project checkout to verify for acceptance.")
+    copen.add_argument("--cache-root", help="Private fully resolved staged-cache root for a schema-4 plan.")
     copen.add_argument("--lens", action="append", help="Required lens id (repeatable).")
     copen.add_argument("--optional-lens", action="append", help="Optional lens id (repeatable).")
     copen.add_argument("--allow", action="append",

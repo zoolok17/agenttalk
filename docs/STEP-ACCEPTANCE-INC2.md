@@ -734,3 +734,133 @@ purpose stated: address data only, never a socket binding. Ruff S104 also applie
 The advice regression was red first (1 failed, 14 passed); the initial scratch-parent
 setup error is excluded. Registry/preflight suites pass on 3.10 and 3.14:
 337 passed, 3 skipped each. Ruff and Bandit cover all changed Python files.
+
+### M3a capability dispatch and lifecycle capture
+
+M2c is commit `33d3770`; the required second commit, `fbdf63f`, replaces all
+31 inventoried predicates with `acceptance_schema.capabilities` (33 calls because
+two predicates compare both operands). The table is closed: integer schemas 1–4
+map to explicit modern/cold/preflight capabilities; unknown integers, booleans,
+strings and absent versions refuse with `acceptance_policy_invalid`. Existing
+closed record-shape/version validators remain in their own namespaces. Schema 4
+does not imply that registry, raw-result, cold-report or close-envelope versions
+also become 4. The inventory test walks each named reader, checks its dispatch
+sites and exercises unknown-version refusal. Schemas 1–3 keep their prior rules.
+
+`close open` now accepts `--cache-root` only with a schema-4 acceptance plan.
+Import validates the strict registry/plan pair, exact registry digest, environment
+entry references, cache-relative pin paths and the private root before creating
+a usable route. Dot-dot locators and detected links/reparse ancestors refuse;
+a syntactically valid missing cache or pin is an unavailable prerequisite instead.
+The operator must supply a fully resolved root. No acquisition or execution occurs.
+The existing transaction freezes the verified project, plan, registry, environment
+expectations, root locator and initial report. Initial absent offline proof,
+missing/changed staged bytes and expired snapshots produce bound HOLD evidence;
+they do not prevent opening a syntactically valid attempt.
+
+The schema-4 route extends schema 3 with exactly these fields:
+
+| Field | Meaning |
+| --- | --- |
+| `cache_root` | Private bounded locator; confined to the private route. |
+| `environment_hash` | Retained canonical planned environment JSON. |
+| `preflight_open_hash` | Retained initial report capsule, required at freeze. |
+| `preflight_attach_hash` | Retained observation/proof report capsule; null until bundle attachment. |
+
+Schema-4 bundles add one required `preflight_observation` reference with exactly
+`path`, `sha256` and integer `size`. Its UTF-8 JSON envelope has exactly
+`schema_version: 1`, `binding` and `observation`. `binding` is the exact object
+containing `close_id`, `instance_id`, `attempt_id`, `project_id`, `revision`,
+`plan_hash` and `registry_hash`. `observation` uses the M1 observation grammar.
+Envelope paths and the observation's banner/log/override paths are relative to
+the supplied bundle's directory, separately from the staged distribution cache.
+An extra submitted pass flag cannot replace evaluator output. An invalid envelope
+or digest/binding mismatch refuses attachment; invalid or failing observation
+evidence is retained with the evaluator's non-green outcome.
+
+Attachment hashes staged inputs before the close transaction, then checks that
+the route used for evaluation is still the route being attached. It recomputes
+against the frozen policy and captures the bytes actually read, including bounded
+mismatching declarative evidence. The existing transaction publishes the immutable
+bundle and its preflight capsule together. A second attachment cannot overwrite
+them. Pin changes require a successor with a new plan/registry binding; schema-4
+successor and publication behavior are part of M3b, not enabled by this checkpoint.
+
+Each retained capsule has exactly `schema_version: 1`, `binding`, `report`,
+`observation_hash` (null at open), and `inputs`. Each captured input has the public
+`ref`, its actual `sha256`, and integer `size`. Reports and capsules use bounded
+strict JSON; each retained blob is at most 1 MiB. Existing evaluator budgets limit
+registry declarative bytes, planned overrides, and observed proof/override bytes
+to 16 MiB each. Distribution chunks are never added to the capture list, copied
+into the store, or treated as retained evidence. The capsule binds observations to
+the frozen attempt without a self-referential hash. Ack bindings include the new
+environment and report hashes, never the root locator.
+
+This is an intermediate review checkpoint, not a complete schema-4 GO path.
+`resolve` exposes the retained staging snapshot and an explicit
+`acceptance_preflight_unavailable` milestone HOLD. It verifies retained capsule
+bindings and bytes; it does not reuse a captured pass as a publication decision.
+M3b must replace this guard with fresh evaluation, outside-lock distribution
+hashing plus inside-lock stat checks, sealed-source/hygiene/inheritance handling,
+historical D1 display, downgrade/LD2 tests, and the operator walkthrough. That
+walkthrough retains the agreed PowerShell UTF-8 guidance. No PR opens at M3a.
+
+### M3a executed evidence
+
+The new schema-dispatch tests first failed because the helper did not exist
+(2 failed); after implementation they passed (2 passed). The four initial open
+regressions failed before lifecycle code because `--cache-root` was unsupported.
+The isolated first integration run exposed a new test expectation error: malformed
+observations are refused before their proof files are read. The corrected test
+asserts that those files are absent from capture while the report remains `fail`.
+No shipped acceptance assertion was changed.
+
+The reviewer's unchanged M2b reference-mutation selection (R1–R13), run against
+an isolated source copy, produced **13 killed, 0 survived, 0 skipped**. This closes
+the eleven surviving reference mutants and retains the two previously killed
+controls. The mutation sources were restored; working/reviewer sources were not
+mutated. Logs, isolated source copies and fixture roots remain in task scratch
+for the cold reader. Only targeted files are run; no full suite or staged tools.
+
+Additional failing-first checks found and closed three retained-manifest syntax
+gaps (3 failed, 1 passed before the guards), three stored-locator syntax gaps
+(3 failed), and a legacy scope/registry diagnostic-order regression in the initial
+integration (1 failed). Final route validation checks syntax without requiring a
+historical cache to exist. Captured-input manifests bound IDs, integer sizes,
+optional hashes and item count (at most 896 from the existing file/entry limits).
+The race test injects cold commitment between evaluation and attachment: attachment
+refuses and neither bundle nor preflight-attachment hash is published. A separate
+test rejects an incomplete bundle/report pair. Windows privacy assertions check
+the JSON-escaped locator as well as plain diagnostic output.
+
+Executed commands use workspace `PYTHONPATH=<checkout>/src`,
+`PYTHONDONTWRITEBYTECODE=1`, `-q -p no:cacheprovider` and separate task-scratch
+`--basetemp` roots. Long-lived testing of the dispatcher kept its source unchanged;
+integration experiments used an isolated source copy, followed by final workspace
+runs. No completed invocation is described as running on a different source state.
+
+| Check | Result |
+| --- | --- |
+| Python 3.10, dispatcher checkpoint: `-m pytest tests/test_acceptance_schema.py tests/test_acceptance.py tests/test_close.py` | 792 passed, 1 skipped; 2142.90 s. Complete invocation, including the full change/ordering obligation table. |
+| Python 3.10, final workspace: `-m pytest tests/test_acceptance_registry.py tests/test_acceptance_preflight.py tests/test_acceptance_schema.py tests/test_acceptance_staging.py` | 379 passed, 3 skipped; 38.79 s. |
+| Python 3.14, same final workspace file list | 379 passed, 3 skipped; 37.78 s. |
+
+The three platform skips are unchanged: one host-restricted symlink case and two
+POSIX-only cases. Ruff checks all ten changed production modules and all three
+changed test files. Bandit checks the same production modules, plus the test files
+with `-s B101` for pytest assertions. All exit zero with no findings; existing
+suppression-comment warnings remain. Intermediate test-harness corrections
+(invalid observation capture expectation and attach exit code 2) remain in scratch
+logs and are excluded from the final passing counts. The initial open red run and
+all later green runs use synthetic staging, never actual checker/tool launches.
+
+The final workspace legacy selection is
+`-m pytest tests/test_acceptance.py tests/test_close.py tests/test_close_signoffs.py tests/test_gates.py`
+with `-k 'publish or successor or lock or serialization or enumeration or transaction or legacy or reopen or replaced_instance'`.
+Python 3.10: **84 passed, 805 deselected in 124.29 s**. Python 3.14:
+**84 passed, 805 deselected in 112.60 s**. Together with the final new-file run,
+each interpreter covers **463 passing cases and 3 platform skips**. These are
+aggregate counts across two completed targeted invocations, not a full-suite run.
+Patch whitespace passes. The added-line privacy sweep detects all eight positive
+controls and finds zero matches. The complete M3a diff remains below 1500 changed
+lines even including the test tables. M3a stops here for the lead's cold read.
