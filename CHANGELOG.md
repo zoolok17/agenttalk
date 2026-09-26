@@ -10,8 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - Add isolated acceptance increment-2 strict registry/environment/proof record
-  readers and bounded declarative-input validation. Schema-4 publication awaits
-  a later milestone; no new GO path is enabled. See
+  readers and bounded declarative-input validation. See
   `docs/STEP-ACCEPTANCE-INC2.md` for limits and retention decisions.
 - Tighten increment-2 staged-input records with per-toolchain/service banner
   pins, explicit environment entry references, and expiring manifests for large
@@ -30,7 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   report; `close acceptance attach` recomputes bound observation/proof evidence.
   Retain bounded declarative inputs while leaving distribution binaries pinned
   in the operator's cache. Private cache locators stay out of public snapshots.
-  Live check/publication integration remains pending; schema-4 GO stays blocked.
+- Re-evaluate schema-4 prerequisites at check and publication, hash distributions
+  before the shared lock and recheck file identity inside it. Seal retained
+  inputs, preserve them across recovery, and support schema-4 successors with
+  protected registry requirements. Historical binaries remain digest-pinned,
+  visibly not retained. Add a synthetic Java staging walkthrough.
 
 ### Changed
 

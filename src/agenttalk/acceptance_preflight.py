@@ -128,10 +128,11 @@ def _offline(entry, observed, lines):
     return [{**error, "ref": entry["id"]} for error in errors]
 
 
-def _environment(environment, root, registry, budget, capture=None, *, role="planned"):
+def _environment(environment, root, registry, budget, capture=None, *, role="planned", reader=None):
+    reader = reader or _read_pin
     errors = []
     for row in environment["row_overrides"]:
-        data, issues = _read_pin(root, row["environment"], budget, evidence=True, public_ref=row["id"],
+        data, issues = reader(root, row["environment"], budget, evidence=True, public_ref=row["id"],
                                  capture=capture, capture_role=role)
         errors.extend(issues)
         if data is not None:
@@ -145,13 +146,14 @@ def _environment(environment, root, registry, budget, capture=None, *, role="pla
 
 
 def evaluate(plan_bytes, registry_bytes, cache_root, *, observation_bytes=None, proof_root=None,
-             decision_at=None, capture=None):
+             decision_at=None, capture=None, reader=None):
     """Evaluate current pins and supplied proof using one injected UTC decision time.
 
     The caller freezes/retains results in M3. This function performs no writes and
     does not produce an acceptance GO; every required entry must pass preflight.
     """
     plan, registry = R.policy(plan_bytes, registry_bytes)
+    reader = reader or _read_pin
     now = decision_at if decision_at is not None else decision_time()
     if not isinstance(now, datetime) or now.utcoffset() != timedelta(0) or now.microsecond:
         A._fail("decision clock must be UTC at whole-second precision")
@@ -172,16 +174,16 @@ def evaluate(plan_bytes, registry_bytes, cache_root, *, observation_bytes=None, 
     elif registry["entries"]:
         common.append(hold(UNPROVEN, "preflight observation and offline proof are absent"))
     proof_budget = [R.MAX_TOTAL_BYTES]
-    common.extend(_environment(plan["environment"], cache_root, registry, [R.MAX_TOTAL_BYTES], capture))
+    common.extend(_environment(plan["environment"], cache_root, registry, [R.MAX_TOTAL_BYTES], capture, reader=reader))
     if observed is not None:
         common.extend(_environment(observed["environment"], proof_root, registry, proof_budget,
-                                   capture, role="observed"))
+                                   capture, role="observed", reader=reader))
     observation_time = R.utc(observed["observed_at"]) if observed is not None else now
     files, file_errors, manifests = {}, {}, []
     distribution_budget, declarative_budget = [MAX_SCAN_BYTES], [R.MAX_TOTAL_BYTES]
     for pin in registry["files"]:
         distribution = pin["role"] == "distribution"
-        _, issues = _read_pin(cache_root, pin, distribution_budget if distribution else declarative_budget,
+        _, issues = reader(cache_root, pin, distribution_budget if distribution else declarative_budget,
                               distribution=distribution, capture=capture)
         if pin["provenance"] is not None and R.utc(pin["provenance"]["retrieved_at"]) > observation_time:
             issues.append(hold(MISMATCH, "provenance retrieval is after observation time", pin["id"]))
@@ -210,10 +212,10 @@ def evaluate(plan_bytes, registry_bytes, cache_root, *, observation_bytes=None, 
         if actual is not None:
             if actual["version"] != entry["version"]:
                 issues.append(hold(MISMATCH, "observed entry version differs from pin", entry["id"]))
-            banner, errors = _read_pin(proof_root, actual["banner"], proof_budget,
+            banner, errors = reader(proof_root, actual["banner"], proof_budget,
                                       evidence=True, public_ref=entry["id"], capture=capture, capture_role="banner")
             issues.extend(errors)
-            log, errors = _read_pin(proof_root, actual["offline"]["log"], proof_budget,
+            log, errors = reader(proof_root, actual["offline"]["log"], proof_budget,
                                    evidence=True, public_ref=entry["id"], capture=capture, capture_role="log")
             issues.extend(errors)
             try:

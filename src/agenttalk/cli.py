@@ -2968,7 +2968,7 @@ def _build_signoff_eval(store, record: dict):
             "active_agents": active}
 
 
-def _build_dod_eval(store, record: dict, *, acceptance_live=None):
+def _build_dod_eval(store, record: dict, *, acceptance_live=None, preflight_scan=None):
     """Resolve the #60 Definition-of-Done evidence (IMPURE) into the bundle
     :func:`close.evaluate_dod` consumes (PURE). ``None`` when the close's scope has no DoD
     requirements (byte-identical to pre-#60). Fails closed via ``policy_error`` on a malformed
@@ -2992,7 +2992,7 @@ def _build_dod_eval(store, record: dict, *, acceptance_live=None):
         bundle["knowledge"] = _resolve_dod_knowledge(store, dims["knowledge"], record)
     if "acceptance" in dims:
         from agenttalk import acceptance
-        bundle["acceptance"] = acceptance.resolve(store, record, live=acceptance_live)
+        bundle["acceptance"] = acceptance.resolve(store, record, live=acceptance_live, preflight_scan=preflight_scan)
     return bundle
 
 
@@ -3686,7 +3686,8 @@ def cmd_close(args: argparse.Namespace) -> int:
                     raise close_mod.CloseError("successor requires plan, project, revision and amendment reason")
                 record = successor(store, parent_id=args.parent, close_id=args.id, plan_file=args.acceptance_plan,
                                    project_repo=args.project_repo, revision=args.revision, by=actor, at=_iso_now(),
-                                   reason=args.reason, reduction_file=args.scope_reduction)
+                                   reason=args.reason, reduction_file=args.scope_reduction,
+                                   cache_root=getattr(args, "cache_root", None))
                 print(f"opened acceptance successor {record['close_id']} of {args.parent}")
                 return 0
             digest = acceptance.attach(store, args.id, args.file, by=actor, at=_iso_now())
@@ -3845,6 +3846,9 @@ def cmd_close(args: argparse.Namespace) -> int:
         dod_eval = (_build_dod_eval(store, rec, acceptance_live=rec.get("status") != close_mod.PUBLISHED)
                     if isinstance(record, dict) else None)
         result = close_mod.compute_verdict(rec, gate_check, signoff_eval, worktree_eval, dod_eval)
+        preflight = ((dod_eval or {}).get("acceptance") or {}).get("preflight")
+        if preflight is not None:
+            result["preflight"] = preflight
         if "acceptance_route" in rec:
             result["acceptance_evaluation"] = ("historical; not GO-publication eligibility"
                                                if rec.get("status") == close_mod.PUBLISHED else "live candidate")
@@ -3858,6 +3862,8 @@ def cmd_close(args: argparse.Namespace) -> int:
             _print_verdict(args.id, result)
             if "acceptance_evaluation" in result:
                 print("acceptance evaluation: " + result["acceptance_evaluation"])
+            for item in (preflight or {}).get("historical", []):
+                print(f"  {item['id']}: {item['status']}")
         return 0 if result["verdict"] == close_mod.VERDICT_GO else 3
 
     if action == "publish":
@@ -3866,6 +3872,8 @@ def cmd_close(args: argparse.Namespace) -> int:
         verdict = close_mod.VERDICT_GO if args.verdict == "go" else close_mod.VERDICT_HOLD
         barrier_epoch = None
         try:
+            from agenttalk import acceptance_live
+            preflight_scan = acceptance_live.prepare(store, close_mod.load_close(store, args.id)) or {"failure": True}
             # Lock order: acceptance writer -> close-ID -> config (if needed).
             # Close, gate, knowledge and config-backed signoff writers all join
             # the outer lock; keep it from discovery through durable GO and the
@@ -3893,7 +3901,8 @@ def cmd_close(args: argparse.Namespace) -> int:
                         store.root, scope=record.get("gate_scope"))
                     signoff_eval = _build_signoff_eval(store, record)
                     worktree_eval = _close_worktree_eval(store, record)
-                    dod_eval = _build_dod_eval(store, record, acceptance_live=verdict == close_mod.VERDICT_GO)
+                    dod_eval = _build_dod_eval(store, record, acceptance_live=verdict == close_mod.VERDICT_GO,
+                                               preflight_scan=preflight_scan)
                     record["worktree_isolation"] = worktree_eval
                     result = close_mod.compute_verdict(
                         record, gate_check, signoff_eval, worktree_eval, dod_eval)
@@ -14980,6 +14989,7 @@ def build_parser() -> argparse.ArgumentParser:
     csucc.add_argument("--parent", required=True)
     csucc.add_argument("--acceptance-plan", required=True)
     csucc.add_argument("--project-repo", required=True)
+    csucc.add_argument("--cache-root", help="Absolute private staged-cache root required for a schema-4 successor.")
     csucc.add_argument("--revision", required=True)
     csucc.add_argument("--reason", required=True)
     csucc.add_argument("--scope-reduction", help="Structured amendment with an actual operator decision reference.")

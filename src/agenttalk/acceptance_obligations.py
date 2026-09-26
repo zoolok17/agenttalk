@@ -53,6 +53,9 @@ def evidence(store, route):
     for digest, prior, old_route, plan in sources(store, route):
         digests.add(digest)
         digests.update(v for k, v in old_route.items() if k.endswith("_hash") and v)
+        if A.schema(old_route["schema_version"]).preflight:
+            from agenttalk import acceptance_staging
+            digests.update(acceptance_staging.evidence(store, prior))
         if old_route.get("bundle_hash"):
             bundle = A.decode(A._retained(store, old_route["bundle_hash"]))
             rows, artifacts = A._bundle(bundle, prior, old_route, plan)

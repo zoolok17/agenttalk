@@ -42,8 +42,8 @@ def open_candidate(case):
     return legacy.open_attempt(case, "--cache-root", str(case["stage"]["root"]))
 
 
-def record(case):
-    return close.load_close(case["store"], "attempt")
+def record(case, close_id="attempt"):
+    return close.load_close(case["store"], close_id)
 
 
 def capsule(case, phase="open"):
@@ -51,20 +51,24 @@ def capsule(case, phase="open"):
     return A.decode(A._retained(case["store"], route[f"preflight_{phase}_hash"]))
 
 
-def attachment(case, change=None, *, commit=True):
+def attachment(case, change=None, *, commit=True, close_id="attempt"):
     from agenttalk import acceptance_staging as staging
     if commit:
-        assert legacy.cold_phase(case, "commit") == 0
+        assert legacy.cold_phase(case, "commit", close_id, actor=case["plan"]["cold_policy"]["reviewer"]) == 0
     data = legacy.bundle_v2(case)
     data["schema_version"] = 4
+    data.update(close_id=close_id, **{
+        k: record(case, close_id)["acceptance_route"][k] for k in
+        ("instance_id", "attempt_id", "revision", "plan_hash", "registry_hash", "project_id")})
     legacy.hygiene_bundle(case, data)
-    envelope = {"schema_version": 1, "binding": staging.binding(record(case)),
+    envelope = {"schema_version": 1, "binding": staging.binding(record(case, close_id)),
                 "observation": deepcopy(case["stage"]["observation"])}
     if change:
         change(envelope)
     path = case["inputs"] / "preflight.json"
     digest = legacy.write_json(path, envelope)
     data["preflight_observation"] = {"path": path.name, "sha256": digest, "size": path.stat().st_size}
+    legacy.hygiene_bundle(case, data)
     for entry in envelope["observation"]["entries"]:
         for ref in (entry["banner"], entry["offline"]["log"]):
             shutil.copyfile(case["stage"]["root"] / ref["path"], case["inputs"] / ref["path"])
@@ -182,14 +186,14 @@ def test_schema4_attach_binding_must_match(candidate, key):
     assert route["bundle_hash"] is route["preflight_attach_hash"] is None
 
 
-def test_schema4_public_snapshot_private_locator_and_m3a_go_guard(candidate):
+def test_schema4_public_snapshot_private_locator_and_cold_guard(candidate):
     assert open_candidate(candidate) == 0
     attachment(candidate)
     assert legacy.attach(candidate) == 0
     result = A.resolve(candidate["store"], record(candidate), live=True)
     encoded_locator = json.dumps(str(candidate["stage"]["root"]))[1:-1]
     assert encoded_locator not in json.dumps(result)
-    assert P.UNAVAILABLE in {code for code, _ in A.evaluate(result)}
+    assert "acceptance_cold_missing" in {code for code, _ in A.evaluate(result)}
     assert legacy.command(candidate, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go") == 3
 
 
@@ -372,11 +376,14 @@ def test_capture_nested_structure_and_observation_are_revalidated(candidate, fau
 
 @pytest.mark.parametrize("fault", ["ref-field", "version"])
 def test_attachment_closed_ref_and_envelope_version(candidate, fault):
+    from agenttalk import acceptance_staging as staging
     assert open_candidate(candidate) == 0
     data = attachment(candidate, (lambda e: e.update(schema_version=2)) if fault == "version" else None)
     if fault == "ref-field":
         data["preflight_observation"]["unexpected"] = True
         legacy.write_json(candidate["inputs"] / "bundle.json", data)
+    with pytest.raises(A.AcceptanceError):
+        staging.prepare_attachment(candidate["store"], "attempt", candidate["inputs"] / "bundle.json", data)
     assert legacy.attach(candidate) == 2
 
 
@@ -393,10 +400,8 @@ def test_legacy_open_refuses_cache_argument(case_v3):
 
 
 def test_project_input_link_keeps_typed_refusal(tmp_path, monkeypatch):
-    import stat
-    from types import SimpleNamespace
     from pathlib import Path
-    monkeypatch.setattr(Path, "lstat", lambda self: SimpleNamespace(st_mode=stat.S_IFLNK, st_file_attributes=0))
+    monkeypatch.setattr(Path, "is_symlink", lambda self: True)
     with pytest.raises(A.LinkedPathError):
         A._path(tmp_path, "plan.json")
 
@@ -416,3 +421,205 @@ def test_capture_retains_both_environment_roles_and_banner(staged):
     refs = [ref for ref, _ in captured]
     assert len(set(refs)) == len(refs)
     assert {"build:planned", "build:observed", "java:banner", "java:log"} <= set(refs)
+
+
+def complete(candidate):
+    assert open_candidate(candidate) == 0
+    data = attachment(candidate)
+    assert legacy.attach(candidate) == 0
+    assert legacy.cold_phase(candidate, "reconcile") == 0
+    legacy.final_accepts(candidate, data)
+
+
+def test_schema4_live_check_and_publish_reach_go(candidate):
+    complete(candidate)
+    assert legacy.command(candidate, "check", "--id", "attempt") == 0
+    assert legacy.command(candidate, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go") == 0
+    saved = record(candidate)["final"]["acceptance_snapshot"]
+    assert "status" not in saved["preflight"]
+
+
+@pytest.mark.parametrize("fault", ["mutation", "deletion", "expiry"])
+def test_schema4_live_prerequisites_rechecked_before_go(candidate, monkeypatch, fault):
+    from datetime import timedelta
+    complete(candidate)
+    assert legacy.command(candidate, "check", "--id", "attempt") == 0
+    path = candidate["stage"]["root"] / "jdk.dat"
+    if fault == "mutation":
+        path.write_bytes(b"changed staged bytes")
+    elif fault == "deletion":
+        path.unlink()
+    else:
+        monkeypatch.setattr(P, "decision_time", lambda: preflight.NOW + timedelta(days=400))
+    assert legacy.command(candidate, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go") == 3
+    assert record(candidate)["status"] != close.PUBLISHED
+
+
+def test_publish_hashes_outside_lock_and_checks_metadata_inside(candidate, monkeypatch):
+    from agenttalk import acceptance_live
+    complete(candidate)
+    read, recheck = P._read_pin, acceptance_live.recheck
+    reads, checks = [], []
+    def observed_read(*args, **kwargs):
+        assert not getattr(close._writer_locks, "held", set())
+        reads.append(True)
+        return read(*args, **kwargs)
+    def observed_recheck(*args, **kwargs):
+        assert getattr(close._writer_locks, "held", set())
+        checks.append(True)
+        return recheck(*args, **kwargs)
+    monkeypatch.setattr(P, "_read_pin", observed_read)
+    monkeypatch.setattr(acceptance_live, "recheck", observed_recheck)
+    assert legacy.command(candidate, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go") == 0
+    assert reads and checks
+
+
+@pytest.mark.parametrize("fault", ["changed", "missing", "expired", "route"])
+def test_publish_rechecks_after_hashing_before_durable_go(candidate, monkeypatch, fault):
+    from contextlib import contextmanager
+    from datetime import timedelta
+    complete(candidate)
+    original = close.close_transaction
+    @contextmanager
+    def after_hash(*args, **kwargs):
+        path = candidate["stage"]["root"] / "jdk.dat"
+        if fault == "changed":
+            path.write_bytes(b"changed at publication boundary")
+        elif fault == "missing":
+            path.unlink()
+        elif fault == "expired":
+            monkeypatch.setattr(P, "decision_time", lambda: preflight.NOW + timedelta(days=400))
+        with original(*args, **kwargs) as tx:
+            if fault == "route":
+                tx.record["acceptance_route"]["cache_root"] += "/changed"
+            yield tx
+    monkeypatch.setattr(close, "close_transaction", after_hash)
+    assert legacy.command(candidate, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go") == 3
+    assert record(candidate)["status"] != close.PUBLISHED
+
+
+def test_historical_cache_absence_is_visible_without_rewriting_verdict(candidate, capsys):
+    complete(candidate)
+    assert legacy.command(candidate, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go") == 0
+    (candidate["stage"]["root"] / "jdk.dat").unlink()
+    result = A.resolve(candidate["store"], record(candidate))
+    historical = result["preflight"]["historical"]
+    assert historical and all(p["status"] == "artifact not retained, pinned by digest" for p in historical)
+    assert not A.evaluate(result)
+    assert record(candidate)["final"]["verdict"] == "GO"
+    capsys.readouterr()
+    assert legacy.command(candidate, "check", "--id", "attempt", "--json") == 3  # already published
+    assert json.loads(capsys.readouterr().out)["preflight"]["historical"] == historical
+
+
+def test_preflight_seal_includes_all_retained_inputs(candidate):
+    from agenttalk import acceptance_staging as staging
+    complete(candidate)
+    result = A.resolve(candidate["store"], record(candidate))
+    route = record(candidate)["acceptance_route"]
+    expected = {route[key] for key in ("environment_hash", "preflight_open_hash", "preflight_attach_hash")}
+    for phase in ("open", "attach"):
+        captured = capsule(candidate, phase)
+        expected.update(item["sha256"] for item in captured["inputs"])
+        if captured["observation_hash"]:
+            expected.add(captured["observation_hash"])
+    assert staging.evidence(candidate["store"], record(candidate)) == expected
+    assert expected <= set(result["hygiene"]["sealed_manifest"])
+    digest = capsule(candidate, "attach")["inputs"][-1]["sha256"]
+    (candidate["store"].dir / "acceptance" / "sha256" / digest).unlink()
+    assert legacy.command(candidate, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go") == 3
+
+
+def test_schema4_successor_hashes_before_parent_lock(candidate, monkeypatch):
+    complete(candidate)
+    legacy.publish_hold(candidate)
+    original = P._read_pin
+    calls = []
+    def read(*args, **kwargs):
+        assert not getattr(close._writer_locks, "held", set())
+        calls.append(True)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(P, "_read_pin", read)
+    assert legacy.command(candidate, "acceptance", "successor", "--id", "next", "--parent", "attempt",
+                          "--from", "lead", "--acceptance-plan", str(candidate["inputs"] / "plan.json"),
+                          "--project-repo", str(candidate["project"]), "--revision", candidate["sha"],
+                          "--cache-root", str(candidate["stage"]["root"]), "--reason", "fresh attempt") == 0
+    assert calls
+    assert A.schema(close.load_close(candidate["store"], "next")["acceptance_route"]["schema_version"]).preflight
+
+
+def test_ld2_preserves_registry_requirements(candidate):
+    from agenttalk import acceptance_coverage as coverage
+    protected = coverage.group(candidate["plan"]["rows"])
+    plan = deepcopy(candidate["plan"])
+    for row in plan["rows"]:
+        row["registry_entries"] = []
+    assert coverage.changes(protected, plan)
+
+
+def test_schema4_route_cannot_downgrade_to_schema3(candidate):
+    complete(candidate)
+    value = record(candidate)
+    value["acceptance_route"]["schema_version"] = 3
+    assert A.evaluate(A.resolve(candidate["store"], value))
+
+
+def test_documented_java_staging_example(tmp_path, monkeypatch):
+    import runpy
+    from pathlib import Path
+    example = Path(__file__).parents[1] / "docs" / "examples"
+    runpy.run_path(str(example / "stage_acceptance.py"))["stage"](tmp_path)
+    assert json.loads((tmp_path / "registry.json").read_text(encoding="utf-8")) == json.loads(
+        (example / "java-registry.json").read_text(encoding="utf-8"))
+    monkeypatch.setattr(P, "decision_time", lambda: preflight.NOW)
+    result = P.evaluate((tmp_path / "plan.json").read_bytes(), (tmp_path / "registry.json").read_bytes(),
+                        tmp_path, observation_bytes=(tmp_path / "observation.json").read_bytes())
+    assert result["status"] == "pass"
+    (tmp_path / "jdk-21.zip").unlink()
+    result = P.evaluate((tmp_path / "plan.json").read_bytes(), (tmp_path / "registry.json").read_bytes(),
+                        tmp_path, observation_bytes=(tmp_path / "observation.json").read_bytes())
+    assert result["status"] == "not-run"
+    assert (P.UNAVAILABLE, "jdk") in {(h["code"], h["ref"]) for h in result["holds"]}
+
+
+def test_schema4_successor_retains_history_and_can_reach_go(candidate):
+    from agenttalk import acceptance_staging as staging
+    complete(candidate)
+    legacy.publish_hold(candidate)
+    old_evidence = staging.evidence(candidate["store"], record(candidate))
+    legacy.assign_fresh_cold(candidate, "next-cold")
+    save(candidate)
+    assert legacy.command(candidate, "acceptance", "successor", "--id", "next", "--parent", "attempt",
+                          "--from", "lead", "--acceptance-plan", str(candidate["inputs"] / "plan.json"),
+                          "--project-repo", str(candidate["project"]), "--revision", candidate["sha"],
+                          "--cache-root", str(candidate["stage"]["root"]), "--reason", "fresh attempt") == 0
+    data = attachment(candidate, close_id="next")
+    assert legacy.command(candidate, "acceptance", "attach", "--id", "next", "--from", "lead",
+                          "--file", str(candidate["inputs"] / "bundle.json")) == 0
+    assert legacy.cold_phase(candidate, "reconcile", "next", actor="next-cold") == 0
+    legacy.final_accepts(candidate, data, "next")
+    result = A.resolve(candidate["store"], record(candidate, "next"))
+    assert old_evidence <= set(result["hygiene"]["sealed_manifest"])
+    assert legacy.command(candidate, "publish", "--id", "next", "--from", "lead", "--verdict", "go") == 0
+
+
+def test_staged_change_during_hashing_is_not_a_verified_read(candidate, monkeypatch):
+    from pathlib import Path
+    complete(candidate)
+    original = P._read_pin
+    def changed(root, pin, budget, **kwargs):
+        result = original(root, pin, budget, **kwargs)
+        if pin.get("id") == "jdk":
+            (Path(root) / pin["path"]).write_bytes(b"changed during hashing")
+        return result
+    monkeypatch.setattr(P, "_read_pin", changed)
+    assert legacy.command(candidate, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go") == 3
+
+
+def test_conflicting_lens_assignment_refuses_before_evaluation(candidate, monkeypatch):
+    calls = []
+    monkeypatch.setattr(P, "evaluate", lambda *a, **k: calls.append(True))
+    lens = "acceptance-run-" + candidate["plan"]["partitions"][0]["id"]
+    assert legacy.open_attempt(candidate, "--cache-root", str(candidate["stage"]["root"]),
+                               "--lens", lens, "--allow", lens + ":wrong-agent") != 0
+    assert calls == []

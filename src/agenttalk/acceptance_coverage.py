@@ -21,16 +21,21 @@ def target_id(row):
 
 
 def predicate(row):
+    requirements = ({"registry_entries": sorted(row["registry_entries"])} if "registry_entries" in row else {})
     if row["comparator"] == "exact-failure-set":
-        return {"kind": "failure-set", "expected": sorted(set(row["expected"]))}
+        return {"kind": "failure-set", "expected": sorted(set(row["expected"])), **requirements}
     if row["comparator"] not in {"exit-code", "exact-value"}:
         A._fail("unsupported coverage comparator")
     # Both exact-value and exit-code accept precisely this typed integer when
     # expected is an integer. Neither accepts true or a floating-point spelling.
-    return {"kind": "exact-json", "expected": row["expected"]}
+    return {"kind": "exact-json", "expected": row["expected"], **requirements}
 
 
 def implies(candidate, obligation):
+    if not set(candidate.get("registry_entries", [])) >= set(obligation.get("registry_entries", [])):
+        return False
+    candidate = {k: v for k, v in candidate.items() if k != "registry_entries"}
+    obligation = {k: v for k, v in obligation.items() if k != "registry_entries"}
     if canonical(candidate) == canonical(obligation):
         return True
     value = candidate["expected"]

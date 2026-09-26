@@ -97,14 +97,21 @@ def _approval(store, data, parent, successor_id, plan_hash, reduction):
 
 
 def successor(store, *, parent_id, close_id, plan_file, project_repo, revision, by, at, reason,
-              reduction_file=None):
+              reduction_file=None, cache_root=None):
     """Preserve a terminal parent before exclusively creating a linked attempt."""
     A._id(close_id, "successor.close_id")
     if close_id == parent_id:
         A._fail("a successor needs a different close ID")
     A._text(reason, "amendment reason")
+    before = close.load_close(store, parent_id)
+    if before["status"] != close.PUBLISHED:
+        A._fail("successor requires a published acceptance parent")
+    # Import and staged hashing must precede the parent's shared writer lock.
+    prepared = A.prepare(store, plan_file, project_repo, revision, before["scope"], cache_root=cache_root)
     with close.close_transaction(store, parent_id) as transaction:
         parent = deepcopy(transaction.record)
+        if parent != before:
+            A._fail("parent changed during successor preparation; retry", "acceptance_plan_stale")
         route, old_plan = A._policy(store, parent)
         if not A.schema(route["schema_version"]).modern or parent["status"] != close.PUBLISHED:
             A._fail("successor requires a published schema-2 acceptance parent")
@@ -117,7 +124,6 @@ def successor(store, *, parent_id, close_id, plan_file, project_repo, revision, 
         if any(code in {"acceptance_record_missing", "acceptance_project_unverified"}
                for code, _ in original["holds"]):
             A._fail("parent evidence cannot be preserved", "acceptance_record_missing")
-        prepared = A.prepare(store, plan_file, project_repo, revision, parent["scope"])
         if (A.schema(prepared["plan"]["schema_version"]).version < A.schema(route["schema_version"]).version
                 or prepared["plan"]["project_id"] != old_plan["project_id"]):
             A._fail("successor must retain verified project identity", "acceptance_project_unverified")

@@ -75,6 +75,9 @@ def provenance(store, record, bundle=None):
         for key, digest in route.items():
             if key.endswith("_hash") and digest is not None:
                 withheld.add(digest)
+        if A.schema(route["schema_version"]).preflight:
+            from agenttalk import acceptance_staging
+            withheld.update(acceptance_staging.evidence(store, attempt))
         if route.get("amendment_hash"):
             excluded.update(actors(A.decode(A._retained(store, route["amendment_hash"]))))
         execution = bundle if depth == 0 and bundle is not None else (

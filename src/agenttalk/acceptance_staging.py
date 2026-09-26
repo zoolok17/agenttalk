@@ -130,10 +130,8 @@ def attach(store, record, prepared):
                          A._retain(store, prepared["envelope"]))
 
 
-def pending_snapshot(store, record):
-    """Expose bound staging results, while refusing GO until M3b is implemented."""
-    route = record["acceptance_route"]
-    digest = route["preflight_attach_hash"] or route["preflight_open_hash"]
+def read_capture(store, record, digest):
+    """Revalidate retained bytes independently of any recorded report status."""
     capsule = A.decode(A._retained(store, digest))
     A._object(capsule, "schema_version binding report observation_hash inputs", "preflight capture")
     A._version(capsule["schema_version"])
@@ -157,6 +155,24 @@ def pending_snapshot(store, record):
             A._fail("retained preflight input size differs", P.INTEGRITY)
     if capsule["observation_hash"]:
         A._retained(store, capsule["observation_hash"])
-    return {"outcomes": [], "preflight": capsule["report"],
-            "holds": [(h["code"], h["detail"]) for h in capsule["report"]["holds"]]
-            + [(P.UNAVAILABLE, "schema-4 publication verification is not enabled in this milestone")]}
+    return capsule
+
+
+def pending_snapshot(store, record):
+    route = record["acceptance_route"]
+    return read_capture(store, record, route["preflight_attach_hash"] or route["preflight_open_hash"])
+
+
+def evidence(store, record):
+    route = record["acceptance_route"]
+    digests = {route["environment_hash"]}
+    for key in ("preflight_open_hash", "preflight_attach_hash"):
+        if route[key]:
+            capsule = read_capture(store, record, route[key])
+            digests.add(route[key])
+            digests.update(item["sha256"] for item in capsule["inputs"])
+            if capsule["observation_hash"]:
+                digests.add(capsule["observation_hash"])
+    for digest in digests:
+        A._retained(store, digest)
+    return digests

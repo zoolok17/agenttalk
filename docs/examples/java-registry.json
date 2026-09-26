@@ -1,0 +1,200 @@
+{
+  "schema_version": 2,
+  "files": [
+    {
+      "id": "jdk",
+      "role": "distribution",
+      "path": "jdk-21.zip",
+      "sha256": "4d8b6f7a5e4aeacb6c0cd846aee43a2b28dee5be0eda125ad0933fa35eb44956",
+      "size": 24,
+      "version": "21.0.1",
+      "expires_at": null,
+      "provenance": {
+        "source": "vendor:synthetic-java",
+        "retrieved_at": "2026-01-01T00:00:00Z",
+        "checksum_source": "vendor:synthetic-checksums",
+        "independent_verification": false,
+        "record": "provenance",
+        "verification": null
+      }
+    },
+    {
+      "id": "checker",
+      "role": "distribution",
+      "path": "checker-1.jar",
+      "sha256": "7324742e8f3d1e82a82289f96be2e3d7b47c30ceab97b6b417f631ff0b98b8f5",
+      "size": 28,
+      "version": "1.0",
+      "expires_at": null,
+      "provenance": {
+        "source": "vendor:synthetic-java",
+        "retrieved_at": "2026-01-01T00:00:00Z",
+        "checksum_source": "vendor:synthetic-checksums",
+        "independent_verification": false,
+        "record": "provenance",
+        "verification": null
+      }
+    },
+    {
+      "id": "advisories",
+      "role": "distribution",
+      "path": "advisories.dat",
+      "sha256": "ccad181cebc0f6313d89c4d175c07f674487ac92ddc0569449444676f6a5ba05",
+      "size": 31,
+      "version": "2026.01",
+      "expires_at": null,
+      "provenance": {
+        "source": "vendor:synthetic-java",
+        "retrieved_at": "2026-01-01T00:00:00Z",
+        "checksum_source": "vendor:synthetic-checksums",
+        "independent_verification": false,
+        "record": "provenance",
+        "verification": null
+      }
+    },
+    {
+      "id": "provenance",
+      "role": "provenance",
+      "path": "provenance.json",
+      "sha256": "4856698238cb9ef02c22a581f76bdcdb301f15ecbaecc9124e17f64b2a298278",
+      "size": 31,
+      "version": null,
+      "expires_at": null,
+      "provenance": null
+    },
+    {
+      "id": "adapter",
+      "role": "adapter",
+      "path": "adapter.json",
+      "sha256": "10138a23786591792782298b829817ea8f97980fca93d52f9de9a410b2b7eda3",
+      "size": 28,
+      "version": null,
+      "expires_at": null,
+      "provenance": null
+    },
+    {
+      "id": "config",
+      "role": "config",
+      "path": "checker-config.json",
+      "sha256": "cb7cbaeffe725f01d1a3e11ad94c8998a83ff531b1aaaaacd99d43468d6a748c",
+      "size": 27,
+      "version": null,
+      "expires_at": null,
+      "provenance": null
+    },
+    {
+      "id": "snapshot",
+      "role": "snapshot",
+      "version": "2026.01",
+      "path": "snapshot.json",
+      "sha256": "3eaadd0593f18e5a6d053bd3e4ab546644b00986158e9bddc6cf9b776367c176",
+      "size": 132,
+      "distribution": {
+        "id": "advisories",
+        "sha256": "ccad181cebc0f6313d89c4d175c07f674487ac92ddc0569449444676f6a5ba05"
+      },
+      "expires_at": "2027-01-01T00:00:00Z",
+      "provenance": {
+        "source": "vendor:synthetic-java",
+        "retrieved_at": "2026-01-01T00:00:00Z",
+        "checksum_source": "vendor:synthetic-checksums",
+        "independent_verification": false,
+        "record": "provenance",
+        "verification": null
+      }
+    }
+  ],
+  "entries": [
+    {
+      "id": "java",
+      "kind": "toolchain",
+      "artifact": "jdk",
+      "version": "21.0.1",
+      "expected_banner": "java 21.0.1",
+      "dependencies": [],
+      "inputs": [],
+      "snapshots": [],
+      "provenance": {
+        "source": "vendor:synthetic-java",
+        "retrieved_at": "2026-01-01T00:00:00Z",
+        "checksum_source": "vendor:synthetic-checksums",
+        "independent_verification": false,
+        "record": "provenance",
+        "verification": null
+      },
+      "command": {
+        "argv": [
+          "{artifact}"
+        ],
+        "cwd": "{checkout}",
+        "inputs": [],
+        "outputs": []
+      },
+      "offline": {
+        "mode": "external-denial",
+        "positive_control": "DENIAL_OK",
+        "cache_hit": null,
+        "real_fetch": "FETCH"
+      },
+      "failure_policy": {
+        "unavailable": "not-run",
+        "mismatch": "fail",
+        "expired": "not-run",
+        "absent_proof": "not-run",
+        "attempted_fetch": "fail"
+      },
+      "measurement": null
+    },
+    {
+      "id": "lint",
+      "kind": "checker",
+      "artifact": "checker",
+      "version": "1.0",
+      "expected_banner": null,
+      "dependencies": [
+        "java"
+      ],
+      "inputs": [
+        "advisories"
+      ],
+      "snapshots": [
+        "snapshot"
+      ],
+      "provenance": {
+        "source": "vendor:synthetic-java",
+        "retrieved_at": "2026-01-01T00:00:00Z",
+        "checksum_source": "vendor:synthetic-checksums",
+        "independent_verification": false,
+        "record": "provenance",
+        "verification": null
+      },
+      "command": {
+        "argv": [
+          "{artifact}"
+        ],
+        "cwd": "{checkout}",
+        "inputs": [],
+        "outputs": []
+      },
+      "offline": {
+        "mode": "external-denial",
+        "positive_control": "DENIAL_OK",
+        "cache_hit": null,
+        "real_fetch": "FETCH"
+      },
+      "failure_policy": {
+        "unavailable": "not-run",
+        "mismatch": "fail",
+        "expired": "not-run",
+        "absent_proof": "not-run",
+        "attempted_fetch": "fail"
+      },
+      "measurement": {
+        "comparator": "adapter",
+        "parser": "adapter",
+        "config": "config",
+        "normalizer": "adapter"
+      }
+    }
+  ]
+}

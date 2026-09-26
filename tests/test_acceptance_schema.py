@@ -33,7 +33,7 @@ def raw_schema_comparisons(tree):
 
 @pytest.mark.parametrize("source", [
     'if route["schema_version"] == 3: pass',
-    'if route.get("schema_version") == 3: pass',
+    'def _probe_new_reader(route):\n    return route.get("schema_version") == 3',
     'version = route.get("schema_version")\nalias = version\nif alias < 3: pass',
 ])
 def test_inventory_detects_direct_get_and_local_alias(source):

@@ -390,3 +390,108 @@ replacing unavailable history with an empty directory discards evidence.
 `close show` keeps displaying the requested record and reports the enumeration
 failure in `acceptance_successors_error`. A genuinely empty readable directory
 is distinct from unavailable history.
+
+## Stage a schema-4 Java acceptance plan
+
+This walkthrough is for an operator checking staged inputs before dispatch.
+Preflight never downloads, installs or executes a checker, service or command
+template. The operator supplies the complete transitive file inventory, exact
+digests, provenance, environment expectations and previously collected offline
+proof. These declarations remain cooperative; passing preflight is not a witness
+that a tool ran or that a network boundary was enforced.
+
+The [inert example generator](examples/stage_acceptance.py) creates a pinned JDK
+distribution, checker jar, advisory distribution and expiring snapshot manifest.
+Its files contain synthetic bytes, not executable Java software. Run this from
+the repository with **PowerShell 7**, choosing an absolute task scratch directory:
+
+```powershell
+$exampleRoot = Join-Path $env:AGENTTALK_SCRATCH 'java-preflight-example'
+python docs/examples/stage_acceptance.py $exampleRoot
+python -m agenttalk close acceptance preflight --plan "$exampleRoot/plan.json" --cache-root $exampleRoot --observation "$exampleRoot/observation.json"
+```
+
+The staged layout is:
+
+```text
+java-preflight-example/
+  plan.json                 registry.json
+  jdk-21.zip                checker-1.jar
+  advisories.dat            snapshot.json
+  provenance.json           adapter.json          checker-config.json
+  observation.json          java.txt             lint.txt
+  java.log                  lint.log
+```
+
+The generated [complete registry JSON](examples/java-registry.json) is executable
+test data, including exact digests and byte sizes. It has this structure (the
+file arrays below are abbreviated; use the complete linked JSON):
+
+```json
+{
+  "schema_version": 2,
+  "files": ["JDK, jar and advisory distribution pins; provenance, adapter, config and snapshot pins"],
+  "entries": ["java toolchain; lint checker depending on java"]
+}
+```
+
+Each real entry is a closed object, not a string. `java.expected_banner` is the
+literal `java 21.0.1`. The checker references its parser, comparator, normalizer
+and config pins. `lint.inputs` includes `advisories`, and `lint.snapshots` includes
+`snapshot`; that manifest binds the advisory digest and expires at
+`2027-01-01T00:00:00Z`. An expired snapshot blocks every consumer of the advisory
+distribution. The plan row explicitly references `["java", "lint"]`, while the
+environment's runtime role references `["java"]`. Tool-free rows use `[]`.
+For a real run, replace the inert distributions, version captures and proof with
+operator-staged artifacts, regenerate every affected digest and size, and bind
+the exact registry bytes into `plan.registry_digest`. Do this before opening the
+attempt; changing frozen pins requires a successor.
+
+Before that expiry, the command prints:
+
+```text
+preflight: pass
+  java: pass
+  lint: pass
+```
+
+Exit 0 means all required prerequisites passed. A missing JDK produces exit 3,
+`preflight: not-run`, and `acceptance_preflight_unavailable [jdk]`; changing one
+byte produces `acceptance_preflight_mismatch [jdk]` and `preflight: fail`. An
+expired snapshot produces `acceptance_snapshot_expired [snapshot]`. None of
+these cases triggers acquisition. `--json` includes the same codes and public
+references. The cache locator is private and is omitted from summaries.
+
+Banner/log files and JSON must be strict UTF-8 without a BOM. **Windows PowerShell
+5.1 `>` writes UTF-16**, which is unsuitable here. Use PowerShell 7 (`pwsh`) or
+its `Out-File -Encoding utf8NoBOM`; that encoding name is unavailable in 5.1.
+Banner and offline markers match a complete line after removing only CR/LF;
+spaces, BOMs, prefixes and near matches do not count. Both offline modes require
+a positive control; recipe mode also requires cache-hit markers, while external
+denial requires `egress_denied`. An attempted fetch is a violation in both modes.
+
+Open with `close open ... --acceptance-plan PLAN --project-repo CHECKOUT
+--cache-root ABSOLUTE_CACHE`. The cache root must already be fully resolved,
+without link/reparse ancestors; this includes resolving macOS `/tmp` aliases and
+OneDrive placeholders. A missing safe cache opens a HOLD attempt. Malformed
+policy or unsafe locators refuse open. Commit the cold observations before
+`close acceptance attach`; its `preflight_observation` pins an envelope with
+`schema_version: 1`, `binding` and `observation`. The binding contains exactly
+`close_id`, `instance_id`, `attempt_id`, `project_id`, `revision`, `plan_hash` and
+`registry_hash` from the frozen route. Observation evidence paths are relative
+to the envelope/bundle directory. Submitted pass flags are never trusted.
+
+Check and publish recompute prerequisites with a fresh decision clock. Publication
+hashes large files before the shared writer lock, then rechecks size, identity
+and modification metadata inside it. No previous report authorizes GO. Direct
+staged-cache mutation while preserving all filesystem metadata remains outside
+this cooperative boundary; keep staging quiescent through publication. Only
+small bounded evidence is retained and sealed. Missing or newly changed evidence
+requires a fresh attachment/attempt and cold seal, not a silent append.
+
+Schema-4 successors use `close acceptance successor ... --cache-root ABSOLUTE_CACHE`.
+They cannot downgrade the schema or silently drop a protected row's registry
+requirements; the existing LD2 authorization rules apply. Historical display
+reports distributions as **artifact not retained, pinned by digest**. It neither
+fabricates a historical pass nor changes the original verdict when today's
+cache is absent. A new candidate must verify its own live staged pins.

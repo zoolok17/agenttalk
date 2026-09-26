@@ -644,14 +644,16 @@ def validate_raw(raw, revision, run_id):
 
 
 @acceptance_git.operation
-def resolve(store, record, *, live=False):
+def resolve(store, record, *, live=False, preflight_scan=None, decision_at=None):
     """Read and verify immutable inputs; return a snapshot for the pure DoD fold."""
     snapshot = {"holds": [], "outcomes": []}
     try:
         route, plan = _policy(store, record)
         if schema(route["schema_version"]).preflight:
-            from agenttalk import acceptance_staging
-            return acceptance_staging.pending_snapshot(store, record)
+            from agenttalk import acceptance_live
+            report = acceptance_live.evaluate(store, record, scan=preflight_scan, decision_at=decision_at)
+            snapshot["preflight"] = report
+            snapshot["holds"].extend((h["code"], "[" + h["ref"] + "] " + h["detail"]) for h in report["holds"])
         # Schema-1 records preserve their original strict-live contract. Schema 2
         # reads historical objects; open, attach and GO publish check live state.
         project = verify_project(route["project"]["locator"], record["revision"],
@@ -683,7 +685,7 @@ def resolve(store, record, *, live=False):
         if total > MAX_TOTAL_BYTES:
             _fail("retained bundle exceeds total byte limit")
         outcomes = []
-        holds = integrity_holds
+        holds = snapshot["holds"] + integrity_holds
         for row in plan["rows"]:
             outcome = {"id": row["id"], "policy": row["policy"], "passed": None}
             comparing = False
@@ -701,7 +703,7 @@ def resolve(store, record, *, live=False):
                         or code in {"acceptance_record_missing", "acceptance_row_unbound"}):
                     holds.append((code, f"row {row['id']}: {exc}"))
             outcomes.append(outcome)
-        snapshot = {"holds": holds, "outcomes": outcomes}
+        snapshot.update(holds=holds, outcomes=outcomes)
         if schema(route["schema_version"]).modern:
             from agenttalk import acceptance_history
             snapshot["trust_checked"] = True
