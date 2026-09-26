@@ -160,7 +160,8 @@ def test_lead_skill_twins_work_contract():
               ("claude/agenttalk.lead.md", "codex/agenttalk-lead/SKILL.md")]
     sections = [body.split("## Work-item protocol", 1)[1].split("\n## ", 1)[0] for body in bodies]
     assert sections[0] == sections[1]
-    for text in ("supersedes", "verdict missing", "READY/NOT READY", "different-seat", "no_gates_reason"):
+    for text in ("supersedes", "verdict missing", "READY/NOT READY", "different-seat", "no_gates_reason",
+                 "assignee_model_vendors", "requester-only", "B6a isolation", "later B6b", "provenance is Unknown"):
         assert text in sections[0]
 
 
@@ -246,3 +247,75 @@ def test_declined_replacement_can_itself_be_replaced(bus):
     task(bus, request_id="tk-final", supersedes="tk-next")
     assert declined.meta["status"] == "declined" and declined.meta["verdict_issue"] == "verdict missing"
     assert len(bus.valid_messages()) == 4
+
+
+def external():
+    return {"external_deliverable": "true", "stage": "read", "work_head": "a" * 40,
+            "work_repo": "repo", "work_branch": "feature", "work_target": "master",
+            "required_gates": "[]", "no_gates_reason": "external CI"}
+
+
+@pytest.mark.parametrize("field,bad", [("external_deliverable", "yes"), ("external_deliverable", 1),
+    ("work_head", None), ("work_repo", None), ("work_branch", None), ("work_target", None),
+    ("required_gates", None), ("required_gates", "{}"), ("required_gates", '["bad/key"]'),
+    ("no_gates_reason", None), ("stage", "build"), ("external_deliverable", "TRUE"),
+    ("work_repo", ""), ("required_gates", '["unit"]'), ("no_gates_reason", "x" * 1025)])
+def test_external_declaration_refuses_incomplete_or_invalid(bus, field, bad):
+    meta = external()
+    meta[field] = bad
+    if bad is None:
+        del meta[field]
+    with pytest.raises(ValueError):
+        task(bus, **meta)
+    assert not bus.valid_messages()
+
+
+@pytest.mark.parametrize("raw,expected", [(True, True), ("true", True), (False, False), ("false", False)])
+def test_external_normalization_and_inheritance(bus, tmp_path, raw, expected):
+    opener = task(bus, **dict(external(), external_deliverable=raw))
+    replacement = task(bus, request_id="tk-next", supersedes="tk-original", stage="delta", work_head="a" * 40)
+    assert opener.meta["external_deliverable"] is expected
+    assert replacement.meta["external_deliverable"] is expected
+    draft = tmp_path / "reply.md"
+    draft.write_text("GO", encoding="utf-8")
+    reply = reply_transport.deliver_draft_reply(bus, agent="worker", record=opener.to_dict(), draft_path=draft)
+    assert reply.meta["external_deliverable"] is expected
+    with pytest.raises(ValueError):
+        bus.send(sender="worker", recipient="lead", kind="task-response", body="GO",
+                 meta={"request_id": "tk-original", "external_deliverable": not expected})
+    with pytest.raises(ValueError):
+        task(bus, request_id="tk-third", supersedes="tk-next", **dict(external(), external_deliverable=not expected))
+
+
+def test_external_requires_lead_and_allows_explicit_checks(bus):
+    meta = dict(external(), request_id="rq-ext", work_item="widget", required_gates='["unit"]')
+    del meta["no_gates_reason"]
+    with pytest.raises(ValueError):
+        bus.send(sender="worker", recipient="reviewer", kind="review-request", body="review", meta=meta)
+    assert bus.send(sender="lead", recipient="reviewer", kind="review-request", body="review", meta=meta)
+
+
+@pytest.mark.parametrize("raw,expected", [("true", True), ("false", False)])
+def test_external_cli_metadata(bus, raw, expected):
+    flags = [arg for k, v in dict(external(), external_deliverable=raw).items() for arg in ("--meta", k + "=" + v)]
+    assert command(bus, "task", "--from", "lead", "--to", "worker", "--force", "-m", "review", *flags) == (
+        2 if expected else 0)
+    assert command(bus, "task", "--from", "lead", "--to", "worker", "--force", "-m", "review",
+                   "--work-item", "widget", *flags) == 0
+    assert bus.messages_for("worker")[-1].meta["external_deliverable"] is expected
+
+
+@pytest.mark.parametrize("key", ["assignee_model_vendors", "assignee_model_vendor"])
+def test_vendor_metadata_reserved_on_cli_and_draft_publication(bus, tmp_path, monkeypatch, key):
+    assert command(bus, "task", "--from", "lead", "--to", "worker", "--force", "-m", "work",
+                   "--meta", key + "=openai") == 2
+    opener = task(bus)
+    original = reply_transport.echo_reply_correlation
+    def injected(meta, **kwargs):
+        original(meta, **kwargs)
+        meta[key] = {"worker": "openai"} if key.endswith("vendors") else "openai"
+    monkeypatch.setattr(reply_transport, "echo_reply_correlation", injected)
+    draft = tmp_path / "reply.md"
+    draft.write_text("done", encoding="utf-8")
+    assert reply_transport.deliver_draft_reply(bus, agent="worker", record=opener.to_dict(), draft_path=draft) is None
+    assert not bus.messages_for("lead")
