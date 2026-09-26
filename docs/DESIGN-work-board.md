@@ -1,399 +1,363 @@
 # A work board that moves itself
 
-Status: proposed design for [#207](https://github.com/zoolok17/agenttalk/issues/207), 2026-09-26.
-Audience: implementers and cold readers deciding whether this contract is buildable.
-Mode: explanation with proposed contracts; none of the new commands or feeds below exists yet.
+Status: proposed v2 design for #207, 2026-09-26; replaces `d232eac`. Audience: implementers and cold readers.
+This is an explanation and proposed contract, not shipped behavior. Design only; no production change.
 
-The operator decided that the board is read-only, derived from agents' work, and comes before
-[plan review #206](https://github.com/zoolok17/agenttalk/issues/206). A card moves because evidence
-arrived, not because someone dragged it. The board describes work; it neither authorizes a merge
-nor replaces the bus, gates, lead, or an existing project planner.
+The operator decided: read-only, derived from agents' work, board before #206. Card detail becomes a
+read-only review surface. Annotation submission stays separate and on hold. The board never sends feedback,
+changes tasks, issues GO or authorizes merges. There is no stakeholder demo requirement. Acceptance is the
+operator's walkthrough on live data; fixtures and synthetic demonstrations are optional development aids.
 
-## 1. What exists, and what is missing
+## 1. Verified basis and the smaller v1
 
-Code inspected: master `01ddb455`, and console v2 `5468cf9` without modifying its branch.
-Integrate the frontend after M4 is accepted; recheck its actual head then. The step record is
-`docs/STEP-CONSOLE-V2-PITCH.md` on `feat/console-v2-pitch`.
+Code basis: master `01ddb455`, console v2 through `d351359`, and the complete cross-vendor review.
+Integrate accepted M4 without touching the frontend seat's active branch. Existing facts constrain v1:
 
-| Existing surface | Consequence for this design |
-|---|---|
-| `store.py:Message.to_dict/from_raw`, `valid_messages`; envelope is `id, ts, from, to, kind, subject, body, meta` | Use validated envelopes and correlation, never keyword searches in bodies. Preserve signature and active/retired-roster validation. |
-| `cli.py:cmd_task` checks lead/liaison and accepts free-form `--meta` | Today's convention is readable, but misspelled slugs/stages are not prevented. |
-| `threads.py:_classify_event` | Task `status=accepted` remains open; `done/declined` are terminal. A terminal reply is not necessarily success. Reuse this logic. |
-| `cli.py:cmd_reply`, `reply_transport` | Correlation is echoed; other metadata is not automatically echoed. Inherit item/stage from the opener, not the reply. |
-| `web.py:_validated_for_state`, `build_threads_index` | Existing feeds scan the message directory. `/api/threads` paginates closed output, not scan work. Do not add another full scan per poll. |
-| `/api/state.recent` is capped at 25; `/api/messages` is not a board index | Neither proves complete work history. `/api/thread/<rid>` is the on-demand transcript. |
-| `build_attention` consumes canonical attention sources/dispositions but omits their general `source_refs` in ordinary wire rows | Add bounded correlation references; never assign a warning to an item by title or by seat alone. |
-| v2 `buildTeamView` combines attention with locally derived stuck incidents, then applies Later/Wait | Extract that calculation for reuse; the board must not invent a second needs-you detector. |
-| `health.py`, `wrapper/health.py` carry `request_id` and `msg_id` when known | A fresh exact match can describe current execution. A generic busy seat, stale health or an idle seat cannot advance a work item. |
-| `gates.py` has typed status, scope, revision and evidence | Reuse gate validation; a prose “tests passed” or a green gate for a different revision cannot make Ready. |
-| `ovh_gateway.py` joins `child_turns(agent,message_id,request_id)` to attempts | Attribution exists, but its `exposure_micro_eur` mixes settled charges and reservations. Do not label it “spent.” |
+- `Message` wire fields are id/ts/from/to/kind/subject/body/meta. Reuse schema, filename, roster/tombstone
+  and signature validation. Never infer workflow from bodies, subjects or seat-name prefixes.
+- `_classify_event` distinguishes accepted from terminal done/declined. Declined is not successful work.
+  Correlation is echoed by reply transport; other metadata need not be. Unpublished drafts are not events.
+- Health can carry exact request/message correlation. CLI flavor is NOT model vendor: Qwen may use Claude CLI.
+- gates.json has one overwrite record per gate NAME per root; `revision` is optional today.
+- `_compute_keep_floor` can compact closed build/review threads while their work item is still active.
+- Attention escalation refs name an esc request, not a work item's build request. An explicit link is needed.
+- `/api/state.recent` has only 25 messages. `/api/threads` output pagination does not bound its underlying scan.
 
-## 2. Identity and declarations, not editable workflow state
+V1 has NO off-bus work-item registry, amendment log, sealed review set, board-only scanner or cursor.
+Group validated work_item meta already sent. Required reviews are the reviews dispatched for the item's
+cycle/candidate. Ready can briefly appear between sequential review dispatches; accept this limitation
+because the board reports observed work, not the lead's unstated plan, and is not merge authority.
 
-Choose validated first-class flags and a small local registry. Meta-only is sufficient to show
-dispatched work, but insufficient to prove grouping, expected reviews, repository identity or completion.
-The registry contains identity, scope and evidence requirements, **never a writable column/status**.
-The console has no create/edit/reorder/move API. The lead records these facts as part of normal dispatch.
+## 2. Identity, metadata and replacement
 
-Identity is `(project_id, work_item)`; `project_id` is the bus root identity, not its filesystem path.
-`work_item` is an immutable ASCII slug matching `[a-z0-9][a-z0-9-]{0,63}`. Titles are separate bounded
-text (160 characters), not identifiers. Different roots never merge equal slugs. One item is one
-reviewable deliverable with one repository and target branch; multi-repository work uses separate
-items with optional related-item links. Every task belongs to at most one item and one cycle.
+Identity is `(project_id, work_item)`. Slug is root-scoped, case-sensitive `[a-z0-9][a-z0-9-]{0,63}`.
+Optional `work_title` is bounded to 160 characters; otherwise use originating task subject with provenance.
+If no unique originating task is provable, show the slug and an ambiguous-origin reason, not a guessed title.
+Conflicting explicit titles are a metadata issue, not a winner selected by timestamp. Similar subjects never join.
 
-Proposed `agenttalk work-item register --file <document>` accepts a closed version-1 declaration:
-`work_item, title, repo_alias, branch, target_ref, cycle, requirements` (plus `schema_version=1`).
-`repo_alias`, `branch` and `target_ref` may all be null for a not-yet-bound item; partial bindings fail.
-`cycle` starts at 1. Requirements contain `required_review_requests[]`, `required_gate_names[]`,
-`no_gates_reason` (null unless the gate list is explicitly empty), `independence` (`cross_vendor`
-by default, or explicitly `different_seat`), and `review_set_sealed` (false until dispatch is complete).
-Review IDs may be added while unsealed;
-sealing freezes the set, which must contain at least one independent reviewer before Ready.
-A small append-only declaration log under the root records actor, timestamp, previous revision and
-content hash; updates use compare-and-swap. The materialized registry is rebuildable. No mutable task
-list duplicates the bus. Referenced IDs must resolve to tasks/reviews for this item and cycle.
-Registration and amendments require the same current lead/liaison authority as task dispatch;
-repository alias approval remains operator configuration. Read operations require no new privilege.
+Proposed task/review flags: --work-item, --stage, --work-cycle, --work-round, --work-head, --supersedes.
+Metadata keys: work_item, stage, work_cycle, work_round, work_head, supersedes. Escalate also gets --work-item
+and --work-cycle, using the SAME validator. Stages: design|build|read|fix|delta|sweep. Cycle/round are positive
+decimal integers on CLI/wire, normalized internally. Legacy missing cycle means 1, labelled legacy; missing
+round is null. Head is a full Git OID. New syntactically valid slugs require no registration; syntax validation
+cannot prevent plausible typos. Do not claim that it does.
 
-Proposed flags on `task` and `review-request`: `--work-item`, `--stage`, `--work-cycle`, `--work-round`,
-and optional `--work-head` (full commit OID). They serialize into `meta.work_item`, `stage`, `work_cycle`,
-`work_round`, `work_head`. Stages are exactly `design|build|read|fix|delta|sweep`; cycle/round are positive
-integers (wire decimal strings, normalized internally). Unknown registered item, bad enum, incompatible
-duplicate `--meta`, or wrong root is exit 2 before publication. Untagged legacy commands still work.
-`reply --verdict GO|FIX|HOLD|done` is validated sugar for `meta.verdict`; it does not change bus kinds or
-terminal-status rules. A task completion needs `status=done`; `verdict` does not close a thread by itself.
-Apply the same validator at the shared publication boundary and draft delivery, not just CLI parsing.
+Validate equivalent --meta and wrapper draft publication too. Malformed values, conflicting flags/meta,
+invalid supersession and cross-root references fail exit 2 before send. Replies inherit item/cycle/stage/head
+from their unique opener; contradictory fields are invalid board evidence. Builders may report output OIDs;
+a lead review dispatch pins the result for review instead of treating a moving branch as candidate truth.
 
-Registry updates also support candidate binding `(cycle, head_oid)`, sealing review requirements,
-explicit request binding, and starting cycle N+1. They cannot set Ready/Done or erase historical
-verdicts. Changing a candidate OID invalidates earlier revision-bound approvals/checks. A new cycle
-retains the old cycle's completion evidence. Reducing sealed requirements requires an audited new
-cycle; it cannot silently turn a HOLD into Ready. This is evidence bookkeeping, not a second planner.
-Use proposed `work-item amend --file <document> --expected-revision <hash>` for a new declaration
-revision and `work-item bind --file <document>` for explicit `{work_item, cycle, opener_ids}` corrections.
-Review replacement records are `{old_request_id, new_request_id, candidate_oid}` in the amendment:
-same item/cycle, no cycles in the replacement graph, and one replacement per original obligation.
-They preserve the sealed requirement rather than remove it; until the replacement is GO the
-requirement remains unsatisfied. A candidate change requires replacement reviews for every required
-reviewer, not just the one who found a problem. Old GO replies cannot bless unseen changes.
+Verdict parser is case-insensitive: GO/FIX/HOLD for read/delta/sweep, done for design/build/fix. Retire
+READY/NOT READY, without aliases. Missing says **verdict missing**; unsupported vocabulary says
+**unrecognized verdict**, never success inferred from prose. Existing protocol status is still required:
+task-response status=done closes work, accepted does not. Native review-result must have consistent valid
+status/verdict: approved/GO, rejected/FIX or HOLD, needs-info/HOLD (nonterminal). Stage comes from opener.
 
-### Existing convention, untagged history and mistakes
+Optional dispatch policy meta: work_repo, work_branch, work_target, required_gates (bounded JSON array of
+check keys), no_gates_reason (bounded text, incompatible with nonempty gates). Originating build/design task
+defines repository/check policy; replacements inherit it. Conflicting parallel policies are Unknown.
+Reviews pin the same policy/candidate. Missing policy is unknown, not an empty list. One repo per item in v1;
+use separate related items for multi-repository deliverables. These are bus facts, not a second item database.
 
-1. A valid existing `meta.work_item` groups openers with that exact slug. It creates a provisional
-   identity, not an implicit registered repository or approval policy. Display “unregistered.”
-   The first opener's subject supplies a provisional title. A declaration later preserves the slug.
-2. Untagged openers get isolated `legacy:<opener-id>` cards in an **Unclassified** section. Resolve
-   their request threads normally, but do not guess common work from similar subjects or authors.
-   Default history is 30 days; an explicit legacy-history query can page older records.
-3. Replies inherit grouping through validated `request_id`/`in_reply_to` and the expected participants
-   and kind. Use the existing thread reducer, including rescind and broadcast semantics. Duplicate or
-   ambiguous opener IDs/correlations produce `unknown`, not a best-effort join. Generic messages do
-   not close tasks. Broadcast copies are separate obligations; an item cannot lose an outstanding copy.
-4. A typo in a registered slug fails at dispatch. Legacy typos remain separate until a lead/liaison
-   records an audited binding of **explicit opener IDs** to the correct item/cycle. Do not fuzzy-merge
-   slugs, rewrite signed messages, or infer aliases from proximity. Conflicting bindings are unknown.
-5. A terminal task reply without a verdict closes its transport obligation but has outcome unknown.
-   `status=declined` is never success. For legacy `review-result`, approved/rejected/needs-info may map
-   to GO/FIX/HOLD with provenance; contradictory explicit verdict/status is invalid board evidence.
-   Approval still needs the correct candidate and requirements. Do not manufacture these retroactively.
-6. A seat-side reply draft is not a bus event. Read only the wrapper's published validated reply.
-   Refused/unpublished drafts may yield an existing attention warning, never a success transition.
-   No board scan opens draft contents. Missing replies remain outstanding even if health goes idle.
+### Vendor source (F1)
 
-## 3. Derivation and precedence
+Default independence: **different_seat**, reviewer differs from every contributing builder for that candidate.
+Unknown builder attribution prevents verified independence. Unknown model vendor is **unverified**; CLI/name
+cannot prove it. A separate CLI badge may describe transport but cannot certify cross-vendor review.
 
-Derive per cycle from validated task obligations, their terminal replies, candidate evidence and
-canonical attention references. Order events by bus message ID, not wall-clock arrival at the cache.
-Retain all required parallel reviews: a later GO from one reviewer cannot erase another's FIX/HOLD.
-A FIX remains unresolved until its request is explicitly superseded by a linked delta review for a
-new candidate, which itself must receive GO. Merely dispatching fixes does not resolve findings.
-No missing review/check is interpreted as green. Completed rounds are retained as history.
+Add operator-set config map `model_vendor: {agent_name: vendor}` alongside roster maps. Closed v1 values:
+anthropic|openai|alibaba|other|unverified; missing means unverified. Validate roster membership. Dispatch copies
+the assignee's value into reserved assignee_model_vendor; ordinary task meta cannot override it. Retain old
+dispatch snapshots after retirement/config changes. Label it operator-configured, not automatic attestation.
+Choose config rather than launcher inference because routes vary and transport is misleading. Updating a
+model route requires updating config for subsequent tasks. Unknown vendor alone does not block different-seat
+review; automatic vendor attestation or mandatory cross-vendor policy is separate scope.
 
-“Building” means assigned/accepted build activity, **not a claim that a process is currently running**.
-The task chip separately says `dispatched`, `accepted`, `running (observed)`, `reply received`, or
-`unknown`. Running requires fresh health with the exact task request/message and expected seat.
-Without such evidence, omit the live pulse. Round is explicit `work_round`; legacy round is null,
-never a count inferred from how many messages the agents sent. Design tasks appear under Building
-with a Design badge; read/delta/sweep appear under Independent review with the specific stage badge.
+### Legacy, mistakes and supersession (F3)
 
-First matching row wins for the **current cycle**, after input validation. Keep every contributing
-request/evidence ID on the result so the detail view explains the placement.
+Untagged openers stay isolated as legacy:<opener-id> in Unclassified. Correlated replies inherit grouping.
+Missing referenced opener, ambiguous correlation, wrong participant or wrong kind means Unknown, never resolved.
+No board scan reads draft bodies; only successfully published validated replies count. Refusals may surface
+through existing attention. Idle health does not prove completion.
+
+`supersedes=<request_id>` on replacement dispatch works for builds AND reviews, same root/item/cycle.
+Only original dispatch authority or current lead/liaison can replace. Validate target; reject self-links,
+cycles and ambiguous branching replacements. Old requests/verdicts remain history. Superseding running work
+does not cancel it: outstanding execution remains visible and blocks Ready until terminal or rescinded.
+Use existing rescind where cancellation is needed. Declined/rescinded work is closed-not-success, not a
+permanent blocker; successful replacement satisfies the surviving obligation. All-declined work cannot be
+Ready without a successful deliverable and independent review. Never pick latest(stage,round): parallel tasks
+can share both. Superseded FIX says awaiting replacement review until successor succeeds; unrelated FIX/HOLD
+remains unresolved. A late superseded reply is history/diagnostic, not approval of a replacement candidate.
+
+Typo repair: rescind mistaken dispatch and reissue correctly, optionally with informational corrects_request
+(NOT cross-item supersedes). Keep cancelled mistaken card in history. No fuzzy merge, signed-message edits
+or binding registry. Bulk repair is separate scope.
+
+## 3. Causal reduction and precedence
+
+Reuse existing kind/participant/status rules. The thread walker currently sorts IDs and skips replies whose
+ID sorts before opener: do not call it unchanged for clock-skew correctness. The board adapter resolves
+request_id/in_reply_to edges first and reuses/extracts _classify_event on causal order, without changing wire
+IDs, bus cursors or delivery. Unique correlated terminal replies can follow their opener despite skew.
+Ambiguous multi-response sequences without links stay Unknown. Preserve rescind and broadcast obligations.
+
+IDs/timestamps are advisory display order across machines. Supersession/candidate correctness uses explicit
+links; incomparable heads are Unknown, not newest-wins. GO applies only to its OID; new heads need renewed
+reviews. Highest explicit cycle number on authorized dispatch is current; old obligations remain diagnostics,
+never silently successful. Ages are approximate; clamp negative age with a skew indicator. Heartbeats/polls
+do not reset workflow age. Deterministic (ts,id) display sorting must not affect correctness.
+
+First matching row wins per cycle. Shared needs-you model adds the top overlay while preserving underlying
+placement and evidence. Unknown appears in Unclassified, not disguised as Queued.
 
 | Priority | Proven condition | Column / reason |
 |---|---|---|
-| 1 | Complete canonical attention incident explicitly linked to this item, unresolved and requiring operator attention | Needs you; preserve underlying workflow column. HOLD alone is not proof that a human is needed. |
-| 2 | Item identity/history/correlation is contradictory, index incomplete, or required workflow source failed | Unknown / specific missing evidence. Show in Unclassified; preserve last-known column separately. Never silently put it in Queued. |
-| 3 | Bound candidate is proved integrated into configured target, current cycle has no later candidate or outstanding task, and required source reads are complete | Done / merged locally. Record whether review/check evidence was complete; merging does not retrospectively prove review. |
-| 4 | Required review returned FIX, or an outstanding fix task exists | Fix round / changes requested or fix dispatched. An active delta review for its replacement candidate shows Independent review with prior FIX retained as history. |
-| 5 | Outstanding build/design task exists | Building / assigned stage; parallel review is a secondary badge. |
-| 6 | Outstanding read/delta/sweep exists and independence is established | Independent review / awaiting required replies. If independence is unproved, Unknown / review independence unknown. |
-| 7 | Candidate and sealed required review set exist; all required independent verdicts are GO for that candidate; required gates are validated green for that revision/scope; all work obligations terminal-success; no unresolved FIX/HOLD or operator incident | Ready / reviewed and checked, awaiting integration. No implied merge authorization. |
-| 8 | Declaration exists with no dispatched tasks in this cycle | Queued / not dispatched. |
-| 9 | Otherwise, including completed work missing verdict/checks, unresolved non-operator HOLD, or untagged stage | Unknown / review held, verdict missing, checks missing, or stage unknown. |
+| 1 | Unresolved canonical operator incident explicitly linked to item/cycle | Needs you; HOLD alone is not human need. Deferral stays visibly deferred here. |
+| 2 | Required workflow history missing, conflicting, partial or stale | Unknown, with last-known placement separately stamped. |
+| 3 | Candidate integrated in configured target, no outstanding execution; or design completion below | Done; unresolved FIX/HOLD requires **merged with open FIX/HOLD**, warning and review links. Missing review/check evidence is also explicit. |
+| 4 | Active fix task, or unresolved FIX without dispatched replacement review | Fix round; dispatched/accepted/running separately labelled. |
+| 5 | Accepted or exactly observed-running design/build task | Building, Design badge where applicable; dispatch alone does not prove running. |
+| 6 | Outstanding independent read/delta/sweep, including linked replacement review | Independent review; prior FIX/HOLD visible. Unproved independence is labelled unverified review, never certified independent. |
+| 7 | Successful deliverable, unique candidate, >=1 independent GO, all surviving dispatched candidate reviews GO, no pending execution/review or unresolved FIX/HOLD, check policy satisfied | Ready: reviewed; no additional review currently dispatched. Mandatory check label below, not permission to merge. |
+| 8 | Known stage dispatched without acceptance/execution/completion evidence | Queued / start unconfirmed, not proof the seat has not started. |
+| 9 | Otherwise, including missing verdict/candidate/policy, non-operator HOLD, all-declined work, unknown stage | Unknown with exact reason. |
 
-The replacement-delta exception in row 4 requires an explicit supersession link and candidate binding;
-it is not triggered by any arbitrary read. Multiple active fixes keep row 4 until all their replacement
-reviews are dispatched; any remaining FIX for the current candidate keeps it there. HOLD blocks Ready
-even alongside GO. A rescinded task is cancelled, not successful; cancellation is visible and does not
-make an otherwise unproved deliverable Done. A new cycle reopens the item, without altering its history.
-Merge, PR and cost observations are separately qualified optional sources: failure of those reads cannot
-erase a proven workflow stage. Unknown merge prevents Done but does not prevent Ready. Unknown gates
-or review coverage prevent Ready; unknown health removes Running, not the recorded dispatch stage.
+Parallel GO cannot outvote FIX/HOLD. Expose counts during sequential-dispatch Ready fluctuations; do not invent
+a seal. Raw merge facts stay visible even when incomplete history forces Unknown. Running requires fresh health,
+exact request/message and assignee, not a generic busy-seat label.
 
-Independence means reviewer seat differs from every builder for that candidate, and the recorded runtime
-vendor differs from its primary builder when the declared review policy requires cross-vendor review.
-Snapshot reviewer/vendor assignment at dispatch from configured runtime facts; do not infer vendor from
-an arbitrary seat-name prefix. Old dispatches lacking that evidence cannot claim verified independence.
-All declarations and outcomes remain within the existing trusted-local-store model; this is not a new
-security boundary against someone who can rewrite that store.
+Design-only cycles originate with stage=design and have no build dispatch; a fix inherits design purpose only
+through explicit supersedes ancestry to that design task. An unlinked fix makes purpose unknown. For these
+cycles, future #206 authenticated operator review_verdict=approve
+for exact design candidate completes as **design approved**, not merged. Unresolved reviewer FIX/HOLD remains
+a warning. Before #206, explicit authorized lead dispatch starting a higher work_cycle may end a terminal
+design phase as **design phase ended by lead; operator approval unrecorded**. It cannot close still-active work
+or prove approval/merge. Without either event, completed design stays Ready/Unknown. No plan-mode hook.
 
-## 4. Ready, Done, repositories and PRs
+## 4. Checks and local Git evidence
 
-Repository bindings are **operator-configured local aliases** under the bus root, each with an approved
-absolute local checkout and target ref. Multiple bus items may refer to another project's local clone.
-The web request supplies only root/item IDs, never a filesystem path, executable or Git arguments.
-Check canonical paths against that registry; reject traversal, escaping symlinks, option-like refs and
-non-repositories. Do not discover repositories by scanning disks, message bodies, issue URLs or cwd.
-An item branch is informational until its candidate is pinned to a full OID. A branch moving invalidates
-its old Ready display until the lead binds and reviews the new candidate; force pushes are not merges.
+Choose item-scoped gate NAMES, not a new history database: `wb.<work_item>.c<cycle>.<check>`.
+Check keys: [a-z0-9-]{1,24}; full name obeys gates.py's 128-character cap. Require scope
+<project_id>/<item>/c<cycle>, revision equal to full candidate OID, plus existing validated green evidence.
+Missing revision NEVER satisfies the board. Item A/B cannot overwrite each other. New revision may overwrite
+same item's gate; old gate history is unavailable, not invented. Global gates retain existing meaning elsewhere.
 
-A bounded local observer records repo alias, branch tip, candidate, target ref/tip, observation time and
-ancestry result using shell-free, timed Git reads with lazy network fetch disabled. Missing objects,
-shallow history, disappearing worktrees, changed alias mappings and timeout all mean unknown. The web
-server never runs `fetch`, `gh`, remote Git, hooks, or credentials helpers. Limit each Git probe to 2 s
-and one observer probe at a time; requests consume its cached result only. Recheck visible repositories
-at most every 10 s; label all evidence “local refs as of …,” never “GitHub live.”
+CI usually runs elsewhere. Common explicit policy: required_gates=[] and no_gates_reason="CI tracked outside
+local gates". Ready says **independent GO; local checks not tracked (CI external)**, NEVER green CI or checks
+passed. Missing list/reason is Unknown. No network CI lookup or PR-badge inference. Optional Git/PR/cost failure
+cannot erase known workflow stage: missing merge prevents Done, missing required checks prevents Ready, missing
+health removes Running only.
 
-Fast-forward/ordinary merge proof: the pinned candidate OID is an ancestor of the configured local
-target tip. Source-branch deletion, a closed PR, task `verdict=done`, or a lead's prose are not proof.
-Missing local refs leave Ready (if other conditions hold), with merge state unknown. Done can be shown
-without a PR. Existing green gates are reused only when their revision and scope match the item; a
-global GO whose evidence is not bound to this candidate is insufficient. An empty declared gate list
-must be explicit with rationale; missing requirements are not an empty successful set.
+work_repo selects an operator-approved local alias mapped in config to canonical checkout and approved target
+refs. This access allowlist is NOT an item registry. Other projects' clones are allowed; never take paths from
+bodies/query strings. Reject escapes/symlinks, option-like refs and ambiguous binding. Root repo defaults only
+when configured; otherwise unknown.
 
-For squash/rebase, v1 does not infer patch equivalence. An optional **lead-side** evidence import can
-record a trusted PR snapshot collected outside the server: repo alias, PR number, source head OID,
-state `open|closed|merged`, resulting merge OID, observed time and source receipt. Done additionally
-requires that merge OID is present in the configured local target ancestry and the receipt pins the
-reviewed source head. Closed-unmerged is not Done. If no such receipt exists, show “integration unproved.”
-PR badge always includes snapshot age. This optional adapter is separately sized; the first demo uses
-ordinary local ancestry, so board delivery never waits for GitHub access.
+Cached observer uses only rev-parse, merge-base --is-ancestor, cat-file: shell-free, validated arguments,
+GIT_NO_LAZY_FETCH=1, GIT_NO_REPLACE_OBJECTS=1, prompts disabled, -c core.fsmonitor=false. No status, diff,
+hooks, fetch, gh, filters or textconv. Read canonical objects, not worktree files. Timeout 2 s/probe, bounded
+output, one probe at a time, visible repos refreshed at most every 10 s. No Git in BOARD handlers. Label local
+refs as-of time. Missing/shallow objects, timeout, branch movement or repointed alias invalidates evidence.
+Ordinary merge/FF: pinned candidate ancestry in configured target proves integration. Closed PR, source branch
+deleted or task done does not. Squash/rebase stays unproved in v1; lead-side PR import is optional later scope,
+never server network calls. Observer follows first UI cut; until then merge unknown and no code-item Done.
 
-## 5. One needs-you source, and the card
+## 5. Shared snapshot, compaction and bounds
 
-Extract `deriveNeeds(input)` from the v2 model: attention items, lead-chat pending decisions and the
-existing stuck detector enter once, with one stable incident ID and source freshness. Both stream and
-board use the same output. Add sanitized `source_refs` (request/message/gate IDs, not bodies or paths)
-to attention entries so task-to-item linking is exact. A stuck incident maps only through fresh exact
-health correlation; if association is ambiguous, keep it in team attention, not every card for the seat.
-Do not infer a work item from the lead-chat text. Deduplicate an escalation exposed through two feeds
-using its canonical request ID. The common model owns all precedence involving Needs you.
+Choose **read archived envelopes** (F2). An item-aware keep floor would couple compaction to workflow completion,
+pin unrelated history behind old items and fail to recover already compacted FIX replies. Shared snapshot reads
+messages/ and archived/compacted/, never silently other archived session trees. Label active/compacted provenance;
+revalidate archives, do not trust merely because previously compacted. Strip bodies from board projection. Do not
+revive archived messages in delivery or alter compaction.
 
-Later/Wait only hide or defer presentation locally. They never resolve an incident or move work back
-to Building. Both views say “deferred” for the same incident; board remains in Needs you, while the
-stream lists it in its deferred group. A new turn incident survives an old deferral. A stale attention
-read retains the last-known incident with its timestamp; an error/empty payload cannot clear it or
-make Ready. Unmapped team attention remains visible above the board, not lost in grouping.
+Support collision filenames <id>.json.<timestamp>: validate embedded ID against original filename and accepted
+suffix grammar. Deduplicate identical canonical messages by ID, prefer active provenance; differing contents for
+one ID are conflict. Missing referenced opener or required archive read is Unknown. A six-week item retains its
+five-week-old FIX. Failed archive refresh cannot yield complete board history; unassignable corruption degrades
+board coverage globally. Archive/dedup rules need tests against actual archive_messages_below output.
 
-Cards contain title, stage/column reason, seat names and verified vendor badges (unknown badge when
-unavailable), explicit round or “round unknown,” outstanding/total request counts, and two ages:
-time since first dispatch and time since last meaningful workflow event. Heartbeat/poll time does not
-reset either. Focusable evidence links open bounded detail; titles and excerpts use textContent.
-Open findings are `{status:"unavailable", count:null}` until #206 supplies stable finding IDs and a
-resolution reducer. A FIX is “changes requested,” never a guessed count from Markdown bullets.
-The future join is `(project_id, work_item, cycle, candidate_oid, finding_id)`; stale-revision findings
-stay in history. A plan artifact link uses a validated document reference from #206 when available;
-until then the click opens today's task/evidence detail, not a disabled promise of an editor.
+ONE per-root validated snapshot service supplies state and board. Refactor existing _validated_for_state behind
+it: state consumes active partition with existing semantics, board consumes active+compacted. Archive caching is
+inside that SAME service; no second scanner or independent validator. State must not replay compacted threads.
+Single refresh job/root, coalesced across clients; reuse unchanged file fingerprints and cached archive data.
+Directory fingerprints detect membership, not in-place edits: stat-check files and fully revalidate content and
+signatures at least every 60 s. Config/signing/retirement changes invalidate trust immediately. Compaction changes
+both partitions: mid-build membership change requires retry/incomplete coverage, not half a move as resolved.
+Publish snapshots atomically; observation interval is not an atomic bus transaction or merge authority.
 
-Cost is null by default. A read-only gateway adapter may sum uniquely attributed child attempts by
-`(gateway_alias, ledger_generation, attempt_id)` and correlate child `(agent,message_id,request_id)`
-to exact tasks. Show settled micro-EUR and reserved/uncertain exposure separately, as-of time, and
-coverage `partial|complete` across **known metered turns**, not the whole team's true cost. No sum of
-both per-attempt and per-turn aggregates. The current exposure aggregate is not settled spend.
-Missing/remote ledger, overlapping attribution or missing generation yields unknown/partial, not zero.
-Subscription usage percentages are not EUR; do not estimate salaries, vendor costs or “money saved.”
-Keep this optional adapter after the basic board; the demo may honestly say “cost not reported.”
+Warm refresh at most once per 5 s, outside handlers. Failure retains last-known data/errors, never stamps it fresh.
+Fresh workflow requires scan-start age <=15 s and complete required partitions. Active state can remain usable
+while archives fail; board exposes degradation. Preserve existing state consumers' error shapes and test parity.
+Slow refresh yields stale, not fake live latency. Input cap: 50,000 records/128 MiB source bytes per root; reaching
+either means capacity_exceeded, not silently complete prefix. Bound file reads before parsing; oversized records
+are coverage errors. One worker services roots fairly, cancellation/budget checks between files. No public
+cooperative iterator/cursor protocol. Measure on observed ~11,400 active records/60 MB plus archives, not a claimed
+25 ms full scan. Cache is disposable; errors never block message publication.
 
-## 6. Bounded derivation and feed contract
+GET /api/work-board?root=<id>: <=100 active cards, <=256 KiB, no cursor. Dated history uses from=<UTC-date>&to=<UTC-date>,
+max 31 days, same caps. Never age-filter away active work. Overflow reports truncated=true, known total and omitted
+count; no quiet/empty claim. >100 active cards requires later filtering/paging. Display sort is approximate event
+time+item key, not reducer order. History ranges use approximate last-work-event time and are labelled accordingly.
+Active means current cycle is not Done and is not wholly cancelled/declined without remaining work. Unknown
+items with missing evidence stay active; proven terminal/cancelled items remain available in dated history.
+Also include Done items whose last-work-event date is within seven UTC days, counted within the same response
+bounds. This approximate activity window is not a claim about merge time; dated history retains older Done items.
 
-Server: pure Python reducer over normalized validated envelopes and declarations, plus local evidence
-adapters and a derived cache. Browser: pure Node-testable view model for formatting, shared attention,
-freshness, filters and final Needs-you overlay; renderer only reconciles DOM. Do not implement task
-closure twice in Python and JS. Retain the current thread reducer's semantics through an indexed adapter.
+BOARD HTTP does O(returned-card-count) cached projection and zero message-file/Git/network reads. This is
+BOARD-scoped, not server-wide: explicit D1/#206 document GET may read one bounded blob. Poll visible board every
+5 s, one request in flight, 5 s timeout including JSON, pause while hidden. Selected-root validation matches
+existing feeds. Failure retains greyed/stamped cards; stale attention cannot clear a blocker into Ready. No HTTP
+writes. Existing transcripts remain on-demand, never loaded as part of board polling.
 
-Do not poll `/api/messages`, scan all history in JavaScript, or call the current full-scan state builder
-from the new handler. One per-root background cache builder reads files in bounded slices, maintaining
-an in-memory envelope index by message ID, request ID and item. Cache is disposable; JSON bus files
-and audited declarations remain authoritative. No cache error may prevent message publication.
+Proposed v1 feed keys: schema_version, target_root_project_id, generated_at, coverage, items, total_count,
+truncated, omitted_count, errors. Coverage contains active/archive status, scan-start/end and valid-until.
+Each item: id, work_item, title, cycle, round, workflow_column, reason, last_known_column, candidate, tasks,
+seats, attention_refs, evidence_refs, first_dispatch_at, last_work_event_at, checks, findings, cost, merge, issues.
+Unknown is null, not zero success. Workflow columns: queued/building/independent_review/fix_round/ready/done/unknown;
+shared client overlay adds needs_you. Merge: integrated/not_integrated/unknown. Coverage: complete/building/stale/
+unavailable/capacity_exceeded. Findings initially {count:null,status:"unavailable"}; cost null. Detail GET takes root
+and validated slug, <=100 task stubs and bounded refs with truncation. Output limits NEVER discard unresolved facts
+from reduction. Closed feed schema/fixture assertions belong in B6; no bus bodies or filesystem paths in list.
 
-Initial implementation limits: 50 cards/page, maximum 100; detail 50 tasks/page and 50 evidence refs/page;
-poll selected board every 5 s, at most one board request in flight, 5 s timeout including JSON decode.
-Page responses capped at 256 KiB; detail bodies use the existing transcript route on demand. Browser
-stops background board polling when its tab is hidden and refreshes on return. Per-root cache cap:
-50,000 envelopes / 64 MiB (whichever first), 2,000 item summaries; exceeding it is `capacity_exceeded`
-with last-known data, never silent truncation presented as complete. No automatic archival of open work.
+## 6. Needs-you, card and read-only detail
 
-The builder keeps an `os.scandir` iterator (no sorted full-directory list each poll) and processes at
-most 250 entries, 2 MiB of file content, or 25 ms per cooperative slice, whichever first. A single file
-above the existing accepted message-size limit is handled as an explicit coverage problem, not truncated
-into a valid envelope. Reuse Store schema/filename/roster/signature checks; body is discarded after
-validation. A read can exceed the time target on slow storage: it runs outside the HTTP thread and
-cannot refresh the snapshot's validity. Only one root's slice runs at once; round-robin roots.
+Extract existing needs-you calculation once for stream/board. Escalate flags and build_attention publish exact
+validated item/cycle with sanitized source_refs. Resolve membership from escalation opener, not by pretending esc
+IDs are build IDs. Deduplicate attention/chat by escalation ID. Unlinked incidents remain team attention; do not
+spray a seat warning across its work. Stuck mapping requires fresh exact task correlation. Later/Wait defer local
+presentation, never resolve workflow; both views show the same incident and deferral state.
 
-Repeat directory sweeps to discover new, edited, deleted and quarantined files, including IDs older than
-the high-water mark. A monotonically increasing message ID alone is **not** a correctness checkpoint.
-Cache unchanged parsed envelopes by file fingerprint; changed files are revalidated. Config/signing/
-registry changes invalidate dependent projections. Publish a new immutable generation only after a
-complete sweep and dependency reads; retain scan-start/scan-end times. It is an observation interval,
-not an atomic bus transaction. Mid-sweep changes to already visited paths appear next sweep; this is
-bounded eventual consistency, visibly “as of,” never authority to merge. Unknown/partial bootstrap
-cannot emit Ready/Done as current. After restart all cached claims stay unavailable until rebuilt.
-Workflow freshness requires scan-start age <=15 s and successful workflow dependency reads; Git/PR/cost
-carry their own observation times and errors and cannot refresh that clock. If the store cannot
-be swept within that budget, retain stale data and report index lag. Do not claim live by stamping a
-fresh HTTP response. A later optimization may use a writer journal, but is not required for this slice.
+Cards show title/reason, seats, configured model vendor or unverified, explicit round or unknown, open/total
+obligations, approximate first-dispatch and last-work-event ages. Evidence explains placement. No guessed finding
+counts from Markdown. Cost later can join exact gateway child (agent,message_id,request_id) and deduplicated
+attempt/generation IDs. Settled spend and reserved/uncertain exposure remain separate; existing child-turn exposure
+is not spend. Subscriptions do not imply EUR and absent cost is not zero. Adapter is optional, not first-board scope.
 
-HTTP does O(page-size) cache work and **zero message-file/Git/network reads**. Sort keys are cached
-`(last_work_event_id, item_id)` descending with deterministic ties. Page cursor includes generation,
-filter hash and last key; retain two generations for 30 s, otherwise return `409 cursor_expired` and
-restart explicitly. Never splice pages from different generations. Open items of every age stay in
-the active query; Done/legacy history defaults to 30 days with an explicit dated history filter.
+Vanilla JS, textContent, same CSP as /dashboard, no style attribute, fixed local links, loopback and GET-only.
+Reconcile keyed cards in place, retain focus/scroll and announce moves politely. One router owns #board,
+#conversation and reserved #review=<escalation-id>; preserve ?root=. Malformed fragments safely fall back. No new
+/ default. Board detail initially shows evidence; D-series follows first B-series delivery.
 
-Proposed GET `/api/work-board?root=<project_id>&view=active|history&limit=50&cursor=...`:
+## 7. #206 integration notes (C1-C9)
 
-```json
-{
-  "schema_version": 1, "target_root_project_id": "project-id",
-  "generation": "opaque", "generated_at": "UTC timestamp",
-  "coverage": {"status": "complete", "scan_started_at": "UTC timestamp", "as_of": "UTC timestamp", "valid_until": "UTC timestamp"},
-  "items": [{
-    "id": "project-id/work-slug", "work_item": "work-slug", "title": "Bounded title",
-    "cycle": 1, "round": 1, "workflow_column": "independent_review",
-    "reason": "review_pending", "as_of": "UTC timestamp", "last_known_column": null,
-    "candidate": {"repo_alias": "service", "branch": "feature", "head_oid": "full OID", "target_ref": "refs/heads/main"},
-    "tasks": {"open": 2, "total": 3}, "seats": [{"name": "reviewer", "vendor": "unknown"}],
-    "attention_refs": [], "evidence_refs": [{"kind": "message", "id": "validated message id"}],
-    "first_dispatch_at": "UTC timestamp", "last_work_event_at": "UTC timestamp",
-    "findings": {"status": "unavailable", "count": null}, "cost": null,
-    "merge": {"status": "unknown", "observed_at": null}, "issues": []
-  }],
-  "next_cursor": null, "errors": []
-}
-```
+#206 remains on hold. These are contracts for its later revision, not edits to that branch in this round.
 
-Illustrative shape, not executable input. Closed enums: workflow column is
-`queued|building|independent_review|fix_round|ready|done|unknown`; final view adds `needs_you`.
-Coverage is `complete|building|stale|unavailable|capacity_exceeded`; merge is
-`integrated|not_integrated|unknown`. References use `message|request|gate|declaration|git|receipt`.
-Reasons are bounded machine codes for the precedence rows, not arbitrary exception text. Optional
-unknown values are null, not zero/empty success. All shown keys are required; candidate may be null.
-`issues` lists bounded `{code, evidence_refs}` anomalies; invalid records cannot enter successful counts.
-An errors-as-data response is not a fresh empty board. The client preserves last good data and greys it.
-Wrong/repeated/unknown root selectors fail closed like existing selected-root feeds. New detail route
-GET `/api/work-board/<slug>` uses the same root selection and cursor discipline, never raw path input.
+| ID | Integration |
+|---|---|
+| C1 | Review escalation adds work_item/work_cycle to review_doc/review_sha/review_series. Series stays per-document within item. |
+| C2 | Finding identity = <reply message id>#<finding id>; item/cycle from review opener, candidate from finding.sha. No second identity or global F1 namespace. |
+| C3 | No per-finding closure in v1. Open findings belong to unsuperseded required FIX/HOLD reviews for current candidate. GO/superseded findings are history; pending replacements remain visible when old findings leave active count. |
+| C4 | Authenticated #206 approve at exact design candidate completes as design approved. Explicit next-cycle lead dispatch may end a terminal design phase, labelled without human approval. Neither is merge proof. |
+| C5 | review_repo uses same approved alias/hardened Git helper. plan_review.paths remains an additional document allowlist per alias; default root only when configured. |
+| C6 | Zero reads is BOARD-scoped. Explicit document GET may do one timed/bounded cat-file read, no arbitrary filesystem or network reads. |
+| C7 | deriveNeeds owns PLAN REVIEW from sanitized additive review object, common item/cycle refs and deferral. One attention sanitizer; land board correlation first. |
+| C8 | Later #206 skill builds on board skill; escalation/fix carry item/cycle and canonical verdict/status. Operator marks/dispositions remain #206 records. |
+| C9 | One router owns #board/#conversation/#review=<id>; board detail is local selection under #board. No competing hash handlers. |
 
-Performance acceptance (measure during build, not claimed here): synthetic 10,000 real-shape messages,
-500 items, 20 seats; warm handler p95 <50 ms, builder slices target <=25 ms, cache RSS within cap,
-no extra full Store scan per board request. At 50,000 envelopes test explicit lag/cap behavior rather
-than promise live performance. Count file reads and Git invocations as well as timings. Existing v2
-feeds can still be costly; this proposal bounds the board's incremental cost, not all server activity.
+### D1-D3, strictly after first B-series delivery
 
-## 7. UI and future plan review
+D1: document at approved alias/path/full SHA, plain safe text with line numbers. Validate path against document
+allowlist and tree/blob, not worktree. Bounded cat-file only. Copy passage with reference emits item, request ID,
+alias, path, SHA, lines and exact quote. Clipboard failure leaves selectable text. Local copying sends nothing.
+Blob <=256 KiB; selection <=8 KiB. Explicit too-large error, not deceptively complete truncation.
 
-Add a read-only Board tab within `/v2`; retain Conversation and the M4 rail. Board is the demo landing
-tab via a validated local URL selection, without changing `/` or the default for existing users.
-Seven named columns plus a visible Unclassified tray; horizontal scrolling at narrow widths, no drag
-handles or reorder affordance. Key cards by stable root/item ID through DOM reconcile. When a card
-changes column, preserve focused element and scroll intent; announce the move via a polite live region,
-do not auto-scroll someone reading a detail. Render meaningful “no matching work,” loading and stale
-states separately. Counts include explicit deferred needs-you incidents, not only visible stream cards.
+D2: changed since you looked uses browser-local last-viewed SHA keyed by root/item/repo/path and labelled as such.
+Capture previous baseline before recording current visit; polling does not advance it. Opening is not approval.
+Missing baseline/object offers explicit revision selection. Compare two bounded approved blobs with a bounded
+in-process text diff (not git diff/helpers); enforce line/work limits and explicit oversize refusal. Comparison is
+not an editor or automatic finding re-anchoring.
 
-All requests from the board are GET, same loopback and CSP policy as `/dashboard`. Use vanilla JS,
-textContent and CSS classes; no inline handlers or style attributes. Links are constructed from validated
-local IDs; bus-supplied URLs are not assigned as href. No enabled Approve/Send/Move control. #206 can
-later open its own separately gated write-capable plan view from a validated artifact reference; that
-does not make this board writable or allow the board to issue a GO.
+D3 later: require #206 stable finding records, C2 identity and C3 counting. Match exact SHA/path/quote; moved,
+outdated/unknown anchors stay labelled, never drawn on unrelated lines. No resolve checkboxes, approve-anyway,
+redlines or submission. Feedback remains existing operator chat/escalation answers. V2 composer cannot send today:
+do not prefill an unusable workflow. #206 write path remains separate and requires its own authorization.
 
-## 8. Lead skill addition (proposed universal text)
+## 8. Universal lead skill addition (proposed)
 
-Apply identical semantics to both shipped lead skills; keep shell examples platform-specific.
+Apply identical semantics to both shipped lead skills; platform-specific shell examples only.
 
-> Before dispatch, choose one stable work-item slug for the deliverable and register its title and
-> repository alias if known. Reuse that identity through design, build, review, fix, delta and sweep.
-> Record the cycle and round; do not encode changing stages in the slug. With older runtimes, pass
-> `--meta work_item=<slug> --meta stage=<stage>` and label missing registry evidence honestly.
+> Reuse one stable work_item slug through design/build/read/fix/delta/sweep; tag cycle/round explicitly. Preserve
+> unknown legacy history. Use validated flags when available, equivalent --meta otherwise. Replacement builds AND
+> reviews carry supersedes=<old request id>; rescind still-running work when cancellation is needed. Similar
+> subjects never prove replacement.
 >
-> Use validated work-item flags when available. Pin the candidate revision before review, record the
-> required independent reviewers and checks, and seal the review set once dispatch is complete.
-> Ask for a typed reply with terminal status and verdict. GO is a review result for a revision;
-> done completes the assigned task. Neither says the deliverable was merged.
+> Pin candidate and approved repo alias before review. Dispatch intended parallel reads before interpreting GO:
+> the board knows only dispatched reviews. Reviews use GO/FIX/HOLD case-insensitively; design/build/fix use done.
+> Retire READY/NOT READY. Require existing typed terminal status too. Missing verdict is not success. GO/done is
+> not merged.
 >
-> Correlate replies to their original requests. Link fixes and replacement delta reviews explicitly;
-> never bury a prior FIX/HOLD under a newer favorable reply. Escalate only decisions requiring a human,
-> attaching the work-item/request reference. Report missing evidence rather than guessing a column.
+> Default to different-seat independence. Model vendor requires operator-configured model_vendor snapshotted at
+> dispatch, never cli/name. Unknown is unverified. Local gates need item-scoped names and exact candidate revision.
+> Otherwise give no_gates_reason (often external CI); do not claim unseen CI verified.
 >
-> Correct a mistaken binding with an audited explicit request-ID correction. Do not edit old messages
-> or move cards. Keep repository aliases local and approved; record merge evidence from the configured
-> target, and publish any remote PR snapshot outside the console server. Do not grant new permissions
-> or perform a merge merely because the board says Ready. Existing gates and project planners govern.
+> Escalate with --work-item/--work-cycle for common incident placement. Never clear FIX/HOLD through prose or an
+> unrelated GO. Correct slugs by cancelling/reissuing, not editing messages. Keep local merge evidence, existing
+> project planners and irreversible-action gates. Ready remains advisory; the board only describes work.
 
-## 9. Build slices and acceptance
+## 9. Delivery slices and acceptance
 
-Each slice targets **about 700 changed lines including tests/docs**, cold-readable independently.
-Split a slice before implementation if its plan exceeds that budget; no milestone may defer its error
-paths to a later “hardening” step. Backend slices suit a strong Python seat; UI slices suit frontend-dev;
-money attribution needs the gateway owner. Every slice gets a different-vendor cold reader.
+Estimates are changed lines including focused tests and documentation, not promises of a fixed diff size.
+Split before implementation if a slice exceeds about 700 lines. No production work is authorized by this design.
+B1 (registry) is removed. B3 is explicitly split; adversarial tests are required before accepting the board.
 
-| Slice | Deliverable / owner | Required targeted evidence |
-|---|---|---|
-| B1 | Identity declarations, registry validation and audited request bindings / Python | `board_identity`: two roots/same slug, typo, conflict, CAS race, invalid ref, legacy adoption, no mutable status. |
-| B2 | Validated dispatch/reply flags and both lead skill updates / Python | `board_transport`: existing untagged compatibility, invalid enums, wrong item, correlation inheritance, terminal status vs verdict, draft publication parity, retired identities. |
-| B3 | Pure workflow reducer / strongest reasoning Python seat | `board_precedence`: every table row; shuffled input; two reviewers GO+FIX; HOLD+GO; rescind/decline; accepted vs done; missing verdict; candidate change; superseded delta; no required-review set; exact health correlation. |
-| B4 | Bounded envelope cache and rebuild lifecycle / Python with IO experience | `board_index`: >25 messages, old open item, late low-ID file, edits/quarantine, invalid signatures, partial rebuild, restart, caps, cache freshness and actual measured work bounds. |
-| B5 | Local Git/gate evidence adapter / Python | `board_completion`: merge/FF, branch moves, shallow/missing repo, separate repo alias, no PR, stale gates, wrong SHA, timeout, no network/lazy fetch, no execution from hostile refs. |
-| B6 | GET list/detail feed and pagination / Python | `board_api`: root isolation, expired cursors, stable pages, body/path redaction, read-only routes, errors-as-data, no per-request scan; benchmark specified above. |
-| B7 | Shared needs-you model and safe correlation references / frontend + bounded backend field addition | `board_attention`: same incident in stream/board, unknown mapping, stale feed, Later/Wait, new turn, duplicate escalation, no false human escalation from HOLD. |
-| B8 | Board view model/rendering, detail and demo fixture / frontend-dev after M4 | Pure Node real-envelope fixtures plus real-browser `board_journey`: moving card retains focus/scroll, root changes, stale/empty/error states, keyboard, 1024/1240 widths, CSP/textContent, GET-only, no dead controls. |
-| B9 (optional after demo) | Local read-only gateway cost adapter / gateway owner | `board_cost`: actual vs reserve, retries, ledger generation, dedup, missing/remote ledger, partial attribution, no account opening balance as task spend. |
+| Slice | Builder | Scope and acceptance | Estimated lines |
+|---|---|---|---:|
+| B2a | Python developer | Validated task tags, reply normalization, supersedes and lead skill. Invalid/conflicting metadata, missing verdict, retired vocabulary, draft/publication parity, declined replacement tests. | 400–600 |
+| B2b | Python developer | Operator model_vendor config/dispatch snapshot; escalation item flags and attention projection. Test qwen routed through claude, unverified vendor, reserved-field spoofing and exact escalation placement. | 250–400 |
+| B3a | Strong Python developer | Pure causal reducer and basic real-envelope fixtures. Each decision row, native thread classification parity, unknown and revision cases. | 350–500 |
+| B3b | Python developer/test specialist | Adversarial reducer fixtures and necessary corrections: shuffled/skewed IDs, parallel GO/FIX/HOLD, decline/re-dispatch, branching supersedes, cycle/head changes, merged-with-FIX, design completion and temporary Ready between reads. | 400–600 |
+| B4a | Python IO developer | Shared per-root validated-envelope snapshot serving state and board. Coalescing, active-state parity, trust invalidation, edited files, errors, source limits and no duplicate scans. | 350–550 |
+| B4b | Python IO developer | Archive partition in the SAME snapshot service. Closed FIX on a live item, suffixed archive filenames, duplicate/conflicting IDs, mid-compaction moves, missing/archived opener, tampering and excluded reset sessions. | 250–400 |
+| B6 | Python developer | Bounded board/history feeds and item gate adapter. Test overflow, old live items, root isolation, path redaction, parallel item gate names, absent revision and external-CI reason. No cursors. | 300–500 |
+| B7 | Frontend developer | Shared needs-you projection and incident identity. Stream/board parity, Later, resolved/stale/unmapped incidents, new turns and future plan-review object. | 200–350 |
+| B8 | Frontend developer after console M4 | Pure console model, keyed cards/detail/router and operator walkthrough. Real-envelope Node fixtures and browser focus/scroll/keyboard, GET/CSP, stale/Unknown, unknown merge/cost/findings. No document viewer. | 500–700 |
+| B5 | Python developer, after first UI | Restricted local Git observer and integration evidence. Allowlist, hostile refs/env, no helper/network invocation, timeout, shallow history, missing objects and merged-with-FIX tests. | 300–500 |
+| D1 | Python + frontend, after B-series | Pinned document and copy-with-reference detail. Traversal/object/blob limits, safe rendering, exact reference/quote and clipboard fallback browser tests. | 500–700 |
+| D2 | Frontend, after D1 | Browser-local comparison baseline and bounded plain-text diff. First visit, reload, polling, storage failure, unavailable revisions and large diff tests. | 400–600 |
+| D3 | Frontend, after stable finding contract | Read-only finding marks with C2/C3 identity, supersession and anchor tests; provisional estimate pending that contract. | 450–700 |
 
-B1-B6 can proceed without #206. B7-B8 integrate the accepted M4 rather than editing its active branch.
-PR snapshot import is a separate follow-up, estimated and cold-read before dispatch. Findings rendering
-waits for #206's stable contract; nullable fields already give it an insertion point. No new task kinds,
-network service, framework, dependency, writable board or full-text history search is required.
+First UI (B2a–B4b, B6–B8) totals roughly 3,000–4,600 changed lines. B5 adds 300–500.
+This is a planning range, not an assurance that archive correctness fits the low end. B6 depends on B3a/B3b and
+B4a/B4b; first UI acceptance also needs B2a/B2b and B7. B5 may follow initial UI with merge explicitly Unknown.
+D-series begins after B-series acceptance, including B5; none is hidden inside B8. Cost aggregation and PR imports
+are optional later slices, not unfinished first-board obligations.
 
-Node fixtures must be adaptations of serialized `Message.to_dict` and actual feed outputs, including
-`meta.request_id`, `in_reply_to`, `status` and `verdict`; do not test only an invented flat `task.state`.
-Pure Python tests own task-state truth; Node tests prove normalization, shared attention and presentation.
-Browser tests must exercise the mounted app and polling, not just detached mock DOM elements. Use a
-temporary isolated bus and Git repositories; no fixture writes to the real team's store.
+Performance acceptance uses at least 11,400 real-shaped active/archive envelopes, 500 historical items and 20 seats.
+Measure warm board HTTP p95 below 50 ms on the recorded development machine, with zero source/Git reads per request.
+Record shared refresh duration, source bytes/reads and peak memory separately; the 50 ms target is NOT a full-scan
+budget. Concurrent state/board polling must coalesce refreshes; oversized or slow refreshes must expose incomplete
+or stale coverage without implying Ready. Use deterministic cap/error tests as well as the measured workload.
 
-## 10. Demonstration and decisions
+The operator's walkthrough on their own live data is acceptance: identify known items and legacy Unknowns; observe
+published replies changing cards; check parallel reads and replacement tasks; compare a linked escalation in both
+views; inspect stale and missing evidence; navigate detail without losing focus/scroll. Before B5 merge is Unknown;
+after B5 compare the pinned candidate against the configured local target and inspect warning cases. No invented
+activity, scripted stakeholder demonstration or fictional root is required. Synthetic fixtures remain test inputs.
 
-1. Open `/v2` on Board with a visibly labelled demo root. Show one queued registered deliverable and
-   “derived from agent activity”; no dragging controls. Keep evidence drawer accessible throughout.
-2. Lead dispatches a real build task in the isolated demo bus. Card moves to Building, labelled
-   dispatched; exact fresh wrapper health can add Running. Open its request to show the source.
-3. Builder publishes a typed completion with a candidate SHA. It does **not** jump to Done. Lead
-   dispatches/seals independent reviews; card moves to Independent review, showing vendor badges.
-4. One reviewer replies FIX, another GO. Card moves to Fix round and retains both evidence links.
-   A linked replacement candidate and delta review bring it back to Independent review.
-5. Lead publishes a real linked operator escalation. Card moves to Needs you and the Conversation
-   stream shows the same incident. Later marks it deferred in both places; it does not resolve work.
-   A typed operator answer through the existing authorized path removes that blocker.
-6. Required GO replies and revision-bound green check evidence make Ready. It says awaiting merge.
-7. Lead performs the already-authorized local merge outside the browser. After the next local ref
-   observation the card moves to Done. Evidence names candidate/target OIDs and observation time.
-8. Stop the feed, then resume it. The last board visibly goes stale without losing cards or pretending
-   to be live. Show an untagged/missing-verdict example in Unclassified. Cost/findings remain explicitly
-   unavailable if those optional sources are absent. No synthetic spend or fake successful history.
+## 10. Review disposition and remaining limits
 
-No blocking operator questions remain: read-only and board-before-plan-review are decided. Use a
-fictional demo root unless the operator separately authorizes showing real project names/content to
-the stakeholder. That disclosure choice is the only operator decision needed for a live-data pitch;
-it does not block implementation or an isolated demonstration. Changing the default landing page,
-adding writable cards or extending the first slice to remote PR polling would be new scope decisions.
+| Review | Disposition and change |
+|---|---|
+| F1 | ACCEPTED: different-seat default, operator config fact snapshotted at dispatch, unverified badges until supplied (§2). |
+| F2 | ACCEPTED: validated archived envelopes in the shared snapshot; missing referenced opener is Unknown (§5). |
+| F3 | ACCEPTED: explicit supersedes for builds and reviews; declined work is not an eternal Ready prerequisite (§2–3). |
+| F4 | ACCEPTED: item/cycle gate names plus mandatory exact revision; external CI normally has an honest no_gates_reason (§4). |
+| F5 | ACCEPTED: escalate item/cycle flags and build_attention projection, not guessed request correlation (§2, §6). |
+| F6 | ACCEPTED: GO/FIX/HOLD versus done, case-insensitive, verdict missing visible; READY/NOT READY retired (§2). |
+| F7 | ACCEPTED: causal references drive state; writer-clock IDs only break display ties; ambiguity stays Unknown (§3). |
+| F8 | ACCEPTED: proven integration can say Done while prominently preserving open FIX/HOLD and missing checks (§3–4). |
+| F9 | ACCEPTED: bounded allowlisted Git plumbing, disabled helpers/lazy fetching/replacements; no status/diff invocation (§4, §7). |
+| O1–O4 | ACCEPTED: no item registry/seal/amendment system, one shared snapshot, bounded list/history without cursors, supersedes metadata (§1–5). |
+| Sizing | ACCEPTED: separate reducer/adversarial tests, archive work and UI/Git phases; explicit total range (§9). |
+| C1–C9 | ACCEPTED as integration contract notes (§7); held #206 is not modified here. |
+| D1–D3 | ACCEPTED as separate follow-ons; read-only document/copy, local comparison and later stable finding marks (§7, §9). |
 
-Design validation: source and issue reads only; no tests executed, as requested for this design round.
-Residual risks for cold read: requirement bookkeeping cost, bounded eventual consistency under a very
-busy file bus, unavailable historical independence evidence, and the integration boundary with M4/#206.
+No disagreement with the binding decisions and no blocking operator question. The chosen archive approach costs an
+additional shared snapshot slice; it avoids changing retention semantics or losing evidence already compacted.
+Explicit supersession is preferred to latest(stage, round), which would silently erase parallel reviewers.
+The known trade-off of no registry/seal is visible temporary Ready between separately dispatched reviews; Ready is
+an observation, never a merge permission. Plausible slug typos require correction through ordinary bus work.
+Operator-set vendor is an assertion, not provider attestation. External CI, PR state, unknown costs and missing
+finding IDs remain explicitly unavailable until actual evidence adapters exist. Document viewing/local comparison
+never constitutes approval and never publishes feedback.
