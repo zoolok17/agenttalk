@@ -735,6 +735,11 @@ def test_documented_java_staging_example(tmp_path, monkeypatch):
     result = P.evaluate((tmp_path / "plan.json").read_bytes(), (tmp_path / "registry.json").read_bytes(),
                         tmp_path, observation_bytes=(tmp_path / "observation.json").read_bytes())
     assert result["status"] == "pass"
+    expiry = preflight.datetime(2027, 1, 1, tzinfo=preflight.timezone.utc)
+    result = P.evaluate((tmp_path / "plan.json").read_bytes(), (tmp_path / "registry.json").read_bytes(),
+                        tmp_path, observation_bytes=(tmp_path / "observation.json").read_bytes(), decision_at=expiry)
+    assert result["status"] == "not-run"
+    assert (P.EXPIRED, "snapshot") in {(h["code"], h["ref"]) for h in result["holds"]}
     (tmp_path / "jdk-21.zip").unlink()
     result = P.evaluate((tmp_path / "plan.json").read_bytes(), (tmp_path / "registry.json").read_bytes(),
                         tmp_path, observation_bytes=(tmp_path / "observation.json").read_bytes())

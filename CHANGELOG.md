@@ -76,6 +76,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Disable automatic Git maintenance before template commits so repository
   copies cannot race with detached maintenance; limit CLI caching to `close`.
 
+### Fixed
+
+- Align acceptance preflight cache-root refusals with close open, clarify renewal and template-path policy, document the example's expiry, and refuse missing ack bindings cleanly.
+
 ## [0.92.0] - 2026-09-25
 
 Theme: **cooperative acceptance passes on `close`, and the OVH/Qwen

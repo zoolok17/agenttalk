@@ -50,6 +50,22 @@ def test_known_capabilities_and_unknown_refusal():
             capabilities(version)
 
 
+@pytest.mark.parametrize("record", [{}, {"acceptance_route": None}, {"acceptance_route": {}},
+    {"acceptance_route": {"pending": True}}, {"acceptance_route": {"schema_version": 4, "pending": True}},
+    {"acceptance_route": []}, {"acceptance_route": "invalid"}])
+def test_ack_binding_missing_route_has_clean_refusal(record):
+    with pytest.raises(A.AcceptanceError, match="acceptance ack binding requires a versioned route") as caught:
+        A.ack_binding(record)
+    assert caught.value.code == "acceptance_record_missing"
+
+
+@pytest.mark.parametrize("version", [None, 5])
+def test_ack_binding_invalid_version_remains_policy_refusal(version):
+    with pytest.raises(A.AcceptanceError, match="unsupported acceptance schema version") as caught:
+        A.ack_binding({"acceptance_route": {"schema_version": version}})
+    assert caught.value.code == "acceptance_policy_invalid"
+
+
 def test_inventory_comparisons_use_one_refusing_dispatch():
     from agenttalk.acceptance_schema import capabilities
     root = Path(A.__file__).parent
