@@ -390,3 +390,164 @@ replacing unavailable history with an empty directory discards evidence.
 `close show` keeps displaying the requested record and reports the enumeration
 failure in `acceptance_successors_error`. A genuinely empty readable directory
 is distinct from unavailable history.
+
+## Stage a schema-4 Java acceptance plan
+
+This walkthrough is for an operator checking staged inputs before dispatch.
+Preflight never downloads, installs or executes a checker, service or command
+template. The operator supplies the complete transitive file inventory, exact
+digests, provenance, environment expectations and previously collected offline
+proof. These declarations remain cooperative; passing preflight is not a witness
+that a tool ran or that a network boundary was enforced.
+
+The [inert example generator](examples/stage_acceptance.py) creates a pinned JDK
+distribution, checker jar, advisory distribution and expiring snapshot manifest.
+Its files contain synthetic bytes, not executable Java software. Run this from
+the repository with **PowerShell 7**, choosing an absolute task scratch directory:
+
+```powershell
+$exampleRoot = Join-Path $env:AGENTTALK_SCRATCH 'java-preflight-example'
+python docs/examples/stage_acceptance.py $exampleRoot
+python -m agenttalk close acceptance preflight --plan "$exampleRoot/plan.json" --cache-root $exampleRoot --observation "$exampleRoot/observation.json"
+```
+
+The staged layout is:
+
+```text
+java-preflight-example/
+  plan.json                 registry.json
+  jdk-21.zip                checker-1.jar
+  advisories.dat            snapshot.json
+  provenance.json           adapter.json          checker-config.json
+  observation.json          java.txt             lint.txt
+  java.log                  lint.log
+```
+
+The generated [complete registry JSON](examples/java-registry.json) is executable
+test data, including exact digests and byte sizes. It has this structure (the
+file arrays below are abbreviated; use the complete linked JSON):
+
+```json
+{
+  "schema_version": 2,
+  "files": ["JDK, jar and advisory distribution pins; provenance, adapter, config and snapshot pins"],
+  "entries": ["java toolchain; lint checker depending on java"]
+}
+```
+
+Each real entry is a closed object, not a string. `java.expected_banner` is the
+literal `java 21.0.1`. The checker references its parser, comparator, normalizer
+and config pins. `lint.inputs` includes `advisories`, and `lint.snapshots` includes
+`snapshot`; that manifest binds the advisory digest and expires at
+`2027-01-01T00:00:00Z`. An expired snapshot blocks every consumer of the advisory
+distribution. The plan row explicitly references `["java", "lint"]`, while the
+environment's runtime role references `["java"]`. Tool-free rows use `[]`.
+For a real run, replace the inert distributions, version captures and proof with
+operator-staged artifacts, regenerate every affected digest and size, and bind
+the exact registry bytes into `plan.registry_digest`. Do this before opening the
+attempt; changing frozen pins requires a successor.
+The generator's project ID and cold change-base are placeholders for preflight
+only. Before opening a real close, bind them to your verified Git project and
+ancestry using the increment-1 plan requirements above.
+
+Before that expiry, the command prints:
+
+```text
+preflight: pass
+  java: pass
+  lint: pass
+```
+
+Exit 0 means all required prerequisites passed. A missing JDK produces exit 3,
+`preflight: not-run`, and `acceptance_preflight_unavailable [jdk]`; changing one
+byte produces `acceptance_preflight_mismatch [jdk]` and `preflight: fail`. An
+expired snapshot produces `acceptance_snapshot_expired [snapshot]`. None of
+these cases triggers acquisition. `--json` includes the same codes and public
+references. The cache locator is private and is omitted from summaries.
+
+Banner/log files and JSON must be strict UTF-8 without a BOM. **Windows PowerShell
+5.1 `>` writes UTF-16**, which is unsuitable here. Use PowerShell 7 (`pwsh`) or
+its `Out-File -Encoding utf8NoBOM`; that encoding name is unavailable in 5.1.
+Banner and offline markers match a complete line after removing only CR/LF;
+spaces, BOMs, prefixes and near matches do not count. Both offline modes require
+a positive control; recipe mode also requires cache-hit markers, while external
+denial requires `egress_denied`. An attempted fetch is a violation in both modes.
+
+Open with `close open ... --acceptance-plan PLAN --project-repo CHECKOUT
+--cache-root ABSOLUTE_CACHE`. The cache root must already be fully resolved,
+without link/reparse ancestors; this includes resolving macOS `/tmp` aliases and
+OneDrive placeholders. A missing safe cache opens a HOLD attempt. Malformed
+policy or unsafe locators refuse open. Commit the cold observations before
+`close acceptance attach`; its `preflight_observation` pins an envelope with
+`schema_version: 1`, `binding` and `observation`. The binding contains exactly
+`close_id`, `instance_id`, `attempt_id`, `project_id`, `revision`, `plan_hash` and
+`registry_hash` from the frozen route. Observation evidence paths are relative
+to the envelope/bundle directory. Submitted pass flags are never trusted.
+
+Check and publish recompute prerequisites with a fresh decision clock. Publication
+hashes large files before the shared writer lock, then rechecks size, identity
+and modification metadata inside it. No previous report authorizes GO. Direct
+staged-cache mutation while preserving all filesystem metadata remains outside
+this cooperative boundary; keep staging quiescent through publication. Only
+small bounded evidence is retained and sealed. Missing or newly changed evidence
+requires a fresh attachment/attempt and cold seal, not a silent append.
+
+Schema-4 successors use `close acceptance successor ... --cache-root ABSOLUTE_CACHE`.
+They cannot downgrade the schema or silently drop a protected row's registry
+requirements. Each required entry binds a digest of its closed definition:
+artifact digest/version, expected banner, transitive dependency definitions,
+measurement config/comparator/parser/normalizer pins, command template, offline
+policy and referenced evidence pins. Replacing any part, even under the same
+entry ID, requires the exact LD2 operator policy-amendment approval. The protected
+predicate also binds the planned environment and that row's environment override:
+changing limits, OS, configuration or override bytes requires the same approval.
+Moving a pin or override to another safe path with identical bytes and metadata
+needs no approval; the locator is excluded from the definition. An additional
+checker can be added without approval when prior definitions and environment
+requirements remain unchanged. Adding a toolchain or service always needs exact
+approval: every such entry must appear once in the environment role lists, so
+adding it changes the protected environment even if no old entry was removed.
+Renewing advisory data after a failed attempt (new digest and expiry)
+requires operator approval, because new data could make the failure disappear.
+An expiry-only extension is not an automatic renewal and remains refused without
+approval. Historical display
+reports distributions as **artifact not retained, pinned by digest**. It neither
+fabricates a historical pass nor changes the original verdict when today's
+cache is absent. A new candidate must verify its own live staged pins.
+
+An approval does not reset ancestral coverage or authorize descendants. Every
+descendant retaining the amended or reduced policy needs a fresh exact operator
+approval while that chain lives, even when its protected plan is unchanged from
+its approved parent. The oldest protected predicates remain in the history.
+Without a fresh approval, expect `acceptance_category_moved_unreviewed` and, for
+the same revision, `acceptance_plan_stale`. This increment does not introduce an
+approval-inheritance rule.
+
+Command templates must reference staged inputs by their registry IDs in `inputs`,
+with `{artifact}` naming the entry's pinned artifact. Other argv tokens must not
+literally contain any staged-pin path, including a placeholder-relative path or
+an option value such as `--input=name.dat`. Import conservatively checks literal
+occurrences after NFC normalization and casefolding; even an incidental occurrence
+is refused. This prevents a locator-only pin move from rebinding a literal command
+argument without changing the protected definition. The same check applies after
+relocation. It validates the declarative template, not arbitrary path construction
+inside a tool; preflight never launches or interprets tool behavior.
+
+Preflight failures follow the policies of the rows that consume their entries,
+including transitive dependencies. A failure used only by informational rows
+remains visible without blocking GO. Retained-evidence integrity failures,
+unsafe paths, missing records, offline violations and stale plan bindings always
+block GO. An unmapped failure also blocks GO. Explicit HOLD publication does not
+scan staging and records that preflight was not evaluated; it asserts no pass.
+
+A plan with no gating rows can reach GO even when every row-associated,
+non-mandatory preflight prerequisite fails: those failures all fold away. This
+does not waive the mandatory failures above or the other acceptance requirements.
+A regular-file identity race while opening is retryable `not-run`, just like a
+change during hashing, and folds by row policy. A link, reparse point or non-regular
+file remains an unsafe-path refusal. Policy import still refuses an identity race;
+retry with staging quiescent.
+
+Upgrade every seat sharing the store before relying on a schema-4 GO. Older
+engines can list an already-published schema-4 verdict as GO even though their
+`close check` fails closed on that record.

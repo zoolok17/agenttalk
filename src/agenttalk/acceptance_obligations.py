@@ -53,6 +53,9 @@ def evidence(store, route):
     for digest, prior, old_route, plan in sources(store, route):
         digests.add(digest)
         digests.update(v for k, v in old_route.items() if k.endswith("_hash") and v)
+        if A.schema(old_route["schema_version"]).preflight:
+            from agenttalk import acceptance_staging
+            digests.update(acceptance_staging.evidence(store, prior))
         if old_route.get("bundle_hash"):
             bundle = A.decode(A._retained(store, old_route["bundle_hash"]))
             rows, artifacts = A._bundle(bundle, prior, old_route, plan)
@@ -113,7 +116,7 @@ def _review_obligations(store, prior, route):
         for observation in initial["observations"]:
             if observation["blocking"] and findings.get(observation["id"], {}).get("disposition") != "resolved":
                 result.append(_counter(prior, "cold", observation["id"], observation["evidence"], initial["reviewer"]))
-    if route.get("bundle_hash") and route["schema_version"] == 3:
+    if route.get("bundle_hash") and A.schema(route["schema_version"]).cold:
         from agenttalk import acceptance_hygiene
         try:
             acceptance_hygiene.execution(store, A.decode(A._retained(store, route["bundle_hash"])))
