@@ -7,7 +7,7 @@ import {
   ATT_ITEM, NOW, agent, busyAgents, busyRecent, env, iso, root,
 } from './console2_fixtures.mjs';
 import {
-  HOSTILE, LEAD, all, app, boot, chips, classOf, rail, server, stream,
+  HOSTILE, LEAD, all, app, boot, chips, classOf, header, rail, server, stream,
 } from './console2_app.mjs';
 
 const { test, run } = createRunner('console2 stream');
@@ -557,6 +557,139 @@ test('F4: the composer says messaging is not available in this read-only view, a
   const input = classOf(stream(dom), 'c2-composer-input')[0];
   assert.equal(input.disabled, true);
   assert.equal(classOf(stream(dom), 'c2-send')[0].disabled, true);
+});
+
+// =============================================================================== M4b: keyboard
+
+const isSelected = (c) => (' ' + c.className + ' ').includes(' is-selected ');
+const key = (dom, k, extra) => dom.document.dispatch('keydown', { key: k, target: { tagName: 'BODY' }, ...extra });
+
+test('M4b: j/k move the selection among the open cards, clamped at either end; exactly one is-selected', async () => {
+  const { dom } = await boot(twoCardsFor());
+  assert.equal(cards(dom).some(isSelected), false, 'nothing selected at first');
+  key(dom, 'j');
+  assert.deepEqual(cards(dom).map(isSelected), [true, false]);
+  key(dom, 'j');
+  assert.deepEqual(cards(dom).map(isSelected), [false, true]);
+  key(dom, 'j');                                          // clamps: no wraparound
+  assert.deepEqual(cards(dom).map(isSelected), [false, true]);
+  key(dom, 'k');
+  assert.deepEqual(cards(dom).map(isSelected), [true, false]);
+  key(dom, 'k');                                          // clamps at the start too
+  assert.deepEqual(cards(dom).map(isSelected), [true, false]);
+});
+
+test('M4b: k with nothing selected starts from the last card', async () => {
+  const { dom } = await boot(twoCardsFor());
+  key(dom, 'k');
+  assert.deepEqual(cards(dom).map(isSelected), [false, true]);
+});
+
+test('M4b: j/k/l/Enter/? do nothing while typing in a field, exactly like every other key', async () => {
+  const { dom } = await boot(twoCardsFor());
+  const before = all(stream(dom));
+  dom.document.dispatch('keydown', { key: 'j', target: { tagName: 'INPUT' } });
+  dom.document.dispatch('keydown', { key: 'l', target: { tagName: 'TEXTAREA' } });
+  dom.document.dispatch('keydown', { key: '?', target: { tagName: 'INPUT' } });
+  assert.equal(cards(dom).some(isSelected), false);
+  assert.equal(all(stream(dom)), before);
+});
+
+test('M4b: the selected card keeps its node identity and its highlight across an ordinary age redraw', async () => {
+  const { dom, clock, fire } = await boot(twoCardsFor());
+  key(dom, 'j');
+  const selected = cards(dom)[0];
+  assert.ok(isSelected(selected));
+  clock.perf += 120e3;
+  await fire((ms) => ms < 5000);
+  assert.ok(all(stream(dom)).includes('waiting 17m'), 'the redraw really happened');
+  assert.strictEqual(cards(dom)[0], selected, 'same node kept');
+  assert.ok(isSelected(cards(dom)[0]), 'still highlighted');
+});
+
+test('M4b: losing the selected card (by a click, not "l") drops the stale selection cleanly', async () => {
+  const { dom } = await boot(twoCardsFor());
+  key(dom, 'j');
+  assert.deepEqual(cards(dom).map(isSelected), [true, false]);
+  classOf(cards(dom)[0], 'c2-later')[0].click();          // card A leaves by a click, not by "l"
+  assert.equal(cards(dom).length, 1);
+  assert.equal(cards(dom).some(isSelected), false, 'the selection did not silently jump to card B');
+  key(dom, 'j');                                          // must start fresh, not from a stale index
+  assert.equal(isSelected(cards(dom)[0]), true, 'j after the drop selects the one remaining card');
+});
+
+test('M4b: l defers the selected card, like clicking Later, and selection moves to what is now there', async () => {
+  const { dom } = await boot(twoCardsFor());
+  key(dom, 'j');                                          // select card A
+  key(dom, 'l');
+  assert.equal(cards(dom).length, 1);
+  assert.equal(cards(dom)[0].getAttribute('data-c2-card'), 'proj-a|b');
+  assert.ok(isSelected(cards(dom)[0]), 'selection followed to the card that is now in its place');
+  assert.equal(deferredLine(dom).textContent, '1 deferred · still open, not dismissed · show');
+});
+
+test('M4b: l does nothing when no card is selected', async () => {
+  const { dom } = await boot(twoCardsFor());
+  key(dom, 'l');
+  assert.equal(cards(dom).length, 2);
+});
+
+test('M4b: Enter opens the selected card - focus goes to Later when it has no options at all', async () => {
+  const { dom } = await boot(twoCardsFor());
+  key(dom, 'j');
+  key(dom, 'Enter');
+  const focused = dom.document.activeElement;
+  assert.equal(focused.tagName, 'BUTTON');
+  assert.equal(focused.textContent, 'Later');
+  assert.equal(focused.getAttribute('data-c2-focus'), 'proj-a|a|later');
+});
+
+test('M4b: Enter skips a card’s locked options - there is no key that can reach a locked action', async () => {
+  const { dom } = await boot(server({ roots: calm, ...att([
+    ATT_ITEM({ id: 'a', answerable: true, options: ['Raise to 54 €', 'Keep 44 €'] }),
+  ]) }));
+  key(dom, 'j');
+  key(dom, 'Enter');
+  const focused = dom.document.activeElement;
+  assert.equal(focused.textContent, 'Later', 'both options are locked (disabled); focus lands on the one live control');
+});
+
+test('M4b: Enter does nothing when no card is selected', async () => {
+  const { dom } = await boot(twoCardsFor());
+  const before = dom.document.activeElement;
+  key(dom, 'Enter');
+  assert.equal(dom.document.activeElement, before);
+});
+
+test('M4b: Escape clears the selection (and does not touch anything else)', async () => {
+  const { dom } = await boot(twoCardsFor());
+  key(dom, 'j');
+  assert.equal(cards(dom).some(isSelected), true);
+  key(dom, 'Escape');
+  assert.equal(cards(dom).some(isSelected), false);
+});
+
+test('M4b: "/" tries to focus the message box, which stays disabled - a browser refuses focus on it', async () => {
+  const { dom } = await boot(server({ roots: calm, ...chatOf(THREAD) }));
+  const before = dom.document.activeElement;
+  key(dom, '/');
+  const input = classOf(stream(dom), 'c2-composer-input')[0];
+  assert.equal(input.disabled, true, 'never enabled by the keypress');
+  assert.equal(dom.document.activeElement, before, 'a disabled control cannot take focus');
+});
+
+test('M4b: "1" and "2" switch team by key, exactly like clicking the chip', async () => {
+  const twoTeams = () => [
+    root({ project_id: 'proj-a', label: 'Alpha', agents: [agent(LEAD, { since: 3000 })], recent: [env(LEAD, 'x', 'message', 5)] }),
+    root({ project_id: 'proj-b', label: 'Beta', agents: [agent(LEAD, { since: 3000 })], recent: [env(LEAD, 'x', 'message', 5)] }),
+  ];
+  const { dom } = await boot(server({ roots: twoTeams }));
+  const pressed = () => chips(dom).filter((c) => c.getAttribute('aria-pressed') === 'true').map((c) => c.textContent);
+  assert.deepEqual(pressed(), ['Alpha']);
+  key(dom, '2');
+  assert.deepEqual(pressed(), ['Beta']);
+  key(dom, '1');
+  assert.deepEqual(pressed(), ['Alpha']);
 });
 
 run();

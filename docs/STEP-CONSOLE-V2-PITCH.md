@@ -601,7 +601,7 @@ open work, not a silent gap). Everything else in the M4 plan (rail avatars and b
 | One app, four themes; theme persists per browser | DONE (M1) |
 | Terminal changes only fonts and radii | DONE (M1) |
 | Header has no mission progress, no "spec-kitty" | DONE (M1) |
-| Team switcher: freshness dot + needs count; 1/2 switch | Dot + count DONE (M1/M2); **click** switches teams (M1b); **key** 1/2 is M4b |
+| Team switcher: freshness dot + needs count; 1/2 switch | DONE. Dot + count (M1/M2); **click** switches teams (M1b); **key** 1/2 switches teams (M4b, section 20) |
 | Every needs card shows evidence; deadline optional; age shown; stuck first then oldest | DONE (M2/M3) |
 | Busy-silent agent with recent output never produces a stuck card | DONE, tested |
 | "Later" defers; deferred count visible and restorable; nothing dismissable | DONE (M3) |
@@ -618,7 +618,7 @@ open work, not a silent gap). Everything else in the M4 plan (rail avatars and b
 | Phone (< 1024px) | OUT OF SCOPE (05-SPEC-PHONE, a later card) |
 | All text ≥ 4.5:1 | Midnight VERIFIED (M4a fix round, section 19): a computed WCAG contrast check over every text-token/background-token pair the CSS actually uses. Paper/Synthwave/Terminal remain out of scope (only Midnight is reviewed this pitch, section 3) |
 | Bus content rendered as text only | DONE throughout, tested repeatedly (including every M4 avatar/tooltip value) |
-| Keyboard map per 08; screen-reader focus order | M4b |
+| Keyboard map per 08; screen-reader focus order | Keyboard map + overlay, j/k/enter/l/1/2/esc/? DONE (M4b, section 20). Screen-reader focus order: keyboard focus itself still follows ordinary tab order and every focus-key mechanism from M3; the card *selection* (j/k) is a visual+behavioral cursor (`is-selected`) that does **not** carry `aria-selected`/`role="listbox"` semantics - flagged in section 21 for the lead, not silently claimed done |
 
 ### Screenshots (Midnight, live-shaped fixture data: a seeded store, real health/heartbeat files, real `web.serve_in_thread`)
 
@@ -654,11 +654,10 @@ Status as of the M4a fix round (section 19): the rail-reconcile gap (F2), the le
 Retry/single-flight discipline (F1), the offline literal-timestamps question, and the Midnight contrast pass
 are all resolved below. What is still genuinely open:
 
-- **M4b (deferred, not silently skipped):** keyboard map + overlay behind `?`, `j/k/enter/l` card navigation
-  and selection styling, `/` focuses the composer, `1`/`2` switch team by key, `esc` closes the overlay or
-  blurs the composer; extend `tests/console2_browser_check.mjs` to drive the overlay and to reproduce the
-  offline banner reliably (a scenario the fixed-fixture stdlib test server does not yet support: it would need
-  to flip live, mid-run, from a fresh snapshot to a stale one).
+- **M4b keyboard:** DONE — see section 20. `console2_browser_check.mjs` now also drives the overlay and one
+  key path (j then Enter). The offline-banner-mid-run reproduction in the real browser is still not attempted
+  (the fixed-fixture stdlib test server would need to flip live to stale mid-run); it stays covered by the
+  data-layer tests only (`console2_data.test.mjs`), as section 18 already noted before this round.
 - **Paper/Synthwave avatars:** both show the Midnight hexagon today (no separate rounded-square/star assets
   are wired up, since only Midnight is reviewed this pitch). If the pitch demos those themes, say so and I'll
   scope wiring in the existing rounded-square/star files from `web_static/avatars/`.
@@ -719,3 +718,75 @@ corrected test was confirmed red against d351359 (or, for the browser check, aga
 25/25, `console2_stream` 42/42, `console2_data` 42/42, `console2_view` 90/90; `test_console2_web.py` 52
 passed/3 skipped, `test_console2_browser.py`, `test_console2_health_writer.py`, `test_health_last_known.py`
 all green.
+
+## 20. M4b record (keyboard)
+
+Built exactly as planned in sections 5/17-18, entirely in `console2.js` and `console2.css`;
+`console2-model.js` is untouched (selection is local UI state, like theme or a deferral, never a
+derived model value).
+
+- **The `?` button and overlay.** The header's `?` button (present but honestly disabled since M1) is
+  now live: it and the `?` key toggle a keyboard-shortcuts overlay, built once at init and only ever
+  toggled by a CSS class (never rebuilt by a data redraw, never a `style=`/`hidden` attribute). Opening
+  it moves focus to its Close button; closing it (Close, click outside is NOT wired - only the two
+  documented ways, `?`/Escape/Close, close it) returns focus to the `?` button. While it is open, every
+  other key is inert (it is modal: `j`/`l`/`t`/etc. do nothing until it closes) - only `Escape` and `?`
+  reach it.
+- **j/k card selection, with styling.** `j`/`k` move a selection cursor by **card id**, never by DOM
+  position, among the currently open cards (clamped at either end, no wraparound; starting from
+  nothing, `j` selects the first and `k` the last). The selected card gets `.is-selected`
+  (`border`/`box-shadow` from `var(--accent)`, no literal colour) baked into its built className, so an
+  unrelated redraw (an age tick) that reproduces the same selection state keeps the same DOM node and
+  the same highlight - exactly the existing `sameShape`/`syncChildren` discipline, extended by tracking
+  a new `data-c2-card` attribute (`team|id`) so two cards can never be confused with each other by
+  position alone (a latent gap the M4a rail-reconcile bug already illustrated for the rail; closed here
+  for the stream's cards too). Switching teams, or a card leaving the open list by any means other than
+  the keyboard, drops the selection cleanly (never a phantom highlight, never a stale index).
+- **Enter opens the selected card.** Focus moves to its first focusable action - `focusables()` (M3)
+  already skips disabled controls, so a card whose only options are locked (read-only answers) lands
+  on Later, never on a locked option: there is no key that can reach a locked action, by construction.
+- **l defers the selected card**, exactly like clicking its Later button; the selection follows to
+  whichever card now sits where it did (the next one, else the previous, else nothing).
+- **`/` tries to focus the message box.** It stays disabled in this read-only slice, and a disabled
+  control cannot take focus - so the key is honestly inert, never an enabled control the page cannot
+  back (the same principle as every other locked affordance in this pitch).
+- **1/2 switch team by key**, calling the same `pickTeam()` a chip click does.
+- **Escape** closes the overlay if it is open, else clears the card selection if one is set.
+- All of the above are gated by the existing `isTypingTarget` guard (no key fires while typing in an
+  input/textarea/select/contenteditable) and the existing modifier-key guard (`ctrlKey`/`metaKey`/
+  `altKey`), unchanged from M1's `t` handler.
+- **Footer hints** now also list `j/k`, `l` and `?` (still short; the full map is the overlay's job).
+
+Tests. `console2_render`: the M1 "disabled keys button" test is corrected (the button is no longer a
+stub) and the footer-hints test is extended; +4 new (overlay opens/closes and moves focus both ways,
+the overlay lists every documented key, other keys are inert while it is open). `console2_stream`: +13
+(j/k selection and clamping, k-from-nothing starts at the end, typing-target guard, selection survives
+an ordinary redraw with node identity kept, losing the selected card drops it cleanly and `j` after
+that starts fresh, l defers and follows the selection, l/Enter no-op with nothing selected, Enter
+focuses Later, Enter skips locked options, Escape clears the selection, `/` is inert on the disabled
+composer, `1`/`2` switch team by key). Real-browser check (`console2_browser_check.mjs` /
+`test_console2_browser.py`): extended to drive the `?` button/overlay open-close-and-refocus cycle and
+one key path (`j` then `Enter`) against the real page. Every new/changed test was confirmed red against
+the pre-M4b file (`git show 4b16f09:.../console2.js`, and for the browser check, the same file swapped
+in on disk) and green against the fix; mutation-tested the streamSig selection signature (drop it -> 5
+tests red), the modal key-block (drop it -> 2 tests red), and the locked-option skip in `focusables()`
+(drop it -> 2 tests red). Full run: `console2_model` 17/17, `console2_render` 29/29, `console2_stream`
+55/55, `console2_data` 42/42, `console2_view` 90/90; `test_console2_web.py` 52 passed/3 skipped;
+`test_console2_browser.py` green (overlay + key-path assertions included).
+
+Changed from the plan: the work order said "step doc section 19 as the M4b record" - section 19 was
+already taken by the M4a fix round record (written the round immediately before this one, which the
+work order's own branch pointer, 4b16f09, is that round's commit); this is recorded as section 20
+instead, with the follow-on open-items section renumbered to 21.
+
+## 21. Open items after M4b (for the lead)
+
+- **Card-selection ARIA semantics:** `j`/`k` selection is a visual+behavioral cursor only
+  (`.is-selected`), not exposed as `aria-selected`/`role="listbox"`/`role="option"`. A screen-reader
+  user gets the same focus-order and control labelling as before M4b, but no independent announcement
+  of "card 2 of 5 selected" separate from where browser focus actually is. Not in the work order's
+  bullet list; flagging rather than silently deciding it either way.
+  - Same offline-banner reproduction gap already noted in section 18: `console2_browser_check.mjs`
+  still does not flip the fixture server from live to stale mid-run (it would need a stateful handler,
+  not the current fixed-fixture one); that scenario stays covered by `console2_data.test.mjs` only.
+- **Paper/Synthwave avatars:** unchanged from section 18 - both still show the Midnight hexagon.

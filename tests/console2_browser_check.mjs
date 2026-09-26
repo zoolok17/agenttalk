@@ -76,6 +76,25 @@ try {
   // (scoped to #c2-rail: the lead block in the stream has its own, already-reconciled, avatar)
   await evaluate(`(() => { window.__avatar = document.querySelector('#c2-rail .c2-avatar-img'); return !!window.__avatar; })()`);
 
+  // M4b: the ? button opens the keyboard overlay and moves focus into it; Escape closes it and
+  // returns focus to the button that opened it.
+  await evaluate(`(() => { document.querySelector('.c2-keybtn').click(); return true; })()`);
+  out.overlayOpenAfterClick = await evaluate(`document.getElementById('c2-keymap').className.indexOf('is-open') >= 0`);
+  out.focusInOverlayAfterClick = await evaluate(`document.activeElement.className === 'c2-overlay-close'`);
+  await evaluate(`(() => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); return true; })()`);
+  out.overlayClosedAfterEscape = await evaluate(`document.getElementById('c2-keymap').className.indexOf('is-open') < 0`);
+  out.focusBackOnKeysBtnAfterEscape = await evaluate(`document.activeElement === document.querySelector('.c2-keybtn')`);
+
+  // M4b: one key path - j selects the first card, Enter focuses its first action (Later, since
+  // these fixture cards carry no options at all).
+  await evaluate(`(() => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'j', bubbles: true })); return true; })()`);
+  out.firstCardSelectedAfterJ = await evaluate(
+    `(() => { const c = document.querySelector('.c2-card'); return !!c && c.className.indexOf('is-selected') >= 0; })()`,
+  );
+  await evaluate(`(() => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); return true; })()`);
+  out.focusAfterEnterOnSelected = await evaluate(`(() => { const a = document.activeElement;
+    return { tag: a.tagName, cls: a.className, sameAsFirstCardLater: a === document.querySelector('.c2-card .c2-later') }; })()`);
+
   // F1: scroll up, let ordinary redraws happen (the fake server ages its cards on every read)
   await evaluate(`(() => { window.__thread = document.querySelector('.c2-thread'); window.__thread.scrollTop = 250; return true; })()`);
   await sleep(4500);

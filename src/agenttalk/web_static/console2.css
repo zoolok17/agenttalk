@@ -216,8 +216,10 @@ html, body {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--r-btn);
+  cursor: pointer;
 }
 .c2-keybtn:disabled { opacity: .5; cursor: default; }
+.c2-keybtn[aria-pressed="true"] { color: var(--fg); border-color: var(--accent); }
 
 .c2-seg button:focus-visible,
 .c2-keybtn:focus-visible,
@@ -347,6 +349,12 @@ html, body {
   border: 1px solid var(--border);
   border: 1px solid color-mix(in srgb, var(--tone) 50%, transparent);
   border-radius: var(--r-card);
+}
+/* M4b: keyboard selection (j/k). A distinct look from focus - this is a cursor over the list, not
+   the browser's own focus ring, which still appears on whichever control actually has focus. */
+.c2-card.is-selected {
+  border: 1px solid var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
 }
 .c2-card-head { display: flex; justify-content: space-between; gap: 12px; }
 .c2-kind { font-family: var(--font-mono); font-size: 10.5px; font-weight: 600; letter-spacing: .1em; color: var(--tone); }
@@ -612,3 +620,69 @@ html, body {
 
 /* the stream takes programmatic focus as a last resort (a redraw removed the focused control) */
 #c2-stream:focus { outline: none; }
+
+/* M4b: the keyboard-shortcuts overlay. Built once, toggled by a class only (never a style
+   attribute); the backdrop is a separate element so its opacity does not also fade the panel. */
+.c2-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+}
+.c2-overlay.is-open { display: flex; }
+.c2-overlay-backdrop {
+  position: absolute;
+  inset: 0;
+  background: var(--bg);
+  opacity: .7;
+}
+.c2-overlay-panel {
+  position: relative;
+  max-width: 420px;
+  margin: 16px;
+  padding: 20px 24px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+}
+.c2-overlay-title {
+  margin: 0 0 12px;
+  font-family: var(--font-serif);
+  font-weight: 400;
+  font-size: 20px;
+  color: var(--serif);
+}
+.c2-keymap-list {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 6px 14px;
+  margin: 0;
+}
+.c2-keymap-key {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+  padding: 1px 6px;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-btn);
+  justify-self: start;
+}
+.c2-keymap-desc { margin: 0; font-size: 13px; color: var(--dim); }
+.c2-overlay-close {
+  appearance: none;
+  margin-top: 18px;
+  padding: 6px 14px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  cursor: pointer;
+}
+.c2-overlay-close:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

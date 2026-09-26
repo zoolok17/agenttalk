@@ -29,7 +29,7 @@ const header = (dom) => dom.document.getElementById('c2-header');
 const buttons = (node) => walk(node).filter((n) => n.tagName === 'BUTTON');
 const label = (b) => b.textContent;
 
-test('header: brand, team chip from /api/state, four themes, disabled keys button', async () => {
+test('header: brand, team chip from /api/state, four themes, keyboard-map button (M4b)', async () => {
   const { dom } = await boot();
   const bar = header(dom);
   assert.ok(texts(bar).includes('agenttalk'));
@@ -37,7 +37,8 @@ test('header: brand, team chip from /api/state, four themes, disabled keys butto
   assert.deepEqual(btns.map(label), ['agenttalk', 'Midnight', 'Paper', 'Synthwave', 'Terminal', '?']);
   assert.equal(btns[0].getAttribute('aria-pressed'), 'true');
   assert.equal(btns[1].getAttribute('aria-pressed'), 'true');
-  assert.equal(btns[5].disabled, true);
+  assert.equal(btns[5].disabled, false, 'M4b: the keyboard map is no longer a stub');
+  assert.equal(btns[5].getAttribute('aria-pressed'), 'false');
   assert.deepEqual(dom.violations, []);
 });
 
@@ -136,10 +137,60 @@ test('key t cycles themes; ignored while typing and with modifiers', async () =>
   assert.equal(theme(), 'midnight');
 });
 
+// ------------------------------------------------------------ M4b: keyboard overlay
+
+const overlay = (dom) => dom.document.getElementById('c2-keymap');
+const overlayOpen = (dom) => (' ' + overlay(dom).className + ' ').includes(' is-open ');
+
+test('the ? button opens the keyboard overlay, moves focus into it, and Close returns focus', async () => {
+  const { dom } = await boot();
+  const keysBtn = buttons(header(dom)).find((b) => label(b) === '?');
+  assert.equal(overlayOpen(dom), false);
+  keysBtn.click();
+  assert.equal(overlayOpen(dom), true);
+  assert.equal(keysBtn.getAttribute('aria-pressed'), 'true');
+  const closeBtn = buttons(overlay(dom)).find((b) => label(b) === 'Close');
+  assert.equal(dom.document.activeElement, closeBtn, 'focus moved into the dialog');
+  closeBtn.click();
+  assert.equal(overlayOpen(dom), false);
+  assert.equal(dom.document.activeElement, keysBtn, 'focus returned to the button that opened it');
+  assert.equal(keysBtn.getAttribute('aria-pressed'), 'false');
+});
+
+test('the ? key toggles the overlay, and Escape closes it without touching anything else', async () => {
+  const { dom } = await boot();
+  dom.document.dispatch('keydown', { key: '?', target: { tagName: 'BODY' } });
+  assert.equal(overlayOpen(dom), true);
+  dom.document.dispatch('keydown', { key: 'Escape', target: { tagName: 'BODY' } });
+  assert.equal(overlayOpen(dom), false);
+  const keysBtn = buttons(header(dom)).find((b) => label(b) === '?');
+  assert.equal(dom.document.activeElement, keysBtn);
+});
+
+test('the overlay lists every key it documents, in plain text', async () => {
+  const { dom } = await boot();
+  dom.document.dispatch('keydown', { key: '?', target: { tagName: 'BODY' } });
+  const all = texts(overlay(dom)).join(' | ');
+  ['j', 'k', 'Enter', 'l', '/', '1', '2', 't', 'Esc', '?'].forEach((k) => assert.ok(all.includes(k), k));
+  assert.deepEqual(dom.violations, []);
+});
+
+test('while the overlay is open, other keys (j, l, t) do nothing', async () => {
+  const { dom } = await boot();
+  dom.document.dispatch('keydown', { key: '?', target: { tagName: 'BODY' } });
+  const theme = () => dom.document.documentElement.getAttribute('data-theme');
+  const before = theme();
+  dom.document.dispatch('keydown', { key: 't', target: { tagName: 'BODY' } });
+  dom.document.dispatch('keydown', { key: 'j', target: { tagName: 'BODY' } });
+  dom.document.dispatch('keydown', { key: 'l', target: { tagName: 'BODY' } });
+  assert.equal(theme(), before);
+  assert.equal(overlayOpen(dom), true, 'still open: only Escape or ? closes it');
+});
+
 test('footer hints advertise only keys that work in this milestone', async () => {
   const { dom } = await boot();
   const hints = dom.document.getElementById('c2-hints');
-  assert.deepEqual(texts(hints), ['t', 'theme']);
+  assert.deepEqual(texts(hints), ['t', 'theme', ' · ', 'j/k', 'select', ' · ', 'l', 'later', ' · ', '?', 'keys']);
 });
 
 test('script without the model stays inert', async () => {

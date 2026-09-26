@@ -59,11 +59,18 @@
     stateSeq: 0                // incremented only when a request is actually issued (belt and braces)
   };
   var ui = { deferred: {}, snoozedUntil: {}, answered: {}, lastVisitMs: null };
-  var chrome = { teamSeg: null, themeButtons: [], chipKeys: [], chips: [] };
+  var chrome = { teamSeg: null, themeButtons: [], chipKeys: [], chips: [], keysBtn: null, overlay: null };
   var lastSig = null;
   var lastRailSig = null;
   var running = false;
   var inflight = {};       // feed key -> true while a request for it is outstanding
+
+  // M4b: j/k select an open card by id, never by DOM position (a card that leaves the list must not
+  // silently hand the selection to whatever now sits at the same index). Reset whenever the visible
+  // team changes, so a stale id from a different team's stream is never carried over.
+  var nav = { selectedTeam: null, selectedId: null, overlayOpen: false };
+  var streamCardTeam = null;
+  var streamCardIds = [];      // ids of the currently open cards, in display order, for streamCardTeam
 
   // ---------------------------------------------------------------- helpers
 
@@ -272,26 +279,80 @@
     });
     bar.appendChild(themeSeg);
 
-    // The keyboard overlay arrives with the keyboard milestone (M4): the button
-    // is present and honestly disabled until then.
     var keys = el('button', 'c2-keybtn', '?');
     keys.setAttribute('type', 'button');
-    keys.setAttribute('aria-label', 'Keyboard map (not available yet)');
-    keys.setAttribute('title', 'Keyboard map: coming in a later step');
-    keys.disabled = true;
+    keys.setAttribute('aria-label', 'Keyboard shortcuts');
+    keys.setAttribute('title', 'Keyboard shortcuts');
+    keys.setAttribute('aria-haspopup', 'dialog');
+    keys.setAttribute('aria-pressed', 'false');
+    on(keys, 'click', function () { setOverlayOpen(!nav.overlayOpen); });
     bar.appendChild(keys);
+    chrome.keysBtn = keys;
 
     syncThemeButtons();
     syncTeamChips([]);
   }
+
+  // ---------------------------------------------------------- keyboard overlay
+
+  var KEY_HELP = [
+    ['j', 'Select the next card'], ['k', 'Select the previous card'],
+    ['Enter', 'Open the selected card (focus its first action)'],
+    ['l', 'Later: defer the selected card'],
+    ['/', 'Focus the message box'], ['1', 'Switch to the first team'], ['2', 'Switch to the second team'],
+    ['t', 'Cycle theme'], ['Esc', 'Close this, or clear the card selection'], ['?', 'Toggle this keyboard map'],
+  ];
+
+  function buildOverlay() {
+    var box = el('div', 'c2-overlay');
+    box.setAttribute('id', 'c2-keymap');
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-modal', 'true');
+    box.setAttribute('aria-label', 'Keyboard shortcuts');
+    box.appendChild(el('div', 'c2-overlay-backdrop'));
+    var panel = el('div', 'c2-overlay-panel');
+    panel.appendChild(el('h2', 'c2-overlay-title', 'Keyboard shortcuts'));
+    var list = el('dl', 'c2-keymap-list');
+    KEY_HELP.forEach(function (row) {
+      list.appendChild(el('dt', 'c2-keymap-key', row[0]));
+      list.appendChild(el('dd', 'c2-keymap-desc', row[1]));
+    });
+    panel.appendChild(list);
+    var close = el('button', 'c2-overlay-close', 'Close');
+    close.setAttribute('type', 'button');
+    on(close, 'click', function () { setOverlayOpen(false); });
+    panel.appendChild(close);
+    box.appendChild(panel);
+    return box;
+  }
+
+  // The overlay is chrome, not data: built once and only ever toggled by a CSS class, never rebuilt
+  // by a redraw. Opening it moves focus to its Close button; closing it returns focus to the `?`
+  // button that (or the key that) opened it - focus is never merely dropped to the page.
+  function setOverlayOpen(open) {
+    nav.overlayOpen = open;
+    if (chrome.overlay) chrome.overlay.className = 'c2-overlay' + (open ? ' is-open' : '');
+    if (chrome.keysBtn) setPressed(chrome.keysBtn, open);
+    if (open) {
+      var closeBtn = chrome.overlay && firstByClass(chrome.overlay, 'c2-overlay-close');
+      if (closeBtn && typeof closeBtn.focus === 'function') closeBtn.focus();
+    } else if (chrome.keysBtn && typeof chrome.keysBtn.focus === 'function') {
+      chrome.keysBtn.focus();
+    }
+  }
+
+  var HINTS = [['t', 'theme'], ['j/k', 'select'], ['l', 'later'], ['?', 'keys']];
 
   function renderHints() {
     var hints = document.getElementById('c2-hints');
     if (!hints) return;
     clear(hints);
     // Only keys that work in this milestone are advertised.
-    hints.appendChild(el('span', 'c2-hint-key', 't'));
-    hints.appendChild(document.createTextNode('theme'));
+    HINTS.forEach(function (h, i) {
+      if (i > 0) hints.appendChild(document.createTextNode(' · '));
+      hints.appendChild(el('span', 'c2-hint-key', h[0]));
+      hints.appendChild(document.createTextNode(h[1]));
+    });
   }
 
   // ----------------------------------------------------------------- stream
@@ -467,8 +528,9 @@
     return btn;
   }
 
-  function needsCard(card, team) {
-    var box = el('article', 'c2-card tone-' + card.tone);
+  function needsCard(card, team, selected) {
+    var box = el('article', 'c2-card tone-' + card.tone + (selected ? ' is-selected' : ''));
+    box.setAttribute('data-c2-card', team + '|' + card.id);
     var head = el('div', 'c2-card-head');
     head.appendChild(el('span', 'c2-kind', card.kind));
     head.appendChild(el('span', 'c2-age', card.ageLabel));
@@ -557,7 +619,8 @@
   // its text is updated). So a redraw that only moves an age label keeps keyboard focus, the
   // operator's scroll position and the chat thread exactly where they are; an element that really
   // changed is replaced, one that is gone is removed.
-  var TRACKED_ATTRS = ['title', 'aria-disabled', 'aria-label', 'role', 'type', 'placeholder', 'data-c2-focus', 'src'];
+  var TRACKED_ATTRS = ['title', 'aria-disabled', 'aria-label', 'role', 'type', 'placeholder', 'data-c2-focus',
+    'data-c2-card', 'src'];
 
   function kids(node) { return Array.prototype.slice.call(node.children); }
 
@@ -655,22 +718,39 @@
   function buildStream(shell) {
     var out = el('div', 'c2-stream-body');
     if (shell.selection.status === 'unknown' && shell.teams.length) {
+      streamCardTeam = null;
+      streamCardIds = [];
       out.appendChild(unknownTeamBox(shell.teams));
       return { node: out, chat: null };
     }
     var v = shell.view;
     if (!v) {
+      streamCardTeam = null;
+      streamCardIds = [];
       // No snapshot yet: either still loading or the very first read failed.
       if (!data.conn.reachable) out.appendChild(banner(M.freshness({}, data.conn, nowMs()).banner));
       else out.appendChild(el('p', 'c2-sub', 'Waiting for the first snapshot.'));
       return { node: out, chat: null };
     }
     var team = v.key;
+    // M4b: the selection is by id, never by DOM position; it is dropped when the visible team
+    // changes, or when its card is simply no longer among the open ones (answered, expired, or
+    // deferred by a means other than the keyboard, e.g. a click).
+    streamCardTeam = team;
+    streamCardIds = v.needs.open.map(function (c) { return c.id; });
+    if (nav.selectedTeam !== team) {
+      nav.selectedTeam = team;
+      nav.selectedId = null;
+    } else if (nav.selectedId !== null && streamCardIds.indexOf(nav.selectedId) === -1) {
+      nav.selectedId = null;
+    }
     if (v.banner) out.appendChild(banner(v.banner));
     if (v.greeting.text) out.appendChild(el('h1', 'c2-greeting', v.greeting.text));
     if (v.greeting.sub) out.appendChild(el('p', 'c2-sub', v.greeting.sub));
     if (v.lead) out.appendChild(leadBlock(v.lead));
-    v.needs.open.forEach(function (card) { out.appendChild(needsCard(card, team)); });
+    v.needs.open.forEach(function (card) {
+      out.appendChild(needsCard(card, team, nav.selectedId === card.id));
+    });
     if (v.needs.deferredCount > 0) out.appendChild(deferredLine(v.needs.deferredCount, team));
     if (v.aside.rows.length) out.appendChild(asideBlock(v.aside.title, v.aside.rows, v.aside.more));
     if (v.since && v.since.rows.length) out.appendChild(asideBlock(v.since.title, v.since.rows, 0));
@@ -817,7 +897,8 @@
     // (see syncChildren), so a redraw does not disturb focus, scrolling or selection.
     var v = shell.view;
     var streamSig = JSON.stringify([shell.selection, v, data.conn.reachable, data.snapshot === null,
-      shell.teams.map(function (t) { return t.key + '|' + t.label; })], railFreeReplacer);
+      shell.teams.map(function (t) { return t.key + '|' + t.label; }),
+      nav.selectedTeam, nav.selectedId], railFreeReplacer);
     var railSig = JSON.stringify(v ? [v.mode, v.roster, v.usage] : null, sigReplacer);
     if (streamSig !== lastSig) {
       lastSig = streamSig;
@@ -1010,10 +1091,80 @@
     return tag === 'input' || tag === 'textarea' || tag === 'select' || target.isContentEditable === true;
   }
 
+  function stop(ev) { if (typeof ev.preventDefault === 'function') ev.preventDefault(); }
+
+  function findCard(main, id) {
+    var key = streamCardTeam + '|' + id;
+    return descendants(main, []).filter(function (n) {
+      return n.tagName === 'ARTICLE' && n.getAttribute('data-c2-card') === key;
+    })[0] || null;
+  }
+
+  // j/k move the selection by id among the currently open cards, clamped at either end (no wrap);
+  // starting from nothing, j selects the first and k the last.
+  function moveSelection(delta) {
+    var ids = streamCardIds;
+    if (!ids.length) { nav.selectedId = null; return; }
+    nav.selectedTeam = streamCardTeam;
+    var idx = nav.selectedId === null ? -1 : ids.indexOf(nav.selectedId);
+    var next = idx === -1 ? (delta > 0 ? 0 : ids.length - 1) : Math.max(0, Math.min(ids.length - 1, idx + delta));
+    nav.selectedId = ids[next];
+    renderAll();
+  }
+
+  // Enter "opens" the selected card: focus moves to its first focusable action (an unlocked option,
+  // else Later - `focusables` already skips disabled controls, so a card with only locked options
+  // still lands on Later, never on a locked one; there is no key that can reach a locked option).
+  function openSelected() {
+    var main = document.getElementById('c2-stream');
+    if (!main || nav.selectedId === null) return;
+    var card = findCard(main, nav.selectedId);
+    if (!card) return;
+    var targets = focusables(card);
+    if (targets.length && typeof targets[0].focus === 'function') targets[0].focus();
+  }
+
+  // l defers the selected card, exactly like clicking its Later button, and the selection moves to
+  // whichever card now sits where it did (the next one, else the previous, else none left).
+  function deferSelected() {
+    if (nav.selectedId === null || nav.selectedTeam === null) return;
+    var ids = streamCardIds;
+    var idx = ids.indexOf(nav.selectedId);
+    var team = nav.selectedTeam;
+    var id = nav.selectedId;
+    nav.selectedId = idx >= 0
+      ? (ids[idx + 1] !== undefined ? ids[idx + 1] : (ids[idx - 1] !== undefined ? ids[idx - 1] : null))
+      : null;
+    deferCard(team, id);
+    renderAll();
+  }
+
+  // "/" tries to focus the message box. It stays disabled in this read-only slice, and a disabled
+  // control cannot take focus (browsers refuse it) - so this key is honestly inert, never an
+  // enabled control the page cannot back.
+  function focusComposer() {
+    var main = document.getElementById('c2-stream');
+    var input = main && firstByClass(main, 'c2-composer-input');
+    if (input && typeof input.focus === 'function') input.focus();
+  }
+
   function onKey(ev) {
     if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
     if (isTypingTarget(ev.target)) return;
-    if (ev.key === 't') setTheme(M.nextTheme(theme));
+    if (nav.overlayOpen) {
+      if (ev.key === 'Escape' || ev.key === '?') { stop(ev); setOverlayOpen(false); }
+      return;   // the overlay is modal: no other key reaches the page while it is open
+    }
+    if (ev.key === 't') { setTheme(M.nextTheme(theme)); return; }
+    if (ev.key === '?') { stop(ev); setOverlayOpen(true); return; }
+    if (ev.key === 'j') { stop(ev); moveSelection(1); return; }
+    if (ev.key === 'k') { stop(ev); moveSelection(-1); return; }
+    if (ev.key === 'Enter') { if (nav.selectedId !== null) { stop(ev); openSelected(); } return; }
+    if (ev.key === 'l') { if (nav.selectedId !== null) { stop(ev); deferSelected(); } return; }
+    if (ev.key === '/') { stop(ev); focusComposer(); return; }
+    if (ev.key === '1') { stop(ev); pickTeam(0); return; }
+    if (ev.key === '2') { stop(ev); pickTeam(1); return; }
+    if (ev.key === 'Escape') { if (nav.selectedId !== null) { nav.selectedId = null; renderAll(); } return; }
   }
 
   // ------------------------------------------------------------------- init
@@ -1023,6 +1174,9 @@
   loadLater();
   buildHeader();
   renderHints();
+  chrome.overlay = buildOverlay();
+  var appRoot = document.getElementById('app');
+  if (appRoot) appRoot.appendChild(chrome.overlay);
   var streamRoot = document.getElementById('c2-stream');
   if (streamRoot) streamRoot.setAttribute('tabindex', '-1');
   on(document, 'keydown', onKey);

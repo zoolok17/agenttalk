@@ -158,5 +158,15 @@ def test_thread_scroll_and_focus_survive_redraws_in_a_real_browser(page) -> None
     assert after_later["tag"] == "BUTTON" and after_later["inStream"] is True, after_later
     # F2: the rail is reconciled in place too - the avatar <img> survives an ordinary redraw
     assert out["railImageKept"] is True, out
+    # M4b: the ? button opens the keyboard overlay, moves focus into it, and Escape closes it and
+    # returns focus to the button that opened it
+    assert out["overlayOpenAfterClick"] is True, out
+    assert out["focusInOverlayAfterClick"] is True, out
+    assert out["overlayClosedAfterEscape"] is True, out
+    assert out["focusBackOnKeysBtnAfterEscape"] is True, out
+    # M4b: one key path - j selects the first card, Enter focuses its first action
+    assert out["firstCardSelectedAfterJ"] is True, out
+    after_enter = out["focusAfterEnterOnSelected"]
+    assert after_enter["tag"] == "BUTTON" and after_enter["sameAsFirstCardLater"] is True, after_enter
     # the page raised no exception and the console CSP blocked nothing
     assert out["problems"] == [], out["problems"]
