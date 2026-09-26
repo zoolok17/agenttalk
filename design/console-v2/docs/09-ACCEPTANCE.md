@@ -1,0 +1,23 @@
+# 09 · Acceptance checklist
+
+- [ ] One app, four themes (Midnight, Paper, Synthwave, Terminal); theme persists per browser.
+- [ ] Terminal changes only fonts and radii; layout, content and keys identical.
+- [ ] Header has no mission progress and no "spec-kitty".
+- [ ] Team switcher shows each team's freshness dot and needs count; 1/2 switch.
+- [ ] Every needs card shows evidence; deadline optional; age shown otherwise; stuck first then oldest.
+- [ ] Busy-silent agent with recent output never produces a stuck card.
+- [ ] "Later" defers; deferred count visible and restorable; nothing dismissable.
+- [ ] Actions requiring `--enable-actions` are disabled with a CLI hint when off, and re-checked server-side.
+- [ ] Operator has no GO button anywhere.
+- [ ] Quiet day renders "All quiet." + idle-is-normal line + since-you-last-looked; idle is grey.
+- [ ] Offline: banner, 50% greying, "as of", stopped pulses, disabled composer/actions, Retry; other team unaffected.
+- [ ] Usage windows: Claude & Codex, 5-hour & weekly, % + reset, threshold colours.
+- [ ] Qwen (flagged): rows show € today; team bar = gateway ledger vs its own alert (dashed) and cutoff (solid), projection dotted, labelled "of <cutoff> € cutoff"; account bar = stacked ledgers vs 100 € cap with timestamped bill tick; no team bar mentions the cap.
+- [ ] "Raise" answers only message the lead; confirmation names the command-line step; no limit changes from the console.
+- [ ] Stuck cards without process data use heartbeat/progress/last-message wording and put Wait first.
+- [ ] Names follow 06-RULES (hyphenated roles → fe-dev; ties → x.rev-1 / q.rev-1); full name in tooltip; passes `reference/name-shortener.js` tests.
+- [ ] Avatars: silhouette per theme, runtime badge, never circle-cropped.
+- [ ] Phone (< 1024px): Needs you → budget → lead; 48px targets; tab bar.
+- [ ] All text ≥ 4.5:1 (fix Paper dim/accent per 06-RULES).
+- [ ] Bus content rendered as text only.
+- [ ] Keyboard map per 08; works with a screen reader focus order (header → stream → rail).

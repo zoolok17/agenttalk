@@ -1,0 +1,29 @@
+/* Spacing — a compact 2px-derived scale. The console lives on tight,
+   information-dense rhythm; gaps cluster around 8–20px. */
+
+:root {
+  --space-1:  4px;
+  --space-2:  6px;
+  --space-3:  8px;
+  --space-4:  10px;
+  --space-5:  12px;
+  --space-6:  14px;
+  --space-7:  16px;
+  --space-8:  18px;
+  --space-9:  20px;
+  --space-10: 24px;
+  --space-12: 30px;
+  --space-16: 40px;
+
+  /* Layout constants */
+  --topbar-h:   56px;
+  --sidebar-w:  238px;
+  --page-pad-y: 26px;
+  --page-pad-x: 30px;
+
+  /* Common paddings */
+  --pad-card:      15px 16px;
+  --pad-card-lg:   18px 20px;
+  --pad-chip:      2px 7px;
+  --pad-btn:       9px 15px;
+}
