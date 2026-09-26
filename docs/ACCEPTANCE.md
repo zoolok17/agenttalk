@@ -439,8 +439,13 @@ Each real entry is a closed object, not a string. `java.expected_banner` is the
 literal `java 21.0.1`. The checker references its parser, comparator, normalizer
 and config pins. `lint.inputs` includes `advisories`, and `lint.snapshots` includes
 `snapshot`; that manifest binds the advisory digest and expires at
-`2027-01-01T00:00:00Z`. An expired snapshot blocks every consumer of the advisory
-distribution. The plan row explicitly references `["java", "lint"]`, while the
+`2027-01-01T00:00:00Z`. The shown `pass` output applies before that instant.
+At or after it, the unchanged example reports `not-run`, exits 3 and includes
+`acceptance_snapshot_expired` for the manifest. The fixed date keeps the generated
+registry reproducible; regenerate the synthetic snapshot with a future expiry
+and its registry/plan bindings before expecting a later positive control.
+An expired snapshot blocks every consumer of the advisory distribution.
+The plan row explicitly references `["java", "lint"]`, while the
 environment's runtime role references `["java"]`. Tool-free rows use `[]`.
 For a real run, replace the inert distributions, version captures and proof with
 operator-staged artifacts, regenerate every affected digest and size, and bind
@@ -507,8 +512,8 @@ checker can be added without approval when prior definitions and environment
 requirements remain unchanged. Adding a toolchain or service always needs exact
 approval: every such entry must appear once in the environment role lists, so
 adding it changes the protected environment even if no old entry was removed.
-Renewing advisory data after a failed attempt (new digest and expiry)
-requires operator approval, because new data could make the failure disappear.
+Any advisory-data renewal (new digest and expiry) requires operator approval,
+regardless of the prior attempt's verdict, because it changes a protected definition.
 An expiry-only extension is not an automatic renewal and remains refused without
 approval. Historical display
 reports distributions as **artifact not retained, pinned by digest**. It neither
@@ -528,7 +533,9 @@ with `{artifact}` naming the entry's pinned artifact. Other argv tokens must not
 literally contain any staged-pin path, including a placeholder-relative path or
 an option value such as `--input=name.dat`. Import conservatively checks literal
 occurrences after NFC normalization and casefolding; even an incidental occurrence
-is refused. This prevents a locator-only pin move from rebinding a literal command
+is refused. This includes `{scratch}` and `{checkout}` tokens and bare scalar
+values for uniformity, even when they cannot rebind a staged artifact.
+This prevents a locator-only pin move from rebinding a literal command
 argument without changing the protected definition. The same check applies after
 relocation. It validates the declarative template, not arbitrary path construction
 inside a tool; preflight never launches or interprets tool behavior.

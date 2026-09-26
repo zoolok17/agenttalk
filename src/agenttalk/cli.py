@@ -3529,6 +3529,8 @@ def cmd_acceptance_preflight(args: argparse.Namespace) -> int:
     """Operator staging check; deliberately bypass Store discovery and construction."""
     from agenttalk import acceptance as A, acceptance_preflight as P, acceptance_registry as R
     try:
+        if not Path(args.cache_root).is_absolute():
+            A._fail("--cache-root must be an absolute, fully resolved path")
         plan_path = Path(args.plan).absolute()
         plan_bytes = P.read_input(plan_path)
         plan = R.decode(plan_bytes)

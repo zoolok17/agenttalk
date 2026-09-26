@@ -316,7 +316,8 @@ def test_closed_pin_definition_keeps_semantic_metadata(registry, field):
 
 
 @pytest.mark.parametrize("arg", ["{cache_overlay}/source.dat", "{checkout}/SOURCE.DAT",
-                                "{scratch}/source.dat", "source.dat", "--input=source.dat"])
+                                "{scratch}/source.dat", "{scratch}/unrelated-source.dat-output",
+                                "source.dat", "--input=source.dat"])
 def test_command_tokens_cannot_name_staged_pin_paths(registry, arg):
     registry["entries"][0]["command"]["argv"].append(arg)
     with pytest.raises(A.AcceptanceError, match="command token names a staged-pin path"):

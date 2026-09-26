@@ -2,6 +2,8 @@
 
 Run with Python and an absolute destination under your task scratch directory.
 The generated distributions are synthetic bytes, not executable Java software.
+The fixed snapshot expires on 2027-01-01 UTC; at or after that instant preflight
+reports not-run (exit 3). See docs/ACCEPTANCE.md for renewal and binding details.
 """
 
 import hashlib
