@@ -62,11 +62,17 @@ whoever issued the work, when any of these holds:
 Exempt, recorded as `challenge=exempt:<reason>`: a fix with a failing
 repro, a review-ordered fix round, a checklist release or rollback, a
 revert, docs-only work, an explicit operator waiver within its scope,
-pre-authorised incident containment (the follow-up project is still
-challenged), and the same UNCHANGED scope challenged within 30 days.
+and pre-authorised incident containment (the follow-up project is still
+challenged). Anyone may run an OPTIONAL challenge on anything else.
+
+**Reuse, not a fresh exemption:** the same UNCHANGED scope challenged
+within 30 days reuses that challenge's VERDICT and DISPOSITION - record
+`challenge=<prior request id>` with the prior `challenge_verdict` and
+`challenge_disposition`. An unresolved `stop`, `defer` or `probe` still
+binds: a reused stop is still stopped unless the operator overrode it, a
+defer still waits for its trigger, a probe still has to be run.
 Re-challenge when the objective, risk class or a binding constraint
-changes, or the cost grows by more than 25%. Anyone may run an
-OPTIONAL challenge on anything else.
+changes, or the cost grows by more than 25%.
 
 ## Requester
 
@@ -90,19 +96,41 @@ OPTIONAL challenge on anything else.
    asked, and leave out your arguments, your preferred solution and
    effort already spent. Do not dress a preferred method up as a
    constraint. Do not hide the commitment's real costs or effects.
-3. **Send it.** Two challengers of different vendors only for
-   money/security/irreversible work or an initiative of 5+ work orders.
+3. **Send it.** Inside a managed wrapper turn
+   (`AGENTTALK_WRAPPER_GENERATION` is set), send with `--await-reply`
+   and **return immediately to the wrapper**: it owns the inbox cursor
+   and delivers the verdict in a later turn. Do not run `wait`, `sync`,
+   `recv` or `drain` from that turn.
    ```bash
    REQ_ID="ch-$(uuidgen 2>/dev/null || python -c 'import uuid; print(uuid.uuid4())')"
+   if [ -n "${AGENTTALK_WRAPPER_GENERATION:-}" ]; then
+     python -m agenttalk send --from "$SELF" --to <challenger> --kind question \
+       --subject "challenge: <outcome in a few words>" \
+       --meta request_id="$REQ_ID" --meta challenge=true --meta round=1 \
+       --await-reply --file <brief.md>
+     return
+   fi
+   ```
+   In a manual/unwrapped session, send WITHOUT `--await-reply` (it is
+   refused outside a wrapper turn) and use the scoped wait:
+   ```bash
    python -m agenttalk send --from "$SELF" --to <challenger> --kind question \
      --subject "challenge: <outcome in a few words>" \
      --meta request_id="$REQ_ID" --meta challenge=true --meta round=1 \
-     --await-reply --file <brief.md>
+     --file <brief.md>
+   python -m agenttalk wait --for "$SELF" --to-request "$REQ_ID" --kind message --timeout 900
    ```
-   In a wrapped turn, return right after sending; the verdict arrives in
-   a later turn. Unwrapped:
-   `python -m agenttalk wait --for "$SELF" --to-request "$REQ_ID" --kind message --timeout 900`.
    Do not dispatch the challenged work while its challenge is pending.
+   **Two challengers** (only for money/security/irreversible work or an
+   initiative of 5+ work orders): send the SAME brief to two challengers
+   of different vendors, each with its own request id, and wait for BOTH.
+   Record both ids on the dispatch (`--meta challenge=<id-1>,<id-2>`) and
+   combine the verdicts so that **stop dominates** - the more restrictive
+   one wins, in this order: stop > replace > defer > unassessed > probe >
+   reshape > proceed. Partial timeout: A says `reshape`, B has not
+   answered after 15 minutes - B counts as `unassessed`, the combined
+   verdict is `unassessed`, and the work does not proceed on A alone. If A
+   says `stop`, stop already dominates; do not wait for B.
 4. **Validate the verdict.** A malformed reply (bad verdict value,
    missing section or meta), a contaminated one (`exposed=yes`, or the
    challenger turns out to be involved) and a missing or late one all
@@ -116,9 +144,16 @@ OPTIONAL challenge on anything else.
      brief (concur: it stands; disagree: the operator decides), or escalate.
      Do this even when the operator asked for the work:
      ```bash
-     python -m agenttalk escalate --from "$SELF" --origin-request "$REQ_ID" \
+     python -m agenttalk escalate --from "$SELF" --subject "challenge verdict: <verdict> on <outcome>" \
+       --meta challenge="$REQ_ID" --meta challenge_verdict=<verdict> \
        -m "<headline> | <strongest reason> | <cheapest alternative> - reply GO, DROP or ALT"
      ```
+     The challenge request id rides as `--meta challenge=`; do NOT add
+     `--origin-request`/`--origin-id` (they correlate a wrapper-enforced
+     inbound request and are refused without its roster state). If
+     escalate refuses because YOU are the operator-facing agent (or the
+     lead with no liaison), put the same three lines to your operator
+     directly.
    - `unassessed`: if it names a missing fact, send that fact ONCE as
      `round=2`; otherwise apply the availability rule below.
    - An override keeps the dissent: the verdict stays on its thread, and
@@ -135,7 +170,9 @@ OPTIONAL challenge on anything else.
 
 Budget: 10 minutes; the pointers plus at most 5 more files; read-only
 commands only - no builds, tests or edits. First check whether the
-outcome already exists or is already planned. Reply ONCE on the thread:
+outcome already exists or is already planned. Reply ONCE on the thread
+with the typed CLI command - never a reply draft, which cannot carry the
+verdict meta (a wrapped turn offers no draft channel for a challenge):
 
 ```bash
 python -m agenttalk reply --from "$SELF" --to-request <RID> --kind message \

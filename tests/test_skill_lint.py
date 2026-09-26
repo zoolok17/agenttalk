@@ -116,6 +116,12 @@ SKILL_INVARIANTS = [
         "exposed=",                        # contamination is declared, not hidden
         "No recursive challenges",         # recursion guard
         "diagnostic band, never a quota",  # never optimise for the rejection rate
+        "AGENTTALK_WRAPPER_GENERATION",    # PR #205 fix 1: wrapped vs unwrapped send branch
+        "send WITHOUT `--await-reply`",    # unwrapped path never passes the refused flag
+        "do NOT add `--origin-request`/`--origin-id`",  # fix 2: escalate stays executable
+        "never a reply draft",             # fix 3: the verdict needs typed meta
+        "stop dominates",                  # fix 5a: two challengers combine restrictively
+        "reuses that challenge's VERDICT and DISPOSITION",  # fix 5b: reuse, not a blank pass
     ]),
     ("agenttalk.sk-loop.md", "agenttalk-sk-loop", [
         "AGENTTALK_SELF",

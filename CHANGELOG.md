@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replace/defer/stop verdict. The lead, propose and listen skills now route
   through it (challenge meta on major dispatches, a Challenge section in
   major proposals, operator ideas challenged before they become work).
+  A wrapped challenger is offered no reply-draft channel for a
+  `challenge=true` question (a body-only draft cannot carry the verdict
+  meta) and is prompted for the typed CLI verdict instead.
 
 ### Changed
 
