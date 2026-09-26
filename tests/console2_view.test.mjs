@@ -92,7 +92,7 @@ test('stuck: 14 min without progress, no reply, fresh heartbeat -> a card with t
 test('stuck without any progress note counts from when the turn began', () => {
   const v = view(sil({ since: 900 }), { recent: WINDOW });
   assert.equal(v.state, 'stuck');
-  assert.equal(v.stuck.evidence, 'No progress noted since the turn began 15m ago \u00b7 no reply sent \u00b7 heartbeat still fresh');
+  assert.equal(v.stuck.evidence, 'No progress since the turn began 15m ago \u00b7 no reply sent \u00b7 heartbeat still fresh');
 });
 
 test('the 10-minute boundary: 599 s is busy, 600 s is stuck', () => {
@@ -150,7 +150,7 @@ test('the wrapper\u2019s own stuck_suspected is a candidate, and a card only wit
   assert.equal(early.state, 'busy');
   assert.equal(early.candidate, true);
   assert.equal(early.stuck, null);
-  assert.equal(early.line, 'Wrapper suspects a stall · last progress 3m ago · reply status unknown');
+  assert.equal(early.line, 'Last progress 3m ago · reply status unknown');
   const evidenced = view(s({ since: 1800, progress: 840 }), { recent: WINDOW });
   assert.equal(evidenced.state, 'stuck');
 });
@@ -592,6 +592,85 @@ test('hostile strings pass through as plain data; nothing is escaped or executed
 test('the view is plain JSON: no functions, no DOM, no undefined holes that break the redraw signature', () => {
   const v = team({ chat: chat([{ from: 'claude-agenttalk-lead', body: 'hi', ts: iso(5) }]), attention: attention([escalation({ id: 'a' })]) });
   assert.equal(JSON.stringify(v), JSON.stringify(JSON.parse(JSON.stringify(v))));
+});
+
+// ---------------------------------------- F2: the baseline is the CURRENT turn
+
+test('progress from an earlier turn does not count against a turn that just started', () => {
+  // last_progress_at is kept by the wrapper across idle and turn_start: 30 min old, the turn 5 s old.
+  const v = view(sil({ since: 5, progress: 1800 }), { recent: WINDOW });
+  assert.equal(v.state, 'busy');
+  assert.equal(v.stuck, null);
+  assert.equal(v.candidate, false);
+  assert.equal(v.line, 'Quiet · no progress since the turn began 5s ago');
+  assert.equal(v.aside.detail, 'No progress since the turn began 5s ago · no card while progress moves');
+});
+
+test('inactivity counts from max(last progress, turn start): boundaries', () => {
+  const at = (since, progress) => view(sil({ since, progress }), { recent: WINDOW });
+  // progress exactly at the turn start belongs to this turn; one second before it does not
+  assert.match(at(900, 900).line, /^Last progress 15m ago/);
+  assert.match(at(900, 901).line, /^No progress since the turn began 15m ago/);
+  // the earlier turn's progress never shortens or lengthens the wait
+  assert.equal(at(599, 5000).state, 'busy');
+  assert.equal(at(600, 5000).state, 'stuck');
+  assert.equal(at(600, 5000).stuck.progressAge, 600);
+  // progress noted in this turn wins over the turn start
+  assert.equal(at(1800, 100).state, 'busy');
+  assert.equal(at(1800, 700).state, 'stuck');
+  assert.equal(at(1800, 700).stuck.progressAge, 700);
+  // no last_progress_at at all
+  assert.equal(view(sil({ since: 1800 }), { recent: WINDOW }).stuck.progressAge, 1800);
+});
+
+test('a watchdog flag counts from when the wrapper raised it, and says so', () => {
+  const flagged = (since, progress) => view(agent(NAME, { state: 'stuck_suspected', since, progress }), { recent: WINDOW });
+  const early = flagged(120, 3000);
+  assert.deepEqual([early.state, early.candidate], ['busy', true]);
+  assert.equal(early.line, 'Wrapper flagged a stall 2m ago · reply status unknown');
+  const late = flagged(900, 3000);
+  assert.equal(late.state, 'stuck');
+  assert.equal(late.stuck.evidence, 'Wrapper flagged a stall 15m ago · no reply sent · heartbeat still fresh');
+});
+
+// ---------------------------------------- F3: the lead-chat feed's own state is shown
+
+const LEAD_MSG = { from: 'claude-agenttalk-lead', to: 'operator', body: 'Three things need you.', ts: iso(240) };
+const chatWith = (o) => team({ chat: { ok: true, asOfMs: NOW, payload: { available: true, lead: 'claude-agenttalk-lead', messages: [LEAD_MSG] }, ...o } });
+
+test('a healthy, fresh chat read carries no note', () => {
+  const v = chatWith({});
+  assert.deepEqual(v.lead.notes, []);
+  assert.equal(v.lead.body, 'Three things need you.');
+});
+
+test('a failed chat read keeps the last message and says the read failed, with how old the last good read is', () => {
+  const v = chatWith({ ok: false, asOfMs: NOW - 90e3 });
+  assert.equal(v.lead.body, 'Three things need you.');
+  assert.deepEqual(v.lead.notes, [{ kind: 'failed', text: 'Lead chat could not be read · last read 1m ago' }]);
+  const never = chatWith({ ok: false, asOfMs: null, payload: null });
+  assert.equal(never.lead.body, '');
+  assert.deepEqual(never.lead.notes, [{ kind: 'failed', text: 'Lead chat could not be read' }]);
+});
+
+test('a chat read that has not been refreshed (a hung request) is called stale', () => {
+  assert.deepEqual(chatWith({ asOfMs: NOW - 8000 }).lead.notes, []);
+  assert.deepEqual(chatWith({ asOfMs: NOW - 9000 }).lead.notes, [{ kind: 'stale', text: 'Lead chat not refreshed for 9s' }]);
+});
+
+test('an unavailable lead is stated even when an older message exists (web.py emits both)', () => {
+  const v = chatWith({ payload: { available: false, error: 'lead_unavailable', detail: 'lead heartbeat stale', lead: 'claude-agenttalk-lead', messages: [LEAD_MSG] } });
+  assert.equal(v.lead.body, 'Three things need you.');
+  assert.equal(v.lead.unavailable, true);
+  assert.deepEqual(v.lead.notes, [{ kind: 'unavailable', text: 'The lead is unavailable: lead heartbeat stale' }]);
+  const bare = chatWith({ payload: { available: false, messages: [] } });
+  assert.deepEqual(bare.lead.notes, [{ kind: 'unavailable', text: 'The lead is unavailable' }]);
+  assert.equal(bare.lead.body, '');
+});
+
+test('failed and unavailable together give both notes, failure first', () => {
+  const v = chatWith({ ok: false, asOfMs: NOW - 30e3, payload: { available: false, detail: 'gone', lead: 'claude-agenttalk-lead', messages: [LEAD_MSG] } });
+  assert.deepEqual(v.lead.notes.map((n) => n.kind), ['failed', 'unavailable']);
 });
 
 run();

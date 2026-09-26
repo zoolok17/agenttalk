@@ -186,6 +186,7 @@
   var RECENT_LIMIT = 25;         // /api/state keeps the 25 newest envelopes per root
   var STALLED_POLLS = 3;         // generated_at not advancing for more than this many polls
   var ATTENTION_FRESH_S = 8;     // an attention read older than four 2 s polls is stale
+  var CHAT_FRESH_S = 8;          // same for the lead-chat read
   var LEAD_BODY_LIMIT = 1200;
   var ASIDE_MAX = 8;
   var USAGE_DIFFER_POINTS = 5;
@@ -381,10 +382,14 @@
     }
     var sinceMs = parseMs(h.since);
     var sinceAge = sinceMs === null ? null : Math.max(0, (nowMs - sinceMs) / 1000);
-    var progressMs = parseMs(h.last_progress_at);
-    var haveProgress = progressMs !== null;
-    if (progressMs === null) progressMs = sinceMs;
-    var progAge = progressMs === null ? null : Math.max(0, (nowMs - progressMs) / 1000);
+    // Inactivity counts from the CURRENT turn. The wrapper keeps last_progress_at across
+    // idle and turn_start, so a value older than `since` (which is when this state began:
+    // the turn start for a freshly spawned, still-silent turn) belongs to an earlier turn and
+    // must not count. Progress noted inside the current state is used as it is.
+    var lpMs = parseMs(h.last_progress_at);
+    var haveProgress = lpMs !== null && (sinceMs === null || lpMs >= sinceMs);
+    var baselineMs = haveProgress ? lpMs : sinceMs;
+    var progAge = baselineMs === null ? null : Math.max(0, (nowMs - baselineMs) / 1000);
     var hbFresh = hbAge !== null && hbAge <= HEARTBEAT_FRESH_S;
 
     var view = {
@@ -399,8 +404,10 @@
       setState('idle', sinceAge === null ? 'Idle' : 'Idle · ' + fmtAge(sinceAge));
     } else if (hs === 'working_turn' || hs === 'working_silent' || hs === 'stuck_suspected') {
       var reply = replyInfo(name, sinceMs, ctx.recent, nowMs);
-      var progWord = haveProgress ? 'Last progress ' + (progAge === null ? '?' : fmtAge(progAge)) + ' ago'
-        : 'No progress noted since the turn began' + (progAge === null ? '' : ' ' + fmtAge(progAge) + ' ago');
+      var progWord;
+      if (haveProgress) progWord = 'Last progress ' + fmtAge(progAge) + ' ago';
+      else if (hs === 'stuck_suspected') progWord = 'Wrapper flagged a stall' + (progAge === null ? '' : ' ' + fmtAge(progAge) + ' ago');
+      else progWord = 'No progress since the turn began' + (progAge === null ? '' : ' ' + fmtAge(progAge) + ' ago');
       var noMsg = reply.lastMessageAge === null ? '' : ' · no message for ' + fmtAge(reply.lastMessageAge);
       if (!hbFresh) {
         setState('unknown', 'Heartbeat ' + (hbAge === null ? 'missing' : 'stale ' + fmtAge(hbAge)) +
@@ -419,8 +426,7 @@
           view.stuck = { evidence: evidence, progressAge: progAge };
         } else if (view.candidate) {
           var tail = reply.replied === true ? 'replied since it woke' : 'reply status unknown';
-          var lead = hs === 'stuck_suspected' && !quietLong ? 'Wrapper suspects a stall · ' : '';
-          setState('busy', lead + (lead ? progWord.charAt(0).toLowerCase() + progWord.slice(1) : progWord) + ' · ' + tail);
+          setState('busy', progWord + ' · ' + tail);
           view.aside = { title: short + ' is quiet',
             detail: progWord + ' · ' + tail + ' · no card without more evidence' };
         } else {
@@ -795,24 +801,39 @@
     view.chip.needsCount = att && view.needs.available ? openCount : null;
 
     // --- lead's latest message ---------------------------------------------------
+    // The newest message stays visible, but what the chat feed is doing to it is said next
+    // to it: the last read failed (with how long ago the last good read was), the read has
+    // not been refreshed for a while (a hung request), or the lead is unavailable.
     var chat = isObj(input.chat) ? input.chat : null;
-    if (chat && isObj(chat.payload)) {
-      var pl = chat.payload;
+    if (chat) {
+      var pl = isObj(chat.payload) ? chat.payload : {};
       var msgs = Array.isArray(pl.messages) ? pl.messages : [];
       var leadName = typeof pl.lead === 'string' ? pl.lead : lead;
       var found = null;
       for (var i = msgs.length - 1; i >= 0; i--) {
         if (isObj(msgs[i]) && msgs[i].from === leadName && typeof msgs[i].body === 'string') { found = msgs[i]; break; }
       }
-      var leadShort = leadName ? shortName(leadName, project, teamIds, known) : 'lead';
-      if (found) {
-        var atMs = parseMs(found.ts);
-        view.lead = { name: leadName, short: leadShort, body: str(found.body, LEAD_BODY_LIMIT),
-                      truncated: found.body.length > LEAD_BODY_LIMIT, atMs: atMs,
-                      ageLabel: atMs === null ? '' : fmtAge((nowMs - atMs) / 1000) + ' ago' };
-      } else if (pl.available === false) {
-        view.lead = { name: leadName, short: leadShort, body: '', unavailable: true,
-                      detail: str(pl.detail, 160), truncated: false, atMs: null, ageLabel: '' };
+      var chatNotes = [];
+      var readAge = typeof chat.asOfMs === 'number' ? Math.max(0, (nowMs - chat.asOfMs) / 1000) : null;
+      if (chat.ok === false) {
+        chatNotes.push({ kind: 'failed', text: 'Lead chat could not be read' +
+          (readAge === null ? '' : ' · last read ' + fmtAge(readAge) + ' ago') });
+      } else if (readAge !== null && readAge > CHAT_FRESH_S) {
+        chatNotes.push({ kind: 'stale', text: 'Lead chat not refreshed for ' + fmtAge(readAge) });
+      }
+      var leadDown = pl.available === false;
+      if (leadDown) {
+        chatNotes.push({ kind: 'unavailable', text: 'The lead is unavailable' + (pl.detail ? ': ' + str(pl.detail, 160) : '') });
+      }
+      if (found || chatNotes.length) {
+        var leadShort = leadName ? shortName(leadName, project, teamIds, known) : 'lead';
+        var atMs = found ? parseMs(found.ts) : null;
+        view.lead = {
+          name: leadName, short: leadShort, body: found ? str(found.body, LEAD_BODY_LIMIT) : '',
+          truncated: found ? found.body.length > LEAD_BODY_LIMIT : false, atMs: atMs,
+          ageLabel: atMs === null ? '' : fmtAge((nowMs - atMs) / 1000) + ' ago',
+          unavailable: leadDown, detail: leadDown ? str(pl.detail, 160) : '', notes: chatNotes
+        };
       }
     }
 
@@ -905,7 +926,8 @@
     // M2: pure view model
     LIMITS: {
       HEARTBEAT_FRESH_S: HEARTBEAT_FRESH_S, SOURCE_STALE_S: SOURCE_STALE_S, STUCK_AFTER_S: STUCK_AFTER_S,
-      RECENT_LIMIT: RECENT_LIMIT, STALLED_POLLS: STALLED_POLLS, ATTENTION_FRESH_S: ATTENTION_FRESH_S
+      RECENT_LIMIT: RECENT_LIMIT, STALLED_POLLS: STALLED_POLLS, ATTENTION_FRESH_S: ATTENTION_FRESH_S,
+      CHAT_FRESH_S: CHAT_FRESH_S
     },
     parseMs: parseMs,
     ageSeconds: ageSeconds,

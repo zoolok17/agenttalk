@@ -235,6 +235,13 @@ def test_v2_js_reads_only_the_three_feeds_through_one_fetch() -> None:
     assert "/api/intent" not in code and "/api/session" not in code
 
 
+def test_v2_js_bounds_every_request_with_a_timeout_and_an_abort_signal() -> None:
+    code = _strip_js_comments(_read("console2.js"))
+    assert "AbortController" in code and "REQUEST_TIMEOUT_MS" in code
+    assert "signal" in code and "clearTimeout" in code
+    assert re.search(r"var REQUEST_TIMEOUT_MS = \d{4};", code)
+
+
 def test_v2_js_uses_textcontent_and_creates_no_markup() -> None:
     code = _strip_js_comments(_read("console2.js"))
     assert "textContent" in code
@@ -372,7 +379,7 @@ def test_layout_matches_the_spec_grid() -> None:
 def test_console2_node_tests(script: str) -> None:
     r = subprocess.run(
         ["node", str(REPO_ROOT / "tests" / script)],
-        capture_output=True, text=True, timeout=120, cwd=REPO_ROOT, env={**os.environ, "TZ": "UTC"},
+        capture_output=True, text=True, encoding="utf-8", timeout=120, cwd=REPO_ROOT, env={**os.environ, "TZ": "UTC"},
     )
     assert r.returncode == 0, r.stdout + r.stderr
     last = r.stdout.strip().splitlines()[-1]

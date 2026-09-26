@@ -19,7 +19,7 @@ async function boot(opts = {}) {
   const wrapped = (url, init) => { requests.push([url, init]); return fetch(url, init); };
   const loaded = loadConsole({
     dom, fetch: wrapped, storage: opts.storage, storageThrows: opts.storageThrows,
-    search: opts.search, pathname: opts.pathname, hash: opts.hash,
+    search: opts.search, pathname: opts.pathname, hash: opts.hash, noAbort: opts.noAbort,
   });
   await tick(); await tick(); await tick();
   return { dom, requests, ...loaded };
@@ -53,7 +53,7 @@ test('only GETs of the three feeds, no cache, nothing else', async () => {
   const { requests } = await boot({ fetch: () => jsonResponse({ roots: [{ label: 'agenttalk', project_id: 'proj-a' }] }) });
   assert.deepEqual(requests.map((r) => r[0]), ['/api/state', '/api/attention?root=proj-a', '/api/lead-chat?root=proj-a']);
   for (const [, init] of requests) {
-    assert.deepEqual(Object.keys(init), ['cache']);
+    assert.deepEqual(Object.keys(init), ['cache', 'signal'], 'no method, no body: a GET bounded by an abort signal');
     assert.equal(init.cache, 'no-store');
   }
 });

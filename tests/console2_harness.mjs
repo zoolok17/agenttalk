@@ -175,7 +175,9 @@ export function loadConsole(opts) {
     console,
     URLSearchParams,
     performance: { now: () => clock.perf },
-    setTimeout(fn, ms) { timers.push({ fn, ms }); return timers.length; },
+    setTimeout(fn, ms) { const t = { fn, ms }; timers.push(t); return t; },
+    clearTimeout(t) { const i = timers.indexOf(t); if (i >= 0) timers.splice(i, 1); },
+    ...(opts.noAbort ? {} : { AbortController }),
     addEventListener(type, fn) { (windowEvents[type] = windowEvents[type] || []).push(fn); },
     location: { search: opts.search || '', pathname: opts.pathname || '/v2', hash: opts.hash || '' },
     history: { replaceState(state, title, url) { historyCalls.push(url); } },
@@ -187,9 +189,12 @@ export function loadConsole(opts) {
   if (!opts.modelOnly) {
     vm.runInContext(readStatic('console2.js'), sandbox, { filename: 'console2.js' });
   }
-  // Fire every timer queued so far (one poll round), then let promises settle.
-  async function fire() {
-    const due = timers.splice(0, timers.length);
+  // Fire the timers queued so far (all, or those whose delay satisfies `pred`), then let
+  // promises settle. Request timeouts (5000 ms) are timers too: pass a predicate to leave
+  // them pending, e.g. fire((ms) => ms < 5000).
+  async function fire(pred) {
+    const due = timers.filter((t) => !pred || pred(t.ms));
+    due.forEach((t) => { const i = timers.indexOf(t); if (i >= 0) timers.splice(i, 1); });
     due.forEach((t) => t.fn());
     for (let i = 0; i < 12; i++) await tick();
     return due.map((t) => t.ms);

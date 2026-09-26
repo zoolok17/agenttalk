@@ -15,6 +15,10 @@ import {
 const { test, run } = createRunner('console2 data layer');
 const HOSTILE = '<img src=x onerror=alert(1)>';
 const LEAD = 'claude-agenttalk-lead';
+const PENDING = { __pending: true };
+const JSON_HANG = { __jsonHang: true };
+const under = (ms) => ms < 5000;   // every timer except the 5 s request timeouts
+const timeouts = (ms) => ms === 5000;
 
 // A programmable server: state/attention/chat handlers may return a payload, a
 // {status} problem, or throw; every request is recorded.
@@ -29,16 +33,22 @@ function server(o = {}) {
     attention: o.attention || (() => ({ target_root_project_id: 'proj-a', items: [] })),
     chat: o.chat || (() => ({ target_root_project_id: 'proj-a', available: true, lead: LEAD, messages: [] })),
     down: false,
+    pendingState: false,   // /api/state never answers
+    inits: [],             // the init object of every request, in order
     fetch(url, init) {
       calls.push(url);
+      s.inits.push(init);
       if (s.down) return Promise.reject(new Error('down'));
       const u = new URL(url, 'http://x');
       const id = u.searchParams.get('root') || '';
       let payload;
+      if (u.pathname === '/api/state' && s.pendingState) return new Promise(() => {});
       if (u.pathname === '/api/state') payload = { schema_version: 1, generated_at: s.generated(), roots: s.roots() };
       else if (u.pathname === '/api/attention') payload = s.attention(id);
       else if (u.pathname === '/api/lead-chat') payload = s.chat(id);
       else return jsonResponse({}, 404);
+      if (payload && payload.__pending) return new Promise(() => {});                       // never settles
+      if (payload && payload.__jsonHang) return Promise.resolve({ ok: true, status: 200, json: () => new Promise(() => {}) });
       if (payload && payload.__status) return jsonResponse({}, payload.__status);
       return jsonResponse(payload);
     },
@@ -126,9 +136,9 @@ test('polling: 2 s cadence, one state read then the selected team’s feeds', as
   const srv = server();
   const { timers, fire } = await boot(srv);
   assert.deepEqual(srv.calls, ['/api/state', '/api/attention?root=proj-a', '/api/lead-chat?root=proj-a']);
-  assert.deepEqual(timers.map((t) => t.ms), [2000]);
+  assert.deepEqual(timers.map((t) => t.ms).sort(), [1000, 2000], 'the poll (2 s) and the repaint (1 s); requests leave no timers behind');
   const ms = await fire();
-  assert.deepEqual(ms, [2000]);
+  assert.deepEqual(ms.sort(), [1000, 2000]);
   assert.equal(srv.calls.length, 6);
   assert.deepEqual(srv.calls.slice(3), ['/api/state', '/api/attention?root=proj-a', '/api/lead-chat?root=proj-a']);
 });
@@ -216,14 +226,15 @@ test('attention with errors-as-data says it cannot read what needs you', async (
   assert.ok(!all(stream(dom)).includes('boom'));
 });
 
-test('an answer for a different team is discarded, not shown', async () => {
+test('an answer for a different team is discarded, not shown, and counts as a failed read', async () => {
   const { dom } = await boot(server({
     attention: () => ({ target_root_project_id: 'someone-else', items: [ATT_ITEM({ id: 'x', title: 'Not ours' })] }),
     chat: () => ({ target_root_project_id: 'someone-else', available: true, lead: LEAD, messages: [{ from: LEAD, body: 'Not ours', ts: iso(1) }] }),
   }));
   const s = all(stream(dom));
   assert.ok(!s.includes('Not ours'));
-  assert.ok(s.includes('Waiting for the first snapshot.'), 'no attention data yet means no claim about what needs you');
+  assert.ok(s.includes('Can\u2019t read what needs you.'), 'no usable attention data: no claim about what needs you');
+  assert.ok(s.includes('Lead chat could not be read'));
 });
 
 test('quiet day: greeting, idle sentence, since-you-last-looked from the stored visit', async () => {
@@ -322,6 +333,160 @@ test('there is no GO button and no control that could act in the page (M2 draws 
   assert.ok(!page.some((t) => /GO/.test(t)), 'no GO');
   const controls = [stream(dom), rail(dom)].flatMap((n) => walk(n)).filter((n) => ['BUTTON', 'INPUT', 'TEXTAREA', 'FORM', 'A'].includes(n.tagName));
   assert.deepEqual(controls, []);
+});
+
+// ------------------------------------------------------- F1: hung requests
+
+test('a lead-chat request that never settles does not stop the state polls or the redraw', async () => {
+  const srv = server();
+  const { dom, clock, fire } = await boot(srv);
+  srv.chat = () => PENDING;
+  await fire(under);                       // the chat request is launched and hangs
+  const stateCalls = () => srv.calls.filter((u) => u === '/api/state').length;
+  const chatCalls = () => srv.calls.filter((u) => u.startsWith('/api/lead-chat')).length;
+  const before = [stateCalls(), chatCalls()];
+  for (let i = 0; i < 3; i++) { clock.perf += 2000; await fire(under); }
+  assert.equal(stateCalls(), before[0] + 3, 'the state keeps being polled');
+  assert.equal(chatCalls(), before[1], 'the hung feed is not stacked with new requests');
+  assert.ok(all(rail(dom)).includes('TEAM · 9'), 'the roster is still drawn');
+});
+
+test('old chat data does not look live while its refresh hangs: a stale note appears on the repaint clock alone', async () => {
+  const msgs = [{ from: LEAD, to: 'operator', body: 'Older word from the lead.', ts: iso(60) }];
+  const srv = server({ chat: () => ({ target_root_project_id: 'proj-a', available: true, lead: LEAD, messages: msgs }) });
+  const { dom, clock, fire } = await boot(srv);
+  assert.ok(all(stream(dom)).includes('Older word from the lead.'));
+  assert.ok(!all(stream(dom)).includes('not refreshed'));
+  srv.chat = () => PENDING;
+  await fire(under);                       // launches the hanging request
+  clock.perf += 9000;
+  srv.down = true;                         // the state is not answering either: only the repaint clock runs
+  await fire((ms) => ms === 1000);
+  assert.ok(all(stream(dom)).includes('Older word from the lead.'), 'the message stays');
+  assert.ok(all(stream(dom)).includes('Lead chat not refreshed for 9s'));
+});
+
+test('a request that hits the timeout is aborted, recorded as failed, and retried on the next round', async () => {
+  const srv = server();
+  const { dom, fire } = await boot(srv);
+  srv.chat = () => PENDING;
+  await fire(under);
+  const hung = srv.inits[srv.inits.length - 1];
+  assert.ok(hung.signal && hung.signal.aborted === false);
+  const before = srv.calls.filter((u) => u.startsWith('/api/lead-chat')).length;
+  await fire(timeouts);                    // the 5 s timeout fires
+  assert.equal(hung.signal.aborted, true, 'the request is aborted');
+  assert.ok(all(stream(dom)).includes('Lead chat could not be read'));
+  await fire(under);                       // next round: the feed is free again
+  assert.equal(srv.calls.filter((u) => u.startsWith('/api/lead-chat')).length, before + 1);
+});
+
+test('without AbortController the timeout still bounds the wait', async () => {
+  const srv = server({ chat: () => PENDING });
+  const { dom, fire } = await boot(srv, { noAbort: true });
+  assert.deepEqual(Object.keys(srv.inits[0]), ['cache']);
+  await fire(timeouts);
+  assert.ok(all(stream(dom)).includes('Lead chat could not be read'));
+});
+
+test('a response whose body never arrives is bounded too', async () => {
+  const srv = server({ chat: () => JSON_HANG });
+  const { dom, fire } = await boot(srv);
+  await fire(timeouts);
+  assert.ok(all(stream(dom)).includes('Lead chat could not be read'));
+});
+
+test('an attention request that hangs ends as "cannot read", not as an empty "loading" forever', async () => {
+  const { dom, fire } = await boot(server({ attention: () => PENDING }));
+  assert.ok(all(stream(dom)).includes('Waiting for the first snapshot.'), 'while it is pending, no claim either way');
+  await fire(timeouts);
+  assert.ok(all(stream(dom)).includes('Can’t read what needs you.'));
+  assert.ok(all(rail(dom)).includes('TEAM · 9'));
+});
+
+test('a hung state read on the first load ends in the unreachable banner', async () => {
+  const srv = server();
+  srv.pendingState = true;
+  const { dom, timers, fire } = await boot(srv);
+  assert.equal(all(stream(dom)), '', 'nothing is claimed while the first read is pending');
+  assert.ok(timers.some((t) => t.ms === 5000));
+  await fire(timeouts);
+  assert.ok(all(stream(dom)).includes('CAN’T REACH THE CONSOLE SERVER'));
+  assert.ok(all(stream(dom)).includes('No snapshot has arrived yet.'));
+  assert.equal(classOf(header(dom), 'c2-chip')[0].textContent, 'No team data');
+});
+
+test('a hung state read later on greys the page with the last data kept', async () => {
+  const srv = server();
+  const { dom, clock, fire } = await boot(srv);
+  srv.pendingState = true;
+  clock.perf += 2000;
+  await fire(under);                       // the next poll hangs
+  assert.equal(app(dom).className, '', 'not yet: the request is still inside its timeout');
+  await fire(timeouts);
+  assert.equal(app(dom).className, 'is-stale');
+  assert.ok(all(stream(dom)).includes('CAN’T REACH THE CONSOLE SERVER'));
+  assert.ok(all(rail(dom)).includes('TEAM · 9'));
+});
+
+test('a response that arrives in time clears its timeout (no leftover timers)', async () => {
+  const { timers } = await boot(server());
+  assert.deepEqual(timers.map((t) => t.ms).sort(), [1000, 2000]);
+});
+
+// -------------------------------------------- F3: chat failures are shown
+
+test('a chat read that fails after a good one keeps the message and says so; recovery clears the note', async () => {
+  const msgs = [{ from: LEAD, to: 'operator', body: 'Standing by.', ts: iso(100) }];
+  const srv = server({ chat: () => ({ target_root_project_id: 'proj-a', available: true, lead: LEAD, messages: msgs }) });
+  const { dom, clock, fire } = await boot(srv);
+  srv.chat = () => ({ __status: 500 });
+  clock.perf += 6000;
+  await fire();
+  const s = all(stream(dom));
+  assert.ok(s.includes('Standing by.'));
+  assert.ok(/Lead chat could not be read · last read [5-7]s ago/.test(s), s);
+  srv.chat = () => ({ target_root_project_id: 'proj-a', available: true, lead: LEAD, messages: msgs });
+  await fire();
+  assert.ok(!all(stream(dom)).includes('could not be read'));
+});
+
+test('an unavailable lead is shown next to an older message', async () => {
+  const msgs = [{ from: LEAD, to: 'operator', body: 'Last thing I said.', ts: iso(600) }];
+  const { dom } = await boot(server({ chat: () => ({ target_root_project_id: 'proj-a', available: false, error: 'lead_unavailable',
+    detail: 'lead heartbeat stale', lead: LEAD, messages: msgs }) }));
+  const s = all(stream(dom));
+  assert.ok(s.includes('Last thing I said.'));
+  assert.ok(s.includes('The lead is unavailable: lead heartbeat stale'));
+});
+
+// --------------------------------- F4: attention errors-as-data keep the last decisions
+
+test('attention errors-as-data after a good read keep the last decisions, flagged, and recovery replaces them', async () => {
+  const good = (title) => () => ({ target_root_project_id: 'proj-a', items: [ATT_ITEM({ id: 'd1', title, age: 3600 })] });
+  const srv = server({ attention: good('Pending decision A') });
+  const { dom, fire } = await boot(srv);
+  assert.ok(all(stream(dom)).includes('Pending decision A'));
+  srv.attention = () => ({ target_root_project_id: 'proj-a', items: [], errors: ['scan failed'] });
+  await fire();
+  const s = all(stream(dom));
+  assert.ok(s.includes('Pending decision A'), 'the decision is not erased');
+  assert.ok(s.includes('Can’t read what needs you.'), 'and the failure is stated');
+  assert.ok(!s.includes('scan failed'), 'the error text is never shown');
+  assert.equal(app(dom).className, 'is-stale');
+  srv.attention = good('Pending decision B');
+  await fire();
+  const after = all(stream(dom));
+  assert.ok(after.includes('Pending decision B') && !after.includes('Pending decision A'));
+  assert.ok(!after.includes('Can’t read what needs you.'));
+  assert.equal(app(dom).className, '');
+});
+
+test('errors-as-data on the very first attention read says cannot read, with no items to keep', async () => {
+  const calm = () => [root({ project_id: 'proj-a', agents: [agent(LEAD)], recent: [env(LEAD, 'x', 'message', 5)] })];
+  const { dom } = await boot(server({ roots: calm, attention: () => ({ target_root_project_id: 'proj-a', items: [], errors: ['x'] }) }));
+  assert.ok(all(stream(dom)).includes('Can’t read what needs you.'));
+  assert.equal(classOf(stream(dom), 'c2-card').length, 0);
 });
 
 run();

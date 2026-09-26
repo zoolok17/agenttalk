@@ -40,6 +40,8 @@
   var POLL_MS = 2000;
   var OTHER_ATTENTION_EVERY = 5;
   var PARAM_SHOW_MAX = 64;
+  var REQUEST_TIMEOUT_MS = 5000;   // no request may hold anything up for longer than this
+  var PAINT_MS = 1000;             // the page repaints on its own clock, whatever the feeds are doing
 
   var theme = M.DEFAULT_THEME;
   var rootParam = readRootParam();   // what ?root= asked for, then what the operator picked
@@ -58,6 +60,7 @@
   var chrome = { teamSeg: null, themeButtons: [], chipKeys: [], chips: [] };
   var lastSig = null;
   var running = false;
+  var inflight = {};       // feed key -> true while a request for it is outstanding
 
   // ---------------------------------------------------------------- helpers
 
@@ -318,12 +321,14 @@
   function leadBlock(lead) {
     var box = el('section', 'c2-lead');
     box.setAttribute('aria-label', 'Lead’s latest message');
-    if (lead.unavailable) {
-      box.appendChild(el('p', 'c2-lead-body is-dim', 'The lead is not reachable' + (lead.detail ? ': ' + lead.detail : '.')));
-      return box;
+    if (lead.body) {
+      box.appendChild(el('p', 'c2-lead-body', lead.body));
+      box.appendChild(el('div', 'c2-meta', lead.short + (lead.ageLabel ? ' · ' + lead.ageLabel : '')));
     }
-    box.appendChild(el('p', 'c2-lead-body', lead.body));
-    box.appendChild(el('div', 'c2-meta', lead.short + (lead.ageLabel ? ' · ' + lead.ageLabel : '')));
+    // What the chat feed is doing to that message: failed read, not refreshed, lead unavailable.
+    (lead.notes || []).forEach(function (n) {
+      box.appendChild(el('div', 'c2-note tone-warn c2-lead-note is-' + n.kind, n.text));
+    });
     return box;
   }
 
@@ -479,10 +484,30 @@
 
   // ------------------------------------------------------------------- data
 
+  // A bounded GET. The timeout also covers a request that never settles at all, and
+  // one that ignores its abort signal, so a hung feed can never hold the page up.
   function getJson(url) {
-    return fetch(url, { cache: 'no-store' }).then(function (r) {
-      if (!r.ok) throw new Error('http ' + r.status);
-      return r.json();
+    return new Promise(function (resolve, reject) {
+      var ctl = typeof AbortController === 'function' ? new AbortController() : null;
+      var settled = false;
+      var timer = setTimeout(function () {
+        if (settled) return;
+        settled = true;
+        if (ctl) { try { ctl.abort(); } catch (e) { /* nothing to abort */ } }
+        reject(new Error('timeout'));
+      }, REQUEST_TIMEOUT_MS);
+      function finish(fn, value) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        fn(value);
+      }
+      var init = { cache: 'no-store' };
+      if (ctl) init.signal = ctl.signal;
+      fetch(url, init).then(function (r) {
+        if (!r.ok) throw new Error('http ' + r.status);
+        return r.json();
+      }).then(function (value) { finish(resolve, value); }, function (err) { finish(reject, err); });
     });
   }
 
@@ -510,29 +535,53 @@
     return payload.target_root_project_id === id;
   }
 
+  // One request per feed at a time: a slow answer is waited for (up to the timeout), not
+  // stacked up behind new requests.
+  function guarded(key, run) {
+    if (inflight[key]) return Promise.resolve();
+    inflight[key] = true;
+    function release() { delete inflight[key]; }
+    return run().then(release, release);
+  }
+
+  // A failed or unusable read never erases what was last known: the items stay, marked
+  // as failed (and how old they are), until a good read replaces them.
+  function attentionFailed(id) {
+    var prior = data.attention[id];
+    data.attention[id] = { ok: false, asOfMs: prior ? prior.asOfMs : null, items: prior ? prior.items : [] };
+  }
+
+  function chatFailed(id) {
+    var prior = data.chat[id];
+    data.chat[id] = { ok: false, asOfMs: prior ? prior.asOfMs : null, payload: prior ? prior.payload : null };
+  }
+
   function fetchAttention(id) {
-    return getJson(rootUrl('/api/attention', id)).then(function (payload) {
-      if (!answersFor(payload, id)) return;
-      var bad = Array.isArray(payload.errors) && payload.errors.length > 0;
-      data.attention[id] = { ok: !bad, asOfMs: nowMs(), items: Array.isArray(payload.items) ? payload.items : [] };
-    }, function () {
-      var prior = data.attention[id];
-      if (prior) data.attention[id] = { ok: false, asOfMs: prior.asOfMs, items: prior.items };
+    return guarded('att:' + id, function () {
+      return getJson(rootUrl('/api/attention', id)).then(function (payload) {
+        var bad = !answersFor(payload, id) || (Array.isArray(payload.errors) && payload.errors.length > 0);
+        if (bad) attentionFailed(id);
+        else data.attention[id] = { ok: true, asOfMs: nowMs(), items: Array.isArray(payload.items) ? payload.items : [] };
+      }, function () {
+        attentionFailed(id);
+      }).then(renderAll);
     });
   }
 
   function fetchChat(id) {
-    return getJson(rootUrl('/api/lead-chat', id)).then(function (payload) {
-      if (!answersFor(payload, id)) return;
-      data.chat[id] = { ok: true, asOfMs: nowMs(), payload: payload };
-    }, function () {
-      var prior = data.chat[id];
-      if (prior) data.chat[id] = { ok: false, asOfMs: prior.asOfMs, payload: prior.payload };
+    return guarded('chat:' + id, function () {
+      return getJson(rootUrl('/api/lead-chat', id)).then(function (payload) {
+        if (!answersFor(payload, id)) chatFailed(id);
+        else data.chat[id] = { ok: true, asOfMs: nowMs(), payload: payload };
+      }, function () {
+        chatFailed(id);
+      }).then(renderAll);
     });
   }
 
   // Feeds for the selected team every round; the other teams' attention (for their
-  // needs badges) on the rounds that ask for it (the first, then every 5th).
+  // needs badges) on the rounds that ask for it (the first, then every 5th). Each feed
+  // runs on its own: nothing here is waited for by the state poll or by the redraw.
   function pollFeeds(withOthers) {
     var roots = currentRoots();
     if (!roots) return Promise.resolve();
@@ -549,6 +598,8 @@
     return Promise.all(jobs);
   }
 
+  // One round: read the state, draw it at once, then start the feeds without waiting
+  // for them. A feed that hangs delays neither the next state read nor any redraw.
   function pollOnce() {
     var withOthers = data.cycle % OTHER_ATTENTION_EVERY === 0;
     data.cycle += 1;
@@ -559,8 +610,9 @@
       data.conn.reachable = false;   // keep the last good data, greyed and stamped
       return false;
     }).then(function (ok) {
-      return ok ? pollFeeds(withOthers) : null;
-    }).then(renderAll, renderAll);
+      renderAll();
+      if (ok) pollFeeds(withOthers);
+    });
   }
 
   function loop() {
@@ -571,6 +623,12 @@
       setTimeout(loop, POLL_MS);
     }
     pollOnce().then(done, done);
+  }
+
+  // Time keeps moving when nothing arrives: ages, the silent threshold and stale feeds
+  // are recomputed on this clock even while every request is outstanding.
+  function paint() {
+    try { renderAll(); } finally { setTimeout(paint, PAINT_MS); }
   }
 
   // --------------------------------------------------------------- keyboard
@@ -596,4 +654,5 @@
   on(document, 'keydown', onKey);
   on(window, 'pagehide', saveVisit);
   loop();
+  setTimeout(paint, PAINT_MS);
 }());
