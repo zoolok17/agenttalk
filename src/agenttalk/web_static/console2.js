@@ -385,6 +385,14 @@
     box.setAttribute('role', 'status');
     box.appendChild(el('div', 'c2-banner-kicker', b.kicker));
     box.appendChild(el('div', 'c2-banner-text', b.message));
+    if (b.retryLabel) box.appendChild(el('div', 'c2-meta c2-banner-retried', b.retryLabel));
+    if (b.canRetry) {
+      var retry = el('button', 'c2-retry', 'Retry now');
+      retry.setAttribute('type', 'button');
+      retry.setAttribute('data-c2-focus', '|banner|retry');
+      on(retry, 'click', retryNow);
+      box.appendChild(retry);
+    }
     return box;
   }
 
@@ -394,12 +402,35 @@
     return (letters.slice(0, 2) || '?').toUpperCase();
   }
 
+  // avatarNode is the ONLY place an <img src> is ever set. `file` only ever reaches here as the
+  // return value of M.avatarFile (a pure function of a fixed motif list and a stable hash: never
+  // raw agent text), and is checked again here against the model's own closed allowlist before
+  // use, so an unexpected value renders no image rather than an unvetted URL.
+  var AVATAR_FILE_SET = {};
+  M.AVATAR_FILES.forEach(function (f) { AVATAR_FILE_SET[f] = true; });
+
+  function avatarNode(file, runtime, cls) {
+    var box = el('span', cls || 'c2-avatar');
+    if (hasOwn(AVATAR_FILE_SET, file)) {
+      var img = el('img', 'c2-avatar-img');
+      img.setAttribute('alt', '');
+      img.setAttribute('src', '/static/avatars/' + file);
+      box.appendChild(img);
+    }
+    box.appendChild(el('span', 'c2-avatar-badge rt-' + (runtime || 'none'), RUNTIME_LETTER[runtime] || '?'));
+    return box;
+  }
+
+  function hasOwn(obj, key) { return Object.prototype.hasOwnProperty.call(obj, key); }
+
   function leadBlock(lead) {
     var box = el('section', 'c2-lead');
     box.setAttribute('aria-label', 'Lead’s latest message');
     if (lead.body) {
       var row = el('div', 'c2-lead-row');
-      row.appendChild(el('span', 'c2-lead-avatar', initials(lead.short)));
+      var avatar = avatarNode(lead.avatarFile, lead.runtime, 'c2-avatar c2-lead-avatar');
+      avatar.setAttribute('title', lead.name);   // 06-RULES: the full name is always in the tooltip
+      row.appendChild(avatar);
       var col = el('div', 'c2-lead-col');
       col.appendChild(el('p', 'c2-lead-body', lead.body));
       col.appendChild(el('div', 'c2-meta', lead.short + (lead.ageLabel ? ' · ' + lead.ageLabel : '')));
@@ -524,7 +555,7 @@
   // its text is updated). So a redraw that only moves an age label keeps keyboard focus, the
   // operator's scroll position and the chat thread exactly where they are; an element that really
   // changed is replaced, one that is gone is removed.
-  var TRACKED_ATTRS = ['title', 'aria-disabled', 'aria-label', 'role', 'type', 'placeholder', 'data-c2-focus'];
+  var TRACKED_ATTRS = ['title', 'aria-disabled', 'aria-label', 'role', 'type', 'placeholder', 'data-c2-focus', 'src'];
 
   function kids(node) { return Array.prototype.slice.call(node.children); }
 
@@ -691,7 +722,7 @@
   function rosterRow(r) {
     var row = el('div', 'c2-agent st-' + r.state);
     row.setAttribute('title', r.title);
-    row.appendChild(el('span', 'c2-rt rt-' + (r.runtime || 'none'), RUNTIME_LETTER[r.runtime] || '?'));
+    row.appendChild(avatarNode(r.avatarFile, r.runtime));
     var text = el('div', 'c2-agent-text');
     text.appendChild(el('div', 'c2-agent-name', r.short));
     text.appendChild(el('div', 'c2-agent-line tone-' + r.tone, r.line));
@@ -822,6 +853,7 @@
 
   function ingestState(payload) {
     if (!payload || !Array.isArray(payload.roots)) throw new Error('bad state');
+    data.conn.retriedAt = null;   // a good read: whatever retry was pending is resolved
     var gen = M.parseMs(payload.generated_at);
     if (gen === null) gen = Date.now();   // an old server without the field: fall back to the local clock
     var stalled = data.generatedMs !== null && gen <= data.generatedMs;
@@ -918,6 +950,13 @@
       renderAll();
       if (ok) pollFeeds(withOthers);
     });
+  }
+
+  // A manual retry: stamp the attempt time (in server-anchored time, so it prints correctly
+  // even while unreachable) and poll immediately, without waiting for the next 2 s tick.
+  function retryNow() {
+    data.conn.retriedAt = nowMs();
+    pollOnce();
   }
 
   function loop() {

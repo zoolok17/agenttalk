@@ -209,10 +209,14 @@ const THREAD = [
 ];
 const chatOf = (messages) => ({ chat: () => ({ target_root_project_id: 'proj-a', available: true, operator: 'operator', lead: LEAD, messages }) });
 
-test('the lead\u2019s latest message: avatar ring initials, body, who and when', async () => {
+test('the lead\u2019s latest message: a hexagon avatar with the runtime badge, body, who and when', async () => {
   const { dom } = await boot(server({ roots: calm, ...chatOf(THREAD) }));
   const lead = classOf(stream(dom), 'c2-lead')[0];
-  assert.equal(classOf(lead, 'c2-lead-avatar')[0].textContent, 'LE');
+  const avatar = classOf(lead, 'c2-lead-avatar')[0];
+  assert.ok(avatar.className.split(' ').includes('c2-avatar'));
+  assert.equal(classOf(avatar, 'c2-avatar-img')[0].getAttribute('src'), '/static/avatars/hexagon-architect.png');
+  assert.equal(classOf(avatar, 'c2-avatar-badge')[0].textContent, 'C');
+  assert.equal(avatar.getAttribute('title'), LEAD, '06-RULES: the full name is always in the tooltip');
   assert.equal(classOf(lead, 'c2-lead-body')[0].textContent, 'Three things need you.');
   assert.equal(classOf(lead, 'c2-meta')[0].textContent, 'lead \u00b7 10m ago');
 });
@@ -293,7 +297,12 @@ test('every option and control label from a feed is text, and no element gets a 
   const html = walk(stream(dom));
   assert.ok(html.some((n) => n.textContent.includes(HOSTILE)));
   for (const n of html) {
-    assert.ok(!Object.keys(n.attributes).some((k) => k.startsWith('on') || k === 'style' || k === 'href' || k === 'src'));
+    if (n.tagName === 'IMG' && n.getAttribute('src')) {
+      assert.match(n.getAttribute('src'), /^\/static\/avatars\/[a-z0-9-]+\.png$/, 'the only allowed src shape');
+      assert.equal(n.getAttribute('alt'), '');
+    }
+    assert.ok(!Object.keys(n.attributes).some((k) => k.startsWith('on') || k === 'style' || k === 'href'
+      || (k === 'src' && n.tagName !== 'IMG')));
     assert.ok(/^[a-z0-9 _:-]*$/i.test(n.className), 'fixed class vocabulary: ' + n.className);
   }
 });

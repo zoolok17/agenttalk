@@ -550,6 +550,27 @@ test('lead\u2019s latest message: the newest from the lead, bounded, with its ag
   assert.deepEqual([down.lead.unavailable, down.lead.detail], [true, 'lead heartbeat stale']);
 });
 
+test('M4: the lead’s message carries an avatar file (from the model’s own closed list) and a runtime', () => {
+  const v = team({ chat: chat([{ from: 'claude-agenttalk-lead', body: 'hi', ts: iso(1) }]) });
+  assert.equal(v.lead.avatarFile, 'hexagon-architect.png');
+  assert.equal(v.lead.runtime, 'claude');
+  assert.ok(M.AVATAR_FILES.indexOf(v.lead.avatarFile) >= 0);
+  const other = team({ chat: chat([{ from: 'codex-agenttalk-lead', body: 'hi', ts: iso(1) }], { lead: 'codex-agenttalk-lead' }) });
+  assert.equal(other.lead.runtime, 'codex');
+});
+
+test('M4: AVATAR_FILES is exactly the ten hexagon motifs, and every roster avatarFile is one of them', () => {
+  assert.equal(M.AVATAR_FILES.length, 10);
+  assert.ok(M.AVATAR_FILES.every((f) => /^hexagon-[a-z]+\.png$/.test(f)));
+  assert.deepEqual(new Set(M.AVATAR_FILES).size, 10, 'no duplicates');
+  const v = team();
+  v.roster.rows.forEach((r) => assert.ok(M.AVATAR_FILES.indexOf(r.avatarFile) >= 0, r.name));
+  // hostile/odd names still resolve to a member of the closed list, never anything else
+  for (const bad of ['<img src=x onerror=alert(1)>', '../../etc/passwd', '', 'claude-agenttalk-' + 'x'.repeat(300)]) {
+    assert.ok(M.AVATAR_FILES.indexOf(M.avatarFile(bad, null)) >= 0, bad);
+  }
+});
+
 test('roster: lead first, short names, ties broken, summary, count', () => {
   const v = team();
   assert.equal(v.roster.total, 9);

@@ -304,6 +304,8 @@
     return h;
   }
 
+  var AVATAR_FILES = HEX_MOTIFS.map(function (m) { return 'hexagon-' + m + '.png'; });
+
   function avatarFile(agentName, role) {
     var motif = null;
     var r = typeof role === 'string' ? role.toLowerCase() : '';
@@ -599,6 +601,10 @@
           : 'The server answers, but the newest write was at ' + clockHM(asOfMs, tz) + '.') +
           ' Everything below is greyed and stamped; nothing is live.'
       };
+    }
+    if (out.banner) {
+      out.banner.canRetry = true;
+      if (typeof c.retriedAt === 'number') out.banner.retryLabel = 'Still unreachable · tried ' + clockHM(c.retriedAt, tz);
     }
     return out;
   }
@@ -906,7 +912,8 @@
           name: leadName, short: leadShort, body: found ? str(found.body, LEAD_BODY_LIMIT) : '',
           truncated: found ? found.body.length > LEAD_BODY_LIMIT : false, atMs: atMs,
           ageLabel: atMs === null ? '' : fmtAge((nowMs - atMs) / 1000) + ' ago',
-          unavailable: leadDown, detail: leadDown ? str(pl.detail, 160) : '', notes: chatNotes
+          unavailable: leadDown, detail: leadDown ? str(pl.detail, 160) : '', notes: chatNotes,
+          avatarFile: avatarFile(leadName, null), runtime: runtimeOf({ name: leadName })
         };
       }
     }
@@ -1022,6 +1029,7 @@
     whenLabel: whenLabel,
     resetLabel: resetLabel,
     avatarFile: avatarFile,
+    AVATAR_FILES: AVATAR_FILES,
     replyInfo: replyInfo,
     agentView: agentView,
     usageRows: usageRows,

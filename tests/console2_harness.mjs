@@ -132,6 +132,13 @@ export function makeDom() {
     removeAttribute(name) { delete this.attributes[String(name).toLowerCase()]; }
     setAttribute(name, value) {
       const n = String(name).toLowerCase();
+      // `src` is allowed ONLY for the one narrow, allowlisted shape the app is meant to use
+      // (a served avatar file, M4): anything else - a hostile string, a bare filename, an
+      // external URL - still throws, so the ban on "a link/source built from data" still holds.
+      if (n === 'src' && /^\/static\/avatars\/[a-z0-9-]+\.png$/.test(String(value))) {
+        this.attributes[n] = String(value);
+        return;
+      }
       if (n === 'style' || n === 'href' || n === 'src' || n === 'srcdoc' || n.startsWith('on')) {
         forbid('setAttribute ' + n);
       }

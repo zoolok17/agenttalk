@@ -121,6 +121,74 @@ test('a failed state read keeps the last good data, greyed, with the unreachable
   assert.equal(chips(dom)[0].children[0].className, 'c2-dot is-live');
 });
 
+// ============================================================================= M4: Retry now
+
+test('Retry now polls at once (not on the 2 s cadence), and disappears once live again', async () => {
+  const srv = server();
+  const { dom, fire } = await boot(srv);
+  srv.down = true;
+  await fire();
+  const before = srv.calls.filter((u) => u === '/api/state').length;
+  classOf(stream(dom), 'c2-retry')[0].click();
+  for (let i = 0; i < 12; i++) await new Promise((r) => setTimeout(r, 0));
+  assert.equal(srv.calls.filter((u) => u === '/api/state').length, before + 1, 'no waiting for the next tick');
+  assert.equal(app(dom).className, 'is-stale', 'still down: the retry itself failed too');
+  srv.down = false;
+  classOf(stream(dom), 'c2-retry')[0].click();
+  for (let i = 0; i < 12; i++) await new Promise((r) => setTimeout(r, 0));
+  assert.equal(app(dom).className, '');
+  assert.equal(classOf(stream(dom), 'c2-retry').length, 0, 'the banner, and its button, are gone');
+});
+
+test('a retry that still fails is followed by "Still unreachable"; the label only appears after a retry', async () => {
+  const srv = server();
+  const { dom, clock, fire } = await boot(srv);
+  srv.down = true;
+  await fire();
+  assert.equal(all(stream(dom)).includes('Still unreachable'), false, 'no retry attempted yet');
+  clock.perf += 3000;
+  classOf(stream(dom), 'c2-retry')[0].click();
+  for (let i = 0; i < 12; i++) await new Promise((r) => setTimeout(r, 0));
+  assert.match(all(stream(dom)), /Still unreachable \u00b7 tried \d\d:\d\d/);
+});
+
+test('a retry that succeeds never leaves a stale "tried" label behind the next time it goes down', async () => {
+  const srv = server();
+  const { dom, fire } = await boot(srv);
+  srv.down = true;
+  await fire();
+  classOf(stream(dom), 'c2-retry')[0].click();
+  for (let i = 0; i < 12; i++) await new Promise((r) => setTimeout(r, 0));
+  assert.match(all(stream(dom)), /Still unreachable/);
+  srv.down = false;
+  await fire();
+  assert.equal(app(dom).className, '');
+  srv.down = true;
+  await fire();
+  assert.equal(all(stream(dom)).includes('Still unreachable'), false, 'a fresh outage, not attempted yet');
+});
+
+test('Retry now also appears on the "team is silent" banner', async () => {
+  const stale = () => root({ project_id: 'proj-a', agents: busyAgents().map((a) => ({ ...a, last_seen: iso(3 * 3600), health: { ...a.health, updated_at: iso(3 * 3600) },
+    ...(a.capacity ? { capacity: { ...a.capacity, observed_at: iso(3 * 3600) } } : {}) })), recent: [env('x', 'y', 'message', 3 * 3600)] });
+  const { dom } = await boot(server({ roots: () => [stale()] }));
+  assert.equal(classOf(stream(dom), 'c2-retry').length, 1);
+});
+
+test('focus on Retry now survives an ordinary redraw (the "ago" wording keeps changing)', async () => {
+  const srv = server();
+  const { dom, clock, fire } = await boot(srv);
+  srv.down = true;
+  await fire();
+  const retry = classOf(stream(dom), 'c2-retry')[0];
+  retry.focus();
+  const before = all(stream(dom));
+  clock.perf += 120e3;
+  await fire();
+  assert.notEqual(all(stream(dom)), before, 'the redraw really happened (the elapsed time changed)');
+  assert.strictEqual(dom.document.activeElement, retry);
+});
+
 test('the very first read failing says so instead of showing an empty page', async () => {
   const srv = server();
   srv.down = true;
@@ -265,7 +333,11 @@ test('every data-bearing field is drawn as text: hostile input everywhere', asyn
   assert.ok(all(stream(dom)).includes(bad));
   assert.ok(all(rail(dom)).includes(bad));
   for (const node of [...walk(stream(dom)), ...walk(rail(dom)), ...walk(header(dom))]) {
-    assert.ok(!Object.keys(node.attributes).some((k) => k.startsWith('on') || k === 'style' || k === 'href' || k === 'src'), node.tagName);
+    if (node.tagName === 'IMG' && node.getAttribute('src')) {
+      assert.match(node.getAttribute('src'), /^\/static\/avatars\/[a-z0-9-]+\.png$/, 'the only allowed src shape');
+    }
+    assert.ok(!Object.keys(node.attributes).some((k) => k.startsWith('on') || k === 'style' || k === 'href'
+      || (k === 'src' && node.tagName !== 'IMG')), node.tagName);
     assert.ok(/^[a-z0-9 _:-]*$/i.test(node.className), 'class names are fixed vocabulary: ' + node.className);
   }
 });

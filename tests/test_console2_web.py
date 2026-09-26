@@ -211,9 +211,47 @@ JS_BANNED = {
 def test_v2_js_source_lint(name: str, what: str) -> None:
     if name == "console2-model.js" and what == "write request (read-only slice)":
         pytest.skip("the model never makes requests (see the no-requests test); its view objects use a body key")
+    if name == "console2.js" and what == "link or source from data":
+        pytest.skip("one sanctioned src assignment exists (M4 avatars); see test_v2_js_avatar_src_is_narrowly_gated")
     code = _strip_js_comments(_read(name))
     hit = re.search(JS_BANNED[what], code)
     assert hit is None, f"{name}: {what}: {hit.group(0)!r}"
+
+
+def test_v2_js_avatar_src_is_narrowly_gated_and_nothing_else_sets_a_link_or_source() -> None:
+    """M4 relaxation of "link or source from data": exactly one place ever assigns `src`, only for
+    an already-served avatar image, only after checking the model's own closed allowlist, and href/
+    action/srcdoc/formaction stay completely banned everywhere."""
+    code = _strip_js_comments(_read("console2.js"))
+    src_sites = re.findall(r"setAttribute\(\s*['\"]src['\"]|\.src\s*=(?!=)", code)
+    assert len(src_sites) == 1, src_sites
+
+    fn = re.search(r"function avatarNode\([^)]*\)\s*\{(.*?)\n  \}", code, re.S)
+    assert fn is not None, "the src assignment must live in a single, narrowly-named function"
+    body = fn.group(1)
+    assert re.search(r"setAttribute\(\s*['\"]src['\"]|\.src\s*=(?!=)", body), "not inside avatarNode"
+    assert re.search(r"hasOwn\(\s*AVATAR_FILE_SET\s*,", body), "no allowlist membership check before use"
+    assert "'/static/avatars/' +" in body, "the path prefix must be a fixed literal, matching the server route"
+
+    other = re.search(
+        r"\.href\s*=(?!=)|\.action\s*=(?!=)|setAttribute\(\s*['\"](?:href|srcdoc|action|formaction)['\"]", code,
+    )
+    assert other is None, other
+
+
+def test_v2_avatar_allowlist_matches_the_servers_static_assets() -> None:
+    """Every filename the model can ever produce is one the server actually serves under
+    /static/avatars/<file> (agenttalk.avatars.AVATAR_ASSETS, exposed via web._STATIC_ASSETS) -
+    client and server are never out of step on what an avatar file name may be."""
+    model_src = _read("console2-model.js")
+    assert "var AVATAR_FILES = HEX_MOTIFS.map(function (m) { return 'hexagon-' + m + '.png'; });" in model_src
+    motifs_block = re.search(r"var HEX_MOTIFS = \[(.*?)\];", model_src, re.S)
+    assert motifs_block is not None
+    motifs = re.findall(r"'([a-z]+)'", motifs_block.group(1))
+    assert len(motifs) == 10
+    files = [f"hexagon-{m}.png" for m in motifs]
+    for f in files:
+        assert f"avatars/{f}" in web._STATIC_ASSETS, f
 
 
 ALLOWED_API_PATHS = {"/api/state", "/api/attention", "/api/lead-chat"}
@@ -374,6 +412,35 @@ def test_composer_is_pinned_to_the_bottom_of_the_stream() -> None:
     css = _strip_css_comments(_read("console2.css"))
     block = re.search(r"\.c2-composer\s*\{([^}]*)\}", css).group(1)
     assert "position: sticky" in block and "bottom:" in block
+
+
+def test_the_live_dot_pulses_and_prefers_reduced_motion_turns_it_off() -> None:
+    """08-INTERACTIONS: "Live dot pulse 2s ease-in-out (opacity 1->.35); nothing else animates.
+    prefers-reduced-motion: no pulse." """
+    css = _strip_css_comments(_read("console2.css"))
+    assert re.search(r"\.c2-dot\.is-live\s*\{[^}]*animation:\s*c2-pulse\s+2s\s+ease-in-out\s+infinite", css)
+    keyframes = re.search(r"@keyframes\s+c2-pulse\s*\{([^}]*\{[^}]*\}[^}]*)\}", css)
+    assert keyframes is not None
+    assert "opacity: 1" in keyframes.group(1) and "opacity: .35" in keyframes.group(1)
+    reduced = re.search(r"@media\s*\(prefers-reduced-motion:\s*reduce\)\s*\{([^}]*\{[^}]*\}[^}]*)\}", css)
+    assert reduced is not None
+    assert "animation: none" in reduced.group(1)
+    # nothing else in the stylesheet declares an animation (only the dot pulses)
+    outside_media = re.sub(r"@media[^{]*\{(?:[^{}]*\{[^{}]*\})*[^{}]*\}", "", css)
+    others = re.findall(r"([a-z0-9.:\[\]\"=_-]+)\s*\{[^}]*animation:", outside_media)
+    assert others == [".c2-dot.is-live"], others
+
+
+def test_retry_button_is_the_only_control_in_the_offline_banner() -> None:
+    css = _strip_css_comments(_read("console2.css"))
+    assert re.search(r"\.c2-retry\s*\{", css)
+    assert "cursor: pointer" in re.search(r"\.c2-retry\s*\{([^}]*)\}", css).group(1)
+
+
+def test_avatar_css_only_hides_the_image_in_terminal_never_via_a_style_attribute() -> None:
+    css = _strip_css_comments(_read("console2.css"))
+    assert 'data-theme="terminal"] .c2-avatar-img { display: none; }' in css
+    assert "style=" not in css and "!important" not in css
 
 
 def test_layout_matches_the_spec_grid() -> None:

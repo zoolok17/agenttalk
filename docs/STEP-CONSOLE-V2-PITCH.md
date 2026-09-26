@@ -544,3 +544,120 @@ over the DevTools protocol. Before the fix it measured `initial scrollTop 0 / sc
 `afterRedraw 0`, thread replaced, and `activeElement BODY` after redraws and after Later; after it
 `initial 1731`, `afterRedraw 250` on the same element, and focus kept on the same Later button, then on the next
 card's Later.
+
+## 17. M4 record (M4a: rail avatars, quiet/offline treatments; keyboard split to M4b)
+
+Split, as the work order allowed: this round is **M4a**. Keyboard map + overlay + `j/k/enter/l/1/2` navigation
+and the real-browser keyboard/offline-greying extension are **M4b**, not built here (section 18 tracks it as
+open work, not a silent gap). Everything else in the M4 plan (rail avatars and badges, quiet/offline treatments,
+`prefers-reduced-motion`, the acceptance crosswalk, screenshots) is done.
+
+### Shipped
+
+- **Avatars.** Roster rows and the lead's message now carry the hexagon avatar (Midnight; the model's existing
+  `avatarFile()`, `HEX_MOTIFS`/`ROLE_MOTIF`/stable-hash choice from M2, section 12 item 8) plus the runtime
+  badge (bottom-right, `object-fit: contain`, never circle-cropped). `avatarNode()` in `console2.js` is the
+  ONLY place an `<img src>` is ever set, gated on membership in `M.AVATAR_FILES` (a closed, ten-entry list the
+  model itself produces, cross-checked in a test against the server's own `avatars/*.png` allowlist
+  `agenttalk.avatars.AVATAR_ASSETS`) — the value only ever reaches that gate as `avatarFile()`'s return, never
+  raw agent text. The "link or source from data" source lint is relaxed by name for exactly this one call site
+  (a dedicated test asserts there is exactly one `src` assignment, that it sits inside `avatarNode`, is
+  preceded by the allowlist check, and uses the literal `/static/avatars/` prefix; every other href/src/action
+  shape stays completely banned). Terminal hides the image and the badge fills the frame (CSS class only, no
+  style attribute) — the design's "no image, runtime letter in a box"; Paper and Synthwave still use the
+  Midnight hexagon (out of scope: only Midnight is reviewed this pitch, per section 3). The lead's avatar
+  carries the full name as its tooltip (06-RULES).
+- **Rail reconciled in place.** `renderRail` now uses the same off-document-build-then-`syncChildren` discipline
+  as the stream (M3 F1/F2), so an avatar image is not torn down and re-fetched every redraw merely because an
+  age label elsewhere changed. `src` was added to the reconcile's tracked attributes, so two different avatar
+  files at the same tree position are never mistaken for "the same node" (which would otherwise skip updating
+  the image).
+- **Retry.** Both offline banners now carry a "Retry now" button (`data-c2-focus` keyed, so it keeps focus like
+  every other stream control): it stamps `conn.retriedAt` (server-anchored time) and polls `/api/state` at once,
+  without waiting for the 2 s cadence. If the team is still not live once that read resolves, the banner adds
+  "Still unreachable · tried HH:MM"; a successful read clears `retriedAt`, so a later, unrelated outage never
+  shows a stale "tried" time. `freshness()` gained no new parameters; the banner only names a retry when the
+  page performed one.
+- **Pulse, `prefers-reduced-motion`.** The team chip's freshness dot pulses (2 s ease-in-out, opacity 1→.35)
+  only while `is-live`; a `prefers-reduced-motion: reduce` query turns the animation off. It is the only
+  animation in the stylesheet.
+- **Quiet/offline, otherwise:** confirmed already satisfied from M2/M3 — the banner, `is-stale` 50% greying
+  (CSS class only, on `#app`, never a style attribute), the roster summary's "frozen · as of HH:MM", the
+  per-window "as of" stamp on a stale usage row, and the composer's disabled state with its reason. Not changed
+  in M4a: per-row relative-age text (e.g. "Idle · 40m") keeps its wording while offline rather than being
+  rewritten to "as of HH:MM" — the design's literal "all timestamps become 'as of HH:MM'" is met at the level
+  the M4 plan's own cold-read check names ("the greying is CSS-class-only; no state is shown live when stale"),
+  not by rewriting every row's text; the last-known data is grey and stamped, never hidden or presented as
+  current. Flagged for the lead in section 18.
+
+### Acceptance crosswalk (09-ACCEPTANCE, in-scope rows)
+
+| Row | Status |
+|---|---|
+| One app, four themes; theme persists per browser | DONE (M1) |
+| Terminal changes only fonts and radii | DONE (M1) |
+| Header has no mission progress, no "spec-kitty" | DONE (M1) |
+| Team switcher: freshness dot + needs count; 1/2 switch | Dot + count DONE (M1/M2); **click** switches teams (M1b); **key** 1/2 is M4b |
+| Every needs card shows evidence; deadline optional; age shown; stuck first then oldest | DONE (M2/M3) |
+| Busy-silent agent with recent output never produces a stuck card | DONE, tested |
+| "Later" defers; deferred count visible and restorable; nothing dismissable | DONE (M3) |
+| Actions requiring `--enable-actions` disabled with a CLI hint when off, re-checked server-side | Disabled + hint DONE; "re-checked server-side" is vacuous here — this build never sends anything (`canAct` is always `false`; no write path exists yet, section 9) |
+| Operator has no GO button anywhere | DONE, tested explicitly |
+| Quiet day: "All quiet." + idle-is-normal line + since-you-last-looked; idle grey | DONE (M2) |
+| Offline: banner, 50% greying, "as of", stopped pulses, disabled composer/actions, Retry; other team unaffected | DONE (M4a). "Other team unaffected" holds for the *silent* truth (judged per team); the *unreachable* truth is inherently the one HTTP connection to the console server, so it is shared by every team on that server by design, not a bug |
+| Usage windows: Claude & Codex, 5-hour & weekly, % + reset, threshold colours | DONE (M2) |
+| Qwen (flagged) rows/bars | OUT OF SCOPE (needs the gateway-spend backend, section 9) |
+| "Raise" answers only message the lead; no limit changes from the console | OUT OF SCOPE (no send capability exists yet in this pitch; the seam (`canAct`, served options) is in place for when it does) |
+| Stuck cards without process data use heartbeat/progress/last-message wording, Wait first | DONE (M2, M2c for a stale-but-remembered read) |
+| Names follow 06-RULES; full name in tooltip; passes `reference/name-shortener.js` tests | DONE — roster rows already set `title` to the full name (M2); the lead avatar's tooltip was the one gap, closed this round |
+| Avatars: silhouette per theme, runtime badge, never circle-cropped | Badge + never-cropped DONE. Silhouette per theme: Midnight DONE; Terminal correctly shows no image (badge fills the frame); Paper/Synthwave use the Midnight hexagon as a placeholder (out of scope: only Midnight is reviewed) |
+| Phone (< 1024px) | OUT OF SCOPE (05-SPEC-PHONE, a later card) |
+| All text ≥ 4.5:1 | NOT VERIFIED this round — no contrast measurement pass was run against the rendered Midnight page; flagged in section 18 |
+| Bus content rendered as text only | DONE throughout, tested repeatedly (including every M4 avatar/tooltip value) |
+| Keyboard map per 08; screen-reader focus order | M4b |
+
+### Screenshots (Midnight, live-shaped fixture data: a seeded store, real health/heartbeat files, real `web.serve_in_thread`)
+
+- `atk-scratch/claude-agenttalk-frontend-dev/shots/m4-midnight-1240.png` — 1240×780.
+- `atk-scratch/claude-agenttalk-frontend-dev/shots/m4-midnight-1024.png` — 1024×780 (the minimum supported width).
+
+Both show the stuck card with Wait/Restart/Later, the also-happening block, the lead-chat area with its
+"lead unavailable" note (the scratch store's config has no resolvable liaison, an honest fallback, not a bug),
+the roster with hexagon avatars and runtime badges, and usage windows reading "no reading" (the seeded store
+has no capacity data — never a stubbed number). An attempted third screenshot of the silent/offline banner
+did not reproduce reliably under headless Chromium's virtual time budget (network I/O does not fast-forward
+the way JS timers do) and was dropped rather than kept as a misleading capture; the offline banner and Retry
+are covered instead by the automated data-layer tests (`console2_data.test.mjs`), which do not have this
+timing problem.
+
+### Tests
+
+Node: `console2_view` +2 (M4: `AVATAR_FILES`/`avatarFile` closed-list checks, the lead's avatar/runtime),
+`console2_data` +6 (Retry: immediate poll, "Still unreachable" only after an attempt, no stale label carried
+into the next outage, Retry on both banners, focus survives a redraw), `console2_stream` (lead avatar +
+tooltip, forbidden-attribute check widened to allow the one sanctioned `<img src>` shape). Python:
+`test_v2_js_avatar_src_is_narrowly_gated_and_nothing_else_sets_a_link_or_source`,
+`test_v2_avatar_allowlist_matches_the_servers_static_assets`, `test_the_live_dot_pulses_and_...`,
+`test_retry_button_is_the_only_control_in_the_offline_banner`,
+`test_avatar_css_only_hides_the_image_in_terminal_never_via_a_style_attribute`; the source-lint's per-file
+skip list gained one line (documented, not silently loosened). Mutations of the new code (allowlist check
+removed, `retriedAt` never cleared/never marked) all go red; the allowlist-removal mutation is additionally
+caught by the static lint test even though the (mocked) allowlist itself was bypassed at runtime.
+
+## 18. Open items after M4a (for the lead)
+
+- **M4b (deferred, not silently skipped):** keyboard map + overlay behind `?`, `j/k/enter/l` card navigation
+  and selection styling, `/` focuses the composer, `1`/`2` switch team by key, `esc` closes the overlay or
+  blurs the composer; extend `tests/console2_browser_check.mjs` to drive the overlay and to reproduce the
+  offline banner reliably (a scenario the fixed-fixture stdlib test server does not yet support: it would need
+  to flip live, mid-run, from a fresh snapshot to a stale one).
+- **Contrast:** no measurement pass has been run against the rendered Midnight page (06-RULES only measured
+  the *design tokens*). Recommend a pass before the pitch, and Paper before it is ever shown live (06-RULES
+  already flags Paper's `dim`/`accent` as under 4.5:1 in the original tokens; this build already uses the
+  fixed values, but that fix itself has not been re-measured against rendered text).
+- **Offline literal timestamps:** per-row relative-age wording is kept while offline rather than rewritten to
+  "as of HH:MM" (section 17). Tell me if the pitch needs the literal per-row rewrite; it's a model change
+  (`agentView` would need the freshness state threaded in), not just a rendering one.
+- **Paper/Synthwave avatars:** both show the Midnight hexagon today (no separate rounded-square/star assets
+  are wired up, since only Midnight is reviewed this pitch). If the pitch demos those themes, say so and I'll
+  scope wiring in the existing rounded-square/star files from `web_static/avatars/`.
