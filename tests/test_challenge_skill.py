@@ -223,6 +223,24 @@ def test_a_dispatch_referencing_a_challenge_keeps_its_draft_channel(tmp_path) ->
     assert isinstance(record.get("reply_draft"), dict)
 
 
+def test_a_question_assignment_referencing_a_challenge_keeps_its_draft_channel(tmp_path) -> None:
+    # The lead skill dispatches assignments as `send --kind question` carrying
+    # `--meta challenge=<request_id>`: a QUESTION whose challenge value is a reference,
+    # not the marker. It must keep the draft channel and the ordinary reply prompt.
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    meta = {"request_id": "q-assign", "challenge": "ch-9",
+            "challenge_verdict": "proceed", "challenge_disposition": "accepted"}
+    q = store.send(sender="alpha", recipient="beta", kind="question", body="do X", meta=meta)
+    record = loop._with_reply_draft(
+        store, "beta", {"id": q.id, "from": "alpha", "kind": "question", "meta": dict(q.meta)})
+    assert isinstance(record.get("reply_draft"), dict)
+    rec = {"from": "alpha", "to": "beta", "kind": "question", "body": "do X",
+           "correlation_id": "q-assign", "request_id": "q-assign", "broadcast_id": None,
+           "id": "m-2", "meta": meta}
+    assert "This is a CHALLENGE question" not in prompt.assemble_turn_prompt(rec)
+
+
 def test_wrapped_prompt_routes_the_challenger_to_the_typed_cli_verdict() -> None:
     rec = {"from": "alpha", "to": "beta", "kind": "question", "body": "brief",
            "correlation_id": "ch-1", "request_id": "ch-1", "broadcast_id": None,
