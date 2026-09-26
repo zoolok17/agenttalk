@@ -528,7 +528,7 @@ test('M4a fix round: offline, a roster row\u2019s age freezes at the last known-
   // not the moment the page happens to render.
   const offConn = { reachable: false, stalledPolls: 0, lastOkMs: NOW };
   const o0 = at(NOW + 60e3, offConn);
-  const o1 = at(NOW + 300e3, offConn);
+  const o1 = at(NOW + 120e3, offConn);   // still well under the 300s heartbeat-freshness boundary (N2)
   const r0 = row(o0);
   const r1 = row(o1);
   assert.equal(r0.line, r1.line, 'frozen: no ticking while offline');
@@ -546,6 +546,59 @@ test('M4a fix round: offline, a roster row\u2019s age freezes at the last known-
   assert.equal(s0.banner.kind, 'silent');
   assert.equal(row(s0).line, row(s1).line, 'silent also freezes');
   assert.match(row(s0).line, /as of \d\d:\d\d$/);
+});
+
+// =============================================================================== N2 fix round
+
+test('N2: an outage must never un-classify an unresolved incident - the 600s stuck crossing is pinned to the true clock', () => {
+  const stuckRoot = root({ operator_facing: 'claude-agenttalk-lead', agents: [
+    agent('claude-agenttalk-lead', { since: 600 }),
+    agent('codex-agenttalk-developer-4', { state: 'working_silent', since: 1200, progress: 605 }),
+  ], recent: [] });
+  const stuckCard = (v) => v.needs.open.find((c) => c.kind === 'LOOKS STUCK');
+
+  // Connected: progress age 605s >= the 600s threshold - correctly a stuck card.
+  const connected = M.buildTeamView({ nowMs: NOW, generatedMs: NOW, root: stuckRoot,
+    attention: attention([]), chat: null, conn: CONN_OK, ui: {}, tz: TZ });
+  assert.ok(stuckCard(connected), 'connected: a stuck card, correctly');
+
+  // The connection drops 2s later: the DISPLAY reading for this snapshot happens to freeze at an
+  // instant earlier than "now" (health.updated_at is a few seconds behind the poll that read it).
+  // If classification used that frozen reading, 605s could read back under 600s and the card would
+  // vanish - the exact regression reported. Classification must use the true clock instead, so the
+  // SAME unresolved incident is still shown as a stuck card, last known.
+  const offConn = { reachable: false, stalledPolls: 0, lastOkMs: NOW };
+  const offline = M.buildTeamView({ nowMs: NOW + 2e3, generatedMs: NOW, root: stuckRoot,
+    attention: attention([]), chat: null, conn: offConn, ui: {}, tz: TZ });
+  assert.equal(offline.banner && offline.banner.kind, 'unreachable');
+  assert.ok(stuckCard(offline), 'offline: the unresolved incident is still a stuck card, not silently dropped');
+});
+
+test('N2: the heartbeat-freshness boundary is also pinned to the true clock during an outage', () => {
+  const hbRoot = root({ operator_facing: 'claude-agenttalk-lead', agents: [
+    agent('claude-agenttalk-lead', { since: 600 }),
+    agent('codex-agenttalk-developer-4', { state: 'working_silent', since: 1200, progress: 605, hb: 250 }),
+  ], recent: [] });
+  const row = (v) => v.roster.rows.find((r) => r.short === 'dev-4');
+  const offConn = { reachable: false, stalledPolls: 0, lastOkMs: NOW };
+
+  // Connected: heartbeat 250s old, still fresh (< 300s) - the incident is judged, and stuck.
+  const connected = M.buildTeamView({ nowMs: NOW, generatedMs: NOW, root: hbRoot,
+    attention: attention([]), chat: null, conn: CONN_OK, ui: {}, tz: TZ });
+  assert.equal(row(connected).state, 'stuck');
+
+  // Briefly offline (+2s): the heartbeat is still genuinely fresh by true elapsed time (252s) -
+  // the incident must still be judged, not waved off merely because the page went offline.
+  const brieflyOffline = M.buildTeamView({ nowMs: NOW + 2e3, generatedMs: NOW, root: hbRoot,
+    attention: attention([]), chat: null, conn: offConn, ui: {}, tz: TZ });
+  assert.equal(row(brieflyOffline).state, 'stuck');
+
+  // A long outage (+60s): true elapsed heartbeat age (310s) really does cross 300s - correctly
+  // reclassified as unknown/not-judged, using the true clock (a frozen one could disagree either way).
+  const longOffline = M.buildTeamView({ nowMs: NOW + 60e3, generatedMs: NOW, root: hbRoot,
+    attention: attention([]), chat: null, conn: offConn, ui: {}, tz: TZ });
+  assert.equal(row(longOffline).state, 'unknown');
+  assert.match(row(longOffline).line, /Heartbeat stale/);
 });
 
 test('attention problems are stated, not hidden: stale read, failed read, never loaded', () => {

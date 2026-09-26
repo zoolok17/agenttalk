@@ -64,6 +64,43 @@ test('the header chip shows freshness and the needs count', async () => {
   assert.deepEqual(parts, [['c2-dot is-live', ''], ['c2-chip-label', 'agenttalk'], ['c2-badge', '3']]);
 });
 
+test('N2: an outage does not un-stick an unresolved incident - the stuck card persists, shown as last known', async () => {
+  const srv = server();
+  const { dom, fire } = await boot(srv);
+  const kindsBefore = classOf(stream(dom), 'c2-kind').map((n) => n.textContent);
+  assert.ok(kindsBefore.includes('LOOKS STUCK'), 'connected: a stuck card exists');
+  srv.down = true;
+  await fire();
+  assert.ok(all(stream(dom)).includes('CAN’T REACH THE CONSOLE SERVER'));
+  const kindsAfter = classOf(stream(dom), 'c2-kind').map((n) => n.textContent);
+  assert.ok(kindsAfter.includes('LOOKS STUCK'), 'offline: the same incident is still shown as a stuck card, not silently dropped');
+});
+
+test('N1: the rail meter width is kept in sync through the reconcile, both up and down within one tone', async () => {
+  const srv = server();
+  let pct = 41;
+  srv.roots = () => [root({ project_id: 'proj-a', agents: busyAgents().map((a, i) => (i === 0
+    ? { ...a, capacity: { ...a.capacity, primary: { ...a.capacity.primary, used_pct: pct } } } : a)),
+    recent: busyRecent(), operator_facing: LEAD })];
+  const { dom, fire } = await boot(srv);
+  const meter = classOf(rail(dom), 'c2-meter-fill')[0];
+  const avatar = classOf(rail(dom), 'c2-avatar-img')[0];
+  assert.equal(meter.style.width, '41%');
+  assert.equal(classOf(rail(dom), 'c2-usage-pct')[0].textContent, '41%');
+
+  pct = 42;   // a fresh reading, same tone ("ok", both under 60%): a same-node redraw
+  await fire();
+  assert.strictEqual(classOf(rail(dom), 'c2-meter-fill')[0], meter, 'the meter node is kept, not rebuilt');
+  assert.equal(classOf(rail(dom), 'c2-usage-pct')[0].textContent, '42%', 'the label updated');
+  assert.equal(meter.style.width, '42%', 'the bar width updated too - an increase');
+  assert.strictEqual(classOf(rail(dom), 'c2-avatar-img')[0], avatar, 'unrelated avatar identity is untouched');
+
+  pct = 30;   // a decrease (e.g. a quota reset), still the same tone
+  await fire();
+  assert.strictEqual(classOf(rail(dom), 'c2-meter-fill')[0], meter);
+  assert.equal(meter.style.width, '30%', 'the bar width updated - a decrease');
+});
+
 test('time is anchored on generated_at: a wrong local clock changes nothing, and while live elapsed time does advance it', async () => {
   const srv = server();
   const { dom, clock, fire } = await boot(srv);
@@ -81,7 +118,7 @@ test('time is anchored on generated_at: a wrong local clock changes nothing, and
   const frozen = all(rail(dom));
   assert.match(frozen, /as of \d\d:\d\d/);
   assert.ok(!frozen.includes('Idle · 42m'), 'no longer the live-ticked reading either: this is a fresh, source-anchored freeze');
-  clock.perf += 120e3;
+  clock.perf += 5e3;   // still well under the 300s heartbeat-freshness boundary (N2): classification is unaffected
   await fire();
   assert.equal(all(rail(dom)), frozen, 'a second offline redraw shows the exact same frozen text: it does not keep advancing');
   assert.ok(all(stream(dom)).includes('CAN’T REACH THE CONSOLE SERVER'));

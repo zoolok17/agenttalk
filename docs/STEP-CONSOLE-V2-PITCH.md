@@ -608,7 +608,7 @@ open work, not a silent gap). Everything else in the M4 plan (rail avatars and b
 | Actions requiring `--enable-actions` disabled with a CLI hint when off, re-checked server-side | Disabled + hint DONE; "re-checked server-side" is vacuous here — this build never sends anything (`canAct` is always `false`; no write path exists yet, section 9) |
 | Operator has no GO button anywhere | DONE, tested explicitly |
 | Quiet day: "All quiet." + idle-is-normal line + since-you-last-looked; idle grey | DONE (M2) |
-| Offline: banner, 50% greying, "as of", stopped pulses, disabled composer/actions, Retry; other team unaffected | DONE (M4a). "Other team unaffected" holds for the *silent* truth (judged per team); the *unreachable* truth is inherently the one HTTP connection to the console server, so it is shared by every team on that server by design, not a bug |
+| Offline: banner, 50% greying, "as of", stopped pulses, disabled composer/actions, Retry; other team unaffected | DONE (M4a), **greying scope revised** (fix round 2, section 22, lead's accessibility decision): last-known TEXT stays fully readable (>=4.5:1); only decorative elements (avatars, usage meters) still grey at 50%/60%. "Other team unaffected" holds for the *silent* truth (judged per team); the *unreachable* truth is inherently the one HTTP connection to the console server, so it is shared by every team on that server by design, not a bug |
 | Usage windows: Claude & Codex, 5-hour & weekly, % + reset, threshold colours | DONE (M2) |
 | Qwen (flagged) rows/bars | OUT OF SCOPE (needs the gateway-spend backend, section 9) |
 | "Raise" answers only message the lead; no limit changes from the console | OUT OF SCOPE (no send capability exists yet in this pitch; the seam (`canAct`, served options) is in place for when it does) |
@@ -616,7 +616,7 @@ open work, not a silent gap). Everything else in the M4 plan (rail avatars and b
 | Names follow 06-RULES; full name in tooltip; passes `reference/name-shortener.js` tests | DONE — roster rows already set `title` to the full name (M2); the lead avatar's tooltip was the one gap, closed this round |
 | Avatars: silhouette per theme, runtime badge, never circle-cropped | Badge + never-cropped DONE. Silhouette per theme: Midnight DONE; Terminal correctly shows no image (badge fills the frame); Paper/Synthwave use the Midnight hexagon as a placeholder (out of scope: only Midnight is reviewed) |
 | Phone (< 1024px) | OUT OF SCOPE (05-SPEC-PHONE, a later card) |
-| All text ≥ 4.5:1 | Midnight VERIFIED (M4a fix round, section 19): a computed WCAG contrast check over every text-token/background-token pair the CSS actually uses. Paper/Synthwave/Terminal remain out of scope (only Midnight is reviewed this pitch, section 3) |
+| All text ≥ 4.5:1 | Midnight VERIFIED, including the composited stale state (fix round 2, section 22): a computed WCAG contrast check over every text-token/background-token pair the CSS uses (M4a fix round, section 19), extended to prove the stale-state opacity rules never apply to a text-bearing class. Paper/Synthwave/Terminal remain out of scope (only Midnight is reviewed this pitch, section 3) |
 | Bus content rendered as text only | DONE throughout, tested repeatedly (including every M4 avatar/tooltip value) |
 | Keyboard map per 08; screen-reader focus order | Keyboard map + overlay, j/k/enter/l/1/2/esc/? DONE (M4b, section 20). Screen-reader focus order: keyboard focus itself still follows ordinary tab order and every focus-key mechanism from M3; the card *selection* (j/k) is a visual+behavioral cursor (`is-selected`) that does **not** carry `aria-selected`/`role="listbox"` semantics - flagged in section 21 for the lead, not silently claimed done |
 
@@ -790,3 +790,66 @@ instead, with the follow-on open-items section renumbered to 21.
   still does not flip the fixture server from live to stale mid-run (it would need a stateful handler,
   not the current fixed-fixture one); that scenario stays covered by `console2_data.test.mjs` only.
 - **Paper/Synthwave avatars:** unchanged from section 18 - both still show the Midnight hexagon.
+
+## 22. Fix round 2 record (N1-N3: meter width, offline classification, stale contrast)
+
+The codex delta read of `d351359..4b16f09` (F1-F3) came back clean; this round is two new
+regressions and one evidence gap it also found, fixed on top of `ce2df7b` (M4b).
+
+- **N1 (MAJOR), the rail's meter width was never reconciled.** `syncNode` updated only a retained
+  leaf's `textContent`; a usage meter's fill has no text at all - its "content" is `fill.style.width`,
+  set once in `usageRow` and never touched again by the reconcile. A fresh same-tone reading (41% then
+  42%, or a decrease, including a quota reset) kept the OLD bar at the new percentage's label. Fixed by
+  giving `syncNode` one narrow, sanctioned case - mirroring `avatarNode` being the only place `src` is
+  set - a retained `.c2-meter-fill` node has its CSSOM `width` brought up to date too, never any other
+  style property and never through a style *attribute* (still completely banned everywhere else).
+  Test: `console2_data.test.mjs` - a same-tone increase then a same-tone decrease, both applied to the
+  SAME retained node, alongside an unrelated avatar's identity staying untouched throughout.
+- **N2 (MAJOR), freezing the DISPLAY clock while offline had also frozen classification.** The M4a
+  fix round's freeze (section 19) was meant to stop each row's printed age from ticking against a
+  clock the data can't back - display only. The implementation reused the same frozen `nowMs` for
+  every threshold decision in `agentView` too (the 600-second stuck crossing, the heartbeat-freshness
+  boundary), and the freeze point (`sourceAsOfMs`, the newest individual *data* timestamp) can sit
+  earlier than the instant a row was last correctly judged online (health `updated_at` lags the actual
+  poll). Going offline could then recompute a real, unresolved incident's elapsed time against an
+  earlier reference and put it back under a threshold it had already crossed - an unresolved stuck
+  agent's card would silently vanish the moment the page lost its connection. Fixed by splitting the
+  two clocks explicitly in `agentView`: `ctx.nowMs` (possibly frozen) feeds only the printed "Xm ago"
+  text; a new `ctx.classifyNowMs` (always the true, live clock, threaded from `buildTeamView`'s own
+  `nowMs` parameter) feeds `hbFresh` and the 600-second `quietLong` crossing - the two decisions that
+  choose which state, and whether a card exists at all. An outage can now only ever let more true time
+  pass (making a real incident's classification more certain, never less); it can never regress one.
+  Tests: `console2_view.test.mjs` +2, reproducing the lead's own scenario exactly (`since=-1200s`,
+  `progress=-605s`, `updated_at=-10s`, `last_seen=-20s`: stuck while connected, still a stuck card 2s
+  after going offline) and the heartbeat-freshness boundary on both sides (still judged at +2s offline,
+  correctly reclassified `unknown` at +60s offline, once the heartbeat is genuinely 300s+ old by true
+  elapsed time); `console2_data.test.mjs` +1 (an end-to-end DOM check that the default busy-day stuck
+  card survives going offline). Two pre-existing tests had accidentally picked timings that landed
+  exactly on the heartbeat-freshness boundary (300s, and a cumulative 360s across three redraws) -
+  corrected to timings safely under it, since crossing that boundary given enough true elapsed time is
+  now correct, intended behaviour, not a bug to pin against.
+- **N3 (MINOR), the contrast check didn't cover the actually-rendered stale state; the lead's
+  decision.** `test_midnight_text_tokens_meet_wcag_aa_contrast_on_their_backgrounds` (section 19)
+  checked flat token pairs, never what the CSS actually paints once `.is-stale` applies: a blanket
+  `opacity: .5` over the whole rail and most of the stream (plus `opacity: .6` per stale usage row),
+  covering READABLE TEXT along with everything else. Midnight's `--dim` text composited that way over
+  `--panel2` measures about 2.1:1 - the design's literal "50% greying" would have failed 4.5:1 for
+  ordinary offline roster/usage text, a case the flat-pair check could not see. **Lead's decision,
+  recorded here as the accessibility deviation from the design**: last-known TEXT stays fully readable
+  during an outage; only decorative elements dim. `console2.css` now applies the stale opacity ONLY to
+  `.c2-avatar` and `.c2-meter` (app-wide) and, per stale usage row, only to that row's own `.c2-meter`
+  - never to any text-bearing element. The banner and every "as of" label were already, and remain,
+  full-strength; staleness is communicated by words (the banner, "as of HH:MM"), never by a colour or
+  opacity change alone. Tests: `test_console2_web.py` +2 - one documents the design's original 50%
+  opacity would read under 3:1 composited (the N3 finding, generously bounded), the other parses every
+  `is-stale` CSS rule that still carries an `opacity` declaration and asserts its selector can only
+  ever be `.c2-avatar` or `.c2-meter`, never a text-bearing class (a list of every such class in the
+  stream and rail) - a regression here is a compile-time-cheap, CSS-only check, not a rendered-pixel
+  one, matching this project's "no headless-Chromium screenshot diffing" testing style throughout.
+
+Red-then-green: every new/changed test confirmed RED against the pre-fix-round file (`git show
+ce2df7b:<path>`, swapped onto disk) and GREEN against the fix, for all three findings. Full run:
+`console2_model` 17/17, `console2_render` 29/29, `console2_stream` 55/55, `console2_data` 44/44,
+`console2_view` 92/92; `test_console2_web.py` 54 passed/3 skipped, `test_console2_browser.py`,
+`test_console2_health_writer.py`, `test_health_last_known.py` all green (73 passed/3 skipped total).
+`node --check` clean on both touched JS files; `ruff`/`bandit` clean on the touched Python test file.

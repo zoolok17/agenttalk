@@ -633,7 +633,19 @@
     return (a.children.length === 0) === (b.children.length === 0);
   }
 
+  // N1: a retained node's own numeric CSSOM properties are not text and are not in TRACKED_ATTRS
+  // (a style ATTRIBUTE stays completely banned everywhere), so a kept meter-fill never had its width
+  // brought up to date - the bar could read stale through a same-tone increase, decrease or a quota
+  // reset. `usageRow` is the only place `style.width` is ever set (mirroring `avatarNode` being the
+  // only place `src` is set), so this is the one narrow, sanctioned place width is ever re-applied.
+  var METER_FILL_CLASS = 'c2-meter-fill';
+
+  function hasClass(node, cls) { return (' ' + node.className + ' ').indexOf(' ' + cls + ' ') >= 0; }
+
   function syncNode(live, fresh) {
+    if (hasClass(fresh, METER_FILL_CLASS) && live.style.width !== fresh.style.width) {
+      live.style.width = fresh.style.width;
+    }
     if (fresh.children.length === 0) {
       if (live.textContent !== fresh.textContent) live.textContent = fresh.textContent;
       return;

@@ -419,6 +419,54 @@ def test_midnight_text_tokens_meet_wcag_aa_contrast_on_their_backgrounds() -> No
         assert ratio >= 4.5, (text_key, bg_key, midnight[text_key], midnight[bg_key], round(ratio, 2))
 
 
+def _composite(fg_hex: str, bg_hex: str, alpha: float) -> str:
+    """The colour a browser actually paints when `fg_hex` is shown at `alpha` opacity over `bg_hex` -
+    i.e. what a token-pair check alone cannot see: an *opacity* rule washes text out toward the
+    background, and a flat pair check on the tokens themselves would never notice."""
+    fg, bg = fg_hex.lstrip("#"), bg_hex.lstrip("#")
+    out = []
+    for i in (0, 2, 4):
+        f, b = int(fg[i:i + 2], 16), int(bg[i:i + 2], 16)
+        out.append(round(f * alpha + b * (1 - alpha)))
+    return "#" + "".join(f"{c:02x}" for c in out)
+
+
+# N3 (fix round 2): the design's blanket "50% greying" for stale (offline/silent) data, applied to
+# whole regions including readable text, measured well under 4.5:1 once actually composited over its
+# background - a wash-out, not a legibility cue. The lead's call: last-known TEXT stays fully
+# readable; only decorative elements (avatars, usage meters) still dim. Recorded as an accessibility
+# deviation from the design's literal "50% greying" in the step doc (section 22).
+STALE_TEXT_CLASSES = (
+    "c2-agent-line", "c2-agent-name", "c2-usage-pct", "c2-usage-name", "c2-card-title",
+    "c2-evidence-text", "c2-meta", "c2-kind", "c2-age", "c2-note", "c2-rt", "c2-greeting", "c2-sub",
+    "c2-lead-body", "c2-bubble",
+)
+
+
+def test_the_designs_blanket_greying_would_have_failed_contrast_composited() -> None:
+    midnight = _theme_blocks()["midnight"]
+    # Documents the N3 finding precisely: --dim text at the design's 50% opacity, composited over
+    # --panel2 (the rail's own background), reads at roughly 2:1 - nowhere near 4.5:1.
+    composited = _composite(midnight["dim"], midnight["panel2"], 0.5)
+    ratio = _contrast(composited, midnight["panel2"])
+    assert ratio < 3.0, (composited, round(ratio, 2))
+
+
+def test_stale_greying_dims_only_decorative_elements_never_readable_text() -> None:
+    css = _strip_css_comments(_read("console2.css"))
+    stale_rules = re.findall(r"([^{}]*\bis-stale\b[^{}]*)\{([^}]*)\}", css)
+    assert stale_rules, "expected at least the app-wide and per-window stale rules"
+    found_opacity = False
+    for selector, decls in stale_rules:
+        if "opacity" not in decls:
+            continue
+        found_opacity = True
+        for cls in STALE_TEXT_CLASSES:
+            assert cls not in selector, (selector, decls, cls)
+        assert (".c2-avatar" in selector) or (".c2-meter" in selector), (selector, decls)
+    assert found_opacity, "expected the stale rules to still dim something (avatars/meters)"
+
+
 def test_terminal_changes_only_fonts_and_radii() -> None:
     blocks = _theme_blocks()
     layout_keys = {"font-ui", "font-serif", "r-card", "r-btn", "r-pill", "r-logo"}

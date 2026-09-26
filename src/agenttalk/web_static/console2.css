@@ -400,7 +400,9 @@ html, body {
 .c2-usage-pct { font-family: var(--font-mono); font-size: 12px; font-weight: 600; color: var(--tone); }
 .c2-meter { height: 4px; margin: 5px 0 3px; background: var(--border); border-radius: var(--r-pill); overflow: hidden; }
 .c2-meter-fill { height: 100%; background: var(--tone); }
-.c2-usage-row.is-stale { opacity: .6; }
+/* N3: a stale (old) usage reading dims only its own meter, never the readable percentage/name/"as
+   of" text next to it - the same accessibility decision as the app-wide stale treatment above. */
+.c2-usage-row.is-stale .c2-meter { opacity: .6; }
 
 .c2-rt {
   display: inline-flex;
@@ -470,9 +472,13 @@ html, body {
 .c2-agent-line { font-size: 11px; color: var(--tone); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .c2-agent-cap { font-family: var(--font-mono); font-size: 10.5px; color: var(--bad); white-space: nowrap; }
 
-/* Stale data (offline or silent): last-known values stay, greyed. */
-.is-stale #c2-stream > :not(.c2-banner),
-.is-stale #c2-rail { opacity: .5; }
+/* Stale data (offline or silent): last-known TEXT stays fully readable (N3 accessibility decision,
+   step doc section 22: the design's blanket 50% greying, measured against the actual rendered page,
+   put Midnight's dim-on-panel text at about 2.08:1 - a wash-out, not a legibility cue). Only
+   decorative elements dim: avatars and usage meters. The banner and every "as of" label were
+   already, and remain, full-strength - the stuck/offline signal is the words, never a colour alone. */
+.is-stale .c2-avatar,
+.is-stale .c2-meter { opacity: .5; }
 
 /* ------------------------------------------------------ M3: the stream
    Midnight is the reviewed theme; every colour and radius below comes from the theme

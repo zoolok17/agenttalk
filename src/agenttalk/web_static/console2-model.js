@@ -386,6 +386,12 @@
     var hs = typeof h.state === 'string' ? h.state : 'unknown';
     if (h.stale === true) hs = 'unknown';
     var nowMs = ctx.nowMs;
+    // N2: nowMs (above) may be a frozen, last-known-good reading while offline (section 19's
+    // freeze) - it is for DISPLAY TEXT only (the printed "Xm ago" wording). classifyNowMs is the
+    // true, live clock, used for every threshold decision below, so an outage can never regress a
+    // real incident's classification (a stuck card must stay stuck, never quietly un-stuck itself
+    // merely because the freeze point happens to sit earlier than the moment it was last judged).
+    var classifyNowMs = typeof ctx.classifyNowMs === 'number' ? ctx.classifyNowMs : nowMs;
     // A stale read (older than the TTL, or than the heartbeat) is `unknown` but may carry
     // what the snapshot last said. That is a memory, not a current state: it is only used
     // to judge stuck-vs-busy, with the staleness stated in the evidence.
@@ -406,6 +412,13 @@
     if (hbAge === null && typeof agent.last_seen_age_seconds === 'number' && ctx.generatedMs !== null) {
       hbAge = agent.last_seen_age_seconds + Math.max(0, (nowMs - ctx.generatedMs) / 1000);
     }
+    // The heartbeat-freshness boundary is classification (agentView below uses it to decide
+    // whether a silent turn is judged at all), so it is pinned to the true clock, never the freeze.
+    var hbAgeClassify = ageSeconds(agent.last_seen, classifyNowMs);
+    if (hbAgeClassify === null && typeof agent.last_seen_age_seconds === 'number' && ctx.generatedMs !== null) {
+      hbAgeClassify = agent.last_seen_age_seconds + Math.max(0, (classifyNowMs - ctx.generatedMs) / 1000);
+    }
+    var hbFresh = hbAgeClassify !== null && hbAgeClassify <= HEARTBEAT_FRESH_S;
     var sinceMs = staleWorking ? lk.sinceMs : parseMs(h.since);
     var sinceAge = sinceMs === null ? null : Math.max(0, (nowMs - sinceMs) / 1000);
     // Inactivity counts from the CURRENT turn. The wrapper keeps last_progress_at across
@@ -419,7 +432,10 @@
     // sign of activity, so that is where its silence began.
     if (staleWorking && lk.state === 'working_turn') baselineMs = lk.updatedMs;
     var progAge = baselineMs === null ? null : Math.max(0, (nowMs - baselineMs) / 1000);
-    var hbFresh = hbAge !== null && hbAge <= HEARTBEAT_FRESH_S;
+    // The 600-second stuck crossing is classification too: pinned to the true clock (below), never
+    // to the freeze, so it can only ever advance further past the threshold during an outage, not
+    // regress back under it merely because the freeze point sits earlier than the last live read.
+    var progAgeClassify = baselineMs === null ? null : Math.max(0, (classifyNowMs - baselineMs) / 1000);
 
     var view = {
       name: name, short: short, runtime: runtimeOf(agent), avatarFile: avatarFile(name, agent.role),
@@ -448,7 +464,7 @@
       } else {
         // working_silent, or the wrapper's own stuck_suspected: a candidate when nothing
         // has moved for 10 minutes. A card needs the full evidence (see below).
-        var quietLong = progAge !== null && progAge >= STUCK_AFTER_S;
+        var quietLong = progAgeClassify !== null && progAgeClassify >= STUCK_AFTER_S;
         view.candidate = (hs === 'stuck_suspected' && !staleWorking) || quietLong;
         if (quietLong && reply.replied === false) {
           var evidence = progWord + ' · no reply sent · heartbeat still fresh';
@@ -816,7 +832,12 @@
     // stopped arriving; each row also says so ("as of HH:MM"), never presenting a frozen number
     // as if it were live.
     var rowNowMs = (offline && typeof fresh.sourceAsOfMs === 'number') ? fresh.sourceAsOfMs : nowMs;
-    var ctx = { nowMs: rowNowMs, generatedMs: typeof input.generatedMs === 'number' ? input.generatedMs : null,
+    // N2: nowMs here is the DISPLAY clock only (frozen while offline, per the lead's original call);
+    // classifyNowMs is always the true, live nowMs, so incident evidence and classification (the
+    // 600-second stuck crossing, the heartbeat-freshness boundary) can never regress during an
+    // outage - only the printed age text freezes, never the verdict a needs-you card is built from.
+    var ctx = { nowMs: rowNowMs, classifyNowMs: nowMs,
+                generatedMs: typeof input.generatedMs === 'number' ? input.generatedMs : null,
                 recent: recent, teamIds: teamIds, project: project, known: known, tz: tz,
                 asOfLabel: offline ? fresh.asOfLabel : null };
     var rows = agents.map(function (a) { return agentView(a, ctx); });
