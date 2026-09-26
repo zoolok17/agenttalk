@@ -156,7 +156,7 @@ def staged_path(root, relative):
         root = Path(root).absolute()
         for parent in (*reversed(root.parents), root):
             if parent.is_symlink() or getattr(parent.lstat(), "st_file_attributes", 0) & 1024:
-                A._fail("staging root contains a link/reparse point")
+                raise A.LinkedPathError("staging root contains a link/reparse point")
         return A._path(root, relative)
     except OSError:
         # Never include an OS exception's private locator in a public hold.

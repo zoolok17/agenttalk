@@ -3543,7 +3543,7 @@ def cmd_acceptance_preflight(args: argparse.Namespace) -> int:
     except A.AcceptanceError as exc:
         # Import messages are fixed/labelled; never print an OS locator or raw record.
         detail = str(exc)[:256]
-        if "link" in detail or "reparse" in detail:
+        if isinstance(exc, A.LinkedPathError):
             detail += "; pass fully resolved paths without links or reparse ancestors"
         holds = [P.hold(exc.code, detail)]
         status = "refusal" if exc.code == "acceptance_policy_invalid" else P._status(holds)

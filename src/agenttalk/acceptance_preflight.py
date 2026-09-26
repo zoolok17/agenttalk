@@ -82,7 +82,7 @@ def _read_pin(root, ref, budget, *, distribution=False, evidence=False, public_r
                     chunks.append(data)
     except (A.AcceptanceError, OSError, ValueError) as exc:
         # Import-time policy refusals remain strict; an evaluation race is retryable.
-        linked = isinstance(exc, A.AcceptanceError) and ("link" in str(exc) or "reparse" in str(exc))
+        linked = isinstance(exc, A.LinkedPathError)
         return None, [hold(UNAVAILABLE, ROOT_ADVICE if linked else UNAVAILABLE_DETAIL, public_ref)]
     if size != ref["size"] or digest.hexdigest() != ref["sha256"]:
         return None, [hold(INTEGRITY if evidence else MISMATCH, "staged size or digest differs from pin", public_ref)]

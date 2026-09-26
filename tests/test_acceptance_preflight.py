@@ -433,6 +433,8 @@ def test_evaluation_failure_status_membership(staged, fault, code):
 def test_evaluation_path_refusal_is_retryable(staged, monkeypatch, detail, advice):
     @contextmanager
     def refuse(*args):
+        if advice:
+            raise A.LinkedPathError(detail)
         raise A.AcceptanceError("acceptance_policy_invalid", detail)
         yield  # pragma: no cover
     monkeypatch.setattr(P.R, "staged_stream", refuse)
@@ -700,3 +702,64 @@ def test_distinct_missing_pins_keep_distinct_public_refs(staged):
         (staged["root"] / (name + ".dat")).unlink()
     issues = [h for h in run(staged)["holds"] if h["code"] == P.UNAVAILABLE]
     assert {h["ref"] for h in issues} == {"jdk", "advisory-data"}
+
+
+@pytest.mark.parametrize("kind,code,ref", [
+    ("pin", P.UNAVAILABLE, "jdk"), ("offline", P.UNPROVEN, "java"),
+    ("banner", P.INTEGRITY, "java"), ("log", P.INTEGRITY, "java"),
+    ("override", P.INTEGRITY, "build"), ("expiry", P.EXPIRED, "advisory-manifest"),
+    ("provenance", P.MISMATCH, "advisory-data"), ("version", P.MISMATCH, "java"),
+    ("banner-line", P.MISMATCH, "java"), ("override-invalid", P.INTEGRITY, "build"),
+    ("utf8", P.INTEGRITY, "java"), ("default", P.INTEGRITY, "preflight"),
+])
+def test_every_hold_kind_preserves_public_ref(staged, kind, code, ref):
+    actual = staged["observation"]["entries"][0]
+    if kind == "pin":
+        (staged["root"] / "jdk.dat").unlink()
+    elif kind == "offline":
+        actual["offline"]["positive_control"] = False
+    elif kind in ("banner", "log"):
+        record = actual["banner"] if kind == "banner" else actual["offline"]["log"]
+        (staged["root"] / record["path"]).write_bytes(b"corrupt")
+    elif kind in ("override", "override-invalid"):
+        override = deepcopy(staged["plan"]["environment"])
+        override["runtime"] = ["absent"]
+        record = {"path": "override.json", "sha256": "a" * 64, "size": 0}
+        evidence(staged, record, encoded(override))
+        for obj in (staged["plan"], staged["observation"]):
+            obj["environment"]["row_overrides"] = [{"id": "build", "environment": deepcopy(record)}]
+        if kind == "override":
+            (staged["root"] / record["path"]).write_bytes(b"corrupt")
+    elif kind == "expiry":
+        staged["registry"]["files"][-1]["expires_at"] = "2026-06-01T00:00:00Z"
+    elif kind == "provenance":
+        staged["registry"]["files"][-2]["provenance"]["retrieved_at"] = "2026-05-01T00:00:00Z"
+    elif kind == "version":
+        actual["version"] = "changed"
+    elif kind in ("banner-line", "utf8"):
+        evidence(staged, actual["banner"], b"different" if kind == "banner-line" else b"\xff")
+    else:
+        staged["observation"]["extra"] = True
+    bind(staged)
+    assert (code, ref) in {(h["code"], h["ref"]) for h in run(staged)["holds"]}
+
+
+@pytest.mark.parametrize("error", [OSError, ValueError])
+def test_cli_unavailable_branch_status_and_detail(staged, monkeypatch, capsys, error):
+    def unreadable(path):
+        raise error("private")
+    monkeypatch.setattr(P, "read_input", unreadable)
+    assert cli.main(["close", "acceptance", "preflight", "--plan", "plan.json",
+                     "--cache-root", str(staged["root"]), "--json"]) == 3
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "not-run"
+    assert result["holds"] == [{"code": P.UNAVAILABLE, "ref": "preflight", "detail": P.UNAVAILABLE_DETAIL}]
+
+
+def test_advice_is_typed_not_message_matching(staged, monkeypatch):
+    @contextmanager
+    def denied(*args):
+        raise A.AcceptanceError("acceptance_policy_invalid", "not a link/reparse diagnostic")
+        yield  # pragma: no cover
+    monkeypatch.setattr(P.R, "staged_stream", denied)
+    assert "fully resolved" not in json.dumps(run(staged))

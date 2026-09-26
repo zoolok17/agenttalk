@@ -39,6 +39,13 @@ def _fail(detail, code="acceptance_policy_invalid"):
     raise AcceptanceError(code, detail)
 
 
+class LinkedPathError(AcceptanceError):
+    """A detected link/reparse point requiring a fully resolved locator."""
+
+    def __init__(self, detail):
+        super().__init__("acceptance_policy_invalid", detail)
+
+
 def _object(value, keys, label):
     if not isinstance(value, dict) or set(value) != set(keys.split()):
         _fail(f"{label}: expected fields {keys}")
@@ -140,7 +147,7 @@ def _path(root, relative):
         if part is not None:
             path = path / part
         if path.is_symlink() or (path.exists() and getattr(path.lstat(), "st_file_attributes", 0) & 1024):
-            _fail("links/reparse points are not acceptance artifacts")
+            raise LinkedPathError("links/reparse points are not acceptance artifacts")
     if not path.resolve().is_relative_to(root.resolve()):
         _fail("artifact path escaped its root")
     return path

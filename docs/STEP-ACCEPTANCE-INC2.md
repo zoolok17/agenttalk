@@ -721,3 +721,16 @@ scan pass; the privacy scanner has eight positive controls.
 No full suite, downloads or staged-tool launches are used. Task scratch is retained
 for the delta reader: baseline/after source copies, mutation/probe logs and isolated
 test roots.
+
+## M3a authorization and M2c prerequisite
+
+The lead split M3 in `tk-79572517ea50`: M3a contains M2c, centralized schema
+dispatch, and schema-4 open/attach only; stop for a cold read before M3b.
+M2c adds the per-hold `(code, ref)` table and explicit CLI unavailable status/detail
+checks. Detected links/reparse points now raise `LinkedPathError`; advice uses its
+type rather than matching diagnostic text. Removing B104 produced a real Bandit
+finding on the all-interface negative test literal, so it is retained with its
+purpose stated: address data only, never a socket binding. Ruff S104 also applies.
+The advice regression was red first (1 failed, 14 passed); the initial scratch-parent
+setup error is excluded. Registry/preflight suites pass on 3.10 and 3.14:
+337 passed, 3 skipped each. Ruff and Bandit cover all changed Python files.
