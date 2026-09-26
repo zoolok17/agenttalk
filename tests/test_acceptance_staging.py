@@ -709,7 +709,8 @@ def test_schema4_successor_hashes_before_parent_lock(candidate, monkeypatch):
 
 def test_ld2_preserves_registry_requirements(candidate):
     from agenttalk import acceptance_coverage as coverage
-    protected = coverage.group(candidate["plan"]["rows"], candidate["stage"]["registry"])
+    protected = coverage.group(candidate["plan"]["rows"], candidate["stage"]["registry"],
+                               candidate["plan"]["environment"])
     plan = deepcopy(candidate["plan"])
     for row in plan["rows"]:
         row["registry_entries"] = []
@@ -994,14 +995,14 @@ def test_historical_diagnostics_only_list_distributions(candidate, capsys):
         assert key + ": artifact not retained, pinned by digest" in text
 
 
-def test_live_coverage_superset_preserves_closed_definitions(registry):
+def test_live_coverage_superset_preserves_closed_definitions(registry, environment):
     from agenttalk import acceptance_coverage as coverage
     registry["entries"].append(dict(deepcopy(registry["entries"][0]), id="extra"))
     closed = coverage.definitions(registry)
-    row = {"comparator": "exit-code", "expected": 0, "registry_entries": ["java"]}
-    old = coverage.predicate(row, closed)
+    row = {"id": "row", "comparator": "exit-code", "expected": 0, "registry_entries": ["java"]}
+    old = coverage.predicate(row, closed, environment)
     row["registry_entries"].append("extra")
-    new = coverage.predicate(row, closed)
+    new = coverage.predicate(row, closed, environment)
     assert coverage.implies(new, old)
     assert not coverage.implies(old, new)
 

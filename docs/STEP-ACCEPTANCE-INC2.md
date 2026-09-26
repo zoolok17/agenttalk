@@ -1126,3 +1126,73 @@ their recorded Git commit after restoration: before matches `cc52135`; after and
 focused copies match `e862183`. Task scratch is retained for the delta read:
 `tk-111fc2ff3654` contains the before/after logs, focused replay and source copies,
 test outputs, privacy checker and isolated pytest directories. No PR was opened.
+
+### M3e environment and race corrections
+
+Base: `6b7bf4b`. This small delta implements the lead's N1-N5 decisions.
+
+- N1: protected schema-4 predicates bind the shared planned environment digest
+  and a separate digest of the relevant row's override pin (or explicit absence).
+  Shared limits, OS/configuration and override-byte changes require exact LD2
+  approval. Unrelated rows' overrides do not alter this row's predicate. History
+  reconstructs the same requirements from retained plans; legacy predicates are
+  unchanged. Missing schema-4 environment context is refused.
+- N2: `StagedInputChangedError` identifies a regular-file identity race between
+  lstat/open/fstat. Import still reports policy-invalid; evaluation recognizes
+  the exception type and maps it to retryable, non-mandatory not-run, including
+  informational-row folding. Link/reparse and non-regular-file failures remain
+  mandatory. No message-text classification is used.
+- N3: file-pin and override locators are excluded from definition digests; all
+  other pinned metadata remains bound. Safe identical-byte relocation needs no
+  approval. The operator guide states that advisory-content renewal after a
+  failure requires approval and an expiry-only edit is not an automatic renewal.
+- N4: the guide explicitly says a plan without gating rows can reach GO with
+  every row-associated non-mandatory preflight failure folded away. This is
+  qualified by the existing mandatory integrity/unsafe-path/offline rules and
+  other acceptance requirements; those were not weakened to make the prose true.
+- N5: tests pin the exact missing-definition guard diagnostic and prove that an
+  implicit manifest consumer's definition changes when that manifest changes.
+
+#### M3e executed evidence
+
+All pytest commands ran foreground with `PYTHONPATH=<workspace>/src`,
+`PYTHONDONTWRITEBYTECODE=1`, `-q -p no:cacheprovider`, isolated task-scratch
+basetemps and existing session Git templates. No full suite, network access,
+downloads or staged-tool execution occurred.
+
+| Command/selection | Python 3.10 | Python 3.14 |
+| --- | --- | --- |
+| Initial `tests/test_acceptance_m3e.py`, before production changes | 6 failed, 2 passed; 27.32 s | Not repeated |
+| First fix, expanded M3e file | 22 passed, 1 failed; 43.89 s | Not repeated |
+| Five files: registry, preflight, schema, staging, m3e | 498 passed, 3 skipped; 269.33 s | 498 passed, 3 skipped; 249.30 s |
+| `tests/test_acceptance.py -k 'coverage or successor or implication or policy_amendment'` | 59 passed, 476 deselected; 190.03 s | 59 passed, 476 deselected; 166.63 s |
+
+The first green-run failure was a test-fixture omission: the observed override
+must also exist in the separate attachment proof directory. Copying its identical
+synthetic bytes corrected the fixture; assertions were unchanged. The complete
+five-file runs above include the correction. Two older direct coverage test
+callers now supply the required environment, preserving their assertions.
+Aggregate across the two final targeted invocations: **557 passes and 3 skips
+per interpreter**. The new file contributes 23 cases.
+
+The reviewer's unchanged `test_zz_probe_m3d.py` selection
+`-k 'q7 or q9 or q11 or q3 or q8'`, with `-p conftest`, passed 5 cases
+(6 deselected) on 3.10 in 33.69 s. Its recorded outcomes show environment-only
+successor GO refused (exit 3), expiry-only successor refused, identical-byte
+provenance relocation GO (exit 0), informational identity race GO and the
+all-informational distribution-mismatch control GO. Repository assertions also
+prove environment and row-override amendments reach GO with valid approval.
+
+The reviewer's `mutate_m3d.py D1-cov-fail D8-def-snap` ran in an isolated copy.
+The two new tests were exposed to its original staging/schema file list by an
+import-only collection shim and selected by name. Baseline: 2 passed,
+138 deselected (0.82 s). **Both mutations killed; zero survived or skipped**
+(0.91 s and 0.80 s). The mutated coverage module was compared with the workspace
+after restoration and matched exactly after newline normalization.
+
+Ruff passes all five changed production modules and both changed test files.
+Bandit passes production and tests (B101 excluded for pytest assertions); existing
+nosec-comment warnings are not findings. Whitespace passes. The cumulative patch
+privacy check passes eight positive controls with zero matches. Scratch retained
+under task `tk-68af97353816` for the delta read contains test/probe/mutation logs
+and the isolated mutation copy. Commit is local only: no push or PR in this round.

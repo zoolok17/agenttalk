@@ -42,7 +42,8 @@ def definitions(registry):
                 if pin["role"] == "snapshot" and pin["distribution"]["id"] in pins:
                     pins.add(pin["id"])
                     pins.update(R._provenance(pin["provenance"], files))
-            closed = {"entry": entries[key], "files": {p: files[p] for p in sorted(pins)},
+            closed = {"entry": entries[key],
+                      "files": {p: {k: v for k, v in files[p].items() if k != "path"} for p in sorted(pins)},
                       "dependencies": {d: digest(d) for d in sorted(entries[key]["dependencies"])}}
             result[key] = A._hash(canonical(closed))
         return result[key]
@@ -52,12 +53,22 @@ def definitions(registry):
     return result
 
 
-def predicate(row, entry_definitions=None):
+def predicate(row, entry_definitions=None, environment=None):
     requirements = ({"registry_entries": sorted(row["registry_entries"])} if "registry_entries" in row else {})
     if "registry_entries" in row:
         if entry_definitions is None:
             A._fail("schema-4 coverage requires closed registry definitions")
         requirements["registry_definitions"] = {key: entry_definitions[key] for key in row["registry_entries"]}
+        if environment is None:
+            A._fail("schema-4 coverage requires planned environment")
+        # Bind the shared policy and this row's exact override bytes separately.
+        # Other rows' overrides and locator-only moves cannot weaken this target.
+        requirements["environment_definition"] = A._hash(canonical(
+            {k: v for k, v in environment.items() if k != "row_overrides"}))
+        override = next((item["environment"] for item in environment["row_overrides"]
+                         if item["id"] == row["id"]), None)
+        requirements["environment_override"] = A._hash(canonical(
+            {k: v for k, v in override.items() if k != "path"} if override is not None else None))
     if row["comparator"] == "exact-failure-set":
         return {"kind": "failure-set", "expected": sorted(set(row["expected"])), **requirements}
     if row["comparator"] not in {"exit-code", "exact-value"}:
@@ -73,8 +84,12 @@ def implies(candidate, obligation):
     if any(candidate.get("registry_definitions", {}).get(key) != digest
            for key, digest in obligation.get("registry_definitions", {}).items()):
         return False
-    candidate = {k: v for k, v in candidate.items() if k not in {"registry_entries", "registry_definitions"}}
-    obligation = {k: v for k, v in obligation.items() if k not in {"registry_entries", "registry_definitions"}}
+    for key in ("environment_definition", "environment_override"):
+        if key in obligation and candidate.get(key) != obligation[key]:
+            return False
+    requirements = {"registry_entries", "registry_definitions", "environment_definition", "environment_override"}
+    candidate = {k: v for k, v in candidate.items() if k not in requirements}
+    obligation = {k: v for k, v in obligation.items() if k not in requirements}
     if canonical(candidate) == canonical(obligation):
         return True
     value = candidate["expected"]
@@ -91,13 +106,13 @@ def strongest(predicates):
             if not any(other != key and implies(value, unique[key]) for other, value in unique.items())]
 
 
-def group(rows, registry=None):
+def group(rows, registry=None, environment=None):
     targets = {}
     closed = definitions(registry) if registry is not None else None
     for row in rows:
         if row["policy"] == "gating":
             entry = targets.setdefault(target_id(row), {"target": target(row), "predicates": []})
-            entry["predicates"].append(predicate(row, closed))
+            entry["predicates"].append(predicate(row, closed, environment))
     for entry in targets.values():
         entry["predicates"] = strongest(entry["predicates"])
     return targets
@@ -118,7 +133,7 @@ def history(store, record, *, max_links=MAX_LINKS):
             if row["policy"] != "gating":
                 continue
             entry = targets.setdefault(target_id(row), {"target": target(row), "predicates": [], "sources": []})
-            entry["predicates"].append(predicate(row, closed))
+            entry["predicates"].append(predicate(row, closed, plan.get("environment")))
             outcome = outcomes.get(row["id"], {})
             # The retained close remains the complete record; this projection
             # avoids recursively embedding prior final snapshots.
@@ -137,7 +152,7 @@ def history(store, record, *, max_links=MAX_LINKS):
 
 
 def changes(protected, plan, registry=None):
-    current = group(plan["rows"], registry)
+    current = group(plan["rows"], registry, plan.get("environment"))
     changed = {}
     for key, old in sorted(protected.items()):
         new = current.get(key, {}).get("predicates", [])

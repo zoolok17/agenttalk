@@ -532,10 +532,11 @@ def staged_stream(root, relative):
             # link to the original inode, even when fstat identity matches.
             after = path.lstat()
             if (not stat.S_ISREG(opened.st_mode) or not stat.S_ISREG(after.st_mode)
-                    or getattr(after, "st_file_attributes", 0) & 1024
-                    or any(getattr(before, key, None) != getattr(current, key, None)
-                           for current in (opened, after) for key in ("st_dev", "st_ino", "st_mode"))):
+                    or getattr(after, "st_file_attributes", 0) & 1024):
                 A._fail("staged declarative input changed while opening")
+            if any(getattr(before, key, None) != getattr(current, key, None)
+                   for current in (opened, after) for key in ("st_dev", "st_ino", "st_mode")):
+                raise A.StagedInputChangedError("staged declarative input changed while opening")
             with os.fdopen(fd, "rb", closefd=False) as stream:
                 yield stream
         finally:

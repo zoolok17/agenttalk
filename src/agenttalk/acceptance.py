@@ -47,6 +47,13 @@ class LinkedPathError(AcceptanceError):
         super().__init__("acceptance_policy_invalid", detail)
 
 
+class StagedInputChangedError(AcceptanceError):
+    """An identity race: strict import refusal, retryable evaluation unavailability."""
+
+    def __init__(self, detail):
+        super().__init__("acceptance_policy_invalid", detail)
+
+
 def _object(value, keys, label):
     if not isinstance(value, dict) or set(value) != set(keys.split()):
         _fail(f"{label}: expected fields {keys}")

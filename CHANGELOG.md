@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Bind protected acceptance coverage to the planned environment and each row's
+  override. Permit safe identical-byte pin relocation without an amendment, and
+  classify regular-file identity races as retryable preflight unavailability.
+
 - Require exact LD2 approval for replacements within a protected acceptance
   registry entry's transitive definition. Fold preflight failures by row policy
   while keeping integrity, unsafe paths, stale bindings and offline violations

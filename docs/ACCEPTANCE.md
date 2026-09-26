@@ -498,8 +498,16 @@ requirements. Each required entry binds a digest of its closed definition:
 artifact digest/version, expected banner, transitive dependency definitions,
 measurement config/comparator/parser/normalizer pins, command template, offline
 policy and referenced evidence pins. Replacing any part, even under the same
-entry ID, requires the exact LD2 operator policy-amendment approval. An additional
-entry is permitted when all prior definitions remain unchanged. Historical display
+entry ID, requires the exact LD2 operator policy-amendment approval. The protected
+predicate also binds the planned environment and that row's environment override:
+changing limits, OS, configuration or override bytes requires the same approval.
+Moving a pin or override to another safe path with identical bytes and metadata
+needs no approval; the locator is excluded from the definition. An additional
+entry is permitted when all prior definitions and environment requirements remain
+unchanged. Renewing advisory data after a failed attempt (new digest and expiry)
+requires operator approval, because new data could make the failure disappear.
+An expiry-only extension is not an automatic renewal and remains refused without
+approval. Historical display
 reports distributions as **artifact not retained, pinned by digest**. It neither
 fabricates a historical pass nor changes the original verdict when today's
 cache is absent. A new candidate must verify its own live staged pins.
@@ -510,6 +518,14 @@ remains visible without blocking GO. Retained-evidence integrity failures,
 unsafe paths, missing records, offline violations and stale plan bindings always
 block GO. An unmapped failure also blocks GO. Explicit HOLD publication does not
 scan staging and records that preflight was not evaluated; it asserts no pass.
+
+A plan with no gating rows can reach GO even when every row-associated,
+non-mandatory preflight prerequisite fails: those failures all fold away. This
+does not waive the mandatory failures above or the other acceptance requirements.
+A regular-file identity race while opening is retryable `not-run`, just like a
+change during hashing, and folds by row policy. A link, reparse point or non-regular
+file remains an unsafe-path refusal. Policy import still refuses an identity race;
+retry with staging quiescent.
 
 Upgrade every seat sharing the store before relying on a schema-4 GO. Older
 engines can list an already-published schema-4 verdict as GO even though their
