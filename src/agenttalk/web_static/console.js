@@ -1477,6 +1477,12 @@
     // Prefs controls (theme / accent / density) — read-only nav, not a write.
     bar.appendChild(prefsControls());
 
+    // Plain link to the console v2 preview (a fixed path, no data in it).
+    var v2Link = el('a', 'tc-pref-btn tc-v2-link', 'New console');
+    v2Link.setAttribute('href', '/v2');
+    v2Link.setAttribute('title', 'Open the console v2 preview');
+    bar.appendChild(v2Link);
+
     // Operator chip.
     var op = el('div', 'tc-operator');
     var operator = (root && root.operator) || {};

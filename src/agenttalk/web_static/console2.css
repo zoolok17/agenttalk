@@ -1,0 +1,229 @@
+/* =============================================================================
+   agenttalk console v2 - console2.css   (pitch slice, milestone M1)
+
+   Served at /static/console2.css for the /v2 shell. Under the console CSP
+   (style-src 'self'): no @font-face, no remote url(), no inline anything. System
+   font stacks only; self-hosting the design fonts is a separate, reviewed change.
+
+   Theme engine: every theme is a block of custom properties on :root, chosen by
+   the data-theme attribute that console2.js sets. Midnight is the default (no
+   attribute needed). Keys follow the design handoff tokens/themes.json:
+     bg panel panel2 border fg dim accent accent-ink ok warn bad info serif
+   plus the runtime badge colours. Terminal keeps the same layout and only flips
+   the fonts to mono and every radius to 0.
+
+   Only Midnight is styled and reviewed in this slice. Paper, Synthwave and
+   Terminal carry their variables so the engine is exercised; Paper uses the two
+   contrast fixes the handoff recommends (06-RULES: dim, accent), not yet reviewed.
+   ============================================================================= */
+
+/* ------------------------------------------------------------------ tokens */
+
+:root {
+  /* Midnight (default) */
+  --bg: #0A0C11;
+  --panel: #11141B;
+  --panel2: #161A23;
+  --border: #232834;
+  --fg: #E7EAF0;
+  --dim: #7D8595;
+  --accent: #7C8CFF;
+  --accent-ink: #0A0C11;
+  --ok: #3DD68C;
+  --warn: #F5B83D;
+  --bad: #FF6B6B;
+  --info: #5CC8FF;
+  --serif: #F2F3F7;
+  --rt-claude: #D08A5E;
+  --rt-codex: #4FB3A0;
+  --rt-qwen: #9E82E0;
+
+  --font-ui: system-ui, "Segoe UI", -apple-system, Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Code", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --font-serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
+
+  --r-card: 16px;
+  --r-btn: 10px;
+  --r-pill: 999px;
+  --r-logo: 9px;
+}
+
+:root[data-theme="paper"] {
+  --bg: #F6F3EC;
+  --panel: #FFFFFF;
+  --panel2: #FBF9F4;
+  --border: #E5E0D4;
+  --fg: #1D1B17;
+  --dim: #6B655B;
+  --accent: #C9481F;
+  --accent-ink: #FFFFFF;
+  --ok: #2E9F6B;
+  --warn: #B7780A;
+  --bad: #D2402F;
+  --info: #2F6FC9;
+  --serif: #1D1B17;
+  --rt-claude: #B0532C;
+  --rt-codex: #2C7A6B;
+  --rt-qwen: #6D4AC0;
+}
+
+:root[data-theme="synthwave"] {
+  --bg: #120822;
+  --panel: #1B0F33;
+  --panel2: #231342;
+  --border: #3B2266;
+  --fg: #FBEFFF;
+  --dim: #A88CCB;
+  --accent: #FF4FD8;
+  --accent-ink: #120822;
+  --ok: #00F5D4;
+  --warn: #FFD23F;
+  --bad: #FF5C8A;
+  --info: #00E5FF;
+  --serif: #FFE3FA;
+}
+
+:root[data-theme="terminal"] {
+  --bg: #040906;
+  --panel: #07100A;
+  --panel2: #0B170F;
+  --border: #1B3A24;
+  --fg: #7CFF9B;
+  --dim: #52A06B;
+  --accent: #DFFFE7;
+  --accent-ink: #040906;
+  --ok: #7CFF9B;
+  --warn: #FFD166;
+  --bad: #FF5C5C;
+  --info: #7FD8FF;
+  --serif: #7CFF9B;
+
+  --font-ui: var(--font-mono);
+  --font-serif: var(--font-mono);
+  --r-card: 0;
+  --r-btn: 0;
+  --r-pill: 0;
+  --r-logo: 0;
+}
+
+/* ------------------------------------------------------------------- frame */
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+#app {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  grid-template-rows: 58px minmax(0, 1fr) 32px;
+  height: 100vh;
+  min-width: 1024px;
+}
+
+#c2-header {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 0 22px;
+  border-bottom: 1px solid var(--border);
+  min-width: 0;
+}
+
+#c2-stream {
+  grid-column: 1;
+  min-width: 0;
+  padding: 22px 26px 14px;
+  overflow-y: auto;
+}
+
+#c2-rail {
+  grid-column: 2;
+  min-width: 0;
+  padding: 18px;
+  overflow-y: auto;
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+}
+
+#c2-footer {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 0 22px;
+  border-top: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.c2-link { color: var(--dim); text-decoration: underline; }
+.c2-link:hover { color: var(--fg); }
+
+/* ------------------------------------------------------------------ header */
+
+.c2-brand { display: flex; align-items: center; gap: 9px; }
+.c2-logo {
+  width: 22px;
+  height: 22px;
+  background: var(--accent);
+  border-radius: var(--r-logo);
+}
+.c2-wordmark { font-size: 15px; font-weight: 600; letter-spacing: .01em; }
+.c2-spacer { flex: 1 1 auto; }
+
+/* Segmented control: team chips and theme choices. */
+.c2-seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+}
+.c2-seg button {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  padding: 5px 12px;
+  border-radius: var(--r-pill);
+  cursor: pointer;
+}
+.c2-seg button[aria-pressed="true"] { background: var(--fg); color: var(--bg); }
+.c2-seg button:disabled { cursor: default; opacity: .6; }
+
+.c2-keybtn {
+  appearance: none;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--dim);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-btn);
+}
+.c2-keybtn:disabled { opacity: .5; cursor: default; }
+
+.c2-seg button:focus-visible,
+.c2-keybtn:focus-visible,
+.c2-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.c2-hint-key { color: var(--fg); margin-right: 4px; }

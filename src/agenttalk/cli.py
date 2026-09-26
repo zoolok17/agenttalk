@@ -10359,6 +10359,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if landing == "/dashboard":
         sys.stderr.write(
             f"agenttalk: serving obligation dashboard at {url}dashboard\n")
+        sys.stderr.write(f"agenttalk: console v2 preview at {url}v2\n")
     else:
         sys.stderr.write(f"agenttalk: serving read-only dashboard at {url}\n")
     sys.stderr.write("           (Ctrl-C to stop)\n")

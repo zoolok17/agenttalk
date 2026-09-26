@@ -52,6 +52,7 @@ Routes
 - ``GET  /api/messages/<id>``   — single message JSON
 - ``GET  /favicon.ico``         — 204 (no icon shipped; suppress browser noise)
 - ``GET  /dashboard``           — the Team Console HTML shell (all roots; 0.58.0)
+- ``GET  /v2``                  — the console v2 "pitch slice" shell (same CSP as /dashboard)
 - ``GET  /static/<name>``       — allowlisted console assets (css/js/png; 0.58.0/0.61.0)
 - ``GET  /api/state``           — multi-root obligation aggregate, schema v1 (0.17.0)
 - ``GET  /api/attention``       — ranked "needs a human" queue for a selected root
@@ -686,6 +687,34 @@ def render_dashboard(roots: list[RootDescriptor]) -> bytes:
     return _console_page("agenttalk :: team console", body)
 
 
+def render_console2() -> bytes:
+    """The console v2 shell: static skeleton, hydrated by ``console2.js``.
+
+    Same discipline as :func:`render_dashboard`: zero inline ``<style>``, zero
+    ``style=`` attributes, zero inline handlers, no inline script, no external
+    URL. The two links are fixed server-authored paths. Nothing bus-derived is
+    rendered here; the client builds every data-bearing node with ``textContent``.
+    """
+    body = (
+        "<div id=\"app\">"
+        "<header id=\"c2-header\"></header>"
+        "<main id=\"c2-stream\" aria-label=\"Stream\"></main>"
+        "<aside id=\"c2-rail\" aria-label=\"Rail\"></aside>"
+        "<footer id=\"c2-footer\">"
+        "<span id=\"c2-hints\"></span>"
+        "<a class=\"c2-link\" href=\"/dashboard\">Classic view</a>"
+        "</footer>"
+        "</div>"
+        "<noscript><p>This console needs JavaScript. Read "
+        "<code>GET /api/state</code> directly instead, or open the "
+        "<a href=\"/dashboard\">classic view</a>.</p></noscript>"
+        "<link rel=\"stylesheet\" href=\"/static/console2.css\">"
+        "<script src=\"/static/console2-model.js\"></script>"
+        "<script src=\"/static/console2.js\"></script>"
+    )
+    return _console_page("agenttalk :: console", body)
+
+
 def _console_page(title: str, body: str) -> bytes:
     """A minimal HTML document for the console shell.
 
@@ -738,6 +767,9 @@ def _load_static_assets() -> dict[str, tuple[str, bytes]]:
     for name, ctype in (
         ("console.css", "text/css; charset=utf-8"),
         ("console.js", "application/javascript; charset=utf-8"),
+        ("console2.css", "text/css; charset=utf-8"),
+        ("console2-model.js", "application/javascript; charset=utf-8"),
+        ("console2.js", "application/javascript; charset=utf-8"),
         *((name, "image/png") for name in _AVATAR_ASSETS),
     ):
         try:
@@ -4577,6 +4609,10 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                 return
             if path == "/dashboard":
                 self._send_html(HTTPStatus.OK, render_dashboard(roots),
+                                csp=_DASHBOARD_CSP)
+                return
+            if path == "/v2":
+                self._send_html(HTTPStatus.OK, render_console2(),
                                 csp=_DASHBOARD_CSP)
                 return
             if path.startswith("/static/"):

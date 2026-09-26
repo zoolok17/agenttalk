@@ -2225,6 +2225,7 @@ body {
   white-space: nowrap;
 }
 .tc-pref-btn:hover { background: var(--hairline); }
+.tc-v2-link { text-decoration: none; }
 .tc-accents { display: flex; align-items: center; gap: 6px; }
 .tc-accent-sw {
   width: 16px;
