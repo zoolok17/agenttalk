@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   readers and bounded declarative-input validation. CLI preflight and close
   integration await later milestones; no new GO path is enabled. See
   `docs/STEP-ACCEPTANCE-INC2.md` for limits and retention decisions.
+- Tighten increment-2 staged-input records with per-toolchain/service banner
+  pins, explicit environment entry references, and expiring manifests for large
+  distribution pins. Reject portable path collisions and additional reserved
+  names; bound refusal diagnostics and verify file identity before reading.
 
 ### Changed
 

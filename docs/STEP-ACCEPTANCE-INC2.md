@@ -43,6 +43,32 @@ These decisions override the corresponding original planning choices below.
   cross-vendor Opus sweep; keep milestone diffs well below about 1,500 changed
   lines excluding test tables. No PR before the final milestone's read.
 
+M1b decisions from the M1 cold read (`tk-8039097e0029`):
+
+- **F1:** each toolchain/service has a required exact `expected_banner`. Environment
+  runtime/compiler/package_manager/services are lists of entry IDs (empty means
+  absent); lists allow multiple runtimes such as Java and Node. Each toolchain or
+  service appears exactly once across those roles. The first three roles accept
+  toolchains only, services accepts services only. No free-text substitute and
+  no unreferenced entry is allowed. Checker expected_banner is explicitly null.
+- **F3:** large advisory content is a distribution pin. Its small retained snapshot
+  manifest pin adds `distribution:{id,sha256}` and `expires_at`. The reference must
+  name a distribution and match its digest. The retained registry binds this
+  manifest metadata and the exact manifest bytes; the distribution is not copied.
+  M2 must apply the manifest's expiry to **every** entry consuming that distribution,
+  including through inputs, templates and transitive dependencies, even if that
+  entry does not separately list the snapshot. Multiple manifests all constrain
+  the distribution; none overrides another. M1 validates bindings, not freshness.
+- **F7:** proof markers match whole lines exactly after stripping the trailing
+  CR/LF terminator only. No substring matching, whitespace trimming or Unicode
+  normalization. Containment between different markers is valid. M2 implements
+  this interpretation; M1 validates distinct bounded literals only.
+- **F2/F9:** M3's first commit must consolidate schema dispatch through one helper
+  rejecting unknown schemas, with a test walking all comparison sites below.
+  M2's operator refusal for a linked/unresolved staging root must tell the operator
+  to pass the fully resolved path (including platform temporary aliases and cloud
+  placeholders), without echoing the locator. Neither feature is enabled in M1b.
+
 ## Invariant and existing integration
 
 Preflight reads staged files and retained evidence. It never downloads, resolves
@@ -181,15 +207,15 @@ levels, invalid UTF-8, BOMs, unpaired surrogates and non-finite numbers.
 
 | Record | Closed shape and interpretation |
 | --- | --- |
-| Registry v2 | `schema_version:2`, `entries:Entry[]`, `files:FilePin[]`. Empty lists are valid only together with explicitly tool-free plan rows. IDs are unique within each namespace. File paths are unique after case folding for portable staging. |
-| FilePin | `id, role, path, sha256, size, expires_at, version, provenance`. `size` is an integer byte count. `role` is distribution/manifest/lockfile/config/proof-log/banner/provenance/verification/snapshot/adapter. Distribution and snapshot require exact opaque `version` and a Provenance object; other roles require both null. Only snapshot has a UTC `expires_at`; others require null. All pins must be referenced. Package distributions are file pins in an entry's inputs, with their own version/provenance. |
-| Entry | `id, kind, version, artifact, dependencies, inputs, snapshots, provenance, command, offline, failure_policy, measurement`. Kind is toolchain/checker/service. Artifact references a distribution pin whose version/provenance must match this entry. Dependencies reference other entry IDs; inputs reference pinned files, including declared transitive package files; snapshots reference only snapshot pins. No row IDs. |
+| Registry v2 | `schema_version:2`, `entries:Entry[]`, `files:FilePin[]`. Empty lists are valid only together with explicitly tool-free plan rows and empty environment role lists. IDs are unique within each namespace. File paths are unique after NFC normalization then case folding, with file/directory prefix conflicts refused. |
+| FilePin | `id, role, path, sha256, size, expires_at, version, provenance`. `size` is an integer byte count. `role` is distribution/manifest/lockfile/config/proof-log/banner/provenance/verification/snapshot/adapter. Distribution and snapshot require exact opaque `version` and a Provenance object; other roles require both null. Only snapshot has a UTC `expires_at`; others require null. Snapshot also requires `distribution:{id,sha256}`, binding one distribution's ID and exact digest; this extra field is forbidden on other roles. All pins must be referenced. Package distributions are file pins in an entry's inputs, with their own version/provenance. |
+| Entry | `id, kind, version, artifact, dependencies, inputs, snapshots, provenance, command, offline, failure_policy, measurement, expected_banner`. Kind is toolchain/checker/service. Toolchain/service expected_banner is a required bounded exact literal; checker requires null. Artifact references a distribution pin whose version/provenance must match this entry. Dependencies reference other entry IDs; inputs reference pinned files, including declared transitive package files; snapshots reference only snapshot pins. No row IDs. |
 | Provenance | `source, retrieved_at, checksum_source, independent_verification, record, verification`. Coordinates are inert nonempty strings. `record` references a provenance-role file. Independent verification is a strict boolean; true requires a verification-role file reference, false requires null. UTC retrieval time is mandatory. Same-source checksums remain provenance only; M1 does not authenticate claims. |
 | Command template | `argv:string[], cwd, inputs:FileID[], outputs:string[]`. First argv item is exactly `{artifact}`; cwd is `{checkout}`. Allowed whole-token placeholders are artifact/checkout/scratch/cache_overlay. The latter three also allow a safe relative suffix. Other tokens are scalar arguments with no braces, slash, backslash or colon. Outputs are unique `{scratch}/relative` paths. No shell grammar, substitution, path search or execution. |
-| Offline policy | `mode, positive_control, cache_hit, real_fetch`. Mode is external-denial/offline-recipe. Markers are distinct bounded literal strings, not regex/code. Offline-recipe requires cache_hit; external-denial requires it null. Policy describes expectations only; M2 interprets retained logs. |
+| Offline policy | `mode, positive_control, cache_hit, real_fetch`. Mode is external-denial/offline-recipe. Markers are distinct bounded literal strings, not regex/code; match whole lines after removing CR/LF terminators only. Offline-recipe requires cache_hit; external-denial requires it null. Policy describes expectations only; M2 interprets retained logs. |
 | Failure policy | Exactly `{unavailable:not-run, mismatch:fail, expired:not-run, absent_proof:not-run, attempted_fetch:fail}`. No caller-defined fallback/acquisition or success policy. |
 | Measurement pins | Checker requires `{comparator, parser, config, normalizer}` with adapter-role references for comparator/parser/normalizer and config-role for config. Other entry kinds require null. Adapters are bounded declarative descriptions in M1, never executable plugins. |
-| Environment v1 | `schema_version:1, runtime, compiler, package_manager, services, os, locale, timezone, environment_digest, config_digest, scratch, cache_overlay, service_data, time_limit_seconds, memory_limit_bytes, row_overrides`. Runtime/compiler/package_manager are exact banner strings or explicit null for absence. Services are unique `{id,banner}` records referencing service-kind entries. OS/locale/timezone are nonempty exact strings. Scratch/cache_overlay/service_data are respectively isolated/fresh-writable/fresh. Digests bind external environment/config inputs. |
+| Environment v1 | `schema_version:1, runtime, compiler, package_manager, services, os, locale, timezone, environment_digest, config_digest, scratch, cache_overlay, service_data, time_limit_seconds, memory_limit_bytes, row_overrides`. Runtime/compiler/package_manager/services are entry-ID lists, each bounded to 64. Every toolchain/service must be referenced exactly once across the roles (F1), including in observations. OS/locale/timezone are nonempty exact strings. Scratch/cache_overlay/service_data are respectively isolated/fresh-writable/fresh. Digests bind external environment/config inputs. |
 | Row override | `{id, environment:EvidenceRef}`; id references a plan row. The external environment bytes are pinned separately, preventing a self-hash cycle. Nested overrides in loaded override environments will be refused using `validate_environment(..., overrides=False)`. Loading/comparing these bytes is M2, not a M1 pass. |
 | Plan v4 | Existing schema-3 plan fields plus `environment:Environment`; every row adds `registry_entries:EntryID[]`. Validate the old plan rules on a copy projected to schema 3, preserving the original. Entry use includes reachable dependencies; reject any unused entry or dangling row/service/override reference. Do not guess undeclared tools. |
 | EvidenceRef | `{path, sha256, size}` for bounded declarative bytes relative to their approved input root. Shape validation does not substitute for later retained-byte validation. |
@@ -238,6 +264,24 @@ declarative reads require regular files. Public errors contain fixed description
 not OS exception text or the private root. As accepted, supported store locks do
 not protect against concurrent manual cache mutation; staging must be quiescent.
 
+M1b extends portable device refusal to the `ntpath.isreserved` device rules,
+plus COM0/LPT0, superscript 1/2/3 port digits and CONIN$/CONOUT$. The implementation
+works on Python 3.10, where `ntpath.isreserved` is unavailable. Prefix conflicts
+and NFC/casefold collisions are checked without changing the actual staged path.
+Invalid IDs produce fixed bounded diagnostics, even for a 200,000-character input.
+Fixed OS refusals are raised outside their exception handlers with `from None`,
+so both the rendered chain and the stored exception context omit private OS text.
+
+Declarative files are lstat-checked, opened once, and fstat-checked against the
+earlier device/inode/mode before reading. The leaf is lstat-checked again to reject
+a Windows link to the original inode. POSIX uses O_NOFOLLOW and O_NONBLOCK to
+reject leaf links and avoid blocking on a substituted FIFO. Platforms without
+these flags cannot provide the same kernel-level protection; comparisons use
+the identity fields the platform reports (zero/missing identifiers cannot prove
+identity). Parent-directory ABA changes and in-place writes remain within the
+cooperative mutation boundary. No claim of an adversarial filesystem sandbox is
+made; M2 still verifies the bytes against their fixed digest.
+
 ### Existing and future reader inventory
 
 | Reader or writer | M1 disposition and M3 obligation |
@@ -252,13 +296,67 @@ not protect against concurrent manual cache mutation; staging must be quiescent.
 | `close.evaluate_dod`, `compute_verdict`, persistence/transactions, `record_publish`, signoff/ack handling | Unchanged. Additive direct HOLDs, generation/instance binding and total lock order remain authoritative. No bypass through green gate labels or cached projections. |
 | CLI list/show/published holds, `attention.close_hold_items` and final/barrier consumers | Unchanged. Future sanitized outputs whitelist IDs/status/codes and omit cache locator. Raw private records remain explicitly private. |
 | `acceptance_git` command/operation scope | Unchanged. New staged-file or proof results are never memoized as immutable Git metadata. |
-| New `acceptance_registry` API | Called only by M1 tests at this milestone. Uses existing acceptance strict-object, ID/hash, decoder and path primitives; no legacy parser or persistence behavior changed. |
+| New `acceptance_registry` API | Called only by M1 tests at this milestone. Uses existing acceptance strict-object, ID/hash, decoder and path primitives. M1b bounds the shared ID refusal diagnostic; legacy validation outcomes and persistence behavior are unchanged. |
 
 Planned M3 envelopes: schema-4 route extends schema 3 with private `cache_root`
 and a retained `preflight_hash`; bundle carries its observation/report and input
 manifest references. Reports bind instance/attempt/project/revision/plan/registry
 without embedding their own hash. Exact envelope grammar and current-run binding
 will be recorded with M3 before enabling those readers. They are unsupported now.
+
+#### Concrete schema-dispatch inventory (F2)
+
+Locations below refer to the M1b source, with unchanged surrounding logic. This
+includes the review's narrow schema-3 sites and the additional version predicates
+found by scanning every `acceptance*.py` module and `close.py`. They are not made
+schema-4 aware in this round. M3 must address them in its **first commit**, using
+one validated dispatch helper and a regression that walks the comparison sites;
+simply broadening `== 3` to `>= 3` would accept unknown schemas and is forbidden.
+
+| File:line | Predicate and meaning |
+| --- | --- |
+| acceptance.py:202 | Plan `==3`: include cold-policy fields in closed shape. |
+| acceptance.py:206 | Plan `==3`: validate cold policy. |
+| acceptance.py:215 | Plan `>=2`: require nonempty authors. |
+| acceptance.py:330 | Plan `>=2`: verify project identity. |
+| acceptance.py:332 | Plan `==3`: verify cold change base. |
+| acceptance.py:346 | Plan `==3`: inherit related change obligations during prepare. |
+| acceptance.py:378 | Plan `>=2`: freeze parent/amendment fields. |
+| acceptance.py:381 | Plan `==3`: freeze cold and obligation hashes. |
+| acceptance.py:385 | Plan `==3`: capture inherited obligations. |
+| acceptance.py:396 | Route `in (2,3)`: include parent/amendment in route shape. |
+| acceptance.py:397 | Route `==3`: require cold/obligation route hashes. |
+| acceptance.py:406 | Route `>=2`: validate paired parent/amendment references. |
+| acceptance.py:438 | Plan/route version equality: frozen policy binding. |
+| acceptance.py:444 | Route `>=2`: verifier/reproduction bundle and run fields. |
+| acceptance.py:445 | Route `==3`: recovery approvals/hygiene/environment/offline fields. |
+| acceptance.py:527 | Route `==3`: cold commitment must precede bundle attachment. |
+| acceptance.py:534 | Route `==3`: reproduction lenses on attachment. |
+| acceptance.py:550 | Route `==3`: bind recovery approvals to actual operator records. |
+| acceptance.py:602 | Route `==1`: force live Git verification for legacy route. |
+| acceptance.py:605 | Route `>=2`: recheck verified project identity. |
+| acceptance.py:649 | Route `>=2`: reproduction, ack and history checks. |
+| acceptance.py:655 | Route `==3`: inherited obligations, cold sweep and hygiene fold. |
+| acceptance.py:691 | Route `==3`: cold/obligation hashes in ack binding. |
+| acceptance_cold.py:91 | Route `!=3`: reject cold commitment on unsupported route. |
+| acceptance_obligations.py:116 | Route `==3`: check source execution hygiene for inherited obligations. |
+| acceptance_history.py:109 | Route `not in (2,3)`: successor eligibility. |
+| acceptance_history.py:121 | Proposed plan version `<` parent route version: prohibit downgrade. |
+| acceptance_history.py:175 | Amendment version `in (2,3)`: assertion_changes shape. |
+| acceptance_history.py:209 | Route `<3`: legacy parent-counter inheritance versus modern obligation fold. |
+| acceptance_history.py:216 | Amendment version `==3`: exact assertion-change comparison. |
+| close.py:1740 | Route `in (2,3)`: attach acceptance binding to lens acknowledgement. |
+
+Explicit version gates also remain in `acceptance._version` and callers:
+plan/registry/route/bundle/raw/reproduced-raw, cold policy and reconciliation,
+hygiene, operator approval/amendment, and the new registry/plan/environment/
+observation readers. `acceptance_registry.validate_plan` deliberately projects
+v4 onto a **copy** with v3 for old row rules; that is validation reuse, not route
+dispatch. `close.py:462` validates the close envelope version; `:607` validates
+signoff-policy version type and `:786-788` the DoD-policy version. Those separate
+schema namespaces must not be confused with acceptance route versions. No
+version comparison occurs in the remaining acceptance modules (audit, coverage,
+Git or hygiene beyond its explicit version gate).
 
 ### M1 executed evidence
 
@@ -296,3 +394,83 @@ M1 is ready for the milestone cold read, not acceptance GO. No M2
 evaluator/command, binary hashing, proof interpretation, sanitized summary,
 retention capture or M3 route/bundle integration is claimed. The remaining five
 named design tests must still be shown red before their M2 guards are built.
+
+### M1b executed evidence and limits
+
+Before production edits, the new contract/reader regressions ran with **16 failed,
+132 deselected in 0.45 s**. Failures demonstrated missing banner/mapping and
+snapshot-binding support, accepted reserved names/prefix/normalization collisions,
+an unbounded ID diagnostic, unchecked opened-file identity and exposed OS context.
+Subsequent tests cover all F4 guards, a real Windows junction above the staging
+root, file replacement before open, device/inode/type mismatch, environment role
+limits and whole-line marker containment. Existing tests were updated only for
+the explicitly changed grammar and open API; refusal assertions remain in place.
+
+Final targeted foreground command (Python 3.10, checkout `src` on PYTHONPATH,
+bytecode disabled, isolated scratch):
+
+```text
+py -3.10 -m pytest tests/test_acceptance_registry.py tests/test_acceptance_git_reads.py tests/test_acceptance.py::test_acceptance_acks_without_bundle_hold tests/test_acceptance.py::test_acceptance_invalid_plan_refused_before_close_creation tests/test_acceptance.py::test_acceptance_schema3_cannot_attach_without_required_hygiene -q -p no:cacheprovider --basetemp <scratch>/final
+```
+
+**216 passed, 3 skipped in 10.72 seconds**. The registry file accounts for
+187 passes: one real-symlink test is host-restricted; two POSIX FIFO/link-swap
+tests are skipped on Windows. The Windows junction case passed. No full suite,
+network, downloads or staged-tool launches ran. The junction fixture uses only
+the fixed OS `mklink /J` helper with isolated temporary paths.
+
+The supplied reviewer scripts were absent from the originally named location;
+they were located in the reviewer's checkout and left unchanged. Original M1
+source/tests were copied to isolated scratch before baseline mutation runs.
+All mutants run one at a time in scratch, with source restored after each run.
+
+| Mutation run | Killed | Survived | Text anchors not found |
+| --- | ---: | ---: | ---: |
+| Original `mutate_m1.py`, original M1 code/tests | 64 | 33 | 0 |
+| Original runner, initial M1b code/tests | 84 | 7 | 6 |
+| Same runner, final M1b, six updated anchors | 92 | 5 | 0 |
+
+Updated anchors are M22/M94 (fixed refusal construction), M52 (NFC plus casefold),
+M68/M72 (environment entry lists and role type), and M90 (lstat before open).
+The original runner logic and mutation intent are preserved; skipped anchors are
+not counted as killed. All **27** lead-listed gaps now kill their mutants:
+
+```text
+M20 M69 M55 M29 M25 M37 M38 M39 M05 M46 M47 M08 M09 M90
+M12 M14 M43 M51 M66 M67 M70 M82 M85 M86 M87 M94 M97
+```
+
+Five remaining mutants are disclosed, not counted as covered: M16 removes an
+explicit dot-component guard while trailing-dot refusal still rejects those
+paths; M36 removes template-input lookup while the aggregate reference set still
+refuses missing pins; M59/M61 remove one of the complementary graph cycle/depth
+checks while the others still refuse; M91 changes the per-read remaining-budget
+cap but the aggregate post-read check still refuses oversized totals. M91 can
+read up to the per-file cap before refusal, so this is not a proof of identical
+resource cost. No new bypass was demonstrated by these five mutations.
+
+The unchanged `probe_m1.py` cases A/B/D/E/F/G/I were run on baseline and M1b;
+both completed after supplying the required scratch parent. The initial runs
+stopped at case I's missing scratch parent and are retained as superseded harness
+logs. The final probes confirm path/device refusals, 3,000 JSON fuzz cases with
+zero undercount bypasses, 43 hostile-scalar cases with zero unstructured refusals,
+the 200,000-character ID producing a 21-character diagnostic, and bounded reads.
+Old service-object syntax in one E probe is now deliberately invalid; positive
+new-shape service and multi-runtime cases are repository tests. H's junction
+behavior is covered by the repository test rather than the probe's shell cleanup.
+
+```text
+py -3.10 -m ruff check --no-cache src/agenttalk/acceptance_registry.py src/agenttalk/acceptance.py tests/test_acceptance_registry.py
+py -3.10 -m bandit -q src/agenttalk/acceptance_registry.py src/agenttalk/acceptance.py
+py -3.10 -m bandit -q -s B101 tests/test_acceptance_registry.py
+```
+
+All three checks exited zero, with no Ruff/Bandit findings. Bandit emits existing
+suppression-comment warnings in acceptance.py; no suppression was added there.
+Patch whitespace and a privacy scan with positive controls are required before
+push. Scratch baseline/after copies, mutation scripts, fixture directories and
+logs are retained under the M1b task scratch for the short delta read.
+
+M1b remains an uncalled reader milestone. M2 evaluation, expiry propagation,
+banner/log comparisons and operator command, and M3 schema dispatch/GO integration
+remain pending their respective authorization and cold reads.
