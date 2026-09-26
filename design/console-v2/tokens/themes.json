@@ -1,0 +1,231 @@
+{
+  "note": "The app (The Conversation) ships these 4 themes. Keys are identical across themes; Terminal also switches every font to JetBrains Mono and every radius to 0.",
+  "themes": [
+    {
+      "name": "midnight",
+      "bg": "#0A0C11",
+      "panel": "#11141B",
+      "panel2": "#161A23",
+      "border": "#232834",
+      "fg": "#E7EAF0",
+      "dim": "#7D8595",
+      "accent": "#7C8CFF",
+      "accentInk": "#0A0C11",
+      "ok": "#3DD68C",
+      "warn": "#F5B83D",
+      "bad": "#FF6B6B",
+      "info": "#5CC8FF",
+      "serif": "#F2F3F7"
+    },
+    {
+      "name": "paper",
+      "bg": "#F6F3EC",
+      "panel": "#FFFFFF",
+      "panel2": "#FBF9F4",
+      "border": "#E5E0D4",
+      "fg": "#1D1B17",
+      "dim": "#857F74",
+      "accent": "#E4572E",
+      "accentInk": "#FFFFFF",
+      "ok": "#2E9F6B",
+      "warn": "#B7780A",
+      "bad": "#D2402F",
+      "info": "#2F6FC9",
+      "serif": "#1D1B17"
+    },
+    {
+      "name": "synthwave",
+      "bg": "#120822",
+      "panel": "#1B0F33",
+      "panel2": "#231342",
+      "border": "#3B2266",
+      "fg": "#FBEFFF",
+      "dim": "#A88CCB",
+      "accent": "#FF4FD8",
+      "accentInk": "#120822",
+      "ok": "#00F5D4",
+      "warn": "#FFD23F",
+      "bad": "#FF5C8A",
+      "info": "#00E5FF",
+      "serif": "#FFE3FA"
+    },
+    {
+      "name": "terminal",
+      "bg": "#040906",
+      "panel": "#07100A",
+      "panel2": "#0B170F",
+      "border": "#1B3A24",
+      "fg": "#7CFF9B",
+      "dim": "#52A06B",
+      "accent": "#DFFFE7",
+      "accentInk": "#040906",
+      "ok": "#7CFF9B",
+      "warn": "#FFD166",
+      "bad": "#FF5C5C",
+      "info": "#7FD8FF"
+    }
+  ],
+  "runtime": {
+    "dark": {
+      "claude": "#D08A5E",
+      "codex": "#4FB3A0",
+      "qwen": "#9E82E0"
+    },
+    "light": {
+      "claude": "#B0532C",
+      "codex": "#2C7A6B",
+      "qwen": "#6D4AC0"
+    },
+    "useLightFor": [
+      "paper"
+    ],
+    "letters": {
+      "claude": "C",
+      "codex": "X",
+      "qwen": "Q"
+    }
+  },
+  "avatarSilhouette": {
+    "midnight": "hexagon",
+    "paper": "rounded-square",
+    "synthwave": "star",
+    "terminal": null
+  },
+  "otherDirections": {
+    "1a Terminal Garden": [
+      {
+        "name": "phosphor",
+        "bg": "#040906",
+        "line": "#1B3A24",
+        "fg": "#7CFF9B",
+        "dim": "#3F8A56",
+        "hot": "#DFFFE7",
+        "warn": "#FFD166",
+        "bad": "#FF5C5C",
+        "info": "#7CE7FF",
+        "glow": "rgba(124,255,155,.55)",
+        "soft": "rgba(124,255,155,.22)",
+        "selInk": "#040906"
+      },
+      {
+        "name": "amber",
+        "bg": "#0A0603",
+        "line": "#3E2A10",
+        "fg": "#FFB547",
+        "dim": "#9A6A26",
+        "hot": "#FFE7BF",
+        "warn": "#FFF08A",
+        "bad": "#FF6A4A",
+        "info": "#FFD59A",
+        "glow": "rgba(255,181,71,.5)",
+        "soft": "rgba(255,181,71,.2)",
+        "selInk": "#0A0603"
+      },
+      {
+        "name": "ice",
+        "bg": "#03060C",
+        "line": "#1A2C4B",
+        "fg": "#8FD3FF",
+        "dim": "#4A7394",
+        "hot": "#E6F6FF",
+        "warn": "#FFE38A",
+        "bad": "#FF7A9A",
+        "info": "#B7A8FF",
+        "glow": "rgba(143,211,255,.5)",
+        "soft": "rgba(143,211,255,.2)",
+        "selInk": "#03060C"
+      }
+    ],
+    "1b Orbital": [
+      {
+        "name": "nebula",
+        "bg": "#07051A",
+        "glow": "rgba(139,92,246,.30)",
+        "glass": "rgba(255,255,255,.05)",
+        "border": "rgba(255,255,255,.11)",
+        "ring": "rgba(167,139,250,.20)",
+        "fg": "#EEEAFF",
+        "dim": "#948DBA",
+        "accent": "#A78BFA",
+        "accent2": "#22D3EE",
+        "track": "rgba(255,255,255,.09)",
+        "ok": "#34D399",
+        "info": "#22D3EE",
+        "warn": "#FBBF24",
+        "bad": "#FB7185",
+        "node": "#120E2B"
+      },
+      {
+        "name": "solar",
+        "bg": "#120804",
+        "glow": "rgba(255,122,48,.28)",
+        "glass": "rgba(255,240,225,.055)",
+        "border": "rgba(255,220,190,.13)",
+        "ring": "rgba(255,160,90,.22)",
+        "fg": "#FFF3E8",
+        "dim": "#BE957C",
+        "accent": "#FF8A3D",
+        "accent2": "#FFD166",
+        "track": "rgba(255,255,255,.09)",
+        "ok": "#9BE15D",
+        "info": "#FFD166",
+        "warn": "#FFB020",
+        "bad": "#FF5A5A",
+        "node": "#221108"
+      },
+      {
+        "name": "void",
+        "bg": "#08080A",
+        "glow": "rgba(255,255,255,.08)",
+        "glass": "rgba(255,255,255,.04)",
+        "border": "rgba(255,255,255,.11)",
+        "ring": "rgba(255,255,255,.11)",
+        "fg": "#F4F4F5",
+        "dim": "#8B8B93",
+        "accent": "#F4F4F5",
+        "accent2": "#A1A1AA",
+        "track": "rgba(255,255,255,.09)",
+        "ok": "#E4E4E7",
+        "info": "#A1A1AA",
+        "warn": "#FDE68A",
+        "bad": "#FCA5A5",
+        "node": "#141417"
+      }
+    ],
+    "1c Loud": [
+      {
+        "name": "acid",
+        "bg": "#0E0E0E",
+        "paper": "#171717",
+        "ink": "#F4F4F0",
+        "hl": "#C6FF00",
+        "hlInk": "#0E0E0E",
+        "hot": "#FF3D00",
+        "hotInk": "#0E0E0E",
+        "mute": "#8E8E88"
+      },
+      {
+        "name": "bubblegum",
+        "bg": "#FFE4EF",
+        "paper": "#FFFFFF",
+        "ink": "#1C0A15",
+        "hl": "#FF4FA3",
+        "hlInk": "#FFFFFF",
+        "hot": "#2F4BFF",
+        "hotInk": "#FFFFFF",
+        "mute": "#7A5A6C"
+      },
+      {
+        "name": "riso",
+        "bg": "#F2ECDF",
+        "paper": "#FBF8F0",
+        "ink": "#1F3A93",
+        "hl": "#FF5A5F",
+        "hlInk": "#FBF8F0",
+        "hot": "#FF5A5F",
+        "hotInk": "#FBF8F0",
+        "mute": "#6A78A8"
+      }
+    ]
+  }
+}

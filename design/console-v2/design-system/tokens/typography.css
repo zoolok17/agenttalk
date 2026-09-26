@@ -1,0 +1,36 @@
+/* Typography — three families with clear jobs.
+   Space Grotesk = headings, big numbers, wordmark.
+   Geist        = UI + body copy.
+   Geist Mono   = every identifier: agent names, IDs, counts, timers, paths. */
+
+:root {
+  --font-display: 'Space Grotesk', system-ui, -apple-system, sans-serif;
+  --font-body:    'Geist', system-ui, -apple-system, sans-serif;
+  --font-mono:    'Geist Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  /* Type scale (px) — matches the console */
+  --text-stat:    30px;   /* big stat numbers (display 600) */
+  --text-h1:      23px;   /* view titles (display 600, -.015em) */
+  --text-title:   15px;   /* card / section titles (display 600) */
+  --text-lg:      15px;   /* emphasised body */
+  --text-body:    13px;   /* default body */
+  --text-sm:      12.5px; /* dense rows */
+  --text-xs:      11.5px; /* meta / captions */
+  --text-chip:    10px;   /* chips (mono, uppercase-ish) */
+  --text-label:   11px;   /* section eyebrow labels */
+
+  --lh-tight:     1.05;
+  --lh-snug:      1.35;
+  --lh-body:      1.5;
+
+  --weight-regular: 400;
+  --weight-medium:  500;
+  --weight-semi:    600;
+  --weight-bold:    700;
+
+  /* Common letter-spacing */
+  --tracking-h1:    -0.015em;
+  --tracking-stat:  -0.02em;
+  --tracking-eyebrow: 0.08em;  /* uppercase section labels */
+  --tracking-legend:  0.09em;
+}
