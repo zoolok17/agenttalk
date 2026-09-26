@@ -3788,7 +3788,7 @@ class Store:
     # --------------------------------------------------------------- reading
 
     def _scan_messages_with_paths(
-        self, *, since_id: str | None = None,
+        self, *, since_id: str | None = None, checkpoint=None,
     ) -> tuple[list[tuple[Message, Path]], list[tuple[Path, str, str]]]:
         """The canonical disk walk, keeping each verdict paired with ITS file.
 
@@ -3816,6 +3816,8 @@ class Store:
         if not self.messages_dir.exists():
             return valid, invalid
         for p in sorted(self.messages_dir.iterdir()):
+            if checkpoint is not None:
+                checkpoint()
             if p.suffix != ".json":
                 continue
             # Fast skip BEFORE any read/parse: stem == id is enforced just

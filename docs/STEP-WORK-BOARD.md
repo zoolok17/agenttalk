@@ -79,3 +79,26 @@ Final Python 3.10 tags/drafts/skill lint/install selection: 164 passed (13.47 s)
 Python 3.14 work-tag control: 81 passed (8.93 s). Ruff and Bandit pass changed
 Python files (B101 excluded for test assertions); whitespace check passes.
 Targeted foreground logs retained under task scratch `tk-b3b13b81a46b` for review.
+
+## B4a — shared per-root validated snapshot
+
+Contributor record, base `f0e6ea28`, design `09b54296` section 5. The HTTP server
+warms one snapshot per root and refreshes outside request handlers, coalesced to
+one start per five seconds. Direct composition calls remain synchronous. The
+existing store scanner supplies both paths; roster/signature validation is shared.
+Membership/stat and config/key checks reject mid-scan changes; explicit invalidation
+discards in-flight generations. Failures retain prior data with degraded coverage.
+State keeps its output/error shapes and active-only semantics, with a 15-second
+freshness ceiling. Four mutation-between-poll tests now advance the worker clock;
+their payload assertions are unchanged. Worker cancellation checks precede reads.
+The selected-closure helper deduplicates both supplied partitions and budgets only
+selected IDs (50,000 / 128 MiB), reports 60% warnings and refuses partial results.
+B3 selects/expands the closure. B4s will populate the body-free archive tuple and
+complete-discovery flag; until then board coverage stays building. No archive
+scanner, reducer, new HTTP feed, retention change or persistent index is added.
+Failing-first: eight new contracts failed before implementation, then eight passed.
+Task scratch `tk-90bbd471392f` retains logs for the cold read. The legacy 1,000-send
+performance fixture was interrupted during setup; cap tests use small injected limits.
+Final Python 3.10 snapshot/state selection: 58 passed, 190 deselected (30.75 s);
+compaction: 16 passed (3.46 s). Python 3.14 snapshot: 10 passed (2.14 s).
+Ruff and Bandit pass changed modules; whitespace check passes. Commit stays local.

@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Share validated active envelopes across dashboard polls through a per-root
+  worker snapshot, with generation checks and a cross-partition selected-work budget.
+
 - Validate and inherit external work declarations, reserve publisher-owned vendor
   metadata, and align both lead skills with the finalized work-board contract.
 
