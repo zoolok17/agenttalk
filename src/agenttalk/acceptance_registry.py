@@ -6,6 +6,7 @@ Distribution pins are never copied by the declarative-input reader (D1).
 
 from datetime import datetime, timezone
 from contextlib import contextmanager
+import errno
 import os
 from pathlib import Path
 import re
@@ -540,8 +541,12 @@ def staged_stream(root, relative):
         finally:
             os.close(fd)
         return
-    except OSError:
-        pass
+    except OSError as exc:
+        linked = exc.errno == errno.ELOOP
+    if linked:
+        # Preserve a kernel NOFOLLOW/link-loop refusal without its private path
+        # or exception context. The evaluator must not waive an unsafe path.
+        raise A.LinkedPathError("staged input contains a link or reparse point")
     raise A.AcceptanceError("acceptance_preflight_unavailable", "staged input is unreadable") from None
 
 

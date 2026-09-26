@@ -94,7 +94,8 @@ def _read_pin(root, ref, budget, *, distribution=False, evidence=False, public_r
     except (A.AcceptanceError, OSError, ValueError) as exc:
         # Import-time policy refusals remain strict; an evaluation race is retryable.
         linked = isinstance(exc, A.LinkedPathError)
-        return None, [hold(UNAVAILABLE, ROOT_ADVICE if linked else UNAVAILABLE_DETAIL, public_ref, mandatory=linked)]
+        unsafe = isinstance(exc, A.AcceptanceError) and exc.code == "acceptance_policy_invalid"
+        return None, [hold(UNAVAILABLE, ROOT_ADVICE if linked else UNAVAILABLE_DETAIL, public_ref, mandatory=unsafe)]
     data = None if distribution else b"".join(chunks)
     if capture is not None and data is not None:
         # Retain the bytes actually evaluated, including bounded mismatching evidence.

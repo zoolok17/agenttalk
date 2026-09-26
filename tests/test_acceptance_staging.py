@@ -442,12 +442,16 @@ def add_informational_tool(case):
     stage["registry"]["entries"].append(entry)
     for value in (case["plan"], stage["observation"]):
         value["environment"]["runtime"] = ["java", "tool2"]
-    stage["observation"]["entries"].append(dict(deepcopy(stage["observation"]["entries"][0]), id="tool2"))
+    observed = dict(deepcopy(stage["observation"]["entries"][0]), id="tool2")
+    observed["banner"]["path"] = "tool2-banner.txt"
+    preflight.evidence(stage, observed["banner"], b"informational tool\njava 21.0.1\n")
+    stage["observation"]["entries"].append(observed)
     case["plan"]["rows"][1].update(policy="informational", registry_entries=["tool2"])
     save(case)
 
 
-@pytest.mark.parametrize("fault", ["missing", "mismatch", "unproven", "violation", "integrity", "unsafe"])
+@pytest.mark.parametrize("fault", ["missing", "mismatch", "unproven", "violation", "integrity", "unsafe",
+                                  "nonregular", "loop-error"])
 def test_live_preflight_informational_policy_and_mandatory_failures(candidate, monkeypatch, fault):
     add_informational_tool(candidate)
     if fault in {"unproven", "violation"}:
@@ -470,8 +474,29 @@ def test_live_preflight_informational_policy_and_mandatory_failures(candidate, m
                 raise A.LinkedPathError("linked staged pin")
             return original(root, relative)
         monkeypatch.setattr(R, "staged_path", linked)
+    elif fault == "nonregular":
+        from contextlib import contextmanager
+        from agenttalk import acceptance_registry as R
+        original = R.staged_stream
+        @contextmanager
+        def unsafe_stream(root, relative):
+            if relative == "jdk2.dat":
+                raise A.AcceptanceError("acceptance_policy_invalid", "staged declarative input must be a regular file")
+            with original(root, relative) as stream:
+                yield stream
+        monkeypatch.setattr(R, "staged_stream", unsafe_stream)
+    elif fault == "loop-error":
+        import errno
+        from pathlib import Path
+        from agenttalk import acceptance_registry as R
+        original = R.os.open
+        def rejected_open(path, *args, **kwargs):
+            if Path(path).name == "jdk2.dat":
+                raise OSError(errno.ELOOP, "injected link swap")
+            return original(path, *args, **kwargs)
+        monkeypatch.setattr(R.os, "open", rejected_open)
     result = A.resolve(candidate["store"], record(candidate))
-    expected = 3 if fault in {"violation", "integrity", "unsafe"} else 0
+    expected = 3 if fault in {"violation", "integrity", "unsafe", "nonregular", "loop-error"} else 0
     assert bool(A.evaluate(result)) == bool(expected)
     if fault != "integrity":
         assert result["preflight"]["holds"]  # informational diagnostics remain visible

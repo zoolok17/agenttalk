@@ -69,7 +69,8 @@ def prepare(store, record):
                     scan["identities"][pin["path"]] = after
                 except (A.AcceptanceError, OSError, ValueError) as exc:
                     result = None, [P.hold(P.UNAVAILABLE, P.UNAVAILABLE_DETAIL, ref,
-                                          mandatory=isinstance(exc, A.LinkedPathError))]
+                                          mandatory=isinstance(exc, A.AcceptanceError)
+                                          and exc.code == "acceptance_policy_invalid")]
                 # A later appearance/change of declarative evidence needs a fresh
                 # attachment and seal. Never append bytes after cold reconciliation.
                 data = result[0]
