@@ -20,7 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Content-Security-Policy: system fonts, no inline style or script, bus content
   only through `textContent`. The classic console gains a "New console" link and
   `agenttalk dashboard` prints the `/v2` URL; `/` and `/dashboard` are unchanged.
-  Plan and open items: `docs/STEP-CONSOLE-V2-PITCH.md`.
+  The preview polls the existing feeds (`/api/state`, `/api/attention`,
+  `/api/lead-chat`, GET only) and derives, with node-tested pure functions,
+  the greeting, the needs-you queue with evidence, stuck-vs-busy with the
+  heartbeat/progress/last-message fallback, the roster with a "down" state,
+  usage windows per runtime, and two separate offline banners ("can't reach the
+  console server" vs "no agent has reported for over 5 minutes"). Keyboard focus
+  stays put in the header and `?root=` selects the team (an unknown one is
+  stated, never replaced). Plan and open items: `docs/STEP-CONSOLE-V2-PITCH.md`.
 
 ### Changed
 

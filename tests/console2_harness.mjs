@@ -61,6 +61,7 @@ export function makeDom() {
       this.disabled = false;
       this._text = '';
       this.nodeType = 1;
+      this.style = {};   // CSSOM object: allowed under the console CSP (unlike a style attribute)
     }
     get textContent() {
       return this.children.length ? this.children.map((c) => c.textContent).join('') : this._text;
@@ -123,7 +124,7 @@ export function makeDom() {
   };
 
   // Server-authored shell regions the script looks up by id.
-  for (const [tag, id] of [['header', 'c2-header'], ['main', 'c2-stream'], ['aside', 'c2-rail'],
+  for (const [tag, id] of [['div', 'app'], ['header', 'c2-header'], ['main', 'c2-stream'], ['aside', 'c2-rail'],
                            ['footer', 'c2-footer'], ['span', 'c2-hints']]) {
     const node = new Node(tag);
     node.setAttribute('id', id);
@@ -165,11 +166,17 @@ export function loadConsole(opts) {
     },
   };
   const historyCalls = [];
+  const timers = [];
+  const clock = opts.clock || { perf: 0 };
+  const windowEvents = {};
   const sandbox = {
     document: dom.document,
     fetch: opts.fetch,
     console,
     URLSearchParams,
+    performance: { now: () => clock.perf },
+    setTimeout(fn, ms) { timers.push({ fn, ms }); return timers.length; },
+    addEventListener(type, fn) { (windowEvents[type] = windowEvents[type] || []).push(fn); },
     location: { search: opts.search || '', pathname: opts.pathname || '/v2', hash: opts.hash || '' },
     history: { replaceState(state, title, url) { historyCalls.push(url); } },
   };
@@ -180,10 +187,17 @@ export function loadConsole(opts) {
   if (!opts.modelOnly) {
     vm.runInContext(readStatic('console2.js'), sandbox, { filename: 'console2.js' });
   }
-  return { sandbox, store, historyCalls };
+  // Fire every timer queued so far (one poll round), then let promises settle.
+  async function fire() {
+    const due = timers.splice(0, timers.length);
+    due.forEach((t) => t.fn());
+    for (let i = 0; i < 12; i++) await tick();
+    return due.map((t) => t.ms);
+  }
+  return { sandbox, store, historyCalls, timers, clock, fire, windowEvents };
 }
 
-export const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+export function tick() { return new Promise((resolve) => setTimeout(resolve, 0)); }
 
 export function jsonResponse(payload, status = 200) {
   return Promise.resolve({ ok: status >= 200 && status < 300, status, json: () => Promise.resolve(payload) });

@@ -49,12 +49,13 @@ test('header carries no mission progress and no spec-kitty', async () => {
   assert.ok(!/\d+\s*\/\s*\d+/.test(all), 'no x/y progress');
 });
 
-test('one GET /api/state, no cache, no writes, no other endpoint', async () => {
-  const { requests } = await boot();
-  assert.equal(requests.length, 1);
-  assert.equal(requests[0][0], '/api/state');
-  assert.deepEqual(Object.keys(requests[0][1]), ['cache']);
-  assert.equal(requests[0][1].cache, 'no-store');
+test('only GETs of the three feeds, no cache, nothing else', async () => {
+  const { requests } = await boot({ fetch: () => jsonResponse({ roots: [{ label: 'agenttalk', project_id: 'proj-a' }] }) });
+  assert.deepEqual(requests.map((r) => r[0]), ['/api/state', '/api/attention?root=proj-a', '/api/lead-chat?root=proj-a']);
+  for (const [, init] of requests) {
+    assert.deepEqual(Object.keys(init), ['cache']);
+    assert.equal(init.cache, 'no-store');
+  }
 });
 
 test('hostile labels from the feed land as text and nowhere else', async () => {
@@ -91,13 +92,15 @@ test('feed failure or bad shape shows only what is known', async () => {
     assert.equal(first.disabled, true);
   }
   const { dom } = await boot({ fetch: () => jsonResponse({ roots: 'nope' }) });
-  assert.equal(label(buttons(header(dom))[0]), 'Team');
+  assert.equal(label(buttons(header(dom))[0]), 'No team data', 'a snapshot without a roots list is a failed read');
+  const empty = await boot({ fetch: () => jsonResponse({ roots: [] }) });
+  assert.equal(label(buttons(header(empty.dom))[0]), 'Team');
 });
 
 test('theme: default applied, click persists and repaints, unknown stored value ignored', async () => {
   let { dom, store } = await boot();
   assert.equal(dom.document.documentElement.getAttribute('data-theme'), 'midnight');
-  assert.equal(store.size, 0, 'loading alone writes nothing');
+  assert.equal(store.has('agenttalk.console2.theme'), false, 'loading alone never stores a theme');
   const paper = buttons(header(dom)).find((b) => label(b) === 'Paper');
   paper.click();
   assert.equal(dom.document.documentElement.getAttribute('data-theme'), 'paper');
@@ -223,11 +226,12 @@ test('the brand, spacer and theme group are the same nodes before and after the 
 const pressedChips = (dom) => buttons(header(dom))
   .filter((b) => b.getAttribute('data-c2-key') && b.getAttribute('aria-pressed') === 'true').map(label);
 const streamText = (dom) => texts(dom.document.getElementById('c2-stream')).join(' | ');
+const noUnknown = (dom) => !streamText(dom).includes('Unknown team.');
 
 test('?root= selects the team with that project_id', async () => {
   const { dom, historyCalls } = await boot({ fetch: TWO_ROOTS, search: '?root=proj-b' });
   assert.deepEqual(pressedChips(dom), ['second']);
-  assert.equal(streamText(dom), '');
+  assert.ok(noUnknown(dom));
   assert.deepEqual(historyCalls, [], 'loading never rewrites the address');
 });
 
@@ -240,7 +244,7 @@ test('no ?root= (or an empty one) selects the first team', async () => {
   for (const search of ['', '?root=', '?other=1']) {
     const { dom } = await boot({ fetch: TWO_ROOTS, search });
     assert.deepEqual(pressedChips(dom), ['main'], search);
-    assert.equal(streamText(dom), '');
+    assert.ok(noUnknown(dom));
   }
 });
 
@@ -262,7 +266,7 @@ test('ambiguous label, repeated root parameter and unknown id are all unknown', 
   ({ dom } = await boot({ fetch: TWO_ROOTS, search: '?root=proj-a&root=proj-b' }));
   assert.ok(streamText(dom).includes('Unknown team.'));
   ({ dom } = await boot({ fetch: dup, search: '?root=p2' }));
-  assert.equal(streamText(dom), '');
+  assert.ok(noUnknown(dom));
 });
 
 test('picking a team from the unknown state selects it and rewrites the address', async () => {
@@ -270,7 +274,7 @@ test('picking a team from the unknown state selects it and rewrites the address'
   const pick = buttons(dom.document.getElementById('c2-stream')).find((b) => label(b) === 'second');
   pick.click();
   assert.deepEqual(pressedChips(dom), ['second']);
-  assert.equal(streamText(dom), '', 'the unknown-team state is gone');
+  assert.ok(noUnknown(dom), 'the unknown-team state is gone');
   assert.deepEqual(historyCalls, ['/v2?root=proj-b&x=1#h']);
 });
 

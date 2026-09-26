@@ -314,3 +314,69 @@ Changed from the plan above, and why:
 8. **CSS/JS tests strip comments before linting**, so comments can describe what is banned.
 
 Not done in M1 (as planned): the polling data layer, every derivation, stream, rail, states, keyboard overlay.
+
+
+## 12. M1b and M2 record (focus and ?root= fixes, view model, data layer)
+
+**M1b** (commit `8029417`), from the M1 cold read (Codex, headless Edge): (1) the header redraw dropped keyboard
+focus. Controls are now built once and updated in place (theme buttons, team chips); a change in the SET of team
+chips rebuilds them and focus returns to the chip with the same key. The recording DOM stub models focus
+(`activeElement`, `focus()`, focus lost when a focused node is detached). (2) `?root=` was ignored. It is resolved
+like the server does (project_id, then a unique label); unknown, ambiguous or repeated selectors show an explicit
+"Unknown team." state with the teams to pick from and never switch silently; picking a team rewrites the address
+with `replaceState`. Both regressions fail against the M1 script.
+
+**M2** shipped:
+
+- `console2-model.js` (pure, no DOM/fetch/timers/storage; a test pins that): time helpers, `agentView` (roster
+  state, line and colour, stuck evidence), `usageRows`, `freshness` (both offline truths), `buildTeamView`,
+  `buildShellView`. The view is plain JSON.
+- `console2.js`: polling `/api/state` every 2 s, then `/api/attention` and `/api/lead-chat` for the selected team
+  (the other teams' attention on the first round and every 5th). "Now" is `generated_at` plus monotonic elapsed
+  time. Last good data is kept on failure. The stream and rail are drawn as plain text (no controls yet) and only
+  redrawn when the drawn text changes.
+- Node tests: `console2_view.test.mjs` (54), `console2_data.test.mjs` (20), `console2_render.test.mjs` (25),
+  `console2_model.test.mjs` (17). Python: `tests/test_console2_web.py`.
+
+Rules as built (each pinned by a test):
+
+- **Stuck card** = health `working_silent` (or the wrapper's `stuck_suspected`) AND no progress for at least 600 s
+  (`last_progress_at`, else the turn start) AND heartbeat at most 300 s old AND the recent-envelope window shows no
+  message from that agent since it woke. Wording: "Last progress 14m ago · no reply sent · heartbeat still fresh",
+  Wait first, Restart locked "CLI only", the weaker-evidence note.
+- **Not a card**: recent progress (busy, "no card while progress moves"); a reply since the wake; reply status
+  unknown because the 25-envelope window does not reach back to the wake (G9); a stale heartbeat ("not judged
+  stuck", a freshness problem); `stuck_suspected` without the evidence (row is busy, "Wrapper suspects a stall").
+- **Offline**: unreachable = the last `/api/state` read failed, or `generated_at` did not advance for more than 3
+  polls. Silent = the server answers but the newest write (any heartbeat, health, capacity reading or envelope) is
+  older than 300 s (5:00 is live, 5:01 silent); no timestamp at all is silent. Unreachable wins over silent. Data
+  stays on screen, greyed (`is-stale` on `#app`), roster summary "frozen · as of HH:MM".
+- **Queue**: LOOKS STUCK first, then oldest, then id. Kinds: escalation DECISION (info), gate GATE HOLD (warn),
+  everything else keeps its `source_label` in warn; the server's own `stuck` items are dropped in favour of the
+  evidence rule; known low-severity sources go to "also happening"; an unknown source is always a card.
+- **Greeting** modes: busy ("Three things need you."), answered, deferred ("Nothing new needs you."), calm
+  (candidates only), quiet ("All quiet." + idle count), offline, needs-unavailable, error, loading.
+- **Roster**: lead first; ten health states map to seven row states (`down` and `unknown` added); usage windows
+  per runtime with the newest reading winning, grey when stale or already reset, "no reading" never 0 %.
+
+Changed from the plan, and why:
+
+1. **`working_turn` is never a stuck candidate** (the plan table listed it). That state means the wrapper sees the
+   turn producing events; `last_progress_at` is only refreshed by explicit progress notes, so an old value on a
+   long, healthy turn would raise false cards. Only `working_silent` and `stuck_suspected` can be candidates.
+2. **Extra greeting modes** the plan did not enumerate: `deferred`, `calm`, `needs-unavailable`, `error`,
+   `loading`, so the page never says "All quiet." when it cannot know.
+3. **"Since you last looked" is separate from "Also happening"**: shown in quiet mode whether or not something is
+   also happening. Lines are counts of messages / review results / task responses from the 25-envelope window
+   ("25+" when the window is all newer than the last visit). The last visit is stored per browser and refreshed on
+   load and `pagehide`; it is compared with server time, so a skewed browser clock shifts it.
+4. **A failed attention read keeps the last items and marks the page stale** rather than clearing them; a read
+   answered for a different team is discarded; an errors-as-data attention answer reads "Can't read what needs you."
+   The error text itself is never shown or carried (it can contain paths).
+5. **`generated_at` missing** (an older server) falls back to the local clock, so the page still works.
+6. **The source lint changed on purpose**: one `fetch(` (in `getJson`), only the three feed paths as literals,
+   and the model may not touch `fetch`, `document`, storage or timers. The `method:`/`body:` ban stays for
+   `console2.js`, so the page still cannot write.
+7. **Tests pin `TZ=UTC`** (the pytest wrapper sets it, and the data test sets it itself) because clock times are
+   drawn in the browser's zone.
+8. **Avatars are chosen in the model but not drawn yet** (M4): fixed hexagon list, role map, stable hash fallback.

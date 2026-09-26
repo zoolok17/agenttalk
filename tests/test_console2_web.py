@@ -10,6 +10,7 @@ here, skipped when node is absent (same convention as the classic console tests)
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -208,16 +209,30 @@ JS_BANNED = {
 @pytest.mark.parametrize("name", V2_JS)
 @pytest.mark.parametrize("what", sorted(JS_BANNED))
 def test_v2_js_source_lint(name: str, what: str) -> None:
+    if name == "console2-model.js" and what == "write request (read-only slice)":
+        pytest.skip("the model never makes requests (see the no-requests test); its view objects use a body key")
     code = _strip_js_comments(_read(name))
     hit = re.search(JS_BANNED[what], code)
     assert hit is None, f"{name}: {what}: {hit.group(0)!r}"
 
 
-def test_v2_js_only_fetches_fixed_api_paths() -> None:
-    calls = re.findall(r"\bfetch\(\s*([^,)]*)", _strip_js_comments(_read("console2.js")))
-    assert calls, "expected at least the /api/state fetch"
-    for first_arg in calls:
-        assert re.fullmatch(r"'/api/[a-z-]+'", first_arg.strip()), first_arg
+ALLOWED_API_PATHS = {"/api/state", "/api/attention", "/api/lead-chat"}
+
+
+def test_v2_model_makes_no_requests_and_touches_no_dom() -> None:
+    code = _strip_js_comments(_read("console2-model.js"))
+    for pattern in (r"\bfetch\b", r"\bdocument\b", r"\blocalStorage\b", r"\bsetTimeout\b", r"\bsetInterval\b",
+                    r"\bXMLHttpRequest\b", r"\bnavigator\b", r"Date\.now\("):
+        assert not re.search(pattern, code), pattern
+
+
+def test_v2_js_reads_only_the_three_feeds_through_one_fetch() -> None:
+    code = _strip_js_comments(_read("console2.js"))
+    assert len(re.findall(r"\bfetch\(", code)) == 1, "one request helper (getJson), nothing else"
+    assert "{ cache: 'no-store' }" in code
+    literals = set(re.findall(r"'(/api/[^']*)'", code))
+    assert literals == ALLOWED_API_PATHS, literals
+    assert "/api/intent" not in code and "/api/session" not in code
 
 
 def test_v2_js_uses_textcontent_and_creates_no_markup() -> None:
@@ -350,11 +365,14 @@ def test_layout_matches_the_spec_grid() -> None:
 # --------------------------------------------------------------- node tests
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not available")
-@pytest.mark.parametrize("script", ["console2_model.test.mjs", "console2_render.test.mjs"])
+@pytest.mark.parametrize(
+    "script",
+    ["console2_model.test.mjs", "console2_view.test.mjs", "console2_render.test.mjs", "console2_data.test.mjs"],
+)
 def test_console2_node_tests(script: str) -> None:
     r = subprocess.run(
         ["node", str(REPO_ROOT / "tests" / script)],
-        capture_output=True, text=True, timeout=120, cwd=REPO_ROOT,
+        capture_output=True, text=True, timeout=120, cwd=REPO_ROOT, env={**os.environ, "TZ": "UTC"},
     )
     assert r.returncode == 0, r.stdout + r.stderr
     last = r.stdout.strip().splitlines()[-1]
