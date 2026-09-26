@@ -20,7 +20,7 @@
 - **Money (qwen gateway).** Three configured levels plus a fourth, late number:
   - **Alert** ("soft stop") — notifies the operator, blocks nothing.
   - **Hard cutoff** — the gateway refuses further calls.
-  - **Monthly cap** — what the operator watches most. Today 100 EUR; spend ≈ 67 EUR.
+  - **Monthly cap** — what the operator watches most (for example 100 EUR).
   - **Provider bill** — arrives hours late. Our internal **ledger is the live figure**; the bill confirms it later.
 - **Freshness.** Every number came from a file an agent wrote. When the machine sleeps or the network drops, numbers go stale *while looking normal*. This happened for real.
 

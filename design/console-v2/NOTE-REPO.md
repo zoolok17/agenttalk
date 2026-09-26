@@ -4,9 +4,9 @@ This folder is the designer's console handoff v2 (decided direction: *The Conver
 
 It is design material, not product code:
 - It is not part of the Python package. The sdist uses an explicit include list, and `design/` is not on it.
-- The prototype runtime (`prototype/support.js`) loads React and Babel from a public CDN when you open a prototype page. That happens only in your browser, only when you view the design; agenttalk never serves these files.
+- The design tool's runtime (`prototype/support.js`) is NOT included, because its redistribution terms are not established (see `LICENSE-NOTES.md`). Without it the prototype pages do not render; open the full handoff zip instead. The specs in `docs/` are complete on their own.
 
-## Left out of the repository copy (to keep it small)
+## Left out of the repository copy
 - `prototype/new_avatars/oval-muted`, `oval-vivid` and `triangle`. These silhouettes belong to directions that were not chosen. The chosen themes use `hexagon` (Midnight), `rounded-square` (Paper) and `star` (Synthwave), and those are included.
 - `assets/avatars-shaped/contact-sheet.png` (a preview of all 60 avatars).
 - `prototype/avatars/`. These ten round avatars are byte-identical to `src/agenttalk/web_static/avatars/`. To view `Team Console.dc.html` with images, copy that folder next to it as `prototype/avatars/`.

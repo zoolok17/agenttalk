@@ -1,5 +1,7 @@
 # agenttalk Console — handoff v2 (decided direction)
 
+> **In this repository:** a trimmed copy, not the full handoff. See `NOTE-REPO.md` for what was left out and why, and `LICENSE-NOTES.md` for provenance and third-party terms.
+
 **Build this:** *The Conversation* (board **3a**) as the whole console, with four themes (Midnight, Paper, Synthwave, Terminal), a phone layout (**3c**), a qwen budget meter (**3b**), and the rules in **3d**. This replaces the "pick a direction" open question from v1: the dev team's notes settled it (1d is the app, the 1a terminal look is one of its themes, keyboard shortcuts everywhere).
 
 Source repo: `zoolok17/agenttalk` (`master`, v0.91.x). Real console: `src/agenttalk/web.py` (stdlib server, loopback) + `src/agenttalk/web_static/` (vanilla JS, no build step). Keep it that way — no framework, stdlib only, `textContent` for anything that came from the bus.
