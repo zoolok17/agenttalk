@@ -1,0 +1,1720 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="design_doc_mode" content="canvas">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Sora:wght@400;500;600;700&family=Archivo:ital,wght@0,500;0,700;0,900;1,900&family=Space+Mono:wght@400;700&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&family=Instrument+Serif:ital@0;1&family=Space+Grotesk:wght@500;600&display=swap" rel="stylesheet">
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;background:#141519;color:#E8E9ED;font-family:'Geist',system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+  a{color:#9AA6FF}
+  a:hover{color:#C4CBFF}
+  input::placeholder{color:inherit;opacity:.45}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  @keyframes blink{0%,49%{opacity:1}50%,100%{opacity:0}}
+  @keyframes dash{to{stroke-dashoffset:-24}}
+  @keyframes marquee{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+  @keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</helmet>
+<section style="padding:56px 64px 40px;display:flex;flex-direction:column;gap:34px;border-bottom:1px solid #26282E">
+  <div style="display:flex;flex-direction:column;gap:8px;max-width:900px">
+    <span style="font-family:'Geist Mono',monospace;font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:#8B8F98">Turn 3 · Answers to the dev team's notes</span>
+    <span style="font-family:'Space Grotesk',sans-serif;font-size:34px;font-weight:600;letter-spacing:-.02em;color:#F4F5F7">One app. Calm by default. Honest when it can't see.</span>
+    <span style="font-size:15px;line-height:1.55;color:#9A9EA8">The Conversation (1d) becomes the whole console, with Terminal as one of its themes. These boards use only data agenttalk has today, except where marked. Click board 3a, then press ? for shortcuts.</span>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:12px;width:2536px">
+    <sc-for list="{{answers3}}" as="g" hint-placeholder-count="14">
+      <div style="background:#1B1C21;border:1px solid #2A2C33;border-radius:12px;padding:14px 16px;display:flex;flex-direction:column;gap:6px">
+        <div style="display:flex;align-items:center;gap:8px"><span style="{{g.tagStyle}}">{{g.tag}}</span><span style="flex:1"></span><a href="{{g.href}}" style="font-family:'Geist Mono',monospace;font-size:12px;font-weight:600;text-decoration:none;color:#C4CBFF">→ {{g.where}}</a></div> <!-- nosemgrep --><!-- design-time template placeholder in a prototype; never served by agenttalk -->
+        <span style="font-size:14px;font-weight:600;line-height:1.3;color:#F2F3F5">{{g.q}}</span>
+        <span style="font-size:12.5px;line-height:1.45;color:#B4B8C1">{{g.a}}</span>
+      </div>
+    </sc-for>
+  </div>
+
+  <div style="display:flex;flex-wrap:wrap;gap:64px 56px;width:2600px">
+
+    <!-- 3a -->
+    <div id="3a" style="display:flex;flex-direction:column;gap:14px">
+      <div style="display:flex;align-items:baseline;gap:12px">
+        <span style="font-family:'Geist Mono',monospace;font-size:13px;font-weight:600;color:#0B0C0F;background:#E8E9ED;border-radius:6px;padding:3px 9px">3a</span>
+        <span style="font-family:'Space Grotesk',sans-serif;font-size:21px;font-weight:600;color:#F2F3F5">The Conversation · the whole app</span>
+        <span style="font-size:13.5px;color:#8B8F98">Two teams, qwen spend, real names, evidence on stuck cards. Try Busy / Quiet / Can't see team.</span>
+      </div>
+      <div tabIndex="0" onKeyDown="{{k3}}" style="width:1240px;height:780px;border-radius:{{r3.frame}};overflow:hidden;position:relative;outline:none;display:grid;grid-template-columns:minmax(0,1fr) 340px;grid-template-rows:58px minmax(0,1fr) 32px;background:{{p5.bg}};color:{{p5.fg}};font-family:{{f3.body}};box-shadow:0 30px 80px rgba(0,0,0,.5)">
+        <div style="grid-column:1 / 3;display:flex;align-items:center;gap:12px;padding:0 18px;border-bottom:1px solid {{p5.border}}">
+          <div style="width:22px;height:22px;border-radius:{{r3.ctl}};background:{{p5.accent}}"></div>
+          <span style="font-weight:600;font-size:15px">agenttalk</span>
+          <div style="display:flex;gap:3px;padding:3px;border-radius:{{r3.ctl}};border:1px solid {{p5.border}};background:{{p5.panel}}">
+            <sc-for list="{{teams3}}" as="t" hint-placeholder-count="2">
+              <div onClick="{{t.set}}" style="{{t.style}}"><span style="{{t.dot}}"></span><span>{{t.label}}</span><span style="{{t.machStyle}}">{{t.machine}}</span><span style="{{t.badge}}">{{t.count}}</span></div>
+            </sc-for>
+          </div>
+          <span style="flex:1"></span>
+          <span style="font-family:{{f3.mono}};font-size:10px;letter-spacing:.12em;color:{{p5.dim}}">DEMO</span>
+          <div style="display:flex;gap:3px;padding:3px;border-radius:{{r3.ctl}};border:1px solid {{p5.border}}"><sc-for list="{{scen3}}" as="c" hint-placeholder-count="3"><span onClick="{{c.set}}" style="{{c.style}}">{{c.label}}</span></sc-for></div>
+          <div style="display:flex;gap:3px;padding:3px;border-radius:{{r3.ctl}};border:1px solid {{p5.border}}"><sc-for list="{{th5Chips}}" as="c" hint-placeholder-count="4"><span onClick="{{c.set}}" style="{{c.style}}">{{c.label}}</span></sc-for></div>
+          <span onClick="{{toggleKeys}}" style="{{keyBtn}}">?</span>
+        </div>
+
+        <div style="display:flex;flex-direction:column;min-height:0;min-width:0">
+          <sc-if value="{{off3}}" hint-placeholder-val="{{false}}">
+            <div style="margin:14px 22px 0;padding:12px 14px;border-radius:{{r3.card}};border:1px solid {{warnEdge}};background:{{warnSoft}};display:flex;align-items:center;gap:14px">
+              <span style="font-family:{{f3.mono}};font-size:10.5px;font-weight:600;letter-spacing:.1em;color:{{p5.warn}};flex:none">CAN'T SEE THE TEAM</span>
+              <span style="flex:1;font-size:13px;line-height:1.45">{{offMsg}}</span>
+              <span onClick="{{retry3}}" style="{{retryStyle}}">{{retryLabel}}</span>
+            </div>
+          </sc-if>
+          <div ref="{{s6Ref}}" style="flex:1;min-height:0;overflow:auto;padding:22px 26px 14px;display:flex;flex-direction:column;gap:14px">
+            <div style="display:flex;flex-direction:column;gap:6px">
+              <span style="font-family:{{f3.serif}};font-size:{{greetSize}};line-height:1.1">{{greet}}</span>
+              <span style="font-size:13.5px;line-height:1.5;color:{{p5.dim}};max-width:620px">{{greetSub}}</span>
+            </div>
+            <div style="display:flex;gap:10px;align-items:flex-start;max-width:660px;opacity:{{frozenOp}}">
+              <div style="{{leadAv}}">LE</div>
+              <div style="display:flex;flex-direction:column;gap:4px"><div style="background:{{p5.panel}};border:1px solid {{p5.border}};border-radius:{{r3.bubble}};padding:11px 15px;font-size:14px;line-height:1.5">{{leadMsg}}</div><span style="font-family:{{f3.mono}};font-size:10.5px;color:{{p5.dim}}">lead · {{leadAge}}</span></div>
+            </div>
+            <sc-for list="{{needs3}}" as="n" hint-placeholder-count="3">
+              <div onClick="{{n.pick}}" style="{{n.card}}">
+                <div style="display:flex;align-items:center;gap:10px"><span style="{{n.kindStyle}}">{{n.kind}}</span><span style="flex:1"></span><span style="font-family:{{f3.mono}};font-size:11px;color:{{p5.dim}}">{{n.age}}</span></div>
+                <span style="font-family:{{f3.serif}};font-size:{{needSize}};line-height:1.2">{{n.title}}</span>
+                <div style="display:flex;gap:12px;align-items:baseline"><span style="font-family:{{f3.mono}};font-size:10px;letter-spacing:.1em;color:{{p5.dim}};flex:none">EVIDENCE</span><span style="font-family:{{f3.mono}};font-size:12px;line-height:1.5">{{n.ev}}</span></div>
+                <sc-if value="{{n.isDone}}" hint-placeholder-val="{{false}}"><span style="font-size:13px;color:{{p5.ok}}">{{n.done}}</span></sc-if>
+                <sc-if value="{{n.notDone}}" hint-placeholder-val="{{true}}">
+                  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                    <sc-for list="{{n.opts}}" as="o" hint-placeholder-count="2"><span onClick="{{o.go}}" style="{{o.style}}">{{o.label}}</span></sc-for>
+                    <span onClick="{{n.later}}" style="{{n.laterStyle}}">Later</span>
+                    <span style="flex:1"></span>
+                    <span style="font-family:{{f3.mono}};font-size:10.5px;color:{{p5.dim}}">{{n.hint}}</span>
+                  </div>
+                </sc-if>
+              </div>
+            </sc-for>
+            <sc-if value="{{hasDeferred}}" hint-placeholder-val="{{false}}"><span onClick="{{undefer}}" style="font-family:{{f3.mono}};font-size:11.5px;color:{{p5.dim}};cursor:pointer">{{deferredLabel}}</span></sc-if>
+            <sc-if value="{{hasSide}}" hint-placeholder-val="{{true}}">
+              <div style="display:flex;flex-direction:column;gap:8px;max-width:660px;opacity:{{frozenOp}}">
+                <span style="font-family:{{f3.mono}};font-size:10.5px;letter-spacing:.12em;color:{{p5.dim}}">{{sideTitle}}</span>
+                <sc-for list="{{side3}}" as="a" hint-placeholder-count="2">
+                  <div style="display:flex;gap:12px;align-items:baseline;padding:10px 14px;border-radius:{{r3.ctl}};border:1px dashed {{p5.border}}"><span style="font-size:13px;font-weight:600;flex:none">{{a.t}}</span><span style="font-family:{{f3.mono}};font-size:11.5px;color:{{p5.dim}};line-height:1.45">{{a.d}}</span></div>
+                </sc-for>
+              </div>
+            </sc-if>
+            <sc-for list="{{chat3}}" as="m" hint-placeholder-count="0">
+              <div style="display:flex;flex-direction:column">
+                <sc-if value="{{m.isYou}}" hint-placeholder-val="{{false}}"><div style="align-self:flex-end;max-width:480px;background:{{p5.accent}};color:{{p5.accentInk}};border-radius:{{r3.you}};padding:10px 14px;font-size:14px;line-height:1.5">{{m.body}}</div></sc-if>
+                <sc-if value="{{m.isLead}}" hint-placeholder-val="{{false}}"><div style="display:flex;gap:10px;max-width:600px"><div style="{{leadAv}}">LE</div><div style="background:{{p5.panel}};border:1px solid {{p5.border}};border-radius:{{r3.bubble}};padding:10px 14px;font-size:14px;line-height:1.5">{{m.body}}</div></div></sc-if>
+              </div>
+            </sc-for>
+          </div>
+          <div style="flex:none;padding:8px 22px 16px">
+            <div style="display:flex;align-items:center;gap:10px;padding:6px 6px 6px 14px;border-radius:{{r3.card}};background:{{p5.panel}};border:1px solid {{p5.border}};opacity:{{composerOp}}">
+              <input ref="{{in6Ref}}" value="{{draft6}}" onInput="{{onDraft6}}" onKeyDown="{{keyDraft6}}" disabled="{{off3}}" placeholder="{{composerPh}}" style="flex:1;background:transparent;border:none;outline:none;color:{{p5.fg}};font-family:{{f3.body}};font-size:14.5px;padding:8px 0">
+              <span onClick="{{send6}}" style="width:40px;height:40px;border-radius:{{r3.ctl}};background:{{p5.accent}};color:{{p5.accentInk}};display:flex;align-items:center;justify-content:center;cursor:pointer"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M6 11l6-6 6 6"></path></svg></span>
+            </div>
+          </div>
+        </div>
+
+        <div style="border-left:1px solid {{p5.border}};background:{{p5.panel}};padding:18px;display:flex;flex-direction:column;gap:20px;min-height:0;overflow:auto">
+          <div style="display:flex;flex-direction:column;gap:9px;opacity:{{frozenOp}}">
+            <div style="display:flex;align-items:center;gap:8px"><span style="{{qwenMark}}">Q</span><span style="font-size:12.5px;font-weight:600">Qwen gateway · September</span><span style="flex:1"></span><span style="font-family:{{f3.mono}};font-size:10.5px;color:{{p5.dim}}">{{bStamp}}</span></div>
+            <div style="display:flex;align-items:baseline;gap:6px"><span style="font-family:{{f3.mono}};font-size:24px;font-weight:600">{{bLedger}}</span><span style="font-size:12.5px;color:{{p5.dim}}">of 100 € cap</span></div>
+            <div style="position:relative;height:{{rb.h}}"><div style="{{rb.track}}"></div><div style="{{rb.proj}}"></div><div style="{{rb.fill}}"></div><div style="{{rb.bill}}"></div><div style="{{rb.alert}}"></div><div style="{{rb.cut}}"></div></div>
+            <div style="display:grid;grid-template-columns:auto minmax(0,1fr);gap:4px 12px;font-size:11.5px;margin-top:4px">
+              <sc-for list="{{bLegend}}" as="l" hint-placeholder-count="4"><span style="{{l.kStyle}}">{{l.k}}</span><span style="color:{{p5.dim}}">{{l.v}}</span></sc-for>
+            </div>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:11px;opacity:{{frozenOp}}">
+            <span style="font-family:{{f3.mono}};font-size:10.5px;letter-spacing:.12em;color:{{p5.dim}}">USAGE WINDOWS</span>
+            <sc-for list="{{usage3}}" as="u" hint-placeholder-count="4">
+              <div style="display:flex;flex-direction:column;gap:5px">
+                <div style="display:flex;align-items:center;gap:7px"><span style="{{u.mark}}">{{u.letter}}</span><span style="font-size:12px;font-weight:500">{{u.rt}}</span><span style="font-size:11.5px;color:{{p5.dim}}">{{u.win}}</span><span style="flex:1"></span><span style="{{u.pctStyle}}">{{u.pct}}</span></div>
+                <div style="height:4px;border-radius:2px;background:{{p5.panel2}};overflow:hidden"><div style="{{u.bar}}"></div></div>
+                <span style="font-family:{{f3.mono}};font-size:10.5px;color:{{p5.dim}};text-align:right">resets {{u.reset}}</span>
+              </div>
+            </sc-for>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:11px">
+            <div style="display:flex;align-items:center"><span style="font-family:{{f3.mono}};font-size:10.5px;letter-spacing:.12em;color:{{p5.dim}}">TEAM · {{rosterN}}</span><span style="flex:1"></span><span style="font-family:{{f3.mono}};font-size:10.5px;color:{{p5.dim}}">{{rosterSum}}</span></div>
+            <sc-for list="{{roster3}}" as="r" hint-placeholder-count="10">
+              <div style="display:flex;align-items:center;gap:11px">
+                <div style="{{r.avWrap}}">
+                  <sc-if value="{{r.hasImg}}" hint-placeholder-val="{{true}}"><div style="{{r.imgBg}}"></div></sc-if>
+                  <sc-if value="{{r.noImg}}" hint-placeholder-val="{{false}}"><span style="{{r.txtAv}}">{{r.letter}}</span></sc-if>
+                  <span style="{{r.badge}}">{{r.letter}}</span>
+                </div>
+                <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:2px"><span title="{{r.full}}" style="font-family:{{f3.mono}};font-size:12px;font-weight:500">{{r.name}}</span><span style="{{r.evStyle}}">{{r.ev}}</span></div>
+                <span style="{{r.capStyle}}">{{r.cap}}</span>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+
+        <div style="grid-column:1 / 3;display:flex;align-items:center;gap:18px;padding:0 18px;border-top:1px solid {{p5.border}};font-family:{{f3.mono}};font-size:11px;color:{{p5.dim}}">
+          <sc-for list="{{keyHints}}" as="k" hint-placeholder-count="7"><span style="display:flex;align-items:center;gap:6px"><span style="{{kbd}}">{{k.k}}</span>{{k.d}}</span></sc-for>
+          <span style="flex:1"></span><span>click the board to use keys</span>
+        </div>
+
+        <sc-if value="{{keys3}}" hint-placeholder-val="{{false}}">
+          <div onClick="{{toggleKeys}}" style="position:absolute;inset:0;background:{{overlayBg}};display:flex;align-items:center;justify-content:center">
+            <div style="width:580px;background:{{p5.panel}};border:1px solid {{p5.border}};border-radius:{{r3.card}};padding:22px 24px;display:flex;flex-direction:column;gap:16px">
+              <div style="display:flex;align-items:baseline"><span style="font-family:{{f3.serif}};font-size:28px">Keyboard</span><span style="flex:1"></span><span style="font-family:{{f3.mono}};font-size:11px;color:{{p5.dim}}">esc or ? to close</span></div>
+              <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 24px">
+                <sc-for list="{{allKeys}}" as="k" hint-placeholder-count="10"><div style="display:flex;align-items:center;gap:10px"><span style="{{kbd}}">{{k.k}}</span><span style="font-size:13px">{{k.d}}</span></div></sc-for>
+              </div>
+              <span style="font-size:12px;line-height:1.5;color:{{p5.dim}}">Same keys in every theme. Terminal only looks like a terminal; it doesn't add or remove anything.</span>
+            </div>
+          </div>
+        </sc-if>
+      </div>
+    </div>
+
+    <!-- 3b -->
+    <div id="3b" style="display:flex;flex-direction:column;gap:14px">
+      <div style="display:flex;align-items:baseline;gap:12px">
+        <span style="font-family:'Geist Mono',monospace;font-size:13px;font-weight:600;color:#0B0C0F;background:#E8E9ED;border-radius:6px;padding:3px 9px">3b</span>
+        <span style="font-family:'Space Grotesk',sans-serif;font-size:21px;font-weight:600;color:#F2F3F5">Qwen budget · anatomy and states</span>
+        <span style="font-size:13.5px;color:#8B8F98">Alert, cutoff, cap and a late bill on one bar. Needs the gateway ledger in the console (not available yet).</span>
+      </div>
+      <div style="width:1240px;height:860px;border-radius:{{r3.frame}};overflow:hidden;background:{{p5.bg}};color:{{p5.fg}};font-family:{{f3.body}};padding:30px 34px;display:flex;flex-direction:column;gap:18px;box-shadow:0 30px 80px rgba(0,0,0,.5)">
+        <div style="display:flex;align-items:baseline;gap:14px"><span style="font-family:{{f3.serif}};font-size:32px;line-height:1.1">One bar against the cap. Two lines on it. One late tick.</span><span style="flex:1"></span><span style="font-family:{{f3.mono}};font-size:11px;color:{{p5.dim}}">levels are gateway config · example values</span></div>
+        <div style="position:relative;height:292px;margin:0 70px 0 40px">
+          <div style="position:absolute;left:0;right:0;top:128px;height:28px"><div style="{{ab.track}}"></div><div style="{{ab.proj}}"></div><div style="{{ab.fill}}"></div><div style="{{ab.bill}}"></div><div style="{{ab.alert}}"></div><div style="{{ab.cut}}"></div><div style="{{ab.end}}"></div></div>
+          <sc-for list="{{anat3}}" as="c" hint-placeholder-count="5">
+            <div style="{{c.line}}"></div>
+            <div style="{{c.box}}"><span style="{{c.labStyle}}">{{c.label}}</span><span style="font-family:{{f3.mono}};font-size:18px;font-weight:600">{{c.value}}</span><span style="font-size:12px;line-height:1.35;color:{{p5.dim}}">{{c.note}}</span></div>
+          </sc-for>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px">
+          <sc-for list="{{bstates3}}" as="b" hint-placeholder-count="6">
+            <div style="{{b.card}}">
+              <div style="display:flex;align-items:center"><span style="font-family:{{f3.mono}};font-size:10.5px;letter-spacing:.1em;color:{{p5.dim}}">{{b.title}}</span><span style="flex:1"></span><span style="font-family:{{f3.mono}};font-size:10.5px;color:{{p5.dim}}">{{b.stamp}}</span></div>
+              <div style="display:flex;align-items:baseline;gap:6px"><span style="{{b.valStyle}}">{{b.val}}</span><span style="font-size:12px;color:{{p5.dim}}">{{b.sub}}</span></div>
+              <div style="position:relative;height:{{b.bar.h}}"><div style="{{b.bar.track}}"></div><div style="{{b.bar.proj}}"></div><div style="{{b.bar.fill}}"></div><div style="{{b.bar.bill}}"></div><div style="{{b.bar.alert}}"></div><div style="{{b.bar.cut}}"></div></div>
+              <span style="{{b.stStyle}}">{{b.status}}</span>
+            </div>
+          </sc-for>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:18px;padding-top:4px;border-top:1px solid {{p5.border}}">
+          <sc-for list="{{brules3}}" as="r" hint-placeholder-count="4"><div style="display:flex;flex-direction:column;gap:4px;padding-top:14px"><span style="font-size:13.5px;font-weight:600">{{r.t}}</span><span style="font-size:12.5px;line-height:1.45;color:{{p5.dim}}">{{r.d}}</span></div></sc-for>
+        </div>
+      </div>
+    </div>
+
+    <!-- 3c -->
+    <div id="3c" style="display:flex;flex-direction:column;gap:14px">
+      <div style="display:flex;align-items:baseline;gap:12px">
+        <span style="font-family:'Geist Mono',monospace;font-size:13px;font-weight:600;color:#0B0C0F;background:#E8E9ED;border-radius:6px;padding:3px 9px">3c</span>
+        <span style="font-family:'Space Grotesk',sans-serif;font-size:21px;font-weight:600;color:#F2F3F5">Phone · check in, decide, leave</span>
+        <span style="font-size:13.5px;color:#8B8F98">Needs you, the budget, the lead's latest message. 48 px buttons. Answers here update 3a.</span>
+      </div>
+      <div style="width:1240px;display:flex;gap:35px;justify-content:center">
+        <sc-for list="{{phones3}}" as="ph" hint-placeholder-count="3">
+          <div style="display:flex;flex-direction:column;gap:12px;align-items:center">
+            <div style="width:380px;height:800px;border-radius:48px;overflow:hidden;display:flex;flex-direction:column;background:{{p5.bg}};color:{{p5.fg}};font-family:{{f3.body}};border:1px solid #33363E;box-shadow:0 30px 80px rgba(0,0,0,.5)">
+              <div style="height:46px;flex:none;display:flex;align-items:center;justify-content:space-between;padding:0 28px;font-family:{{f3.mono}};font-size:13px;font-weight:600"><span>21:34</span><span style="width:104px;height:28px;border-radius:14px;background:#000"></span><span>{{ph.net}}</span></div>
+              <div style="padding:6px 18px 12px;display:flex;align-items:center;gap:10px;flex:none">
+                <div style="width:22px;height:22px;border-radius:{{r3.ctl}};background:{{p5.accent}}"></div>
+                <div style="display:flex;flex-direction:column;gap:1px"><span style="font-size:15px;font-weight:600">Main team</span><span style="{{ph.freshStyle}}">{{ph.fresh}}</span></div>
+                <span style="flex:1"></span>
+                <span style="height:44px;padding:0 14px;display:flex;align-items:center;gap:6px;border-radius:{{r3.ctl}};border:1px solid {{p5.border}};font-size:13px">2 teams <span style="{{ph.otherBadge}}">1</span></span>
+              </div>
+              <sc-if value="{{ph.offline}}" hint-placeholder-val="{{false}}">
+                <div style="margin:0 16px 10px;padding:12px 14px;border-radius:{{r3.card}};border:1px solid {{warnEdge}};background:{{warnSoft}};font-size:13.5px;line-height:1.45"><span style="font-weight:600;color:{{p5.warn}}">Can't see the team.</span> win-ws01 stopped reporting 3h 12m ago. Everything here is from 18:22.</div>
+              </sc-if>
+              <div style="flex:1;min-height:0;overflow:auto;padding:2px 16px 16px;display:flex;flex-direction:column;gap:14px">
+                <span style="font-family:{{f3.mono}};font-size:11px;letter-spacing:.12em;color:{{p5.dim}}">NEEDS YOU · {{ph.count}}</span>
+                <sc-for list="{{ph.needs}}" as="n" hint-placeholder-count="2">
+                  <div style="{{n.card}}">
+                    <div style="display:flex;align-items:center"><span style="{{n.kindStyle}}">{{n.kind}}</span><span style="flex:1"></span><span style="font-family:{{f3.mono}};font-size:11px;color:{{p5.dim}}">{{n.age}}</span></div>
+                    <span style="font-family:{{f3.serif}};font-size:20px;line-height:1.2">{{n.title}}</span>
+                    <span style="font-family:{{f3.mono}};font-size:11.5px;line-height:1.45;color:{{p5.dim}}">{{n.ev}}</span>
+                    <sc-if value="{{n.isDone}}" hint-placeholder-val="{{false}}"><span style="font-size:14px;color:{{p5.ok}}">{{n.done}}</span></sc-if>
+                    <sc-if value="{{n.notDone}}" hint-placeholder-val="{{true}}"><div style="display:flex;gap:8px"><sc-for list="{{n.btns}}" as="o" hint-placeholder-count="2"><span onClick="{{o.go}}" style="{{o.style}}">{{o.label}}</span></sc-for></div></sc-if>
+                  </div>
+                </sc-for>
+                <sc-if value="{{ph.calm}}" hint-placeholder-val="{{false}}">
+                  <div style="padding:22px 18px;border-radius:{{r3.card}};border:1px solid {{p5.border}};display:flex;flex-direction:column;gap:8px"><span style="font-family:{{f3.serif}};font-size:30px;line-height:1.1">Nothing needs you.</span><span style="font-size:14px;line-height:1.5;color:{{p5.dim}}">{{ph.calmSub}}</span></div>
+                </sc-if>
+                <div style="padding:14px 16px;border-radius:{{r3.card}};background:{{p5.panel}};border:1px solid {{p5.border}};display:flex;flex-direction:column;gap:9px;opacity:{{ph.op}}">
+                  <div style="display:flex;align-items:baseline;gap:6px"><span style="font-size:13px;font-weight:600">Qwen spend</span><span style="flex:1"></span><span style="font-family:{{f3.mono}};font-size:18px;font-weight:600">{{ph.bLedger}}</span><span style="font-size:12px;color:{{p5.dim}}">/ 100 €</span></div>
+                  <div style="position:relative;height:{{ph.bar.h}}"><div style="{{ph.bar.track}}"></div><div style="{{ph.bar.proj}}"></div><div style="{{ph.bar.fill}}"></div><div style="{{ph.bar.bill}}"></div><div style="{{ph.bar.alert}}"></div><div style="{{ph.bar.cut}}"></div></div>
+                  <span style="font-family:{{f3.mono}};font-size:11px;color:{{p5.dim}}">{{ph.bLine}}</span>
+                </div>
+                <div style="padding:14px 16px;border-radius:{{r3.card}};background:{{p5.panel}};border:1px solid {{p5.border}};display:flex;flex-direction:column;gap:10px;opacity:{{ph.op}}">
+                  <div style="display:flex;align-items:center;gap:8px"><div style="{{leadAv}}">LE</div><span style="font-size:13px;font-weight:600">Lead</span><span style="flex:1"></span><span style="font-family:{{f3.mono}};font-size:11px;color:{{p5.dim}}">{{ph.leadAge}}</span></div>
+                  <span style="font-size:14.5px;line-height:1.5">{{ph.leadMsg}}</span>
+                  <div style="height:48px;display:flex;align-items:center;padding:0 14px;border-radius:{{r3.ctl}};border:1px solid {{p5.border}};font-size:14px;color:{{p5.dim}}">{{ph.replyPh}}</div>
+                </div>
+              </div>
+              <div style="height:66px;flex:none;display:grid;grid-template-columns:repeat(3,1fr);border-top:1px solid {{p5.border}};background:{{p5.panel}}">
+                <sc-for list="{{ph.tabs}}" as="t" hint-placeholder-count="3"><div style="{{t.style}}"><span>{{t.label}}</span><span style="{{t.badge}}">{{t.n}}</span></div></sc-for>
+              </div>
+            </div>
+            <span style="font-size:13px;color:#9A9EA8">{{ph.caption}}</span>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+
+    <!-- 3d -->
+    <div id="3d" style="display:flex;flex-direction:column;gap:14px">
+      <div style="display:flex;align-items:baseline;gap:12px">
+        <span style="font-family:'Geist Mono',monospace;font-size:13px;font-weight:600;color:#0B0C0F;background:#E8E9ED;border-radius:6px;padding:3px 9px">3d</span>
+        <span style="font-family:'Space Grotesk',sans-serif;font-size:21px;font-weight:600;color:#F2F3F5">Rules · names, avatars, contrast, data</span>
+        <span style="font-size:13.5px;color:#8B8F98">The decisions the boards rely on, written down so they can be built the same way everywhere.</span>
+      </div>
+      <div style="width:1240px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px">
+
+        <div style="background:#1B1C21;border:1px solid #2A2C33;border-radius:16px;padding:22px 24px;display:flex;flex-direction:column;gap:14px">
+          <span style="font-family:'Space Grotesk',sans-serif;font-size:19px;font-weight:600;color:#F2F3F5">Shortening agent names</span>
+          <div style="display:flex;flex-direction:column;gap:9px">
+            <sc-for list="{{nameRules}}" as="r" hint-placeholder-count="4"><div style="display:flex;gap:12px"><span style="font-family:'Geist Mono',monospace;font-size:12px;font-weight:600;color:#9AA6FF;flex:none;width:16px">{{r.n}}</span><div style="display:flex;flex-direction:column;gap:2px"><span style="font-size:13.5px;font-weight:600;color:#F2F3F5">{{r.t}}</span><span style="font-size:12.5px;line-height:1.45;color:#9A9EA8">{{r.d}}</span></div></div></sc-for>
+          </div>
+          <div style="display:flex;flex-direction:column;border-top:1px solid #2A2C33">
+            <sc-for list="{{names3}}" as="r" hint-placeholder-count="7">
+              <div style="display:grid;grid-template-columns:minmax(0,1fr) 22px 150px 130px;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid #24262C">
+                <span style="font-family:'Geist Mono',monospace;font-size:12px;color:#9A9EA8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{r.full}}</span>
+                <span style="{{r.badge}}">{{r.letter}}</span>
+                <span style="font-family:'Geist Mono',monospace;font-size:13px;font-weight:600;color:#F2F3F5">{{r.short}}</span>
+                <span style="font-size:11.5px;color:#8B8F98">{{r.ctx}}</span>
+              </div>
+            </sc-for>
+          </div>
+          <span style="font-size:12px;line-height:1.5;color:#8B8F98">The full name is always one hover or tap away, and appears in every detail view. Names that don't fit the pattern are shown in full, cut at the end, never in the middle.</span>
+        </div>
+
+        <div style="background:#1B1C21;border:1px solid #2A2C33;border-radius:16px;padding:22px 24px;display:flex;flex-direction:column;gap:14px">
+          <span style="font-family:'Space Grotesk',sans-serif;font-size:19px;font-weight:600;color:#F2F3F5">Avatars · the silhouette follows the theme, a badge shows the runtime</span>
+          <sc-for list="{{avatars3}}" as="a" hint-placeholder-count="4">
+            <div style="{{a.row}}">
+              <div style="display:flex;flex-direction:column;gap:2px;width:150px;flex:none"><span style="{{a.nameStyle}}">{{a.name}}</span><span style="{{a.shapeStyle}}">{{a.shape}}</span></div>
+              <div style="display:flex;gap:16px">
+                <sc-for list="{{a.samples}}" as="s" hint-placeholder-count="3">
+                  <div style="position:relative;width:48px;height:48px">
+                    <sc-if value="{{s.hasImg}}" hint-placeholder-val="{{true}}"><div style="{{s.imgBg}}"></div></sc-if>
+                    <sc-if value="{{s.noImg}}" hint-placeholder-val="{{false}}"><span style="{{s.txtAv}}">{{s.letter}}</span></sc-if>
+                    <span style="{{s.badge}}">{{s.letter}}</span>
+                  </div>
+                </sc-for>
+              </div>
+              <span style="{{a.noteStyle}}">{{a.note}}</span>
+            </div>
+          </sc-for>
+          <span style="font-size:12.5px;line-height:1.5;color:#9A9EA8">Badge letters: <span style="color:#D08A5E;font-weight:600">C</span> Claude · <span style="color:#4FB3A0;font-weight:600">X</span> Codex · <span style="color:#9E82E0;font-weight:600">Q</span> Qwen. Health is never shown by the avatar; it lives in the status line next to the name. Other directions: 1b Orbital uses oval-vivid, 1c Loud uses triangle, and the calm baseline console uses oval-muted.</span>
+        </div>
+
+        <div style="background:#1B1C21;border:1px solid #2A2C33;border-radius:16px;padding:22px 24px;display:flex;flex-direction:column;gap:14px">
+          <span style="font-family:'Space Grotesk',sans-serif;font-size:19px;font-weight:600;color:#F2F3F5">Loud (1c) · contrast, measured</span>
+          <div style="display:grid;grid-template-columns:96px repeat(5,minmax(0,1fr)) 92px;gap:8px;font-family:'Geist Mono',monospace;font-size:10.5px;letter-spacing:.06em;color:#8B8F98">
+            <span>THEME</span><span>BODY</span><span>CARD</span><span>META</span><span>HIGHLIGHT</span><span>HOT BLOCK</span><span>LONG TEXT</span>
+          </div>
+          <sc-for list="{{contrast3}}" as="t" hint-placeholder-count="3">
+            <div style="display:grid;grid-template-columns:96px repeat(5,minmax(0,1fr)) 92px;gap:8px;align-items:center">
+              <span style="font-size:13.5px;font-weight:600;color:#F2F3F5">{{t.name}}</span>
+              <sc-for list="{{t.cells}}" as="c" hint-placeholder-count="5">
+                <div style="display:flex;align-items:center;gap:7px"><span style="{{c.sw}}">Aa</span><div style="display:flex;flex-direction:column"><span style="font-family:'Geist Mono',monospace;font-size:12px;color:#F2F3F5">{{c.v}}:1</span><span style="{{c.gStyle}}">{{c.g}}</span></div></div>
+              </sc-for>
+              <span style="{{t.longStyle}}">{{t.long}}</span>
+            </div>
+          </sc-for>
+          <span style="font-size:12.5px;line-height:1.5;color:#9A9EA8">{{contrastNote}}</span>
+        </div>
+
+        <div style="background:#1B1C21;border:1px solid #2A2C33;border-radius:16px;padding:22px 24px;display:flex;flex-direction:column;gap:14px">
+          <span style="font-family:'Space Grotesk',sans-serif;font-size:19px;font-weight:600;color:#F2F3F5">Only the data that exists</span>
+          <span style="font-family:'Geist Mono',monospace;font-size:10.5px;letter-spacing:.12em;color:#7CE7C4">LIVE TODAY · USED IN 3A–3C</span>
+          <div style="display:flex;flex-wrap:wrap;gap:6px"><sc-for list="{{live3}}" as="l" hint-placeholder-count="9"><span style="font-size:12px;color:#E8E9ED;border:1px solid rgba(124,231,196,.35);border-radius:999px;padding:4px 10px">{{l}}</span></sc-for></div>
+          <span style="font-family:'Geist Mono',monospace;font-size:10.5px;letter-spacing:.12em;color:#F5B83D;margin-top:4px">NOT YET · WHAT THE CONSOLE DOES INSTEAD</span>
+          <sc-for list="{{notyet3}}" as="n" hint-placeholder-count="6">
+            <div style="display:grid;grid-template-columns:190px minmax(0,1fr);gap:12px;padding:8px 0;border-bottom:1px solid #24262C"><span style="font-size:13px;font-weight:600;color:#F2F3F5">{{n.what}}</span><span style="font-size:12.5px;line-height:1.45;color:#9A9EA8">{{n.instead}}</span></div>
+          </sc-for>
+        </div>
+
+      </div>
+    </div>
+
+  </div>
+</section>
+<section style="padding:56px 64px 40px;display:flex;flex-direction:column;gap:34px;border-bottom:1px solid #26282E">
+  <div style="display:flex;align-items:flex-end;gap:40px;flex-wrap:wrap">
+    <div style="display:flex;flex-direction:column;gap:8px;max-width:820px">
+      <span style="font-family:'Geist Mono',monospace;font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:#8B8F98">Turn 2 · Coverage pass against the repo (v0.91)</span>
+      <span style="font-family:'Space Grotesk',sans-serif;font-size:34px;font-weight:600;letter-spacing:-.02em;color:#F4F5F7">What Turn 1 missed — and where it lives now</span>
+      <span style="font-size:15px;line-height:1.55;color:#9A9EA8">The live console already ships ten views, and the product roadmap asks for more. Turn 1 covered only the original five. Each board below adds the missing surfaces in one direction's style, with the same themes and live data.</span>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <span style="font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#8B8F98">Console mode (real flag: --enable-actions)</span>
+      <div style="display:flex;gap:8px">
+        <sc-for list="{{modeChips}}" as="m" hint-placeholder-count="2"><button onClick="{{m.set}}" style="{{m.style}}">{{m.label}}</button></sc-for>
+      </div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;width:2536px">
+    <sc-for list="{{gaps}}" as="g" hint-placeholder-count="12">
+      <div style="background:#1B1C21;border:1px solid #2A2C33;border-radius:12px;padding:14px 16px;display:flex;flex-direction:column;gap:6px">
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="{{g.srcStyle}}">{{g.src}}</span>
+          <span style="flex:1"></span>
+          <a href="{{g.href}}" style="font-family:'Geist Mono',monospace;font-size:12px;font-weight:600;text-decoration:none;color:#C4CBFF">→ {{g.where}}</a> <!-- nosemgrep --><!-- design-time template placeholder in a prototype; never served by agenttalk -->
+        </div>
+        <span style="font-size:14px;font-weight:600;color:#F2F3F5">{{g.title}}</span>
+        <span style="font-size:12.5px;line-height:1.45;color:#9A9EA8">{{g.why}}</span>
+      </div>
+    </sc-for>
+  </div>
+
+  <div style="display:flex;flex-wrap:wrap;gap:64px 56px;width:2600px">
+
+    <!-- 2a -->
+    <div id="2a" style="display:flex;flex-direction:column;gap:14px">
+      <div style="display:flex;align-items:baseline;gap:12px">
+        <span style="font-family:'Geist Mono',monospace;font-size:13px;font-weight:600;color:#0B0C0F;background:#E8E9ED;border-radius:6px;padding:3px 9px">2a</span>
+        <span style="font-family:'Space Grotesk',sans-serif;font-size:21px;font-weight:600;color:#F2F3F5">Terminal Garden · Gates &amp; close</span>
+        <span style="font-size:13.5px;color:#8B8F98">Every gate, its evidence, its verifier. Waivers with expiry. The close verdict and sign-offs.</span>
+      </div>
+      <div style="width:1240px;height:780px;border-radius:14px;overflow:hidden;position:relative;display:flex;flex-direction:column;background:{{t1.bg}};color:{{t1.fg}};font-family:'JetBrains Mono',monospace;font-size:12.5px;text-shadow:0 0 6px {{t1.soft}};box-shadow:0 30px 80px rgba(0,0,0,.5)">
+        <div style="height:44px;flex:none;display:flex;align-items:center;gap:16px;padding:0 18px;border-bottom:1px solid {{t1.line}}">
+          <span style="color:{{t1.hot}};font-weight:700;text-shadow:0 0 10px {{t1.glow}}">agenttalk://gates</span>
+          <span style="color:{{t1.dim}}">project:</span>
+          <div style="display:flex;gap:4px"><sc-for list="{{proj1}}" as="p" hint-placeholder-count="2"><span onClick="{{p.set}}" style="{{p.style}}">{{p.label}}</span></sc-for></div>
+          <span style="flex:1"></span>
+          <span style="{{fresh1Style}}">snapshot:{{freshLabel}}</span>
+          <span style="{{mode1Style}}">{{modeShort}}</span>
+          <div style="display:flex;gap:4px"><sc-for list="{{th1Chips}}" as="c" hint-placeholder-count="3"><span onClick="{{c.set}}" style="{{c.style}}">{{c.label}}</span></sc-for></div>
+        </div>
+        <div style="flex:1;min-height:0;display:grid;grid-template-columns:minmax(0,1fr) 370px;gap:18px;padding:22px 18px 16px">
+          <div style="display:flex;flex-direction:column;gap:20px;min-height:0">
+            <div style="position:relative;border:1px solid {{closeLine}};padding:20px 16px 14px;display:flex;align-items:center;gap:22px">
+              <span style="position:absolute;top:-9px;left:14px;background:{{t1.bg}};padding:0 8px;color:{{t1.hot}}">CLOSE ─ m-4.2 ─ release</span>
+              <span style="{{closeBig}}">{{closeVerdict}}</span>
+              <div style="display:flex;flex-direction:column;gap:5px;flex:1">
+                <span>{{closeLine1}}</span>
+                <span style="color:{{t1.dim}}">{{closeLine2}}</span>
+                <span style="color:{{t1.dim}}">exit {{closeExit}} · agenttalk close check m-4.2</span>
+              </div>
+            </div>
+            <div style="position:relative;border:1px solid {{t1.line}};padding:18px 0 8px">
+              <span style="position:absolute;top:-9px;left:14px;background:{{t1.bg}};padding:0 8px;color:{{t1.hot}}">GATES ─ {{gateCount}} ─ <span style="color:{{t1.bad}}">{{holdCount}} HOLD</span></span>
+              <div style="display:grid;grid-template-columns:22px 130px 70px 72px minmax(0,1fr) 96px;gap:0 10px;padding:0 14px 8px;color:{{t1.dim}};font-size:11px"><span>ST</span><span>GATE</span><span>SCOPE</span><span>STATE</span><span>EVIDENCE</span><span>VERIFIER</span></div>
+              <sc-for list="{{gates1}}" as="g" hint-placeholder-count="6">
+                <div onClick="{{g.pick}}" style="{{g.style}}">
+                  <span style="{{g.glyphStyle}}">{{g.glyph}}</span><span>{{g.name}}</span><span style="{{g.dimStyle}}">{{g.scope}}</span><span style="{{g.stStyle}}">{{g.state}}</span><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{g.evidence}}</span><span style="{{g.dimStyle}}">{{g.verifier}}</span>
+                </div>
+              </sc-for>
+            </div>
+            <div style="position:relative;flex:1;min-height:0;border:1px solid {{t1.line}};padding:20px 16px 12px;display:flex;flex-direction:column;gap:9px">
+              <span style="position:absolute;top:-9px;left:14px;background:{{t1.bg}};padding:0 8px;color:{{t1.hot}}">EVIDENCE ─ {{g1.name}}</span>
+              <div style="display:grid;grid-template-columns:100px minmax(0,1fr);gap:7px 14px">
+                <span style="color:{{t1.dim}}">state</span><span style="{{g1.stStyle}}">{{g1.state}}</span>
+                <span style="color:{{t1.dim}}">evidence</span><span>{{g1.evidence}}</span>
+                <span style="color:{{t1.dim}}">verifier</span><span>{{g1.verifier}} · independent of author</span>
+                <span style="color:{{t1.dim}}">expires</span><span>{{g1.expires}}</span>
+              </div>
+              <div style="flex:1"></div>
+              <div style="display:flex;gap:20px;align-items:center">
+                <span onClick="{{g1.waive}}" style="{{g1.waiveStyle}}">[w] {{g1.waiveLabel}}</span>
+                <span style="color:{{t1.dim}}"><span style="color:{{t1.hot}}">[e]</span> open artifact</span>
+                <span style="color:{{t1.dim}}"><span style="color:{{t1.hot}}">[t]</span> review thread</span>
+              </div>
+            </div>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:20px;min-height:0">
+            <div style="position:relative;border:1px solid {{t1.line}};padding:18px 14px 10px;display:flex;flex-direction:column;gap:10px">
+              <span style="position:absolute;top:-9px;left:14px;background:{{t1.bg}};padding:0 8px;color:{{t1.warn}}">WAIVERS [{{waiverCount}}]</span>
+              <sc-for list="{{waivers1}}" as="w" hint-placeholder-count="1">
+                <div style="display:flex;flex-direction:column;gap:3px"><span><span style="color:{{t1.warn}}">~</span> {{w.name}} <span style="color:{{t1.dim}}">by operator</span></span><span style="color:{{t1.dim}};font-size:11px">{{w.reason}}</span><span style="{{w.expStyle}}">expires {{w.expires}} {{w.bar}}</span></div>
+              </sc-for>
+            </div>
+            <div style="position:relative;border:1px solid {{t1.line}};padding:18px 14px 10px;display:flex;flex-direction:column;gap:8px">
+              <span style="position:absolute;top:-9px;left:14px;background:{{t1.bg}};padding:0 8px;color:{{t1.hot}}">SIGN-OFFS ─ by risk class</span>
+              <sc-for list="{{signoffs1}}" as="s" hint-placeholder-count="4">
+                <div style="display:grid;grid-template-columns:18px 90px minmax(0,1fr);gap:8px"><span style="{{s.mStyle}}">{{s.mark}}</span><span>{{s.cls}}</span><span style="color:{{t1.dim}}">{{s.who}}</span></div>
+              </sc-for>
+              <span style="color:{{t1.dim}};font-size:11px;margin-top:4px">one-shot reviewers count as evidence, never as sign-offs</span>
+            </div>
+            <div style="position:relative;flex:1;border:1px solid {{t1.line}};padding:18px 14px 10px;display:flex;flex-direction:column;gap:8px">
+              <span style="position:absolute;top:-9px;left:14px;background:{{t1.bg}};padding:0 8px;color:{{t1.hot}}">BREAKERS &amp; DEAD LETTERS</span>
+              <div style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px 10px">
+                <span>commit-gate claude-arch</span><span style="color:{{t1.warn}}">TRIPPED</span>
+                <span>commit-gate codex-dev</span><span>closed</span>
+                <span>dead-letter codex-scout</span><span style="color:{{t1.bad}}">1 poison</span>
+                <span>retry ceiling</span><span style="color:{{t1.dim}}">3 attempts</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div style="position:absolute;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg,rgba(0,0,0,.22) 0px,rgba(0,0,0,.22) 1px,transparent 1px,transparent 3px);opacity:{{crt}}"></div>
+        <div style="position:absolute;inset:0;pointer-events:none;box-shadow:inset 0 0 140px rgba(0,0,0,.6)"></div>
+      </div>
+    </div>
+
+    <!-- 2b -->
+    <div id="2b" style="display:flex;flex-direction:column;gap:14px">
+      <div style="display:flex;align-items:baseline;gap:12px">
+        <span style="font-family:'Geist Mono',monospace;font-size:13px;font-weight:600;color:#0B0C0F;background:#E8E9ED;border-radius:6px;padding:3px 9px">2b</span>
+        <span style="font-family:'Space Grotesk',sans-serif;font-size:21px;font-weight:600;color:#F2F3F5">Orbital · Lanes &amp; ownership</span>
+        <span style="font-size:13.5px;color:#8B8F98">The data that's recorded but never shown: every scoped lane, its stage, its reject→fix history.</span>
+      </div>
+      <div style="width:1240px;height:780px;border-radius:22px;overflow:hidden;position:relative;display:flex;flex-direction:column;background:radial-gradient(circle at 20% 0%, {{t2.glow}} 0%, transparent 55%),{{t2.bg}};color:{{t2.fg}};font-family:'Sora',sans-serif;box-shadow:0 30px 80px rgba(0,0,0,.5)">
+        <div style="height:68px;flex:none;display:flex;align-items:center;gap:14px;padding:0 28px">
+          <div style="width:24px;height:24px;border-radius:50%;border:2px solid {{t2.accent}};box-shadow:0 0 16px {{t2.accent}}"></div>
+          <span style="font-weight:600;font-size:16px">agenttalk</span>
+          <div style="display:flex;gap:4px;padding:4px;border-radius:999px;background:{{t2.glass}};border:1px solid {{t2.border}}"><sc-for list="{{proj2}}" as="p" hint-placeholder-count="2"><span onClick="{{p.set}}" style="{{p.style}}">{{p.label}}</span></sc-for></div>
+          <span style="flex:1"></span>
+          <div style="display:flex;gap:4px;padding:4px;border-radius:999px;background:{{t2.glass}};border:1px solid {{t2.border}}">
+            <span style="font-size:12px;padding:6px 14px;border-radius:999px;color:{{t2.dim}}">Orbit</span>
+            <span style="font-size:12px;font-weight:500;padding:6px 14px;border-radius:999px;background:{{t2.fg}};color:{{t2.bg}}">Lanes</span>
+            <span style="font-size:12px;padding:6px 14px;border-radius:999px;color:{{t2.dim}}">Ownership</span>
+          </div>
+          <span style="flex:1"></span>
+          <span style="{{fresh2Style}}">● {{freshLabel}}</span>
+          <div style="display:flex;gap:4px;padding:4px;border-radius:999px;background:{{t2.glass}};border:1px solid {{t2.border}}"><sc-for list="{{th2Chips}}" as="c" hint-placeholder-count="3"><span onClick="{{c.set}}" style="{{c.style}}">{{c.label}}</span></sc-for></div>
+        </div>
+        <div style="flex:1;min-height:0;display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:20px;padding:4px 28px 28px">
+          <div style="border-radius:22px;background:{{t2.glass}};border:1px solid {{t2.border}};padding:22px 24px;display:flex;flex-direction:column;gap:6px;min-height:0">
+            <div style="display:grid;grid-template-columns:90px 150px minmax(0,1fr) 150px 96px;gap:14px;font-size:10.5px;letter-spacing:.16em;color:{{t2.dim}};padding-bottom:10px">
+              <span>LANE</span><span>OWNER</span><span>ASSIGNED → CHECKED → DELIVERED → CLEANED</span><span>REVIEW ROUNDS</span><span>CYCLE</span>
+            </div>
+            <sc-for list="{{lanes2}}" as="l" hint-placeholder-count="5">
+              <div onClick="{{l.pick}}" style="{{l.row}}">
+                <span style="font-family:'Geist Mono',monospace;font-size:13px;font-weight:500">{{l.id}}</span>
+                <div style="display:flex;align-items:center;gap:8px"><div style="{{l.orb}}">{{l.ini}}</div><span style="font-family:'Geist Mono',monospace;font-size:11px;color:{{t2.dim}}">{{l.owner}}</span></div>
+                <div style="display:flex;align-items:center">
+                  <sc-for list="{{l.track}}" as="s" hint-placeholder-count="4"><span style="{{s.line}}"></span><span style="{{s.node}}"></span></sc-for>
+                  <span style="{{l.holdStyle}}">{{l.hold}}</span>
+                </div>
+                <div style="display:flex;gap:5px"><sc-for list="{{l.hist}}" as="h" hint-placeholder-count="2"><span style="{{h.style}}">{{h.t}}</span></sc-for></div>
+                <span style="font-family:'Geist Mono',monospace;font-size:12px;color:{{t2.dim}}">{{l.cycle}}</span>
+              </div>
+            </sc-for>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:16px;min-height:0">
+            <div style="border-radius:22px;background:{{t2.glass}};border:1px solid {{t2.border}};padding:20px;display:flex;flex-direction:column;gap:11px">
+              <span style="font-size:10.5px;letter-spacing:.18em;color:{{t2.dim}}">LANE CHECK · {{ld.id}}</span>
+              <div style="display:flex;align-items:center;gap:12px"><span style="{{ld.verdictStyle}}">{{ld.verdict}}</span><span style="font-size:13px;line-height:1.45">{{ld.reason}}</span></div>
+              <div style="display:grid;grid-template-columns:92px minmax(0,1fr);gap:7px 12px;font-size:12px">
+                <span style="color:{{t2.dim}}">domain</span><span style="font-family:'Geist Mono',monospace">{{ld.domain}}</span>
+                <span style="color:{{t2.dim}}">worktree</span><span style="font-family:'Geist Mono',monospace">{{ld.wt}}</span>
+                <span style="color:{{t2.dim}}">base → target</span><span style="font-family:'Geist Mono',monospace">{{ld.base}} → lanes/{{ld.id}}</span>
+                <span style="color:{{t2.dim}}">reviewer</span><span style="font-family:'Geist Mono',monospace">{{ld.rev}}</span>
+              </div>
+              <div style="display:flex;gap:8px;margin-top:2px">
+                <span onClick="{{ld.deliver}}" style="{{ld.deliverStyle}}">{{ld.deliverLabel}}</span>
+                <span style="flex:1;text-align:center;font-size:12px;padding:9px 0;border-radius:999px;border:1px solid {{t2.border}};color:{{t2.fg}}">Diff</span>
+              </div>
+            </div>
+            <div style="flex:1;min-height:0;border-radius:22px;background:{{t2.glass}};border:1px solid {{t2.border}};padding:20px;display:flex;flex-direction:column;gap:11px;overflow:hidden">
+              <span style="font-size:10.5px;letter-spacing:.18em;color:{{t2.dim}}">OWNERSHIP MAP · domains.json</span>
+              <sc-for list="{{domains2}}" as="d" hint-placeholder-count="5">
+                <div style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 10px;padding-bottom:9px;border-bottom:1px solid {{t2.border}}">
+                  <span style="font-size:13px;font-weight:500">{{d.name}}</span><span style="{{d.sharedStyle}}">{{d.shared}}</span>
+                  <span style="font-family:'Geist Mono',monospace;font-size:10.5px;color:{{t2.dim}}">{{d.globs}}</span><span style="font-family:'Geist Mono',monospace;font-size:10.5px;color:{{t2.accent}}">{{d.owner}} · rev {{d.rev}}</span>
+                </div>
+              </sc-for>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 2c -->
+    <div id="2c" style="display:flex;flex-direction:column;gap:14px">
+      <div style="display:flex;align-items:baseline;gap:12px">
+        <span style="font-family:'Geist Mono',monospace;font-size:13px;font-weight:600;color:#0B0C0F;background:#E8E9ED;border-radius:6px;padding:3px 9px">2c</span>
+        <span style="font-family:'Space Grotesk',sans-serif;font-size:21px;font-weight:600;color:#F2F3F5">Loud · Program &amp; risk</span>
+        <span style="font-size:13.5px;color:#8B8F98">The program layer from the roadmap: evidence-backed stages, a risk register, a signed export.</span>
+      </div>
+      <div style="width:1240px;height:780px;overflow:hidden;position:relative;display:flex;flex-direction:column;gap:20px;padding:26px 30px;background:{{t3.bg}};color:{{t3.ink}};font-family:'Archivo',sans-serif;box-shadow:0 30px 80px rgba(0,0,0,.5)">
+        <div style="display:flex;align-items:center;gap:16px;flex:none">
+          <span style="font-weight:900;font-size:24px;letter-spacing:-.02em;background:{{t3.hl}};color:{{t3.hlInk}};padding:2px 12px;transform:rotate(-2deg);border:2px solid {{t3.ink}}">AGENTTALK</span>
+          <span style="font-family:'Space Mono',monospace;font-size:12px">/program —</span>
+          <sc-for list="{{proj3}}" as="p" hint-placeholder-count="2"><span onClick="{{p.set}}" style="{{p.style}}">{{p.label}}</span></sc-for>
+          <span style="flex:1"></span>
+          <sc-for list="{{th3Chips}}" as="c" hint-placeholder-count="3"><span onClick="{{c.set}}" style="{{c.style}}">{{c.label}}</span></sc-for>
+        </div>
+        <div style="font-weight:900;font-size:58px;line-height:.95;letter-spacing:-.04em;text-transform:uppercase;flex:none">Parity verified. <span style="background:{{t3.hot}};color:{{t3.hotInk}};padding:0 12px">Not cutover-ready.</span></div>
+        <div style="display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:10px;flex:none">
+          <sc-for list="{{stages3}}" as="s" hint-placeholder-count="7">
+            <div style="{{s.box}}"><span style="font-family:'Space Mono',monospace;font-size:10px;font-weight:700">{{s.n}}</span><span style="font-weight:900;font-size:15px;line-height:1.05;text-transform:uppercase">{{s.name}}</span><span style="{{s.markStyle}}">{{s.mark}}</span><span style="font-family:'Space Mono',monospace;font-size:10px;line-height:1.35">{{s.proof}}</span></div>
+          </sc-for>
+        </div>
+        <div style="flex:1;min-height:0;display:grid;grid-template-columns:minmax(0,1fr) 330px;gap:24px">
+          <div style="display:flex;flex-direction:column;gap:12px;min-height:0">
+            <span style="font-weight:900;font-size:26px;letter-spacing:-.03em;line-height:1">RISK REGISTER</span>
+            <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px">
+              <sc-for list="{{risks3}}" as="r" hint-placeholder-count="4">
+                <div style="{{r.card}}">
+                  <div style="display:flex;align-items:center;gap:8px"><span style="{{r.sevStyle}}">{{r.sev}}</span><span style="font-family:'Space Mono',monospace;font-size:10px;font-weight:700">{{r.src}}</span><span style="flex:1"></span><span style="font-family:'Space Mono',monospace;font-size:10px">{{r.age}}</span></div>
+                  <span style="font-weight:700;font-size:15px;line-height:1.2">{{r.title}}</span>
+                  <span style="font-family:'Space Mono',monospace;font-size:10.5px">OWNER {{r.owner}} · {{r.state}}</span>
+                  <span onClick="{{r.act}}" style="{{r.btn}}">{{r.btnLabel}}</span>
+                </div>
+              </sc-for>
+            </div>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:14px">
+            <div style="background:{{t3.ink}};color:{{t3.bg}};border:2px solid {{t3.ink}};box-shadow:5px 5px 0 {{t3.hl}};padding:16px;display:flex;flex-direction:column;gap:10px">
+              <span style="font-weight:900;font-size:24px;line-height:1;letter-spacing:-.03em">THE PROOF</span>
+              <sc-for list="{{proof3}}" as="p" hint-placeholder-count="4">
+                <div style="display:flex;align-items:baseline;gap:10px;border-top:2px dashed {{t3.bg}};padding-top:8px"><span style="font-weight:900;font-size:30px;line-height:1;color:{{t3.hl}}">{{p.v}}</span><span style="font-family:'Space Mono',monospace;font-size:11px;line-height:1.3">{{p.k}}</span></div>
+              </sc-for>
+            </div>
+            <span onClick="{{exportGo}}" style="{{exportStyle}}">{{exportLabel}}</span>
+            <span style="font-family:'Space Mono',monospace;font-size:10.5px;line-height:1.4">Static, timestamped, yours to keep — no remote access to the live console.</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 2d -->
+    <div id="2d" style="display:flex;flex-direction:column;gap:14px">
+      <div style="display:flex;align-items:baseline;gap:12px">
+        <span style="font-family:'Geist Mono',monospace;font-size:13px;font-weight:600;color:#0B0C0F;background:#E8E9ED;border-radius:6px;padding:3px 9px">2d</span>
+        <span style="font-family:'Space Grotesk',sans-serif;font-size:21px;font-weight:600;color:#F2F3F5">The Conversation · Tasks, decisions, memory</span>
+        <span style="font-size:13.5px;color:#8B8F98">Lead work orders, a Decision Center, lessons and onboarding unknowns — all inline.</span>
+      </div>
+      <div style="width:1240px;height:780px;border-radius:18px;overflow:hidden;display:grid;grid-template-columns:minmax(0,1fr) 320px;background:{{t4.bg}};color:{{t4.fg}};font-family:'Geist',sans-serif;box-shadow:0 30px 80px rgba(0,0,0,.5)">
+        <div style="display:flex;flex-direction:column;min-height:0">
+          <div style="height:58px;flex:none;display:flex;align-items:center;gap:12px;padding:0 26px;border-bottom:1px solid {{t4.border}}">
+            <div style="width:22px;height:22px;border-radius:7px;background:{{t4.accent}}"></div>
+            <span style="font-weight:600;font-size:15px">agenttalk</span>
+            <div style="display:flex;gap:3px;padding:3px;border-radius:10px;border:1px solid {{t4.border}};background:{{t4.panel}}"><sc-for list="{{proj4}}" as="p" hint-placeholder-count="2"><span onClick="{{p.set}}" style="{{p.style}}">{{p.label}}</span></sc-for></div>
+            <span style="flex:1"></span>
+            <span style="{{mode4Style}}">{{modeShort}}</span>
+            <div style="display:flex;gap:3px;padding:3px;border-radius:10px;border:1px solid {{t4.border}};background:{{t4.panel}}"><sc-for list="{{th4Chips}}" as="c" hint-placeholder-count="3"><span onClick="{{c.set}}" style="{{c.style}}">{{c.label}}</span></sc-for></div>
+          </div>
+          <div ref="{{stream5Ref}}" style="flex:1;min-height:0;overflow:auto;padding:22px 30px 16px;display:flex;flex-direction:column;gap:14px">
+            <sc-for list="{{stream5}}" as="m" hint-placeholder-count="5">
+              <div style="display:flex;flex-direction:column">
+                <sc-if value="{{m.isLead}}" hint-placeholder-val="{{true}}">
+                  <div style="display:flex;gap:10px;align-items:flex-start;max-width:600px">
+                    <div style="width:30px;height:30px;border-radius:50%;flex:none;border:2px solid {{t4.accent}};display:flex;align-items:center;justify-content:center;font-family:'Geist Mono',monospace;font-size:10px;font-weight:600">LE</div>
+                    <div style="background:{{t4.panel}};border:1px solid {{t4.border}};border-radius:4px 16px 16px 16px;padding:11px 15px;font-size:14px;line-height:1.5">{{m.body}}</div>
+                  </div>
+                </sc-if>
+                <sc-if value="{{m.isYou}}" hint-placeholder-val="{{false}}">
+                  <div style="align-self:flex-end;max-width:520px;background:{{t4.accent}};color:{{t4.accentInk}};border-radius:16px 4px 16px 16px;padding:11px 15px;font-size:14px;line-height:1.5">{{m.body}}</div>
+                </sc-if>
+                <sc-if value="{{m.isTask}}" hint-placeholder-val="{{false}}">
+                  <div style="display:flex;align-items:center;gap:12px;max-width:640px;padding:12px 14px;border-radius:14px;border:1px solid {{t4.border}};background:{{t4.panel2}}">
+                    <span style="font-family:'Geist Mono',monospace;font-size:10.5px;font-weight:600;letter-spacing:.08em;color:{{t4.accent}};border:1px solid {{t4.accent}};border-radius:6px;padding:3px 7px">TASK</span>
+                    <div style="flex:1;min-width:0"><div style="font-size:13.5px;font-weight:600">{{m.title}}</div><div style="font-family:'Geist Mono',monospace;font-size:11.5px;color:{{t4.dim}};margin-top:3px">claude-lead → {{m.to}} · work order</div></div>
+                    <span style="{{m.stStyle}}">{{m.status}}</span>
+                  </div>
+                </sc-if>
+                <sc-if value="{{m.isDecision}}" hint-placeholder-val="{{false}}">
+                  <div style="max-width:660px;padding:16px 18px;border-radius:16px;border:1px solid {{m.edge}};background:{{t4.panel}};display:flex;flex-direction:column;gap:10px">
+                    <div style="display:flex;align-items:center;gap:8px"><span style="font-family:'Geist Mono',monospace;font-size:10.5px;font-weight:600;letter-spacing:.1em;color:{{t4.warn}}">DECISION CENTER</span><span style="flex:1"></span><span style="font-size:11.5px;color:{{t4.dim}}">decide by {{m.deadline}} · owner you</span></div>
+                    <span style="font-family:'Instrument Serif',serif;font-size:24px;line-height:1.15">{{m.title}}</span>
+                    <span style="font-size:13px;line-height:1.5;color:{{t4.dim}}">{{m.impact}}</span>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap"><sc-for list="{{m.opts}}" as="o" hint-placeholder-count="3"><span onClick="{{o.go}}" style="{{o.style}}">{{o.label}}</span></sc-for></div>
+                  </div>
+                </sc-if>
+                <sc-if value="{{m.isLesson}}" hint-placeholder-val="{{false}}">
+                  <div style="display:flex;align-items:flex-start;gap:12px;max-width:640px;padding:12px 14px;border-radius:14px;border:1px dashed {{t4.border}}">
+                    <span style="font-family:'Geist Mono',monospace;font-size:10.5px;font-weight:600;letter-spacing:.08em;color:{{t4.ok}}">LESSON</span>
+                    <div style="flex:1;min-width:0"><div style="font-size:13.5px;line-height:1.45">{{m.body}}</div><div style="font-family:'Geist Mono',monospace;font-size:11px;color:{{t4.dim}};margin-top:4px">knowledge publish · domain {{m.domain}} · taught to {{m.who}}</div></div>
+                  </div>
+                </sc-if>
+                <sc-if value="{{m.isUnknown}}" hint-placeholder-val="{{false}}">
+                  <div style="display:flex;align-items:center;gap:12px;max-width:640px;padding:12px 14px;border-radius:14px;border:1px solid {{t4.border}};background:{{t4.panel2}}">
+                    <span style="font-family:'Geist Mono',monospace;font-size:10.5px;font-weight:600;letter-spacing:.08em;color:{{t4.bad}}">BLOCKING UNKNOWN</span>
+                    <div style="flex:1;min-width:0"><div style="font-size:13.5px;font-weight:600">{{m.body}}</div><div style="font-family:'Geist Mono',monospace;font-size:11px;color:{{t4.dim}};margin-top:3px">onboarding ledger · {{m.seg}}</div></div>
+                    <span onClick="{{m.answer}}" style="{{m.ansStyle}}">{{m.ansLabel}}</span>
+                  </div>
+                </sc-if>
+              </div>
+            </sc-for>
+            <sc-if value="{{typing2}}" hint-placeholder-val="{{false}}"><span style="font-size:12px;color:{{t4.dim}};padding-left:40px"><span style="animation:pulse 1s ease-in-out infinite">●●●</span> claude-lead is typing</span></sc-if>
+          </div>
+          <div style="flex:none;padding:10px 24px 20px">
+            <div style="display:flex;align-items:center;gap:10px;padding:6px 6px 6px 14px;border-radius:16px;background:{{t4.panel}};border:1px solid {{t4.border}}">
+              <input value="{{draft5}}" onInput="{{onDraft5}}" onKeyDown="{{keyDraft5}}" placeholder="Message the lead — it can issue tasks, not you" style="flex:1;background:transparent;border:none;outline:none;color:{{t4.fg}};font-family:'Geist',sans-serif;font-size:14.5px;padding:8px 0">
+              <span onClick="{{send5}}" style="width:40px;height:40px;border-radius:12px;background:{{t4.accent}};color:{{t4.accentInk}};display:flex;align-items:center;justify-content:center;cursor:pointer"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M6 11l6-6 6 6"></path></svg></span>
+            </div>
+          </div>
+        </div>
+        <div style="background:{{t4.panel}};border-left:1px solid {{t4.border}};padding:22px 20px;display:flex;flex-direction:column;gap:18px;min-height:0;overflow:hidden">
+          <div style="display:flex;align-items:center;gap:8px"><span style="{{fresh4Dot}}"></span><span style="font-size:12px">Snapshot {{freshLabel}}</span><span style="flex:1"></span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:{{t4.dim}}">{{snapAge}}</span></div>
+          <div style="display:flex;gap:3px;padding:3px;border-radius:10px;border:1px solid {{t4.border}}"><sc-for list="{{rosterChips}}" as="c" hint-placeholder-count="2"><span onClick="{{c.set}}" style="{{c.style}}">{{c.label}}</span></sc-for></div>
+          <div style="display:flex;flex-direction:column;gap:11px;flex:1;min-height:0">
+            <sc-for list="{{roster5}}" as="r" hint-placeholder-count="8">
+              <div style="{{r.row}}">
+                <div style="{{r.av}}">{{r.ini}}</div>
+                <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:2px"><span style="font-family:'Geist Mono',monospace;font-size:11.5px">{{r.name}}</span><span style="{{r.stStyle}}">{{r.st}}</span></div>
+                <span style="{{r.capStyle}}">{{r.cap}}</span>
+              </div>
+            </sc-for>
+          </div>
+          <span style="font-size:11px;line-height:1.45;color:{{t4.dim}}">Capacity shows confidence: <span style="color:{{t4.fg}}">fresh</span>, <span style="color:{{t4.warn}}">stale~</span>, or <span style="color:{{t4.dim}}">?</span> unknown.</span>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</section>
+<section style="padding:56px 64px 96px;display:flex;flex-direction:column;gap:34px">
+  <div style="display:flex;align-items:flex-end;gap:40px;flex-wrap:wrap">
+    <div style="display:flex;flex-direction:column;gap:8px;max-width:760px">
+      <span style="font-family:'Geist Mono',monospace;font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:#8B8F98">Turn 1 · Console futures</span>
+      <span style="font-family:'Space Grotesk',sans-serif;font-size:34px;font-weight:600;letter-spacing:-.02em;color:#F4F5F7">Four directions for the agenttalk console</span>
+      <span style="font-size:15px;line-height:1.55;color:#9A9EA8">Built for developers who ship only through agents. Every console has three themes (chips in its header), and everything is live — pick agents, clear the attention queue, and message the lead from any of them.</span>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <span style="font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#8B8F98">Switch all at once</span>
+      <div style="display:flex;gap:8px">
+        <sc-for list="{{allSets}}" as="s" hint-placeholder-count="3">
+          <button onClick="{{s.set}}" style="{{s.style}}">{{s.label}}</button>
+        </sc-for>
+      </div>
+    </div>
+  </div>
+
+  <div style="display:flex;flex-wrap:wrap;gap:64px 56px;width:2600px">
+
+    <!-- 1a -->
+    <div id="1a" style="display:flex;flex-direction:column;gap:14px">
+      <div style="display:flex;align-items:baseline;gap:12px">
+        <span style="font-family:'Geist Mono',monospace;font-size:13px;font-weight:600;color:#0B0C0F;background:#E8E9ED;border-radius:6px;padding:3px 9px">1a</span>
+        <span style="font-family:'Space Grotesk',sans-serif;font-size:21px;font-weight:600;color:#F2F3F5">Terminal Garden</span>
+        <span style="font-size:13.5px;color:#8B8F98">A TUI you live in — keyboard-first, phosphor glow, no chrome.</span>
+      </div>
+      <div style="width:1240px;height:780px;border-radius:14px;overflow:hidden;position:relative;display:flex;flex-direction:column;background:{{t1.bg}};color:{{t1.fg}};font-family:'JetBrains Mono',monospace;font-size:12.5px;text-shadow:0 0 6px {{t1.soft}};box-shadow:0 30px 80px rgba(0,0,0,.5)">
+        <div style="height:44px;flex:none;display:flex;align-items:center;gap:18px;padding:0 18px;border-bottom:1px solid {{t1.line}}">
+          <span style="color:{{t1.hot}};font-weight:700;text-shadow:0 0 10px {{t1.glow}}">agenttalk://team</span>
+          <span style="color:{{t1.dim}}">mission:<span style="color:{{t1.fg}}">lanes</span></span>
+          <span style="color:{{t1.dim}}">[<span style="color:{{t1.fg}}">▮▮▮▮▮▮▮</span>▯▯▯▯▯] 7/12</span>
+          <span style="flex:1"></span>
+          <span style="color:{{t1.dim}}">theme:</span>
+          <div style="display:flex;gap:4px">
+            <sc-for list="{{th1Chips}}" as="c" hint-placeholder-count="3"><span onClick="{{c.set}}" style="{{c.style}}">{{c.label}}</span></sc-for>
+          </div>
+          <span style="color:{{t1.dim}}">│</span>
+          <span style="display:flex;gap:7px;align-items:center"><span style="{{t1Live}}">●</span><span>LIVE</span><span style="color:{{t1.dim}}">{{clock}}</span></span>
+        </div>
+
+        <div style="flex:1;min-height:0;display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:18px;padding:22px 18px 16px">
+          <div style="display:flex;flex-direction:column;gap:20px;min-height:0">
+            <div style="position:relative;border:1px solid {{t1.line}};padding:18px 0 8px">
+              <span style="position:absolute;top:-9px;left:14px;background:{{t1.bg}};padding:0 8px;color:{{t1.hot}}">TEAM ─ {{nAgents}} agents ─ <span style="color:{{t1.fg}}">{{nBusy}} busy</span> ─ <span style="color:{{t1.warn}}">{{nNeed}} need you</span></span>
+              <div style="display:grid;grid-template-columns:22px 108px 76px minmax(0,1fr) 84px 84px;gap:0 10px;padding:0 14px 8px;color:{{t1.dim}};font-size:11px">
+                <span>ST</span><span>AGENT</span><span>STATE</span><span>TASK</span><span>RATE</span><span>CTX</span>
+              </div>
+              <sc-for list="{{r1}}" as="r" hint-placeholder-count="8">
+                <div onClick="{{r.pick}}" style="{{r.style}}">
+                  <span style="{{r.dotStyle}}">{{r.glyph}}</span>
+                  <span>{{r.id}}</span>
+                  <span style="{{r.stStyle}}">{{r.label}}</span>
+                  <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{r.task}}</span>
+                  <span style="{{r.rateStyle}}">{{r.rateBar}}</span>
+                  <span style="{{r.ctxStyle}}">{{r.ctxBar}}</span>
+                </div>
+              </sc-for>
+            </div>
+            <div style="position:relative;flex:1;min-height:0;border:1px solid {{t1.line}};padding:22px 18px 14px;display:flex;flex-direction:column;gap:10px">
+              <span style="position:absolute;top:-9px;left:14px;background:{{t1.bg}};padding:0 8px;color:{{t1.hot}}">INSPECT ─ {{d1.id}}</span>
+              <div style="display:grid;grid-template-columns:110px minmax(0,1fr);gap:9px 14px">
+                <span style="color:{{t1.dim}}">state</span><span style="{{d1.stStyle}}">{{d1.label}}</span>
+                <span style="color:{{t1.dim}}">task</span><span>{{d1.task}}</span>
+                <span style="color:{{t1.dim}}">peer</span><span>{{d1.peer}}</span>
+                <span style="color:{{t1.dim}}">runtime</span><span>{{d1.cli}} · wrapped · restartable</span>
+                <span style="color:{{t1.dim}}">heartbeat</span><span>{{d1.hb}}</span>
+              </div>
+              <div style="flex:1"></div>
+              <div style="display:flex;gap:20px;color:{{t1.dim}}">
+                <span><span style="color:{{t1.hot}}">[m]</span> message</span>
+                <span><span style="color:{{t1.hot}}">[t]</span> transcript</span>
+                <span><span style="color:{{t1.hot}}">[r]</span> restart</span>
+                <span><span style="color:{{t1.hot}}">[esc]</span> back</span>
+              </div>
+            </div>
+          </div>
+
+          <div style="display:flex;flex-direction:column;gap:20px;min-height:0">
+            <div style="position:relative;flex:1;min-height:0;border:1px solid {{t1.line}};padding:18px 0 10px;display:flex;flex-direction:column;overflow:hidden">
+              <span style="position:absolute;top:-9px;left:14px;background:{{t1.bg}};padding:0 8px;color:{{t1.hot}}">BUS TAIL ─ .agenttalk/messages</span>
+              <div style="flex:1"></div>
+              <sc-for list="{{bus1}}" as="l" hint-placeholder-count="7">
+                <div style="{{l.style}}">
+                  <span style="color:{{t1.dim}}">{{l.time}}</span>
+                  <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><span style="color:{{t1.hot}}">{{l.from}}</span> <span style="color:{{t1.dim}}">→</span> {{l.to}} <span style="{{l.kindStyle}}">{{l.kind}}</span> <span style="color:{{t1.dim}}">{{l.subj}}</span></span>
+                </div>
+              </sc-for>
+              <div style="padding:4px 14px;color:{{t1.fg}}"><span style="animation:blink 1s steps(1) infinite">█</span></div>
+            </div>
+            <div style="position:relative;flex:none;border:1px solid {{t1.line}};padding:18px 0 10px">
+              <span style="position:absolute;top:-9px;left:14px;background:{{t1.bg}};padding:0 8px;color:{{t1.warn}}">NEEDS YOU [{{nNeed}}]</span>
+              <sc-if value="{{hasAttn}}" hint-placeholder-val="{{true}}">
+                <sc-for list="{{attn1}}" as="a" hint-placeholder-count="3">
+                  <div style="display:flex;gap:10px;padding:6px 14px;align-items:flex-start">
+                    <span style="{{a.sevStyle}}">[!]</span>
+                    <div style="flex:1;min-width:0"><div>{{a.title}}</div><div style="color:{{t1.dim}};font-size:11px;margin-top:2px">{{a.meta}}</div></div>
+                    <span onClick="{{a.act}}" style="color:{{t1.hot}};cursor:pointer">{{a.key}}</span>
+                  </div>
+                </sc-for>
+              </sc-if>
+              <sc-if value="{{noAttn}}" hint-placeholder-val="{{false}}"><div style="padding:6px 14px;color:{{t1.dim}}">queue empty. nothing waiting on you.</div></sc-if>
+            </div>
+          </div>
+        </div>
+
+        <div style="flex:none;border-top:1px solid {{t1.line}};padding:12px 18px 14px;display:flex;flex-direction:column;gap:8px">
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="color:{{t1.hot}};text-shadow:0 0 10px {{t1.glow}}">lead&gt;</span>
+            <input value="{{cmd1}}" onInput="{{onCmd1}}" onKeyDown="{{keyCmd1}}" placeholder="talk to claude-lead — or /status  /approve m-4.2  /restart claude-arch" style="flex:1;background:transparent;border:none;outline:none;color:{{t1.hot}};font-family:'JetBrains Mono',monospace;font-size:13px;caret-color:{{t1.fg}};text-shadow:inherit">
+          </div>
+          <div style="display:flex;gap:20px;color:{{t1.dim}};font-size:11px">
+            <span>↑↓ select</span><span>enter inspect</span><span>[a] attention</span><span>[c] chat</span><span>[s] sessions</span><span>[/] command</span><span style="flex:1"></span><span style="color:{{t1.fg}}">{{leadLine}}</span>
+          </div>
+        </div>
+        <div style="position:absolute;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg,rgba(0,0,0,.22) 0px,rgba(0,0,0,.22) 1px,transparent 1px,transparent 3px);opacity:{{crt}}"></div>
+        <div style="position:absolute;inset:0;pointer-events:none;box-shadow:inset 0 0 140px rgba(0,0,0,.6)"></div>
+      </div>
+    </div>
+
+    <!-- 1b -->
+    <div id="1b" style="display:flex;flex-direction:column;gap:14px">
+      <div style="display:flex;align-items:baseline;gap:12px">
+        <span style="font-family:'Geist Mono',monospace;font-size:13px;font-weight:600;color:#0B0C0F;background:#E8E9ED;border-radius:6px;padding:3px 9px">1b</span>
+        <span style="font-family:'Space Grotesk',sans-serif;font-size:21px;font-weight:600;color:#F2F3F5">Orbital</span>
+        <span style="font-size:13.5px;color:#8B8F98">The team as a star system — the mission is the core, agents orbit, conversations are light.</span>
+      </div>
+      <div style="width:1240px;height:780px;border-radius:22px;overflow:hidden;position:relative;background:radial-gradient(circle at 50% 50%, {{t2.glow}} 0%, transparent 60%),{{t2.bg}};color:{{t2.fg}};font-family:'Sora',sans-serif;box-shadow:0 30px 80px rgba(0,0,0,.5)">
+        <div style="position:absolute;top:0;left:0;right:0;height:68px;display:flex;align-items:center;gap:14px;padding:0 28px;z-index:3">
+          <div style="width:24px;height:24px;border-radius:50%;border:2px solid {{t2.accent}};box-shadow:0 0 16px {{t2.accent}}"></div>
+          <span style="font-weight:600;font-size:16px;letter-spacing:-.01em">agenttalk</span>
+          <span style="font-size:12px;color:{{t2.dim}}">orbit</span>
+          <span style="flex:1"></span>
+          <div style="display:flex;gap:4px;padding:4px;border-radius:999px;background:{{t2.glass}};border:1px solid {{t2.border}}">
+            <span style="font-size:12px;font-weight:500;padding:6px 14px;border-radius:999px;background:{{t2.fg}};color:{{t2.bg}}">Orbit</span>
+            <span style="font-size:12px;font-weight:500;padding:6px 14px;border-radius:999px;color:{{t2.dim}}">Threads</span>
+            <span style="font-size:12px;font-weight:500;padding:6px 14px;border-radius:999px;color:{{t2.dim}}">Sessions</span>
+          </div>
+          <span style="flex:1"></span>
+          <div style="display:flex;gap:4px;padding:4px;border-radius:999px;background:{{t2.glass}};border:1px solid {{t2.border}}">
+            <sc-for list="{{th2Chips}}" as="c" hint-placeholder-count="3"><span onClick="{{c.set}}" style="{{c.style}}">{{c.label}}</span></sc-for>
+          </div>
+          <span style="font-family:'Geist Mono',monospace;font-size:12px;color:{{t2.dim}}">{{clock}}</span>
+        </div>
+
+        <div style="position:absolute;left:320px;top:68px;width:600px;height:600px">
+          <div style="position:absolute;left:50px;top:50px;width:500px;height:500px;border-radius:50%;border:1px solid {{t2.ring}}"></div>
+          <div style="position:absolute;left:130px;top:130px;width:340px;height:340px;border-radius:50%;border:1px dashed {{t2.ring}}"></div>
+          <svg width="600" height="600" style="position:absolute;inset:0;overflow:visible">
+            <sc-for list="{{edges2}}" as="e" hint-placeholder-count="5"><line x1="{{e.x1}}" y1="{{e.y1}}" x2="{{e.x2}}" y2="{{e.y2}}" style="{{e.style}}"></line></sc-for>
+          </svg>
+          <div style="{{coreStyle}}">
+            <div style="width:100%;height:100%;border-radius:50%;background:{{t2.node}};display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px">
+              <span style="font-size:10px;letter-spacing:.2em;color:{{t2.dim}}">LANES</span>
+              <span style="font-size:36px;font-weight:600;letter-spacing:-.03em;line-height:1">7/12</span>
+              <span style="font-size:11px;color:{{t2.dim}}">work packages</span>
+            </div>
+          </div>
+          <sc-for list="{{n2}}" as="n" hint-placeholder-count="8">
+            <div onClick="{{n.pick}}" style="{{n.wrap}}">
+              <div style="{{n.orb}}">{{n.ini}}</div>
+              <span style="font-family:'Geist Mono',monospace;font-size:11.5px;color:{{t2.fg}};white-space:nowrap">{{n.name}}</span>
+              <span style="{{n.stStyle}}">{{n.stLabel}}</span>
+            </div>
+          </sc-for>
+        </div>
+
+        <div style="position:absolute;left:28px;top:92px;width:290px;padding:20px;border-radius:22px;background:{{t2.glass}};border:1px solid {{t2.border}};backdrop-filter:blur(16px);display:flex;flex-direction:column;gap:12px;z-index:2">
+          <span style="font-size:10.5px;letter-spacing:.18em;color:{{t2.dim}}">IN FOCUS</span>
+          <span style="font-family:'Geist Mono',monospace;font-size:19px;font-weight:500">{{d2.name}}</span>
+          <div style="display:flex;gap:6px;flex-wrap:wrap"><span style="{{d2.stChip}}">{{d2.stLabel}}</span><span style="{{d2.cliChip}}">{{d2.cli}}</span></div>
+          <span style="font-size:13.5px;line-height:1.5;color:{{t2.fg}}">{{d2.task}}</span>
+          <div style="display:flex;flex-direction:column;gap:6px">
+            <div style="display:flex;justify-content:space-between;font-size:11px;color:{{t2.dim}}"><span>rate limit</span><span>{{d2.rate}}%</span></div>
+            <div style="height:5px;border-radius:3px;background:{{t2.track}};overflow:hidden"><div style="{{d2.rateBar}}"></div></div>
+            <div style="display:flex;justify-content:space-between;font-size:11px;color:{{t2.dim}};margin-top:4px"><span>context</span><span>{{d2.ctx}}%</span></div>
+            <div style="height:5px;border-radius:3px;background:{{t2.track}};overflow:hidden"><div style="{{d2.ctxBar}}"></div></div>
+          </div>
+          <span style="font-size:11.5px;color:{{t2.dim}}">peer · {{d2.peer}} · heartbeat {{d2.hb}}</span>
+          <div style="display:flex;gap:8px">
+            <span onClick="{{d2.msg}}" style="flex:1;text-align:center;font-size:12.5px;font-weight:600;padding:9px 0;border-radius:999px;background:{{t2.accent}};color:{{t2.bg}};cursor:pointer">Ask lead</span>
+            <span style="flex:1;text-align:center;font-size:12.5px;font-weight:500;padding:9px 0;border-radius:999px;border:1px solid {{t2.border}};color:{{t2.fg}}">Transcript</span>
+          </div>
+        </div>
+
+        <div style="position:absolute;left:28px;bottom:108px;width:290px;padding:16px 18px;border-radius:20px;background:{{t2.glass}};border:1px solid {{t2.border}};backdrop-filter:blur(16px);display:flex;flex-direction:column;gap:10px;z-index:2">
+          <span style="font-size:10.5px;letter-spacing:.18em;color:{{t2.dim}}">SIGNALS</span>
+          <sc-for list="{{feed2}}" as="f" hint-placeholder-count="4">
+            <div style="display:flex;gap:9px;align-items:flex-start">
+              <span style="{{f.dot}}"></span>
+              <div style="min-width:0;flex:1"><div style="font-family:'Geist Mono',monospace;font-size:10.5px;color:{{t2.fg}};white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{f.fromTo}}</div><div style="font-size:11.5px;color:{{t2.dim}};white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{f.subj}}</div></div>
+            </div>
+          </sc-for>
+        </div>
+
+        <div style="position:absolute;right:28px;top:92px;width:290px;display:flex;flex-direction:column;gap:10px;z-index:2">
+          <div style="display:flex;align-items:center;gap:8px;padding:0 4px"><span style="font-size:10.5px;letter-spacing:.18em;color:{{t2.dim}}">NEEDS YOU</span><span style="font-size:11px;font-weight:600;color:{{t2.bg}};background:{{t2.bad}};border-radius:999px;padding:1px 8px">{{nNeed}}</span></div>
+          <sc-for list="{{attn2}}" as="a" hint-placeholder-count="3">
+            <div style="padding:14px 16px;border-radius:18px;background:{{t2.glass}};border:1px solid {{t2.border}};backdrop-filter:blur(16px);display:flex;flex-direction:column;gap:8px">
+              <div style="display:flex;align-items:center;gap:8px"><span style="{{a.dot}}"></span><span style="font-size:10px;letter-spacing:.16em;color:{{t2.dim}}">{{a.src}}</span></div>
+              <span style="font-size:13.5px;line-height:1.4;font-weight:500">{{a.title}}</span>
+              <span style="font-size:11.5px;color:{{t2.dim}}">{{a.meta}}</span>
+              <div style="display:flex;gap:6px;margin-top:2px">
+                <span onClick="{{a.act}}" style="font-size:11.5px;font-weight:600;padding:6px 13px;border-radius:999px;background:{{t2.fg}};color:{{t2.bg}};cursor:pointer">{{a.actLabel}}</span>
+                <span onClick="{{a.later}}" style="font-size:11.5px;padding:6px 13px;border-radius:999px;border:1px solid {{t2.border}};color:{{t2.dim}};cursor:pointer">Later</span>
+              </div>
+            </div>
+          </sc-for>
+          <sc-if value="{{noAttn}}" hint-placeholder-val="{{false}}"><div style="padding:18px;border-radius:18px;background:{{t2.glass}};border:1px solid {{t2.border}};font-size:13px;color:{{t2.dim}}">Clear skies — nothing needs you.</div></sc-if>
+        </div>
+
+        <div style="position:absolute;left:50%;bottom:22px;transform:translateX(-50%);width:640px;padding:6px 6px 6px 8px;border-radius:30px;background:{{t2.glass}};border:1px solid {{t2.border}};backdrop-filter:blur(18px);display:flex;align-items:center;gap:12px;z-index:2">
+          <div style="width:46px;height:46px;border-radius:50%;background:{{t2.node}};border:2px solid {{t2.accent}};display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:600;flex:none">LE</div>
+          <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:2px">
+            <span style="font-size:11.5px;line-height:1.35;color:{{t2.dim}};white-space:nowrap;overflow:hidden;text-overflow:ellipsis"><span style="color:{{t2.accent}}">claude-lead · </span>{{toast2}}</span>
+            <input value="{{draft2}}" onInput="{{onDraft2}}" onKeyDown="{{keyDraft2}}" placeholder="Talk to claude-lead…" style="background:transparent;border:none;outline:none;color:{{t2.fg}};font-family:'Sora',sans-serif;font-size:14px;padding:0">
+          </div>
+          <span onClick="{{send2}}" style="width:48px;height:48px;border-radius:50%;background:{{t2.accent}};color:{{t2.bg}};display:flex;align-items:center;justify-content:center;cursor:pointer;flex:none"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"></path></svg></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 1c -->
+    <div id="1c" style="display:flex;flex-direction:column;gap:14px">
+      <div style="display:flex;align-items:baseline;gap:12px">
+        <span style="font-family:'Geist Mono',monospace;font-size:13px;font-weight:600;color:#0B0C0F;background:#E8E9ED;border-radius:6px;padding:3px 9px">1c</span>
+        <span style="font-family:'Space Grotesk',sans-serif;font-size:21px;font-weight:600;color:#F2F3F5">Loud</span>
+        <span style="font-size:13.5px;color:#8B8F98">Neo-brutalist zine — status as headlines, hard shadows, a ticker that never sleeps.</span>
+      </div>
+      <div style="width:1240px;height:780px;overflow:hidden;position:relative;display:flex;flex-direction:column;gap:18px;padding:26px 30px 0;background:{{t3.bg}};color:{{t3.ink}};font-family:'Archivo',sans-serif;box-shadow:0 30px 80px rgba(0,0,0,.5)">
+        <div style="display:flex;align-items:center;gap:16px;flex:none">
+          <span style="font-weight:900;font-size:24px;letter-spacing:-.02em;background:{{t3.hl}};color:{{t3.hlInk}};padding:2px 12px;transform:rotate(-2deg);border:2px solid {{t3.ink}}">AGENTTALK</span>
+          <span style="font-family:'Space Mono',monospace;font-size:12px">/team — mission LANES — WP 7/12</span>
+          <span style="flex:1"></span>
+          <sc-for list="{{th3Chips}}" as="c" hint-placeholder-count="3"><span onClick="{{c.set}}" style="{{c.style}}">{{c.label}}</span></sc-for>
+        </div>
+        <div style="display:flex;align-items:center;gap:22px;flex:none">
+          <div style="font-weight:900;font-size:60px;line-height:.95;letter-spacing:-.04em;text-transform:uppercase">{{nAgents}} agents. {{nBusy}} busy. <span style="background:{{t3.hot}};color:{{t3.hotInk}};padding:0 12px">{{nNeed}} need you.</span></div>
+          <div style="width:88px;height:88px;flex:none;border-radius:50%;background:{{t3.hl}};color:{{t3.hlInk}};border:2px solid {{t3.ink}};display:flex;flex-direction:column;align-items:center;justify-content:center;transform:rotate(12deg);font-family:'Space Mono',monospace;font-size:11px;font-weight:700;gap:2px">
+            <span><span style="animation:pulse 1.2s ease-in-out infinite">●</span> LIVE</span><span>{{clockShort}}</span>
+          </div>
+        </div>
+        <div style="flex:1;min-height:0;display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:24px">
+          <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));grid-template-rows:1fr 1fr;gap:18px">
+            <sc-for list="{{tiles3}}" as="t" hint-placeholder-count="8">
+              <div style="{{t.tile}}" style-hover="{{t.hover}}">
+                <div style="display:flex;align-items:center;gap:8px"><span style="font-family:'Space Mono',monospace;font-size:12px;font-weight:700">{{t.name}}</span><span style="flex:1"></span><span style="{{t.cliStyle}}">{{t.cli}}</span></div>
+                <span style="{{t.stStyle}}">{{t.stLabel}}</span>
+                <span style="font-size:13px;font-weight:500;line-height:1.3;flex:1">{{t.task}}</span>
+                <div style="display:flex;align-items:center;gap:8px"><span style="font-family:'Space Mono',monospace;font-size:10px;font-weight:700;width:30px">RATE</span><div style="flex:1;height:12px;border:2px solid {{t3.ink}}"><div style="{{t.rateFill}}"></div></div></div>
+                <div style="display:flex;align-items:center;gap:8px"><span style="font-family:'Space Mono',monospace;font-size:10px;font-weight:700;width:30px">CTX</span><div style="flex:1;height:12px;border:2px solid {{t3.ink}}"><div style="{{t.ctxFill}}"></div></div></div>
+              </div>
+            </sc-for>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:14px;min-height:0">
+            <div style="flex:1;min-height:0;background:{{t3.ink}};color:{{t3.bg}};border:2px solid {{t3.ink}};box-shadow:5px 5px 0 {{t3.hl}};padding:14px 16px 12px;display:flex;flex-direction:column;gap:9px;overflow:auto">
+              <span style="font-weight:900;font-size:24px;letter-spacing:-.03em;line-height:1">NEEDS YOU ({{nNeed}})</span>
+              <sc-for list="{{attn3}}" as="a" hint-placeholder-count="3">
+                <div style="display:flex;flex-direction:column;gap:6px;padding-top:9px;border-top:2px dashed {{t3.bg}}">
+                  <span style="font-family:'Space Mono',monospace;font-size:10px;font-weight:700;color:{{t3.hl}};letter-spacing:.06em">{{a.src}}</span>
+                  <span style="font-weight:700;font-size:14px;line-height:1.2">{{a.title}}</span>
+                  <div style="display:flex;gap:8px">
+                    <span onClick="{{a.act}}" style="font-family:'Space Mono',monospace;font-size:11px;font-weight:700;padding:5px 11px;background:{{t3.hl}};color:{{t3.hlInk}};border:2px solid {{t3.hl}};cursor:pointer">{{a.actLabel}}</span>
+                    <span onClick="{{a.later}}" style="font-family:'Space Mono',monospace;font-size:11px;font-weight:700;padding:5px 11px;border:2px solid {{t3.bg}};cursor:pointer">LATER</span>
+                  </div>
+                </div>
+              </sc-for>
+              <sc-if value="{{noAttn}}" hint-placeholder-val="{{false}}"><span style="font-weight:900;font-size:22px;color:{{t3.hl}}">ALL CLEAR.</span></sc-if>
+            </div>
+            <div style="flex:none;border:2px solid {{t3.ink}};background:{{t3.paper}};box-shadow:5px 5px 0 {{t3.ink}};padding:10px 12px;display:flex;flex-direction:column;gap:6px">
+              <span style="font-family:'Space Mono',monospace;font-size:10px;font-weight:700">LEAD SAYS →</span>
+              <span style="font-size:12.5px;line-height:1.35;font-weight:500">{{leadLine}}</span>
+              <input value="{{draft3}}" onInput="{{onDraft3}}" onKeyDown="{{keyDraft3}}" placeholder="TELL THE LEAD…" style="border:none;border-top:2px solid {{t3.ink}};outline:none;background:transparent;color:{{t3.ink}};font-family:'Space Mono',monospace;font-size:12px;font-weight:700;padding:8px 0 2px">
+            </div>
+          </div>
+        </div>
+        <div style="flex:none;margin:0 -30px;height:46px;background:{{t3.hl}};color:{{t3.hlInk}};border-top:2px solid {{t3.ink}};overflow:hidden;display:flex;align-items:center">
+          <div style="display:flex;gap:40px;white-space:nowrap;animation:marquee 38s linear infinite;padding-left:40px">
+            <sc-for list="{{ticker3}}" as="k" hint-placeholder-count="10"><span style="font-family:'Space Mono',monospace;font-size:13px;font-weight:700">✦ {{k.text}}</span></sc-for>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 1d -->
+    <div id="1d" style="display:flex;flex-direction:column;gap:14px">
+      <div style="display:flex;align-items:baseline;gap:12px">
+        <span style="font-family:'Geist Mono',monospace;font-size:13px;font-weight:600;color:#0B0C0F;background:#E8E9ED;border-radius:6px;padding:3px 9px">1d</span>
+        <span style="font-family:'Space Grotesk',sans-serif;font-size:21px;font-weight:600;color:#F2F3F5">The Conversation</span>
+        <span style="font-size:13.5px;color:#8B8F98">Lead-first — the console is one stream. You talk, the team works, decisions arrive inline.</span>
+      </div>
+      <div style="width:1240px;height:780px;border-radius:18px;overflow:hidden;display:grid;grid-template-columns:minmax(0,1fr) 320px;background:{{t4.bg}};color:{{t4.fg}};font-family:'Geist',sans-serif;box-shadow:0 30px 80px rgba(0,0,0,.5)">
+        <div style="display:flex;flex-direction:column;min-height:0">
+          <div style="height:58px;flex:none;display:flex;align-items:center;gap:12px;padding:0 26px;border-bottom:1px solid {{t4.border}}">
+            <div style="width:22px;height:22px;border-radius:7px;background:{{t4.accent}}"></div>
+            <span style="font-weight:600;font-size:15px">agenttalk</span>
+            <span style="font-size:13px;color:{{t4.dim}}">· lanes</span>
+            <span style="flex:1"></span>
+            <div style="display:flex;gap:3px;padding:3px;border-radius:10px;border:1px solid {{t4.border}};background:{{t4.panel}}">
+              <sc-for list="{{th4Chips}}" as="c" hint-placeholder-count="3"><span onClick="{{c.set}}" style="{{c.style}}">{{c.label}}</span></sc-for>
+            </div>
+            <span style="font-family:'Geist Mono',monospace;font-size:12px;color:{{t4.dim}}">{{clock}}</span>
+          </div>
+          <div style="flex:none;display:flex;gap:6px;padding:14px 20px;border-bottom:1px solid {{t4.border}}">
+            <sc-for list="{{pres4}}" as="p" hint-placeholder-count="8">
+              <div style="width:96px;display:flex;flex-direction:column;align-items:center;gap:5px">
+                <div style="{{p.av}}">{{p.ini}}</div>
+                <span style="{{p.nameStyle}}">{{p.name}}</span>
+                <span style="{{p.stStyle}}">{{p.st}}</span>
+              </div>
+            </sc-for>
+          </div>
+          <div ref="{{streamRef}}" style="flex:1;min-height:0;overflow:auto;padding:24px 30px 18px;display:flex;flex-direction:column;gap:14px">
+            <div style="font-family:'Instrument Serif',serif;font-size:36px;line-height:1.12;letter-spacing:-.01em;color:{{t4.serif}};max-width:660px;margin-bottom:6px">Evening. WP-07 just cleared review — <em style="color:{{t4.accent}}">a few things need you.</em></div>
+            <sc-for list="{{stream4}}" as="m" hint-placeholder-count="4">
+              <div style="display:flex;flex-direction:column">
+                <sc-if value="{{m.isLead}}" hint-placeholder-val="{{true}}">
+                  <div style="display:flex;gap:10px;align-items:flex-start;max-width:600px">
+                    <div style="width:30px;height:30px;border-radius:50%;flex:none;border:2px solid {{t4.accent}};display:flex;align-items:center;justify-content:center;font-family:'Geist Mono',monospace;font-size:10px;font-weight:600">LE</div>
+                    <div style="display:flex;flex-direction:column;gap:8px">
+                      <div style="background:{{t4.panel}};border:1px solid {{t4.border}};border-radius:4px 16px 16px 16px;padding:11px 15px;font-size:14px;line-height:1.5">{{m.body}}</div>
+                      <div style="display:flex;gap:6px;flex-wrap:wrap">
+                        <sc-for list="{{m.quick}}" as="q" hint-placeholder-count="0"><span onClick="{{q.go}}" style="{{q.style}}">{{q.label}}</span></sc-for>
+                      </div>
+                    </div>
+                  </div>
+                </sc-if>
+                <sc-if value="{{m.isYou}}" hint-placeholder-val="{{false}}">
+                  <div style="align-self:flex-end;max-width:520px;background:{{t4.accent}};color:{{t4.accentInk}};border-radius:16px 4px 16px 16px;padding:11px 15px;font-size:14px;line-height:1.5">{{m.body}}</div>
+                </sc-if>
+                <sc-if value="{{m.isEvent}}" hint-placeholder-val="{{false}}">
+                  <div style="display:flex;align-items:center;gap:12px;max-width:640px;padding:11px 14px;border-radius:14px;border:1px solid {{t4.border}};background:{{t4.panel2}}">
+                    <span style="{{m.icon}}">{{m.glyph}}</span>
+                    <div style="flex:1;min-width:0"><div style="font-size:13.5px;font-weight:600">{{m.title}}</div><div style="font-size:12px;color:{{t4.dim}};margin-top:2px">{{m.meta}}</div></div>
+                    <sc-for list="{{m.quick}}" as="q" hint-placeholder-count="0"><span onClick="{{q.go}}" style="{{q.style}}">{{q.label}}</span></sc-for>
+                  </div>
+                </sc-if>
+              </div>
+            </sc-for>
+            <sc-if value="{{typing}}" hint-placeholder-val="{{false}}"><span style="font-size:12px;color:{{t4.dim}};padding-left:40px"><span style="animation:pulse 1s ease-in-out infinite">●●●</span> claude-lead is typing</span></sc-if>
+          </div>
+          <div style="flex:none;padding:10px 24px 20px;display:flex;flex-direction:column;gap:10px">
+            <div style="display:flex;gap:7px;flex-wrap:wrap">
+              <sc-for list="{{cmds4}}" as="c" hint-placeholder-count="4"><span onClick="{{c.go}}" style="{{c.style}}">{{c.label}}</span></sc-for>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;padding:6px 6px 6px 14px;border-radius:16px;background:{{t4.panel}};border:1px solid {{t4.border}}">
+              <span style="font-family:'Geist Mono',monospace;font-size:11px;color:{{t4.dim}};border:1px solid {{t4.border}};border-radius:5px;padding:1px 6px">/</span>
+              <input value="{{draft4}}" onInput="{{onDraft4}}" onKeyDown="{{keyDraft4}}" placeholder="Message the lead, or type / for commands" style="flex:1;background:transparent;border:none;outline:none;color:{{t4.fg}};font-family:'Geist',sans-serif;font-size:14.5px;padding:8px 0">
+              <span onClick="{{send4}}" style="width:40px;height:40px;border-radius:12px;background:{{t4.accent}};color:{{t4.accentInk}};display:flex;align-items:center;justify-content:center;cursor:pointer"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M6 11l6-6 6 6"></path></svg></span>
+            </div>
+          </div>
+        </div>
+        <div style="background:{{t4.panel}};border-left:1px solid {{t4.border}};padding:22px 20px;display:flex;flex-direction:column;gap:22px;min-height:0;overflow:hidden">
+          <div style="display:flex;flex-direction:column;gap:10px">
+            <div style="display:flex;align-items:baseline;gap:8px"><span style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:{{t4.dim}}">Mission</span><span style="flex:1"></span><span style="font-family:'Geist Mono',monospace;font-size:12px">7 / 12</span></div>
+            <span style="font-family:'Instrument Serif',serif;font-size:24px;line-height:1">lanes</span>
+            <div style="display:grid;grid-template-columns:repeat(12,1fr);gap:4px"><sc-for list="{{wp4}}" as="w" hint-placeholder-count="12"><span style="{{w.style}}"></span></sc-for></div>
+            <span style="font-size:11.5px;color:{{t4.dim}}">WP-07 in review · 3 open threads · ETA ~2h</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:13px;flex:1;min-height:0">
+            <span style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:{{t4.dim}}">Right now</span>
+            <sc-for list="{{now4}}" as="r" hint-placeholder-count="8">
+              <div style="display:flex;gap:10px;align-items:flex-start">
+                <span style="{{r.dot}}"></span>
+                <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:3px">
+                  <div style="display:flex;align-items:baseline;gap:6px"><span style="font-family:'Geist Mono',monospace;font-size:11.5px">{{r.name}}</span><span style="{{r.stStyle}}">{{r.st}}</span></div>
+                  <span style="font-size:11.5px;color:{{t4.dim}};white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{r.task}}</span>
+                  <div style="height:3px;border-radius:2px;background:{{t4.border}};overflow:hidden"><div style="{{r.bar}}"></div></div>
+                </div>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</section>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;actions&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:false,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Behavior&quot;},&quot;live&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Behavior&quot;},&quot;crt&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;1a Terminal&quot;}}">
+class Component extends DCLogic {
+  constructor(props){
+    super(props);
+    const t=Date.now(); this.t0=t; this.lastInj=t; this.poolIx=0; this.recAt=null;
+    this.agents=[
+      {id:'claude-lead',ini:'LE',cli:'claude',role:'lead',state:'working',task:'Routing the m-4.2 release close',rate:41,ctx:62,peer:'—',hb:3},
+      {id:'claude-dev',ini:'CD',cli:'claude',role:'implementer',state:'working',task:'WP-07 · lane deliver-gate bounds check',rate:58,ctx:74,peer:'codex-rev',hb:8},
+      {id:'codex-dev',ini:'XD',cli:'codex',role:'implementer',state:'quiet',task:'WP-05 · attention collector refactor',rate:33,ctx:48,peer:'claude-rev',hb:22},
+      {id:'codex-rev',ini:'XR',cli:'codex',role:'reviewer',state:'working',task:'Reviewing rq-7a1 — rename bounds path',rate:69,ctx:81,peer:'claude-dev',hb:5},
+      {id:'claude-rev',ini:'CR',cli:'claude',role:'reviewer',state:'idle',task:'Waiting on codex-dev handoff',rate:20,ctx:30,peer:'codex-dev',hb:46},
+      {id:'codex-test',ini:'XT',cli:'codex',role:'tester',state:'working',task:'Failure-injection suite · 38/42 green',rate:44,ctx:55,peer:'—',hb:12},
+      {id:'codex-infra',ini:'XI',cli:'codex',role:'infra',state:'limited',task:'Rate window resets at 22:08',rate:98,ctx:40,peer:'—',hb:214},
+      {id:'claude-arch',ini:'CA',cli:'claude',role:'implementer',state:'stuck',task:'No progress for 6m on WP-09',rate:51,ctx:93,peer:'codex-rev',hb:372}
+    ];
+    this.attnAll=[
+      {id:'esc',sev:'bad',src:'ESCALATION',title:'Reassign WP-11? codex-infra is rate-capped',meta:'codex-infra · window resets 22:08',actLabel:'Reassign',act:'Yes, reassign WP-11 to claude-dev'},
+      {id:'gate',sev:'bad',src:'GATE HOLD',title:'Release close m-4.2 is blocked',meta:'automation_ci evidence missing · 1 of 3',actLabel:'Evidence',act:'/evidence m-4.2'},
+      {id:'stuck',sev:'warn',src:'STUCK',title:'claude-arch — no progress in 6m',meta:'WP-09 · wrapped · restartable',actLabel:'Restart',act:'/restart claude-arch'}
+    ];
+    this.pool=[
+      {from:'codex-test',to:'claude-lead',kind:'note',subj:'failure-injection 40/42 green'},
+      {from:'claude-rev',to:'codex-dev',kind:'reply',subj:'ack — starting WP-05 review'},
+      {from:'codex-rev',to:'claude-lead',kind:'note',subj:'WP-07 cross-review archived'},
+      {from:'claude-dev',to:'codex-rev',kind:'wake',subj:'WP-08 ready for review'},
+      {from:'codex-dev',to:'claude-rev',kind:'review-request',subj:'WP-05 attention collector'}
+    ];
+    this.P1=[
+      {name:'phosphor',bg:'#040906',line:'#1B3A24',fg:'#7CFF9B',dim:'#3F8A56',hot:'#DFFFE7',warn:'#FFD166',bad:'#FF5C5C',info:'#7CE7FF',glow:'rgba(124,255,155,.55)',soft:'rgba(124,255,155,.22)',selInk:'#040906'},
+      {name:'amber',bg:'#0A0603',line:'#3E2A10',fg:'#FFB547',dim:'#9A6A26',hot:'#FFE7BF',warn:'#FFF08A',bad:'#FF6A4A',info:'#FFD59A',glow:'rgba(255,181,71,.5)',soft:'rgba(255,181,71,.2)',selInk:'#0A0603'},
+      {name:'ice',bg:'#03060C',line:'#1A2C4B',fg:'#8FD3FF',dim:'#4A7394',hot:'#E6F6FF',warn:'#FFE38A',bad:'#FF7A9A',info:'#B7A8FF',glow:'rgba(143,211,255,.5)',soft:'rgba(143,211,255,.2)',selInk:'#03060C'}
+    ];
+    this.P2=[
+      {name:'nebula',bg:'#07051A',glow:'rgba(139,92,246,.30)',glass:'rgba(255,255,255,.05)',border:'rgba(255,255,255,.11)',ring:'rgba(167,139,250,.20)',fg:'#EEEAFF',dim:'#948DBA',accent:'#A78BFA',accent2:'#22D3EE',track:'rgba(255,255,255,.09)',ok:'#34D399',info:'#22D3EE',warn:'#FBBF24',bad:'#FB7185',node:'#120E2B'},
+      {name:'solar',bg:'#120804',glow:'rgba(255,122,48,.28)',glass:'rgba(255,240,225,.055)',border:'rgba(255,220,190,.13)',ring:'rgba(255,160,90,.22)',fg:'#FFF3E8',dim:'#BE957C',accent:'#FF8A3D',accent2:'#FFD166',track:'rgba(255,255,255,.09)',ok:'#9BE15D',info:'#FFD166',warn:'#FFB020',bad:'#FF5A5A',node:'#221108'},
+      {name:'void',bg:'#08080A',glow:'rgba(255,255,255,.08)',glass:'rgba(255,255,255,.04)',border:'rgba(255,255,255,.11)',ring:'rgba(255,255,255,.11)',fg:'#F4F4F5',dim:'#8B8B93',accent:'#F4F4F5',accent2:'#A1A1AA',track:'rgba(255,255,255,.09)',ok:'#E4E4E7',info:'#A1A1AA',warn:'#FDE68A',bad:'#FCA5A5',node:'#141417'}
+    ];
+    this.P3=[
+      {name:'acid',bg:'#0E0E0E',paper:'#171717',ink:'#F4F4F0',hl:'#C6FF00',hlInk:'#0E0E0E',hot:'#FF3D00',hotInk:'#0E0E0E',mute:'#8E8E88'},
+      {name:'bubblegum',bg:'#FFE4EF',paper:'#FFFFFF',ink:'#1C0A15',hl:'#FF4FA3',hlInk:'#FFFFFF',hot:'#2F4BFF',hotInk:'#FFFFFF',mute:'#7A5A6C'},
+      {name:'riso',bg:'#F2ECDF',paper:'#FBF8F0',ink:'#1F3A93',hl:'#FF5A5F',hlInk:'#FBF8F0',hot:'#FF5A5F',hotInk:'#FBF8F0',mute:'#6A78A8'}
+    ];
+    this.P4=[
+      {name:'midnight',bg:'#0A0C11',panel:'#11141B',panel2:'#161A23',border:'#232834',fg:'#E7EAF0',dim:'#7D8595',accent:'#7C8CFF',accentInk:'#0A0C11',ok:'#3DD68C',warn:'#F5B83D',bad:'#FF6B6B',info:'#5CC8FF',serif:'#F2F3F7'},
+      {name:'paper',bg:'#F6F3EC',panel:'#FFFFFF',panel2:'#FBF9F4',border:'#E5E0D4',fg:'#1D1B17',dim:'#857F74',accent:'#E4572E',accentInk:'#FFFFFF',ok:'#2E9F6B',warn:'#B7780A',bad:'#D2402F',info:'#2F6FC9',serif:'#1D1B17'},
+      {name:'synthwave',bg:'#120822',panel:'#1B0F33',panel2:'#231342',border:'#3B2266',fg:'#FBEFFF',dim:'#A88CCB',accent:'#FF4FD8',accentInk:'#120822',ok:'#00F5D4',warn:'#FFD23F',bad:'#FF5C8A',info:'#00E5FF',serif:'#FFE3FA'}
+    ];
+    this.projects=[{label:'agenttalk',id:'agenttalk-3f2a'},{label:'legacy-billing',id:'legacy-billing-9c1d'}];
+    this.gates=[
+      {id:'g-tests',name:'tests',scope:'m-4.2',state:'GO',evidence:'dev-gate release · py3.10–3.14 · 1,912 passed',verifier:'codex-test',expires:'—'},
+      {id:'g-review',name:'review',scope:'m-4.2',state:'GO',evidence:'rq-7a1 review-result approved · head 7b2d9c1',verifier:'codex-rev',expires:'—'},
+      {id:'g-ci',name:'automation_ci',scope:'m-4.2',state:'HOLD',evidence:'CI run #418 has not reported',verifier:'—',expires:'—'},
+      {id:'g-sec',name:'security-scan',scope:'m-4.2',state:'WAIVED',evidence:'scanner unavailable on runner',verifier:'operator',expires:'in 4d 6h'},
+      {id:'g-lane',name:'lane:WP-07',scope:'WP-07',state:'GO',evidence:'lane check · in bounds · merge clean',verifier:'lane',expires:'—'},
+      {id:'g-parity',name:'parity',scope:'m-4.2',state:'HOLD',evidence:'2 of 41 behaviours unmeasured',verifier:'—',expires:'—'}
+    ];
+    this.lanes=[
+      {id:'WP-04',owner:'claude-dev',ini:'CD',domain:'roster',stage:3,hist:['A'],cycle:'1h 40m',rev:'codex-rev'},
+      {id:'WP-07',owner:'claude-dev',ini:'CD',domain:'lanes',stage:2,hist:['R','F','A'],cycle:'3h 12m',rev:'codex-rev'},
+      {id:'WP-05',owner:'codex-dev',ini:'XD',domain:'attention',stage:1,hist:['R','F'],cycle:'2h 05m',rev:'claude-rev'},
+      {id:'WP-09',owner:'claude-arch',ini:'CA',domain:'knowledge',stage:0,hist:[],cycle:'—',rev:'codex-rev',hold:'touches cli.py — shared path needs approve-shared'},
+      {id:'WP-11',owner:'codex-infra',ini:'XI',domain:'supervisor',stage:0,hist:[],cycle:'—',rev:'claude-rev',hold:'owner is rate-capped until 22:08'}
+    ];
+    this.domains=[
+      {name:'lanes',globs:'src/agenttalk/lanes.py',owner:'claude-dev',rev:'codex-rev'},
+      {name:'attention',globs:'src/agenttalk/attention*.py',owner:'codex-dev',rev:'claude-rev'},
+      {name:'knowledge',globs:'src/agenttalk/knowledge/**',owner:'claude-arch',rev:'codex-rev'},
+      {name:'supervisor',globs:'src/agenttalk/supervise*.py, deadman.py',owner:'codex-infra',rev:'claude-rev'},
+      {name:'cli surface',globs:'src/agenttalk/cli.py',owner:'claude-lead',rev:'codex-rev',shared:true}
+    ];
+    this.risks=[
+      {id:'r1',sev:'HIGH',src:'GATE',title:'Cutover has never been rehearsed end-to-end',owner:'operator',age:'6d'},
+      {id:'r2',sev:'HIGH',src:'PARITY',title:'2 behaviours unmeasured: nightly ledger close, refund rounding',owner:'codex-test',age:'2d'},
+      {id:'r3',sev:'MED',src:'WAIVER',title:'Security scan waived — expires in 4 days',owner:'operator',age:'1d'},
+      {id:'r4',sev:'MED',src:'DEAD LETTER',title:'Poison message parked in codex-scout inbox',owner:'claude-lead',age:'20m'}
+    ];
+    this.retired=[{id:'codex-scout',ini:'XS'},{id:'claude-docs',ini:'DO'}];
+    this.stream2Init=[
+      {type:'task',title:'WP-05 · attention collector refactor',to:'codex-dev',status:'accepted'},
+      {type:'task',title:'WP-04 · roster rename carries groups',to:'claude-dev',status:'done'},
+      {type:'lesson',body:'A rename’s OLD path must be bounds-checked as a removal, or a move out of the lane slips through.',domain:'lanes',who:'claude-dev, codex-dev'},
+      {type:'unknown',id:'u1',body:'Does the nightly job write to the ledger table directly?',seg:'segment billing/batch · blocking'},
+      {type:'decision',title:'Cut billing-export over this sprint, or rehearse first?',impact:'Parity is verified, but cutover was never rehearsed and a security waiver expires Friday. Rehearsal costs ~1 day.',deadline:'Fri 18:00',opts:['Rehearse first','Cut over now','Ask me tomorrow']},
+      {type:'lead',body:'Two work orders are out, one lesson landed, and one question blocks the billing batch segment. The cutover call is yours.'}
+    ];
+    const bus=[
+      {from:'codex-rev',to:'claude-dev',kind:'review-result',subj:'WP-07 GO — rename bounds verified',ago:14},
+      {from:'claude-lead',to:'reviewers',kind:'broadcast',subj:'naming: lane vs deliver-gate?',ago:40},
+      {from:'claude-dev',to:'codex-rev',kind:'wake',subj:'WP-07 ready for re-review',ago:62},
+      {from:'codex-test',to:'claude-lead',kind:'note',subj:'failure-injection 38/42 green',ago:135},
+      {from:'claude-arch',to:'codex-rev',kind:'review-request',subj:'WP-09 first pass',ago:300},
+      {from:'codex-infra',to:'claude-lead',kind:'escalate',subj:'rate cap — reassign WP-11?',ago:480},
+      {from:'claude-lead',to:'codex-dev',kind:'message',subj:'WP-05 scope confirmed',ago:620}
+    ].map(b=>({...b,t:t-b.ago*1000,fresh:false}));
+    this.state={s3:'busy',th5:0,team3:0,keys3:false,sel3:0,done3:{},later3:[],chat3:[],draft6:'',retried:false,selGate:'g-ci',gateOver:{},selLane:'WP-07',delivered:{},riskAcc:[],exported:false,proj:0,roster:'active',typing2:false,draft5:'',decided:null,answered:false,stream2:this.stream2Init,th1:0,th2:0,th3:0,th4:0,sel1:'claude-dev',sel2:'codex-rev',cmd1:'',draft2:'',draft3:'',draft4:'',now:t,typing:false,dismissed:[],archOk:false,bus,
+      stream:[
+        {type:'event',tone:'ok',title:'codex-rev approved WP-07',meta:'review-result · GO · rename bounds verified'},
+        {type:'lead',body:'codex-infra hit its 5-hour window — WP-11 is stalled until 22:08. Hand it to claude-dev once WP-07 lands?',quick:['Yes, reassign WP-11','Wait for reset']},
+        {type:'event',tone:'bad',title:'Release close m-4.2 is on HOLD',meta:'gate · automation_ci evidence missing (1 of 3)',quick:[['View evidence','/evidence m-4.2']]},
+        {type:'event',tone:'warn',title:'claude-arch looks stuck on WP-09',meta:'no progress in 6m · wrapped · restartable',quick:[['Restart with context','/restart claude-arch']]}
+      ]};
+  }
+  componentDidMount(){ this.iv=setInterval(()=>this.tick(),1000); }
+  componentWillUnmount(){ clearInterval(this.iv); clearTimeout(this.rt); }
+  componentDidUpdate(){ if(this._s4 && this._n4!==this.state.stream.length){ this._n4=this.state.stream.length; this._s4.scrollTop=this._s4.scrollHeight; } if(this._s5 && this._n5!==this.state.stream2.length){ this._n5=this.state.stream2.length; this._s5.scrollTop=this._s5.scrollHeight; } if(this._s6 && this._n6!==this.state.chat3.length){ this._n6=this.state.chat3.length; this._s6.scrollTop=this._s6.scrollHeight; } }
+  tick(){
+    if(this.props.live===false) return;
+    const now=Date.now(); let bus=this.state.bus;
+    if(now-this.lastInj>9000){ const p=this.pool[this.poolIx++%this.pool.length]; bus=[{...p,t:now,fresh:true},...bus.map(b=>({...b,fresh:false}))].slice(0,9); this.lastInj=now; }
+    this.setState({now,bus});
+  }
+  reply(text){
+    const s=text.toLowerCase();
+    if(s.includes('status')) return '5 working, 1 thinking, 1 waiting. WP-07 is through review, WP-05 is mid-refactor, and m-4.2 is on HOLD for CI evidence.';
+    if(s.includes('approve')) return 'm-4.2 is still HOLD — automation_ci evidence hasn’t landed (CI #418 pending). Want me to request an operator waiver?';
+    if(s.includes('restart')) return 'Restarting claude-arch with context. Its heartbeat is back — resuming WP-09.';
+    if(s.includes('reassign')||s.startsWith('yes')) return 'Done — WP-11 goes to claude-dev the moment WP-07 lands. codex-infra stays paused until 22:08.';
+    if(s.includes('wait')) return 'Holding WP-11 for codex-infra’s reset at 22:08. I’ll ping you if it slips.';
+    if(s.includes('evidence')) return 'm-4.2 evidence: review GO, tests GO, automation_ci missing — CI run #418 hasn’t reported yet.';
+    return 'Ack — routing that to the team. I’ll report back here.';
+  }
+  send5(text){
+    text=(text||'').trim(); if(!text) return;
+    this.setState(s=>({typing2:true,stream2:[...s.stream2,{type:'you',body:text}]}));
+    clearTimeout(this.rt2);
+    this.rt2=setTimeout(()=>{
+      const s0=text.toLowerCase();
+      let r=this.reply(text), extra=[];
+      if(s0.includes('rehearse')){ r='Scheduling a cutover rehearsal. I’ve issued the work order to codex-infra for after its window resets.'; extra=[{type:'task',title:'Cutover rehearsal · billing-export',to:'codex-infra',status:'pending'}]; }
+      else if(s0.includes('cut over')){ r='Understood — but the close is still HOLD on automation_ci and parity. I can’t move it to GO; that needs evidence or your waiver.'; }
+      else if(s0.includes('tomorrow')){ r='Deferred to tomorrow 09:00. The waiver clock keeps running — I’ll flag it at 24h.'; }
+      this.setState(s=>({typing2:false,stream2:[...s.stream2,...extra,{type:'lead',body:r}]}));
+    },1200);
+  }
+  dismiss(id){ this.setState(s=>({dismissed:s.dismissed.indexOf(id)<0?[...s.dismissed,id]:s.dismissed})); }
+  send(text){
+    text=(text||'').trim(); if(!text) return;
+    const now=Date.now();
+    this.setState(s=>({typing:true,stream:[...s.stream,{type:'you',body:text}],bus:[{from:'you',to:'claude-lead',kind:'message',subj:text,t:now,fresh:true},...s.bus.map(b=>({...b,fresh:false}))].slice(0,9)}));
+    clearTimeout(this.rt);
+    this.rt=setTimeout(()=>{
+      const r=this.reply(text), n=Date.now();
+      const extra={};
+      if(/restart/i.test(text)){ extra.archOk=true; this.recAt=n; }
+      this.setState(s=>{
+        let d=s.dismissed.slice();
+        if(/restart/i.test(text)&&d.indexOf('stuck')<0) d.push('stuck');
+        if(/reassign|^yes/i.test(text)&&d.indexOf('esc')<0) d.push('esc');
+        return {...extra,dismissed:d,typing:false,stream:[...s.stream,{type:'lead',body:r}],bus:[{from:'claude-lead',to:'you',kind:'reply',subj:r,t:n,fresh:true},...s.bus.map(b=>({...b,fresh:false}))].slice(0,9)};
+      });
+    },1300);
+  }
+  hexA(hex,a){ if(!hex||hex[0]!=='#') return hex; const n=parseInt(hex.slice(1),16); return 'rgba('+((n>>16)&255)+','+((n>>8)&255)+','+(n&255)+','+a+')'; }
+  fmt(s){ s=Math.max(0,Math.floor(s)); if(s<60) return s+'s'; const m=Math.floor(s/60), r=s%60; return m+'m'+(r?' '+r+'s':''); }
+
+  send6(text){
+    text=(text||'').trim(); if(!text||this.state.s3==='offline'&&this.state.team3===0) return;
+    this.setState(s=>({draft6:'',chat3:[...s.chat3,{who:'you',body:text}]}));
+    clearTimeout(this.rt6);
+    this.rt6=setTimeout(()=>{
+      const t=text.toLowerCase();
+      let r='Noted. I’ll fold that in and only come back if it needs you.';
+      if(t.indexOf('status')>=0) r='Two working, one running tests, the rest idle. Nothing is blocked except what’s on your list.';
+      else if(t.indexOf('restart')>=0) r='Restarting dev-6 with its last context. I’ll check it replies within 2 minutes.';
+      else if(t.indexOf('120')>=0||t.indexOf('raise')>=0) r='Done — cap is 120 € for September. Alert moves to 96 €, cutoff to 114 €.';
+      else if(t.indexOf('keep')>=0) r='Keeping it. I’ll add a removal task for next release so it doesn’t get forgotten.';
+      else if(t.indexOf('wait')>=0) r='Waiting. I’ll only come back if the evidence changes.';
+      this.setState(s=>({chat3:[...s.chat3,{who:'lead',body:r}]}));
+    },900);
+  }
+  t3(st,now){
+    const key=JSON.stringify([st.s3,st.th5,st.team3,st.keys3,st.sel3,st.done3,st.later3,st.chat3.length,st.draft6,st.retried,this.props.actions===true]);
+    if(this._t3k===key&&this._t3v) return this._t3v;
+    this._t3k=key; this._t3v=this.t3build(st);
+    return this._t3v;
+  }
+  t3build(st){
+    const P5=[...this.P4,{name:'terminal',bg:'#040906',panel:'#07100A',panel2:'#0B170F',border:'#1B3A24',fg:'#7CFF9B',dim:'#52A06B',accent:'#DFFFE7',accentInk:'#040906',ok:'#7CFF9B',warn:'#FFD166',bad:'#FF5C5C',info:'#7FD8FF'}];
+    const p=P5[st.th5]||P5[0], mono=p.name==='terminal', light=p.name==='paper', A=(c,a)=>this.hexA(c,a);
+    const actions=this.props.actions===true;
+    const MONO=mono?"'JetBrains Mono',monospace":"'Geist Mono',monospace";
+    const f3={body:mono?"'JetBrains Mono',monospace":"'Geist',sans-serif",serif:mono?"'JetBrains Mono',monospace":"'Instrument Serif',serif",mono:MONO};
+    const rad=n=>mono?'0px':n+'px';
+    const r3={frame:rad(18),card:rad(16),ctl:rad(9),bubble:mono?'0px':'4px 16px 16px 16px',you:mono?'0px':'16px 4px 16px 16px'};
+    const RT=light?{claude:'#B0532C',codex:'#2C7A6B',qwen:'#6D4AC0'}:{claude:'#D08A5E',codex:'#4FB3A0',qwen:'#9E82E0'};
+    const RL={claude:'C',codex:'X',qwen:'Q'};
+    const ROLE={developer:'dev',reviewer:'rev',tester:'test',architect:'arch',lead:'lead'};
+    const parse=id=>{const m=/^(claude|codex|qwen)-([a-z0-9]+)-([a-z]+)(?:-(\d+))?$/.exec(id); return m?{rt:m[1],proj:m[2],base:(ROLE[m[3]]||m[3])+(m[4]?'-'+m[4]:'')}:null;};
+    const shortName=(id,project,pool)=>{const q=parse(id); if(!q) return id.length>18?id.slice(0,17)+'…':id; let s=q.base;
+      if(pool&&pool.some(o=>{const z=parse(o); return o!==id&&z&&z.base===q.base&&z.proj===q.proj;})) s=RL[q.rt].toLowerCase()+'.'+s;
+      if(project&&q.proj!==project) s=q.proj+'/'+s; return s;};
+    const SHAPE={midnight:'hexagon',paper:'rounded-square',synthwave:'star'};
+    const FILES={hexagon:['architect','builder','devops','analyst','detective','monitor','translator','docs','sandbox','social'],'rounded-square':['architect','terminal','debugger','reader','detective','launch','network','accessibility','mobile','writer'],star:['workflow','web','devops','reviewer','support','database','cloud','analytics','designer','integrator']};
+    const shape=SHAPE[p.name]||null;
+    const badgeSt=(rt,sz,ring)=>({position:'absolute',right:'-3px',bottom:'-3px',width:sz+'px',height:sz+'px',borderRadius:mono?'0px':'50%',background:RT[rt],color:'#FFFFFF',fontFamily:MONO,fontSize:(sz*.56)+'px',fontWeight:700,display:mono?'none':'flex',alignItems:'center',justifyContent:'center',border:'2px solid '+ring});
+    const txtAvSt=(rt,sz)=>({width:sz+'px',height:sz+'px',display:'flex',alignItems:'center',justifyContent:'center',border:'1px solid '+RT[rt],color:RT[rt],fontFamily:MONO,fontSize:(sz*.44)+'px',fontWeight:700});
+
+    const scen=st.s3, team=st.team3;
+    const off=scen==='offline'&&team===0, quiet=scen==='quiet';
+    const TEAMS=[
+      {label:'Main team',machine:'win-ws01',project:'agenttalk',rows:[
+        ['claude-agenttalk-lead','claude','working','Reading rev-1’s review of WP-14','idle','Idle · nothing queued'],
+        ['claude-agenttalk-developer-1','claude','working','Implementing WP-15 · 3m in','working','Nightly lint · 2m in'],
+        ['claude-agenttalk-developer-2','claude','idle','Idle · last turn 40m ago','idle','Idle · last turn 3h ago'],
+        ['claude-agenttalk-reviewer-1','claude','idle','Idle · gave GO on WP-14','idle','Idle · gave GO on WP-14'],
+        ['claude-agenttalk-reviewer-3','claude','idle','Idle · gave FIX on WP-12','idle','Idle'],
+        ['codex-agenttalk-developer-5','codex','busy','Running tests 6m · output 40s ago','idle','Idle'],
+        ['codex-agenttalk-developer-6','codex','stuck','No output 14m · tests exited 12m ago','idle','Idle'],
+        ['codex-agenttalk-reviewer-2','codex','capped','5-hour window full','idle','Idle','resets 23:40',''],
+        ['qwen-agenttalk-developer-7','qwen','working','Drafting WP-16 fixtures','idle','Idle','€3.20 today','€0.00 today'],
+        ['qwen-agenttalk-reviewer-4','qwen','idle','Idle','idle','Idle','€0.40 today','€0.00 today']],
+       needs:[
+        {id:'n3',kind:'LOOKS STUCK',tone:'bad',title:'dev-6 has gone quiet',ev:'No output for 14 min · test run exited 12 min ago · no reply sent',age:'14m',opts:['Restart with context','Wait 10 min']},
+        {id:'n1',kind:'SPEND LIMIT',tone:'warn',title:'Raise the qwen cap from 100 € to 120 € for September?',ev:'Ledger 67.20 € on day 21 · ≈ 96 € by the 30th · the 95 € cutoff lands around the 29th',age:'no deadline · waiting 2d',opts:['Raise to 120 €','Keep 100 €']},
+        {id:'n2',kind:'DECISION',tone:'info',title:'Keep the old CSV export for one more release?',ev:'rev-3 cold review: FIX · two callers still use it · the lead recommends keeping it',age:'no deadline · waiting 5h',opts:['Keep it','Remove it']}],
+       lead:{busy:'Three things need you. dev-6 first — it looks stuck, not busy. The spend call is the only one with a real clock: at this rate qwen hits its cutoff around the 29th.',quiet:'Nothing needs you. I’ll start WP-16 when dev-1 finishes the nightly lint.'}},
+      {label:'Shopfront',machine:'linux-02',project:'shopfront',rows:[
+        ['claude-shopfront-lead','claude','working','Planning checkout WP-3','idle','Idle'],
+        ['claude-shopfront-developer-1','claude','working','Implementing WP-3 · 11m in','idle','Idle'],
+        ['codex-shopfront-developer-2','codex','idle','Idle','idle','Idle'],
+        ['codex-shopfront-reviewer-1','codex','idle','Idle · gave HOLD on WP-2','idle','Idle'],
+        ['qwen-shopfront-developer-3','qwen','idle','Idle','idle','Idle','€0.90 today','€0.00 today']],
+       needs:[{id:'s1',kind:'GATE HOLD',tone:'warn',title:'Checkout WP-3 is on HOLD. Wait for CI, or waive?',ev:'automation_ci hasn’t reported for 2h · rev-1 cold review: GO · only evidence can turn it GO',age:'no deadline · waiting 2h',opts:['Wait for CI',actions?'Waive for 7 days':'Waive · CLI only'],lock:[false,!actions]}],
+       lead:{busy:'One call on checkout. Everything else is moving.',quiet:'Quiet here too. Nothing is queued.'}}
+    ];
+    const T=TEAMS[team];
+    const visNeeds=tm=>quiet?[]:TEAMS[tm].needs.filter(n=>st.later3.indexOf(n.id)<0);
+    const openCount=tm=>visNeeds(tm).filter(n=>!st.done3[n.id]).length;
+    const vis=visNeeds(team);
+    const toneC={warn:p.warn,info:p.info,bad:p.bad};
+    const act=(n,o)=>{ if(off||st.done3[n.id]) return; this.setState(s=>({done3:{...s.done3,[n.id]:o}})); this.send6(o); };
+    const later=n=>{ this.setState(s=>({later3:[...s.later3,n.id],sel3:0})); };
+    const needs3=vis.map((n,i)=>{const c=toneC[n.tone], sel=i===st.sel3&&!off, done=st.done3[n.id];
+      return {kind:n.kind,title:n.title,ev:n.ev,age:n.age,isDone:!!done,notDone:!done,done:done?'✓ Sent to the lead: '+done:'',hint:sel?'enter · l later':'',
+        pick:()=>this.setState({sel3:i}),
+        card:{background:p.panel,border:'1px solid '+(sel?p.accent:(done?p.border:A(c,.5))),borderRadius:r3.card,padding:'15px 18px',display:'flex',flexDirection:'column',gap:'9px',maxWidth:'700px',opacity:off?.5:(done?.65:1),boxShadow:sel&&!done?'0 0 0 3px '+A(p.accent,.18):'none',cursor:'pointer'},
+        kindStyle:{fontFamily:MONO,fontSize:'10.5px',fontWeight:600,letterSpacing:'.1em',color:c},
+        opts:n.opts.map((o,j)=>{const locked=off||(n.lock&&n.lock[j]); return {label:o,go:e=>{e.stopPropagation(); if(!locked) act(n,o);},style:{fontSize:'13px',fontWeight:500,padding:'8px 14px',borderRadius:mono?'0px':'999px',cursor:locked?'default':'pointer',opacity:locked?.5:1,background:j===0&&!locked?p.accent:'transparent',color:j===0&&!locked?p.accentInk:p.fg,border:'1px solid '+(j===0&&!locked?p.accent:p.border)}};}),
+        later:e=>{e.stopPropagation(); if(!off) later(n);},laterStyle:{fontSize:'13px',padding:'8px 12px',cursor:off?'default':'pointer',color:p.dim}};});
+    const nOpen=vis.filter(n=>!st.done3[n.id]).length;
+    const W=['No','One','Two','Three','Four','Five'];
+    const deferred=TEAMS[team].needs.filter(n=>st.later3.indexOf(n.id)>=0).length;
+
+    const stC={working:p.ok,busy:p.info,idle:p.dim,stuck:p.warn,capped:p.bad};
+    const pool=T.rows.map(r=>r[0]);
+    const roster3=T.rows.map((r,i)=>{const [id,rt]=r; const s=quiet?r[4]:r[2], ev=quiet?r[5]:r[3], cap=(quiet?r[7]:r[6])||'';
+      const c=off?p.dim:stC[s];
+      return {full:id,name:shortName(id,T.project,pool),ev,cap,letter:RL[rt],hasImg:!!shape,noImg:!shape,
+        imgBg:{width:'32px',height:'32px',backgroundImage:shape?'url("new_avatars/'+shape+'/'+FILES[shape][i%10]+'.png")':'none',backgroundSize:'contain',backgroundRepeat:'no-repeat',backgroundPosition:'center'},
+        avWrap:{position:'relative',width:'32px',height:'32px',flex:'none',opacity:off?.45:1},
+        txtAv:txtAvSt(rt,32),badge:badgeSt(rt,15,p.panel),
+        evStyle:{fontSize:'11px',color:c,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'},
+        capStyle:{fontFamily:MONO,fontSize:'10.5px',color:off?p.dim:(rt==='qwen'?RT.qwen:p.bad),flex:'none'}};});
+    const idleN=T.rows.filter(r=>(quiet?r[4]:r[2])==='idle').length;
+
+    const CAP=100,ALERT=80,CUT=95;
+    const bar=(v,bill,proj,h,frozen)=>{const pc=x=>Math.min(100,x/CAP*100)+'%'; const col=frozen?p.dim:(v>=CUT?p.bad:v>=ALERT?p.warn:p.accent);
+      return {h:h+'px',
+        track:{position:'absolute',inset:'0',borderRadius:rad(h/2),background:p.panel2,border:'1px solid '+p.border},
+        proj:{position:'absolute',left:'0',top:'0',bottom:'0',width:proj?pc(proj):'0%',borderRadius:rad(h/2),background:'repeating-linear-gradient(90deg,'+A(col,.4)+' 0 3px,transparent 3px 7px)'},
+        fill:{position:'absolute',left:'0',top:'0',bottom:'0',width:pc(v),borderRadius:rad(h/2),background:col},
+        bill:{position:'absolute',left:'calc('+pc(bill||0)+' - 1px)',top:'-4px',bottom:'-4px',width:'3px',borderRadius:'1px',background:p.fg,display:bill?'block':'none'},
+        alert:{position:'absolute',left:pc(ALERT),top:'-5px',bottom:'-5px',width:'0',borderLeft:'2px dashed '+p.warn},
+        cut:{position:'absolute',left:pc(CUT),top:'-5px',bottom:'-5px',width:'2px',background:p.bad},
+        end:{position:'absolute',right:'-1px',top:'-5px',bottom:'-5px',width:'2px',background:p.fg}};};
+    const B=quiet?{l:52.30,b:49.10,p:75}:{l:67.20,b:61.80,p:96};
+    const eur=v=>v.toFixed(2)+' €';
+    const rb=bar(B.l,B.b,B.p,10,off);
+    const bLegend=[['alert',p.warn,'80 € · notifies you, blocks nothing'],['cutoff',p.bad,'95 € · gateway refuses calls'],['bill ▮',p.fg,eur(B.b)+' · as of 14:00'],['projected',p.dim,'≈ '+B.p+' € by the 30th']].map(([k,c,v])=>({k,v,kStyle:{fontFamily:MONO,color:c}}));
+
+    const U=quiet?[['claude','5-hour',18,'22:10'],['claude','weekly',38,'Mon 09:00'],['codex','5-hour',31,'23:55'],['codex','weekly',55,'Thu 14:00']]:[['claude','5-hour',62,'23:40'],['claude','weekly',41,'Mon 09:00'],['codex','5-hour',100,'23:40'],['codex','weekly',58,'Thu 14:00']];
+    const thr=v=>off?p.dim:(v>=85?p.bad:v>=60?p.warn:p.ok);
+    const usage3=U.map(([rt,win,v,reset])=>({rt:rt==='claude'?'Claude':'Codex',win,pct:v+'%',reset,letter:RL[rt],
+      mark:{width:'16px',height:'16px',borderRadius:mono?'0px':'50%',background:RT[rt],color:'#FFFFFF',fontFamily:MONO,fontSize:'9px',fontWeight:700,display:'flex',alignItems:'center',justifyContent:'center'},
+      pctStyle:{fontFamily:MONO,fontSize:'12px',fontWeight:600,color:thr(v)},bar:{width:v+'%',height:'100%',background:thr(v)}}));
+
+    const teams3=TEAMS.map((t,i)=>{const on=i===team, isOff=scen==='offline'&&i===0, n=scen==='offline'&&i===0?visNeeds(0).length:openCount(i);
+      return {label:t.label,machine:t.machine,count:n,set:()=>this.setState({team3:i,sel3:0}),
+        style:{display:'flex',alignItems:'center',gap:'7px',padding:'5px 10px',borderRadius:rad(7),cursor:'pointer',fontSize:'12px',fontWeight:500,background:on?p.fg:'transparent',color:on?p.bg:p.fg},
+        machStyle:{fontFamily:MONO,fontSize:'10.5px',opacity:.65},
+        dot:{width:'7px',height:'7px',borderRadius:'50%',background:isOff?p.warn:p.ok,animation:isOff?'none':'pulse 2s ease-in-out infinite'},
+        badge:{display:n?'flex':'none',fontFamily:MONO,fontSize:'10.5px',fontWeight:700,minWidth:'18px',height:'18px',padding:'0 5px',borderRadius:mono?'0px':'999px',background:p.warn,color:'#111111',alignItems:'center',justifyContent:'center'}};});
+    const seg=(on)=>({cursor:'pointer',fontSize:'11.5px',fontWeight:500,padding:'5px 10px',borderRadius:rad(7),background:on?p.fg:'transparent',color:on?p.bg:p.dim});
+    const scen3=[['busy','Busy'],['quiet','Quiet day'],['offline','Can’t see team']].map(([k,l])=>({label:l,set:()=>this.setState({s3:k,sel3:0}),style:seg(scen===k)}));
+    const th5Chips=P5.map((t,i)=>({label:t.name[0].toUpperCase()+t.name.slice(1),set:()=>this.setState({th5:i}),style:seg(st.th5===i)}));
+
+    const greet=off?'Can’t see the main team.':(quiet?'All quiet.':(nOpen?W[nOpen]+' thing'+(nOpen>1?'s':'')+' need'+(nOpen>1?'':'s')+' you.':'That’s everything.'));
+    const greetSub=off?'Everything below is greyed and stamped. Nothing is live, and nothing you press can reach the lead until win-ws01 is back.'
+      :quiet?('Nothing needs you. '+idleN+' of '+T.rows.length+' agents are idle — that’s their resting state; they wake when the lead messages them.')
+      :(nOpen?'Stuck agents first, then oldest. A deadline only shows if someone set one.':'The lead will come back only when something needs a human.');
+    const side3=team===0&&!quiet?[{t:'dev-5 is quiet, not stuck',d:'Tests running 6m · output 40s ago · no card unless output stops for 10 min'},{t:'rev-2 is capped',d:'Codex 5-hour window full · resets 23:40 · the lead routes reviews to rev-1'}]
+      :team===0&&quiet?[{t:'WP-14 delivered',d:'rev-1 cold review: GO · merged 19:40'},{t:'Lesson published',d:'“Bounds-check a rename’s old path as a removal” · taught to dev-5, dev-6'},{t:'Qwen +4.10 € since yesterday',d:'52.30 of 100 € · projected ≈ 75 €, under the alert level'}]:[];
+
+    const kbd={fontFamily:MONO,fontSize:'10.5px',padding:'1px 6px',borderRadius:rad(5),border:'1px solid '+p.border,background:p.panel2,color:p.fg,whiteSpace:'nowrap'};
+    const allKeys=[['j / k','next / previous item'],['enter','answer with the first option'],['l','later (defer, never dismiss)'],['/','message the lead'],['1 / 2','switch team'],['t','next theme'],['?','show / hide keys'],['esc','close, or leave the composer']].map(([k,d])=>({k,d}));
+    const keyHints=[['j k','move'],['enter','answer'],['l','later'],['/','lead'],['1 2','team'],['t','theme'],['?','keys']].map(([k,d])=>({k,d}));
+    const k3=e=>{const tg=e.target; if(tg&&tg.tagName==='INPUT'){ if(e.key==='Escape'){tg.blur(); if(this._b3) this._b3.focus&&0;} return; }
+      const k=e.key, cnt=vis.length;
+      if(k==='?'){this.setState(s=>({keys3:!s.keys3}));e.preventDefault();}
+      else if(k==='Escape') this.setState({keys3:false});
+      else if(k==='t') this.setState(s=>({th5:(s.th5+1)%P5.length}));
+      else if(k==='1'||k==='2') this.setState({team3:+k-1,sel3:0});
+      else if(k==='j'||k==='ArrowDown'){e.preventDefault(); this.setState(s=>({sel3:Math.min(s.sel3+1,Math.max(0,cnt-1))}));}
+      else if(k==='k'||k==='ArrowUp'){e.preventDefault(); this.setState(s=>({sel3:Math.max(0,s.sel3-1)}));}
+      else if(k==='Enter'){const n=vis[st.sel3]; if(n&&!(n.lock&&n.lock[0])) act(n,n.opts[0]);}
+      else if(k==='l'){const n=vis[st.sel3]; if(n&&!off) later(n);}
+      else if(k==='/'){ if(this._in6&&!off){this._in6.focus(); e.preventDefault();} }};
+
+    // 3b
+    const anat=[
+      {x:80,up:true,tier:1,al:'c',col:p.warn,label:'ALERT',value:'80 €',note:'notifies · blocks nothing'},
+      {x:95,up:true,tier:2,al:'r',col:p.bad,label:'HARD CUTOFF',value:'95 €',note:'gateway refuses calls'},
+      {x:61.8,up:false,tier:1,al:'r',col:p.fg,label:'BILL ▮',value:'61.80 €',note:'as of 14:00 · hours late'},
+      {x:67.2,up:false,tier:1,al:'l',col:p.accent,label:'LEDGER · LIVE',value:'67.20 €',note:'dotted: ≈ 96 € by the 30th'},
+      {x:100,up:false,tier:2,al:'r',col:p.fg,label:'MONTHLY CAP',value:'100 €',note:'the number you watch'}];
+    const TOP={u1:64,u2:0,d1:170,d2:236}, BAR_T=128, BAR_B=156;
+    const anat3=anat.map(a=>{const tr=a.al==='c'?'translateX(-50%)':a.al==='r'?'translateX(-100%)':'none';
+      const bt=a.up?TOP['u'+a.tier]:TOP['d'+a.tier];
+      const lt=a.up?bt+56:BAR_B, lh=a.up?BAR_T-(bt+56):bt-BAR_B-2;
+      return {label:a.label,value:a.value,note:a.note,labStyle:{fontFamily:MONO,fontSize:'10.5px',fontWeight:600,letterSpacing:'.08em',color:a.col},
+        line:{position:'absolute',left:a.x+'%',width:'1px',background:a.col,top:lt+'px',height:lh+'px'},
+        box:{position:'absolute',left:a.x+'%',top:bt+'px',width:'150px',transform:tr,display:'flex',flexDirection:'column',gap:'1px',whiteSpace:'nowrap',textAlign:a.al==='c'?'center':a.al==='r'?'right':'left',alignItems:a.al==='c'?'center':a.al==='r'?'flex-end':'flex-start'}};});
+    const ab=bar(67.2,61.8,96,28,false);
+    const BS=[
+      ['NORMAL · DAY 12',30.00,27.40,75,false,p.ok,'Projected 75 € — under the alert level. Nothing to do.','live'],
+      ['TRENDING OVER · DAY 21',67.20,61.80,96,false,p.warn,'Projected past the cutoff around the 29th. The lead asks you once, with no deadline.','live'],
+      ['PAST THE ALERT',84.10,80.30,0,false,p.warn,'Alert sent at 18:02. Nothing is blocked; qwen agents keep working.','live'],
+      ['AT THE CUTOFF',95.00,92.60,0,false,p.bad,'Gateway refusing calls. dev-7 and rev-4 are paused; Claude and Codex agents carry on.','live'],
+      ['BILL AHEAD OF LEDGER',71.30,71.30,0,false,p.info,'Bill is 4.10 € above our ledger (67.20 €) — calls may be missing. The higher number is shown until they match.','bill 21:10'],
+      ['CAN’T SEE THE GATEWAY',67.20,61.80,0,true,p.dim,'Ledger last written 3h ago. Shown greyed as of 18:22 — never as live.','as of 18:22']];
+    const bstates3=BS.map(([title,l,b,pj,fr,c,status,stamp])=>({title,stamp,val:eur(l),sub:'of 100 €',status,bar:bar(l,b,pj,12,fr),
+      card:{background:p.panel,border:'1px solid '+p.border,borderRadius:r3.card,padding:'14px 16px',display:'flex',flexDirection:'column',gap:'10px'},
+      valStyle:{fontFamily:MONO,fontSize:'22px',fontWeight:600,color:fr?p.dim:p.fg},stStyle:{fontSize:'12.5px',lineHeight:1.45,color:fr?p.dim:c}}));
+    const brules3=[['The ledger is the headline','It’s written as each call happens, so it’s the live number. The bill confirms it later.'],['The bill is a tick, not a bar','Always with its own timestamp. Never added to the ledger.'],['If they disagree, show the higher','And say so. A ledger below the bill usually means missed calls.'],['Money is qwen’s capacity','Qwen rows show € today. Percent is only for Claude and Codex usage windows.']].map(([t,d])=>({t,d}));
+
+    // 3c
+    const phNeeds=(sc)=>sc==='quiet'?[]:TEAMS[0].needs.filter(n=>st.later3.indexOf(n.id)<0).slice(0,2);
+    const phones3=['busy','quiet','offline'].map(sc=>{const po=sc==='offline'; const list=phNeeds(sc); const Bx=sc==='quiet'?{l:52.30,b:49.10,p:75}:{l:67.20,b:61.80,p:96};
+      const cnt=sc==='quiet'?0:TEAMS[0].needs.filter(n=>st.later3.indexOf(n.id)<0&&!st.done3[n.id]).length;
+      return {net:po?'no signal':'5G',fresh:po?'offline · last seen 3h 12m ago':'live · updated 3s ago',freshStyle:{fontFamily:MONO,fontSize:'11px',color:po?p.warn:p.ok},
+        offline:po,calm:sc==='quiet',calmSub:'9 of 10 agents are idle — that’s normal. The lead will message you if anything changes.',
+        count:po?cnt+' · frozen':cnt,op:po?.5:1,
+        otherBadge:{fontFamily:MONO,fontSize:'10.5px',fontWeight:700,padding:'1px 6px',borderRadius:mono?'0px':'999px',background:p.warn,color:'#111111'},
+        needs:list.map(n=>{const c=toneC[n.tone], done=st.done3[n.id];
+          return {kind:n.kind,title:n.title,ev:n.ev,age:n.age,isDone:!!done,notDone:!done,done:done?'✓ Sent: '+done:'',
+            card:{padding:'14px 16px',borderRadius:r3.card,background:p.panel,border:'1px solid '+A(c,.5),display:'flex',flexDirection:'column',gap:'8px',opacity:po?.5:1},
+            kindStyle:{fontFamily:MONO,fontSize:'10.5px',fontWeight:600,letterSpacing:'.1em',color:c},
+            btns:[n.opts[0],'Later'].map((o,j)=>({label:po?(j===0?'Can’t send':'Later'):o,go:()=>{ if(po) return; if(j===0) act(n,o); else later(n); },
+              style:{flex:j===0?2:1,height:'48px',display:'flex',alignItems:'center',justifyContent:'center',borderRadius:rad(12),fontSize:'14.5px',fontWeight:600,cursor:po?'default':'pointer',background:j===0&&!po?p.accent:'transparent',color:j===0&&!po?p.accentInk:p.fg,border:'1px solid '+(j===0&&!po?p.accent:p.border),opacity:po?.6:1}}))};}),
+        bar:bar(Bx.l,Bx.b,Bx.p,10,po),bLedger:eur(Bx.l),bLine:po?'as of 18:22 · greyed':'alert 80 · cutoff 95 · bill '+eur(Bx.b)+' (14:00)',
+        leadMsg:sc==='quiet'?TEAMS[0].lead.quiet:TEAMS[0].lead.busy,leadAge:po?'as of 18:22':(sc==='quiet'?'2h ago':'just now'),replyPh:po?'Paused while offline':'Reply to the lead…',
+        tabs:[['Needs you',cnt],['Team',''],['Lead','']].map(([l,n],i)=>({label:l,n,style:{display:'flex',alignItems:'center',justifyContent:'center',gap:'6px',fontSize:'13px',fontWeight:i===0?600:500,color:i===0?p.accent:p.dim,minHeight:'48px'},badge:{display:n?'inline-flex':'none',fontFamily:MONO,fontSize:'10.5px',fontWeight:700,padding:'1px 6px',borderRadius:mono?'0px':'999px',background:p.warn,color:'#111111'}})),
+        caption:sc==='busy'?'Busy: two items, big buttons, budget at a glance':sc==='quiet'?'Quiet: one sentence, then the numbers':'Offline: says so first, greys everything, disables sending'};});
+
+    // 3d
+    const nameRules=[['Drop the runtime','Claude, Codex or Qwen moves to the avatar badge (C, X, Q).'],['Drop the project','When it matches the team on screen. In cross-team lists it stays as a prefix: shopfront/dev-1.'],['Shorten the role, keep the number','developer → dev, reviewer → rev, tester → test, architect → arch.'],['Break ties with the runtime letter','Only if two agents would get the same name: c.dev-1 and x.dev-1.']].map(([t,d],i)=>({n:i+1,t,d}));
+    const NX=[['codex-agenttalk-developer-5','agenttalk','Main team',null],['claude-agenttalk-lead','agenttalk','Main team',null],['qwen-agenttalk-reviewer-4','agenttalk','Main team',null],['claude-shopfront-developer-1','shopfront','Shopfront team',null],['claude-shopfront-developer-1','agenttalk','Cross-team list',null],['codex-agenttalk-developer-1','agenttalk','Two dev-1s on a team',['claude-agenttalk-developer-1','codex-agenttalk-developer-1']],['nightly-docs-builder-agent','agenttalk','Doesn’t fit the pattern',null]];
+    const names3=NX.map(([id,proj,ctx,pl])=>{const q=parse(id); const rt=q?q.rt:null;
+      return {full:id,short:shortName(id,proj,pl),ctx,letter:rt?RL[rt]:'?',badge:{width:'20px',height:'20px',borderRadius:'50%',background:rt?({claude:'#D08A5E',codex:'#4FB3A0',qwen:'#9E82E0'})[rt]:'#3A3D45',color:'#FFFFFF',fontFamily:"'Geist Mono',monospace",fontSize:'10px',fontWeight:700,display:'flex',alignItems:'center',justifyContent:'center'}};});
+    const AVN={midnight:'Hexagon · reads as a badge on dark glass',paper:'Rounded square · quiet, print-like',synthwave:'Star · loud enough for neon',terminal:'No image · the runtime letter in a box, on the text grid'};
+    const avatars3=P5.map(t=>{const sh=SHAPE[t.name]||null, tm=t.name==='terminal', lt=t.name==='paper'; const rtc=lt?{claude:'#B0532C',codex:'#2C7A6B',qwen:'#6D4AC0'}:{claude:'#D08A5E',codex:'#4FB3A0',qwen:'#9E82E0'};
+      return {name:t.name[0].toUpperCase()+t.name.slice(1),shape:sh||'text only',note:AVN[t.name]||'',
+        row:{display:'flex',alignItems:'center',gap:'20px',padding:'14px 16px',borderRadius:'12px',background:t.bg,border:'1px solid '+t.border},
+        nameStyle:{fontSize:'14px',fontWeight:600,color:t.fg},shapeStyle:{fontFamily:"'Geist Mono',monospace",fontSize:'11px',color:t.dim},noteStyle:{fontSize:'12px',lineHeight:1.4,color:t.dim},
+        samples:['claude','codex','qwen'].map((rt,i)=>({hasImg:!!sh,noImg:!sh,letter:RL[rt],
+          imgBg:{width:'48px',height:'48px',backgroundImage:sh?'url("new_avatars/'+sh+'/'+FILES[sh][i*3]+'.png")':'none',backgroundSize:'contain',backgroundRepeat:'no-repeat',backgroundPosition:'center'},
+          txtAv:{width:'48px',height:'48px',display:'flex',alignItems:'center',justifyContent:'center',border:'1px solid '+rtc[rt],color:rtc[rt],fontFamily:"'JetBrains Mono',monospace",fontSize:'20px',fontWeight:700},
+          badge:{position:'absolute',right:'-4px',bottom:'-4px',width:'20px',height:'20px',borderRadius:'50%',background:rtc[rt],color:'#FFFFFF',fontFamily:"'Geist Mono',monospace",fontSize:'10.5px',fontWeight:700,display:tm?'none':'flex',alignItems:'center',justifyContent:'center',border:'2px solid '+t.bg}}))};});
+    const lum=h=>{const n=parseInt(h.slice(1),16); return [(n>>16)&255,(n>>8)&255,n&255].map(v=>{v/=255; return v<=.03928?v/12.92:Math.pow((v+.055)/1.055,2.4);}).reduce((s,v,i)=>s+v*[.2126,.7152,.0722][i],0);};
+    const cr=(a,b)=>{const x=lum(a),y=lum(b); return (Math.max(x,y)+.05)/(Math.min(x,y)+.05);};
+    const PAIRS=[['ink','bg'],['ink','paper'],['mute','bg'],['hlInk','hl'],['hotInk','hot']];
+    const contrast3=this.P3.map(t=>{const cells=PAIRS.map(([f,b])=>{const r=cr(t[f],t[b]); return {v:r.toFixed(1),g:r>=4.5?'AA':r>=3?'large only':'fail',
+        sw:{width:'30px',height:'26px',flex:'none',display:'flex',alignItems:'center',justifyContent:'center',background:t[b],color:t[f],fontSize:'13px',fontWeight:700,border:'1px solid #33363E'},
+        gStyle:{fontFamily:"'Geist Mono',monospace",fontSize:'10px',color:r>=4.5?'#7CE7C4':r>=3?'#F5B83D':'#FF7A7A'}};});
+      const ok=cells.slice(0,3).every(c=>+c.v>=4.5); const bad=['body','card','meta'].filter((k,i)=>+cells[i].v<4.5);
+      return {name:t.name,cells,ok,bad,long:ok?'Yes':'No · '+bad.join(', '),longStyle:{fontSize:'12.5px',fontWeight:600,color:ok?'#7CE7C4':'#FF7A7A'}};});
+    const passing=contrast3.filter(t=>t.ok).map(t=>t.name), failing=contrast3.filter(t=>!t.ok);
+    const chipFails=contrast3.filter(t=>t.cells.slice(3).some(c=>+c.v<4.5)).map(t=>t.name);
+    const contrastNote=(passing.length?'Long text reads fine in '+passing.join(' and ')+'. ':'')+(failing.length?failing.map(t=>t.name+' fails for '+t.bad.join(' and ')+' text').join('; ')+' — darken its mute color before using it for paragraphs. ':'')+(chipFails.length?'Highlight and hot blocks in '+chipFails.join(' and ')+' are under 4.5:1, so keep them to big, bold words.':'Every highlight and hot block also passes.');
+    const live3=['Roster & health','Messages & threads','Needs-a-human queue','Gates & evidence','Risk register','Ownership map','Lessons & onboarding','Lead chat','Claude & Codex usage windows'];
+    const notyet3=[['Mission progress & ETA','Gone from every header. The lead says where things stand, in words.'],['Program stages','Stays a concept (2c). Not in the app.'],['Decision deadlines & options','Optional. With no deadline the card shows how long it’s waited; options are the lead’s quick replies.'],['Signed export','Hidden until the server can sign.'],['Qwen spend in the console','Designed (3b). Ships behind a flag once the gateway ledger is readable.'],['Both machines in one view','The switcher is designed. Until it’s supported, each team opens its own console.']].map(([what,instead])=>({what,instead}));
+
+    const Q=(tag,q,a,where,href)=>({tag,q,a,where,href,tagStyle:{fontFamily:"'Geist Mono',monospace",fontSize:'10px',fontWeight:600,letterSpacing:'.08em',color:tag[0]==='Q'?'#F5B83D':'#7CE7C4',border:'1px solid '+(tag[0]==='Q'?'rgba(245,184,61,.4)':'rgba(124,231,196,.4)'),borderRadius:'5px',padding:'2px 6px'}});
+    const answers3=[
+      Q('QUESTION 1','Is 1d the whole app? Terminal as a theme?','Yes. 1d is the app and Terminal is its fourth theme (press t). The same keys work in every theme: j/k, enter, l, /, 1–2, ?.','3a','#3a'),
+      Q('QUESTION 2','One budget: alert, cutoff, late bill?','One bar against the cap. The alert is a dashed line, the cutoff a solid line, the live ledger the fill, and the late bill a tick with its own timestamp.','3b','#3b'),
+      Q('QUESTION 3','What does a quiet day look like?','A sentence, not a dashboard: “All quiet.”, then what changed since you last looked. Idle is grey, never amber.','3a','#3a'),
+      Q('QUESTION 4','“I can’t see the team right now”','A banner saying how long it’s been. Everything is greyed and stamped “as of”, the live dots stop, and sending is paused.','3a','#3a'),
+      Q('QUESTION 5','Decisions with no deadline?','Yes, the deadline is optional. Without one the card shows how long it has waited. The queue puts stuck agents first, then oldest.','3a','#3a'),
+      Q('QUESTION 6','Avatar silhouette per theme? Show the runtime?','Midnight: hexagon. Paper: rounded square. Synthwave: star. Terminal: text only. The runtime is a C / X / Q corner badge.','3d','#3d'),
+      Q('QUESTION 7','Which Loud themes are readable?',(passing.length?passing.join(', ')+' passes for long text':'None passes for long text')+(failing.length?'; '+failing.map(t=>t.name).join(' and ')+' fail on '+Array.from(new Set(failing.flatMap(t=>t.bad))).join('/')+' text':'')+'. Measured, not eyeballed.','3d','#3d'),
+      Q('NOTE 2','Qwen: capacity as money','Qwen rows show € today instead of a percent. Claude and Codex keep their 5-hour and weekly windows with reset times.','3a','#3a'),
+      Q('NOTE 3','A phone layout','Needs you, the budget, and the lead’s latest message. Buttons are 48 px tall, one team per screen.','3c','#3c'),
+      Q('NOTE 4','Two machines, two teams','A team switcher with a needs-you count and its own freshness dot for each team. Press 1 or 2.','3a','#3a'),
+      Q('NOTE 5','A rule for shortening names','codex-agenttalk-developer-5 becomes dev-5. The runtime moves to the badge; the project is dropped when it’s the current team.','3d','#3d'),
+      Q('NOTE 6','“spec-kitty” in the header','Removed from the calm console. The header now shows the team and machine; the “7/12” mission progress is gone too.','Team Console','Team Console.dc.html'),
+      Q('NOTE','Busy can look stuck','A stuck card has to show evidence. dev-5 (tests running, output 40s ago) gets no card; dev-6 (no output 14 min, tests exited) does, with Restart.','3a','#3a'),
+      Q('NOTE','Only data that exists','Mission progress, stages, deadlines and the signed export are gone from 3a–3c. Board 3d lists what replaced each one.','3d','#3d')];
+
+    return {p5:p,f3,r3,answers3,teams3,scen3,th5Chips,off3:off,quiet3:quiet,
+      keyBtn:{...kbd,cursor:'pointer',fontSize:'12px',padding:'4px 9px'},toggleKeys:()=>this.setState(s=>({keys3:!s.keys3})),
+      warnEdge:A(p.warn,.5),warnSoft:A(p.warn,.1),overlayBg:A(p.bg,.8),
+      offMsg:'win-ws01 stopped reporting 3h 12m ago — asleep or off the network. Everything below is frozen at 18:22 and greyed, and messages can’t reach the lead.',
+      retry3:()=>this.setState({retried:true}),retryLabel:st.retried?'Still unreachable · tried 21:34':'Retry now',
+      retryStyle:{fontSize:'12.5px',fontWeight:600,padding:'7px 12px',borderRadius:rad(8),border:'1px solid '+p.warn,color:p.warn,cursor:'pointer',flex:'none'},
+      greet,greetSub,greetSize:mono?'28px':'40px',needSize:mono?'17px':'22px',
+      leadMsg:quiet?T.lead.quiet:T.lead.busy,leadAge:off?'as of 18:22':(quiet?'2h ago':'just now'),frozenOp:off?.5:1,
+      leadAv:{width:'30px',height:'30px',borderRadius:mono?'0px':'50%',flex:'none',border:'2px solid '+p.accent,display:'flex',alignItems:'center',justifyContent:'center',fontFamily:MONO,fontSize:'10px',fontWeight:600},
+      needs3,hasDeferred:deferred>0,deferredLabel:deferred+' deferred · still open, not dismissed · show',undefer:()=>this.setState({later3:[]}),
+      hasSide:side3.length>0,side3,sideTitle:quiet?'SINCE YOU LAST LOOKED · YESTERDAY 22:10':'ALSO HAPPENING · NOT FOR YOU',
+      chat3:off?[]:st.chat3.map(m=>({isYou:m.who==='you',isLead:m.who==='lead',body:m.body})),
+      s6Ref:this._s6r||(this._s6r=el=>{this._s6=el;}),in6Ref:this._i6r||(this._i6r=el=>{this._in6=el;}),
+      draft6:st.draft6,onDraft6:e=>this.setState({draft6:e.target.value}),
+      keyDraft6:e=>{ if(e.key==='Enter') this.send6(st.draft6); if(e.key==='Escape') e.target.blur(); },
+      send6:()=>this.send6(st.draft6),composerOp:off?.5:1,
+      composerPh:off?'Paused — the lead can’t receive while win-ws01 is offline':'Message the lead   ( / )',
+      qwenMark:{width:'18px',height:'18px',borderRadius:mono?'0px':'50%',background:RT.qwen,color:'#FFFFFF',fontFamily:MONO,fontSize:'10px',fontWeight:700,display:'flex',alignItems:'center',justifyContent:'center'},
+      bStamp:off?'as of 18:22':'live · ledger',bLedger:eur(B.l),rb,bLegend,usage3,
+      roster3,rosterN:T.rows.length,rosterSum:off?'frozen · as of 18:22':(idleN+' idle · that’s normal'),
+      kbd,keyHints,allKeys,k3,keys3:st.keys3,
+      ab,anat3,bstates3,brules3,phones3,nameRules,names3,avatars3,contrast3,contrastNote,live3,notyet3};
+  }
+  renderVals(){
+    const st=this.state, now=st.now, el=(now-this.t0)/1000;
+    const hms=ts=>new Date(ts).toLocaleTimeString('en-GB',{hour12:false});
+    const agents=this.agents.map(a=>(a.id==='claude-arch'&&st.archOk)?{...a,state:'working',task:'Resumed WP-09 with context',_rec:true}:a);
+    const age=a=>a._rec?(now-(this.recAt||now))/1000:a.hb+el;
+    const attn=this.attnAll.filter(a=>st.dismissed.indexOf(a.id)<0);
+    const nBusy=agents.filter(a=>a.state==='working'||a.state==='quiet').length;
+    const nNeed=attn.length;
+    const leads=st.stream.filter(m=>m.type==='lead');
+    const lastLead=leads.length?leads[leads.length-1].body:'';
+    const leadLine=st.typing?'claude-lead is typing…':lastLead;
+    const chipsFor=(idx,pal,key,mk)=>pal.map((p,i)=>({label:p.name,set:()=>this.setState({[key]:i}),style:mk(i===idx)}));
+    const kmap={working:'ok',quiet:'info',idle:'dim',stuck:'warn',limited:'bad'};
+
+    // 1a
+    const p1=this.P1[st.th1];
+    const c1={working:p1.fg,quiet:p1.info,idle:p1.dim,stuck:p1.warn,limited:p1.bad};
+    const lab1={working:'WORKING',quiet:'QUIET',idle:'IDLE',stuck:'STUCK?',limited:'CAPPED'};
+    const g1={working:'●',quiet:'◐',idle:'○',stuck:'▲',limited:'■'};
+    const bar=v=>{const f=Math.round(v/20);return '▮'.repeat(f)+'▯'.repeat(5-f)+' '+String(v).padStart(2,' ');};
+    const thr1=v=>v>=85?p1.bad:v>=60?p1.warn:p1.fg;
+    const r1=agents.map(a=>{
+      const sel=a.id===st.sel1, c=c1[a.state], ink=p1.selInk;
+      return {id:a.id,role:a.role,label:lab1[a.state],task:a.task,rateBar:bar(a.rate),ctxBar:bar(a.ctx),glyph:g1[a.state],
+        pick:()=>this.setState({sel1:a.id}),
+        style:{display:'grid',gridTemplateColumns:'22px 108px 76px minmax(0,1fr) 84px 84px',gap:'0 10px',alignItems:'center',padding:'6px 14px',cursor:'pointer',background:sel?p1.fg:'transparent',color:sel?ink:p1.fg,textShadow:sel?'none':'inherit'},
+        dotStyle:{color:sel?ink:c,textShadow:sel?'none':'0 0 8px '+c,animation:a.state==='working'?'pulse 1.8s ease-in-out infinite':'none'},
+        dimStyle:{color:sel?ink:p1.dim},stStyle:{color:sel?ink:c,fontWeight:700},
+        rateStyle:{color:sel?ink:thr1(a.rate),whiteSpace:'pre',letterSpacing:'-1px'},
+        ctxStyle:{color:sel?ink:thr1(a.ctx),whiteSpace:'pre',letterSpacing:'-1px'}};
+    });
+    const s1=agents.find(a=>a.id===st.sel1)||agents[0];
+    const d1={id:s1.id,label:lab1[s1.state],stStyle:{color:c1[s1.state],fontWeight:700},task:s1.task,peer:s1.peer,cli:s1.cli,hb:this.fmt(age(s1))+' ago'};
+    const kc1=k=>({'review-result':p1.hot,escalate:p1.bad,wake:p1.info,reply:p1.hot,message:p1.hot,broadcast:p1.info,'review-request':p1.warn}[k]||p1.dim);
+    const bus1=st.bus.slice(0,8).reverse().map(b=>({time:hms(b.t),from:b.from,to:b.to,kind:b.kind,subj:b.subj,kindStyle:{color:kc1(b.kind)},
+      style:{display:'grid',gridTemplateColumns:'64px minmax(0,1fr)',gap:'10px',padding:'4px 14px',background:b.fresh?p1.line:'transparent'}}));
+    const attn1=attn.map((a,i)=>({title:a.title,meta:a.meta,key:'['+(i+1)+'] '+a.actLabel.toLowerCase(),act:()=>{this.send(a.act);},
+      sevStyle:{color:a.sev==='bad'?p1.bad:p1.warn,fontWeight:700,textShadow:'0 0 8px '+(a.sev==='bad'?p1.bad:p1.warn)}}));
+
+    // 1b
+    const p2=this.P2[st.th2];
+    const c2={working:p2.ok,quiet:p2.info,idle:p2.dim,stuck:p2.warn,limited:p2.bad};
+    const lab2={working:'working',quiet:'thinking',idle:'waiting',stuck:'stuck',limited:'rate-capped'};
+    const pos={};
+    agents.forEach((a,i)=>{const an=(-90+i*45)*Math.PI/180; pos[a.id]={x:Math.round(300+250*Math.cos(an)),y:Math.round(300+250*Math.sin(an))};});
+    const n2=agents.map(a=>{
+      const sel=a.id===st.sel2, c=c2[a.state], sz=sel?70:60, p=pos[a.id];
+      return {ini:a.ini,name:a.id,stLabel:lab2[a.state],pick:()=>this.setState({sel2:a.id}),
+        wrap:{position:'absolute',left:p.x+'px',top:p.y+'px',transform:'translate(-50%,-50%)',display:'flex',flexDirection:'column',alignItems:'center',gap:'6px',cursor:'pointer',width:'130px'},
+        orb:{width:sz+'px',height:sz+'px',borderRadius:'50%',background:p2.node,border:'2px solid '+c,boxShadow:(a.state==='working'?'0 0 28px '+this.hexA(c,.55):'0 0 0 rgba(0,0,0,0)')+(sel?', 0 0 0 7px '+this.hexA(p2.accent,.22):''),display:'flex',alignItems:'center',justifyContent:'center',fontWeight:600,fontSize:'14px',color:p2.fg,transition:'all .25s'},
+        stStyle:{fontSize:'10.5px',color:c}};
+    });
+    const pairs=[['claude-dev','codex-rev',true],['codex-dev','claude-rev',false],['codex-infra','claude-lead',false],['codex-test','claude-lead',false],['claude-arch','codex-rev',false]];
+    const edges2=pairs.map(([a,b,hot])=>({x1:pos[a].x,y1:pos[a].y,x2:pos[b].x,y2:pos[b].y,
+      style:hot?{stroke:p2.accent2,strokeWidth:'2',strokeDasharray:'4 8',animation:'dash 1s linear infinite',opacity:.9}:{stroke:p2.accent,strokeWidth:'1.2',opacity:.35}}));
+    const coreStyle={position:'absolute',left:'212px',top:'212px',width:'176px',height:'176px',borderRadius:'50%',padding:'7px',background:'conic-gradient('+p2.accent+' 0deg 210deg, '+p2.track+' 210deg 360deg)',boxShadow:'0 0 80px '+p2.glow};
+    const s2=agents.find(a=>a.id===st.sel2)||agents[0], cs2=c2[s2.state];
+    const gradBar=v=>({width:v+'%',height:'100%',borderRadius:'3px',background:'linear-gradient(90deg,'+p2.accent+','+p2.accent2+')'});
+    const d2={name:s2.id,stLabel:lab2[s2.state],cli:s2.cli,task:s2.task,rate:s2.rate,ctx:s2.ctx,peer:s2.peer,hb:this.fmt(age(s2)),
+      stChip:{fontSize:'11px',color:cs2,background:this.hexA(cs2,.14),border:'1px solid '+this.hexA(cs2,.35),borderRadius:'999px',padding:'3px 10px'},
+      cliChip:{fontSize:'11px',color:p2.dim,border:'1px solid '+p2.border,borderRadius:'999px',padding:'3px 10px'},
+      rateBar:gradBar(s2.rate),ctxBar:gradBar(s2.ctx),
+      msg:()=>this.setState({draft2:'What is '+s2.id+' blocked on?'})};
+    const kc2=k=>({'review-result':p2.ok,escalate:p2.bad,wake:p2.accent2,reply:p2.accent,message:p2.accent,'review-request':p2.warn}[k]||p2.dim);
+    const feed2=st.bus.slice(0,4).map(b=>({fromTo:b.from+' → '+b.to,subj:b.subj,dot:{width:'7px',height:'7px',borderRadius:'50%',flex:'none',marginTop:'4px',background:kc2(b.kind),boxShadow:'0 0 8px '+kc2(b.kind)}}));
+    const attn2=attn.map(a=>({src:a.src,title:a.title,meta:a.meta,actLabel:a.actLabel,act:()=>this.send(a.act),later:()=>this.dismiss(a.id),
+      dot:{width:'7px',height:'7px',borderRadius:'50%',background:a.sev==='bad'?p2.bad:p2.warn,boxShadow:'0 0 10px '+(a.sev==='bad'?p2.bad:p2.warn)}}));
+
+    // 1c
+    const p3=this.P3[st.th3];
+    const lab3={working:'BUSY',quiet:'THINKING',idle:'WAITING',stuck:'STUCK',limited:'CAPPED'};
+    const thr3=v=>v>=85?p3.hot:v>=60?p3.hl:p3.ink;
+    const big={fontWeight:900,fontSize:'30px',lineHeight:1,letterSpacing:'-.02em',alignSelf:'flex-start'};
+    const tiles3=agents.map(a=>{
+      let stS;
+      if(a.state==='stuck'||a.state==='limited') stS={...big,background:p3.hot,color:p3.hotInk,padding:'2px 6px'};
+      else if(a.state==='working') stS={...big,color:p3.ink,boxShadow:'inset 0 -11px 0 '+p3.hl};
+      else if(a.state==='quiet') stS={...big,fontStyle:'italic',color:p3.ink};
+      else stS={...big,color:p3.mute};
+      return {name:a.id,cli:a.cli.toUpperCase(),task:a.task,stLabel:lab3[a.state],stStyle:stS,
+        tile:{background:p3.paper,border:'2px solid '+p3.ink,boxShadow:'5px 5px 0 '+p3.ink,padding:'13px 14px',display:'flex',flexDirection:'column',gap:'8px',cursor:'pointer',transition:'transform .12s, box-shadow .12s',minHeight:0,overflow:'hidden'},
+        hover:{transform:'translate(-2px,-2px)',boxShadow:'8px 8px 0 '+p3.ink},
+        cliStyle:{fontFamily:"'Space Mono',monospace",fontSize:'10px',fontWeight:700,border:'1.5px solid '+p3.ink,borderRadius:'999px',padding:'1px 8px',transform:'rotate(-4deg)',background:a.cli==='claude'?p3.hl:'transparent',color:a.cli==='claude'?p3.hlInk:p3.ink},
+        rateFill:{width:a.rate+'%',height:'100%',background:thr3(a.rate)},ctxFill:{width:a.ctx+'%',height:'100%',background:thr3(a.ctx)}};
+    });
+    const attn3=attn.map(a=>({src:a.src,title:a.title.toUpperCase(),actLabel:a.actLabel.toUpperCase(),act:()=>this.send(a.act),later:()=>this.dismiss(a.id)}));
+    const tk=st.bus.map(b=>({text:(b.from+' → '+b.to+' · '+b.kind+' · '+b.subj).toUpperCase()}));
+    const ticker3=[...tk,...tk];
+
+    // 1d
+    const p4=this.P4[st.th4];
+    const c4={working:p4.ok,quiet:p4.info,idle:p4.dim,stuck:p4.warn,limited:p4.bad};
+    const lab4={working:'working',quiet:'thinking',idle:'waiting',stuck:'stuck',limited:'capped'};
+    const pres4=agents.map(a=>{const c=c4[a.state]; return {ini:a.ini,name:a.id.replace('claude-','cl-').replace('codex-','cx-'),st:lab4[a.state],
+      av:{width:'44px',height:'44px',borderRadius:'50%',background:p4.panel2,border:'2px solid '+c,boxShadow:a.state==='working'?'0 0 0 4px '+this.hexA(c,.2):'none',display:'flex',alignItems:'center',justifyContent:'center',fontFamily:"'Geist Mono',monospace",fontSize:'12px',fontWeight:600,color:p4.fg,animation:a.state==='working'?'pulse 2.4s ease-in-out infinite':'none'},
+      nameStyle:{fontFamily:"'Geist Mono',monospace",fontSize:'10.5px',color:a.role==='lead'?p4.accent:p4.fg,fontWeight:a.role==='lead'?600:400},
+      stStyle:{fontSize:'10px',color:c}};});
+    const pill=(fill)=>({fontSize:'12px',fontWeight:500,padding:'6px 12px',borderRadius:'999px',cursor:'pointer',whiteSpace:'nowrap',background:fill?p4.accent:'transparent',color:fill?p4.accentInk:p4.fg,border:'1px solid '+(fill?p4.accent:p4.border)});
+    const toneC={ok:p4.ok,bad:p4.bad,warn:p4.warn};
+    const glyph={ok:'✓',bad:'‖',warn:'!'};
+    const stream4=st.stream.map(m=>{
+      const quick=(m.quick||[]).map((q,i)=>{const label=Array.isArray(q)?q[0]:q, text=Array.isArray(q)?q[1]:q; return {label,go:()=>this.send(text),style:pill(i===0)};});
+      const tc=toneC[m.tone]||p4.dim;
+      return {isLead:m.type==='lead',isYou:m.type==='you',isEvent:m.type==='event',body:m.body,title:m.title,meta:m.meta,quick,glyph:glyph[m.tone]||'•',
+        icon:{width:'30px',height:'30px',borderRadius:'10px',flex:'none',background:this.hexA(tc,.16),color:tc,display:'flex',alignItems:'center',justifyContent:'center',fontSize:'14px',fontWeight:700}};
+    });
+    const cmds4=['/status','/approve m-4.2','/restart claude-arch','/reassign WP-11'].map(c=>({label:c,go:()=>this.send(c),style:{fontFamily:"'Geist Mono',monospace",fontSize:'11.5px',padding:'5px 10px',borderRadius:'8px',cursor:'pointer',border:'1px solid '+p4.border,color:p4.dim,background:p4.panel}}));
+    const wp4=Array.from({length:12},(_,i)=>({style:{height:'10px',borderRadius:'3px',background:i<6?p4.ok:i===6?p4.accent:p4.border,animation:i===6?'pulse 1.6s ease-in-out infinite':'none'}}));
+    const now4=agents.map(a=>{const c=c4[a.state]; return {name:a.id,st:lab4[a.state],task:a.task,stStyle:{fontSize:'10.5px',color:c},
+      dot:{width:'8px',height:'8px',borderRadius:'50%',background:c,flex:'none',marginTop:'5px'},bar:{width:a.rate+'%',height:'100%',background:c}};});
+
+    const sets=[0,1,2].map(i=>({label:[this.P1[i].name,this.P2[i].name,this.P3[i].name,this.P4[i].name].join(' · '),set:()=>this.setState({th1:i,th2:i,th3:i,th4:i}),
+      style:{fontFamily:"'Geist Mono',monospace",fontSize:'12px',padding:'8px 13px',borderRadius:'9px',cursor:'pointer',border:'1px solid '+((st.th1===i&&st.th2===i&&st.th3===i&&st.th4===i)?'#E8E9ED':'#34363D'),background:(st.th1===i&&st.th2===i&&st.th3===i&&st.th4===i)?'#E8E9ED':'transparent',color:(st.th1===i&&st.th2===i&&st.th3===i&&st.th4===i)?'#0B0C0F':'#B4B7BF'}}));
+
+    // ---- Turn 2 ----
+    const T2={};
+    const actions=this.props.actions===true, live=this.props.live!==false;
+    T2.modeChips=[['Read-only (default)',false],['Actions enabled',true]].map(([l,v])=>({label:l,set:()=>{},style:{fontFamily:"'Geist Mono',monospace",fontSize:'12px',padding:'8px 13px',borderRadius:'9px',border:'1px solid '+(actions===v?'#E8E9ED':'#34363D'),background:actions===v?'#E8E9ED':'transparent',color:actions===v?'#0B0C0F':'#8B8F98'}}));
+    T2.modeShort=actions?'ACTIONS · loopback operator':'READ-ONLY · act via CLI';
+    T2.freshLabel=live?'current':'stale';
+    T2.snapAge=live?(((now/1000)%2).toFixed(1)+'s ago'):'polling paused';
+    const G=[
+      ['REPO VIEW','Gates & evidence wall','Gates view ships; Turn 1 only hinted at HOLD inside the queue.','2a','#2a'],
+      ['REPO CLI','Close verdict & sign-offs','close check aggregates gates + typed evidence; sign-offs by risk class.','2a','#2a'],
+      ['REPO CLI','Waivers with expiry','Operator waivers are recorded with reasons and expiry — never silent.','2a','#2a'],
+      ['REPO CLI','Breakers & dead letters','commit-gate breakers and poison quarantine had no home.','2a','#2a'],
+      ['PROPOSAL #4','Lane & delivery ledger','The biggest recorded-but-unshown gap: stage, worktree, reject→fix history.','2b','#2b'],
+      ['REPO VIEW','Ownership map','domains.json owners, reviewers and shared paths as a real view.','2b','#2b'],
+      ['PROPOSAL §7','Program stages','assessed → … → cutover-ready: evidence-backed, no early victory.','2c','#2c'],
+      ['REPO VIEW','Risk register & export','Risk register ships; static signed briefing is the client deliverable.','2c','#2c'],
+      ['REPO CLI','Lead work orders','task kind: accepted / declined / done replies from each agent.','2d','#2d'],
+      ['PROPOSAL §7','Decision Center','Human queue upgraded: decision, options, impact, owner, deadline.','2d','#2d'],
+      ['REPO VIEW','Learning & onboarding','Lessons taught to agents; blocking unknowns from the onboarding ledger.','2d','#2d'],
+      ['REPO VIEW','Projects, freshness, roster scope','Multi-root switcher, snapshot current/stale, active run vs all roster, capacity confidence, read-only mode.','all','#2d']
+    ];
+    T2.gaps=G.map(([src,title,why,where,href])=>({src,title,why,where,href,srcStyle:{fontFamily:"'Geist Mono',monospace",fontSize:'10px',fontWeight:600,letterSpacing:'.08em',color:src.indexOf('PROPOSAL')===0?'#F5B83D':'#7CE7C4',border:'1px solid '+(src.indexOf('PROPOSAL')===0?'rgba(245,184,61,.4)':'rgba(124,231,196,.4)'),borderRadius:'5px',padding:'2px 6px'}}));
+    const projChips=(mk)=>this.projects.map((p,i)=>({label:p.label,set:()=>this.setState({proj:i}),style:mk(i===st.proj)}));
+    // 2a
+    const gs=this.gates.map(g=>({...g,state:st.gateOver[g.id]||g.state,expires:st.gateOver[g.id]?'in 7d 0h':g.expires}));
+    const gc={GO:p1.fg,HOLD:p1.bad,WAIVED:p1.warn}, gg={GO:'●',HOLD:'■',WAIVED:'~'};
+    T2.gates1=gs.map(g=>{const sel=g.id===st.selGate, ink=p1.selInk; return {name:g.name,scope:g.scope,state:g.state,evidence:g.evidence,verifier:g.verifier,glyph:gg[g.state],
+      pick:()=>this.setState({selGate:g.id}),
+      style:{display:'grid',gridTemplateColumns:'22px 130px 70px 72px minmax(0,1fr) 96px',gap:'0 10px',alignItems:'center',padding:'6px 14px',cursor:'pointer',background:sel?p1.fg:'transparent',color:sel?ink:p1.fg,textShadow:sel?'none':'inherit'},
+      glyphStyle:{color:sel?ink:gc[g.state]},stStyle:{color:sel?ink:gc[g.state],fontWeight:700},dimStyle:{color:sel?ink:p1.dim}};});
+    const holdN=gs.filter(g=>g.state==='HOLD').length;
+    T2.gateCount=gs.length+' gates'; T2.holdCount=holdN;
+    T2.closeVerdict=holdN?'HOLD':'GO'; T2.closeExit=holdN?3:0;
+    T2.closeLine=holdN?p1.bad:p1.fg;
+    T2.closeBig={fontSize:'44px',fontWeight:700,letterSpacing:'-.02em',color:holdN?p1.bad:p1.fg,textShadow:'0 0 18px '+(holdN?p1.bad:p1.fg)};
+    T2.closeLine1=holdN?(holdN+' blocking gate'+(holdN>1?'s':'')+' without evidence or waiver'):'all gates GO or waived · sign-offs pending';
+    T2.closeLine2='reviews: 2 approved (both on final SHA) · waivers: '+gs.filter(g=>g.state==='WAIVED').length;
+    const sg=gs.find(g=>g.id===st.selGate)||gs[0];
+    const canWaive=actions&&sg.state==='HOLD';
+    T2.g1={name:sg.name,state:sg.state,evidence:sg.evidence,verifier:sg.verifier,expires:sg.expires,stStyle:{color:gc[sg.state],fontWeight:700},
+      waiveLabel:sg.state!=='HOLD'?'waive — not needed':(actions?'waive as operator (7d)':'waive — read-only · run agenttalk gate waive'),
+      waive:()=>{ if(canWaive) this.setState(s=>({gateOver:{...s.gateOver,[sg.id]:'WAIVED'}})); },
+      waiveStyle:{color:canWaive?p1.hot:p1.dim,cursor:canWaive?'pointer':'default',textDecoration:canWaive?'none':'line-through'}};
+    T2.waivers1=gs.filter(g=>g.state==='WAIVED').map(g=>{const d=g.expires.indexOf('4d')>=0?4:7; return {name:g.name,reason:g.evidence,expires:g.expires,bar:'['+'▮'.repeat(d)+'▯'.repeat(7-d)+']',expStyle:{color:d<=4?p1.warn:p1.dim,fontSize:'11px'}};});
+    T2.waiverCount=T2.waivers1.length;
+    T2.signoffs1=[['security','codex-rev · approved',true],['data','claude-rev · approved',true],['release','operator · pending',false],['perf','n/a · risk class low',null]].map(([c,w,ok])=>({cls:c,who:w,mark:ok===true?'✓':ok===false?'·':'–',mStyle:{color:ok===true?p1.fg:ok===false?p1.warn:p1.dim}}));
+    T2.proj1=projChips(on=>({cursor:'pointer',padding:'1px 7px',background:on?p1.fg:'transparent',color:on?p1.selInk:p1.dim,textShadow:'none'}));
+    T2.fresh1Style={color:live?p1.fg:p1.warn};
+    T2.mode1Style={color:actions?p1.warn:p1.dim,border:'1px solid '+(actions?p1.warn:p1.line),padding:'1px 7px'};
+    // 2b
+    T2.proj2=projChips(on=>({cursor:'pointer',fontSize:'11.5px',fontWeight:500,padding:'5px 11px',borderRadius:'999px',background:on?p2.fg:'transparent',color:on?p2.bg:p2.dim}));
+    T2.fresh2Style={fontSize:'12px',color:live?p2.ok:p2.warn};
+    const lanes=this.lanes.map(l=>st.delivered[l.id]?{...l,stage:Math.max(l.stage,2)}:l);
+    const hc={R:p2.bad,F:p2.warn,A:p2.ok};
+    T2.lanes2=lanes.map(l=>{const sel=l.id===st.selLane, blocked=!!l.hold; const c=blocked?p2.warn:p2.accent;
+      return {id:l.id,owner:l.owner,ini:l.ini,cycle:l.cycle,hold:blocked?'HOLD':'',pick:()=>this.setState({selLane:l.id}),
+        row:{display:'grid',gridTemplateColumns:'90px 150px minmax(0,1fr) 150px 96px',gap:'14px',alignItems:'center',padding:'13px 12px',margin:'0 -12px',borderRadius:'14px',cursor:'pointer',background:sel?this.hexA(p2.accent,.12):'transparent',border:'1px solid '+(sel?this.hexA(p2.accent,.35):'transparent')},
+        orb:{width:'28px',height:'28px',borderRadius:'50%',background:p2.node,border:'2px solid '+p2.accent,display:'flex',alignItems:'center',justifyContent:'center',fontSize:'10px',fontWeight:600},
+        track:[0,1,2,3].map(i=>({line:{display:i===0?'none':'block',width:'44px',height:'2px',background:i<=l.stage?c:p2.track},node:{width:i===l.stage?'16px':'11px',height:i===l.stage?'16px':'11px',borderRadius:'50%',flex:'none',background:i<=l.stage?c:'transparent',border:'2px solid '+(i<=l.stage?c:p2.track),boxShadow:i===l.stage?'0 0 14px '+c:'none'}})),
+        holdStyle:{marginLeft:'12px',fontSize:'10.5px',fontWeight:600,letterSpacing:'.1em',color:p2.warn},
+        hist:(l.hist.length?l.hist:['—']).map(h=>({t:h,style:{width:'24px',height:'24px',borderRadius:'50%',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'10.5px',fontWeight:600,background:hc[h]?this.hexA(hc[h],.18):'transparent',color:hc[h]||p2.dim,border:'1px solid '+(hc[h]?this.hexA(hc[h],.5):p2.border)}}))};});
+    const sl=lanes.find(l=>l.id===st.selLane)||lanes[0];
+    const lblocked=!!sl.hold, canDeliver=actions&&!lblocked&&sl.stage<2;
+    T2.ld={id:sl.id,domain:sl.domain,wt:'.agenttalk/worktrees/'+sl.id,base:'4e74e0e',rev:sl.rev,verdict:lblocked?'HOLD':'GO',
+      reason:lblocked?sl.hold:(sl.stage>=2?'Delivered — diff in bounds, merge check clean.':'In bounds · no overlap with other active lanes · merge clean.'),
+      verdictStyle:{fontSize:'22px',fontWeight:700,color:lblocked?p2.warn:p2.ok,textShadow:'0 0 18px '+(lblocked?p2.warn:p2.ok)},
+      deliverLabel:sl.stage>=2?'Delivered':(lblocked?'Blocked':(actions?'Deliver':'Deliver · CLI only')),
+      deliver:()=>{ if(canDeliver) this.setState(s=>({delivered:{...s.delivered,[sl.id]:true}})); },
+      deliverStyle:{flex:1,textAlign:'center',fontSize:'12.5px',fontWeight:600,padding:'9px 0',borderRadius:'999px',cursor:canDeliver?'pointer':'default',background:canDeliver?p2.accent:'transparent',color:canDeliver?p2.bg:p2.dim,border:'1px solid '+(canDeliver?p2.accent:p2.border)}};
+    T2.domains2=this.domains.map(d=>({...d,shared:d.shared?'SHARED':'',sharedStyle:{fontSize:'10px',fontWeight:600,letterSpacing:'.1em',color:p2.warn}}));
+    // 2c
+    T2.proj3=projChips(on=>({cursor:'pointer',fontFamily:"'Space Mono',monospace",fontSize:'12px',fontWeight:700,padding:'2px 8px',border:'2px solid '+p3.ink,background:on?p3.ink:'transparent',color:on?p3.bg:p3.ink}));
+    const S=[['Assessed','done','comprehension scan · 212 features'],['Plan approved','done','operator · 09-02'],['Reimplemented','done','12/12 lanes delivered'],['Parity verified','done','39/41 behaviours measured'],['Acceptance-ready','part','bar green · cold sweep open'],['Cutover-ready','no','never rehearsed'],['Decommissioned','no','—']];
+    T2.stages3=S.map(([n,s,p],i)=>({n:'0'+(i+1),name:n,proof:p,mark:s==='done'?'✓ PROVEN':s==='part'?'◐ PARTIAL':'✗ NOT YET',
+      box:{border:'2px solid '+p3.ink,padding:'10px 10px 12px',display:'flex',flexDirection:'column',gap:'6px',background:s==='done'?p3.paper:s==='part'?p3.hl:'transparent',color:s==='part'?p3.hlInk:p3.ink,boxShadow:s==='no'?'none':'4px 4px 0 '+p3.ink,opacity:s==='no'?.7:1},
+      markStyle:{fontFamily:"'Space Mono',monospace",fontSize:'11px',fontWeight:700,color:s==='no'?p3.hot:'inherit'}}));
+    T2.risks3=this.risks.map(r=>{const acc=st.riskAcc.indexOf(r.id)>=0, can=actions&&!acc;
+      return {sev:r.sev,src:r.src,title:r.title,owner:r.owner,age:r.age,state:acc?'ACCEPTED · EXPIRES 7D':'OPEN',
+        btnLabel:acc?'✓ RISK ACCEPTED':(actions?'ACCEPT RISK · 7D':'ACCEPT · CLI ONLY'),
+        act:()=>{ if(can) this.setState(s=>({riskAcc:[...s.riskAcc,r.id]})); },
+        card:{background:p3.paper,border:'2px solid '+p3.ink,boxShadow:'5px 5px 0 '+p3.ink,padding:'12px 14px',display:'flex',flexDirection:'column',gap:'8px',opacity:acc?.6:1},
+        sevStyle:{fontFamily:"'Space Mono',monospace",fontSize:'10px',fontWeight:700,padding:'2px 7px',background:r.sev==='HIGH'?p3.hot:p3.hl,color:r.sev==='HIGH'?p3.hotInk:p3.hlInk},
+        btn:{alignSelf:'flex-start',fontFamily:"'Space Mono',monospace",fontSize:'10.5px',fontWeight:700,padding:'5px 10px',border:'2px solid '+p3.ink,cursor:can?'pointer':'default',background:can?p3.ink:'transparent',color:can?p3.bg:p3.mute}};});
+    T2.proof3=[['41','behaviours in the baseline register'],['39','measured at base & candidate'],['6','gates · 2 still HOLD'],['1','waiver expiring in 4d']].map(([v,k])=>({v,k}));
+    T2.exportLabel=st.exported?'✓ BRIEFING-2026-09-25.HTML':'EXPORT SIGNED BRIEFING →';
+    T2.exportGo=()=>this.setState({exported:true});
+    T2.exportStyle={fontWeight:900,fontSize:'18px',letterSpacing:'-.01em',padding:'14px 16px',border:'2px solid '+p3.ink,boxShadow:'5px 5px 0 '+p3.ink,background:st.exported?p3.paper:p3.hl,color:st.exported?p3.ink:p3.hlInk,cursor:'pointer',textAlign:'center'};
+    // 2d
+    T2.proj4=projChips(on=>({cursor:'pointer',fontSize:'12px',fontWeight:500,padding:'5px 11px',borderRadius:'7px',background:on?p4.fg:'transparent',color:on?p4.bg:p4.dim}));
+    T2.mode4Style={fontFamily:"'Geist Mono',monospace",fontSize:'11px',padding:'5px 9px',borderRadius:'7px',border:'1px solid '+(actions?p4.warn:p4.border),color:actions?p4.warn:p4.dim};
+    const tsc={accepted:p4.info,done:p4.ok,declined:p4.bad,pending:p4.warn};
+    T2.stream5=st.stream2.map(m=>{
+      const o={isLead:m.type==='lead',isYou:m.type==='you',isTask:m.type==='task',isDecision:m.type==='decision',isLesson:m.type==='lesson',isUnknown:m.type==='unknown',
+        body:m.body,title:m.title,to:m.to,status:m.status,impact:m.impact,deadline:m.deadline,domain:m.domain,who:m.who,seg:m.seg};
+      if(m.type==='task') o.stStyle={fontFamily:"'Geist Mono',monospace",fontSize:'11px',fontWeight:600,color:tsc[m.status],background:this.hexA(tsc[m.status],.14),borderRadius:'999px',padding:'3px 10px'};
+      if(m.type==='decision'){ o.edge=st.decided?p4.border:p4.warn; o.opts=m.opts.map((x,i)=>{const ch=st.decided===x; return {label:ch?'✓ '+x:x,go:()=>{ if(!st.decided){ this.setState({decided:x}); this.send5(x); } },style:{fontSize:'12.5px',fontWeight:500,padding:'8px 14px',borderRadius:'999px',cursor:st.decided?'default':'pointer',background:ch||(!st.decided&&i===0)?p4.accent:'transparent',color:ch||(!st.decided&&i===0)?p4.accentInk:(st.decided?p4.dim:p4.fg),border:'1px solid '+(ch||(!st.decided&&i===0)?p4.accent:p4.border)}};}); }
+      if(m.type==='unknown'){ o.ansLabel=st.answered?'✓ answered':'Answer'; o.answer=()=>{ if(!st.answered){ this.setState({answered:true}); this.send5('Yes — the nightly job writes the ledger table directly.'); } };
+        o.ansStyle={fontSize:'12px',fontWeight:500,padding:'6px 12px',borderRadius:'999px',cursor:st.answered?'default':'pointer',border:'1px solid '+p4.border,color:st.answered?p4.ok:p4.fg}; }
+      return o;
+    });
+    T2.typing2=st.typing2;
+    T2.draft5=st.draft5; T2.onDraft5=e=>this.setState({draft5:e.target.value});
+    T2.keyDraft5=e=>{ if(e.key==='Enter'){ this.send5(st.draft5); this.setState({draft5:''}); } };
+    T2.send5=()=>{ this.send5(st.draft5); this.setState({draft5:''}); };
+    T2.stream5Ref=el=>{ this._s5=el; if(el) el.scrollTop=el.scrollHeight; };
+    T2.fresh4Dot={width:'8px',height:'8px',borderRadius:'50%',background:live?p4.ok:p4.warn,animation:live?'pulse 2s ease-in-out infinite':'none'};
+    T2.rosterChips=[['active','Active run · '+agents.length],['all','All roster · '+(agents.length+this.retired.length)]].map(([k,l])=>({label:l,set:()=>this.setState({roster:k}),style:{flex:1,textAlign:'center',cursor:'pointer',fontSize:'11.5px',fontWeight:500,padding:'5px 0',borderRadius:'7px',background:st.roster===k?p4.fg:'transparent',color:st.roster===k?p4.bg:p4.dim}}));
+    const capOf=a=>a.id==='codex-infra'?['98%','fresh']:a.id==='claude-arch'?['93%~','stale']:a.id==='codex-dev'?['?','unknown']:[a.ctx+'%','fresh'];
+    const rows5=agents.map(a=>{const c=c4[a.state], [cv,cf]=capOf(a); return {name:a.id,ini:a.ini,st:lab4[a.state],
+      row:{display:'flex',alignItems:'center',gap:'10px'},
+      av:{width:'30px',height:'30px',borderRadius:'50%',flex:'none',background:p4.panel2,border:'2px solid '+c,display:'flex',alignItems:'center',justifyContent:'center',fontFamily:"'Geist Mono',monospace",fontSize:'10px',fontWeight:600},
+      stStyle:{fontSize:'10.5px',color:c},cap:cv,capStyle:{fontFamily:"'Geist Mono',monospace",fontSize:'11px',color:cf==='fresh'?p4.fg:cf==='stale'?p4.warn:p4.dim}};});
+    const ret5=this.retired.map(r=>({name:r.id,ini:r.ini,st:'retired · tombstoned',row:{display:'flex',alignItems:'center',gap:'10px',opacity:.45},
+      av:{width:'30px',height:'30px',borderRadius:'50%',flex:'none',border:'2px dashed '+p4.dim,display:'flex',alignItems:'center',justifyContent:'center',fontFamily:"'Geist Mono',monospace",fontSize:'10px',fontWeight:600},
+      stStyle:{fontSize:'10.5px',color:p4.dim},cap:'—',capStyle:{fontFamily:"'Geist Mono',monospace",fontSize:'11px',color:p4.dim}}));
+    T2.roster5=st.roster==='all'?[...rows5,...ret5]:rows5;
+
+    return {
+      ...T2, ...this.t3(st,now),
+      allSets:sets, clock:hms(now), clockShort:hms(now).slice(0,5),
+      nAgents:agents.length, nBusy, nNeed, hasAttn:nNeed>0, noAttn:nNeed===0, leadLine, typing:st.typing,
+      t1:p1, crt:this.props.crt===false?0:1, r1, d1, bus1, attn1,
+      th1Chips:chipsFor(st.th1,this.P1,'th1',on=>({cursor:'pointer',padding:'1px 7px',background:on?p1.fg:'transparent',color:on?p1.selInk:p1.dim,textShadow:'none'})),
+      t1Live:{color:p1.fg,animation:'pulse 1.4s ease-in-out infinite',textShadow:'0 0 8px '+p1.fg},
+      cmd1:st.cmd1, onCmd1:e=>this.setState({cmd1:e.target.value}), keyCmd1:e=>{ if(e.key==='Enter'){ this.send(st.cmd1); this.setState({cmd1:''}); } },
+      t2:p2, n2, edges2, coreStyle, d2, feed2, attn2, toast2:leadLine,
+      th2Chips:chipsFor(st.th2,this.P2,'th2',on=>({cursor:'pointer',fontSize:'11.5px',fontWeight:500,padding:'5px 11px',borderRadius:'999px',background:on?p2.fg:'transparent',color:on?p2.bg:p2.dim})),
+      draft2:st.draft2, onDraft2:e=>this.setState({draft2:e.target.value}), keyDraft2:e=>{ if(e.key==='Enter'){ this.send(st.draft2); this.setState({draft2:''}); } }, send2:()=>{ this.send(st.draft2); this.setState({draft2:''}); },
+      t3:p3, tiles3, attn3, ticker3,
+      th3Chips:chipsFor(st.th3,this.P3,'th3',on=>({cursor:'pointer',fontFamily:"'Space Mono',monospace",fontSize:'11px',fontWeight:700,textTransform:'uppercase',padding:'5px 11px',border:'2px solid '+p3.ink,boxShadow:'3px 3px 0 '+p3.ink,background:on?p3.ink:p3.paper,color:on?p3.bg:p3.ink})),
+      draft3:st.draft3, onDraft3:e=>this.setState({draft3:e.target.value}), keyDraft3:e=>{ if(e.key==='Enter'){ this.send(st.draft3); this.setState({draft3:''}); } },
+      t4:p4, pres4, stream4, cmds4, wp4, now4,
+      th4Chips:chipsFor(st.th4,this.P4,'th4',on=>({cursor:'pointer',fontSize:'12px',fontWeight:500,padding:'5px 11px',borderRadius:'7px',background:on?p4.fg:'transparent',color:on?p4.bg:p4.dim})),
+      draft4:st.draft4, onDraft4:e=>this.setState({draft4:e.target.value}), keyDraft4:e=>{ if(e.key==='Enter'){ this.send(st.draft4); this.setState({draft4:''}); } }, send4:()=>{ this.send(st.draft4); this.setState({draft4:''}); },
+      streamRef:el=>{ this._s4=el; if(el) el.scrollTop=el.scrollHeight; }
+    };
+  }
+}
+</script>
+</body>
+</html>

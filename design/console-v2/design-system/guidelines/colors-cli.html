@@ -1,0 +1,23 @@
+<!-- @dsCard group="Colors" viewport="700x120" name="CLI identity" subtitle="Per-runtime badge colors" -->
+<!DOCTYPE html><html><head><meta charset="utf-8"><link rel="stylesheet" href="../styles.css">
+<style>
+  body{margin:0;font-family:var(--font-body);background:var(--canvas);padding:16px;display:flex;gap:22px;align-items:center}
+  .col{display:flex;gap:10px;align-items:center}
+  .badge{font-family:var(--font-mono);font-size:10px;font-weight:500;letter-spacing:.02em;border-radius:var(--radius-chip);padding:3px 9px}
+  .note{font-size:11px;color:var(--ink-3)}
+</style></head>
+<body>
+  <div class="col">
+    <span class="badge" style="color:var(--claude);background:var(--claude-bg)">CLAUDE</span>
+    <span class="note">--claude / --claude-bg</span>
+  </div>
+  <div class="col">
+    <span class="badge" style="color:var(--codex);background:var(--codex-bg)">CODEX</span>
+    <span class="note">--codex / --codex-bg</span>
+  </div>
+  <div class="col" data-theme="dark" style="background:var(--surface);padding:8px 12px;border-radius:10px">
+    <span class="badge" style="color:var(--claude);background:var(--claude-bg)">CLAUDE</span>
+    <span class="badge" style="color:var(--codex);background:var(--codex-bg)">CODEX</span>
+    <span class="note" style="color:var(--ink-3)">dark</span>
+  </div>
+</body></html>

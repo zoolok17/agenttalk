@@ -1,0 +1,18 @@
+<!-- @dsCard group="Colors" viewport="700x180" name="Status language" subtitle="Solid + soft pairs mapped to agent health states" -->
+<!DOCTYPE html><html><head><meta charset="utf-8"><link rel="stylesheet" href="../styles.css">
+<style>
+  body{margin:0;font-family:var(--font-body);background:var(--canvas);padding:16px;display:flex;flex-wrap:wrap;gap:10px}
+  .chip{display:flex;flex-direction:column;gap:6px;flex:1;min-width:120px}
+  .bar{height:34px;border-radius:8px;display:flex;align-items:center;padding:0 10px;font-family:var(--font-mono);font-size:11px;font-weight:500}
+  .name{font-family:var(--font-mono);font-size:10px;color:var(--ink-4)}
+</style></head>
+<body>
+  <div class="chip"><div class="bar" style="background:var(--ok-soft);color:var(--ok)">Working</div><span class="name">--ok · GO</span></div>
+  <div class="chip"><div class="bar" style="background:var(--info-soft);color:var(--info)">Quiet · question</div><span class="name">--info</span></div>
+  <div class="chip"><div class="bar" style="background:var(--warn-soft);color:var(--warn)">Idle · waiting</div><span class="name">--warn</span></div>
+  <div class="chip"><div class="bar" style="background:var(--attn-soft);color:var(--attn)">Stuck?</div><span class="name">--attn</span></div>
+  <div class="chip"><div class="bar" style="background:var(--danger-soft);color:var(--danger)">Rate-limited · HOLD</div><span class="name">--danger</span></div>
+  <div class="chip"><div class="bar" style="background:var(--violet-soft);color:var(--violet)">Proposal</div><span class="name">--violet</span></div>
+  <div class="chip"><div class="bar" style="background:var(--teal-soft);color:var(--teal)">Wake</div><span class="name">--teal</span></div>
+  <div class="chip"><div class="bar" style="background:var(--gray-soft);color:var(--gray)">Unknown</div><span class="name">--gray</span></div>
+</body></html>

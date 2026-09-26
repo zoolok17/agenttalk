@@ -1,0 +1,436 @@
+{
+  "note": "Scenarios: busy, quiet, offline (offline = busy frozen at 18:22, main team only). Times are local.",
+  "teams": [
+    {
+      "key": "main",
+      "label": "Main team",
+      "machine": "win-ws01",
+      "project": "agenttalk",
+      "agents": [
+        {
+          "id": "claude-agenttalk-lead",
+          "runtime": "claude",
+          "busy": {
+            "state": "working",
+            "status_line": "Reading rev-1’s review of WP-14",
+            "cap": null
+          },
+          "quiet": {
+            "state": "idle",
+            "status_line": "Idle · nothing queued",
+            "cap": null
+          }
+        },
+        {
+          "id": "claude-agenttalk-developer-1",
+          "runtime": "claude",
+          "busy": {
+            "state": "working",
+            "status_line": "Implementing WP-15 · 3m in",
+            "cap": null
+          },
+          "quiet": {
+            "state": "working",
+            "status_line": "Nightly lint · 2m in",
+            "cap": null
+          }
+        },
+        {
+          "id": "claude-agenttalk-developer-2",
+          "runtime": "claude",
+          "busy": {
+            "state": "idle",
+            "status_line": "Idle · last turn 40m ago",
+            "cap": null
+          },
+          "quiet": {
+            "state": "idle",
+            "status_line": "Idle · last turn 3h ago",
+            "cap": null
+          }
+        },
+        {
+          "id": "claude-agenttalk-reviewer-1",
+          "runtime": "claude",
+          "busy": {
+            "state": "idle",
+            "status_line": "Idle · gave GO on WP-14",
+            "cap": null
+          },
+          "quiet": {
+            "state": "idle",
+            "status_line": "Idle · gave GO on WP-14",
+            "cap": null
+          }
+        },
+        {
+          "id": "claude-agenttalk-reviewer-3",
+          "runtime": "claude",
+          "busy": {
+            "state": "idle",
+            "status_line": "Idle · gave FIX on WP-12",
+            "cap": null
+          },
+          "quiet": {
+            "state": "idle",
+            "status_line": "Idle",
+            "cap": null
+          }
+        },
+        {
+          "id": "codex-agenttalk-developer-5",
+          "runtime": "codex",
+          "busy": {
+            "state": "busy",
+            "status_line": "Running tests 6m · output 40s ago",
+            "cap": null
+          },
+          "quiet": {
+            "state": "idle",
+            "status_line": "Idle",
+            "cap": null
+          }
+        },
+        {
+          "id": "codex-agenttalk-developer-6",
+          "runtime": "codex",
+          "busy": {
+            "state": "stuck",
+            "status_line": "No output 14m · tests exited 12m ago",
+            "cap": null
+          },
+          "quiet": {
+            "state": "idle",
+            "status_line": "Idle",
+            "cap": null
+          }
+        },
+        {
+          "id": "codex-agenttalk-reviewer-2",
+          "runtime": "codex",
+          "busy": {
+            "state": "capped",
+            "status_line": "5-hour window full",
+            "cap": "resets 23:40"
+          },
+          "quiet": {
+            "state": "idle",
+            "status_line": "Idle",
+            "cap": null
+          }
+        },
+        {
+          "id": "qwen-agenttalk-developer-7",
+          "runtime": "qwen",
+          "busy": {
+            "state": "working",
+            "status_line": "Drafting WP-16 fixtures",
+            "cap": "€3.20 today"
+          },
+          "quiet": {
+            "state": "idle",
+            "status_line": "Idle",
+            "cap": "€0.00 today"
+          }
+        },
+        {
+          "id": "qwen-agenttalk-reviewer-4",
+          "runtime": "qwen",
+          "busy": {
+            "state": "idle",
+            "status_line": "Idle",
+            "cap": "€0.40 today"
+          },
+          "quiet": {
+            "state": "idle",
+            "status_line": "Idle",
+            "cap": "€0.00 today"
+          }
+        }
+      ],
+      "needs_busy": [
+        {
+          "id": "n3",
+          "kind": "LOOKS STUCK",
+          "title": "dev-6 has gone quiet",
+          "evidence": "No output for 14 min · test run exited 12 min ago · no reply sent",
+          "age": "14m",
+          "deadline": null,
+          "options": [
+            "Restart with context",
+            "Wait 10 min"
+          ]
+        },
+        {
+          "id": "n1",
+          "kind": "SPEND LIMIT",
+          "title": "Raise the qwen cap from 100 € to 120 € for September?",
+          "evidence": "Ledger 67.20 € on day 21 · ≈ 96 € by the 30th · the 95 € cutoff lands around the 29th",
+          "age": "waiting 2d",
+          "deadline": null,
+          "options": [
+            "Raise to 120 €",
+            "Keep 100 €"
+          ]
+        },
+        {
+          "id": "n2",
+          "kind": "DECISION",
+          "title": "Keep the old CSV export for one more release?",
+          "evidence": "rev-3 cold review: FIX · two callers still use it · the lead recommends keeping it",
+          "age": "waiting 5h",
+          "deadline": null,
+          "options": [
+            "Keep it",
+            "Remove it"
+          ]
+        }
+      ],
+      "lead_latest": {
+        "busy": "Three things need you. dev-6 first — it looks stuck, not busy. The spend call is the only one with a real clock: at this rate qwen hits its cutoff around the 29th.",
+        "quiet": "Nothing needs you. I’ll start WP-16 when dev-1 finishes the nightly lint."
+      },
+      "also_busy": [
+        [
+          "dev-5 is quiet, not stuck",
+          "Tests running 6m · output 40s ago · no card unless output stops for 10 min"
+        ],
+        [
+          "rev-2 is capped",
+          "Codex 5-hour window full · resets 23:40 · the lead routes reviews to rev-1"
+        ]
+      ],
+      "since_last_quiet": [
+        [
+          "WP-14 delivered",
+          "rev-1 cold review: GO · merged 19:40"
+        ],
+        [
+          "Lesson published",
+          "“Bounds-check a rename’s old path as a removal” · taught to dev-5, dev-6"
+        ],
+        [
+          "Qwen +4.10 € since yesterday",
+          "52.30 of 100 € · projected ≈ 75 €, under the alert level"
+        ]
+      ],
+      "offline": {
+        "last_seen": "3h 12m ago",
+        "frozen_at": "18:22"
+      }
+    },
+    {
+      "key": "shop",
+      "label": "Shopfront",
+      "machine": "linux-02",
+      "project": "shopfront",
+      "agents": [
+        {
+          "id": "claude-shopfront-lead",
+          "runtime": "claude",
+          "busy": {
+            "state": "working",
+            "status_line": "Planning checkout WP-3",
+            "cap": null
+          },
+          "quiet": {
+            "state": "idle",
+            "status_line": "Idle",
+            "cap": null
+          }
+        },
+        {
+          "id": "claude-shopfront-developer-1",
+          "runtime": "claude",
+          "busy": {
+            "state": "working",
+            "status_line": "Implementing WP-3 · 11m in",
+            "cap": null
+          },
+          "quiet": {
+            "state": "idle",
+            "status_line": "Idle",
+            "cap": null
+          }
+        },
+        {
+          "id": "codex-shopfront-developer-2",
+          "runtime": "codex",
+          "busy": {
+            "state": "idle",
+            "status_line": "Idle",
+            "cap": null
+          },
+          "quiet": {
+            "state": "idle",
+            "status_line": "Idle",
+            "cap": null
+          }
+        },
+        {
+          "id": "codex-shopfront-reviewer-1",
+          "runtime": "codex",
+          "busy": {
+            "state": "idle",
+            "status_line": "Idle · gave HOLD on WP-2",
+            "cap": null
+          },
+          "quiet": {
+            "state": "idle",
+            "status_line": "Idle",
+            "cap": null
+          }
+        },
+        {
+          "id": "qwen-shopfront-developer-3",
+          "runtime": "qwen",
+          "busy": {
+            "state": "idle",
+            "status_line": "Idle",
+            "cap": "€0.90 today"
+          },
+          "quiet": {
+            "state": "idle",
+            "status_line": "Idle",
+            "cap": "€0.00 today"
+          }
+        }
+      ],
+      "needs_busy": [
+        {
+          "id": "s1",
+          "kind": "GATE HOLD",
+          "title": "Checkout WP-3 is on HOLD. Wait for CI, or waive?",
+          "evidence": "automation_ci hasn’t reported for 2h · rev-1 cold review: GO · only evidence can turn it GO",
+          "age": "waiting 2h",
+          "deadline": null,
+          "options": [
+            {
+              "label": "Wait for CI"
+            },
+            {
+              "label": "Waive for 7 days",
+              "requires_actions": true,
+              "locked_label": "Waive · CLI only"
+            }
+          ]
+        }
+      ],
+      "lead_latest": {
+        "busy": "One call on checkout. Everything else is moving.",
+        "quiet": "Quiet here too. Nothing is queued."
+      }
+    }
+  ],
+  "usage": {
+    "busy": [
+      [
+        "claude",
+        "5h",
+        62,
+        "23:40"
+      ],
+      [
+        "claude",
+        "weekly",
+        41,
+        "Mon 09:00"
+      ],
+      [
+        "codex",
+        "5h",
+        100,
+        "23:40"
+      ],
+      [
+        "codex",
+        "weekly",
+        58,
+        "Thu 14:00"
+      ]
+    ],
+    "quiet": [
+      [
+        "claude",
+        "5h",
+        18,
+        "22:10"
+      ],
+      [
+        "claude",
+        "weekly",
+        38,
+        "Mon 09:00"
+      ],
+      [
+        "codex",
+        "5h",
+        31,
+        "23:55"
+      ],
+      [
+        "codex",
+        "weekly",
+        55,
+        "Thu 14:00"
+      ]
+    ]
+  },
+  "budget": {
+    "levels": {
+      "alert": 80,
+      "cutoff": 95,
+      "cap": 100
+    },
+    "busy": {
+      "ledger": 67.2,
+      "bill": 61.8,
+      "bill_as_of": "14:00",
+      "projected": 96
+    },
+    "quiet": {
+      "ledger": 52.3,
+      "bill": 49.1,
+      "bill_as_of": "14:00",
+      "projected": 75
+    },
+    "states": [
+      [
+        "Normal · day 12",
+        30,
+        27.4,
+        75
+      ],
+      [
+        "Trending over · day 21",
+        67.2,
+        61.8,
+        96
+      ],
+      [
+        "Past the alert",
+        84.1,
+        80.3,
+        null
+      ],
+      [
+        "At the cutoff",
+        95,
+        92.6,
+        null
+      ],
+      [
+        "Bill ahead of ledger",
+        67.2,
+        71.3,
+        null
+      ],
+      [
+        "Can’t see the gateway",
+        67.2,
+        61.8,
+        null
+      ]
+    ]
+  }
+}
