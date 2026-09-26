@@ -505,3 +505,42 @@ storage, Wait and its expiry, the lead block, the thread and its scrolling, the 
 list, hostile text), `console2_view.test.mjs` +8 (thread, composer, per-team state, prototype-key ids),
 `test_console2_web.py` +2 (colour literals, sticky composer). A headless-Edge screenshot of a seeded store at
 1240x780 (Midnight) was checked by eye; it is not part of the tests.
+
+## 16. M3 fix round record (F1-F4 from the M3 cold read)
+
+- **F1, thread scroll lost.** `chatThread` set `scrollTop` on a detached element; a detached element has no scroll
+  layout. The stream is now updated IN PLACE (below), so an existing thread element is kept and never touched by an
+  age redraw, and a new or replaced thread is scrolled only after it is in the document, when it is new or has a new
+  newest message.
+- **F2, focus lost on a routine redraw.** The stream was cleared and rebuilt on every change. It is now built
+  off-document and reconciled into the live one: an element whose tag, classes, key and state are unchanged stays
+  the same element (only its text changes), so a redraw that only moves an age label keeps focus, scroll and
+  selection. Controls carry a `data-c2-focus` key (`team|card|later`, `team|card|wait`, `team|deferred|show`).
+  Matching looks ahead, so a note appearing above the cards no longer shifts every block out of alignment, and a
+  control only pairs with one of the same key, so a kept button still acts for its own card. If the focused control
+  is replaced or its card is gone, focus goes to the same control by key, else to the control now at its position
+  among its kind (the next card's Later), else the deferred line, else the first Later, else the stream itself
+  (`tabindex=-1`), never the page. Focus outside the stream is never taken. The stream and the rail now have
+  separate redraw signatures.
+- **F3, a deferral outliving its incident.** A stuck card now carries the turn it is about (`incident.turnStartMs`:
+  a silent turn's `since`, also through a stale read's `last_known_since`; unknown for a watchdog flag, whose
+  `since` is the flag time). A Later or Wait is void for a turn that began after it was made (a new incident starts
+  undeferred, also across sessions), and the local deferral/snooze of `stuck:<agent>` is dropped when that agent
+  is verifiably recovered (any state other than stuck or unknown; not judged while the team is offline or
+  unreadable). `unknown` keeps the incident open. Residual: a watchdog-only incident that starts while the page is
+  closed after an earlier watchdog-only deferral cannot be told apart and stays deferred until the agent is seen
+  recovered.
+- **F4, misleading composer hint.** It now reads "Messaging the lead is not available in this read-only view. Use the
+  classic console or the CLI." The input and Send stay disabled; `canAct` is still the seam.
+
+Tests. The DOM stub now models what a browser does (an element outside the document has no scroll layout and cannot
+take focus; a subtree that leaves the document takes focus with it; `removeChild`, `replaceChild`, `insertBefore`),
+which reproduces F1 and F2 without changes to the tests' intent. New: 16 stream cases (F1 x3, F2 x8, F3 x6 incl.
+the exact recovery sequence, F4), 4 view cases (incident identity, deferral/snooze validity, watchdog residual), and
+a real-browser check (`tests/test_console2_browser.py` + `console2_browser_check.mjs`, skipped without node and a
+Chromium-family browser; set `AGENTTALK_TEST_BROWSER` to choose one). It serves the real `/v2` shell and scripts
+under the console CSP with fixed feeds (30 chat messages, cards that age on every read) and drives headless Edge
+over the DevTools protocol. Before the fix it measured `initial scrollTop 0 / scrollHeight 2051 / clientHeight 320`,
+`afterRedraw 0`, thread replaced, and `activeElement BODY` after redraws and after Later; after it
+`initial 1731`, `afterRedraw 250` on the same element, and focus kept on the same Later button, then on the next
+card's Later.

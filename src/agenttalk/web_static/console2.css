@@ -554,3 +554,6 @@ html, body {
   border-radius: var(--r-btn);
 }
 .c2-composer-reason { margin-top: 6px; }
+
+/* the stream takes programmatic focus as a last resort (a redraw removed the focused control) */
+#c2-stream:focus { outline: none; }

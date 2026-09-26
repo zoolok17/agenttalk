@@ -261,7 +261,7 @@ test('the composer: pinned last, disabled, with the reason; nothing can be sent'
   const send = classOf(composer, 'c2-send')[0];
   assert.deepEqual([send.textContent, send.disabled], ['Send', true]);
   send.click();
-  assert.equal(classOf(composer, 'c2-composer-reason')[0].textContent, 'Read-only: start the console with --enable-actions to message the lead.');
+  assert.equal(classOf(composer, 'c2-composer-reason')[0].textContent, 'Messaging the lead is not available in this read-only view. Use the classic console or the CLI.');
 });
 
 test('the composer says the team is offline when it is', async () => {
@@ -312,6 +312,242 @@ test('the busy scenario still reads end to end with the M3 controls', async () =
   for (const want of ['Two things need you.', 'LOOKS STUCK', 'DECISION', 'ALSO HAPPENING', 'LEAD CHAT', 'Later']) assert.ok(s.includes(want), want);
   assert.ok(all(rail(dom)).includes('USAGE WINDOWS'));
   assert.equal(app(dom).className, '');
+});
+
+// ============================================================ M3 fix round
+
+// ---- F1: the thread is scrolled AFTER it is in the document (a detached element has no scroll layout)
+
+const manyMsgs = (n) => Array.from({ length: n }, (_, i) => ({ id: 'm' + String(i).padStart(3, '0'), from: i % 3 === 0 ? 'operator' : LEAD,
+  to: LEAD, body: 'Message number ' + i, ts: iso(3600 - i * 60) }));
+
+test('F1: with 30 messages the first draw is scrolled to the end (the element is attached when it scrolls)', async () => {
+  const { dom } = await boot(server({ roots: calm, ...chatOf(manyMsgs(30)) }));
+  const log = classOf(stream(dom), 'c2-thread')[0];
+  assert.equal(log.isConnected, true);
+  assert.equal(log.scrollTop, log.scrollHeight);
+  assert.ok(log.scrollTop > 0);
+});
+
+test('F1: a scrolled-up thread keeps its position across a normal age redraw, and the node is kept', async () => {
+  const { dom, clock, fire } = await boot(server({ roots: calm, ...chatOf(manyMsgs(30)) }));
+  const log = () => classOf(stream(dom), 'c2-thread')[0];
+  const before = log();
+  before.scrollTop = 250;
+  clock.perf += 120e3;                       // ages move; no new message
+  await fire((ms) => ms < 5000);
+  assert.strictEqual(log(), before, 'the thread element itself is kept, not rebuilt');
+  assert.equal(log().scrollTop, 250);
+});
+
+test('F1: a new message scrolls to the end, an unchanged thread does not', async () => {
+  const msgs = manyMsgs(30);
+  const srv = server({ roots: calm, chat: () => ({ target_root_project_id: 'proj-a', available: true, operator: 'operator', lead: LEAD, messages: msgs.slice() }) });
+  const { dom, clock, fire } = await boot(srv);
+  const log = () => classOf(stream(dom), 'c2-thread')[0];
+  log().scrollTop = 250;
+  await fire((ms) => ms < 5000);
+  assert.equal(log().scrollTop, 250);
+  msgs.push({ id: 'm999', from: LEAD, to: 'operator', body: 'brand new', ts: iso(-clock.perf / 1000) });
+  await fire((ms) => ms < 5000);
+  assert.equal(log().children.length, 31);
+  assert.equal(log().scrollTop, log().scrollHeight);
+});
+
+// ---- F2: a routine redraw must not take keyboard focus away from a control in the stream
+
+const focusKey = (dom) => dom.document.activeElement.getAttribute('data-c2-focus');
+// items whose age grows with the server's clock, like a real queue
+const twoCardsFor = () => {
+  const srv = server({ roots: calm, attention: () => ({ target_root_project_id: 'proj-a', items: [
+    ATT_ITEM({ id: 'a', title: 'A', age: 900 + srv.clock.perf / 1000 }), ATT_ITEM({ id: 'b', title: 'B', age: 800 + srv.clock.perf / 1000 })] }) });
+  return srv;
+};
+
+test('F2: focus on a Later button survives an age redraw (same card, same action)', async () => {
+  const { dom, clock, fire } = await boot(twoCardsFor());
+  const laterA = classOf(cards(dom)[0], 'c2-later')[0];
+  laterA.focus();
+  assert.strictEqual(dom.document.activeElement, laterA);
+  clock.perf += 120e3;                                   // "waiting 15m" -> "waiting 17m": the stream redraws
+  await fire((ms) => ms < 5000);
+  assert.ok(all(stream(dom)).includes('waiting 17m'), 'the redraw really happened');
+  const now = dom.document.activeElement;
+  assert.equal(now.tagName, 'BUTTON');
+  assert.equal(now.textContent, 'Later');
+  assert.equal(now.isConnected, true);
+  assert.equal(focusKey(dom), 'proj-a|a|later');
+});
+
+test('F2: focus on Wait 10 min survives a feed redraw (a new chat message arrives)', async () => {
+  const msgs = THREAD.slice();
+  const srv = server({ chat: () => ({ target_root_project_id: 'proj-a', available: true, operator: 'operator', lead: LEAD, messages: msgs.slice() }) });
+  const { dom, clock, fire } = await boot(srv);
+  const wait = byText(stream(dom), /^Wait 10 min$/)[0];
+  wait.focus();
+  msgs.push({ id: 'c9', from: LEAD, to: 'operator', body: 'fresh word', ts: iso(-clock.perf / 1000) });
+  await fire((ms) => ms < 5000);
+  assert.ok(all(stream(dom)).includes('fresh word'));
+  assert.equal(focusKey(dom), 'proj-a|stuck:codex-agenttalk-developer-4|wait');
+});
+
+test('F2: focus on the deferred "show" button survives an age redraw', async () => {
+  const { dom, clock, fire } = await boot(server(one));
+  classOf(cards(dom)[0], 'c2-later')[0].click();
+  const show = deferredLine(dom);
+  show.focus();
+  clock.perf += 120e3;
+  await fire((ms) => ms < 5000);
+  assert.equal(focusKey(dom), 'proj-a|deferred|show');
+});
+
+test('F2: the focused button is not replaced at all when only text changed', async () => {
+  const { dom, clock, fire } = await boot(twoCardsFor());
+  const laterA = classOf(cards(dom)[0], 'c2-later')[0];
+  laterA.focus();
+  clock.perf += 120e3;
+  await fire((ms) => ms < 5000);
+  assert.strictEqual(dom.document.activeElement, laterA, 'same element: no flicker, no re-announcement');
+});
+
+test('F2: deliberate fallback when the focused card goes away: the next card, then the previous, then the deferred line', async () => {
+  const { dom } = await boot(twoCardsFor());
+  classOf(cards(dom)[0], 'c2-later')[0].focus();
+  classOf(cards(dom)[0], 'c2-later')[0].click();         // Later on card A: it leaves, B slides up
+  assert.equal(focusKey(dom), 'proj-a|b|later', 'the next card’s Later');
+  classOf(cards(dom)[0], 'c2-later')[0].click();         // Later on the last card
+  assert.equal(focusKey(dom), 'proj-a|deferred|show', 'the deferred line, which is where the card went');
+  deferredLine(dom).click();                             // show: both come back, the button is gone
+  assert.equal(dom.document.activeElement.tagName, 'BUTTON');
+  assert.equal(dom.document.activeElement.textContent, 'Later', 'a Later button again, never the page');
+});
+
+test('F2: focus outside the stream is never taken by a redraw', async () => {
+  const { dom, clock, fire } = await boot(twoCardsFor());
+  const paper = walk(dom.document.getElementById('c2-header')).find((n) => n.textContent === 'Paper');
+  paper.focus();
+  clock.perf += 120e3;
+  await fire((ms) => ms < 5000);
+  assert.strictEqual(dom.document.activeElement, paper);
+});
+
+test('F2: with nothing left to focus the stream itself takes it, not the page', async () => {
+  const srv = twoCardsFor();
+  const { dom, fire } = await boot(srv);
+  classOf(cards(dom)[0], 'c2-later')[0].focus();
+  srv.attention = () => ({ target_root_project_id: 'proj-a', items: [] });          // both cards resolved elsewhere
+  await fire((ms) => ms < 5000);
+  assert.equal(cards(dom).length, 0);
+  assert.strictEqual(dom.document.activeElement, stream(dom));
+  assert.equal(stream(dom).getAttribute('tabindex'), '-1');
+});
+
+// ---- F3: a deferral belongs to the incident it was made for
+
+const HB = (srv) => new Date(NOW + srv.clock.perf - 20e3).toISOString();
+const stall = (srv, o) => root({ project_id: 'proj-a', operator_facing: LEAD, recent: [env(LEAD, 'x', 'message', 5)], agents: [
+  agent(LEAD, { since: 3000 }),
+  { ...agent('codex-agenttalk-developer-4', o), last_seen: HB(srv) }] });
+const at = (srv, ageSeconds) => Math.round(ageSeconds - srv.clock.perf / 1000);     // health ages are relative to NOW
+const stuckCard = (dom) => cards(dom).find((c) => classOf(c, 'c2-kind')[0].textContent === 'LOOKS STUCK');
+
+test('F3: Later on one stalled turn does not hide a different stalled turn 15 minutes after recovery', async () => {
+  let mode = 'stalled';
+  const srv = server({ roots: () => [mode === 'stalled' ? stall(srv, { state: 'working_silent', since: at(srv, 1800), progress: at(srv, 840) })
+    : (mode === 'idle' ? stall(srv, { state: 'idle_waiting', since: at(srv, 30) })
+      : stall(srv, { state: 'working_silent', since: at(srv, 660) }))] });
+  const { dom, clock, fire, store } = await boot(srv);
+  assert.ok(stuckCard(dom), 'the first stall raises a card');
+  classOf(stuckCard(dom), 'c2-later')[0].click();
+  assert.equal(stuckCard(dom), undefined);
+  assert.equal(deferredLine(dom).textContent, '1 deferred · still open, not dismissed · show');
+  assert.deepEqual(Object.keys(JSON.parse(store.get(LATER)).deferred['proj-a']), ['stuck:codex-agenttalk-developer-4']);
+
+  mode = 'idle';                                        // the agent recovers
+  clock.perf += 5000;
+  await fire((ms) => ms < 5000);
+  assert.equal(deferredLine(dom), undefined, 'the deferred line goes with the recovery');
+  assert.deepEqual(Object.keys(JSON.parse(store.get(LATER)).deferred['proj-a'] || {}), [], 'and so does the stored deferral');
+
+  clock.perf += 15 * 60e3;                              // 15 minutes later, a different turn goes silent
+  mode = 'silent-again';
+  await fire((ms) => ms < 5000);
+  clock.perf += 2000;
+  await fire((ms) => ms < 5000);
+  const card = stuckCard(dom);
+  assert.ok(card, 'the new stall raises its own card');
+  assert.equal(deferredLine(dom), undefined);
+  assert.equal(chips(dom)[0].children[2].textContent, '1', 'and it counts in the needs badge');
+});
+
+test('F3: a deferral made in an earlier session cannot hide a turn that began after it', async () => {
+  const srv = server({ roots: () => [stall(srv, { state: 'working_silent', since: at(srv, 660) })] });
+  const oldDeferral = { deferred: { 'proj-a': { 'stuck:codex-agenttalk-developer-4': NOW - 3600e3 } }, snoozed: {} };
+  const { dom } = await boot(srv, { storage: { [LATER]: JSON.stringify(oldDeferral) } });
+  assert.ok(stuckCard(dom), 'the new turn started after that deferral: it is a new incident');
+  assert.equal(deferredLine(dom), undefined);
+});
+
+test('F3: the same incident stays deferred, also when the turn is still running past the deferral', async () => {
+  const srv = server({ roots: () => [stall(srv, { state: 'working_silent', since: at(srv, 1800), progress: at(srv, 840) })] });
+  const fresh = { deferred: { 'proj-a': { 'stuck:codex-agenttalk-developer-4': NOW - 60e3 } }, snoozed: {} };
+  const { dom } = await boot(srv, { storage: { [LATER]: JSON.stringify(fresh) } });
+  assert.equal(stuckCard(dom), undefined);
+  assert.equal(deferredLine(dom).textContent, '1 deferred · still open, not dismissed · show');
+});
+
+test('F3: Wait 10 min is per incident too, and recovery clears it', async () => {
+  let mode = 'stalled';
+  const srv = server({ roots: () => [mode === 'stalled' ? stall(srv, { state: 'working_silent', since: at(srv, 1800), progress: at(srv, 840) })
+    : stall(srv, { state: 'idle_waiting', since: at(srv, 30) })] });
+  const { dom, clock, fire, store } = await boot(srv);
+  byText(stuckCard(dom), /^Wait 10 min$/)[0].click();
+  assert.equal(stuckCard(dom), undefined);
+  mode = 'idle';
+  clock.perf += 5000;
+  await fire((ms) => ms < 5000);
+  assert.deepEqual(Object.keys(JSON.parse(store.get(LATER)).snoozed['proj-a'] || {}), []);
+});
+
+test('F3: an agent that turns "unknown" (a blip in its heartbeat) keeps the deferral: only a verified recovery ends it', async () => {
+  let mode = 'stalled';
+  const srv = server({ roots: () => [mode === 'blip'
+    ? { ...stall(srv, { state: 'working_silent', since: at(srv, 1800), progress: at(srv, 840) }),
+        agents: [agent(LEAD, { since: 3000 }), { ...agent('codex-agenttalk-developer-4', { state: 'working_silent', since: at(srv, 1800), progress: at(srv, 840) }), last_seen: new Date(NOW + srv.clock.perf - 900e3).toISOString() }] }
+    : stall(srv, { state: 'working_silent', since: at(srv, 1800), progress: at(srv, 840) })] });
+  const { dom, clock, fire, store } = await boot(srv);
+  classOf(stuckCard(dom), 'c2-later')[0].click();
+  mode = 'blip';                                             // heartbeat 15 min old: judged "unknown", not recovered
+  clock.perf += 5000;
+  await fire((ms) => ms < 5000);
+  assert.equal(stuckCard(dom), undefined);
+  assert.deepEqual(Object.keys(JSON.parse(store.get(LATER)).deferred['proj-a']), ['stuck:codex-agenttalk-developer-4']);
+  mode = 'stalled';                                          // and it is the same incident when the blip ends
+  clock.perf += 5000;
+  await fire((ms) => ms < 5000);
+  assert.equal(stuckCard(dom), undefined);
+  assert.equal(deferredLine(dom).textContent, '1 deferred · still open, not dismissed · show');
+});
+
+test('F3: a deferral of an ordinary (feed) card is untouched by recovery of an agent', async () => {
+  const srv = server({ roots: () => [stall(srv, { state: 'idle_waiting', since: at(srv, 30) })], ...att([ATT_ITEM({ id: 'e1', title: 'Only question', age: 3600 })]) });
+  const { dom, fire, clock } = await boot(srv);
+  classOf(cards(dom)[0], 'c2-later')[0].click();
+  clock.perf += 5000;
+  await fire((ms) => ms < 5000);
+  assert.equal(deferredLine(dom).textContent, '1 deferred · still open, not dismissed · show');
+});
+
+// ---- F4: the composer never points at something this page cannot do
+
+test('F4: the composer says messaging is not available in this read-only view, and points at the working interface', async () => {
+  const { dom } = await boot(server({ roots: calm, ...chatOf(THREAD) }));
+  const reason = classOf(stream(dom), 'c2-composer-reason')[0].textContent;
+  assert.equal(reason, 'Messaging the lead is not available in this read-only view. Use the classic console or the CLI.');
+  assert.ok(!/enable-actions/.test(all(stream(dom))), 'no instruction that this page cannot honour');
+  const input = classOf(stream(dom), 'c2-composer-input')[0];
+  assert.equal(input.disabled, true);
+  assert.equal(classOf(stream(dom), 'c2-send')[0].disabled, true);
 });
 
 run();

@@ -826,7 +826,7 @@ test('a failed or stale chat read still shows the thread that was read', () => {
 test('the composer is disabled in this slice and says why, first reason first', () => {
   const online = team({ chat: chat(THREAD) });
   assert.deepEqual([online.composer.enabled, online.composer.reason, online.composer.placeholder],
-    [false, 'Read-only: start the console with --enable-actions to message the lead.', 'Message the lead   ( / )']);
+    [false, 'Messaging the lead is not available in this read-only view. Use the classic console or the CLI.', 'Message the lead   ( / )']);
   const offline = team({ chat: chat(THREAD), conn: { reachable: false, stalledPolls: 0, lastOkMs: NOW - 5000 } });
   assert.equal(offline.composer.reason, 'Paused — the lead can’t receive while the team is offline.');
   const down = team({ chat: chat(THREAD, { available: false, detail: 'gone' }) });
@@ -868,6 +868,49 @@ test('feed-supplied ids that look like prototype keys are ordinary ids for defer
 test('an agent whose project token is a prototype key does not break the team project', () => {
   assert.equal(M.teamProject(['claude-__proto__-lead', 'codex-__proto__-developer-1'], []), '__proto__');
   assert.equal(M.shortName('claude-constructor-lead', 'constructor', [], []), 'lead');
+});
+
+// ------------------------------------------- M3 fix round F3: a deferral belongs to its incident
+
+const stuckTeam = (o, ui) => M.buildTeamView({ nowMs: NOW, generatedMs: NOW, root: root({ agents: [agent('claude-agenttalk-lead'), agent(NAME, o)], recent: WINDOW }),
+  attention: attention([]), chat: null, conn: CONN_OK, ui: ui || {}, tz: TZ });
+const STUCK_ID = 'stuck:' + NAME;
+
+test('F3: a stuck card carries the turn it is about: a silent turn’s start, unknown for a watchdog flag', () => {
+  const silent = stuckTeam({ state: 'working_silent', since: 1800, progress: 840 });
+  assert.equal(silent.needs.open[0].incident.turnStartMs, NOW - 1800e3);
+  assert.equal(silent.needs.open[0].id, STUCK_ID);
+  const flagged = stuckTeam({ state: 'stuck_suspected', since: 900 });
+  assert.equal(flagged.needs.open[0].incident.turnStartMs, null, 'since is the flag time, not the turn start');
+  const remembered = M.buildTeamView({ nowMs: NOW, generatedMs: NOW, tz: TZ, conn: CONN_OK, ui: {}, attention: attention([]), chat: null,
+    root: root({ agents: [agent('claude-agenttalk-lead'), staleAgent(NAME, { lk: 'working_silent', since: 900 })], recent: WINDOW }) });
+  assert.equal(remembered.needs.open[0].incident.turnStartMs, NOW - 900e3, 'also through a stale read (last_known_since)');
+});
+
+test('F3: a deferral made after the turn began applies; one made before it began does not', () => {
+  const o = { state: 'working_silent', since: 1800, progress: 840 };          // the turn began at NOW - 1800 s
+  const after = stuckTeam(o, { deferred: { [STUCK_ID]: NOW - 300e3 } });        // deferred while it was stalled
+  assert.deepEqual([after.needs.open.length, after.needs.deferredCount], [0, 1]);
+  const before = stuckTeam(o, { deferred: { [STUCK_ID]: NOW - 3600e3 } });      // deferred before this turn existed
+  assert.deepEqual([before.needs.open.map((c) => c.id), before.needs.deferredCount], [[STUCK_ID], 0]);
+  assert.deepEqual(before.needs.deferredCards, []);
+});
+
+test('F3: the same holds for Wait 10 min (its start is the snooze end minus ten minutes)', () => {
+  const o = { state: 'working_silent', since: 1800, progress: 840 };
+  const fresh = stuckTeam(o, { snoozedUntil: { [STUCK_ID]: NOW + 300e3 } });      // started 5 min ago: after the turn began
+  assert.deepEqual([fresh.needs.open.length, fresh.needs.snoozed.length], [0, 1]);
+  const old = stuckTeam({ state: 'working_silent', since: 200, progress: null }, { snoozedUntil: { [STUCK_ID]: NOW + 300e3 } });
+  assert.equal(old.needs.snoozed.length, 0, 'the turn began 200 s ago, after that snooze started (5 min ago): a new incident');
+});
+
+test('F3: a watchdog-flag incident cannot be told apart, so its deferral stands; feed cards ignore incidents', () => {
+  const flagged = stuckTeam({ state: 'stuck_suspected', since: 900 }, { deferred: { [STUCK_ID]: NOW - 3600e3 } });
+  assert.deepEqual([flagged.needs.open.length, flagged.needs.deferredCount], [0, 1]);
+  const feedCard = team({ root: { agents: [agent('claude-agenttalk-lead')] }, attention: attention([escalation({ id: 'e1' })]), ui: { deferred: { e1: NOW - 999e9 } } });
+  assert.equal(feedCard.needs.deferredCount, 1);
+  const legacy = team({ root: { agents: [agent('claude-agenttalk-lead')] }, attention: attention([escalation({ id: 'e1' })]), ui: { deferred: { e1: true } } });
+  assert.equal(legacy.needs.deferredCount, 1);
 });
 
 run();

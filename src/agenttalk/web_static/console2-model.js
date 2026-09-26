@@ -189,6 +189,7 @@
   var CHAT_FRESH_S = 8;          // same for the lead-chat read
   var LEAD_BODY_LIMIT = 1200;
   var ASIDE_MAX = 8;
+  var SNOOZE_MS = 10 * 60e3;   // how long "Wait 10 min" hides a stuck card
   var USAGE_DIFFER_POINTS = 5;
   var DAY_S = 86400;
 
@@ -450,7 +451,10 @@
         if (quietLong && reply.replied === false) {
           var evidence = progWord + ' · no reply sent · heartbeat still fresh';
           setState('stuck', evidence);
-          view.stuck = { evidence: evidence, progressAge: progAge };
+          // turnStartMs: when this turn began, where the file says so (a silent turn's `since`; for a
+          // watchdog flag `since` is the flag time, so the turn start is unknown). It identifies the
+          // incident, so a Later made for one stalled turn is not carried onto a later one.
+          view.stuck = { evidence: evidence, progressAge: progAge, turnStartMs: hs === 'working_silent' ? sinceMs : null };
         } else if (view.candidate || staleWorking) {
           var tail = reply.replied === true ? 'replied since it woke'
             : (reply.replied === false ? 'no reply sent' : 'reply status unknown');
@@ -651,8 +655,16 @@
       ageLabel: fmtAge(v.stuck.progressAge),
       options: [{ label: 'Wait 10 min', primary: true, locked: null, action: 'wait' },
                 { label: 'Restart with context', primary: false, locked: 'CLI only' }],
+      incident: { turnStartMs: v.stuck.turnStartMs },
       answerable: false, state: 'open'
     };
+  }
+
+  // A deferral or snooze made at `madeAtMs` belongs to a card only if the card's incident already
+  // existed then: a turn that began AFTER it is a different stall and starts undeferred.
+  function appliesTo(card, madeAtMs) {
+    var t = card.incident ? card.incident.turnStartMs : null;
+    return !(typeof t === 'number' && t > madeAtMs);
   }
 
   // Queue order: LOOKS STUCK first, then the oldest waiting, then id.
@@ -823,7 +835,7 @@
       var card = stuckCard(r);
       var snoozes = ui.snoozedUntil || {};
       var until = hasOwn(snoozes, card.id) && typeof snoozes[card.id] === 'number' ? snoozes[card.id] : null;
-      if (until !== null && until > nowMs) {
+      if (until !== null && until > nowMs && appliesTo(card, until - SNOOZE_MS)) {
         view.needs.snoozed.push(card);
         snoozeRows.push({ title: r.short + ' · waiting', detail: 'Snoozed until ' + clockHM(until, tz) });
       } else {
@@ -834,14 +846,17 @@
     // Card ids come from a feed: only OWN keys count ("__proto__" is an id, not an inherited flag).
     var deferred = ui.deferred || {};
     var answered = ui.answered || {};
-    function isDeferred(id) { return hasOwn(deferred, id) && !!deferred[id]; }
+    function isDeferred(c) {
+      if (!hasOwn(deferred, c.id) || !deferred[c.id]) return false;
+      return typeof deferred[c.id] === 'number' ? appliesTo(c, deferred[c.id]) : true;
+    }
     function isAnswered(id) { return hasOwn(answered, id) && !!answered[id]; }
     cards.forEach(function (c) {
       if (isAnswered(c.id)) { c.state = 'answered'; view.needs.answered.push(c); }
-      else if (isDeferred(c.id)) { view.needs.deferredCount += 1; }
+      else if (isDeferred(c)) { view.needs.deferredCount += 1; }
       else view.needs.open.push(c);
     });
-    view.needs.deferredCards = cards.filter(function (c) { return isDeferred(c.id) && !isAnswered(c.id); });
+    view.needs.deferredCards = cards.filter(function (c) { return isDeferred(c) && !isAnswered(c.id); });
     var openCount = view.needs.open.length;
     view.chip.needsCount = att && view.needs.available ? openCount : null;
 
@@ -930,7 +945,7 @@
     var leadIsDown = !!(view.lead && view.lead.unavailable);
     var composerReason = offline ? 'Paused \u2014 the lead can\u2019t receive while the team is offline.'
       : (leadIsDown ? 'The lead is unavailable, so a message cannot be delivered.'
-        : 'Read-only: start the console with --enable-actions to message the lead.');
+        : 'Messaging the lead is not available in this read-only view. Use the classic console or the CLI.');
     view.composer = { enabled: input.canAct === true && !offline && !leadIsDown,
                       placeholder: 'Message the lead   ( / )', reason: input.canAct === true && !offline && !leadIsDown ? '' : composerReason };
 
@@ -996,7 +1011,7 @@
     // M2: pure view model
     LIMITS: {
       HEARTBEAT_FRESH_S: HEARTBEAT_FRESH_S, SOURCE_STALE_S: SOURCE_STALE_S, STUCK_AFTER_S: STUCK_AFTER_S,
-      RECENT_LIMIT: RECENT_LIMIT, STALLED_POLLS: STALLED_POLLS, ATTENTION_FRESH_S: ATTENTION_FRESH_S,
+      RECENT_LIMIT: RECENT_LIMIT, STALLED_POLLS: STALLED_POLLS, ATTENTION_FRESH_S: ATTENTION_FRESH_S, SNOOZE_MS: SNOOZE_MS,
       CHAT_FRESH_S: CHAT_FRESH_S
     },
     parseMs: parseMs,

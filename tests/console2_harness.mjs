@@ -62,33 +62,74 @@ export function makeDom() {
       this._text = '';
       this.nodeType = 1;
       this.style = {};   // CSSOM object: allowed under the console CSP (unlike a style attribute)
-      this.scrollTop = 0;
+      this.parent = null;
+      this._root = false;   // the served shell's elements and <html>/<body> are part of the document
+      this._st = 0;
     }
+    // Like a browser: only an element that is in the document has scroll layout, so a scrollTop
+    // set on a detached element is lost (this is what made the M3 thread scroll a no-op).
+    get isConnected() { return this._root || (this.parent !== null && this.parent.isConnected); }
+    get scrollTop() { return this._st; }
+    set scrollTop(v) { if (this.isConnected) this._st = Number(v); }
     get scrollHeight() { return 100 * (this.children.length + 1); }
+    _drop(child) {
+      // A subtree leaving the document takes focus with it (the page gets it back).
+      if (active && (child === active || (child.nodeType === 1 && child.contains(active)))) active = body;
+      child.parent = null;
+    }
     get textContent() {
       return this.children.length ? this.children.map((c) => c.textContent).join('') : this._text;
     }
     set textContent(value) {
       // Replacing the children detaches the old ones: like a browser, focus that sat
       // inside them falls back to the page.
-      if (active && this.children.some((c) => c === active || (c.nodeType === 1 && c.contains(active)))) {
-        active = body;
-      }
+      this.children.forEach((c) => this._drop(c));
       this.children = [];
       this._text = String(value);
-      this.scrollTop = 0;   // worst case for a scroller whose content was replaced: back to the top
+      this._st = 0;   // worst case for a scroller whose content was replaced: back to the top
     }
     contains(node) {
       if (node === this) return true;
       return this.children.some((c) => c.nodeType === 1 && c.contains(node));
     }
-    focus() { if (!this.disabled) active = this; }
+    focus() { if (!this.disabled && this.isConnected) active = this; }
     blur() { if (active === this) active = body; }
     set innerHTML(_v) { forbid('innerHTML'); }
     get innerHTML() { return forbid('innerHTML read'); }
     set outerHTML(_v) { forbid('outerHTML'); }
     insertAdjacentHTML() { forbid('insertAdjacentHTML'); }
-    appendChild(child) { this.children.push(child); return child; }
+    appendChild(child) {
+      if (child.nodeType === 1 && child.parent) child.parent.removeChild(child);
+      this.children.push(child);
+      child.parent = this;
+      return child;
+    }
+    removeChild(child) {
+      const i = this.children.indexOf(child);
+      if (i < 0) throw new Error('removeChild: not a child');
+      this.children.splice(i, 1);
+      this._drop(child);
+      return child;
+    }
+    insertBefore(fresh, ref) {
+      if (fresh.nodeType === 1 && fresh.parent) fresh.parent.removeChild(fresh);
+      const i = this.children.indexOf(ref);
+      if (i < 0) throw new Error('insertBefore: reference is not a child');
+      this.children.splice(i, 0, fresh);
+      fresh.parent = this;
+      return fresh;
+    }
+    replaceChild(fresh, old) {
+      const i = this.children.indexOf(old);
+      if (i < 0) throw new Error('replaceChild: not a child');
+      if (fresh.nodeType === 1 && fresh.parent) fresh.parent.removeChild(fresh);
+      this.children.splice(this.children.indexOf(old), 1, fresh);
+      fresh.parent = this;
+      this._drop(old);
+      return old;
+    }
+    hasAttribute(name) { return this.getAttribute(name) !== null; }
+    removeAttribute(name) { delete this.attributes[String(name).toLowerCase()]; }
     setAttribute(name, value) {
       const n = String(name).toLowerCase();
       if (n === 'style' || n === 'href' || n === 'src' || n === 'srcdoc' || n.startsWith('on')) {
@@ -115,7 +156,9 @@ export function makeDom() {
   }
 
   const documentElement = new Node('html');
+  documentElement._root = true;
   const body = new Node('body');
+  body._root = true;
   active = body;
   const document = {
     documentElement,
@@ -133,6 +176,7 @@ export function makeDom() {
   for (const [tag, id] of [['div', 'app'], ['header', 'c2-header'], ['main', 'c2-stream'], ['aside', 'c2-rail'],
                            ['footer', 'c2-footer'], ['span', 'c2-hints']]) {
     const node = new Node(tag);
+    node._root = true;
     node.setAttribute('id', id);
   }
 

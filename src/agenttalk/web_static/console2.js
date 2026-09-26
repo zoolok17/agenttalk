@@ -59,6 +59,7 @@
   var ui = { deferred: {}, snoozedUntil: {}, answered: {}, lastVisitMs: null };
   var chrome = { teamSeg: null, themeButtons: [], chipKeys: [], chips: [] };
   var lastSig = null;
+  var lastRailSig = null;
   var running = false;
   var inflight = {};       // feed key -> true while a request for it is outstanding
 
@@ -300,7 +301,7 @@
   var LATER_KEY = 'agenttalk.console2.later';
   var LATER_MAX = 500;
   var LATER_KEEP_MS = 30 * 24 * 3600e3;
-  var SNOOZE_MS = 10 * 60e3;
+  var SNOOZE_MS = M.LIMITS.SNOOZE_MS;
   var later = { deferred: Object.create(null), snoozed: Object.create(null) };
 
   function teamMap(table, key) {
@@ -371,6 +372,7 @@
     teams.forEach(function (t) {
       var btn = el('button', 'c2-pick-btn', t.label);
       btn.setAttribute('type', 'button');
+      btn.setAttribute('data-c2-focus', '|pick|' + t.index);
       on(btn, 'click', function () { pickTeam(t.index); });
       list.appendChild(btn);
     });
@@ -417,6 +419,7 @@
     var text = option.label + (option.locked ? ' · ' + option.locked : '');
     var btn = el('button', 'c2-opt' + (option.primary ? ' is-primary' : '') + (option.locked ? ' is-locked' : ''), text);
     btn.setAttribute('type', 'button');
+    btn.setAttribute('data-c2-focus', team + '|' + card.id + '|' + (option.action === 'wait' ? 'wait' : 'opt'));
     if (option.locked) {
       btn.disabled = true;
       btn.setAttribute('aria-disabled', 'true');
@@ -447,6 +450,7 @@
     card.options.forEach(function (o) { actions.appendChild(optionButton(o, team, card)); });
     var laterBtn = el('button', 'c2-later', 'Later');
     laterBtn.setAttribute('type', 'button');
+    laterBtn.setAttribute('data-c2-focus', team + '|' + card.id + '|later');
     laterBtn.setAttribute('title', 'Put this off in this browser. It stays open and counted.');
     on(laterBtn, 'click', function () { deferCard(team, card.id); });
     actions.appendChild(laterBtn);
@@ -457,6 +461,7 @@
   function deferredLine(count, team) {
     var btn = el('button', 'c2-deferred', count + ' deferred · still open, not dismissed · show');
     btn.setAttribute('type', 'button');
+    btn.setAttribute('data-c2-focus', team + '|deferred|show');
     btn.setAttribute('title', 'Bring the deferred items back');
     on(btn, 'click', function () { restoreDeferred(team); });
     return btn;
@@ -475,9 +480,9 @@
     return box;
   }
 
-  var thread = { node: null, lastId: null };   // the chat thread of the last draw
+  var thread = { node: null, lastId: null };   // the chat thread element of the last draw, and its newest message
 
-  function chatThread(chat, savedTop) {
+  function chatThread(chat) {
     var box = el('section', 'c2-chat');
     box.setAttribute('aria-label', 'Lead chat');
     box.appendChild(el('div', 'c2-label', 'LEAD CHAT'));
@@ -486,16 +491,10 @@
     chat.messages.forEach(function (m) {
       var msg = el('div', 'c2-msg is-' + m.side);
       msg.appendChild(el('p', 'c2-bubble', m.body));
-      msg.appendChild(el('div', 'c2-meta', m.short + (m.ageLabel ? ' · ' + m.ageLabel : '')));
+      msg.appendChild(el('div', 'c2-meta', m.short + (m.ageLabel ? ' \u00b7 ' + m.ageLabel : '')));
       log.appendChild(msg);
     });
     box.appendChild(log);
-    // Scroll the thread to its end only when there is a NEW message (or this is the first
-    // draw); otherwise keep wherever the operator had scrolled it to.
-    thread.node = log;
-    if (thread.lastId !== chat.lastId) log.scrollTop = log.scrollHeight;
-    else if (typeof savedTop === 'number') log.scrollTop = savedTop;
-    thread.lastId = chat.lastId;
     return box;
   }
 
@@ -518,42 +517,154 @@
     return box;
   }
 
-  function renderStream(shell) {
-    var main = document.getElementById('c2-stream');
-    if (!main) return;
-    var savedTop = main.scrollTop;
-    var savedThreadTop = thread.node ? thread.node.scrollTop : null;
-    thread.node = null;
-    clear(main);
-    if (shell.selection.status === 'unknown' && shell.teams.length) {
-      thread.lastId = null;
-      main.appendChild(unknownTeamBox(shell.teams));
+  // ---- in-place update of the stream
+  //
+  // A redraw builds the new stream off-document and then brings the live one up to date IN PLACE:
+  // an element whose tag, classes, key and state are unchanged keeps being the same element (only
+  // its text is updated). So a redraw that only moves an age label keeps keyboard focus, the
+  // operator's scroll position and the chat thread exactly where they are; an element that really
+  // changed is replaced, one that is gone is removed.
+  var TRACKED_ATTRS = ['title', 'aria-disabled', 'aria-label', 'role', 'type', 'placeholder', 'data-c2-focus'];
+
+  function kids(node) { return Array.prototype.slice.call(node.children); }
+
+  function sameShape(a, b) {
+    if (a.tagName !== b.tagName || a.className !== b.className) return false;
+    if (!!a.disabled !== !!b.disabled) return false;
+    for (var i = 0; i < TRACKED_ATTRS.length; i++) {
+      if (a.getAttribute(TRACKED_ATTRS[i]) !== b.getAttribute(TRACKED_ATTRS[i])) return false;
+    }
+    return (a.children.length === 0) === (b.children.length === 0);
+  }
+
+  function syncNode(live, fresh) {
+    if (fresh.children.length === 0) {
+      if (live.textContent !== fresh.textContent) live.textContent = fresh.textContent;
       return;
+    }
+    syncChildren(live, fresh);
+  }
+
+  // Match the fresh children to the live ones in order. A block that appeared or vanished (a note
+  // above the cards, say) must not push every later block out of alignment, so a live child is
+  // looked for ahead of the cursor; in-between live children are removed, unmatched fresh ones inserted.
+  // Controls only ever pair with a control of the same key, so a kept button still acts for its own card.
+  function syncChildren(parent, fresh) {
+    var live = kids(parent);
+    var next = kids(fresh);
+    var cursor = 0;
+    var i;
+    var j;
+    for (i = 0; i < next.length; i++) {
+      var found = -1;
+      for (j = cursor; j < live.length; j++) {
+        if (sameShape(live[j], next[i])) { found = j; break; }
+      }
+      if (found < 0) {
+        if (cursor < live.length) parent.insertBefore(next[i], live[cursor]);
+        else parent.appendChild(next[i]);
+      } else {
+        for (j = cursor; j < found; j++) parent.removeChild(live[j]);
+        syncNode(live[found], next[i]);
+        cursor = found + 1;
+      }
+    }
+    for (j = live.length - 1; j >= cursor; j--) parent.removeChild(live[j]);
+  }
+
+  function descendants(node, out) {
+    kids(node).forEach(function (c) { out.push(c); descendants(c, out); });
+    return out;
+  }
+
+  function focusKeyOf(node) { return node.getAttribute('data-c2-focus'); }
+
+  function roleOf(key) { return key.slice(key.lastIndexOf('|') + 1); }
+
+  function focusables(main) {
+    return descendants(main, []).filter(function (n) { return focusKeyOf(n) !== null && !n.disabled; });
+  }
+
+  // Which stream control has focus (if any), and where it sits among the controls of its kind.
+  function captureFocus(main) {
+    var a = document.activeElement;
+    if (!a || a === main || !main.contains(a) || typeof a.getAttribute !== 'function') return null;
+    var key = focusKeyOf(a);
+    if (key === null) return null;
+    var role = roleOf(key);
+    var same = focusables(main).filter(function (n) { return roleOf(focusKeyOf(n)) === role; });
+    return { key: key, role: role, index: Math.max(0, same.indexOf(a)) };
+  }
+
+  // Keep focus in the stream. The same control is normally still there (kept in place, above).
+  // If it was replaced or its card is gone: the same control by key, else the one now at its
+  // position among controls of its kind (the next card's Later), else the deferred line (where
+  // a deferred card went), else the first Later, else the stream itself. Never the page.
+  function restoreFocus(main, captured) {
+    if (!captured) return;
+    var a = document.activeElement;
+    if (a && a !== main && main.contains(a)) return;
+    var all = focusables(main);
+    var byKey = all.filter(function (n) { return focusKeyOf(n) === captured.key; })[0];
+    var same = all.filter(function (n) { return roleOf(focusKeyOf(n)) === captured.role; });
+    var pick = byKey
+      || (same.length ? same[Math.min(captured.index, same.length - 1)] : null)
+      || all.filter(function (n) { return roleOf(focusKeyOf(n)) === 'show'; })[0]
+      || all.filter(function (n) { return roleOf(focusKeyOf(n)) === 'later'; })[0]
+      || main;
+    if (typeof pick.focus === 'function') pick.focus();
+  }
+
+  function firstByClass(node, cls) {
+    return descendants(node, []).filter(function (n) { return (' ' + n.className + ' ').indexOf(' ' + cls + ' ') >= 0; })[0] || null;
+  }
+
+  function buildStream(shell) {
+    var out = el('div', 'c2-stream-body');
+    if (shell.selection.status === 'unknown' && shell.teams.length) {
+      out.appendChild(unknownTeamBox(shell.teams));
+      return { node: out, chat: null };
     }
     var v = shell.view;
     if (!v) {
       // No snapshot yet: either still loading or the very first read failed.
-      thread.lastId = null;
-      if (!data.conn.reachable) {
-        main.appendChild(banner(M.freshness({}, data.conn, nowMs()).banner));
-      } else {
-        main.appendChild(el('p', 'c2-sub', 'Waiting for the first snapshot.'));
-      }
-      return;
+      if (!data.conn.reachable) out.appendChild(banner(M.freshness({}, data.conn, nowMs()).banner));
+      else out.appendChild(el('p', 'c2-sub', 'Waiting for the first snapshot.'));
+      return { node: out, chat: null };
     }
     var team = v.key;
-    if (v.banner) main.appendChild(banner(v.banner));
-    if (v.greeting.text) main.appendChild(el('h1', 'c2-greeting', v.greeting.text));
-    if (v.greeting.sub) main.appendChild(el('p', 'c2-sub', v.greeting.sub));
-    if (v.lead) main.appendChild(leadBlock(v.lead));
-    v.needs.open.forEach(function (card) { main.appendChild(needsCard(card, team)); });
-    if (v.needs.deferredCount > 0) main.appendChild(deferredLine(v.needs.deferredCount, team));
-    if (v.aside.rows.length) main.appendChild(asideBlock(v.aside.title, v.aside.rows, v.aside.more));
-    if (v.since && v.since.rows.length) main.appendChild(asideBlock(v.since.title, v.since.rows, 0));
-    if (v.chat) main.appendChild(chatThread(v.chat, savedThreadTop));
-    else thread.lastId = null;
-    if (v.composer) main.appendChild(composerBox(v.composer));
-    main.scrollTop = savedTop;
+    if (v.banner) out.appendChild(banner(v.banner));
+    if (v.greeting.text) out.appendChild(el('h1', 'c2-greeting', v.greeting.text));
+    if (v.greeting.sub) out.appendChild(el('p', 'c2-sub', v.greeting.sub));
+    if (v.lead) out.appendChild(leadBlock(v.lead));
+    v.needs.open.forEach(function (card) { out.appendChild(needsCard(card, team)); });
+    if (v.needs.deferredCount > 0) out.appendChild(deferredLine(v.needs.deferredCount, team));
+    if (v.aside.rows.length) out.appendChild(asideBlock(v.aside.title, v.aside.rows, v.aside.more));
+    if (v.since && v.since.rows.length) out.appendChild(asideBlock(v.since.title, v.since.rows, 0));
+    if (v.chat) out.appendChild(chatThread(v.chat));
+    if (v.composer) out.appendChild(composerBox(v.composer));
+    return { node: out, chat: v.chat };
+  }
+
+  function renderStream(shell) {
+    var main = document.getElementById('c2-stream');
+    if (!main) return;
+    var captured = captureFocus(main);
+    var built = buildStream(shell);
+    syncChildren(main, built.node);
+    // The thread is scrolled AFTER it is in the document (a detached element has no scroll
+    // layout), and only when it is a new element or has a new newest message: otherwise it
+    // stays wherever the operator left it.
+    var log = built.chat ? firstByClass(main, 'c2-thread') : null;
+    if (log) {
+      if (log !== thread.node || thread.lastId !== built.chat.lastId) log.scrollTop = log.scrollHeight;
+      thread.node = log;
+      thread.lastId = built.chat.lastId;
+    } else {
+      thread.node = null;
+      thread.lastId = null;
+    }
+    restoreFocus(main, captured);
   }
 
   // ------------------------------------------------------------------- rail
@@ -618,22 +729,62 @@
     return key === 'ageSeconds' || key === 'progressAge' ? undefined : value;
   }
 
-  function renderAll() {
-    var shell = M.buildShellView({
+  // The stream's signature leaves out what only the rail draws.
+  function railFreeReplacer(key, value) {
+    return key === 'roster' || key === 'usage' ? undefined : sigReplacer(key, value);
+  }
+
+  // A deferral or snooze of a stuck card is about one incident. When the agent has verifiably
+  // recovered (it is now in any state other than stuck or unknown, which keep the incident open),
+  // the incident is over and the local Later/Wait for it is dropped, so the next stall of that
+  // agent raises its own card. Not judged while the team is offline or unreadable.
+  function pruneRecovered(v) {
+    if (!v || v.banner || v.mode === 'error' || v.mode === 'loading') return false;
+    var changed = false;
+    [later.deferred, later.snoozed].forEach(function (table) {
+      var map = table[v.key];
+      if (!map) return;
+      Object.keys(map).forEach(function (id) {
+        if (id.indexOf('stuck:') !== 0) return;
+        var name = id.slice('stuck:'.length);
+        var row = v.roster.rows.filter(function (r) { return r.name === name; })[0];
+        if (!row || (row.state !== 'stuck' && row.state !== 'unknown')) {
+          delete map[id];
+          changed = true;
+        }
+      });
+    });
+    if (changed) saveLater();
+    return changed;
+  }
+
+  function buildShell() {
+    return M.buildShellView({
       roots: currentRoots(), attentionByRoot: data.attention, chatByRoot: data.chat, param: rootParam,
       nowMs: nowMs(), generatedMs: data.generatedMs, conn: data.conn, ui: ui, uiFor: uiFor, canAct: false
     });
+  }
+
+  function renderAll() {
+    var shell = buildShell();
+    if (pruneRecovered(shell.view)) shell = buildShell();
     syncTeamChips(shell.teams);
     var app = document.getElementById('app');
     if (app) app.className = shell.view && shell.view.stale ? 'is-stale' : '';
-    // Redraw the stream and rail only when what they show has changed (a redraw every
-    // 2 s would reset scrolling and text selection for nothing).
-    var sig = JSON.stringify([shell.selection, shell.view, data.conn.reachable, data.snapshot === null,
-      shell.teams.map(function (t) { return t.key + '|' + t.label; })], sigReplacer);
-    if (sig === lastSig) return;
-    lastSig = sig;
-    renderStream(shell);
-    renderRail(shell);
+    // Redraw a region only when what it shows has changed. The stream is then updated in place
+    // (see syncChildren), so a redraw does not disturb focus, scrolling or selection.
+    var v = shell.view;
+    var streamSig = JSON.stringify([shell.selection, v, data.conn.reachable, data.snapshot === null,
+      shell.teams.map(function (t) { return t.key + '|' + t.label; })], railFreeReplacer);
+    var railSig = JSON.stringify(v ? [v.mode, v.roster, v.usage] : null, sigReplacer);
+    if (streamSig !== lastSig) {
+      lastSig = streamSig;
+      renderStream(shell);
+    }
+    if (railSig !== lastRailSig) {
+      lastRailSig = railSig;
+      renderRail(shell);
+    }
   }
 
   // ------------------------------------------------------------------- data
@@ -806,6 +957,8 @@
   loadLater();
   buildHeader();
   renderHints();
+  var streamRoot = document.getElementById('c2-stream');
+  if (streamRoot) streamRoot.setAttribute('tabindex', '-1');
   on(document, 'keydown', onKey);
   on(window, 'pagehide', saveVisit);
   loop();
