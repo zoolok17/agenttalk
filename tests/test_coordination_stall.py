@@ -857,16 +857,23 @@ def test_stall_identity_and_disposition_survive_age_ticks(tmp_path: Path) -> Non
     assert applied["state"] == "dismissed"
 
 
-def test_only_consult_and_handoff_skills_adopt_wrapped_await_reply() -> None:
+def test_only_consult_handoff_and_challenge_skills_adopt_wrapped_await_reply() -> None:
     skills = Path(__file__).parents[1] / "src" / "agenttalk" / "skills"
     adopters = {
         path.relative_to(skills).as_posix()
         for path in skills.rglob("*")
         if path.is_file() and "--await-reply" in path.read_text(encoding="utf-8")
     }
+    # The challenge twins adopt it for the same reason consult does: the requester
+    # sends a question and needs the correlated answer in a LATER wrapped turn. Like
+    # consult, they branch on AGENTTALK_WRAPPER_GENERATION and send WITHOUT the flag
+    # unwrapped, where it is refused (tests/test_challenge_skill.py executes both
+    # branches). Every other skill must keep staying off it.
     assert adopters == {
+        "claude/agenttalk.challenge.md",
         "claude/agenttalk.consult.md",
         "claude/agenttalk.handoff.md",
+        "codex/agenttalk-challenge/SKILL.md",
         "codex/agenttalk-consult/SKILL.md",
         "codex/agenttalk-handoff/SKILL.md",
     }

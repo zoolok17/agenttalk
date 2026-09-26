@@ -4,3 +4,5 @@
 # Public schema type used by ChildEstablishmentGuardV1.key; not a credential.
 0ae2e8858614efd2f1294e1cd2eb7a98e2564e37:docs/DESIGN-87A-supervisor-classifier-authority.md:generic-api-key:377
 0ae2e8858614efd2f1294e1cd2eb7a98e2564e37:docs/DESIGN-87A-supervisor-classifier-authority.md:generic-api-key:383
+# Superseded PR #202 branch docs/console-v2-design: a keyboard handler `const k=e.key, cnt=vis.length;` in a design prototype; not a credential (the merged copy carries gitleaks:allow). The gate scans --all refs, so this commit is scanned while that branch exists.
+b033979a00770d0511f724b4084d4d5aae68114a:design/console-v2/prototype/Console Futures.dc.html:generic-api-key:1341

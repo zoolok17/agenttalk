@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 
+from agenttalk import reply_transport
+
 # #wrapper-reply-channels increment B: every CLI invocation below is written
 # ONCE, in PowerShell form (the majority-population default and the shape
 # every rules string was already hardcoded to) - a single, exact, literal
@@ -114,6 +116,14 @@ _DEFAULT_RULES = (
     "- question with meta.consult=true: ATTACK the draft, do not endorse; reply "
     "kind=message echoing request_id + consult=true + round, ending with agree / "
     "disagree / qualified-agree; do not start your own consult.\n"
+    "- question with meta.challenge=true: you are the CHALLENGER of proposed work "
+    "(agenttalk challenge skill) - a read-only desk check (no edits, no builds, about "
+    "10 minutes); judge the need, not who asked. Reply ONCE with the typed CLI verdict "
+    "shown below (there is no draft channel for it): kind=message with meta "
+    "challenge=true, verdict=proceed|reshape|probe|replace|defer|stop|unassessed, "
+    "confidence, basis, exposed and minutes, and every required section (Headline, "
+    "Case against, Case for, Alternatives, What would change my mind, Kill signal, "
+    "Checked). Do not challenge the challenge.\n"
     "- ordinary tracked question owing a plain answer: answer on the thread. A "
     "broadcast question that does not "
     "concern your role: reply --na (never placeholder-ack, never go silent).\n"
@@ -282,6 +292,19 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
                 "--file <path-you-just-wrote>",
                 "Declining the work still needs a typed response, never a bare refusal or "
                 "--na: add --meta status=declined --meta reason=<why>.",
+            ]
+        elif reply_transport.is_challenge_question(record):
+            out += [
+                "This is a CHALLENGE question: your reply MUST be ONE typed CLI verdict "
+                "(no draft channel - it cannot carry the verdict meta, and a verdict "
+                "without it counts as unassessed). Write the required sections to a file "
+                "with your Write tool, then send:",
+                f"  & \"$env:AGENTTALK_PY\" -m agenttalk reply {anchor} --kind message "
+                "--meta challenge=true "
+                "--meta verdict=<proceed|reshape|probe|replace|defer|stop|unassessed> "
+                "--meta confidence=<high|medium|low> "
+                "--meta basis=<verified|reasoned|unknown> --meta exposed=<yes|no> "
+                "--meta minutes=<n> --file <path-you-just-wrote>",
             ]
         else:
             out += [
