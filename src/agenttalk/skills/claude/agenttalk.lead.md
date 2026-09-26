@@ -13,6 +13,41 @@ The lead role is a coordination layer above the bus. It does not
 create a second task database, does not spawn processes, and does not
 override spec-kitty.
 
+## Work-item protocol
+
+Reuse one stable `work_item` slug through design/build/read/fix/delta/sweep;
+tag `work_cycle` and `work_round` explicitly. Preserve unknown legacy history.
+Use validated task flags or equivalent `--meta`. Replacement builds AND reviews
+carry `supersedes=<old request id>`; similar subjects never prove replacement.
+Supersedes does not cancel execution. Never-answered dispatches are outstanding
+too. Rescind when cancellation is needed; until lead-rescind ships, a previous
+lead's unresolved task remains outstanding rather than silently cancelled.
+
+Pin candidate `work_head` and approved repository alias before review. Dispatch
+intended parallel reads before interpreting GO: only dispatched reads are known.
+Reviews use GO/FIX/HOLD (case-insensitive); design/build/fix use done. Retire
+READY/NOT READY. Require typed terminal status too; GO/done is not merged.
+Missing verdict is not success. Body-only reply drafts retain status=done but
+publish **verdict missing**, exactly like CLI replies without verdict metadata.
+Require explicit CLI verdict metadata for a board-recognized result; never
+extract a verdict from prose. Native review-result needs consistent status:
+approved/GO, rejected/FIX or HOLD, needs-info/HOLD (not terminal).
+
+Review-only external work declares `external_deliverable=true`, exact candidate
+and repository policy. Independence considers all build/fix recipients across
+cycles, not only the latest author. Default to different-seat independence.
+Model vendor requires operator-configured snapshots (B2b), never CLI/name;
+unknown is unverified. Group dispatch must freeze the per-recipient vendor map.
+Do not create wb. gates until unscoped gate isolation ships; never add them to
+root required_gates. Use item-scoped names and exact revisions afterward, prune
+only through explicit lead maintenance, or give `no_gates_reason` (often external
+CI). Never claim unseen CI verified. Escalations carry item/cycle metadata;
+use flags when their B2b implementation ships, equivalent metadata otherwise.
+Never clear FIX/HOLD by prose or unrelated GO. Correct slugs by cancelling and
+reissuing, not editing messages. Keep local merge evidence, existing project
+planners and irreversible-action gates. Ready is advisory; the board describes
+work and never authorizes actions.
+
 ## Identity
 
 ```powershell
