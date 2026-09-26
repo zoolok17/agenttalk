@@ -16,6 +16,53 @@ import pytest
 
 from agenttalk.store import Store
 
+
+@pytest.fixture(scope="session")
+def acceptance_project_template(tmp_path_factory):
+    """Copied, never shared, by acceptance tests needing a synthetic Git root."""
+    project = tmp_path_factory.mktemp("acceptance-project-template")
+
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(project), *args],
+                                       stderr=subprocess.STDOUT).decode().strip()
+
+    git("init", "-q")
+    # Disable automatic writers before the first commit. check_output waits for
+    # each foreground Git command; neither this template nor its candidate copy
+    # may leave detached maintenance changing .git while copytree reads it.
+    git("config", "gc.auto", "0")
+    git("config", "maintenance.auto", "false")
+    git("config", "gc.autoDetach", "false")
+    git("config", "user.name", "Synthetic Author")
+    git("config", "user.email", "synthetic@example.invalid")
+    (project / "source.txt").write_text("synthetic source\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-qm", "synthetic fixture")
+    return project, git("rev-parse", "HEAD")
+
+
+@pytest.fixture(scope="session")
+def acceptance_project_identity(acceptance_project_template):
+    from agenttalk import acceptance
+    project, sha = acceptance_project_template
+    return acceptance.project_id(acceptance.verify_project(project, sha))
+
+
+@pytest.fixture(scope="session")
+def acceptance_candidate_template(acceptance_project_template, tmp_path_factory):
+    """A second snapshot of the same template history for schema-3 fixtures."""
+    template, _ = acceptance_project_template
+    project = tmp_path_factory.mktemp("acceptance-candidate-template") / "project"
+    shutil.copytree(template, project)
+    # The copied config already disables maintenance before this commit too.
+    (project / "source.txt").write_text("synthetic candidate\n", encoding="utf-8")
+    subprocess.check_output(["git", "-C", str(project), "commit", "-qam", "candidate from verified base"],
+                            stderr=subprocess.STDOUT)
+    sha = subprocess.check_output(["git", "-C", str(project), "rev-parse", "HEAD"],
+                                  stderr=subprocess.STDOUT).decode().strip()
+    return project, sha
+
+
 _SYMLINK_DEVMODE_SUBKEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock"
 _SYMLINK_DEVMODE_VALUE = "AllowDevelopmentWithoutDevicePrivilege"
 #: Dedicated, repo-specific opt-in - required IN ADDITION to CI/

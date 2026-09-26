@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Reduce acceptance Git process overhead with command-local metadata/history
+  reuse, compatible batched queries, and copied session test repositories (#198).
+  Live HEAD/dirty checks and retained-evidence validation remain in place.
+  Disable automatic Git maintenance before template commits so repository
+  copies cannot race with detached maintenance; limit CLI caching to `close`.
+
 ## [0.92.0] - 2026-09-25
 
 Theme: **cooperative acceptance passes on `close`, and the OVH/Qwen

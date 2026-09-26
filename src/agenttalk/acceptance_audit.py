@@ -4,7 +4,7 @@ from datetime import datetime
 import os
 import subprocess  # nosec B404 - fixed Git argv lists; shell is never used
 
-from agenttalk import acceptance as A, acceptance_coverage as coverage, close, gates
+from agenttalk import acceptance as A, acceptance_coverage as coverage, acceptance_git, close, gates
 
 
 def lineage(store, record):
@@ -103,9 +103,17 @@ def _git(project, *args, data=None):
     """Read real objects, with identical Git environment for ancestry and content."""
     env = {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_")}
     env["GIT_NO_REPLACE_OBJECTS"] = "1"
-    try:
+    def read():
         return subprocess.run(["git", "-C", project["locator"], *args], capture_output=True,  # noqa: S603,S607  # nosec B603 B607
                               input=data, timeout=10, env=env)
+
+    try:
+        # These fixed, read-only probes have bounded output. Do not retain the
+        # potentially large diff/patch input in the command cache.
+        if args[0] in {"rev-parse", "merge-base"}:
+            key = ("audit", project["locator"], args, tuple(sorted(env.items())))
+            return acceptance_git.read_once(key, read)
+        return read()
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise A.AcceptanceError("acceptance_cold_missing", "source identity Git unavailable") from exc
 
@@ -134,6 +142,11 @@ def related_revisions(project, earlier, later):
 def change_identity(project, plan):
     """Stable patch-id of the complete frozen base-to-candidate diff."""
     base = plan["cold_policy"]["change_base"]
+    key = ("change", project["locator"], project["revision"], base, tuple(sorted(os.environ.items())))
+    return acceptance_git.read_once(key, lambda: _change_identity(project, base))
+
+
+def _change_identity(project, base):
     revision = project["revision"]
     _complete_history(project, base, revision)
     for sha in (base, revision):
