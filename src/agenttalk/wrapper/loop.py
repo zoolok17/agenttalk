@@ -216,6 +216,13 @@ def _with_reply_draft(store, agent: str, record: dict) -> dict:
     record_meta = record.get("meta") if isinstance(record.get("meta"), dict) else {}
     if record_meta.get("consult"):
         return record
+    # A challenge verdict must carry typed meta (challenge, verdict, confidence,
+    # basis, exposed, minutes) the body-only draft channel cannot carry either;
+    # a draft-published verdict would reach the requester without it and count
+    # as unassessed. Match the question marker exactly: dispatches reuse the
+    # `challenge` key for a request-id reference, and those keep the channel.
+    if reply_transport.is_challenge_question(record):
+        return record
     # A kind=message arriving on a review-request/proposal thread (e.g. the
     # author's answer to a needs-info review-result) owes a TYPED response
     # next — publishing a draft as kind=message would commit the turn while

@@ -90,6 +90,10 @@ implementation work.
 
    ## Decision requested
    <accepted / rejected / countered, and what each means>
+
+   ## Challenge
+   <for major work (see $agenttalk-challenge): request id, verdict and
+   disposition, or exempt:<reason>>
    ```
 4. Send:
    ```bash

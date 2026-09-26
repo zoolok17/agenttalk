@@ -256,6 +256,10 @@ the agents you plan.
   the reply correlates). Both are typed wrappers over send/reply that stamp reserved audit
   metadata through the 0.42.0 audit guard; never hand-roll that metadata. The lead-loop to
   operator direction stays `python -m agenttalk escalate`.
+- **Challenge an operator idea before it becomes work.** When operator input is
+  an idea or wish rather than an order whose why is settled, run
+  `$agenttalk-challenge` before turning it into work orders, and bring a
+  replace/defer/stop verdict back to the operator as its 3-line escalation.
 - **Fresh-context evidence-only reviewers.** When risk justifies an independent look
   (gate/close/authority/persistence/security surfaces, a final SHA, or where a standing
   reviewer helped design the change), request a one-shot fresh reviewer with
@@ -304,6 +308,14 @@ the agents you plan.
    ```
 3. Clarify the mission only if necessary. For an implementation split
    outside spec-kitty, get explicit user approval before dispatching.
+   Before dispatching MAJOR work (the threshold in `$agenttalk-challenge`:
+   2+ work orders, ~2 agent-hours, a format/schema/public-CLI/shipped-skill
+   change, a new dependency or data flow, money/security/irreversible, any
+   operator idea, or unknown size), challenge it first and carry the result
+   on the dispatch (`python -m agenttalk task` or the assignment below):
+   `--meta challenge=<request_id> --meta challenge_verdict=<verdict> --meta challenge_disposition=<disposition>`,
+   or `--meta challenge=exempt:<reason>`. Only the operator overrides a
+   replace/defer/stop verdict; escalate it.
 4. Decompose into small assignments with clear owners and reviewers.
    For implementation lanes, run `& "$env:AGENTTALK_PY" -m agenttalk lane assign ...`
    first; it provisions the isolated worktree by default. Include
