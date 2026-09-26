@@ -3416,6 +3416,8 @@ class Store:
                     work_tags.validate_replacement(
                         meta, sender, self.valid_messages(), (self.sole_lead(), self.operator_facing()),
                     )
+                if meta.get("external_deliverable") is True and kind in work_tags.OPENERS:
+                    work_tags._external_opener(self, sender, kind, meta)
                 self._reserve_message_publication_sequence(
                     msg.id,
                     self.valid_messages(),

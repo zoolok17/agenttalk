@@ -1,8 +1,10 @@
 """Validated work-item publication metadata; no board state or prose inference."""
 
+import json
 import re
 
-FIELDS = ("work_item", "stage", "work_cycle", "work_round", "work_head", "supersedes", "work_title")
+FIELDS = ("work_item", "stage", "work_cycle", "work_round", "work_head", "supersedes", "work_title",
+          "external_deliverable")
 STAGES = {"design", "build", "read", "fix", "delta", "sweep"}
 REVIEWS = {"read", "delta", "sweep"}
 OPENERS = {"task", "review-request"}
@@ -10,6 +12,12 @@ REPLIES = {"task-response": "task", "review-result": "review-request"}
 
 
 def value(key, raw):
+    if key == "external_deliverable":
+        if type(raw) is bool:
+            return raw
+        if isinstance(raw, str) and raw in {"true", "false"}:
+            return raw == "true"
+        raise ValueError("external_deliverable must be true or false")
     if key in {"work_cycle", "work_round"} and type(raw) is int:
         raw = str(raw)
     if not isinstance(raw, str):
@@ -73,7 +81,27 @@ def validate_replacement(meta, sender, messages, authorities):
     return original
 
 
+def _external_opener(store, sender, kind, meta):
+    if kind not in OPENERS or sender != store.sole_lead() or meta.get("stage") not in REVIEWS:
+        raise ValueError("external deliverable requires a lead-issued review dispatch")
+    for key in ("work_item", "work_head", "work_repo", "work_branch", "work_target"):
+        if not isinstance(meta.get(key), str) or not meta[key].strip() or len(meta[key]) > 256:
+            raise ValueError(f"external deliverable requires bounded {key}")
+    gates = meta.get("required_gates")
+    if isinstance(gates, str) and len(gates) <= 4096:
+        gates = json.loads(gates)
+    if (not isinstance(gates, list) or len(gates) > 64
+            or any(not isinstance(g, str) or not re.fullmatch(r"[a-z0-9-]{1,24}", g) for g in gates)):
+        raise ValueError("external deliverable requires an explicit check-key array (at most 64 keys)")
+    reason = meta.get("no_gates_reason")
+    if (gates and reason is not None) or (not gates and (
+            not isinstance(reason, str) or not reason.strip() or len(reason) > 1024)):
+        raise ValueError("empty checks require a bounded no_gates_reason; nonempty checks forbid it")
+
+
 def normalize(store, sender, recipient, kind, meta):
+    if {"assignee_model_vendors", "assignee_model_vendor"} & meta.keys():
+        raise ValueError("assignee_model_vendors is publisher-owned; vendor metadata overrides are forbidden")
     result = dict(meta)
     for key in FIELDS:
         if key == "supersedes" and kind == "rescind":
@@ -86,11 +114,18 @@ def normalize(store, sender, recipient, kind, meta):
         original = validate_replacement(
             result, sender, store.valid_messages(), (store.sole_lead(), store.operator_facing()),
         )
+        expected_external = value("external_deliverable", original.meta.get("external_deliverable", False))
+        if result.get("external_deliverable", expected_external) != expected_external:
+            raise ValueError("replacement external_deliverable contradicts original declaration")
+        if "external_deliverable" in original.meta:
+            result["external_deliverable"] = expected_external
         for key in ("work_repo", "work_branch", "work_target", "required_gates", "no_gates_reason"):
             if key in original.meta:
                 if key in result and result[key] != original.meta[key]:
                     raise ValueError(f"replacement {key} contradicts original dispatch policy")
                 result[key] = original.meta[key]
+    if result.get("external_deliverable") is True and kind not in REPLIES:
+        _external_opener(store, sender, kind, result)
     if kind not in REPLIES:
         return result
     messages = store.valid_messages()
@@ -107,8 +142,8 @@ def normalize(store, sender, recipient, kind, meta):
             or (result.get("in_reply_to") and anchor is None)
             or (anchor is not None and anchor.meta.get("request_id") != rid)):
         raise ValueError("work reply participant, kind or correlation contradicts opener")
-    for key in ("work_item", "stage", "work_cycle", "work_round", "work_head"):
-        expected = opener.meta.get(key, "1" if key == "work_cycle" else None)
+    for key in ("work_item", "stage", "work_cycle", "work_round", "work_head", "external_deliverable"):
+        expected = opener.meta.get(key, {"work_cycle": "1", "external_deliverable": False}.get(key))
         if expected is not None:
             expected = value(key, expected)
         # Builders can report their output; a review must remain on its pinned OID.

@@ -61,6 +61,25 @@ Whitespace and privacy checks accompany the local commit. Task scratch
 `tk-56e02d050a1d` retains red/green and compatibility logs for the cold read.
 Commits remain local; no push or PR in this slice.
 
+## B2a-f — finalized declaration and publisher ownership contract
+
+Base `b54c05cc`; design `09b54296` section 8. Strict boolean/true/false external
+declarations inherit across replacements and replies; contradictory overrides
+refuse. True openers require current sole lead, review stage, item/full head,
+repo/branch/target and explicit checks. Authority is rechecked under publication
+lock. Declaration bounds: repository strings 256 characters, check JSON 4096
+characters / 64 keys of at most 24 characters, empty-check reason 1024 characters.
+Nonempty checks forbid a no-gates reason. Both vendor metadata spellings refuse
+at shared publication, including injected draft metadata. B2b owns map generation.
+Both skill twins revise the existing cancellation, external provenance, exact
+vendor-map and B6a/B6b themes; all-cycle independence remains. Whole-history mixed
+provenance stays B3 work; no rescind, cleanup or reducer implementation is added.
+Failing-first: 18 failed, 57 deselected (2.51 s); first green: 75 passed (8.77 s).
+Final Python 3.10 tags/drafts/skill lint/install selection: 164 passed (13.47 s).
+Python 3.14 work-tag control: 81 passed (8.93 s). Ruff and Bandit pass changed
+Python files (B101 excluded for test assertions); whitespace check passes.
+Targeted foreground logs retained under task scratch `tk-b3b13b81a46b` for review.
+
 ## B3a — pure causal reducer
 
 Base: `feat/work-board-b2a` `b54c05c`. Contract: design/work-board `09b5429`,
