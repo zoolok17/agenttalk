@@ -533,6 +533,8 @@ open/check/publish integration. Stop here for the required cold read.
   without cache locators, relative file paths, banners or proof-log content.
   Unsafe-root messages tell the operator to pass a fully resolved path without
   links or reparse ancestors, including aliased temporary roots and placeholders.
+  M2b limits that advice to an actually detected link/reparse point; missing files
+  and identity races receive ordinary unavailable diagnostics.
   Caller-labelled ID errors state the fixed rule without printing submitted values.
 
 The operator stages files and captures observations separately, then runs:
@@ -557,6 +559,9 @@ status, per-entry/per-row holds, and per-file expected digest/size/status/retent
 classification. Distribution bytes are streamed and discarded, never copied into
 retained evidence. Declarative bytes are bounded reads; durable retention and the
 historical missing-cache display remain M3 work.
+Each hold has a public `ref`: the registry pin ID for file failures, the entry ID
+for its banner/offline proof, the row ID for overrides, or the fixed `preflight`
+scope for failures before a specific pin is known. Text output prints `[ref]`.
 
 | Condition | Code | Outcome |
 | --- | --- | --- |
@@ -580,14 +585,20 @@ informational row; M3 will apply the existing row-policy fold for close decision
 
 External-denial and offline-recipe modes validate supplied evidence only. A positive
 control requires both its observation flag and exact log line; recipes additionally
-require the cache-hit flag and line. A fetch flag or exact fetch marker fails.
+require the cache-hit flag and line. Only external-denial requires `egress_denied`;
+offline-recipe relies on its own control/cache-hit evidence. A fetch flag or exact
+fetch marker fails in both modes.
 Endpoints require literal loopback IP addresses and declared ownership; unresolved
 hostnames, scoped addresses, external addresses and unowned endpoints fail. These
 are cooperative declarations, not a network sandbox or process-ownership attestation.
+IPv4-mapped IPv6 addresses are classified using their mapped IPv4 address, so
+supported Python versions agree on the same bytes.
 Provenance and adapter/config files are validated and digest-bound data, never run.
 
 Additional evaluator limits: 2 GiB per distribution, 8 GiB total distribution
-bytes, streaming chunks at most 1 MiB. Each declarative file and each imported
+bytes, streaming chunks at most 1 MiB. M2b reads a distribution only up to its
+declared size plus one sentinel byte; excess bytes immediately yield a mismatch.
+Each declarative file and each imported
 plan/registry/observation record is at most 1 MiB. Registry declarative files,
 planned override evidence, and observed override/banner/proof evidence each have
 a separate 16 MiB aggregate budget. Exceeding a budget refuses green status;
@@ -638,3 +649,75 @@ in acceptance/CLI; test assertions are intentionally excluded from B101.
 Task scratch is retained for review: red/green fixtures, M1c mutation copy/log,
 the five M2 mutation scripts/logs and isolated test roots. No private locator is
 included in public documentation or report output.
+
+## M2b: cold-read corrections
+
+Authority: `tk-046fd6cf218f`; base `6fbd1e9`. This delta implements F1–F5/F7
+and records F6/F8 for M3. M3 remains unstarted pending the short delta read.
+
+| Finding | Change and evidence |
+| --- | --- |
+| F1 interpreter-dependent mapped loopback | Normalize IPv4-mapped IPv6 before classification. The table retains all 21 reviewer spellings and adds octal/leading-zero/integer controls. The unchanged R2 probe gives identical outcomes on Python 3.10 and 3.14. |
+| F2 offline modes | Require denial only for external-denial. Recipe positive-control/cache-hit evidence can pass with `egress_denied=false`; recorded fetch flags or whole-line markers fail both modes. |
+| F3 CLI status | Import errors use the evaluator's status mapping; stale/integrity failures print `fail`, invalid policy prints `refusal`, unavailable inputs print `not-run`. JSON tests and unchanged R12 probes cover these outcomes. |
+| F4 guard gaps | Tests cover status membership, evaluation race/link refusals, streaming peak memory, separate evidence roots including overrides and CLI, null checker banners, snapshot consumption/dependency/provenance closure, clock types, override errors, bounded CLI diagnostics, non-object plans, OS errors and legacy KeyError translation. |
+| F5 diagnostic references | Every hold carries a public `ref`, preserved during deduplication and printed in text mode. Missing files no longer suggest resolving links. R9 confirms missing pin identification without locator, relative-path or banner leakage. |
+| F7 bounded distribution reads | Stop at declared size plus one and classify excess as mismatch. A reader spy proves a two-byte pin causes at most a three-byte read; streaming memory stays bounded rather than accumulating distribution chunks. |
+
+### Deferred lead decisions for M3
+
+- **F6 authoring guidance:** the worked staging example must specify banner/log
+  captures as strict UTF-8 without BOM. Warn that Windows PowerShell 5.1 `>` writes
+  UTF-16. Show PowerShell 7 (`pwsh`) with `Out-File -Encoding utf8NoBOM`; do not
+  present that encoding switch as available in Windows PowerShell 5.1. This is
+  documentation work for the authorized M3 walkthrough, not a new M2 decoder change.
+- **F8 publication cost:** hash staged distributions outside the store-wide
+  acceptance lock; inside the lock re-check size and file identity before committing.
+  Preserve the cooperative mutation boundary and reject changed inputs. Do not
+  hold the store lock while hashing gigabytes. M3's first commit still introduces
+  the schema-dispatch helper and comparison-site test before lifecycle integration.
+
+### Red/green and mutation evidence
+
+Before the fixes, the new regression run had **10 failed, 97 passed**: both mapped
+loopback spellings on 3.10, valid recipe evidence, four CLI statuses, race advice,
+the declared-size read bound, and missing public pin references. All were behavior
+assertions, not setup/collection errors. The subsequent targeted tests pass on both
+interpreters; no existing assertion was weakened.
+
+The unchanged reviewer `mutate_m2.py` baseline on an isolated copy of `6fbd1e9`
+was **51 killed, 32 survived, 0 skipped**. After the fixes and tests:
+
+- First unchanged-script run: **61 killed, 9 survived, 13 exact-text skips**.
+- A scratch-only adapter retained the same mutation intent at the 13 changed
+  sites: **12 killed, 1 survived, 0 skipped**.
+- Additional boundary tests killed seven remaining original mutants; the escaping
+  registry-reference test killed C7. Aggregate final original-table evidence:
+  **81 killed, 2 survived, 0 unresolved skips**, across these completed runs.
+- D7's remaining catch deletion is equivalent: `AcceptanceError` derives from
+  `CloseError(ValueError)`, so the unchanged `ValueError` catch still handles it.
+  A supplementary mutant that actually re-raises acceptance errors was killed.
+  V24 removes a redundant aggregate: import requires file use and per-entry input
+  closure already propagates every required pin's holds. Neither survivor is claimed
+  as a killed mutant or proof of additional coverage.
+
+The adapter initially had a variable-name error; a boundary rerun initially lacked
+its scratch parent. Those invalid runs are retained and excluded from all counts.
+Corrected runs completed and restored their scratch sources. Reviewer scripts and
+the working source were never mutated by these runners.
+
+Final commands use the same targeted file/node list as the M2 section, source
+`PYTHONPATH`, `PYTHONDONTWRITEBYTECODE=1`, and distinct task-scratch basetemps.
+Python 3.10: **351 passed, 3 skipped in 15.39 s**. Python 3.14:
+**351 passed, 3 skipped in 14.82 s**. The skips remain the host-restricted symlink
+and two POSIX-only cases. Both include the complete registry and preflight files,
+Git-read regression file and three legacy close smoke tests named above.
+Ruff and Bandit cover `acceptance_preflight.py`, `cli.py` and
+`test_acceptance_preflight.py` (test assertions excluded with `-s B101`). Negative
+all-interface address data has an explicit S104/B104 annotation; it opens no socket.
+All three final lint/security commands exit zero with no findings; Bandit emits
+existing suppression-comment warnings. Patch whitespace and the added-line privacy
+scan pass; the privacy scanner has eight positive controls.
+No full suite, downloads or staged-tool launches are used. Task scratch is retained
+for the delta reader: baseline/after source copies, mutation/probe logs and isolated
+test roots.

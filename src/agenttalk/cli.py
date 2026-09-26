@@ -3545,9 +3545,11 @@ def cmd_acceptance_preflight(args: argparse.Namespace) -> int:
         detail = str(exc)[:256]
         if "link" in detail or "reparse" in detail:
             detail += "; pass fully resolved paths without links or reparse ancestors"
-        result = {"status": "not-run", "entries": [], "holds": [P.hold(exc.code, detail)]}
+        holds = [P.hold(exc.code, detail)]
+        status = "refusal" if exc.code == "acceptance_policy_invalid" else P._status(holds)
+        result = {"status": status, "entries": [], "holds": holds}
     except (OSError, ValueError):
-        result = {"status": "not-run", "entries": [], "holds": [P.hold(P.UNAVAILABLE, P.ROOT_ADVICE)]}
+        result = {"status": "not-run", "entries": [], "holds": [P.hold(P.UNAVAILABLE, P.UNAVAILABLE_DETAIL)]}
     if args.json:
         print(json.dumps(result, sort_keys=True))
     else:
@@ -3555,9 +3557,9 @@ def cmd_acceptance_preflight(args: argparse.Namespace) -> int:
         for entry in result["entries"]:
             print(f"  {entry['id']}: {entry['status']}")
             for issue in entry["holds"]:
-                print(f"    {issue['code']}: {issue['detail']}")
+                print(f"    {issue['code']} [{issue['ref']}]: {issue['detail']}")
         for issue in result["holds"]:
-            print(f"  {issue['code']}: {issue['detail']}")
+            print(f"  {issue['code']} [{issue['ref']}]: {issue['detail']}")
     return 0 if result["status"] == "pass" else 3
 
 

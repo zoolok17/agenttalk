@@ -22,14 +22,15 @@ UNPROVEN = "acceptance_offline_unproven"
 VIOLATION = "acceptance_offline_violation"
 INTEGRITY = "acceptance_record_missing"
 ROOT_ADVICE = "staged input unavailable; pass a fully resolved root without links or reparse ancestors"
+UNAVAILABLE_DETAIL = "staged input is missing, unreadable or changed while opening"
 
 
 def decision_time():
     return datetime.now(timezone.utc).replace(microsecond=0)
 
 
-def hold(code, detail):
-    return {"code": code, "detail": detail}
+def hold(code, detail, ref="preflight"):
+    return {"code": code, "detail": detail, "ref": ref}
 
 
 def _status(holds):
@@ -40,8 +41,8 @@ def _status(holds):
 
 
 def _unique(holds):
-    return [{"code": code, "detail": detail} for code, detail in
-            sorted({(h["code"], h["detail"]) for h in holds})]
+    return [hold(code, detail, ref) for code, detail, ref in
+            sorted({(h["code"], h["detail"], h["ref"]) for h in holds})]
 
 
 def read_input(path):
@@ -54,10 +55,14 @@ def read_input(path):
     return data
 
 
-def _read_pin(root, ref, budget, *, distribution=False, evidence=False):
+def _read_pin(root, ref, budget, *, distribution=False, evidence=False, public_ref=None):
+    public_ref = public_ref or ref.get("id", "preflight")
     limit = MAX_DISTRIBUTION_BYTES if distribution else R.MAX_INPUT_BYTES
     if ref["size"] > limit or ref["size"] > budget[0]:
-        return None, [hold(UNAVAILABLE if distribution else INTEGRITY, "staged input exceeds read budget")]
+        return None, [hold(UNAVAILABLE if distribution else INTEGRITY, "staged input exceeds read budget", public_ref)]
+    if distribution:
+        # One sentinel byte proves a size mismatch without hashing an oversized file.
+        limit = ref["size"]
     digest, size, chunks = hashlib.sha256(), 0, []
     try:
         with R.staged_stream(root, ref["path"]) as stream:
@@ -67,16 +72,20 @@ def _read_pin(root, ref, budget, *, distribution=False, evidence=False):
                     break
                 size += len(data)
                 budget[0] -= len(data)
+                if distribution and size > ref["size"]:
+                    return None, [hold(MISMATCH, "staged size or digest differs from pin", public_ref)]
                 if size > limit or budget[0] < 0:
-                    return None, [hold(UNAVAILABLE if distribution else INTEGRITY, "staged input exceeds read budget")]
+                    return None, [hold(UNAVAILABLE if distribution else INTEGRITY,
+                                       "staged input exceeds read budget", public_ref)]
                 digest.update(data)
                 if not distribution:
                     chunks.append(data)
-    except (A.AcceptanceError, OSError, ValueError):
+    except (A.AcceptanceError, OSError, ValueError) as exc:
         # Import-time policy refusals remain strict; an evaluation race is retryable.
-        return None, [hold(UNAVAILABLE, ROOT_ADVICE)]
+        linked = isinstance(exc, A.AcceptanceError) and ("link" in str(exc) or "reparse" in str(exc))
+        return None, [hold(UNAVAILABLE, ROOT_ADVICE if linked else UNAVAILABLE_DETAIL, public_ref)]
     if size != ref["size"] or digest.hexdigest() != ref["sha256"]:
-        return None, [hold(INTEGRITY if evidence else MISMATCH, "staged size or digest differs from pin")]
+        return None, [hold(INTEGRITY if evidence else MISMATCH, "staged size or digest differs from pin", public_ref)]
     return None if distribution else b"".join(chunks), []
 
 
@@ -95,25 +104,29 @@ def _offline(entry, observed, lines):
         errors.append(hold(UNPROVEN, "offline proof mode differs from policy"))
     if not proof["positive_control"] or policy["positive_control"] not in lines:
         errors.append(hold(UNPROVEN, "offline positive control is absent"))
-    if not proof["egress_denied"] or proof["attempted_fetch"] or policy["real_fetch"] in lines:
+    if ((policy["mode"] == "external-denial" and not proof["egress_denied"])
+            or proof["attempted_fetch"] or policy["real_fetch"] in lines):
         errors.append(hold(VIOLATION, "external egress or attempted fetch is recorded"))
     if policy["mode"] == "offline-recipe" and (not proof["cache_hit"] or policy["cache_hit"] not in lines):
         errors.append(hold(UNPROVEN, "offline recipe cache-hit proof is absent"))
     for endpoint in proof["endpoints"]:
         try:
             address = ipaddress.ip_address(endpoint["host"])
+            # Python versions differ on mapped IPv6 is_loopback; classify IPv4 explicitly.
+            if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+                address = address.ipv4_mapped
             loopback = address.is_loopback and "%" not in endpoint["host"]
         except ValueError:
             loopback = False
         if not loopback or not endpoint["owned"]:
             errors.append(hold(VIOLATION, "endpoint is external, unresolved or not owned"))
-    return errors
+    return [{**error, "ref": entry["id"]} for error in errors]
 
 
 def _environment(environment, root, registry, budget):
     errors = []
     for row in environment["row_overrides"]:
-        data, issues = _read_pin(root, row["environment"], budget, evidence=True)
+        data, issues = _read_pin(root, row["environment"], budget, evidence=True, public_ref=row["id"])
         errors.extend(issues)
         if data is not None:
             try:
@@ -121,7 +134,7 @@ def _environment(environment, root, registry, budget):
                 R.validate_environment(override, overrides=False)
                 R._service_refs(override, {e["id"]: e for e in registry["entries"]})
             except A.AcceptanceError:
-                errors.append(hold(INTEGRITY, "row environment override is invalid"))
+                errors.append(hold(INTEGRITY, "row environment override is invalid", row["id"]))
     return errors
 
 
@@ -163,10 +176,10 @@ def evaluate(plan_bytes, registry_bytes, cache_root, *, observation_bytes=None, 
         _, issues = _read_pin(cache_root, pin, distribution_budget if distribution else declarative_budget,
                               distribution=distribution)
         if pin["provenance"] is not None and R.utc(pin["provenance"]["retrieved_at"]) > observation_time:
-            issues.append(hold(MISMATCH, "provenance retrieval is after observation time"))
+            issues.append(hold(MISMATCH, "provenance retrieval is after observation time", pin["id"]))
         if pin["role"] == "snapshot":
             if now >= R.utc(pin["expires_at"]):
-                issues.append(hold(EXPIRED, "snapshot is expired at decision time"))
+                issues.append(hold(EXPIRED, "snapshot is expired at decision time", pin["id"]))
             manifests.append(pin)
         file_errors[pin["id"]] = issues
         files[pin["id"]] = {"id": pin["id"], "sha256": pin["sha256"], "size": pin["size"],
@@ -188,19 +201,21 @@ def evaluate(plan_bytes, registry_bytes, cache_root, *, observation_bytes=None, 
         actual = observations.get(entry["id"])
         if actual is not None:
             if actual["version"] != entry["version"]:
-                issues.append(hold(MISMATCH, "observed entry version differs from pin"))
-            banner, errors = _read_pin(proof_root, actual["banner"], proof_budget, evidence=True)
+                issues.append(hold(MISMATCH, "observed entry version differs from pin", entry["id"]))
+            banner, errors = _read_pin(proof_root, actual["banner"], proof_budget,
+                                      evidence=True, public_ref=entry["id"])
             issues.extend(errors)
-            log, errors = _read_pin(proof_root, actual["offline"]["log"], proof_budget, evidence=True)
+            log, errors = _read_pin(proof_root, actual["offline"]["log"], proof_budget,
+                                   evidence=True, public_ref=entry["id"])
             issues.extend(errors)
             try:
                 if banner is not None:
                     banner_lines = _lines(banner)
                     if entry["expected_banner"] is not None and entry["expected_banner"] not in banner_lines:
-                        issues.append(hold(MISMATCH, "expected banner is absent as a whole line"))
+                        issues.append(hold(MISMATCH, "expected banner is absent as a whole line", entry["id"]))
                 issues.extend(_offline(entry, actual, _lines(log) if log is not None else set()))
             except A.AcceptanceError:
-                issues.append(hold(INTEGRITY, "banner/proof capture is not strict UTF-8"))
+                issues.append(hold(INTEGRITY, "banner/proof capture is not strict UTF-8", entry["id"]))
         results[entry["id"]] = {"id": entry["id"], "holds": _unique(issues)}
     # Dependent entries also require their tools' execution/offline prerequisites.
     definitions = {entry["id"]: entry for entry in registry["entries"]}

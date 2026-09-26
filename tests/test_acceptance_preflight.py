@@ -1,11 +1,13 @@
 """Synthetic staging and operator preflight; no tools or network required."""
 
 from copy import deepcopy
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import socket
+import tracemalloc
 # Execution is prohibited by an explicit test double, not used to stage tools.
 import subprocess  # nosec B404
 
@@ -368,3 +370,333 @@ def test_policy_wrong_field_type_is_a_structured_refusal(staged, field):
     staged["plan"]["rows"][0][field] = []
     with pytest.raises(A.AcceptanceError):
         run(staged)
+
+
+@pytest.mark.parametrize("host,passes", [
+    ("::ffff:127.0.0.1", True), ("::ffff:7f00:1", True), ("127.0.0.2", True),
+    ("0:0:0:0:0:0:0:1", True), ("localhost", False),
+    # Negative address data only; the test opens no socket.
+    ("0.0.0.0", False),  # noqa: S104  # nosec B104
+    ("::", False), ("::1%1", False), ("127.1", False), ("0x7f000001", False),
+    ("0177.0.0.1", False), ("127.00.0.1", False), ("2130706433", False),
+    ("[::1]", False), ("::ffff:192.0.2.1", False),
+    ("127.0.0.1", True), ("127.255.255.254", True), ("::1", True),
+    ("127.0.0.1%lo", False), ("10.0.0.1", False), ("169.254.1.1", False),
+    ("::ffff:8.8.8.8", False), ("0x7f.0.0.1", False), ("127.000.000.001", False),
+    ("::ffff:0:127.0.0.1", False),
+])
+def test_loopback_verdict_is_interpreter_independent(staged, host, passes):
+    staged["observation"]["entries"][0]["offline"]["endpoints"] = [
+        {"host": host, "port": 1234, "pid": 42, "owned": True}]
+    assert run(staged)["status"] == ("pass" if passes else "fail")
+
+
+@pytest.mark.parametrize("mode", ["external-denial", "offline-recipe"])
+@pytest.mark.parametrize("fetch", ["none", "flag", "line"])
+def test_offline_modes_have_distinct_egress_requirements(staged, mode, fetch):
+    staged["registry"]["entries"][0]["offline"].update(
+        mode=mode, cache_hit="CACHE_HIT" if mode == "offline-recipe" else None)
+    proof = staged["observation"]["entries"][0]["offline"]
+    proof.update(mode=mode, egress_denied=False, cache_hit=True, attempted_fetch=fetch == "flag")
+    evidence(staged, proof["log"], b"DENIAL_OK\nCACHE_HIT\n" + (b"FETCH\n" if fetch == "line" else b""))
+    bind(staged)
+    assert run(staged)["status"] == ("pass" if mode == "offline-recipe" and fetch == "none" else "fail")
+
+
+@pytest.mark.parametrize("code,status", [(P.VIOLATION, "fail"), (P.INTEGRITY, "fail"),
+    ("acceptance_plan_stale", "fail"), ("acceptance_policy_invalid", "refusal")])
+def test_operator_import_status_matches_hold(staged, monkeypatch, capsys, code, status):
+    def refuse(path):
+        raise A.AcceptanceError(code, "fixed diagnostic")
+    monkeypatch.setattr(P, "read_input", refuse)
+    assert cli.main(["close", "acceptance", "preflight", "--plan", "plan.json",
+                     "--cache-root", str(staged["root"]), "--json"]) == 3
+    assert json.loads(capsys.readouterr().out)["status"] == status
+
+
+@pytest.mark.parametrize("fault,code", [("endpoint", P.VIOLATION), ("proof", P.INTEGRITY),
+                                       ("binding", "acceptance_plan_stale")])
+def test_evaluation_failure_status_membership(staged, fault, code):
+    actual = staged["observation"]["entries"][0]
+    if fault == "endpoint":
+        actual["offline"]["attempted_fetch"] = True
+    elif fault == "proof":
+        (staged["root"] / actual["banner"]["path"]).write_bytes(b"corrupted")
+    else:
+        staged["observation"]["registry_hash"] = "b" * 64
+    result = run(staged)
+    assert code in codes(result) and result["status"] == "fail"
+
+
+@pytest.mark.parametrize("detail,advice", [("staged declarative input changed while opening", False),
+    ("links/reparse points are not acceptance artifacts", True)])
+def test_evaluation_path_refusal_is_retryable(staged, monkeypatch, detail, advice):
+    @contextmanager
+    def refuse(*args):
+        raise A.AcceptanceError("acceptance_policy_invalid", detail)
+        yield  # pragma: no cover
+    monkeypatch.setattr(P.R, "staged_stream", refuse)
+    result = run(staged)
+    assert result["status"] == "not-run" and P.UNAVAILABLE in codes(result)
+    assert ("fully resolved" in json.dumps(result)) is advice
+
+
+def test_distribution_read_stops_at_declared_size_plus_one(staged, monkeypatch):
+    reads = []
+    class Stream:
+        def read(self, size):
+            reads.append(size)
+            assert sum(reads) <= 3
+            return b"x" * size
+    @contextmanager
+    def opened(*args):
+        yield Stream()
+    monkeypatch.setattr(P.R, "staged_stream", opened)
+    _, holds = P._read_pin(staged["root"], {"id": "tiny", "path": "tiny", "size": 2,
+                                         "sha256": "a" * 64}, [P.MAX_SCAN_BYTES], distribution=True)
+    assert sum(reads) == 3 and P.MISMATCH in codes({"holds": holds})
+
+
+def test_distribution_chunks_are_not_accumulated(staged, monkeypatch):
+    total = 8 * 1024**2
+    class Stream:
+        remaining = total
+        def read(self, size):
+            size = min(size, self.remaining, 65536)
+            self.remaining -= size
+            return b"x" * size
+    @contextmanager
+    def opened(*args):
+        yield Stream()
+    monkeypatch.setattr(P.R, "staged_stream", opened)
+    tracemalloc.start()
+    try:
+        data, _ = P._read_pin(staged["root"], {"id": "large", "path": "large", "size": total,
+                                              "sha256": "a" * 64}, [total], distribution=True)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert data is None and peak < 1024**2
+
+
+def separate_proof_root(staged):
+    root = staged["root"] / "evidence"
+    root.mkdir()
+    actual = staged["observation"]["entries"][0]
+    for ref in (actual["banner"], actual["offline"]["log"]):
+        (staged["root"] / ref["path"]).rename(root / ref["path"])
+    return root
+
+
+@pytest.mark.parametrize("missing", ["planned", "observed", "neither"])
+def test_environment_overrides_use_separate_roots(staged, missing):
+    proof_root = separate_proof_root(staged)
+    ref = {"path": "override.json", "size": 0, "sha256": "a" * 64}
+    evidence(staged, ref, encoded(staged["plan"]["environment"]))
+    (proof_root / ref["path"]).write_bytes((staged["root"] / ref["path"]).read_bytes())
+    for record in (staged["plan"], staged["observation"]):
+        record["environment"]["row_overrides"] = [{"id": "build", "environment": deepcopy(ref)}]
+    if missing != "neither":
+        ((staged["root"] if missing == "planned" else proof_root) / ref["path"]).unlink()
+    result = run(staged, proof_root=proof_root)
+    assert result["status"] == ("pass" if missing == "neither" else "not-run")
+
+
+def test_operator_separate_evidence_directory(staged, capsys):
+    root = staged["root"]
+    proof_root = separate_proof_root(staged)
+    for filename, record in (("plan.json", "plan"), ("registry.json", "registry")):
+        (root / filename).write_bytes(encoded(staged[record]))
+    (proof_root / "observation.json").write_bytes(encoded(staged["observation"]))
+    assert cli.main(["close", "acceptance", "preflight", "--plan", str(root / "plan.json"),
+                     "--cache-root", str(root), "--observation", str(proof_root / "observation.json"),
+                     "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "pass"
+
+
+def test_checker_null_expected_banner_is_valid(staged):
+    entry = staged["registry"]["entries"][0]
+    entry.update(kind="checker", expected_banner=None,
+                 measurement={"comparator": "adapter", "parser": "adapter",
+                              "config": "config", "normalizer": "adapter"})
+    for item in (pin("adapter", "adapter"), pin("config", "config")):
+        evidence(staged, item, b"{}")
+        staged["registry"]["files"].append(item)
+    for record in (staged["plan"], staged["observation"]):
+        record["environment"]["runtime"] = []
+    bind(staged)
+    assert run(staged)["status"] == "pass"
+
+
+def test_snapshot_must_be_listed_by_a_consumer(staged):
+    staged["registry"]["entries"][0].update(snapshots=[], inputs=["advisory-data", "advisory-manifest"])
+    bind(staged)
+    with pytest.raises(A.AcceptanceError, match="listed"):
+        run(staged)
+
+
+def test_snapshot_consumer_may_use_transitive_dependency(staged):
+    entry = staged["registry"]["entries"][0]
+    dep = dict(deepcopy(entry), id="node", snapshots=[])
+    entry.update(inputs=[], dependencies=["node"])
+    staged["registry"]["entries"].append(dep)
+    for record in (staged["plan"], staged["observation"]):
+        record["environment"]["runtime"] = ["java", "node"]
+    staged["observation"]["entries"].append(dict(deepcopy(staged["observation"]["entries"][0]), id="node"))
+    bind(staged)
+    assert run(staged)["status"] == "pass"
+
+
+@pytest.mark.parametrize("role", ["distribution", "snapshot"])
+def test_pin_provenance_is_in_entry_input_closure(staged, role):
+    item = pin("dedicated-source", "provenance")
+    evidence(staged, item, b"provenance")
+    staged["registry"]["files"].append(item)
+    target = next(p for p in staged["registry"]["files"] if p["id"] ==
+                  ("advisory-data" if role == "distribution" else "advisory-manifest"))
+    target["provenance"]["record"] = item["id"]
+    bind(staged)
+    (staged["root"] / item["path"]).unlink()
+    result = run(staged)
+    assert P.UNAVAILABLE in codes(result["entries"][0])
+
+
+def test_inherited_manifest_provenance_reaches_other_consumer(staged):
+    registry = staged["registry"]
+    registry["entries"].append(dict(deepcopy(registry["entries"][0]), id="node", snapshots=[]))
+    source = pin("manifest-source", "provenance")
+    evidence(staged, source, b"provenance")
+    registry["files"][-1]["provenance"]["record"] = source["id"]
+    registry["files"].append(source)
+    for record in (staged["plan"], staged["observation"]):
+        record["environment"]["runtime"] = ["java", "node"]
+    staged["plan"]["rows"][0]["registry_entries"] = ["java", "node"]
+    staged["observation"]["entries"].append(dict(deepcopy(staged["observation"]["entries"][0]), id="node"))
+    bind(staged)
+    (staged["root"] / source["path"]).unlink()
+    result = run(staged)
+    assert all(P.UNAVAILABLE in codes(entry) for entry in result["entries"])
+
+
+@pytest.mark.parametrize("fault", ["roles", "digest"])
+def test_override_role_and_integrity_failures(staged, fault):
+    override = deepcopy(staged["plan"]["environment"])
+    if fault == "roles":
+        override["runtime"] = ["unknown"]
+    ref = {"path": "override.json", "size": 0, "sha256": "a" * 64}
+    evidence(staged, ref, encoded(override))
+    for record in (staged["plan"], staged["observation"]):
+        record["environment"]["row_overrides"] = [{"id": "build", "environment": deepcopy(ref)}]
+    if fault == "digest":
+        (staged["root"] / ref["path"]).write_bytes(b"wrong")
+    assert P.INTEGRITY in codes(run(staged))
+
+
+def test_clock_wrong_type_is_structured(staged):
+    with pytest.raises(A.AcceptanceError, match="decision clock"):
+        P.evaluate(encoded(staged["plan"]), encoded(staged["registry"]), staged["root"], decision_at="tomorrow")
+
+
+@pytest.mark.parametrize("fault", ["oserror", "long", "non-object"])
+def test_operator_import_error_surface(staged, monkeypatch, capsys, fault):
+    def read(path):
+        if fault == "oserror":
+            raise OSError(str(staged["root"]))
+        if fault == "long":
+            raise A.AcceptanceError("acceptance_policy_invalid", "x" * 2000)
+        return b"[]"
+    monkeypatch.setattr(P, "read_input", read)
+    assert cli.main(["close", "acceptance", "preflight", "--plan", "plan.json",
+                     "--cache-root", str(staged["root"]), "--json"]) == 3
+    output = capsys.readouterr().out
+    result = json.loads(output)
+    assert str(staged["root"]) not in output and len(result["holds"][0]["detail"]) <= 256
+    assert (P.UNAVAILABLE if fault == "oserror" else "acceptance_policy_invalid") in codes(result)
+
+
+def test_legacy_projection_keyerror_is_structured(staged, monkeypatch):
+    def invalid(value):
+        raise KeyError("missing")
+    monkeypatch.setattr(A, "validate_plan", invalid)
+    with pytest.raises(A.AcceptanceError, match="projected plan"):
+        run(staged)
+
+
+def test_pin_hold_ref_and_missing_file_advice(staged, capsys):
+    (staged["root"] / "jdk.dat").unlink()
+    result = run(staged)
+    issue = next(h for h in result["holds"] if h["code"] == P.UNAVAILABLE)
+    assert issue["ref"] == "jdk" and "fully resolved" not in issue["detail"]
+    root = staged["root"]
+    for key in ("plan", "registry", "observation"):
+        (root / (key + ".json")).write_bytes(encoded(staged[key]))
+    assert cli.main(["close", "acceptance", "preflight", "--plan", str(root / "plan.json"),
+                     "--cache-root", str(root), "--observation", str(root / "observation.json")]) == 3
+    assert "[jdk]" in capsys.readouterr().out
+
+
+def test_import_read_cap_rejects_instead_of_truncating(tmp_path, monkeypatch):
+    path = tmp_path / "policy.json"
+    path.write_bytes(b"x" * 17)
+    monkeypatch.setattr(P.R, "MAX_INPUT_BYTES", 16)
+    with pytest.raises(A.AcceptanceError) as error:
+        P.read_input(path)
+    assert error.value.code == P.INTEGRITY
+
+
+@pytest.mark.parametrize("size,budget", [(2 * 1024**3 + 1, P.MAX_SCAN_BYTES), (21, 20)])
+def test_distribution_limit_refuses_before_open(staged, monkeypatch, size, budget):
+    def forbidden(*args):
+        pytest.fail("out-of-budget distribution was opened")
+    monkeypatch.setattr(P.R, "staged_stream", forbidden)
+    _, issues = P._read_pin(staged["root"], {"id": "large", "path": "large", "size": size,
+                                           "sha256": "a" * 64}, [budget], distribution=True)
+    assert P.UNAVAILABLE in codes({"holds": issues})
+
+
+@pytest.mark.parametrize("budget,length", [(100, 17), (8, 9)])
+def test_declarative_read_limits_hold_before_digest(staged, monkeypatch, budget, length):
+    monkeypatch.setattr(P.R, "MAX_INPUT_BYTES", 16)
+    (staged["root"] / "oversized").write_bytes(b"x" * length)
+    _, issues = P._read_pin(staged["root"], {"id": "large", "path": "oversized", "size": 2,
+                                           "sha256": "a" * 64}, [budget])
+    assert codes({"holds": issues}) == {P.INTEGRITY}
+
+
+def test_matching_digest_does_not_excuse_incorrect_size(staged):
+    ref = next(pin for pin in staged["registry"]["files"] if pin["id"] == "source")
+    ref["size"] += 1
+    bind(staged)
+    assert P.MISMATCH in codes(run(staged))
+
+
+def test_pin_read_oserror_is_structured(staged, monkeypatch):
+    @contextmanager
+    def denied(*args):
+        raise PermissionError(str(staged["root"]))
+        yield  # pragma: no cover
+    monkeypatch.setattr(P.R, "staged_stream", denied)
+    result = run(staged)
+    assert result["status"] == "not-run" and codes(result) == {P.UNAVAILABLE, P.UNPROVEN}
+    assert str(staged["root"]) not in json.dumps(result)
+
+
+@pytest.mark.parametrize("locator", ["../outside.json", "/outside.json"])
+def test_cli_refuses_escaping_registry_before_read(staged, monkeypatch, capsys, locator):
+    staged["plan"]["registry_ref"] = locator
+    reads = []
+    def read(path):
+        reads.append(path)
+        assert len(reads) == 1, "escaped registry was read before policy refusal"
+        return encoded(staged["plan"])
+    monkeypatch.setattr(P, "read_input", read)
+    assert cli.main(["close", "acceptance", "preflight", "--plan", "plan.json",
+                     "--cache-root", str(staged["root"]), "--json"]) == 3
+    assert json.loads(capsys.readouterr().out)["status"] == "refusal"
+
+
+def test_distinct_missing_pins_keep_distinct_public_refs(staged):
+    for name in ("jdk", "advisory-data"):
+        (staged["root"] / (name + ".dat")).unlink()
+    issues = [h for h in run(staged)["holds"] if h["code"] == P.UNAVAILABLE]
+    assert {h["ref"] for h in issues} == {"jdk", "advisory-data"}

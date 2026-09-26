@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declarative pins, snapshot expiry, exact environment/banner observations and
   offline proof. Report per-entry outcomes without fetching or launching tools,
   creating a close, or exposing private cache locators.
+- Make preflight loopback classification consistent across Python versions,
+  distinguish recipe evidence from external-denial requirements, report public
+  pin references and accurate refusal/failure statuses, and stop distribution
+  reads at the declared size plus one byte.
 
 ### Changed
 
