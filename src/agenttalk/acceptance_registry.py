@@ -222,6 +222,11 @@ def _template(value, files):
         _text(arg, "argv token")
         if arg in PLACEHOLDERS:
             continue
+        # Literal locators would make a path-only pin move change command meaning.
+        # Keep argv opaque: conservatively refuse even a locator inside an option.
+        token = unicodedata.normalize("NFC", arg).casefold()
+        if any(unicodedata.normalize("NFC", pin["path"]).casefold() in token for pin in files.values()):
+            A._fail("command token names a staged-pin path; use pinned input IDs")
         prefix = next((token + "/" for token in PLACEHOLDERS[1:] if arg.startswith(token + "/")), None)
         if prefix is not None:
             relative_path(arg[len(prefix):])

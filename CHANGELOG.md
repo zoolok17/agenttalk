@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Refuse acceptance command tokens that contain staged-pin locators; document
+  environment approval for added toolchains/services and fresh approvals for
+  descendants of amended coverage. Strengthen policy and file-race regressions.
+
 - Bind protected acceptance coverage to the planned environment and each row's
   override. Permit safe identical-byte pin relocation without an amendment, and
   classify regular-file identity races as retryable preflight unavailability.

@@ -70,7 +70,6 @@ def prepare(store, record):
                 except (A.AcceptanceError, OSError, ValueError) as exc:
                     result = None, [P.hold(P.UNAVAILABLE, P.UNAVAILABLE_DETAIL, ref,
                                           mandatory=isinstance(exc, A.AcceptanceError)
-                                          and not isinstance(exc, A.StagedInputChangedError)
                                           and exc.code == "acceptance_policy_invalid")]
                 # A later appearance/change of declarative evidence needs a fresh
                 # attachment and seal. Never append bytes after cold reconciliation.

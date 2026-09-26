@@ -1196,3 +1196,68 @@ nosec-comment warnings are not findings. Whitespace passes. The cumulative patch
 privacy check passes eight positive controls with zero matches. Scratch retained
 under task `tk-68af97353816` for the delta read contains test/probe/mutation logs
 and the isolated mutation copy. Commit is local only: no push or PR in this round.
+
+### M3f final delta corrections
+
+Base: `b2ddea1`. This round preserves the accepted environment/ancestry policy and
+closes the remaining test and documentation findings.
+
+| Item | Change | Behavior pinned |
+| --- | --- | --- |
+| M1 | Guide distinguishes checker additions from toolchain/service additions. | CLI: checker superset GO without approval; toolchain and service additions HOLD without approval and GO with exact approval. All original rows remain gating. |
+| M2 | Guide documents that approval does not reset ancestor coverage. No ancestry rule added. | An approved amendment reaches GO; its completed descendant with identical protected policy and a fresh cold reviewer still has category-moved and same-revision plan-stale holds without fresh approval. |
+| M3 | Expanded override, identity, unsafe-swap, pin-metadata and environment-role guards. Removed unreachable C2 clause. | Unrelated override first; opened and post-open dev/inode/mode independently; mid-open FIFO and Windows reparse stay mandatory; snapshot version/provenance/distribution and input-pin role remain bound; all four environment role lists bind. |
+| M4 | Registry import rejects literal staged-pin paths inside command tokens. | Placeholder-relative, bare, case-variant and option-value forms refuse; moving a pin into a previously unbound command pathname refuses too. |
+| M5 | Renamed milestone-named test file to `tests/test_acceptance_policy.py`. | Existing assertions retained; only historical evidence records retain the old filename. |
+
+For M4, validation was chosen over conditional path binding. The rule checks
+literal occurrences after NFC normalization and casefolding, across all file pins,
+including references to another entry's pin. It conservatively rejects incidental
+occurrences rather than interpreting tool-specific argument grammar. Registry
+input IDs and the special `{artifact}` token remain the references to staged pins.
+This preserves identical-byte relocation without making arbitrary tool argument
+interpretation part of preflight. Runtime-computed paths remain within the
+existing cooperative tool-behavior boundary; no tool is launched.
+
+The removed C2 clause in `acceptance_live.prepare` could never observe a
+`StagedInputChangedError`: `_read_pin` catches that exception and returns the
+mapped hold; the outer staged-path/lstat operations do not raise that type, and
+the during-hash comparison raises ordinary preflight-unavailable. Mandatory
+unsafe-path handling remains in place.
+
+#### M3f executed evidence
+
+All pytest commands ran foreground with `PYTHONPATH=<workspace>/src`,
+`PYTHONDONTWRITEBYTECODE=1`, `-q -p no:cacheprovider`; `TEMP`, `TMP` and basetemps
+were under task scratch `tk-fd5a70233dc1`. Fixtures reuse session repositories and
+synthetic staged files. No full suite, downloads or staged-tool launches occurred.
+
+Failing-first policy file: **6 failed, 45 passed in 78.02 s** on Python 3.10.
+Five failures are the previously accepted literal command paths. The sixth was
+the new descendant fixture checking history before attachment: fixed by completing
+attachment, reconciliation and acks with a fresh cold reviewer. No production
+ancestry change or weakened assertion was used. Focused green run, including the
+additional path-rebinding case: **52 passed in 78.37 s**.
+
+The reviewer's unchanged `mutate_m3e.py` ran only the 14 requested survivor cases:
+E7; R2/R4/R7/R8/R9; P5/P6/P7/P8; and the runtime/compiler/package_manager/services
+environment exclusions. A scratch-only import shim supplies its old test filename
+after the rename. `PYTEST_ADDOPTS` selects the corresponding guard tests from its
+original three-file list; no mutation or assertion was changed. Baseline:
+**28 passed, 162 deselected in 0.92 s**. Mutation result: **14 killed, 0 survived,
+0 skipped**, including Windows R9. This is a focused replay, not a claim about
+every mutation in the runner. Both mutated modules were compared with the source
+after restoration and matched after newline normalization.
+
+Final command on each interpreter: `python -m pytest
+tests/test_acceptance_registry.py tests/test_acceptance_preflight.py
+tests/test_acceptance_schema.py tests/test_acceptance_staging.py
+tests/test_acceptance_policy.py -q -p no:cacheprovider --basetemp <task-scratch>`.
+Python 3.10: **527 passed, 3 skipped in 269.14 s**. Python 3.14:
+**527 passed, 3 skipped in 250.23 s**. The renamed policy file contributes 52
+cases. Ruff and Bandit pass both changed production modules and the policy test
+file (B101 excluded for pytest assertions). Whitespace passes; the cumulative
+privacy scan passes eight positive controls with zero matches. Task scratch
+`tk-fd5a70233dc1` is retained for the final sweep, including red/green/targeted
+logs, mutation baseline/results and isolated restored source copy. Local commit
+only; no push or PR in this round.

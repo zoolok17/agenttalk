@@ -503,14 +503,35 @@ predicate also binds the planned environment and that row's environment override
 changing limits, OS, configuration or override bytes requires the same approval.
 Moving a pin or override to another safe path with identical bytes and metadata
 needs no approval; the locator is excluded from the definition. An additional
-entry is permitted when all prior definitions and environment requirements remain
-unchanged. Renewing advisory data after a failed attempt (new digest and expiry)
+checker can be added without approval when prior definitions and environment
+requirements remain unchanged. Adding a toolchain or service always needs exact
+approval: every such entry must appear once in the environment role lists, so
+adding it changes the protected environment even if no old entry was removed.
+Renewing advisory data after a failed attempt (new digest and expiry)
 requires operator approval, because new data could make the failure disappear.
 An expiry-only extension is not an automatic renewal and remains refused without
 approval. Historical display
 reports distributions as **artifact not retained, pinned by digest**. It neither
 fabricates a historical pass nor changes the original verdict when today's
 cache is absent. A new candidate must verify its own live staged pins.
+
+An approval does not reset ancestral coverage or authorize descendants. Every
+descendant retaining the amended or reduced policy needs a fresh exact operator
+approval while that chain lives, even when its protected plan is unchanged from
+its approved parent. The oldest protected predicates remain in the history.
+Without a fresh approval, expect `acceptance_category_moved_unreviewed` and, for
+the same revision, `acceptance_plan_stale`. This increment does not introduce an
+approval-inheritance rule.
+
+Command templates must reference staged inputs by their registry IDs in `inputs`,
+with `{artifact}` naming the entry's pinned artifact. Other argv tokens must not
+literally contain any staged-pin path, including a placeholder-relative path or
+an option value such as `--input=name.dat`. Import conservatively checks literal
+occurrences after NFC normalization and casefolding; even an incidental occurrence
+is refused. This prevents a locator-only pin move from rebinding a literal command
+argument without changing the protected definition. The same check applies after
+relocation. It validates the declarative template, not arbitrary path construction
+inside a tool; preflight never launches or interprets tool behavior.
 
 Preflight failures follow the policies of the rows that consume their entries,
 including transitive dependencies. A failure used only by informational rows
