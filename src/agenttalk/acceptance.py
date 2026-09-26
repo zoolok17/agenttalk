@@ -650,10 +650,11 @@ def resolve(store, record, *, live=False, preflight_scan=None, decision_at=None)
     try:
         route, plan = _policy(store, record)
         if schema(route["schema_version"]).preflight:
-            from agenttalk import acceptance_live
+            from agenttalk import acceptance_live, acceptance_preflight
             report = acceptance_live.evaluate(store, record, scan=preflight_scan, decision_at=decision_at)
             snapshot["preflight"] = report
-            snapshot["holds"].extend((h["code"], "[" + h["ref"] + "] " + h["detail"]) for h in report["holds"])
+            snapshot["holds"].extend((h["code"], "[" + h["ref"] + "] " + h["detail"])
+                                     for h in acceptance_preflight.blocking_holds(report))
         # Schema-1 records preserve their original strict-live contract. Schema 2
         # reads historical objects; open, attach and GO publish check live state.
         project = verify_project(route["project"]["locator"], record["revision"],

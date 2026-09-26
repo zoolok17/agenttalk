@@ -494,7 +494,23 @@ requires a fresh attachment/attempt and cold seal, not a silent append.
 
 Schema-4 successors use `close acceptance successor ... --cache-root ABSOLUTE_CACHE`.
 They cannot downgrade the schema or silently drop a protected row's registry
-requirements; the existing LD2 authorization rules apply. Historical display
+requirements. Each required entry binds a digest of its closed definition:
+artifact digest/version, expected banner, transitive dependency definitions,
+measurement config/comparator/parser/normalizer pins, command template, offline
+policy and referenced evidence pins. Replacing any part, even under the same
+entry ID, requires the exact LD2 operator policy-amendment approval. An additional
+entry is permitted when all prior definitions remain unchanged. Historical display
 reports distributions as **artifact not retained, pinned by digest**. It neither
 fabricates a historical pass nor changes the original verdict when today's
 cache is absent. A new candidate must verify its own live staged pins.
+
+Preflight failures follow the policies of the rows that consume their entries,
+including transitive dependencies. A failure used only by informational rows
+remains visible without blocking GO. Retained-evidence integrity failures,
+unsafe paths, missing records, offline violations and stale plan bindings always
+block GO. An unmapped failure also blocks GO. Explicit HOLD publication does not
+scan staging and records that preflight was not evaluated; it asserts no pass.
+
+Upgrade every seat sharing the store before relying on a schema-4 GO. Older
+engines can list an already-published schema-4 verdict as GO even though their
+`close check` fails closed on that record.

@@ -67,8 +67,9 @@ def prepare(store, record):
                     if before != after:
                         raise A.AcceptanceError(P.UNAVAILABLE, "staged input changed during hashing")
                     scan["identities"][pin["path"]] = after
-                except (A.AcceptanceError, OSError, ValueError):
-                    result = None, [P.hold(P.UNAVAILABLE, P.UNAVAILABLE_DETAIL, ref)]
+                except (A.AcceptanceError, OSError, ValueError) as exc:
+                    result = None, [P.hold(P.UNAVAILABLE, P.UNAVAILABLE_DETAIL, ref,
+                                          mandatory=isinstance(exc, A.LinkedPathError))]
                 # A later appearance/change of declarative evidence needs a fresh
                 # attachment and seal. Never append bytes after cold reconciliation.
                 data = result[0]
@@ -106,6 +107,10 @@ def evaluate(store, record, *, scan=None, decision_at=None):
         return {"historical": [{"id": pin["id"], "sha256": pin["sha256"],
                                 "status": "artifact not retained, pinned by digest"}
                                for pin in registry["files"] if pin["role"] == "distribution"], "holds": []}
+    if scan is not None and scan.get("not_requested"):
+        # Explicit HOLD publication does not assess staging or invent a failure
+        # that a successor would then have to dispose. No pass is asserted.
+        return {"evaluation": "not requested for HOLD publication", "holds": []}
     scan = prepare(store, record) if scan is None else scan
     recheck(record, scan)
 

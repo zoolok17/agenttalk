@@ -20,8 +20,44 @@ def target_id(row):
     return "target-" + hashlib.sha256(canonical(target(row))).hexdigest()
 
 
-def predicate(row):
+def registry_for(store, route):
+    return (A.decode(A._retained(store, route["registry_hash"]))
+            if A.schema(route["schema_version"]).preflight else None)
+
+
+def definitions(registry):
+    """Close each entry over its dependency definitions and every consumed pin."""
+    from agenttalk import acceptance_registry as R
+    R.validate_registry(registry)
+    entries = {e["id"]: e for e in registry["entries"]}
+    files = {p["id"]: p for p in registry["files"]}
+    inputs = R.entry_inputs(registry)
+    result = {}
+
+    def digest(key):
+        if key not in result:
+            pins = set(inputs[key])
+            # All consumers inherit freshness, even if another entry lists the manifest.
+            for pin in files.values():
+                if pin["role"] == "snapshot" and pin["distribution"]["id"] in pins:
+                    pins.add(pin["id"])
+                    pins.update(R._provenance(pin["provenance"], files))
+            closed = {"entry": entries[key], "files": {p: files[p] for p in sorted(pins)},
+                      "dependencies": {d: digest(d) for d in sorted(entries[key]["dependencies"])}}
+            result[key] = A._hash(canonical(closed))
+        return result[key]
+
+    for key in entries:
+        digest(key)
+    return result
+
+
+def predicate(row, entry_definitions=None):
     requirements = ({"registry_entries": sorted(row["registry_entries"])} if "registry_entries" in row else {})
+    if "registry_entries" in row:
+        if entry_definitions is None:
+            A._fail("schema-4 coverage requires closed registry definitions")
+        requirements["registry_definitions"] = {key: entry_definitions[key] for key in row["registry_entries"]}
     if row["comparator"] == "exact-failure-set":
         return {"kind": "failure-set", "expected": sorted(set(row["expected"])), **requirements}
     if row["comparator"] not in {"exit-code", "exact-value"}:
@@ -34,8 +70,11 @@ def predicate(row):
 def implies(candidate, obligation):
     if not set(candidate.get("registry_entries", [])) >= set(obligation.get("registry_entries", [])):
         return False
-    candidate = {k: v for k, v in candidate.items() if k != "registry_entries"}
-    obligation = {k: v for k, v in obligation.items() if k != "registry_entries"}
+    if any(candidate.get("registry_definitions", {}).get(key) != digest
+           for key, digest in obligation.get("registry_definitions", {}).items()):
+        return False
+    candidate = {k: v for k, v in candidate.items() if k not in {"registry_entries", "registry_definitions"}}
+    obligation = {k: v for k, v in obligation.items() if k not in {"registry_entries", "registry_definitions"}}
     if canonical(candidate) == canonical(obligation):
         return True
     value = candidate["expected"]
@@ -52,12 +91,13 @@ def strongest(predicates):
             if not any(other != key and implies(value, unique[key]) for other, value in unique.items())]
 
 
-def group(rows):
+def group(rows, registry=None):
     targets = {}
+    closed = definitions(registry) if registry is not None else None
     for row in rows:
         if row["policy"] == "gating":
             entry = targets.setdefault(target_id(row), {"target": target(row), "predicates": []})
-            entry["predicates"].append(predicate(row))
+            entry["predicates"].append(predicate(row, closed))
     for entry in targets.values():
         entry["predicates"] = strongest(entry["predicates"])
     return targets
@@ -68,6 +108,8 @@ def history(store, record, *, max_links=MAX_LINKS):
     targets = {}
     for _ in range(max_links + 1):
         route, plan = A._policy(store, record)
+        registry = registry_for(store, route)
+        closed = definitions(registry) if registry is not None else None
         saved = (record.get("final") or {}).get("acceptance_snapshot") or {}
         if not isinstance(saved, dict):
             A._fail("ancestor outcome snapshot is malformed", "acceptance_record_missing")
@@ -76,7 +118,7 @@ def history(store, record, *, max_links=MAX_LINKS):
             if row["policy"] != "gating":
                 continue
             entry = targets.setdefault(target_id(row), {"target": target(row), "predicates": [], "sources": []})
-            entry["predicates"].append(predicate(row))
+            entry["predicates"].append(predicate(row, closed))
             outcome = outcomes.get(row["id"], {})
             # The retained close remains the complete record; this projection
             # avoids recursively embedding prior final snapshots.
@@ -94,8 +136,8 @@ def history(store, record, *, max_links=MAX_LINKS):
     A._fail("acceptance ancestry exceeds supported depth")
 
 
-def changes(protected, plan):
-    current = group(plan["rows"])
+def changes(protected, plan, registry=None):
+    current = group(plan["rows"], registry)
     changed = {}
     for key, old in sorted(protected.items()):
         new = current.get(key, {}).get("predicates", [])

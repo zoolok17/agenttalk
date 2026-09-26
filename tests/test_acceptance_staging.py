@@ -431,6 +431,140 @@ def complete(candidate):
     legacy.final_accepts(candidate, data)
 
 
+def add_informational_tool(case):
+    stage = case["stage"]
+    pin = deepcopy(stage["registry"]["files"][0])
+    pin.update(id="jdk2", path="jdk2.dat")
+    preflight.evidence(stage, pin, b"second synthetic distribution")
+    stage["registry"]["files"].append(pin)
+    entry = deepcopy(stage["registry"]["entries"][0])
+    entry.update(id="tool2", artifact="jdk2", inputs=[], snapshots=[], dependencies=[])
+    stage["registry"]["entries"].append(entry)
+    for value in (case["plan"], stage["observation"]):
+        value["environment"]["runtime"] = ["java", "tool2"]
+    stage["observation"]["entries"].append(dict(deepcopy(stage["observation"]["entries"][0]), id="tool2"))
+    case["plan"]["rows"][1].update(policy="informational", registry_entries=["tool2"])
+    save(case)
+
+
+@pytest.mark.parametrize("fault", ["missing", "mismatch", "unproven", "violation", "integrity", "unsafe"])
+def test_live_preflight_informational_policy_and_mandatory_failures(candidate, monkeypatch, fault):
+    add_informational_tool(candidate)
+    if fault in {"unproven", "violation"}:
+        candidate["stage"]["observation"]["entries"][1]["offline"].update(
+            positive_control=fault != "unproven", attempted_fetch=fault == "violation")
+    complete(candidate)
+    path = candidate["stage"]["root"] / "jdk2.dat"
+    if fault == "missing":
+        path.unlink()
+    elif fault == "mismatch":
+        path.write_bytes(b"different synthetic distribution")
+    elif fault == "integrity":
+        item = next(i for i in capsule(candidate, "attach")["inputs"] if i["ref"] == "tool2:banner")
+        (candidate["store"].dir / "acceptance" / "sha256" / item["sha256"]).unlink()
+    elif fault == "unsafe":
+        from agenttalk import acceptance_registry as R
+        original = R.staged_path
+        def linked(root, relative):
+            if relative == "jdk2.dat":
+                raise A.LinkedPathError("linked staged pin")
+            return original(root, relative)
+        monkeypatch.setattr(R, "staged_path", linked)
+    result = A.resolve(candidate["store"], record(candidate))
+    expected = 3 if fault in {"violation", "integrity", "unsafe"} else 0
+    assert bool(A.evaluate(result)) == bool(expected)
+    if fault != "integrity":
+        assert result["preflight"]["holds"]  # informational diagnostics remain visible
+    assert legacy.command(candidate, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go") == expected
+
+
+@pytest.mark.parametrize("state", ["hold", "published", "barrier"])
+def test_publish_refusal_or_hold_does_no_staged_reads(candidate, monkeypatch, state):
+    complete(candidate)
+    if state != "hold":
+        assert legacy.command(candidate, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go") == 0
+    reads = []
+    original = P._read_pin
+    def read(*args, **kwargs):
+        reads.append(True)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(P, "_read_pin", read)
+    extra = ["--bump-barrier"] if state == "barrier" else []
+    legacy.command(candidate, "publish", "--id", "attempt", "--from", "lead",
+                   "--verdict", "hold" if state == "hold" else "go", *extra)
+    assert reads == []
+
+
+def successor_command(case, reduction=None):
+    extra = ["--scope-reduction", str(reduction)] if reduction else []
+    return legacy.command(case, "acceptance", "successor", "--id", "next", "--parent", "attempt",
+                          "--from", "lead", "--acceptance-plan", str(case["inputs"] / "plan.json"),
+                          "--project-repo", str(case["project"]), "--revision", case["sha"],
+                          "--cache-root", str(case["stage"]["root"]), "--reason", "policy amendment", *extra)
+
+
+@pytest.mark.parametrize("fault,approved", [("java", False), ("java", True), ("config", False), ("comparator", False)])
+def test_successor_same_id_tool_swap_requires_exact_ld2_approval(candidate, approved, fault):
+    from agenttalk import acceptance_coverage as coverage, acceptance_history as history
+    stage = candidate["stage"]
+    if fault != "java":
+        checker = dict(deepcopy(stage["registry"]["entries"][0]), id="checker", kind="checker",
+                       expected_banner=None, dependencies=["java"], measurement={})
+        for key in ("config", "comparator", "parser", "normalizer"):
+            pin = preflight.pin(key, "config" if key == "config" else "adapter")
+            preflight.evidence(stage, pin, b"strict measurement policy")
+            stage["registry"]["files"].append(pin)
+            checker["measurement"][key] = key
+        stage["registry"]["entries"].append(checker)
+        stage["observation"]["entries"].append(dict(deepcopy(stage["observation"]["entries"][0]), id="checker"))
+        for row in candidate["plan"]["rows"]:
+            row["registry_entries"] = ["checker"]
+        save(candidate)
+    complete(candidate)
+    legacy.publish_hold(candidate)
+    if fault == "java":
+        preflight.evidence(stage, stage["registry"]["files"][0], b"older synthetic runtime")
+        stage["registry"]["files"][0]["version"] = "8.0.1"
+        stage["registry"]["entries"][0].update(version="8.0.1", expected_banner="java 8.0.1")
+        stage["observation"]["entries"][0]["version"] = "8.0.1"
+        preflight.evidence(stage, stage["observation"]["entries"][0]["banner"], b"java 8.0.1\n")
+    else:
+        pin = deepcopy(next(p for p in stage["registry"]["files"] if p["id"] == fault))
+        pin.update(id="lenient-" + fault, path="lenient-" + fault + ".dat")
+        preflight.evidence(stage, pin, b"lenient measurement policy")
+        stage["registry"]["files"].append(pin)
+        checker["measurement"][fault] = pin["id"]
+        checker["inputs"].append(fault)  # retain the old pin as an input; only the measurement reference moves
+    legacy.assign_fresh_cold(candidate, "next-cold")
+    save(candidate)
+    reduction = None
+    if approved:
+        parent = record(candidate)
+        changes = coverage.changes(coverage.history(candidate["store"], parent), candidate["plan"], stage["registry"])
+        assert changes
+        value = {"rows": list(changes), "changes": changes, "cause": "policy-amendment",
+                 "reason": "explicit tool replacement", "alternatives": ["keep original"],
+                 "impact": "different checker semantics", "owner": "operator", "expires_at": "9999-01-01T00:00:00Z",
+                 "evidence": [parent["acceptance_route"]["registry_hash"]], "decision_ref": "pending"}
+        plan_hash = A._hash((candidate["inputs"] / "plan.json").read_bytes())
+        payload = history.approval_payload(parent, "next", plan_hash, value)
+        msg = candidate["store"].send(sender="operator", recipient="lead", kind="message",
+                                      body=json.dumps(payload), _allow_reserved_sender=True)
+        value["decision_ref"] = msg.id
+        reduction = candidate["inputs"] / "reduction.json"
+        legacy.write_json(reduction, value)
+    assert successor_command(candidate, reduction) == 0
+    data = attachment(candidate, close_id="next")
+    assert legacy.command(candidate, "acceptance", "attach", "--id", "next", "--from", "lead",
+                          "--file", str(candidate["inputs"] / "bundle.json")) == 0
+    assert legacy.cold_phase(candidate, "reconcile", "next", actor="next-cold") == 0
+    legacy.final_accepts(candidate, data, "next")
+    result = A.resolve(candidate["store"], record(candidate, "next"))
+    assert ("acceptance_category_moved_unreviewed" in {c for c, _ in A.evaluate(result)}) != approved
+    expected = 0 if approved else 3
+    assert legacy.command(candidate, "publish", "--id", "next", "--from", "lead", "--verdict", "go") == expected
+
+
 def test_schema4_live_check_and_publish_reach_go(candidate):
     complete(candidate)
     assert legacy.command(candidate, "check", "--id", "attempt") == 0
@@ -550,11 +684,11 @@ def test_schema4_successor_hashes_before_parent_lock(candidate, monkeypatch):
 
 def test_ld2_preserves_registry_requirements(candidate):
     from agenttalk import acceptance_coverage as coverage
-    protected = coverage.group(candidate["plan"]["rows"])
+    protected = coverage.group(candidate["plan"]["rows"], candidate["stage"]["registry"])
     plan = deepcopy(candidate["plan"])
     for row in plan["rows"]:
         row["registry_entries"] = []
-    assert coverage.changes(protected, plan)
+    assert coverage.changes(protected, plan, candidate["stage"]["registry"])
 
 
 def test_schema4_route_cannot_downgrade_to_schema3(candidate):
@@ -641,3 +775,246 @@ def test_new_declarative_evidence_after_seal_requires_fresh_attempt(candidate):
     assert (P.INTEGRITY, pin["id"]) in {(h["code"], h["ref"]) for h in result["preflight"]["holds"]}
     assert legacy.command(candidate, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go") == 3
     assert record(candidate)["acceptance_route"] == before
+
+
+@pytest.mark.parametrize("field", ["st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns"])
+def test_live_identity_checks_each_reported_field(tmp_path, monkeypatch, field):
+    from pathlib import Path
+    from types import SimpleNamespace
+    from agenttalk import acceptance_live as live
+    path = tmp_path / "pin.dat"
+    path.write_bytes(b"x")
+    before = path.lstat()
+    route = {"cache_root": str(tmp_path)}
+    scan = {"route": route, "identities": {path.name: live.identity(before)}}
+    values = {key: getattr(before, key) for key in
+              ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")}
+    values[field] += 1
+    original = Path.lstat
+    monkeypatch.setattr(Path, "lstat", lambda self: SimpleNamespace(**values) if self == path else original(self))
+    with pytest.raises(A.AcceptanceError, match="staged input changed after hashing") as error:
+        live.recheck({"acceptance_route": route}, scan)
+    assert error.value.code == P.UNAVAILABLE
+
+
+def test_live_sealed_banner_log_and_observed_override_do_not_need_source_files(candidate, monkeypatch):
+    override = deepcopy(candidate["plan"]["environment"])
+    ref = {"path": "override.json", "size": 0, "sha256": "a" * 64}
+    preflight.evidence(candidate["stage"], ref, preflight.encoded(override))
+    row_id = candidate["plan"]["rows"][0]["id"]
+    for obj in (candidate["plan"], candidate["stage"]["observation"]):
+        obj["environment"]["row_overrides"] = [{"id": row_id, "environment": deepcopy(ref)}]
+    save(candidate)
+    assert open_candidate(candidate) == 0
+    data = attachment(candidate)
+    shutil.copyfile(candidate["stage"]["root"] / ref["path"], candidate["inputs"] / ref["path"])
+    assert legacy.attach(candidate) == 0
+    assert legacy.cold_phase(candidate, "reconcile") == 0
+    legacy.final_accepts(candidate, data)
+    for entry in candidate["stage"]["observation"]["entries"]:
+        for proof in (entry["banner"], entry["offline"]["log"]):
+            (candidate["stage"]["root"] / proof["path"]).unlink()
+            (candidate["inputs"] / proof["path"]).unlink()
+    (candidate["inputs"] / ref["path"]).unlink()
+    original = P._read_pin
+    def staged_read(*args, **kwargs):
+        assert kwargs.get("capture_role", "pin") not in {"banner", "log", "observed"}
+        return original(*args, **kwargs)
+    monkeypatch.setattr(P, "_read_pin", staged_read)
+    assert legacy.command(candidate, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go") == 0
+
+
+@pytest.mark.parametrize("fault", ["size", "hash", "budget", "debit"])
+def test_live_retained_reader_validates_pin_and_aggregate_budget(staged, monkeypatch, fault):
+    from agenttalk import acceptance_live as live
+    data = b"proof"
+    pin = {"path": "missing.dat", "size": len(data), "sha256": A._hash(data)}
+    if fault == "size":
+        pin["size"] += 1
+    elif fault == "hash":
+        pin["sha256"] = "0" * 64
+    route = {"schema_version": 4, "cache_root": str(staged["root"]), "plan_hash": "p", "registry_hash": "r"}
+    monkeypatch.setattr(live, "_inputs", lambda *a: (route, {"inputs": [{"ref": "java:banner", "sha256": "s"}]}, None))
+    monkeypatch.setattr(A, "_retained", lambda *a: data)
+    def evaluate(*args, reader, **kwargs):
+        budget = [len(data) - 1 if fault == "budget" else len(data)]
+        value, errors = reader(staged["root"], pin, budget, public_ref="java", capture_role="banner")
+        if fault == "debit":
+            assert value == data and not errors
+            value, errors = reader(staged["root"], pin, budget, public_ref="java", capture_role="banner")
+        assert value is None and [(h["code"], h["ref"]) for h in errors] == [(P.INTEGRITY, "java")]
+        return {}
+    monkeypatch.setattr(P, "evaluate", evaluate)
+    assert not live.prepare(None, {"acceptance_route": route}).get("failure")
+
+
+@pytest.mark.parametrize("fault", ["duplicate", "role", "id"])
+def test_capture_role_ref_strictness(candidate, fault):
+    from agenttalk import acceptance_staging as staging
+    assert open_candidate(candidate) == 0
+    value = capsule(candidate)
+    if fault == "duplicate":
+        value["inputs"].append(deepcopy(value["inputs"][0]))
+    else:
+        value["inputs"][0]["ref"] = "jdk:future" if fault == "role" else "bad id:pin"
+    digest = A._retain(candidate["store"], staging.canonical(value))
+    with pytest.raises(A.AcceptanceError):
+        staging.read_capture(candidate["store"], record(candidate), digest)
+
+
+def test_capture_duplicate_reference_refused(candidate):
+    from agenttalk import acceptance_staging as staging
+    assert open_candidate(candidate) == 0
+    with pytest.raises(A.AcceptanceError, match="duplicate retained input reference"):
+        staging.retain_report(candidate["store"], record(candidate), {}, [("java:banner", b"a"), ("java:banner", b"b")])
+
+
+def test_live_cold_delivery_refuses_preflight_evidence_under_new_label(candidate, capsys):
+    from agenttalk import acceptance_audit as audit
+    assert open_candidate(candidate) == 0
+    item = capsule(candidate)["inputs"][0]
+    with pytest.raises(A.AcceptanceError, match="withheld acceptance evidence") as error:
+        audit.check_delivery(candidate["store"], record(candidate), [{"sha256": item["sha256"], "id": "source"}])
+    assert error.value.code == "acceptance_cold_missing"
+    resource = candidate["inputs"] / "disguised-source.txt"
+    resource.write_bytes(A._retained(candidate["store"], item["sha256"]))
+    def delivered(value):
+        value["delivery_manifest"].append({"kind": "source", "path": resource.name, "sha256": item["sha256"]})
+    assert legacy.cold_phase(candidate, "commit", change=delivered) == 2
+    assert "withheld acceptance evidence" in capsys.readouterr().err
+    assert record(candidate)["acceptance_route"]["cold_commit_hash"] is None
+
+
+def test_invalid_open_plan_changes_during_preparation(candidate, monkeypatch, capsys):
+    from agenttalk import acceptance_staging as staging
+    original = staging.prepare
+    def changed(*args, **kwargs):
+        candidate["plan"]["plan_id"] = "new-plan"
+        save(candidate)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(staging, "prepare", changed)
+    assert open_candidate(candidate) == 3
+    assert "plan changed during preparation" in capsys.readouterr().err
+    assert not close.close_path(candidate["store"], "attempt").exists()
+
+
+@pytest.mark.parametrize("fault", ["unpublished", "changed"])
+def test_successor_parent_preconditions_before_creation(candidate, monkeypatch, capsys, fault):
+    complete(candidate)
+    if fault == "changed":
+        legacy.publish_hold(candidate)
+    calls = []
+    original = A.prepare
+    def prepare(*args, **kwargs):
+        calls.append(True)
+        result = original(*args, **kwargs)
+        if fault == "changed":
+            with close.close_transaction(candidate["store"], "attempt") as tx:
+                tx.record["final"]["reason"] = "changed during preparation"
+                tx.commit()
+        return result
+    monkeypatch.setattr(A, "prepare", prepare)
+    assert successor_command(candidate) == 2
+    message = capsys.readouterr().err
+    expected = "parent changed during successor preparation" if fault == "changed" else "published acceptance parent"
+    assert expected in message
+    assert bool(calls) == (fault == "changed")
+    assert not close.close_path(candidate["store"], "next").exists()
+
+
+@pytest.mark.parametrize("value,message", [(None, "--cache-root is required for a schema-4 plan"),
+                                          ("relative", "--cache-root must be an absolute, fully resolved path")])
+def test_cache_locator_diagnostic(value, message):
+    from agenttalk import acceptance_staging as staging
+    with pytest.raises(A.AcceptanceError, match=message):
+        staging.locator(value)
+
+
+def test_live_observation_version_diagnostic(candidate):
+    from agenttalk import acceptance_live as live, acceptance_staging as staging
+    assert open_candidate(candidate) == 0
+    attachment(candidate)
+    assert legacy.attach(candidate) == 0
+    value = capsule(candidate, "attach")
+    envelope = A.decode(A._retained(candidate["store"], value["observation_hash"]))
+    envelope["schema_version"] = 2
+    value["observation_hash"] = A._retain(candidate["store"], staging.canonical(envelope))
+    with close.close_transaction(candidate["store"], "attempt") as tx:
+        tx.record["acceptance_route"]["preflight_attach_hash"] = A._retain(candidate["store"], staging.canonical(value))
+        tx.commit()
+    with pytest.raises(A.AcceptanceError, match="unsupported acceptance schema_version"):
+        live._inputs(candidate["store"], record(candidate))
+
+
+def test_live_explicit_decision_clock_controls_expiry(candidate):
+    from datetime import timedelta
+    from agenttalk import acceptance_live as live
+    complete(candidate)
+    scan = live.prepare(candidate["store"], record(candidate))
+    result = live.evaluate(candidate["store"], record(candidate), scan=scan,
+                           decision_at=preflight.NOW + timedelta(days=400))
+    assert P.EXPIRED in {h["code"] for h in result["holds"]}
+
+
+def test_historical_diagnostics_only_list_distributions(candidate, capsys):
+    complete(candidate)
+    legacy.publish_hold(candidate)
+    result = A.resolve(candidate["store"], record(candidate))
+    expected = {p["id"] for p in candidate["stage"]["registry"]["files"] if p["role"] == "distribution"}
+    assert {p["id"] for p in result["preflight"]["historical"]} == expected
+    capsys.readouterr()
+    assert legacy.command(candidate, "check", "--id", "attempt") == 3
+    text = capsys.readouterr().out
+    for key in expected:
+        assert key + ": artifact not retained, pinned by digest" in text
+
+
+def test_live_coverage_superset_preserves_closed_definitions(registry):
+    from agenttalk import acceptance_coverage as coverage
+    registry["entries"].append(dict(deepcopy(registry["entries"][0]), id="extra"))
+    closed = coverage.definitions(registry)
+    row = {"comparator": "exit-code", "expected": 0, "registry_entries": ["java"]}
+    old = coverage.predicate(row, closed)
+    row["registry_entries"].append("extra")
+    new = coverage.predicate(row, closed)
+    assert coverage.implies(new, old)
+    assert not coverage.implies(old, new)
+
+
+@pytest.mark.parametrize("fault", ["artifact", "version", "banner", "dependency", "offline", "command", "provenance"])
+def test_live_coverage_definition_binds_transitive_semantics(registry, fault):
+    from agenttalk import acceptance_coverage as coverage
+    registry["entries"].append(dict(deepcopy(registry["entries"][0]), id="dep"))
+    registry["entries"][0]["dependencies"] = ["dep"]
+    before = coverage.definitions(registry)["java"]
+    entry = registry["entries"][1] if fault == "dependency" else registry["entries"][0]
+    if fault == "version":
+        registry["files"][0]["version"] = "8.0.1"
+        for tool in registry["entries"]:
+            tool["version"] = "8.0.1"
+    elif fault == "dependency":
+        entry["expected_banner"] = "dependency changed"
+    elif fault == "artifact":
+        registry["files"][0]["sha256"] = "b" * 64
+    elif fault == "banner":
+        entry["expected_banner"] = "java 8"
+    elif fault == "offline":
+        entry["offline"]["positive_control"] = "DIFFERENT"
+    elif fault == "command":
+        entry["command"]["argv"].append("--lenient")
+    else:
+        registry["files"][1]["sha256"] = "b" * 64
+    assert coverage.definitions(registry)["java"] != before
+
+
+@pytest.mark.parametrize("code,mandatory", [(P.MISMATCH, False), (P.UNAVAILABLE, False), (P.EXPIRED, False),
+    (P.UNPROVEN, False), (P.INTEGRITY, True), (P.VIOLATION, True), ("acceptance_plan_stale", True),
+    ("acceptance_policy_invalid", True), ("acceptance_row_unbound", True)])
+def test_live_preflight_fold_mandatory_and_row_mapping(code, mandatory):
+    issue = P.hold(code, "diagnostic", "tool")
+    report = {"holds": [issue], "rows": [{"id": "row", "policy": "informational", "holds": [issue]}]}
+    assert bool(P.blocking_holds(report)) == mandatory
+    report["rows"][0]["policy"] = "gating"
+    assert P.blocking_holds(report) == [issue]
+    report["rows"] = []
+    assert P.blocking_holds(report) == [issue]  # unknown association is never waived

@@ -144,7 +144,9 @@ def successor(store, *, parent_id, close_id, plan_file, project_repo, revision, 
                      "by": by, "at": at, "reason": reason, "cause": cause,
                      "observed_before": prepared["parent_record_hash"], "reduction": reduction,
                      "approval_hash": approval_hash,
-                     "assertion_changes": coverage.changes(protected, prepared["plan"])}
+                     "assertion_changes": coverage.changes(protected, prepared["plan"],
+                         coverage.registry_for(store, {"schema_version": prepared["plan"]["schema_version"],
+                                                       "registry_hash": prepared["registry_hash"]}))}
         prepared["amendment_hash"] = A._retain(store, _bytes(amendment))
         record = deepcopy(parent)
         record.update(close_id=close_id, instance_id=None, generation=0, status=close.OPEN,
@@ -217,7 +219,7 @@ def evaluate(store, record, plan, snapshot, *, depth=0):
         if not isinstance(current, dict) or current.get("decision") == close.COUNTER_PENDING:
             snapshot["holds"].append(("acceptance_residual_open", f"parent counter {cid} remains unresolved"))
     protected = coverage.history(store, parent)
-    changes = coverage.changes(protected, plan)
+    changes = coverage.changes(protected, plan, coverage.registry_for(store, route))
     reduction = amendment["reduction"]
     if A.schema(version).cold and _bytes(amendment["assertion_changes"]) != _bytes(changes):
         A._fail("retained target coverage differs from plans", "acceptance_category_moved_unreviewed")
@@ -227,7 +229,7 @@ def evaluate(store, record, plan, snapshot, *, depth=0):
 def apply_coverage(store, record, plan, snapshot, parent, protected, reduction, approval_hash):
     """The same exact LD2 approval and outcome rules apply inside and across roots."""
     route = record["acceptance_route"]
-    changes = coverage.changes(protected, plan)
+    changes = coverage.changes(protected, plan, coverage.registry_for(store, route))
     approved = False
     if changes or reduction is not None:
         try:

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Require exact LD2 approval for replacements within a protected acceptance
+  registry entry's transitive definition. Fold preflight failures by row policy
+  while keeping integrity, unsafe paths, stale bindings and offline violations
+  mandatory. Avoid staged reads for explicit HOLD and repeated publication.
+
 - Add isolated acceptance increment-2 strict registry/environment/proof record
   readers and bounded declarative-input validation. See
   `docs/STEP-ACCEPTANCE-INC2.md` for limits and retention decisions.

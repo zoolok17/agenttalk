@@ -29,8 +29,8 @@ def decision_time():
     return datetime.now(timezone.utc).replace(microsecond=0)
 
 
-def hold(code, detail, ref="preflight"):
-    return {"code": code, "detail": detail, "ref": ref}
+def hold(code, detail, ref="preflight", *, mandatory=False):
+    return {"code": code, "detail": detail, "ref": ref, **({"mandatory": True} if mandatory else {})}
 
 
 def _status(holds):
@@ -41,8 +41,18 @@ def _status(holds):
 
 
 def _unique(holds):
-    return [hold(code, detail, ref) for code, detail, ref in
-            sorted({(h["code"], h["detail"], h["ref"]) for h in holds})]
+    return [hold(code, detail, ref, mandatory=mandatory) for code, detail, ref, mandatory in
+            sorted({(h["code"], h["detail"], h["ref"], h.get("mandatory", False)) for h in holds})]
+
+
+def blocking_holds(report):
+    """Fold mapped prerequisites by row policy; unclassified/integrity failures block."""
+    rows = report.get("rows", [])
+    mandatory = {INTEGRITY, VIOLATION, "acceptance_plan_stale", "acceptance_policy_invalid", "acceptance_row_unbound"}
+    return [issue for issue in report["holds"]
+            if issue["code"] in mandatory or issue.get("mandatory")
+            or not any(issue in row["holds"] for row in rows)
+            or any(row["policy"] == "gating" and issue in row["holds"] for row in rows)]
 
 
 def read_input(path):
@@ -84,7 +94,7 @@ def _read_pin(root, ref, budget, *, distribution=False, evidence=False, public_r
     except (A.AcceptanceError, OSError, ValueError) as exc:
         # Import-time policy refusals remain strict; an evaluation race is retryable.
         linked = isinstance(exc, A.LinkedPathError)
-        return None, [hold(UNAVAILABLE, ROOT_ADVICE if linked else UNAVAILABLE_DETAIL, public_ref)]
+        return None, [hold(UNAVAILABLE, ROOT_ADVICE if linked else UNAVAILABLE_DETAIL, public_ref, mandatory=linked)]
     data = None if distribution else b"".join(chunks)
     if capture is not None and data is not None:
         # Retain the bytes actually evaluated, including bounded mismatching evidence.

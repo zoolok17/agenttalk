@@ -3873,7 +3873,10 @@ def cmd_close(args: argparse.Namespace) -> int:
         barrier_epoch = None
         try:
             from agenttalk import acceptance_live
-            preflight_scan = acceptance_live.prepare(store, close_mod.load_close(store, args.id)) or {"failure": True}
+            before = close_mod.load_close(store, args.id)
+            preflight_scan = {"not_requested": True} if verdict == close_mod.VERDICT_HOLD else {"failure": True}
+            if verdict == close_mod.VERDICT_GO and before.get("status") != close_mod.PUBLISHED:
+                preflight_scan = acceptance_live.prepare(store, before) or {"failure": True}
             # Lock order: acceptance writer -> close-ID -> config (if needed).
             # Close, gate, knowledge and config-backed signoff writers all join
             # the outer lock; keep it from discovery through durable GO and the
