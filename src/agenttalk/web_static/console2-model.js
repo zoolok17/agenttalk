@@ -144,6 +144,33 @@
     return best;
   }
 
+  // ------------------------------------------------------------ team selection
+  //
+  // Resolve the ?root= parameter against the roots of /api/state, the way the
+  // server resolves it (web.py _root_selection): an exact project_id first, then
+  // a display label that is unique (the read-only legacy selector). Anything else
+  // is UNKNOWN: the caller shows an explicit state and never switches silently.
+  //   param '' / null / undefined  -> the first root (default, nothing was asked)
+  //   returns { status: 'default' | 'match' | 'unknown', index }   (index -1 = none)
+  function resolveRoot(roots, param) {
+    var list = Array.isArray(roots) ? roots : [];
+    if (param === '' || param === null || param === undefined) {
+      return { status: 'default', index: list.length ? 0 : -1 };
+    }
+    if (typeof param !== 'string') return { status: 'unknown', index: -1 };
+    var i;
+    for (i = 0; i < list.length; i++) {
+      if (list[i] && list[i].project_id === param) return { status: 'match', index: i };
+    }
+    var found = -1;
+    var count = 0;
+    for (i = 0; i < list.length; i++) {
+      if (list[i] && list[i].label === param) { found = i; count += 1; }
+    }
+    if (count === 1) return { status: 'match', index: found };
+    return { status: 'unknown', index: -1 };
+  }
+
   return {
     THEMES: THEMES,
     DEFAULT_THEME: DEFAULT_THEME,
@@ -151,6 +178,7 @@
     nextTheme: nextTheme,
     parseAgentName: parse,
     shortName: shortName,
-    teamProject: teamProject
+    teamProject: teamProject,
+    resolveRoot: resolveRoot
   };
 }));

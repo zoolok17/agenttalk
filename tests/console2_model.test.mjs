@@ -143,4 +143,36 @@ test('nextTheme cycles through all four and recovers from an unknown value', () 
   assert.equal(M.nextTheme('bogus'), 'paper');
 });
 
+const ROOTS = [
+  { label: 'main', project_id: 'proj-a' },
+  { label: 'second', project_id: 'proj-b' },
+  { label: 'twin', project_id: 'proj-c' },
+  { label: 'twin', project_id: 'proj-d' },
+  null,
+];
+
+test('resolveRoot: nothing asked means the first root, and only then', () => {
+  for (const param of ['', null, undefined]) {
+    assert.deepEqual({ ...M.resolveRoot(ROOTS, param) }, { status: 'default', index: 0 });
+  }
+  assert.deepEqual({ ...M.resolveRoot([], '') }, { status: 'default', index: -1 });
+  assert.deepEqual({ ...M.resolveRoot(null, undefined) }, { status: 'default', index: -1 });
+});
+
+test('resolveRoot: project_id first, then a unique label', () => {
+  assert.deepEqual({ ...M.resolveRoot(ROOTS, 'proj-b') }, { status: 'match', index: 1 });
+  assert.deepEqual({ ...M.resolveRoot(ROOTS, 'second') }, { status: 'match', index: 1 });
+  assert.deepEqual({ ...M.resolveRoot(ROOTS, 'proj-d') }, { status: 'match', index: 3 });
+  // an id that equals another root's label wins as an id
+  const tricky = [{ label: 'proj-b', project_id: 'x' }, { label: 'y', project_id: 'proj-b' }];
+  assert.deepEqual({ ...M.resolveRoot(tricky, 'proj-b') }, { status: 'match', index: 1 });
+});
+
+test('resolveRoot: unknown, ambiguous and odd input never fall back to the first root', () => {
+  for (const param of ['nope', 'twin', 'PROJ-A', ' proj-a', 7, {}, ['proj-a']]) {
+    assert.deepEqual({ ...M.resolveRoot(ROOTS, param) }, { status: 'unknown', index: -1 }, String(param));
+  }
+  assert.deepEqual({ ...M.resolveRoot([], 'proj-a') }, { status: 'unknown', index: -1 });
+});
+
 run();

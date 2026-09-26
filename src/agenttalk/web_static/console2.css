@@ -227,3 +227,31 @@ html, body {
 }
 
 .c2-hint-key { color: var(--fg); margin-right: 4px; }
+
+/* ------------------------------------------------------------------ stream */
+
+.c2-greeting {
+  margin: 0;
+  font-family: var(--font-serif);
+  font-weight: 400;
+  font-size: 40px;
+  line-height: 1.1;
+  color: var(--serif);
+}
+:root[data-theme="terminal"] .c2-greeting { font-size: 28px; }
+.c2-sub { margin: 10px 0 0; max-width: 620px; font-size: 13.5px; color: var(--dim); }
+
+.c2-pick { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.c2-pick-btn {
+  appearance: none;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  padding: 6px 14px;
+  color: var(--fg);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  cursor: pointer;
+}
+.c2-pick-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

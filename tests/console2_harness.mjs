@@ -44,6 +44,7 @@ export function createRunner(title) {
 export function makeDom() {
   const violations = [];
   const registry = new Map();   // id -> node
+  let active = null;            // document.activeElement (the body when nothing is focused)
 
   function forbid(what) {
     violations.push(what);
@@ -65,9 +66,20 @@ export function makeDom() {
       return this.children.length ? this.children.map((c) => c.textContent).join('') : this._text;
     }
     set textContent(value) {
+      // Replacing the children detaches the old ones: like a browser, focus that sat
+      // inside them falls back to the page.
+      if (active && this.children.some((c) => c === active || (c.nodeType === 1 && c.contains(active)))) {
+        active = body;
+      }
       this.children = [];
       this._text = String(value);
     }
+    contains(node) {
+      if (node === this) return true;
+      return this.children.some((c) => c.nodeType === 1 && c.contains(node));
+    }
+    focus() { if (!this.disabled) active = this; }
+    blur() { if (active === this) active = body; }
     set innerHTML(_v) { forbid('innerHTML'); }
     get innerHTML() { return forbid('innerHTML read'); }
     set outerHTML(_v) { forbid('outerHTML'); }
@@ -96,8 +108,12 @@ export function makeDom() {
   }
 
   const documentElement = new Node('html');
+  const body = new Node('body');
+  active = body;
   const document = {
     documentElement,
+    body,
+    get activeElement() { return active; },
     createElement: (tag) => new Node(tag),
     createTextNode: (text) => new TextNode(text),
     getElementById: (id) => registry.get(id) || null,
@@ -148,10 +164,14 @@ export function loadConsole(opts) {
       store.set(k, String(v));
     },
   };
+  const historyCalls = [];
   const sandbox = {
     document: dom.document,
     fetch: opts.fetch,
     console,
+    URLSearchParams,
+    location: { search: opts.search || '', pathname: opts.pathname || '/v2', hash: opts.hash || '' },
+    history: { replaceState(state, title, url) { historyCalls.push(url); } },
   };
   sandbox.window = sandbox;
   sandbox.localStorage = localStorage;
@@ -160,7 +180,7 @@ export function loadConsole(opts) {
   if (!opts.modelOnly) {
     vm.runInContext(readStatic('console2.js'), sandbox, { filename: 'console2.js' });
   }
-  return { sandbox, store };
+  return { sandbox, store, historyCalls };
 }
 
 export const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
