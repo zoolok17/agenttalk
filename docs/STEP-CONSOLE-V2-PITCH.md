@@ -380,3 +380,43 @@ Changed from the plan, and why:
 7. **Tests pin `TZ=UTC`** (the pytest wrapper sets it, and the data test sets it itself) because clock times are
    drawn in the browser's zone.
 8. **Avatars are chosen in the model but not drawn yet** (M4): fixed hexagon list, role map, stable hash fallback.
+
+## 13. M2b record (fixes from the M1b + M2 cold read)
+
+- **F1, hung requests.** Every request goes through one `getJson()` with a 5 s timeout (also covers a request
+  that never settles, one that ignores its abort signal, and a body that never arrives) and an `AbortController`
+  when the browser has one. The poll no longer waits for the feeds: it reads `/api/state`, draws, then starts the
+  attention and lead-chat reads on their own, one in flight per feed (a slow feed is not stacked with new
+  requests) and each redrawing when it lands. A separate 1 s repaint clock recomputes ages, the silent threshold
+  and stale feeds while requests are outstanding. A feed that times out is recorded as failed (attention: "Can't
+  read what needs you."; chat: a note), never left as "loading" forever. Tests use requests that NEVER settle,
+  not only rejected ones.
+- **F2, false LOOKS STUCK from an earlier turn.** Verified against `wrapper/health.py`: `_last_progress_at`
+  survives `idle()` and `turn_start()`, and the file carries no turn-start field. What it does carry is `since`,
+  the moment the current state began: for `working_silent` that is the turn start (`turn_start()` forces a
+  write, and idle to working is a state change), and for `stuck_suspected` it is when the watchdog fired. The
+  baseline is therefore `last_progress_at` only when it is not older than `since` (progress inside the current
+  state), otherwise `since`. Wording follows: "Last progress N ago", "No progress since the turn began N ago",
+  "Wrapper flagged a stall N ago". No backend change is needed for this fix. `tests/test_console2_health_writer.py`
+  generates the rows with the real `WrapperHealthWriter` and `Store.read_health` under a fake clock and runs them
+  through the node model; it fails against the M2 model.
+- **F3, chat feed state hidden.** The model now reads `chat.ok`, `chat.asOfMs` and `payload.available`. The
+  newest message stays, with notes next to it: "Lead chat could not be read · last read 1m ago", "Lead chat not
+  refreshed for 9s" (a hung refresh), "The lead is unavailable: <detail>" (shown even when an older message
+  exists, which `web.py` emits). A failed read with no earlier data also gets its note.
+- **F4, attention errors-as-data.** A 200 answer with `errors`, an answer for another team, or a rejected request
+  are the same thing: keep the last items, mark the read failed (greeting "Can't read what needs you.", page
+  greyed), and let the next good read replace them.
+
+### Finding from the F2 regression, not fixed here: the stuck card can rarely appear with today's health files
+
+`WrapperHealthWriter` writes on state changes and adapter events only; nothing refreshes the file during a
+silent turn. `Store.read_health` turns a snapshot older than 300 s into `unknown` and drops its state, `since` and
+`last_progress_at` (`health_stale_ttl`). So a genuinely wedged turn reads "No fresh health" after five minutes,
+before the ten-minute rule can be evaluated, and the LOOKS STUCK card fires only when health keeps being
+refreshed (for example by `agenttalk progress` notes) yet nothing else moves. `test_health_older_than_the_ttl_...`
+pins this. Smallest backend addition, if the pitch needs the card on a real wedge: keep the last known snapshot
+on the stale read (`health.normalize`, TTL branch: add `last_known: {state, since, last_progress_at,
+updated_at}` from the validated raw file; `state` stays `unknown`, `stale` stays true). The console would then
+treat "last known state working_silent, no health write for 10 min, heartbeat fresh, no reply" as the stuck
+evidence, which is exactly what a silent turn looks like. Not done: it changes a shared reader, so it needs a go.
