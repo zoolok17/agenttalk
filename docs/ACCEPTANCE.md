@@ -446,6 +446,9 @@ For a real run, replace the inert distributions, version captures and proof with
 operator-staged artifacts, regenerate every affected digest and size, and bind
 the exact registry bytes into `plan.registry_digest`. Do this before opening the
 attempt; changing frozen pins requires a successor.
+The generator's project ID and cold change-base are placeholders for preflight
+only. Before opening a real close, bind them to your verified Git project and
+ancestry using the increment-1 plan requirements above.
 
 Before that expiry, the command prints:
 

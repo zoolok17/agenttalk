@@ -204,7 +204,7 @@ def test_schema4_distributions_are_not_retained(candidate):
     save(candidate)
     assert open_candidate(candidate) == 0
     assert not (candidate["store"].dir / "acceptance" / "sha256" / pin["sha256"]).exists()
-    assert pin["id"] not in {i["ref"] for i in capsule(candidate)["inputs"]}
+    assert pin["id"] + ":pin" not in {i["ref"] for i in capsule(candidate)["inputs"]}
 
 
 def test_schema4_linked_cache_refuses_without_private_path(candidate, monkeypatch, capsys):
@@ -623,3 +623,21 @@ def test_conflicting_lens_assignment_refuses_before_evaluation(candidate, monkey
     assert legacy.open_attempt(candidate, "--cache-root", str(candidate["stage"]["root"]),
                                "--lens", lens, "--allow", lens + ":wrong-agent") != 0
     assert calls == []
+
+
+def test_new_declarative_evidence_after_seal_requires_fresh_attempt(candidate):
+    pin = next(p for p in candidate["stage"]["registry"]["files"] if p["role"] != "distribution")
+    path = candidate["stage"]["root"] / pin["path"]
+    original = path.read_bytes()
+    path.unlink()
+    assert open_candidate(candidate) == 0
+    data = attachment(candidate)
+    assert legacy.attach(candidate) == 0
+    assert legacy.cold_phase(candidate, "reconcile") == 0
+    legacy.final_accepts(candidate, data)
+    before = deepcopy(record(candidate)["acceptance_route"])
+    path.write_bytes(original)
+    result = A.resolve(candidate["store"], record(candidate))
+    assert (P.INTEGRITY, pin["id"]) in {(h["code"], h["ref"]) for h in result["preflight"]["holds"]}
+    assert legacy.command(candidate, "publish", "--id", "attempt", "--from", "lead", "--verdict", "go") == 3
+    assert record(candidate)["acceptance_route"] == before

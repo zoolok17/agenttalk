@@ -881,3 +881,119 @@ inventory scans all acceptance modules, close and CLI, tracking subscription,
 `get` and local aliases. Only close-envelope and DoD-policy version validators
 belong to separate namespaces. Literal binding-key and nested capsule tests cover
 the cold reader's identified gaps. M3b replaces the publication guard separately.
+
+### M3b lifecycle integration
+
+M3c is commit `6591f58`; lifecycle integration and the operator walkthrough are
+commit `b7210da`. The latter adds a command-local verified read set, not a cached
+preflight verdict. Publication prepares it before acquiring the acceptance writer
+lock. Inside that lock, the same evaluator checks the current route against the
+prepared route and rechecks each staged file's device, inode, mode, size and
+nanosecond modification/change times. It then applies the injected decision clock
+again, so expiry after hashing still prevents GO. Unsupported/missing filesystem
+metadata is represented by the platform's reported value; mutation preserving
+all reported metadata remains the documented cooperative boundary. The metadata
+check does not claim filesystem immutability after that instant.
+
+Distribution bytes are streamed once per decision command and never accumulated
+in the read set or retained. Captured banner/log/observed-environment bytes are
+read from their bound retained inputs. Planned overrides and all staged file pins
+are checked live. A newly available declarative input that was absent at attachment
+is refused after sealing; evaluation never appends evidence. Missing/changed pins,
+offline violations, integrity failures and expiry use the existing five preflight
+codes and the existing pure acceptance verdict fold. The published snapshot omits
+the preflight report's overall `status`; per-entry outcomes remain diagnostic.
+
+The final hygiene manifest and inherited evidence closure include the environment,
+both capture capsules, observation envelope and every captured declarative input.
+Cold provenance withholds these same hashes. Historical distribution display says
+`artifact not retained, pinned by digest`; it does not rerun the original verdict
+against today's cache. `close check` exposes that status in text and JSON while
+preserving the ordinary already-published HOLD. Corrupt retained evidence still
+fails closed. The JSON display regression was red on the missing `preflight` key
+before the display change, then green.
+
+Schema-4 successors accept an absolute `--cache-root`. Preparation and distribution
+hashing precede the parent's lock; the parent is compared again inside it before
+creation. Existing terminal-parent and retained-evidence rules remain. Downgrades
+are refused, and protected measurement predicates now include required registry
+entry IDs, so dropping those requirements needs the existing exact LD2 approval.
+The complete successor test performs fresh cold review, seals the parent's retained
+preflight evidence, and reaches GO. No staged tool is executed in these tests.
+
+The operator walkthrough includes a pinned synthetic JDK, checker jar, advisory
+distribution, expiring manifest, provenance and bounded adapter/config inputs.
+The complete JSON is in `docs/examples/java-registry.json`; its generator and
+read-only preflight command were executed successfully. An automated example
+test checks registry parity, pass and missing-JDK not-run. The guide includes the
+strict UTF-8/no-BOM requirement and PowerShell 5.1 UTF-16 redirection warning.
+
+#### Executed validation
+
+All pytest invocations are foreground, targeted, use `PYTHONPATH=<checkout>/src`,
+`PYTHONDONTWRITEBYTECODE=1`, `-q -p no:cacheprovider` and separate task-scratch
+`--basetemp` directories. No full repository suite was run.
+
+| Invocation | Result |
+| --- | --- |
+| M3c early-refusal/pending-ack regression selection, Python 3.10 | Before: 6 failed, 1 passed. After: 7 passed. |
+| M3c staging/schema/preflight files, Python 3.10 | 205 passed, 55.17 s. |
+| M3b initial lifecycle GO and mutation/deletion/expiry selection, Python 3.10 | Before: 4 failed at blocked GO. After: 4 passed, 17.63 s. |
+| Registry/preflight/schema/staging checkpoint, Python 3.10 | 415 passed, 3 skipped, 112.85 s. |
+| Final staging file, Python 3.10 | 75 passed, 126.70 s; the later conflicting-lens case also passed. |
+| Registry/preflight/schema/staging checkpoint, Python 3.14 | 415 passed, 1 failed, 3 skipped, 122.64 s. The failure was a test mock: 3.14 `is_symlink` bypasses `Path.lstat`. |
+| Corrected staging file, Python 3.14 | 74 passed, 114.48 s. Final hashing-race, literal-seal and conflicting-lens selection: 3 passed, 9.61 s. |
+| Exact reviewer T9 spelling and schema inventory | Python 3.10 selection: 5 passed (includes lens case); Python 3.14 schema file: 5 passed. |
+| Shipped acceptance/close/signoff/gate selection, Python 3.10 | 84 passed, 805 deselected, 143.06 s. |
+| Same shipped-path selection, Python 3.14 | 84 passed, 805 deselected, 143.51 s. |
+
+The shipped-path `-k` expression is `publish or successor or lock or serialization
+or enumeration or transaction or legacy or reopen or replaced_instance`. Across
+the completed invocations and corrections, each interpreter covers **503 distinct
+passing cases and 3 platform skips**, including **419** in the four increment-2
+files and **84** in the shipped-path selection. This is aggregate evidence, not
+a claim of one completed combined invocation. The final tests preserve pending
+ack compatibility, cheap refusals, the exact binding key set, strict capture
+structure, role-qualified refs, privacy, live freshness and both hash/lock races.
+
+The final post-seal case (one pass on each interpreter) restores a declarative
+file that was absent at both open and attachment. Publication refuses GO and
+leaves the frozen route unchanged; those bytes cannot enter the evidence seal.
+
+Ruff passes all changed production/test modules and the example generator.
+Bandit passes those production modules and generator, and the changed tests with
+only pytest assertion rule B101 excluded. Existing suppression-comment warnings
+are not findings. Patch whitespace passes. The added-line privacy sweep has eight
+successful positive controls and zero matches. No PR is opened; the milestone
+stops for the lead's cold read.
+
+#### Mutation evidence
+
+The unchanged reviewer mutation script was run against isolated source copies.
+Before M3c (`775ec0d`), its baseline passed 184 cases and the audit produced
+**57 killed, 26 survived, 1 unmatched pattern**. At the M3c checkpoint (`6591f58`),
+the baseline passed 205 cases and the audit produced **68 killed, 9 survived,
+7 unmatched patterns**. Unmatched patterns are excluded from mutation results;
+they reflect changed source anchors, not passing tests. An initial before-run
+with a missing scratch parent failed fixture setup and is excluded entirely.
+
+Final focused replays against the lifecycle implementation killed **all 19
+requested gap mutants**: T2/T3/T5/T6/T7, T41/T44/T48/T50/T51, T29/T30/T33,
+A1/A11/A14 and P3/P4/P5. Four anchors were adapted to the refactored capsule and
+role-qualified capture code. Five additional lifecycle mutations were killed:
+removing final metadata checks, removing during-hash identity checks, restoring
+the published overall pass status, omitting preflight evidence from the seal,
+and removing registry-entry LD2 coverage. That invocation killed 24 of 24.
+
+A separate replay killed P8 after correcting the negative distribution-retention
+assertion to use its role-qualified `:pin` reference; the unqualified assertion
+had become ineffective. Its unchanged baseline passes on both interpreters.
+Thus the final focused evidence is **25 of 25 killed across two invocations**.
+This does not imply every broad-audit survivor is killed: T11, T13, T14, T25,
+T26, T31 and A7 remain recorded broad-audit gaps outside the requested 19.
+T30 and P8 survived the earlier checkpoint but are killed by the final replays.
+
+All three isolated production source copies were compared with their recorded
+Git commits after restoration. Task scratch is retained for the cold read,
+including before/after logs, focused replay scripts, baseline and mutant outputs,
+and isolated pytest directories.
