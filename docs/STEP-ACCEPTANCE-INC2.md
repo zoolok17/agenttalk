@@ -320,7 +320,7 @@ simply broadening `== 3` to `>= 3` would accept unknown schemas and is forbidden
 | acceptance.py:215 | Plan `>=2`: require nonempty authors. |
 | acceptance.py:330 | Plan `>=2`: verify project identity. |
 | acceptance.py:332 | Plan `==3`: verify cold change base. |
-| acceptance.py:346 | Plan `==3`: inherit related change obligations during prepare. |
+| acceptance.py:346 | Plan `==3`: add the required final cold-review lens assignment. |
 | acceptance.py:378 | Plan `>=2`: freeze parent/amendment fields. |
 | acceptance.py:381 | Plan `==3`: freeze cold and obligation hashes. |
 | acceptance.py:385 | Plan `==3`: capture inherited obligations. |
