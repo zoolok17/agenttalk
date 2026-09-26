@@ -1,11 +1,11 @@
 # 06 · Rules
 
 ## Names
-Pattern: `<runtime>-<project>-<role>[-<n>]`, runtime ∈ claude | codex | qwen.
+Pattern: `<runtime>-<project>-<role>[-<n>]`, runtime ∈ claude | codex | qwen. **The role is everything between the project and the optional number, hyphens included.** Projects are matched against the known team list (so a project may contain hyphens too).
 1. **Drop the runtime** — it's shown by the avatar badge (C / X / Q).
 2. **Drop the project** when it matches the team on screen. In cross-team lists keep it as a prefix: `shopfront/dev-1`.
-3. **Shorten the role, keep the number**: developer→dev, reviewer→rev, tester→test, architect→arch, lead→lead.
-4. **Break ties** with the lowercase runtime letter, only when needed: `c.dev-1` / `x.dev-1`.
+3. **Shorten each word of the role, keep the number**: developer→dev, reviewer→rev, frontend→fe, backend→be, tester→test, architect→arch, lead→lead. Unknown words stay as they are.
+4. **Break ties** with the lowercase runtime letter, only when needed: `x.rev-1` next to `q.rev-1`.
 5. Names that don't fit the pattern: show in full, cut at the **end** at 17 chars + "…". Never middle-ellipsis.
 6. Full name always in tooltip / long-press and in every detail view.
 
@@ -13,10 +13,11 @@ Pattern: `<runtime>-<project>-<role>[-<n>]`, runtime ∈ claude | codex | qwen.
 |---|---|---|
 | codex-agenttalk-developer-5 | Main team | dev-5 |
 | claude-agenttalk-lead | Main team | lead |
-| qwen-agenttalk-reviewer-4 | Main team | rev-4 |
+| claude-agenttalk-frontend-dev | Main team | fe-dev |
+| codex-agenttalk-reviewer-1 | next to qwen-agenttalk-reviewer-1 | x.rev-1 |
+| qwen-agenttalk-reviewer-1 | next to codex-agenttalk-reviewer-1 | q.rev-1 |
 | claude-shopfront-developer-1 | Shopfront team | dev-1 |
 | claude-shopfront-developer-1 | Cross-team list | shopfront/dev-1 |
-| codex-agenttalk-developer-1 | Two dev-1s on a team | x.dev-1 |
 | nightly-docs-builder-agent | Doesn't fit | nightly-docs-buil… |
 
 Reference implementation + tests: `reference/name-shortener.js`.
@@ -55,5 +56,8 @@ Live today: roster & health · messages & threads · needs-a-human queue · gate
 | Program stages | Stays a concept (2c). Not in the app. |
 | Decision deadlines & options | Optional. No deadline → show waiting age; options are the lead's quick replies. |
 | Signed export | Hidden until the server can sign. |
-| Qwen spend in the console | Designed (3b). Behind a flag until the gateway ledger is readable. |
+| Gateway spend in the console | Designed (3b): each gateway vs its own limits + account sum vs cap. Behind a flag. |
+| Process status for stuck agents | Evidence from heartbeat, progress counter, last message: "no progress 14 min · no reply sent". Wait is primary until process evidence exists. |
+| List of team sources | Switcher designed; until it exists each machine opens its own console. |
+| Changing gateway limits | Never in the console. The answer goes to the lead; the operator changes the limit on the machine, from the command line. |
 | Both machines in one view | Switcher designed; each team is its own source. Until supported, each team opens its own console. |

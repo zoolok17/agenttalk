@@ -12,8 +12,10 @@
 - [ ] Quiet day renders "All quiet." + idle-is-normal line + since-you-last-looked; idle is grey.
 - [ ] Offline: banner, 50% greying, "as of", stopped pulses, disabled composer/actions, Retry; other team unaffected.
 - [ ] Usage windows: Claude & Codex, 5-hour & weekly, % + reset, threshold colours.
-- [ ] Qwen (flagged): rows show € today; rail budget bar with alert (dashed), cutoff (solid), cap (end), bill tick (timestamped), projection (dotted); higher of ledger/bill shown when bill is newer.
-- [ ] Names follow 06-RULES; full name in tooltip; passes `reference/name-shortener.js` tests.
+- [ ] Qwen (flagged): rows show € today; team bar = gateway ledger vs its own alert (dashed) and cutoff (solid), projection dotted, labelled "of <cutoff> € cutoff"; account bar = stacked ledgers vs 100 € cap with timestamped bill tick; no team bar mentions the cap.
+- [ ] "Raise" answers only message the lead; confirmation names the command-line step; no limit changes from the console.
+- [ ] Stuck cards without process data use heartbeat/progress/last-message wording and put Wait first.
+- [ ] Names follow 06-RULES (hyphenated roles → fe-dev; ties → x.rev-1 / q.rev-1); full name in tooltip; passes `reference/name-shortener.js` tests.
 - [ ] Avatars: silhouette per theme, runtime badge, never circle-cropped.
 - [ ] Phone (< 1024px): Needs you → budget → lead; 48px targets; tab bar.
 - [ ] All text ≥ 4.5:1 (fix Paper dim/accent per 06-RULES).

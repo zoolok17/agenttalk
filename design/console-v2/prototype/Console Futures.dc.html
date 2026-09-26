@@ -88,6 +88,7 @@
                 <div style="display:flex;align-items:center;gap:10px"><span style="{{n.kindStyle}}">{{n.kind}}</span><span style="flex:1"></span><span style="font-family:{{f3.mono}};font-size:11px;color:{{p5.dim}}">{{n.age}}</span></div>
                 <span style="font-family:{{f3.serif}};font-size:{{needSize}};line-height:1.2">{{n.title}}</span>
                 <div style="display:flex;gap:12px;align-items:baseline"><span style="font-family:{{f3.mono}};font-size:10px;letter-spacing:.1em;color:{{p5.dim}};flex:none">EVIDENCE</span><span style="font-family:{{f3.mono}};font-size:12px;line-height:1.5">{{n.ev}}</span></div>
+                <sc-if value="{{n.hasTag}}" hint-placeholder-val="{{false}}"><span style="font-size:12px;line-height:1.45;color:{{p5.dim}}">{{n.evTag}}</span></sc-if>
                 <sc-if value="{{n.isDone}}" hint-placeholder-val="{{false}}"><span style="font-size:13px;color:{{p5.ok}}">{{n.done}}</span></sc-if>
                 <sc-if value="{{n.notDone}}" hint-placeholder-val="{{true}}">
                   <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
@@ -125,11 +126,16 @@
 
         <div style="border-left:1px solid {{p5.border}};background:{{p5.panel}};padding:18px;display:flex;flex-direction:column;gap:20px;min-height:0;overflow:auto">
           <div style="display:flex;flex-direction:column;gap:9px;opacity:{{frozenOp}}">
-            <div style="display:flex;align-items:center;gap:8px"><span style="{{qwenMark}}">Q</span><span style="font-size:12.5px;font-weight:600">Qwen gateway · September</span><span style="flex:1"></span><span style="font-family:{{f3.mono}};font-size:10.5px;color:{{p5.dim}}">{{bStamp}}</span></div>
-            <div style="display:flex;align-items:baseline;gap:6px"><span style="font-family:{{f3.mono}};font-size:24px;font-weight:600">{{bLedger}}</span><span style="font-size:12.5px;color:{{p5.dim}}">of 100 € cap</span></div>
-            <div style="position:relative;height:{{rb.h}}"><div style="{{rb.track}}"></div><div style="{{rb.proj}}"></div><div style="{{rb.fill}}"></div><div style="{{rb.bill}}"></div><div style="{{rb.alert}}"></div><div style="{{rb.cut}}"></div></div>
+            <div style="display:flex;align-items:center;gap:8px"><span style="{{qwenMark}}">Q</span><span style="font-size:12.5px;font-weight:600">{{gwTitle}}</span><span style="flex:1"></span><span style="font-family:{{f3.mono}};font-size:10.5px;color:{{p5.dim}}">{{bStamp}}</span></div>
+            <div style="display:flex;align-items:baseline;gap:6px"><span style="font-family:{{f3.mono}};font-size:24px;font-weight:600">{{bLedger}}</span><span style="font-size:12.5px;color:{{p5.dim}}">{{bOf}}</span></div>
+            <div style="position:relative;height:{{rb.h}}"><div style="{{rb.track}}"></div><div style="{{rb.proj}}"></div><div style="{{rb.fill}}"></div><div style="{{rb.fill2}}"></div><div style="{{rb.bill}}"></div><div style="{{rb.alert}}"></div><div style="{{rb.cut}}"></div><div style="{{rb.end}}"></div></div>
             <div style="display:grid;grid-template-columns:auto minmax(0,1fr);gap:4px 12px;font-size:11.5px;margin-top:4px">
-              <sc-for list="{{bLegend}}" as="l" hint-placeholder-count="4"><span style="{{l.kStyle}}">{{l.k}}</span><span style="color:{{p5.dim}}">{{l.v}}</span></sc-for>
+              <sc-for list="{{bLegend}}" as="l" hint-placeholder-count="3"><span style="{{l.kStyle}}">{{l.k}}</span><span style="color:{{p5.dim}}">{{l.v}}</span></sc-for>
+            </div>
+            <div style="margin-top:6px;padding-top:12px;border-top:1px solid {{p5.border}};display:flex;flex-direction:column;gap:8px">
+              <div style="display:flex;align-items:baseline;gap:6px"><span style="font-size:12px;font-weight:600">Account · September</span><span style="flex:1"></span><span style="font-family:{{f3.mono}};font-size:13px;font-weight:600">{{aSum}}</span><span style="font-size:11.5px;color:{{p5.dim}}">of 100 € cap</span></div>
+              <div style="position:relative;height:{{ra.h}}"><div style="{{ra.track}}"></div><div style="{{ra.proj}}"></div><div style="{{ra.fill}}"></div><div style="{{ra.fill2}}"></div><div style="{{ra.bill}}"></div><div style="{{ra.alert}}"></div><div style="{{ra.cut}}"></div><div style="{{ra.end}}"></div></div>
+              <span style="font-family:{{f3.mono}};font-size:10.5px;line-height:1.5;color:{{p5.dim}}">{{aLine}}</span>
             </div>
           </div>
           <div style="display:flex;flex-direction:column;gap:11px;opacity:{{frozenOp}}">
@@ -182,23 +188,28 @@
       <div style="display:flex;align-items:baseline;gap:12px">
         <span style="font-family:'Geist Mono',monospace;font-size:13px;font-weight:600;color:#0B0C0F;background:#E8E9ED;border-radius:6px;padding:3px 9px">3b</span>
         <span style="font-family:'Space Grotesk',sans-serif;font-size:21px;font-weight:600;color:#F2F3F5">Qwen budget · anatomy and states</span>
-        <span style="font-size:13.5px;color:#8B8F98">Alert, cutoff, cap and a late bill on one bar. Needs the gateway ledger in the console (not available yet).</span>
+        <span style="font-size:13.5px;color:#8B8F98">Per-gateway alert and cutoff, account cap and late bill — kept apart so the cap is never counted twice. Needs gateway spend in the console (not available yet).</span>
       </div>
-      <div style="width:1240px;height:860px;border-radius:{{r3.frame}};overflow:hidden;background:{{p5.bg}};color:{{p5.fg}};font-family:{{f3.body}};padding:30px 34px;display:flex;flex-direction:column;gap:18px;box-shadow:0 30px 80px rgba(0,0,0,.5)">
-        <div style="display:flex;align-items:baseline;gap:14px"><span style="font-family:{{f3.serif}};font-size:32px;line-height:1.1">One bar against the cap. Two lines on it. One late tick.</span><span style="flex:1"></span><span style="font-family:{{f3.mono}};font-size:11px;color:{{p5.dim}}">levels are gateway config · example values</span></div>
-        <div style="position:relative;height:292px;margin:0 70px 0 40px">
-          <div style="position:absolute;left:0;right:0;top:128px;height:28px"><div style="{{ab.track}}"></div><div style="{{ab.proj}}"></div><div style="{{ab.fill}}"></div><div style="{{ab.bill}}"></div><div style="{{ab.alert}}"></div><div style="{{ab.cut}}"></div><div style="{{ab.end}}"></div></div>
-          <sc-for list="{{anat3}}" as="c" hint-placeholder-count="5">
-            <div style="{{c.line}}"></div>
-            <div style="{{c.box}}"><span style="{{c.labStyle}}">{{c.label}}</span><span style="font-family:{{f3.mono}};font-size:18px;font-weight:600">{{c.value}}</span><span style="font-size:12px;line-height:1.35;color:{{p5.dim}}">{{c.note}}</span></div>
-          </sc-for>
-        </div>
+      <div style="width:1240px;height:1090px;border-radius:{{r3.frame}};overflow:hidden;background:{{p5.bg}};color:{{p5.fg}};font-family:{{f3.body}};padding:30px 34px;display:flex;flex-direction:column;gap:18px;box-shadow:0 30px 80px rgba(0,0,0,.5)">
+        <div style="display:flex;align-items:baseline;gap:14px"><span style="font-family:{{f3.serif}};font-size:32px;line-height:1.1">Two levels: each gateway against its own limits, the account against the cap.</span><span style="flex:1"></span><span style="font-family:{{f3.mono}};font-size:11px;color:{{p5.dim}}">levels are gateway config · example values</span></div>
+        <sc-for list="{{anatomies3}}" as="an" hint-placeholder-count="2">
+          <div style="display:flex;flex-direction:column;gap:4px">
+            <div style="display:flex;align-items:baseline;gap:12px"><span style="font-family:{{f3.mono}};font-size:11px;font-weight:600;letter-spacing:.12em;color:{{p5.accent}}">{{an.title}}</span><span style="font-size:12.5px;color:{{p5.dim}}">{{an.sub}}</span></div>
+            <div style="position:relative;height:226px;margin:0 70px 0 40px">
+              <div style="position:absolute;left:0;right:0;top:128px;height:28px"><div style="position:relative;height:28px"><div style="{{an.bar.track}}"></div><div style="{{an.bar.proj}}"></div><div style="{{an.bar.fill}}"></div><div style="{{an.bar.fill2}}"></div><div style="{{an.bar.bill}}"></div><div style="{{an.bar.alert}}"></div><div style="{{an.bar.cut}}"></div><div style="{{an.bar.end}}"></div></div></div>
+              <sc-for list="{{an.calls}}" as="c" hint-placeholder-count="5">
+                <div style="{{c.line}}"></div>
+                <div style="{{c.box}}"><span style="{{c.labStyle}}">{{c.label}}</span><span style="font-family:{{f3.mono}};font-size:18px;font-weight:600">{{c.value}}</span><span style="font-size:12px;line-height:1.35;color:{{p5.dim}}">{{c.note}}</span></div>
+              </sc-for>
+            </div>
+          </div>
+        </sc-for>
         <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px">
           <sc-for list="{{bstates3}}" as="b" hint-placeholder-count="6">
             <div style="{{b.card}}">
               <div style="display:flex;align-items:center"><span style="font-family:{{f3.mono}};font-size:10.5px;letter-spacing:.1em;color:{{p5.dim}}">{{b.title}}</span><span style="flex:1"></span><span style="font-family:{{f3.mono}};font-size:10.5px;color:{{p5.dim}}">{{b.stamp}}</span></div>
               <div style="display:flex;align-items:baseline;gap:6px"><span style="{{b.valStyle}}">{{b.val}}</span><span style="font-size:12px;color:{{p5.dim}}">{{b.sub}}</span></div>
-              <div style="position:relative;height:{{b.bar.h}}"><div style="{{b.bar.track}}"></div><div style="{{b.bar.proj}}"></div><div style="{{b.bar.fill}}"></div><div style="{{b.bar.bill}}"></div><div style="{{b.bar.alert}}"></div><div style="{{b.bar.cut}}"></div></div>
+              <div style="position:relative;height:{{b.bar.h}}"><div style="{{b.bar.track}}"></div><div style="{{b.bar.proj}}"></div><div style="{{b.bar.fill}}"></div><div style="{{b.bar.fill2}}"></div><div style="{{b.bar.bill}}"></div><div style="{{b.bar.alert}}"></div><div style="{{b.bar.cut}}"></div><div style="{{b.bar.end}}"></div></div>
               <span style="{{b.stStyle}}">{{b.status}}</span>
             </div>
           </sc-for>
@@ -245,8 +256,8 @@
                   <div style="padding:22px 18px;border-radius:{{r3.card}};border:1px solid {{p5.border}};display:flex;flex-direction:column;gap:8px"><span style="font-family:{{f3.serif}};font-size:30px;line-height:1.1">Nothing needs you.</span><span style="font-size:14px;line-height:1.5;color:{{p5.dim}}">{{ph.calmSub}}</span></div>
                 </sc-if>
                 <div style="padding:14px 16px;border-radius:{{r3.card}};background:{{p5.panel}};border:1px solid {{p5.border}};display:flex;flex-direction:column;gap:9px;opacity:{{ph.op}}">
-                  <div style="display:flex;align-items:baseline;gap:6px"><span style="font-size:13px;font-weight:600">Qwen spend</span><span style="flex:1"></span><span style="font-family:{{f3.mono}};font-size:18px;font-weight:600">{{ph.bLedger}}</span><span style="font-size:12px;color:{{p5.dim}}">/ 100 €</span></div>
-                  <div style="position:relative;height:{{ph.bar.h}}"><div style="{{ph.bar.track}}"></div><div style="{{ph.bar.proj}}"></div><div style="{{ph.bar.fill}}"></div><div style="{{ph.bar.bill}}"></div><div style="{{ph.bar.alert}}"></div><div style="{{ph.bar.cut}}"></div></div>
+                  <div style="display:flex;align-items:baseline;gap:6px"><span style="font-size:13px;font-weight:600">Qwen spend</span><span style="flex:1"></span><span style="font-family:{{f3.mono}};font-size:18px;font-weight:600">{{ph.bLedger}}</span><span style="font-size:12px;color:{{p5.dim}}">{{ph.bOf}}</span></div>
+                  <div style="position:relative;height:{{ph.bar.h}}"><div style="{{ph.bar.track}}"></div><div style="{{ph.bar.proj}}"></div><div style="{{ph.bar.fill}}"></div><div style="{{ph.bar.fill2}}"></div><div style="{{ph.bar.bill}}"></div><div style="{{ph.bar.alert}}"></div><div style="{{ph.bar.cut}}"></div><div style="{{ph.bar.end}}"></div></div>
                   <span style="font-family:{{f3.mono}};font-size:11px;color:{{p5.dim}}">{{ph.bLine}}</span>
                 </div>
                 <div style="padding:14px 16px;border-radius:{{r3.card}};background:{{p5.panel}};border:1px solid {{p5.border}};display:flex;flex-direction:column;gap:10px;opacity:{{ph.op}}">
@@ -1041,7 +1052,7 @@
   </div>
 </section>
 </x-dc>
-<script type="text/x-dc" data-dc-script data-props="{&quot;actions&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:false,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Behavior&quot;},&quot;live&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Behavior&quot;},&quot;crt&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;1a Terminal&quot;}}">
+<script type="text/x-dc" data-dc-script data-props="{&quot;actions&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:false,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Behavior&quot;},&quot;live&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Behavior&quot;},&quot;processEvidence&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:false,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Behavior&quot;},&quot;crt&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;1a Terminal&quot;}}">
 class Component extends DCLogic {
   constructor(props){
     super(props);
@@ -1205,14 +1216,14 @@ class Component extends DCLogic {
       let r='Noted. I’ll fold that in and only come back if it needs you.';
       if(t.indexOf('status')>=0) r='Two working, one running tests, the rest idle. Nothing is blocked except what’s on your list.';
       else if(t.indexOf('restart')>=0) r='Restarting dev-6 with its last context. I’ll check it replies within 2 minutes.';
-      else if(t.indexOf('120')>=0||t.indexOf('raise')>=0) r='Done — cap is 120 € for September. Alert moves to 96 €, cutoff to 114 €.';
+      else if(t.indexOf('54')>=0||t.indexOf('raise')>=0) r='Noted: 54 € for the main gateway. Changing the limit is an operator step on win-ws01, from the command line. I’ll confirm once its ledger reports the new cutoff.';
       else if(t.indexOf('keep')>=0) r='Keeping it. I’ll add a removal task for next release so it doesn’t get forgotten.';
       else if(t.indexOf('wait')>=0) r='Waiting. I’ll only come back if the evidence changes.';
       this.setState(s=>({chat3:[...s.chat3,{who:'lead',body:r}]}));
     },900);
   }
   t3(st,now){
-    const key=JSON.stringify([st.s3,st.th5,st.team3,st.keys3,st.sel3,st.done3,st.later3,st.chat3.length,st.draft6,st.retried,this.props.actions===true]);
+    const key=JSON.stringify([st.s3,st.th5,st.team3,st.keys3,st.sel3,st.done3,st.later3,st.chat3.length,st.draft6,st.retried,this.props.actions===true,this.props.processEvidence===true]);
     if(this._t3k===key&&this._t3v) return this._t3v;
     this._t3k=key; this._t3v=this.t3build(st);
     return this._t3v;
@@ -1227,8 +1238,13 @@ class Component extends DCLogic {
     const r3={frame:rad(18),card:rad(16),ctl:rad(9),bubble:mono?'0px':'4px 16px 16px 16px',you:mono?'0px':'16px 4px 16px 16px'};
     const RT=light?{claude:'#B0532C',codex:'#2C7A6B',qwen:'#6D4AC0'}:{claude:'#D08A5E',codex:'#4FB3A0',qwen:'#9E82E0'};
     const RL={claude:'C',codex:'X',qwen:'Q'};
-    const ROLE={developer:'dev',reviewer:'rev',tester:'test',architect:'arch',lead:'lead'};
-    const parse=id=>{const m=/^(claude|codex|qwen)-([a-z0-9]+)-([a-z]+)(?:-(\d+))?$/.exec(id); return m?{rt:m[1],proj:m[2],base:(ROLE[m[3]]||m[3])+(m[4]?'-'+m[4]:'')}:null;};
+    const pe=this.props.processEvidence===true;
+    const ABBR={developer:'dev',reviewer:'rev',tester:'test',architect:'arch',frontend:'fe',backend:'be',lead:'lead'};
+    const PROJ=['agenttalk','shopfront'];
+    const parse=id=>{const m=/^(claude|codex|qwen)-(.+)$/.exec(id); if(!m) return null; const rest=m[2]; let proj=PROJ.find(x=>rest.indexOf(x+'-')===0), tail;
+      if(proj) tail=rest.slice(proj.length+1); else { const i=rest.indexOf('-'); if(i<0) return null; proj=rest.slice(0,i); tail=rest.slice(i+1); }
+      const n=/^(.*?)(?:-(\d+))?$/.exec(tail); if(!n[1]) return null;
+      return {rt:m[1],proj,base:n[1].split('-').map(w=>ABBR[w]||w).join('-')+(n[2]?'-'+n[2]:'')};};
     const shortName=(id,project,pool)=>{const q=parse(id); if(!q) return id.length>18?id.slice(0,17)+'…':id; let s=q.base;
       if(pool&&pool.some(o=>{const z=parse(o); return o!==id&&z&&z.base===q.base&&z.proj===q.proj;})) s=RL[q.rt].toLowerCase()+'.'+s;
       if(project&&q.proj!==project) s=q.proj+'/'+s; return s;};
@@ -1242,21 +1258,22 @@ class Component extends DCLogic {
     const off=scen==='offline'&&team===0, quiet=scen==='quiet';
     const TEAMS=[
       {label:'Main team',machine:'win-ws01',project:'agenttalk',rows:[
-        ['claude-agenttalk-lead','claude','working','Reading rev-1’s review of WP-14','idle','Idle · nothing queued'],
+        ['claude-agenttalk-lead','claude','working','Reading rev-2’s review of WP-14','idle','Idle · nothing queued'],
         ['claude-agenttalk-developer-1','claude','working','Implementing WP-15 · 3m in','working','Nightly lint · 2m in'],
-        ['claude-agenttalk-developer-2','claude','idle','Idle · last turn 40m ago','idle','Idle · last turn 3h ago'],
-        ['claude-agenttalk-reviewer-1','claude','idle','Idle · gave GO on WP-14','idle','Idle · gave GO on WP-14'],
+        ['claude-agenttalk-frontend-dev','claude','idle','Idle · last turn 40m ago','idle','Idle · last turn 3h ago'],
+        ['claude-agenttalk-reviewer-2','claude','idle','Idle · gave GO on WP-14','idle','Idle · gave GO on WP-14'],
         ['claude-agenttalk-reviewer-3','claude','idle','Idle · gave FIX on WP-12','idle','Idle'],
-        ['codex-agenttalk-developer-5','codex','busy','Running tests 6m · output 40s ago','idle','Idle'],
-        ['codex-agenttalk-developer-6','codex','stuck','No output 14m · tests exited 12m ago','idle','Idle'],
-        ['codex-agenttalk-reviewer-2','codex','capped','5-hour window full','idle','Idle','resets 23:40',''],
+        ['codex-agenttalk-developer-5','codex','busy',pe?'Running tests 6m · output 40s ago':'Progress +3 in 2 min · no message 6m','idle','Idle'],
+        ['codex-agenttalk-developer-6','codex','stuck',pe?'No output 14m · tests exited 12m ago':'No progress 14m · no reply sent','idle','Idle'],
+        ['codex-agenttalk-reviewer-1','codex','capped','5-hour window full','idle','Idle','resets 23:40',''],
         ['qwen-agenttalk-developer-7','qwen','working','Drafting WP-16 fixtures','idle','Idle','€3.20 today','€0.00 today'],
-        ['qwen-agenttalk-reviewer-4','qwen','idle','Idle','idle','Idle','€0.40 today','€0.00 today']],
+        ['qwen-agenttalk-reviewer-1','qwen','idle','Idle','idle','Idle','€0.40 today','€0.00 today']],
        needs:[
-        {id:'n3',kind:'LOOKS STUCK',tone:'bad',title:'dev-6 has gone quiet',ev:'No output for 14 min · test run exited 12 min ago · no reply sent',age:'14m',opts:['Restart with context','Wait 10 min']},
-        {id:'n1',kind:'SPEND LIMIT',tone:'warn',title:'Raise the qwen cap from 100 € to 120 € for September?',ev:'Ledger 67.20 € on day 21 · ≈ 96 € by the 30th · the 95 € cutoff lands around the 29th',age:'no deadline · waiting 2d',opts:['Raise to 120 €','Keep 100 €']},
+        pe?{id:'n3',kind:'LOOKS STUCK',tone:'bad',title:'dev-6 has gone quiet',ev:'No output for 14 min · test run exited 12 min ago · no reply sent',age:'14m',opts:['Restart with context','Wait 10 min']}
+          :{id:'n3',kind:'LOOKS STUCK',tone:'bad',title:'dev-6 has gone quiet',ev:'No progress for 14 min · no reply sent · heartbeat still fresh',evTag:'Weaker evidence: process status isn’t visible yet, so Wait comes first.',age:'14m',opts:['Wait 10 min','Restart with context']},
+        {id:'n1',kind:'SPEND LIMIT',tone:'warn',title:'Raise the main gateway’s cutoff from 44 € to 54 €?',ev:'Main ledger 36.80 € on day 21 · ≈ 52.60 € by the 30th · the 44 € cutoff lands around the 25th · both gateways would total 93 € of the 100 € cap',age:'no deadline · waiting 2d',opts:['Raise to 54 €','Keep 44 €'],cli:'the limit itself changes on win-ws01, from the command line'},
         {id:'n2',kind:'DECISION',tone:'info',title:'Keep the old CSV export for one more release?',ev:'rev-3 cold review: FIX · two callers still use it · the lead recommends keeping it',age:'no deadline · waiting 5h',opts:['Keep it','Remove it']}],
-       lead:{busy:'Three things need you. dev-6 first — it looks stuck, not busy. The spend call is the only one with a real clock: at this rate qwen hits its cutoff around the 29th.',quiet:'Nothing needs you. I’ll start WP-16 when dev-1 finishes the nightly lint.'}},
+       lead:{busy:'Three things need you. dev-6 first — no progress for 14 minutes and no reply. The spend call has a real clock: at this rate the main gateway reaches its 44 € cutoff around the 25th.',quiet:'Nothing needs you. I’ll start WP-16 when dev-1 finishes the nightly lint.'}},
       {label:'Shopfront',machine:'linux-02',project:'shopfront',rows:[
         ['claude-shopfront-lead','claude','working','Planning checkout WP-3','idle','Idle'],
         ['claude-shopfront-developer-1','claude','working','Implementing WP-3 · 11m in','idle','Idle'],
@@ -1274,7 +1291,7 @@ class Component extends DCLogic {
     const act=(n,o)=>{ if(off||st.done3[n.id]) return; this.setState(s=>({done3:{...s.done3,[n.id]:o}})); this.send6(o); };
     const later=n=>{ this.setState(s=>({later3:[...s.later3,n.id],sel3:0})); };
     const needs3=vis.map((n,i)=>{const c=toneC[n.tone], sel=i===st.sel3&&!off, done=st.done3[n.id];
-      return {kind:n.kind,title:n.title,ev:n.ev,age:n.age,isDone:!!done,notDone:!done,done:done?'✓ Sent to the lead: '+done:'',hint:sel?'enter · l later':'',
+      return {kind:n.kind,title:n.title,ev:n.ev,age:n.age,evTag:n.evTag||'',hasTag:!!n.evTag&&!done,isDone:!!done,notDone:!done,done:done?'✓ Sent to the lead: '+done+(n.cli&&done===n.opts[0]?' · '+n.cli:''):'',hint:sel?'enter · l later':'',
         pick:()=>this.setState({sel3:i}),
         card:{background:p.panel,border:'1px solid '+(sel?p.accent:(done?p.border:A(c,.5))),borderRadius:r3.card,padding:'15px 18px',display:'flex',flexDirection:'column',gap:'9px',maxWidth:'700px',opacity:off?.5:(done?.65:1),boxShadow:sel&&!done?'0 0 0 3px '+A(p.accent,.18):'none',cursor:'pointer'},
         kindStyle:{fontFamily:MONO,fontSize:'10.5px',fontWeight:600,letterSpacing:'.1em',color:c},
@@ -1296,20 +1313,24 @@ class Component extends DCLogic {
         capStyle:{fontFamily:MONO,fontSize:'10.5px',color:off?p.dim:(rt==='qwen'?RT.qwen:p.bad),flex:'none'}};});
     const idleN=T.rows.filter(r=>(quiet?r[4]:r[2])==='idle').length;
 
-    const CAP=100,ALERT=80,CUT=95;
-    const bar=(v,bill,proj,h,frozen)=>{const pc=x=>Math.min(100,x/CAP*100)+'%'; const col=frozen?p.dim:(v>=CUT?p.bad:v>=ALERT?p.warn:p.accent);
+    const bar=o=>{const S=o.scale, pc=x=>Math.max(0,Math.min(100,x/S*100))+'%', h=o.h, r=rad(h/2);
+      const col=o.frozen?p.dim:(o.cut&&o.v>=o.cut?p.bad:(o.alert&&o.v>=o.alert?p.warn:p.accent));
       return {h:h+'px',
-        track:{position:'absolute',inset:'0',borderRadius:rad(h/2),background:p.panel2,border:'1px solid '+p.border},
-        proj:{position:'absolute',left:'0',top:'0',bottom:'0',width:proj?pc(proj):'0%',borderRadius:rad(h/2),background:'repeating-linear-gradient(90deg,'+A(col,.4)+' 0 3px,transparent 3px 7px)'},
-        fill:{position:'absolute',left:'0',top:'0',bottom:'0',width:pc(v),borderRadius:rad(h/2),background:col},
-        bill:{position:'absolute',left:'calc('+pc(bill||0)+' - 1px)',top:'-4px',bottom:'-4px',width:'3px',borderRadius:'1px',background:p.fg,display:bill?'block':'none'},
-        alert:{position:'absolute',left:pc(ALERT),top:'-5px',bottom:'-5px',width:'0',borderLeft:'2px dashed '+p.warn},
-        cut:{position:'absolute',left:pc(CUT),top:'-5px',bottom:'-5px',width:'2px',background:p.bad},
-        end:{position:'absolute',right:'-1px',top:'-5px',bottom:'-5px',width:'2px',background:p.fg}};};
-    const B=quiet?{l:52.30,b:49.10,p:75}:{l:67.20,b:61.80,p:96};
+        track:{position:'absolute',inset:'0',borderRadius:r,background:p.panel2,border:'1px solid '+p.border},
+        proj:{position:'absolute',left:'0',top:'0',bottom:'0',width:o.proj?pc(o.proj):'0%',borderRadius:r,background:'repeating-linear-gradient(90deg,'+A(col,.4)+' 0 3px,transparent 3px 7px)'},
+        fill:{position:'absolute',left:'0',top:'0',bottom:'0',width:pc(o.v),borderRadius:r,background:col},
+        fill2:{position:'absolute',top:'0',bottom:'0',left:pc(o.v),width:o.seg2?pc(o.seg2):'0%',background:o.frozen?p.dim:A(p.accent,.45),display:o.seg2?'block':'none'},
+        bill:{position:'absolute',left:'calc('+pc(o.bill||0)+' - 1px)',top:'-4px',bottom:'-4px',width:'3px',borderRadius:'1px',background:p.fg,display:o.bill?'block':'none'},
+        alert:{position:'absolute',left:pc(o.alert||0),top:'-5px',bottom:'-5px',width:'0',borderLeft:'2px dashed '+p.warn,display:o.alert?'block':'none'},
+        cut:{position:'absolute',left:'calc('+pc(o.cut||0)+' - 1px)',top:'-5px',bottom:'-5px',width:'2px',background:p.bad,display:o.cut?'block':'none'},
+        end:{position:'absolute',right:'-1px',top:'-5px',bottom:'-5px',width:'2px',background:p.fg,display:o.endLine?'block':'none'}};};
     const eur=v=>v.toFixed(2)+' €';
-    const rb=bar(B.l,B.b,B.p,10,off);
-    const bLegend=[['alert',p.warn,'80 € · notifies you, blocks nothing'],['cutoff',p.bad,'95 € · gateway refuses calls'],['bill ▮',p.fg,eur(B.b)+' · as of 14:00'],['projected',p.dim,'≈ '+B.p+' € by the 30th']].map(([k,c,v])=>({k,v,kStyle:{fontFamily:MONO,color:c}}));
+    const GW=quiet?{main:{l:24.10,alert:39,cut:44,proj:34.40},shop:{l:20.00,alert:35,cut:39,proj:28.60},bill:41.00}:{main:{l:36.80,alert:39,cut:44,proj:52.60},shop:{l:30.40,alert:35,cut:39,proj:37.10},bill:61.80};
+    const teamBar=(g,h,frozen)=>bar({v:g.l,alert:g.alert,cut:g.cut,proj:g.proj,scale:Math.max(g.cut,g.proj||0)*1.04,h,frozen});
+    const acctBar=(a,b,bill,h)=>bar({v:a,seg2:b,bill,scale:100,endLine:true,h});
+    const G=team===0?GW.main:GW.shop, sumL=GW.main.l+GW.shop.l, crossDay=G.proj>G.cut?Math.round(21*G.cut/G.l):0;
+    const rb=teamBar(G,10,off), ra=acctBar(GW.main.l,GW.shop.l,GW.bill,8);
+    const bLegend=[['alert',p.warn,G.alert+' € · notifies you, blocks nothing'],['cutoff',p.bad,G.cut+' € · this gateway refuses calls'],['projected',crossDay?p.bad:p.dim,'≈ '+eur(G.proj)+' by the 30th'+(crossDay?' · past the cutoff ~'+crossDay+'th':'')]].map(([k,c,v])=>({k,v,kStyle:{fontFamily:MONO,color:c}}));
 
     const U=quiet?[['claude','5-hour',18,'22:10'],['claude','weekly',38,'Mon 09:00'],['codex','5-hour',31,'23:55'],['codex','weekly',55,'Thu 14:00']]:[['claude','5-hour',62,'23:40'],['claude','weekly',41,'Mon 09:00'],['codex','5-hour',100,'23:40'],['codex','weekly',58,'Thu 14:00']];
     const thr=v=>off?p.dim:(v>=85?p.bad:v>=60?p.warn:p.ok);
@@ -1331,8 +1352,8 @@ class Component extends DCLogic {
     const greetSub=off?'Everything below is greyed and stamped. Nothing is live, and nothing you press can reach the lead until win-ws01 is back.'
       :quiet?('Nothing needs you. '+idleN+' of '+T.rows.length+' agents are idle — that’s their resting state; they wake when the lead messages them.')
       :(nOpen?'Stuck agents first, then oldest. A deadline only shows if someone set one.':'The lead will come back only when something needs a human.');
-    const side3=team===0&&!quiet?[{t:'dev-5 is quiet, not stuck',d:'Tests running 6m · output 40s ago · no card unless output stops for 10 min'},{t:'rev-2 is capped',d:'Codex 5-hour window full · resets 23:40 · the lead routes reviews to rev-1'}]
-      :team===0&&quiet?[{t:'WP-14 delivered',d:'rev-1 cold review: GO · merged 19:40'},{t:'Lesson published',d:'“Bounds-check a rename’s old path as a removal” · taught to dev-5, dev-6'},{t:'Qwen +4.10 € since yesterday',d:'52.30 of 100 € · projected ≈ 75 €, under the alert level'}]:[];
+    const side3=team===0&&!quiet?[{t:'dev-5 is quiet, not stuck',d:pe?'Tests running 6m · output 40s ago · no card unless output stops for 10 min':'Progress +3 in the last 2 min · no message for 6m · no card while progress moves'},{t:'x.rev-1 is capped',d:'Codex 5-hour window full · resets 23:40 · the lead routes reviews to rev-2'}]
+      :team===0&&quiet?[{t:'WP-14 delivered',d:'rev-2 cold review: GO · merged 19:40'},{t:'Lesson published',d:'“Bounds-check a rename’s old path as a removal” · taught to dev-5, dev-6'},{t:'Qwen +4.10 € since yesterday',d:'44.10 of 100 € across both gateways · each under its own alert'}]:[];
 
     const kbd={fontFamily:MONO,fontSize:'10.5px',padding:'1px 6px',borderRadius:rad(5),border:'1px solid '+p.border,background:p.panel2,color:p.fg,whiteSpace:'nowrap'};
     const allKeys=[['j / k','next / previous item'],['enter','answer with the first option'],['l','later (defer, never dismiss)'],['/','message the lead'],['1 / 2','switch team'],['t','next theme'],['?','show / hide keys'],['esc','close, or leave the composer']].map(([k,d])=>({k,d}));
@@ -1350,54 +1371,61 @@ class Component extends DCLogic {
       else if(k==='/'){ if(this._in6&&!off){this._in6.focus(); e.preventDefault();} }};
 
     // 3b
-    const anat=[
-      {x:80,up:true,tier:1,al:'c',col:p.warn,label:'ALERT',value:'80 €',note:'notifies · blocks nothing'},
-      {x:95,up:true,tier:2,al:'r',col:p.bad,label:'HARD CUTOFF',value:'95 €',note:'gateway refuses calls'},
-      {x:61.8,up:false,tier:1,al:'r',col:p.fg,label:'BILL ▮',value:'61.80 €',note:'as of 14:00 · hours late'},
-      {x:67.2,up:false,tier:1,al:'l',col:p.accent,label:'LEDGER · LIVE',value:'67.20 €',note:'dotted: ≈ 96 € by the 30th'},
-      {x:100,up:false,tier:2,al:'r',col:p.fg,label:'MONTHLY CAP',value:'100 €',note:'the number you watch'}];
-    const TOP={u1:64,u2:0,d1:170,d2:236}, BAR_T=128, BAR_B=156;
-    const anat3=anat.map(a=>{const tr=a.al==='c'?'translateX(-50%)':a.al==='r'?'translateX(-100%)':'none';
-      const bt=a.up?TOP['u'+a.tier]:TOP['d'+a.tier];
-      const lt=a.up?bt+56:BAR_B, lh=a.up?BAR_T-(bt+56):bt-BAR_B-2;
+    const call=(scale,a)=>{const x=a.v/scale*100, tr=a.al==='c'?'translateX(-50%)':a.al==='r'?'translateX(-100%)':'none';
+      const bt=a.up?(a.tier===1?64:0):170, lt=a.up?bt+56:156, lh=a.up?128-(bt+56):bt-158;
       return {label:a.label,value:a.value,note:a.note,labStyle:{fontFamily:MONO,fontSize:'10.5px',fontWeight:600,letterSpacing:'.08em',color:a.col},
-        line:{position:'absolute',left:a.x+'%',width:'1px',background:a.col,top:lt+'px',height:lh+'px'},
-        box:{position:'absolute',left:a.x+'%',top:bt+'px',width:'150px',transform:tr,display:'flex',flexDirection:'column',gap:'1px',whiteSpace:'nowrap',textAlign:a.al==='c'?'center':a.al==='r'?'right':'left',alignItems:a.al==='c'?'center':a.al==='r'?'flex-end':'flex-start'}};});
-    const ab=bar(67.2,61.8,96,28,false);
+        line:{position:'absolute',left:x+'%',width:'1px',background:a.col,top:lt+'px',height:lh+'px'},
+        box:{position:'absolute',left:x+'%',top:bt+'px',width:'160px',transform:tr,display:'flex',flexDirection:'column',gap:'1px',whiteSpace:'nowrap',textAlign:a.al==='c'?'center':a.al==='r'?'right':'left',alignItems:a.al==='c'?'center':a.al==='r'?'flex-end':'flex-start'}};};
+    const sT=52.6*1.04;
+    const anatomies3=[
+      {title:'EACH TEAM · ITS OWN GATEWAY',sub:'Main team (win-ws01): its ledger against its own alert and cutoff. The cap is not shown here.',bar:teamBar({l:36.80,alert:39,cut:44,proj:52.60},28,false),calls:[
+        {v:39,up:true,tier:1,al:'c',col:p.warn,label:'ALERT',value:'39 €',note:'notifies · blocks nothing'},
+        {v:44,up:true,tier:2,al:'r',col:p.bad,label:'HARD CUTOFF',value:'44 €',note:'this gateway refuses calls'},
+        {v:36.8,up:false,al:'r',col:p.accent,label:'LEDGER · LIVE',value:'36.80 €',note:'written on every call'},
+        {v:52.6,up:false,al:'r',col:p.bad,label:'PROJECTED',value:'≈ 52.60 €',note:'dotted · past the cutoff ~25th'}].map(a=>call(sT,a))},
+      {title:'THE ACCOUNT · CAP AND BILL',sub:'Both ledgers stacked against the 100 € cap. The provider bill covers the whole account.',bar:acctBar(36.80,30.40,61.80,28),calls:[
+        {v:18.4,up:true,tier:1,al:'c',col:p.accent,label:'MAIN LEDGER',value:'36.80 €',note:'win-ws01 · live'},
+        {v:52,up:true,tier:1,al:'c',col:p.accent,label:'SHOPFRONT LEDGER',value:'30.40 €',note:'linux-02 · live'},
+        {v:61.8,up:true,tier:2,al:'l',col:p.fg,label:'BILL ▮',value:'61.80 €',note:'whole account · as of 14:00'},
+        {v:67.2,up:false,al:'r',col:p.accent,label:'SUM OF LEDGERS',value:'67.20 €',note:'the live account figure'},
+        {v:100,up:false,al:'r',col:p.fg,label:'MONTHLY CAP',value:'100 €',note:'the number you watch'}].map(a=>call(100,a))}];
     const BS=[
-      ['NORMAL · DAY 12',30.00,27.40,75,false,p.ok,'Projected 75 € — under the alert level. Nothing to do.','live'],
-      ['TRENDING OVER · DAY 21',67.20,61.80,96,false,p.warn,'Projected past the cutoff around the 29th. The lead asks you once, with no deadline.','live'],
-      ['PAST THE ALERT',84.10,80.30,0,false,p.warn,'Alert sent at 18:02. Nothing is blocked; qwen agents keep working.','live'],
-      ['AT THE CUTOFF',95.00,92.60,0,false,p.bad,'Gateway refusing calls. dev-7 and rev-4 are paused; Claude and Codex agents carry on.','live'],
-      ['BILL AHEAD OF LEDGER',71.30,71.30,0,false,p.info,'Bill is 4.10 € above our ledger (67.20 €) — calls may be missing. The higher number is shown until they match.','bill 21:10'],
-      ['CAN’T SEE THE GATEWAY',67.20,61.80,0,true,p.dim,'Ledger last written 3h ago. Shown greyed as of 18:22 — never as live.','as of 18:22']];
-    const bstates3=BS.map(([title,l,b,pj,fr,c,status,stamp])=>({title,stamp,val:eur(l),sub:'of 100 €',status,bar:bar(l,b,pj,12,fr),
-      card:{background:p.panel,border:'1px solid '+p.border,borderRadius:r3.card,padding:'14px 16px',display:'flex',flexDirection:'column',gap:'10px'},
-      valStyle:{fontFamily:MONO,fontSize:'22px',fontWeight:600,color:fr?p.dim:p.fg},stStyle:{fontSize:'12.5px',lineHeight:1.45,color:fr?p.dim:c}}));
-    const brules3=[['The ledger is the headline','It’s written as each call happens, so it’s the live number. The bill confirms it later.'],['The bill is a tick, not a bar','Always with its own timestamp. Never added to the ledger.'],['If they disagree, show the higher','And say so. A ledger below the bill usually means missed calls.'],['Money is qwen’s capacity','Qwen rows show € today. Percent is only for Claude and Codex usage windows.']].map(([t,d])=>({t,d}));
+      ['MAIN · NORMAL · DAY 12','t',{l:15.00,alert:39,cut:44,proj:37.50},p.ok,'Projected 37.50 € — under this gateway’s 39 € alert. Nothing to do.','live'],
+      ['MAIN · TRENDING OVER · DAY 21','t',{l:36.80,alert:39,cut:44,proj:52.60},p.warn,'Projected past the 44 € cutoff around the 25th. The lead asks you once, with no deadline.','live'],
+      ['MAIN · PAST THE ALERT','t',{l:40.20,alert:39,cut:44},p.warn,'Alert sent at 18:02. Nothing is blocked; qwen agents keep working.','live'],
+      ['MAIN · AT THE CUTOFF','t',{l:44.00,alert:39,cut:44},p.bad,'Main gateway refusing calls: dev-7 and q.rev-1 are paused. Shopfront’s gateway is separate and keeps working.','live'],
+      ['ACCOUNT · BILL AHEAD','a',{a:36.80,b:30.40,bill:71.30},p.info,'Bill 71.30 € is 4.10 € above both ledgers (67.20 €) — calls may be missing. The account shows the higher number until they match.','bill 21:10'],
+      ['CAN’T SEE THE MAIN GATEWAY','f',{l:36.80,alert:39,cut:44},p.dim,'Main ledger last written 3h ago. Greyed as of 18:22; the account sum marks main as stale.','as of 18:22']];
+    const bstates3=BS.map(([title,k,g,c,status,stamp])=>{const fr=k==='f';
+      return {title,stamp,status,val:k==='a'?eur(Math.max(g.a+g.b,g.bill)):eur(g.l),sub:k==='a'?'of 100 € cap':'of '+g.cut+' € cutoff',
+        bar:k==='a'?acctBar(g.a,g.b,g.bill,12):teamBar(g,12,fr),
+        card:{background:p.panel,border:'1px solid '+p.border,borderRadius:r3.card,padding:'14px 16px',display:'flex',flexDirection:'column',gap:'10px'},
+        valStyle:{fontFamily:MONO,fontSize:'22px',fontWeight:600,color:fr?p.dim:p.fg},stStyle:{fontSize:'12.5px',lineHeight:1.45,color:fr?p.dim:c}};});
+    const brules3=[['Cap and bill are account-level','The 100 € cap and the provider bill cover both machines. Only the account bar shows them.'],['Each gateway has its own limits','A team bar is measured against its own alert and cutoff. It never says “of 100 €”.'],['Ledgers are live, the bill is late','The account figure is both ledgers added. The bill is a timestamped tick; if it’s higher, it’s shown and flagged.'],['Limits change on the machine','Answering “raise” tells the lead. The operator changes the gateway from the command line.']].map(([t,d])=>({t,d}));
 
     // 3c
     const phNeeds=(sc)=>sc==='quiet'?[]:TEAMS[0].needs.filter(n=>st.later3.indexOf(n.id)<0).slice(0,2);
-    const phones3=['busy','quiet','offline'].map(sc=>{const po=sc==='offline'; const list=phNeeds(sc); const Bx=sc==='quiet'?{l:52.30,b:49.10,p:75}:{l:67.20,b:61.80,p:96};
+    const phones3=['busy','quiet','offline'].map(sc=>{const po=sc==='offline'; const list=phNeeds(sc); const Gx=sc==='quiet'?{l:24.10,alert:39,cut:44,proj:34.40}:{l:36.80,alert:39,cut:44,proj:52.60}; const sx=sc==='quiet'?44.10:67.20, bx=sc==='quiet'?41.00:61.80;
       const cnt=sc==='quiet'?0:TEAMS[0].needs.filter(n=>st.later3.indexOf(n.id)<0&&!st.done3[n.id]).length;
       return {net:po?'no signal':'5G',fresh:po?'offline · last seen 3h 12m ago':'live · updated 3s ago',freshStyle:{fontFamily:MONO,fontSize:'11px',color:po?p.warn:p.ok},
         offline:po,calm:sc==='quiet',calmSub:'9 of 10 agents are idle — that’s normal. The lead will message you if anything changes.',
         count:po?cnt+' · frozen':cnt,op:po?.5:1,
         otherBadge:{fontFamily:MONO,fontSize:'10.5px',fontWeight:700,padding:'1px 6px',borderRadius:mono?'0px':'999px',background:p.warn,color:'#111111'},
         needs:list.map(n=>{const c=toneC[n.tone], done=st.done3[n.id];
-          return {kind:n.kind,title:n.title,ev:n.ev,age:n.age,isDone:!!done,notDone:!done,done:done?'✓ Sent: '+done:'',
+          return {kind:n.kind,title:n.title,ev:n.ev,age:n.age,isDone:!!done,notDone:!done,done:done?'✓ Sent: '+done+(n.cli&&done===n.opts[0]?' · change it on win-ws01':''):'',
             card:{padding:'14px 16px',borderRadius:r3.card,background:p.panel,border:'1px solid '+A(c,.5),display:'flex',flexDirection:'column',gap:'8px',opacity:po?.5:1},
             kindStyle:{fontFamily:MONO,fontSize:'10.5px',fontWeight:600,letterSpacing:'.1em',color:c},
             btns:[n.opts[0],'Later'].map((o,j)=>({label:po?(j===0?'Can’t send':'Later'):o,go:()=>{ if(po) return; if(j===0) act(n,o); else later(n); },
               style:{flex:j===0?2:1,height:'48px',display:'flex',alignItems:'center',justifyContent:'center',borderRadius:rad(12),fontSize:'14.5px',fontWeight:600,cursor:po?'default':'pointer',background:j===0&&!po?p.accent:'transparent',color:j===0&&!po?p.accentInk:p.fg,border:'1px solid '+(j===0&&!po?p.accent:p.border),opacity:po?.6:1}}))};}),
-        bar:bar(Bx.l,Bx.b,Bx.p,10,po),bLedger:eur(Bx.l),bLine:po?'as of 18:22 · greyed':'alert 80 · cutoff 95 · bill '+eur(Bx.b)+' (14:00)',
+        bar:teamBar(Gx,10,po),bLedger:eur(Gx.l),bOf:'/ 44 € cutoff',bLine:po?'as of 18:22 · greyed':'alert 39 · account '+eur(sx)+' of 100 € · bill '+eur(bx)+' (14:00)',
         leadMsg:sc==='quiet'?TEAMS[0].lead.quiet:TEAMS[0].lead.busy,leadAge:po?'as of 18:22':(sc==='quiet'?'2h ago':'just now'),replyPh:po?'Paused while offline':'Reply to the lead…',
         tabs:[['Needs you',cnt],['Team',''],['Lead','']].map(([l,n],i)=>({label:l,n,style:{display:'flex',alignItems:'center',justifyContent:'center',gap:'6px',fontSize:'13px',fontWeight:i===0?600:500,color:i===0?p.accent:p.dim,minHeight:'48px'},badge:{display:n?'inline-flex':'none',fontFamily:MONO,fontSize:'10.5px',fontWeight:700,padding:'1px 6px',borderRadius:mono?'0px':'999px',background:p.warn,color:'#111111'}})),
         caption:sc==='busy'?'Busy: two items, big buttons, budget at a glance':sc==='quiet'?'Quiet: one sentence, then the numbers':'Offline: says so first, greys everything, disables sending'};});
 
     // 3d
-    const nameRules=[['Drop the runtime','Claude, Codex or Qwen moves to the avatar badge (C, X, Q).'],['Drop the project','When it matches the team on screen. In cross-team lists it stays as a prefix: shopfront/dev-1.'],['Shorten the role, keep the number','developer → dev, reviewer → rev, tester → test, architect → arch.'],['Break ties with the runtime letter','Only if two agents would get the same name: c.dev-1 and x.dev-1.']].map(([t,d],i)=>({n:i+1,t,d}));
-    const NX=[['codex-agenttalk-developer-5','agenttalk','Main team',null],['claude-agenttalk-lead','agenttalk','Main team',null],['qwen-agenttalk-reviewer-4','agenttalk','Main team',null],['claude-shopfront-developer-1','shopfront','Shopfront team',null],['claude-shopfront-developer-1','agenttalk','Cross-team list',null],['codex-agenttalk-developer-1','agenttalk','Two dev-1s on a team',['claude-agenttalk-developer-1','codex-agenttalk-developer-1']],['nightly-docs-builder-agent','agenttalk','Doesn’t fit the pattern',null]];
+    const nameRules=[['Drop the runtime','Claude, Codex or Qwen moves to the avatar badge (C, X, Q).'],['Drop the project','When it matches the team on screen (matched against the known team list). In cross-team lists it stays as a prefix: shopfront/dev-1.'],['The rest is the role, plus an optional number','Everything between the project and the number is the role, hyphens included. Each word shortens: developer → dev, reviewer → rev, frontend → fe, backend → be, tester → test, architect → arch.'],['Break ties with the runtime letter','Only if two agents would get the same name: x.rev-1 next to q.rev-1.']].map(([t,d],i)=>({n:i+1,t,d}));
+    const TIE=['codex-agenttalk-reviewer-1','qwen-agenttalk-reviewer-1'];
+    const NX=[['codex-agenttalk-developer-5','agenttalk','Main team',null],['claude-agenttalk-frontend-dev','agenttalk','Hyphenated role',null],['claude-agenttalk-lead','agenttalk','Main team',null],['codex-agenttalk-reviewer-1','agenttalk','Tie with qwen rev-1',TIE],['qwen-agenttalk-reviewer-1','agenttalk','Tie with codex rev-1',TIE],['claude-shopfront-developer-1','agenttalk','Cross-team list',null],['nightly-docs-builder-agent','agenttalk','Doesn’t fit the pattern',null]];
     const names3=NX.map(([id,proj,ctx,pl])=>{const q=parse(id); const rt=q?q.rt:null;
       return {full:id,short:shortName(id,proj,pl),ctx,letter:rt?RL[rt]:'?',badge:{width:'20px',height:'20px',borderRadius:'50%',background:rt?({claude:'#D08A5E',codex:'#4FB3A0',qwen:'#9E82E0'})[rt]:'#3A3D45',color:'#FFFFFF',fontFamily:"'Geist Mono',monospace",fontSize:'10px',fontWeight:700,display:'flex',alignItems:'center',justifyContent:'center'}};});
     const AVN={midnight:'Hexagon · reads as a badge on dark glass',paper:'Rounded square · quiet, print-like',synthwave:'Star · loud enough for neon',terminal:'No image · the runtime letter in a box, on the text grid'};
@@ -1421,23 +1449,23 @@ class Component extends DCLogic {
     const chipFails=contrast3.filter(t=>t.cells.slice(3).some(c=>+c.v<4.5)).map(t=>t.name);
     const contrastNote=(passing.length?'Long text reads fine in '+passing.join(' and ')+'. ':'')+(failing.length?failing.map(t=>t.name+' fails for '+t.bad.join(' and ')+' text').join('; ')+' — darken its mute color before using it for paragraphs. ':'')+(chipFails.length?'Highlight and hot blocks in '+chipFails.join(' and ')+' are under 4.5:1, so keep them to big, bold words.':'Every highlight and hot block also passes.');
     const live3=['Roster & health','Messages & threads','Needs-a-human queue','Gates & evidence','Risk register','Ownership map','Lessons & onboarding','Lead chat','Claude & Codex usage windows'];
-    const notyet3=[['Mission progress & ETA','Gone from every header. The lead says where things stand, in words.'],['Program stages','Stays a concept (2c). Not in the app.'],['Decision deadlines & options','Optional. With no deadline the card shows how long it’s waited; options are the lead’s quick replies.'],['Signed export','Hidden until the server can sign.'],['Qwen spend in the console','Designed (3b). Ships behind a flag once the gateway ledger is readable.'],['Both machines in one view','The switcher is designed. Until it’s supported, each team opens its own console.']].map(([what,instead])=>({what,instead}));
+    const notyet3=[['Mission progress & ETA','Gone from every header. The lead says where things stand, in words.'],['Program stages','Stays a concept (2c). Not in the app.'],['Decision deadlines & options','Optional. No deadline → show waiting age; options are the lead’s quick replies.'],['Signed export','Hidden until the server can sign.'],['Gateway spend in the console','Designed (3b): each gateway against its own limits, plus the account sum against the cap. Behind a flag.'],['Process status for stuck agents','Cards use heartbeat, progress counter and last message: “no progress 14 min · no reply sent”. Wait comes first until process evidence exists.'],['List of team sources','Switcher designed; until it exists, each machine opens its own console.'],['Changing gateway limits','Never from the console. Answering “raise” tells the lead; the operator changes the limit on the machine, from the command line.']].map(([what,instead])=>({what,instead}));
 
     const Q=(tag,q,a,where,href)=>({tag,q,a,where,href,tagStyle:{fontFamily:"'Geist Mono',monospace",fontSize:'10px',fontWeight:600,letterSpacing:'.08em',color:tag[0]==='Q'?'#F5B83D':'#7CE7C4',border:'1px solid '+(tag[0]==='Q'?'rgba(245,184,61,.4)':'rgba(124,231,196,.4)'),borderRadius:'5px',padding:'2px 6px'}});
     const answers3=[
       Q('QUESTION 1','Is 1d the whole app? Terminal as a theme?','Yes. 1d is the app and Terminal is its fourth theme (press t). The same keys work in every theme: j/k, enter, l, /, 1–2, ?.','3a','#3a'),
-      Q('QUESTION 2','One budget: alert, cutoff, late bill?','One bar against the cap. The alert is a dashed line, the cutoff a solid line, the live ledger the fill, and the late bill a tick with its own timestamp.','3b','#3b'),
+      Q('QUESTION 2','One budget: alert, cutoff, late bill?','Two levels. Each team: its ledger against its own alert (dashed) and cutoff (solid). The account: both ledgers stacked against the 100 € cap, with the late bill as a timestamped tick.','3b','#3b'),
       Q('QUESTION 3','What does a quiet day look like?','A sentence, not a dashboard: “All quiet.”, then what changed since you last looked. Idle is grey, never amber.','3a','#3a'),
       Q('QUESTION 4','“I can’t see the team right now”','A banner saying how long it’s been. Everything is greyed and stamped “as of”, the live dots stop, and sending is paused.','3a','#3a'),
       Q('QUESTION 5','Decisions with no deadline?','Yes, the deadline is optional. Without one the card shows how long it has waited. The queue puts stuck agents first, then oldest.','3a','#3a'),
       Q('QUESTION 6','Avatar silhouette per theme? Show the runtime?','Midnight: hexagon. Paper: rounded square. Synthwave: star. Terminal: text only. The runtime is a C / X / Q corner badge.','3d','#3d'),
       Q('QUESTION 7','Which Loud themes are readable?',(passing.length?passing.join(', ')+' passes for long text':'None passes for long text')+(failing.length?'; '+failing.map(t=>t.name).join(' and ')+' fail on '+Array.from(new Set(failing.flatMap(t=>t.bad))).join('/')+' text':'')+'. Measured, not eyeballed.','3d','#3d'),
-      Q('NOTE 2','Qwen: capacity as money','Qwen rows show € today instead of a percent. Claude and Codex keep their 5-hour and weekly windows with reset times.','3a','#3a'),
+      Q('NOTE 2','Qwen: capacity as money','Qwen rows show € today. The rail shows this team’s gateway against its own limits, then the account sum against the cap.','3a','#3a'),
       Q('NOTE 3','A phone layout','Needs you, the budget, and the lead’s latest message. Buttons are 48 px tall, one team per screen.','3c','#3c'),
       Q('NOTE 4','Two machines, two teams','A team switcher with a needs-you count and its own freshness dot for each team. Press 1 or 2.','3a','#3a'),
-      Q('NOTE 5','A rule for shortening names','codex-agenttalk-developer-5 becomes dev-5. The runtime moves to the badge; the project is dropped when it’s the current team.','3d','#3d'),
+      Q('NOTE 5','A rule for shortening names','codex-agenttalk-developer-5 → dev-5, claude-agenttalk-frontend-dev → fe-dev. Everything between the project and the number is the role; ties get x. / q.','3d','#3d'),
       Q('NOTE 6','“spec-kitty” in the header','Removed from the calm console. The header now shows the team and machine; the “7/12” mission progress is gone too.','Team Console','Team Console.dc.html'),
-      Q('NOTE','Busy can look stuck','A stuck card has to show evidence. dev-5 (tests running, output 40s ago) gets no card; dev-6 (no output 14 min, tests exited) does, with Restart.','3a','#3a'),
+      Q('NOTE','Busy can look stuck','A stuck card shows evidence. Today that’s heartbeat, progress and last message (“no progress 14 min · no reply sent”), with Wait first. With process evidence (tweak), Restart comes first.','3a','#3a'),
       Q('NOTE','Only data that exists','Mission progress, stages, deadlines and the signed export are gone from 3a–3c. Board 3d lists what replaced each one.','3d','#3d')];
 
     return {p5:p,f3,r3,answers3,teams3,scen3,th5Chips,off3:off,quiet3:quiet,
@@ -1458,10 +1486,10 @@ class Component extends DCLogic {
       send6:()=>this.send6(st.draft6),composerOp:off?.5:1,
       composerPh:off?'Paused — the lead can’t receive while win-ws01 is offline':'Message the lead   ( / )',
       qwenMark:{width:'18px',height:'18px',borderRadius:mono?'0px':'50%',background:RT.qwen,color:'#FFFFFF',fontFamily:MONO,fontSize:'10px',fontWeight:700,display:'flex',alignItems:'center',justifyContent:'center'},
-      bStamp:off?'as of 18:22':'live · ledger',bLedger:eur(B.l),rb,bLegend,usage3,
+      gwTitle:'Qwen · '+T.machine+' gateway',bStamp:off?'as of 18:22':'live · ledger',bLedger:eur(G.l),bOf:'of '+G.cut+' € cutoff',rb,bLegend,ra,aSum:eur(sumL),aLine:'main '+eur(GW.main.l)+(scen==='offline'?' (stale)':'')+' · shopfront '+eur(GW.shop.l)+' · bill ▮ '+eur(GW.bill)+' as of 14:00',usage3,
       roster3,rosterN:T.rows.length,rosterSum:off?'frozen · as of 18:22':(idleN+' idle · that’s normal'),
       kbd,keyHints,allKeys,k3,keys3:st.keys3,
-      ab,anat3,bstates3,brules3,phones3,nameRules,names3,avatars3,contrast3,contrastNote,live3,notyet3};
+      anatomies3,bstates3,brules3,phones3,nameRules,names3,avatars3,contrast3,contrastNote,live3,notyet3};
   }
   renderVals(){
     const st=this.state, now=st.now, el=(now-this.t0)/1000;

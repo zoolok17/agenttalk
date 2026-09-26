@@ -10,7 +10,7 @@ Top → bottom:
    - "NEEDS YOU · n" (mono 11). Offline: "n · frozen".
    - Cards (max 2 visible, same order as desktop): kind + age · serif 20 title · evidence mono 11.5 · **two buttons, 48px tall**: primary (flex 2, first option) + Later (flex 1). Offline: "Can't send", disabled.
    - Quiet: calm card "Nothing needs you." serif 30 + "9 of 10 agents are idle — that's normal…".
-   - Qwen spend card: label, mono 18 value "/ 100 €", 10px bar, line "alert 80 · cutoff 95 · bill 61.80 € (14:00)".
+   - Qwen spend card: this team's gateway — mono 18 "36.80 €" + "/ 44 € cutoff", 10px team bar, line "alert 39 · account 67.20 € of 100 € · bill 61.80 € (14:00)".
    - Lead card: avatar + "Lead" + age · latest message 14.5 · reply field 48px.
 5. Tab bar 66px: Needs you (badge) · Team · Lead; each target ≥ 48px.
 

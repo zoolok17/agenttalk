@@ -12,7 +12,7 @@
           "runtime": "claude",
           "busy": {
             "state": "working",
-            "status_line": "Reading rev-1’s review of WP-14",
+            "status_line": "Reading rev-2’s review of WP-14",
             "cap": null
           },
           "quiet": {
@@ -36,7 +36,7 @@
           }
         },
         {
-          "id": "claude-agenttalk-developer-2",
+          "id": "claude-agenttalk-frontend-dev",
           "runtime": "claude",
           "busy": {
             "state": "idle",
@@ -50,7 +50,7 @@
           }
         },
         {
-          "id": "claude-agenttalk-reviewer-1",
+          "id": "claude-agenttalk-reviewer-2",
           "runtime": "claude",
           "busy": {
             "state": "idle",
@@ -82,8 +82,9 @@
           "runtime": "codex",
           "busy": {
             "state": "busy",
-            "status_line": "Running tests 6m · output 40s ago",
-            "cap": null
+            "status_line": "Progress +3 in 2 min · no message 6m",
+            "cap": null,
+            "status_line_with_process": "Running tests 6m · output 40s ago"
           },
           "quiet": {
             "state": "idle",
@@ -96,8 +97,9 @@
           "runtime": "codex",
           "busy": {
             "state": "stuck",
-            "status_line": "No output 14m · tests exited 12m ago",
-            "cap": null
+            "status_line": "No progress 14m · no reply sent",
+            "cap": null,
+            "status_line_with_process": "No output 14m · tests exited 12m ago"
           },
           "quiet": {
             "state": "idle",
@@ -106,7 +108,7 @@
           }
         },
         {
-          "id": "codex-agenttalk-reviewer-2",
+          "id": "codex-agenttalk-reviewer-1",
           "runtime": "codex",
           "busy": {
             "state": "capped",
@@ -134,7 +136,7 @@
           }
         },
         {
-          "id": "qwen-agenttalk-reviewer-4",
+          "id": "qwen-agenttalk-reviewer-1",
           "runtime": "qwen",
           "busy": {
             "state": "idle",
@@ -153,25 +155,34 @@
           "id": "n3",
           "kind": "LOOKS STUCK",
           "title": "dev-6 has gone quiet",
-          "evidence": "No output for 14 min · test run exited 12 min ago · no reply sent",
+          "evidence": "No progress for 14 min · no reply sent · heartbeat still fresh",
+          "evidence_note": "Weaker evidence: process status isn’t visible yet, so Wait comes first.",
           "age": "14m",
           "deadline": null,
           "options": [
-            "Restart with context",
-            "Wait 10 min"
-          ]
+            "Wait 10 min",
+            "Restart with context"
+          ],
+          "with_process_evidence": {
+            "evidence": "No output for 14 min · test run exited 12 min ago · no reply sent",
+            "options": [
+              "Restart with context",
+              "Wait 10 min"
+            ]
+          }
         },
         {
           "id": "n1",
           "kind": "SPEND LIMIT",
-          "title": "Raise the qwen cap from 100 € to 120 € for September?",
-          "evidence": "Ledger 67.20 € on day 21 · ≈ 96 € by the 30th · the 95 € cutoff lands around the 29th",
+          "title": "Raise the main gateway’s cutoff from 44 € to 54 €?",
+          "evidence": "Main ledger 36.80 € on day 21 · ≈ 52.60 € by the 30th · the 44 € cutoff lands around the 25th · both gateways would total 93 € of the 100 € cap",
           "age": "waiting 2d",
           "deadline": null,
           "options": [
-            "Raise to 120 €",
-            "Keep 100 €"
-          ]
+            "Raise to 54 €",
+            "Keep 44 €"
+          ],
+          "on_primary_note": "the limit itself changes on win-ws01, from the command line"
         },
         {
           "id": "n2",
@@ -187,23 +198,23 @@
         }
       ],
       "lead_latest": {
-        "busy": "Three things need you. dev-6 first — it looks stuck, not busy. The spend call is the only one with a real clock: at this rate qwen hits its cutoff around the 29th.",
+        "busy": "Three things need you. dev-6 first — no progress for 14 minutes and no reply. The spend call has a real clock: at this rate the main gateway reaches its 44 € cutoff around the 25th.",
         "quiet": "Nothing needs you. I’ll start WP-16 when dev-1 finishes the nightly lint."
       },
       "also_busy": [
         [
           "dev-5 is quiet, not stuck",
-          "Tests running 6m · output 40s ago · no card unless output stops for 10 min"
+          "Progress +3 in the last 2 min · no message for 6m · no card while progress moves"
         ],
         [
-          "rev-2 is capped",
-          "Codex 5-hour window full · resets 23:40 · the lead routes reviews to rev-1"
+          "x.rev-1 is capped",
+          "Codex 5-hour window full · resets 23:40 · the lead routes reviews to rev-2"
         ]
       ],
       "since_last_quiet": [
         [
           "WP-14 delivered",
-          "rev-1 cold review: GO · merged 19:40"
+          "rev-2 cold review: GO · merged 19:40"
         ],
         [
           "Lesson published",
@@ -211,7 +222,7 @@
         ],
         [
           "Qwen +4.10 € since yesterday",
-          "52.30 of 100 € · projected ≈ 75 €, under the alert level"
+          "44.10 of 100 € across both gateways · each under its own alert"
         ]
       ],
       "offline": {
@@ -376,61 +387,95 @@
       ]
     ]
   },
-  "budget": {
-    "levels": {
-      "alert": 80,
-      "cutoff": 95,
-      "cap": 100
+  "gateways": {
+    "main": {
+      "machine": "win-ws01",
+      "alert": 39,
+      "cutoff": 44,
+      "busy": {
+        "ledger": 36.8,
+        "projected": 52.6
+      },
+      "quiet": {
+        "ledger": 24.1,
+        "projected": 34.4
+      }
     },
+    "shop": {
+      "machine": "linux-02",
+      "alert": 35,
+      "cutoff": 39,
+      "busy": {
+        "ledger": 30.4,
+        "projected": 37.1
+      },
+      "quiet": {
+        "ledger": 20,
+        "projected": 28.6
+      }
+    }
+  },
+  "account": {
+    "cap": 100,
     "busy": {
-      "ledger": 67.2,
+      "sum": 67.2,
       "bill": 61.8,
-      "bill_as_of": "14:00",
-      "projected": 96
+      "bill_as_of": "14:00"
     },
     "quiet": {
-      "ledger": 52.3,
-      "bill": 49.1,
-      "bill_as_of": "14:00",
-      "projected": 75
-    },
-    "states": [
-      [
-        "Normal · day 12",
-        30,
-        27.4,
-        75
-      ],
-      [
-        "Trending over · day 21",
-        67.2,
-        61.8,
-        96
-      ],
-      [
-        "Past the alert",
-        84.1,
-        80.3,
-        null
-      ],
-      [
-        "At the cutoff",
-        95,
-        92.6,
-        null
-      ],
-      [
-        "Bill ahead of ledger",
-        67.2,
-        71.3,
-        null
-      ],
-      [
-        "Can’t see the gateway",
-        67.2,
-        61.8,
-        null
-      ]
+      "sum": 44.1,
+      "bill": 41,
+      "bill_as_of": "14:00"
+    }
+  },
+  "budget_states": [
+    [
+      "Main · normal · day 12",
+      "team",
+      {
+        "ledger": 15,
+        "projected": 37.5
+      }
+    ],
+    [
+      "Main · trending over · day 21",
+      "team",
+      {
+        "ledger": 36.8,
+        "projected": 52.6
+      }
+    ],
+    [
+      "Main · past the alert",
+      "team",
+      {
+        "ledger": 40.2
+      }
+    ],
+    [
+      "Main · at the cutoff",
+      "team",
+      {
+        "ledger": 44
+      }
+    ],
+    [
+      "Account · bill ahead",
+      "account",
+      {
+        "main": 36.8,
+        "shop": 30.4,
+        "bill": 71.3
+      }
+    ],
+    [
+      "Can’t see the main gateway",
+      "team",
+      {
+        "ledger": 36.8,
+        "stale": true,
+        "as_of": "18:22"
+      }
     ]
-  }
+  ]
 }

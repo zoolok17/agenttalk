@@ -8,7 +8,7 @@
 6. **Keyboard**: map + overlay.
 7. **Phone layout** (05) at < 1024px.
 8. **Action gating** with `--enable-actions` + server re-checks.
-9. **Flagged**: qwen budget (needs gateway ledger reader); multi-team sources (needs per-team source list — until then each machine opens its own console, and the switcher can list console URLs).
+9. **Flagged — three backend pieces**: (a) gateway spend per machine + account bill in the console; (b) a list of team sources; (c) process evidence for stuck agents. Until (c), stuck detection uses heartbeat + progress counter + last message with Wait first.
 10. **Inherited surfaces** (gates, lanes, ownership, risk, tasks, lessons, onboarding) as stream items + detail drawer, using 2a–2d as reference.
 
 Not planned: mission progress/ETA, program stages, signed export (no data).

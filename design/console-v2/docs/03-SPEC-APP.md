@@ -34,8 +34,9 @@ Padding 22/26/14, gap 14, scrolls; composer pinned below.
 - Row 1: KIND (mono 10.5/600, .1em, tone color) · spacer · age (mono 11 dim): "14m" or "no deadline · waiting 2d" or "decide by Fri 18:00" when a deadline exists.
 - Title: serif 22/1.2.
 - Evidence row: "EVIDENCE" label (mono 10 dim) + text (mono 12/1.5). **Required** for every card.
+- Evidence note (optional, 12 dim) under it — used when only weaker evidence exists: "Weaker evidence: process status isn't visible yet, so Wait comes first."
 - Actions: options as pills (first = primary: accent bg / accentInk; others outline), then "Later" (text button, dim), then key hint when selected ("enter · l later").
-- Answered: actions replaced by "✓ Sent to the lead: <option>" (ok), card at 65% opacity.
+- Answered: actions replaced by "✓ Sent to the lead: <option>" (ok), card at 65% opacity. If the answer needs a machine step, append it: "· the limit itself changes on win-ws01, from the command line".
 - Selected (keyboard): accent border + 3px accent ring at 18%.
 - Kinds and tones: LOOKS STUCK → bad · SPEND LIMIT → warn · GATE HOLD → warn · DECISION → info.
 - Locked options (need actions, or offline) render at 50% opacity with a reason label, e.g. "Waive · CLI only".
@@ -44,7 +45,7 @@ Padding 22/26/14, gap 14, scrolls; composer pinned below.
 **Deferred line** (if any): "1 deferred · still open, not dismissed · show" (mono 11.5 dim, click restores).
 
 **Side block** (dashed rows, radius 9):
-- Busy: "ALSO HAPPENING · NOT FOR YOU" — e.g. "dev-5 is quiet, not stuck — Tests running 6m · output 40s ago · no card unless output stops for 10 min"; "rev-2 is capped — Codex 5-hour window full · resets 23:40 · the lead routes reviews to rev-1".
+- Busy: "ALSO HAPPENING · NOT FOR YOU" — e.g. "dev-5 is quiet, not stuck — Progress +3 in the last 2 min · no message for 6m · no card while progress moves" (with process evidence: "Tests running 6m · output 40s ago"); "x.rev-1 is capped — Codex 5-hour window full · resets 23:40 · the lead routes reviews to rev-2".
 - Quiet: "SINCE YOU LAST LOOKED · YESTERDAY 22:10" — 3 lines (delivered work, lesson published, spend delta).
 
 **Chat thread**: your bubbles right (accent, radius 16/4/16/16), lead left. Auto-scroll to bottom on new message only.
@@ -52,7 +53,8 @@ Padding 22/26/14, gap 14, scrolls; composer pinned below.
 **Composer**: panel, border, radius 16, 6/6/6/14 padding; input 14.5; send button 40px accent. Placeholder "Message the lead   ( / )". Offline: disabled, 50%, "Paused — the lead can't receive while win-ws01 is offline".
 
 ## 3. Rail (340px, panel bg, left border, padding 18, gap 20, scrolls)
-**Qwen gateway · <month>** — Q badge 18px (qwen color) · title 12.5/600 · stamp ("live · ledger" / "as of 18:22"). Value: mono 24/600 "67.20 €" + "of 100 € cap". Bar 10px (see 04). Legend grid (mono key colored / dim value): alert · cutoff · bill ▮ · projected.
+**Qwen · <machine> gateway** — Q badge 18px (qwen color) · title 12.5/600 · stamp ("live · ledger" / "as of 18:22"). Value: mono 24/600 "36.80 €" + "of 44 € cutoff" (**this team's gateway, never the account cap**). Team bar 10px. Legend: alert · cutoff · projected.
+Then a divider and **Account · September**: mono 13 sum of both ledgers + "of 100 € cap", 8px stacked account bar with the bill tick, and the line "main 36.80 € · shopfront 30.40 € · bill ▮ 61.80 € as of 14:00". Details: 04.
 
 **USAGE WINDOWS** — per runtime × window (Claude 5-hour, Claude weekly, Codex 5-hour, Codex weekly): runtime badge 16px + name + window + % (mono 12/600, threshold color); 4px bar; "resets 23:40" right-aligned. Thresholds: <60 ok, 60–84 warn, ≥85 bad.
 

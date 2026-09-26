@@ -15,11 +15,7 @@ It is design material, not product code:
 The full original handoff (a zip) is with the operator.
 
 ## One change to the designer's files
-`prototype/Console Futures.dc.html` lines 37 and 368 carry a `nosemgrep` comment. The repository's security scan reads the prototype's `{{ ... }}` template placeholders as server-side template injection. They are design-time placeholders in a file agenttalk never serves.
+The two lines in `prototype/Console Futures.dc.html` that contain `href="{{` carry a `nosemgrep` comment. The repository's security scan reads the prototype's `{{ ... }}` template placeholders as server-side template injection. They are design-time placeholders in a file agenttalk never serves.
 
-## Open notes from the lead
-These were sent back to the designer:
-1. The monthly cap and the provider bill are account-wide, while each machine's gateway has its own ledger, alert level and cutoff. The budget view needs an account level and a per-team level.
-2. `claude-agenttalk-frontend-dev` does not fit the name-shortener pattern, because its role contains a hyphen.
-3. Process-level evidence for stuck cards ("test run exited") is not in the snapshot yet, so the cards need fallback wording.
-4. Raising a cap is an operator machine action. In the console it is a message to the lead, not a button.
+## Notes from the lead
+The lead's four notes on the first v2 (the budget levels, a name that broke the shortener, stuck-card evidence without process data, and raising a limit) were answered by the designer in round 2. See `docs/02-DECISIONS.md` ("Round 2"). The updated name rule shortens all 15 real agent names correctly.

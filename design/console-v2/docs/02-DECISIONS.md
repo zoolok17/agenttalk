@@ -17,5 +17,13 @@
 | — | Busy can look stuck | dev-5 (tests running 6m, output 40s ago) gets **no card** — it's listed under "Also happening · not for you". dev-6 (no output 14m, tests exited 12m ago, no reply) gets a card with Restart. | 3a |
 | — | Only data that exists | Mission progress/ETA, program stages, deadlines, signed export: removed from the app. Qwen spend and cross-machine: designed, behind flags. | 3d |
 
+## Round 2 (team lead's reply to handoff v2)
+| # | Note | Change |
+|---|---|---|
+| R1 | Cap and bill are account-wide; each machine's gateway has its own ledger, alert and cutoff (main 39/44 €, second 35/39 €). | **Two levels.** Team bar = its ledger vs its own alert + cutoff, labelled "of 44 € cutoff", never "of 100 €". Account bar = both ledgers stacked vs the 100 € cap, bill tick on top. Spec: 04. |
+| R2 | `claude-agenttalk-frontend-dev` broke the rule. | Everything between the project and the optional number is the role, hyphens included; each word abbreviated → **fe-dev**. Projects matched against the known team list. Code: `reference/name-shortener.js`. |
+| R3 | Process status (running/exited) isn't visible yet. | Fallback evidence from heartbeat + progress counter + last message: "No progress for 14 min · no reply sent · heartbeat still fresh". With only this, **Wait is the primary option** and Restart second, with the line "Weaker evidence: process status isn't visible yet, so Wait comes first." Prototype tweak `processEvidence` shows the stronger version. |
+| R4 | Changing gateway limits is an operator machine action. | "Raise to 54 €" only sends the answer to the lead. Confirmation reads "✓ Sent to the lead: Raise to 54 € · the limit itself changes on win-ws01, from the command line". The console never changes limits. |
+
 ## Correction to the chat summary
 The chat said "only acid passes for long text". The measured table (06-RULES) shows **bubblegum passes too**; the board 3d computes this live and is correct.

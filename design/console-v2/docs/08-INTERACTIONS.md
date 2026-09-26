@@ -21,7 +21,7 @@ Locked options (require actions; or team offline) are visible but disabled with 
 Triggered per team by stale/unreachable source. Banner + greying + "as of" stamps + stopped pulses + disabled composer/actions. "Retry now" polls immediately; failure shows "Still unreachable · tried HH:MM". The other team stays live and switchable.
 
 ## Lead replies (prototype keyword rules — production uses the real lead)
-status → summary · restart → "Restarting dev-6 with its last context…" · raise/120 → cap raised · keep → "Keeping it…" · wait → "Waiting…" · else → "Noted. I'll fold that in and only come back if it needs you."
+status → summary · restart → "Restarting dev-6 with its last context…" · raise/54 → "Noted: 54 € for the main gateway. Changing the limit is an operator step on win-ws01, from the command line…" (the console never changes limits) · keep → "Keeping it…" · wait → "Waiting…" · else → "Noted. I'll fold that in and only come back if it needs you."
 
 ## Motion
 Live dot pulse 2s ease-in-out (opacity 1→.35); nothing else animates. `prefers-reduced-motion`: no pulse.
