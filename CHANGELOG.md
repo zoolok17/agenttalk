@@ -78,7 +78,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Align acceptance preflight cache-root refusals with close open, clarify renewal and template-path policy, document the example's expiry, and refuse missing ack bindings cleanly.
+- Share one cache-root syntax check across acceptance preflight, close open and stored routes (including parent-traversal refusal), clarify renewal and template-path policy, document the example's expiry, and refuse missing ack bindings cleanly.
 
 ## [0.92.0] - 2026-09-25
 
