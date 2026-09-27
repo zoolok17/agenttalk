@@ -1357,6 +1357,19 @@ def test_a_stranded_publication_marker_is_cleared_during_a_later_in_place_retry(
 # failed-delivery disposition by its own loop test.
 
 
+def test_the_contended_reasons_are_exactly_the_documented_contract() -> None:
+    # Each reason is one row of the caller contract; the continuous loop's
+    # _gate_step retries exactly these, everyone else sees an ordinary state.
+    assert obligations.CONTENDED_REASONS == {
+        obligations.LANDED_REPLAY_CONTENDED,
+        obligations.LANDED_RETENTION_CONTENDED,
+        obligations.LEDGER_REPLAY_CONTENDED,
+        obligations.DISPOSITION_CONTENDED,
+        obligations.BLOCK_WRITE_CONTENDED,
+        obligations.PROJECTION_ACCOUNTING_CONTENDED,
+    }
+
+
 def _owed_admission(s: Store, gate) -> dict:
     return next(iter(json.loads(gate.path.read_text(encoding="utf-8"))["obligations"].values()))
 
@@ -1558,7 +1571,8 @@ def test_one_shot_failed_delivery_contended_past_its_own_retry_recovers_next_pol
 # --- fail_delivery_or_block, unit: the internal second chance
 
 _FAILED_DELIVERY_SECOND_CHANCE = [
-    pytest.param("ledger.lock", 2, "LEDGER_REPLAY_CONTENDED", id="replay"),
+    pytest.param("ledger.lock", 2, "LEDGER_REPLAY_CONTENDED", id="replay-folded"),
+    pytest.param("ledger.lock", 3, "DISPOSITION_CONTENDED", id="replay-raised"),
     pytest.param("message-publication", 1, "DISPOSITION_CONTENDED", id="retry"),
 ]
 
@@ -1569,7 +1583,9 @@ def test_failed_delivery_second_chance_returns_contention_unpersisted(
     tmp_path, monkeypatch, lock_name, skip, reason, contended,
 ) -> None:
     # The first disposition misses on a stale revision (not contention); then its
-    # replay, or its one retry at the fresh revision, is contended.
+    # replay (folded by resolve into a contended result, or raised by resolve's
+    # pending-broadcast reconcile), or its one retry at the fresh revision, is
+    # contended.
     s, m, gate, record, resolution = _fresh_owed(tmp_path)
     stale = resolution.scoped_revision - 1
     barrier = LockBarrier(monkeypatch)
