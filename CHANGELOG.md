@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Configure model vendors independently of CLI transport; freeze per-recipient
+  vendor maps on work dispatches and link escalations to exact work items/cycles.
+
 - Validate and inherit external work declarations, reserve publisher-owned vendor
   metadata, and align both lead skills with the finalized work-board contract.
 

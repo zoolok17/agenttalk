@@ -6820,6 +6820,8 @@ def cmd_escalate(args: argparse.Namespace) -> int:
         return 2
     meta = _parse_meta(args.meta)
     meta["needs_operator"] = "true"  # force-set: the bucket discriminator
+    from agenttalk import work_tags
+    meta = work_tags.task_metadata(meta, args)
     origin_request = getattr(args, "origin_request", None)
     origin_id = getattr(args, "origin_id", None)
     if bool(origin_request) != bool(origin_id):
@@ -7713,7 +7715,16 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
     # (kind, subject, body, and every frozen meta key come from an
     # existing copy - the plan was sealed at first send) and writes only
     # the missing copies. Broadcaster-only.
+    from agenttalk import work_tags
     resume = getattr(args, "resume", None)
+    if args.kind == "task":
+        if sender not in (store.sole_lead(), store.operator_facing()):
+            raise ValueError("only the lead or liaison may dispatch tasks")
+        behind = _roster_members_behind_task_kind(store, roster, exclude=sender)
+        if behind and not args.force:
+            raise ValueError("task recipients need an upgrade; use --force to override")
+        if behind:
+            sys.stderr.write(f"agenttalk broadcast: --force; task kind unsupported by {behind}\n")
     if resume:
         if (args.message or getattr(args, "file", None) or args.subject
                 or args.kind != "message" or args.meta
@@ -7744,6 +7755,13 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
                 f"audience (pre-0.15.0 broadcast) - re-send by hand with "
                 f"--meta request_id/broadcast_id/audience set.\n")
             return 2
+        vendors = None
+        if proto.kind in work_tags.OPENERS:
+            vendors = proto.meta.get("assignee_model_vendors", dict.fromkeys(resolved, "unverified"))
+            work_tags.validate_vendor_map(vendors, resolved)
+            if any(m.meta.get("assignee_model_vendors", dict.fromkeys(resolved, "unverified")) != vendors
+                   for m in copies if m.kind == proto.kind and m.sender == proto.sender):
+                raise ValueError("conflicting fan-out vendor maps")
         existing = {m.recipient for m in copies}
         missed = [r for r in resolved if r not in existing]
         if not missed:
@@ -7787,7 +7805,8 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
                 msg = store.send(
                     sender=sender, recipient=r, body=proto.body,
                     kind=proto.kind, subject=proto.subject,
-                    meta=dict(proto.meta or {}),
+                    meta={k: v for k, v in proto.meta.items() if k != "assignee_model_vendors"},
+                    _dispatch_vendors=vendors,
                 )
             except Exception as e:  # noqa: BLE001 - account every failure
                 failure = e
@@ -7920,6 +7939,8 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
     # mid-loop (send() leaves a supplied value intact; --resume preserves it
     # from the frozen copies). Only opener kinds carry an epoch stamp.
     epoch_snapshot = store.current_epoch() if args.kind in OPENER_KINDS else None
+    work_tags.reject_vendor_override(meta_base)
+    vendors = work_tags.vendor_snapshot(cfg, recipients) if args.kind in work_tags.OPENERS else None
     for r in recipients:
         meta = dict(meta_base)
         # Reuse request_id as the correlation token (so existing
@@ -7949,6 +7970,7 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
             msg = store.send(
                 sender=sender, recipient=r, body=body,
                 kind=args.kind, subject=args.subject or "", meta=meta,
+                _dispatch_vendors=vendors,
             )
         except Exception as e:  # noqa: BLE001 — any failure must be accounted
             failure = e
@@ -8254,6 +8276,12 @@ def cmd_roster(args: argparse.Namespace) -> int:
             reason=getattr(args, "reason", None))
         print(f"roster: forwarded {args.name}'s request {args.to_request} "
               f"to {args.to} (sender {msg.sender}; note {msg.id}).")
+        return 0
+    if action == "set-model-vendor":
+        if bool(args.clear) == bool(args.vendor):
+            raise ValueError("provide a model vendor or --clear")
+        store.set_model_vendor(args.name, None if args.clear else args.vendor)
+        print("roster: updated operator-configured model vendor (not provider attestation).")
         return 0
     if action == "set-role":
         demoted = store.set_role(args.name, args.role)
@@ -14484,6 +14512,12 @@ def build_parser() -> argparse.ArgumentParser:
                             "operator-facing identity). Never the target.")
     r_fwd.add_argument("--reason", help="Optional audit note / body.")
     r_fwd.set_defaults(func=cmd_roster)
+    from agenttalk import work_tags
+    r_mv = rsub.add_parser("set-model-vendor", help="Set operator-configured model vendor, independent of CLI.")
+    r_mv.add_argument("name")
+    r_mv.add_argument("vendor", nargs="?", choices=sorted(work_tags.MODEL_VENDORS))
+    r_mv.add_argument("--clear", action="store_true")
+    r_mv.set_defaults(func=cmd_roster)
     r_sr = rsub.add_parser("set-role", help="Set an agent's role.")
     r_sr.add_argument("name")
     r_sr.add_argument("role")
@@ -15435,6 +15469,8 @@ def build_parser() -> argparse.ArgumentParser:
              "(printed as `request_id=<id>` for the follow-up `wait "
              "--to-request`). Refuses (exit 2) only when none of those resolve.",
     )
+    pesc.add_argument("--work-item", help="Exact root-scoped work-item slug.")
+    pesc.add_argument("--work-cycle", help="Positive work cycle (default 1 for a linked item).")
     pesc.add_argument("--from", dest="sender",
                       help="Sender agent name (default: $AGENTTALK_SELF)")
     pesc.add_argument("--to",
@@ -15613,8 +15649,9 @@ def build_parser() -> argparse.ArgumentParser:
                            "frozen copies of this batch id (kind/subject/"
                            "body/meta come from the original copies). "
                            "Broadcaster-only; takes no body/kind overrides.")
+    pbc.add_argument("--force", action="store_true", help="Override old-reader task-kind refusal.")
     pbc.add_argument("--kind", default="message",
-                     choices=["message", "note", "question"],
+                     choices=["message", "note", "question", "task", "review-request"],
                      help="Broadcast kind (default: message). Use `question` "
                           "when you want everyone to respond.")
     pbc.add_argument("--subject", help="One-line summary.")

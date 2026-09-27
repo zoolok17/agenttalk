@@ -9,6 +9,40 @@ STAGES = {"design", "build", "read", "fix", "delta", "sweep"}
 REVIEWS = {"read", "delta", "sweep"}
 OPENERS = {"task", "review-request"}
 REPLIES = {"task-response": "task", "review-result": "review-request"}
+MODEL_VENDORS = {"anthropic", "openai", "alibaba", "other", "unverified"}
+
+
+def validate_vendor_config(mapping, roster):
+    if (not isinstance(mapping, dict) or set(mapping) - set(roster)
+            or any(not isinstance(v, str) or v not in MODEL_VENDORS for v in mapping.values())):
+        raise ValueError("model_vendor must map roster members to a supported vendor")
+    return mapping
+
+
+def vendor_snapshot(cfg, recipients):
+    mapping = validate_vendor_config(cfg.get("model_vendor", {}), cfg["agents"])
+    return {name: mapping.get(name, "unverified") for name in recipients}
+
+
+def validate_vendor_map(mapping, recipients):
+    validate_vendor_config(mapping, recipients)
+    if set(mapping) != set(recipients):
+        raise ValueError("assignee_model_vendors must name the exact dispatch recipients")
+    return dict(mapping)
+
+
+def reject_vendor_override(meta):
+    if {"assignee_model_vendors", "assignee_model_vendor"} & meta.keys():
+        raise ValueError("assignee_model_vendors is publisher-owned; vendor metadata overrides are forbidden")
+
+
+def item_ref(meta):
+    """Legacy malformed links remain team attention, never guessed item placement."""
+    try:
+        return {"work_item": value("work_item", meta.get("work_item")),
+                "work_cycle": value("work_cycle", meta.get("work_cycle", "1"))}
+    except ValueError:
+        return {}
 
 
 def value(key, raw):
@@ -89,7 +123,10 @@ def _external_opener(store, sender, kind, meta):
             raise ValueError(f"external deliverable requires bounded {key}")
     gates = meta.get("required_gates")
     if isinstance(gates, str) and len(gates) <= 4096:
-        gates = json.loads(gates)
+        try:
+            gates = json.loads(gates)
+        except ValueError:
+            gates = None  # same validated refusal as a non-array value
     if (not isinstance(gates, list) or len(gates) > 64
             or any(not isinstance(g, str) or not re.fullmatch(r"[a-z0-9-]{1,24}", g) for g in gates)):
         raise ValueError("external deliverable requires an explicit check-key array (at most 64 keys)")
@@ -100,8 +137,7 @@ def _external_opener(store, sender, kind, meta):
 
 
 def normalize(store, sender, recipient, kind, meta):
-    if {"assignee_model_vendors", "assignee_model_vendor"} & meta.keys():
-        raise ValueError("assignee_model_vendors is publisher-owned; vendor metadata overrides are forbidden")
+    reject_vendor_override(meta)
     result = dict(meta)
     for key in FIELDS:
         if key == "supersedes" and kind == "rescind":
