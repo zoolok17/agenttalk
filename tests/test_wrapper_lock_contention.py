@@ -303,13 +303,35 @@ def test_lock_order_inversion_is_not_contention(tmp_path) -> None:
 # ------------------------------------------ recovery: before admission
 
 
-@pytest.mark.parametrize("lock_name", ["ledger.lock", "message-publication"])
+# Every lock acquisition the live (inactive-policy) path makes before a turn is
+# admitted, in order: the gate's replay indexing (ledger), the landed-response
+# replay (publication), then the drive authorization's publication lock, replay
+# indexing and claim (ledger). ``skip`` walks the barrier onto each one; the
+# diagnostic names the gate's reason where the gate folds the contention into a
+# result, and the store's own lock where it propagates.
+_ADMISSION_SITES = [
+    pytest.param("ledger.lock", 0,
+                 (obligations.LEDGER_REPLAY_CONTENDED, None), id="admission-replay-index"),
+    pytest.param("message-publication", 0,
+                 (obligations.LANDED_REPLAY_CONTENDED, None), id="landed-replay"),
+    pytest.param("message-publication", 1,
+                 ("message publication", "message-publication"), id="authorization-publication"),
+    pytest.param("ledger.lock", 1,
+                 (obligations.LEDGER_REPLAY_CONTENDED, None), id="authorization-replay-index"),
+    # The claim contends first, but each retry re-runs the WHOLE authorization, so
+    # by the bound the barrier meets its replay indexing first.
+    pytest.param("ledger.lock", 2,
+                 (obligations.LEDGER_REPLAY_CONTENDED, None), id="authorization-claim"),
+]
+
+
+@pytest.mark.parametrize(("lock_name", "skip", "diagnosed"), _ADMISSION_SITES)
 def test_contention_before_admission_is_retried_then_recovers(
-    tmp_path, monkeypatch, lock_name,
+    tmp_path, monkeypatch, lock_name, skip, diagnosed,
 ) -> None:
     s, m = _bus(tmp_path)
     barrier = LockBarrier(monkeypatch)
-    barrier.arm(lock_name, hold=BOUND + 1)
+    barrier.arm(lock_name, skip=skip, hold=BOUND + 1)
     held_at_drive: list[int] = []
 
     def drive(rec):
@@ -327,15 +349,34 @@ def test_contention_before_admission_is_retried_then_recovers(
     assert s.cursor("beta") == m.id
     assert health.contended_phases() == [loop.LOCK_CONTENTION_PHASE_ADMISSION] * (BOUND + 1)
     assert health.recovered()
-    # The first acquisition of either lock is inside the commit gate, which folds
-    # contention into a fail-closed result: the diagnostic names that gate reason.
     assert health.diagnostics == [{
         "phase": loop.LOCK_CONTENTION_PHASE_ADMISSION,
-        "lock": (obligations.LEDGER_REPLAY_CONTENDED if lock_name == "ledger.lock"
-                 else obligations.LANDED_REPLAY_CONTENDED),
-        "lock_file": None,
+        "lock": diagnosed[0],
+        "lock_file": diagnosed[1],
         "attempts": BOUND,
     }]
+
+
+def test_contended_inbox_peek_is_retried_in_place(tmp_path, monkeypatch) -> None:
+    # next_record takes no store lock today; the admission wrap still covers it,
+    # so a future lock-taking inbox read cannot reintroduce the exit.
+    s, m = _bus(tmp_path)
+    real_next = loop.recv_api.next_record
+    calls = {"n": 0}
+
+    def contended_peek(store, agent, **kwargs):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise LockContention("could not acquire the inbox", what="inbox")
+        return real_next(store, agent, **kwargs)
+
+    monkeypatch.setattr(loop.recv_api, "next_record", contended_peek)
+    driver = CountedDriver()
+    health = Health()
+    assert _run(s, _inactive_gate(s), driver, health) == 1
+    assert driver.calls == 1
+    assert health.contended_phases()[:2] == [loop.LOCK_CONTENTION_PHASE_ADMISSION] * 2
+    assert s.cursor("beta") == m.id
 
 
 # ------------------------------------------ recovery: after the child turn
@@ -436,15 +477,20 @@ def test_contention_around_finalization_is_retried_visibly(tmp_path, monkeypatch
     assert [d["phase"] for d in health.diagnostics] == [loop.LOCK_CONTENTION_PHASE_FINALIZATION]
 
 
+# An active gate with a not-owed head and no reply: the durable completion proof
+# is the retained no-admission success, then the ledger-guarded cursor. After the
+# child completes, the ledger is taken by: the retention's replay indexing (0) and
+# claim (1), then the finalizer's replay indexing (2) and disposition (3).
+@pytest.mark.parametrize("skip", [0, 1, 2, 3],
+                         ids=["retention-index", "retention-claim",
+                              "finalize-index", "finalize-disposition"])
 def test_ledger_finalization_contention_retains_success_and_never_redrives(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, skip,
 ) -> None:
-    # An active gate with a not-owed head and no reply: the durable completion
-    # proof is the retained no-admission success, then the ledger-guarded cursor.
     s, m = _bus(tmp_path, kind="message")
     barrier = LockBarrier(monkeypatch)
     driver = CountedDriver(reply=None, on_complete=lambda: barrier.arm(
-        "ledger.lock", hold=BOUND + 1))
+        "ledger.lock", skip=skip, hold=BOUND + 1))
     health = Health()
     turns = _run(s, _active_gate(s), driver, health)
 
@@ -455,6 +501,29 @@ def test_ledger_finalization_contention_retains_success_and_never_redrives(
     assert set(health.contended_phases()) == {loop.LOCK_CONTENTION_PHASE_FINALIZATION}
     assert health.recovered()
     assert len(health.diagnostics) == 1
+
+
+@pytest.mark.parametrize(("lock_name", "skip"), [
+    ("message-publication", 2),    # the retention's replay (after send + landed replay)
+    ("ledger.lock", 1),            # the retention's replay indexing (after send's hook)
+], ids=["retention-publication", "retention-index"])
+def test_landed_reply_retention_contention_is_retried_visibly(
+    tmp_path, monkeypatch, lock_name, skip,
+) -> None:
+    # An active gate, a not-owed task answered through the draft: finalization
+    # RETAINS the landed reply as the completion proof before the cursor moves.
+    s, m = _bus(tmp_path, kind="task")
+    barrier = LockBarrier(monkeypatch)
+    driver = CountedDriver(on_complete=lambda: barrier.arm(lock_name, skip=skip, hold=BOUND))
+    health = Health()
+    turns = _run(s, _active_gate(s), driver, health)
+
+    assert turns == 1 and driver.calls == 1
+    assert barrier.hits[lock_name] == BOUND
+    assert len(_replies(s)) == 1
+    assert s.cursor("beta") == m.id
+    assert health.contended_phases() == [loop.LOCK_CONTENTION_PHASE_FINALIZATION] * BOUND
+    assert health.diagnostics[0]["lock"] == obligations.LANDED_RETENTION_CONTENDED
 
 
 def test_one_diagnostic_per_persistent_episode(tmp_path, monkeypatch) -> None:
@@ -772,3 +841,24 @@ def test_lifecycle_log_records_one_persisting_contention_row() -> None:
     assert row["lock"] == "message publication"
     assert row["lock_file"] == ".message-publication.generation"
     assert row["attempts"] == BOUND
+
+
+def test_cmd_wrap_wires_contention_health_and_the_durable_diagnostic(
+    tmp_path, monkeypatch, capsys,
+) -> None:
+    s = Store(tmp_path)
+    s.init(["lead", "beta"])
+    captured: dict = {}
+    monkeypatch.setattr(loop, "run_loop", lambda *a, **k: captured.update(k) or 0)
+    cli._wrap_loop_mode(s, "beta", cli="codex", base_argv=["python", "-c", "pass"],
+                        sender="beta", min_interval=0.0, render=False, lead_loop=False)
+    captured["on_health_contention"](loop.LOCK_CONTENTION_PHASE_FINALIZATION)
+    snap = s.read_health("beta")
+    assert snap["state"] == health_model.STATE_RATE_LIMITED_OR_OUTAGE
+    assert snap["reason_code"] == loop.LOCK_CONTENTION_REASON
+    captured["on_contention_persisting"]({
+        "phase": "finalization", "lock": "message publication",
+        "lock_file": ".message-publication.generation", "attempts": BOUND})
+    err = capsys.readouterr().err
+    assert "store lock contention persists" in err
+    assert "message publication" in err and "finalization phase" in err
