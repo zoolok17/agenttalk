@@ -3022,6 +3022,7 @@ def build_gates(desc: RootDescriptor) -> dict:
             "root_info": _root_info(desc),
             "target_root_project_id": store.project_id(),
             "verdict": checked.get("verdict", "HOLD"),
+            "warnings": checked.get("warnings", []),
             "required_gates": [
                 _envelope_str(n) for n in (checked.get("required_gates") or [])
             ],
