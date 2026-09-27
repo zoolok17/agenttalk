@@ -255,3 +255,38 @@ All runs foreground with `PYTHONPATH=<worktree>/src`, `PYTHONDONTWRITEBYTECODE=1
 - Size (B3b only, over merge `6f66de6`): `work_board.py` +216/-116, tests
   +331/-14, and this record. That is above the section 9 400-600 estimate
   once the adversarial suite is counted, and below the split threshold for code.
+
+### B3b fix round 2 — codex delta read N1-N6
+
+Base `b6ed00d`. The delta read closed F2, F3 and F5-F8 and verified the M3
+ruling; F1 and F4 stayed open in further paths, and four more defects were
+reproduced. Each fix below has a failing-first test from the reviewer's exact
+sequence. N1's test uses a real isolated `Store`, which accepts an approved/GO
+and then a needs-info/HOLD on the same native review.
+
+| Finding | Correction | Test |
+| --- | --- | --- |
+| N1 terminal erased a later/unordered needs-info | Publication does not order a result and a needs-info; only explicit `in_reply_to` ancestry across all messages does. A HOLD the result provably answers is history. A HOLD proven later stays open. Otherwise the item is row 2 "ambiguous response order". Every HOLD stays in verdict evidence, and evidence (builders, verdicts) is now built before placement, so row-2 cards keep it. | `test_n1_real_store_go_then_needs_info_hold_is_ambiguous`, `test_n1_proven_order_decides_between_needs_info_and_terminal` |
+| N2 integration beat a policy conflict | Policy is evaluated once, before any row. Conflicting declarations join the row-2 conflicts ahead of Done. Every item carries the raw `integration` facts for its heads, even when Unknown. | `test_n2_policy_conflict_precedes_done_and_keeps_the_raw_integration_fact` |
+| N3 partial fan-out looked complete | The publisher's frozen `assignee_model_vendors` map is the recipient set. A named recipient without a copy is row 2 "incomplete fan-out: frozen recipient map names a missing opener"; a copy outside the map is row 2 too. | `test_n3_frozen_recipient_map_exposes_a_missing_fan_out_copy` |
+| N4 missing policy covered by another origin | Every origin must declare. The origins are the cycle's builds, else its designs, else its external review, taken from the latest cycle that has one. A silent origin is "check policy missing". Replacements inherit, as B2a publishes. | `test_n4_an_origin_without_policy_is_not_covered_by_another` |
+| N5 check labels wrong or dropped on Done | The label follows the fact: green, failed or evidence unavailable. Done keeps it explicit ("integrated with failed required checks"; "integrated; check policy missing"). | `test_n5_failed_check_stays_explicit_including_on_done` (+ N4 test) |
+| N6 malformed title aborted everything | `work_title` and the vendor map are parsed inside the one opener guard. Malformed history gives a per-item row 2 "malformed work metadata" with evidence. | `test_n6_malformed_historical_title_is_a_per_item_unknown` |
+
+Executed (foreground, `PYTHONPATH=<worktree>/src`, `python -B`, no bytecode,
+task-scratch TEMP/TMP/basetemps, `-q -p no:cacheprovider`):
+
+- Failing first: **7 failed, 35 passed**. Every failure was the intended one;
+  the real `Store` accepted both review results and the reducer said Ready.
+- The first implementation left one failure. The real-Store row-2 card had no
+  verdict evidence, because verdicts were built only during placement. They
+  are now built before it.
+- Final: `tests/test_work_board_reducer.py` **42 passed**. With
+  `tests/test_work_tags.py`: **123 passed** on Python 3.10.11. With
+  `tests/test_threads.py` too: **197 passed** on Python 3.14.6.
+- Mutation (committed first, restored through git, bytecode-free): **42/42
+  killed**, covering 14 round-2 mutants plus 28 re-anchored earlier ones.
+  One first-draft mutant (`{} or ...`) was equivalent code and was rewritten
+  (`{} and ...`), then killed.
+- Ruff and Bandit (B101 excluded) are clean; `git diff --check` is clean.
+- Size over `b6ed00d`: `work_board.py` +104/-51, tests +119.

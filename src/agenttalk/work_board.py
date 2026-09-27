@@ -50,18 +50,24 @@ def _parse(meta):
         raise ValueError("repository/check policy must be text")
     # The whole repository/check declaration is compared, not just its check half.
     policy = (*declared[:3], tuple(gates) if gates is not None else None, declared[3])
+    vendors = meta.get("assignee_model_vendors")
+    if vendors is not None and not (isinstance(vendors, dict) and all(
+            isinstance(k, str) and isinstance(v, str) for k, v in vendors.items())):
+        raise ValueError("assignee_model_vendors must map recipients to vendors")
+    title = meta.get("work_title")
     return tags, {"stage": tags["stage"], "cycle": int(tags["work_cycle"] or 1),
+                  "title": None if title is None else work_tags.value("work_title", title), "vendors": vendors,
                   "round": int(tags["work_round"]) if tags["work_round"] else None,
                   "head": _tag(meta, "work_head"), "supersedes": _tag(meta, "supersedes"),
                   "external": tags["external_deliverable"] is True,
                   "policy": policy if any(v is not None for v in policy) else None}
 
 
-def _request(rid, copies, responses, running):
+def _request(rid, copies, responses, running, descends):
     first, meta = copies[0], copies[0].meta
     openers = sorted(c.id for c in copies)
     req = {"request_id": rid, "kind": first.kind, "requester": first.sender, "openers": openers,
-           "issues": [], "obligations": [], "title": meta.get("work_title"), "explicit_cycle": "work_cycle" in meta,
+           "issues": [], "obligations": [], "title": None, "vendors": None, "explicit_cycle": "work_cycle" in meta,
            "work_item": meta.get("work_item") if isinstance(meta.get("work_item"), str) else None,
            "stage": None, "cycle": None, "round": None, "head": None, "supersedes": None,
            "external": False, "policy": None}
@@ -75,12 +81,17 @@ def _request(rid, copies, responses, running):
         tags = None
     else:
         req.update(parsed)
+    vendors = req["vendors"] or {}
+    # N3: the publisher's frozen map names every recipient; a missing copy is an incomplete snapshot.
+    if req["vendors"] is not None and set(vendors) - {c.recipient for c in copies}:
+        req["issues"].append(("incomplete fan-out: frozen recipient map names a missing opener", openers))
+    if req["vendors"] is not None and {c.recipient for c in copies} - set(vendors):
+        req["issues"].append(("fan-out copy outside its frozen recipient map", openers))
     rescinds = [r for r in responses if r.kind == "rescind" and r.sender == first.sender]
-    vendors = meta.get("assignee_model_vendors") if isinstance(meta.get("assignee_model_vendors"), dict) else {}
     for copy in copies:
         ob = {"request_id": rid, "opener": copy.id, "requester": copy.sender, "recipient": copy.recipient,
               "stage": req["stage"], "cycle": req["cycle"], "head": req["head"], "state": "outstanding",
-              "verdict": None, "issue": None, "accepted": False, "holds": [],
+              "verdict": None, "issue": None, "accepted": False, "holds": [], "hold_open": False,
               "running": (copy.recipient, rid) in running, "reply": None,
               "vendor": vendors.get(copy.recipient, "unverified")}
         terminal = []
@@ -98,6 +109,7 @@ def _request(rid, copies, responses, running):
             else:
                 ob["holds"].append(reply.id)  # native needs-info is a HOLD (design section 2)
         ob["holds"].sort()
+        ob["hold_open"] = bool(ob["holds"])  # a rescind or silence never answers a HOLD
         if rescinds and terminal:
             ob["state"] = "conflict"
             req["issues"].append(("reply and requester rescind both recorded; causal order unproven",
@@ -115,6 +127,12 @@ def _request(rid, copies, responses, running):
             else:
                 ob["state"] = "done"
                 ob["verdict"], ob["issue"] = _verdict(req["stage"], reply.meta)
+            # N1: publication does not order a result and a needs-info; only explicit reply links do.
+            before = [h for h in ob["holds"] if descends(reply.id, h)]
+            after = [h for h in ob["holds"] if descends(h, reply.id)]
+            if set(before) | set(after) != set(ob["holds"]):
+                req["issues"].append(("ambiguous response order", [reply.id, *ob["holds"]]))
+            ob["hold_open"] = bool(after)
         req["obligations"].append(ob)
     return req
 
@@ -153,9 +171,20 @@ def reduce(messages, *, lead, incidents=(), integrated=None, running=frozenset()
             why = "reply has no available opener"
         if isinstance(m.meta.get("work_item"), str) and m.kind != "rescind":
             orphans.setdefault(m.meta["work_item"], []).append((why, [m.id]))
+    parent = {m.id: m.meta.get("in_reply_to") for m in messages if isinstance(m.meta.get("in_reply_to"), str)}
+
+    def descends(later, earlier):
+        seen, node = set(), parent.get(later)
+        while node is not None and node not in seen:
+            if node == earlier:
+                return True
+            seen.add(node)
+            node = parent.get(node)
+        return False
+
     grouped, legacy = {}, []
     for rid, copies in openers.items():
-        req = _request(rid, copies, responses.get(rid, []), running)
+        req = _request(rid, copies, responses.get(rid, []), running, descends)
         (grouped.setdefault(req["work_item"], []) if req["work_item"] else legacy).append(req)
     facts = {"lead": lead, "incidents": list(incidents), "integrated": integrated or {}, "checks": checks or {},
              "known": set(openers)}
@@ -208,7 +237,9 @@ def _graph(reqs, known):
 def _item(slug, reqs, orphans, facts):
     item = {"work_item": slug, "title": None, "cycle": None, "legacy_cycle": True, "round": None,
             "candidate": None, "builders": [], "verdicts": {}, "obligations": [], "incidents": [],
-            "issues": [], "previous_cycles": [], "checks": None}
+            "issues": [], "previous_cycles": [], "checks": None,
+            "integration": dict(sorted((head, value) for (item_slug, head), value in facts["integrated"].items()
+                                       if item_slug == slug))}
     if not reqs:
         return dict(item, column="unknown", workflow_column="unknown", row=2, reason=orphans[0][0],
                     evidence=sorted(i for _, ids in orphans for i in ids))
@@ -232,6 +263,25 @@ def _item(slug, reqs, orphans, facts):
                  and any(o["state"] != "rescinded" for o in r["obligations"])]
     if len({r["head"] for r in surviving} - {None}) > 1:
         conflicts.append(("multiple candidates without supersession", [i for r in surviving for i in r["openers"]]))
+    build_purpose = any(r["stage"] == "build" for r in cur)
+    builders = {o["recipient"] for r in valid if r["stage"] in ("build", "fix") for o in r["obligations"]}
+    if not build_purpose:  # design purpose survives explicit fix ancestry; conservatively keep its authors
+        builders |= {o["recipient"] for r in cur if r["stage"] == "design" for o in r["obligations"]}
+    item["builders"] = sorted(builders)
+    for r in cur:
+        for o in r["obligations"] if r["stage"] in work_tags.REVIEWS else ():
+            final = [(o["verdict"], o["reply"])] if o["state"] == "done" and o["verdict"] else []
+            for verdict, reply in final + [("HOLD", h) for h in o["holds"]]:  # every HOLD stays as evidence
+                item["verdicts"].setdefault(o["head"], []).append(
+                    {"reviewer": o["recipient"], "verdict": verdict, "reply": reply,
+                     "independent": o["recipient"] not in builders, "vendor": o["vendor"]})
+    for entries in item["verdicts"].values():
+        entries.sort(key=lambda e: (e["reviewer"], e["reply"]))
+    policy = _policy(slug, valid, cur, current, facts) if current is not None else {
+        "conflict": None, "problem": ("check policy missing", []), "label": None}
+    item["checks"] = policy["label"]
+    if policy["conflict"]:
+        conflicts.append(policy["conflict"])
     obs = [o for r in cur for o in r["obligations"]]
     item.update(cycle=current, legacy_cycle=not any(r["explicit_cycle"] for r in reqs),
                 round=max((r["round"] for r in cur if r["round"]), default=None),
@@ -252,7 +302,7 @@ def _item(slug, reqs, orphans, facts):
         conflicts.sort(key=lambda c: (c[0], sorted(c[1])))
         row, column, reason, evidence = 2, "unknown", conflicts[0][0], [i for _, ids in conflicts for i in ids]
     else:
-        row, column, reason, evidence = _place(slug, valid, cur, by_rid, successor, surviving, facts, item)
+        row, column, reason, evidence = _place(slug, valid, cur, by_rid, successor, surviving, policy, facts, item)
     item.update(workflow_column=column, row=row, reason=reason, evidence=sorted(set(evidence)),
                 column="needs_you" if item["incidents"] else column)
     return item
@@ -262,7 +312,7 @@ def _live(r):
     return [o for o in r["obligations"] if o["state"] != "rescinded"]
 
 
-def _place(slug, valid, cur, by_rid, successor, surviving, facts, item):
+def _place(slug, valid, cur, by_rid, successor, surviving, policy, facts, item):
     def head_of(r):
         seen = set()
         while r["request_id"] in successor and r["request_id"] not in seen:
@@ -284,39 +334,31 @@ def _place(slug, valid, cur, by_rid, successor, surviving, facts, item):
     reviews = [r for r in cur if r["stage"] in work_tags.REVIEWS]
     heads = {r["head"] for r in surviving}
     candidate = next(iter(heads)) if len(heads) == 1 and None not in heads else None
-    build_purpose = any(r["stage"] == "build" for r in cur)
-    builders = {o["recipient"] for r in valid if r["stage"] in ("build", "fix") for o in r["obligations"]}
-    if not build_purpose:  # design purpose survives explicit fix ancestry; conservatively keep its authors
-        builders |= {o["recipient"] for r in cur if r["stage"] == "design" for o in r["obligations"]}
-    item.update(candidate=candidate, builders=sorted(builders))
+    builders = set(item["builders"])
+    item["candidate"] = candidate
     unresolved, awaiting = [], []
     for r in reviews:
         for o in r["obligations"]:
-            if o["state"] == "done" and o["verdict"]:
-                marks = [(o["verdict"], o["reply"])]
-            else:
-                marks = [("HOLD", h) for h in o["holds"]] if o["state"] != "done" else []
+            final = [(o["verdict"], o["reply"])] if o["state"] == "done" and o["verdict"] else []
+            marks = [m for m in final if m[0] in ("FIX", "HOLD")] + (
+                [("HOLD", h) for h in o["holds"]] if o["hold_open"] else [])
             for verdict, reply in marks:
-                item["verdicts"].setdefault(o["head"], []).append(
-                    {"reviewer": o["recipient"], "verdict": verdict, "reply": reply,
-                     "independent": o["recipient"] not in builders, "vendor": o["vendor"]})
-                if verdict == "GO":
-                    continue
                 head = head_of(r)
                 live = _live(head)
                 if head is not r and live and all(x["state"] == "done" and x["verdict"] == "GO" for x in live):
                     continue  # discharged by the surviving end of an explicit replacement chain
                 pending = head is not r and any(x["state"] == "outstanding" for x in head["obligations"])
                 (awaiting if pending else unresolved).append((verdict, reply))
-    for entries in item["verdicts"].values():
-        entries.sort(key=lambda e: (e["reviewer"], e["reply"]))
     open_marks = unresolved + awaiting
     if candidate and facts["integrated"].get((slug, candidate)) and not any(
             o["state"] == "outstanding" for o in execs):
         independent = any(o["verdict"] == "GO" and o["head"] == candidate and o["recipient"] not in builders
                           for r in surviving for o in _live(r))
-        reason = ("merged with open FIX/HOLD" if open_marks else "integrated in configured target" if independent
-                  else "integrated without independent GO")  # missing review evidence stays explicit
+        # Missing review or check evidence stays explicit on Done.
+        problem = policy["problem"]
+        reason = ("merged with open FIX/HOLD" if open_marks else "integrated without independent GO" if not independent
+                  else "integrated with failed required checks" if item["checks"] == "required checks failed"
+                  else "integrated; " + problem[0] if problem else "integrated in configured target")
         return 3, "done", reason, [reply for _, reply in open_marks] or [i for r in surviving for i in r["openers"]]
     active_fix = [o for o in execs if o["stage"] == "fix" and o["state"] == "outstanding"]
     if active_fix:
@@ -337,8 +379,8 @@ def _place(slug, valid, cur, by_rid, successor, surviving, facts, item):
                   else "independent review" if all(o["recipient"] not in builders for o in waiting)
                   else "unverified review")
         return 6, "independent_review", reason, [o["opener"] for o in waiting]
-    blockers = _blockers(slug, valid, cur, obs, execs, surviving, successor, candidate, heads, builders,
-                         open_marks, descends_from_design, facts, item)
+    blockers = _blockers(cur, obs, execs, surviving, successor, candidate, heads, builders,
+                         open_marks, descends_from_design, policy)
     if not blockers:
         success = [o["reply"] for o in execs if o["verdict"] == "done"]
         gos = [o["reply"] for r in surviving for o in _live(r) if o["verdict"] == "GO"]
@@ -351,9 +393,8 @@ def _place(slug, valid, cur, by_rid, successor, surviving, facts, item):
     return 9, "unknown", blockers[0][0], blockers[0][1]
 
 
-def _blockers(slug, valid, cur, obs, execs, surviving, successor, candidate, heads, builders, open_marks,
-              descends_from_design, facts, item):
-    item["checks"] = None
+def _blockers(cur, obs, execs, surviving, successor, candidate, heads, builders, open_marks,
+              descends_from_design, policy):
     blockers = []
     if any(o["stage"] not in work_tags.STAGES for o in obs):
         blockers.append(("unknown stage", [o["opener"] for o in obs]))
@@ -392,29 +433,41 @@ def _blockers(slug, valid, cur, obs, execs, surviving, successor, candidate, hea
     if unlinked:
         blockers.append(("fix purpose unknown: no supersedes ancestry to the design task",
                          [i for r in unlinked for i in r["openers"]]))
-    policy = _policy(slug, valid, cur, facts, item)
-    if policy:
-        blockers.append(policy)
+    if policy["problem"]:
+        blockers.append(policy["problem"])
     return blockers
 
 
-def _policy(slug, valid, cur, facts, item):
-    # The originating dispatch defines policy; a fix-only later cycle inherits the earlier origin.
-    origin = [r for r in valid if not r["supersedes"] and (r["stage"] in ("design", "build") or r["external"])]
-    current = {r["request_id"] for r in cur}
-    sources = [r for r in origin if r["request_id"] in current] or origin
-    declared = {r["policy"] for r in sources if r["policy"]}
+def _policy(slug, valid, cur, current, facts):
+    """Conflicting declarations are history conflicts; a missing or failing policy is never satisfied."""
+    sources = []
+    for cycle in sorted({r["cycle"] for r in valid if r["cycle"] <= current}, reverse=True):
+        # The deliverable's origin defines policy: builds, else designs, else an external review declaration.
+        origin = [r for r in valid if r["cycle"] == cycle and not r["supersedes"]]
+        sources = ([r for r in origin if r["stage"] == "build"] or [r for r in origin if r["stage"] == "design"]
+                   or [r for r in origin if r["external"]])
+        if sources:
+            break
     evidence = [i for r in sources for i in r["openers"]]
+    declared = {r["policy"] for r in sources if r["policy"]}
+    result = {"conflict": None, "problem": None, "label": None}
     if len(declared) > 1:
-        return "conflicting repository/check policies", evidence
-    gates, reason = declared.pop()[3:] if declared else (None, None)
+        result["conflict"] = ("conflicting repository/check policies", evidence)
+        return result
+    if not sources or any(r["policy"] is None for r in sources):
+        result["problem"] = ("check policy missing", evidence)  # section 2: missing is unknown, never empty
+        return result
+    gates, reason = declared.pop()[3:]
     if gates and reason:
-        return "no_gates_reason conflicts with required gates", evidence
-    if not gates:
-        item["checks"] = "local checks not tracked" if reason else None
-        return None if reason else ("check policy missing", evidence)
-    result = facts["checks"].get((slug, item["cycle"]))
-    if result is None:
-        return "required check evidence unavailable", evidence
-    item["checks"] = "required checks green"
-    return None if result else ("required checks not satisfied", evidence)
+        result["problem"] = ("no_gates_reason conflicts with required gates", evidence)
+    elif not gates:
+        result["label"] = "local checks not tracked" if reason else None
+        result["problem"] = None if reason else ("check policy missing", evidence)
+    else:
+        passed = facts["checks"].get((slug, current))
+        result["label"] = {True: "required checks green", False: "required checks failed"}.get(
+            passed, "required check evidence unavailable")
+        if passed is not True:
+            result["problem"] = ("required checks not satisfied" if passed is False
+                                 else "required check evidence unavailable", evidence)
+    return result

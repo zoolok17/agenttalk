@@ -570,3 +570,122 @@ def test_pre_b2a_history_without_verdict_or_with_text_false_is_not_green():
     text_false.reply(text_false.task("tk-read", REVIEWER, "read", work_head=HEAD, raw=True, **declared),
                      verdict="GO", raw=True)
     assert card(text_false)["reason"] == "no successful surviving deliverable"
+
+
+# ---- B3b delta read (codex, 2026-09-27): N1-N6 ----
+
+EVIDENCE = {"risk_class": "workflow-correctness", "release_blocker": "no", "tests_referenced": "n/a",
+            "tests_executed": "n/a", "evidence": "review notes", "residual_risk": "low"}
+
+
+def test_n1_real_store_go_then_needs_info_hold_is_ambiguous(tmp_path):
+    from agenttalk.store import Store
+    store = Store(tmp_path)
+    store.init([LEAD, BUILDER, REVIEWER])
+    store.set_role(LEAD, "lead")
+    build = store.send(sender=LEAD, recipient=BUILDER, kind="task", body="b",
+                       meta={"work_item": ITEM, "stage": "build", "request_id": "tk-build", **POLICY})
+    store.send(sender=BUILDER, recipient=LEAD, kind="task-response", body="r",
+               meta={"in_reply_to": build.id, "request_id": "tk-build", "status": "done", "verdict": "done"})
+    review = store.send(sender=LEAD, recipient=REVIEWER, kind="review-request", body="read",
+                        meta={"work_item": ITEM, "stage": "read", "request_id": "tk-r", "work_head": HEAD})
+    go = store.send(sender=REVIEWER, recipient=LEAD, kind="review-result", body="ok",
+                    meta={"in_reply_to": review.id, "request_id": "tk-r", "status": "approved", "verdict": "GO",
+                          **EVIDENCE})
+    hold = store.send(sender=REVIEWER, recipient=LEAD, kind="review-result", body="wait",
+                      meta={"in_reply_to": review.id, "request_id": "tk-r", "status": "needs-info", "verdict": "HOLD"})
+    item = next(i for i in W.reduce(store.valid_messages(), lead=LEAD)["items"] if i["work_item"] == ITEM)
+    assert (item["workflow_column"], item["row"], item["reason"]) == ("unknown", 2, "ambiguous response order")
+    assert {go.id, hold.id} <= set(item["evidence"])
+    assert [e["verdict"] for e in item["verdicts"][HEAD]] == ["GO", "HOLD"] or [
+        e["verdict"] for e in item["verdicts"][HEAD]] == ["HOLD", "GO"]
+
+
+def test_n1_proven_order_decides_between_needs_info_and_terminal():
+    answered = Bus()
+    built(answered)
+    review = answered.task("tk-r", REVIEWER, "read", kind="review-request", work_head=HEAD)
+    hold = answered.reply(review, status="needs-info", verdict="HOLD")
+    answer = answered.add(LEAD, REVIEWER, "message", {"in_reply_to": hold.id, "request_id": "tk-r"})
+    go = answered.add(REVIEWER, LEAD, "review-result", {"in_reply_to": answer.id, "request_id": "tk-r",
+                                                          "status": "approved", "verdict": "GO"})
+    item = card(answered)
+    assert item["workflow_column"] == "ready" and go.id in item["evidence"]
+    assert {e["reply"] for e in item["verdicts"][HEAD]} == {hold.id, go.id}  # the HOLD stays as history
+    reopened = Bus()
+    built(reopened)
+    review = reopened.task("tk-r", REVIEWER, "read", kind="review-request", work_head=HEAD)
+    go = reopened.reply(review, status="approved", verdict="GO")
+    late = reopened.add(REVIEWER, LEAD, "review-result", {"in_reply_to": go.id, "request_id": "tk-r",
+                                                            "status": "needs-info", "verdict": "HOLD"})
+    item = card(reopened)
+    assert (item["workflow_column"], item["reason"]) == ("unknown", "non-operator HOLD") and late.id in item["evidence"]
+
+
+def test_n2_policy_conflict_precedes_done_and_keeps_the_raw_integration_fact():
+    bus = Bus()
+    repo = {"work_branch": "feature", "work_target": "main", **POLICY}
+    bus.reply(bus.task("tk-build-a", BUILDER, "build", work_repo="repo-a", **repo), verdict="done")
+    bus.reply(bus.task("tk-build-b", REVIEWER2, "build", work_repo="repo-b", **repo), verdict="done")
+    bus.reply(bus.task("tk-read", REVIEWER, "read", work_head=HEAD), verdict="GO")
+    item = card(bus, integrated={(ITEM, HEAD): True})
+    assert (item["workflow_column"], item["row"], item["reason"]) == (
+        "unknown", 2, "conflicting repository/check policies")
+    assert item["integration"] == {HEAD: True}
+
+
+def test_n3_frozen_recipient_map_exposes_a_missing_fan_out_copy():
+    bus = Bus()
+    built(bus)
+    vendors = {"assignee_model_vendors": {REVIEWER: "anthropic", REVIEWER2: "alibaba"}}
+    copies = [bus.task("tk-group", to, "read", work_head=HEAD, publisher=vendors) for to in (REVIEWER, REVIEWER2)]
+    bus.reply(copies[0], verdict="GO")
+    assert card(bus)["workflow_column"] == "independent_review"
+    bus.messages = [m for m in bus.messages if m.id != copies[1].id]
+    item = card(bus)
+    assert (item["workflow_column"], item["row"], item["reason"]) == (
+        "unknown", 2, "incomplete fan-out: frozen recipient map names a missing opener")
+    assert copies[0].id in item["evidence"]
+    outside = Bus()
+    built(outside)
+    only_x = {"assignee_model_vendors": {REVIEWER: "anthropic"}}
+    for to in (REVIEWER, REVIEWER2):
+        outside.task("tk-group", to, "read", work_head=HEAD, publisher=only_x)
+    assert card(outside)["reason"] == "fan-out copy outside its frozen recipient map"
+
+
+def test_n4_an_origin_without_policy_is_not_covered_by_another():
+    bus = Bus()
+    bus.reply(bus.task("tk-build-1", BUILDER, "build", **POLICY), verdict="done")
+    bus.reply(bus.task("tk-build-2", REVIEWER2, "build"), verdict="done")
+    bus.reply(bus.task("tk-read", REVIEWER, "read", work_head=HEAD), verdict="GO")
+    assert (card(bus)["workflow_column"], card(bus)["reason"]) == ("unknown", "check policy missing")
+    assert card(bus, integrated={(ITEM, HEAD): True})["reason"] == "integrated; check policy missing"
+
+
+def test_n5_failed_check_stays_explicit_including_on_done():
+    bus = Bus()
+    bus.reply(bus.task("tk-build", BUILDER, "build", required_gates='["unit"]'), verdict="done")
+    bus.reply(bus.task("tk-read", REVIEWER, "read", work_head=HEAD), verdict="GO")
+    failed = {(ITEM, 1): False}
+    item = card(bus, checks=failed)
+    assert (item["workflow_column"], item["reason"], item["checks"]) == (
+        "unknown", "required checks not satisfied", "required checks failed")
+    item = card(bus, checks=failed, integrated={(ITEM, HEAD): True})
+    assert (item["workflow_column"], item["reason"], item["checks"]) == (
+        "done", "integrated with failed required checks", "required checks failed")
+    green = card(bus, checks={(ITEM, 1): True})
+    assert (green["workflow_column"], green["checks"]) == ("ready", "required checks green")
+
+
+def test_n6_malformed_historical_title_is_a_per_item_unknown():
+    bus = Bus()
+    bad = bus.task("tk-old", BUILDER, "build", raw=True, work_title=["bad"], **POLICY)
+    bus.reply(bus.task("tk-other", BUILDER, "build", item="other-item", **POLICY), verdict="done")
+    out = W.reduce(bus.messages, lead=LEAD)
+    item = next(i for i in out["items"] if i["work_item"] == ITEM)
+    assert (item["row"], item["reason"], item["evidence"]) == (2, "malformed work metadata", [bad.id])
+    assert next(i for i in out["items"] if i["work_item"] == "other-item")["reason"] == "no review dispatched"
+    vendor = Bus()
+    vendor.task("tk-old", REVIEWER, "read", work_head=HEAD, publisher={"assignee_model_vendors": ["bad"]})
+    assert card(vendor)["reason"] == "malformed work metadata"
