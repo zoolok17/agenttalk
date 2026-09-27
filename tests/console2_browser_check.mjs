@@ -17,9 +17,23 @@ import { spawn } from 'node:child_process';
 
 const [exe, pageUrl, profile, flagsJson, sabotage] = process.argv.slice(2);
 const extraFlags = flagsJson ? JSON.parse(flagsJson) : [];
+
+// The page can carry more than one `.c2-age` label at once (one per open card), each on its OWN
+// independent clock, and "the first .c2-age" is neither stable (DOM/queue order depends on
+// relative age, which the fixture or a real store can change run to run) nor guaranteed to ever
+// tick within any bounded wait (an already hour-scale label can go a full simulated hour, sped up
+// or not, without its rendered text changing - exactly what stalled a real CI runner). Watch a
+// SPECIFIC card instead, selected by its own stable key - card-2, the one
+// tests/test_console2_browser.py's fixture keeps as the OLDEST of its two cards (so it is the one
+// still open once this check's own R2/R3 key-path steps below defer the other away) and near-zero
+// aged (so it stays well clear of hour granularity for the life of one run). Matched by
+// data-c2-card's own "team|id" convention regardless of what "team" resolves to, since only the id
+// half is ours to fix.
+const WATCHED_AGE_SELECTOR = '[data-c2-card$="|card-2"] .c2-age';
+
 const sabotageScrollScript = sabotage === 'scroll'
   ? `window.__sabotageObserver = new MutationObserver(() => { window.__thread.scrollTop = 999999; });
-     window.__sabotageObserver.observe(document.querySelector('.c2-age'), { childList: true, characterData: true, subtree: true });`
+     window.__sabotageObserver.observe(document.querySelector('${WATCHED_AGE_SELECTOR}'), { childList: true, characterData: true, subtree: true });`
   : '';
 const PORT = 9300 + Math.floor(Math.random() * 500);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -80,14 +94,14 @@ async function waitForAgeChange(previousText, { timeoutMs = 30000, intervalMs = 
   const start = Date.now();
   for (;;) {
     const current = await evaluate(
-      `(() => { const a = document.querySelector('.c2-age'); return a ? a.textContent : null; })()`,
+      `(() => { const a = document.querySelector('${WATCHED_AGE_SELECTOR}'); return a ? a.textContent : null; })()`,
     );
     if (current !== previousText) return { changed: true, elapsedMs: Date.now() - start, text: current };
     const elapsedMs = Date.now() - start;
     if (elapsedMs >= timeoutMs) {
       throw new Error(
         `no redraw observed in ${(elapsedMs / 1000).toFixed(1)}s `
-        + `(the .c2-age label's text stayed "${previousText}")`);
+        + `(the watched card's age label text stayed "${previousText}")`);
     }
     await sleep(intervalMs);
   }
@@ -145,6 +159,17 @@ try {
 
   // F1: first draw is scrolled to the end
   out.initial = await measure();
+
+  // Assert the watched age label exists (and so is the intended one - see WATCHED_AGE_SELECTOR
+  // above) BEFORE relying on it anywhere below; a wrong or missing selector must fail clearly
+  // here, not surface later as a confusing "no redraw observed" timeout.
+  const watchedLabelText = await evaluate(
+    `(() => { const a = document.querySelector('${WATCHED_AGE_SELECTOR}'); return a ? a.textContent : null; })()`,
+  );
+  if (watchedLabelText === null) {
+    throw new Error(`watched age label not found: no element matches "${WATCHED_AGE_SELECTOR}"`);
+  }
+  out.watchedLabelInitialText = watchedLabelText;
 
   // F2: the rail's avatar <img> is reconciled in place, not torn down, across an ordinary redraw
   // (scoped to #c2-rail: the lead block in the stream has its own, already-reconciled, avatar)
@@ -252,12 +277,14 @@ try {
     window.__thread = document.querySelector('.c2-thread');
     window.__thread.scrollTop = 250;
     ${sabotageScrollScript}
-    return document.querySelector('.c2-age').textContent;
+    return document.querySelector('${WATCHED_AGE_SELECTOR}').textContent;
   })()`);
   out.firstRedrawWaitMs = (await waitForAgeChange(ageAtScroll)).elapsedMs;
   out.afterRedraw = await measure();
   out.threadKept = await evaluate('window.__thread === document.querySelector(".c2-thread") && window.__thread.isConnected');
-  out.redrawHappened = await evaluate(`(() => { const a = document.querySelector('.c2-age'); return a ? a.textContent : null; })()`);
+  out.redrawHappened = await evaluate(
+    `(() => { const a = document.querySelector('${WATCHED_AGE_SELECTOR}'); return a ? a.textContent : null; })()`,
+  );
   out.railImageKept = await evaluate('window.__avatar === document.querySelector("#c2-rail .c2-avatar-img") && window.__avatar.isConnected');
 
   // F2: focus a Later button, let redraws happen, focus must stay put on the same element - again
@@ -268,7 +295,7 @@ try {
     const b = document.querySelector('.c2-later');
     window.__later = b;
     b.focus();
-    return document.querySelector('.c2-age').textContent;
+    return document.querySelector('${WATCHED_AGE_SELECTOR}').textContent;
   })()`);
   const secondRedrawWait = await waitForAgeChange(ageBefore);
   out.secondRedrawWaitMs = secondRedrawWait.elapsedMs;

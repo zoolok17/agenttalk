@@ -133,9 +133,26 @@ def _handler(started: float):
             elif path == "/api/state":
                 self._send(json.dumps(_state(now, grown)).encode(), "application/json", web._DEFAULT_CSP)
             elif path == "/api/attention":
-                items = [{"id": f"card-{n}", "source": "escalation", "source_label": "ESCALATION", "severity": "high",
-                          "title": f"Question {n}", "agent": None, "detail": "why it matters",
-                          "age_seconds": 900 + 100 * n + grown, "human_can_unblock_now": True} for n in (1, 2)]
+                # Both cards now start near zero (not ~1000s+, as before): a card's rendered age
+                # label crosses from "Nm" to hour ("Nh") granularity at 3600 simulated seconds,
+                # which this fixture's own 60x-accelerated `grown` reaches from a near-zero base
+                # about a real MINUTE after the server starts - comfortably longer than this
+                # check's own total run time on any realistic runner, however slow. From ~1000s+,
+                # that margin was only ~40 real seconds, which is exactly what a real CI runner
+                # exceeded (fix). card-2 is kept SLIGHTLY older (oldest-first queue order, "card-2
+                # then card-1" - unchanged) so it is still the SURVIVING card once the M4b/R2/R3
+                # key-path steps below defer the other one away; console2_browser_check.mjs
+                # watches THIS card specifically, by its own stable data-c2-card key, never "the
+                # first .c2-age" (which is what a real CI runner's queue/render order handed it,
+                # non-deterministically, before this fix).
+                items = [
+                    {"id": "card-1", "source": "escalation", "source_label": "ESCALATION", "severity": "high",
+                     "title": "Question 1", "agent": None, "detail": "why it matters",
+                     "age_seconds": grown, "human_can_unblock_now": True},
+                    {"id": "card-2", "source": "escalation", "source_label": "ESCALATION", "severity": "high",
+                     "title": "Question 2", "agent": None, "detail": "why it matters",
+                     "age_seconds": 50 + grown, "human_can_unblock_now": True},
+                ]
                 self._send(json.dumps({"target_root_project_id": PROJECT, "items": items}).encode(),
                            "application/json", web._DEFAULT_CSP)
             elif path == "/api/lead-chat":
