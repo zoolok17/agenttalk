@@ -1095,3 +1095,61 @@ reviewer-found gap) - all three new tests correctly went red. Full run: `console
 `test_console2_web.py` 56 passed/3 skipped, `test_console2_browser.py`,
 `test_console2_health_writer.py`, `test_health_last_known.py` all green (75 passed/3 skipped total).
 `node --check` clean.
+
+## 27. CI fix record (real-browser check on linux/macos, CodeQL py/bad-tag-filter)
+
+PR #214's dev-gate first ran the console suite on CI's linux and macos legs (this branch had only
+ever been exercised locally, on Windows) and failed one test on all three of linux/3.10, linux/3.11
+and macos/3.11: `test_console2_browser.py::test_thread_scroll_and_focus_survive_redraws_in_a_real_
+browser` - the Chromium-family browser the check found could not start at all, and separately CodeQL
+flagged `py/bad-tag-filter` again on the case-insensitive-script-tag negative-control test added for
+the previous fix (section 26's own predecessor kept the OLD, flagged regex "for the record"; CodeQL
+correctly does not care that it was dead code by intent).
+
+Both were fixed (commits `73c52e8`, `a190b33`, `45c8bcc`, `24617f6`, arriving on this branch via a
+`master` merge - a second seat's fix, landed and verified independently in this turn rather than
+duplicated):
+
+- **Real-browser check, linux/macos.** The launch flags (`--headless=new`, `--disable-gpu`, etc.)
+  were written and only ever exercised against Edge on Windows; the SAME flags leave a
+  containerized, often-effectively-root linux CI runner's Chromium unable to start at all (no
+  sandbox, a small `/dev/shm`) - macOS needs neither workaround, since it is not containerized.
+  Fixed with `_browser_launch_flags(system)` in `test_console2_browser.py` - a PURE function
+  (never queries `platform.system()` itself; the caller passes it in) that returns
+  `--no-sandbox --disable-dev-shm-usage` in addition to the common flags only for `"Linux"` - so
+  every branch is exercisable and tested from any host, including this Windows one, where the
+  linux/macos legs themselves cannot be run locally. `console2_browser_check.mjs` now accepts the
+  flags as a JSON argument (empty means none, for manual debugging with a visible window), captures
+  the launched browser's own stderr, and waits for the DevTools endpoint with a bounded retry (30s)
+  instead of a short fixed one - surfacing that stderr in the thrown error (and so in
+  `result.stderr`) if the browser process exits before the endpoint ever comes up. A browser binary
+  that exists but fails to start is therefore a hard test FAILURE (`assert result.returncode == 0,
+  result.stderr`), never a skip; the ONLY skip is "no Chromium-family browser on this runner" (or no
+  node), when `_find_browser()` finds nothing at all. Test:
+  `test_browser_launch_flags_are_correct_per_platform` runs unconditionally (no browser or node
+  required) and is the part of this fix actually verified locally on this Windows worktree - the
+  real launch on linux/macos CI itself is not, and is said so here honestly; CI is the proof for
+  those two legs.
+  - Two further, related hardening fixes landed alongside this one on the same branch (not part of
+    this work order, but touching the same files, so recorded here too): the redraw-wait was
+    changed from a fixed sleep to polling for the actual observed age-label change (bounded, so a
+    real stall still fails fast, never silently drops through on a slow runner); and the watched
+    age label is now a SPECIFIC card selected by its own stable `data-c2-card` key rather than "the
+    first `.c2-age`" (whose DOM/queue order is not guaranteed stable run to run, and whose label can
+    go a full simulated hour without changing at hour-scale granularity - both a real source of the
+    CI stalls this fix set out to close).
+- **CodeQL `py/bad-tag-filter`, again.** The negative-control test added for the html.parser-based
+  script-tag check (section 26's predecessor) kept the very regex CodeQL had already flagged, "for
+  the record" (to document what it used to miss). CodeQL does not distinguish "flagged code kept as
+  a demonstration" from a live check; the fix is simply to remove it. The `html.parser`-based check
+  and its negative controls (`<SCRIPT>x</SCRIPT>`, `<ScRiPt >x</ScRiPt >`) are the whole of the
+  evidence now; no regex tag-matcher remains anywhere in the file.
+
+Verification this turn: pulled `origin/feat/console-v2-pitch` (fast-forwarded through the merge
+carrying these commits), then ran both files locally rather than assuming the merged commits were
+correct: `test_console2_web.py` 58 passed/2 skipped, `test_console2_browser.py` 3 passed (this
+Windows worktree does have a Chromium-family browser, so all three - including the two negative
+controls - actually ran, not merely skipped). Full node suite (`console2_model`/`console2_render`/
+`console2_stream`/`console2_data`/`console2_view`) unaffected, all still green. `node --check` clean
+on `console2_browser_check.mjs`. Nothing further to commit for the fix itself (already on the
+branch); this section is the step-doc record the work order asked for.
