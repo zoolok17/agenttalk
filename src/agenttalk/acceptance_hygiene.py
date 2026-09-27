@@ -30,6 +30,9 @@ def final_manifest(store, route, reconciliation):
         digests.update(approval["reduction"]["evidence"])
     digests.update(a["sha256"] for a in initial["delivery_manifest"])
     digests.update(route[k] for k in ("plan_hash", "registry_hash", "bundle_hash", "cold_commit_hash"))
+    if A.schema(route["schema_version"]).preflight:
+        from agenttalk import acceptance_staging
+        digests.update(acceptance_staging.evidence(store, close.load_close(store, bundle["close_id"])))
     from agenttalk import acceptance_obligations
     digests.update(acceptance_obligations.evidence(store, route))
     # Parent/amendment records are part of the final evidence set as well.
@@ -37,8 +40,11 @@ def final_manifest(store, route, reconciliation):
     if route.get("parent_record_hash"):
         digests.update(route[k] for k in ("parent_record_hash", "amendment_hash"))
         parent = A.decode(A._retained(store, route["parent_record_hash"]))
-        for _, old_route, _ in acceptance_audit.lineage(store, parent):
+        for old_record, old_route, _ in acceptance_audit.lineage(store, parent):
             digests.update(v for k, v in old_route.items() if k.endswith("_hash") and v)
+            if A.schema(old_route["schema_version"]).preflight:
+                from agenttalk import acceptance_staging
+                digests.update(acceptance_staging.evidence(store, old_record))
             if old_route.get("bundle_hash"):
                 old_bundle = A.decode(A._retained(store, old_route["bundle_hash"]))
                 digests.update(a["sha256"] for a in old_bundle["artifacts"])

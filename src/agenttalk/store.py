@@ -1318,6 +1318,9 @@ class Store:
                 validate_trust_classes(cfg["trust_classes"], agents)
             except ValueError as e:
                 raise ValueError(f"corrupt config at {self.config_path}: {e}.") from e
+        from agenttalk import work_tags
+        work_tags.validate_vendor_config(cfg.get("model_vendor", {}), agents)
+
         # Identity registry tombstones (0.16.0, #19 Phase A). Absent OR null ⇒
         # no retirements (full 0.15.0 behavior). Validated fail-closed so a
         # corrupt registry can't alias an active name or smuggle an unsafe one.
@@ -2409,6 +2412,7 @@ class Store:
                 cfg["avatars"].pop(name, None)
             if isinstance(cfg.get("trust_classes"), dict):
                 cfg["trust_classes"].pop(name, None)
+            cfg.get("model_vendor", {}).pop(name, None)
             if was_external:
                 retired = cfg.get("retired")
                 if not isinstance(retired, list):
@@ -2445,6 +2449,22 @@ class Store:
                 values[name] = trust_class
             validate_trust_classes(values, roster)
             self._assert_external_worker_authority_safe(cfg)
+            self._write_config(cfg)
+        return cfg
+
+    def set_model_vendor(self, name: str, vendor: str | None) -> dict:
+        """Local operator assertion, independent of launcher/CLI transport."""
+        from agenttalk import work_tags
+        with self._config_lock():
+            cfg = self.load_config()
+            if name not in cfg["agents"]:
+                raise ValueError("model_vendor agent must be in the active roster")
+            mapping = cfg.setdefault("model_vendor", {})
+            if vendor is None:
+                mapping.pop(name, None)
+            else:
+                mapping[name] = vendor
+            work_tags.validate_vendor_config(mapping, cfg["agents"])
             self._write_config(cfg)
         return cfg
 
@@ -2858,6 +2878,7 @@ class Store:
         trust_classes = cfg.get("trust_classes")
         if isinstance(trust_classes, dict):
             trust_classes.pop(name, None)
+        cfg.get("model_vendor", {}).pop(name, None)
 
     def set_avatar(self, name: str, avatar_id: str) -> dict:
         """Set an active roster member's display-avatar preference."""
@@ -2984,6 +3005,7 @@ class Store:
             was_liaison = cfg.get("operator_facing") == old
             old_managed = (cfg.get("managed_lead_loop") or {}).get(old)
             old_trust_class = (cfg.get("trust_classes") or {}).get(old)
+            old_vendor = cfg.get("model_vendor", {}).get(old)
             avatars = cfg.get("avatars")
             old_avatar = avatars.get(old) if isinstance(avatars, dict) else None
             # Retire old -> tombstone(renamed_to=new), then activate new + carryover.
@@ -3018,6 +3040,8 @@ class Store:
                 self._cfg_dict(cfg, "managed_lead_loop")[new] = old_managed
             if old_trust_class is not None:
                 self._cfg_dict(cfg, "trust_classes")[new] = old_trust_class
+            if old_vendor is not None:
+                cfg["model_vendor"][new] = old_vendor
             avatar_id = _avatars.normalize_avatar_id(old_avatar)
             if avatar_id is not None:
                 self._cfg_dict(cfg, "avatars")[new] = avatar_id
@@ -3267,6 +3291,7 @@ class Store:
         sign: bool | None = None,
         _allow_reserved_sender: bool = False,
         _config_locked: bool = False,
+        _dispatch_vendors: dict | None = None,
     ) -> Message:
         if not self.initialized():
             raise FileNotFoundError("agenttalk not initialized; run `agenttalk init`.")
@@ -3287,6 +3312,7 @@ class Store:
                     sign=sign,
                     _allow_reserved_sender=_allow_reserved_sender,
                     _config_locked=True,
+                    _dispatch_vendors=_dispatch_vendors,
                 )
         config_before = os.stat(self.config_path)
         cfg = self.load_config()
@@ -3358,6 +3384,15 @@ class Store:
             meta["authorized_liaisons"] = sorted(authorized)
         from agenttalk import work_tags
         meta = work_tags.normalize(self, sender, recipient, kind, meta)
+        if kind in work_tags.OPENERS:
+            if _dispatch_vendors is None:
+                vendors = work_tags.vendor_snapshot(cfg, [recipient])
+            else:
+                recipients = meta.get("audience_resolved", recipient).split(",")
+                if recipient not in recipients:
+                    raise ValueError("dispatch recipient is missing from frozen audience")
+                vendors = work_tags.validate_vendor_map(_dispatch_vendors, recipients)
+            meta["assignee_model_vendors"] = vendors
         _gates.validate_response_status(kind, meta)
         if kind in OPENER_KINDS and "epoch_at_send" not in meta:
             meta["epoch_at_send"] = self.current_epoch()
@@ -3788,7 +3823,7 @@ class Store:
     # --------------------------------------------------------------- reading
 
     def _scan_messages_with_paths(
-        self, *, since_id: str | None = None,
+        self, *, since_id: str | None = None, checkpoint=None, paths=None, compacted=False,
     ) -> tuple[list[tuple[Message, Path]], list[tuple[Path, str, str]]]:
         """The canonical disk walk, keeping each verdict paired with ITS file.
 
@@ -3810,13 +3845,18 @@ class Store:
         never deliver. It is NOT sound for tamper visibility, so the
         invalid report / quarantine callers MUST NOT pass ``since_id``
         (they keep full-scanning). ``None`` = full scan (current behavior).
+        Snapshot refreshes supply changed ``paths``; ``compacted`` additionally
+        accepts the collision suffix emitted by archive_messages_below. Delivery
+        never sets either option and never discovers archived envelopes.
         """
         valid: list[tuple[Message, Path]] = []
         invalid: list[tuple[Path, str, str]] = []
-        if not self.messages_dir.exists():
+        if paths is None and not self.messages_dir.exists():
             return valid, invalid
-        for p in sorted(self.messages_dir.iterdir()):
-            if p.suffix != ".json":
+        for p in sorted(self.messages_dir.iterdir() if paths is None else paths):
+            if checkpoint is not None:
+                checkpoint()
+            if not compacted and p.suffix != ".json":
                 continue
             # Fast skip BEFORE any read/parse: stem == id is enforced just
             # below for delivered files, and ids sort lexically, so a stem
@@ -3825,6 +3865,11 @@ class Store:
                 continue
             try:
                 text = p.read_text(encoding="utf-8")
+            except UnicodeError as e:
+                if not compacted:
+                    raise  # preserve active scanner's existing failure shape
+                invalid.append((p, p.stem, f"invalid encoding: {e}"))
+                continue
             except OSError as e:
                 invalid.append((p, p.stem, f"cannot read file: {e}"))
                 continue
@@ -3841,7 +3886,14 @@ class Store:
                     ident = p.stem
                 invalid.append((p, ident, str(e)))
                 continue
-            if p.stem != msg.id:
+            filename_ok = p.name == f"{msg.id}.json"
+            if compacted and not filename_ok:
+                # archive_messages_below appends _now_iso().replace(':', '-').
+                filename_ok = re.fullmatch(
+                    re.escape(msg.id) + r"\.json\.\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{6}Z",
+                    p.name,
+                ) is not None
+            if not filename_ok:
                 # The file name must equal the embedded id — send() is the
                 # only writer and always names files <id>.json. A mismatch is
                 # a forged/corrupt/renamed file: a low-sorting name carrying a

@@ -49,6 +49,14 @@ def _serve(store: Store, *, host: str = "127.0.0.1", enable_actions: bool = Fals
     return web.serve_in_thread(store, host=host, port=0, enable_actions=enable_actions)
 
 
+def _refresh_envelopes(server):
+    # Advance the worker clock, not wall time, after a fixture changes the bus.
+    for snapshot in server.envelope_snapshots.values():
+        now = snapshot.clock() + 5
+        snapshot.clock = lambda now=now: now
+        assert snapshot.refresh()
+
+
 def _urlopen(target, *, timeout: float = 5.0, _attempts: int = 4, _backoff: float = 0.05):
     """``urllib.request.urlopen`` with a bounded retry on TRANSIENT connection errors.
 
@@ -1095,6 +1103,7 @@ def test_api_state_epoch_status_three_state(tmp_path: Path) -> None:
         # post-barrier opener stamps the live epoch
         s.send(sender="alpha", recipient="beta", kind="question",
                subject="post-barrier", body="y", meta={"request_id": "q-new"})
+        _refresh_envelopes(srv)
         root = state_root(base)
         assert root["epoch"] == cur
         by_rid = {r["request_id"]: r for r in root["threads"]}
@@ -1124,6 +1133,7 @@ def test_api_state_thread_dedup_ball_holder(tmp_path: Path) -> None:
         s.send(sender="beta", recipient="alpha", kind="review-result",
                subject="done", body="lgtm",
                meta={"request_id": "rid-1", "status": "approved"})
+        _refresh_envelopes(srv)
         (root,) = _state(base)["roots"]
         assert len(root["threads"]) == 1
         row = root["threads"][0]
@@ -1653,6 +1663,7 @@ def test_api_state_corrupt_root_isolated(tmp_path: Path) -> None:
         assert "edges" not in roots[1]
         # recovery without a server restart (research D4)
         cfg_path.write_text(original, encoding="utf-8")
+        _refresh_envelopes(srv)
         roots = _state(base)["roots"]
         assert roots[1]["errors"] == []
         assert {ag["name"] for ag in roots[1]["agents"]} == {"lead", "dev"}
@@ -5837,6 +5848,7 @@ def test_api_state_thread_verdict_and_active_review(tmp_path: Path) -> None:
         s.send(sender="beta", recipient="alpha", kind="review-result",
                subject="done", body="lgtm",
                meta={"request_id": "rid-v", "status": "approved"})
+        _refresh_envelopes(srv)
         (root,) = _state(base)["roots"]
         row = next(r for r in root["threads"] if r["request_id"] == "rid-v")
         assert row["verdict"] == "approved"
@@ -6879,8 +6891,9 @@ def test_api_attention_actions_off_escalation_shape_is_legacy_fixture(
         item = next(it for it in payload["items"] if it["source"] == "escalation")
         assert set(item) == {
             "id", "source", "source_label", "severity", "title", "agent",
-            "detail", "age_seconds", "human_can_unblock_now",
+            "detail", "age_seconds", "human_can_unblock_now", "source_refs",
         }
+        assert item["source_refs"] == [{"kind": "message", "request_id": "esc-help"}]
         assert item["title"] == "Choose release path"
         assert item["source_label"] == "ESCALATION"
         assert "body must not leak" not in raw.decode("utf-8")

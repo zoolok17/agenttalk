@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep the fresh last-known-good dashboard view during snapshot scan races and
+  schedule a bounded prompt retry; config mismatch and stale data still refuse.
+
+- Recheck current task authority and reader compatibility when resuming a partial
+  task broadcast; a prior dispatch no longer authorizes a demoted sender to resume.
+
+## [0.93.0] - 2026-09-27
+
+Theme: **challenge major work before it starts, and run acceptance on a pinned,
+offline-checked tool registry.**
+
 ### Added
 
 - Add the pure work-board reducer: validated envelopes become work items placed by
@@ -17,6 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Adversarial hardening keeps needs-info HOLDs, follows explicit replacement chains,
   compares whole repository/check policies and degrades malformed or partial history
   to a per-item Unknown instead of a false Ready.
+
+- Discover all compacted work evidence through the shared snapshot, caching validated
+  facts across polls and keeping active state available while archive coverage builds or degrades.
+
+- Share validated active envelopes across dashboard polls through a per-root
+  worker snapshot, with generation checks and a cross-partition selected-work budget.
+
+- Configure model vendors independently of CLI transport; freeze per-recipient
+  vendor maps on work dispatches and link escalations to exact work items/cycles.
 
 - Validate and inherit external work declarations, reserve publisher-owned vendor
   metadata, and align both lead skills with the finalized work-board contract.
@@ -43,6 +65,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `challenge=true` question (a body-only draft cannot carry the verdict
   meta) and is prompted for the typed CLI verdict instead.
 
+- Refuse acceptance command tokens that contain staged-pin locators; document
+  environment approval for added toolchains/services and fresh approvals for
+  descendants of amended coverage. Strengthen policy and file-race regressions.
+
+- Bind protected acceptance coverage to the planned environment and each row's
+  override. Permit safe identical-byte pin relocation without an amendment, and
+  classify regular-file identity races as retryable preflight unavailability.
+
+- Require exact LD2 approval for replacements within a protected acceptance
+  registry entry's transitive definition. Fold preflight failures by row policy
+  while keeping integrity, unsafe paths, stale bindings and offline violations
+  mandatory. Avoid staged reads for explicit HOLD and repeated publication.
+
+- Add isolated acceptance increment-2 strict registry/environment/proof record
+  readers and bounded declarative-input validation. See
+  `docs/STEP-ACCEPTANCE-INC2.md` for limits and retention decisions.
+- Tighten increment-2 staged-input records with per-toolchain/service banner
+  pins, explicit environment entry references, and expiring manifests for large
+  distribution pins. Reject portable path collisions and additional reserved
+  names; bound refusal diagnostics and verify file identity before reading.
+- Add read-only `close acceptance preflight` to check staged distribution and
+  declarative pins, snapshot expiry, exact environment/banner observations and
+  offline proof. Report per-entry outcomes without fetching or launching tools,
+  creating a close, or exposing private cache locators.
+- Make preflight loopback classification consistent across Python versions,
+  distinguish recipe evidence from external-denial requirements, report public
+  pin references and accurate refusal/failure statuses, and stop distribution
+  reads at the declared size plus one byte.
+- Centralize acceptance schema dispatch with unknown-version refusal. Schema-4
+  `close open --cache-root` freezes the registry, environment and bound staging
+  report; `close acceptance attach` recomputes bound observation/proof evidence.
+  Retain bounded declarative inputs while leaving distribution binaries pinned
+  in the operator's cache. Private cache locators stay out of public snapshots.
+- Re-evaluate schema-4 prerequisites at check and publication, hash distributions
+  before the shared lock and recheck file identity inside it. Seal retained
+  inputs, preserve them across recovery, and support schema-4 successors with
+  protected registry requirements. Historical binaries remain digest-pinned,
+  visibly not retained. Add a synthetic Java staging walkthrough.
+
 ### Changed
 
 - Reduce acceptance Git process overhead with command-local metadata/history
@@ -50,6 +111,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Live HEAD/dirty checks and retained-evidence validation remain in place.
   Disable automatic Git maintenance before template commits so repository
   copies cannot race with detached maintenance; limit CLI caching to `close`.
+
+### Fixed
+
+- Share one cache-root syntax check across acceptance preflight, close open and stored routes (including parent-traversal refusal), clarify renewal and template-path policy, document the example's expiry, and refuse missing ack bindings cleanly.
 
 ## [0.92.0] - 2026-09-25
 
