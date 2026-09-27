@@ -515,3 +515,53 @@ under 9 minutes):
 - Ruff and Bandit are clean; `git diff --check` is clean.
 - Size over `b55ee63`: `work_board.py` +120/-53, `work_tags.py` +40/-16
   (extraction), tests +217.
+
+### Reducer fix round 6 — N16, a qualified Done keeps every unresolved obligation
+
+Base `ad7c5da`. Codex developer-4's final read, under the stopping rule, closed
+N13-N15. It accepted the structural audit and the seven-point residual as
+written. One realistic MAJOR remained. It violated residual point 6.
+
+- **N16.** The sequence is fully publication-accepted, with dispatches first: a
+  build with `no_gates_reason`; two independent reviews pinned to head A;
+  build done/done; R1 done/GO; R2 done with no verdict (published with
+  `verdict_issue` "verdict missing").
+- Without integration the item was Unknown, "verdict missing" (correct). With
+  the true merge fact it was a clean Done with no issues.
+- The cause: row 3 asked only whether *some* independent GO existed and whether a
+  review was still outstanding. The Ready blockers were never consulted.
+- **Fix:** row 3 now reuses the same `_blockers` list that gates Ready.
+  - The specific phrases stay: "merged with open FIX/HOLD", "integrated without
+    independent GO", "integrated without a recorded deliverable", "integrated
+    with review outstanding", "integrated with failed required checks".
+  - Any other blocker yields "integrated; <blocker>", e.g. "integrated; verdict
+    missing" or "integrated; declined review without replacement".
+  - Every blocker reason joins `issues`, and its evidence joins `evidence`.
+  - By construction, **a clean Done is exactly an integrated Ready**.
+- Regression: `test_n16_integration_keeps_every_unresolved_obligation_explicit`.
+  It covers the two-review missing-verdict sequence with and without
+  integration, dev-4's two related controls (an unreplaced declined second
+  review, a second builder with no verdict), and a pending second review.
+- Property B now asserts that equivalence on every one of its 5,700 damaged
+  histories. For each, the set of clean-Done items with the merge fact equals
+  the set of Ready items without it. That was 715 matched pairs, with no
+  mismatch. The never-raises and rejected-never-certifies counts are unchanged
+  (5,700 / 3,654).
+
+Executed (foreground, `PYTHONPATH=<worktree>/src`, `python -B`, no bytecode,
+task-scratch TEMP/TMP/basetemps, `-q -p no:cacheprovider`, each command well
+under 9 minutes):
+
+- Failing first: **2 failed**. These were the N16 regression and property B,
+  which found clean Done without Ready on damaged histories.
+- Final: `tests/test_work_board_reducer.py` **62 passed**.
+  - With `test_work_tags.py`, `test_threads.py` and `test_reply_draft_delivery.py`:
+    **260 passed** on Python 3.14.6.
+  - The same set without threads: **186 passed** on Python 3.10.11.
+- Mutation (committed first, restored through git, bytecode-free): **83/83
+  killed**, including 3 round-6 mutants. The one first-pass survivor was the
+  now-redundant "integrated with review outstanding" phrase. It was still
+  qualified through the generic path; a direct case now pins the clearer phrase.
+- Ruff and Bandit are clean; `git diff --check` is clean.
+- Size over `ad7c5da`: `work_board.py` +8/-6, tests +60/-12.
+- The residual (round 5) is unchanged. Point 6 now holds by construction.

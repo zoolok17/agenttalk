@@ -499,12 +499,14 @@ def _place(slug, valid, cur, by_rid, successor, surviving, policy, facts, item):
                 pending = head is not r and any(x["state"] == "outstanding" for x in head["obligations"])
                 (awaiting if pending else unresolved).append((verdict, reply))
     open_marks = unresolved + awaiting
+    blockers = _blockers(cur, obs, execs, surviving, successor, candidate, heads, builders,
+                         open_marks, descends_from_design, policy)
     if candidate and facts["integrated"].get((slug, candidate)) and not any(
             o["state"] == "outstanding" for o in execs):
+        # Integration adds Done, never cleanliness: every obligation that would block Ready stays explicit,
+        # so a clean Done is exactly an integrated Ready (design row 3; residual point 6).
         independent = any(o["verdict"] == "GO" and o["head"] == candidate and o["recipient"] not in builders
                           for r in surviving for o in _live(r))
-        # Missing review or check evidence stays explicit on Done.
-        problem = policy["problem"]
         pending_review = any(o["state"] == "outstanding" for r in reviews for o in r["obligations"])
         delivered = any(r["external"] for r in cur) or any(
             o["state"] == "done" and o["verdict"] == "done" for r in cur
@@ -513,8 +515,10 @@ def _place(slug, valid, cur, by_rid, successor, surviving, policy, facts, item):
                   else "integrated without a recorded deliverable" if not delivered
                   else "integrated with review outstanding" if pending_review
                   else "integrated with failed required checks" if item["checks"] == "required checks failed"
-                  else "integrated; " + problem[0] if problem else "integrated in configured target")
-        return 3, "done", reason, [reply for _, reply in open_marks] or [i for r in surviving for i in r["openers"]]
+                  else "integrated; " + blockers[0][0] if blockers else "integrated in configured target")
+        item["issues"] += sorted({why for why, _ in blockers} - set(item["issues"]))
+        evidence = [reply for _, reply in open_marks] or [i for r in surviving for i in r["openers"]]
+        return 3, "done", reason, evidence + [i for _, ids in blockers for i in ids if i]
     active_fix = [o for o in execs if o["stage"] == "fix" and o["state"] == "outstanding"]
     if active_fix:
         state = "running" if any(o["running"] for o in active_fix) else (
@@ -534,8 +538,6 @@ def _place(slug, valid, cur, by_rid, successor, surviving, policy, facts, item):
                   else "independent review" if all(o["recipient"] not in builders for o in waiting)
                   else "unverified review")
         return 6, "independent_review", reason, [o["opener"] for o in waiting]
-    blockers = _blockers(cur, obs, execs, surviving, successor, candidate, heads, builders,
-                         open_marks, descends_from_design, policy)
     if not blockers:
         success = [o["reply"] for o in execs if o["verdict"] == "done"]
         gos = [o["reply"] for r in surviving for o in _live(r) if o["verdict"] == "GO"]

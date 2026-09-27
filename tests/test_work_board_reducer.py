@@ -1068,23 +1068,33 @@ def damages(bus):
                     yield bus.messages[:index] + [replace(message, meta=meta)] + bus.messages[index + 1:], reached
 
 
+def clean_done(item):
+    return item["workflow_column"] == "done" and item["reason"] == "integrated in configured target"
+
+
 def test_property_never_raises_and_rejected_history_never_certifies():
-    total = rejected = 0
+    total = rejected = equivalent = 0
     for bus in shapes():
         heads = {m.meta.get("work_head") for m in bus.messages if m.meta.get("work_head")}
-        for integrated in ({}, {(slug, head): True for slug in (ITEM, "other-item") for head in heads}):
-            for history, affected in damages(bus):
-                out = W.reduce(history, lead=LEAD, integrated=integrated)  # must never raise
-                total += 1
-                if publishable(history):
-                    continue  # realistic history: correctness is judged by the targeted tests, not here
-                rejected += 1
+        merge = {(slug, head): True for slug in (ITEM, "other-item") for head in heads}
+        for history, affected in damages(bus):
+            plain = W.reduce(history, lead=LEAD)  # must never raise
+            merged = W.reduce(history, lead=LEAD, integrated=merge)
+            total += 2
+            # Integration adds Done, never cleanliness: a clean Done is exactly an integrated Ready.
+            ready = {i["work_item"] for i in plain["items"] if i["workflow_column"] == "ready"}
+            done = {i["work_item"] for i in merged["items"] if clean_done(i)}
+            assert done == ready, (done, ready)
+            equivalent += len(done)
+            if publishable(history):
+                continue  # realistic history: correctness is judged by the targeted tests, not here
+            rejected += 2
+            for out in (plain, merged):
                 for item in out["items"]:
                     if item["work_item"] in affected:
-                        assert not (item["workflow_column"] == "ready" or (
-                            item["workflow_column"] == "done" and item["reason"] == "integrated in configured target")
-                                    ), (item["work_item"], item["reason"])
-    assert (total, rejected) == (5700, 3654)  # never raised on any; none of the 3,654 rejected certifies
+                        assert not (item["workflow_column"] == "ready" or clean_done(item)), (
+                            item["work_item"], item["reason"])
+    assert (total, rejected, equivalent) == (5700, 3654, 715)  # 715 clean Done == integrated Ready pairs
 
 
 def test_replayed_opener_invariants_reach_the_original_item():
@@ -1154,3 +1164,41 @@ def test_invalid_reply_status_is_evidence_not_silently_ignored():
                                                    "status": "maybe", "verdict": "done"}, raw=True)
     item = card(bus)
     assert item["row"] == 2 and odd.id in item["evidence"] and "status" in item["reason"]
+
+
+# ---- Round 6 (codex dev-4 final read, 2026-09-27): N16 ----
+
+def test_n16_integration_keeps_every_unresolved_obligation_explicit():
+    def history(second_review_status="done", second_build=False):
+        bus = Bus()  # dispatches first, as the reviewer published them
+        build = bus.task("tk-build", BUILDER, "build", **POLICY)
+        extra = bus.task("tk-build-b", BUILDER2, "build", **POLICY) if second_build else None
+        r1 = bus.task("tk-r1", REVIEWER, "read", work_head=HEAD)
+        r2 = bus.task("tk-r2", REVIEWER2, "read", work_head=HEAD)
+        bus.reply(build, verdict="done")
+        if extra is not None:
+            bus.reply(extra)  # completed without a verdict
+        bus.reply(r1, verdict="GO")
+        silent = bus.reply(r2, status=second_review_status, verdict="GO" if second_build else None)
+        return bus, silent
+
+    bus, silent = history()
+    assert silent.meta["verdict_issue"] == "verdict missing"
+    plain = card(bus)
+    assert (plain["workflow_column"], plain["reason"]) == ("unknown", "verdict missing")
+    merged = card(bus, integrated={(ITEM, HEAD): True})
+    assert (merged["workflow_column"], merged["reason"]) == ("done", "integrated; verdict missing")
+    assert "verdict missing" in merged["issues"] and silent.id in merged["evidence"]
+    declined, _ = history(second_review_status="declined")
+    item = card(declined, integrated={(ITEM, HEAD): True})
+    assert (item["workflow_column"], item["reason"]) == ("done", "integrated; declined review without replacement")
+    builders, _ = history(second_build=True)
+    item = card(builders, integrated={(ITEM, HEAD): True})
+    assert (item["workflow_column"], item["reason"]) == ("done", "integrated; verdict missing")
+    pending = Bus()  # one reviewer GO, the other still owes a verdict
+    built(pending)
+    pending.reply(pending.task("tk-r1", REVIEWER, "read", work_head=HEAD), verdict="GO")
+    pending.task("tk-r2", REVIEWER2, "read", work_head=HEAD)
+    item = card(pending, integrated={(ITEM, HEAD): True})
+    assert (item["workflow_column"], item["reason"]) == ("done", "integrated with review outstanding")
+    assert "pending execution or review" in item["issues"]
