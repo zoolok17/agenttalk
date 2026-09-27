@@ -1054,3 +1054,44 @@ always true -> the new test red). Full run: `console2_model` 17/17, `console2_re
 passed/3 skipped, `test_console2_browser.py`, `test_console2_health_writer.py`,
 `test_health_last_known.py` all green (75 passed/3 skipped total). `node --check` clean on both
 touched JS files.
+
+## 26. Console merge-gate delta record (F2 narrowed: every mode, not just quiet)
+
+The reviewer's delta read of `a814f50` closed F1 and F3 outright; F2 came back FIX, narrowed. The
+`needs-stale` branch added in section 25 only pre-empted the final `quiet` fallback in the
+mode/greeting chain - `deferred` and `calm` are checked EARLIER in that same `if`/`else if` chain, so
+either one still resolved (and rendered) before the staleness check was ever reached, unqualified.
+Reproduced through the real scripts on the ordinary two-team polling schedule (switch to team B at
+t=9s while its attention refresh is genuinely pending, past the 8s freshness limit, within its own 5s
+timeout): a quiet-but-watched candidate (a reply since waking, so no stuck card) rendered "Nothing
+needs you right now. <name> has been quiet for a while..." with no staleness notice at all, and a
+locally-deferred attention card rendered "Nothing new needs you. 1 item is deferred..." - also with no
+notice. Both are "nothing new/current" claims a stale, still-pending attention read cannot back.
+
+Fixed by moving the staleness check OUT of the mode-selection chain entirely: `quiet`/`calm`/`deferred`
+are still chosen exactly as before (their sub-text keeps the idle count, the candidate's health
+context, or the deferred count - none of that changes), and only AFTER that selection, if the
+attention cache backing it is stale, the mode is re-labelled `needs-stale` and the greeting is
+re-composed: the headline becomes "Can't confirm nothing needs you." (quiet) or "Can't confirm nothing
+new needs you." (calm/deferred), with the reason - "The attention read has not refreshed for Xs;
+showing the last known result, not confirmed current." - appended to whatever sub-text was already
+there, never replacing it. `busy`/`answered` are untouched: they never assert an absence of work, so
+there is nothing to qualify. `offline`/`needs-unavailable`/`loading` are also untouched - they already
+say the read cannot be trusted, in their own words.
+
+Tests: `console2_view.test.mjs` +1, reproducing both the calm case (a quiet-but-replied-to candidate,
+matching the reviewer's exact health shape) and the deferred case (one locally-deferred attention
+card) as direct model calls, asserting the health/candidate name and the deferred count both survive
+into the qualified sub-text. `console2_data.test.mjs` +2, reproducing both through the real scripts on
+the ordinary two-team polling schedule per the work order, matching the reviewer's own timing (switch
+at t=9s, attention left genuinely pending past 8s, still within the 5s request timeout - not merely a
+fixture standing in for the sequence).
+
+Red-then-green: all three new tests confirmed RED against the pre-delta file (`git show
+a814f50:src/agenttalk/web_static/console2-model.js`, swapped onto disk) and GREEN against the fix.
+Mutation-tested the qualifier's mode check (narrowed back to `'quiet'` only, reproducing the exact
+reviewer-found gap) - all three new tests correctly went red. Full run: `console2_model` 17/17,
+`console2_render` 31/31, `console2_stream` 59/59, `console2_data` 48/48, `console2_view` 95/95;
+`test_console2_web.py` 56 passed/3 skipped, `test_console2_browser.py`,
+`test_console2_health_writer.py`, `test_health_last_known.py` all green (75 passed/3 skipped total).
+`node --check` clean.

@@ -735,10 +735,6 @@
             : 'Everything below is greyed and stamped as of ' + x.asOf + '. Nothing is live until an agent writes again.' };
       case 'needs-unavailable':
         return { text: 'Can’t read what needs you.', sub: 'The attention feed failed. The roster below is still live.' };
-      case 'needs-stale':
-        return { text: 'Can’t confirm nothing needs you.',
-          sub: 'The attention read has not refreshed for ' + fmtAge(x.ageSeconds) +
-            '; showing the last known result, not a current all-clear.' };
       case 'busy':
         return { text: needsWord(x.n) + (x.n === 1 ? ' thing needs you.' : ' things need you.'),
           sub: 'Stuck agents first, then oldest. A deadline only shows if someone set one.' };
@@ -1003,15 +999,21 @@
     } else if (candidates.length) {
       view.mode = 'calm';
       view.greeting = greetingFor('calm', { what: candidates[0].short + ' has been quiet for a while; the evidence does not show a stall, so it is only being watched.' });
-    } else if (att && view.needs.stale) {
-      // F2 (final sweep): an aged (or failed-then-recovered-to-stale) attention cache with nothing
-      // OPEN in it is not the same thing as a confirmed all-clear - "All quiet" is a claim this read
-      // cannot back. Say the read hasn't refreshed, with its age, and keep whatever was last known.
-      view.mode = 'needs-stale';
-      view.greeting = greetingFor('needs-stale', { ageSeconds: Math.max(0, (nowMs - attentionAsOf) / 1000) });
     } else {
       view.mode = 'quiet';
       view.greeting = greetingFor('quiet', { idle: idle, total: rows.length });
+    }
+    // F2 (narrowed): a stale attention cache qualifies EVERY feed-derived "nothing new/current"
+    // claim - idle, calm and deferred alike, not just the emptiest (quiet) case. Health context and
+    // the deferral stay exactly as computed above (the sub-text is kept, not dropped); only the
+    // headline claim of certainty is replaced, and the reason - with its age - is appended.
+    if (att && view.needs.stale && (view.mode === 'quiet' || view.mode === 'calm' || view.mode === 'deferred')) {
+      var attentionAge = Math.max(0, (nowMs - attentionAsOf) / 1000);
+      var qualifiedText = view.mode === 'quiet' ? 'Can’t confirm nothing needs you.' : 'Can’t confirm nothing new needs you.';
+      var staleNote = 'The attention read has not refreshed for ' + fmtAge(attentionAge) +
+        '; showing the last known result, not confirmed current.';
+      view.greeting = { text: qualifiedText, sub: view.greeting.sub ? view.greeting.sub + ' ' + staleNote : staleNote };
+      view.mode = 'needs-stale';
     }
     view.stale = offline || view.needs.stale;
     // The composer. This slice is read-only, so it is always disabled, and says why (the first

@@ -656,6 +656,34 @@ test('F2 (final sweep): a stale, EMPTY attention cache must not claim an unquali
   assert.match(stale.greeting.text + ' ' + stale.greeting.sub, /not refresh|last known|can.t confirm/i);
 });
 
+test('F2 (narrowed): a stale attention cache qualifies calm and deferred modes too, never just quiet', () => {
+  const idleRoot = () => root({ agents: [
+    agent('claude-agenttalk-lead', { state: 'idle_waiting', since: 3000 }),
+    agent('codex-agenttalk-developer-4', { state: 'working_silent', since: 1200, progress: 900 }),
+  ], operator_facing: 'claude-agenttalk-lead', recent: [env('codex-agenttalk-developer-4', 'operator', 'task-response', 100)] });
+
+  // CALM: dev-4 replied since waking (reply.replied === true), so despite 900s of no progress it is
+  // a watched candidate, not a stuck card - exactly the reviewer's reproduction (case 1).
+  const calmStale = M.buildTeamView({ nowMs: NOW, generatedMs: NOW, root: idleRoot(),
+    attention: attention([], { asOfMs: NOW - 9000 }), chat: null, conn: CONN_OK, ui: {}, tz: TZ });
+  assert.equal(calmStale.needs.stale, true);
+  assert.equal(calmStale.mode, 'needs-stale', 'calm must not be reported as a confirmed all-clear when attention is stale');
+  assert.match(calmStale.greeting.text, /Can.t confirm/);
+  assert.match(calmStale.greeting.sub, /dev-4/, 'the health/candidate context is kept, not dropped');
+  assert.match(calmStale.greeting.sub, /not refresh|not confirmed current/);
+
+  // DEFERRED: one attention card, locally deferred with Later - exactly the reviewer's case 2.
+  const item = escalation({ id: 'e1' });
+  const deferredUi = { deferred: { e1: NOW - 1000 } };
+  const deferredStale = M.buildTeamView({ nowMs: NOW, generatedMs: NOW, root: idleRoot(),
+    attention: attention([item], { asOfMs: NOW - 9000 }), chat: null, conn: CONN_OK, ui: deferredUi, tz: TZ });
+  assert.equal(deferredStale.needs.stale, true);
+  assert.equal(deferredStale.needs.deferredCount, 1);
+  assert.equal(deferredStale.mode, 'needs-stale', 'deferred must not be reported as a confirmed all-clear when attention is stale');
+  assert.match(deferredStale.greeting.sub, /1 item is deferred/, 'the deferral context is kept, not dropped');
+  assert.match(deferredStale.greeting.sub, /not refresh|not confirmed current/);
+});
+
 test('an unreadable root says only that; a root without agents yet is loading', () => {
   const bad = M.buildTeamView({ nowMs: NOW, root: { label: 'x', project_id: 'p', errors: ['C:\\secret\\path failed'] }, conn: CONN_OK, ui: {}, tz: TZ });
   assert.equal(bad.mode, 'error');

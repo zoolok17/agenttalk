@@ -107,6 +107,56 @@ test('F2 (final sweep, ordinary polling): switching to a team whose attention re
   assert.ok(all(stream(dom)).includes('confirm') || all(stream(dom)).includes('not refresh'));
 });
 
+test('F2 (narrowed, ordinary polling): calm mode is also qualified when attention is stale, never a bare all-clear', async () => {
+  let pendingForB = false;
+  const twoTeams = () => [
+    root({ project_id: 'proj-a', label: 'Alpha', agents: [agent(LEAD, { since: 3000 })], recent: [env(LEAD, 'x', 'message', 5)] }),
+    root({ project_id: 'proj-b', label: 'Beta', operator_facing: LEAD, agents: [
+      agent(LEAD, { since: 3000 }),
+      // 900s of no progress (quietLong) but a reply since it woke: a watched candidate, not stuck.
+      agent('codex-agenttalk-developer-4', { state: 'working_silent', since: 1200, progress: 900 }),
+    ], recent: [env('codex-agenttalk-developer-4', 'operator', 'task-response', 100)] }),
+  ];
+  const srv = server({
+    roots: twoTeams,
+    attention: (id) => (id === 'proj-b' && pendingForB ? PENDING : { target_root_project_id: id, items: [] }),
+  });
+  const { dom, clock, fire } = await boot(srv);
+  pendingForB = true;
+  chips(dom)[1].click();                          // switch to Beta - its NEW attention request hangs
+  clock.perf += 9000;                              // stale (> 8s), still under the 5s request timeout
+  await fire(under);
+  assert.ok(!all(stream(dom)).includes('Nothing needs you right now.'),
+    'a stale, still-pending attention read must qualify the calm claim too, not just quiet');
+  assert.ok(all(stream(dom)).includes('confirm') || all(stream(dom)).includes('not refresh'));
+  assert.ok(all(stream(dom)).includes('dev-4'), 'the health/candidate context is kept, not dropped');
+});
+
+test('F2 (narrowed, ordinary polling): deferred mode is also qualified when attention is stale, never a bare all-clear', async () => {
+  let pendingForB = false;
+  const itemB = () => ({ target_root_project_id: 'proj-b', items: [ATT_ITEM({ id: 'e1', title: 'Only question' })] });
+  const twoTeams = () => [
+    root({ project_id: 'proj-a', label: 'Alpha', agents: [agent(LEAD, { since: 3000 })], recent: [env(LEAD, 'x', 'message', 5)] }),
+    root({ project_id: 'proj-b', label: 'Beta', agents: [agent(LEAD, { since: 3000 })], recent: [env(LEAD, 'x', 'message', 5)] }),
+  ];
+  const srv = server({
+    roots: twoTeams,
+    attention: (id) => (id === 'proj-b' ? (pendingForB ? PENDING : itemB()) : { target_root_project_id: id, items: [] }),
+  });
+  const { dom, fire, clock } = await boot(srv);
+  chips(dom)[1].click();                          // switch to Beta while its attention is still fresh
+  await fire(under);
+  classOf(stream(dom), 'c2-later')[0].click();     // defer the one card locally
+  assert.ok(all(stream(dom)).includes('1 deferred') || all(stream(dom)).includes('deferred'));
+  pendingForB = true;                              // Beta's NEXT attention refresh now hangs
+  clock.perf += 9000;
+  await fire(under);
+  assert.ok(!/^Nothing new needs you\./.test(all(stream(dom)).trim()),
+    'a stale, still-pending attention read must qualify the deferred claim too');
+  assert.ok(all(stream(dom)).includes('1 item is deferred'), 'the deferral context is kept, not dropped');
+  assert.ok(all(stream(dom)).includes('confirm') || all(stream(dom)).includes('not refresh'));
+});
+
 test('N2: an outage does not un-stick an unresolved incident - the stuck card persists, shown as last known', async () => {
   const srv = server();
   const { dom, fire } = await boot(srv);
