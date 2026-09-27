@@ -562,7 +562,7 @@ def _deliver_reply_draft(store, agent: str, record: dict, *,
                     preserved.unlink(missing_ok=True)
                 except OSError:
                     pass
-    except Exception as exc:  # noqa: BLE001, S110 - must never change disposition  # nosec B110
+    except Exception as exc:  # noqa: BLE001 - must never change disposition
         if exc is retry_abort:
             raise
         return
