@@ -907,3 +907,327 @@ def test_cmd_wrap_wires_contention_health_and_the_durable_diagnostic(
     events = [json.loads(line) for line in rows.getvalue().splitlines()]
     persisting = [e for e in events if e["event"] == "wrapper_lock_contention_persisting"]
     assert len(persisting) == 1 and persisting[0]["attempts"] == BOUND
+
+
+# ------------------------------------------ F1: an owner that cannot clean up
+
+
+def _hold_guard_until(tmp_path: Path, lock: Path, held: threading.Event,
+                      release: threading.Event) -> threading.Thread:
+    """A second holder of ``lock``'s GENERATION GUARD (not its marker), so the
+    owner's release cannot re-enter the guard to remove its own marker."""
+
+    def run() -> None:
+        other = Store(tmp_path)
+        with other._lock_generation_guard(
+            lock, deadline=time.monotonic() + 5.0, poll=0.005, what="guard holder",
+        ):
+            held.set()
+            release.wait(10)
+
+    return threading.Thread(target=run, daemon=True)
+
+
+def _strand_own_marker(tmp_path: Path, s: Store, lock: Path):
+    """Reviewer-1's F1 reproduction: acquire ``lock`` (80 ms), and while inside
+    its body let a second thread hold the same path's generation guard, so the
+    owner's release exceeds 80 ms. Returns (raised, holder, release)."""
+    held, release = threading.Event(), threading.Event()
+    holder = _hold_guard_until(tmp_path, lock, held, release)
+    raised = False
+    try:
+        with s._exclusive_lock(lock, timeout=0.08, what="wrapper operation publication"):
+            holder.start()
+            assert held.wait(5)
+    except LockContention:
+        raised = True
+    return raised, holder, release
+
+
+def test_release_guard_contention_never_strands_an_unrecoverable_own_marker(
+    tmp_path,
+) -> None:
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    lock = s.state_dir / "operation-publication.lock"
+    raised, holder, release = _strand_own_marker(tmp_path, s, lock)
+    try:
+        # The owner could not remove its marker while the guard was held: the
+        # marker is still there, owned by THIS live process.
+        pid, _identity, _record = store_mod._read_lock_owner(lock)
+        assert pid == store_mod.os.getpid()
+    finally:
+        release.set()
+        holder.join(5)
+    # The critical section completed, so the deferred cleanup is not reported
+    # as contention (a retry would re-run completed work)...
+    assert raised is False
+    # ...and this process recovers its OWN marker (inode + generation + pid
+    # validated under the guard) instead of waiting on itself forever.
+    with s._exclusive_lock(lock, timeout=0.08, what="wrapper operation publication"):
+        assert lock.exists()
+    assert not lock.exists()
+
+
+def test_a_body_failure_still_propagates_when_the_release_is_contended(
+    tmp_path,
+) -> None:
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    lock = s.state_dir / "operation-publication.lock"
+    held, release = threading.Event(), threading.Event()
+    holder = _hold_guard_until(tmp_path, lock, held, release)
+    try:
+        with pytest.raises(ValueError, match="corrupt"):
+            with s._exclusive_lock(lock, timeout=0.08, what="wrapper operation publication"):
+                holder.start()
+                assert held.wait(5)
+                raise ValueError("corrupt payload")      # never masked as contention
+    finally:
+        release.set()
+        holder.join(5)
+    with s._exclusive_lock(lock, timeout=0.08, what="wrapper operation publication"):
+        pass
+    assert not lock.exists()
+
+
+def test_stranded_own_marker_is_swept_once_its_guard_frees(tmp_path) -> None:
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    lock = s.state_dir / "operation-publication.lock"
+    _raised, holder, release = _strand_own_marker(tmp_path, s, lock)
+    try:
+        assert s.complete_stranded_lock_releases() == 0   # guard still held: kept
+        assert lock.exists()
+    finally:
+        release.set()
+        holder.join(5)
+    assert Store(tmp_path).complete_stranded_lock_releases() == 1   # any Store, same process
+    assert not lock.exists()
+    assert s.complete_stranded_lock_releases() == 0
+
+
+def test_a_live_marker_this_process_did_not_strand_is_never_unlinked(
+    tmp_path,
+) -> None:
+    # Same PID, different owner (another thread): a stale stranded entry for the
+    # path must not license removing it - identity and generation must match.
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    lock = s.state_dir / "operation-publication.lock"
+    _raised, holder, release = _strand_own_marker(tmp_path, s, lock)
+    release.set()
+    holder.join(5)
+    lock.unlink()                                      # the stranded marker is gone
+    holding, done = threading.Event(), threading.Event()
+
+    def hold_marker() -> None:
+        with Store(tmp_path)._exclusive_lock(lock, timeout=5.0, what="publication"):
+            holding.set()
+            done.wait(10)
+
+    t = threading.Thread(target=hold_marker, daemon=True)
+    t.start()
+    try:
+        assert holding.wait(5)
+        live = store_mod._read_lock_owner(lock)[2]
+        with pytest.raises(LockContention):
+            with s._exclusive_lock(lock, timeout=0.1, what="publication"):
+                pass
+        assert s.complete_stranded_lock_releases() == 0
+        assert store_mod._read_lock_owner(lock)[2] == live   # the live marker survived
+    finally:
+        done.set()
+        t.join(5)
+
+
+def test_wrapper_publication_with_a_contended_release_publishes_once_and_cleans_up(
+    tmp_path, monkeypatch,
+) -> None:
+    # F1 end to end: the reply's send_operation lands, then its
+    # operation-publication.lock release cannot re-enter the guard. Before the
+    # fix the in-place retry waited on its own live marker forever.
+    s, m = _bus(tmp_path)
+    lock = s.state_dir / "operation-publication.lock"
+    real_exclusive = Store._exclusive_lock
+
+    def short_publication_lock(self, path, *, timeout=10.0, poll=0.05, what="lock"):
+        if Path(path).name == "operation-publication.lock":
+            timeout = min(timeout, 0.08)
+        return real_exclusive(self, path, timeout=timeout, poll=poll, what=what)
+
+    monkeypatch.setattr(Store, "_exclusive_lock", short_publication_lock)
+    held, release = threading.Event(), threading.Event()
+    holder = _hold_guard_until(tmp_path, lock, held, release)
+    real_send = s.send
+    started: list[bool] = []
+
+    def send_then_hold_the_guard(**kwargs):
+        message = real_send(**kwargs)
+        if kwargs.get("sender") == "beta" and not started:
+            started.append(True)
+            holder.start()
+            assert held.wait(5)
+        return message
+
+    monkeypatch.setattr(s, "send", send_then_hold_the_guard)
+    sleeps = {"n": 0}
+
+    def sleep(_delay: float) -> None:
+        sleeps["n"] += 1
+        if sleeps["n"] == 1:
+            release.set()                            # the guard frees after the turn
+            holder.join(5)
+        if sleeps["n"] > 20:
+            raise AssertionError("the wrapper is retrying against its own marker")
+
+    driver = CountedDriver()
+    health = Health()
+    try:
+        turns = loop.run_loop(
+            s, "beta", driver, clock=lambda: 0.0, sleep=sleep, max_polls=4,
+            commit_gate=_inactive_gate(s), on_health_idle=health.idle,
+            on_health_contention=health.contended,
+            on_contention_persisting=health.persisting,
+        )
+    finally:
+        release.set()
+        holder.join(5)
+    assert turns == 1 and driver.calls == 1
+    assert len(_replies(s)) == 1
+    assert s.cursor("beta") == m.id
+    assert not lock.exists()                         # no marker left to block other seats
+
+
+# ------------------------------------------ F2: owed heads, the admitted path
+
+
+def _owed_bus(tmp_path: Path):
+    s = Store(tmp_path)
+    s.init(["alpha", "beta", "lead"])
+    s.set_operator_facing("lead")
+    m = s.send(sender="alpha", recipient="beta", kind="question",
+               body="What is 19 * 21?", meta={"request_id": "q-154"})
+    return s, m
+
+
+class OwedDriver:
+    """The paid admitted dispatch, counted: answers through the owed-action
+    transport exactly like a child would. ``on_complete`` runs after the answer
+    landed. A second invocation fails at once."""
+
+    def __init__(self, tmp_path: Path, *, on_complete=None) -> None:
+        self.tmp_path = tmp_path
+        self.calls = 0
+        self.on_complete = on_complete
+
+    def __call__(self, rec: dict) -> loop.DriveOutcome:
+        self.calls += 1
+        if self.calls > 1:
+            raise AssertionError("the paid driver was re-entered for a completed turn")
+        owed = rec["owed_action"]
+        Path(owed["draft_path"]).write_text("399", encoding="utf-8")
+        assert cli.main(["--root", str(self.tmp_path), *owed["argv"][3:], "--quiet"]) == 0
+        if self.on_complete is not None:
+            self.on_complete()
+        return loop.DriveOutcome(ok=True, bus_action_attempted=True)
+
+
+def _answers(s: Store) -> list:
+    return [m for m in s.messages_for("alpha") if m.sender == "beta"]
+
+
+# Every lock the admitted path takes BEFORE its paid dispatch, in order: the
+# admission's replay index and claim, the dispatch-purpose read, the
+# reservation's publication lock, replay index and ledger CAS, then the dispatch
+# arming's acceptance-writer, config and ledger locks.
+_OWED_PRE_DISPATCH_SITES = [
+    pytest.param("ledger.lock", 0, id="admission-replay-index"),
+    pytest.param("ledger.lock", 1, id="admission-claim"),
+    pytest.param("ledger.lock", 2, id="dispatch-purpose"),
+    pytest.param("message-publication", 0, id="reservation-publication"),
+    pytest.param("ledger.lock", 3, id="reservation-replay-index"),
+    pytest.param("ledger.lock", 4, id="reservation-cas"),
+    pytest.param(".acceptance-write.lock", 0, id="arming-acceptance-writer"),
+    pytest.param("config.lock", 0, id="arming-config"),
+    pytest.param("ledger.lock", 5, id="arming-ledger"),
+]
+
+
+@pytest.mark.parametrize(("lock_name", "skip"), _OWED_PRE_DISPATCH_SITES)
+def test_owed_head_contention_before_the_paid_dispatch_is_retried_in_place(
+    tmp_path, monkeypatch, lock_name, skip,
+) -> None:
+    s, m = _owed_bus(tmp_path)
+    barrier = LockBarrier(monkeypatch)
+    barrier.arm(lock_name, skip=skip, hold=BOUND + 1)
+    held_at_drive: list[int] = []
+    driver = OwedDriver(tmp_path)
+
+    def drive(rec):
+        held_at_drive.append(barrier.remaining(lock_name))
+        return driver(rec)
+
+    health = Health()
+    turns = _run(s, _active_gate(s), drive, health, max_polls=6)
+
+    assert turns == 1                                   # a live wrapper, not an exit
+    assert driver.calls == 1 and held_at_drive == [0]   # ONE paid dispatch, after release
+    assert barrier.hits[lock_name] == BOUND + 1
+    assert len(_answers(s)) == 1                        # ONE publication
+    assert s.cursor("beta") == m.id
+    assert health.contended_phases() == [loop.LOCK_CONTENTION_PHASE_ADMISSION] * (BOUND + 1)
+    assert health.recovered()
+    assert len(health.diagnostics) == 1
+
+
+# After the paid dispatch answered: the result replay (index, pending broadcast
+# close), the dispatch-result record, the finalizer's disposition CAS, and the
+# compliance-streak reset. skip=5 passes the finalizer's best-effort completion
+# telemetry (4), which swallows its own failures by design.
+_OWED_POST_DISPATCH_SITES = [
+    pytest.param(0, id="result-replay-index"),
+    pytest.param(1, id="result-replay-broadcast-close"),
+    pytest.param(2, id="dispatch-result"),
+    pytest.param(3, id="finalize-disposition"),
+    pytest.param(5, id="satisfied-streak"),
+]
+
+
+@pytest.mark.parametrize("skip", _OWED_POST_DISPATCH_SITES)
+def test_owed_head_contention_after_the_answer_landed_never_redrives(
+    tmp_path, monkeypatch, skip,
+) -> None:
+    s, m = _owed_bus(tmp_path)
+    barrier = LockBarrier(monkeypatch)
+    driver = OwedDriver(tmp_path, on_complete=lambda: barrier.arm(
+        "ledger.lock", skip=skip, hold=BOUND + 1))
+    health = Health()
+    turns = _run(s, _active_gate(s), driver, health, max_polls=6)
+
+    assert turns == 1
+    assert driver.calls == 1                            # never re-enters the paid driver
+    assert barrier.hits["ledger.lock"] == BOUND + 1
+    assert len(_answers(s)) == 1
+    assert s.cursor("beta") == m.id
+    assert health.contended_phases() == [
+        loop.LOCK_CONTENTION_PHASE_FINALIZATION] * (BOUND + 1)
+    assert health.recovered()
+    assert len(health.diagnostics) == 1
+
+
+def test_owed_head_corruption_after_the_answer_landed_stays_fatal(
+    tmp_path, monkeypatch,
+) -> None:
+    s, _m = _owed_bus(tmp_path)
+    barrier = LockBarrier(monkeypatch)
+    driver = OwedDriver(tmp_path, on_complete=lambda: barrier.arm(
+        "ledger.lock", skip=2, hold=5, error=ValueError("owed-action ledger is corrupt")))
+    health = Health()
+    with pytest.raises(ValueError, match="corrupt"):
+        _run(s, _active_gate(s), driver, health, max_polls=6)
+    assert barrier.hits["ledger.lock"] == 1             # the dispatch result: never retried
+    assert driver.calls == 1
+    assert len(_answers(s)) == 1
+    assert s.cursor("beta") == ""
+    assert health.contended_phases() == []

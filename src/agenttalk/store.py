@@ -154,6 +154,50 @@ class LockContention(TimeoutError):
         self.lock_file = lock_file
 
 
+# #154 F1: ownership markers THIS process created but could not remove, because
+# the owner's release could not re-enter the lock's generation guard. The marker
+# names this live PID, so no other client will ever recover it; only this
+# process may, and only that exact marker: each entry pins its inode and its
+# generation token, so a later owner's marker at the same path is never touched.
+_STRANDED_MARKERS: dict[str, tuple[Path, os.stat_result, str]] = {}
+_STRANDED_MARKERS_LOCK = threading.Lock()
+
+
+def _stranded_key(lock: Path) -> str:
+    return os.path.normcase(os.path.abspath(str(lock)))
+
+
+def _remember_stranded_marker(lock: Path, identity: os.stat_result,
+                              generation: str) -> None:
+    with _STRANDED_MARKERS_LOCK:
+        _STRANDED_MARKERS[_stranded_key(lock)] = (lock, identity, generation)
+
+
+def _forget_stranded_marker(lock: Path, generation: str) -> None:
+    with _STRANDED_MARKERS_LOCK:
+        entry = _STRANDED_MARKERS.get(_stranded_key(lock))
+        if entry is not None and entry[2] == generation:
+            del _STRANDED_MARKERS[_stranded_key(lock)]
+
+
+def _own_stranded_generation(lock: Path, pid: int | None,
+                             existing: os.stat_result,
+                             record: dict | None) -> str | None:
+    """The generation of ``lock``'s marker iff it is this process's own
+    stranded marker (same PID, same generation token, same inode)."""
+    with _STRANDED_MARKERS_LOCK:
+        entry = _STRANDED_MARKERS.get(_stranded_key(lock))
+    if (
+        entry is None
+        or pid != os.getpid()
+        or not isinstance(record, dict)
+        or record.get("generation") != entry[2]
+        or not _same_file(existing, entry[1])
+    ):
+        return None
+    return entry[2]
+
+
 def _ensure_lock_byte(fd: int) -> None:
     """Make byte zero lockable without relying on owner metadata."""
     if os.fstat(fd).st_size == 0:
@@ -1534,6 +1578,7 @@ class Store:
         )
         deadline = time.monotonic() + timeout
         identity: os.stat_result | None = None
+        owned_generation = ""
         ownerless_generation: tuple[int, int] | None = None
         ownerless_seen_at: float | None = None
         try:
@@ -1570,6 +1615,18 @@ class Store:
                             ownerless_generation = None
                             ownerless_seen_at = None
                         else:
+                            stranded = _own_stranded_generation(
+                                lock, pid, existing, record,
+                            )
+                            if stranded is not None:
+                                # #154 F1: this process's OWN marker, left by a
+                                # release that could not re-enter the guard we
+                                # hold now. Validated above (PID, generation,
+                                # inode), so remove it instead of waiting on
+                                # ourselves forever.
+                                _unlink_if_same_file(lock, existing)
+                                _forget_stranded_marker(lock, stranded)
+                                continue
                             os_lock_available = (
                                 existing.st_size > 0
                                 and _existing_os_lock_available(lock)
@@ -1615,6 +1672,7 @@ class Store:
                                     continue
                     else:
                         identity = os.lstat(lock)
+                        owned_generation = generation
                         try:
                             _validate_lock_file_stat(lock, identity)
                             if not _same_file(created, identity):
@@ -1637,36 +1695,99 @@ class Store:
             yield
         finally:
             if identity is not None:
+                try:
+                    self._release_owned_marker(
+                        lock,
+                        identity,
+                        deadline=max(deadline, time.monotonic() + timeout),
+                        poll=poll,
+                        what=what,
+                    )
+                except LockContention:
+                    # #154 F1: the owner could not re-enter its guard to remove
+                    # its own marker. The critical section itself is complete
+                    # (or its own exception keeps propagating), so this is not
+                    # acquisition contention and must not make a caller re-run
+                    # completed work. Record the exact marker instead: this
+                    # process removes it on its next acquisition of this lock or
+                    # its next complete_stranded_lock_releases() sweep.
+                    _remember_stranded_marker(lock, identity, owned_generation)
+
+    def _release_owned_marker(
+        self,
+        lock: Path,
+        identity: os.stat_result,
+        *,
+        deadline: float,
+        poll: float,
+        what: str,
+    ) -> None:
+        with self._lock_generation_guard(
+            lock,
+            deadline=deadline,
+            poll=poll,
+            what=what,
+        ):
+            last_error: OSError | None = None
+            for _ in range(100):
+                try:
+                    current = os.lstat(lock)
+                    _validate_lock_file_stat(lock, current)
+                    if not _same_file(identity, current):
+                        raise OSError("ownership marker generation changed")
+                    if not _unlink_if_same_file(lock, identity):
+                        raise OSError("ownership marker generation changed")
+                    last_error = None
+                    break
+                except FileNotFoundError as exc:
+                    last_error = exc
+                    break
+                except PermissionError as exc:
+                    last_error = exc
+                    time.sleep(0.01)
+                except OSError as exc:
+                    last_error = exc
+                    break
+            if last_error is not None:
+                raise OSError(
+                    f"could not release the {what} at {lock}: {last_error}"
+                ) from last_error
+
+    def complete_stranded_lock_releases(self) -> int:
+        """#154 F1: remove this process's stranded ownership markers whose guard
+        is free right now; returns how many were removed.
+
+        Never waits: a still-contended or unopenable guard keeps its entry for the
+        next sweep. Each marker is re-validated under its guard (this PID, the
+        recorded generation token and inode) before removal, and an entry whose
+        path now holds anything else is dropped without touching the file.
+        """
+        with _STRANDED_MARKERS_LOCK:
+            entries = list(_STRANDED_MARKERS.values())
+        removed = 0
+        for lock, identity, generation in entries:
+            try:
                 with self._lock_generation_guard(
                     lock,
-                    deadline=max(deadline, time.monotonic() + timeout),
-                    poll=poll,
-                    what=what,
+                    deadline=time.monotonic(),
+                    poll=0.0,
+                    what="stranded ownership marker",
                 ):
-                    last_error: OSError | None = None
-                    for _ in range(100):
-                        try:
-                            current = os.lstat(lock)
-                            _validate_lock_file_stat(lock, current)
-                            if not _same_file(identity, current):
-                                raise OSError("ownership marker generation changed")
-                            if not _unlink_if_same_file(lock, identity):
-                                raise OSError("ownership marker generation changed")
-                            last_error = None
-                            break
-                        except FileNotFoundError as exc:
-                            last_error = exc
-                            break
-                        except PermissionError as exc:
-                            last_error = exc
-                            time.sleep(0.01)
-                        except OSError as exc:
-                            last_error = exc
-                            break
-                    if last_error is not None:
-                        raise OSError(
-                            f"could not release the {what} at {lock}: {last_error}"
-                        ) from last_error
+                    try:
+                        pid, existing, record = _read_lock_owner(lock)
+                    except FileNotFoundError:
+                        _forget_stranded_marker(lock, generation)
+                        continue
+                    if (
+                        _own_stranded_generation(lock, pid, existing, record)
+                        == generation
+                        and _unlink_if_same_file(lock, identity)
+                    ):
+                        removed += 1
+                    _forget_stranded_marker(lock, generation)
+            except OSError:
+                continue
+        return removed
 
     def _advance_config_lock_generation(
         self,
