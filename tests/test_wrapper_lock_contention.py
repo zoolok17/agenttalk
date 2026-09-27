@@ -506,7 +506,8 @@ def test_ledger_finalization_contention_retains_success_and_never_redrives(
 @pytest.mark.parametrize(("lock_name", "skip"), [
     ("message-publication", 2),    # the retention's replay (after send + landed replay)
     ("ledger.lock", 1),            # the retention's replay indexing (after send's hook)
-], ids=["retention-publication", "retention-index"])
+    ("ledger.lock", 2),            # the retention's claim read
+], ids=["retention-publication", "retention-index", "retention-claim"])
 def test_landed_reply_retention_contention_is_retried_visibly(
     tmp_path, monkeypatch, lock_name, skip,
 ) -> None:
@@ -698,6 +699,41 @@ def test_ownership_loss_while_contended_stays_fatal(tmp_path, monkeypatch) -> No
     assert s.cursor("beta") == ""
 
 
+def test_unexpected_publish_error_keeps_the_never_raise_contract(
+    tmp_path, monkeypatch,
+) -> None:
+    # A programming error before send_operation (not a refusal, not contention)
+    # is swallowed exactly as without a retry: attempted once, no refusal, the
+    # draft and any preserved progress untouched.
+    s, m = _bus(tmp_path)
+    calls = {"n": 0}
+
+    def broken_digest(*args, **kwargs):
+        calls["n"] += 1
+        raise RuntimeError("digest bug")
+
+    monkeypatch.setattr(reply_transport, "operation_digest_for", broken_digest)
+    record = loop._with_reply_draft(
+        s, "beta", {"id": m.id, "from": "alpha", "kind": "question", "meta": {}})
+    draft = Path(record["reply_draft"]["path"])
+    draft.write_text("answer", encoding="utf-8")
+    interrupted = loop._interrupted_draft_path(s, "beta", m.id)
+    interrupted.write_text("earlier progress", encoding="utf-8")
+    retried: list[str] = []
+
+    def retry(phase, step, *args, **kwargs):
+        retried.append(phase)
+        return step(*args, **kwargs)
+
+    assert loop._deliver_reply_draft(s, "beta", record, retry=retry) is None
+    assert retried == [loop.LOCK_CONTENTION_PHASE_PUBLICATION]
+    assert calls["n"] == 1
+    assert draft.read_text(encoding="utf-8") == "answer"
+    assert not reply_transport.refused_reason_path(draft).exists()
+    assert interrupted.is_file()
+    assert _replies(s) == []
+
+
 def test_publication_failure_that_is_not_contention_is_refused_once(
     tmp_path, monkeypatch,
 ) -> None:
@@ -849,9 +885,11 @@ def test_cmd_wrap_wires_contention_health_and_the_durable_diagnostic(
     s = Store(tmp_path)
     s.init(["lead", "beta"])
     captured: dict = {}
+    rows = io.StringIO()
     monkeypatch.setattr(loop, "run_loop", lambda *a, **k: captured.update(k) or 0)
     cli._wrap_loop_mode(s, "beta", cli="codex", base_argv=["python", "-c", "pass"],
-                        sender="beta", min_interval=0.0, render=False, lead_loop=False)
+                        sender="beta", min_interval=0.0, render=False, lead_loop=False,
+                        lifecycle_log=WrapperLifecycleLog("beta", stream=rows))
     captured["on_health_contention"](loop.LOCK_CONTENTION_PHASE_FINALIZATION)
     snap = s.read_health("beta")
     assert snap["state"] == health_model.STATE_RATE_LIMITED_OR_OUTAGE
@@ -862,3 +900,6 @@ def test_cmd_wrap_wires_contention_health_and_the_durable_diagnostic(
     err = capsys.readouterr().err
     assert "store lock contention persists" in err
     assert "message publication" in err and "finalization phase" in err
+    events = [json.loads(line) for line in rows.getvalue().splitlines()]
+    persisting = [e for e in events if e["event"] == "wrapper_lock_contention_persisting"]
+    assert len(persisting) == 1 and persisting[0]["attempts"] == BOUND
