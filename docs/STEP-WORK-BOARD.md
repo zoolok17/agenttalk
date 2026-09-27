@@ -87,7 +87,8 @@ warms one snapshot per root and refreshes outside request handlers, coalesced to
 one start per five seconds. Direct composition calls remain synchronous. The
 existing store scanner supplies both paths; roster/signature validation is shared.
 Membership/stat and config/key checks reject mid-scan changes; explicit invalidation
-discards in-flight generations. Failures retain prior data with degraded coverage.
+discards in-flight generations. After the cold-read correction below, failures
+serve fresh prior data with degraded coverage instead of dropping the team view.
 State keeps its output/error shapes and active-only semantics, with a 15-second
 freshness ceiling. Four mutation-between-poll tests now advance the worker clock;
 their payload assertions are unchanged. Worker cancellation checks precede reads.
@@ -102,3 +103,20 @@ performance fixture was interrupted during setup; cap tests use small injected l
 Final Python 3.10 snapshot/state selection: 58 passed, 190 deselected (30.75 s);
 compaction: 16 passed (3.46 s). Python 3.14 snapshot: 10 passed (2.14 s).
 Ruff and Bandit pass changed modules; whitespace check passes. Commit stays local.
+
+### B4a cold-read correction — last-known-good on a scan race
+
+`active()` now prefers the published generation despite a refresh error, provided
+its config matches and scan-start age is at most 15 seconds. Coverage remains
+degraded until successful refresh. Without a usable generation it stays building
+or refuses; config mismatch and staleness still fail closed. Membership races use
+a dedicated exception and schedule a 250 ms retry that wakes the worker; repeated
+races cannot busy-loop. Normal refreshes retain the five-second cadence.
+HTTP regressions publish a real message both before and after the scanner read,
+and assert the entire root key set and counts survive until recovery. The worker
+retry test also verifies automatic execution without waiting for the normal poll.
+Failing-first: 3 failed / 9 deselected, including both HTTP reproductions (1.45 s).
+Task scratch `tk-bb35ff68d3a9` retains the red/green and final targeted logs.
+Final Python 3.10 snapshot/state selection: 61 passed, 190 deselected (31.76 s).
+Python 3.14 snapshot tests: 13 passed (2.66 s). Ruff, Bandit, whitespace and
+added-line privacy checks pass. No full suite; commit remains local.

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep the fresh last-known-good dashboard view during snapshot scan races and
+  schedule a bounded prompt retry; config mismatch and stale data still refuse.
+
 ### Added
 
 - Share validated active envelopes across dashboard polls through a per-root

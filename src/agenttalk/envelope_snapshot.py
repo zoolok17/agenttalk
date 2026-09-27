@@ -103,6 +103,10 @@ def selected_closure(snapshot, selected_ids, *, envelope_limit=50000, byte_limit
             if status == "complete" else []}
 
 
+class MembershipChanged(ValueError):
+    """An ordinary concurrent publication/compaction requires another scan."""
+
+
 class SnapshotService:
     """One worker-owned generation per root; polling reads only the published value."""
     def __init__(self, store, *, clock=time.monotonic):
@@ -113,6 +117,8 @@ class SnapshotService:
         self._busy = False
         self._generation = 0
         self._last_start = float("-inf")
+        self._retry_at = None
+        self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread = None
 
@@ -127,16 +133,21 @@ class SnapshotService:
         result = {}
         for path in self.store.messages_dir.iterdir():
             if path.suffix == ".json":
-                st = path.stat()
+                try:
+                    st = path.stat()
+                except FileNotFoundError:
+                    raise MembershipChanged("snapshot membership changed during scan") from None
                 result[path] = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
         return result
 
     def refresh(self):
         with self._lock:
             start = self.clock()
-            if self._busy or start - self._last_start < 5 or self._stop.is_set():
+            due = self._retry_at if self._retry_at is not None else self._last_start + 5
+            if self._busy or start < due or self._stop.is_set():
                 return False
             self._busy, self._last_start = True, start
+            self._retry_at = None
             generation = self._generation
         try:
             cfg = self.store.load_config()
@@ -152,13 +163,17 @@ class SnapshotService:
                     time.sleep(0)  # yield between bounded reads, never inside HTTP
                     batch, slice_start = 0, self.clock()
             rows, invalid = validated_active(self.store, cfg, checkpoint)
+            if before != self._membership():
+                raise MembershipChanged("snapshot membership changed during scan")
             entries = []
             for message, path in rows:
                 fields = message.to_dict()
                 digest = _digest(fields)
                 fields.pop("body", None)
                 entries.append(Envelope(message.id, fields, digest, before[path][2], "active"))
-            if before != self._membership() or trust != _trust(self.store, self.store.load_config()):
+            if before != self._membership():
+                raise MembershipChanged("snapshot membership changed during scan")
+            if trust != _trust(self.store, self.store.load_config()):
                 raise ValueError("snapshot generation changed during scan")
             value = Snapshot(generation + 1, start, trust[0], tuple(m for m, _ in rows), invalid,
                              tuple(entries), len(before), sum(s[2] for s in before.values()), self.clock() - start)
@@ -171,6 +186,9 @@ class SnapshotService:
         except Exception as exc:  # errors-as-data, preserving the last published generation
             with self._lock:
                 self.error = exc
+                if isinstance(exc, MembershipChanged):
+                    self._retry_at = self.clock() + .25
+                    self._wake.set()
             return False
         finally:
             with self._lock:
@@ -178,10 +196,10 @@ class SnapshotService:
 
     def active(self, cfg):
         with self._lock:
-            if self.error:
-                raise self.error
             value = self.current
             if value is None:
+                if self.error and not isinstance(self.error, MembershipChanged):
+                    raise self.error
                 raise ValueError("snapshot building")
             if value.config_digest != _digest(cfg):
                 raise ValueError("snapshot config generation changed")
@@ -205,12 +223,19 @@ class SnapshotService:
 
     def start(self):
         def run():
-            while not self._stop.wait(5):
+            while not self._stop.is_set():
+                with self._lock:
+                    delay = max(0, self._retry_at - self.clock()) if self._retry_at is not None else 5
+                self._wake.wait(delay)
+                self._wake.clear()
+                if self._stop.is_set():
+                    break
                 self.refresh()
         self._thread = threading.Thread(target=run, daemon=True, name="agenttalk-envelope-snapshot")
         self._thread.start()
 
     def close(self):
         self._stop.set()
+        self._wake.set()
         if self._thread:
             self._thread.join()
