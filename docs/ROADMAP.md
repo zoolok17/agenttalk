@@ -2,16 +2,16 @@
 
 **Status:** Official · **Owner:** lead (operator-facing) · **Last updated:** 2026-09-27 (UTC)
 **Audience:** maintainers, operators, and agents deciding what to build next.
-**Horizon:** the next two releases in detail, then a ranked "next" tier and a labelled "later" tier.
+**Horizon:** the next release (v0.94.0) in detail, then a ranked "next" tier and a labelled "later" tier.
 **Current shipped baseline:** v0.93.0 (2026-09-27). `CHANGELOG.md` remains the release-history source of truth.
 
-**Platform requirement:** agenttalk must run on **Windows, macOS, and Linux**. The Python core (bus, store, CLI, wrapper) is cross-platform and CI-tested on all three (Windows/macOS/Ubuntu × Python 3.10–3.13). The model gateway has a Windows scheduled-task backend and, since v0.91.0, a Linux systemd `--user` backend. **The supervisor is still the open platform gap:** it needs PowerShell Core 7+ and the Windows-only `Win32_Process`. A POSIX supervisor path is unbuilt (§7, §9).
+**Platform requirement:** agenttalk must run on **Windows, macOS, and Linux**. The Python core (bus, store, CLI, wrapper) is cross-platform and CI-tested on all three (Windows/macOS/Ubuntu × Python 3.10–3.13). The model gateway has a Windows scheduled-task backend and, since v0.91.0, a Linux systemd `--user` backend. **The supervisor is still the open platform gap:** it needs PowerShell Core 7+ and the Windows-only `Win32_Process`. A POSIX supervisor path is unbuilt (§6.1 G5, §8).
 
 Companion docs:
 - `docs/DESIGN.md` (why / architecture);
 - `docs/ASSURANCE.md` (per-release attestation);
 - `docs/ISSUES.md` (living tracker and known limitations);
-- `docs/DESIGN-work-board.md` (the work board, #207);
+- the work-board design (#207): `docs/DESIGN-work-board.md` on branch `design/work-board`, and the reducer's residual in `docs/STEP-WORK-BOARD.md` on branch `feat/work-board-b3a`. Both land on master with the board PRs;
 - `docs/TEST-COVERAGE-REPORT.md`;
 - `docs/DASHBOARD-CONTROL-PLANE-DESIGN-HISTORY.md`;
 - `docs/ROADMAP-ARCHIVE-2026-06.md` (**archived**; do not plan from it);
@@ -130,10 +130,10 @@ The team should be as autonomous as possible, so the lead must always be able to
 **Findings (investigation, 2026-09-27).** The supervisor's decision core already covers most of this:
 - relaunch with backoff, and a readiness give-up that stops after three never-ready relaunches;
 - a fail-closed barrier that proves no wrapper for the seat survives before it starts a replacement;
-- an audited `request-restart` verb that only the lead or liaison may use;
+- an audited `request-restart` verb. It is authorized only for the configured operator-facing liaison, or for the sole lead when no liaison is configured. On the maintainers' fleet the lead is the liaison, so the lead's request is authorized. A fleet with a separate liaison routes restarts through that liaison; any wider authority is a separate design;
 - config rows for every current seat kind: Claude Code, Codex CLI, and gateway-backed seats declared as Claude seats.
 
-The gaps are operational and platform-related, not missing logic.
+Most of the gaps are operational or platform-related. Three recovery items carried from the 2026-08 plan are still missing logic (G6-G8).
 
 | Gap | Size | Note |
 |---|---|---|
@@ -142,22 +142,33 @@ The gaps are operational and platform-related, not missing logic.
 | G3. Guard-aware relaunch | 4-8 h | Do not relaunch a wrapper killed by a publication-guard timeout straight into the same contention (§6.2). |
 | G4. The supervisor crash-simulation harness | 1-2 agent-days | A fake agent the real supervisor launches, failing in every realistic way. A prerequisite for G3. |
 | G5. A POSIX supervisor | design first | §8. |
+| G6. Absence is not staleness | 2-4 h | A twice-confirmed-absent wrapper still waits out the heartbeat threshold (up to 2400 s for Codex) before relaunch. A complete process snapshot, not the heartbeat, should decide absence. Independently stageable. |
+| G7. Terminate a provably childless wrapper; hard-cap the retry | 4-8 h | The launch barrier correctly refuses while an orphaned wrapper survives, so recovery backs off into silence. Someone must own terminating it, and the retry cycle must escalate instead of going quiet. |
+| G8. Launch only on complete ownership proof | design first | Recovery may launch only when absence rests on a complete account of the current process graph, not on a list of known identities. The spawn-seam prerequisite shipped in 0.83. |
+
+Order: G2 then G1 first (G6 shortens a dead Codex seat's outage from about 40 minutes); G4 before G3, G7 and G8.
 
 **Related:** host-restart survival (#155), self-continuation of unfinished work (#139), and the supervisor correctness items #27, #33, #180 and #182.
 
-### 6.2 Per-recipient delivery instead of the store-wide publication guard *(candidate)*
+### 6.2 The publication hot path: survive contention, then shrink the critical section
 
 Every publication takes one store-wide guard with a 10 s deadline (#154). When the lead sent several messages back to back, waiting wrappers timed out on the guard and exited without a crash record. This happened seven times on 2026-09-12, at about 9k messages, and twice on 2026-09-27, at about 11.7k.
 
 **Mechanism (code read, 2026-09-27).** Inside the lock, each send runs a full validated scan of the store: every file is parsed, the roster checked and the HMAC verified. It then rewrites the whole publication-order map and its hash chain. The final rename is O(1); the critical section is O(store). The wrapper does not treat a lock timeout on a core path as transient.
 
 Staged plan:
-1. **Wrappers survive lock contention** (2-4 agent-hours): bounded retry with backoff on the same message and cursor, a degraded health reason, and one durable diagnostic if contention persists. No format change. This is the first fix.
+1. **Wrappers survive lock contention** (a few agent-hours; reshaped by its challenge on 2026-09-27):
+   - Recovery is phase-specific: retry a safe inbox peek before a turn is admitted. After a completed model turn, recover only the publication and finalization, using the retained proof and a stable operation identity.
+   - A completed paid turn is never re-entered, and storage corruption or an unsafe generation change is never treated as contention.
+   - Existing health states are reused, with a specific contention reason.
+   - It is proven with a counted fake driver and deterministic lock barriers.
+   - No format change. This is the first fix.
 2. **Measure, then shrink the critical section** (6-10 h of measurement and design, then a bounded build):
    - measure lock wait against lock hold, scans and bytes at fleet size;
    - remove redundant scans and share the validated snapshot with the board;
    - only then decide on incremental order maintenance. An append-only order log with checkpointed chains is a format v2 plus migration. It keeps the fail-closed rule for reconstructed order, and it needs a challenge and a separate compatibility decision.
-3. **Not planned:** replacing the canonical per-message files with SQLite. That would lose per-file signing, archives and backup semantics. A disposable, rebuildable index is acceptable.
+3. **Undecided:** recipient-partitioned delivery (per-recipient inboxes). It is not part of this plan, and it would be decided only if measurement shows the shared order cannot meet the target.
+4. **Not planned:** replacing the canonical per-message files with SQLite. That would lose per-file signing, archives and backup semantics. A disposable, rebuildable index is acceptable.
 
 - **Interim rule:** one publication per command.
 - **Related:** #147 and #171 (the same 10 s guard flakes on slow CI).
@@ -185,7 +196,7 @@ About 130 unanswered openers keep compaction from reclaiming the store, so the s
 
 ## 7. Candidate Features From the Agent-to-Agent Landscape
 
-**Status: investigated on 2026-09-27 by two independent seats from different vendors.** They agree: no tool has a messaging feature that beats agenttalk's typed, correlated, cross-vendor, unattended model. The value is in a few borrowed **reliability ideas**, and each needs a challenge verdict before it becomes work.
+**Status: investigated on 2026-09-27 by two independent seats from different vendors.** Their scoped conclusion: among the tools examined, none has a messaging feature that would replace agenttalk's combination of typed correlation, cross-vendor review and close authority, and unattended seats. The value is in a few borrowed **reliability ideas**, and each needs a challenge verdict before it becomes work.
 
 | Rank | Candidate | Borrowed from | When |
 |---|---|---|---|
@@ -219,7 +230,7 @@ The research (2026-09-27) found four families of direct agent-to-agent communica
 1. **In-program frameworks** (AutoGen, CrewAI, LangGraph, OpenAI Agents SDK): the agents are LLM calls inside one program, coordinated by group chat, task outputs, a typed-state graph or handoffs. They are not separate CLIs.
 2. **Claude Code Agent Teams** (experimental): per-agent JSON mailboxes validated on read, a file-locked shared task list, and hooks as quality gates. Claude-only, one team per session, interactive sessions only.
 3. **The A2A protocol** (Linux Foundation, v1.0 on 2026-03-12): HTTP or gRPC bindings, typed tasks, and optionally signed Agent Cards. Neither major coding CLI supports it natively; only MCP bridges exist.
-4. **Cross-vendor CLI bridges** (for example a WAL-mode SQLite bridge, JSONL mailboxes, MCP relays): the closest to agenttalk. They carry plain-text messages with no types, threads, reviews or gates.
+4. **Cross-vendor CLI bridges** (for example a WAL-mode SQLite bridge, JSONL mailboxes, MCP relays): the closest to agenttalk. Some have threads and replies (an MCP mail server, for one). None of those examined has review, gate, close or authority semantics.
 
 agenttalk's differences:
 - typed request/reply with threads;
@@ -237,11 +248,15 @@ agenttalk's differences:
 - **Plan review write path (#206).** Annotate a plan and send it back. It is resumed only if the operator's trial of a markup tool shows that marking up beats chat. The read half is D1–D3 (§5).
 
 **Supervisor and runtime:**
-- the POSIX supervisor (P1) and a crash-simulation harness (P2), carried from the 2026-08 plan;
+- the POSIX supervisor (P1), carried from the 2026-08 plan (the crash-simulation harness P2 is ranked in §6.1 as G4);
 - the agent lifecycle RFC (#36);
 - direct-wrap diagnostics (#181);
 - #26 and #28;
-- per-agent identity and authorization (RFC #19).
+- per-agent identity and authorization (RFC #19);
+- carried from the 2026-08 turn-envelope/hygiene items, not yet shipped:
+  - **Gate execution outside the turn envelope:** an owned, bounded, start-guarded detached runner that outlives the turn and writes SHA-bound evidence. The practice half (targeted tests in-turn, CI as the gate) is in force.
+  - **Same-message livelock visibility:** surface consecutive turn starts on the same message, and park a message that repeatedly wedges the wrapper instead of starving the queue.
+  - **Provision the `.agenttalk/` ignore rule:** `ASSURANCE.md` treats the state directory as gitignored, but `init` does not provision the rule.
 
 **Bus and protocol:**
 - a completion receipt for tasks (#178);
@@ -287,14 +302,20 @@ agenttalk's differences:
 
 ## 9. Native Work & Evidence Spine: Direction
 
-The 2026-08 plan specified a native `agenttalk work` record store. The work board takes a smaller first step: **work is a projection over the bus.** Dispatches carry `work_item`/`stage` tags, replies carry typed verdicts, and a pure reducer derives the card. No second source of truth exists to drift from the bus, and "unknown" is a legal state. Native work records are added only where a projection cannot prove a fact, for example integration evidence (B5).
+The 2026-08 plan specified a native `agenttalk work` record store. The work board takes a smaller first step: **work is a projection over the bus.** Dispatches carry `work_item`/`stage` tags, replies carry typed verdicts, and a pure reducer derives the card. No second source of truth exists to drift from the bus, and "unknown" is a legal state. Anything a projection cannot prove, such as integration evidence, comes from a restricted observer that records evidence (B5), not from a second authoritative work registry.
 
 These invariants from the original spine still hold:
 - **Evidence tiers are never collapsed into one green dot:** `referenced` < `local_agent` < `local_operator` < `automation_ci` < `external_attested`. Release-blocking gates require `automation_ci`, `external_attested`, or an explicit operator waiver.
 - **Evidence is write-once** and bound to the exact head, base, policy hash and producer.
 - **Policy boundary:** core validates schemas, ids, references, freshness, hashes and transitions. It hardcodes no language or scanner. Project policy owns required checks, lenses, accepted tiers, waivers, named tools, timeouts and network policy. Third-party tools are declared checks, pinned and checked offline (0.93).
 
-Workflows on top (onboarding and comprehension, greenfield, existing-project change, legacy adoption) keep the 2026-08 shape. The modernization dogfood showed that the migration phases are a lead-run method; #153 turns them into a first-class workflow.
+Workflows on top keep the 2026-08 shape, restated here so this file stays self-contained:
+- **Onboarding and comprehension:** an onboarding run records the segments inspected, the claims proposed or confirmed, docs/code drift, and blocking unknowns. Large projects fan out by segment, with cross-check records before results become domains, work items, knowledge notes or characterization targets.
+- **Greenfield:** requirements intake, then spec, bootstrap, slice delivery, and a release close over the exact revision.
+- **Existing-project change:** onboard, record claims and unknowns before editing, map ownership and path scope, add characterization tests before risky changes, deliver small gated items, and preserve discoveries.
+- **Legacy adoption:** map, preserve, build the safety net, then change in small gated steps.
+
+The modernization dogfood showed that the migration phases are a lead-run method; #153 turns them into a first-class workflow.
 
 ---
 
@@ -323,7 +344,7 @@ Do not ship broad workflow claims if any of these are true:
 ## 11. Top Risks
 
 - **False trust:** operators read green as correctness. **Mitigation:** the language and UI say "evidence current and policy satisfied", never "code correct"; unknown is shown as unknown.
-- **Store scale:** the publication guard's hold time grows with the store, and it has killed waiting wrappers (#154). **Mitigation:** one publication per command now; compaction unblocked (§6.3); per-recipient delivery (§6.2).
+- **Store scale:** the publication guard's hold time grows with the store, and it has killed waiting wrappers (#154). **Mitigation:** one publication per command now; wrappers that survive contention, then a smaller critical section (§6.2); compaction unblocked (§6.3).
 - **Seat availability:** a dead seat stalls its work until someone relaunches it. **Mitigation:** §6.1.
 - **State-machine drift:** a work layer duplicates lane/gate/close truth. **Mitigation:** the board is a pure projection (§9).
 - **Harness drift:** vendor CLIs change underneath the wrapper. Seen in the field:
@@ -344,7 +365,7 @@ Do not ship broad workflow claims if any of these are true:
 - **Wrapped seat turns start only on a message.** Unfinished multi-turn work waits for the next message (#139).
 - **After a release bump,** tasks to seats not yet relaunched on the new version are refused (#185).
 - **`drain | head` can consume mail that was never displayed** (#37).
-- **The work board is read-only by design.** A stage the evidence cannot prove shows as unknown, and the reducer carries a documented residual (see `docs/DESIGN-work-board.md`).
+- **The work board is read-only by design.** A stage the evidence cannot prove shows as unknown, and the reducer carries a documented seven-point residual (`docs/STEP-WORK-BOARD.md` on branch `feat/work-board-b3a`, landing with PR #215).
 - **Windows CI** runs its serial suite near the one-hour ceiling (#151). Guard-timeout flakes recur on slow runners (#171).
 
 ---
@@ -354,7 +375,7 @@ Do not ship broad workflow claims if any of these are true:
 1. **Ship v0.94.0**, the first board delivery plus the console v2 preview, and upgrade the fleet once.
 2. **Make the team self-healing:**
    - wrappers survive store contention (§6.2 step 1);
-   - close G2 and run the supervisor (§6.1 G1);
+   - close G2, run the supervisor (§6.1 G1), and stop a dead seat waiting out its heartbeat threshold (G6);
    - then the crash harness and guard-aware relaunch (G4, G3);
    - then host-restart survival (#155).
 3. **Fix the store at the mechanism:** measure and shrink the publication critical section (§6.2 step 2), and reconcile stale obligations (§6.3).
