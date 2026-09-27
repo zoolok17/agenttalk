@@ -763,3 +763,23 @@ def test_advice_is_typed_not_message_matching(staged, monkeypatch):
         yield  # pragma: no cover
     monkeypatch.setattr(P.R, "staged_stream", denied)
     assert "fully resolved" not in json.dumps(run(staged))
+
+
+@pytest.mark.parametrize("form,detail", [
+    ("relative", "--cache-root must be an absolute, fully resolved path"),
+    ("parent", "cache root must be a fully resolved locator"),
+])
+def test_operator_preflight_refuses_unresolved_cache_root(staged, monkeypatch, capsys, form, detail):
+    root = staged["root"]
+    (root / "plan.json").write_bytes(encoded(staged["plan"]))
+    (root / "registry.json").write_bytes(encoded(staged["registry"]))
+    (root / "observation.json").write_bytes(encoded(staged["observation"]))
+    decoy = root.parent / (root.name + "-decoy")
+    decoy.mkdir()
+    cache_root = "." if form == "relative" else str(decoy / ".." / root.name)
+    monkeypatch.chdir(root)
+    assert cli.main(["close", "acceptance", "preflight", "--plan", "plan.json",
+                     "--cache-root", cache_root, "--observation", "observation.json", "--json"]) == 3
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "refusal"
+    assert result["holds"] == [P.hold("acceptance_policy_invalid", detail)]

@@ -752,7 +752,9 @@ def evaluate(snapshot):
 
 
 def ack_binding(record):
-    route = record.get("acceptance_route") or {}
+    route = record.get("acceptance_route")
+    if not isinstance(route, dict) or route.get("pending") or "schema_version" not in route:
+        _fail("acceptance ack binding requires a versioned route", "acceptance_record_missing")
     keys = ["instance_id", "attempt_id", "revision", "plan_hash", "registry_hash", "bundle_hash"]
     if schema(route.get("schema_version")).cold:
         keys.extend(["cold_commit_hash", "cold_reconcile_hash", "obligations_hash"])

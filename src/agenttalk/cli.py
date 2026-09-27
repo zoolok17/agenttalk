@@ -3528,7 +3528,9 @@ def _counter_decision_from_cli_spelling(spelling: str, close_mod) -> str:
 def cmd_acceptance_preflight(args: argparse.Namespace) -> int:
     """Operator staging check; deliberately bypass Store discovery and construction."""
     from agenttalk import acceptance as A, acceptance_preflight as P, acceptance_registry as R
+    from agenttalk.acceptance_staging import locator_path
     try:
+        cache_root = locator_path(args.cache_root)
         plan_path = Path(args.plan).absolute()
         plan_bytes = P.read_input(plan_path)
         plan = R.decode(plan_bytes)
@@ -3538,7 +3540,7 @@ def cmd_acceptance_preflight(args: argparse.Namespace) -> int:
         registry_bytes = P.read_input(plan_path.parent / registry_ref)
         observation_path = Path(args.observation).absolute() if args.observation else None
         observation_bytes = P.read_input(observation_path) if observation_path is not None else None
-        result = P.evaluate(plan_bytes, registry_bytes, args.cache_root, observation_bytes=observation_bytes,
+        result = P.evaluate(plan_bytes, registry_bytes, cache_root, observation_bytes=observation_bytes,
                             proof_root=observation_path.parent if observation_path is not None else None)
     except A.AcceptanceError as exc:
         # Import messages are fixed/labelled; never print an OS locator or raw record.
