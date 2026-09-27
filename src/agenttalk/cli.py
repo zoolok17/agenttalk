@@ -196,6 +196,10 @@ def _parse_meta(items: list[str] | None) -> dict:
             # collides with `agenttalk wait`'s timeout signal.
             raise ValueError(f"--meta expects key=value, got {item!r}")
         k, v = item.split("=", 1)
+        from agenttalk import work_tags
+        if k.strip() in work_tags.FIELDS and k.strip() in out:
+            if work_tags.value(k.strip(), out[k.strip()]) != work_tags.value(k.strip(), v.strip()):
+                raise ValueError(f"conflicting {k.strip()} metadata")
         out[k.strip()] = v.strip()
     return out
 
@@ -7722,6 +7726,8 @@ def cmd_task(args: argparse.Namespace) -> int:
             f"will NOT see it (agenttalk build predates task-kind support): "
             f"{names}.\n")
     meta = _parse_meta(args.meta)
+    from agenttalk import work_tags
+    meta = work_tags.task_metadata(meta, args)
     _maybe_autogen_request_id("task", meta, quiet=args.quiet)
     msg = store.send(
         sender=sender,
@@ -15630,6 +15636,8 @@ def build_parser() -> argparse.ArgumentParser:
                             "or the single other agent in the roster)")
     ptask.add_argument("--subject", help="One-line summary")
     ptask.add_argument("--meta", action="append", help="key=value (repeatable)")
+    for flag in ("work-item", "stage", "work-cycle", "work-round", "work-head", "supersedes"):
+        ptask.add_argument("--" + flag, help="Validated work-item dispatch metadata")
     ptask.add_argument("-m", "--message", help="Body text (else --file or stdin)")
     ptask.add_argument("--file", help="Read body from this file path ('-' = stdin)")
     ptask.add_argument("--force", action="store_true",

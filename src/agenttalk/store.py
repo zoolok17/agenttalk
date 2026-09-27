@@ -3356,6 +3356,8 @@ class Store:
                 )
             meta["roster_revision"] = roster_revision
             meta["authorized_liaisons"] = sorted(authorized)
+        from agenttalk import work_tags
+        meta = work_tags.normalize(self, sender, recipient, kind, meta)
         _gates.validate_response_status(kind, meta)
         if kind in OPENER_KINDS and "epoch_at_send" not in meta:
             meta["epoch_at_send"] = self.current_epoch()
@@ -3410,6 +3412,12 @@ class Store:
                     recipient=recipient,
                     allow_reserved_sender=_allow_reserved_sender,
                 )
+                if "supersedes" in meta and kind in work_tags.OPENERS:
+                    work_tags.validate_replacement(
+                        meta, sender, self.valid_messages(), (self.sole_lead(), self.operator_facing()),
+                    )
+                if meta.get("external_deliverable") is True and kind in work_tags.OPENERS:
+                    work_tags._external_opener(self, sender, kind, meta)
                 self._reserve_message_publication_sequence(
                     msg.id,
                     self.valid_messages(),

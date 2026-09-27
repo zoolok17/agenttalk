@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Validate and inherit external work declarations, reserve publisher-owned vendor
+  metadata, and align both lead skills with the finalized work-board contract.
+
+- Validate work-item task flags and equivalent metadata, normalize correlated
+  reply verdicts without inferring missing verdicts, and validate explicit
+  build/review replacements. Align both lead skills with the work-item protocol.
+
 - **`agenttalk.challenge` / `agenttalk-challenge` skill: challenge major work
   before it starts.** A requester sends a blind brief (outcome, trigger,
   size including the cost of doing nothing, constraints, pointers; never who
