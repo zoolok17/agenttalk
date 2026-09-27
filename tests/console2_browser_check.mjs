@@ -60,6 +60,30 @@ async function evaluate(expression) {
   return r.result.value;
 }
 
+// F1/F2 need at least one real redraw to have happened (the fake server ages its cards on every
+// read, so the page's own poll-and-redraw cycle is what changes the .c2-age label's text) before
+// the after-redraw measurements below mean anything. A FIXED sleep before checking once is a race:
+// a slower CI runner (macOS in particular) can miss that window entirely, which is a genuine,
+// correctly-refused precondition failure, not flakiness to paper over with a longer constant.
+// This polls for the actual observed change instead, bounded so a real stall still fails fast and
+// with a clear reason - never silently drops through and lets a stale reading pass as if it moved.
+async function waitForAgeChange(previousText, { timeoutMs = 30000, intervalMs = 250 } = {}) {
+  const start = Date.now();
+  for (;;) {
+    const current = await evaluate(
+      `(() => { const a = document.querySelector('.c2-age'); return a ? a.textContent : null; })()`,
+    );
+    if (current !== previousText) return { changed: true, elapsedMs: Date.now() - start, text: current };
+    const elapsedMs = Date.now() - start;
+    if (elapsedMs >= timeoutMs) {
+      throw new Error(
+        `no redraw observed in ${(elapsedMs / 1000).toFixed(1)}s `
+        + `(the .c2-age label's text stayed "${previousText}")`);
+    }
+    await sleep(intervalMs);
+  }
+}
+
 // R1/R2: a synthetic `document.dispatchEvent(new KeyboardEvent(...))` only ever fires JS listeners -
 // it never triggers the browser's OWN default actions (Tab moving focus, Enter activating a focused
 // button or navigating a focused link). Those defaults are exactly what a focus trap and a
@@ -207,20 +231,24 @@ try {
   out.overlayClosedAfterNativeEscape = await evaluate(`document.getElementById('c2-keymap').className.indexOf('is-open') < 0`);
   out.focusBackOnKeysBtnAfterEscape = await evaluate(`document.activeElement === document.querySelector('.c2-keybtn')`);
 
-  // F1: scroll up, let ordinary redraws happen (the fake server ages its cards on every read)
+  // F1: scroll up, let ordinary redraws happen (the fake server ages its cards on every read) -
+  // wait until one is actually observed (see waitForAgeChange) rather than a fixed sleep.
+  const ageAtScroll = await evaluate(`document.querySelector('.c2-age').textContent`);
   await evaluate(`(() => { window.__thread = document.querySelector('.c2-thread'); window.__thread.scrollTop = 250; return true; })()`);
-  await sleep(4500);
+  out.firstRedrawWaitMs = (await waitForAgeChange(ageAtScroll)).elapsedMs;
   out.afterRedraw = await measure();
   out.threadKept = await evaluate('window.__thread === document.querySelector(".c2-thread") && window.__thread.isConnected');
   out.redrawHappened = await evaluate(`(() => { const a = document.querySelector('.c2-age'); return a ? a.textContent : null; })()`);
   out.railImageKept = await evaluate('window.__avatar === document.querySelector("#c2-rail .c2-avatar-img") && window.__avatar.isConnected');
 
-  // F2: focus a Later button, let redraws happen, focus must stay put on the same element
+  // F2: focus a Later button, let redraws happen, focus must stay put on the same element - again
+  // waiting until the redraw is actually observed, bounded, rather than a fixed sleep.
   await evaluate(`(() => { const b = document.querySelector('.c2-later'); window.__later = b; b.focus();
     return document.activeElement === b; })()`);
   const ageBefore = await evaluate(`document.querySelector('.c2-age').textContent`);
-  await sleep(4500);
-  out.ageMoved = ageBefore !== await evaluate(`document.querySelector('.c2-age').textContent`);
+  const secondRedrawWait = await waitForAgeChange(ageBefore);
+  out.secondRedrawWaitMs = secondRedrawWait.elapsedMs;
+  out.ageMoved = secondRedrawWait.changed;
   out.focusAfter = await evaluate(`(() => { const a = document.activeElement;
     return { tag: a.tagName, key: a.getAttribute('data-c2-focus'), same: a === window.__later, inStream: document.getElementById('c2-stream').contains(a) }; })()`);
 
