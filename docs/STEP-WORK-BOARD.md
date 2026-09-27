@@ -406,3 +406,112 @@ under 9 minutes):
   `work_tags.py` and the tests; `git diff --check` is clean.
 - Size over `fb924fc`: `work_board.py` +140/-69, `work_tags.py` +63/-26 (the
   extraction; behaviour unchanged), tests +177/-3.
+
+### Reducer fix round 5 — audit completion, totality and the documented residual
+
+Base `b55ee63`. Codex developer-4 closed N10-N12 and compared old and new
+`normalize` over 4,632 inputs with no publication difference. It then found where
+the audit did not yet reach (N13-N15). This round completes the mechanism.
+
+**Completion.**
+
+- Openers are audited too. The audit replays every publication invariant that is
+  a function of the envelopes themselves, through two more extracted `work_tags`
+  functions that `normalize` also calls:
+  - `external_declaration`: the structure of an external declaration.
+  - `replacement_target`: a replacement names an existing original of the same
+    item and cycle.
+
+  It also replays `inherit_dispatch`, so a replacement keeps its original's
+  declaration and policy.
+- A violation is recorded against every item any of its references reach:
+  request, the whole reply ancestry, the replacement target and the envelope's
+  own tag. Before, attribution stopped at the first.
+- A tagged reply to an untagged opener is validated, as publication does, not
+  waved through as legacy.
+- `reduce()` is total. Each envelope's audit, each request, each item and the
+  legacy group run in isolation. An internal fault makes only that item Unknown
+  ("reducer could not evaluate this item (Type)"). Envelopes that are not
+  well-formed objects are reported as `unassigned` "malformed envelope". A last
+  resort returns an `error` instead of raising.
+- Malformed-tag recovery uses only type-checked references and creates its item
+  bucket safely (N14).
+
+| Finding | Test |
+| --- | --- |
+| N13 attribution stopped at the first reference | `test_n13_violation_marks_every_item_its_references_reach` |
+| N14 malformed-tag recovery aborted the board | `test_n14_malformed_tag_recovery_never_aborts_the_board` (3 variants) |
+| N15 opener invariants not audited | `test_n15_opener_publication_invariants_are_audited_too` (repo removed; repo + checks removed) |
+| totality | `test_reduce_is_total_an_internal_fault_isolates_one_item`, `test_every_isolation_layer_turns_a_fault_into_one_unknown_item`, `test_malformed_envelopes_are_reported_not_raised` |
+| replacement and reply replay | `test_replayed_opener_invariants_reach_the_original_item`, `test_invalid_reply_status_is_evidence_not_silently_ignored` |
+
+**Property tests.**
+
+- **A** (round 4, kept): 1,996 single deletions or corruptions across the 12
+  single-item shapes. None is Ready and none is a clean Done.
+- **B** (new, `test_property_never_raises_and_rejected_history_never_certifies`)
+  covers 15 shapes: the 12, plus two contradicting items, an item whose only
+  opener carries the tag, and an external-deliverable item.
+  - The damage space is every single deletion; every key set to `[]`,
+    `"garbage"` or `7`, or removed; sender or recipient swapped to another
+    roster seat or a stranger; and cross-item `in_reply_to`/`request_id` swaps.
+  - Result: **5,700 damaged histories, and the reducer never raised on any.**
+  - Realism is judged by replaying `work_tags.normalize` over each history, with
+    dispatches first and then everything else in order.
+  - **3,654 are rejected by publication, and none certifies any affected item.**
+    The other 2,046 are histories publication would accept; the targeted tests
+    judge those.
+  - The oracle is order-canonical because, in an arbitrary fixture order, a fan-out
+    reply anchored to a sibling copy only *looked* unpublishable. It is
+    publishable once copies are dispatched first, and it still answers its own
+    copy.
+
+**Documented residual** (the lead's stopping rule). The reducer certifies only
+from evidence in its snapshot. It is not a guarantee against the following:
+
+1. **Historical authority and freshness.** It does not verify that a
+   replacement's or external declaration's sender held lead, liaison or
+   original-dispatch authority *at the time*, or that a replacement's request ID
+   was fresh when published. Past roles are not recorded. Both checks run at
+   publication only.
+2. **Store validity.** Roster membership, signatures and envelope schema come
+   from `valid_messages`. Non-roster identities never reach the reducer.
+3. **Snapshot completeness.** A retained explicit reference to absent history
+   makes the item Unknown. But a snapshot missing a *whole* thread with no
+   retained reference to it looks exactly like work never dispatched. An example
+   is a separate FIX review, request and reply both absent. The reducer then
+   certifies from what remains. Complete discovery of both partitions before
+   publishing a fresh generation is the B4a/B4s contract.
+4. **Semantic truth.** Publication-valid history whose content is wrong in
+   intent is outside any evidence reducer: a review that approves without
+   reading, a mislabelled stage, a wrongly pinned head.
+5. **Legacy.** Untagged openers only feed the counted Legacy group. Their replies
+   are correlated but not validated, matching publication.
+6. **Integration.** An injected merge fact (B5) may produce Done, but only with
+   its missing or open review, deliverable or check evidence stated.
+7. **Corruption.** Damage that publication would reject and the audit still
+   misses is residual by rule. Property B bounds it over the enumerated space
+   above.
+
+Executed (foreground, `PYTHONPATH=<worktree>/src`, `python -B`, no bytecode,
+task-scratch TEMP/TMP/basetemps, `-q -p no:cacheprovider`, each command well
+under 9 minutes):
+
+- Failing first: **5 failed**. These were N13, N14 (a KeyError), N15, totality
+  (the injected fault escaped) and property B.
+- Publication parity after both `work_tags` extractions: `test_work_tags.py`
+  plus `test_reply_draft_delivery.py` gave **124 passed** each time.
+- Final: `tests/test_work_board_reducer.py` **61 passed**.
+  - With `test_work_tags.py`, `test_threads.py` and `test_reply_draft_delivery.py`:
+    **259 passed** on Python 3.14.6.
+  - The same set without threads: **185 passed** on Python 3.10.11.
+  - `tests/test_cli.py -k "task or reply"`: **33 passed**.
+- Mutation (committed first, restored through git, bytecode-free): **81/81
+  killed**. That includes 17 round-5 mutants (2 in `work_tags`) and every
+  earlier rule re-anchored. Two first-pass survivors were real coverage gaps,
+  now pinned. An N14 variant's fixture short-circuited before the guard it was
+  meant to exercise, and an invalid reply status was only ever ignored, never
+  surfaced.
+- Ruff and Bandit are clean; `git diff --check` is clean.
+- Size over `b55ee63`: `work_board.py` +120/-53, `work_tags.py` +40/-16
+  (extraction), tests +217.

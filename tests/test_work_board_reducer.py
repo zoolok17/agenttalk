@@ -937,3 +937,220 @@ def test_audit_attributes_every_way_and_keeps_malformed_tags_attached():
     item = card(attached)
     assert (item["row"], item["reason"]) == (2, "malformed work metadata") and replacement.id in item["evidence"]
     assert W.reduce(attached.messages, lead=LEAD)["legacy"]["open_request_count"] == 0
+
+
+# ---- Round 5 (codex dev-4, 2026-09-27): N13-N15, totality, extended property ----
+
+def other_item(bus, head=HEAD2):
+    bus.reply(bus.task("tk-b-build", BUILDER, "build", item="other-item", **POLICY), verdict="done")
+    return bus.task("tk-b-read", REVIEWER, "read", item="other-item", work_head=head)
+
+
+def items_of(messages, **facts):
+    return {i["work_item"]: i for i in W.reduce(messages, lead=LEAD, **facts)["items"]}
+
+
+def test_n13_violation_marks_every_item_its_references_reach():
+    bus = Bus()
+    reviewed(bus)
+    b_read = other_item(bus)
+    bus.reply(b_read, verdict="GO")
+    columns = {slug: item["workflow_column"] for slug, item in items_of(bus.messages).items()}
+    assert columns == {ITEM: "ready", "other-item": "ready"}
+    bad = bus.add(REVIEWER, LEAD, "task-response", {"request_id": "tk-read", "in_reply_to": b_read.id, "status": "done",
+                                                      "verdict": "FIX"}, raw=True)
+    for item in items_of(bus.messages).values():
+        assert item["row"] == 2 and bad.id in item["evidence"], item["work_item"]
+
+
+def test_n14_malformed_tag_recovery_never_aborts_the_board():
+    def with_meta(message, **changes):
+        return replace(message, meta=dict(message.meta, **changes))
+
+    base = Bus()
+    build = base.task("tk-build", BUILDER, "build", **POLICY)
+    base.reply(build, verdict="done")
+    other_item(base)
+    only = [with_meta(build, work_item=["bad"])] + base.messages[1:]
+    out = W.reduce(only, lead=LEAD)
+    item = next(i for i in out["items"] if i["work_item"] == ITEM)
+    assert (item["row"], item["reason"]) == (2, "malformed work metadata") and build.id in item["evidence"]
+    assert next(i for i in out["items"] if i["work_item"] == "other-item")["workflow_column"] == "independent_review"
+    variant = [with_meta(build, work_item=["bad"], supersedes=[])] + base.messages[1:]
+    assert next(i for i in W.reduce(variant, lead=LEAD)["items"] if i["work_item"] == ITEM)["row"] == 2
+    stray = replace(base.messages[1], id=nth_id(90),
+                    meta=dict(base.messages[1].meta, request_id="tk-elsewhere", in_reply_to=[]))
+    assert next(i for i in W.reduce(only + [stray], lead=LEAD)["items"] if i["work_item"] == ITEM)["row"] == 2
+
+
+def test_n15_opener_publication_invariants_are_audited_too():
+    bus = Bus()
+    read = bus.task("tk-read", REVIEWER, "read", work_head=HEAD, **EXTERNAL)
+    bus.reply(read, verdict="GO")
+    assert card(bus)["workflow_column"] == "ready"
+    for removed in (("work_repo",), ("work_repo", "required_gates")):
+        meta = {k: v for k, v in read.meta.items() if k not in removed}
+        history = [replace(read, meta=meta)] + bus.messages[1:]
+        item = next(i for i in W.reduce(history, lead=LEAD)["items"] if i["work_item"] == ITEM)
+        assert (item["row"], item["reason"]) == (2, "external deliverable requires bounded work_repo")
+
+
+def test_reduce_is_total_an_internal_fault_isolates_one_item(monkeypatch):
+    bus = Bus()
+    reviewed(bus)
+    other_item(bus)
+    real = W._place
+
+    def faulty(slug, *args, **kwargs):
+        if slug == ITEM:
+            raise KeyError("boom")
+        return real(slug, *args, **kwargs)
+
+    monkeypatch.setattr(W, "_place", faulty)
+    out = items_of(bus.messages)
+    assert (out[ITEM]["workflow_column"], out[ITEM]["row"], out[ITEM]["reason"]) == (
+        "unknown", 2, "reducer could not evaluate this item (KeyError)")
+    assert out["other-item"]["workflow_column"] == "independent_review"
+
+
+def publishable(messages):
+    """Could modern publication have produced this history? Replay work_tags.normalize envelope by envelope.
+
+    Dispatches go first (a real fan-out dispatches every copy before replies arrive), then the rest in order,
+    so a reply anchored to a sibling copy is judged on content, not on this fixture's arbitrary order.
+    """
+    prefix = Bus()
+    ordered = [m for m in messages if m.kind in ("task", "review-request")] + [
+        m for m in messages if m.kind not in ("task", "review-request")]
+    for m in ordered:
+        try:
+            work_tags.normalize(prefix, m.sender, m.recipient, m.kind, dict(m.meta))
+        except Exception:  # noqa: BLE001 - classification of a fixture, not production handling
+            return False
+        prefix.messages.append(m)
+    return True
+
+
+def shapes():
+    for variant, review in [(v, r) for v in range(3) for r in range(4)]:
+        yield valid_history(variant, review)[0]
+    two = Bus()
+    reviewed(two)
+    two.reply(other_item(two), verdict="GO")
+    yield two
+    lone = Bus()
+    lone.reply(lone.task("tk-build", BUILDER, "build", **POLICY), verdict="done")
+    yield lone
+    external = Bus()
+    external.reply(external.task("tk-read", REVIEWER, "read", work_head=HEAD, **EXTERNAL), verdict="GO")
+    yield external
+
+
+def damages(bus):
+    """Every single deletion, key corruption/removal, participant swap and cross-item reference swap."""
+    openers = [m for m in bus.messages if m.kind in ("task", "review-request")]
+    for index, message in enumerate(bus.messages):
+        slug = message.meta.get("work_item") if isinstance(message.meta.get("work_item"), str) else None
+        yield bus.messages[:index] + bus.messages[index + 1:], {slug}
+        variants = [dict(message.meta, **{key: bad}) for key in message.meta for bad in ([], "garbage", 7)]
+        variants += [{k: v for k, v in message.meta.items() if k != key} for key in message.meta]
+        for meta in variants:
+            yield bus.messages[:index] + [replace(message, meta=meta)] + bus.messages[index + 1:], {slug}
+        for role in ("sender", "recipient"):
+            for who in (REVIEWER3, "stranger-agent"):
+                changed = replace(message, **{role: who})
+                yield bus.messages[:index] + [changed] + bus.messages[index + 1:], {slug}
+        if message.kind in work_tags.REPLIES:
+            for target in openers:
+                reached = {slug, target.meta.get("work_item")}
+                for meta in (dict(message.meta, in_reply_to=target.id),
+                             dict(message.meta, request_id=target.meta["request_id"])):
+                    yield bus.messages[:index] + [replace(message, meta=meta)] + bus.messages[index + 1:], reached
+
+
+def test_property_never_raises_and_rejected_history_never_certifies():
+    total = rejected = 0
+    for bus in shapes():
+        heads = {m.meta.get("work_head") for m in bus.messages if m.meta.get("work_head")}
+        for integrated in ({}, {(slug, head): True for slug in (ITEM, "other-item") for head in heads}):
+            for history, affected in damages(bus):
+                out = W.reduce(history, lead=LEAD, integrated=integrated)  # must never raise
+                total += 1
+                if publishable(history):
+                    continue  # realistic history: correctness is judged by the targeted tests, not here
+                rejected += 1
+                for item in out["items"]:
+                    if item["work_item"] in affected:
+                        assert not (item["workflow_column"] == "ready" or (
+                            item["workflow_column"] == "done" and item["reason"] == "integrated in configured target")
+                                    ), (item["work_item"], item["reason"])
+    assert (total, rejected) == (5700, 3654)  # never raised on any; none of the 3,654 rejected certifies
+
+
+def test_replayed_opener_invariants_reach_the_original_item():
+    crossing = Bus()
+    reviewed(crossing)  # ITEM: completed build tk-build, GO review
+    rogue = crossing.task("tk-rogue", REVIEWER2, "build", item="other-item", supersedes="tk-build", raw=True, **POLICY)
+    item = card(crossing)
+    assert (item["row"], item["reason"]) == (2, "supersedes must name the same work item")
+    assert rogue.id in item["evidence"]
+    lost = Bus()
+    lost.task("tk-build", BUILDER, "build", **POLICY)
+    lost.reply(lost.task("tk-build-2", BUILDER2, "build", supersedes="tk-build", raw=True), verdict="done")
+    lost.rescind("tk-build", sender=LEAD)
+    lost.reply(lost.task("tk-read", REVIEWER, "read", work_head=HEAD), verdict="GO")
+    assert card(lost)["reason"] == "replacement dispatch lost its original's declaration or policy"
+    claimed = Bus()
+    reviewed(claimed)
+    untagged = claimed.task("tk-legacy", BUILDER, "build", item=None)
+    claimed.add(BUILDER, LEAD, "task-response", {"in_reply_to": untagged.id, "request_id": "tk-legacy",
+                                                 "status": "done", "verdict": "done", "work_item": ITEM}, raw=True)
+    assert (card(claimed)["row"], card(claimed)["reason"]) == (2, "reply work_item contradicts opener")
+
+
+def test_every_isolation_layer_turns_a_fault_into_one_unknown_item(monkeypatch):
+    bus = Bus()
+    reviewed(bus)
+    other_item(bus)
+
+    def fault_for_item(name):
+        real = getattr(W, name)
+
+        def faulty(first, *args, **kwargs):
+            if getattr(first, "meta", first).get("work_item") == ITEM:  # an envelope or its meta
+                raise RuntimeError(name)
+            return real(first, *args, **kwargs)
+        monkeypatch.setattr(W, name, faulty)
+
+    for name in ("_audit_one", "_parse"):
+        with monkeypatch.context():
+            fault_for_item(name)
+            out = items_of(bus.messages)
+            assert out[ITEM]["reason"] == "reducer could not evaluate this item (RuntimeError)", name
+            assert out["other-item"]["workflow_column"] == "independent_review", name
+    monkeypatch.setattr(W, "_legacy", lambda reqs: 1 / 0)
+    out = W.reduce(bus.messages, lead=LEAD)
+    assert out["legacy"]["open_request_count"] is None and "ZeroDivisionError" in out["legacy"]["error"]
+    assert len(out["items"]) == 2
+    monkeypatch.setattr(W, "_audit", lambda messages, openers: 1 / 0)
+    assert W.reduce(bus.messages, lead=LEAD)["error"] == "reducer could not evaluate the board (ZeroDivisionError)"
+
+
+def test_malformed_envelopes_are_reported_not_raised():
+    from types import SimpleNamespace
+    bus = Bus()
+    reviewed(bus)
+    odd = SimpleNamespace(id="odd-1", kind="task", sender=LEAD, recipient=BUILDER, meta=None)
+    out = W.reduce(bus.messages + [odd], lead=LEAD)
+    assert out["unassigned"]["reasons"] == {"malformed envelope": 1}
+    assert next(i for i in out["items"] if i["work_item"] == ITEM)["workflow_column"] == "ready"
+
+
+def test_invalid_reply_status_is_evidence_not_silently_ignored():
+    bus = Bus()
+    reviewed(bus)
+    build = next(m for m in bus.messages if m.meta.get("request_id") == "tk-build" and m.kind == "task")
+    odd = bus.add(BUILDER, LEAD, "task-response", {"in_reply_to": build.id, "request_id": "tk-build",
+                                                   "status": "maybe", "verdict": "done"}, raw=True)
+    item = card(bus)
+    assert item["row"] == 2 and odd.id in item["evidence"] and "status" in item["reason"]

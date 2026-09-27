@@ -9,7 +9,8 @@ Before reduction, a read-side audit applies the publication invariants of
 work_tags to every envelope, historical or modern. A violation is evidence
 against the item the envelope can still be attributed to, which becomes Unknown;
 an explicit reference that does not resolve is missing history, never a fallback;
-unattributable violations are reported, not dropped. It never aborts the reduction.
+unattributable violations are reported, not dropped. reduce() is total: an
+internal fault on one item makes that item Unknown and the rest of the board reduces.
 """
 
 import json
@@ -21,6 +22,7 @@ EXECUTION = {"design", "build", "fix"}
 EARLIER_REQUESTER = "outstanding task from an earlier requester; current lead cannot cancel yet"
 EXTERNAL = "external deliverable; authorship unverified"
 MISSING = "missing required correlation history"
+FAULT = "reducer could not evaluate this item"
 _TAGS = ("work_item", "stage", "work_cycle", "work_round", "external_deliverable")
 _DISPATCH_ONLY = {"supersedes", "assignee_model_vendors", "assignee_model_vendor"}
 _POLICY = ("work_repo", "work_branch", "work_target", "no_gates_reason")
@@ -55,7 +57,7 @@ def _parse(meta):
                   "policy": policy if any(v is not None for v in policy) else None}
 
 
-def _request(rid, copies, responses, running, descends):
+def _request(rid, copies, responses, running, descends, parse=True):
     first, meta = copies[0], copies[0].meta
     openers = sorted(c.id for c in copies)
     req = {"request_id": rid, "kind": first.kind, "requester": first.sender, "openers": openers,
@@ -66,6 +68,8 @@ def _request(rid, copies, responses, running, descends):
     if (any((c.sender, c.kind, c.meta) != (first.sender, first.kind, meta) for c in copies)
             or len({c.recipient for c in copies}) != len(copies)):
         req["issues"].append(("ambiguous fan-out openers", openers))
+    if not parse:
+        return req
     try:
         req.update(_parse(meta)[1])
     except (TypeError, ValueError):
@@ -158,19 +162,19 @@ def _audit(messages, openers):
     responses, flags, unassigned = {}, {}, []
 
     def owners(m):
-        found = []
-        rid = m.meta.get("request_id")
-        if isinstance(rid, str) and rid in openers:
-            found.append(rid)
+        # Every reference counts independently: request, whole reply ancestry, replacement target, own tag.
+        found = set()
+        references = [m.meta.get("request_id")]
+        if m.kind in work_tags.OPENERS:
+            references.append(m.meta.get("supersedes"))
         seen, node = set(), m.meta.get("in_reply_to")
-        while not found and isinstance(node, str) and node in by_id and node not in seen:
+        while isinstance(node, str) and node in by_id and node not in seen:
             seen.add(node)
-            ancestor = by_id[node].meta.get("request_id")
-            if isinstance(ancestor, str) and ancestor in openers:
-                found.append(ancestor)
+            references.append(by_id[node].meta.get("request_id"))
             node = parent.get(node)
+        found.update(ref for ref in references if isinstance(ref, str) and ref in openers)
         slug = _slug(m.meta)
-        return found + ([("item", slug)] if slug else [])
+        return sorted(found) + ([("item", slug)] if slug else [])
 
     def flag(m, reason):
         targets = owners(m)
@@ -180,54 +184,95 @@ def _audit(messages, openers):
             flags.setdefault(target, []).append((reason, [m.id]))
 
     for m in messages:
-        meta = m.meta
-        rid, anchor_id = meta.get("request_id"), meta.get("in_reply_to")
-        if (not (rid is None or isinstance(rid, str)) or not (anchor_id is None or isinstance(anchor_id, str))
-                or (m.kind in work_tags.OPENERS and not rid)):
-            flag(m, "malformed correlation")
-        elif anchor_id is not None and anchor_id not in by_id:
-            flag(m, MISSING)  # a named reference that does not resolve is never replaced by a fallback
-        elif anchor_id is not None and _cyclic(m.id, parent):
-            flag(m, "cyclic reply ancestry")
-        elif m.kind in work_tags.REPLIES or m.kind == "rescind":
-            anchor = by_id.get(anchor_id)
-            request = rid or (anchor.meta.get("request_id") if anchor is not None else None)
-            copies = openers.get(request) if isinstance(request, str) else None
-            if copies is None:
-                flag(m, MISSING)
-            elif m.kind == "rescind" or not any("work_item" in c.meta for c in copies):
-                responses.setdefault(request, []).append(m)  # untagged legacy protocol is unchanged
-            else:
-                try:
-                    if _DISPATCH_ONLY & meta.keys():
-                        raise ValueError("reply carries dispatch-only metadata")
-                    work_tags.reply_request(meta, anchor)
-                    opener = work_tags.reply_opener(copies, m.sender, m.recipient, m.kind)
-                    clean = work_tags.inherit(opener.meta, {
-                        k: work_tags.value(k, v) if k in work_tags.FIELDS else v for k, v in meta.items()})
-                    gates.validate_response_status(m.kind, clean)
-                    _, issue = work_tags.reply_verdict(m.kind, clean.get("stage"), clean.get("status"),
-                                                       clean.get("verdict"))
-                    if issue == "unrecognized verdict":  # uninterpretable evidence cannot certify any row
-                        raise ValueError(issue)
-                except LookupError:
-                    flag(m, MISSING)
-                except (TypeError, ValueError) as exc:
-                    flag(m, str(exc))
-                else:
-                    responses.setdefault(request, []).append(m)
+        try:
+            _audit_one(m, by_id, parent, openers, responses, flag)
+        except Exception as exc:  # noqa: BLE001 - totality: the fault becomes that item's evidence
+            flag(m, f"{FAULT} ({type(exc).__name__})")
     return responses, flags, unassigned, parent
 
 
+def _audit_one(m, by_id, parent, openers, responses, flag):
+    meta = m.meta
+    rid, anchor_id = meta.get("request_id"), meta.get("in_reply_to")
+    if (not (rid is None or isinstance(rid, str)) or not (anchor_id is None or isinstance(anchor_id, str))
+            or (m.kind in work_tags.OPENERS and not rid)):
+        flag(m, "malformed correlation")
+    elif anchor_id is not None and anchor_id not in by_id:
+        flag(m, MISSING)  # a named reference that does not resolve is never replaced by a fallback
+    elif anchor_id is not None and _cyclic(m.id, parent):
+        flag(m, "cyclic reply ancestry")
+    elif m.kind in work_tags.OPENERS:
+        try:  # malformed tags are reported by the per-request parse; replay the rest of publication
+            clean = {k: work_tags.value(k, v) if k in work_tags.FIELDS else v for k, v in meta.items()}
+        except (TypeError, ValueError):
+            return
+        try:
+            if clean.get("external_deliverable") is True:
+                work_tags.external_declaration(m.kind, clean)
+            target = clean.get("supersedes")
+            if isinstance(target, str) and target in openers:  # a missing target is the graph's MISSING
+                original = work_tags.replacement_target(clean, openers[target])
+                if work_tags.inherit_dispatch(original.meta, clean) != clean:
+                    raise ValueError("replacement dispatch lost its original's declaration or policy")
+        except (TypeError, ValueError) as exc:
+            flag(m, str(exc))
+    elif m.kind in work_tags.REPLIES or m.kind == "rescind":
+        anchor = by_id.get(anchor_id)
+        request = rid or (anchor.meta.get("request_id") if anchor is not None else None)
+        copies = openers.get(request) if isinstance(request, str) else None
+        if copies is None:
+            flag(m, MISSING)
+        elif m.kind == "rescind" or not (any("work_item" in c.meta for c in copies)
+                                         or set(work_tags.FIELDS) & meta.keys()):
+            responses.setdefault(request, []).append(m)  # untagged legacy protocol is unchanged, as published
+        else:
+            try:
+                if _DISPATCH_ONLY & meta.keys():
+                    raise ValueError("reply carries dispatch-only metadata")
+                work_tags.reply_request(meta, anchor)
+                opener = work_tags.reply_opener(copies, m.sender, m.recipient, m.kind)
+                clean = work_tags.inherit(opener.meta, {
+                    k: work_tags.value(k, v) if k in work_tags.FIELDS else v for k, v in meta.items()})
+                gates.validate_response_status(m.kind, clean)
+                _, issue = work_tags.reply_verdict(m.kind, clean.get("stage"), clean.get("status"),
+                                                   clean.get("verdict"))
+                if issue == "unrecognized verdict":  # uninterpretable evidence cannot certify any row
+                    raise ValueError(issue)
+            except LookupError:
+                flag(m, MISSING)
+            except (TypeError, ValueError) as exc:
+                flag(m, str(exc))
+            else:
+                responses.setdefault(request, []).append(m)
+
+
 def reduce(messages, *, lead, incidents=(), integrated=None, running=frozenset(), checks=None):
-    """Return {"items", "legacy", "unassigned"}; the input is never mutated or ordered by ID."""
+    """Return {"items", "legacy", "unassigned"}; total, never mutates its input or orders it by ID."""
+    try:
+        return _reduce(messages, lead, incidents, integrated, running, checks)
+    except Exception as exc:  # noqa: BLE001 - last resort; per-item isolation below normally applies
+        return {"items": [], "legacy": {"open_request_count": None, "known_lower_bound": 0, "counts_by_kind": {},
+                                        "examples": [], "truncated": False},
+                "unassigned": {"count": 0, "reasons": {}, "examples": []},
+                "error": f"reducer could not evaluate the board ({type(exc).__name__})"}
+
+
+def _well_formed(m):
+    return all(isinstance(getattr(m, name, None), str) for name in ("id", "kind", "sender", "recipient")) and \
+        isinstance(getattr(m, "meta", None), dict)
+
+
+def _reduce(messages, lead, incidents, integrated, running, checks):
     messages = list(messages)
+    broken = [m for m in messages if not _well_formed(m)]
+    messages = [m for m in messages if _well_formed(m)]
     openers = {}
     for m in messages:
         rid, anchor = m.meta.get("request_id"), m.meta.get("in_reply_to")
         if m.kind in work_tags.OPENERS and isinstance(rid, str) and rid and (anchor is None or isinstance(anchor, str)):
             openers.setdefault(rid, []).append(m)
     responses, flags, unassigned, parent = _audit(messages, openers)
+    unassigned += [("malformed envelope", getattr(m, "id", None)) for m in broken]
 
     def descends(later, earlier):
         seen, node = set(), parent.get(later)
@@ -240,7 +285,11 @@ def reduce(messages, *, lead, incidents=(), integrated=None, running=frozenset()
 
     grouped, legacy, detached = {}, [], []
     for rid, copies in openers.items():
-        req = _request(rid, copies, responses.get(rid, []), running, descends)
+        try:
+            req = _request(rid, copies, responses.get(rid, []), running, descends)
+        except Exception as exc:  # noqa: BLE001 - totality: the request's item becomes Unknown
+            req = _request(rid, copies, [], frozenset(), lambda later, earlier: False, parse=False)
+            req["issues"].append((f"{FAULT} ({type(exc).__name__})", req["openers"]))
         req["issues"] += flags.get(rid, [])
         req["work_item"] = _slug(copies[0].meta)
         if req["work_item"]:
@@ -252,12 +301,13 @@ def reduce(messages, *, lead, incidents=(), integrated=None, running=frozenset()
     item_of = {r["request_id"]: slug for slug, reqs in grouped.items() for r in reqs}
     for req, copies in detached:
         ids = {c.id for c in copies}
-        links = {item_of.get(copies[0].meta.get("supersedes"))} | {
-            _slug(m.meta) for m in messages if m.meta.get("request_id") == req["request_id"]
-            or m.meta.get("in_reply_to") in ids}
+        target = copies[0].meta.get("supersedes")
+        links = {item_of.get(target)} if isinstance(target, str) else set()
+        links |= {_slug(m.meta) for m in messages if m.meta.get("request_id") == req["request_id"]
+                  or (isinstance(m.meta.get("in_reply_to"), str) and m.meta["in_reply_to"] in ids)}
         links.discard(None)
         if len(links) == 1:
-            grouped[links.pop()].append(req)  # its malformed-metadata issue makes that item Unknown
+            grouped.setdefault(links.pop(), []).append(req)  # its malformed-metadata issue makes that item Unknown
         else:
             unassigned.extend(("malformed work metadata", i) for i in sorted(ids))
     tagged = {key[1]: issues for key, issues in flags.items() if isinstance(key, tuple)}
@@ -268,7 +318,12 @@ def reduce(messages, *, lead, incidents=(), integrated=None, running=frozenset()
     reasons = {}
     for reason, _ in unassigned:
         reasons[reason] = reasons.get(reason, 0) + 1
-    return {"items": items, "legacy": _legacy(legacy),
+    try:
+        legacy_group = _legacy(legacy)
+    except Exception as exc:  # noqa: BLE001 - totality: an uncountable legacy group is unknown, never zero
+        legacy_group = {"open_request_count": None, "known_lower_bound": 0, "counts_by_kind": {}, "examples": [],
+                        "truncated": False, "error": f"{FAULT} ({type(exc).__name__})"}
+    return {"items": items, "legacy": legacy_group,
             "unassigned": {"count": len(unassigned), "reasons": dict(sorted(reasons.items())),
                            "examples": sorted(i for _, i in unassigned)[:20]}}
 
@@ -315,6 +370,18 @@ def _graph(reqs, known):
 
 
 def _item(slug, reqs, orphans, facts):
+    try:
+        return _evaluate_item(slug, reqs, orphans, facts)
+    except Exception as exc:  # noqa: BLE001 - totality: one item's fault never hides the rest of the board
+        evidence = sorted({i for r in reqs for i in r["openers"]} | {i for _, ids in orphans for i in ids})
+        return {"work_item": slug, "title": None, "cycle": None, "legacy_cycle": True, "round": None,
+                "candidate": None, "builders": [], "verdicts": {}, "obligations": [], "incidents": [],
+                "issues": [], "previous_cycles": [], "checks": None, "integration": {},
+                "column": "unknown", "workflow_column": "unknown", "row": 2,
+                "reason": f"{FAULT} ({type(exc).__name__})", "evidence": evidence}
+
+
+def _evaluate_item(slug, reqs, orphans, facts):
     item = {"work_item": slug, "title": None, "cycle": None, "legacy_cycle": True, "round": None,
             "candidate": None, "builders": [], "verdicts": {}, "obligations": [], "incidents": [],
             "issues": [], "previous_cycles": [], "checks": None,
