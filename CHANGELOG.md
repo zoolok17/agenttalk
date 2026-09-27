@@ -25,9 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   diagnostic per persistent episode. An owner that cannot re-enter a lock's guard
   to remove its own marker no longer waits on itself: the process removes exactly
   that marker on its next acquisition or sweep. Contention is never persisted as a
-  permanent block: failed-delivery disposition, retry-exhaustion settlement, the
-  retry barrier, block writes and cursor-projection accounting report it typed so
-  the step is retried. Corruption, access denial, unsafe generation changes,
+  permanent block, and no gate method raises anything new because of it:
+  failed-delivery disposition, retry-exhaustion settlement, block writes and
+  cursor-projection accounting keep their own internal retry and return state, but
+  a contended outcome is left unpersisted, so the step is retried (in place in the
+  continuous loop, on the next poll in a one-shot). Corruption, access denial, unsafe
+  generation changes,
   lock-order inversions and a lost lease keep their existing handling and are
   never retried as contention.
 

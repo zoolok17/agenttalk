@@ -66,17 +66,26 @@ MAX_FINALIZATION_MISSES = 12
 MAX_FINALIZATION_SECONDS = 900.0
 MAX_DEFERRAL_SECONDS = 3600.0
 PROOF_UNREADABLE_SECONDS = 900.0
-# #154: the landed-response lookups report store lock contention under these exact
-# reasons instead of the generic unavailability, so the continuous wrapper loop can
-# retry that one step in place (visibly) rather than re-peek. Every other caller
-# still sees an ordinary unavailable / INDETERMINATE result, exactly as before.
+# #154 caller contract: store lock contention never changes what a gate method
+# raises or which state it returns. Where a method used to fold a failure into a
+# fail-closed result, contention returns that SAME state with one of these exact
+# reasons, and nothing is persisted for it: no obligation block, no disposition
+# block. Callers without an in-place retry (the one-shot loop, the CLI) therefore
+# see exactly the result they always handled and simply try again later; the
+# continuous wrapper loop recognizes the reason and retries the call in place.
 LANDED_REPLAY_CONTENDED = "validated landed-response replay contended"
 LANDED_RETENTION_CONTENDED = "landed-response retention contended"
 LEDGER_REPLAY_CONTENDED = "canonical replay indexing contended"
+DISPOSITION_CONTENDED = "failed-delivery disposition contended"
+BLOCK_WRITE_CONTENDED = "obligation block write contended"
+PROJECTION_ACCOUNTING_CONTENDED = "cursor projection miss accounting contended"
 CONTENDED_REASONS = frozenset({
     LANDED_REPLAY_CONTENDED,
     LANDED_RETENTION_CONTENDED,
     LEDGER_REPLAY_CONTENDED,
+    DISPOSITION_CONTENDED,
+    BLOCK_WRITE_CONTENDED,
+    PROJECTION_ACCOUNTING_CONTENDED,
 })
 
 
@@ -136,20 +145,15 @@ class LedgerContended(LedgerUnreadable):
     """
 
 
-def _is_contention(exc: BaseException) -> bool:
+def _is_contention(exc: BaseException | None) -> bool:
     """#154: identifiable store lock contention, raised directly or as a timed-out replay."""
     return isinstance(exc, (LockContention, LedgerContended))
 
 
-def _uncontended(result: "Resolution") -> "Resolution":
-    """#154: a replay folded into a contended fail-closed result decides nothing.
-
-    Re-raise it TYPED before a caller can persist a permanent block from it, so the
-    wrapper's in-place retry acts instead; every other result passes through.
-    """
-    if result.reason in CONTENDED_REASONS:
-        raise LedgerContended(result.reason)
-    return result
+def _contended(result: "Resolution") -> bool:
+    """#154: a result that only reports contention: it decides nothing and must
+    never be persisted as a block."""
+    return result.reason in CONTENDED_REASONS
 
 
 class StaleRevision(GateError):
@@ -5025,8 +5029,6 @@ class DetectionCommitGate:
         with self.store._message_publication_lock():
             try:
                 self._validated_messages()
-            except LedgerContended:
-                raise  # #154: contention is not "no retry now"; the caller retries this
             except LedgerUnreadable:
                 return False
             with self.store._exclusive_lock(
@@ -5207,7 +5209,9 @@ class DetectionCommitGate:
         try:
             return self.mark_blocked(key, reason=reason)
         except LockContention:
-            raise  # #154: retry this block write; never escalate contention globally
+            # #154: the same BLOCKED state, but not persisted and never escalated
+            # into the disposition block; the block is re-derived on the next try.
+            return Resolution(ResolverState.BLOCKED, BLOCK_WRITE_CONTENDED, key)
         except (GateError, OSError, TimeoutError):
             self._record_disposition_block(reason=reason)
             return Resolution(ResolverState.BLOCKED, reason, key)
@@ -5222,9 +5226,11 @@ class DetectionCommitGate:
     ) -> Resolution:
         """Commit exact-head failed delivery, or make inability to do so visible.
 
-        #154: store lock contention anywhere in here - raised, or folded into a
-        replay - propagates TYPED before anything persists a block; only a
-        non-contention failure is made visible as the fail-closed BLOCK.
+        #154: the flow and its one internal replay-and-retry are unchanged, so a
+        single transient contention still recovers inside this call. Only when
+        the outcome would be the "disposition unavailable" BLOCK and the cause is
+        contention is that BLOCKED state returned unpersisted instead (see
+        CONTENDED_REASONS).
         """
         try:
             return self.delivery_failed(
@@ -5234,18 +5240,18 @@ class DetectionCommitGate:
                 expected_revision=expected_revision,
             )
         except (GateError, OSError, TimeoutError, ValueError, RuntimeError) as exc:
-            if _is_contention(exc):
-                raise
             failure = exc
         try:
-            replayed = _uncontended(self.resolve(record))
+            replayed = self.resolve(record)
         except (GateError, OSError, TimeoutError, ValueError, RuntimeError) as exc:
             if _is_contention(exc):
-                raise
+                return Resolution(ResolverState.BLOCKED, DISPOSITION_CONTENDED, key)
             return self._block_retry_exhaustion(
                 key,
                 reason=f"failed-delivery disposition unavailable: {type(exc).__name__}",
             )
+        if _contended(replayed):
+            return replayed
         if replayed.terminal:
             try:
                 finalized = self.finalize(
@@ -5269,9 +5275,9 @@ class DetectionCommitGate:
                     expected_revision=replayed.scoped_revision,
                 )
             except (GateError, OSError, TimeoutError, ValueError, RuntimeError) as exc:
-                if _is_contention(exc):
-                    raise
                 failure = exc
+        if _is_contention(failure):
+            return Resolution(ResolverState.BLOCKED, DISPOSITION_CONTENDED, key)
         return self._block_retry_exhaustion(
             key,
             reason=f"failed-delivery disposition unavailable: {type(failure).__name__}",
@@ -5298,9 +5304,11 @@ class DetectionCommitGate:
             locks.enter_context(self.store._message_publication_lock())
             try:
                 messages, _ = self._validated_messages()
-            except LedgerContended:
-                raise  # #154: contention is not an unavailable proof
             except LedgerUnreadable as exc:
+                if _is_contention(exc):
+                    # #154: contention is not an unavailable proof: same state,
+                    # nothing persisted.
+                    return Resolution(ResolverState.BLOCKED, LEDGER_REPLAY_CONTENDED, key)
                 return self._block_retry_exhaustion(
                     key,
                     reason=f"head-local proof unavailable: {exc}",
@@ -5461,9 +5469,9 @@ class DetectionCommitGate:
         """Replay once at the bound, then choose terminal, local failure, or BLOCKED."""
         if category not in {"operation_infra", "finalization"}:
             raise ValueError("unknown retry category")
-        # #154: a contended replay decides nothing - it must never become the
-        # exhaustion BLOCK below; _uncontended re-raises it typed first.
-        latest = _uncontended(self.resolve(record))
+        latest = self.resolve(record)
+        if _contended(latest):
+            return latest  # #154: a contended replay decides nothing; nothing persisted
         if latest.terminal:
             finalized = self.finalize(
                 record,
@@ -5472,7 +5480,9 @@ class DetectionCommitGate:
             )
             if finalized.state != ResolverState.INDETERMINATE:
                 return finalized
-            raced = _uncontended(self.resolve(record))
+            raced = self.resolve(record)
+            if _contended(raced):
+                return raced  # #154: never the "raced its final replay" block
             if raced.terminal:
                 # Keep the canonical terminal authoritative.  The next poll can
                 # retry only its cursor CAS; synthesizing BLOCKED here would mask
@@ -6772,13 +6782,16 @@ class DetectionCommitGate:
                             key_digest=key_digest,
                         )
                     self._write(ledger)
-            except LockContention:
-                # #154: the disposition is durable; retry this finalization
-                # instead of escalating contention into a disposition block.
-                raise
-            except (OSError, TimeoutError, ValueError, RuntimeError, LedgerUnreadable):
-                reason = "cursor projection failure accounting is unavailable"
-                exhausted = True
+            except (OSError, TimeoutError, ValueError, RuntimeError, LedgerUnreadable) as exc:
+                if _is_contention(exc):
+                    # #154: the same INDETERMINATE result, without escalating
+                    # contention into a disposition block; the next finalization
+                    # accounts the outstanding miss.
+                    reason = PROJECTION_ACCOUNTING_CONTENDED
+                    exhausted = False
+                else:
+                    reason = "cursor projection failure accounting is unavailable"
+                    exhausted = True
             if exhausted:
                 self._record_disposition_block(reason=reason)
             return Resolution(ResolverState.INDETERMINATE, reason, key)

@@ -2490,19 +2490,11 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                     continue
                 captured = commit_gate.captured_operation(key)
                 if captured is not None:
-                    from .obligations import LedgerContended
-
-                    try:
-                        may_retry = commit_gate.record_retry_barrier(
-                            key,
-                            category="operation_infra",
-                            expected_revision=resolution.scoped_revision,
-                        )
-                    except LedgerContended:
-                        # #154: the gate now reports a contended replay typed; the
-                        # one-shot loop has no in-place retry, so keep its old
-                        # "no retry this poll" answer.
-                        may_retry = False
+                    may_retry = commit_gate.record_retry_barrier(
+                        key,
+                        category="operation_infra",
+                        expected_revision=resolution.scoped_revision,
+                    )
                     if not may_retry:
                         latest = commit_gate.resolve(record)
                         should_settle = latest.terminal or latest.state in {
