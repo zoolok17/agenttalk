@@ -80,6 +80,46 @@ Python 3.14 work-tag control: 81 passed (8.93 s). Ruff and Bandit pass changed
 Python files (B101 excluded for test assertions); whitespace check passes.
 Targeted foreground logs retained under task scratch `tk-b3b13b81a46b` for review.
 
+## B2b — operator vendor map and escalation links
+
+Contributor/operator record, base `f0e6ea28`, design `09b54296` section 2. Configure
+an active seat with `agenttalk roster set-model-vendor <agent> alibaba`; clear with
+`agenttalk roster set-model-vendor <agent> --clear`. Config uses `model_vendor`;
+closed values are anthropic/openai/alibaba/other/unverified, absent = unverified.
+This is an operator assertion, never transport inference or provider attestation.
+For example qwen through the Claude CLI remains alibaba. Rename carries config;
+removal/retirement clears config while historical dispatch maps remain unchanged.
+
+Task/review-request publication stamps reserved `assignee_model_vendors`. Group
+fan-out freezes one exact-recipient map and request ID; resume reuses it and refuses
+conflicting maps. Generic metadata and draft spoofing stay refused. Interpretation:
+the existing broadcast command now accepts task/review-request to provide group
+work dispatch; tasks retain lead/liaison and old-reader refusal (`--force` override).
+`agenttalk escalate --work-item <slug> --work-cycle <positive integer>` uses the
+same validator as metadata. Attention refs expose the exact escalation request ID
+plus validated item/cycle (legacy cycle defaults 1); malformed/unlinked refs remain
+team attention. Similar subjects do not merge distinct escalation IDs. No bodies
+are added to the sanitized refs. Malformed external check JSON now shares the
+wrong-shape refusal. No reducer/vendor-independence verdict is introduced here.
+
+Failing-first: 15 failed, 4 passed (1.96 s); initial combined B2a/B2b green:
+100 passed (11.69 s). Task scratch `tk-c127c9964399` retains logs for cold review.
+Final Python 3.10 vendor/tags/attention suites: 320 passed (25.40 s); existing
+CLI/store/web compatibility selection: 79 passed, 599 deselected (29.69 s).
+Python 3.14 vendor/tag control: 106 passed (12.81 s). Ruff passes all changed
+Python files. Bandit passes production and new tests (B101 excluded for test
+assertions); the existing web test file has 37 baseline findings, unchanged.
+
+### B2b cold-read follow-up — task resume gates
+
+Initial dispatch and resume share the task authority/reader checks. Resume uses
+the frozen opener kind and current lead/liaison authority; old-reader overrides
+require `--force` again. Frozen vendor maps remain unchanged. Both demotion and
+old-reader regressions failed before the fix (2 failed, 24 deselected, 1.02 s).
+Targeted vendor/broadcast checks pass on Python 3.10 and 3.14 (33 passed each,
+265 deselected); Ruff and Bandit pass (B101 excluded for test assertions).
+Task scratch `tk-aaa3fe3d0b17` retains red/green evidence for the delta read.
+
 ## B4a — shared per-root validated snapshot
 
 Contributor record, base `f0e6ea28`, design `09b54296` section 5. The HTTP server

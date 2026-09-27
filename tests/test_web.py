@@ -6891,8 +6891,9 @@ def test_api_attention_actions_off_escalation_shape_is_legacy_fixture(
         item = next(it for it in payload["items"] if it["source"] == "escalation")
         assert set(item) == {
             "id", "source", "source_label", "severity", "title", "agent",
-            "detail", "age_seconds", "human_can_unblock_now",
+            "detail", "age_seconds", "human_can_unblock_now", "source_refs",
         }
+        assert item["source_refs"] == [{"kind": "message", "request_id": "esc-help"}]
         assert item["title"] == "Choose release path"
         assert item["source_label"] == "ESCALATION"
         assert "body must not leak" not in raw.decode("utf-8")
