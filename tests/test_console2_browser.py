@@ -231,3 +231,32 @@ def test_thread_scroll_and_focus_survive_redraws_in_a_real_browser(page) -> None
     assert out["focusBackOnKeysBtnAfterEscape"] is True, out
     # the page raised no exception and the console CSP blocked nothing
     assert out["problems"] == [], out["problems"]
+
+
+@pytest.mark.skipif(BROWSER is None, reason="no Chromium-family browser on this runner")
+@pytest.mark.skipif(shutil.which("node") is None, reason="no node on this runner")
+def test_check_catches_a_redraw_that_breaks_scroll_after_setup(page) -> None:
+    """Negative control for dev-4 finding F1: console2_browser_check.mjs's own "scroll" sabotage
+    mode installs a MutationObserver that snaps the thread back to its bottom on every age
+    redraw. If the scroll-setup (capturing the thread, writing scrollTop=250) and the age
+    baseline it waits against were ever split back into two separate CDP round-trips, a redraw
+    landing BETWEEN them would satisfy waitForAgeChange on evidence of the WRONG redraw - one
+    that happened BEFORE our own scrollTop=250 write - and this sabotage would go completely
+    undetected (afterRedraw.top would still read 250, the value WE just wrote, not yet touched
+    by the sabotage's own reaction to a LATER redraw). With setup and baseline atomic, the
+    sabotage is reliably caught: this must fail (afterRedraw.top != 250), never pass.
+    """
+    url, profile = page
+    flags = _browser_launch_flags(platform.system())
+    result = subprocess.run(
+        ["node", str(CHECK), BROWSER, url, str(profile), json.dumps(flags), "scroll"],
+        capture_output=True, text=True, encoding="utf-8", timeout=120, cwd=REPO_ROOT,
+    )
+    assert result.returncode == 0, result.stderr
+    out = json.loads(result.stdout)
+    assert out["ageMoved"] is True, "the redraws really happened"
+    assert out["afterRedraw"]["top"] != 250, (
+        "the sabotage should have snapped scrollTop away from 250 on the redraw that followed "
+        "setup - if this is 250, the atomic setup+baseline fix has regressed and a redraw "
+        "landing before setup is being mistaken for one that happened after it"
+    )

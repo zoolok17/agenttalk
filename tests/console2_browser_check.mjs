@@ -1,17 +1,26 @@
 // Real-browser check for the console v2 stream, driven over the DevTools protocol.
-// Usage: node console2_browser_check.mjs <browser-exe> <page-url> <profile-dir> [launch-flags-json]
+// Usage: node console2_browser_check.mjs <browser-exe> <page-url> <profile-dir> [launch-flags-json] [sabotage]
 // launch-flags-json is a JSON array of the platform-specific launch flags (see
 // test_console2_browser.py's _browser_launch_flags, the pure function that picks them - the
 // sole caller always supplies it); an empty/omitted array means no headless/GPU/sandbox flags
 // at all, useful only for manual debugging with a real, visible browser window.
+// sabotage, when the literal string "scroll", installs a MutationObserver that snaps the thread
+// back to its bottom on every age redraw - a NEGATIVE CONTROL for the F1 scroll check (dev-4's
+// own finding): tests/test_console2_browser.py's own negative-control test asserts this makes
+// afterRedraw.top come back wrong, proving the atomic setup+baseline fix below actually waits for
+// a redraw AFTER scrollTop is set, not one that already happened before it.
 // Prints one JSON object of measurements; tests/test_console2_browser.py asserts on it.
 //
 // What the DOM stub cannot show and this does: a detached element has no scroll layout (the thread
 // must be scrolled after insertion), and a redraw that replaces a focused control drops focus to <body>.
 import { spawn } from 'node:child_process';
 
-const [exe, pageUrl, profile, flagsJson] = process.argv.slice(2);
+const [exe, pageUrl, profile, flagsJson, sabotage] = process.argv.slice(2);
 const extraFlags = flagsJson ? JSON.parse(flagsJson) : [];
+const sabotageScrollScript = sabotage === 'scroll'
+  ? `window.__sabotageObserver = new MutationObserver(() => { window.__thread.scrollTop = 999999; });
+     window.__sabotageObserver.observe(document.querySelector('.c2-age'), { childList: true, characterData: true, subtree: true });`
+  : '';
 const PORT = 9300 + Math.floor(Math.random() * 500);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -232,9 +241,19 @@ try {
   out.focusBackOnKeysBtnAfterEscape = await evaluate(`document.activeElement === document.querySelector('.c2-keybtn')`);
 
   // F1: scroll up, let ordinary redraws happen (the fake server ages its cards on every read) -
-  // wait until one is actually observed (see waitForAgeChange) rather than a fixed sleep.
-  const ageAtScroll = await evaluate(`document.querySelector('.c2-age').textContent`);
-  await evaluate(`(() => { window.__thread = document.querySelector('.c2-thread'); window.__thread.scrollTop = 250; return true; })()`);
+  // wait until one is actually observed (see waitForAgeChange) rather than a fixed sleep. The
+  // thread capture, the scrollTop=250 write and the age-baseline read are ONE atomic evaluation
+  // (dev-4 finding F1): two separate CDP round-trips leave a window where a redraw lands BETWEEN
+  // reading the baseline and writing scrollTop - that redraw's own age change already satisfies
+  // waitForAgeChange instantly, so a LATER redraw (the one that actually follows our own setup,
+  // and so is the one whose effect on scrolling this check exists to prove) is never waited for
+  // or observed at all.
+  const ageAtScroll = await evaluate(`(() => {
+    window.__thread = document.querySelector('.c2-thread');
+    window.__thread.scrollTop = 250;
+    ${sabotageScrollScript}
+    return document.querySelector('.c2-age').textContent;
+  })()`);
   out.firstRedrawWaitMs = (await waitForAgeChange(ageAtScroll)).elapsedMs;
   out.afterRedraw = await measure();
   out.threadKept = await evaluate('window.__thread === document.querySelector(".c2-thread") && window.__thread.isConnected');
@@ -242,10 +261,15 @@ try {
   out.railImageKept = await evaluate('window.__avatar === document.querySelector("#c2-rail .c2-avatar-img") && window.__avatar.isConnected');
 
   // F2: focus a Later button, let redraws happen, focus must stay put on the same element - again
-  // waiting until the redraw is actually observed, bounded, rather than a fixed sleep.
-  await evaluate(`(() => { const b = document.querySelector('.c2-later'); window.__later = b; b.focus();
-    return document.activeElement === b; })()`);
-  const ageBefore = await evaluate(`document.querySelector('.c2-age').textContent`);
+  // waiting until the redraw is actually observed, bounded, rather than a fixed sleep, and again
+  // the setup (focus) and the age-baseline read are ONE atomic evaluation, for the identical
+  // reason as F1 above (dev-4 finding F1 applies here too, not only to the scroll baseline).
+  const ageBefore = await evaluate(`(() => {
+    const b = document.querySelector('.c2-later');
+    window.__later = b;
+    b.focus();
+    return document.querySelector('.c2-age').textContent;
+  })()`);
   const secondRedrawWait = await waitForAgeChange(ageBefore);
   out.secondRedrawWaitMs = secondRedrawWait.elapsedMs;
   out.ageMoved = secondRedrawWait.changed;
