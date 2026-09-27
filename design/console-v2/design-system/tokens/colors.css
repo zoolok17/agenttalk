@@ -1,0 +1,89 @@
+/* Colors — extracted from the agenttalk Team Console.
+   Two themes: default (light) on :root, dark on [data-theme="dark"].
+   Every semantic color ships as a solid + a soft (tint) pair so chips,
+   status bars, and meters can share one language. */
+
+:root {
+  /* Neutrals — surfaces */
+  --canvas:        #F1F3F6;  /* app background */
+  --surface:       #FFFFFF;  /* cards, bars, panels */
+  --surface-2:     #F8F9FB;  /* insets, feed rows, transcript bg */
+  --border:        #E7E9EE;  /* card / control borders */
+  --border-2:      #EDEEF2;  /* subtle section dividers */
+  --hairline:      #F0F1F4;  /* inner row dividers */
+  --track:         #EEF0F3;  /* meter / progress tracks */
+  --inset:         #F1F3F6;  /* chip + tag backgrounds */
+  --edge:          #C7CCD6;  /* graph edges, faint strokes */
+
+  /* Neutrals — ink (primary → faint) */
+  --ink:           #1B1E24;
+  --ink-2:         #5B616E;
+  --ink-3:         #8A909C;
+  --ink-4:         #A2A8B4;
+  --ink-5:         #B0B6C0;
+
+  /* Neutral chip */
+  --chip-neutral:      #6B7280;
+  --chip-neutral-bg:   #EEF0F3;
+
+  /* Semantic status (solid / soft) */
+  --ok:        #12996A;  --ok-soft:      #E4F5EE;  /* working · GO · healthy */
+  --info:      #2F7AC7;  --info-soft:    #E7F1FB;  /* quiet work · question · broadcast */
+  --warn:      #B4820A;  --warn-soft:    #FBF2DA;  /* idle · medium severity */
+  --attn:      #E4681F;  --attn-soft:    #FCEBDE;  /* stuck · needs attention */
+  --danger:    #D8443F;  --danger-soft:  #FBE7E6;  /* rate-limited · error · HOLD · escalate */
+  --violet:    #6D4AC0;  --violet-soft:  #EEE8FA;  /* proposal · countered */
+  --teal:      #2E9E8F;  --teal-soft:    #E1F2EF;  /* wake */
+  --gray:      #98A0AE;  --gray-soft:    #EFF1F4;  /* unknown · offline */
+
+  /* CLI identity badges */
+  --claude:    #B0532C;  --claude-bg:    #F6EBE3;
+  --codex:     #2C7A6B;  --codex-bg:     #E4F1EE;
+
+  /* Accent — themeable; default agenttalk indigo */
+  --accent:        #4457E6;
+  --accent-soft:   rgba(68, 87, 230, .12);
+
+  /* Shadow tints */
+  --shadow:        rgba(20, 25, 40, .04);
+  --shadow-lg:     rgba(20, 25, 40, .10);
+}
+
+[data-theme="dark"] {
+  --canvas:        #0E1116;
+  --surface:       #161A21;
+  --surface-2:     #1B2029;
+  --border:        #2A313D;
+  --border-2:      #232A34;
+  --hairline:      #21272F;
+  --track:         #252B35;
+  --inset:         #1B2029;
+  --edge:          #39414D;
+
+  --ink:           #E8EBEF;
+  --ink-2:         #AEB6C2;
+  --ink-3:         #7F8895;
+  --ink-4:         #6A7280;
+  --ink-5:         #58606D;
+
+  --chip-neutral:      #9BA3B0;
+  --chip-neutral-bg:   #252B35;
+
+  --ok:        #3DBE8B;  --ok-soft:      rgba(61,190,139,.16);
+  --info:      #5AA0E0;  --info-soft:    rgba(90,160,224,.16);
+  --warn:      #D9A22E;  --warn-soft:    rgba(217,162,46,.16);
+  --attn:      #F0803F;  --attn-soft:    rgba(240,128,63,.16);
+  --danger:    #E86560;  --danger-soft:  rgba(232,101,96,.18);
+  --violet:    #9E82E0;  --violet-soft:  rgba(158,130,224,.18);
+  --teal:      #42B9A8;  --teal-soft:    rgba(66,185,168,.16);
+  --gray:      #8A929E;  --gray-soft:    rgba(138,146,158,.16);
+
+  --claude:    #D08A5E;  --claude-bg:    rgba(208,138,94,.16);
+  --codex:     #4FB3A0;  --codex-bg:     rgba(79,179,160,.16);
+
+  --accent:        #8091FF;
+  --accent-soft:   rgba(128, 145, 255, .20);
+
+  --shadow:        rgba(0, 0, 0, .4);
+  --shadow-lg:     rgba(0, 0, 0, .55);
+}

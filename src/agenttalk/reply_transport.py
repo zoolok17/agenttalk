@@ -46,6 +46,21 @@ def draft_reply_kind_for(inbound_kind: object) -> str:
     return DRAFT_REPLY_KIND.get(inbound_kind, "message")
 
 
+def is_challenge_question(record: dict) -> bool:
+    """True for an agenttalk.challenge QUESTION (``meta.challenge == "true"``).
+
+    Its verdict owes typed meta (challenge, verdict, confidence, basis, exposed,
+    minutes) that a body-only reply draft cannot carry. The marker is matched
+    exactly: a major-work dispatch reuses the ``challenge`` key for a reference
+    (``ch-...``, ``exempt:...``) and is not a challenge question.
+    """
+    if record.get("kind") != "question":
+        return False
+    meta = record.get("meta") if isinstance(record.get("meta"), dict) else {}
+    value = meta.get("challenge")
+    return value is True or (isinstance(value, str) and value.strip().lower() == "true")
+
+
 def echo_reply_correlation(
     meta: dict,
     *,

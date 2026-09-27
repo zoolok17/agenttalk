@@ -310,6 +310,7 @@ Bus skills:
 | `agenttalk.handoff` | `agenttalk-handoff` | Send work for review and wait |
 | `agenttalk.consult` | `agenttalk-consult` | Ask a peer before answering |
 | `agenttalk.propose` | `agenttalk-propose` | Ask for accept/reject/counter on a plan |
+| `agenttalk.challenge` | `agenttalk-challenge` | Ask an independent peer whether major work should be done at all |
 | `agenttalk.lead` | `agenttalk-lead` | Coordinate a named team |
 | `agenttalk.sk-loop` | `agenttalk-sk-loop` | Persistent spec-kitty implement/review loop |
 

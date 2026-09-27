@@ -129,7 +129,7 @@ repair it.
 
 **Mission.** The single human-facing coordinator: decompose work, dispatch assignments, track replies, and report back to the operator. A lead is a *coordination* role, not an authority boundary.
 
-**Skill(s).** `/agenttalk.lead` (Claude) / `agenttalk-lead` (Codex).
+**Skill(s).** `/agenttalk.lead` (Claude) / `agenttalk-lead` (Codex); `/agenttalk.challenge` / `agenttalk-challenge` before dispatching major work or turning an operator idea into work.
 
 **Your commands.**
 - Setup/roster: `roster set-operator-facing <name>`; `roster add <name> --unique`; `roster set-role` / `set-group` / `forward` / `retire`.
@@ -262,6 +262,7 @@ the pending transaction with force/abandon/reassign.
 
 The ritual every change runs through, with the verbs used at each step:
 
+0. **CHALLENGE major work** - before any design, an independent peer (not the proposer, another vendor, a blind brief) challenges whether the work should be done at all via `/agenttalk.challenge` / `agenttalk-challenge`; only the operator overrides a replace/defer/stop verdict.
 1. **DESIGN** - the architect produces the design + rationale, **consulting** peers (typically a developer and a reviewer) via `consult` / `propose` until they qualified-agree, and folds their input.
 2. **LEAD-GATE the design** - the lead reviews and gates the design before any code is written (the bar to start building).
 3. **BUILD in an isolated worktree** - a developer builds the slice in a dedicated `git worktree` off the candidate base SHA, then runs the committed `agenttalk dev-gate --profile release` local precheck ([reference](DEV-GATE.md)).

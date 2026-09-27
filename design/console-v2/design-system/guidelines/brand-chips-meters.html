@@ -1,0 +1,27 @@
+<!-- @dsCard group="Brand" viewport="700x150" name="Chips & meters" subtitle="The two workhorse micro-components" -->
+<!DOCTYPE html><html><head><meta charset="utf-8"><link rel="stylesheet" href="../styles.css">
+<style>
+  body{margin:0;font-family:var(--font-body);background:var(--canvas);padding:18px}
+  .r{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+  .chip{font-family:var(--font-mono);font-size:10px;font-weight:500;letter-spacing:.02em;border-radius:var(--radius-chip);padding:2px 7px}
+  .meter{width:150px}
+  .mlab{display:flex;justify-content:space-between;font-family:var(--font-mono);font-size:9.5px;color:var(--ink-4);margin-bottom:5px}
+  .track{height:4px;background:var(--track);border-radius:3px;overflow:hidden}
+  .fill{height:100%;border-radius:3px}
+</style></head>
+<body>
+  <div class="r">
+    <span class="chip" style="color:var(--ok);background:var(--ok-soft)">Working</span>
+    <span class="chip" style="color:var(--warn);background:var(--warn-soft)">Idle · waiting</span>
+    <span class="chip" style="color:var(--attn);background:var(--attn-soft)">Stuck?</span>
+    <span class="chip" style="color:var(--accent);background:var(--accent-soft)">review-request</span>
+    <span class="chip" style="color:var(--ok);background:var(--ok-soft)">review-result</span>
+    <span class="chip" style="color:var(--violet);background:var(--violet-soft)">proposal</span>
+    <span class="chip" style="color:var(--teal);background:var(--teal-soft)">wake</span>
+  </div>
+  <div class="r">
+    <div class="meter"><div class="mlab"><span>RATE</span><span>41%</span></div><div class="track"><div class="fill" style="width:41%;background:var(--ok)"></div></div></div>
+    <div class="meter"><div class="mlab"><span>CTX</span><span>74%</span></div><div class="track"><div class="fill" style="width:74%;background:var(--warn)"></div></div></div>
+    <div class="meter"><div class="mlab"><span>RATE</span><span>98%</span></div><div class="track"><div class="fill" style="width:98%;background:var(--danger)"></div></div></div>
+  </div>
+</body></html>

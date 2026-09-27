@@ -1,0 +1,335 @@
+{
+  "agents": [
+    {
+      "id": "claude-lead",
+      "ini": "LE",
+      "cli": "claude",
+      "role": "lead",
+      "state": "working",
+      "task": "Routing the m-4.2 release close",
+      "rate": 41,
+      "ctx": 62,
+      "peer": "—",
+      "hb": 3
+    },
+    {
+      "id": "claude-dev",
+      "ini": "CD",
+      "cli": "claude",
+      "role": "implementer",
+      "state": "working",
+      "task": "WP-07 · lane deliver-gate bounds check",
+      "rate": 58,
+      "ctx": 74,
+      "peer": "codex-rev",
+      "hb": 8
+    },
+    {
+      "id": "codex-dev",
+      "ini": "XD",
+      "cli": "codex",
+      "role": "implementer",
+      "state": "quiet",
+      "task": "WP-05 · attention collector refactor",
+      "rate": 33,
+      "ctx": 48,
+      "peer": "claude-rev",
+      "hb": 22
+    },
+    {
+      "id": "codex-rev",
+      "ini": "XR",
+      "cli": "codex",
+      "role": "reviewer",
+      "state": "working",
+      "task": "Reviewing rq-7a1 — rename bounds path",
+      "rate": 69,
+      "ctx": 81,
+      "peer": "claude-dev",
+      "hb": 5
+    },
+    {
+      "id": "claude-rev",
+      "ini": "CR",
+      "cli": "claude",
+      "role": "reviewer",
+      "state": "idle",
+      "task": "Waiting on codex-dev handoff",
+      "rate": 20,
+      "ctx": 30,
+      "peer": "codex-dev",
+      "hb": 46
+    },
+    {
+      "id": "codex-test",
+      "ini": "XT",
+      "cli": "codex",
+      "role": "tester",
+      "state": "working",
+      "task": "Failure-injection suite · 38/42 green",
+      "rate": 44,
+      "ctx": 55,
+      "peer": "—",
+      "hb": 12
+    },
+    {
+      "id": "codex-infra",
+      "ini": "XI",
+      "cli": "codex",
+      "role": "infra",
+      "state": "limited",
+      "task": "Rate window resets at 22:08",
+      "rate": 98,
+      "ctx": 40,
+      "peer": "—",
+      "hb": 214
+    },
+    {
+      "id": "claude-arch",
+      "ini": "CA",
+      "cli": "claude",
+      "role": "implementer",
+      "state": "stuck",
+      "task": "No progress for 6m on WP-09",
+      "rate": 51,
+      "ctx": 93,
+      "peer": "codex-rev",
+      "hb": 372
+    }
+  ],
+  "attention": [
+    {
+      "id": "esc",
+      "sev": "bad",
+      "src": "ESCALATION",
+      "title": "Reassign WP-11? codex-infra is rate-capped",
+      "meta": "codex-infra · window resets 22:08",
+      "actLabel": "Reassign",
+      "act": "Yes, reassign WP-11 to claude-dev"
+    },
+    {
+      "id": "gate",
+      "sev": "bad",
+      "src": "GATE HOLD",
+      "title": "Release close m-4.2 is blocked",
+      "meta": "automation_ci evidence missing · 1 of 3",
+      "actLabel": "Evidence",
+      "act": "/evidence m-4.2"
+    },
+    {
+      "id": "stuck",
+      "sev": "warn",
+      "src": "STUCK",
+      "title": "claude-arch — no progress in 6m",
+      "meta": "WP-09 · wrapped · restartable",
+      "actLabel": "Restart",
+      "act": "/restart claude-arch"
+    }
+  ],
+  "gates": [
+    {
+      "id": "g-tests",
+      "name": "tests",
+      "scope": "m-4.2",
+      "state": "GO",
+      "evidence": "dev-gate release · py3.10–3.14 · 1,912 passed",
+      "verifier": "codex-test",
+      "expires": "—"
+    },
+    {
+      "id": "g-review",
+      "name": "review",
+      "scope": "m-4.2",
+      "state": "GO",
+      "evidence": "rq-7a1 review-result approved · head 7b2d9c1",
+      "verifier": "codex-rev",
+      "expires": "—"
+    },
+    {
+      "id": "g-ci",
+      "name": "automation_ci",
+      "scope": "m-4.2",
+      "state": "HOLD",
+      "evidence": "CI run #418 has not reported",
+      "verifier": "—",
+      "expires": "—"
+    },
+    {
+      "id": "g-sec",
+      "name": "security-scan",
+      "scope": "m-4.2",
+      "state": "WAIVED",
+      "evidence": "scanner unavailable on runner",
+      "verifier": "operator",
+      "expires": "in 4d 6h"
+    },
+    {
+      "id": "g-lane",
+      "name": "lane:WP-07",
+      "scope": "WP-07",
+      "state": "GO",
+      "evidence": "lane check · in bounds · merge clean",
+      "verifier": "lane",
+      "expires": "—"
+    },
+    {
+      "id": "g-parity",
+      "name": "parity",
+      "scope": "m-4.2",
+      "state": "HOLD",
+      "evidence": "2 of 41 behaviours unmeasured",
+      "verifier": "—",
+      "expires": "—"
+    }
+  ],
+  "lanes": [
+    {
+      "id": "WP-04",
+      "owner": "claude-dev",
+      "ini": "CD",
+      "domain": "roster",
+      "stage": 3,
+      "hist": [
+        "A"
+      ],
+      "cycle": "1h 40m",
+      "rev": "codex-rev"
+    },
+    {
+      "id": "WP-07",
+      "owner": "claude-dev",
+      "ini": "CD",
+      "domain": "lanes",
+      "stage": 2,
+      "hist": [
+        "R",
+        "F",
+        "A"
+      ],
+      "cycle": "3h 12m",
+      "rev": "codex-rev"
+    },
+    {
+      "id": "WP-05",
+      "owner": "codex-dev",
+      "ini": "XD",
+      "domain": "attention",
+      "stage": 1,
+      "hist": [
+        "R",
+        "F"
+      ],
+      "cycle": "2h 05m",
+      "rev": "claude-rev"
+    },
+    {
+      "id": "WP-09",
+      "owner": "claude-arch",
+      "ini": "CA",
+      "domain": "knowledge",
+      "stage": 0,
+      "hist": [],
+      "cycle": "—",
+      "rev": "codex-rev",
+      "hold": "touches cli.py — shared path needs approve-shared"
+    },
+    {
+      "id": "WP-11",
+      "owner": "codex-infra",
+      "ini": "XI",
+      "domain": "supervisor",
+      "stage": 0,
+      "hist": [],
+      "cycle": "—",
+      "rev": "claude-rev",
+      "hold": "owner is rate-capped until 22:08"
+    }
+  ],
+  "domains": [
+    {
+      "name": "lanes",
+      "globs": "src/agenttalk/lanes.py",
+      "owner": "claude-dev",
+      "rev": "codex-rev"
+    },
+    {
+      "name": "attention",
+      "globs": "src/agenttalk/attention*.py",
+      "owner": "codex-dev",
+      "rev": "claude-rev"
+    },
+    {
+      "name": "knowledge",
+      "globs": "src/agenttalk/knowledge/**",
+      "owner": "claude-arch",
+      "rev": "codex-rev"
+    },
+    {
+      "name": "supervisor",
+      "globs": "src/agenttalk/supervise*.py, deadman.py",
+      "owner": "codex-infra",
+      "rev": "claude-rev"
+    },
+    {
+      "name": "cli surface",
+      "globs": "src/agenttalk/cli.py",
+      "owner": "claude-lead",
+      "rev": "codex-rev",
+      "shared": true
+    }
+  ],
+  "risks": [
+    {
+      "id": "r1",
+      "sev": "HIGH",
+      "src": "GATE",
+      "title": "Cutover has never been rehearsed end-to-end",
+      "owner": "operator",
+      "age": "6d"
+    },
+    {
+      "id": "r2",
+      "sev": "HIGH",
+      "src": "PARITY",
+      "title": "2 behaviours unmeasured: nightly ledger close, refund rounding",
+      "owner": "codex-test",
+      "age": "2d"
+    },
+    {
+      "id": "r3",
+      "sev": "MED",
+      "src": "WAIVER",
+      "title": "Security scan waived — expires in 4 days",
+      "owner": "operator",
+      "age": "1d"
+    },
+    {
+      "id": "r4",
+      "sev": "MED",
+      "src": "DEAD LETTER",
+      "title": "Poison message parked in codex-scout inbox",
+      "owner": "claude-lead",
+      "age": "20m"
+    }
+  ],
+  "retired": [
+    {
+      "id": "codex-scout",
+      "ini": "XS"
+    },
+    {
+      "id": "claude-docs",
+      "ini": "DO"
+    }
+  ],
+  "projects": [
+    {
+      "label": "agenttalk",
+      "id": "agenttalk-3f2a"
+    },
+    {
+      "label": "legacy-billing",
+      "id": "legacy-billing-9c1d"
+    }
+  ]
+}

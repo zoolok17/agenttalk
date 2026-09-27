@@ -1,0 +1,33 @@
+/* Effects — radii, shadows, motion. The console uses soft 1px card
+   shadows, a status "spine" via inset box-shadow, and one breathing
+   pulse for live/working states. */
+
+:root {
+  /* Radii */
+  --radius-chip:    6px;
+  --radius-btn:     8px;
+  --radius-input:   10px;
+  --radius-card:    12px;
+  --radius-card-lg: 14px;
+  --radius-pill:    999px;
+
+  /* Shadows */
+  --shadow-card:   0 1px 2px var(--shadow);
+  --shadow-hover:  0 4px 16px var(--shadow-lg);
+  /* status spine: inset 3px 0 0 <status color>, composed alongside --shadow-card */
+
+  /* Borders */
+  --border-1:  1px solid var(--border);
+
+  /* Motion */
+  --dur-fast:  150ms;
+  --dur-mid:   300ms;
+  --dur-slow:  500ms;
+  --ease-standard: ease;
+  --ease-out:      cubic-bezier(.2, .8, .2, 1);
+}
+
+/* Shared keyframes used across components */
+@keyframes ds-liveDot { 0%,100% { opacity: 1 } 50% { opacity: .32 } }
+@keyframes ds-dashmove { to { stroke-dashoffset: -24 } }
+@keyframes ds-fadeInUp { from { opacity: 0; transform: translateY(7px) } to { opacity: 1; transform: none } }
