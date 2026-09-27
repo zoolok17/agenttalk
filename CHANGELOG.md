@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.93.0] - 2026-09-27
+
+Theme: **challenge major work before it starts, and run acceptance on a pinned,
+offline-checked tool registry.**
+
 ### Added
 
 - **`agenttalk.challenge` / `agenttalk-challenge` skill: challenge major work
