@@ -2972,7 +2972,7 @@ def _build_signoff_eval(store, record: dict):
             "active_agents": active}
 
 
-def _build_dod_eval(store, record: dict, *, acceptance_live=None):
+def _build_dod_eval(store, record: dict, *, acceptance_live=None, preflight_scan=None):
     """Resolve the #60 Definition-of-Done evidence (IMPURE) into the bundle
     :func:`close.evaluate_dod` consumes (PURE). ``None`` when the close's scope has no DoD
     requirements (byte-identical to pre-#60). Fails closed via ``policy_error`` on a malformed
@@ -2996,7 +2996,7 @@ def _build_dod_eval(store, record: dict, *, acceptance_live=None):
         bundle["knowledge"] = _resolve_dod_knowledge(store, dims["knowledge"], record)
     if "acceptance" in dims:
         from agenttalk import acceptance
-        bundle["acceptance"] = acceptance.resolve(store, record, live=acceptance_live)
+        bundle["acceptance"] = acceptance.resolve(store, record, live=acceptance_live, preflight_scan=preflight_scan)
     return bundle
 
 
@@ -3529,6 +3529,46 @@ def _counter_decision_from_cli_spelling(spelling: str, close_mod) -> str:
     }[spelling]
 
 
+def cmd_acceptance_preflight(args: argparse.Namespace) -> int:
+    """Operator staging check; deliberately bypass Store discovery and construction."""
+    from agenttalk import acceptance as A, acceptance_preflight as P, acceptance_registry as R
+    from agenttalk.acceptance_staging import locator_path
+    try:
+        cache_root = locator_path(args.cache_root)
+        plan_path = Path(args.plan).absolute()
+        plan_bytes = P.read_input(plan_path)
+        plan = R.decode(plan_bytes)
+        if not isinstance(plan, dict):
+            A._fail("preflight plan must be an object")
+        registry_ref = R.relative_path(plan.get("registry_ref"))
+        registry_bytes = P.read_input(plan_path.parent / registry_ref)
+        observation_path = Path(args.observation).absolute() if args.observation else None
+        observation_bytes = P.read_input(observation_path) if observation_path is not None else None
+        result = P.evaluate(plan_bytes, registry_bytes, cache_root, observation_bytes=observation_bytes,
+                            proof_root=observation_path.parent if observation_path is not None else None)
+    except A.AcceptanceError as exc:
+        # Import messages are fixed/labelled; never print an OS locator or raw record.
+        detail = str(exc)[:256]
+        if isinstance(exc, A.LinkedPathError):
+            detail += "; pass fully resolved paths without links or reparse ancestors"
+        holds = [P.hold(exc.code, detail)]
+        status = "refusal" if exc.code == "acceptance_policy_invalid" else P._status(holds)
+        result = {"status": status, "entries": [], "holds": holds}
+    except (OSError, ValueError):
+        result = {"status": "not-run", "entries": [], "holds": [P.hold(P.UNAVAILABLE, P.UNAVAILABLE_DETAIL)]}
+    if args.json:
+        print(json.dumps(result, sort_keys=True))
+    else:
+        print(f"preflight: {result['status']}")
+        for entry in result["entries"]:
+            print(f"  {entry['id']}: {entry['status']}")
+            for issue in entry["holds"]:
+                print(f"    {issue['code']} [{issue['ref']}]: {issue['detail']}")
+        for issue in result["holds"]:
+            print(f"  {issue['code']} [{issue['ref']}]: {issue['detail']}")
+    return 0 if result["status"] == "pass" else 3
+
+
 def cmd_close(args: argparse.Namespace) -> int:
     """Assurance P2 milestone/release close (advisory; see close.py)."""
     from agenttalk import close as close_mod
@@ -3555,11 +3595,11 @@ def cmd_close(args: argparse.Namespace) -> int:
                         "acceptance requires --project-repo and forbids force/dirty overrides")
                 prepared = acceptance.prepare(
                     store, args.acceptance_plan, args.project_repo, args.revision, args.scope,
-                    _close_lens_specs(args))
+                    _close_lens_specs(args), cache_root=getattr(args, "cache_root", None))
                 revision, kind = prepared["project"]["revision"], "sha"
             else:
-                if getattr(args, "project_repo", None):
-                    raise close_mod.CloseError("--project-repo requires --acceptance-plan")
+                if getattr(args, "project_repo", None) or getattr(args, "cache_root", None):
+                    raise close_mod.CloseError("--project-repo/--cache-root requires --acceptance-plan")
                 revision, kind = _resolve_revision(store.root, args.revision)
         except close_mod.CloseError as e:
             code = getattr(e, "code", None)
@@ -3652,7 +3692,8 @@ def cmd_close(args: argparse.Namespace) -> int:
                     raise close_mod.CloseError("successor requires plan, project, revision and amendment reason")
                 record = successor(store, parent_id=args.parent, close_id=args.id, plan_file=args.acceptance_plan,
                                    project_repo=args.project_repo, revision=args.revision, by=actor, at=_iso_now(),
-                                   reason=args.reason, reduction_file=args.scope_reduction)
+                                   reason=args.reason, reduction_file=args.scope_reduction,
+                                   cache_root=getattr(args, "cache_root", None))
                 print(f"opened acceptance successor {record['close_id']} of {args.parent}")
                 return 0
             digest = acceptance.attach(store, args.id, args.file, by=actor, at=_iso_now())
@@ -3811,6 +3852,9 @@ def cmd_close(args: argparse.Namespace) -> int:
         dod_eval = (_build_dod_eval(store, rec, acceptance_live=rec.get("status") != close_mod.PUBLISHED)
                     if isinstance(record, dict) else None)
         result = close_mod.compute_verdict(rec, gate_check, signoff_eval, worktree_eval, dod_eval)
+        preflight = ((dod_eval or {}).get("acceptance") or {}).get("preflight")
+        if preflight is not None:
+            result["preflight"] = preflight
         if "acceptance_route" in rec:
             result["acceptance_evaluation"] = ("historical; not GO-publication eligibility"
                                                if rec.get("status") == close_mod.PUBLISHED else "live candidate")
@@ -3824,6 +3868,8 @@ def cmd_close(args: argparse.Namespace) -> int:
             _print_verdict(args.id, result)
             if "acceptance_evaluation" in result:
                 print("acceptance evaluation: " + result["acceptance_evaluation"])
+            for item in (preflight or {}).get("historical", []):
+                print(f"  {item['id']}: {item['status']}")
         return 0 if result["verdict"] == close_mod.VERDICT_GO else 3
 
     if action == "publish":
@@ -3832,6 +3878,11 @@ def cmd_close(args: argparse.Namespace) -> int:
         verdict = close_mod.VERDICT_GO if args.verdict == "go" else close_mod.VERDICT_HOLD
         barrier_epoch = None
         try:
+            from agenttalk import acceptance_live
+            before = close_mod.load_close(store, args.id)
+            preflight_scan = {"not_requested": True} if verdict == close_mod.VERDICT_HOLD else {"failure": True}
+            if verdict == close_mod.VERDICT_GO and before.get("status") != close_mod.PUBLISHED:
+                preflight_scan = acceptance_live.prepare(store, before) or {"failure": True}
             # Lock order: acceptance writer -> close-ID -> config (if needed).
             # Close, gate, knowledge and config-backed signoff writers all join
             # the outer lock; keep it from discovery through durable GO and the
@@ -3859,7 +3910,8 @@ def cmd_close(args: argparse.Namespace) -> int:
                         store.root, scope=record.get("gate_scope"))
                     signoff_eval = _build_signoff_eval(store, record)
                     worktree_eval = _close_worktree_eval(store, record)
-                    dod_eval = _build_dod_eval(store, record, acceptance_live=verdict == close_mod.VERDICT_GO)
+                    dod_eval = _build_dod_eval(store, record, acceptance_live=verdict == close_mod.VERDICT_GO,
+                                               preflight_scan=preflight_scan)
                     record["worktree_isolation"] = worktree_eval
                     result = close_mod.compute_verdict(
                         record, gate_check, signoff_eval, worktree_eval, dod_eval)
@@ -14941,6 +14993,7 @@ def build_parser() -> argparse.ArgumentParser:
     copen.add_argument("--acceptance-plan",
                        help="Freeze a strict acceptance plan; schema 3 supports verified cooperative GO.")
     copen.add_argument("--project-repo", help="Actual project checkout to verify for acceptance.")
+    copen.add_argument("--cache-root", help="Private fully resolved staged-cache root for a schema-4 plan.")
     copen.add_argument("--lens", action="append", help="Required lens id (repeatable).")
     copen.add_argument("--optional-lens", action="append", help="Optional lens id (repeatable).")
     copen.add_argument("--allow", action="append",
@@ -14967,6 +15020,14 @@ def build_parser() -> argparse.ArgumentParser:
     caccept = csub.add_parser("acceptance",
                             help="Attach acceptance evidence, record cold review, or create a successor.")
     cacceptsub = caccept.add_subparsers(dest="acceptance_cmd", required=True)
+    cpreflight = cacceptsub.add_parser("preflight",
+                                     help="Read-only staged pins and offline-proof check; never runs tools.")
+    cpreflight.add_argument("--plan", required=True)
+    cpreflight.add_argument("--cache-root", required=True, help="Fully resolved operator-staged directory.")
+    cpreflight.add_argument("--observation",
+                            help="Supplied observation JSON; evidence paths are relative to its directory.")
+    cpreflight.add_argument("--json", action="store_true")
+    cpreflight.set_defaults(func=cmd_acceptance_preflight)
     cattach = cacceptsub.add_parser("attach", help="Copy and bind an immutable bundle and its raw artifacts.")
     cattach.add_argument("--id", required=True)
     cattach.add_argument("--file", required=True)
@@ -14977,6 +15038,7 @@ def build_parser() -> argparse.ArgumentParser:
     csucc.add_argument("--parent", required=True)
     csucc.add_argument("--acceptance-plan", required=True)
     csucc.add_argument("--project-repo", required=True)
+    csucc.add_argument("--cache-root", help="Absolute private staged-cache root required for a schema-4 successor.")
     csucc.add_argument("--revision", required=True)
     csucc.add_argument("--reason", required=True)
     csucc.add_argument("--scope-reduction", help="Structured amendment with an actual operator decision reference.")
