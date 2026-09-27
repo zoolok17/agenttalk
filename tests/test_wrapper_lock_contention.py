@@ -180,10 +180,10 @@ def _inactive_gate(s: Store) -> DetectionCommitGate:
                                fence="wrapper-1")
 
 
-def _active_gate(s: Store) -> DetectionCommitGate:
+def _active_gate(s: Store, *, fence: str = "wrapper-1") -> DetectionCommitGate:
     policy = PolicySnapshot.from_mapping(
         {"schema_version": 1, "agents": {"beta": {"grade": DETECTION_GRADE}}}, "beta")
-    return DetectionCommitGate(s, "beta", policy, fence="wrapper-1")
+    return DetectionCommitGate(s, "beta", policy, fence=fence)
 
 
 def _replies(s: Store) -> list:
@@ -997,7 +997,9 @@ def test_stranded_own_marker_is_swept_once_its_guard_frees(tmp_path) -> None:
     lock = s.state_dir / "operation-publication.lock"
     _raised, holder, release = _strand_own_marker(tmp_path, s, lock)
     try:
+        started = time.monotonic()
         assert s.complete_stranded_lock_releases() == 0   # guard still held: kept
+        assert time.monotonic() - started < 1.0          # and the sweep never waits
         assert lock.exists()
     finally:
         release.set()
@@ -1231,3 +1233,110 @@ def test_owed_head_corruption_after_the_answer_landed_stays_fatal(
     assert len(_answers(s)) == 1
     assert s.cursor("beta") == ""
     assert health.contended_phases() == []
+
+
+class _Crash(BaseException):
+    """The wrapper process dies right after the paid dispatch answered."""
+
+
+def test_owed_relaunch_after_a_landed_answer_settles_through_contention_without_redriving(
+    tmp_path, monkeypatch,
+) -> None:
+    s, m = _owed_bus(tmp_path)
+
+    def answer_then_die(rec):
+        OwedDriver(tmp_path)(rec)
+        raise _Crash()
+
+    with pytest.raises(_Crash):
+        _run(s, _active_gate(s), answer_then_die, Health(), max_polls=6)
+    assert len(_answers(s)) == 1 and s.cursor("beta") == ""
+
+    # The relaunch finds the landed answer at admission and finalizes it; the
+    # compliance-streak reset that follows is contended.
+    barrier = LockBarrier(monkeypatch)
+    relaunched = _active_gate(s, fence="wrapper-2")
+    real_mark_satisfied = relaunched.mark_satisfied
+    armed: list[bool] = []
+
+    def contended_mark_satisfied(key):
+        if not armed:
+            armed.append(True)
+            barrier.arm("ledger.lock", hold=BOUND + 1)
+        return real_mark_satisfied(key)
+
+    monkeypatch.setattr(relaunched, "mark_satisfied", contended_mark_satisfied)
+    driver = OwedDriver(tmp_path)
+    health = Health()
+    turns = _run(s, relaunched, driver, health, max_polls=6)
+
+    assert turns == 1
+    assert driver.calls == 0                            # the landed answer is never re-paid
+    assert barrier.hits["ledger.lock"] == BOUND + 1
+    assert len(_answers(s)) == 1
+    assert s.cursor("beta") == m.id
+    assert health.contended_phases() == [
+        loop.LOCK_CONTENTION_PHASE_FINALIZATION] * (BOUND + 1)
+
+
+def test_a_stranded_publication_marker_is_cleared_during_a_later_in_place_retry(
+    tmp_path, monkeypatch,
+) -> None:
+    # The reply's publication strands its operation-publication.lock marker; the
+    # turn's finalization then contends. Before the next poll, each in-place
+    # retry first sweeps this process's stranded markers, so other seats are not
+    # kept behind the marker for the whole finalization episode.
+    s, m = _bus(tmp_path)
+    lock = s.state_dir / "operation-publication.lock"
+    real_exclusive = Store._exclusive_lock
+
+    def short_publication_lock(self, path, *, timeout=10.0, poll=0.05, what="lock"):
+        if Path(path).name == "operation-publication.lock":
+            timeout = min(timeout, 0.08)
+        return real_exclusive(self, path, timeout=timeout, poll=poll, what=what)
+
+    monkeypatch.setattr(Store, "_exclusive_lock", short_publication_lock)
+    held, release = threading.Event(), threading.Event()
+    holder = _hold_guard_until(tmp_path, lock, held, release)
+    barrier = LockBarrier(monkeypatch)
+    real_send = s.send
+    started: list[bool] = []
+
+    def send_then_hold_the_guard(**kwargs):
+        message = real_send(**kwargs)
+        if kwargs.get("sender") == "beta" and not started:
+            started.append(True)
+            holder.start()
+            assert held.wait(5)
+            # the landed-reply replay right after this publication contends
+            barrier.arm("message-publication", hold=4)
+        return message
+
+    monkeypatch.setattr(s, "send", send_then_hold_the_guard)
+    marker_during_retries: list[bool] = []
+    health = Health()
+
+    def contended(phase: str) -> None:
+        health.contended(phase)
+        count = len(health.contended_phases())
+        if count == 1:
+            release.set()                            # the guard frees mid-episode
+            holder.join(5)
+        if count == 3:
+            marker_during_retries.append(lock.exists())
+
+    try:
+        turns = loop.run_loop(
+            s, "beta", CountedDriver(), clock=lambda: 0.0, sleep=lambda _d: None,
+            max_turns=1, commit_gate=_inactive_gate(s), on_health_idle=health.idle,
+            on_health_contention=contended,
+            on_contention_persisting=health.persisting,
+        )
+    finally:
+        release.set()
+        holder.join(5)
+    assert turns == 1
+    assert health.contended_phases() == [loop.LOCK_CONTENTION_PHASE_FINALIZATION] * 4
+    assert marker_during_retries == [False]          # swept before the episode ended
+    assert len(_replies(s)) == 1
+    assert s.cursor("beta") == m.id
