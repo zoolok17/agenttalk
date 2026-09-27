@@ -193,10 +193,10 @@ def _replies(s: Store) -> list:
 
 def _run(s: Store, gate, driver, health: Health, **kwargs) -> int:
     kwargs.setdefault("sleep", lambda _d: None)
+    kwargs.setdefault("max_turns", 1)
     return loop.run_loop(
         s, "beta", driver,
         clock=lambda: 0.0,
-        max_turns=1,
         commit_gate=gate,
         on_health_idle=health.idle,
         on_health_contention=health.contended,
@@ -1340,3 +1340,206 @@ def test_a_stranded_publication_marker_is_cleared_during_a_later_in_place_retry(
     assert marker_during_retries == [False]          # swept before the episode ended
     assert len(_replies(s)) == 1
     assert s.cursor("beta") == m.id
+
+
+# ------------------------------------------ N1 + siblings: contention is never a
+# permanent block. Each site is pinned by a paired contention / control fixture.
+
+
+def _owed_admission(s: Store, gate) -> dict:
+    return next(iter(json.loads(gate.path.read_text(encoding="utf-8"))["obligations"].values()))
+
+
+def _transitions(gate) -> list[str]:
+    return [row["transition"]
+            for row in json.loads(gate.path.read_text(encoding="utf-8"))["transitions"]]
+
+
+def _disposition_blocked(gate) -> bool:
+    try:
+        health = json.loads(gate.proof_health_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False
+    return health.get("disposition_block") is True
+
+
+@pytest.mark.parametrize("hold", [0, 2, BOUND + 1], ids=["control", "contended", "persisting"])
+def test_failed_delivery_disposition_under_contention_matches_its_control(
+    tmp_path, monkeypatch, hold,
+) -> None:
+    # Reviewer-1's N1 pair: both permitted paid dispatches return without
+    # answering, so a failed-delivery disposition is due; contention is armed
+    # just before the first real fail_delivery_or_block.
+    s, m = _owed_bus(tmp_path)
+    gate = _active_gate(s)
+    barrier = LockBarrier(monkeypatch)
+    real_fail = gate.fail_delivery_or_block
+    armed: list[bool] = []
+
+    def contended_fail(*args, **kwargs):
+        if not armed:
+            armed.append(True)
+            barrier.arm("message-publication", hold=hold)
+        return real_fail(*args, **kwargs)
+
+    monkeypatch.setattr(gate, "fail_delivery_or_block", contended_fail)
+    drives: list[str] = []
+
+    def unanswered(rec):
+        drives.append(rec["owed_action"]["purpose"])
+        return True
+
+    health = Health()
+    _run(s, gate, unanswered, health, max_turns=None, max_polls=6)
+
+    admission = _owed_admission(s, gate)
+    assert drives == ["initial", "recovery"]            # no extra paid dispatch
+    assert admission["state"] == "delivery_failed"      # the control's outcome...
+    assert admission["terminal_state"] == "delivery_exhausted"
+    assert "OBLIGATION_BLOCKED" not in _transitions(gate)   # ...never a permanent block
+    assert not _disposition_blocked(gate)
+    assert s.cursor("beta") == m.id
+    assert barrier.hits["message-publication"] == hold
+    assert health.contended_phases() == [loop.LOCK_CONTENTION_PHASE_FINALIZATION] * hold
+    assert len(health.diagnostics) == (1 if hold >= BOUND else 0)
+
+
+def _fresh_owed(tmp_path: Path):
+    """An admitted, open owed obligation owned by this fence, outside the loop."""
+    s, m = _owed_bus(tmp_path)
+    s.write_waiting("beta", {"mode": "wrapper-loop", "wrapper_generation": "wrapper-1",
+                             "wait_token": "wrapper-1", "pid": store_mod.os.getpid()})
+    gate = _active_gate(s)
+    record = loop.recv_api.next_record(s, "beta")
+    resolution = gate.admit_or_finalize(record)
+    assert resolution.state == obligations.ResolverState.OWED_UNSATISFIED
+    return s, m, gate, record, resolution
+
+
+@pytest.mark.parametrize("contended", [False, True], ids=["control", "contended"])
+def test_retry_exhaustion_settlement_never_blocks_on_a_contended_replay(
+    tmp_path, monkeypatch, contended,
+) -> None:
+    s, m, gate, record, resolution = _fresh_owed(tmp_path)
+    barrier = LockBarrier(monkeypatch)
+    if contended:
+        barrier.arm("ledger.lock", hold=1)                # the settlement's replay index
+        with pytest.raises(obligations.LedgerContended):
+            gate.settle_retry_exhaustion(record, resolution.key,
+                                         category="finalization", reason="bound spent")
+        assert _owed_admission(s, gate)["state"] == "open"    # nothing persisted
+        assert "OBLIGATION_BLOCKED" not in _transitions(gate)
+        assert barrier.hits["ledger.lock"] == 1
+    settled = gate.settle_retry_exhaustion(record, resolution.key,
+                                           category="finalization", reason="bound spent")
+    assert settled.state == obligations.ResolverState.DELIVERY_EXHAUSTED
+    assert _owed_admission(s, gate)["state"] == "delivery_failed"
+    assert "OBLIGATION_BLOCKED" not in _transitions(gate)
+    assert s.cursor("beta") == m.id
+
+
+@pytest.mark.parametrize("contended", [False, True], ids=["control", "contended"])
+def test_retry_barrier_reports_a_contended_replay_typed_not_as_no_retry(
+    tmp_path, monkeypatch, contended,
+) -> None:
+    s, _m, gate, _record, resolution = _fresh_owed(tmp_path)
+    barrier = LockBarrier(monkeypatch)
+    if contended:
+        barrier.arm("ledger.lock", hold=1)
+        with pytest.raises(obligations.LedgerContended):
+            gate.record_retry_barrier(resolution.key, category="operation_infra",
+                                      expected_revision=resolution.scoped_revision)
+        assert int(_owed_admission(s, gate).get("operation_infra_attempts", 0)) == 0
+    assert gate.record_retry_barrier(resolution.key, category="operation_infra",
+                                     expected_revision=resolution.scoped_revision) is True
+    assert _owed_admission(s, gate)["operation_infra_attempts"] == 1   # counted once
+
+
+@pytest.mark.parametrize(
+    "error",
+    [None, OSError("owed-action ledger write failed")],
+    ids=["contended", "non-contention-control"],
+)
+def test_a_contended_block_write_is_retried_never_escalated_to_a_disposition_block(
+    tmp_path, monkeypatch, error,
+) -> None:
+    s, _m, gate, _record, resolution = _fresh_owed(tmp_path)
+    barrier = LockBarrier(monkeypatch)
+    barrier.arm("ledger.lock", hold=1, error=error)      # mark_blocked's ledger lock
+    if error is None:
+        with pytest.raises(LockContention):
+            gate._block_retry_exhaustion(resolution.key, reason="exhausted")
+        assert not _disposition_blocked(gate)             # nothing escalated
+        assert _owed_admission(s, gate)["state"] == "open"
+        blocked = gate._block_retry_exhaustion(resolution.key, reason="exhausted")
+        assert _owed_admission(s, gate)["state"] == "blocked"
+    else:
+        # Unchanged fail-closed rule: a real write failure escalates visibly.
+        blocked = gate._block_retry_exhaustion(resolution.key, reason="exhausted")
+        assert _disposition_blocked(gate)
+    assert blocked.state == obligations.ResolverState.BLOCKED
+
+
+@pytest.mark.parametrize(
+    "error",
+    [None, ValueError("owed-action ledger is corrupt")],
+    ids=["contended", "non-contention-control"],
+)
+def test_head_local_disposition_treats_a_contended_replay_as_contention(
+    tmp_path, monkeypatch, error,
+) -> None:
+    s, _m, gate, record, resolution = _fresh_owed(tmp_path)
+    permit = obligations.DispatchPermit(
+        resolution.key.digest, "0" * 32, "0" * 32, "recovery", 1,
+        tmp_path / "unused-draft.txt", "",
+    )
+    barrier = LockBarrier(monkeypatch)
+    barrier.arm("ledger.lock", hold=1, error=error)      # the proof replay's index
+    if error is None:
+        with pytest.raises(obligations.LedgerContended):
+            gate.fail_head_local_corruption_or_block(
+                record, resolution.key, permit, reason="corrupt artifact",
+                expected_revision=resolution.scoped_revision)
+        assert _owed_admission(s, gate)["state"] == "open"
+        assert "OBLIGATION_BLOCKED" not in _transitions(gate)
+    else:
+        # Unchanged: an unreadable proof replay fails closed as a visible block.
+        blocked = gate.fail_head_local_corruption_or_block(
+            record, resolution.key, permit, reason="corrupt artifact",
+            expected_revision=resolution.scoped_revision)
+        assert blocked.state == obligations.ResolverState.BLOCKED
+        assert blocked.reason.startswith("head-local proof unavailable")
+
+
+@pytest.mark.parametrize("contended", [False, True], ids=["control", "contended"])
+def test_cursor_projection_miss_accounting_contention_never_blocks_dispositions(
+    tmp_path, monkeypatch, contended,
+) -> None:
+    # The finalizer's cursor write fails once (an I/O miss it must account for);
+    # contention on that accounting used to escalate into a disposition block.
+    s, m = _bus(tmp_path, kind="message")
+    gate = _active_gate(s)
+    barrier = LockBarrier(monkeypatch)
+    real_advance = s.advance_cursor
+    failed: list[bool] = []
+
+    def advance_once_failing(agent, msg_id):
+        if not failed:
+            failed.append(True)
+            if contended:
+                barrier.arm("ledger.lock", hold=1)        # the miss accounting
+            raise OSError("cursor write failed")
+        return real_advance(agent, msg_id)
+
+    monkeypatch.setattr(s, "advance_cursor", advance_once_failing)
+    driver = CountedDriver(reply=None)
+    health = Health()
+    _run(s, gate, driver, health, max_turns=None, max_polls=6)
+
+    assert driver.calls == 1
+    assert failed == [True]
+    assert not _disposition_blocked(gate)
+    assert s.cursor("beta") == m.id
+    assert barrier.hits["ledger.lock"] == (1 if contended else 0)
+    assert health.contended_phases() == (
+        [loop.LOCK_CONTENTION_PHASE_FINALIZATION] if contended else [])

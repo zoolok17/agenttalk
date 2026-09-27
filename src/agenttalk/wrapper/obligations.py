@@ -136,6 +136,22 @@ class LedgerContended(LedgerUnreadable):
     """
 
 
+def _is_contention(exc: BaseException) -> bool:
+    """#154: identifiable store lock contention, raised directly or as a timed-out replay."""
+    return isinstance(exc, (LockContention, LedgerContended))
+
+
+def _uncontended(result: "Resolution") -> "Resolution":
+    """#154: a replay folded into a contended fail-closed result decides nothing.
+
+    Re-raise it TYPED before a caller can persist a permanent block from it, so the
+    wrapper's in-place retry acts instead; every other result passes through.
+    """
+    if result.reason in CONTENDED_REASONS:
+        raise LedgerContended(result.reason)
+    return result
+
+
 class StaleRevision(GateError):
     """A scoped compare-and-swap lost a race."""
 
@@ -5009,6 +5025,8 @@ class DetectionCommitGate:
         with self.store._message_publication_lock():
             try:
                 self._validated_messages()
+            except LedgerContended:
+                raise  # #154: contention is not "no retry now"; the caller retries this
             except LedgerUnreadable:
                 return False
             with self.store._exclusive_lock(
@@ -5188,6 +5206,8 @@ class DetectionCommitGate:
     ) -> Resolution:
         try:
             return self.mark_blocked(key, reason=reason)
+        except LockContention:
+            raise  # #154: retry this block write; never escalate contention globally
         except (GateError, OSError, TimeoutError):
             self._record_disposition_block(reason=reason)
             return Resolution(ResolverState.BLOCKED, reason, key)
@@ -5200,7 +5220,12 @@ class DetectionCommitGate:
         reason: str,
         expected_revision: int,
     ) -> Resolution:
-        """Commit exact-head failed delivery, or make inability to do so visible."""
+        """Commit exact-head failed delivery, or make inability to do so visible.
+
+        #154: store lock contention anywhere in here - raised, or folded into a
+        replay - propagates TYPED before anything persists a block; only a
+        non-contention failure is made visible as the fail-closed BLOCK.
+        """
         try:
             return self.delivery_failed(
                 record,
@@ -5209,22 +5234,28 @@ class DetectionCommitGate:
                 expected_revision=expected_revision,
             )
         except (GateError, OSError, TimeoutError, ValueError, RuntimeError) as exc:
+            if _is_contention(exc):
+                raise
             failure = exc
         try:
-            replayed = self.resolve(record)
+            replayed = _uncontended(self.resolve(record))
         except (GateError, OSError, TimeoutError, ValueError, RuntimeError) as exc:
+            if _is_contention(exc):
+                raise
             return self._block_retry_exhaustion(
                 key,
                 reason=f"failed-delivery disposition unavailable: {type(exc).__name__}",
             )
         if replayed.terminal:
             try:
-                finalized = self.finalize(
+                finalized = _uncontended(self.finalize(
                     record,
                     replayed,
                     expected_revision=replayed.scoped_revision,
-                )
-            except (GateError, OSError, TimeoutError, ValueError, RuntimeError):
+                ))
+            except (GateError, OSError, TimeoutError, ValueError, RuntimeError) as exc:
+                if _is_contention(exc):
+                    raise
                 return replayed
             return replayed if finalized.state == ResolverState.INDETERMINATE else finalized
         if replayed.state == ResolverState.OWED_UNSATISFIED and replayed.key == key:
@@ -5240,6 +5271,8 @@ class DetectionCommitGate:
                     expected_revision=replayed.scoped_revision,
                 )
             except (GateError, OSError, TimeoutError, ValueError, RuntimeError) as exc:
+                if _is_contention(exc):
+                    raise
                 failure = exc
         return self._block_retry_exhaustion(
             key,
@@ -5267,6 +5300,8 @@ class DetectionCommitGate:
             locks.enter_context(self.store._message_publication_lock())
             try:
                 messages, _ = self._validated_messages()
+            except LedgerContended:
+                raise  # #154: contention is not an unavailable proof
             except LedgerUnreadable as exc:
                 return self._block_retry_exhaustion(
                     key,
@@ -5428,16 +5463,18 @@ class DetectionCommitGate:
         """Replay once at the bound, then choose terminal, local failure, or BLOCKED."""
         if category not in {"operation_infra", "finalization"}:
             raise ValueError("unknown retry category")
-        latest = self.resolve(record)
+        # #154: a contended replay decides nothing - it must never become the
+        # exhaustion BLOCK below; _uncontended re-raises it typed first.
+        latest = _uncontended(self.resolve(record))
         if latest.terminal:
-            finalized = self.finalize(
+            finalized = _uncontended(self.finalize(
                 record,
                 latest,
                 expected_revision=latest.ledger_revision,
-            )
+            ))
             if finalized.state != ResolverState.INDETERMINATE:
                 return finalized
-            raced = self.resolve(record)
+            raced = _uncontended(self.resolve(record))
             if raced.terminal:
                 # Keep the canonical terminal authoritative.  The next poll can
                 # retry only its cursor CAS; synthesizing BLOCKED here would mask
@@ -6737,6 +6774,10 @@ class DetectionCommitGate:
                             key_digest=key_digest,
                         )
                     self._write(ledger)
+            except LockContention:
+                # #154: the disposition is durable; retry this finalization
+                # instead of escalating contention into a disposition block.
+                raise
             except (OSError, TimeoutError, ValueError, RuntimeError, LedgerUnreadable):
                 reason = "cursor projection failure accounting is unavailable"
                 exhausted = True

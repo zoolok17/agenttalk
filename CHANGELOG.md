@@ -24,9 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as `rate_limited_or_outage` / `store_lock_contention`, with one wrapper-log
   diagnostic per persistent episode. An owner that cannot re-enter a lock's guard
   to remove its own marker no longer waits on itself: the process removes exactly
-  that marker on its next acquisition or sweep. Corruption, access denial, unsafe
-  generation changes, lock-order inversions and a lost lease keep their existing
-  handling and are never retried as contention.
+  that marker on its next acquisition or sweep. Contention is never persisted as a
+  permanent block: failed-delivery disposition, retry-exhaustion settlement, the
+  retry barrier, block writes and cursor-projection accounting report it typed so
+  the step is retried. Corruption, access denial, unsafe generation changes,
+  lock-order inversions and a lost lease keep their existing handling and are
+  never retried as contention.
 
 ## [0.93.0] - 2026-09-27
 
