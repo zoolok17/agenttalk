@@ -317,6 +317,36 @@ def check_gates(root: Path, *, scope: str | None = None, now: datetime | None = 
     }
 
 
+def check_board(root: Path | None, *, project: str, item: str, cycle: int, revision: str | None,
+                keys: list[str], state: dict | None = None) -> bool | None:
+    """Exact declared checks only; global barriers remain a separate ordinary check.
+
+    None means unavailable evidence. A warning, stale revision or waiver cannot
+    stand in for validated blocker-green evidence for this candidate.
+    """
+    if not revision or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision) or not keys:
+        return None
+    state = load_gate_state(root) if state is None else state
+    if state.get("load_error"):
+        return None
+    for key in keys:
+        if not isinstance(key, str) or not re.fullmatch(r"[a-z0-9-]{1,24}", key):
+            return None
+        name = f"wb.{item}.c{cycle}.{key}"
+        if len(name) > 128:
+            return None
+        gate = state["gates"].get(name)
+        if gate is None:
+            return None
+        if gate.get("scope") != f"{project}/{item}/c{cycle}" or gate.get("revision") != revision:
+            return None
+        if (gate.get("severity") != "blocker" or gate.get("status") != "green"
+                or gate.get("evidence_source") not in BLOCKER_GREEN_SOURCES
+                or not _has_gate_evidence(gate, gate.get("evidence_source"))):
+            return False
+    return True
+
+
 def validate_response_status(kind: str, meta: dict) -> None:
     """Validate a typed response status when present.
 

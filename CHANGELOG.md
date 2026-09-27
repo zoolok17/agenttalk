@@ -9,7 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Serve a bounded, read-only work-board feed from the shared snapshot worker, with
+  exact item/cycle/revision checks and visible coverage, overflow and legacy groups.
+
 ### Fixed
+
+- Isolate `wb.` gates from root checks and both gate-HOLD attention paths; refuse
+  new board names in root requirements and warn about legacy contaminated lists.
 
 - Keep the fresh last-known-good dashboard view during snapshot scan races and
   schedule a bounded prompt retry; config mismatch and stale data still refuse.

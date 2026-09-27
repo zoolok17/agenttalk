@@ -54,6 +54,7 @@ Routes
 - ``GET  /dashboard``           — the Team Console HTML shell (all roots; 0.58.0)
 - ``GET  /static/<name>``       — allowlisted console assets (css/js/png; 0.58.0/0.61.0)
 - ``GET  /api/state``           — multi-root obligation aggregate, schema v1 (0.17.0)
+- ``GET  /api/work-board``      — bounded cached work cards for the selected root
 - ``GET  /api/attention``       — ranked "needs a human" queue for a selected root
 - ``GET  /api/gates``           — gate & evidence wall: every gate's status/
   severity/evidence/waiver for a selected root
@@ -4441,6 +4442,18 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False,
                 # feed keeps the strict _DEFAULT_CSP.
                 self._send_json(HTTPStatus.OK,
                                 build_state(roots, history=health_history, snapshots=snapshots))
+                return
+            if path == "/api/work-board":
+                selected = self._root_selection(self._request_params())
+                if selected is None:
+                    self._bad_root()
+                    return
+                _, root = selected
+                service = (snapshots or {}).get(str(root.store.root.resolve()))
+                payload = service.board() if service else {
+                    "schema_version": 1, "items": [], "total_count": None,
+                    "coverage": {"status": "building"}, "errors": ["board snapshot unavailable"]}
+                self._send_json(HTTPStatus.OK, payload)
                 return
             if path == "/api/session":
                 self._handle_session_get()

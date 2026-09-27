@@ -7646,8 +7646,9 @@ def test_api_gates_shape_evidence_and_waiver(tmp_path: Path) -> None:
         payload = _gates(base)
         assert set(payload) == {
             "root", "root_path", "root_info", "target_root_project_id",
-            "verdict", "required_gates", "gates", "count",
+            "verdict", "required_gates", "gates", "count", "warnings",
         }
+        assert payload["warnings"] == []
         assert payload["count"] == len(payload["gates"])
         assert payload["required_gates"] == ["tests"]
         by_name = {g["name"]: g for g in payload["gates"]}
