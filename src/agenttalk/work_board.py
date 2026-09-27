@@ -5,37 +5,29 @@ and declared cycle numbers. Message IDs and timestamps never order evidence.
 Bodies and subjects are never read; seat names are compared as identities,
 never parsed. Facts the bus cannot prove (operator incidents, integration,
 fresh health, check results) are injected by later slices and default to unknown.
-Malformed or partial history degrades only the affected item to Unknown with
-evidence; it never aborts the reduction.
+Before reduction, a read-side audit applies the publication invariants of
+work_tags to every envelope, historical or modern. A violation is evidence
+against the item the envelope can still be attributed to, which becomes Unknown;
+an explicit reference that does not resolve is missing history, never a fallback;
+unattributable violations are reported, not dropped. It never aborts the reduction.
 """
 
 import json
 
-from agenttalk import work_tags
+from agenttalk import gates, work_tags
 from agenttalk.threads import _classify_event
 
 EXECUTION = {"design", "build", "fix"}
 EARLIER_REQUESTER = "outstanding task from an earlier requester; current lead cannot cancel yet"
 EXTERNAL = "external deliverable; authorship unverified"
+MISSING = "missing required correlation history"
 _TAGS = ("work_item", "stage", "work_cycle", "work_round", "external_deliverable")
-_DEFAULTS = {"work_cycle": "1", "external_deliverable": False}
+_DISPATCH_ONLY = {"supersedes", "assignee_model_vendors", "assignee_model_vendor"}
 _POLICY = ("work_repo", "work_branch", "work_target", "no_gates_reason")
 
 
 def _tag(meta, key):
     return work_tags.value(key, meta[key]) if key in meta else None
-
-
-def _verdict(stage, meta):
-    if meta.get("verdict_issue"):
-        return None, meta["verdict_issue"]
-    allowed = {"go": "GO", "fix": "FIX", "hold": "HOLD"} if stage in work_tags.REVIEWS else (
-        {"done": "done"} if stage in EXECUTION else {})
-    raw = meta.get("verdict")
-    if raw is None:
-        return None, "verdict missing"
-    canonical = allowed.get(raw.casefold()) if isinstance(raw, str) else None
-    return (canonical, None) if canonical else (None, "unrecognized verdict")
 
 
 def _parse(meta):
@@ -75,12 +67,9 @@ def _request(rid, copies, responses, running, descends):
             or len({c.recipient for c in copies}) != len(copies)):
         req["issues"].append(("ambiguous fan-out openers", openers))
     try:
-        tags, parsed = _parse(meta)
+        req.update(_parse(meta)[1])
     except (TypeError, ValueError):
         req["issues"].append(("malformed work metadata", openers))
-        tags = None
-    else:
-        req.update(parsed)
     vendors = req["vendors"] or {}
     # N3: the publisher's frozen map names every recipient; a missing copy is an incomplete snapshot.
     if req["vendors"] is not None and set(vendors) - {c.recipient for c in copies}:
@@ -100,8 +89,6 @@ def _request(rid, copies, responses, running, descends):
                 first.kind, reply, copy.sender, copy.recipient, copy.recipient)
             if event is None:
                 continue
-            if tags is not None and _contradicts(reply.meta, tags, req["head"], req["stage"]):
-                req["issues"].append(("reply contradicts its opener", [reply.id]))
             if event[0] == "terminal":
                 terminal.append(reply)
             elif first.kind == "task":
@@ -126,7 +113,11 @@ def _request(rid, copies, responses, running, descends):
                 ob["state"] = "declined"
             else:
                 ob["state"] = "done"
-                ob["verdict"], ob["issue"] = _verdict(req["stage"], reply.meta)
+                try:
+                    ob["verdict"], ob["issue"] = work_tags.reply_verdict(
+                        reply.kind, req["stage"], reply.meta.get("status"), reply.meta.get("verdict"))
+                except ValueError as exc:  # audited away for work items; legacy has no pairing
+                    ob["issue"] = str(exc)
             # N1: publication does not order a result and a needs-info; only explicit reply links do.
             before = [h for h in ob["holds"] if descends(reply.id, h)]
             after = [h for h in ob["holds"] if descends(h, reply.id)]
@@ -137,56 +128,106 @@ def _request(rid, copies, responses, running, descends):
     return req
 
 
-def _contradicts(meta, tags, head, stage):
+def _slug(meta):
+    """The valid work-item tag of an envelope, else None (absent or malformed)."""
     try:
-        if any(key in meta and _tag(meta, key) != (_DEFAULTS.get(key) if tags[key] is None else tags[key])
-               for key in _TAGS):
-            return True
-        return stage in work_tags.REVIEWS and "work_head" in meta and _tag(meta, "work_head") != head
+        return work_tags.value("work_item", meta["work_item"]) if "work_item" in meta else None
     except (TypeError, ValueError):
-        return True
+        return None
+
+
+def _cyclic(start, parent):
+    seen, node = {start}, parent.get(start)
+    while node is not None:
+        if node in seen:
+            return True
+        seen.add(node)
+        node = parent.get(node)
+    return False
+
+
+def _audit(messages, openers):
+    """Read-side publication invariants over every envelope, historical or modern, before reduction.
+
+    The checks are work_tags' own (reply_request, reply_opener, inherit, reply_verdict, value) and the
+    response-status enum. A violating envelope is withheld from reduction and recorded against whatever it
+    can still be attributed to: its request, its reply ancestry, then its tag; otherwise it is unassigned.
+    """
+    by_id = {m.id: m for m in messages}
+    parent = {m.id: m.meta["in_reply_to"] for m in messages if isinstance(m.meta.get("in_reply_to"), str)}
+    responses, flags, unassigned = {}, {}, []
+
+    def owners(m):
+        found = []
+        rid = m.meta.get("request_id")
+        if isinstance(rid, str) and rid in openers:
+            found.append(rid)
+        seen, node = set(), m.meta.get("in_reply_to")
+        while not found and isinstance(node, str) and node in by_id and node not in seen:
+            seen.add(node)
+            ancestor = by_id[node].meta.get("request_id")
+            if isinstance(ancestor, str) and ancestor in openers:
+                found.append(ancestor)
+            node = parent.get(node)
+        slug = _slug(m.meta)
+        return found + ([("item", slug)] if slug else [])
+
+    def flag(m, reason):
+        targets = owners(m)
+        if not targets:
+            unassigned.append((reason, m.id))
+        for target in targets:
+            flags.setdefault(target, []).append((reason, [m.id]))
+
+    for m in messages:
+        meta = m.meta
+        rid, anchor_id = meta.get("request_id"), meta.get("in_reply_to")
+        if (not (rid is None or isinstance(rid, str)) or not (anchor_id is None or isinstance(anchor_id, str))
+                or (m.kind in work_tags.OPENERS and not rid)):
+            flag(m, "malformed correlation")
+        elif anchor_id is not None and anchor_id not in by_id:
+            flag(m, MISSING)  # a named reference that does not resolve is never replaced by a fallback
+        elif anchor_id is not None and _cyclic(m.id, parent):
+            flag(m, "cyclic reply ancestry")
+        elif m.kind in work_tags.REPLIES or m.kind == "rescind":
+            anchor = by_id.get(anchor_id)
+            request = rid or (anchor.meta.get("request_id") if anchor is not None else None)
+            copies = openers.get(request) if isinstance(request, str) else None
+            if copies is None:
+                flag(m, MISSING)
+            elif m.kind == "rescind" or not any("work_item" in c.meta for c in copies):
+                responses.setdefault(request, []).append(m)  # untagged legacy protocol is unchanged
+            else:
+                try:
+                    if _DISPATCH_ONLY & meta.keys():
+                        raise ValueError("reply carries dispatch-only metadata")
+                    work_tags.reply_request(meta, anchor)
+                    opener = work_tags.reply_opener(copies, m.sender, m.recipient, m.kind)
+                    clean = work_tags.inherit(opener.meta, {
+                        k: work_tags.value(k, v) if k in work_tags.FIELDS else v for k, v in meta.items()})
+                    gates.validate_response_status(m.kind, clean)
+                    _, issue = work_tags.reply_verdict(m.kind, clean.get("stage"), clean.get("status"),
+                                                       clean.get("verdict"))
+                    if issue == "unrecognized verdict":  # uninterpretable evidence cannot certify any row
+                        raise ValueError(issue)
+                except LookupError:
+                    flag(m, MISSING)
+                except (TypeError, ValueError) as exc:
+                    flag(m, str(exc))
+                else:
+                    responses.setdefault(request, []).append(m)
+    return responses, flags, unassigned, parent
 
 
 def reduce(messages, *, lead, incidents=(), integrated=None, running=frozenset(), checks=None):
-    """Return {"items": [...], "legacy": {...}}; the input is never mutated or ordered by ID."""
+    """Return {"items", "legacy", "unassigned"}; the input is never mutated or ordered by ID."""
     messages = list(messages)
-    openers, opener_rid = {}, {}
-    responses, orphans = {}, {}
-
-    def orphan(m, why):
-        if isinstance(m.meta.get("work_item"), str) and m.kind != "rescind":
-            orphans.setdefault(m.meta["work_item"], []).append((why, [m.id]))
-
-    def malformed(m):
+    openers = {}
+    for m in messages:
         rid, anchor = m.meta.get("request_id"), m.meta.get("in_reply_to")
-        return not (rid is None or isinstance(rid, str)) or not (anchor is None or isinstance(anchor, str))
-
-    for m in messages:
-        rid = m.meta.get("request_id")
-        if m.kind in work_tags.OPENERS and isinstance(rid, str) and rid and not malformed(m):
+        if m.kind in work_tags.OPENERS and isinstance(rid, str) and rid and (anchor is None or isinstance(anchor, str)):
             openers.setdefault(rid, []).append(m)
-            opener_rid[m.id] = rid
-        elif m.kind in work_tags.OPENERS:
-            orphan(m, "malformed correlation")
-    parent = {m.id: m.meta["in_reply_to"] for m in messages if isinstance(m.meta.get("in_reply_to"), str)}
-    for m in messages:
-        if m.kind not in work_tags.REPLIES and m.kind != "rescind":
-            continue
-        if malformed(m):
-            orphan(m, "malformed correlation")
-            continue
-        # Walk explicit reply ancestry to the opener it answers; a stated request_id must agree.
-        rid, seen, node = m.meta.get("request_id"), set(), m.meta.get("in_reply_to")
-        while node is not None and node not in opener_rid and node not in seen:
-            seen.add(node)
-            node = parent.get(node)
-        found = opener_rid.get(node)
-        if found is not None and rid is not None and rid != found:
-            orphan(m, "reply request_id contradicts its in_reply_to ancestry")
-        elif (found or rid) in openers:
-            responses.setdefault(found or rid, []).append(m)
-        else:
-            orphan(m, "reply has no available opener")
+    responses, flags, unassigned, parent = _audit(messages, openers)
 
     def descends(later, earlier):
         seen, node = set(), parent.get(later)
@@ -197,15 +238,39 @@ def reduce(messages, *, lead, incidents=(), integrated=None, running=frozenset()
             node = parent.get(node)
         return False
 
-    grouped, legacy = {}, []
+    grouped, legacy, detached = {}, [], []
     for rid, copies in openers.items():
         req = _request(rid, copies, responses.get(rid, []), running, descends)
-        (grouped.setdefault(req["work_item"], []) if req["work_item"] else legacy).append(req)
+        req["issues"] += flags.get(rid, [])
+        req["work_item"] = _slug(copies[0].meta)
+        if req["work_item"]:
+            grouped.setdefault(req["work_item"], []).append(req)
+        elif "work_item" in copies[0].meta:
+            detached.append((req, copies))
+        else:
+            legacy.append(req)
+    item_of = {r["request_id"]: slug for slug, reqs in grouped.items() for r in reqs}
+    for req, copies in detached:
+        ids = {c.id for c in copies}
+        links = {item_of.get(copies[0].meta.get("supersedes"))} | {
+            _slug(m.meta) for m in messages if m.meta.get("request_id") == req["request_id"]
+            or m.meta.get("in_reply_to") in ids}
+        links.discard(None)
+        if len(links) == 1:
+            grouped[links.pop()].append(req)  # its malformed-metadata issue makes that item Unknown
+        else:
+            unassigned.extend(("malformed work metadata", i) for i in sorted(ids))
+    tagged = {key[1]: issues for key, issues in flags.items() if isinstance(key, tuple)}
     facts = {"lead": lead, "incidents": list(incidents), "integrated": integrated or {}, "checks": checks or {},
              "known": set(openers)}
-    items = [_item(slug, grouped.get(slug, []), orphans.get(slug, []), facts)
-             for slug in sorted(set(grouped) | set(orphans))]
-    return {"items": items, "legacy": _legacy(legacy)}
+    items = [_item(slug, grouped.get(slug, []), tagged.get(slug, []), facts)
+             for slug in sorted(set(grouped) | set(tagged))]
+    reasons = {}
+    for reason, _ in unassigned:
+        reasons[reason] = reasons.get(reason, 0) + 1
+    return {"items": items, "legacy": _legacy(legacy),
+            "unassigned": {"count": len(unassigned), "reasons": dict(sorted(reasons.items())),
+                           "examples": sorted(i for _, i in unassigned)[:20]}}
 
 
 def _legacy(reqs):
@@ -230,7 +295,7 @@ def _graph(reqs, known):
         if target is None:
             continue
         if old is None:
-            why = "supersedes crosses work items" if target in known else "missing referenced opener"
+            why = "supersedes crosses work items" if target in known else MISSING
             conflicts.append((why, r["openers"]))
         elif old["cycle"] != r["cycle"]:
             conflicts.append(("supersedes crosses work cycles", old["openers"] + r["openers"]))
@@ -373,7 +438,13 @@ def _place(slug, valid, cur, by_rid, successor, surviving, policy, facts, item):
                           for r in surviving for o in _live(r))
         # Missing review or check evidence stays explicit on Done.
         problem = policy["problem"]
+        pending_review = any(o["state"] == "outstanding" for r in reviews for o in r["obligations"])
+        delivered = any(r["external"] for r in cur) or any(
+            o["state"] == "done" and o["verdict"] == "done" for r in cur
+            if r["stage"] in EXECUTION and r["request_id"] not in successor for o in _live(r))
         reason = ("merged with open FIX/HOLD" if open_marks else "integrated without independent GO" if not independent
+                  else "integrated without a recorded deliverable" if not delivered
+                  else "integrated with review outstanding" if pending_review
                   else "integrated with failed required checks" if item["checks"] == "required checks failed"
                   else "integrated; " + problem[0] if problem else "integrated in configured target")
         return 3, "done", reason, [reply for _, reply in open_marks] or [i for r in surviving for i in r["openers"]]

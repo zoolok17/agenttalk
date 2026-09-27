@@ -115,6 +115,10 @@ def test_row3_integrated_candidate_is_done_and_keeps_open_fix_visible():
     reviewed(bypassed, reviewer=BUILDER)  # only the builder reviewed
     assert card(bypassed, integrated={(ITEM, HEAD): True})["reason"] == "integrated without independent GO"
     assert card(bus, integrated={(ITEM, HEAD): True})["reason"] == "integrated in configured target"
+    review_only = Bus()  # reviewed and merged, but no build dispatch and no external declaration
+    review_only.reply(review_only.task("tk-read", REVIEWER, "read", work_head=HEAD, **POLICY), verdict="GO")
+    item = card(review_only, integrated={(ITEM, HEAD): True})
+    assert (item["workflow_column"], item["reason"]) == ("done", "integrated without a recorded deliverable")
 
 
 def test_row4_unresolved_fix_or_active_fix_task_is_fix_round():
@@ -345,7 +349,7 @@ def test_f3_snapshot_missing_the_superseded_opener_is_unknown():
     assert card(bus)["workflow_column"] == "ready"
     bus.messages = [m for m in bus.messages if m.id not in {r1.id, fix.id}]
     item = card(bus)
-    assert (item["workflow_column"], item["row"], item["reason"]) == ("unknown", 2, "missing referenced opener")
+    assert (item["workflow_column"], item["row"], item["reason"]) == ("unknown", 2, W.MISSING)
     assert r2.id in item["evidence"]
 
 
@@ -499,7 +503,7 @@ def test_partial_snapshots_never_look_complete():
     assert card(bus)["workflow_column"] == "ready"
     no_opener = [m for m in bus.messages if m.id != build.id]
     item = next(i for i in W.reduce(no_opener, lead=LEAD)["items"] if i["work_item"] == ITEM)
-    assert (item["row"], item["reason"]) == (2, "reply has no available opener")
+    assert (item["row"], item["reason"]) == (2, W.MISSING)
     no_reply = [m for m in bus.messages if m.meta.get("in_reply_to") != build.id]
     assert next(i for i in W.reduce(no_reply, lead=LEAD)["items"])["workflow_column"] == "queued"
 
@@ -743,7 +747,7 @@ def test_n8_ancestry_disagreeing_with_request_id_is_a_conflict():
     bad = bus.add(REVIEWER, LEAD, "task-response", {"in_reply_to": note.id, "request_id": "tk-r", "status": "done",
                                                      "verdict": "GO", "work_item": ITEM}, raw=True)
     assert review and (card(bus)["row"], card(bus)["reason"]) == (
-        2, "reply request_id contradicts its in_reply_to ancestry")
+        2, "reply request_id contradicts its in_reply_to anchor")
     assert bad.id in card(bus)["evidence"]
 
 
@@ -763,3 +767,173 @@ def test_n9_malformed_historical_correlation_is_a_per_item_unknown():
     bad = opener.task([], BUILDER, "build", raw=True, **POLICY)
     assert (card(opener)["row"], card(opener)["reason"], card(opener)["evidence"]) == (
         2, "malformed correlation", [bad.id])
+
+
+# ---- Round 4 (codex dev-4, 2026-09-27): read-side validation, N10-N12 ----
+
+REVIEWER3 = "codex-agenttalk-reviewer-1"
+BUILDER2 = "codex-agenttalk-dev-6"
+
+
+def nth_id(n):
+    return f"20260926-2225{n:02d}-{n:06d}-q{n:03d}"
+
+
+def test_n10_removed_link_or_cyclic_ancestry_is_missing_history_not_a_fallback():
+    bus = Bus()
+    built(bus)
+    review = bus.task("tk-r", REVIEWER, "read", kind="review-request", work_head=HEAD)
+    link = bus.add(LEAD, REVIEWER, "message", {"request_id": "tk-r", "in_reply_to": review.id})
+    go = bus.add(REVIEWER, LEAD, "review-result", {"request_id": "tk-r", "in_reply_to": link.id,
+                                                     "status": "approved", "verdict": "GO"})
+    assert card(bus)["workflow_column"] == "ready"
+    bus.messages = [m for m in bus.messages if m.id != link.id]
+    item = card(bus)
+    assert (item["workflow_column"], item["row"], item["reason"]) == (
+        "unknown", 2, "missing required correlation history")
+    assert go.id in item["evidence"]
+    cyclic = Bus()
+    built(cyclic)
+    review = cyclic.task("tk-r", REVIEWER, "read", kind="review-request", work_head=HEAD)
+    n = len(cyclic.messages)
+    note = cyclic.add(LEAD, REVIEWER, "message", {"request_id": "tk-r", "in_reply_to": nth_id(n + 2)}, raw=True)
+    cyclic.add(REVIEWER, LEAD, "review-result", {"request_id": "tk-r", "in_reply_to": note.id, "status": "approved",
+                                                 "verdict": "GO", "work_item": ITEM}, raw=True)
+    item = card(cyclic)
+    assert (item["workflow_column"], item["row"], item["reason"]) == ("unknown", 2, "cyclic reply ancestry")
+
+
+def test_n11_historical_native_status_verdict_disagreement_is_not_an_approval():
+    bus = Bus()
+    built(bus)
+    review = bus.task("tk-r", REVIEWER, "read", kind="review-request", work_head=HEAD)
+    meta = {"in_reply_to": review.id, "request_id": "tk-r", "status": "rejected", "verdict": "GO", "work_item": ITEM}
+    bad = bus.add(REVIEWER, LEAD, "review-result", meta, raw=True)
+    item = card(bus)
+    assert (item["workflow_column"], item["row"], item["reason"]) == (
+        "unknown", 2, "review status and verdict must agree")
+    assert bad.id in item["evidence"]
+
+
+def test_n12_malformed_reply_without_repeated_tag_is_attributed_by_its_request():
+    bus = Bus()
+    built(bus)
+    bus.reply(bus.task("tk-r1", REVIEWER, "read", work_head=HEAD), verdict="GO")
+    bus.task("tk-r2", REVIEWER2, "read", work_head=HEAD)
+    bus.rescind("tk-r2", sender=LEAD, to=REVIEWER2)
+    bad = bus.add(REVIEWER2, LEAD, "task-response", {"request_id": "tk-r2", "in_reply_to": [], "status": "done",
+                                                       "verdict": "FIX"}, raw=True)
+    item = card(bus)
+    assert (item["workflow_column"], item["row"], item["reason"]) == ("unknown", 2, "malformed correlation")
+    assert bad.id in item["evidence"]
+
+
+def test_unattributable_corruption_is_reported_not_silently_dropped():
+    bus = Bus()
+    reviewed(bus)
+    stray = bus.add(REVIEWER2, LEAD, "task-response", {"request_id": "tk-gone", "status": "done"}, raw=True)
+    out = W.reduce(bus.messages, lead=LEAD)
+    assert out["unassigned"] == {"count": 1, "reasons": {"missing required correlation history": 1},
+                                 "examples": [stray.id]}
+    assert next(i for i in out["items"] if i["work_item"] == ITEM)["workflow_column"] == "ready"
+
+
+def valid_history(variant, review):
+    """A normalized history ending Ready (Done when integration is injected); 3 executions x 4 reviews."""
+    bus = Bus()
+    if variant == 0:
+        built(bus)
+    elif variant == 1:
+        bus.task("tk-build", BUILDER, "build", **POLICY)
+        bus.reply(bus.task("tk-build-2", BUILDER2, "build", supersedes="tk-build"), verdict="done")
+        bus.rescind("tk-build", sender=LEAD)
+    else:
+        for to in (BUILDER, BUILDER2):
+            copy = bus.task("tk-build", to, "build", **POLICY)
+            bus.reply(copy, verdict="done")
+    head = HEAD
+    if review == 0:
+        bus.reply(bus.task("tk-r", REVIEWER, "read", work_head=HEAD), verdict="GO")
+    elif review == 1:
+        opener = bus.task("tk-r", REVIEWER, "read", kind="review-request", work_head=HEAD)
+        hold = bus.reply(opener, status="needs-info", verdict="HOLD")
+        answer = bus.add(LEAD, REVIEWER, "message", {"request_id": "tk-r", "in_reply_to": hold.id})
+        bus.add(REVIEWER, LEAD, "review-result", {"request_id": "tk-r", "in_reply_to": answer.id,
+                                                  "status": "approved", "verdict": "GO"})
+    elif review == 2:
+        bus.reply(bus.task("tk-r", REVIEWER, "read", work_head=HEAD), verdict="FIX")
+        bus.reply(bus.task("tk-r2", REVIEWER3, "delta", work_head=HEAD2, supersedes="tk-r"), verdict="GO")
+        head = HEAD2
+    else:
+        for to in (REVIEWER, REVIEWER3):
+            bus.reply(bus.task("tk-r", to, "read", work_head=HEAD), verdict="GO")
+    return bus, head
+
+
+RELIED = ("request_id", "in_reply_to", "work_item", "stage", "work_cycle", "work_round", "work_head",
+          "supersedes", "status", "verdict", "required_gates", "no_gates_reason")
+TEXT = {"no_gates_reason"}  # any text is a valid declaration, so only a type corruption applies
+
+
+def certified(messages, integrated):
+    """Ready, or a clean Done. Design row 3 lets proven integration say Done only with its open or missing
+    review/check evidence stated, so a qualified Done under damage is correct and a clean one is not."""
+    item = next((i for i in W.reduce(messages, lead=LEAD, integrated=integrated)["items"]
+                 if i["work_item"] == ITEM), None)
+    return item is not None and (item["workflow_column"] == "ready" or (
+        item["workflow_column"] == "done" and item["reason"] == "integrated in configured target"))
+
+
+def test_property_no_single_deletion_or_corruption_certifies_ready_or_done():
+    checked = 0
+    for variant, review in [(v, r) for v in range(3) for r in range(4)]:
+        bus, head = valid_history(variant, review)
+        for integrated in ({}, {(ITEM, head): True}):
+            assert certified(bus.messages, integrated)
+            for gone in bus.messages:
+                rest = [m for m in bus.messages if m is not gone]
+                assert not certified(rest, integrated), gone
+                checked += 1
+            for index, message in enumerate(bus.messages):
+                work = message.kind in ("task", "review-request", "task-response", "review-result")
+                corruptions = [(key, bad) for key in RELIED if key in message.meta
+                               for bad in ([], *(() if key in TEXT else ("garbage",)))]
+                # Participants the publication rules check: every work sender, and reply recipients. An
+                # opener's recipient is evidence only through its replies (a rescind cancels by request).
+                corruptions += [("sender", "stranger-agent")] if work else []
+                corruptions += [("recipient", "stranger-agent")] if message.kind in work_tags.REPLIES else []
+                for key, bad in corruptions:
+                    if key in ("sender", "recipient"):
+                        broken = replace(message, **{key: bad})
+                    else:
+                        broken = replace(message, meta=dict(message.meta, **{key: bad}))
+                    mutated = bus.messages[:index] + [broken] + bus.messages[index + 1:]
+                    assert not certified(mutated, integrated), (message, key, bad)
+                    checked += 1
+    assert checked == 1996  # every deletion and corruption of all 12 shapes, with and without integration
+
+
+def test_audit_attributes_every_way_and_keeps_malformed_tags_attached():
+    carrier = Bus()
+    reviewed(carrier)
+    build = next(m for m in carrier.messages if m.meta.get("request_id") == "tk-build" and m.kind == "task")
+    carrier.add(BUILDER, LEAD, "task-response", {"in_reply_to": build.id, "request_id": "tk-build", "status": "done",
+                                                 "verdict": "done", "supersedes": "tk-x"}, raw=True)
+    assert (card(carrier)["row"], card(carrier)["reason"]) == (2, "reply carries dispatch-only metadata")
+    both = Bus()
+    reviewed(both)
+    other = both.task("tk-other", BUILDER, "build", item="other-item", **POLICY)
+    stray = both.add(BUILDER, LEAD, "task-response", {"in_reply_to": other.id, "request_id": "tk-other",
+                                                      "status": "done", "verdict": "done", "work_item": ITEM}, raw=True)
+    out = W.reduce(both.messages, lead=LEAD)
+    for slug in (ITEM, "other-item"):
+        item = next(i for i in out["items"] if i["work_item"] == slug)
+        assert item["row"] == 2 and stray.id in item["evidence"]
+    attached = Bus()
+    attached.task("tk-build", BUILDER, "build", **POLICY)
+    replacement = attached.task("tk-build-2", BUILDER2, "build", raw=True, supersedes="tk-build", item=["bad"],
+                                **POLICY)
+    attached.rescind("tk-build", sender=LEAD)
+    item = card(attached)
+    assert (item["row"], item["reason"]) == (2, "malformed work metadata") and replacement.id in item["evidence"]
+    assert W.reduce(attached.messages, lead=LEAD)["legacy"]["open_request_count"] == 0

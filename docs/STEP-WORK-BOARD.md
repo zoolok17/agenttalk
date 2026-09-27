@@ -320,3 +320,89 @@ task-scratch TEMP/TMP/basetemps, `-q -p no:cacheprovider`):
   two full runs.
 - Ruff and Bandit (B101 excluded) are clean; `git diff --check` is clean.
 - Size over `51ef3e8`: `work_board.py` +34/-18, tests +74.
+
+### Reducer fix round 4 — structural read-side validation (N10-N12)
+
+Base `fb924fc`. A fresh codex reader (developer-4) closed N7-N9 and found N10-N12.
+All three belong to the class the previous rounds kept patching one case at a
+time: historical or partial evidence that modern publication would have refused,
+or that is incomplete. This round replaces point fixes with one mechanism.
+
+**Mechanism.**
+
+- Before reduction, `_audit` applies the publication invariants to every envelope,
+  historical or modern. These are `work_tags`' own functions, which `normalize`
+  now calls too (`reply_request`, `reply_opener`, `inherit`, `reply_verdict`,
+  `value`), plus `gates.validate_response_status`. The reducer keeps no forked
+  copy of a publication rule.
+- A violating envelope is withheld from reduction and recorded against every
+  item it can still be attributed to: its request, its reply ancestry, and its
+  own valid tag. That item becomes row-2 Unknown with the envelope as evidence;
+  other items reduce normally.
+- Any explicit reference (`request_id`, `in_reply_to`, `supersedes`) that does
+  not resolve in the snapshot is "missing required correlation history". It is
+  never a fallback. Cyclic ancestry and malformed correlation types are
+  violations too.
+- A request whose `work_item` is malformed is never demoted to legacy. It is
+  attached through its explicit links (supersedes target, or correlated
+  envelopes' tags); otherwise it is reported.
+- Unattributable violations surface in a new top-level `unassigned`
+  {count, reasons, examples} contract instead of disappearing.
+- Uninterpretable verdict vocabulary is conflicting evidence (row 2).
+- Done stays qualified when review or deliverable evidence is missing:
+  "integrated with review outstanding", "integrated without a recorded
+  deliverable".
+
+| Finding | Closed by construction | Test |
+| --- | --- | --- |
+| N10 unresolved or cyclic link fell back to request_id | A named reference that does not resolve is missing history; cyclic ancestry is a violation. | `test_n10_removed_link_or_cyclic_ancestry_is_missing_history_not_a_fallback` |
+| N11 historical rejected/GO counted as approval | The shared `reply_verdict` pairing runs on history. | `test_n11_historical_native_status_verdict_disagreement_is_not_an_approval` |
+| N12 malformed untagged reply vanished | The violation is attributed by request, ancestry and tag. | `test_n12_malformed_reply_without_repeated_tag_is_attributed_by_its_request` |
+| contract | Unattributable corruption is reported. | `test_unattributable_corruption_is_reported_not_silently_dropped` |
+| attribution | Dispatch-only metadata on a reply, dual attribution, and a malformed tag attached to its item are pinned. | `test_audit_attributes_every_way_and_keeps_malformed_tags_attached` |
+
+**Property test** (`test_property_no_single_deletion_or_corruption_certifies_ready_or_done`):
+
+- It covers all 12 valid history shapes: 3 execution variants (single, superseded
+  with rescind, fan-out) × 4 review variants (plain, needs-info answered through
+  a link, FIX then replacement GO, fan-out). Each shape runs with and without
+  injected integration.
+- Every single deletion is tried. So is every corruption of a relied-on field:
+  `[]`, plus `"garbage"` for fields that have a domain, plus a stranger in the
+  checked participants.
+- 1,996 damaged histories: none is Ready, and none is a clean Done.
+- Interpretation: design row 3 lets proven integration say Done only with its
+  open or missing evidence stated, so a *qualified* Done under damage is
+  correct.
+- It found two gaps the targeted tests had missed, both fixed: a malformed tag
+  demoted a replacement to legacy, and a pending fan-out review hid behind a
+  clean Done.
+- It also showed two cases were never evidence, so they are out of scope:
+  - an opener's recipient on an obligation its requester rescinded (cancellation
+    is by request);
+  - non-roster names, which Store validation keeps out of the input.
+
+Executed (foreground, `PYTHONPATH=<worktree>/src`, `python -B`, no bytecode,
+task-scratch TEMP/TMP/basetemps, `-q -p no:cacheprovider`, every command well
+under 9 minutes):
+
+- Failing first: **5 failed**. These were N10 (removed link, cycle), N11, N12,
+  the unassigned contract, and the property test, which failed at once on N10's
+  fallback.
+- The `work_tags` refactor preserved publication behaviour: `test_work_tags.py`
+  plus `test_reply_draft_delivery.py` gave **124 passed** before the reducer
+  changed.
+- Final: `tests/test_work_board_reducer.py` **52 passed**.
+  - With `test_work_tags.py`, `test_threads.py` and `test_reply_draft_delivery.py`:
+    **250 passed** on Python 3.14.6.
+  - The same set without threads: **176 passed** on Python 3.10.11.
+  - `tests/test_cli.py -k "task or reply"`: **33 passed**.
+- Mutation (committed first, restored through git, bytecode-free): **64/64
+  killed**. That includes 19 round-4 mutants, 2 of them in the shared
+  `work_tags` validators, plus every earlier rule re-anchored. The one first
+  survivor (the no-deliverable Done qualification) became redundant inside the
+  property once tag attribution landed; a direct review-only test now pins it.
+- Ruff and Bandit (B101 excluded) are clean for `work_board.py`,
+  `work_tags.py` and the tests; `git diff --check` is clean.
+- Size over `fb924fc`: `work_board.py` +140/-69, `work_tags.py` +63/-26 (the
+  extraction; behaviour unchanged), tests +177/-3.
