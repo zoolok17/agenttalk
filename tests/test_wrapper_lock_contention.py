@@ -1543,3 +1543,103 @@ def test_cursor_projection_miss_accounting_contention_never_blocks_dispositions(
     assert barrier.hits["ledger.lock"] == (1 if contended else 0)
     assert health.contended_phases() == (
         [loop.LOCK_CONTENTION_PHASE_FINALIZATION] if contended else [])
+
+
+# fail_delivery_or_block's second chance: the first disposition misses on a
+# stale revision (not contention); then either its replay (the replay index,
+# ledger skip=2) or its one retry at the fresh revision (publication skip=1) is
+# contended. Neither may persist the "disposition unavailable" block.
+_FAILED_DELIVERY_SECOND_CHANCE = [
+    pytest.param("ledger.lock", 2, id="replay"),
+    pytest.param("message-publication", 1, id="retry"),
+]
+
+
+@pytest.mark.parametrize(("lock_name", "skip"), _FAILED_DELIVERY_SECOND_CHANCE)
+@pytest.mark.parametrize("contended", [False, True], ids=["control", "contended"])
+def test_failed_delivery_second_chance_treats_contention_as_contention(
+    tmp_path, monkeypatch, lock_name, skip, contended,
+) -> None:
+    s, m, gate, record, resolution = _fresh_owed(tmp_path)
+    stale = resolution.scoped_revision - 1
+    barrier = LockBarrier(monkeypatch)
+    if contended:
+        barrier.arm(lock_name, skip=skip, hold=1)
+        with pytest.raises((LockContention, obligations.LedgerContended)):
+            gate.fail_delivery_or_block(record, resolution.key, reason="exhausted",
+                                        expected_revision=stale)
+        assert barrier.hits[lock_name] == 1
+        assert _owed_admission(s, gate)["state"] == "open"
+        assert "OBLIGATION_BLOCKED" not in _transitions(gate)
+        assert not _disposition_blocked(gate)
+    settled = gate.fail_delivery_or_block(record, resolution.key, reason="exhausted",
+                                          expected_revision=stale)
+    assert settled.state == obligations.ResolverState.DELIVERY_EXHAUSTED
+    assert _owed_admission(s, gate)["state"] == "delivery_failed"
+    assert s.cursor("beta") == m.id
+
+
+@pytest.mark.parametrize("contended", [False, True], ids=["control", "contended"])
+def test_settlement_race_replay_contention_never_becomes_the_race_block(
+    tmp_path, monkeypatch, contended,
+) -> None:
+    # settle_retry_exhaustion: a terminal replay whose finalize misses its CAS,
+    # then a racing replay. A CONTENDED racing replay must not be read as "the
+    # exhaustion raced its final replay" and blocked.
+    s, _m, gate, record, resolution = _fresh_owed(tmp_path)
+    terminal = obligations.Resolution(
+        obligations.ResolverState.DELIVERY_EXHAUSTED, "terminal", resolution.key,
+        ledger_revision=resolution.scoped_revision,
+    )
+    raced = (
+        obligations.Resolution(obligations.ResolverState.BLOCKED,
+                               obligations.LEDGER_REPLAY_CONTENDED)
+        if contended else
+        obligations.Resolution(obligations.ResolverState.OWED_UNSATISFIED,
+                               "still owed", resolution.key)
+    )
+    replays = iter([terminal, raced])
+    monkeypatch.setattr(gate, "resolve", lambda _record: next(replays))
+    monkeypatch.setattr(gate, "finalize", lambda *_a, **_k: obligations.Resolution(
+        obligations.ResolverState.INDETERMINATE, "finalization CAS miss"))
+    if contended:
+        with pytest.raises(obligations.LedgerContended):
+            gate.settle_retry_exhaustion(record, resolution.key,
+                                         category="finalization", reason="bound spent")
+        assert _owed_admission(s, gate)["state"] == "open"
+    else:
+        blocked = gate.settle_retry_exhaustion(record, resolution.key,
+                                               category="finalization", reason="bound spent")
+        assert blocked.state == obligations.ResolverState.BLOCKED   # unchanged fail-closed
+        assert _owed_admission(s, gate)["state"] == "blocked"
+
+
+@pytest.mark.parametrize("contended", [False, True], ids=["control", "contended"])
+def test_one_shot_keeps_no_retry_this_poll_for_a_contended_retry_barrier(
+    tmp_path, monkeypatch, contended,
+) -> None:
+    # The one-shot loop has no in-place retry: a contended retry barrier keeps the
+    # old "no retry this poll" answer there instead of ending the one-shot.
+    s, _m = _owed_bus(tmp_path)
+    gate = _active_gate(s)
+    captured = obligations.DispatchPermit(
+        "0" * 64, "0" * 32, "0" * 32, "recovery", 1, tmp_path / "captured.txt", "")
+    monkeypatch.setattr(gate, "captured_operation", lambda _key: captured)
+    barrier_calls: list[str] = []
+
+    def barrier(_key, **kwargs):
+        barrier_calls.append(kwargs["category"])
+        if contended:
+            raise obligations.LedgerContended(obligations.LEDGER_REPLAY_CONTENDED)
+        return False
+
+    monkeypatch.setattr(gate, "record_retry_barrier", barrier)
+
+    def must_not_drive(_rec):
+        raise AssertionError("a captured operation is never re-driven")
+
+    turns = loop.run_loop(s, "beta", must_not_drive, clock=lambda: 0.0,
+                          sleep=lambda _d: None, max_polls=1,
+                          only_request_id="q-154", commit_gate=gate)
+    assert turns == 0
+    assert barrier_calls == ["operation_infra"]

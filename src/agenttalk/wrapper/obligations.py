@@ -5248,14 +5248,12 @@ class DetectionCommitGate:
             )
         if replayed.terminal:
             try:
-                finalized = _uncontended(self.finalize(
+                finalized = self.finalize(
                     record,
                     replayed,
                     expected_revision=replayed.scoped_revision,
-                ))
-            except (GateError, OSError, TimeoutError, ValueError, RuntimeError) as exc:
-                if _is_contention(exc):
-                    raise
+                )
+            except (GateError, OSError, TimeoutError, ValueError, RuntimeError):
                 return replayed
             return replayed if finalized.state == ResolverState.INDETERMINATE else finalized
         if replayed.state == ResolverState.OWED_UNSATISFIED and replayed.key == key:
@@ -5467,11 +5465,11 @@ class DetectionCommitGate:
         # exhaustion BLOCK below; _uncontended re-raises it typed first.
         latest = _uncontended(self.resolve(record))
         if latest.terminal:
-            finalized = _uncontended(self.finalize(
+            finalized = self.finalize(
                 record,
                 latest,
                 expected_revision=latest.ledger_revision,
-            ))
+            )
             if finalized.state != ResolverState.INDETERMINATE:
                 return finalized
             raced = _uncontended(self.resolve(record))
