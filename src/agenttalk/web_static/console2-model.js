@@ -368,12 +368,28 @@
     return { replied: replied, lastMessageAge: lastAge };
   }
 
-  function cappedLine(agent) {
+  // F3 (final sweep): only a FRESH, unexpired reading may diagnose a specific cap - the same
+  // freshness test usageRows already uses (confidence === 'fresh', and its own reset time not yet
+  // passed). A fresh health read of rate_limited_or_outage alongside stale or expired cached usage
+  // is a present provider outage or a live rate limit, not evidence that a window is still full;
+  // expiry is judged against the true clock (classifyNowMs), never a display freeze, for the same
+  // reason N2 pinned classification to the true clock: an outage must not rejuvenate stale evidence.
+  function cappedLine(agent, classifyNowMs) {
     var cap = isObj(agent.capacity) ? agent.capacity : {};
     var p = isObj(cap.primary) ? cap.primary : null;
     var w = isObj(cap.secondary) ? cap.secondary : null;
-    if (p && typeof p.used_pct === 'number' && p.used_pct >= 100) return { text: '5-hour window full', reset: p.resets_at };
-    if (w && typeof w.used_pct === 'number' && w.used_pct >= 100) return { text: 'Weekly window full', reset: w.resets_at };
+    var fresh = cap.confidence === 'fresh';
+    function current(win) {
+      if (!fresh) return false;
+      if (typeof win.resets_at !== 'number' || !isFinite(win.resets_at)) return true;
+      return win.resets_at * 1000 > classifyNowMs;
+    }
+    if (p && typeof p.used_pct === 'number' && p.used_pct >= 100 && current(p)) {
+      return { text: '5-hour window full', reset: p.resets_at };
+    }
+    if (w && typeof w.used_pct === 'number' && w.used_pct >= 100 && current(w)) {
+      return { text: 'Weekly window full', reset: w.resets_at };
+    }
     var reset = p && typeof p.resets_at === 'number' ? p.resets_at : null;
     return { text: 'Rate limited or provider outage', reset: reset };
   }
@@ -492,7 +508,7 @@
       // starting would have written at once. The heartbeat says the wrapper is alive.
       setState('idle', 'Idle \u00b7 ' + fmtAge(Math.max(0, (nowMs - lk.sinceMs) / 1000)));
     } else if (hs === 'rate_limited_or_outage') {
-      var c = cappedLine(agent);
+      var c = cappedLine(agent, classifyNowMs);
       var resetMs = typeof c.reset === 'number' && isFinite(c.reset) ? c.reset * 1000 : null;
       var resetText = resetMs !== null && resetMs > nowMs ? 'resets ' + resetLabel(resetMs, nowMs, ctx.tz) : '';
       setState('capped', c.text);
@@ -719,6 +735,10 @@
             : 'Everything below is greyed and stamped as of ' + x.asOf + '. Nothing is live until an agent writes again.' };
       case 'needs-unavailable':
         return { text: 'Can’t read what needs you.', sub: 'The attention feed failed. The roster below is still live.' };
+      case 'needs-stale':
+        return { text: 'Can’t confirm nothing needs you.',
+          sub: 'The attention read has not refreshed for ' + fmtAge(x.ageSeconds) +
+            '; showing the last known result, not a current all-clear.' };
       case 'busy':
         return { text: needsWord(x.n) + (x.n === 1 ? ' thing needs you.' : ' things need you.'),
           sub: 'Stuck agents first, then oldest. A deadline only shows if someone set one.' };
@@ -983,6 +1003,12 @@
     } else if (candidates.length) {
       view.mode = 'calm';
       view.greeting = greetingFor('calm', { what: candidates[0].short + ' has been quiet for a while; the evidence does not show a stall, so it is only being watched.' });
+    } else if (att && view.needs.stale) {
+      // F2 (final sweep): an aged (or failed-then-recovered-to-stale) attention cache with nothing
+      // OPEN in it is not the same thing as a confirmed all-clear - "All quiet" is a claim this read
+      // cannot back. Say the read hasn't refreshed, with its age, and keep whatever was last known.
+      view.mode = 'needs-stale';
+      view.greeting = greetingFor('needs-stale', { ageSeconds: Math.max(0, (nowMs - attentionAsOf) / 1000) });
     } else {
       view.mode = 'quiet';
       view.greeting = greetingFor('quiet', { idle: idle, total: rows.length });

@@ -1016,13 +1016,21 @@
     data.conn.retriedAt = null;   // a good read: whatever retry was pending is resolved
     var gen = M.parseMs(payload.generated_at);
     if (gen === null) gen = Date.now();   // an old server without the field: fall back to the local clock
-    var stalled = data.generatedMs !== null && gen <= data.generatedMs;
-    data.conn.stalledPolls = stalled ? data.conn.stalledPolls + 1 : 0;
+    // F1 (final sweep): an identical or regressed generated_at is a stalled feed, not a fresh
+    // moment - re-anchoring the clock to it on every such response would freeze every age and
+    // classification in place (ages never advance, a stuck agent's heartbeat never goes stale)
+    // even while stalledPolls correctly counts the feed as stalled. The anchor and generatedMs only
+    // ever move forward, on an ACTUAL new snapshot; detecting a stalled feed must not also rejuvenate
+    // its timestamps.
+    var advanced = data.generatedMs === null || gen > data.generatedMs;
+    data.conn.stalledPolls = advanced ? 0 : data.conn.stalledPolls + 1;
     data.conn.reachable = true;
-    data.conn.lastOkMs = gen;
     data.snapshot = payload;
-    data.generatedMs = gen;
-    data.anchor = { epochMs: gen, perf: perfNow() };
+    if (advanced) {
+      data.conn.lastOkMs = gen;
+      data.generatedMs = gen;
+      data.anchor = { epochMs: gen, perf: perfNow() };
+    }
   }
 
   // A feed answer is used only when it names the team it was asked for.

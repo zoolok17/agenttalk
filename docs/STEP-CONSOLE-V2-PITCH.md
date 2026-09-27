@@ -992,3 +992,65 @@ R4 node test and 1 pre-existing overlay test both correctly went red). Full run:
 `test_console2_web.py` 56 passed/3 skipped, `test_console2_browser.py` (extended for R3/R4, green),
 `test_console2_health_writer.py`, `test_health_last_known.py` all green (75 passed/3 skipped total).
 `node --check` clean; `ruff`/`bandit` clean on the touched Python test file.
+
+## 25. Final cross-vendor sweep record (F1 clock re-anchor, F2 stale all-clear, F3 expired capacity)
+
+A fresh codex reader swept the whole branch (`fc21190..7a40b57`) as one change (not a delta read) and
+found no issues in GET-only, `textContent`, the asset allowlist, CSP reuse, disabled actions or health
+compatibility - three findings against the model/data layer, fixed on top of `7a40b57`.
+
+- **F1 (MAJOR), a repeated `generated_at` re-anchored the clock on every successful read.**
+  `ingestState` unconditionally set `data.anchor = { epochMs: gen, perf: perfNow() }` on every
+  successful HTTP response, even when the payload's `generated_at` was identical to (or older than)
+  the one already held - correctly counted as a stalled poll (`stalledPolls` incremented, eventually
+  the unreachable banner), but the SAME response also reset the elapsed-time anchor back to that same
+  `gen`, with a freshly-read `perf`. Net effect: while a server kept returning one unchanging
+  snapshot, `nowMs()` never advanced past that snapshot's own timestamp, no matter how much real time
+  passed - ages froze at "0s ago", and a stuck agent's heartbeat could never age past its
+  freshness boundary, so a card that should have gone from "stuck" to "unknown, heartbeat stale" (per
+  fix round 2's own N2 fix - see section 22) never did, because the classification clock it depends
+  on was itself being rewound. The third distinct time-anchoring defect in this console (after the
+  M4a freeze and the fix-round-2 classification split); the work order asked to pin it with a test
+  that holds the snapshot constant while the clock moves - done. Fixed: the anchor (and
+  `data.generatedMs`, and `data.conn.lastOkMs`) now only ever move forward, on a payload whose
+  `generated_at` is genuinely newer (or on the very first read). A stalled feed is detected
+  (`stalledPolls`) without also rejuvenating the timestamps that detection depends on.
+- **F2 (MINOR), a stale attention cache could still claim an unqualified all-clear.** `buildTeamView`
+  already computed `view.needs.stale` correctly (an aged or failed attention read), but the
+  mode/greeting selection never consulted it: with nothing currently OPEN (no cards, no health-based
+  candidate, nothing deferred/answered), it fell straight to the `quiet` mode's "All quiet. Nothing
+  needs you." - even when that "nothing" came from a cache that had not refreshed in time (e.g. a
+  team switch whose new attention request was still pending past `ATTENTION_FRESH_S` = 8s). Fixed
+  with a new mode, `needs-stale`, inserted ahead of the `quiet` fallback (but after the genuinely
+  affirmative `busy`/`answered`/`deferred`/`calm` states, which rest on real cached or local data, not
+  on an assumption that nothing new exists): "Can't confirm nothing needs you. The attention read has
+  not refreshed for Xs; showing the last known result, not a current all-clear." Reproduced and
+  tested both as a direct model call and, per the work order, through the ordinary polling schedule
+  (switching teams with the new team's attention request left genuinely pending, not merely a
+  fixture).
+- **F3 (MINOR), expired capacity was used as a current quota diagnosis.** `cappedLine` read
+  `used_pct >= 100` off the cached capacity reading with no regard for `confidence` or whether the
+  window's own `resets_at` had already passed - so a fresh health read of `rate_limited_or_outage`
+  next to a stale, long-expired 100%-used cache still produced "5-hour window full" / "is capped",
+  actively misreporting a present provider outage or live rate limit as a stale quota claim (while the
+  usage panel elsewhere, correctly, already said "reset passed"). Fixed by requiring BOTH
+  `confidence === 'fresh'` AND an unexpired (or absent) `resets_at` before a specific window claim is
+  made - the exact same freshness test `usageRows` already applies to the rail's own usage bars, now
+  shared by the roster's capped diagnosis too. Expiry is judged against the true clock
+  (`classifyNowMs`, threaded the same way N2 established in fix round 2), not a display freeze, so an
+  outage cannot rejuvenate stale quota evidence either. Falls back to the honest, coarse "Rate limited
+  or provider outage" whenever the specific claim cannot be backed.
+
+Tests: `console2_data.test.mjs` +2 (F1: a fixed `generated_at` while the clock advances six minutes;
+F2: the ordinary-polling-schedule team-switch reproduction), `console2_view.test.mjs` +2 (F2: a
+stale, empty attention cache against an idle-only roster, with a fresh control case; F3: stale/expired
+capacity against three cases - expired, current, and fresh-but-past-its-own-reset). Every new test
+confirmed RED against the pre-sweep file (`git show 7a40b57:<path>`, swapped onto disk) and GREEN
+against the fix. Mutation-tested each fix directly: F1's `advanced` check (short-circuited to always
+true -> 2 tests red, including a pre-existing one), F2's `needs-stale` branch condition
+(short-circuited to false -> both new tests red), F3's `current()` freshness check (short-circuited to
+always true -> the new test red). Full run: `console2_model` 17/17, `console2_render` 31/31,
+`console2_stream` 59/59, `console2_data` 46/46, `console2_view` 94/94; `test_console2_web.py` 56
+passed/3 skipped, `test_console2_browser.py`, `test_console2_health_writer.py`,
+`test_health_last_known.py` all green (75 passed/3 skipped total). `node --check` clean on both
+touched JS files.

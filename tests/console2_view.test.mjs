@@ -169,6 +169,27 @@ test('capped: window full and when it resets; weekly; and a bare outage', () => 
   assert.equal(bare.cap, '');
 });
 
+test('F3 (final sweep): expired or stale cached capacity must not diagnose a current cap', () => {
+  const capped = (cap) => view(agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900, capacity: cap }));
+  // Fresh health says rate_limited_or_outage, but the cached usage is stale (confidence !== 'fresh')
+  // and its own reset time has already passed - exactly the reported sequence.
+  const expired = capped(capacity({ confidence: 'stale', observed: 2 * 3600, primary: 100, primaryReset: -3600 }));
+  assert.equal(expired.state, 'capped');
+  assert.notEqual(expired.line, '5-hour window full');
+  assert.equal(expired.line, 'Rate limited or provider outage', 'the specific window claim is not evidence any more - the coarse diagnosis stands');
+  assert.equal(expired.cap, '', 'no reset time is shown for a diagnosis that was not made from it');
+
+  // Same 100%/expired-reset shape, but still confidence: 'fresh' and NOT yet past its reset:
+  // the specific window claim is legitimate and must still be shown (the control case).
+  const current = capped(capacity({ confidence: 'fresh', observed: 30, primary: 100, primaryReset: 3600 }));
+  assert.equal(current.line, '5-hour window full');
+
+  // confidence: 'fresh' alone is not enough either - a fresh READING of an already-past reset is
+  // still an expired quota claim, not a current one.
+  const freshButExpired = capped(capacity({ confidence: 'fresh', observed: 30, primary: 100, primaryReset: -60 }));
+  assert.equal(freshButExpired.line, 'Rate limited or provider outage');
+});
+
 test('down states get their own bad-tone row and no card', () => {
   const cases = {
     crashed_or_exited: 'Crashed or exited', errored_poison: 'Errored (poisoned turn)',
@@ -611,6 +632,28 @@ test('attention problems are stated, not hidden: stale read, failed read, never 
   assert.deepEqual([failed.mode, failed.greeting.text, failed.chip.needsCount], ['needs-unavailable', 'Can\u2019t read what needs you.', null]);
   const loading = team({ attention: null });
   assert.deepEqual([loading.mode, loading.greeting.sub, loading.chip.needsCount], ['loading', 'Waiting for the first snapshot.', null]);
+});
+
+test('F2 (final sweep): a stale, EMPTY attention cache must not claim an unqualified all-clear', () => {
+  // No stuck/candidate agent at all (unlike busyAgents()), so a fresh, empty attention cache
+  // legitimately reaches the "All quiet" fallback - this is the control case.
+  const idleRoot = root({ agents: [agent('claude-agenttalk-lead', { state: 'idle_waiting', since: 3000 })],
+    operator_facing: 'claude-agenttalk-lead' });
+  const fresh = M.buildTeamView({ nowMs: NOW, generatedMs: NOW, root: idleRoot,
+    attention: attention([], { asOfMs: NOW - 7000 }), chat: null, conn: CONN_OK, ui: {}, tz: TZ });
+  assert.equal(fresh.needs.stale, false);
+  assert.equal(fresh.mode, 'quiet');
+  assert.equal(fresh.greeting.text, 'All quiet.');
+
+  // The SAME idle roster, but the attention cache is 9s old (past ATTENTION_FRESH_S=8, e.g. a
+  // pending refresh after switching teams): "nothing needs you" is no longer a claim this page can
+  // stand behind - it must say so, not repeat the last (now unconfirmed) empty result as current.
+  const stale = M.buildTeamView({ nowMs: NOW, generatedMs: NOW, root: idleRoot,
+    attention: attention([], { asOfMs: NOW - 9000 }), chat: null, conn: CONN_OK, ui: {}, tz: TZ });
+  assert.equal(stale.needs.stale, true);
+  assert.notEqual(stale.mode, 'quiet', 'a stale attention cache must never be reported as a confirmed all-clear');
+  assert.notEqual(stale.greeting.text, 'All quiet.');
+  assert.match(stale.greeting.text + ' ' + stale.greeting.sub, /not refresh|last known|can.t confirm/i);
 });
 
 test('an unreadable root says only that; a root without agents yet is loading', () => {

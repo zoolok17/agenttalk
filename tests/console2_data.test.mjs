@@ -64,6 +64,49 @@ test('the header chip shows freshness and the needs count', async () => {
   assert.deepEqual(parts, [['c2-dot is-live', ''], ['c2-chip-label', 'agenttalk'], ['c2-badge', '3']]);
 });
 
+test('F1 (final sweep): a repeated generated_at does not re-anchor the clock - ages and classification keep advancing on real elapsed time', async () => {
+  const FIXED = new Date(NOW).toISOString();
+  const srv = server({
+    generated: () => FIXED,
+    roots: () => [root({ project_id: 'proj-a', operator_facing: LEAD, agents: [
+      agent(LEAD, { since: 600 }),
+      agent('codex-agenttalk-developer-4', { state: 'working_silent', since: 900, progress: 900, hb: 20 }),
+    ], recent: [] })],
+  });
+  const { dom, clock, fire } = await boot(srv);
+  assert.ok(all(stream(dom)).includes('LOOKS STUCK'), 'connected: correctly judged stuck at the snapshot time');
+  clock.perf += 360e3;   // six real minutes pass; the server keeps returning the SAME generated_at
+  await fire();
+  // Third time-anchoring defect, pinned: a stalled (non-advancing) feed must not freeze the clock.
+  // The heartbeat (fixed at 20s old in the payload, never refreshed) is now genuinely 380s old by
+  // real elapsed time - past the 300s freshness boundary - so the incident can no longer be judged
+  // fresh: "unknown, not judged stuck", never a stuck card asserting a heartbeat that is not really fresh.
+  assert.ok(!all(stream(dom)).includes('LOOKS STUCK'),
+    'a repeated snapshot must not keep the clock (and the judgment) frozen');
+  assert.ok(all(rail(dom)).includes('Heartbeat') && all(rail(dom)).includes('not judged stuck'),
+    'the heartbeat is correctly judged stale by real elapsed time, not "still fresh"');
+});
+
+test('F2 (final sweep, ordinary polling): switching to a team whose attention refresh is pending past 8s must not show an unqualified all-clear', async () => {
+  let pendingForB = false;
+  const twoTeams = () => [
+    root({ project_id: 'proj-a', label: 'Alpha', agents: [agent(LEAD, { since: 3000 })], recent: [env(LEAD, 'x', 'message', 5)] }),
+    root({ project_id: 'proj-b', label: 'Beta', agents: [agent(LEAD, { since: 3000 })], recent: [env(LEAD, 'x', 'message', 5)] }),
+  ];
+  const srv = server({
+    roots: twoTeams,
+    attention: (id) => (id === 'proj-b' && pendingForB ? PENDING : { target_root_project_id: id, items: [] }),
+  });
+  const { dom, clock, fire } = await boot(srv);   // both teams' attention already fetched fresh, empty
+  pendingForB = true;
+  chips(dom)[1].click();                          // switch to Beta - its NEW attention request hangs
+  clock.perf += 9000;                              // 9s later: stale (> ATTENTION_FRESH_S=8s)...
+  await fire(under);                               // ...but stay under the 5s request timeout: still pending, not failed
+  assert.ok(!all(stream(dom)).includes('All quiet.'),
+    'a stale, still-pending attention read must not claim an all-clear');
+  assert.ok(all(stream(dom)).includes('confirm') || all(stream(dom)).includes('not refresh'));
+});
+
 test('N2: an outage does not un-stick an unresolved incident - the stuck card persists, shown as last known', async () => {
   const srv = server();
   const { dom, fire } = await boot(srv);
