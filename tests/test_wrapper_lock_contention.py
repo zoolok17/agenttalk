@@ -122,7 +122,9 @@ class LockBarrier:
 
 class CountedDriver:
     """The paid child turn, counted. Writes a reply draft unless ``reply`` is None;
-    ``on_complete`` runs as the child finishes (arms a post-completion barrier)."""
+    ``on_complete`` runs as the child finishes (arms a post-completion barrier).
+    A second invocation fails at once: re-entering the paid driver for a
+    completed turn is the defect under test, never an allowed recovery."""
 
     def __init__(self, *, reply: str | None = "the answer", on_complete=None) -> None:
         self.calls = 0
@@ -131,6 +133,8 @@ class CountedDriver:
 
     def __call__(self, rec: dict) -> bool:
         self.calls += 1
+        if self.calls > 1:
+            raise AssertionError("the paid driver was re-entered for a completed turn")
         if self.reply is not None:
             Path(rec["reply_draft"]["path"]).write_text(self.reply, encoding="utf-8")
         if self.on_complete is not None:
