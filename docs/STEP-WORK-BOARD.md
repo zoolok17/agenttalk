@@ -119,3 +119,74 @@ old-reader regressions failed before the fix (2 failed, 24 deselected, 1.02 s).
 Targeted vendor/broadcast checks pass on Python 3.10 and 3.14 (33 passed each,
 265 deselected); Ruff and Bandit pass (B101 excluded for test assertions).
 Task scratch `tk-aaa3fe3d0b17` retains red/green evidence for the delta read.
+
+## B4a — shared per-root validated snapshot
+
+Contributor record, base `f0e6ea28`, design `09b54296` section 5. The HTTP server
+warms one snapshot per root and refreshes outside request handlers, coalesced to
+one start per five seconds. Direct composition calls remain synchronous. The
+existing store scanner supplies both paths; roster/signature validation is shared.
+Membership/stat and config/key checks reject mid-scan changes; explicit invalidation
+discards in-flight generations. After the cold-read correction below, failures
+serve fresh prior data with degraded coverage instead of dropping the team view.
+State keeps its output/error shapes and active-only semantics, with a 15-second
+freshness ceiling. Four mutation-between-poll tests now advance the worker clock;
+their payload assertions are unchanged. Worker cancellation checks precede reads.
+The selected-closure helper deduplicates both supplied partitions and budgets only
+selected IDs (50,000 / 128 MiB), reports 60% warnings and refuses partial results.
+B3 selects/expands the closure. B4s will populate the body-free archive tuple and
+complete-discovery flag; until then board coverage stays building. No archive
+scanner, reducer, new HTTP feed, retention change or persistent index is added.
+Failing-first: eight new contracts failed before implementation, then eight passed.
+Task scratch `tk-90bbd471392f` retains logs for the cold read. The legacy 1,000-send
+performance fixture was interrupted during setup; cap tests use small injected limits.
+Final Python 3.10 snapshot/state selection: 58 passed, 190 deselected (30.75 s);
+compaction: 16 passed (3.46 s). Python 3.14 snapshot: 10 passed (2.14 s).
+Ruff and Bandit pass changed modules; whitespace check passes. Commit stays local.
+
+### B4a cold-read correction — last-known-good on a scan race
+
+`active()` now prefers the published generation despite a refresh error, provided
+its config matches and scan-start age is at most 15 seconds. Coverage remains
+degraded until successful refresh. Without a usable generation it stays building
+or refuses; config mismatch and staleness still fail closed. Membership races use
+a dedicated exception and schedule a 250 ms retry that wakes the worker; repeated
+races cannot busy-loop. Normal refreshes retain the five-second cadence.
+HTTP regressions publish a real message both before and after the scanner read,
+and assert the entire root key set and counts survive until recovery. The worker
+retry test also verifies automatic execution without waiting for the normal poll.
+Failing-first: 3 failed / 9 deselected, including both HTTP reproductions (1.45 s).
+Task scratch `tk-bb35ff68d3a9` retains the red/green and final targeted logs.
+Final Python 3.10 snapshot/state selection: 61 passed, 190 deselected (31.76 s).
+Python 3.14 snapshot tests: 13 passed (2.66 s). Ruff, Bandit, whitespace and
+added-line privacy checks pass. No full suite; commit remains local.
+
+## B4s — complete compacted discovery and fingerprint cache
+
+Contributor record, base `f714881a`, design `09b54296` section 5. The same per-root
+service now enumerates every envelope in `messages/` and `archived/compacted/`,
+including compaction collision filenames; reset-session archives stay excluded.
+The canonical scanner accepts changed-file paths without changing delivery/retention.
+Identical canonical IDs dedup, preferring active; different contents remain a conflict.
+
+Cache keys include path/file identity, size, nanosecond modification/change times,
+and config/signing generation. Unchanged valid files avoid reads; invalid verdicts
+are retried behind new/changed files to prevent starvation. Archive facts retain no
+body/Message. Restart/invalidation forces validation. Fingerprints cannot detect an
+actor preserving every stat while rewriting.
+
+Each refresh reads at most 1,000 changed archive files or 250 ms of archive work,
+then publishes active state independently. Remaining discovery resumes next refresh;
+coverage stays building until complete, incomplete on invalid envelopes, stale on
+archive failure. Membership races schedule the bounded prompt retry; HTTP never scans.
+Counts include both partitions; closure caps/warnings count selected IDs only.
+Old FIX replies, entirely archived items and legacy metadata ignore the UI window.
+B3 owns selection/dependency expansion and legacy display; no reducer/endpoint is added.
+
+Failing-first: 12 discovery contracts failed (1.69 s). A separate one-file-slice
+starvation regression failed before its fix (0.36 s); empty-roster parity failed
+before its fix (0.17 s). Final discovery/snapshot/compaction/scanner: Python 3.10
+51 passed (8.98 s), Python 3.14 51 passed (8.87 s). Existing state/delivery selection:
+61 passed, 345 deselected (46.43 s). Ruff/Bandit pass (B101 excluded for tests).
+Task scratch `tk-3e4f33ca3f41` retains logs. Limits use small injected values;
+no full suite or large-file population. Whitespace/privacy checks pass.
