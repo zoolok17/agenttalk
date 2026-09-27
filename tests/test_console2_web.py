@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import urllib.error
 import urllib.request
+from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
@@ -67,6 +68,49 @@ def _strip_css_comments(src: str) -> str:
     return re.sub(r"/\*.*?\*/", "", src, flags=re.S)
 
 
+class _ScriptTagCollector(HTMLParser):
+    """Every ``<script>`` tag, however it is cased or spaced - the HTML5 tokenizer (and this
+    stdlib parser) treats tag and attribute names case-insensitively, so ``<script>``, ``<SCRIPT>``
+    and ``<ScRiPt>`` are all found the same way. This is the fix for py/bad-tag-filter: a regex
+    anchored on a literal lowercase ``<script`` (as the old check was) can be fooled by upper or
+    mixed case; a real parser cannot."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.scripts: list[tuple[str | None, bool]] = []  # (src attribute, has inline text)
+        self._depth = 0
+        self._src: str | None = None
+        self._text: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "script":
+            self._depth += 1
+            self._src = dict(attrs).get("src")
+            self._text = []
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "script":
+            self.scripts.append((dict(attrs).get("src"), False))
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "script" and self._depth:
+            self._depth -= 1
+            self.scripts.append((self._src, "".join(self._text).strip() != ""))
+
+    def handle_data(self, data: str) -> None:
+        if self._depth:
+            self._text.append(data)
+
+
+def _find_scripts(page: str) -> list[tuple[str | None, bool]]:
+    """Every ``<script>`` tag in `page`, paired with whether it carries inline (non-whitespace)
+    text content - case-insensitively, unlike a hand-rolled regex."""
+    parser = _ScriptTagCollector()
+    parser.feed(page)
+    parser.close()
+    return parser.scripts
+
+
 # ------------------------------------------------------------ route & shell
 
 def test_v2_shell_uses_the_dashboard_csp_byte_for_byte(tmp_path: Path) -> None:
@@ -105,8 +149,10 @@ def test_v2_shell_has_no_inline_anything_and_no_external_url(tmp_path: Path) -> 
     assert not re.search(r"\son[a-z]+\s*=", page)
     assert not re.search(r"(?i)javascript:", page)
     assert "http://" not in page and "https://" not in page
-    scripts = re.findall(r"<script\b[^>]*>", page)
-    assert scripts and all(" src=\"/static/console2" in tag for tag in scripts)
+    scripts = _find_scripts(page)
+    assert scripts, "expected at least the two served <script src> tags"
+    assert not any(has_inline for _src, has_inline in scripts), "a <script> tag carries inline content"
+    assert all(src is not None and src.startswith("/static/console2") for src, _has_inline in scripts)
     assert "<link rel=\"stylesheet\" href=\"/static/console2.css\">" in page
     # the two links are fixed server-authored paths
     assert sorted(set(re.findall(r"<a\b[^>]*href=\"([^\"]*)\"", page))) == ["/dashboard"]
@@ -115,6 +161,26 @@ def test_v2_shell_has_no_inline_anything_and_no_external_url(tmp_path: Path) -> 
     assert "spec-kitty" not in page.lower()
     # nothing bus-derived is rendered server-side
     assert "alpha" not in page and "beta" not in page
+
+
+def test_script_tag_check_is_not_fooled_by_case_or_spacing() -> None:
+    """Negative control for py/bad-tag-filter: the inline-script check above must not be fooled by
+    an upper-case or mixed-case <script> tag, or by extra whitespace before the closing angle
+    bracket - it must FIND the tag and correctly report it as carrying inline content."""
+    upper = '<script src="/static/console2.js"></script><SCRIPT>x</SCRIPT>'
+    mixed = '<script src="/static/console2.js"></script><ScRiPt >x</ScRiPt >'
+    for page in (upper, mixed):
+        scripts = _find_scripts(page)
+        assert len(scripts) == 2, (page, scripts)
+        assert any(has_inline for _src, has_inline in scripts), (page, scripts)
+        # confirms the check is genuinely catching it, not merely finding an unrelated tag:
+        # the legitimate served script must still be recognised as inline-free
+        assert any(src == "/static/console2.js" and not has_inline for src, has_inline in scripts)
+
+    # The old check this replaces (a bare lowercase-anchored regex) is exactly what
+    # py/bad-tag-filter flagged: it cannot see either case at all.
+    old_regex = re.findall(r"<script\b[^>]*>", upper)
+    assert len(old_regex) == 1, "documents the old regex's blind spot: it only ever saw the lowercase tag"
 
 
 def test_classic_console_is_untouched_by_the_new_route(tmp_path: Path) -> None:
