@@ -3823,7 +3823,7 @@ class Store:
     # --------------------------------------------------------------- reading
 
     def _scan_messages_with_paths(
-        self, *, since_id: str | None = None,
+        self, *, since_id: str | None = None, checkpoint=None, paths=None, compacted=False,
     ) -> tuple[list[tuple[Message, Path]], list[tuple[Path, str, str]]]:
         """The canonical disk walk, keeping each verdict paired with ITS file.
 
@@ -3845,13 +3845,18 @@ class Store:
         never deliver. It is NOT sound for tamper visibility, so the
         invalid report / quarantine callers MUST NOT pass ``since_id``
         (they keep full-scanning). ``None`` = full scan (current behavior).
+        Snapshot refreshes supply changed ``paths``; ``compacted`` additionally
+        accepts the collision suffix emitted by archive_messages_below. Delivery
+        never sets either option and never discovers archived envelopes.
         """
         valid: list[tuple[Message, Path]] = []
         invalid: list[tuple[Path, str, str]] = []
-        if not self.messages_dir.exists():
+        if paths is None and not self.messages_dir.exists():
             return valid, invalid
-        for p in sorted(self.messages_dir.iterdir()):
-            if p.suffix != ".json":
+        for p in sorted(self.messages_dir.iterdir() if paths is None else paths):
+            if checkpoint is not None:
+                checkpoint()
+            if not compacted and p.suffix != ".json":
                 continue
             # Fast skip BEFORE any read/parse: stem == id is enforced just
             # below for delivered files, and ids sort lexically, so a stem
@@ -3860,6 +3865,11 @@ class Store:
                 continue
             try:
                 text = p.read_text(encoding="utf-8")
+            except UnicodeError as e:
+                if not compacted:
+                    raise  # preserve active scanner's existing failure shape
+                invalid.append((p, p.stem, f"invalid encoding: {e}"))
+                continue
             except OSError as e:
                 invalid.append((p, p.stem, f"cannot read file: {e}"))
                 continue
@@ -3876,7 +3886,14 @@ class Store:
                     ident = p.stem
                 invalid.append((p, ident, str(e)))
                 continue
-            if p.stem != msg.id:
+            filename_ok = p.name == f"{msg.id}.json"
+            if compacted and not filename_ok:
+                # archive_messages_below appends _now_iso().replace(':', '-').
+                filename_ok = re.fullmatch(
+                    re.escape(msg.id) + r"\.json\.\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{6}Z",
+                    p.name,
+                ) is not None
+            if not filename_ok:
                 # The file name must equal the embedded id — send() is the
                 # only writer and always names files <id>.json. A mismatch is
                 # a forged/corrupt/renamed file: a low-sorting name carrying a

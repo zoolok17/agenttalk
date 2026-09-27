@@ -131,6 +131,7 @@ from agenttalk import knowledge as _knowledge
 from agenttalk import lesson_context as _lesson_context
 from agenttalk import onboarding as _onboarding
 from agenttalk import signing as _signing
+from agenttalk import envelope_snapshot as _snapshots
 from agenttalk import threads as th
 from agenttalk.store import COMPOSING_INTENT_STALE_SECONDS, Message, Store
 from agenttalk.threads import Thread, derive_threads
@@ -932,55 +933,9 @@ def _closed_rids_for(store: Store, agent: str) -> set[str]:
 
 
 def _validated_for_state(store: Store, cfg: dict) -> tuple[list[Message], int]:
-    """One disk walk per root per request (research D8 / NFR-003).
-
-    Parity with ``Store._validated_messages()`` — the KNOWN roster
-    (active ∪ retired, the 0.16.0 D3 rule, so retired identities' open
-    threads still derive) plus HMAC when enforced — but built from a
-    single ``_scan_messages()`` pass. Calling the store's stacked
-    surfaces here (``valid_messages`` + ``current_epoch`` +
-    ``list_invalid_messages`` + ``unread_for``×N) would re-walk the
-    message dir five-plus times per poll; at 1k messages that blew the
-    2 s NFR by 5× in testing.
-
-    Returns ``(validated messages sorted by id, invalid_count)`` where
-    the count matches ``list_invalid_messages()``'s gate set (parse/
-    schema failures + roster/signature rejects).
-    """
-    valid_scan, invalid_scan = store._scan_messages()  # noqa: SLF001 — same call doctor uses
-    roster = store._known_roster(cfg)  # noqa: SLF001 — D3 parity with valid_messages()
-    if not roster:
-        raise ValueError("project config roster is empty")
-    require_sig = store.signing_enforced()
-    key: bytes | None = None
-    project_id: str | None = None
-    if require_sig:
-        project_id = store.project_id()
-        try:
-            key = _signing.load_key(project_id)
-        except (FileNotFoundError, OSError, ValueError):
-            key = None  # enforcement on, key unreadable → refuse all (CLI parity)
-    msgs: list[Message] = []
-    rejects = 0
-    for m in valid_scan:
-        try:
-            m.validate(roster)
-        except ValueError:
-            rejects += 1
-            continue
-        if require_sig:
-            if key is None:
-                rejects += 1
-                continue
-            try:
-                _signing.verify_message(m.to_dict(), key,
-                                        expected_key_id=project_id)
-            except ValueError:
-                rejects += 1
-                continue
-        msgs.append(m)
-    msgs.sort(key=lambda m: m.id)
-    return msgs, len(invalid_scan) + rejects
+    """Synchronous composition callers share the worker's canonical validator."""
+    rows, invalid = _snapshots.validated_active(store, cfg)
+    return [message for message, _ in rows], invalid
 
 
 def _epoch_from(msgs: list[Message]) -> str | None:
@@ -1656,7 +1611,7 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
 
 
 def _root_state(desc: RootDescriptor,
-                history: "HealthTimelineRing | None" = None) -> dict:
+                history: "HealthTimelineRing | None" = None, snapshots=None) -> dict:
     """One root's full snapshot — or its degraded errors-as-data form.
 
     A failure ANYWHERE in this root's collection yields
@@ -1679,8 +1634,10 @@ def _root_state(desc: RootDescriptor,
             raise ValueError("project config roster is empty")
         avatar_prefs, _avatar_warnings = _avatars.sanitize_avatar_preferences(
             cfg.get("avatars"), roster)
-        # ONE disk walk per root per request (D8) — see _validated_for_state.
-        msgs, invalid_count = _validated_for_state(store, cfg)
+        if snapshots is None:
+            msgs, invalid_count = _validated_for_state(store, cfg)
+        else:
+            msgs, invalid_count = snapshots[str(store.root.resolve())].active(cfg)
         current = _epoch_from(msgs)
         threads_rows, broadcasts, closed_count = _derive_root_threads(
             store, msgs, roster, current)
@@ -1785,7 +1742,7 @@ def _root_state(desc: RootDescriptor,
 
 
 def build_state(roots: list[RootDescriptor],
-                *, history: "HealthTimelineRing | None" = None) -> dict:
+                *, history: "HealthTimelineRing | None" = None, snapshots=None) -> dict:
     """The /api/state aggregate (data-model.md, schema v1).
 
     ``generated_at`` is NOT purely informational: message ids remain the
@@ -1807,7 +1764,7 @@ def build_state(roots: list[RootDescriptor],
         "schema_version": STATE_SCHEMA_VERSION,
         "agenttalk_version": __version__,
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "roots": [_root_state(d, history) for d in roots],
+        "roots": [_root_state(d, history, snapshots) for d in roots],
     }
 
 
@@ -3771,7 +3728,8 @@ def _age_seconds_of(ts: Any, *, now: datetime) -> float | None:
 
 # ------------------------------------------------------------ HTTP handler
 
-def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) -> type[BaseHTTPRequestHandler]:
+def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False,
+                  snapshots=None) -> type[BaseHTTPRequestHandler]:
     """Build a request handler class closed over the watched roots.
 
     Returns a class (not an instance) because ``ThreadingHTTPServer``
@@ -4520,7 +4478,7 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                 # health sample this tick and emits health_timeline (§5). JSON
                 # feed keeps the strict _DEFAULT_CSP.
                 self._send_json(HTTPStatus.OK,
-                                build_state(roots, history=health_history))
+                                build_state(roots, history=health_history, snapshots=snapshots))
                 return
             if path == "/api/session":
                 self._handle_session_get()
@@ -4733,7 +4691,8 @@ def make_server(store: Store, host: str, port: int,
         )
     roots = [RootDescriptor(store=store, label=store.root.name or str(store.root))]
     roots.extend(extra or [])
-    handler_cls = _make_handler(roots, enable_actions=enable_actions)
+    snapshots = {str(d.store.root.resolve()): _snapshots.SnapshotService(d.store) for d in roots}
+    handler_cls = _make_handler(roots, enable_actions=enable_actions, snapshots=snapshots)
     if not quiet:
         handler_cls._quiet = False  # noqa: SLF001 — class attr by design
     # Bind a loopback LITERAL — never delegate 'localhost' to the OS resolver.
@@ -4749,7 +4708,17 @@ def make_server(store: Store, host: str, port: int,
     class _LoopbackServer(ThreadingHTTPServer):
         address_family = family
 
-    return _LoopbackServer((bind_host, port), handler_cls)
+        def server_close(self):
+            for snapshot in snapshots.values():
+                snapshot.close()
+            super().server_close()
+
+    server = _LoopbackServer((bind_host, port), handler_cls)
+    server.envelope_snapshots = snapshots
+    for snapshot in snapshots.values():
+        snapshot.refresh()  # initial availability before the first HTTP request
+        snapshot.start()
+    return server
 
 
 def serve(store: Store, *, host: str = "127.0.0.1", port: int = 8765,

@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Keep the fresh last-known-good dashboard view during snapshot scan races and
+  schedule a bounded prompt retry; config mismatch and stale data still refuse.
+
 - Recheck current task authority and reader compatibility when resuming a partial
   task broadcast; a prior dispatch no longer authorizes a demoted sender to resume.
 
@@ -46,6 +49,12 @@ offline-checked tool registry.**
   `last_known_updated_at` and (when present) `last_known_progress_at`. Nothing
   else changes for status, doctor, the supervisor or the classic console; the
   v2 console uses the fields to tell a wedged silent turn from a healthy one.
+
+- Discover all compacted work evidence through the shared snapshot, caching validated
+  facts across polls and keeping active state available while archive coverage builds or degrades.
+
+- Share validated active envelopes across dashboard polls through a per-root
+  worker snapshot, with generation checks and a cross-partition selected-work budget.
 
 - Configure model vendors independently of CLI transport; freeze per-recipient
   vendor maps on work dispatches and link escalations to exact work items/cycles.
