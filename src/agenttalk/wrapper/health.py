@@ -16,6 +16,7 @@ from .loop import (
     CLASS_GATEWAY_HELD,
     CLASS_INFRA,
     CLASS_POISON,
+    LOCK_CONTENTION_REASON,
 )
 
 
@@ -168,6 +169,18 @@ class WrapperHealthWriter:
             reason_code=reason_code,
             request_id=request_id if isinstance(request_id, str) else None,
             msg_id=msg_id if isinstance(msg_id, str) else None,
+        )
+
+    def lock_contention(self, phase: str) -> None:
+        """#154: the loop is retrying one store step IN PLACE under store lock
+        contention - an outage-like, self-healing wait, so the existing
+        rate_limited_or_outage state with a specific reason (and the phase as a
+        warning label), not idle and not an error. Not forced: the first attempt
+        is a state change (written at once) and repeats throttle."""
+        self._write(
+            health_model.STATE_RATE_LIMITED_OR_OUTAGE,
+            reason_code=LOCK_CONTENTION_REASON,
+            warnings=[f"lock_contention_{phase}"],
         )
 
     def event(self, event: Event) -> None:

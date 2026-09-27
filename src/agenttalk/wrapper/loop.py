@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 import os
+import secrets
 import time
 import uuid
 from collections.abc import Callable
@@ -24,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from agenttalk import reply_transport
+from agenttalk.store import LockContention
 
 from . import recv_api
 
@@ -107,6 +109,58 @@ INTERRUPTION_BUDGET_EXHAUSTED = "interruption_budget_exhausted"
 # queue for that long. Capped, a runaway counter degrades to "very slow"
 # instead of "effectively never".
 INTERRUPTION_BACKOFF_CAP_SECONDS = 900.0
+
+# #154: store lock contention (store.LockContention - another live holder kept a
+# lock past its acquisition deadline) is retried IN PLACE, one idempotent store
+# step at a time, and only at the named phases below: never by re-running the
+# loop iteration, so a completed turn is never re-driven. Every other lock
+# failure (access denial, unsafe generation change, lock-order inversion, a
+# lost lease) keeps propagating exactly as before.
+LOCK_CONTENTION_PHASE_ADMISSION = "admission"        # before any drive() this poll
+LOCK_CONTENTION_PHASE_PUBLICATION = "publication"    # the completed turn's draft
+LOCK_CONTENTION_PHASE_FINALIZATION = "finalization"  # retention + cursor commit
+# Health reason (existing STATE_RATE_LIMITED_OR_OUTAGE state) while contended.
+LOCK_CONTENTION_REASON = "store_lock_contention"
+# Backoff between attempts: base x 2^(n-1) with equal jitter, capped at the
+# heartbeat cadence. Each attempt has already waited out the lock's own timeout
+# (10 s by default), and the loop stamps before every backoff sleep, so a
+# contended wrapper never reads as stale to the supervisor.
+LOCK_CONTENTION_BACKOFF_BASE_SECONDS = 0.5
+LOCK_CONTENTION_BACKOFF_CAP_SECONDS = HEARTBEAT_INTERVAL_SECONDS
+# The bound: after this many consecutive contended attempts on one step the loop
+# emits ONE durable diagnostic for the episode (and keeps retrying, visibly).
+LOCK_CONTENTION_DIAGNOSTIC_AFTER_ATTEMPTS = 6
+_CONTENTION_JITTER = secrets.SystemRandom()
+
+
+def _contention_backoff(attempt: int) -> float:
+    """Equal-jitter backoff for the ``attempt``-th consecutive contended try."""
+    ceiling = min(
+        LOCK_CONTENTION_BACKOFF_CAP_SECONDS,
+        LOCK_CONTENTION_BACKOFF_BASE_SECONDS * (2.0 ** min(max(attempt, 1) - 1, 16)),
+    )
+    return ceiling / 2.0 + _CONTENTION_JITTER.uniform(0.0, ceiling / 2.0)
+
+
+class _InPlaceGate:
+    """#154 F2: a commit-gate view whose every call is ONE gate operation retried
+    in place on identifiable contention (``retry`` is the loop's _await_lock,
+    ``adapt`` its _gate_step). Non-callable attributes pass straight through."""
+
+    def __init__(self, gate, retry, adapt, phase: str) -> None:
+        self._gate = gate
+        self._retry = retry
+        self._adapt = adapt
+        self._phase = phase
+
+    def __getattr__(self, name: str):
+        member = getattr(self._gate, name)
+        if not callable(member):
+            return member
+
+        def call(*args, **kwargs):
+            return self._retry(self._phase, self._adapt(member), *args, **kwargs)
+        return call
 
 
 def _interruption_remedy(agent: str, head_id: object, *, k: int, kind: str,
@@ -402,8 +456,22 @@ def _report_stray_reply_drafts(store, agent: str, record: dict) -> list[str]:
     return warnings
 
 
-def _deliver_reply_draft(store, agent: str, record: dict) -> str | None:
+# #154: the publish step's own never-raise result (vs. None = nothing deliverable).
+_PUBLISH_FAILED = object()
+
+
+def _deliver_reply_draft(store, agent: str, record: dict, *,
+                         retry: Callable[..., object] | None = None) -> str | None:
     """Publish a child-written freeform draft after a CLEAN turn.
+
+    #154: with ``retry`` (the continuous loop's in-place contention retry), the
+    publication gets ONE operation nonce minted here, reused by every retry, and
+    store lock contention is retried through ``retry`` instead of refusing the
+    draft. Without it (one-shot), contention is refused like before. The publish
+    step keeps the never-raise contract itself, so the only exception that can
+    leave ``retry`` is the retry machinery's own fatal signal (e.g. a lease lost
+    while backing off) - that one escapes the boundary below instead of being
+    swallowed as a refusal.
 
     Refusals are silent by contract WITH RESPECT TO THE TURN'S OWN OUTCOME:
     freeform replies are not obligatory, so a missing/invalid draft must leave
@@ -420,6 +488,7 @@ def _deliver_reply_draft(store, agent: str, record: dict) -> str | None:
     if not isinstance(declared, dict) or not declared.get("path"):
         return None
     draft = Path(str(declared["path"]))
+    retry_abort: BaseException | None = None
     try:
         if not draft.is_file():
             # P2-6: no LIVE draft this turn - the child may have answered directly
@@ -462,9 +531,31 @@ def _deliver_reply_draft(store, agent: str, record: dict) -> str | None:
                 except OSError:
                     pass
             return
-        published = reply_transport.deliver_draft_reply(
-            store, agent=agent, record=record, draft_path=draft,
-        )
+        if retry is None:
+            published = reply_transport.deliver_draft_reply(
+                store, agent=agent, record=record, draft_path=draft,
+            )
+        else:
+            nonce = secrets.token_hex(16)   # ONE operation identity for every attempt
+
+            def publish():
+                try:
+                    return reply_transport.deliver_draft_reply(
+                        store, agent=agent, record=record, draft_path=draft,
+                        operation_nonce=nonce,
+                    )
+                except LockContention:
+                    raise                   # the retry's to handle, same nonce
+                except Exception:  # noqa: BLE001 - the never-raise contract, as below
+                    return _PUBLISH_FAILED
+
+            try:
+                published = retry(LOCK_CONTENTION_PHASE_PUBLICATION, publish)
+            except Exception as exc:
+                retry_abort = exc
+                raise
+            if published is _PUBLISH_FAILED:
+                return None
         if published is None and draft.exists():
             # The child wrote an answer the wrapper refused (oversize, bad
             # encoding, publish failure). The turn still commits, so without
@@ -492,7 +583,9 @@ def _deliver_reply_draft(store, agent: str, record: dict) -> str | None:
                     preserved.unlink(missing_ok=True)
                 except OSError:
                     pass
-    except Exception:  # noqa: BLE001, S110 - must never change disposition  # nosec B110
+    except Exception as exc:  # noqa: BLE001 - must never change disposition
+        if exc is retry_abort:
+            raise
         return
 
 
@@ -655,6 +748,8 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
              cadence: Callable[[], CadenceResult] | None = None,
              on_health_idle: Callable[..., None] | None = None,
              on_health_parked: Callable[[dict, str], None] | None = None,
+             on_health_contention: Callable[[str], None] | None = None,
+             on_contention_persisting: Callable[[dict], None] | None = None,
              on_runtime_idle: Callable[[], None] | None = None,
              on_runtime_dead_letter: Callable[[dict], None] | None = None,
              capacity_refresh: Callable[[], None] | None = None,
@@ -700,7 +795,13 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
     ``capacity_refresh`` (CONTINUOUS only): an advisory observability hook
     called only after an idle heartbeat stamp or successful turn boundary. It is
     interval-gated and failure-isolated; exceptions are swallowed so capacity
-    cannot undo the just-completed liveness/cursor boundary."""
+    cannot undo the just-completed liveness/cursor boundary.
+
+    ``on_health_contention`` / ``on_contention_persisting`` (#154, CONTINUOUS only):
+    failure-isolated hooks for store lock contention the loop is retrying in place.
+    The first gets the phase on every contended attempt (visible health); the second
+    gets ``{"phase", "lock", "lock_file", "attempts"}`` ONCE per episode that reaches
+    LOCK_CONTENTION_DIAGNOSTIC_AFTER_ATTEMPTS (the durable diagnostic)."""
     stamp = heartbeat if heartbeat is not None else (lambda: store.write_heartbeat(agent))
     gate_generation = getattr(commit_gate, "fence", None)
     wait_token = (
@@ -747,6 +848,8 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
             on_dead_letter=on_dead_letter, on_escalate=on_escalate, stamp=stamp,
             pre_commit=pre_commit, cadence=cadence, on_health_idle=on_health_idle,
             on_health_parked=on_health_parked,
+            on_health_contention=on_health_contention,
+            on_contention_persisting=on_contention_persisting,
             on_runtime_idle=on_runtime_idle,
             on_runtime_dead_letter=on_runtime_dead_letter,
             capacity_refresh=capacity_refresh,
@@ -777,6 +880,8 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                     cadence: Callable[[], CadenceResult] | None,
                     on_health_idle: Callable[..., None] | None,
                     on_health_parked: Callable[[dict, str], None] | None,
+                    on_health_contention: Callable[[str], None] | None,
+                    on_contention_persisting: Callable[[dict], None] | None,
                     on_runtime_idle: Callable[[], None] | None,
                     on_runtime_dead_letter: Callable[[dict], None] | None,
                     capacity_refresh: Callable[[], None] | None,
@@ -807,18 +912,123 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         return consumed
 
     def _settle_retry_exhaustion(record: dict, *args, **kwargs):
-        settled = commit_gate.settle_retry_exhaustion(record, *args, **kwargs)
+        settled = settled_gate.settle_retry_exhaustion(record, *args, **kwargs)
         _runtime_idle_if_consumed(record)
         return settled
 
+    def _await_lock(phase: str, step: Callable[..., object], *args, **kwargs):
+        """#154: run ONE idempotent store step, retrying it IN PLACE while the store
+        reports identifiable lock contention (store.LockContention).
+
+        Never re-runs the loop iteration, so a completed turn is never re-driven, and
+        a publication keeps the operation nonce its caller bound into ``kwargs`` for
+        every attempt. Anything else - access denial, an unsafe generation change, a
+        lock-order inversion, a lost lease, corruption - propagates on its FIRST
+        occurrence, exactly as before. Degradation is visible on every contended
+        attempt, one durable diagnostic marks an episode that reaches the bound, and
+        the heartbeat stays fresh so the supervisor never reaps a contended wrapper.
+        """
+        nonlocal last_hb
+        attempts = 0
+        while True:
+            try:
+                result = step(*args, **kwargs)
+            except LockContention as exc:
+                attempts += 1
+                if on_health_contention is not None:
+                    try:
+                        on_health_contention(phase)
+                    except Exception:  # noqa: BLE001, S110 - advisory health  # nosec B110
+                        pass
+                if (attempts == LOCK_CONTENTION_DIAGNOSTIC_AFTER_ATTEMPTS
+                        and on_contention_persisting is not None):
+                    try:
+                        on_contention_persisting({
+                            "phase": phase,
+                            "lock": exc.what,
+                            "lock_file": exc.lock_file,
+                            "attempts": attempts,
+                        })
+                    except Exception:  # noqa: BLE001, S110 - a diagnostic never crashes the loop  # nosec B110
+                        pass
+                try:
+                    stamp()                  # contended != dead: keep the heartbeat fresh
+                except LockContention:
+                    pass                     # the lease lock itself is contended: next beat
+                last_hb = clock()
+                sleep(_contention_backoff(attempts))
+                _finish_stranded_releases()  # F1: never wait on our own marker
+                continue
+            if attempts and on_health_idle is not None:
+                try:
+                    on_health_idle()         # the episode is over: clear the contention state
+                except Exception:  # noqa: BLE001, S110 - advisory health  # nosec B110
+                    pass
+            return result
+
+    def _gate_step(method: Callable[..., object]) -> Callable[..., object]:
+        """#154: the commit gate folds some store lock contention into a fail-closed
+        result (one of obligations.CONTENDED_REASONS) instead of raising. Re-raise
+        exactly those as LockContention so _await_lock retries the ONE call in place;
+        every other result - including every other BLOCKED/INDETERMINATE - passes
+        through unchanged to the loop's existing handling."""
+        from .obligations import CONTENDED_REASONS, LedgerContended
+
+        def call(*args, **kwargs):
+            try:
+                result = method(*args, **kwargs)
+            except LedgerContended as exc:   # raised, not folded (e.g. reserve_dispatch)
+                raise LockContention(str(exc), what=str(exc)) from exc
+            reason = (getattr(result, "unavailable_reason", None)
+                      or getattr(result, "reason", None))
+            if reason in CONTENDED_REASONS:
+                raise LockContention(str(reason), what=str(reason))
+            return result
+        return call
+
+    def _finish_stranded_releases() -> None:
+        # #154 F1: this process's own ownership markers that a contended release
+        # could not remove (see Store.complete_stranded_lock_releases); advisory.
+        sweep = getattr(store, "complete_stranded_lock_releases", None)
+        if callable(sweep):
+            try:
+                sweep()
+            except Exception:  # noqa: BLE001, S110 - cleanup never breaks the loop  # nosec B110
+                pass
+
+    # #154 F2: the admitted (owed) path's views of the commit gate. Every call is
+    # ONE gate operation retried in place on identifiable contention; none re-runs
+    # the iteration, so the paid dispatch between them is never re-entered. Each
+    # operation on that path is safe to repeat after an acquisition-time failure:
+    # a single ledger critical section (mark_*, complete_retry_barrier,
+    # next_dispatch_purpose, retry_bound_exhausted), a deterministic or reused
+    # nonce (reserve_dispatch, retry_captured_operation), or a revision-guarded
+    # replay (resolve, finalize, settle_retry_exhaustion, fail_delivery_or_block,
+    # record_retry_barrier). Contention inside a release never reaches here (F1).
+    admitted_gate = (None if commit_gate is None else
+                     _InPlaceGate(commit_gate, _await_lock, _gate_step,
+                                  LOCK_CONTENTION_PHASE_ADMISSION))
+    settled_gate = (None if commit_gate is None else
+                    _InPlaceGate(commit_gate, _await_lock, _gate_step,
+                                 LOCK_CONTENTION_PHASE_FINALIZATION))
+    published_gate = (None if commit_gate is None else
+                      _InPlaceGate(commit_gate, _await_lock, _gate_step,
+                                   LOCK_CONTENTION_PHASE_PUBLICATION))
+
     def _commit(rec: dict, gate_resolution=None) -> bool:
+        return _await_lock(
+            LOCK_CONTENTION_PHASE_FINALIZATION, _commit_once, rec, gate_resolution)
+
+    def _commit_once(rec: dict, gate_resolution=None) -> bool:
+        # Idempotent end to end, so _commit may retry it whole: the ownership check
+        # re-runs, finalize is revision-guarded and a repeat cursor advance is a no-op.
         _guard_advance()
         if (
             commit_gate is not None
             and gate_resolution is not None
             and gate_resolution.ledger_revision is not None
         ):
-            commit_gate.finalize(
+            _gate_step(commit_gate.finalize)(
                 rec,
                 gate_resolution,
                 expected_revision=gate_resolution.ledger_revision,
@@ -843,7 +1053,9 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             return False
         finalization_resolution = gate_resolution
         if gate_resolution.ledger_revision is not None:
-            finalization_resolution = commit_gate.retain_landed_response(
+            finalization_resolution = _await_lock(
+                LOCK_CONTENTION_PHASE_FINALIZATION,
+                _gate_step(commit_gate.retain_landed_response),
                 rec,
                 gate_resolution,
                 proof,
@@ -1099,7 +1311,9 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         if max_wall is not None and (clock() - start) >= max_wall:
             return turns
         polls += 1
-        record = recv_api.next_record(store, agent)
+        _finish_stranded_releases()
+        record = _await_lock(
+            LOCK_CONTENTION_PHASE_ADMISSION, recv_api.next_record, store, agent)
         now = clock()
         if record is None:
             # IDLE. First consult the proactive CADENCE hook (WP3): it gates due-ness
@@ -1150,7 +1364,11 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         if commit_gate is not None:
             from .obligations import GateError, ResolverState
 
-            resolution = commit_gate.admit_or_finalize(record)
+            resolution = _await_lock(
+                LOCK_CONTENTION_PHASE_ADMISSION,
+                _gate_step(commit_gate.admit_or_finalize),
+                record,
+            )
             if resolution.allows_legacy_commit:
                 legacy_gate_resolution = resolution
             if not resolution.allows_legacy_commit:
@@ -1170,7 +1388,9 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                     continue
                 if resolution.terminal:
                     _guard_advance()
-                    finalized = commit_gate.finalize(
+                    finalized = _await_lock(
+                        LOCK_CONTENTION_PHASE_FINALIZATION,
+                        _gate_step(commit_gate.finalize),
                         record,
                         resolution,
                         expected_revision=resolution.ledger_revision,
@@ -1190,7 +1410,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                         fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                         continue
                     if resolution.key is not None and resolution.compliance_success:
-                        commit_gate.mark_satisfied(resolution.key)
+                        settled_gate.mark_satisfied(resolution.key)
                     consumed = _runtime_idle_if_consumed(record)
                     landed = (
                         finalized.terminal
@@ -1224,26 +1444,26 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                     stamp()
                     sleep(fail_sleep)
                     continue
-                captured = commit_gate.captured_operation(key)
+                captured = settled_gate.captured_operation(key)
                 if captured is not None:
-                    may_retry = commit_gate.record_retry_barrier(
+                    may_retry = settled_gate.record_retry_barrier(
                         key,
                         category="operation_infra",
                         expected_revision=resolution.scoped_revision,
                     )
                     if may_retry:
-                        if commit_gate.retry_captured_operation(captured, record):
-                            commit_gate.mark_captured_operation_succeeded(captured)
+                        if published_gate.retry_captured_operation(captured, record):
+                            settled_gate.mark_captured_operation_succeeded(captured)
                         else:
-                            commit_gate.complete_retry_barrier(
+                            settled_gate.complete_retry_barrier(
                                 key, category="operation_infra")
                     else:
-                        latest = commit_gate.resolve(record)
+                        latest = settled_gate.resolve(record)
                         should_settle = latest.terminal or latest.state in {
                             ResolverState.BLOCKED,
                             ResolverState.BLOCKED_POLICY,
                             ResolverState.BLOCKED_COMPLIANCE,
-                        } or commit_gate.retry_bound_exhausted(
+                        } or settled_gate.retry_bound_exhausted(
                             key,
                             category="operation_infra",
                         )
@@ -1260,20 +1480,20 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                             reason="captured bus operation exhausted its durable retry bound",
                             permit=captured,
                         )
-                        commit_gate.cleanup_permit(captured)
+                        settled_gate.cleanup_permit(captured)
                         stamp()
                         if not recv_api.consume_boundary_complete(store, agent, record):
                             sleep(fail_sleep)
                             fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                         continue
-                    resolution = commit_gate.resolve(record)
+                    resolution = settled_gate.resolve(record)
                     if resolution.terminal:
                         _guard_advance()
-                        finalized = commit_gate.finalize(record, resolution)
+                        finalized = settled_gate.finalize(record, resolution)
                         if finalized.state != ResolverState.INDETERMINATE:
                             if resolution.compliance_success:
-                                commit_gate.mark_satisfied(key)
-                            commit_gate.cleanup_permit(captured)
+                                settled_gate.mark_satisfied(key)
+                            settled_gate.cleanup_permit(captured)
                             consumed = _runtime_idle_if_consumed(record)
                             stamp()
                             if consumed:
@@ -1299,11 +1519,11 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                         fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                     continue
 
-                purpose = commit_gate.next_dispatch_purpose(key)
+                purpose = admitted_gate.next_dispatch_purpose(key)
                 if purpose is None:
-                    if commit_gate.dispatch_exhausted(key):
+                    if admitted_gate.dispatch_exhausted(key):
                         _guard_advance()
-                        commit_gate.fail_delivery_or_block(
+                        settled_gate.fail_delivery_or_block(
                             record,
                             key,
                             reason=(
@@ -1325,14 +1545,14 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                         fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                     continue
                 try:
-                    permit = commit_gate.reserve_dispatch(resolution, purpose=purpose)
+                    permit = admitted_gate.reserve_dispatch(resolution, purpose=purpose)
                 except GateError:
                     stamp()
                     sleep(fail_sleep)
                     fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                     continue
                 try:
-                    dispatch_record = commit_gate.dispatch_record(record, permit)
+                    dispatch_record = admitted_gate.dispatch_record(record, permit)
                 except GateError:
                     stamp()
                     sleep(fail_sleep)
@@ -1345,38 +1565,38 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 action_infra = (
                     outcome.bus_action_infra or outcome.failure_class == CLASS_INFRA
                 )
-                resolution = commit_gate.resolve(record)
+                resolution = settled_gate.resolve(record)
                 post_budget_composing = resolution.reason == "post_budget_composing"
                 action_rejected = outcome.bus_action_rejected or (
                     resolution.state == ResolverState.OWED_UNSATISFIED
                     and outcome.bus_action_attempted
                     and not action_infra
                 )
-                commit_gate.mark_dispatch_result(
+                settled_gate.mark_dispatch_result(
                     permit,
                     action_attempted=outcome.bus_action_attempted,
                     action_rejected=action_rejected,
                     action_infra=action_infra,
                 )
                 if post_budget_composing:
-                    resolution = commit_gate.resolve(record)
-                    action_infra = commit_gate.captured_operation(key) is not None
+                    resolution = settled_gate.resolve(record)
+                    action_infra = settled_gate.captured_operation(key) is not None
                 if (
                     resolution.state == ResolverState.OWED_UNSATISFIED
                     and outcome.bus_action_attempted
                     and not action_infra
                 ):
-                    commit_gate.mark_unsatisfied_attempt(
+                    settled_gate.mark_unsatisfied_attempt(
                         permit,
                         reason="attempted action did not legally terminate this obligation",
                     )
                 if resolution.terminal:
                     _guard_advance()
-                    finalized = commit_gate.finalize(record, resolution)
+                    finalized = settled_gate.finalize(record, resolution)
                     if finalized.state != ResolverState.INDETERMINATE:
                         if resolution.compliance_success:
-                            commit_gate.mark_satisfied(key)
-                        commit_gate.cleanup_permit(permit)
+                            settled_gate.mark_satisfied(key)
+                        settled_gate.cleanup_permit(permit)
                         consumed = _runtime_idle_if_consumed(record)
                         stamp()
                         if consumed:
@@ -1400,22 +1620,22 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                     fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                     continue
                 if action_infra:
-                    may_retry = commit_gate.record_retry_barrier(
+                    may_retry = settled_gate.record_retry_barrier(
                         key,
                         category="operation_infra",
                         expected_revision=resolution.scoped_revision,
                     )
                     if may_retry:
-                        if commit_gate.retry_captured_operation(permit, record):
-                            commit_gate.mark_captured_operation_succeeded(permit)
-                            resolution = commit_gate.resolve(record)
+                        if published_gate.retry_captured_operation(permit, record):
+                            settled_gate.mark_captured_operation_succeeded(permit)
+                            resolution = settled_gate.resolve(record)
                             if resolution.terminal:
                                 _guard_advance()
-                                finalized = commit_gate.finalize(record, resolution)
+                                finalized = settled_gate.finalize(record, resolution)
                                 if finalized.state != ResolverState.INDETERMINATE:
                                     if resolution.compliance_success:
-                                        commit_gate.mark_satisfied(key)
-                                    commit_gate.cleanup_permit(permit)
+                                        settled_gate.mark_satisfied(key)
+                                    settled_gate.cleanup_permit(permit)
                                     consumed = _runtime_idle_if_consumed(record)
                                     stamp()
                                     if consumed:
@@ -1444,7 +1664,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                                         reason="finalization CAS contention exhausted",
                                     )
                                     if settled.terminal:
-                                        commit_gate.cleanup_permit(permit)
+                                        settled_gate.cleanup_permit(permit)
                                 sleep(fail_sleep)
                                 fail_sleep = min(
                                     max_idle_interval,
@@ -1452,15 +1672,15 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                                 )
                                 continue
                         else:
-                            commit_gate.complete_retry_barrier(
+                            settled_gate.complete_retry_barrier(
                                 key, category="operation_infra")
                     else:
-                        latest = commit_gate.resolve(record)
+                        latest = settled_gate.resolve(record)
                         should_settle = latest.terminal or latest.state in {
                             ResolverState.BLOCKED,
                             ResolverState.BLOCKED_POLICY,
                             ResolverState.BLOCKED_COMPLIANCE,
-                        } or commit_gate.retry_bound_exhausted(
+                        } or settled_gate.retry_bound_exhausted(
                             key,
                             category="operation_infra",
                         )
@@ -1477,15 +1697,15 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                             reason="captured bus operation exhausted its durable retry bound",
                             permit=permit,
                         )
-                        commit_gate.cleanup_permit(permit)
+                        settled_gate.cleanup_permit(permit)
                         stamp()
                         if not recv_api.consume_boundary_complete(store, agent, record):
                             sleep(fail_sleep)
                             fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                         continue
-                if commit_gate.dispatch_exhausted(key) and not action_infra:
+                if settled_gate.dispatch_exhausted(key) and not action_infra:
                     _guard_advance()
-                    commit_gate.fail_delivery_or_block(
+                    settled_gate.fail_delivery_or_block(
                         record,
                         key,
                         reason=(
@@ -1495,7 +1715,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                         expected_revision=resolution.scoped_revision,
                     )
                     consumed = _runtime_idle_if_consumed(record)
-                    commit_gate.cleanup_permit(permit)
+                    settled_gate.cleanup_permit(permit)
                     stamp()
                     if consumed:
                         fail_sleep = idle_interval
@@ -1516,7 +1736,9 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             }
         ):
             _guard_advance()
-            commit_gate.finalize(
+            _await_lock(
+                LOCK_CONTENTION_PHASE_FINALIZATION,
+                _gate_step(commit_gate.finalize),
                 record,
                 legacy_gate_resolution,
                 expected_revision=legacy_gate_resolution.ledger_revision,
@@ -1537,7 +1759,11 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             continue
 
         if commit_gate is not None and legacy_gate_resolution is not None:
-            landed = commit_gate.resolve_landed_response(record)
+            landed = _await_lock(
+                LOCK_CONTENTION_PHASE_ADMISSION,
+                _gate_step(commit_gate.resolve_landed_response),
+                record,
+            )
             if landed.unavailable_reason is not None:
                 stamp()
                 if on_health_idle is not None:
@@ -1671,13 +1897,17 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 # incl. a stale-kill mid-outage, must keep retrying until it clears).
 
         if commit_gate is not None and legacy_gate_resolution is not None:
-            authorized = commit_gate.authorize_no_admission_drive(
+            authorized = _await_lock(
+                LOCK_CONTENTION_PHASE_ADMISSION,
+                _gate_step(commit_gate.authorize_no_admission_drive),
                 record,
                 legacy_gate_resolution,
             )
             if authorized.terminal:
                 _guard_advance()
-                finalized = commit_gate.finalize(
+                finalized = _await_lock(
+                    LOCK_CONTENTION_PHASE_FINALIZATION,
+                    _gate_step(commit_gate.finalize),
                     record,
                     authorized,
                     expected_revision=authorized.ledger_revision,
@@ -1778,13 +2008,20 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         draft_reason_code = None
         stray_draft_warnings: list[str] = []
         if outcome.ok:
-            draft_reason_code = _deliver_reply_draft(store, agent, record)
+            # #154: the turn is complete - from here on only publication and
+            # finalization are retried (in place), never drive().
+            draft_reason_code = _deliver_reply_draft(
+                store, agent, record, retry=_await_lock)
             # #wrapper-reply-channels increment C: disk-based on every clean
             # turn, regardless of THIS turn's own kind - a stray from a past
             # turn must surface even while the current turn is unrelated.
             stray_draft_warnings = _report_stray_reply_drafts(store, agent, record)
         if commit_gate is not None and legacy_gate_resolution is not None:
-            landed = commit_gate.resolve_landed_response(record)
+            landed = _await_lock(
+                LOCK_CONTENTION_PHASE_FINALIZATION,
+                _gate_step(commit_gate.resolve_landed_response),
+                record,
+            )
             if landed.proof is not None:
                 if _commit_landed(
                     record,
@@ -1834,7 +2071,9 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 and legacy_gate_resolution is not None
                 and legacy_gate_resolution.ledger_revision is not None
             ):
-                finalization_resolution = commit_gate.record_no_admission_success(
+                finalization_resolution = _await_lock(
+                    LOCK_CONTENTION_PHASE_FINALIZATION,
+                    _gate_step(commit_gate.record_no_admission_success),
                     record,
                     legacy_gate_resolution,
                 )

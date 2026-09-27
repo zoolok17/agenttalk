@@ -11800,6 +11800,22 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
 
         cadence_hook = _cadence
 
+    def _on_contention_persisting(info: dict) -> None:
+        # #154: the ONE durable diagnostic per persistent store-lock contention
+        # episode, in the supervisor-captured wrapper log (a structured row plus a
+        # plain line). A bus notice would itself need the contended publication lock.
+        lifecycle_log.lock_contention_persisting(
+            phase=info.get("phase"),
+            lock=info.get("lock"),
+            lock_file=info.get("lock_file"),
+            attempts=info.get("attempts"),
+        )
+        sys.stderr.write(
+            f"agenttalk wrap: {agent!r} store lock contention persists "
+            f"({info.get('lock')} [{info.get('lock_file')}], {info.get('phase')} phase, "
+            f"{info.get('attempts')} attempts); still retrying in place.\n"
+        )
+
     def _on_runtime_dead_letter(record: dict) -> None:
         runtime_writer.dead_letter(message_id=record.get("id"))
         # item 10: a dead-lettered message will not be retried, so its ovh-qwen
@@ -11849,6 +11865,8 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             cadence=cadence_hook,  # WP3 proactive sweep (lead-loop only)
             on_health_idle=health_writer.idle,
             on_health_parked=health_writer.parked,  # #58: config-blocked park is visible, not a frozen 'idle'
+            on_health_contention=health_writer.lock_contention,  # #154
+            on_contention_persisting=_on_contention_persisting,  # #154
             on_runtime_idle=runtime_writer.idle,
             on_runtime_dead_letter=_on_runtime_dead_letter,
             capacity_refresh=capacity_refresh,
