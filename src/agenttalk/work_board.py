@@ -151,27 +151,42 @@ def reduce(messages, *, lead, incidents=(), integrated=None, running=frozenset()
     """Return {"items": [...], "legacy": {...}}; the input is never mutated or ordered by ID."""
     messages = list(messages)
     openers, opener_rid = {}, {}
+    responses, orphans = {}, {}
+
+    def orphan(m, why):
+        if isinstance(m.meta.get("work_item"), str) and m.kind != "rescind":
+            orphans.setdefault(m.meta["work_item"], []).append((why, [m.id]))
+
+    def malformed(m):
+        rid, anchor = m.meta.get("request_id"), m.meta.get("in_reply_to")
+        return not (rid is None or isinstance(rid, str)) or not (anchor is None or isinstance(anchor, str))
+
     for m in messages:
         rid = m.meta.get("request_id")
-        if m.kind in work_tags.OPENERS and isinstance(rid, str) and rid:
+        if m.kind in work_tags.OPENERS and isinstance(rid, str) and rid and not malformed(m):
             openers.setdefault(rid, []).append(m)
             opener_rid[m.id] = rid
-    responses, orphans = {}, {}
+        elif m.kind in work_tags.OPENERS:
+            orphan(m, "malformed correlation")
+    parent = {m.id: m.meta["in_reply_to"] for m in messages if isinstance(m.meta.get("in_reply_to"), str)}
     for m in messages:
         if m.kind not in work_tags.REPLIES and m.kind != "rescind":
             continue
-        rid, anchor = m.meta.get("request_id"), m.meta.get("in_reply_to")
-        if anchor in opener_rid and rid not in (None, opener_rid[anchor]):
-            why = "reply request_id contradicts its in_reply_to opener"
+        if malformed(m):
+            orphan(m, "malformed correlation")
+            continue
+        # Walk explicit reply ancestry to the opener it answers; a stated request_id must agree.
+        rid, seen, node = m.meta.get("request_id"), set(), m.meta.get("in_reply_to")
+        while node is not None and node not in opener_rid and node not in seen:
+            seen.add(node)
+            node = parent.get(node)
+        found = opener_rid.get(node)
+        if found is not None and rid is not None and rid != found:
+            orphan(m, "reply request_id contradicts its in_reply_to ancestry")
+        elif (found or rid) in openers:
+            responses.setdefault(found or rid, []).append(m)
         else:
-            rid = opener_rid.get(anchor, rid)
-            if rid in openers:
-                responses.setdefault(rid, []).append(m)
-                continue
-            why = "reply has no available opener"
-        if isinstance(m.meta.get("work_item"), str) and m.kind != "rescind":
-            orphans.setdefault(m.meta["work_item"], []).append((why, [m.id]))
-    parent = {m.id: m.meta.get("in_reply_to") for m in messages if isinstance(m.meta.get("in_reply_to"), str)}
+            orphan(m, "reply has no available opener")
 
     def descends(later, earlier):
         seen, node = set(), parent.get(later)
@@ -299,7 +314,9 @@ def _item(slug, reqs, orphans, facts):
     item["incidents"] = sorted(i["id"] for i in facts["incidents"] if i.get("work_item") == slug
                                and str(i.get("work_cycle", "1")).lstrip("0") == str(current))
     if conflicts:
-        conflicts.sort(key=lambda c: (c[0], sorted(c[1])))
+        # A policy conflict is often derivative (e.g. of M3), so the specific history conflict leads.
+        conflicts.sort(key=lambda c: (c[0] == "conflicting repository/check policies", c[0], sorted(c[1])))
+        item["issues"] += sorted({reason for reason, _ in conflicts} - set(item["issues"]))
         row, column, reason, evidence = 2, "unknown", conflicts[0][0], [i for _, ids in conflicts for i in ids]
     else:
         row, column, reason, evidence = _place(slug, valid, cur, by_rid, successor, surviving, policy, facts, item)
@@ -442,10 +459,9 @@ def _policy(slug, valid, cur, current, facts):
     """Conflicting declarations are history conflicts; a missing or failing policy is never satisfied."""
     sources = []
     for cycle in sorted({r["cycle"] for r in valid if r["cycle"] <= current}, reverse=True):
-        # The deliverable's origin defines policy: builds, else designs, else an external review declaration.
-        origin = [r for r in valid if r["cycle"] == cycle and not r["supersedes"]]
-        sources = ([r for r in origin if r["stage"] == "build"] or [r for r in origin if r["stage"] == "design"]
-                   or [r for r in origin if r["external"]])
+        # Every independent origin defines policy together: designs, builds and external review declarations.
+        sources = [r for r in valid if r["cycle"] == cycle and not r["supersedes"]
+                   and (r["stage"] in ("design", "build") or r["external"])]
         if sources:
             break
     evidence = [i for r in sources for i in r["openers"]]

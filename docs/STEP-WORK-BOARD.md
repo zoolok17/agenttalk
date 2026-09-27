@@ -290,3 +290,33 @@ task-scratch TEMP/TMP/basetemps, `-q -p no:cacheprovider`):
   (`{} and ...`), then killed.
 - Ruff and Bandit (B101 excluded) are clean; `git diff --check` is clean.
 - Size over `b6ed00d`: `work_board.py` +104/-51, tests +119.
+
+### B3b fix round 3 — codex delta read 2 N7-N9
+
+Base `51ef3e8`. Closed by the delta read: N1, N3, N5 and N6. N2 and N4 stayed
+partly open through N7. Each fix has a failing-first test from the reviewer's
+exact sequence; N8's test is a real isolated `Store` round trip.
+
+| Finding | Correction | Test |
+| --- | --- | --- |
+| N7 builds-else-designs hid a design origin (regression from round 2) | Every independent origin of the cycle is compared: design, build and external review, all non-superseding. Each must declare, and all declarations must agree. A design's conflicting or missing policy is no longer covered by a build. A policy conflict is ordered after more specific row-2 conflicts (such as M3), and every conflict reason is listed in `issues`. | `test_n7_every_design_and_build_origin_declares_one_policy` (with and without integration) |
+| N8 direct-anchor-only reply grouping | A reply reaches its opener by walking explicit `in_reply_to` ancestry through non-opener messages, with a cycle guard. A stated `request_id` that disagrees with the ancestry's opener is row 2. | `test_n8_real_store_transitive_reply_ancestry_finds_its_opener`, `test_n8_ancestry_disagreeing_with_request_id_is_a_conflict` |
+| N9 malformed correlation aborted the board | `request_id`/`in_reply_to` types are checked before any lookup, for openers and replies alike. A tagged envelope with malformed correlation is a per-item row 2 "malformed correlation" with its ID; other items reduce. | `test_n9_malformed_historical_correlation_is_a_per_item_unknown` |
+
+Executed (foreground, `PYTHONPATH=<worktree>/src`, `python -B`, no bytecode,
+task-scratch TEMP/TMP/basetemps, `-q -p no:cacheprovider`):
+
+- Failing first: **4 failed, 42 passed**. The ancestry-contradiction test was
+  tightened to a transitive path (reply, then note, then another opener),
+  because the direct case was already caught.
+- After the fix, one earlier test changed its reported reason. The same-cycle
+  M3 case now also carries a derivative policy conflict. The ordering rule
+  above restores the specific M3 reason, and the policy conflict stays listed.
+- Final: `tests/test_work_board_reducer.py` **46 passed**. With
+  `tests/test_work_tags.py`: **127 passed** on Python 3.10.11. With
+  `tests/test_threads.py` too: **201 passed** on Python 3.14.6.
+- Mutation (committed first, restored through git, bytecode-free): **49/49
+  killed**, covering 7 round-3 mutants plus the 42 earlier ones. Confirmed on
+  two full runs.
+- Ruff and Bandit (B101 excluded) are clean; `git diff --check` is clean.
+- Size over `51ef3e8`: `work_board.py` +34/-18, tests +74.

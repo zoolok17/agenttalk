@@ -254,6 +254,7 @@ def test_external_deliverable_review_only_item_and_same_cycle_mixed_provenance()
     item = card(mixed)
     assert (item["workflow_column"], item["row"], item["reason"]) == (
         "unknown", 2, "external deliverable conflicts with recorded build dispatches")
+    assert "conflicting repository/check policies" in item["issues"]  # derivative, still visible
     malformed = Bus()
     malformed.task("tk-read", REVIEWER, "read", work_head=HEAD, raw=True, **dict(EXTERNAL, external_deliverable="yes"))
     assert (card(malformed)["row"], card(malformed)["reason"]) == (2, "malformed work metadata")
@@ -689,3 +690,76 @@ def test_n6_malformed_historical_title_is_a_per_item_unknown():
     vendor = Bus()
     vendor.task("tk-old", REVIEWER, "read", work_head=HEAD, publisher={"assignee_model_vendors": ["bad"]})
     assert card(vendor)["reason"] == "malformed work metadata"
+
+
+# ---- B3b delta read 2 (codex, 2026-09-27): N7-N9 ----
+
+def test_n7_every_design_and_build_origin_declares_one_policy():
+    repo = {"work_branch": "feature", "work_target": "main", **POLICY}
+    conflicting = Bus()
+    conflicting.reply(conflicting.task("tk-design", BUILDER, "design", work_repo="repo-a", **repo), verdict="done")
+    conflicting.reply(conflicting.task("tk-build", REVIEWER2, "build", work_repo="repo-b", **repo), verdict="done")
+    conflicting.reply(conflicting.task("tk-read", REVIEWER, "read", work_head=HEAD), verdict="GO")
+    for facts in ({}, {"integrated": {(ITEM, HEAD): True}}):
+        item = card(conflicting, **facts)
+        assert (item["workflow_column"], item["row"], item["reason"]) == (
+            "unknown", 2, "conflicting repository/check policies")
+    silent = Bus()
+    silent.reply(silent.task("tk-design", BUILDER, "design"), verdict="done")
+    silent.reply(silent.task("tk-build", REVIEWER2, "build", work_repo="repo-b", **repo), verdict="done")
+    silent.reply(silent.task("tk-read", REVIEWER, "read", work_head=HEAD), verdict="GO")
+    assert (card(silent)["workflow_column"], card(silent)["reason"]) == ("unknown", "check policy missing")
+
+
+def test_n8_real_store_transitive_reply_ancestry_finds_its_opener(tmp_path):
+    from agenttalk.store import Store
+    store = Store(tmp_path)
+    store.init([LEAD, BUILDER, REVIEWER])
+    store.set_role(LEAD, "lead")
+    build = store.send(sender=LEAD, recipient=BUILDER, kind="task", body="b",
+                       meta={"work_item": ITEM, "stage": "build", "request_id": "tk-build", **POLICY})
+    store.send(sender=BUILDER, recipient=LEAD, kind="task-response", body="r",
+               meta={"in_reply_to": build.id, "request_id": "tk-build", "status": "done", "verdict": "done"})
+    review = store.send(sender=LEAD, recipient=REVIEWER, kind="review-request", body="read",
+                        meta={"work_item": ITEM, "stage": "read", "request_id": "tk-r", "work_head": HEAD})
+    hold = store.send(sender=REVIEWER, recipient=LEAD, kind="review-result", body="question",
+                      meta={"in_reply_to": review.id, "request_id": "tk-r", "status": "needs-info", "verdict": "HOLD"})
+    answer = store.send(sender=LEAD, recipient=REVIEWER, kind="message", body="answer",
+                        meta={"request_id": "tk-r", "in_reply_to": hold.id})
+    go = store.send(sender=REVIEWER, recipient=LEAD, kind="review-result", body="ok",
+                    meta={"in_reply_to": answer.id, "status": "approved", "verdict": "GO", **EVIDENCE})
+    assert "request_id" not in go.meta
+    item = next(i for i in W.reduce(store.valid_messages(), lead=LEAD)["items"] if i["work_item"] == ITEM)
+    assert (item["workflow_column"], item["candidate"]) == ("ready", HEAD)
+    assert {e["reply"] for e in item["verdicts"][HEAD]} == {hold.id, go.id}
+
+
+def test_n8_ancestry_disagreeing_with_request_id_is_a_conflict():
+    bus = Bus()
+    built(bus)
+    review = bus.task("tk-r", REVIEWER, "read", work_head=HEAD)
+    other = bus.task("tk-other", REVIEWER, "read", work_head=HEAD)
+    note = bus.add(LEAD, REVIEWER, "message", {"in_reply_to": other.id})
+    bad = bus.add(REVIEWER, LEAD, "task-response", {"in_reply_to": note.id, "request_id": "tk-r", "status": "done",
+                                                     "verdict": "GO", "work_item": ITEM}, raw=True)
+    assert review and (card(bus)["row"], card(bus)["reason"]) == (
+        2, "reply request_id contradicts its in_reply_to ancestry")
+    assert bad.id in card(bus)["evidence"]
+
+
+def test_n9_malformed_historical_correlation_is_a_per_item_unknown():
+    for field in ("in_reply_to", "request_id"):
+        bus = Bus()
+        build = bus.task("tk-build", BUILDER, "build", **POLICY)
+        meta = {"in_reply_to": build.id, "request_id": "tk-build", "status": "done", "verdict": "done",
+                "work_item": ITEM, field: []}
+        bad = bus.add(BUILDER, LEAD, "task-response", meta, raw=True)
+        bus.reply(bus.task("tk-other", BUILDER, "build", item="other-item", **POLICY), verdict="done")
+        out = W.reduce(bus.messages, lead=LEAD)
+        item = next(i for i in out["items"] if i["work_item"] == ITEM)
+        assert (item["row"], item["reason"], item["evidence"]) == (2, "malformed correlation", [bad.id])
+        assert next(i for i in out["items"] if i["work_item"] == "other-item")["reason"] == "no review dispatched"
+    opener = Bus()
+    bad = opener.task([], BUILDER, "build", raw=True, **POLICY)
+    assert (card(opener)["row"], card(opener)["reason"], card(opener)["evidence"]) == (
+        2, "malformed correlation", [bad.id])
