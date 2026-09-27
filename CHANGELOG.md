@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Recheck current task authority and reader compatibility when resuming a partial
+  task broadcast; a prior dispatch no longer authorizes a demoted sender to resume.
+
 ### Added
 
 - Configure model vendors independently of CLI transport; freeze per-recipient

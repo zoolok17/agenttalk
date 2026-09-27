@@ -7717,7 +7717,9 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
     # the missing copies. Broadcaster-only.
     from agenttalk import work_tags
     resume = getattr(args, "resume", None)
-    if args.kind == "task":
+    def check_task_dispatch(kind):
+        if kind != "task":
+            return
         if sender not in (store.sole_lead(), store.operator_facing()):
             raise ValueError("only the lead or liaison may dispatch tasks")
         behind = _roster_members_behind_task_kind(store, roster, exclude=sender)
@@ -7725,6 +7727,7 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
             raise ValueError("task recipients need an upgrade; use --force to override")
         if behind:
             sys.stderr.write(f"agenttalk broadcast: --force; task kind unsupported by {behind}\n")
+    check_task_dispatch(args.kind)
     if resume:
         if (args.message or getattr(args, "file", None) or args.subject
                 or args.kind != "message" or args.meta
@@ -7747,6 +7750,7 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
                 f"agenttalk broadcast: only the broadcaster "
                 f"({proto.sender!r}) may resume batch {resume!r}.\n")
             return 2
+        check_task_dispatch(proto.kind)
         resolved = [x for x in
                     ((proto.meta or {}).get("audience_resolved") or "").split(",") if x]
         if not resolved:

@@ -59,7 +59,8 @@ def test_unknown_vendor_not_inferred_and_spoofs_refused(bus):
     assert len(bus.valid_messages()) == 1
 
 
-def test_partial_group_resume_preserves_frozen_vendor_map(bus, monkeypatch):
+@pytest.mark.parametrize("guard", ["demoted", "old-reader"])
+def test_partial_group_resume_rechecks_authority_and_preserves_vendor_map(bus, monkeypatch, capsys, guard):
     bus.set_model_vendor("worker", "alibaba")
     original = Store.send
     calls = []
@@ -73,7 +74,14 @@ def test_partial_group_resume_preserves_frozen_vendor_map(bus, monkeypatch):
     first = bus.valid_messages()[0]
     monkeypatch.setattr(Store, "send", original)
     bus.set_model_vendor("worker", "openai")
-    assert command(bus, "broadcast", "--from", "lead", "--resume", first.meta["broadcast_id"]) == 0
+    if guard == "demoted":
+        bus.set_role("reviewer", "lead")
+    capsys.readouterr()
+    assert command(bus, "broadcast", "--from", "lead", "--resume", first.meta["broadcast_id"]) == 2
+    assert ("only the lead or liaison" if guard == "demoted" else "need an upgrade") in capsys.readouterr().err
+    assert len(bus.valid_messages()) == 1
+    bus.set_role("lead", "lead")
+    assert command(bus, "broadcast", "--from", "lead", "--resume", first.meta["broadcast_id"], "--force") == 0
     assert len(bus.valid_messages()) == 2
     assert all(m.meta["assignee_model_vendors"] == first.meta["assignee_model_vendors"] for m in bus.valid_messages())
 

@@ -109,3 +109,13 @@ CLI/store/web compatibility selection: 79 passed, 599 deselected (29.69 s).
 Python 3.14 vendor/tag control: 106 passed (12.81 s). Ruff passes all changed
 Python files. Bandit passes production and new tests (B101 excluded for test
 assertions); the existing web test file has 37 baseline findings, unchanged.
+
+### B2b cold-read follow-up — task resume gates
+
+Initial dispatch and resume share the task authority/reader checks. Resume uses
+the frozen opener kind and current lead/liaison authority; old-reader overrides
+require `--force` again. Frozen vendor maps remain unchanged. Both demotion and
+old-reader regressions failed before the fix (2 failed, 24 deselected, 1.02 s).
+Targeted vendor/broadcast checks pass on Python 3.10 and 3.14 (33 passed each,
+265 deselected); Ruff and Bandit pass (B101 excluded for test assertions).
+Task scratch `tk-aaa3fe3d0b17` retains red/green evidence for the delta read.
