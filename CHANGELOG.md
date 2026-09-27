@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Discover all compacted work evidence through the shared snapshot, caching validated
+  facts across polls and keeping active state available while archive coverage builds or degrades.
+
+- Share validated active envelopes across dashboard polls through a per-root
+  worker snapshot, with generation checks and a cross-partition selected-work budget.
+
+- Configure model vendors independently of CLI transport; freeze per-recipient
+  vendor maps on work dispatches and link escalations to exact work items/cycles.
+
 ### Fixed
 
 - Keep the fresh last-known-good dashboard view during snapshot scan races and
@@ -23,15 +34,6 @@ Theme: **challenge major work before it starts, and run acceptance on a pinned,
 offline-checked tool registry.**
 
 ### Added
-
-- Discover all compacted work evidence through the shared snapshot, caching validated
-  facts across polls and keeping active state available while archive coverage builds or degrades.
-
-- Share validated active envelopes across dashboard polls through a per-root
-  worker snapshot, with generation checks and a cross-partition selected-work budget.
-
-- Configure model vendors independently of CLI transport; freeze per-recipient
-  vendor maps on work dispatches and link escalations to exact work items/cycles.
 
 - Validate and inherit external work declarations, reserve publisher-owned vendor
   metadata, and align both lead skills with the finalized work-board contract.
