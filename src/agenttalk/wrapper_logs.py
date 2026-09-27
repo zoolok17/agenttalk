@@ -809,6 +809,24 @@ class WrapperLifecycleLog:
             return_code=return_code,
         )
 
+    def lock_contention_persisting(
+        self,
+        *,
+        phase: object,
+        lock: object,
+        lock_file: object,
+        attempts: object,
+    ) -> None:
+        # #154: the one durable row per persistent store-lock contention episode;
+        # the wrapper is still alive and retrying in place.
+        self._emit(
+            "wrapper_lock_contention_persisting",
+            phase=phase,
+            lock=lock,
+            lock_file=lock_file,
+            attempts=attempts,
+        )
+
     def wrapper_exited(self, exit_code: int, *, reason: str) -> None:
         self.terminal_emitted = True
         self._emit("wrapper_exited", exit_code=exit_code, reason=reason)

@@ -28,6 +28,7 @@ from agenttalk.store import (
     CONTROL_KINDS,
     OPENER_KINDS,
     PROC_DEAD,
+    LockContention,
     Message,
     _process_liveness,
 )
@@ -65,6 +66,18 @@ MAX_FINALIZATION_MISSES = 12
 MAX_FINALIZATION_SECONDS = 900.0
 MAX_DEFERRAL_SECONDS = 3600.0
 PROOF_UNREADABLE_SECONDS = 900.0
+# #154: the landed-response lookups report store lock contention under these exact
+# reasons instead of the generic unavailability, so the continuous wrapper loop can
+# retry that one step in place (visibly) rather than re-peek. Every other caller
+# still sees an ordinary unavailable / INDETERMINATE result, exactly as before.
+LANDED_REPLAY_CONTENDED = "validated landed-response replay contended"
+LANDED_RETENTION_CONTENDED = "landed-response retention contended"
+LEDGER_REPLAY_CONTENDED = "canonical replay indexing contended"
+CONTENDED_REASONS = frozenset({
+    LANDED_REPLAY_CONTENDED,
+    LANDED_RETENTION_CONTENDED,
+    LEDGER_REPLAY_CONTENDED,
+})
 
 
 class ResolverState(str, Enum):
@@ -113,6 +126,14 @@ class GateError(RuntimeError):
 
 class LedgerUnreadable(GateError):
     """The canonical journal cannot be read safely."""
+
+
+class LedgerContended(LedgerUnreadable):
+    """#154: replay indexing timed out on store lock contention, not unreadability.
+
+    Still a LedgerUnreadable, so every caller keeps its fail-closed BLOCKED result,
+    now carrying LEDGER_REPLAY_CONTENDED as its reason for the wrapper loop's retry.
+    """
 
 
 class StaleRevision(GateError):
@@ -2020,7 +2041,10 @@ class DetectionCommitGate:
             ledger = self._index_messages(messages, invalid_records=invalid_records)
         except (OSError, ValueError, TimeoutError, RuntimeError) as exc:
             observed_at = self.now()
-            if isinstance(exc, LedgerUnreadable):
+            if isinstance(exc, LockContention):
+                # #154: contention is not corruption - no projection rebuild.
+                failure = LedgerContended(LEDGER_REPLAY_CONTENDED)
+            elif isinstance(exc, LedgerUnreadable):
                 if self._try_rebuild_projection(observed_at=observed_at):
                     failure = LedgerUnreadable(
                         "canonical projection rebuilt; fail-closed replay required"
@@ -2369,6 +2393,8 @@ class DetectionCommitGate:
         try:
             with self.store._message_publication_lock():
                 messages = self.store.publication_ordered_messages()
+        except LockContention:
+            return LandedResponseResult(unavailable_reason=LANDED_REPLAY_CONTENDED)
         except (OSError, ValueError, TimeoutError, RuntimeError):
             return LandedResponseResult(
                 unavailable_reason="validated landed-response replay unavailable"
@@ -6019,6 +6045,8 @@ class DetectionCommitGate:
         try:
             with self.store._message_publication_lock():
                 messages, ledger = self._validated_messages()
+        except (LockContention, LedgerContended):
+            return Resolution(ResolverState.INDETERMINATE, LANDED_RETENTION_CONTENDED)
         except (OSError, ValueError, TimeoutError, RuntimeError):
             return Resolution(
                 ResolverState.INDETERMINATE,
@@ -6065,6 +6093,8 @@ class DetectionCommitGate:
                 started = bool(
                     isinstance(claim, dict) and claim.get("drive_started_at")
                 )
+        except LockContention:
+            return Resolution(ResolverState.INDETERMINATE, LANDED_RETENTION_CONTENDED)
         except (OSError, ValueError, TimeoutError, RuntimeError):
             return Resolution(
                 ResolverState.INDETERMINATE,

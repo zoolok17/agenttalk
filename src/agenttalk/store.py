@@ -136,6 +136,24 @@ _AWAIT_MAX_ROOT_ENTRIES = 256
 _AWAIT_MAX_DIAGNOSTICS = 64
 
 
+class LockContention(TimeoutError):
+    """Another live holder kept a store lock past this acquisition deadline.
+
+    Raised ONLY by the two acquisition waits (the generation guard and the
+    ownership marker), so it is the one lock failure a caller may retry. Access
+    denial ("could not open the generation guard"), an unsafe generation change,
+    a failed release and a lock-order inversion keep their own types and
+    messages. A TimeoutError subclass, so every existing ``except TimeoutError``
+    boundary behaves exactly as before.
+    """
+
+    def __init__(self, message: str, *, what: str = "lock",
+                 lock_file: str | None = None) -> None:
+        super().__init__(message)
+        self.what = what
+        self.lock_file = lock_file
+
+
 def _ensure_lock_byte(fd: int) -> None:
     """Make byte zero lockable without relying on owner metadata."""
     if os.fstat(fd).st_size == 0:
@@ -1449,9 +1467,11 @@ class Store:
                 )
             while not _try_acquire_file_lock(fd):
                 if time.monotonic() >= deadline:
-                    raise TimeoutError(
+                    raise LockContention(
                         f"could not acquire the generation guard for {what} "
-                        f"at {guard}"
+                        f"at {guard}",
+                        what=what,
+                        lock_file=guard.name,
                     ) from None
                 time.sleep(poll)
             acquired = True
@@ -1607,9 +1627,11 @@ class Store:
                             raise
                 if identity is None:
                     if time.monotonic() >= deadline:
-                        raise TimeoutError(
+                        raise LockContention(
                             f"could not acquire the {what} at {lock} within "
-                            f"{timeout:g}s"
+                            f"{timeout:g}s",
+                            what=what,
+                            lock_file=lock.name,
                         ) from None
                     time.sleep(poll)
             yield

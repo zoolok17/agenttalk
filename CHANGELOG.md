@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Recheck current task authority and reader compatibility when resuming a partial
   task broadcast; a prior dispatch no longer authorizes a demoted sender to resume.
 
+- Keep wrapped seats alive through store lock contention (#154): the continuous loop
+  retries only the contended step in place, before admission or, after a completed
+  turn, for publication (one stable operation nonce) and finalization, never
+  re-driving the turn. Contention shows as `rate_limited_or_outage` /
+  `store_lock_contention`, with one wrapper-log diagnostic per persistent episode.
+  Corruption, access denial, unsafe generation changes, lock-order inversions and a
+  lost lease keep their existing handling and are never retried as contention.
+
 ## [0.93.0] - 2026-09-27
 
 Theme: **challenge major work before it starts, and run acceptance on a pinned,

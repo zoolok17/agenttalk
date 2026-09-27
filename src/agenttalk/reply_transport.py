@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from agenttalk import gates as gate_mod
+from agenttalk.store import LockContention
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from agenttalk.store import Message, Store
@@ -377,6 +378,7 @@ def deliver_draft_reply(
     agent: str,
     record: dict,
     draft_path: Path,
+    operation_nonce: str | None = None,
 ) -> "Message | None":
     """Validate a child-written draft and publish it as the agent's reply.
 
@@ -384,6 +386,14 @@ def deliver_draft_reply(
     (missing/oversize/empty draft, malformed record). Never raises on a
     refusal path: the caller's turn disposition must not change because
     freeform replies are not obligatory.
+
+    #154: a caller that supplies ``operation_nonce`` owns this publication's
+    identity AND its retry. Store lock contention then propagates as
+    ``LockContention`` with the draft left live and unrefused, so the caller
+    can retry with the SAME nonce: ``send_operation`` dedupes on it, which also
+    covers a publication that landed before its lock release timed out.
+    Without a nonce, a fresh one is minted and contention is refused like any
+    other publish failure (unchanged).
     """
     inbound_id = record.get("id")
     requester = record.get("from")
@@ -429,7 +439,7 @@ def deliver_draft_reply(
         # acknowledgment, still on the hook) must use the CLI path instead;
         # the draft channel does not support that shape.
         meta["status"] = "done"
-    nonce = secrets.token_hex(16)
+    nonce = operation_nonce if operation_nonce is not None else secrets.token_hex(16)
     digest = operation_digest_for(
         meta, operation="terminal", body=body, kind=kind, recipient=requester,
     )
@@ -454,6 +464,8 @@ def deliver_draft_reply(
             operation_digest=digest,
         )
     except Exception as e:  # noqa: BLE001 - refusal contract: the caller preserves
+        if operation_nonce is not None and isinstance(e, LockContention):
+            raise  # #154: the nonce's owner retries; see the docstring
         # ValueError (nonce/validator) AND operational failures (publication
         # lock timeout, I/O): returning None routes ALL of them into the
         # caller's observable refused-draft preservation instead of a silent
