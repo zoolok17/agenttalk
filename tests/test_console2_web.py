@@ -177,11 +177,6 @@ def test_script_tag_check_is_not_fooled_by_case_or_spacing() -> None:
         # the legitimate served script must still be recognised as inline-free
         assert any(src == "/static/console2.js" and not has_inline for src, has_inline in scripts)
 
-    # The old check this replaces (a bare lowercase-anchored regex) is exactly what
-    # py/bad-tag-filter flagged: it cannot see either case at all.
-    old_regex = re.findall(r"<script\b[^>]*>", upper)
-    assert len(old_regex) == 1, "documents the old regex's blind spot: it only ever saw the lowercase tag"
-
 
 def test_classic_console_is_untouched_by_the_new_route(tmp_path: Path) -> None:
     srv, _t, base = _serve(tmp_path)

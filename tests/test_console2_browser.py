@@ -1,4 +1,5 @@
-"""Real-browser check of the console v2 stream (skipped when no Chromium-family browser or node).
+"""Real-browser check of the console v2 stream (the one browser-driving test is skipped when no
+Chromium-family browser or node is present; the launch-flags unit test below it always runs).
 
 The DOM stub in the node tests models detachment and focus, but only a real browser proves that
 (F1) a thread scrolled while detached loses its position and (F2) a redraw that replaces a focused
@@ -11,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import shutil
 import subprocess
 import threading
@@ -49,10 +51,37 @@ def _find_browser() -> str | None:
     return None
 
 
+def _browser_launch_flags(system: str) -> list[str]:
+    """The Chromium-family launch flags for `system` (a `platform.system()`-shaped string:
+    "Linux", "Darwin" or "Windows" - never queried internally, so every branch is exercisable
+    from any host, including this one, where CI's linux/macos legs cannot actually be run).
+
+    Fix for PR #214: this check was written and only ever exercised against Edge on Windows;
+    on a linux CI runner (typically containerized, often effectively root, with a small
+    /dev/shm) the SAME flags the Windows leg used let the browser process fail to start at
+    all, with no sandbox or shared-memory workaround. macOS needs neither: it is not
+    containerized and Chrome's normal sandbox works there in CI the same as anywhere else.
+    """
+    common = ["--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check"]
+    if system == "Linux":
+        return common + ["--no-sandbox", "--disable-dev-shm-usage"]
+    return common
+
+
+def test_browser_launch_flags_are_correct_per_platform() -> None:
+    """Pure-function unit test: runs unconditionally (no browser or node required), and so is
+    the one part of this fix actually verified locally - the real launch on linux/macos CI is
+    not (see the module docstring)."""
+    linux = _browser_launch_flags("Linux")
+    assert "--no-sandbox" in linux and "--disable-dev-shm-usage" in linux
+    assert "--headless=new" in linux and "--disable-gpu" in linux
+    for other_system in ("Darwin", "Windows"):
+        flags = _browser_launch_flags(other_system)
+        assert "--no-sandbox" not in flags and "--disable-dev-shm-usage" not in flags
+        assert "--headless=new" in flags and "--disable-gpu" in flags
+
+
 BROWSER = _find_browser()
-pytestmark = pytest.mark.skipif(
-    BROWSER is None or shutil.which("node") is None, reason="needs node and a Chromium-family browser",
-)
 
 
 def _iso(when: datetime) -> str:
@@ -134,12 +163,17 @@ def page(tmp_path: Path):
         srv.server_close()
 
 
+@pytest.mark.skipif(BROWSER is None, reason="no Chromium-family browser on this runner")
+@pytest.mark.skipif(shutil.which("node") is None, reason="no node on this runner")
 def test_thread_scroll_and_focus_survive_redraws_in_a_real_browser(page) -> None:
     url, profile = page
+    flags = _browser_launch_flags(platform.system())
     result = subprocess.run(
-        ["node", str(CHECK), BROWSER, url, str(profile)],
+        ["node", str(CHECK), BROWSER, url, str(profile), json.dumps(flags)],
         capture_output=True, text=True, encoding="utf-8", timeout=120, cwd=REPO_ROOT,
     )
+    # A browser binary that exists but fails to start is a hard FAILURE, never a skip -
+    # result.stderr carries the launched process's own stderr on that path (see the .mjs).
     assert result.returncode == 0, result.stderr
     out = json.loads(result.stdout)
     # F1: the thread is scrolled to its end on the first draw (it has 30 messages: it must overflow)

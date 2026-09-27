@@ -1,26 +1,44 @@
 // Real-browser check for the console v2 stream, driven over the DevTools protocol.
-// Usage: node console2_browser_check.mjs <browser-exe> <page-url> <profile-dir>
+// Usage: node console2_browser_check.mjs <browser-exe> <page-url> <profile-dir> [launch-flags-json]
+// launch-flags-json is a JSON array of the platform-specific launch flags (see
+// test_console2_browser.py's _browser_launch_flags, the pure function that picks them - the
+// sole caller always supplies it); an empty/omitted array means no headless/GPU/sandbox flags
+// at all, useful only for manual debugging with a real, visible browser window.
 // Prints one JSON object of measurements; tests/test_console2_browser.py asserts on it.
 //
 // What the DOM stub cannot show and this does: a detached element has no scroll layout (the thread
 // must be scrolled after insertion), and a redraw that replaces a focused control drops focus to <body>.
 import { spawn } from 'node:child_process';
 
-const [exe, pageUrl, profile] = process.argv.slice(2);
+const [exe, pageUrl, profile, flagsJson] = process.argv.slice(2);
+const extraFlags = flagsJson ? JSON.parse(flagsJson) : [];
 const PORT = 9300 + Math.floor(Math.random() * 500);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// `profile` is a fresh, unique directory per test run - the caller's job
+// (test_console2_browser.py's `page` fixture uses pytest's own tmp_path); a reused or
+// already-open profile directory makes Chromium refuse to start outright.
 const child = spawn(exe, [
-  '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check', `--user-data-dir=${profile}`,
+  ...extraFlags, `--user-data-dir=${profile}`,
   `--remote-debugging-port=${PORT}`, '--window-size=1240,780', 'about:blank',
-], { stdio: 'ignore' });
+], { stdio: ['ignore', 'ignore', 'pipe'] });
+
+let childStderr = '';
+child.stderr.on('data', (chunk) => { childStderr += chunk.toString(); });
+let childExit = null;
+child.on('exit', (code, signal) => { childExit = { code, signal }; });
 
 async function json(path) {
-  for (let i = 0; i < 100; i++) {
+  for (let i = 0; i < 200; i++) {
     try { const r = await fetch(`http://127.0.0.1:${PORT}${path}`); if (r.ok) return await r.json(); } catch (e) { /* not up yet */ }
-    await sleep(100);
+    if (childExit) {
+      throw new Error(
+        `browser process exited before the DevTools endpoint came up (code=${childExit.code} `
+        + `signal=${childExit.signal}); stderr:\n${childStderr}`);
+    }
+    await sleep(150);
   }
-  throw new Error('browser did not start');
+  throw new Error(`browser did not start within the retry budget; stderr:\n${childStderr}`);
 }
 
 let seq = 0;
