@@ -1,4 +1,4 @@
-"""Shared validated envelopes; archive discovery plugs into Snapshot in B4s."""
+"""Shared validated active and compacted envelopes with disposable fingerprint facts."""
 import copy
 import hashlib
 import json
@@ -25,13 +25,13 @@ def _trust(store, cfg):
     return (_digest(cfg), required, project, key)
 
 
-def validated_active(store, cfg, checkpoint=None):
+def validated_active(store, cfg, checkpoint=None, *, trust=None, **scan_options):
     """Use the canonical store scanner and the legacy state's full validation gate."""
-    rows, invalid = store._scan_messages_with_paths(checkpoint=checkpoint)
+    rows, invalid = store._scan_messages_with_paths(checkpoint=checkpoint, **scan_options)
     roster = store._known_roster(cfg)
     if not roster:
         raise ValueError("project config roster is empty")
-    _, required, project, key = _trust(store, cfg)
+    _, required, project, key = trust if trust is not None else _trust(store, cfg)
     valid, rejects = [], len(invalid)
     for message, path in rows:
         try:
@@ -70,12 +70,13 @@ class Snapshot:
     duration: float
     archives: tuple = ()
     archives_complete: bool = False
+    archive_invalid_count: int = 0
 
 
 def selected_closure(snapshot, selected_ids, *, envelope_limit=50000, byte_limit=128 * 1024 * 1024):
     """Budget the reducer-selected full closure, never the discovery population.
 
-    Selection/linked dependency expansion belongs to B3/B4s. Missing IDs and
+    Selection/linked dependency expansion belongs to the reducer. Missing IDs and
     incomplete discovery cannot produce a successful reduction. No prefix is
     returned on failure; the caller retains its last-known placement.
     """
@@ -92,7 +93,7 @@ def selected_closure(snapshot, selected_ids, *, envelope_limit=50000, byte_limit
         status = "building"
     elif conflicts:
         status = "conflict"
-    elif snapshot.invalid_count or len(chosen) != len(set(selected_ids)):
+    elif snapshot.invalid_count or snapshot.archive_invalid_count or len(chosen) != len(set(selected_ids)):
         status = "incomplete"
     if count > envelope_limit or size > byte_limit:
         status = "capacity_exceeded"
@@ -109,8 +110,11 @@ class MembershipChanged(ValueError):
 
 class SnapshotService:
     """One worker-owned generation per root; polling reads only the published value."""
-    def __init__(self, store, *, clock=time.monotonic):
+    def __init__(self, store, *, clock=time.monotonic, archive_slice_limit=1000):
         self.store, self.clock = store, clock
+        self._archive_slice_limit = archive_slice_limit
+        self._cache, self._cache_trust = {}, None
+        self._archive_error = None
         self.current = None
         self.error = None
         self._lock = threading.Lock()
@@ -126,19 +130,48 @@ class SnapshotService:
         with self._lock:
             self._generation += 1
             self.error = ValueError("snapshot generation invalidated")
+            self._cache_trust = None
 
-    def _membership(self):
-        if not self.store.messages_dir.exists():
+    def _membership(self, compacted=False):
+        directory = self.store.compacted_dir if compacted else self.store.messages_dir
+        if not directory.exists():
             return {}
         result = {}
-        for path in self.store.messages_dir.iterdir():
-            if path.suffix == ".json":
+        for path in directory.iterdir():
+            if path.suffix == ".json" or (compacted and ".json." in path.name):
                 try:
                     st = path.stat()
                 except FileNotFoundError:
                     raise MembershipChanged("snapshot membership changed during scan") from None
                 result[path] = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
         return result
+
+    def _cached_partition(self, cfg, membership, checkpoint, *, compacted=False):
+        """Cache invalid verdicts too; archive entries never retain Message/body objects."""
+        pending = [p for p, fingerprint in membership.items()
+                   if p not in self._cache or self._cache[p][0] != fingerprint or self._cache[p][1] is None]
+        # New/changed evidence must advance even if an earlier file stays unreadable.
+        pending.sort(key=lambda p: p in self._cache and self._cache[p][0] == membership[p])
+        if compacted:
+            pending = pending[:self._archive_slice_limit]
+        began = self.clock()
+        for path in pending:
+            rows, _ = validated_active(self.store, cfg, checkpoint, trust=self._cache_trust,
+                                       paths=[path], compacted=compacted)
+            fact, message = None, None
+            if rows:
+                message = rows[0][0]
+                fields = message.to_dict()
+                digest = _digest(fields)
+                fields.pop("body", None)
+                fact = Envelope(message.id, fields, digest, membership[path][2],
+                                "compacted" if compacted else "active")
+            self._cache[path] = (membership[path], fact, None if compacted else message)
+            if compacted and self.clock() - began >= .25:
+                break
+        records = [self._cache[p] for p, fingerprint in membership.items()
+                   if p in self._cache and self._cache[p][0] == fingerprint]
+        return records, len(records) == len(membership)
 
     def refresh(self):
         with self._lock:
@@ -151,7 +184,12 @@ class SnapshotService:
             generation = self._generation
         try:
             cfg = self.store.load_config()
+            if not self.store._known_roster(cfg):
+                raise ValueError("project config roster is empty")
             trust = _trust(self.store, cfg)
+            if trust != self._cache_trust:
+                self._cache.clear()
+                self._cache_trust = trust
             before = self._membership()
             batch, slice_start = 0, self.clock()
             def checkpoint():
@@ -162,26 +200,43 @@ class SnapshotService:
                 if batch >= 1000 or self.clock() - slice_start >= .25:
                     time.sleep(0)  # yield between bounded reads, never inside HTTP
                     batch, slice_start = 0, self.clock()
-            rows, invalid = validated_active(self.store, cfg, checkpoint)
+            records, _ = self._cached_partition(cfg, before, checkpoint)
             if before != self._membership():
                 raise MembershipChanged("snapshot membership changed during scan")
-            entries = []
-            for message, path in rows:
-                fields = message.to_dict()
-                digest = _digest(fields)
-                fields.pop("body", None)
-                entries.append(Envelope(message.id, fields, digest, before[path][2], "active"))
+            entries = tuple(r[1] for r in records if r[1] is not None)
+            active = tuple(sorted((r[2] for r in records if r[2] is not None), key=lambda m: m.id))
+            invalid = len(records) - len(entries)
+            archives, archive_before, archive_invalid, complete = (), {}, 0, False
+            archive_error = None
+            try:
+                archive_before = self._membership(compacted=True)
+                cold, complete = self._cached_partition(cfg, archive_before, checkpoint, compacted=True)
+                archives = tuple(r[1] for r in cold if r[1] is not None)
+                archive_invalid = len(cold) - len(archives)
+                if archive_before != self._membership(compacted=True):
+                    raise MembershipChanged("archive membership changed during scan")
+                self._cache = {p: record for p, record in self._cache.items()
+                               if p in before or p in archive_before}
+            except (OSError, ValueError) as exc:
+                archive_error, complete = exc, False
+                archives = self.current.archives if self.current else ()
             if before != self._membership():
                 raise MembershipChanged("snapshot membership changed during scan")
             if trust != _trust(self.store, self.store.load_config()):
                 raise ValueError("snapshot generation changed during scan")
-            value = Snapshot(generation + 1, start, trust[0], tuple(m for m, _ in rows), invalid,
-                             tuple(entries), len(before), sum(s[2] for s in before.values()), self.clock() - start)
+            value = Snapshot(generation + 1, start, trust[0], active, invalid,
+                             entries, len(before) + len(archive_before),
+                             sum(s[2] for s in (*before.values(), *archive_before.values())),
+                             self.clock() - start, archives, complete, archive_invalid)
             with self._lock:
                 if generation != self._generation:
                     return False
                 self._generation += 1
                 self.current, self.error = value, None
+                self._archive_error = archive_error
+                if isinstance(archive_error, MembershipChanged):
+                    self._retry_at = self.clock() + .25
+                    self._wake.set()
             return True
         except Exception as exc:  # errors-as-data, preserving the last published generation
             with self._lock:
@@ -211,15 +266,15 @@ class SnapshotService:
         with self._lock:
             value = self.current
             status = "building"
-            if self.error or (value and self.clock() - value.started > 15):
+            if self.error or self._archive_error or (value and self.clock() - value.started > 15):
                 status = "stale"
             elif value and value.archives_complete:
-                status = "complete"
+                status = "incomplete" if value.invalid_count or value.archive_invalid_count else "complete"
             return {"status": status, "generation": value.generation if value else None,
                     "discovered_files": value.discovered_files if value else 0,
                     "discovered_bytes": value.discovered_bytes if value else 0,
                     "refresh_duration": value.duration if value else 0,
-                    "cache_size": len(value.envelopes) + len(value.archives) if value else 0}
+                    "cache_size": len(self._cache)}
 
     def start(self):
         def run():

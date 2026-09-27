@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Discover all compacted work evidence through the shared snapshot, caching validated
+  facts across polls and keeping active state available while archive coverage builds or degrades.
+
 - Share validated active envelopes across dashboard polls through a per-root
   worker snapshot, with generation checks and a cross-partition selected-work budget.
 

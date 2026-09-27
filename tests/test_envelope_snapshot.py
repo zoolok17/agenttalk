@@ -67,7 +67,7 @@ def test_refresh_generation_freshness_failure_and_recovery(bus, monkeypatch):
     snapshot = service(bus, clock=lambda: now[0])
     snapshot.refresh()
     before = snapshot.current
-    assert snapshot.coverage()["status"] == "building"  # B4s has not discovered archives
+    assert snapshot.coverage()["status"] == "complete"
     now[0] = 5
     snapshot.refresh()
     assert snapshot.current.generation > before.generation
@@ -75,6 +75,8 @@ def test_refresh_generation_freshness_failure_and_recovery(bus, monkeypatch):
     def failed(**kwargs):
         raise OSError("scan failed")
     monkeypatch.setattr(bus, "_scan_messages_with_paths", failed)
+    path = next(bus.messages_dir.glob("*.json"))
+    path.write_text(path.read_text() + " ", encoding="utf-8")  # force a cache miss
     now[0] = 10
     assert snapshot.refresh() is False
     assert snapshot.current.active == before.active
@@ -150,7 +152,7 @@ def test_closure_deduplicates_prefers_active_and_never_truncates_conflicts(bus):
     conflict = replace(duplicate, digest="different")
     assert selected_closure(replace(complete, archives=(conflict,)), {first.id})["status"] == "conflict"
     assert selected_closure(complete, {"missing"})["status"] == "incomplete"
-    assert selected_closure(current, {first.id})["status"] == "building"
+    assert selected_closure(replace(current, archives_complete=False), {first.id})["status"] == "building"
 
 
 def test_signing_generation_revalidated_and_compaction_never_replays(bus, tmp_path, monkeypatch):
@@ -219,6 +221,8 @@ def test_http_mid_scan_write_keeps_team_view_and_retries(bus, monkeypatch, write
         with _get(url + "/api/state") as response:
             before = json.load(response)["roots"][0]
         monkeypatch.setattr(bus, "_scan_messages_with_paths", racing)
+        path = next(bus.messages_dir.glob("*.json"))
+        path.write_text(path.read_text() + " ", encoding="utf-8")
         assert snapshot.refresh() is False
         assert snapshot.coverage()["status"] == "stale"
         with _get(url + "/api/state") as response:
@@ -247,6 +251,8 @@ def test_worker_runs_scheduled_membership_retry_without_normal_poll_delay(bus, m
     def race(**kwargs):
         raise MembershipChanged("concurrent write")
     monkeypatch.setattr(bus, "_scan_messages_with_paths", race)
+    path = next(bus.messages_dir.glob("*.json"))
+    path.write_text(path.read_text() + " ", encoding="utf-8")
     now[0] = 5
     assert snapshot.refresh() is False
     monkeypatch.setattr(bus, "_scan_messages_with_paths", original)

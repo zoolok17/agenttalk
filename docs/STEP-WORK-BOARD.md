@@ -120,3 +120,33 @@ Task scratch `tk-bb35ff68d3a9` retains the red/green and final targeted logs.
 Final Python 3.10 snapshot/state selection: 61 passed, 190 deselected (31.76 s).
 Python 3.14 snapshot tests: 13 passed (2.66 s). Ruff, Bandit, whitespace and
 added-line privacy checks pass. No full suite; commit remains local.
+
+## B4s — complete compacted discovery and fingerprint cache
+
+Contributor record, base `f714881a`, design `09b54296` section 5. The same per-root
+service now enumerates every envelope in `messages/` and `archived/compacted/`,
+including compaction collision filenames; reset-session archives stay excluded.
+The canonical scanner accepts changed-file paths without changing delivery/retention.
+Identical canonical IDs dedup, preferring active; different contents remain a conflict.
+
+Cache keys include path/file identity, size, nanosecond modification/change times,
+and config/signing generation. Unchanged valid files avoid reads; invalid verdicts
+are retried behind new/changed files to prevent starvation. Archive facts retain no
+body/Message. Restart/invalidation forces validation. Fingerprints cannot detect an
+actor preserving every stat while rewriting.
+
+Each refresh reads at most 1,000 changed archive files or 250 ms of archive work,
+then publishes active state independently. Remaining discovery resumes next refresh;
+coverage stays building until complete, incomplete on invalid envelopes, stale on
+archive failure. Membership races schedule the bounded prompt retry; HTTP never scans.
+Counts include both partitions; closure caps/warnings count selected IDs only.
+Old FIX replies, entirely archived items and legacy metadata ignore the UI window.
+B3 owns selection/dependency expansion and legacy display; no reducer/endpoint is added.
+
+Failing-first: 12 discovery contracts failed (1.69 s). A separate one-file-slice
+starvation regression failed before its fix (0.36 s); empty-roster parity failed
+before its fix (0.17 s). Final discovery/snapshot/compaction/scanner: Python 3.10
+51 passed (8.98 s), Python 3.14 51 passed (8.87 s). Existing state/delivery selection:
+61 passed, 345 deselected (46.43 s). Ruff/Bandit pass (B101 excluded for tests).
+Task scratch `tk-3e4f33ca3f41` retains logs. Limits use small injected values;
+no full suite or large-file population. Whitespace/privacy checks pass.
