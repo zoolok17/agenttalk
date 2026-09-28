@@ -81,14 +81,14 @@ test('boardCard: seats are distinct recipients, sorted; obligations open/total c
       { request_id: 'r3', recipient: 'alpha', stage: 'fix', state: 'outstanding', verdict: null },
     ],
   });
-  const card = M2.boardCard(item, { nowMs: NOW, incidents: [] });
+  const card = M2.boardCard(item, { nowMs: NOW, incidents: [], trustworthy: true });
   assert.deepEqual(card.seats, ['alpha', 'zeta']);
   assert.equal(card.obligationsTotal, 3);
   assert.equal(card.obligationsOpen, 2);
 });
 
 test('boardCard: title falls back to the slug; round/candidate/checks null render as Unknown-shaped', () => {
-  const card = M2.boardCard(ITEM({ title: null, round: null, candidate: null, checks: null }), { nowMs: NOW, incidents: [] });
+  const card = M2.boardCard(ITEM({ title: null, round: null, candidate: null, checks: null }), { nowMs: NOW, incidents: [], trustworthy: true });
   assert.equal(card.title, 'gate-b');
   assert.equal(card.round, null);
   assert.equal(card.checks, null);
@@ -98,49 +98,49 @@ test('boardCard: vendor is read from verdicts[candidate], never guessed; no cand
   const withVendor = M2.boardCard(ITEM({
     candidate: 'a'.repeat(40),
     verdicts: { [('a'.repeat(40))]: [{ reviewer: 'codex-agenttalk-reviewer-1', verdict: 'GO', reply: 'rp-1', independent: true, vendor: 'openai' }] },
-  }), { nowMs: NOW, incidents: [] });
+  }), { nowMs: NOW, incidents: [], trustworthy: true });
   assert.deepEqual(withVendor.vendors, [{ recipient: 'codex-agenttalk-reviewer-1', vendor: 'openai' }]);
 
   const missingVendor = M2.boardCard(ITEM({
     candidate: 'b'.repeat(40),
     verdicts: { [('b'.repeat(40))]: [{ reviewer: 'x', verdict: 'GO', reply: 'rp-2', independent: true, vendor: null }] },
-  }), { nowMs: NOW, incidents: [] });
+  }), { nowMs: NOW, incidents: [], trustworthy: true });
   assert.deepEqual(missingVendor.vendors, [{ recipient: 'x', vendor: 'unverified' }]);
 
-  const noCandidate = M2.boardCard(ITEM({ candidate: null }), { nowMs: NOW, incidents: [] });
+  const noCandidate = M2.boardCard(ITEM({ candidate: null }), { nowMs: NOW, incidents: [], trustworthy: true });
   assert.deepEqual(noCandidate.vendors, []);
 });
 
 test('boardCard: merge is integrated/not_integrated only when the reducer names THIS candidate, else unknown', () => {
   const head = 'c'.repeat(40);
-  const integrated = M2.boardCard(ITEM({ candidate: head, integration: { [head]: true } }), { nowMs: NOW, incidents: [] });
+  const integrated = M2.boardCard(ITEM({ candidate: head, integration: { [head]: true } }), { nowMs: NOW, incidents: [], trustworthy: true });
   assert.equal(integrated.merge, 'integrated');
-  const notIntegrated = M2.boardCard(ITEM({ candidate: head, integration: { [head]: false } }), { nowMs: NOW, incidents: [] });
+  const notIntegrated = M2.boardCard(ITEM({ candidate: head, integration: { [head]: false } }), { nowMs: NOW, incidents: [], trustworthy: true });
   assert.equal(notIntegrated.merge, 'not_integrated');
-  const unknownNoCandidate = M2.boardCard(ITEM({ candidate: null, integration: {} }), { nowMs: NOW, incidents: [] });
+  const unknownNoCandidate = M2.boardCard(ITEM({ candidate: null, integration: {} }), { nowMs: NOW, incidents: [], trustworthy: true });
   assert.equal(unknownNoCandidate.merge, 'unknown');
-  const unknownUnrelatedIntegration = M2.boardCard(ITEM({ candidate: head, integration: { ['d'.repeat(40)]: true } }), { nowMs: NOW, incidents: [] });
+  const unknownUnrelatedIntegration = M2.boardCard(ITEM({ candidate: head, integration: { ['d'.repeat(40)]: true } }), { nowMs: NOW, incidents: [], trustworthy: true });
   assert.equal(unknownUnrelatedIntegration.merge, 'unknown');
 });
 
 test('boardCard: findings and cost are ALWAYS explicitly unknown in v1 - never guessed from Markdown', () => {
-  const card = M2.boardCard(ITEM({}), { nowMs: NOW, incidents: [] });
+  const card = M2.boardCard(ITEM({}), { nowMs: NOW, incidents: [], trustworthy: true });
   assert.deepEqual(card.findings, { count: null, status: 'unavailable' });
   assert.equal(card.cost, null);
 });
 
 test('boardCard: ages are approximate seconds from the feed timestamps, null (Unknown) when absent', () => {
-  const card = M2.boardCard(ITEM({ firstDispatchAgo: 600, lastWorkEventAgo: 30 }), { nowMs: NOW, incidents: [] });
+  const card = M2.boardCard(ITEM({ firstDispatchAgo: 600, lastWorkEventAgo: 30 }), { nowMs: NOW, incidents: [], trustworthy: true });
   assert.equal(card.firstDispatchAgeSeconds, 600);
   assert.equal(card.lastWorkEventAgeSeconds, 30);
-  const unknownAges = M2.boardCard(ITEM({ firstDispatchAgo: null, lastWorkEventAgo: null }), { nowMs: NOW, incidents: [] });
+  const unknownAges = M2.boardCard(ITEM({ firstDispatchAgo: null, lastWorkEventAgo: null }), { nowMs: NOW, incidents: [], trustworthy: true });
   assert.equal(unknownAges.firstDispatchAgeSeconds, null);
   assert.equal(unknownAges.lastWorkEventAgeSeconds, null);
 });
 
 test('boardCard: the needs-you overlay changes the shown column but keeps the underlying placement', () => {
   const incidents = [INCIDENT({ workItem: 'gate-b', workCycle: '1' })];
-  const card = M2.boardCard(ITEM({ workItem: 'gate-b', cycle: 1, workflowColumn: 'building' }), { nowMs: NOW, incidents: incidents });
+  const card = M2.boardCard(ITEM({ workItem: 'gate-b', cycle: 1, workflowColumn: 'building' }), { nowMs: NOW, incidents: incidents, trustworthy: true });
   assert.equal(card.needsYou, true);
   assert.equal(card.column, 'needs_you');
   assert.equal(card.underlyingColumn, 'building', 'row 1: overlay on top, placement kept underneath');
@@ -149,21 +149,21 @@ test('boardCard: the needs-you overlay changes the shown column but keeps the un
 
 test('boardCard: an incident for a DIFFERENT cycle of the same item never overlays this card - no stuck mapping', () => {
   const incidents = [INCIDENT({ workItem: 'gate-b', workCycle: '2' })];
-  const card = M2.boardCard(ITEM({ workItem: 'gate-b', cycle: 1 }), { nowMs: NOW, incidents: incidents });
+  const card = M2.boardCard(ITEM({ workItem: 'gate-b', cycle: 1 }), { nowMs: NOW, incidents: incidents, trustworthy: true });
   assert.equal(card.needsYou, false);
   assert.equal(card.column, card.underlyingColumn);
 });
 
 test('boardCard: an unlinked incident (no validated work_item) never sprays a warning onto any card', () => {
   const incidents = [INCIDENT({ workItem: null, workCycle: null, linked: false })];
-  const card = M2.boardCard(ITEM({ workItem: 'gate-b', cycle: 1 }), { nowMs: NOW, incidents: incidents });
+  const card = M2.boardCard(ITEM({ workItem: 'gate-b', cycle: 1 }), { nowMs: NOW, incidents: incidents, trustworthy: true });
   assert.equal(card.needsYou, false);
 });
 
 test('boardCard: malformed/garbage item input never throws', () => {
-  assert.doesNotThrow(() => M2.boardCard(null, { nowMs: NOW, incidents: [] }));
-  assert.doesNotThrow(() => M2.boardCard({}, { nowMs: NOW, incidents: [] }));
-  assert.doesNotThrow(() => M2.boardCard({ obligations: 'nope', evidence: 42, verdicts: 'x' }, { nowMs: NOW, incidents: [] }));
+  assert.doesNotThrow(() => M2.boardCard(null, { nowMs: NOW, incidents: [], trustworthy: true }));
+  assert.doesNotThrow(() => M2.boardCard({}, { nowMs: NOW, incidents: [], trustworthy: true }));
+  assert.doesNotThrow(() => M2.boardCard({ obligations: 'nope', evidence: 42, verdicts: 'x' }, { nowMs: NOW, incidents: [], trustworthy: true }));
 });
 
 // --------------------------------------------------------------------------------- boardSummary
@@ -209,6 +209,126 @@ test('boardSummary: garbage/missing feed input never throws', () => {
   assert.doesNotThrow(() => M2.boardSummary(null, { nowMs: NOW, incidents: [] }));
   assert.doesNotThrow(() => M2.boardSummary(undefined, {}));
   assert.doesNotThrow(() => M2.boardSummary({ items: 'nope', legacy: 1, coverage: 'x' }, { nowMs: NOW }));
+});
+
+// A real-shaped /api/work-board feed (work_board_feed.py's own top-level keys).
+function FEED(o = {}) {
+  return {
+    schema_version: 1, target_root_project_id: 'proj-a',
+    generated_at: o.generatedAgo === undefined ? iso(2) : iso(o.generatedAgo),
+    coverage: o.coverage === undefined ? { status: 'complete', valid_until: iso(-15) } : o.coverage,
+    items: o.items === undefined ? [ITEM({ workItem: 'gate-b', workflowColumn: 'ready', reason: 'reviewed; independent GO; local checks not tracked' })] : o.items,
+    legacy: { open_request_count: 0, known_lower_bound: 0 }, unassigned: { count: 0 },
+    total_count: o.totalCount === undefined ? 1 : o.totalCount,
+    truncated: o.truncated === true, omitted_count: o.omittedCount === undefined ? 0 : o.omittedCount,
+    errors: o.errors === undefined ? [] : o.errors, window_days: 7,
+    ...(o.lastKnown ? { last_known: true } : {}),
+  };
+}
+
+// ------------------------------------------------------------------------ F1: freshness governs truth
+
+test('F1: a complete, unexpired feed is trustworthy - cards show their live column/reason/checks', () => {
+  const feed = FEED({ coverage: { status: 'complete', valid_until: iso(-15) } });   // valid_until 15s in the future
+  const summary = M2.boardSummary(feed, { nowMs: NOW, incidents: [] });
+  assert.equal(summary.trustworthy, true);
+  assert.equal(summary.cards[0].stale, false);
+});
+
+test('F1: server-marked last_known=true demotes every card to stale, even with healthy coverage.status', () => {
+  const feed = FEED({ coverage: { status: 'complete', valid_until: iso(-15) }, lastKnown: true });
+  const summary = M2.boardSummary(feed, { nowMs: NOW, incidents: [] });
+  assert.equal(summary.trustworthy, false);
+  assert.equal(summary.lastKnown, true);
+  assert.equal(summary.cards[0].stale, true, 'a last-known READY item must never render as live Ready');
+});
+
+test('F1: degraded coverage.status (stale/building/unavailable/capacity_exceeded) demotes every card', () => {
+  for (const status of ['stale', 'building', 'unavailable', 'capacity_exceeded']) {
+    const summary = M2.boardSummary(FEED({ coverage: { status, valid_until: iso(-15) } }), { nowMs: NOW, incidents: [] });
+    assert.equal(summary.trustworthy, false, status);
+    assert.equal(summary.cards[0].stale, true, status);
+  }
+});
+
+test('F1: a complete response whose coverage.valid_until has ELAPSED is no longer trustworthy, with no new payload at all', () => {
+  // The reviewer's own clock probe: valid_until = T+15s, then nowMs advances to T+30s with the
+  // SAME (otherwise unchanged) snapshot object - this must flip from fresh to stale on its own.
+  const feed = FEED({ coverage: { status: 'complete', valid_until: iso(15) } });   // valid_until 15s in the PAST of "now"
+  const fresh = M2.boardSummary(feed, { nowMs: NOW - 30000, incidents: [] });      // evaluated before expiry
+  assert.equal(fresh.trustworthy, true);
+  const expired = M2.boardSummary(feed, { nowMs: NOW, incidents: [] });           // the exact same feed object, later
+  assert.equal(expired.trustworthy, false);
+  assert.equal(expired.cards[0].stale, true);
+});
+
+test('F1: missing/malformed valid_until on an otherwise-complete feed is treated as already expired (fail closed)', () => {
+  const summary = M2.boardSummary(FEED({ coverage: { status: 'complete' } }), { nowMs: NOW, incidents: [] });
+  assert.equal(summary.trustworthy, false);
+});
+
+// ------------------------------------------------------------------ F2: a failed read keeps cards
+
+test('F2: readFailed retains and demotes the cards from the LAST GOOD payload, never blanks them', () => {
+  const feed = FEED({ coverage: { status: 'complete', valid_until: iso(-15) } });
+  const summary = M2.boardSummary(feed, { nowMs: NOW, incidents: [], readFailed: true });
+  assert.equal(summary.trustworthy, false);
+  assert.equal(summary.readFailed, true);
+  assert.equal(summary.cards.length, 1, 'the retained card is still projected, not discarded');
+  assert.equal(summary.cards[0].stale, true);
+});
+
+// --------------------------------------------------------- F3: shared deferral/presentation state
+
+test('F3: an incident\'s presentation (open/deferred/answered) comes from the caller\'s shared stream state', () => {
+  const incidents = [INCIDENT({ escalationId: 'esc-a', workItem: 'gate-b', workCycle: '1' })];
+  const deferred = M2.boardCard(ITEM({ workItem: 'gate-b', cycle: 1 }), {
+    nowMs: NOW, incidents, trustworthy: true, incidentPresentation: { 'esc-a': 'deferred' },
+  });
+  assert.equal(deferred.incidents[0].presentation, 'deferred');
+  assert.equal(deferred.needsYou, true, 'deferring never changes the placement (section 6)');
+  assert.equal(deferred.column, 'needs_you', 'the overlay is preserved - only its presentation is qualified');
+
+  const open = M2.boardCard(ITEM({ workItem: 'gate-b', cycle: 1 }), {
+    nowMs: NOW, incidents, trustworthy: true, incidentPresentation: {},
+  });
+  assert.equal(open.incidents[0].presentation, 'open', 'no presentation recorded for this id defaults to open');
+});
+
+test('F3: two incidents on one item are inspectable separately, each with its own presentation', () => {
+  const incidents = [
+    INCIDENT({ escalationId: 'esc-a', workItem: 'gate-b', workCycle: '1' }),
+    INCIDENT({ escalationId: 'esc-b', workItem: 'gate-b', workCycle: '1' }),
+  ];
+  const card = M2.boardCard(ITEM({ workItem: 'gate-b', cycle: 1 }), {
+    nowMs: NOW, incidents, trustworthy: true, incidentPresentation: { 'esc-a': 'deferred', 'esc-b': 'answered' },
+  });
+  assert.equal(card.incidents.length, 2);
+  assert.equal(card.incidents.find((i) => i.escalationId === 'esc-a').presentation, 'deferred');
+  assert.equal(card.incidents.find((i) => i.escalationId === 'esc-b').presentation, 'answered');
+});
+
+// ------------------------------------------------------------------------- F5: honest empty claims
+
+test('F5: knownEmpty is true only for a complete, non-truncated, trustworthy, genuinely empty board', () => {
+  const empty = M2.boardSummary(FEED({ items: [], totalCount: 0 }), { nowMs: NOW, incidents: [] });
+  assert.equal(empty.knownEmpty, true);
+});
+
+test('F5: an overflow that omits the only item is never claimed as "no work items"', () => {
+  const overflowed = M2.boardSummary(
+    FEED({ items: [], totalCount: 1, truncated: true, omittedCount: 1 }), { nowMs: NOW, incidents: [] },
+  );
+  assert.equal(overflowed.cards.length, 0);
+  assert.equal(overflowed.knownEmpty, false, 'truncation, not emptiness, explains the zero cards');
+  assert.equal(overflowed.truncated, true);
+});
+
+test('F5: building/stale/unavailable coverage with no items is never claimed as "no work items" either', () => {
+  for (const status of ['building', 'stale', 'unavailable', 'capacity_exceeded']) {
+    const summary = M2.boardSummary(FEED({ items: [], totalCount: null, coverage: { status } }), { nowMs: NOW, incidents: [] });
+    assert.equal(summary.knownEmpty, false, status);
+  }
 });
 
 run();

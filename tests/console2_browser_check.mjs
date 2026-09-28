@@ -119,6 +119,7 @@ const KEYS = {
   Escape: { code: 'Escape', keyCode: 27, key: 'Escape' },
   '?': { code: 'Slash', keyCode: 191, key: '?', shift: true },
   j: { code: 'KeyJ', keyCode: 74, key: 'j' },
+  ' ': { code: 'Space', keyCode: 32, key: ' ' },
 };
 
 async function pressKey(name, opts = {}) {
@@ -152,6 +153,11 @@ try {
   await send('Runtime.enable');
   await send('Log.enable');
   await send('Page.enable');
+  // B8/F6: a headless target starts backgrounded (document.hidden/visibilityState report hidden)
+  // unless explicitly brought to the front - activating it here makes the page-visibility checks
+  // below exercise the SAME "visible" branch a real, focused browser tab would.
+  await json('/json/activate/' + page.id).catch(() => {});
+  try { await send('Page.setWebLifecycleState', { state: 'active' }); } catch (e) { /* older targets lack this */ }
   await send('Page.navigate', { url: pageUrl });
   await sleep(3500);                                   // first poll, feeds, first draw
 
@@ -321,7 +327,10 @@ try {
   for (let i = 0; i < 100; i++) {
     const n = await evaluate("document.querySelectorAll('.c2-board-card').length");
     if (n >= 2) break;
-    if (i === 99) throw new Error('board cards never rendered');
+    if (i === 99) {
+      throw new Error('board cards never rendered; board.textContent='
+        + await evaluate('document.getElementById("c2-board").textContent'));
+    }
     await sleep(150);
   }
   out.boardShellSwapped = await evaluate(
@@ -362,6 +371,25 @@ try {
   await pressKey('Escape');
   out.boardSelectionClearedByEscape = await evaluate(
     "document.querySelectorAll('.c2-board-card.is-selected').length === 0",
+  );
+
+  // F4: a card is `role="button" tabindex="0"` on a plain <article> - a real <button> gets
+  // automatic Enter/Space activation from the browser itself; an ARIA role alone gets NONE, so
+  // this must be wired up by the page's own key handler or native input on a focused, unselected
+  // card silently does nothing (dev-4's own finding). Focus is set directly (simulating whatever
+  // got it there - Tab order, not just j/k) to isolate activation from selection-and-focus-together.
+  await evaluate("(() => { document.querySelector('.c2-board-card').focus(); return true; })()");
+  await pressKey('Enter');
+  out.boardEnterActivatesFocusedCard = await evaluate(
+    "document.querySelector('.c2-board-card').className.indexOf('is-selected') >= 0",
+  );
+  await pressKey('Escape');
+  await evaluate(
+    "(() => { const c = [...document.querySelectorAll('.c2-board-card')][1]; c.focus(); return true; })()",
+  );
+  await pressKey(' ');
+  out.boardSpaceActivatesFocusedCard = await evaluate(
+    "[...document.querySelectorAll('.c2-board-card')][1].className.indexOf('is-selected') >= 0",
   );
 
   out.problems = problems;

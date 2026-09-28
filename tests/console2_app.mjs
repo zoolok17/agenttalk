@@ -25,6 +25,12 @@ export function server(o = {}) {
     roots: o.roots || (() => [root({ project_id: 'proj-a', agents: busyAgents(), recent: busyRecent(), operator_facing: LEAD })]),
     attention: o.attention || (() => ({ target_root_project_id: 'proj-a', items: [] })),
     chat: o.chat || (() => ({ target_root_project_id: 'proj-a', available: true, lead: LEAD, messages: [] })),
+    board: o.board || (() => ({
+      schema_version: 1, target_root_project_id: 'proj-a', generated_at: s.generated(),
+      coverage: { status: 'complete', valid_until: new Date(NOW + clock.perf + 15000).toISOString() },
+      items: [], legacy: { open_request_count: 0, known_lower_bound: 0 }, unassigned: { count: 0 },
+      total_count: 0, truncated: false, omitted_count: 0, errors: [], window_days: 7,
+    })),
     down: false,
     pendingState: false,   // /api/state never answers
     inits: [],             // the init object of every request, in order
@@ -39,6 +45,7 @@ export function server(o = {}) {
       if (u.pathname === '/api/state') payload = { schema_version: 1, generated_at: s.generated(), roots: s.roots() };
       else if (u.pathname === '/api/attention') payload = s.attention(id);
       else if (u.pathname === '/api/lead-chat') payload = s.chat(id);
+      else if (u.pathname === '/api/work-board') payload = s.board(id);
       else return jsonResponse({}, 404);
       if (payload && payload.__pending) return new Promise(() => {});                       // never settles
       if (payload && payload.__jsonHang) return Promise.resolve({ ok: true, status: 200, json: () => new Promise(() => {}) });
@@ -58,6 +65,9 @@ export async function boot(srv, opts = {}) {
 
 export const stream = (dom) => dom.document.getElementById('c2-stream');
 export const rail = (dom) => dom.document.getElementById('c2-rail');
+export const board = (dom) => dom.document.getElementById('c2-board');
+export const boardDetail = (dom) => dom.document.getElementById('c2-board-detail');
+export const boardCadence = (ms) => ms === 5000;
 export const all = (node) => texts(node).join(' | ');
 export const app = (dom) => dom.document.getElementById('app');
 export const header = (dom) => dom.document.getElementById('c2-header');

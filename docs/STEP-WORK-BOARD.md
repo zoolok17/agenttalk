@@ -118,6 +118,92 @@ No scripted demo: open `/v2` on the operator's own live root, then:
    board's scroll position survive normal polling the whole time, and that
    Escape/`#conversation` return cleanly with `?root=` unchanged.
 
+### Fix round (PR #221 cold read, codex reviewer-1)
+
+Seven findings (F1 major/release-blocking, F2-F7 minor), all reproduced by the reviewer with
+app/clock probes and native-browser key events.
+
+- **F1 (major):** board freshness never governed card truth. A `last_known`/degraded-coverage
+  response still rendered a live green READY card with its ordinary reason, and a COMPLETE
+  response's own `coverage.valid_until` was never read at all - a snapshot could sit unchanged
+  while real time passed it, with no redraw ever re-evaluating it. Fixed with one feed-level
+  `trustworthy` fact (`boardSummary`, console2-board-model.js): false on a failed read, a
+  server-marked `last_known` response, non-`complete` coverage, or an elapsed `valid_until`
+  (missing/malformed `valid_until` fails closed, already expired). Every card carries `stale:
+  !trustworthy`; the renderer shows a dim "LAST KNOWN · ..." badge and a coverage/as-of
+  timestamp in the detail panel instead of the live tone. `trustworthy` was also missing from
+  `renderAll`'s `boardSig` - a wholly unchanged snapshot could never trigger a redraw as its own
+  `valid_until` elapsed; now included, so the 1 s `paint()` tick (already running regardless of
+  feed activity) is what actually demotes a stale card with no new poll needed.
+- **F2 (minor):** a failed `/api/work-board` GET discarded the visible last-known cards and the
+  selected card's detail, even though `boardFailed` already retained the payload. `buildBoard`/
+  `buildBoardDetail` now share one `boardViewFor` resolver: a retained payload is always
+  projected (via the SAME `trustworthy` fact, forced false on `readFailed`), never blanked; only
+  a payload that was NEVER successfully read at all shows "Board could not be read."
+- **F3 (minor):** Later/Wait deferral and per-incident evidence disappeared at the board
+  boundary - the model received only incident IDENTITY, not the stream's shared presentation
+  state, and the renderer never drew `card.incidents` or `underlyingColumn` at all. Fixed:
+  `incidentPresentationMap` (console2.js) reads the SAME `view.needs.open`/`deferredCards`/
+  `answered` the stream already computed, keyed by escalation id; `boardCard` stamps each
+  incident's `presentation` from it. The NEEDS YOU badge gains a "· DEFERRED"/"·
+  ANSWERED" qualifier once none of its incidents are still open (placement itself never moves -
+  section 6), the card meta shows `underlying: <COLUMN>` whenever overlaid, and the detail panel
+  gets its own INCIDENTS section listing each escalation id, link state and presentation
+  separately - two incidents on one item are now inspectable independently.
+- **F4 (minor, accessibility):** a focused card (`role="button" tabindex="0"` on a plain
+  `<article>`) had no Enter/Space activation - the browser gives that only to a real `<button>`,
+  never to an ARIA role by itself. Fixed with an explicit board-mode Enter/Space handler
+  (`activateFocusedBoardCard`) reading the focused element's own `data-c2-card` key.
+- **F5 (minor):** an overflow that omitted the board's only item, or a building/degraded read
+  with no items yet, rendered the SAME "No active or recently done work items." claim as a
+  genuinely empty board, immediately followed by the contradicting truncation note. Fixed with
+  `boardSummary`'s `knownEmpty` (true only for complete, non-truncated, trustworthy, zero cards);
+  anything else says "No cards can currently be shown." instead.
+- **F6 (minor, contract-drift):** the board GET rode the stream's unconditional 2 s cadence with
+  no `document.hidden` guard. Fixed with `boardLoop`, a fully separate 5 s cadence that skips the
+  GET (but keeps rescheduling) while hidden, and stops rescheduling entirely once the board is no
+  longer the visible route (conversation-only sessions now carry no board timer at all);
+  `onHashChange`/`onVisibilityChange` (re)start it exactly when the board becomes relevant again.
+  A startup-race side-effect surfaced while fixing this (not one of the reviewer's findings): a
+  fresh load landing straight on `#board` could see `boardLoop`'s very first, synchronous call
+  find `/api/state` not yet resolved, give up, and not retry for the full 5 s - fixed with a
+  short 200 ms retry specifically for that "no roots yet" case.
+- **F7 (test-gap):** `console2_board_model.test.mjs` was never added to
+  `test_console2_web.py`'s `test_console2_node_tests` parametrize list, so CI never actually ran
+  it. Added.
+
+A second environment-only discovery, unrelated to the review but found while adding F4's/F6's
+browser coverage: a headless Edge/Chromium target launched via DevTools starts backgrounded
+(`document.hidden`/`visibilityState` report hidden) unless explicitly activated, which would have
+made F6's own "pause while hidden" fix look identical to a permanently-stuck board under the
+existing browser-check harness. Fixed in `console2_browser_check.mjs` itself (`/json/activate/<id>`
+plus `Page.setWebLifecycleState`), not in production code - a real, focused browser tab does not
+start hidden.
+
+Failing-first evidence: node stash-testing (production files reverted, tests kept) showed
+`console2_board_model.test.mjs` failing 11 of 27 cases (F1/F2/F3/F5) and `console2_board_app.test.mjs`
+failing 5 of 8 (F1/F5/F6) against the pre-fix code; the real-browser check failed outright (`board
+cards never rendered`) before the headless-activation fix, then failed F4's two new assertions
+specifically once rendering was restored, before the Enter/Space handler existed.
+
+Final verification (foreground, worktree `src` on PYTHONPATH, chunked):
+
+- `tests/console2_board_model.test.mjs`: **27/27 passed** (16 prior + 11 new: F1 trustworthy/
+  expiry/fail-closed, F2 retained-and-demoted, F3 presentation/two-incidents, F5 knownEmpty).
+- New `tests/console2_board_app.test.mjs` (console2.js driven through the real VM harness, a real
+  fetch mock and real timers - extended `console2_harness.mjs`/`console2_app.mjs` with `c2-board`/
+  `c2-board-detail` stub regions, a settable `document.hidden`, and an `/api/work-board` mock):
+  **8/8 passed** (F1 x3, F2, F5 x2, F6 x2).
+- Full node regression (unchanged): `console2_model` 17/17, `console2_render` 31/31,
+  `console2_stream` 59/59, `console2_data` 48/48, `console2_view` 95/95, `console2_needs_you`
+  18/18.
+- `tests/test_console2_web.py`: **71 passed, 2 skipped** (F7's registration; one transient
+  Windows socket abort on a full-file run reproduced as a pass in isolation - a local runner
+  flake, not a regression).
+- `tests/test_console2_browser.py`: **3 passed** (real Edge, not skipped on this runner) -
+  extended with F4's native Enter/Space activation checks on a Tab-focused-equivalent card.
+- No Python production code touched in this round; no full suite run.
+
 ## B7 — shared needs-you projection and incident identity
 
 Branch `feat/work-board-b7` from `origin/master` at the recorded console v2

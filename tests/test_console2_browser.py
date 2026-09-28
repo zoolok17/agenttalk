@@ -311,6 +311,10 @@ def test_thread_scroll_and_focus_survive_redraws_in_a_real_browser(page) -> None
     assert out["boardFocusKept"] is True, out
     # Escape clears the board selection
     assert out["boardSelectionClearedByEscape"] is True, out
+    # F4: native Enter and Space (real CDP key events, not synthetic DOM ones) activate whichever
+    # board card actually holds focus - a role="button" article gets none of this for free
+    assert out["boardEnterActivatesFocusedCard"] is True, out
+    assert out["boardSpaceActivatesFocusedCard"] is True, out
     # the page raised no exception and the console CSP blocked nothing
     assert out["problems"] == [], out["problems"]
 
