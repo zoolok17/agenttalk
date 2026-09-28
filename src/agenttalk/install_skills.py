@@ -19,10 +19,7 @@ This module copies them out on demand.
 from __future__ import annotations
 
 import filecmp
-import hashlib
-import os
 import shutil
-import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -76,75 +73,31 @@ class InstallResult:
 @dataclass
 class RetiredSkillAction:
     path: Path
-    # "removed"       — byte-identical to the last-shipped version, deleted
-    # "would-remove"  — dry-run: would have deleted (byte-identical)
-    # "warn-modified" — present, does NOT match the last-shipped bytes; left
-    #                   alone (never destroy a file that might be modified)
-    # "warn-linked"   — a path component between the install root and the
-    #                   file is a symlink/junction/reparse point; left alone
-    #                   even if the bytes match (content identity does not
-    #                   prove this is an installer-owned copy safe to delete)
+    # "warn" — a retired skill is still installed at this path. Reported
+    #          only; install-skills never deletes it.
     status: str
-    linked_at: Path | None = None
 
 
 # Skills retired from the bundled tree. Deleting the SOURCE does not remove
 # an already-installed copy (fresh-install pairs only enumerate surviving
 # sources), so on every install-skills run we separately check each retired
-# skill's install DESTINATION: byte-identical to the last-shipped content
-# means it was never modified, so it is safe to delete; anything else is
-# left alone with a warning naming the exact path. This is deliberately a
-# single hardcoded table, not a general uninstall framework.
+# skill's install DESTINATION and warn if it is still present, naming the
+# exact path and the manual migration recipe. This is deliberately a single
+# hardcoded table, not a general uninstall framework, and it is
+# warning-only by design: an earlier revision of this feature attempted an
+# automatic byte-identical delete, but "byte-identical" has no
+# cross-platform-safe definition (the same shipped content hashes
+# differently between a CRLF checkout and an LF checkout), and the delete
+# path could not be made safe against a hash-to-unlink race or a linked
+# directory component swapped in between the check and the delete. Warning
+# and leaving removal to the operator sidesteps all of that.
 _RETIRED_SKILLS: tuple[dict, ...] = (
     {
         "name": "agenttalk.sk-loop.md",
         "claude_rel": "agenttalk.sk-loop.md",
         "codex_rel": "agenttalk-sk-loop/SKILL.md",
-        "claude_sha256": "4e65e65fd189cb662dce755c5342165b9a4347e166f11e968e61e107f3b6ffef",
-        "codex_sha256": "8b7b6f990d1cb1247b0d5f79c82aa5ba05dbfed55f4a69408455770050d219f8",
     },
 )
-
-
-def _sha256(path: Path) -> str | None:
-    try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
-    except OSError:
-        return None
-
-
-def _is_link_like(path: Path) -> bool:
-    """True if `path` ITSELF (not what it resolves to) is a symlink, a
-    Windows junction, or carries any other reparse point. Uses an
-    un-followed stat (lstat) so it never resolves through a link to judge
-    the link by its target's properties."""
-    try:
-        st = os.lstat(path)
-    except OSError:
-        return False
-    if stat.S_ISLNK(st.st_mode):
-        return True
-    # Windows junctions (dir "mount points") are reparse points but are
-    # NOT reported by S_ISLNK on every Python build; st_file_attributes
-    # (Windows-only os.stat_result field) catches those and any other
-    # reparse-point tag directly.
-    attrs = getattr(st, "st_file_attributes", None)
-    return attrs is not None and bool(attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT)
-
-
-def _linked_component(root: Path, rel: str) -> Path | None:
-    """Walk `root / rel` component by component; return the first path
-    (strictly beneath `root`) that is itself a symlink/junction/reparse
-    point, or None if every component down to the file is a plain
-    directory/file. A regular file (e.g. SKILL.md) sitting beneath a
-    linked PARENT directory is still caught, because the parent
-    directory component is checked on the way down."""
-    current = root
-    for part in Path(rel).parts:
-        current = current / part
-        if _is_link_like(current):
-            return current
-    return None
 
 
 def check_retired_skills(
@@ -153,45 +106,24 @@ def check_retired_skills(
     codex: bool,
     claude_dir: Path,
     codex_dir: Path,
-    dry_run: bool,
 ) -> list[RetiredSkillAction]:
     """Detect retired-skill leftovers at install destinations.
 
-    Only acts on a destination that still exists. Before hashing or
-    deleting anything, every path component between the configured
-    install root and the file is checked for being a symlink/junction/
-    reparse point — matching bytes through a link only proves the
-    content is familiar, never that this is an installer-owned copy safe
-    to delete, so a linked component always wins over a byte match and is
-    reported ``warn-linked`` without ever being hashed or touched.
-    Otherwise, a byte-identical match against the last-shipped content is
-    deleted (or reported as ``would-remove`` under ``--dry-run``);
-    anything else — including a file this table doesn't know how to
-    verify — is reported as ``warn-modified`` and never touched.
+    Warning-only: a retired skill still present at its install
+    destination is reported, naming the exact path, and never touched.
+    A fresh install (nothing there) and ``--dry-run`` report identically,
+    since neither path ever deletes anything.
     """
     out: list[RetiredSkillAction] = []
     for retired in _RETIRED_SKILLS:
-        candidates: list[tuple[Path, str, str]] = []
+        candidates: list[Path] = []
         if claude:
-            candidates.append((claude_dir, retired["claude_rel"], retired["claude_sha256"]))
+            candidates.append(claude_dir / retired["claude_rel"])
         if codex:
-            candidates.append((codex_dir, retired["codex_rel"], retired["codex_sha256"]))
-        for root, rel, expected_sha256 in candidates:
-            dst = root / rel
-            if not dst.exists():
-                continue
-            linked = _linked_component(root, rel)
-            if linked is not None:
-                out.append(RetiredSkillAction(path=dst, status="warn-linked", linked_at=linked))
-                continue
-            if _sha256(dst) == expected_sha256:
-                if dry_run:
-                    out.append(RetiredSkillAction(path=dst, status="would-remove"))
-                else:
-                    dst.unlink()
-                    out.append(RetiredSkillAction(path=dst, status="removed"))
-            else:
-                out.append(RetiredSkillAction(path=dst, status="warn-modified"))
+            candidates.append(codex_dir / retired["codex_rel"])
+        for dst in candidates:
+            if dst.exists():
+                out.append(RetiredSkillAction(path=dst, status="warn"))
     return out
 
 
@@ -295,7 +227,6 @@ def install(
             codex=codex,
             claude_dir=claude_dir,
             codex_dir=codex_dir,
-            dry_run=dry_run,
         )
 
     return result
