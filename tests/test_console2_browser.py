@@ -64,8 +64,18 @@ def _browser_launch_flags(system: str) -> list[str]:
     /dev/shm) the SAME flags the Windows leg used let the browser process fail to start at
     all, with no sandbox or shared-memory workaround. macOS needs neither: it is not
     containerized and Chrome's normal sandbox works there in CI the same as anywhere else.
+
+    Fix for PR #221 (N4 follow-up): a headless target with no real OS window can still
+    "occlude" itself and drift `document.hidden`/`visibilityState` back to backgrounded mid-run
+    (observed even after an explicit `/json/activate` - console2_browser_check.mjs re-asserts it
+    before the board section for exactly this reason), which stalls the board's OWN F6 hidden-tab
+    pause indefinitely. These two flags are Chromium's own documented switches for headless/CI
+    testing to disable that occlusion-based throttling at the source.
     """
-    common = ["--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check"]
+    common = [
+        "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+        "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding",
+    ]
     if system == "Linux":
         return common + ["--no-sandbox", "--disable-dev-shm-usage"]
     return common
@@ -78,10 +88,12 @@ def test_browser_launch_flags_are_correct_per_platform() -> None:
     linux = _browser_launch_flags("Linux")
     assert "--no-sandbox" in linux and "--disable-dev-shm-usage" in linux
     assert "--headless=new" in linux and "--disable-gpu" in linux
+    assert "--disable-backgrounding-occluded-windows" in linux and "--disable-renderer-backgrounding" in linux
     for other_system in ("Darwin", "Windows"):
         flags = _browser_launch_flags(other_system)
         assert "--no-sandbox" not in flags and "--disable-dev-shm-usage" not in flags
         assert "--headless=new" in flags and "--disable-gpu" in flags
+        assert "--disable-backgrounding-occluded-windows" in flags and "--disable-renderer-backgrounding" in flags
 
 
 BROWSER = _find_browser()
@@ -315,6 +327,11 @@ def test_thread_scroll_and_focus_survive_redraws_in_a_real_browser(page) -> None
     # board card actually holds focus - a role="button" article gets none of this for free
     assert out["boardEnterActivatesFocusedCard"] is True, out
     assert out["boardSpaceActivatesFocusedCard"] is True, out
+    # N2 (PR #221 delta round 2): the board's own Enter/Space handler must consume a key ONLY when
+    # it actually handled a board card - a focused Conversation link or help button, both real
+    # server-rendered/page-built controls unrelated to any card, keep their own native activation
+    assert out["n2ConversationLinkNavigatesOnEnter"] is True, out
+    assert out["n2HelpButtonStillOpensOnEnter"] is True, out
     # the page raised no exception and the console CSP blocked nothing
     assert out["problems"] == [], out["problems"]
 

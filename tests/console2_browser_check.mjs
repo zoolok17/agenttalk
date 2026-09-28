@@ -64,6 +64,15 @@ async function json(path) {
   throw new Error(`browser did not start within the retry budget; stderr:\n${childStderr}`);
 }
 
+// A ONE-SHOT DevTools HTTP action (never a "wait for the endpoint to come up" read like json()
+// above): brings `id` to the front. The endpoint replies text/plain, not JSON - reading it as text
+// and surfacing any real failure is the whole N4 fix (never silently retried, never swallowed).
+async function activateTarget(id) {
+  const r = await fetch(`http://127.0.0.1:${PORT}/json/activate/${id}`);
+  const body = await r.text();
+  if (!r.ok) throw new Error(`could not activate the browser target: http ${r.status} ${body}`);
+}
+
 let seq = 0;
 const pending = new Map();
 const problems = [];
@@ -90,24 +99,53 @@ async function evaluate(expression) {
 // correctly-refused precondition failure, not flakiness to paper over with a longer constant.
 // This polls for the actual observed change instead, bounded so a real stall still fails fast and
 // with a clear reason - never silently drops through and lets a stale reading pass as if it moved.
+// A headless target can drift document.hidden/visibilityState back to backgrounded after enough
+// real time with no INPUT event reaching it (observed even with the anti-occlusion launch flags
+// and an explicit one-time activation): the stream's OWN F1/F2 waits happen right after a long
+// run of real pressKey() calls and so are never exposed to this for long, but a purely passive
+// poll loop like this one - exactly what the board's redraw wait is - can sit idle long enough to
+// trip it, silently starving F6's OWN correct "pause while hidden" of the visibility it needs.
+// keepAliveTargetId (module-scoped, set once `page` is known) is re-activated every iteration -
+// a single local DevTools HTTP GET, cheap even at up to ~120 calls over a full 30s timeout.
+let keepAliveTargetId = null;
+
 async function waitForTextChange(selector, previousText, { timeoutMs = 30000, intervalMs = 250 } = {}) {
   const start = Date.now();
   for (;;) {
+    if (keepAliveTargetId !== null) await activateTarget(keepAliveTargetId).catch(() => {});
     const current = await evaluate(
       `(() => { const a = document.querySelector('${selector}'); return a ? a.textContent : null; })()`,
     );
     if (current !== previousText) return { changed: true, elapsedMs: Date.now() - start, text: current };
     const elapsedMs = Date.now() - start;
     if (elapsedMs >= timeoutMs) {
+      const hidden = await evaluate('document.hidden');
       throw new Error(
         `no redraw observed in ${(elapsedMs / 1000).toFixed(1)}s `
-        + `(the watched label text stayed "${previousText}", selector "${selector}")`);
+        + `(the watched label text stayed "${previousText}", selector "${selector}", docHidden=${hidden})`);
     }
     await sleep(intervalMs);
   }
 }
 
 function waitForAgeChange(previousText, opts) { return waitForTextChange(WATCHED_AGE_SELECTOR, previousText, opts); }
+
+// macOS CI follow-up (N4 side-effect): a watched age already at hour/day granularity when a
+// redraw wait is about to START cannot be relied on to change again within waitForTextChange's own
+// 30s budget (fmtAge only advances "Nh" once a further 60 simulated minutes have passed, which at
+// this fixture's 60x acceleration is another 60 REAL seconds). Wasted real time before this point -
+// N4's ~30s of redundant activation retries being the exact case that tripped this on CI - could
+// push the fixture's accelerated age past that boundary before either redraw check even started.
+// Assert the starting granularity up front and fail clearly, rather than let the wait time out
+// with a confusing "stayed the same" message that does not explain WHY it could never have moved.
+function assertFineGrainedAge(text, pattern, label) {
+  const m = pattern.exec(text);
+  if (!m) throw new Error(`${label}: could not find its own age token in "${text}"`);
+  if (m[1] === 'h' || m[1] === 'd') {
+    throw new Error(`${label} is already at hour/day granularity ("${m[0]}" in "${text}") before the `
+      + 'redraw wait started - it cannot be relied on to change again within the wait budget');
+  }
+}
 
 // R1/R2: a synthetic `document.dispatchEvent(new KeyboardEvent(...))` only ever fires JS listeners -
 // it never triggers the browser's OWN default actions (Tab moving focus, Enter activating a focused
@@ -137,6 +175,7 @@ try {
   await json('/json/version');
   const targets = await json('/json/list');
   const page = targets.find((t) => t.type === 'page');
+  keepAliveTargetId = page.id;
   ws = new WebSocket(page.webSocketDebuggerUrl);
   await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = reject; });
   ws.onmessage = (ev) => {
@@ -156,9 +195,22 @@ try {
   // B8/F6: a headless target starts backgrounded (document.hidden/visibilityState report hidden)
   // unless explicitly brought to the front - activating it here makes the page-visibility checks
   // below exercise the SAME "visible" branch a real, focused browser tab would.
-  await json('/json/activate/' + page.id).catch(() => {});
-  try { await send('Page.setWebLifecycleState', { state: 'active' }); } catch (e) { /* older targets lack this */ }
+  //
+  // N4 (PR #221 delta): /json/activate/<id> is a ONE-SHOT action, not a "wait for the DevTools
+  // endpoint to come up" read - it replies text/plain ("Target activated"), never JSON. The
+  // original code reused `json()` (built for polling /json/version|/json/list, which genuinely
+  // are not up yet right after spawning the process) for this too; every read attempt failed the
+  // JSON parse, was swallowed as "not up yet", and retried 200 times at 150ms - about 30 wasted
+  // seconds on every browser scenario - while also hiding a genuine activation failure behind the
+  // same swallowed catch. A single plain GET, and an explicit post-navigate visibility check that
+  // FAILS CLEARLY rather than silently proceeding, replaces it.
+  await activateTarget(page.id);
+  try { await send('Page.setWebLifecycleState', { state: 'active' }); } catch (e) { /* older targets lack this; activateTarget above is the primary mechanism */ }
   await send('Page.navigate', { url: pageUrl });
+  const stillHidden = await evaluate('document.hidden');
+  if (stillHidden) {
+    throw new Error('target activation did not make the page visible (document.hidden is still true)');
+  }
   await sleep(3500);                                   // first poll, feeds, first draw
 
   const out = {};
@@ -287,6 +339,7 @@ try {
     ${sabotageScrollScript}
     return document.querySelector('${WATCHED_AGE_SELECTOR}').textContent;
   })()`);
+  assertFineGrainedAge(ageAtScroll, /\d+([smhd])$/, 'the watched stream card\'s age (F1 scroll baseline)');
   out.firstRedrawWaitMs = (await waitForAgeChange(ageAtScroll)).elapsedMs;
   out.afterRedraw = await measure();
   out.threadKept = await evaluate('window.__thread === document.querySelector(".c2-thread") && window.__thread.isConnected');
@@ -305,6 +358,7 @@ try {
     b.focus();
     return document.querySelector('${WATCHED_AGE_SELECTOR}').textContent;
   })()`);
+  assertFineGrainedAge(ageBefore, /\d+([smhd])$/, 'the watched stream card\'s age (F2 focus baseline)');
   const secondRedrawWait = await waitForAgeChange(ageBefore);
   out.secondRedrawWaitMs = secondRedrawWait.elapsedMs;
   out.ageMoved = secondRedrawWait.changed;
@@ -322,6 +376,15 @@ try {
   // recedes every read (the same 60x-accelerated `grown` counter as /api/attention above), so the
   // watched card's own meta line changes text on every ordinary redraw - the same proof technique
   // as F1/F2 above, applied to the board instead of the stream.
+  //
+  // The board specifically needs real visibility (F6's own hidden-tab pause is exactly what would
+  // otherwise stall it forever): a headless target has been observed drifting back to backgrounded
+  // after enough prior CDP interaction (overlay/keyboard steps above), so re-assert activation
+  // right here rather than trust the very first one (top of this script) to still hold this far in.
+  await activateTarget(page.id);
+  if (await evaluate('document.hidden')) {
+    throw new Error('the page went hidden again before the board section; target activation did not hold');
+  }
   const BOARD_META_SELECTOR = '[data-c2-card="board|board-a"] .c2-board-card-meta';
   await evaluate("location.hash = '#board'");
   for (let i = 0; i < 100; i++) {
@@ -329,7 +392,9 @@ try {
     if (n >= 2) break;
     if (i === 99) {
       throw new Error('board cards never rendered; board.textContent='
-        + await evaluate('document.getElementById("c2-board").textContent'));
+        + await evaluate('document.getElementById("c2-board").textContent')
+        + ' docHidden=' + await evaluate('document.hidden')
+        + ' route=' + await evaluate('location.hash'));
     }
     await sleep(150);
   }
@@ -359,6 +424,7 @@ try {
     window.__boardEl.scrollTop = 40;
     return document.querySelector('${BOARD_META_SELECTOR}').textContent;
   })()`);
+  assertFineGrainedAge(metaAtScroll, /active \d+([smhd]) ago/, 'the watched board card\'s "active" age (scroll baseline)');
   await waitForTextChange(BOARD_META_SELECTOR, metaAtScroll);
   out.boardScrollKept = await evaluate('window.__boardEl.scrollTop') === 40;
   out.boardContainerKept = await evaluate('window.__boardEl === document.getElementById("c2-board") && window.__boardEl.isConnected');
@@ -391,6 +457,26 @@ try {
   out.boardSpaceActivatesFocusedCard = await evaluate(
     "[...document.querySelectorAll('.c2-board-card')][1].className.indexOf('is-selected') >= 0",
   );
+
+  // N2 (PR #221 delta round 2): still on #board, a native Enter on the (real, server-rendered)
+  // Conversation link must actually navigate there - the board's own Enter/Space handler must
+  // never suppress a key it did not itself handle, whatever else is focused on this route.
+  await evaluate(
+    "(() => { const a = document.querySelector('[data-c2-route=\"conversation\"]'); a.focus();"
+    + ' return document.activeElement === a; })()',
+  );
+  await pressKey('Enter');
+  await sleep(200);
+  out.n2ConversationLinkNavigatesOnEnter = await evaluate("location.hash === '#conversation'");
+  // Back to #board for a clean end state, and confirm the help button's native Enter still works too.
+  await evaluate("location.hash = '#board'");
+  await sleep(200);
+  await evaluate("(() => { document.querySelector('.c2-keybtn').focus(); return true; })()");
+  await pressKey('Enter');
+  out.n2HelpButtonStillOpensOnEnter = await evaluate(
+    "document.getElementById('c2-keymap').className.indexOf('is-open') >= 0",
+  );
+  await pressKey('Escape');
 
   out.problems = problems;
   process.stdout.write(JSON.stringify(out));

@@ -204,6 +204,77 @@ Final verification (foreground, worktree `src` on PYTHONPATH, chunked):
   extended with F4's native Enter/Space activation checks on a Tab-focused-equivalent card.
 - No Python production code touched in this round; no full suite run.
 
+### Fix round 2 (PR #221 delta read, codex reviewer-1) - N1-N4 and a macOS CI failure
+
+The delta read of `9318fee` confirmed F1-F7 all closed, but found two production regressions the
+fixes themselves introduced (N1, N2) and two test/harness issues (N3, N4), all minor. CI also
+failed on macos/3.10 and macos/3.13 in the real-browser test, both a `waitForTextChange` timeout
+that the lead correctly diagnosed as a consequence of N4.
+
+- **N1 (minor, perf/correctness):** `boardLoop`'s `done()` cleared `boardPolling` (protecting only
+  against a CONCURRENT fetch) and then scheduled an UNTRACKED `setTimeout` - a visibilitychange or
+  a rapid `#conversation`<->`#board` round-trip could start a fresh call while the earlier
+  timeout was still queued, and both eventually rescheduled their own next tick independently.
+  Reviewer-1 measured one chain becoming four after three hide/show cycles. Fixed with one owned
+  `boardTimer` handle: every entry into `boardLoop` (its own tick firing, or an external caller)
+  first cancels whatever is currently pending, so scheduling and an active request are the SAME
+  chain, never several independently-multiplying ones. `onHashChange`/`onVisibilityChange` now
+  call `boardLoop()` itself (which restarts the chain idempotently) rather than a bare one-off
+  `fetchBoard()`.
+- **N2 (minor, correctness/accessibility):** the F4 activation handler called `stop(ev)`
+  (`preventDefault`) for every board-route Enter/Space BEFORE checking whether the target was
+  actually a board card - a focused theme button, the Conversation link or the help button lost
+  their own native activation entirely. Fixed by making `activateFocusedBoardCard` report whether
+  it actually handled the target (`true`/`false`); the key is consumed only when it did.
+- **N3 (test-gap):** `console2_board_app.test.mjs` was written to say it runs under
+  `test_console2_web.py`'s node runner, but was never added to that parametrize list, so its own
+  eight regression cases (including N1/N2's own tests, added this round) never ran there. Added.
+- **N4 (test/perf):** `/json/activate/<id>` is a one-shot DevTools HTTP action that replies
+  `text/plain` ("Target activated"), never JSON; the F1-round activation fix reused `json()`
+  (built for polling `/json/version`/`/json/list`, which genuinely are not up yet right after
+  spawning the browser), so every read failed the JSON parse, was swallowed as "not up yet", and
+  retried 200 times at 150ms - about 30 wasted seconds on every browser scenario, and a genuine
+  activation failure would have been hidden the same way. Fixed with `activateTarget`, a single
+  plain GET that reads the response as text and throws on a real HTTP failure.
+- **macOS CI (`waitForTextChange` timeout, both legs):** confirmed as N4's direct consequence -
+  the ~30s of wasted retries let the fixture's 60x-accelerated ages cross into hour granularity
+  (`fmtAge` only advances "Nh" every further 60 REAL seconds at that acceleration) before either
+  redraw check even started, so neither watched label could tick within the 30s wait budget. N4's
+  fix removes the wasted time; additionally, both waits now assert their own starting granularity
+  up front (`assertFineGrainedAge`) and fail with a direct, explained message instead of a
+  confusing "stayed the same" timeout if a slow runner ever crosses that boundary again anyway.
+  A second, unrelated environment issue surfaced while chasing this on the actual real-browser
+  session (not one of reviewer-1's findings): a headless target can drift `document.hidden`/
+  `visibilityState` back to backgrounded mid-run even after an explicit one-time activation,
+  apparently after enough real time passes with no CDP `Input.*` event reaching it (the stream's
+  own redraw waits are shielded by the preceding run of real `pressKey()` calls; the board's
+  purely-passive wait was not). Fixed two ways: `_browser_launch_flags` gained Chromium's own
+  `--disable-backgrounding-occluded-windows`/`--disable-renderer-backgrounding` switches (its own
+  pinning test updated to match), and `waitForTextChange` itself now re-activates the target on
+  every poll iteration (a single cheap local HTTP GET) rather than trusting one activation to hold
+  for the rest of a long passive wait.
+
+Failing-first evidence: `console2_board_app.test.mjs`'s new N1 test (direct pending-timer count)
+showed **6** owned board timers after five hide/show and route round-trip cycles against the
+pre-fix code (expected 1); its new N2 test showed `preventDefault` incorrectly called for a
+focused theme button. Both pass against the fix. The real-browser check failed with the exact
+macOS-reported timeout shape before the granularity fix, then stalled on the board's own redraw
+wait specifically (traced to the mid-run visibility drift) before the keep-alive fix.
+
+Final verification (foreground, worktree `src` on PYTHONPATH, chunked):
+
+- `tests/console2_board_app.test.mjs`: **10/10 passed** (8 prior + 2 new: N1 owned-timer-count
+  across hide/show and hash round-trips, N2 theme/help-button native-key non-suppression plus the
+  positive board-card-activation case).
+- Full node regression (unchanged): `console2_model` 17/17, `console2_render` 31/31,
+  `console2_stream` 59/59, `console2_data` 48/48, `console2_view` 95/95, `console2_needs_you`
+  18/18, `console2_board_model` 27/27.
+- `tests/test_console2_web.py`: **72 passed, 2 skipped** (N3's registration).
+- `tests/test_console2_browser.py`: **3 passed**, wall time **~21s** (down from ~93s before this
+  round's fixes - N4 alone removed ~30s of wasted activation retries per scenario; the keep-alive
+  and launch-flag fixes removed the board-specific visibility-drift stall on top of that).
+- No Python production code touched in this round.
+
 ## B7 — shared needs-you projection and incident identity
 
 Branch `feat/work-board-b7` from `origin/master` at the recorded console v2

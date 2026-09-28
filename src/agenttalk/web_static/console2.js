@@ -1524,13 +1524,26 @@
   // usage (the common case) must never carry a perpetual background timer for a view no one is
   // looking at. Leaving #board (or never having entered it) lets the chain go idle; onHashChange
   // and onVisibilityChange are what start it again, exactly when it becomes relevant.
+  // N1 (PR #221 delta): boardTimer is the ONE owned handle for the next scheduled tick - every
+  // entry into boardLoop (its own timer firing, OR an external caller like onHashChange/
+  // onVisibilityChange asking to run right now) first cancels whatever is currently pending, so
+  // scheduling and an active request are one chain, never two-or-more independently multiplying
+  // ones. `boardPolling` alone (the previous fix) only ever protected against a concurrent FETCH;
+  // it did nothing to stop an untracked setTimeout from a PRIOR call still firing later and
+  // starting its own second chain.
+  var boardTimer = null;
+
   function boardLoop() {
-    if (boardPolling) return;
+    if (boardTimer !== null) { clearTimeout(boardTimer); boardTimer = null; }
+    if (boardPolling) return;   // a fetch is already in flight; its OWN done() below will reschedule
     boardPolling = true;
     var onBoard = boardEnabled && currentRoute().mode === 'board';
     function done(delayMs) {
       boardPolling = false;
-      if (onBoard) setTimeout(boardLoop, typeof delayMs === 'number' ? delayMs : BOARD_POLL_MS);
+      if (onBoard) {
+        boardTimer = setTimeout(function () { boardTimer = null; boardLoop(); },
+          typeof delayMs === 'number' ? delayMs : BOARD_POLL_MS);
+      }
     }
     if (!onBoard || pageHidden()) { done(); return; }
     var roots = currentRoots();
@@ -1657,11 +1670,15 @@
   // F4: activation is tied to whichever card is ACTUALLY focused (native Tab order, not only
   // j/k's own selection), by reading its own data-c2-card key straight off the event target -
   // exactly what a real <button> would give for free, reproduced here for this ARIA one.
+  // Returns true only when `target` really is a board card (and so was actually activated) - the
+  // caller uses this to decide whether to consume the key at all (N2: an unrelated focused control
+  // must keep its own native Enter/Space).
   function activateFocusedBoardCard(target) {
-    if (!target || typeof target.getAttribute !== 'function') return;
+    if (!target || typeof target.getAttribute !== 'function') return false;
     var full = target.getAttribute('data-c2-card');
-    if (typeof full !== 'string' || full.indexOf('board|') !== 0) return;
+    if (typeof full !== 'string' || full.indexOf('board|') !== 0) return false;
     selectBoardCard(full.slice('board|'.length));
+    return true;
   }
 
   function onKey(ev) {
@@ -1682,9 +1699,11 @@
       // F4: a card is `role="button" tabindex="0"` on a plain <article> - a browser gives ONLY a
       // real <button> automatic Enter/Space activation, never an ARIA role by itself, so a card
       // reached by Tab (not just j/k) must be wired up here or it can never be activated at all.
+      // N2 (PR #221 delta): the event is consumed ONLY when the target actually IS a board card -
+      // a focused theme button, the Conversation link or the help button must keep their own
+      // native Enter/Space activation on this same route, never silently swallowed.
       if (ev.key === 'Enter' || ev.key === ' ' || ev.key === 'Spacebar') {
-        stop(ev);
-        activateFocusedBoardCard(ev.target);
+        if (activateFocusedBoardCard(ev.target)) stop(ev);
         return;
       }
       if (ev.key === 'Escape') { if (boardNav.selectedKey !== null) { boardNav.selectedKey = null; renderAll(); } return; }

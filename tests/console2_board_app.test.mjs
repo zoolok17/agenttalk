@@ -7,13 +7,23 @@
 process.env.TZ = 'UTC';
 
 import assert from 'node:assert/strict';
-import { createRunner } from './console2_harness.mjs';
+import { createRunner, walk } from './console2_harness.mjs';
 import { NOW, agent, root } from './console2_fixtures.mjs';
 import {
-  LEAD, all, board, boardCadence, boardDetail, server, under, boot,
+  LEAD, all, board, boardCadence, boardDetail, header, server, under, boot,
 } from './console2_app.mjs';
 
-const { test, run } = createRunner('console2 board app (F1/F2/F3/F5/F6)');
+const { test, run } = createRunner('console2 board app (F1/F2/F3/F5/F6/N1/N2)');
+
+// Dispatches a native-shaped keydown and reports whether the handler called preventDefault - N2's
+// own bug was calling it unconditionally for Enter/Space on #board, suppressing whatever native
+// activation an UNRELATED focused control (a theme button, a link) would otherwise have received.
+function dispatchKey(dom, k, target) {
+  const ev = { key: k, target: target || { tagName: 'BODY' }, prevented: false };
+  ev.preventDefault = () => { ev.prevented = true; };
+  dom.document.dispatch('keydown', ev);
+  return ev;
+}
 const iso = (msFromNow) => new Date(NOW + msFromNow).toISOString();
 
 // A real-shaped /api/work-board item.
@@ -147,6 +157,83 @@ test('F6: polling pauses while the document is hidden, and resumes immediately o
   await fire(under);
   assert.equal(srv.calls.filter((u) => u.startsWith('/api/work-board')).length, before + 1,
     'regaining visibility fetches right away, not after waiting out the rest of the 5s cadence');
+});
+
+// ------------------------------------------------------------------------------------------- N1
+
+test('N1: repeated hide/show and #conversation<->#board round-trips never multiply the board\'s polling chain', async () => {
+  const srv = server({ roots: oneRoot, board: () => BOARD_FEED() });
+  const { dom, fire, timers, sandbox, windowEvents } = await boot(srv, { hash: '#board' });
+  await fire(under);   // the initial board load settles (startup-race retry + a stream tick)
+
+  function navigateHash(hash) {
+    sandbox.location.hash = hash;
+    (windowEvents.hashchange || []).forEach((fn) => fn());
+  }
+  function pendingBoardTimers() { return timers.filter((t) => boardCadence(t.ms)).length; }
+
+  assert.equal(pendingBoardTimers(), 1, 'one owned chain right after the initial load');
+
+  // Three hide/show cycles - reviewer-1's own repro ("one normal board timer became four after
+  // three hide/show cycles"). `fire(under)` never touches a 5s-tagged timer, so if the bug were
+  // present, each cycle's untracked reschedule would sit here accumulating, un-fired, unnoticed
+  // until something eventually fired them - exactly the failure mode reviewer-1 found.
+  for (let i = 0; i < 3; i++) {
+    dom.document.hidden = true;
+    dom.document.dispatch('visibilitychange', {});
+    await fire(under);
+    dom.document.hidden = false;
+    dom.document.dispatch('visibilitychange', {});
+    await fire(under);
+  }
+  // Two rapid #conversation -> #board round-trips too (the review names both triggers).
+  for (let i = 0; i < 2; i++) {
+    navigateHash('#conversation');
+    await fire(under);
+    navigateHash('#board');
+    await fire(under);
+  }
+
+  assert.equal(pendingBoardTimers(), 1,
+    'still exactly one owned chain after repeated hide/show and route round-trips, never several');
+
+  // And firing that one tick produces exactly one GET, with staggered completions between
+  // repeated ticks never compounding into more than one owned chain at a time.
+  const before = srv.calls.filter((u) => u.startsWith('/api/work-board')).length;
+  await fire(boardCadence);
+  assert.equal(srv.calls.filter((u) => u.startsWith('/api/work-board')).length, before + 1);
+  assert.equal(pendingBoardTimers(), 1, 'exactly one chain survives afterward too');
+});
+
+// ------------------------------------------------------------------------------------------- N2
+
+test('N2: native Enter/Space on #board only activates a board card - an unrelated focused control (theme, help) keeps its own default', async () => {
+  const srv = server({ roots: oneRoot, board: () => BOARD_FEED() });
+  const { dom, fire } = await boot(srv, { hash: '#board' });
+  await fire(under);
+
+  const paperButton = walk(header(dom)).find((n) => n.tagName === 'BUTTON' && n.textContent === 'Paper');
+  assert.ok(paperButton, 'the Paper theme button exists in the header');
+  const evEnter = dispatchKey(dom, 'Enter', paperButton);
+  assert.equal(evEnter.prevented, false, 'Enter on the theme button must keep its own native activation');
+  // console2.js's own click handler is what actually changes the theme on a real click; a native
+  // Enter on an ALREADY-FOCUSED real <button> fires that same click natively in a real browser -
+  // what matters here, in this synthetic-event harness, is only that the key handler never
+  // intercepted/suppressed it via preventDefault, which is exactly what N2's bug did.
+  const evSpace = dispatchKey(dom, ' ', paperButton);
+  assert.equal(evSpace.prevented, false, 'Space on the theme button must keep its own native activation');
+
+  const helpButton = walk(header(dom)).find((n) => n.className === 'c2-keybtn');
+  assert.ok(helpButton, 'the help (?) button exists in the header');
+  const evHelp = dispatchKey(dom, 'Enter', helpButton);
+  assert.equal(evHelp.prevented, false, 'Enter on the help button must keep its own native activation');
+
+  // The positive case still works: a real board card IS consumed and activated. A selected card
+  // is a DIFFERENT shape (className changes), so syncChildren replaces the node - re-query after
+  // dispatch rather than reusing the pre-render reference, which would now be a detached, stale node.
+  const evCard = dispatchKey(dom, 'Enter', board(dom).children[0]);
+  assert.equal(evCard.prevented, true, 'Enter on an actual board card is still consumed');
+  assert.ok(board(dom).children[0].className.indexOf('is-selected') >= 0, 'and still selects the card');
 });
 
 run();
