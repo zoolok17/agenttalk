@@ -103,11 +103,7 @@ def validate_replacement(meta, sender, messages, authorities):
     rid = meta.get("request_id")
     if not rid or rid == target or any(m.meta.get("request_id") == rid for m in messages):
         raise ValueError("replacement requires a fresh request ID; self-links/cycles are invalid")
-    original = _opener(messages, target)[0]
-    if not meta.get("work_item") or meta["work_item"] != original.meta.get("work_item"):
-        raise ValueError("supersedes must name the same work item")
-    if value("work_cycle", meta.get("work_cycle", "1")) != value("work_cycle", original.meta.get("work_cycle", "1")):
-        raise ValueError("supersedes must name the same work cycle")
+    original = replacement_target(meta, messages)
     if sender not in {original.sender, *authorities}:
         raise ValueError("replacement requires original dispatch authority or current lead/liaison")
     if any(m.kind in OPENERS and m.meta.get("supersedes") == target for m in messages):
@@ -115,8 +111,29 @@ def validate_replacement(meta, sender, messages, authorities):
     return original
 
 
+def replacement_target(meta, messages):
+    """The original a replacement names, when item and cycle agree (structure only; the board audit
+    replays this over history, where freshness and lead authority cannot be reconstructed)."""
+    original = _opener(messages, meta.get("supersedes"))[0]
+    if not meta.get("work_item") or meta["work_item"] != original.meta.get("work_item"):
+        raise ValueError("supersedes must name the same work item")
+    if value("work_cycle", meta.get("work_cycle", "1")) != value("work_cycle", original.meta.get("work_cycle", "1")):
+        raise ValueError("supersedes must name the same work cycle")
+    return original
+
+
 def _external_opener(store, sender, kind, meta):
-    if kind not in OPENERS or sender != store.sole_lead() or meta.get("stage") not in REVIEWS:
+    if sender != store.sole_lead():
+        raise ValueError("external deliverable requires a lead-issued review dispatch")
+    external_declaration(kind, meta)
+
+
+def external_declaration(kind, meta):
+    """Structural requirements of an external declaration; the board audit replays them over history.
+
+    Lead authority is checked only at publication (_external_opener): past roles are not recorded.
+    """
+    if kind not in OPENERS or meta.get("stage") not in REVIEWS:
         raise ValueError("external deliverable requires a lead-issued review dispatch")
     for key in ("work_item", "work_head", "work_repo", "work_branch", "work_target"):
         if not isinstance(meta.get(key), str) or not meta[key].strip() or len(meta[key]) > 256:
@@ -136,6 +153,77 @@ def _external_opener(store, sender, kind, meta):
         raise ValueError("empty checks require a bounded no_gates_reason; nonempty checks forbid it")
 
 
+REVIEW_PAIRS = frozenset({("approved", "GO"), ("rejected", "FIX"), ("rejected", "HOLD"), ("needs-info", "HOLD")})
+INHERITED = ("work_item", "stage", "work_cycle", "work_round", "work_head", "external_deliverable")
+
+
+# Publication invariants shared with the board's read-side audit (work_board), so history is judged by the
+# same rules modern publication enforces.
+def inherit_dispatch(original_meta, meta):
+    """Replacement dispatch metadata carrying its original's external declaration and repository/check policy."""
+    result = dict(meta)
+    expected_external = value("external_deliverable", original_meta.get("external_deliverable", False))
+    if result.get("external_deliverable", expected_external) != expected_external:
+        raise ValueError("replacement external_deliverable contradicts original declaration")
+    if "external_deliverable" in original_meta:
+        result["external_deliverable"] = expected_external
+    for key in ("work_repo", "work_branch", "work_target", "required_gates", "no_gates_reason"):
+        if key in original_meta:
+            if key in result and result[key] != original_meta[key]:
+                raise ValueError(f"replacement {key} contradicts original dispatch policy")
+            result[key] = original_meta[key]
+    return result
+
+
+def reply_request(meta, anchor):
+    """Request a reply answers; LookupError for a named but absent anchor, ValueError for a disagreeing one."""
+    rid = meta.get("request_id")
+    if not rid and anchor is not None:
+        rid = anchor.meta.get("request_id")
+    if meta.get("in_reply_to") and anchor is None:
+        raise LookupError("missing required correlation history")
+    if anchor is not None and anchor.meta.get("request_id") != rid:
+        raise ValueError("reply request_id contradicts its in_reply_to anchor")
+    return rid
+
+
+def reply_opener(matches, sender, recipient, kind):
+    """The fan-out copy a work reply answers; ValueError when participants or kinds contradict it."""
+    opener = next((m for m in matches if m.recipient == sender), None)
+    if opener is None or opener.sender != recipient or opener.kind != REPLIES[kind]:
+        raise ValueError("work reply participant, kind or correlation contradicts opener")
+    return opener
+
+
+def inherit(opener_meta, meta):
+    """Reply metadata with the opener's normalized tags; ValueError when the reply contradicts them."""
+    result = dict(meta)
+    for key in INHERITED:
+        expected = opener_meta.get(key, {"work_cycle": "1", "external_deliverable": False}.get(key))
+        if expected is not None:
+            expected = value(key, expected)
+        # Builders can report their output; a review must remain on its pinned OID.
+        if key == "work_head" and opener_meta.get("stage") in {"design", "build", "fix"} and key in result:
+            continue
+        if key in result and result[key] != expected:
+            raise ValueError(f"reply {key} contradicts opener")
+        if key in opener_meta:
+            result[key] = expected
+    return result
+
+
+def reply_verdict(kind, stage, status, raw):
+    """Canonical verdict or its issue; ValueError when a native review's status contradicts its verdict."""
+    allowed = {"go": "GO", "fix": "FIX", "hold": "HOLD"} if stage in REVIEWS else (
+        {"done": "done"} if stage in STAGES else {})
+    canonical = allowed.get(raw.casefold()) if isinstance(raw, str) else None
+    if canonical is None:
+        return None, "verdict missing" if raw is None else "unrecognized verdict"
+    if kind == "review-result" and (status, canonical) not in REVIEW_PAIRS:
+        raise ValueError("review status and verdict must agree")
+    return canonical, None
+
+
 def normalize(store, sender, recipient, kind, meta):
     reject_vendor_override(meta)
     result = dict(meta)
@@ -150,16 +238,7 @@ def normalize(store, sender, recipient, kind, meta):
         original = validate_replacement(
             result, sender, store.valid_messages(), (store.sole_lead(), store.operator_facing()),
         )
-        expected_external = value("external_deliverable", original.meta.get("external_deliverable", False))
-        if result.get("external_deliverable", expected_external) != expected_external:
-            raise ValueError("replacement external_deliverable contradicts original declaration")
-        if "external_deliverable" in original.meta:
-            result["external_deliverable"] = expected_external
-        for key in ("work_repo", "work_branch", "work_target", "required_gates", "no_gates_reason"):
-            if key in original.meta:
-                if key in result and result[key] != original.meta[key]:
-                    raise ValueError(f"replacement {key} contradicts original dispatch policy")
-                result[key] = original.meta[key]
+        result = inherit_dispatch(original.meta, result)
     if result.get("external_deliverable") is True and kind not in REPLIES:
         _external_opener(store, sender, kind, result)
     if kind not in REPLIES:
@@ -173,34 +252,16 @@ def normalize(store, sender, recipient, kind, meta):
     if not any("work_item" in m.meta for m in candidates) and not any(k in result for k in FIELDS):
         return result  # Untagged legacy protocol is unchanged.
     matches = _opener(messages, rid)
-    opener = next((m for m in matches if m.recipient == sender), None)
-    if (opener is None or opener.sender != recipient or opener.kind != REPLIES[kind]
-            or (result.get("in_reply_to") and anchor is None)
-            or (anchor is not None and anchor.meta.get("request_id") != rid)):
-        raise ValueError("work reply participant, kind or correlation contradicts opener")
-    for key in ("work_item", "stage", "work_cycle", "work_round", "work_head", "external_deliverable"):
-        expected = opener.meta.get(key, {"work_cycle": "1", "external_deliverable": False}.get(key))
-        if expected is not None:
-            expected = value(key, expected)
-        # Builders can report their output; a review must remain on its pinned OID.
-        if key == "work_head" and opener.meta.get("stage") in {"design", "build", "fix"} and key in result:
-            continue
-        if key in result and result[key] != expected:
-            raise ValueError(f"reply {key} contradicts opener")
-        if key in opener.meta:
-            result[key] = expected
+    try:
+        reply_request(result, anchor)
+        opener = reply_opener(matches, sender, recipient, kind)
+    except (LookupError, ValueError):
+        raise ValueError("work reply participant, kind or correlation contradicts opener") from None
+    result = inherit(opener.meta, result)
     result.pop("verdict_issue", None)
-    verdict = result.get("verdict")
-    review = result.get("stage") in REVIEWS
-    allowed = {"go": "GO", "fix": "FIX", "hold": "HOLD"} if review else (
-        {"done": "done"} if result.get("stage") in STAGES else {})
-    canonical = allowed.get(verdict.casefold()) if isinstance(verdict, str) else None
+    canonical, issue = reply_verdict(kind, result.get("stage"), result.get("status"), result.get("verdict"))
     if canonical is None:
-        result["verdict_issue"] = "verdict missing" if verdict is None else "unrecognized verdict"
+        result["verdict_issue"] = issue
     else:
         result["verdict"] = canonical
-        if kind == "review-result" and (result.get("status"), canonical) not in {
-            ("approved", "GO"), ("rejected", "FIX"), ("rejected", "HOLD"), ("needs-info", "HOLD")
-        }:
-            raise ValueError("review status and verdict must agree")
     return result
