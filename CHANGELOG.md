@@ -11,6 +11,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Console v2 preview at `/v2` (pitch slice, step M1).** A second, read-only
+  document route beside the classic `/dashboard`: shell, theme engine (Midnight
+  styled; Paper, Synthwave and Terminal carry their variables), header with team
+  chips, and the agent-name shortener (`claude-agenttalk-frontend-dev` shows as
+  `fe-dev`). It serves three new allowlisted assets (`console2.css`,
+  `console2-model.js`, `console2.js`) under the unchanged console
+  Content-Security-Policy: system fonts, no inline style or script, bus content
+  only through `textContent`. The classic console gains a "New console" link and
+  `agenttalk dashboard` prints the `/v2` URL; `/` and `/dashboard` are unchanged.
+  The preview polls the existing feeds (`/api/state`, `/api/attention`,
+  `/api/lead-chat`, GET only) and derives, with node-tested pure functions,
+  the greeting, the needs-you queue with evidence, stuck-vs-busy with the
+  heartbeat/progress/last-message fallback, the roster with a "down" state,
+  usage windows per runtime, and two separate offline banners ("can't reach the
+  console server" vs "no agent has reported for over 5 minutes"). Keyboard focus
+  stays put in the header and `?root=` selects the team (an unknown one is
+  stated, never replaced). Plan and open items: `docs/STEP-CONSOLE-V2-PITCH.md`.
+
+- **Health reads that are too old now say what they last reported.** A
+  snapshot older than the TTL, or older than the heartbeat by more than the
+  skew, still reads `state: unknown` with every existing field unchanged, and
+  additionally carries `last_known_state`, `last_known_since`,
+  `last_known_updated_at` and (when present) `last_known_progress_at`. Nothing
+  else changes for status, doctor, the supervisor or the classic console; the
+  v2 console uses the fields to tell a wedged silent turn from a healthy one.
+
 - Add the pure work-board reducer: validated envelopes become work items placed by
   the design's precedence rows from explicit correlation only, with a counted legacy
   group. No bodies, subjects or message-ID order are used; unknown is never green.

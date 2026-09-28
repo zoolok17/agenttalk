@@ -1,0 +1,1123 @@
+// Console v2 view-model tests (M2): the pure derivations in console2-model.js.
+// Run: node tests/console2_view.test.mjs   (also run by tests/test_console2_web.py)
+import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+import { createRunner } from './console2_harness.mjs';
+import {
+  ATT_ITEM, CONN_OK, NOW, agent, attention, busyAgents, busyRecent, capacity, chat, env, epochIn, iso, root, staleAgent,
+} from './console2_fixtures.mjs';
+
+// Loaded as a CommonJS module in this realm (the model is pure), so returned arrays and
+// objects compare with deepEqual without crossing a vm boundary.
+const M = createRequire(import.meta.url)('../src/agenttalk/web_static/console2-model.js');
+const { test, run } = createRunner('console2 view model');
+const TZ = 'utc';
+const P = ['agenttalk'];
+
+function ctx(o = {}) {
+  return { nowMs: NOW, generatedMs: NOW, recent: [], teamIds: [], project: 'agenttalk', known: P, tz: TZ, ...o };
+}
+const view = (a, o) => M.agentView(a, ctx(o));
+const NAME = 'codex-agenttalk-developer-6';
+const sil = (o) => agent(NAME, { state: 'working_silent', ...o });
+// The bus window covers everything since the agent woke: fewer than 25 envelopes.
+const WINDOW = [env('claude-agenttalk-lead', 'operator', 'message', 5)];
+
+// ------------------------------------------------------------------ formatting
+
+test('fmtAge: seconds, minutes, hours, days', () => {
+  const got = [0, 40, 59, 60, 840, 3599, 3600, 18000, 86399, 86400, 172800].map(M.fmtAge);
+  assert.deepEqual(got, ['0s', '40s', '59s', '1m', '14m', '59m', '1h', '5h', '23h', '1d', '2d']);
+  assert.equal(M.fmtAge(-5), '0s');
+});
+
+test('fmtAgeLong: banners read 3h 12m, not 3h', () => {
+  assert.deepEqual([40, 840, 3 * 3600 + 12 * 60, 3600, 2 * 86400 + 4 * 3600].map(M.fmtAgeLong),
+    ['40s', '14m', '3h 12m', '1h 0m', '2d 4h']);
+});
+
+test('clockHM, whenLabel and resetLabel in a fixed zone', () => {
+  const t = Date.UTC(2026, 8, 26, 18, 22);
+  assert.equal(M.clockHM(t, TZ), '18:22');
+  assert.equal(M.whenLabel(t, NOW, TZ), '18:22', 'later today is a bare clock time');
+  assert.equal(M.whenLabel(Date.UTC(2026, 8, 25, 22, 10), NOW, TZ), 'yesterday 22:10');
+  assert.equal(M.whenLabel(Date.UTC(2026, 8, 22, 9, 5), NOW, TZ), 'Tue 09:05');
+  assert.equal(M.resetLabel(Date.UTC(2026, 8, 26, 23, 40), NOW, TZ), '23:40');
+  assert.equal(M.resetLabel(Date.UTC(2026, 8, 28, 3, 0), NOW, TZ), 'Mon 03:00');
+});
+
+test('ageSeconds: ISO and epoch input, never negative, null when unparseable', () => {
+  assert.equal(M.ageSeconds(iso(90), NOW), 90);
+  assert.equal(M.ageSeconds(NOW - 5000, NOW), 5);
+  assert.equal(M.ageSeconds(iso(-30), NOW), 0, 'a future time reads as now');
+  for (const bad of [null, undefined, '', 'yesterday', {}, NaN]) assert.equal(M.ageSeconds(bad, NOW), null, String(bad));
+});
+
+// ---------------------------------------------------------------- roster rows
+
+test('idle agent: grey, resting, with how long', () => {
+  const v = view(agent('claude-agenttalk-frontend-dev', { state: 'idle_waiting', since: 2400 }));
+  assert.deepEqual([v.state, v.tone, v.line], ['idle', 'dim', 'Idle \u00b7 40m']);
+  assert.equal(v.short, 'fe-dev');
+  assert.equal(v.title, 'claude-agenttalk-frontend-dev');
+});
+
+test('working turn shows the task and how long; a long turn is never stuck', () => {
+  const v = view(agent('claude-agenttalk-developer-2', { state: 'working_turn', since: 180, task: 'Implementing WP-15' }));
+  assert.deepEqual([v.state, v.tone, v.line], ['working', 'ok', 'Working \u00b7 Implementing WP-15 \u00b7 3m']);
+  const long = view(agent('claude-agenttalk-developer-2', { state: 'working_turn', since: 7200 }), { recent: WINDOW });
+  assert.equal(long.state, 'working');
+  assert.equal(long.stuck, null);
+});
+
+test('busy: silent but progress is recent -> no card, listed as also happening', () => {
+  const v = view(sil({ since: 1200, progress: 120 }), { recent: [env(NAME, 'claude-agenttalk-lead', 'message', 360)] });
+  assert.equal(v.state, 'busy');
+  assert.equal(v.stuck, null);
+  assert.equal(v.candidate, false);
+  assert.equal(v.line, 'Quiet \u00b7 last progress 2m ago \u00b7 no message for 6m');
+  assert.equal(v.aside.title, 'dev-6 is quiet, not stuck');
+  assert.equal(v.aside.detail, 'Last progress 2m ago \u00b7 no message for 6m \u00b7 no card while progress moves');
+});
+
+test('stuck: 14 min without progress, no reply, fresh heartbeat -> a card with the fallback evidence', () => {
+  const v = view(sil({ since: 1800, progress: 840 }), { recent: WINDOW });
+  assert.equal(v.state, 'stuck');
+  assert.equal(v.tone, 'warn');
+  assert.equal(v.stuck.evidence, 'Last progress 14m ago \u00b7 no reply sent \u00b7 heartbeat still fresh');
+  assert.equal(v.stuck.progressAge, 840);
+  assert.equal(v.aside, null);
+});
+
+test('stuck without any progress note counts from when the turn began', () => {
+  const v = view(sil({ since: 900 }), { recent: WINDOW });
+  assert.equal(v.state, 'stuck');
+  assert.equal(v.stuck.evidence, 'No progress since the turn began 15m ago \u00b7 no reply sent \u00b7 heartbeat still fresh');
+});
+
+test('the 10-minute boundary: 599 s is busy, 600 s is stuck', () => {
+  assert.equal(view(sil({ since: 1800, progress: 599 }), { recent: WINDOW }).state, 'busy');
+  assert.equal(view(sil({ since: 1800, progress: 600 }), { recent: WINDOW }).state, 'stuck');
+});
+
+test('a reply since the agent woke means it is not stuck', () => {
+  const recent = [env(NAME, 'claude-agenttalk-lead', 'message', 700)];
+  const v = view(sil({ since: 1800, progress: 840 }), { recent });
+  assert.equal(v.state, 'busy');
+  assert.equal(v.candidate, true);
+  assert.equal(v.stuck, null);
+  assert.equal(v.line, 'Last progress 14m ago \u00b7 replied since it woke');
+  // a message from BEFORE the wake does not count
+  const before = view(sil({ since: 1800, progress: 840 }), { recent: [env(NAME, 'x', 'message', 2400)] });
+  assert.equal(before.state, 'stuck');
+});
+
+test('reply status unknown (window too short to cover the wake) raises no card', () => {
+  const full = [];
+  for (let i = 0; i < 25; i++) full.push(env('claude-agenttalk-lead', 'operator', 'message', 60 + i * 10)); // newest 25, all after the wake
+  const v = view(sil({ since: 1800, progress: 840 }), { recent: full });
+  assert.equal(v.state, 'busy');
+  assert.equal(v.stuck, null);
+  assert.equal(v.line, 'Last progress 14m ago \u00b7 reply status unknown');
+  assert.equal(v.aside.title, 'dev-6 is quiet');
+  // ...but the same window DOES cover the wake if it reaches back past it
+  const reaching = full.slice(0, 24).concat([env('claude-agenttalk-lead', 'operator', 'message', 2000)]);
+  assert.equal(view(sil({ since: 1800, progress: 840 }), { recent: reaching }).state, 'stuck');
+});
+
+test('replyInfo: coverage rules, last message age', () => {
+  assert.deepEqual({ ...M.replyInfo(NAME, NOW - 1800e3, [], NOW) }, { replied: false, lastMessageAge: null });
+  assert.deepEqual({ ...M.replyInfo(NAME, null, [], NOW) }, { replied: null, lastMessageAge: null });
+  const after = [env(NAME, 'x', 'message', 100), env(NAME, 'x', 'message', 900)];
+  assert.deepEqual({ ...M.replyInfo(NAME, NOW - 1800e3, after, NOW) }, { replied: true, lastMessageAge: 100 });
+  assert.deepEqual({ ...M.replyInfo(NAME, NOW - 50e3, after, NOW) }, { replied: false, lastMessageAge: 100 });
+  assert.equal(M.replyInfo(NAME, NOW, [null, 5, 'x', { ts: 'bad', from: NAME }], NOW).replied, false);
+});
+
+test('a stale heartbeat is a freshness problem, not a stuck agent', () => {
+  const v = view(sil({ since: 1800, progress: 840, hb: 400 }), { recent: WINDOW });
+  assert.equal(v.state, 'unknown');
+  assert.equal(v.stuck, null);
+  assert.equal(v.line, 'Heartbeat stale 6m \u00b7 not judged stuck');
+  assert.equal(view(sil({ since: 1800, progress: 840, hb: 300 }), { recent: WINDOW }).state, 'stuck', '300 s is still fresh');
+  assert.equal(view(sil({ since: 1800, progress: 840, hb: 301 }), { recent: WINDOW }).state, 'unknown');
+  assert.match(view(sil({ since: 1800, hb: null }), { recent: WINDOW }).line, /^Heartbeat missing/);
+});
+
+test('the wrapper\u2019s own stuck_suspected is a candidate, and a card only with the full evidence', () => {
+  const s = (o) => agent(NAME, { state: 'stuck_suspected', ...o });
+  const early = view(s({ since: 1800, progress: 200 }), { recent: WINDOW });
+  assert.equal(early.state, 'busy');
+  assert.equal(early.candidate, true);
+  assert.equal(early.stuck, null);
+  assert.equal(early.line, 'Last progress 3m ago · no reply sent');
+  const evidenced = view(s({ since: 1800, progress: 840 }), { recent: WINDOW });
+  assert.equal(evidenced.state, 'stuck');
+});
+
+test('capped: window full and when it resets; weekly; and a bare outage', () => {
+  const capped = (cap) => view(agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900, capacity: cap }));
+  const five = capped(capacity({ primary: 100, primaryReset: 11 * 3600 + 40 * 60, secondary: 40 }));
+  assert.deepEqual([five.state, five.tone, five.line, five.cap], ['capped', 'bad', '5-hour window full', 'resets 23:40']);
+  assert.equal(five.aside.title, 'rev-1 is capped');
+  assert.equal(five.aside.detail, '5-hour window full \u00b7 resets 23:40');
+  const weekly = capped(capacity({ primary: 50, secondary: 100, secondaryReset: 2 * 86400 }));
+  assert.equal(weekly.line, 'Weekly window full');
+  assert.equal(weekly.cap, 'resets Mon 12:00');
+  const bare = view(agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900 }));
+  assert.equal(bare.line, 'Rate limited or provider outage');
+  assert.equal(bare.cap, '');
+});
+
+test('F3 (final sweep): expired or stale cached capacity must not diagnose a current cap', () => {
+  const capped = (cap) => view(agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900, capacity: cap }));
+  // Fresh health says rate_limited_or_outage, but the cached usage is stale (confidence !== 'fresh')
+  // and its own reset time has already passed - exactly the reported sequence.
+  const expired = capped(capacity({ confidence: 'stale', observed: 2 * 3600, primary: 100, primaryReset: -3600 }));
+  assert.equal(expired.state, 'capped');
+  assert.notEqual(expired.line, '5-hour window full');
+  assert.equal(expired.line, 'Rate limited or provider outage', 'the specific window claim is not evidence any more - the coarse diagnosis stands');
+  assert.equal(expired.cap, '', 'no reset time is shown for a diagnosis that was not made from it');
+
+  // Same 100%/expired-reset shape, but still confidence: 'fresh' and NOT yet past its reset:
+  // the specific window claim is legitimate and must still be shown (the control case).
+  const current = capped(capacity({ confidence: 'fresh', observed: 30, primary: 100, primaryReset: 3600 }));
+  assert.equal(current.line, '5-hour window full');
+
+  // confidence: 'fresh' alone is not enough either - a fresh READING of an already-past reset is
+  // still an expired quota claim, not a current one.
+  const freshButExpired = capped(capacity({ confidence: 'fresh', observed: 30, primary: 100, primaryReset: -60 }));
+  assert.equal(freshButExpired.line, 'Rate limited or provider outage');
+});
+
+test('down states get their own bad-tone row and no card', () => {
+  const cases = {
+    crashed_or_exited: 'Crashed or exited', errored_poison: 'Errored (poisoned turn)',
+    errored_ambiguous: 'Errored', degraded_output: 'Degraded output',
+  };
+  for (const [state, text] of Object.entries(cases)) {
+    const v = view(agent('claude-agenttalk-developer-2', { state, since: 720 }));
+    assert.deepEqual([v.state, v.tone, v.line, v.stuck], ['down', 'bad', text + ' \u00b7 12m', null], state);
+    assert.equal(v.aside.title, 'dev-2 is down');
+  }
+});
+
+test('unknown health (missing, stale, or unrecognised) reads as unknown, never as idle', () => {
+  assert.equal(view(agent('claude-agenttalk-developer-2', { state: 'unknown', hb: 700 })).line, 'No fresh health \u00b7 last seen 11m');
+  assert.equal(view(agent('claude-agenttalk-developer-2', { stale: true, hb: 30 })).state, 'unknown');
+  assert.equal(view(agent('claude-agenttalk-developer-2', { state: 'brand_new_state' })).state, 'unknown');
+  assert.equal(view(agent('claude-agenttalk-developer-2', { state: 'unknown', hb: null })).line, 'No fresh health \u00b7 never seen');
+  assert.equal(view({ name: 'x' }).state, 'unknown');
+});
+
+test('avatar file comes from a fixed hexagon list, never from the feed', () => {
+  const files = ['lead', 'developer', 'reviewer', 'frontend-dev', 'weirdrole'].map((r) => M.avatarFile('claude-agenttalk-' + r, r === 'frontend-dev' ? '' : r));
+  assert.deepEqual(files.slice(0, 3), ['hexagon-architect.png', 'hexagon-builder.png', 'hexagon-detective.png']);
+  assert.equal(files[3], 'hexagon-builder.png');
+  assert.match(files[4], /^hexagon-(analyst|architect|builder|detective|devops|docs|monitor|sandbox|social|translator)\.png$/);
+  assert.equal(M.avatarFile('claude-agenttalk-x', '../../etc/passwd').startsWith('hexagon-'), true);
+  assert.equal(M.avatarFile('same', 'zzz'), M.avatarFile('same', 'zzz'), 'stable');
+});
+
+// --------------------------------------------------------------- usage windows
+
+const withCap = (name, cap) => agent(name, { capacity: cap });
+
+test('usage: per runtime and window, both present, thresholds on the colour', () => {
+  const rows = M.usageRows([
+    withCap('claude-agenttalk-lead', capacity({ primary: 41, primaryReset: 3 * 3600, secondary: 23, secondaryReset: 4 * 86400 })),
+    withCap('codex-agenttalk-developer-5', capacity({ primary: 100, primaryReset: 11 * 3600 + 40 * 60, secondary: 62 })),
+  ], NOW, TZ);
+  assert.deepEqual(rows.map((r) => [r.runtime, r.window, r.pct, r.tone]), [
+    ['claude', '5h', 41, 'ok'], ['claude', 'weekly', 23, 'ok'], ['codex', '5h', 100, 'bad'], ['codex', 'weekly', 62, 'warn'],
+  ]);
+  assert.equal(rows[0].resetsLabel, 'resets 15:00');
+  assert.equal(rows[2].resetsLabel, 'resets 23:40');
+  assert.equal(rows[2].barPct, 100);
+});
+
+test('usage thresholds: 59 ok, 60 warn, 84 warn, 85 bad', () => {
+  const tone = (pct) => M.usageRows([withCap('claude-agenttalk-lead', capacity({ primary: pct }))], NOW, TZ)[0].tone;
+  assert.deepEqual([59, 59.4, 60, 84, 84.9, 85, 100].map(tone), ['ok', 'ok', 'warn', 'warn', 'warn', 'bad', 'bad']);
+});
+
+test('usage: the newest reading of a runtime wins, and disagreement is flagged', () => {
+  const rows = M.usageRows([
+    withCap('claude-agenttalk-lead', capacity({ primary: 30, observed: 600 })),
+    withCap('claude-agenttalk-developer-2', capacity({ primary: 42, observed: 20 })),
+    withCap('claude-agenttalk-reviewer-3', capacity({ primary: 10, observed: 4000 })),
+  ], NOW, TZ);
+  assert.equal(rows[0].pct, 42);
+  assert.equal(rows[0].differs, true);
+  const close = M.usageRows([
+    withCap('claude-agenttalk-lead', capacity({ primary: 40, observed: 600 })),
+    withCap('claude-agenttalk-developer-2', capacity({ primary: 43, observed: 20 })),
+  ], NOW, TZ);
+  assert.equal(close[0].differs, false, 'within 5 points');
+});
+
+test('usage: a window nobody reported says "no reading", never 0 %', () => {
+  const rows = M.usageRows([withCap('claude-agenttalk-lead', capacity({ primary: 10 }))], NOW, TZ);
+  assert.deepEqual(rows.map((r) => [r.window, r.noReading]), [['5h', false], ['weekly', true]]);
+  assert.equal(rows[1].pct, undefined);
+  const none = M.usageRows([agent('claude-agenttalk-lead')], NOW, TZ);
+  assert.deepEqual(none.map((r) => r.noReading), [true, true]);
+});
+
+test('usage: a stale or already-reset reading is grey with its "as of" time', () => {
+  const stale = M.usageRows([withCap('codex-agenttalk-developer-5', capacity({ primary: 90, confidence: 'stale', observed: 5400 }))], NOW, TZ)[0];
+  assert.deepEqual([stale.stale, stale.tone, stale.asOfLabel], [true, 'dim', 'as of 10:30']);
+  const passed = M.usageRows([withCap('codex-agenttalk-developer-5', capacity({ primary: 90, primaryReset: -60 }))], NOW, TZ)[0];
+  assert.deepEqual([passed.stale, passed.resetsLabel], [true, 'reset passed']);
+  const unknown = M.usageRows([withCap('codex-agenttalk-developer-5', capacity({ primary: 90, confidence: 'unknown' }))], NOW, TZ)[0];
+  assert.equal(unknown.stale, true);
+});
+
+test('usage: only runtimes on the team get rows; qwen never does; junk is ignored', () => {
+  assert.deepEqual(M.usageRows([agent('qwen-agenttalk-dev-1', { capacity: capacity({ primary: 5 }) })], NOW, TZ), []);
+  assert.deepEqual(M.usageRows([], NOW, TZ), []);
+  assert.deepEqual(M.usageRows(null, NOW, TZ), []);
+  const rows = M.usageRows([withCap('claude-agenttalk-lead', { primary: { used_pct: 'lots' }, secondary: null })], NOW, TZ);
+  assert.deepEqual(rows.map((r) => r.noReading), [true, true]);
+  assert.equal(M.usageRows([{ name: 'plain', cli: 'codex', capacity: capacity({ primary: 12 }) }], NOW, TZ)[0].runtime, 'codex');
+});
+
+// ------------------------------------------------------- freshness, two banners
+
+const FRESH_ROOT = () => root({ agents: [agent('claude-agenttalk-lead', { hb: 30 })] });
+
+test('sourceAsOf is the newest heartbeat, health, capacity or envelope time', () => {
+  const r = root({
+    agents: [agent('a-b-c', { hb: 900, capacity: capacity({ primary: 1, observed: 500 }) })],
+    recent: [env('x', 'y', 'message', 200)],
+  });
+  r.agents[0].health.updated_at = iso(700);
+  assert.equal(M.sourceAsOf(r), NOW - 200e3);
+  assert.equal(M.sourceAsOf(root({ agents: [agent('a-b-c', { hb: 900 })] })), NOW - 10e3);
+  assert.equal(M.sourceAsOf({ agents: [{ name: 'x' }] }), null);
+  assert.equal(M.sourceAsOf(null), null);
+});
+
+test('live: server reachable and something wrote within 5 minutes', () => {
+  const f = M.freshness(FRESH_ROOT(), CONN_OK, NOW, TZ);
+  assert.equal(f.state, 'live');
+  assert.equal(f.banner, null);
+});
+
+test('silent: the server answers but nothing has been written for over 5 minutes (5:00 fine, 5:01 silent)', () => {
+  const at = (age) => root({ agents: [agent('claude-agenttalk-lead', { hb: age })] });
+  const quiet = (age) => { const r = at(age); r.agents[0].health.updated_at = iso(age); return M.freshness(r, CONN_OK, NOW, TZ); };
+  assert.equal(quiet(300).state, 'live');
+  const s = quiet(301);
+  assert.equal(s.state, 'silent');
+  assert.equal(s.banner.kind, 'silent');
+  assert.match(s.banner.kicker, /^NO AGENT HAS REPORTED FOR 5M$/);
+  const long = quiet(3 * 3600 + 12 * 60);
+  assert.equal(long.banner.kicker, 'NO AGENT HAS REPORTED FOR 3H 12M');
+  assert.match(long.banner.message, /server answers/);
+  assert.match(long.banner.message, /08:48/);
+});
+
+test('no timestamps at all is silent, not live', () => {
+  const f = M.freshness({ agents: [{ name: 'x' }] }, CONN_OK, NOW, TZ);
+  assert.equal(f.state, 'silent');
+  assert.match(f.banner.message, /No agent has written/);
+});
+
+test('unreachable: a failed read, or generated_at stalled for more than 3 polls, beats silent', () => {
+  const down = M.freshness(FRESH_ROOT(), { reachable: false, stalledPolls: 0, lastOkMs: NOW - 192 * 60e3 }, NOW, TZ);
+  assert.equal(down.state, 'unreachable');
+  assert.equal(down.banner.kicker, 'CAN\u2019T REACH THE CONSOLE SERVER');
+  assert.match(down.banner.message, /Last snapshot 08:48 \(3h 12m ago\)/);
+  assert.equal(M.freshness(FRESH_ROOT(), { reachable: true, stalledPolls: 3, lastOkMs: NOW }, NOW, TZ).state, 'live');
+  assert.equal(M.freshness(FRESH_ROOT(), { reachable: true, stalledPolls: 4, lastOkMs: NOW }, NOW, TZ).state, 'unreachable');
+  const never = M.freshness(FRESH_ROOT(), { reachable: false, stalledPolls: 0, lastOkMs: null }, NOW, TZ);
+  assert.match(never.banner.message, /No snapshot has arrived yet/);
+  const both = M.freshness(root({ agents: [] }), { reachable: false, stalledPolls: 0, lastOkMs: NOW }, NOW, TZ);
+  assert.equal(both.state, 'unreachable');
+});
+
+test('recovery: a fresh snapshot clears the banner', () => {
+  const r = FRESH_ROOT();
+  assert.equal(M.freshness(r, { reachable: false, lastOkMs: NOW - 60e3 }, NOW, TZ).state, 'unreachable');
+  assert.equal(M.freshness(r, { reachable: true, stalledPolls: 0, lastOkMs: NOW }, NOW, TZ).state, 'live');
+});
+
+// ---------------------------------------------------------------- team view
+
+const team = (o = {}) => M.buildTeamView({
+  nowMs: NOW, generatedMs: NOW, root: root({ agents: busyAgents(), recent: busyRecent(), operator_facing: 'claude-agenttalk-lead', ...o.root }),
+  attention: o.attention === undefined ? attention([]) : o.attention, chat: o.chat === undefined ? null : o.chat,
+  conn: o.conn || CONN_OK, ui: o.ui || {}, tz: TZ, canAct: o.canAct,
+});
+const escalation = (o) => ATT_ITEM({ source: 'escalation', ...o });
+
+test('busy day: stuck first, then oldest; greeting counts the cards', () => {
+  const v = team({
+    attention: attention([
+      escalation({ id: 'e-new', title: 'Newer question', age: 300 }),
+      escalation({ id: 'e-old', title: 'Old question', age: 172800 }),
+      ATT_ITEM({ id: 'g-1', source: 'gate', source_label: 'GATE HOLD', title: 'Gate holds', age: 5000 }),
+    ]),
+  });
+  assert.equal(v.mode, 'busy');
+  assert.deepEqual(v.needs.open.map((c) => c.id), ['stuck:codex-agenttalk-developer-4', 'e-old', 'g-1', 'e-new']);
+  assert.equal(v.greeting.text, 'Four things need you.');
+  assert.equal(v.greeting.sub, 'Stuck agents first, then oldest. A deadline only shows if someone set one.');
+  assert.equal(v.chip.needsCount, 4);
+  const [stuck, old] = v.needs.open;
+  assert.deepEqual([stuck.kind, stuck.tone, stuck.title, stuck.ageLabel], ['LOOKS STUCK', 'bad', 'dev-4 has gone quiet', '14m']);
+  assert.equal(stuck.evidence, 'Last progress 14m ago \u00b7 no reply sent \u00b7 heartbeat still fresh');
+  assert.equal(stuck.evidenceNote, 'Weaker evidence: process status isn\u2019t visible yet, so Wait comes first.');
+  assert.deepEqual(stuck.options.map((o) => [o.label, o.primary, o.locked]), [['Wait 10 min', true, null], ['Restart with context', false, 'CLI only']]);
+  assert.equal(old.ageLabel, 'no deadline \u00b7 waiting 2d');
+});
+
+test('greeting words: One thing, Three things, digits after ten', () => {
+  const n = (k) => team({ attention: attention(Array.from({ length: k }, (_, i) => escalation({ id: 'e' + i, age: 100 + i })).concat([])), root: { agents: [agent('claude-agenttalk-lead')] } }).greeting.text;
+  assert.equal(n(1), 'One thing needs you.');
+  assert.equal(n(3), 'Three things need you.');
+  assert.equal(n(10), 'Ten things need you.');
+  assert.equal(n(11), '11 things need you.');
+});
+
+test('kinds: escalation -> DECISION, gate -> GATE HOLD, others keep their label, none dropped', () => {
+  const v = team({
+    root: { agents: [agent('claude-agenttalk-lead')] },
+    attention: attention([
+      escalation({ id: 'a' }),
+      ATT_ITEM({ id: 'b', source: 'gate', source_label: 'GATE HOLD' }),
+      ATT_ITEM({ id: 'c', source: 'supervisor', source_label: 'SUPERVISOR HOLD', severity: 'high' }),
+      ATT_ITEM({ id: 'd', source: 'deadletter', source_label: 'DEAD LETTER', severity: 'med' }),
+      ATT_ITEM({ id: 'e', source: 'coordination_stall', source_label: 'TEAM STALL' }),
+      ATT_ITEM({ id: 'f', source: 'other', source_label: 'OTHER', severity: 'low' }),
+      ATT_ITEM({ id: 'g', source: 'brand_new_source', source_label: '', severity: 'med' }),
+    ]),
+  });
+  const byId = Object.fromEntries(v.needs.open.map((c) => [c.id, c]));
+  assert.deepEqual(['a', 'b', 'c', 'd', 'e', 'f', 'g'].map((id) => byId[id].kind),
+    ['DECISION', 'GATE HOLD', 'SUPERVISOR HOLD', 'DEAD LETTER', 'TEAM STALL', 'OTHER', 'BRAND_NEW_SOURCE']);
+  assert.deepEqual(['a', 'b', 'c'].map((id) => byId[id].tone), ['info', 'warn', 'warn']);
+});
+
+test('low-severity known sources are "also happening", not cards', () => {
+  const v = team({ root: { agents: [agent('claude-agenttalk-lead')] },
+    attention: attention([ATT_ITEM({ id: 'l', source: 'supervisor', source_label: 'SUPERVISOR', severity: 'low', title: 'Lead not armed', detail: 'no lead loop' })]) });
+  assert.equal(v.needs.open.length, 0);
+  assert.deepEqual(v.aside.rows.map((r) => [r.title, r.detail]), [['Lead not armed', 'no lead loop']]);
+});
+
+test('the server\u2019s own stuck items are not shown as cards (the evidence rule decides)', () => {
+  const v = team({ root: { agents: [agent('claude-agenttalk-lead')] },
+    attention: attention([ATT_ITEM({ id: 'stuck:x', source: 'stuck', source_label: 'STUCK', severity: 'med' })]) });
+  assert.equal(v.needs.open.length, 0);
+});
+
+test('evidence is required on every card: missing evidence says so, the card stays', () => {
+  const v = team({ root: { agents: [agent('claude-agenttalk-lead')] },
+    attention: attention([escalation({ id: 'x', detail: '' }), escalation({ id: 'y', detail: 'because' })]) });
+  const [x, y] = ['x', 'y'].map((id) => v.needs.open.find((c) => c.id === id));
+  assert.deepEqual([x.evidenceMissing, x.evidenceText], [true, 'No evidence recorded']);
+  assert.deepEqual([y.evidenceMissing, y.evidenceText], [false, 'because']);
+});
+
+test('options: locked "CLI only" without actions; the served options when answerable', () => {
+  const v = team({ root: { agents: [agent('claude-agenttalk-lead')] },
+    attention: attention([escalation({ id: 'ro' }), escalation({ id: 'rw', answerable: true, options: ['Raise to 54', 'Keep 44'] })]) });
+  const ro = v.needs.open.find((c) => c.id === 'ro');
+  const rw = v.needs.open.find((c) => c.id === 'rw');
+  assert.deepEqual(ro.options.map((o) => [o.label, o.locked]), [['Answer', 'CLI only']]);
+  assert.deepEqual(rw.options.map((o) => [o.label, o.primary, o.locked]),
+    [['Raise to 54', true, 'read-only'], ['Keep 44', false, 'read-only']], 'served options are shown, disabled: this slice is read-only');
+  assert.equal(rw.answerable, true);
+  const live = team({ root: { agents: [agent('claude-agenttalk-lead')] }, canAct: true,
+    attention: attention([escalation({ id: 'rw', answerable: true, options: ['Raise to 54', 'Keep 44'] })]) });
+  assert.deepEqual(live.needs.open[0].options.map((o) => o.locked), [null, null], 'the seam for the slice that sends');
+});
+
+test('card ages keep growing after the attention read; unknown age says so', () => {
+  const later = M.buildTeamView({ nowMs: NOW + 120e3, generatedMs: NOW, root: root({ agents: [agent('claude-agenttalk-lead')] }),
+    attention: attention([escalation({ id: 'a', age: 60 }), escalation({ id: 'b', age_unknown: true, age: 0 })], { asOfMs: NOW }),
+    chat: null, conn: CONN_OK, ui: {}, tz: TZ });
+  const byId = Object.fromEntries(later.needs.open.map((c) => [c.id, c]));
+  assert.equal(byId.a.ageLabel, 'no deadline \u00b7 waiting 3m');
+  assert.equal(byId.b.ageLabel, 'age unknown');
+});
+
+test('later, snooze and answered: deferred stays counted, snoozed reappears, none is dismissed', () => {
+  const items = attention([escalation({ id: 'a', age: 900 }), escalation({ id: 'b', age: 800 }), escalation({ id: 'c', age: 700 })]);
+  const ui = { deferred: { a: true }, answered: { c: true }, snoozedUntil: { 'stuck:codex-agenttalk-developer-4': NOW + 600e3 } };
+  const v = team({ attention: items, ui });
+  assert.deepEqual(v.needs.open.map((c) => c.id), ['b']);
+  assert.equal(v.needs.deferredCount, 1);
+  assert.deepEqual(v.needs.deferredCards.map((c) => c.id), ['a']);
+  assert.deepEqual(v.needs.answered.map((c) => [c.id, c.state]), [['c', 'answered']]);
+  assert.equal(v.needs.snoozed.length, 1);
+  assert.ok(v.aside.rows.some((r) => r.title === 'dev-4 \u00b7 waiting' && r.detail === 'Snoozed until 12:10'));
+  const expired = team({ ui: { snoozedUntil: { 'stuck:codex-agenttalk-developer-4': NOW - 1 } } });
+  assert.ok(expired.needs.open.some((c) => c.id === 'stuck:codex-agenttalk-developer-4'), 'the card comes back when the snooze ends');
+});
+
+test('quiet day: greeting, idle count, since-you-last-looked; idle is grey', () => {
+  const agents = ['a', 'b', 'c', 'd'].map((x) => agent('claude-agenttalk-developer-' + x.charCodeAt(0), { since: 3000 }));
+  agents.push(agent('claude-agenttalk-lead', { state: 'working_turn', since: 60, task: 'lint' }));
+  const recent = [
+    env('claude-agenttalk-lead', 'operator', 'message', 600),
+    env('claude-agenttalk-reviewer-3', 'claude-agenttalk-lead', 'review-result', 1200),
+    env('claude-agenttalk-developer-1', 'claude-agenttalk-lead', 'task-response', 1300),
+    env('claude-agenttalk-developer-1', 'claude-agenttalk-lead', 'task-response', 1400),
+    env('claude-agenttalk-developer-1', 'claude-agenttalk-lead', 'message', 90000),
+  ];
+  const lastVisit = NOW - 6 * 3600e3;
+  const v = team({ root: { agents, recent }, ui: { lastVisitMs: lastVisit } });
+  assert.equal(v.mode, 'quiet');
+  assert.equal(v.greeting.text, 'All quiet.');
+  assert.equal(v.greeting.sub, 'Nothing needs you. 4 of 5 agents are idle \u2014 that\u2019s their resting state; they wake when the lead messages them.');
+  assert.equal(v.roster.summary, '4 idle \u00b7 that\u2019s normal');
+  assert.equal(v.since.title, 'SINCE YOU LAST LOOKED \u00b7 06:00');
+  assert.deepEqual(v.since.rows, [
+    { title: '4 messages', detail: 'exchanged since 06:00' },
+    { title: '1 review result', detail: 'posted since 06:00' },
+    { title: '2 task responses', detail: 'posted since 06:00' },
+  ]);
+  assert.ok(v.roster.rows.filter((r) => r.state === 'idle').every((r) => r.tone === 'dim'));
+});
+
+test('quiet day without a last visit looks back 24 hours; a full window is "at least"', () => {
+  const full = Array.from({ length: 25 }, (_, i) => env('claude-agenttalk-lead', 'operator', 'message', 60 + i * 60));
+  const v = team({ root: { agents: [agent('claude-agenttalk-lead')], recent: full }, ui: {} });
+  assert.equal(v.since.title, 'IN THE LAST 24 HOURS');
+  assert.equal(v.since.rows[0].title, '25+ messages');
+  const none = team({ root: { agents: [agent('claude-agenttalk-lead')], recent: [] }, ui: {} });
+  assert.deepEqual(none.since.rows, []);
+});
+
+test('deferred-only and answered-only days do not say "All quiet"', () => {
+  const one = attention([escalation({ id: 'a' })]);
+  const deferred = team({ root: { agents: [agent('claude-agenttalk-lead')] }, attention: one, ui: { deferred: { a: true } } });
+  assert.equal(deferred.mode, 'deferred');
+  assert.equal(deferred.greeting.text, 'Nothing new needs you.');
+  assert.equal(deferred.greeting.sub, '1 item is deferred: still open, not dismissed.');
+  const answered = team({ root: { agents: [agent('claude-agenttalk-lead')] }, attention: one, ui: { answered: { a: true } } });
+  assert.deepEqual([answered.mode, answered.greeting.text], ['answered', 'That\u2019s everything.']);
+});
+
+test('a quiet-but-not-stuck agent keeps the day "calm", not "All quiet"', () => {
+  const v = team({ root: { agents: [sil({ since: 1800, progress: 840 })], recent: [env(NAME, 'x', 'message', 700)] } });
+  assert.equal(v.mode, 'calm');
+  assert.equal(v.greeting.text, 'Nothing needs you right now.');
+});
+
+test('offline: both truths, greeting and stamps', () => {
+  const unreachable = team({ conn: { reachable: false, stalledPolls: 0, lastOkMs: NOW - 192 * 60e3 } });
+  assert.equal(unreachable.mode, 'offline');
+  assert.equal(unreachable.stale, true);
+  assert.equal(unreachable.banner.kind, 'unreachable');
+  assert.equal(unreachable.greeting.text, 'Can\u2019t see the team.');
+  assert.match(unreachable.greeting.sub, /greyed and stamped as of \d\d:\d\d\. Nothing is live, and nothing you press can reach the lead until the console server is back\./);
+  assert.match(unreachable.roster.summary, /^frozen \u00b7 as of \d\d:\d\d$/);
+  assert.equal(unreachable.chip.freshness, 'unreachable');
+
+  const old = busyAgents().map((a) => ({ ...a, last_seen: iso(1200), health: { ...a.health, updated_at: iso(1200) } }));
+  old.forEach((a) => { a.capacity && (a.capacity.observed_at = iso(1200)); });
+  const silent = team({ root: { agents: old, recent: [env('x', 'y', 'message', 1200)] } });
+  assert.equal(silent.banner.kind, 'silent');
+  assert.match(silent.greeting.sub, /Nothing is live until an agent writes again\./);
+  assert.equal(silent.chip.freshness, 'silent');
+});
+
+test('the last known data stays visible while offline', () => {
+  const v = team({ conn: { reachable: false, stalledPolls: 0, lastOkMs: NOW - 5000 }, attention: attention([escalation({ id: 'a' })]) });
+  assert.equal(v.needs.open.length > 0, true);
+  assert.equal(v.roster.rows.length, 9);
+});
+
+test('M4a fix round: offline, a roster row\u2019s age freezes at the last known-good reading and says "as of HH:MM"', () => {
+  const onlineRoot = { agents: busyAgents(), recent: busyRecent() };
+  const at = (nowMs, conn) => M.buildTeamView({ nowMs, generatedMs: NOW, root: root(onlineRoot),
+    attention: attention([]), chat: null, conn, ui: {}, tz: TZ });
+  const row = (v) => v.roster.rows.find((r) => r.short === 'dev-2');
+
+  // Online: the same agent's line keeps advancing as time passes (the control case).
+  const t0 = row(at(NOW, CONN_OK)).line;
+  const t1 = row(at(NOW + 180e3, CONN_OK)).line;
+  assert.notEqual(t0, t1, 'online, the age keeps ticking');
+  assert.ok(!t1.includes('as of'));
+
+  // Offline (unreachable): the line is identical at two different "now" instants, and says
+  // when it is as of - using the SAME reading fmtAge would have used online (source_as_of),
+  // not the moment the page happens to render.
+  const offConn = { reachable: false, stalledPolls: 0, lastOkMs: NOW };
+  const o0 = at(NOW + 60e3, offConn);
+  const o1 = at(NOW + 120e3, offConn);   // still well under the 300s heartbeat-freshness boundary (N2)
+  const r0 = row(o0);
+  const r1 = row(o1);
+  assert.equal(r0.line, r1.line, 'frozen: no ticking while offline');
+  assert.match(r0.line, /as of \d\d:\d\d$/);
+  assert.ok(r0.line.startsWith('Working \u00b7 Implementing WP-15'), 'the frozen reading is the pre-outage data, not blanked or altered');
+  assert.equal(o0.roster.summary, o1.roster.summary, 'the roster summary (already "frozen \u00b7 as of ...") agrees');
+
+  // Silent (server answers, nothing has been written for 5+ minutes) freezes and labels the same way.
+  const staleRoot = root({ agents: busyAgents().map((a) => ({ ...a, last_seen: new Date(NOW - 360e3).toISOString(),
+    health: { ...a.health, updated_at: new Date(NOW - 360e3).toISOString() },
+    ...(a.capacity ? { capacity: { ...a.capacity, observed_at: new Date(NOW - 360e3).toISOString() } } : {}) })),
+    recent: [env('x', 'y', 'message', 360)] });
+  const s0 = M.buildTeamView({ nowMs: NOW + 60e3, generatedMs: NOW, root: staleRoot, attention: attention([]), chat: null, conn: CONN_OK, ui: {}, tz: TZ });
+  const s1 = M.buildTeamView({ nowMs: NOW + 240e3, generatedMs: NOW, root: staleRoot, attention: attention([]), chat: null, conn: CONN_OK, ui: {}, tz: TZ });
+  assert.equal(s0.banner.kind, 'silent');
+  assert.equal(row(s0).line, row(s1).line, 'silent also freezes');
+  assert.match(row(s0).line, /as of \d\d:\d\d$/);
+});
+
+// =============================================================================== N2 fix round
+
+test('N2: an outage must never un-classify an unresolved incident - the 600s stuck crossing is pinned to the true clock', () => {
+  const stuckRoot = root({ operator_facing: 'claude-agenttalk-lead', agents: [
+    agent('claude-agenttalk-lead', { since: 600 }),
+    agent('codex-agenttalk-developer-4', { state: 'working_silent', since: 1200, progress: 605 }),
+  ], recent: [] });
+  const stuckCard = (v) => v.needs.open.find((c) => c.kind === 'LOOKS STUCK');
+
+  // Connected: progress age 605s >= the 600s threshold - correctly a stuck card.
+  const connected = M.buildTeamView({ nowMs: NOW, generatedMs: NOW, root: stuckRoot,
+    attention: attention([]), chat: null, conn: CONN_OK, ui: {}, tz: TZ });
+  assert.ok(stuckCard(connected), 'connected: a stuck card, correctly');
+
+  // The connection drops 2s later: the DISPLAY reading for this snapshot happens to freeze at an
+  // instant earlier than "now" (health.updated_at is a few seconds behind the poll that read it).
+  // If classification used that frozen reading, 605s could read back under 600s and the card would
+  // vanish - the exact regression reported. Classification must use the true clock instead, so the
+  // SAME unresolved incident is still shown as a stuck card, last known.
+  const offConn = { reachable: false, stalledPolls: 0, lastOkMs: NOW };
+  const offline = M.buildTeamView({ nowMs: NOW + 2e3, generatedMs: NOW, root: stuckRoot,
+    attention: attention([]), chat: null, conn: offConn, ui: {}, tz: TZ });
+  assert.equal(offline.banner && offline.banner.kind, 'unreachable');
+  assert.ok(stuckCard(offline), 'offline: the unresolved incident is still a stuck card, not silently dropped');
+});
+
+test('N2: the heartbeat-freshness boundary is also pinned to the true clock during an outage', () => {
+  const hbRoot = root({ operator_facing: 'claude-agenttalk-lead', agents: [
+    agent('claude-agenttalk-lead', { since: 600 }),
+    agent('codex-agenttalk-developer-4', { state: 'working_silent', since: 1200, progress: 605, hb: 250 }),
+  ], recent: [] });
+  const row = (v) => v.roster.rows.find((r) => r.short === 'dev-4');
+  const offConn = { reachable: false, stalledPolls: 0, lastOkMs: NOW };
+
+  // Connected: heartbeat 250s old, still fresh (< 300s) - the incident is judged, and stuck.
+  const connected = M.buildTeamView({ nowMs: NOW, generatedMs: NOW, root: hbRoot,
+    attention: attention([]), chat: null, conn: CONN_OK, ui: {}, tz: TZ });
+  assert.equal(row(connected).state, 'stuck');
+
+  // Briefly offline (+2s): the heartbeat is still genuinely fresh by true elapsed time (252s) -
+  // the incident must still be judged, not waved off merely because the page went offline.
+  const brieflyOffline = M.buildTeamView({ nowMs: NOW + 2e3, generatedMs: NOW, root: hbRoot,
+    attention: attention([]), chat: null, conn: offConn, ui: {}, tz: TZ });
+  assert.equal(row(brieflyOffline).state, 'stuck');
+
+  // A long outage (+60s): true elapsed heartbeat age (310s) really does cross 300s - correctly
+  // reclassified as unknown/not-judged, using the true clock (a frozen one could disagree either way).
+  const longOffline = M.buildTeamView({ nowMs: NOW + 60e3, generatedMs: NOW, root: hbRoot,
+    attention: attention([]), chat: null, conn: offConn, ui: {}, tz: TZ });
+  assert.equal(row(longOffline).state, 'unknown');
+  assert.match(row(longOffline).line, /Heartbeat stale/);
+});
+
+test('attention problems are stated, not hidden: stale read, failed read, never loaded', () => {
+  const stale = team({ attention: attention([escalation({ id: 'a' })], { asOfMs: NOW - 9000 }) });
+  assert.equal(stale.needs.stale, true);
+  assert.equal(stale.stale, true);
+  const fresh = team({ attention: attention([escalation({ id: 'a' })], { asOfMs: NOW - 8000 }) });
+  assert.equal(fresh.needs.stale, false);
+  const failed = team({ attention: attention([], { ok: false }) });
+  assert.deepEqual([failed.mode, failed.greeting.text, failed.chip.needsCount], ['needs-unavailable', 'Can\u2019t read what needs you.', null]);
+  const loading = team({ attention: null });
+  assert.deepEqual([loading.mode, loading.greeting.sub, loading.chip.needsCount], ['loading', 'Waiting for the first snapshot.', null]);
+});
+
+test('F2 (final sweep): a stale, EMPTY attention cache must not claim an unqualified all-clear', () => {
+  // No stuck/candidate agent at all (unlike busyAgents()), so a fresh, empty attention cache
+  // legitimately reaches the "All quiet" fallback - this is the control case.
+  const idleRoot = root({ agents: [agent('claude-agenttalk-lead', { state: 'idle_waiting', since: 3000 })],
+    operator_facing: 'claude-agenttalk-lead' });
+  const fresh = M.buildTeamView({ nowMs: NOW, generatedMs: NOW, root: idleRoot,
+    attention: attention([], { asOfMs: NOW - 7000 }), chat: null, conn: CONN_OK, ui: {}, tz: TZ });
+  assert.equal(fresh.needs.stale, false);
+  assert.equal(fresh.mode, 'quiet');
+  assert.equal(fresh.greeting.text, 'All quiet.');
+
+  // The SAME idle roster, but the attention cache is 9s old (past ATTENTION_FRESH_S=8, e.g. a
+  // pending refresh after switching teams): "nothing needs you" is no longer a claim this page can
+  // stand behind - it must say so, not repeat the last (now unconfirmed) empty result as current.
+  const stale = M.buildTeamView({ nowMs: NOW, generatedMs: NOW, root: idleRoot,
+    attention: attention([], { asOfMs: NOW - 9000 }), chat: null, conn: CONN_OK, ui: {}, tz: TZ });
+  assert.equal(stale.needs.stale, true);
+  assert.notEqual(stale.mode, 'quiet', 'a stale attention cache must never be reported as a confirmed all-clear');
+  assert.notEqual(stale.greeting.text, 'All quiet.');
+  assert.match(stale.greeting.text + ' ' + stale.greeting.sub, /not refresh|last known|can.t confirm/i);
+});
+
+test('F2 (narrowed): a stale attention cache qualifies calm and deferred modes too, never just quiet', () => {
+  const idleRoot = () => root({ agents: [
+    agent('claude-agenttalk-lead', { state: 'idle_waiting', since: 3000 }),
+    agent('codex-agenttalk-developer-4', { state: 'working_silent', since: 1200, progress: 900 }),
+  ], operator_facing: 'claude-agenttalk-lead', recent: [env('codex-agenttalk-developer-4', 'operator', 'task-response', 100)] });
+
+  // CALM: dev-4 replied since waking (reply.replied === true), so despite 900s of no progress it is
+  // a watched candidate, not a stuck card - exactly the reviewer's reproduction (case 1).
+  const calmStale = M.buildTeamView({ nowMs: NOW, generatedMs: NOW, root: idleRoot(),
+    attention: attention([], { asOfMs: NOW - 9000 }), chat: null, conn: CONN_OK, ui: {}, tz: TZ });
+  assert.equal(calmStale.needs.stale, true);
+  assert.equal(calmStale.mode, 'needs-stale', 'calm must not be reported as a confirmed all-clear when attention is stale');
+  assert.match(calmStale.greeting.text, /Can.t confirm/);
+  assert.match(calmStale.greeting.sub, /dev-4/, 'the health/candidate context is kept, not dropped');
+  assert.match(calmStale.greeting.sub, /not refresh|not confirmed current/);
+
+  // DEFERRED: one attention card, locally deferred with Later - exactly the reviewer's case 2.
+  const item = escalation({ id: 'e1' });
+  const deferredUi = { deferred: { e1: NOW - 1000 } };
+  const deferredStale = M.buildTeamView({ nowMs: NOW, generatedMs: NOW, root: idleRoot(),
+    attention: attention([item], { asOfMs: NOW - 9000 }), chat: null, conn: CONN_OK, ui: deferredUi, tz: TZ });
+  assert.equal(deferredStale.needs.stale, true);
+  assert.equal(deferredStale.needs.deferredCount, 1);
+  assert.equal(deferredStale.mode, 'needs-stale', 'deferred must not be reported as a confirmed all-clear when attention is stale');
+  assert.match(deferredStale.greeting.sub, /1 item is deferred/, 'the deferral context is kept, not dropped');
+  assert.match(deferredStale.greeting.sub, /not refresh|not confirmed current/);
+});
+
+test('an unreadable root says only that; a root without agents yet is loading', () => {
+  const bad = M.buildTeamView({ nowMs: NOW, root: { label: 'x', project_id: 'p', errors: ['C:\\secret\\path failed'] }, conn: CONN_OK, ui: {}, tz: TZ });
+  assert.equal(bad.mode, 'error');
+  assert.equal(bad.greeting.text, 'Can\u2019t read this team.');
+  assert.ok(!JSON.stringify(bad).includes('secret'), 'the error text (which can carry paths) is never carried into the view');
+  assert.equal(bad.chip.freshness, 'error');
+  const loading = M.buildTeamView({ nowMs: NOW, root: { label: 'x', project_id: 'p' }, conn: CONN_OK, ui: {}, tz: TZ });
+  assert.equal(loading.mode, 'loading');
+});
+
+test('lead\u2019s latest message: the newest from the lead, bounded, with its age', () => {
+  const msgs = [
+    { from: 'claude-agenttalk-lead', to: 'operator', body: 'older', ts: iso(900) },
+    { from: 'operator', to: 'claude-agenttalk-lead', body: 'my question', ts: iso(500) },
+    { from: 'claude-agenttalk-lead', to: 'operator', body: 'Three things need you.', ts: iso(240) },
+  ];
+  const v = team({ chat: chat(msgs) });
+  assert.deepEqual([v.lead.short, v.lead.body, v.lead.ageLabel, v.lead.truncated], ['lead', 'Three things need you.', '4m ago', false]);
+  const long = team({ chat: chat([{ from: 'claude-agenttalk-lead', body: 'x'.repeat(5000), ts: iso(1) }]) });
+  assert.equal(long.lead.body.length, 1200);
+  assert.equal(long.lead.truncated, true);
+  assert.equal(team({ chat: chat([{ from: 'operator', body: 'hi', ts: iso(1) }]) }).lead, null, 'no lead message -> nothing invented');
+  assert.equal(team({ chat: null }).lead, null);
+  const down = team({ chat: chat([], { available: false, detail: 'lead heartbeat stale' }) });
+  assert.deepEqual([down.lead.unavailable, down.lead.detail], [true, 'lead heartbeat stale']);
+});
+
+test('M4: the lead’s message carries an avatar file (from the model’s own closed list) and a runtime', () => {
+  const v = team({ chat: chat([{ from: 'claude-agenttalk-lead', body: 'hi', ts: iso(1) }]) });
+  assert.equal(v.lead.avatarFile, 'hexagon-architect.png');
+  assert.equal(v.lead.runtime, 'claude');
+  assert.ok(M.AVATAR_FILES.indexOf(v.lead.avatarFile) >= 0);
+  const other = team({ chat: chat([{ from: 'codex-agenttalk-lead', body: 'hi', ts: iso(1) }], { lead: 'codex-agenttalk-lead' }) });
+  assert.equal(other.lead.runtime, 'codex');
+});
+
+test('M4b F3: the lead’s badge uses the roster row’s configured runtime, never a guess from the name', () => {
+  // A claude-NAMED lead whose feed row explicitly carries cli=codex (a rename, a misconfigured
+  // seat, or simply an operator-chosen name that does not match its runtime): the row wins.
+  const mismatched = M.buildTeamView({
+    nowMs: NOW, generatedMs: NOW, tz: TZ, conn: CONN_OK, ui: {},
+    root: root({ agents: [agent('claude-agenttalk-lead', { cli: 'codex', since: 60 })], operator_facing: 'claude-agenttalk-lead' }),
+    attention: attention([]), chat: chat([{ from: 'claude-agenttalk-lead', body: 'hi', ts: iso(1) }]),
+  });
+  assert.equal(mismatched.lead.runtime, 'codex');
+  assert.equal(mismatched.lead.avatarFile, mismatched.roster.rows[0].avatarFile, 'same row, same avatar, not recomputed from the name alone');
+
+  // A generic seat name (no runtime prefix at all) is still resolved from its row, not left blank.
+  const generic = M.buildTeamView({
+    nowMs: NOW, generatedMs: NOW, tz: TZ, conn: CONN_OK, ui: {},
+    root: root({ agents: [agent('mission-control', { cli: 'qwen', since: 60 })], operator_facing: 'mission-control' }),
+    attention: attention([]), chat: chat([{ from: 'mission-control', body: 'hi', ts: iso(1) }], { lead: 'mission-control' }),
+  });
+  assert.equal(generic.lead.runtime, 'qwen');
+
+  // No matching row at all (a cross-team or unrecognised lead name): falls back to the old,
+  // name-based guess - never blank, never crashing.
+  const noRow = team({ chat: chat([{ from: 'codex-agenttalk-lead', body: 'hi', ts: iso(1) }], { lead: 'codex-agenttalk-lead' }) });
+  assert.equal(noRow.lead.runtime, 'codex');
+});
+
+test('M4: AVATAR_FILES is exactly the ten hexagon motifs, and every roster avatarFile is one of them', () => {
+  assert.equal(M.AVATAR_FILES.length, 10);
+  assert.ok(M.AVATAR_FILES.every((f) => /^hexagon-[a-z]+\.png$/.test(f)));
+  assert.deepEqual(new Set(M.AVATAR_FILES).size, 10, 'no duplicates');
+  const v = team();
+  v.roster.rows.forEach((r) => assert.ok(M.AVATAR_FILES.indexOf(r.avatarFile) >= 0, r.name));
+  // hostile/odd names still resolve to a member of the closed list, never anything else
+  for (const bad of ['<img src=x onerror=alert(1)>', '../../etc/passwd', '', 'claude-agenttalk-' + 'x'.repeat(300)]) {
+    assert.ok(M.AVATAR_FILES.indexOf(M.avatarFile(bad, null)) >= 0, bad);
+  }
+});
+
+test('roster: lead first, short names, ties broken, summary, count', () => {
+  const v = team();
+  assert.equal(v.roster.total, 9);
+  assert.equal(v.roster.rows[0].name, 'claude-agenttalk-lead');
+  assert.deepEqual(v.roster.rows.map((r) => r.short), ['lead', 'dev-2', 'fe-dev', 'rev-3', 'dev-5', 'dev-4', 'x.rev-1', 'dev-1', 'q.rev-1']);
+  assert.equal(v.roster.summary, '4 idle \u00b7 that\u2019s normal');
+  assert.equal(v.roster.rows.find((r) => r.short === 'x.rev-1').cap, 'resets 23:40');
+});
+
+test('also happening lists down, capped, then quiet agents, cut at 8 with a count', () => {
+  const v = team();
+  assert.deepEqual(v.aside.rows.map((r) => r.title), ['x.rev-1 is capped', 'dev-5 is quiet, not stuck']);
+  const many = Array.from({ length: 10 }, (_, i) => agent('claude-agenttalk-developer-' + (i + 1), { state: 'crashed_or_exited', since: 60 }));
+  const crowded = team({ root: { agents: many, recent: [] } });
+  assert.equal(crowded.aside.rows.length, 8);
+  assert.equal(crowded.aside.more, 2);
+});
+
+test('the chip carries freshness and the open count for the selected and other teams', () => {
+  const shell = M.buildShellView({
+    roots: [root({ project_id: 'a', agents: busyAgents(), recent: busyRecent() }), root({ label: 'second', project_id: 'b', agents: [agent('claude-second-lead')] })],
+    attentionByRoot: { a: attention([escalation({ id: 'e1' })]) }, chatByRoot: {},
+    param: 'b', nowMs: NOW, generatedMs: NOW, conn: CONN_OK, ui: {}, tz: TZ,
+  });
+  assert.deepEqual(shell.teams.map((t) => [t.label, t.pressed, t.freshness, t.needsCount]),
+    [['agenttalk', false, 'live', 2], ['second', true, 'live', null]]);
+  assert.equal(shell.view.label, 'second');
+  const unknown = M.buildShellView({ roots: [root({ agents: [agent('claude-agenttalk-lead')] })], param: 'nope', nowMs: NOW, conn: CONN_OK, ui: {}, tz: TZ });
+  assert.deepEqual([unknown.selection.status, unknown.view], ['unknown', null]);
+  const none = M.buildShellView({ roots: null, param: '', nowMs: NOW, conn: CONN_OK, ui: {}, tz: TZ });
+  assert.deepEqual([none.teams, none.view], [[], null]);
+});
+
+test('hostile strings pass through as plain data; nothing is escaped or executed by the model', () => {
+  const evil = '<img src=x onerror=alert(1)>';
+  const v = team({ root: { agents: [agent('claude-agenttalk-lead', { task: evil, state: 'working_turn', since: 5 })] },
+    attention: attention([escalation({ id: evil, title: evil, detail: evil, agent: evil })]),
+    chat: chat([{ from: 'claude-agenttalk-lead', body: evil, ts: iso(1) }]) });
+  assert.equal(v.needs.open[0].title, evil);
+  assert.equal(v.lead.body, evil);
+  assert.ok(v.roster.rows[0].line.includes(evil));
+});
+
+test('the view is plain JSON: no functions, no DOM, no undefined holes that break the redraw signature', () => {
+  const v = team({ chat: chat([{ from: 'claude-agenttalk-lead', body: 'hi', ts: iso(5) }]), attention: attention([escalation({ id: 'a' })]) });
+  assert.equal(JSON.stringify(v), JSON.stringify(JSON.parse(JSON.stringify(v))));
+});
+
+// ---------------------------------------- F2: the baseline is the CURRENT turn
+
+test('progress from an earlier turn does not count against a turn that just started', () => {
+  // last_progress_at is kept by the wrapper across idle and turn_start: 30 min old, the turn 5 s old.
+  const v = view(sil({ since: 5, progress: 1800 }), { recent: WINDOW });
+  assert.equal(v.state, 'busy');
+  assert.equal(v.stuck, null);
+  assert.equal(v.candidate, false);
+  assert.equal(v.line, 'Quiet · no progress since the turn began 5s ago');
+  assert.equal(v.aside.detail, 'No progress since the turn began 5s ago · no card while progress moves');
+});
+
+test('inactivity counts from max(last progress, turn start): boundaries', () => {
+  const at = (since, progress) => view(sil({ since, progress }), { recent: WINDOW });
+  // progress exactly at the turn start belongs to this turn; one second before it does not
+  assert.match(at(900, 900).line, /^Last progress 15m ago/);
+  assert.match(at(900, 901).line, /^No progress since the turn began 15m ago/);
+  // the earlier turn's progress never shortens or lengthens the wait
+  assert.equal(at(599, 5000).state, 'busy');
+  assert.equal(at(600, 5000).state, 'stuck');
+  assert.equal(at(600, 5000).stuck.progressAge, 600);
+  // progress noted in this turn wins over the turn start
+  assert.equal(at(1800, 100).state, 'busy');
+  assert.equal(at(1800, 700).state, 'stuck');
+  assert.equal(at(1800, 700).stuck.progressAge, 700);
+  // no last_progress_at at all
+  assert.equal(view(sil({ since: 1800 }), { recent: WINDOW }).stuck.progressAge, 1800);
+});
+
+test('a watchdog flag counts from when the wrapper raised it, and says so', () => {
+  const flagged = (since, progress) => view(agent(NAME, { state: 'stuck_suspected', since, progress }), { recent: WINDOW });
+  const early = flagged(120, 3000);
+  assert.deepEqual([early.state, early.candidate], ['busy', true]);
+  assert.equal(early.line, 'Wrapper flagged a stall 2m ago · no reply sent');
+  const late = flagged(900, 3000);
+  assert.equal(late.state, 'stuck');
+  assert.equal(late.stuck.evidence, 'Wrapper flagged a stall 15m ago · no reply sent · heartbeat still fresh');
+});
+
+// ---------------------------------------- F3: the lead-chat feed's own state is shown
+
+const LEAD_MSG = { from: 'claude-agenttalk-lead', to: 'operator', body: 'Three things need you.', ts: iso(240) };
+const chatWith = (o) => team({ chat: { ok: true, asOfMs: NOW, payload: { available: true, lead: 'claude-agenttalk-lead', messages: [LEAD_MSG] }, ...o } });
+
+test('a healthy, fresh chat read carries no note', () => {
+  const v = chatWith({});
+  assert.deepEqual(v.lead.notes, []);
+  assert.equal(v.lead.body, 'Three things need you.');
+});
+
+test('a failed chat read keeps the last message and says the read failed, with how old the last good read is', () => {
+  const v = chatWith({ ok: false, asOfMs: NOW - 90e3 });
+  assert.equal(v.lead.body, 'Three things need you.');
+  assert.deepEqual(v.lead.notes, [{ kind: 'failed', text: 'Lead chat could not be read · last read 1m ago' }]);
+  const never = chatWith({ ok: false, asOfMs: null, payload: null });
+  assert.equal(never.lead.body, '');
+  assert.deepEqual(never.lead.notes, [{ kind: 'failed', text: 'Lead chat could not be read' }]);
+});
+
+test('a chat read that has not been refreshed (a hung request) is called stale', () => {
+  assert.deepEqual(chatWith({ asOfMs: NOW - 8000 }).lead.notes, []);
+  assert.deepEqual(chatWith({ asOfMs: NOW - 9000 }).lead.notes, [{ kind: 'stale', text: 'Lead chat not refreshed for 9s' }]);
+});
+
+test('an unavailable lead is stated even when an older message exists (web.py emits both)', () => {
+  const v = chatWith({ payload: { available: false, error: 'lead_unavailable', detail: 'lead heartbeat stale', lead: 'claude-agenttalk-lead', messages: [LEAD_MSG] } });
+  assert.equal(v.lead.body, 'Three things need you.');
+  assert.equal(v.lead.unavailable, true);
+  assert.deepEqual(v.lead.notes, [{ kind: 'unavailable', text: 'The lead is unavailable: lead heartbeat stale' }]);
+  const bare = chatWith({ payload: { available: false, messages: [] } });
+  assert.deepEqual(bare.lead.notes, [{ kind: 'unavailable', text: 'The lead is unavailable' }]);
+  assert.equal(bare.lead.body, '');
+});
+
+test('failed and unavailable together give both notes, failure first', () => {
+  const v = chatWith({ ok: false, asOfMs: NOW - 30e3, payload: { available: false, detail: 'gone', lead: 'claude-agenttalk-lead', messages: [LEAD_MSG] } });
+  assert.deepEqual(v.lead.notes.map((n) => n.kind), ['failed', 'unavailable']);
+});
+
+// ------------------------- M2c: a stale health read that remembers what it last said
+
+const sillyStale = (o) => staleAgent(NAME, o);
+const stale = (o, ctxOpts) => view(sillyStale(o), { recent: WINDOW, ...ctxOpts });
+
+test('a wedged silent turn past 10 minutes is a stuck card, with "health stale" evidence and Wait first', () => {
+  const v = stale({ lk: 'working_silent', since: 900 });
+  assert.equal(v.state, 'stuck');
+  assert.equal(v.healthStale, true);
+  assert.equal(v.stuck.evidence, 'Health stale 15m (last known: silent turn) · no reply sent · heartbeat still fresh');
+  assert.equal(v.stuck.progressAge, 900);
+  const t = M.buildTeamView({ nowMs: NOW, generatedMs: NOW, root: root({ agents: [sillyStale({ lk: 'working_silent', since: 900 })], recent: WINDOW }),
+    attention: attention([]), chat: null, conn: CONN_OK, ui: {}, tz: TZ });
+  const card = t.needs.open[0];
+  assert.deepEqual([card.kind, card.title, card.evidenceNote], ['LOOKS STUCK', 'dev-6 has gone quiet',
+    'Weaker evidence: process status isn’t visible yet, so Wait comes first.']);
+  assert.deepEqual(card.options.map((o) => [o.label, o.primary, o.locked]), [['Wait 10 min', true, null], ['Restart with context', false, 'CLI only']]);
+});
+
+test('stale + last known: the 10-minute boundary counts from the turn start (599 busy, 600 stuck)', () => {
+  assert.equal(stale({ lk: 'working_silent', since: 599 }).state, 'busy');
+  assert.equal(stale({ lk: 'working_silent', since: 600 }).state, 'stuck');
+  const busy = stale({ lk: 'working_silent', since: 240 });
+  assert.equal(busy.line, 'Health stale 4m (last known: silent turn) · no reply sent');
+  assert.equal(busy.aside.detail, 'Health stale 4m (last known: silent turn) · no reply sent · no card before 10 min without activity');
+  assert.equal(busy.stuck, null);
+});
+
+test('stale + last known: progress noted inside the turn counts, an earlier turn’s does not', () => {
+  assert.equal(stale({ lk: 'working_silent', since: 1200, progress: 300 }).state, 'busy');       // progress 5 min ago
+  assert.equal(stale({ lk: 'working_silent', since: 1200, progress: 700 }).state, 'stuck');      // 11+ min ago
+  assert.equal(stale({ lk: 'working_silent', since: 5, progress: 1800 }).state, 'busy');         // previous turn
+});
+
+test('stale + last known working_turn: its last write is when the silence began', () => {
+  const v = stale({ lk: 'working_turn', since: 3000, updated: 700 });
+  assert.equal(v.state, 'stuck');
+  assert.equal(v.stuck.evidence, 'Health stale 11m (last known: working) · no reply sent · heartbeat still fresh');
+  assert.equal(stale({ lk: 'working_turn', since: 3000, updated: 500 }).state, 'busy');
+  assert.equal(stale({ lk: 'working_turn', since: 3000, updated: 500 }).candidate, false);
+});
+
+test('stale + last known stuck_suspected counts from when the wrapper flagged it', () => {
+  const v = stale({ lk: 'stuck_suspected', since: 900 });
+  assert.equal(v.state, 'stuck');
+  assert.equal(v.stuck.evidence, 'Health stale 15m (last known: wrapper flagged a stall) · no reply sent · heartbeat still fresh');
+  assert.equal(stale({ lk: 'stuck_suspected', since: 200 }).state, 'busy');
+});
+
+test('stale + last known: a reply since the wake, or an unknown reply status, is never a card', () => {
+  const replied = stale({ lk: 'working_silent', since: 900 }, { recent: [env(NAME, 'x', 'message', 100)] });
+  assert.equal(replied.state, 'busy');
+  assert.equal(replied.line, 'Health stale 15m (last known: silent turn) · replied since it woke');
+  const full = Array.from({ length: 25 }, (_, i) => env('claude-agenttalk-lead', 'operator', 'message', 60 + i * 10));
+  const unknown = stale({ lk: 'working_silent', since: 900 }, { recent: full });
+  assert.equal(unknown.state, 'busy');
+  assert.equal(unknown.line, 'Health stale 15m (last known: silent turn) · reply status unknown');
+});
+
+test('stale + last known with a stale heartbeat is a freshness problem, not a stuck agent', () => {
+  const v = stale({ lk: 'working_silent', since: 900, hb: 400 });
+  assert.deepEqual([v.state, v.stuck], ['unknown', null]);
+  assert.equal(v.line, 'Heartbeat stale 6m · not judged stuck');
+  assert.equal(stale({ lk: 'working_silent', since: 900, hb: 300 }).state, 'stuck');
+  assert.equal(stale({ lk: 'working_silent', since: 900, hb: 301 }).state, 'unknown');
+});
+
+test('stale + last known idle with a live heartbeat is still idle; without one it is unknown', () => {
+  const v = stale({ lk: 'idle_waiting', since: 2400 });
+  assert.deepEqual([v.state, v.tone, v.line, v.healthStale], ['idle', 'dim', 'Idle · 40m', true]);
+  const dead = stale({ lk: 'idle_waiting', since: 2400, hb: 900 });
+  assert.equal(dead.state, 'unknown');
+  assert.equal(dead.line, 'No fresh health · last known: idle (40m ago) · last seen 15m');
+});
+
+test('stale + last known in any other state stays unknown, and says what it last reported', () => {
+  const v = stale({ lk: 'crashed_or_exited', since: 600 });
+  assert.deepEqual([v.state, v.stuck], ['unknown', null]);
+  assert.equal(v.line, 'No fresh health · last known: crashed or exited (10m ago) · last seen 20s');
+  assert.equal(stale({ lk: 'rate_limited_or_outage', since: 600 }).state, 'unknown');
+});
+
+test('last_known_* is ignored unless valid: junk state, missing or unparseable times, a fresh health read', () => {
+  assert.equal(stale({ lk: 'bogus_state', since: 900 }).line, 'No fresh health · last seen 20s');
+  assert.equal(stale({ lk: '<img src=x onerror=alert(1)>', since: 900 }).state, 'unknown');
+  const noTimes = sillyStale({ lk: 'working_silent', since: 900 });
+  noTimes.health.last_known_updated_at = 'nope';
+  assert.equal(view(noTimes, { recent: WINDOW }).state, 'unknown');
+  const noSince = sillyStale({ lk: 'working_silent', since: 900 });
+  delete noSince.health.last_known_since;
+  assert.equal(view(noSince, { recent: WINDOW }).state, 'unknown');
+  // a fresh read never consults last_known_*
+  const fresh = agent(NAME, { state: 'idle_waiting', since: 60 });
+  fresh.health.last_known_state = 'working_silent';
+  fresh.health.last_known_since = iso(5000);
+  fresh.health.last_known_updated_at = iso(5000);
+  assert.equal(view(fresh).state, 'idle');
+});
+
+test('without last_known_* a stale read is exactly what it was: unknown, no card', () => {
+  const plain = sillyStale({ lk: null });
+  assert.deepEqual([view(plain).state, view(plain).line], ['unknown', 'No fresh health · last seen 20s']);
+});
+
+test('a team with idle agents whose health is stale (heartbeat newer) still reads as a quiet team', () => {
+  const agents = ['a', 'b', 'c'].map((x) => staleAgent('claude-agenttalk-developer-' + x.charCodeAt(0), { lk: 'idle_waiting', since: 3000 }));
+  const v = M.buildTeamView({ nowMs: NOW, generatedMs: NOW, root: root({ agents, recent: [env('x', 'y', 'message', 10)] }),
+    attention: attention([]), chat: null, conn: CONN_OK, ui: {}, tz: TZ });
+  assert.equal(v.mode, 'quiet');
+  assert.equal(v.greeting.sub.startsWith('Nothing needs you. 3 of 3 agents are idle'), true);
+});
+
+// ------------------------------------------------ M3: chat thread and composer
+
+const THREAD = [
+  { id: 'c1', from: 'operator', to: 'claude-agenttalk-lead', body: 'Any news?', ts: iso(900) },
+  { id: 'c2', from: 'claude-agenttalk-lead', to: 'operator', body: 'Three things need you.', ts: iso(600) },
+  { id: 'c3', from: 'operator', to: 'claude-agenttalk-lead', body: 'Thanks', ts: iso(60) },
+];
+
+test('the chat thread carries both sides, oldest first, with who and how long ago', () => {
+  const v = team({ chat: chat(THREAD) });
+  assert.deepEqual(v.chat.messages.map((m) => [m.id, m.side, m.short, m.body, m.ageLabel]), [
+    ['c1', 'you', 'you', 'Any news?', '15m ago'],
+    ['c2', 'lead', 'lead', 'Three things need you.', '10m ago'],
+    ['c3', 'you', 'you', 'Thanks', '1m ago'],
+  ]);
+  assert.equal(v.chat.lastId, 'c3');
+  assert.equal(v.lead.body, 'Three things need you.', 'the lead’s latest message is still picked out');
+});
+
+test('the thread skips malformed messages, bounds long bodies, and is absent when there is nothing', () => {
+  const v = team({ chat: chat([null, { from: 'operator' }, { body: 'no sender' }, { from: 'operator', body: 5 },
+    { id: 'ok', from: 'operator', body: 'x'.repeat(5000), ts: iso(1) }]) });
+  assert.deepEqual(v.chat.messages.map((m) => m.id), ['ok']);
+  assert.equal(v.chat.messages[0].body.length, 1200);
+  assert.equal(v.chat.messages[0].truncated, true);
+  assert.equal(team({ chat: chat([]) }).chat, null);
+  assert.equal(team({ chat: null }).chat, null);
+});
+
+test('a failed or stale chat read still shows the thread that was read', () => {
+  const v = team({ chat: { ok: false, asOfMs: NOW - 60e3, payload: { available: true, operator: 'operator', lead: 'claude-agenttalk-lead', messages: THREAD } } });
+  assert.equal(v.chat.messages.length, 3);
+});
+
+test('the composer is disabled in this slice and says why, first reason first', () => {
+  const online = team({ chat: chat(THREAD) });
+  assert.deepEqual([online.composer.enabled, online.composer.reason, online.composer.placeholder],
+    [false, 'Messaging the lead is not available in this read-only view. Use the classic console or the CLI.', 'Message the lead   ( / )']);
+  const offline = team({ chat: chat(THREAD), conn: { reachable: false, stalledPolls: 0, lastOkMs: NOW - 5000 } });
+  assert.equal(offline.composer.reason, 'Paused — the lead can’t receive while the team is offline.');
+  const down = team({ chat: chat(THREAD, { available: false, detail: 'gone' }) });
+  assert.equal(down.composer.reason, 'The lead is unavailable, so a message cannot be delivered.');
+  assert.equal(team({ chat: null }).composer.enabled, false);
+});
+
+test('the composer can only be enabled by canAct, and never while offline or with the lead unavailable', () => {
+  const on = team({ chat: chat(THREAD), canAct: true });
+  assert.deepEqual([on.composer.enabled, on.composer.reason], [true, '']);
+  assert.equal(team({ chat: chat(THREAD), canAct: true, conn: { reachable: false, lastOkMs: NOW } }).composer.enabled, false);
+  assert.equal(team({ chat: chat(THREAD, { available: false }), canAct: true }).composer.enabled, false);
+});
+
+test('deferrals and snoozes are per team: uiFor gives each team its own', () => {
+  const roots = [root({ project_id: 'a', agents: [agent('claude-agenttalk-lead')], recent: [env('x', 'y', 'message', 5)] }),
+    root({ label: 'second', project_id: 'b', agents: [agent('claude-second-lead')], recent: [env('x', 'y', 'message', 5)] })];
+  const item = escalation({ id: 'same-id' });
+  const shell = M.buildShellView({
+    roots, attentionByRoot: { a: attention([item]), b: attention([item]) }, chatByRoot: {}, param: '',
+    nowMs: NOW, generatedMs: NOW, conn: CONN_OK, ui: {}, tz: TZ,
+    uiFor: (id) => (id === 'a' ? { deferred: { 'same-id': NOW } } : {}),
+  });
+  assert.deepEqual(shell.teams.map((t) => [t.label, t.needsCount]), [['agenttalk', 0], ['second', 1]]);
+  assert.equal(shell.teams[0].view.needs.deferredCount, 1);
+});
+
+test('feed-supplied ids that look like prototype keys are ordinary ids for deferral, snooze and answers', () => {
+  const evil = ['__proto__', 'constructor', 'toString', 'hasOwnProperty'];
+  const items = attention(evil.map((id, i) => escalation({ id, title: 'T' + id, age: 100 + i })));
+  const plain = team({ root: { agents: [agent('claude-agenttalk-lead')] }, attention: items, ui: { deferred: {}, answered: {}, snoozedUntil: {} } });
+  assert.deepEqual(plain.needs.open.map((c) => c.id).sort(), evil.slice().sort(), 'nothing is hidden by an inherited key');
+  const some = team({ root: { agents: [agent('claude-agenttalk-lead')] }, attention: items, ui: { deferred: { constructor: 1 }, answered: { toString: 1 } } });
+  assert.deepEqual(some.needs.open.map((c) => c.id).sort(), ['__proto__', 'hasOwnProperty']);
+  assert.equal(some.needs.deferredCount, 1);
+  assert.deepEqual(some.needs.answered.map((c) => c.id), ['toString']);
+});
+
+test('an agent whose project token is a prototype key does not break the team project', () => {
+  assert.equal(M.teamProject(['claude-__proto__-lead', 'codex-__proto__-developer-1'], []), '__proto__');
+  assert.equal(M.shortName('claude-constructor-lead', 'constructor', [], []), 'lead');
+});
+
+// ------------------------------------------- M3 fix round F3: a deferral belongs to its incident
+
+const stuckTeam = (o, ui) => M.buildTeamView({ nowMs: NOW, generatedMs: NOW, root: root({ agents: [agent('claude-agenttalk-lead'), agent(NAME, o)], recent: WINDOW }),
+  attention: attention([]), chat: null, conn: CONN_OK, ui: ui || {}, tz: TZ });
+const STUCK_ID = 'stuck:' + NAME;
+
+test('F3: a stuck card carries the turn it is about: a silent turn’s start, unknown for a watchdog flag', () => {
+  const silent = stuckTeam({ state: 'working_silent', since: 1800, progress: 840 });
+  assert.equal(silent.needs.open[0].incident.turnStartMs, NOW - 1800e3);
+  assert.equal(silent.needs.open[0].id, STUCK_ID);
+  const flagged = stuckTeam({ state: 'stuck_suspected', since: 900 });
+  assert.equal(flagged.needs.open[0].incident.turnStartMs, null, 'since is the flag time, not the turn start');
+  const remembered = M.buildTeamView({ nowMs: NOW, generatedMs: NOW, tz: TZ, conn: CONN_OK, ui: {}, attention: attention([]), chat: null,
+    root: root({ agents: [agent('claude-agenttalk-lead'), staleAgent(NAME, { lk: 'working_silent', since: 900 })], recent: WINDOW }) });
+  assert.equal(remembered.needs.open[0].incident.turnStartMs, NOW - 900e3, 'also through a stale read (last_known_since)');
+});
+
+test('F3: a deferral made after the turn began applies; one made before it began does not', () => {
+  const o = { state: 'working_silent', since: 1800, progress: 840 };          // the turn began at NOW - 1800 s
+  const after = stuckTeam(o, { deferred: { [STUCK_ID]: NOW - 300e3 } });        // deferred while it was stalled
+  assert.deepEqual([after.needs.open.length, after.needs.deferredCount], [0, 1]);
+  const before = stuckTeam(o, { deferred: { [STUCK_ID]: NOW - 3600e3 } });      // deferred before this turn existed
+  assert.deepEqual([before.needs.open.map((c) => c.id), before.needs.deferredCount], [[STUCK_ID], 0]);
+  assert.deepEqual(before.needs.deferredCards, []);
+});
+
+test('F3: the same holds for Wait 10 min (its start is the snooze end minus ten minutes)', () => {
+  const o = { state: 'working_silent', since: 1800, progress: 840 };
+  const fresh = stuckTeam(o, { snoozedUntil: { [STUCK_ID]: NOW + 300e3 } });      // started 5 min ago: after the turn began
+  assert.deepEqual([fresh.needs.open.length, fresh.needs.snoozed.length], [0, 1]);
+  const old = stuckTeam({ state: 'working_silent', since: 200, progress: null }, { snoozedUntil: { [STUCK_ID]: NOW + 300e3 } });
+  assert.equal(old.needs.snoozed.length, 0, 'the turn began 200 s ago, after that snooze started (5 min ago): a new incident');
+});
+
+test('F3: a watchdog-flag incident cannot be told apart, so its deferral stands; feed cards ignore incidents', () => {
+  const flagged = stuckTeam({ state: 'stuck_suspected', since: 900 }, { deferred: { [STUCK_ID]: NOW - 3600e3 } });
+  assert.deepEqual([flagged.needs.open.length, flagged.needs.deferredCount], [0, 1]);
+  const feedCard = team({ root: { agents: [agent('claude-agenttalk-lead')] }, attention: attention([escalation({ id: 'e1' })]), ui: { deferred: { e1: NOW - 999e9 } } });
+  assert.equal(feedCard.needs.deferredCount, 1);
+  const legacy = team({ root: { agents: [agent('claude-agenttalk-lead')] }, attention: attention([escalation({ id: 'e1' })]), ui: { deferred: { e1: true } } });
+  assert.equal(legacy.needs.deferredCount, 1);
+});
+
+run();

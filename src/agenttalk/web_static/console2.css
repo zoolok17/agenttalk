@@ -1,0 +1,698 @@
+/* =============================================================================
+   agenttalk console v2 - console2.css   (pitch slice, milestone M1)
+
+   Served at /static/console2.css for the /v2 shell. Under the console CSP
+   (style-src 'self'): no @font-face, no remote url(), no inline anything. System
+   font stacks only; self-hosting the design fonts is a separate, reviewed change.
+
+   Theme engine: every theme is a block of custom properties on :root, chosen by
+   the data-theme attribute that console2.js sets. Midnight is the default (no
+   attribute needed). Keys follow the design handoff tokens/themes.json:
+     bg panel panel2 border fg dim accent accent-ink ok warn bad info serif
+   plus the runtime badge colours. Terminal keeps the same layout and only flips
+   the fonts to mono and every radius to 0.
+
+   Only Midnight is styled and reviewed in this slice. Paper, Synthwave and
+   Terminal carry their variables so the engine is exercised; Paper uses the two
+   contrast fixes the handoff recommends (06-RULES: dim, accent), not yet reviewed.
+   ============================================================================= */
+
+/* ------------------------------------------------------------------ tokens */
+
+:root {
+  /* Midnight (default) */
+  --bg: #0A0C11;
+  --panel: #11141B;
+  --panel2: #161A23;
+  --border: #232834;
+  --fg: #E7EAF0;
+  --dim: #7D8595;
+  --accent: #7C8CFF;
+  --accent-ink: #0A0C11;
+  --ok: #3DD68C;
+  --warn: #F5B83D;
+  --bad: #FF6B6B;
+  --info: #5CC8FF;
+  --serif: #F2F3F7;
+  --rt-claude: #D08A5E;
+  --rt-codex: #4FB3A0;
+  --rt-qwen: #9E82E0;
+
+  --font-ui: system-ui, "Segoe UI", -apple-system, Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Code", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --font-serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
+
+  --r-card: 16px;
+  --r-btn: 10px;
+  --r-pill: 999px;
+  --r-logo: 9px;
+}
+
+:root[data-theme="paper"] {
+  --bg: #F6F3EC;
+  --panel: #FFFFFF;
+  --panel2: #FBF9F4;
+  --border: #E5E0D4;
+  --fg: #1D1B17;
+  --dim: #6B655B;
+  --accent: #C9481F;
+  --accent-ink: #FFFFFF;
+  --ok: #2E9F6B;
+  --warn: #B7780A;
+  --bad: #D2402F;
+  --info: #2F6FC9;
+  --serif: #1D1B17;
+  --rt-claude: #B0532C;
+  --rt-codex: #2C7A6B;
+  --rt-qwen: #6D4AC0;
+}
+
+:root[data-theme="synthwave"] {
+  --bg: #120822;
+  --panel: #1B0F33;
+  --panel2: #231342;
+  --border: #3B2266;
+  --fg: #FBEFFF;
+  --dim: #A88CCB;
+  --accent: #FF4FD8;
+  --accent-ink: #120822;
+  --ok: #00F5D4;
+  --warn: #FFD23F;
+  --bad: #FF5C8A;
+  --info: #00E5FF;
+  --serif: #FFE3FA;
+}
+
+:root[data-theme="terminal"] {
+  --bg: #040906;
+  --panel: #07100A;
+  --panel2: #0B170F;
+  --border: #1B3A24;
+  --fg: #7CFF9B;
+  --dim: #52A06B;
+  --accent: #DFFFE7;
+  --accent-ink: #040906;
+  --ok: #7CFF9B;
+  --warn: #FFD166;
+  --bad: #FF5C5C;
+  --info: #7FD8FF;
+  --serif: #7CFF9B;
+
+  --font-ui: var(--font-mono);
+  --font-serif: var(--font-mono);
+  --r-card: 0;
+  --r-btn: 0;
+  --r-pill: 0;
+  --r-logo: 0;
+}
+
+/* ------------------------------------------------------------------- frame */
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+#app {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  grid-template-rows: 58px minmax(0, 1fr) 32px;
+  height: 100vh;
+  min-width: 1024px;
+}
+
+#c2-header {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 0 22px;
+  border-bottom: 1px solid var(--border);
+  min-width: 0;
+}
+
+#c2-stream {
+  grid-column: 1;
+  min-width: 0;
+  padding: 22px 26px 14px;
+  overflow-y: auto;
+}
+
+#c2-rail {
+  grid-column: 2;
+  min-width: 0;
+  padding: 18px;
+  overflow-y: auto;
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+}
+
+#c2-footer {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 0 22px;
+  border-top: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.c2-link { color: var(--dim); text-decoration: underline; }
+.c2-link:hover { color: var(--fg); }
+
+/* ------------------------------------------------------------------ header */
+
+.c2-brand { display: flex; align-items: center; gap: 9px; }
+.c2-logo {
+  width: 22px;
+  height: 22px;
+  background: var(--accent);
+  border-radius: var(--r-logo);
+}
+.c2-wordmark { font-size: 15px; font-weight: 600; letter-spacing: .01em; }
+.c2-spacer { flex: 1 1 auto; }
+
+/* Segmented control: team chips and theme choices. */
+.c2-seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+}
+.c2-seg button {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  padding: 5px 12px;
+  border-radius: var(--r-pill);
+  cursor: pointer;
+}
+.c2-seg button[aria-pressed="true"] { background: var(--fg); color: var(--bg); }
+.c2-seg button:disabled { cursor: default; opacity: .6; }
+
+.c2-keybtn {
+  appearance: none;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--dim);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-btn);
+  cursor: pointer;
+}
+.c2-keybtn:disabled { opacity: .5; cursor: default; }
+.c2-keybtn[aria-pressed="true"] { color: var(--fg); border-color: var(--accent); }
+
+.c2-seg button:focus-visible,
+.c2-keybtn:focus-visible,
+.c2-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.c2-hint-key { color: var(--fg); margin-right: 4px; }
+
+/* ------------------------------------------------------------------ stream */
+
+.c2-greeting {
+  margin: 0;
+  font-family: var(--font-serif);
+  font-weight: 400;
+  font-size: 40px;
+  line-height: 1.1;
+  color: var(--serif);
+}
+:root[data-theme="terminal"] .c2-greeting { font-size: 28px; }
+.c2-sub { margin: 10px 0 0; max-width: 620px; font-size: 13.5px; color: var(--dim); }
+
+.c2-pick { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.c2-pick-btn {
+  appearance: none;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  padding: 6px 14px;
+  color: var(--fg);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  cursor: pointer;
+}
+.c2-pick-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* -------------------------------------------- M2: data-bearing skeleton
+   Plain and legible on purpose: the polished treatment (pulse, avatars, meters,
+   cards as controls) arrives with M3 and M4. Tone classes are a fixed set chosen by
+   the model; nothing here is derived from feed text. */
+
+.tone-ok { --tone: var(--ok); }
+.tone-info { --tone: var(--info); }
+.tone-warn { --tone: var(--warn); }
+.tone-bad { --tone: var(--bad); }
+.tone-dim { --tone: var(--dim); }
+
+.c2-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .1em;
+  color: var(--dim);
+}
+.c2-meta { font-family: var(--font-mono); font-size: 10.5px; color: var(--dim); }
+
+/* Team chips: freshness dot, label, needs badge. */
+.c2-seg .c2-chip { display: inline-flex; align-items: center; gap: 7px; }
+.c2-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dim); flex: none; }
+.c2-dot.is-live { background: var(--ok); animation: c2-pulse 2s ease-in-out infinite; }
+.c2-dot.is-silent, .c2-dot.is-unreachable, .c2-dot.is-error { background: var(--warn); }
+@keyframes c2-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) {
+  .c2-dot.is-live { animation: none; }
+}
+.c2-badge {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 0 6px;
+  color: #111;
+  background: var(--warn);
+  border-radius: var(--r-pill);
+}
+.c2-badge.is-empty { display: none; }
+.c2-seg button[aria-pressed="true"] .c2-badge { color: #111; }
+
+/* Offline / silent banner. */
+.c2-banner {
+  max-width: 700px;
+  padding: 12px 16px;
+  margin-bottom: 14px;
+  border: 1px solid var(--warn);
+  border-radius: var(--r-card);
+  background: var(--panel);
+}
+.c2-banner-kicker { font-family: var(--font-mono); font-size: 10.5px; font-weight: 600; color: var(--warn); }
+.c2-banner-text { margin-top: 4px; font-size: 13px; }
+.c2-banner-retried { margin-top: 6px; }
+.c2-retry {
+  appearance: none;
+  margin-top: 10px;
+  padding: 6px 14px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--warn);
+  background: transparent;
+  border: 1px solid var(--warn);
+  border-radius: var(--r-pill);
+  cursor: pointer;
+}
+.c2-retry:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.c2-lead { max-width: 700px; margin: 16px 0 6px; }
+.c2-lead-body {
+  margin: 0 0 4px;
+  padding: 10px 14px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px var(--r-card) var(--r-card) var(--r-card);
+  font-size: 14px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.c2-lead-body.is-dim { color: var(--dim); }
+
+/* Needs-you cards (text only in M2). */
+.c2-card {
+  max-width: 700px;
+  margin: 14px 0 0;
+  padding: 15px 18px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border: 1px solid color-mix(in srgb, var(--tone) 50%, transparent);
+  border-radius: var(--r-card);
+}
+/* M4b: keyboard selection (j/k). R3: focus moves onto the card itself with the selection (never
+   left behind on a stale control), so `:focus-visible` below pairs with `.is-selected` rather than
+   fighting it - both are the same accent colour, one a hairline border, the other the outline. */
+.c2-card.is-selected {
+  border: 1px solid var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.c2-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.c2-card-head { display: flex; justify-content: space-between; gap: 12px; }
+.c2-kind { font-family: var(--font-mono); font-size: 10.5px; font-weight: 600; letter-spacing: .1em; color: var(--tone); }
+.c2-age { font-family: var(--font-mono); font-size: 11px; color: var(--dim); }
+.c2-card-title {
+  margin: 8px 0;
+  font-family: var(--font-serif);
+  font-weight: 400;
+  font-size: 22px;
+  line-height: 1.2;
+  color: var(--serif);
+  overflow-wrap: anywhere;
+}
+:root[data-theme="terminal"] .c2-card-title { font-size: 17px; }
+.c2-evidence { display: flex; gap: 10px; align-items: baseline; }
+.c2-evidence-text { font-family: var(--font-mono); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.c2-evidence-text.is-missing { color: var(--dim); }
+.c2-note { margin-top: 6px; font-size: 12px; color: var(--dim); }
+.c2-options { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 0; padding: 0; list-style: none; }
+.c2-option { padding: 5px 12px; font-size: 12px; border: 1px solid var(--border); border-radius: var(--r-pill); }
+.c2-option.is-primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.c2-option.is-locked { opacity: .5; }
+
+.c2-deferred { margin-top: 12px; font-family: var(--font-mono); font-size: 11.5px; color: var(--dim); }
+.c2-aside { max-width: 700px; margin-top: 18px; }
+.c2-aside-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 6px;
+  padding: 8px 12px;
+  border: 1px dashed var(--border);
+  border-radius: 9px;
+}
+.c2-aside-title { font-size: 13px; font-weight: 600; }
+.c2-aside-detail { font-size: 12px; color: var(--dim); overflow-wrap: anywhere; }
+
+/* Rail. */
+.c2-usage, .c2-roster { margin-bottom: 20px; }
+.c2-usage-row { margin-top: 10px; }
+.c2-usage-head { display: flex; align-items: center; gap: 8px; }
+.c2-usage-name { flex: 1 1 auto; font-size: 12px; }
+.c2-usage-pct { font-family: var(--font-mono); font-size: 12px; font-weight: 600; color: var(--tone); }
+.c2-meter { height: 4px; margin: 5px 0 3px; background: var(--border); border-radius: var(--r-pill); overflow: hidden; }
+.c2-meter-fill { height: 100%; background: var(--tone); }
+/* N3: a stale (old) usage reading dims only its own meter, never the readable percentage/name/"as
+   of" text next to it - the same accessibility decision as the app-wide stale treatment above. */
+.c2-usage-row.is-stale .c2-meter { opacity: .6; }
+
+.c2-rt {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--bg);
+  background: var(--dim);
+  border-radius: 4px;
+}
+.c2-rt.rt-claude { background: var(--rt-claude); }
+.c2-rt.rt-codex { background: var(--rt-codex); }
+.c2-rt.rt-qwen { background: var(--rt-qwen); }
+
+/* Avatar: a served hexagon silhouette (Midnight) with the runtime badge bottom-right. The badge
+   alone is what Terminal shows (design 06-RULES: "Terminal -> no image, runtime letter in a box");
+   `.c2-avatar-img` is simply hidden there and the badge is styled to fill the frame. */
+.c2-avatar {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 32px;
+  height: 32px;
+}
+.c2-avatar-img { width: 100%; height: 100%; object-fit: contain; }
+.c2-avatar-badge {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--bg);
+  background: var(--dim);
+  border: 2px solid var(--panel);
+  border-radius: 4px;
+}
+.c2-avatar-badge.rt-claude { background: var(--rt-claude); }
+.c2-avatar-badge.rt-codex { background: var(--rt-codex); }
+.c2-avatar-badge.rt-qwen { background: var(--rt-qwen); }
+:root[data-theme="terminal"] .c2-avatar-img { display: none; }
+:root[data-theme="terminal"] .c2-avatar-badge {
+  position: static;
+  width: 100%;
+  height: 100%;
+  font-size: 13px;
+  border: 1px solid var(--border);
+  border-radius: 0;
+}
+
+.c2-roster-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.c2-agent { display: flex; align-items: flex-start; gap: 10px; margin-top: 11px; min-width: 0; }
+.c2-agent-text { flex: 1 1 auto; min-width: 0; }
+.c2-agent-name { font-family: var(--font-mono); font-size: 12px; font-weight: 500; }
+.c2-agent-line { font-size: 11px; color: var(--tone); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.c2-agent-cap { font-family: var(--font-mono); font-size: 10.5px; color: var(--bad); white-space: nowrap; }
+
+/* Stale data (offline or silent): last-known TEXT stays fully readable (N3 accessibility decision,
+   step doc section 22: the design's blanket 50% greying, measured against the actual rendered page,
+   put Midnight's dim-on-panel text at about 2.08:1 - a wash-out, not a legibility cue). Only
+   decorative elements dim: the avatar IMAGE (never the badge - fix round 3, N3 narrowed: the runtime
+   letter is informational when a seat's configured runtime differs from its name, so it stays
+   full-strength even here) and usage meters. The banner and every "as of" label were already, and
+   remain, full-strength - the stuck/offline signal is the words, never a colour alone. */
+.is-stale .c2-avatar-img,
+.is-stale .c2-meter { opacity: .5; }
+
+/* ------------------------------------------------------ M3: the stream
+   Midnight is the reviewed theme; every colour and radius below comes from the theme
+   variables, so the other three carry it along (Terminal: radii 0, mono fonts). */
+
+#c2-stream > * { flex: none; }
+.c2-greeting { margin-top: 2px; }
+
+.c2-lead-row { display: flex; align-items: flex-start; gap: 10px; }
+.c2-lead-col { min-width: 0; }
+.c2-lead-avatar {
+  width: 30px;
+  height: 30px;
+  border: 2px solid var(--accent);
+  border-radius: var(--r-pill);
+}
+:root[data-theme="terminal"] .c2-lead-avatar { border-radius: 0; }
+.c2-lead-note { margin-top: 8px; }
+
+/* Needs-you cards. */
+.c2-card { margin-top: 14px; }
+.c2-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
+.c2-opt {
+  appearance: none;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  padding: 6px 14px;
+  color: var(--fg);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  cursor: pointer;
+}
+.c2-opt.is-primary { color: var(--accent-ink); background: var(--accent); border-color: var(--accent); }
+.c2-opt:disabled { cursor: default; }
+.c2-opt.is-locked { opacity: .5; }
+.c2-later {
+  appearance: none;
+  font: inherit;
+  font-size: 12px;
+  padding: 6px 8px;
+  color: var(--dim);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+.c2-later:hover { color: var(--fg); }
+.c2-opt:focus-visible, .c2-later:focus-visible, .c2-deferred:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.c2-deferred {
+  appearance: none;
+  display: block;
+  margin-top: 12px;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--dim);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  text-align: left;
+}
+.c2-deferred:hover { color: var(--fg); }
+
+/* Lead chat thread: yours on the right, the lead's on the left. */
+.c2-chat { max-width: 700px; margin-top: 22px; }
+.c2-thread {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 320px;
+  margin-top: 8px;
+  padding-right: 4px;
+  overflow-y: auto;
+}
+.c2-msg { display: flex; flex-direction: column; gap: 3px; max-width: 85%; }
+.c2-msg.is-you { align-self: flex-end; align-items: flex-end; }
+.c2-bubble {
+  margin: 0;
+  padding: 9px 14px;
+  font-size: 14px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--fg);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px var(--r-card) var(--r-card) var(--r-card);
+}
+.c2-msg.is-you .c2-bubble {
+  color: var(--accent-ink);
+  background: var(--accent);
+  border-color: var(--accent);
+  border-radius: var(--r-card) 4px var(--r-card) var(--r-card);
+}
+:root[data-theme="terminal"] .c2-bubble { border-radius: 0; }
+
+/* Composer: pinned to the bottom of the stream, disabled in this slice with its reason. */
+.c2-composer {
+  position: sticky;
+  bottom: -14px;
+  max-width: 700px;
+  margin-top: 18px;
+  padding: 8px 0 14px;
+  background: var(--bg);
+}
+.c2-composer-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 6px 6px 14px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+}
+.c2-composer-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font: inherit;
+  font-size: 14.5px;
+  color: var(--fg);
+  background: transparent;
+  border: 0;
+  outline: 0;
+}
+.c2-composer-input:disabled, .c2-send:disabled { opacity: .5; cursor: not-allowed; }
+.c2-send {
+  appearance: none;
+  flex: none;
+  height: 40px;
+  padding: 0 16px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent-ink);
+  background: var(--accent);
+  border: 0;
+  border-radius: var(--r-btn);
+}
+.c2-composer-reason { margin-top: 6px; }
+
+/* the stream takes programmatic focus as a last resort (a redraw removed the focused control) */
+#c2-stream:focus { outline: none; }
+
+/* M4b: the keyboard-shortcuts overlay. Built once, toggled by a class only (never a style
+   attribute); the backdrop is a separate element so its opacity does not also fade the panel. */
+.c2-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+}
+.c2-overlay.is-open { display: flex; }
+.c2-overlay-backdrop {
+  position: absolute;
+  inset: 0;
+  background: var(--bg);
+  opacity: .7;
+}
+.c2-overlay-panel {
+  position: relative;
+  max-width: 420px;
+  margin: 16px;
+  padding: 20px 24px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+}
+.c2-overlay-title {
+  margin: 0 0 12px;
+  font-family: var(--font-serif);
+  font-weight: 400;
+  font-size: 20px;
+  color: var(--serif);
+}
+.c2-keymap-list {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 6px 14px;
+  margin: 0;
+}
+.c2-keymap-key {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+  padding: 1px 6px;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-btn);
+  justify-self: start;
+}
+.c2-keymap-desc { margin: 0; font-size: 13px; color: var(--dim); }
+.c2-overlay-close {
+  appearance: none;
+  margin-top: 18px;
+  padding: 6px 14px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  cursor: pointer;
+}
+.c2-overlay-close:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

@@ -1,0 +1,266 @@
+// Shared harness for the console v2 node tests: a tiny runner and a recording DOM
+// stub. The stub is strict on purpose. Every way of turning a string into markup or
+// style (innerHTML, outerHTML, insertAdjacentHTML, setAttribute of style / href /
+// on* / src) throws AND is recorded in `violations`, because a page script can catch
+// a throw; the tests assert `violations` stays empty.
+import fs from 'node:fs';
+import path from 'node:path';
+import vm from 'node:vm';
+import { fileURLToPath } from 'node:url';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+export const STATIC_DIR = path.join(here, '..', 'src', 'agenttalk', 'web_static');
+
+export function readStatic(name) {
+  return fs.readFileSync(path.join(STATIC_DIR, name), 'utf8');
+}
+
+// ------------------------------------------------------------------ runner
+
+export function createRunner(title) {
+  const cases = [];
+  return {
+    test(name, fn) { cases.push([name, fn]); },
+    async run() {
+      let passed = 0;
+      for (const [name, fn] of cases) {
+        try {
+          await fn();
+          passed += 1;
+          console.log('PASS', name);
+        } catch (err) {
+          console.log('FAIL', name);
+          console.log(String(err && err.stack ? err.stack : err));
+        }
+      }
+      console.log(`${title}: ${passed}/${cases.length} passed`);
+      process.exit(passed === cases.length ? 0 : 1);
+    },
+  };
+}
+
+// ---------------------------------------------------------------- DOM stub
+
+export function makeDom() {
+  const violations = [];
+  const registry = new Map();   // id -> node
+  let active = null;            // document.activeElement (the body when nothing is focused)
+
+  function forbid(what) {
+    violations.push(what);
+    throw new Error('forbidden DOM use: ' + what);
+  }
+
+  class Node {
+    constructor(tag) {
+      this.tagName = tag.toUpperCase();
+      this.className = '';
+      this.children = [];
+      this.attributes = {};
+      this.listeners = {};
+      this.disabled = false;
+      this._text = '';
+      this.nodeType = 1;
+      this.style = {};   // CSSOM object: allowed under the console CSP (unlike a style attribute)
+      this.parent = null;
+      this._root = false;   // the served shell's elements and <html>/<body> are part of the document
+      this._st = 0;
+    }
+    // Like a browser: only an element that is in the document has scroll layout, so a scrollTop
+    // set on a detached element is lost (this is what made the M3 thread scroll a no-op).
+    get isConnected() { return this._root || (this.parent !== null && this.parent.isConnected); }
+    get scrollTop() { return this._st; }
+    set scrollTop(v) { if (this.isConnected) this._st = Number(v); }
+    get scrollHeight() { return 100 * (this.children.length + 1); }
+    _drop(child) {
+      // A subtree leaving the document takes focus with it (the page gets it back).
+      if (active && (child === active || (child.nodeType === 1 && child.contains(active)))) active = body;
+      child.parent = null;
+    }
+    get textContent() {
+      return this.children.length ? this.children.map((c) => c.textContent).join('') : this._text;
+    }
+    set textContent(value) {
+      // Replacing the children detaches the old ones: like a browser, focus that sat
+      // inside them falls back to the page.
+      this.children.forEach((c) => this._drop(c));
+      this.children = [];
+      this._text = String(value);
+      this._st = 0;   // worst case for a scroller whose content was replaced: back to the top
+    }
+    contains(node) {
+      if (node === this) return true;
+      return this.children.some((c) => c.nodeType === 1 && c.contains(node));
+    }
+    focus() { if (!this.disabled && this.isConnected) active = this; }
+    blur() { if (active === this) active = body; }
+    set innerHTML(_v) { forbid('innerHTML'); }
+    get innerHTML() { return forbid('innerHTML read'); }
+    set outerHTML(_v) { forbid('outerHTML'); }
+    insertAdjacentHTML() { forbid('insertAdjacentHTML'); }
+    appendChild(child) {
+      if (child.nodeType === 1 && child.parent) child.parent.removeChild(child);
+      this.children.push(child);
+      child.parent = this;
+      return child;
+    }
+    removeChild(child) {
+      const i = this.children.indexOf(child);
+      if (i < 0) throw new Error('removeChild: not a child');
+      this.children.splice(i, 1);
+      this._drop(child);
+      return child;
+    }
+    insertBefore(fresh, ref) {
+      if (fresh.nodeType === 1 && fresh.parent) fresh.parent.removeChild(fresh);
+      const i = this.children.indexOf(ref);
+      if (i < 0) throw new Error('insertBefore: reference is not a child');
+      this.children.splice(i, 0, fresh);
+      fresh.parent = this;
+      return fresh;
+    }
+    replaceChild(fresh, old) {
+      const i = this.children.indexOf(old);
+      if (i < 0) throw new Error('replaceChild: not a child');
+      if (fresh.nodeType === 1 && fresh.parent) fresh.parent.removeChild(fresh);
+      this.children.splice(this.children.indexOf(old), 1, fresh);
+      fresh.parent = this;
+      this._drop(old);
+      return old;
+    }
+    hasAttribute(name) { return this.getAttribute(name) !== null; }
+    removeAttribute(name) { delete this.attributes[String(name).toLowerCase()]; }
+    setAttribute(name, value) {
+      const n = String(name).toLowerCase();
+      // `src` is allowed ONLY for the one narrow, allowlisted shape the app is meant to use
+      // (a served avatar file, M4): anything else - a hostile string, a bare filename, an
+      // external URL - still throws, so the ban on "a link/source built from data" still holds.
+      if (n === 'src' && /^\/static\/avatars\/[a-z0-9-]+\.png$/.test(String(value))) {
+        this.attributes[n] = String(value);
+        return;
+      }
+      if (n === 'style' || n === 'href' || n === 'src' || n === 'srcdoc' || n.startsWith('on')) {
+        forbid('setAttribute ' + n);
+      }
+      this.attributes[n] = String(value);
+      if (n === 'id') registry.set(String(value), this);
+    }
+    getAttribute(name) {
+      const n = String(name).toLowerCase();
+      return Object.prototype.hasOwnProperty.call(this.attributes, n) ? this.attributes[n] : null;
+    }
+    addEventListener(type, fn) {
+      (this.listeners[type] = this.listeners[type] || []).push(fn);
+    }
+    click() {
+      if (this.disabled) return;   // like a browser: a disabled control fires nothing
+      (this.listeners.click || []).forEach((fn) => fn({ target: this }));
+    }
+  }
+
+  class TextNode {
+    constructor(text) { this.nodeType = 3; this.textContent = String(text); }
+  }
+
+  const documentElement = new Node('html');
+  documentElement._root = true;
+  const body = new Node('body');
+  body._root = true;
+  active = body;
+  const document = {
+    documentElement,
+    body,
+    get activeElement() { return active; },
+    createElement: (tag) => new Node(tag),
+    createTextNode: (text) => new TextNode(text),
+    getElementById: (id) => registry.get(id) || null,
+    addEventListener(type, fn) { (this._l[type] = this._l[type] || []).push(fn); },
+    _l: {},
+    dispatch(type, ev) { (this._l[type] || []).forEach((fn) => fn(ev)); },
+  };
+
+  // Server-authored shell regions the script looks up by id.
+  for (const [tag, id] of [['div', 'app'], ['header', 'c2-header'], ['main', 'c2-stream'], ['aside', 'c2-rail'],
+                           ['footer', 'c2-footer'], ['span', 'c2-hints']]) {
+    const node = new Node(tag);
+    node._root = true;
+    node.setAttribute('id', id);
+  }
+
+  return { document, violations, Node, walk, texts };
+}
+
+// Depth-first list of every element under (and including) `node`.
+export function walk(node, out = []) {
+  if (node.nodeType !== 1) return out;
+  out.push(node);
+  node.children.forEach((c) => walk(c, out));
+  return out;
+}
+
+// Every text a node tree carries, in order.
+export function texts(node, out = []) {
+  if (node.nodeType === 3) { out.push(node.textContent); return out; }
+  if (node._text) out.push(node._text);
+  node.children.forEach((c) => texts(c, out));
+  return out;
+}
+
+// ---------------------------------------------------------- script loading
+
+// Evaluate the model then console2.js inside one vm context with the given globals.
+export function loadConsole(opts) {
+  const dom = opts.dom;
+  const store = new Map(Object.entries(opts.storage || {}));
+  const localStorage = {
+    getItem(k) {
+      if (opts.storageThrows) throw new Error('storage disabled');
+      return store.has(k) ? store.get(k) : null;
+    },
+    setItem(k, v) {
+      if (opts.storageThrows) throw new Error('storage disabled');
+      store.set(k, String(v));
+    },
+  };
+  const historyCalls = [];
+  const timers = [];
+  const clock = opts.clock || { perf: 0 };
+  const windowEvents = {};
+  const sandbox = {
+    document: dom.document,
+    fetch: opts.fetch,
+    console,
+    URLSearchParams,
+    performance: { now: () => clock.perf },
+    setTimeout(fn, ms) { const t = { fn, ms }; timers.push(t); return t; },
+    clearTimeout(t) { const i = timers.indexOf(t); if (i >= 0) timers.splice(i, 1); },
+    ...(opts.noAbort ? {} : { AbortController }),
+    addEventListener(type, fn) { (windowEvents[type] = windowEvents[type] || []).push(fn); },
+    location: { search: opts.search || '', pathname: opts.pathname || '/v2', hash: opts.hash || '' },
+    history: { replaceState(state, title, url) { historyCalls.push(url); } },
+  };
+  sandbox.window = sandbox;
+  sandbox.localStorage = localStorage;
+  vm.createContext(sandbox);
+  vm.runInContext(readStatic('console2-model.js'), sandbox, { filename: 'console2-model.js' });
+  if (!opts.modelOnly) {
+    vm.runInContext(readStatic('console2.js'), sandbox, { filename: 'console2.js' });
+  }
+  // Fire the timers queued so far (all, or those whose delay satisfies `pred`), then let
+  // promises settle. Request timeouts (5000 ms) are timers too: pass a predicate to leave
+  // them pending, e.g. fire((ms) => ms < 5000).
+  async function fire(pred) {
+    const due = timers.filter((t) => !pred || pred(t.ms));
+    due.forEach((t) => { const i = timers.indexOf(t); if (i >= 0) timers.splice(i, 1); });
+    due.forEach((t) => t.fn());
+    for (let i = 0; i < 12; i++) await tick();
+    return due.map((t) => t.ms);
+  }
+  return { sandbox, store, historyCalls, timers, clock, fire, windowEvents };
+}
+
+export function tick() { return new Promise((resolve) => setTimeout(resolve, 0)); }
+
+export function jsonResponse(payload, status = 200) {
+  return Promise.resolve({ ok: status >= 200 && status < 300, status, json: () => Promise.resolve(payload) });
+}

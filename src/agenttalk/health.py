@@ -223,6 +223,25 @@ def unknown(agent: str, warning: str) -> dict[str, Any]:
     return snap
 
 
+def _stale_unknown(agent: str, warning: str, raw: dict[str, Any], state: str) -> dict[str, Any]:
+    """``unknown(...)`` for a snapshot that validated but is too old to trust, plus what it said.
+
+    Every existing key and value is exactly what ``unknown()`` returns (state stays
+    ``unknown``, ``stale`` True, times None). Only new keys are appended, so no existing
+    consumer sees a different value. The ``last_known_*`` fields are the validated snapshot's
+    own state and timestamps (no free text): a reader can tell "this agent last reported a
+    silent turn, and has written nothing since" from "no health at all". They are NOT a
+    current state and must never be used as one.
+    """
+    out = unknown(agent, warning)
+    out["last_known_state"] = state
+    out["last_known_since"] = raw.get("since")
+    out["last_known_updated_at"] = raw.get("updated_at")
+    if raw.get("last_progress_at") is not None:
+        out["last_known_progress_at"] = raw.get("last_progress_at")
+    return out
+
+
 def normalize(
     raw: Any,
     *,
@@ -262,9 +281,9 @@ def normalize(
 
     age = max(0.0, now - updated_at.timestamp())
     if ttl >= 0 and age > ttl:
-        return unknown(agent, "health_stale_ttl")
+        return _stale_unknown(agent, "health_stale_ttl", raw, state)
     if heartbeat is not None and updated_at.timestamp() < heartbeat.timestamp() - skew:
-        return unknown(agent, "health_older_than_heartbeat")
+        return _stale_unknown(agent, "health_older_than_heartbeat", raw, state)
 
     out = build_snapshot(
         agent=agent,

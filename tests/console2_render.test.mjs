@@ -1,0 +1,390 @@
+// Console v2 render tests (M1): header, theme engine, keys, textContent-only.
+// Run: node tests/console2_render.test.mjs   (also run by tests/test_console2_web.py)
+//
+// console2.js is executed in a vm context against the recording DOM stub from
+// console2_harness.mjs. The stub throws (and records) on any innerHTML / outerHTML /
+// insertAdjacentHTML use and on setAttribute of style, href, src or on*.
+import assert from 'node:assert/strict';
+import {
+  createRunner, jsonResponse, loadConsole, makeDom, tick, texts, walk,
+} from './console2_harness.mjs';
+
+const { test, run } = createRunner('console2 render');
+const HOSTILE = '<img src=x onerror=alert(1)>';
+
+async function boot(opts = {}) {
+  const dom = makeDom();
+  const requests = [];
+  const fetch = opts.fetch || (() => jsonResponse({ roots: [{ label: 'agenttalk' }] }));
+  const wrapped = (url, init) => { requests.push([url, init]); return fetch(url, init); };
+  const loaded = loadConsole({
+    dom, fetch: wrapped, storage: opts.storage, storageThrows: opts.storageThrows,
+    search: opts.search, pathname: opts.pathname, hash: opts.hash, noAbort: opts.noAbort,
+  });
+  await tick(); await tick(); await tick();
+  return { dom, requests, ...loaded };
+}
+
+const header = (dom) => dom.document.getElementById('c2-header');
+const buttons = (node) => walk(node).filter((n) => n.tagName === 'BUTTON');
+const label = (b) => b.textContent;
+
+test('header: brand, team chip from /api/state, four themes, keyboard-map button (M4b)', async () => {
+  const { dom } = await boot();
+  const bar = header(dom);
+  assert.ok(texts(bar).includes('agenttalk'));
+  const btns = buttons(bar);
+  assert.deepEqual(btns.map(label), ['agenttalk', 'Midnight', 'Paper', 'Synthwave', 'Terminal', '?']);
+  assert.equal(btns[0].getAttribute('aria-pressed'), 'true');
+  assert.equal(btns[1].getAttribute('aria-pressed'), 'true');
+  assert.equal(btns[5].disabled, false, 'M4b: the keyboard map is no longer a stub');
+  assert.equal(btns[5].getAttribute('aria-pressed'), 'false');
+  assert.deepEqual(dom.violations, []);
+});
+
+test('header carries no mission progress and no spec-kitty', async () => {
+  const { dom } = await boot({ fetch: () => jsonResponse({ roots: [{ label: 'agenttalk',
+    spec_kitty: { missions: ['some-mission-01ABC'] } }] }) });
+  const all = texts(header(dom)).join(' ').toLowerCase();
+  assert.ok(!all.includes('spec-kitty') && !all.includes('mission') && !all.includes('some-mission'));
+  assert.ok(!/\d+\s*\/\s*\d+/.test(all), 'no x/y progress');
+});
+
+test('only GETs of the three feeds, no cache, nothing else', async () => {
+  const { requests } = await boot({ fetch: () => jsonResponse({ roots: [{ label: 'agenttalk', project_id: 'proj-a' }] }) });
+  assert.deepEqual(requests.map((r) => r[0]), ['/api/state', '/api/attention?root=proj-a', '/api/lead-chat?root=proj-a']);
+  for (const [, init] of requests) {
+    assert.deepEqual(Object.keys(init), ['cache', 'signal'], 'no method, no body: a GET bounded by an abort signal');
+    assert.equal(init.cache, 'no-store');
+  }
+});
+
+test('hostile labels from the feed land as text and nowhere else', async () => {
+  const { dom } = await boot({ fetch: () => jsonResponse({ roots: [
+    { label: HOSTILE }, { label: null }, {}, { label: 42 }, null,
+  ] }) });
+  const chips = buttons(header(dom)).slice(0, 5).map(label);
+  assert.deepEqual(chips, [HOSTILE, 'Team 2', 'Team 3', 'Team 4', 'Team 5']);
+  for (const node of walk(header(dom))) {
+    assert.ok(!Object.keys(node.attributes).some((k) => k.startsWith('on')), 'no on* attribute');
+    assert.ok(!('style' in node.attributes) && !('href' in node.attributes));
+  }
+  assert.deepEqual(dom.violations, []);
+});
+
+test('selecting a team chip moves the pressed state', async () => {
+  const { dom } = await boot({ fetch: () => jsonResponse({ roots: [{ label: 'main' }, { label: 'second' }] }) });
+  let chips = buttons(header(dom));
+  assert.deepEqual([chips[0], chips[1]].map((c) => c.getAttribute('aria-pressed')), ['true', 'false']);
+  chips[1].click();
+  chips = buttons(header(dom));
+  assert.deepEqual([chips[0], chips[1]].map((c) => c.getAttribute('aria-pressed')), ['false', 'true']);
+});
+
+test('feed failure or bad shape shows only what is known', async () => {
+  for (const fetch of [
+    () => Promise.reject(new Error('down')),
+    () => jsonResponse({}, 500),
+    () => Promise.resolve({ ok: true, status: 200, json: () => Promise.reject(new Error('bad json')) }),
+  ]) {
+    const { dom } = await boot({ fetch });
+    const first = buttons(header(dom))[0];
+    assert.equal(label(first), 'No team data');
+    assert.equal(first.disabled, true);
+  }
+  const { dom } = await boot({ fetch: () => jsonResponse({ roots: 'nope' }) });
+  assert.equal(label(buttons(header(dom))[0]), 'No team data', 'a snapshot without a roots list is a failed read');
+  const empty = await boot({ fetch: () => jsonResponse({ roots: [] }) });
+  assert.equal(label(buttons(header(empty.dom))[0]), 'Team');
+});
+
+test('theme: default applied, click persists and repaints, unknown stored value ignored', async () => {
+  let { dom, store } = await boot();
+  assert.equal(dom.document.documentElement.getAttribute('data-theme'), 'midnight');
+  assert.equal(store.has('agenttalk.console2.theme'), false, 'loading alone never stores a theme');
+  const paper = buttons(header(dom)).find((b) => label(b) === 'Paper');
+  paper.click();
+  assert.equal(dom.document.documentElement.getAttribute('data-theme'), 'paper');
+  assert.equal(store.get('agenttalk.console2.theme'), 'paper');
+  const pressed = buttons(header(dom)).filter((b) => b.getAttribute('aria-pressed') === 'true').map(label);
+  assert.ok(pressed.includes('Paper') && !pressed.includes('Midnight'));
+
+  ({ dom } = await boot({ storage: { 'agenttalk.console2.theme': 'synthwave' } }));
+  assert.equal(dom.document.documentElement.getAttribute('data-theme'), 'synthwave');
+  ({ dom } = await boot({ storage: { 'agenttalk.console2.theme': '"><script>' } }));
+  assert.equal(dom.document.documentElement.getAttribute('data-theme'), 'midnight');
+});
+
+test('theme still works when storage is unavailable', async () => {
+  const { dom } = await boot({ storageThrows: true });
+  assert.equal(dom.document.documentElement.getAttribute('data-theme'), 'midnight');
+  buttons(header(dom)).find((b) => label(b) === 'Terminal').click();
+  assert.equal(dom.document.documentElement.getAttribute('data-theme'), 'terminal');
+});
+
+test('key t cycles themes; ignored while typing and with modifiers', async () => {
+  const { dom } = await boot();
+  const theme = () => dom.document.documentElement.getAttribute('data-theme');
+  dom.document.dispatch('keydown', { key: 't', target: { tagName: 'BODY' } });
+  assert.equal(theme(), 'paper');
+  dom.document.dispatch('keydown', { key: 't', target: { tagName: 'INPUT' } });
+  dom.document.dispatch('keydown', { key: 't', target: { tagName: 'TEXTAREA' } });
+  dom.document.dispatch('keydown', { key: 't', target: { tagName: 'DIV', isContentEditable: true } });
+  dom.document.dispatch('keydown', { key: 't', ctrlKey: true, target: { tagName: 'BODY' } });
+  dom.document.dispatch('keydown', { key: 'j', target: { tagName: 'BODY' } });
+  assert.equal(theme(), 'paper');
+  for (let i = 0; i < 3; i++) dom.document.dispatch('keydown', { key: 't', target: { tagName: 'BODY' } });
+  assert.equal(theme(), 'midnight');
+});
+
+// ------------------------------------------------------------ M4b: keyboard overlay
+
+const overlay = (dom) => dom.document.getElementById('c2-keymap');
+const overlayOpen = (dom) => (' ' + overlay(dom).className + ' ').includes(' is-open ');
+
+test('the ? button opens the keyboard overlay, moves focus into it, and Close returns focus', async () => {
+  const { dom } = await boot();
+  const keysBtn = buttons(header(dom)).find((b) => label(b) === '?');
+  assert.equal(overlayOpen(dom), false);
+  keysBtn.focus();   // a real click focuses its target first, like every other button in this suite
+  keysBtn.click();
+  assert.equal(overlayOpen(dom), true);
+  assert.equal(keysBtn.getAttribute('aria-pressed'), 'true');
+  const closeBtn = buttons(overlay(dom)).find((b) => label(b) === 'Close');
+  assert.equal(dom.document.activeElement, closeBtn, 'focus moved into the dialog');
+  closeBtn.click();
+  assert.equal(overlayOpen(dom), false);
+  assert.equal(dom.document.activeElement, keysBtn, 'focus returned to the button that opened it');
+  assert.equal(keysBtn.getAttribute('aria-pressed'), 'false');
+});
+
+// ---- R1: the overlay must contain focus and make the background inert
+
+const BACKGROUND_IDS = ['c2-header', 'c2-stream', 'c2-rail', 'c2-footer'];
+const backgroundRegions = (dom) => BACKGROUND_IDS.map((id) => dom.document.getElementById(id));
+
+test('R1: opening the overlay makes every background region inert; closing it restores them', async () => {
+  const { dom } = await boot();
+  backgroundRegions(dom).forEach((r) => assert.equal(r.hasAttribute('inert'), false, r.tagName));
+  buttons(header(dom)).find((b) => label(b) === '?').click();
+  backgroundRegions(dom).forEach((r) => assert.equal(r.hasAttribute('inert'), true, r.tagName));
+  buttons(overlay(dom)).find((b) => label(b) === 'Close').click();
+  backgroundRegions(dom).forEach((r) => assert.equal(r.hasAttribute('inert'), false, r.tagName));
+});
+
+test('R1: Tab and Shift+Tab inside the overlay are trapped on its one focusable control', async () => {
+  const { dom } = await boot();
+  dom.document.dispatch('keydown', { key: '?', target: { tagName: 'BODY' } });
+  const closeBtn = buttons(overlay(dom)).find((b) => label(b) === 'Close');
+  assert.equal(dom.document.activeElement, closeBtn);
+
+  let prevented = false;
+  dom.document.dispatch('keydown', { key: 'Tab', target: closeBtn, preventDefault: () => { prevented = true; } });
+  assert.equal(prevented, true, 'the browser default (moving focus onward) must be suppressed');
+  assert.equal(dom.document.activeElement, closeBtn, 'still trapped, not escaped to the page beneath');
+
+  prevented = false;
+  dom.document.dispatch('keydown', {
+    key: 'Tab', shiftKey: true, target: closeBtn, preventDefault: () => { prevented = true; },
+  });
+  assert.equal(prevented, true);
+  assert.equal(dom.document.activeElement, closeBtn);
+});
+
+test('the ? key toggles the overlay, and Escape closes it without touching anything else', async () => {
+  const { dom } = await boot();
+  dom.document.dispatch('keydown', { key: '?', target: { tagName: 'BODY' } });
+  assert.equal(overlayOpen(dom), true);
+  dom.document.dispatch('keydown', { key: 'Escape', target: { tagName: 'BODY' } });
+  assert.equal(overlayOpen(dom), false);
+  // R4: focus returns to wherever it was invoked FROM - here, nothing had focus (body), so it
+  // returns to body, not a blanket default to the ? button (which is a DIFFERENT scenario, covered
+  // by the test above where the ? button itself was focused when it was clicked).
+  assert.equal(dom.document.activeElement, dom.document.body);
+});
+
+test('the overlay lists every key it documents, in plain text', async () => {
+  const { dom } = await boot();
+  dom.document.dispatch('keydown', { key: '?', target: { tagName: 'BODY' } });
+  const all = texts(overlay(dom)).join(' | ');
+  ['j', 'k', 'Enter', 'l', '/', '1', '2', 't', 'Esc', '?'].forEach((k) => assert.ok(all.includes(k), k));
+  assert.deepEqual(dom.violations, []);
+});
+
+test('while the overlay is open, other keys (j, l, t) do nothing', async () => {
+  const { dom } = await boot();
+  dom.document.dispatch('keydown', { key: '?', target: { tagName: 'BODY' } });
+  const theme = () => dom.document.documentElement.getAttribute('data-theme');
+  const before = theme();
+  dom.document.dispatch('keydown', { key: 't', target: { tagName: 'BODY' } });
+  dom.document.dispatch('keydown', { key: 'j', target: { tagName: 'BODY' } });
+  dom.document.dispatch('keydown', { key: 'l', target: { tagName: 'BODY' } });
+  assert.equal(theme(), before);
+  assert.equal(overlayOpen(dom), true, 'still open: only Escape or ? closes it');
+});
+
+test('footer hints advertise only keys that work in this milestone', async () => {
+  const { dom } = await boot();
+  const hints = dom.document.getElementById('c2-hints');
+  assert.deepEqual(texts(hints), ['t', 'theme', ' · ', 'j/k', 'select', ' · ', 'l', 'later', ' · ', '?', 'keys']);
+});
+
+test('script without the model stays inert', async () => {
+  const dom = makeDom();
+  const before = header(dom).children.length;
+  // No model in the context: console2.js must return before touching the page.
+  const vmMod = await import('node:vm');
+  const { readStatic } = await import('./console2_harness.mjs');
+  const sandbox = { document: dom.document, fetch: () => { throw new Error('no fetch'); } };
+  sandbox.window = sandbox;
+  vmMod.createContext(sandbox);
+  vmMod.runInContext(readStatic('console2.js'), sandbox);
+  assert.equal(header(dom).children.length, before);
+});
+
+// ------------------------------------------------------------ M1b: focus
+
+const TWO_ROOTS = () => jsonResponse({ roots: [
+  { label: 'main', project_id: 'proj-a' }, { label: 'second', project_id: 'proj-b' },
+] });
+const active = (dom) => dom.document.activeElement;
+
+test('focus stays on the theme button that was just activated', async () => {
+  const { dom } = await boot({ fetch: TWO_ROOTS });
+  const paper = buttons(header(dom)).find((b) => label(b) === 'Paper');
+  paper.focus();
+  assert.equal(active(dom), paper);
+  paper.click();
+  assert.equal(dom.document.documentElement.getAttribute('data-theme'), 'paper');
+  assert.equal(active(dom), paper, 'same node, still focused');
+  assert.equal(paper.getAttribute('aria-pressed'), 'true');
+  assert.equal(buttons(header(dom)).find((b) => label(b) === 'Midnight').getAttribute('aria-pressed'), 'false');
+});
+
+test('focus stays on the team chip that was just activated', async () => {
+  const { dom } = await boot({ fetch: TWO_ROOTS });
+  const [first, second] = buttons(header(dom));
+  second.focus();
+  second.click();
+  assert.equal(active(dom), second);
+  assert.equal(second.getAttribute('aria-pressed'), 'true');
+  assert.equal(first.getAttribute('aria-pressed'), 'false');
+  assert.strictEqual(buttons(header(dom))[1], second, 'chip nodes are reused, not rebuilt');
+});
+
+test('the t key does not move focus off the control that has it', async () => {
+  const { dom } = await boot({ fetch: TWO_ROOTS });
+  const synth = buttons(header(dom)).find((b) => label(b) === 'Synthwave');
+  synth.focus();
+  dom.document.dispatch('keydown', { key: 't', target: synth });
+  assert.equal(active(dom), synth);
+});
+
+test('the initial fetch resolving does not steal focus from the theme buttons', async () => {
+  let resolve;
+  const pending = new Promise((r) => { resolve = r; });
+  const dom = makeDom();
+  loadConsole({ dom, fetch: () => pending });
+  await tick();
+  const terminal = buttons(header(dom)).find((b) => label(b) === 'Terminal');
+  terminal.focus();
+  resolve({ ok: true, status: 200, json: () => Promise.resolve({ roots: [{ label: 'a', project_id: 'p1' }] }) });
+  await tick(); await tick(); await tick();
+  assert.equal(active(dom), terminal);
+  assert.equal(buttons(header(dom))[0].textContent, 'a');
+});
+
+test('the brand, spacer and theme group are the same nodes before and after the load', async () => {
+  let resolve;
+  const pending = new Promise((r) => { resolve = r; });
+  const dom = makeDom();
+  loadConsole({ dom, fetch: () => pending });
+  await tick();
+  const before = header(dom).children.slice();
+  resolve({ ok: true, status: 200, json: () => Promise.resolve({ roots: [{ label: 'a' }, { label: 'b' }] }) });
+  await tick(); await tick(); await tick();
+  const after = header(dom).children;
+  assert.equal(after.length, before.length);
+  before.forEach((node, i) => assert.strictEqual(after[i], node, 'header child ' + i));
+});
+
+// ------------------------------------------------------- M1b: ?root= selection
+
+const pressedChips = (dom) => buttons(header(dom))
+  .filter((b) => b.getAttribute('data-c2-key') && b.getAttribute('aria-pressed') === 'true').map(label);
+const streamText = (dom) => texts(dom.document.getElementById('c2-stream')).join(' | ');
+const noUnknown = (dom) => !streamText(dom).includes('Unknown team.');
+
+test('?root= selects the team with that project_id', async () => {
+  const { dom, historyCalls } = await boot({ fetch: TWO_ROOTS, search: '?root=proj-b' });
+  assert.deepEqual(pressedChips(dom), ['second']);
+  assert.ok(noUnknown(dom));
+  assert.deepEqual(historyCalls, [], 'loading never rewrites the address');
+});
+
+test('?root= also accepts a unique label, like the server', async () => {
+  const { dom } = await boot({ fetch: TWO_ROOTS, search: '?root=second' });
+  assert.deepEqual(pressedChips(dom), ['second']);
+});
+
+test('no ?root= (or an empty one) selects the first team', async () => {
+  for (const search of ['', '?root=', '?other=1']) {
+    const { dom } = await boot({ fetch: TWO_ROOTS, search });
+    assert.deepEqual(pressedChips(dom), ['main'], search);
+    assert.ok(noUnknown(dom));
+  }
+});
+
+test('an unknown ?root= shows an explicit unknown-team state and switches nothing', async () => {
+  const { dom, historyCalls } = await boot({ fetch: TWO_ROOTS, search: '?root=proj-zzz' });
+  assert.deepEqual(pressedChips(dom), [], 'no chip is pressed');
+  const text = streamText(dom);
+  assert.ok(text.includes('Unknown team.'));
+  assert.ok(text.includes('proj-zzz'));
+  const picks = buttons(dom.document.getElementById('c2-stream')).map(label);
+  assert.deepEqual(picks, ['main', 'second']);
+  assert.deepEqual(historyCalls, [], 'the address is left alone');
+});
+
+test('ambiguous label, repeated root parameter and unknown id are all unknown', async () => {
+  const dup = () => jsonResponse({ roots: [{ label: 'same', project_id: 'p1' }, { label: 'same', project_id: 'p2' }] });
+  let { dom } = await boot({ fetch: dup, search: '?root=same' });
+  assert.ok(streamText(dom).includes('Unknown team.'));
+  ({ dom } = await boot({ fetch: TWO_ROOTS, search: '?root=proj-a&root=proj-b' }));
+  assert.ok(streamText(dom).includes('Unknown team.'));
+  ({ dom } = await boot({ fetch: dup, search: '?root=p2' }));
+  assert.ok(noUnknown(dom));
+});
+
+test('picking a team from the unknown state selects it and rewrites the address', async () => {
+  const { dom, historyCalls } = await boot({ fetch: TWO_ROOTS, search: '?root=nope&x=1', hash: '#h' });
+  const pick = buttons(dom.document.getElementById('c2-stream')).find((b) => label(b) === 'second');
+  pick.click();
+  assert.deepEqual(pressedChips(dom), ['second']);
+  assert.ok(noUnknown(dom), 'the unknown-team state is gone');
+  assert.deepEqual(historyCalls, ['/v2?root=proj-b&x=1#h']);
+});
+
+test('choosing a chip updates the address and keeps other parameters', async () => {
+  const { dom, historyCalls } = await boot({ fetch: TWO_ROOTS, search: '?a=1' });
+  buttons(header(dom))[1].click();
+  assert.deepEqual(historyCalls, ['/v2?a=1&root=proj-b']);
+});
+
+test('the asked-for root is shown as text, cut when long, never as markup', async () => {
+  const { dom } = await boot({ fetch: TWO_ROOTS, search: '?root=' + encodeURIComponent(HOSTILE + 'x'.repeat(200)) });
+  const text = streamText(dom);
+  assert.ok(text.includes(HOSTILE.slice(0, 10)));
+  assert.ok(text.includes('…'));
+  assert.ok(!text.includes('x'.repeat(100)));
+  assert.deepEqual(dom.violations, []);
+});
+
+test('a root feed without project ids can still be picked, by label', async () => {
+  const { dom, historyCalls } = await boot({ fetch: () => jsonResponse({ roots: [{ label: 'a' }, { label: 'b' }] }) });
+  buttons(header(dom))[1].click();
+  assert.deepEqual(historyCalls, ['/v2?root=b']);
+  assert.deepEqual(pressedChips(dom), ['b']);
+});
+
+run();
