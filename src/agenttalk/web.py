@@ -694,16 +694,26 @@ def render_console2() -> bytes:
 
     Same discipline as :func:`render_dashboard`: zero inline ``<style>``, zero
     ``style=`` attributes, zero inline handlers, no inline script, no external
-    URL. The two links are fixed server-authored paths. Nothing bus-derived is
-    rendered here; the client builds every data-bearing node with ``textContent``.
+    URL. Every link is a fixed, server-authored path (``/dashboard``, or one of
+    the two B8 route anchors, ``#board``/``#conversation``) - the client-side
+    router (``console2.js``) only ever READS ``location.hash``, since it is
+    banned (like every v2 script) from ever assigning ``href`` itself. Nothing
+    bus-derived is rendered here; the client builds every data-bearing node
+    with ``textContent``.
     """
     body = (
         "<div id=\"app\">"
         "<header id=\"c2-header\"></header>"
         "<main id=\"c2-stream\" aria-label=\"Stream\"></main>"
         "<aside id=\"c2-rail\" aria-label=\"Rail\"></aside>"
+        "<main id=\"c2-board\" aria-label=\"Board\" hidden></main>"
+        "<aside id=\"c2-board-detail\" aria-label=\"Board detail\" hidden></aside>"
         "<footer id=\"c2-footer\">"
         "<span id=\"c2-hints\"></span>"
+        "<nav id=\"c2-routes\" aria-label=\"View\">"
+        "<a class=\"c2-link\" data-c2-route=\"conversation\" href=\"#conversation\">Conversation</a>"
+        "<a class=\"c2-link\" data-c2-route=\"board\" href=\"#board\">Board</a>"
+        "</nav>"
         "<a class=\"c2-link\" href=\"/dashboard\">Classic view</a>"
         "</footer>"
         "</div>"
@@ -712,6 +722,7 @@ def render_console2() -> bytes:
         "<a href=\"/dashboard\">classic view</a>.</p></noscript>"
         "<link rel=\"stylesheet\" href=\"/static/console2.css\">"
         "<script src=\"/static/console2-model.js\"></script>"
+        "<script src=\"/static/console2-board-model.js\"></script>"
         "<script src=\"/static/console2.js\"></script>"
     )
     return _console_page("agenttalk :: console", body)
@@ -771,6 +782,7 @@ def _load_static_assets() -> dict[str, tuple[str, bytes]]:
         ("console.js", "application/javascript; charset=utf-8"),
         ("console2.css", "text/css; charset=utf-8"),
         ("console2-model.js", "application/javascript; charset=utf-8"),
+        ("console2-board-model.js", "application/javascript; charset=utf-8"),
         ("console2.js", "application/javascript; charset=utf-8"),
         *((name, "image/png") for name in _AVATAR_ASSETS),
     ):

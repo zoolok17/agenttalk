@@ -1,12 +1,15 @@
-"""Real-browser check of the console v2 stream (the one browser-driving test is skipped when no
-Chromium-family browser or node is present; the launch-flags unit test below it always runs).
+"""Real-browser check of the console v2 stream and B8 work board (the one browser-driving test is
+skipped when no Chromium-family browser or node is present; the launch-flags unit test below it
+always runs).
 
 The DOM stub in the node tests models detachment and focus, but only a real browser proves that
 (F1) a thread scrolled while detached loses its position and (F2) a redraw that replaces a focused
 control drops focus to <body>. The page under test is the REAL /v2 shell and scripts, served with
-the console CSP by a tiny stdlib server that also answers the three feeds with fixed JSON (30 chat
-messages, two needs cards whose age grows on every read). The browser is driven over the DevTools
-protocol by tests/console2_browser_check.mjs.
+the console CSP by a tiny stdlib server that also answers the four feeds with fixed JSON (30 chat
+messages, two needs cards and two board items, all of whose ages grow on every read). The browser
+is driven over the DevTools protocol by tests/console2_browser_check.mjs, which also drives the
+board: hash-navigating to #board, then proving its keyed cards keep focus and scroll across an
+ordinary redraw exactly like the stream's needs-you cards and chat thread do, plus j/k/Escape.
 """
 from __future__ import annotations
 
@@ -61,8 +64,18 @@ def _browser_launch_flags(system: str) -> list[str]:
     /dev/shm) the SAME flags the Windows leg used let the browser process fail to start at
     all, with no sandbox or shared-memory workaround. macOS needs neither: it is not
     containerized and Chrome's normal sandbox works there in CI the same as anywhere else.
+
+    Fix for PR #221 (N4 follow-up): a headless target with no real OS window can still
+    "occlude" itself and drift `document.hidden`/`visibilityState` back to backgrounded mid-run
+    (observed even after an explicit `/json/activate` - console2_browser_check.mjs re-asserts it
+    before the board section for exactly this reason), which stalls the board's OWN F6 hidden-tab
+    pause indefinitely. These two flags are Chromium's own documented switches for headless/CI
+    testing to disable that occlusion-based throttling at the source.
     """
-    common = ["--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check"]
+    common = [
+        "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+        "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding",
+    ]
     if system == "Linux":
         return common + ["--no-sandbox", "--disable-dev-shm-usage"]
     return common
@@ -75,10 +88,12 @@ def test_browser_launch_flags_are_correct_per_platform() -> None:
     linux = _browser_launch_flags("Linux")
     assert "--no-sandbox" in linux and "--disable-dev-shm-usage" in linux
     assert "--headless=new" in linux and "--disable-gpu" in linux
+    assert "--disable-backgrounding-occluded-windows" in linux and "--disable-renderer-backgrounding" in linux
     for other_system in ("Darwin", "Windows"):
         flags = _browser_launch_flags(other_system)
         assert "--no-sandbox" not in flags and "--disable-dev-shm-usage" not in flags
         assert "--headless=new" in flags and "--disable-gpu" in flags
+        assert "--disable-backgrounding-occluded-windows" in flags and "--disable-renderer-backgrounding" in flags
 
 
 BROWSER = _find_browser()
@@ -155,6 +170,53 @@ def _handler(started: float):
                 ]
                 self._send(json.dumps({"target_root_project_id": PROJECT, "items": items}).encode(),
                            "application/json", web._DEFAULT_CSP)
+            elif path == "/api/work-board":
+                # B8: two real-envelope-shaped board items. board-a's last_work_event_at recedes by
+                # the SAME accelerated `grown` counter as /api/attention above, so its rendered
+                # "active ... ago" meta text changes on every ordinary redraw - the console2_browser_
+                # check.mjs board section watches it the same way F1/F2 watch WATCHED_AGE_SELECTOR.
+                items = [
+                    {"work_item": "board-a", "title": None, "cycle": 1, "round": None, "legacy_cycle": False,
+                     "candidate": None,
+                     "obligations": [{"request_id": "rq-a1", "recipient": "claude-agenttalk-developer-2",
+                                      "stage": "build", "state": "outstanding", "verdict": None}],
+                     "verdicts": {}, "integration": {}, "workflow_column": "building", "reason": "build accepted",
+                     "evidence": ["rq-a1"], "checks": None, "issues": [],
+                     "first_dispatch_at": _iso(now - timedelta(seconds=1800)),
+                     "last_work_event_at": _iso(now - timedelta(seconds=30 + grown))},
+                    {"work_item": "board-b", "title": "Second item", "cycle": 2, "round": 1,
+                     "legacy_cycle": False, "candidate": "a" * 40,
+                     "obligations": [{"request_id": "rq-b1", "recipient": "codex-agenttalk-reviewer-1",
+                                      "stage": "read", "state": "done", "verdict": "GO"}],
+                     "verdicts": {"a" * 40: [{"reviewer": "codex-agenttalk-reviewer-1", "verdict": "GO",
+                                              "reply": "rp-b1", "independent": True, "vendor": "openai"}]},
+                     "integration": {}, "workflow_column": "ready",
+                     "reason": "reviewed; independent GO; local checks not tracked",
+                     "evidence": ["rq-b1"], "checks": "local checks not tracked", "issues": [],
+                     "first_dispatch_at": _iso(now - timedelta(seconds=3600)),
+                     "last_work_event_at": _iso(now - timedelta(seconds=10))},
+                ]
+                # Padding cards so the list genuinely overflows #c2-board's viewport - the scroll
+                # check below is meaningless if two short cards never need a scrollbar at all.
+                items += [
+                    {"work_item": f"board-pad-{n}", "title": None, "cycle": 1, "round": None,
+                     "legacy_cycle": False, "candidate": None,
+                     "obligations": [{"request_id": f"rq-pad-{n}", "recipient": "claude-agenttalk-developer-2",
+                                      "stage": "build", "state": "outstanding", "verdict": None}],
+                     "verdicts": {}, "integration": {}, "workflow_column": "queued", "reason": "start unconfirmed",
+                     "evidence": [f"rq-pad-{n}"], "checks": None, "issues": [],
+                     "first_dispatch_at": _iso(now - timedelta(seconds=600)),
+                     "last_work_event_at": _iso(now - timedelta(seconds=600))}
+                    for n in range(12)
+                ]
+                payload = {
+                    "schema_version": 1, "target_root_project_id": PROJECT, "generated_at": _iso(now),
+                    "coverage": {"status": "complete"}, "items": items,
+                    "legacy": {"open_request_count": 0, "known_lower_bound": 0}, "unassigned": {"count": 0},
+                    "total_count": len(items), "truncated": False, "omitted_count": 0, "errors": [],
+                    "window_days": 7,
+                }
+                self._send(json.dumps(payload).encode(), "application/json", web._DEFAULT_CSP)
             elif path == "/api/lead-chat":
                 msgs = [{"id": f"m{n:03d}", "from": "operator" if n % 3 == 0 else LEAD, "to": LEAD,
                          "body": f"Message number {n} " + "x" * 60, "ts": _iso(now - timedelta(minutes=60 - n))}
@@ -246,6 +308,30 @@ def test_thread_scroll_and_focus_survive_redraws_in_a_real_browser(page) -> None
     # a native Escape still closes the overlay too, and returns focus to the button that opened it
     assert out["overlayClosedAfterNativeEscape"] is True, out
     assert out["focusBackOnKeysBtnAfterEscape"] is True, out
+    # B8: the board - hash-navigating to #board swaps the stream/rail out for the board/detail pair
+    assert out["boardShellSwapped"] is True, out
+    # j selects the first card with REAL focus and the selected class together
+    assert out["boardFirstSelectedWithFocus"] is True, out
+    # a second j moves focus WITH the selection onto the next card, never left behind
+    assert out["boardSecondJMovedFocus"] is True, out
+    # the detail panel shows the selection (not the "select a card" placeholder) once one exists
+    assert out["boardDetailShowsSelection"] is True, out
+    # scrolling the board, then an ordinary redraw (the watched card's own age ticked) - the
+    # container, the selected card and its focus all survive, exactly like the stream's thread/rail
+    assert out["boardScrollKept"] is True, out
+    assert out["boardContainerKept"] is True, out
+    assert out["boardFocusKept"] is True, out
+    # Escape clears the board selection
+    assert out["boardSelectionClearedByEscape"] is True, out
+    # F4: native Enter and Space (real CDP key events, not synthetic DOM ones) activate whichever
+    # board card actually holds focus - a role="button" article gets none of this for free
+    assert out["boardEnterActivatesFocusedCard"] is True, out
+    assert out["boardSpaceActivatesFocusedCard"] is True, out
+    # N2 (PR #221 delta round 2): the board's own Enter/Space handler must consume a key ONLY when
+    # it actually handled a board card - a focused Conversation link or help button, both real
+    # server-rendered/page-built controls unrelated to any card, keep their own native activation
+    assert out["n2ConversationLinkNavigatesOnEnter"] is True, out
+    assert out["n2HelpButtonStillOpensOnEnter"] is True, out
     # the page raised no exception and the console CSP blocked nothing
     assert out["problems"] == [], out["problems"]
 

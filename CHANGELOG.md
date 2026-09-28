@@ -62,6 +62,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (never guessed), attention and lead-chat pending decisions dedupe by escalation
   ID, and Later/Wait defer local presentation only, never the underlying incident.
 
+- **Read-only work board at `/v2#board`.** A second view in the same console v2 app,
+  behind one router that also owns `#conversation` and a reserved `#review=<escalation-id>`
+  (no UI yet). Its pure model (`console2-board-model.js`) projects `/api/work-board`
+  cards on top of the shared B7 needs-you projection - never recomputed - showing
+  title/reason, seats, configured model vendor or "unverified", explicit round or
+  unknown, open/total obligations, approximate dispatch/activity ages and the
+  evidence behind each placement; findings, cost and merge stay explicitly Unknown
+  where the data does not prove them. Keyed cards are reconciled in place, keeping
+  focus and scroll across redraws, with j/k/Escape selection and a read-only detail
+  panel. Both route anchors are fixed, server-authored hash links, so switching
+  views never disturbs `?root=`.
+
 ### Fixed
 
 - Keep the fresh last-known-good dashboard view during snapshot scan races and

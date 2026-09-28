@@ -181,11 +181,13 @@ export function makeDom() {
 
   // Server-authored shell regions the script looks up by id.
   for (const [tag, id] of [['div', 'app'], ['header', 'c2-header'], ['main', 'c2-stream'], ['aside', 'c2-rail'],
+                           ['main', 'c2-board'], ['aside', 'c2-board-detail'],
                            ['footer', 'c2-footer'], ['span', 'c2-hints']]) {
     const node = new Node(tag);
     node._root = true;
     node.setAttribute('id', id);
   }
+  document.hidden = false;   // B8/F6: a plain, directly settable stand-in for the real read-only DOM property
 
   return { document, violations, Node, walk, texts };
 }
@@ -244,6 +246,7 @@ export function loadConsole(opts) {
   vm.createContext(sandbox);
   vm.runInContext(readStatic('console2-model.js'), sandbox, { filename: 'console2-model.js' });
   if (!opts.modelOnly) {
+    vm.runInContext(readStatic('console2-board-model.js'), sandbox, { filename: 'console2-board-model.js' });
     vm.runInContext(readStatic('console2.js'), sandbox, { filename: 'console2.js' });
   }
   // Fire the timers queued so far (all, or those whose delay satisfies `pred`), then let
