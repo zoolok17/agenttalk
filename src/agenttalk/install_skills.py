@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import filecmp
 import hashlib
+import os
 import shutil
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -78,7 +80,12 @@ class RetiredSkillAction:
     # "would-remove"  — dry-run: would have deleted (byte-identical)
     # "warn-modified" — present, does NOT match the last-shipped bytes; left
     #                   alone (never destroy a file that might be modified)
+    # "warn-linked"   — a path component between the install root and the
+    #                   file is a symlink/junction/reparse point; left alone
+    #                   even if the bytes match (content identity does not
+    #                   prove this is an installer-owned copy safe to delete)
     status: str
+    linked_at: Path | None = None
 
 
 # Skills retired from the bundled tree. Deleting the SOURCE does not remove
@@ -106,6 +113,40 @@ def _sha256(path: Path) -> str | None:
         return None
 
 
+def _is_link_like(path: Path) -> bool:
+    """True if `path` ITSELF (not what it resolves to) is a symlink, a
+    Windows junction, or carries any other reparse point. Uses an
+    un-followed stat (lstat) so it never resolves through a link to judge
+    the link by its target's properties."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    # Windows junctions (dir "mount points") are reparse points but are
+    # NOT reported by S_ISLNK on every Python build; st_file_attributes
+    # (Windows-only os.stat_result field) catches those and any other
+    # reparse-point tag directly.
+    attrs = getattr(st, "st_file_attributes", None)
+    return attrs is not None and bool(attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _linked_component(root: Path, rel: str) -> Path | None:
+    """Walk `root / rel` component by component; return the first path
+    (strictly beneath `root`) that is itself a symlink/junction/reparse
+    point, or None if every component down to the file is a plain
+    directory/file. A regular file (e.g. SKILL.md) sitting beneath a
+    linked PARENT directory is still caught, because the parent
+    directory component is checked on the way down."""
+    current = root
+    for part in Path(rel).parts:
+        current = current / part
+        if _is_link_like(current):
+            return current
+    return None
+
+
 def check_retired_skills(
     *,
     claude: bool,
@@ -116,21 +157,32 @@ def check_retired_skills(
 ) -> list[RetiredSkillAction]:
     """Detect retired-skill leftovers at install destinations.
 
-    Only acts on a destination that still exists. A byte-identical match
-    against the last-shipped content is deleted (or reported as
-    ``would-remove`` under ``--dry-run``); anything else — including a
-    file this table doesn't know how to verify — is reported as
-    ``warn-modified`` and never touched.
+    Only acts on a destination that still exists. Before hashing or
+    deleting anything, every path component between the configured
+    install root and the file is checked for being a symlink/junction/
+    reparse point — matching bytes through a link only proves the
+    content is familiar, never that this is an installer-owned copy safe
+    to delete, so a linked component always wins over a byte match and is
+    reported ``warn-linked`` without ever being hashed or touched.
+    Otherwise, a byte-identical match against the last-shipped content is
+    deleted (or reported as ``would-remove`` under ``--dry-run``);
+    anything else — including a file this table doesn't know how to
+    verify — is reported as ``warn-modified`` and never touched.
     """
     out: list[RetiredSkillAction] = []
     for retired in _RETIRED_SKILLS:
-        candidates: list[tuple[Path, str]] = []
+        candidates: list[tuple[Path, str, str]] = []
         if claude:
-            candidates.append((claude_dir / retired["claude_rel"], retired["claude_sha256"]))
+            candidates.append((claude_dir, retired["claude_rel"], retired["claude_sha256"]))
         if codex:
-            candidates.append((codex_dir / retired["codex_rel"], retired["codex_sha256"]))
-        for dst, expected_sha256 in candidates:
+            candidates.append((codex_dir, retired["codex_rel"], retired["codex_sha256"]))
+        for root, rel, expected_sha256 in candidates:
+            dst = root / rel
             if not dst.exists():
+                continue
+            linked = _linked_component(root, rel)
+            if linked is not None:
+                out.append(RetiredSkillAction(path=dst, status="warn-linked", linked_at=linked))
                 continue
             if _sha256(dst) == expected_sha256:
                 if dry_run:

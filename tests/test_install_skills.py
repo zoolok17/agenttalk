@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -10,6 +13,30 @@ import pytest
 from agenttalk import cli
 from agenttalk import install_skills as iskl
 from agenttalk.install_skills import SKILLS_ROOT, install
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+# The commit before this branch retired the sk-loop skill (still origin/master
+# as of this fix round) — the real, last-shipped bytes for the link/junction
+# regression below, never synthesized.
+_LAST_SHIPPED_REF = "af680c6"
+
+
+def _git_show(ref: str, path: str) -> bytes:
+    return subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "show", f"{ref}:{path}"],
+        check=True, capture_output=True,
+    ).stdout
+
+
+def _make_dir_link(link: Path, target: Path) -> None:
+    """A real directory link: a Windows junction, or a POSIX symlink,
+    pointing at `target` (which may live OUTSIDE the install root)."""
+    target.mkdir(parents=True, exist_ok=True)
+    if sys.platform == "win32":
+        import _winapi
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        os.symlink(target, link, target_is_directory=True)
 
 DEVKIT_SKILLS = [
     # dev-discipline pack
@@ -443,6 +470,126 @@ def test_cli_install_skills_warns_with_migration_recipe(
     assert str(target) in out
     assert "install-skills --force" in out
     assert target.exists()
+
+
+# --------------------------------- retired skills: never delete through a link (PR #224 F1)
+
+def test_real_last_shipped_content_matches_pinned_sha256() -> None:
+    """The sha256s pinned in install_skills._RETIRED_SKILLS must match the
+    REAL git-history bytes of the retired skill at the commit before this
+    branch deleted it — the link/junction regression below relies on this
+    being true, not on a synthetic hash."""
+    claude_bytes = _git_show(
+        _LAST_SHIPPED_REF, "src/agenttalk/skills/claude/agenttalk.sk-loop.md")
+    codex_bytes = _git_show(
+        _LAST_SHIPPED_REF, "src/agenttalk/skills/codex/agenttalk-sk-loop/SKILL.md")
+    entry = iskl._RETIRED_SKILLS[0]
+    assert hashlib.sha256(claude_bytes).hexdigest() == entry["claude_sha256"]
+    assert hashlib.sha256(codex_bytes).hexdigest() == entry["codex_sha256"]
+
+
+def test_linked_install_directory_never_deletes_through_the_link(
+    tmp_path: Path,
+) -> None:
+    """Reviewer-1's F1 (PR #224 cold read): a real directory junction
+    (Windows) / symlink (POSIX) installed AT the retired skill's codex
+    path, pointing OUTSIDE the install root, whose SKILL.md carries the
+    exact REAL last-shipped bytes (git history, not a synthetic hash).
+    install-skills must warn and leave both the link and its external
+    target untouched — matching content only proves the bytes are
+    familiar, never that this is an installer-owned copy safe to delete.
+    Checking only `dst.is_symlink()` is insufficient: on this platform a
+    Windows junction does not set S_ISLNK at all (verified empirically:
+    only the reparse-point file attribute catches it), and SKILL.md
+    itself is a perfectly ordinary file sitting beneath the linked
+    parent directory."""
+    codex_dir = tmp_path / "linked-install"
+    codex_dir.mkdir()
+    managed_source = tmp_path / "managed-source"  # OUTSIDE the install root
+    real_bytes = _git_show(
+        _LAST_SHIPPED_REF, "src/agenttalk/skills/codex/agenttalk-sk-loop/SKILL.md")
+    managed_source.mkdir()
+    (managed_source / "SKILL.md").write_bytes(real_bytes)
+    _make_dir_link(codex_dir / "agenttalk-sk-loop", managed_source)
+
+    res = install(claude=False, codex=True, codex_dir=codex_dir, devkit=False)
+
+    linked_dst = codex_dir / "agenttalk-sk-loop" / "SKILL.md"
+    assert linked_dst.is_file(), "the link must still resolve to the file"
+    assert (managed_source / "SKILL.md").is_file(), "the external source must survive"
+    assert (managed_source / "SKILL.md").read_bytes() == real_bytes, (
+        "the external source's bytes must be untouched"
+    )
+    statuses = {str(r.path): r.status for r in res.retired}
+    assert statuses[str(linked_dst)] == "warn-linked"
+    # the seven surviving codex skills still install normally alongside the warning
+    assert res.counts().get("copied") == _bundled_codex_count()
+
+
+def test_ordinary_unmodified_leftover_still_auto_removed_with_link_check_present(
+    tmp_path: Path,
+) -> None:
+    """The new link-awareness must not regress the plain (non-linked) case:
+    an ordinary byte-identical leftover, using the REAL last-shipped
+    bytes, is still auto-removed."""
+    claude_dir = tmp_path / "claude"
+    codex_dir = tmp_path / "codex"
+    claude_dir.mkdir(parents=True)
+    real_bytes = _git_show(
+        _LAST_SHIPPED_REF, "src/agenttalk/skills/claude/agenttalk.sk-loop.md")
+    target = claude_dir / "agenttalk.sk-loop.md"
+    target.write_bytes(real_bytes)
+
+    res = install(claude_dir=claude_dir, codex_dir=codex_dir)
+
+    statuses = {str(r.path): r.status for r in res.retired}
+    assert statuses[str(target)] == "removed"
+    assert not target.exists()
+
+
+def test_dry_run_with_linked_install_reports_warn_linked_without_deleting(
+    tmp_path: Path,
+) -> None:
+    codex_dir = tmp_path / "linked-install"
+    codex_dir.mkdir()
+    managed_source = tmp_path / "managed-source"
+    real_bytes = _git_show(
+        _LAST_SHIPPED_REF, "src/agenttalk/skills/codex/agenttalk-sk-loop/SKILL.md")
+    managed_source.mkdir()
+    (managed_source / "SKILL.md").write_bytes(real_bytes)
+    _make_dir_link(codex_dir / "agenttalk-sk-loop", managed_source)
+
+    res = install(claude=False, codex=True, codex_dir=codex_dir, devkit=False, dry_run=True)
+
+    statuses = {str(r.path): r.status for r in res.retired}
+    assert statuses[str(codex_dir / "agenttalk-sk-loop" / "SKILL.md")] == "warn-linked"
+    assert (managed_source / "SKILL.md").exists()
+
+
+def test_cli_reports_linked_retired_skill_with_link_path(
+    tmp_path: Path, capsys,
+) -> None:
+    """The CLI surface names the exact linked path so the operator's
+    manual migration recipe has something concrete to act on."""
+    codex_dir = tmp_path / "linked-install"
+    codex_dir.mkdir()
+    managed_source = tmp_path / "managed-source"
+    real_bytes = _git_show(
+        _LAST_SHIPPED_REF, "src/agenttalk/skills/codex/agenttalk-sk-loop/SKILL.md")
+    managed_source.mkdir()
+    (managed_source / "SKILL.md").write_bytes(real_bytes)
+    _make_dir_link(codex_dir / "agenttalk-sk-loop", managed_source)
+
+    rc = cli.main([
+        "install-skills", "--no-devkit", "--codex-only",
+        "--codex-dir", str(codex_dir),
+    ])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert str(codex_dir / "agenttalk-sk-loop" / "SKILL.md") in out
+    assert "symlink/junction" in out
+    assert "install-skills --force" in out
 
 
 def test_listen_skills_contain_consult_handling(tmp_path: Path) -> None:

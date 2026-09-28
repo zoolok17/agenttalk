@@ -9990,18 +9990,29 @@ def cmd_install_skills(args: argparse.Namespace) -> int:
     print(f"\nagenttalk install-skills: {summary or 'no actions'}")
 
     retired_removed = [r for r in res.retired if r.status in ("removed", "would-remove")]
-    retired_warn = [r for r in res.retired if r.status == "warn-modified"]
+    retired_warn_modified = [r for r in res.retired if r.status == "warn-modified"]
+    retired_warn_linked = [r for r in res.retired if r.status == "warn-linked"]
     for r in retired_removed:
         marker = "?" if r.status == "would-remove" else "-"
         print(f"  {marker} {r.status:<16} {r.path}  (retired skill: agenttalk.sk-loop)")
-    if retired_warn:
+    if retired_warn_linked:
+        print(
+            "\nRetired skill 'sk-loop' is installed through a symlink/junction/"
+            "reparse point, so it was left in place (matching bytes through a "
+            "link only proves the content is familiar, never that this is an "
+            "installer-owned copy safe to delete):"
+        )
+        for r in retired_warn_linked:
+            print(f"  ! {r.path}  (linked at: {r.linked_at})")
+    if retired_warn_modified:
         print(
             "\nRetired skill 'sk-loop' is still installed and differs from the "
             "last-shipped version, so it was left in place (never destroying a "
             "possibly-modified file):"
         )
-        for r in retired_warn:
+        for r in retired_warn_modified:
             print(f"  ! {r.path}")
+    if retired_warn_linked or retired_warn_modified:
         print(
             "\nManual migration recipe: remove the two installed sk-loop paths, "
             "then refresh the surviving skills:\n"

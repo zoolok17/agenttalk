@@ -120,7 +120,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   installed `agenttalk.sk-loop.md` / `agenttalk-sk-loop/SKILL.md` at your
   install destinations: byte-identical to the last-shipped version is
   removed automatically, anything else (a possibly-modified copy) is left
-  in place with a warning naming the exact path. To migrate by hand:
+  in place with a warning naming the exact path. Before hashing or
+  deleting, every path component between the configured install root and
+  the file is checked for a symlink, a Windows junction, or any other
+  reparse point — a linked component is always left in place with a
+  warning naming the exact link, even when the bytes match; matching
+  content only proves the bytes are familiar, never that the copy is
+  installer-owned and safe to delete (cross-vendor review finding, PR
+  #224). To migrate by hand:
   ```
   rm "<claude-commands-dir>/agenttalk.sk-loop.md"
   rm -r "<codex-skills-dir>/agenttalk-sk-loop"
