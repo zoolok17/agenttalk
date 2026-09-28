@@ -427,6 +427,7 @@ def _evaluate_item(slug, reqs, orphans, facts):
     policy = _policy(slug, valid, cur, current, facts) if current is not None else {
         "conflict": None, "problem": ("check policy missing", []), "label": None}
     item["checks"] = policy["label"]
+    item["check_keys"] = policy.get("keys")
     if policy["conflict"]:
         conflicts.append(policy["conflict"])
     obs = [o for r in cur for o in r["obligations"]]
@@ -614,6 +615,7 @@ def _policy(slug, valid, cur, current, facts):
         result["problem"] = ("check policy missing", evidence)  # section 2: missing is unknown, never empty
         return result
     gates, reason = declared.pop()[3:]
+    result["keys"] = list(gates) if gates is not None else None
     if gates and reason:
         result["problem"] = ("no_gates_reason conflicts with required gates", evidence)
     elif not gates:

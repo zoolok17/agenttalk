@@ -1,7 +1,48 @@
 # Work-board implementation record
 
-Audience: implementers and cold reviewers. This records shipped slices, not a
-claim that the board reducer, feeds or UI exist.
+Audience: implementers and cold reviewers. This records shipped slices; the
+console board UI remains a separate slice.
+
+## B6a — gate isolation and bounded cached feed
+
+Branch `feat/work-board-b6a`; integrated reviewed B4s `4198550a` and B3a/B3b
+`70c39978` at merge `b5908e7a`, retaining both prior records. Contract: design
+`09b5429`, sections 4–6 and the B6a row. Gate isolation landed first in `82e9a433`.
+
+- One unscoped/non-board gate filter excludes both recorded and required `wb.`
+  names. Web and CLI attention already use that verdict. Root additions refuse;
+  existing contaminated lists report a warning. Ordinary global blockers and
+  unreadable gate state retain their fail-closed behavior.
+- The adapter selects declared exact names, scope and full candidate revision,
+  requiring validated blocker-green evidence. The reducer exposes its resolved
+  check keys so the adapter does not duplicate policy resolution. Global barriers
+  are separately shown and continue to govern ordinary pre-merge checks.
+- `/api/work-board` copies the worker-owned bounded feed: active plus seven UTC
+  days of Done, 100 cards, 256 KiB including Legacy/unassigned groups, visible
+  omissions and capacity. Closure includes all cycles and linked untagged active
+  and compacted evidence before the display cap. Stale/failed refreshes retain
+  explicitly last-known cards; board failure never disables active state.
+- No UI, cleanup, gate writer, Git observation, CI lookup, history endpoint or
+  cursor. External CI remains not tracked; integration stays unknown. See
+  [the feed reference](WORK-BOARD-FEED.md).
+
+Failing-first evidence: four isolation failures, then thirteen adapter/feed
+failures; four further failures pinned repeated truncation, malformed metadata,
+state availability after a board fault and cancelled-item filtering. One further
+failure pinned recent replies correlated by anchor only. All were fixed.
+
+Final verification (foreground, seat `src` on PYTHONPATH, task-scratch TEMP/TMP):
+
+- Python 3.10: **471 passed** in 235.23 s across feed, snapshot/archive, reducer,
+  gates, web, CLI attention and lock-order tests. Late deltas: **90 passed**.
+- Python 3.14: broad run **469 passed / 1 failed**, the additive `/api/gates`
+  `warnings` shape assertion, updated explicitly. Final affected tests plus that
+  regression: **234 passed** in 24.57 s. Final wrong-binding label regressions
+  first failed **3 cases**, then passed; a missing/wrong binding is unavailable,
+  not an assertion that the candidate's checks ran and failed.
+- Ruff, Bandit and `git diff --check` pass. No ranked lock site added; the
+  existing inventory passes unchanged. No full suite, network CI or scale/p95
+  benchmark run. B7/B8 and the independent cold read remain outstanding.
 
 ## B2a — tags, verdicts, supersedes and lead skill
 
@@ -190,6 +231,7 @@ before its fix (0.17 s). Final discovery/snapshot/compaction/scanner: Python 3.1
 61 passed, 345 deselected (46.43 s). Ruff/Bandit pass (B101 excluded for tests).
 Task scratch `tk-3e4f33ca3f41` retains logs. Limits use small injected values;
 no full suite or large-file population. Whitespace/privacy checks pass.
+
 
 ## B3a — pure causal reducer
 

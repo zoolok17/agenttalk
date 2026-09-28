@@ -90,6 +90,9 @@ def _serialized_write(function):
 
 @_serialized_write
 def write_gate_state(root: Path, state: dict) -> None:
+    added = set(state.get("required_gates") or []) - set(load_gate_state(root)["required_gates"])
+    if any(name.startswith("wb.") for name in added):
+        raise ValueError("root required_gates cannot include wb. names")
     state = {
         "schema_version": SCHEMA_VERSION,
         "required_gates": sorted(set(state.get("required_gates") or [])),
@@ -116,6 +119,8 @@ def set_gate(
     required: bool | None = None,
 ) -> dict:
     _validate_gate_name(name)
+    if name.startswith("wb.") and required is True:
+        raise ValueError("root required_gates cannot include wb. names")
     status = _validate_choice("status", status, VALID_STATUSES)
     severity = _validate_choice("severity", severity, VALID_SEVERITIES)
     evidence_source = _validate_choice("evidence_source", evidence_source, VALID_EVIDENCE_SOURCES)
@@ -244,8 +249,8 @@ def check_gates(root: Path, *, scope: str | None = None, now: datetime | None = 
     verdict from one snapshot with evidence from another."""
     if state is None:
         state = load_gate_state(root)
-    gates = state["gates"]
-    required = sorted(set(state["required_gates"]))
+    gates = {name: gate for name, gate in state["gates"].items() if not name.startswith("wb.")}
+    required = sorted(name for name in set(state["required_gates"]) if not name.startswith("wb."))
     now = now or datetime.now(timezone.utc)
     checked: list[dict] = []
     blockers: list[dict] = []
@@ -307,7 +312,39 @@ def check_gates(root: Path, *, scope: str | None = None, now: datetime | None = 
         "required_gates": required,
         "blockers": blockers,
         "gates": checked,
+        "warnings": ["wb. names in root required_gates ignored"]
+        if any(name.startswith("wb.") for name in state["required_gates"]) else [],
     }
+
+
+def check_board(root: Path | None, *, project: str, item: str, cycle: int, revision: str | None,
+                keys: list[str], state: dict | None = None) -> bool | None:
+    """Exact declared checks only; global barriers remain a separate ordinary check.
+
+    None means unavailable evidence. A warning, stale revision or waiver cannot
+    stand in for validated blocker-green evidence for this candidate.
+    """
+    if not revision or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision) or not keys:
+        return None
+    state = load_gate_state(root) if state is None else state
+    if state.get("load_error"):
+        return None
+    for key in keys:
+        if not isinstance(key, str) or not re.fullmatch(r"[a-z0-9-]{1,24}", key):
+            return None
+        name = f"wb.{item}.c{cycle}.{key}"
+        if len(name) > 128:
+            return None
+        gate = state["gates"].get(name)
+        if gate is None:
+            return None
+        if gate.get("scope") != f"{project}/{item}/c{cycle}" or gate.get("revision") != revision:
+            return None
+        if (gate.get("severity") != "blocker" or gate.get("status") != "green"
+                or gate.get("evidence_source") not in BLOCKER_GREEN_SOURCES
+                or not _has_gate_evidence(gate, gate.get("evidence_source"))):
+            return False
+    return True
 
 
 def validate_response_status(kind: str, meta: dict) -> None:

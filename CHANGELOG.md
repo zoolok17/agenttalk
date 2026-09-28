@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configure model vendors independently of CLI transport; freeze per-recipient
   vendor maps on work dispatches and link escalations to exact work items/cycles.
 
+- Serve a bounded, read-only work-board feed from the shared snapshot worker, with
+  exact item/cycle/revision checks and visible coverage, overflow and legacy groups.
+
 ### Fixed
 
 - Keep the fresh last-known-good dashboard view during snapshot scan races and
@@ -51,6 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generation changes,
   lock-order inversions and a lost lease keep their existing handling and are
   never retried as contention.
+
+- Isolate `wb.` gates from root checks and both gate-HOLD attention paths; refuse
+  new board names in root requirements and warn about legacy contaminated lists.
 
 ## [0.93.0] - 2026-09-27
 

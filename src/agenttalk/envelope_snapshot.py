@@ -116,6 +116,8 @@ class SnapshotService:
         self._cache, self._cache_trust = {}, None
         self._archive_error = None
         self.current = None
+        self._board = None
+        self._board_error = None
         self.error = None
         self._lock = threading.Lock()
         self._busy = False
@@ -228,11 +230,26 @@ class SnapshotService:
                              entries, len(before) + len(archive_before),
                              sum(s[2] for s in (*before.values(), *archive_before.values())),
                              self.clock() - start, archives, complete, archive_invalid)
+            # Reduction and gate IO belong to this worker, never a polling handler.
+            from agenttalk import gates, work_board_feed
+            board_error = None
+            try:
+                board = work_board_feed.build(value, project=self.store.project_id(),
+                                              lead=self.store.sole_lead(),
+                                              gate_state=gates.load_gate_state(self.store.root))
+                if board["coverage"]["status"] != "complete" and self._board:
+                    board["items"] = copy.deepcopy(self._board["items"])
+                    board["last_known"] = True
+                    board = work_board_feed.bounded(board)
+            except Exception as exc:  # board failures must not disable active /api/state
+                board, board_error = self._board, type(exc).__name__
             with self._lock:
                 if generation != self._generation:
                     return False
                 self._generation += 1
                 self.current, self.error = value, None
+                self._board = board
+                self._board_error = board_error
                 self._archive_error = archive_error
                 if isinstance(archive_error, MembershipChanged):
                     self._retry_at = self.clock() + .25
@@ -264,17 +281,45 @@ class SnapshotService:
 
     def coverage(self):
         with self._lock:
-            value = self.current
-            status = "building"
-            if self.error or self._archive_error or (value and self.clock() - value.started > 15):
-                status = "stale"
-            elif value and value.archives_complete:
-                status = "incomplete" if value.invalid_count or value.archive_invalid_count else "complete"
-            return {"status": status, "generation": value.generation if value else None,
-                    "discovered_files": value.discovered_files if value else 0,
-                    "discovered_bytes": value.discovered_bytes if value else 0,
-                    "refresh_duration": value.duration if value else 0,
-                    "cache_size": len(self._cache)}
+            return self._coverage_locked()
+
+    def _coverage_locked(self):
+        value = self.current
+        status = "building"
+        if self.error or self._archive_error or (value and self.clock() - value.started > 15):
+            status = "stale"
+        elif value and value.archives_complete:
+            status = "incomplete" if value.invalid_count or value.archive_invalid_count else "complete"
+        return {"status": status, "generation": value.generation if value else None,
+                "discovered_files": value.discovered_files if value else 0,
+                "discovered_bytes": value.discovered_bytes if value else 0,
+                "refresh_duration": value.duration if value else 0,
+                "cache_size": len(self._cache)}
+
+    def board(self):
+        """No source reads/rebuilds: stale placements remain explicitly last-known."""
+        from agenttalk.work_board_feed import bounded
+        with self._lock:
+            feed = copy.deepcopy(self._board)
+            board_error = self._board_error
+            status = self._coverage_locked()
+        if board_error:
+            status["status"] = "stale"
+        if feed is None:
+            return {"schema_version": 1, "items": [], "total_count": None, "omitted_count": None,
+                    "target_root_project_id": None, "generated_at": None, "window_days": 7,
+                    "legacy": {"open_request_count": None, "known_lower_bound": 0,
+                               "counts_by_kind": {}, "examples": [], "truncated": False},
+                    "unassigned": {"count": None, "reasons": {}, "examples": []},
+                    "truncated": False, "coverage": status, "errors": ["board snapshot building"]}
+        feed["coverage"].update({k: v for k, v in status.items() if k not in ("status", "generation")})
+        if status["status"] != "complete":
+            feed["coverage"]["status"] = status["status"]
+            feed.update(last_known=True, total_count=None)
+            feed["legacy"]["open_request_count"] = None
+        if board_error:
+            feed["errors"].append("board projection failed: " + board_error)
+        return bounded(feed)
 
     def start(self):
         def run():

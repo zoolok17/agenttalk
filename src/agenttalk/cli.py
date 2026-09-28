@@ -2141,6 +2141,8 @@ def cmd_check(args: argparse.Namespace) -> int:
             print(f"hold        {rid}")
         if gate_obj is not None:
             print(f"  gates: {gate_obj['verdict']}")
+            for warning in gate_obj.get("warnings", []):
+                print(f"    warning: {warning}")
             for blocker in gate_obj["blockers"]:
                 why = f" - {blocker['reason']}" if blocker.get("reason") else ""
                 print(f"    blocker {blocker['name']}: {blocker['status']}{why}")
@@ -2551,6 +2553,8 @@ def _cmd_gate(args: argparse.Namespace) -> int:
             print(json.dumps(result, indent=2))
         else:
             print(result["verdict"])
+            for warning in result.get("warnings", []):
+                print(f"warning: {warning}")
             if result["required_gates"]:
                 print("required gates: " + ", ".join(result["required_gates"]))
             for blocker in result["blockers"]:
