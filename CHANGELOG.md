@@ -11,9 +11,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Serve a bounded, read-only work-board feed from the shared snapshot worker, with
-  exact item/cycle/revision checks and visible coverage, overflow and legacy groups.
-
 - Add the pure work-board reducer: validated envelopes become work items placed by
   the design's precedence rows from explicit correlation only, with a counted legacy
   group. No bodies, subjects or message-ID order are used; unknown is never green.
@@ -30,10 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configure model vendors independently of CLI transport; freeze per-recipient
   vendor maps on work dispatches and link escalations to exact work items/cycles.
 
-### Fixed
+- Serve a bounded, read-only work-board feed from the shared snapshot worker, with
+  exact item/cycle/revision checks and visible coverage, overflow and legacy groups.
 
-- Isolate `wb.` gates from root checks and both gate-HOLD attention paths; refuse
-  new board names in root requirements and warn about legacy contaminated lists.
+### Fixed
 
 - Keep the fresh last-known-good dashboard view during snapshot scan races and
   schedule a bounded prompt retry; config mismatch and stale data still refuse.
@@ -57,6 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generation changes,
   lock-order inversions and a lost lease keep their existing handling and are
   never retried as contention.
+
+- Isolate `wb.` gates from root checks and both gate-HOLD attention paths; refuse
+  new board names in root requirements and warn about legacy contaminated lists.
 
 ## [0.93.0] - 2026-09-27
 
