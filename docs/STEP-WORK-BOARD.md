@@ -75,7 +75,10 @@ suite run):
   48/48, `console2_view` 95/95 — all green, confirming no behavior change to
   anything already rendered.
 - `tests/test_console2_web.py`: **59 passed, 2 skipped** in 43.39 s (skips are
-  the pre-existing environment-gated browser-launch tests, unrelated to B7).
+  the pre-existing, deliberate model/no-request and sanctioned avatar-src
+  static-check exemptions at `test_console2_web.py:274/276`, unrelated to B7 -
+  not, as an earlier draft of this record wrongly said, browser-launch
+  environment gates).
 - `tests/test_attention.py`: **174 passed** in 2.69 s, including a new pinning
   test (`test_needs_operator_source_refs_carry_validated_item_ref_never_a_guess`)
   added to close a gap: no existing Python test asserted that
@@ -87,6 +90,62 @@ suite run):
   `pending_decisions` wire shape was already pinned there).
 - Ruff/Bandit not re-run in this record (no server-side production code
   changed). B8 (the board UI itself) comes after this slice is reviewed.
+
+### Fix round (PR #220 cold read, codex developer-4)
+
+Two correctness/contract defects found in the exported-but-not-yet-rendered B7
+contract; neither had a user-visible symptom yet (no renderer consumed these
+fields), but both would mislead B8.
+
+- **F1 (major):** `resolvedIncidentIds` treated an escalation's mere absence
+  from the current read as proof of resolution. Two reproductions: (a) a
+  server-side snapshot-bound `ACTION_DEFER` removes an item from
+  `attention.build_queue`'s output while the escalation is still pending -
+  the identical wire shape as a genuine resolution, and this wire carries no
+  positive terminal signal to tell the two apart; (b) a root read error left
+  `view.needs.available` at its default `true` even though nothing was
+  loaded, so a caller would read an empty incident set as an all-clear.
+  Fixed by renaming the function to `missingIncidentIds`, which never claims
+  resolution - only that an id is no longer visible - and gating it on an
+  explicit `currentTrustworthy` flag (closed by default) so an unavailable or
+  stale read reports nothing missing at all. The two early-return `view.mode`
+  paths (`error`, `loading`) now also set `view.needs.available = false`.
+- **F2 (minor):** `chatOnlyDecisions` copied lead-chat's `pending_decisions`
+  through with no record of whether THAT read was stale or had failed, and
+  those decisions did not participate in `view.needs.incidents` at all, so a
+  failed/stale-chat-only pending decision could show `answerable: true` while
+  the shared incident set reported none. Fixed by threading the same
+  `chat.ok`/read-age signal that already drives `view.lead.notes` into
+  `dedupeAttentionAndChat` (new `sourceStale`/`sourceAvailable` fields on each
+  `chatOnly` entry) and adding `mergeIncidentsWithChatOnly`, which folds those
+  decisions into `view.needs.incidents` as unlinked incidents (pending_decisions
+  carries no `work_item`/`work_cycle` - never guessed), deduplicated by
+  escalation id against attention's own incidents.
+- **Docs nit:** corrected above - the two `test_console2_web.py` skips are the
+  deliberate model/no-request and avatar-src static-check exemptions at
+  `test_console2_web.py:274/276`, not browser-launch environment gates.
+
+Failing-first evidence: a targeted stash-and-run of the pre-fix
+`console2-model.js` against the new tests showed 7 of 18
+`console2_needs_you.test.mjs` cases failing (`missingIncidentIds is not a
+function` ×2 from the direct unit tests, plus the `mergeIncidentsWithChatOnly`
+unit tests failing the same way, plus the `needs.available`/stale-chat
+integration tests asserting the wrong value) - one test per finding at
+minimum, several redundantly covering the same gap from different angles.
+
+Final verification (foreground, worktree `src` on PYTHONPATH, chunked):
+
+- `tests/console2_needs_you.test.mjs`: **18/18 passed** (12 pre-existing + 6
+  new: freshness-stamping, two `mergeIncidentsWithChatOnly` cases, two
+  `missingIncidentIds` cases, and the root-error/failed-chat integration
+  reproductions).
+- Full node regression sweep (unchanged): `console2_model` 17/17,
+  `console2_render` 31/31, `console2_stream` 59/59, `console2_data` 48/48,
+  `console2_view` 95/95.
+- `tests/test_console2_web.py`: **59 passed, 2 skipped** in 41.6 s.
+- `tests/test_attention.py`: **174 passed** in 1.9 s (unchanged from the prior
+  slice's pinning test).
+- No Python production code touched in this round; no full suite run.
 
 ## B6a — gate isolation and bounded cached feed
 

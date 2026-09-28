@@ -789,27 +789,70 @@
   // `pending_decisions` (drawn from the same operator-facing thread, filtered to the current
   // lead). Matched ONLY by escalation id (request_id) - titles/subjects can coincide, ids cannot.
   // A pending decision with no matching attention item (attention stale/unavailable, or a read
-  // that has not caught up yet) is never silently dropped: it comes back as `chatOnly`.
-  function dedupeAttentionAndChat(attentionItems, pendingDecisions) {
+  // that has not caught up yet) is never silently dropped: it comes back as `chatOnly`, stamped
+  // with the CHAT read's own freshness/availability (F2) - a decision that rode in on a stale or
+  // failed lead-chat read must say so, never look as current as one from a fresh read.
+  function dedupeAttentionAndChat(attentionItems, pendingDecisions, chatSource) {
     var attentionIds = Object.create(null);
     (Array.isArray(attentionItems) ? attentionItems : []).forEach(function (item) {
       if (!isObj(item) || item.source !== 'escalation') return;
       var id = incidentRef(item).escalationId;
       if (id !== null) attentionIds[id] = true;
     });
+    var stale = isObj(chatSource) && chatSource.stale === true;
+    var available = !isObj(chatSource) || chatSource.available !== false;
     var chatOnly = [];
     (Array.isArray(pendingDecisions) ? pendingDecisions : []).forEach(function (d) {
       var id = isObj(d) && typeof d.request_id === 'string' && d.request_id ? d.request_id : null;
-      if (id !== null && !hasOwn(attentionIds, id)) chatOnly.push(d);
+      if (id === null || hasOwn(attentionIds, id)) return;
+      var copy = {};
+      for (var k in d) { if (hasOwn(d, k)) copy[k] = d[k]; }
+      copy.sourceStale = stale;
+      copy.sourceAvailable = available;
+      chatOnly.push(copy);
     });
     return { chatOnly: chatOnly };
   }
 
-  // Which escalation ids were incidents a moment ago and are not any more - answered, expired, or
-  // resolved outside this page. A caller (stream or board) holding its own previous projection
-  // uses this to say an incident was resolved, rather than letting it just vanish unremarked.
-  // Pure and stateless itself: the "moment ago" is whatever the caller last held.
-  function resolvedIncidentIds(previousIncidents, currentIncidents) {
+  // A chat-only pending decision IS an incident the shared set must carry - lead-chat can surface
+  // one attention hasn't (yet, or won't: a stale/failed attention read), and the design's own rule
+  // is deduplication across BOTH feeds, not attention-only. pending_decisions carries no
+  // work_item/work_cycle at all, so it is added unlinked - never guessed - and tagged with its own
+  // feed's freshness so a caller can tell a chat-derived incident's evidence apart from attention's.
+  // Deduplicates by escalation id against the incidents already present (attention wins on a tie,
+  // though by construction dedupeAttentionAndChat's chatOnly already excludes attention matches).
+  function mergeIncidentsWithChatOnly(incidents, chatOnlyDecisions) {
+    var seen = Object.create(null);
+    var out = [];
+    (Array.isArray(incidents) ? incidents : []).forEach(function (inc) {
+      if (!isObj(inc) || typeof inc.escalationId !== 'string' || hasOwn(seen, inc.escalationId)) return;
+      seen[inc.escalationId] = true;
+      out.push(inc);
+    });
+    (Array.isArray(chatOnlyDecisions) ? chatOnlyDecisions : []).forEach(function (d) {
+      var id = isObj(d) && typeof d.request_id === 'string' && d.request_id ? d.request_id : null;
+      if (id === null || hasOwn(seen, id)) return;
+      seen[id] = true;
+      out.push({ escalationId: id, workItem: null, workCycle: null, linked: false, itemId: null,
+                 source: 'chat', sourceStale: d.sourceStale === true, sourceAvailable: d.sourceAvailable !== false });
+    });
+    return out;
+  }
+
+  // Which escalation ids were incidents a moment ago and are NOT reported missing unless the
+  // current read can be trusted (fresh AND available): an unavailable or stale read reports
+  // nothing here, so a caller's previously-known incidents keep their identity through an outage
+  // or a hung poll rather than being wiped by a snapshot it cannot trust (F1).
+  //
+  // "Missing" is deliberately NOT "resolved". build_queue can hide an item behind a snapshot-bound
+  // disposition (a server-side defer, or a dismiss) while the escalation is still pending - the
+  // exact same visible effect as an actual resolution, and this wire carries no positive terminal
+  // signal ("answered", "closed") to tell the two apart. A fresh, successful absence is therefore
+  // reported as missing/unknown, never asserted as resolved; a caller wanting "resolved" needs a
+  // source that actually says so, not mere disappearance. Pure and stateless itself: the "moment
+  // ago" is whatever the caller last held, and `currentTrustworthy` is the caller's own call.
+  function missingIncidentIds(previousIncidents, currentIncidents, currentTrustworthy) {
+    if (currentTrustworthy !== true) return [];
     var now = Object.create(null);
     (Array.isArray(currentIncidents) ? currentIncidents : []).forEach(function (inc) { now[inc.escalationId] = true; });
     return (Array.isArray(previousIncidents) ? previousIncidents : [])
@@ -919,12 +962,16 @@
       view.mode = 'error';
       view.greeting = greetingFor('error', {});
       view.chip.freshness = 'error';
+      // F1: an unreadable root reads no attention at all - `available` must say so, never default
+      // to true, or a caller diffing incidents against this empty set would read it as "resolved".
+      view.needs.available = false;
       return view;
     }
     var agents = (Array.isArray(root.agents) ? root.agents : []).filter(isObj);
     if (!agents.length && !Array.isArray(root.agents)) {
       view.mode = 'loading';
       view.greeting = greetingFor('loading', {});
+      view.needs.available = false;
       return view;
     }
 
@@ -1031,6 +1078,11 @@
       }
       var chatNotes = [];
       var readAge = typeof chat.asOfMs === 'number' ? Math.max(0, (nowMs - chat.asOfMs) / 1000) : null;
+      // F2: the SAME two signals that drive chatNotes ("could not be read" / "not refreshed")
+      // travel with every chat-only pending decision too, not only as prose in view.lead.notes -
+      // a decision that rode in on a failed or stale chat read must say so wherever it surfaces.
+      var chatAvailable = chat.ok !== false;
+      var chatStale = !chatAvailable || (readAge !== null && readAge > CHAT_FRESH_S);
       if (chat.ok === false) {
         chatNotes.push({ kind: 'failed', text: 'Lead chat could not be read' +
           (readAge === null ? '' : ' · last read ' + fmtAge(readAge) + ' ago') });
@@ -1046,8 +1098,11 @@
       // does not currently have (a stale/unavailable read, or one that has not caught up) surface
       // here; the rest stay exactly where they already are, once, not doubled.
       view.needs.chatOnlyDecisions = dedupeAttentionAndChat(
-        att ? att.items : null, pl.pending_decisions,
+        att ? att.items : null, pl.pending_decisions, { stale: chatStale, available: chatAvailable },
       ).chatOnly;
+      // F2: a chat-only decision is itself an incident (an escalation attention has not, or has
+      // not yet, surfaced) - the shared incident set must include it, not just the chat panel.
+      view.needs.incidents = mergeIncidentsWithChatOnly(view.needs.incidents, view.needs.chatOnlyDecisions);
       // The thread: both sides of the lead chat, oldest first (the feed keeps the newest 100).
       var operatorName = typeof pl.operator === 'string' ? pl.operator : '';
       var thread = [];
@@ -1222,6 +1277,7 @@
     projectIncidents: projectIncidents,
     incidentsForItem: incidentsForItem,
     dedupeAttentionAndChat: dedupeAttentionAndChat,
-    resolvedIncidentIds: resolvedIncidentIds
+    mergeIncidentsWithChatOnly: mergeIncidentsWithChatOnly,
+    missingIncidentIds: missingIncidentIds
   };
 }));

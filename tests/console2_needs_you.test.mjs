@@ -112,16 +112,59 @@ test('dedupeAttentionAndChat: garbage/missing input never throws, and never inve
   assert.deepEqual(onlyChat.chatOnly.map((d) => d.request_id), ['esc-x']);
 });
 
-// ------------------------------------------------------------ resolvedIncidentIds
+// F2: freshness/availability travel WITH the decision, not only as prose elsewhere.
+test('dedupeAttentionAndChat: a chat-only decision carries the chat read\'s own freshness and availability', () => {
+  const fresh = M.dedupeAttentionAndChat([], [PENDING_DECISION({ requestId: 'esc-x' })], { stale: false, available: true });
+  assert.equal(fresh.chatOnly[0].sourceStale, false);
+  assert.equal(fresh.chatOnly[0].sourceAvailable, true);
 
-test('resolvedIncidentIds: an incident present before and absent now is resolved; one still present is not', () => {
+  const failed = M.dedupeAttentionAndChat([], [PENDING_DECISION({ requestId: 'esc-x' })], { stale: true, available: false });
+  assert.equal(failed.chatOnly[0].sourceStale, true);
+  assert.equal(failed.chatOnly[0].sourceAvailable, false, 'a failed chat read never looks available');
+});
+
+// ------------------------------------------------------------ mergeIncidentsWithChatOnly
+
+test('mergeIncidentsWithChatOnly: a chat-only decision becomes an unlinked incident, never guessed a work item', () => {
+  const incidents = M.projectIncidents([ATT_ITEM({ id: 'a', linked: true, requestId: 'esc-a', workItem: 'gate-b' })]);
+  const chatOnly = M.dedupeAttentionAndChat([], [PENDING_DECISION({ requestId: 'esc-x' })], { stale: true, available: false }).chatOnly;
+  const merged = M.mergeIncidentsWithChatOnly(incidents, chatOnly);
+  assert.deepEqual(merged.map((i) => i.escalationId).sort(), ['esc-a', 'esc-x']);
+  const fromChat = merged.find((i) => i.escalationId === 'esc-x');
+  assert.deepEqual(fromChat, {
+    escalationId: 'esc-x', workItem: null, workCycle: null, linked: false, itemId: null,
+    source: 'chat', sourceStale: true, sourceAvailable: false,
+  });
+});
+
+test('mergeIncidentsWithChatOnly: an id already an attention incident is never duplicated from chat', () => {
+  const incidents = M.projectIncidents([ATT_ITEM({ id: 'a', linked: true, requestId: 'esc-a', workItem: 'gate-b' })]);
+  const chatOnly = [{ request_id: 'esc-a', sourceStale: false, sourceAvailable: true }];
+  assert.equal(M.mergeIncidentsWithChatOnly(incidents, chatOnly).length, 1);
+});
+
+// ------------------------------------------------------------ missingIncidentIds (F1)
+
+test('missingIncidentIds: requires currentTrustworthy===true; an untrustworthy read reports nothing missing', () => {
+  const before = M.projectIncidents([ATT_ITEM({ id: 'a', linked: true, requestId: 'esc-a', workItem: 'x' })]);
+  // F1 read-error case: a root/attention read that cannot be trusted must never make a
+  // previously-known incident look resolved merely because the new read came back empty.
+  assert.deepEqual(M.missingIncidentIds(before, [], false), [], 'unavailable/stale: report nothing');
+  assert.deepEqual(M.missingIncidentIds(before, [], undefined), [], 'no explicit true: closed by default');
+});
+
+test('missingIncidentIds: a fresh, trustworthy absence is reported as missing, never asserted resolved', () => {
   const before = M.projectIncidents([
     ATT_ITEM({ id: 'a', linked: true, requestId: 'esc-a', workItem: 'x' }),
     ATT_ITEM({ id: 'b', linked: true, requestId: 'esc-b', workItem: 'x' }),
   ]);
+  // F1 defer case: a snapshot-bound server-side DEFER removes an escalation from build_queue's
+  // output while it is still pending - the identical wire shape as a genuine resolution. This
+  // function is named, and behaves, as "missing": it never claims that absence is resolution.
   const after = M.projectIncidents([ATT_ITEM({ id: 'b', linked: true, requestId: 'esc-b', workItem: 'x' })]);
-  assert.deepEqual(M.resolvedIncidentIds(before, after), ['esc-a']);
-  assert.deepEqual(M.resolvedIncidentIds(after, before), [], 'nothing resolved when the set only grows');
+  assert.deepEqual(M.missingIncidentIds(before, after, true), ['esc-a']);
+  assert.deepEqual(M.missingIncidentIds(after, before, true), [], 'nothing missing when the set only grows');
+  assert.equal(M.resolvedIncidentIds, undefined, 'no export may claim resolution from mere absence');
 });
 
 // ------------------------------------------------------------ wired into buildTeamView (stream)
@@ -177,6 +220,35 @@ test('buildTeamView: a stale attention read keeps its incidents - never hidden, 
   const v = view({ attention: attention(items, { asOfMs: NOW - 9000 }) });
   assert.equal(v.needs.stale, true);
   assert.equal(v.needs.incidents.length, 1, 'the incident is not thrown away merely because the read is stale');
+});
+
+// F1 read-error case: a root read error must mark needs unavailable, never silently default to
+// "available" - a caller diffing against this empty incident set must not read it as resolution.
+test('buildTeamView: a root read error marks needs.available false, never a silent all-clear', () => {
+  const v = view({ root: root({ errors: ['store unreadable'] }) });
+  assert.equal(v.mode, 'error');
+  assert.equal(v.needs.available, false);
+  assert.deepEqual(v.needs.incidents, []);
+});
+
+// F2 exact reproduction: fresh empty attention, a 60-second-old chat read with ok=false and one
+// pending decision. The decision must carry its own source freshness/availability, and the shared
+// incident set must include it (rather than reporting needs.incidents=[] while an incident exists).
+test('buildTeamView: a failed, stale chat read never presents its pending decision as fresh or resolved', () => {
+  const msgs = [{ from: LEAD, to: 'operator', body: 'hi', ts: new Date(NOW - 1000).toISOString() }];
+  const v = view({
+    attention: attention([]),
+    chat: {
+      ok: false, asOfMs: NOW - 60000,
+      payload: { available: true, operator: 'operator', lead: LEAD, messages: msgs, detail: '',
+                 pending_decisions: [PENDING_DECISION({ requestId: 'esc-probe' })] },
+    },
+  });
+  assert.equal(v.needs.stale, false, 'needs.stale reflects the ATTENTION feed only, unaffected by a failed chat read');
+  assert.equal(v.needs.chatOnlyDecisions[0].sourceStale, true, 'a 60s-old failed chat read is stale');
+  assert.equal(v.needs.chatOnlyDecisions[0].sourceAvailable, false, 'a failed read is never presented as available');
+  assert.equal(v.needs.incidents.length, 1, 'a chat-only pending decision is part of the shared incident set');
+  assert.equal(v.needs.incidents[0].linked, false, 'pending_decisions carries no work_item/work_cycle - never guessed');
 });
 
 run();
