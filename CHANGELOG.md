@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.94.0] - 2026-09-28
+
+Theme: **a work board that moves itself, and seats that survive a busy store.**
+
 ### Added
 
 - **Console v2 preview at `/v2` (pitch slice, step M1).** A second, read-only
