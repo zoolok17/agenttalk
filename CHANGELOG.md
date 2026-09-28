@@ -14,20 +14,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Serve a bounded, read-only work-board feed from the shared snapshot worker, with
   exact item/cycle/revision checks and visible coverage, overflow and legacy groups.
 
-### Fixed
+- Add the pure work-board reducer: validated envelopes become work items placed by
+  the design's precedence rows from explicit correlation only, with a counted legacy
+  group. No bodies, subjects or message-ID order are used; unknown is never green.
+  Adversarial hardening keeps needs-info HOLDs, follows explicit replacement chains,
+  compares whole repository/check policies and degrades malformed or partial history
+  to a per-item Unknown instead of a false Ready.
 
-- Isolate `wb.` gates from root checks and both gate-HOLD attention paths; refuse
-  new board names in root requirements and warn about legacy contaminated lists.
+- Discover all compacted work evidence through the shared snapshot, caching validated
+  facts across polls and keeping active state available while archive coverage builds or degrades.
 
-- Keep the fresh last-known-good dashboard view during snapshot scan races and
-  schedule a bounded prompt retry; config mismatch and stale data still refuse.
+- Share validated active envelopes across dashboard polls through a per-root
+  worker snapshot, with generation checks and a cross-partition selected-work budget.
 
-## [0.93.0] - 2026-09-27
-
-Theme: **challenge major work before it starts, and run acceptance on a pinned,
-offline-checked tool registry.**
-
-### Added
+- Configure model vendors independently of CLI transport; freeze per-recipient
+  vendor maps on work dispatches and link escalations to exact work items/cycles.
 
 - Discover all compacted work evidence through the shared snapshot, caching validated
   facts across polls and keeping active state available while archive coverage builds or degrades.
@@ -40,6 +41,41 @@ offline-checked tool registry.**
   Adversarial hardening keeps needs-info HOLDs, follows explicit replacement chains,
   compares whole repository/check policies and degrades malformed or partial history
   to a per-item Unknown instead of a false Ready.
+
+### Fixed
+
+- Isolate `wb.` gates from root checks and both gate-HOLD attention paths; refuse
+  new board names in root requirements and warn about legacy contaminated lists.
+
+- Keep the fresh last-known-good dashboard view during snapshot scan races and
+  schedule a bounded prompt retry; config mismatch and stale data still refuse.
+
+- Recheck current task authority and reader compatibility when resuming a partial
+  task broadcast; a prior dispatch no longer authorizes a demoted sender to resume.
+
+- Keep wrapped seats alive through store lock contention (#154): the continuous loop
+  retries only the contended step in place, before admission or, after a completed
+  turn, for publication (one stable operation nonce) and finalization, never
+  re-driving the turn, including on owed (admitted-dispatch) heads. Contention shows
+  as `rate_limited_or_outage` / `store_lock_contention`, with one wrapper-log
+  diagnostic per persistent episode. An owner that cannot re-enter a lock's guard
+  to remove its own marker no longer waits on itself: the process removes exactly
+  that marker on its next acquisition or sweep. Contention is never persisted as a
+  permanent block, and no gate method raises anything new because of it:
+  failed-delivery disposition, retry-exhaustion settlement, block writes and
+  cursor-projection accounting keep their own internal retry and return state, but
+  a contended outcome is left unpersisted, so the step is retried (in place in the
+  continuous loop, on the next poll in a one-shot). Corruption, access denial, unsafe
+  generation changes,
+  lock-order inversions and a lost lease keep their existing handling and are
+  never retried as contention.
+
+## [0.93.0] - 2026-09-27
+
+Theme: **challenge major work before it starts, and run acceptance on a pinned,
+offline-checked tool registry.**
+
+### Added
 
 - Validate and inherit external work declarations, reserve publisher-owned vendor
   metadata, and align both lead skills with the finalized work-board contract.

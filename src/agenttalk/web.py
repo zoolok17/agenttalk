@@ -2622,6 +2622,13 @@ def build_attention(desc: RootDescriptor,
                 "age_seconds": float(it.get("age_seconds") or 0),
                 "human_can_unblock_now": bool(it.get("human_can_unblock_now")),
             }
+            if src == _attention.SOURCE_NEEDS_OPERATOR:
+                from agenttalk import work_tags
+                entry["source_refs"] = [
+                    {"kind": "message", "request_id": _envelope_str(ref.get("request_id", "")),
+                     **work_tags.item_ref(ref)}
+                    for ref in it.get("source_refs", []) if isinstance(ref, dict) and ref.get("kind") == "message"
+                ]
             if (
                 src == _attention.SOURCE_PROCESS_TREE_HOLD
                 and it.get("recommendation")

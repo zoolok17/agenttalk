@@ -136,6 +136,68 @@ _AWAIT_MAX_ROOT_ENTRIES = 256
 _AWAIT_MAX_DIAGNOSTICS = 64
 
 
+class LockContention(TimeoutError):
+    """Another live holder kept a store lock past this acquisition deadline.
+
+    Raised ONLY by the two acquisition waits (the generation guard and the
+    ownership marker), so it is the one lock failure a caller may retry. Access
+    denial ("could not open the generation guard"), an unsafe generation change,
+    a failed release and a lock-order inversion keep their own types and
+    messages. A TimeoutError subclass, so every existing ``except TimeoutError``
+    boundary behaves exactly as before.
+    """
+
+    def __init__(self, message: str, *, what: str = "lock",
+                 lock_file: str | None = None) -> None:
+        super().__init__(message)
+        self.what = what
+        self.lock_file = lock_file
+
+
+# #154 F1: ownership markers THIS process created but could not remove, because
+# the owner's release could not re-enter the lock's generation guard. The marker
+# names this live PID, so no other client will ever recover it; only this
+# process may, and only that exact marker: each entry pins its inode and its
+# generation token, so a later owner's marker at the same path is never touched.
+_STRANDED_MARKERS: dict[str, tuple[Path, os.stat_result, str]] = {}
+_STRANDED_MARKERS_LOCK = threading.Lock()
+
+
+def _stranded_key(lock: Path) -> str:
+    return os.path.normcase(os.path.abspath(str(lock)))
+
+
+def _remember_stranded_marker(lock: Path, identity: os.stat_result,
+                              generation: str) -> None:
+    with _STRANDED_MARKERS_LOCK:
+        _STRANDED_MARKERS[_stranded_key(lock)] = (lock, identity, generation)
+
+
+def _forget_stranded_marker(lock: Path, generation: str) -> None:
+    with _STRANDED_MARKERS_LOCK:
+        entry = _STRANDED_MARKERS.get(_stranded_key(lock))
+        if entry is not None and entry[2] == generation:
+            del _STRANDED_MARKERS[_stranded_key(lock)]
+
+
+def _own_stranded_generation(lock: Path, pid: int | None,
+                             existing: os.stat_result,
+                             record: dict | None) -> str | None:
+    """The generation of ``lock``'s marker iff it is this process's own
+    stranded marker (same PID, same generation token, same inode)."""
+    with _STRANDED_MARKERS_LOCK:
+        entry = _STRANDED_MARKERS.get(_stranded_key(lock))
+    if (
+        entry is None
+        or pid != os.getpid()
+        or not isinstance(record, dict)
+        or record.get("generation") != entry[2]
+        or not _same_file(existing, entry[1])
+    ):
+        return None
+    return entry[2]
+
+
 def _ensure_lock_byte(fd: int) -> None:
     """Make byte zero lockable without relying on owner metadata."""
     if os.fstat(fd).st_size == 0:
@@ -1318,6 +1380,9 @@ class Store:
                 validate_trust_classes(cfg["trust_classes"], agents)
             except ValueError as e:
                 raise ValueError(f"corrupt config at {self.config_path}: {e}.") from e
+        from agenttalk import work_tags
+        work_tags.validate_vendor_config(cfg.get("model_vendor", {}), agents)
+
         # Identity registry tombstones (0.16.0, #19 Phase A). Absent OR null ⇒
         # no retirements (full 0.15.0 behavior). Validated fail-closed so a
         # corrupt registry can't alias an active name or smuggle an unsafe one.
@@ -1446,9 +1511,11 @@ class Store:
                 )
             while not _try_acquire_file_lock(fd):
                 if time.monotonic() >= deadline:
-                    raise TimeoutError(
+                    raise LockContention(
                         f"could not acquire the generation guard for {what} "
-                        f"at {guard}"
+                        f"at {guard}",
+                        what=what,
+                        lock_file=guard.name,
                     ) from None
                 time.sleep(poll)
             acquired = True
@@ -1511,6 +1578,7 @@ class Store:
         )
         deadline = time.monotonic() + timeout
         identity: os.stat_result | None = None
+        owned_generation = ""
         ownerless_generation: tuple[int, int] | None = None
         ownerless_seen_at: float | None = None
         try:
@@ -1547,6 +1615,18 @@ class Store:
                             ownerless_generation = None
                             ownerless_seen_at = None
                         else:
+                            stranded = _own_stranded_generation(
+                                lock, pid, existing, record,
+                            )
+                            if stranded is not None:
+                                # #154 F1: this process's OWN marker, left by a
+                                # release that could not re-enter the guard we
+                                # hold now. Validated above (PID, generation,
+                                # inode), so remove it instead of waiting on
+                                # ourselves forever.
+                                _unlink_if_same_file(lock, existing)
+                                _forget_stranded_marker(lock, stranded)
+                                continue
                             os_lock_available = (
                                 existing.st_size > 0
                                 and _existing_os_lock_available(lock)
@@ -1592,6 +1672,7 @@ class Store:
                                     continue
                     else:
                         identity = os.lstat(lock)
+                        owned_generation = generation
                         try:
                             _validate_lock_file_stat(lock, identity)
                             if not _same_file(created, identity):
@@ -1604,44 +1685,109 @@ class Store:
                             raise
                 if identity is None:
                     if time.monotonic() >= deadline:
-                        raise TimeoutError(
+                        raise LockContention(
                             f"could not acquire the {what} at {lock} within "
-                            f"{timeout:g}s"
+                            f"{timeout:g}s",
+                            what=what,
+                            lock_file=lock.name,
                         ) from None
                     time.sleep(poll)
             yield
         finally:
             if identity is not None:
+                try:
+                    self._release_owned_marker(
+                        lock,
+                        identity,
+                        deadline=max(deadline, time.monotonic() + timeout),
+                        poll=poll,
+                        what=what,
+                    )
+                except LockContention:
+                    # #154 F1: the owner could not re-enter its guard to remove
+                    # its own marker. The critical section itself is complete
+                    # (or its own exception keeps propagating), so this is not
+                    # acquisition contention and must not make a caller re-run
+                    # completed work. Record the exact marker instead: this
+                    # process removes it on its next acquisition of this lock or
+                    # its next complete_stranded_lock_releases() sweep.
+                    _remember_stranded_marker(lock, identity, owned_generation)
+
+    def _release_owned_marker(
+        self,
+        lock: Path,
+        identity: os.stat_result,
+        *,
+        deadline: float,
+        poll: float,
+        what: str,
+    ) -> None:
+        with self._lock_generation_guard(
+            lock,
+            deadline=deadline,
+            poll=poll,
+            what=what,
+        ):
+            last_error: OSError | None = None
+            for _ in range(100):
+                try:
+                    current = os.lstat(lock)
+                    _validate_lock_file_stat(lock, current)
+                    if not _same_file(identity, current):
+                        raise OSError("ownership marker generation changed")
+                    if not _unlink_if_same_file(lock, identity):
+                        raise OSError("ownership marker generation changed")
+                    last_error = None
+                    break
+                except FileNotFoundError as exc:
+                    last_error = exc
+                    break
+                except PermissionError as exc:
+                    last_error = exc
+                    time.sleep(0.01)
+                except OSError as exc:
+                    last_error = exc
+                    break
+            if last_error is not None:
+                raise OSError(
+                    f"could not release the {what} at {lock}: {last_error}"
+                ) from last_error
+
+    def complete_stranded_lock_releases(self) -> int:
+        """#154 F1: remove this process's stranded ownership markers whose guard
+        is free right now; returns how many were removed.
+
+        Never waits: a still-contended or unopenable guard keeps its entry for the
+        next sweep. Each marker is re-validated under its guard (this PID, the
+        recorded generation token and inode) before removal, and an entry whose
+        path now holds anything else is dropped without touching the file.
+        """
+        with _STRANDED_MARKERS_LOCK:
+            entries = list(_STRANDED_MARKERS.values())
+        removed = 0
+        for lock, identity, generation in entries:
+            try:
                 with self._lock_generation_guard(
                     lock,
-                    deadline=max(deadline, time.monotonic() + timeout),
-                    poll=poll,
-                    what=what,
+                    deadline=time.monotonic(),
+                    poll=0.0,
+                    what="stranded ownership marker",
                 ):
-                    last_error: OSError | None = None
-                    for _ in range(100):
-                        try:
-                            current = os.lstat(lock)
-                            _validate_lock_file_stat(lock, current)
-                            if not _same_file(identity, current):
-                                raise OSError("ownership marker generation changed")
-                            if not _unlink_if_same_file(lock, identity):
-                                raise OSError("ownership marker generation changed")
-                            last_error = None
-                            break
-                        except FileNotFoundError as exc:
-                            last_error = exc
-                            break
-                        except PermissionError as exc:
-                            last_error = exc
-                            time.sleep(0.01)
-                        except OSError as exc:
-                            last_error = exc
-                            break
-                    if last_error is not None:
-                        raise OSError(
-                            f"could not release the {what} at {lock}: {last_error}"
-                        ) from last_error
+                    try:
+                        pid, existing, record = _read_lock_owner(lock)
+                    except FileNotFoundError:
+                        _forget_stranded_marker(lock, generation)
+                        continue
+                    if (
+                        _own_stranded_generation(lock, pid, existing, record)
+                        == generation
+                        and _unlink_if_same_file(lock, identity)
+                    ):
+                        removed += 1
+                    _forget_stranded_marker(lock, generation)
+            except OSError:
+                continue
+        return removed
 
     def _advance_config_lock_generation(
         self,
@@ -2409,6 +2555,7 @@ class Store:
                 cfg["avatars"].pop(name, None)
             if isinstance(cfg.get("trust_classes"), dict):
                 cfg["trust_classes"].pop(name, None)
+            cfg.get("model_vendor", {}).pop(name, None)
             if was_external:
                 retired = cfg.get("retired")
                 if not isinstance(retired, list):
@@ -2445,6 +2592,22 @@ class Store:
                 values[name] = trust_class
             validate_trust_classes(values, roster)
             self._assert_external_worker_authority_safe(cfg)
+            self._write_config(cfg)
+        return cfg
+
+    def set_model_vendor(self, name: str, vendor: str | None) -> dict:
+        """Local operator assertion, independent of launcher/CLI transport."""
+        from agenttalk import work_tags
+        with self._config_lock():
+            cfg = self.load_config()
+            if name not in cfg["agents"]:
+                raise ValueError("model_vendor agent must be in the active roster")
+            mapping = cfg.setdefault("model_vendor", {})
+            if vendor is None:
+                mapping.pop(name, None)
+            else:
+                mapping[name] = vendor
+            work_tags.validate_vendor_config(mapping, cfg["agents"])
             self._write_config(cfg)
         return cfg
 
@@ -2858,6 +3021,7 @@ class Store:
         trust_classes = cfg.get("trust_classes")
         if isinstance(trust_classes, dict):
             trust_classes.pop(name, None)
+        cfg.get("model_vendor", {}).pop(name, None)
 
     def set_avatar(self, name: str, avatar_id: str) -> dict:
         """Set an active roster member's display-avatar preference."""
@@ -2984,6 +3148,7 @@ class Store:
             was_liaison = cfg.get("operator_facing") == old
             old_managed = (cfg.get("managed_lead_loop") or {}).get(old)
             old_trust_class = (cfg.get("trust_classes") or {}).get(old)
+            old_vendor = cfg.get("model_vendor", {}).get(old)
             avatars = cfg.get("avatars")
             old_avatar = avatars.get(old) if isinstance(avatars, dict) else None
             # Retire old -> tombstone(renamed_to=new), then activate new + carryover.
@@ -3018,6 +3183,8 @@ class Store:
                 self._cfg_dict(cfg, "managed_lead_loop")[new] = old_managed
             if old_trust_class is not None:
                 self._cfg_dict(cfg, "trust_classes")[new] = old_trust_class
+            if old_vendor is not None:
+                cfg["model_vendor"][new] = old_vendor
             avatar_id = _avatars.normalize_avatar_id(old_avatar)
             if avatar_id is not None:
                 self._cfg_dict(cfg, "avatars")[new] = avatar_id
@@ -3267,6 +3434,7 @@ class Store:
         sign: bool | None = None,
         _allow_reserved_sender: bool = False,
         _config_locked: bool = False,
+        _dispatch_vendors: dict | None = None,
     ) -> Message:
         if not self.initialized():
             raise FileNotFoundError("agenttalk not initialized; run `agenttalk init`.")
@@ -3287,6 +3455,7 @@ class Store:
                     sign=sign,
                     _allow_reserved_sender=_allow_reserved_sender,
                     _config_locked=True,
+                    _dispatch_vendors=_dispatch_vendors,
                 )
         config_before = os.stat(self.config_path)
         cfg = self.load_config()
@@ -3358,6 +3527,15 @@ class Store:
             meta["authorized_liaisons"] = sorted(authorized)
         from agenttalk import work_tags
         meta = work_tags.normalize(self, sender, recipient, kind, meta)
+        if kind in work_tags.OPENERS:
+            if _dispatch_vendors is None:
+                vendors = work_tags.vendor_snapshot(cfg, [recipient])
+            else:
+                recipients = meta.get("audience_resolved", recipient).split(",")
+                if recipient not in recipients:
+                    raise ValueError("dispatch recipient is missing from frozen audience")
+                vendors = work_tags.validate_vendor_map(_dispatch_vendors, recipients)
+            meta["assignee_model_vendors"] = vendors
         _gates.validate_response_status(kind, meta)
         if kind in OPENER_KINDS and "epoch_at_send" not in meta:
             meta["epoch_at_send"] = self.current_epoch()

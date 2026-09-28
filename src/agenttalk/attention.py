@@ -649,6 +649,7 @@ def needs_operator_items(pending: list[dict]) -> list[dict]:
     carries it so UI surfaces with an answer box can show what is being answered.
     human_can_unblock_now=True (a worker is literally blocked on the operator's answer).
     """
+    from agenttalk import work_tags
     out = []
     for e in pending:
         fields, warns = parse_attention_meta(e.get("meta") or {})
@@ -662,11 +663,12 @@ def needs_operator_items(pending: list[dict]) -> list[dict]:
                       ident_content={"rid": rid, "decision": fields.get("decision"),
                                      "subject": e.get("subject")},
                       human_can_unblock_now=True, age_seconds=float(e.get("age_seconds") or 0),
-                      source_refs=[{"kind": "message", "request_id": rid}],
+                      source_refs=[{"kind": "message", "request_id": rid,
+                                    **work_tags.item_ref(e.get("meta") or {})}],
                       fields=extra_fields,
                       warnings=warns)
         it["dedupe_key"] = dedupe_key(SOURCE_NEEDS_OPERATOR,
-                                      identity=f"{e.get('sender', '')}|{e.get('subject', '')}",
+                                      identity=rid,
                                       decision_hash=dh)
         out.append(it)
     return out
