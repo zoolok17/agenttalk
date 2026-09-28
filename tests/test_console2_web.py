@@ -29,9 +29,10 @@ STATIC = REPO_ROOT / "src" / "agenttalk" / "web_static"
 V2_ASSETS = {
     "console2.css": "text/css",
     "console2-model.js": "application/javascript",
+    "console2-board-model.js": "application/javascript",
     "console2.js": "application/javascript",
 }
-V2_JS = ("console2-model.js", "console2.js")
+V2_JS = ("console2-model.js", "console2-board-model.js", "console2.js")
 
 
 # --------------------------------------------------------------- helpers
@@ -154,9 +155,9 @@ def test_v2_shell_has_no_inline_anything_and_no_external_url(tmp_path: Path) -> 
     assert not any(has_inline for _src, has_inline in scripts), "a <script> tag carries inline content"
     assert all(src is not None and src.startswith("/static/console2") for src, _has_inline in scripts)
     assert "<link rel=\"stylesheet\" href=\"/static/console2.css\">" in page
-    # the two links are fixed server-authored paths
-    assert sorted(set(re.findall(r"<a\b[^>]*href=\"([^\"]*)\"", page))) == ["/dashboard"]
-    for region in ("c2-header", "c2-stream", "c2-rail", "c2-footer", "c2-hints"):
+    # every link is a fixed server-authored path: /dashboard plus the two B8 route anchors
+    assert sorted(set(re.findall(r"<a\b[^>]*href=\"([^\"]*)\"", page))) == ["#board", "#conversation", "/dashboard"]
+    for region in ("c2-header", "c2-stream", "c2-rail", "c2-board", "c2-board-detail", "c2-footer", "c2-hints"):
         assert f"id=\"{region}\"" in page
     assert "spec-kitty" not in page.lower()
     # nothing bus-derived is rendered server-side
@@ -315,11 +316,12 @@ def test_v2_avatar_allowlist_matches_the_servers_static_assets() -> None:
         assert f"avatars/{f}" in web._STATIC_ASSETS, f
 
 
-ALLOWED_API_PATHS = {"/api/state", "/api/attention", "/api/lead-chat"}
+ALLOWED_API_PATHS = {"/api/state", "/api/attention", "/api/lead-chat", "/api/work-board"}
 
 
-def test_v2_model_makes_no_requests_and_touches_no_dom() -> None:
-    code = _strip_js_comments(_read("console2-model.js"))
+@pytest.mark.parametrize("name", ("console2-model.js", "console2-board-model.js"))
+def test_v2_model_makes_no_requests_and_touches_no_dom(name: str) -> None:
+    code = _strip_js_comments(_read(name))
     for pattern in (r"\bfetch\b", r"\bdocument\b", r"\blocalStorage\b", r"\bsetTimeout\b", r"\bsetInterval\b",
                     r"\bXMLHttpRequest\b", r"\bnavigator\b", r"Date\.now\("):
         assert not re.search(pattern, code), pattern

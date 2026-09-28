@@ -90,22 +90,24 @@ async function evaluate(expression) {
 // correctly-refused precondition failure, not flakiness to paper over with a longer constant.
 // This polls for the actual observed change instead, bounded so a real stall still fails fast and
 // with a clear reason - never silently drops through and lets a stale reading pass as if it moved.
-async function waitForAgeChange(previousText, { timeoutMs = 30000, intervalMs = 250 } = {}) {
+async function waitForTextChange(selector, previousText, { timeoutMs = 30000, intervalMs = 250 } = {}) {
   const start = Date.now();
   for (;;) {
     const current = await evaluate(
-      `(() => { const a = document.querySelector('${WATCHED_AGE_SELECTOR}'); return a ? a.textContent : null; })()`,
+      `(() => { const a = document.querySelector('${selector}'); return a ? a.textContent : null; })()`,
     );
     if (current !== previousText) return { changed: true, elapsedMs: Date.now() - start, text: current };
     const elapsedMs = Date.now() - start;
     if (elapsedMs >= timeoutMs) {
       throw new Error(
         `no redraw observed in ${(elapsedMs / 1000).toFixed(1)}s `
-        + `(the watched card's age label text stayed "${previousText}")`);
+        + `(the watched label text stayed "${previousText}", selector "${selector}")`);
     }
     await sleep(intervalMs);
   }
 }
+
+function waitForAgeChange(previousText, opts) { return waitForTextChange(WATCHED_AGE_SELECTOR, previousText, opts); }
 
 // R1/R2: a synthetic `document.dispatchEvent(new KeyboardEvent(...))` only ever fires JS listeners -
 // it never triggers the browser's OWN default actions (Tab moving focus, Enter activating a focused
@@ -308,6 +310,59 @@ try {
   await sleep(300);
   out.focusAfterLater = await evaluate(`(() => { const a = document.activeElement;
     return { tag: a.tagName, key: a.getAttribute('data-c2-focus'), inStream: document.getElementById('c2-stream').contains(a) }; })()`);
+
+  // B8: board - keyed cards reconciled in place, retaining focus and scroll, with j/k/Escape.
+  // The fixture (test_console2_browser.py) serves two /api/work-board items whose last_work_event_at
+  // recedes every read (the same 60x-accelerated `grown` counter as /api/attention above), so the
+  // watched card's own meta line changes text on every ordinary redraw - the same proof technique
+  // as F1/F2 above, applied to the board instead of the stream.
+  const BOARD_META_SELECTOR = '[data-c2-card="board|board-a"] .c2-board-card-meta';
+  await evaluate("location.hash = '#board'");
+  for (let i = 0; i < 100; i++) {
+    const n = await evaluate("document.querySelectorAll('.c2-board-card').length");
+    if (n >= 2) break;
+    if (i === 99) throw new Error('board cards never rendered');
+    await sleep(150);
+  }
+  out.boardShellSwapped = await evaluate(
+    `(() => { const b = document.getElementById('c2-board'); const s = document.getElementById('c2-stream');
+      return !b.hidden && s.hidden; })()`,
+  );
+
+  // j selects the first rendered card; real focus and the selected class land on it together.
+  await pressKey('j');
+  out.boardFirstSelectedWithFocus = await evaluate(`(() => { const c = document.querySelector('.c2-board-card');
+    return !!c && c.className.indexOf('is-selected') >= 0 && document.activeElement === c
+      && c.getAttribute('aria-pressed') === 'true'; })()`);
+
+  // A second j must move focus WITH the selection onto the next card, never leave it behind.
+  await pressKey('j');
+  out.boardSecondJMovedFocus = await evaluate(`(() => { const cards = [...document.querySelectorAll('.c2-board-card')];
+    const a = document.activeElement;
+    return a.tagName === 'ARTICLE' && a.className.indexOf('is-selected') >= 0 && cards[1] === a; })()`);
+
+  // Scroll the board container, let an ordinary redraw happen (the watched card's own age-derived
+  // meta text changes every read), and check the container, the selected card and its focus all
+  // survive - the atomic setup+baseline read avoids the same race F1/F2 guard against above.
+  const metaAtScroll = await evaluate(`(() => {
+    window.__boardEl = document.getElementById('c2-board');
+    window.__boardCard = document.activeElement;
+    window.__boardEl.scrollTop = 40;
+    return document.querySelector('${BOARD_META_SELECTOR}').textContent;
+  })()`);
+  await waitForTextChange(BOARD_META_SELECTOR, metaAtScroll);
+  out.boardScrollKept = await evaluate('window.__boardEl.scrollTop') === 40;
+  out.boardContainerKept = await evaluate('window.__boardEl === document.getElementById("c2-board") && window.__boardEl.isConnected');
+  out.boardFocusKept = await evaluate('document.activeElement === window.__boardCard && window.__boardCard.isConnected');
+  out.boardDetailShowsSelection = await evaluate(
+    "document.getElementById('c2-board-detail').textContent.indexOf('Select a card') === -1",
+  );
+
+  // Escape clears the board selection (never navigates away or reaches the stream underneath).
+  await pressKey('Escape');
+  out.boardSelectionClearedByEscape = await evaluate(
+    "document.querySelectorAll('.c2-board-card.is-selected').length === 0",
+  );
 
   out.problems = problems;
   process.stdout.write(JSON.stringify(out));

@@ -1,7 +1,122 @@
 # Work-board implementation record
 
-Audience: implementers and cold reviewers. This records shipped slices; the
-console board UI remains a separate slice.
+Audience: implementers and cold reviewers. This records shipped slices. B8
+delivers the first read-only board UI; D1-D3 (a document viewer and beyond)
+remain later, separate slices.
+
+## B8 — console model, keyed cards/detail/router and operator walkthrough
+
+Branch `feat/work-board-b8` from `origin/master`. Recorded master SHAs: console v2
+merge `2fbb3fa`, pure reducer `f855a5e`, B6a feed `cbadd0a`, B7 needs-you `ea1074b`.
+Contract: design `09b5429`, section 6, the B8 row in section 9, and the acceptance/
+performance text following the slice table. No code edited or extracted from any
+unmerged branch.
+
+Scope delivered:
+
+- **`console2-board-model.js`** (new, dual Node/browser, pure - same discipline as
+  `console2-model.js`): `parseRoute`/`routeHash` (the one router: `#board`,
+  `#conversation` default, reserved `#review=<escalation-id>` with no UI yet -
+  every unrecognised fragment safely falls back to `#conversation`, never
+  throws), and `boardCard`/`boardSummary`, which project one `/api/work-board`
+  item (the REAL shipped field names from `work_board.py`/`work_board_feed.py` -
+  `work_item`, `workflow_column`, `obligations[{recipient,state}]`, `verdicts`,
+  `integration`, `evidence`, `checks`, `first_dispatch_at`/`last_work_event_at` -
+  not the design doc's aspirational §5 field list, which this reducer does not
+  produce) into a card: title/reason, distinct seats, the current candidate's
+  reviewer vendor(s) or `unverified`, explicit round or unknown, open/total
+  obligations, approximate dispatch/activity ages, and the evidence list. The
+  needs-you overlay calls B7's OWN `incidentsForItem` on the caller-supplied,
+  already-computed incidents array (`view.needs.incidents`) - never recomputed -
+  overlaying the shown `column` to `needs_you` while keeping `underlyingColumn`
+  intact (design row 1: "overlay on top, placement kept underneath"). Findings
+  and cost are unconditionally `{count:null,status:"unavailable"}`/`null` in v1
+  (section 6: never guessed from Markdown); merge is `integrated`/`not_integrated`
+  only when the reducer's own `integration` fact names the current candidate,
+  else `unknown`.
+- **`console2.js`** extended: the router (`currentRoute()`, hash-only nav via two
+  fixed, server-authored anchors - console2.js itself is banned from ever
+  assigning `href`, like every v2 script, so navigation MUST be server-rendered
+  links plus a `hashchange` listener, never client-built ones); `/api/work-board`
+  fetched through the SAME single `getJson` helper, only while the board is the
+  visible route; keyed board cards built off-document and reconciled into
+  `#c2-board` with the SAME `syncChildren`/`captureFocus`/`restoreFocus` the
+  stream already uses (one mechanism, not a second one) - so focus and scroll
+  survive an ordinary redraw exactly like the stream's cards and chat thread; a
+  read-only detail panel (`#c2-board-detail`) showing the selected card's full
+  field list plus evidence and issues; j/k select by KEY (never DOM position),
+  focus moving with the selection, Escape clears it - board-only keys, inert on
+  the stream and vice versa.
+- **`web.py`/`console2.css`**: `console2-board-model.js` added to the static
+  asset allowlist and the `/v2` shell's fixed script tags; two new shell regions
+  (`#c2-board`, `#c2-board-detail`) occupying the SAME grid cells as the stream/
+  rail, toggled via the `hidden` attribute only (never a style attribute); two
+  fixed, server-authored route anchors (`#board`/`#conversation`) in the footer,
+  each a bare hash so following either NEVER touches the current `?root=` query
+  or pathname - the whole mechanism "preserves ?root=" relies on.
+- No document viewer (D-series, later). No write path, no new default for `/`.
+
+Failing-first evidence: none of this code existed before this slice (a pure
+addition, not a fix), so tests were written pure-first: `boardCard`'s `merge`
+computation was drafted checking only `item.candidate`, caught by its own test
+expecting `unknown` when `integration` names an unrelated head - fixed to require
+`integration` to name the SAME candidate. The real-browser board scroll check
+first failed against a 2-card fixture that never overflowed `#c2-board`'s
+viewport (`scrollTop` clamped back to 0) - fixed by padding the browser-test
+fixture to 14 items; the failure and fix are recorded in this same commit's
+history, not silently smoothed over.
+
+Final verification (foreground, worktree `src` on PYTHONPATH, chunked, no full
+suite run):
+
+- New `tests/console2_board_model.test.mjs`: **16/16 passed** (router, card
+  field derivation - seats/vendor/round/obligations/ages/checks/findings/cost/
+  merge - needs-you overlay and exact-cycle matching, malformed-input safety,
+  card ordering, coverage/legacy/truncation passthrough).
+- Full node regression sweep (unchanged): `console2_model` 17/17, `console2_render`
+  31/31, `console2_stream` 59/59, `console2_data` 48/48, `console2_view` 95/95,
+  `console2_needs_you` 18/18.
+- `tests/test_console2_web.py`: **70 passed, 2 skipped** - extended for the new
+  asset (allowlist, CSP, security lint parametrized over it too), the two new
+  shell regions, the widened `ALLOWED_API_PATHS`/fixed-href-set assertions, and
+  a parametrized "no requests/DOM" purity check over both model files.
+- `tests/test_console2_browser.py`: **3 passed** (real Edge, not skipped on this
+  runner) - extended with a board section in `console2_browser_check.mjs`
+  (hash-navigate to `#board`; j/k selection with real focus; a scroll+redraw
+  proof reusing the same atomic setup+baseline technique as the stream's F1/F2;
+  Escape clears selection) and a 14-item board fixture in the test server. The
+  pre-existing stream/negative-control tests are unchanged and still green.
+
+### Operator walkthrough (design section 9's acceptance text)
+
+No scripted demo: open `/v2` on the operator's own live root, then:
+
+1. Open `#board` (footer link or type the fragment). Confirm the stream/rail
+   disappear and board cards appear, sorted with any `needs_you`-overlaid card
+   first; identify a few known work items by title/slug, and the Legacy /
+   untagged-work line if any untagged threads are open.
+2. Leave the tab open across a real reply (a task-response, review-result, or
+   escalation reply the operator or a seat actually sends) and watch the
+   affected card update on its own within a couple of polls - same item key,
+   same DOM node, no flash/scroll jump elsewhere on the page.
+3. Find an item with more than one obligation (a group dispatch, or a build
+   plus its review) and confirm the open/total count and seats match what is
+   actually outstanding; watch a parallel review or a replacement (`supersedes`)
+   task update the same card rather than creating a second one.
+4. Pick a work item with a linked escalation. Compare it on the board (its
+   `needs_you` overlay, still showing the underlying column underneath) against
+   the SAME escalation on `#conversation` (the needs-you card) - same incident,
+   same identity, same deferral state either way.
+5. Force or wait for a stale/unavailable board or attention read (stop the
+   server briefly, or watch a real network hiccup) and confirm the board shows
+   its coverage/staleness note rather than silently going quiet or blank; do
+   the same for an item whose history is genuinely incomplete and confirm it
+   reads Unknown, never a guessed Ready/Done.
+6. Click or `j`/`k` into a few cards and read their detail panel: seats, vendor
+   or "unverified", round or "unknown", checks, findings ("unavailable"), cost
+   ("unknown"), merge, and the evidence list. Confirm keyboard focus and the
+   board's scroll position survive normal polling the whole time, and that
+   Escape/`#conversation` return cleanly with `?root=` unchanged.
 
 ## B7 — shared needs-you projection and incident identity
 

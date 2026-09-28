@@ -31,6 +31,7 @@
 
   var M = window.AgentTalkConsole2Model;
   if (!M) return;   // the model script failed to load: leave the shell inert
+  var M2 = window.AgentTalkConsole2BoardModel;   // B8: the board's own pure model, same load guard
 
   var THEME_KEY = 'agenttalk.console2.theme';
   var VISIT_KEY = 'agenttalk.console2.lastvisit';
@@ -54,6 +55,7 @@
     conn: { reachable: true, stalledPolls: 0, lastOkMs: null },
     attention: Object.create(null),   // project_id -> { ok, asOfMs, items }
     chat: Object.create(null),        // project_id -> { ok, asOfMs, payload }
+    board: Object.create(null),       // project_id -> { ok, payload }  (B8: /api/work-board)
     cycle: 0,
     statePending: false,      // F1: at most one /api/state request in flight, ever
     stateSeq: 0                // incremented only when a request is actually issued (belt and braces)
@@ -62,6 +64,7 @@
   var chrome = { teamSeg: null, themeButtons: [], chipKeys: [], chips: [], keysBtn: null, overlay: null };
   var lastSig = null;
   var lastRailSig = null;
+  var lastBoardSig = null;
   var running = false;
   var inflight = {};       // feed key -> true while a request for it is outstanding
 
@@ -71,6 +74,12 @@
   var nav = { selectedTeam: null, selectedId: null, overlayOpen: false, overlayInvoker: null };
   var streamCardTeam = null;
   var streamCardIds = [];      // ids of the currently open cards, in display order, for streamCardTeam
+
+  // B8: the board's own selection, by card key (work_item), never by DOM position - same
+  // discipline as nav.selectedId above. Reset whenever the visible team changes.
+  var boardEnabled = !!(M2 && typeof M2.parseRoute === 'function');
+  var boardNav = { selectedTeam: null, selectedKey: null };
+  var boardCardKeys = [];      // keys of the currently rendered cards, in display order
 
   // ---------------------------------------------------------------- helpers
 
@@ -160,6 +169,16 @@
 
   function currentRoots() {
     return data.snapshot && Array.isArray(data.snapshot.roots) ? data.snapshot.roots : null;
+  }
+
+  // B8: ONE router owns #board, #conversation and the reserved #review=<escalation-id> (no UI for
+  // review yet - it renders exactly like #conversation, but the id still parses without crashing,
+  // so a link to it is never a broken/blank page). ?root= is untouched by any hash change: every
+  // nav link this file builds is a bare hash ("#board"), which a browser navigates without
+  // touching the current pathname or query string at all.
+  function currentRoute() {
+    if (!boardEnabled) return { mode: 'conversation', reviewId: null };
+    return M2.parseRoute(window.location.hash || '');
   }
 
   function rootKey(root) {
@@ -330,7 +349,7 @@
   // neither Tab nor a click can reach them at all - the browser itself refuses, the same way it
   // refuses focus on a disabled control. `trapOverlayTab` below is a second, explicit line of
   // defense for the same invariant (and the only one the node test harness can exercise).
-  var BACKGROUND_REGION_IDS = ['c2-header', 'c2-stream', 'c2-rail', 'c2-footer'];
+  var BACKGROUND_REGION_IDS = ['c2-header', 'c2-stream', 'c2-rail', 'c2-board', 'c2-board-detail', 'c2-footer'];
 
   function setBackgroundInert(makeInert) {
     BACKGROUND_REGION_IDS.forEach(function (id) {
@@ -911,6 +930,189 @@
     syncChildren(rail, buildRail(shell));
   }
 
+  // -------------------------------------------------------------- board (B8)
+
+  var COLUMN_LABEL = {
+    needs_you: 'NEEDS YOU', queued: 'QUEUED', building: 'BUILDING', fix_round: 'FIX ROUND',
+    independent_review: 'INDEPENDENT REVIEW', ready: 'READY', done: 'DONE', unknown: 'UNKNOWN'
+  };
+
+  function columnLabel(col) { return COLUMN_LABEL[col] || 'UNKNOWN'; }
+
+  function columnTone(col) {
+    if (col === 'needs_you') return 'bad';
+    if (col === 'ready' || col === 'done') return 'ok';
+    if (col === 'fix_round' || col === 'unknown') return 'warn';
+    return 'dim';
+  }
+
+  function vendorText(vendors) {
+    return vendors.length ? vendors.map(function (v) { return v.recipient + ' (' + v.vendor + ')'; }).join(', ') : 'unverified';
+  }
+
+  function selectBoardCard(key) {
+    boardNav.selectedKey = key;
+    renderAll();
+  }
+
+  // One card: title/reason, seats, vendor-or-unverified, round-or-unknown, open/total obligations,
+  // approximate ages and the reason that explains its placement - exactly the design's field list
+  // (section 6). Keyed by `data-c2-card`/`data-c2-focus` with the SAME "team|id"-shaped convention
+  // syncChildren/captureFocus/restoreFocus already use for the stream (a fixed "board" pseudo-team),
+  // so reconciliation, focus retention and scroll retention are the SAME mechanism, not a second one.
+  function boardCardNode(c, selected) {
+    var card = el('article', 'c2-board-card' + (c.needsYou ? ' is-needs-you' : '') + (selected ? ' is-selected' : ''));
+    card.setAttribute('data-c2-card', 'board|' + c.key);
+    card.setAttribute('data-c2-focus', 'board|' + c.key + '|card');
+    card.setAttribute('tabindex', '0');
+    card.setAttribute('role', 'button');
+    card.setAttribute('aria-pressed', selected ? 'true' : 'false');
+    var head = el('div', 'c2-board-card-head');
+    head.appendChild(el('span', 'c2-board-card-title', c.title));
+    head.appendChild(el('span', 'c2-board-card-column tone-' + columnTone(c.column), columnLabel(c.column)));
+    card.appendChild(head);
+    var meta = [
+      c.seats.length ? c.seats.join(', ') : 'no seats recorded',
+      vendorText(c.vendors),
+      c.round === null ? 'round unknown' : 'round ' + c.round,
+      c.obligationsOpen + '/' + c.obligationsTotal + ' open',
+      c.firstDispatchAgeSeconds === null ? 'first dispatch unknown' : 'dispatched ' + M.fmtAge(c.firstDispatchAgeSeconds) + ' ago',
+      c.lastWorkEventAgeSeconds === null ? 'last activity unknown' : 'active ' + M.fmtAge(c.lastWorkEventAgeSeconds) + ' ago'
+    ];
+    card.appendChild(el('div', 'c2-board-card-meta', meta.join(' · ')));
+    card.appendChild(el('div', 'c2-board-card-reason', c.reason));
+    on(card, 'click', function () { selectBoardCard(c.key); });
+    return card;
+  }
+
+  // The selected team's board feed, projected through the SHARED B7 needs-you incidents (never
+  // recomputed here) into cards. A missing/unread feed, an unknown team or no snapshot yet all say
+  // so in place of cards - never a quiet empty board that looks the same as "nothing to do".
+  function buildBoard(shell) {
+    var out = el('div', 'c2-board-body');
+    if (!boardEnabled) {
+      boardNav.selectedTeam = null;
+      boardCardKeys = [];
+      out.appendChild(el('p', 'c2-sub', 'Board unavailable.'));
+      return out;
+    }
+    if (shell.selection.status === 'unknown' && shell.teams.length) {
+      boardNav.selectedTeam = null;
+      boardCardKeys = [];
+      out.appendChild(unknownTeamBox(shell.teams));
+      return out;
+    }
+    var v = shell.view;
+    if (!v) {
+      boardNav.selectedTeam = null;
+      boardCardKeys = [];
+      out.appendChild(el('p', 'c2-sub', 'Waiting for the first snapshot.'));
+      return out;
+    }
+    var team = v.key;
+    if (boardNav.selectedTeam !== team) { boardNav.selectedTeam = team; boardNav.selectedKey = null; }
+    var entry = data.board[team];
+    if (!entry || !entry.ok) {
+      boardCardKeys = [];
+      out.appendChild(el('p', 'c2-sub', entry ? 'Board could not be read.' : 'Loading the board…'));
+      return out;
+    }
+    var summary = M2.boardSummary(entry.payload, { nowMs: nowMs(), incidents: v.needs.incidents });
+    boardCardKeys = summary.cards.map(function (c) { return c.key; });
+    if (boardNav.selectedKey !== null && boardCardKeys.indexOf(boardNav.selectedKey) === -1) boardNav.selectedKey = null;
+    if (summary.coverageStatus !== 'complete') {
+      out.appendChild(el('p', 'c2-board-note',
+        'Board coverage: ' + summary.coverageStatus + (summary.lastKnown ? ' (last known)' : '')));
+    }
+    if (summary.errors.length) out.appendChild(el('p', 'c2-board-note', summary.errors[0]));
+    if (!summary.cards.length) out.appendChild(el('p', 'c2-sub', 'No active or recently done work items.'));
+    summary.cards.forEach(function (c) { out.appendChild(boardCardNode(c, boardNav.selectedKey === c.key)); });
+    if (summary.legacyOpenCount !== null || summary.legacyLowerBound > 0) {
+      var legacyText = summary.legacyOpenCount !== null
+        ? summary.legacyOpenCount + ' untagged open request(s)'
+        : 'at least ' + summary.legacyLowerBound + ' untagged open request(s) (exact count unknown)';
+      out.appendChild(el('p', 'c2-board-legacy', 'Legacy / untagged work: ' + legacyText));
+    }
+    if (summary.truncated) {
+      out.appendChild(el('p', 'c2-board-note',
+        'Board truncated' + (summary.omittedCount !== null ? ' (' + summary.omittedCount + ' omitted)' : '') + '.'));
+    }
+    return out;
+  }
+
+  function renderBoard(shell) {
+    var main = document.getElementById('c2-board');
+    if (!main) return;
+    var captured = captureFocus(main);
+    syncChildren(main, buildBoard(shell));
+    restoreFocus(main, captured);
+  }
+
+  // The selected card's own read-only detail: initially just evidence (and the rest of the design's
+  // field list) - no document viewer, that is a later D-series slice. Recomputing boardSummary here
+  // is cheap (<=100 small objects) and keeps this function independent of buildBoard's own state.
+  function findSelectedBoardCard(shell) {
+    if (boardNav.selectedKey === null) return null;
+    var v = shell.view;
+    var entry = v && data.board[v.key];
+    if (!v || !entry || !entry.ok) return null;
+    var summary = M2.boardSummary(entry.payload, { nowMs: nowMs(), incidents: v.needs.incidents });
+    return summary.cards.filter(function (c) { return c.key === boardNav.selectedKey; })[0] || null;
+  }
+
+  function detailRow(dl, term, value) {
+    dl.appendChild(el('dt', '', term));
+    dl.appendChild(el('dd', '', value));
+  }
+
+  function buildBoardDetail(shell) {
+    var out = el('div', 'c2-board-detail-body');
+    var card = boardEnabled ? findSelectedBoardCard(shell) : null;
+    if (!card) {
+      out.appendChild(el('p', 'c2-sub', 'Select a card to see its evidence.'));
+      return out;
+    }
+    out.appendChild(el('h2', 'c2-board-detail-title', card.title));
+    out.appendChild(el('p', 'c2-board-detail-reason', card.reason));
+    var fields = el('dl', 'c2-board-detail-fields');
+    detailRow(fields, 'Seats', card.seats.length ? card.seats.join(', ') : 'none recorded');
+    detailRow(fields, 'Model vendor', vendorText(card.vendors));
+    detailRow(fields, 'Round', card.round === null ? 'unknown' : String(card.round));
+    detailRow(fields, 'Obligations', card.obligationsOpen + ' open of ' + card.obligationsTotal + ' total');
+    detailRow(fields, 'First dispatch',
+      card.firstDispatchAgeSeconds === null ? 'unknown' : M.fmtAge(card.firstDispatchAgeSeconds) + ' ago');
+    detailRow(fields, 'Last activity',
+      card.lastWorkEventAgeSeconds === null ? 'unknown' : M.fmtAge(card.lastWorkEventAgeSeconds) + ' ago');
+    detailRow(fields, 'Checks', card.checks === null ? 'unknown' : card.checks);
+    detailRow(fields, 'Findings', card.findings.status === 'unavailable' ? 'unavailable' : String(card.findings.count));
+    detailRow(fields, 'Cost', card.cost === null ? 'unknown' : String(card.cost));
+    detailRow(fields, 'Merge', card.merge);
+    out.appendChild(fields);
+    if (card.issues.length) {
+      out.appendChild(el('div', 'c2-label', 'ISSUES'));
+      var issues = el('ul', 'c2-board-detail-list');
+      card.issues.forEach(function (i) { issues.appendChild(el('li', '', i)); });
+      out.appendChild(issues);
+    }
+    out.appendChild(el('div', 'c2-label', 'EVIDENCE'));
+    if (card.evidence.length) {
+      var list = el('ul', 'c2-board-detail-list');
+      card.evidence.forEach(function (id) { list.appendChild(el('li', '', id)); });
+      out.appendChild(list);
+    } else {
+      out.appendChild(el('p', 'c2-sub', 'No evidence recorded.'));
+    }
+    return out;
+  }
+
+  function renderBoardDetail(shell) {
+    var aside = document.getElementById('c2-board-detail');
+    if (!aside) return;
+    var captured = captureFocus(aside);
+    syncChildren(aside, buildBoardDetail(shell));
+    restoreFocus(aside, captured);
+  }
+
   // ------------------------------------------------------------------ draw
 
   // Raw second-resolution ages are in the view for the tests; what is drawn is their
@@ -955,12 +1157,46 @@
     });
   }
 
+  // B8: which of (stream, rail) vs (board, board-detail) is shown - the `hidden` attribute only
+  // (never a style attribute), so the two pairs occupy the same grid cells (console2.css) and
+  // switching is instant, with no layout it has to compute from scratch.
+  function applyRouteVisibility(mode) {
+    var showBoard = mode === 'board';
+    ['c2-stream', 'c2-rail'].forEach(function (id) {
+      var node = document.getElementById(id);
+      if (node) node.hidden = showBoard;
+    });
+    ['c2-board', 'c2-board-detail'].forEach(function (id) {
+      var node = document.getElementById(id);
+      if (node) node.hidden = !showBoard;
+    });
+  }
+
+  // The two static, server-authored route anchors (#board/#conversation) get a plain aria-current
+  // toggle - never href, which every v2 script is banned from ever assigning (see the model/data
+  // section below and its own tests).
+  function syncRouteLinks(mode) {
+    var nav = document.getElementById('c2-routes');
+    if (!nav) return;
+    kids(nav).forEach(function (a) {
+      if (a.getAttribute('data-c2-route') === mode) a.setAttribute('aria-current', 'page');
+      else a.removeAttribute('aria-current');
+    });
+  }
+
   function renderAll() {
     var shell = buildShell();
     if (pruneRecovered(shell.view)) shell = buildShell();
     syncTeamChips(shell.teams);
     var app = document.getElementById('app');
     if (app) app.className = shell.view && shell.view.stale ? 'is-stale' : '';
+    // The reserved #review=<id> route has no UI yet (B8 scope): it renders exactly like
+    // #conversation, but currentRoute() still parses the id without throwing or falling through
+    // to something else, so a stray link to it is never a broken or blank page.
+    var route = currentRoute();
+    var displayMode = route.mode === 'review' ? 'conversation' : route.mode;
+    applyRouteVisibility(displayMode);
+    syncRouteLinks(displayMode);
     // Redraw a region only when what it shows has changed. The stream is then updated in place
     // (see syncChildren), so a redraw does not disturb focus, scrolling or selection.
     var v = shell.view;
@@ -975,6 +1211,17 @@
     if (railSig !== lastRailSig) {
       lastRailSig = railSig;
       renderRail(shell);
+    }
+    if (boardEnabled) {
+      var boardSig = JSON.stringify([
+        displayMode, shell.selection, v && v.key, v && v.needs.incidents,
+        v && data.board[v.key], boardNav.selectedTeam, boardNav.selectedKey,
+      ]);
+      if (boardSig !== lastBoardSig) {
+        lastBoardSig = boardSig;
+        renderBoard(shell);
+        renderBoardDetail(shell);
+      }
     }
   }
 
@@ -1061,6 +1308,24 @@
     data.chat[id] = { ok: false, asOfMs: prior ? prior.asOfMs : null, payload: prior ? prior.payload : null };
   }
 
+  function boardFailed(id) {
+    var prior = data.board[id];
+    data.board[id] = { ok: false, payload: prior ? prior.payload : null };
+  }
+
+  // B8: only fetched while the board is actually the visible route - the stream/rail feeds already
+  // poll unconditionally, but a board the operator is not looking at need not be kept warm.
+  function fetchBoard(id) {
+    return guarded('board:' + id, function () {
+      return getJson(rootUrl('/api/work-board', id)).then(function (payload) {
+        if (!answersFor(payload, id)) boardFailed(id);
+        else data.board[id] = { ok: true, payload: payload };
+      }, function () {
+        boardFailed(id);
+      }).then(renderAll);
+    });
+  }
+
   function fetchAttention(id) {
     return guarded('att:' + id, function () {
       return getJson(rootUrl('/api/attention', id)).then(function (payload) {
@@ -1096,6 +1361,7 @@
       var id = rootKey(r);
       if (i === sel.index) {
         jobs.push(fetchAttention(id), fetchChat(id));
+        if (boardEnabled && currentRoute().mode === 'board') jobs.push(fetchBoard(id));
       } else if (withOthers && (!r || !Array.isArray(r.errors) || !r.errors.length)) {
         jobs.push(fetchAttention(id));
       }
@@ -1239,6 +1505,29 @@
     return tag === 'button' || tag === 'a' || tag === 'input' || tag === 'select' || tag === 'textarea';
   }
 
+  // B8: j/k on the board move the selection by KEY (work_item), never by DOM position, exactly
+  // like the stream's moveSelection - and focus moves WITH it, onto the card itself, so a later
+  // keypress can never land on a card that is no longer the highlighted one. Selecting a card also
+  // shows its (read-only) detail immediately: there is no separate "open" step to announce.
+  function findBoardCard(main, key) {
+    var full = 'board|' + key;
+    return descendants(main, []).filter(function (n) {
+      return n.tagName === 'ARTICLE' && n.getAttribute('data-c2-card') === full;
+    })[0] || null;
+  }
+
+  function moveBoardSelection(delta) {
+    var keys = boardCardKeys;
+    if (!keys.length) { boardNav.selectedKey = null; return; }
+    var idx = boardNav.selectedKey === null ? -1 : keys.indexOf(boardNav.selectedKey);
+    var next = idx === -1 ? (delta > 0 ? 0 : keys.length - 1) : Math.max(0, Math.min(keys.length - 1, idx + delta));
+    boardNav.selectedKey = keys[next];
+    renderAll();
+    var main = document.getElementById('c2-board');
+    var card = main && findBoardCard(main, boardNav.selectedKey);
+    if (card && typeof card.focus === 'function') card.focus();
+  }
+
   function onKey(ev) {
     if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
     if (isTypingTarget(ev.target)) return;
@@ -1249,6 +1538,14 @@
     }
     if (ev.key === 't') { setTheme(M.nextTheme(theme)); return; }
     if (ev.key === '?') { stop(ev); setOverlayOpen(true); return; }
+    if (ev.key === '1') { stop(ev); pickTeam(0); return; }
+    if (ev.key === '2') { stop(ev); pickTeam(1); return; }
+    if (boardEnabled && currentRoute().mode === 'board') {
+      if (ev.key === 'j') { stop(ev); moveBoardSelection(1); return; }
+      if (ev.key === 'k') { stop(ev); moveBoardSelection(-1); return; }
+      if (ev.key === 'Escape') { if (boardNav.selectedKey !== null) { boardNav.selectedKey = null; renderAll(); } return; }
+      return;   // stream-only keys (Enter/l//) are inert on the read-only board
+    }
     if (ev.key === 'j') { stop(ev); moveSelection(1); return; }
     if (ev.key === 'k') { stop(ev); moveSelection(-1); return; }
     if (ev.key === 'Enter') {
@@ -1257,9 +1554,22 @@
     }
     if (ev.key === 'l') { if (nav.selectedId !== null) { stop(ev); deferSelected(); } return; }
     if (ev.key === '/') { stop(ev); focusComposer(); return; }
-    if (ev.key === '1') { stop(ev); pickTeam(0); return; }
-    if (ev.key === '2') { stop(ev); pickTeam(1); return; }
     if (ev.key === 'Escape') { if (nav.selectedId !== null) { nav.selectedId = null; renderAll(); } return; }
+  }
+
+  // B8: navigating the hash (a click on #board/#conversation, Back/Forward, or a pasted link)
+  // redraws immediately and, entering the board, fetches it right away rather than waiting for
+  // the next 2 s poll tick - the same "act now, do not wait for the loop" pattern retryNow uses.
+  function onHashChange() {
+    renderAll();
+    if (boardEnabled && currentRoute().mode === 'board') {
+      var roots = currentRoots();
+      if (roots) {
+        var sel = M.resolveRoot(roots, rootParam);
+        var r = roots[sel.index];
+        if (r) fetchBoard(rootKey(r));
+      }
+    }
   }
 
   // ------------------------------------------------------------------- init
@@ -1274,8 +1584,11 @@
   if (appRoot) appRoot.appendChild(chrome.overlay);
   var streamRoot = document.getElementById('c2-stream');
   if (streamRoot) streamRoot.setAttribute('tabindex', '-1');
+  var boardRoot = document.getElementById('c2-board');
+  if (boardRoot) boardRoot.setAttribute('tabindex', '-1');
   on(document, 'keydown', onKey);
   on(window, 'pagehide', saveVisit);
+  on(window, 'hashchange', onHashChange);
   loop();
   setTimeout(paint, PAINT_MS);
 }());
