@@ -3,6 +3,91 @@
 Audience: implementers and cold reviewers. This records shipped slices; the
 console board UI remains a separate slice.
 
+## B7 — shared needs-you projection and incident identity
+
+Branch `feat/work-board-b7` from `origin/master` at the recorded console v2
+merge `2fbb3fa3ee6d457ec2ac85d76d63bab64a369571` (PR #214), which also carries
+the pure reducer merge `f855a5e` and B6a `cbadd0a`. Contract: design `09b5429`,
+section 6 ("Needs-you, card and read-only detail") and the B7 row in section 9.
+No code was edited or extracted from any unmerged branch.
+
+Research first established that the server-side incident-identity contract was
+already complete from a prior slice (B2b): `work_tags.item_ref(meta)` validates
+`work_item`/`work_cycle` together or returns `{}` on any malformed input, never
+guessing a placement; `attention.needs_operator_items` publishes that exact
+result inside each escalation's `source_refs`; `web.build_attention` forwards
+and re-validates it for the wire. That contract needed no Python change. The
+gap was that `console2-model.js` (the merged console v2 shared model, already
+used by both `#conversation` and the future `#board`) never read `source_refs`
+at all, and `/api/lead-chat`'s `pending_decisions` field went unused - so
+attention and chat could show the same escalation twice with no shared
+identity to dedupe on.
+
+Five pure functions were added to `console2-model.js` and exported for a future
+board consumer, wired additively into the existing `buildTeamView`:
+
+- `incidentRef(item)` — reads the one `{kind:"message"}` source_ref off an
+  escalation item; `linked` is true only when BOTH `work_item` and `work_cycle`
+  validated (item_ref's own contract: both together or neither), so a
+  hypothetically partial/malformed ref is never read as linked.
+- `projectIncidents(items)` — escalation items only, deduplicated by escalation
+  ID (never by item ID or title); unlinked incidents are kept, not dropped, so
+  they stay visible as team attention per the design's "unlinked stays team
+  attention" rule.
+- `incidentsForItem(incidents, workItem, workCycle)` — exact (item, cycle)
+  match only; a request_id that happens to spell a plausible work-item slug is
+  never matched as that item unless the incident's OWN validated `workItem`
+  says so, and a stuck mapping never leaks across cycles of the same item.
+- `dedupeAttentionAndChat(attentionItems, pendingDecisions)` — matches by
+  escalation ID (`request_id`) only; an unmatched pending decision surfaces as
+  `chatOnly`, never silently dropped.
+- `resolvedIncidentIds(previousIncidents, currentIncidents)` — the caller-side
+  diff a future board uses to notice an incident dropped out between polls.
+
+`buildTeamView` now exposes `view.needs.incidents` (the exact `projectIncidents`
+result — stream/board parity by construction, since both would call the same
+function on the same wire data), `card.escalation` on each needs-you card, and
+`view.needs.chatOnlyDecisions`. Later/Wait continue to affect only local
+`ui.deferred` presentation (`needs.open`/`needs.deferredCount`); a deferred
+incident remains present, unchanged, in `needs.incidents`. `escalationId` is
+exposed in a form directly usable as a future `#review=<escalation-id>` hash
+(B8's router), with no router code added here.
+
+Fixtures (`tests/console2_fixtures.mjs`): `ATT_ITEM` grew an optional
+`source_refs`/`linked` synthesis matching `attention.py`'s real wire shape, and
+a new `PENDING_DECISION` builder matches `build_lead_chat`'s
+`pending_decisions` entry shape (both keyed by `request_id`, i.e. escalation
+ID). Real-envelope-shaped throughout: every fixture mirrors the actual
+`/api/attention` and `/api/lead-chat` JSON, not an invented shape.
+
+Failing-first evidence: `incidentRef`'s `linked` computation first shipped as
+`workItem !== null` alone; a partial-ref test (`work_item` present,
+`work_cycle` absent) caught it expecting `linked: false` and got `true`. Fixed
+by requiring both fields non-null.
+
+Final verification (foreground, worktree `src` on PYTHONPATH, chunked, no full
+suite run):
+
+- New `tests/console2_needs_you.test.mjs`: **12/12 passed**, added to
+  `test_console2_web.py`'s `test_console2_node_tests` parametrize list.
+- Full node regression sweep (unchanged existing suites): `console2_model`
+  17/17, `console2_render` 31/31, `console2_stream` 59/59, `console2_data`
+  48/48, `console2_view` 95/95 — all green, confirming no behavior change to
+  anything already rendered.
+- `tests/test_console2_web.py`: **59 passed, 2 skipped** in 43.39 s (skips are
+  the pre-existing environment-gated browser-launch tests, unrelated to B7).
+- `tests/test_attention.py`: **174 passed** in 2.69 s, including a new pinning
+  test (`test_needs_operator_source_refs_carry_validated_item_ref_never_a_guess`)
+  added to close a gap: no existing Python test asserted that
+  `needs_operator_items`' `source_refs` actually carry a validated
+  `work_item`/`work_cycle`, or that a malformed one is silently omitted rather
+  than guessed. That is the exact contract the new JS code depends on.
+- `tests/test_web.py -k attention`: **12 passed** in 11.05 s (unchanged).
+- `tests/test_lead_chat.py`: **21 passed** in 12.40 s (unchanged;
+  `pending_decisions` wire shape was already pinned there).
+- Ruff/Bandit not re-run in this record (no server-side production code
+  changed). B8 (the board UI itself) comes after this slice is reviewed.
+
 ## B6a — gate isolation and bounded cached feed
 
 Branch `feat/work-board-b6a`; integrated reviewed B4s `4198550a` and B3a/B3b

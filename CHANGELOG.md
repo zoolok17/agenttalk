@@ -56,6 +56,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Serve a bounded, read-only work-board feed from the shared snapshot worker, with
   exact item/cycle/revision checks and visible coverage, overflow and legacy groups.
 
+- Extract the merged console v2 needs-you calculation into one shared projection
+  (`console2-model.js`) so a future work-board view reads the exact same incident
+  identity as the stream: escalation `source_refs` carry the validated item/cycle
+  (never guessed), attention and lead-chat pending decisions dedupe by escalation
+  ID, and Later/Wait defer local presentation only, never the underlying incident.
+
 ### Fixed
 
 - Keep the fresh last-known-good dashboard view during snapshot scan races and

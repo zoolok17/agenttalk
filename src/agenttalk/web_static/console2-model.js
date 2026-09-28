@@ -720,6 +720,103 @@
     return a.id < b.id ? -1 : (a.id > b.id ? 1 : 0);
   }
 
+  // -------------------------------------------------- B7: shared needs-you projection
+  //
+  // The MERGED console v2 needs-you calculation (M2/M4), extracted once so a future board can
+  // call the exact same functions the stream already uses - not a second, drifting copy. Nothing
+  // here reaches the DOM, a clock or storage; every function is pure over its arguments, like the
+  // rest of this file.
+  //
+  // Incident identity: build_attention (attention.py) already publishes the exact validated
+  // item/cycle on an escalation's OWN source_refs, sanitized by work_tags.item_ref - present only
+  // when the escalation's opener carried valid `--work-item`/`--work-cycle` tags, absent (never
+  // guessed) otherwise. This is the ONLY place that ref is read; a card's own `id` (a message
+  // identity, "escalation:<request_id>") is never mistaken for a work-item slug, here or anywhere
+  // that consumes this projection's output.
+
+  function isMessageRef(ref) { return isObj(ref) && ref.kind === 'message'; }
+
+  // One escalation item's incident identity: { escalationId, workItem, workCycle, linked }.
+  // escalationId is the request_id of the escalation itself - the identity BOTH the attention
+  // queue and lead-chat's pending_decisions key on, and the one a future #review=<escalation-id>
+  // link would carry. workItem/workCycle are null (never guessed) unless the server-validated ref
+  // supplies both.
+  function incidentRef(item) {
+    var refs = Array.isArray(item && item.source_refs) ? item.source_refs : [];
+    var ref = null;
+    for (var i = 0; i < refs.length; i++) { if (isMessageRef(refs[i])) { ref = refs[i]; break; } }
+    var escalationId = ref && typeof ref.request_id === 'string' && ref.request_id ? ref.request_id : null;
+    var workItem = ref && typeof ref.work_item === 'string' && ref.work_item ? ref.work_item : null;
+    var workCycle = ref && typeof ref.work_cycle === 'string' && ref.work_cycle ? ref.work_cycle : null;
+    // work_tags.item_ref always produces both fields together or neither (a validated work_cycle
+    // defaults to "1" when the opener is legacy-silent on cycle) - requiring both here too means a
+    // hypothetically malformed/partial ref is never treated as linked on incomplete identity.
+    return { escalationId: escalationId, workItem: workItem, workCycle: workCycle,
+             linked: workItem !== null && workCycle !== null };
+  }
+
+  // Every escalation-sourced attention item, reduced to its incident identity and deduplicated by
+  // escalation id. A malformed or unlinked escalation (no valid work_item) still becomes an
+  // incident here - it stays team attention exactly by carrying `linked: false`, never dropped and
+  // never sprayed across a seat's other work by a guessed placement.
+  function projectIncidents(items) {
+    var seen = Object.create(null);
+    var out = [];
+    (Array.isArray(items) ? items : []).forEach(function (item) {
+      if (!isObj(item) || item.source !== 'escalation') return;
+      var ref = incidentRef(item);
+      if (ref.escalationId === null || hasOwn(seen, ref.escalationId)) return;
+      seen[ref.escalationId] = true;
+      out.push({ escalationId: ref.escalationId, workItem: ref.workItem, workCycle: ref.workCycle,
+                 linked: ref.linked, itemId: str(item.id, 200) });
+    });
+    return out;
+  }
+
+  // Strict membership for a future per-item board card: an incident belongs to (workItem,
+  // workCycle) only on an EXACT match of both fields the server itself validated - never a fuzzy
+  // or seat-wide guess, and never by treating an unrelated string (an escalation id, a title) as
+  // if it were the work-item slug.
+  function incidentsForItem(incidents, workItem, workCycle) {
+    var wi = typeof workItem === 'string' ? workItem : null;
+    var wc = typeof workCycle === 'string' ? workCycle : null;
+    return (Array.isArray(incidents) ? incidents : []).filter(function (inc) {
+      return inc.linked && inc.workItem === wi && inc.workCycle === wc;
+    });
+  }
+
+  // The SAME escalation can surface on both feeds: build_attention's queue, and lead-chat's
+  // `pending_decisions` (drawn from the same operator-facing thread, filtered to the current
+  // lead). Matched ONLY by escalation id (request_id) - titles/subjects can coincide, ids cannot.
+  // A pending decision with no matching attention item (attention stale/unavailable, or a read
+  // that has not caught up yet) is never silently dropped: it comes back as `chatOnly`.
+  function dedupeAttentionAndChat(attentionItems, pendingDecisions) {
+    var attentionIds = Object.create(null);
+    (Array.isArray(attentionItems) ? attentionItems : []).forEach(function (item) {
+      if (!isObj(item) || item.source !== 'escalation') return;
+      var id = incidentRef(item).escalationId;
+      if (id !== null) attentionIds[id] = true;
+    });
+    var chatOnly = [];
+    (Array.isArray(pendingDecisions) ? pendingDecisions : []).forEach(function (d) {
+      var id = isObj(d) && typeof d.request_id === 'string' && d.request_id ? d.request_id : null;
+      if (id !== null && !hasOwn(attentionIds, id)) chatOnly.push(d);
+    });
+    return { chatOnly: chatOnly };
+  }
+
+  // Which escalation ids were incidents a moment ago and are not any more - answered, expired, or
+  // resolved outside this page. A caller (stream or board) holding its own previous projection
+  // uses this to say an incident was resolved, rather than letting it just vanish unremarked.
+  // Pure and stateless itself: the "moment ago" is whatever the caller last held.
+  function resolvedIncidentIds(previousIncidents, currentIncidents) {
+    var now = Object.create(null);
+    (Array.isArray(currentIncidents) ? currentIncidents : []).forEach(function (inc) { now[inc.escalationId] = true; });
+    return (Array.isArray(previousIncidents) ? previousIncidents : [])
+      .map(function (inc) { return inc.escalationId; })
+      .filter(function (id) { return !hasOwn(now, id); });
+  }
+
   // ---------------------------------------------------------------- greeting
 
   function needsWord(n) { return n <= 10 ? NUMBER_WORDS[n] : String(n); }
@@ -810,7 +907,8 @@
       label: label, key: typeof root.project_id === 'string' ? root.project_id : '',
       mode: 'ok', stale: false, banner: null, freshness: null,
       greeting: { text: '', sub: '' }, lead: null,
-      needs: { open: [], answered: [], deferredCount: 0, snoozed: [], stale: false, loaded: false, available: true },
+      needs: { open: [], answered: [], deferredCount: 0, snoozed: [], stale: false, loaded: false, available: true,
+                incidents: [], chatOnlyDecisions: [] },
       aside: { title: 'ALSO HAPPENING · NOT FOR YOU', rows: [], more: 0 }, since: null,
       roster: { total: 0, summary: '', rows: [] }, usage: [], chat: null, composer: null,
       chip: { label: label, freshness: 'loading', needsCount: null }
@@ -872,10 +970,14 @@
       view.needs.loaded = true;
       view.needs.available = att.ok !== false;
       view.needs.stale = att.ok === false || (nowMs - attentionAsOf) / 1000 > ATTENTION_FRESH_S;
+      // B7: the full incident set, independent of local Later/Wait/answered state - a deferral is
+      // local presentation only (section 6) and never makes an incident stop existing.
+      view.needs.incidents = projectIncidents(att.items);
       (Array.isArray(att.items) ? att.items : []).forEach(function (item) {
         if (!isObj(item) || item.source === 'stuck') return;   // stuck cards are derived from health + evidence
         var c = attentionCard(item, { nowMs: nowMs, attentionAsOfMs: attentionAsOf, project: project, teamIds: teamIds,
           known: known, canAct: input.canAct === true });
+        if (item.source === 'escalation') c.escalation = incidentRef(item);
         if (item.severity === 'low' && item.source !== 'other') {
           lowRows.push({ title: c.title, detail: c.evidence || c.kind });
         } else {
@@ -939,6 +1041,13 @@
       if (leadDown) {
         chatNotes.push({ kind: 'unavailable', text: 'The lead is unavailable' + (pl.detail ? ': ' + str(pl.detail, 160) : '') });
       }
+      // B7: lead-chat's own pending_decisions can name the SAME escalations the attention queue
+      // already has as cards - by escalation id, never by matching text. Only the ones attention
+      // does not currently have (a stale/unavailable read, or one that has not caught up) surface
+      // here; the rest stay exactly where they already are, once, not doubled.
+      view.needs.chatOnlyDecisions = dedupeAttentionAndChat(
+        att ? att.items : null, pl.pending_decisions,
+      ).chatOnly;
       // The thread: both sides of the lead chat, oldest first (the feed keeps the newest 100).
       var operatorName = typeof pl.operator === 'string' ? pl.operator : '';
       var thread = [];
@@ -1106,6 +1215,13 @@
     freshness: freshness,
     sinceRows: sinceRows,
     buildTeamView: buildTeamView,
-    buildShellView: buildShellView
+    buildShellView: buildShellView,
+    // B7: the shared needs-you projection - exported so a future board (B8) calls the exact same
+    // functions the stream already uses, never a second copy.
+    incidentRef: incidentRef,
+    projectIncidents: projectIncidents,
+    incidentsForItem: incidentsForItem,
+    dedupeAttentionAndChat: dedupeAttentionAndChat,
+    resolvedIncidentIds: resolvedIncidentIds
   };
 }));

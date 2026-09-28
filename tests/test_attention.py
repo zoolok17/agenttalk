@@ -3208,6 +3208,23 @@ def test_needs_operator_item_carries_typed_fields_and_surfaces_malformed() -> No
     assert bad[0]["item_id"] == "needs_operator:esc-2"          # still surfaces
 
 
+def test_needs_operator_source_refs_carry_validated_item_ref_never_a_guess() -> None:
+    # B7: incident identity is read from the escalation's OWN opener meta only - work_item/work_cycle
+    # ride along in source_refs exactly as work_tags.item_ref validates them, never invented.
+    linked = att.needs_operator_items([{"request_id": "esc-1", "subject": "s", "sender": "b",
+        "age_seconds": 1, "meta": {"work_item": "gate-b", "work_cycle": "2"}}])
+    assert linked[0]["source_refs"] == [{"kind": "message", "request_id": "esc-1",
+                                          "work_item": "gate-b", "work_cycle": "2"}]
+
+    unset = att.needs_operator_items([{"request_id": "esc-2", "subject": "s", "sender": "b",
+        "age_seconds": 1, "meta": {}}])
+    assert unset[0]["source_refs"] == [{"kind": "message", "request_id": "esc-2"}]
+
+    malformed = att.needs_operator_items([{"request_id": "esc-3", "subject": "s", "sender": "b",
+        "age_seconds": 1, "meta": {"work_item": "NOT-A-SLUG"}}])
+    assert malformed[0]["source_refs"] == [{"kind": "message", "request_id": "esc-3"}]  # never guessed
+
+
 def test_build_queue_dedupes_display_keeps_all_ids() -> None:
     # two config_blocked notices for the same agent+summary collapse to one representative
     holds = att.config_blocked_items([{"agent": "beta", "summary": "python not found"}])
