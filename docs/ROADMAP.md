@@ -58,7 +58,7 @@ A thin substrate plus pluggable products with hard boundaries.
 |---|---|---|
 | **A. Core Coordination Bus** | Roster, typed messages, threads, requests, work orders, review handoff, broadcast, transcripts. | Product-grade. `task`/`task-response` work orders (0.88). Validated work-item tags and reply verdicts (0.93). **Known scale limit:** one store-wide publication guard (§6.2). |
 | **B. Native Work & Evidence Spine** | Work items, workspaces, evidence, review bindings, gate/check state, delivery lifecycle. | **In build as a derived work board (#207).** Cards are projected from bus events tagged with `work_item`/`stage`; there is no hand-kept state. Tags and verdicts shipped in 0.93; vendor records and a shared snapshot are on master; the reducer and feed are in review. |
-| **C. Method Engine Adapter** | External planners create or link work; agenttalk owns execution evidence. | **Retired in its spec-kitty form** (operator decision, 2026-09-28; §6.4). The migration method is first-class instead. |
+| **C. Method Engine Adapter** | External planners create or link work; agenttalk owns execution evidence. | **Retired in its spec-kitty form** (operator decision, 2026-09-28; §6.4). The migration method becoming first-class is still open (#153). |
 | **D. Craft Skill Pack** | Coding, review, test, QA, security, release and lead skills. | Useful and growing. Challenge skill (0.93); lead skills aligned with the work-item protocol (0.93); the assurance-scan and review lenses. |
 | **E. Assurance & Release Governance** | Gates, closes, specialist sign-off, acceptance, scan evidence. | **Strong.** Cooperative acceptance passes on `close` (0.92). A pinned, offline-checked tool registry with `close acceptance preflight` (0.93). |
 | **F. Knowledge & Codebase Memory** | Domains, pointer notes, lessons, onboarding runs, the comprehension plane. | Primitives exist. Comprehension producer slice 1, a static inventory plane (0.87). The per-project knowledge and per-seat memory design is drafted (§6.4). |
@@ -185,7 +185,7 @@ About 130 unanswered openers keep compaction from reclaiming the store, so the s
 
 1. **Context policy:** per turn, the wrapper chooses RESUME, SUMMARY (a fresh session seeded with a short handoff note and a context pack, #158) or FRESH.
 2. **Per-project knowledge and per-seat memory,** curated at slice close. They make "fresh with knowledge" the default for dispatches.
-3. **Done: spec-kitty remnants retired** (operator decision, 2026-09-28) and the migration method is first-class: the stage model, programme documents and per-stage evidence profiles (#153).
+3. **Spec-kitty remnants: retired** (operator decision, 2026-09-28). **Still open:** make the migration method first-class: the stage model, programme documents and per-stage evidence profiles (#153).
 
 ### 6.5 Store and host survival
 
@@ -379,7 +379,7 @@ Do not ship broad workflow claims if any of these are true:
    - then the crash harness and guard-aware relaunch (G4, G3);
    - then host-restart survival (#155).
 3. **Fix the store at the mechanism:** measure and shrink the publication critical section (§6.2 step 2), and reconcile stale obligations (§6.3).
-4. **Then the remaining refocus items:** context policy with knowledge and memory (§6.4). Spec-kitty removal and the first-class migration method are done.
+4. **Then the remaining refocus items:** context policy with knowledge and memory, and a first-class migration method (§6.4). Spec-kitty removal is done.
 5. **Later:** the remaining §7 candidates by rank, each with its own challenge verdict.
 
 Bottom line: agenttalk can become the platform for teams of agents from different vendors to build software "by the book". But the product has to be honest about authority. It can enforce process, preserve evidence, challenge work before it starts, and fail closed when evidence is missing. It cannot remove the human oracle or prove correctness by itself.
