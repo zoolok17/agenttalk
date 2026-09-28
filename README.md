@@ -89,8 +89,8 @@ port.
 - **Not a task queue.** There's no central scheduler deciding what
   runs next; agents decide what to do and message each other about it.
   If you want an explicit "what's next" driver, pair agenttalk with a
-  workflow tool such as spec-kitty — agenttalk carries the wake
-  signal, the workflow tool remains the source of truth for state.
+  planning/work-breakdown tool of your choice — agenttalk carries the
+  wake signal, the planning tool remains the source of truth for state.
 - **Not a replacement for git.** Nothing here manages branches, merges,
   or history. `lane` and `domain` gate *who may deliver what*, using
   git diffs as evidence; they don't perform the merge.
@@ -369,13 +369,7 @@ full.
 For a new project, there's no legacy-belief risk to guard against, so
 the emphasis shifts to keeping a growing team's roles straight from
 the start, and getting review into the loop before the first feature
-lands rather than after. If you're driving work from a spec/plan tool
-such as spec-kitty, agenttalk's `sk-loop` skills (`/agenttalk.sk-loop`
-for Claude, `$agenttalk-sk-loop` for Codex) call `spec-kitty next
---agent <self>` to decide what's next, do the work, and send a small
-wake message so the peer reacts instantly — spec-kitty stays the
-source of truth for state, agenttalk is just the wake signal. Without
-a spec tool, wire up roles directly:
+lands rather than after. Wire up roles directly:
 
 ```powershell
 agenttalk init --here --agents claude-dev,codex-dev,claude-rev,codex-rev,claude-lead

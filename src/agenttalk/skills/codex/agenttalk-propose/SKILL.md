@@ -58,8 +58,9 @@ Do NOT run `pip install -e <agenttalk-source>` as an in-turn bus fix. If the run
 ## Split-work guard
 
 A proposal must not become a backdoor for splitting implementation
-work. Outside a spec-kitty mission, if the proposal assigns ownership
-of files/tasks between agents, ask the user first. If the user already
+work. Unless the project's chosen planning authority already owns the
+assignment, if the proposal assigns ownership of files/tasks between
+agents, ask the user first. If the user already
 approved the split, state the ownership boundary in the proposal or a
 separate `kind=note`, and every implemented piece still needs a
 `kind=review-request` cross-review before the work is called done.

@@ -102,6 +102,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Isolate `wb.` gates from root checks and both gate-HOLD attention paths; refuse
   new board names in root requirements and warn about legacy contaminated lists.
 
+### Removed
+
+- **spec-kitty support (operator decision, 2026-09-28).** The retired
+  `agenttalk.sk-loop`/`agenttalk-sk-loop` skill is no longer bundled; the lead,
+  listen, handoff, propose and send skills now state their split-work,
+  ownership-boundary, review and no-second-state-machine invariants in
+  positive, tool-neutral wording instead of naming spec-kitty. `/api/state`
+  no longer emits a `spec_kitty` field, and the classic console drops the
+  mission pill and the mission count in the health subtitle — the generic
+  `mission`/`wp_id` thread-metadata display is unaffected; that stays as
+  plain bus metadata. `kitty-specs/` and `.kittify/` are removed from the
+  tree (git history keeps them), and the spec-kitty-specific lines are
+  removed from `.gitignore`/`.gitattributes`/`.claudeignore`.
+
+  **Existing-install migration.** `install-skills` now detects a leftover
+  installed `agenttalk.sk-loop.md` / `agenttalk-sk-loop/SKILL.md` at your
+  install destinations: byte-identical to the last-shipped version is
+  removed automatically, anything else (a possibly-modified copy) is left
+  in place with a warning naming the exact path. To migrate by hand:
+  ```
+  rm "<claude-commands-dir>/agenttalk.sk-loop.md"
+  rm -r "<codex-skills-dir>/agenttalk-sk-loop"
+  agenttalk install-skills --force
+  ```
+
 ## [0.93.0] - 2026-09-27
 
 Theme: **challenge major work before it starts, and run acceptance on a pinned,

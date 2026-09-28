@@ -1705,13 +1705,18 @@ def test_api_state_uninitialized_root_is_error_data(tmp_path: Path) -> None:
         srv.server_close()
 
 
-def test_api_state_spec_kitty_detection(tmp_path: Path) -> None:
+def test_api_state_has_no_spec_kitty_field_even_with_kitty_specs_dir(
+    tmp_path: Path,
+) -> None:
+    """spec-kitty support is retired: /api/state must never emit a
+    `spec_kitty` field, even when a leftover `kitty-specs/` directory is
+    still present on disk (e.g. from an install predating the removal)."""
     s = _make_store(tmp_path)
     (tmp_path / "kitty-specs" / "some-mission-01ABC").mkdir(parents=True)
     srv, _t, base = _serve(s)
     try:
         (root,) = _state(base)["roots"]
-        assert root["spec_kitty"]["missions"] == ["some-mission-01ABC"]
+        assert "spec_kitty" not in root
     finally:
         srv.shutdown()
         srv.server_close()
@@ -2770,29 +2775,6 @@ def test_console_renderer_safety(tmp_path: Path) -> None:
     assert "eval(" not in js
     assert "csrf_token" not in js.split("localStorage", 1)[0]
     assert "sessionStorage" not in js
-
-
-def test_console_mission_pill_bounds_long_text(tmp_path: Path) -> None:
-    """#207: long mission labels stay inside the header and retain a full-text
-    tooltip when the visible label is truncated."""
-    s = _make_store(tmp_path)
-    srv, _t, base = _serve(s)
-    try:
-        with _get(f"{base}/static/console.css") as resp:
-            css = resp.read().decode("utf-8")
-        with _get(f"{base}/static/console.js") as resp:
-            js = resp.read().decode("utf-8")
-    finally:
-        srv.shutdown()
-        srv.server_close()
-
-    pill = re.search(r"\.tc-mission-pill\s*\{([^}]*)\}", css, re.S)
-    label = re.search(r"\.tc-mission-name\s*\{([^}]*)\}", css, re.S)
-    assert pill is not None and "min-width: 0" in pill.group(1)
-    assert pill is not None and "max-width:" in pill.group(1)
-    assert label is not None and "overflow: hidden" in label.group(1)
-    assert label is not None and "text-overflow: ellipsis" in label.group(1)
-    assert "titled(pill, missionText)" in js
 
 
 def test_console_ages_and_staleness_use_server_time_anchor(tmp_path: Path) -> None:
@@ -4291,7 +4273,6 @@ const root = {
   path: 'D:\\work\\demo-root',
   project_id: 'project-demo-id',
   operator: { principal: 'operator', label: 'Operator', role_label: 'operator' },
-  spec_kitty: { missions: ['smoke-mission'] },
   counts: { closed_threads: 1 },
   agents: [
     {

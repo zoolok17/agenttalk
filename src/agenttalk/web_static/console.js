@@ -1158,9 +1158,8 @@
   // ages the data past the freshness window, even though no data poll rendered (v0.76.0).
   var lastHealthSig = null;
   function healthSig(v) { return (v.tone || '') + '|' + (v.pill || '') + '|' + (v.text || ''); }
-  function subtitleTextFor(verdict, root) {
-    var missionN = (root.spec_kitty && isArray(root.spec_kitty.missions)) ? root.spec_kitty.missions.length : 0;
-    return verdict.text + (missionN ? ' · ' + missionN + ' mission' + (missionN === 1 ? '' : 's') + ' active' : '');
+  function subtitleTextFor(verdict) {
+    return verdict.text;
   }
   function refreshHealthIfChanged() {
     var root = currentRoot();
@@ -1169,7 +1168,7 @@
     renderChrome();   // re-renders topbar pill + sidebar badge (no scrollable content); resets lastHealthSig
     if (state.view === 'overview' && root) {
       var sub = document.querySelector('#main .tc-subtitle');
-      if (sub) { sub.className = 'tc-subtitle is-' + v.tone; sub.textContent = subtitleTextFor(v, root); }
+      if (sub) { sub.className = 'tc-subtitle is-' + v.tone; sub.textContent = subtitleTextFor(v); }
     }
   }
 
@@ -1436,16 +1435,6 @@
     project.appendChild(projectPath);
     bar.appendChild(project);
 
-    // Mission pill (from root.spec_kitty.missions — name only, no x/y).
-    if (root && root.spec_kitty && isArray(root.spec_kitty.missions) && root.spec_kitty.missions.length) {
-      var pill = el('div', 'tc-mission-pill');
-      var missionText = root.spec_kitty.missions.join(' · ');
-      pill.appendChild(missionIcon());
-      pill.appendChild(el('span', 'tc-mission-name', missionText));
-      titled(pill, missionText);
-      bar.appendChild(pill);
-    }
-
     bar.appendChild(el('div', 'tc-spacer'));
 
     // Poll freshness + server clock (recomputed each tick). "Current" describes
@@ -1675,7 +1664,7 @@
     // OK?" answer (v0.76.0), replacing the four jargon count-clauses (the raw
     // numbers still live in the stat tiles + sidebar legend below).
     var verdict = teamHealthVerdict(root);
-    titleBox.appendChild(el('p', 'tc-subtitle is-' + verdict.tone, subtitleTextFor(verdict, root)));
+    titleBox.appendChild(el('p', 'tc-subtitle is-' + verdict.tone, subtitleTextFor(verdict)));
     header.appendChild(titleBox);
     header.appendChild(el('div', 'tc-spacer'));
     header.appendChild(filterChips(root, counts));
@@ -4150,11 +4139,6 @@
   function navIconChat() { return iconPath('M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z'); }
   function navIconAlert() { return iconPath(['M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z', 'M12 9v4', 'M12 17h.01']); }
   function navIconFile() { return iconPath(['M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z', 'M14 2v6h6', 'M9 13h6', 'M9 17h6']); }
-  function missionIcon() {
-    var svg = iconPath(['M9 11l3 3L22 4', 'M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11'], 2);
-    svg.setAttribute('width', '13'); svg.setAttribute('height', '13');
-    return svg;
-  }
   function wrappedIcon() {
     var svg = iconPath('M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2', 2);
     svg.setAttribute('width', '13'); svg.setAttribute('height', '13');

@@ -1,6 +1,6 @@
 ---
 name: agenttalk-handoff
-description: Send a structured handoff, typically a review request, to a named agent and block until the reply arrives. Works for spec-kitty WP reviews and ad-hoc cross-reviews; the receiver mode-detects from meta.
+description: Send a structured handoff, typically a review request, to a named agent and block until the reply arrives. Works for mission/work-item-tagged reviews and ad-hoc cross-reviews; the receiver mode-detects from meta.
 reviewed-against: "0.55"
 ---
 
@@ -12,8 +12,9 @@ It is for review requests, focused questions, and bounded second
 opinions that need a reply before you continue.
 
 Works in two modes, distinguished only by `meta`:
-- **Spec-kitty mode** - include `mission` / `wp_id`. Receiver routes
-  to the spec-kitty review workflow.
+- **Mission-tagged mode** - include `mission` / `wp_id`. Receiver
+  reviews the referenced unit of work per the project's own planning
+  authority and applies whatever ownership checks it defines.
 - **Ad-hoc cross-review mode** - omit mission/wp_id. Receiver reviews
   the scope declared in your body, optionally verified against
   `base_sha..head_sha`.
@@ -56,8 +57,9 @@ Treat `agenttalk` as the installed/runtime package for this environment. Do NOT 
 Do NOT run `pip install -e <agenttalk-source>` as an in-turn bus fix. If the runtime import resolves outside the workspace, ask the operator to install agenttalk non-editable into the runtime Python used by `AGENTTALK_PY`, or run the agent from the agenttalk workspace when intentionally developing agenttalk. If `AGENTTALK_PY` exists but cannot execute inside Codex workspace-write, ask the operator to opt in to the Python install directory with Codex `--add-dir` or equivalent config.
 ## Splitting implementation work with the peer
 
-**Outside spec-kitty, do NOT split implementation work with the peer
-without first asking the user.** The user invoked you to do a task;
+**Unless the project's chosen planning authority already owns the
+split, do NOT split implementation work with the peer without first
+asking the user.** The user invoked you to do a task;
 the peer, target reviewer, or group is for review or specific
 delegated subtasks, not for unilaterally carving up the work. Do not
 use `kind=proposal`, `$agenttalk-propose`, or broadcast to route
@@ -73,12 +75,14 @@ If the user explicitly approves a split:
 3. **Reviews are read-only.** The implementer of each piece fixes
    their own blockers unless the user explicitly changes ownership.
 
-In a spec-kitty mission, ignore this section - spec-kitty's state
-machine already assigns implement/review responsibilities per WP.
+When the project's chosen planning authority already assigns
+implement/review responsibilities per unit of work, ignore this
+section.
 
 ## When to use
 
-- You finished implementing a WP (spec-kitty) and want review.
+- You finished implementing a unit of work tracked by the project's
+  own planning authority and want review.
 - You finished a chunk of organic split work and want a named peer or
   fresh-review agent to cross-review it.
 - A focused question whose answer determines next steps.
@@ -123,7 +127,8 @@ from proposal ids (`pp-...`).
 Always:
 - `request_id=$REQ_ID`
 
-Spec-kitty mode (only if reviewing a spec-kitty WP):
+Mission-tagged mode (only if reviewing a unit of work tracked by
+mission/wp_id):
 - `mission=<slug>`
 - `wp_id=WP##`
 
@@ -136,8 +141,9 @@ Ad-hoc cross-review mode (if available):
 
 ### 4. Build the body
 
-For spec-kitty mode: WP id, feature dir, files changed, spec-kitty
-command the reviewer should run, non-obvious decisions.
+For mission-tagged mode: work-item id, feature dir, files changed,
+the command the reviewer should run to inspect current state,
+non-obvious decisions.
 
 For ad-hoc cross-review, use this template:
 

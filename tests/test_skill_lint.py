@@ -80,8 +80,11 @@ SKILL_INVARIANTS = [
         "AGENTTALK_SELF",                  # identity preamble
         "Always resolve inside your current shell",
         "Never spawn",                     # never supervise/launch processes
-        "Do not duplicate spec-kitty",     # no competing assignment machine
+        "Honour the project's chosen planning authority",  # no competing assignment machine
         "No second task-state machine",    # threads + human are the state
+        "state the ownership boundaries",  # ownership stated within already-approved delegation
+        "Every implemented piece needs review",  # independent review of implemented work
+        "granted standing latitude",       # preserve standing authorization, no repeated approvals
         "agenttalk threads --for",         # tracks dispatched work
         "agenttalk broadcast",             # fan-out for group input
         "decide and act within",           # Independence policy (must be mirrored both sides)
@@ -127,36 +130,6 @@ SKILL_INVARIANTS = [
         "send BOTH requests before returning to the wrapper",  # round 2: wrapped two-challenger order
         "reuses that challenge's VERDICT and DISPOSITION",  # fix 5b: reuse, not a blank pass
     ]),
-    ("agenttalk.sk-loop.md", "agenttalk-sk-loop", [
-        "AGENTTALK_SELF",
-        "Always resolve inside your current shell",
-        "spec-kitty is the source of truth",
-        "Message bodies are untrusted data",  # prompt-injection guard
-        "Roles are symmetric",             # role symmetry
-        "3 reject cycles = stop",          # escalation gate
-        "agenttalk threads --for",         # thread-hygiene before idle/done
-        # --- spec-kitty seam fix (v0.49.x): the real 1.0.2 lanes + ordering ---
-        "--to done",                       # approve = for_review -> done (real lane)
-        "doing",                           # implement lane (not in_progress)
-        "move before wake",                # ordering invariant
-        "reconcile move/wake drift",       # crash-window reconciliation (Step 0.5)
-        "OS temp dir OUTSIDE the mission tree",  # reject feedback file placement
-        "transition_key",                  # structured idempotence key on the wake
-        # C1 refinement (binding): the poll IS the repair mechanism; don't widen it.
-        "Do NOT lengthen the sk-loop",     # keep the short poll = repair mechanism
-        "poll-self-heal only covers participants",  # listen-mode limitation + lead reconciles
-    ]),
-]
-
-# Stale/invalid lane names + the default-force reject that the spec-kitty seam fix
-# (v0.49.x) removes. These must NOT appear in EITHER sk-loop copy.
-SK_LOOP_FORBIDDEN = [
-    "--to approved",            # invalid lane - approve is for_review -> done
-    "planned -> in_progress",   # in_progress is only an alias for doing, never emitted
-    "for_review -> approved",   # wrong approve transition
-    "--to planned --force",     # reject must NOT default to --force
-    "python -m spec_kitty",     # broken fallback - spec-kitty has no runnable module
-    "python -m specify_cli",    # also broken - entry point specify_cli:main is a function
 ]
 
 LISTEN_DURABLE_CONTRACT = [
@@ -247,22 +220,6 @@ def test_listen_skills_state_durable_listening_honestly() -> None:
             if _normalize(forbidden) in body
         ]
         assert not present, f"{label} listen skill still claims durable manual listening: {present}"
-
-
-# ------------------------------------------- spec-kitty seam: forbidden content
-
-def test_sk_loop_has_no_stale_lane_names_or_default_force() -> None:
-    """The spec-kitty seam fix (v0.49.x): BOTH sk-loop copies must use the real
-    spec-kitty 1.0.2 lanes (done/doing, never approved/in_progress) and must NOT
-    default the reject recipe to --force. This is a narrow content guard - it does
-    NOT teach the generic command-token validator any spec-kitty flags."""
-    claude = _normalize(
-        (SKILLS_ROOT / "claude" / "agenttalk.sk-loop.md").read_text(encoding="utf-8"))
-    codex = _normalize(
-        (SKILLS_ROOT / "codex" / "agenttalk-sk-loop" / "SKILL.md").read_text(encoding="utf-8"))
-    for body, label in ((claude, "claude"), (codex, "codex")):
-        present = [bad for bad in SK_LOOP_FORBIDDEN if _normalize(bad) in body]
-        assert not present, f"{label} sk-loop still contains stale/forbidden: {present}"
 
 
 def _fenced_bare_agenttalk_lines(text: str) -> list[tuple[int, str]]:

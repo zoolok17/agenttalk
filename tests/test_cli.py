@@ -302,7 +302,7 @@ def test_invalid_meta_exits_2_not_1(
 ) -> None:
     """Regression: --meta without `=` used to raise SystemExit(str),
     which exits 1 — that collides with `agenttalk wait`'s timeout
-    signal and would confuse the sk-loop. Must exit 2 instead.
+    signal and would confuse a wait-consuming loop. Must exit 2 instead.
     """
     _run_expect_exit(
         ["send", "--from", "alpha", "--to", "beta", "-m", "x", "--meta", "bad_no_equals"],

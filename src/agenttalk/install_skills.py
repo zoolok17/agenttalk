@@ -8,9 +8,9 @@ Two skill families ship in the package:
   ``~/.codex/skills/<name>/SKILL.md``. The two sides differ in format, so they
   have separate sources under ``src/agenttalk/skills/{claude,codex}/``.
 * **Devkit skills** (the dev-discipline pack: craft-code, test-coverage,
-  review-code, write-docs, review-docs — a non-spec-kitty fallback). These are
-  byte-identical Agent-Skills ``SKILL.md`` folders for BOTH agents, so a single
-  source under ``src/agenttalk/skills/devkit/<name>/`` installs to BOTH
+  review-code, write-docs, review-docs). These are byte-identical
+  Agent-Skills ``SKILL.md`` folders for BOTH agents, so a single source under
+  ``src/agenttalk/skills/devkit/<name>/`` installs to BOTH
   ``~/.claude/skills/<name>/`` and ``~/.codex/skills/<name>/``.
 
 This module copies them out on demand.
@@ -19,6 +19,7 @@ This module copies them out on demand.
 from __future__ import annotations
 
 import filecmp
+import hashlib
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -61,12 +62,85 @@ class FileAction:
 @dataclass
 class InstallResult:
     actions: list[FileAction] = field(default_factory=list)
+    retired: list["RetiredSkillAction"] = field(default_factory=list)
 
     def counts(self) -> dict[str, int]:
         out: dict[str, int] = {}
         for a in self.actions:
             out[a.status] = out.get(a.status, 0) + 1
         return out
+
+
+@dataclass
+class RetiredSkillAction:
+    path: Path
+    # "removed"       — byte-identical to the last-shipped version, deleted
+    # "would-remove"  — dry-run: would have deleted (byte-identical)
+    # "warn-modified" — present, does NOT match the last-shipped bytes; left
+    #                   alone (never destroy a file that might be modified)
+    status: str
+
+
+# Skills retired from the bundled tree. Deleting the SOURCE does not remove
+# an already-installed copy (fresh-install pairs only enumerate surviving
+# sources), so on every install-skills run we separately check each retired
+# skill's install DESTINATION: byte-identical to the last-shipped content
+# means it was never modified, so it is safe to delete; anything else is
+# left alone with a warning naming the exact path. This is deliberately a
+# single hardcoded table, not a general uninstall framework.
+_RETIRED_SKILLS: tuple[dict, ...] = (
+    {
+        "name": "agenttalk.sk-loop.md",
+        "claude_rel": "agenttalk.sk-loop.md",
+        "codex_rel": "agenttalk-sk-loop/SKILL.md",
+        "claude_sha256": "4e65e65fd189cb662dce755c5342165b9a4347e166f11e968e61e107f3b6ffef",
+        "codex_sha256": "8b7b6f990d1cb1247b0d5f79c82aa5ba05dbfed55f4a69408455770050d219f8",
+    },
+)
+
+
+def _sha256(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def check_retired_skills(
+    *,
+    claude: bool,
+    codex: bool,
+    claude_dir: Path,
+    codex_dir: Path,
+    dry_run: bool,
+) -> list[RetiredSkillAction]:
+    """Detect retired-skill leftovers at install destinations.
+
+    Only acts on a destination that still exists. A byte-identical match
+    against the last-shipped content is deleted (or reported as
+    ``would-remove`` under ``--dry-run``); anything else — including a
+    file this table doesn't know how to verify — is reported as
+    ``warn-modified`` and never touched.
+    """
+    out: list[RetiredSkillAction] = []
+    for retired in _RETIRED_SKILLS:
+        candidates: list[tuple[Path, str]] = []
+        if claude:
+            candidates.append((claude_dir / retired["claude_rel"], retired["claude_sha256"]))
+        if codex:
+            candidates.append((codex_dir / retired["codex_rel"], retired["codex_sha256"]))
+        for dst, expected_sha256 in candidates:
+            if not dst.exists():
+                continue
+            if _sha256(dst) == expected_sha256:
+                if dry_run:
+                    out.append(RetiredSkillAction(path=dst, status="would-remove"))
+                else:
+                    dst.unlink()
+                    out.append(RetiredSkillAction(path=dst, status="removed"))
+            else:
+                out.append(RetiredSkillAction(path=dst, status="warn-modified"))
+    return out
 
 
 def _claude_pairs(claude_dir: Path) -> list[tuple[Path, Path]]:
@@ -162,6 +236,15 @@ def install(
     for src, dst in pairs:
         action = _plan_one(src, dst, force=force, dry_run=dry_run)
         result.actions.append(action)
+
+    if claude or codex:
+        result.retired = check_retired_skills(
+            claude=claude,
+            codex=codex,
+            claude_dir=claude_dir,
+            codex_dir=codex_dir,
+            dry_run=dry_run,
+        )
 
     return result
 

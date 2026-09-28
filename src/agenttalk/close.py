@@ -20,8 +20,9 @@ Design (codex P2 design, lead-gated; dev-2 review folded in):
     sole-lead / operator-facing / configured close-lead). The published verdict is
     a strong signal + audit trail, never an enforced lock.
   * Reuses gates.check_gates / gate state / barrier; never reinvents gate semantics
-    and never auto-creates or mutates gates. Coexists with spec-kitty (references
-    mission/WP ids in evidence/remediation, never alters WP state).
+    and never auto-creates or mutates gates. References mission/WP ids in
+    evidence/remediation as generic bus metadata, never alters an external
+    planner's own state.
 
 P3 (HELD, not here): role->member routing, specialist discovery, skill rubrics,
 severity policy, ephemeral adversarial reviewers.
