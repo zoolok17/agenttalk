@@ -63,13 +63,32 @@ export const ATT_ITEM = (o = {}) => ({
   age_seconds: o.age === undefined ? 18000 : o.age, human_can_unblock_now: true,
   ...(o.answerable ? { answerable: true, options: o.options || ['Keep it', 'Remove it'] } : {}),
   ...(o.age_unknown ? { age_unknown: true } : {}),
+  // B7: build_attention's own wire shape for an escalation - source_refs[0] carries the exact
+  // validated {work_item, work_cycle} ONLY when the escalation's opener declared both (never
+  // guessed); an unlinked/malformed escalation's ref has request_id alone, matching
+  // web_tags.item_ref's {} return. o.requestId defaults to the item's own id, like a real escalation.
+  ...(o.source_refs !== undefined ? { source_refs: o.source_refs } : (o.linked !== undefined ? {
+    source_refs: [{ kind: 'message', request_id: o.requestId || o.id || 'it-1',
+                    ...(o.linked ? { work_item: o.workItem || 'demo-item', work_cycle: o.workCycle || '1' } : {}) }],
+  } : {})),
 });
 
 export const attention = (items, o = {}) => ({ ok: o.ok !== false, asOfMs: o.asOfMs === undefined ? NOW : o.asOfMs, items });
 
 export const chat = (messages, o = {}) => ({
   ok: true, asOfMs: NOW,
-  payload: { available: o.available !== false, operator: 'operator', lead: o.lead || 'claude-agenttalk-lead', messages, detail: o.detail || '' },
+  payload: { available: o.available !== false, operator: 'operator', lead: o.lead || 'claude-agenttalk-lead', messages,
+             detail: o.detail || '', ...(o.pendingDecisions ? { pending_decisions: o.pendingDecisions } : {}) },
+});
+
+// One /api/lead-chat pending_decisions entry (build_lead_chat's _lead_chat_pending_decisions),
+// keyed the same way an attention escalation item is: by request_id.
+export const PENDING_DECISION = (o = {}) => ({
+  request_id: o.requestId || 'esc-1', sender: o.sender || 'claude-agenttalk-lead',
+  subject: o.subject === undefined ? 'operator input needed' : o.subject,
+  decision: o.decision === undefined ? 'Keep the old CSV export?' : o.decision,
+  recommendation: o.recommendation || '', priority: o.priority || '', risk_severity: o.riskSeverity || '',
+  options: o.options || [], age_seconds: o.age === undefined ? 18000 : o.age, answerable: true,
 });
 
 export const CONN_OK = { reachable: true, stalledPolls: 0, lastOkMs: NOW };
