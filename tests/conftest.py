@@ -10,10 +10,12 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
+from agenttalk.comprehension.privacy import VcsPrivacyRefused, run_privacy_preflight
 from agenttalk.store import Store
 
 
@@ -246,14 +248,48 @@ def comprehension_privacy_root(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def _run_privacy_preflight_with_bounded_retry(root: Path, *, attempts: int = 4, delay: float = 0.5):
+    """#223: ``run_privacy_preflight`` shells out to real ``git`` (rev-parse,
+    ls-files, check-ignore), each bounded by ``privacy.GIT_TIMEOUT_SECONDS``
+    (2s). On a loaded Windows CI runner that timeout can occasionally trip
+    on a transient scheduling delay, not a real problem with the git
+    repo — ``subprocess.TimeoutExpired`` is a ``SubprocessError``, so
+    ``privacy._run_git``/``_run_git_with_stdin`` swallow it into ``None``
+    ("untrustworthy"), and the preflight correctly (fail-closed, product-
+    correct) refuses with a "could not be trusted" ``VcsPrivacyRefused``.
+
+    This fixture's whole job is to hand back a REAL, proven result for
+    tests whose subject is something else entirely (locking, publishing,
+    escalation, ...) — for THEM, that occasional transient refusal is
+    pure flake, not a signal. Retry the whole (idempotent, read-only)
+    preflight a bounded number of times before giving up, but ONLY for
+    that specific "could not be trusted" class of refusal — matched by
+    the exact substring every untrustworthy-git-answer site in
+    ``privacy.py`` uses (see ``run_privacy_preflight``). A genuine
+    refusal (not ignored, already tracked, not a worktree, ...) is a real
+    test-setup bug, never transient, and must NOT be retried into
+    silence: it re-raises immediately, unbounded-retry-free, same as
+    before this fixture existed.
+    """
+    for attempt in range(attempts):
+        try:
+            return run_privacy_preflight(root)
+        except VcsPrivacyRefused as exc:
+            if "could not be trusted" not in str(exc) or attempt + 1 >= attempts:
+                raise
+            time.sleep(delay)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
 @pytest.fixture
 def comprehension_privacy(comprehension_privacy_root: Path):
     """A REAL, proven ``PrivacyPreflightResult`` (``vcs_privacy ==
     "ignored"``), obtained by actually running ``run_privacy_preflight``
-    against :func:`comprehension_privacy_root`'s git fixture."""
-    from agenttalk.comprehension.privacy import run_privacy_preflight
-
-    return run_privacy_preflight(comprehension_privacy_root)
+    against :func:`comprehension_privacy_root`'s git fixture. #223: bounded
+    retry absorbs a transient "git could not be trusted" timeout on a
+    loaded CI host — see :func:`_run_privacy_preflight_with_bounded_retry`.
+    """
+    return _run_privacy_preflight_with_bounded_retry(comprehension_privacy_root)
 
 
 @pytest.fixture
