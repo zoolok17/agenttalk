@@ -100,15 +100,72 @@ test('F2 regression: two waits sharing ONE deadline stay bounded by that ONE bud
   assert.ok(clock.now() < 91000, `expected ~90s total, got ${clock.now()}ms - looks like two independent budgets`);
 });
 
-test('F2 regression: a never-settling fn() does not hang the loop past the shared deadline', async () => {
-  const clock = fakeClock();
-  const deadline = makeDeadline(5000, clock);
+// PR #230 delta review round 2, N1 (connector, major): the retry loop used to RACE each attempt
+// against one poll-interval tick so a never-settling `fn()` could not hang the loop. That race was
+// exactly the bug - a fast attempt always "won", so the tick's sleep was merely started, never
+// actually awaited, and intervalMs throttled nothing (reviewer-1 measured 14,109 real attempts in
+// 51ms for an immediate-undefined fn, 5,858 in 50ms for an immediate rejection). The recast drops
+// the race: fn is now awaited fully, every time, and the CONTRACT is that fn bounds itself (its own
+// AbortSignal.timeout, like fetchJsonOnce) - so a never-settling raw promise is no longer this
+// loop's problem to solve; it is fn's, by actually releasing the resource it is waiting on. Real
+// timers here (not the fake clock above) because the eager fake `sleep` mutates its clock the
+// instant it is CALLED, independent of whether it is actually awaited - exactly what hid this bug
+// from the fake-clock suite in the first place; only real elapsed time proves the pacing is real.
+test('N1 pacing (round 2): intervalMs actually paces immediate-undefined attempts, not thousands per tick', async () => {
+  let calls = 0;
+  const budgetMs = 300;
+  const intervalMs = 50;
   await assert.rejects(
-    () => waitForDeadline(() => new Promise(() => { /* never settles */ }),
-      { deadline, sleep: clock.sleep, intervalMs: 150 }),
-    /did not happen within the shared budget/,
+    () => waitForDeadline(async () => { calls += 1; return undefined; }, {
+      deadline: makeDeadline(budgetMs), intervalMs, describe: 'the thing',
+    }),
+    /the thing did not happen within the shared budget/,
   );
-  assert.ok(clock.now() >= 5000, 'the deadline elapsed rather than hanging forever on fn()');
+  const maxExpected = Math.ceil(budgetMs / intervalMs) + 1;
+  assert.ok(calls <= maxExpected,
+    `expected at most ~${maxExpected} attempts over ${budgetMs}ms at ${intervalMs}ms pacing, got ${calls} - intervalMs is not throttling`);
+});
+
+test('N1 pacing (round 2): intervalMs actually paces immediate-rejection attempts too', async () => {
+  let calls = 0;
+  const budgetMs = 300;
+  const intervalMs = 50;
+  await assert.rejects(
+    () => waitForDeadline(async () => { calls += 1; throw new Error('ECONNREFUSED (simulated)'); }, {
+      deadline: makeDeadline(budgetMs), intervalMs, describe: 'the thing',
+    }),
+    /the thing did not happen within the shared budget/,
+  );
+  const maxExpected = Math.ceil(budgetMs / intervalMs) + 1;
+  assert.ok(calls <= maxExpected,
+    `expected at most ~${maxExpected} attempts over ${budgetMs}ms at ${intervalMs}ms pacing, got ${calls} - intervalMs is not throttling`);
+});
+
+test('N1 (round 2): the abort wiring a real fn() relies on (fetchJsonOnce\'s AbortSignal.timeout pattern) actually aborts a never-answering attempt at its cap, rather than hanging', async () => {
+  // fetchJsonOnce bounds every real HTTP attempt via fetch(url, { signal: AbortSignal.timeout(capMs) })
+  // - this is what makes "fn must bound itself" a safe contract for waitForDeadline to rely on. Proven
+  // here against a stub that never answers unless aborted, exercising the exact same signal wiring.
+  const capMs = 30;
+  // AbortSignal.timeout()'s own internal timer is unref'd (by design, so a live abort signal never
+  // alone keeps a process alive) - unlike a real fetch(), this bare stub holds no other handle, so
+  // with nothing else pending Node would exit clean before the timer ever fires. A real fn() never
+  // hits this: the pending socket itself keeps the loop alive. A plain ref'd keep-alive reproduces
+  // that here, without changing what is actually being proven (the abort itself still fires the cap).
+  const keepAlive = setTimeout(() => {}, capMs + 500);
+  try {
+    const neverAnswers = (signal) => new Promise((_resolve, reject) => {
+      signal.addEventListener('abort', () => reject(new DOMException('This operation was aborted', 'AbortError')));
+    });
+    const start = Date.now();
+    await assert.rejects(
+      () => neverAnswers(AbortSignal.timeout(capMs)),
+      (err) => err.name === 'AbortError',
+    );
+    const elapsed = Date.now() - start;
+    assert.ok(elapsed < 1000, `expected the abort at ~${capMs}ms to fire promptly, took ${elapsed}ms`);
+  } finally {
+    clearTimeout(keepAlive);
+  }
 });
 
 // -------------------------------------------------------- PR #230 delta review, F3: exit propagation

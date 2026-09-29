@@ -58,18 +58,22 @@ export class FatalExitError extends Error {
 // Retries `fn` until it resolves to a value other than `undefined`, bounded by a SHARED `deadline`
 // (a makeDeadline() - never its own fresh timeout, see above).
 //
-// PR #230 delta review, F2 ("a never-settling operation escapes the deadline"): each iteration
-// races the current `fn()` ATTEMPT against ONE poll interval (never the full remaining budget in
-// one race - an earlier version of this fix tried that and, under a fake clock whose `sleep`
-// necessarily mutates shared state as soon as it is CALLED, discovered `Promise.race` does not
-// cancel the loser: BOTH racers still run to completion regardless of which "wins", so a
-// remaining-time sleep silently jumped the fake clock to the deadline on every single iteration,
-// corrupting the very thing under test). A single still-pending `fn()` attempt is preserved
-// (`pending`) and re-raced on each subsequent iteration - never re-invoked - so a slow-but-alive
-// operation is still waited on correctly, while the LOOP itself keeps re-checking checkExited and
-// the deadline every `intervalMs`, and so cannot hang past the budget even if `fn()` itself never
-// settles. This is a backstop: the real fix for a hung network call is giving THAT call its own
-// AbortSignal (see fetchJsonOnce below), which actually releases the underlying resource.
+// CONTRACT: `fn(remainingMs)` must bound ITSELF to (at most) the `remainingMs` it is given - e.g.
+// via its own AbortSignal.timeout(min(remainingMs, someCap)), like fetchJsonOnce below. This loop
+// does not race attempts against anything; it awaits each one fully, then sleeps one poll interval,
+// then repeats. A never-settling `fn` is not this loop's problem to solve - it is `fn`'s, by
+// actually releasing whatever resource it is waiting on.
+//
+// PR #230 delta review round 2, N1 (connector, [major]): an EARLIER version of this loop raced
+// each `fn()` attempt against a poll-interval "tick" so a slow-but-alive attempt could still be
+// waited on across iterations without re-invoking `fn`. That race meant a FAST attempt (an
+// immediate rejection, or an immediate `undefined`) never actually awaited the poll-interval sleep
+// at all - `pending` simply won the race every time - so `intervalMs` throttled nothing: a refused
+// connection or an empty page-target list could be retried tens of thousands of times per second
+// while Chromium was still starting. Racing is unnecessary here in the first place: every real
+// attempt in this file is already a single bounded fetch (its own AbortSignal.timeout), so the
+// loop only needs to await each attempt fully and then genuinely await its own sleep before trying
+// again - never a race, so the sleep can never be skipped.
 //
 // A FatalExitError is NEVER swallowed as "not ready yet" (F3): it propagates immediately, with its
 // exit code/stderr intact, from anywhere inside `fn`. Every dependency is injectable (`sleepFn`)
@@ -78,36 +82,27 @@ export class FatalExitError extends Error {
 export async function waitForDeadline(fn, {
   deadline, intervalMs = 150, sleep: sleepFn = sleep, checkExited, describe, getDiagnostics,
 } = {}) {
-  let pending = null;   // the in-flight fn() attempt, if any is still outstanding from a prior tick
   for (;;) {
     const exitedBefore = checkExited && checkExited();
     if (exitedBefore) throw new FatalExitError(describe, exitedBefore);
     if (deadline.expired()) {
-      // Connector P2 (N1): the browser can stay ALIVE (no exit, so no FatalExitError) while never
-      // exposing the DevTools endpoint - exactly the slow-startup path this whole change exists to
-      // diagnose. The old fixed-attempt-budget error always included the accumulated stderr; this
-      // one must too, not only the (already-covered) fatal-exit path.
+      // Connector P2 (N1, round 1): the browser can stay ALIVE (no exit, so no FatalExitError)
+      // while never exposing the DevTools endpoint - exactly the slow-startup path this whole
+      // change exists to diagnose. The old fixed-attempt-budget error always included the
+      // accumulated stderr; this one must too, not only the (already-covered) fatal-exit path.
       const extra = getDiagnostics && getDiagnostics();
       throw new Error(`${describe || 'condition'} did not happen within the shared budget`
         + (extra ? `; ${extra}` : ''));
     }
-    if (pending === null) {
-      pending = (async () => {
-        try { return { ok: true, value: await fn() }; } catch (e) { return { ok: false, error: e }; }
-      })();
+    let settled;
+    try { settled = { ok: true, value: await fn(deadline.remainingMs()) }; } catch (e) { settled = { ok: false, error: e }; }
+    if (!settled.ok) {
+      if (settled.error instanceof FatalExitError) throw settled.error;
+      // an ordinary failure - not ready yet; fall through to the paced sleep below, then retry
+    } else if (settled.value !== undefined) {
+      return settled.value;
     }
-    const tickMs = Math.max(0, Math.min(intervalMs, deadline.remainingMs()));
-    const outcome = await Promise.race([
-      pending.then((settled) => ({ ticked: false, settled })),
-      sleepFn(tickMs).then(() => ({ ticked: true })),
-    ]);
-    if (outcome.ticked) continue;   // fn() is still outstanding; re-race the SAME attempt next tick
-    pending = null;                 // this attempt is done - a fresh one starts next iteration if needed
-    if (!outcome.settled.ok) {
-      if (outcome.settled.error instanceof FatalExitError) throw outcome.settled.error;
-      continue;   // an ordinary failure - not ready yet, retry with a fresh attempt
-    }
-    if (outcome.settled.value !== undefined) return outcome.settled.value;
+    await sleepFn(Math.max(0, Math.min(intervalMs, deadline.remainingMs())));
   }
 }
 
@@ -119,8 +114,8 @@ export async function waitForDeadline(fn, {
 // deadline bug returns) - opts.deadline/opts.checkExited are required, shared with whatever else
 // draws from the same overall budget.
 export async function waitForPageTarget(listTargetsOnce, opts) {
-  return waitForDeadline(async () => {
-    const targets = await listTargetsOnce();
+  return waitForDeadline(async (remainingMs) => {
+    const targets = await listTargetsOnce(remainingMs);
     return Array.isArray(targets) ? targets.find((t) => t.type === 'page') : undefined;
   }, { intervalMs: 150, describe: 'a page target appearing in /json/list', ...opts });
 }
@@ -293,7 +288,7 @@ try {
   // `startupDeadline`; whatever the first phase spent is no longer available to the second.
   const startupDeadline = makeDeadline(STARTUP_BUDGET_MS);
   const getDiagnostics = () => `stderr:\n${childStderr}`;
-  await waitForDeadline(() => fetchJsonOnce('/json/version', startupDeadline.remainingMs()), {
+  await waitForDeadline((remainingMs) => fetchJsonOnce('/json/version', remainingMs), {
     deadline: startupDeadline, intervalMs: 150,
     checkExited: checkChildExited, describe: 'the DevTools endpoint (/json/version)', getDiagnostics,
   });
@@ -301,7 +296,7 @@ try {
   // old code took whatever the FIRST list response held unconditionally and crashed reading
   // `.id` off `undefined`. Wait for one to actually appear instead, still on the SAME budget.
   const page = await waitForPageTarget(
-    () => fetchJsonOnce('/json/list', startupDeadline.remainingMs()),
+    (remainingMs) => fetchJsonOnce('/json/list', remainingMs),
     { deadline: startupDeadline, checkExited: checkChildExited, getDiagnostics },
   );
   keepAliveTargetId = page.id;

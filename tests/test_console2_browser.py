@@ -140,7 +140,7 @@ def _state(now: datetime, grown: int = 0) -> dict:
     }]}
 
 
-def _handler():
+def _handler(monotonic=time.monotonic):
     # PR #230 delta review, F1: aging used to start at HANDLER-CONSTRUCTION time (before Chromium
     # even launches), so a longer (but healthy) browser startup - #229's own fix allows up to 90s -
     # directly ate into the fixture's own 3600s (1h) granularity budget: the reviewer reproduced
@@ -148,6 +148,8 @@ def _handler():
     # Aging is decoupled from startup duration by starting the clock lazily, on the FIRST request
     # this server actually receives (the earliest a page could possibly be exercising it) rather
     # than at construction time - real startup time, however long, is no longer charged against it.
+    # `monotonic` is injectable (round 2, N2) so the real-browser fixture uses real time.monotonic
+    # while the F1 regression test below can drive it with fixed readings instead of a real sleep.
     clock = {"started": None}
 
     class Handler(BaseHTTPRequestHandler):
@@ -164,10 +166,10 @@ def _handler():
 
         def do_GET(self) -> None:  # noqa: N802
             if clock["started"] is None:
-                clock["started"] = time.monotonic()
+                clock["started"] = monotonic()
             path = self.path.split("?", 1)[0]
             now = datetime.now(timezone.utc)
-            grown = int((time.monotonic() - clock["started"]) * 60)  # cards age 60 s per second: a new label every read
+            grown = int((monotonic() - clock["started"]) * 60)  # cards age 60 s per second: a new label every read
             if path == "/v2":
                 self._send(web.render_console2(), "text/html; charset=utf-8", web._DASHBOARD_CSP)
             elif path.startswith("/static/") and path[len("/static/"):] in web._STATIC_ASSETS:
@@ -273,25 +275,56 @@ def page(tmp_path: Path):
 
 
 def test_fixture_aging_starts_on_first_request_not_construction() -> None:
-    """PR #230 delta review, F1 regression - cheap, no browser needed: a real (but short) gap
-    between constructing the fixture and its FIRST request (standing in for however long a real
-    browser takes to start) must never be charged against the fixture's own aging clock. Before
-    the fix, `_handler(started)` took `time.monotonic()` as a constructor argument - a slow start
-    was indistinguishable from genuine card age. Two plain loopback GETs with a real sleep between
-    them are enough to observe the difference; no monkeypatching of time.monotonic needed."""
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), _handler())
+    """PR #230 delta review, F1 regression, made deterministic in round 2 (N2): a real (but short)
+    gap between constructing the fixture and its FIRST request (standing in for however long a real
+    browser takes to start) must never be charged against the fixture's own aging clock. Before the
+    F1 fix, `_handler(started)` took `time.monotonic()` as a constructor argument - a slow start was
+    indistinguishable from genuine card age.
+
+    Round 1 exercised this with a real 2s sleep and a loose `first_grown < 10` bound - which was
+    itself load-sensitive (N2): do_GET reads the injected clock TWICE on the first request (once to
+    lazily set clock["started"], once to compute `grown`), and under real time.monotonic those two
+    reads can legitimately drift apart by more than 167ms of scheduler jitter alone, at this
+    fixture's 60x acceleration - a correctly-lazy first request descheduled for 200ms between those
+    two reads reports grown=12 and fails outright, adding a load-sensitive flake to a flake fix.
+
+    Injecting a controllable `monotonic` callable removes both the real sleep AND the wall-clock
+    bound: the TEST advances the clock explicitly (standing in for however long a real gap is,
+    without waiting for one), so the exact epoch semantics can be asserted precisely instead of
+    merely bounded. A plain canned reading sequence cannot express this: since nothing calls
+    monotonic() during the "gap" itself, a sequential fake would hand the same next value to
+    "started" whether the code reads it eagerly at construction or lazily at the first request -
+    the two are only distinguishable if the clock can advance independently of being read."""
+
+    class FakeMonotonic:
+        def __init__(self, value: float) -> None:
+            self.value = value
+
+        def __call__(self) -> float:
+            return self.value
+
+    fake = FakeMonotonic(100.0)
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _handler(monotonic=fake))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        time.sleep(2)   # stands in for a slow (but healthy) browser startup gap
         base = f"http://127.0.0.1:{srv.server_address[1]}"
+        # The exact 65s the reviewer used to reproduce the original bug ("backdating `started` by
+        # 65s ... 'waiting 1h' on the very first read") - a healthy but slow browser startup gap,
+        # advanced directly with no real sleep and no other code ever reading the clock meanwhile.
+        fake.value += 65.0
         with urllib.request.urlopen(f"{base}/api/attention", timeout=5) as resp:  # noqa: S310  # nosec B310  # nosemgrep
             first = json.loads(resp.read())
-        # card-2's age is "50 + grown" (see the /api/attention branch below) - grown must be near
-        # zero on this FIRST request. At the fixture's 60x acceleration, if aging had incorrectly
-        # already started at construction, the 2s real gap above would show as ~120 simulated
-        # seconds here instead - the fix keeps it near zero regardless of how long the gap was.
-        first_grown = first["items"][1]["age_seconds"] - 50
-        assert first_grown < 10, f"aging appears to have started before the first request: grown={first_grown}"
+        # card-2's age is "50 + grown" (see the /api/attention branch below). Lazy (correct): started
+        # is set to 165.0 AT this first read, so grown=(165.0-165.0)*60=0 EXACTLY. Eager (the F1 bug):
+        # started would have been captured as 100.0 at construction, so grown=(165.0-100.0)*60=3900 -
+        # unmistakably not 0.
+        assert first["items"][1]["age_seconds"] - 50 == 0
+        fake.value += 1.0   # a whole second - exact in binary float, no int()-truncation surprises
+        with urllib.request.urlopen(f"{base}/api/attention", timeout=5) as resp:  # noqa: S310  # nosec B310  # nosemgrep
+            second = json.loads(resp.read())
+        # grown=(166.0-165.0)*60=60 EXACTLY - ages forward from the FIRST request's start, not from
+        # construction, and is not re-latched on every request.
+        assert second["items"][1]["age_seconds"] - 50 == 60
     finally:
         srv.shutdown()
         srv.server_close()
