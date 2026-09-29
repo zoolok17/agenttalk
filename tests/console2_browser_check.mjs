@@ -14,7 +14,57 @@
 // What the DOM stub cannot show and this does: a detached element has no scroll layout (the thread
 // must be scrolled after insertion), and a redraw that replaces a focused control drops focus to <body>.
 import { spawn } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 
+export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Issue #229: a fixed 200x150ms attempt budget (~30s) can starve out on a slow/loaded CI runner
+// even though the awaited condition would still have been met soon after - CI observed the
+// Chromium process itself had NOT exited, just not yet answering. A DEADLINE (elapsed real time,
+// generous: ~90s) rather than an attempt COUNT tolerates that without silently waiting forever:
+// `checkExited` (when given) still fails FAST and clearly the moment a process that will never
+// answer has already exited, rather than waiting out the whole budget for nothing. Every
+// dependency is injectable (`sleepFn`/`now`) so this can be unit-tested against a stub with no
+// real browser, process or timers - see console2_browser_check_wait.test.mjs.
+export async function waitForDeadline(fn, {
+  timeoutMs, intervalMs = 150, sleep: sleepFn = sleep, now = Date.now, checkExited, describe,
+} = {}) {
+  const start = now();
+  for (;;) {
+    let result;
+    try {
+      result = await fn();
+    } catch (e) { /* condition not met yet */ }
+    if (result !== undefined) return result;
+    const exited = checkExited && checkExited();
+    if (exited) {
+      throw new Error(`${describe || 'condition'}: the process exited before it was met (${JSON.stringify(exited)})`);
+    }
+    if (now() - start >= timeoutMs) {
+      throw new Error(`${describe || 'condition'} did not happen within ${(timeoutMs / 1000).toFixed(0)}s`);
+    }
+    await sleepFn(intervalMs);
+  }
+}
+
+// Issue #229: `/json/list` can answer OK before the browser has created its initial page target
+// yet (a startup race, distinct from the DevTools HTTP endpoint merely being up at all) - the
+// previous code took the FIRST list response unconditionally and crashed on the missing target
+// (`Cannot read properties of undefined (reading 'id')`) rather than waiting for one to exist.
+export async function waitForPageTarget(listTargets, opts = {}) {
+  return waitForDeadline(async () => {
+    const targets = await listTargets();
+    return Array.isArray(targets) ? targets.find((t) => t.type === 'page') : undefined;
+  }, {
+    timeoutMs: 90000, intervalMs: 150,
+    describe: 'a page target appearing in /json/list',
+    ...opts,
+  });
+}
+
+// Everything below this line is the check's own entrypoint - spawning a real browser and driving
+// it over CDP - guarded so importing the pure helpers above (for a unit test) never also does that.
+async function main() {
 const [exe, pageUrl, profile, flagsJson, sabotage] = process.argv.slice(2);
 const extraFlags = flagsJson ? JSON.parse(flagsJson) : [];
 
@@ -36,7 +86,6 @@ const sabotageScrollScript = sabotage === 'scroll'
      window.__sabotageObserver.observe(document.querySelector('${WATCHED_AGE_SELECTOR}'), { childList: true, characterData: true, subtree: true });`
   : '';
 const PORT = 9300 + Math.floor(Math.random() * 500);
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // `profile` is a fresh, unique directory per test run - the caller's job
 // (test_console2_browser.py's `page` fixture uses pytest's own tmp_path); a reused or
@@ -51,17 +100,19 @@ child.stderr.on('data', (chunk) => { childStderr += chunk.toString(); });
 let childExit = null;
 child.on('exit', (code, signal) => { childExit = { code, signal }; });
 
+// Issue #229: was a fixed 200x150ms attempt budget (~30s); CI showed Chromium's stderr held only
+// headless dbus noise and the process had NOT exited - it was simply still starting, slower than
+// 30s allowed for, on a loaded runner. Now a 90s DEADLINE (see waitForDeadline above), and
+// `childExit` still fails fast and clearly if the process really has already exited.
 async function json(path) {
-  for (let i = 0; i < 200; i++) {
-    try { const r = await fetch(`http://127.0.0.1:${PORT}${path}`); if (r.ok) return await r.json(); } catch (e) { /* not up yet */ }
-    if (childExit) {
-      throw new Error(
-        `browser process exited before the DevTools endpoint came up (code=${childExit.code} `
-        + `signal=${childExit.signal}); stderr:\n${childStderr}`);
-    }
-    await sleep(150);
-  }
-  throw new Error(`browser did not start within the retry budget; stderr:\n${childStderr}`);
+  return waitForDeadline(async () => {
+    const r = await fetch(`http://127.0.0.1:${PORT}${path}`);
+    return r.ok ? await r.json() : undefined;
+  }, {
+    timeoutMs: 90000, intervalMs: 150,
+    checkExited: () => childExit && { ...childExit, stderr: childStderr },
+    describe: `the DevTools endpoint (${path})`,
+  });
 }
 
 // A ONE-SHOT DevTools HTTP action (never a "wait for the endpoint to come up" read like json()
@@ -173,8 +224,10 @@ async function pressKey(name, opts = {}) {
 
 try {
   await json('/json/version');
-  const targets = await json('/json/list');
-  const page = targets.find((t) => t.type === 'page');
+  // Issue #229: `/json/list` can answer OK before any `type === 'page'` target exists yet - the
+  // old code took whatever the FIRST list response held unconditionally and crashed reading
+  // `.id` off `undefined`. Wait for one to actually appear instead.
+  const page = await waitForPageTarget(() => json('/json/list'));
   keepAliveTargetId = page.id;
   ws = new WebSocket(page.webSocketDebuggerUrl);
   await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = reject; });
@@ -485,3 +538,8 @@ try {
   child.kill();
 }
 process.exit(0);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
+  main();
+}

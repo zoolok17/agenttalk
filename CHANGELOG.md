@@ -135,6 +135,15 @@ Theme: **a work board that moves itself, and seats that survive a busy store.**
 - Isolate `wb.` gates from root checks and both gate-HOLD attention paths; refuse
   new board names in root requirements and warn about legacy contaminated lists.
 
+- Fix CI flake #229: the console2 real-browser check's DevTools startup wait was a
+  fixed 200x150ms attempt budget (~30s), which starved out on a slow/loaded CI
+  runner even though the browser process was still healthily starting; it is now a
+  generous 90s deadline, with a clear, immediate failure if the process actually
+  exited. `/json/list` can also answer before any `type === "page"` target exists
+  yet - the check now waits (bounded, same clear-failure discipline) for one to
+  appear instead of crashing on the missing target. Test harness only; every
+  scroll/focus/visibility/sabotage-detection assertion is unchanged.
+
 ## [0.93.0] - 2026-09-27
 
 Theme: **challenge major work before it starts, and run acceptance on a pinned,
