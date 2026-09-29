@@ -83,13 +83,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Dev gate: record per-test durations (measurement only).** Windows dev-gate
-  legs now take 125-165 min against the 180-min job ceiling (the slowest at
-  92%), against 31-46 min on Linux, with only progress-dot pytest logs in the
-  uploaded evidence to say where the time goes. Every `pytest` check (source
-  and wheel, every required Python minor) now also runs with
-  `--junitxml=<logs_dir>/<check_id>.junit.xml` — structured, with per-test
-  time and classname (the default xunit2 report has no `file` attribute;
+- **Dev gate: record per-test durations (measurement only) — diagnostics,
+  never evidence.** Windows dev-gate legs now take 125-165 min against the
+  180-min job ceiling (the slowest at 92%), against 31-46 min on Linux, with
+  only progress-dot pytest logs in the uploaded evidence to say where the
+  time goes. Every `pytest` check (source and wheel, every required Python
+  minor) now runs with `--junitxml=<path>` — structured, with per-test time
+  and classname (the default xunit2 report has no `file` attribute;
   classname maps to the module path), so one normal CI run can point at the
   real hotspot (git-spawn cost, bytecode effects for subprocess-heavy files,
   the two-worker split, or something unseen) instead of guessing from a
@@ -99,26 +99,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (or the gate's own stdout grammar) is affected, and pass/fail semantics are
   unchanged. The manifest's committed, floor-pinned `pytest.args` (`["-q"]`)
   is untouched: like `--basetemp`, the junit path is per-run/per-check and is
-  built at call time, never a static arg. The new file is bound into the
-  evidence the same way the existing per-check `.log` is — an optional
-  `junit_xml: {path, sha256, artifact_path}` on the check record, present
-  only when pytest genuinely produced the file (never a new way for the gate
-  to block); `write_run_evidence` collects it into the bundle at
-  `logs/<check_id>.junit.xml` and re-verifies its hash, exactly like the
-  existing log collection. No product behaviour change and no new
-  dependency (junitxml is built into pytest).
+  built at call time, never a static arg. No product behaviour change and no
+  new dependency (junitxml is built into pytest).
 
-  **Fix round 1** (codex cold read): both the attachment (`_record_from_outcome`)
-  and the collection (`write_run_evidence`) steps are now fully best-effort —
-  an `OSError` from stat/hash/read at either point (a permission error, the
-  report vanishing or changing between the two steps) degrades to "omit the
-  field", never aborts the check's own evidence or blocks publication of the
-  rest of the leg. Re-validating an artifact ALREADY bound into a published
-  bundle (e.g. during aggregation) still hard-rejects tampering — that
-  integrity guarantee is unchanged. The evidence's positional argv-shape
-  validator now accepts both the pre-junitxml command shape (records from a
-  gate build predating this change) and the current one, so historical
-  evidence keeps validating.
+  **Design, after two rounds of fixes for the same class of edge case
+  (a best-effort attachment step, then a verify-then-place collection step,
+  then a third cold read finding debris from a failed `unlink()`): an
+  optional, best-effort file must never live inside the hash-bound,
+  integrity-checked evidence bundle at all.** `--junitxml` is now added only
+  when `AGENTTALK_DEV_GATE_TIMINGS_DIR` is set — an environment variable
+  (not a CLI option, since `_run_pytest_mode` sits deep below
+  `execute_gate`'s call stack and an env var needs no signature threaded
+  through every intermediate caller; same `AGENTTALK_DEV_GATE_<PURPOSE>`
+  convention as the existing `AGENTTALK_DEV_GATE_COMMITTED_SRC`), set only
+  by `tests.yml`, and writes into a directory OUTSIDE `logs_dir` and outside
+  anything `write_run_evidence` collects. When unset (every local run), no
+  `--junitxml` flag is added at all. The `junit_xml` evidence field is
+  removed entirely — the attachment in `_record_from_outcome`, the schema
+  rule in `validate_run_artifact`, and the collection in
+  `write_run_evidence` are all gone, along with their tests. Nothing about
+  timings is hashed, bound, or collected by the gate; the evidence bundle is
+  byte-for-byte what master produces today. The evidence's positional
+  argv-shape validator still accepts both shapes (with and without the
+  `--junitxml <path>` pair), since which one appears now depends only on
+  whether CI set the diagnostics env var, never on tampering. `tests.yml`
+  uploads the timings directory as its own `dev-gate-timings-<os>-<py>`
+  artifact, `if: always()` and `if-no-files-found: ignore`, clearly
+  commented as unverified diagnostic data, not gate evidence.
 
 ### CI
 

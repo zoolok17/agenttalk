@@ -45,6 +45,23 @@ def test_leg_upload_includes_the_json_and_its_sibling_logs() -> None:
     assert "path: ${{ runner.temp }}/dev-gate-evidence/\n" in leg
 
 
+def test_leg_uploads_timings_as_a_separate_unverified_artifact() -> None:
+    """RECAST (#231, stopping rule): the timing record is DIAGNOSTICS, never
+    evidence - it must be a SEPARATE artifact from dev-gate-evidence, using
+    the same pinned upload-artifact action, tolerant of never having been
+    produced at all (if-no-files-found: ignore, unlike the evidence upload's
+    if-no-files-found: error), and uploaded even if a prior step failed."""
+    workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")
+    leg = workflow.split("  dev-gate-aggregate:")[0]
+    assert "AGENTTALK_DEV_GATE_TIMINGS_DIR: ${{ runner.temp }}/dev-gate-timings" in leg
+    assert "name: dev-gate-timings-${{ matrix.os.id }}-${{ matrix.python-version }}" in leg
+    assert "path: ${{ runner.temp }}/dev-gate-timings/\n" in leg
+    assert "if-no-files-found: ignore" in leg
+    timings_step = leg.split("- name: Upload leg timings")[1]
+    assert "if: always()" in timings_step.split("- name:")[0]
+    assert "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" in timings_step.split("- name:")[0]
+
+
 def test_windows_ci_job_ceiling_matches_the_231_f3_stopgap() -> None:
     """#231 F3 (Windows CI capacity stopgap, following the #197 precedent
     87c529a): pin the actual numbers so a silent drift back to the stale

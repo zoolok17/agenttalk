@@ -98,6 +98,13 @@ jobs:
           tar -xzf "$archive" -C "$bindir" gitleaks
           echo "$bindir" >> "$GITHUB_PATH"
       - name: Run the committed gate
+        env:
+          # RECAST (#231, stopping rule): the timing record is DIAGNOSTICS,
+          # never evidence - set only here, by CI, never by a local run.
+          # dev_gate.py adds --junitxml to the pytest checks only when this
+          # is set, writing into a directory outside anything the gate
+          # hashes or binds into dev-gate-evidence.json.
+          AGENTTALK_DEV_GATE_TIMINGS_DIR: ${{ runner.temp }}/dev-gate-timings
         run: >
           python -I -m agenttalk dev-gate
           --profile release
@@ -110,6 +117,18 @@ jobs:
           name: dev-gate-leg-${{ matrix.os.id }}-${{ matrix.python-version }}
           path: ${{ runner.temp }}/dev-gate-evidence/
           if-no-files-found: error
+          retention-days: 14
+      - name: Upload leg timings
+        # Unverified diagnostic data, not gate evidence: junit XML written by
+        # pytest for per-test CI-time measurement only. Never hashed or bound
+        # by the gate (see AGENTTALK_DEV_GATE_TIMINGS_DIR above) - a missing
+        # or partial file here must never fail the job.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: dev-gate-timings-${{ matrix.os.id }}-${{ matrix.python-version }}
+          path: ${{ runner.temp }}/dev-gate-timings/
+          if-no-files-found: ignore
           retention-days: 14
 
   dev-gate-aggregate:

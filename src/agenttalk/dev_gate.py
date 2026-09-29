@@ -1001,13 +1001,7 @@ def validate_run_artifact(
     checks_by_id: dict[str, dict[str, Any]] = {}
     for index, check in enumerate(checks):
         item = _require_object(check, f"checks[{index}]")
-        # #(ci-windows-durations): `junit_xml` is OPTIONAL (only pytest checks
-        # ever carry it, and only when pytest genuinely produced the file) -
-        # same forward-compatible, per-item field-set pattern as `log.artifact_path`.
-        item_fields = set(check_fields)
-        if "junit_xml" in item:
-            item_fields.add("junit_xml")
-        _require_artifact_fields(item, item_fields, f"checks[{index}]")
+        _require_artifact_fields(item, check_fields, f"checks[{index}]")
         check_id = item["id"]
         expected_kind, expected_mode, expected_python, needs_provenance = _check_semantics(check_id)
         if not isinstance(item["status"], str) or item["status"] not in CHECK_STATUSES:
@@ -1048,33 +1042,6 @@ def validate_run_artifact(
                     raise GateBlock("evidence_log_invalid", f"collected log hash mismatch: {check_id}")
             except OSError as exc:
                 raise GateBlock("evidence_log_invalid", f"cannot read collected log {check_id}: {exc}") from exc
-        if "junit_xml" in item:
-            if expected_kind != "pytest":
-                raise GateBlock("evidence_schema_invalid", f"checks[{index}].junit_xml is only valid for pytest checks")
-            junit = _require_object(item["junit_xml"], f"checks[{index}].junit_xml")
-            junit_fields = {"path", "sha256"}
-            if "artifact_path" in junit:
-                junit_fields.add("artifact_path")
-                if junit["artifact_path"] != f"logs/{check_id}.junit.xml":
-                    raise GateBlock(
-                        "evidence_schema_invalid", f"checks[{index}].junit_xml.artifact_path is malformed"
-                    )
-            _require_artifact_fields(junit, junit_fields, f"checks[{index}].junit_xml")
-            if not _is_absolute_path_text(junit["path"]) or not _is_hash(junit["sha256"], 64):
-                raise GateBlock("evidence_schema_invalid", f"checks[{index}].junit_xml is malformed")
-            if "artifact_path" in junit:
-                if bundle_root is None:
-                    raise GateBlock("evidence_log_invalid", "bundle root required for collected logs")
-                try:
-                    collected = bundle_root / junit["artifact_path"]
-                    if not collected.resolve().is_relative_to(bundle_root.resolve()):
-                        raise GateBlock("evidence_log_invalid", f"junit_xml escapes bundle: {check_id}")
-                    if sha256_bytes(_read_check_log(collected)) != junit["sha256"]:
-                        raise GateBlock("evidence_log_invalid", f"collected junit_xml hash mismatch: {check_id}")
-                except OSError as exc:
-                    raise GateBlock(
-                        "evidence_log_invalid", f"cannot read collected junit_xml {check_id}: {exc}"
-                    ) from exc
         if item["status"] == "pass":
             if (
                 not isinstance(item["exit_code"], int)
@@ -1315,74 +1282,6 @@ def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str,
         except OSError as exc:
             raise GateBlock("evidence_log_collection_failed", f"cannot collect log for {check['id']}: {exc}") from exc
         log["artifact_path"] = relative
-        # FIX ROUND 1 (#231 F1): collecting the OPTIONAL junit_xml measurement
-        # artifact is best-effort, unlike the primary log above - a report
-        # that disappeared or became unreadable (or whose bytes changed)
-        # between attachment and collection must never block publication of
-        # the rest of the (otherwise valid) leg evidence. Any failure here
-        # drops the key entirely rather than raising; the check's own status
-        # and every other field are untouched either way. This is distinct
-        # from validate_run_artifact's OWN junit_xml re-check (used when
-        # RE-validating an ALREADY-published bundle's `artifact_path`, e.g.
-        # during aggregation) - that path stays a hard GateBlock, since
-        # tampering with an artifact already bound into a published bundle
-        # must still be caught.
-        # FIX ROUND 2 (#231 P2, codex cold read + independent reproduction):
-        # best-effort must ALSO mean the FINAL destination path never ends up
-        # holding rejected or partially-written bytes - the CI workflow
-        # uploads the whole `logs/` directory as one artifact, unconditioned
-        # on which checks made it into evidence.json, so a file sitting there
-        # is published exactly as if it had been verified. Verify BEFORE
-        # placing: write to a temp name beside the destination (same
-        # directory -> same filesystem -> the rename is atomic), re-hash the
-        # temp file's OWN on-disk bytes (catches a partial/corrupted write,
-        # not just a source that already didn't match), and only then
-        # os.replace() it into the final path. Any rejection - content
-        # mismatch, a failed read, a failed or partial write - runs the same
-        # cleanup: if the final path exists, it is removed, so a leftover
-        # "rejected" file is never left where the whole-directory upload
-        # would publish it as trustworthy.
-        if "junit_xml" in check:
-            junit = check["junit_xml"]
-            junit_relative = f"logs/{check['id']}.junit.xml"
-            junit_destination = path.parent / junit_relative
-            junit_collected = False
-            try:
-                junit_destination.parent.mkdir(parents=True, exist_ok=True)
-                junit_source = Path(junit["path"])
-                junit_content = _read_check_log(junit_source)
-                content_ok = sha256_bytes(junit_content) == junit["sha256"]
-                same_path = junit_source.resolve() == junit_destination.resolve()
-                if content_ok and same_path:
-                    junit_collected = True
-                elif content_ok:
-                    tmp_destination = junit_destination.with_name(
-                        f"{junit_destination.name}.tmp-{uuid.uuid4().hex}"
-                    )
-                    try:
-                        tmp_destination.write_bytes(junit_content)
-                        if _sha256_file(tmp_destination) == junit["sha256"]:
-                            os.replace(tmp_destination, junit_destination)
-                            junit_collected = True
-                    finally:
-                        if tmp_destination.exists():
-                            tmp_destination.unlink()
-            except (OSError, GateBlock):
-                junit_collected = False
-            if junit_collected:
-                junit["artifact_path"] = junit_relative
-            else:
-                try:
-                    if junit_destination.exists():
-                        junit_destination.unlink()
-                except OSError:
-                    pass
-                print(
-                    f"agenttalk dev-gate: {check['id']}: junit-xml is a best-effort measurement "
-                    "artifact and could not be collected; omitted (check status unaffected)",
-                    file=sys.stderr,
-                )
-                del check["junit_xml"]
     payload = json.dumps(artifact, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
     try:
         write_text(path, payload, encoding="utf-8", newline="\n")
@@ -2083,7 +1982,6 @@ def _record_from_outcome(
     python: str | None = None,
     import_provenance: dict[str, Any] | None = None,
     runtime_environment: dict[str, Any] | None = None,
-    junit_xml_path: Path | None = None,
 ) -> dict[str, Any]:
     log_hash = _sha256_file(outcome.log_path) if outcome.log_path.exists() else ""
     record: dict[str, Any] = {
@@ -2103,29 +2001,6 @@ def _record_from_outcome(
         "import_provenance": import_provenance,
         "runtime_environment": runtime_environment,
     }
-    # #(ci-windows-durations): best-effort ONLY - a measurement artifact must
-    # never become a new way for the gate to block. pytest writes this file
-    # even when tests fail, but not on every crash/timeout of the pytest
-    # PROCESS itself (which is already correctly reflected in `status`
-    # independent of this field) - attach it only when it genuinely exists
-    # and is within the same size bound the primary log already enforces;
-    # otherwise omit the key entirely rather than recording broken evidence.
-    # FIX ROUND 1 (#231 F1, codex cold read dev-4): `.exists()`/`.stat()`/the
-    # hash read can ALSO raise OSError (permission error, the file vanishing
-    # between the check and the read, ...) - that must degrade to the same
-    # "omit the key" outcome, never propagate and abort the whole record
-    # (and with it the pytest outcome's own otherwise-fine evidence).
-    if junit_xml_path is not None:
-        try:
-            attach = junit_xml_path.exists() and junit_xml_path.stat().st_size <= MAX_CHECK_LOG_BYTES
-            if attach:
-                record["junit_xml"] = {"path": str(junit_xml_path), "sha256": _sha256_file(junit_xml_path)}
-        except OSError as exc:
-            print(
-                f"agenttalk dev-gate: {check_id}: junit-xml is a best-effort measurement "
-                f"artifact and could not be read ({exc}); omitted (check status unaffected)",
-                file=sys.stderr,
-            )
     return record
 
 
@@ -2682,13 +2557,25 @@ def _run_pytest_mode(
         )
     except GateBlock as exc:
         return _blocked_record(check_id, exc.detail, logs_dir)
-    # #(ci-windows-durations): a per-test timing record for CI-time measurement
-    # (git-spawn cost, bytecode effects, worker split, ...), same disambiguation
-    # as the existing per-check .log file (logs_dir / f"{check_id}.<ext>") so
-    # source and wheel runs across every python minor never collide. `--basetemp`
-    # is the existing precedent for a per-run dynamic flag that cannot live in
-    # the manifest's static, floor-pinned `args` list.
-    junit_path = logs_dir / f"{check_id}.junit.xml"
+    # RECAST (#231, stopping rule): a per-test timing record is DIAGNOSTICS,
+    # never evidence - three rounds of edge cases in the evidence-collection
+    # machinery for an optional, best-effort file (P1/F1, then P2, then a
+    # third cold read finding debris from a failed unlink()) showed an
+    # optional artifact must never live inside the hash-bound, integrity-
+    # checked evidence bundle at all. AGENTTALK_DEV_GATE_TIMINGS_DIR (env
+    # var, not a CLI option: _run_pytest_mode is deep below execute_gate's
+    # call stack, and an env var needs no signature threaded through every
+    # intermediate caller - same AGENTTALK_DEV_GATE_<PURPOSE> convention as
+    # the existing AGENTTALK_DEV_GATE_COMMITTED_SRC) is set only by
+    # tests.yml, pointing at a directory OUTSIDE the evidence bundle and
+    # outside anything write_run_evidence collects. When unset (local runs),
+    # no --junitxml is added at all - nothing about timings is hashed,
+    # bound, or collected by the gate.
+    timings_dir = os.environ.get("AGENTTALK_DEV_GATE_TIMINGS_DIR")
+    extra_args: list[str] = []
+    if timings_dir:
+        junit_path = Path(timings_dir) / f"{check_id}.junit.xml"
+        extra_args = ["--junitxml", str(junit_path)]
     argv = isolated_tool_argv(
         interpreter.path,
         "pytest",
@@ -2697,8 +2584,7 @@ def _run_pytest_mode(
         "no:cacheprovider",
         "--basetemp",
         str(basetemp),
-        "--junitxml",
-        str(junit_path),
+        *extra_args,
         *spec.get("paths", []),
         candidate_import_root=import_root if mode == "source" else None,
     )
@@ -2720,7 +2606,6 @@ def _run_pytest_mode(
         python=interpreter.requested,
         import_provenance=provenance,
         runtime_environment=runtime_environment,
-        junit_xml_path=junit_path,
     )
 
 
