@@ -10,10 +10,12 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
+from agenttalk.comprehension.privacy import VcsPrivacyRefused, run_privacy_preflight
 from agenttalk.store import Store
 
 
@@ -246,14 +248,89 @@ def comprehension_privacy_root(tmp_path: Path) -> Path:
     return tmp_path
 
 
+#: #223 fix round (PR #228): the substrings every TRANSIENT
+#: ``VcsPrivacyRefused`` message carries. ``"could not be trusted"`` covers
+#: the ls-files/check-ignore probes timing out; ``"is not inside a Git
+#: worktree"`` covers the FIRST git call (``rev-parse
+#: --is-inside-work-tree``) itself timing out — ``_run_git`` returns
+#: ``None``, ``_is_git_worktree`` returns ``False``, and
+#: ``run_privacy_preflight`` refuses with that message before it ever
+#: reaches the "could not be trusted" checks later in the same function.
+#: That message is ALSO the genuine, correct refusal for a root that
+#: really is not a git repo — treating it as transient here is safe ONLY
+#: because of this helper's one actual caller's own invariant: see the
+#: docstring below.
+_TRANSIENT_VCS_PRIVACY_REFUSAL_MARKERS = (
+    "could not be trusted",
+    "is not inside a Git worktree",
+)
+
+
+def _run_privacy_preflight_with_bounded_retry(root: Path, *, attempts: int = 4, delay: float = 0.5):
+    """#223: ``run_privacy_preflight`` shells out to real ``git`` (rev-parse,
+    ls-files, check-ignore), each bounded by ``privacy.GIT_TIMEOUT_SECONDS``
+    (2s). On a loaded Windows CI runner that timeout can occasionally trip
+    on a transient scheduling delay, not a real problem with the git
+    repo — ``subprocess.TimeoutExpired`` is a ``SubprocessError``, so
+    ``privacy._run_git``/``_run_git_with_stdin`` swallow it into ``None``
+    ("untrustworthy"), and the preflight correctly (fail-closed, product-
+    correct) refuses with a "could not be trusted" ``VcsPrivacyRefused``.
+
+    #223 fix round (PR #228): the SAME transient timeout can also hit the
+    very FIRST git call this function makes (``_is_git_worktree`` ->
+    ``rev-parse --is-inside-work-tree``), which produces a DIFFERENT
+    refusal message — "... is not inside a Git worktree (or git is
+    unavailable)" — that does not contain "could not be trusted" at all,
+    so the original (first fix round) retry missed this path entirely.
+    This helper's one actual caller, the ``comprehension_privacy``
+    fixture, is only ever handed :func:`comprehension_privacy_root`,
+    which has JUST run ``git init`` successfully against that exact
+    directory — so for THIS root, "not inside a Git worktree" can only
+    mean the rev-parse call itself timed out, never a genuine non-repo.
+    Treating it as transient is safe under that specific invariant, NOT
+    in general (a root that really isn't a git repo gets this exact same
+    message, correctly, and this helper would be wrong to retry that
+    case blindly — it just never sees that case in practice, because its
+    only caller never hands it one).
+
+    Ideally this would branch on a structured reason the exception
+    carries rather than matching message text — ``VcsPrivacyRefused``
+    carries only a free-text ``detail`` today, no machine-readable
+    "transient vs. genuine" marker. Adding one is a product-code change,
+    out of scope for this tests-only fix; worth a follow-up if this
+    class of flake needs a third fix round.
+
+    This fixture's whole job is to hand back a REAL, proven result for
+    tests whose subject is something else entirely (locking, publishing,
+    escalation, ...) — for THEM, an occasional transient refusal of
+    either shape is pure flake, not a signal. Retry the whole (idempotent,
+    read-only) preflight a bounded number of times before giving up, but
+    ONLY for the two transient marker strings above. A genuine refusal
+    (not ignored, already tracked, stageable, ...) is a real test-setup
+    bug, never transient, and must NOT be retried into silence: it
+    re-raises immediately, unbounded-retry-free, same as before this
+    fixture existed.
+    """
+    for attempt in range(attempts):
+        try:
+            return run_privacy_preflight(root)
+        except VcsPrivacyRefused as exc:
+            transient = any(marker in str(exc) for marker in _TRANSIENT_VCS_PRIVACY_REFUSAL_MARKERS)
+            if not transient or attempt + 1 >= attempts:
+                raise
+            time.sleep(delay)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
 @pytest.fixture
 def comprehension_privacy(comprehension_privacy_root: Path):
     """A REAL, proven ``PrivacyPreflightResult`` (``vcs_privacy ==
     "ignored"``), obtained by actually running ``run_privacy_preflight``
-    against :func:`comprehension_privacy_root`'s git fixture."""
-    from agenttalk.comprehension.privacy import run_privacy_preflight
-
-    return run_privacy_preflight(comprehension_privacy_root)
+    against :func:`comprehension_privacy_root`'s git fixture. #223: bounded
+    retry absorbs a transient "git could not be trusted" timeout on a
+    loaded CI host — see :func:`_run_privacy_preflight_with_bounded_retry`.
+    """
+    return _run_privacy_preflight_with_bounded_retry(comprehension_privacy_root)
 
 
 @pytest.fixture

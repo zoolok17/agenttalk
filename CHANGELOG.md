@@ -38,6 +38,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agenttalk install-skills --force
   ```
 
+### Fixed
+
+- **CI flake #223: comprehension tests no longer depend on a real `git
+  check-ignore` succeeding within 2 seconds.** Two Windows dev-gate legs
+  each hit one `VcsPrivacyRefused` error out of ~8.5k tests, on PRs that
+  never touch comprehension. Root cause: `run_privacy_preflight` shells
+  out to real `git` (rev-parse/ls-files/check-ignore), each call bounded
+  by `privacy.GIT_TIMEOUT_SECONDS` (2s); on a loaded Windows runner that
+  timeout can occasionally trip on scheduling delay alone, and
+  `subprocess.TimeoutExpired` (a `SubprocessError`) is caught the same as
+  a real git error, correctly producing a fail-closed "could not be
+  trusted" refusal — the product behavior here was already correct. The
+  flake was that the shared `comprehension_privacy` test fixture (used by
+  nearly every comprehension test, not just the ones testing privacy
+  itself) had no tolerance for that transient case. The fixture now
+  retries the whole (idempotent, read-only) preflight up to 4 times,
+  matched precisely to the "could not be trusted" refusal message so a
+  genuine, non-transient refusal (unignored content, already-tracked
+  paths, ...) still fails on the first attempt, exactly as before. The
+  dedicated privacy tests that exercise real refusals directly (never
+  through this fixture) are unchanged. `GIT_TIMEOUT_SECONDS` itself is
+  unchanged in this PR — worth a look on its own, see issue #223.
+
 ## [0.94.0] - 2026-09-28
 
 Theme: **a work board that moves itself, and seats that survive a busy store.**
