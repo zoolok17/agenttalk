@@ -43,17 +43,151 @@ def _serve(tmp_path: Path, *, enable_actions: bool = False):
     return web.serve_in_thread(s, host="127.0.0.1", port=0, enable_actions=enable_actions)
 
 
+# Issue #226: a local loopback request to the test server occasionally hits a transient
+# connection abort/reset (observed as `ConnectionAbortedError: [WinError 10053]` on Windows CI,
+# and once locally during a full-file run) - not a product defect, a harness one: every request
+# in this file funnels through these two helpers, so a bounded retry here covers all of them.
+# Each attempt is a brand-new `urlopen()` call (a fresh connection, never a reused/kept-alive
+# one), so a retry can never replay a request onto the same broken socket. Bounded, not
+# infinite: a PERSISTENT failure still raises after `_RETRY_ATTEMPTS`, never swallowed forever.
+#
+# FIX ROUND 1 (Codex connector P2, tests/test_web.py's `_urlopen` already handles this):
+# depending on where the abort lands, `urllib` surfaces it either as a BARE
+# `ConnectionAbortedError`/`ConnectionResetError` (raised out of `getresponse`) or the SAME
+# error WRAPPED in a `urllib.error.URLError` (raised out of `AbstractHTTPHandler.do_open` when
+# the abort lands while connecting/sending) - only the bare form was retried before, so the
+# flake survived depending on timing. `HTTPError` is a `URLError` SUBCLASS and is caught first,
+# unconditionally re-raised: `_status_of` relies on catching it for 403/404/405, never a
+# transient abort. Any OTHER `URLError` (a real failure, e.g. a bad host) is also re-raised
+# immediately, never retried.
+_RETRIABLE_SOCKET_ERRORS = (ConnectionAbortedError, ConnectionResetError)
+_RETRY_ATTEMPTS = 3
+
+
+def _urlopen_with_retry(url_or_request, *, timeout: float = 5):
+    last_exc: Exception | None = None
+    for _ in range(_RETRY_ATTEMPTS):
+        try:
+            return urllib.request.urlopen(url_or_request, timeout=timeout)  # noqa: S310  # nosec B310  # nosemgrep
+        except urllib.error.HTTPError:
+            raise  # a real HTTP status response - never a transient abort, never retried
+        except _RETRIABLE_SOCKET_ERRORS as exc:
+            last_exc = exc
+        except urllib.error.URLError as exc:
+            if not isinstance(exc.reason, _RETRIABLE_SOCKET_ERRORS):
+                raise  # a non-transient URLError - a real failure, do not mask it
+            last_exc = exc
+    assert last_exc is not None
+    raise last_exc
+
+
 def _get(url: str):
-    return urllib.request.urlopen(url, timeout=5)  # noqa: S310  # nosec B310  # nosemgrep
+    return _urlopen_with_retry(url)
 
 
 def _status_of(url: str, *, method: str = "GET", data: bytes | None = None) -> int:
     req = urllib.request.Request(url, method=method, data=data)  # noqa: S310  # nosec B310  # nosemgrep
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310  # nosec B310  # nosemgrep
+        with _urlopen_with_retry(req) as resp:
             return resp.status
     except urllib.error.HTTPError as exc:
         return exc.code
+
+
+def test_urlopen_retry_recovers_one_socket_abort_but_never_swallows_a_persistent_one(monkeypatch) -> None:
+    """Issue #226 regression: a single injected abort/reset must be retried transparently (the
+    exact class observed on CI, `ConnectionAbortedError`, plus its sibling `ConnectionResetError`);
+    a PERSISTENT one must still raise, bounded at `_RETRY_ATTEMPTS`, never retried forever."""
+    sentinel = object()
+    for exc_cls in (ConnectionAbortedError, ConnectionResetError):
+        calls = {"n": 0}
+
+        def flaky_once(*_args, _exc_cls=exc_cls, _calls=calls, **_kwargs):
+            _calls["n"] += 1
+            if _calls["n"] == 1:
+                raise _exc_cls("simulated transient local-socket abort")
+            return sentinel
+
+        monkeypatch.setattr(urllib.request, "urlopen", flaky_once)
+        assert _urlopen_with_retry("http://127.0.0.1:1/unused") is sentinel
+        assert calls["n"] == 2, "one retry, on a fresh call, recovered the request"
+
+    persistent_calls = {"n": 0}
+
+    def always_aborts(*_args, **_kwargs):
+        persistent_calls["n"] += 1
+        raise ConnectionAbortedError("simulated persistent local-socket abort")
+
+    monkeypatch.setattr(urllib.request, "urlopen", always_aborts)
+    with pytest.raises(ConnectionAbortedError):
+        _urlopen_with_retry("http://127.0.0.1:1/unused")
+    assert persistent_calls["n"] == _RETRY_ATTEMPTS, "bounded - never retried forever"
+
+
+def test_urlopen_retry_recovers_a_single_wrapped_url_error(monkeypatch) -> None:
+    """FIX ROUND 1 (#226 Codex connector P2): when the abort lands while urllib is
+    connecting/sending, `AbstractHTTPHandler.do_open` wraps it in `urllib.error.URLError`
+    instead of raising it bare - that wrapped form must be retried too, transparently,
+    exactly like the bare form already is."""
+    sentinel = object()
+    calls = {"n": 0}
+
+    def flaky_once(*_args, **_kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise urllib.error.URLError(ConnectionAbortedError("simulated wrapped abort"))
+        return sentinel
+
+    monkeypatch.setattr(urllib.request, "urlopen", flaky_once)
+    assert _urlopen_with_retry("http://127.0.0.1:1/unused") is sentinel
+    assert calls["n"] == 2, "one retry, on a fresh call, recovered the request"
+
+
+def test_urlopen_retry_raises_after_bound_on_persistent_wrapped_url_error(monkeypatch) -> None:
+    """A PERSISTENT wrapped abort must still raise, bounded at `_RETRY_ATTEMPTS`, never
+    retried forever - same bound as the bare-exception case."""
+    calls = {"n": 0}
+
+    def always_aborts(*_args, **_kwargs):
+        calls["n"] += 1
+        raise urllib.error.URLError(ConnectionAbortedError("simulated persistent wrapped abort"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", always_aborts)
+    with pytest.raises(urllib.error.URLError):
+        _urlopen_with_retry("http://127.0.0.1:1/unused")
+    assert calls["n"] == _RETRY_ATTEMPTS, "bounded - never retried forever"
+
+
+def test_urlopen_retry_never_retries_http_error(monkeypatch) -> None:
+    """`HTTPError` is a `URLError` SUBCLASS - it is a real HTTP status response, never a
+    transient abort, and must be raised on the FIRST call: `_status_of` relies on catching
+    it for 403/404/405."""
+    calls = {"n": 0}
+
+    def raises_http_error(*_args, **_kwargs):
+        calls["n"] += 1
+        raise urllib.error.HTTPError("http://127.0.0.1:1/unused", 404, "Not Found", None, None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", raises_http_error)
+    with pytest.raises(urllib.error.HTTPError):
+        _urlopen_with_retry("http://127.0.0.1:1/unused")
+    assert calls["n"] == 1, "an HTTP status response is never retried"
+
+
+def test_urlopen_retry_never_retries_a_non_connection_url_error(monkeypatch) -> None:
+    """A `URLError` whose `.reason` is NOT one of the intended connection errors is a real
+    failure (e.g. a bad host/DNS lookup) - it must be raised on the FIRST call, never masked
+    by a retry."""
+    calls = {"n": 0}
+
+    def raises_unrelated_url_error(*_args, **_kwargs):
+        calls["n"] += 1
+        raise urllib.error.URLError("nodename nor servname provided, or not known")
+
+    monkeypatch.setattr(urllib.request, "urlopen", raises_unrelated_url_error)
+    with pytest.raises(urllib.error.URLError):
+        _urlopen_with_retry("http://127.0.0.1:1/unused")
+    assert calls["n"] == 1, "a non-connection URLError is never retried"
 
 
 def _read(name: str) -> str:

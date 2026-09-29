@@ -158,6 +158,12 @@ Theme: **a work board that moves itself, and seats that survive a busy store.**
 - Isolate `wb.` gates from root checks and both gate-HOLD attention paths; refuse
   new board names in root requirements and warn about legacy contaminated lists.
 
+- Fix CI flake #226: `tests/test_console2_web.py`'s local-loopback request helpers
+  now retry a transient connection abort/reset (observed as `WinError 10053` on
+  Windows CI, and once locally), bounded and always on a fresh connection, never
+  swallowing a persistent failure. Test harness only; every read-only, GET-only
+  and CSP assertion is unchanged.
+
 ## [0.93.0] - 2026-09-27
 
 Theme: **challenge major work before it starts, and run acceptance on a pinned,
