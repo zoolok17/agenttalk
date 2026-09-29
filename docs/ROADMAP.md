@@ -1,9 +1,9 @@
 # agenttalk - Product Roadmap & Feasibility
 
-**Status:** Official · **Owner:** lead (operator-facing) · **Last updated:** 2026-09-27 (UTC)
+**Status:** Official · **Owner:** lead (operator-facing) · **Last updated:** 2026-09-29 (UTC)
 **Audience:** maintainers, operators, and agents deciding what to build next.
 **Horizon:** the next release (v0.94.0) in detail, then a ranked "next" tier and a labelled "later" tier.
-**Current shipped baseline:** v0.93.0 (2026-09-27). `CHANGELOG.md` remains the release-history source of truth.
+**Current shipped baseline:** v0.94.0 (2026-09-28). `CHANGELOG.md` remains the release-history source of truth.
 
 **Platform requirement:** agenttalk must run on **Windows, macOS, and Linux**. The Python core (bus, store, CLI, wrapper) is cross-platform and CI-tested on all three (Windows/macOS/Ubuntu × Python 3.10–3.13). The model gateway has a Windows scheduled-task backend and, since v0.91.0, a Linux systemd `--user` backend. **The supervisor is still the open platform gap:** it needs PowerShell Core 7+ and the Windows-only `Win32_Process`. A POSIX supervisor path is unbuilt (§6.1 G5, §8).
 
@@ -94,21 +94,26 @@ By theme. Versions are in brackets; details are in `CHANGELOG.md`.
 - **Acceptance of major work:** cooperative acceptance passes on `close` [0.92]; the pinned, offline-checked tool registry, preflight and schema-4 closes [0.93]; fewer git spawns in the acceptance suite [0.93].
 - **Challenge before building** [0.93]: the `agenttalk.challenge` skill. It is mandatory for major work. A malformed, contaminated or late verdict counts as unassessed, never as proceed, and only the operator overrides replace/defer/stop.
 - **Work board foundations** [0.93]: validated work-item tags, normalized reply verdicts, and supersession.
+- **The first work board delivery** [0.94]: the reducer, the bounded feed and gate isolation, the shared needs-you projection, and the board view at `/v2#board`, inside the console v2 preview.
+- **Seats survive store-lock contention** [0.94] (#218): phase-specific in-place retry that never re-drives a completed paid turn.
 
 ---
 
-## 5. Now: the v0.94.0 Line
+## 5. Shipped: the v0.94.0 Line (2026-09-28)
 
-**Theme: a work board that moves itself.** The first delivery of #207, together with the console v2 preview it renders in. The acceptance test is the operator's own walkthrough on live data; there is no scripted demo.
+**Theme: a work board that moves itself, and seats that survive a busy store.** The first delivery of #207 and the console v2 preview it renders in both shipped in v0.94.0. The acceptance test is the operator's own walkthrough on live data (the script is in `docs/STEP-WORK-BOARD.md`); there is no scripted demo.
 
-| Item | What | State (2026-09-27) |
+| Item | What | State (2026-09-29) |
 |---|---|---|
-| Board data layer | Vendor records and escalation links (B2b, #212). A shared per-root envelope snapshot that includes compacted archives (B4a+B4s, #213). | **Merged to master** |
-| Pure causal reducer (B3a+B3b) | Derives each card's stage from bus evidence, with a read-side audit. A stage the data cannot prove shows as unknown. It stops with a documented residual rather than chasing edge cases, unless a realistic false Ready/Done is found. | Reviewed GO; CI (PR #215) |
-| Bounded feed + gate isolation (B6a) | Active cards plus 7 days of Done, capped by count and size with overflow visible; zero message-file reads on the HTTP thread. Board gates never block an ordinary merge check. | Cold read GO; PR next |
-| Console v2 preview + board UI | The v2 preview at `/v2` (#214). Then the shared "needs you" projection (B7) and the console model, cards and walkthrough (B8). GET only, text-only rendering, and no stale state shown as live. | #214 reviewed, CI; B7/B8 after #214 and B6a |
+| Board data layer | Vendor records and escalation links (B2b); a shared per-root envelope snapshot that includes compacted archives (B4a+B4s). | Shipped in 0.94.0 |
+| Pure causal reducer (B3a+B3b) | Derives each card's stage from bus evidence, with a read-side audit. A stage the data cannot prove shows as unknown. | Shipped in 0.94.0 |
+| Bounded feed + gate isolation (B6a) | Active cards plus 7 days of Done, capped and with overflow visible; board gates never block an ordinary merge check. | Shipped in 0.94.0 |
+| Console v2 preview + board UI | `/v2` (#214), the shared needs-you projection (B7) and the board view (B8): GET only, text-only rendering, and stale or expired data dimmed as "last known". | Shipped in 0.94.0; the operator walkthrough is pending |
+| Seats survive store-lock contention (#218) | Phase-specific in-place retry; no re-driven paid turn; corruption and ownership loss stay fatal. | Shipped in 0.94.0 |
 
-**Fleet upgrade:** the maintainers' seats skip a 0.93.0 runtime and upgrade **once, to 0.94.0**: one runtime build, one pin change, one full-fleet relaunch.
+**Fleet upgrade:** done on 2026-09-28. The seven Claude and Codex seats run the v0.94.0 runtime. The two gateway-backed seats stay on v0.91.1 for now: they use their own launcher, and the gateway upgrade is a separate decision.
+
+**After the release, on master:** spec-kitty support removed entirely (§6.4), and the lead skill's assignment example now uses tagged `task` dispatches.
 
 **Deferred board slices** (designed, not scheduled for 0.94.0):
 - lead-authorized rescind (B2c);
@@ -358,12 +363,12 @@ Do not ship broad workflow claims if any of these are true:
 
 ---
 
-## 12. Known Limitations (2026-09-27)
+## 12. Known Limitations (2026-09-29)
 
 - **The supervisor** is PowerShell Core + `Win32_Process`-bound, and it is not run on the maintainers' fleet. Dead seats are relaunched by hand (§6.1).
 - **Publications serialize on one store-wide guard.** Several sends back to back can make waiting wrappers exit without a crash record (#154).
 - **Wrapped seat turns start only on a message.** Unfinished multi-turn work waits for the next message (#139).
-- **After a release bump,** tasks to seats not yet relaunched on the new version are refused (#185).
+- **After a release bump,** tasks to seats not yet relaunched on the new version are refused (#185). The version check covers the whole roster (#201), so a `task` to an upgraded seat is refused too while any roster member runs an older build. Point-to-point sends need `--force` until every seat is upgraded.
 - **`drain | head` can consume mail that was never displayed** (#37).
 - **The work board is read-only by design.** A stage the evidence cannot prove shows as unknown, and the reducer carries a documented seven-point residual (`docs/STEP-WORK-BOARD.md` on branch `feat/work-board-b3a`, landing with PR #215).
 - **Windows CI** runs its serial suite near the one-hour ceiling (#151). Guard-timeout flakes recur on slow runners (#171).
