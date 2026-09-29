@@ -54,12 +54,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nearly every comprehension test, not just the ones testing privacy
   itself) had no tolerance for that transient case. The fixture now
   retries the whole (idempotent, read-only) preflight up to 4 times,
-  matched precisely to the "could not be trusted" refusal message so a
+  matched precisely to the "could not be trusted" refusal and to the "not
+  inside a Git worktree" refusal that a timed-out first git call produces
+  (safe only because the fixture has just run `git init` on that root), so a
   genuine, non-transient refusal (unignored content, already-tracked
   paths, ...) still fails on the first attempt, exactly as before. The
   dedicated privacy tests that exercise real refusals directly (never
   through this fixture) are unchanged. `GIT_TIMEOUT_SECONDS` itself is
   unchanged in this PR — worth a look on its own, see issue #223.
+
+- Fix CI flake #226: `tests/test_console2_web.py`'s local-loopback request helpers
+  now retry a transient connection abort/reset, bare or wrapped in `URLError`
+  (observed as `WinError 10053` on Windows CI, and once locally), bounded and
+  always on a fresh connection, never
+  swallowing a persistent failure. Test harness only; every read-only, GET-only
+  and CSP assertion is unchanged.
 
 ## [0.94.0] - 2026-09-28
 
@@ -157,12 +166,6 @@ Theme: **a work board that moves itself, and seats that survive a busy store.**
 
 - Isolate `wb.` gates from root checks and both gate-HOLD attention paths; refuse
   new board names in root requirements and warn about legacy contaminated lists.
-
-- Fix CI flake #226: `tests/test_console2_web.py`'s local-loopback request helpers
-  now retry a transient connection abort/reset (observed as `WinError 10053` on
-  Windows CI, and once locally), bounded and always on a fresh connection, never
-  swallowing a persistent failure. Test harness only; every read-only, GET-only
-  and CSP assertion is unchanged.
 
 ## [0.93.0] - 2026-09-27
 
