@@ -70,6 +70,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   swallowing a persistent failure. Test harness only; every read-only, GET-only
   and CSP assertion is unchanged.
 
+- Fix CI flake #229: the console2 real-browser check's DevTools startup wait was a
+  fixed 200x150ms attempt budget (~30s), which starved out on a slow/loaded CI
+  runner even though the browser process was still healthily starting. Startup
+  (DevTools up, then a page target in `/json/list`) now shares ONE 90s budget;
+  each request is bounded by its own abort signal, retries are paced, a browser
+  exit fails immediately with its exit code and stderr, and a deadline failure
+  keeps the stderr too. The fixture's accelerated age clock now starts on the
+  first request, so a slow startup no longer skews the redraw checks, and the
+  Python caller's subprocess timeout is 240s to fit the worst case. Test harness
+  only; every scroll/focus/visibility/sabotage-detection assertion is unchanged.
+
 ### Changed
 
 - **Dev gate: record per-test durations (measurement only).** Windows dev-gate
