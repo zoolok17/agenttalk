@@ -39,14 +39,21 @@ jobs:
       # one job whose Windows leg needs those symlink tests to execute.
       AGENTTALK_AUTHORIZE_SYMLINK_DEVMODE: ${{ matrix.os.id == 'windows' && '1' || '' }}
     # Per-OS ceiling: the two pytest runs (source + wheel) are each capped at
-    # 5400s in dev-gate.json. Measured 2026-09-25 with the acceptance suite:
-    # Windows pytest takes ~55-65 min per run (~2h10 per leg; each acceptance
-    # test spawns ~70 git processes), so the Windows ceiling is 180 min.
-    # The Windows runner's slow filesystem + costly process/venv creation push
-    # its wall time up to that ceiling, leaving no headroom for setup and the
-    # other per-leg checks — the leg is then killed by duration, not by a test
-    # failure. Windows gets a wider ceiling; the fast Linux/macOS legs keep a
-    # tight cap so a genuine hang there still fails quickly.
+    # 7200s in dev-gate.json (raised from 5400s). Measured 2026-09-29 (the
+    # 09-25 "~55-65 min per run" figure above was already stale): PR #230's
+    # dev-gate windows/3.11 run (36559648529) had its SOURCE pytest killed at
+    # the 5400s cap at 93% complete with no failing test; its wheel run took
+    # 5085s (94% of that cap); the job used 177 of its 180 min ceiling.
+    # Windows legs generally now take 125-177 min. So the Windows job ceiling
+    # is 270 min: two pytest runs each capped at 7200s (120 min) plus roughly
+    # 30 min for setup and the other per-leg checks, within GitHub's 360-min
+    # job maximum. The Windows runner's slow filesystem + costly process/venv
+    # creation push its wall time up to that ceiling, leaving no headroom for
+    # setup and the other per-leg checks — the leg is then killed by
+    # duration, not by a test failure. Windows gets a wider ceiling; the fast
+    # Linux/macOS legs keep a tight cap so a genuine hang there still fails
+    # quickly. This is a stopgap (following the #197 precedent, 87c529a) -
+    # the real fix follows a per-test duration measurement.
     timeout-minutes: ${{ matrix.os.timeout_minutes }}
     strategy:
       fail-fast: false
@@ -57,7 +64,7 @@ jobs:
             timeout_minutes: 90
           - id: windows
             runner: windows-latest
-            timeout_minutes: 180
+            timeout_minutes: 270
           - id: macos
             runner: macos-latest
             timeout_minutes: 90
