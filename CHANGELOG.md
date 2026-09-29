@@ -81,6 +81,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Python caller's subprocess timeout is 240s to fit the worst case. Test harness
   only; every scroll/focus/visibility/sabotage-detection assertion is unchanged.
 
+- **Work board Done lane made reachable (operator feedback 2026-09-29).**
+  `work_board.reduce(..., integrated=...)` only ever placed an item in Done
+  when the caller supplied a true integration fact, but the live server's
+  `envelope_snapshot.py` never passed `integrated=` at all - merged work sat
+  in fix_round/independent_review forever (0 done with 27 live items,
+  despite #227/#228/#230/#233 all being merged). The envelope worker (the
+  only place allowed to run IO here, never a polling handler) now supplies
+  it: a cheap preliminary reduce finds each item's candidate head and its
+  declared `work_target`, then one bounded, local `git merge-base
+  --is-ancestor <head> <target>` subprocess per DISTINCT head decides
+  integration - cached for the life of the worker, so a head is never
+  re-checked. No fetch, no network. A candidate with no declared
+  `work_target` falls back to whichever of `master`/`main` resolves locally;
+  an unknown commit, a missing git binary or a timeout all degrade to "not
+  integrated" plus a diagnostic in the board's `errors`, never an exception -
+  a missing `work_head` (the lead's own dispatch practice gap, being fixed
+  separately) still keeps items out of Done with their existing reason,
+  exactly as before.
+
 ### CI
 
 - **Windows CI capacity stopgap.** Master run 36571318073 (`e6b6421`) killed

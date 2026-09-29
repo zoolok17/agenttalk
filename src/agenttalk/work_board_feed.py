@@ -60,12 +60,19 @@ def bounded(feed, *, card_limit=100, byte_limit=256 * 1024):
     return feed
 
 
+def snapshot_messages(snapshot):
+    """The same active/compacted, deduplicated Message list build() reduces - shared with the
+    envelope worker (B5) so it can run its OWN preliminary reduce (for candidate/target facts)
+    against the identical message set, without re-deriving this de-duplication logic."""
+    # Identical active/compacted copies count once. Conflicts are rejected by closure coverage.
+    found = {e.id: e for e in (*snapshot.archives, *snapshot.envelopes)}
+    return [Message.from_dict(e.fields) for e in found.values()]
+
+
 def build(snapshot, *, project, lead, gate_state, now=None, integrated=None,
           envelope_limit=50000, source_byte_limit=128 * 1024 * 1024, **bounds):
     now = now or datetime.now(timezone.utc)
-    # Identical active/compacted copies count once. Conflicts are rejected by closure coverage.
-    found = {e.id: e for e in (*snapshot.archives, *snapshot.envelopes)}
-    messages = [Message.from_dict(e.fields) for e in found.values()]
+    messages = snapshot_messages(snapshot)
     preliminary = work_board.reduce(messages, lead=lead, integrated=integrated)
     checks = {(i["work_item"], i["cycle"]): gates.check_board(
         None, project=project, item=i["work_item"], cycle=i["cycle"], revision=i["candidate"],

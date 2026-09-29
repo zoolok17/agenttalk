@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 
 from agenttalk import signing
+from agenttalk.work_board_integration import GitAncestryCache, compute_integrated, resolve_default_target
 
 
 def _digest(value):
@@ -118,6 +119,7 @@ class SnapshotService:
         self.current = None
         self._board = None
         self._board_error = None
+        self._git_cache = GitAncestryCache(self.store.root)
         self.error = None
         self._lock = threading.Lock()
         self._busy = False
@@ -231,12 +233,25 @@ class SnapshotService:
                              sum(s[2] for s in (*before.values(), *archive_before.values())),
                              self.clock() - start, archives, complete, archive_invalid)
             # Reduction and gate IO belong to this worker, never a polling handler.
-            from agenttalk import gates, work_board_feed
+            from agenttalk import gates, work_board, work_board_feed
             board_error = None
             try:
-                board = work_board_feed.build(value, project=self.store.project_id(),
-                                              lead=self.store.sole_lead(),
-                                              gate_state=gates.load_gate_state(self.store.root))
+                # B5: local git ancestry supplies the "integrated" fact the reducer needs to ever
+                # place an item in Done (design row 3). A cheap preliminary reduce (no integration
+                # facts yet - they do not affect candidate/target computation) finds every
+                # candidate head and its declared work_target; one bounded `git merge-base
+                # --is-ancestor` subprocess per DISTINCT head then resolves each, cached on this
+                # worker for the life of the service. Never a fetch, never the network.
+                lead = self.store.sole_lead()
+                preliminary = work_board.reduce(work_board_feed.snapshot_messages(value), lead=lead)
+                default_target = resolve_default_target(self.store.root)
+                integrated, diagnostics = compute_integrated(
+                    preliminary["items"], cache=self._git_cache, default_target=default_target)
+                board = work_board_feed.build(value, project=self.store.project_id(), lead=lead,
+                                              gate_state=gates.load_gate_state(self.store.root),
+                                              integrated=integrated)
+                for (work_item, head), reason in sorted(diagnostics.items()):
+                    board["errors"].append(f"integration check for {work_item}@{head[:12]}: {reason}")
                 if board["coverage"]["status"] != "complete" and self._board:
                     board["items"] = copy.deepcopy(self._board["items"])
                     board["last_known"] = True
