@@ -7,7 +7,14 @@ import time
 from dataclasses import dataclass
 
 from agenttalk import signing
-from agenttalk.work_board_integration import GitAncestryCache, compute_integrated, resolve_default_target
+from agenttalk.work_board_integration import GitAncestryCache, integration_fact_for
+
+#: M4 (fix round 1): the whole candidate set is bounded by this aggregate wall-clock
+#: budget per refresh cycle, checked between items (never mid-probe) alongside
+#: shutdown - a slow or hung git observation must never block active-state publication
+#: (which now happens BEFORE any git probe runs at all) or make close() wait out the
+#: whole set.
+GIT_PROBE_BUDGET_SECONDS = 8.0
 
 
 def _digest(value):
@@ -111,15 +118,17 @@ class MembershipChanged(ValueError):
 
 class SnapshotService:
     """One worker-owned generation per root; polling reads only the published value."""
-    def __init__(self, store, *, clock=time.monotonic, archive_slice_limit=1000):
+    def __init__(self, store, *, clock=time.monotonic, archive_slice_limit=1000,
+                 probe_budget_seconds=GIT_PROBE_BUDGET_SECONDS):
         self.store, self.clock = store, clock
         self._archive_slice_limit = archive_slice_limit
+        self._probe_budget_seconds = probe_budget_seconds
         self._cache, self._cache_trust = {}, None
         self._archive_error = None
         self.current = None
         self._board = None
         self._board_error = None
-        self._git_cache = GitAncestryCache(self.store.root)
+        self._git_cache = GitAncestryCache(clock=clock)
         self.error = None
         self._lock = threading.Lock()
         self._busy = False
@@ -232,21 +241,34 @@ class SnapshotService:
                              entries, len(before) + len(archive_before),
                              sum(s[2] for s in (*before.values(), *archive_before.values())),
                              self.clock() - start, archives, complete, archive_invalid)
-            # Reduction and gate IO belong to this worker, never a polling handler.
+            # M4 (fix round 1): publish ACTIVE state now, BEFORE any git observation - a slow or
+            # hung git probe must never delay /api/state's own freshness. `started` (used by
+            # active()'s 15s window) was captured before any of the scanning/reduction/board work
+            # in this function even began, so publishing right after `value` exists keeps that
+            # window honest regardless of how long the optional board/git work below takes.
+            with self._lock:
+                if generation != self._generation:
+                    return False
+                self._generation += 1
+                published_generation = self._generation
+                self.current, self.error = value, None
+                self._archive_error = archive_error
+                if isinstance(archive_error, MembershipChanged):
+                    self._retry_at = self.clock() + .25
+                    self._wake.set()
+            # Reduction and gate IO belong to this worker, never a polling handler. Git
+            # observation runs LAST and is itself bounded/cancellable (_integration_facts) so it
+            # can never block the active-state publish above or make close() wait it out.
             from agenttalk import gates, work_board, work_board_feed
             board_error = None
             try:
                 # B5: local git ancestry supplies the "integrated" fact the reducer needs to ever
                 # place an item in Done (design row 3). A cheap preliminary reduce (no integration
                 # facts yet - they do not affect candidate/target computation) finds every
-                # candidate head and its declared work_target; one bounded `git merge-base
-                # --is-ancestor` subprocess per DISTINCT head then resolves each, cached on this
-                # worker for the life of the service. Never a fetch, never the network.
+                # candidate head and its declared work_repo/work_target.
                 lead = self.store.sole_lead()
                 preliminary = work_board.reduce(work_board_feed.snapshot_messages(value), lead=lead)
-                default_target = resolve_default_target(self.store.root)
-                integrated, diagnostics = compute_integrated(
-                    preliminary["items"], cache=self._git_cache, default_target=default_target)
+                integrated, diagnostics = self._integration_facts(preliminary["items"], cfg)
                 board = work_board_feed.build(value, project=self.store.project_id(), lead=lead,
                                               gate_state=gates.load_gate_state(self.store.root),
                                               integrated=integrated)
@@ -259,16 +281,10 @@ class SnapshotService:
             except Exception as exc:  # board failures must not disable active /api/state
                 board, board_error = self._board, type(exc).__name__
             with self._lock:
-                if generation != self._generation:
-                    return False
-                self._generation += 1
-                self.current, self.error = value, None
+                if published_generation != self._generation:
+                    return False  # a newer refresh/invalidate already superseded this board
                 self._board = board
                 self._board_error = board_error
-                self._archive_error = archive_error
-                if isinstance(archive_error, MembershipChanged):
-                    self._retry_at = self.clock() + .25
-                    self._wake.set()
             return True
         except Exception as exc:  # errors-as-data, preserving the last published generation
             with self._lock:
@@ -280,6 +296,26 @@ class SnapshotService:
         finally:
             with self._lock:
                 self._busy = False
+
+    def _integration_facts(self, items, cfg):
+        """M4: bounded, cancellable - an aggregate wall-clock budget plus a stop-check between
+        every item, so a slow or hung git observation can never grind through the whole
+        candidate set, and shutdown does not wait for it. Anything not reached this cycle is
+        simply left out of `integrated` (the reducer already treats an absent fact as "not
+        integrated" - safe, conservative, and retried on the next cycle)."""
+        integrated, diagnostics = {}, {}
+        deadline = self.clock() + self._probe_budget_seconds
+        for item in items:
+            if self._stop.is_set() or self.clock() >= deadline:
+                break
+            fact = integration_fact_for(item, cfg, self._git_cache)
+            if fact is None:
+                continue
+            key, ok, why = fact
+            integrated[key] = ok
+            if why:
+                diagnostics[key] = why
+        return integrated, diagnostics
 
     def active(self, cfg):
         with self._lock:

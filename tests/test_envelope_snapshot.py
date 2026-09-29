@@ -269,3 +269,62 @@ def test_worker_runs_scheduled_membership_retry_without_normal_poll_delay(bus, m
         assert snapshot.error is None
     finally:
         snapshot.close()
+
+
+# ----------------------------------------------- M4 (B5 fix round 1): bounded git observation
+
+def test_git_observation_never_delays_active_state_publication(bus, monkeypatch):
+    """M4: a slow (or hung) git-observation phase must never delay /api/state's own
+    freshness. Active state is published BEFORE _integration_facts ever runs, so a
+    refresh() still blocked deep inside it must not stop another thread from reading a
+    fresh, complete snapshot."""
+    now = [0.0]
+    snapshot = service(bus, clock=lambda: now[0])
+    entered, release = threading.Event(), threading.Event()
+    def blocked(items, cfg):
+        entered.set()
+        assert release.wait(5)
+        return {}, {}
+    monkeypatch.setattr(snapshot, "_integration_facts", blocked)
+    with ThreadPoolExecutor() as pool:
+        first = pool.submit(snapshot.refresh)
+        assert entered.wait(5), "refresh() must have reached git observation by now"
+        rows, invalid = snapshot.active(bus.load_config())  # must not raise/block
+        assert snapshot.coverage()["status"] == "complete"
+        release.set()
+        assert first.result() is True
+
+
+def test_integration_facts_stop_flag_cancels_mid_batch_not_the_whole_set(bus, monkeypatch):
+    """M4: shutdown must not wait for the whole candidate set - the loop checks _stop
+    BETWEEN items, never mid-probe, so setting it (as close() does) after the first
+    item stops the batch there, leaving the rest simply unchecked this cycle."""
+    snapshot = service(bus)
+    calls = []
+    def fake_fact(item, cfg, cache):
+        calls.append(item["work_item"])
+        if len(calls) == 1:
+            snapshot._stop.set()
+        return (item["work_item"], "a" * 40), False, None
+    monkeypatch.setattr("agenttalk.envelope_snapshot.integration_fact_for", fake_fact)
+    items = [{"work_item": f"item-{i}", "candidate": "a" * 40} for i in range(5)]
+    integrated, diagnostics = snapshot._integration_facts(items, {})
+    assert len(calls) == 1
+    assert integrated == {("item-0", "a" * 40): False}
+
+
+def test_integration_facts_respects_an_aggregate_probe_budget(bus, monkeypatch):
+    """M4: an aggregate wall-clock budget across the WHOLE candidate set, not just a
+    per-probe timeout - even if every individual probe reports back promptly, the
+    batch as a whole cannot run unbounded."""
+    now = [0.0]
+    snapshot = service(bus, clock=lambda: now[0], probe_budget_seconds=1.0)
+    calls = []
+    def fake_fact(item, cfg, cache):
+        calls.append(item["work_item"])
+        now[0] += 2.0  # this single probe alone already exceeds the 1s aggregate budget
+        return (item["work_item"], "a" * 40), False, None
+    monkeypatch.setattr("agenttalk.envelope_snapshot.integration_fact_for", fake_fact)
+    items = [{"work_item": f"item-{i}", "candidate": "a" * 40} for i in range(5)]
+    snapshot._integration_facts(items, {})
+    assert len(calls) == 1

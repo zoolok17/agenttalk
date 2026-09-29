@@ -376,7 +376,8 @@ def _item(slug, reqs, orphans, facts):
         evidence = sorted({i for r in reqs for i in r["openers"]} | {i for _, ids in orphans for i in ids})
         return {"work_item": slug, "title": None, "cycle": None, "legacy_cycle": True, "round": None,
                 "candidate": None, "builders": [], "verdicts": {}, "obligations": [], "incidents": [],
-                "issues": [], "previous_cycles": [], "checks": None, "integration": {}, "work_target": None,
+                "issues": [], "previous_cycles": [], "checks": None, "integration": {},
+                "work_target": None, "work_repo": None,
                 "column": "unknown", "workflow_column": "unknown", "row": 2,
                 "reason": f"{FAULT} ({type(exc).__name__})", "evidence": evidence}
 
@@ -384,7 +385,7 @@ def _item(slug, reqs, orphans, facts):
 def _evaluate_item(slug, reqs, orphans, facts):
     item = {"work_item": slug, "title": None, "cycle": None, "legacy_cycle": True, "round": None,
             "candidate": None, "builders": [], "verdicts": {}, "obligations": [], "incidents": [],
-            "issues": [], "previous_cycles": [], "checks": None, "work_target": None,
+            "issues": [], "previous_cycles": [], "checks": None, "work_target": None, "work_repo": None,
             "integration": dict(sorted((head, value) for (item_slug, head), value in facts["integrated"].items()
                                        if item_slug == slug))}
     if not reqs:
@@ -425,10 +426,12 @@ def _evaluate_item(slug, reqs, orphans, facts):
     for entries in item["verdicts"].values():
         entries.sort(key=lambda e: (e["reviewer"], e["reply"]))
     policy = _policy(slug, valid, cur, current, facts) if current is not None else {
-        "conflict": None, "problem": ("check policy missing", []), "label": None, "target": None}
+        "conflict": None, "problem": ("check policy missing", []), "label": None,
+        "target": None, "repo": None}
     item["checks"] = policy["label"]
     item["check_keys"] = policy.get("keys")
     item["work_target"] = policy.get("target")  # B5: declared merge-target branch, else None
+    item["work_repo"] = policy.get("repo")  # B5: declared work_repo alias, else None
     if policy["conflict"]:
         conflicts.append(policy["conflict"])
     obs = [o for r in cur for o in r["obligations"]]
@@ -608,15 +611,17 @@ def _policy(slug, valid, cur, current, facts):
             break
     evidence = [i for r in sources for i in r["openers"]]
     declared = {r["policy"] for r in sources if r["policy"]}
-    result = {"conflict": None, "problem": None, "label": None, "target": None}
+    result = {"conflict": None, "problem": None, "label": None, "target": None, "repo": None}
     if len(declared) > 1:
         result["conflict"] = ("conflicting repository/check policies", evidence)
         return result
     if not sources or any(r["policy"] is None for r in sources):
         result["problem"] = ("check policy missing", evidence)  # section 2: missing is unknown, never empty
         return result
-    _repo, _branch, target, gates, reason = declared.pop()
-    result["target"] = target  # B5: the declared work_target, surfaced for the integration fact seam
+    repo, _branch, target, gates, reason = declared.pop()
+    # B5: the declared work_repo/work_target, surfaced for the integration fact seam (design
+    # section 4: work_repo selects an operator-approved local alias, never a raw path).
+    result["repo"], result["target"] = repo, target
     result["keys"] = list(gates) if gates is not None else None
     if gates and reason:
         result["problem"] = ("no_gates_reason conflicts with required gates", evidence)
