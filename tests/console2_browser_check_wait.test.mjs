@@ -68,6 +68,20 @@ test('waitForDeadline: checkExited fails FAST and clearly - never waits out the 
   assert.ok(clock.now() < 90000, 'did not wait out the deadline - failed fast instead');
 });
 
+test('N1 regression (connector P2): a deadline-expired failure includes accumulated stderr, like the fatal-exit path does', async () => {
+  // The browser can stay ALIVE (no exit -> no FatalExitError) while never exposing the DevTools
+  // endpoint - exactly the slow-startup path this whole change exists to diagnose. The old,
+  // pre-#229 fixed-attempt-budget error always included the accumulated stderr; this path must too.
+  const clock = fakeClock();
+  await assert.rejects(
+    () => waitForDeadline(async () => undefined, {
+      deadline: makeDeadline(5000, clock), intervalMs: 150, describe: 'the thing', sleep: clock.sleep,
+      getDiagnostics: () => 'stderr:\nheadless dbus noise',
+    }),
+    /the thing did not happen within the shared budget; stderr:\nheadless dbus noise/,
+  );
+});
+
 // -------------------------------------------------------- PR #230 delta review, F2: one budget
 
 test('F2 regression: two waits sharing ONE deadline stay bounded by that ONE budget, not doubled', async () => {

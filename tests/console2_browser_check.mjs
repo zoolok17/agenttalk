@@ -75,13 +75,21 @@ export class FatalExitError extends Error {
 // exit code/stderr intact, from anywhere inside `fn`. Every dependency is injectable (`sleepFn`)
 // so this is unit-testable against a stub with no real browser, process or timers - see
 // console2_browser_check_wait.test.mjs.
-export async function waitForDeadline(fn, { deadline, intervalMs = 150, sleep: sleepFn = sleep, checkExited, describe } = {}) {
+export async function waitForDeadline(fn, {
+  deadline, intervalMs = 150, sleep: sleepFn = sleep, checkExited, describe, getDiagnostics,
+} = {}) {
   let pending = null;   // the in-flight fn() attempt, if any is still outstanding from a prior tick
   for (;;) {
     const exitedBefore = checkExited && checkExited();
     if (exitedBefore) throw new FatalExitError(describe, exitedBefore);
     if (deadline.expired()) {
-      throw new Error(`${describe || 'condition'} did not happen within the shared budget`);
+      // Connector P2 (N1): the browser can stay ALIVE (no exit, so no FatalExitError) while never
+      // exposing the DevTools endpoint - exactly the slow-startup path this whole change exists to
+      // diagnose. The old fixed-attempt-budget error always included the accumulated stderr; this
+      // one must too, not only the (already-covered) fatal-exit path.
+      const extra = getDiagnostics && getDiagnostics();
+      throw new Error(`${describe || 'condition'} did not happen within the shared budget`
+        + (extra ? `; ${extra}` : ''));
     }
     if (pending === null) {
       pending = (async () => {
@@ -284,16 +292,17 @@ try {
   // timeout, which composed to a measured 180s worst case. Both phases below draw on this SAME
   // `startupDeadline`; whatever the first phase spent is no longer available to the second.
   const startupDeadline = makeDeadline(STARTUP_BUDGET_MS);
+  const getDiagnostics = () => `stderr:\n${childStderr}`;
   await waitForDeadline(() => fetchJsonOnce('/json/version', startupDeadline.remainingMs()), {
     deadline: startupDeadline, intervalMs: 150,
-    checkExited: checkChildExited, describe: 'the DevTools endpoint (/json/version)',
+    checkExited: checkChildExited, describe: 'the DevTools endpoint (/json/version)', getDiagnostics,
   });
   // Issue #229: `/json/list` can answer OK before any `type === 'page'` target exists yet - the
   // old code took whatever the FIRST list response held unconditionally and crashed reading
   // `.id` off `undefined`. Wait for one to actually appear instead, still on the SAME budget.
   const page = await waitForPageTarget(
     () => fetchJsonOnce('/json/list', startupDeadline.remainingMs()),
-    { deadline: startupDeadline, checkExited: checkChildExited },
+    { deadline: startupDeadline, checkExited: checkChildExited, getDiagnostics },
   );
   keepAliveTargetId = page.id;
   ws = new WebSocket(page.webSocketDebuggerUrl);
