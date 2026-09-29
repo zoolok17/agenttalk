@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -32,6 +33,22 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CHECK = REPO_ROOT / "tests" / "console2_browser_check.mjs"
 LEAD = "claude-agenttalk-lead"
 PROJECT = "proj-browser"
+
+# PR #230 delta review, F2: the subprocess timeout must exceed the check's OWN worst-case elapsed
+# time - the SUM of every phase, each already independent/sequential, never nested (the startup
+# phase is now itself ONE shared 90s budget, not two 90s budgets composed - see
+# console2_browser_check.mjs's STARTUP_BUDGET_MS/makeDeadline):
+#   startup (DevTools up AND a page target found - ONE shared budget) ......... 90.0s
+#   post-navigate settle sleep .................................................. 3.5s
+#   F1 stream redraw wait (waitForTextChange, its own independent 30s budget) . 30.0s
+#   F2 stream redraw wait (waitForTextChange) .................................. 30.0s
+#   board-cards-render wait loop (100 attempts x 150ms) ......................... 15.0s
+#   board meta redraw wait (waitForTextChange) .................................. 30.0s
+#   misc small fixed sleeps and CDP round-trips (keyboard/overlay steps, etc.) ...  5.0s
+#                                                                              ----------
+#   worst case, one full scenario ............................................ 203.5s
+# 240s leaves ~36s of headroom above that computed worst case.
+BROWSER_CHECK_TIMEOUT_S = 240
 
 
 def _find_browser() -> str | None:
@@ -123,7 +140,18 @@ def _state(now: datetime, grown: int = 0) -> dict:
     }]}
 
 
-def _handler(started: float):
+def _handler(monotonic=time.monotonic):
+    # PR #230 delta review, F1: aging used to start at HANDLER-CONSTRUCTION time (before Chromium
+    # even launches), so a longer (but healthy) browser startup - #229's own fix allows up to 90s -
+    # directly ate into the fixture's own 3600s (1h) granularity budget: the reviewer reproduced
+    # this exactly by backdating `started` by 65s and getting "waiting 1h" on the very first read.
+    # Aging is decoupled from startup duration by starting the clock lazily, on the FIRST request
+    # this server actually receives (the earliest a page could possibly be exercising it) rather
+    # than at construction time - real startup time, however long, is no longer charged against it.
+    # `monotonic` is injectable (round 2, N2) so the real-browser fixture uses real time.monotonic
+    # while the F1 regression test below can drive it with fixed readings instead of a real sleep.
+    clock = {"started": None}
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args) -> None:  # noqa: D401 - silence the test server
             return
@@ -137,9 +165,11 @@ def _handler(started: float):
             self.wfile.write(body)
 
         def do_GET(self) -> None:  # noqa: N802
+            if clock["started"] is None:
+                clock["started"] = monotonic()
             path = self.path.split("?", 1)[0]
             now = datetime.now(timezone.utc)
-            grown = int((time.monotonic() - started) * 60)          # cards age 60 s per second: a new label every read
+            grown = int((monotonic() - clock["started"]) * 60)  # cards age 60 s per second: a new label every read
             if path == "/v2":
                 self._send(web.render_console2(), "text/html; charset=utf-8", web._DASHBOARD_CSP)
             elif path.startswith("/static/") and path[len("/static/"):] in web._STATIC_ASSETS:
@@ -151,7 +181,9 @@ def _handler(started: float):
                 # Both cards now start near zero (not ~1000s+, as before): a card's rendered age
                 # label crosses from "Nm" to hour ("Nh") granularity at 3600 simulated seconds,
                 # which this fixture's own 60x-accelerated `grown` reaches from a near-zero base
-                # about a real MINUTE after the server starts - comfortably longer than this
+                # about a real MINUTE after `clock["started"]` is set (F1: the FIRST request this
+                # server actually answers, not construction time - a slow browser startup, however
+                # long, is never charged against this margin) - comfortably longer than this
                 # check's own total run time on any realistic runner, however slow. From ~1000s+,
                 # that margin was only ~40 real seconds, which is exactly what a real CI runner
                 # exceeded (fix). card-2 is kept SLIGHTLY older (oldest-first queue order, "card-2
@@ -233,10 +265,66 @@ def _handler(started: float):
 
 @pytest.fixture
 def page(tmp_path: Path):
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), _handler(time.monotonic()))
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _handler())
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         yield f"http://127.0.0.1:{srv.server_address[1]}/v2", tmp_path / "profile"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_fixture_aging_starts_on_first_request_not_construction() -> None:
+    """PR #230 delta review, F1 regression, made deterministic in round 2 (N2): a real (but short)
+    gap between constructing the fixture and its FIRST request (standing in for however long a real
+    browser takes to start) must never be charged against the fixture's own aging clock. Before the
+    F1 fix, `_handler(started)` took `time.monotonic()` as a constructor argument - a slow start was
+    indistinguishable from genuine card age.
+
+    Round 1 exercised this with a real 2s sleep and a loose `first_grown < 10` bound - which was
+    itself load-sensitive (N2): do_GET reads the injected clock TWICE on the first request (once to
+    lazily set clock["started"], once to compute `grown`), and under real time.monotonic those two
+    reads can legitimately drift apart by more than 167ms of scheduler jitter alone, at this
+    fixture's 60x acceleration - a correctly-lazy first request descheduled for 200ms between those
+    two reads reports grown=12 and fails outright, adding a load-sensitive flake to a flake fix.
+
+    Injecting a controllable `monotonic` callable removes both the real sleep AND the wall-clock
+    bound: the TEST advances the clock explicitly (standing in for however long a real gap is,
+    without waiting for one), so the exact epoch semantics can be asserted precisely instead of
+    merely bounded. A plain canned reading sequence cannot express this: since nothing calls
+    monotonic() during the "gap" itself, a sequential fake would hand the same next value to
+    "started" whether the code reads it eagerly at construction or lazily at the first request -
+    the two are only distinguishable if the clock can advance independently of being read."""
+
+    class FakeMonotonic:
+        def __init__(self, value: float) -> None:
+            self.value = value
+
+        def __call__(self) -> float:
+            return self.value
+
+    fake = FakeMonotonic(100.0)
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _handler(monotonic=fake))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        # The exact 65s the reviewer used to reproduce the original bug ("backdating `started` by
+        # 65s ... 'waiting 1h' on the very first read") - a healthy but slow browser startup gap,
+        # advanced directly with no real sleep and no other code ever reading the clock meanwhile.
+        fake.value += 65.0
+        with urllib.request.urlopen(f"{base}/api/attention", timeout=5) as resp:  # noqa: S310  # nosec B310  # nosemgrep
+            first = json.loads(resp.read())
+        # card-2's age is "50 + grown" (see the /api/attention branch below). Lazy (correct): started
+        # is set to 165.0 AT this first read, so grown=(165.0-165.0)*60=0 EXACTLY. Eager (the F1 bug):
+        # started would have been captured as 100.0 at construction, so grown=(165.0-100.0)*60=3900 -
+        # unmistakably not 0.
+        assert first["items"][1]["age_seconds"] - 50 == 0
+        fake.value += 1.0   # a whole second - exact in binary float, no int()-truncation surprises
+        with urllib.request.urlopen(f"{base}/api/attention", timeout=5) as resp:  # noqa: S310  # nosec B310  # nosemgrep
+            second = json.loads(resp.read())
+        # grown=(166.0-165.0)*60=60 EXACTLY - ages forward from the FIRST request's start, not from
+        # construction, and is not re-latched on every request.
+        assert second["items"][1]["age_seconds"] - 50 == 60
     finally:
         srv.shutdown()
         srv.server_close()
@@ -249,7 +337,7 @@ def test_thread_scroll_and_focus_survive_redraws_in_a_real_browser(page) -> None
     flags = _browser_launch_flags(platform.system())
     result = subprocess.run(
         ["node", str(CHECK), BROWSER, url, str(profile), json.dumps(flags)],
-        capture_output=True, text=True, encoding="utf-8", timeout=120, cwd=REPO_ROOT,
+        capture_output=True, text=True, encoding="utf-8", timeout=BROWSER_CHECK_TIMEOUT_S, cwd=REPO_ROOT,
     )
     # A browser binary that exists but fails to start is a hard FAILURE, never a skip -
     # result.stderr carries the launched process's own stderr on that path (see the .mjs).
@@ -353,7 +441,7 @@ def test_check_catches_a_redraw_that_breaks_scroll_after_setup(page) -> None:
     flags = _browser_launch_flags(platform.system())
     result = subprocess.run(
         ["node", str(CHECK), BROWSER, url, str(profile), json.dumps(flags), "scroll"],
-        capture_output=True, text=True, encoding="utf-8", timeout=120, cwd=REPO_ROOT,
+        capture_output=True, text=True, encoding="utf-8", timeout=BROWSER_CHECK_TIMEOUT_S, cwd=REPO_ROOT,
     )
     assert result.returncode == 0, result.stderr
     out = json.loads(result.stdout)

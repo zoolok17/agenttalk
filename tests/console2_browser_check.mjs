@@ -14,7 +14,115 @@
 // What the DOM stub cannot show and this does: a detached element has no scroll layout (the thread
 // must be scrolled after insertion), and a redraw that replaces a focused control drops focus to <body>.
 import { spawn } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 
+export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// PR #230 delta review, F2: a single per-HTTP-attempt cap. Every attempt gets the SMALLER of this
+// and whatever remains of the shared budget, so one stalled attempt cannot eat the whole thing,
+// and several retries stay possible within the overall deadline.
+export const PER_REQUEST_CAP_MS = 10000;
+// The overall startup budget (DevTools up AND a page target found) - ONE shared elapsed-time
+// clock, not two independent ones (see makeDeadline/F2 below).
+export const STARTUP_BUDGET_MS = 90000;
+
+// A single overall elapsed-time budget, meant to be created ONCE and threaded through every wait
+// composed from it. PR #230 delta review, F2: the previous code gave waitForPageTarget its OWN
+// fresh 90s timeout, which internally called json() - ALSO its own fresh 90s timeout - so a
+// reviewer's fake-clock composition measured 180,050 ms total: two independent deadlines, each
+// blind to how much the OTHER had already spent. A shared `deadline` object fixes that at the
+// root - every consumer asks the SAME clock "how much is left", never starts its own.
+export function makeDeadline(totalMs, { now = Date.now } = {}) {
+  const start = now();
+  return {
+    remainingMs: () => Math.max(0, totalMs - (now() - start)),
+    expired: () => now() - start >= totalMs,
+  };
+}
+
+// PR #230 delta review, F3: thrown ONLY when `checkExited` reports a real process exit -
+// deliberately a DISTINCT class from an ordinary "not ready yet" failure (connection refused, a
+// malformed response), so a blanket `catch` elsewhere can tell "the browser is DEAD, stop retrying"
+// apart from "try again shortly" and never swallow the former. The previous code's outer
+// waitForPageTarget loop caught its inner json() call's own already-correct fatal-exit error with
+// the SAME catch-all used for transient failures, discarding the exit code/stderr and just
+// retrying blindly until its own timeout - this is what let that information get lost.
+export class FatalExitError extends Error {
+  constructor(describe, exitInfo) {
+    super(`${describe || 'condition'}: the process exited before it was met (${JSON.stringify(exitInfo)})`);
+    this.name = 'FatalExitError';
+    this.exitInfo = exitInfo;
+  }
+}
+
+// Retries `fn` until it resolves to a value other than `undefined`, bounded by a SHARED `deadline`
+// (a makeDeadline() - never its own fresh timeout, see above).
+//
+// CONTRACT: `fn(remainingMs)` must bound ITSELF to (at most) the `remainingMs` it is given - e.g.
+// via its own AbortSignal.timeout(min(remainingMs, someCap)), like fetchJsonOnce below. This loop
+// does not race attempts against anything; it awaits each one fully, then sleeps one poll interval,
+// then repeats. A never-settling `fn` is not this loop's problem to solve - it is `fn`'s, by
+// actually releasing whatever resource it is waiting on.
+//
+// PR #230 delta review round 2, N1 (connector, [major]): an EARLIER version of this loop raced
+// each `fn()` attempt against a poll-interval "tick" so a slow-but-alive attempt could still be
+// waited on across iterations without re-invoking `fn`. That race meant a FAST attempt (an
+// immediate rejection, or an immediate `undefined`) never actually awaited the poll-interval sleep
+// at all - `pending` simply won the race every time - so `intervalMs` throttled nothing: a refused
+// connection or an empty page-target list could be retried tens of thousands of times per second
+// while Chromium was still starting. Racing is unnecessary here in the first place: every real
+// attempt in this file is already a single bounded fetch (its own AbortSignal.timeout), so the
+// loop only needs to await each attempt fully and then genuinely await its own sleep before trying
+// again - never a race, so the sleep can never be skipped.
+//
+// A FatalExitError is NEVER swallowed as "not ready yet" (F3): it propagates immediately, with its
+// exit code/stderr intact, from anywhere inside `fn`. Every dependency is injectable (`sleepFn`)
+// so this is unit-testable against a stub with no real browser, process or timers - see
+// console2_browser_check_wait.test.mjs.
+export async function waitForDeadline(fn, {
+  deadline, intervalMs = 150, sleep: sleepFn = sleep, checkExited, describe, getDiagnostics,
+} = {}) {
+  for (;;) {
+    const exitedBefore = checkExited && checkExited();
+    if (exitedBefore) throw new FatalExitError(describe, exitedBefore);
+    if (deadline.expired()) {
+      // Connector P2 (N1, round 1): the browser can stay ALIVE (no exit, so no FatalExitError)
+      // while never exposing the DevTools endpoint - exactly the slow-startup path this whole
+      // change exists to diagnose. The old fixed-attempt-budget error always included the
+      // accumulated stderr; this one must too, not only the (already-covered) fatal-exit path.
+      const extra = getDiagnostics && getDiagnostics();
+      throw new Error(`${describe || 'condition'} did not happen within the shared budget`
+        + (extra ? `; ${extra}` : ''));
+    }
+    let settled;
+    try { settled = { ok: true, value: await fn(deadline.remainingMs()) }; } catch (e) { settled = { ok: false, error: e }; }
+    if (!settled.ok) {
+      if (settled.error instanceof FatalExitError) throw settled.error;
+      // an ordinary failure - not ready yet; fall through to the paced sleep below, then retry
+    } else if (settled.value !== undefined) {
+      return settled.value;
+    }
+    await sleepFn(Math.max(0, Math.min(intervalMs, deadline.remainingMs())));
+  }
+}
+
+// Issue #229: `/json/list` can answer OK before the browser has created its initial page target
+// yet (a startup race, distinct from the DevTools HTTP endpoint merely being up at all) - the
+// previous code took the FIRST list response unconditionally and crashed on the missing target
+// (`Cannot read properties of undefined (reading 'id')`) rather than waiting for one to exist.
+// `listTargetsOnce` must be a SINGLE bounded attempt (never its own retry loop, or F2's nested-
+// deadline bug returns) - opts.deadline/opts.checkExited are required, shared with whatever else
+// draws from the same overall budget.
+export async function waitForPageTarget(listTargetsOnce, opts) {
+  return waitForDeadline(async (remainingMs) => {
+    const targets = await listTargetsOnce(remainingMs);
+    return Array.isArray(targets) ? targets.find((t) => t.type === 'page') : undefined;
+  }, { intervalMs: 150, describe: 'a page target appearing in /json/list', ...opts });
+}
+
+// Everything below this line is the check's own entrypoint - spawning a real browser and driving
+// it over CDP - guarded so importing the pure helpers above (for a unit test) never also does that.
+async function main() {
 const [exe, pageUrl, profile, flagsJson, sabotage] = process.argv.slice(2);
 const extraFlags = flagsJson ? JSON.parse(flagsJson) : [];
 
@@ -36,7 +144,6 @@ const sabotageScrollScript = sabotage === 'scroll'
      window.__sabotageObserver.observe(document.querySelector('${WATCHED_AGE_SELECTOR}'), { childList: true, characterData: true, subtree: true });`
   : '';
 const PORT = 9300 + Math.floor(Math.random() * 500);
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // `profile` is a fresh, unique directory per test run - the caller's job
 // (test_console2_browser.py's `page` fixture uses pytest's own tmp_path); a reused or
@@ -50,25 +157,28 @@ let childStderr = '';
 child.stderr.on('data', (chunk) => { childStderr += chunk.toString(); });
 let childExit = null;
 child.on('exit', (code, signal) => { childExit = { code, signal }; });
+const checkChildExited = () => childExit && { ...childExit, stderr: childStderr };
 
-async function json(path) {
-  for (let i = 0; i < 200; i++) {
-    try { const r = await fetch(`http://127.0.0.1:${PORT}${path}`); if (r.ok) return await r.json(); } catch (e) { /* not up yet */ }
-    if (childExit) {
-      throw new Error(
-        `browser process exited before the DevTools endpoint came up (code=${childExit.code} `
-        + `signal=${childExit.signal}); stderr:\n${childStderr}`);
-    }
-    await sleep(150);
-  }
-  throw new Error(`browser did not start within the retry budget; stderr:\n${childStderr}`);
+// ONE bounded GET, returning parsed JSON or `undefined` if the endpoint is not ready yet (any
+// connection failure, non-OK status, or the request itself timing out) - NEVER a retry loop of
+// its own (PR #230 delta review, F2: that is exactly what nested two independent deadlines).
+// Retrying is the CALLER's job, against ONE shared budget. `remainingMs` bounds this ONE attempt
+// via AbortSignal, capped at PER_REQUEST_CAP_MS, so a single stalled connection can never eat the
+// whole shared budget - the real fix for a never-settling fetch (waitForDeadline's own race is a
+// backstop for a stub `fn` in general, not a substitute for actually releasing the socket).
+async function fetchJsonOnce(path, remainingMs) {
+  const capMs = Math.max(1, Math.min(remainingMs, PER_REQUEST_CAP_MS));
+  const r = await fetch(`http://127.0.0.1:${PORT}${path}`, { signal: AbortSignal.timeout(capMs) });
+  return r.ok ? await r.json() : undefined;
 }
 
-// A ONE-SHOT DevTools HTTP action (never a "wait for the endpoint to come up" read like json()
-// above): brings `id` to the front. The endpoint replies text/plain, not JSON - reading it as text
-// and surfacing any real failure is the whole N4 fix (never silently retried, never swallowed).
+// A ONE-SHOT DevTools HTTP action (never a "wait for ready" read like fetchJsonOnce above): brings
+// `id` to the front. The endpoint replies text/plain, not JSON - reading it as text and surfacing
+// any real failure is the whole N4 fix (never silently retried, never swallowed). Bounded by its
+// own short, fixed cap (PR #230 delta review, F2: "the fetch has no abort signal") - this call
+// happens well after startup, so it does not draw on the shared startup budget.
 async function activateTarget(id) {
-  const r = await fetch(`http://127.0.0.1:${PORT}/json/activate/${id}`);
+  const r = await fetch(`http://127.0.0.1:${PORT}/json/activate/${id}`, { signal: AbortSignal.timeout(PER_REQUEST_CAP_MS) });
   const body = await r.text();
   if (!r.ok) throw new Error(`could not activate the browser target: http ${r.status} ${body}`);
 }
@@ -172,9 +282,23 @@ async function pressKey(name, opts = {}) {
 }
 
 try {
-  await json('/json/version');
-  const targets = await json('/json/list');
-  const page = targets.find((t) => t.type === 'page');
+  // PR #230 delta review, F2: ONE shared budget for the WHOLE startup sequence (DevTools coming
+  // up, then a page target appearing) - the previous code gave each phase its own independent 90s
+  // timeout, which composed to a measured 180s worst case. Both phases below draw on this SAME
+  // `startupDeadline`; whatever the first phase spent is no longer available to the second.
+  const startupDeadline = makeDeadline(STARTUP_BUDGET_MS);
+  const getDiagnostics = () => `stderr:\n${childStderr}`;
+  await waitForDeadline((remainingMs) => fetchJsonOnce('/json/version', remainingMs), {
+    deadline: startupDeadline, intervalMs: 150,
+    checkExited: checkChildExited, describe: 'the DevTools endpoint (/json/version)', getDiagnostics,
+  });
+  // Issue #229: `/json/list` can answer OK before any `type === 'page'` target exists yet - the
+  // old code took whatever the FIRST list response held unconditionally and crashed reading
+  // `.id` off `undefined`. Wait for one to actually appear instead, still on the SAME budget.
+  const page = await waitForPageTarget(
+    (remainingMs) => fetchJsonOnce('/json/list', remainingMs),
+    { deadline: startupDeadline, checkExited: checkChildExited, getDiagnostics },
+  );
   keepAliveTargetId = page.id;
   ws = new WebSocket(page.webSocketDebuggerUrl);
   await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = reject; });
@@ -485,3 +609,8 @@ try {
   child.kill();
 }
 process.exit(0);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
+  main();
+}
