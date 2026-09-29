@@ -1327,6 +1327,21 @@ def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str,
         # during aggregation) - that path stays a hard GateBlock, since
         # tampering with an artifact already bound into a published bundle
         # must still be caught.
+        # FIX ROUND 2 (#231 P2, codex cold read + independent reproduction):
+        # best-effort must ALSO mean the FINAL destination path never ends up
+        # holding rejected or partially-written bytes - the CI workflow
+        # uploads the whole `logs/` directory as one artifact, unconditioned
+        # on which checks made it into evidence.json, so a file sitting there
+        # is published exactly as if it had been verified. Verify BEFORE
+        # placing: write to a temp name beside the destination (same
+        # directory -> same filesystem -> the rename is atomic), re-hash the
+        # temp file's OWN on-disk bytes (catches a partial/corrupted write,
+        # not just a source that already didn't match), and only then
+        # os.replace() it into the final path. Any rejection - content
+        # mismatch, a failed read, a failed or partial write - runs the same
+        # cleanup: if the final path exists, it is removed, so a leftover
+        # "rejected" file is never left where the whole-directory upload
+        # would publish it as trustworthy.
         if "junit_xml" in check:
             junit = check["junit_xml"]
             junit_relative = f"logs/{check['id']}.junit.xml"
@@ -1336,14 +1351,32 @@ def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str,
                 junit_destination.parent.mkdir(parents=True, exist_ok=True)
                 junit_source = Path(junit["path"])
                 junit_content = _read_check_log(junit_source)
-                if junit_source.resolve() != junit_destination.resolve():
-                    junit_destination.write_bytes(junit_content)
-                junit_collected = _sha256_file(junit_destination) == junit["sha256"]
+                content_ok = sha256_bytes(junit_content) == junit["sha256"]
+                same_path = junit_source.resolve() == junit_destination.resolve()
+                if content_ok and same_path:
+                    junit_collected = True
+                elif content_ok:
+                    tmp_destination = junit_destination.with_name(
+                        f"{junit_destination.name}.tmp-{uuid.uuid4().hex}"
+                    )
+                    try:
+                        tmp_destination.write_bytes(junit_content)
+                        if _sha256_file(tmp_destination) == junit["sha256"]:
+                            os.replace(tmp_destination, junit_destination)
+                            junit_collected = True
+                    finally:
+                        if tmp_destination.exists():
+                            tmp_destination.unlink()
             except (OSError, GateBlock):
                 junit_collected = False
             if junit_collected:
                 junit["artifact_path"] = junit_relative
             else:
+                try:
+                    if junit_destination.exists():
+                        junit_destination.unlink()
+                except OSError:
+                    pass
                 print(
                     f"agenttalk dev-gate: {check['id']}: junit-xml is a best-effort measurement "
                     "artifact and could not be collected; omitted (check status unaffected)",

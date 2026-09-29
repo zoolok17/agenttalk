@@ -1285,6 +1285,9 @@ def test_write_run_evidence_omits_junit_xml_that_vanished_before_collection(
     assert uploaded_check["status"] == "pass"
     # the primary log for this (and every) check still collected normally
     assert (evidence.parent / uploaded_check["log"]["artifact_path"]).is_file()
+    # #231 P2: nothing was ever there to publish (the source never existed at
+    # collection time), so the bundle path must be physically absent too.
+    assert not (evidence.parent / f"logs/{uploaded_check['id']}.junit.xml").exists()
 
 
 def test_write_run_evidence_omits_junit_xml_that_changed_before_collection(
@@ -1310,6 +1313,57 @@ def test_write_run_evidence_omits_junit_xml_that_changed_before_collection(
     uploaded_check = next(c for c in uploaded["checks"] if c["id"] == "pytest-source-py310")
     assert "junit_xml" not in uploaded_check
     assert uploaded_check["status"] == "pass"
+    # #231 P2 (codex cold read + independent reproduction): the OLD code
+    # wrote the changed bytes to the bundle path BEFORE checking the hash,
+    # then only removed the JSON key on mismatch - the rejected file was
+    # still physically there for tests.yml's whole-directory upload to
+    # publish as if it were verified. It must be physically ABSENT now.
+    assert not (evidence.parent / f"logs/{uploaded_check['id']}.junit.xml").exists()
+    assert not list(evidence.parent.glob(f"logs/{uploaded_check['id']}.junit.xml.tmp-*")), (
+        "no leftover temp file either"
+    )
+
+
+def test_write_run_evidence_removes_a_failed_or_partial_junit_xml_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#231 P2: a partial/interrupted WRITE (disk error mid-write, not just
+    a source that already didn't match) must also never leave anything at
+    the bundle path - verify-then-place writes to a temp file first
+    precisely so a write failure there cannot corrupt/create the final
+    path at all."""
+    manifest = _manifest()
+    artifact = _leg_artifact(manifest, "linux/3.10")
+    _write_check_logs(artifact, tmp_path / "fake-logs")
+    junit_path = tmp_path / "source.junit.xml"
+    junit_path.write_text("<testsuites>plenty of bytes here</testsuites>", encoding="utf-8")
+    real_hash = dev_gate.sha256_bytes(junit_path.read_bytes())
+    pytest_check = next(c for c in artifact["checks"] if c["id"] == "pytest-source-py310")
+    pytest_check["junit_xml"] = {"path": str(junit_path), "sha256": real_hash}
+
+    real_write_bytes = Path.write_bytes
+
+    def flaky_write_bytes(self: Path, data: bytes):
+        if ".tmp-" in self.name:
+            # simulate a disk error partway through the write: some bytes
+            # land, then the write is interrupted.
+            real_write_bytes(self, data[: len(data) // 2])
+            raise OSError("simulated disk error mid-write")
+        return real_write_bytes(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", flaky_write_bytes)
+
+    evidence = tmp_path / "bundle" / "dev-gate-evidence.json"
+    dev_gate.write_run_evidence(evidence, artifact, manifest)  # must NOT raise
+
+    uploaded = json.loads(evidence.read_text(encoding="utf-8"))
+    uploaded_check = next(c for c in uploaded["checks"] if c["id"] == "pytest-source-py310")
+    assert "junit_xml" not in uploaded_check
+    assert uploaded_check["status"] == "pass"
+    assert not (evidence.parent / f"logs/{uploaded_check['id']}.junit.xml").exists()
+    assert not list(evidence.parent.glob(f"logs/{uploaded_check['id']}.junit.xml.tmp-*")), (
+        "the partially-written temp file must be cleaned up, not left behind"
+    )
 
 
 def test_run_pytest_mode_style_invocation_produces_and_binds_a_junit_xml_artifact(
@@ -1375,6 +1429,8 @@ def test_run_pytest_mode_style_invocation_produces_and_binds_a_junit_xml_artifac
     collected = evidence.parent / uploaded_check["junit_xml"]["artifact_path"]
     assert collected.is_file()
     assert dev_gate.sha256_bytes(collected.read_bytes()) == uploaded_check["junit_xml"]["sha256"]
+    # #231 P2: verify-then-place must not leave its temp file behind on success.
+    assert not list(evidence.parent.glob(f"logs/{uploaded_check['id']}.junit.xml.tmp-*"))
 
 
 def test_validate_run_artifact_still_rejects_tampering_of_a_published_junit_xml(
