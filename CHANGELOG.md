@@ -70,6 +70,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   swallowing a persistent failure. Test harness only; every read-only, GET-only
   and CSP assertion is unchanged.
 
+### Changed
+
+- **Dev gate: record per-test durations (measurement only).** Windows dev-gate
+  legs now take 125-165 min against the 180-min job ceiling (the slowest at
+  92%), against 31-46 min on Linux, with only progress-dot pytest logs in the
+  uploaded evidence to say where the time goes. Every `pytest` check (source
+  and wheel, every required Python minor) now also runs with
+  `--junitxml=<logs_dir>/<check_id>.junit.xml` — structured, with per-test
+  time, classname and file, so one normal CI run can point at the real
+  hotspot (git-spawn cost, bytecode effects for subprocess-heavy files, the
+  two-worker split, or something unseen) instead of guessing from a sampled
+  local measurement. `--durations=0` into the existing log was the
+  alternative; junitxml was preferred because it's a separate file — it adds
+  no lines to pytest's console output, so nothing that parses that output
+  (or the gate's own stdout grammar) is affected, and pass/fail semantics are
+  unchanged. The manifest's committed, floor-pinned `pytest.args` (`["-q"]`)
+  is untouched: like `--basetemp`, the junit path is per-run/per-check and is
+  built at call time, never a static arg. The new file is bound into the
+  evidence the same way the existing per-check `.log` is — an optional
+  `junit_xml: {path, sha256, artifact_path}` on the check record, present
+  only when pytest genuinely produced the file (never a new way for the gate
+  to block); `write_run_evidence` collects it into the bundle at
+  `logs/<check_id>.junit.xml` and re-verifies its hash, exactly like the
+  existing log collection. No product behaviour change and no new
+  dependency (junitxml is built into pytest).
+
 ## [0.94.0] - 2026-09-28
 
 Theme: **a work board that moves itself, and seats that survive a busy store.**

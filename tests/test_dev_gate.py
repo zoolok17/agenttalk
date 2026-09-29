@@ -4,6 +4,7 @@ import copy
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import zipfile
@@ -85,6 +86,8 @@ def _check(check_id: str, manifest: dict, minor: str, *, status: str = "pass") -
             "no:cacheprovider",
             "--basetemp",
             str((Path.cwd() / "pytest-temp").resolve()),
+            "--junitxml",
+            str((Path.cwd() / f"{check_id}.junit.xml").resolve()),
             *spec["paths"],
             candidate_import_root=(Path.cwd() / "src").resolve() if mode == "source" else None,
         )
@@ -1167,6 +1170,102 @@ def test_historical_evidence_without_artifact_path_still_validates() -> None:
     artifact = _leg_artifact(manifest, "linux/3.10")
     assert all(set(check["log"]) == {"path", "sha256"} for check in artifact["checks"])
     assert dev_gate.validate_run_artifact(artifact, manifest) == artifact
+
+
+# ------------------------------------------------- #(ci-windows-durations): per-test timing record
+
+def test_record_from_outcome_omits_junit_xml_when_the_file_is_missing(tmp_path: Path) -> None:
+    """A measurement artifact must never become a new way to fail: if pytest
+    never wrote the junit-xml file (e.g. it crashed before producing one),
+    the check record simply omits the field rather than recording broken
+    evidence."""
+    outcome = dev_gate.CommandOutcome(
+        argv=("pytest",), returncode=0, duration_ms=1, status="pass",
+        reason_code=None, diagnostic="", log_path=tmp_path / "does-not-exist.log",
+    )
+    record = dev_gate._record_from_outcome(
+        "pytest-source-py310", "pytest", outcome,
+        tool_path=sys.executable, tool_version="8.0.0",
+        mode="source", python="3.10",
+        junit_xml_path=tmp_path / "missing.junit.xml",
+    )
+    assert "junit_xml" not in record
+
+
+def test_run_pytest_mode_style_invocation_produces_and_binds_a_junit_xml_artifact(
+    tmp_path: Path,
+) -> None:
+    """#(ci-windows-durations): a real pytest subprocess, invoked with
+    --junitxml the same way _run_pytest_mode invokes it, must leave a real
+    per-test timing record; _record_from_outcome must attach it to the
+    check, and write_run_evidence must collect it into the bundle exactly
+    like the existing .log artifact (artifact_path + sha256)."""
+    test_file = tmp_path / "test_sample.py"
+    test_file.write_text(
+        "def test_one():\n    assert 1 == 1\n"
+        "def test_two():\n    assert 2 == 2\n",
+        encoding="utf-8",
+    )
+    logs_dir = tmp_path / "runner"
+    junit_path = logs_dir / "pytest-source-py310.junit.xml"
+    argv = [
+        sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+        "--junitxml", str(junit_path), str(test_file),
+    ]
+    outcome = dev_gate.run_command(
+        check_id="pytest-source-py310",
+        argv=argv,
+        cwd=tmp_path,
+        env={**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"},
+        timeout_seconds=30,
+        logs_dir=logs_dir,
+    )
+    assert outcome.status == "pass"
+    assert junit_path.is_file(), "pytest must have written the junit-xml report"
+    xml_text = junit_path.read_text(encoding="utf-8")
+    assert 'name="test_one"' in xml_text and 'name="test_two"' in xml_text
+    assert re.search(r'name="test_one"[^>]*\btime="[0-9.]+"', xml_text), (
+        "per-test timing must be present in the report"
+    )
+
+    record = dev_gate._record_from_outcome(
+        "pytest-source-py310", "pytest", outcome,
+        tool_path=sys.executable, tool_version="8.0.0",
+        mode="source", python="3.10",
+        junit_xml_path=junit_path,
+    )
+    assert record["junit_xml"]["path"] == str(junit_path)
+    assert record["junit_xml"]["sha256"] == dev_gate.sha256_bytes(junit_path.read_bytes())
+
+    manifest = _manifest()
+    artifact = _leg_artifact(manifest, "linux/3.10")
+    _write_check_logs(artifact, tmp_path / "fake-logs")
+    pytest_check = next(c for c in artifact["checks"] if c["id"] == "pytest-source-py310")
+    pytest_check["junit_xml"] = {
+        "path": record["junit_xml"]["path"],
+        "sha256": record["junit_xml"]["sha256"],
+    }
+
+    evidence = tmp_path / "bundle" / "dev-gate-evidence.json"
+    dev_gate.write_run_evidence(evidence, artifact, manifest)
+
+    uploaded = json.loads(evidence.read_text(encoding="utf-8"))
+    uploaded_check = next(c for c in uploaded["checks"] if c["id"] == "pytest-source-py310")
+    assert uploaded_check["junit_xml"]["artifact_path"] == "logs/pytest-source-py310.junit.xml"
+    collected = evidence.parent / uploaded_check["junit_xml"]["artifact_path"]
+    assert collected.is_file()
+    assert dev_gate.sha256_bytes(collected.read_bytes()) == uploaded_check["junit_xml"]["sha256"]
+
+
+def test_junit_xml_field_rejected_on_a_non_pytest_check() -> None:
+    """The optional junit_xml field only ever makes sense for pytest checks -
+    a defensive guard, not a scenario the real gate can produce."""
+    manifest = _manifest()
+    artifact = _leg_artifact(manifest, "linux/3.10")
+    build_check = next(c for c in artifact["checks"] if c["id"] == "package-build")
+    build_check["junit_xml"] = {"path": str(Path("x.xml").resolve()), "sha256": "a" * 64}
+    with pytest.raises(dev_gate.GateBlock, match="evidence_schema_invalid"):
+        dev_gate.validate_run_artifact(artifact, manifest)
 
 
 @pytest.mark.parametrize("damage", ["missing", "changed"])

@@ -577,10 +577,13 @@ def _validate_check_command(
         python = require_python(minor) if mode == "source" else require_runtime_python(minor, "test")
         spec = manifest["checks"]["pytest"]
         launcher = [python, "-I", "-c", _ISOLATED_TOOL_LAUNCHER, "pytest"]
+        # #(ci-windows-durations): "--basetemp <path>" and "--junitxml <path>" are
+        # both per-run DYNAMIC flags (own value, never in the manifest's static,
+        # floor-pinned `args`) - same reason neither lives in `suffix_args`.
         suffix_args = [*spec["args"], "-p", "no:cacheprovider", "--basetemp"]
         valid = (
             item["mode"] == mode
-            and len(argv) == len(launcher) + 1 + len(suffix_args) + 1 + len(spec["paths"])
+            and len(argv) == len(launcher) + 1 + len(suffix_args) + 1 + 2 + len(spec["paths"])
             and argv[: len(launcher)] == launcher
             and (
                 _is_absolute_path_text(argv[len(launcher)])
@@ -589,7 +592,9 @@ def _validate_check_command(
             )
             and argv[len(launcher) + 1 : len(launcher) + 1 + len(suffix_args)] == suffix_args
             and _is_absolute_path_text(argv[len(launcher) + 1 + len(suffix_args)])
-            and argv[len(launcher) + 2 + len(suffix_args) :] == spec["paths"]
+            and argv[len(launcher) + 2 + len(suffix_args)] == "--junitxml"
+            and _is_absolute_path_text(argv[len(launcher) + 3 + len(suffix_args)])
+            and argv[len(launcher) + 4 + len(suffix_args) :] == spec["paths"]
         )
     elif check_id == "package-build":
         python = require_python(expected_minors[0])
@@ -980,7 +985,13 @@ def validate_run_artifact(
     checks_by_id: dict[str, dict[str, Any]] = {}
     for index, check in enumerate(checks):
         item = _require_object(check, f"checks[{index}]")
-        _require_artifact_fields(item, check_fields, f"checks[{index}]")
+        # #(ci-windows-durations): `junit_xml` is OPTIONAL (only pytest checks
+        # ever carry it, and only when pytest genuinely produced the file) -
+        # same forward-compatible, per-item field-set pattern as `log.artifact_path`.
+        item_fields = set(check_fields)
+        if "junit_xml" in item:
+            item_fields.add("junit_xml")
+        _require_artifact_fields(item, item_fields, f"checks[{index}]")
         check_id = item["id"]
         expected_kind, expected_mode, expected_python, needs_provenance = _check_semantics(check_id)
         if not isinstance(item["status"], str) or item["status"] not in CHECK_STATUSES:
@@ -1021,6 +1032,33 @@ def validate_run_artifact(
                     raise GateBlock("evidence_log_invalid", f"collected log hash mismatch: {check_id}")
             except OSError as exc:
                 raise GateBlock("evidence_log_invalid", f"cannot read collected log {check_id}: {exc}") from exc
+        if "junit_xml" in item:
+            if expected_kind != "pytest":
+                raise GateBlock("evidence_schema_invalid", f"checks[{index}].junit_xml is only valid for pytest checks")
+            junit = _require_object(item["junit_xml"], f"checks[{index}].junit_xml")
+            junit_fields = {"path", "sha256"}
+            if "artifact_path" in junit:
+                junit_fields.add("artifact_path")
+                if junit["artifact_path"] != f"logs/{check_id}.junit.xml":
+                    raise GateBlock(
+                        "evidence_schema_invalid", f"checks[{index}].junit_xml.artifact_path is malformed"
+                    )
+            _require_artifact_fields(junit, junit_fields, f"checks[{index}].junit_xml")
+            if not _is_absolute_path_text(junit["path"]) or not _is_hash(junit["sha256"], 64):
+                raise GateBlock("evidence_schema_invalid", f"checks[{index}].junit_xml is malformed")
+            if "artifact_path" in junit:
+                if bundle_root is None:
+                    raise GateBlock("evidence_log_invalid", "bundle root required for collected logs")
+                try:
+                    collected = bundle_root / junit["artifact_path"]
+                    if not collected.resolve().is_relative_to(bundle_root.resolve()):
+                        raise GateBlock("evidence_log_invalid", f"junit_xml escapes bundle: {check_id}")
+                    if sha256_bytes(_read_check_log(collected)) != junit["sha256"]:
+                        raise GateBlock("evidence_log_invalid", f"collected junit_xml hash mismatch: {check_id}")
+                except OSError as exc:
+                    raise GateBlock(
+                        "evidence_log_invalid", f"cannot read collected junit_xml {check_id}: {exc}"
+                    ) from exc
         if item["status"] == "pass":
             if (
                 not isinstance(item["exit_code"], int)
@@ -1261,6 +1299,23 @@ def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str,
         except OSError as exc:
             raise GateBlock("evidence_log_collection_failed", f"cannot collect log for {check['id']}: {exc}") from exc
         log["artifact_path"] = relative
+        if "junit_xml" in check:
+            junit = check["junit_xml"]
+            junit_relative = f"logs/{check['id']}.junit.xml"
+            junit_destination = path.parent / junit_relative
+            try:
+                junit_destination.parent.mkdir(parents=True, exist_ok=True)
+                junit_source = Path(junit["path"])
+                junit_content = _read_check_log(junit_source)
+                if junit_source.resolve() != junit_destination.resolve():
+                    junit_destination.write_bytes(junit_content)
+                if _sha256_file(junit_destination) != junit["sha256"]:
+                    raise GateBlock("evidence_log_collection_failed", f"junit_xml hash changed for {check['id']}")
+            except OSError as exc:
+                raise GateBlock(
+                    "evidence_log_collection_failed", f"cannot collect junit_xml for {check['id']}: {exc}"
+                ) from exc
+            junit["artifact_path"] = junit_relative
     payload = json.dumps(artifact, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
     try:
         write_text(path, payload, encoding="utf-8", newline="\n")
@@ -1961,9 +2016,10 @@ def _record_from_outcome(
     python: str | None = None,
     import_provenance: dict[str, Any] | None = None,
     runtime_environment: dict[str, Any] | None = None,
+    junit_xml_path: Path | None = None,
 ) -> dict[str, Any]:
     log_hash = _sha256_file(outcome.log_path) if outcome.log_path.exists() else ""
-    return {
+    record: dict[str, Any] = {
         "id": check_id,
         "kind": kind,
         "mode": mode,
@@ -1980,6 +2036,20 @@ def _record_from_outcome(
         "import_provenance": import_provenance,
         "runtime_environment": runtime_environment,
     }
+    # #(ci-windows-durations): best-effort ONLY - a measurement artifact must
+    # never become a new way for the gate to block. pytest writes this file
+    # even when tests fail, but not on every crash/timeout of the pytest
+    # PROCESS itself (which is already correctly reflected in `status`
+    # independent of this field) - attach it only when it genuinely exists
+    # and is within the same size bound the primary log already enforces;
+    # otherwise omit the key entirely rather than recording broken evidence.
+    if (
+        junit_xml_path is not None
+        and junit_xml_path.exists()
+        and junit_xml_path.stat().st_size <= MAX_CHECK_LOG_BYTES
+    ):
+        record["junit_xml"] = {"path": str(junit_xml_path), "sha256": _sha256_file(junit_xml_path)}
+    return record
 
 
 def _blocked_record(check_id: str, detail: str, logs_dir: Path) -> dict[str, Any]:
@@ -2535,6 +2605,13 @@ def _run_pytest_mode(
         )
     except GateBlock as exc:
         return _blocked_record(check_id, exc.detail, logs_dir)
+    # #(ci-windows-durations): a per-test timing record for CI-time measurement
+    # (git-spawn cost, bytecode effects, worker split, ...), same disambiguation
+    # as the existing per-check .log file (logs_dir / f"{check_id}.<ext>") so
+    # source and wheel runs across every python minor never collide. `--basetemp`
+    # is the existing precedent for a per-run dynamic flag that cannot live in
+    # the manifest's static, floor-pinned `args` list.
+    junit_path = logs_dir / f"{check_id}.junit.xml"
     argv = isolated_tool_argv(
         interpreter.path,
         "pytest",
@@ -2543,6 +2620,8 @@ def _run_pytest_mode(
         "no:cacheprovider",
         "--basetemp",
         str(basetemp),
+        "--junitxml",
+        str(junit_path),
         *spec.get("paths", []),
         candidate_import_root=import_root if mode == "source" else None,
     )
@@ -2564,6 +2643,7 @@ def _run_pytest_mode(
         python=interpreter.requested,
         import_provenance=provenance,
         runtime_environment=runtime_environment,
+        junit_xml_path=junit_path,
     )
 
 
