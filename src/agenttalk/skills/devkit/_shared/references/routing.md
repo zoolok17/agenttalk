@@ -32,7 +32,7 @@ unique evidence).
 
 ## Core precedence
 
-1. Bus/team coordination uses agenttalk-lead/-listen/-handoff/-send/-sk-loop. Never team-lead.
+1. Bus/team coordination uses agenttalk-lead/-listen/-handoff/-send. Never team-lead.
 2. New production code uses craft-code; behavior-preserving cleanup uses refactor-code;
    if behavior changes it is craft-code.
 3. Architecture / security / performance are SUB-LENSES under review-code unless routed as

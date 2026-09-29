@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from agenttalk import cli
+from agenttalk import install_skills as iskl
 from agenttalk.install_skills import SKILLS_ROOT, install
 
 DEVKIT_SKILLS = [
@@ -62,7 +65,6 @@ def test_bundled_skills_exist_in_package() -> None:
         "agenttalk.listen.md",
         "agenttalk.propose.md",
         "agenttalk.send.md",
-        "agenttalk.sk-loop.md",
     ]
     codex_subdirs = sorted(p.name for p in codex_dir.iterdir() if p.is_dir())
     assert codex_subdirs == [
@@ -73,7 +75,6 @@ def test_bundled_skills_exist_in_package() -> None:
         "agenttalk-listen",
         "agenttalk-propose",
         "agenttalk-send",
-        "agenttalk-sk-loop",
     ]
     for sub in codex_subdirs:
         assert (codex_dir / sub / "SKILL.md").is_file()
@@ -303,6 +304,147 @@ def test_cli_no_devkit_skips_pack(tmp_path: Path) -> None:
     assert rc == 0
     assert (bus_cl / "agenttalk.listen.md").is_file()
     assert not cl.exists() and not cx.exists()  # devkit skipped
+
+
+# ---------------------------------------------------- retired skills (sk-loop)
+#
+# Warning-only (PR #224 fix round 2): install-skills never deletes a
+# retired skill's install destination. Two rounds of an automatic
+# byte-identical delete each turned up a new correctness problem (a
+# stationary directory junction, then a hash-to-unlink race, a fail-open
+# lstat error, an unchecked root/ancestor, AND no cross-platform-safe
+# definition of "byte-identical" since a CRLF checkout and an LF checkout
+# hash the same shipped content differently) — so the feature is
+# recast to detect-and-warn only. One test per vendor is enough: the
+# leftover is reported, the file is untouched, and dry-run reports the
+# same (there is nothing for --dry-run to preview, since neither path
+# ever writes).
+
+_FAKE_RETIRED_SKILL = {
+    "name": "agenttalk.sk-loop.md",
+    "claude_rel": "agenttalk.sk-loop.md",
+    "codex_rel": "agenttalk-sk-loop/SKILL.md",
+}
+
+
+def test_real_retired_skills_table_matches_no_bundled_source() -> None:
+    """The retired-skill table's whole point is that the source is GONE;
+    guard against someone re-adding a same-named source without also
+    dropping the (now stale) retired-skill entry."""
+    assert not (SKILLS_ROOT / "claude" / "agenttalk.sk-loop.md").exists()
+    assert not (SKILLS_ROOT / "codex" / "agenttalk-sk-loop").exists()
+
+
+def test_fresh_install_reports_no_retired_skills(tmp_path: Path) -> None:
+    """A fresh install has nothing to detect: no leftover retired-skill file
+    exists at the destination, so `retired` stays empty."""
+    claude_dir = tmp_path / "claude"
+    codex_dir = tmp_path / "codex"
+    res = install(claude_dir=claude_dir, codex_dir=codex_dir)
+    assert res.retired == []
+
+
+def test_existing_claude_install_warns_and_leaves_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A leftover installed agenttalk.sk-loop.md is reported, by exact
+    path, and never touched — regardless of its content."""
+    monkeypatch.setattr(iskl, "_RETIRED_SKILLS", (_FAKE_RETIRED_SKILL,))
+    claude_dir = tmp_path / "claude"
+    codex_dir = tmp_path / "codex"
+    claude_dir.mkdir(parents=True)
+    target = claude_dir / "agenttalk.sk-loop.md"
+    target.write_text("operator-authored mission notes, do not delete\n", encoding="utf-8")
+
+    res = install(claude_dir=claude_dir, codex_dir=codex_dir)
+
+    statuses = {str(r.path): r.status for r in res.retired}
+    assert statuses[str(target)] == "warn"
+    assert target.exists()
+    assert target.read_text(encoding="utf-8") == (
+        "operator-authored mission notes, do not delete\n"
+    )
+
+
+def test_existing_codex_install_warns_and_leaves_the_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same as the Claude case, for the folder-per-skill Codex layout."""
+    monkeypatch.setattr(iskl, "_RETIRED_SKILLS", (_FAKE_RETIRED_SKILL,))
+    claude_dir = tmp_path / "claude"
+    codex_dir = tmp_path / "codex"
+    (codex_dir / "agenttalk-sk-loop").mkdir(parents=True)
+    target = codex_dir / "agenttalk-sk-loop" / "SKILL.md"
+    target.write_text("operator-authored mission notes, do not delete\n", encoding="utf-8")
+
+    res = install(claude_dir=claude_dir, codex_dir=codex_dir)
+
+    statuses = {str(r.path): r.status for r in res.retired}
+    assert statuses[str(target)] == "warn"
+    assert target.exists()
+    assert target.read_text(encoding="utf-8") == (
+        "operator-authored mission notes, do not delete\n"
+    )
+
+
+def test_dry_run_reports_the_same_warning_without_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(iskl, "_RETIRED_SKILLS", (_FAKE_RETIRED_SKILL,))
+    claude_dir = tmp_path / "claude"
+    codex_dir = tmp_path / "codex"
+    claude_dir.mkdir(parents=True)
+    target = claude_dir / "agenttalk.sk-loop.md"
+    target.write_text("still installed\n", encoding="utf-8")
+
+    res = install(claude_dir=claude_dir, codex_dir=codex_dir, dry_run=True)
+
+    statuses = {str(r.path): r.status for r in res.retired}
+    assert statuses[str(target)] == "warn"
+    assert target.exists()
+    assert target.read_text(encoding="utf-8") == "still installed\n"
+
+
+def test_claude_only_does_not_check_codex_retired_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Honour the same --claude-only/--codex-only scoping the rest of
+    install-skills respects."""
+    monkeypatch.setattr(iskl, "_RETIRED_SKILLS", (_FAKE_RETIRED_SKILL,))
+    claude_dir = tmp_path / "claude"
+    codex_dir = tmp_path / "codex"
+    claude_dir.mkdir(parents=True)
+    (codex_dir / "agenttalk-sk-loop").mkdir(parents=True)
+    (codex_dir / "agenttalk-sk-loop" / "SKILL.md").write_text("x", encoding="utf-8")
+
+    res = install(claude=True, codex=False, claude_dir=claude_dir, codex_dir=codex_dir)
+
+    assert res.retired == []
+    assert (codex_dir / "agenttalk-sk-loop" / "SKILL.md").exists()
+
+
+def test_cli_install_skills_warns_with_migration_recipe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    """The CLI surface prints the exact path plus the manual migration
+    recipe (remove both installed sk-loop paths, refresh with --force)."""
+    monkeypatch.setattr(iskl, "_RETIRED_SKILLS", (_FAKE_RETIRED_SKILL,))
+    claude_dir = tmp_path / "claude"
+    codex_dir = tmp_path / "codex"
+    claude_dir.mkdir(parents=True)
+    target = claude_dir / "agenttalk.sk-loop.md"
+    target.write_text("still installed\n", encoding="utf-8")
+
+    rc = cli.main([
+        "install-skills", "--no-devkit",
+        "--claude-dir", str(claude_dir), "--codex-dir", str(codex_dir),
+    ])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert str(target) in out
+    assert "install-skills --force" in out
+    assert target.exists()
 
 
 def test_listen_skills_contain_consult_handling(tmp_path: Path) -> None:

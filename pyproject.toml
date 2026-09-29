@@ -88,7 +88,6 @@ include = [
     "/docs/supervisor-hosting.md",
     "/docs/supervisor-liveness-design.md",
     "/docs/supervisor-tutorial.md",
-    "/kitty-specs",
     "/pyproject.toml",
     "/src",
     "/tests",

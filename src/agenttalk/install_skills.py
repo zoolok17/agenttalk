@@ -8,9 +8,9 @@ Two skill families ship in the package:
   ``~/.codex/skills/<name>/SKILL.md``. The two sides differ in format, so they
   have separate sources under ``src/agenttalk/skills/{claude,codex}/``.
 * **Devkit skills** (the dev-discipline pack: craft-code, test-coverage,
-  review-code, write-docs, review-docs — a non-spec-kitty fallback). These are
-  byte-identical Agent-Skills ``SKILL.md`` folders for BOTH agents, so a single
-  source under ``src/agenttalk/skills/devkit/<name>/`` installs to BOTH
+  review-code, write-docs, review-docs). These are byte-identical
+  Agent-Skills ``SKILL.md`` folders for BOTH agents, so a single source under
+  ``src/agenttalk/skills/devkit/<name>/`` installs to BOTH
   ``~/.claude/skills/<name>/`` and ``~/.codex/skills/<name>/``.
 
 This module copies them out on demand.
@@ -61,12 +61,70 @@ class FileAction:
 @dataclass
 class InstallResult:
     actions: list[FileAction] = field(default_factory=list)
+    retired: list["RetiredSkillAction"] = field(default_factory=list)
 
     def counts(self) -> dict[str, int]:
         out: dict[str, int] = {}
         for a in self.actions:
             out[a.status] = out.get(a.status, 0) + 1
         return out
+
+
+@dataclass
+class RetiredSkillAction:
+    path: Path
+    # "warn" — a retired skill is still installed at this path. Reported
+    #          only; install-skills never deletes it.
+    status: str
+
+
+# Skills retired from the bundled tree. Deleting the SOURCE does not remove
+# an already-installed copy (fresh-install pairs only enumerate surviving
+# sources), so on every install-skills run we separately check each retired
+# skill's install DESTINATION and warn if it is still present, naming the
+# exact path and the manual migration recipe. This is deliberately a single
+# hardcoded table, not a general uninstall framework, and it is
+# warning-only by design: an earlier revision of this feature attempted an
+# automatic byte-identical delete, but "byte-identical" has no
+# cross-platform-safe definition (the same shipped content hashes
+# differently between a CRLF checkout and an LF checkout), and the delete
+# path could not be made safe against a hash-to-unlink race or a linked
+# directory component swapped in between the check and the delete. Warning
+# and leaving removal to the operator sidesteps all of that.
+_RETIRED_SKILLS: tuple[dict, ...] = (
+    {
+        "name": "agenttalk.sk-loop.md",
+        "claude_rel": "agenttalk.sk-loop.md",
+        "codex_rel": "agenttalk-sk-loop/SKILL.md",
+    },
+)
+
+
+def check_retired_skills(
+    *,
+    claude: bool,
+    codex: bool,
+    claude_dir: Path,
+    codex_dir: Path,
+) -> list[RetiredSkillAction]:
+    """Detect retired-skill leftovers at install destinations.
+
+    Warning-only: a retired skill still present at its install
+    destination is reported, naming the exact path, and never touched.
+    A fresh install (nothing there) and ``--dry-run`` report identically,
+    since neither path ever deletes anything.
+    """
+    out: list[RetiredSkillAction] = []
+    for retired in _RETIRED_SKILLS:
+        candidates: list[Path] = []
+        if claude:
+            candidates.append(claude_dir / retired["claude_rel"])
+        if codex:
+            candidates.append(codex_dir / retired["codex_rel"])
+        for dst in candidates:
+            if dst.exists():
+                out.append(RetiredSkillAction(path=dst, status="warn"))
+    return out
 
 
 def _claude_pairs(claude_dir: Path) -> list[tuple[Path, Path]]:
@@ -162,6 +220,14 @@ def install(
     for src, dst in pairs:
         action = _plan_one(src, dst, force=force, dry_run=dry_run)
         result.actions.append(action)
+
+    if claude or codex:
+        result.retired = check_retired_skills(
+            claude=claude,
+            codex=codex,
+            claude_dir=claude_dir,
+            codex_dir=codex_dir,
+        )
 
     return result
 

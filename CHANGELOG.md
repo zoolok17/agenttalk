@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **spec-kitty support (operator decision, 2026-09-28).** The retired
+  `agenttalk.sk-loop`/`agenttalk-sk-loop` skill is no longer bundled; the lead,
+  listen, handoff, propose and send skills now state their split-work,
+  ownership-boundary, review and no-second-state-machine invariants in
+  positive, tool-neutral wording instead of naming spec-kitty. `/api/state`
+  no longer emits a `spec_kitty` field, and the classic console drops the
+  mission pill and the mission count in the health subtitle — the generic
+  `mission`/`wp_id` thread-metadata display is unaffected; that stays as
+  plain bus metadata. `kitty-specs/` and `.kittify/` are removed from the
+  tree (git history keeps them), and the spec-kitty-specific lines are
+  removed from `.gitignore`/`.gitattributes`/`.claudeignore`.
+
+  **Existing-install migration.** `install-skills` detects a leftover
+  installed `agenttalk.sk-loop.md` / `agenttalk-sk-loop/SKILL.md` at your
+  install destinations and WARNS with the exact path and this migration
+  recipe. It never deletes anything: an earlier round of this change did
+  attempt an automatic byte-identical delete, but that turned out to have
+  no cross-platform-safe definition of "byte-identical" (CRLF vs LF
+  checkouts hash differently) and could not be made safe against a
+  hash-to-unlink race or a linked directory component, so removal is a
+  manual step:
+  ```
+  rm "<claude-commands-dir>/agenttalk.sk-loop.md"
+  rm -r "<codex-skills-dir>/agenttalk-sk-loop"
+  agenttalk install-skills --force
+  ```
+
 ## [0.94.0] - 2026-09-28
 
 Theme: **a work board that moves itself, and seats that survive a busy store.**

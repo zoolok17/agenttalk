@@ -1731,14 +1731,6 @@ def _root_state(desc: RootDescriptor,
              "kind": m.kind, "subject": m.subject or ""}
             for m in reversed(msgs[-_RECENT_LIMIT:])
         ]
-        kdir = store.root / "kitty-specs"
-        if kdir.is_dir():
-            # Filesystem detection ONLY (FR-008): never import spec-kitty.
-            out["spec_kitty"] = {
-                "kitty_specs_dir": str(kdir),
-                "missions": sorted(
-                    p.name for p in kdir.iterdir() if p.is_dir()),
-            }
         return out
     except Exception as e:  # noqa: BLE001
         # Degrade to errors-as-data for ANY failure, not just OSError/ValueError:

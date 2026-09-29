@@ -256,18 +256,6 @@ def test_listen_skills_state_release_end_only_exit_and_antipattern(path) -> None
 
 
 @pytest.mark.parametrize("path", [
-    ("claude", "agenttalk.sk-loop.md"),
-    ("codex", "agenttalk-sk-loop", "SKILL.md"),
-])
-def test_sk_loop_skills_require_authority_envelope_to_exit(path) -> None:
-    text = _skill(*path)
-    # the sk-loop must NOT say a bare kind=end exits; it must require the envelope.
-    assert "Only exit on\nmission completion, `kind=end`" not in text
-    assert "release_authority" in text and "authority_reason" in text
-    assert "KEEP LISTENING" in text
-
-
-@pytest.mark.parametrize("path", [
     ("claude", "agenttalk.lead.md"),
     ("codex", "agenttalk-lead", "SKILL.md"),
 ])

@@ -184,7 +184,7 @@ The bus accepts a fixed vocabulary of message kinds. Important kinds are:
 | `proposal` | Concrete proposal; expects `proposal-response` |
 | `proposal-response` | Proposal verdict; `accepted`, `rejected`, or `countered` |
 | `broadcast` command output | Fan-out copies, each with the same `broadcast_id` and `request_id` |
-| `wake` | Low-latency state-change signal, commonly for spec-kitty loops |
+| `wake` | Low-latency state-change signal for another process |
 | `composing` | Control-plane hint that a reply is in progress |
 | `rescind` | Supersedes the requester's own tracked request |
 | `release` | Stand-down signal requiring `--relay-human` or `--emergency` plus a reason |
@@ -312,7 +312,6 @@ Bus skills:
 | `agenttalk.propose` | `agenttalk-propose` | Ask for accept/reject/counter on a plan |
 | `agenttalk.challenge` | `agenttalk-challenge` | Ask an independent peer whether major work should be done at all |
 | `agenttalk.lead` | `agenttalk-lead` | Coordinate a named team |
-| `agenttalk.sk-loop` | `agenttalk-sk-loop` | Persistent spec-kitty implement/review loop |
 
 Dev-discipline skills:
 
@@ -386,8 +385,9 @@ If broadcast exits `5`, some copies were written and some were missed. Use
 
 Use a proposal when the peer should accept, reject, or counter a concrete plan.
 Use a consult when you need critique before answering the operator. Neither is a
-back door for hidden split work. Outside a spec-kitty mission, the human must
-approve implementation ownership splits.
+back door for hidden split work. Unless the project's chosen planning authority
+already owns the assignment, the human must approve implementation ownership
+splits.
 
 ## 9. Dashboard
 

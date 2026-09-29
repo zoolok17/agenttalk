@@ -414,7 +414,7 @@ def test_wait_warns_but_proceeds_without_refuse(
     store: Store, store_root: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
     """Default stays WARN: a live duplicate warns but the wait still arms
-    (so re-arm loops in sk-loop/listen are unaffected) and times out."""
+    (so re-arm loops in listen are unaffected) and times out."""
     monkeypatch.setattr("agenttalk.store._process_alive", lambda pid: True)
     store.write_waiting("alpha", {"agent": "alpha", "pid": 999999,
                                   "deadline_epoch": None})

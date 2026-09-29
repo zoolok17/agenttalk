@@ -72,9 +72,10 @@ use `agenttalk-handoff`. To act as a passive listener, use
 **Do NOT use this skill to coordinate splitting implementation work**
 (e.g., "I'll do the frontend, you do the backend") without first
 asking the user. See `$agenttalk-handoff` and `$agenttalk-listen` for
-the full split-work rules; the short version is: don't split outside
-a spec-kitty mission without user approval, and when a split is
-approved, every piece MUST be cross-reviewed via `$agenttalk-handoff`.
+the full split-work rules; the short version is: don't split work not
+already owned by the project's chosen planning authority without user
+approval, and when a split is approved, every piece MUST be
+cross-reviewed via `$agenttalk-handoff`.
 
 ## Prerequisites
 

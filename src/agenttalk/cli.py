@@ -9082,7 +9082,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
                                       stale_after=STALE_THRESHOLD_SECONDS)
     if _foreign is not None:
         # fix #4a (opt-in): refuse to stack a second live waiter on this
-        # mailbox. Default stays WARN (re-arm patterns in sk-loop/listen rely
+        # mailbox. Default stays WARN (re-arm patterns in listen rely
         # on it); only --refuse-stacked-wait turns the warning into exit 6.
         if getattr(args, "refuse_stacked_wait", False):
             sys.stderr.write(
@@ -9988,6 +9988,22 @@ def cmd_install_skills(args: argparse.Namespace) -> int:
     counts = res.counts()
     summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
     print(f"\nagenttalk install-skills: {summary or 'no actions'}")
+
+    if res.retired:
+        print(
+            "\nRetired skill 'sk-loop' is still installed. install-skills never "
+            "deletes it automatically (only the surviving skills above are "
+            "copied/refreshed) — remove it by hand:"
+        )
+        for r in res.retired:
+            print(f"  ! {r.path}")
+        print(
+            "\nManual migration recipe: remove the two installed sk-loop paths, "
+            "then refresh the surviving skills:\n"
+            "  rm \"<claude-commands-dir>/agenttalk.sk-loop.md\"\n"
+            "  rm -r \"<codex-skills-dir>/agenttalk-sk-loop\"\n"
+            "  agenttalk install-skills --force"
+        )
 
     if counts.get("skipped"):
         print(
