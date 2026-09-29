@@ -45,6 +45,18 @@ def test_leg_upload_includes_the_json_and_its_sibling_logs() -> None:
     assert "path: ${{ runner.temp }}/dev-gate-evidence/\n" in leg
 
 
+def test_windows_ci_job_ceiling_matches_the_231_f3_stopgap() -> None:
+    """#231 F3 (Windows CI capacity stopgap, following the #197 precedent
+    87c529a): pin the actual numbers so a silent drift back to the stale
+    180-min ceiling (which PR #230 measured at 177/180 min, 98%) is a test
+    failure, not a rediscovery under load. Linux/macOS keep the tight cap."""
+    workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")
+    assert "timeout_minutes: 270" in workflow
+    assert workflow.count("timeout_minutes: 90") == 2
+    assert "timeout_minutes: 180" not in workflow
+    assert "timeout_minutes: 120" not in workflow
+
+
 def test_security_workflow_contains_only_declared_codeql_exception() -> None:
     workflow = Path(".github/workflows/security.yml").read_text(encoding="utf-8")
 

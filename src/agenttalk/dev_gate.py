@@ -581,9 +581,18 @@ def _validate_check_command(
         # both per-run DYNAMIC flags (own value, never in the manifest's static,
         # floor-pinned `args`) - same reason neither lives in `suffix_args`.
         suffix_args = [*spec["args"], "-p", "no:cacheprovider", "--basetemp"]
-        valid = (
+        # COMPAT (#231 fix round 1): accept BOTH the shape recorded before
+        # #(ci-windows-durations) (no --junitxml pair at all - historical
+        # evidence predating this PR) and the current shape (--junitxml
+        # <path> immediately after --basetemp <path>). Cross-version
+        # validation is intentionally supported here: this check only proves
+        # a PASSING run used the committed command shape, and a record from
+        # an older gate build is still a legitimate proof of that, not a
+        # forgery - only a shape matching NEITHER form is rejected.
+        min_prefix_len = len(launcher) + 1 + len(suffix_args) + 1
+        prefix_ok = (
             item["mode"] == mode
-            and len(argv) == len(launcher) + 1 + len(suffix_args) + 1 + 2 + len(spec["paths"])
+            and len(argv) >= min_prefix_len
             and argv[: len(launcher)] == launcher
             and (
                 _is_absolute_path_text(argv[len(launcher)])
@@ -592,9 +601,16 @@ def _validate_check_command(
             )
             and argv[len(launcher) + 1 : len(launcher) + 1 + len(suffix_args)] == suffix_args
             and _is_absolute_path_text(argv[len(launcher) + 1 + len(suffix_args)])
-            and argv[len(launcher) + 2 + len(suffix_args)] == "--junitxml"
-            and _is_absolute_path_text(argv[len(launcher) + 3 + len(suffix_args)])
-            and argv[len(launcher) + 4 + len(suffix_args) :] == spec["paths"]
+        )
+        basetemp_end = min_prefix_len
+        valid = prefix_ok and (
+            argv[basetemp_end:] == spec["paths"]
+            or (
+                len(argv) >= basetemp_end + 2
+                and argv[basetemp_end] == "--junitxml"
+                and _is_absolute_path_text(argv[basetemp_end + 1])
+                and argv[basetemp_end + 2 :] == spec["paths"]
+            )
         )
     elif check_id == "package-build":
         python = require_python(expected_minors[0])
@@ -1299,23 +1315,41 @@ def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str,
         except OSError as exc:
             raise GateBlock("evidence_log_collection_failed", f"cannot collect log for {check['id']}: {exc}") from exc
         log["artifact_path"] = relative
+        # FIX ROUND 1 (#231 F1): collecting the OPTIONAL junit_xml measurement
+        # artifact is best-effort, unlike the primary log above - a report
+        # that disappeared or became unreadable (or whose bytes changed)
+        # between attachment and collection must never block publication of
+        # the rest of the (otherwise valid) leg evidence. Any failure here
+        # drops the key entirely rather than raising; the check's own status
+        # and every other field are untouched either way. This is distinct
+        # from validate_run_artifact's OWN junit_xml re-check (used when
+        # RE-validating an ALREADY-published bundle's `artifact_path`, e.g.
+        # during aggregation) - that path stays a hard GateBlock, since
+        # tampering with an artifact already bound into a published bundle
+        # must still be caught.
         if "junit_xml" in check:
             junit = check["junit_xml"]
             junit_relative = f"logs/{check['id']}.junit.xml"
             junit_destination = path.parent / junit_relative
+            junit_collected = False
             try:
                 junit_destination.parent.mkdir(parents=True, exist_ok=True)
                 junit_source = Path(junit["path"])
                 junit_content = _read_check_log(junit_source)
                 if junit_source.resolve() != junit_destination.resolve():
                     junit_destination.write_bytes(junit_content)
-                if _sha256_file(junit_destination) != junit["sha256"]:
-                    raise GateBlock("evidence_log_collection_failed", f"junit_xml hash changed for {check['id']}")
-            except OSError as exc:
-                raise GateBlock(
-                    "evidence_log_collection_failed", f"cannot collect junit_xml for {check['id']}: {exc}"
-                ) from exc
-            junit["artifact_path"] = junit_relative
+                junit_collected = _sha256_file(junit_destination) == junit["sha256"]
+            except (OSError, GateBlock):
+                junit_collected = False
+            if junit_collected:
+                junit["artifact_path"] = junit_relative
+            else:
+                print(
+                    f"agenttalk dev-gate: {check['id']}: junit-xml is a best-effort measurement "
+                    "artifact and could not be collected; omitted (check status unaffected)",
+                    file=sys.stderr,
+                )
+                del check["junit_xml"]
     payload = json.dumps(artifact, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
     try:
         write_text(path, payload, encoding="utf-8", newline="\n")
@@ -2043,12 +2077,22 @@ def _record_from_outcome(
     # independent of this field) - attach it only when it genuinely exists
     # and is within the same size bound the primary log already enforces;
     # otherwise omit the key entirely rather than recording broken evidence.
-    if (
-        junit_xml_path is not None
-        and junit_xml_path.exists()
-        and junit_xml_path.stat().st_size <= MAX_CHECK_LOG_BYTES
-    ):
-        record["junit_xml"] = {"path": str(junit_xml_path), "sha256": _sha256_file(junit_xml_path)}
+    # FIX ROUND 1 (#231 F1, codex cold read dev-4): `.exists()`/`.stat()`/the
+    # hash read can ALSO raise OSError (permission error, the file vanishing
+    # between the check and the read, ...) - that must degrade to the same
+    # "omit the key" outcome, never propagate and abort the whole record
+    # (and with it the pytest outcome's own otherwise-fine evidence).
+    if junit_xml_path is not None:
+        try:
+            attach = junit_xml_path.exists() and junit_xml_path.stat().st_size <= MAX_CHECK_LOG_BYTES
+            if attach:
+                record["junit_xml"] = {"path": str(junit_xml_path), "sha256": _sha256_file(junit_xml_path)}
+        except OSError as exc:
+            print(
+                f"agenttalk dev-gate: {check_id}: junit-xml is a best-effort measurement "
+                f"artifact and could not be read ({exc}); omitted (check status unaffected)",
+                file=sys.stderr,
+            )
     return record
 
 

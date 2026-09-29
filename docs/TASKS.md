@@ -19,7 +19,7 @@ These are the ones being worked right now, and the ones most likely to be cited 
 | # | What it is |
 |---|---|
 | ~112 | **The keystone defect.** The per-turn watchdog's own kill wedged the wrapper it was protecting: the turn never failed, the wrapper hung forever at `phase=active`. Ten instances measured today, all within ~47s of 1800s. **Fixed and SHIPPED in v0.80.0** (`e0faf96`, gated 14/14 on the post-bump commit). |
-| ~121 | **Running the dev-gate inside a wrapped turn guarantees a watchdog kill.** The watchdog fires at 1800s elapsed AND 600s of a live tool descendant; the gate's pytest leg is allowed 2700s. Gating in-turn satisfies both conditions by doing the job correctly. Fix is a detached runner, not higher thresholds. |
+| ~121 | **Running the dev-gate inside a wrapped turn guarantees a watchdog kill.** The watchdog fires at 1800s elapsed AND 600s of a live tool descendant; the gate's pytest leg is allowed 7200s (raised from 5400s, #231 F3 stopgap). Gating in-turn satisfies both conditions by doing the job correctly. Fix is a detached runner, not higher thresholds. |
 | ~122 | **Head-of-queue livelock.** A wrapped agent processes one message per turn, so a message whose processing wedges the wrapper blocks the instruction that would fix it. Recurred today: rescinding the head just promotes the next message into the same trap. |
 | ~87 | P0 supervisor recovery authority (Design 87-A). Round-3 delta panel returned 4 blockers + 4 majors; obligations tracked in `docs/rr87a-delta-panel-obligations.md`. |
 | ~105 | Team Console and doctor rendered raw wrapper health as green, so a dead CLI child looked healthy. **Fixed, green 13/13 on `a5171fc`.** |

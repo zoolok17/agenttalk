@@ -78,10 +78,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uploaded evidence to say where the time goes. Every `pytest` check (source
   and wheel, every required Python minor) now also runs with
   `--junitxml=<logs_dir>/<check_id>.junit.xml` — structured, with per-test
-  time, classname and file, so one normal CI run can point at the real
-  hotspot (git-spawn cost, bytecode effects for subprocess-heavy files, the
-  two-worker split, or something unseen) instead of guessing from a sampled
-  local measurement. `--durations=0` into the existing log was the
+  time and classname (the default xunit2 report has no `file` attribute;
+  classname maps to the module path), so one normal CI run can point at the
+  real hotspot (git-spawn cost, bytecode effects for subprocess-heavy files,
+  the two-worker split, or something unseen) instead of guessing from a
+  sampled local measurement. `--durations=0` into the existing log was the
   alternative; junitxml was preferred because it's a separate file — it adds
   no lines to pytest's console output, so nothing that parses that output
   (or the gate's own stdout grammar) is affected, and pass/fail semantics are
@@ -95,6 +96,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `logs/<check_id>.junit.xml` and re-verifies its hash, exactly like the
   existing log collection. No product behaviour change and no new
   dependency (junitxml is built into pytest).
+
+  **Fix round 1** (codex cold read): both the attachment (`_record_from_outcome`)
+  and the collection (`write_run_evidence`) steps are now fully best-effort —
+  an `OSError` from stat/hash/read at either point (a permission error, the
+  report vanishing or changing between the two steps) degrades to "omit the
+  field", never aborts the check's own evidence or blocks publication of the
+  rest of the leg. Re-validating an artifact ALREADY bound into a published
+  bundle (e.g. during aggregation) still hard-rejects tampering — that
+  integrity guarantee is unchanged. The evidence's positional argv-shape
+  validator now accepts both the pre-junitxml command shape (records from a
+  gate build predating this change) and the current one, so historical
+  evidence keeps validating.
+
+### CI
+
+- **Dev-gate Windows budget stopgap: pytest cap 5400s → 7200s, Windows job
+  ceiling 180 → 270 min (#231 F3, following the #197 precedent, `87c529a`).**
+  PR #230's dev-gate windows/3.11 run had its source pytest killed at the
+  5400s cap at 93% complete with no failing test, its wheel run took 5085s
+  (94% of the cap), and the job used 177 of its 180-min ceiling; Windows legs
+  generally now take 125-177 min, well past the `tests.yml` comment's stale
+  "~55-65 min per run" (2026-09-25) figure. 270 min covers two pytest runs
+  each capped at 120 min plus roughly 30 min of setup and the other per-leg
+  checks, within GitHub's 360-min job maximum; Linux and macOS stay at 90.
+  This is a stopgap, not a fix — the real fix follows the per-test duration
+  measurement this PR adds.
 
 ## [0.94.0] - 2026-09-28
 
