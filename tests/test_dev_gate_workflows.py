@@ -62,6 +62,21 @@ def test_leg_uploads_timings_as_a_separate_unverified_artifact() -> None:
     assert "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" in timings_step.split("- name:")[0]
 
 
+def test_timings_upload_is_non_voting_but_evidence_upload_stays_strict() -> None:
+    """FIX ROUND 1 (#231 recast, codex cold read dev-5, M2): if-no-files-found:
+    ignore only covers an EMPTY search - a real read/upload-service error in
+    the pinned action still calls core.setFailed and would fail the leg over
+    a diagnostic. The timings step needs its own continue-on-error: true; the
+    evidence step must NOT have it, since a broken evidence upload is a real
+    gate failure."""
+    workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")
+    leg = workflow.split("  dev-gate-aggregate:")[0]
+    evidence_step = leg.split("- name: Upload leg evidence")[1].split("- name:")[0]
+    timings_step = leg.split("- name: Upload leg timings")[1].split("- name:")[0]
+    assert "continue-on-error" not in evidence_step
+    assert "continue-on-error: true" in timings_step
+
+
 def test_windows_ci_job_ceiling_matches_the_231_f3_stopgap() -> None:
     """#231 F3 (Windows CI capacity stopgap, following the #197 precedent
     87c529a): pin the actual numbers so a silent drift back to the stale

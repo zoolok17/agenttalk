@@ -127,6 +127,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   artifact, `if: always()` and `if-no-files-found: ignore`, clearly
   commented as unverified diagnostic data, not gate evidence.
 
+  **Fix round 1 after the recast** (codex cold read dev-5, two majors): (M1)
+  pointing `--junitxml` directly at the caller-supplied
+  `AGENTTALK_DEV_GATE_TIMINGS_DIR` let pytest's own writer, running inside
+  the VOTING subprocess, turn a genuinely passing run into `check_failed`
+  whenever that path was unusable (e.g. an existing regular file, not a
+  directory) — reproduced with a real pytest subprocess. Fixed by always
+  writing into a directory the gate itself freshly creates next to its own
+  `basetemp` (as reliable as `basetemp`, never caller-supplied); only AFTER
+  `run_command` returns, with status already fixed from pytest's own exit
+  code, is that file copied best-effort into `AGENTTALK_DEV_GATE_TIMINGS_DIR`
+  — any failure there is a stderr diagnostic only and never changes status,
+  reruns pytest, or touches the evidence bundle. (M2) the "Upload leg
+  timings" step had no `continue-on-error`; `if-no-files-found: ignore` only
+  covers an empty search, so a real read/upload-service error in the pinned
+  action still failed the leg. Fixed with `continue-on-error: true` on that
+  step only — the evidence upload stays strict.
+
 ### CI
 
 - **Dev-gate Windows budget stopgap: pytest cap 5400s → 7200s, Windows job

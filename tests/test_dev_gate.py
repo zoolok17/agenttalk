@@ -1225,7 +1225,14 @@ def test_run_pytest_mode_adds_junitxml_only_when_timings_dir_is_set(
     """The timing record is DIAGNOSTICS, never evidence: --junitxml is added
     to the real argv only when AGENTTALK_DEV_GATE_TIMINGS_DIR is set (as
     tests.yml does), pointing OUTSIDE logs_dir - and is entirely absent,
-    with no env var read at all producing a flag, when unset."""
+    with no env var read at all producing a flag, when unset.
+
+    FIX ROUND 1 (#231 recast, codex cold read dev-5): the flag must point at
+    an internal directory the GATE itself freshly creates next to its own
+    basetemp (run_root/timings/), NEVER directly at the caller-supplied
+    AGENTTALK_DEV_GATE_TIMINGS_DIR - that value is only used afterwards, as
+    a best-effort copy destination (covered by the real-subprocess tests
+    below), so a bad value there can never reach pytest's own writer."""
     interpreter = dev_gate.InterpreterInfo(
         requested=f"{sys.version_info.major}.{sys.version_info.minor}",
         path=Path(sys.executable).resolve(),
@@ -1248,30 +1255,142 @@ def test_run_pytest_mode_adds_junitxml_only_when_timings_dir_is_set(
 
     monkeypatch.setattr(dev_gate, "run_command", run)
     manifest = _manifest()
+    basetemp = tmp_path / "pytest-temp"
 
     monkeypatch.delenv("AGENTTALK_DEV_GATE_TIMINGS_DIR", raising=False)
     record = dev_gate._run_pytest_mode(
         mode="source", interpreter=interpreter, source_root=tmp_path,
         import_root=tmp_path / "src", env=dev_gate._base_env(tmp_path),
         expected_version="0.78.1", manifest=manifest,
-        basetemp=tmp_path / "pytest-temp", logs_dir=tmp_path / "logs-unset",
+        basetemp=basetemp, logs_dir=tmp_path / "logs-unset",
     )
     assert "--junitxml" not in calls[-1]
     assert "junit_xml" not in record
 
-    timings_dir = tmp_path / "timings"
-    monkeypatch.setenv("AGENTTALK_DEV_GATE_TIMINGS_DIR", str(timings_dir))
+    export_dir = tmp_path / "external-timings-export"
+    monkeypatch.setenv("AGENTTALK_DEV_GATE_TIMINGS_DIR", str(export_dir))
     record = dev_gate._run_pytest_mode(
         mode="source", interpreter=interpreter, source_root=tmp_path,
         import_root=tmp_path / "src", env=dev_gate._base_env(tmp_path),
         expected_version="0.78.1", manifest=manifest,
-        basetemp=tmp_path / "pytest-temp", logs_dir=tmp_path / "logs-set",
+        basetemp=basetemp, logs_dir=tmp_path / "logs-set",
     )
     argv = calls[-1]
     assert "--junitxml" in argv
     junit_path = Path(argv[argv.index("--junitxml") + 1])
-    assert junit_path.parent == timings_dir
+    assert junit_path.parent == basetemp.parent / "timings"
+    assert junit_path.parent.is_dir(), "the gate must create this directory itself, like basetemp"
+    assert junit_path.parent != export_dir
     assert junit_path.parent != (tmp_path / "logs-set")
+    assert "junit_xml" not in record
+    # the mocked run_command never wrote the internal file, so the
+    # best-effort export must have been skipped, not raised
+    assert not export_dir.exists()
+
+
+def _run_real_pytest_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    test_body: str,
+    timings_dir: Path | None,
+) -> dict:
+    """Invoke the REAL `_run_pytest_mode`, with a real `pytest` subprocess
+    (run_command is NOT mocked) against a tiny one-test scratch file - only
+    the interpreter/version probing (irrelevant to the M1 bug) is mocked."""
+    source_root = tmp_path / "src"
+    source_root.mkdir()
+    (source_root / "test_sample.py").write_text(test_body, encoding="utf-8")
+    monkeypatch.setattr(dev_gate, "_probe_python_module", lambda *_a, **_k: "pytest 8.0.0")
+    monkeypatch.setattr(dev_gate, "import_probe", lambda *_a, **_k: None)
+    if timings_dir is None:
+        monkeypatch.delenv("AGENTTALK_DEV_GATE_TIMINGS_DIR", raising=False)
+    else:
+        monkeypatch.setenv("AGENTTALK_DEV_GATE_TIMINGS_DIR", str(timings_dir))
+    interpreter = dev_gate.InterpreterInfo(
+        requested=f"{sys.version_info.major}.{sys.version_info.minor}",
+        path=Path(sys.executable).resolve(),
+        implementation="CPython",
+        version=platform.python_version(),
+    )
+    manifest = {"checks": {"pytest": {"args": ["-q"], "paths": ["test_sample.py"], "timeout_seconds": 60}}}
+    run_root = tmp_path / "run"
+    return dev_gate._run_pytest_mode(
+        mode="source",
+        interpreter=interpreter,
+        source_root=source_root,
+        import_root=source_root,
+        env={**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"},
+        expected_version="0.0.0",
+        manifest=manifest,
+        basetemp=run_root / "pytest-temp",
+        logs_dir=run_root / "logs",
+    )
+
+
+def test_real_pytest_subprocess_stays_pass_when_the_timings_export_target_is_a_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """FIX ROUND 1 (#231 recast, codex cold read dev-5): reproduces the exact
+    bug - a real pytest subprocess, with AGENTTALK_DEV_GATE_TIMINGS_DIR
+    pointing at an existing REGULAR FILE (not a directory). Before this fix,
+    pytest's own --junitxml writer targeted that path directly and raised
+    FileExistsError from os.makedirs() inside pytest_sessionfinish, turning
+    a passing run into check_failed. Now pytest writes into the gate's own
+    internal directory (always reliable), and only the AFTERWARDS best-effort
+    export to the bad path fails - status must stay pass, with a stderr
+    diagnostic, and nothing written into any evidence bundle."""
+    not_a_dir = tmp_path / "timings-export-is-a-file"
+    not_a_dir.write_text("not a directory", encoding="utf-8")
+
+    record = _run_real_pytest_mode(
+        tmp_path, monkeypatch,
+        test_body="def test_one():\n    assert 1 == 1\n",
+        timings_dir=not_a_dir,
+    )
+
+    assert record["status"] == "pass"
+    assert "junit_xml" not in record
+    captured = capsys.readouterr()
+    assert "timings export" in captured.err
+    assert record["id"] in captured.err
+    # the bad path is untouched - still the same regular file, no debris
+    assert not_a_dir.is_file()
+    assert not_a_dir.read_text(encoding="utf-8") == "not a directory"
+
+
+def test_real_pytest_subprocess_a_genuine_test_failure_still_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Control for the fix above: with the SAME timings env set to a
+    perfectly writable directory, a genuinely failing test must still fail -
+    the fix must not convert nonzero pytest exits into passes."""
+    timings_dir = tmp_path / "timings-export"
+    record = _run_real_pytest_mode(
+        tmp_path, monkeypatch,
+        test_body="def test_one():\n    assert 1 == 2\n",
+        timings_dir=timings_dir,
+    )
+    assert record["status"] == "fail"
+    assert "junit_xml" not in record
+
+
+def test_real_pytest_subprocess_exports_the_file_to_a_writable_timings_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ordinary, happy-path case: a genuinely writable
+    AGENTTALK_DEV_GATE_TIMINGS_DIR receives a real copy of the junit report
+    pytest wrote into the gate's internal directory."""
+    timings_dir = tmp_path / "timings-export"
+    record = _run_real_pytest_mode(
+        tmp_path, monkeypatch,
+        test_body="def test_one():\n    assert 1 == 1\n",
+        timings_dir=timings_dir,
+    )
+    assert record["status"] == "pass"
+    exported = timings_dir / f"{record['id']}.junit.xml"
+    assert exported.is_file()
+    assert 'name="test_one"' in exported.read_text(encoding="utf-8")
     assert "junit_xml" not in record
 
 

@@ -2567,15 +2567,28 @@ def _run_pytest_mode(
     # call stack, and an env var needs no signature threaded through every
     # intermediate caller - same AGENTTALK_DEV_GATE_<PURPOSE> convention as
     # the existing AGENTTALK_DEV_GATE_COMMITTED_SRC) is set only by
-    # tests.yml, pointing at a directory OUTSIDE the evidence bundle and
-    # outside anything write_run_evidence collects. When unset (local runs),
-    # no --junitxml is added at all - nothing about timings is hashed,
-    # bound, or collected by the gate.
+    # tests.yml. When unset (local runs), no --junitxml is added at all.
+    # FIX ROUND 1 (#231 recast, codex cold read dev-5): pytest's own
+    # --junitxml writer runs INSIDE the voting subprocess (pytest_sessionfinish),
+    # so pointing it directly at the CALLER-supplied AGENTTALK_DEV_GATE_TIMINGS_DIR
+    # let a bad value there (e.g. an existing regular file, not a directory)
+    # turn a genuinely passing run into a gate failure - a diagnostic write
+    # error must never change the voting verdict. pytest instead always
+    # writes into a directory the GATE itself freshly creates next to its own
+    # basetemp (run_root/timings/, exactly as reliable as basetemp: both are
+    # mkdir'd by this process under the mkdtemp'd run_root, never
+    # caller-supplied). Only AFTER run_command returns - status already fixed
+    # from pytest's own exit code - is that file copied, best-effort, into
+    # AGENTTALK_DEV_GATE_TIMINGS_DIR if set; any failure there is a stderr
+    # diagnostic only and never touches status, never reruns pytest, and
+    # never writes into the evidence bundle.
     timings_dir = os.environ.get("AGENTTALK_DEV_GATE_TIMINGS_DIR")
     extra_args: list[str] = []
+    internal_junit_path: Path | None = None
     if timings_dir:
-        junit_path = Path(timings_dir) / f"{check_id}.junit.xml"
-        extra_args = ["--junitxml", str(junit_path)]
+        internal_junit_path = basetemp.parent / "timings" / f"{check_id}.junit.xml"
+        internal_junit_path.parent.mkdir(parents=True, exist_ok=True)
+        extra_args = ["--junitxml", str(internal_junit_path)]
     argv = isolated_tool_argv(
         interpreter.path,
         "pytest",
@@ -2596,6 +2609,19 @@ def _run_pytest_mode(
         timeout_seconds=int(spec["timeout_seconds"]),
         logs_dir=logs_dir,
     )
+    if internal_junit_path is not None and timings_dir:
+        try:
+            if internal_junit_path.is_file():
+                export_path = Path(timings_dir) / f"{check_id}.junit.xml"
+                export_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(internal_junit_path, export_path)
+        except OSError as exc:
+            print(
+                f"agenttalk dev-gate: {check_id}: timings export to "
+                f"AGENTTALK_DEV_GATE_TIMINGS_DIR is a best-effort diagnostic copy "
+                f"and failed ({exc}); the check result is unaffected",
+                file=sys.stderr,
+            )
     return _record_from_outcome(
         check_id,
         "pytest",

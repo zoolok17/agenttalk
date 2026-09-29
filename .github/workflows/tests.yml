@@ -101,9 +101,11 @@ jobs:
         env:
           # RECAST (#231, stopping rule): the timing record is DIAGNOSTICS,
           # never evidence - set only here, by CI, never by a local run.
-          # dev_gate.py adds --junitxml to the pytest checks only when this
-          # is set, writing into a directory outside anything the gate
-          # hashes or binds into dev-gate-evidence.json.
+          # dev_gate.py always writes pytest's --junitxml into its own
+          # internal scratch dir first (as reliable as its basetemp), then
+          # best-effort copies the file here afterwards, once the check's
+          # pass/fail status is already fixed from pytest's own exit code -
+          # this directory is never hashed or bound into dev-gate-evidence.json.
           AGENTTALK_DEV_GATE_TIMINGS_DIR: ${{ runner.temp }}/dev-gate-timings
         run: >
           python -I -m agenttalk dev-gate
@@ -121,9 +123,14 @@ jobs:
       - name: Upload leg timings
         # Unverified diagnostic data, not gate evidence: junit XML written by
         # pytest for per-test CI-time measurement only. Never hashed or bound
-        # by the gate (see AGENTTALK_DEV_GATE_TIMINGS_DIR above) - a missing
-        # or partial file here must never fail the job.
+        # by the gate (see AGENTTALK_DEV_GATE_TIMINGS_DIR above). Non-voting:
+        # if-no-files-found: ignore only covers an empty search - a real
+        # read/upload-service error in the pinned action still calls
+        # core.setFailed, so continue-on-error is required here too; a
+        # missing or partial timings file must never fail the leg. The
+        # evidence upload above stays strict (no continue-on-error).
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: dev-gate-timings-${{ matrix.os.id }}-${{ matrix.python-version }}
