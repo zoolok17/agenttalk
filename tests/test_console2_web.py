@@ -624,9 +624,11 @@ def test_midnight_text_tokens_meet_wcag_aa_contrast_on_their_backgrounds() -> No
         assert ratio >= 4.5, (text_key, bg_key, midnight[text_key], midnight[bg_key], round(ratio, 2))
 
 
-# Paper tone-down (operator feedback 2026-09-29): same text-token-on-background pairs as Midnight
-# above - Paper is now reviewed too, not just carrying its variables.
-PAPER_TEXT_ON_BG = MIDNIGHT_TEXT_ON_BG
+# Paper tone-down (operator feedback 2026-09-29): the same text-token-on-background pairs as
+# Midnight above, plus the needs-count badge's own dedicated ink-on-fill pair (fix round 1, F1) -
+# introduced BECAUSE the badge used to paint a fixed #111 straight onto --warn, and deepening --warn
+# for body text (to pass the pairs above) dropped that pair from 5.13:1 to 3.24:1.
+PAPER_TEXT_ON_BG = [*MIDNIGHT_TEXT_ON_BG, ("badge-ink", "badge-bg")]
 
 
 def test_paper_text_tokens_meet_wcag_aa_contrast_on_their_backgrounds() -> None:
@@ -701,6 +703,21 @@ def test_avatar_badge_text_meets_wcag_aa_contrast_undimmed_by_the_stale_state() 
     for text_key, bg_key in BADGE_TEXT_ON_FILL:
         ratio = _contrast(midnight[text_key], midnight[bg_key])
         assert ratio >= 4.5, (text_key, bg_key, midnight[text_key], midnight[bg_key], round(ratio, 2))
+
+
+# Paper fix round 1 (F2): .c2-rt/.c2-avatar-badge painted var(--bg) as the runtime-letter ink - on
+# the UNCHANGED rt-claude/rt-codex/rt-qwen fills, Paper's darker --bg (the tone-down) dropped Claude
+# from 4.60 to 3.91 and Codex from 4.62 to 3.93. Paper now declares its own --rt-ink (#FFFFFF),
+# decoupled from --bg; every theme still paints via var(--rt-ink) (Midnight/Synthwave/Terminal
+# default it to var(--bg), unchanged).
+PAPER_BADGE_TEXT_ON_FILL = [("rt-ink", "dim"), ("rt-ink", "rt-claude"), ("rt-ink", "rt-codex"), ("rt-ink", "rt-qwen")]
+
+
+def test_paper_avatar_badge_text_meets_wcag_aa_contrast_undimmed_by_the_stale_state() -> None:
+    paper = _theme_blocks()["paper"]
+    for text_key, bg_key in PAPER_BADGE_TEXT_ON_FILL:
+        ratio = _contrast(paper[text_key], paper[bg_key])
+        assert ratio >= 4.5, (text_key, bg_key, paper[text_key], paper[bg_key], round(ratio, 2))
 
 
 def test_the_badge_at_the_old_whole_avatar_opacity_would_have_failed_contrast() -> None:

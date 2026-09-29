@@ -38,6 +38,11 @@
   --rt-claude: #D08A5E;
   --rt-codex: #4FB3A0;
   --rt-qwen: #9E82E0;
+  /* Dedicated pairs so a surface/status retune (e.g. Paper's --warn) never silently drags a
+     fixed-ink badge with it - see the Paper block below for why these exist at all. */
+  --badge-bg: var(--warn);
+  --badge-ink: #111111;
+  --rt-ink: var(--bg);
 
   --font-ui: system-ui, "Segoe UI", -apple-system, Roboto, "Helvetica Neue", Arial, sans-serif;
   --font-mono: ui-monospace, "Cascadia Code", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
@@ -59,8 +64,21 @@
    these darker surfaces - see PAPER_TEXT_ON_BG in test_console2_web.py for
    the exact pairs and test_paper_text_tokens_meet_wcag_aa_contrast_on_their_
    backgrounds for the measured ratios (worst case 4.57:1, ok on panel2).
-   --fg, --serif, --accent, --accent-ink and the rt-* runtime badge colours
-   are unchanged - all already comfortably legible on the new surfaces. */
+   --fg, --serif, --accent and --accent-ink are unchanged, already comfortably
+   legible on the new surfaces.
+
+   Fix round 1 (codex cold read, F1/F2): two fixed-ink badges silently rode
+   along with tokens they were never meant to depend on. The needs-count
+   badge (.c2-badge) painted a fixed #111 on --warn directly - deepening
+   --warn for body text (above) dropped that pair from 5.13:1 to 3.24:1. It
+   now gets its OWN --badge-bg, the original (lighter) Paper warn value,
+   decoupled from the body-text --warn; --badge-ink stays the same #111 the
+   other themes use (still 5.13:1, unchanged from before the tone-down). The
+   9px runtime-letter badges (.c2-rt/.c2-avatar-badge) painted var(--bg) as
+   their ink on the UNCHANGED rt-claude/rt-codex/rt-qwen fills - Paper's
+   darker --bg dropped Claude from 4.60 to 3.91 and Codex from 4.62 to 3.93.
+   --rt-ink is now a dedicated #FFFFFF for Paper (5.10/5.12/6.19 on the same
+   three fills, 7.27 on --dim's fallback fill), instead of following --bg. */
 :root[data-theme="paper"] {
   --bg: #E6E1D6;
   --panel: #EFEBE2;
@@ -68,6 +86,9 @@
   --border: #C9C0AC;
   --fg: #1D1B17;
   --dim: #5C564C;
+  --badge-bg: #B7780A;
+  --badge-ink: #111111;
+  --rt-ink: #FFFFFF;
   --accent: #C9481F;
   --accent-ink: #FFFFFF;
   --ok: #21734E;
@@ -323,12 +344,12 @@ html, body {
   font-size: 10.5px;
   font-weight: 700;
   padding: 0 6px;
-  color: #111;
-  background: var(--warn);
+  color: var(--badge-ink);
+  background: var(--badge-bg);
   border-radius: var(--r-pill);
 }
 .c2-badge.is-empty { display: none; }
-.c2-seg button[aria-pressed="true"] .c2-badge { color: #111; }
+.c2-seg button[aria-pressed="true"] .c2-badge { color: var(--badge-ink); }
 
 /* Offline / silent banner. */
 .c2-banner {
@@ -484,7 +505,7 @@ html, body {
   font-family: var(--font-mono);
   font-size: 9px;
   font-weight: 700;
-  color: var(--bg);
+  color: var(--rt-ink);
   background: var(--dim);
   border-radius: 4px;
 }
@@ -517,7 +538,7 @@ html, body {
   font-family: var(--font-mono);
   font-size: 9px;
   font-weight: 700;
-  color: var(--bg);
+  color: var(--rt-ink);
   background: var(--dim);
   border: 2px solid var(--panel);
   border-radius: 4px;
