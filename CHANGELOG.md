@@ -81,6 +81,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Python caller's subprocess timeout is 240s to fit the worst case. Test harness
   only; every scroll/focus/visibility/sabotage-detection assertion is unchanged.
 
+- Fix #235: `tests/test_compact.py`'s "now, an hour ahead" reference
+  (`keep_age_days=0.0` leaves nothing "young") was a module-level constant
+  computed once at IMPORT time. When the file's tests ran more than an hour
+  after pytest collected them, that frozen reference was already in the past
+  and compaction archived nothing — 8 failures on a slow Windows xdist probe
+  run (issue #235). It is now computed fresh at call time by every test that
+  needs it. Test-only; every assertion is unchanged.
+
 ## [0.94.0] - 2026-09-28
 
 Theme: **a work board that moves itself, and seats that survive a busy store.**
