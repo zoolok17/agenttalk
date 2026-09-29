@@ -473,6 +473,15 @@ def test_committed_pytest_timeout_has_wheel_leg_headroom() -> None:
     assert manifest["checks"]["pytest"]["timeout_seconds"] >= 2400
 
 
+def test_committed_pytest_timeout_matches_the_windows_capacity_stopgap() -> None:
+    """Windows CI capacity stopgap: pin the exact current cap (raised 5400 -> 7200,
+    following the #197 precedent 87c529a) so a silent drift is a test failure, not a
+    rediscovery under load - PR #230's dev-gate windows/3.11 run had its
+    source pytest killed at the old 5400s cap at 93% complete."""
+    manifest = _manifest()
+    assert manifest["checks"]["pytest"]["timeout_seconds"] == 7200
+
+
 def test_logical_plan_digest_is_runtime_path_independent_and_semantic() -> None:
     manifest = dev_gate.validate_manifest(_manifest())
     original = dev_gate.logical_plan_digest(manifest, "release")

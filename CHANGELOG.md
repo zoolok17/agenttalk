@@ -81,6 +81,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Python caller's subprocess timeout is 240s to fit the worst case. Test harness
   only; every scroll/focus/visibility/sabotage-detection assertion is unchanged.
 
+### CI
+
+- **Windows CI capacity stopgap.** Master run 36571318073 (`e6b6421`) killed
+  dev-gate windows/3.13's source pytest at the 5400s per-run cap with no
+  failing test; a PR #231 serial run measured windows 3.11 and 3.12 source
+  pytest at ~5750s each. Following the #197 precedent (`87c529a`): the pytest
+  `timeout_seconds` cap is raised 5400 -> 7200 (`dev-gate.json`), and the
+  Windows CI job ceiling 180 -> 270 minutes (two capped 120-min pytest runs
+  plus ~30 min setup/other checks, within GitHub's 360-min job maximum);
+  Linux/macOS stay at 90. This is a stopgap, not the real fix — that follows
+  a per-test duration measurement.
+
 ## [0.94.0] - 2026-09-28
 
 Theme: **a work board that moves itself, and seats that survive a busy store.**
