@@ -12,9 +12,10 @@
    plus the runtime badge colours. Terminal keeps the same layout and only flips
    the fonts to mono and every radius to 0.
 
-   Only Midnight is styled and reviewed in this slice. Paper, Synthwave and
-   Terminal carry their variables so the engine is exercised; Paper uses the two
-   contrast fixes the handoff recommends (06-RULES: dim, accent), not yet reviewed.
+   Only Midnight is styled and reviewed in this slice. Synthwave and Terminal
+   carry their variables so the engine is exercised, not yet reviewed. Paper
+   is now also reviewed (operator feedback 2026-09-29: "EXTREMELY bright") -
+   see the Paper block below for what deviates from the raw handoff and why.
    ============================================================================= */
 
 /* ------------------------------------------------------------------ tokens */
@@ -48,19 +49,31 @@
   --r-logo: 9px;
 }
 
+/* Paper (operator feedback 2026-09-29: "EXTREMELY bright" - pure-white panels
+   on a near-white bg read as glare, not a calm light theme). No pure white
+   surfaces: bg/panel/panel2 are warm, mid-light greiges a clear step apart,
+   border a step darker again for real division visibility (was ~1.3:1
+   against panel; now ~1.5:1). --dim, --ok, --warn, --bad and --info are all
+   deepened from the raw handoff tokens (design/console-v2/tokens/themes.json)
+   so every text-token-on-panel pairing still clears WCAG AA (4.5:1) against
+   these darker surfaces - see PAPER_TEXT_ON_BG in test_console2_web.py for
+   the exact pairs and test_paper_text_tokens_meet_wcag_aa_contrast_on_their_
+   backgrounds for the measured ratios (worst case 4.57:1, ok on panel2).
+   --fg, --serif, --accent, --accent-ink and the rt-* runtime badge colours
+   are unchanged - all already comfortably legible on the new surfaces. */
 :root[data-theme="paper"] {
-  --bg: #F6F3EC;
-  --panel: #FFFFFF;
-  --panel2: #FBF9F4;
-  --border: #E5E0D4;
+  --bg: #E6E1D6;
+  --panel: #EFEBE2;
+  --panel2: #E9E4D9;
+  --border: #C9C0AC;
   --fg: #1D1B17;
-  --dim: #6B655B;
+  --dim: #5C564C;
   --accent: #C9481F;
   --accent-ink: #FFFFFF;
-  --ok: #2E9F6B;
-  --warn: #B7780A;
-  --bad: #D2402F;
-  --info: #2F6FC9;
+  --ok: #21734E;
+  --warn: #8B5B08;
+  --bad: #B63627;
+  --info: #2A64B4;
   --serif: #1D1B17;
   --rt-claude: #B0532C;
   --rt-codex: #2C7A6B;
