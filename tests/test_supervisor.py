@@ -15779,13 +15779,6 @@ def test_attended_process_tree_reset_retires_stale_runtime_before_relaunch_plan(
         launcher_nonce_injected=True,
     )
     second_report = json.loads(json.dumps(report))
-    # Admission proof is distinct from process ownership. Complete it so the
-    # assertions below continue to exercise stale-runtime refusal and fresh
-    # generation adoption, rather than the earlier startup-proof pending gate.
-    second_report["agents"]["worker"]["codex_bus_proof"] = {
-        "agent": "worker", "nonce": OTHER_NONCE,
-        "message_id": "replacement-proof", "ready_epoch": NOW + 2,
-    }
     second_report["agents"]["worker"]["restart_request"] = _auth_marker(
         "rr-before-replacement-runtime"
     )
@@ -15819,9 +15812,6 @@ def test_attended_process_tree_reset_retires_stale_runtime_before_relaunch_plan(
     # The boundary applies only to the exact retired observation. A new wrapper
     # generation follows the ordinary fail-closed adoption path.
     fresh_report = json.loads(json.dumps(report))
-    fresh_report["agents"]["worker"]["codex_bus_proof"] = (
-        second_report["agents"]["worker"]["codex_bus_proof"]
-    )
     fresh_report["agents"]["worker"]["restart_request"] = None
     fresh_report["agents"]["worker"]["wrapper_runtime"] = (
         _wrapper_runtime_view(

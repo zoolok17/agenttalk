@@ -563,8 +563,6 @@ def _child_env(
                 LEAD_LOOP_LEASE_ENV,
                 WRAPPER_GENERATION_ENV,
                 INBOUND_REQUEST_ID_ENV,
-                "AGENTTALK_CODEX_BUS_PROBE",
-                "AGENTTALK_CODEX_BUS_PROBE_DEADLINE",
                 *_WRAPPER_LOG_ENV_NAMES,
             }
         }
@@ -1102,6 +1100,7 @@ def classify_bus_execution(
     output: object,
     exit_status: object = None,
     raw_event: object = None,
+    *, store_dir: Path | None = None,
 ) -> dict[str, str]:
     """Classify a completed agenttalk bus command without inferring failure from text alone."""
     command_text = _command_text(command)
@@ -1115,6 +1114,11 @@ def classify_bus_execution(
     failed = _bus_execution_failed(exit_status, raw_event)
     if not failed:
         return _bus_result(BUS_KIND_OK_OR_NO_SIGNAL, "no_failed_execution_signal", "")
+    if store_dir is not None and verb in (_REQUIRED_BUS_WRITE_VERBS | _BEST_EFFORT_BUS_VERBS):
+        from agenttalk import codex_preflight
+        if codex_preflight.is_store_permission_denial(text, store_dir):
+            return _bus_result(codex_preflight.BUS_PERMISSION_DENIED, "store_access_denied",
+                               "Codex bus write denied under the message store; repair guard ACL inheritance")
     runtime_blocked = _runtime_config_blocked_summary(text)
     if runtime_blocked:
         return _bus_result(BUS_KIND_CONFIG_BLOCKED, "agenttalk_runtime", runtime_blocked)
@@ -1394,98 +1398,6 @@ def _default_render(event: Event) -> None:
 def _default_info(signal) -> None:
     sys.stderr.write(f"[degraded:{signal.confidence}] {signal.reason}\n")
     sys.stderr.flush()
-
-
-def run_codex_startup_probe(store, agent: str, base_argv: list[str], nonce: str, *,
-                            timeout: float | None = None, clock=time.monotonic,
-                            sleep=time.sleep, popen=None, session_state=None,
-                            persist=None) -> bool:
-    """One bounded Codex turn before inbox consumption; never a work retry.
-
-    The receipt is written by a restricted shell command, not this host wrapper.
-    Waiting occurs in this seat's wrapper, never in the supervisor polling process.
-    Ctrl-C/termination and supervisor.kill cancel it. Use the work session's
-    normal resume path; never substitute an isolated diagnostic session.
-    """
-    from agenttalk import codex_preflight as cp
-    from . import session
-    from .turn_watchdog import descendants_of, kill_targets, snapshot_processes
-
-    timeout = cp.PROBE_SECONDS if timeout is None else timeout
-    if (store.dir / "supervisor.kill").exists():
-        return False
-    child_env = _child_env(store.root)
-    prompt = cp.probe_prompt(store, agent, nonce, child_env["AGENTTALK_PY"])
-    session_state = session_state or session.SessionState(cli="codex")
-    spec = session.build_turn(session_state, prompt)
-    start = clock()
-    proc = (popen or subprocess.Popen)(  # noqa: S603  # nosec B603
-        [*base_argv, *spec.args, prompt],
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        env=child_env, **_child_window_kwargs(child_env),
-    )
-    succeeded = False
-    try:
-        eof = False
-        pending = b""
-        while True:
-            if (store.dir / "supervisor.kill").exists() or clock() - start >= timeout:
-                return False
-            # Drain without retaining model output, and wait for EOF as well as
-            # root exit (native launchers can hand stdout to a child process).
-            chunk = b"" if eof else _read_ready_pipe_chunk(proc.stdout)
-            eof = eof or chunk == b""
-            if chunk:
-                pending += chunk
-                while b"\n" in pending:
-                    line, pending = pending.split(b"\n", 1)
-                    try:
-                        event = json.loads(line)
-                    except (ValueError, UnicodeError):
-                        continue
-                    if isinstance(event, dict) and event.get("type") == "thread.started":
-                        session.observe_event(session_state, event)
-                        if persist is not None:
-                            persist(session_state)
-                if len(pending) > 1024 * 1024:
-                    return False
-            if eof and proc.poll() is not None:
-                receipt = cp.read_bus_proof(store, agent)
-                ok = proc.returncode == 0 and receipt is not None and receipt.get("nonce") == nonce
-                if ok:
-                    session_state.turns += 1
-                    if persist is not None:
-                        persist(session_state)
-                succeeded = ok
-                return ok
-            if not chunk:
-                sleep(min(0.2, max(0, timeout - (clock() - start))))
-    finally:
-        if proc.stdout:
-            proc.stdout.close()
-        if not succeeded:
-            # Mirror the existing watchdog's start-guarded descendant cleanup.
-            # The root itself uses our retained Popen handle, not a stale PID.
-            snapshot = snapshot_processes(timeout=2.0)
-            # The launcher may already have exited while a descendant keeps
-            # stdout open. Its parent-chain still identifies cleanup targets.
-            if snapshot:
-                targets = [{"pid": pid, "start": snapshot[pid].get("create_epoch")}
-                           for pid in reversed(descendants_of(snapshot, proc.pid))]
-                cleanup_until = time.monotonic() + 5.0
-                for target in targets:
-                    if time.monotonic() >= cleanup_until:
-                        sys.stderr.write("Codex startup probe: descendant cleanup budget exhausted.\n")
-                        break
-                    # Each identity recheck is itself capped at five seconds.
-                    kill_targets([target])
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=2)
 
 
 def run_wrapper(
@@ -2201,6 +2113,9 @@ def _classify_drive_failure(
     if wd:
         summary = wd.get("summary") if isinstance(wd, dict) else None
         return CLASS_AMBIGUOUS, summary or "turn watchdog killed hung tool descendant"
+    bus_failure = sig.get("bus_failure")
+    if isinstance(bus_failure, dict) and bus_failure.get("kind") == "codex_bus_permission_denied":
+        return "codex_bus_permission_denied", bus_failure["summary"]
     if sig.get("config_blocked"):
         summary = sig.get("config_blocked_text")
         return CLASS_CONFIG_BLOCKED, summary or "deterministic exec permission denied"
@@ -2778,8 +2693,13 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                         verb = _bus_command_verb(ev.tool)
                         if verb in _REQUIRED_BUS_WRITE_VERBS:
                             sig["bus_action_attempted"] = True
-                        bus = classify_bus_execution(ev.tool, ev.text, ev.exit_code, ev.raw)
-                        if bus["kind"] == BUS_KIND_CONFIG_BLOCKED:
+                        bus = classify_bus_execution(ev.tool, ev.text, ev.exit_code, ev.raw,
+                                                     store_dir=store.dir if session_state.cli == "codex" else None)
+                        if bus["kind"] == "codex_bus_permission_denied":
+                            from agenttalk.codex_preflight import write_permission_hold
+                            write_permission_hold(store, agent)
+                            sig["bus_failure"] = bus
+                        elif bus["kind"] == BUS_KIND_CONFIG_BLOCKED:
                             sig["config_blocked"] = True
                             sig["config_blocked_text"] = bus["summary"]
                         elif bus["kind"] in (
@@ -2951,7 +2871,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 produced_model_output=bool(sig.get("produced_model_output")),
                 result_num_turns=sig.get("result_num_turns"),
             )
-            if resume_failure_class == CLASS_CONFIG_BLOCKED:
+            if resume_failure_class in (CLASS_CONFIG_BLOCKED, "codex_bus_permission_denied"):
                 _session.clear_resume_attempt(session_state)
                 store.clear_heartbeat(agent)
                 engine.reset_heartbeat_throttle()
@@ -3250,8 +3170,13 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                             sig["terminal"] = True
                             sig["terminal_text"] = ev.text or sig["terminal_text"]
                     elif ev.type == EventType.TOOL_FINISHED:
-                        bus = classify_bus_execution(ev.tool, ev.text, ev.exit_code, ev.raw)
-                        if bus["kind"] == BUS_KIND_CONFIG_BLOCKED:
+                        bus = classify_bus_execution(ev.tool, ev.text, ev.exit_code, ev.raw,
+                                                     store_dir=store.dir if session_state.cli == "codex" else None)
+                        if bus["kind"] == "codex_bus_permission_denied":
+                            from agenttalk.codex_preflight import write_permission_hold
+                            write_permission_hold(store, agent)
+                            sig["bus_failure"] = bus
+                        elif bus["kind"] == BUS_KIND_CONFIG_BLOCKED:
                             sig["config_blocked"] = True
                             sig["config_blocked_text"] = bus["summary"]
                         elif bus["kind"] in (
@@ -3311,7 +3236,7 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
             resume_failure_class, resume_summary = _classify_drive_failure(sig)
             attributable = _session.resume_failure_is_session_attributable(
                 resume_failure_class, resume_summary)
-            if resume_failure_class == CLASS_CONFIG_BLOCKED:
+            if resume_failure_class in (CLASS_CONFIG_BLOCKED, "codex_bus_permission_denied"):
                 _session.clear_resume_attempt(session_state)
                 if persist is not None:
                     persist(session_state)

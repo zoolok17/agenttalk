@@ -141,49 +141,38 @@ runtime generation still follows normal fail-closed adoption.
 
 ## Codex launch access checks
 
-Regular supervisor Codex launches require `wrap --loop`. Before launching,
-the supervisor resets inheritance on existing `.generation` guard files under
-the message store on Windows. It leaves the files in place so an open lock
-keeps its identity. Traversal and ACL commands share a ten-second budget;
-linked entries, permission errors, or a timeout refuse the launch with
-`CODEX_ACL_PREFLIGHT_FAILED`. A direct, unwrapped Codex configuration also
-receives this HOLD because it cannot run the supervised startup check.
+Before a regular Codex relaunch on Windows, the supervisor resets ACL inheritance
+on existing `*.generation` guards under the store. Traversal and `icacls` share a
+10-second budget. Linked/reparse paths and unresettable guards fail closed as
+`CODEX_ACL_PREFLIGHT_FAILED`. Guards are never renamed or replaced, preserving
+the identity of locks held by live processes. Other platforms skip the ACL step.
 
-The new wrapper runs one Codex startup turn, using its configured model,
-permissions and environment, before consuming inbox work. This turn has a
-60-second execution limit and only asks the restricted shell to publish a bus
-note and a receipt bound to the supervisor launch nonce. It never consumes an
-inbox record. It follows the work session's normal resume
-path and adds one diagnostic turn to that session, with no automatic fresh
-fallback or retry. It incurs one model invocation per relaunch. On Windows
-the receipt command checks its process token and refuses
-an unrestricted host process; an ordinary wrapper heartbeat cannot satisfy it.
+A preflight failure persists a supervisor hold and attempts lead/operator
+escalation in the same poll, independently of optional notification settings.
+Failed delivery is retried on subsequent polls; successful delivery is latched.
+There is no automatic relaunch while the hold is present.
 
-After the probe exits successfully, the wrapper acknowledges completion on the
-existing restricted receipt; it cannot create a receipt on the child's behalf.
-The wrapper receives the same admission deadline reserved before spawn; recording
-the launch does not extend it. A late completion cannot admit inbox work.
-Unsuccessful probes clean up discoverable descendants even if the launcher has
-already exited while a tool retains its output pipe.
+There is no startup model turn or proactive write proof. During a real Codex
+turn, a failed agenttalk bus-write command that reports permission denied/EACCES
+and an absolute path beneath this store's `.agenttalk` directory on the same
+error line is classified as `codex_bus_permission_denied`. Other paths, successful
+commands, and ordinary check commands keep their existing classification.
 
-The supervisor polls for the completed receipt for at most 120 seconds from
-the reserved launch, without waiting on the seat. A missing or incomplete receipt becomes
-`CODEX_FIRST_BUS_WRITE_MISSING`, independently of `config_blocked`. Both HOLDs
-disable further automatic relaunches and send an operator question to the live
-operator-facing agent or sole lead, even when optional `notify_to` settings are
-absent. Failed notifications are retried; a delivered escalation is latched.
-`supervisor.kill` cancels the startup check and disables its bus write. Probe
-termination attempts start-checked descendant cleanup with a bounded budget,
-then terminates the retained child process; any unobservable descendants need
-operator inspection.
+The host records a durable permission marker without reopening the denied guard.
+The wrapper stops before draft publication or cursor advancement; the inbound
+message stays unread. A restarted wrapper also stops while the marker remains.
+The supervisor reports `CODEX_BUS_PERMISSION_DENIED`, holds automatic relaunch,
+and escalates once to the lead/operator. This class is separate from generic
+`config_blocked`. No paid probe turn, proof note, or receipt polling is involved.
 
-To recover, keep the kill switch present and stop the supervisor. Inspect and
-stop any remaining processes for that seat, repair the reported ACL/runtime
-problem, and remove only that agent's `codex_launch_check` field from the
-primary `.agenttalk/supervisor-state.json`. Preserve valid JSON and the other
-ownership and restart fields. Remove the kill switch and resume supervision;
-the next launch must earn a new receipt. Refresh generated scripts after
-upgrading the installed package, while the supervisor is stopped.
+To recover, set `supervisor.kill`, stop the supervisor and affected wrapper, and
+repair the guard permissions. Remove the affected agent's
+`state/codex-bus-permission-*.json` marker (verify its `agent` field), remove the
+failed head's entry from `messages` in `state/dead-letter-attempts/<agent>.json`, and
+remove only that agent's `codex_access_hold` from `.agenttalk/supervisor-state.json`.
+Keep the rest of the state valid and intact. Then restart the supervisor and
+wrapper. Regenerate supervisor scripts after upgrading; old generated scripts
+do not acquire the new preflight and escalation behavior.
 
 ## Deadman
 

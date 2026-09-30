@@ -234,6 +234,8 @@ def classify_failure(sig: dict[str, Any], failure_class: str | None) -> tuple[st
     """Map turn signals to an advisory state plus safe reason code."""
     if sig.get("watchdog"):
         return health_model.STATE_STUCK_SUSPECTED, "turn_watchdog_fired"
+    if failure_class == "codex_bus_permission_denied":
+        return health_model.STATE_ERRORED_AMBIGUOUS, "codex_bus_permission_denied"
     if failure_class == CLASS_CONFIG_BLOCKED:
         return health_model.STATE_ERRORED_AMBIGUOUS, _setup_failure_reason(sig) or "config_blocked"
     if failure_class == CLASS_GATEWAY_HELD:

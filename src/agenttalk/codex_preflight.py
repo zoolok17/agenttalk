@@ -1,7 +1,6 @@
 """Codex supervisor launch admission and evidence from the restricted process.
 
-Host ACL repair is necessary but is not proof. Only the sandbox command that
-successfully publishes a bus message writes the launch-specific receipt.
+Windows guard repair and durable holds for real-turn bus access denials.
 """
 from __future__ import annotations
 
@@ -11,7 +10,7 @@ import os
 from pathlib import Path
 import re
 import stat
-import subprocess
+import subprocess  # nosec B404
 import time
 import uuid
 
@@ -19,10 +18,7 @@ from ._atomic import write_text
 from .store import validate_agent_name
 
 ACL_TIMEOUT = 10.0
-PROBE_SECONDS = 60.0
-PROOF_TIMEOUT = 120.0
-PROBE_ENV = "AGENTTALK_CODEX_BUS_PROBE"
-PROBE_DEADLINE_ENV = "AGENTTALK_CODEX_BUS_PROBE_DEADLINE"
+BUS_PERMISSION_DENIED = "codex_bus_permission_denied"
 
 
 class PreflightError(ValueError):
@@ -74,115 +70,46 @@ def reset_guard_acls(directory: Path, *, windows=None, run=None) -> None:
         raise PreflightError(f"codex_acl_preflight_failed: {exc}") from exc
 
 
-def is_restricted_process() -> bool:
-    """On Windows reject receipts written by the ordinary host wrapper token."""
-    if os.name != "nt":
-        return True
-    import ctypes
-    from ctypes import wintypes
+def is_store_permission_denial(output: str, store_dir: Path) -> bool:
+    """Require a denial and this store's absolute child path on the same line."""
+    def normalized(text):
+        return re.sub(r"\\+", "/", text).casefold() if os.name == "nt" else text
 
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel.GetCurrentProcess.restype = wintypes.HANDLE
-    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-    advapi.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
-    advapi.OpenProcessToken.restype = wintypes.BOOL
-    advapi.IsTokenRestricted.argtypes = [wintypes.HANDLE]
-    advapi.IsTokenRestricted.restype = wintypes.BOOL
-    token = wintypes.HANDLE()
-    if not advapi.OpenProcessToken(kernel.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
-        raise PreflightError("codex_bus_proof_failed: cannot inspect restricted token")
-    try:
-        return bool(advapi.IsTokenRestricted(token))
-    finally:
-        kernel.CloseHandle(token)
+    prefix = normalized(str(store_dir.resolve())).rstrip("/") + "/"
+    denial = re.compile(r"permission denied|access is denied|\bEACCES\b|\[Errno 13\]|\[WinError 5\]", re.I)
+    return any(denial.search(line) and prefix in normalized(line) for line in output.splitlines())
 
 
-def _nonce(value: str) -> str:
-    if not isinstance(value, str) or not re.fullmatch(r"[a-fA-F0-9]{32}", value):
-        raise PreflightError("codex_bus_proof_failed: invalid launch nonce")
-    return value
-
-
-def _receipt_path(store, agent: str) -> Path:
+def permission_hold_path(store, agent: str) -> Path:
     validate_agent_name(agent)
     digest = hashlib.sha256(agent.encode()).hexdigest()[:32]
-    return store.state_dir / f"codex-bus-proof-{digest}.json"
+    return store.state_dir / f"codex-bus-permission-{digest}.json"
 
 
-def write_bus_proof(store, agent: str, nonce: str) -> None:
-    _nonce(nonce)
-    path = _receipt_path(store, agent)
-    if not is_restricted_process():
-        raise PreflightError("codex_bus_proof_failed: command must run inside the restricted seat")
-    target = store.operator_facing() or store.sole_lead()
-    if not target:
-        raise PreflightError("codex_bus_proof_failed: no lead or operator-facing recipient")
-    message = store.send(sender=agent, recipient=target, kind="note",
-                         subject="Codex restricted bus-write proof",
-                         body=f"{agent}: restricted Codex process published its launch proof.",
-                         meta={"codex_bus_proof": nonce})
-    write_text(path, json.dumps({"agent": agent, "nonce": nonce,
-                                "message_id": message.id}))
+def write_permission_hold(store, agent: str) -> None:
+    # The host records a child sandbox's denial without reopening that guard.
+    write_text(permission_hold_path(store, agent), json.dumps({"agent": agent, "failure": BUS_PERMISSION_DENIED}))
+
+
+def has_permission_hold(store, agent: str) -> bool:
+    try:
+        permission_hold_path(store, agent).stat()
+    except FileNotFoundError:
+        return False
+    # Presence is a hold, including malformed content. Other IO failures propagate.
+    return True
 
 
 def notify_failure(store, agent: str, failure: str) -> None:
-    """Mandatory lead escalation; independent of optional supervisor notes."""
-    if failure not in {"CODEX_ACL_PREFLIGHT_FAILED", "CODEX_FIRST_BUS_WRITE_MISSING"}:
-        raise PreflightError("unknown Codex launch failure")
+    """Mandatory escalation, independent of optional supervisor notifications."""
+    if failure not in {"CODEX_ACL_PREFLIGHT_FAILED", "CODEX_BUS_PERMISSION_DENIED"}:
+        raise PreflightError("unknown Codex access failure")
     target = store.operator_facing() or store.sole_lead()
     if not target:
         raise PreflightError(f"{failure}: cannot escalate: no lead/operator-facing recipient")
-    store.send(sender=agent, recipient=target, kind="question",
-               subject=failure,
+    store.send(sender=agent, recipient=target, kind="question", subject=failure,
                body=f"Supervisor: {agent}: {failure}. Automatic relaunch is held. "
-               "Repair the guard ACLs/runtime, stop the supervisor and clear this agent's "
-               "codex_launch_check in supervisor state before retrying.",
+               "Stop the supervisor and wrapper, repair guard permissions, then clear "
+               "this agent's permission marker and codex_access_hold before restarting.",
                meta={"request_id": "esc-" + uuid.uuid4().hex[:12],
                      "needs_operator": "true", "codex_launch_failure": failure})
-
-
-def read_bus_proof(store, agent: str) -> dict | None:
-    try:
-        with _receipt_path(store, agent).open("rb") as stream:
-            payload = stream.read(4097)
-        if len(payload) > 4096:
-            return None
-        receipt = json.loads(payload)
-        if (isinstance(receipt, dict) and receipt.get("agent") == agent
-                and isinstance(receipt.get("message_id"), str) and receipt["message_id"]):
-            _nonce(receipt.get("nonce"))
-            return receipt
-    except (OSError, ValueError):
-        pass
-    return None
-
-
-def complete_probe(store, agent: str, nonce: str, *, deadline_epoch: float) -> None:
-    """Host completion acknowledges an existing restricted receipt, never creates one."""
-    now = time.time()
-    if (not isinstance(deadline_epoch, (int, float)) or isinstance(deadline_epoch, bool)
-            or not 0 < now <= deadline_epoch < 1e12):
-        raise PreflightError("codex_bus_proof_failed: admission deadline passed or invalid")
-    receipt = read_bus_proof(store, agent)
-    if receipt is None or receipt.get("nonce") != nonce:
-        raise PreflightError("codex_bus_proof_failed: no matching restricted receipt")
-    receipt["ready_epoch"] = now
-    write_text(_receipt_path(store, agent), json.dumps(receipt))
-
-
-def probe_prompt(store, agent: str, nonce: str, python: str) -> str:
-    _nonce(nonce)
-    validate_agent_name(agent)
-    # This is a one-command startup check, not an inbound work turn.
-    args = [python, "-m", "agenttalk", "--root", str(store.root), "supervise",
-            "--codex-bus-proof", nonce, "--for", agent]
-    if os.name == "nt":
-        command = "& " + " ".join("'" + a.replace("'", "''") + "'" for a in args)
-    else:
-        import shlex
-        command = shlex.join(args)
-    return ("Supervisor startup check. Run exactly this one command using your normal "
-            "sandboxed shell tool, with no escalation, then end the turn. Do not write "
-            "a reply draft or run any other commands. A permission refusal is a result; "
-            "do not retry it or change permissions.\n" + command)

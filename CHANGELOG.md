@@ -11,11 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Supervised Codex relaunches now reset Windows store guard ACL inheritance
-  before launch and require a launch-bound bus write from the restricted seat.
-  An unfixable guard or missing write proof produces a named, durable HOLD and
-  a lead escalation instead of an unattended relaunch loop. Other seats continue
-  polling while the new wrapper runs its bounded startup check.
+- Supervised Codex relaunches reset Windows store guard ACL inheritance in
+  place before launch. An unfixable guard produces a durable
+  `CODEX_ACL_PREFLIGHT_FAILED` hold and same-poll lead escalation. Real-turn
+  bus-write permission denials under the store are classified separately as
+  `codex_bus_permission_denied`: the message stays unread and the supervisor
+  holds relaunch and escalates. No startup probe turn is required.
 
 ### Removed
 
