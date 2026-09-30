@@ -81,6 +81,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Python caller's subprocess timeout is 240s to fit the worst case. Test harness
   only; every scroll/focus/visibility/sabotage-detection assertion is unchanged.
 
+- **Console v2 Paper theme toned down (operator feedback 2026-09-29: "EXTREMELY
+  bright").** Paper used pure-white panels (`--panel` `#FFFFFF`, `--panel2`
+  `#FBF9F4`) on a near-white `--bg` (`#F6F3EC`) - only Midnight had been styled
+  and reviewed in the pitch slice; Paper just carried its variables. Surfaces
+  are now warm, mid-light greiges a clear step apart: `--bg` `#E6E1D6`,
+  `--panel` `#EFEBE2`, `--panel2` `#E9E4D9`, `--border` `#C9C0AC` (no pure
+  white anywhere). `--dim` (`#6B655B` -> `#5C564C`) and the status colours
+  `--ok`/`--warn`/`--bad`/`--info` (`#2E9F6B`/`#B7780A`/`#D2402F`/`#2F6FC9` ->
+  `#21734E`/`#8B5B08`/`#B63627`/`#2A64B4`) are deepened so every text-on-panel
+  pairing still clears WCAG AA (4.5:1; worst case 4.57:1, `ok` on `panel2`) on
+  the new, less-bright surfaces - `--fg`, `--serif`, `--accent`,
+  `--accent-ink` and the runtime badge colours are unchanged, already
+  comfortably legible. Midnight, Synthwave and Terminal are untouched; no CSP
+  or font changes. New `test_paper_text_tokens_meet_wcag_aa_contrast_on_their_backgrounds`
+  covers Paper the same way Midnight was already covered.
+
+- Fix #235: `tests/test_compact.py`'s "now, an hour ahead" reference
+  (`keep_age_days=0.0` leaves nothing "young") was a module-level constant
+  computed once at IMPORT time. When the file's tests ran more than an hour
+  after pytest collected them, that frozen reference was already in the past
+  and compaction archived nothing — 8 failures on a slow Windows xdist probe
+  run (issue #235). It is now computed fresh at call time by every test that
+  needs it. Test-only; every assertion is unchanged.
+
 ### Changed
 
 - **Dev gate: record per-test durations (measurement only).** Windows dev-gate
@@ -122,17 +146,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### CI
 
-- **Dev-gate Windows budget stopgap: pytest cap 5400s → 7200s, Windows job
-  ceiling 180 → 270 min (#231 F3, following the #197 precedent, `87c529a`).**
-  PR #230's dev-gate windows/3.11 run had its source pytest killed at the
-  5400s cap at 93% complete with no failing test, its wheel run took 5085s
-  (94% of the cap), and the job used 177 of its 180-min ceiling; Windows legs
-  generally now take 125-177 min, well past the `tests.yml` comment's stale
-  "~55-65 min per run" (2026-09-25) figure. 270 min covers two pytest runs
-  each capped at 120 min plus roughly 30 min of setup and the other per-leg
-  checks, within GitHub's 360-min job maximum; Linux and macOS stay at 90.
-  This is a stopgap, not a fix — the real fix follows the per-test duration
-  measurement this PR adds.
+- **Windows CI capacity stopgap.** Master run 36571318073 (`e6b6421`) killed
+  dev-gate windows/3.13's source pytest at the 5400s per-run cap with no
+  failing test; a PR #231 serial run measured windows 3.11 and 3.12 source
+  pytest at ~5750s each. Following the #197 precedent (`87c529a`): the pytest
+  `timeout_seconds` cap is raised 5400 -> 7200 (`dev-gate.json`), and the
+  Windows CI job ceiling 180 -> 270 minutes (two capped 120-min pytest runs
+  plus ~30 min setup/other checks, within GitHub's 360-min job maximum);
+  Linux/macOS stay at 90. This is a stopgap, not the real fix — that follows
+  a per-test duration measurement. (Already landed on master as #233; this
+  branch inherited it via the merge below rather than re-describing it.)
+
+- **PROBE (draft #232, not merged): two pytest-xdist workers in the dev gate.**
+  `-n 2 --dist loadgroup -p xdist.plugin` (explicit `-p` since the gate
+  disables plugin autoload), floor-pinned in `dev-gate.json`/`required_contract`
+  alongside a new `xdist_requirement`. Round 1 (serial baseline vs. two
+  workers): elapsed pytest time fell 35-48% on Linux/macOS and 15-40% on
+  Windows, every serial test still ran, and the only outcome differences were
+  the now-fixed #235 import-time-clock bug and PowerShell-host startup
+  contention. Round 2: `--dist loadgroup` plus a `tests/conftest.py`
+  collection hook that assigns every item its own per-file `xdist_group` (so
+  everything else keeps exactly today's file-level distribution) except the
+  tests that spawn a REAL PowerShell process (verified by reading each
+  helper, not just grepping for the word), which all share one `"pwsh"`
+  group and therefore always land on the same worker, serialized against
+  each other, with no timeout loosened anywhere. Draft only; CI is the
+  measurement.
 
 ## [0.94.0] - 2026-09-28
 

@@ -4,11 +4,20 @@ derivation (epoch / threads / rescind / check) or losing unread, protected, or
 invalid messages.
 
 All deterministic — no real sleeping. `now` is pushed an hour ahead where it
-matters so the keep_age tail never protects the just-created test messages."""
+matters so the keep_age tail never protects the just-created test messages.
+
+Fix #235: that "an hour ahead" reference must be computed at CALL time, not
+once at collection/import time - a slow run (a loaded Windows xdist probe,
+or a slow serial run) can put more than an hour between the two, at which
+point an import-time snapshot is already in the past and nothing archives.
+`_later()` is called fresh by each test that needs it; see
+test_compaction_uses_call_time_not_import_time_reference below for the
+regression this guards against."""
 
 from __future__ import annotations
 
 import json
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -18,9 +27,19 @@ from agenttalk import cli
 from agenttalk import threads as th
 from agenttalk.store import Store
 
-# now-ahead so keep_age_days=0 leaves nothing "young" (deterministic).
-_LATER = datetime.now(timezone.utc) + timedelta(hours=1)
 _BARRIER_META = {"barrier": {"version": 1, "scope": "global", "type": "epoch"}}
+
+
+def _now_utc() -> datetime:
+    """The module's clock source - a single seam so a test can monkeypatch it."""
+    return datetime.now(timezone.utc)
+
+
+def _later() -> datetime:
+    """now-ahead so keep_age_days=0 leaves nothing "young" (deterministic).
+    Computed at CALL time (fix #235) - never cache this in a module-level
+    constant, or a slow run can make it stale before a test actually uses it."""
+    return _now_utc() + timedelta(hours=1)
 
 
 def _run(argv: list[str], root: Path) -> int:
@@ -60,6 +79,53 @@ def _invalid_idents(store: Store) -> set[str]:
     return {ident for ident, _ in store.list_invalid_messages()}
 
 
+# -------------------------------------------------------------- fix #235: clock
+
+def test_compaction_uses_call_time_not_import_time_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fix #235 regression: the "an hour ahead" reference must be computed at
+    CALL time, not once at collection/import time. A module-level
+    `_LATER = ...now() + 1h` captures whatever "now" is at collection; if the
+    test body actually runs more than an hour later (a loaded Windows xdist
+    probe run, or a slow serial run), that frozen value is already BEHIND the
+    freshly-created messages' real timestamps and nothing archives (8
+    failures on issue #235's evidence).
+
+    Simulated deterministically, no real sleeps: the module's clock source is
+    monkeypatched to pretend "collection" happened 2 real hours before actual
+    now, so an import-time-shaped snapshot (`_later()` evaluated under that
+    patch) would be `collection_time + 1h` == `real_now - 1h` - one real hour
+    BEHIND current time, exactly the shape of the bug. Restoring the real
+    clock and computing `_later()` again (the fix, called fresh every time)
+    is `real_now + 1h` - correctly ahead - and archives the same store
+    correctly. `dry_run=True` on both calls so they compare the same,
+    unmodified store."""
+    s = _store(tmp_path)
+    for i in range(4):
+        s.send(sender="alpha", recipient="beta", body=f"old{i}")
+    s.send(sender="alpha", recipient="beta", kind="note", body="epoch",
+           meta=_BARRIER_META)
+    newest = s.send(sender="alpha", recipient="beta", body="newest").id
+    s.set_cursor("alpha", newest)
+    s.set_cursor("beta", newest)
+
+    real_now = _now_utc()
+    monkeypatch.setattr(sys.modules[__name__], "_now_utc",
+                        lambda: real_now - timedelta(hours=2))
+    stale = _later()   # what an import-time `_LATER` would have frozen forever
+    stale_result = cli._run_compaction(s, s.load_config(), keep_count=2,
+                                       keep_age_days=0.0, dry_run=True, now=stale)
+    assert stale_result["archived"] == [], (
+        "bug #235 reproduced: a stale, import-time-shaped reference archives nothing")
+
+    monkeypatch.undo()   # restore the real clock source
+    fresh = _later()     # the fix: computed fresh, always ahead of real "now"
+    fresh_result = cli._run_compaction(s, s.load_config(), keep_count=2,
+                                       keep_age_days=0.0, dry_run=True, now=fresh)
+    assert len(fresh_result["archived"]) == 4, "the fix: a fresh reference archives correctly"
+
+
 # ---------------------------------------------------------- keep_floor math
 
 def test_compute_keep_floor_epoch_and_prefix(tmp_path: Path) -> None:
@@ -77,8 +143,9 @@ def test_compute_keep_floor_epoch_and_prefix(tmp_path: Path) -> None:
     s.set_cursor("alpha", newest)
     s.set_cursor("beta", newest)
 
+    later = _later()
     keep_floor, capped_by, comp = cli._compute_keep_floor(
-        s, s.load_config(), keep_count=2, keep_age_days=0.0, now=_LATER)
+        s, s.load_config(), keep_count=2, keep_age_days=0.0, now=later)
     assert keep_floor == barrier
     assert "epoch" in capped_by
     # everything below the barrier (the 4 notes) is archivable; nothing else.
@@ -93,7 +160,7 @@ def test_compute_keep_floor_failsafe_empty_cursor(tmp_path: Path) -> None:
         s.send(sender="alpha", recipient="beta", body=str(i))
     # beta never set a cursor.
     keep_floor, capped_by, _ = cli._compute_keep_floor(
-        s, s.load_config(), keep_count=1, keep_age_days=0.0, now=_LATER)
+        s, s.load_config(), keep_count=1, keep_age_days=0.0, now=_later())
     assert keep_floor == ""
     assert "cursor" in capped_by
 
@@ -106,7 +173,7 @@ def test_compute_keep_floor_no_epoch_is_no_restriction(tmp_path: Path) -> None:
     s.set_cursor("alpha", ids[-1])
     s.set_cursor("beta", ids[-1])
     _, _, comp = cli._compute_keep_floor(
-        s, s.load_config(), keep_count=2, keep_age_days=0.0, now=_LATER)
+        s, s.load_config(), keep_count=2, keep_age_days=0.0, now=_later())
     assert comp["epoch"] is None
 
 
@@ -129,18 +196,19 @@ def test_compaction_preserves_all_derivations(tmp_path: Path) -> None:
     s.set_cursor("alpha", newest)
     s.set_cursor("beta", newest)
 
+    later = _later()
     epoch_before = s.current_epoch()
-    threads_before = {a: _thread_state_set(s, a, _LATER) for a in ("alpha", "beta")}
+    threads_before = {a: _thread_state_set(s, a, later) for a in ("alpha", "beta")}
     rescind_before = _run(["wait", "--for", "beta", "--to-request", "r-resc",
                            "--timeout", "1", "--grace", "0", "--quiet"], tmp_path)
 
     res = cli._run_compaction(s, s.load_config(), keep_count=2,
-                              keep_age_days=0.0, dry_run=False, now=_LATER)
+                              keep_age_days=0.0, dry_run=False, now=later)
     assert len(res["archived"]) == 4, "expected the 4 leading notes archived"
 
     assert s.current_epoch() == epoch_before
     for a in ("alpha", "beta"):
-        assert _thread_state_set(s, a, _LATER) == threads_before[a]
+        assert _thread_state_set(s, a, later) == threads_before[a]
     rescind_after = _run(["wait", "--for", "beta", "--to-request", "r-resc",
                           "--timeout", "1", "--grace", "0", "--quiet"], tmp_path)
     assert rescind_before == rescind_after == 3
@@ -159,14 +227,15 @@ def test_protected_thread_group_stays_live(tmp_path: Path) -> None:
             for i in range(3)]
     s.set_cursor("alpha", tail[-1])
     s.set_cursor("beta", tail[-1])
+    later = _later()
     res = cli._run_compaction(s, s.load_config(), keep_count=2,
-                              keep_age_days=0.0, dry_run=False, now=_LATER)
+                              keep_age_days=0.0, dry_run=False, now=later)
     live = _ids_in_messages_dir(s)
     assert old not in live                      # the old prefix archived
     assert opener in live                        # protected opener kept
     assert {r["id"] for r in res["archived"]} == {old}
     # r1 still derivable as open-outbound for alpha
-    assert ("r1", "open-outbound") in _thread_state_set(s, "alpha", _LATER)
+    assert ("r1", "open-outbound") in _thread_state_set(s, "alpha", later)
 
 
 def test_roster_invalid_file_stays_visible_after_compaction(tmp_path: Path) -> None:
@@ -185,7 +254,7 @@ def test_roster_invalid_file_stays_visible_after_compaction(tmp_path: Path) -> N
     s.set_cursor("beta", newest)
     assert ghost in _invalid_idents(s)                      # before
     res = cli._run_compaction(s, s.load_config(), keep_count=2,
-                              keep_age_days=0.0, dry_run=False, now=_LATER)
+                              keep_age_days=0.0, dry_run=False, now=_later())
     assert len(res["archived"]) >= 1                         # real notes archived
     assert ghost not in {r["id"] for r in res["archived"]}
     assert (s.messages_dir / f"{ghost}.json").exists()       # NOT moved
@@ -211,7 +280,7 @@ def test_hmac_invalid_file_stays_visible_after_compaction(
     unsigned = _hand_write(s, "20200101-000000-000000-bbbb")        # no signature
     assert unsigned in _invalid_idents(s)
     cli._run_compaction(s, s.load_config(), keep_count=2,
-                        keep_age_days=0.0, dry_run=False, now=_LATER)
+                        keep_age_days=0.0, dry_run=False, now=_later())
     assert (s.messages_dir / f"{unsigned}.json").exists()
     assert unsigned in _invalid_idents(s)
 
@@ -228,7 +297,7 @@ def test_invalid_files_are_never_archived(tmp_path: Path) -> None:
     s.set_cursor("alpha", ids[-1])
     s.set_cursor("beta", ids[-1])
     cli._run_compaction(s, s.load_config(), keep_count=1,
-                        keep_age_days=0.0, dry_run=False, now=_LATER)
+                        keep_age_days=0.0, dry_run=False, now=_later())
     assert bad.exists(), "invalid file must not be archived"
     invalid_ids = {ident for ident, _ in s.list_invalid_messages()}
     assert "00000000-000000-000000-zzzz" in invalid_ids
@@ -247,7 +316,7 @@ def test_cursor_delivery_after_archiving_below_cursor(tmp_path: Path) -> None:
     s.set_cursor("alpha", ids[-1])
     # keep_floor will be min cursor = ids[2]; archive ids[0], ids[1]
     cli._run_compaction(s, s.load_config(), keep_count=2,
-                        keep_age_days=0.0, dry_run=False, now=_LATER)
+                        keep_age_days=0.0, dry_run=False, now=_later())
     delivered = [m.id for m in s.messages_for("beta", since_id=s.cursor("beta"))]
     assert delivered == ids[3:]                  # exclusive of the cursor, correct tail
 
@@ -261,11 +330,12 @@ def test_idempotent_second_run_archives_nothing(tmp_path: Path) -> None:
     newest = s.send(sender="alpha", recipient="beta", body="newest").id
     s.set_cursor("alpha", newest)
     s.set_cursor("beta", newest)
+    later = _later()
     first = cli._run_compaction(s, s.load_config(), keep_count=2,
-                                keep_age_days=0.0, dry_run=False, now=_LATER)
+                                keep_age_days=0.0, dry_run=False, now=later)
     assert len(first["archived"]) > 0
     second = cli._run_compaction(s, s.load_config(), keep_count=2,
-                                 keep_age_days=0.0, dry_run=False, now=_LATER)
+                                 keep_age_days=0.0, dry_run=False, now=later)
     assert second["archived"] == []
 
 
@@ -279,15 +349,16 @@ def test_ack_to_request_unpins_compaction(tmp_path: Path) -> None:
             for i in range(3)]
     s.set_cursor("alpha", tail[-1])
     s.set_cursor("beta", tail[-1])
+    later = _later()
     # While r1 is open it pins the floor at the opener -> opener not archivable.
     pre = cli._run_compaction(s, s.load_config(), keep_count=1,
-                              keep_age_days=0.0, dry_run=True, now=_LATER)
+                              keep_age_days=0.0, dry_run=True, now=later)
     assert opener not in {r["id"] for r in pre["archived"]}
     # Both parties close it; now nothing protects it.
     s.close_thread("alpha", "r1", seen_msg_id=opener, reason="done")
     s.close_thread("beta", "r1", seen_msg_id=opener, reason="done")
     post = cli._run_compaction(s, s.load_config(), keep_count=1,
-                               keep_age_days=0.0, dry_run=True, now=_LATER)
+                               keep_age_days=0.0, dry_run=True, now=later)
     assert opener in {r["id"] for r in post["archived"]}
 
 
@@ -311,7 +382,7 @@ def test_partial_archive_is_resumable(tmp_path: Path) -> None:
     first.unlink()
     # Re-run: it archives the remaining 3 notes; total archived (cold) == 4.
     res = cli._run_compaction(s, s.load_config(), keep_count=2,
-                              keep_age_days=0.0, dry_run=False, now=_LATER)
+                              keep_age_days=0.0, dry_run=False, now=_later())
     assert len(res["archived"]) == 3
     cold = {p.stem for p in s.compacted_dir.iterdir()}
     for n in notes:
@@ -340,7 +411,7 @@ def test_old_closed_thread_check_returns_unknown_after_archive(
     # Before: rc is a known (resolved) thread -> current.
     assert _run(["check", "--for", "alpha", "--to-request", "rc"], tmp_path) == 0
     res = cli._run_compaction(s, s.load_config(), keep_count=2,
-                              keep_age_days=0.0, dry_run=False, now=_LATER)
+                              keep_age_days=0.0, dry_run=False, now=_later())
     assert len(res["archived"]) >= 2, "rc's messages should have been archived"
     # After: rc is no longer derivable -> unknown (exit 4), fail-closed.
     assert _run(["check", "--for", "alpha", "--to-request", "rc"], tmp_path) == 4

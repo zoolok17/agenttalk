@@ -503,14 +503,18 @@ def test_v2_files_do_not_leak_machine_names() -> None:
 THEME_KEYS = ("bg", "panel", "panel2", "border", "fg", "dim", "accent", "accent-ink",
               "ok", "warn", "bad", "info", "serif")
 
-# Values of design/console-v2/tokens/themes.json (handoff v2). Paper's dim and accent are the two
-# contrast fixes recommended by 06-RULES ("Action needed - Paper"): themes.json has #857F74 / #E4572E.
+# Values of design/console-v2/tokens/themes.json (handoff v2), except where PAPER_FIXED below
+# documents a deliberate deviation. Paper was toned down (operator feedback 2026-09-29: "EXTREMELY
+# bright" - pure-white panels on a near-white bg); themes.json's raw paper block is bg #F6F3EC,
+# panel #FFFFFF, panel2 #FBF9F4, border #E5E0D4, dim #857F74, accent #E4572E, ok #2E9F6B,
+# warn #B7780A, bad #D2402F, info #2F6FC9 (dim/accent were already a prior contrast-fix deviation;
+# see console2.css's Paper block comment for the surface/status-colour deviations added now).
 EXPECTED = {
     "midnight": dict(zip(THEME_KEYS, ("#0A0C11", "#11141B", "#161A23", "#232834", "#E7EAF0", "#7D8595",
                                       "#7C8CFF", "#0A0C11", "#3DD68C", "#F5B83D", "#FF6B6B", "#5CC8FF",
                                       "#F2F3F7"), strict=True)),
-    "paper": dict(zip(THEME_KEYS, ("#F6F3EC", "#FFFFFF", "#FBF9F4", "#E5E0D4", "#1D1B17", "#6B655B",
-                                   "#C9481F", "#FFFFFF", "#2E9F6B", "#B7780A", "#D2402F", "#2F6FC9",
+    "paper": dict(zip(THEME_KEYS, ("#E6E1D6", "#EFEBE2", "#E9E4D9", "#C9C0AC", "#1D1B17", "#5C564C",
+                                   "#C9481F", "#FFFFFF", "#21734E", "#8B5B08", "#B63627", "#2A64B4",
                                    "#1D1B17"), strict=True)),
     "synthwave": dict(zip(THEME_KEYS, ("#120822", "#1B0F33", "#231342", "#3B2266", "#FBEFFF", "#A88CCB",
                                        "#FF4FD8", "#120822", "#00F5D4", "#FFD23F", "#FF5C8A", "#00E5FF",
@@ -519,7 +523,10 @@ EXPECTED = {
                                       "#DFFFE7", "#040906", "#7CFF9B", "#FFD166", "#FF5C5C", "#7FD8FF",
                                       "#7CFF9B"), strict=True)),
 }
-PAPER_FIXED = {"dim", "accent"}
+# Every Paper key that deliberately deviates from the raw design-file handoff: dim/accent were
+# already a prior contrast fix; bg/panel/panel2/border/ok/warn/bad/info are the 2026-09-29 tone-down
+# (surfaces off pure-white, status colours deepened to keep 4.5:1 on the new, less-bright panels).
+PAPER_FIXED = {"bg", "panel", "panel2", "border", "dim", "accent", "ok", "warn", "bad", "info"}
 RUNTIME = {"dark": ("#D08A5E", "#4FB3A0", "#9E82E0"), "light": ("#B0532C", "#2C7A6B", "#6D4AC0")}
 
 
@@ -593,10 +600,11 @@ def _contrast(a: str, b: str) -> float:
     return (lighter + 0.05) / (darker + 0.05)
 
 
-# Only Midnight is styled and reviewed in this slice (see the CSS header). Pairs below are every
-# text-token-on-background-token combination the CSS actually uses to paint readable text (fg,
-# dim, serif, warn, bad, ok, info as `color`, over bg/panel/panel2 as `background`), plus
-# accent-ink on accent (the one token pair whose own name says "ink for this background").
+# Midnight and Paper are styled and reviewed (see the CSS header); Synthwave and Terminal still
+# only carry their variables. Pairs below are every text-token-on-background-token combination the
+# CSS actually uses to paint readable text (fg, dim, serif, warn, bad, ok, info as `color`, over
+# bg/panel/panel2 as `background`), plus accent-ink on accent (the one token pair whose own name
+# says "ink for this background").
 MIDNIGHT_TEXT_ON_BG = [
     ("fg", "bg"), ("fg", "panel"), ("fg", "panel2"),
     ("dim", "bg"), ("dim", "panel"), ("dim", "panel2"),
@@ -614,6 +622,20 @@ def test_midnight_text_tokens_meet_wcag_aa_contrast_on_their_backgrounds() -> No
     for text_key, bg_key in MIDNIGHT_TEXT_ON_BG:
         ratio = _contrast(midnight[text_key], midnight[bg_key])
         assert ratio >= 4.5, (text_key, bg_key, midnight[text_key], midnight[bg_key], round(ratio, 2))
+
+
+# Paper tone-down (operator feedback 2026-09-29): the same text-token-on-background pairs as
+# Midnight above, plus the needs-count badge's own dedicated ink-on-fill pair (fix round 1, F1) -
+# introduced BECAUSE the badge used to paint a fixed #111 straight onto --warn, and deepening --warn
+# for body text (to pass the pairs above) dropped that pair from 5.13:1 to 3.24:1.
+PAPER_TEXT_ON_BG = [*MIDNIGHT_TEXT_ON_BG, ("badge-ink", "badge-bg")]
+
+
+def test_paper_text_tokens_meet_wcag_aa_contrast_on_their_backgrounds() -> None:
+    paper = _theme_blocks()["paper"]
+    for text_key, bg_key in PAPER_TEXT_ON_BG:
+        ratio = _contrast(paper[text_key], paper[bg_key])
+        assert ratio >= 4.5, (text_key, bg_key, paper[text_key], paper[bg_key], round(ratio, 2))
 
 
 def _composite(fg_hex: str, bg_hex: str, alpha: float) -> str:
@@ -681,6 +703,21 @@ def test_avatar_badge_text_meets_wcag_aa_contrast_undimmed_by_the_stale_state() 
     for text_key, bg_key in BADGE_TEXT_ON_FILL:
         ratio = _contrast(midnight[text_key], midnight[bg_key])
         assert ratio >= 4.5, (text_key, bg_key, midnight[text_key], midnight[bg_key], round(ratio, 2))
+
+
+# Paper fix round 1 (F2): .c2-rt/.c2-avatar-badge painted var(--bg) as the runtime-letter ink - on
+# the UNCHANGED rt-claude/rt-codex/rt-qwen fills, Paper's darker --bg (the tone-down) dropped Claude
+# from 4.60 to 3.91 and Codex from 4.62 to 3.93. Paper now declares its own --rt-ink (#FFFFFF),
+# decoupled from --bg; every theme still paints via var(--rt-ink) (Midnight/Synthwave/Terminal
+# default it to var(--bg), unchanged).
+PAPER_BADGE_TEXT_ON_FILL = [("rt-ink", "dim"), ("rt-ink", "rt-claude"), ("rt-ink", "rt-codex"), ("rt-ink", "rt-qwen")]
+
+
+def test_paper_avatar_badge_text_meets_wcag_aa_contrast_undimmed_by_the_stale_state() -> None:
+    paper = _theme_blocks()["paper"]
+    for text_key, bg_key in PAPER_BADGE_TEXT_ON_FILL:
+        ratio = _contrast(paper[text_key], paper[bg_key])
+        assert ratio >= 4.5, (text_key, bg_key, paper[text_key], paper[bg_key], round(ratio, 2))
 
 
 def test_the_badge_at_the_old_whole_avatar_opacity_would_have_failed_contrast() -> None:
