@@ -22,8 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Ambiguous refs, symlinked or escaping paths, shallow history and missing
     objects give no fact (Unknown), never Done.
   - It writes a bounded, schema-versioned `state/work-board-facts.json`
-    atomically, under a store lock. Publication is ordered: an older run never
-    replaces a newer run's observation.
+    atomically, under a store lock, bound to the store session.
+  - Only one run at a time: a second run is refused. A run also refuses to
+    publish after a store reset, and never overwrites a facts file of an
+    unsupported schema.
 
   The snapshot worker only reads that file and never runs Git:
   - a missing, malformed or oversize file, or any other fault in this optional
@@ -34,7 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - a fact from a remapped alias or target is ignored;
   - a fact counts only for the item's current binding (its declared
     `work_repo`/`work_target`, else the current default), so proof from an
-    earlier default or target is never reused.
+    earlier default or target is never reused. An explicitly empty declaration
+    is invalid, never the default;
+  - a section from another store session is ignored.
 
   This replaces the in-server cached observer of the work-board design
   (section 4) and supersedes draft #238. The lead skill now runs the command

@@ -8081,6 +8081,7 @@ def cmd_board(args: argparse.Namespace) -> int:
         return 2
     from agenttalk import work_board_facts
     store = _get_store(args)
+    # a VerifyRefused (ValueError) reaches main(): message on stderr, exit 2
     result = work_board_facts.verify_merges(store, dry_run=args.dry_run)
     configured = bool(work_board_facts.repo_aliases(store.load_config())[0])
     if args.json:
@@ -8093,8 +8094,6 @@ def cmd_board(args: argparse.Namespace) -> int:
           + ("; dry run, nothing written" if args.dry_run else ""))
     for slug, reason in result["unknown"][:20]:
         print(f"  unknown {slug}: {reason}")
-    for slug, target in result["superseded"][:20]:
-        print(f"  superseded {slug} ({target}): a newer observation is already recorded")
     for problem in result["problems"]:
         sys.stderr.write(f"agenttalk board verify-merges: warning: {problem}\n")
     if not configured:

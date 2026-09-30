@@ -5,6 +5,7 @@ reviewed candidate is an ancestor of an approved target ref in an operator-appro
 local checkout, and records each result in one bounded, schema-versioned store
 file. The snapshot worker only reads that file: the server never runs Git.
 """
+import contextlib
 import json
 import os
 import re
@@ -13,10 +14,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from agenttalk._atomic import write_text as _atomic_write_text
+from agenttalk.store import LockContention
 
 SCHEMA_VERSION = 1
 FACTS_FILE = "work-board-facts.json"
 LOCK_FILE = "work-board-facts.lock"
+RUN_LOCK_FILE = "work-board-verify.lock"
 MAX_FILE_BYTES = 512 * 1024
 MAX_FACTS = 400
 PROBE_TIMEOUT_SECONDS = 2.0
@@ -31,6 +34,11 @@ _FLAGS = {"--verify", "--quiet", "--end-of-options", "--is-ancestor", "--is-shal
 _FACT_KEYS = {"project", "repo_alias", "repo_path", "work_item", "candidate", "target_ref", "target_oid",
               "checked_at", "result"}
 _TIMED_OUT = "git unavailable or timed out"
+_SCHEMA_UNSUPPORTED = "integration facts schema unsupported"
+
+
+class VerifyRefused(ValueError):
+    """verify-merges published nothing, for an operator-actionable reason."""
 
 
 def _valid_ref(ref):
@@ -95,6 +103,8 @@ def resolve_binding(binding, aliases, default):
     if binding == "ambiguous":
         return None, [], "conflicting repository declarations"
     binding = binding if isinstance(binding, dict) else {}
+    if any(isinstance(binding.get(k), str) and not binding[k].strip() for k in ("repo", "target")):
+        return None, [], "empty repository/target declaration"
     alias = binding.get("repo") or default
     if alias not in aliases:
         return None, [], (f"repository {alias!r} is not an approved work_repos alias" if alias
@@ -196,7 +206,24 @@ def _candidates(store, cfg):
 
 def verify_merges(store, *, now=None, dry_run=False):
     """Check every current (work_item, candidate) pair against its approved targets and
-    record the verified results. Unknown outcomes are reported, never recorded."""
+    record the verified results. Unknown outcomes are reported, never recorded.
+
+    A publishing run holds a dedicated run lock from its first read to its publish,
+    so two runs never interleave and a second one is refused at once. The lock sits
+    outside state/, so a reset during the run cannot remove it. A dry run publishes
+    nothing and takes no lock."""
+    if dry_run:
+        return _verify(store, now, dry_run=True)
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(store._exclusive_lock(store.dir / RUN_LOCK_FILE, timeout=0,
+                                                      what="verify-merges run lock"))
+        except LockContention:
+            raise VerifyRefused("another verify-merges run is in progress") from None
+        return _verify(store, now, dry_run=False)
+
+
+def _verify(store, now, *, dry_run):
     now = now or datetime.now(timezone.utc)
     cfg = store.load_config()
     aliases, default, problems = repo_aliases(cfg)
@@ -232,11 +259,10 @@ def verify_merges(store, *, now=None, dry_run=False):
                 facts.append({"project": project, "repo_alias": alias, "repo_path": aliases[alias]["path"],
                               "work_item": slug, "candidate": candidate, "target_ref": ref,
                               "target_oid": target_oid, "checked_at": now.isoformat(), "result": result})
-    superseded = []
-    if not dry_run:  # the Git probes above ran outside the lock; ordering is settled inside it
-        superseded = _write_section(store, "integration", {"written_at": now.isoformat(), "facts": facts})
-    return {"facts": facts, "unknown": unknown, "problems": problems, "written": not dry_run,
-            "superseded": superseded}
+    if not dry_run:
+        _write_section(store, "integration", {"session_id": cfg.get("session_id"),
+                                              "written_at": now.isoformat(), "facts": facts})
+    return {"facts": facts, "unknown": unknown, "problems": problems, "written": not dry_run}
 
 
 def _read(path):
@@ -255,48 +281,28 @@ def _read(path):
     except ValueError:
         return None, "integration facts malformed"
     if not isinstance(doc, dict) or doc.get("schema_version") != SCHEMA_VERSION:
-        return None, "integration facts schema unsupported"
+        return None, _SCHEMA_UNSUPPORTED
     return doc, None
 
 
-def _fact_key(fact):
-    return fact["work_item"], fact["candidate"], fact["repo_alias"], fact["target_ref"]
-
-
-def _order_integration(published, incoming):
-    """Publication ordering: an older run never replaces a newer observation.
-
-    A run's facts carry its observation start as checked_at. Published facts observed
-    after this run started survive, and this run's fact for the same key is dropped as
-    superseded. Older published facts are replaced by this run's view, as before."""
-    started = _time(incoming["written_at"])
-    facts = published.get("facts") if isinstance(published, dict) else None
-    newer = [f for f in facts if _valid_fact(f) and _time(f["checked_at"]) > started] if isinstance(
-        facts, list) else []
-    held = {_fact_key(f) for f in newer}
-    superseded = [(f["work_item"], f["target_ref"]) for f in incoming["facts"] if _fact_key(f) in held]
-    merged = newer + [f for f in incoming["facts"] if _fact_key(f) not in held]
-    superseded += [(f["work_item"], f["target_ref"]) for f in merged[MAX_FACTS:]]
-    stamps = [started] + [_time(f["checked_at"]) for f in newer]
-    return {"written_at": max(stamps).isoformat(), "facts": merged[:MAX_FACTS]}, superseded
-
-
 def _write_section(store, name, section):
-    """Replace one section atomically under the store lock, keeping the others. The
-    integration section is ordered against what is already published; returns the
-    (work_item, target_ref) pairs this run lost to a newer observation."""
+    """Replace one section atomically under the facts lock, keeping the others. Refuses
+    to overwrite a file of an unsupported schema, and to publish into a session other
+    than the one the run started in (a store reset in between)."""
     path = store.state_dir / FACTS_FILE
-    superseded = []
     with store._exclusive_lock(store.state_dir / LOCK_FILE, what="work board facts"):
-        doc = _read(path)[0] or {"schema_version": SCHEMA_VERSION}
-        if name == "integration":
-            section, superseded = _order_integration(doc.get(name), section)
+        doc, warning = _read(path)
+        if warning == _SCHEMA_UNSUPPORTED:
+            raise VerifyRefused(f"{path} has an unsupported schema_version; it was left untouched "
+                                "and nothing was published")
+        if "session_id" in section and section["session_id"] != store.load_config().get("session_id"):
+            raise VerifyRefused("the store session changed during this run (a reset); nothing was published")
+        doc = doc or {"schema_version": SCHEMA_VERSION}
         doc[name] = section
         text = json.dumps(doc, indent=2, ensure_ascii=False)
         if len(text.encode("utf-8")) > MAX_FILE_BYTES:
             raise ValueError("work board facts would exceed their size bound")
         _atomic_write_text(path, text)
-    return superseded
 
 
 def _valid_fact(fact):
@@ -326,6 +332,8 @@ def _load_integration(store, cfg, now):
     facts = section.get("facts") if isinstance(section, dict) else None
     if not isinstance(facts, list) or len(facts) > MAX_FACTS or not all(_valid_fact(f) for f in facts):
         return {"facts": [], "config": cfg, "warnings": ["integration facts malformed"]}
+    if section.get("session_id") != cfg.get("session_id"):
+        return {"facts": [], "config": cfg, "warnings": ["integration facts are from another store session"]}
     oldest, project = now - timedelta(seconds=max_age_seconds(cfg)), store.project_id()
     kept, ignored = [], 0
     for fact in facts:

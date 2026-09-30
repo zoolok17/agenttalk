@@ -376,7 +376,7 @@ def _item(slug, reqs, orphans, facts):
         evidence = sorted({i for r in reqs for i in r["openers"]} | {i for _, ids in orphans for i in ids})
         return {"work_item": slug, "title": None, "cycle": None, "legacy_cycle": True, "round": None,
                 "candidate": None, "builders": [], "verdicts": {}, "obligations": [], "incidents": [],
-                "issues": [], "previous_cycles": [], "checks": None, "integration": {},
+                "issues": [], "previous_cycles": [], "checks": None, "integration": {}, "repo_binding": None,
                 "column": "unknown", "workflow_column": "unknown", "row": 2,
                 "reason": f"{FAULT} ({type(exc).__name__})", "evidence": evidence}
 
@@ -384,7 +384,7 @@ def _item(slug, reqs, orphans, facts):
 def _evaluate_item(slug, reqs, orphans, facts):
     item = {"work_item": slug, "title": None, "cycle": None, "legacy_cycle": True, "round": None,
             "candidate": None, "builders": [], "verdicts": {}, "obligations": [], "incidents": [],
-            "issues": [], "previous_cycles": [], "checks": None,
+            "issues": [], "previous_cycles": [], "checks": None, "repo_binding": None,
             "integration": dict(sorted((head, value) for (item_slug, head), value in facts["integrated"].items()
                                        if item_slug == slug))}
     if not reqs:
@@ -614,8 +614,8 @@ def _policy(slug, valid, cur, current, facts):
     binding = None
     if len(pairs) == 1 and all(r["policy"] for r in sources):
         repo, target = pairs.pop()
-        binding = {"repo": repo, "target": target} if repo or target else None
-    elif any(v for pair in pairs for v in pair):
+        binding = {"repo": repo, "target": target} if repo is not None or target is not None else None
+    elif any(v is not None for pair in pairs for v in pair):
         binding = "ambiguous"
     result = {"conflict": None, "problem": None, "label": None, "binding": binding}
     if len(declared) > 1:

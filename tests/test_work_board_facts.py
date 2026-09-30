@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
@@ -12,7 +13,7 @@ from agenttalk import cli, work_board
 from agenttalk import work_board_facts as F
 from agenttalk.envelope_snapshot import SnapshotService
 from agenttalk.store import Store
-from test_work_board_reducer import BUILDER, LEAD, POLICY, REVIEWER, Bus
+from test_work_board_reducer import BUILDER, ITEM, LEAD, POLICY, REVIEWER, Bus
 
 MISSING = "c" * 40
 
@@ -480,28 +481,32 @@ def test_future_dated_fact_is_stale_even_minutes_ahead(tmp_path, repo):
     assert card["workflow_column"] == "ready" and "integration evidence stale (as of " in card["reason"]
 
 
-def test_older_run_cannot_restore_an_invalidated_done(tmp_path, repo, monkeypatch, capsys):
+@pytest.mark.parametrize("change", ["reset", "delete"])
+def test_second_run_is_refused_and_the_next_run_invalidates(tmp_path, repo, monkeypatch, capsys, change):
+    """Runs are serialized. While run A holds the run lock, run B is refused, so B
+    can never publish first and be overwritten. The run after A replaces A's view,
+    whether it records not_integrated (reset) or nothing at all (deleted target)."""
     path, merged, _ = repo
     store = team(tmp_path, path)
     publish(store, {"item-merged": merged})
-    publish_now, interleaved = F._write_section, []
+    publish_now, refused = F._write_section, []
 
     def interleave(store_arg, name, section):
-        # Run A has probed (merged) and waits for the lock; meanwhile the target is
-        # reset and run B observes that and publishes first.
-        if not interleaved:
-            interleaved.append(True)
-            git(path, "update-ref", "refs/heads/master", git(path, "rev-parse", merged + "^"))
-            newer = F.verify_merges(store)
-            assert newer["facts"][0]["result"] == "not_integrated" and newer["superseded"] == []
-            assert board(store)[0]["item-merged"]["workflow_column"] == "ready"
+        if not refused:  # A has probed and is about to publish
+            git(path, "update-ref", *(["-d", "refs/heads/master"] if change == "delete"
+                                      else ["refs/heads/master", git(path, "rev-parse", merged + "^")]))
+            with pytest.raises(F.VerifyRefused, match="another verify-merges run is in progress"):
+                F.verify_merges(store)
+            assert cli.main(["--root", str(store.root), "board", "verify-merges"]) == 2
+            refused.append(capsys.readouterr().err)
         return publish_now(store_arg, name, section)
     monkeypatch.setattr(F, "_write_section", interleave)
     assert cli.main(["--root", str(store.root), "board", "verify-merges"]) == 0
-    assert ("superseded item-merged (refs/heads/master): a newer observation is already recorded"
-            in capsys.readouterr().out)
-    facts = json.loads((store.state_dir / F.FACTS_FILE).read_text(encoding="utf-8"))["integration"]["facts"]
-    assert [f["result"] for f in facts] == ["not_integrated"]
+    assert "another verify-merges run is in progress" in refused[0]
+    assert board(store)[0]["item-merged"]["workflow_column"] == "done"  # A's own observation
+    monkeypatch.setattr(F, "_write_section", publish_now)
+    result = F.verify_merges(store)
+    assert [f["result"] for f in result["facts"]] == ([] if change == "delete" else ["not_integrated"])
     assert board(store)[0]["item-merged"]["workflow_column"] == "ready"
 
 
@@ -513,8 +518,7 @@ def test_newer_run_replaces_an_older_observation(tmp_path, repo):
     F.verify_merges(store, now=older)
     assert board(store)[0]["item-merged"]["workflow_column"] == "done"
     git(path, "update-ref", "refs/heads/master", git(path, "rev-parse", merged + "^"))
-    result = F.verify_merges(store, now=older + timedelta(minutes=1))
-    assert result["superseded"] == []
+    F.verify_merges(store, now=older + timedelta(minutes=1))
     facts = json.loads((store.state_dir / F.FACTS_FILE).read_text(encoding="utf-8"))["integration"]["facts"]
     assert [(f["result"], f["checked_at"]) for f in facts] == [
         ("not_integrated", (older + timedelta(minutes=1)).isoformat())]
@@ -522,22 +526,84 @@ def test_newer_run_replaces_an_older_observation(tmp_path, repo):
     assert (card["workflow_column"], card["integration"]) == ("ready", {merged: False})
 
 
-def test_publication_order_keeps_newer_facts_and_replaces_older_ones(monkeypatch):
-    start = datetime(2026, 9, 30, 12, tzinfo=timezone.utc)
-    later, earlier = start + timedelta(minutes=1), start - timedelta(minutes=1)
+# ---------------------------------------------------------------- recast (#247, after two fix rounds)
 
-    def fact(slug, at):
-        return {"project": "p", "repo_alias": "a", "repo_path": "x", "work_item": slug, "candidate": MISSING,
-                "target_ref": "refs/heads/master", "target_oid": "d" * 40, "checked_at": at.isoformat(),
-                "result": "integrated"}
-    published = {"written_at": later.isoformat(),
-                 "facts": [fact("newer", later), fact("older", earlier), fact("same", later)]}
-    incoming = {"written_at": start.isoformat(), "facts": [fact("same", start), fact("mine", start)]}
-    section, superseded = F._order_integration(published, incoming)
-    assert sorted((f["work_item"], f["checked_at"]) for f in section["facts"]) == [
-        ("mine", start.isoformat()), ("newer", later.isoformat()), ("same", later.isoformat())]
-    assert superseded == [("same", "refs/heads/master")] and section["written_at"] == later.isoformat()
-    assert F._order_integration(None, incoming) == (incoming, [])
-    monkeypatch.setattr(F, "MAX_FACTS", 2)  # the merged section stays inside the loader's bound
-    section, superseded = F._order_integration(published, incoming)
-    assert len(section["facts"]) == 2 and superseded == [("same", "refs/heads/master"), ("mine", "refs/heads/master")]
+def test_run_refuses_to_publish_after_a_store_reset(tmp_path, repo, monkeypatch):
+    path, merged, _ = repo
+    store = team(tmp_path, path)
+    publish(store, {"item-merged": merged})
+    publish_now = F._write_section
+
+    def interleave(store_arg, name, section):
+        # A reset by another process while this run probes: a thread keeps its own lock order.
+        worker = threading.Thread(target=store.reset)
+        worker.start()
+        worker.join()
+        publish(store, {"item-merged": merged})
+        return publish_now(store_arg, name, section)
+    monkeypatch.setattr(F, "_write_section", interleave)
+    with pytest.raises(F.VerifyRefused, match="store session changed during this run"):
+        F.verify_merges(store)
+    assert not (store.state_dir / F.FACTS_FILE).exists()
+    assert board(store)[0]["item-merged"]["workflow_column"] == "ready"
+
+
+def test_loader_ignores_facts_from_another_session(tmp_path, repo):
+    path, merged, _ = repo
+    store = team(tmp_path, path)
+    publish(store, {"item-merged": merged})
+    F.verify_merges(store)
+    assert board(store)[0]["item-merged"]["workflow_column"] == "done"
+    configure(store, session_id="20260101T000000-testZ")  # a new session that kept the state files
+    items, feed = board(store)
+    assert items["item-merged"]["workflow_column"] == "ready"
+    assert "integration facts are from another store session" in feed["errors"]
+
+
+def test_unsupported_schema_file_is_left_untouched(tmp_path, repo, capsys):
+    path, merged, _ = repo
+    store = team(tmp_path, path)
+    publish(store, {"item-merged": merged})
+    target = store.state_dir / F.FACTS_FILE
+    before = json.dumps({"schema_version": 2, "plans": {"keep": "me"}})
+    target.write_text(before, encoding="utf-8")
+    assert cli.main(["--root", str(store.root), "board", "verify-merges"]) == 2
+    assert "unsupported schema_version; it was left untouched" in capsys.readouterr().err
+    assert target.read_text(encoding="utf-8") == before
+
+
+@pytest.mark.parametrize("field", ["work_repo", "work_target"])
+def test_explicitly_empty_declaration_is_invalid_not_the_default(tmp_path, repo, field):
+    path, merged, _ = repo
+    store = team(tmp_path, path)
+    publish(store, {"item-merged": merged}, **{field: ""})
+    result = F.verify_merges(store)
+    assert result["facts"] == [] and result["unknown"] == [("item-merged", "empty repository/target declaration")]
+    card = board(store)[0]["item-merged"]
+    assert card["workflow_column"] == "ready"
+    assert card["repo_binding"][field.removeprefix("work_")] == ""
+    evidence = {"facts": [dict(json.loads(json.dumps({"work_item": "item-merged", "candidate": merged,
+                                                      "repo_alias": "agenttalk", "target_ref": "refs/heads/master",
+                                                      "target_oid": "d" * 40, "checked_at": "x",
+                                                      "result": "integrated"})),
+                                   checked=datetime.now(timezone.utc), fresh=True)],
+                "config": store.load_config()}
+    integrated, notes = F.integration_for([card], evidence)  # an earlier default proof is not reused
+    assert integrated == {} and notes[("item-merged", merged)][0] == (
+        "integration evidence ignored: empty repository/target declaration")
+
+
+@pytest.mark.parametrize("fallback", ["orphan", "fault"])
+def test_unknown_fallback_cards_carry_repo_binding(monkeypatch, fallback):
+    bus = Bus()
+    if fallback == "orphan":
+        bus.add(BUILDER, LEAD, "task-response", {"request_id": "tk-missing", "work_item": ITEM, "status": "done"},
+                raw=True)
+    else:
+        bus.task("tk-build", BUILDER, "build", **POLICY)
+
+        def broken(*args, **kwargs):
+            raise RuntimeError("boom")
+        monkeypatch.setattr(work_board, "_evaluate_item", broken)
+    item = next(i for i in work_board.reduce(bus.messages, lead=LEAD)["items"] if i["work_item"] == ITEM)
+    assert item["workflow_column"] == "unknown" and item["repo_binding"] is None

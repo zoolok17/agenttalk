@@ -79,7 +79,9 @@ local checkouts, not an item registry. For this repository:
 - A dispatch may declare `work_repo` (an alias) and `work_target` (`master` or
   `refs/heads/master`). An item without a declaration uses the one alias marked
   `default`. With no default, an unlisted alias or conflicting declarations,
-  the item stays Unknown. Paths never come from messages.
+  the item stays Unknown. An explicitly empty `work_repo` or `work_target` is
+  an invalid binding ("empty repository/target declaration"), never the same
+  as no declaration. Paths never come from messages.
 - Invalid entries, two aliases for one checkout, and two defaults are refused
   with a warning.
 
@@ -104,8 +106,20 @@ candidate) pair against each approved target of the item's alias:
 - A shallow checkout, a missing candidate or a failed ancestry check records
   no fact (Unknown).
 
-The command lists unknown pairs. It exits 2 when no usable alias is configured,
-otherwise 0.
+One run at a time: a publishing run holds `.agenttalk/work-board-verify.lock`
+(outside `state/`, so a reset cannot remove it) from its first read to its
+publish, so two runs never interleave. A second run is
+refused at once with "another verify-merges run is in progress". A dry run
+publishes nothing and takes no lock. The snapshot worker never takes this lock.
+
+The command lists unknown pairs. It exits 2, having published nothing, when:
+
+- no usable alias is configured;
+- another run is in progress;
+- the store session changed during the run (a reset);
+- the facts file has an unsupported schema version (the file is left untouched).
+
+Otherwise it exits 0.
 
 ### Facts file
 
@@ -115,10 +129,9 @@ kept. It holds at most 400 facts and 512 KiB. Each fact records `project`,
 `repo_alias`, `repo_path`, `work_item`, `candidate`, `target_ref`, `target_oid`
 (at check time), `checked_at` and `result` (`integrated` or `not_integrated`).
 Each run rewrites the integration section for the current pairs, so an
-invalidated result disappears. `checked_at` is the run's observation start, and
-publication is ordered under the lock: an older run never replaces a fact
-observed after it started. Its fact for that key is dropped, and the command
-reports it as superseded.
+invalidated result disappears. The section records the store `session_id` its
+run started in. The run publishes only if that session is still current, and
+the reader ignores a section from another session, with a warning.
 
 The snapshot worker reads the file on every refresh, bounded and schema-checked:
 
