@@ -97,6 +97,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or font changes. New `test_paper_text_tokens_meet_wcag_aa_contrast_on_their_backgrounds`
   covers Paper the same way Midnight was already covered.
 
+- Fix #235: `tests/test_compact.py`'s "now, an hour ahead" reference
+  (`keep_age_days=0.0` leaves nothing "young") was a module-level constant
+  computed once at IMPORT time. When the file's tests ran more than an hour
+  after pytest collected them, that frozen reference was already in the past
+  and compaction archived nothing — 8 failures on a slow Windows xdist probe
+  run (issue #235). It is now computed fresh at call time by every test that
+  needs it. Test-only; every assertion is unchanged.
+
 ### CI
 
 - **Windows CI capacity stopgap.** Master run 36571318073 (`e6b6421`) killed
