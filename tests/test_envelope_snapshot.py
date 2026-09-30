@@ -3,10 +3,11 @@ import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from agenttalk import web
+from agenttalk import gates, web, work_board_feed
 from agenttalk.store import Store
 
 
@@ -271,25 +272,135 @@ def test_worker_runs_scheduled_membership_retry_without_normal_poll_delay(bus, m
         snapshot.close()
 
 
-def test_refresh_skips_the_whole_rebuild_when_nothing_changed(bus, monkeypatch):
-    """#239 regression: refresh() re-read, re-reduced and re-built the WHOLE board every ~5s
-    cycle even when the store had not changed at all since the last successful refresh - the
-    confirmed dominant driver of the reported runaway memory growth (`agenttalk serve` grew to
-    ~1.9 GB working set / ~19 GB private in 70 minutes on an 11.7k-message store). An in-process
-    repro (many refreshes plus repeated .active()/.board()/.coverage() calls, matching a real
-    browser tab's polling, against a real ~11k-message synthetic store) showed working set
-    climbing steadily while tracemalloc's own traced-object total and live object count stayed
-    completely flat - allocator churn from rebuilding large, short-lived structures every cycle,
-    never a retained reference. This is a cheap, deterministic proxy for that same finding: 200
-    refreshes on an UNCHANGED store must reuse the exact same published Snapshot/board objects
-    every time, never re-reduce or rebuild after the first."""
-    from agenttalk import work_board_feed
+# ----------------------------------------------- #239 fix round 1 (dev-5 cold read, F1-F5)
+#
+# Round 1's own fix ("reuse the whole board when message/archive membership + trust are
+# unchanged") broke five real invariants by trying to enumerate every input that could make a
+# cached board stale (gate state, waivers, time, transient failures, discarded generations,
+# archive errors) - exactly what the lead's direction warned against. This round instead skips
+# ONLY the expensive reduce()/closure computation, keyed on this cycle's own freshly-computed,
+# never-throttled active-state facts (never an upstream guess) - and ALWAYS re-evaluates
+# gate/waiver state fresh, cache hit or not, since it is cheap and can change with no file
+# change at all (a waiver expiring). The five probes below are the reviewer's own repro,
+# adapted to this file's fixtures; all five FAIL against round 1 and PASS here.
+
+def _board_setup(tmp_path, *, clock):
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    store.set_role("alpha", "lead")
+    store.send(sender="alpha", recipient="beta", kind="task", body="work",
+              meta={"request_id": "tk-probe", "work_item": "probe", "stage": "build"})
+    snapshot = service(store, clock=clock)
+    assert snapshot.refresh()
+    return store, snapshot
+
+
+def test_gate_only_change_is_observed_with_no_message(tmp_path):
+    """F1: a global gate flip with an otherwise-unchanged bus must be reflected immediately,
+    never frozen at the cached board's original GO verdict."""
+    now = [0.0]
+    store, snapshot = _board_setup(tmp_path, clock=lambda: now[0])
+    assert snapshot.board()["items"][0]["global_gates"]["verdict"] == "GO"
+    gates.set_gate(store.root, name="release", status="red", severity="blocker",
+                   scope="global", actor="alpha", evidence_source="automation_ci")
+    assert gates.check_gates(store.root)["verdict"] == "HOLD"
+    now[0] += 6
+    assert snapshot.refresh()
+    assert snapshot.board()["items"][0]["global_gates"]["verdict"] == "HOLD"
+
+
+def test_board_failure_is_retried_without_another_message(tmp_path, monkeypatch):
+    """F2: a transient board failure must not become permanent - the very next refresh, with
+    no new message at all, must retry and recover once the failure clears."""
+    now = [0.0]
+    store, snapshot = _board_setup(tmp_path, clock=lambda: now[0])
+    def failed(*a, **k):
+        raise OSError("transient board failure")
+    monkeypatch.setattr(work_board_feed, "build", failed)
+    store.send(sender="alpha", recipient="beta", body="new message")
+    now[0] += 6
+    assert snapshot.refresh()
+    assert snapshot.board()["coverage"]["status"] == "stale"
+    monkeypatch.undo()
+    now[0] += 6
+    assert snapshot.refresh()
+    assert snapshot.board()["coverage"]["status"] == "complete"
+
+
+def test_invalidated_build_does_not_poison_the_reuse_key(tmp_path, monkeypatch):
+    """F3: invalidate() firing mid-build must discard that generation entirely, including the
+    #239 reuse key - the NEXT refresh must not republish stale facts as if they were current."""
+    now = [0.0]
+    store, snapshot = _board_setup(tmp_path, clock=lambda: now[0])
+    original = work_board_feed.build
+    def invalidated(*a, **k):
+        result = original(*a, **k)
+        snapshot.invalidate()
+        return result
+    monkeypatch.setattr(work_board_feed, "build", invalidated)
+    store.send(sender="alpha", recipient="beta", body="new message")
+    now[0] += 6
+    assert snapshot.refresh() is False
+    monkeypatch.undo()
+    now[0] += 6
+    assert snapshot.refresh()
+    assert len(snapshot.active(store.load_config())[0]) == 2
+
+
+def test_archive_error_does_not_disable_active_refresh(tmp_path, monkeypatch):
+    """F4: an unreadable archive partition must stay isolated to board/archive coverage - it
+    must never age out or block the ACTIVE snapshot refresh."""
+    now = [0.0]
+    store, snapshot = _board_setup(tmp_path, clock=lambda: now[0])
+    original = snapshot._membership
+    def unreadable(compacted=False):
+        if compacted:
+            raise PermissionError("archive temporarily unavailable")
+        return original(compacted)
+    monkeypatch.setattr(snapshot, "_membership", unreadable)
+    store.send(sender="alpha", recipient="beta", body="new message")
+    now[0] += 6
+    assert snapshot.refresh()
+    assert len(snapshot.active(store.load_config())[0]) == 2
+    assert snapshot.coverage()["status"] == "stale"
+
+
+def test_waiver_expiry_is_observed_without_any_file_change(tmp_path, monkeypatch):
+    """F1/F5: a waiver expiring is a pure function of WALL TIME - no message, no gate file
+    write, nothing to key a reuse cache on. It must still flip the board's verdict."""
+    now = [0.0]
+    store, snapshot = _board_setup(tmp_path, clock=lambda: now[0])
+    gates.set_gate(store.root, name="release", status="red", severity="blocker",
+                   scope="global", actor="alpha", evidence_source="automation_ci")
+    wall = [datetime.now(timezone.utc)]
+    gates.waive_gate(store.root, name="release", operator="human", reason="temporary",
+                     scope="global", expires=(wall[0] + timedelta(seconds=10)).isoformat())
+    class FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return wall[0]
+    monkeypatch.setattr(gates, "datetime", FakeDateTime)
+    store.send(sender="alpha", recipient="beta", body="waiver now active")
+    now[0] += 6
+    assert snapshot.refresh()
+    assert snapshot.board()["items"][0]["global_gates"]["verdict"] == "GO"
+    wall[0] += timedelta(seconds=20)
+    now[0] += 20
+    assert gates.check_gates(store.root)["verdict"] == "HOLD"
+    assert snapshot.refresh()
+    assert snapshot.board()["items"][0]["global_gates"]["verdict"] == "HOLD"
+
+
+def test_refresh_skips_the_expensive_reduce_when_facts_are_unchanged(bus, monkeypatch):
+    """#239 root cause, round 2: refresh() re-read, re-reduced and re-built the WHOLE board
+    every ~5s cycle even when nothing had changed - the confirmed dominant driver of the
+    reported runaway memory growth. This is the cheap, deterministic regression proxy: 200
+    refreshes on an unchanged store must call work_board_feed.build exactly once (the first),
+    never again - while gate state (checked separately above) stays live throughout."""
     now = [0.0]
     snapshot = service(bus, clock=lambda: now[0])
     assert snapshot.refresh()
-    first_active = snapshot.current.active
-    first_items, first_legacy = snapshot._board["items"], snapshot._board["legacy"]
-    assert snapshot.current.archives_complete  # the fast path requires completed discovery
+    first_items = snapshot._board["items"]
     calls = []
     original_build = work_board_feed.build
     def counting_build(*args, **kwargs):
@@ -299,16 +410,11 @@ def test_refresh_skips_the_whole_rebuild_when_nothing_changed(bus, monkeypatch):
     for _ in range(200):
         now[0] += 6.0
         assert snapshot.refresh()
-    assert calls == [], "the board must never be rebuilt once nothing has changed"
-    assert snapshot.current.active is first_active, "the active tuple must be reused, not recopied"
-    assert snapshot._board["items"] is first_items, "board items must be reused, not recopied"
-    assert snapshot._board["legacy"] is first_legacy
-    assert snapshot.current.generation == 201  # every cycle still counts as a real refresh
-    # A real change (a new message) must still be picked up - the fast path is not a permanent
-    # freeze, only a skip while the store is genuinely unchanged.
+    assert calls == [], "the expensive reduce/build must never rerun once facts are unchanged"
+    assert snapshot._board["items"] is not first_items  # a new dict every cycle (gate re-stamp)
+    assert snapshot._board["items"] == first_items       # but equal content - nothing rebuilt
+    # A real change (a new message) must still trigger a genuine rebuild.
     bus.send(sender="alpha", recipient="beta", body="a new message arrives")
     now[0] += 6.0
     assert snapshot.refresh()
     assert len(calls) == 1
-    assert snapshot.current.active is not first_active
-    assert snapshot._board["items"] is not first_items

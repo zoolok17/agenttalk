@@ -4,7 +4,7 @@ import hashlib
 import json
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from agenttalk import signing
@@ -116,9 +116,7 @@ class SnapshotService:
         self._archive_slice_limit = archive_slice_limit
         self._cache, self._cache_trust = {}, None
         self._archive_error = None
-        self._last_membership = None
-        self._last_archive_membership = None
-        self._last_trust = None
+        self._board_source_key = None
         self.current = None
         self._board = None
         self._board_error = None
@@ -197,32 +195,6 @@ class SnapshotService:
                 self._cache.clear()
                 self._cache_trust = trust
             before = self._membership()
-            # #239 root cause: every cycle re-read, re-reduced and re-built the WHOLE board
-            # (work_board_feed.build over every message) even when nothing had changed since
-            # the last successful refresh - on a real store this is pure churn every ~5s,
-            # forever, and was the dominant driver of the reported runaway memory growth
-            # (confirmed by an in-process repro: working set climbs while tracemalloc's own
-            # traced-object total and live object count stay flat - the growth is allocator
-            # churn from rebuilding large, short-lived structures, not a retained reference).
-            # When the active AND archive partitions are BYTE-IDENTICAL to the last published
-            # generation, trust is unchanged, and archive discovery already completed, there is
-            # nothing new to reduce - republish the existing Snapshot/board verbatim (same
-            # tuples, no new allocation) with only the as-of bookkeeping refreshed.
-            archive_before_fast = self._membership(compacted=True)
-            if (self.current is not None and self._board is not None
-                    and self.current.archives_complete and trust == self._last_trust
-                    and before == self._last_membership
-                    and archive_before_fast == self._last_archive_membership):
-                value = replace(self.current, generation=generation + 1, started=start,
-                                duration=self.clock() - start)
-                board = self._refresh_board_timestamps(self._board, start, generation + 1)
-                with self._lock:
-                    if generation != self._generation:
-                        return False
-                    self._generation += 1
-                    self.current, self.error = value, None
-                    self._board = board
-                return True
             batch, slice_start = 0, self.clock()
             def checkpoint():
                 nonlocal batch, slice_start
@@ -263,19 +235,36 @@ class SnapshotService:
             # Reduction and gate IO belong to this worker, never a polling handler.
             from agenttalk import gates, work_board_feed
             board_error = None
+            # #239: the reduce()/closure computation is expensive (O(every message)) and was
+            # being paid every ~5s cycle forever, even when nothing had changed - the confirmed
+            # dominant driver of the reported memory growth. Skip it ONLY when this cycle's
+            # OWN freshly-computed, never-throttled active-state facts (active/invalid_count/
+            # envelopes/archives) are IDENTICAL to the ones the last SUCCESSFUL board build
+            # used - never an upstream input guess (config/trust/gates/time), just the same
+            # downstream facts this function already recomputes honestly every cycle regardless.
+            # Gate/waiver state is ALWAYS re-evaluated fresh below, cache hit or not - it is
+            # cheap (O(items), not O(messages)) and time-dependent (a waiver can expire with no
+            # file change at all), so it must never ride along with a skipped rebuild. A failed
+            # attempt (board_error set) never poisons the key, so a transient failure is retried
+            # next cycle regardless of whether the facts still match.
+            board_key = (value.active, value.invalid_count, value.envelopes, value.archives,
+                        value.archive_invalid_count, value.archives_complete)
+            new_board_source_key = None
             try:
-                board = work_board_feed.build(value, project=self.store.project_id(),
-                                              lead=self.store.sole_lead(),
-                                              gate_state=gates.load_gate_state(self.store.root))
-                if board["coverage"]["status"] != "complete" and self._board:
-                    board["items"] = copy.deepcopy(self._board["items"])
-                    board["last_known"] = True
-                    board = work_board_feed.bounded(board)
+                gate_state = gates.load_gate_state(self.store.root)
+                if (self._board_error is None and self._board is not None
+                        and board_key == self._board_source_key):
+                    board = self._refresh_gate_state(self._board, value, gate_state=gate_state)
+                else:
+                    board = work_board_feed.build(value, project=self.store.project_id(),
+                                                  lead=self.store.sole_lead(), gate_state=gate_state)
+                    if board["coverage"]["status"] != "complete" and self._board:
+                        board["items"] = copy.deepcopy(self._board["items"])
+                        board["last_known"] = True
+                        board = work_board_feed.bounded(board)
+                    new_board_source_key = board_key
             except Exception as exc:  # board failures must not disable active /api/state
                 board, board_error = self._board, type(exc).__name__
-            self._last_membership = before
-            self._last_archive_membership = archive_before
-            self._last_trust = trust
             with self._lock:
                 if generation != self._generation:
                     return False
@@ -283,6 +272,10 @@ class SnapshotService:
                 self.current, self.error = value, None
                 self._board = board
                 self._board_error = board_error
+                if board_error is None:
+                    self._board_source_key = new_board_source_key or board_key
+                else:
+                    self._board_source_key = None
                 self._archive_error = archive_error
                 if isinstance(archive_error, MembershipChanged):
                     self._retry_at = self.clock() + .25
@@ -299,17 +292,22 @@ class SnapshotService:
             with self._lock:
                 self._busy = False
 
-    def _refresh_board_timestamps(self, board, start, generation):
-        """A cheap, SHALLOW re-stamp of the as-of bookkeeping for the #239 fast path - never
-        touches `items`/`legacy`/`unassigned` (the actual reduced facts, unchanged), and never
-        mutates the previous `board` object in place (a concurrent `.board()` read may still
-        hold a reference to it until the lock-guarded swap below)."""
+    def _refresh_gate_state(self, board, value, *, gate_state):
+        """#239: re-evaluate ONLY the live, cheap (O(items), not O(messages)) gate/waiver state
+        onto an otherwise-cached board - never skipped, since a gate flip or a waiver expiring
+        is real, observable truth regardless of whether any message changed (F1). Returns a NEW
+        dict; never mutates the previous `board` in place (a concurrent `.board()` read may
+        still hold a reference to it until the lock-guarded swap in refresh())."""
+        from agenttalk import gates
+        global_gates = gates.check_gates(None, state=gate_state)
+        stamp = {"verdict": global_gates["verdict"], "blockers": global_gates["blockers"]}
+        items = [dict(item, global_gates=stamp) for item in board["items"]]
         now = datetime.now(timezone.utc)
-        began = now - timedelta(seconds=self.clock() - start)
-        coverage = dict(board["coverage"], generation=generation,
+        began = now - timedelta(seconds=value.duration)
+        coverage = dict(board["coverage"], generation=value.generation,
                         scan_started_at=began.isoformat(), scan_ended_at=now.isoformat(),
                         valid_until=(began + timedelta(seconds=15)).isoformat())
-        return dict(board, coverage=coverage, generated_at=now.isoformat())
+        return dict(board, items=items, coverage=coverage, generated_at=now.isoformat())
 
     def active(self, cfg):
         with self._lock:

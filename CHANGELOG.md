@@ -40,24 +40,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`agenttalk serve` memory leak (#239).** `SnapshotService.refresh()` re-read,
-  re-reduced and re-built the WHOLE work board (`work_board_feed.build` over
-  every message) every ~5s worker cycle even when the store had not changed
-  at all - reported growth to ~1.9 GB working set / ~19 GB private in about
-  70 minutes on an ~11.7k-message store with one browser tab open. An
-  in-process repro (many refreshes plus repeated `.active()`/`.board()`/
-  `.coverage()` calls against a real ~11k-message synthetic store, bounded to
-  1.0 GB / 10 minutes) confirmed it: working set climbed steadily while
-  `tracemalloc`'s own traced-object total and live object count stayed
-  completely flat - allocator churn from rebuilding large, short-lived
-  structures every cycle forever, never a retained reference. `refresh()` now
-  republishes the existing Snapshot/board verbatim (same tuples, no new
-  allocation) when the active and archive partitions are byte-identical to
-  the last successful refresh, trust is unchanged, and archive discovery
-  already completed - a genuine change still triggers a full rebuild exactly
-  as before. Regression test: 200 refreshes on an unchanged fixture store
-  must reuse the exact same published objects and never call
-  `work_board_feed.build` again after the first.
+- **`agenttalk serve` idle-churn reduction (#239, scope narrowed after fix round 1).**
+  `SnapshotService.refresh()` re-read, re-reduced and re-built the WHOLE work board
+  (`work_board_feed.build` over every message) every ~5s worker cycle, even when the
+  message/archive facts had not changed since the last successful build. Round 1's fix
+  tried to reuse the whole board whenever the raw file membership matched, which broke
+  five real invariants a codex cold read caught: a global gate flip or an expiring
+  operator waiver could be frozen at a stale verdict indefinitely with no file change; a
+  transient board-build failure became permanent; `invalidate()` firing mid-build could
+  republish a discarded generation as current; and an unreadable archive partition could
+  age out the unrelated ACTIVE snapshot. This round instead skips ONLY the expensive
+  reduce/closure computation, keyed on this cycle's own freshly-computed,
+  never-throttled active-state facts (never an upstream guess about config/trust/gates/
+  time) - and ALWAYS re-evaluates gate and waiver state fresh, cache hit or not, since it
+  is cheap (O(items), not O(messages)) and can change with no file write at all. A failed
+  attempt never poisons the reuse key, and the key is only committed once the same
+  generation-discard check that already guards `self.current`/`self._board` passes.
+  **Honesty on scope**: round 1's tracemalloc-instrumented in-process repro reported
+  working-set growth (140→290 MB) that the round-1 reply attributed to this churn.
+  Round 2's bounded, uninstrumented (private bytes + working set via the Windows API
+  directly, no tracemalloc) A/B measurement of the SAME synthetic ~11k-message store
+  found the PARENT commit already flat (~100→~120 MB, plateauing within about 20 cycles)
+  on both an idle and an actively-changing store, over up to 280 cycles / ~8 minutes -
+  and a separate, explicitly-instrumented run of the identical parent code showed
+  tracemalloc's own overhead alone adding roughly 130 MB at the very first sample. The
+  original incident's reported ~1.9 GB working set / ~19 GB private growth over 70
+  real minutes has **not** been reproduced or root-caused in-process by either round;
+  issue #239 stays open with these measurements recorded against it. This change is
+  scoped honestly as a verified reduction in redundant per-cycle work on an idle/
+  unchanged store, not a proven fix for the reported incident.
 
 - **CI flake #223: comprehension tests no longer depend on a real `git
   check-ignore` succeeding within 2 seconds.** Two Windows dev-gate legs
