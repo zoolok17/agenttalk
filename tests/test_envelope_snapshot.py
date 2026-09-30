@@ -269,3 +269,46 @@ def test_worker_runs_scheduled_membership_retry_without_normal_poll_delay(bus, m
         assert snapshot.error is None
     finally:
         snapshot.close()
+
+
+def test_refresh_skips_the_whole_rebuild_when_nothing_changed(bus, monkeypatch):
+    """#239 regression: refresh() re-read, re-reduced and re-built the WHOLE board every ~5s
+    cycle even when the store had not changed at all since the last successful refresh - the
+    confirmed dominant driver of the reported runaway memory growth (`agenttalk serve` grew to
+    ~1.9 GB working set / ~19 GB private in 70 minutes on an 11.7k-message store). An in-process
+    repro (many refreshes plus repeated .active()/.board()/.coverage() calls, matching a real
+    browser tab's polling, against a real ~11k-message synthetic store) showed working set
+    climbing steadily while tracemalloc's own traced-object total and live object count stayed
+    completely flat - allocator churn from rebuilding large, short-lived structures every cycle,
+    never a retained reference. This is a cheap, deterministic proxy for that same finding: 200
+    refreshes on an UNCHANGED store must reuse the exact same published Snapshot/board objects
+    every time, never re-reduce or rebuild after the first."""
+    from agenttalk import work_board_feed
+    now = [0.0]
+    snapshot = service(bus, clock=lambda: now[0])
+    assert snapshot.refresh()
+    first_active = snapshot.current.active
+    first_items, first_legacy = snapshot._board["items"], snapshot._board["legacy"]
+    assert snapshot.current.archives_complete  # the fast path requires completed discovery
+    calls = []
+    original_build = work_board_feed.build
+    def counting_build(*args, **kwargs):
+        calls.append(1)
+        return original_build(*args, **kwargs)
+    monkeypatch.setattr(work_board_feed, "build", counting_build)
+    for _ in range(200):
+        now[0] += 6.0
+        assert snapshot.refresh()
+    assert calls == [], "the board must never be rebuilt once nothing has changed"
+    assert snapshot.current.active is first_active, "the active tuple must be reused, not recopied"
+    assert snapshot._board["items"] is first_items, "board items must be reused, not recopied"
+    assert snapshot._board["legacy"] is first_legacy
+    assert snapshot.current.generation == 201  # every cycle still counts as a real refresh
+    # A real change (a new message) must still be picked up - the fast path is not a permanent
+    # freeze, only a skip while the store is genuinely unchanged.
+    bus.send(sender="alpha", recipient="beta", body="a new message arrives")
+    now[0] += 6.0
+    assert snapshot.refresh()
+    assert len(calls) == 1
+    assert snapshot.current.active is not first_active
+    assert snapshot._board["items"] is not first_items

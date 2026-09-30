@@ -40,6 +40,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`agenttalk serve` memory leak (#239).** `SnapshotService.refresh()` re-read,
+  re-reduced and re-built the WHOLE work board (`work_board_feed.build` over
+  every message) every ~5s worker cycle even when the store had not changed
+  at all - reported growth to ~1.9 GB working set / ~19 GB private in about
+  70 minutes on an ~11.7k-message store with one browser tab open. An
+  in-process repro (many refreshes plus repeated `.active()`/`.board()`/
+  `.coverage()` calls against a real ~11k-message synthetic store, bounded to
+  1.0 GB / 10 minutes) confirmed it: working set climbed steadily while
+  `tracemalloc`'s own traced-object total and live object count stayed
+  completely flat - allocator churn from rebuilding large, short-lived
+  structures every cycle forever, never a retained reference. `refresh()` now
+  republishes the existing Snapshot/board verbatim (same tuples, no new
+  allocation) when the active and archive partitions are byte-identical to
+  the last successful refresh, trust is unchanged, and archive discovery
+  already completed - a genuine change still triggers a full rebuild exactly
+  as before. Regression test: 200 refreshes on an unchanged fixture store
+  must reuse the exact same published objects and never call
+  `work_board_feed.build` again after the first.
+
 - **CI flake #223: comprehension tests no longer depend on a real `git
   check-ignore` succeeding within 2 seconds.** Two Windows dev-gate legs
   each hit one `VcsPrivacyRefused` error out of ~8.5k tests, on PRs that
