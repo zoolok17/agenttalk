@@ -508,6 +508,49 @@ _PWSH_SPAWNING_ONLY_PARAM_IDS = {
     "test_prepare_cli_requires_powershell_accepted_config_before_effects": {"transport_ambiguous"},
 }
 
+# PROBE (#232 round 3): the OVH gateway's real ports are FIXED module-level
+# constants (127.0.0.1:4000/4001, ovh_gateway.PUBLIC_PORT/INTERNAL_PORT) -
+# every unmocked call into exclusive_bind_probe/_both_sockets_free (reached
+# from gateway_status, reconfigure_endpoint, rebind_runtime, the real service
+# runner, and the task-start path in ovh_gateway_service.py) does a REAL
+# socket bind-probe against them. Two of these landing on different xdist
+# workers at the same moment collide - dev-5 caught this as an intermittent
+# `reconfigure_endpoint` -> GatewayConfigError("refusing to reconfigure while
+# the gateway is running") on Windows CI (5/8 runs). Identified by tracing
+# every call site, not by grepping for the port constants (which alone would
+# have missed test_ovh_gateway_cli.py - it never mentions PUBLIC_PORT/
+# INTERNAL_PORT by name, but its bare `agenttalk gateway status` CLI test
+# calls the unmocked `service.gateway_status()`, which unconditionally probes
+# PUBLIC_PORT). None of these 12 tests are parametrized. This group is
+# disjoint from "pwsh" (no test is both) - if that ever changes, "pwsh"
+# wins, since PowerShell-host startup contention was the FIRST flake found
+# and its probe timeout is tighter (5s) than any gateway-port failure mode.
+_GATEWAY_PORT_TEST_NAMES = frozenset(
+    {
+        # tests/test_ovh_gateway_lifecycle_integration.py - both tests: each
+        # spawns real subprocesses that call unmocked rebind_runtime/
+        # reconfigure_endpoint/run_service; the second test's subprocess
+        # actually binds and listens on both ports for the test's duration.
+        "test_real_process_rebind_serializes_reconfigure_without_stale_manifest_write",
+        "test_real_process_service_startup_excludes_rebind_until_sockets_are_owned",
+        # tests/test_ovh_gateway_service.py - each reaches gateway_status()
+        # or stop_task()/_service_absent() without mocking
+        # exclusive_bind_probe/_both_sockets_free first.
+        "test_operator_stop_uses_gateway_kill_switch_before_bounded_task_end",
+        "test_linux_operator_stop_uses_gateway_kill_switch_before_bounded_unit_stop",
+        "test_linux_status_reports_absent_unit_before_any_install",
+        "test_forced_stop_removes_only_stale_marker_after_both_sockets_are_free",
+        "test_manifest_and_task_written_under_one_envelope_fail_against_another_ledger",
+        "test_status_reports_no_policy_hash_when_the_ledger_is_unavailable",
+        "test_init_with_reasoning_params_renders_them_and_records_them_in_the_manifest",
+        "test_default_install_has_no_reasoning_params_anywhere",
+        "test_a_tampered_manifest_reasoning_param_fails_closed",
+        # tests/test_ovh_gateway_cli.py - the one CLI test that never mocks
+        # gateway_status before invoking `agenttalk gateway status`.
+        "test_gateway_status_not_ready_uses_operational_error_exit",
+    }
+)
+
 
 def _pwsh_group_for(item: pytest.Item) -> str | None:
     name = getattr(item, "originalname", None) or item.name.split("[", 1)[0]
@@ -521,6 +564,16 @@ def _pwsh_group_for(item: pytest.Item) -> str | None:
     return "pwsh"
 
 
+def _xdist_group_for(item: pytest.Item) -> str | None:
+    name = getattr(item, "originalname", None) or item.name.split("[", 1)[0]
+    pwsh_group = _pwsh_group_for(item)
+    if pwsh_group is not None:
+        return pwsh_group
+    if name in _GATEWAY_PORT_TEST_NAMES:
+        return "gateway-ports"
+    return None
+
+
 def pytest_collection_modifyitems(config, items) -> None:
     """#50: process-orchestration tests marked source_layout cannot pass under
     an installed-wheel run through a venv launcher (Popen.pid != child pid), and
@@ -528,11 +581,12 @@ def pytest_collection_modifyitems(config, items) -> None:
     subprocess). Skip them only when running against an installed wheel; source
     mode runs them.
 
-    #232 round 2: under `--dist loadgroup`, every item is forced into the
-    "pwsh" group (see above) if it spawns a real PowerShell process, else its
-    own test file - reproducing today's `--dist loadfile` behavior for
-    everything else. Only meaningful with the xdist plugin loaded; a plain
-    `pytest` run (no xdist installed) skips this entirely."""
+    #232 round 2/3: under `--dist loadgroup`, every item is forced into the
+    "pwsh" or "gateway-ports" group (see above) if it touches one of those
+    two shared, machine-wide resources for real, else its own test file -
+    reproducing today's `--dist loadfile` behavior for everything else. Only
+    meaningful with the xdist plugin loaded; a plain `pytest` run (no xdist
+    installed) skips this entirely."""
     if not _running_against_installed_wheel():
         pass
     else:
@@ -546,5 +600,5 @@ def pytest_collection_modifyitems(config, items) -> None:
 
     if config.pluginmanager.hasplugin("xdist"):
         for item in items:
-            group = _pwsh_group_for(item) or item.location[0]
+            group = _xdist_group_for(item) or item.location[0]
             item.add_marker(pytest.mark.xdist_group(name=group))
