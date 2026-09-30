@@ -18,7 +18,6 @@ import socket
 import subprocess
 import threading
 import time
-import tracemalloc
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -2793,7 +2792,7 @@ def test_scan_saturation_returns_503_busy_and_thread_count_recovers(
 
         def fire(_i: int) -> None:
             start = time.time()
-            req = urllib.request.Request(f"{base}/api/attention")
+            req = urllib.request.Request(f"{base}/api/attention")  # noqa: S310  # nosemgrep
             try:
                 with _urlopen(req, timeout=slow_seconds + 15) as resp:
                     status, headers = resp.status, resp.headers
