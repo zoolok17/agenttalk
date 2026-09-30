@@ -81,6 +81,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Python caller's subprocess timeout is 240s to fit the worst case. Test harness
   only; every scroll/focus/visibility/sabotage-detection assertion is unchanged.
 
+- **Console v2 Paper theme toned down (operator feedback 2026-09-29: "EXTREMELY
+  bright").** Paper used pure-white panels (`--panel` `#FFFFFF`, `--panel2`
+  `#FBF9F4`) on a near-white `--bg` (`#F6F3EC`) - only Midnight had been styled
+  and reviewed in the pitch slice; Paper just carried its variables. Surfaces
+  are now warm, mid-light greiges a clear step apart: `--bg` `#E6E1D6`,
+  `--panel` `#EFEBE2`, `--panel2` `#E9E4D9`, `--border` `#C9C0AC` (no pure
+  white anywhere). `--dim` (`#6B655B` -> `#5C564C`) and the status colours
+  `--ok`/`--warn`/`--bad`/`--info` (`#2E9F6B`/`#B7780A`/`#D2402F`/`#2F6FC9` ->
+  `#21734E`/`#8B5B08`/`#B63627`/`#2A64B4`) are deepened so every text-on-panel
+  pairing still clears WCAG AA (4.5:1; worst case 4.57:1, `ok` on `panel2`) on
+  the new, less-bright surfaces - `--fg`, `--serif`, `--accent`,
+  `--accent-ink` and the runtime badge colours are unchanged, already
+  comfortably legible. Midnight, Synthwave and Terminal are untouched; no CSP
+  or font changes. New `test_paper_text_tokens_meet_wcag_aa_contrast_on_their_backgrounds`
+  covers Paper the same way Midnight was already covered.
+
 - Fix #235: `tests/test_compact.py`'s "now, an hour ahead" reference
   (`keep_age_days=0.0` leaves nothing "young") was a module-level constant
   computed once at IMPORT time. When the file's tests ran more than an hour
