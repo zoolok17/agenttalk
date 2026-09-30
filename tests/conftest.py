@@ -393,18 +393,158 @@ def pytest_configure(config: pytest.Config) -> None:
     )
 
 
+# PROBE (#232 round 2): two pytest-xdist workers under --dist loadgroup contend
+# for real PowerShell-host startup capacity when a test that spawns a real
+# pwsh/powershell.exe process lands on a DIFFERENT worker than another one -
+# round 1 measured this as intermittent 5s-probe timeouts, never a real
+# product bug. Every item below spawns a genuine PowerShell process (verified
+# by reading each helper, not just grepping for the word "powershell") and is
+# forced into the shared "pwsh" xdist_group so all of them always land on the
+# SAME one worker, serialized against each other; every other test keeps its
+# per-file group, reproducing today's --dist loadfile behavior exactly.
+_PWSH_SPAWNING_TEST_NAMES = frozenset(
+    {
+        # tests/test_powershell_functional.py - module-skipped off Windows /
+        # without a real `pwsh` on PATH; every remaining test spawns one.
+        "test_real_core_parses_and_runs_all_generated_harmless_paths",
+        "test_real_core_accepts_direct_powershell_to_python_claim_chain",
+        "test_real_core_override_claim_uses_baked_fallback_for_validation",
+        "test_windows_powershell_51_rejects_each_script_before_sentinel",
+        "test_real_selected_host_record_is_discrete_core_version",
+        "test_real_probe_timeout_job_reaps_descendant",
+        # tests/test_supervisor.py - each of these calls a real pwsh/powershell.exe
+        # (a live probe, a live config-transport read, or a generated .ps1
+        # actually executed), not a monkeypatched stand-in.
+        "test_checkpoint_hook_guard_masks_legacy_exit_two_in_pwsh",
+        "test_generated_ps1_is_bom_ascii_and_parses",
+        "test_supervisor_config_transport_preserves_unicode_environment_names",
+        "test_supervisor_config_transport_rejects_ambiguous_environment_names",
+        "test_ephemeral_launcher_applies_environment_names_literally",
+        "test_generated_helper_ps1_are_bom_ascii_and_parse",
+        "test_generated_ps1_holds_malformed_config_poll_until_refresh_recovers",
+        "test_generated_ps1_hot_adds_agent_across_live_polls",
+        "test_generated_ps1_holds_poll_when_preplan_state_save_is_contended",
+        "test_ps_state_atomic_swap_retries_windows_sharing_violation",
+        "test_ps_poll_state_save_warns_and_survives_persistent_contention",
+        "test_ps_poll_state_save_only_softens_sharing_and_lock_violations",
+        "test_spawned_launch_is_not_acknowledged_when_record_launch_cannot_commit",
+        "test_generated_ps1_two_polls_do_not_duplicate_launch_after_postspawn_contention",
+        "test_ps_state_helpers_recover_backup_and_refuse_two_corrupt_copies",
+        "test_ps_set_agent_state_adds_new_agent_to_fresh_and_reloaded_state",
+        "test_generated_ps1_runs_bus_calls_without_console_script_on_path",
+        "test_proc_start_falls_back_to_get_process_when_cim_denied",
+        "test_generated_proc_snapshot_emits_exact_live_filetime",
+        "test_stop_tree_rejects_rounded_start_collision_by_exact_filetime",
+        "test_stop_tree_verifies_and_terminates_through_one_native_handle",
+        "test_generated_ps1_tamper_refuses_before_claim",
+        "test_generated_ps1_quiet_suppresses_warning_path",
+        "test_generated_ps1_quiet_suppresses_relaunch_helper_warnings",
+        "test_generated_ps1_quotes_args_with_spaces_as_single_arg",
+        "test_ps_wrapper_log_targets_preserve_output_and_prune_old_generations",
+        "test_ps_wrapper_log_retention_settles_one_over_quota_not_at_quota",
+        "test_ps_wrapper_log_prune_survives_backward_clock_correction",
+        "test_ps_wrapper_log_sequence_survives_failover_to_fallback_root",
+        "test_ps_wrapper_log_attempt_cleaned_up_when_pending_marker_write_fails",
+        "test_ps_wrapper_log_prune_refuses_when_root_scan_is_uncertain",
+        "test_ps_wrapper_log_sequence_not_uncertain_when_root_has_no_agent_dir",
+        "test_ps_wrapper_log_prune_bound_recovers_from_persistent_uncertainty",
+        "test_ps_wrapper_log_sequence_write_failure_marks_uncertain_and_defers_prune",
+        "test_ps_wrapper_log_sequence_uncertainty_persists_to_the_next_launch",
+        "test_ps_wrapper_log_security_does_not_depend_on_ambient_os_marker",
+        "test_ps_wrapper_log_cleanup_failure_uses_new_generation_and_still_launches",
+        "test_ps_wrapper_log_retention_is_global_across_primary_and_fallback",
+        "test_ps_failed_launch_generations_never_evict_prior_evidence",
+        "test_ps_locked_uncommitted_generation_never_displaces_real_evidence",
+        "test_ps_markerless_failed_generation_never_displaces_real_evidence",
+        "test_ps_wrapper_log_agent_paths_do_not_alias_windows_names",
+        "test_ps_wrapper_log_root_reparse_is_rejected_before_traversal",
+        "test_ps_wrapper_redirect_closes_supervisor_capture_pipes_before_child_exit",
+        "test_launch_environment_apply_failure_restores_parent_without_spawn",
+        "test_supervisor_launch_nonce_injection_consumes_typed_position",
+        "test_ps_regular_wrapped_launch_consumes_planned_loop_admission",
+        "test_launchers_consume_accepted_admission_argv_without_dropping_empty_argument",
+        "test_launchers_refuse_unusable_admission_before_environment_or_spawn",
+        "test_launch_admission_resolver_rejects_type_coercion_and_shape_drift",
+        "test_supervisor_wrapper_logging_is_driven_by_typed_admission",
+        "test_ps_start_wrapper_process_fallback_strips_logging_env_vars",
+        "test_ps_start_wrapper_process_reports_unredirected_when_both_sides_degrade",
+        "test_ps_start_wrapper_process_reports_redirected_when_one_side_degrades",
+        "test_ps_start_wrapper_process_strips_env_before_both_degraded_fallback",
+        "test_ps_launch_discards_targets_when_fallback_is_unredirected",
+        "test_launch_rechecks_kill_switch_after_branch_guard",
+        "test_stop_tree_kills_real_two_level_tree_start_guarded",
+        "test_seed_codex_home_provisions_and_fails_closed",
+        "test_preflight_wrapped_codex_validates_python_not_codex_sandbox",
+        "test_preflight_wrapped_console_entry_uses_direct_version_probe",
+        "test_preflight_wrapped_smoke_test_uses_admitted_prefix",
+        # tests/test_supervisor_spawn_seam.py - real spawn-seam tests only
+        # (the pure PS_TEMPLATE text/regression-tripwire tests in the same
+        # file are deliberately left OUT: they never spawn anything).
+        "test_spawn_seam_refuses_invalid_precreate_input_with_closed_result",
+        "test_spawn_seam_reports_unknown_without_a_null_result",
+        "test_spawn_seam_start_process_path_records_exact_identity",
+        "test_spawn_seam_real_wrapper_reaches_readiness_with_one_exact_identity",
+        # tests/test_ephemeral_reviewers.py
+        "test_prepare_cli_preserves_unicode_profile_environment_names",
+        "test_prepare_cli_rejects_colliding_environment_names_before_effects",
+        "test_prepare_cli_requires_powershell_accepted_config_before_effects",
+        # tests/test_coverage_producer.py - each junctions a real reparse point
+        # via a short-lived `powershell -Command New-Item -ItemType Junction`.
+        "test_dangling_selected_reparse_object_refuses_default",
+        "test_agenttalk_runtime_junction_is_not_scanner_owned",
+        "test_scanner_leaf_below_runtime_junction_is_not_exempt",
+        "test_coverage_lock_refuses_reparse_parent_without_touching_target",
+        "test_stored_coverage_lock_context_revalidates_replaced_parent",
+        "test_artifact_writer_refuses_reparse_output_parent",
+    }
+)
+
+# test_prepare_cli_requires_powershell_accepted_config_before_effects is
+# parametrized over 3 config-drift scenarios; only "transport_ambiguous"
+# actually reaches the real powershell-config-transport probe - the
+# "missing"/"changed" scenarios are rejected earlier, before any process is
+# spawned, and must stay free to run on either worker.
+_PWSH_SPAWNING_ONLY_PARAM_IDS = {
+    "test_prepare_cli_requires_powershell_accepted_config_before_effects": {"transport_ambiguous"},
+}
+
+
+def _pwsh_group_for(item: pytest.Item) -> str | None:
+    name = getattr(item, "originalname", None) or item.name.split("[", 1)[0]
+    if name not in _PWSH_SPAWNING_TEST_NAMES:
+        return None
+    only_ids = _PWSH_SPAWNING_ONLY_PARAM_IDS.get(name)
+    if only_ids is not None:
+        callspec_id = getattr(getattr(item, "callspec", None), "id", None)
+        if callspec_id not in only_ids:
+            return None
+    return "pwsh"
+
+
 def pytest_collection_modifyitems(config, items) -> None:
     """#50: process-orchestration tests marked source_layout cannot pass under
     an installed-wheel run through a venv launcher (Popen.pid != child pid), and
     add no packaging coverage (they force PYTHONPATH=src for their own
     subprocess). Skip them only when running against an installed wheel; source
-    mode runs them."""
+    mode runs them.
+
+    #232 round 2: under `--dist loadgroup`, every item is forced into the
+    "pwsh" group (see above) if it spawns a real PowerShell process, else its
+    own test file - reproducing today's `--dist loadfile` behavior for
+    everything else. Only meaningful with the xdist plugin loaded; a plain
+    `pytest` run (no xdist installed) skips this entirely."""
     if not _running_against_installed_wheel():
-        return
-    skip = pytest.mark.skip(
-        reason="source_layout: process-orchestration test needs a real-interpreter "
-        "layout; not run under wheel-isolation (#50)"
-    )
-    for item in items:
-        if "source_layout" in item.keywords:
-            item.add_marker(skip)
+        pass
+    else:
+        skip = pytest.mark.skip(
+            reason="source_layout: process-orchestration test needs a real-interpreter "
+            "layout; not run under wheel-isolation (#50)"
+        )
+        for item in items:
+            if "source_layout" in item.keywords:
+                item.add_marker(skip)
+
+    if config.pluginmanager.hasplugin("xdist"):
+        for item in items:
+            group = _pwsh_group_for(item) or item.location[0]
+            item.add_marker(pytest.mark.xdist_group(name=group))

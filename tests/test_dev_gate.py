@@ -604,7 +604,7 @@ def test_passing_check_command_must_match_committed_plan() -> None:
         dev_gate.validate_run_artifact(artifact, manifest)
 
 
-@pytest.mark.parametrize("parallel_arg", ["xdist.plugin", "2", "loadfile"])
+@pytest.mark.parametrize("parallel_arg", ["xdist.plugin", "2", "loadgroup"])
 def test_passing_pytest_evidence_requires_parallel_command(parallel_arg: str) -> None:
     """#(ci-windows-xdist-probe), ported from PR #105: a passing pytest
     check's argv must genuinely carry the committed parallel-execution

@@ -281,7 +281,7 @@ def validate_manifest(data: Any) -> dict[str, Any]:
     required_contract = {
         "pytest": {
             "paths": ["tests"],
-            "args": ["-q", "-p", "xdist.plugin", "-n", "2", "--dist", "loadfile"],
+            "args": ["-q", "-p", "xdist.plugin", "-n", "2", "--dist", "loadgroup"],
             "test_requirement": "pytest>=8.0",
             "xdist_requirement": "pytest-xdist>=3.8.0",
         },

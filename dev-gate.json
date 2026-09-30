@@ -73,7 +73,7 @@
         "-n",
         "2",
         "--dist",
-        "loadfile"
+        "loadgroup"
       ],
       "test_requirement": "pytest>=8.0",
       "xdist_requirement": "pytest-xdist>=3.8.0",
