@@ -44,15 +44,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     security-relevant context), so nothing about validation freshness has
     to depend on a coalescing key correctly enumerating every
     context-relevant input.
+  - Sharing even just the scan has its own freshness risk: a request that
+    starts after a message was successfully published could join a scan
+    that enumerated the messages directory BEFORE that publication and
+    silently miss it - per-caller validation cannot recover a file that is
+    simply absent from the shared scanned rows. Coalescing is now
+    generation-gated: a caller supplies its own freshly-observed
+    publication generation (the messages directory's `st_mtime_ns` -
+    verified directly that both a plain write and the real publish path's
+    `os.link` hardlink advance a directory's mtime on Windows; `store.py`
+    has no existing publication counter to prefer over this) and never
+    joins an in-flight scan whose own generation is older - it starts a
+    fresh scan instead. Unchanged generations (the #239 browser-polling
+    case) still coalesce exactly as before.
   - Added regression tests: `test_concurrent_calls_with_matching_context_still_coalesce_the_scan`
     (many genuinely concurrent calls sharing a matching context still
     coalesce onto one scan; thread count returns to baseline; retained
-    allocations stay under a fixed ceiling) and, event-synchronized (no
+    allocations stay under a fixed ceiling); event-synchronized (no
     sleep-and-hope races), `test_signing_enforcement_change_mid_flight_is_never_shared`
     / `test_roster_change_mid_flight_is_never_shared` (each parametrized
     over both entry points) proving a follower that joins an in-flight scan
     always validates with its own current context, never a leader's stale
-    one.
+    one; and `test_read_after_publication_freshness_is_never_shared` (same
+    parametrization) proving a follower whose own publication generation is
+    newer than an in-flight scan's never joins it.
 
 ### Added
 
