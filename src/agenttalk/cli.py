@@ -14207,14 +14207,21 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             sys.stderr.write("agenttalk supervise --clear-restart: need --for "
                              "<agent> and --request-id <rid>\n")
             return 2
+        pending = store.read_restart_request(args.agent)
+        budget_only = (
+            isinstance(pending, dict)
+            and pending.get("request_id") == args.request_id
+            and pending.get("mode") == sup.RESTART_BUDGET_CLEAR_MODE
+        )
         cleared = store.clear_restart_request(args.agent, args.request_id)
         # ONLY a CONFIRMED restart (a marker actually matched + was cleared) supersedes
         # the lead-loop exit marker - so an operator re-arm is not defeated by a stale
         # stand-down/blocked marker if the relaunched child fails before acquire (the
         # .ps1 calls this right after a confirmed Start-Process). A clear-restart that
         # matched NOTHING (stale/typo rid) must NOT delete a deliberate stand-down
-        # marker (codex: no re-arm without a confirmed restart).
-        if cleared:
+        # marker (codex: no re-arm without a confirmed restart). A budget-only
+        # clear restarts nothing, so it never supersedes one either.
+        if cleared and not budget_only:
             store.clear_lead_loop_exit(args.agent)
         print(f"cleared restart-request for {args.agent!r}" if cleared
               else f"no matching restart-request for {args.agent!r} "

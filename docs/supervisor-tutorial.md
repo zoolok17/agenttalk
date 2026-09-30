@@ -498,12 +498,20 @@ the work in flight. (Restarting a *protected* agent — see below — needs
 
 The monitor never relaunches a seat into a loop. Besides the backoff and
 the readiness give-up, each seat has a **restart budget**: at most
-`max_relaunches` (default 4) automatic relaunches until the seat has been
-continuously healthy for `window_seconds` (default 3600), which refills
-the budget. When a relaunch is due and the budget is spent, the monitor
-does not relaunch. It holds the seat in `RESTART_BUDGET_EXHAUSTED` and
-sends `notify_to` one note naming the seat, the relaunch count and the
-window.
+`max_relaunches` (default 4) automatic relaunch attempts until the seat has
+been continuously healthy for `window_seconds` (default 3600), which
+refills the budget.
+
+- Every automatic attempt counts, even one whose preflight fails. Your own
+  `request-restart` relaunches do not.
+- Continuously healthy means every poll in the window was green, with no
+  gap of more than 5 minutes between polls. Any other observation starts
+  the window again.
+
+When a relaunch is due and the budget is spent, the monitor does not
+relaunch. It holds the seat in `RESTART_BUDGET_EXHAUSTED` and sends
+`notify_to` one note naming the seat, the relaunch count and the window.
+If that send fails, or `notify_to` is not set, it retries on a later poll.
 
 The hold is sticky. A healthy blip, or even hours of health, does not lift
 it, and neither does restarting the monitor: the budget lives in
@@ -518,7 +526,8 @@ agenttalk request-restart --for codex-dev --clear-restart-budget --reason "fixed
 A plain `request-restart` always re-arms the budget, and that relaunch is
 not charged to it. `--clear-restart-budget` kills and launches nothing; a
 seat that is still dead relaunches on a later poll under the fresh budget.
-Set `restart_budget` globally or per agent in `supervisor.json`.
+It also never lifts a lead-loop stand-down. Set `restart_budget` globally
+or per agent in `supervisor.json`.
 
 ---
 

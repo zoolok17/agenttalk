@@ -9185,17 +9185,26 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     healthy_since = st.get("healthy_since")
     last_warn = float(st.get("last_warn_epoch", 0.0) or 0.0)
     # Restart budget: every entry counts, even a malformed one, and any
-    # non-null hold is held, so a damaged state file fails closed.
+    # non-null hold is held, so a damaged state file fails closed. An absent
+    # list is a fresh budget; a present non-list is treated as spent.
+    def _epoch(v: object) -> float | None:
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
     raw_budget = st.get("restart_budget_relaunches")
+    budget_malformed = "restart_budget_relaunches" in st and not isinstance(raw_budget, list)
     budget_relaunches = list(raw_budget) if isinstance(raw_budget, list) else []
     raw_hold = st.get("restart_budget_hold")
     budget_hold = None if raw_hold is None else (raw_hold if isinstance(raw_hold, dict) else {})
-    raw_notify = st.get("restart_budget_last_notify_epoch")
-    budget_last_notify = (
-        float(raw_notify)
-        if isinstance(raw_notify, (int, float)) and not isinstance(raw_notify, bool)
-        else 0.0
+    budget_last_notify = _epoch(st.get("restart_budget_last_notify_epoch")) or 0.0
+    # The refill needs its own health interval: any poll that is not a green
+    # observation drops it, and so does a gap between polls longer than
+    # budget_max_gap (the seat was not observed).
+    raw_health = st.get("restart_budget_health")
+    budget_health = (
+        (_epoch(raw_health.get("since")), _epoch(raw_health.get("seen")))
+        if isinstance(raw_health, dict) else (None, None)
     )
+    budget_max_gap = max(300.0, 3 * (_epoch(config.get("poll_seconds")) or float(_DEFAULTS["poll_seconds"])))
 
     brain_pid = liveness.get("brain_pid")
     brain_start = liveness.get("brain_start")
@@ -9372,9 +9381,12 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     ):
         nxt["wrapper_recognition"] = copy.deepcopy(wrapper_recognition)
     # The restart budget is persisted here so a supervisor restart cannot
-    # reset a crash loop. Written only once a seat has used it.
+    # reset a crash loop. Written only once a seat has used it. A malformed
+    # value is kept as it is until an audited clear replaces it.
+    # restart_budget_health is not carried: only a green poll writes it, so
+    # any other decision drops the interval.
     if "restart_budget_relaunches" in st:
-        nxt["restart_budget_relaunches"] = copy.deepcopy(budget_relaunches)
+        nxt["restart_budget_relaunches"] = copy.deepcopy(raw_budget)
     if budget_hold is not None:
         nxt["restart_budget_hold"] = copy.deepcopy(budget_hold)
     for key in ("restart_budget_last_notify_epoch", "restart_budget_cleared"):
@@ -9433,6 +9445,10 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                 barrier_state=None):
         if wrapped and cli_child_verdict_is_gone(state):
             nxt["healthy_since"] = None
+        if isinstance(nxt.get("restart_budget_hold"), dict) and state != "RESTART_BUDGET_EXHAUSTED":
+            # A hold stays visible behind every other decision.
+            reason = (f"{reason}; restart budget hold stays until an audited "
+                      "request-restart or --clear-restart-budget")
         res = {"agent": name, "action": action, "state": state,
                "clear_marker": clear_marker, "kill_first": bool(kill_first),
                "kill_orphans": bool(kill_orphans), "kill_targets": kill_targets or [],
@@ -9463,6 +9479,17 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
             )
             if isinstance(barrier_state, dict):
                 res["barrier_state"] = barrier_state
+        elif _budget_escalation_due():
+            # The executor installs ack_state only after a confirmed send, so a
+            # failed or unconfigured notify keeps the intent in next_state and a
+            # later poll retries it.
+            nxt["restart_budget_last_notify_epoch"] = now_epoch
+            ack = copy.deepcopy(nxt)
+            ack["restart_budget_hold"]["notified_epoch"] = now_epoch
+            res["restart_budget_escalation"] = {
+                "message": _budget_hold_text(nxt["restart_budget_hold"]),
+                "ack_state": ack,
+            }
         return res
 
     def _healthy(state: str, reason: str) -> dict:
@@ -9477,45 +9504,50 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
             nxt["healthy_since"] = now_epoch
         elif fails and (now_epoch - float(healthy_since)) >= reset_after:
             nxt["consecutive_fails"], nxt["backoff_next_epoch"] = 0, 0.0
-        if budget_hold is not None:
-            # Health never lifts a hold, however long it lasts.
-            reason = (f"{reason}; restart budget hold stays until an audited "
-                      "request-restart or --clear-restart-budget")
-        elif (budget_relaunches and healthy_since is not None
-              and (now_epoch - float(healthy_since)) >= budget_window):
-            nxt["restart_budget_relaunches"] = []
+        # Health never lifts a hold, however long it lasts; it only refills a
+        # spent-but-unheld budget after window_seconds of observed health.
+        if budget_hold is None and budget_relaunches:
+            since, seen = budget_health
+            if (since is None or seen is None or seen < since or seen > now_epoch
+                    or now_epoch - seen > budget_max_gap):
+                since = now_epoch
+            if now_epoch - since >= budget_window:
+                nxt["restart_budget_relaunches"] = []
+            else:
+                nxt["restart_budget_health"] = {"since": since, "seen": now_epoch}
         return _result(NONE, state=state, reason=reason)
 
-    def _budget_hold_result() -> dict:
-        hold = nxt["restart_budget_hold"]
-
-        def _num(key: str, default: float) -> float:
-            v = hold.get(key)
-            return v if isinstance(v, (int, float)) and not isinstance(v, bool) else default
-
-        count = _num("count", len(budget_relaunches))
-        window = _num("window_seconds", budget_window)
-        reason = (
-            f"restart budget exhausted for {name}: {count:.0f} supervisor relaunch(es) "
-            f"without {window:.0f}s of continuous health (budget "
-            f"{_num('max_relaunches', budget_max):.0f} per {window:.0f}s window); "
+    def _budget_hold_text(hold: dict) -> str:
+        count = _epoch(hold.get("count"))
+        window = _epoch(hold.get("window_seconds")) or budget_window
+        limit = _epoch(hold.get("max_relaunches")) or budget_max
+        spent = (f"{count:.0f} supervisor relaunch(es)" if count is not None
+                 else "an unreadable relaunch record")
+        return (
+            f"restart budget exhausted for {name}: {spent} without {window:.0f}s "
+            f"of continuous health (budget {limit:.0f} per {window:.0f}s window); "
             "STOPPED relaunching until an audited "
             f"`agenttalk request-restart --for {name}` (relaunch now) or "
             f"`agenttalk request-restart --for {name} --clear-restart-budget` "
             "(re-arm only)"
         )
-        # ONE escalation per hold, delayed (never dropped) by the rate limit.
-        if hold.get("notified_epoch") is None and now_epoch - budget_last_notify >= suspect_interval:
-            hold["notified_epoch"] = now_epoch
-            nxt["restart_budget_last_notify_epoch"] = now_epoch
-            return _result(RESTART_BUDGET_EXHAUSTED, state="RESTART_BUDGET_EXHAUSTED",
-                           notify=True, reason=reason)
-        return _result(NONE, state="RESTART_BUDGET_EXHAUSTED", reason=reason)
+
+    def _budget_escalation_due() -> bool:
+        # ONE escalation per hold, delayed (never dropped) by the rate limit,
+        # whatever decision this poll makes.
+        hold = nxt.get("restart_budget_hold")
+        return (isinstance(hold, dict) and hold.get("notified_epoch") is None
+                and now_epoch - budget_last_notify >= suspect_interval)
+
+    def _budget_hold_result() -> dict:
+        action = RESTART_BUDGET_EXHAUSTED if _budget_escalation_due() else NONE
+        return _result(action, state="RESTART_BUDGET_EXHAUSTED",
+                       reason=_budget_hold_text(nxt["restart_budget_hold"]))
 
     def _clear_restart_budget(req: dict, rid: str, *, via: str, always: bool) -> None:
         # The only way a hold clears: an audited restart-request marker.
         held = nxt.pop("restart_budget_hold", None)
-        if held is None and not budget_relaunches and not always:
+        if held is None and not budget_relaunches and not budget_malformed and not always:
             return
         nxt["restart_budget_relaunches"] = []
         nxt["restart_budget_cleared"] = {
@@ -9526,8 +9558,38 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
             "reason": req.get("reason") if isinstance(req.get("reason"), str) else "",
             "at_epoch": now_epoch,
             "was_held": held is not None,
-            "relaunches": len(budget_relaunches),
+            "relaunches": None if budget_malformed else len(budget_relaunches),
         }
+
+    def _marker_authorized(m: dict) -> bool:
+        return (
+            m.get("authority_result") == "authorized"
+            and isinstance(m.get("requested_by"), str)
+            and isinstance(m.get("authorized_by"), str)
+            and m.get("authorized_by") == m.get("requested_by")
+            and m.get("authority_still_valid", True) is True
+        )
+
+    # Operator budget clear: authenticated like any restart-request, but it
+    # kills nothing and launches nothing, so the teardown and launch guards
+    # below do not gate it. A still-dead seat relaunches on a later poll
+    # under a fresh budget. Once consumed it is handled like a consumed
+    # restart marker in section 0, so a marker that failed to clear never
+    # blocks recovery.
+    if (
+        isinstance(marker, dict)
+        and isinstance(marker.get("request_id"), str)
+        and marker.get("mode") == RESTART_BUDGET_CLEAR_MODE
+        and marker["request_id"] not in consumed
+        and _marker_authorized(marker)
+    ):
+        rid = marker["request_id"]
+        nxt["consumed_rids"] = [*consumed, rid]
+        _clear_restart_budget(marker, rid, via=RESTART_BUDGET_CLEAR_MODE, always=True)
+        return _result(CLEAR_MARKER, state="RESTART_BUDGET_CLEARED", clear_marker=rid,
+                       reason=f"restart budget cleared by {rid} "
+                              f"(requested_by={marker.get('requested_by')}); no relaunch "
+                              "from this request")
 
     if (
         wrapped
@@ -9625,30 +9687,13 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     # 0) Manual restart-request marker (highest priority).
     if isinstance(marker, dict) and isinstance(marker.get("request_id"), str):
         rid = marker["request_id"]
-        auth_ok = (
-            marker.get("authority_result") == "authorized"
-            and isinstance(marker.get("requested_by"), str)
-            and isinstance(marker.get("authorized_by"), str)
-            and marker.get("authorized_by") == marker.get("requested_by")
-            and marker.get("authority_still_valid", True) is True
-        )
-        if not auth_ok:
+        if not _marker_authorized(marker):
             nxt["last_warn_epoch"] = now_epoch
             return _result(REFUSE_PROTECTED, state="RESTART_UNAUTHORIZED",
                            notify=True,
                            reason="restart-request has no valid authorization marker")
+        # a budget clear reaching here is already consumed (applied above)
         budget_clear = marker.get("mode") == RESTART_BUDGET_CLEAR_MODE
-        if budget_clear and rid not in consumed:
-            # Operator clear: re-arm the budget, kill nothing, launch nothing.
-            # A still-dead seat relaunches on a later poll under a fresh budget.
-            # Once consumed it is handled like a consumed restart marker below,
-            # so a marker that failed to clear never blocks recovery.
-            nxt["consumed_rids"] = [*consumed, rid]
-            _clear_restart_budget(marker, rid, via=RESTART_BUDGET_CLEAR_MODE, always=True)
-            return _result(CLEAR_MARKER, state="RESTART_BUDGET_CLEARED", clear_marker=rid,
-                           reason=f"restart budget cleared by {rid} "
-                                  f"(requested_by={marker.get('requested_by')}); no relaunch "
-                                  "from this request")
         force_authorized = (
             marker.get("force_protected_authorized") is True
             and isinstance(marker.get("force_protected_authorized_by"), str)
@@ -10136,12 +10181,12 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
             # RESTART BUDGET: an additional bound on top of backoff and the
             # readiness cap. It catches the seat that reaches readiness and
             # then crashes again, which neither of those ever stops.
-            if len(budget_relaunches) >= budget_max:
-                numeric = [x for x in budget_relaunches
-                           if isinstance(x, (int, float)) and not isinstance(x, bool)]
+            if budget_malformed or len(budget_relaunches) >= budget_max:
+                numeric = [x for x in budget_relaunches if _epoch(x) is not None]
                 nxt["restart_budget_hold"] = {
                     "since_epoch": now_epoch,
-                    "count": len(budget_relaunches),
+                    "count": None if budget_malformed else len(budget_relaunches),
+                    "malformed": budget_malformed,
                     "max_relaunches": budget_max,
                     "window_seconds": budget_window,
                     "first_relaunch_epoch": min(numeric) if numeric else None,
@@ -12331,7 +12376,7 @@ CONFIG_TEMPLATE = """\
   "claude_permission_mode": "bypassPermissions",
   "backoff": { "base_seconds": 30, "cap_seconds": 900, "reset_after_seconds": 180 },
   "restart_budget": { "max_relaunches": 4, "window_seconds": 3600 },
-  "_comment_restart_budget": "At most max_relaunches automatic relaunches of a seat until it has been continuously healthy for window_seconds (which refills the budget). The next relaunch is refused: the seat is held in RESTART_BUDGET_EXHAUSTED and notify_to gets ONE escalation. Neither health nor time lifts the hold; only `agenttalk request-restart --for <seat>` (relaunch now) or `agenttalk request-restart --for <seat> --clear-restart-budget` (re-arm only), by the operator-facing liaison or sole lead. A per-agent restart_budget overrides these; out-of-range values (max_relaunches 1-100, window_seconds 60-604800) fall back. The budget is persisted in supervisor-state.json, so restarting the supervisor does not reset it.",
+  "_comment_restart_budget": "At most max_relaunches automatic relaunch attempts of a seat (a manual request-restart is not counted) until every poll for window_seconds has been green, with no gap over 5 minutes (which refills the budget). The next relaunch is refused: the seat is held in RESTART_BUDGET_EXHAUSTED and notify_to gets ONE escalation, retried until a send succeeds. Neither health nor time lifts the hold; only `agenttalk request-restart --for <seat>` (relaunch now) or `agenttalk request-restart --for <seat> --clear-restart-budget` (re-arm only), by the operator-facing liaison or sole lead. A per-agent restart_budget overrides these; out-of-range values (max_relaunches 1-100, window_seconds 60-604800) fall back. The budget is persisted in supervisor-state.json, so restarting the supervisor does not reset it.",
   "notify_sender": null,
   "notify_to": null,
   "ephemeral_reviewers": {
@@ -13399,6 +13444,33 @@ function Wait-ForNextPoll($config) {
   if (-not $Once) { Start-Sleep -Seconds ([int]$config.poll_seconds) }
 }
 # endregion checked-mutations
+# region restart-budget-actions  (extracted verbatim by the test harness - keep self-contained)
+function Complete-ClearMarker($state, [string]$name, $p) {
+  # Durable first: the consumed request id, a cleared budget and its audit
+  # are saved before the marker is deleted, so a crash in between leaves a
+  # consumed marker to acknowledge again, never a lost request.
+  Set-AgentState $state $name $p.next_state
+  if (-not $p.clear_marker) { return }
+  if (-not (Save-StateForPoll $state)) { return }
+  if (Assert-ActionsEnabled ("clear-restart {0}" -f $name)) {
+    & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null
+  }
+}
+function Send-RestartBudgetEscalation($state, [string]$name, $escalation, $config) {
+  # The hold is marked notified only once the send confirms delivery;
+  # otherwise next_state keeps the intent and a later poll retries it.
+  $delivered = $false
+  if ($config.notify_sender -and $config.notify_to -and (Assert-ActionsEnabled ("notify {0}" -f $name))) {
+    & $AgenttalkCmd --root $Root send --from $config.notify_sender --to $config.notify_to --kind note -m ("supervisor: {0}: {1}" -f $name, $escalation.message) --quiet | Out-Null
+    $delivered = ($LASTEXITCODE -eq 0)
+  }
+  if ($delivered) {
+    Set-AgentState $state $name $escalation.ack_state
+  } else {
+    Write-Warning ("supervisor: {0}: restart budget escalation not delivered; a later poll retries it" -f $name)
+  }
+}
+# endregion restart-budget-actions
 # region wrapper-log-helpers
 function Test-RunningOnWindows {
   # Ambient markers such as `$env:OS` are optional and are deliberately absent
@@ -15115,7 +15187,7 @@ $pollNum = 0
           }
         }
       }
-      'clear_marker' { if ($p.clear_marker -and (Assert-ActionsEnabled ("clear-restart {0}" -f $name))) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }; Set-AgentState $state $name $p.next_state }
+      'clear_marker' { Complete-ClearMarker $state $name $p }
       'refuse_protected' { Write-Warning ("supervisor: {0}: {1}" -f $name, $p.reason); if ($p.clear_marker -and (Assert-ActionsEnabled ("clear-restart {0}" -f $name))) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }; Set-AgentState $state $name $p.next_state }
       { $_ -in 'warn_only','suspect_warn','snapshot_unavailable','readiness_gave_up','restart_budget_exhausted' } {
         Write-Warning ("supervisor: {0}: {1}" -f $name, $p.reason)
@@ -15126,6 +15198,9 @@ $pollNum = 0
       }
       default { Set-AgentState $state $name $p.next_state }
     }
+    # A pending restart-budget escalation rides on whatever decision this
+    # poll made, so an ownership or liveness hold never masks it.
+    if ($p.restart_budget_escalation) { Send-RestartBudgetEscalation $state $name $p.restart_budget_escalation $cfg }
   }
   foreach ($rid in $plan.launch_requests.PSObject.Properties.Name) {
     $p = $plan.launch_requests.$rid
