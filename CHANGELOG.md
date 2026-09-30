@@ -27,19 +27,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   earlier synthetic-load testing. Measured on a real-store copy: private
   bytes grew roughly 600 MB/min with handle and thread counts climbing in
   lockstep and never plateauing - consistent with the reported incident
-  (~1.9 GB private / ~1.9 GB working set growth over about 70 minutes with a
+  (~19 GB private / ~1.9 GB working set growth over about 70 minutes with a
   single browser tab open).
-  - Both scans are now coalesced per store root via a small
-    single-flight helper (`web._SingleFlight`): concurrent callers for the
-    SAME store share one in-flight computation instead of each starting
-    their own. The data returned is unchanged (still computed fresh, at
-    real request time) - only the redundant concurrent work is removed.
-  - Added a regression test
-    (`test_concurrent_attention_requests_coalesce_the_uncached_scan`) that
-    fires many genuinely concurrent `/api/attention` requests against an
-    in-process server and asserts the scan is coalesced, thread count
-    returns to baseline, and retained allocations stay under a fixed
-    ceiling.
+  - The raw, context-independent disk scan (`store._scan_messages_with_paths`)
+    is now coalesced per store root via a small single-flight helper
+    (`web._SingleFlight`): concurrent callers for the SAME store share one
+    in-flight scan instead of each starting their own. Validation (roster +
+    signing) is deliberately NEVER coalesced - it always runs fresh, per
+    caller, with that caller's own current config/roster/signing context
+    (`envelope_snapshot.validate_scanned_rows`) - a review of the first cut
+    (which coalesced the whole validated computation) found that a request
+    starting after signing enforcement or a roster/config change could join
+    an older in-flight computation and render a message its current policy
+    would reject. Splitting scan from validation removes that risk
+    entirely: sharing the scan is always safe (it never depends on
+    security-relevant context), so nothing about validation freshness has
+    to depend on a coalescing key correctly enumerating every
+    context-relevant input.
+  - Added regression tests: `test_concurrent_calls_with_matching_context_still_coalesce_the_scan`
+    (many genuinely concurrent calls sharing a matching context still
+    coalesce onto one scan; thread count returns to baseline; retained
+    allocations stay under a fixed ceiling) and, event-synchronized (no
+    sleep-and-hope races), `test_signing_enforcement_change_mid_flight_is_never_shared`
+    / `test_roster_change_mid_flight_is_never_shared` (each parametrized
+    over both entry points) proving a follower that joins an in-flight scan
+    always validates with its own current context, never a leader's stale
+    one.
 
 ### Added
 

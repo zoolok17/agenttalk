@@ -873,7 +873,24 @@ class _SingleFlight:
         return holder["result"]
 
 
-_all_messages_singleflight = _SingleFlight()
+_message_scan_singleflight = _SingleFlight()
+
+
+def _scan_messages_with_paths_coalesced(store: Store):
+    """Coalesce the raw, CONTEXT-INDEPENDENT disk walk per store root (#246 F1
+    correctness fix, on top of the #239 fix). ``store._scan_messages_with_paths``
+    only reads and parses envelope files off disk - it never consults config,
+    roster, or signing trust - so sharing it across concurrent callers is
+    always safe and never stale. VALIDATION is the opposite (see
+    ``envelope_snapshot.validate_scanned_rows``'s docstring): it is NEVER
+    coalesced here, so a caller whose config/roster/signing context changed
+    since an in-flight scan started always validates fresh, with its own
+    current context, rather than inheriting an older in-flight leader's
+    verdicts (the F1 bug: coalescing the WHOLE validated computation let a
+    follower that joined after signing enforcement turned on receive a
+    message its own current policy would reject).
+    """
+    return _message_scan_singleflight.do(str(store.root), store._scan_messages_with_paths)
 
 
 def _all_messages(store: Store, *, cfg: dict | None = None) -> list[Message]:
@@ -886,54 +903,29 @@ def _all_messages(store: Store, *, cfg: dict | None = None) -> list[Message]:
     through ``store.list_invalid_messages()`` and is surfaced in
     ``/api/status.invalid_messages`` instead of being rendered.
 
-    The scan itself is coalesced per store root via ``_all_messages_singleflight``
-    (#239) - see ``_SingleFlight``'s docstring for why.
+    The raw disk scan is coalesced per store root (see
+    ``_scan_messages_with_paths_coalesced``) but validation always runs
+    fresh, with THIS call's own current config/roster/signing context - see
+    that function's docstring for why the two must never be coalesced
+    together.
     """
     if cfg is None:
         cfg, config_error = _projection_config(store)
         if config_error is not None or cfg is None:
             return []
-    return _all_messages_singleflight.do(str(store.root), lambda: _all_messages_scan(store, cfg))
-
-
-def _all_messages_scan(store: Store, cfg: dict) -> list[Message]:
-    """The actual (expensive, O(store size)) scan body of ``_all_messages``."""
     # 0.18.0 (FR-004): validate against the KNOWN roster (active ∪ retired),
     # matching valid_messages / _validated_for_state — otherwise a retired
     # identity's historical messages vanish from /api/messages, /messages/<id>,
     # and the index while the thread panel still shows them. The two surfaces
     # must agree.
-    roster = store._known_roster(cfg)  # noqa: SLF001 — D3 parity
-    valid, _ = store._scan_messages()  # noqa: SLF001 — same call doctor uses
-    if not roster:
+    rows, invalid = _scan_messages_with_paths_coalesced(store)
+    try:
+        valid_rows, _rejects = _snapshots.validate_scanned_rows(store, cfg, rows, len(invalid))
+    except ValueError:
+        # Empty/unresolvable roster - _all_messages has always degraded to
+        # an empty list here (never raised); preserve that contract.
         return []
-    require_sig = store.signing_enforced()
-    key: bytes | None = None
-    project_id: str | None = None
-    if require_sig:
-        project_id = store.project_id()
-        try:
-            key = _signing.load_key(project_id)
-        except (FileNotFoundError, OSError, ValueError):
-            # Enforcement is on but the key file is unreadable. The
-            # CLI's recv/tail path skips all messages in this state;
-            # do the same here.
-            return []
-    out: list[Message] = []
-    for m in valid:
-        try:
-            m.validate(roster)
-        except ValueError:
-            continue  # unknown kind / out-of-roster — surface in invalid_messages
-        if require_sig:
-            try:
-                _signing.verify_message(
-                    m.to_dict(), key, expected_key_id=project_id,
-                )
-            except ValueError:
-                continue
-        out.append(m)
-    return sorted(out, key=lambda x: x.id, reverse=True)
+    return [message for message, _path in valid_rows][::-1]  # newest first
 
 
 def messages_payload(store: Store) -> dict:
@@ -1002,22 +994,21 @@ def _closed_rids_for(store: Store, agent: str) -> set[str]:
     }
 
 
-_validated_for_state_singleflight = _SingleFlight()
-
-
 def _validated_for_state(store: Store, cfg: dict) -> tuple[list[Message], int]:
     """Synchronous composition callers share the worker's canonical validator.
 
-    Coalesced per store root via ``_validated_for_state_singleflight`` (#239) -
+    The raw disk scan is coalesced per store root (see
+    ``_scan_messages_with_paths_coalesced``), same as ``_all_messages`` -
     this is the OTHER uncached O(store size) scan real browser traffic (GET
-    /api/attention, /api/lead-chat) can fire faster than one call completes;
-    see ``_SingleFlight``'s docstring for why that unbounded overlap is the
-    growth mechanism.
+    /api/attention, /api/lead-chat) can fire faster than one call completes.
+    Validation always runs fresh with THIS call's own current config/roster/
+    signing context (#246 F1) - never shared, so a request that starts after
+    a signing/config/roster change can never inherit an older in-flight
+    computation's stale verdicts.
     """
-    def _do() -> tuple[list[Message], int]:
-        rows, invalid = _snapshots.validated_active(store, cfg)
-        return [message for message, _ in rows], invalid
-    return _validated_for_state_singleflight.do(str(store.root), _do)
+    rows, invalid = _scan_messages_with_paths_coalesced(store)
+    valid_rows, rejects = _snapshots.validate_scanned_rows(store, cfg, rows, len(invalid))
+    return [message for message, _path in valid_rows], rejects
 
 
 def _epoch_from(msgs: list[Message]) -> str | None:
