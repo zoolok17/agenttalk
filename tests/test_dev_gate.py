@@ -585,6 +585,62 @@ def test_run_pytest_mode_adds_posix_parallel_args_only_when_the_env_var_is_set(
     assert argv[argv.index("--dist") + 1] == "loadgroup"
 
 
+def test_xdist_grouping_is_active_under_the_gates_real_pytest_invocation() -> None:
+    """#250 fix round 1 (codex cold read dev-5, reproduced directly): the
+    dev gate disables plugin autoload and loads xdist explicitly via
+    `-p xdist.plugin` - that registers under the name "xdist.plugin", not
+    the autoload entry-point name "xdist" that tests/conftest.py's old
+    `config.pluginmanager.hasplugin("xdist")` check alone caught. Under the
+    gate's real invocation shape, registration was {xdist: False,
+    xdist.plugin: True} - no xdist_group markers were ever added, so both
+    the shared-resource groups and the per-file default grouping were
+    INACTIVE (the same class of silent inertness the #232 probe's round 6
+    found for the marker/nodeid hook-ordering bug).
+
+    This runs a REAL pytest subprocess with the gate's actual invocation
+    shape (PYTEST_DISABLE_PLUGIN_AUTOLOAD=1, an explicit
+    `-p xdist.plugin -n 2 --dist loadgroup`) against two tests from the
+    SAME file and confirms grouping is genuinely active: both must land on
+    the SAME worker, with the per-file group suffix visible in their
+    reported node ids. Must fail on 7a9b1bc (pre-fix): registration under
+    that exact shape never matched "xdist", so this file's tests would
+    schedule individually, with no @-suffix, and were free to land on
+    either worker."""
+    env = {**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "PYTHONPATH": str(Path.cwd() / "src")}
+    node_ids = (
+        "tests/test_dev_gate.py::test_manifest_declares_real_ci_matrix_separately_from_local_interpreters",
+        "tests/test_dev_gate.py::test_committed_pytest_timeout_has_wheel_leg_headroom",
+    )
+    completed = subprocess.run(
+        [
+            sys.executable, "-m", "pytest",
+            "-p", "xdist.plugin", "-n", "2", "--dist", "loadgroup", "-v",
+            *node_ids,
+        ],
+        cwd=Path.cwd(),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+    report_lines = [
+        line for line in completed.stdout.splitlines()
+        if line.startswith("[gw") and any(node_id.rsplit("::", 1)[1] in line for node_id in node_ids)
+    ]
+    assert len(report_lines) == len(node_ids), completed.stdout
+
+    workers = set()
+    for line in report_lines:
+        worker = line.split("]", 1)[0].removeprefix("[")
+        workers.add(worker)
+        assert "@" in line and "test_dev_gate.py" in line.split("@", 1)[1], (
+            f"missing the per-file xdist_group suffix in the reported test id: {line!r}"
+        )
+    assert len(workers) == 1, f"the two tests landed on DIFFERENT workers: {report_lines}"
+
+
 def test_logical_plan_digest_is_runtime_path_independent_and_semantic() -> None:
     manifest = dev_gate.validate_manifest(_manifest())
     original = dev_gate.logical_plan_digest(manifest, "release")

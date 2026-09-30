@@ -576,6 +576,22 @@ def _xdist_group_for(item: pytest.Item) -> str | None:
     return None
 
 
+def _xdist_is_active(config: pytest.Config) -> bool:
+    """#250 fix round 1 (codex cold read dev-5, reproduced directly): the
+    dev gate disables plugin autoload and loads xdist explicitly via
+    `-p xdist.plugin` - that registers the plugin under the name
+    "xdist.plugin", NOT the autoload entry-point name "xdist" that a bare
+    `config.pluginmanager.hasplugin("xdist")` check alone would catch.
+    Registration under the gate's real invocation was observed as
+    {xdist: False, xdist.plugin: True} - no xdist_group markers were ever
+    added under it, the same class of silent inertness the #232 probe's
+    round 6 found for the marker/nodeid hook-ordering bug. Check the actual
+    CAPABILITY xdist adds (the -n/--dist CLI options, confirmed present
+    only when xdist is loaded by either name) instead of any one specific
+    plugin name, so a third future loading mechanism is covered too."""
+    return hasattr(config.option, "numprocesses")
+
+
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items) -> None:
     """#50: process-orchestration tests marked source_layout cannot pass under
@@ -617,7 +633,7 @@ def pytest_collection_modifyitems(config, items) -> None:
             if "source_layout" in item.keywords:
                 item.add_marker(skip)
 
-    if config.pluginmanager.hasplugin("xdist"):
+    if _xdist_is_active(config):
         for item in items:
             group = _xdist_group_for(item) or item.location[0]
             item.add_marker(pytest.mark.xdist_group(name=group))
