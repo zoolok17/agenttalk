@@ -28,7 +28,70 @@ pytestmark = [
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SOURCE_ROOT = (_REPO_ROOT / "src").resolve()
 
-_REBIND_CHILD = r"""
+# PROBE (#232 round 5): instrument, don't guess. Round 4's fix (a bounded
+# wait for a genuinely free port) may or may not be the whole story; CI
+# never showed WHY reconfigure_endpoint/rebind_runtime refused, because
+# _both_sockets_free() swallows the specific GatewayConfigError (host, port,
+# underlying OSError errno) before raising its own generic "gateway is
+# running" message. This diagnostic-only helper re-probes each port
+# independently on failure (capturing errno/winerror), and reports every
+# path a stale-state hypothesis would implicate (the runtime marker, the
+# kill switch, the scheduled-task name, LOCALAPPDATA) - all derived from
+# `root`, this test's own tmp_path, so a machine-wide leak would show up
+# here as a surprising, unexpected value. Never changes what is raised or
+# whether the test passes - only what ends up in the result JSON.
+_DIAGNOSTICS_HELPER = r"""
+def _gather_diagnostics(root):
+    import os as _os
+    diagnostics = {}
+    diagnostics["root"] = str(root)
+    diagnostics["localappdata_env"] = _os.environ.get("LOCALAPPDATA")
+    for label, host, port in (
+        ("public", service.PUBLIC_HOST, service.PUBLIC_PORT),
+        ("internal", service.INTERNAL_HOST, service.INTERNAL_PORT),
+    ):
+        diagnostics[f"{label}_port"] = f"{host}:{port}"
+        try:
+            service.exclusive_bind_probe(host, port)
+            diagnostics[f"{label}_port_free_at_diagnostic_time"] = True
+        except service.GatewayConfigError as probe_exc:
+            cause = probe_exc.__cause__
+            diagnostics[f"{label}_port_free_at_diagnostic_time"] = False
+            diagnostics[f"{label}_port_errno"] = getattr(cause, "errno", None)
+            diagnostics[f"{label}_port_winerror"] = getattr(cause, "winerror", None)
+            diagnostics[f"{label}_port_strerror"] = getattr(cause, "strerror", None)
+    marker_path = service.runtime_marker_path(root)
+    diagnostics["runtime_marker_path"] = str(marker_path)
+    diagnostics["runtime_marker_exists"] = marker_path.exists()
+    if diagnostics["runtime_marker_exists"]:
+        try:
+            diagnostics["runtime_marker_content"] = marker_path.read_text(encoding="utf-8")
+        except OSError as read_exc:
+            diagnostics["runtime_marker_read_error"] = str(read_exc)
+    kill_path = service.kill_switch_path(root)
+    diagnostics["kill_switch_path"] = str(kill_path)
+    diagnostics["kill_switch_exists"] = kill_path.exists()
+    diagnostics["task_name"] = service.project_task_name(root)
+    diagnostics["gateway_state_dir"] = str(service.gateway_state_dir(root))
+    return diagnostics
+
+
+def _failure_payload(exc, root):
+    import traceback
+    try:
+        diagnostics = _gather_diagnostics(root)
+    except BaseException as diag_exc:  # noqa: BLE001 - never let diagnostics mask the real failure
+        diagnostics = {"diagnostics_error": f"{type(diag_exc).__name__}: {diag_exc}"}
+    return {
+        "ok": False,
+        "type": type(exc).__name__,
+        "message": str(exc),
+        "traceback": traceback.format_exc(),
+        "diagnostics": diagnostics,
+    }
+"""
+
+_REBIND_CHILD = _DIAGNOSTICS_HELPER + r"""
 import json
 import os
 from pathlib import Path
@@ -46,11 +109,11 @@ try:
     value = service.rebind_runtime(root, litellm_executable=candidate)
     payload = {"ok": True, "value": value}
 except BaseException as exc:
-    payload = {"ok": False, "type": type(exc).__name__, "message": str(exc)}
+    payload = _failure_payload(exc, root)
 result_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
 """
 
-_RECONFIGURE_CHILD = r"""
+_RECONFIGURE_CHILD = _DIAGNOSTICS_HELPER + r"""
 import contextlib
 import json
 import os
@@ -80,7 +143,7 @@ try:
     value = service.reconfigure_endpoint(root)
     payload = {"ok": True, "value": value}
 except BaseException as exc:
-    payload = {"ok": False, "type": type(exc).__name__, "message": str(exc)}
+    payload = _failure_payload(exc, root)
 result_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
 """
 
@@ -488,8 +551,10 @@ def test_real_process_rebind_serializes_reconfigure_without_stale_manifest_write
         _wait_process(rebind)
         _wait_process(reconfigure)
 
-        assert _read_result(rebind_result)["ok"] is True
-        assert _read_result(reconfigure_result)["ok"] is True
+        rebind_res = _read_result(rebind_result)
+        reconfigure_res = _read_result(reconfigure_result)
+        assert rebind_res["ok"] is True, rebind_res
+        assert reconfigure_res["ok"] is True, reconfigure_res
         final_manifest = service.load_install_manifest(root)
         expected_config = service.render_litellm_config(
             api_base=service.DEFAULT_API_BASE
@@ -582,9 +647,9 @@ def test_real_process_service_startup_excludes_rebind_until_sockets_are_owned(
         _wait_process(rebind)
 
         refusal = _read_result(rebind_result)
-        assert refusal["ok"] is False
-        assert refusal["type"] == "GatewayConfigError"
-        assert "while the gateway is running" in refusal["message"]
+        assert refusal["ok"] is False, refusal
+        assert refusal["type"] == "GatewayConfigError", refusal
+        assert "while the gateway is running" in refusal["message"], refusal
         assert service.load_install_manifest(root)["litellm_executable"] == str(
             old_runtime.resolve()
         )
@@ -592,7 +657,8 @@ def test_real_process_service_startup_excludes_rebind_until_sockets_are_owned(
         stop_serving.write_text("stop\n", encoding="ascii")
         _wait_for_path(run_result, (runner,))
         _wait_process(runner)
-        assert _read_result(run_result) == {"ok": True, "value": 0}
+        run_res = _read_result(run_result)
+        assert run_res == {"ok": True, "value": 0}, run_res
         assert not service.runtime_marker_path(root).exists()
         _assert_ports_free()
     finally:
