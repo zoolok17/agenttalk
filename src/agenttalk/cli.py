@@ -11660,11 +11660,13 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
         proof_ok = False
         if probe_nonce == supervisor_launch_nonce:
             try:
+                probe_deadline = float(os.environ.get(codex_preflight.PROBE_DEADLINE_ENV, ""))
                 proof_ok = wrapper_run.run_codex_startup_probe(
                     store, agent, base_argv, probe_nonce, session_state=state,
                     persist=lambda st: wsession.save_session(store, agent, st))
                 if proof_ok:
-                    codex_preflight.complete_probe(store, agent, probe_nonce)
+                    codex_preflight.complete_probe(store, agent, probe_nonce,
+                                                   deadline_epoch=probe_deadline)
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 proof_ok = False
                 sys.stderr.write(f"CODEX_FIRST_BUS_WRITE_MISSING: {exc}\n")

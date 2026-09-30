@@ -161,6 +161,11 @@ an unrestricted host process; an ordinary wrapper heartbeat cannot satisfy it.
 
 After the probe exits successfully, the wrapper acknowledges completion on the
 existing restricted receipt; it cannot create a receipt on the child's behalf.
+The wrapper receives the same admission deadline reserved before spawn; recording
+the launch does not extend it. A late completion cannot admit inbox work.
+Unsuccessful probes clean up discoverable descendants even if the launcher has
+already exited while a tool retains its output pipe.
+
 The supervisor polls for the completed receipt for at most 120 seconds from
 the reserved launch, without waiting on the seat. A missing or incomplete receipt becomes
 `CODEX_FIRST_BUS_WRITE_MISSING`, independently of `config_blocked`. Both HOLDs

@@ -11365,11 +11365,14 @@ def record_launch(state: dict, agent: str, *, cli: str, pid: int | None,
         entry["session_id"] = None        # never persist a fake id for codex
         if bool(lcfg.get("wrapped", False)):
             from .codex_preflight import PROOF_TIMEOUT
-            entry["codex_launch_check"] = (
-                {"status": "pending", "nonce": launcher_nonce, "deadline_epoch": now + PROOF_TIMEOUT}
-                if launcher_nonce_injected and _valid_launch_nonce(launcher_nonce)
-                else {"status": "failed", "failure": "CODEX_FIRST_BUS_WRITE_MISSING"}
-            )
+            reserved = entry.get("codex_launch_check")
+            if not (launcher_nonce_injected and _valid_launch_nonce(launcher_nonce)):
+                entry["codex_launch_check"] = {"status": "failed", "failure": "CODEX_FIRST_BUS_WRITE_MISSING"}
+            elif not (isinstance(reserved, dict) and reserved.get("nonce") == launcher_nonce):
+                entry["codex_launch_check"] = {
+                    "status": "pending", "nonce": launcher_nonce, "deadline_epoch": now + PROOF_TIMEOUT}
+            # Preserve this launch's pre-spawn deadline (and any terminal state).
+            # The wrapper received exactly that deadline in its environment.
     elif session_id:
         entry["session_id"] = session_id  # claude: pin the minted/known id
     return state
@@ -14578,11 +14581,14 @@ function Launch($name, $plan, $codexHome, $acceptedAdmission = $null) {
   # Regular supervised Codex only. Bind the startup check to this launch;
   # configured or inherited environment must not disable or replay it.
   Set-AgenttalkEnvironmentMapEntry $applied 'AGENTTALK_CODEX_BUS_PROBE' $null
+  Set-AgenttalkEnvironmentMapEntry $applied 'AGENTTALK_CODEX_BUS_PROBE_DEADLINE' $null
   if ($plan.cli -ceq 'codex' -and $plan.launch_mode -eq 'wrap') {
     if (-not $nonceResult.injected) {
       throw 'CODEX_FIRST_BUS_WRITE_MISSING: cannot bind a restricted probe to this launch'
     }
     Set-AgenttalkEnvironmentMapEntry $applied 'AGENTTALK_CODEX_BUS_PROBE' $launchNonce
+    $probeDeadline = ([double]$plan.next_state.codex_launch_check.deadline_epoch).ToString('R', [Globalization.CultureInfo]::InvariantCulture)
+    Set-AgenttalkEnvironmentMapEntry $applied 'AGENTTALK_CODEX_BUS_PROBE_DEADLINE' $probeDeadline
   }
   foreach ($reserved in $WrapperLogEnvKeys) {
     foreach ($candidate in @($applied.Keys)) {

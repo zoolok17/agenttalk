@@ -564,6 +564,7 @@ def _child_env(
                 WRAPPER_GENERATION_ENV,
                 INBOUND_REQUEST_ID_ENV,
                 "AGENTTALK_CODEX_BUS_PROBE",
+                "AGENTTALK_CODEX_BUS_PROBE_DEADLINE",
                 *_WRAPPER_LOG_ENV_NAMES,
             }
         }
@@ -1423,6 +1424,7 @@ def run_codex_startup_probe(store, agent: str, base_argv: list[str], nonce: str,
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         env=child_env, **_child_window_kwargs(child_env),
     )
+    succeeded = False
     try:
         eof = False
         pending = b""
@@ -1454,17 +1456,20 @@ def run_codex_startup_probe(store, agent: str, base_argv: list[str], nonce: str,
                     session_state.turns += 1
                     if persist is not None:
                         persist(session_state)
+                succeeded = ok
                 return ok
             if not chunk:
                 sleep(min(0.2, max(0, timeout - (clock() - start))))
     finally:
         if proc.stdout:
             proc.stdout.close()
-        if proc.poll() is None:
+        if not succeeded:
             # Mirror the existing watchdog's start-guarded descendant cleanup.
             # The root itself uses our retained Popen handle, not a stale PID.
             snapshot = snapshot_processes(timeout=2.0)
-            if snapshot and proc.poll() is None:
+            # The launcher may already have exited while a descendant keeps
+            # stdout open. Its parent-chain still identifies cleanup targets.
+            if snapshot:
                 targets = [{"pid": pid, "start": snapshot[pid].get("create_epoch")}
                            for pid in reversed(descendants_of(snapshot, proc.pid))]
                 cleanup_until = time.monotonic() + 5.0

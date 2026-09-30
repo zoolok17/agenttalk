@@ -1,5 +1,6 @@
 """Codex relaunch admission and restricted-process write proof (#147)."""
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -119,10 +120,10 @@ def test_malformed_launch_check_holds_instead_of_skipping_or_crashing(check):
 def test_probe_completion_cannot_mint_host_proof(tmp_path, monkeypatch):
     store = _store(tmp_path)
     with pytest.raises(cp.PreflightError, match="no matching"):
-        cp.complete_probe(store, "worker", NONCE)
+        cp.complete_probe(store, "worker", NONCE, deadline_epoch=time.time() + 120)
     monkeypatch.setattr(cp, "is_restricted_process", lambda: True)
     cp.write_bus_proof(store, "worker", NONCE)
-    cp.complete_probe(store, "worker", NONCE)
+    cp.complete_probe(store, "worker", NONCE, deadline_epoch=time.time() + 120)
     assert cp.read_bus_proof(store, "worker")["ready_epoch"] > 0
 
 
@@ -136,6 +137,7 @@ def test_wrapper_probe_failure_stops_before_inbox_setup(tmp_path, monkeypatch):
     from agenttalk.wrapper import run, loop
     store = _store(tmp_path)
     monkeypatch.setenv(cp.PROBE_ENV, NONCE)
+    monkeypatch.setenv(cp.PROBE_DEADLINE_ENV, str(time.time() + 120))
     probe = Mock(return_value=False)
     monkeypatch.setattr(run, "run_codex_startup_probe", probe)
     consume = Mock(side_effect=AssertionError("inbox work must not start"))
@@ -242,11 +244,12 @@ def test_probe_is_bounded_cancellable_and_never_retries(tmp_path, monkeypatch, c
 
 
 def test_probe_requires_receipt_even_when_child_exits_zero(tmp_path, monkeypatch):
-    from agenttalk.wrapper import run
+    from agenttalk.wrapper import run, turn_watchdog
     store = _store(tmp_path)
     proc = Mock(pid=123, returncode=0)
     proc.poll.return_value = 0
     factory = Mock(return_value=proc)
+    monkeypatch.setattr(turn_watchdog, "snapshot_processes", lambda **kwargs: {})
     monkeypatch.setattr(run, "_read_ready_pipe_chunk", lambda stream: b"")
     assert not run.run_codex_startup_probe(store, "worker", ["codex"], NONCE, popen=factory)
     monkeypatch.setattr(cp, "is_restricted_process", lambda: True)
@@ -324,3 +327,103 @@ def test_real_windows_stale_acl_reset(tmp_path):
         cp.reset_guard_acls(tmp_path)
     after = subprocess.check_output(["icacls", str(guard)], timeout=10).decode(errors="replace")
     assert "(I)" in after
+
+
+def test_probe_reaps_pipe_holder_after_launcher_exit(tmp_path, monkeypatch):
+    from agenttalk.wrapper import run, turn_watchdog
+    store = _store(tmp_path)
+    # The launcher really exits, leaving its tool's inherited pipe open. Inject
+    # the snapshot topology because POSIX reparents orphans to another process.
+    pid_file = tmp_path / "holder.pid"
+    code = ("import subprocess, sys; from pathlib import Path; "
+            "p=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+            f"Path({str(pid_file)!r}).write_text(str(p.pid))")
+    launched = {}
+
+    def spawn(*args, **kwargs):
+        root = subprocess.Popen(*args, **kwargs)
+        launched["root"] = root
+        assert root.wait(timeout=5) == 0
+        launched["holder_pid"] = int(pid_file.read_text())
+        launched["reader"] = os.fdopen(os.dup(root.stdout.fileno()), "rb", buffering=0)
+        return root
+
+    tick = [0.0]
+    snapshot = Mock(side_effect=lambda **kwargs: {
+        launched["holder_pid"]: {"ppid": launched["root"].pid, "create_epoch": 1.0}})
+    monkeypatch.setattr(turn_watchdog, "snapshot_processes", snapshot)
+    original_kill = turn_watchdog.kill_targets
+    killed = []
+
+    def kill(targets):
+        result = original_kill(targets, start_fn=lambda pid: 1.0,
+                               killer=lambda pid: os.kill(pid, signal.SIGTERM) is None)
+        killed.extend(result)
+        return result
+
+    monkeypatch.setattr(turn_watchdog, "kill_targets", kill)
+    try:
+        assert not run.run_codex_startup_probe(
+            store, "worker", [sys.executable, "-c", code], NONCE, timeout=0.5,
+            clock=lambda: tick[0], sleep=lambda seconds: tick.__setitem__(0, tick[0] + seconds),
+            popen=spawn)
+        snapshot.assert_called_once()
+        # EOF on our retained reader proves the inherited writer was closed.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if run._read_ready_pipe_chunk(launched["reader"]) == b"":
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("tool descendant still holds the pipe after cleanup")
+    finally:
+        if "holder_pid" in launched and launched["holder_pid"] not in killed:
+            try:
+                os.kill(launched["holder_pid"], signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                if os.name != "nt":
+                    raise
+        if "reader" in launched:
+            launched["reader"].close()
+        if "root" in launched:
+            launched["root"].stdout.close()
+
+
+def test_late_completion_never_unlocks_wrapper_inbox(tmp_path, monkeypatch):
+    from agenttalk.wrapper import run, loop
+    store = _store(tmp_path)
+    monkeypatch.setenv(cp.PROBE_ENV, NONCE)
+    monkeypatch.setenv("AGENTTALK_CODEX_BUS_PROBE_DEADLINE", "99")
+    monkeypatch.setattr(cp.time, "time", lambda: 100.0)
+    monkeypatch.setattr(cp, "is_restricted_process", lambda: True)
+    cp.write_bus_proof(store, "worker", NONCE)
+    monkeypatch.setattr(run, "run_codex_startup_probe", Mock(return_value=True))
+    consume = Mock(side_effect=AssertionError("late probe must not start inbox work"))
+    monkeypatch.setattr(loop, "run_loop", consume)
+    assert cli._wrap_loop_mode(store, "worker", cli="codex", base_argv=["codex"],
+                               sender="worker", min_interval=1, render=False,
+                               supervisor_launch_nonce=NONCE) == 3
+    consume.assert_not_called()
+    assert "ready_epoch" not in cp.read_bus_proof(store, "worker")
+
+
+def test_record_launch_preserves_reserved_admission_deadline():
+    check = {"nonce": NONCE, "status": "pending", "deadline_epoch": 120.0}
+    state = {"agents": {"worker": {"codex_launch_check": check.copy()}}}
+    sup.record_launch(state, "worker", cli="codex", pid=123, now_epoch=100,
+                      launcher_nonce=NONCE, launcher_nonce_injected=True,
+                      cfg_agent={"wrapped": True})
+    assert state["agents"]["worker"]["codex_launch_check"] == check
+
+
+@pytest.mark.parametrize("deadline", [99, None, True, float("nan"), float("inf")])
+def test_probe_completion_rejects_expired_or_invalid_deadline(tmp_path, monkeypatch, deadline):
+    store = _store(tmp_path)
+    monkeypatch.setattr(cp.time, "time", lambda: 100.0)
+    monkeypatch.setattr(cp, "is_restricted_process", lambda: True)
+    cp.write_bus_proof(store, "worker", NONCE)
+    with pytest.raises(cp.PreflightError, match="deadline"):
+        cp.complete_probe(store, "worker", NONCE, deadline_epoch=deadline)
+    assert "ready_epoch" not in cp.read_bus_proof(store, "worker")

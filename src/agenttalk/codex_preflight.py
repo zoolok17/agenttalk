@@ -22,6 +22,7 @@ ACL_TIMEOUT = 10.0
 PROBE_SECONDS = 60.0
 PROOF_TIMEOUT = 120.0
 PROBE_ENV = "AGENTTALK_CODEX_BUS_PROBE"
+PROBE_DEADLINE_ENV = "AGENTTALK_CODEX_BUS_PROBE_DEADLINE"
 
 
 class PreflightError(ValueError):
@@ -157,12 +158,16 @@ def read_bus_proof(store, agent: str) -> dict | None:
     return None
 
 
-def complete_probe(store, agent: str, nonce: str) -> None:
+def complete_probe(store, agent: str, nonce: str, *, deadline_epoch: float) -> None:
     """Host completion acknowledges an existing restricted receipt, never creates one."""
+    now = time.time()
+    if (not isinstance(deadline_epoch, (int, float)) or isinstance(deadline_epoch, bool)
+            or not 0 < now <= deadline_epoch < 1e12):
+        raise PreflightError("codex_bus_proof_failed: admission deadline passed or invalid")
     receipt = read_bus_proof(store, agent)
     if receipt is None or receipt.get("nonce") != nonce:
         raise PreflightError("codex_bus_proof_failed: no matching restricted receipt")
-    receipt["ready_epoch"] = time.time()
+    receipt["ready_epoch"] = now
     write_text(_receipt_path(store, agent), json.dumps(receipt))
 
 
