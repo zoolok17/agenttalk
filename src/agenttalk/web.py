@@ -827,6 +827,55 @@ def _projection_config(store: Store) -> tuple[dict | None, str | None]:
     return cfg, None
 
 
+class _SingleFlight:
+    """Coalesce concurrent callers of the SAME expensive computation onto one
+    in-flight run (#239 serve-growth). ``ThreadingHTTPServer`` caps neither
+    per-endpoint concurrency nor connection lifetime: when a real browser fires
+    several overlapping requests for the same expensive, uncached full-store
+    scan faster than one completes (confirmed via tracemalloc: a synthetic,
+    strictly-sequential client never overlaps these calls and stays flat, but
+    real browser traffic does), each used to start its OWN full rescan on its
+    OWN thread - those threads, and the full scanned/validated copy each one
+    held in its stack, piled up without bound under sustained real-browser
+    load (measured ~600 MB/min, threads/handles climbing in lockstep).
+    Singleflight never changes the DATA returned - every result is still
+    computed fresh, at real request time - it only prevents redundant
+    concurrent work for the SAME key.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._inflight: dict[object, tuple[threading.Event, dict]] = {}
+
+    def do(self, key, fn):
+        with self._lock:
+            entry = self._inflight.get(key)
+            if entry is not None:
+                event, holder = entry
+                leader = False
+            else:
+                event, holder = threading.Event(), {}
+                self._inflight[key] = (event, holder)
+                leader = True
+        if leader:
+            try:
+                holder["result"] = fn()
+            except BaseException as exc:  # noqa: BLE001 - re-raised to every waiter
+                holder["exc"] = exc
+            finally:
+                with self._lock:
+                    del self._inflight[key]
+                event.set()
+        else:
+            event.wait()
+        if "exc" in holder:
+            raise holder["exc"]
+        return holder["result"]
+
+
+_all_messages_singleflight = _SingleFlight()
+
+
 def _all_messages(store: Store, *, cfg: dict | None = None) -> list[Message]:
     """Return every renderable message in the store, most recent first.
 
@@ -836,11 +885,19 @@ def _all_messages(store: Store, *, cfg: dict | None = None) -> list[Message]:
     ``signing_enforced()``) HMAC-valid. Anything that fails goes
     through ``store.list_invalid_messages()`` and is surfaced in
     ``/api/status.invalid_messages`` instead of being rendered.
+
+    The scan itself is coalesced per store root via ``_all_messages_singleflight``
+    (#239) - see ``_SingleFlight``'s docstring for why.
     """
     if cfg is None:
         cfg, config_error = _projection_config(store)
         if config_error is not None or cfg is None:
             return []
+    return _all_messages_singleflight.do(str(store.root), lambda: _all_messages_scan(store, cfg))
+
+
+def _all_messages_scan(store: Store, cfg: dict) -> list[Message]:
+    """The actual (expensive, O(store size)) scan body of ``_all_messages``."""
     # 0.18.0 (FR-004): validate against the KNOWN roster (active ∪ retired),
     # matching valid_messages / _validated_for_state — otherwise a retired
     # identity's historical messages vanish from /api/messages, /messages/<id>,
@@ -945,10 +1002,22 @@ def _closed_rids_for(store: Store, agent: str) -> set[str]:
     }
 
 
+_validated_for_state_singleflight = _SingleFlight()
+
+
 def _validated_for_state(store: Store, cfg: dict) -> tuple[list[Message], int]:
-    """Synchronous composition callers share the worker's canonical validator."""
-    rows, invalid = _snapshots.validated_active(store, cfg)
-    return [message for message, _ in rows], invalid
+    """Synchronous composition callers share the worker's canonical validator.
+
+    Coalesced per store root via ``_validated_for_state_singleflight`` (#239) -
+    this is the OTHER uncached O(store size) scan real browser traffic (GET
+    /api/attention, /api/lead-chat) can fire faster than one call completes;
+    see ``_SingleFlight``'s docstring for why that unbounded overlap is the
+    growth mechanism.
+    """
+    def _do() -> tuple[list[Message], int]:
+        rows, invalid = _snapshots.validated_active(store, cfg)
+        return [message for message, _ in rows], invalid
+    return _validated_for_state_singleflight.do(str(store.root), _do)
 
 
 def _epoch_from(msgs: list[Message]) -> str | None:

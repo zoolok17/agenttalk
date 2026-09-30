@@ -18,6 +18,7 @@ import socket
 import subprocess
 import threading
 import time
+import tracemalloc
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -2590,6 +2591,104 @@ def test_api_state_perf_smoke(tmp_path: Path) -> None:
             f"environment cannot meet the NFR-003 reference bound for any "
             f"command (build_state measured {elapsed:.2f}s)")
     assert elapsed < 2.0, f"build_state took {elapsed:.2f}s at 1k messages"
+
+
+# ============================================ #239: serve-growth regression
+
+def test_concurrent_attention_requests_coalesce_the_uncached_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#239: a real browser fires GET /api/attention (and /api/lead-chat)
+    every ~2s WITHOUT waiting for a prior call to finish - unlike a
+    strictly-sequential synthetic client, which never has more than one
+    such call in flight. Before this fix, `_validated_for_state` ran a full,
+    UNCACHED O(store-size) rescan on every call, and ThreadingHTTPServer caps
+    neither per-endpoint concurrency nor connection lifetime - so N
+    overlapping requests started N fully independent, fully redundant
+    rescans, each retaining its own scanned/validated copy in its own
+    thread's stack until it finished. Measured against the real incident:
+    ~600 MB/min, thread/handle counts climbing in lockstep, never
+    plateauing.
+
+    This reproduces the SAME overlap deterministically (a patched, slowed
+    `validated_active` guarantees true concurrent overlap instead of hoping
+    real scan timing races correctly) and asserts the fix coalesces it:
+    the expensive scan runs far fewer than N times, retained memory from the
+    scan stays under a fixed ceiling, and no thread is left blocked/hung
+    afterward (thread count returns to baseline). RED before the
+    singleflight fix in `web.py` (every one of the N requests would run its
+    own scan and retain its own allocation), GREEN after (only the leader(s)
+    run the scan; the rest share its result).
+    """
+    store = _make_store(tmp_path)
+    store.send(sender="alpha", recipient="beta", body="m0")
+
+    call_count = 0
+    call_lock = threading.Lock()
+    retained_blocks: list[bytearray] = []
+    real_validated_active = web._snapshots.validated_active
+
+    def slow_validated_active(store_arg, cfg_arg, *args, **kwargs):
+        nonlocal call_count
+        with call_lock:
+            call_count += 1
+        # Stand in for the real scan's cost: a store this small returns in
+        # under a millisecond, which would never force genuine overlap on a
+        # loaded CI box. Sleeping AND allocating a fixed, measurable "as if
+        # scanned" block makes the reproduction (and the ceiling assertion
+        # below) deterministic rather than a timing race.
+        block = bytearray(2 * 1024 * 1024)
+        retained_blocks.append(block)
+        time.sleep(0.3)
+        return real_validated_active(store_arg, cfg_arg, *args, **kwargs)
+
+    monkeypatch.setattr(web._snapshots, "validated_active", slow_validated_active)
+
+    server, thread, base = _serve(store)
+    try:
+        baseline_threads = threading.active_count()
+        tracemalloc.start()
+        baseline_snapshot = tracemalloc.take_snapshot()
+
+        concurrency = 20
+
+        def fire() -> None:
+            with _urlopen(f"{base}/api/attention", timeout=10) as resp:
+                resp.read()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+            list(pool.map(lambda _: fire(), range(concurrency)))
+
+        # Sanity: the fix must not leave any waiter blocked/hung - every
+        # handler thread should be reaped back to baseline shortly after all
+        # requests complete.
+        deadline = time.time() + 5.0
+        while threading.active_count() > baseline_threads and time.time() < deadline:
+            time.sleep(0.05)
+        assert threading.active_count() <= baseline_threads + 1, (
+            f"thread count did not return to baseline after the burst: "
+            f"{threading.active_count()} vs baseline {baseline_threads}")
+
+        snapshot = tracemalloc.take_snapshot()
+        stats = snapshot.compare_to(baseline_snapshot, "lineno")
+        retained_growth = sum(s.size_diff for s in stats if s.size_diff > 0)
+
+        # The core regression assertion: coalesced, the expensive scan runs
+        # only once per non-overlapping window, never once per request.
+        assert call_count < concurrency // 2, (
+            f"the uncached scan ran {call_count} times for {concurrency} "
+            f"concurrent requests - it is not being coalesced")
+        # Retained-allocation ceiling: well above what ONE scan's 2 MiB
+        # "retained copy" costs, far below what {concurrency} independent,
+        # uncoalesced copies would cost (~{concurrency * 2} MiB).
+        ceiling = 12 * 1024 * 1024
+        assert retained_growth < ceiling, (
+            f"retained {retained_growth} bytes after {concurrency} concurrent "
+            f"requests (ceiling {ceiling}) - the scan is not being coalesced")
+    finally:
+        tracemalloc.stop()
+        server.shutdown()
+        server.server_close()
 
 
 # ===================================== 0.18.0 (WP02): retired history parity

@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`agenttalk serve`: unbounded memory/thread growth under real browser
+  traffic (#239).** `GET /api/attention` and `GET /api/lead-chat` each ran a
+  full, uncached, O(store-size) rescan-and-validate of every message file on
+  every single request (`web._validated_for_state` / `web._all_messages`),
+  unlike `/api/state`, which already reads from the cached
+  `SnapshotService`. `ThreadingHTTPServer` caps neither per-endpoint
+  concurrency nor connection lifetime, so when requests for these two
+  endpoints arrived faster than one scan completed, each one started its own
+  fully redundant rescan on its own thread - and each thread retained its
+  own scanned/validated copy of the store until it returned. A real browser
+  (confirmed with headless Edge against the real console `/v2` page) fires
+  these polls without waiting for a prior call to finish; a strictly
+  sequential synthetic client never does, which is why this was invisible to
+  earlier synthetic-load testing. Measured on a real-store copy: private
+  bytes grew roughly 600 MB/min with handle and thread counts climbing in
+  lockstep and never plateauing - consistent with the reported incident
+  (~1.9 GB private / ~1.9 GB working set growth over about 70 minutes with a
+  single browser tab open).
+  - Both scans are now coalesced per store root via a small
+    single-flight helper (`web._SingleFlight`): concurrent callers for the
+    SAME store share one in-flight computation instead of each starting
+    their own. The data returned is unchanged (still computed fresh, at
+    real request time) - only the redundant concurrent work is removed.
+  - Added a regression test
+    (`test_concurrent_attention_requests_coalesce_the_uncached_scan`) that
+    fires many genuinely concurrent `/api/attention` requests against an
+    in-process server and asserts the scan is coalesced, thread count
+    returns to baseline, and retained allocations stay under a fixed
+    ceiling.
+
 ### Added
 
 - **Supervisor restart budget: a seat is never relaunched into a loop.**
