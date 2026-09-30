@@ -11,6 +11,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Work board: a Done lane from lead-run, Git-verified merge facts (#207).**
+  The reducer could already place Done from integration evidence, but nothing
+  supplied it. The new `agenttalk board verify-merges [--dry-run] [--json]`
+  runs outside the web server. For every current (work item, candidate) pair,
+  it checks ancestry against the approved target refs of an operator-approved
+  local checkout (`work_repos` in the project config).
+  - It uses only `rev-parse`, `merge-base --is-ancestor` and `cat-file`, with
+    a hardened environment and a 2 second timeout per probe.
+  - Ambiguous refs, symlinked or escaping paths, shallow history and missing
+    objects give no fact (Unknown), never Done.
+  - It writes a bounded, schema-versioned `state/work-board-facts.json`
+    atomically, under a store lock, bound to the store session.
+  - Only one run at a time: a second run is refused. A run also refuses to
+    publish after a store reset, and never overwrites a facts file of an
+    unsupported schema.
+
+  The snapshot worker only reads that file and never runs Git:
+  - a missing, malformed or oversize file, or any other fault in this optional
+    evidence, gives no facts and a visible warning, never a missing board;
+  - a fact older than `integration_facts_max_age_seconds` (default 24 h), or
+    future-dated, never makes Done, and the card says "integration evidence
+    stale (as of ...)";
+  - a fact from a remapped alias or target is ignored;
+  - a fact counts only for the item's current binding (its declared
+    `work_repo`/`work_target`, else the current default), so proof from an
+    earlier default or target is never reused. An explicitly empty declaration
+    is invalid, never the default;
+  - a section from another store session is ignored.
+
+  This replaces the in-server cached observer of the work-board design
+  (section 4) and supersedes draft #238. The lead skill now runs the command
+  after every merge and on every lead tick. Cards also carry the item's
+  declared `repo_binding`. See docs/WORK-BOARD-FEED.md.
+
 - **Supervisor restart budget: a seat is never relaunched into a loop.**
   Backoff only slows relaunches down, and the readiness give-up stops only a
   seat that never becomes ready. So a seat that became ready and then crashed

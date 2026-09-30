@@ -48,7 +48,8 @@ use flags when their B2b implementation ships, equivalent metadata otherwise.
 Never clear FIX/HOLD by prose or unrelated GO. Correct slugs by cancelling and
 reissuing, not editing messages. Keep local merge evidence, existing project
 planners and irreversible-action gates. Ready is advisory; the board describes
-work and never authorizes actions.
+work and never authorizes actions. Right after each merge, and on every lead tick, run the
+`board verify-merges` subcommand: Done needs fresh local ancestry facts.
 
 ## Identity
 
