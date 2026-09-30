@@ -18,6 +18,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `codex_bus_permission_denied`: the message stays unread and the supervisor
   holds relaunch and escalates. No startup probe turn is required.
 
+- **Supervisor restart budget: a seat is never relaunched into a loop.**
+  Backoff only slows relaunches down, and the readiness give-up stops only a
+  seat that never becomes ready. So a seat that became ready and then crashed
+  again was relaunched forever. Each seat now has a durable restart budget:
+  at most `max_relaunches` (default 4) automatic relaunch attempts until the
+  seat has been continuously healthy for `window_seconds` (default 3600),
+  which refills it.
+  - Every automatic relaunch attempt is charged, including one whose
+    seed/preflight check fails or whose launch returns no process.
+  - A manual `request-restart` relaunch and a launch-barrier refusal are not
+    charged.
+  - "Continuously healthy" means every poll in the window was green. Any
+    other observation (for example an unreadable wrapper identity), or a gap
+    between polls of more than 5 minutes (or three poll intervals, if
+    longer), starts the window again. Time alone never refills the budget.
+
+  When a relaunch is due and the budget is spent, the supervisor does not
+  relaunch. It holds the seat in the new sticky `RESTART_BUDGET_EXHAUSTED`
+  state and sends ONE escalation note to `notify_to`, naming the seat, the
+  relaunch count and the window.
+  - The note is marked delivered only after the send succeeds. A failed or
+    unconfigured send is retried every `suspect_warn_interval_seconds`, which
+    delays the note but never drops it.
+  - A hold stays visible, and its escalation is still sent, while another
+    hold (for example a process-ownership warning) decides the poll.
+
+  Neither health nor time lifts the hold. It clears only on an audited
+  request by the operator-facing liaison or sole lead:
+  - `agenttalk request-restart --for <seat>` relaunches now; that relaunch is
+    not charged to the budget;
+  - the new `agenttalk request-restart --for <seat> --clear-restart-budget`
+    re-arms the budget without killing or launching anything. It is applied
+    even while a process-ownership guard blocks restarts, and it never
+    removes a lead-loop stand-down or exit marker.
+
+  The budget, the hold and the last clear's audit record are persisted in
+  `supervisor-state.json`, so restarting the supervisor does not reset a
+  crash loop. A clear is saved before its request marker is deleted. A
+  damaged relaunch record counts as a spent budget until an audited clear
+  replaces it. Set `restart_budget` globally or per agent in
+  `supervisor.json`; out-of-range values fall back and cannot switch the
+  budget off. Backoff, the readiness give-up (which keeps precedence) and
+  the one-wrapper barrier are unchanged.
+
 ### Removed
 
 - **spec-kitty support (operator decision, 2026-09-28).** The retired

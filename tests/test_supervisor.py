@@ -1630,7 +1630,7 @@ def test_ps_template_console_action_log_and_quiet() -> None:
     # (inherited by called functions) rather than gating each Write-Warning. And the
     # warning actions are NOT double-logged by the info Write-Host (excluded there).
     assert ("'warn_only','suspect_warn','refuse_protected','snapshot_unavailable',"
-            "'readiness_gave_up' -notcontains") in ps
+            "'readiness_gave_up','restart_budget_exhausted' -notcontains") in ps
     assert "$WarningPreference = 'SilentlyContinue'" in ps   # -Quiet silences all warnings
 
 
@@ -20312,6 +20312,743 @@ def test_stuck_recovery_of_ready_agent_is_not_immediately_capped() -> None:
                    {"agents": {"worker": _ready(backoff_next_epoch=0, readiness_fails=0)}},
                    snapshot=_snap(cli="claude"))
     assert p["action"] == sup.STUCK_RECOVER and p["next_state"]["readiness_fails"] == 1
+
+
+# ------------------------------------------------ restart budget (never loop)
+
+def _budget_poll(entry: dict, now: float, *, stale: bool, marker=None,
+                 config=_HOOK_CONFIG, protected: bool = False, **report) -> dict:
+    rpt = _report(heartbeat_stale=stale, restart_request=marker, protected=protected, **report)
+    return _plan_hook(rpt, {"agents": {"worker": entry}}, now=now,
+                      config=config, snapshot=[])
+
+
+def _healthy_for(entry: dict, start: float, seconds: float, *, step: float = 60.0,
+                 config=_HOOK_CONFIG) -> tuple[dict, float]:
+    """Observe a healthy seat every ``step`` seconds from ``start`` for
+    ``seconds``; returns the state and the time of the last poll."""
+    t = start
+    entry = _budget_poll(entry, t, stale=False, config=config)["next_state"]
+    while t + step <= start + seconds:
+        t += step
+        entry = _budget_poll(entry, t, stale=False, config=config)["next_state"]
+    return entry, t
+
+
+def _crash_loop(entry: dict, start: float, cycles: int, *,
+                healthy_for: float = 600.0, config=_HOOK_CONFIG):
+    """Drive ready-then-crash cycles: a stale poll (relaunch due), healthy
+    polls from the first fresh heartbeat past grace for ``healthy_for``
+    seconds (long enough to reset the backoff), then a crash. Returns the
+    state, the stale-poll plans and the time of the next stale poll."""
+    plans, t = [], start
+    for _ in range(cycles):
+        p = _budget_poll(entry, t, stale=True, config=config)
+        plans.append(p)
+        entry, t = _healthy_for(p["next_state"], t + 200, healthy_for, config=config)
+        t += 1000
+    return entry, plans, t
+
+
+def _held_entry() -> tuple[dict, float]:
+    """A held seat whose one escalation was delivered."""
+    entry, _, t = _crash_loop(_ready(), NOW, 4)
+    p = _budget_poll(entry, t, stale=True)
+    assert p["action"] == sup.RESTART_BUDGET_EXHAUSTED
+    return p["restart_budget_escalation"]["ack_state"], t + 15
+
+
+def _clear_marker(rid: str = "rr-c", **over) -> dict:
+    return {**_auth_marker(rid), "mode": sup.RESTART_BUDGET_CLEAR_MODE, **over}
+
+
+def _wrap_healthy_poll(entry: dict, now: float) -> dict:
+    return _plan_wrap(
+        _report(heartbeat_stale=False, wrapper_runtime=_wrapper_runtime_view(now=now)),
+        {"agents": {"worker": entry}}, now=now, snapshot=_wrap_snap()[:1])
+
+
+def _wrap_unknown_poll(entry: dict, now: float, marker=None) -> dict:
+    """A poll whose wrapper identity is unreadable: PROCESS_TREE_UNKNOWN."""
+    wrapper = dict(_wrap_snap()[0])
+    wrapper["command_line"] = None
+    return _plan_wrap(
+        _report(heartbeat_stale=False, restart_request=marker,
+                wrapper_runtime=_wrapper_runtime_view(now=now)),
+        {"agents": {"worker": entry}}, now=now, snapshot=[wrapper])
+
+
+def test_restart_budget_ready_then_crash_loop_holds_after_budget() -> None:
+    entry, plans, t = _crash_loop(_ready(), NOW, 4)
+    # every cycle reached readiness, so the readiness cap never engaged
+    assert [p["action"] for p in plans] == [sup.STUCK_RECOVER] * 4
+    assert all(p["next_state"]["readiness_fails"] == 1 for p in plans)
+    assert len(entry["restart_budget_relaunches"]) == 4
+
+    p = _budget_poll(entry, t, stale=True)
+    assert (p["action"], p["state"], p["notify"]) == (
+        sup.RESTART_BUDGET_EXHAUSTED, "RESTART_BUDGET_EXHAUSTED", False)
+    assert p["kill_first"] is False and p["kill_targets"] == []
+    assert "barrier_state" not in p and p["cli"] is None   # nothing is launched
+    esc = p["restart_budget_escalation"]
+    for text in (p["reason"], esc["message"]):
+        assert "worker" in text and "4 supervisor relaunch" in text
+        assert "3600s" in text and "--clear-restart-budget" in text
+    hold = p["next_state"]["restart_budget_hold"]
+    assert hold["count"] == 4 and hold["max_relaunches"] == 4
+    assert hold["window_seconds"] == 3600.0 and hold["malformed"] is False
+    assert hold["since_epoch"] == t and hold["first_relaunch_epoch"] == NOW
+    assert len(p["next_state"]["restart_budget_relaunches"]) == 4
+    # next_state keeps the intent; only the executor's confirmed send installs
+    # ack_state, which records the escalation as delivered
+    assert hold["notified_epoch"] is None
+    assert p["next_state"]["restart_budget_last_notify_epoch"] == t
+    assert esc["ack_state"]["restart_budget_hold"]["notified_epoch"] == t
+
+    # ONE escalation: once delivered, later polls stay held and silent.
+    entry = esc["ack_state"]
+    for later in (t + 60, t + 86_400, t + 30 * 86_400):
+        p = _budget_poll(entry, later, stale=True)
+        assert (p["action"], p["state"]) == (sup.NONE, "RESTART_BUDGET_EXHAUSTED")
+        assert "restart_budget_escalation" not in p
+        entry = p["next_state"]
+
+
+def test_undelivered_restart_budget_escalation_is_retried() -> None:
+    entry, _, t = _crash_loop(_ready(), NOW, 4)
+    undelivered = _budget_poll(entry, t, stale=True)["next_state"]
+    assert "restart_budget_escalation" not in _budget_poll(undelivered, t + 299, stale=True)
+    p = _budget_poll(undelivered, t + 300, stale=True)
+    assert p["action"] == sup.RESTART_BUDGET_EXHAUSTED
+    assert p["restart_budget_escalation"]["ack_state"]["restart_budget_hold"][
+        "notified_epoch"] == t + 300
+
+
+def test_restart_budget_hold_is_not_lifted_by_sustained_health() -> None:
+    entry, t = _held_entry()
+    entry, t2 = _healthy_for(entry, t, 10 * 3600, step=240)
+    p = _budget_poll(entry, t2 + 60, stale=False)
+    assert p["state"] == "HEALTHY_IDLE" and "hold stays" in p["reason"]
+    entry = p["next_state"]
+    assert entry["restart_budget_hold"]["count"] == 4
+    assert len(entry["restart_budget_relaunches"]) == 4
+    p = _budget_poll(entry, t2 + 120, stale=True)
+    assert (p["action"], p["state"]) == (sup.NONE, "RESTART_BUDGET_EXHAUSTED")
+
+
+def test_restart_budget_survives_supervisor_state_reload(tmp_path: Path) -> None:
+    path = tmp_path / "supervisor-state.json"
+    # three relaunches into the loop, then the supervisor restarts
+    entry, _, t = _crash_loop(_ready(), NOW, 3)
+    sup.save_supervisor_state(path, {"agents": {"worker": entry}})
+    entry = sup.load_supervisor_state(path)["agents"]["worker"]
+    entry, plans, t = _crash_loop(entry, t, 1)
+    assert plans[0]["action"] == sup.STUCK_RECOVER
+    p = _budget_poll(entry, t, stale=True)
+    assert p["action"] == sup.RESTART_BUDGET_EXHAUSTED
+
+    # the hold survives another restart, from the primary or the backup copy
+    delivered = p["restart_budget_escalation"]["ack_state"]
+    sup.save_supervisor_state(path, {"agents": {"worker": delivered}})
+    sup.save_supervisor_state(path, {"agents": {"worker": delivered}})
+    path.write_text("{broken", encoding="utf-8")
+    entry = sup.load_supervisor_state(path)["agents"]["worker"]
+    p = _budget_poll(entry, t + 86_400, stale=True)
+    assert (p["action"], p["state"]) == (sup.NONE, "RESTART_BUDGET_EXHAUSTED")
+    assert "restart_budget_escalation" not in p
+
+
+def _run_budget_actions(tmp_path: Path, lines: list[str], *, stub_exit: int = 0,
+                        snapshot_state: bool = False) -> tuple[dict, list[str], Path]:
+    """Run the shipped restart-budget-actions region (plus the state helpers)
+    under pwsh, with a stub agenttalk that logs its arguments and exits with
+    ``stub_exit``. The stub can also copy the state file as it stood at the
+    moment it ran. Returns the saved agents, the stub calls, the copy path."""
+    ps = sup.PS_TEMPLATE
+    helpers = ps[ps.index("# region state-helpers"):ps.index("# endregion state-helpers")]
+    actions = ps[ps.index("# region restart-budget-actions"):
+                 ps.index("# endregion restart-budget-actions")]
+    state_path = tmp_path / "supervisor-state.json"
+    copy_path = tmp_path / "state-when-stub-ran.json"
+    log = tmp_path / "agenttalk-calls.log"
+    stub = tmp_path / "agenttalk.cmd"
+    body = ["@echo off"]
+    if snapshot_state:
+        body.append(f'copy /y "{state_path}" "{copy_path}" >nul')
+    body += [f'>>"{log}" echo %*', f"exit /b {stub_exit}"]
+    stub.write_text("\r\n".join(body) + "\r\n", encoding="utf-8")
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        f"$StatePath = {_pslit(str(state_path))}",
+        "$StateBackupPath = \"$StatePath.bak\"",
+        "$KillSwitchPath = Join-Path (Split-Path -Parent $StatePath) 'supervisor.kill'",
+        f"$Root = {_pslit(str(tmp_path))}",
+        f"$AgenttalkCmd = {_pslit(str(stub))}",
+        "function Actions-Enabled { return $true }",
+        "function Assert-ActionsEnabled([string]$what) { return $true }",
+        helpers,
+        actions,
+        "$state = Load-State",
+        *lines,
+        "Save-State $state",
+    ])
+    script = tmp_path / "restart-budget-actions.ps1"
+    script.write_text(harness, encoding="utf-8-sig")
+    result = subprocess.run([_pick_powershell(), "-NoProfile", "-File", str(script)],
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+    return sup.load_supervisor_state(state_path)["agents"], calls, copy_path
+
+
+def _escalation_line() -> str:
+    """The executor's post-switch escalation line, verbatim."""
+    ps = sup.PS_TEMPLATE
+    line = next(ln.strip() for ln in ps.splitlines()
+                if "Send-RestartBudgetEscalation $state $name" in ln)
+    switch_end = ps.index("      default { Set-AgentState $state $name $p.next_state }\n    }\n")
+    assert ps.index(line) > switch_end   # runs after whatever branch acted
+    return line
+
+
+@pytest.mark.parametrize("case", ["delivered", "masked-delivered", "send-fails", "no-notify-target"])
+def test_executor_marks_escalation_delivered_only_after_confirmed_send(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    if not _pick_powershell():
+        return
+    if case == "masked-delivered":
+        # the escalation rides on an ownership warning (P2-7 boundary)
+        t = NOW
+        plan = _wrap_unknown_poll(_wrap_ready(restart_budget_relaunches=[NOW - 10] * 4,
+                                              restart_budget_hold={"count": 4, "notified_epoch": None}), t)
+        assert (plan["action"], plan["state"]) == (sup.WARN_ONLY, "PROCESS_TREE_UNKNOWN")
+    else:
+        entry, _, t = _crash_loop(_ready(), NOW, 4)
+        plan = _budget_poll(entry, t, stale=True)
+    assert "restart_budget_escalation" in plan
+    cfg = {"notify_sender": "supervisor", "notify_to": None if case == "no-notify-target" else "lead"}
+    (tmp_path / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    (tmp_path / "cfg.json").write_text(json.dumps(cfg), encoding="utf-8")
+    agents, calls, _ = _run_budget_actions(tmp_path, [
+        f"$p = Get-Content -Raw {_pslit(str(tmp_path / 'plan.json'))} | ConvertFrom-Json",
+        f"$cfg = Get-Content -Raw {_pslit(str(tmp_path / 'cfg.json'))} | ConvertFrom-Json",
+        "$name = 'worker'",
+        "Set-AgentState $state $name $p.next_state",   # what every action branch does
+        _escalation_line(),
+    ], stub_exit=7 if case == "send-fails" else 0)
+    saved = agents["worker"]
+    if case.endswith("delivered"):
+        assert saved["restart_budget_hold"]["notified_epoch"] == t
+        assert len(calls) == 1 and "--to lead" in calls[0] and "--kind note" in calls[0]
+        assert "restart budget exhausted for worker" in calls[0]
+        return
+    assert saved["restart_budget_hold"]["notified_epoch"] is None
+    assert len(calls) == (1 if case == "send-fails" else 0)
+    # the undelivered intent is retried by a later poll, for example next day
+    later = _budget_poll(saved, t + 86_400, stale=True)
+    assert "restart_budget_escalation" in later
+
+
+@pytest.mark.parametrize("save_ok", [True, False])
+def test_executor_saves_budget_clear_before_deleting_its_marker(
+    tmp_path: Path,
+    save_ok: bool,
+) -> None:
+    if not _pick_powershell():
+        return
+    entry, t = _held_entry()
+    plan = _budget_poll(entry, t, stale=True, marker=_clear_marker())
+    assert (plan["action"], plan["clear_marker"]) == (sup.CLEAR_MARKER, "rr-c")
+    (tmp_path / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    lines = [f"$p = Get-Content -Raw {_pslit(str(tmp_path / 'plan.json'))} | ConvertFrom-Json"]
+    if not save_ok:
+        lines.append("function Save-StateForPoll($state) { return $false }")
+    lines.append("Complete-ClearMarker $state 'worker' $p")
+    agents, calls, copy_path = _run_budget_actions(tmp_path, lines, snapshot_state=True)
+    assert "restart_budget_hold" not in agents["worker"]
+    if not save_ok:
+        # nothing durable yet, so the marker stays for the next poll to re-apply
+        assert calls == [] and not copy_path.exists()
+        return
+    assert calls == [f"--root {tmp_path} supervise --clear-restart --for worker --request-id rr-c"]
+    # when the marker was deleted, the state file already held the effect
+    at_delete = json.loads(copy_path.read_text(encoding="utf-8-sig"))["agents"]["worker"]
+    assert "rr-c" in at_delete["consumed_rids"]
+    assert "restart_budget_hold" not in at_delete
+    assert at_delete["restart_budget_cleared"]["request_id"] == "rr-c"
+    # retry-safe after a crash before the delete: the consumed marker is only
+    # acknowledged again, never re-applied or re-audited
+    again = _budget_poll(at_delete, t + 60, stale=False, marker=_clear_marker())
+    assert (again["action"], again["clear_marker"]) == (sup.CLEAR_MARKER, "rr-c")
+    assert again["next_state"]["restart_budget_cleared"] == at_delete["restart_budget_cleared"]
+
+
+def test_budget_clear_acknowledgement_keeps_a_lead_loop_stand_down(tmp_path: Path) -> None:
+    s = _team(tmp_path)
+    s.write_lead_loop_exit("worker", state=s.LEAD_LOOP_EXIT_STOOD_DOWN, owner_pid=4321)
+    s.write_restart_request("worker", _clear_marker("rr-b"))
+    stood_down = s.read_lead_loop_exit("worker")
+    p = _budget_poll(_held_entry()[0], NOW + 90_000, stale=True, marker=_clear_marker("rr-b"),
+                     lead_loop_exit=stood_down)
+    assert (p["action"], p["clear_marker"]) == (sup.CLEAR_MARKER, "rr-b")
+    assert _run(["supervise", "--clear-restart", "--for", "worker",
+                 "--request-id", "rr-b"], tmp_path) == 0
+    assert s.read_restart_request("worker") is None
+    assert s.read_lead_loop_exit("worker") == stood_down
+    # the stand-down still holds the re-armed seat
+    q = _budget_poll(p["next_state"], NOW + 90_060, stale=True, lead_loop_exit=stood_down)
+    assert (q["action"], q["state"]) == (sup.NONE, "LEAD_LOOP_STOOD_DOWN")
+    # a real restart marker still supersedes it, as before
+    s.write_restart_request("worker", _auth_marker("rr-r"))
+    assert _run(["supervise", "--clear-restart", "--for", "worker",
+                 "--request-id", "rr-r"], tmp_path) == 0
+    assert s.read_lead_loop_exit("worker") is None
+
+
+def test_request_restart_clears_restart_budget_hold_and_is_not_charged() -> None:
+    # with no budget in use, a manual restart leaves the state shape unchanged
+    p = _budget_poll(_ready(), NOW, stale=True, marker=_auth_marker("rr-y"))
+    assert p["action"] == sup.RELAUNCH
+    assert not any(k.startswith("restart_budget") for k in p["next_state"])
+    entry, t = _held_entry()
+    p = _budget_poll(entry, t, stale=True, marker=_auth_marker("rr-x"))
+    assert p["action"] == sup.RELAUNCH
+    nxt = p["next_state"]
+    assert "restart_budget_hold" not in nxt and nxt["restart_budget_relaunches"] == []
+    assert nxt["restart_budget_cleared"] == {
+        "request_id": "rr-x", "via": "request_restart",
+        "requested_by": "lead", "authorized_by": "lead", "reason": "",
+        "at_epoch": t, "was_held": True, "relaunches": 4,
+    }
+    # a launch-barrier refusal applies barrier_state: still held, marker retried
+    assert p["barrier_state"]["restart_budget_hold"]["count"] == 4
+    assert "rr-x" not in p["barrier_state"]["consumed_rids"]
+    # the re-armed seat gets the full budget again
+    entry, plans, t2 = _crash_loop(nxt, t + 1000, 4)
+    assert [q["action"] for q in plans] == [sup.STUCK_RECOVER] * 4
+    assert _budget_poll(entry, t2, stale=True)["action"] == sup.RESTART_BUDGET_EXHAUSTED
+
+
+def test_operator_clear_lifts_restart_budget_hold_without_relaunch() -> None:
+    entry, t = _held_entry()
+    clear = _clear_marker(reason="fixed the crash")
+    p = _budget_poll(entry, t, stale=True, marker=clear)
+    assert (p["action"], p["state"], p["clear_marker"]) == (
+        sup.CLEAR_MARKER, "RESTART_BUDGET_CLEARED", "rr-c")
+    assert p["kill_first"] is False and p["kill_targets"] == []
+    nxt = p["next_state"]
+    assert "restart_budget_hold" not in nxt and nxt["restart_budget_relaunches"] == []
+    audit = nxt["restart_budget_cleared"]
+    assert (audit["via"], audit["request_id"], audit["requested_by"]) == (
+        "clear_restart_budget", "rr-c", "lead")
+    assert audit["was_held"] is True and audit["reason"] == "fixed the crash"
+    assert "rr-c" in nxt["consumed_rids"]
+    # the dead seat relaunches on a later poll under a fresh budget, also when
+    # the consumed marker failed to clear
+    for marker in (None, clear):
+        q = _budget_poll(nxt, t + 60, stale=True, marker=marker)
+        assert q["action"] == sup.STUCK_RECOVER
+        assert q["next_state"]["restart_budget_relaunches"] == [t + 60]
+        assert q["next_state"]["restart_budget_cleared"] == audit
+
+
+def test_operator_clear_of_protected_agent_never_refuses() -> None:
+    clear = _clear_marker()
+    entry = _ready(restart_budget_relaunches=[NOW - 10])
+    p = _budget_poll(entry, NOW, stale=False, marker=clear, protected=True)
+    assert p["action"] == sup.CLEAR_MARKER
+    # consumed and healthy: cleared like any consumed marker, never REFUSE_PROTECTED
+    p = _budget_poll(p["next_state"], NOW + 15, stale=False, marker=clear, protected=True)
+    assert (p["action"], p["clear_marker"]) == (sup.CLEAR_MARKER, "rr-c")
+
+
+def test_budget_clear_is_not_gated_by_ownership_guards() -> None:
+    held = _wrap_ready(restart_budget_relaunches=[NOW - 10] * 4,
+                       restart_budget_hold={"count": 4, "notified_epoch": NOW - 99})
+    p = _wrap_unknown_poll(held, NOW, marker=_clear_marker())
+    assert (p["action"], p["state"], p["clear_marker"]) == (
+        sup.CLEAR_MARKER, "RESTART_BUDGET_CLEARED", "rr-c")
+    assert "restart_budget_hold" not in p["next_state"] and p["kill_targets"] == []
+    # the guards stay in force for anything that is not budget-only
+    for marker in (_clear_marker("rr-u", authority_result="denied"), _auth_marker("rr-r")):
+        q = _wrap_unknown_poll(held, NOW, marker=marker)
+        assert (q["action"], q["state"]) == (sup.WARN_ONLY, "PROCESS_TREE_UNKNOWN")
+        assert marker["request_id"] not in q["next_state"]["consumed_rids"]
+        assert q["next_state"]["restart_budget_hold"]["count"] == 4
+
+
+def test_masked_restart_budget_hold_is_surfaced_and_escalated() -> None:
+    held = _wrap_ready(restart_budget_relaunches=[NOW - 10] * 4,
+                       restart_budget_hold={"count": 4, "max_relaunches": 4,
+                                            "window_seconds": 3600.0, "notified_epoch": None})
+    p = _wrap_unknown_poll(held, NOW)
+    # the ownership warning is kept ...
+    assert (p["action"], p["state"]) == (sup.WARN_ONLY, "PROCESS_TREE_UNKNOWN")
+    assert p["reason"].startswith("The current wrapper identity observation")
+    # ... and the durable hold is surfaced with its pending escalation
+    assert "restart budget hold stays" in p["reason"]
+    esc = p["restart_budget_escalation"]
+    assert "restart budget exhausted for worker: 4 supervisor relaunch" in esc["message"]
+    assert esc["ack_state"]["restart_budget_hold"]["notified_epoch"] == NOW
+    # once delivered, the masked hold stays visible but is not escalated again
+    q = _wrap_unknown_poll(esc["ack_state"], NOW + 900)
+    assert "restart budget hold stays" in q["reason"]
+    assert "restart_budget_escalation" not in q
+
+
+def test_unknown_observation_restarts_the_budget_health_interval() -> None:
+    entry = _wrap_ready(restart_budget_relaunches=[NOW - 10] * 4)
+    t = NOW
+    while t < NOW + 1800:
+        p = _wrap_healthy_poll(entry, t)
+        assert p["state"] == "HEALTHY_IDLE"
+        entry, t = p["next_state"], t + 60
+    u = _wrap_unknown_poll(entry, NOW + 1800)
+    assert u["state"] == "PROCESS_TREE_UNKNOWN"
+    entry = u["next_state"]
+    assert "restart_budget_health" not in entry
+    # green again every 60 s: the refill comes a full window after the first
+    # green poll that followed the unknown one, not a window after NOW
+    start = NOW + 1860
+    for k in range(61):
+        entry = _wrap_healthy_poll(entry, start + 60 * k)["next_state"]
+        assert (entry["restart_budget_relaunches"] == []) == (k == 60), k
+
+
+def test_unobserved_gap_restarts_the_budget_health_interval() -> None:
+    spent = _ready(restart_budget_relaunches=[NOW - 10] * 4)
+    entry = _budget_poll(spent, NOW, stale=False)["next_state"]
+    assert entry["restart_budget_health"] == {"since": NOW, "seen": NOW}
+    # no observation for an hour is not an hour of health
+    entry = _budget_poll(entry, NOW + 3600, stale=False)["next_state"]
+    assert len(entry["restart_budget_relaunches"]) == 4
+    assert entry["restart_budget_health"] == {"since": NOW + 3600, "seen": NOW + 3600}
+    # a gap up to the bound (300 s here) keeps the interval; beyond it restarts it
+    kept = _budget_poll(entry, NOW + 3900, stale=False)["next_state"]
+    assert kept["restart_budget_health"]["since"] == NOW + 3600
+    lost = _budget_poll(entry, NOW + 3901, stale=False)["next_state"]
+    assert lost["restart_budget_health"]["since"] == NOW + 3901
+
+
+def test_sustained_health_for_window_refills_restart_budget() -> None:
+    spent = _ready(restart_budget_relaunches=[NOW - 4000, NOW - 3000, NOW - 2000, NOW - 1000])
+    entry, t = _healthy_for(spent, NOW, 3540)
+    assert t == NOW + 3540 and len(entry["restart_budget_relaunches"]) == 4
+    assert _budget_poll(entry, t + 60, stale=True)["action"] == sup.RESTART_BUDGET_EXHAUSTED
+    full = _budget_poll(entry, t + 60, stale=False)["next_state"]
+    assert full["restart_budget_relaunches"] == []
+    p = _budget_poll(full, t + 120, stale=True)
+    assert p["action"] == sup.STUCK_RECOVER
+    assert p["next_state"]["restart_budget_relaunches"] == [t + 120]
+
+
+def test_crash_loop_with_long_healthy_stretches_never_holds() -> None:
+    entry, plans, t = _crash_loop(_ready(), NOW, 8, healthy_for=3600.0)
+    assert [p["action"] for p in plans] == [sup.STUCK_RECOVER] * 8
+    assert _budget_poll(entry, t, stale=True)["action"] == sup.STUCK_RECOVER
+
+
+def test_restart_budget_does_not_refill_on_time_alone() -> None:
+    spent = _ready(restart_budget_relaunches=[NOW - 30 * 86_400] * 4)
+    assert _budget_poll(spent, NOW, stale=True)["action"] == sup.RESTART_BUDGET_EXHAUSTED
+
+
+def test_single_crash_still_relaunches_and_charges_budget() -> None:
+    p = _budget_poll(_ready(backoff_next_epoch=0), NOW, stale=True)
+    assert p["action"] == sup.STUCK_RECOVER
+    assert p["next_state"]["restart_budget_relaunches"] == [NOW]
+    assert "restart_budget_hold" not in p["next_state"]
+    # a launch-barrier refusal applies barrier_state, which is not charged
+    assert "restart_budget_relaunches" not in p["barrier_state"]
+
+
+def test_never_ready_give_up_unchanged_by_restart_budget() -> None:
+    # a ready seat crashes and never comes back: the readiness cap still stops
+    # it after 3 relaunches, before the 4-relaunch budget is spent
+    entry, t, actions = _ready(), NOW, []
+    for _ in range(4):
+        p = _budget_poll(entry, t, stale=True)
+        actions.append(p["action"])
+        entry, t = p["next_state"], t + 1000
+    assert actions == [sup.STUCK_RECOVER] * 3 + [sup.READINESS_GAVE_UP]
+    assert len(entry["restart_budget_relaunches"]) == 3
+    assert "restart_budget_hold" not in entry
+    # the give-up keeps precedence even when the budget is also spent
+    p = _plan_hook(_report(heartbeat_stale=True),
+                   {"agents": {"worker": _never_ready(
+                       readiness_fails=3, restart_budget_relaunches=[NOW - 10] * 4)}},
+                   snapshot=[])
+    assert (p["action"], p["state"]) == (sup.READINESS_GAVE_UP, "READINESS_GAVE_UP")
+    assert "restart_budget_hold" not in p["next_state"]
+
+
+def test_restart_budget_escalation_is_delayed_not_dropped_by_rate_limit() -> None:
+    spent = _ready(restart_budget_relaunches=[NOW - 900] * 4,
+                   restart_budget_last_notify_epoch=NOW - 10)
+    p = _budget_poll(spent, NOW, stale=True)
+    assert (p["action"], p["state"]) == (sup.NONE, "RESTART_BUDGET_EXHAUSTED")
+    assert "restart_budget_escalation" not in p
+    assert p["next_state"]["restart_budget_hold"]["notified_epoch"] is None
+    p = _budget_poll(p["next_state"], NOW + 289, stale=True)
+    assert "restart_budget_escalation" not in p
+    p = _budget_poll(p["next_state"], NOW + 290, stale=True)
+    assert p["action"] == sup.RESTART_BUDGET_EXHAUSTED and "restart_budget_escalation" in p
+    assert p["next_state"]["restart_budget_last_notify_epoch"] == NOW + 290
+    delivered = p["restart_budget_escalation"]["ack_state"]
+    assert "restart_budget_escalation" not in _budget_poll(delivered, NOW + 900, stale=True)
+
+
+@pytest.mark.parametrize("fields", [
+    pytest.param({"restart_budget_hold": "yes"}, id="non-dict-hold"),
+    pytest.param({"restart_budget_relaunches": ["x", None, True, {}]}, id="junk-entries-count"),
+])
+def test_malformed_restart_budget_state_fails_closed(fields: dict) -> None:
+    p = _budget_poll(_ready(**fields), NOW, stale=True)
+    assert p["state"] == "RESTART_BUDGET_EXHAUSTED"
+    assert p["action"] == sup.RESTART_BUDGET_EXHAUSTED
+
+
+@pytest.mark.parametrize("raw", [{}, None, "4", 4], ids=["dict", "null", "str", "int"])
+def test_malformed_relaunch_list_counts_as_spent_until_an_audited_clear(
+    tmp_path: Path,
+    raw: object,
+) -> None:
+    path = tmp_path / "supervisor-state.json"
+    sup.save_supervisor_state(path, {"agents": {"worker": _ready(restart_budget_relaunches=raw)}})
+    entry = sup.load_supervisor_state(path)["agents"]["worker"]
+    # health neither repairs nor launders it
+    entry, t = _healthy_for(entry, NOW, 7200)
+    assert entry["restart_budget_relaunches"] == raw
+    p = _budget_poll(entry, t + 60, stale=True)
+    assert (p["action"], p["state"]) == (sup.RESTART_BUDGET_EXHAUSTED, "RESTART_BUDGET_EXHAUSTED")
+    hold = p["next_state"]["restart_budget_hold"]
+    assert hold["count"] is None and hold["malformed"] is True
+    assert "an unreadable relaunch record" in p["restart_budget_escalation"]["message"]
+    # an audited restart repairs it, even with no hold yet
+    q = _budget_poll(_ready(restart_budget_relaunches=raw), NOW, stale=True,
+                     marker=_auth_marker("rr-m"))
+    assert q["action"] == sup.RELAUNCH
+    assert q["next_state"]["restart_budget_relaunches"] == []
+    assert q["next_state"]["restart_budget_cleared"]["relaunches"] is None
+
+
+def test_resolve_restart_budget_defaults_overrides_and_fallbacks() -> None:
+    default = {"max_relaunches": 4, "window_seconds": 3600.0}
+    assert sup.resolve_restart_budget({}, {}) == default
+    assert sup.resolve_restart_budget({"restart_budget": "off"}, {}) == default
+    g = {"restart_budget": {"max_relaunches": 6, "window_seconds": 7200}}
+    assert sup.resolve_restart_budget(g, {}) == {"max_relaunches": 6, "window_seconds": 7200.0}
+    a = {"restart_budget": {"max_relaunches": 2}}
+    assert sup.resolve_restart_budget(g, a) == {"max_relaunches": 2, "window_seconds": 7200.0}
+    for bad in (0, -1, 101, True, "5", 2.5, None):
+        got = sup.resolve_restart_budget({"restart_budget": {"max_relaunches": bad}}, {})
+        assert got == default, bad
+        # an invalid per-agent value falls back to the global one
+        assert sup.resolve_restart_budget(g, {"restart_budget": {"max_relaunches": bad}}) == {
+            "max_relaunches": 6, "window_seconds": 7200.0}
+    for bad in (59, 604801, True, "3600", None):
+        got = sup.resolve_restart_budget({"restart_budget": {"window_seconds": bad}}, {})
+        assert got == default, bad
+    assert sup.resolve_restart_budget(
+        {"restart_budget": {"max_relaunches": 1, "window_seconds": 60}}, {}) == {
+            "max_relaunches": 1, "window_seconds": 60.0}
+    assert sup.resolve_restart_budget(
+        {"restart_budget": {"max_relaunches": 100, "window_seconds": 604800}}, {}) == {
+            "max_relaunches": 100, "window_seconds": 604800.0}
+
+
+def test_per_agent_restart_budget_is_honoured_by_planner() -> None:
+    worker = {**_HOOK_CONFIG["agents"]["worker"],
+              "restart_budget": {"max_relaunches": 1, "window_seconds": 600}}
+    cfg = {**_HOOK_CONFIG, "agents": {"worker": worker}}
+    p = _budget_poll(_ready(), NOW, stale=True, config=cfg)
+    assert p["action"] == sup.STUCK_RECOVER
+    p = _budget_poll(p["next_state"], NOW + 1000, stale=True, config=cfg)
+    assert p["action"] == sup.RESTART_BUDGET_EXHAUSTED
+    hold = p["next_state"]["restart_budget_hold"]
+    assert (hold["max_relaunches"], hold["window_seconds"]) == (1, 600.0)
+    assert "600s" in p["reason"]
+
+
+def test_config_template_documents_restart_budget_defaults() -> None:
+    cfg = json.loads(sup.CONFIG_TEMPLATE)
+    assert sup.resolve_restart_budget(cfg, {}) == sup.resolve_restart_budget({}, {})
+    assert cfg["restart_budget"] == sup._DEFAULTS["restart_budget"]  # noqa: SLF001
+    assert "RESTART_BUDGET_EXHAUSTED" in cfg["_comment_restart_budget"]
+
+
+def test_ps_template_routes_restart_budget_hold_and_escalation() -> None:
+    ps = sup.PS_TEMPLATE
+    warn_branch = ps[ps.index("{ $_ -in 'warn_only'"):]
+    warn_branch = warn_branch[:warn_branch.index("default {")]
+    assert "'restart_budget_exhausted'" in warn_branch   # surfaced as a warning
+    assert "'clear_marker' { Complete-ClearMarker $state $name $p }" in ps
+    assert _escalation_line() == (
+        "if ($p.restart_budget_escalation) { Send-RestartBudgetEscalation "
+        "$state $name $p.restart_budget_escalation $cfg }")
+
+
+def test_request_restart_clear_restart_budget_writes_clear_marker(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    s = _team(tmp_path)
+    s.set_role("lead", "lead")
+    assert _run(["request-restart", "--for", "worker", "--from", "lead",
+                 "--clear-restart-budget", "--reason", "fixed"], tmp_path) == 0
+    m = s.read_restart_request("worker")
+    assert m["mode"] == sup.RESTART_BUDGET_CLEAR_MODE
+    assert m["authority_result"] == "authorized" and m["requested_by"] == "lead"
+    assert m["reason"] == "fixed" and m["request_id"].startswith("rr-")
+    assert "does not restart the seat" in capsys.readouterr().out
+    # it kills nothing, so the kill acknowledgements are refused with it
+    for flag in ("--force-protected", "--acknowledge-live-protected-kill"):
+        assert _run(["request-restart", "--for", "worker", "--from", "lead",
+                     "--clear-restart-budget", flag], tmp_path) == 2
+    assert s.read_restart_request("worker")["request_id"] == m["request_id"]
+    # a plain request keeps its marker shape
+    assert _run(["request-restart", "--for", "worker", "--from", "lead"], tmp_path) == 0
+    assert "mode" not in s.read_restart_request("worker")
+
+
+def test_request_restart_clear_restart_budget_requires_authority(tmp_path: Path) -> None:
+    s = _team(tmp_path)
+    s.set_role("lead", "lead")
+    assert _run(["request-restart", "--for", "worker", "--from", "worker",
+                 "--clear-restart-budget"], tmp_path) == 2
+    assert s.read_restart_request("worker") is None
+
+
+def test_ps_state_save_keeps_restart_budget_hold_and_one_entry_list(
+    tmp_path: Path,
+) -> None:
+    """The script persists next_state through ConvertFrom/ConvertTo-Json: the
+    nested hold and a ONE-entry relaunch list must come back intact."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    held, t = _held_entry()
+    one = _budget_poll(_ready(), NOW, stale=True)["next_state"]
+    assert one["restart_budget_relaunches"] == [NOW]
+    ps = sup.PS_TEMPLATE
+    helpers = ps[ps.index("# region state-helpers"):ps.index("# endregion state-helpers")]
+    state_path = tmp_path / "supervisor-state.json"
+    held_json = tmp_path / "held.json"
+    one_json = tmp_path / "one.json"
+    held_json.write_text(json.dumps(held), encoding="utf-8")
+    one_json.write_text(json.dumps(one), encoding="utf-8")
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        f"$StatePath = {_pslit(str(state_path))}",
+        "$StateBackupPath = \"$StatePath.bak\"",
+        "$KillSwitchPath = Join-Path (Split-Path -Parent $StatePath) 'supervisor.kill'",
+        "function Actions-Enabled { return $true }",
+        helpers,
+        "$state = Load-State",
+        f"Set-AgentState $state 'worker' (Get-Content -Raw {_pslit(str(held_json))} | ConvertFrom-Json)",
+        f"Set-AgentState $state 'other' (Get-Content -Raw {_pslit(str(one_json))} | ConvertFrom-Json)",
+        "Save-State $state",
+        "$state = Load-State",
+        "Save-State $state",
+    ])
+    script = tmp_path / "restart-budget-state.ps1"
+    script.write_text(harness, encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    agents = sup.load_supervisor_state(state_path)["agents"]
+    assert agents["worker"]["restart_budget_hold"] == held["restart_budget_hold"]
+    assert agents["worker"]["restart_budget_relaunches"] == held["restart_budget_relaunches"]
+    assert agents["other"]["restart_budget_relaunches"] == [NOW]
+    p = _budget_poll(agents["worker"], t + 86_400, stale=True)
+    assert (p["action"], p["state"]) == (sup.NONE, "RESTART_BUDGET_EXHAUSTED")
+
+
+@pytest.mark.parametrize("failure", ["CODEX_ACL_PREFLIGHT_FAILED", "CODEX_BUS_PERMISSION_DENIED"])
+def test_codex_access_hold_preserves_restart_budget_without_more_attempts(failure: str) -> None:
+    config = {**_HOOK_CONFIG, "agents": {"worker": {
+        **_HOOK_CONFIG["agents"]["worker"], "cli": "codex"}}}
+    launched = _budget_poll(_ready(), NOW, stale=True, config=config)
+    assert launched["action"] == sup.STUCK_RECOVER
+    entry = launched["next_state"]
+    # The executor records the ACL failure in the charged launch state.
+    entry["codex_access_hold"] = {"failure": failure, "notified": True}
+    for t in (NOW + 60, NOW + 7200):
+        p = _budget_poll(entry, t, stale=False, config=config)
+        assert (p["action"], p["state"]) == (sup.NONE, failure)
+        assert p["next_state"]["restart_budget_relaunches"] == [NOW]
+        assert "restart_budget_health" not in p["next_state"]
+        entry = p["next_state"]
+    # Manual restart cannot bypass the access hold either.
+    p = _budget_poll(entry, NOW + 7260, stale=True, config=config,
+                     marker=_auth_marker("rr-access"))
+    assert p["state"] == failure and not p["kill_targets"]
+    assert "rr-access" not in p["next_state"]["consumed_rids"]
+
+
+@pytest.mark.parametrize("failure", ["CODEX_ACL_PREFLIGHT_FAILED", "CODEX_BUS_PERMISSION_DENIED"])
+def test_budget_clear_preserves_codex_access_hold(failure: str) -> None:
+    entry, t = _held_entry()
+    entry["codex_access_hold"] = {"failure": failure, "notified": True}
+    config = {**_HOOK_CONFIG, "agents": {"worker": {
+        **_HOOK_CONFIG["agents"]["worker"], "cli": "codex"}}}
+    p = _budget_poll(entry, t, stale=True, config=config, marker=_clear_marker())
+    assert p["action"] == sup.CLEAR_MARKER and not p["kill_targets"]
+    assert "restart_budget_hold" not in p["next_state"]
+    assert p["next_state"]["restart_budget_relaunches"] == []
+    assert p["next_state"]["codex_access_hold"] == entry["codex_access_hold"]
+    q = _budget_poll(p["next_state"], t + 60, stale=True, config=config)
+    assert (q["action"], q["state"]) == (sup.NONE, failure)
+
+
+@pytest.mark.parametrize("access_delivered", [True, False])
+@pytest.mark.parametrize("budget_delivered", [True, False])
+def test_budget_escalation_preserves_codex_notification_retry(
+    tmp_path: Path, access_delivered: bool, budget_delivered: bool,
+) -> None:
+    if not _pick_powershell():
+        pytest.skip("PowerShell required")
+    entry, t = _held_entry()
+    entry["restart_budget_hold"]["notified_epoch"] = None
+    entry["codex_access_hold"] = {"failure": "CODEX_BUS_PERMISSION_DENIED", "notified": False}
+    config = {**_HOOK_CONFIG, "agents": {"worker": {
+        **_HOOK_CONFIG["agents"]["worker"], "cli": "codex"}}}
+    t += 1000
+    p = _budget_poll(entry, t, stale=True, config=config)
+    assert (p["action"], p["state"]) == (sup.WARN_ONLY, "CODEX_BUS_PERMISSION_DENIED")
+    assert "restart budget hold stays" in p["reason"]
+    assert "restart_budget_escalation" in p
+    (tmp_path / "plan.json").write_text(json.dumps(p), encoding="utf-8")
+    ps = sup.PS_TEMPLATE
+    start = ps.index("function Set-CodexAccessHold(")
+    helper = ps[start:ps.index("\nfunction ", start + 1)]
+    agents, calls, _ = _run_budget_actions(tmp_path, [
+        helper,
+        "function Invoke-CheckedSupervisorMutation($label, $arguments) { return $"
+        + str(access_delivered).lower() + " }",
+        f"$p = Get-Content -Raw {_pslit(str(tmp_path / 'plan.json'))} | ConvertFrom-Json",
+        "$name = 'worker'",
+        "$cfg = [pscustomobject]@{ notify_sender = 'supervisor'; notify_to = 'lead' }",
+        "Set-CodexAccessHold $name $p $state $p.state",
+        _escalation_line(),
+    ], stub_exit=0 if budget_delivered else 7)
+    saved = agents["worker"]
+    assert len(calls) == 1
+    assert saved["codex_access_hold"]["notified"] is access_delivered
+    assert saved["restart_budget_hold"]["notified_epoch"] == (t if budget_delivered else None)
+    later = _budget_poll(saved, t + 1000, stale=True, config=config)
+    assert later["state"] == "CODEX_BUS_PERMISSION_DENIED"
+    assert later["notify"] is not access_delivered
+    assert ("restart_budget_escalation" in later) is not budget_delivered
+    assert later["next_state"]["restart_budget_relaunches"] == entry["restart_budget_relaunches"]
 
 
 def _stub_cmd(path: Path, log: Path) -> None:
