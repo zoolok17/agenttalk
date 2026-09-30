@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### CI
+
+- **Dev gate: two pytest-xdist workers on Linux/macOS legs only (#232 probe
+  recommendation (b); Windows stays serial).** `-n 2 --dist loadgroup` is
+  added to the real pytest argv only when `AGENTTALK_DEV_GATE_POSIX_PARALLEL`
+  is set - an env var, set only by `tests.yml`'s matrix expression
+  (`matrix.os.id != 'windows'`), never by a runtime platform check inside
+  `dev_gate.py` (which runs identically on every OS; only the committed
+  `posix_parallel_args` list and whether the env var is set differ). The
+  manifest floor pin and the evidence's positional argv-shape validator both
+  enforce this as a checked fact, not just a declaration: a passing
+  Linux/macOS leg's evidence must carry `posix_parallel_args`, and a passing
+  Windows (or local) leg's evidence must NOT.
+
+  A six-round probe (#232, `ci/probe-xdist-2`, not merged) measured Linux and
+  macOS at a consistent ~1.8-2.4x pytest wall-time reduction with zero test
+  failures across every round. Windows was not shipped: even after fixing a
+  real pytest-xdist hook-ordering bug that had silently made grouping inert
+  since the probe's round 2 (`tests/conftest.py`'s `xdist_group`-adding hook
+  needs `@pytest.hookimpl(tryfirst=True)` to run before xdist's own worker-
+  side nodeid-rewrite hook - carried over here, since it also matters for
+  the Linux/macOS legs' own "pwsh"/"gateway-ports" groups), Windows's
+  speedup shrank to 1.3-1.8x with 0 of 4 Python versions fully green (a
+  PowerShell-host-startup timeout and a fixed-port gateway test both still
+  contend for real, machine-wide resources under real parallel workers, and
+  the serialized worker becomes the long pole). See #232 for the full
+  round-by-round data and the three published lessons.
+
+  **Kill signal, recorded here**: if merged Linux/macOS dev-gate runs
+  regularly save less than ~20% of pytest wall time under production CI
+  load, revert this change.
+
 ### Added
 
 - **Supervisor restart budget: a seat is never relaunched into a loop.**

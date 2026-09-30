@@ -251,6 +251,7 @@ def validate_manifest(data: Any) -> dict[str, Any]:
         "kind",
         "paths",
         "args",
+        "posix_parallel_args",
         "exclude",
         "error",
         "config",
@@ -265,6 +266,7 @@ def validate_manifest(data: Any) -> dict[str, Any]:
         "required_wheel_resources",
         "dependency_index",
         "test_requirement",
+        "xdist_requirement",
     }
     for check_id, expected_kind in REQUIRED_CONFIGURED_CHECKS.items():
         spec = _require_object(checks.get(check_id), f"checks.{check_id}")
@@ -278,7 +280,13 @@ def validate_manifest(data: Any) -> dict[str, Any]:
             raise GateBlock("manifest_schema_invalid", f"checks.{check_id}.timeout_seconds must be positive")
 
     required_contract = {
-        "pytest": {"paths": ["tests"], "args": ["-q"], "test_requirement": "pytest>=8.0"},
+        "pytest": {
+            "paths": ["tests"],
+            "args": ["-q"],
+            "posix_parallel_args": ["-p", "xdist.plugin", "-n", "2", "--dist", "loadgroup"],
+            "test_requirement": "pytest>=8.0",
+            "xdist_requirement": "pytest-xdist>=3.8.0",
+        },
         "ruff": {"paths": ["src", "tests"]},
         "bandit": {"paths": ["src"], "exclude": ["src/agenttalk/skills"]},
         "gitleaks": {"config": ".gitleaks.toml", "require_full_history": True},
@@ -536,6 +544,7 @@ def _validate_check_command(
     manifest: dict[str, Any],
     interpreter_paths: dict[str, str],
     expected_minors: list[str],
+    expected_os: str | None,
 ) -> None:
     """Require a passing check to prove the committed command shape."""
 
@@ -578,9 +587,10 @@ def _validate_check_command(
         spec = manifest["checks"]["pytest"]
         launcher = [python, "-I", "-c", _ISOLATED_TOOL_LAUNCHER, "pytest"]
         suffix_args = [*spec["args"], "-p", "no:cacheprovider", "--basetemp"]
-        valid = (
+        prefix_len = len(launcher) + 1 + len(suffix_args) + 1
+        prefix_ok = (
             item["mode"] == mode
-            and len(argv) == len(launcher) + 1 + len(suffix_args) + 1 + len(spec["paths"])
+            and len(argv) >= prefix_len
             and argv[: len(launcher)] == launcher
             and (
                 _is_absolute_path_text(argv[len(launcher)])
@@ -589,8 +599,19 @@ def _validate_check_command(
             )
             and argv[len(launcher) + 1 : len(launcher) + 1 + len(suffix_args)] == suffix_args
             and _is_absolute_path_text(argv[len(launcher) + 1 + len(suffix_args)])
-            and argv[len(launcher) + 2 + len(suffix_args) :] == spec["paths"]
         )
+        tail = argv[prefix_len:]
+        # #(ci-xdist-posix): the committed posix_parallel_args are REQUIRED
+        # in a passing Linux/macOS leg's real argv (dropping them silently
+        # is rejected, not just the manifest floor pin) - Windows/local
+        # evidence must show NEITHER shape but the plain paths, keeping
+        # "Windows stays exactly as today" an evidence-checked fact, not
+        # just a manifest declaration.
+        if expected_os in ("linux", "macos"):
+            posix_args = spec.get("posix_parallel_args", [])
+            valid = prefix_ok and bool(posix_args) and tail == [*posix_args, *spec["paths"]]
+        else:
+            valid = prefix_ok and tail == spec["paths"]
     elif check_id == "package-build":
         python = require_python(expected_minors[0])
         prefix = [
@@ -1038,6 +1059,7 @@ def validate_run_artifact(
                 manifest=manifest,
                 interpreter_paths=interpreter_paths,
                 expected_minors=expected_minors,
+                expected_os=expected_os,
             )
         elif (
             (item["exit_code"] is not None and (
@@ -2535,6 +2557,19 @@ def _run_pytest_mode(
         )
     except GateBlock as exc:
         return _blocked_record(check_id, exc.detail, logs_dir)
+    # #(ci-xdist-posix): two xdist workers on Linux/macOS only - see #232's
+    # probe for why Windows stays serial (PowerShell-host startup capacity
+    # and a fixed-port gateway test both contend under real parallel
+    # workers in ways not yet fully run to ground). Scoped entirely by
+    # tests.yml's matrix (AGENTTALK_DEV_GATE_POSIX_PARALLEL, set only for
+    # the linux/macos legs), never by a platform check here - this module
+    # runs identically on every OS; only the committed
+    # posix_parallel_args list and whether the env var is set differ.
+    posix_extra = (
+        list(spec.get("posix_parallel_args", []))
+        if os.environ.get("AGENTTALK_DEV_GATE_POSIX_PARALLEL")
+        else []
+    )
     argv = isolated_tool_argv(
         interpreter.path,
         "pytest",
@@ -2543,6 +2578,7 @@ def _run_pytest_mode(
         "no:cacheprovider",
         "--basetemp",
         str(basetemp),
+        *posix_extra,
         *spec.get("paths", []),
         candidate_import_root=import_root if mode == "source" else None,
     )
@@ -2746,6 +2782,7 @@ def _prepare_wheel_test_environment(
     for label, requirement in (
         ("candidate", str(wheel)),
         ("pytest", manifest["checks"]["pytest"]["test_requirement"]),
+        ("pytest-xdist", manifest["checks"]["pytest"]["xdist_requirement"]),
     ):
         outcome = run_command(
             check_id=f"wheel-test-install-{label}-{_python_suffix(creator.requested)}",

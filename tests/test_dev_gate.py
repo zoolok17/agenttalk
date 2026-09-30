@@ -20,7 +20,7 @@ def _manifest() -> dict:
     return json.loads(Path("dev-gate.json").read_text(encoding="utf-8"))
 
 
-def _check(check_id: str, manifest: dict, minor: str, *, status: str = "pass") -> dict:
+def _check(check_id: str, manifest: dict, minor: str, *, status: str = "pass", os_id: str | None = None) -> dict:
     kind = check_id.split("-", 1)[0]
     mode = None
     python = None
@@ -77,6 +77,7 @@ def _check(check_id: str, manifest: dict, minor: str, *, status: str = "pass") -
         argv = [tool_path, "status", "--porcelain=v1", "--untracked-files=all"]
     elif check_id.startswith("pytest-"):
         spec = manifest["checks"]["pytest"]
+        posix_args = spec.get("posix_parallel_args", []) if os_id in ("linux", "macos") else []
         argv = dev_gate.isolated_tool_argv(
             tool_path,
             "pytest",
@@ -85,6 +86,7 @@ def _check(check_id: str, manifest: dict, minor: str, *, status: str = "pass") -
             "no:cacheprovider",
             "--basetemp",
             str((Path.cwd() / "pytest-temp").resolve()),
+            *posix_args,
             *spec["paths"],
             candidate_import_root=(Path.cwd() / "src").resolve() if mode == "source" else None,
         )
@@ -259,6 +261,7 @@ def _leg_artifact(manifest: dict, leg: str, *, status: str = "pass") -> dict:
                 manifest,
                 leg.split("/", 1)[1],
                 status=status if index == 0 else "pass",
+                os_id=leg.split("/", 1)[0],
             )
             for index, check_id in enumerate(required)
         ],
@@ -435,6 +438,10 @@ def test_manifest_declares_real_ci_matrix_separately_from_local_interpreters() -
         lambda data: data["checks"].pop("semgrep"),
         lambda data: data.update({"ci_native_exceptions": []}),
         lambda data: data["checks"]["pytest"].update({"paths": ["tests/test_dev_gate.py"]}),
+        lambda data: data["checks"]["pytest"].pop("posix_parallel_args"),
+        lambda data: data["checks"]["pytest"].update({"posix_parallel_args": ["-q"]}),
+        lambda data: data["checks"]["pytest"].pop("xdist_requirement"),
+        lambda data: data["checks"]["pytest"].update({"xdist_requirement": "pytest-xdist"}),
         lambda data: data["checks"]["ruff"].update({"paths": []}),
         lambda data: data["checks"]["bandit"].update({"exclude": ["src"]}),
         lambda data: data["checks"]["gitleaks"].update({"require_full_history": False}),
@@ -480,6 +487,102 @@ def test_committed_pytest_timeout_matches_the_windows_capacity_stopgap() -> None
     source pytest killed at the old 5400s cap at 93% complete."""
     manifest = _manifest()
     assert manifest["checks"]["pytest"]["timeout_seconds"] == 7200
+
+
+@pytest.mark.parametrize("leg", ["linux/3.10", "macos/3.10"])
+def test_posix_leg_pytest_evidence_requires_the_parallel_args(leg: str) -> None:
+    """ci-xdist-posix: a passing pytest check's argv on a Linux/macOS leg
+    must genuinely carry the committed posix_parallel_args - dropping them
+    (as if the leg silently regressed to serial) must be rejected, not
+    silently accepted."""
+    manifest = dev_gate.validate_manifest(_manifest())
+    artifact = _leg_artifact(manifest, leg)
+    spec = manifest["checks"]["pytest"]
+    posix_args = spec["posix_parallel_args"]
+    # Strip EVERY pytest check's posix_parallel_args block (both source and
+    # wheel modes are required per leg) by POSITION - it sits directly
+    # before the trailing `paths`, and `list.remove()` by value is unsafe
+    # here since "-p" also appears earlier for "no:cacheprovider". Touching
+    # only one of the two would leave the other still correctly carrying
+    # the flags, which is not what this test is isolating.
+    for pytest_check in (c for c in artifact["checks"] if c["id"].startswith("pytest-")):
+        paths_start = len(pytest_check["argv"]) - len(spec["paths"])
+        posix_start = paths_start - len(posix_args)
+        assert pytest_check["argv"][posix_start:paths_start] == posix_args
+        del pytest_check["argv"][posix_start:paths_start]
+
+    with pytest.raises(dev_gate.GateBlock, match="command"):
+        dev_gate.validate_run_artifact(artifact, manifest)
+
+
+def test_windows_leg_pytest_evidence_rejects_the_posix_parallel_args() -> None:
+    """The converse: Windows stays exactly serial as an evidence-checked
+    fact, not just a manifest declaration - a Windows check record that
+    somehow carries the posix xdist flags must be rejected too."""
+    manifest = dev_gate.validate_manifest(_manifest())
+    artifact = _leg_artifact(manifest, "windows/3.10")
+    pytest_check = next(c for c in artifact["checks"] if c["id"].startswith("pytest-"))
+    spec = manifest["checks"]["pytest"]
+    paths_start = len(pytest_check["argv"]) - len(spec["paths"])
+    pytest_check["argv"][paths_start:paths_start] = spec["posix_parallel_args"]
+
+    with pytest.raises(dev_gate.GateBlock, match="command"):
+        dev_gate.validate_run_artifact(artifact, manifest)
+
+
+def test_run_pytest_mode_adds_posix_parallel_args_only_when_the_env_var_is_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ci-xdist-posix: --n/--dist are added to the real argv only when
+    AGENTTALK_DEV_GATE_POSIX_PARALLEL is set (as tests.yml does for
+    Linux/macOS legs only) - and are entirely absent, with no env var read
+    at all producing a flag, when unset (every Windows leg, every local
+    run)."""
+    interpreter = dev_gate.InterpreterInfo(
+        requested=f"{sys.version_info.major}.{sys.version_info.minor}",
+        path=Path(sys.executable).resolve(),
+        implementation="CPython",
+        version=platform.python_version(),
+    )
+    monkeypatch.setattr(dev_gate, "_probe_python_module", lambda *_a, **_k: "pytest 8.0.0")
+    monkeypatch.setattr(dev_gate, "import_probe", lambda *_a, **_k: None)
+    calls: list[list[str]] = []
+
+    def run(**kwargs):
+        calls.append(list(kwargs["argv"]))
+        log_path = kwargs["logs_dir"] / f"{kwargs['check_id']}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("collected\n", encoding="utf-8")
+        return dev_gate.CommandOutcome(
+            argv=tuple(kwargs["argv"]), returncode=0, duration_ms=1, status="pass",
+            reason_code=None, diagnostic="", log_path=log_path,
+        )
+
+    monkeypatch.setattr(dev_gate, "run_command", run)
+    manifest = _manifest()
+
+    monkeypatch.delenv("AGENTTALK_DEV_GATE_POSIX_PARALLEL", raising=False)
+    dev_gate._run_pytest_mode(
+        mode="source", interpreter=interpreter, source_root=tmp_path,
+        import_root=tmp_path / "src", env=dev_gate._base_env(tmp_path),
+        expected_version="0.78.1", manifest=manifest,
+        basetemp=tmp_path / "pytest-temp", logs_dir=tmp_path / "logs-unset",
+    )
+    assert "-n" not in calls[-1]
+    assert "--dist" not in calls[-1]
+
+    monkeypatch.setenv("AGENTTALK_DEV_GATE_POSIX_PARALLEL", "1")
+    dev_gate._run_pytest_mode(
+        mode="source", interpreter=interpreter, source_root=tmp_path,
+        import_root=tmp_path / "src", env=dev_gate._base_env(tmp_path),
+        expected_version="0.78.1", manifest=manifest,
+        basetemp=tmp_path / "pytest-temp", logs_dir=tmp_path / "logs-set",
+    )
+    argv = calls[-1]
+    assert argv.count("-p") == 2  # "no:cacheprovider" plus "xdist.plugin"
+    assert "xdist.plugin" in argv
+    assert argv[argv.index("-n") + 1] == "2"
+    assert argv[argv.index("--dist") + 1] == "loadgroup"
 
 
 def test_logical_plan_digest_is_runtime_path_independent_and_semantic() -> None:
