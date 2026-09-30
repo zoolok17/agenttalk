@@ -52,19 +52,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     get wrong - and concurrency is simply bounded rather than unbounded, so
     a real browser's overlapping requests wait briefly on a handler thread
     instead of each starting a fully redundant rescan.
+  - **Bounding concurrency alone left the WAIT unbounded.** A real
+    browser's arrivals can outpace the bound faster than scans drain on a
+    large store (measured: one full scan of the real, ~217MB/19k-file
+    store took a median of 1.7s warm, and up to 87s on a cold file-system
+    cache), and an unbounded wait piled up as blocked-but-unfinished
+    handler threads that `ThreadingMixIn`'s own reaper never collects (it
+    only prunes threads that have already returned) - trading #239's
+    unbounded MEMORY growth for unbounded HANDLE/THREAD growth instead
+    (measured directly on a real 10-minute browser run: private memory
+    flat at 334-386MB, but handles 218→775 and threads 12→122, steadily,
+    with no plateau). Closed by bounding the wait itself: acquiring a scan
+    slot now uses a short timeout (`web._SCAN_WAIT_TIMEOUT_SECONDS`,
+    3 seconds); on timeout the route answers `503` with `Retry-After: 2`
+    and a small JSON body (`{"error": "busy", "retry_after": 2}`,
+    never cached - `Cache-Control: no-store` is already sent
+    unconditionally) instead of blocking the handler thread indefinitely,
+    so the thread finishes and thread/handle count is bounded by
+    concurrency plus arrivals within the timeout window. The console's
+    existing per-endpoint in-flight guard (`guarded()` in `console2.js`,
+    pre-existing - verified, not added) already never starts a second
+    fetch of an endpoint while one is outstanding, and its existing
+    failed-read handling already keeps the last good data on screen with
+    no special error treatment for a `503` versus any other failure - a
+    real browser re-run confirms all three signals (private memory,
+    handles, threads) now stay bounded for the full 10 minutes.
   - Added regression tests:
     `test_concurrent_attention_and_lead_chat_requests_bound_scan_concurrency`
     (an HTTP-level test against a real in-process server with a slowed,
     instrumented scanner - peak concurrent scans stay at or below the
     bound and every request completes; fails against unmodified
     `origin/master`, which has no bound of any kind);
-    `test_read_after_publication_is_never_missed`,
+    `test_scan_saturation_returns_503_busy_and_thread_count_recovers`
+    (more concurrent requests than the bound get `503` within the timeout
+    while the others succeed, and thread count returns to baseline
+    afterward); `test_read_after_publication_is_never_missed`,
     `test_signing_enforcement_change_is_always_applied_fresh`, and
     `test_roster_change_is_always_applied_fresh` (event-synchronized, no
     sleep-and-hope races) pinning that a call starting after a publication
     or a signing/roster change always reflects it, while a call already in
     flight before the change legitimately keeps its own as-of-call-time
-    answer.
+    answer. Two new client-side tests in `tests/console2_data.test.mjs`
+    pin the existing (unmodified) `503`/in-flight-guard behavior.
 
 ### Added
 

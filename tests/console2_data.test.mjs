@@ -425,6 +425,41 @@ test('a stale attention read greys the page; a failed one keeps the last items',
   assert.equal(app(dom).className, 'is-stale');
 });
 
+// ------------------------------------------------- #246: server-side scan-concurrency bound
+
+test('#246: a 503 "busy" attention read keeps the last items, same as any other failure - no special error flash', async () => {
+  const srv = server({ attention: () => ({ target_root_project_id: 'proj-a', items: [ATT_ITEM({ id: 'a', title: 'Only question' })] }) });
+  const { dom, fire } = await boot(srv);
+  const before = all(stream(dom));
+  srv.attention = () => ({ __status: 503 });   // the scan-concurrency bound answering "busy"
+  await fire();
+  const after = all(stream(dom));
+  assert.ok(after.includes('Only question'), 'the previous data stays on screen');
+  assert.equal(app(dom).className, 'is-stale', 'the SAME stale treatment as any other failed read');
+  // no alarming text beyond the existing, generic "can't read" vocabulary this UI already uses
+  // for every kind of attention-read failure (500, timeout, errors-as-data, ...):
+  assert.ok(!after.includes('503') && !after.includes('busy'), 'no raw status/body text leaks into the UI');
+  srv.attention = () => ({ target_root_project_id: 'proj-a', items: [ATT_ITEM({ id: 'a', title: 'Only question' })] });
+  await fire();
+  assert.equal(app(dom).className, '', 'recovers exactly like any other transient failure');
+});
+
+test('#246: no second attention fetch starts while the busy scan bound has not answered yet', async () => {
+  const srv = server({ attention: () => ({ target_root_project_id: 'proj-a', items: [] }) });
+  const { dom, clock, fire } = await boot(srv);
+  srv.attention = () => PENDING;   // simulates a scan still waiting on the concurrency bound
+  await fire(under);               // the poll tick starts one attention request; it hangs
+  const attentionCalls = () => srv.calls.filter((u) => u.startsWith('/api/attention')).length;
+  const before = attentionCalls();
+  for (let i = 0; i < 3; i++) { clock.perf += 2000; await fire(under); }
+  assert.equal(attentionCalls(), before, 'the still-pending request is never stacked with a new one');
+  await fire(timeouts);            // the 5s client-side timeout fires, freeing the endpoint
+  clock.perf += 2000;
+  srv.attention = () => ({ target_root_project_id: 'proj-a', items: [] });
+  await fire(under);
+  assert.equal(attentionCalls(), before + 1, 'the NEXT tick issues exactly one fresh request');
+});
+
 test('attention with errors-as-data says it cannot read what needs you', async () => {
   const { dom } = await boot(server({ attention: () => ({ target_root_project_id: 'proj-a', items: [], errors: ['boom'] }) }));
   assert.ok(all(stream(dom)).includes('Can’t read what needs you.'));

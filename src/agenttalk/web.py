@@ -102,6 +102,7 @@ every JSON feed (``/api/state``, ``/api/attention``, ``/api/gates``,
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import html
 import hmac
@@ -861,6 +862,16 @@ def _scan_semaphore(store: Store) -> threading.Semaphore:
     thread (holding a thread, not a copy of scanned data) until a slot
     frees up - which is exactly the resource `_SCAN_CONCURRENCY_LIMIT` is
     sized to keep small regardless of request volume.
+
+    That wait itself must ALSO be bounded (#246 recast completion): a real
+    browser's arrivals can outpace the bound faster than scans drain on a
+    large store, and an unbounded wait would pile up blocked-but-unfinished
+    handler threads that ``ThreadingMixIn``'s own reaper never collects (it
+    only prunes threads that have ALREADY returned) - trading #239's
+    unbounded MEMORY growth for unbounded HANDLE/THREAD growth instead
+    (measured directly: private memory flat at 334-386MB, but handles
+    218->775 and threads 12->122, steadily, over a 10-minute real-browser
+    run). See ``_acquire_scan_slot``, which adds the bounded wait.
     """
     key = str(store.root)
     with _scan_semaphores_lock:
@@ -871,12 +882,45 @@ def _scan_semaphore(store: Store) -> threading.Semaphore:
         return sem
 
 
+_SCAN_WAIT_TIMEOUT_SECONDS = 3.0  # module constant (#246 recast completion)
+_SCAN_BUSY_RETRY_AFTER_SECONDS = 2
+
+
+class ScanBusy(Exception):
+    """Raised when a scan-concurrency slot could not be acquired within
+    ``_SCAN_WAIT_TIMEOUT_SECONDS`` (#246 recast completion). The route
+    dispatcher (``do_GET``) catches this and answers HTTP 503 immediately -
+    the handler thread then FINISHES (instead of blocking indefinitely),
+    which is what keeps thread/handle count bounded by concurrency plus
+    arrivals within the timeout window, rather than growing with every
+    request that ever had to wait."""
+
+    def __init__(self, retry_after: int = _SCAN_BUSY_RETRY_AFTER_SECONDS) -> None:
+        self.retry_after = retry_after
+        super().__init__("scan concurrency bound busy")
+
+
+@contextlib.contextmanager
+def _acquire_scan_slot(store: Store):
+    """Acquire a ``_scan_semaphore`` slot with a bounded wait; raise
+    ``ScanBusy`` on timeout instead of blocking the handler thread
+    indefinitely. See ``_scan_semaphore``'s docstring for why the wait
+    itself must be bounded, not just the concurrency."""
+    sem = _scan_semaphore(store)
+    if not sem.acquire(timeout=_SCAN_WAIT_TIMEOUT_SECONDS):
+        raise ScanBusy()
+    try:
+        yield
+    finally:
+        sem.release()
+
+
 def _scan_messages_with_paths_bounded(store: Store):
-    """Run the raw disk scan under the per-store-root concurrency bound
-    (#246 recast) - see ``_scan_semaphore``'s docstring for why this
-    replaces the earlier singleflight/generation designs. Always a fresh,
-    uncached scan; never shared."""
-    with _scan_semaphore(store):
+    """Run the raw disk scan under the per-store-root concurrency bound,
+    with a bounded wait (#246 recast) - see ``_scan_semaphore``'s and
+    ``_acquire_scan_slot``'s docstrings. Always a fresh, uncached scan;
+    never shared. Raises ``ScanBusy`` if no slot frees up in time."""
+    with _acquire_scan_slot(store):
         return store._scan_messages_with_paths()
 
 
@@ -2450,6 +2494,12 @@ def _collect_web_attention_items(store: Store, roster: list[str],
     if for_agent:
         try:
             items += A.needs_operator_items(_web_needs_operator(store, for_agent))
+        except ScanBusy:
+            # #246 recast completion: a busy scan-concurrency bound must
+            # answer 503 at the route level, never degrade into a
+            # per-source error item - re-raise past this source's own
+            # errors-as-data isolation so `do_GET` can handle it.
+            raise
         except Exception as e:  # noqa: BLE001
             items.append(A.source_error_item("needs_operator", str(e)))
     try:
@@ -2545,10 +2595,18 @@ def _collect_web_attention_items(store: Store, roster: list[str],
         # supervisor.build_report() call (for active ephemeral reviewers)
         # may ALSO lazily call store.valid_messages() internally, with no
         # reuse hook of its own - the surrounding semaphore still bounds it.
-        with _scan_semaphore(store):
+        with _acquire_scan_slot(store):
             valid_messages = store.valid_messages()
             snapshot = _coordination_stall.build_snapshot(store, valid_messages=valid_messages)
         items += A.coordination_stall_items(snapshot.get("items") or [])
+    except ScanBusy:
+        # #246 recast completion: re-raise past this source's own
+        # errors-as-data isolation - a busy scan-concurrency bound must
+        # answer 503 at the route level (do_GET), never degrade into a
+        # per-source error item that would let the handler thread carry on
+        # (and, worse, mask the very saturation this bound exists to
+        # surface promptly).
+        raise
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("coordination_stall", str(e)))
     return items
@@ -2828,6 +2886,12 @@ def build_attention(desc: RootDescriptor,
             "items": wire,
             "count": len(wire),
         }
+    except ScanBusy:
+        # #246 recast completion: re-raise past this route's own
+        # errors-as-data fail-safe - a busy scan-concurrency bound must
+        # answer 503 at the route level (do_GET), never degrade into a
+        # 200 "errors-as-data" body.
+        raise
     except Exception as e:  # noqa: BLE001 — errors-as-data, never a 500 (B1)
         return {
             "root": desc.label,
@@ -3775,6 +3839,12 @@ def build_lead_chat(desc: RootDescriptor, *, limit: int = _LEAD_CHAT_LIMIT) -> d
             payload["error"] = "lead_unavailable"
             payload["detail"] = liveness.get("reason") or liveness.get("detail") or ""
         return payload
+    except ScanBusy:
+        # #246 recast completion: re-raise past this route's own fail-safe
+        # JSON handling - a busy scan-concurrency bound must answer 503 at
+        # the route level (do_GET), never degrade into a 200
+        # "lead_chat_unavailable" body.
+        raise
     except Exception as e:  # noqa: BLE001 - fail-safe JSON, never a broken endpoint
         payload["error"] = "lead_chat_unavailable"
         payload["detail"] = _envelope_str(e)
@@ -3860,9 +3930,11 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False,
                        csp: str | None = None) -> None:
             self._send(status, body, "text/html; charset=utf-8", csp)
 
-        def _send_json(self, status: int, payload: Any) -> None:
+        def _send_json(self, status: int, payload: Any,
+                      *, extra_headers: dict[str, str] | None = None) -> None:
             data = json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
-            self._send(status, data, "application/json; charset=utf-8")
+            self._send(status, data, "application/json; charset=utf-8",
+                      extra_headers=extra_headers)
 
         def _json_problem(self, status: int, code: str, detail: str,
                           *, close: bool = False) -> None:
@@ -3906,6 +3978,17 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False,
                 return
             try:
                 self._route()
+            except ScanBusy as busy:
+                # #246 recast completion: answer immediately so THIS
+                # handler thread finishes rather than blocking indefinitely
+                # on a saturated scan-concurrency bound - see ScanBusy's
+                # docstring. Cache-Control: no-store is already sent
+                # unconditionally by _send() for every response.
+                self._send_json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"error": "busy", "retry_after": busy.retry_after},
+                    extra_headers={"Retry-After": str(busy.retry_after)})
+                return
             except Exception as exc:  # noqa: BLE001 — never leak a traceback to the browser
                 if _is_client_disconnect(exc):
                     self.close_connection = True

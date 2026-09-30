@@ -2750,6 +2750,88 @@ def test_concurrent_attention_and_lead_chat_requests_bound_scan_concurrency(
         server.server_close()
 
 
+def test_scan_saturation_returns_503_busy_and_thread_count_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#246 recast completion: bounding CONCURRENCY alone left the WAIT
+    unbounded - a real browser's arrivals outpacing the bound piled up as
+    blocked-but-unfinished handler threads with no plateau (measured: 218
+    -> 775 handles, 12 -> 122 threads over 10 minutes, while memory itself
+    stayed flat). This closes that: with the scan slowed well past
+    `_SCAN_WAIT_TIMEOUT_SECONDS`, firing more concurrent requests than
+    `_SCAN_CONCURRENCY_LIMIT` must not let the excess block indefinitely -
+    each gets HTTP 503 "busy" within about the timeout (with `Retry-After`
+    and the existing unconditional `Cache-Control: no-store`), and ITS OWN
+    HANDLER THREAD THEREFORE FINISHES. The others (up to the bound)
+    succeed normally. Afterwards, thread count returns to baseline - the
+    actual fix for the growth this round's own re-verification found.
+    """
+    store = _make_store(tmp_path)
+    store.send(sender="alpha", recipient="beta", body="m0")
+    real_scan = store._scan_messages_with_paths
+
+    # Long relative to the timeout (not just barely longer): concurrent
+    # requests do not all reach the semaphore at the exact same instant
+    # (connection/accept staggering), so a margin too close to the timeout
+    # makes an excess request's ACTUAL wait borderline and racy. A scan
+    # several times longer than the timeout keeps every excess request's
+    # wait reliably well past it regardless of arrival staggering.
+    slow_seconds = web._SCAN_WAIT_TIMEOUT_SECONDS * 3
+
+    def slow_scan(*args, **kwargs):
+        time.sleep(slow_seconds)
+        return real_scan(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_scan_messages_with_paths", slow_scan)
+
+    server, thread, base = _serve(store)
+    try:
+        baseline_threads = threading.active_count()
+        concurrency = web._SCAN_CONCURRENCY_LIMIT + 2
+        results: list[tuple] = []
+        results_lock = threading.Lock()
+
+        def fire(_i: int) -> None:
+            start = time.time()
+            req = urllib.request.Request(f"{base}/api/attention")
+            try:
+                with _urlopen(req, timeout=slow_seconds + 15) as resp:
+                    status, headers = resp.status, resp.headers
+            except urllib.error.HTTPError as exc:
+                status, headers = exc.code, exc.headers
+            elapsed = time.time() - start
+            with results_lock:
+                results.append((status, headers, elapsed))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+            list(pool.map(fire, range(concurrency)))
+
+        busy = [r for r in results if r[0] == 503]
+        ok = [r for r in results if r[0] == 200]
+        assert len(ok) == web._SCAN_CONCURRENCY_LIMIT, (
+            f"expected exactly {web._SCAN_CONCURRENCY_LIMIT} requests to succeed, got {len(ok)}")
+        assert len(busy) == concurrency - web._SCAN_CONCURRENCY_LIMIT, (
+            f"expected the remaining {concurrency - web._SCAN_CONCURRENCY_LIMIT} requests "
+            f"to get 503 busy, got {len(busy)}")
+        for _status, headers, elapsed in busy:
+            assert headers.get("Retry-After") is not None, "503 busy must carry Retry-After"
+            assert headers.get("Cache-Control") == "no-store"
+            assert elapsed < web._SCAN_WAIT_TIMEOUT_SECONDS + 5, (
+                f"a busy response took {elapsed:.1f}s - the handler thread was not "
+                f"released promptly")
+
+        # Thread count must return to baseline once the slow "ok" scans finish too.
+        deadline = time.time() + slow_seconds + 15
+        while threading.active_count() > baseline_threads and time.time() < deadline:
+            time.sleep(0.05)
+        assert threading.active_count() <= baseline_threads + 1, (
+            f"thread count did not return to baseline: {threading.active_count()} "
+            f"vs baseline {baseline_threads}")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_read_after_publication_is_never_missed(tmp_path: Path) -> None:
     """#246 (both the round-1 generation-check and the recast that replaced
     it address this): a request that starts AFTER a message was
