@@ -4,8 +4,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -355,9 +357,75 @@ def _initialize_gateway(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     )
 
 
+def _wait_for_free_bind(host: str, port: int, *, timeout: float = 3.0) -> None:
+    """PROBE (#232 round 4): under `--dist loadgroup`, this test now runs
+    directly adjacent (same worker, same process, no inter-test gap) to
+    other real-port-touching gateway tests it never used to be scheduled
+    next to under `--dist loadfile`/serial - a just-terminated predecessor's
+    subprocess teardown (OS socket-handle release) can still be draining by
+    the time this test's own setup runs. That is a genuine, BOUNDED timing
+    race on a loaded multi-worker runner, not stale product state, so the
+    TEST retries its own precondition wait - the product's own
+    reconfigure_endpoint/rebind_runtime/run_service refusal (their own
+    _both_sockets_free() call) is completely untouched and stays exactly as
+    strict; this only widens how long the TEST is willing to wait before
+    treating "still occupied" as a real, reportable failure."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            service.exclusive_bind_probe(host, port)
+            return
+        except service.GatewayConfigError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
 def _assert_ports_free() -> None:
-    service.exclusive_bind_probe(service.PUBLIC_HOST, service.PUBLIC_PORT)
-    service.exclusive_bind_probe(service.INTERNAL_HOST, service.INTERNAL_PORT)
+    _wait_for_free_bind(service.PUBLIC_HOST, service.PUBLIC_PORT)
+    _wait_for_free_bind(service.INTERNAL_HOST, service.INTERNAL_PORT)
+
+
+def test_wait_for_free_bind_retries_through_a_transient_occupant() -> None:
+    """#232 round 4 regression: a port occupied for a MOMENT and then
+    genuinely released must not fail the caller - exactly the shape of the
+    CI race (a just-terminated predecessor's socket handle still draining).
+    Uses an OS-assigned ephemeral port, never the real fixed gateway ports,
+    so this is safe to run on any machine, including one where a real
+    gateway happens to already own 4000/4001."""
+    occupant = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    occupant.bind(("127.0.0.1", 0))
+    occupant.listen(1)
+    port = occupant.getsockname()[1]
+
+    def release() -> None:
+        time.sleep(0.2)
+        occupant.close()
+
+    releaser = threading.Thread(target=release, daemon=True)
+    releaser.start()
+    try:
+        _wait_for_free_bind("127.0.0.1", port, timeout=3.0)  # must NOT raise
+    finally:
+        releaser.join(timeout=5)
+
+
+def test_wait_for_free_bind_still_fails_closed_when_never_released() -> None:
+    """The retry is bounded, not infinite or silently permissive: a port
+    that stays occupied for the WHOLE window still raises, exactly like the
+    product's own bind-probe - the fail-closed guarantee this fix must
+    never weaken."""
+    occupant = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    occupant.bind(("127.0.0.1", 0))
+    occupant.listen(1)
+    port = occupant.getsockname()[1]
+    try:
+        started = time.monotonic()
+        with pytest.raises(service.GatewayConfigError):
+            _wait_for_free_bind("127.0.0.1", port, timeout=0.3)
+        assert time.monotonic() - started >= 0.3
+    finally:
+        occupant.close()
 
 
 def test_real_process_rebind_serializes_reconfigure_without_stale_manifest_write(
