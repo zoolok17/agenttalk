@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Supervisor restart budget: a seat is never relaunched into a loop.**
+  Backoff only slows relaunches down, and the readiness give-up stops only a
+  seat that never becomes ready. So a seat that became ready and then crashed
+  again was relaunched forever. Each seat now has a durable restart budget:
+  at most `max_relaunches` (default 4) automatic relaunches until the seat
+  has been continuously healthy for `window_seconds` (default 3600), which
+  refills it. Time alone never refills it.
+
+  When a relaunch is due and the budget is spent, the supervisor does not
+  relaunch. It holds the seat in the new sticky `RESTART_BUDGET_EXHAUSTED`
+  state and sends ONE escalation note to `notify_to`, naming the seat, the
+  relaunch count and the window. The note is rate-limited by
+  `suspect_warn_interval_seconds`, which delays it but never drops it.
+
+  Neither health nor time lifts the hold. It clears only on an audited
+  request by the operator-facing liaison or sole lead:
+  - `agenttalk request-restart --for <seat>` relaunches now; that relaunch is
+    not charged to the budget;
+  - the new `agenttalk request-restart --for <seat> --clear-restart-budget`
+    re-arms the budget without killing or launching anything.
+
+  The budget, the hold and the last clear's audit record are persisted in
+  `supervisor-state.json`, so restarting the supervisor does not reset a
+  crash loop. A launch-barrier refusal costs no budget. Set `restart_budget`
+  globally or per agent in `supervisor.json`; out-of-range values fall back
+  and cannot switch the budget off. Backoff, the readiness give-up (which
+  keeps precedence) and the one-wrapper barrier are unchanged.
+
 ### Removed
 
 - **spec-kitty support (operator decision, 2026-09-28).** The retired

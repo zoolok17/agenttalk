@@ -75,7 +75,10 @@ CLEAR_MARKER = "clear_marker"    # a consumed restart marker on a now-healthy ag
 SNAPSHOT_UNAVAILABLE = "snapshot_unavailable"  # legacy token; no longer emitted by heartbeat liveness
 READINESS_FAILED = "readiness_failed"  # legacy token; folded into stale heartbeat recovery
 READINESS_GAVE_UP = "readiness_gave_up"  # never-ready past the retry cap - STOP relaunching, await operator
+RESTART_BUDGET_EXHAUSTED = "restart_budget_exhausted"  # relaunch budget spent - STOP relaunching, escalate once
 NONE = "none"                    # healthy, nothing to do
+# restart-request marker mode that re-arms the restart budget without a relaunch
+RESTART_BUDGET_CLEAR_MODE = "clear_restart_budget"
 EPHEMERAL_LAUNCH = eph.ACTION_LAUNCH
 EPHEMERAL_DENY = eph.ACTION_DENY
 EPHEMERAL_COMPLETE = eph.ACTION_COMPLETE
@@ -117,6 +120,9 @@ _DEFAULTS = {
     "restart_cooldown_seconds": 45,        # manual restarts bypass backoff, not every-poll churn
     "max_readiness_retries": 3,            # never-ready relaunches before READINESS_GAVE_UP (no infinite churn)
     "backoff": {"base_seconds": 30, "cap_seconds": 900, "reset_after_seconds": 180},
+    # at most max_relaunches supervisor relaunches until the seat has been
+    # continuously healthy for window_seconds; the next one is held for an operator.
+    "restart_budget": {"max_relaunches": 4, "window_seconds": 3600},
     "health": {"ttl_seconds": health_model.DEFAULT_TTL_SECONDS,
                "heartbeat_skew_seconds": health_model.DEFAULT_HEARTBEAT_SKEW_SECONDS},
     # dead-letter caps (wrapper-owned; the supervisor only carries the config so the
@@ -1056,6 +1062,29 @@ def resolve_health_timing(config: dict, cfg_agent: dict) -> dict:
         "heartbeat_skew_seconds": _pick(
             "heartbeat_skew_seconds", "health_heartbeat_skew_seconds"),
     }
+
+
+def resolve_restart_budget(config: dict, cfg_agent: dict) -> dict:
+    """Resolve the per-seat restart budget.
+
+    Per-agent ``restart_budget`` keys win over the global block. A missing or
+    out-of-range value falls back to the next source, never to "unlimited":
+    the budget cannot be switched off.
+    """
+    out = dict(_DEFAULTS["restart_budget"])
+    config = config if isinstance(config, dict) else {}
+    cfg_agent = cfg_agent if isinstance(cfg_agent, dict) else {}
+    for src in (config.get("restart_budget"), cfg_agent.get("restart_budget")):
+        if not isinstance(src, dict):
+            continue
+        n = src.get("max_relaunches")
+        if isinstance(n, int) and not isinstance(n, bool) and 1 <= n <= 100:
+            out["max_relaunches"] = n
+        w = src.get("window_seconds")
+        if isinstance(w, (int, float)) and not isinstance(w, bool) and 60 <= w <= 604800:
+            out["window_seconds"] = w
+    return {"max_relaunches": int(out["max_relaunches"]),
+            "window_seconds": float(out["window_seconds"])}
 
 
 def project_coordination_availability(
@@ -9050,6 +9079,9 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     grace_seconds = float(config.get("launch_grace_seconds", _DEFAULTS["launch_grace_seconds"]))
     max_readiness_retries = int(config.get(
         "max_readiness_retries", _DEFAULTS["max_readiness_retries"]))
+    restart_budget = resolve_restart_budget(config, cfg_agent)
+    budget_max = restart_budget["max_relaunches"]
+    budget_window = restart_budget["window_seconds"]
     raw_restart_cooldown = config.get(
         "restart_cooldown_seconds", _DEFAULTS["restart_cooldown_seconds"])
     restart_cooldown = (
@@ -9152,6 +9184,18 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     backoff_next = float(st.get("backoff_next_epoch", 0.0) or 0.0)
     healthy_since = st.get("healthy_since")
     last_warn = float(st.get("last_warn_epoch", 0.0) or 0.0)
+    # Restart budget: every entry counts, even a malformed one, and any
+    # non-null hold is held, so a damaged state file fails closed.
+    raw_budget = st.get("restart_budget_relaunches")
+    budget_relaunches = list(raw_budget) if isinstance(raw_budget, list) else []
+    raw_hold = st.get("restart_budget_hold")
+    budget_hold = None if raw_hold is None else (raw_hold if isinstance(raw_hold, dict) else {})
+    raw_notify = st.get("restart_budget_last_notify_epoch")
+    budget_last_notify = (
+        float(raw_notify)
+        if isinstance(raw_notify, (int, float)) and not isinstance(raw_notify, bool)
+        else 0.0
+    )
 
     brain_pid = liveness.get("brain_pid")
     brain_start = liveness.get("brain_start")
@@ -9327,6 +9371,15 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         == WrapRecognitionStatus.UNKNOWN.value
     ):
         nxt["wrapper_recognition"] = copy.deepcopy(wrapper_recognition)
+    # The restart budget is persisted here so a supervisor restart cannot
+    # reset a crash loop. Written only once a seat has used it.
+    if "restart_budget_relaunches" in st:
+        nxt["restart_budget_relaunches"] = copy.deepcopy(budget_relaunches)
+    if budget_hold is not None:
+        nxt["restart_budget_hold"] = copy.deepcopy(budget_hold)
+    for key in ("restart_budget_last_notify_epoch", "restart_budget_cleared"):
+        if key in st:
+            nxt[key] = copy.deepcopy(st[key])
 
     def _relaunch_state() -> None:
         nf = fails + 1
@@ -9424,7 +9477,57 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
             nxt["healthy_since"] = now_epoch
         elif fails and (now_epoch - float(healthy_since)) >= reset_after:
             nxt["consecutive_fails"], nxt["backoff_next_epoch"] = 0, 0.0
+        if budget_hold is not None:
+            # Health never lifts a hold, however long it lasts.
+            reason = (f"{reason}; restart budget hold stays until an audited "
+                      "request-restart or --clear-restart-budget")
+        elif (budget_relaunches and healthy_since is not None
+              and (now_epoch - float(healthy_since)) >= budget_window):
+            nxt["restart_budget_relaunches"] = []
         return _result(NONE, state=state, reason=reason)
+
+    def _budget_hold_result() -> dict:
+        hold = nxt["restart_budget_hold"]
+
+        def _num(key: str, default: float) -> float:
+            v = hold.get(key)
+            return v if isinstance(v, (int, float)) and not isinstance(v, bool) else default
+
+        count = _num("count", len(budget_relaunches))
+        window = _num("window_seconds", budget_window)
+        reason = (
+            f"restart budget exhausted for {name}: {count:.0f} supervisor relaunch(es) "
+            f"without {window:.0f}s of continuous health (budget "
+            f"{_num('max_relaunches', budget_max):.0f} per {window:.0f}s window); "
+            "STOPPED relaunching until an audited "
+            f"`agenttalk request-restart --for {name}` (relaunch now) or "
+            f"`agenttalk request-restart --for {name} --clear-restart-budget` "
+            "(re-arm only)"
+        )
+        # ONE escalation per hold, delayed (never dropped) by the rate limit.
+        if hold.get("notified_epoch") is None and now_epoch - budget_last_notify >= suspect_interval:
+            hold["notified_epoch"] = now_epoch
+            nxt["restart_budget_last_notify_epoch"] = now_epoch
+            return _result(RESTART_BUDGET_EXHAUSTED, state="RESTART_BUDGET_EXHAUSTED",
+                           notify=True, reason=reason)
+        return _result(NONE, state="RESTART_BUDGET_EXHAUSTED", reason=reason)
+
+    def _clear_restart_budget(req: dict, rid: str, *, via: str, always: bool) -> None:
+        # The only way a hold clears: an audited restart-request marker.
+        held = nxt.pop("restart_budget_hold", None)
+        if held is None and not budget_relaunches and not always:
+            return
+        nxt["restart_budget_relaunches"] = []
+        nxt["restart_budget_cleared"] = {
+            "request_id": rid,
+            "via": via,
+            "requested_by": req.get("requested_by"),
+            "authorized_by": req.get("authorized_by"),
+            "reason": req.get("reason") if isinstance(req.get("reason"), str) else "",
+            "at_epoch": now_epoch,
+            "was_held": held is not None,
+            "relaunches": len(budget_relaunches),
+        }
 
     if (
         wrapped
@@ -9534,12 +9637,24 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
             return _result(REFUSE_PROTECTED, state="RESTART_UNAUTHORIZED",
                            notify=True,
                            reason="restart-request has no valid authorization marker")
+        budget_clear = marker.get("mode") == RESTART_BUDGET_CLEAR_MODE
+        if budget_clear and rid not in consumed:
+            # Operator clear: re-arm the budget, kill nothing, launch nothing.
+            # A still-dead seat relaunches on a later poll under a fresh budget.
+            # Once consumed it is handled like a consumed restart marker below,
+            # so a marker that failed to clear never blocks recovery.
+            nxt["consumed_rids"] = [*consumed, rid]
+            _clear_restart_budget(marker, rid, via=RESTART_BUDGET_CLEAR_MODE, always=True)
+            return _result(CLEAR_MARKER, state="RESTART_BUDGET_CLEARED", clear_marker=rid,
+                           reason=f"restart budget cleared by {rid} "
+                                  f"(requested_by={marker.get('requested_by')}); no relaunch "
+                                  "from this request")
         force_authorized = (
             marker.get("force_protected_authorized") is True
             and isinstance(marker.get("force_protected_authorized_by"), str)
             and marker.get("force_protected_still_authorized", True) is True
         )
-        if protected and not force_authorized:
+        if protected and not force_authorized and not budget_clear:
             nxt["last_warn_epoch"] = now_epoch
             return _result(REFUSE_PROTECTED, state="REFUSE_PROTECTED",
                            notify=True, reason="restart of a protected agent requires "
@@ -9567,6 +9682,8 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
             kt = _targets(include_launcher=True)
             _relaunch_state()
             nxt["readiness_fails"] = 0   # operator restart CLEARS a readiness give-up
+            # ...and re-arms the restart budget; this relaunch is not charged to it.
+            _clear_restart_budget(marker, rid, via="request_restart", always=False)
             nxt["restart_request_state"] = "applied_pending_readiness"
             nxt["pending_restart_request_id"] = rid
             nxt["restart_requested_by"] = marker.get("requested_by")
@@ -9989,6 +10106,10 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                                notify=unsafe_low_codex, reason=warn_reason)
             return _result(NONE, state="ACTIVE_OR_BUSY",
                            reason="suspect (warn rate-limited)")
+        # RESTART BUDGET HOLD: sticky until an audited restart-request or
+        # operator clear (section 0); neither backoff expiry nor health lifts it.
+        if budget_hold is not None:
+            return _budget_hold_result()
         # READINESS GIVE-UP CAP (0.31.2 / codex Fix A): a relaunch of an agent that
         # has NOT reached readiness since its last launch (launching + never a fresh
         # heartbeat) is a READINESS-failure relaunch - a resume that never re-enters
@@ -10012,10 +10133,29 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                                    notify=True, reason=give_up_reason)
                 return _result(NONE, state="READINESS_GAVE_UP",
                                reason="readiness gave up (warn rate-limited)")
+            # RESTART BUDGET: an additional bound on top of backoff and the
+            # readiness cap. It catches the seat that reaches readiness and
+            # then crashes again, which neither of those ever stops.
+            if len(budget_relaunches) >= budget_max:
+                numeric = [x for x in budget_relaunches
+                           if isinstance(x, (int, float)) and not isinstance(x, bool)]
+                nxt["restart_budget_hold"] = {
+                    "since_epoch": now_epoch,
+                    "count": len(budget_relaunches),
+                    "max_relaunches": budget_max,
+                    "window_seconds": budget_window,
+                    "first_relaunch_epoch": min(numeric) if numeric else None,
+                    "last_relaunch_epoch": max(numeric) if numeric else None,
+                    "notified_epoch": None,
+                }
+                return _budget_hold_result()
             kt = _targets(include_launcher=True)
             barrier_state = _barrier_backoff_state()
             _relaunch_state()
             nxt["readiness_fails"] = (readiness_fails + 1) if never_ready else 1
+            # Charged only in next_state: a launch-barrier refusal applies
+            # barrier_state instead and costs no budget.
+            nxt["restart_budget_relaunches"] = [*budget_relaunches, now_epoch]
             return _result(STUCK_RECOVER, state=child_recovery_state or "STUCK_OR_DEAD",
                            kill_first=bool(kt), kill_orphans=True,
                            kill_targets=kt,
@@ -12190,6 +12330,8 @@ CONFIG_TEMPLATE = """\
   "_comment_max_readiness_retries": "After this many relaunches of an agent that NEVER reaches readiness (no first heartbeat - e.g. a manual resume that does not re-enter the listen loop), the supervisor STOPS relaunching and surfaces READINESS_GAVE_UP (warn/notify, no kill) instead of churning forever. Reset by a fresh heartbeat or an operator restart/clear. A WRAPPED agent avoids this class entirely (the wrapper owns the heartbeat regardless of the model prompt) - prefer wrapped for hands-off supervision.",
   "claude_permission_mode": "bypassPermissions",
   "backoff": { "base_seconds": 30, "cap_seconds": 900, "reset_after_seconds": 180 },
+  "restart_budget": { "max_relaunches": 4, "window_seconds": 3600 },
+  "_comment_restart_budget": "At most max_relaunches automatic relaunches of a seat until it has been continuously healthy for window_seconds (which refills the budget). The next relaunch is refused: the seat is held in RESTART_BUDGET_EXHAUSTED and notify_to gets ONE escalation. Neither health nor time lifts the hold; only `agenttalk request-restart --for <seat>` (relaunch now) or `agenttalk request-restart --for <seat> --clear-restart-budget` (re-arm only), by the operator-facing liaison or sole lead. A per-agent restart_budget overrides these; out-of-range values (max_relaunches 1-100, window_seconds 60-604800) fall back. The budget is persisted in supervisor-state.json, so restarting the supervisor does not reset it.",
   "notify_sender": null,
   "notify_to": null,
   "ephemeral_reviewers": {
@@ -14802,11 +14944,11 @@ $pollNum = 0
     # no-action agent logs only when its state CHANGES (first sight + transitions),
     # so the window shows events without one HEALTHY line per poll. The warning
     # actions (warn_only / suspect_warn / refuse_protected / snapshot_unavailable /
-    # readiness_gave_up) are announced by their OWN Write-Warning below - skip them here so a warning
+    # readiness_gave_up / restart_budget_exhausted) are announced by their OWN Write-Warning below - skip them here so a warning
     # action is logged ONCE, not twice. -Quiet suppresses ALL console output (this
     # log AND the warnings below); the bus notify still fires.
     if (-not $Quiet) {
-      if (($p.action -ne 'none') -and ('warn_only','suspect_warn','refuse_protected','snapshot_unavailable','readiness_gave_up' -notcontains $p.action)) {
+      if (($p.action -ne 'none') -and ('warn_only','suspect_warn','refuse_protected','snapshot_unavailable','readiness_gave_up','restart_budget_exhausted' -notcontains $p.action)) {
         Write-Host ("supervisor: {0}: {1} -> {2}: {3}" -f $name, $p.state, $p.action, $p.reason)
       } elseif (($p.action -eq 'none') -and ($lastLogged[$name] -ne $p.state)) {
         Write-Host ("supervisor: {0}: {1} ({2})" -f $name, $p.state, $p.reason)
@@ -14975,7 +15117,7 @@ $pollNum = 0
       }
       'clear_marker' { if ($p.clear_marker -and (Assert-ActionsEnabled ("clear-restart {0}" -f $name))) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }; Set-AgentState $state $name $p.next_state }
       'refuse_protected' { Write-Warning ("supervisor: {0}: {1}" -f $name, $p.reason); if ($p.clear_marker -and (Assert-ActionsEnabled ("clear-restart {0}" -f $name))) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }; Set-AgentState $state $name $p.next_state }
-      { $_ -in 'warn_only','suspect_warn','snapshot_unavailable','readiness_gave_up' } {
+      { $_ -in 'warn_only','suspect_warn','snapshot_unavailable','readiness_gave_up','restart_budget_exhausted' } {
         Write-Warning ("supervisor: {0}: {1}" -f $name, $p.reason)
         if ($p.notify -and $cfg.notify_sender -and $cfg.notify_to -and (Assert-ActionsEnabled ("notify {0}" -f $name))) {
           & $AgenttalkCmd --root $Root send --from $cfg.notify_sender --to $cfg.notify_to --kind note -m ("supervisor: {0}: {1}" -f $name, $p.reason) --quiet | Out-Null

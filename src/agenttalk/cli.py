@@ -10936,6 +10936,13 @@ def cmd_request_restart(args: argparse.Namespace) -> int:
                          f"roster {sorted(roster)}\n")
         return 2
     from agenttalk import supervisor as _sup
+    clear_budget = bool(getattr(args, "clear_restart_budget", False))
+    if clear_budget and (args.force_protected
+                         or getattr(args, "acknowledge_live_protected_kill", False)):
+        sys.stderr.write("agenttalk request-restart: --clear-restart-budget only "
+                         "re-arms the restart budget and kills nothing; drop "
+                         "--force-protected/--acknowledge-live-protected-kill.\n")
+        return 2
     requested_by = _resolve_self(args.sender, roster=roster)
     authority = _sup.resolve_restart_request_authority(
         store,
@@ -10970,7 +10977,16 @@ def cmd_request_restart(args: argparse.Namespace) -> int:
             "acknowledge_live_protected_kill_by"),
         "reason": args.reason or "",
     }
+    if clear_budget:
+        marker["mode"] = _sup.RESTART_BUDGET_CLEAR_MODE
     store.write_restart_request(agent, marker)
+    if clear_budget:
+        print(
+            f"request-restart: queued restart-budget clear for {agent!r} [{rid}]; "
+            "the supervisor re-arms the budget when it assesses the request and "
+            "does not restart the seat for it."
+        )
+        return 0
     extra = " (force-protected)" if args.force_protected else ""
     blocked = False
     try:
@@ -16060,6 +16076,12 @@ def build_parser() -> argparse.ArgumentParser:
                      dest="acknowledge_live_protected_kill", action="store_true",
                      help="Second operator-facing acknowledgement required before a "
                           "freshly heartbeating protected agent is killed.")
+    prr.add_argument("--clear-restart-budget", dest="clear_restart_budget",
+                     action="store_true",
+                     help="Re-arm the agent's restart budget (lifts a "
+                          "RESTART_BUDGET_EXHAUSTED hold) without restarting it; "
+                          "the supervisor relaunches a still-dead agent on a later "
+                          "poll under a fresh budget.")
     prr.set_defaults(func=cmd_request_restart)
 
     pcg = sub.add_parser(
