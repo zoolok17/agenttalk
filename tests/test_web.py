@@ -2688,7 +2688,19 @@ def test_concurrent_attention_and_lead_chat_requests_bound_scan_concurrency(
     directly: no bound of any kind exists there, so N concurrent requests
     produce peak concurrency == N); GREEN with `_scan_semaphore`'s bound in
     place.
+
+    This test measures ONLY the concurrency bound - it asserts zero request
+    failures, which is a DIFFERENT contract from the later bounded-wait
+    tests (`test_scan_saturation_returns_503_busy_and_thread_count_recovers`
+    et al.), which deliberately exceed the wait and expect some requests to
+    get a busy 503. On a slow CI runner (observed: macOS CI, both 3.11 and
+    3.13), 12 requests queued 6-deep behind a bound of 2 can legitimately
+    take longer than `_SCAN_WAIT_TIMEOUT_SECONDS` (3s) to each get a turn,
+    which made this test intermittently red for a reason that has nothing
+    to do with what it checks. Patch the wait timeout high so this test
+    isolates the concurrency bound from the separately-tested wait bound.
     """
+    monkeypatch.setattr(web, "_SCAN_WAIT_TIMEOUT_SECONDS", 120.0)
     store = _make_store(tmp_path)
     store.set_role("alpha", "lead")
     for i in range(10):
@@ -2842,7 +2854,16 @@ def test_validation_stays_inside_the_scan_concurrency_bound(
     was released. ``_scan_and_validate_bounded`` now holds ONE permit across
     both steps; slow ``validate_scanned_rows`` directly (not the scan) and
     confirm peak concurrent validator calls never exceeds the bound.
+
+    Like `test_concurrent_attention_and_lead_chat_requests_bound_scan_
+    concurrency`, this measures ONLY the concurrency bound and asserts zero
+    request failures - a queued request waiting its turn behind the bound
+    on a sufficiently slow CI runner could otherwise legitimately exceed
+    `_SCAN_WAIT_TIMEOUT_SECONDS` (3s) and get a busy 503, which would be
+    a false failure here, not a real one (macOS CI red on the sibling test,
+    2026-09-30). Patch the wait timeout high for the same reason.
     """
+    monkeypatch.setattr(web, "_SCAN_WAIT_TIMEOUT_SECONDS", 120.0)
     store = _make_store(tmp_path)
     for i in range(5):
         store.send(sender="alpha", recipient="beta", body=f"m{i}")
