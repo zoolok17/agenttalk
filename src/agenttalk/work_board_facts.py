@@ -45,9 +45,9 @@ def _norm(path):
 def _time(text):
     try:
         value = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except (AttributeError, TypeError, ValueError):
+        return value.astimezone(timezone.utc) if value.tzinfo else None
+    except (AttributeError, TypeError, ValueError, OverflowError):
         return None
-    return value.astimezone(timezone.utc) if value.tzinfo else None
 
 
 def repo_aliases(cfg):
@@ -86,6 +86,24 @@ def repo_aliases(cfg):
         problems.append("more than one work_repos alias is marked default")
     default = defaults[0] if len(defaults) == 1 and defaults[0] in aliases else None
     return aliases, default, problems
+
+
+def resolve_binding(binding, aliases, default):
+    """(alias, approved target refs, None) for an item's CURRENT binding, or (None, [], reason).
+
+    The binding is the item's declared work_repo/work_target, else the current default."""
+    if binding == "ambiguous":
+        return None, [], "conflicting repository declarations"
+    binding = binding if isinstance(binding, dict) else {}
+    alias = binding.get("repo") or default
+    if alias not in aliases:
+        return None, [], (f"repository {alias!r} is not an approved work_repos alias" if alias
+                          else "no default work_repos alias is configured")
+    declared = binding.get("target")
+    targets = [ref for ref in aliases[alias]["targets"] if declared in (None, ref, ref.removeprefix("refs/heads/"))]
+    if not targets:
+        return None, [], f"target {declared!r} is not approved for {alias}"
+    return alias, targets, None
 
 
 def max_age_seconds(cfg):
@@ -184,14 +202,10 @@ def verify_merges(store, *, now=None, dry_run=False):
     aliases, default, problems = repo_aliases(cfg)
     project, opened, facts, unknown = store.project_id(), {}, [], []
     for item in _candidates(store, cfg):
-        slug, candidate, binding = item["work_item"], item["candidate"], item.get("repo_binding")
-        if binding == "ambiguous":
-            unknown.append((slug, "conflicting repository declarations"))
-            continue
-        alias = (binding or {}).get("repo") or default
-        if alias not in aliases:
-            unknown.append((slug, f"repository {alias!r} is not an approved work_repos alias" if alias
-                            else "no default work_repos alias is configured"))
+        slug, candidate = item["work_item"], item["candidate"]
+        alias, targets, reason = resolve_binding(item.get("repo_binding"), aliases, default)
+        if alias is None:
+            unknown.append((slug, reason))
             continue
         if alias not in opened:
             opened[alias] = _open_repo(aliases[alias])
@@ -201,11 +215,9 @@ def verify_merges(store, *, now=None, dry_run=False):
         if repo is None:
             unknown.append((slug, reason))
             continue
-        declared = (binding or {}).get("target")
-        chosen = {ref: oid for ref, oid in repo[1].items()
-                  if declared in (None, ref, ref.removeprefix("refs/heads/"))}
+        chosen = {ref: oid for ref, oid in repo[1].items() if ref in targets}
         if not chosen:
-            unknown.append((slug, f"target {declared!r} is not approved for {alias}"))
+            unknown.append((slug, "no approved target of this item resolved"))
         for ref, target_oid in sorted(chosen.items()):
             result = _probe(repo[0], candidate, target_oid)
             if result is None:  # one timeout stops this checkout: never a probe storm
@@ -266,34 +278,63 @@ def _valid_fact(fact):
 
 
 def load_integration(store, cfg, *, now):
-    """Server side, no Git: return (integrated, stale, warnings) for work_board_feed.build.
+    """Server side, no Git: the evidence integration_for() selects from. Never raises,
+    because optional evidence must never take the board down; any fault is a warning."""
+    try:
+        return _load_integration(store, cfg, now)
+    except Exception as exc:  # noqa: BLE001 - the board projects without this evidence
+        return {"facts": [], "config": cfg, "warnings": [f"integration facts unusable ({type(exc).__name__})"]}
 
-    integrated maps (work_item, candidate) to a fact summary (truthy: merged) or False.
-    A stale fact, or one whose alias/target mapping no longer matches config, is never
-    passed on; stale ones only label the card. Any file problem means no facts."""
+
+def _load_integration(store, cfg, now):
     aliases = repo_aliases(cfg)[0]
     doc, warning = _read(store.state_dir / FACTS_FILE)
     if doc is None:
         unconfigured = warning.startswith("integration facts missing") and "work_repos" not in cfg
-        return {}, {}, [] if unconfigured else [warning]
+        return {"facts": [], "config": cfg, "warnings": [] if unconfigured else [warning]}
     section = doc.get("integration")
     facts = section.get("facts") if isinstance(section, dict) else None
     if not isinstance(facts, list) or len(facts) > MAX_FACTS or not all(_valid_fact(f) for f in facts):
-        return {}, {}, ["integration facts malformed"]
+        return {"facts": [], "config": cfg, "warnings": ["integration facts malformed"]}
     oldest, project = now - timedelta(seconds=max_age_seconds(cfg)), store.project_id()
-    integrated, stale, ignored = {}, {}, 0
+    kept, ignored = [], 0
     for fact in facts:
         entry = aliases.get(fact["repo_alias"])
         if (fact["project"] != project or entry is None or entry["path"] != fact["repo_path"]
                 or fact["target_ref"] not in entry["targets"]):
             ignored += 1
             continue
-        key, checked = (fact["work_item"], fact["candidate"]), _time(fact["checked_at"])
-        if not oldest <= checked <= now + timedelta(minutes=5):
-            stale[key] = max(stale.get(key, checked), checked)
-        elif fact["result"] == "integrated":
-            integrated[key] = {k: fact[k] for k in ("repo_alias", "target_ref", "target_oid", "checked_at")}
+        checked = _time(fact["checked_at"])
+        kept.append(dict(fact, checked=checked, fresh=oldest <= checked <= now + timedelta(minutes=5)))
+    warnings = [f"{ignored} integration fact(s) ignored: repository mapping changed"] if ignored else []
+    return {"facts": kept, "config": cfg, "warnings": warnings}
+
+
+def integration_for(items, evidence):
+    """(integrated, notes) for work_board.reduce: a fact counts only when its alias and
+    target ref match the item's CURRENT binding. notes maps (work_item, candidate) to
+    (card reason suffix, stale as-of or None); unmatched or stale evidence never makes Done."""
+    aliases, default, _ = repo_aliases(evidence["config"])
+    found = {}
+    for fact in evidence["facts"]:
+        found.setdefault((fact["work_item"], fact["candidate"]), []).append(fact)
+    integrated, notes = {}, {}
+    for item in items:
+        key = (item["work_item"], item.get("candidate"))
+        if key not in found:
+            continue
+        alias, targets, reason = resolve_binding(item.get("repo_binding"), aliases, default)
+        bound = [f for f in found[key] if f["repo_alias"] == alias and f["target_ref"] in targets]
+        fresh = [f for f in bound if f["fresh"]]
+        merged = next((f for f in fresh if f["result"] == "integrated"), None)
+        if merged:
+            integrated[key] = {k: merged[k] for k in ("repo_alias", "target_ref", "target_oid", "checked_at")}
+        elif fresh:
+            integrated[key] = False
+        elif bound:
+            as_of = max(f["checked"] for f in bound).isoformat()
+            notes[key] = (f"integration evidence stale (as of {as_of})", as_of)
         else:
-            integrated.setdefault(key, False)
-    stale = {key: when.isoformat() for key, when in stale.items() if key not in integrated}
-    return integrated, stale, [f"{ignored} integration fact(s) ignored: repository mapping changed"] if ignored else []
+            notes[key] = ("integration evidence ignored: "
+                          + (reason or "recorded for another repository or target"), None)
+    return integrated, notes

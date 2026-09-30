@@ -121,9 +121,15 @@ The snapshot worker reads the file on every refresh, bounded and schema-checked:
 
 - A missing, unreadable, malformed or oversize file gives no facts and a warning
   in `errors`. A missing file is silent only while `work_repos` is not
-  configured. The file never errors the board and never implies Done.
+  configured. Any other fault while reading or selecting the evidence also
+  becomes a warning. The facts never error the board and never imply Done.
 - A fact whose project, alias path or target no longer matches the config is
   ignored, with a warning, so old proof is never reused after a remap.
+- A fact counts only for the item's CURRENT binding: its declared `work_repo`
+  and `work_target` (from its current cycle), else the current default alias
+  and its targets. Proof from an earlier default or an earlier target is never
+  reused. Unmatched facts leave the card's column as derived and end its reason
+  with `integration evidence ignored: <why>`.
 - A fact older than `integration_facts_max_age_seconds` (default 86,400; from
   60 seconds to 30 days) is stale. It never makes Done: the card keeps its
   derived column, its reason ends with `integration evidence stale (as of

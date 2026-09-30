@@ -359,3 +359,111 @@ def test_verify_merges_keeps_other_sections(tmp_path, repo):
     F.verify_merges(store)
     doc = json.loads((store.state_dir / F.FACTS_FILE).read_text(encoding="utf-8"))
     assert doc["plans"] == {"p": 1} and len(doc["integration"]["facts"]) == 1
+
+
+
+# ---------------------------------------------------------------- fix round 1 (#247 cold read)
+
+def publish_cycle(store, slug, head, cycle, **policy):
+    """A later build/read cycle for the same item, continuing the store's message ids."""
+    bus, now = Bus(), datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    bus.messages = list(store.valid_messages())
+    first = len(bus.messages)
+    bus.reply(bus.task(f"tk-build-{slug}-c{cycle}", BUILDER, "build", item=slug, work_cycle=cycle,
+                       **POLICY, **policy), verdict="done")
+    bus.reply(bus.task(f"tk-read-{slug}-c{cycle}", REVIEWER, "read", item=slug, work_cycle=cycle,
+                       work_head=head), verdict="GO")
+    for m in bus.messages[first:]:
+        (store.messages_dir / f"{m.id}.json").write_text(json.dumps(replace(m, ts=now).to_dict()),
+                                                          encoding="utf-8")
+
+
+def test_default_repo_switch_needs_proof_in_the_new_repo(tmp_path, repo):
+    path, merged, _ = repo
+    store = team(tmp_path, path)
+    publish(store, {"item-merged": merged})
+    F.verify_merges(store)
+    assert board(store)[0]["item-merged"]["workflow_column"] == "done"
+    other = tmp_path / "other"
+    git(tmp_path, "clone", "-q", str(path), str(other))
+    configure(store, work_repos={
+        "agenttalk": {"path": str(path), "targets": ["refs/heads/master"], "default": False},
+        "other": {"path": str(other), "targets": ["refs/heads/master"], "default": True}})
+    card = board(store)[0]["item-merged"]
+    assert (card["workflow_column"], card["integration"]) == ("ready", {})
+    assert card["reason"].endswith("; integration evidence ignored: recorded for another repository or target")
+    F.verify_merges(store)  # proof in the current default repo is accepted again
+    card = board(store)[0]["item-merged"]
+    assert card["workflow_column"] == "done" and card["integration"][merged]["repo_alias"] == "other"
+
+
+def test_new_cycle_target_needs_proof_for_that_target(tmp_path, repo):
+    path, merged, _ = repo
+    git(path, "update-ref", "refs/heads/release", git(path, "rev-parse", merged + "^"))
+    store = team(tmp_path, path, targets=["refs/heads/master", "refs/heads/release"])
+    publish(store, {"item-merged": merged}, work_repo="agenttalk", work_target="master")
+    F.verify_merges(store)
+    assert board(store)[0]["item-merged"]["workflow_column"] == "done"
+    publish_cycle(store, "item-merged", merged, 2, work_repo="agenttalk", work_target="release")
+    card = board(store)[0]["item-merged"]
+    assert card["repo_binding"] == {"repo": "agenttalk", "target": "release"}
+    assert card["workflow_column"] == "ready" and "integration evidence ignored" in card["reason"]
+    result = F.verify_merges(store)  # the release proof is negative, and it is the one that counts
+    assert [(f["target_ref"], f["result"]) for f in result["facts"]] == [("refs/heads/release", "not_integrated")]
+    card = board(store)[0]["item-merged"]
+    assert (card["workflow_column"], card["integration"]) == ("ready", {merged: False})
+
+
+def test_overflowing_timestamp_is_rejected_and_the_board_projects(tmp_path, repo):
+    path, merged, _ = repo
+    store = team(tmp_path, path)
+    publish(store, {"item-merged": merged})
+    F.verify_merges(store)
+    target = store.state_dir / F.FACTS_FILE
+    doc = json.loads(target.read_text(encoding="utf-8"))
+    doc["integration"]["facts"][0]["checked_at"] = "9999-12-31T23:59:59-23:00"  # parses, then overflows UTC
+    target.write_text(json.dumps(doc), encoding="utf-8")
+    items, feed = board(store)
+    assert feed["coverage"]["status"] == "complete" and items["item-merged"]["workflow_column"] == "ready"
+    assert "integration facts malformed" in feed["errors"]
+
+
+@pytest.mark.parametrize("stage", ["_load_integration", "integration_for"])
+def test_any_fault_in_optional_evidence_leaves_the_board_projecting(tmp_path, repo, monkeypatch, stage):
+    path, merged, _ = repo
+    store = team(tmp_path, path)
+    publish(store, {"item-merged": merged})
+    F.verify_merges(store)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(F, stage, broken)
+    items, feed = board(store)
+    assert feed["coverage"]["status"] == "complete" and items["item-merged"]["workflow_column"] == "ready"
+    word = "facts" if stage == "_load_integration" else "evidence"
+    assert f"integration {word} unusable (RuntimeError)" in feed["errors"]
+
+
+def test_integration_for_selects_only_the_current_binding(tmp_path):
+    now = datetime.now(timezone.utc)
+    cfg = {"work_repos": {"agenttalk": {"path": str(tmp_path), "default": True,
+                                        "targets": ["refs/heads/master", "refs/heads/release"]}}}
+
+    def fact(target, result, age=0):
+        return {"work_item": "item", "candidate": MISSING, "repo_alias": "agenttalk", "target_ref": target,
+                "target_oid": "d" * 40, "checked_at": "x", "result": result,
+                "checked": now - timedelta(hours=age), "fresh": age < 24}
+
+    def pick(binding, *facts):
+        item = {"work_item": "item", "candidate": MISSING, "repo_binding": binding}
+        integrated, notes = F.integration_for([item], {"facts": list(facts), "config": cfg})
+        return integrated.get(("item", MISSING)), notes.get(("item", MISSING))
+    both = (fact("refs/heads/master", "integrated"), fact("refs/heads/release", "not_integrated"))
+    assert pick(None, *both)[0]["target_ref"] == "refs/heads/master"  # merged into one approved target
+    assert pick({"repo": None, "target": "release"}, *both) == (False, None)
+    assert pick({"repo": None, "target": "master"}, fact("refs/heads/master", "integrated", age=30))[1][0] \
+        .startswith("integration evidence stale (as of ")
+    assert pick("ambiguous", *both) == (None, (
+        "integration evidence ignored: conflicting repository declarations", None))
+    assert pick({"repo": "elsewhere", "target": None}, *both)[1][0] == (
+        "integration evidence ignored: repository 'elsewhere' is not an approved work_repos alias")

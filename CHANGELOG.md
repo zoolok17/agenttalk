@@ -25,11 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     atomically, under a store lock.
 
   The snapshot worker only reads that file and never runs Git:
-  - a missing, malformed or oversize file gives no facts and a visible
-    warning;
+  - a missing, malformed or oversize file, or any other fault in this optional
+    evidence, gives no facts and a visible warning, never a missing board;
   - a fact older than `integration_facts_max_age_seconds` (default 24 h) never
     makes Done, and the card says "integration evidence stale (as of ...)";
-  - a fact from a remapped alias or target is ignored.
+  - a fact from a remapped alias or target is ignored;
+  - a fact counts only for the item's current binding (its declared
+    `work_repo`/`work_target`, else the current default), so proof from an
+    earlier default or target is never reused.
 
   This replaces the in-server cached observer of the work-board design
   (section 4) and supersedes draft #238. The lead skill now runs the command
