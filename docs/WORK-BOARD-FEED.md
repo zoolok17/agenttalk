@@ -114,10 +114,12 @@ publishes nothing and takes no lock. The snapshot worker never takes this lock.
 
 The command lists unknown pairs. It exits 2, having published nothing, when:
 
-- no usable alias is configured;
+- no usable alias is configured (so clearing `work_repos` never erases the last
+  proof; delete the facts file to retire it);
 - another run is in progress;
 - the store session changed during the run (a reset);
-- the facts file has an unsupported schema version (the file is left untouched).
+- the facts file has an unsupported schema version, or exceeds the 512 KiB read
+  bound (either way the file is left untouched).
 
 Otherwise it exits 0.
 
@@ -153,8 +155,11 @@ The snapshot worker reads the file on every refresh, bounded and schema-checked:
   <time>)`, and `integration_stale_as_of` holds the time.
 - A fresh `integrated` fact for the current candidate places the card in Done,
   subject to every Ready condition. The card's `integration` maps the candidate
-  to `{repo_alias, target_ref, target_oid, checked_at}`. A fresh
-  `not_integrated` fact maps it to `false`.
+  to `{repo_alias, target_ref, target_oid, checked_at}`. Fresh
+  `not_integrated` facts map it to `false` only when they cover every target
+  the item selects. A partial negative (another target timed out or was not
+  checked) stays Unknown, and the reason ends with `integration evidence
+  incomplete (no fresh result for <targets>)`.
 
 ### Refresh owners
 
