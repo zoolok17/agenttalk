@@ -1100,7 +1100,6 @@ def classify_bus_execution(
     output: object,
     exit_status: object = None,
     raw_event: object = None,
-    *, store_dir: Path | None = None,
 ) -> dict[str, str]:
     """Classify a completed agenttalk bus command without inferring failure from text alone."""
     command_text = _command_text(command)
@@ -1114,11 +1113,6 @@ def classify_bus_execution(
     failed = _bus_execution_failed(exit_status, raw_event)
     if not failed:
         return _bus_result(BUS_KIND_OK_OR_NO_SIGNAL, "no_failed_execution_signal", "")
-    if store_dir is not None and verb in (_REQUIRED_BUS_WRITE_VERBS | _BEST_EFFORT_BUS_VERBS):
-        from agenttalk import codex_preflight
-        if codex_preflight.is_store_permission_denial(text, store_dir):
-            return _bus_result(codex_preflight.BUS_PERMISSION_DENIED, "store_access_denied",
-                               "Codex bus write denied under the message store; repair guard ACL inheritance")
     runtime_blocked = _runtime_config_blocked_summary(text)
     if runtime_blocked:
         return _bus_result(BUS_KIND_CONFIG_BLOCKED, "agenttalk_runtime", runtime_blocked)
@@ -2113,9 +2107,6 @@ def _classify_drive_failure(
     if wd:
         summary = wd.get("summary") if isinstance(wd, dict) else None
         return CLASS_AMBIGUOUS, summary or "turn watchdog killed hung tool descendant"
-    bus_failure = sig.get("bus_failure")
-    if isinstance(bus_failure, dict) and bus_failure.get("kind") == "codex_bus_permission_denied":
-        return "codex_bus_permission_denied", bus_failure["summary"]
     if sig.get("config_blocked"):
         summary = sig.get("config_blocked_text")
         return CLASS_CONFIG_BLOCKED, summary or "deterministic exec permission denied"
@@ -2693,13 +2684,8 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                         verb = _bus_command_verb(ev.tool)
                         if verb in _REQUIRED_BUS_WRITE_VERBS:
                             sig["bus_action_attempted"] = True
-                        bus = classify_bus_execution(ev.tool, ev.text, ev.exit_code, ev.raw,
-                                                     store_dir=store.dir if session_state.cli == "codex" else None)
-                        if bus["kind"] == "codex_bus_permission_denied":
-                            from agenttalk.codex_preflight import write_permission_hold
-                            write_permission_hold(store, agent)
-                            sig["bus_failure"] = bus
-                        elif bus["kind"] == BUS_KIND_CONFIG_BLOCKED:
+                        bus = classify_bus_execution(ev.tool, ev.text, ev.exit_code, ev.raw)
+                        if bus["kind"] == BUS_KIND_CONFIG_BLOCKED:
                             sig["config_blocked"] = True
                             sig["config_blocked_text"] = bus["summary"]
                         elif bus["kind"] in (
@@ -2871,7 +2857,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 produced_model_output=bool(sig.get("produced_model_output")),
                 result_num_turns=sig.get("result_num_turns"),
             )
-            if resume_failure_class in (CLASS_CONFIG_BLOCKED, "codex_bus_permission_denied"):
+            if resume_failure_class == CLASS_CONFIG_BLOCKED:
                 _session.clear_resume_attempt(session_state)
                 store.clear_heartbeat(agent)
                 engine.reset_heartbeat_throttle()
@@ -3170,13 +3156,8 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                             sig["terminal"] = True
                             sig["terminal_text"] = ev.text or sig["terminal_text"]
                     elif ev.type == EventType.TOOL_FINISHED:
-                        bus = classify_bus_execution(ev.tool, ev.text, ev.exit_code, ev.raw,
-                                                     store_dir=store.dir if session_state.cli == "codex" else None)
-                        if bus["kind"] == "codex_bus_permission_denied":
-                            from agenttalk.codex_preflight import write_permission_hold
-                            write_permission_hold(store, agent)
-                            sig["bus_failure"] = bus
-                        elif bus["kind"] == BUS_KIND_CONFIG_BLOCKED:
+                        bus = classify_bus_execution(ev.tool, ev.text, ev.exit_code, ev.raw)
+                        if bus["kind"] == BUS_KIND_CONFIG_BLOCKED:
                             sig["config_blocked"] = True
                             sig["config_blocked_text"] = bus["summary"]
                         elif bus["kind"] in (
@@ -3236,7 +3217,7 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
             resume_failure_class, resume_summary = _classify_drive_failure(sig)
             attributable = _session.resume_failure_is_session_attributable(
                 resume_failure_class, resume_summary)
-            if resume_failure_class in (CLASS_CONFIG_BLOCKED, "codex_bus_permission_denied"):
+            if resume_failure_class == CLASS_CONFIG_BLOCKED:
                 _session.clear_resume_attempt(session_state)
                 if persist is not None:
                     persist(session_state)

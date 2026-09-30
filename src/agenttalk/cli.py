@@ -16319,7 +16319,7 @@ def build_parser() -> argparse.ArgumentParser:
     gsup.add_argument("--codex-preflight", action="store_true",
                       help="(script use) Reset Windows store guard ACL inheritance before a Codex launch.")
     gsup.add_argument("--codex-launch-failure",
-                      choices=("CODEX_ACL_PREFLIGHT_FAILED", "CODEX_BUS_PERMISSION_DENIED"),
+                      choices=("CODEX_ACL_PREFLIGHT_FAILED",),
                       help="(script use) Escalate a held Codex seat to the lead.")
     gsup.add_argument("--prepare-launch-request", dest="prepare_launch_request",
                       action="store_true",

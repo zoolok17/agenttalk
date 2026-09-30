@@ -143,8 +143,8 @@ runtime generation still follows normal fail-closed adoption.
 
 Before a regular Codex relaunch on Windows, the supervisor resets ACL inheritance
 on existing `*.generation` guards under the store. Traversal and `icacls` share a
-10-second budget. Linked/reparse paths and unresettable guards fail closed as
-`CODEX_ACL_PREFLIGHT_FAILED`. Guards are never renamed or replaced, preserving
+10-second budget. Symlink/reparse paths, hard-linked guards and unresettable
+guards fail closed as `CODEX_ACL_PREFLIGHT_FAILED`. Guards are never renamed or replaced, preserving
 the identity of locks held by live processes. Other platforms skip the ACL step.
 
 A preflight failure persists a supervisor hold and attempts lead/operator
@@ -152,24 +152,19 @@ escalation in the same poll, independently of optional notification settings.
 Failed delivery is retried on subsequent polls; successful delivery is latched.
 There is no automatic relaunch while the hold is present.
 
-There is no startup model turn or proactive write proof. During a real Codex
-turn, a failed agenttalk bus-write command that reports permission denied/EACCES
-and an absolute path beneath this store's `.agenttalk` directory on the same
-error line is classified as `codex_bus_permission_denied`. Other paths, successful
-commands, and ordinary check commands keep their existing classification.
+If the affected seat is itself the lead/liaison, the question is addressed to
+the configured human operator principal and appears among lead-chat pending
+decisions. A missing or invalid operator identity fails delivery loudly and
+leaves the escalation pending for retry; it is never sent to the same seat.
 
-The host records a durable permission marker without reopening the denied guard.
-The wrapper stops before draft publication or cursor advancement; the inbound
-message stays unread. A restarted wrapper also stops while the marker remains.
-The supervisor reports `CODEX_BUS_PERMISSION_DENIED`, holds automatic relaunch,
-and escalates once to the lead/operator. This class is separate from generic
-`config_blocked`. No paid probe turn, proof note, or receipt polling is involved.
+An automatic relaunch whose ACL preflight fails consumes one restart-budget
+attempt. Subsequent polls under the access hold consume none. Clearing the
+restart budget does not clear this access hold. The preflight does not prove
+that a later restricted model turn can write the bus.
 
 To recover, set `supervisor.kill`, stop the supervisor and affected wrapper, and
-repair the guard permissions. Remove the affected agent's
-`state/codex-bus-permission-*.json` marker (verify its `agent` field), remove the
-failed head's entry from `messages` in `state/dead-letter-attempts/<agent>.json`, and
-remove only that agent's `codex_access_hold` from `.agenttalk/supervisor-state.json`.
+repair the guard permissions. Remove only the affected agent's
+`codex_access_hold` from `.agenttalk/supervisor-state.json`.
 Keep the rest of the state valid and intact. Then restart the supervisor and
 wrapper. Regenerate supervisor scripts after upgrading; old generated scripts
 do not acquire the new preflight and escalation behavior.

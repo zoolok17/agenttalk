@@ -24,7 +24,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-from agenttalk import reply_transport, codex_preflight
+from agenttalk import reply_transport
 from agenttalk.store import LockContention
 
 from . import recv_api
@@ -1311,8 +1311,6 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         if max_wall is not None and (clock() - start) >= max_wall:
             return turns
         polls += 1
-        if codex_preflight.has_permission_hold(store, agent):
-            return turns  # held for supervisor escalation; unread work stays unread
         _finish_stranded_releases()
         record = _await_lock(
             LOCK_CONTENTION_PHASE_ADMISSION, recv_api.next_record, store, agent)
@@ -2002,11 +2000,6 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         store.record_attempt_start(agent, record, attempt_id=uuid.uuid4().hex[:12],
                                    at=now_iso())
         outcome = _as_outcome(drive(record))
-        if outcome.failure_class == codex_preflight.BUS_PERMISSION_DENIED:
-            codex_preflight.write_permission_hold(store, agent)
-            store.record_attempt_result(agent, head_id, failure_class=outcome.failure_class,
-                                        summary=outcome.summary, at=now_iso())
-            return turns  # no draft publication, cursor commit or retry
         # #201: a CLEAN turn's child-written draft is published by the wrapper
         # itself BEFORE the landed-check below, which then finds and commits it
         # through the same proof machinery as a child-delivered reply. A dirty
@@ -2419,8 +2412,6 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
         if max_wall is not None and (clock() - start) >= max_wall:
             return turns                # wall timeout: never spin forever
         polls += 1
-        if codex_preflight.has_permission_hold(store, agent):
-            return turns  # held for supervisor escalation; unread work stays unread
         env = recv_api.poll(store, agent, scoped_request_id=rid)
         record = env.get("record")
         scoped = env.get("scoped") or {}
@@ -2764,9 +2755,6 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
         # THIS attempt's "previously interrupted" fact on the record itself.
         record = _with_reply_draft(store, agent, _with_interruption_context(record))
         outcome = _as_outcome(drive(record))
-        if outcome.failure_class == codex_preflight.BUS_PERMISSION_DENIED:
-            codex_preflight.write_permission_hold(store, agent)
-            return turns  # no draft publication, cursor commit or retry
         _note_interruption(outcome)
         # connector P2 (final head): one-shot is LEDGER-LESS, so the FIX 5
         # decoration above is the only carrier of "previously interrupted" -

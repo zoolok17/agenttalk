@@ -8570,9 +8570,6 @@ def build_report(store: Store, *, now_epoch: float,
             "session_id": st.get("session_id"),  # supervisor-local; None unless state passed
         }
         sup_agent = sup_agents.get(a) if isinstance(sup_agents.get(a), dict) else {}
-        if sup_agent.get("cli") == "codex":
-            from .codex_preflight import has_permission_hold
-            agents[a]["codex_bus_permission_denied"] = has_permission_hold(store, a)
         if bool(sup_agent.get("wrapped", False)):
             agents[a]["wrapper_runtime"] = runtime_obs.read_runtime(
                 store.state_dir,
@@ -9598,17 +9595,14 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
 
     if cli_name == "codex":
         hold = nxt.get("codex_access_hold")
-        if rpt.get("codex_bus_permission_denied") and hold is None:
-            hold = nxt["codex_access_hold"] = {"failure": "CODEX_BUS_PERMISSION_DENIED"}
         if "codex_access_hold" in nxt:
-            if (not isinstance(hold, dict) or not isinstance(hold.get("failure"), str)
-                    or hold["failure"] not in {"CODEX_ACL_PREFLIGHT_FAILED", "CODEX_BUS_PERMISSION_DENIED"}):
-                hold = nxt["codex_access_hold"] = {"failure": "CODEX_BUS_PERMISSION_DENIED"}
+            if not isinstance(hold, dict) or hold.get("failure") != "CODEX_ACL_PREFLIGHT_FAILED":
+                hold = nxt["codex_access_hold"] = {"failure": "CODEX_ACL_PREFLIGHT_FAILED"}
             notify = hold.get("notified") is not True
             hold["notified"] = True
             return _result(WARN_ONLY if notify else NONE, state=hold["failure"], notify=notify,
                            reason=f"{hold['failure']}: automatic relaunch held; repair store permissions "
-                           "and clear the permission marker and codex_access_hold with the supervisor stopped.")
+                           "and clear codex_access_hold with the supervisor stopped.")
 
     if (
         wrapped
@@ -15234,7 +15228,7 @@ $pollNum = 0
       'refuse_protected' { Write-Warning ("supervisor: {0}: {1}" -f $name, $p.reason); if ($p.clear_marker -and (Assert-ActionsEnabled ("clear-restart {0}" -f $name))) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }; Set-AgentState $state $name $p.next_state }
       { $_ -in 'warn_only','suspect_warn','snapshot_unavailable','readiness_gave_up','restart_budget_exhausted' } {
         Write-Warning ("supervisor: {0}: {1}" -f $name, $p.reason)
-        if ($p.notify -and $p.state -in @('CODEX_ACL_PREFLIGHT_FAILED','CODEX_BUS_PERMISSION_DENIED')) {
+        if ($p.notify -and $p.state -eq 'CODEX_ACL_PREFLIGHT_FAILED') {
           Set-CodexAccessHold $name $p $state $p.state
         } elseif ($p.notify -and $cfg.notify_sender -and $cfg.notify_to -and (Assert-ActionsEnabled ("notify {0}" -f $name))) {
           & $AgenttalkCmd --root $Root send --from $cfg.notify_sender --to $cfg.notify_to --kind note -m ("supervisor: {0}: {1}" -f $name, $p.reason) --quiet | Out-Null

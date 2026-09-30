@@ -20972,8 +20972,8 @@ def test_ps_state_save_keeps_restart_budget_hold_and_one_entry_list(
     assert (p["action"], p["state"]) == (sup.NONE, "RESTART_BUDGET_EXHAUSTED")
 
 
-@pytest.mark.parametrize("failure", ["CODEX_ACL_PREFLIGHT_FAILED", "CODEX_BUS_PERMISSION_DENIED"])
-def test_codex_access_hold_preserves_restart_budget_without_more_attempts(failure: str) -> None:
+def test_codex_access_hold_preserves_restart_budget_without_more_attempts() -> None:
+    failure = "CODEX_ACL_PREFLIGHT_FAILED"
     config = {**_HOOK_CONFIG, "agents": {"worker": {
         **_HOOK_CONFIG["agents"]["worker"], "cli": "codex"}}}
     launched = _budget_poll(_ready(), NOW, stale=True, config=config)
@@ -20994,8 +20994,8 @@ def test_codex_access_hold_preserves_restart_budget_without_more_attempts(failur
     assert "rr-access" not in p["next_state"]["consumed_rids"]
 
 
-@pytest.mark.parametrize("failure", ["CODEX_ACL_PREFLIGHT_FAILED", "CODEX_BUS_PERMISSION_DENIED"])
-def test_budget_clear_preserves_codex_access_hold(failure: str) -> None:
+def test_budget_clear_preserves_codex_access_hold() -> None:
+    failure = "CODEX_ACL_PREFLIGHT_FAILED"
     entry, t = _held_entry()
     entry["codex_access_hold"] = {"failure": failure, "notified": True}
     config = {**_HOOK_CONFIG, "agents": {"worker": {
@@ -21018,12 +21018,12 @@ def test_budget_escalation_preserves_codex_notification_retry(
         pytest.skip("PowerShell required")
     entry, t = _held_entry()
     entry["restart_budget_hold"]["notified_epoch"] = None
-    entry["codex_access_hold"] = {"failure": "CODEX_BUS_PERMISSION_DENIED", "notified": False}
+    entry["codex_access_hold"] = {"failure": "CODEX_ACL_PREFLIGHT_FAILED", "notified": False}
     config = {**_HOOK_CONFIG, "agents": {"worker": {
         **_HOOK_CONFIG["agents"]["worker"], "cli": "codex"}}}
     t += 1000
     p = _budget_poll(entry, t, stale=True, config=config)
-    assert (p["action"], p["state"]) == (sup.WARN_ONLY, "CODEX_BUS_PERMISSION_DENIED")
+    assert (p["action"], p["state"]) == (sup.WARN_ONLY, "CODEX_ACL_PREFLIGHT_FAILED")
     assert "restart budget hold stays" in p["reason"]
     assert "restart_budget_escalation" in p
     (tmp_path / "plan.json").write_text(json.dumps(p), encoding="utf-8")
@@ -21045,7 +21045,7 @@ def test_budget_escalation_preserves_codex_notification_retry(
     assert saved["codex_access_hold"]["notified"] is access_delivered
     assert saved["restart_budget_hold"]["notified_epoch"] == (t if budget_delivered else None)
     later = _budget_poll(saved, t + 1000, stale=True, config=config)
-    assert later["state"] == "CODEX_BUS_PERMISSION_DENIED"
+    assert later["state"] == "CODEX_ACL_PREFLIGHT_FAILED"
     assert later["notify"] is not access_delivered
     assert ("restart_budget_escalation" in later) is not budget_delivered
     assert later["next_state"]["restart_budget_relaunches"] == entry["restart_budget_relaunches"]

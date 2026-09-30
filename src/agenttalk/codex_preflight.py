@@ -1,24 +1,16 @@
-"""Codex supervisor launch admission and evidence from the restricted process.
-
-Windows guard repair and durable holds for real-turn bus access denials.
-"""
+"""Bounded Windows guard ACL repair before supervised Codex relaunches."""
 from __future__ import annotations
 
-import hashlib
-import json
 import os
 from pathlib import Path
-import re
 import stat
 import subprocess  # nosec B404
 import time
 import uuid
 
-from ._atomic import write_text
-from .store import validate_agent_name
+from .store import _validate_lock_file_stat
 
 ACL_TIMEOUT = 10.0
-BUS_PERMISSION_DENIED = "codex_bus_permission_denied"
 
 
 class PreflightError(ValueError):
@@ -57,6 +49,9 @@ def reset_guard_acls(directory: Path, *, windows=None, run=None) -> None:
                     elif entry.name.endswith(".generation"):
                         guards.append(path)
         for guard in guards:
+            # DirEntry.stat can omit link counts on Windows. Use a fresh stat
+            # and the store's lock safety rules before privileged ACL changes.
+            _validate_lock_file_stat(guard, guard.lstat())
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise OSError("ACL reset exceeded admission budget")
@@ -70,46 +65,23 @@ def reset_guard_acls(directory: Path, *, windows=None, run=None) -> None:
         raise PreflightError(f"codex_acl_preflight_failed: {exc}") from exc
 
 
-def is_store_permission_denial(output: str, store_dir: Path) -> bool:
-    """Require a denial and this store's absolute child path on the same line."""
-    def normalized(text):
-        return re.sub(r"\\+", "/", text).casefold() if os.name == "nt" else text
-
-    prefix = normalized(str(store_dir.resolve())).rstrip("/") + "/"
-    denial = re.compile(r"permission denied|access is denied|\bEACCES\b|\[Errno 13\]|\[WinError 5\]", re.I)
-    return any(denial.search(line) and prefix in normalized(line) for line in output.splitlines())
-
-
-def permission_hold_path(store, agent: str) -> Path:
-    validate_agent_name(agent)
-    digest = hashlib.sha256(agent.encode()).hexdigest()[:32]
-    return store.state_dir / f"codex-bus-permission-{digest}.json"
-
-
-def write_permission_hold(store, agent: str) -> None:
-    # The host records a child sandbox's denial without reopening that guard.
-    write_text(permission_hold_path(store, agent), json.dumps({"agent": agent, "failure": BUS_PERMISSION_DENIED}))
-
-
-def has_permission_hold(store, agent: str) -> bool:
-    try:
-        permission_hold_path(store, agent).stat()
-    except FileNotFoundError:
-        return False
-    # Presence is a hold, including malformed content. Other IO failures propagate.
-    return True
-
-
 def notify_failure(store, agent: str, failure: str) -> None:
     """Mandatory escalation, independent of optional supervisor notifications."""
-    if failure not in {"CODEX_ACL_PREFLIGHT_FAILED", "CODEX_BUS_PERMISSION_DENIED"}:
+    if failure != "CODEX_ACL_PREFLIGHT_FAILED":
         raise PreflightError("unknown Codex access failure")
     target = store.operator_facing() or store.sole_lead()
     if not target:
         raise PreflightError(f"{failure}: cannot escalate: no lead/operator-facing recipient")
+    if target == agent:
+        # Lead-chat displays questions from the lead to the human principal;
+        # self-addressed questions are excluded from the operator view.
+        try:
+            target = store.operator_identity(lead=agent)
+        except ValueError as exc:
+            raise PreflightError(f"{failure}: cannot escalate: {exc}") from exc
     store.send(sender=agent, recipient=target, kind="question", subject=failure,
                body=f"Supervisor: {agent}: {failure}. Automatic relaunch is held. "
                "Stop the supervisor and wrapper, repair guard permissions, then clear "
-               "this agent's permission marker and codex_access_hold before restarting.",
+               "this agent's codex_access_hold before restarting.",
                meta={"request_id": "esc-" + uuid.uuid4().hex[:12],
                      "needs_operator": "true", "codex_launch_failure": failure})
