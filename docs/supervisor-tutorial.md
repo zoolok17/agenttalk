@@ -494,6 +494,41 @@ comes back remembering its prior turn — the branch, the files it had open,
 the work in flight. (Restarting a *protected* agent — see below — needs
 `--force-protected`.)
 
+### The restart budget
+
+The monitor never relaunches a seat into a loop. Besides the backoff and
+the readiness give-up, each seat has a **restart budget**: at most
+`max_relaunches` (default 4) automatic relaunch attempts until the seat has
+been continuously healthy for `window_seconds` (default 3600), which
+refills the budget.
+
+- Every automatic attempt counts, even one whose preflight fails. Your own
+  `request-restart` relaunches do not.
+- Continuously healthy means every poll in the window was green, with no
+  gap of more than 5 minutes between polls. Any other observation starts
+  the window again.
+
+When a relaunch is due and the budget is spent, the monitor does not
+relaunch. It holds the seat in `RESTART_BUDGET_EXHAUSTED` and sends
+`notify_to` one note naming the seat, the relaunch count and the window.
+If that send fails, or `notify_to` is not set, it retries on a later poll.
+
+The hold is sticky. A healthy blip, or even hours of health, does not lift
+it, and neither does restarting the monitor: the budget lives in
+`supervisor-state.json`. Only an audited request by the operator-facing
+liaison (or the sole lead) clears it:
+
+```powershell
+agenttalk request-restart --for codex-dev --reason "fixed the crash"          # relaunch now, fresh budget
+agenttalk request-restart --for codex-dev --clear-restart-budget --reason "fixed the crash"  # re-arm only
+```
+
+A plain `request-restart` always re-arms the budget, and that relaunch is
+not charged to it. `--clear-restart-budget` kills and launches nothing; a
+seat that is still dead relaunches on a later poll under the fresh budget.
+It also never lifts a lead-loop stand-down. Set `restart_budget` globally
+or per agent in `supervisor.json`.
+
 ---
 
 ## 8. The progress wrapper, standalone
@@ -759,7 +794,8 @@ without ever rebuilding state.
 | `agenttalk supervise --install-activity-hook [--codex\|--codex-only]` | Merge the identity-neutral heartbeat `PostToolUse` plus checkpoint `PreCompact` and `SessionStart/compact` hooks into the **project** `.claude/settings.json`. Codex modes write only the heartbeat hook to `.codex/hooks.json`. Never global, never clobbers unrelated settings. |
 | `agenttalk supervise --install-activity-hook --interactive-for <lead>` | Merge the three Claude hooks with a fallback identity for the current operator-facing human liaison; `AGENTTALK_SELF` still takes precedence. Refuses Codex hook modes. |
 | `agenttalk wrap --for A --cli claude\|codex [--loop] [--no-render] -- <real exe> <base args>` | Run an agent through the progress wrapper: visibility + working-turn heartbeat + degraded detection. `--loop` = long-running supervised wrapper, one turn per inbound message. |
-| `agenttalk request-restart --for A [--reason ...] [--force-protected] [--acknowledge-live-protected-kill]` | Queue a manual restart (resumes the session - mechanism per section 1). Healthy idle agents are restarted at the next supervisor poll. `--force-protected` restarts a protected agent; add `--acknowledge-live-protected-kill` when that protected agent still has a fresh heartbeat. |
+| `agenttalk request-restart --for A [--reason ...] [--force-protected] [--acknowledge-live-protected-kill]` | Queue a manual restart (resumes the session - mechanism per section 1). Healthy idle agents are restarted at the next supervisor poll. `--force-protected` restarts a protected agent; add `--acknowledge-live-protected-kill` when that protected agent still has a fresh heartbeat. Also re-arms the restart budget (section 7). |
+| `agenttalk request-restart --for A --clear-restart-budget [--reason ...]` | Lift a `RESTART_BUDGET_EXHAUSTED` hold without restarting the agent (section 7). |
 | `agenttalk heartbeat [--for A] [--min-interval 5]` | Stamp the activity heartbeat (wired as a hook for manual agents; the wrapper does this for you). Hook identity comes from `--for`, then `AGENTTALK_SELF`; the interactive installer uses a hook-only fallback for the liaison window. Throttled, so the per-tool-call hook is nearly free. |
 
 For the full per-agent config schema, read the generated
