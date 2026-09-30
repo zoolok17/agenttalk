@@ -841,21 +841,39 @@ class _SingleFlight:
     Singleflight never changes the DATA returned - every result is still
     computed fresh, at real request time - it only prevents redundant
     concurrent work for the SAME key.
+
+    GENERATION-GATED (#246 P2): a plain "coalesce by key" is not enough for a
+    scan - a message published after an in-flight scan started is invisible
+    to it, so a caller must never JOIN a scan that cannot see a publication
+    it already knows about. Every call supplies ``gen``, its own freshly
+    observed publication generation (see ``_messages_generation``). A caller
+    whose ``gen`` is NEWER than the in-flight entry's own (the generation the
+    leader observed when it started) never joins it - it starts its own,
+    fresh computation instead, itself becoming the new in-flight entry for
+    any subsequent joiners. Callers whose ``gen`` matches (the common case:
+    nothing published since the leader started, e.g. the #239 browser-polling
+    case on an otherwise-idle store) coalesce exactly as before.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._inflight: dict[object, tuple[threading.Event, dict]] = {}
+        self._inflight: dict[object, dict] = {}
 
-    def do(self, key, fn):
+    def do(self, key, gen, fn):
         with self._lock:
             entry = self._inflight.get(key)
+            if entry is not None and gen > entry["gen"]:
+                # A publication this caller already knows about happened
+                # after the in-flight scan started - it cannot see it, so
+                # joining it would silently lose a message (#246 P2).
+                entry = None
             if entry is not None:
-                event, holder = entry
+                event, holder = entry["event"], entry["holder"]
                 leader = False
             else:
                 event, holder = threading.Event(), {}
-                self._inflight[key] = (event, holder)
+                entry = {"event": event, "holder": holder, "gen": gen}
+                self._inflight[key] = entry
                 leader = True
         if leader:
             try:
@@ -864,7 +882,11 @@ class _SingleFlight:
                 holder["exc"] = exc
             finally:
                 with self._lock:
-                    del self._inflight[key]
+                    # Identity check (#246): a staleness check above may
+                    # already have replaced this entry with a newer one -
+                    # never delete a successor's entry out from under it.
+                    if self._inflight.get(key) is entry:
+                        del self._inflight[key]
                 event.set()
         else:
             event.wait()
@@ -876,21 +898,44 @@ class _SingleFlight:
 _message_scan_singleflight = _SingleFlight()
 
 
+def _messages_generation(store: Store) -> int:
+    """A cheap, RELIABLE-on-Windows publication-generation signal for
+    ``store.messages_dir`` (#246 P2): its own ``st_mtime_ns``. Publishing a
+    message links a new file into this directory (``store.py``'s
+    ``_publish_text_no_replace`` via ``os.link``), and directory mtime
+    updates on child creation on NTFS - verified directly (a plain write AND
+    a hardlink into a fresh temp dir both advanced its ``st_mtime_ns`` on
+    this host). There is no existing publication counter/generation in
+    ``store.py`` to prefer over this (checked first, per the review). Two
+    publications landing within the SAME mtime tick would be
+    indistinguishable, but real publish rates (seconds apart) are far
+    coarser than NTFS's timestamp resolution, so this is reliable in
+    practice; a directory that does not exist yet has never been published
+    to, so it is fixed at ``0``.
+    """
+    try:
+        return store.messages_dir.stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
 def _scan_messages_with_paths_coalesced(store: Store):
     """Coalesce the raw, CONTEXT-INDEPENDENT disk walk per store root (#246 F1
     correctness fix, on top of the #239 fix). ``store._scan_messages_with_paths``
     only reads and parses envelope files off disk - it never consults config,
     roster, or signing trust - so sharing it across concurrent callers is
-    always safe and never stale. VALIDATION is the opposite (see
-    ``envelope_snapshot.validate_scanned_rows``'s docstring): it is NEVER
-    coalesced here, so a caller whose config/roster/signing context changed
-    since an in-flight scan started always validates fresh, with its own
-    current context, rather than inheriting an older in-flight leader's
-    verdicts (the F1 bug: coalescing the WHOLE validated computation let a
-    follower that joined after signing enforcement turned on receive a
-    message its own current policy would reject).
+    always safe with respect to VALIDATION context (see
+    ``envelope_snapshot.validate_scanned_rows``'s docstring: that is NEVER
+    coalesced here either, so a caller whose config/roster/signing context
+    changed since an in-flight scan started always validates fresh).
+
+    Sharing the scan ITSELF still has to respect read-after-publication
+    freshness (#246 P2), which is why this also passes the caller's own
+    current ``_messages_generation`` into the generation-gated
+    ``_SingleFlight`` - see its docstring.
     """
-    return _message_scan_singleflight.do(str(store.root), store._scan_messages_with_paths)
+    gen = _messages_generation(store)
+    return _message_scan_singleflight.do(str(store.root), gen, store._scan_messages_with_paths)
 
 
 def _all_messages(store: Store, *, cfg: dict | None = None) -> list[Message]:

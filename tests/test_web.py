@@ -2613,19 +2613,33 @@ def _pausable_scan(store: Store):
     """Patch ``store._scan_messages_with_paths`` to block after being entered,
     so a test can deterministically control exactly when a "leader"'s scan
     is in flight (rather than hoping a fixed sleep lines up with a mid-flight
-    config/trust change). Returns ``(entered, proceed)``; the real scan runs
-    once ``proceed`` is set."""
+    config/trust/publication change). Returns ``(entered, proceed,
+    second_call_started)``; the real scan runs once ``proceed`` is set.
+    ``second_call_started`` fires the moment a SECOND call reaches this
+    function - whether that call is about to join the paused first one
+    (pre-#246-P2-fix) or is a fresh, gen-gated rescan of its own (post-fix) -
+    either way it deterministically marks "a follower attempt happened",
+    replacing a sleep-and-hope wait."""
     real_scan = store._scan_messages_with_paths
     entered = threading.Event()
     proceed = threading.Event()
+    second_call_started = threading.Event()
+    calls = [0]
+    calls_lock = threading.Lock()
 
     def paused_scan(*args, **kwargs):
-        entered.set()
-        assert proceed.wait(timeout=5), "test never released the paused scan"
+        with calls_lock:
+            calls[0] += 1
+            n = calls[0]
+        if n == 2:
+            second_call_started.set()
+        if n == 1:
+            entered.set()
+            assert proceed.wait(timeout=5), "test never released the paused scan"
         return real_scan(*args, **kwargs)
 
     store._scan_messages_with_paths = paused_scan
-    return entered, proceed
+    return entered, proceed, second_call_started
 
 
 def _pausable_trust(monkeypatch: pytest.MonkeyPatch):
@@ -2635,22 +2649,100 @@ def _pausable_trust(monkeypatch: pytest.MonkeyPatch):
     repro paused at ("pause it right after validation"). Only the FIRST call
     pauses (the leader's); later calls (a follower's own, independent call
     under this fix, since validation is no longer coalesced) proceed
-    immediately. Returns ``(entered, proceed)``."""
+    immediately. Returns ``(entered, proceed, second_call_started)`` -
+    ``second_call_started`` fires the moment a follower's OWN call reaches
+    ``_trust``, replacing a sleep-and-hope wait."""
     real_trust = web._snapshots._trust
     entered = threading.Event()
     proceed = threading.Event()
-    first = threading.Event()
+    second_call_started = threading.Event()
+    calls = [0]
+    calls_lock = threading.Lock()
 
     def paused_trust(store, cfg):
+        with calls_lock:
+            calls[0] += 1
+            n = calls[0]
+        if n == 2:
+            second_call_started.set()
         result = real_trust(store, cfg)
-        if not first.is_set():
-            first.set()
+        if n == 1:
             entered.set()
             assert proceed.wait(timeout=5), "test never released the paused trust"
         return result
 
     monkeypatch.setattr(web._snapshots, "_trust", paused_trust)
+    return entered, proceed, second_call_started
+
+
+class _PausableDirProxy:
+    """Wraps a real directory ``Path`` so its FIRST ``iterdir()`` call
+    freezes the listing immediately (matching the real scan's own
+    ``sorted(self.messages_dir.iterdir())`` - the listing is captured before
+    anything can pause), then blocks - exactly the reviewer's own "pause
+    right after the sorted enumeration" checkpoint, not merely "before the
+    scan starts" (which would let the scan's FIRST call happen to observe a
+    publication that landed during the pause, depending on unrelated
+    timing). All other attribute access delegates to the real ``Path``."""
+
+    def __init__(self, real_dir, on_enumerated, wait_for_release):
+        self._real_dir = real_dir
+        self._on_enumerated = on_enumerated
+        self._wait_for_release = wait_for_release
+        self._first = True
+
+    def iterdir(self):
+        listing = list(self._real_dir.iterdir())
+        if self._first:
+            self._first = False
+            self._on_enumerated()
+            self._wait_for_release()
+        return iter(listing)
+
+    def __getattr__(self, name):
+        return getattr(self._real_dir, name)
+
+
+def _pausable_enumeration(store: Store):
+    """Patch ``store.messages_dir`` so the scan's FIRST directory listing
+    freezes and pauses immediately after being captured. Returns
+    ``(entered, proceed)``."""
+    entered = threading.Event()
+    proceed = threading.Event()
+
+    def wait_for_release():
+        assert proceed.wait(timeout=5), "test never released the paused enumeration"
+
+    store.messages_dir = _PausableDirProxy(store.messages_dir, entered.set, wait_for_release)
     return entered, proceed
+
+
+def _confirm_second_singleflight_attempt(monkeypatch: pytest.MonkeyPatch) -> threading.Event:
+    """Patch ``_message_scan_singleflight.do`` to signal the moment a SECOND
+    call attempt reaches the coalescer's leader/follower decision - unlike
+    ``_pausable_scan``'s own ``second_call_started`` (which only fires if a
+    second call reaches the underlying scan FUNCTION, i.e. only when the
+    follower is gen-gated into starting a fresh scan of its own), this fires
+    regardless of whether the follower ends up joining the in-flight entry
+    or being correctly turned away from it - the right signal for a test
+    (like a plain roster/config change, with no publication) where the
+    follower is EXPECTED to join rather than rescan. Replaces a
+    sleep-and-hope wait for "the follower reached the coalescer"."""
+    real_do = web._message_scan_singleflight.do
+    count = [0]
+    count_lock = threading.Lock()
+    second_attempt = threading.Event()
+
+    def traced_do(key, gen, fn):
+        with count_lock:
+            count[0] += 1
+            n = count[0]
+        if n == 2:
+            second_attempt.set()
+        return real_do(key, gen, fn)
+
+    monkeypatch.setattr(web._message_scan_singleflight, "do", traced_do)
+    return second_attempt
 
 
 def test_concurrent_calls_with_matching_context_still_coalesce_the_scan(
@@ -2766,7 +2858,7 @@ def test_signing_enforcement_change_mid_flight_is_never_shared(
     cfg = store.load_config()
     assert store.signing_enforced() is False  # sanity: starts OFF
 
-    entered, proceed = _pausable_trust(monkeypatch)
+    entered, proceed, second_call_started = _pausable_trust(monkeypatch)
 
     def call_entry_point():
         if entry_point == "all_messages":
@@ -2789,7 +2881,8 @@ def test_signing_enforcement_change_mid_flight_is_never_shared(
     follower_result = {}
     follower = threading.Thread(target=lambda: follower_result.update(bodies=call_entry_point()))
     follower.start()
-    time.sleep(0.2)  # let the follower reach and join the in-flight scan
+    assert second_call_started.wait(timeout=5), (
+        "follower never reached its own trust decision")
 
     proceed.set()
     leader.join(timeout=5)
@@ -2813,7 +2906,7 @@ def test_signing_enforcement_change_mid_flight_is_never_shared(
 
 @pytest.mark.parametrize("entry_point", ["all_messages", "validated_for_state"])
 def test_roster_change_mid_flight_is_never_shared(
-    tmp_path: Path, entry_point: str,
+    tmp_path: Path, entry_point: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """#246 F1: same shape as the signing-transition test, for a
     config/roster change instead of a trust change - but unlike signing
@@ -2848,7 +2941,8 @@ def test_roster_change_mid_flight_is_never_shared(
         "subject": "", "body": "new-agent-body", "meta": {},
     })
 
-    entered, proceed = _pausable_scan(store)
+    entered, proceed, _ = _pausable_scan(store)
+    second_attempt = _confirm_second_singleflight_attempt(monkeypatch)
 
     def call_entry_point():
         # Reload cfg FRESH per call, exactly as a real request does (each
@@ -2875,7 +2969,7 @@ def test_roster_change_mid_flight_is_never_shared(
     follower_result = {}
     follower = threading.Thread(target=lambda: follower_result.update(bodies=call_entry_point()))
     follower.start()
-    time.sleep(0.2)  # let the follower reach and join the in-flight scan
+    assert second_attempt.wait(timeout=5), "follower never reached the coalescer"
 
     proceed.set()
     leader.join(timeout=5)
@@ -2894,6 +2988,95 @@ def test_roster_change_mid_flight_is_never_shared(
         f"{entry_point}: follower did not get its own current roster applied - "
         f"it inherited the leader's stale, pre-change validation verdict "
         f"instead of validating fresh with its own context")
+
+
+@pytest.mark.parametrize("entry_point", ["all_messages", "validated_for_state"])
+def test_read_after_publication_freshness_is_never_shared(
+    tmp_path: Path, entry_point: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#246 P2 (read-after-publication), reproducing the delta reader's own
+    interleave on both entry points: pause the scanner right after the
+    sorted enumeration (event-synchronized, via ``_pausable_enumeration`` -
+    the exact checkpoint the reviewer's own repro used, so the leader's file
+    LIST is frozen before anything else can run); publish a SECOND message
+    via an INDEPENDENT ``Store`` handle
+    (mirroring a different request/connection, which would construct its
+    own) while the scan is held open; start a follower and confirm it
+    reached the coalescer; release.
+
+    Before this fix (coalescing keyed by store root alone, with no
+    publication-awareness), the follower joined the stale, one-message
+    scan outright - it could not see the second message no matter how fresh
+    its own validation context was (per-caller validation, F1's whole fix,
+    cannot recover a file that is simply ABSENT from the shared rows). After
+    this fix (generation-gated coalescing - see ``_SingleFlight``'s
+    docstring), the follower's own freshly-observed publication generation
+    is NEWER than what the in-flight scan started with, so it never joins:
+    it starts its own, unblocked rescan and correctly sees both messages.
+    The leader, having started before the publish, legitimately keeps
+    seeing only the first message throughout (same as-of-call-time contract
+    as the roster/trust tests above) - asserted explicitly so a future
+    change that makes the LEADER's answer change too (impossible without
+    coalescing validation itself, which would reopen F1) gets caught here.
+    """
+    store = _make_store(tmp_path)
+    store.send(sender="alpha", recipient="beta", body="first-message")
+    cfg = store.load_config()
+
+    entered, proceed = _pausable_enumeration(store)
+
+    def call_entry_point():
+        if entry_point == "all_messages":
+            msgs = web._all_messages(store, cfg=cfg)
+        else:
+            msgs, _rejects = web._validated_for_state(store, cfg)
+        return {m.body for m in msgs}
+
+    leader_result = {}
+    leader = threading.Thread(target=lambda: leader_result.update(bodies=call_entry_point()))
+    leader.start()
+    assert entered.wait(timeout=5), "leader never finished its sorted enumeration"
+
+    # Publish a SECOND message via an INDEPENDENT Store handle - a different
+    # request/connection would construct its own Store too - WHILE the
+    # leader's scan is held open.
+    independent_store = Store(store.root)
+    independent_store.send(sender="alpha", recipient="beta", body="second-message")
+
+    # Confirm the follower actually reached the coalescer's decision before
+    # releasing - deterministic, not a sleep-and-hope race. Either outcome
+    # (joining the leader, or the gen-gated fresh rescan this fix performs)
+    # reaches `_message_scan_singleflight.do`, so this signal is outcome-
+    # agnostic. Patched BEFORE the follower thread starts - the leader's own
+    # call already passed through `.do` before this point, so it is
+    # unaffected (a Python attribute lookup at call time, not re-dispatched
+    # mid-call).
+    real_do = web._message_scan_singleflight.do
+    reached = threading.Event()
+
+    def watch_do(key, gen, fn):
+        reached.set()
+        return real_do(key, gen, fn)
+    monkeypatch.setattr(web._message_scan_singleflight, "do", watch_do)
+
+    follower_result = {}
+    follower = threading.Thread(target=lambda: follower_result.update(bodies=call_entry_point()))
+    follower.start()
+    assert reached.wait(timeout=5), "follower never reached the coalescer"
+
+    proceed.set()
+    leader.join(timeout=5)
+    follower.join(timeout=5)
+    assert not leader.is_alive() and not follower.is_alive()
+
+    # The leader legitimately keeps seeing only what existed when it began.
+    assert follower_result["bodies"] == {"first-message", "second-message"}, (
+        f"{entry_point}: follower did not see the message published while "
+        f"its in-flight scan was open - it joined a scan that cannot see it "
+        f"(read-after-publication freshness violated)")
+    assert leader_result["bodies"] == {"first-message"}, (
+        f"{entry_point}: leader's own result changed after a follower/publish "
+        f"- validation or scan results are leaking across callers")
 
 
 # ===================================== 0.18.0 (WP02): retired history parity
