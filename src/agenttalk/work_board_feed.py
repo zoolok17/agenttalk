@@ -3,7 +3,7 @@ import json
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-from agenttalk import gates, work_board
+from agenttalk import gates, work_board, work_board_facts
 from agenttalk.envelope_snapshot import selected_closure
 from agenttalk.store import Message
 
@@ -60,13 +60,20 @@ def bounded(feed, *, card_limit=100, byte_limit=256 * 1024):
     return feed
 
 
-def build(snapshot, *, project, lead, gate_state, now=None, integrated=None,
+def build(snapshot, *, project, lead, gate_state, now=None, integrated=None, integration=None,
           envelope_limit=50000, source_byte_limit=128 * 1024 * 1024, **bounds):
     now = now or datetime.now(timezone.utc)
     # Identical active/compacted copies count once. Conflicts are rejected by closure coverage.
     found = {e.id: e for e in (*snapshot.archives, *snapshot.envelopes)}
     messages = [Message.from_dict(e.fields) for e in found.values()]
     preliminary = work_board.reduce(messages, lead=lead, integrated=integrated)
+    notes, warnings = {}, list((integration or {}).get("warnings", []))
+    if integration is not None:
+        try:  # facts bind to each item's current repository binding from this reduction
+            integrated, notes = work_board_facts.integration_for(preliminary["items"], integration)
+        except Exception as exc:  # noqa: BLE001 - optional evidence never suppresses the board
+            integrated, notes = {}, {}
+            warnings.append(f"integration evidence unusable ({type(exc).__name__})")
     checks = {(i["work_item"], i["cycle"]): gates.check_board(
         None, project=project, item=i["work_item"], cycle=i["cycle"], revision=i["candidate"],
         keys=i.get("check_keys"), state=gate_state) for i in preliminary["items"]}
@@ -105,6 +112,11 @@ def build(snapshot, *, project, lead, gate_state, now=None, integrated=None,
         if snapshot.archives_complete and not snapshot.invalid_count and not snapshot.archive_invalid_count and (
                 cancelled or (item["workflow_column"] == "done" and last and last < now - timedelta(days=7))):
             continue
+        note = notes.get((item["work_item"], item["candidate"]))
+        if note:  # stale or unmatched evidence never makes Done; the derived column stays
+            item["reason"] += "; " + note[0]
+            if note[1]:
+                item["integration_stale_as_of"] = note[1]
         starts = dispatched[item["work_item"]]
         item.update(first_dispatch_at=min(starts).isoformat() if starts else None,
                     last_work_event_at=last.isoformat() if last else None,
@@ -125,6 +137,7 @@ def build(snapshot, *, project, lead, gate_state, now=None, integrated=None,
         reduced["legacy"]["open_request_count"] = None
     selected.sort(key=lambda i: (i["last_work_event_at"] or "", i["work_item"]), reverse=True)
     errors = ([reduced["error"]] if reduced.get("error") else []) + global_gates.get("warnings", [])
+    errors += warnings
     if closure["capacity_warning"]:
         errors.append("selected closure at capacity warning; schedule B4b/B4c indexing")
     return bounded({"schema_version": 1, "target_root_project_id": project, "generated_at": now.isoformat(),

@@ -737,7 +737,7 @@ _SUPERVISOR_LAUNCH_NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 _AGENTTALK_SUBCOMMANDS = frozenset(
     "dev-gate init status supervisor threads roster avatar domain send "
     "await-cancel composing rescind check gate close lane relay knowledge "
-    "onboarding barrier prune escalate attention propose task broadcast recv "
+    "onboarding barrier board prune escalate attention propose task broadcast recv "
     "drain compact wait ack sync whoami transcript end release heartbeat "
     "checkpoint request-restart commit-gate request-launch wrap "
     "_internal-check-wrap-dispatch dead-letter reply-refusal progress "

@@ -38,6 +38,14 @@ jobs:
       # will mutate this runner's registry - set explicitly only here, the
       # one job whose Windows leg needs those symlink tests to execute.
       AGENTTALK_AUTHORIZE_SYMLINK_DEVMODE: ${{ matrix.os.id == 'windows' && '1' || '' }}
+      # ci-xdist-posix (see #232's probe for why): two pytest-xdist workers
+      # on Linux/macOS only - set here, by the OS-scoped matrix expression,
+      # never by a runtime platform check inside dev_gate.py (which runs
+      # identically on every OS). Windows stays serial: PowerShell-host
+      # startup capacity and a fixed-port gateway test both showed real
+      # contention under parallel workers there that #232's probe did not
+      # finish running to ground in six rounds.
+      AGENTTALK_DEV_GATE_POSIX_PARALLEL: ${{ matrix.os.id != 'windows' && '1' || '' }}
     # Per-OS ceiling: the two pytest runs (source + wheel) are each capped at
     # 7200s in dev-gate.json (raised from 5400s). Measured 2026-09-29 (the
     # 09-25 "~55-65 min per run" figure above was already stale): PR #230's

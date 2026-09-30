@@ -393,18 +393,247 @@ def pytest_configure(config: pytest.Config) -> None:
     )
 
 
+# CI (#232 probe, ci-xdist-posix): two pytest-xdist workers under --dist
+# loadgroup contend for real, machine-wide resources (a PowerShell-host
+# startup slot, the OVH gateway's fixed 127.0.0.1:4000/4001 ports) when a
+# test that touches one lands on a DIFFERENT worker than another one -
+# round 1 of the probe measured this as intermittent failures/timeouts,
+# never a real product bug. Every item below touches a real, unmocked
+# instance of one of those two resources (verified by reading each helper,
+# not just grepping for a keyword) and is forced into the matching shared
+# xdist_group so every member always lands on the SAME one worker,
+# serialized against each other; every other test keeps its per-file
+# group, reproducing today's --dist loadfile behavior exactly. Linux/macOS
+# only actually distribute under xdist today (see pytest_collection_
+# modifyitems below); on Windows these markers are harmless no-ops.
+_PWSH_SPAWNING_TEST_NAMES = frozenset(
+    {
+        # tests/test_powershell_functional.py - module-skipped off Windows /
+        # without a real `pwsh` on PATH; every remaining test spawns one.
+        "test_real_core_parses_and_runs_all_generated_harmless_paths",
+        "test_real_core_accepts_direct_powershell_to_python_claim_chain",
+        "test_real_core_override_claim_uses_baked_fallback_for_validation",
+        "test_windows_powershell_51_rejects_each_script_before_sentinel",
+        "test_real_selected_host_record_is_discrete_core_version",
+        "test_real_probe_timeout_job_reaps_descendant",
+        # tests/test_supervisor.py - each of these calls a real pwsh/powershell.exe
+        # (a live probe, a live config-transport read, or a generated .ps1
+        # actually executed), not a monkeypatched stand-in.
+        "test_checkpoint_hook_guard_masks_legacy_exit_two_in_pwsh",
+        "test_generated_ps1_is_bom_ascii_and_parses",
+        "test_supervisor_config_transport_preserves_unicode_environment_names",
+        "test_supervisor_config_transport_rejects_ambiguous_environment_names",
+        "test_ephemeral_launcher_applies_environment_names_literally",
+        "test_generated_helper_ps1_are_bom_ascii_and_parse",
+        "test_generated_ps1_holds_malformed_config_poll_until_refresh_recovers",
+        "test_generated_ps1_hot_adds_agent_across_live_polls",
+        "test_generated_ps1_holds_poll_when_preplan_state_save_is_contended",
+        "test_ps_state_atomic_swap_retries_windows_sharing_violation",
+        "test_ps_poll_state_save_warns_and_survives_persistent_contention",
+        "test_ps_poll_state_save_only_softens_sharing_and_lock_violations",
+        "test_spawned_launch_is_not_acknowledged_when_record_launch_cannot_commit",
+        "test_generated_ps1_two_polls_do_not_duplicate_launch_after_postspawn_contention",
+        "test_ps_state_helpers_recover_backup_and_refuse_two_corrupt_copies",
+        "test_ps_set_agent_state_adds_new_agent_to_fresh_and_reloaded_state",
+        "test_generated_ps1_runs_bus_calls_without_console_script_on_path",
+        "test_proc_start_falls_back_to_get_process_when_cim_denied",
+        "test_generated_proc_snapshot_emits_exact_live_filetime",
+        "test_stop_tree_rejects_rounded_start_collision_by_exact_filetime",
+        "test_stop_tree_verifies_and_terminates_through_one_native_handle",
+        "test_generated_ps1_tamper_refuses_before_claim",
+        "test_generated_ps1_quiet_suppresses_warning_path",
+        "test_generated_ps1_quiet_suppresses_relaunch_helper_warnings",
+        "test_generated_ps1_quotes_args_with_spaces_as_single_arg",
+        "test_ps_wrapper_log_targets_preserve_output_and_prune_old_generations",
+        "test_ps_wrapper_log_retention_settles_one_over_quota_not_at_quota",
+        "test_ps_wrapper_log_prune_survives_backward_clock_correction",
+        "test_ps_wrapper_log_sequence_survives_failover_to_fallback_root",
+        "test_ps_wrapper_log_attempt_cleaned_up_when_pending_marker_write_fails",
+        "test_ps_wrapper_log_prune_refuses_when_root_scan_is_uncertain",
+        "test_ps_wrapper_log_sequence_not_uncertain_when_root_has_no_agent_dir",
+        "test_ps_wrapper_log_prune_bound_recovers_from_persistent_uncertainty",
+        "test_ps_wrapper_log_sequence_write_failure_marks_uncertain_and_defers_prune",
+        "test_ps_wrapper_log_sequence_uncertainty_persists_to_the_next_launch",
+        "test_ps_wrapper_log_security_does_not_depend_on_ambient_os_marker",
+        "test_ps_wrapper_log_cleanup_failure_uses_new_generation_and_still_launches",
+        "test_ps_wrapper_log_retention_is_global_across_primary_and_fallback",
+        "test_ps_failed_launch_generations_never_evict_prior_evidence",
+        "test_ps_locked_uncommitted_generation_never_displaces_real_evidence",
+        "test_ps_markerless_failed_generation_never_displaces_real_evidence",
+        "test_ps_wrapper_log_agent_paths_do_not_alias_windows_names",
+        "test_ps_wrapper_log_root_reparse_is_rejected_before_traversal",
+        "test_ps_wrapper_redirect_closes_supervisor_capture_pipes_before_child_exit",
+        "test_launch_environment_apply_failure_restores_parent_without_spawn",
+        "test_supervisor_launch_nonce_injection_consumes_typed_position",
+        "test_ps_regular_wrapped_launch_consumes_planned_loop_admission",
+        "test_launchers_consume_accepted_admission_argv_without_dropping_empty_argument",
+        "test_launchers_refuse_unusable_admission_before_environment_or_spawn",
+        "test_launch_admission_resolver_rejects_type_coercion_and_shape_drift",
+        "test_supervisor_wrapper_logging_is_driven_by_typed_admission",
+        "test_ps_start_wrapper_process_fallback_strips_logging_env_vars",
+        "test_ps_start_wrapper_process_reports_unredirected_when_both_sides_degrade",
+        "test_ps_start_wrapper_process_reports_redirected_when_one_side_degrades",
+        "test_ps_start_wrapper_process_strips_env_before_both_degraded_fallback",
+        "test_ps_launch_discards_targets_when_fallback_is_unredirected",
+        "test_launch_rechecks_kill_switch_after_branch_guard",
+        "test_stop_tree_kills_real_two_level_tree_start_guarded",
+        "test_seed_codex_home_provisions_and_fails_closed",
+        "test_preflight_wrapped_codex_validates_python_not_codex_sandbox",
+        "test_preflight_wrapped_console_entry_uses_direct_version_probe",
+        "test_preflight_wrapped_smoke_test_uses_admitted_prefix",
+        # tests/test_supervisor_spawn_seam.py - real spawn-seam tests only
+        # (the pure PS_TEMPLATE text/regression-tripwire tests in the same
+        # file are deliberately left OUT: they never spawn anything).
+        "test_spawn_seam_refuses_invalid_precreate_input_with_closed_result",
+        "test_spawn_seam_reports_unknown_without_a_null_result",
+        "test_spawn_seam_start_process_path_records_exact_identity",
+        "test_spawn_seam_real_wrapper_reaches_readiness_with_one_exact_identity",
+        # tests/test_ephemeral_reviewers.py
+        "test_prepare_cli_preserves_unicode_profile_environment_names",
+        "test_prepare_cli_rejects_colliding_environment_names_before_effects",
+        "test_prepare_cli_requires_powershell_accepted_config_before_effects",
+        # tests/test_coverage_producer.py - each junctions a real reparse point
+        # via a short-lived `powershell -Command New-Item -ItemType Junction`.
+        "test_dangling_selected_reparse_object_refuses_default",
+        "test_agenttalk_runtime_junction_is_not_scanner_owned",
+        "test_scanner_leaf_below_runtime_junction_is_not_exempt",
+        "test_coverage_lock_refuses_reparse_parent_without_touching_target",
+        "test_stored_coverage_lock_context_revalidates_replaced_parent",
+        "test_artifact_writer_refuses_reparse_output_parent",
+    }
+)
+
+# test_prepare_cli_requires_powershell_accepted_config_before_effects is
+# parametrized over 3 config-drift scenarios; only "transport_ambiguous"
+# actually reaches the real powershell-config-transport probe - the
+# "missing"/"changed" scenarios are rejected earlier, before any process is
+# spawned, and must stay free to run on either worker.
+_PWSH_SPAWNING_ONLY_PARAM_IDS = {
+    "test_prepare_cli_requires_powershell_accepted_config_before_effects": {"transport_ambiguous"},
+}
+
+# The OVH gateway's real ports are FIXED module-level constants
+# (127.0.0.1:4000/4001, ovh_gateway.PUBLIC_PORT/INTERNAL_PORT) - every
+# unmocked call into exclusive_bind_probe/_both_sockets_free (reached from
+# gateway_status, reconfigure_endpoint, rebind_runtime, the real service
+# runner, and the task-start path in ovh_gateway_service.py) does a REAL
+# socket bind-probe against them. Two of these landing on different xdist
+# workers at the same moment collide. Identified by tracing every call
+# site, not by grepping for the port constants (which alone would have
+# missed test_ovh_gateway_cli.py - it never mentions PUBLIC_PORT/
+# INTERNAL_PORT by name, but its bare `agenttalk gateway status` CLI test
+# calls the unmocked `service.gateway_status()`, which unconditionally
+# probes PUBLIC_PORT). None of these 12 tests are parametrized. This group
+# is disjoint from "pwsh" (no test is both) - if that ever changes, "pwsh"
+# wins, since PowerShell-host startup contention was the FIRST flake found
+# and its probe timeout is tighter (5s) than any gateway-port failure mode.
+_GATEWAY_PORT_TEST_NAMES = frozenset(
+    {
+        # tests/test_ovh_gateway_lifecycle_integration.py - both tests: each
+        # spawns real subprocesses that call unmocked rebind_runtime/
+        # reconfigure_endpoint/run_service; the second test's subprocess
+        # actually binds and listens on both ports for the test's duration.
+        "test_real_process_rebind_serializes_reconfigure_without_stale_manifest_write",
+        "test_real_process_service_startup_excludes_rebind_until_sockets_are_owned",
+        # tests/test_ovh_gateway_service.py - each reaches gateway_status()
+        # or stop_task()/_service_absent() without mocking
+        # exclusive_bind_probe/_both_sockets_free first.
+        "test_operator_stop_uses_gateway_kill_switch_before_bounded_task_end",
+        "test_linux_operator_stop_uses_gateway_kill_switch_before_bounded_unit_stop",
+        "test_linux_status_reports_absent_unit_before_any_install",
+        "test_forced_stop_removes_only_stale_marker_after_both_sockets_are_free",
+        "test_manifest_and_task_written_under_one_envelope_fail_against_another_ledger",
+        "test_status_reports_no_policy_hash_when_the_ledger_is_unavailable",
+        "test_init_with_reasoning_params_renders_them_and_records_them_in_the_manifest",
+        "test_default_install_has_no_reasoning_params_anywhere",
+        "test_a_tampered_manifest_reasoning_param_fails_closed",
+        # tests/test_ovh_gateway_cli.py - the one CLI test that never mocks
+        # gateway_status before invoking `agenttalk gateway status`.
+        "test_gateway_status_not_ready_uses_operational_error_exit",
+    }
+)
+
+
+def _pwsh_group_for(item: pytest.Item) -> str | None:
+    name = getattr(item, "originalname", None) or item.name.split("[", 1)[0]
+    if name not in _PWSH_SPAWNING_TEST_NAMES:
+        return None
+    only_ids = _PWSH_SPAWNING_ONLY_PARAM_IDS.get(name)
+    if only_ids is not None:
+        callspec_id = getattr(getattr(item, "callspec", None), "id", None)
+        if callspec_id not in only_ids:
+            return None
+    return "pwsh"
+
+
+def _xdist_group_for(item: pytest.Item) -> str | None:
+    name = getattr(item, "originalname", None) or item.name.split("[", 1)[0]
+    pwsh_group = _pwsh_group_for(item)
+    if pwsh_group is not None:
+        return pwsh_group
+    if name in _GATEWAY_PORT_TEST_NAMES:
+        return "gateway-ports"
+    return None
+
+
+def _xdist_is_active(config: pytest.Config) -> bool:
+    """#250 fix round 1 (codex cold read dev-5, reproduced directly): the
+    dev gate disables plugin autoload and loads xdist explicitly via
+    `-p xdist.plugin` - that registers the plugin under the name
+    "xdist.plugin", NOT the autoload entry-point name "xdist" that a bare
+    `config.pluginmanager.hasplugin("xdist")` check alone would catch.
+    Registration under the gate's real invocation was observed as
+    {xdist: False, xdist.plugin: True} - no xdist_group markers were ever
+    added under it, the same class of silent inertness the #232 probe's
+    round 6 found for the marker/nodeid hook-ordering bug. Check the actual
+    CAPABILITY xdist adds (the -n/--dist CLI options, confirmed present
+    only when xdist is loaded by either name) instead of any one specific
+    plugin name, so a third future loading mechanism is covered too."""
+    return hasattr(config.option, "numprocesses")
+
+
+@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items) -> None:
     """#50: process-orchestration tests marked source_layout cannot pass under
     an installed-wheel run through a venv launcher (Popen.pid != child pid), and
     add no packaging coverage (they force PYTHONPATH=src for their own
     subprocess). Skip them only when running against an installed wheel; source
-    mode runs them."""
+    mode runs them.
+
+    CI (#232 probe -> ci-xdist-posix): under `--dist loadgroup` (Linux/macOS
+    legs only - see dev_gate.py's AGENTTALK_DEV_GATE_POSIX_PARALLEL), every
+    item is forced into the "pwsh" or "gateway-ports" group (see above) if
+    it touches one of those two shared, machine-wide resources for real,
+    else its own test file - reproducing today's `--dist loadfile` behavior
+    for everything else. Only meaningful with the xdist plugin loaded and
+    `-n`/`--dist` actually passed; a plain `pytest` run, or a Windows leg
+    (xdist never distributes there), collects these markers as inert no-ops.
+
+    `@pytest.hookimpl(tryfirst=True)` above is REQUIRED, not decorative
+    (#232 probe round 6, reproduced directly: a 3-item minimal case ran on
+    two DIFFERENT xdist workers without it, and on one worker, with the
+    group suffix visible in the reported test ids, after adding it).
+    `xdist.remote.WorkerInteractor` (loaded only inside each xdist WORKER
+    subprocess) has its OWN plain-priority `pytest_collection_modifyitems`
+    that reads each item's `xdist_group` markers and appends `@<group>` to
+    the item's nodeid - that suffix, not the marker object itself, is what
+    the scheduler actually groups on. With default hook priority, pytest
+    calls xdist's implementation BEFORE this one (no marker exists yet when
+    xdist looks), so `--dist loadgroup` silently falls back to per-item
+    scheduling - group membership is correct, but has zero scheduling
+    effect, unless this hook runs first."""
     if not _running_against_installed_wheel():
-        return
-    skip = pytest.mark.skip(
-        reason="source_layout: process-orchestration test needs a real-interpreter "
-        "layout; not run under wheel-isolation (#50)"
-    )
-    for item in items:
-        if "source_layout" in item.keywords:
-            item.add_marker(skip)
+        pass
+    else:
+        skip = pytest.mark.skip(
+            reason="source_layout: process-orchestration test needs a real-interpreter "
+            "layout; not run under wheel-isolation (#50)"
+        )
+        for item in items:
+            if "source_layout" in item.keywords:
+                item.add_marker(skip)
+
+    if _xdist_is_active(config):
+        for item in items:
+            group = _xdist_group_for(item) or item.location[0]
+            item.add_marker(pytest.mark.xdist_group(name=group))

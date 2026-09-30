@@ -9,6 +9,115 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Work board: a Done lane from lead-run, Git-verified merge facts (#207).**
+  The reducer could already place Done from integration evidence, but nothing
+  supplied it. The new `agenttalk board verify-merges [--dry-run] [--json]`
+  runs outside the web server. For every current (work item, candidate) pair,
+  it checks ancestry against the approved target refs of an operator-approved
+  local checkout (`work_repos` in the project config).
+  - It uses only `rev-parse`, `merge-base --is-ancestor` and `cat-file`, with
+    a hardened environment and a 2 second timeout per probe.
+  - Ambiguous refs, symlinked or escaping paths, shallow history and missing
+    objects give no fact (Unknown), never Done.
+  - It writes a bounded, schema-versioned `state/work-board-facts.json`
+    atomically, under a store lock, bound to the store session.
+  - Only one run at a time: a second run is refused. A run also refuses to
+    publish after a store reset, and never overwrites a facts file of an
+    unsupported schema.
+
+  The snapshot worker only reads that file and never runs Git:
+  - a missing, malformed or oversize file, or any other fault in this optional
+    evidence, gives no facts and a visible warning, never a missing board;
+  - a fact older than `integration_facts_max_age_seconds` (default 24 h), or
+    future-dated, never makes Done, and the card says "integration evidence
+    stale (as of ...)";
+  - a fact from a remapped alias or target is ignored;
+  - a fact counts only for the item's current binding (its declared
+    `work_repo`/`work_target`, else the current default), so proof from an
+    earlier default or target is never reused. An explicitly empty declaration
+    is invalid, never the default;
+  - a section from another store session is ignored.
+
+  This replaces the in-server cached observer of the work-board design
+  (section 4) and supersedes draft #238. The lead skill now runs the command
+  after every merge and on every lead tick. Cards also carry the item's
+  declared `repo_binding`. See docs/WORK-BOARD-FEED.md.
+
+- **Supervisor restart budget: a seat is never relaunched into a loop.**
+  Backoff only slows relaunches down, and the readiness give-up stops only a
+  seat that never becomes ready. So a seat that became ready and then crashed
+  again was relaunched forever. Each seat now has a durable restart budget:
+  at most `max_relaunches` (default 4) automatic relaunch attempts until the
+  seat has been continuously healthy for `window_seconds` (default 3600),
+  which refills it.
+  - Every automatic relaunch attempt is charged, including one whose
+    seed/preflight check fails or whose launch returns no process.
+  - A manual `request-restart` relaunch and a launch-barrier refusal are not
+    charged.
+  - "Continuously healthy" means every poll in the window was green. Any
+    other observation (for example an unreadable wrapper identity), or a gap
+    between polls of more than 5 minutes (or three poll intervals, if
+    longer), starts the window again. Time alone never refills the budget.
+
+  When a relaunch is due and the budget is spent, the supervisor does not
+  relaunch. It holds the seat in the new sticky `RESTART_BUDGET_EXHAUSTED`
+  state and sends ONE escalation note to `notify_to`, naming the seat, the
+  relaunch count and the window.
+  - The note is marked delivered only after the send succeeds. A failed or
+    unconfigured send is retried every `suspect_warn_interval_seconds`, which
+    delays the note but never drops it.
+  - A hold stays visible, and its escalation is still sent, while another
+    hold (for example a process-ownership warning) decides the poll.
+
+  Neither health nor time lifts the hold. It clears only on an audited
+  request by the operator-facing liaison or sole lead:
+  - `agenttalk request-restart --for <seat>` relaunches now; that relaunch is
+    not charged to the budget;
+  - the new `agenttalk request-restart --for <seat> --clear-restart-budget`
+    re-arms the budget without killing or launching anything. It is applied
+    even while a process-ownership guard blocks restarts, and it never
+    removes a lead-loop stand-down or exit marker.
+
+  The budget, the hold and the last clear's audit record are persisted in
+  `supervisor-state.json`, so restarting the supervisor does not reset a
+  crash loop. A clear is saved before its request marker is deleted. A
+  damaged relaunch record counts as a spent budget until an audited clear
+  replaces it. Set `restart_budget` globally or per agent in
+  `supervisor.json`; out-of-range values fall back and cannot switch the
+  budget off. Backoff, the readiness give-up (which keeps precedence) and
+  the one-wrapper barrier are unchanged.
+
+### Removed
+
+- **spec-kitty support (operator decision, 2026-09-28).** The retired
+  `agenttalk.sk-loop`/`agenttalk-sk-loop` skill is no longer bundled; the lead,
+  listen, handoff, propose and send skills now state their split-work,
+  ownership-boundary, review and no-second-state-machine invariants in
+  positive, tool-neutral wording instead of naming spec-kitty. `/api/state`
+  no longer emits a `spec_kitty` field, and the classic console drops the
+  mission pill and the mission count in the health subtitle — the generic
+  `mission`/`wp_id` thread-metadata display is unaffected; that stays as
+  plain bus metadata. `kitty-specs/` and `.kittify/` are removed from the
+  tree (git history keeps them), and the spec-kitty-specific lines are
+  removed from `.gitignore`/`.gitattributes`/`.claudeignore`.
+
+  **Existing-install migration.** `install-skills` detects a leftover
+  installed `agenttalk.sk-loop.md` / `agenttalk-sk-loop/SKILL.md` at your
+  install destinations and WARNS with the exact path and this migration
+  recipe. It never deletes anything: an earlier round of this change did
+  attempt an automatic byte-identical delete, but that turned out to have
+  no cross-platform-safe definition of "byte-identical" (CRLF vs LF
+  checkouts hash differently) and could not be made safe against a
+  hash-to-unlink race or a linked directory component, so removal is a
+  manual step:
+  ```
+  rm "<claude-commands-dir>/agenttalk.sk-loop.md"
+  rm -r "<codex-skills-dir>/agenttalk-sk-loop"
+  agenttalk install-skills --force
+  ```
+
 ### Fixed
 
 - **`agenttalk serve`: unbounded memory/thread growth under real browser
@@ -126,83 +235,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     escalation-answer POST), and a dedicated
     `test_validation_stays_inside_the_scan_concurrency_bound`.
 
-### Added
-
-- **Supervisor restart budget: a seat is never relaunched into a loop.**
-  Backoff only slows relaunches down, and the readiness give-up stops only a
-  seat that never becomes ready. So a seat that became ready and then crashed
-  again was relaunched forever. Each seat now has a durable restart budget:
-  at most `max_relaunches` (default 4) automatic relaunch attempts until the
-  seat has been continuously healthy for `window_seconds` (default 3600),
-  which refills it.
-  - Every automatic relaunch attempt is charged, including one whose
-    seed/preflight check fails or whose launch returns no process.
-  - A manual `request-restart` relaunch and a launch-barrier refusal are not
-    charged.
-  - "Continuously healthy" means every poll in the window was green. Any
-    other observation (for example an unreadable wrapper identity), or a gap
-    between polls of more than 5 minutes (or three poll intervals, if
-    longer), starts the window again. Time alone never refills the budget.
-
-  When a relaunch is due and the budget is spent, the supervisor does not
-  relaunch. It holds the seat in the new sticky `RESTART_BUDGET_EXHAUSTED`
-  state and sends ONE escalation note to `notify_to`, naming the seat, the
-  relaunch count and the window.
-  - The note is marked delivered only after the send succeeds. A failed or
-    unconfigured send is retried every `suspect_warn_interval_seconds`, which
-    delays the note but never drops it.
-  - A hold stays visible, and its escalation is still sent, while another
-    hold (for example a process-ownership warning) decides the poll.
-
-  Neither health nor time lifts the hold. It clears only on an audited
-  request by the operator-facing liaison or sole lead:
-  - `agenttalk request-restart --for <seat>` relaunches now; that relaunch is
-    not charged to the budget;
-  - the new `agenttalk request-restart --for <seat> --clear-restart-budget`
-    re-arms the budget without killing or launching anything. It is applied
-    even while a process-ownership guard blocks restarts, and it never
-    removes a lead-loop stand-down or exit marker.
-
-  The budget, the hold and the last clear's audit record are persisted in
-  `supervisor-state.json`, so restarting the supervisor does not reset a
-  crash loop. A clear is saved before its request marker is deleted. A
-  damaged relaunch record counts as a spent budget until an audited clear
-  replaces it. Set `restart_budget` globally or per agent in
-  `supervisor.json`; out-of-range values fall back and cannot switch the
-  budget off. Backoff, the readiness give-up (which keeps precedence) and
-  the one-wrapper barrier are unchanged.
-
-### Removed
-
-- **spec-kitty support (operator decision, 2026-09-28).** The retired
-  `agenttalk.sk-loop`/`agenttalk-sk-loop` skill is no longer bundled; the lead,
-  listen, handoff, propose and send skills now state their split-work,
-  ownership-boundary, review and no-second-state-machine invariants in
-  positive, tool-neutral wording instead of naming spec-kitty. `/api/state`
-  no longer emits a `spec_kitty` field, and the classic console drops the
-  mission pill and the mission count in the health subtitle — the generic
-  `mission`/`wp_id` thread-metadata display is unaffected; that stays as
-  plain bus metadata. `kitty-specs/` and `.kittify/` are removed from the
-  tree (git history keeps them), and the spec-kitty-specific lines are
-  removed from `.gitignore`/`.gitattributes`/`.claudeignore`.
-
-  **Existing-install migration.** `install-skills` detects a leftover
-  installed `agenttalk.sk-loop.md` / `agenttalk-sk-loop/SKILL.md` at your
-  install destinations and WARNS with the exact path and this migration
-  recipe. It never deletes anything: an earlier round of this change did
-  attempt an automatic byte-identical delete, but that turned out to have
-  no cross-platform-safe definition of "byte-identical" (CRLF vs LF
-  checkouts hash differently) and could not be made safe against a
-  hash-to-unlink race or a linked directory component, so removal is a
-  manual step:
-  ```
-  rm "<claude-commands-dir>/agenttalk.sk-loop.md"
-  rm -r "<codex-skills-dir>/agenttalk-sk-loop"
-  agenttalk install-skills --force
-  ```
-
-### Fixed
-
 - **CI flake #223: comprehension tests no longer depend on a real `git
   check-ignore` succeeding within 2 seconds.** Two Windows dev-gate legs
   each hit one `VcsPrivacyRefused` error out of ~8.5k tests, on PRs that
@@ -269,6 +301,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   needs it. Test-only; every assertion is unchanged.
 
 ### CI
+
+- **Dev gate: two pytest-xdist workers on Linux/macOS legs only (#232 probe
+  recommendation (b); Windows stays serial).** `-n 2 --dist loadgroup` is
+  added to the real pytest argv only when `AGENTTALK_DEV_GATE_POSIX_PARALLEL`
+  is set - an env var, set only by `tests.yml`'s matrix expression
+  (`matrix.os.id != 'windows'`), never by a runtime platform check inside
+  `dev_gate.py` (which runs identically on every OS; only the committed
+  `posix_parallel_args` list and whether the env var is set differ). The
+  manifest floor pin and the evidence's positional argv-shape validator both
+  enforce this as a checked fact, not just a declaration: a passing
+  Linux/macOS leg's evidence must carry `posix_parallel_args`, and a passing
+  Windows (or local) leg's evidence must NOT.
+
+  A six-round probe (#232, `ci/probe-xdist-2`, not merged) measured Linux and
+  macOS at a consistent ~1.8-2.4x pytest wall-time reduction with zero test
+  failures across every round. Windows was not shipped: even after fixing a
+  real pytest-xdist hook-ordering bug that had silently made grouping inert
+  since the probe's round 2 (`tests/conftest.py`'s `xdist_group`-adding hook
+  needs `@pytest.hookimpl(tryfirst=True)` to run before xdist's own worker-
+  side nodeid-rewrite hook - carried over here, since it also matters for
+  the Linux/macOS legs' own "pwsh"/"gateway-ports" groups), Windows's
+  speedup shrank to 1.3-1.8x with 0 of 4 Python versions fully green (a
+  PowerShell-host-startup timeout and a fixed-port gateway test both still
+  contend for real, machine-wide resources under real parallel workers, and
+  the serialized worker becomes the long pole). See #232 for the full
+  round-by-round data and the three published lessons.
+
+  **Kill signal, recorded here**: if merged Linux/macOS dev-gate runs
+  regularly save less than ~20% of pytest wall time under production CI
+  load, revert this change.
 
 - **Windows CI capacity stopgap.** Master run 36571318073 (`e6b6421`) killed
   dev-gate windows/3.13's source pytest at the 5400s per-run cap with no

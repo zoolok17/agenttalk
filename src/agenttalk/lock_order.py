@@ -30,6 +30,7 @@ def rank(root: Path, path: Path) -> int:
         "message-publication": 160,
         "state/owed-action/ledger.lock": 170,
         "state/owed-action/proof-health.lock": 180,
+        "work-board-verify.lock": 205,
     }
     if relative in exact:
         return exact[relative]
