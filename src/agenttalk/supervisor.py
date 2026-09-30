@@ -14698,6 +14698,9 @@ function Set-CodexAccessHold($name, $plan, $state, $failure) {
   $notice = @('--root', $Root, 'supervise', '--codex-launch-failure', $failure, '--for', $name)
   $plan.next_state.codex_access_hold.notified = Invoke-CheckedSupervisorMutation ("codex-access-hold {0}" -f $name) $notice
   Set-AgentState $state $name $plan.next_state
+  if ($plan.next_state.codex_access_hold.notified) {
+    if (-not (Save-StateForPoll $state)) { throw 'Codex access notification could not be persisted' }
+  }
 }
 
 function Launch($name, $plan, $codexHome, $acceptedAdmission = $null) {

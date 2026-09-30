@@ -37,6 +37,61 @@ def test_non_windows_does_not_run_icacls(tmp_path):
     run.assert_not_called()
 
 
+def _directory_link(target, link):
+    try:
+        if os.name == 'nt':
+            import _winapi
+            _winapi.CreateJunction(str(target), str(link))
+        else:
+            link.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f'filesystem cannot create directory links: {exc}')
+
+
+def test_acl_reset_skips_real_codex_home_junction(tmp_path):
+    directory = tmp_path / 'store'
+    home = directory / 'codex-home' / 'myagent'
+    home.mkdir(parents=True)
+    guard = home / '.beside.generation'
+    guard.touch()
+    target = tmp_path / 'shared-skills'
+    target.mkdir()
+    (target / '.outside.generation').touch()
+    _directory_link(target, home / 'skills')
+    reset = Mock(return_value=subprocess.CompletedProcess([], 0))
+    cp.reset_guard_acls(directory, windows=True, run=reset)
+    assert reset.call_count == 1
+    assert reset.call_args.args[0][-3:] == [str(guard), '/reset', '/L']
+
+
+@pytest.mark.parametrize('top_level', [False, True])
+def test_linked_generation_or_store_root_is_rejected(tmp_path, top_level):
+    directory = tmp_path / 'store'
+    directory.mkdir()
+    target = tmp_path / 'outside'
+    target.mkdir()
+    link = directory / '.linked.generation'
+    _directory_link(target, link)
+    reset = Mock(return_value=subprocess.CompletedProcess([], 0))
+    with pytest.raises(cp.PreflightError, match='linked store'):
+        cp.reset_guard_acls(link if top_level else directory, windows=True, run=reset)
+    reset.assert_not_called()
+
+
+def test_acl_reset_skips_other_linked_files(tmp_path):
+    directory = tmp_path / 'store'
+    directory.mkdir()
+    target = tmp_path / 'outside.txt'
+    target.touch()
+    try:
+        (directory / 'linked.txt').symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f'filesystem cannot create file symlinks: {exc}')
+    reset = Mock(return_value=subprocess.CompletedProcess([], 0))
+    cp.reset_guard_acls(directory, windows=True, run=reset)
+    reset.assert_not_called()
+
+
 def test_hard_link_guard_is_rejected_before_acl_reset(tmp_path):
     target = tmp_path / 'outside.txt'
     target.write_text('must not be reset')
@@ -115,7 +170,10 @@ def test_same_poll_acl_hold_escalation(tmp_path, delivered):
 $Root = 'test-root'
 $script:events = @()
 function Set-AgentState($state, $name, $next) { $state[$name] = $next }
-function Save-StateForPoll($state) { $script:events += 'saved'; return $true }
+function Save-StateForPoll($state) {
+  $state | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $PSScriptRoot 'hold.json')
+  $script:events += 'saved'; return $true
+}
 function Invoke-CheckedSupervisorMutation($label, $argv) {
   if ($argv -notcontains '--codex-launch-failure') { throw 'wrong command' }
   $script:events += 'escalated'; return $true
@@ -123,10 +181,12 @@ function Invoke-CheckedSupervisorMutation($label, $argv) {
 $state = @{}
 $plan = [pscustomobject]@{ next_state = [pscustomobject]@{} }
 Set-CodexAccessHold 'worker' $plan $state 'CODEX_ACL_PREFLIGHT_FAILED'
-if (($script:events -join ',') -ne 'saved,escalated') { throw 'not same-poll escalation' }
+if (($script:events -join ',') -ne 'saved,escalated,saved') { throw 'not same-poll escalation' }
+$state = Get-Content -Raw (Join-Path $PSScriptRoot 'hold.json') | ConvertFrom-Json
 if (-not $state.worker.codex_access_hold.notified) { throw 'not latched' }
 '''
     if not delivered:
+        test = test.replace("'saved,escalated,saved'", "'saved,escalated'")
         test = test.replace("$script:events += 'escalated'; return $true",
                             "$script:events += 'escalated'; return $false")
         test = test.replace('if (-not $state.worker.codex_access_hold.notified)',

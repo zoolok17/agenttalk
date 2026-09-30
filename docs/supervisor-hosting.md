@@ -143,8 +143,10 @@ runtime generation still follows normal fail-closed adoption.
 
 Before a regular Codex relaunch on Windows, the supervisor resets ACL inheritance
 on existing `*.generation` guards under the store. Traversal and `icacls` share a
-10-second budget. Symlink/reparse paths, hard-linked guards and unresettable
-guards fail closed as `CODEX_ACL_PREFLIGHT_FAILED`. Guards are never renamed or replaced, preserving
+10-second budget. A linked store root, linked or hard-linked guards and
+unresettable guards fail closed as `CODEX_ACL_PREFLIGHT_FAILED`. Other linked
+entries, including Codex-home junctions, are skipped without following them.
+Guards are never renamed or replaced, preserving
 the identity of locks held by live processes. Other platforms skip the ACL step.
 
 A preflight failure persists a supervisor hold and attempts lead/operator

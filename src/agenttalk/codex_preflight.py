@@ -43,7 +43,9 @@ def reset_guard_acls(directory: Path, *, windows=None, run=None) -> None:
                     path = Path(entry.path)
                     if (entry.is_symlink() or getattr(entry.stat(follow_symlinks=False),
                                                      "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
-                        raise OSError(f"linked store entry: {path}")
+                        if entry.name.endswith(".generation"):
+                            raise OSError(f"linked store entry: {path}")
+                        continue  # Codex-home junctions are not guard traversal roots.
                     if entry.is_dir(follow_symlinks=False):
                         stack.append(path)
                     elif entry.name.endswith(".generation"):
