@@ -31,7 +31,7 @@ must not hold locks from two different stores at once.
 | 180 | `state/owed-action/proof-health.lock`: proof health projection. |
 | 190 | Per-agent lead-loop lease lock. Release may clear its waiting mirror. |
 | 200 | Per-agent waiting lock. |
-| 210 | Per-agent awaiting locks and other independent leaf store locks. No lower-rank callback is allowed. |
+| 210 | Per-agent awaiting locks and other independent leaf store locks, including `state/work-board-facts.lock` (one facts-file read and atomic replace). No lower-rank callback is allowed. |
 | 220 | Process-local message-ID lock: updates timestamp/random ID state only. |
 | 230 | Ownership generation OS guards used by marker acquisition/release; and underlying OS lock primitives. No application callback runs inside a marker's generation guard. |
 | 240 | Process-local diagnostic leaves: wrapper log stream, web rate/timeline state. They perform local state or output operations without store transaction callbacks. |
@@ -64,7 +64,7 @@ acceptance and its ID lock through the release-barrier message.
 
 The acquisition-site census covers `store`, `close`, `cli`, `assurance`,
 `attention`, `checkpoint`, `gates`, `knowledge`, `lanes`, `lesson_context`,
-`onboarding`, `recovery`, `supervisor`, `supervisor_lifecycle`,
+`onboarding`, `recovery`, `supervisor`, `supervisor_lifecycle`, `work_board_facts`,
 `wrapper/obligations` and `wrapper/turn_watchdog`. Other primitives found by the
 package scan are the gateway lifecycle, comprehension scan and process-local
 guards listed above. Exclusive creation of an evidence/temp file is not a

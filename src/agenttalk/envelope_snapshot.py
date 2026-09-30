@@ -5,6 +5,7 @@ import json
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from agenttalk import signing
 
@@ -231,12 +232,17 @@ class SnapshotService:
                              sum(s[2] for s in (*before.values(), *archive_before.values())),
                              self.clock() - start, archives, complete, archive_invalid)
             # Reduction and gate IO belong to this worker, never a polling handler.
-            from agenttalk import gates, work_board_feed
+            from agenttalk import gates, work_board_facts, work_board_feed
             board_error = None
             try:
+                # Integration facts come from the lead-run verify-merges file: no Git here.
+                now = datetime.now(timezone.utc)
+                integrated, stale, warnings = work_board_facts.load_integration(self.store, cfg, now=now)
                 board = work_board_feed.build(value, project=self.store.project_id(),
-                                              lead=self.store.sole_lead(),
-                                              gate_state=gates.load_gate_state(self.store.root))
+                                              lead=self.store.sole_lead(), now=now,
+                                              gate_state=gates.load_gate_state(self.store.root),
+                                              integrated=integrated, stale_integration=stale,
+                                              integration_warnings=warnings)
                 if board["coverage"]["status"] != "complete" and self._board:
                     board["items"] = copy.deepcopy(self._board["items"])
                     board["last_known"] = True

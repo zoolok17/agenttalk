@@ -60,8 +60,8 @@ def bounded(feed, *, card_limit=100, byte_limit=256 * 1024):
     return feed
 
 
-def build(snapshot, *, project, lead, gate_state, now=None, integrated=None,
-          envelope_limit=50000, source_byte_limit=128 * 1024 * 1024, **bounds):
+def build(snapshot, *, project, lead, gate_state, now=None, integrated=None, stale_integration=None,
+          integration_warnings=(), envelope_limit=50000, source_byte_limit=128 * 1024 * 1024, **bounds):
     now = now or datetime.now(timezone.utc)
     # Identical active/compacted copies count once. Conflicts are rejected by closure coverage.
     found = {e.id: e for e in (*snapshot.archives, *snapshot.envelopes)}
@@ -105,6 +105,10 @@ def build(snapshot, *, project, lead, gate_state, now=None, integrated=None,
         if snapshot.archives_complete and not snapshot.invalid_count and not snapshot.archive_invalid_count and (
                 cancelled or (item["workflow_column"] == "done" and last and last < now - timedelta(days=7))):
             continue
+        stale_as_of = (stale_integration or {}).get((item["work_item"], item["candidate"]))
+        if stale_as_of:  # stale evidence never makes Done; the derived column stays
+            item["reason"] += f"; integration evidence stale (as of {stale_as_of})"
+            item["integration_stale_as_of"] = stale_as_of
         starts = dispatched[item["work_item"]]
         item.update(first_dispatch_at=min(starts).isoformat() if starts else None,
                     last_work_event_at=last.isoformat() if last else None,
@@ -125,6 +129,7 @@ def build(snapshot, *, project, lead, gate_state, now=None, integrated=None,
         reduced["legacy"]["open_request_count"] = None
     selected.sort(key=lambda i: (i["last_work_event_at"] or "", i["work_item"]), reverse=True)
     errors = ([reduced["error"]] if reduced.get("error") else []) + global_gates.get("warnings", [])
+    errors += list(integration_warnings)
     if closure["capacity_warning"]:
         errors.append("selected closure at capacity warning; schedule B4b/B4c indexing")
     return bounded({"schema_version": 1, "target_root_project_id": project, "generated_at": now.isoformat(),

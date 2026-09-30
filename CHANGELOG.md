@@ -11,6 +11,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Work board: a Done lane from lead-run, Git-verified merge facts (#207).**
+  The reducer could already place Done from integration evidence, but nothing
+  supplied it. The new `agenttalk board verify-merges [--dry-run] [--json]`
+  runs outside the web server. For every current (work item, candidate) pair,
+  it checks ancestry against the approved target refs of an operator-approved
+  local checkout (`work_repos` in the project config).
+  - It uses only `rev-parse`, `merge-base --is-ancestor` and `cat-file`, with
+    a hardened environment and a 2 second timeout per probe.
+  - Ambiguous refs, symlinked or escaping paths, shallow history and missing
+    objects give no fact (Unknown), never Done.
+  - It writes a bounded, schema-versioned `state/work-board-facts.json`
+    atomically, under a store lock.
+
+  The snapshot worker only reads that file and never runs Git:
+  - a missing, malformed or oversize file gives no facts and a visible
+    warning;
+  - a fact older than `integration_facts_max_age_seconds` (default 24 h) never
+    makes Done, and the card says "integration evidence stale (as of ...)";
+  - a fact from a remapped alias or target is ignored.
+
+  This replaces the in-server cached observer of the work-board design
+  (section 4) and supersedes draft #238. The lead skill now runs the command
+  after every merge and on every lead tick. Cards also carry the item's
+  declared `repo_binding`. See docs/WORK-BOARD-FEED.md.
+
 - **Supervisor restart budget: a seat is never relaunched into a loop.**
   Backoff only slows relaunches down, and the readiness give-up stops only a
   seat that never becomes ready. So a seat that became ready and then crashed

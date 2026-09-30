@@ -80,8 +80,8 @@ def test_package_acquisition_site_inventory():
         "assurance.py": 7, "attention.py": 2, "checkpoint.py": 1, "cli.py": 31,
         "close.py": 3, "gates.py": 1, "knowledge.py": 2, "lanes.py": 1,
         "lesson_context.py": 1, "onboarding.py": 2, "recovery.py": 1, "store.py": 65,
-        "supervisor.py": 4, "supervisor_lifecycle.py": 14, "wrapper/obligations.py": 64,
-        "wrapper/turn_watchdog.py": 1,
+        "supervisor.py": 4, "supervisor_lifecycle.py": 14, "work_board_facts.py": 1,
+        "wrapper/obligations.py": 64, "wrapper/turn_watchdog.py": 1,
     }
 
 

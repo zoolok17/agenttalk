@@ -8074,6 +8074,33 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_board(args: argparse.Namespace) -> int:
+    """`board verify-merges`: lead-run, out-of-server integration facts for the Done lane."""
+    if getattr(args, "board_cmd", None) != "verify-merges":
+        sys.stderr.write("agenttalk board: the only action is `verify-merges`.\n")
+        return 2
+    from agenttalk import work_board_facts
+    store = _get_store(args)
+    result = work_board_facts.verify_merges(store, dry_run=args.dry_run)
+    configured = bool(work_board_facts.repo_aliases(store.load_config())[0])
+    if args.json:
+        print(json.dumps(dict(result, unknown=[{"work_item": s, "reason": r} for s, r in result["unknown"]]),
+                         indent=2, ensure_ascii=False))
+        return 0 if configured else 2
+    merged = sum(f["result"] == "integrated" for f in result["facts"])
+    print(f"verify-merges: {len(result['facts'])} fact(s) ({merged} integrated, "
+          f"{len(result['facts']) - merged} not integrated), {len(result['unknown'])} unknown"
+          + ("; dry run, nothing written" if args.dry_run else ""))
+    for slug, reason in result["unknown"][:20]:
+        print(f"  unknown {slug}: {reason}")
+    for problem in result["problems"]:
+        sys.stderr.write(f"agenttalk board verify-merges: warning: {problem}\n")
+    if not configured:
+        sys.stderr.write("agenttalk board verify-merges: no usable work_repos alias is configured "
+                         "(see docs/WORK-BOARD-FEED.md).\n")
+    return 0 if configured else 2
+
+
 def cmd_barrier(args: argparse.Namespace) -> int:
     """Fire a global epoch barrier (#19 Phase A, RFC §"Global Epochs").
 
@@ -15564,6 +15591,22 @@ def build_parser() -> argparse.ArgumentParser:
                            help='{"epoch", "scope"}.')
     pbar_bump.set_defaults(func=cmd_barrier)
     pbar.set_defaults(func=cmd_barrier, barrier_cmd=None)
+
+    pboard = sub.add_parser(
+        "board",
+        help="Work-board maintenance run by the lead outside the web server.",
+    )
+    boardsub = pboard.add_subparsers(dest="board_cmd")
+    pboard_verify = boardsub.add_parser(
+        "verify-merges",
+        help="Check each work item's reviewed candidate against the approved work_repos "
+             "targets with local Git and record the integration facts the board reads.",
+    )
+    pboard_verify.add_argument("--dry-run", action="store_true",
+                               help="Check and report, but write nothing.")
+    pboard_verify.add_argument("--json", action="store_true")
+    pboard_verify.set_defaults(func=cmd_board)
+    pboard.set_defaults(func=cmd_board, board_cmd=None)
 
     pprn = sub.add_parser(
         "prune",

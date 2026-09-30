@@ -428,6 +428,7 @@ def _evaluate_item(slug, reqs, orphans, facts):
         "conflict": None, "problem": ("check policy missing", []), "label": None}
     item["checks"] = policy["label"]
     item["check_keys"] = policy.get("keys")
+    item["repo_binding"] = policy.get("binding")
     if policy["conflict"]:
         conflicts.append(policy["conflict"])
     obs = [o for r in cur for o in r["obligations"]]
@@ -607,7 +608,16 @@ def _policy(slug, valid, cur, current, facts):
             break
     evidence = [i for r in sources for i in r["openers"]]
     declared = {r["policy"] for r in sources if r["policy"]}
-    result = {"conflict": None, "problem": None, "label": None}
+    # The declared work_repo alias and work_target select integration evidence; partial or
+    # conflicting declarations are ambiguous, never a silent fall back to the default alias.
+    pairs = {(p[0], p[2]) for p in declared}
+    binding = None
+    if len(pairs) == 1 and all(r["policy"] for r in sources):
+        repo, target = pairs.pop()
+        binding = {"repo": repo, "target": target} if repo or target else None
+    elif any(v for pair in pairs for v in pair):
+        binding = "ambiguous"
+    result = {"conflict": None, "problem": None, "label": None, "binding": binding}
     if len(declared) > 1:
         result["conflict"] = ("conflicting repository/check policies", evidence)
         return result
