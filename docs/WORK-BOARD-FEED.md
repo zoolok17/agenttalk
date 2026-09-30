@@ -115,7 +115,10 @@ kept. It holds at most 400 facts and 512 KiB. Each fact records `project`,
 `repo_alias`, `repo_path`, `work_item`, `candidate`, `target_ref`, `target_oid`
 (at check time), `checked_at` and `result` (`integrated` or `not_integrated`).
 Each run rewrites the integration section for the current pairs, so an
-invalidated result disappears.
+invalidated result disappears. `checked_at` is the run's observation start, and
+publication is ordered under the lock: an older run never replaces a fact
+observed after it started. Its fact for that key is dropped, and the command
+reports it as superseded.
 
 The snapshot worker reads the file on every refresh, bounded and schema-checked:
 
@@ -131,7 +134,8 @@ The snapshot worker reads the file on every refresh, bounded and schema-checked:
   reused. Unmatched facts leave the card's column as derived and end its reason
   with `integration evidence ignored: <why>`.
 - A fact older than `integration_facts_max_age_seconds` (default 86,400; from
-  60 seconds to 30 days) is stale. It never makes Done: the card keeps its
+  60 seconds to 30 days), or dated after the reader's clock (writer and reader
+  run on one host), is stale. It never makes Done: the card keeps its
   derived column, its reason ends with `integration evidence stale (as of
   <time>)`, and `integration_stale_as_of` holds the time.
 - A fresh `integrated` fact for the current candidate places the card in Done,

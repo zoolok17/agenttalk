@@ -22,13 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Ambiguous refs, symlinked or escaping paths, shallow history and missing
     objects give no fact (Unknown), never Done.
   - It writes a bounded, schema-versioned `state/work-board-facts.json`
-    atomically, under a store lock.
+    atomically, under a store lock. Publication is ordered: an older run never
+    replaces a newer run's observation.
 
   The snapshot worker only reads that file and never runs Git:
   - a missing, malformed or oversize file, or any other fault in this optional
     evidence, gives no facts and a visible warning, never a missing board;
-  - a fact older than `integration_facts_max_age_seconds` (default 24 h) never
-    makes Done, and the card says "integration evidence stale (as of ...)";
+  - a fact older than `integration_facts_max_age_seconds` (default 24 h), or
+    future-dated, never makes Done, and the card says "integration evidence
+    stale (as of ...)";
   - a fact from a remapped alias or target is ignored;
   - a fact counts only for the item's current binding (its declared
     `work_repo`/`work_target`, else the current default), so proof from an

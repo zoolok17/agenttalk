@@ -232,9 +232,11 @@ def verify_merges(store, *, now=None, dry_run=False):
                 facts.append({"project": project, "repo_alias": alias, "repo_path": aliases[alias]["path"],
                               "work_item": slug, "candidate": candidate, "target_ref": ref,
                               "target_oid": target_oid, "checked_at": now.isoformat(), "result": result})
-    if not dry_run:
-        _write_section(store, "integration", {"written_at": now.isoformat(), "facts": facts})
-    return {"facts": facts, "unknown": unknown, "problems": problems, "written": not dry_run}
+    superseded = []
+    if not dry_run:  # the Git probes above ran outside the lock; ordering is settled inside it
+        superseded = _write_section(store, "integration", {"written_at": now.isoformat(), "facts": facts})
+    return {"facts": facts, "unknown": unknown, "problems": problems, "written": not dry_run,
+            "superseded": superseded}
 
 
 def _read(path):
@@ -257,16 +259,44 @@ def _read(path):
     return doc, None
 
 
+def _fact_key(fact):
+    return fact["work_item"], fact["candidate"], fact["repo_alias"], fact["target_ref"]
+
+
+def _order_integration(published, incoming):
+    """Publication ordering: an older run never replaces a newer observation.
+
+    A run's facts carry its observation start as checked_at. Published facts observed
+    after this run started survive, and this run's fact for the same key is dropped as
+    superseded. Older published facts are replaced by this run's view, as before."""
+    started = _time(incoming["written_at"])
+    facts = published.get("facts") if isinstance(published, dict) else None
+    newer = [f for f in facts if _valid_fact(f) and _time(f["checked_at"]) > started] if isinstance(
+        facts, list) else []
+    held = {_fact_key(f) for f in newer}
+    superseded = [(f["work_item"], f["target_ref"]) for f in incoming["facts"] if _fact_key(f) in held]
+    merged = newer + [f for f in incoming["facts"] if _fact_key(f) not in held]
+    superseded += [(f["work_item"], f["target_ref"]) for f in merged[MAX_FACTS:]]
+    stamps = [started] + [_time(f["checked_at"]) for f in newer]
+    return {"written_at": max(stamps).isoformat(), "facts": merged[:MAX_FACTS]}, superseded
+
+
 def _write_section(store, name, section):
-    """Replace one section atomically under the store lock, keeping the others."""
+    """Replace one section atomically under the store lock, keeping the others. The
+    integration section is ordered against what is already published; returns the
+    (work_item, target_ref) pairs this run lost to a newer observation."""
     path = store.state_dir / FACTS_FILE
+    superseded = []
     with store._exclusive_lock(store.state_dir / LOCK_FILE, what="work board facts"):
         doc = _read(path)[0] or {"schema_version": SCHEMA_VERSION}
+        if name == "integration":
+            section, superseded = _order_integration(doc.get(name), section)
         doc[name] = section
         text = json.dumps(doc, indent=2, ensure_ascii=False)
         if len(text.encode("utf-8")) > MAX_FILE_BYTES:
             raise ValueError("work board facts would exceed their size bound")
         _atomic_write_text(path, text)
+    return superseded
 
 
 def _valid_fact(fact):
@@ -305,7 +335,7 @@ def _load_integration(store, cfg, now):
             ignored += 1
             continue
         checked = _time(fact["checked_at"])
-        kept.append(dict(fact, checked=checked, fresh=oldest <= checked <= now + timedelta(minutes=5)))
+        kept.append(dict(fact, checked=checked, fresh=oldest <= checked <= now))  # future-dated is stale
     warnings = [f"{ignored} integration fact(s) ignored: repository mapping changed"] if ignored else []
     return {"facts": kept, "config": cfg, "warnings": warnings}
 

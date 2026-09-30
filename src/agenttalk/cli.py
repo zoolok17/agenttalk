@@ -8093,6 +8093,8 @@ def cmd_board(args: argparse.Namespace) -> int:
           + ("; dry run, nothing written" if args.dry_run else ""))
     for slug, reason in result["unknown"][:20]:
         print(f"  unknown {slug}: {reason}")
+    for slug, target in result["superseded"][:20]:
+        print(f"  superseded {slug} ({target}): a newer observation is already recorded")
     for problem in result["problems"]:
         sys.stderr.write(f"agenttalk board verify-merges: warning: {problem}\n")
     if not configured:

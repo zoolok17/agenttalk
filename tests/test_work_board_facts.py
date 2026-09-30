@@ -467,3 +467,77 @@ def test_integration_for_selects_only_the_current_binding(tmp_path):
         "integration evidence ignored: conflicting repository declarations", None))
     assert pick({"repo": "elsewhere", "target": None}, *both)[1][0] == (
         "integration evidence ignored: repository 'elsewhere' is not an approved work_repos alias")
+
+
+# ---------------------------------------------------------------- fix round 2 (#247 delta read)
+
+def test_future_dated_fact_is_stale_even_minutes_ahead(tmp_path, repo):
+    path, merged, _ = repo
+    store = team(tmp_path, path)
+    publish(store, {"item-merged": merged})
+    F.verify_merges(store, now=datetime.now(timezone.utc) + timedelta(minutes=4))
+    card = board(store)[0]["item-merged"]
+    assert card["workflow_column"] == "ready" and "integration evidence stale (as of " in card["reason"]
+
+
+def test_older_run_cannot_restore_an_invalidated_done(tmp_path, repo, monkeypatch, capsys):
+    path, merged, _ = repo
+    store = team(tmp_path, path)
+    publish(store, {"item-merged": merged})
+    publish_now, interleaved = F._write_section, []
+
+    def interleave(store_arg, name, section):
+        # Run A has probed (merged) and waits for the lock; meanwhile the target is
+        # reset and run B observes that and publishes first.
+        if not interleaved:
+            interleaved.append(True)
+            git(path, "update-ref", "refs/heads/master", git(path, "rev-parse", merged + "^"))
+            newer = F.verify_merges(store)
+            assert newer["facts"][0]["result"] == "not_integrated" and newer["superseded"] == []
+            assert board(store)[0]["item-merged"]["workflow_column"] == "ready"
+        return publish_now(store_arg, name, section)
+    monkeypatch.setattr(F, "_write_section", interleave)
+    assert cli.main(["--root", str(store.root), "board", "verify-merges"]) == 0
+    assert ("superseded item-merged (refs/heads/master): a newer observation is already recorded"
+            in capsys.readouterr().out)
+    facts = json.loads((store.state_dir / F.FACTS_FILE).read_text(encoding="utf-8"))["integration"]["facts"]
+    assert [f["result"] for f in facts] == ["not_integrated"]
+    assert board(store)[0]["item-merged"]["workflow_column"] == "ready"
+
+
+def test_newer_run_replaces_an_older_observation(tmp_path, repo):
+    path, merged, _ = repo
+    store = team(tmp_path, path)
+    publish(store, {"item-merged": merged})
+    older = datetime.now(timezone.utc) - timedelta(minutes=2)
+    F.verify_merges(store, now=older)
+    assert board(store)[0]["item-merged"]["workflow_column"] == "done"
+    git(path, "update-ref", "refs/heads/master", git(path, "rev-parse", merged + "^"))
+    result = F.verify_merges(store, now=older + timedelta(minutes=1))
+    assert result["superseded"] == []
+    facts = json.loads((store.state_dir / F.FACTS_FILE).read_text(encoding="utf-8"))["integration"]["facts"]
+    assert [(f["result"], f["checked_at"]) for f in facts] == [
+        ("not_integrated", (older + timedelta(minutes=1)).isoformat())]
+    card = board(store)[0]["item-merged"]
+    assert (card["workflow_column"], card["integration"]) == ("ready", {merged: False})
+
+
+def test_publication_order_keeps_newer_facts_and_replaces_older_ones(monkeypatch):
+    start = datetime(2026, 9, 30, 12, tzinfo=timezone.utc)
+    later, earlier = start + timedelta(minutes=1), start - timedelta(minutes=1)
+
+    def fact(slug, at):
+        return {"project": "p", "repo_alias": "a", "repo_path": "x", "work_item": slug, "candidate": MISSING,
+                "target_ref": "refs/heads/master", "target_oid": "d" * 40, "checked_at": at.isoformat(),
+                "result": "integrated"}
+    published = {"written_at": later.isoformat(),
+                 "facts": [fact("newer", later), fact("older", earlier), fact("same", later)]}
+    incoming = {"written_at": start.isoformat(), "facts": [fact("same", start), fact("mine", start)]}
+    section, superseded = F._order_integration(published, incoming)
+    assert sorted((f["work_item"], f["checked_at"]) for f in section["facts"]) == [
+        ("mine", start.isoformat()), ("newer", later.isoformat()), ("same", later.isoformat())]
+    assert superseded == [("same", "refs/heads/master")] and section["written_at"] == later.isoformat()
+    assert F._order_integration(None, incoming) == (incoming, [])
+    monkeypatch.setattr(F, "MAX_FACTS", 2)  # the merged section stays inside the loader's bound
+    section, superseded = F._order_integration(published, incoming)
+    assert len(section["facts"]) == 2 and superseded == [("same", "refs/heads/master"), ("mine", "refs/heads/master")]
