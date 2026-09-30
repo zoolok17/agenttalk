@@ -574,6 +574,7 @@ def _xdist_group_for(item: pytest.Item) -> str | None:
     return None
 
 
+@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items) -> None:
     """#50: process-orchestration tests marked source_layout cannot pass under
     an installed-wheel run through a venv launcher (Popen.pid != child pid), and
@@ -586,7 +587,24 @@ def pytest_collection_modifyitems(config, items) -> None:
     two shared, machine-wide resources for real, else its own test file -
     reproducing today's `--dist loadfile` behavior for everything else. Only
     meaningful with the xdist plugin loaded; a plain `pytest` run (no xdist
-    installed) skips this entirely."""
+    installed) skips this entirely.
+
+    #232 round 6 (codex cold read + independent reproduction): `tryfirst=True`
+    above is REQUIRED, not decorative. `xdist.remote.WorkerInteractor` (loaded
+    only inside each xdist WORKER subprocess) has its OWN plain-priority
+    `pytest_collection_modifyitems` that reads each item's `xdist_group`
+    markers and appends `@<group>` to the item's nodeid - that suffix, not
+    the marker object itself, is what the scheduler actually groups on. With
+    default hook priority, pytest called xdist's implementation BEFORE this
+    one (no marker existed yet when xdist looked), so `--dist loadgroup`
+    silently fell back to per-item scheduling for every "pwsh"/"gateway-ports"
+    item - group membership was correct, but had zero scheduling effect.
+    Reproduced directly: a 3-item minimal case (one cli, one service, one
+    lifecycle "gateway-ports" test) ran on two DIFFERENT workers without this
+    decorator, and on one worker, with `@gateway-ports` visible in the test
+    ids, after adding it. This means round 2's "pwsh" grouping never actually
+    worked either - its CI PASS was luck (no colliding pair got scheduled
+    apart in that run), not a working mechanism."""
     if not _running_against_installed_wheel():
         pass
     else:

@@ -553,6 +553,11 @@ def test_real_process_rebind_serializes_reconfigure_without_stale_manifest_write
 
         rebind_res = _read_result(rebind_result)
         reconfigure_res = _read_result(reconfigure_result)
+        # #232 round 6: an assertion message this large gets truncated by
+        # pytest's own terminal/JUnit reporting ("..."); printing to stdout
+        # first is captured in full, untruncated, in JUnit's system-out.
+        print("rebind_res:", json.dumps(rebind_res, indent=2, sort_keys=True))
+        print("reconfigure_res:", json.dumps(reconfigure_res, indent=2, sort_keys=True))
         assert rebind_res["ok"] is True, rebind_res
         assert reconfigure_res["ok"] is True, reconfigure_res
         final_manifest = service.load_install_manifest(root)
@@ -647,6 +652,7 @@ def test_real_process_service_startup_excludes_rebind_until_sockets_are_owned(
         _wait_process(rebind)
 
         refusal = _read_result(rebind_result)
+        print("refusal:", json.dumps(refusal, indent=2, sort_keys=True))
         assert refusal["ok"] is False, refusal
         assert refusal["type"] == "GatewayConfigError", refusal
         assert "while the gateway is running" in refusal["message"], refusal
