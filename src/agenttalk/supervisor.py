@@ -8541,6 +8541,9 @@ def build_report(store: Store, *, now_epoch: float,
             "session_id": st.get("session_id"),  # supervisor-local; None unless state passed
         }
         sup_agent = sup_agents.get(a) if isinstance(sup_agents.get(a), dict) else {}
+        if sup_agent.get("cli") == "codex" and "codex_launch_check" in st:
+            from .codex_preflight import read_bus_proof
+            agents[a]["codex_bus_proof"] = read_bus_proof(store, a)
         if bool(sup_agent.get("wrapped", False)):
             agents[a]["wrapper_runtime"] = runtime_obs.read_runtime(
                 store.state_dir,
@@ -9312,6 +9315,8 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         nxt["pending_launch_record"] = copy.deepcopy(
             st.get("pending_launch_record")
         )
+    if "codex_launch_check" in st:
+        nxt["codex_launch_check"] = copy.deepcopy(st["codex_launch_check"])
     if owned_tree is not None:
         nxt["owned_process_tree"] = copy.deepcopy(owned_tree)
     legacy_process_evidence = liveness.get("legacy_process_evidence")
@@ -9425,6 +9430,47 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         elif fails and (now_epoch - float(healthy_since)) >= reset_after:
             nxt["consecutive_fails"], nxt["backoff_next_epoch"] = 0, 0.0
         return _result(NONE, state=state, reason=reason)
+
+    # Host heartbeats and generic config_blocked observations cannot satisfy or
+    # overwrite this launch's restricted-process proof. This is a poll decision,
+    # not a wait: every other seat is still planned on the same tick.
+    check = nxt.get("codex_launch_check")
+    if cli_name == "codex" and "codex_launch_check" in nxt:
+        valid = (isinstance(check, dict) and isinstance(check.get("status"), str)
+                 and check["status"] in {"pending", "proved", "failed"})
+        if valid and check["status"] in {"pending", "proved"}:
+            deadline = check.get("deadline_epoch")
+            valid = (_valid_launch_nonce(check.get("nonce"))
+                     and isinstance(deadline, (int, float)) and not isinstance(deadline, bool)
+                     and 0 < deadline < 1e12)
+        elif valid:
+            valid = (isinstance(check.get("failure"), str)
+                     and check["failure"] in {"CODEX_ACL_PREFLIGHT_FAILED", "CODEX_FIRST_BUS_WRITE_MISSING"})
+        if not valid:
+            check = nxt["codex_launch_check"] = {
+                "status": "failed", "failure": "CODEX_FIRST_BUS_WRITE_MISSING"}
+        if check.get("status") == "pending":
+            receipt = rpt.get("codex_bus_proof")
+            ready = receipt.get("ready_epoch") if isinstance(receipt, dict) else None
+            if (isinstance(receipt, dict) and receipt.get("nonce") == check.get("nonce")
+                    and receipt.get("agent") == name and receipt.get("message_id")
+                    and isinstance(ready, (int, float)) and not isinstance(ready, bool)
+                    and 0 < ready <= min(now_epoch, check.get("deadline_epoch", 0))):
+                check["status"] = "proved"
+            elif now_epoch < check.get("deadline_epoch", 0):
+                return _result(NONE, state="CODEX_BUS_PROOF_PENDING",
+                               reason="Waiting for this launch's restricted bus-write proof.")
+            else:
+                check.update(status="failed", failure="CODEX_FIRST_BUS_WRITE_MISSING")
+        if check.get("status") == "failed":
+            notify = check.get("notified") is not True
+            if notify:
+                check["notified"] = True
+                nxt["last_warn_epoch"] = now_epoch
+            return _result(WARN_ONLY if notify else NONE,
+                           state=check["failure"], notify=notify,
+                           reason=f"{check['failure']}: Codex launch held; no automatic relaunch. "
+                           "Repair ACLs/runtime and clear codex_launch_check with the supervisor stopped.")
 
     if (
         wrapped
@@ -11317,6 +11363,13 @@ def record_launch(state: dict, agent: str, *, cli: str, pid: int | None,
     entry["launched"] = True
     if cli == "codex":
         entry["session_id"] = None        # never persist a fake id for codex
+        if bool(lcfg.get("wrapped", False)):
+            from .codex_preflight import PROOF_TIMEOUT
+            entry["codex_launch_check"] = (
+                {"status": "pending", "nonce": launcher_nonce, "deadline_epoch": now + PROOF_TIMEOUT}
+                if launcher_nonce_injected and _valid_launch_nonce(launcher_nonce)
+                else {"status": "failed", "failure": "CODEX_FIRST_BUS_WRITE_MISSING"}
+            )
     elif session_id:
         entry["session_id"] = session_id  # claude: pin the minted/known id
     return state
@@ -14485,6 +14538,12 @@ function Launch($name, $plan, $codexHome, $acceptedAdmission = $null) {
   $sid = $plan.session_id
   $argv = @($admission.argv)
   $launchNonce = [guid]::NewGuid().ToString('N')
+  if ($plan.cli -ceq 'codex' -and $plan.launch_mode -eq 'wrap') {
+    $launchNonce = [string]$plan.next_state.codex_launch_check.nonce
+    if ($launchNonce -cnotmatch '^[0-9a-f]{32}$') {
+      throw 'CODEX_FIRST_BUS_WRITE_MISSING: missing durable launch probe reservation'
+    }
+  }
   $nonceResult = Add-SupervisorLaunchNonceAt $admission $launchNonce
   $argv = @($nonceResult.argv)
   $shouldLog = (
@@ -14515,6 +14574,15 @@ function Launch($name, $plan, $codexHome, $acceptedAdmission = $null) {
     foreach ($k in $a.env.PSObject.Properties.Name) {
       Set-AgenttalkEnvironmentMapEntry $applied $k $a.env.$k
     }
+  }
+  # Regular supervised Codex only. Bind the startup check to this launch;
+  # configured or inherited environment must not disable or replay it.
+  Set-AgenttalkEnvironmentMapEntry $applied 'AGENTTALK_CODEX_BUS_PROBE' $null
+  if ($plan.cli -ceq 'codex' -and $plan.launch_mode -eq 'wrap') {
+    if (-not $nonceResult.injected) {
+      throw 'CODEX_FIRST_BUS_WRITE_MISSING: cannot bind a restricted probe to this launch'
+    }
+    Set-AgenttalkEnvironmentMapEntry $applied 'AGENTTALK_CODEX_BUS_PROBE' $launchNonce
   }
   foreach ($reserved in $WrapperLogEnvKeys) {
     foreach ($candidate in @($applied.Keys)) {
@@ -14916,6 +14984,19 @@ $pollNum = 0
           $prefixTokens = Get-LaunchAdmissionPrefixTokens $launchAdmission
         }
         if ($seedOk -and -not (Assert-ActionsEnabled ("preflight {0}" -f $name))) { $seedOk = $false }
+        if ($seedOk -and $p.cli -ceq 'codex') {
+          $aclOk = ($p.launch_mode -eq 'wrap')
+          if ($aclOk) {
+            $aclOk = Invoke-CheckedSupervisorMutation ("codex-acl-preflight {0}" -f $name) @('--root', $Root, 'supervise', '--codex-preflight')
+          }
+          if (-not $aclOk) {
+            Write-Warning ("CODEX_ACL_PREFLIGHT_FAILED: {0}: guard repair failed or launch is not wrapped; refusing launch" -f $name)
+            $p.next_state | Add-Member -NotePropertyName codex_launch_check -NotePropertyValue ([pscustomobject]@{
+              status = 'failed'; failure = 'CODEX_ACL_PREFLIGHT_FAILED'
+            }) -Force
+            $seedOk = $false
+          }
+        }
         if ($seedOk -and -not (Preflight $name $p $file $homeEnv $prefixTokens $launchAdmission)) { $seedOk = $false }
         if (-not $seedOk) {
           Write-Warning ("supervisor: {0}: seed/preflight failed - skipping relaunch this tick (fail closed)" -f $name)
@@ -14925,6 +15006,13 @@ $pollNum = 0
           # launching/grace and consumes a manual restart id, so a failed
           # post-spawn PID record cannot make the next poll launch a second
           # legacy-direct process from the old state.
+          if ($p.cli -ceq 'codex') {
+            # Persist BEFORE spawn, including the nonce later passed to wrap.
+            # A crash before record-launch must still reach a bounded HOLD.
+            $p.next_state | Add-Member -NotePropertyName codex_launch_check -NotePropertyValue ([pscustomobject]@{
+              status = 'pending'; nonce = [guid]::NewGuid().ToString('N'); deadline_epoch = ($now + 120)
+            }) -Force
+          }
           $p.next_state | Add-Member -NotePropertyName pending_launch_record `
             -NotePropertyValue $p.record_launch_context -Force
           Set-AgentState $state $name $p.next_state
@@ -14977,7 +15065,13 @@ $pollNum = 0
       'refuse_protected' { Write-Warning ("supervisor: {0}: {1}" -f $name, $p.reason); if ($p.clear_marker -and (Assert-ActionsEnabled ("clear-restart {0}" -f $name))) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }; Set-AgentState $state $name $p.next_state }
       { $_ -in 'warn_only','suspect_warn','snapshot_unavailable','readiness_gave_up' } {
         Write-Warning ("supervisor: {0}: {1}" -f $name, $p.reason)
-        if ($p.notify -and $cfg.notify_sender -and $cfg.notify_to -and (Assert-ActionsEnabled ("notify {0}" -f $name))) {
+        if ($p.notify -and $p.state -in @('CODEX_ACL_PREFLIGHT_FAILED','CODEX_FIRST_BUS_WRITE_MISSING')) {
+          $notice = @('--root', $Root, 'supervise', '--codex-launch-failure', $p.state, '--for', $name)
+          if (-not (Invoke-CheckedSupervisorMutation ("codex-launch-failure {0}" -f $name) $notice)) {
+            # A failed bus write is not a delivered escalation. Retry next poll.
+            $p.next_state.codex_launch_check.notified = $false
+          }
+        } elseif ($p.notify -and $cfg.notify_sender -and $cfg.notify_to -and (Assert-ActionsEnabled ("notify {0}" -f $name))) {
           & $AgenttalkCmd --root $Root send --from $cfg.notify_sender --to $cfg.notify_to --kind note -m ("supervisor: {0}: {1}" -f $name, $p.reason) --quiet | Out-Null
         }
         Set-AgentState $state $name $p.next_state

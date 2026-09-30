@@ -11652,6 +11652,29 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
         state.model = runtime_model
         state.reasoning_effort = runtime_effort
         wsession.save_session(store, agent, state)
+    # Only the regular supervisor relaunch sets this capability. Probe through
+    # the same session/model/permissions as work, before any inbox consumption.
+    from . import codex_preflight
+    probe_nonce = os.environ.get(codex_preflight.PROBE_ENV)
+    if cli == "codex" and probe_nonce and one_shot_request_id is None:
+        proof_ok = False
+        if probe_nonce == supervisor_launch_nonce:
+            try:
+                proof_ok = wrapper_run.run_codex_startup_probe(
+                    store, agent, base_argv, probe_nonce, session_state=state,
+                    persist=lambda st: wsession.save_session(store, agent, st))
+                if proof_ok:
+                    codex_preflight.complete_probe(store, agent, probe_nonce)
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                proof_ok = False
+                sys.stderr.write(f"CODEX_FIRST_BUS_WRITE_MISSING: {exc}\n")
+            except BaseException:
+                _release()
+                raise
+        if not proof_ok:
+            _release()
+            sys.stderr.write("CODEX_FIRST_BUS_WRITE_MISSING: restricted startup write was not proved; exiting.\n")
+            return _wrapper_exit(3, "codex_first_bus_write_missing")
     health_mode = (
         "lead-loop" if lead_loop else
         "wrapper-one-shot" if one_shot_request_id else
@@ -13172,6 +13195,9 @@ def cmd_supervise(args: argparse.Namespace) -> int:
     decision table); --clear-restart clears a restart marker by request_id."""
     store = _get_store(args)
     supervisor_mutations = (
+        "codex_preflight",
+        "codex_bus_proof",
+        "codex_launch_failure",
         "archive_launch_request",
         "claim_instance",
         "clear_restart",
@@ -13197,6 +13223,20 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             "script-use supervisor mutation\n"
         )
         return 3
+    if (getattr(args, "codex_preflight", False) or getattr(args, "codex_bus_proof", None)
+            or getattr(args, "codex_launch_failure", None)):
+        from . import codex_preflight
+        try:
+            if args.codex_preflight:
+                codex_preflight.reset_guard_acls(store.dir)
+            elif args.codex_bus_proof:
+                codex_preflight.write_bus_proof(store, args.agent, args.codex_bus_proof)
+            else:
+                codex_preflight.notify_failure(store, args.agent, args.codex_launch_failure)
+        except (OSError, ValueError) as exc:
+            sys.stderr.write(f"agenttalk supervise: {exc}\n")
+            return 3
+        return 0
     if args.init:
         try:
             res = sup.init(store, force=args.force)
@@ -16274,6 +16314,13 @@ def build_parser() -> argparse.ArgumentParser:
                       help="(script use) Apply launch-success state for --for: "
                            "Claude pins --session-id; Codex marks launched + no "
                            "pinned id. Needs --state-file.")
+    gsup.add_argument("--codex-preflight", action="store_true",
+                      help="(script use) Reset Windows store guard ACL inheritance before a Codex launch.")
+    gsup.add_argument("--codex-bus-proof", metavar="NONCE",
+                      help="(restricted seat use) Publish a bus write and record this launch nonce.")
+    gsup.add_argument("--codex-launch-failure",
+                      choices=("CODEX_ACL_PREFLIGHT_FAILED", "CODEX_FIRST_BUS_WRITE_MISSING"),
+                      help="(script use) Escalate a held Codex launch to the lead.")
     gsup.add_argument("--prepare-launch-request", dest="prepare_launch_request",
                       action="store_true",
                       help="(script use) Claim an ephemeral launch request, roster "

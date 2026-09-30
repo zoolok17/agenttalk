@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Supervised Codex relaunches now reset Windows store guard ACL inheritance
+  before launch and require a launch-bound bus write from the restricted seat.
+  An unfixable guard or missing write proof produces a named, durable HOLD and
+  a lead escalation instead of an unattended relaunch loop. Other seats continue
+  polling while the new wrapper runs its bounded startup check.
+
 ### Removed
 
 - **spec-kitty support (operator decision, 2026-09-28).** The retired
