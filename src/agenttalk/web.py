@@ -900,6 +900,37 @@ class ScanBusy(Exception):
         super().__init__("scan concurrency bound busy")
 
 
+def _reraise_busy(exc: Exception) -> None:
+    """Call as the FIRST line of every broad ``except Exception`` on a path
+    that can reach a scan helper (``_all_messages`` / ``_validated_for_state``
+    / the ``_acquire_scan_slot`` block in ``_collect_web_attention_items``).
+
+    #246 final round: a confirmation read found FOUR separate places where a
+    pre-existing "errors-as-data" broad catch absorbed ``ScanBusy`` into a
+    degraded-but-200 (or, on the POST path, an unhandled disconnect) response
+    instead of letting it reach ``do_GET``/``do_POST``'s 503 mapping - exactly
+    the failure mode round 2's ``except ScanBusy: raise`` guards were meant to
+    close, just at sites that guard hadn't been added to yet. A single
+    shared helper (called from inside the ordinary ``except Exception as e:``
+    clause, rather than a separate ``except ScanBusy: raise`` clause bolted in
+    front of each site) makes every site look identical and a missed one
+    grep-able: search this file for ``except Exception as e:`` on a scan path
+    and confirm the very next line is this call.
+
+    One deliberate exception: ``_root_state`` (the per-root builder inside
+    ``build_state``/``/api/state``) does NOT call this. ``/api/state``
+    aggregates MULTIPLE roots in one response, and FR-005 (see its module
+    docstring) requires a corrupt-or-busy root to degrade to its own
+    ``errors`` entry WITHOUT failing sibling roots or 5xx-ing the whole
+    aggregate - re-raising there would turn one busy root into a 503 for
+    every root in the payload, the opposite of that contract. Every other
+    site fixed here answers exactly ONE selected root (or, for the
+    escalation-answer POST, one write), so 503 is the right answer and
+    swallowing would hide the saturation this bound exists to surface."""
+    if isinstance(exc, ScanBusy):
+        raise exc
+
+
 @contextlib.contextmanager
 def _acquire_scan_slot(store: Store):
     """Acquire a ``_scan_semaphore`` slot with a bounded wait; raise
@@ -915,13 +946,22 @@ def _acquire_scan_slot(store: Store):
         sem.release()
 
 
-def _scan_messages_with_paths_bounded(store: Store):
-    """Run the raw disk scan under the per-store-root concurrency bound,
-    with a bounded wait (#246 recast) - see ``_scan_semaphore``'s and
-    ``_acquire_scan_slot``'s docstrings. Always a fresh, uncached scan;
-    never shared. Raises ``ScanBusy`` if no slot frees up in time."""
+def _scan_and_validate_bounded(store: Store, cfg: dict):
+    """Run the raw disk scan AND its validation inside ONE permit scope
+    (#246 final round).
+
+    The prior recast bounded only the raw scan (``_scan_messages_with_paths_
+    bounded``, now folded into this function) and left each caller to call
+    ``validate_scanned_rows`` AFTER releasing the slot - validation does real
+    work (roster/kind checks plus, when enforced, an HMAC verify per message),
+    and a confirmation read's probe showed 8 concurrent validators running
+    against a concurrency bound of 2: the validation step had silently
+    escaped the very bound it was supposed to count against. Holding the
+    slot across both the scan and the validation (no nested acquisition -
+    this is the ONLY place that acquires for this call) closes that gap."""
     with _acquire_scan_slot(store):
-        return store._scan_messages_with_paths()
+        rows, invalid = store._scan_messages_with_paths()
+        return _snapshots.validate_scanned_rows(store, cfg, rows, len(invalid))
 
 
 def _all_messages(store: Store, *, cfg: dict | None = None) -> list[Message]:
@@ -948,12 +988,13 @@ def _all_messages(store: Store, *, cfg: dict | None = None) -> list[Message]:
     # identity's historical messages vanish from /api/messages, /messages/<id>,
     # and the index while the thread panel still shows them. The two surfaces
     # must agree.
-    rows, invalid = _scan_messages_with_paths_bounded(store)
     try:
-        valid_rows, _rejects = _snapshots.validate_scanned_rows(store, cfg, rows, len(invalid))
+        valid_rows, _rejects = _scan_and_validate_bounded(store, cfg)
     except ValueError:
         # Empty/unresolvable roster - _all_messages has always degraded to
-        # an empty list here (never raised); preserve that contract.
+        # an empty list here (never raised); preserve that contract. ValueError
+        # can never be a wrapped ScanBusy (a distinct, non-subclassed
+        # Exception), so this catch cannot accidentally swallow a busy bound.
         return []
     return [message for message, _path in valid_rows][::-1]  # newest first
 
@@ -1035,10 +1076,11 @@ def _validated_for_state(store: Store, cfg: dict) -> tuple[list[Message], int]:
     and its own fresh validation with THIS call's current config/roster/
     signing context - nothing is ever shared across callers, so neither a
     stale context nor a missed publication can leak from one caller to
-    another (#246 recast).
+    another (#246 recast). The scan AND the validation now share ONE permit
+    scope (see ``_scan_and_validate_bounded``, #246 final round) - validation
+    used to run after the slot was released and could itself run unbounded.
     """
-    rows, invalid = _scan_messages_with_paths_bounded(store)
-    valid_rows, rejects = _snapshots.validate_scanned_rows(store, cfg, rows, len(invalid))
+    valid_rows, rejects = _scan_and_validate_bounded(store, cfg)
     return [message for message, _path in valid_rows], rejects
 
 
@@ -1829,6 +1871,15 @@ def _root_state(desc: RootDescriptor,
         # never escape and 500 the entire /api/state aggregate. A broad catch is
         # strictly safer than propagating an unanticipated exception type
         # (review). The errors-as-data shape is the documented degraded form.
+        #
+        # Deliberately does NOT call _reraise_busy (#246 final round): unlike
+        # every other site that guard touches, this one composes MULTIPLE
+        # roots into a single /api/state response - re-raising ScanBusy here
+        # would 503 the whole aggregate (including every OTHER, non-busy
+        # root) over one root's saturated bound, exactly the cross-root
+        # failure FR-005 forbids. Degrading to this root's own errors entry
+        # (busy is just another reason a root couldn't be read this tick) is
+        # the correct, intentional behavior, not a missed guard.
         return {
             "label": label,
             "path": path,
@@ -1898,6 +1949,7 @@ def build_threads_index(desc: RootDescriptor, *, state: str = "closed",
             payload["next_cursor"] = page[-1].get("last_msg_id")
         return payload
     except Exception as e:  # noqa: BLE001
+        _reraise_busy(e)  # #246 final round: /api/threads answers ONE root - 503, not a degraded 200
         payload["error"] = "threads_unavailable"
         payload["detail"] = _envelope_str(e)
         return payload
@@ -2494,13 +2546,12 @@ def _collect_web_attention_items(store: Store, roster: list[str],
     if for_agent:
         try:
             items += A.needs_operator_items(_web_needs_operator(store, for_agent))
-        except ScanBusy:
-            # #246 recast completion: a busy scan-concurrency bound must
-            # answer 503 at the route level, never degrade into a
-            # per-source error item - re-raise past this source's own
-            # errors-as-data isolation so `do_GET` can handle it.
-            raise
         except Exception as e:  # noqa: BLE001
+            # #246: a busy scan-concurrency bound must answer 503 at the
+            # route level, never degrade into a per-source error item -
+            # _reraise_busy re-raises past this source's own errors-as-data
+            # isolation so `do_GET` can handle it.
+            _reraise_busy(e)
             items.append(A.source_error_item("needs_operator", str(e)))
     try:
         holds = [h for a in roster if (h := store.read_config_blocked_hold(a))]
@@ -2599,15 +2650,14 @@ def _collect_web_attention_items(store: Store, roster: list[str],
             valid_messages = store.valid_messages()
             snapshot = _coordination_stall.build_snapshot(store, valid_messages=valid_messages)
         items += A.coordination_stall_items(snapshot.get("items") or [])
-    except ScanBusy:
-        # #246 recast completion: re-raise past this source's own
+    except Exception as e:  # noqa: BLE001
+        # #246: re-raise (via _reraise_busy) past this source's own
         # errors-as-data isolation - a busy scan-concurrency bound must
         # answer 503 at the route level (do_GET), never degrade into a
         # per-source error item that would let the handler thread carry on
         # (and, worse, mask the very saturation this bound exists to
         # surface promptly).
-        raise
-    except Exception as e:  # noqa: BLE001
+        _reraise_busy(e)
         items.append(A.source_error_item("coordination_stall", str(e)))
     return items
 
@@ -2875,7 +2925,12 @@ def build_attention(desc: RootDescriptor,
                 agents = _agent_entries(store, cfg,
                                         _validated_for_state(store, cfg)[0],
                                         for_agent)
-            except Exception:  # noqa: BLE001 — stuck items are best-effort
+            except Exception as e:  # noqa: BLE001 — stuck items are best-effort
+                # #246 final round: this used to swallow ScanBusy into a
+                # degraded agents=[] (empty stuck-agent list, no partial
+                # indicator, HTTP 200) - re-raise so a saturated bound
+                # answers 503 instead of a confidently-empty attention queue.
+                _reraise_busy(e)
                 agents = []
         wire.extend(_derive_stuck_items(agents, now=now))
         return {
@@ -2886,13 +2941,12 @@ def build_attention(desc: RootDescriptor,
             "items": wire,
             "count": len(wire),
         }
-    except ScanBusy:
-        # #246 recast completion: re-raise past this route's own
+    except Exception as e:  # noqa: BLE001 — errors-as-data, never a 500 (B1)
+        # #246: re-raise (via _reraise_busy) past this route's own
         # errors-as-data fail-safe - a busy scan-concurrency bound must
         # answer 503 at the route level (do_GET), never degrade into a
         # 200 "errors-as-data" body.
-        raise
-    except Exception as e:  # noqa: BLE001 — errors-as-data, never a 500 (B1)
+        _reraise_busy(e)
         return {
             "root": desc.label,
             "root_path": str(store.root),
@@ -3351,6 +3405,7 @@ def build_risk_register(desc: RootDescriptor) -> dict:
             agents = _agent_entries(store, cfg, _validated_for_state(store, cfg)[0],
                                     for_agent)
         except Exception as e:  # noqa: BLE001
+            _reraise_busy(e)  # #246 final round: a busy bound is 503, not a degraded row
             agents = []
             degraded.append(_envelope_str(f"stuck_agents: {e}"))
         for stuck in _derive_stuck_items(agents, now=now):
@@ -3465,6 +3520,10 @@ def build_risk_register(desc: RootDescriptor) -> dict:
             "degraded_sources": degraded,
         }
     except Exception as e:  # noqa: BLE001 — errors-as-data, never a 500
+        # #246 final round: re-raise (via _reraise_busy) so a busy scan bound
+        # answers 503, not a confident-looking "partial": True 200 body -
+        # /api/risk-register answers ONE root, same rationale as /api/attention.
+        _reraise_busy(e)
         return {
             "root": desc.label,
             "root_path": str(store.root),
@@ -3839,13 +3898,12 @@ def build_lead_chat(desc: RootDescriptor, *, limit: int = _LEAD_CHAT_LIMIT) -> d
             payload["error"] = "lead_unavailable"
             payload["detail"] = liveness.get("reason") or liveness.get("detail") or ""
         return payload
-    except ScanBusy:
-        # #246 recast completion: re-raise past this route's own fail-safe
-        # JSON handling - a busy scan-concurrency bound must answer 503 at
-        # the route level (do_GET), never degrade into a 200
-        # "lead_chat_unavailable" body.
-        raise
     except Exception as e:  # noqa: BLE001 - fail-safe JSON, never a broken endpoint
+        # #246: re-raise (via _reraise_busy) past this route's own fail-safe
+        # JSON handling - a busy scan-concurrency bound must answer 503 at
+        # the route level (do_GET / do_POST), never degrade into a 200
+        # "lead_chat_unavailable" body.
+        _reraise_busy(e)
         payload["error"] = "lead_chat_unavailable"
         payload["detail"] = _envelope_str(e)
         return payload
@@ -3973,6 +4031,20 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False,
         def do_HEAD(self) -> None:  # noqa: N802 — stdlib API
             self.do_GET()
 
+        def _send_scan_busy(self, busy: "ScanBusy") -> None:
+            # #246: shared by do_GET and do_POST so BOTH methods answer a
+            # saturated scan-concurrency bound identically - a confirmation
+            # read found the POST path (the escalation-answer send, the only
+            # POST route that can reach build_lead_chat's scan) had no
+            # ScanBusy handling at all and let the exception escape as a
+            # bare RemoteDisconnected instead of this retryable 503. Cache-
+            # Control: no-store is already sent unconditionally by _send()
+            # for every response.
+            self._send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "busy", "retry_after": busy.retry_after},
+                extra_headers={"Retry-After": str(busy.retry_after)})
+
         def do_GET(self) -> None:  # noqa: N802 — stdlib API
             if not self._check_peer_or_403():
                 return
@@ -3982,12 +4054,8 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False,
                 # #246 recast completion: answer immediately so THIS
                 # handler thread finishes rather than blocking indefinitely
                 # on a saturated scan-concurrency bound - see ScanBusy's
-                # docstring. Cache-Control: no-store is already sent
-                # unconditionally by _send() for every response.
-                self._send_json(
-                    HTTPStatus.SERVICE_UNAVAILABLE,
-                    {"error": "busy", "retry_after": busy.retry_after},
-                    extra_headers={"Retry-After": str(busy.retry_after)})
+                # docstring.
+                self._send_scan_busy(busy)
                 return
             except Exception as exc:  # noqa: BLE001 — never leak a traceback to the browser
                 if _is_client_disconnect(exc):
@@ -4012,10 +4080,20 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False,
             if path not in ("/api/intent", "/api/lead-chat"):
                 self._method_not_allowed()
                 return
-            if path == "/api/lead-chat":
-                self._handle_lead_chat_post()
-            else:
-                self._handle_intent_post()
+            try:
+                if path == "/api/lead-chat":
+                    self._handle_lead_chat_post()
+                else:
+                    self._handle_intent_post()
+            except ScanBusy as busy:
+                # #246 final round: the escalation-answer send
+                # (_handle_lead_chat_post -> build_lead_chat) can hit the
+                # same saturated scan-concurrency bound GET routes do - only
+                # do_GET mapped ScanBusy to 503 before this fix, so a busy
+                # bound on this path used to escape as an unhandled
+                # exception (RemoteDisconnected client-side). Same retryable
+                # 503 JSON as do_GET, via the shared helper.
+                self._send_scan_busy(busy)
 
         def do_PUT(self) -> None:  # noqa: N802
             if not self._check_peer_or_403():

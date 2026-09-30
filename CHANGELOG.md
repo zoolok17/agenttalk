@@ -94,6 +94,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     flight before the change legitimately keeps its own as-of-call-time
     answer. Two new client-side tests in `tests/console2_data.test.mjs`
     pin the existing (unmodified) `503`/in-flight-guard behavior.
+  - **The bound itself had four leaks (final round).** A confirmation read
+    found `ScanBusy` (the prior round's own 503-busy signal) escaping
+    through four pre-existing "errors-as-data" broad catches instead of
+    ever reaching the 503 mapping: (1) validation ran in a SEPARATE step
+    AFTER the scan's permit was released, so it could itself run unbounded
+    - a probe admitted 8 concurrent validators against a bound of 2;
+    `_all_messages` and `_validated_for_state` now share ONE permit scope
+    across scan + validation (`web._scan_and_validate_bounded`), with no
+    nested acquisition; (2) `/api/attention`'s STUCK-agent enrichment
+    swallowed a busy bound into a silently empty `items: []` 200 instead of
+    a 503; (3) the escalation-answer POST (`/api/lead-chat` with
+    `to_request`+`body`) had NO `ScanBusy` handling at all - only `do_GET`
+    mapped it to 503, so a saturated bound on this path used to escape as
+    an unhandled exception (a bare disconnect client-side); (4)
+    `/api/threads` and `/api/risk-register` each degraded a busy bound into
+    a 200 body (`threads_unavailable` / `partial: true`) with no
+    `Retry-After`. Every broad catch on a path that can reach a scan helper
+    now calls one shared guard (`web._reraise_busy`) as the first line of
+    its `except Exception as e:` clause, re-raising `ScanBusy` past the
+    catch instead of absorbing it - one exception, `_root_state`
+    (`/api/state`'s per-root builder), intentionally keeps degrading a busy
+    root to its own `errors` entry rather than 5xx-ing the whole multi-root
+    aggregate over one root's saturated bound (the documented FR-005
+    contract: a corrupt-or-busy root must never fail its siblings).
+    `do_POST` now maps `ScanBusy` to the same 503 JSON `do_GET` does, via a
+    shared `_send_scan_busy` helper. Added HTTP-level saturation tests for
+    `/api/attention` (including the stuck-agent path,
+    `test_attention_saturation_returns_503_even_on_the_stuck_agent_path`),
+    `/api/threads`, `/api/risk-register`, `/api/lead-chat` (GET and the
+    escalation-answer POST), and a dedicated
+    `test_validation_stays_inside_the_scan_concurrency_bound`.
 
 ### Added
 
