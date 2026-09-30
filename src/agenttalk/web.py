@@ -827,115 +827,57 @@ def _projection_config(store: Store) -> tuple[dict | None, str | None]:
     return cfg, None
 
 
-class _SingleFlight:
-    """Coalesce concurrent callers of the SAME expensive computation onto one
-    in-flight run (#239 serve-growth). ``ThreadingHTTPServer`` caps neither
-    per-endpoint concurrency nor connection lifetime: when a real browser fires
-    several overlapping requests for the same expensive, uncached full-store
-    scan faster than one completes (confirmed via tracemalloc: a synthetic,
-    strictly-sequential client never overlaps these calls and stays flat, but
-    real browser traffic does), each used to start its OWN full rescan on its
-    OWN thread - those threads, and the full scanned/validated copy each one
-    held in its stack, piled up without bound under sustained real-browser
+_SCAN_CONCURRENCY_LIMIT = 2  # module constant (#246 recast)
+
+_scan_semaphores_lock = threading.Lock()
+_scan_semaphores: dict[str, threading.Semaphore] = {}
+
+
+def _scan_semaphore(store: Store) -> threading.Semaphore:
+    """One bounded semaphore per store root (#246 recast, replacing the prior
+    two singleflight-based designs). ``ThreadingHTTPServer`` caps neither
+    per-endpoint concurrency nor connection lifetime: a real browser's
+    overlapping requests can fire a full-store scan faster than one
+    completes, and each used to start its own fully independent, fully
+    redundant rescan - piling up without bound under sustained real-browser
     load (measured ~600 MB/min, threads/handles climbing in lockstep).
-    Singleflight never changes the DATA returned - every result is still
-    computed fresh, at real request time - it only prevents redundant
-    concurrent work for the SAME key.
 
-    GENERATION-GATED (#246 P2): a plain "coalesce by key" is not enough for a
-    scan - a message published after an in-flight scan started is invisible
-    to it, so a caller must never JOIN a scan that cannot see a publication
-    it already knows about. Every call supplies ``gen``, its own freshly
-    observed publication generation (see ``_messages_generation``). A caller
-    whose ``gen`` is NEWER than the in-flight entry's own (the generation the
-    leader observed when it started) never joins it - it starts its own,
-    fresh computation instead, itself becoming the new in-flight entry for
-    any subsequent joiners. Callers whose ``gen`` matches (the common case:
-    nothing published since the leader started, e.g. the #239 browser-polling
-    case on an otherwise-idle store) coalesce exactly as before.
+    Two earlier designs tried to SHARE one scan's result across concurrent
+    callers instead of bounding how many run at once - both failed a
+    freshness review: sharing validation let a follower inherit a leader's
+    stale signing/roster verdict (round 1's F1), and even sharing just the
+    raw scan let a follower miss a message published after the scan it
+    joined had already enumerated the directory (round 1's F2) - directory
+    ``st_mtime_ns`` then turned out not to be a reliable enough publication
+    signal on Windows either (round 2's F2: 500 sequential publishes gave
+    406 unchanged consecutive timestamps), so even a corrected generation
+    check could not be trusted.
+
+    This recast stops sharing results entirely: every caller always runs
+    its OWN fresh scan (so read-after-publication freshness holds by
+    construction - there is no shared state to be stale) and merely BOUNDS
+    how many such scans may run concurrently per store root. A request that
+    arrives once the bound is already held simply waits on its OWN handler
+    thread (holding a thread, not a copy of scanned data) until a slot
+    frees up - which is exactly the resource `_SCAN_CONCURRENCY_LIMIT` is
+    sized to keep small regardless of request volume.
     """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._inflight: dict[object, dict] = {}
-
-    def do(self, key, gen, fn):
-        with self._lock:
-            entry = self._inflight.get(key)
-            if entry is not None and gen > entry["gen"]:
-                # A publication this caller already knows about happened
-                # after the in-flight scan started - it cannot see it, so
-                # joining it would silently lose a message (#246 P2).
-                entry = None
-            if entry is not None:
-                event, holder = entry["event"], entry["holder"]
-                leader = False
-            else:
-                event, holder = threading.Event(), {}
-                entry = {"event": event, "holder": holder, "gen": gen}
-                self._inflight[key] = entry
-                leader = True
-        if leader:
-            try:
-                holder["result"] = fn()
-            except BaseException as exc:  # noqa: BLE001 - re-raised to every waiter
-                holder["exc"] = exc
-            finally:
-                with self._lock:
-                    # Identity check (#246): a staleness check above may
-                    # already have replaced this entry with a newer one -
-                    # never delete a successor's entry out from under it.
-                    if self._inflight.get(key) is entry:
-                        del self._inflight[key]
-                event.set()
-        else:
-            event.wait()
-        if "exc" in holder:
-            raise holder["exc"]
-        return holder["result"]
+    key = str(store.root)
+    with _scan_semaphores_lock:
+        sem = _scan_semaphores.get(key)
+        if sem is None:
+            sem = threading.Semaphore(_SCAN_CONCURRENCY_LIMIT)
+            _scan_semaphores[key] = sem
+        return sem
 
 
-_message_scan_singleflight = _SingleFlight()
-
-
-def _messages_generation(store: Store) -> int:
-    """A cheap, RELIABLE-on-Windows publication-generation signal for
-    ``store.messages_dir`` (#246 P2): its own ``st_mtime_ns``. Publishing a
-    message links a new file into this directory (``store.py``'s
-    ``_publish_text_no_replace`` via ``os.link``), and directory mtime
-    updates on child creation on NTFS - verified directly (a plain write AND
-    a hardlink into a fresh temp dir both advanced its ``st_mtime_ns`` on
-    this host). There is no existing publication counter/generation in
-    ``store.py`` to prefer over this (checked first, per the review). Two
-    publications landing within the SAME mtime tick would be
-    indistinguishable, but real publish rates (seconds apart) are far
-    coarser than NTFS's timestamp resolution, so this is reliable in
-    practice; a directory that does not exist yet has never been published
-    to, so it is fixed at ``0``.
-    """
-    try:
-        return store.messages_dir.stat().st_mtime_ns
-    except OSError:
-        return 0
-
-
-def _scan_messages_with_paths_coalesced(store: Store):
-    """Coalesce the raw, CONTEXT-INDEPENDENT disk walk per store root (#246 F1
-    correctness fix, on top of the #239 fix). ``store._scan_messages_with_paths``
-    only reads and parses envelope files off disk - it never consults config,
-    roster, or signing trust - so sharing it across concurrent callers is
-    always safe with respect to VALIDATION context (see
-    ``envelope_snapshot.validate_scanned_rows``'s docstring: that is NEVER
-    coalesced here either, so a caller whose config/roster/signing context
-    changed since an in-flight scan started always validates fresh).
-
-    Sharing the scan ITSELF still has to respect read-after-publication
-    freshness (#246 P2), which is why this also passes the caller's own
-    current ``_messages_generation`` into the generation-gated
-    ``_SingleFlight`` - see its docstring.
-    """
-    gen = _messages_generation(store)
-    return _message_scan_singleflight.do(str(store.root), gen, store._scan_messages_with_paths)
+def _scan_messages_with_paths_bounded(store: Store):
+    """Run the raw disk scan under the per-store-root concurrency bound
+    (#246 recast) - see ``_scan_semaphore``'s docstring for why this
+    replaces the earlier singleflight/generation designs. Always a fresh,
+    uncached scan; never shared."""
+    with _scan_semaphore(store):
+        return store._scan_messages_with_paths()
 
 
 def _all_messages(store: Store, *, cfg: dict | None = None) -> list[Message]:
@@ -948,11 +890,10 @@ def _all_messages(store: Store, *, cfg: dict | None = None) -> list[Message]:
     through ``store.list_invalid_messages()`` and is surfaced in
     ``/api/status.invalid_messages`` instead of being rendered.
 
-    The raw disk scan is coalesced per store root (see
-    ``_scan_messages_with_paths_coalesced``) but validation always runs
-    fresh, with THIS call's own current config/roster/signing context - see
-    that function's docstring for why the two must never be coalesced
-    together.
+    The raw disk scan runs under the per-store-root concurrency bound (see
+    ``_scan_semaphore``) - always a fresh scan, per call, with THIS call's
+    own current config/roster/signing context; nothing is ever shared
+    across callers.
     """
     if cfg is None:
         cfg, config_error = _projection_config(store)
@@ -963,7 +904,7 @@ def _all_messages(store: Store, *, cfg: dict | None = None) -> list[Message]:
     # identity's historical messages vanish from /api/messages, /messages/<id>,
     # and the index while the thread panel still shows them. The two surfaces
     # must agree.
-    rows, invalid = _scan_messages_with_paths_coalesced(store)
+    rows, invalid = _scan_messages_with_paths_bounded(store)
     try:
         valid_rows, _rejects = _snapshots.validate_scanned_rows(store, cfg, rows, len(invalid))
     except ValueError:
@@ -1042,16 +983,17 @@ def _closed_rids_for(store: Store, agent: str) -> set[str]:
 def _validated_for_state(store: Store, cfg: dict) -> tuple[list[Message], int]:
     """Synchronous composition callers share the worker's canonical validator.
 
-    The raw disk scan is coalesced per store root (see
-    ``_scan_messages_with_paths_coalesced``), same as ``_all_messages`` -
-    this is the OTHER uncached O(store size) scan real browser traffic (GET
-    /api/attention, /api/lead-chat) can fire faster than one call completes.
-    Validation always runs fresh with THIS call's own current config/roster/
-    signing context (#246 F1) - never shared, so a request that starts after
-    a signing/config/roster change can never inherit an older in-flight
-    computation's stale verdicts.
+    The raw disk scan runs under the per-store-root concurrency bound (see
+    ``_scan_semaphore``), same as ``_all_messages`` - this is the OTHER
+    uncached O(store size) scan real browser traffic (GET /api/attention,
+    /api/lead-chat) can fire faster than one call completes. Every call
+    (leader or not - there is no leader anymore) runs its own fresh scan
+    and its own fresh validation with THIS call's current config/roster/
+    signing context - nothing is ever shared across callers, so neither a
+    stale context nor a missed publication can leak from one caller to
+    another (#246 recast).
     """
-    rows, invalid = _scan_messages_with_paths_coalesced(store)
+    rows, invalid = _scan_messages_with_paths_bounded(store)
     valid_rows, rejects = _snapshots.validate_scanned_rows(store, cfg, rows, len(invalid))
     return [message for message, _path in valid_rows], rejects
 
@@ -2595,7 +2537,17 @@ def _collect_web_attention_items(store: Store, roster: list[str],
     try:
         from agenttalk import coordination_stall as _coordination_stall
 
-        snapshot = _coordination_stall.build_snapshot(store)
+        # #246 recast F1: build_snapshot defaults to its OWN independent,
+        # unbounded `store.valid_messages()` scan when valid_messages is
+        # omitted (as this call used to) - pass a pre-computed list (itself
+        # run under the SAME per-root bound) so this route does ONE scan,
+        # not two, and bound the call itself too: build_snapshot's own
+        # supervisor.build_report() call (for active ephemeral reviewers)
+        # may ALSO lazily call store.valid_messages() internally, with no
+        # reuse hook of its own - the surrounding semaphore still bounds it.
+        with _scan_semaphore(store):
+            valid_messages = store.valid_messages()
+            snapshot = _coordination_stall.build_snapshot(store, valid_messages=valid_messages)
         items += A.coordination_stall_items(snapshot.get("items") or [])
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("coordination_stall", str(e)))

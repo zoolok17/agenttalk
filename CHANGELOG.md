@@ -29,45 +29,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lockstep and never plateauing - consistent with the reported incident
   (~19 GB private / ~1.9 GB working set growth over about 70 minutes with a
   single browser tab open).
-  - The raw, context-independent disk scan (`store._scan_messages_with_paths`)
-    is now coalesced per store root via a small single-flight helper
-    (`web._SingleFlight`): concurrent callers for the SAME store share one
-    in-flight scan instead of each starting their own. Validation (roster +
-    signing) is deliberately NEVER coalesced - it always runs fresh, per
-    caller, with that caller's own current config/roster/signing context
-    (`envelope_snapshot.validate_scanned_rows`) - a review of the first cut
-    (which coalesced the whole validated computation) found that a request
-    starting after signing enforcement or a roster/config change could join
-    an older in-flight computation and render a message its current policy
-    would reject. Splitting scan from validation removes that risk
-    entirely: sharing the scan is always safe (it never depends on
-    security-relevant context), so nothing about validation freshness has
-    to depend on a coalescing key correctly enumerating every
-    context-relevant input.
-  - Sharing even just the scan has its own freshness risk: a request that
-    starts after a message was successfully published could join a scan
-    that enumerated the messages directory BEFORE that publication and
-    silently miss it - per-caller validation cannot recover a file that is
-    simply absent from the shared scanned rows. Coalescing is now
-    generation-gated: a caller supplies its own freshly-observed
-    publication generation (the messages directory's `st_mtime_ns` -
-    verified directly that both a plain write and the real publish path's
-    `os.link` hardlink advance a directory's mtime on Windows; `store.py`
-    has no existing publication counter to prefer over this) and never
-    joins an in-flight scan whose own generation is older - it starts a
-    fresh scan instead. Unchanged generations (the #239 browser-polling
-    case) still coalesce exactly as before.
-  - Added regression tests: `test_concurrent_calls_with_matching_context_still_coalesce_the_scan`
-    (many genuinely concurrent calls sharing a matching context still
-    coalesce onto one scan; thread count returns to baseline; retained
-    allocations stay under a fixed ceiling); event-synchronized (no
-    sleep-and-hope races), `test_signing_enforcement_change_mid_flight_is_never_shared`
-    / `test_roster_change_mid_flight_is_never_shared` (each parametrized
-    over both entry points) proving a follower that joins an in-flight scan
-    always validates with its own current context, never a leader's stale
-    one; and `test_read_after_publication_freshness_is_never_shared` (same
-    parametrization) proving a follower whose own publication generation is
-    newer than an in-flight scan's never joins it.
+  - **Final design: bound concurrency, never share results.** Two earlier
+    cuts tried sharing one scan's result across concurrent callers instead
+    (a single-flight coalescer, later made "generation-gated" against
+    publications) - both failed review: sharing validation let a follower
+    inherit a stale signing/roster verdict, and even sharing just the raw
+    scan let a follower miss a message published after the scan it joined
+    had already enumerated the directory; the publication-generation signal
+    that second cut relied on (the messages directory's `st_mtime_ns`) then
+    turned out not to be reliable enough on Windows either (500 sequential
+    publishes gave 406 unchanged consecutive timestamps), so even a
+    corrected generation check could not be trusted. The shipped fix stops
+    sharing results entirely: `_all_messages`, `_validated_for_state`, and
+    the `/api/attention` route's `coordination_stall`/`supervisor` scans
+    (which used to run their own independent, unbounded
+    `store.valid_messages()` scan - the attention route now passes it the
+    already-computed messages instead) all run under one bounded
+    `threading.Semaphore` per store root (`web._SCAN_CONCURRENCY_LIMIT`,
+    currently 2). Every caller still runs its own fresh scan with its own
+    current context - so read-after-publication freshness and per-caller
+    validation both hold BY CONSTRUCTION, with no sharing and no signal to
+    get wrong - and concurrency is simply bounded rather than unbounded, so
+    a real browser's overlapping requests wait briefly on a handler thread
+    instead of each starting a fully redundant rescan.
+  - Added regression tests:
+    `test_concurrent_attention_and_lead_chat_requests_bound_scan_concurrency`
+    (an HTTP-level test against a real in-process server with a slowed,
+    instrumented scanner - peak concurrent scans stay at or below the
+    bound and every request completes; fails against unmodified
+    `origin/master`, which has no bound of any kind);
+    `test_read_after_publication_is_never_missed`,
+    `test_signing_enforcement_change_is_always_applied_fresh`, and
+    `test_roster_change_is_always_applied_fresh` (event-synchronized, no
+    sleep-and-hope races) pinning that a call starting after a publication
+    or a signing/roster change always reflects it, while a call already in
+    flight before the change legitimately keeps its own as-of-call-time
+    answer.
 
 ### Added
 
