@@ -2250,13 +2250,110 @@ def test_task_ignores_senders_own_stale_health_for_the_version_gate(
     # The sender is obviously current (it is running this exact check) - its
     # own possibly-absent/stale health.json must never self-block a task.
     store.set_role("alpha", "lead")
-    # The peer advertises the CURRENT package version: the gate compares
-    # against the sender's own running major.minor, so a literal pin here
-    # would go red on every release bump (it did on 0.89.0).
+    # The peer advertises the CURRENT package version: it is far above the
+    # 0.88.0 task-kind floor, so the gate accepts it. (Under the old
+    # "no peer older than me" rule this pinned literal went red on every
+    # release bump - it did on 0.89.0; the fixed floor made that class of
+    # test breakage impossible.)
     from agenttalk import __version__
     store.write_health("beta", {"agenttalk_version": __version__})
     rc = _run(["task", "--from", "alpha", "--to", "beta", "-m", "go"], store_root)
     assert rc == 0
+    # The `exclude` skip is pinned at the function level too: the sender
+    # never counts as behind, even if it were listed as a recipient and
+    # never advertised a version itself.
+    assert cli._recipients_behind_kind(store, ["alpha", "beta"],
+                                       kind="task",
+                                       exclude="alpha") == []
+
+
+def test_task_accepts_recipient_exactly_at_the_floor(
+    store: Store, store_root: Path,
+) -> None:
+    # The `task` kind was first understood in v0.88.0: a recipient
+    # advertising EXACTLY the floor can parse it, whatever the sender runs.
+    store.set_role("alpha", "lead")
+    store.write_health("beta", {"agenttalk_version": "0.88.0"})
+    rc = _run(["task", "--from", "alpha", "--to", "beta", "-m", "go"], store_root)
+    assert rc == 0
+    assert store.messages_for("beta")[-1].kind == "task"
+
+
+def test_task_refuses_recipient_below_the_floor_and_names_its_version(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    # A recipient on 0.87.3 (just below the 0.88.0 floor) would silently
+    # drop a `task` — the refusal must name it WITH its advertised version.
+    store.set_role("alpha", "lead")
+    store.write_health("beta", {"agenttalk_version": "0.87.3"})
+    _run_expect_exit(["task", "--from", "alpha", "--to", "beta", "-m", "go"],
+                     store_root, 2)
+    err = capsys.readouterr().err
+    assert "beta (0.87.3)" in err
+    assert "--force" in err
+    assert store.messages_for("beta") == []
+
+
+def test_task_ignores_non_recipient_roster_members_below_the_floor(
+    store: Store, store_root: Path,
+) -> None:
+    # #201: a `task` goes to exactly ONE recipient, so a stale seat that
+    # does not receive it must not block the dispatch (the old gate scanned
+    # the WHOLE roster against the sender's own version).
+    store.set_role("alpha", "lead")
+    store.add_agent("gamma")  # a REAL roster member, so a whole-roster scan sees it
+    store.write_health("beta", {"agenttalk_version": "0.90.0"})
+    store.write_health("gamma", {"agenttalk_version": "0.80.0"})
+    rc = _run(["task", "--from", "alpha", "--to", "beta", "-m", "go"], store_root)
+    assert rc == 0
+    assert store.messages_for("beta")[-1].kind == "task"
+    assert store.messages_for("gamma") == []
+
+
+def test_task_version_bump_alone_changes_nothing(
+    store: Store, store_root: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The gate is a FIXED per-kind floor (task: 0.88.0), not the sender's
+    # running version: with the sender's version patched to 9.99.0, a
+    # recipient on 0.94.0 (>= 0.88.0) is still accepted. The old
+    # "no peer older than me" rule would have refused here on every release.
+    store.set_role("alpha", "lead")
+    store.write_health("beta", {"agenttalk_version": "0.94.0"})
+    monkeypatch.setattr(cli, "__version__", "9.99.0")
+    rc = _run(["task", "--from", "alpha", "--to", "beta", "-m", "go"], store_root)
+    assert rc == 0
+    assert store.messages_for("beta")[-1].kind == "task"
+
+
+def test_broadcast_task_kind_gates_on_resolved_audience_not_roster(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    # #201 for fan-out: `broadcast --kind task` must gate on the RESOLVED
+    # audience only. A below-floor seat OUTSIDE the audience must not
+    # block; one INSIDE it must.
+    root = _role_root(tmp_path)  # lead, rev-a, rev-b, impl-c
+    assert _run(["roster", "set-role", "lead", "lead"], root) == 0  # sole lead
+    s = Store(root)
+    # Audience seats advertise a current version (>= the 0.88.0 floor);
+    # impl-c is below the floor but OUTSIDE the audience.
+    s.write_health("rev-a", {"agenttalk_version": "0.94.0"})
+    s.write_health("rev-b", {"agenttalk_version": "0.94.0"})
+    s.write_health("impl-c", {"agenttalk_version": "0.80.0"})
+
+    # impl-c is below the floor but OUTSIDE the audience: no block.
+    rc = _run(["broadcast", "--from", "lead", "--to-role", "reviewer",
+               "--kind", "task", "-m", "fresh eyes", "--quiet"], root)
+    assert rc == 0
+    copies = [m for m in _msgs_on_disk(root) if m["kind"] == "task"]
+    assert sorted(m["to"] for m in copies) == ["rev-a", "rev-b"]
+    capsys.readouterr()
+
+    # Now a below-floor seat INSIDE the audience: the fan-out is refused.
+    Store(root).write_health("rev-b", {"agenttalk_version": "0.87.0"})
+    _run_expect_exit(["broadcast", "--from", "lead", "--to-role", "reviewer",
+                      "--kind", "task", "-m", "fresh eyes", "--quiet"],
+                     root, 2)
+    assert "rev-b (0.87.0)" in capsys.readouterr().err
 
 
 def test_send_question_autogen_q_request_id(
@@ -4219,6 +4316,89 @@ def test_resume_complete_batch_json_parseable(tmp_path: Path, capsys) -> None:
     rc = _run(["broadcast", "--from", "lead", "--resume", "b-done", "--json"], root)
     assert rc == 0
     manifest = json.loads(capsys.readouterr().out)   # stdout must be ONLY JSON
+    assert manifest["delivered"] == ["w1"]
+    assert manifest["missed"] == []
+
+
+def _partial_task_broadcast(root: Path, bid: str, members) -> None:
+    """A PARTIAL task-kind frozen-audience batch: a copy goes ONLY to the
+    first member; ``audience_resolved`` names all (the rest are 'missed').
+    Built via direct Store.send (CLI ``send --kind task`` is refused, and
+    ``broadcast`` would send to everyone, so neither CLI path can make a
+    partial task batch) - the opener copy's meta is copied from
+    ``cmd_broadcast``'s own send loop (request_id/broadcast_id +
+    audience_resolved + the per-member vendor map)."""
+    s = Store(root)
+    vendors = dict.fromkeys(members, "unverified")
+    s.send(sender="lead", recipient=members[0], kind="task", body="do X",
+           meta={
+               "request_id": bid, "broadcast_id": bid,
+               "audience": "all", "audience_kind": "all",
+               "audience_resolved": ",".join(members),
+               "batch_total": str(len(members)),
+           }, _dispatch_vendors=vendors)
+
+
+def test_resume_task_broadcast_retired_below_floor_is_dropped_not_blocking(
+    tmp_path: Path, capsys,
+) -> None:
+    # #259 fix-round-1 F1: the resume version gate must look only at the
+    # ACTIVE, still-missing recipients - NOT the whole frozen audience. A
+    # retired below-floor member (w3) can never receive (store.send refuses
+    # it; it is reported under `dropped`), so gating it would trap the
+    # resume and strand the active missing copy (w2). Exit 0, w2 delivered,
+    # w3 dropped.
+    root = _team_root(tmp_path, agents="lead,w1,w2,w3")
+    assert _run(["roster", "set-role", "lead", "lead"], root) == 0  # sole lead
+    s = Store(root)
+    s.write_health("w1", {"agenttalk_version": "0.94.0"})
+    s.write_health("w2", {"agenttalk_version": "0.94.0"})
+    s.write_health("w3", {"agenttalk_version": "0.87.0"})   # below the floor
+    _partial_task_broadcast(root, "b-probe", ["w1", "w2", "w3"])  # only w1 sent
+    assert _run(["roster", "retire", "w3"], root) == 0      # w2 active, w3 retired
+    capsys.readouterr()
+    rc = _run(["broadcast", "--from", "lead", "--resume", "b-probe", "--json"], root)
+    assert rc == 0
+    manifest = json.loads(capsys.readouterr().out)   # stdout must be ONLY JSON
+    assert "w2" in manifest["delivered"]             # the active copy was sent
+    assert manifest["dropped"] == ["w3"]             # the retired one, not blocking
+    assert manifest["missed"] == []
+
+
+def test_resume_task_broadcast_active_below_floor_missing_refused(
+    tmp_path: Path, capsys,
+) -> None:
+    # #259 fix-round-1 F1 (the refusal side): a resume whose only ACTIVE,
+    # still-missing member is below the floor is REFUSED - it would never
+    # parse the task - and the error names it with its version. (This pins
+    # the gate: it must still block a genuinely-below-floor ACTIVE recipient.)
+    root = _team_root(tmp_path, agents="lead,w1,w2")
+    assert _run(["roster", "set-role", "lead", "lead"], root) == 0  # sole lead
+    s = Store(root)
+    s.write_health("w1", {"agenttalk_version": "0.94.0"})
+    s.write_health("w2", {"agenttalk_version": "0.87.0"})   # below the floor, ACTIVE
+    _partial_task_broadcast(root, "b-ref", ["w1", "w2"])    # only w1 sent, w2 active-missing
+    capsys.readouterr()
+    _run_expect_exit(["broadcast", "--from", "lead", "--resume", "b-ref"], root, 2)
+    err = capsys.readouterr().err
+    assert "w2 (0.87.0)" in err
+    assert "--force" in err
+
+
+def test_resume_task_broadcast_complete_batch_below_floor_noop_exit0(
+    tmp_path: Path, capsys,
+) -> None:
+    # #259 fix-round-1 F1 (the no-op side): an already-COMPLETE batch with a
+    # below-floor member that already got its copy must resume as a no-op
+    # (exit 0) - the `not missed` path is not version-gated at all.
+    root = _team_root(tmp_path, agents="lead,w1")
+    s = Store(root)
+    s.write_health("w1", {"agenttalk_version": "0.87.0"})   # below the floor, but...
+    _partial_task_broadcast(root, "b-done", ["w1"])         # ...already delivered
+    capsys.readouterr()
+    rc = _run(["broadcast", "--from", "lead", "--resume", "b-done", "--json"], root)
+    assert rc == 0
+    manifest = json.loads(capsys.readouterr().out)
     assert manifest["delivered"] == ["w1"]
     assert manifest["missed"] == []
 

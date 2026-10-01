@@ -622,23 +622,33 @@ KNOWN_KINDS = frozenset({
     # An older receiver's own (older) KNOWN_KINDS silently skips a `task`
     # message at read time — see `Message.validate`'s docstring above and
     # the write-time check in `Store.send` below — so `cmd_task` refuses
-    # to open a `task` thread while any OTHER roster member's
-    # last-advertised `agenttalk_version` (`health.json`, stamped every
-    # wrapper turn) is older than the SENDER'S OWN running version, or was
-    # never advertised at all (never a silent assumption of support).
-    # Deliberately compared against the sender's live `__version__`, not a
-    # hardcoded "introduced in X.Y" constant here: this repo bumps
-    # `__version__` in its own dedicated release commit, separate from the
-    # feature PR that adds a kind (see git log on `src/agenttalk/__init__.py`
-    # — "release: vX.Y.Z" commits), so a constant guessing the eventual
-    # release number would be wrong until that bump lands, AND wrong again
-    # for the general case if some later kind ships in a version other than
-    # anyone predicted. "No peer may be older than me" is always correct by
-    # construction — I am running the code that defines `task`. See
-    # `cli._roster_members_behind_task_kind`.
+    # to open a `task` thread while the RECIPIENT's last-advertised
+    # `agenttalk_version` (`health.json`, stamped every wrapper turn) is
+    # older than the version that first understood `task`, or was never
+    # advertised at all (never a silent assumption of support).
+    #
+    # That "first understood" version is a FIXED floor per kind, not the
+    # sender's own running version: `task`/`task-response` shipped in
+    # v0.88.0 (registered in fd5b2b1), so any 0.88.0+ reader already
+    # handles them, regardless of how much newer the sender is. The old
+    # "no peer may be older than me" rule was wrong in two ways after each
+    # release — a freshly upgraded lead could not send ANY task until the
+    # whole fleet relaunched, and it blocked on seats the task never went
+    # to. See `cli._recipients_behind_kind` and `KIND_SUPPORT_FLOOR`
+    # below; a version bump of this repo alone must change nothing.
     "task",
     "task-response",
 })
+
+# The first (major, minor) that understands each gated kind. A recipient
+# advertising a version at or above the floor can parse the kind; one
+# below it (or none at all) would silently drop the message, so the
+# sender refuses until it is upgraded or `--force`d. `task`/`task-response`
+# were registered in fd5b2b1 and first released in v0.88.0.
+KIND_SUPPORT_FLOOR = {
+    "task": (0, 88),
+    "task-response": (0, 88),
+}
 
 # Kinds the bus uses to signal flow control rather than carry agent
 # content. They are still persisted (so transcripts and the dashboard
