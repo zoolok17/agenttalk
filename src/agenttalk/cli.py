@@ -7832,11 +7832,6 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
                 f"audience (pre-0.15.0 broadcast) - re-send by hand with "
                 f"--meta request_id/broadcast_id/audience set.\n")
             return 2
-        # Version-floor gate on the FROZEN audience: the batch was already
-        # accepted under this rule at first send (or force-overridden), so
-        # this keeps --resume from silently resurrecting a fan-out a
-        # refused audience member could no longer parse.
-        check_task_dispatch(proto.kind, audience=resolved)
         vendors = None
         if proto.kind in work_tags.OPENERS:
             vendors = proto.meta.get("assignee_model_vendors", dict.fromkeys(resolved, "unverified"))
@@ -7880,6 +7875,14 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
                 print(f"(batch {resume} resolved: all remaining recipients "
                       f"are retired and were dropped)")
             return 0
+        # Version-floor gate, run AFTER the retired filtering: only the
+        # ACTIVE recipients that will actually receive a (re)sent copy are
+        # checked. Retired members can never receive anyway (store.send
+        # refuses them; they are reported under `dropped`), so gating them
+        # would trap the resume on a member who will get nothing — and the
+        # two no-op paths above (`not missed` / `not to_send`) are complete
+        # as far as delivery goes, so they must not be gated at all.
+        check_task_dispatch(proto.kind, audience=to_send)
         sent_resume: list = []
         failure: Exception | None = None
         for r in to_send:
