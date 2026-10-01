@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,7 @@ DEVKIT_SKILLS = [
     # dev-discipline pack
     "assurance-scan", "craft-code", "fix-ci", "qa-strategy", "refactor-code", "review-code", "review-docs",
     "test-coverage",
-    "write-docs",
+    "write-docs", "write-for-humans",
     # assurance review/test pack (P4) — emit P2/P3 close-compatible evidence
     "review-contract-drift", "review-failure-injection", "review-release-readiness",
     "system-review-protocol", "tester-qa", "test-docs", "test-integration",
@@ -461,3 +462,172 @@ def test_listen_skills_contain_consult_handling(tmp_path: Path) -> None:
         assert "Do NOT modify project files" in body
         assert "Do NOT answer the user directly" in body
         assert "Do NOT start your own consult in return" in body
+
+
+def _flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def test_lead_skills_carry_the_writing_rules_without_the_devkit(tmp_path: Path) -> None:
+    """A bus-only install (--no-devkit) has no write-for-humans skill, so the lead
+    skills must carry its core rules themselves, in identical words."""
+    claude_dir = tmp_path / "claude"
+    codex_dir = tmp_path / "codex"
+    install(claude_dir=claude_dir, codex_dir=codex_dir)
+    claude_lead = _flat((claude_dir / "agenttalk.lead.md").read_text(encoding="utf-8"))
+    codex_lead = _flat((codex_dir / "agenttalk-lead" / "SKILL.md").read_text(encoding="utf-8"))
+    rule = (
+        "use the write-for-humans skill if it is installed. If it is not, follow its "
+        "three core rules: (1) to describe a change, write in this order: what changed, "
+        "why it matters, what they will notice, what they need to do; (2) use plain "
+        "words that are true for this case, never invent a number, name or place, and "
+        "explain any technical term you cannot avoid the first time; (3) keep "
+        "every fact, with file names, IDs and test names in a Technical details section "
+        "at the end, but never include secrets, private data or internal-only addresses, "
+        "not even there. A review comment keeps the review's own format and severity tag."
+    )
+    assert rule in claude_lead
+    assert rule in codex_lead
+
+
+def test_write_for_humans_never_publishes_sensitive_data() -> None:
+    """'Keep every fact' must carry its sensitive-data exception right beside it."""
+    text = (SKILLS_ROOT / "devkit" / "write-for-humans" / "SKILL.md").read_text(encoding="utf-8")
+    section = _flat(text.split("## PRECISION WITHOUT CLUTTER", 1)[1].split("\n## ", 1)[0])
+    keep = section.index("**Keep every fact.**")
+    exception = section.index("**Except anything sensitive, which this rule never covers.**")
+    assert keep < exception < section.index("The main text must make sense")
+    assert "not even in Technical details" in section
+    assert "Moving them to the end does not make them safe" in section
+
+
+def test_write_for_humans_defers_to_the_calling_skills_evidence() -> None:
+    from agenttalk.skill_currency import _parse_skill_stub
+
+    text = (SKILLS_ROOT / "devkit" / "write-for-humans" / "SKILL.md").read_text(encoding="utf-8")
+    evidence = _flat(text.split("\n## Evidence", 1)[1])
+    assert "emit THAT skill's evidence, unchanged" in evidence
+    assert "`review-result` fields" in evidence
+    whole_job = evidence.split("Only when this skill is the whole job", 1)[1].split("emit the", 1)[0]
+    assert "an issue comment" in whole_job
+    # the standalone stub stays production-handoff, so the parity check still applies
+    assert _parse_skill_stub(text)[0] == "production-handoff"
+
+
+def test_write_for_humans_review_comments_keep_the_severity_tag() -> None:
+    text = (SKILLS_ROOT / "devkit" / "write-for-humans" / "SKILL.md").read_text(encoding="utf-8")
+    comments = text.split("### Issue and review comments", 1)[1].split("\n### ", 1)[0]
+    assert "**<severity tag, unchanged> What I found:**" in comments
+    assert "it never replaces it" in _flat(comments)
+    assert "**P1. What I found:**" in comments
+
+
+def test_write_for_humans_keeps_the_calling_review_format() -> None:
+    text = (SKILLS_ROOT / "devkit" / "write-for-humans" / "SKILL.md").read_text(encoding="utf-8")
+    comments = _flat(text.split("### Issue and review comments", 1)[1].split("\n### ", 1)[0])
+    own_format = comments.index("keep that format exactly: the same fields, labels, severity "
+                                "tags and order")
+    assert own_format < comments.index("When no format is set, use the template below")
+    assert "This skill only changes the words inside it" in comments
+
+
+def _skill() -> str:
+    return (SKILLS_ROOT / "devkit" / "write-for-humans" / "SKILL.md").read_text(encoding="utf-8")
+
+
+def _section(text: str, heading: str) -> str:
+    return text.split(f"\n## {heading}", 1)[1].split("\n## ", 1)[0]
+
+
+def test_write_for_humans_explains_terms_for_this_case() -> None:
+    terms = _flat(_section(_skill(), "TERMS"))
+    assert "**The plain words must be true for this case, not in general.**" in terms
+    assert "ask what your plain version now claims that the original did not" in terms
+    assert "Never invent a number, a name or a place that the source does not give." in terms
+
+
+def test_write_for_humans_has_no_substitution_table() -> None:
+    """A fixed 'say this instead' table is false in some context, so the skill
+    carries no markdown table at all."""
+    separator = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$")
+    assert not [ln for ln in _skill().splitlines() if separator.match(ln)]
+
+
+def test_write_for_humans_examples_are_labelled_and_at_most_three() -> None:
+    terms = _section(_skill(), "TERMS")
+    assert "They show the method; they are not words to copy." in _flat(terms)
+    examples = re.findall(r'\*\*Example (\d+), "([^"]+)"\.\*\*', terms)
+    assert examples == [("1", "merged"), ("2", "timeout"), ("3", "race condition")]
+    for example in re.split(r"\*\*Example \d+, ", _flat(terms))[1:]:
+        assert "Wrong:" in example and "Why it is wrong:" in example and "Right:" in example
+
+
+def test_write_for_humans_keeps_release_and_deploy_apart() -> None:
+    terms = _flat(_section(_skill(), "TERMS"))
+    assert ('"Released" means a new version can be installed; it does not mean anyone '
+            'is using it yet.') in terms
+    assert ('"Deployed" means a running system was switched over to it, so people are '
+            'using it now.') in terms
+
+
+def test_write_for_humans_keeps_null_absent_and_empty_apart() -> None:
+    terms = _flat(_section(_skill(), "TERMS"))
+    assert 'the field is there but set to "no value" on purpose (null)' in terms
+    assert "the field is left out entirely (absent or undefined)" in terms
+    assert "the field is there but empty (an empty text or an empty list)" in terms
+
+
+def test_write_for_humans_never_invents_numbers_from_a_percentage() -> None:
+    text = _flat((SKILLS_ROOT / "devkit" / "write-for-humans" / "SKILL.md").read_text(encoding="utf-8"))
+    assert "1 second instead of 6" not in text
+    assert "only when the source measured them; never work them out from a percentage" in text
+    assert "(the p95) dropped by 83%" in text
+
+
+def test_write_for_humans_before_and_now_only_for_changes() -> None:
+    text = (SKILLS_ROOT / "devkit" / "write-for-humans" / "SKILL.md").read_text(encoding="utf-8")
+    order = _flat(text.split("## ORDER", 1)[1].split("\n## ", 1)[0])
+    assert order.index("This order is for text that describes a change") < order.index("1. ")
+    assert "Review comments and status reports follow their own templates" in order
+    check = _flat(text.split("## SELF-CHECK", 1)[1].split("\n## ", 1)[0])
+    assert ("For a release note, changelog entry or pull request description: is \"what "
+            "you will notice\" there") in check
+
+
+def test_write_for_humans_triggers_only_on_its_artifacts() -> None:
+    text = (SKILLS_ROOT / "devkit" / "write-for-humans" / "SKILL.md").read_text(encoding="utf-8")
+    description = _flat(text.split("description: >-", 1)[1].split("\nreviewed-against:", 1)[0])
+    assert "anything a person will read" not in description
+    assert "whenever the reader may not be a developer" not in description
+    assert description.startswith(
+        "Write release notes, changelog entries, pull request descriptions, issue and "
+        "review comments, and status reports")
+    assert "Use only for those kinds of text." in description
+    assert "Do NOT use for answering questions, plans or design discussions" in description
+
+
+def test_write_for_humans_samples_follow_the_skill() -> None:
+    """The reference rewrites must pass the skill's own checks: no issue numbers in the
+    reader-facing text, the PR template's sections, and no overstated freshness."""
+    repo = Path(__file__).resolve().parents[1]
+    text = (repo / "docs" / "examples" / "write-for-humans-samples.md").read_text(encoding="utf-8")
+    afters = [a.split("## Sample 2", 1)[0] for a in re.split(r"(?m)^### After$", text)[1:]]
+    assert len(afters) == 2
+    for after in afters:
+        main = re.split(r"(?m)^#{4,5} Technical details$", after)[0]
+        assert not re.findall(r"#\d+", main)
+    pr_sections = re.findall(r"(?m)^#### (.*)$", afters[1])
+    for required in ("What this changes", "What you will notice",
+                     "What reviewers and users need to do", "How we checked it",
+                     "Technical details"):
+        assert required in pr_sections
+    assert "never out of date" not in _flat(afters[1])
+
+
+def test_write_for_humans_samples_ship_in_the_sdist() -> None:
+    """The CHANGELOG points readers at the samples, so the sdist must carry them."""
+    repo = Path(__file__).resolve().parents[1]
+    pyproject = (repo / "pyproject.toml").read_text(encoding="utf-8")
+    sdist = pyproject.split("[tool.hatch.build.targets.sdist]", 1)[1].split("\n[", 1)[0]
+    assert '"/docs/examples/write-for-humans-samples.md"' in sdist
+    assert (repo / "docs" / "examples" / "write-for-humans-samples.md").is_file()

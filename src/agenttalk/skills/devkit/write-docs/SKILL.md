@@ -18,6 +18,10 @@ Documentation is part of the behavioral surface: a change is incomplete while it
 docs still teach the old behavior. Write for one reader, in one mode, with examples
 that actually run.
 
+This skill covers documentation pages (READMEs, guides, tutorials, reference).
+For release notes, changelog entries, pull request descriptions, comments and
+status reports, use write-for-humans instead.
+
 ## CLASSIFY — before writing
 - [ ] Pick exactly **one Diataxis mode** for the page and don't mix them — split and
       cross-link instead:
