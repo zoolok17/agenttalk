@@ -321,6 +321,7 @@ Dev-discipline skills:
 | `test-coverage` | Behavior tests for touched behavior |
 | `review-code` | Diff review for bugs and regressions |
 | `write-docs`, `review-docs`, `test-docs` | Documentation authoring and QA |
+| `write-for-humans` | Plain-language release notes, PR descriptions, comments and status reports |
 | `review-failure-injection`, `review-contract-drift`, `review-release-readiness` | Specialist review lenses |
 | `tester-qa`, `test-integration`, `test-security`, `assurance-scan` | Executed evidence and QA |
 | `system-review-protocol` | Multi-lens release or milestone close |

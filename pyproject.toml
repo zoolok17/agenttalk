@@ -82,6 +82,7 @@ include = [
     "/docs/bug-report-2026-07-11-taskkill-windows-0xc0000142.md",
     "/docs/agenttalk-delivery-os-field-notes.md",
     "/docs/audit-2026-06-28.md",
+    "/docs/examples/write-for-humans-samples.md",
     "/docs/reviews",
     "/docs/rfc-identity-authz.md",
     "/docs/skill-devkit-evolution-design.md",

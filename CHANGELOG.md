@@ -25,6 +25,41 @@ too-bright colour theme.
 
 ### Added
 
+- **A new skill that teaches agents to write for people, not for programmers.**
+  Release notes, pull request descriptions and comments were written for
+  developers: short, dense and full of file names and jargon. Someone who does
+  not program could not tell what had changed or why it mattered.
+
+  The new `write-for-humans` skill teaches every agent to write for that reader:
+  - first say what changed, then why it matters, then what you will notice
+    ("before this ... now ..."), then what you need to do;
+  - use simple words, and explain any unavoidable technical term the first
+    time, in words that are true for this particular case. There is no fixed
+    list of replacement words, because the same plain words can be true in one
+    case and false in the next; three worked examples show the method instead;
+  - keep every fact, and move file names, commit IDs and test names to a short
+    "Technical details" section at the end;
+  - but never publish anything sensitive (passwords, keys, private or customer
+    data, internal-only addresses): remove it or summarise it safely, even in
+    the technical details.
+
+  It comes with templates for release notes, pull request descriptions, review
+  comments (which keep the review's own format and severity tag) and status
+  reports, plus a checklist to run before posting. When it is used inside
+  another skill's work, such as a review, that skill's evidence rules still
+  apply.
+
+  What you will notice: agents that write for you should start explaining
+  their work in plain language, at greater length. Nothing to do: the skill is
+  installed with the others by `agenttalk install-skills`.
+
+  Technical details: `src/agenttalk/skills/devkit/write-for-humans/SKILL.md`.
+  It is linked from the `write-docs` skill, the shared skill routing index,
+  both lead skills (step 7, which also carries the three core rules for a
+  `--no-devkit` install) and the user manual's skill table. Before-and-after
+  samples are in `docs/examples/write-for-humans-samples.md`, which ships in the
+  source distribution.
+
 - **Work board: a Done lane from lead-run, Git-verified merge facts (#207).**
   The reducer could already place Done from integration evidence, but nothing
   supplied it. The new `agenttalk board verify-merges [--dry-run] [--json]`
