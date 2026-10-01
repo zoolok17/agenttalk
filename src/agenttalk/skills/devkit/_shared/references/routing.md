@@ -25,6 +25,7 @@ unique evidence).
 | Executable security tests / abuse cases | test-security |
 | Integrated diff review | review-code |
 | Documentation | write-docs |
+| Release notes, changelog entries, PR descriptions, comments, status reports a person will read | write-for-humans |
 | Executable documentation checks | test-docs |
 | Documentation accuracy / audience / prose review | review-docs |
 | Failure-path / contract-drift / release-readiness assurance | review-failure-injection / review-contract-drift / review-release-readiness |

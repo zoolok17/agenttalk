@@ -409,6 +409,17 @@ the agents you plan.
 7. Collect results, request cross-review for implemented pieces, and
    summarize the outcome to the user with unresolved blockers called
    out explicitly.
+   For anything a person will read (this summary, release notes, changelog
+   entries, pull request descriptions, issue and review comments), use the
+   write-for-humans skill if it is installed. If it is not, follow its three
+   core rules: (1) to describe a change, write in this order: what changed,
+   why it matters, what they will notice, what they need to do; (2) use plain
+   words that are true for this case, never invent a number, name or place,
+   and explain any technical term you cannot avoid the first time; (3) keep
+   every fact, with file names, IDs and test names in a Technical
+   details section at the end, but never include secrets, private data or
+   internal-only addresses, not even there. A review comment keeps the
+   review's own format and severity tag.
 
 ## Publishing a sandboxed worker's commit
 
