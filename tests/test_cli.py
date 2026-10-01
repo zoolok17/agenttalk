@@ -4328,9 +4328,8 @@ def _partial_task_broadcast(root: Path, bid: str, members) -> None:
     partial task batch) - the opener copy's meta is copied from
     ``cmd_broadcast``'s own send loop (request_id/broadcast_id +
     audience_resolved + the per-member vendor map)."""
-    from agenttalk import work_tags
     s = Store(root)
-    vendors = {m: "unverified" for m in members}
+    vendors = dict.fromkeys(members, "unverified")
     s.send(sender="lead", recipient=members[0], kind="task", body="do X",
            meta={
                "request_id": bid, "broadcast_id": bid,
