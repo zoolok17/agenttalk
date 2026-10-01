@@ -4320,6 +4320,90 @@ def test_resume_complete_batch_json_parseable(tmp_path: Path, capsys) -> None:
     assert manifest["missed"] == []
 
 
+def _partial_task_broadcast(root: Path, bid: str, members) -> None:
+    """A PARTIAL task-kind frozen-audience batch: a copy goes ONLY to the
+    first member; ``audience_resolved`` names all (the rest are 'missed').
+    Built via direct Store.send (CLI ``send --kind task`` is refused, and
+    ``broadcast`` would send to everyone, so neither CLI path can make a
+    partial task batch) - the opener copy's meta is copied from
+    ``cmd_broadcast``'s own send loop (request_id/broadcast_id +
+    audience_resolved + the per-member vendor map)."""
+    from agenttalk import work_tags
+    s = Store(root)
+    vendors = {m: "unverified" for m in members}
+    s.send(sender="lead", recipient=members[0], kind="task", body="do X",
+           meta={
+               "request_id": bid, "broadcast_id": bid,
+               "audience": "all", "audience_kind": "all",
+               "audience_resolved": ",".join(members),
+               "batch_total": str(len(members)),
+           }, _dispatch_vendors=vendors)
+
+
+def test_resume_task_broadcast_retired_below_floor_is_dropped_not_blocking(
+    tmp_path: Path, capsys,
+) -> None:
+    # #259 fix-round-1 F1: the resume version gate must look only at the
+    # ACTIVE, still-missing recipients - NOT the whole frozen audience. A
+    # retired below-floor member (w3) can never receive (store.send refuses
+    # it; it is reported under `dropped`), so gating it would trap the
+    # resume and strand the active missing copy (w2). Exit 0, w2 delivered,
+    # w3 dropped.
+    root = _team_root(tmp_path, agents="lead,w1,w2,w3")
+    assert _run(["roster", "set-role", "lead", "lead"], root) == 0  # sole lead
+    s = Store(root)
+    s.write_health("w1", {"agenttalk_version": "0.94.0"})
+    s.write_health("w2", {"agenttalk_version": "0.94.0"})
+    s.write_health("w3", {"agenttalk_version": "0.87.0"})   # below the floor
+    _partial_task_broadcast(root, "b-probe", ["w1", "w2", "w3"])  # only w1 sent
+    assert _run(["roster", "retire", "w3"], root) == 0      # w2 active, w3 retired
+    capsys.readouterr()
+    rc = _run(["broadcast", "--from", "lead", "--resume", "b-probe", "--json"], root)
+    assert rc == 0
+    manifest = json.loads(capsys.readouterr().out)   # stdout must be ONLY JSON
+    assert "w2" in manifest["delivered"]             # the active copy was sent
+    assert manifest["dropped"] == ["w3"]             # the retired one, not blocking
+    assert manifest["missed"] == []
+
+
+def test_resume_task_broadcast_active_below_floor_missing_refused(
+    tmp_path: Path, capsys,
+) -> None:
+    # #259 fix-round-1 F1 (the refusal side): a resume whose only ACTIVE,
+    # still-missing member is below the floor is REFUSED - it would never
+    # parse the task - and the error names it with its version. (This pins
+    # the gate: it must still block a genuinely-below-floor ACTIVE recipient.)
+    root = _team_root(tmp_path, agents="lead,w1,w2")
+    assert _run(["roster", "set-role", "lead", "lead"], root) == 0  # sole lead
+    s = Store(root)
+    s.write_health("w1", {"agenttalk_version": "0.94.0"})
+    s.write_health("w2", {"agenttalk_version": "0.87.0"})   # below the floor, ACTIVE
+    _partial_task_broadcast(root, "b-ref", ["w1", "w2"])    # only w1 sent, w2 active-missing
+    capsys.readouterr()
+    _run_expect_exit(["broadcast", "--from", "lead", "--resume", "b-ref"], root, 2)
+    err = capsys.readouterr().err
+    assert "w2 (0.87.0)" in err
+    assert "--force" in err
+
+
+def test_resume_task_broadcast_complete_batch_below_floor_noop_exit0(
+    tmp_path: Path, capsys,
+) -> None:
+    # #259 fix-round-1 F1 (the no-op side): an already-COMPLETE batch with a
+    # below-floor member that already got its copy must resume as a no-op
+    # (exit 0) - the `not missed` path is not version-gated at all.
+    root = _team_root(tmp_path, agents="lead,w1")
+    s = Store(root)
+    s.write_health("w1", {"agenttalk_version": "0.87.0"})   # below the floor, but...
+    _partial_task_broadcast(root, "b-done", ["w1"])         # ...already delivered
+    capsys.readouterr()
+    rc = _run(["broadcast", "--from", "lead", "--resume", "b-done", "--json"], root)
+    assert rc == 0
+    manifest = json.loads(capsys.readouterr().out)
+    assert manifest["delivered"] == ["w1"]
+    assert manifest["missed"] == []
+
+
 def test_wait_warns_on_live_duplicate(tmp_path: Path, capsys,
                                       monkeypatch: pytest.MonkeyPatch) -> None:
     """FR-007: `wait` warns when foreign_wait_pid reports a live duplicate;
