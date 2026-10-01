@@ -267,7 +267,7 @@ agenttalk's differences:
 
 **Bus and protocol:**
 - a completion receipt for tasks (#178);
-- the task version gate refusing tasks to seats not yet relaunched after a release bump (#185), and the whole-roster sender-version check (#201);
+- ~~the task version gate refusing tasks to seats not yet relaunched after a release bump (#185), and the whole-roster sender-version check (#201)~~ — **fixed by PR #259** (the gate now compares the recipient against the fixed 0.88.0 floor, not the sender's version; other seats' versions are irrelevant);
 - drain losing mail under truncated output (#37);
 - not-found subclasses (#39);
 - a CLI command-registration seam (#38).
@@ -370,7 +370,7 @@ Do not ship broad workflow claims if any of these are true:
 - **The supervisor** is PowerShell Core + `Win32_Process`-bound, and it is not run on the maintainers' fleet. Dead seats are relaunched by hand (§6.1).
 - **Publications serialize on one store-wide guard.** Several sends back to back can make waiting wrappers exit without a crash record (#154).
 - **Wrapped seat turns start only on a message.** Unfinished multi-turn work waits for the next message (#139).
-- **After a release bump,** tasks to seats not yet relaunched on the new version are refused (#185). The version check covers the whole roster (#201), so a `task` to an upgraded seat is refused too while any roster member runs an older build. Point-to-point sends need `--force` until every seat is upgraded.
+- ~~**After a release bump,** tasks to seats not yet relaunched on the new version are refused (#185). The version check covers the whole roster (#201), so a `task` to an upgraded seat is refused too while any roster member runs an older build. Point-to-point sends need `--force` until every seat is upgraded.~~ — **resolved by PR #259:** the gate now compares the recipient against the fixed 0.88.0 floor, so an upgraded seat can receive a task immediately; a recipient that genuinely predates `task` support is still (correctly) refused.
 - **`drain | head` can consume mail that was never displayed** (#37).
 - **The work board is read-only by design.** A stage the evidence cannot prove shows as unknown, and the reducer carries a documented seven-point residual (`docs/STEP-WORK-BOARD.md` on branch `feat/work-board-b3a`, landing with PR #215).
 - **Windows CI** runs its serial suite near the one-hour ceiling (#151). Guard-timeout flakes recur on slow runners (#171).
