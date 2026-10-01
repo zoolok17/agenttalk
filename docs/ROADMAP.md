@@ -3,7 +3,7 @@
 **Status:** Official · **Owner:** lead (operator-facing) · **Last updated:** 2026-09-29 (UTC)
 **Audience:** maintainers, operators, and agents deciding what to build next.
 **Horizon:** the next release (v0.94.0) in detail, then a ranked "next" tier and a labelled "later" tier.
-**Current shipped baseline:** v0.94.0 (2026-09-28). `CHANGELOG.md` remains the release-history source of truth.
+**Current shipped baseline:** v0.95.0 (2026-10-01). `CHANGELOG.md` remains the release-history source of truth.
 
 **Platform requirement:** agenttalk must run on **Windows, macOS, and Linux**. The Python core (bus, store, CLI, wrapper) is cross-platform and CI-tested on all three (Windows/macOS/Ubuntu × Python 3.10–3.13). The model gateway has a Windows scheduled-task backend and, since v0.91.0, a Linux systemd `--user` backend. **The supervisor is still the open platform gap:** it needs PowerShell Core 7+ and the Windows-only `Win32_Process`. A POSIX supervisor path is unbuilt (§6.1 G5, §8).
 
