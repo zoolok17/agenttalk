@@ -208,35 +208,49 @@ section 5 rows in the facts file wb-done-facts created above
 The existing `integration` section, and every OTHER plan's rows, are left
 exactly as they were. It never runs Git and never touches the bus.
 
-The plan file must contain EXACTLY ONE raw `## 5. Work items` heading line —
-counted across the whole file, with no awareness of code fences at all. Zero
-or more than one (including one hidden inside a fenced example elsewhere in
-the file) refuses. No code fence (```` ``` ```` or `~~~`, any length,
-optionally indented) may appear anywhere from the start of the file through
-the end of section 5 (the next raw `## ` line after the heading, or EOF) —
-one anywhere in that range refuses too, whether or not it "closes". A fence
-AFTER section 5 is never examined and is fine.
+The whole file is first split into lines and classified ONCE, by ONE
+function: every line is exactly a heading, a title (`# Plan: ...`), a fence,
+a table row (starts with `|`), a `Plan id:`/`Plan revision:` field, or plain
+text. Every rule below — the section-5 location, the header block, the
+fence ban, the field counts, the table — works ONLY on that classified
+list; nothing re-searches the raw text. Seven review rounds each found a
+different pair of ad hoc regexes quietly disagreeing about what a heading
+or a field was (`##5. Work items` passed one check and failed the next); one
+classifier removes the possibility of two rules disagreeing, because there
+is only one rule for each kind of line.
 
-Markdown fence-matching (length, character, nesting) is an open-ended free
-dimension; rather than parse it, a plan file with any fence near its
-work-items section is simply refused, with a message naming the reason.
-Section 5's table is then the FIRST CONTIGUOUS run of `|`-prefixed lines
-directly under the heading (leading blank lines, or a prose sentence before
-the table, are skipped; the table ends at the first line after it that is
-not a table row). Anything past that — a second table further down the
-section (a "Legend:", say) — is never read, by construction; it is not a
-reason to refuse.
+**Near-miss refusal:** a line starting with `#` that is not a valid
+CommonMark ATX heading (`#` through `######`, then a space, then content —
+so `##5. Work items` and `#Plan: ...` are NOT headings) refuses outright,
+naming the line. A line that looks like a `Plan id:` or `Plan revision:`
+field (any case, optional spacing, a colon) but whose value is not valid
+ALSO refuses outright, naming the line — it is never silently treated as
+plain text or quietly skipped. This closes the class of bug where "only
+count VALID occurrences" let an invalid second occurrence go unnoticed.
+
+The plan file must contain EXACTLY ONE heading classified as `## 5. Work
+items`. Zero or more than one (including one hidden inside a fenced
+example) refuses. No line classified as a fence may appear anywhere from
+the start of the file through the end of section 5 (the next heading line
+after it, or EOF) — one anywhere in that range refuses, whether or not it
+"closes". A fence AFTER section 5 is never examined and is fine. Section
+5's table is then the FIRST CONTIGUOUS run of table-row lines directly
+under the heading (leading non-table lines, like the template's own
+"Dispatches carry ..." sentence, are skipped; the table ends at the first
+line after it that is not a table row). Anything past that — a second
+table further down the section (a "Legend:", say) — is never read, by
+construction; it is not a reason to refuse.
 
 The SAME "exactly right, or refuse" principle applies to every other field
-the importer reads, not just the section-5 heading. The title (`# Plan:
-<name>`), the optional `Plan id:` line and `Plan revision: rN` are read ONLY
-from the plan's HEADER BLOCK — the lines before the file's first raw `## `
-line (section 5's own heading counts). Each one's raw occurrences are
-counted across the WHOLE file, fence-unaware, the same way the section-5
-heading is: the title and revision must occur exactly once, `Plan id:` at
-most once, and EVERY occurrence — not just the ones that happen to match —
-must sit inside that header block. A plan with an otherwise-normal section 5
-and an ALLOWED fenced example after it (fences after section 5 are fine) that
+the importer reads, not just the section-5 heading. The title, the optional
+`Plan id:` line and `Plan revision: rN` are read ONLY from the plan's
+HEADER BLOCK — the lines before the file's first heading line (section 5's
+own heading counts, and so does any other heading earlier in the file).
+Each one's classified occurrences are counted across the WHOLE file: the
+title and revision must occur exactly once, `Plan id:` at most once, and
+EVERY occurrence — not just the ones that happen to match — must sit
+inside that header block. A plan with an otherwise-normal section 5 and an
+ALLOWED fenced example after it (fences after section 5 are fine) that
 happens to contain its own `Plan id: ...` line used to let that line win,
 importing under a hijacked, unrelated id and overwriting whatever already
 used it; it is refused instead now, wherever the stray occurrence sits.
@@ -248,6 +262,10 @@ It exits 2, having published nothing, when the plan file:
 
 - does not exist, is unreadable, is not valid UTF-8, or exceeds the 512 KiB
   read bound;
+- has a line starting with `#` that is not a valid heading (needs a space
+  after the `#`s), or a line that looks like a `Plan id:`/`Plan revision:`
+  field but has an invalid value — either refuses immediately, by itself,
+  wherever it is;
 - does not contain EXACTLY ONE `# Plan: <name>` title line, or one exists
   outside the header block;
 - has an explicit `Plan id:` line that is not a lowercase slug of at most 64

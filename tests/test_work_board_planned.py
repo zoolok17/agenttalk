@@ -399,6 +399,53 @@ def test_a_fence_after_section_5_with_no_header_field_text_still_imports():
     assert [r["work_item"] for r in rows] == ["task-a"]
 
 
+# ------------------------------------------------------ classifier near-miss refusals (7th read)
+
+def test_heading_with_no_space_after_hash_marks_refuses():
+    # Reviewer repro: _WORK_ITEMS_HEADING used to accept "##5." (its own "\s*" allowed zero
+    # spaces) while _NEXT_HEADING required one - two regexes disagreeing about what a heading
+    # is. The classifier has exactly one heading rule, so "##5." is simply not a heading at all.
+    text = ("# Plan: x\n\nPlan revision: r1\n\n##5. Work items\n\n"
+           "| work_item | Phase | Owner (vendor) | Starts when |\n|---|---|---|---|\n"
+           "| task-a | 1 | dev | ready |\n")
+    _, _, _, _, rows, skipped, problems = F._parse_plan(text)
+    assert rows == [] and skipped == []
+    assert any("not a valid Markdown heading" in p and "##5. Work items" in p for p in problems)
+
+
+def test_import_refuses_the_no_space_heading_leaving_stored_rows_untouched(tmp_path):
+    store = new_store(tmp_path)
+    F.import_plan(store, write(tmp_path / "plan.md", PLAN))
+    facts = store.state_dir / F.FACTS_FILE
+    before = facts.read_bytes()
+    bad = PLAN.replace("## 5. Work items", "##5. Work items")
+    with pytest.raises(F.PlanRefused, match="plan file malformed"):
+        F.import_plan(store, write(tmp_path / "bad.md", bad))
+    assert facts.read_bytes() == before
+
+
+def test_a_second_invalid_plan_revision_refuses_never_silently_ignored():
+    # Reviewer repro: the old _PLAN_REV regex only matched a VALID "rN" value, so a second,
+    # invalid "Plan revision: invalid" line simply never matched it and was silently ignored -
+    # "count every raw occurrence" was not actually true. The classifier marks ANY line that
+    # looks like a "Plan revision:" field, valid or not; an invalid one refuses outright.
+    text = ("# Plan: x\n\nPlan revision: r1\n\nPlan revision: invalid\n\n## 5. Work items\n\n"
+           "| work_item | Phase | Owner (vendor) | Starts when |\n|---|---|---|---|\n"
+           "| task-a | 1 | dev | ready |\n")
+    _, _, _, _, rows, skipped, problems = F._parse_plan(text)
+    assert rows == [] and skipped == []
+    assert any("looks like a 'Plan revision:' field but its value is invalid" in p for p in problems)
+
+
+def test_title_with_no_space_after_hash_refuses():
+    text = ("#Plan: x\n\nPlan revision: r1\n\n## 5. Work items\n\n"
+           "| work_item | Phase | Owner (vendor) | Starts when |\n|---|---|---|---|\n"
+           "| task-a | 1 | dev | ready |\n")
+    _, _, _, _, rows, skipped, problems = F._parse_plan(text)
+    assert rows == [] and skipped == []
+    assert any("not a valid Markdown heading" in p and "#Plan: x" in p for p in problems)
+
+
 def test_import_refuses_when_only_a_later_section_has_a_table(tmp_path):
     store = new_store(tmp_path)
     F.import_plan(store, write(tmp_path / "plan.md", PLAN))

@@ -15,6 +15,7 @@ import json
 import os
 import re
 import subprocess  # nosec B404
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -48,13 +49,67 @@ _UNSET = object()  # distinct from a legitimate session_id of None
 # ----------------------------------------------------- plan import (wb-planned-lane)
 _PLANNED_ROW_KEYS = {"work_item", "phase", "owner", "starts_when"}
 _PLANNED_ENTRY_KEYS = {"project", "plan_rev", "plan_name", "written_at", "rows"}
-_PLAN_TITLE = re.compile(r"^#\s*Plan:\s*(.+?)\s*$", re.MULTILINE)
-_PLAN_ID_LINE = re.compile(r"^Plan id:(.*)$", re.MULTILINE)
-_PLAN_REV = re.compile(r"^Plan revision:\s*(r\d+)\b", re.MULTILINE)
-_WORK_ITEMS_HEADING = re.compile(r"^##\s*5\.\s*Work items\s*$", re.MULTILINE)
-_NEXT_HEADING = re.compile(r"^##\s", re.MULTILINE)
-_FENCE_LINE = re.compile(r"^[ \t]*(?:`{3,}|~{3,})", re.MULTILINE)
 _SEP_CELL = re.compile(r":?-{3,}:?")
+
+# One-line classifier (recast, after 7 reads each finding a different pair of regexes that
+# quietly disagreed about what a heading or a field was): every rule below works ONLY on the
+# classified line list _classify_lines produces, never on the raw text again. A near-miss -
+# a line that starts with "#" but isn't a valid heading, or looks like a "Plan id:"/"Plan
+# revision:" field but has an invalid value - refuses outright rather than being silently
+# treated as plain text (see docs/WORK-BOARD-FEED.md's self-attack table).
+_HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(\S.*)$")  # CommonMark ATX: 1-6 #'s, a space, content
+_TITLE_TEXT_RE = re.compile(r"^Plan:\s*(.+)$")
+_FENCE_RE = re.compile(r"^[ \t]*(?:`{3,}|~{3,})")
+_FIELD_RE = re.compile(r"^Plan\s*(id|revision)\s*:(.*)$", re.IGNORECASE)
+_REVISION_VALUE_RE = re.compile(r"^r\d+\b")
+_SECTION5_TEXT_RE = re.compile(r"^5\.\s*Work items$")
+
+
+@dataclass(frozen=True)
+class _Line:
+    """One physical line of a plan file, classified exactly once. ``kind`` is one of "title",
+    "heading", "fence", "table_row", "field" or "other". A line that looks like an attempt at
+    a heading or a field but fails validation keeps its kind ("heading"/"field") with
+    ``valid=False``, rather than falling through to "other" - callers refuse on sight of one,
+    they never silently skip it."""
+    kind: str
+    raw: str
+    level: int = 0   # "heading": 1-6
+    text: str = ""   # "heading": content after the "#"s; "title": the name after "Plan: "
+    key: str = ""    # "field": "id" or "revision"
+    value: str = ""  # "field": the raw text after the colon
+    valid: bool = True
+
+
+def _classify_line(raw):
+    if raw.startswith("#"):
+        m = _HEADING_RE.match(raw)
+        if not m:
+            return _Line("heading", raw, valid=False)
+        level, text = len(m.group(1)), m.group(2).rstrip()
+        if level == 1:
+            title = _TITLE_TEXT_RE.match(text)
+            if title:
+                return _Line("title", raw, level=1, text=title.group(1).strip())
+        return _Line("heading", raw, level=level, text=text)
+    if _FENCE_RE.match(raw):
+        return _Line("fence", raw)
+    if raw.strip().startswith("|"):
+        return _Line("table_row", raw)
+    field = _FIELD_RE.match(raw)
+    if field:
+        key, value = field.group(1).lower(), field.group(2)
+        if key == "id":
+            tokens = value.split()
+            valid = len(tokens) == 1 and bool(_SLUG.fullmatch(tokens[0]))
+        else:
+            valid = bool(_REVISION_VALUE_RE.match(value.strip()))
+        return _Line("field", raw, key=key, value=value, valid=valid)
+    return _Line("other", raw)
+
+
+def _classify_lines(text):
+    return [_classify_line(ln) for ln in text.splitlines()]
 
 
 class PlanRefused(ValueError):
@@ -464,60 +519,52 @@ def _split_row(line):
     return cells
 
 
-def _plan_table(text):
-    """(header-cells, [data-row-cells], fatal-reason-or-None) of the ONE table under
-    "## 5. Work items".
+def _plan_table(lines):
+    """(header-cells, [data-row-cells], fatal-reason-or-None) of the ONE table under the
+    plan's single "5. Work items" heading, given the WHOLE file's classified ``_Line`` list
+    (see ``_classify_lines`` - the caller has already refused on any near-miss, so every line
+    here is either a clean match for its kind or genuinely something else).
 
-    Markdown fence rules (open matched to its own close, by length and character) are an
-    open-ended free dimension a parser can chase forever - a prior version tried, and a fence
-    whose contents happened to include a FAKE "## 5. Work items" heading, or a longer fence
-    nested inside a shorter one, still fooled it (both reviewer-found). The CUT: stop parsing
-    fences, and refuse anything ambiguous instead -
+    - exactly one line must classify as a level-2 heading whose text is "5. Work items".
+      Zero or more than one (including one that would have been hidden inside a fenced
+      example, had fences not already been banned there) refuses.
+    - no line between the start of the file and the end of section 5 (the next heading line,
+      or EOF) may classify as a fence. A fence anywhere in that range refuses; a fence AFTER
+      section 5 is simply never looked at.
 
-    - the plan must contain EXACTLY ONE raw "## 5. Work items" heading line, counted across the
-      WHOLE file with no fence-awareness at all. Zero or more than one (including one hidden
-      inside a fenced example) refuses.
-    - no fence-looking line (``` or ~~~, 3 or more characters, optionally indented) may appear
-      ANYWHERE from the start of the file through the end of section 5 (the next raw "## " line
-      after the heading, or EOF). A fence anywhere in that range refuses, whether or not it
-      "closes" - there is no length/character matching to get subtly wrong. A fence AFTER
-      section 5 is unexamined and fine; the table search never looks there anyway.
-
-    Only once both hold does the ordinary search run: skip forward over anything that is not a
-    table row (blank lines, a prose sentence like the template's own "Dispatches carry ..."
-    line) to find where the table starts, then collect the CONTIGUOUS run of "|"-prefixed lines
-    from there, stopping at the first line after it that is not a table row. A second,
-    unrelated table later in the section (a "Legend:" table) is never read, by construction.
+    Only once both hold does the ordinary search run: skip forward over anything that is not
+    a table row (blank lines, a prose sentence like the template's own "Dispatches carry ..."
+    line) to find where the table starts, then collect the CONTIGUOUS run of table-row lines
+    from there, stopping at the first line after it that is not one. A second, unrelated table
+    later in the section (a "Legend:" table) is never read, by construction.
 
     ([], [], None) if section 5 holds no table, or the second line is not a separator row of
-    the SAME width as the header (a header line with no separator at all used to parse as "zero
-    data rows", i.e. a valid empty table, rather than a malformed one) - the caller turns a
-    missing table into its own fatal reason. A table with a valid header, a matching separator,
-    and ZERO further data rows is a valid, empty table - callers decide whether that is a
-    problem, not this parser. A stray extra separator-shaped row within the contiguous block is
-    still dropped, as before."""
-    headings = list(_WORK_ITEMS_HEADING.finditer(text))
-    if len(headings) != 1:
+    the SAME width as the header (a header line with no separator at all parses as "zero data
+    rows", i.e. a valid empty table, rather than a malformed one) - the caller turns a missing
+    table into its own fatal reason. A table with a valid header, a matching separator, and
+    ZERO further data rows is a valid, empty table - callers decide whether that is a problem,
+    not this parser. A stray extra separator-shaped row within the contiguous block is still
+    dropped, as before."""
+    heading_idxs = [i for i, ln in enumerate(lines)
+                    if ln.kind == "heading" and ln.level == 2 and _SECTION5_TEXT_RE.match(ln.text)]
+    if len(heading_idxs) != 1:
         return [], [], "plan must contain exactly one '## 5. Work items' heading"
-    heading = headings[0]
-    rest = text[heading.end():]
-    next_heading = _NEXT_HEADING.search(rest)
-    section_end = heading.end() + (next_heading.start() if next_heading else len(rest))
-    if _FENCE_LINE.search(text[:section_end]):
+    start = heading_idxs[0] + 1
+    end = next((i for i in range(start, len(lines)) if lines[i].kind == "heading"), len(lines))
+    if any(ln.kind == "fence" for ln in lines[:end]):
         return [], [], ("code blocks are not allowed before or inside the work-items section; "
                         "move examples below it")
-    section = text[heading.end():section_end]
-    all_lines = section.splitlines()
+    section = lines[start:end]
     i = 0
-    while i < len(all_lines) and not all_lines[i].strip().startswith("|"):
+    while i < len(section) and section[i].kind != "table_row":
         i += 1
-    lines = []
-    while i < len(all_lines) and all_lines[i].strip().startswith("|"):
-        lines.append(all_lines[i].strip())
+    table_lines = []
+    while i < len(section) and section[i].kind == "table_row":
+        table_lines.append(section[i].raw.strip())
         i += 1
-    if len(lines) < 2:
+    if len(table_lines) < 2:
         return [], [], None
-    rows = [_split_row(ln) for ln in lines]
+    rows = [_split_row(ln) for ln in table_lines]
     header, sep, data = rows[0], rows[1], rows[2:]
     if len(sep) != len(header) or not all(_SEP_CELL.fullmatch(c) for c in sep):
         return [], [], None
@@ -535,57 +582,66 @@ def _parse_plan(text):
     header and separator and ZERO data rows to begin with is a valid, empty plan - this is what
     lets a plan be cleared by re-importing an empty table. A NON-empty table where every row was
     skipped is NOT the same thing and is a (fatal) problem instead: "everything skipped" must
-    never be silently treated as an intentional empty-plan clear."""
-    problems = []
-    # Header fields (the title, "Plan id:" and "Plan revision:") are read ONLY from the
-    # header block - the lines before the first raw "## " heading - counted across the WHOLE
-    # file with no fence-awareness, exactly like the section-5 heading count. Without this, a
-    # fenced example placed AFTER section 5 (itself perfectly allowed) could carry its own
-    # "Plan id: ..." line that silently won, importing under an unrelated, hijacked id and
-    # overwriting whatever plan already used it (reviewer-found data loss).
-    first_heading = _NEXT_HEADING.search(text)
-    header_end = first_heading.start() if first_heading else len(text)
+    never be silently treated as an intentional empty-plan clear.
 
-    def header_only(pattern, name):
-        """[matches] in the WHOLE file if every one sits inside the header block and there is
-        at most one; else appends a problem naming ``name`` and returns None. Zero matches
-        returns [] with no problem - the caller decides whether that absence is itself fatal."""
-        matches = list(pattern.finditer(text))
-        if any(m.start() >= header_end for m in matches):
+    Every rule here works on ONE classified pass over the file (``_classify_lines`` - see its
+    docstring and docs/WORK-BOARD-FEED.md's self-attack table), never on the raw text again. A
+    near-miss - a line that starts with "#" but is not a valid heading, or looks like a "Plan
+    id:"/"Plan revision:" field with an invalid value - refuses immediately, unconditionally,
+    wherever it sits in the file; it is never silently reclassified as plain text."""
+    problems = []
+    lines = _classify_lines(text)
+    broken_headings = [(i, ln) for i, ln in enumerate(lines) if ln.kind == "heading" and not ln.valid]
+    if broken_headings:
+        problems += [f"line {i + 1} starts with '#' but is not a valid Markdown heading "
+                    f"(needs a space after the '#'s): {ln.raw!r}" for i, ln in broken_headings]
+        return None, None, None, None, [], [], problems
+    broken_fields = [(i, ln) for i, ln in enumerate(lines) if ln.kind == "field" and not ln.valid]
+    if broken_fields:
+        problems += [f"line {i + 1} looks like a 'Plan {ln.key}:' field but its value is "
+                    f"invalid: {ln.raw!r}" for i, ln in broken_fields]
+        return None, None, None, None, [], [], problems
+    # Header fields (the title, "Plan id:" and "Plan revision:") are read ONLY from the
+    # header block - the lines before the file's first (valid) heading line - counted across
+    # the WHOLE file with no fence-awareness, exactly like the section-5 heading count. Without
+    # this, a fenced example placed AFTER section 5 (itself perfectly allowed) could carry its
+    # own "Plan id: ..." line that silently won, importing under an unrelated, hijacked id and
+    # overwriting whatever plan already used it (reviewer-found data loss).
+    header_end = next((i for i, ln in enumerate(lines) if ln.kind == "heading"), len(lines))
+
+    def header_only(entries, name):
+        """``entries`` if every one sits inside the header block and there is at most one;
+        else appends a problem naming ``name`` and returns None. An empty list returns [] with
+        no problem - the caller decides whether that absence is itself fatal."""
+        if any(i >= header_end for i, _ in entries):
             problems.append(f"'{name}' must appear only in the plan's header, before its "
-                            "first '## ' heading")
+                            "first heading")
             return None
-        if len(matches) > 1:
+        if len(entries) > 1:
             problems.append(f"plan must contain at most one {name!r} line")
             return None
-        return matches
+        return entries
 
-    titles = header_only(_PLAN_TITLE, "# Plan: <name>")
-    plan_name = titles[0].group(1) if titles else None
+    titles = header_only([(i, ln) for i, ln in enumerate(lines) if ln.kind == "title"],
+                         "# Plan: <name>")
+    plan_name = titles[0][1].text if titles else None
     if titles is not None and not plan_name:
         problems.append("missing a '# Plan: <name>' title line")
-    # The field's PRESENCE is detected separately from its validity: a "Plan id:" line that is
-    # blank or has more than one token must REFUSE, never silently fall back to the title slug
-    # (reviewer-found: the old regex required the whole line to be one token, so a malformed
-    # line simply failed to match at all, and this code could not tell "no line" from "bad line").
-    id_lines = header_only(_PLAN_ID_LINE, "Plan id:")
-    explicit_id = None
-    if id_lines:
-        id_line = id_lines[0]
-        tokens = id_line.group(1).split()
-        if len(tokens) != 1 or not _SLUG.fullmatch(tokens[0]):
-            problems.append(f"'Plan id:{id_line.group(1)}' is not a single lowercase slug "
-                            "of at most 64 characters")
-        else:
-            explicit_id = tokens[0]
+    # By this point every "field"-kind line has already passed the near-miss check above, so
+    # its value IS a single valid slug - this is just the header/count placement check.
+    id_lines = header_only([(i, ln) for i, ln in enumerate(lines) if ln.kind == "field" and ln.key == "id"],
+                           "Plan id:")
+    explicit_id = id_lines[0][1].value.strip() if id_lines else None
     plan_id = explicit_id if explicit_id is not None else (plan_id_of(plan_name) if plan_name else None)
     if explicit_id is None and plan_name and plan_id is None:
         problems.append(f"plan title {plan_name!r} does not yield a usable plan id; add a 'Plan id:' line")
-    revs = header_only(_PLAN_REV, "Plan revision:")
-    plan_rev = revs[0].group(1) if revs else None
-    if revs is not None and not plan_rev:
+    rev_lines = header_only(
+        [(i, ln) for i, ln in enumerate(lines) if ln.kind == "field" and ln.key == "revision"],
+        "Plan revision:")
+    plan_rev = _REVISION_VALUE_RE.match(rev_lines[0][1].value.strip()).group(0) if rev_lines else None
+    if rev_lines is not None and not plan_rev:
         problems.append("missing a 'Plan revision: rN' line")
-    header, data, table_problem = _plan_table(text)
+    header, data, table_problem = _plan_table(lines)
     if table_problem:
         problems.append(table_problem)
         return plan_id, explicit_id, plan_name, plan_rev, [], [], problems
