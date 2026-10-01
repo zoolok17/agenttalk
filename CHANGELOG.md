@@ -132,6 +132,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     before publishing (exit 2) instead of writing an empty integration
     section.
 
+- **`agenttalk serve`: a corrupt message file silently vanished data instead
+  of surfacing the failure (regression from #246).** `_all_messages` wrapped
+  its scan+validate call in a broad `except ValueError: return []`, meant
+  only to preserve the pre-#246 "empty/unresolvable roster" contract - but
+  `store._scan_messages_with_paths` deliberately re-raises
+  `UnicodeDecodeError` (a `ValueError` subclass) for an invalid-UTF-8 message
+  file, so the same catch also silently absorbed a genuine corrupt-file scan
+  failure. `GET /api/messages` returned a successful, empty `200` instead of
+  the pre-#246 `500`, and `/messages/<id>` / `GET /api/messages/<id>`
+  (`_find_message`) returned a confident "message not found" `404` instead
+  of the same pre-#246 `500`. Fixed by checking the EXPLICIT empty/
+  unresolvable-roster condition up front (`store._known_roster(cfg)`, the
+  same pure, disk-free check `validate_scanned_rows` itself makes) and
+  letting every other exception from the scan propagate, exactly as before
+  #246. `GET /api/lead-chat` is unaffected either way: `build_lead_chat` has
+  always had its own, separate, pre-existing broad `except Exception`
+  fail-safe (present identically before #246) that already degraded any
+  failure - including a decode error - into a graceful `200` with
+  `error: "lead_chat_unavailable"`; this is deliberate, unrelated design,
+  not part of this regression, and this fix leaves it untouched.
+  `_validated_for_state` was audited for the same pattern and has no added
+  catch around its scan - it already propagated a decode error unchanged,
+  matching pre-#246. Regression tests: `test_api_messages_scan_decode_
+  failure_is_not_swallowed_into_empty_list`,
+  `test_message_detail_routes_scan_decode_failure_is_not_swallowed_into_404`
+  (both RED against the merged #246 code, GREEN after), plus
+  `test_lead_chat_get_decode_failure_behavior_is_unchanged_by_246` pinning
+  the lead-chat non-regression.
+
 - **`agenttalk serve`: unbounded memory/thread growth under real browser
   traffic (#239).** `GET /api/attention` and `GET /api/lead-chat` each ran a
   full, uncached, O(store-size) rescan-and-validate of every message file on

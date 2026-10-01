@@ -988,14 +988,20 @@ def _all_messages(store: Store, *, cfg: dict | None = None) -> list[Message]:
     # identity's historical messages vanish from /api/messages, /messages/<id>,
     # and the index while the thread panel still shows them. The two surfaces
     # must agree.
-    try:
-        valid_rows, _rejects = _scan_and_validate_bounded(store, cfg)
-    except ValueError:
-        # Empty/unresolvable roster - _all_messages has always degraded to
-        # an empty list here (never raised); preserve that contract. ValueError
-        # can never be a wrapped ScanBusy (a distinct, non-subclassed
-        # Exception), so this catch cannot accidentally swallow a busy bound.
+    #
+    # Check the EXPLICIT empty/unresolvable-roster condition up front, rather
+    # than wrapping the scan+validate call in a broad `except ValueError`
+    # (regression, connector comment 4150475058 on #246's final head): the
+    # scanner deliberately RE-RAISES `UnicodeDecodeError` for an invalid-UTF-8
+    # message file, and `UnicodeDecodeError` is a `ValueError` subclass - a
+    # catch here broad enough to mean "empty roster" also silently absorbed a
+    # genuine corrupt-file scan failure into the same empty list, which
+    # pre-#246 code never did (it called the raw scan with no catch at all).
+    # `_known_roster` is a pure function of `cfg` (no disk I/O), so checking
+    # it first costs nothing and cannot itself raise.
+    if not store._known_roster(cfg):  # noqa: SLF001 — same accessor validate_scanned_rows uses
         return []
+    valid_rows, _rejects = _scan_and_validate_bounded(store, cfg)
     return [message for message, _path in valid_rows][::-1]  # newest first
 
 

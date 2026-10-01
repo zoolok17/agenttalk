@@ -170,6 +170,112 @@ def test_thread_route_real_error_returns_500_and_logs(
     assert "RuntimeError: boom" in err
 
 
+def _write_corrupt_message_file(
+    store: Store, msg_id: str = "20990101-000000-000000-CRPT",
+) -> Path:
+    """Write a message-shaped filename containing invalid-UTF-8 bytes - the
+    exact shape ``store._scan_messages_with_paths`` deliberately RE-RAISES
+    ``UnicodeDecodeError`` for on the live (non-archived/non-compacted) scan
+    path: ``except UnicodeError as e: if not compacted: raise``."""
+    path = store.messages_dir / f"{msg_id}.json"
+    path.write_bytes(b"\xff\xfe\x00not valid utf-8")
+    return path
+
+
+def test_api_messages_scan_decode_failure_is_not_swallowed_into_empty_list(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Regression fix (connector comment 4150475058 on #246's final head,
+    web.py:993): ``_all_messages`` wrapped its scan+validate call in a broad
+    ``except ValueError: return []`` meant only to preserve the pre-#246
+    empty-roster contract - but ``store._scan_messages_with_paths``
+    deliberately re-raises ``UnicodeDecodeError`` (a ``ValueError``
+    subclass) for an invalid-UTF-8 message file, so the SAME catch also
+    silently turned a corrupt store into a successful, EMPTY
+    ``/api/messages`` response instead of surfacing the failure.
+
+    Before #246 (master 8066212), ``_all_messages`` called the raw scan
+    with NO catch at all, so this propagated all the way to ``do_GET``'s
+    generic handler: HTTP 500, traceback to stderr. Pin that exact pre-#246
+    shape - NOT a 200 with ``messages: []``.
+    """
+    s = _make_store(tmp_path)
+    s.send(sender="alpha", recipient="beta", body="good message")
+    _write_corrupt_message_file(s)
+
+    srv, _t, base = _serve(s)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _get(f"{base}/api/messages")
+        assert exc.value.code == 500
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    err = _read_stderr_until(capfd, ("UnicodeDecodeError",))
+    assert "UnicodeDecodeError" in err
+
+
+def test_message_detail_routes_scan_decode_failure_is_not_swallowed_into_404(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Same regression, the other two routes that funnel through
+    ``_all_messages`` with no catch of their own (``_find_message``): before
+    #246 these also 500'd on a corrupt store (no catch anywhere in the
+    chain); #246's ``_all_messages`` catch degraded ``_find_message`` to a
+    confident "message not found" 404 instead - silently wrong, not just
+    silently empty.
+    """
+    s = _make_store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="good message")
+    _write_corrupt_message_file(s)
+
+    srv, _t, base = _serve(s)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _get(f"{base}/messages/{m.id}")
+        assert exc.value.code == 500
+        with pytest.raises(urllib.error.HTTPError) as exc2:
+            _get(f"{base}/api/messages/{m.id}")
+        assert exc2.value.code == 500
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    err = _read_stderr_until(capfd, ("UnicodeDecodeError",))
+    assert "UnicodeDecodeError" in err
+
+
+def test_lead_chat_get_decode_failure_behavior_is_unchanged_by_246(
+    tmp_path: Path,
+) -> None:
+    """NOT part of the #246 regression - confirmed and pinned here so a
+    future change notices if this ever changes, rather than assuming:
+    ``build_lead_chat`` has its OWN broad ``except Exception`` fail-safe
+    catch, present IDENTICALLY before #246 (master 8066212), that already
+    degraded ANY failure - including a scan decode error - into a graceful
+    ``available: False`` / ``error: "lead_chat_unavailable"`` 200 body.
+    #246 did not touch this catch (it only added the new, narrower one
+    inside ``_all_messages`` itself, fixed above); lead-chat's degrade-to-200
+    is unrelated, pre-existing, deliberate "fail-safe JSON, never a broken
+    endpoint" behavior - unaffected by this round's fix.
+    """
+    s = _make_store(tmp_path)
+    s.set_role("alpha", "lead")
+    _write_corrupt_message_file(s)
+
+    srv, _t, base = _serve(s)
+    try:
+        with _get(f"{base}/api/lead-chat") as resp:
+            assert resp.status == 200
+            payload = json.loads(resp.read())
+        assert payload.get("error") == "lead_chat_unavailable"
+        assert payload.get("messages") == []
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_error_html_swallows_only_disconnect(tmp_path: Path) -> None:
     handler_cls = web._make_handler([web.RootDescriptor(_make_store(tmp_path), "root")])
 
