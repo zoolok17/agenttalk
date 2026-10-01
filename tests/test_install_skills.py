@@ -14,7 +14,7 @@ DEVKIT_SKILLS = [
     # dev-discipline pack
     "assurance-scan", "craft-code", "fix-ci", "qa-strategy", "refactor-code", "review-code", "review-docs",
     "test-coverage",
-    "write-docs",
+    "write-docs", "write-for-humans",
     # assurance review/test pack (P4) — emit P2/P3 close-compatible evidence
     "review-contract-drift", "review-failure-injection", "review-release-readiness",
     "system-review-protocol", "tester-qa", "test-docs", "test-integration",

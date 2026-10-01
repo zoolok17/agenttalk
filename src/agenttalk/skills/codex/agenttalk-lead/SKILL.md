@@ -400,6 +400,10 @@ the agents you plan.
 7. Collect results, request cross-review for implemented pieces, and
    summarize the outcome to the user with unresolved blockers called
    out explicitly.
+   For anything a person will read (this summary, release notes, changelog
+   entries, pull request descriptions, issue and review comments), use the
+   write-for-humans skill: what changed, why it matters, what they will
+   notice, what they need to do, with technical details at the end.
 
 ## Publishing a sandboxed worker's commit
 
