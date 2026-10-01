@@ -1,6 +1,7 @@
 """wb-planned-lane: `board import-plan`/`retire-plan` and the Planned column they feed."""
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -8,6 +9,12 @@ from agenttalk import cli, work_board_facts as F
 from agenttalk.store import Store
 from test_work_board_facts import board
 from test_work_board_reducer import BUILDER, LEAD, POLICY, REVIEWER, Bus
+
+# The lead's real, live plan file (copied verbatim) - FIX round 2's P1 regression: a real
+# 8-column table, with "Starts when" fifth, imported zero rows and erased prior cards.
+REAL_PLAN_PATH = Path(__file__).parent / "fixtures" / "plan-board-lanes-v2-views.md"
+REAL_PLAN_WORK_ITEMS = ["wb-done-facts", "wb-planned-lane", "wb-lanes-ui", "v2-team",
+                       "v2-history", "v2-learning", "v2-walkthrough"]
 
 PLAN = """# Plan: board lanes and the v2 team views
 
@@ -194,6 +201,58 @@ def test_wrong_cell_count_is_skipped_the_rest_still_imports():
     assert len(skipped) == 1 and "wrong number of cells" in skipped[0][1]
 
 
+def test_real_eight_column_plan_imports_exactly_its_seven_rows():
+    # FIX round 2 P1: width used to be max(required-column index)+1, not the header's own
+    # width, so a real table with extra columns (Reviewer, Estimate, ...) after the four
+    # required ones rejected every row as a cell-count mismatch.
+    text = REAL_PLAN_PATH.read_text(encoding="utf-8")
+    _, _, _, _, rows, skipped, problems = F._parse_plan(text)
+    assert problems == [] and skipped == []
+    assert [r["work_item"] for r in rows] == REAL_PLAN_WORK_ITEMS
+
+
+def test_header_only_table_with_no_separator_refuses():
+    # FIX round 2 P1/F3: a header line with no separator line at all used to parse as a
+    # valid, empty table (zero data rows) instead of a malformed one.
+    broken = NO_TITLE.replace("no title here", "# Plan: x").replace("\n|---|---|---|---|\n", "\n")
+    _, _, _, _, rows, skipped, problems = F._parse_plan(broken)
+    assert rows == [] and skipped == []
+    assert any("missing a '## 5. Work items' section" in p for p in problems)
+
+
+@pytest.mark.parametrize("order", ["incomplete-first", "complete-first"])
+def test_duplicate_detection_is_order_independent(order):
+    incomplete = "| task-a | 1 | | later |\n"
+    complete = "| task-a | 1 | dev | ready |\n"
+    rows_text = incomplete + complete if order == "incomplete-first" else complete + incomplete
+    header = ("# Plan: dup order test\n\nPlan revision: r1\n\n## 5. Work items\n\n"
+             "| work_item | Phase | Owner (vendor) | Starts when |\n|---|---|---|---|\n")
+    _, _, _, _, rows, skipped, problems = F._parse_plan(header + rows_text)
+    assert rows == [] and skipped == []
+    assert any("duplicate work_item" in p for p in problems)
+
+
+def test_every_row_skipped_refuses_never_silently_clears():
+    # FIX round 2 P1: "everything skipped" must never be treated the same as a
+    # structurally empty table - only a table with zero DATA ROWS at all may clear a plan.
+    all_incomplete = ("# Plan: x\n\nPlan revision: r1\n\n## 5. Work items\n\n"
+                      "| work_item | Phase | Owner (vendor) | Starts when |\n|---|---|---|---|\n"
+                      "| a | 1 | | y |\n| b | 1 | x | |\n")
+    _, _, _, _, rows, skipped, problems = F._parse_plan(all_incomplete)
+    assert rows == []
+    assert any("every row in section 5 was skipped" in p for p in problems)
+
+
+def test_malformed_explicit_plan_id_refuses_never_falls_back_to_title():
+    # FIX round 2 F2: presence of a "Plan id:" line is detected separately from its
+    # validity - a blank or multi-token value must refuse, never silently fall back.
+    for bad in ("Plan id: stable id", "Plan id: "):
+        text = PLAN.replace("Plan revision: r2", f"{bad}\n\nPlan revision: r2")
+        plan_id, explicit_id, _, _, rows, skipped, problems = F._parse_plan(text)
+        assert explicit_id is None and rows == [] and skipped == []
+        assert any("Plan id:" in p for p in problems), problems
+
+
 # ------------------------------------------------------------------------------- import_plan
 
 def test_import_plan_writes_its_own_section_and_keeps_integration_untouched(tmp_path):
@@ -259,6 +318,107 @@ def test_cli_import_plan_lists_skipped_rows(tmp_path, capsys):
     assert cli.main(["--root", str(store.root), "board", "import-plan", str(plan_file)]) == 0
     out = capsys.readouterr().out
     assert "1 skipped" in out and "skipped" in out and "task-a" in out
+
+
+def test_import_plan_with_the_real_plan_file_does_not_erase_prior_rows(tmp_path):
+    # FIX round 2 P1, end to end: seed a plan under the real plan's own id, then import the
+    # real file over it - it must REPLACE with its 7 real rows, never erase down to zero.
+    store = new_store(tmp_path)
+    real_id = F._parse_plan(REAL_PLAN_PATH.read_text(encoding="utf-8"))[0]
+    seed = PLAN.replace("Plan revision: r2", f"Plan id: {real_id}\n\nPlan revision: r2")
+    F.import_plan(store, write(tmp_path / "seed.md", seed))
+    result = F.import_plan(store, REAL_PLAN_PATH)
+    assert [r["work_item"] for r in result["rows"]] == REAL_PLAN_WORK_ITEMS
+    assert result["skipped"] == []
+    doc = json.loads((store.state_dir / F.FACTS_FILE).read_text(encoding="utf-8"))
+    assert [r["work_item"] for r in doc["planned"]["plans"][real_id]["rows"]] == REAL_PLAN_WORK_ITEMS
+
+
+def test_header_only_import_refuses_and_keeps_stored_rows(tmp_path):
+    store = new_store(tmp_path)
+    F.import_plan(store, write(tmp_path / "plan.md", PLAN))
+    broken = PLAN.replace("|---|---|---|---|\n", "")
+    with pytest.raises(F.PlanRefused):
+        F.import_plan(store, write(tmp_path / "plan2.md", broken))
+    doc = json.loads((store.state_dir / F.FACTS_FILE).read_text(encoding="utf-8"))
+    assert len(doc["planned"]["plans"][PLAN_ID]["rows"]) == 3  # untouched by the refused import
+
+
+def test_all_rows_skipped_refuses_and_keeps_stored_rows(tmp_path):
+    store = new_store(tmp_path)
+    F.import_plan(store, write(tmp_path / "plan.md", PLAN))
+    all_incomplete = PLAN.replace("| wb-done-facts | 1 | dev-2 (claude) | challenge disposed |",
+                                  "| wb-done-facts | 1 | | challenge disposed |"
+                                  ).replace("| wb-planned-lane | 1 | dev-6 (claude) | wb-done-facts merged |",
+                                  "| wb-planned-lane | 1 | | wb-done-facts merged |"
+                                  ).replace("| wb-lanes-ui | 1 | frontend (claude) | wb-planned-lane merged |",
+                                  "| wb-lanes-ui | 1 | | wb-planned-lane merged |")
+    with pytest.raises(F.PlanRefused, match="every row in section 5 was skipped"):
+        F.import_plan(store, write(tmp_path / "plan2.md", all_incomplete))
+    doc = json.loads((store.state_dir / F.FACTS_FILE).read_text(encoding="utf-8"))
+    assert len(doc["planned"]["plans"][PLAN_ID]["rows"]) == 3  # untouched by the refused import
+
+
+def test_one_malformed_stored_plan_is_isolated_others_still_load(tmp_path):
+    store = new_store(tmp_path)
+    F.import_plan(store, write(tmp_path / "plan.md", PLAN))
+    facts = store.state_dir / F.FACTS_FILE
+    doc = json.loads(facts.read_text(encoding="utf-8"))
+    corrupt = json.loads(json.dumps(doc["planned"]["plans"][PLAN_ID]))
+    corrupt["rows"][0]["work_item"] = 7  # JSON allows any type; the real fault that hid every plan
+    doc["planned"]["plans"]["corrupt"] = corrupt
+    facts.write_text(json.dumps(doc), encoding="utf-8")
+    loaded = F.load_planned(store, store.load_config())
+    assert "corrupt" not in loaded["plans"]
+    assert PLAN_ID in loaded["plans"]
+    assert any("corrupt" in w for w in loaded["warnings"])
+
+
+def test_import_and_retire_tag_the_current_session(tmp_path):
+    store = new_store(tmp_path)
+    F.import_plan(store, write(tmp_path / "plan.md", PLAN))
+    doc = json.loads((store.state_dir / F.FACTS_FILE).read_text(encoding="utf-8"))
+    assert doc["planned"]["session_id"] == store.load_config()["session_id"]
+
+
+def test_import_refuses_if_the_session_changes_between_build_and_write(tmp_path, monkeypatch):
+    # FIX round 2 F4: the planned section now carries session_id, so the SAME generic guard
+    # _write_section already applies to the integration section fires here too, if the store's
+    # session changes between build() computing the new section and _write_section's own fresh
+    # re-read immediately after. (A real store.reset() cannot run INSIDE the held facts lock -
+    # the project's own lock-order guard forbids it - so this directly fakes the config read
+    # build() sees, rather than performing a real concurrent reset.)
+    store = new_store(tmp_path)
+    F.import_plan(store, write(tmp_path / "plan.md", PLAN))
+    real_load_config, calls = store.load_config, {"n": 0}
+
+    def flaky_load_config():
+        calls["n"] += 1
+        cfg = dict(real_load_config())
+        if calls["n"] == 1:  # the read build() uses to tag the new section
+            cfg["session_id"] = "stale-session"
+        return cfg  # every later read (_write_section's own check) sees the REAL session
+
+    monkeypatch.setattr(store, "load_config", flaky_load_config)
+    with pytest.raises(F.PlanRefused, match="store session changed"):
+        F.import_plan(store, write(tmp_path / "plan2.md", PLAN))
+
+
+def test_import_succeeds_across_a_reset_that_happens_before_the_write(tmp_path, monkeypatch):
+    # The companion case: a reset that happens BEFORE any of import-plan's own store-dependent
+    # work (project/session are read fresh, inside build(), under the lock) is simply the new,
+    # current store - there is nothing stale to refuse. Matches the reviewer's own probe.
+    store = new_store(tmp_path)
+    real_write_section = F._write_section
+
+    def reset_then_write(store_arg, name, section=None, *, build=None, refuse_cls=F.VerifyRefused):
+        store_arg.reset()
+        return real_write_section(store_arg, name, build=build, refuse_cls=refuse_cls)
+
+    monkeypatch.setattr(F, "_write_section", reset_then_write)
+    result = F.import_plan(store, write(tmp_path / "plan.md", PLAN))
+    assert len(result["rows"]) == 3
+    assert PLAN_ID in F.load_planned(store, store.load_config())["plans"]
 
 
 # -------------------------------------------------------------------------- plan identity (C)

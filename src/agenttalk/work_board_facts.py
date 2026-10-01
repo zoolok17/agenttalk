@@ -47,7 +47,7 @@ _OVERSIZE = "integration facts exceed their size bound"
 # ----------------------------------------------------- plan import (wb-planned-lane)
 _PLANNED_ROW_KEYS = {"work_item", "phase", "owner", "starts_when"}
 _PLAN_TITLE = re.compile(r"^#\s*Plan:\s*(.+?)\s*$", re.MULTILINE)
-_PLAN_ID_LINE = re.compile(r"^Plan id:\s*(\S+)\s*$", re.MULTILINE)
+_PLAN_ID_LINE = re.compile(r"^Plan id:(.*)$", re.MULTILINE)
 _PLAN_REV = re.compile(r"^Plan revision:\s*(r\d+)\b", re.MULTILINE)
 _WORK_ITEMS_HEADING = re.compile(r"^##\s*5\.\s*Work items\s*$", re.MULTILINE)
 _NEXT_HEADING = re.compile(r"^##\s", re.MULTILINE)
@@ -457,10 +457,12 @@ def _split_row(line):
 
 def _plan_table(text):
     """(header-cells, [data-row-cells]) of the "## 5. Work items" markdown table, or ([], [])
-    if the heading or a table under it is missing. Any row where every cell is a separator
-    (``---``/``:--:``) is dropped, wherever it sits, rather than assumed to be line 2. A table
-    with a valid header and ZERO surviving data rows is a valid, empty table - callers decide
-    whether that is a problem, not this parser."""
+    if the heading is missing, there is no table under it, or the SECOND line is not a
+    separator row of the SAME width as the header (reviewer-found: a header line with no
+    separator at all used to parse as "zero data rows", i.e. a valid empty table, rather than
+    a malformed one). A table with a valid header, a matching separator, and ZERO further data
+    rows is a valid, empty table - callers decide whether that is a problem, not this parser.
+    A stray extra separator-shaped row further down is still dropped, as before."""
     heading = _WORK_ITEMS_HEADING.search(text)
     if not heading:
         return [], []
@@ -468,11 +470,14 @@ def _plan_table(text):
     next_heading = _NEXT_HEADING.search(rest)
     section = rest[:next_heading.start()] if next_heading else rest
     lines = [ln.strip() for ln in section.splitlines() if ln.strip().startswith("|")]
-    if not lines:
+    if len(lines) < 2:
         return [], []
     rows = [_split_row(ln) for ln in lines]
-    rows = [r for r in rows if not all(_SEP_CELL.fullmatch(c) for c in r)]
-    return (rows[0], rows[1:]) if rows else ([], [])
+    header, sep, data = rows[0], rows[1], rows[2:]
+    if len(sep) != len(header) or not all(_SEP_CELL.fullmatch(c) for c in sep):
+        return [], []
+    data = [r for r in data if not (len(r) == len(header) and all(_SEP_CELL.fullmatch(c) for c in r))]
+    return header, data
 
 
 def _parse_plan(text):
@@ -489,11 +494,19 @@ def _parse_plan(text):
     plan_name = title.group(1) if title else None
     if not plan_name:
         problems.append("missing a '# Plan: <name>' title line")
+    # The field's PRESENCE is detected separately from its validity: a "Plan id:" line that is
+    # blank or has more than one token must REFUSE, never silently fall back to the title slug
+    # (reviewer-found: the old regex required the whole line to be one token, so a malformed
+    # line simply failed to match at all, and this code could not tell "no line" from "bad line").
     id_line = _PLAN_ID_LINE.search(text)
-    explicit_id = id_line.group(1) if id_line else None
-    if explicit_id is not None and not _SLUG.fullmatch(explicit_id):
-        problems.append(f"'Plan id: {explicit_id}' is not a lowercase slug of at most 64 characters")
-        explicit_id = None
+    explicit_id = None
+    if id_line is not None:
+        tokens = id_line.group(1).split()
+        if len(tokens) != 1 or not _SLUG.fullmatch(tokens[0]):
+            problems.append(f"'Plan id:{id_line.group(1)}' is not a single lowercase slug "
+                            "of at most 64 characters")
+        else:
+            explicit_id = tokens[0]
     plan_id = explicit_id if explicit_id is not None else (plan_id_of(plan_name) if plan_name else None)
     if explicit_id is None and plan_name and plan_id is None:
         problems.append(f"plan title {plan_name!r} does not yield a usable plan id; add a 'Plan id:' line")
@@ -518,7 +531,11 @@ def _parse_plan(text):
         return plan_id, explicit_id, plan_name, plan_rev, [], [], problems
     if problems:  # a title/id/revision problem already refuses the import; skip row work
         return plan_id, explicit_id, plan_name, plan_rev, [], [], problems
-    width, seen, rows, skipped = max(cols.values()) + 1, set(), [], []
+    # The expected width is the FULL header width (the real plan table has columns this
+    # import never reads, e.g. Reviewer/Estimate) - only the four required fields are
+    # extracted from it. Using max(required-index)+1 here under-counted a wider header and
+    # rejected every real row as a cell-count mismatch (reviewer-found P1).
+    width, seen, rows, skipped = len(header), set(), [], []
     for cells in data:
         row_text = " | ".join(cells)
         if len(cells) != width:
@@ -532,13 +549,22 @@ def _parse_plan(text):
         if work_item in seen:
             problems.append(f"duplicate work_item in this plan's table: {work_item!r}")
             continue
+        # Identity is recorded as soon as work_item itself is known valid - BEFORE the
+        # skippable-field check below - so a later duplicate is caught regardless of
+        # whether THIS row went on to be skipped or kept (reviewer-found: order-dependent).
+        seen.add(work_item)
         phase, owner, starts_when = (cells[cols[k]] for k in ("phase", "owner", "starts_when"))
         if not (phase and owner and starts_when):
             skipped.append((row_text, f"work item {work_item!r} is missing phase, owner or starts-when"))
             continue
-        seen.add(work_item)
         rows.append({"work_item": work_item, "phase": phase, "owner": owner, "starts_when": starts_when})
     if problems:
+        return plan_id, explicit_id, plan_name, plan_rev, [], [], problems
+    if not rows and data:
+        # Every row was skipped: a non-empty table that imports nothing is never a silent
+        # "clear this plan" - only a STRUCTURALLY empty table (no data rows at all) is.
+        problems.append("every row in section 5 was skipped, not a valid empty table: "
+                        + "; ".join(f"{why} ({row!r})" for row, why in skipped))
         return plan_id, explicit_id, plan_name, plan_rev, [], [], problems
     return plan_id, explicit_id, plan_name, plan_rev, rows, skipped, []
 
@@ -592,8 +618,6 @@ def import_plan(store, path, *, now=None):
     if problems:
         raise PlanRefused("plan file malformed: " + "; ".join(problems))
     now = now or datetime.now(timezone.utc)
-    entry = {"project": store.project_id(), "plan_rev": plan_rev, "plan_name": plan_name,
-             "written_at": now.isoformat(), "rows": rows}
     check = _planned_build(plan_id)
 
     def build(current):
@@ -604,8 +628,15 @@ def import_plan(store, path, *, now=None):
                 f"plan id {plan_id!r} (derived from the title) is already recorded for a "
                 f"different plan ({existing.get('plan_name')!r}); add an explicit "
                 "'Plan id: <id>' line to this plan file to give it its own stable identity")
+        # project and session are read fresh HERE, under the lock, never captured earlier -
+        # a reset before this point is simply the new, current store; a reset were it somehow
+        # possible between this read and _write_section's own matching re-read is refused by
+        # the session_id check below, exactly like the integration section's writer.
+        cfg = store.load_config()
+        entry = {"project": store.project_id(), "plan_rev": plan_rev, "plan_name": plan_name,
+                 "written_at": now.isoformat(), "rows": rows}
         plans = dict(plans, **{plan_id: entry})
-        return {"schema_version": PLANNED_SCHEMA_VERSION, "plans": plans}
+        return {"schema_version": PLANNED_SCHEMA_VERSION, "session_id": cfg.get("session_id"), "plans": plans}
 
     _write_section(store, "planned", build=build, refuse_cls=PlanRefused)
     return {"plan_id": plan_id, "plan_name": plan_name, "plan_rev": plan_rev, "rows": rows, "skipped": skipped}
@@ -624,15 +655,20 @@ def retire_plan(store, plan_id):
         if plan_id not in plans:
             raise PlanRefused(f"no planned rows are recorded for plan id {plan_id!r}; nothing changed")
         del plans[plan_id]
-        return {"schema_version": PLANNED_SCHEMA_VERSION, "plans": plans}
+        session_id = store.load_config().get("session_id")  # read fresh, under the lock
+        return {"schema_version": PLANNED_SCHEMA_VERSION, "session_id": session_id, "plans": plans}
 
     _write_section(store, "planned", build=build, refuse_cls=PlanRefused)
     return {"plan_id": plan_id}
 
 
 def _valid_planned_row(row):
-    return (isinstance(row, dict) and set(row) == _PLANNED_ROW_KEYS and _SLUG.fullmatch(row["work_item"])
-            and all(isinstance(row[k], str) and row[k] for k in ("phase", "owner", "starts_when")))
+    # work_item is type-checked BEFORE the regex: a non-string value (JSON allows any type)
+    # must fail validation, never raise TypeError out of this function and past its caller's
+    # per-plan isolation (reviewer-found: this used to take down every OTHER plan too).
+    return (isinstance(row, dict) and set(row) == _PLANNED_ROW_KEYS
+            and isinstance(row.get("work_item"), str) and _SLUG.fullmatch(row["work_item"])
+            and all(isinstance(row.get(k), str) and row[k] for k in ("phase", "owner", "starts_when")))
 
 
 def load_planned(store, cfg, *, now=None):
