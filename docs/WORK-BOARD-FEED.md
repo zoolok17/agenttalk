@@ -208,11 +208,24 @@ section 5 rows in the facts file wb-done-facts created above
 The existing `integration` section, and every OTHER plan's rows, are left
 exactly as they were. It never runs Git and never touches the bus.
 
-Section 5's table is the FIRST CONTIGUOUS run of `|`-prefixed lines directly
-under the `## 5. Work items` heading (leading blank lines are skipped; the
-table ends at the first line after it that is not a table row). Anything
-past that — prose, a second table further down the section (a "Legend:",
-say) — is never read, by construction; it is not a reason to refuse.
+The plan file must contain EXACTLY ONE raw `## 5. Work items` heading line —
+counted across the whole file, with no awareness of code fences at all. Zero
+or more than one (including one hidden inside a fenced example elsewhere in
+the file) refuses. No code fence (```` ``` ```` or `~~~`, any length,
+optionally indented) may appear anywhere from the start of the file through
+the end of section 5 (the next raw `## ` line after the heading, or EOF) —
+one anywhere in that range refuses too, whether or not it "closes". A fence
+AFTER section 5 is never examined and is fine.
+
+Markdown fence-matching (length, character, nesting) is an open-ended free
+dimension; rather than parse it, a plan file with any fence near its
+work-items section is simply refused, with a message naming the reason.
+Section 5's table is then the FIRST CONTIGUOUS run of `|`-prefixed lines
+directly under the heading (leading blank lines, or a prose sentence before
+the table, are skipped; the table ends at the first line after it that is
+not a table row). Anything past that — a second table further down the
+section (a "Legend:", say) — is never read, by construction; it is not a
+reason to refuse.
 
 It exits 2, having published nothing, when the plan file:
 
@@ -223,10 +236,12 @@ It exits 2, having published nothing, when the plan file:
   characters, or (with no explicit line) a title that yields no usable slug
   (see **Plan id** below);
 - has no `Plan revision: rN` line;
-- has no `## 5. Work items` section, no table directly under it, or the
-  table's second line is not a separator row of the same width as the
-  header, or the table is missing the `work_item`, `Phase`, `Owner (vendor)`
-  (or `Owner`) or `Starts when` column;
+- does not contain EXACTLY ONE `## 5. Work items` heading line;
+- has any code fence from the start of the file through the end of section 5;
+- has no table directly under the heading, or the table's second line is
+  not a separator row of the same width as the header, or the table is
+  missing the `work_item`, `Phase`, `Owner (vendor)` (or `Owner`) or
+  `Starts when` column;
 - has a table row whose `work_item` is not a lowercase slug of at most 64
   characters, or that repeats a `work_item` already seen in this plan's own
   table;

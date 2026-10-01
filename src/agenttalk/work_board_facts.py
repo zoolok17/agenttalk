@@ -53,7 +53,7 @@ _PLAN_ID_LINE = re.compile(r"^Plan id:(.*)$", re.MULTILINE)
 _PLAN_REV = re.compile(r"^Plan revision:\s*(r\d+)\b", re.MULTILINE)
 _WORK_ITEMS_HEADING = re.compile(r"^##\s*5\.\s*Work items\s*$", re.MULTILINE)
 _NEXT_HEADING = re.compile(r"^##\s", re.MULTILINE)
-_FENCE = re.compile(r"^(`{3,}|~{3,})")
+_FENCE_LINE = re.compile(r"^[ \t]*(?:`{3,}|~{3,})", re.MULTILINE)
 _SEP_CELL = re.compile(r":?-{3,}:?")
 
 
@@ -465,62 +465,64 @@ def _split_row(line):
 
 
 def _plan_table(text):
-    """(header-cells, [data-row-cells]) of the ONE table under "## 5. Work items": skip forward
-    over anything that is not a table row (blank lines, a prose sentence like the template's own
-    "Dispatches carry ..." line) to find where the FIRST table starts, then collect the
-    CONTIGUOUS run of "|"-prefixed lines from there, stopping at the first line after it that is
-    not a table row. Anything past that point - more prose, a second table (e.g. a "Legend:"
-    table further down the section) - is never read (recast: parse exactly one table, by
-    construction, rather than collecting every "|"-prefixed line anywhere in the section, which
-    let an unrelated later table become bogus Planned cards).
+    """(header-cells, [data-row-cells], fatal-reason-or-None) of the ONE table under
+    "## 5. Work items".
 
-    Two bounds, both closing a reviewer-found false positive on NORMAL input:
-    - the search is scoped to section 5 ONLY - from the heading up to the next "## " heading or
-      the end of the file. Without this, a later section's own unrelated table (e.g. "## 6.
-      Reference") could be read as if it were section 5's, once section 5 itself had no table.
-    - a fenced code block (``` or ~~~, open matched to its own close) is skipped ENTIRELY before
-      this scan ever sees it: a "|"-shaped line inside a fence (an example table in prose) is
-      never mistaken for the real table, wherever it sits relative to the real one.
+    Markdown fence rules (open matched to its own close, by length and character) are an
+    open-ended free dimension a parser can chase forever - a prior version tried, and a fence
+    whose contents happened to include a FAKE "## 5. Work items" heading, or a longer fence
+    nested inside a shorter one, still fooled it (both reviewer-found). The CUT: stop parsing
+    fences, and refuse anything ambiguous instead -
 
-    ([], []) if the heading is missing, there is no table under it (inside these bounds), or the
-    SECOND visible line is not a separator row of the SAME width as the header (a header line
-    with no separator at all used to parse as "zero data rows", i.e. a valid empty table, rather
-    than a malformed one). A table with a valid header, a matching separator, and ZERO further
-    data rows is a valid, empty table - callers decide whether that is a problem, not this
-    parser. A stray extra separator-shaped row within the SAME contiguous block is still
-    dropped, as before."""
-    heading = _WORK_ITEMS_HEADING.search(text)
-    if not heading:
-        return [], []
+    - the plan must contain EXACTLY ONE raw "## 5. Work items" heading line, counted across the
+      WHOLE file with no fence-awareness at all. Zero or more than one (including one hidden
+      inside a fenced example) refuses.
+    - no fence-looking line (``` or ~~~, 3 or more characters, optionally indented) may appear
+      ANYWHERE from the start of the file through the end of section 5 (the next raw "## " line
+      after the heading, or EOF). A fence anywhere in that range refuses, whether or not it
+      "closes" - there is no length/character matching to get subtly wrong. A fence AFTER
+      section 5 is unexamined and fine; the table search never looks there anyway.
+
+    Only once both hold does the ordinary search run: skip forward over anything that is not a
+    table row (blank lines, a prose sentence like the template's own "Dispatches carry ..."
+    line) to find where the table starts, then collect the CONTIGUOUS run of "|"-prefixed lines
+    from there, stopping at the first line after it that is not a table row. A second,
+    unrelated table later in the section (a "Legend:" table) is never read, by construction.
+
+    ([], [], None) if section 5 holds no table, or the second line is not a separator row of
+    the SAME width as the header (a header line with no separator at all used to parse as "zero
+    data rows", i.e. a valid empty table, rather than a malformed one) - the caller turns a
+    missing table into its own fatal reason. A table with a valid header, a matching separator,
+    and ZERO further data rows is a valid, empty table - callers decide whether that is a
+    problem, not this parser. A stray extra separator-shaped row within the contiguous block is
+    still dropped, as before."""
+    headings = list(_WORK_ITEMS_HEADING.finditer(text))
+    if len(headings) != 1:
+        return [], [], "plan must contain exactly one '## 5. Work items' heading"
+    heading = headings[0]
     rest = text[heading.end():]
     next_heading = _NEXT_HEADING.search(rest)
-    section = rest[:next_heading.start()] if next_heading else rest
-    visible, fence = [], None
-    for ln in section.splitlines():
-        stripped = ln.strip()
-        m = _FENCE.match(stripped)
-        if fence is None:
-            if m:
-                fence = m.group(1)[0]  # '`' or '~' - everything up to the matching close is gone
-            else:
-                visible.append(ln)
-        elif m and m.group(1)[0] == fence:
-            fence = None
+    section_end = heading.end() + (next_heading.start() if next_heading else len(rest))
+    if _FENCE_LINE.search(text[:section_end]):
+        return [], [], ("code blocks are not allowed before or inside the work-items section; "
+                        "move examples below it")
+    section = text[heading.end():section_end]
+    all_lines = section.splitlines()
     i = 0
-    while i < len(visible) and not visible[i].strip().startswith("|"):
+    while i < len(all_lines) and not all_lines[i].strip().startswith("|"):
         i += 1
     lines = []
-    while i < len(visible) and visible[i].strip().startswith("|"):
-        lines.append(visible[i].strip())
+    while i < len(all_lines) and all_lines[i].strip().startswith("|"):
+        lines.append(all_lines[i].strip())
         i += 1
     if len(lines) < 2:
-        return [], []
+        return [], [], None
     rows = [_split_row(ln) for ln in lines]
     header, sep, data = rows[0], rows[1], rows[2:]
     if len(sep) != len(header) or not all(_SEP_CELL.fullmatch(c) for c in sep):
-        return [], []
+        return [], [], None
     data = [r for r in data if not (len(r) == len(header) and all(_SEP_CELL.fullmatch(c) for c in r))]
-    return header, data
+    return header, data, None
 
 
 def _parse_plan(text):
@@ -559,7 +561,10 @@ def _parse_plan(text):
     plan_rev = rev.group(1) if rev else None
     if not plan_rev:
         problems.append("missing a 'Plan revision: rN' line")
-    header, data = _plan_table(text)
+    header, data, table_problem = _plan_table(text)
+    if table_problem:
+        problems.append(table_problem)
+        return plan_id, explicit_id, plan_name, plan_rev, [], [], problems
     if not header:
         problems.append("missing a '## 5. Work items' section with a table")
         return plan_id, explicit_id, plan_name, plan_rev, [], [], problems

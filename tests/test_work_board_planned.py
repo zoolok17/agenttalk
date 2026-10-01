@@ -164,7 +164,7 @@ def test_parse_plan_extracts_id_rev_and_rows():
 @pytest.mark.parametrize("broken,msg", [
     (NO_TITLE, "missing a '# Plan: <name>' title line"),
     (NO_REV, "missing a 'Plan revision: rN' line"),
-    (NO_TABLE, "missing a '## 5. Work items' section"),
+    (NO_TABLE, "plan must contain exactly one '## 5. Work items' heading"),
     (MISSING_COLS, "missing column(s)"),
     (DUP_WORK_ITEM, "duplicate work_item"),
     (BAD_WORK_ITEM, "invalid work_item"),
@@ -251,29 +251,84 @@ def test_a_table_in_a_later_section_is_never_mistaken_for_section_5s_own():
     assert any("missing a '## 5. Work items' section with a table" in p for p in problems)
 
 
-def test_a_fenced_example_table_before_the_real_one_is_skipped():
-    # Scoped-fix repro 2: a fenced code block showing an EXAMPLE table, before the real one in
-    # section 5, must never be mistaken for the real table - the whole fence is invisible to
-    # the table search, regardless of what is inside it.
+def test_a_fenced_block_before_the_real_table_now_refuses():
+    # CUT: fence parsing is gone - a code fence ANYWHERE from the start of the file through the
+    # end of section 5 refuses outright, instead of being parsed/skipped. This is a deliberate
+    # change from the prior round's "skip the fence, import task-a" behavior.
     text = ("# Plan: x\n\nPlan revision: r1\n\n## 5. Work items\n\n"
            "Example:\n\n```\n| work_item | Phase | Owner (vendor) | Starts when |\n"
            "|---|---|---|---|\n| example | 1 | dev | ready |\n```\n\n"
            "| work_item | Phase | Owner (vendor) | Starts when |\n|---|---|---|---|\n"
            "| task-a | 1 | dev | ready |\n")
     _, _, _, _, rows, skipped, problems = F._parse_plan(text)
-    assert problems == [] and skipped == []
-    assert [r["work_item"] for r in rows] == ["task-a"]
+    assert rows == [] and skipped == []
+    assert any("code blocks are not allowed" in p for p in problems)
 
 
-def test_a_tilde_fenced_example_table_is_also_skipped():
+def test_a_tilde_fenced_block_before_the_real_table_also_refuses():
     text = ("# Plan: x\n\nPlan revision: r1\n\n## 5. Work items\n\n"
            "~~~\n| work_item | Phase | Owner (vendor) | Starts when |\n"
            "|---|---|---|---|\n| example | 1 | dev | ready |\n~~~\n\n"
            "| work_item | Phase | Owner (vendor) | Starts when |\n|---|---|---|---|\n"
            "| task-a | 1 | dev | ready |\n")
     _, _, _, _, rows, skipped, problems = F._parse_plan(text)
+    assert rows == [] and skipped == []
+    assert any("code blocks are not allowed" in p for p in problems)
+
+
+def test_a_fenced_example_containing_a_fake_section_5_heading_refuses():
+    # Reviewer repro 1 (scoped confirm read): a fence whose CONTENTS include a fake "##
+    # 5. Work items" heading and a row, placed before the real section. The heading count
+    # (2, fence-unaware) refuses before any fence/table logic even runs.
+    text = ("# Plan: x\n\nPlan revision: r1\n\n"
+           "```\n## 5. Work items\n\n| work_item | Phase | Owner (vendor) | Starts when |\n"
+           "|---|---|---|---|\n| example | 1 | dev | ready |\n```\n\n"
+           "## 5. Work items\n\n"
+           "| work_item | Phase | Owner (vendor) | Starts when |\n|---|---|---|---|\n"
+           "| task-a | 1 | dev | ready |\n")
+    _, _, _, _, rows, skipped, problems = F._parse_plan(text)
+    assert rows == [] and skipped == []
+    assert any("exactly one" in p for p in problems)
+
+
+def test_a_four_backtick_fence_containing_triple_backtick_lines_refuses():
+    # Reviewer repro 2: a 4-backtick fence containing 3-backtick lines used to close early
+    # (the old tracker matched on character, not length), so the nested example imported.
+    # The CUT has no length matching at all - ANY fence line in range refuses.
+    text = ("# Plan: x\n\nPlan revision: r1\n\n## 5. Work items\n\n"
+           "````\nExample with a nested fence:\n```\nnot a table\n```\n"
+           "| work_item | Phase | Owner (vendor) | Starts when |\n"
+           "|---|---|---|---|\n| example | 1 | dev | ready |\n````\n\n"
+           "| work_item | Phase | Owner (vendor) | Starts when |\n|---|---|---|---|\n"
+           "| task-a | 1 | dev | ready |\n")
+    _, _, _, _, rows, skipped, problems = F._parse_plan(text)
+    assert rows == [] and skipped == []
+    assert any("code blocks are not allowed" in p for p in problems)
+
+
+def test_a_fence_after_section_5_is_fine():
+    # Fences are only forbidden from the start of the file through the END of section 5; one
+    # appearing in a LATER section (outside the bound the table search ever looks at) is simply
+    # never examined.
+    text = ("# Plan: x\n\nPlan revision: r1\n\n## 5. Work items\n\n"
+           "| work_item | Phase | Owner (vendor) | Starts when |\n|---|---|---|---|\n"
+           "| task-a | 1 | dev | ready |\n\n"
+           "## 6. Notes\n\n```\nsome example here, well after section 5\n```\n")
+    _, _, _, _, rows, skipped, problems = F._parse_plan(text)
     assert problems == [] and skipped == []
     assert [r["work_item"] for r in rows] == ["task-a"]
+
+
+def test_two_section_5_headings_refuse():
+    text = ("# Plan: x\n\nPlan revision: r1\n\n## 5. Work items\n\n"
+           "| work_item | Phase | Owner (vendor) | Starts when |\n|---|---|---|---|\n"
+           "| task-a | 1 | dev | ready |\n\n"
+           "## 5. Work items\n\n"
+           "| work_item | Phase | Owner (vendor) | Starts when |\n|---|---|---|---|\n"
+           "| task-b | 1 | dev | ready |\n")
+    _, _, _, _, rows, skipped, problems = F._parse_plan(text)
+    assert rows == [] and skipped == []
+    assert any("exactly one" in p for p in problems)
 
 
 def test_import_refuses_when_only_a_later_section_has_a_table(tmp_path):
@@ -289,6 +344,31 @@ def test_import_refuses_when_only_a_later_section_has_a_table(tmp_path):
     with pytest.raises(F.PlanRefused, match="plan file malformed"):
         F.import_plan(store, write(tmp_path / "bad.md", bad))
     assert facts.read_bytes() == before  # the stored rows are untouched
+
+
+def test_import_refuses_both_reviewer_repros_without_changing_bytes(tmp_path):
+    store = new_store(tmp_path)
+    F.import_plan(store, write(tmp_path / "plan.md", PLAN))
+    facts = store.state_dir / F.FACTS_FILE
+    before = facts.read_bytes()
+    fake_heading_in_fence = (
+        "# Plan: board lanes and the v2 team views\n\nPlan revision: r3\n\n"
+        "```\n## 5. Work items\n\n| work_item | Phase | Owner (vendor) | Starts when |\n"
+        "|---|---|---|---|\n| example | 1 | dev | ready |\n```\n\n"
+        "## 5. Work items\n\n"
+        "| work_item | Phase | Owner (vendor) | Starts when |\n|---|---|---|---|\n"
+        "| task-a | 1 | dev | ready |\n")
+    nested_fence = (
+        "# Plan: board lanes and the v2 team views\n\nPlan revision: r3\n\n"
+        "## 5. Work items\n\n````\nExample:\n```\nnot a table\n```\n"
+        "| work_item | Phase | Owner (vendor) | Starts when |\n"
+        "|---|---|---|---|\n| example | 1 | dev | ready |\n````\n\n"
+        "| work_item | Phase | Owner (vendor) | Starts when |\n|---|---|---|---|\n"
+        "| task-a | 1 | dev | ready |\n")
+    for name, text in (("fake-heading.md", fake_heading_in_fence), ("nested-fence.md", nested_fence)):
+        with pytest.raises(F.PlanRefused, match="plan file malformed"):
+            F.import_plan(store, write(tmp_path / name, text))
+        assert facts.read_bytes() == before  # the stored rows are untouched, every time
 
 
 def test_header_only_table_with_no_separator_refuses():
