@@ -55,7 +55,9 @@ templates below, without a "before" and a "now".
 - [ ] Use simple words and short sentences, one idea per sentence. Say who does
       what: "the app now saves your list" rather than "saving is now performed".
 - [ ] Avoid jargon. When a technical term cannot be avoided, explain it the first
-      time, in plain words: "a cache (a saved copy kept so pages load faster)".
+      time, in plain words that fit this case (see TERMS below): "the app keeps a
+      saved copy of your list on your phone (a cache), so it opens without
+      waiting for the internet".
 - [ ] Give examples from the reader's world: the shopping basket, the to-do list,
       tomorrow's forecast.
 - [ ] Keep numbers exact, and say what they mean without inventing new ones.
@@ -65,34 +67,44 @@ templates below, without a "before" and a "now".
       from a percentage.
 - [ ] Be honest about limits: "we have not tested this on phones yet" is better
       than silence.
-- [ ] Never let one plain phrase stand for two different facts. "Released" means
-      a new version can be installed; it does not mean anyone is using it yet.
 
-Instead of this, say that:
+## TERMS: explain each one for this case
+A fixed list of "say this instead" words cannot work: the same plain words are true
+in one case and false in the next. So explain each term for the case in front of
+you.
+- [ ] **The plain words must be true for this case, not in general.**
+- [ ] Before you replace a term, ask what your plain version now claims that the
+      original did not: where, which branch or version, who, how many, how long,
+      in what order. Add those details from the source, or keep the term and
+      explain it in a sentence.
+- [ ] Never invent a number, a name or a place that the source does not give.
+- [ ] Never let one plain phrase stand for two different facts. Two pairs that
+      are often mixed up:
+      - **Released and deployed.** "Released" means a new version can be
+        installed; it does not mean anyone is using it yet. "Deployed" means a
+        running system was switched over to it, so people are using it now. Say
+        which one happened.
+      - **Null, absent and empty.** Say which one it is: the field is there but
+        set to "no value" on purpose (null), the field is left out entirely
+        (absent or undefined), or the field is there but empty (an empty text or
+        an empty list).
 
-| Instead of | Say |
-|---|---|
-| merged | added to the main version of the code, the one the next release is made from |
-| regression | something that used to work broke again |
-| CI, the pipeline | the automatic checks that run on every change |
-| race condition | two things happened at the same moment and got in each other's way |
-| refactor | reorganised the code without changing what it does |
-| flaky test | an automatic check that sometimes fails for no real reason |
-| dependency | a piece of someone else's software that this one relies on |
-| release, publish | made a new version available to install (people get it when they upgrade) |
-| deploy, roll out | switched a running system over to the new version, so people are now using it |
-| revert | undid a change in the code |
-| rollback | switched a running system back to the previous version |
-| cache | a saved copy kept so things load faster |
-| endpoint, API | the address another program uses to ask for data |
-| timeout | gave up waiting after N seconds |
-| memory leak | the program kept using more memory and never gave it back |
-| lock | a rule that lets only one thing change something at a time |
-| null | there, but set to "no value" on purpose |
-| undefined, absent | left out: the field is not there at all |
-| empty string, empty list | there, but empty: no text, or a list with nothing in it |
-| PR, pull request | a proposed change, waiting for review |
-| commit ID, SHA, file path | (move to Technical details) |
+Three worked examples follow. They show the method; they are not words to copy.
+
+- **Example 1, "merged".** Wrong: "the change was added to the main version".
+  Why it is wrong: the source may mean a release branch or someone's feature
+  branch, and "the main version" claims more than it says. Right: "the change was
+  added to <the branch the source names>", plus "it will be in the next release"
+  only if the source says so.
+- **Example 2, "timeout".** Wrong: "it gave up after 30 seconds", when the source
+  gives no number. Why it is wrong: the number is made up. Right: "it stopped
+  waiting when it reached its time limit", with the limit itself only if the
+  source states it.
+- **Example 3, "race condition".** Wrong: "two things happened at the same moment".
+  Why it is wrong: in a race the two steps can happen at different times; what
+  goes wrong is that nothing controls which one acts first. Right: "the result
+  depended on which of the two steps acted first", followed by what broke when
+  they came in the wrong order, from the source.
 
 ## PRECISION WITHOUT CLUTTER
 - [ ] **Keep every fact.** Translate it; do not delete it. A fact that only a
@@ -197,7 +209,8 @@ suggest:** check the stock again just before taking the payment.
 ## SELF-CHECK: before posting
 - [ ] Would someone who has never programmed understand every sentence of the
       main text?
-- [ ] Is every technical term either avoided or explained the first time?
+- [ ] Is every technical term either avoided or explained the first time, in words
+      that are true for this case, with no invented number, name or place?
 - [ ] For a release note, changelog entry or pull request description: is "what
       you will notice" there, with a before and a now?
 - [ ] Is it clear what the reader needs to do or decide, even if it is "nothing"?
@@ -220,7 +233,8 @@ a review written with review-code still emits review-code's `review-result` fiel
 testing skill's `qa-result` fields.
 
 Only when this skill is the whole job (a release note, a changelog entry, a pull
-request description or a status report that no other skill is producing), emit the
+request description, an issue comment or a status report that no other skill is
+producing), emit the
 `production-handoff` profile (full rules + bus-validated vs skill-policy: ../_shared/references/evidence.md).
 
 Required fields:

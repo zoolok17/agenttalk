@@ -20,7 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - first say what changed, then why it matters, then what you will notice
     ("before this ... now ..."), then what you need to do;
   - use simple words, and explain any unavoidable technical term the first
-    time. A table offers plain replacements for common jargon;
+    time, in words that are true for this particular case. There is no fixed
+    list of replacement words, because the same plain words can be true in one
+    case and false in the next; three worked examples show the method instead;
   - keep every fact, and move file names, commit IDs and test names to a short
     "Technical details" section at the end;
   - but never publish anything sensitive (passwords, keys, private or customer

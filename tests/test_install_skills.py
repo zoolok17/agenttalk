@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -479,7 +480,8 @@ def test_lead_skills_carry_the_writing_rules_without_the_devkit(tmp_path: Path) 
         "use the write-for-humans skill if it is installed. If it is not, follow its "
         "three core rules: (1) to describe a change, write in this order: what changed, "
         "why it matters, what they will notice, what they need to do; (2) use plain "
-        "words, and explain any technical term you cannot avoid the first time; (3) keep "
+        "words that are true for this case, never invent a number, name or place, and "
+        "explain any technical term you cannot avoid the first time; (3) keep "
         "every fact, with file names, IDs and test names in a Technical details section "
         "at the end, but never include secrets, private data or internal-only addresses, "
         "not even there. A review comment keeps the review's own format and severity tag."
@@ -506,6 +508,8 @@ def test_write_for_humans_defers_to_the_calling_skills_evidence() -> None:
     evidence = _flat(text.split("\n## Evidence", 1)[1])
     assert "emit THAT skill's evidence, unchanged" in evidence
     assert "`review-result` fields" in evidence
+    whole_job = evidence.split("Only when this skill is the whole job", 1)[1].split("emit the", 1)[0]
+    assert "an issue comment" in whole_job
     # the standalone stub stays production-handoff, so the parity check still applies
     assert _parse_skill_stub(text)[0] == "production-handoff"
 
@@ -527,27 +531,50 @@ def test_write_for_humans_keeps_the_calling_review_format() -> None:
     assert "This skill only changes the words inside it" in comments
 
 
-def _rows(text: str) -> dict[str, str]:
-    return {ln.split("|")[1].strip(): ln.split("|")[2].strip()
-            for ln in text.splitlines() if ln.startswith("| ") and ln.count("|") == 3}
+def _skill() -> str:
+    return (SKILLS_ROOT / "devkit" / "write-for-humans" / "SKILL.md").read_text(encoding="utf-8")
+
+
+def _section(text: str, heading: str) -> str:
+    return text.split(f"\n## {heading}", 1)[1].split("\n## ", 1)[0]
+
+
+def test_write_for_humans_explains_terms_for_this_case() -> None:
+    terms = _flat(_section(_skill(), "TERMS"))
+    assert "**The plain words must be true for this case, not in general.**" in terms
+    assert "ask what your plain version now claims that the original did not" in terms
+    assert "Never invent a number, a name or a place that the source does not give." in terms
+
+
+def test_write_for_humans_has_no_substitution_table() -> None:
+    """A fixed 'say this instead' table is false in some context, so the skill
+    carries no markdown table at all."""
+    separator = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$")
+    assert not [ln for ln in _skill().splitlines() if separator.match(ln)]
+
+
+def test_write_for_humans_examples_are_labelled_and_at_most_three() -> None:
+    terms = _section(_skill(), "TERMS")
+    assert "They show the method; they are not words to copy." in _flat(terms)
+    examples = re.findall(r'\*\*Example (\d+), "([^"]+)"\.\*\*', terms)
+    assert examples == [("1", "merged"), ("2", "timeout"), ("3", "race condition")]
+    for example in re.split(r"\*\*Example \d+, ", _flat(terms))[1:]:
+        assert "Wrong:" in example and "Why it is wrong:" in example and "Right:" in example
 
 
 def test_write_for_humans_keeps_release_and_deploy_apart() -> None:
-    text = (SKILLS_ROOT / "devkit" / "write-for-humans" / "SKILL.md").read_text(encoding="utf-8")
-    rows = _rows(text)
-    assert "release, publish" in rows and "deploy, roll out" in rows
-    assert rows["release, publish"] != rows["deploy, roll out"]
-    assert "available to install" in rows["release, publish"]
-    assert "now using it" in rows["deploy, roll out"]
+    terms = _flat(_section(_skill(), "TERMS"))
+    assert ('"Released" means a new version can be installed; it does not mean anyone '
+            'is using it yet.') in terms
+    assert ('"Deployed" means a running system was switched over to it, so people are '
+            'using it now.') in terms
 
 
 def test_write_for_humans_keeps_null_absent_and_empty_apart() -> None:
-    text = (SKILLS_ROOT / "devkit" / "write-for-humans" / "SKILL.md").read_text(encoding="utf-8")
-    rows = _rows(text)
-    states = [rows["null"], rows["undefined, absent"], rows["empty string, empty list"]]
-    assert len(set(states)) == 3
-    assert "not there at all" in rows["undefined, absent"]
-    assert "there, but empty" in rows["empty string, empty list"]
+    terms = _flat(_section(_skill(), "TERMS"))
+    assert 'the field is there but set to "no value" on purpose (null)' in terms
+    assert "the field is left out entirely (absent or undefined)" in terms
+    assert "the field is there but empty (an empty text or an empty list)" in terms
 
 
 def test_write_for_humans_never_invents_numbers_from_a_percentage() -> None:
@@ -577,6 +604,24 @@ def test_write_for_humans_triggers_only_on_its_artifacts() -> None:
         "review comments, and status reports")
     assert "Use only for those kinds of text." in description
     assert "Do NOT use for answering questions, plans or design discussions" in description
+
+
+def test_write_for_humans_samples_follow_the_skill() -> None:
+    """The reference rewrites must pass the skill's own checks: no issue numbers in the
+    reader-facing text, the PR template's sections, and no overstated freshness."""
+    repo = Path(__file__).resolve().parents[1]
+    text = (repo / "docs" / "examples" / "write-for-humans-samples.md").read_text(encoding="utf-8")
+    afters = [a.split("## Sample 2", 1)[0] for a in re.split(r"(?m)^### After$", text)[1:]]
+    assert len(afters) == 2
+    for after in afters:
+        main = re.split(r"(?m)^#{4,5} Technical details$", after)[0]
+        assert not re.findall(r"#\d+", main)
+    pr_sections = re.findall(r"(?m)^#### (.*)$", afters[1])
+    for required in ("What this changes", "What you will notice",
+                     "What reviewers and users need to do", "How we checked it",
+                     "Technical details"):
+        assert required in pr_sections
+    assert "never out of date" not in _flat(afters[1])
 
 
 def test_write_for_humans_samples_ship_in_the_sdist() -> None:

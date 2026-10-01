@@ -162,8 +162,8 @@ What you need to do: nothing. Open the new link if you want to try it.
 
 **When an agent's health report is too old, it now says what it last reported**
 
-Every agent regularly reports how it is doing ("working on a task", "waiting for
-work" and so on). When a report is too old to trust, it has always read as
+Every agent regularly reports how it is doing, for example whether it is working
+on a task or waiting for work. When a report is too old to trust, it has always read as
 "unknown". It still does, and nothing in it changes, but it now also carries the
 last thing the agent reported, and when.
 
@@ -189,8 +189,7 @@ first view you can look at:
 - **One shared copy:** all the console's views share one checked copy of the
   messages, instead of each one reading everything again.
 - **Which company's model:** each agent can now be recorded with the company
-  whose AI model it uses, for example Anthropic or OpenAI, separately from the
-  program that runs it. Each task keeps a record of this for the agents it was
+  whose AI model it uses, separately from the program that runs it. Each task keeps a record of this for the agents it was
   sent to, as it was when the task was sent. Questions raised to you
   ("escalations") are now linked to the exact piece of work, and the exact round
   of it, that they are about.
@@ -213,8 +212,8 @@ first view you can look at:
     are still open out of the total, roughly how long ago work was sent and last
     moved, and the evidence for the column it is in.
   - **Honest gaps:** where the data does not prove something (what the review
-    found, what the work cost, or whether it was added to the main version of
-    the code), the card says "unknown".
+    found, what the work cost, or whether it was added to the branch it was
+    meant for), the card says "unknown".
   - **Moving around:** use the j, k and Escape keys, and open a read-only
     details panel. The board keeps your place and your scroll position when it
     refreshes, and switching between the board and the conversation never
@@ -239,7 +238,7 @@ picked up again later, the resumed send used to rely on the permission the
 sender had when it first started. Now it checks again, so someone who is no
 longer the lead cannot finish sending tasks.
 
-**Agents no longer stop when the shared message store is busy (#154).**
+**Agents no longer stop when the shared message store is busy.**
 
 All agents keep their messages in one shared folder. To stop two agents writing
 at the same moment, each one briefly takes a "lock" on it: a rule that lets only
@@ -258,7 +257,7 @@ permission error, a lock taken in the wrong order, or an agent that has lost
 its claim to its turn.
 
 **Checks recorded on the work board can no longer block the whole team.** The
-work board can record automatic checks ("gates") for a single piece of work.
+work board can record required checks ("gates") for a single piece of work.
 Before this, such a check could be mistaken for a team-wide check and hold up
 unrelated work, or put a hold on the team's attention list. Now a board check
 only counts for its own piece of work, and adding a new one to the team-wide list
@@ -430,7 +429,7 @@ Serve the same cached `SnapshotService` `/api/state` already reads from for `/ap
 
 ### After
 
-**Title:** Stop the console server from using more and more memory while the new console is open (#239)
+**Title:** Stop the console server from using more and more memory while the new console is open
 
 #### What this changes
 
@@ -444,8 +443,8 @@ times faster. This change stops that. Memory now stays flat.
 
 Two parts of the console ask the server for information every few seconds:
 "what needs your attention" and "the chat with the lead". To answer either
-question, the server read through every message the team had ever stored and
-checked each one, every time. It kept no saved copy.
+question, the server read through every message file in the team's message
+store and checked each one, every time. It kept no saved copy.
 
 A real web browser does not wait for one answer before asking again. When
 questions arrived faster than the server could answer them, each new question
@@ -461,9 +460,11 @@ real console page.
 #### What we changed
 
 **Only two reads at a time.** Each team now allows at most two of these full
-reads at once. Every request still reads and checks everything fresh, with the
-team's current settings, so the answer is never out of date. What is limited is
-how many run at the same moment. Checking each message (who sent it, what kind
+reads at once. Every request still does its own fresh read and check when it
+starts, using the team's settings as they are at that moment. So each answer is
+up to date as of the moment its request began, and a change that arrives while a
+read is under way shows up in the next answer. What is limited is how many reads
+run at the same moment. Checking each message (who sent it, what kind
 of message it is, and its signature when signatures are required) is real work
 too, so it counts as part of the same read and is limited in the same way.
 
@@ -496,8 +497,9 @@ tried it twice, and both attempts failed review:
   row.
 
 So nothing is shared. Every request does its own fresh read, and the only thing
-limited is how many happen at once. This way the answers are always correct by
-design, not by careful timing.
+limited is how many happen at once. This way each answer is fresh as of the
+moment its request started, and checked with that moment's settings, by design
+rather than by careful timing.
 
 #### What you will notice
 
@@ -523,9 +525,15 @@ yet, the same read can take up to 87 seconds. In that situation the 3-second
 wait limit means the console shows "busy" for a while, until things warm up.
 This change does not fix that; it is tracked for the follow-up below.
 
-The planned follow-up (#251) will answer these two questions from the same saved
+A planned follow-up will answer these two questions from the same saved
 copy that the main overview already uses. That would remove the slow read
 entirely, instead of only limiting it. It is not part of this change.
+
+#### What reviewers and users need to do
+
+Nothing to set up or change: the fix works on its own once the console server
+runs this version. Every item in the test plan below is already done, including
+an independent review.
 
 #### How we checked it
 
@@ -534,9 +542,10 @@ entirely, instead of only limiting it. It is not part of this change.
 - **Every path says "busy" cleanly:** when the limit is reached, every affected
   page answers "busy, try again" rather than a misleading partial answer, and the
   number of threads comes back down afterwards.
-- **Always fresh:** a request that starts after a new message, or after a change
-  to the team or its security settings, always sees that change. A request
-  already under way keeps the answer as things stood when it started.
+- **Fresh at the start of every request:** a request that starts after a new
+  message, or after a change to the team or its security settings, always sees
+  that change. A request already under way keeps the answer as things stood when
+  it started.
 - **The console side:** this change does not touch the console page itself. Two
   checks confirm that it treats "busy" like any other failed read (it keeps the
   last good data and shows no special error), and never asks the same question
@@ -551,6 +560,7 @@ entirely, instead of only limiting it. It is not part of this change.
 
 #### Technical details
 
+- **Issue:** #239.
 - **Cause:**
   - `GET /api/attention` and `GET /api/lead-chat` did an uncached O(store-size)
     rescan and validation per request (`web._validated_for_state`,
