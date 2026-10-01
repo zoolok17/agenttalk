@@ -23,7 +23,9 @@ and a list of file names where an explanation should be.
 
 This skill never asks you to drop a fact. It asks you to **explain** every fact,
 and to move the details only developers need (file names, commit IDs, test names)
-to a short section at the end.
+to a short section at the end. The one exception is anything that must not be
+published, such as a password, a key or a customer's details: that is removed or
+summarised safely, never moved to the end (see PRECISION WITHOUT CLUTTER).
 
 ## WHO: the reader
 - [ ] They use the product, pay for it or decide about it. They do not read the code.
@@ -54,20 +56,24 @@ to a short section at the end.
       instead of 6", not only "p95 latency down 83%".
 - [ ] Be honest about limits: "we have not tested this on phones yet" is better
       than silence.
+- [ ] Never let one plain phrase stand for two different facts. "Released" means
+      a new version can be installed; it does not mean anyone is using it yet.
 
 Instead of this, say that:
 
 | Instead of | Say |
 |---|---|
-| merged | added to the main version of the software |
+| merged | added to the main version of the code, the one the next release is made from |
 | regression | something that used to work broke again |
 | CI, the pipeline | the automatic checks that run on every change |
 | race condition | two things happened at the same moment and got in each other's way |
 | refactor | reorganised the code without changing what it does |
 | flaky test | an automatic check that sometimes fails for no real reason |
 | dependency | a piece of someone else's software that this one relies on |
-| deploy, release | put the new version where people use it |
-| revert, rollback | went back to the previous version |
+| release, publish | made a new version available to install (people get it when they upgrade) |
+| deploy, roll out | switched a running system over to the new version, so people are now using it |
+| revert | undid a change in the code |
+| rollback | switched a running system back to the previous version |
 | cache | a saved copy kept so things load faster |
 | endpoint, API | the address another program uses to ask for data |
 | timeout | gave up waiting after N seconds |
@@ -80,10 +86,20 @@ Instead of this, say that:
 ## PRECISION WITHOUT CLUTTER
 - [ ] **Keep every fact.** Translate it; do not delete it. A fact that only a
       developer needs moves to Technical details, but it stays.
+- [ ] **Except anything sensitive, which this rule never covers.** Secrets,
+      passwords, keys and tokens; private or customer data (names, email
+      addresses, account numbers, anything copied from a real person's records or
+      logs); and internal-only paths, hostnames or addresses are never kept, not
+      even in Technical details. Moving them to the end does not make them safe.
+      Remove them, or replace them with a safe summary that keeps the meaning: "a
+      key was rotated", "one customer's order was affected". Check pasted command
+      output and logs for them too. If you are not sure whether something is
+      sensitive, leave it out and tell whoever asked for the text.
 - [ ] The main text must make sense with the Technical details section removed.
       Test this by reading it without that section.
 - [ ] Technical details holds a short list of file paths, commit IDs, function and
-      test names, issue numbers, settings names and exact command output.
+      test names, issue numbers, settings names and exact command output, all
+      with sensitive data already removed.
 - [ ] Say "fixed" only when it was checked, and say how in plain words: "we left it
       running for ten minutes and memory stayed flat".
 - [ ] When a document has a required format (for example a changelog with fixed
@@ -131,17 +147,22 @@ Nothing to do.
 
 ### Issue and review comments
 A review finding is a small story: what is wrong, why it matters, what to do.
+If your review process gives each finding a severity tag (P1, P2 and so on, or
+any other scale), keep that tag exactly as the process requires, at the start,
+so findings can still be sorted and counted. The plain-language "why it matters"
+goes next to the tag. It explains the tag; it never replaces it.
 ```markdown
-**What I found:** <one sentence a non-programmer understands>.
-**Why it matters:** <who is affected, how badly, how often; "a customer could be
-charged twice", not "P1">.
+**<severity tag, unchanged> What I found:** <one sentence a non-programmer
+understands>.
+**Why it matters:** <who is affected, how badly, how often, in plain words: "a
+customer could be charged twice">.
 **What I suggest:** <the change, or the decision needed>.
 **Technical details:** <file and line, how to reproduce it, test names>.
 ```
-Example, for a shop: **What I found:** if two people buy the last item at the same
-moment, both orders go through. **Why it matters:** one of them pays for something
-we cannot send. It is rare, but it happens on busy sale days. **What I suggest:**
-check the stock again just before taking the payment.
+Example, for a shop: **P1. What I found:** if two people buy the last item at the
+same moment, both orders go through. **Why it matters:** one of them pays for
+something we cannot send. It is rare, but it happens on busy sale days. **What I
+suggest:** check the stock again just before taking the payment.
 
 ### Status reports to a person
 ```markdown
@@ -161,11 +182,22 @@ check the stock again just before taking the payment.
 - [ ] Are paths, IDs and code names only in Technical details, and does the main
       text still make sense without them?
 - [ ] Did every fact from the technical version survive?
+- [ ] Is there no secret, private data or internal-only address anywhere,
+      including Technical details and pasted output?
+- [ ] Does every review finding still carry its severity tag?
 - [ ] Is every claim honest about what was checked and what was not?
 
 ## Evidence
 
-Emit the `production-handoff` profile (full rules + bus-validated vs skill-policy: ../_shared/references/evidence.md).
+This skill changes how the text reads, never the evidence that goes with it.
+When you use it inside another skill's work, emit THAT skill's evidence, unchanged:
+a review written with review-code still emits review-code's `review-result` fields
+(its status, severity tags and reviewed commit), and a test report still emits the
+testing skill's `qa-result` fields.
+
+Only when this skill is the whole job (a release note, a changelog entry, a pull
+request description or a status report that no other skill is producing), emit the
+`production-handoff` profile (full rules + bus-validated vs skill-policy: ../_shared/references/evidence.md).
 
 Required fields:
 

@@ -461,3 +461,77 @@ def test_listen_skills_contain_consult_handling(tmp_path: Path) -> None:
         assert "Do NOT modify project files" in body
         assert "Do NOT answer the user directly" in body
         assert "Do NOT start your own consult in return" in body
+
+
+def _flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def test_lead_skills_carry_the_writing_rules_without_the_devkit(tmp_path: Path) -> None:
+    """A bus-only install (--no-devkit) has no write-for-humans skill, so the lead
+    skills must carry its core rules themselves, in identical words."""
+    claude_dir = tmp_path / "claude"
+    codex_dir = tmp_path / "codex"
+    install(claude_dir=claude_dir, codex_dir=codex_dir)
+    claude_lead = _flat((claude_dir / "agenttalk.lead.md").read_text(encoding="utf-8"))
+    codex_lead = _flat((codex_dir / "agenttalk-lead" / "SKILL.md").read_text(encoding="utf-8"))
+    rule = (
+        "use the write-for-humans skill if it is installed. If it is not, follow its "
+        "three core rules: (1) write in this order: what changed, why it matters, what "
+        "they will notice, what they need to do; (2) use plain words, and explain any "
+        "technical term you cannot avoid the first time; (3) keep every fact, with file "
+        "names, IDs and test names in a Technical details section at the end, but never "
+        "include secrets, private data or internal-only addresses, not even there. A "
+        "review finding keeps its severity tag."
+    )
+    assert rule in claude_lead
+    assert rule in codex_lead
+
+
+def test_write_for_humans_never_publishes_sensitive_data() -> None:
+    """'Keep every fact' must carry its sensitive-data exception right beside it."""
+    text = (SKILLS_ROOT / "devkit" / "write-for-humans" / "SKILL.md").read_text(encoding="utf-8")
+    section = _flat(text.split("## PRECISION WITHOUT CLUTTER", 1)[1].split("\n## ", 1)[0])
+    keep = section.index("**Keep every fact.**")
+    exception = section.index("**Except anything sensitive, which this rule never covers.**")
+    assert keep < exception < section.index("The main text must make sense")
+    assert "not even in Technical details" in section
+    assert "Moving them to the end does not make them safe" in section
+
+
+def test_write_for_humans_defers_to_the_calling_skills_evidence() -> None:
+    from agenttalk.skill_currency import _parse_skill_stub
+
+    text = (SKILLS_ROOT / "devkit" / "write-for-humans" / "SKILL.md").read_text(encoding="utf-8")
+    evidence = _flat(text.split("\n## Evidence", 1)[1])
+    assert "emit THAT skill's evidence, unchanged" in evidence
+    assert "`review-result` fields" in evidence
+    # the standalone stub stays production-handoff, so the parity check still applies
+    assert _parse_skill_stub(text)[0] == "production-handoff"
+
+
+def test_write_for_humans_review_comments_keep_the_severity_tag() -> None:
+    text = (SKILLS_ROOT / "devkit" / "write-for-humans" / "SKILL.md").read_text(encoding="utf-8")
+    comments = text.split("### Issue and review comments", 1)[1].split("\n### ", 1)[0]
+    assert "**<severity tag, unchanged> What I found:**" in comments
+    assert "it never replaces it" in _flat(comments)
+    assert "**P1. What I found:**" in comments
+
+
+def test_write_for_humans_keeps_release_and_deploy_apart() -> None:
+    text = (SKILLS_ROOT / "devkit" / "write-for-humans" / "SKILL.md").read_text(encoding="utf-8")
+    rows = {ln.split("|")[1].strip(): ln.split("|")[2].strip()
+            for ln in text.splitlines() if ln.startswith("| ") and ln.count("|") == 3}
+    assert "release, publish" in rows and "deploy, roll out" in rows
+    assert rows["release, publish"] != rows["deploy, roll out"]
+    assert "available to install" in rows["release, publish"]
+    assert "now using it" in rows["deploy, roll out"]
+
+
+def test_write_for_humans_samples_ship_in_the_sdist() -> None:
+    """The CHANGELOG points readers at the samples, so the sdist must carry them."""
+    repo = Path(__file__).resolve().parents[1]
+    pyproject = (repo / "pyproject.toml").read_text(encoding="utf-8")
+    sdist = pyproject.split("[tool.hatch.build.targets.sdist]", 1)[1].split("\n[", 1)[0]
+    assert '"/docs/examples/write-for-humans-samples.md"' in sdist
+    assert (repo / "docs" / "examples" / "write-for-humans-samples.md").is_file()

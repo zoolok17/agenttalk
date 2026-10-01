@@ -411,8 +411,13 @@ the agents you plan.
    out explicitly.
    For anything a person will read (this summary, release notes, changelog
    entries, pull request descriptions, issue and review comments), use the
-   write-for-humans skill: what changed, why it matters, what they will
-   notice, what they need to do, with technical details at the end.
+   write-for-humans skill if it is installed. If it is not, follow its three
+   core rules: (1) write in this order: what changed, why it matters, what
+   they will notice, what they need to do; (2) use plain words, and explain
+   any technical term you cannot avoid the first time; (3) keep every fact,
+   with file names, IDs and test names in a Technical details section at the
+   end, but never include secrets, private data or internal-only addresses,
+   not even there. A review finding keeps its severity tag.
 
 ## Publishing a sandboxed worker's commit
 

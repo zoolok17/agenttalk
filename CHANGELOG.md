@@ -22,10 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - use simple words, and explain any unavoidable technical term the first
     time. A table offers plain replacements for common jargon;
   - keep every fact, and move file names, commit IDs and test names to a short
-    "Technical details" section at the end.
+    "Technical details" section at the end;
+  - but never publish anything sensitive (passwords, keys, private or customer
+    data, internal-only addresses): remove it or summarise it safely, even in
+    the technical details.
 
   It comes with templates for release notes, pull request descriptions, review
-  comments and status reports, plus a checklist to run before posting.
+  comments (which keep their severity tag) and status reports, plus a checklist
+  to run before posting. When it is used inside another skill's work, such as a
+  review, that skill's evidence rules still apply.
 
   What you will notice: agents that write for you should start explaining
   their work in plain language, at greater length. Nothing to do: the skill is
@@ -33,8 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Technical details: `src/agenttalk/skills/devkit/write-for-humans/SKILL.md`.
   It is linked from the `write-docs` skill, the shared skill routing index,
-  both lead skills (step 7) and the user manual's skill table. Before-and-after
-  samples are in `docs/examples/write-for-humans-samples.md`.
+  both lead skills (step 7, which also carries the three core rules for a
+  `--no-devkit` install) and the user manual's skill table. Before-and-after
+  samples are in `docs/examples/write-for-humans-samples.md`, which ships in the
+  source distribution.
 
 - **Work board: a Done lane from lead-run, Git-verified merge facts (#207).**
   The reducer could already place Done from integration evidence, but nothing
