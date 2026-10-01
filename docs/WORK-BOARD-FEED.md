@@ -227,21 +227,41 @@ not a table row). Anything past that — a second table further down the
 section (a "Legend:", say) — is never read, by construction; it is not a
 reason to refuse.
 
+The SAME "exactly right, or refuse" principle applies to every other field
+the importer reads, not just the section-5 heading. The title (`# Plan:
+<name>`), the optional `Plan id:` line and `Plan revision: rN` are read ONLY
+from the plan's HEADER BLOCK — the lines before the file's first raw `## `
+line (section 5's own heading counts). Each one's raw occurrences are
+counted across the WHOLE file, fence-unaware, the same way the section-5
+heading is: the title and revision must occur exactly once, `Plan id:` at
+most once, and EVERY occurrence — not just the ones that happen to match —
+must sit inside that header block. A plan with an otherwise-normal section 5
+and an ALLOWED fenced example after it (fences after section 5 are fine) that
+happens to contain its own `Plan id: ...` line used to let that line win,
+importing under a hijacked, unrelated id and overwriting whatever already
+used it; it is refused instead now, wherever the stray occurrence sits.
+The table's own header is checked the same way: a required column name
+appearing twice (two `work_item` columns, say) refuses rather than silently
+using the first one.
+
 It exits 2, having published nothing, when the plan file:
 
 - does not exist, is unreadable, is not valid UTF-8, or exceeds the 512 KiB
   read bound;
-- has no `# Plan: <name>` title line;
+- does not contain EXACTLY ONE `# Plan: <name>` title line, or one exists
+  outside the header block;
 - has an explicit `Plan id:` line that is not a lowercase slug of at most 64
-  characters, or (with no explicit line) a title that yields no usable slug
-  (see **Plan id** below);
-- has no `Plan revision: rN` line;
+  characters, occurs more than once, or sits outside the header block (see
+  **Plan id** below), or (with no explicit line) a title that yields no
+  usable slug;
+- does not contain EXACTLY ONE `Plan revision: rN` line, or one exists
+  outside the header block;
 - does not contain EXACTLY ONE `## 5. Work items` heading line;
 - has any code fence from the start of the file through the end of section 5;
 - has no table directly under the heading, or the table's second line is
-  not a separator row of the same width as the header, or the table is
-  missing the `work_item`, `Phase`, `Owner (vendor)` (or `Owner`) or
-  `Starts when` column;
+  not a separator row of the same width as the header, or the table header
+  is missing the `work_item`, `Phase`, `Owner (vendor)` (or `Owner`) or
+  `Starts when` column, or repeats any of those required columns;
 - has a table row whose `work_item` is not a lowercase slug of at most 64
   characters, or that repeats a `work_item` already seen in this plan's own
   table;

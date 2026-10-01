@@ -331,6 +331,74 @@ def test_two_section_5_headings_refuse():
     assert any("exactly one" in p for p in problems)
 
 
+# ------------------------------------------------- header fields (exactly once, header only)
+
+def test_plan_id_below_section_5_in_a_fence_cannot_hijack_the_import():
+    # Reviewer-found data loss: a "Plan id:" line inside an ALLOWED fence after section 5 used
+    # to be searched for across the whole file and win, importing under the hijacked id.
+    text = ("# Plan: x\n\nPlan revision: r1\n\n## 5. Work items\n\n"
+           "| work_item | Phase | Owner (vendor) | Starts when |\n|---|---|---|---|\n"
+           "| task-a | 1 | dev | ready |\n\n"
+           "## 6. Notes\n\n```\nPlan id: example-only\n```\n")
+    _, explicit_id, _, _, rows, skipped, problems = F._parse_plan(text)
+    assert rows == [] and skipped == [] and explicit_id is None
+    assert any("header" in p for p in problems)
+
+
+def test_import_refuses_the_plan_id_hijack_leaving_the_hijacked_plan_untouched(tmp_path):
+    store = new_store(tmp_path)
+    hijack_target = PLAN.replace("Plan revision: r2", "Plan id: example-only\n\nPlan revision: r2")
+    F.import_plan(store, write(tmp_path / "target.md", hijack_target))
+    facts = store.state_dir / F.FACTS_FILE
+    before = facts.read_bytes()
+    hijacker = ("# Plan: a different plan\n\nPlan revision: r1\n\n## 5. Work items\n\n"
+               "| work_item | Phase | Owner (vendor) | Starts when |\n|---|---|---|---|\n"
+               "| task-a | 1 | dev | ready |\n\n"
+               "## 6. Notes\n\n```\nPlan id: example-only\n```\n")
+    with pytest.raises(F.PlanRefused, match="plan file malformed"):
+        F.import_plan(store, write(tmp_path / "hijacker.md", hijacker))
+    assert facts.read_bytes() == before  # "example-only" is untouched
+
+
+def test_duplicate_plan_revision_refuses():
+    text = ("# Plan: x\n\nPlan revision: r1\n\nPlan revision: r2\n\n## 5. Work items\n\n"
+           "| work_item | Phase | Owner (vendor) | Starts when |\n|---|---|---|---|\n"
+           "| task-a | 1 | dev | ready |\n")
+    _, _, _, _, rows, skipped, problems = F._parse_plan(text)
+    assert rows == [] and skipped == []
+    assert any("at most one" in p for p in problems)
+
+
+def test_plan_id_below_the_first_heading_refuses_even_without_a_fence():
+    # The header block ends at the first RAW "## " line, fences aside - a "Plan id:" line that
+    # simply sits after section 5's own heading (no fence involved at all) is just as wrong.
+    text = ("# Plan: x\n\nPlan revision: r1\n\n## 5. Work items\n\nPlan id: late\n\n"
+           "| work_item | Phase | Owner (vendor) | Starts when |\n|---|---|---|---|\n"
+           "| task-a | 1 | dev | ready |\n")
+    _, explicit_id, _, _, rows, skipped, problems = F._parse_plan(text)
+    assert rows == [] and skipped == [] and explicit_id is None
+    assert any("header" in p for p in problems)
+
+
+def test_duplicate_work_item_header_column_refuses():
+    text = ("# Plan: x\n\nPlan revision: r1\n\n## 5. Work items\n\n"
+           "| work_item | Phase | work_item | Starts when |\n|---|---|---|---|\n"
+           "| task-a | 1 | dup | ready |\n")
+    _, _, _, _, rows, skipped, problems = F._parse_plan(text)
+    assert rows == [] and skipped == []
+    assert any("repeats required column" in p and "work_item" in p for p in problems)
+
+
+def test_a_fence_after_section_5_with_no_header_field_text_still_imports():
+    text = ("# Plan: x\n\nPlan revision: r1\n\n## 5. Work items\n\n"
+           "| work_item | Phase | Owner (vendor) | Starts when |\n|---|---|---|---|\n"
+           "| task-a | 1 | dev | ready |\n\n"
+           "## 6. Notes\n\n```\njust an ordinary example, nothing header-shaped here\n```\n")
+    _, _, _, _, rows, skipped, problems = F._parse_plan(text)
+    assert problems == [] and skipped == []
+    assert [r["work_item"] for r in rows] == ["task-a"]
+
+
 def test_import_refuses_when_only_a_later_section_has_a_table(tmp_path):
     store = new_store(tmp_path)
     F.import_plan(store, write(tmp_path / "plan.md", PLAN))

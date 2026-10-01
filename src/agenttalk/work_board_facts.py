@@ -537,17 +537,41 @@ def _parse_plan(text):
     skipped is NOT the same thing and is a (fatal) problem instead: "everything skipped" must
     never be silently treated as an intentional empty-plan clear."""
     problems = []
-    title = _PLAN_TITLE.search(text)
-    plan_name = title.group(1) if title else None
-    if not plan_name:
+    # Header fields (the title, "Plan id:" and "Plan revision:") are read ONLY from the
+    # header block - the lines before the first raw "## " heading - counted across the WHOLE
+    # file with no fence-awareness, exactly like the section-5 heading count. Without this, a
+    # fenced example placed AFTER section 5 (itself perfectly allowed) could carry its own
+    # "Plan id: ..." line that silently won, importing under an unrelated, hijacked id and
+    # overwriting whatever plan already used it (reviewer-found data loss).
+    first_heading = _NEXT_HEADING.search(text)
+    header_end = first_heading.start() if first_heading else len(text)
+
+    def header_only(pattern, name):
+        """[matches] in the WHOLE file if every one sits inside the header block and there is
+        at most one; else appends a problem naming ``name`` and returns None. Zero matches
+        returns [] with no problem - the caller decides whether that absence is itself fatal."""
+        matches = list(pattern.finditer(text))
+        if any(m.start() >= header_end for m in matches):
+            problems.append(f"'{name}' must appear only in the plan's header, before its "
+                            "first '## ' heading")
+            return None
+        if len(matches) > 1:
+            problems.append(f"plan must contain at most one {name!r} line")
+            return None
+        return matches
+
+    titles = header_only(_PLAN_TITLE, "# Plan: <name>")
+    plan_name = titles[0].group(1) if titles else None
+    if titles is not None and not plan_name:
         problems.append("missing a '# Plan: <name>' title line")
     # The field's PRESENCE is detected separately from its validity: a "Plan id:" line that is
     # blank or has more than one token must REFUSE, never silently fall back to the title slug
     # (reviewer-found: the old regex required the whole line to be one token, so a malformed
     # line simply failed to match at all, and this code could not tell "no line" from "bad line").
-    id_line = _PLAN_ID_LINE.search(text)
+    id_lines = header_only(_PLAN_ID_LINE, "Plan id:")
     explicit_id = None
-    if id_line is not None:
+    if id_lines:
+        id_line = id_lines[0]
         tokens = id_line.group(1).split()
         if len(tokens) != 1 or not _SLUG.fullmatch(tokens[0]):
             problems.append(f"'Plan id:{id_line.group(1)}' is not a single lowercase slug "
@@ -557,9 +581,9 @@ def _parse_plan(text):
     plan_id = explicit_id if explicit_id is not None else (plan_id_of(plan_name) if plan_name else None)
     if explicit_id is None and plan_name and plan_id is None:
         problems.append(f"plan title {plan_name!r} does not yield a usable plan id; add a 'Plan id:' line")
-    rev = _PLAN_REV.search(text)
-    plan_rev = rev.group(1) if rev else None
-    if not plan_rev:
+    revs = header_only(_PLAN_REV, "Plan revision:")
+    plan_rev = revs[0].group(1) if revs else None
+    if revs is not None and not plan_rev:
         problems.append("missing a 'Plan revision: rN' line")
     header, data, table_problem = _plan_table(text)
     if table_problem:
@@ -569,12 +593,19 @@ def _parse_plan(text):
         problems.append("missing a '## 5. Work items' section with a table")
         return plan_id, explicit_id, plan_name, plan_rev, [], [], problems
     norm = [re.sub(r"\s+", " ", c).strip().lower() for c in header]
-
-    def col(*names):
-        return next((norm.index(n) for n in names if n in norm), None)
-
-    cols = {"work_item": col("work_item"), "phase": col("phase"),
-            "owner": col("owner (vendor)", "owner"), "starts_when": col("starts when")}
+    field_names = {"work_item": ("work_item",), "phase": ("phase",),
+                  "owner": ("owner (vendor)", "owner"), "starts_when": ("starts when",)}
+    cols, duplicate = {}, []
+    for key, names in field_names.items():
+        idx = [i for i, n in enumerate(norm) if n in names]
+        if len(idx) > 1:
+            duplicate.append(key)
+        cols[key] = idx[0] if idx else None
+    if duplicate:
+        # A repeated required column name used to silently take the FIRST one (reviewer-found):
+        # refuse instead, rather than guess which column the author meant.
+        problems.append("section 5 table header repeats required column(s): " + ", ".join(sorted(duplicate)))
+        return plan_id, explicit_id, plan_name, plan_rev, [], [], problems
     missing = [k for k, i in cols.items() if i is None]
     if missing:
         problems.append("section 5 table is missing column(s): " + ", ".join(sorted(missing)))
