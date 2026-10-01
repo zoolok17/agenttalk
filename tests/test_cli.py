@@ -2250,13 +2250,21 @@ def test_task_ignores_senders_own_stale_health_for_the_version_gate(
     # The sender is obviously current (it is running this exact check) - its
     # own possibly-absent/stale health.json must never self-block a task.
     store.set_role("alpha", "lead")
-    # The peer advertises the CURRENT package version: the gate compares
-    # against the sender's own running major.minor, so a literal pin here
-    # would go red on every release bump (it did on 0.89.0).
+    # The peer advertises the CURRENT package version: it is far above the
+    # 0.88.0 task-kind floor, so the gate accepts it. (Under the old
+    # "no peer older than me" rule this pinned literal went red on every
+    # release bump - it did on 0.89.0; the fixed floor made that class of
+    # test breakage impossible.)
     from agenttalk import __version__
     store.write_health("beta", {"agenttalk_version": __version__})
     rc = _run(["task", "--from", "alpha", "--to", "beta", "-m", "go"], store_root)
     assert rc == 0
+    # The `exclude` skip is pinned at the function level too: the sender
+    # never counts as behind, even if it were listed as a recipient and
+    # never advertised a version itself.
+    assert cli._recipients_behind_kind(store, ["alpha", "beta"],
+                                       kind="task",
+                                       exclude="alpha") == []
 
 
 def test_task_accepts_recipient_exactly_at_the_floor(
@@ -2293,6 +2301,7 @@ def test_task_ignores_non_recipient_roster_members_below_the_floor(
     # does not receive it must not block the dispatch (the old gate scanned
     # the WHOLE roster against the sender's own version).
     store.set_role("alpha", "lead")
+    store.add_agent("gamma")  # a REAL roster member, so a whole-roster scan sees it
     store.write_health("beta", {"agenttalk_version": "0.90.0"})
     store.write_health("gamma", {"agenttalk_version": "0.80.0"})
     rc = _run(["task", "--from", "alpha", "--to", "beta", "-m", "go"], store_root)
@@ -2324,7 +2333,12 @@ def test_broadcast_task_kind_gates_on_resolved_audience_not_roster(
     # block; one INSIDE it must.
     root = _role_root(tmp_path)  # lead, rev-a, rev-b, impl-c
     assert _run(["roster", "set-role", "lead", "lead"], root) == 0  # sole lead
-    Store(root).write_health("impl-c", {"agenttalk_version": "0.80.0"})
+    s = Store(root)
+    # Audience seats advertise a current version (>= the 0.88.0 floor);
+    # impl-c is below the floor but OUTSIDE the audience.
+    s.write_health("rev-a", {"agenttalk_version": "0.94.0"})
+    s.write_health("rev-b", {"agenttalk_version": "0.94.0"})
+    s.write_health("impl-c", {"agenttalk_version": "0.80.0"})
 
     # impl-c is below the floor but OUTSIDE the audience: no block.
     rc = _run(["broadcast", "--from", "lead", "--to-role", "reviewer",
