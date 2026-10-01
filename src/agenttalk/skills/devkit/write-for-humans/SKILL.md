@@ -1,13 +1,13 @@
 ---
 name: write-for-humans
 description: >-
-  Write anything a person will read (release notes, changelog entries, pull request
-  descriptions, issue and review comments, status reports) so that someone who does
-  not program understands what changed, why it matters and what they will notice.
-  Same facts, explained in plain words, with the technical detail moved to the end.
-  Use whenever the reader may not be a developer. Do NOT use for code comments (use
-  craft-code), for reference, tutorial or how-to documentation pages (use write-docs),
-  or for reviewing existing documentation (use review-docs).
+  Write release notes, changelog entries, pull request descriptions, issue and review
+  comments, and status reports so that someone who does not program understands what
+  changed, why it matters and what they will notice. Same facts, explained in plain
+  words, with the technical detail moved to the end. Use only for those kinds of text.
+  Do NOT use for answering questions, plans or design discussions, for code comments
+  (use craft-code), for reference, tutorial or how-to documentation pages (use
+  write-docs), or for reviewing existing documentation (use review-docs).
 reviewed-against: "0.94"
 category: production
 evidence-profile:
@@ -30,12 +30,18 @@ summarised safely, never moved to the end (see PRECISION WITHOUT CLUTTER).
 ## WHO: the reader
 - [ ] They use the product, pay for it or decide about it. They do not read the code.
 - [ ] They know what the product is for, but not how it works inside.
-- [ ] They read to answer four questions: **What changed? Why should I care? What
-      will I notice? Do I need to do anything?** Answer all four.
+- [ ] When you describe a change, they read to answer four questions: **What
+      changed? Why should I care? What will I notice? Do I need to do anything?**
+      Answer all four. Review comments and status reports answer their own
+      questions (see TEMPLATES).
 - [ ] Length is fine. A longer text in plain words beats a short one full of
       jargon. Do not compress to look efficient.
 
 ## ORDER: write in this order
+This order is for text that describes a change: release notes, changelog entries
+and pull request descriptions. Review comments and status reports follow their own
+templates below, without a "before" and a "now".
+
 1. **What changed, for the user.** One or two sentences, told from the user's side.
    "Reminders no longer arrive twice", not "Fixed duplicate dispatch in the
    notifier".
@@ -52,8 +58,11 @@ summarised safely, never moved to the end (see PRECISION WITHOUT CLUTTER).
       time, in plain words: "a cache (a saved copy kept so pages load faster)".
 - [ ] Give examples from the reader's world: the shopping basket, the to-do list,
       tomorrow's forecast.
-- [ ] Keep numbers exact, but say what they mean: "the page now loads in 1 second
-      instead of 6", not only "p95 latency down 83%".
+- [ ] Keep numbers exact, and say what they mean without inventing new ones.
+      "p95 latency down 83%" becomes "the time that 95 out of 100 page loads stay
+      under (the p95) dropped by 83%". Give before and after values ("from 6
+      seconds to 1") only when the source measured them; never work them out
+      from a percentage.
 - [ ] Be honest about limits: "we have not tested this on phones yet" is better
       than silence.
 - [ ] Never let one plain phrase stand for two different facts. "Released" means
@@ -79,7 +88,9 @@ Instead of this, say that:
 | timeout | gave up waiting after N seconds |
 | memory leak | the program kept using more memory and never gave it back |
 | lock | a rule that lets only one thing change something at a time |
-| null, undefined | missing or empty |
+| null | there, but set to "no value" on purpose |
+| undefined, absent | left out: the field is not there at all |
+| empty string, empty list | there, but empty: no text, or a list with nothing in it |
 | PR, pull request | a proposed change, waiting for review |
 | commit ID, SHA, file path | (move to Technical details) |
 
@@ -147,10 +158,20 @@ Nothing to do.
 
 ### Issue and review comments
 A review finding is a small story: what is wrong, why it matters, what to do.
-If your review process gives each finding a severity tag (P1, P2 and so on, or
-any other scale), keep that tag exactly as the process requires, at the start,
-so findings can still be sorted and counted. The plain-language "why it matters"
-goes next to the tag. It explains the tag; it never replaces it.
+
+When the review skill or process you work in sets its own comment format (for
+example `label (decoration): subject` followed by a one-line reason), keep that
+format exactly: the same fields, labels, severity tags and order. This skill only
+changes the words inside it: a subject a non-programmer understands, and a reason
+that says who is affected and how badly. For example: **issue (blocking): if two
+people buy the last item at the same moment, both orders go through.** One of them
+pays for something we cannot send; it is rare, but it happens on busy sale days.
+
+When no format is set, use the template below. If your review process gives each
+finding a severity tag (P1, P2 and so on, or any other scale), keep that tag
+exactly as the process requires, at the start, so findings can still be sorted and
+counted. The plain-language "why it matters" goes next to the tag. It explains the
+tag; it never replaces it.
 ```markdown
 **<severity tag, unchanged> What I found:** <one sentence a non-programmer
 understands>.
@@ -177,8 +198,11 @@ suggest:** check the stock again just before taking the payment.
 - [ ] Would someone who has never programmed understand every sentence of the
       main text?
 - [ ] Is every technical term either avoided or explained the first time?
-- [ ] Is "what you will notice" there, with a before and a now?
-- [ ] Is "what you need to do" there, even if it is "nothing"?
+- [ ] For a release note, changelog entry or pull request description: is "what
+      you will notice" there, with a before and a now?
+- [ ] Is it clear what the reader needs to do or decide, even if it is "nothing"?
+- [ ] For a review comment: is the review's own format kept, with its severity
+      tag?
 - [ ] Are paths, IDs and code names only in Technical details, and does the main
       text still make sense without them?
 - [ ] Did every fact from the technical version survive?

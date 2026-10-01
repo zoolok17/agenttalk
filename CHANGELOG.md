@@ -28,9 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the technical details.
 
   It comes with templates for release notes, pull request descriptions, review
-  comments (which keep their severity tag) and status reports, plus a checklist
-  to run before posting. When it is used inside another skill's work, such as a
-  review, that skill's evidence rules still apply.
+  comments (which keep the review's own format and severity tag) and status
+  reports, plus a checklist to run before posting. When it is used inside
+  another skill's work, such as a review, that skill's evidence rules still
+  apply.
 
   What you will notice: agents that write for you should start explaining
   their work in plain language, at greater length. Nothing to do: the skill is

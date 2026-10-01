@@ -477,12 +477,12 @@ def test_lead_skills_carry_the_writing_rules_without_the_devkit(tmp_path: Path) 
     codex_lead = _flat((codex_dir / "agenttalk-lead" / "SKILL.md").read_text(encoding="utf-8"))
     rule = (
         "use the write-for-humans skill if it is installed. If it is not, follow its "
-        "three core rules: (1) write in this order: what changed, why it matters, what "
-        "they will notice, what they need to do; (2) use plain words, and explain any "
-        "technical term you cannot avoid the first time; (3) keep every fact, with file "
-        "names, IDs and test names in a Technical details section at the end, but never "
-        "include secrets, private data or internal-only addresses, not even there. A "
-        "review finding keeps its severity tag."
+        "three core rules: (1) to describe a change, write in this order: what changed, "
+        "why it matters, what they will notice, what they need to do; (2) use plain "
+        "words, and explain any technical term you cannot avoid the first time; (3) keep "
+        "every fact, with file names, IDs and test names in a Technical details section "
+        "at the end, but never include secrets, private data or internal-only addresses, "
+        "not even there. A review comment keeps the review's own format and severity tag."
     )
     assert rule in claude_lead
     assert rule in codex_lead
@@ -518,14 +518,65 @@ def test_write_for_humans_review_comments_keep_the_severity_tag() -> None:
     assert "**P1. What I found:**" in comments
 
 
+def test_write_for_humans_keeps_the_calling_review_format() -> None:
+    text = (SKILLS_ROOT / "devkit" / "write-for-humans" / "SKILL.md").read_text(encoding="utf-8")
+    comments = _flat(text.split("### Issue and review comments", 1)[1].split("\n### ", 1)[0])
+    own_format = comments.index("keep that format exactly: the same fields, labels, severity "
+                                "tags and order")
+    assert own_format < comments.index("When no format is set, use the template below")
+    assert "This skill only changes the words inside it" in comments
+
+
+def _rows(text: str) -> dict[str, str]:
+    return {ln.split("|")[1].strip(): ln.split("|")[2].strip()
+            for ln in text.splitlines() if ln.startswith("| ") and ln.count("|") == 3}
+
+
 def test_write_for_humans_keeps_release_and_deploy_apart() -> None:
     text = (SKILLS_ROOT / "devkit" / "write-for-humans" / "SKILL.md").read_text(encoding="utf-8")
-    rows = {ln.split("|")[1].strip(): ln.split("|")[2].strip()
-            for ln in text.splitlines() if ln.startswith("| ") and ln.count("|") == 3}
+    rows = _rows(text)
     assert "release, publish" in rows and "deploy, roll out" in rows
     assert rows["release, publish"] != rows["deploy, roll out"]
     assert "available to install" in rows["release, publish"]
     assert "now using it" in rows["deploy, roll out"]
+
+
+def test_write_for_humans_keeps_null_absent_and_empty_apart() -> None:
+    text = (SKILLS_ROOT / "devkit" / "write-for-humans" / "SKILL.md").read_text(encoding="utf-8")
+    rows = _rows(text)
+    states = [rows["null"], rows["undefined, absent"], rows["empty string, empty list"]]
+    assert len(set(states)) == 3
+    assert "not there at all" in rows["undefined, absent"]
+    assert "there, but empty" in rows["empty string, empty list"]
+
+
+def test_write_for_humans_never_invents_numbers_from_a_percentage() -> None:
+    text = _flat((SKILLS_ROOT / "devkit" / "write-for-humans" / "SKILL.md").read_text(encoding="utf-8"))
+    assert "1 second instead of 6" not in text
+    assert "only when the source measured them; never work them out from a percentage" in text
+    assert "(the p95) dropped by 83%" in text
+
+
+def test_write_for_humans_before_and_now_only_for_changes() -> None:
+    text = (SKILLS_ROOT / "devkit" / "write-for-humans" / "SKILL.md").read_text(encoding="utf-8")
+    order = _flat(text.split("## ORDER", 1)[1].split("\n## ", 1)[0])
+    assert order.index("This order is for text that describes a change") < order.index("1. ")
+    assert "Review comments and status reports follow their own templates" in order
+    check = _flat(text.split("## SELF-CHECK", 1)[1].split("\n## ", 1)[0])
+    assert ("For a release note, changelog entry or pull request description: is \"what "
+            "you will notice\" there") in check
+
+
+def test_write_for_humans_triggers_only_on_its_artifacts() -> None:
+    text = (SKILLS_ROOT / "devkit" / "write-for-humans" / "SKILL.md").read_text(encoding="utf-8")
+    description = _flat(text.split("description: >-", 1)[1].split("\nreviewed-against:", 1)[0])
+    assert "anything a person will read" not in description
+    assert "whenever the reader may not be a developer" not in description
+    assert description.startswith(
+        "Write release notes, changelog entries, pull request descriptions, issue and "
+        "review comments, and status reports")
+    assert "Use only for those kinds of text." in description
+    assert "Do NOT use for answering questions, plans or design discussions" in description
 
 
 def test_write_for_humans_samples_ship_in_the_sdist() -> None:
