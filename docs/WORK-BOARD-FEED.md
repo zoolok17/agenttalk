@@ -191,6 +191,15 @@ plain, versioned, portable contract — any plan file in this shape is
 understood, without needing the lead's own private template
 (`plan-template.md`, kept outside this repository).
 
+Two commands write it (`import-plan`, `retire-plan`, below) and one design
+principle governs both, and reading the result back: **fail closed on
+anything unexpected, and bound every output.** Concretely: parse exactly one
+table, not everything that looks table-shaped in the section; refuse a write
+rather than silently treat a oddly-shaped stored section as empty; capture
+the session once, before any read, and re-check it right before the write;
+and cap what a corrupted store can make the board say, so it can never push
+real cards out of the response.
+
 ### Commands
 
 `agenttalk board import-plan <file>` reads one plan file and records its
@@ -198,6 +207,12 @@ section 5 rows in the facts file wb-done-facts created above
 (`.agenttalk/state/work-board-facts.json`), in their own `planned` section.
 The existing `integration` section, and every OTHER plan's rows, are left
 exactly as they were. It never runs Git and never touches the bus.
+
+Section 5's table is the FIRST CONTIGUOUS run of `|`-prefixed lines directly
+under the `## 5. Work items` heading (leading blank lines are skipped; the
+table ends at the first line after it that is not a table row). Anything
+past that — prose, a second table further down the section (a "Legend:",
+say) — is never read, by construction; it is not a reason to refuse.
 
 It exits 2, having published nothing, when the plan file:
 
@@ -208,32 +223,71 @@ It exits 2, having published nothing, when the plan file:
   characters, or (with no explicit line) a title that yields no usable slug
   (see **Plan id** below);
 - has no `Plan revision: rN` line;
-- has no `## 5. Work items` section, or that section has no table, or the
-  table is missing the `work_item`, `Phase`, `Owner (vendor)` (or `Owner`) or
-  `Starts when` column;
+- has no `## 5. Work items` section, no table directly under it, or the
+  table's second line is not a separator row of the same width as the
+  header, or the table is missing the `work_item`, `Phase`, `Owner (vendor)`
+  (or `Owner`) or `Starts when` column;
 - has a table row whose `work_item` is not a lowercase slug of at most 64
   characters, or that repeats a `work_item` already seen in this plan's own
   table;
 - derives its plan id from the title (no explicit `Plan id:` line) and that
   id already names a DIFFERENT plan's stored rows (a title collision — see
   **Plan id**);
-- would leave the facts file over its 512 KiB size bound.
+- is a non-empty table where EVERY row was skipped (see below) — this is
+  never the same as an intentionally empty table, and never silently clears
+  the plan;
+- would leave the facts file over its 512 KiB size bound;
+- finds the CURRENTLY STORED `planned` section present but not in exactly
+  the expected shape (every container level type-checked — see **Fail
+  closed on the stored shape** below), or finds the store's session has
+  changed since the command started (a concurrent reset).
 
 A table row is SKIPPED, with a reason, rather than failing the whole import,
 when it has an empty `Phase`, `Owner` or `Starts when` cell, or the wrong
 number of cells for the header (a markdown authoring slip, or an unescaped
 `|` inside a cell — see **Escaped pipes** below). The rest of the plan still
-imports around it; the command lists every skipped row (and so does the
-`--json` output, under `skipped`). A table with a valid header and ZERO
-surviving rows — written empty, or emptied by skipping every row — is a
-valid, empty plan: this is how a plan's rows are cleared without retiring it
-outright. Otherwise the command exits 0.
+imports around it, as long as at least one row survives; the command lists
+every skipped row (and so does the `--json` output, under `skipped`). A
+table with a valid header and separator and ZERO data rows FROM THE START is
+a valid, empty plan — this is how a plan's rows are cleared without retiring
+it outright. A table that had rows but lost every one of them to skipping is
+NOT the same thing: that refuses (see above), it never clears silently.
+Otherwise the command exits 0.
 
 `agenttalk board retire-plan <plan id>` atomically removes one plan id's
 rows from the `planned` section — for a plan that is done, abandoned, or
 renamed without keeping its old id. It exits 2, publishing nothing, if no
-rows are currently recorded for that plan id. Every other plan id's rows and
-the `integration` section are untouched either way.
+rows are currently recorded for that plan id, the stored section is present
+but not in the expected shape, or the session has changed since the command
+started. Every other plan id's rows and the `integration` section are
+untouched either way.
+
+### Fail closed on the stored shape
+
+Before EITHER command writes anything, the planned section's CURRENT stored
+value (if any) is validated at every container level: the schema version,
+the `plans` map itself, every plan id (a lowercase slug) and every entry in
+it (exact key set, non-empty string fields, a valid `rows` list). A section
+that is present but does not match this exactly — a `plans` container that
+is a list instead of a map, say — refuses the write outright. It is never
+silently treated as "empty" and overwritten: that would durably discard
+whatever it held, which looks identical to the data simply never having
+existed. The server's own read side (below) stays more forgiving for
+DISPLAY — one malformed plan there is dropped and the rest of the board
+still renders — but a WRITE never guesses at a shape it cannot verify.
+
+### Session capture
+
+Both commands capture `(project, session)` once, before reading anything —
+the plan file, the facts file, or the store's roster. The read, the build of
+the new section value, and the publish all happen under the one facts lock.
+Immediately before the atomic replace, the session is re-checked against a
+fresh read; if it no longer matches what was captured at the start — a
+concurrent `agenttalk reset` landed anywhere in between, including between
+the facts file's own read and this check — the write is refused and nothing
+is published. This is the same mechanism `verify-merges` already used for
+the `integration` section, now shared by both sections through one explicit
+parameter on the shared writer, rather than two different ad hoc checks.
 
 ### The import contract
 
@@ -278,6 +332,7 @@ the `integration` section are untouched either way.
 ```json
 "planned": {
   "schema_version": 1,
+  "session_id": "<the store session this was last written under>",
   "plans": {
     "board-lanes-and-the-v2-team-views": {
       "project": "<project id>",
@@ -296,10 +351,19 @@ the `integration` section are untouched either way.
 
 The snapshot worker reads this section on every refresh, bounded and
 schema-checked exactly like `integration` above: a missing, malformed or
-wrong-schema section gives no planned rows and a warning in `errors`, never a
+wrong-schema section gives no planned rows and one `errors` warning, never a
 broken board. A plan whose `project` does not match the current store is
 excluded without a warning (it belongs to another project's facts file, nothing
-changed here to report).
+changed here to report). Unlike the write path's all-or-nothing shape check
+above, reading is per-plan: one malformed stored plan entry is dropped with
+its own warning, and every OTHER plan still loads and still shows on the
+board. However many plans are malformed, the warning list is capped (the
+first 5, then one "and N more" line) — a corrupted store with thousands of
+bad entries can never grow this list large enough to push real cards out of
+the response's byte budget. Planned cards themselves carry the same
+protection from the other direction: they are appended after every
+dispatched card, so the response's existing 100-card/256 KiB bounds always
+cut Planned cards first, never active work.
 
 ### How a plan row becomes a card
 

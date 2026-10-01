@@ -211,6 +211,32 @@ def test_real_eight_column_plan_imports_exactly_its_seven_rows():
     assert [r["work_item"] for r in rows] == REAL_PLAN_WORK_ITEMS
 
 
+def test_a_prose_line_between_the_heading_and_the_table_is_skipped():
+    # The real plan file's own template has one sentence ("Dispatches carry ...") between the
+    # "## 5. Work items" heading and the table itself - the parser must look PAST prose to find
+    # where the table starts, not require the table to be the literal first line.
+    text = ("# Plan: x\n\nPlan revision: r1\n\n## 5. Work items\n"
+           "Dispatches carry some prose that is not a table row.\n\n"
+           "| work_item | Phase | Owner (vendor) | Starts when |\n|---|---|---|---|\n"
+           "| a | 1 | x | y |\n")
+    _, _, _, _, rows, skipped, problems = F._parse_plan(text)
+    assert problems == [] and skipped == []
+    assert [r["work_item"] for r in rows] == ["a"]
+
+
+def test_a_second_later_table_in_section_5_is_never_read():
+    # Recast principle A: parse exactly the FIRST contiguous table. A "Legend:" table further
+    # down section 5 must never become bogus Planned cards (reviewer-found).
+    text = ("# Plan: x\n\nPlan revision: r1\n\n## 5. Work items\n\n"
+           "| work_item | Phase | Owner (vendor) | Starts when |\n|---|---|---|---|\n"
+           "| task-a | 1 | dev | ready |\n"
+           "\nLegend:\n\n| code | phase | owner | meaning |\n|---|---|---|---|\n"
+           "| note | x | y | z |\n")
+    _, _, _, _, rows, skipped, problems = F._parse_plan(text)
+    assert problems == [] and skipped == []
+    assert [r["work_item"] for r in rows] == ["task-a"]
+
+
 def test_header_only_table_with_no_separator_refuses():
     # FIX round 2 P1/F3: a header line with no separator line at all used to parse as a
     # valid, empty table (zero data rows) instead of a malformed one.
@@ -374,6 +400,71 @@ def test_one_malformed_stored_plan_is_isolated_others_still_load(tmp_path):
     assert any("corrupt" in w for w in loaded["warnings"])
 
 
+# ------------------------------------------------------- recast B: fail closed on stored shape
+
+def test_import_refuses_when_the_stored_plans_container_is_not_a_map(tmp_path):
+    # Recast principle B: a "plans" container that is a LIST (not a map) must refuse the write,
+    # never be silently treated as empty - that would let the next import overwrite it for good
+    # (reviewer-found data loss).
+    store = new_store(tmp_path)
+    F.import_plan(store, write(tmp_path / "plan.md", PLAN))
+    facts = store.state_dir / F.FACTS_FILE
+    doc = json.loads(facts.read_text(encoding="utf-8"))
+    doc["planned"]["plans"] = [doc["planned"]["plans"]]
+    facts.write_text(json.dumps(doc), encoding="utf-8")
+    corrupted = facts.read_bytes()
+    with pytest.raises(F.PlanRefused, match="not in the expected shape"):
+        F.import_plan(store, write(tmp_path / "plan2.md", PLAN))
+    assert facts.read_bytes() == corrupted  # untouched by the refused import
+
+
+def test_retire_refuses_when_a_stored_entry_has_the_wrong_keys(tmp_path):
+    store = new_store(tmp_path)
+    F.import_plan(store, write(tmp_path / "plan.md", PLAN))
+    facts = store.state_dir / F.FACTS_FILE
+    doc = json.loads(facts.read_text(encoding="utf-8"))
+    doc["planned"]["plans"][PLAN_ID]["extra_unexpected_key"] = "x"
+    facts.write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(F.PlanRefused, match="not in the expected shape"):
+        F.retire_plan(store, PLAN_ID)
+
+
+# -------------------------------------------------------------- recast D: bounded output
+
+def test_thousands_of_malformed_plans_give_a_capped_warning_list_not_an_unbounded_one(tmp_path):
+    store = new_store(tmp_path)
+    facts = store.state_dir / F.FACTS_FILE
+    facts.parent.mkdir(parents=True, exist_ok=True)
+    doc = {"schema_version": 1,
+          "planned": {"schema_version": 1, "plans": {f"p{i:05}": None for i in range(6000)}}}
+    facts.write_text(json.dumps(doc), encoding="utf-8")
+    loaded = F.load_planned(store, store.load_config())
+    assert loaded["plans"] == {}
+    assert len(loaded["warnings"]) == F._MAX_PLANNED_WARNINGS + 1
+    assert "and " in loaded["warnings"][-1] and "more" in loaded["warnings"][-1]
+
+
+def test_bounded_warnings_never_push_active_cards_out_of_the_feed(tmp_path):
+    # The reviewer's own end-to-end reproduction: thousands of planned warnings used to grow
+    # feed["errors"] large enough that bounded()'s byte-trim popped every real card before ever
+    # touching errors. With the cap, the real card survives.
+    store = new_store(tmp_path, [LEAD, BUILDER, REVIEWER])
+    facts = store.state_dir / F.FACTS_FILE
+    doc = {"schema_version": 1,
+          "planned": {"schema_version": 1, "plans": {f"p{i:05}": None for i in range(6000)}}}
+    facts.write_text(json.dumps(doc), encoding="utf-8")
+    bus = Bus()
+    build = bus.task("tk-build", BUILDER, "build", item="wb-done-facts", **POLICY)
+    bus.reply(build, verdict="done")
+    read = bus.task("tk-read", REVIEWER, "read", item="wb-done-facts", work_head="a" * 40)
+    bus.reply(read, verdict="GO")
+    for m in bus.messages:
+        (store.messages_dir / f"{m.id}.json").write_text(json.dumps(m.to_dict()), encoding="utf-8")
+    items, feed = board(store)
+    assert "wb-done-facts" in items  # the real, active card survives
+    assert any("planned section" in e or "malformed" in e for e in feed["errors"])
+
+
 def test_import_and_retire_tag_the_current_session(tmp_path):
     store = new_store(tmp_path)
     F.import_plan(store, write(tmp_path / "plan.md", PLAN))
@@ -381,13 +472,12 @@ def test_import_and_retire_tag_the_current_session(tmp_path):
     assert doc["planned"]["session_id"] == store.load_config()["session_id"]
 
 
-def test_import_refuses_if_the_session_changes_between_build_and_write(tmp_path, monkeypatch):
-    # FIX round 2 F4: the planned section now carries session_id, so the SAME generic guard
-    # _write_section already applies to the integration section fires here too, if the store's
-    # session changes between build() computing the new section and _write_section's own fresh
-    # re-read immediately after. (A real store.reset() cannot run INSIDE the held facts lock -
-    # the project's own lock-order guard forbids it - so this directly fakes the config read
-    # build() sees, rather than performing a real concurrent reset.)
+def test_import_refuses_if_the_session_changes_before_the_internal_read(tmp_path, monkeypatch):
+    # Recast principle C: project/session are now captured ONCE at the very start of
+    # import_plan, before ANY read - so a session change at ANY point after that, including
+    # before _write_section's own internal _read, is caught by the fresh re-check immediately
+    # before the atomic write. (Earlier this round, capturing session_id inside build() meant a
+    # reset before build() ran went undetected - exactly the reviewer's "F4 still open" finding.)
     store = new_store(tmp_path)
     F.import_plan(store, write(tmp_path / "plan.md", PLAN))
     real_load_config, calls = store.load_config, {"n": 0}
@@ -395,30 +485,59 @@ def test_import_refuses_if_the_session_changes_between_build_and_write(tmp_path,
     def flaky_load_config():
         calls["n"] += 1
         cfg = dict(real_load_config())
-        if calls["n"] == 1:  # the read build() uses to tag the new section
+        if calls["n"] == 1:  # import_plan's OWN capture, at its very first line
             cfg["session_id"] = "stale-session"
-        return cfg  # every later read (_write_section's own check) sees the REAL session
+        return cfg  # every later read (inside build(), and _write_section's own check) is real
 
     monkeypatch.setattr(store, "load_config", flaky_load_config)
     with pytest.raises(F.PlanRefused, match="store session changed"):
         F.import_plan(store, write(tmp_path / "plan2.md", PLAN))
+    assert PLAN_ID in F.load_planned(store, store.load_config())["plans"]  # the first import stands
 
 
-def test_import_succeeds_across_a_reset_that_happens_before_the_write(tmp_path, monkeypatch):
-    # The companion case: a reset that happens BEFORE any of import-plan's own store-dependent
-    # work (project/session are read fresh, inside build(), under the lock) is simply the new,
-    # current store - there is nothing stale to refuse. Matches the reviewer's own probe.
+@pytest.mark.parametrize("operation", ["import", "retire"])
+def test_refuses_across_a_real_reset_after_the_internal_read(tmp_path, operation):
+    # The reviewer's own exact interleave (probe_round2.py): a REAL Store.reset(), on an
+    # independent thread, synchronously waited, landing right after _write_section's own
+    # _read(path) returns (which is itself AFTER import_plan/retire_plan's session capture) but
+    # before build() runs. Without principle C this resurrected the pre-reset plan's rows into
+    # the new session; with it, the stale capture no longer matches the fresh re-check and the
+    # write is refused - nothing is resurrected.
+    from concurrent.futures import ThreadPoolExecutor
+
+    from agenttalk.store import Store
+
     store = new_store(tmp_path)
-    real_write_section = F._write_section
+    F.import_plan(store, write(tmp_path / "plan.md", PLAN))
+    other = PLAN.replace("# Plan: board lanes and the v2 team views", "# Plan: another plan"
+                         ).replace("Plan revision: r2", "Plan revision: r1")
+    F.import_plan(store, write(tmp_path / "other.md", other))
+    before_session = store.load_config()["session_id"]
+    original_read = F._read
 
-    def reset_then_write(store_arg, name, section=None, *, build=None, refuse_cls=F.VerifyRefused):
-        store_arg.reset()
-        return real_write_section(store_arg, name, build=build, refuse_cls=refuse_cls)
+    def reset_after_read(path):
+        result = original_read(path)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(Store(store.root).reset).result(10)
+        assert store.load_config()["session_id"] != before_session
+        return result
 
-    monkeypatch.setattr(F, "_write_section", reset_then_write)
-    result = F.import_plan(store, write(tmp_path / "plan.md", PLAN))
-    assert len(result["rows"]) == 3
-    assert PLAN_ID in F.load_planned(store, store.load_config())["plans"]
+    original_read_ref = F._read
+    F._read = reset_after_read
+    try:
+        if operation == "import":
+            new_plan = PLAN.replace("# Plan: board lanes and the v2 team views", "# Plan: a new plan"
+                                    ).replace("Plan revision: r2", "Plan revision: r3")
+            with pytest.raises((F.PlanRefused, OSError)):
+                F.import_plan(store, write(tmp_path / "new.md", new_plan))
+        else:
+            with pytest.raises((F.PlanRefused, OSError)):
+                F.retire_plan(store, "another-plan")
+    finally:
+        F._read = original_read_ref
+    retained = F.load_planned(store, store.load_config())["plans"]
+    assert "another-plan" not in retained  # not resurrected into the new session
+    assert "a-new-plan" not in retained  # the new import was refused, never published
 
 
 # -------------------------------------------------------------------------- plan identity (C)
@@ -528,7 +647,7 @@ def test_malformed_planned_section_is_no_rows_and_a_warning_never_breaks_the_boa
     facts.write_text(json.dumps(doc), encoding="utf-8")
     items, feed = board(store)
     assert "wb-planned-lane" not in items
-    assert any("planned facts schema unsupported" in e for e in feed["errors"])
+    assert any("planned section invalid" in e for e in feed["errors"])
 
 
 def test_planned_rows_are_cut_first_under_the_card_bound(tmp_path):
