@@ -11,6 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Work board: a Planned lane from the lead's plan files.** `agenttalk board
+  import-plan <file>` reads a plan's work-items table and records its rows in
+  the same facts file `verify-merges` writes to, in their own versioned
+  section. A plan row with no dispatch yet now shows on the board as Planned;
+  once the item is actually dispatched, the board shows its real progress
+  instead, never the plan's guess. A work item named in more than one plan
+  shows as Unknown rather than picking either plan silently. See
+  `docs/WORK-BOARD-FEED.md` for the full import contract.
 - **Work board: a Done lane from lead-run, Git-verified merge facts (#207).**
   The reducer could already place Done from integration evidence, but nothing
   supplied it. The new `agenttalk board verify-merges [--dry-run] [--json]`
