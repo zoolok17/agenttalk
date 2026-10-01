@@ -631,3 +631,83 @@ def test_write_for_humans_samples_ship_in_the_sdist() -> None:
     sdist = pyproject.split("[tool.hatch.build.targets.sdist]", 1)[1].split("\n[", 1)[0]
     assert '"/docs/examples/write-for-humans-samples.md"' in sdist
     assert (repo / "docs" / "examples" / "write-for-humans-samples.md").is_file()
+
+
+# ---------------------------------------------- the shared plain-language voice
+
+_VOICE_REL = Path("_shared") / "references" / "plain-language.md"
+
+
+def _voice() -> str:
+    return (SKILLS_ROOT / "devkit" / _VOICE_REL).read_text(encoding="utf-8")
+
+
+def _kind(letter: str) -> str:
+    return _voice().split(f"\n### {letter}. ", 1)[1].split("\n### ", 1)[0].split("\n## ", 1)[0]
+
+
+def test_plain_language_reference_ships_and_installs(tmp_path: Path) -> None:
+    assert (SKILLS_ROOT / "devkit" / _VOICE_REL).is_file()
+    cl, cx = tmp_path / "cl", tmp_path / "cx"
+    install(claude=False, codex=False, devkit=True, claude_skills_dir=cl, codex_skills_dir=cx)
+    assert (cl / _VOICE_REL).is_file() and (cx / _VOICE_REL).is_file()
+    assert "references/plain-language.md" in (SKILLS_ROOT / "devkit" / "_shared" / "SKILL.md").read_text(
+        encoding="utf-8")
+
+
+@pytest.mark.parametrize("skill, kind", [
+    ("write-for-humans", "kind A"),
+    ("write-docs", "kind B"),
+    ("review-docs", "kind B"),
+    ("craft-code", "kind C"),
+    ("craft-code", "kind D"),
+])
+def test_writing_skills_point_to_the_plain_language_voice(skill: str, kind: str) -> None:
+    text = _flat((SKILLS_ROOT / "devkit" / skill / "SKILL.md").read_text(encoding="utf-8"))
+    assert "../_shared/references/plain-language.md" in text
+    assert kind in text
+
+
+def test_write_for_humans_trigger_is_not_widened_by_the_shared_voice() -> None:
+    description = _flat(_skill().split("description: >-", 1)[1].split("\nreviewed-against:", 1)[0])
+    positive = description.split("Do NOT use", 1)[0]
+    for wider in ("documentation", "code comment", "interface", "README", "dashboard", "anything"):
+        assert wider not in positive
+    assert "Use only for those kinds of text." in positive
+
+
+def test_plain_language_kinds_carry_their_length_and_structure_rules() -> None:
+    kinds = {"A": "Release notes", "B": "Documentation", "C": "Code comments", "D": "Interface text"}
+    for letter, title in kinds.items():
+        section = _flat(_kind(letter))
+        assert section.startswith(title)
+        assert "- Length:" in section and "- Structure:" in section
+    assert 'opens with an **"In plain words"** summary' in _flat(_kind("B"))
+    assert "about 3 to 6 sentences" in _flat(_kind("B"))
+    assert "one or two sentences. Never an essay." in _flat(_kind("C"))
+    assert 'No "before" and "now".' in _flat(_kind("C"))
+    assert "as short as possible" in _flat(_kind("D"))
+    assert "never blames the reader" in _flat(_kind("D"))
+
+
+def test_plain_language_leaves_agent_messages_compact() -> None:
+    out_of_scope = _flat(_voice().split("\n## Out of scope: text for agents", 1)[1])
+    assert "Messages between agents, task briefs, bus traffic" in out_of_scope
+    assert "stay compact and precise" in out_of_scope
+    assert "every extra word costs input" in out_of_scope
+
+
+@pytest.mark.parametrize("rule", [
+    "**The plain words must be true for this case, not in general.**",
+    "ask what your plain version now claims that the original did not: where, which branch "
+    "or version, who, how many, how long, in what order.",
+    "Never invent a number, a name or a place that the source does not give.",
+    '"Released" means a new version can be installed; it does not mean anyone is using it yet.',
+    'field is there but set to "no value" on purpose (null), the field is left out entirely '
+    "(absent or undefined), or the field is there but empty (an empty text or an empty list).",
+])
+def test_write_for_humans_and_the_shared_voice_state_the_core_rules_alike(rule: str) -> None:
+    """write-for-humans keeps its own copy (a loader may show only SKILL.md), so the
+    shared voice and the skill must not drift apart."""
+    assert rule in _flat(_voice())
+    assert rule in _flat(_skill())

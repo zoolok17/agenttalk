@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **One plain-language voice for everything a person reads, not only release
+  notes.** The write-for-humans skill taught agents to explain changes in plain
+  words, but only in release notes, pull request descriptions, comments and
+  status reports. Documentation, code comments and the text on screen were
+  still written for programmers.
+
+  Now one shared guide describes the same voice for every kind of text a
+  person reads, each with its own length and shape:
+  - release notes and similar texts work as before;
+  - documentation (READMEs, guides, reference pages, the manual, specifications
+    and design documents) opens with a short "In plain words" summary of what
+    it is, who it is for and what you can do with it. Reference pages keep
+    every exact name and option, explained the first time it appears;
+  - code comments use plain words and say why, in one or two sentences; the
+    longer story goes in the commit message or the pull request;
+  - text on screen (labels, buttons, error messages) is as short as possible,
+    says what you can do next and never blames you.
+  Messages between agents stay short and exact: only agents read them, and
+  every extra word adds to what they must read, which counts against their
+  usage.
+
+  What you will notice: new and changed documents start with a plain summary,
+  and new comments and on-screen text read more plainly. Existing documents
+  are not rewritten just to change their voice. Nothing to do: the guide is
+  installed with the other skills by `agenttalk install-skills`.
+
+  Technical details: `src/agenttalk/skills/devkit/_shared/references/plain-language.md`
+  (kinds A to D plus an out-of-scope rule for agent text). `write-docs` now
+  also covers manuals, specifications and design documents, and its README
+  contract opens with the summary; `write-for-humans` (kind A), `write-docs`
+  and `review-docs` (kind B) and `craft-code` (kinds C and D) point to it; the
+  routing index gains a row for interface text. `write-for-humans`' trigger is
+  unchanged. Tests in `tests/test_install_skills.py`.
+
 ## [0.95.0] - 2026-10-01
 
 **In short:** the console server no longer keeps using more and more memory

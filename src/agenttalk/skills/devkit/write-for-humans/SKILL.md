@@ -27,6 +27,11 @@ to a short section at the end. The one exception is anything that must not be
 published, such as a password, a key or a customer's details: that is removed or
 summarised safely, never moved to the end (see PRECISION WITHOUT CLUTTER).
 
+The same voice is shared with the other writing skills (documentation, code comments,
+interface text) in ../_shared/references/plain-language.md. This skill owns kind A there:
+release notes, changelog entries, pull request descriptions, issue and review comments, and
+status reports.
+
 ## WHO: the reader
 - [ ] They use the product, pay for it or decide about it. They do not read the code.
 - [ ] They know what the product is for, but not how it works inside.

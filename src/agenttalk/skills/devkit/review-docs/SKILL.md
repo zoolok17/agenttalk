@@ -34,6 +34,11 @@ approve on "looks fine".
       or error path a real user would hit.
 - [ ] **Clarity & scannability** — scannable structure, descriptive headings, concise
       sentences, descriptive link text, code in code font.
+- [ ] **Voice** (../_shared/references/plain-language.md, kind B) — the document opens
+      with an "In plain words" summary and its plain words are true for this case;
+      reference material keeps exact names, flags and fields, explained the first time.
+      A missing summary or unexplained jargon is a minor finding; a plain paraphrase
+      that changes a fact is an accuracy finding (blocking).
 
 ## DRIFT GUARDS
 - [ ] No stale screenshots, paths, env-var names, command flags, or output blocks.

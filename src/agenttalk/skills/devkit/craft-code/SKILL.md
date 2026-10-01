@@ -49,6 +49,14 @@ Work the checklist top to bottom; don't skip the AFTER gate.
       loop indices). If a name needs a comment to explain it, rename it.
 - [ ] Comment **WHY**, not what: rationale, trade-offs, gotchas, non-obvious
       constraints. Delete comments that restate the code. No unexplained magic numbers.
+      Use plain words in one or two sentences, and spell out an abbreviation or a
+      project-specific term the first time it appears in a file; the full story goes
+      in the commit message or pull request (../_shared/references/plain-language.md,
+      kind C).
+- [ ] Interface text (labels, buttons, empty states, error messages, tooltips): as
+      short as possible, say what the person can do next, never blame the reader, and
+      never show a secret or an internal path (../_shared/references/plain-language.md,
+      kind D).
 - [ ] Handle errors **by expectedness**: fail fast on programmer bugs; exceptions for
       truly exceptional cases; explicit return/Result for expected domain failures.
       Never silently swallow an error; attach context. Design errors out of existence
