@@ -57,6 +57,24 @@ def test_windows_ci_job_ceiling_matches_the_windows_capacity_stopgap() -> None:
     assert "timeout_minutes: 120" not in workflow
 
 
+def test_xdist_parallel_is_scoped_to_posix_legs_by_the_matrix_not_dev_gate_py() -> None:
+    """ci-xdist-posix: the OS-scoped decision (two xdist workers on
+    Linux/macOS, Windows stays serial) must live in the workflow matrix
+    expression, never as a runtime platform check inside dev_gate.py (which
+    runs identically on every leg) - the two pytest-mode checks read only
+    an opaque env var, the same shape as the existing
+    AGENTTALK_AUTHORIZE_SYMLINK_DEVMODE/AGENTTALK_DEV_GATE_COMMITTED_SRC
+    precedents."""
+    workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")
+    assert (
+        "AGENTTALK_DEV_GATE_POSIX_PARALLEL: ${{ matrix.os.id != 'windows' && '1' || '' }}"
+        in workflow
+    )
+    dev_gate_source = Path("src/agenttalk/dev_gate.py").read_text(encoding="utf-8")
+    assert 'os.environ.get("AGENTTALK_DEV_GATE_POSIX_PARALLEL")' in dev_gate_source
+    assert "sys.platform" not in dev_gate_source
+
+
 def test_security_workflow_contains_only_declared_codeql_exception() -> None:
     workflow = Path(".github/workflows/security.yml").read_text(encoding="utf-8")
 

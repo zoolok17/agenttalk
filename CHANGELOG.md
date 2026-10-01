@@ -132,6 +132,121 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     before publishing (exit 2) instead of writing an empty integration
     section.
 
+- **`agenttalk serve`: unbounded memory/thread growth under real browser
+  traffic (#239).** `GET /api/attention` and `GET /api/lead-chat` each ran a
+  full, uncached, O(store-size) rescan-and-validate of every message file on
+  every single request (`web._validated_for_state` / `web._all_messages`),
+  unlike `/api/state`, which already reads from the cached
+  `SnapshotService`. `ThreadingHTTPServer` caps neither per-endpoint
+  concurrency nor connection lifetime, so when requests for these two
+  endpoints arrived faster than one scan completed, each one started its own
+  fully redundant rescan on its own thread - and each thread retained its
+  own scanned/validated copy of the store until it returned. A real browser
+  (confirmed with headless Edge against the real console `/v2` page) fires
+  these polls without waiting for a prior call to finish; a strictly
+  sequential synthetic client never does, which is why this was invisible to
+  earlier synthetic-load testing. Measured on a real-store copy: private
+  bytes grew roughly 600 MB/min with handle and thread counts climbing in
+  lockstep and never plateauing - consistent with the reported incident
+  (~19 GB private / ~1.9 GB working set growth over about 70 minutes with a
+  single browser tab open).
+  - **Final design: bound concurrency, never share results.** Two earlier
+    cuts tried sharing one scan's result across concurrent callers instead
+    (a single-flight coalescer, later made "generation-gated" against
+    publications) - both failed review: sharing validation let a follower
+    inherit a stale signing/roster verdict, and even sharing just the raw
+    scan let a follower miss a message published after the scan it joined
+    had already enumerated the directory; the publication-generation signal
+    that second cut relied on (the messages directory's `st_mtime_ns`) then
+    turned out not to be reliable enough on Windows either (500 sequential
+    publishes gave 406 unchanged consecutive timestamps), so even a
+    corrected generation check could not be trusted. The shipped fix stops
+    sharing results entirely: `_all_messages`, `_validated_for_state`, and
+    the `/api/attention` route's `coordination_stall`/`supervisor` scans
+    (which used to run their own independent, unbounded
+    `store.valid_messages()` scan - the attention route now passes it the
+    already-computed messages instead) all run under one bounded
+    `threading.Semaphore` per store root (`web._SCAN_CONCURRENCY_LIMIT`,
+    currently 2). Every caller still runs its own fresh scan with its own
+    current context - so read-after-publication freshness and per-caller
+    validation both hold BY CONSTRUCTION, with no sharing and no signal to
+    get wrong - and concurrency is simply bounded rather than unbounded, so
+    a real browser's overlapping requests wait briefly on a handler thread
+    instead of each starting a fully redundant rescan.
+  - **Bounding concurrency alone left the WAIT unbounded.** A real
+    browser's arrivals can outpace the bound faster than scans drain on a
+    large store (measured: one full scan of the real, ~217MB/19k-file
+    store took a median of 1.7s warm, and up to 87s on a cold file-system
+    cache), and an unbounded wait piled up as blocked-but-unfinished
+    handler threads that `ThreadingMixIn`'s own reaper never collects (it
+    only prunes threads that have already returned) - trading #239's
+    unbounded MEMORY growth for unbounded HANDLE/THREAD growth instead
+    (measured directly on a real 10-minute browser run: private memory
+    flat at 334-386MB, but handles 218→775 and threads 12→122, steadily,
+    with no plateau). Closed by bounding the wait itself: acquiring a scan
+    slot now uses a short timeout (`web._SCAN_WAIT_TIMEOUT_SECONDS`,
+    3 seconds); on timeout the route answers `503` with `Retry-After: 2`
+    and a small JSON body (`{"error": "busy", "retry_after": 2}`,
+    never cached - `Cache-Control: no-store` is already sent
+    unconditionally) instead of blocking the handler thread indefinitely,
+    so the thread finishes and thread/handle count is bounded by
+    concurrency plus arrivals within the timeout window. The console's
+    existing per-endpoint in-flight guard (`guarded()` in `console2.js`,
+    pre-existing - verified, not added) already never starts a second
+    fetch of an endpoint while one is outstanding, and its existing
+    failed-read handling already keeps the last good data on screen with
+    no special error treatment for a `503` versus any other failure - a
+    real browser re-run confirms all three signals (private memory,
+    handles, threads) now stay bounded for the full 10 minutes.
+  - Added regression tests:
+    `test_concurrent_attention_and_lead_chat_requests_bound_scan_concurrency`
+    (an HTTP-level test against a real in-process server with a slowed,
+    instrumented scanner - peak concurrent scans stay at or below the
+    bound and every request completes; fails against unmodified
+    `origin/master`, which has no bound of any kind);
+    `test_scan_saturation_returns_503_busy_and_thread_count_recovers`
+    (more concurrent requests than the bound get `503` within the timeout
+    while the others succeed, and thread count returns to baseline
+    afterward); `test_read_after_publication_is_never_missed`,
+    `test_signing_enforcement_change_is_always_applied_fresh`, and
+    `test_roster_change_is_always_applied_fresh` (event-synchronized, no
+    sleep-and-hope races) pinning that a call starting after a publication
+    or a signing/roster change always reflects it, while a call already in
+    flight before the change legitimately keeps its own as-of-call-time
+    answer. Two new client-side tests in `tests/console2_data.test.mjs`
+    pin the existing (unmodified) `503`/in-flight-guard behavior.
+  - **The bound itself had four leaks (final round).** A confirmation read
+    found `ScanBusy` (the prior round's own 503-busy signal) escaping
+    through four pre-existing "errors-as-data" broad catches instead of
+    ever reaching the 503 mapping: (1) validation ran in a SEPARATE step
+    AFTER the scan's permit was released, so it could itself run unbounded
+    - a probe admitted 8 concurrent validators against a bound of 2;
+    `_all_messages` and `_validated_for_state` now share ONE permit scope
+    across scan + validation (`web._scan_and_validate_bounded`), with no
+    nested acquisition; (2) `/api/attention`'s STUCK-agent enrichment
+    swallowed a busy bound into a silently empty `items: []` 200 instead of
+    a 503; (3) the escalation-answer POST (`/api/lead-chat` with
+    `to_request`+`body`) had NO `ScanBusy` handling at all - only `do_GET`
+    mapped it to 503, so a saturated bound on this path used to escape as
+    an unhandled exception (a bare disconnect client-side); (4)
+    `/api/threads` and `/api/risk-register` each degraded a busy bound into
+    a 200 body (`threads_unavailable` / `partial: true`) with no
+    `Retry-After`. Every broad catch on a path that can reach a scan helper
+    now calls one shared guard (`web._reraise_busy`) as the first line of
+    its `except Exception as e:` clause, re-raising `ScanBusy` past the
+    catch instead of absorbing it - one exception, `_root_state`
+    (`/api/state`'s per-root builder), intentionally keeps degrading a busy
+    root to its own `errors` entry rather than 5xx-ing the whole multi-root
+    aggregate over one root's saturated bound (the documented FR-005
+    contract: a corrupt-or-busy root must never fail its siblings).
+    `do_POST` now maps `ScanBusy` to the same 503 JSON `do_GET` does, via a
+    shared `_send_scan_busy` helper. Added HTTP-level saturation tests for
+    `/api/attention` (including the stuck-agent path,
+    `test_attention_saturation_returns_503_even_on_the_stuck_agent_path`),
+    `/api/threads`, `/api/risk-register`, `/api/lead-chat` (GET and the
+    escalation-answer POST), and a dedicated
+    `test_validation_stays_inside_the_scan_concurrency_bound`.
+
 - **CI flake #223: comprehension tests no longer depend on a real `git
   check-ignore` succeeding within 2 seconds.** Two Windows dev-gate legs
   each hit one `VcsPrivacyRefused` error out of ~8.5k tests, on PRs that
@@ -198,6 +313,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   needs it. Test-only; every assertion is unchanged.
 
 ### CI
+
+- **Dev gate: two pytest-xdist workers on Linux/macOS legs only (#232 probe
+  recommendation (b); Windows stays serial).** `-n 2 --dist loadgroup` is
+  added to the real pytest argv only when `AGENTTALK_DEV_GATE_POSIX_PARALLEL`
+  is set - an env var, set only by `tests.yml`'s matrix expression
+  (`matrix.os.id != 'windows'`), never by a runtime platform check inside
+  `dev_gate.py` (which runs identically on every OS; only the committed
+  `posix_parallel_args` list and whether the env var is set differ). The
+  manifest floor pin and the evidence's positional argv-shape validator both
+  enforce this as a checked fact, not just a declaration: a passing
+  Linux/macOS leg's evidence must carry `posix_parallel_args`, and a passing
+  Windows (or local) leg's evidence must NOT.
+
+  A six-round probe (#232, `ci/probe-xdist-2`, not merged) measured Linux and
+  macOS at a consistent ~1.8-2.4x pytest wall-time reduction with zero test
+  failures across every round. Windows was not shipped: even after fixing a
+  real pytest-xdist hook-ordering bug that had silently made grouping inert
+  since the probe's round 2 (`tests/conftest.py`'s `xdist_group`-adding hook
+  needs `@pytest.hookimpl(tryfirst=True)` to run before xdist's own worker-
+  side nodeid-rewrite hook - carried over here, since it also matters for
+  the Linux/macOS legs' own "pwsh"/"gateway-ports" groups), Windows's
+  speedup shrank to 1.3-1.8x with 0 of 4 Python versions fully green (a
+  PowerShell-host-startup timeout and a fixed-port gateway test both still
+  contend for real, machine-wide resources under real parallel workers, and
+  the serialized worker becomes the long pole). See #232 for the full
+  round-by-round data and the three published lessons.
+
+  **Kill signal, recorded here**: if merged Linux/macOS dev-gate runs
+  regularly save less than ~20% of pytest wall time under production CI
+  load, revert this change.
 
 - **Windows CI capacity stopgap.** Master run 36571318073 (`e6b6421`) killed
   dev-gate windows/3.13's source pytest at the 5400s per-run cap with no

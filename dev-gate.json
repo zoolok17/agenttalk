@@ -69,7 +69,16 @@
       "args": [
         "-q"
       ],
+      "posix_parallel_args": [
+        "-p",
+        "xdist.plugin",
+        "-n",
+        "2",
+        "--dist",
+        "loadgroup"
+      ],
       "test_requirement": "pytest>=8.0",
+      "xdist_requirement": "pytest-xdist>=3.8.0",
       "timeout_seconds": 7200
     },
     "ruff": {

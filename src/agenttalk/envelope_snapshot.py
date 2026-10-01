@@ -26,14 +26,25 @@ def _trust(store, cfg):
     return (_digest(cfg), required, project, key)
 
 
-def validated_active(store, cfg, checkpoint=None, *, trust=None, **scan_options):
-    """Use the canonical store scanner and the legacy state's full validation gate."""
-    rows, invalid = store._scan_messages_with_paths(checkpoint=checkpoint, **scan_options)
+def validate_scanned_rows(store, cfg, rows, invalid_count, *, trust=None):
+    """Validate ALREADY-SCANNED ``(message, path)`` rows against a FRESH context.
+
+    Split out of ``validated_active`` (#246 F1 correctness fix): the raw scan
+    (``store._scan_messages_with_paths``) never consults config, roster, or
+    signing trust - it just reads and parses files off disk - so it is safe
+    for concurrent callers to COALESCE (share one in-flight scan). Validation
+    is the opposite: it is exactly what makes the result depend on config,
+    roster, and signing trust, so a caller whose context changed (signing
+    enforcement flipped on, a roster/config edit landed) must always validate
+    with ITS OWN current context, never share a verdict computed under an
+    older, possibly now-wrong, context. Callers that coalesce the scan MUST
+    call this separately, per caller, rather than sharing its result too.
+    """
     roster = store._known_roster(cfg)
     if not roster:
         raise ValueError("project config roster is empty")
     _, required, project, key = trust if trust is not None else _trust(store, cfg)
-    valid, rejects = [], len(invalid)
+    valid, rejects = [], invalid_count
     for message, path in rows:
         try:
             message.validate(roster)
@@ -47,6 +58,12 @@ def validated_active(store, cfg, checkpoint=None, *, trust=None, **scan_options)
             valid.append((message, path))
     valid.sort(key=lambda row: row[0].id)
     return valid, rejects
+
+
+def validated_active(store, cfg, checkpoint=None, *, trust=None, **scan_options):
+    """Use the canonical store scanner and the legacy state's full validation gate."""
+    rows, invalid = store._scan_messages_with_paths(checkpoint=checkpoint, **scan_options)
+    return validate_scanned_rows(store, cfg, rows, len(invalid), trust=trust)
 
 
 @dataclass(frozen=True)
