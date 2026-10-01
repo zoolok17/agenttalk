@@ -2259,6 +2259,89 @@ def test_task_ignores_senders_own_stale_health_for_the_version_gate(
     assert rc == 0
 
 
+def test_task_accepts_recipient_exactly_at_the_floor(
+    store: Store, store_root: Path,
+) -> None:
+    # The `task` kind was first understood in v0.88.0: a recipient
+    # advertising EXACTLY the floor can parse it, whatever the sender runs.
+    store.set_role("alpha", "lead")
+    store.write_health("beta", {"agenttalk_version": "0.88.0"})
+    rc = _run(["task", "--from", "alpha", "--to", "beta", "-m", "go"], store_root)
+    assert rc == 0
+    assert store.messages_for("beta")[-1].kind == "task"
+
+
+def test_task_refuses_recipient_below_the_floor_and_names_its_version(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    # A recipient on 0.87.3 (just below the 0.88.0 floor) would silently
+    # drop a `task` — the refusal must name it WITH its advertised version.
+    store.set_role("alpha", "lead")
+    store.write_health("beta", {"agenttalk_version": "0.87.3"})
+    _run_expect_exit(["task", "--from", "alpha", "--to", "beta", "-m", "go"],
+                     store_root, 2)
+    err = capsys.readouterr().err
+    assert "beta (0.87.3)" in err
+    assert "--force" in err
+    assert store.messages_for("beta") == []
+
+
+def test_task_ignores_non_recipient_roster_members_below_the_floor(
+    store: Store, store_root: Path,
+) -> None:
+    # #201: a `task` goes to exactly ONE recipient, so a stale seat that
+    # does not receive it must not block the dispatch (the old gate scanned
+    # the WHOLE roster against the sender's own version).
+    store.set_role("alpha", "lead")
+    store.write_health("beta", {"agenttalk_version": "0.90.0"})
+    store.write_health("gamma", {"agenttalk_version": "0.80.0"})
+    rc = _run(["task", "--from", "alpha", "--to", "beta", "-m", "go"], store_root)
+    assert rc == 0
+    assert store.messages_for("beta")[-1].kind == "task"
+    assert store.messages_for("gamma") == []
+
+
+def test_task_version_bump_alone_changes_nothing(
+    store: Store, store_root: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The gate is a FIXED per-kind floor (task: 0.88.0), not the sender's
+    # running version: with the sender's version patched to 9.99.0, a
+    # recipient on 0.94.0 (>= 0.88.0) is still accepted. The old
+    # "no peer older than me" rule would have refused here on every release.
+    store.set_role("alpha", "lead")
+    store.write_health("beta", {"agenttalk_version": "0.94.0"})
+    monkeypatch.setattr(cli, "__version__", "9.99.0")
+    rc = _run(["task", "--from", "alpha", "--to", "beta", "-m", "go"], store_root)
+    assert rc == 0
+    assert store.messages_for("beta")[-1].kind == "task"
+
+
+def test_broadcast_task_kind_gates_on_resolved_audience_not_roster(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    # #201 for fan-out: `broadcast --kind task` must gate on the RESOLVED
+    # audience only. A below-floor seat OUTSIDE the audience must not
+    # block; one INSIDE it must.
+    root = _role_root(tmp_path)  # lead, rev-a, rev-b, impl-c
+    assert _run(["roster", "set-role", "lead", "lead"], root) == 0  # sole lead
+    Store(root).write_health("impl-c", {"agenttalk_version": "0.80.0"})
+
+    # impl-c is below the floor but OUTSIDE the audience: no block.
+    rc = _run(["broadcast", "--from", "lead", "--to-role", "reviewer",
+               "--kind", "task", "-m", "fresh eyes", "--quiet"], root)
+    assert rc == 0
+    copies = [m for m in _msgs_on_disk(root) if m["kind"] == "task"]
+    assert sorted(m["to"] for m in copies) == ["rev-a", "rev-b"]
+    capsys.readouterr()
+
+    # Now a below-floor seat INSIDE the audience: the fan-out is refused.
+    Store(root).write_health("rev-b", {"agenttalk_version": "0.87.0"})
+    _run_expect_exit(["broadcast", "--from", "lead", "--to-role", "reviewer",
+                      "--kind", "task", "-m", "fresh eyes", "--quiet"],
+                     root, 2)
+    assert "rev-b (0.87.0)" in capsys.readouterr().err
+
+
 def test_send_question_autogen_q_request_id(
     store: Store, store_root: Path, capsys: pytest.CaptureFixture,
 ) -> None:
