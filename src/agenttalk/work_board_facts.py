@@ -52,6 +52,8 @@ _PLAN_TITLE = re.compile(r"^#\s*Plan:\s*(.+?)\s*$", re.MULTILINE)
 _PLAN_ID_LINE = re.compile(r"^Plan id:(.*)$", re.MULTILINE)
 _PLAN_REV = re.compile(r"^Plan revision:\s*(r\d+)\b", re.MULTILINE)
 _WORK_ITEMS_HEADING = re.compile(r"^##\s*5\.\s*Work items\s*$", re.MULTILINE)
+_NEXT_HEADING = re.compile(r"^##\s", re.MULTILINE)
+_FENCE = re.compile(r"^(`{3,}|~{3,})")
 _SEP_CELL = re.compile(r":?-{3,}:?")
 
 
@@ -472,22 +474,44 @@ def _plan_table(text):
     construction, rather than collecting every "|"-prefixed line anywhere in the section, which
     let an unrelated later table become bogus Planned cards).
 
-    ([], []) if the heading is missing, there is no table under it, or the SECOND line is not a
-    separator row of the SAME width as the header (a header line with no separator at all used
-    to parse as "zero data rows", i.e. a valid empty table, rather than a malformed one). A
-    table with a valid header, a matching separator, and ZERO further data rows is a valid,
-    empty table - callers decide whether that is a problem, not this parser. A stray extra
-    separator-shaped row within the SAME contiguous block is still dropped, as before."""
+    Two bounds, both closing a reviewer-found false positive on NORMAL input:
+    - the search is scoped to section 5 ONLY - from the heading up to the next "## " heading or
+      the end of the file. Without this, a later section's own unrelated table (e.g. "## 6.
+      Reference") could be read as if it were section 5's, once section 5 itself had no table.
+    - a fenced code block (``` or ~~~, open matched to its own close) is skipped ENTIRELY before
+      this scan ever sees it: a "|"-shaped line inside a fence (an example table in prose) is
+      never mistaken for the real table, wherever it sits relative to the real one.
+
+    ([], []) if the heading is missing, there is no table under it (inside these bounds), or the
+    SECOND visible line is not a separator row of the SAME width as the header (a header line
+    with no separator at all used to parse as "zero data rows", i.e. a valid empty table, rather
+    than a malformed one). A table with a valid header, a matching separator, and ZERO further
+    data rows is a valid, empty table - callers decide whether that is a problem, not this
+    parser. A stray extra separator-shaped row within the SAME contiguous block is still
+    dropped, as before."""
     heading = _WORK_ITEMS_HEADING.search(text)
     if not heading:
         return [], []
-    all_lines = text[heading.end():].splitlines()
+    rest = text[heading.end():]
+    next_heading = _NEXT_HEADING.search(rest)
+    section = rest[:next_heading.start()] if next_heading else rest
+    visible, fence = [], None
+    for ln in section.splitlines():
+        stripped = ln.strip()
+        m = _FENCE.match(stripped)
+        if fence is None:
+            if m:
+                fence = m.group(1)[0]  # '`' or '~' - everything up to the matching close is gone
+            else:
+                visible.append(ln)
+        elif m and m.group(1)[0] == fence:
+            fence = None
     i = 0
-    while i < len(all_lines) and not all_lines[i].strip().startswith("|"):
+    while i < len(visible) and not visible[i].strip().startswith("|"):
         i += 1
     lines = []
-    while i < len(all_lines) and all_lines[i].strip().startswith("|"):
-        lines.append(all_lines[i].strip())
+    while i < len(visible) and visible[i].strip().startswith("|"):
+        lines.append(visible[i].strip())
         i += 1
     if len(lines) < 2:
         return [], []

@@ -237,6 +237,60 @@ def test_a_second_later_table_in_section_5_is_never_read():
     assert [r["work_item"] for r in rows] == ["task-a"]
 
 
+def test_a_table_in_a_later_section_is_never_mistaken_for_section_5s_own():
+    # Scoped-fix repro 1: removing the section bound let the search run into a LATER section
+    # once section 5 itself held no table. The search must stay confined to section 5 - from
+    # its heading to the next "## " heading - even when that means refusing.
+    text = ("# Plan: x\n\nPlan revision: r1\n\n## 5. Work items\n\n"
+           "No work table in this section.\n\n"
+           "## 6. Reference\n\n"
+           "| work_item | Phase | Owner (vendor) | Starts when |\n|---|---|---|---|\n"
+           "| reference | 1 | dev | ready |\n")
+    _, _, _, _, rows, skipped, problems = F._parse_plan(text)
+    assert rows == [] and skipped == []
+    assert any("missing a '## 5. Work items' section with a table" in p for p in problems)
+
+
+def test_a_fenced_example_table_before_the_real_one_is_skipped():
+    # Scoped-fix repro 2: a fenced code block showing an EXAMPLE table, before the real one in
+    # section 5, must never be mistaken for the real table - the whole fence is invisible to
+    # the table search, regardless of what is inside it.
+    text = ("# Plan: x\n\nPlan revision: r1\n\n## 5. Work items\n\n"
+           "Example:\n\n```\n| work_item | Phase | Owner (vendor) | Starts when |\n"
+           "|---|---|---|---|\n| example | 1 | dev | ready |\n```\n\n"
+           "| work_item | Phase | Owner (vendor) | Starts when |\n|---|---|---|---|\n"
+           "| task-a | 1 | dev | ready |\n")
+    _, _, _, _, rows, skipped, problems = F._parse_plan(text)
+    assert problems == [] and skipped == []
+    assert [r["work_item"] for r in rows] == ["task-a"]
+
+
+def test_a_tilde_fenced_example_table_is_also_skipped():
+    text = ("# Plan: x\n\nPlan revision: r1\n\n## 5. Work items\n\n"
+           "~~~\n| work_item | Phase | Owner (vendor) | Starts when |\n"
+           "|---|---|---|---|\n| example | 1 | dev | ready |\n~~~\n\n"
+           "| work_item | Phase | Owner (vendor) | Starts when |\n|---|---|---|---|\n"
+           "| task-a | 1 | dev | ready |\n")
+    _, _, _, _, rows, skipped, problems = F._parse_plan(text)
+    assert problems == [] and skipped == []
+    assert [r["work_item"] for r in rows] == ["task-a"]
+
+
+def test_import_refuses_when_only_a_later_section_has_a_table(tmp_path):
+    store = new_store(tmp_path)
+    F.import_plan(store, write(tmp_path / "plan.md", PLAN))
+    facts = store.state_dir / F.FACTS_FILE
+    before = facts.read_bytes()
+    bad = ("# Plan: board lanes and the v2 team views\n\nPlan revision: r3\n\n"
+          "## 5. Work items\n\nNo work table in this section.\n\n"
+          "## 6. Reference\n\n"
+          "| work_item | Phase | Owner (vendor) | Starts when |\n|---|---|---|---|\n"
+          "| reference | 1 | dev | ready |\n")
+    with pytest.raises(F.PlanRefused, match="plan file malformed"):
+        F.import_plan(store, write(tmp_path / "bad.md", bad))
+    assert facts.read_bytes() == before  # the stored rows are untouched
+
+
 def test_header_only_table_with_no_separator_refuses():
     # FIX round 2 P1/F3: a header line with no separator line at all used to parse as a
     # valid, empty table (zero data rows) instead of a malformed one.
