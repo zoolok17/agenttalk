@@ -1061,3 +1061,55 @@ def test_current_turn_delivery_unaffected_by_an_unrelated_past_orphan(tmp_path) 
     # exactly what "leave it, don't lose it" means for this increment.
     assert (directory / "orphaned-turn-id.md").read_text(encoding="utf-8") == (
         "a reply that never got published")
+
+
+def test_stray_reply_drafts_skips_superseded_live_draft(tmp_path) -> None:
+    # #258 unit: a live ``<id>.md`` that has a ``.superseded.md`` sibling is
+    # the deliberate task-kind race trace (increment A), NOT an orphan - the
+    # scan must skip it. A bare ``<id>.md`` with no sidecar in the SAME
+    # directory is still a genuine stray.
+    s = _store(tmp_path)
+    directory = reply_transport.reply_draft_dir(s, "beta")
+    directory.mkdir(parents=True)
+    (directory / "old-6.md").write_text("superseded draft", encoding="utf-8")
+    (directory / "old-6.superseded.md").write_text("superseded note", encoding="utf-8")
+    (directory / "old-1.md").write_text("a true orphan", encoding="utf-8")
+
+    strays = reply_transport.stray_reply_drafts(s, "beta")
+    assert [p.stem for p in strays] == ["old-1"]   # old-6 skipped, old-1 is stray
+    # The sidecar itself is never a stray candidate (second suffix).
+    assert all(p.stem not in ("old-6", "old-6.superseded") for p in strays)
+
+
+def test_stray_scan_skips_superseded_task_draft_end_to_end(tmp_path) -> None:
+    # #258 end-to-end race: a task turn answered via CLI leaves the LIVE draft
+    # + ``.superseded.md`` in place (increment A's deliberate trace, no
+    # double-post). On the NEXT turn the stray scan must NOT flag that live
+    # draft as an orphan - it is already accounted for. ``_report_...``
+    # returns [] and the lead gets no stray notice.
+    s = _store(tmp_path)
+    s.set_role("alpha", "lead")
+    t = s.send(sender="alpha", recipient="beta", kind="task", body="do X",
+               meta={"request_id": "tk-258"})
+
+    def drive(rec):
+        s.send(sender="beta", recipient="alpha", kind="task-response",
+               body="cli answer",
+               meta={"in_reply_to": rec["id"], "request_id": "tk-258"})
+        Path(rec["reply_draft"]["path"]).write_text(
+            "draft answer", encoding="utf-8")
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1)
+    draft_path = reply_transport.reply_draft_path(s, "beta", t.id)
+    assert draft_path.is_file()                     # live draft left in place
+    assert reply_transport.superseded_sidecar_path(draft_path).is_file()
+
+    # The NEXT turn (a different id): the superseded live draft must NOT be
+    # reported as stray, and no notice may reach the lead.
+    warnings = loop._report_stray_reply_drafts(s, "beta", {"id": "some-later-turn"})
+    assert warnings == []
+    stray_notices = [m for m in _reply_inbox(s, "alpha")
+                     if (m.meta or {}).get("stray_reply_draft") == "true"]
+    assert stray_notices == []

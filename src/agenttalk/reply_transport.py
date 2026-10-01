@@ -149,6 +149,14 @@ def stray_reply_drafts(
     above has a second suffix (``.refused``, ``.superseded``, ...) that a
     bare ``<id>.md`` never does, since message ids never themselves contain
     a literal dot.
+
+    One further exception: a live ``<id>.md`` that has a
+    :func:`superseded_sidecar_path` sibling is the DELIBERATE task-kind race
+    trace from increment A — the draft was left in place on purpose (its
+    reply already landed via the other channel; deleting it would erase the
+    evidence of the race). It is already accounted for, so it is not an
+    orphan either (#258: without this, the next turn's scan false-alarmed
+    on it as a stray).
     """
     directory = reply_draft_dir(store, agent)
     try:
@@ -158,6 +166,7 @@ def stray_reply_drafts(
     return [
         path for path in candidates
         if len(path.suffixes) == 1 and path.stem != exclude_id
+        and not superseded_sidecar_path(path).exists()
     ]
 
 
