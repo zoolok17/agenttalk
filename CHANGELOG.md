@@ -120,6 +120,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Work orders no longer stall after an upgrade (#185, #201).**
+  Before, `agenttalk task` refused to send a work order as long as ANY
+  other seat in the roster was running an older build than the sender -
+  so after every release, the lead had to wait for the whole fleet to
+  relaunch (or force every work order) before it could dispatch anything.
+  The version check is also now aimed at the ONE seat that actually
+  receives the message: a stale seat that is not the recipient no longer
+  blocks the dispatch. Now the check compares the recipient against the
+  version that first understood `task` work orders (0.88.0) - a fixed
+  floor, not the sender's own version. `broadcast --kind task` is the
+  same: only the seats that receive a copy are checked. What you will
+  notice: after an upgrade the lead can immediately dispatch work to any
+  seat on 0.88.0 or newer, no matter how new the lead itself is, and
+  `--force` is no longer the default for right after a release.
+
 - **Work board Done lane: three residuals from the #247 review (#249).**
   - A partial negative is no longer shown as not integrated. When an item
     selects two targets and only one has a fresh negative result (the other
