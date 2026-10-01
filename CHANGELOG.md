@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Work orders no longer stall after an upgrade (#185, #201).**
+  Before, `agenttalk task` refused to send a work order as long as ANY
+  other seat in the roster was running an older build than the sender -
+  so after every release, the lead had to wait for the whole fleet to
+  relaunch (or force every work order) before it could dispatch anything.
+  The version check is also now aimed at the ONE seat that actually
+  receives the message: a stale seat that is not the recipient no longer
+  blocks the dispatch. Now the check compares the recipient against the
+  version that first understood `task` work orders (0.88.0) - a fixed
+  floor, not the sender's own version. `broadcast --kind task` is the
+  same: only the seats that receive a copy are checked. What you will
+  notice: after an upgrade the lead can immediately dispatch work to any
+  seat on 0.88.0 or newer, no matter how new the lead itself is, and
+  `--force` is no longer the default for right after a release.
+
+## [0.95.0] - 2026-10-01
+
+**In short:** the console server no longer keeps using more and more memory
+while its web page is open — we found why and fixed it, and watched it stay
+steady for ten minutes under real use. Finished work can now move itself to
+"Done" on the board automatically, checked against the real history in git,
+instead of needing someone to update it by hand. The automatic checks that
+run on every change now finish faster on two of our three platforms, with
+the slower one left untouched until it is verified safe there too. Agents
+also get a safety limit on how many times they restart in a row, so a
+broken one stops trying and asks for help instead of looping forever.
+A new skill teaches agents to write for people rather than for programmers:
+in release notes, pull request descriptions, comments and status reports,
+agents that use it explain in plain words what changed, why it matters and
+what you will notice, and keep the technical details for the end. A few smaller problems were fixed too, including flaky automatic checks
+and a too-bright colour theme.
+
 ### Added
 
 - **A new skill that teaches agents to write for people, not for programmers.**
@@ -154,21 +188,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ```
 
 ### Fixed
-
-- **Work orders no longer stall after an upgrade (#185, #201).**
-  Before, `agenttalk task` refused to send a work order as long as ANY
-  other seat in the roster was running an older build than the sender -
-  so after every release, the lead had to wait for the whole fleet to
-  relaunch (or force every work order) before it could dispatch anything.
-  The version check is also now aimed at the ONE seat that actually
-  receives the message: a stale seat that is not the recipient no longer
-  blocks the dispatch. Now the check compares the recipient against the
-  version that first understood `task` work orders (0.88.0) - a fixed
-  floor, not the sender's own version. `broadcast --kind task` is the
-  same: only the seats that receive a copy are checked. What you will
-  notice: after an upgrade the lead can immediately dispatch work to any
-  seat on 0.88.0 or newer, no matter how new the lead itself is, and
-  `--force` is no longer the default for right after a release.
 
 - **No more false "undelivered reply" alarm after a correctly answered work order (#258).**
   Before, if a seat answered a task with the CLI reply AND also left its
