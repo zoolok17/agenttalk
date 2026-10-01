@@ -1,9 +1,14 @@
-"""Lead-run integration facts for the work board's Done lane.
+"""Lead-run integration facts for the work board's Done and Planned lanes.
 
 `agenttalk board verify-merges` proves, outside the web server, that an item's
 reviewed candidate is an ancestor of an approved target ref in an operator-approved
 local checkout, and records each result in one bounded, schema-versioned store
 file. The snapshot worker only reads that file: the server never runs Git.
+
+`agenttalk board import-plan <file>` reads a lead-written plan file's work-items
+table and records its rows in the SAME file, in their own "planned" section,
+keyed by plan id. A plan row with no matching dispatch becomes a Planned card;
+a dispatched item always keeps its derived column instead (see work_board_feed).
 """
 import contextlib
 import json
@@ -13,10 +18,12 @@ import subprocess  # nosec B404
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from agenttalk import work_tags
 from agenttalk._atomic import write_text as _atomic_write_text
 from agenttalk.store import LockContention
 
 SCHEMA_VERSION = 1
+PLANNED_SCHEMA_VERSION = 1
 FACTS_FILE = "work-board-facts.json"
 LOCK_FILE = "work-board-facts.lock"
 RUN_LOCK_FILE = "work-board-verify.lock"
@@ -36,6 +43,18 @@ _FACT_KEYS = {"project", "repo_alias", "repo_path", "work_item", "candidate", "t
 _TIMED_OUT = "git unavailable or timed out"
 _SCHEMA_UNSUPPORTED = "integration facts schema unsupported"
 _OVERSIZE = "integration facts exceed their size bound"
+
+# ----------------------------------------------------- plan import (wb-planned-lane)
+_PLANNED_ROW_KEYS = {"work_item", "phase", "owner", "starts_when"}
+_PLAN_TITLE = re.compile(r"^#\s*Plan:\s*(.+?)\s*$", re.MULTILINE)
+_PLAN_REV = re.compile(r"^Plan revision:\s*(r\d+)\b", re.MULTILINE)
+_WORK_ITEMS_HEADING = re.compile(r"^##\s*5\.\s*Work items\s*$", re.MULTILINE)
+_NEXT_HEADING = re.compile(r"^##\s", re.MULTILINE)
+_SEP_CELL = re.compile(r":?-{3,}:?")
+
+
+class PlanRefused(ValueError):
+    """import-plan published nothing, for an operator-actionable reason."""
 
 
 class VerifyRefused(ValueError):
@@ -385,4 +404,213 @@ def integration_for(items, evidence):
         else:
             notes[key] = ("integration evidence ignored: "
                           + (reason or "recorded for another repository or target"), None)
+    return integrated, notes
+
+
+def plan_id_of(plan_name):
+    """The portable plan id: the title's text, lowercased and slugified (docs/WORK-BOARD-FEED.md).
+    None if the title yields nothing a plan id can be made of."""
+    slug = re.sub(r"-{2,}", "-", re.sub(r"[^a-z0-9]+", "-", plan_name.lower())).strip("-")[:64]
+    return slug if _SLUG.fullmatch(slug) else None
+
+
+def _plan_table(text):
+    """(header-cells, [data-row-cells]) of the "## 5. Work items" markdown table, or ([], [])
+    if the heading or a table under it is missing. Any row where every cell is a separator
+    (``---``/``:--:``) is dropped, wherever it sits, rather than assumed to be line 2."""
+    heading = _WORK_ITEMS_HEADING.search(text)
+    if not heading:
+        return [], []
+    rest = text[heading.end():]
+    next_heading = _NEXT_HEADING.search(rest)
+    section = rest[:next_heading.start()] if next_heading else rest
+    lines = [ln.strip() for ln in section.splitlines() if ln.strip().startswith("|")]
+    if not lines:
+        return [], []
+    rows = [[c.strip() for c in ln.strip("|").split("|")] for ln in lines]
+    rows = [r for r in rows if not all(_SEP_CELL.fullmatch(c) for c in r)]
+    return (rows[0], rows[1:]) if rows else ([], [])
+
+
+def _parse_plan(text):
+    """(plan_id, plan_name, plan_rev, rows, problems). ``rows`` and ``problems`` are never both
+    non-empty: a malformed table yields problems and no rows, never a partial import."""
+    problems = []
+    title = _PLAN_TITLE.search(text)
+    plan_name = title.group(1) if title else None
+    if not plan_name:
+        problems.append("missing a '# Plan: <name>' title line")
+    plan_id = plan_id_of(plan_name) if plan_name else None
+    if plan_name and plan_id is None:
+        problems.append(f"plan title {plan_name!r} does not yield a usable plan id")
+    rev = _PLAN_REV.search(text)
+    plan_rev = rev.group(1) if rev else None
+    if not plan_rev:
+        problems.append("missing a 'Plan revision: rN' line")
+    header, data = _plan_table(text)
+    if not header:
+        problems.append("missing a '## 5. Work items' section with a table")
+        return plan_id, plan_name, plan_rev, [], problems
+    norm = [re.sub(r"\s+", " ", c).strip().lower() for c in header]
+
+    def col(*names):
+        return next((norm.index(n) for n in names if n in norm), None)
+
+    cols = {"work_item": col("work_item"), "phase": col("phase"),
+            "owner": col("owner (vendor)", "owner"), "starts_when": col("starts when")}
+    missing = [k for k, i in cols.items() if i is None]
+    if missing:
+        problems.append("section 5 table is missing column(s): " + ", ".join(sorted(missing)))
+        return plan_id, plan_name, plan_rev, [], problems
+    width, seen, rows = max(cols.values()) + 1, set(), []
+    for cells in data:
+        if len(cells) < width:
+            problems.append(f"malformed table row (too few columns): {' | '.join(cells)!r}")
+            continue
+        try:
+            work_item = work_tags.value("work_item", cells[cols["work_item"]])
+        except (TypeError, ValueError):
+            problems.append(f"invalid work_item in table row: {cells[cols['work_item']]!r}")
+            continue
+        if work_item in seen:
+            problems.append(f"duplicate work_item in this plan's table: {work_item!r}")
+            continue
+        phase, owner, starts_when = (cells[cols[k]] for k in ("phase", "owner", "starts_when"))
+        if not (phase and owner and starts_when):
+            problems.append(f"work item {work_item!r} is missing phase, owner or starts-when")
+            continue
+        seen.add(work_item)
+        rows.append({"work_item": work_item, "phase": phase, "owner": owner, "starts_when": starts_when})
+    if not rows and not problems:
+        problems.append("section 5 table has no data rows")
+    return plan_id, plan_name, plan_rev, ([] if problems else rows), problems
+
+
+def _read_plan_text(path):
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(MAX_FILE_BYTES + 1)
+    except FileNotFoundError:
+        raise PlanRefused(f"{path} does not exist; nothing was published") from None
+    except OSError as exc:
+        raise PlanRefused(f"{path} is unreadable ({exc}); nothing was published") from None
+    if len(raw) > MAX_FILE_BYTES:
+        raise PlanRefused(f"{path} exceeds the {MAX_FILE_BYTES // 1024} KiB read bound; nothing was published")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise PlanRefused(f"{path} is not valid UTF-8 text; nothing was published") from None
+
+
+def import_plan(store, path, *, now=None):
+    """Parse a plan file's "## 5. Work items" table and atomically replace THIS plan's rows in
+    the same facts file wb-done-facts created, in their own "planned" section. Row identity is
+    (plan id, work_item): a re-import replaces every row of this plan_id, so a row dropped from
+    the file disappears and a superseded plan_rev is replaced. Other plans' rows and the
+    integration section are untouched. Refuses, publishing nothing, on a malformed plan file."""
+    text = _read_plan_text(path)
+    plan_id, plan_name, plan_rev, rows, problems = _parse_plan(text)
+    if problems:
+        raise PlanRefused("plan file malformed: " + "; ".join(problems))
+    now = now or datetime.now(timezone.utc)
+    entry = {"project": store.project_id(), "plan_rev": plan_rev, "plan_name": plan_name,
+             "written_at": now.isoformat(), "rows": rows}
+    _write_planned(store, plan_id, entry)
+    return {"plan_id": plan_id, "plan_name": plan_name, "plan_rev": plan_rev, "rows": rows}
+
+
+def _write_planned(store, plan_id, entry):
+    """Replace doc["planned"]["plans"][plan_id] atomically, under the facts lock, keeping every
+    other plan's rows and the integration section exactly as they were."""
+    path = store.state_dir / FACTS_FILE
+    with store._exclusive_lock(store.state_dir / LOCK_FILE, what="work board facts"):
+        doc, warning = _read(path)
+        if warning == _SCHEMA_UNSUPPORTED:
+            raise PlanRefused(f"{path} has an unsupported schema_version; it was left untouched "
+                              "and nothing was published")
+        if warning == _OVERSIZE:
+            raise PlanRefused(f"{path} exceeds the {MAX_FILE_BYTES // 1024} KiB read bound; it was left "
+                              "untouched and nothing was published")
+        doc = doc or {"schema_version": SCHEMA_VERSION}
+        planned = doc.get("planned")
+        if planned is not None and (not isinstance(planned, dict)
+                                    or planned.get("schema_version") != PLANNED_SCHEMA_VERSION):
+            raise PlanRefused("the planned section has an unsupported schema_version; it was left "
+                              "untouched and nothing was published")
+        plans = dict(planned["plans"]) if planned and isinstance(planned.get("plans"), dict) else {}
+        plans[plan_id] = entry
+        doc = dict(doc, planned={"schema_version": PLANNED_SCHEMA_VERSION, "plans": plans})
+        text = json.dumps(doc, indent=2, ensure_ascii=False)
+        if len(text.encode("utf-8")) > MAX_FILE_BYTES:
+            raise ValueError("work board facts would exceed their size bound")
+        _atomic_write_text(path, text)
+
+
+def _valid_planned_row(row):
+    return (isinstance(row, dict) and set(row) == _PLANNED_ROW_KEYS and _SLUG.fullmatch(row["work_item"])
+            and all(isinstance(row[k], str) and row[k] for k in ("phase", "owner", "starts_when")))
+
+
+def load_planned(store, cfg, *, now=None):
+    """Server side, no Git: the plan rows the Planned column reads. Never raises, because
+    optional evidence must never take the board down; any fault is a warning and no rows."""
+    try:
+        return _load_planned(store, cfg)
+    except Exception as exc:  # noqa: BLE001 - the board projects without this evidence
+        return {"plans": {}, "warnings": [f"planned facts unusable ({type(exc).__name__})"]}
+
+
+def _load_planned(store, cfg):
+    doc, warning = _read(store.state_dir / FACTS_FILE)
+    if doc is None:
+        unconfigured = warning.startswith("integration facts missing")
+        return {"plans": {}, "warnings": [] if unconfigured else [warning]}
+    section = doc.get("planned")
+    if section is None:
+        return {"plans": {}, "warnings": []}
+    if not isinstance(section, dict) or section.get("schema_version") != PLANNED_SCHEMA_VERSION:
+        return {"plans": {}, "warnings": ["planned facts schema unsupported"]}
+    plans = section.get("plans")
+    if not isinstance(plans, dict):
+        return {"plans": {}, "warnings": ["planned facts malformed"]}
+    project, kept, warnings = store.project_id(), {}, []
+    for plan_id, entry in plans.items():
+        ok = (isinstance(plan_id, str) and _SLUG.fullmatch(plan_id) and isinstance(entry, dict)
+              and isinstance(entry.get("plan_rev"), str) and entry["plan_rev"]
+              and isinstance(entry.get("plan_name"), str) and entry["plan_name"]
+              and isinstance(entry.get("rows"), list) and all(_valid_planned_row(r) for r in entry["rows"]))
+        if not ok:
+            warnings.append(f"planned facts: plan {plan_id!r} malformed; ignored")
+            continue
+        if entry.get("project") != project:
+            continue  # another store's plan rows (no mapping change to report; just not ours)
+        kept[plan_id] = {"plan_rev": entry["plan_rev"], "plan_name": entry["plan_name"], "rows": entry["rows"]}
+    return {"plans": kept, "warnings": warnings}
+
+
+def planned_cards(dispatched, planned):
+    """[(work_item, column, reason, planned-dict-or-None)], sorted by work_item, for every plan
+    row whose work_item has NO dispatch (``dispatched``: every work_item the reducer placed,
+    dispatched or not - see work_board_feed.build). A dispatched item is skipped here and keeps
+    its own derived column. A work_item planned by more than one plan_id is "unknown", never a
+    silent pick of either."""
+    by_item = {}
+    for plan_id, entry in planned["plans"].items():
+        for row in entry["rows"]:
+            by_item.setdefault(row["work_item"], []).append((plan_id, entry, row))
+    out = []
+    for work_item in sorted(by_item):
+        if work_item in dispatched:
+            continue
+        hits = by_item[work_item]
+        plan_ids = sorted({plan_id for plan_id, _, _ in hits})
+        if len(plan_ids) > 1:
+            out.append((work_item, "unknown",
+                       "planned in more than one plan: " + ", ".join(plan_ids), None))
+        else:
+            plan_id, entry, row = hits[0]
+            out.append((work_item, "planned", f"planned in {entry['plan_name']} ({entry['plan_rev']})",
+                       {"phase": row["phase"], "owner": row["owner"], "starts_when": row["starts_when"],
+                        "plan_id": plan_id, "plan_name": entry["plan_name"], "plan_rev": entry["plan_rev"]}))
+    return out
     return integrated, notes

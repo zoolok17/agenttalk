@@ -22,6 +22,13 @@ Done needs integration evidence recorded by the lead-run `agenttalk board
 verify-merges` (below); task completion alone never means Done. External CI is
 labelled `local checks not tracked`.
 
+A plan row with no dispatch appears as Planned (`workflow_column: "planned"`),
+recorded by the lead-run `agenttalk board import-plan` (below). A dispatched
+item always keeps its own derived column instead; it is never shown as
+Planned too. Planned cards are appended after every dispatched card and are
+the first ones cut by the 100-card/256 KiB bounds, so a plan can never push
+active work out of the response.
+
 There are at most 100 tagged cards and 256 KiB of UTF-8 JSON, including groups and
 coverage. Overflow omits whole cards, sets `truncated`, and reports known totals
 and omissions; incomplete totals are null. One counted Legacy group and the
@@ -169,3 +176,114 @@ within the window.
 
 Ordinary merges and fast-forwards are proven by ancestry. Squash and rebase
 merges stay unproved.
+
+## Planned work and the Planned lane
+
+A PLANNED lane shows work that is in a plan but not yet dispatched. The input
+is the markdown plan format the lead already writes: a `# Plan: <name>` title
+line, a `Plan revision: rN` line, and a `## 5. Work items` table. This is a
+plain, versioned, portable contract — any plan file in this shape is
+understood, without needing the lead's own private template
+(`plan-template.md`, kept outside this repository).
+
+### Command
+
+`agenttalk board import-plan <file>` reads one plan file and records its
+section 5 rows in the facts file wb-done-facts created above
+(`.agenttalk/state/work-board-facts.json`), in their own `planned` section.
+The existing `integration` section, and every OTHER plan's rows, are left
+exactly as they were. It never runs Git and never touches the bus.
+
+It exits 2, having published nothing, when the plan file:
+
+- does not exist, is unreadable, is not valid UTF-8, or exceeds the 512 KiB
+  read bound;
+- has no `# Plan: <name>` title line, or the title does not yield a usable
+  plan id (see below);
+- has no `Plan revision: rN` line;
+- has no `## 5. Work items` section, or that section has no table, or the
+  table is missing the `work_item`, `Phase`, `Owner (vendor)` (or `Owner`) or
+  `Starts when` column;
+- has a table row whose `work_item` is not a lowercase slug of at most 64
+  characters, or that repeats a `work_item` already seen in this plan's own
+  table;
+- would leave the facts file over its 512 KiB size bound.
+
+A row with an empty `Phase`, `Owner` or `Starts when` cell is skipped with a
+reason; the rest of the plan still imports, as long as at least one row
+survives. The command lists every skipped row. Otherwise it exits 0.
+
+### The import contract
+
+- **Schema version:** the `planned` section carries its own
+  `schema_version` (currently 1), checked independently of the facts file's
+  own top-level `schema_version`. A section with an unsupported version is
+  left untouched and the import is refused, never silently reset.
+- **Plan id:** the title's text after `# Plan: `, lowercased, with every run
+  of characters outside `a-z0-9` collapsed to one `-`, trimmed of leading and
+  trailing `-`, and capped at 64 characters. Renaming the file never changes
+  the plan id; changing the title does. Two different plan files that happen
+  to share a title collide by design — treat the title as the plan's stable
+  name.
+- **Plan revision:** the literal `rN` token from the `Plan revision:` line
+  (everything after it — "supersedes", a status, an owner — is ignored).
+- **Row identity:** `(plan id, work_item)`. A re-import of the same plan id
+  REPLACES every row of that plan id atomically: a row dropped from the file
+  disappears from the board, and a superseded `plan_rev` replaces the old
+  one. A different plan id's rows are a separate entry and are never touched
+  by another plan's import.
+- Each row records `work_item`, `phase`, `owner` and `starts_when` — the
+  table cell text, verbatim (the owner cell's vendor parenthetical is kept
+  as-is, never parsed further).
+
+### Facts file: the `planned` section
+
+```json
+"planned": {
+  "schema_version": 1,
+  "plans": {
+    "board-lanes-and-the-v2-team-views": {
+      "project": "<project id>",
+      "plan_rev": "r2",
+      "plan_name": "board lanes and the v2 team views",
+      "written_at": "2026-10-01T00:00:00+00:00",
+      "rows": [
+        {"work_item": "wb-planned-lane", "phase": "1",
+         "owner": "claude-agenttalk-developer-6 (claude)",
+         "starts_when": "wb-done-facts merged"}
+      ]
+    }
+  }
+}
+```
+
+The snapshot worker reads this section on every refresh, bounded and
+schema-checked exactly like `integration` above: a missing, malformed or
+wrong-schema section gives no planned rows and a warning in `errors`, never a
+broken board. A plan whose `project` does not match the current store is
+excluded without a warning (it belongs to another project's facts file, nothing
+changed here to report).
+
+### How a plan row becomes a card
+
+For every plan row whose `work_item` has **no dispatch at all** (no bus
+opener ever carried that `work_item` tag, dispatched, done, cancelled or
+otherwise):
+
+- exactly one plan names it: a Planned card, carrying `planned: {phase,
+  owner, starts_when, plan_id, plan_name, plan_rev}`;
+- more than one plan names it: an Unknown card, reason `planned in more than
+  one plan: <plan id>, <plan id>, ...` — never a silent pick of either plan's
+  row.
+
+A `work_item` with any dispatch is never shown as Planned: the dispatched
+item keeps exactly the column the reducer already placed it in, Planned or
+not. Planned and conflict cards carry no obligations, candidate, checks or
+integration evidence — there is no execution history to show yet.
+
+### Refresh owners
+
+The lead runs `agenttalk board import-plan <file>` after approving or
+revising a plan (section 8 of the plan template's replan rule). Nothing else
+refreshes planned rows, so a merged or abandoned plan stays on the board as
+written until the lead re-imports or the facts file is reset.
