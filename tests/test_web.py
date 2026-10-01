@@ -2592,6 +2592,717 @@ def test_api_state_perf_smoke(tmp_path: Path) -> None:
     assert elapsed < 2.0, f"build_state took {elapsed:.2f}s at 1k messages"
 
 
+# ============================================ #239: serve-growth regression
+#
+# NOTE on test target (#246 review): these tests drive `web._all_messages`
+# and `web._validated_for_state` DIRECTLY with real concurrent threads,
+# rather than through the full `/api/attention` HTTP route. `/api/attention`
+# also aggregates `coordination_stall.build_snapshot()` and
+# `supervisor.build_report()`, which independently call `store.valid_messages()`
+# on their own, uncoalesced, entirely OUTSIDE the scope of this fix (pre-
+# existing, tracked separately per #184) - driving the burst through that
+# route conflates their calls with the ones actually being coalesced here,
+# making the "how many times did the scan run" assertion unreliable. Calling
+# the two coalesced entry points directly is precise and still exercises
+# real concurrent HTTP-request-shaped calls (each still runs on its own
+# thread, same as a real `ThreadingHTTPServer` handler thread would).
+
+
+def _pausable_enumeration(store: Store):
+    """Patch ``store.messages_dir`` so the scan's FIRST directory listing
+    freezes and pauses immediately after being captured (matching the real
+    scan's own eager ``sorted(self.messages_dir.iterdir())``) - lets a test
+    hold one call's scan open across a concurrent publish or context change,
+    deterministically (event-synchronized, not a sleep-and-hope race).
+    Returns ``(entered, proceed)``. Only the FIRST call pauses; later calls
+    return immediately - the #246 recast never shares a scan, so there is
+    no "follower" to gate, only independent callers."""
+    class _PausableDirProxy:
+        def __init__(self, real_dir):
+            self._real_dir = real_dir
+            self._first = True
+
+        def iterdir(self):
+            listing = list(self._real_dir.iterdir())
+            if self._first:
+                self._first = False
+                entered.set()
+                assert proceed.wait(timeout=5), "test never released the paused enumeration"
+            return iter(listing)
+
+        def __getattr__(self, name):
+            return getattr(self._real_dir, name)
+
+    entered = threading.Event()
+    proceed = threading.Event()
+    store.messages_dir = _PausableDirProxy(store.messages_dir)
+    return entered, proceed
+
+
+def _pausable_trust(monkeypatch: pytest.MonkeyPatch):
+    """Patch ``envelope_snapshot._trust`` to block, ONCE, right after
+    computing its (roster-config-digest, required, project, key) tuple.
+    Unlike ``_pausable_enumeration`` (which only freezes the file LIST),
+    trust is read LIVE, AFTER the scan resolves, by every caller - so
+    pausing the scan does NOT freeze a held call's signing verdict; a
+    signing-transition test needs trust itself held open across the
+    transition. Returns ``(entered, proceed)``."""
+    real_trust = web._snapshots._trust
+    entered = threading.Event()
+    proceed = threading.Event()
+    first = [True]
+
+    def paused_trust(store, cfg):
+        result = real_trust(store, cfg)
+        if first[0]:
+            first[0] = False
+            entered.set()
+            assert proceed.wait(timeout=5), "test never released the paused trust"
+        return result
+
+    monkeypatch.setattr(web._snapshots, "_trust", paused_trust)
+    return entered, proceed
+
+
+def test_concurrent_attention_and_lead_chat_requests_bound_scan_concurrency(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#246 recast: N concurrent GET /api/attention and /api/lead-chat
+    against a REAL in-process server (not called directly - the recast's
+    OWN final delta read caught exactly this gap: an earlier regression
+    test moved off HTTP and so never exercised the real `/api/attention`
+    route, which still ran an independent, unbounded second scan via
+    `coordination_stall.build_snapshot(store)` omitting its own
+    `valid_messages` argument - `coordination_stall.py` then called
+    `store.valid_messages()` itself, bypassing whatever the web-layer
+    protected). This instruments BOTH `store._scan_messages_with_paths`
+    (what `_all_messages`/`_validated_for_state` funnel through) AND
+    `store.valid_messages` (what `coordination_stall.build_snapshot` used to
+    call on its own) with a slowed wrapper tracking PEAK CONCURRENT
+    invocations - not total count: the recast deliberately gives every
+    caller its own fresh scan (no sharing, so freshness holds by
+    construction), so total count equals request count by design; bounded
+    CONCURRENCY is the property that actually has to hold.
+
+    RED against the real, unmodified `origin/master` `web.py` (confirmed
+    directly: no bound of any kind exists there, so N concurrent requests
+    produce peak concurrency == N); GREEN with `_scan_semaphore`'s bound in
+    place.
+
+    This test measures ONLY the concurrency bound - it asserts zero request
+    failures, which is a DIFFERENT contract from the later bounded-wait
+    tests (`test_scan_saturation_returns_503_busy_and_thread_count_recovers`
+    et al.), which deliberately exceed the wait and expect some requests to
+    get a busy 503. On a slow CI runner (observed: macOS CI, both 3.11 and
+    3.13), 12 requests queued 6-deep behind a bound of 2 can legitimately
+    take longer than `_SCAN_WAIT_TIMEOUT_SECONDS` (3s) to each get a turn,
+    which made this test intermittently red for a reason that has nothing
+    to do with what it checks. Patch the wait timeout high so this test
+    isolates the concurrency bound from the separately-tested wait bound.
+    """
+    monkeypatch.setattr(web, "_SCAN_WAIT_TIMEOUT_SECONDS", 120.0)
+    store = _make_store(tmp_path)
+    store.set_role("alpha", "lead")
+    for i in range(10):
+        store.send(sender="alpha", recipient="beta", body=f"m{i}")
+
+    peak_lock = threading.Lock()
+    active: dict[str, int] = {"scan": 0, "valid_messages": 0}
+    peak: dict[str, int] = {"scan": 0, "valid_messages": 0}
+
+    def make_slow(kind, real_fn):
+        def slow(*args, **kwargs):
+            with peak_lock:
+                active[kind] += 1
+                peak[kind] = max(peak[kind], active[kind])
+            time.sleep(0.15)
+            try:
+                return real_fn(*args, **kwargs)
+            finally:
+                with peak_lock:
+                    active[kind] -= 1
+        return slow
+
+    monkeypatch.setattr(store, "_scan_messages_with_paths",
+                        make_slow("scan", store._scan_messages_with_paths))
+    monkeypatch.setattr(store, "valid_messages",
+                        make_slow("valid_messages", store.valid_messages))
+
+    server, thread, base = _serve(store)
+    try:
+        concurrency = 12
+        errors: list[BaseException] = []
+        errors_lock = threading.Lock()
+
+        def fire(path: str) -> None:
+            try:
+                with _urlopen(f"{base}{path}", timeout=15) as resp:
+                    resp.read()
+            except Exception as exc:  # noqa: BLE001
+                with errors_lock:
+                    errors.append(exc)
+
+        targets = (["/api/attention"] * (concurrency // 2)
+                   + ["/api/lead-chat"] * (concurrency - concurrency // 2))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+            list(pool.map(fire, targets))
+
+        assert not errors, f"requests failed: {errors!r}"
+        limit = web._SCAN_CONCURRENCY_LIMIT
+        assert peak["scan"] <= limit, (
+            f"peak concurrent full-store scans {peak['scan']} exceeded the "
+            f"bound {limit}")
+        assert peak["valid_messages"] <= limit, (
+            f"peak concurrent valid_messages() scans {peak['valid_messages']} "
+            f"exceeded the bound {limit} - /api/attention is still running "
+            f"an unbounded scan of its own")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_scan_saturation_returns_503_busy_and_thread_count_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#246 recast completion: bounding CONCURRENCY alone left the WAIT
+    unbounded - a real browser's arrivals outpacing the bound piled up as
+    blocked-but-unfinished handler threads with no plateau (measured: 218
+    -> 775 handles, 12 -> 122 threads over 10 minutes, while memory itself
+    stayed flat). This closes that: with the scan slowed well past
+    `_SCAN_WAIT_TIMEOUT_SECONDS`, firing more concurrent requests than
+    `_SCAN_CONCURRENCY_LIMIT` must not let the excess block indefinitely -
+    each gets HTTP 503 "busy" within about the timeout (with `Retry-After`
+    and the existing unconditional `Cache-Control: no-store`), and ITS OWN
+    HANDLER THREAD THEREFORE FINISHES. The others (up to the bound)
+    succeed normally. Afterwards, thread count returns to baseline - the
+    actual fix for the growth this round's own re-verification found.
+    """
+    store = _make_store(tmp_path)
+    store.send(sender="alpha", recipient="beta", body="m0")
+    real_scan = store._scan_messages_with_paths
+
+    # Long relative to the timeout (not just barely longer): concurrent
+    # requests do not all reach the semaphore at the exact same instant
+    # (connection/accept staggering), so a margin too close to the timeout
+    # makes an excess request's ACTUAL wait borderline and racy. A scan
+    # several times longer than the timeout keeps every excess request's
+    # wait reliably well past it regardless of arrival staggering.
+    slow_seconds = web._SCAN_WAIT_TIMEOUT_SECONDS * 3
+
+    def slow_scan(*args, **kwargs):
+        time.sleep(slow_seconds)
+        return real_scan(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_scan_messages_with_paths", slow_scan)
+
+    server, thread, base = _serve(store)
+    try:
+        baseline_threads = threading.active_count()
+        concurrency = web._SCAN_CONCURRENCY_LIMIT + 2
+        results: list[tuple] = []
+        results_lock = threading.Lock()
+
+        def fire(_i: int) -> None:
+            start = time.time()
+            req = urllib.request.Request(f"{base}/api/attention")  # noqa: S310  # nosemgrep
+            try:
+                with _urlopen(req, timeout=slow_seconds + 15) as resp:
+                    status, headers = resp.status, resp.headers
+            except urllib.error.HTTPError as exc:
+                status, headers = exc.code, exc.headers
+            elapsed = time.time() - start
+            with results_lock:
+                results.append((status, headers, elapsed))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+            list(pool.map(fire, range(concurrency)))
+
+        busy = [r for r in results if r[0] == 503]
+        ok = [r for r in results if r[0] == 200]
+        assert len(ok) == web._SCAN_CONCURRENCY_LIMIT, (
+            f"expected exactly {web._SCAN_CONCURRENCY_LIMIT} requests to succeed, got {len(ok)}")
+        assert len(busy) == concurrency - web._SCAN_CONCURRENCY_LIMIT, (
+            f"expected the remaining {concurrency - web._SCAN_CONCURRENCY_LIMIT} requests "
+            f"to get 503 busy, got {len(busy)}")
+        for _status, headers, elapsed in busy:
+            assert headers.get("Retry-After") is not None, "503 busy must carry Retry-After"
+            assert headers.get("Cache-Control") == "no-store"
+            assert elapsed < web._SCAN_WAIT_TIMEOUT_SECONDS + 5, (
+                f"a busy response took {elapsed:.1f}s - the handler thread was not "
+                f"released promptly")
+
+        # Thread count must return to baseline once the slow "ok" scans finish too.
+        deadline = time.time() + slow_seconds + 15
+        while threading.active_count() > baseline_threads and time.time() < deadline:
+            time.sleep(0.05)
+        assert threading.active_count() <= baseline_threads + 1, (
+            f"thread count did not return to baseline: {threading.active_count()} "
+            f"vs baseline {baseline_threads}")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_validation_stays_inside_the_scan_concurrency_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#246 final round (finding 1): the raw scan and its validation used to
+    run as two SEPARATE steps, only the first (``store._scan_messages_with_
+    paths``) inside the permit - a confirmation read's probe slowed
+    validation instead of the scan and admitted 8 concurrent validators
+    against a concurrency bound of 2, because validation ran AFTER the slot
+    was released. ``_scan_and_validate_bounded`` now holds ONE permit across
+    both steps; slow ``validate_scanned_rows`` directly (not the scan) and
+    confirm peak concurrent validator calls never exceeds the bound.
+
+    Like `test_concurrent_attention_and_lead_chat_requests_bound_scan_
+    concurrency`, this measures ONLY the concurrency bound and asserts zero
+    request failures - a queued request waiting its turn behind the bound
+    on a sufficiently slow CI runner could otherwise legitimately exceed
+    `_SCAN_WAIT_TIMEOUT_SECONDS` (3s) and get a busy 503, which would be
+    a false failure here, not a real one (macOS CI red on the sibling test,
+    2026-09-30). Patch the wait timeout high for the same reason.
+    """
+    monkeypatch.setattr(web, "_SCAN_WAIT_TIMEOUT_SECONDS", 120.0)
+    store = _make_store(tmp_path)
+    for i in range(5):
+        store.send(sender="alpha", recipient="beta", body=f"m{i}")
+
+    peak_lock = threading.Lock()
+    active = {"n": 0}
+    peak = {"n": 0}
+    real_validate = web._snapshots.validate_scanned_rows
+
+    def slow_validate(*args, **kwargs):
+        with peak_lock:
+            active["n"] += 1
+            peak["n"] = max(peak["n"], active["n"])
+        time.sleep(0.15)
+        try:
+            return real_validate(*args, **kwargs)
+        finally:
+            with peak_lock:
+                active["n"] -= 1
+
+    monkeypatch.setattr(web._snapshots, "validate_scanned_rows", slow_validate)
+
+    server, thread, base = _serve(store)
+    try:
+        concurrency = web._SCAN_CONCURRENCY_LIMIT + 4
+        errors: list[BaseException] = []
+        errors_lock = threading.Lock()
+
+        def fire(_i: int) -> None:
+            try:
+                with _urlopen(f"{base}/api/messages", timeout=15) as resp:
+                    resp.read()
+            except Exception as exc:  # noqa: BLE001
+                with errors_lock:
+                    errors.append(exc)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+            list(pool.map(fire, range(concurrency)))
+
+        assert not errors, f"requests failed: {errors!r}"
+        limit = web._SCAN_CONCURRENCY_LIMIT
+        assert peak["n"] <= limit, (
+            f"peak concurrent validators {peak['n']} exceeded the bound "
+            f"{limit} - validation is escaping the scan's permit scope")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _slow_scan(store: Store, *, factor: float = 3.0):
+    """Patch ``store._scan_messages_with_paths`` to sleep ``factor *
+    _SCAN_WAIT_TIMEOUT_SECONDS`` before running for real. Long relative to
+    the timeout (not just barely longer): concurrent requests do not all
+    reach the semaphore at the exact same instant (connection/accept
+    staggering), so a margin too close to the timeout makes an excess
+    request's ACTUAL wait borderline and racy (#246 recast completion's own
+    tuning note). Returns the sleep duration in seconds."""
+    real_scan = store._scan_messages_with_paths
+    slow_seconds = web._SCAN_WAIT_TIMEOUT_SECONDS * factor
+
+    def slow_scan(*args, **kwargs):
+        time.sleep(slow_seconds)
+        return real_scan(*args, **kwargs)
+
+    store._scan_messages_with_paths = slow_scan
+    return slow_seconds
+
+
+def test_attention_saturation_returns_503_even_on_the_stuck_agent_path(
+    tmp_path: Path,
+) -> None:
+    """#246 final round (finding 2): ``build_attention``'s STUCK-agent
+    enrichment (``if agents is None: try: ... except Exception: agents =
+    []``) used to catch ``ScanBusy`` too - a saturated scan bound degraded
+    SILENTLY into a 200 with an EMPTY items list (no stuck item, no partial
+    indicator), instead of the 503 every other saturated source now gets.
+    Set up a genuinely stuck agent (so a non-busy response would show a
+    STUCK item) and confirm a saturated scan still answers 503 for the
+    excess requests, and that every 200 that DOES come back carries the
+    stuck item - never a quietly-incomplete success.
+    """
+    store = _make_store(tmp_path)
+    store.write_heartbeat("alpha")
+    _write_health(store, "alpha", _hm.STATE_STUCK_SUSPECTED, cli="claude", mode="wrapper-loop")
+    slow_seconds = _slow_scan(store)
+
+    server, thread, base = _serve(store)
+    try:
+        concurrency = web._SCAN_CONCURRENCY_LIMIT + 2
+        results: list[tuple] = []
+        results_lock = threading.Lock()
+
+        def fire(_i: int) -> None:
+            req = urllib.request.Request(f"{base}/api/attention")  # noqa: S310  # nosemgrep
+            try:
+                with _urlopen(req, timeout=slow_seconds + 25) as resp:
+                    status, headers, payload = (
+                        resp.status, resp.headers, json.loads(resp.read()))
+            except urllib.error.HTTPError as exc:
+                status, headers, payload = exc.code, exc.headers, json.loads(exc.read())
+            with results_lock:
+                results.append((status, headers, payload))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+            list(pool.map(fire, range(concurrency)))
+
+        busy = [r for r in results if r[0] == 503]
+        ok = [r for r in results if r[0] == 200]
+        assert busy, "saturation never produced a single 503 - test is not exercising the bound"
+        for _status, headers, _payload in busy:
+            assert headers.get("Retry-After") is not None
+            assert headers.get("Cache-Control") == "no-store"
+        for _status, _headers, payload in ok:
+            assert any(it.get("source") == "stuck" for it in payload.get("items", [])), (
+                "a 200 response is missing the stuck item - ScanBusy was silently "
+                "swallowed into an empty agents list instead of answering 503")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_threads_saturation_returns_503_busy_never_degraded(tmp_path: Path) -> None:
+    """#246 final round (finding 4): ``build_threads_index``'s fail-safe
+    catch used to swallow ``ScanBusy`` into a 200 body with ``error:
+    "threads_unavailable"`` and no ``Retry-After`` - indistinguishable from a
+    genuine ledger corruption, and not retryable the way every other
+    saturated source now is. A saturated scan bound must answer 503 instead.
+    """
+    store = _make_store(tmp_path)
+    store.send(sender="alpha", recipient="beta", body="m0")
+    slow_seconds = _slow_scan(store)
+
+    server, thread, base = _serve(store)
+    try:
+        concurrency = web._SCAN_CONCURRENCY_LIMIT + 2
+        results: list[tuple] = []
+        results_lock = threading.Lock()
+
+        def fire(_i: int) -> None:
+            req = urllib.request.Request(f"{base}/api/threads")  # noqa: S310  # nosemgrep
+            try:
+                with _urlopen(req, timeout=slow_seconds + 20) as resp:
+                    status, headers, payload = (
+                        resp.status, resp.headers, json.loads(resp.read()))
+            except urllib.error.HTTPError as exc:
+                status, headers, payload = exc.code, exc.headers, json.loads(exc.read())
+            with results_lock:
+                results.append((status, headers, payload))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+            list(pool.map(fire, range(concurrency)))
+
+        busy = [r for r in results if r[0] == 503]
+        ok = [r for r in results if r[0] == 200]
+        assert busy, "saturation never produced a single 503 - test is not exercising the bound"
+        for _status, headers, _payload in busy:
+            assert headers.get("Retry-After") is not None
+            assert headers.get("Cache-Control") == "no-store"
+        for _status, _headers, payload in ok:
+            assert "error" not in payload, (
+                f"a 200 response degraded instead of answering 503: {payload!r}")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_risk_register_saturation_returns_503_busy_never_degraded(tmp_path: Path) -> None:
+    """#246 final round (finding 4): ``build_risk_register``'s inner
+    (stuck-agent) AND outer (whole-route) fail-safe catches used to swallow
+    ``ScanBusy`` into a 200 body with ``partial: true`` / ``errors`` instead
+    of the retryable 503 every other saturated source now gets."""
+    store = _make_store(tmp_path)
+    store.send(sender="alpha", recipient="beta", body="m0")
+    slow_seconds = _slow_scan(store)
+
+    server, thread, base = _serve(store)
+    try:
+        concurrency = web._SCAN_CONCURRENCY_LIMIT + 2
+        results: list[tuple] = []
+        results_lock = threading.Lock()
+
+        def fire(_i: int) -> None:
+            req = urllib.request.Request(f"{base}/api/risk-register")  # noqa: S310  # nosemgrep
+            try:
+                with _urlopen(req, timeout=slow_seconds + 25) as resp:
+                    status, headers, payload = (
+                        resp.status, resp.headers, json.loads(resp.read()))
+            except urllib.error.HTTPError as exc:
+                status, headers, payload = exc.code, exc.headers, json.loads(exc.read())
+            with results_lock:
+                results.append((status, headers, payload))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+            list(pool.map(fire, range(concurrency)))
+
+        busy = [r for r in results if r[0] == 503]
+        ok = [r for r in results if r[0] == 200]
+        assert busy, "saturation never produced a single 503 - test is not exercising the bound"
+        for _status, headers, _payload in busy:
+            assert headers.get("Retry-After") is not None
+            assert headers.get("Cache-Control") == "no-store"
+        for _status, _headers, payload in ok:
+            assert payload.get("partial") is False and "errors" not in payload, (
+                f"a 200 response degraded instead of answering 503: {payload!r}")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_lead_chat_get_saturation_returns_503_busy_never_degraded(
+    tmp_path: Path,
+) -> None:
+    """#246 final round: ``build_lead_chat``'s fail-safe catch already
+    re-raised ``ScanBusy`` (round 2); this pins it stays that way through an
+    HTTP-level saturation run, alongside the newly-fixed sibling routes."""
+    store = _make_store(tmp_path)
+    store.set_role("alpha", "lead")
+    store.write_heartbeat("alpha")
+    slow_seconds = _slow_scan(store)
+
+    server, thread, base = _serve(store)
+    try:
+        concurrency = web._SCAN_CONCURRENCY_LIMIT + 2
+        results: list[tuple] = []
+        results_lock = threading.Lock()
+
+        def fire(_i: int) -> None:
+            req = urllib.request.Request(f"{base}/api/lead-chat")  # noqa: S310  # nosemgrep
+            try:
+                with _urlopen(req, timeout=slow_seconds + 25) as resp:
+                    status, headers, payload = (
+                        resp.status, resp.headers, json.loads(resp.read()))
+            except urllib.error.HTTPError as exc:
+                status, headers, payload = exc.code, exc.headers, json.loads(exc.read())
+            with results_lock:
+                results.append((status, headers, payload))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+            list(pool.map(fire, range(concurrency)))
+
+        busy = [r for r in results if r[0] == 503]
+        ok = [r for r in results if r[0] == 200]
+        assert busy, "saturation never produced a single 503 - test is not exercising the bound"
+        for _status, headers, _payload in busy:
+            assert headers.get("Retry-After") is not None
+            assert headers.get("Cache-Control") == "no-store"
+        for _status, _headers, payload in ok:
+            assert "error" not in payload, (
+                f"a 200 response degraded instead of answering 503: {payload!r}")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_lead_chat_answer_post_maps_scan_busy_to_503_not_disconnect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#246 final round (finding 3): only ``do_GET`` mapped ``ScanBusy`` to
+    503 - the escalation-answer POST (``_handle_lead_chat_post`` ->
+    ``build_lead_chat``) had NO ``ScanBusy`` handling at all, so a saturated
+    scan bound on this path used to escape ``do_POST`` as an unhandled
+    exception (a bare disconnect client-side) instead of the same retryable
+    503 every GET route answers with.
+
+    A genuine real-concurrency race here would need this POST's TWO
+    sequential scan-bounded stages inside ``build_lead_chat`` (messages +
+    pending_decisions) to line up against the bound at the exact right
+    moment - slow and inherently racy. Force the EXACT failure directly
+    instead (``build_lead_chat`` raising ``ScanBusy``, precisely what a
+    saturated bound raises): deterministic, and still exercises the real
+    ``do_POST`` dispatch end to end, proven by the same style already used
+    elsewhere in this file (``monkeypatch.setattr(web,
+    "_send_authenticated_lead_chat", ...)``) for patching a module-level
+    function a request-handler closure calls by bare name.
+    """
+    store = _make_store(tmp_path)
+    store.set_role("alpha", "lead")
+
+    def busy_build_lead_chat(*args, **kwargs):
+        raise web.ScanBusy()
+
+    monkeypatch.setattr(web, "build_lead_chat", busy_build_lead_chat)
+
+    server, thread, base = _serve(store, enable_actions=True)
+    try:
+        token = _session(base)["csrf_token"]
+        data = json.dumps({"to_request": "esc-choice", "body": "ship"}).encode("utf-8")
+        req = urllib.request.Request(  # noqa: S310  # nosemgrep
+            f"{base}/api/lead-chat", method="POST", data=data,
+            headers={
+                "Content-Type": "application/json",
+                "X-CSRF-Token": token,
+                "Origin": base,
+            })
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            _urlopen(req, timeout=10)
+        exc = exc_info.value
+        assert exc.code == 503
+        assert exc.headers.get("Retry-After") is not None
+        assert exc.headers.get("Cache-Control") == "no-store"
+        assert json.loads(exc.read()) == {
+            "error": "busy",
+            "retry_after": web._SCAN_BUSY_RETRY_AFTER_SECONDS,
+        }
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_read_after_publication_is_never_missed(tmp_path: Path) -> None:
+    """#246 (both the round-1 generation-check and the recast that replaced
+    it address this): a request that starts AFTER a message was
+    successfully published must see it. Since the recast stops sharing
+    scan results entirely - every caller always runs its own fresh scan -
+    this holds unconditionally, by construction, with no publication
+    signal needed at all. Regression-pins it anyway: pause one call's
+    enumeration open (event-synchronized, not a sleep-and-hope race),
+    publish a second message via an INDEPENDENT ``Store`` handle (mirroring
+    a separate request/connection) while it is held open, then run a
+    plain, unblocked SECOND call and confirm it sees both messages -
+    exactly the shape a request that starts after the publish has.
+    """
+    store = _make_store(tmp_path)
+    store.send(sender="alpha", recipient="beta", body="first-message")
+    cfg = store.load_config()
+
+    entered, proceed = _pausable_enumeration(store)
+
+    held_result = {}
+    held = threading.Thread(
+        target=lambda: held_result.update(bodies={m.body for m in web._all_messages(store, cfg=cfg)}))
+    held.start()
+    assert entered.wait(timeout=5), "held call never finished its enumeration"
+
+    independent_store = Store(store.root)
+    independent_store.send(sender="alpha", recipient="beta", body="second-message")
+
+    # A plain request starting NOW (after the publish) must see both
+    # messages - it runs its own fresh scan, unaffected by the held one.
+    msgs, _rejects = web._validated_for_state(store, cfg)
+    assert {m.body for m in msgs} == {"first-message", "second-message"}, (
+        "a request started after a successful publish did not see it")
+
+    proceed.set()
+    held.join(timeout=5)
+    assert not held.is_alive()
+    # The held call legitimately keeps seeing only what existed when its
+    # enumeration ran - it started before the publish.
+    assert held_result["bodies"] == {"first-message"}
+
+
+def test_signing_enforcement_change_is_always_applied_fresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#246 (originally F1, now holds by construction under the recast):
+    two concurrent calls, one whose own trust decision predates signing
+    enforcement turning on and one whose own trust decision postdates it,
+    must each reflect THEIR OWN context - never share a verdict. Since
+    nothing is shared anymore, this is a directness check rather than a
+    race: it still runs the two calls genuinely concurrently (one held open
+    right at its own trust decision while enforcement turns on, the other
+    started only after) to pin that a future change cannot reintroduce
+    sharing without breaking this test. Uses ``_pausable_trust`` (not
+    ``_pausable_enumeration``): trust is read LIVE, AFTER the scan, by
+    every caller, so pausing only the scan would not freeze the held
+    call's signing verdict at all.
+    """
+    monkeypatch.setenv("AGENTTALK_HMAC_KEY_FILE", str(tmp_path / "k.key"))
+    store = _make_store(tmp_path)
+    store.send(sender="alpha", recipient="beta", body="unsigned-body")
+    cfg = store.load_config()
+    assert store.signing_enforced() is False
+
+    entered, proceed = _pausable_trust(monkeypatch)
+
+    before_result = {}
+    before = threading.Thread(
+        target=lambda: before_result.update(bodies={m.body for m in web._all_messages(store, cfg=cfg)}))
+    before.start()
+    assert entered.wait(timeout=5), "the held call never reached its trust decision"
+
+    signing.init_key(store.project_id())
+    assert store.signing_enforced() is True
+
+    # A call starting NOW (after enforcement turned on) must reject the
+    # unsigned message - its own, independent trust decision.
+    msgs, _rejects = web._validated_for_state(store, cfg)
+    assert "unsigned-body" not in {m.body for m in msgs}, (
+        "a call started after signing enforcement turned on still rendered "
+        "an unsigned message")
+
+    proceed.set()
+    before.join(timeout=5)
+    assert not before.is_alive()
+    # The held call legitimately keeps its own (pre-enforcement) verdict.
+    assert "unsigned-body" in before_result["bodies"]
+
+
+def test_roster_change_is_always_applied_fresh(tmp_path: Path) -> None:
+    """#246 (originally F1, now holds by construction under the recast):
+    same shape as the signing test, for a roster/config change - a call
+    starting after an agent is added to the roster must see a message from
+    that agent; a call already in flight before the change legitimately
+    keeps using the roster it loaded."""
+    store = _make_store(tmp_path)
+    store.send(sender="alpha", recipient="beta", body="known-agent-body")
+    _hand_write_message(store, {
+        "id": "20990101-000000-000000-GAMA", "ts": "2099-01-01T00:00:00Z",
+        "from": "gamma", "to": "alpha", "kind": "message",
+        "subject": "", "body": "new-agent-body", "meta": {},
+    })
+
+    entered, proceed = _pausable_enumeration(store)
+
+    before_cfg = store.load_config()
+    before_result = {}
+    before = threading.Thread(
+        target=lambda: before_result.update(
+            bodies={m.body for m in web._all_messages(store, cfg=before_cfg)}))
+    before.start()
+    assert entered.wait(timeout=5), "the held call never finished its enumeration"
+
+    store.add_agent("gamma")
+
+    # A call starting NOW, with a freshly-reloaded cfg, must see gamma's
+    # message.
+    after_cfg = store.load_config()
+    msgs, _rejects = web._validated_for_state(store, after_cfg)
+    assert "new-agent-body" in {m.body for m in msgs}, (
+        "a call started after the roster change did not see the new agent's message")
+
+    proceed.set()
+    before.join(timeout=5)
+    assert not before.is_alive()
+    # The held call legitimately keeps using the roster it loaded before
+    # the change.
+    assert "new-agent-body" not in before_result["bodies"]
+
+
 # ===================================== 0.18.0 (WP02): retired history parity
 
 def test_retired_history_renders_on_message_routes(tmp_path: Path) -> None:
