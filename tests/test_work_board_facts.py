@@ -607,3 +607,56 @@ def test_unknown_fallback_cards_carry_repo_binding(monkeypatch, fallback):
         monkeypatch.setattr(work_board, "_evaluate_item", broken)
     item = next(i for i in work_board.reduce(bus.messages, lead=LEAD)["items"] if i["work_item"] == ITEM)
     assert item["workflow_column"] == "unknown" and item["repo_binding"] is None
+
+
+# ---------------------------------------------------------------- #249 residuals
+
+def test_partial_negative_across_targets_stays_unknown(tmp_path, repo, monkeypatch):
+    path, merged, _ = repo
+    git(path, "update-ref", "refs/heads/release", git(path, "rev-parse", "master"))
+    git(path, "update-ref", "refs/heads/master", git(path, "rev-parse", merged + "^"))
+    release = git(path, "rev-parse", "release")
+    store = team(tmp_path, path, targets=["refs/heads/master", "refs/heads/release"])
+    publish(store, {"item-merged": merged})
+    probe = F._probe
+    monkeypatch.setattr(F, "_probe", lambda real, head, target: (
+        None if target == release else probe(real, head, target)))
+    result = F.verify_merges(store)  # master says no, release times out
+    assert [f["result"] for f in result["facts"]] == ["not_integrated"] and result["unknown"]
+    card = board(store)[0]["item-merged"]
+    assert card["integration"] == {}
+    assert card["reason"].endswith("; integration evidence incomplete (no fresh result for refs/heads/release)")
+    monkeypatch.setattr(F, "_probe", probe)  # a negative for every selected target is still a negative
+    git(path, "update-ref", "refs/heads/release", git(path, "rev-parse", merged + "^"))
+    F.verify_merges(store)
+    assert board(store)[0]["item-merged"]["integration"] == {merged: False}
+
+
+def test_oversized_facts_file_is_left_untouched(tmp_path, repo, capsys):
+    path, merged, _ = repo
+    store = team(tmp_path, path)
+    publish(store, {"item-merged": merged})
+    target = store.state_dir / F.FACTS_FILE
+    before = json.dumps({"schema_version": 1, "plans": {"keep": "x" * F.MAX_FILE_BYTES}})
+    target.write_text(before, encoding="utf-8")
+    assert cli.main(["--root", str(store.root), "board", "verify-merges"]) == 2
+    assert "exceeds the 512 KiB read bound; it was left untouched" in capsys.readouterr().err
+    assert target.read_text(encoding="utf-8") == before
+
+
+def test_unconfigured_run_refuses_before_publishing(tmp_path, repo, capsys):
+    path, merged, _ = repo
+    store = team(tmp_path, path)
+    publish(store, {"item-merged": merged})
+    F.verify_merges(store)
+    target = store.state_dir / F.FACTS_FILE
+    before = target.read_bytes()
+    configure(store, work_repos={})
+    assert cli.main(["--root", str(store.root), "board", "verify-merges"]) == 2
+    assert "no usable work_repos alias is configured" in capsys.readouterr().err
+    assert target.read_bytes() == before
+    assert F.verify_merges(store, dry_run=True)["facts"] == []  # a dry run still reports
+    configure(store, work_repos={"bad": {"path": "relative", "targets": ["refs/heads/master"]}})
+    with pytest.raises(F.VerifyRefused, match="nothing was published; work_repos.bad: path must be absolute"):
+        F.verify_merges(store)
+    assert target.read_bytes() == before
