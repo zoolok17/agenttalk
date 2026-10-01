@@ -120,6 +120,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **No more false "undelivered reply" alarm after a correctly answered work order (#258).**
+  Before, if a seat answered a task with the CLI reply AND also left its
+  automatic reply draft, the seat's next turn would raise a
+  "stray reply draft" alarm flagged needs_operator — even though the reply
+  had in fact landed and the leftover draft was a deliberate, already-traced
+  record of a two-channel race (not a lost reply). Now that case raises no
+  alarm at all; a genuinely lost reply — a draft with no such trace — still
+  raises the alarm exactly once, unchanged. What you will notice: after
+  answering a work order normally, the lead no longer gets a false
+  needs_operator "stray draft" ping the next turn.
+
 - **Work board Done lane: three residuals from the #247 review (#249).**
   - A partial negative is no longer shown as not integrated. When an item
     selects two targets and only one has a fresh negative result (the other
