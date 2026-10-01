@@ -35,6 +35,7 @@ _FACT_KEYS = {"project", "repo_alias", "repo_path", "work_item", "candidate", "t
               "checked_at", "result"}
 _TIMED_OUT = "git unavailable or timed out"
 _SCHEMA_UNSUPPORTED = "integration facts schema unsupported"
+_OVERSIZE = "integration facts exceed their size bound"
 
 
 class VerifyRefused(ValueError):
@@ -227,6 +228,9 @@ def _verify(store, now, *, dry_run):
     now = now or datetime.now(timezone.utc)
     cfg = store.load_config()
     aliases, default, problems = repo_aliases(cfg)
+    if not aliases and not dry_run:  # publishing now would silently erase the last proof
+        raise VerifyRefused("no usable work_repos alias is configured (see docs/WORK-BOARD-FEED.md); "
+                            "nothing was published" + "".join(f"; {p}" for p in problems[:5]))
     project, opened, facts, unknown = store.project_id(), {}, [], []
     for item in _candidates(store, cfg):
         slug, candidate = item["work_item"], item["candidate"]
@@ -275,7 +279,7 @@ def _read(path):
     except OSError:
         return None, "integration facts unreadable"
     if len(raw) > MAX_FILE_BYTES:
-        return None, "integration facts exceed their size bound"
+        return None, _OVERSIZE
     try:
         doc = json.loads(raw.decode("utf-8"))
     except ValueError:
@@ -295,6 +299,9 @@ def _write_section(store, name, section):
         if warning == _SCHEMA_UNSUPPORTED:
             raise VerifyRefused(f"{path} has an unsupported schema_version; it was left untouched "
                                 "and nothing was published")
+        if warning == _OVERSIZE:
+            raise VerifyRefused(f"{path} exceeds the {MAX_FILE_BYTES // 1024} KiB read bound; it was left "
+                                "untouched and nothing was published")
         if "session_id" in section and section["session_id"] != store.load_config().get("session_id"):
             raise VerifyRefused("the store session changed during this run (a reset); nothing was published")
         doc = doc or {"schema_version": SCHEMA_VERSION}
@@ -367,8 +374,11 @@ def integration_for(items, evidence):
         merged = next((f for f in fresh if f["result"] == "integrated"), None)
         if merged:
             integrated[key] = {k: merged[k] for k in ("repo_alias", "target_ref", "target_oid", "checked_at")}
-        elif fresh:
+        elif fresh and {f["target_ref"] for f in fresh} >= set(targets):
             integrated[key] = False
+        elif fresh:  # a partial negative is not a negative
+            missing = ", ".join(sorted(set(targets) - {f["target_ref"] for f in fresh}))
+            notes[key] = (f"integration evidence incomplete (no fresh result for {missing})", None)
         elif bound:
             as_of = max(f["checked"] for f in bound).isoformat()
             notes[key] = (f"integration evidence stale (as of {as_of})", as_of)

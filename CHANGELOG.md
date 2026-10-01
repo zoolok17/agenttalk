@@ -145,6 +145,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Work board Done lane: three residuals from the #247 review (#249).**
+  - A partial negative is no longer shown as not integrated. When an item
+    selects two targets and only one has a fresh negative result (the other
+    timed out), the card now stays Unknown with "integration evidence
+    incomplete". A negative now needs fresh evidence for every selected target.
+  - `board verify-merges` no longer replaces a facts file that exceeds its
+    512 KiB read bound, which dropped its other sections. The file is left
+    untouched, and the command exits 2.
+  - With no usable `work_repos` alias configured, a publishing run now refuses
+    before publishing (exit 2) instead of writing an empty integration
+    section.
+
 - **`agenttalk serve`: a corrupt message file silently vanished data instead
   of surfacing the failure (regression from #246).** `_all_messages` wrapped
   its scan+validate call in a broad `except ValueError: return []`, meant
