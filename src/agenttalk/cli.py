@@ -7626,26 +7626,29 @@ def cmd_propose(args: argparse.Namespace) -> int:
     return 0
 
 
-def _roster_members_behind_task_kind(store: Store, roster: list[str],
-                                     *, exclude: str) -> list[tuple[str, str]]:
-    """Active roster members (other than ``exclude``, the sender - obviously
-    current, since it is running this exact check) whose last-advertised
-    ``agenttalk_version`` (``health.json``, stamped every wrapper turn by
-    ``WrapperHealthWriter``) is older than the SENDER'S OWN running
-    ``agenttalk.__version__``, or never advertised one at all. No
-    advertisement is treated the SAME as an old one — never a silent
-    assumption of support (#163 reviewer-3 citation: an un-upgraded
-    reader's own KNOWN_KINDS silently drops an unrecognized ``task``).
+def _recipients_behind_kind(store: Store, recipients: list[str], *,
+                            kind: str, exclude: str) -> list[tuple[str, str]]:
+    """The given ``recipients`` (other than ``exclude``, the sender) whose
+    last-advertised ``agenttalk_version`` (``health.json``, stamped every
+    wrapper turn by ``WrapperHealthWriter``) cannot understand ``kind``.
 
-    Compared against the sender's OWN live version rather than a hardcoded
-    "task shipped in X.Y" constant — see the long comment on
-    ``store.KNOWN_KINDS`` for why a hardcoded guess would be wrong until
-    this repo's own separate release-bump commit lands, and wrong again in
-    general for any later kind. Returns ``(agent, shown_version)`` pairs,
-    ``"unknown"`` for the latter, for the refusal message."""
-    my_version = skill_currency_mod.current_major_minor(__version__)
+    The comparison is against a FIXED per-kind floor (``store_mod.
+    KIND_SUPPORT_FLOOR``), NOT the sender's own running version: ``task``
+    has been understood since v0.88.0, so a 0.88.0+ recipient can parse it
+    no matter how much newer the sender is. Checking only the recipients
+    (not the whole roster) is right because a ``task`` goes to exactly one
+    peer — the other seats' versions are irrelevant to whether THIS
+    message gets through (#201).
+
+    A recipient that never advertised a version (missing, empty, or not a
+    string) is treated the SAME as an old one — never a silent assumption
+    of support (#163 reviewer-3 citation: an un-upgraded reader's own
+    KNOWN_KINDS silently drops an unrecognized ``task``). Returns
+    ``(agent, shown_version)`` pairs, ``"unknown"`` for the latter, for the
+    refusal message."""
+    floor = store_mod.KIND_SUPPORT_FLOOR[kind]
     behind: list[tuple[str, str]] = []
-    for agent in roster:
+    for agent in recipients:
         if agent == exclude:
             continue
         raw = store.read_health_raw(agent)
@@ -7653,7 +7656,7 @@ def _roster_members_behind_task_kind(store: Store, roster: list[str],
         if not isinstance(version, str) or not version.strip():
             behind.append((agent, "unknown"))
             continue
-        if skill_currency_mod.current_major_minor(version) < my_version:
+        if skill_currency_mod.current_major_minor(version) < floor:
             behind.append((agent, version))
     return behind
 
@@ -7669,11 +7672,12 @@ def cmd_task(args: argparse.Namespace) -> int:
     Gated at write time, not just by receiver-side judgement (the exact gap
     #163 exposed): the sender must be the roster's `sole_lead()` or its
     `operator_facing()` liaison, checked against the LIVE config — never
-    the message's own claim. Also refuses if any OTHER active roster member
-    last-advertised an `agenttalk_version` older than task-kind support (an
-    un-upgraded reader would silently DROP this message — see
+    the message's own claim. Also refuses if the RECIPIENT last-advertised
+    an `agenttalk_version` that predates task-kind support (below 0.88.0,
+    an un-upgraded reader would silently DROP this message — see
     `Message.validate`'s docstring), unless `--force`, which sends anyway
-    and prints exactly who will not see it.
+    and prints exactly who will not see it. Other roster members' versions
+    never block a task to a current recipient (#201).
 
     The recipient replies with `agenttalk reply --kind task-response --meta
     status=accepted|declined|done` — a bare prose refusal or `--na` is not
@@ -7711,16 +7715,17 @@ def cmd_task(args: argparse.Namespace) -> int:
             "agenttalk task: empty body (use -m TEXT, --file PATH, or pipe "
             "stdin) — a work order needs actual instructions.\n")
         return 2
-    behind = _roster_members_behind_task_kind(store, roster, exclude=sender)
+    behind = _recipients_behind_kind(store, [recipient], kind="task",
+                                     exclude=sender)
     if behind:
         names = ", ".join(f"{name} ({version})" for name, version in behind)
         if not getattr(args, "force", False):
             sys.stderr.write(
-                "agenttalk task: refusing — these roster members are on an "
-                "agenttalk build that predates task-kind support and would "
-                f"silently DROP this message (unrecognized kind): {names}. "
-                "Upgrade them first, or re-run with --force to send anyway "
-                "(it will not reach them).\n")
+                "agenttalk task: refusing — the recipient is on an agenttalk "
+                "build that predates task-kind support and would silently "
+                f"DROP this message (unrecognized kind): {names}. Upgrade it "
+                "first, or re-run with --force to send anyway (it will not "
+                "reach them).\n")
             return 2
         # --force: still compute and print who will not see it (a
         # non-blocking advisory) before sending anyway - reviewer-3's
@@ -7728,8 +7733,8 @@ def cmd_task(args: argparse.Namespace) -> int:
         # claim that --force "prints exactly who will not see the
         # message," not just silently override the refusal.
         sys.stderr.write(
-            f"agenttalk task: --force — sending anyway. These roster members "
-            f"will NOT see it (agenttalk build predates task-kind support): "
+            f"agenttalk task: --force — sending anyway. This recipient will "
+            f"NOT see it (agenttalk build predates task-kind support): "
             f"{names}.\n")
     meta = _parse_meta(args.meta)
     from agenttalk import work_tags
@@ -7773,16 +7778,29 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
     # the missing copies. Broadcaster-only.
     from agenttalk import work_tags
     resume = getattr(args, "resume", None)
-    def check_task_dispatch(kind):
+    def check_task_dispatch(kind, audience=None):
         if kind != "task":
             return
         if sender not in (store.sole_lead(), store.operator_facing()):
             raise ValueError("only the lead or liaison may dispatch tasks")
-        behind = _roster_members_behind_task_kind(store, roster, exclude=sender)
+        # Version-floor gate: the RESOLVED audience (the members who will
+        # actually get a copy), never the whole roster - seats outside the
+        # audience are irrelevant (#201). ``audience=None`` enforces only
+        # the dispatch privilege (the early call site, before the audience
+        # is known); the version gate runs where the audience is resolved -
+        # after the fan-out plan for a fresh send, on the frozen list for
+        # a resume.
+        if audience is None:
+            return
+        behind = _recipients_behind_kind(store, audience, kind=kind,
+                                         exclude=sender)
+        names = ", ".join(f"{n} ({v})" for n, v in behind)
         if behind and not args.force:
-            raise ValueError("task recipients need an upgrade; use --force to override")
+            raise ValueError(
+                "task recipients need an upgrade (agenttalk build predates "
+                f"task-kind support): {names}; use --force to override")
         if behind:
-            sys.stderr.write(f"agenttalk broadcast: --force; task kind unsupported by {behind}\n")
+            sys.stderr.write(f"agenttalk broadcast: --force; task kind unsupported by {names}\n")
     check_task_dispatch(args.kind)
     if resume:
         if (args.message or getattr(args, "file", None) or args.subject
@@ -7806,7 +7824,6 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
                 f"agenttalk broadcast: only the broadcaster "
                 f"({proto.sender!r}) may resume batch {resume!r}.\n")
             return 2
-        check_task_dispatch(proto.kind)
         resolved = [x for x in
                     ((proto.meta or {}).get("audience_resolved") or "").split(",") if x]
         if not resolved:
@@ -7815,6 +7832,11 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
                 f"audience (pre-0.15.0 broadcast) - re-send by hand with "
                 f"--meta request_id/broadcast_id/audience set.\n")
             return 2
+        # Version-floor gate on the FROZEN audience: the batch was already
+        # accepted under this rule at first send (or force-overridden), so
+        # this keeps --resume from silently resurrecting a fan-out a
+        # refused audience member could no longer parse.
+        check_task_dispatch(proto.kind, audience=resolved)
         vendors = None
         if proto.kind in work_tags.OPENERS:
             vendors = proto.meta.get("assignee_model_vendors", dict.fromkeys(resolved, "unverified"))
@@ -7940,6 +7962,9 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
             f"besides {sender}.\n"
         )
         return 2
+    # Version-floor gate for --kind task, now that the audience is resolved
+    # (#201: only the members who will actually get a copy are checked).
+    check_task_dispatch(args.kind, audience=recipients)
     body = _read_body(args)
     if not body and not args.allow_empty:
         sys.stderr.write(
@@ -15769,8 +15794,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="(#163) Send a `task`: a lead work order the recipient must "
              "execute or explicitly decline. Gated: sender must be the "
              "roster's sole_lead() or operator_facing() liaison (live "
-             "config); refuses if any other roster member's advertised "
-             "agenttalk_version predates task-kind support unless --force. "
+             "config); refuses if the RECIPIENT's advertised "
+             "agenttalk_version predates task-kind support (first "
+             "understood in 0.88.0; other roster members are irrelevant) "
+             "unless --force. "
              "Peer replies with `reply --kind task-response --meta "
              "status=accepted|declined|done`.",
     )
