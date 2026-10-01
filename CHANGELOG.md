@@ -14,10 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Work board: a Planned lane from the lead's plan files.** `agenttalk board
   import-plan <file>` reads a plan's work-items table and records its rows in
   the same facts file `verify-merges` writes to, in their own versioned
-  section. A plan row with no dispatch yet now shows on the board as Planned;
-  once the item is actually dispatched, the board shows its real progress
-  instead, never the plan's guess. A work item named in more than one plan
-  shows as Unknown rather than picking either plan silently. See
+  section; `agenttalk board retire-plan <plan id>` clears one plan's rows
+  once it is done or abandoned. A plan row with no dispatch yet now shows on
+  the board as Planned; once the item is actually dispatched, the board
+  shows its real progress instead, never the plan's guess. A work item named
+  in more than one plan shows as Unknown rather than picking either plan
+  silently. A plan's identity is normally its title, but an optional
+  `Plan id:` line lets it survive a later rename. See
   `docs/WORK-BOARD-FEED.md` for the full import contract.
 - **Work board: a Done lane from lead-run, Git-verified merge facts (#207).**
   The reducer could already place Done from integration evidence, but nothing

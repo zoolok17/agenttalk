@@ -148,6 +148,11 @@ The snapshot worker reads the file on every refresh, bounded and schema-checked:
   in `errors`. A missing file is silent only while `work_repos` is not
   configured. Any other fault while reading or selecting the evidence also
   becomes a warning. The facts never error the board and never imply Done.
+- The file existing with no `integration` section at all (for example, only
+  `import-plan` has ever run against this store) reads the same as a missing
+  file: silent while `work_repos` is not configured, else a warning saying
+  evidence is missing — never the `malformed` warning, which is reserved for
+  a section that IS present but does not parse as valid facts.
 - A fact whose project, alias path or target no longer matches the config is
   ignored, with a warning, so old proof is never reused after a remap.
 - A fact counts only for the item's CURRENT binding: its declared `work_repo`
@@ -186,7 +191,7 @@ plain, versioned, portable contract — any plan file in this shape is
 understood, without needing the lead's own private template
 (`plan-template.md`, kept outside this repository).
 
-### Command
+### Commands
 
 `agenttalk board import-plan <file>` reads one plan file and records its
 section 5 rows in the facts file wb-done-facts created above
@@ -198,8 +203,10 @@ It exits 2, having published nothing, when the plan file:
 
 - does not exist, is unreadable, is not valid UTF-8, or exceeds the 512 KiB
   read bound;
-- has no `# Plan: <name>` title line, or the title does not yield a usable
-  plan id (see below);
+- has no `# Plan: <name>` title line;
+- has an explicit `Plan id:` line that is not a lowercase slug of at most 64
+  characters, or (with no explicit line) a title that yields no usable slug
+  (see **Plan id** below);
 - has no `Plan revision: rN` line;
 - has no `## 5. Work items` section, or that section has no table, or the
   table is missing the `work_item`, `Phase`, `Owner (vendor)` (or `Owner`) or
@@ -207,34 +214,64 @@ It exits 2, having published nothing, when the plan file:
 - has a table row whose `work_item` is not a lowercase slug of at most 64
   characters, or that repeats a `work_item` already seen in this plan's own
   table;
+- derives its plan id from the title (no explicit `Plan id:` line) and that
+  id already names a DIFFERENT plan's stored rows (a title collision — see
+  **Plan id**);
 - would leave the facts file over its 512 KiB size bound.
 
-A row with an empty `Phase`, `Owner` or `Starts when` cell is skipped with a
-reason; the rest of the plan still imports, as long as at least one row
-survives. The command lists every skipped row. Otherwise it exits 0.
+A table row is SKIPPED, with a reason, rather than failing the whole import,
+when it has an empty `Phase`, `Owner` or `Starts when` cell, or the wrong
+number of cells for the header (a markdown authoring slip, or an unescaped
+`|` inside a cell — see **Escaped pipes** below). The rest of the plan still
+imports around it; the command lists every skipped row (and so does the
+`--json` output, under `skipped`). A table with a valid header and ZERO
+surviving rows — written empty, or emptied by skipping every row — is a
+valid, empty plan: this is how a plan's rows are cleared without retiring it
+outright. Otherwise the command exits 0.
+
+`agenttalk board retire-plan <plan id>` atomically removes one plan id's
+rows from the `planned` section — for a plan that is done, abandoned, or
+renamed without keeping its old id. It exits 2, publishing nothing, if no
+rows are currently recorded for that plan id. Every other plan id's rows and
+the `integration` section are untouched either way.
 
 ### The import contract
 
 - **Schema version:** the `planned` section carries its own
   `schema_version` (currently 1), checked independently of the facts file's
   own top-level `schema_version`. A section with an unsupported version is
-  left untouched and the import is refused, never silently reset.
-- **Plan id:** the title's text after `# Plan: `, lowercased, with every run
-  of characters outside `a-z0-9` collapsed to one `-`, trimmed of leading and
-  trailing `-`, and capped at 64 characters. Renaming the file never changes
-  the plan id; changing the title does. Two different plan files that happen
-  to share a title collide by design — treat the title as the plan's stable
-  name.
+  left untouched and the import (or retirement) is refused, never silently
+  reset.
+- **Plan id:** an OPTIONAL `Plan id: <id>` line, if present, names the slug
+  that IS the plan's identity (validated the same way a `work_item` is: a
+  lowercase slug of at most 64 characters). It survives a later title
+  change — rename the plan freely, re-import under the same `Plan id:` line,
+  and its rows stay the same entry.
+  Without a `Plan id:` line, the id falls back to the title's own slug
+  (legacy): the title's text after `# Plan: `, lowercased, with every run of
+  characters outside `a-z0-9` collapsed to one `-`, trimmed of leading and
+  trailing `-`, and capped at 64 characters. Renaming the FILE never changes
+  this fallback id; changing the TITLE does — so a renamed plan, re-imported
+  under its new title with no `Plan id:` line, becomes a new, separate entry,
+  and the old one is only cleared by `retire-plan` (or by the next import
+  that happens to collide, see below).
+  **Collision guard:** two different plans whose titles happen to slugify to
+  the SAME id, with neither using an explicit `Plan id:` line, do not
+  silently overwrite one another — the second import is refused, naming the
+  stored plan's own title and suggesting an explicit `Plan id:` line. Giving
+  either plan its own `Plan id:` line resolves it.
 - **Plan revision:** the literal `rN` token from the `Plan revision:` line
   (everything after it — "supersedes", a status, an owner — is ignored).
 - **Row identity:** `(plan id, work_item)`. A re-import of the same plan id
   REPLACES every row of that plan id atomically: a row dropped from the file
   disappears from the board, and a superseded `plan_rev` replaces the old
   one. A different plan id's rows are a separate entry and are never touched
-  by another plan's import.
+  by another plan's import or retirement.
 - Each row records `work_item`, `phase`, `owner` and `starts_when` — the
   table cell text, verbatim (the owner cell's vendor parenthetical is kept
-  as-is, never parsed further).
+  as-is, never parsed further). A literal `|` inside a cell must be escaped
+  as `\|`, exactly as in ordinary GitHub-flavoured markdown tables; otherwise
+  it would end the cell early and misalign everything after it.
 
 ### Facts file: the `planned` section
 
@@ -284,6 +321,8 @@ integration evidence — there is no execution history to show yet.
 ### Refresh owners
 
 The lead runs `agenttalk board import-plan <file>` after approving or
-revising a plan (section 8 of the plan template's replan rule). Nothing else
-refreshes planned rows, so a merged or abandoned plan stays on the board as
-written until the lead re-imports or the facts file is reset.
+revising a plan (section 8 of the plan template's replan rule), and
+`agenttalk board retire-plan <plan id>` once a plan is fully done or
+abandoned. Nothing else refreshes or clears planned rows, so a merged or
+abandoned plan stays on the board exactly as last imported until the lead
+re-imports (with fewer rows, or an empty table) or retires it.

@@ -47,6 +47,7 @@ _OVERSIZE = "integration facts exceed their size bound"
 # ----------------------------------------------------- plan import (wb-planned-lane)
 _PLANNED_ROW_KEYS = {"work_item", "phase", "owner", "starts_when"}
 _PLAN_TITLE = re.compile(r"^#\s*Plan:\s*(.+?)\s*$", re.MULTILINE)
+_PLAN_ID_LINE = re.compile(r"^Plan id:\s*(\S+)\s*$", re.MULTILINE)
 _PLAN_REV = re.compile(r"^Plan revision:\s*(r\d+)\b", re.MULTILINE)
 _WORK_ITEMS_HEADING = re.compile(r"^##\s*5\.\s*Work items\s*$", re.MULTILINE)
 _NEXT_HEADING = re.compile(r"^##\s", re.MULTILINE)
@@ -308,23 +309,33 @@ def _read(path):
     return doc, None
 
 
-def _write_section(store, name, section):
-    """Replace one section atomically under the facts lock, keeping the others. Refuses
-    to overwrite a file of an unsupported schema, and to publish into a session other
-    than the one the run started in (a store reset in between)."""
+def _write_section(store, name, section=None, *, build=None, refuse_cls=VerifyRefused):
+    """Replace one section atomically under the ONE facts lock every writer shares
+    (verify-merges, import-plan, retire-plan), keeping every other section untouched.
+
+    With ``build``, the new value is computed from the section's CURRENT value (None if
+    absent) INSIDE the lock, so two writers of the SAME section merge correctly instead of
+    racing (import-plan, retire-plan: only their own plan id's entry must change). Without
+    ``build``, ``section`` replaces the section outright - safe only when the caller is
+    already the sole writer of this section by another means (verify-merges' own run lock).
+
+    Refuses to overwrite a file of an unsupported schema, exceed the size bound, or (for a
+    session-bound section) publish after a store reset in between."""
     path = store.state_dir / FACTS_FILE
     with store._exclusive_lock(store.state_dir / LOCK_FILE, what="work board facts"):
         doc, warning = _read(path)
         if warning == _SCHEMA_UNSUPPORTED:
-            raise VerifyRefused(f"{path} has an unsupported schema_version; it was left untouched "
-                                "and nothing was published")
+            raise refuse_cls(f"{path} has an unsupported schema_version; it was left untouched "
+                             "and nothing was published")
         if warning == _OVERSIZE:
-            raise VerifyRefused(f"{path} exceeds the {MAX_FILE_BYTES // 1024} KiB read bound; it was left "
-                                "untouched and nothing was published")
-        if "session_id" in section and section["session_id"] != store.load_config().get("session_id"):
-            raise VerifyRefused("the store session changed during this run (a reset); nothing was published")
+            raise refuse_cls(f"{path} exceeds the {MAX_FILE_BYTES // 1024} KiB read bound; it was left "
+                             "untouched and nothing was published")
         doc = doc or {"schema_version": SCHEMA_VERSION}
-        doc[name] = section
+        new_section = build(doc.get(name)) if build is not None else section
+        if (isinstance(new_section, dict) and "session_id" in new_section
+                and new_section["session_id"] != store.load_config().get("session_id")):
+            raise refuse_cls("the store session changed during this run (a reset); nothing was published")
+        doc[name] = new_section
         text = json.dumps(doc, indent=2, ensure_ascii=False)
         if len(text.encode("utf-8")) > MAX_FILE_BYTES:
             raise ValueError("work board facts would exceed their size bound")
@@ -355,6 +366,9 @@ def _load_integration(store, cfg, now):
         unconfigured = warning.startswith("integration facts missing") and "work_repos" not in cfg
         return {"facts": [], "config": cfg, "warnings": [] if unconfigured else [warning]}
     section = doc.get("integration")
+    if section is None:  # the file exists (e.g. import-plan created it) but verify-merges never ran
+        unconfigured = "work_repos" not in cfg
+        return {"facts": [], "config": cfg, "warnings": [] if unconfigured else ["integration evidence missing"]}
     facts = section.get("facts") if isinstance(section, dict) else None
     if not isinstance(facts, list) or len(facts) > MAX_FACTS or not all(_valid_fact(f) for f in facts):
         return {"facts": [], "config": cfg, "warnings": ["integration facts malformed"]}
@@ -414,10 +428,39 @@ def plan_id_of(plan_name):
     return slug if _SLUG.fullmatch(slug) else None
 
 
+def _split_row(line):
+    """Markdown table cells, splitting on unescaped '|' only - '\\|' is literal pipe content,
+    never a cell delimiter. (A reviewer-found bug: a plain str.split("|") silently misaligned
+    every cell after one containing an escaped pipe, e.g. an owner cell of "dev \\| backup".)
+    The table's own leading/trailing delimiter produces one empty cell at each end; dropped,
+    matching the stripped "|...|".split("|") shape ordinary rows already had."""
+    cells, cur, i = [], [], 0
+    while i < len(line):
+        ch = line[i]
+        if ch == "\\" and i + 1 < len(line) and line[i + 1] == "|":
+            cur.append("|")
+            i += 2
+        elif ch == "|":
+            cells.append("".join(cur).strip())
+            cur = []
+            i += 1
+        else:
+            cur.append(ch)
+            i += 1
+    cells.append("".join(cur).strip())
+    if cells and cells[0] == "":
+        cells = cells[1:]
+    if cells and cells[-1] == "":
+        cells = cells[:-1]
+    return cells
+
+
 def _plan_table(text):
     """(header-cells, [data-row-cells]) of the "## 5. Work items" markdown table, or ([], [])
     if the heading or a table under it is missing. Any row where every cell is a separator
-    (``---``/``:--:``) is dropped, wherever it sits, rather than assumed to be line 2."""
+    (``---``/``:--:``) is dropped, wherever it sits, rather than assumed to be line 2. A table
+    with a valid header and ZERO surviving data rows is a valid, empty table - callers decide
+    whether that is a problem, not this parser."""
     heading = _WORK_ITEMS_HEADING.search(text)
     if not heading:
         return [], []
@@ -427,22 +470,33 @@ def _plan_table(text):
     lines = [ln.strip() for ln in section.splitlines() if ln.strip().startswith("|")]
     if not lines:
         return [], []
-    rows = [[c.strip() for c in ln.strip("|").split("|")] for ln in lines]
+    rows = [_split_row(ln) for ln in lines]
     rows = [r for r in rows if not all(_SEP_CELL.fullmatch(c) for c in r)]
     return (rows[0], rows[1:]) if rows else ([], [])
 
 
 def _parse_plan(text):
-    """(plan_id, plan_name, plan_rev, rows, problems). ``rows`` and ``problems`` are never both
-    non-empty: a malformed table yields problems and no rows, never a partial import."""
+    """(plan_id, explicit_id, plan_name, plan_rev, rows, skipped, problems).
+
+    ``problems`` is FATAL: any entry refuses the whole import, and ``rows``/``skipped`` are
+    both []. ``skipped`` is per-row ([(row text, reason)]) for a row that cannot be used but
+    does not invalidate the rest of an otherwise-valid table (docs/WORK-BOARD-FEED.md): the
+    table still imports around it. A structurally valid table with zero surviving rows - a
+    genuinely empty table, or one where every row was skipped - is a valid plan of zero rows,
+    never a problem: this is what lets a plan be cleared by re-importing an empty table."""
     problems = []
     title = _PLAN_TITLE.search(text)
     plan_name = title.group(1) if title else None
     if not plan_name:
         problems.append("missing a '# Plan: <name>' title line")
-    plan_id = plan_id_of(plan_name) if plan_name else None
-    if plan_name and plan_id is None:
-        problems.append(f"plan title {plan_name!r} does not yield a usable plan id")
+    id_line = _PLAN_ID_LINE.search(text)
+    explicit_id = id_line.group(1) if id_line else None
+    if explicit_id is not None and not _SLUG.fullmatch(explicit_id):
+        problems.append(f"'Plan id: {explicit_id}' is not a lowercase slug of at most 64 characters")
+        explicit_id = None
+    plan_id = explicit_id if explicit_id is not None else (plan_id_of(plan_name) if plan_name else None)
+    if explicit_id is None and plan_name and plan_id is None:
+        problems.append(f"plan title {plan_name!r} does not yield a usable plan id; add a 'Plan id:' line")
     rev = _PLAN_REV.search(text)
     plan_rev = rev.group(1) if rev else None
     if not plan_rev:
@@ -450,7 +504,7 @@ def _parse_plan(text):
     header, data = _plan_table(text)
     if not header:
         problems.append("missing a '## 5. Work items' section with a table")
-        return plan_id, plan_name, plan_rev, [], problems
+        return plan_id, explicit_id, plan_name, plan_rev, [], [], problems
     norm = [re.sub(r"\s+", " ", c).strip().lower() for c in header]
 
     def col(*names):
@@ -461,11 +515,14 @@ def _parse_plan(text):
     missing = [k for k, i in cols.items() if i is None]
     if missing:
         problems.append("section 5 table is missing column(s): " + ", ".join(sorted(missing)))
-        return plan_id, plan_name, plan_rev, [], problems
-    width, seen, rows = max(cols.values()) + 1, set(), []
+        return plan_id, explicit_id, plan_name, plan_rev, [], [], problems
+    if problems:  # a title/id/revision problem already refuses the import; skip row work
+        return plan_id, explicit_id, plan_name, plan_rev, [], [], problems
+    width, seen, rows, skipped = max(cols.values()) + 1, set(), [], []
     for cells in data:
-        if len(cells) < width:
-            problems.append(f"malformed table row (too few columns): {' | '.join(cells)!r}")
+        row_text = " | ".join(cells)
+        if len(cells) != width:
+            skipped.append((row_text, f"wrong number of cells ({len(cells)}, expected {width})"))
             continue
         try:
             work_item = work_tags.value("work_item", cells[cols["work_item"]])
@@ -477,13 +534,13 @@ def _parse_plan(text):
             continue
         phase, owner, starts_when = (cells[cols[k]] for k in ("phase", "owner", "starts_when"))
         if not (phase and owner and starts_when):
-            problems.append(f"work item {work_item!r} is missing phase, owner or starts-when")
+            skipped.append((row_text, f"work item {work_item!r} is missing phase, owner or starts-when"))
             continue
         seen.add(work_item)
         rows.append({"work_item": work_item, "phase": phase, "owner": owner, "starts_when": starts_when})
-    if not rows and not problems:
-        problems.append("section 5 table has no data rows")
-    return plan_id, plan_name, plan_rev, ([] if problems else rows), problems
+    if problems:
+        return plan_id, explicit_id, plan_name, plan_rev, [], [], problems
+    return plan_id, explicit_id, plan_name, plan_rev, rows, skipped, []
 
 
 def _read_plan_text(path):
@@ -502,48 +559,75 @@ def _read_plan_text(path):
         raise PlanRefused(f"{path} is not valid UTF-8 text; nothing was published") from None
 
 
+def _planned_build(plan_id, raise_cls=PlanRefused):
+    """A ``_write_section`` ``build`` callback factory shared by import-plan and retire-plan:
+    checks the planned section's own schema, unwraps its "plans" map, and leaves every OTHER
+    plan id's entry untouched. The caller supplies what happens to THIS plan id's own entry."""
+    def check(current):
+        if current is not None and (not isinstance(current, dict)
+                                    or current.get("schema_version") != PLANNED_SCHEMA_VERSION):
+            raise raise_cls("the planned section has an unsupported schema_version; it was left "
+                            "untouched and nothing was published")
+        return dict(current["plans"]) if current and isinstance(current.get("plans"), dict) else {}
+    return check
+
+
 def import_plan(store, path, *, now=None):
     """Parse a plan file's "## 5. Work items" table and atomically replace THIS plan's rows in
     the same facts file wb-done-facts created, in their own "planned" section. Row identity is
     (plan id, work_item): a re-import replaces every row of this plan_id, so a row dropped from
-    the file disappears and a superseded plan_rev is replaced. Other plans' rows and the
-    integration section are untouched. Refuses, publishing nothing, on a malformed plan file."""
+    the file disappears (including down to zero rows, for a structurally valid empty table) and
+    a superseded plan_rev is replaced. Other plans' rows and the integration section are
+    untouched. Refuses, publishing nothing, on a malformed plan file - a per-row issue the
+    documented contract allows (an empty cell, a cell-count mismatch) is skipped and reported
+    instead, never refused.
+
+    Plan identity: an explicit "Plan id: <id>" line, when present, IS the identity and survives
+    a later title change. Without one, the id falls back to the title's own slug (legacy) - and
+    if that slug already names a DIFFERENT plan's stored rows (a title collision), the import is
+    refused with a message suggesting an explicit "Plan id:" line, rather than silently
+    overwriting a different plan's rows."""
     text = _read_plan_text(path)
-    plan_id, plan_name, plan_rev, rows, problems = _parse_plan(text)
+    plan_id, explicit_id, plan_name, plan_rev, rows, skipped, problems = _parse_plan(text)
     if problems:
         raise PlanRefused("plan file malformed: " + "; ".join(problems))
     now = now or datetime.now(timezone.utc)
     entry = {"project": store.project_id(), "plan_rev": plan_rev, "plan_name": plan_name,
              "written_at": now.isoformat(), "rows": rows}
-    _write_planned(store, plan_id, entry)
-    return {"plan_id": plan_id, "plan_name": plan_name, "plan_rev": plan_rev, "rows": rows}
+    check = _planned_build(plan_id)
+
+    def build(current):
+        plans = check(current)
+        existing = plans.get(plan_id)
+        if explicit_id is None and existing is not None and existing.get("plan_name") != plan_name:
+            raise PlanRefused(
+                f"plan id {plan_id!r} (derived from the title) is already recorded for a "
+                f"different plan ({existing.get('plan_name')!r}); add an explicit "
+                "'Plan id: <id>' line to this plan file to give it its own stable identity")
+        plans = dict(plans, **{plan_id: entry})
+        return {"schema_version": PLANNED_SCHEMA_VERSION, "plans": plans}
+
+    _write_section(store, "planned", build=build, refuse_cls=PlanRefused)
+    return {"plan_id": plan_id, "plan_name": plan_name, "plan_rev": plan_rev, "rows": rows, "skipped": skipped}
 
 
-def _write_planned(store, plan_id, entry):
-    """Replace doc["planned"]["plans"][plan_id] atomically, under the facts lock, keeping every
-    other plan's rows and the integration section exactly as they were."""
-    path = store.state_dir / FACTS_FILE
-    with store._exclusive_lock(store.state_dir / LOCK_FILE, what="work board facts"):
-        doc, warning = _read(path)
-        if warning == _SCHEMA_UNSUPPORTED:
-            raise PlanRefused(f"{path} has an unsupported schema_version; it was left untouched "
-                              "and nothing was published")
-        if warning == _OVERSIZE:
-            raise PlanRefused(f"{path} exceeds the {MAX_FILE_BYTES // 1024} KiB read bound; it was left "
-                              "untouched and nothing was published")
-        doc = doc or {"schema_version": SCHEMA_VERSION}
-        planned = doc.get("planned")
-        if planned is not None and (not isinstance(planned, dict)
-                                    or planned.get("schema_version") != PLANNED_SCHEMA_VERSION):
-            raise PlanRefused("the planned section has an unsupported schema_version; it was left "
-                              "untouched and nothing was published")
-        plans = dict(planned["plans"]) if planned and isinstance(planned.get("plans"), dict) else {}
-        plans[plan_id] = entry
-        doc = dict(doc, planned={"schema_version": PLANNED_SCHEMA_VERSION, "plans": plans})
-        text = json.dumps(doc, indent=2, ensure_ascii=False)
-        if len(text.encode("utf-8")) > MAX_FILE_BYTES:
-            raise ValueError("work board facts would exceed their size bound")
-        _atomic_write_text(path, text)
+def retire_plan(store, plan_id):
+    """Atomically remove one plan id's rows from the planned section - clears an old or renamed
+    plan the board should stop showing. Refuses, publishing nothing, if this plan id has no
+    recorded rows; every other plan id's rows and the integration section are untouched."""
+    if not _SLUG.fullmatch(plan_id):
+        raise PlanRefused(f"{plan_id!r} is not a lowercase slug of at most 64 characters")
+    check = _planned_build(plan_id)
+
+    def build(current):
+        plans = dict(check(current))
+        if plan_id not in plans:
+            raise PlanRefused(f"no planned rows are recorded for plan id {plan_id!r}; nothing changed")
+        del plans[plan_id]
+        return {"schema_version": PLANNED_SCHEMA_VERSION, "plans": plans}
+
+    _write_section(store, "planned", build=build, refuse_cls=PlanRefused)
+    return {"plan_id": plan_id}
 
 
 def _valid_planned_row(row):
@@ -613,4 +697,3 @@ def planned_cards(dispatched, planned):
                        {"phase": row["phase"], "owner": row["owner"], "starts_when": row["starts_when"],
                         "plan_id": plan_id, "plan_name": entry["plan_name"], "plan_rev": entry["plan_rev"]}))
     return out
-    return integrated, notes

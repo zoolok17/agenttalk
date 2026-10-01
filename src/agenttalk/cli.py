@@ -8075,11 +8075,12 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
 
 
 def cmd_board(args: argparse.Namespace) -> int:
-    """`board verify-merges`/`board import-plan`: lead-run, out-of-server facts for the Done
-    and Planned lanes."""
+    """`board verify-merges`/`board import-plan`/`board retire-plan`: lead-run, out-of-server
+    facts for the Done and Planned lanes."""
     action = getattr(args, "board_cmd", None)
-    if action not in ("verify-merges", "import-plan"):
-        sys.stderr.write("agenttalk board: the only actions are `verify-merges` and `import-plan`.\n")
+    if action not in ("verify-merges", "import-plan", "retire-plan"):
+        sys.stderr.write("agenttalk board: the only actions are `verify-merges`, "
+                         "`import-plan` and `retire-plan`.\n")
         return 2
     from agenttalk import work_board_facts
     store = _get_store(args)
@@ -8087,10 +8088,23 @@ def cmd_board(args: argparse.Namespace) -> int:
         # a PlanRefused (ValueError) reaches main(): message on stderr, exit 2
         result = work_board_facts.import_plan(store, args.file)
         if args.json:
-            print(json.dumps(result, indent=2, ensure_ascii=False))
+            print(json.dumps(dict(result, skipped=[{"row": r, "reason": why}
+                                                    for r, why in result["skipped"]]),
+                             indent=2, ensure_ascii=False))
         else:
             print(f"import-plan: plan {result['plan_id']!r} ({result['plan_name']!r}, "
-                  f"{result['plan_rev']}): {len(result['rows'])} row(s) recorded")
+                  f"{result['plan_rev']}): {len(result['rows'])} row(s) recorded, "
+                  f"{len(result['skipped'])} skipped")
+            for row, why in result["skipped"]:
+                print(f"  skipped {row!r}: {why}")
+        return 0
+    if action == "retire-plan":
+        # a PlanRefused (ValueError) reaches main(): message on stderr, exit 2
+        result = work_board_facts.retire_plan(store, args.plan_id)
+        if args.json:
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        else:
+            print(f"retire-plan: plan {result['plan_id']!r} removed")
         return 0
     # a VerifyRefused (ValueError) reaches main(): message on stderr, exit 2
     result = work_board_facts.verify_merges(store, dry_run=args.dry_run)
@@ -15626,6 +15640,15 @@ def build_parser() -> argparse.ArgumentParser:
     pboard_import.add_argument("file", help="Path to the plan markdown file.")
     pboard_import.add_argument("--json", action="store_true")
     pboard_import.set_defaults(func=cmd_board)
+    pboard_retire = boardsub.add_parser(
+        "retire-plan",
+        help="Atomically remove one plan id's rows from the planned section, so an old or "
+             "renamed plan stops showing on the board.",
+    )
+    pboard_retire.add_argument("plan_id", help="The plan id to remove (an explicit 'Plan id:' "
+                                              "line, or the title's slug).")
+    pboard_retire.add_argument("--json", action="store_true")
+    pboard_retire.set_defaults(func=cmd_board)
     pboard.set_defaults(func=cmd_board, board_cmd=None)
 
     pprn = sub.add_parser(
