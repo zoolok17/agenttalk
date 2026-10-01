@@ -25,10 +25,18 @@ between agents are not covered; see "Out of scope" at the end.
   details from the source, or keep the term and explain it in a sentence.
 - Explain every technical term the first time it appears, or avoid it.
 - Never invent a number, a name or a place that the source does not give.
-- Keep every fact. The one exception is anything sensitive: secrets, passwords, keys and
-  tokens; private or customer data; internal-only paths, hostnames or addresses. Remove it,
-  or replace it with a safe summary that keeps the meaning ("a key was rotated"). Moving it
-  to a technical section does not make it safe.
+- Keep every fact. The one exception is anything sensitive:
+  - secrets (passwords, keys, tokens) and private or customer data are removed from every
+    text, whoever reads it;
+  - internal-only paths, hostnames and addresses are removed from anything a public or
+    unauthorized audience sees (release notes, a public page, an error sent to a remote
+    caller). Local diagnostics and private run guides keep the path, or another safe
+    identifier, when it is what lets the person fix the problem.
+
+  Remove it, or replace it with a safe summary that keeps the meaning ("a key was rotated").
+  Moving it to a technical section does not make it safe. This rule never forces a choice
+  between saying what to do next and keeping something private: say what to do with what
+  the reader is allowed to see.
 - Put technical detail last. Where a kind has no closing technical section (code comments,
   interface text), keep only the detail the reader needs and leave the rest to the commit
   message or the pull request.
@@ -37,9 +45,11 @@ between agents are not covered; see "Out of scope" at the end.
   - **Released and deployed.** "Released" means a new version can be installed; it does not
     mean anyone is using it yet. "Deployed" means a running system was switched over to it,
     so people are using it now.
-  - **Null, absent and empty.** The field is there but set to "no value" on purpose (null),
-    the field is left out entirely (absent or undefined), or the field is there but empty (an
-    empty text or an empty list).
+  - **Absent, null, undefined and empty.** Wherever the language or the data format tells them
+    apart, they are different facts, so say which one it is: the field is left out entirely
+    (absent); the field is there but set to "no value" (null); the field is there but holds
+    "undefined" (in JavaScript, `{field: undefined}` still has the field, while `{}` does not);
+    or the field is there but empty (an empty text or an empty list).
 - Be honest about limits and about what was and was not checked.
 
 ## By kind of text
@@ -63,6 +73,10 @@ between agents are not covered; see "Out of scope" at the end.
 - Precision first in reference material: exact names, flags, commands, fields and values stay
   in place, in code font, never replaced by a paraphrase. Explain each one in plain words the
   first time it appears.
+- Proposals: a specification or a design document may describe what is not built yet, when its
+  status is labelled (a `Status: proposed` line, and "will" / "proposed" wording). Never
+  present an unimplemented proposal as something the software already does. Documentation of
+  the current product describes only what has shipped.
 - Scope: apply this to documents you write or change. Do not rewrite untouched documents only
   to change their voice.
 
@@ -84,7 +98,12 @@ between agents are not covered; see "Out of scope" at the end.
 - Length: as short as possible. A label is a word or two; a message is one sentence where it
   can be.
 - Words: use the same name for the same thing everywhere in the interface and the
-  documentation. Never show a secret, a token or an internal path, including in error details.
+  documentation.
+- Privacy: never show a secret (a password, a key, a token), anywhere, including in error
+  details. Hide internal paths and hostnames only from people who should not see them: a
+  public page, or an error sent to a remote caller. A local diagnostic keeps the path, for
+  example `cannot save the order: /var/lib/shop/orders.db is read-only`, because it is what
+  lets the person fix the problem.
 
 ## Out of scope: text for agents
 Messages between agents, task briefs, bus traffic and instructions written for agents (skills,

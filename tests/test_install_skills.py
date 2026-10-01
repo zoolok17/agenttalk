@@ -572,9 +572,11 @@ def test_write_for_humans_keeps_release_and_deploy_apart() -> None:
 
 def test_write_for_humans_keeps_null_absent_and_empty_apart() -> None:
     terms = _flat(_section(_skill(), "TERMS"))
-    assert 'the field is there but set to "no value" on purpose (null)' in terms
-    assert "the field is left out entirely (absent or undefined)" in terms
+    assert "the field is left out entirely (absent);" in terms
+    assert 'the field is there but set to "no value" (null);' in terms
+    assert "`{field: undefined}` still has the field, while `{}` does not" in terms
     assert "the field is there but empty (an empty text or an empty list)" in terms
+    assert "absent or undefined" not in terms
 
 
 def test_write_for_humans_never_invents_numbers_from_a_percentage() -> None:
@@ -703,11 +705,48 @@ def test_plain_language_leaves_agent_messages_compact() -> None:
     "or version, who, how many, how long, in what order.",
     "Never invent a number, a name or a place that the source does not give.",
     '"Released" means a new version can be installed; it does not mean anyone is using it yet.',
-    'field is there but set to "no value" on purpose (null), the field is left out entirely '
-    "(absent or undefined), or the field is there but empty (an empty text or an empty list).",
+    "Wherever the language or the data format tells them apart, they are different facts, so "
+    "say which one it is: the field is left out entirely (absent); the field is there but set "
+    'to "no value" (null); the field is there but holds "undefined" (in JavaScript, '
+    "`{field: undefined}` still has the field, while `{}` does not); or the field is there "
+    "but empty (an empty text or an empty list).",
 ])
 def test_write_for_humans_and_the_shared_voice_state_the_core_rules_alike(rule: str) -> None:
     """write-for-humans keeps its own copy (a loader may show only SKILL.md), so the
     shared voice and the skill must not drift apart."""
     assert rule in _flat(_voice())
     assert rule in _flat(_skill())
+
+
+def test_design_documents_may_describe_labelled_proposals() -> None:
+    """Specs and design docs are in write-docs' scope, so the shipped-behavior rule must
+    not forbid their main content; a proposal is allowed only when labelled."""
+    docs = _flat((SKILLS_ROOT / "devkit" / "write-docs" / "SKILL.md").read_text(encoding="utf-8"))
+    assert "For **current product documentation**, update docs in the **same change as the code**" in docs
+    assert "A **design or specification document** may describe what is not built yet" in docs
+    assert "`Status: proposed`" in docs
+    assert "never present an unimplemented proposal as existing behavior" in docs
+    review = _flat((SKILLS_ROOT / "devkit" / "review-docs" / "SKILL.md").read_text(encoding="utf-8"))
+    assert "In a **design or specification document**, proposals are allowed" in review
+    assert "An unimplemented proposal presented as existing behavior is **BLOCKING**" in review
+    kind_b = _flat(_kind("B"))
+    assert "Proposals: a specification or a design document may describe what is not built yet" in kind_b
+    assert "Never present an unimplemented proposal as something the software already does." in kind_b
+
+
+def test_internal_paths_are_hidden_by_audience_and_secrets_everywhere() -> None:
+    """Secrets are never shown; internal paths are hidden only from public or unauthorized
+    readers, so a local diagnostic keeps the detail that lets the person fix the problem."""
+    core = _flat(_voice().split("\n## Core rules", 1)[1].split("\n## ", 1)[0])
+    assert "secrets (passwords, keys, tokens) and private or customer data are removed from every text" in core
+    assert "removed from anything a public or unauthorized audience sees" in core
+    assert "Local diagnostics and private run guides keep the path" in core
+    assert "never forces a choice between saying what to do next and keeping something private" in core
+    kind_d = _flat(_kind("D"))
+    assert "never show a secret (a password, a key, a token), anywhere" in kind_d
+    assert "Hide internal paths and hostnames only from people who should not see them" in kind_d
+    assert "A local diagnostic keeps the path" in kind_d
+    assert "an internal path, including in error details" not in kind_d
+    craft = _flat((SKILLS_ROOT / "devkit" / "craft-code" / "SKILL.md").read_text(encoding="utf-8"))
+    assert "Hide internal paths only from public or unauthorized readers" in craft
+    assert "a local diagnostic keeps the path" in craft

@@ -23,6 +23,10 @@ approve on "looks fine".
       values, flags, errors, config keys, defaults, output, and version numbers must
       match what the code does **today**. Flag any drift as **BLOCKING** — a confidently
       wrong doc is worse than a missing one.
+- [ ] In a **design or specification document**, proposals are allowed: check that
+      anything not built yet is clearly labelled (a `Status: proposed` line, "will" /
+      "proposed" wording) and that what it says about today's behavior matches the
+      code. An unimplemented proposal presented as existing behavior is **BLOCKING**.
 - [ ] **Run every example / command / snippet** (or confirm CI runs them) and confirm
       the documented result. Reject illustrative-but-unrun examples that "should work".
 

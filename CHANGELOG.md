@@ -23,7 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - documentation (READMEs, guides, reference pages, the manual, specifications
     and design documents) opens with a short "In plain words" summary of what
     it is, who it is for and what you can do with it. Reference pages keep
-    every exact name and option, explained the first time it appears;
+    every exact name and option, explained the first time it appears, and a
+    design or specification document may describe what is not built yet, as
+    long as it is clearly labelled as a proposal;
   - code comments use plain words and say why, in one or two sentences; the
     longer story goes in the commit message or the pull request;
   - text on screen (labels, buttons, error messages) is as short as possible,

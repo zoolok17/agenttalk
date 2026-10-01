@@ -61,9 +61,15 @@ write-for-humans instead.
       prerequisites honestly.
 
 ## GATE — accuracy and CI
-- [ ] Update docs in the **same change as the code** they describe. Never document
-      unshipped behavior. When behavior changes, also update the changelog and any
-      API reference / navigation that points at it.
+- [ ] For **current product documentation**, update docs in the **same change as the
+      code** they describe, and never document unshipped behavior. When behavior
+      changes, also update the changelog and any API reference / navigation that
+      points at it.
+- [ ] A **design or specification document** may describe what is not built yet:
+      proposed requirements, alternatives and open decisions. Label its status
+      clearly (a `Status: proposed` line near the top, and "will" / "proposed"
+      wording), and never present an unimplemented proposal as existing behavior.
+      What it says about how the software works today must still match the code.
 - [ ] Run / confirm the examples produce the documented output.
 - [ ] Pass the local docs-as-code gates if present (markdownlint, a prose/terminology
       linter like Vale, a link checker) before declaring done.

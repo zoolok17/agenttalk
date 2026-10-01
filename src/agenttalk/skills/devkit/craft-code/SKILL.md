@@ -55,8 +55,9 @@ Work the checklist top to bottom; don't skip the AFTER gate.
       kind C).
 - [ ] Interface text (labels, buttons, empty states, error messages, tooltips): as
       short as possible, say what the person can do next, never blame the reader, and
-      never show a secret or an internal path (../_shared/references/plain-language.md,
-      kind D).
+      never show a secret. Hide internal paths only from public or unauthorized readers
+      (a public page, a remote error response); a local diagnostic keeps the path when it
+      helps the person fix the problem (../_shared/references/plain-language.md, kind D).
 - [ ] Handle errors **by expectedness**: fail fast on programmer bugs; exceptions for
       truly exceptional cases; explicit return/Result for expected domain failures.
       Never silently swallow an error; attach context. Design errors out of existence

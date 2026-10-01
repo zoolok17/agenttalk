@@ -89,10 +89,12 @@ you.
         installed; it does not mean anyone is using it yet. "Deployed" means a
         running system was switched over to it, so people are using it now. Say
         which one happened.
-      - **Null, absent and empty.** Say which one it is: the field is there but
-        set to "no value" on purpose (null), the field is left out entirely
-        (absent or undefined), or the field is there but empty (an empty text or
-        an empty list).
+      - **Absent, null, undefined and empty.** Wherever the language or the data
+        format tells them apart, they are different facts, so say which one it
+        is: the field is left out entirely (absent); the field is there but set
+        to "no value" (null); the field is there but holds "undefined" (in
+        JavaScript, `{field: undefined}` still has the field, while `{}` does
+        not); or the field is there but empty (an empty text or an empty list).
 
 Three worked examples follow. They show the method; they are not words to copy.
 
