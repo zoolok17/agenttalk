@@ -10,6 +10,8 @@ export const HOSTILE = '<img src=x onerror=alert(1)>';
 export const LEAD = 'claude-agenttalk-lead';
 export const PENDING = { __pending: true };
 export const JSON_HANG = { __jsonHang: true };
+// #267: the server's busy-scan-bound reply, with a usable retry_after by default.
+export const BUSY = (retryAfter = 2) => ({ __status: 503, __body: { error: 'busy', retry_after: retryAfter } });
 export const under = (ms) => ms < 5000;   // every timer except the 5 s request timeouts
 export const timeouts = (ms) => ms === 5000;
 
@@ -49,7 +51,7 @@ export function server(o = {}) {
       else return jsonResponse({}, 404);
       if (payload && payload.__pending) return new Promise(() => {});                       // never settles
       if (payload && payload.__jsonHang) return Promise.resolve({ ok: true, status: 200, json: () => new Promise(() => {}) });
-      if (payload && payload.__status) return jsonResponse({}, payload.__status);
+      if (payload && payload.__status) return jsonResponse(payload.__body || {}, payload.__status);
       return jsonResponse(payload);
     },
   };

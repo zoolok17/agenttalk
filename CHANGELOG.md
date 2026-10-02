@@ -53,7 +53,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   routing index gains a row for interface text. `write-for-humans`' trigger is
   unchanged. Tests in `tests/test_install_skills.py`.
 
+### Changed
+
+- **The v2 console's on-screen text is now in plain words.** A copy pass
+  applied the new plain-language guide (kind D) to every label, button,
+  heading, empty state, error message and tooltip in the v2 console. A few
+  messages used roundabout or technical phrasing - an empty work board said
+  "No active or recently done work items" instead of saying plainly what that
+  meant, and the "what needs you" panel's failure text named internal
+  mechanics ("the attention feed", "the attention read") a reader has no
+  reason to know about. Agent names, ids and numbers are unchanged; where a
+  message was unclear only because the underlying state itself is unclear,
+  it was left as is (listed in the pull request) rather than guessed at.
+  What you will notice: the empty board now says, for example, "No work in
+  progress, and nothing finished in the last 7 days"; a board that cannot
+  load fully says "Cards can't be shown right now; the board keeps trying";
+  a truncated board says "Not all cards fit: 12 are not shown"; and the
+  "what needs you" panel's failure and stale-read text no longer name the
+  feed/read mechanism. What you need to do: nothing - every message's
+  meaning is unchanged, only the wording. Technical details:
+  `src/agenttalk/web_static/console2.js` and `console2-model.js`; the full
+  before/after table is in the pull request. Tests: updated copy assertions
+  in `tests/console2_board_app.test.mjs`.
+
 ### Fixed
+
+- **The "what needs you" panel no longer flashes an error when the server is
+  briefly busy (#267).** A server under heavy load can answer a request for
+  this panel with `503 busy` for a moment, asking the console to try again
+  shortly - the panel used to treat that exactly like a real failure, showing
+  "Can't read what needs you. The attention feed failed." even though the
+  server was about to have a real answer within seconds. Now a busy reply
+  quietly waits out the server's requested delay and tries again, keeping
+  whatever was already on screen; only after several busy replies in a row
+  (capped at 3) does it show the real failure message, so a genuine failure
+  is still never hidden. What you will notice: brief server-busy moments no
+  longer show up as an error in this panel. Technical details:
+  `src/agenttalk/web_static/console2.js` (`fetchAttention`, `getJson`,
+  `busyRetryAfterSeconds`). Tests: `tests/console2_data.test.mjs`.
 
 - **Work orders no longer stall after an upgrade (#185, #201).**
   Before, `agenttalk task` refused to send a work order as long as ANY

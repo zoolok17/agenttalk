@@ -1095,7 +1095,10 @@
     // honestly different wording instead of the same contradictory empty claim.
     if (!summary.cards.length) {
       out.appendChild(el('p', 'c2-sub', summary.knownEmpty
-        ? 'No active or recently done work items.' : 'No cards can currently be shown.'));
+        ? (summary.windowDays !== null
+            ? 'No work in progress, and nothing finished in the last ' + summary.windowDays + ' days.'
+            : 'No work in progress, and nothing finished recently.')
+        : 'Cards can’t be shown right now; the board keeps trying.'));
     }
     summary.cards.forEach(function (c) { out.appendChild(boardCardNode(c, boardNav.selectedKey === c.key)); });
     if (summary.legacyOpenCount !== null || summary.legacyLowerBound > 0) {
@@ -1105,8 +1108,9 @@
       out.appendChild(el('p', 'c2-board-legacy', 'Legacy / untagged work: ' + legacyText));
     }
     if (summary.truncated) {
-      out.appendChild(el('p', 'c2-board-note',
-        'Board truncated' + (summary.omittedCount !== null ? ' (' + summary.omittedCount + ' omitted)' : '') + '.'));
+      out.appendChild(el('p', 'c2-board-note', summary.omittedCount !== null
+        ? 'Not all cards fit: ' + summary.omittedCount + ' are not shown.'
+        : 'Not all cards fit; some are not shown.'));
     }
     return out;
   }
@@ -1338,8 +1342,17 @@
       var init = { cache: 'no-store' };
       if (ctl) init.signal = ctl.signal;
       fetch(url, init).then(function (r) {
-        if (!r.ok) throw new Error('http ' + r.status);
-        return r.json();
+        if (r.ok) return r.json();
+        // #267: a failed response's body can carry a machine-readable reason (a 503 busy
+        // reply's retry_after) - read it on a best-effort basis so a caller can tell "ask
+        // again shortly" apart from a genuine failure. A body that is missing or not JSON
+        // still rejects, just without that extra detail.
+        return r.json().catch(function () { return null; }).then(function (body) {
+          var err = new Error('http ' + r.status);
+          err.status = r.status;
+          err.body = body;
+          throw err;
+        });
       }).then(function (value) { finish(resolve, value); }, function (err) { finish(reject, err); });
     });
   }
@@ -1416,13 +1429,46 @@
     });
   }
 
+  // #267: a busy scan bound (503 {"error":"busy","retry_after":N}) is the server saying "ask
+  // again shortly", not a failure - a single one must not flip the panel to the "can't read
+  // what needs you" error state. project_id -> { untilPerf, retries }, cleared on any
+  // non-busy outcome (success or a genuine failure).
+  var ATTENTION_BUSY_MAX_RETRIES = 3;
+  var attentionBusy = Object.create(null);
+
+  // Null unless `err` is exactly a busy reply with a usable retry_after (a positive, finite
+  // number of seconds) - a 503 with no such body, or any other status, is a genuine failure.
+  function busyRetryAfterSeconds(err) {
+    var body = err && err.body;
+    if (!err || err.status !== 503 || !body || typeof body !== 'object' || body.error !== 'busy') return null;
+    var n = body.retry_after;
+    return typeof n === 'number' && isFinite(n) && n > 0 ? n : null;
+  }
+
   function fetchAttention(id) {
     return guarded('att:' + id, function () {
+      var busy = attentionBusy[id];
+      if (busy && perfNow() < busy.untilPerf) {
+        // Still waiting out the server's requested delay: no request this tick. Nothing in
+        // `data.attention[id]` changed, so this render is a no-op today, but it keeps this
+        // path's contract the same as every other outcome below (always ends in a render).
+        return Promise.resolve().then(renderAll);
+      }
       return getJson(rootUrl('/api/attention', id)).then(function (payload) {
+        delete attentionBusy[id];
         var bad = !answersFor(payload, id) || (Array.isArray(payload.errors) && payload.errors.length > 0);
         if (bad) attentionFailed(id);
         else data.attention[id] = { ok: true, asOfMs: nowMs(), items: Array.isArray(payload.items) ? payload.items : [] };
-      }, function () {
+      }, function (err) {
+        var retryAfter = busyRetryAfterSeconds(err);
+        if (retryAfter !== null) {
+          var retries = (busy ? busy.retries : 0) + 1;
+          if (retries <= ATTENTION_BUSY_MAX_RETRIES) {
+            attentionBusy[id] = { untilPerf: perfNow() + retryAfter * 1000, retries: retries };
+            return;   // calm: keep whatever was last known (or still "loading"); ask again after the delay
+          }
+        }
+        delete attentionBusy[id];
         attentionFailed(id);
       }).then(renderAll);
     });

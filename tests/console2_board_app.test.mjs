@@ -112,7 +112,7 @@ test('F5: a genuinely complete, empty, non-truncated board says so plainly', asy
   const srv = server({ roots: oneRoot, board: () => BOARD_FEED({ items: [], totalCount: 0 }) });
   const { dom, fire } = await boot(srv, { hash: '#board' });
   await fire(under);
-  assert.ok(all(board(dom)).includes('No active or recently done work items.'));
+  assert.ok(all(board(dom)).includes('No work in progress, and nothing finished in the last 7 days.'));
 });
 
 test('F5: an overflow that omits the only item is never claimed as "no work items"', async () => {
@@ -123,9 +123,9 @@ test('F5: an overflow that omits the only item is never claimed as "no work item
   const { dom, fire } = await boot(srv, { hash: '#board' });
   await fire(under);
   const b = all(board(dom));
-  assert.ok(!b.includes('No active or recently done work items.'), b);
-  assert.ok(b.includes('No cards can currently be shown.'), b);
-  assert.ok(b.includes('Board truncated') && b.includes('1 omitted'), b);
+  assert.ok(!b.includes('No work in progress, and nothing finished in the last 7 days.'), b);
+  assert.ok(b.includes('Cards can’t be shown right now; the board keeps trying.'), b);
+  assert.ok(b.includes('Not all cards fit: 1 are not shown.'), b);
 });
 
 // ------------------------------------------------------------------------------------------- F6

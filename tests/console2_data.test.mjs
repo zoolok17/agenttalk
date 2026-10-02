@@ -10,7 +10,7 @@ import {
   ATT_ITEM, NOW, agent, busyAgents, busyRecent, env, iso, root,
 } from './console2_fixtures.mjs';
 import {
-  HOSTILE, JSON_HANG, LEAD, PENDING, all, app, boot, chips, classOf, header, rail, server, stream, timeouts, under,
+  BUSY, HOSTILE, JSON_HANG, LEAD, PENDING, all, app, boot, chips, classOf, header, rail, server, stream, timeouts, under,
 } from './console2_app.mjs';
 import { texts, walk } from './console2_harness.mjs';
 
@@ -425,23 +425,68 @@ test('a stale attention read greys the page; a failed one keeps the last items',
   assert.equal(app(dom).className, 'is-stale');
 });
 
-// ------------------------------------------------- #246: server-side scan-concurrency bound
+// ------------------------------------------------- #246/#267: server-side scan-concurrency bound
 
-test('#246: a 503 "busy" attention read keeps the last items, same as any other failure - no special error flash', async () => {
+test('#267: a single busy attention reply is calm, not a failure, and retries after retry_after seconds', async () => {
   const srv = server({ attention: () => ({ target_root_project_id: 'proj-a', items: [ATT_ITEM({ id: 'a', title: 'Only question' })] }) });
-  const { dom, fire } = await boot(srv);
-  const before = all(stream(dom));
-  srv.attention = () => ({ __status: 503 });   // the scan-concurrency bound answering "busy"
-  await fire();
+  const { dom, clock, fire } = await boot(srv);
+  const attentionCalls = () => srv.calls.filter((u) => u.startsWith('/api/attention')).length;
+  const callsAfterBoot = attentionCalls();
+
+  srv.attention = () => BUSY(4);   // the scan-concurrency bound answering "busy", retry in 4 s
+  await fire();                     // one poll tick: fires the request, gets busy
   const after = all(stream(dom));
-  assert.ok(after.includes('Only question'), 'the previous data stays on screen');
-  assert.equal(app(dom).className, 'is-stale', 'the SAME stale treatment as any other failed read');
-  // no alarming text beyond the existing, generic "can't read" vocabulary this UI already uses
-  // for every kind of attention-read failure (500, timeout, errors-as-data, ...):
-  assert.ok(!after.includes('503') && !after.includes('busy'), 'no raw status/body text leaks into the UI');
+  assert.ok(after.includes('Only question'), 'the previous items stay on screen');
+  assert.ok(!after.includes('503') && !after.includes('busy') && !after.includes('retry_after'),
+    'no raw status/body text leaks into the UI');
+  assert.equal(app(dom).className, '', 'a single busy reply is calm, not the failed-read treatment');
+
+  clock.perf += 2000;               // less than the 4 s retry_after
+  await fire();
+  assert.equal(attentionCalls(), callsAfterBoot + 1, 'no new request before the server-requested delay elapses');
+  assert.equal(app(dom).className, '', 'still calm while waiting out the delay');
+
+  clock.perf += 2000;               // now 4 s have elapsed since the busy reply
   srv.attention = () => ({ target_root_project_id: 'proj-a', items: [ATT_ITEM({ id: 'a', title: 'Only question' })] });
   await fire();
-  assert.equal(app(dom).className, '', 'recovers exactly like any other transient failure');
+  assert.equal(attentionCalls(), callsAfterBoot + 2, 'the next tick on/after the delay retries');
+  assert.equal(app(dom).className, '', 'recovers calmly - never flagged as a failure in the first place');
+});
+
+test('#267: busy retries are capped, then the real error shows', async () => {
+  const srv = server({ attention: () => ({ target_root_project_id: 'proj-a', items: [ATT_ITEM({ id: 'a', title: 'Only question' })] }) });
+  const { dom, clock, fire } = await boot(srv);
+  srv.attention = () => BUSY(2);
+  // Four consecutive busy replies, 2 s apart: the first three stay within the retry cap (calm,
+  // no error); the fourth exceeds it and finally shows the real error.
+  for (let i = 0; i < 4; i++) {
+    await fire();
+    if (i < 3) {
+      assert.equal(app(dom).className, '', `still calm after busy reply ${i + 1} (within the cap)`);
+      clock.perf += 2000;
+    }
+  }
+  assert.ok(all(stream(dom)).includes('Can’t read what needs you.'), 'the cap is exceeded: the real error shows');
+  assert.equal(app(dom).className, 'is-stale', 'a genuine failure gets the same stale treatment as any other');
+});
+
+test('#267: a non-busy error shows the real error immediately, not a calm wait', async () => {
+  const srv = server({ attention: () => ({ target_root_project_id: 'proj-a', items: [ATT_ITEM({ id: 'a', title: 'Only question' })] }) });
+  const { dom, fire } = await boot(srv);
+  srv.attention = () => ({ __status: 500 });   // a genuine server error, not a busy scan bound
+  await fire();
+  assert.ok(all(stream(dom)).includes('Can’t read what needs you.'), 'a real error shows immediately, no grace period');
+  assert.equal(app(dom).className, 'is-stale');
+});
+
+test('#267: a 503 with no usable retry_after shows the real error immediately', async () => {
+  const srv = server({ attention: () => ({ target_root_project_id: 'proj-a', items: [ATT_ITEM({ id: 'a', title: 'Only question' })] }) });
+  const { dom, fire } = await boot(srv);
+  srv.attention = () => ({ __status: 503 });   // empty body: not recognisable as the "busy" shape
+  await fire();
+  assert.ok(all(stream(dom)).includes('Can’t read what needs you.'),
+    'a 503 with no usable retry_after is a real error, not a calm wait');
+  assert.equal(app(dom).className, 'is-stale');
 });
 
 test('#246: no second attention fetch starts while the busy scan bound has not answered yet', async () => {
