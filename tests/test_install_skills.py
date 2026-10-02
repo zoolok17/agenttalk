@@ -890,3 +890,47 @@ def test_technical_detail_last_is_scoped_to_kind_a() -> None:
     assert "Where technical detail goes depends on the kind of text." in core
     assert "Documentation keeps exact names, flags, commands and fields in place" in core
     assert "- Put technical detail last." not in core
+
+
+# ------------------------------------------------------- the lead routine
+
+_LEAD_SKILLS = (SKILLS_ROOT / "claude" / "agenttalk.lead.md", SKILLS_ROOT / "codex" / "agenttalk-lead" / "SKILL.md")
+
+
+def _lead_routine(path: Path) -> str:
+    text = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+    return text.split("\n## Lead routine\n", 1)[1].split("\n## ", 1)[0]
+
+
+def test_lead_skills_carry_the_lead_routine_in_step() -> None:
+    """A new lead learns the check-in and the handover note from the playbook alone; the
+    Claude and Codex copies differ only in how a command is written."""
+    def same_words(text: str) -> str:
+        return (text.replace("python -m agenttalk", "agenttalk").replace('"$SELF"', "$SELF")
+                .replace("```bash", "```powershell").replace(" \\\n", " `\n"))
+
+    claude, codex = (_lead_routine(p) for p in _LEAD_SKILLS)
+    assert same_words(claude) == same_words(codex)
+    routine = _flat(claude)
+    for heading in ("### Check-in", "### Handover note", "### Switching the timers on",
+                    "### What to report to the person in charge"):
+        assert heading in claude
+    assert "Skip any step your team does not have" in routine
+    assert "agenttalk checkpoint save --for $SELF" in routine
+    assert "A session timer dies with the session" in routine
+    assert "agenttalk wrap --loop --lead-loop" in routine
+    assert "Report only what needs them" in routine
+    assert "Merge only with a GO that covers the exact head commit" in routine
+    assert "no closing `status` still shows as open, so read the reply before you chase it" in routine
+
+
+def test_lead_skill_task_reply_examples_close_with_a_status() -> None:
+    """A task response without a closing status can leave the task open, so every example
+    in the lead skills that shows one also asks for --meta status=done."""
+    for path in _LEAD_SKILLS:
+        blocks = re.findall(r"```[a-z]*\n(.*?)```", path.read_text(encoding="utf-8").replace("\r\n", "\n"),
+                            flags=re.S)
+        replies = [b for b in blocks if "--kind task-response" in b]
+        assert replies, path.name
+        for block in replies:
+            assert "--meta status=done" in block, (path.name, block)

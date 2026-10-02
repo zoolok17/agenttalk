@@ -371,6 +371,12 @@ the agents you plan.
      --meta lane_id=<lane-id> \
      -m "<goal, scope, verification, expected reply>"
    ```
+   Ask for the reply in this form. A task response needs a closing `status`
+   next to its `verdict`; without one, the task can stay open:
+   ```bash
+   python -m agenttalk reply --to-request <request_id> --kind task-response \
+     --meta status=done --meta verdict=<verdict> -m "<result>"
+   ```
 5. Use broadcast for shared awareness or parallel input:
    ```bash
    python -m agenttalk broadcast --from "$SELF" --to-group <group> --kind question \
@@ -411,6 +417,92 @@ the agents you plan.
    details section at the end, but never include secrets, private data or
    internal-only addresses, not even there. A review comment keeps the
    review's own format and severity tag.
+
+## Lead routine
+
+Two habits keep a team healthy over a long run: a regular check-in, and a
+short handover note that lets a reset lead, or a replacement, carry on where
+you left off. Set both up when you start leading. Skip any step your team does
+not have (no paid model route, no code host, no work board) rather than
+inventing one.
+
+### Check-in (for example every 30 minutes)
+
+1. **Read new messages and act on every reply.** In a supervised lead loop
+   the wrapper delivers them for you; then skip this step.
+   ```bash
+   python -m agenttalk drain --for "$SELF"
+   ```
+   (`python -m agenttalk recv --for "$SELF"` shows them without marking them read.)
+2. **See who is alive and who is stuck.** Look into any seat whose heartbeat
+   is stale, or that shows as stuck or parked, before giving it more work;
+   `python -m agenttalk doctor` checks deeper.
+   ```bash
+   python -m agenttalk status
+   ```
+3. **See what you owe and what is owed to you.** Answer what you owe; chase or
+   re-plan what is overdue. A task whose reply had a verdict but no closing
+   `status` still shows as open, so read the reply before you chase it.
+   ```bash
+   python -m agenttalk threads --for "$SELF"
+   ```
+4. **Open reviews and pull requests.** Read each review's verdict and the code
+   host's inline review comments (see "Read the host's AUTOMATED review
+   findings" above). Merge only with a GO that covers the exact head commit
+   (`work_head`); a GO on an earlier head does not count. If the project uses
+   the work board, run `python -m agenttalk board verify-merges` after each merge.
+5. **Capacity, before handing out more work.** Check that the machine has
+   enough free memory for another agent or build, and steer long work away
+   from a seat near its context limit.
+   ```bash
+   python -m agenttalk capacity
+   ```
+6. **Knowledge.** List notes and lessons including the uncurated ones, then
+   verify or retract each uncurated one (a retract needs `--reason`).
+   ```bash
+   python -m agenttalk knowledge pull --include-uncurated
+   python -m agenttalk knowledge curate verify --domain <domain> --key <key>
+   ```
+7. **Spend, if the team has a paid model route.** Compare it with the agreed
+   limit using that route's own spend report, and tell the person in charge
+   before it reaches the limit.
+
+### Handover note (for example every two hours, and before any reset)
+
+1. Save what agenttalk can see: your open threads, the capacity signal, and
+   your checkout's branch and commit. After a reset, `checkpoint resume`
+   shows it again.
+   ```bash
+   python -m agenttalk checkpoint save --for "$SELF"
+   python -m agenttalk checkpoint resume --for "$SELF"
+   ```
+2. Add what it cannot see, in a few lines in your own notes (your memory, if
+   you have one):
+   - what is running: each seat, its task id, and its branch and commit;
+   - what waits on whom;
+   - open decisions for the person in charge;
+   - spend so far, if the team has a paid route;
+   - what you planned to do next.
+
+Keep the whole note under about 20 lines.
+
+### Switching the timers on
+
+For example:
+- **Claude Code:** a scheduled prompt in the lead's own session, such as
+  `/loop 30m` with the check-in as its prompt, or a session cron. A session
+  timer dies with the session, so set it again after every restart.
+- **Codex:** there is no built-in timer. Run the lead as a supervised lead loop
+  (`python -m agenttalk wrap --loop --lead-loop`; see "Lead-loop, relay, and review modes"
+  above), which runs proactive ticks on a quiet bus at its configured cadence,
+  or use an operating-system scheduled task that nudges the lead, for example
+  with a short message.
+
+### What to report to the person in charge
+
+Report only what needs them: decisions only they can make, actions only they
+can take, and money alarms. Keep everything else (routine progress, merges,
+retries) in your own notes, where the next handover note picks it up.
 
 ## Publishing a sandboxed worker's commit
 

@@ -349,6 +349,13 @@ agenttalk send --from codex-lead --to codex-dev --kind question --subject bugfix
 agenttalk broadcast --from codex-lead --to-group reviewers --kind question --subject review-availability -m "Who can review the final SHA?"
 ```
 
+On a long run, the lead skill (`agenttalk.lead` for Claude Code, `agenttalk-lead`
+for Codex) has a "Lead routine" section. It gives a regular check-in (messages,
+seat health, open threads, reviews, capacity, knowledge and, if the team has a
+paid model route, spend), a short handover note saved with
+`agenttalk checkpoint save` so a reset lead can carry on, and ways to put both on
+a timer. Skip any step your team does not have.
+
 ### Escalation and operator answers
 
 Workers should not ask the human in their own terminal when a liaison exists.
