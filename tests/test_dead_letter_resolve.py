@@ -191,6 +191,68 @@ def test_notice_closure_signature_cannot_accept_call_site_attribution():
     assert not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
 
 
+def test_resolve_then_purge_notice_to_retired_liaison(tmp_path, monkeypatch, capsys):
+    from agenttalk import threads
+    s = Store(tmp_path)
+    s.init(["claude", "beta", "liaison-b"])
+    s.set_operator_facing("liaison-b")
+    mid = _dead_letter(s)
+    assert cli._dead_letter_notifier(s, "beta")({
+        "msg_id": mid, "agent": "beta", "from": "claude", "kind": "message",
+        "attempts": 3, "failure_class": "poison_eligible",
+    }, disposed=False)
+    notice = next(m for m in s.valid_messages() if m.kind == "question")
+    s.set_operator_facing("claude")
+    s.retire_agent("liaison-b", reason="handoff")
+    real_send = Store.send
+
+    def no_retired_send(store, **kwargs):
+        assert kwargs.get("sender") != "liaison-b", "must not try a retired sender"
+        return real_send(store, **kwargs)
+
+    monkeypatch.setattr(Store, "send", no_retired_send)
+    capsys.readouterr()
+    assert _run(tmp_path, "dead-letter", "resolve", "--from", "claude", "--agent", "beta", "--id", mid,
+                "--reason", "handled") == 0
+    diagnostic = f"notice {notice.id} was addressed to retired liaison-b; nothing to close"
+    output = capsys.readouterr()
+    assert len(output.err.splitlines()) == 1 and diagnostic in output.err
+    assert _run(tmp_path, "dead-letter", "purge", "--resolved", "--from", "claude") == 0
+    output = capsys.readouterr()
+    assert len(output.err.splitlines()) == 1 and diagnostic in output.err
+    assert s.list_dead_letters("beta") == []
+    assert not any(m.meta.get("dead_letter_resolved") for m in s.valid_messages())
+    # Report-only observation requested by the lead: general thread derivation
+    # still leaves this point-to-point operator question open for its sender.
+    rows = threads.derive_threads(s.valid_messages(), agent="beta", cursor=notice.id,
+                                  retired=set(s.retired_agents()))
+    row = next(t for t in rows if t.request_id == notice.meta["request_id"])
+    assert row.state == "open-outbound"
+
+
+@pytest.mark.parametrize("failure", [OSError("disk unavailable\ntry later"), ValueError("send rejected")])
+def test_notice_send_failure_reports_notice_and_error(tmp_path, monkeypatch, capsys, failure):
+    s = _store(tmp_path)
+    mid = _dead_letter(s)
+    assert cli._dead_letter_notifier(s, "beta")({
+        "msg_id": mid, "agent": "beta", "from": "claude", "kind": "message",
+        "attempts": 3, "failure_class": "poison_eligible",
+    }, disposed=False)
+    notice = next(m for m in s.valid_messages() if m.kind == "question")
+
+    def fail_send(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(Store, "send", fail_send)
+    capsys.readouterr()
+    assert _run(tmp_path, "dead-letter", "resolve", "--from", "claude", "--agent", "beta", "--id", mid,
+                "--reason", "handled") == 0
+    output = capsys.readouterr()
+    assert len(output.err.splitlines()) == 1
+    assert notice.id in output.err and " ".join(str(failure).splitlines()) in output.err
+    assert not any(m.meta.get("dead_letter_resolved") for m in s.valid_messages())
+
+
 def test_purge_refuses_when_recorded_resolution_is_unavailable(tmp_path, monkeypatch, capsys):
     s = _store(tmp_path)
     mid = _dead_letter(s)

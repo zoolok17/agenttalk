@@ -12752,8 +12752,10 @@ def _pending_dead_letter_notices(
     *,
     agent: str,
     msg_id: str,
+    report_retired: bool = False,
 ) -> list[Message]:
     msgs = sorted(store.valid_messages(), key=lambda m: m.id)
+    retired = set(store.retired_agents())
     rows_by_recipient = {}
     notices = {}
     for m in msgs:
@@ -12773,14 +12775,25 @@ def _pending_dead_letter_notices(
             rows_by_recipient[m.recipient] = {
                 t.request_id: t for t in th.derive_threads(
                     msgs, agent=m.recipient, cursor=store.cursor(m.recipient) or "",
-                    closed_rids=_closed_rids(store, m.recipient), retired=set(store.retired_agents()),
+                    closed_rids=_closed_rids(store, m.recipient), retired=retired,
                 )
             }
         row = rows_by_recipient[m.recipient].get(rid)
         if row is None or row.operator_state != "pending":
             continue
         notices[rid] = m
-    return [notices[rid] for rid in sorted(notices)]
+    pending = []
+    for rid in sorted(notices):
+        notice = notices[rid]
+        if notice.recipient in retired:
+            if report_retired:
+                sys.stderr.write(
+                    f"agenttalk dead-letter: notice {notice.id} was addressed to retired "
+                    f"{notice.recipient}; nothing to close.\n"
+                )
+            continue
+        pending.append(notice)
+    return pending
 
 
 def _close_dead_letter_notice_threads(
@@ -12808,7 +12821,7 @@ def _close_dead_letter_notice_threads(
     evidence = resolution.get("evidence")
     closed = 0
     for notice in _pending_dead_letter_notices(
-        store, agent=agent, msg_id=msg_id,
+        store, agent=agent, msg_id=msg_id, report_retired=True,
     ):
         meta = {
             "request_id": notice.meta["request_id"],
@@ -12832,8 +12845,9 @@ def _close_dead_letter_notice_threads(
                 meta=meta,
             )
             closed += 1
-        except (OSError, ValueError):
-            continue
+        except (OSError, ValueError) as exc:
+            error = " ".join(str(exc).splitlines())
+            sys.stderr.write(f"agenttalk dead-letter: notice {notice.id} could not be closed: {error}\n")
     return closed
 
 
