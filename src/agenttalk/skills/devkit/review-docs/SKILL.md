@@ -23,17 +23,33 @@ approve on "looks fine".
       values, flags, errors, config keys, defaults, output, and version numbers must
       match what the code does **today**. Flag any drift as **BLOCKING** — a confidently
       wrong doc is worse than a missing one.
-- [ ] **Run every example / command / snippet** (or confirm CI runs them) and confirm
-      the documented result. Reject illustrative-but-unrun examples that "should work".
+- [ ] In a **design or specification document**, proposals are allowed: check that
+      anything not built yet is clearly labelled (a `Status: proposed` line, "will" /
+      "proposed" wording) and that what it says about today's behavior matches the
+      code. An unimplemented proposal presented as existing behavior is **BLOCKING**.
+- [ ] **Run every example / command / snippet of existing behavior** (or confirm CI runs
+      them) and confirm the documented result. Reject illustrative-but-unrun examples
+      that "should work".
+- [ ] In a `Status: proposed` design or specification, an example of a proposed command,
+      API or setting cannot run yet: check it against the proposed contract instead, and
+      check that it is visibly marked (for example "proposed, not runnable yet"). Never
+      require an implementation just to approve a design.
 
 ## FIT & COMPLETENESS
 - [ ] **Mode check** — the page is a single clean Diataxis mode (tutorial / how-to /
-      reference / explanation), not a hybrid that half-teaches and half-references.
+      reference / explanation), not a hybrid that half-teaches and half-references. A
+      design or specification document counts as explanation mode and may hold
+      requirements and alternatives.
 - [ ] **Audience & goal** — clear and consistent; the content serves that reader.
 - [ ] **Completeness for the stated task** — no missing step, prerequisite, edge case,
       or error path a real user would hit.
 - [ ] **Clarity & scannability** — scannable structure, descriptive headings, concise
       sentences, descriptive link text, code in code font.
+- [ ] **Voice** (../_shared/references/plain-language.md, kind B) — the document opens
+      with an "In plain words" summary and its plain words are true for this case;
+      reference material keeps exact names, flags and fields, explained the first time.
+      A missing summary or unexplained jargon is a minor finding; a plain paraphrase
+      that changes a fact is an accuracy finding (blocking).
 
 ## DRIFT GUARDS
 - [ ] No stale screenshots, paths, env-var names, command flags, or output blocks.

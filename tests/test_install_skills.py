@@ -572,9 +572,11 @@ def test_write_for_humans_keeps_release_and_deploy_apart() -> None:
 
 def test_write_for_humans_keeps_null_absent_and_empty_apart() -> None:
     terms = _flat(_section(_skill(), "TERMS"))
-    assert 'the field is there but set to "no value" on purpose (null)' in terms
-    assert "the field is left out entirely (absent or undefined)" in terms
+    assert "the field is left out entirely (absent);" in terms
+    assert 'the field is there but set to "no value" (null);' in terms
+    assert "`{field: undefined}` still has the field, while `{}` does not" in terms
     assert "the field is there but empty (an empty text or an empty list)" in terms
+    assert "absent or undefined" not in terms
 
 
 def test_write_for_humans_never_invents_numbers_from_a_percentage() -> None:
@@ -631,3 +633,202 @@ def test_write_for_humans_samples_ship_in_the_sdist() -> None:
     sdist = pyproject.split("[tool.hatch.build.targets.sdist]", 1)[1].split("\n[", 1)[0]
     assert '"/docs/examples/write-for-humans-samples.md"' in sdist
     assert (repo / "docs" / "examples" / "write-for-humans-samples.md").is_file()
+
+
+# ---------------------------------------------- the shared plain-language voice
+
+_VOICE_REL = Path("_shared") / "references" / "plain-language.md"
+
+
+def _voice() -> str:
+    return (SKILLS_ROOT / "devkit" / _VOICE_REL).read_text(encoding="utf-8")
+
+
+def _kind(letter: str) -> str:
+    return _voice().split(f"\n### {letter}. ", 1)[1].split("\n### ", 1)[0].split("\n## ", 1)[0]
+
+
+def test_plain_language_reference_ships_and_installs(tmp_path: Path) -> None:
+    assert (SKILLS_ROOT / "devkit" / _VOICE_REL).is_file()
+    cl, cx = tmp_path / "cl", tmp_path / "cx"
+    install(claude=False, codex=False, devkit=True, claude_skills_dir=cl, codex_skills_dir=cx)
+    assert (cl / _VOICE_REL).is_file() and (cx / _VOICE_REL).is_file()
+    assert "references/plain-language.md" in (SKILLS_ROOT / "devkit" / "_shared" / "SKILL.md").read_text(
+        encoding="utf-8")
+
+
+@pytest.mark.parametrize("skill, kind", [
+    ("write-for-humans", "kind A"),
+    ("write-docs", "kind B"),
+    ("review-docs", "kind B"),
+    ("craft-code", "kind C"),
+    ("craft-code", "kind D"),
+])
+def test_writing_skills_point_to_the_plain_language_voice(skill: str, kind: str) -> None:
+    text = _flat((SKILLS_ROOT / "devkit" / skill / "SKILL.md").read_text(encoding="utf-8"))
+    assert "../_shared/references/plain-language.md" in text
+    assert kind in text
+
+
+def test_write_for_humans_trigger_is_not_widened_by_the_shared_voice() -> None:
+    description = _flat(_skill().split("description: >-", 1)[1].split("\nreviewed-against:", 1)[0])
+    positive = description.split("Do NOT use", 1)[0]
+    for wider in ("documentation", "code comment", "interface", "README", "dashboard", "anything"):
+        assert wider not in positive
+    assert "Use only for those kinds of text." in positive
+
+
+def test_plain_language_kinds_carry_their_length_and_structure_rules() -> None:
+    kinds = {"A": "Release notes", "B": "Documentation", "C": "Code comments", "D": "Interface text"}
+    for letter, title in kinds.items():
+        section = _flat(_kind(letter))
+        assert section.startswith(title)
+        assert "- Length:" in section and "- Structure:" in section
+    assert 'opens with an **"In plain words"** summary' in _flat(_kind("B"))
+    assert "about 3 to 6 sentences" in _flat(_kind("B"))
+    assert "one or two sentences. Never an essay." in _flat(_kind("C"))
+    assert 'No "before" and "now".' in _flat(_kind("C"))
+    assert "as short as possible" in _flat(_kind("D"))
+    assert "never blames the reader" in _flat(_kind("D"))
+
+
+def test_plain_language_leaves_agent_messages_compact() -> None:
+    out_of_scope = _flat(_voice().split("\n## Out of scope: text for agents", 1)[1])
+    assert "Messages between agents, task briefs, bus traffic" in out_of_scope
+    assert "stay compact and precise" in out_of_scope
+    assert "every extra word costs input" in out_of_scope
+
+
+@pytest.mark.parametrize("rule", [
+    "**The plain words must be true for this case, not in general.**",
+    "ask what your plain version now claims that the original did not: where, which branch "
+    "or version, who, how many, how long, in what order.",
+    "Never invent a number, a name or a place that the source does not give.",
+    '"Released" means a new version can be installed; it does not mean anyone is using it yet.',
+    "paths, hostnames and addresses are removed from anything a public or unauthorized audience "
+    "sees (release notes, a public page, an error sent to a remote caller). Local diagnostics and "
+    "private run guides keep the path, or another safe identifier, when it is what lets the "
+    "person fix the problem.",
+    "Wherever the language or the data format tells them apart, they are different facts, so "
+    "say which one it is: the field is left out entirely (absent); the field is there but set "
+    'to "no value" (null); the field is there but holds "undefined" (in JavaScript, '
+    "`{field: undefined}` still has the field, while `{}` does not); or the field is there "
+    "but empty (an empty text or an empty list).",
+])
+def test_write_for_humans_and_the_shared_voice_state_the_core_rules_alike(rule: str) -> None:
+    """write-for-humans keeps its own copy (a loader may show only SKILL.md), so the
+    shared voice and the skill must not drift apart."""
+    assert rule in _flat(_voice())
+    assert rule in _flat(_skill())
+
+
+def test_design_documents_may_describe_labelled_proposals() -> None:
+    """Specs and design docs are in write-docs' scope, so the shipped-behavior rule must
+    not forbid their main content; a proposal is allowed only when labelled."""
+    docs = _flat((SKILLS_ROOT / "devkit" / "write-docs" / "SKILL.md").read_text(encoding="utf-8"))
+    assert "For **current product documentation**, update docs in the **same change as the code**" in docs
+    assert "A **design or specification document** may describe what is not built yet" in docs
+    assert "`Status: proposed`" in docs
+    assert "never present an unimplemented proposal as existing behavior" in docs
+    review = _flat((SKILLS_ROOT / "devkit" / "review-docs" / "SKILL.md").read_text(encoding="utf-8"))
+    assert "In a **design or specification document**, proposals are allowed" in review
+    assert "An unimplemented proposal presented as existing behavior is **BLOCKING**" in review
+    kind_b = _flat(_kind("B"))
+    assert "Proposals: a specification or a design document may describe what is not built yet" in kind_b
+    assert "Never present an unimplemented proposal as something the software already does." in kind_b
+
+
+def test_internal_paths_are_hidden_by_audience_and_secrets_everywhere() -> None:
+    """Secrets are never shown; internal paths are hidden only from public or unauthorized
+    readers, so a local diagnostic keeps the detail that lets the person fix the problem."""
+    core = _flat(_voice().split("\n## Core rules", 1)[1].split("\n## ", 1)[0])
+    assert "secrets (passwords, keys, tokens) are removed from every text, whoever reads it" in core
+    assert "removed from anything a public or unauthorized audience sees" in core
+    assert "Local diagnostics and private run guides keep the path" in core
+    assert "never forces a choice between saying what to do next and keeping something private" in core
+    kind_d = _flat(_kind("D"))
+    assert "never show a secret (a password, a key, a token), anywhere" in kind_d
+    assert "Hide internal paths and hostnames only from people who should not see them" in kind_d
+    assert "A local diagnostic keeps the path" in kind_d
+    assert "an internal path, including in error details" not in kind_d
+    craft = _flat((SKILLS_ROOT / "devkit" / "craft-code" / "SKILL.md").read_text(encoding="utf-8"))
+    assert "Hide internal paths only from public or unauthorized readers" in craft
+    assert "a local diagnostic keeps the path" in craft
+
+
+def _devkit(skill: str) -> str:
+    return (SKILLS_ROOT / "devkit" / skill / "SKILL.md").read_text(encoding="utf-8")
+
+
+def test_proposed_examples_are_checked_against_the_proposal_not_run() -> None:
+    """A design must be approvable before anything is built, so only examples of existing
+    behavior must run; a proposed example is marked and checked against the proposal."""
+    review = _flat(_devkit("review-docs"))
+    assert "**Run every example / command / snippet of existing behavior**" in review
+    assert "check it against the proposed contract instead" in review
+    assert '"proposed, not runnable yet"' in review
+    assert "Never require an implementation just to approve a design." in review
+    docs = _flat(_devkit("write-docs"))
+    assert "Run / confirm the examples of existing behavior produce the documented output." in docs
+    assert '"proposed, not runnable yet"' in docs
+    assert 'An example of proposed behavior is marked "proposed, not runnable yet"' in _flat(_kind("B"))
+
+
+def test_private_data_follows_authorization_not_ownership() -> None:
+    """Staff may be authorized to see a customer's data, so the rule is who may see it,
+    not whose it is; and it is a writing rule, never an access check."""
+    core = _flat(_voice().split("\n## Core rules", 1)[1].split("\n## ", 1)[0])
+    assert "private data is shown only to a reader who is authorized to see it for this purpose" in core
+    assert "or data the product's access rules let them see" in core
+    assert "a fulfilment screen that shows the address to the staff member handling the order" in core
+    assert "private data is never shown to anyone who is not authorized to see it" in core
+    assert "real private or customer records are never pasted into examples, prose, logs or public pages" in core
+    assert "this is a writing rule: it never replaces or invents the product's own access checks" in core
+    kind_d = _flat(_kind("D"))
+    assert "Show private data only to a reader the product authorizes to see it" in kind_d
+    craft = _flat(_devkit("craft-code"))
+    assert "Show private data only to a reader the product authorizes to see it" in craft
+    for text in (core, kind_d, craft):
+        assert "someone else's" not in text
+        assert "anyone else's private data" not in text
+        assert "the signed-in person it belongs to" not in text
+
+
+def test_changelog_tells_existing_installs_to_force_refresh() -> None:
+    """A plain install-skills skips changed skill files on an existing install, so the entry
+    must give the dry-run, back-up and --force steps."""
+    repo = Path(__file__).resolve().parents[1]
+    unreleased = (repo / "CHANGELOG.md").read_text(encoding="utf-8").split("## [Unreleased]", 1)[1]
+    entry = _flat(unreleased.split("\n## [", 1)[0].split("- **One plain-language voice", 1)[1].split("\n- **", 1)[0])
+    assert "On an existing install, a plain `agenttalk install-skills` is not enough" in entry
+    assert "Preview with `agenttalk install-skills --dry-run --force`" in entry
+    assert "back up any local edits you want to keep" in entry
+    assert "then run `agenttalk install-skills --force`" in entry
+    assert "Nothing to do: the guide is installed" not in entry
+
+
+def test_write_docs_emits_planning_evidence_for_proposed_designs() -> None:
+    from agenttalk.skill_currency import _frontmatter_profiles, _parse_skill_stub
+
+    text = _devkit("write-docs")
+    assert _frontmatter_profiles(text) == ["production-handoff", "planning-artifact"]
+    assert _parse_skill_stub(text)[0] == "production-handoff"
+    evidence = _flat(text.split("\n## Evidence", 1)[1])
+    assert "emit the planning-artifact profile instead" in evidence
+    for field in ("assumptions", "alternatives", "open_questions", "required_reviews"):
+        assert field in evidence
+    assert "stays for documentation that ships with an implementation" in evidence
+
+
+def test_design_documents_count_as_explanation_mode() -> None:
+    assert ("A design or specification document counts as explanation mode: it may hold requirements, "
+            "alternatives and trade-offs without becoming a tutorial or reference hybrid.") in _flat(
+                _devkit("write-docs"))
+    assert "A design or specification document counts as explanation mode" in _flat(_devkit("review-docs"))
+
+
+def test_craft_code_triggers_on_interface_text() -> None:
+    """The routing index is not loaded first, so craft-code's own description must name
+    interface-copy work for kind D to be found."""
+    description = _flat(_devkit("craft-code").split("description: >-", 1)[1].split("\nreviewed-against:", 1)[0])
+    assert "or writing interface text (labels, buttons, empty states, error messages, tooltips)" in description

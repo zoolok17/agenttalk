@@ -2,14 +2,17 @@
 name: write-docs
 description: >-
   Write or update documentation as a first-class artifact — one Diataxis mode per
-  page, audience named, examples runnable, zero drift from the code. Use when writing
-  or updating a README, guide, reference, or any user-facing doc, or when a code
-  change alters how users build/configure/call the software. Do NOT use for inline
-  code comments (use craft-code) or for reviewing existing docs (use review-docs).
+  page, audience named, examples of current behavior runnable, zero drift from the
+  code, in the shared plain-language voice. Use when writing or updating a README,
+  guide, reference, manual, specification, design document, or any user-facing doc,
+  or when a code change alters how users build/configure/call the software.
+  Do NOT use for inline code comments (use craft-code) or for reviewing existing
+  docs (use review-docs).
 reviewed-against: "0.43"
 category: production
 evidence-profile:
   - production-handoff
+  - planning-artifact
 ---
 
 # write-docs
@@ -18,9 +21,10 @@ Documentation is part of the behavioral surface: a change is incomplete while it
 docs still teach the old behavior. Write for one reader, in one mode, with examples
 that actually run.
 
-This skill covers documentation pages (READMEs, guides, tutorials, reference).
-For release notes, changelog entries, pull request descriptions, comments and
-status reports, use write-for-humans instead.
+This skill covers documentation: READMEs, guides, tutorials, reference pages,
+manuals, specifications and design documents. For release notes, changelog
+entries, pull request descriptions, comments and status reports, use
+write-for-humans instead.
 
 ## CLASSIFY — before writing
 - [ ] Pick exactly **one Diataxis mode** for the page and don't mix them — split and
@@ -29,10 +33,20 @@ status reports, use write-for-humans instead.
       - **How-to guide** — a recipe to achieve one goal for a competent user.
       - **Reference** — neutral, exhaustive facts that mirror the code's structure.
       - **Explanation** — the why: concepts, trade-offs, background.
+      A design or specification document counts as explanation mode: it may hold
+      requirements, alternatives and trade-offs without becoming a tutorial or
+      reference hybrid.
 - [ ] Name the **audience** (user / integrator / contributor / operator) and their
       single goal at the top. Include only what serves that reader.
 
 ## WRITE — prose and examples
+- [ ] **Plain-language voice** (../_shared/references/plain-language.md, kind B):
+      open every document with an **"In plain words"** summary of about 3 to 6
+      sentences (what it is, who it is for, what you can do with it; for a
+      specification or design document, also what it decides and leaves open).
+      Write the body in plain words that are true for this case, never invent a
+      number, name or place, and in reference material keep exact names, flags,
+      commands and fields in place, each explained the first time.
 - [ ] For tutorials, how-tos, quickstarts, and any example meant to be executed: lead
       with a **minimal runnable** snippet — copy-paste runnable, versions pinned where
       output depends on them, expected output shown. Reference/explanation pages may
@@ -45,17 +59,26 @@ status reports, use write-for-humans instead.
 - [ ] Optimize for **scanning**: 2–3 sentence paragraphs, one idea per sentence,
       front-load the key info, headings that form a usable table of contents. Reference
       pages mirror the code's structure.
-- [ ] **README contract** (for a README): one-line problem statement → minimal example
-      → install/quickstart → usage → link to full docs → contributing → support →
-      license. Don't make an FAQ the primary documentation.
+- [ ] **README contract** (for a README): "In plain words" summary (it states the
+      problem) → minimal example → install/quickstart → usage → link to full docs →
+      contributing → support → license. Don't make an FAQ the primary documentation.
 - [ ] Be precise: no vague claims or unsupported guarantees; state limits and
       prerequisites honestly.
 
 ## GATE — accuracy and CI
-- [ ] Update docs in the **same change as the code** they describe. Never document
-      unshipped behavior. When behavior changes, also update the changelog and any
-      API reference / navigation that points at it.
-- [ ] Run / confirm the examples produce the documented output.
+- [ ] For **current product documentation**, update docs in the **same change as the
+      code** they describe, and never document unshipped behavior. When behavior
+      changes, also update the changelog and any API reference / navigation that
+      points at it.
+- [ ] A **design or specification document** may describe what is not built yet:
+      proposed requirements, alternatives and open decisions. Label its status
+      clearly (a `Status: proposed` line near the top, and "will" / "proposed"
+      wording), and never present an unimplemented proposal as existing behavior.
+      What it says about how the software works today must still match the code.
+- [ ] Run / confirm the examples of existing behavior produce the documented output. In
+      a proposed design or specification, mark each example of proposed behavior
+      "proposed, not runnable yet" and keep it consistent with the proposal; it is not
+      run until the proposal is built.
 - [ ] Pass the local docs-as-code gates if present (markdownlint, a prose/terminology
       linter like Vale, a link checker) before declaring done.
 
@@ -74,3 +97,9 @@ Required fields:
 - `residual_risk`
 - `required_review_lenses`
 - `evidence`
+
+For a proposed design or specification (`Status: proposed`, with nothing implemented in
+the same change), emit the planning-artifact profile instead: artifact_type, scope,
+decision or proposal, assumptions, alternatives, risks, required_reviews, open_questions
+and evidence (same reference). It never carries status=approved. The production-handoff
+profile above stays for documentation that ships with an implementation.

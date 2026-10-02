@@ -27,6 +27,11 @@ to a short section at the end. The one exception is anything that must not be
 published, such as a password, a key or a customer's details: that is removed or
 summarised safely, never moved to the end (see PRECISION WITHOUT CLUTTER).
 
+The same voice is shared with the other writing skills (documentation, code comments,
+interface text) in ../_shared/references/plain-language.md. This skill owns kind A there:
+release notes, changelog entries, pull request descriptions, issue and review comments, and
+status reports.
+
 ## WHO: the reader
 - [ ] They use the product, pay for it or decide about it. They do not read the code.
 - [ ] They know what the product is for, but not how it works inside.
@@ -84,10 +89,12 @@ you.
         installed; it does not mean anyone is using it yet. "Deployed" means a
         running system was switched over to it, so people are using it now. Say
         which one happened.
-      - **Null, absent and empty.** Say which one it is: the field is there but
-        set to "no value" on purpose (null), the field is left out entirely
-        (absent or undefined), or the field is there but empty (an empty text or
-        an empty list).
+      - **Absent, null, undefined and empty.** Wherever the language or the data
+        format tells them apart, they are different facts, so say which one it
+        is: the field is left out entirely (absent); the field is there but set
+        to "no value" (null); the field is there but holds "undefined" (in
+        JavaScript, `{field: undefined}` still has the field, while `{}` does
+        not); or the field is there but empty (an empty text or an empty list).
 
 Three worked examples follow. They show the method; they are not words to copy.
 
@@ -110,10 +117,14 @@ Three worked examples follow. They show the method; they are not words to copy.
 - [ ] **Keep every fact.** Translate it; do not delete it. A fact that only a
       developer needs moves to Technical details, but it stays.
 - [ ] **Except anything sensitive, which this rule never covers.** Secrets,
-      passwords, keys and tokens; private or customer data (names, email
-      addresses, account numbers, anything copied from a real person's records or
-      logs); and internal-only paths, hostnames or addresses are never kept, not
-      even in Technical details. Moving them to the end does not make them safe.
+      passwords, keys and tokens, and real private or customer records (names,
+      email addresses, account numbers, anything copied from a real person's
+      records or logs), are never kept, not even in Technical details.
+      Internal-only paths, hostnames and addresses are removed from anything a
+      public or unauthorized audience sees (release notes, a public page, an
+      error sent to a remote caller). Local diagnostics and private run guides
+      keep the path, or another safe identifier, when it is what lets the person
+      fix the problem. Moving them to the end does not make them safe.
       Remove them, or replace them with a safe summary that keeps the meaning: "a
       key was rotated", "one customer's order was affected". Check pasted command
       output and logs for them too. If you are not sure whether something is
@@ -219,8 +230,9 @@ suggest:** check the stock again just before taking the payment.
 - [ ] Are paths, IDs and code names only in Technical details, and does the main
       text still make sense without them?
 - [ ] Did every fact from the technical version survive?
-- [ ] Is there no secret, private data or internal-only address anywhere,
-      including Technical details and pasted output?
+- [ ] Is there no secret or real private record anywhere, including Technical
+      details and pasted output, and no internal-only path or address in text a
+      public or unauthorized reader will see?
 - [ ] Does every review finding still carry its severity tag?
 - [ ] Is every claim honest about what was checked and what was not?
 
