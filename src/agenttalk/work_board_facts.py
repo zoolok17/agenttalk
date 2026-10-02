@@ -22,7 +22,14 @@ LOCK_FILE = "work-board-facts.lock"
 RUN_LOCK_FILE = "work-board-verify.lock"
 MAX_FILE_BYTES = 512 * 1024
 MAX_FACTS = 400
-PROBE_TIMEOUT_SECONDS = 2.0
+# Windows CI flakes (2026-10-01): same reasoning as privacy.py's own
+# GIT_TIMEOUT_SECONDS - a loaded Windows runner can take longer than a
+# couple of seconds just to START `git`, which this fail-closed probe
+# (see `_git`, below) cannot tell apart from a genuinely hung git. Raised
+# from 2.0s to 15s. `test_probe_timeout_stops_the_checkout_and_records_
+# nothing` already monkeypatches this constant to its own explicit value
+# for the deliberate-timeout scenario, so it is unaffected by this change.
+PROBE_TIMEOUT_SECONDS = 15.0
 DEFAULT_MAX_AGE_SECONDS = 24 * 3600
 GIT = ("git",)
 

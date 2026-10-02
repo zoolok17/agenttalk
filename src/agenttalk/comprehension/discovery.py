@@ -74,7 +74,14 @@ from .paths import RELATIVE_COMPREHENSION_DIR
 #: a later-stage enforcement concern that never imports discovery.py
 #: either - the same accepted, hand-synced-duplication shape this
 #: package already carries for ``_TEST_SOURCE_ROOT_SEGMENT``).
-_GIT_CONFIG_TIMEOUT_SECONDS = 2.0
+#:
+#: Windows CI flakes (2026-10-01): kept hand-synced with privacy.py's own
+#: ``GIT_TIMEOUT_SECONDS`` raise (2.0s -> 15s) - see that constant's own
+#: comment for why. This one is exercised directly by real (non-mocked)
+#: ``git config -f .gitmodules`` subprocess calls in
+#: ``tests/test_comprehension_discovery.py``, so the same loaded-Windows-
+#: runner risk applies here too.
+_GIT_CONFIG_TIMEOUT_SECONDS = 15.0
 
 PATH_NORMALIZATION_VERSION = 1
 

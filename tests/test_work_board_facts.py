@@ -185,7 +185,7 @@ def test_git_probe_is_hardened_and_allowlisted(tmp_path, monkeypatch):
     monkeypatch.setattr(F.subprocess, "run", lambda argv, **kw: seen.update(argv=argv, **kw))
     F._git(tmp_path, "merge-base", "--is-ancestor", "a" * 40, "b" * 40)
     assert seen["argv"][1:6] == ["--no-replace-objects", "-c", "core.fsmonitor=false", "-C", str(tmp_path)]
-    assert seen["timeout"] == 2.0 and "shell" not in seen and "GIT_DIR" not in seen["env"]
+    assert seen["timeout"] == F.PROBE_TIMEOUT_SECONDS and "shell" not in seen and "GIT_DIR" not in seen["env"]
     assert {k: seen["env"][k] for k in ("GIT_NO_LAZY_FETCH", "GIT_NO_REPLACE_OBJECTS", "GIT_TERMINAL_PROMPT")} == {
         "GIT_NO_LAZY_FETCH": "1", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_TERMINAL_PROMPT": "0"}
     for probe in (("status",), ("rev-parse", "--output=x"), ("rev-parse", "HEAD"), ("merge-base", "a" * 40),
