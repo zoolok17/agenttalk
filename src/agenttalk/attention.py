@@ -820,6 +820,8 @@ def process_tree_hold_items(
     lane_workspaces: dict[str, str] | None = None,
     reset_admissions: dict | None = None,
     now_epoch: float | None = None,
+    visible_agents: frozenset[str] | None = None,
+    supervisor_running: bool = True,
 ) -> list[dict]:
     """Project strict supervisor process-tree HOLDs into global human attention.
 
@@ -830,6 +832,21 @@ def process_tree_hold_items(
     is absent this projector names no scripted command and makes no claim that
     none exists.  The configured detached argv remains recovery information,
     never launch authority.
+
+    ``visible_agents`` (issue #267): when given, a hold for an agent NOT in
+    this set is dropped entirely rather than projected - the caller's live
+    roster already excludes retired tombstones (``Store._known_roster``), so
+    passing the roster here hides both a retired agent's hold and a stale key
+    left behind by neither. ``None`` (the default) projects every hold, same
+    as before.
+
+    ``supervisor_running`` (issue #267): when False, every hold that is still
+    shown is relabeled ``state="history"`` with ``priority``/``risk_severity``
+    downgraded to ``"low"`` and a note prefixed onto ``why_it_matters`` - a
+    HOLD nobody is running can still block a manual restart, but it is no
+    longer a live, actively-worsening situation an operator needs to be
+    paged for right now. Defaults to True (unchanged prior behavior) so
+    existing callers that don't know supervisor liveness keep full severity.
     """
     from agenttalk import supervisor as supervisor_mod
 
@@ -1142,6 +1159,16 @@ def process_tree_hold_items(
         )
         if identity_warning:
             recommendation = f"{identity_warning} {recommendation}"
+        # issue #267: refreshed_at is stamped once when the tree is first
+        # built/relabeled (_owned_process_tree/_unverified_owned_process_tree
+        # in supervisor.py) and then carried forward UNCHANGED by every later
+        # poll while the hold stays truncated/invalid - so it is exactly
+        # "when this hold was recorded", not "now" (the previous bug: no
+        # age was read here at all, so the wire default of 0.0 always showed
+        # a brand-new hold).
+        hold_age_seconds, hold_age_unknown = _age_seconds_from_iso(
+            tree_record.get("refreshed_at"), projection_epoch
+        )
         if blocked_restart is not None:
             recommendation += (
                 " A restart request is blocked by this refusal and is not "
@@ -1202,6 +1229,7 @@ def process_tree_hold_items(
                     "wrapper_recognition": wrapper_recognition,
                 }),
             },
+            age_seconds=hold_age_seconds,
             human_can_unblock_now=(
                 not recognition_unknown
                 or remedy_mode == "configured_reset"
@@ -1223,6 +1251,7 @@ def process_tree_hold_items(
                 "risk_severity": "high",
                 "confidence": "high",
                 "affected": [agent],
+                "age_unknown": hold_age_unknown,
             },
             source_refs=[{
                 "kind": "supervisor_state",
@@ -1295,11 +1324,30 @@ def process_tree_hold_items(
             SOURCE_PROCESS_TREE_HOLD,
             identity=identity,
         )
+        if not supervisor_running:
+            # issue #267: nobody is polling this hold right now, so it cannot
+            # be getting worse - history, not a page. state="history" (not
+            # "active") keeps it out of build_queue's active_count/needs-you
+            # tally while still showing it (history is always-shown, unlike
+            # deferred/dismissed).
+            it["state"] = "history"
+            it["priority"] = "low"
+            it["risk_severity"] = "low"
+            it["why_it_matters"] = (
+                "Recorded by a supervisor that is not running, so this is "
+                "history, not an active page. " + (it["why_it_matters"] or "")
+            )
         out.append(it)
 
     if isinstance(agents, dict):
         for agent, row in sorted(agents.items()):
             if isinstance(agent, str) and isinstance(row, dict):
+                # issue #267: visible_agents gates ONLY this named/durable
+                # roster loop - an ephemeral one-shot reviewer (below) was
+                # never "on the roster" to retire from, so it is never
+                # subject to this filter.
+                if visible_agents is not None and agent not in visible_agents:
+                    continue
                 append_hold(identity=agent, agent=agent, row=row)
     eph_root = (
         state.get("ephemeral_reviewers")
@@ -1367,6 +1415,15 @@ def _age_seconds_from_iso(value: Any, now_epoch: float | None) -> tuple[float, b
     return age, False
 
 
+# issue #267: a dead letter older than this is grouped into one "old dead
+# letters (N)" line instead of listing it separately. Chosen as 7 days - a
+# dead letter is a durable, named per-message record (not a stale cache
+# entry), so nothing is lost by grouping it; a week is long enough that one
+# is very unlikely to still be the thing an operator is actively triaging,
+# but short enough that grouping doesn't swallow something from this week.
+OLD_DEAD_LETTER_AGE_SECONDS = 7 * 24 * 3600
+
+
 def dead_letter_items(entries: list[dict], *, now_epoch: float | None = None) -> list[dict]:
     """Build items from canonical dead-letter entries.
 
@@ -1377,12 +1434,24 @@ def dead_letter_items(entries: list[dict], *, now_epoch: float | None = None) ->
     default of 0.0 - omit for a pure/deterministic call (defaults to 0.0,
     unchanged from before). Also stamps ``age_unknown`` (see
     ``_age_seconds_from_iso``).
+
+    Entries older than :data:`OLD_DEAD_LETTER_AGE_SECONDS` (issue #267) are
+    folded into one trailing "old dead letters (N)" item instead of being
+    listed individually - an entry whose age is UNKNOWN (no ``now_epoch``, or
+    an unparseable/future ``deadlettered_at``) is never folded in: grouping is
+    only ever based on a PROVEN age, never a guess (fail closed, same
+    reasoning as every other "don't silently drop what you can't verify"
+    check in this module).
     """
     out = []
+    old: list[tuple[str, str, float]] = []
     for e in entries:
         ag, mid = e.get("agent", ""), e.get("message_id", "")
         ident = dead_letter_entry_notice_state(e)
         age_seconds, age_unknown = _age_seconds_from_iso(e.get("deadlettered_at"), now_epoch)
+        if not age_unknown and age_seconds >= OLD_DEAD_LETTER_AGE_SECONDS:
+            old.append((ag, mid, age_seconds))
+            continue
         it = _mk_item(SOURCE_DEAD_LETTER, item_id(SOURCE_DEAD_LETTER, ag, mid),
                       title=f"dead-letter: {ag}/{mid}",
                       ident_content=ident,
@@ -1393,7 +1462,42 @@ def dead_letter_items(entries: list[dict], *, now_epoch: float | None = None) ->
                       source_refs=[{"kind": "dead_letter", "agent": ag, "message_id": mid}])
         it["dedupe_key"] = dedupe_key(SOURCE_DEAD_LETTER, identity=f"{ag}:{mid}")
         out.append(it)
+    if old:
+        out.append(_old_dead_letter_group_item(old))
     return out
+
+
+def _old_dead_letter_group_item(old: list[tuple[str, str, float]]) -> dict:
+    """One attention item standing in for every dead letter older than
+    :data:`OLD_DEAD_LETTER_AGE_SECONDS` (issue #267). ``age_seconds`` is the
+    OLDEST member's age (the group's true dwell, matching how
+    ``oldest_active_age_seconds`` is derived elsewhere); ``source_hash`` is
+    bound to the exact membership, so adding/removing a member resurfaces the
+    group past any disposition made against the old membership (gate
+    condition 1)."""
+    members = sorted((ag, mid) for ag, mid, _age in old)
+    oldest_age = max(age for _ag, _mid, age in old)
+    it = _mk_item(
+        SOURCE_DEAD_LETTER,
+        item_id(SOURCE_DEAD_LETTER, "old"),
+        title=f"old dead letters ({len(old)})",
+        ident_content={"members": members},
+        human_can_unblock_now=True,
+        age_seconds=oldest_age,
+        fields={
+            "why_it_matters": (
+                f"{len(old)} dead letter(s) older than "
+                f"{OLD_DEAD_LETTER_AGE_SECONDS // 86400} days are grouped "
+                "here; more recent dead letters are still listed "
+                "individually."
+            ),
+            "priority": "high",
+        },
+        source_refs=[{"kind": "dead_letter", "agent": ag, "message_id": mid}
+                     for ag, mid in members],
+    )
+    it["dedupe_key"] = dedupe_key(SOURCE_DEAD_LETTER, identity="old")
+    return it
 
 
 def gate_hold_items(blockers: list[dict], *, scope: str = "release",
@@ -1539,7 +1643,11 @@ def build_queue(items: list[dict], dispositions: list[dict], *, now_iso: str,
     events. Never raises; a needs_operator item is never hidden by a torn disposition."""
     folded = fold_dispositions(dispositions)
     applied = [apply_disposition(it, folded, now_iso=now_iso) for it in items]
-    shown_states = {"active"}
+    # "history" (issue #267: a supervisor-not-running hold) is always shown,
+    # unlike deferred/dismissed/resolved - it is a system-computed state, not
+    # an operator disposition, and hiding it would defeat the point of
+    # keeping a stale hold visible-but-deprioritized instead of invisible.
+    shown_states = {"active", "history"}
     if include_deferred:
         shown_states.add("deferred")
     if include_dismissed:

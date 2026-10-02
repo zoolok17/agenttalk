@@ -7429,6 +7429,11 @@ def test_api_attention_surfaces_process_tree_hold_without_liaison(
         '{"agent": "beta"}',
         encoding="utf-8",
     )
+    # issue #267: these holds exercise full-severity "active" rendering, not
+    # the no-supervisor-running history downgrade (see
+    # test_api_attention_hides_retired_agent_hold_and_downgrades_stale_hold
+    # below for that) - claim a live instance lock so the fixture matches.
+    assert s.claim_supervisor_instance(pid=4321) is not None
     monkeypatch.setattr(
         supervisor_mod,
         "evaluate_process_tree_reset_admissions",
@@ -7476,18 +7481,22 @@ def test_api_attention_surfaces_process_tree_hold_without_liaison(
         for item in payload["items"]
         if item["source_label"] == "SUPERVISOR HOLD"
     } == {"process_tree_hold:alpha", "process_tree_hold:beta"}
+    # issue #267: refreshed_at ("2026-06-01T00:00:00Z") is now a real,
+    # non-zero age against wall-clock time, not the old hardcoded 0.0.
+    age_seconds = wire.pop("age_seconds")
+    assert age_seconds > 0
     assert wire == {
         "id": internal["item_id"],
         "source": "supervisor",
         "source_label": "SUPERVISOR HOLD",
         "severity": "high",
+        "state": "active",
         "title": internal["title"],
         "agent": "alpha",
         "detail": internal["why_it_matters"],
         "recommendation": web._envelope_str(internal["recommendation"]),
         "configured_launch": internal["configured_launch"],
         "restart_request": internal["restart_request"],
-        "age_seconds": 0.0,
         "human_can_unblock_now": True,
     }
     assert wire["restart_request"] == {
@@ -7577,6 +7586,7 @@ def test_api_attention_surfaces_process_tree_hold_without_liaison(
 def test_api_attention_hides_resolved_dead_letter_and_keeps_unresolved(
     tmp_path: Path,
 ) -> None:
+    from datetime import datetime, timezone
     from agenttalk import cli as cli_mod
     from agenttalk.wrapper import recv_api
 
@@ -7590,12 +7600,17 @@ def test_api_attention_hides_resolved_dead_letter_and_keeps_unresolved(
         )
         record = recv_api.next_record(s, "beta")
         assert record["id"] == message.id
+        # issue #267: a fresh timestamp, not a fixed past date - this test is
+        # about resolve/hide behavior, not age, and a fixed date would
+        # eventually cross OLD_DEAD_LETTER_AGE_SECONDS and get folded into
+        # the grouped "old dead letters" item instead of staying individual.
+        now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         s.dead_letter(
             "beta",
             record,
             reason="turn failed deterministically",
             failure_class="poison_eligible",
-            at="2026-07-12T00:00:00Z",
+            at=now_iso,
         )
         return message.id
 
@@ -7688,7 +7703,7 @@ def test_api_attention_actions_off_escalation_shape_is_legacy_fixture(
         payload = json.loads(raw)
         item = next(it for it in payload["items"] if it["source"] == "escalation")
         assert set(item) == {
-            "id", "source", "source_label", "severity", "title", "agent",
+            "id", "source", "source_label", "severity", "state", "title", "agent",
             "detail", "age_seconds", "human_can_unblock_now", "source_refs",
         }
         assert item["source_refs"] == [{"kind": "message", "request_id": "esc-help"}]

@@ -55,6 +55,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Stale supervisor holds and old dead letters no longer crowd the "what
+  needs you" list (#267).** Before, that list (the console's attention panel
+  and `agenttalk attention`) could show a supervisor hold for an agent who
+  had since been retired or taken off the roster entirely, each one claiming
+  to be brand new (zero seconds old) no matter how long it had actually sat
+  there, plus one line for every old dead letter even when dozens of them
+  were weeks old. None of that needed anyone to act.
+
+  Now a hold for a retired or off-roster agent is hidden outright. When no
+  supervisor is currently running, any remaining holds are shown as history -
+  "recorded by a supervisor that is not running" - with their real age, and
+  are no longer counted as something that needs you right now. Dead letters
+  older than 7 days are grouped into one "old dead letters (N)" line instead
+  of one line each; recent dead letters still show individually.
+
 - **Work orders no longer stall after an upgrade (#185, #201).**
   Before, `agenttalk task` refused to send a work order as long as ANY
   other seat in the roster was running an older build than the sender -

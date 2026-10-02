@@ -7072,6 +7072,13 @@ def _collect_attention_items(store: Store, *, for_agent: str | None, roster: lis
             lane_workspaces=lane_workspaces,
             reset_admissions=reset_admissions,
             now_epoch=time.time(),
+            # issue #267: same roster/liveness check as web.py's mirrored
+            # collector (web.py:_collect_web_attention_items) - `roster` is
+            # this function's own live-roster parameter, and
+            # store.read_supervisor_instance() is the same singleton-lock
+            # liveness test build_preflight already uses (web.py:488-490).
+            visible_agents=frozenset(roster),
+            supervisor_running=store.read_supervisor_instance() is not None,
         )
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("process_tree_hold", str(e)))
