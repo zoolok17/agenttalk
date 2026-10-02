@@ -473,6 +473,51 @@ def _process_tree_state(
     }
 
 
+# --------------------------------------------- issue #267: retired-agent hold filter
+
+def test_process_tree_hold_hides_retired_agent_with_valid_config() -> None:
+    state = _process_tree_state(status="truncated", reason_code="process_tree_truncated")
+    config = {"agents": [], "retired": [{"name": "worker", "retired_at": "2026-06-01T00:00:00Z"}]}
+    items = att.process_tree_hold_items(
+        state, reset_admissions=_NO_RESET_ADMITTED, store_config=config,
+    )
+    assert items == []
+
+
+def test_process_tree_hold_shown_when_config_unreadable() -> None:
+    # fail OPEN: any doubt about membership means show every hold unchanged
+    # (a config read/parse failure is represented the same way both
+    # cli.py's and web.py's collectors already represent it - store_config
+    # is None, never a partially-trusted dict).
+    state = _process_tree_state(status="truncated", reason_code="process_tree_truncated")
+    items = att.process_tree_hold_items(
+        state, reset_admissions=_NO_RESET_ADMITTED, store_config=None,
+    )
+    assert len(items) == 1
+    assert items[0]["item_id"] == "process_tree_hold:worker"
+
+
+def test_process_tree_hold_shown_for_active_agent() -> None:
+    state = _process_tree_state(status="truncated", reason_code="process_tree_truncated")
+    config = {"agents": ["worker"], "retired": []}
+    items = att.process_tree_hold_items(
+        state, reset_admissions=_NO_RESET_ADMITTED, store_config=config,
+    )
+    assert len(items) == 1
+    assert items[0]["item_id"] == "process_tree_hold:worker"
+
+
+def test_process_tree_hold_shown_for_agent_unknown_to_config() -> None:
+    # absence from the config is not proof of retirement.
+    state = _process_tree_state(status="truncated", reason_code="process_tree_truncated")
+    config = {"agents": [], "retired": []}
+    items = att.process_tree_hold_items(
+        state, reset_admissions=_NO_RESET_ADMITTED, store_config=config,
+    )
+    assert len(items) == 1
+    assert items[0]["item_id"] == "process_tree_hold:worker"
+
+
 @pytest.mark.parametrize(
     ("status", "reason_code", "observed_count", "expected_detail"),
     [
@@ -3275,126 +3320,3 @@ def test_build_queue_resolved_dead_letter_hidden_by_default() -> None:
     assert not [i for i in q["items"] if i["source"] == att.SOURCE_DEAD_LETTER]  # resolved -> hidden
     q2 = att.build_queue([dl], [disp], now_iso=_now(), include_resolved=True)
     assert [i for i in q2["items"] if i["source"] == att.SOURCE_DEAD_LETTER]     # --resolved shows it
-
-
-# --------------------------------------------- issue #267: stale attention items
-
-
-def _epoch(iso: str) -> float:
-    from datetime import datetime
-    return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
-
-
-def test_process_tree_hold_reports_real_age_from_refreshed_at() -> None:
-    # issue #267: before this, no age was read for a supervisor hold at all,
-    # so the wire default of 0.0 always showed a brand-new hold no matter how
-    # long it had actually been open.
-    state = _process_tree_state(status="truncated", reason_code="process_tree_truncated")
-    state["agents"]["worker"]["owned_process_tree"]["refreshed_at"] = "2026-06-01T00:00:00Z"
-    item = att.process_tree_hold_items(
-        state,
-        reset_admissions=_NO_RESET_ADMITTED,
-        now_epoch=_epoch("2026-06-08T00:00:00Z"),
-    )[0]
-    assert item["age_seconds"] == pytest.approx(7 * 86400)
-    assert item["age_unknown"] is False
-
-
-def test_process_tree_hold_age_unknown_without_refreshed_at() -> None:
-    # fail closed (same "don't guess" reasoning as the dead-letter grouping
-    # below): a record with no refreshed_at reports unknown, never a bare
-    # 0.0 that would read as "just happened".
-    state = _process_tree_state(status="truncated", reason_code="process_tree_truncated")
-    del state["agents"]["worker"]["owned_process_tree"]["refreshed_at"]
-    item = att.process_tree_hold_items(
-        state, reset_admissions=_NO_RESET_ADMITTED, now_epoch=_epoch("2026-06-08T00:00:00Z"),
-    )[0]
-    assert item["age_seconds"] == 0.0
-    assert item["age_unknown"] is True
-
-
-def test_supervisor_appears_running_fails_toward_true_when_not_scaffolded(
-    tmp_path: Path,
-) -> None:
-    # FIX round 1 (CI regression on PR #272): no supervisor.ps1/supervisor.json
-    # at all means there is no "the supervisor" for a hold to have been
-    # recorded by - liveness is not established, so this must read True
-    # (fail toward showing), never False from a bare missing instance lock.
-    s = Store(tmp_path)
-    s.init(["worker"])
-    assert not (s.dir / "supervisor.ps1").exists()
-    assert att.supervisor_appears_running(s) is True
-
-
-def test_supervisor_appears_running_false_only_when_scaffolded_and_unclaimed(
-    tmp_path: Path,
-) -> None:
-    s = Store(tmp_path)
-    s.init(["worker"])
-    (s.dir / "supervisor.ps1").write_text("# scaffold", encoding="utf-8")
-    (s.dir / "supervisor.json").write_text("{}", encoding="utf-8")
-    assert att.supervisor_appears_running(s) is False
-    assert s.claim_supervisor_instance(pid=4321) is not None
-    assert att.supervisor_appears_running(s) is True
-
-
-def test_process_tree_hold_hides_agent_outside_visible_set() -> None:
-    state = _process_tree_state(status="truncated", reason_code="process_tree_truncated")
-    visible = att.process_tree_hold_items(
-        state, reset_admissions=_NO_RESET_ADMITTED, visible_agents=frozenset({"worker"}),
-    )
-    assert len(visible) == 1
-    hidden = att.process_tree_hold_items(
-        state, reset_admissions=_NO_RESET_ADMITTED, visible_agents=frozenset({"someone-else"}),
-    )
-    assert hidden == []
-
-
-def test_process_tree_hold_becomes_history_when_supervisor_not_running() -> None:
-    state = _process_tree_state(status="truncated", reason_code="process_tree_truncated")
-    active = att.process_tree_hold_items(
-        state, reset_admissions=_NO_RESET_ADMITTED, supervisor_running=True,
-    )[0]
-    assert active["state"] == "active"
-    assert active["priority"] == active["risk_severity"] == "high"
-
-    history = att.process_tree_hold_items(
-        state, reset_admissions=_NO_RESET_ADMITTED, supervisor_running=False,
-    )[0]
-    assert history["state"] == "history"
-    assert history["priority"] == history["risk_severity"] == "low"
-    assert "not running" in history["why_it_matters"]
-
-    # not counted as "needs you": active_count excludes it, but it still
-    # shows up in the default (no include_* flags) queue view.
-    q = att.build_queue([history], [], now_iso=_now())
-    assert q["summary"]["active_count"] == 0
-    assert [i for i in q["items"] if i["item_id"] == history["item_id"]]
-
-
-def test_dead_letter_items_group_old_entries_and_keep_recent() -> None:
-    now_epoch = _epoch("2026-06-10T00:00:00Z")
-    entries = [
-        {"agent": "beta", "message_id": "old-1", "deadlettered_at": "2026-05-01T00:00:00Z"},
-        {"agent": "beta", "message_id": "old-2", "deadlettered_at": "2026-05-20T00:00:00Z"},
-        {"agent": "beta", "message_id": "recent-1", "deadlettered_at": "2026-06-09T00:00:00Z"},
-    ]
-    items = att.dead_letter_items(entries, now_epoch=now_epoch)
-    ids = {it["item_id"] for it in items}
-    assert ids == {"dead_letter:beta:recent-1", "dead_letter:old"}
-    group = next(it for it in items if it["item_id"] == "dead_letter:old")
-    assert group["title"] == "old dead letters (2)"
-    assert group["age_seconds"] == pytest.approx(now_epoch - _epoch("2026-05-01T00:00:00Z"))
-    assert {tuple(r.values()) for r in group["source_refs"]} == {
-        ("dead_letter", "beta", "old-1"),
-        ("dead_letter", "beta", "old-2"),
-    }
-
-
-def test_dead_letter_items_never_group_unknown_age() -> None:
-    # fail closed (same reasoning as every other "don't silently drop what
-    # you can't verify" check in this module): an entry with no/garbled
-    # deadlettered_at is never assumed old just because its age is unknown.
-    entries = [{"agent": "beta", "message_id": "no-timestamp"}]
-    items = att.dead_letter_items(entries, now_epoch=_epoch("2026-06-10T00:00:00Z"))
-    assert [it["item_id"] for it in items] == ["dead_letter:beta:no-timestamp"]

@@ -7072,16 +7072,6 @@ def _collect_attention_items(store: Store, *, for_agent: str | None, roster: lis
             lane_workspaces=lane_workspaces,
             reset_admissions=reset_admissions,
             now_epoch=time.time(),
-            # issue #267: same roster/liveness check as web.py's mirrored
-            # collector (web.py:_collect_web_attention_items) - `roster` is
-            # this function's own live-roster parameter, and
-            # A.supervisor_appears_running fails toward TRUE (a project
-            # that never scaffolded supervision at all has no "the
-            # supervisor" for a hold to have been recorded by; only a
-            # scaffolded-but-unclaimed instance lock is provable
-            # non-liveness, same build_preflight signal, web.py:483-490).
-            visible_agents=frozenset(roster),
-            supervisor_running=A.supervisor_appears_running(store),
         )
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("process_tree_hold", str(e)))

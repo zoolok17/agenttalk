@@ -55,20 +55,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Stale supervisor holds and old dead letters no longer crowd the "what
-  needs you" list (#267).** Before, that list (the console's attention panel
-  and `agenttalk attention`) could show a supervisor hold for an agent who
-  had since been retired or taken off the roster entirely, each one claiming
-  to be brand new (zero seconds old) no matter how long it had actually sat
-  there, plus one line for every old dead letter even when dozens of them
-  were weeks old. None of that needed anyone to act.
+- **A retired agent's old supervisor hold no longer sits in the "what needs
+  you" list next to current ones (#267).** The console's attention panel and
+  `agenttalk attention` showed a supervisor hold for an agent even after
+  that agent had been retired and could never come back - there was nothing
+  left to recover, so it was just noise alongside the holds that still
+  needed a decision.
 
-  Now a hold for a retired or off-roster agent is hidden outright. When no
-  supervisor is currently running, any remaining holds are shown as history -
-  "recorded by a supervisor that is not running" - with their real age, and
-  are no longer counted as something that needs you right now. Dead letters
-  older than 7 days are grouped into one "old dead letters (N)" line instead
-  of one line each; recent dead letters still show individually.
+  Now that hold is hidden, but only when agenttalk can actually confirm the
+  agent is retired: it reads the roster file, and the agent must be listed
+  there as retired. If the roster file can't be read or parsed for any
+  reason, or the agent isn't listed as retired (including an agent nobody
+  recognizes at all), its hold is shown exactly as before. When in doubt, a
+  safety hold stays visible rather than disappearing.
 
 - **Work orders no longer stall after an upgrade (#185, #201).**
   Before, `agenttalk task` refused to send a work order as long as ANY

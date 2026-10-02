@@ -288,17 +288,12 @@ def test_config_blocked_defer_then_different_fault_resurfaces_via_cli(tmp_path: 
 
 def test_resolved_dead_letter_absent_from_attention_queue(tmp_path: Path) -> None:
     # a resolved dead-letter must not resurface in the operator attention queue (CLI).
-    from datetime import datetime, timezone
     from agenttalk.wrapper import recv_api
     s = _team(tmp_path)
     m = s.send(sender="claude", recipient="beta", body="poison", kind="message", meta={})
     rec = recv_api.next_record(s, "beta")
-    # issue #267: a fresh timestamp - this test is about resolve/coalesce,
-    # not age, and a fixed past date would eventually cross
-    # OLD_DEAD_LETTER_AGE_SECONDS and get folded into the grouped item.
-    now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     s.dead_letter("beta", rec, reason="deterministic failure",
-                  failure_class="poison_eligible", at=now_iso)
+                  failure_class="poison_eligible", at="2026-07-02T00:00:00Z")
     dl_item = f"dead_letter:beta:{m.id}"
     from agenttalk import attention as A
     # before resolve: present in the queue
@@ -404,17 +399,11 @@ def test_published_hold_close_surfaces_and_malformed_degrades(tmp_path: Path) ->
 # ----------------------------------------------------------- cluster C: wrapper-notice coalescing (F6)
 
 def _dl_message(s, body: str = "poison"):
-    from datetime import datetime, timezone
     from agenttalk.wrapper import recv_api
     m = s.send(sender="claude", recipient="beta", body=body, kind="message", meta={})
     rec = recv_api.next_record(s, "beta")
-    # issue #267: a fresh timestamp, not a fixed past date - these tests are
-    # about resolve/coalesce behavior, not age, and a fixed date would
-    # eventually cross OLD_DEAD_LETTER_AGE_SECONDS and get folded into the
-    # grouped "old dead letters" item instead of staying individually named.
-    now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     s.dead_letter("beta", rec, reason="deterministic", failure_class="poison_eligible",
-                  at=now_iso)
+                  at="2026-07-02T00:00:00Z")
     return m.id
 
 
@@ -1134,7 +1123,7 @@ def test_attention_cli_hides_ephemeral_launch_when_effective_binding_drifts(
     assert web_item["source_hash"] == item["source_hash"]
 
 
-# --------------------------------------------- issue #267: stale attention items
+# --------------------------------------------- issue #267: retired-agent hold filter
 
 def _held_supervisor_state(agent: str) -> dict:
     return {
@@ -1182,75 +1171,50 @@ def test_attention_hides_retired_agent_hold_in_cli_and_web(tmp_path: Path) -> No
     assert not [i for i in web_items if i["source"] == A.SOURCE_PROCESS_TREE_HOLD]
 
 
-def test_attention_hold_is_history_not_needs_you_without_live_supervisor(
-    tmp_path: Path,
-) -> None:
-    from agenttalk import attention as A
+def test_attention_shows_hold_when_config_json_is_unreadable(tmp_path: Path) -> None:
+    # LEAD DECISION (CUT, round 2): any config read/parse failure means SHOW
+    # every hold unchanged - doubt about membership must never hide a real
+    # safety hold. A hand-truncated config.json ('{') reproduces the real
+    # failure mode (store.load_config() raises, both collectors already
+    # catch that into store_config=None).
     s = _team(tmp_path)
-    # issue #267 FIX round 1: "no supervisor running" is only provable when
-    # supervision is scaffolded in the first place (A.supervisor_appears_running
-    # fails toward True otherwise) - write the same two files
-    # build_preflight checks (web.py:483-490) so this test's "nobody claimed
-    # the lock" genuinely means "configured, but not currently running".
-    (s.dir / "supervisor.ps1").write_text("# scaffold", encoding="utf-8")
-    (s.dir / "supervisor.json").write_text(json.dumps({"agents": {}}), encoding="utf-8")
+    s.retire_agent("beta", reason="superseded by a renamed seat")
     supervisor_mod.save_supervisor_state(
         s.dir / "supervisor-state.json",
         _held_supervisor_state("beta"),
     )
+    (s.dir / "config.json").write_text("{", encoding="utf-8")
+
+    cli_items = cli._collect_attention_items(  # noqa: SLF001
+        s, for_agent="claude", roster=["beta", "claude"],
+    )
+    web_items = web_mod._collect_web_attention_items(  # noqa: SLF001
+        s, ["beta", "claude"], "claude",
+    )
+    assert [i for i in cli_items if i["item_id"] == "process_tree_hold:beta"]
+    assert [i for i in web_items if i["item_id"] == "process_tree_hold:beta"]
+
+
+def test_attention_shows_hold_for_active_and_unknown_agents(tmp_path: Path) -> None:
+    from agenttalk import attention as A
+    s = _team(tmp_path)
+    state = {
+        "agents": {
+            "beta": _held_supervisor_state("beta")["agents"]["beta"],
+            "ghost": _held_supervisor_state("ghost")["agents"]["ghost"],
+        },
+    }
+    supervisor_mod.save_supervisor_state(s.dir / "supervisor-state.json", state)
     roster = s.load_config().get("agents") or []
-    assert s.read_supervisor_instance() is None  # nobody claimed the lock
+    assert "beta" in roster
+    assert "ghost" not in roster  # absent from config entirely: not proof of retirement
 
-    for items in (
-        cli._collect_attention_items(s, for_agent="claude", roster=roster),  # noqa: SLF001
-        web_mod._collect_web_attention_items(s, roster, "claude"),  # noqa: SLF001
-    ):
-        hold = next(i for i in items if i["source"] == A.SOURCE_PROCESS_TREE_HOLD)
-        assert hold["state"] == "history"
-        assert hold["priority"] == hold["risk_severity"] == "low"
-        q = A.build_queue(items, [], now_iso="2026-06-08T00:00:00Z")
-        # shown, but not tallied as something needing the operator right now
-        assert [i for i in q["items"] if i["item_id"] == hold["item_id"]]
-        assert hold["item_id"] not in {
-            i["item_id"] for i in q["items"] if i.get("state") == "active"
-        }
-
-    # claiming the instance lock restores full-severity "active" holds.
-    assert s.claim_supervisor_instance(pid=4321) is not None
-    live_cli_items = cli._collect_attention_items(  # noqa: SLF001
+    cli_items = cli._collect_attention_items(  # noqa: SLF001
         s, for_agent="claude", roster=roster,
     )
-    live_hold = next(
-        i for i in live_cli_items if i["source"] == A.SOURCE_PROCESS_TREE_HOLD
+    web_items = web_mod._collect_web_attention_items(  # noqa: SLF001
+        s, roster, "claude",
     )
-    assert live_hold["state"] == "active"
-    assert live_hold["priority"] == live_hold["risk_severity"] == "high"
-
-
-def test_attention_hold_keeps_severity_when_supervision_was_never_scaffolded(
-    tmp_path: Path,
-) -> None:
-    # FIX round 1 (CI regression on PR #272): a project with no
-    # supervisor.ps1/supervisor.json at all has no "the supervisor" for a
-    # hold to have been recorded by - liveness cannot be established, so the
-    # original severity/escalation must be kept (fail toward showing, not
-    # hiding). This is exactly test_supervisor.py's
-    # test_owned_process_tree_bound_holds_and_escalates_when_truncated shape:
-    # supervisor-state.json written directly, no scaffold, no lock.
-    from agenttalk import attention as A
-    s = _team(tmp_path)
-    assert not (s.dir / "supervisor.ps1").exists()
-    assert not (s.dir / "supervisor.json").exists()
-    supervisor_mod.save_supervisor_state(
-        s.dir / "supervisor-state.json",
-        _held_supervisor_state("beta"),
-    )
-    roster = s.load_config().get("agents") or []
-
-    for items in (
-        cli._collect_attention_items(s, for_agent="claude", roster=roster),  # noqa: SLF001
-        web_mod._collect_web_attention_items(s, roster, "claude"),  # noqa: SLF001
-    ):
-        hold = next(i for i in items if i["source"] == A.SOURCE_PROCESS_TREE_HOLD)
-        assert hold["state"] == "active"
-        assert hold["priority"] == hold["risk_severity"] == "high"
+    for items in (cli_items, web_items):
+        ids = {i["item_id"] for i in items if i["source"] == A.SOURCE_PROCESS_TREE_HOLD}
+        assert ids == {"process_tree_hold:beta", "process_tree_hold:ghost"}
