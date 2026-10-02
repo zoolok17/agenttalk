@@ -53,6 +53,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   routing index gains a row for interface text. `write-for-humans`' trigger is
   unchanged. Tests in `tests/test_install_skills.py`.
 
+- **The lead skills now teach a regular check-in and a handover note (#276).**
+  A lead on a long run had no written routine: what to look at and how often,
+  what to write down so that a reset lead can carry on, and what to tell the
+  person in charge. Each lead made up its own, and a reset could lose track of
+  work in flight.
+
+  Now both lead skills have a "Lead routine" section:
+  - a check-in, for example every 30 minutes: read new messages, see which
+    seats are alive or stuck, look at open threads, go through reviews and pull
+    requests (merge only with a review that covers the exact head commit),
+    check each seat's model budget and context with `agenttalk capacity` and
+    the machine's free memory with the operating system's own check, curate
+    knowledge, and check spend if the team has a paid model route. A step the
+    team does not have is skipped;
+  - a handover, for example every two hours and before any reset:
+    `agenttalk checkpoint save` keeps what agenttalk can see, and a separate
+    note of a few lines in the lead's own notes keeps the rest, under about 20
+    lines in all. The checkpoint does not store that note;
+  - ways to put both on a timer: a scheduled prompt in Claude Code, or an
+    operating-system scheduled task for the Codex terminal CLI. The supervised
+    lead loop is a separate safety sweep, not a timer for this routine;
+  - what to report to the person in charge: only decisions and actions that
+    need them, and money alarms.
+
+  The task example in each lead skill now also shows the reply to ask for: a
+  task response with `--meta status=done` next to its verdict. Without a
+  closing status the task stays listed as open (part of #277).
+
+  What you will notice: a lead that loads the updated skill keeps a steady
+  check-in and leaves a handover note. The manual's "Lead-led team" section
+  points to the routine.
+
+  What you need to do: on an existing install, a plain
+  `agenttalk install-skills` leaves a changed skill file alone. Preview with
+  `agenttalk install-skills --dry-run --force`, back up any local edits you
+  want to keep, then run `agenttalk install-skills --force`.
+
+  Technical details: `src/agenttalk/skills/claude/agenttalk.lead.md` and
+  `src/agenttalk/skills/codex/agenttalk-lead/SKILL.md` carry the same text,
+  each in its own agent's command style; `docs/AGENTTALK-NEW-USER-MANUAL.md`.
+  Tests in `tests/test_install_skills.py` keep the two copies in step and check
+  that every task-response example in the lead skills asks for a closing
+  status.
+
 ### Changed
 
 - **The README and the new-user manual now open in plain words.** Both start

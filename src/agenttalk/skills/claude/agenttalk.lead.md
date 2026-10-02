@@ -380,6 +380,12 @@ the agents you plan.
      --meta lane_id=<lane-id> `
      -m "<goal, scope, verification, expected reply>"
    ```
+   Ask for the reply in this form. A task response needs a closing `status`
+   next to its `verdict`; without one, the task can stay open:
+   ```powershell
+   agenttalk reply --to-request <request_id> --kind task-response `
+     --meta status=done --meta verdict=<verdict> -m "<result>"
+   ```
 5. Use broadcast for shared awareness or parallel input:
    ```powershell
    agenttalk broadcast --from $SELF --to-group <group> --kind question `
@@ -420,6 +426,108 @@ the agents you plan.
    details section at the end, but never include secrets, private data or
    internal-only addresses, not even there. A review comment keeps the
    review's own format and severity tag.
+
+## Lead routine
+
+Two habits keep a team healthy over a long run: a regular check-in, and a
+short handover note that lets a reset lead, or a replacement, carry on where
+you left off. Set both up when you start leading. Skip any step your team does
+not have (no paid model route, no code host, no work board) rather than
+inventing one.
+
+### Check-in (for example every 30 minutes)
+
+1. **Read new messages and act on every reply.** If you run wrapped, for
+   example as a supervised lead loop, the wrapper delivers them for you and its
+   rules forbid `drain`, `recv` and `threads`; then skip this step and step 3.
+   ```powershell
+   agenttalk drain --for $SELF
+   ```
+   (`agenttalk recv --for $SELF` shows them without marking them read.)
+2. **See who is alive and who is stuck.** Look into any seat whose heartbeat
+   is stale, or that shows as stuck or parked, before giving it more work;
+   `agenttalk doctor` checks deeper.
+   ```powershell
+   agenttalk status
+   ```
+3. **See what you owe and what is owed to you.** Answer what you owe; chase or
+   re-plan what is overdue. A task whose reply had a verdict but no closing
+   `status` still shows as open, so read the reply before you chase it.
+   ```powershell
+   agenttalk threads --for $SELF
+   ```
+4. **Open reviews and pull requests.** Read each review's verdict and the code
+   host's inline review comments (see "Read the host's AUTOMATED review
+   findings" above). Merge only with a GO that covers the exact head commit
+   (`work_head`); a GO on an earlier head does not count. If the project uses
+   the work board, run `agenttalk board verify-merges` after each merge.
+5. **Capacity, before handing out more work.**
+   - Model budgets and context: `agenttalk capacity` shows the budgets and
+     context use that each seat has published. Steer long work away from a
+     seat near a limit.
+     ```powershell
+     agenttalk capacity
+     ```
+   - Free memory: agenttalk does not check the machine's memory. Before you
+     start another agent or build, use your operating system's own check, for
+     example Task Manager on Windows, `free -h` on Linux, or Activity Monitor
+     on macOS.
+6. **Knowledge.** Pull the notes and lessons, including the uncurated ones, as
+   JSON with a `--limit` above your number of lessons: by default a pull shows
+   only 5 lessons, and curated ones can push uncurated ones out of view. If the
+   output's `truncation` still counts lessons left out, raise the limit. The
+   uncurated rows have `"view": "proposal"`; verify or retract each one (a
+   retract needs `--reason`).
+   ```powershell
+   agenttalk knowledge pull --include-uncurated --json --limit 1000
+   agenttalk knowledge curate verify --domain <domain> --key <key>
+   ```
+7. **Spend, if the team has a paid model route.** Compare it with the agreed
+   limit using that route's own spend report, and tell the person in charge
+   before it reaches the limit.
+
+### Handover note (for example every two hours, and before any reset)
+
+1. Save a checkpoint of what agenttalk can see: your open threads, the
+   capacity signal, and the branch and commit of the folder that holds the
+   agenttalk store. It holds no notes of your own. After a reset,
+   `checkpoint resume` shows it again.
+   ```powershell
+   agenttalk checkpoint save --for $SELF
+   agenttalk checkpoint resume --for $SELF
+   ```
+2. Write a separate handover note with what the checkpoint cannot see, in a
+   few lines in your own notes (your memory, if you have one):
+   - what is running: each seat, its task id, and its branch and commit;
+   - what waits on whom;
+   - open decisions for the person in charge;
+   - spend so far, if the team has a paid route;
+   - what you planned to do next.
+
+Keep the whole note under about 20 lines.
+
+### Switching the timers on
+
+Use two timers: one for the check-in, and a slower one for the handover note.
+A timer only reminds you; you still run the steps yourself. For example:
+- **Claude Code:** a scheduled prompt in your own session, such as `/loop 30m`
+  with the check-in as its prompt, and `/loop 2h` with the handover note as its
+  prompt. After a restart, first list the scheduled tasks you still have (ask
+  "what scheduled tasks do I have?"), then recreate only the ones that are
+  missing or expired, so that you do not run two copies of the same timer.
+- **Codex (the terminal CLI):** the CLI has no built-in timer for this. Use an
+  operating-system scheduled task that nudges you to run the routine.
+
+The supervised lead loop (see "Lead-loop, relay, and review modes" above) is
+not a timer for this routine. It is a separate safety sweep: on a quiet bus it
+starts a turn only for overdue reminders, dead letters and unrouted
+escalations, and it does not run the check-in or the handover note.
+
+### What to report to the person in charge
+
+Report only what needs them: decisions only they can make, actions only they
+can take, and money alarms. Keep everything else (routine progress, merges,
+retries) in your own notes, where the next handover note picks it up.
 
 ## Publishing a sandboxed worker's commit
 
