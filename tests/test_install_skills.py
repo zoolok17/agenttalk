@@ -890,3 +890,80 @@ def test_technical_detail_last_is_scoped_to_kind_a() -> None:
     assert "Where technical detail goes depends on the kind of text." in core
     assert "Documentation keeps exact names, flags, commands and fields in place" in core
     assert "- Put technical detail last." not in core
+
+
+# ------------------------------------------------------- the lead routine
+
+_LEAD_SKILLS = (SKILLS_ROOT / "claude" / "agenttalk.lead.md", SKILLS_ROOT / "codex" / "agenttalk-lead" / "SKILL.md")
+
+
+def _lead_routine(path: Path) -> str:
+    text = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+    return text.split("\n## Lead routine\n", 1)[1].split("\n## ", 1)[0]
+
+
+def test_lead_skills_carry_the_lead_routine_in_step() -> None:
+    """A new lead learns the check-in and the handover note from the playbook alone; the
+    Claude and Codex copies differ only in how a command is written."""
+    def same_words(text: str) -> str:
+        return (text.replace("python -m agenttalk", "agenttalk").replace('"$SELF"', "$SELF")
+                .replace("```bash", "```powershell").replace(" \\\n", " `\n"))
+
+    claude, codex = (_lead_routine(p) for p in _LEAD_SKILLS)
+    assert same_words(claude) == same_words(codex)
+    routine = _flat(claude)
+    for heading in ("### Check-in", "### Handover note", "### Switching the timers on",
+                    "### What to report to the person in charge"):
+        assert heading in claude
+    assert "Skip any step your team does not have" in routine
+    assert "agenttalk checkpoint save --for $SELF" in routine
+    assert "Report only what needs them" in routine
+    assert "Merge only with a GO that covers the exact head commit" in routine
+    assert "no closing `status` still shows as open, so read the reply before you chase it" in routine
+
+
+def test_lead_routine_claims_only_what_the_commands_do() -> None:
+    """Each step says what its command really covers and what the lead must do by hand."""
+    routine = _flat(_lead_routine(_LEAD_SKILLS[0]))
+    # a wrapped lead's rules forbid drain, recv and threads
+    assert "its rules forbid `drain`, `recv` and `threads`; then skip this step and step 3" in routine
+    # capacity reports budgets and context; free memory is the operating system's check
+    assert "`agenttalk capacity` shows the budgets and context use that each seat has published" in routine
+    assert "agenttalk does not check the machine's memory" in routine
+    # a plain pull shows 5 lessons, so pull them all as JSON and filter the proposals
+    assert "agenttalk knowledge pull --include-uncurated --json --limit 1000" in routine
+    assert "If the output's `truncation` still counts lessons left out, raise the limit" in routine
+    assert 'The uncurated rows have `"view": "proposal"`' in routine
+    # the checkpoint stores observable state only; the handover note is separate
+    assert "the branch and commit of the folder that holds the agenttalk store" in routine
+    assert "It holds no notes of your own" in routine
+    assert "Write a separate handover note with what the checkpoint cannot see" in routine
+    # the timers nudge the lead; restored session tasks must not be doubled
+    assert "A timer only reminds you; you still run the steps yourself" in routine
+    assert "recreate only the ones that are missing or expired" in routine
+    assert "Codex (the terminal CLI):** the CLI has no built-in timer for this" in routine
+    # the managed lead loop is a safety sweep, never presented as this routine's timer
+    assert "is not a timer for this routine. It is a separate safety sweep" in routine
+    assert "--lead-loop" not in routine
+    assert "dies with the session" not in routine
+
+
+def test_manual_keeps_the_handover_note_apart_from_the_checkpoint() -> None:
+    manual = (Path(__file__).resolve().parents[1] / "docs" / "AGENTTALK-NEW-USER-MANUAL.md")
+    text = manual.read_text(encoding="utf-8").replace("\r\n", "\n")
+    lead_led = _flat(text.split("\n### Lead-led team\n", 1)[1].split("\n### ", 1)[0])
+    assert "`agenttalk checkpoint save` records what agenttalk can see" in lead_led
+    assert "a separate short note, kept in the lead's own notes, records the rest" in lead_led
+    assert "The checkpoint does not store that note" in lead_led
+
+
+def test_lead_skill_task_reply_examples_close_with_a_status() -> None:
+    """A task response without a closing status can leave the task open, so every example
+    in the lead skills that shows one also asks for --meta status=done."""
+    for path in _LEAD_SKILLS:
+        blocks = re.findall(r"```[a-z]*\n(.*?)```", path.read_text(encoding="utf-8").replace("\r\n", "\n"),
+                            flags=re.S)
+        replies = [b for b in blocks if "--kind task-response" in b]
+        assert replies, path.name
+        for block in replies:
+            assert "--meta status=done" in block, (path.name, block)

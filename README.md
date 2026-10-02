@@ -1,5 +1,16 @@
 # agenttalk
 
+**In plain words:** agenttalk lets AI coding assistants that run in a terminal,
+such as Claude Code and Codex, send each other messages and work on the same
+project. It is for developers who want a second agent, ideally from another AI
+company, to review or continue the first one's work, and for people who run a
+whole team of agents. Each message is a file in the project's own
+`.agenttalk/` folder, so there is no server to set up and no account to create.
+You install it with one `pip` command, set up the project once, give each
+terminal an agent name, and the agents can then hand work to each other and
+reply. Everything else, from team roles to a read-only web dashboard, is
+optional.
+
 1. [Quick intro](#1-quick-intro)
 2. [Quick setup](#2-quick-setup)
 3. [Use cases](#3-use-cases)
@@ -10,12 +21,14 @@
 
 ## 1. Quick intro
 
-agenttalk is a small, file-backed message bus that lets coding-agent
-CLIs — Claude Code and Codex, a pair or a named team — talk to each
-other directly and work on the same repo. There is no daemon and no
-server: every message is a JSON file under a project-local
-`.agenttalk/` directory, and each CLI runs in its own terminal window
-so you watch the full conversation as it happens.
+agenttalk is a small message bus: a shared place where agents leave
+messages for each other. Coding agents that run as command-line tools
+(CLIs), such as Claude Code and Codex, use it to talk to each other
+directly and work on the same repository, as a pair or as a named team.
+The messaging needs no background service and no server: every message
+is a JSON file under a project-local `.agenttalk/` directory. Each CLI
+runs in its own terminal window, so you can watch the whole conversation
+as it happens.
 
 ### Why a bus instead of copy-paste
 
@@ -65,27 +78,93 @@ a team or runs unattended:
   `agenttalk dashboard`) for watching roster, threads, and obligations
   without joining the bus yourself.
 
-### Local-first, no egress
+### Local-first: what reaches the network
 
-agenttalk itself makes no network calls. The bus is files on disk; the
-only network traffic is whatever the underlying agent CLI (Claude
-Code, Codex) already makes to its own provider. The bundled dashboard
-binds to loopback only and has no flag to expose it — reach it from
-another machine over an SSH tunnel if you need to, not by opening the
-port.
+The bus itself makes no network calls: messages are files on disk. Your
+agent CLIs (Claude Code, Codex) keep talking to their own model providers,
+as they would without agenttalk. These are agenttalk's built-in network
+integrations, and when they connect:
+
+- **DEFAULT: none.** The bus, the dashboard and the supervisor open no
+  outbound connections.
+- **OPT-IN, the managed model gateway** (`agenttalk gateway`): while it is
+  installed and running, it sends gateway-backed agents' model calls to
+  OVH AI Endpoints at `https://oai.endpoints.kepler.ai.cloud.ovh.net/v1`.
+- **OPT-IN, the contributor check `agenttalk dev-gate`** (this project's
+  CI runs it too): when you run it, it installs the package it built
+  locally, fetching that package's dependencies and the test tools from
+  the Python package index (`https://pypi.org/simple`), downloads the live
+  Semgrep rule sets `p/python` and `p/security-audit`
+  from the Semgrep registry, and checks dependencies against the PyPI
+  advisory database through `pip-audit`.
+- **OPT-IN, the assurance tool** (`python -m agenttalk.assurance`): the
+  OSV vulnerability database (through `osv-scanner`), the PyPI advisory
+  database (through `pip-audit`) and remote Semgrep configurations are all
+  off by default; each runs only when the scan profile's `network_allowed`
+  setting lists that tool. A `release`-profile scan also builds the
+  package with `python -m build`. That build is not gated by
+  `network_allowed`: it can download the project's build backend from the
+  Python package index even when `network_allowed` allows nothing.
+
+Commands you configure yourself, such as the assurance tool's test,
+coverage and tool commands or a project's build backend, can reach
+anything, and `network_allowed` is not an operating-system network
+sandbox.
+
+The bundled dashboard binds to loopback only (it listens only on this
+computer) and has no flag to expose it — reach it from another machine
+over an SSH tunnel if you need to, not by opening the port.
+
+### Where agenttalk keeps files
+
+The coordination store (messages, the roster, cursors, thread state and
+archives) is in the project's `.agenttalk/` folder. A few things live
+outside it, in per-user folders. By default they are:
+
+- **signing keys**, if you turned on message signing with
+  `agenttalk hmac-init`: `%LOCALAPPDATA%\agenttalk\keys\` on Windows,
+  `$XDG_CONFIG_HOME/agenttalk/keys/` (default `~/.config`) elsewhere.
+  Without the key, signed messages cannot be verified;
+- **backups** made with `agenttalk backup`: `agenttalk\recovery\` in the
+  same per-user folder, unless `AGENTTALK_RECOVERY_DIR` points elsewhere;
+- **the supervisor's wrapper logs**: `%LOCALAPPDATA%\agenttalk\wrapper-logs\`
+  on Windows, `$XDG_STATE_HOME/agenttalk/wrapper-logs/` (default
+  `~/.local/state`) elsewhere;
+- **the managed gateway's secrets** (its API key and tokens), **its
+  `install.json` and its spend ledger**, if you use the gateway:
+  `agenttalk-ovh\` and `agenttalk-ovh-spend\` under `LOCALAPPDATA` when that
+  variable is set, otherwise under `~/.local/share`, on every system;
+- **Codex settings**: `agenttalk codex-config --enable` adds a block for
+  this project to `~/.codex/config.toml`.
+
+To move them: `AGENTTALK_HMAC_KEY_FILE` sets the signing key file,
+`AGENTTALK_RECOVERY_DIR` sets the backup folder, and
+`agenttalk codex-config --config-path` uses a different Codex settings
+file.
+
+`agenttalk backup` copies only the coordination store; none of the
+per-user items above are in it. Restoring the gateway needs its whole
+per-user folders: the secrets (API key, front token, internal token),
+`install.json` and the spend ledger, because the gateway checks the front
+token against the ledger when it starts. Deleting the project folder does
+not remove the per-user items above.
 
 ### What agenttalk is not
 
-- **Not a model.** agenttalk doesn't call any model API itself and has
-  no opinion on which model a CLI uses — it only moves messages between
-  whatever agent CLIs you start. The intelligence is entirely in the
-  agents; the bus just lets them talk.
+- **Not a model.** The bus doesn't choose or run a model and has no
+  opinion on which model a CLI uses — it moves messages between whatever
+  agent CLIs you start. The intelligence is entirely in the agents; the
+  bus just lets them talk. The one model-specific part is the optional
+  managed gateway, which supports a single route, pinned in code: OVH AI
+  Endpoints with the Qwen3.8-27B model. It refuses any other address or
+  model.
 - **Not an IDE plugin.** There's no editor integration to install.
   agenttalk is a CLI-level bus: it works with whatever terminal or
   editor-embedded terminal you already run your agent CLIs in.
 - **Not a hosted service.** No account, no server to sign up for, no
-  cloud component. Everything lives in your project's `.agenttalk/`
-  directory on your own machine.
+  cloud component. agenttalk's own files stay on your own machine: the
+  coordination store in your project's `.agenttalk/` directory, and the
+  per-user files listed under "Where agenttalk keeps files".
 - **Not a task queue.** There's no central scheduler deciding what
   runs next; agents decide what to do and message each other about it.
   If you want an explicit "what's next" driver, pair agenttalk with a
@@ -110,21 +189,32 @@ python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.95.0"
 agenttalk install-skills          # installs bus skills + the dev-discipline devkit
 ```
 
-Pin to a released tag (`@v0.95.0` above, or whatever the current
-release is) rather than a branch — the CLI surface and message schema
-can change between releases, and a tag keeps every agent in a project
-talking the same protocol version.
+The first line installs agenttalk itself. Pin it to a released tag
+(`@v0.95.0` above, or whatever the current release is) rather than a
+branch: the commands and the message format can change between
+releases, and a tag keeps every agent in a project on the same version.
 
-`agenttalk install-skills` writes Claude Code's bus commands under
-`~/.claude/commands` and Codex's under `~/.codex/skills` by default;
-pass `--claude-only` or `--codex-only` to install just one side, or
-`--dry-run` to preview without writing.
+The second line installs the skills, the instructions each agent CLI
+reads to use agenttalk. It writes Claude Code's bus commands under
+`~/.claude/commands` and Codex's under `~/.codex/skills`, and the
+dev-discipline pack (the devkit) under both `~/.claude/skills` and
+`~/.codex/skills`. `--claude-only` and `--codex-only` choose which
+side gets the bus commands; the devkit still goes to both sides unless
+you add `--no-devkit`, so `--claude-only --no-devkit` installs Claude
+Code's bus commands and nothing else. `--devkit-only` installs only the
+devkit, and `--dry-run` previews without writing.
+
+When you upgrade an existing install, a plain `agenttalk install-skills`
+leaves alone every skill file that differs from the new version, so
+updated skills would not arrive. Preview with
+`agenttalk install-skills --dry-run --force`, back up any local edits you
+want to keep, then run `agenttalk install-skills --force`.
 
 ### Initialize a project
 
-Once per project, from the project root, with the actual names you'll
-use in each terminal (not the generic `claude`/`codex` default — see
-the next section for why):
+Do this once per project, from the project's top folder. Name the agents
+you will run, one per terminal; use real names rather than the default
+`claude` and `codex` (the next section explains why):
 
 ```powershell
 agenttalk init --here --agents claude-dev,codex-rev
@@ -801,7 +891,7 @@ typed-evidence shape at the milestone level.
 | `install-skills` | Install bus skills (and the dev-discipline devkit) for Claude and/or Codex. |
 | `hmac-init` | Provision HMAC signing material. |
 | `backup` | (#156) Write a verified out-of-tree snapshot of the store, keyed by project identity; `--json`. See [docs/BACKUP.md](docs/BACKUP.md). |
-| `gateway` | `{init,start,stop,status,...}` — multi-agent process gateway lifecycle. |
+| `gateway` | `{init,task-install,start,stop,status,...}` — lifecycle of the optional managed model gateway, the supported route for gateway-backed seats: OVH AI Endpoints with the Qwen3.8-27B model, pinned in code. Start it through the managed task; `gateway run` is the internal service entry that task launches, not a supported way to start it by hand. |
 
 **Dashboards**
 

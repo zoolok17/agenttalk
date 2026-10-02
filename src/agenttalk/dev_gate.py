@@ -304,7 +304,7 @@ def validate_manifest(data: Any) -> dict[str, Any]:
             "required_sdist_paths": [
                 "dev-gate.json",
                 "dev-gate-requirements.txt",
-                "docs/AGENTTALK-NEW-USER-MANUAL.pdf",
+                "docs/AGENTTALK-NEW-USER-MANUAL.md",
                 "src/agenttalk/web_static/console.js",
             ],
         },
