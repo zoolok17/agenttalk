@@ -350,9 +350,10 @@ def check_board(root: Path | None, *, project: str, item: str, cycle: int, revis
 def validate_response_status(kind: str, meta: dict) -> None:
     """Validate a typed response status when present.
 
-    Missing status remains readable for mixed-version history, but it is not a
-    terminal thread event. A present status must be an exact member of the
-    response kind's enum.
+    Missing status remains readable for mixed-version history. Task responses
+    with a non-empty verdict can close a thread without a status; other typed
+    responses still require a terminal status. A present status must be an
+    exact member of the response kind's enum.
     """
     allowed = RESPONSE_STATUS_ENUMS.get(kind)
     if allowed is None or "status" not in meta:

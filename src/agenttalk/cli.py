@@ -10333,6 +10333,10 @@ def cmd_reply(args: argparse.Namespace) -> int:
         if not args.quiet:
             print(f"(reply operation already recorded: id={msg.id})")
         return 0
+    if kind == "task-response" and "status" not in meta and not str(meta.get("verdict") or "").strip():
+        sys.stderr.write(
+            "agenttalk reply: warning: this task will stay open; close it with --meta status=done.\n"
+        )
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: REPLY  {msg.sender} -> {msg.recipient}"))
     _register_await_reply(store, await_record, quiet=args.quiet)
@@ -12727,55 +12731,77 @@ def _is_listed_dead_letter(store: Store, agent: str, msg_id: str) -> bool:
         return False
 
 
-def _pending_dead_letter_notice_request_ids(
+def _recorded_dead_letter_resolution(store: Store, *, agent: str, msg_id: str) -> dict | None:
+    """Read the authoritative decision only while it matches the live sink entry."""
+    from agenttalk import attention as A
+    entry = next((m for m in store.list_dead_letters(agent) if m.get("message_id") == msg_id), None)
+    if entry is None:
+        return None
+    events, _ = A.read_dispositions(store)
+    recorded = A.fold_dispositions(events).get(
+        A.item_id(A.SOURCE_DEAD_LETTER, agent, msg_id), {},
+    ).get("dead_letter_resolution")
+    if (recorded and recorded["action"] == A.ACTION_RESOLVE_DEAD_LETTER
+            and recorded["source_snapshot"]["source_hash"] == A.dead_letter_entry_source_hash(entry)):
+        return recorded
+    return None
+
+
+def _pending_dead_letter_notices(
     store: Store,
     *,
-    actor: str,
     agent: str,
     msg_id: str,
-) -> list[str]:
+    report_retired: bool = False,
+) -> list[Message]:
     msgs = sorted(store.valid_messages(), key=lambda m: m.id)
-    rows = {
-        t.request_id: t
-        for t in th.derive_threads(
-            msgs,
-            agent=actor,
-            cursor=store.cursor(actor) or "",
-            closed_rids=_closed_rids(store, actor),
-            retired=set(store.retired_agents()),
-        )
-    }
-    request_ids: list[str] = []
+    retired = set(store.retired_agents())
+    rows_by_recipient = {}
+    notices = {}
     for m in msgs:
         meta = m.meta or {}
         rid = meta.get("request_id")
         if not (isinstance(rid, str) and rid):
             continue
-        if m.sender != agent or m.recipient != actor or m.kind != "question":
+        if m.sender != agent or m.kind != "question":
             continue
         if str(meta.get("needs_operator", "")).lower() != "true":
             continue
         if str(meta.get("dead_letter", "")).lower() != "true":
             continue
-        if str(meta.get("dl_disposed", "")).lower() != "true":
-            continue
         if str(meta.get("dl_msg_id") or "") != msg_id:
             continue
-        row = rows.get(rid)
+        if m.recipient not in rows_by_recipient:
+            rows_by_recipient[m.recipient] = {
+                t.request_id: t for t in th.derive_threads(
+                    msgs, agent=m.recipient, cursor=store.cursor(m.recipient) or "",
+                    closed_rids=_closed_rids(store, m.recipient), retired=retired,
+                )
+            }
+        row = rows_by_recipient[m.recipient].get(rid)
         if row is None or row.operator_state != "pending":
             continue
-        request_ids.append(rid)
-    return sorted(set(request_ids))
+        notices[rid] = m
+    pending = []
+    for rid in sorted(notices):
+        notice = notices[rid]
+        if notice.recipient in retired:
+            if report_retired:
+                sys.stderr.write(
+                    f"agenttalk dead-letter: notice {notice.id} was addressed to retired "
+                    f"{notice.recipient}; nothing to close.\n"
+                )
+            continue
+        pending.append(notice)
+    return pending
 
 
 def _close_dead_letter_notice_threads(
     store: Store,
     *,
-    actor: str,
     agent: str,
     msg_id: str,
-    reason: str,
-    evidence: str | None = None,
+    resolution: dict | None,
 ) -> int:
     """Best-effort close of wrapper escalation twins for a resolved sink row.
 
@@ -12785,12 +12811,20 @@ def _close_dead_letter_notice_threads(
     only the matching pending wrapper notices so their thread projections stop looking like
     current work.
     """
+    if resolution is None:
+        sys.stderr.write(
+            f"agenttalk dead-letter: no recorded resolution for {agent}/{msg_id}; notices left open.\n"
+        )
+        return 0
+    actor = resolution["actor"]
+    reason = resolution["reason"].strip()
+    evidence = resolution.get("evidence")
     closed = 0
-    for rid in _pending_dead_letter_notice_request_ids(
-        store, actor=actor, agent=agent, msg_id=msg_id,
+    for notice in _pending_dead_letter_notices(
+        store, agent=agent, msg_id=msg_id, report_retired=True,
     ):
         meta = {
-            "request_id": rid,
+            "request_id": notice.meta["request_id"],
             "operator_answer": "true",
             "operator_origin": actor,
             "dead_letter_resolved": "true",
@@ -12801,7 +12835,9 @@ def _close_dead_letter_notice_threads(
             meta["dead_letter_evidence"] = evidence
         try:
             store.send(
-                sender=actor,
+                # Reply on the original notice thread; attribution comes only
+                # from the saved decision, even if the liaison has changed.
+                sender=notice.recipient,
                 recipient=agent,
                 kind="message",
                 subject=f"dead-letter resolved ({msg_id})",
@@ -12809,8 +12845,9 @@ def _close_dead_letter_notice_threads(
                 meta=meta,
             )
             closed += 1
-        except (OSError, ValueError):
-            continue
+        except (OSError, ValueError) as exc:
+            error = " ".join(str(exc).splitlines())
+            sys.stderr.write(f"agenttalk dead-letter: notice {notice.id} could not be closed: {error}\n")
     return closed
 
 
@@ -12843,6 +12880,21 @@ def _cmd_dead_letter_resolve(store: Store, args: argparse.Namespace) -> int:
                          f"{args.agent}/{args.id}.\n")
         return 2
     src_hash = A.dead_letter_entry_source_hash(entry)
+    recorded = _recorded_dead_letter_resolution(store, agent=args.agent, msg_id=args.id)
+    if recorded is not None:
+        # Retry any notice left pending by an interrupted resolution, without
+        # recording the same operator decision or rewriting its sidecar again.
+        if (reason.strip() != recorded["reason"].strip()
+                or getattr(args, "evidence", None) != recorded.get("evidence")):
+            sys.stderr.write(
+                "agenttalk dead-letter resolve: retry arguments differ; "
+                "using the recorded reason/evidence.\n"
+            )
+        _close_dead_letter_notice_threads(
+            store, agent=args.agent, msg_id=args.id, resolution=recorded,
+        )
+        print(f"dead-letter {args.agent}/{args.id} already resolved")
+        return 0
     event_id = "att-" + uuid.uuid4().hex[:12]
     A.append_disposition(store, {
         "schema_version": A.SCHEMA_VERSION, "event_id": event_id,
@@ -12864,11 +12916,9 @@ def _cmd_dead_letter_resolve(store: Store, args: argparse.Namespace) -> int:
         pass
     closed = _close_dead_letter_notice_threads(
         store,
-        actor=actor,
         agent=args.agent,
         msg_id=args.id,
-        reason=reason.strip(),
-        evidence=getattr(args, "evidence", None),
+        resolution=_recorded_dead_letter_resolution(store, agent=args.agent, msg_id=args.id),
     )
     extra = f"; closed {closed} related escalation thread(s)" if closed else ""
     print(f"resolved dead-letter {args.agent}/{args.id} by {actor} "
@@ -12900,9 +12950,8 @@ def _cmd_dead_letter_purge(store: Store, args: argparse.Namespace) -> int:
             mid = str(entry.get("message_id") or "")
             preview.append({
                 **entry,
-                "pending_notice_request_ids": _pending_dead_letter_notice_request_ids(
-                    store, actor=actor, agent=ag, msg_id=mid,
-                ),
+                "pending_notice_request_ids": [m.meta["request_id"] for m in
+                                               _pending_dead_letter_notices(store, agent=ag, msg_id=mid)],
             })
         print(json.dumps({"dry_run": True, "count": len(preview), "items": preview},
                          indent=2))
@@ -12920,16 +12969,14 @@ def _cmd_dead_letter_purge(store: Store, args: argparse.Namespace) -> int:
         for entry in candidates:
             ag = str(entry.get("agent") or "")
             mid = str(entry.get("message_id") or "")
-            if _pending_dead_letter_notice_request_ids(store, actor=actor, agent=ag, msg_id=mid):
-                _close_dead_letter_notice_threads(
-                    store, actor=actor, agent=ag, msg_id=mid,
-                    reason="dead-letter purge preflight",
-                )
-            pending = _pending_dead_letter_notice_request_ids(
-                store, actor=actor, agent=ag, msg_id=mid,
+            recorded = _recorded_dead_letter_resolution(store, agent=ag, msg_id=mid)
+            _close_dead_letter_notice_threads(
+                store, agent=ag, msg_id=mid, resolution=recorded,
             )
-            if pending:
-                blocked.append(f"{ag}/{mid} ({', '.join(pending)})")
+            pending = _pending_dead_letter_notices(store, agent=ag, msg_id=mid)
+            if recorded is None or pending:
+                detail = ", ".join(m.meta["request_id"] for m in pending) if recorded else "no recorded resolution"
+                blocked.append(f"{ag}/{mid} ({detail})")
         if blocked:
             sys.stderr.write(
                 "agenttalk dead-letter purge: refusing to archive resolved item(s) "
