@@ -1,228 +1,294 @@
 # The Planned lane, from bus records
 
-Status: proposed. Date: 2026-10-02.
+Status: proposed, revision 2. Date: 2026-10-02.
 
 ## In plain words
 
 The work board shows work in progress, in review, and done - nothing
 planned but not started. Three earlier attempts to add that (reading a
-plan's prose, importing a JSON file, reading that file fresh each time)
-were all parked: each invented its own file format, and each format grew
-its own decoding, identity, and storage problems.
+plan's prose, a JSON sidecar, in three design rounds) were all parked:
+each invented its own file format with its own decoding, identity, and
+storage problems.
 
-This design invents no file. The lead already tells the board about real
-work by sending a `task` or `review-request` carrying a validated label
-(`work_item`, a slug; `work_title`, a short name). This proposes one more
-label the lead can send, carrying the same two fields, meaning "this work
-item is planned." The board shows it under Planned until a real `task` or
-`review-request` with the same `work_item` appears - then the board's
-existing lanes take over, as today. Nothing is read but the bus log the
-board already scans.
+This design invents no file. The lead writes ONE record per planned item
+to itself, on the same bus log the board already scans, carrying the
+same two labels a real `task` already carries (`work_item`, `work_title`).
+The board shows the item under Planned until a real `task` or
+`review-request` for the same `work_item` appears - permanently; after
+that, it never returns to Planned under that name.
 
-What you will notice, once built: one short command per planned item; a
-Planned lane on the board. What you need to do now: review this contract.
-No code is proposed yet.
+**Revision 2** closes a first design review's seven findings by removing
+three things that caused nearly all of them: broadcasting the record,
+trusting message order, and three optional fields. What is left is
+smaller and exact.
 
----
-
-## 1. Record format
-
-**A new message kind, `planned`.** Reusing `note`/`message` was
-considered: either works mechanically, but neither carries a validated
-`work_item`/`work_title` pair, and giving one that meaning retroactively
-would make every *existing* `note`/`message` ambiguous about whether it
-was ever meant to tag work. A dedicated kind costs one line in
-`store.KNOWN_KINDS` and gives every reader (§5) one unambiguous thing to
-look for - the same reasoning that gave `task` and `rescind` their own
-kinds rather than overloading `message`.
-
-**Publisher and audience.** Only `sole_lead()`/`operator_facing()` may
-publish one, checked against the live config - `cmd_task`'s gate, reused
-verbatim. Broadcast (`--to all`), never one recipient: it asks nothing of
-anyone, so no one party could owe it a reply. **Not** added to
-`store.OPENER_KINDS` or `work_tags.OPENERS` - it opens no thread, creates
-no `owed-inbound` obligation, and can never carry `supersedes`
-(`work_tags.normalize` already refuses that outside `OPENERS` - enforced
-by existing code).
-
-**Meta fields**, validated through the existing `work_tags.normalize`
-path (called the same way `cmd_task` already calls it):
-- `work_item` - the existing slug, unchanged (`work_tags.value`, 1-64
-  lowercase chars).
-- `work_title` - the existing field, unchanged (1-160 chars).
-- `owner`, `phase`, `starts_when` - three **new**, optional fields, each
-  added to `work_tags.FIELDS` with its own cap: `owner` and `starts_when`
-  1-200 chars, `phase` 1-64 chars. Free display text, not a closed
-  vocabulary - a plan phase is not a dispatch stage (next point).
-- `withdrawn` - a new, optional boolean field (§2).
-
-**`planned` is never a `stage`.** `work_tags.STAGES` stays exactly
-`{design, build, read, fix, delta, sweep}` - a dispatchable value a
-`task` can carry. A planned record has no `stage` at all; its `phase`
-field is a different, free-text concept, so the two can never be
-confused by a reader that (correctly) only trusts `stage` for real work.
-
-**Command surface:** `agenttalk board plan add|change|withdraw`, a new
-`plan` action nested under the existing `board` subcommand (today's only
-`board_cmd` is `verify-merges`; `import-plan`/`retire-plan` from the
-parked branch were never ported to `master` - this is a fresh, small
-addition, not a restoration).
+What you will notice, once built: one command per planned item; a
+Planned lane on the board. What you need to do now: review this
+contract. No code is proposed yet.
 
 ---
 
-## 2. Lifecycle
+## 1. One self-addressed record, one publishing route
 
-- **Add:** `board plan add --work-item X --work-title T [--owner --phase
-  --starts-when]` publishes one `planned` record.
-- **Change:** `board plan add` again for the same `work_item` - a later
-  record replaces the earlier one. "Later" means its position in the bus
-  log (the append-only order every reducer here already trusts; never a
-  timestamp - `work_board.py`: "Message IDs and timestamps never order
-  evidence").
-- **Withdraw:** `board plan withdraw X` publishes a `planned` record for
-  `X` with `withdrawn: true`, no other fields required. Not `supersedes`:
-  that means "this dispatch replaces that one, same work" - stronger than
-  "stop planning this." A withdrawal is just the latest record for `X`,
-  reusing "later replaces earlier," not a second mechanism.
-- **Promotion:** a `task`/`review-request` with the same `work_item`
-  anywhere in the log moves it out of Planned - "planned minus every
-  `work_item` the board's reducer already found a real opener for" (§7).
-- **Re-planned after done:** if `X`'s record is never withdrawn and its
-  real work ages off the board (the existing 7-day Done window), `X`
-  reappears in Planned - the old record is still the latest for `X`. Not
-  a bug; the lead's habit should be "withdraw when planning the *next*
-  thing for `X`," not only when dispatching it.
-- **Order in the lane:** most-recently-planned first (bus position),
-  `work_item` as tiebreak - matching every other lane's own convention.
+**Self-addressed, not broadcast (closes F2b/F7c/F9).** The lead sends a
+`planned` record to itself - sender and recipient are the same agent, the
+same pattern `current_epoch()`'s global barrier already uses
+(`store.py:4879`: "a single self-addressed barrier is globally
+authoritative because this scans the WHOLE validated log"). One copy,
+one file, written once. This removes every broadcast concern at a stroke:
+no partial fan-out, no `--resume`, no second seat's wrapper turn, no
+delivery or dead-letter path - there is no second party to deliver to.
+The board finds it by scanning the validated log (`store.valid_messages()`
+/ the snapshot `work_board_feed.build` already reads), the same way it
+finds every other message, not through anyone's inbox.
 
----
+**One publishing route (closes F3).** Only `agenttalk board plan
+add|change|withdraw` may send `kind=planned`, the only caller of one
+shared planned validator (§3). `send`/`broadcast` refuse `--kind planned`
+outright, the same refusal `send` already gives `task`/`rescind`/`end`
+(`cli.py:1722`). **Trusted direct `Store.send()` callers are not
+specially defended, and this is not a new gap:** `Store.send()` validates
+only `kind in KNOWN_KINDS` (`store.py:3488`); no kind's semantic rules,
+`task`'s included, live inside `Store.send()` itself today. A direct
+caller already bypasses `task`'s role/version checks the same way.
 
-## 3. Budget
-
-- **Cap on cards shown:** at most 20 Planned cards. Past that, one
-  overflow card, "+N more planned items" - it is never counted against,
-  and never displaces, any in-progress card; Planned is its own lane,
-  never sharing a slot budget with Building/Review/Fix/Ready/Done.
-- **Field caps are refused at publish**, not truncated and not stored
-  short: `work_tags.value` already raises on an oversized `work_item` or
-  `work_title`; §1's three new fields get the same treatment, so an
-  invalid record never reaches the log (§4).
-- **Warning-byte budget:** any warning this feature adds (§4's malformed-
-  record case) joins the board's existing bounded warning list
-  (`errors` in `work_board_feed.build`'s return value) - same cap, not a
-  new one.
-- **Cost: the bus scan the board already does.** `work_board_feed.build`
-  already materializes every message into one `messages` list before
-  doing anything else (`work_board_feed.py:68`). Finding `planned`
-  records is one more pass over that same, already-in-memory list - no
-  new file, no new directory, no second scan.
+**Replay is structural only.** A stored `planned` record is honoured if
+its *shape* is valid (§3) and, when the store can say who was lead at
+that point in history, its sender held that role then. Where history
+cannot establish that (no roster-at-time reconstruction available), the
+record is honoured on shape alone - the same "judge history by
+publication-time rules, not today's roster" principle `work_tags.inherit`
+already applies to replay. This is a policy choice, stated once, not
+reinterpreted per record.
 
 ---
 
-## 4. Failure policy
+## 2. Identity: `replaces`, not order (closes F2a)
 
-- **Refused at publish:** an oversized or wrong-typed field, a
-  `work_item` that collides with `supersedes`-style replacement syntax,
-  or `withdrawn` alongside any other field, all refuse before the record
-  is written - the same shape as every other `work_tags.normalize`
-  refusal today.
-- **Malformed record already in the log** (hand-edited, or written by an
-  older build missing a field this design later added): the board's
-  per-message isolation already does this for every kind
-  (`envelope_snapshot.validate_scanned_rows`, `work_board.py`'s own
-  per-item `Unknown` isolation) - one bounded warning, zero rows lost
-  from any other item.
-- **Older readers, and why `--force` is genuinely needed here.** An older
-  build's `KNOWN_KINDS` lacks `planned`; its envelope scan rejects it as
-  invalid rather than crashing (`envelope_snapshot.py:48-58`) - but that
-  reject is not free: `selected_closure` turns any nonzero
-  `invalid_count` into `status="incomplete"` (`:114`), and
-  `work_board_feed.build` then marks **every** item `column="unknown"` on
-  incomplete coverage (`work_board_feed.py:133-136`). Not new to
-  `planned` - already true of `task`/`rescind`/any kind ever added - but
-  one unrecognized record can blank an older reader's *whole* board, not
-  just hide the new lane. `cmd_task` checks only its one recipient's
-  version, because only that recipient needs to understand `task`;
-  `planned` has no single recipient, so publishing it must check the
-  **whole live roster's** version against a new
-  `KIND_SUPPORT_FLOOR["planned"]` entry - same mechanism, wider audience.
-  Behind: refuse, naming who, unless `--force`.
+Every `change` or `withdraw` record names **exactly one** earlier record
+it replaces: `meta.replaces = <message id>`, validated to be an earlier
+`planned` record for the **same** `work_item`, from a lead (§1). The
+*current* plan for a work_item is whichever record nothing else replaces.
+**No timestamp, no list position, no publication index decides this** -
+`replaces` is the only link. Two records for one item that both go
+unreplaced make that item **Unknown in Planned**, with one bounded
+reason ("competing unreplaced plan records") - never a guess at which one
+is "latest."
+
+This also answers finding F2's broadcast-copy question without needing
+an answer: there is one copy (§1), so "which copy is newest after
+compaction or resume" cannot arise.
 
 ---
 
-## 5. Reader audit
+## 3. v1 fields, and the exact metadata table (closes F3, F8)
 
-| Reader | Effect |
-|---|---|
-| `work_board.reduce`/`_audit` | **Unaffected.** Only scans `m.kind in work_tags.OPENERS` (`task`, `review-request`); `planned` is deliberately excluded from `OPENERS` (§1). |
-| `work_board_feed.build` | **Changed, additively.** One new pass over the already-materialized `messages` list builds the Planned set (§7); every existing line is untouched. |
-| `threads.py` / status WARNs | **Unaffected.** Thread derivation keys off `store.OPENER_KINDS`; `planned` is not in it, so it opens no thread and trips no owed-inbound warning. |
-| Checkpoint owed counts | **Unaffected.** Owed counts are thread states rolled up; no thread, no count. |
-| `attention.py` | **Unaffected.** No attention source reads generic kind/meta beyond `needs_operator`'s own `meta.attention` block, which a `planned` record never carries. |
-| Console feeds (`/api/state`, `/api/messages`, `/api/threads`) | **Unaffected.** A `planned` record displays like any other ordinary, kind-labeled message - the same way `rescind`/`release` already do. |
-| Dead letters | **Unaffected.** Same broadcast/send path as any kind; creates no reply obligation, so there is nothing for a recipient to get stuck failing to answer. |
-| `work_tags.normalize` | **Reused, not changed** - it already validates every `FIELDS` key present in `meta`, for any `kind` (`work_tags.py:230-234`); the three new fields just join `FIELDS` (§1). |
-| Gates (`gates.check_board`/`check_gates`) | **Unaffected.** Gate checks run over real openers found via `work_tags.OPENERS`; `planned` is never in that set. |
+`work_item`, `work_title`, and `withdrawn` (boolean, withdraw only).
+**`owner`, `phase`, `starts_when` are deferred** - not part of v1. No new
+keys join `work_tags.FIELDS`; the planned validator owns `work_item`
+(reusing `work_tags.value("work_item", ...)` unchanged) and
+`work_title`/`withdrawn` itself, so **this does not touch `FIELDS`
+validation for any other kind** (a real compatibility risk the first
+review found: adding global keys like `owner` could reject metadata on
+ordinary messages that happened to use that name).
 
----
+**Nonblank, defined exactly, for `planned` records only:**
+`value.strip() != ""`. `work_title`'s own existing rule (nonempty, ≤160)
+is unchanged for every other kind - this is a new, separate check the
+planned validator applies to its own copy of the field, not a change to
+`work_tags.value`.
 
-## 6. Acceptance cases
+| Action | `work_item` | `work_title` | `replaces` | `withdrawn` |
+|---|---|---|---|---|
+| `add` | required (no current record may already exist for it) | required, nonblank | absent | absent |
+| `change` | required (must name an item with a current record) | required, nonblank | required: the current record's id | absent |
+| `withdraw` | required (must name an item with a current record) | absent | required: the current record's id | required: `true` |
 
-1. Add a planned record; it appears in the Planned lane with its title/owner/phase/starts-when.
-2. Change: a second `add` for the same `work_item` replaces the first; only the latest shows.
-3. Withdraw: the item leaves Planned, with no card left behind.
-4. Promotion: dispatching a `task` for a planned `work_item` moves it to its real lane and out of Planned, same bus build.
-5. Re-plan after done: a withdrawn-then-added record reappears correctly; an un-withdrawn one reappears once its done item ages off the board (§2), and this is asserted as expected, not a regression.
-6. The cap: 21+ planned items show 20 cards plus one "+N more" card; no in-progress card is displaced.
-7. Every refusal in §4's "refused at publish" list is exercised, each leaving the log unchanged.
-8. A malformed `planned` record hand-inserted into the log: one bounded warning, every other item unaffected.
-9. An older-build seat (or the board server itself pinned old): confirm `board plan add` refuses naming who is behind, that `--force` sends anyway, and that the resulting old-reader board shows `status="incomplete"` / all-`unknown` exactly as §4 predicts - not silently wrong.
-
----
-
-## 7. Reuse
-
-**Port:** the PLANNED label and planned-card rendering in `console2.js`,
-and the *shape* of the dispatched-vs-planned merge in `planned_cards`
-(planned set minus dispatched set, cards for the difference) - its
-*inputs* change completely: no stored section, no file; both sets come
-from the one `messages` list `work_board_feed.build` already holds (§3),
-computed directly there, not a separate `work_board_facts` reader.
-
-**Do not port:** anything that reads a plan file - `_classify_line`/
-`_parse_plan` (the Markdown parser), every JSON-sidecar reader/validator
-from #274's revisions 1-3, `_write_section`'s merge extension,
-`_planned_build`, `retire_plan`. None have anything left to do.
+`board plan add` and `board plan change` each resolve "the current
+record for this `work_item`" themselves and refuse with a clear reason
+when the precondition is wrong (`add` on an already-planned item: "already
+planned; use `change`"; `change`/`withdraw` on one with no current
+record: "not currently planned; use `add`") - the advertised
+`add|change|withdraw` surface and the `replaces` mechanics agree by
+construction, not by convention.
 
 ---
 
-## 8. Open questions
+## 4. Isolation from real work (closes F4, F7a)
 
-1. **Is 20 the right cap (§3)?** Chosen to match a human's glance at a
-   board, not measured against a real roster's planning volume.
-   Recommendation: ship with 20, revisit once a real project's lead has
-   used it for a sprint.
-2. **Should the whole-roster version-floor check (§4) block, or only
-   warn?** Recommendation: block by default with `--force` to override,
-   matching `cmd_task` exactly - a board-wide effect deserves at least
-   the same friction as a single-recipient one.
-3. **Does `phase` need any validation beyond a length cap** (for example,
-   rejecting blank/whitespace-only text, as the parked attempts' field
-   rules did)? Recommendation: yes, reuse the same non-blank check
-   `work_tags.value` already applies to `work_title`, rather than writing
-   a new one.
+**`_audit`/`_audit_one` gain one new, first-checked branch:**
+`if m.kind == "planned": return` - no flag, no `owners()` call, no
+attribution to any item. Today, `_audit_one` runs for *every* message
+(`work_board.py:186`), and a message with a dangling `in_reply_to` gets
+flagged against whatever `owners()` can attribute it to, including its
+own `work_item` tag (`work_board.py:176-177`) - so an unrelated
+`planned` record with a stray `in_reply_to` could otherwise inject a
+phantom entry, or a spurious issue, onto a real item. The new branch
+removes `planned` from `_audit` entirely; it is validated by its own
+read-side pass (§3's table, applied the same way at read time as at
+publish time) in `work_board_feed.build`, never by the reducer's
+request/reply machinery.
+
+**A malformed *current* record makes the item Unknown in Planned, never
+a fallback to an older one.** A structurally invalid *envelope* (bad
+schema/signing) still only increments `invalid_count`, unchanged
+board-wide coverage behavior; a structurally valid envelope whose
+`planned` metadata fails §3's table is never a plan, not even a stale
+one - one bounded diagnostic, zero Planned rows from it, every other
+item unaffected.
+
+**Activity exclusion.** `work_board_feed.build`'s activity loop
+(`work_board_feed.py:87-104`) currently appends to `activity[slug]` for
+*any* message resolving to a slug, regardless of kind - a `planned`
+record for an old Done item would refresh its `last_work_event_at` and
+could keep it out of the 7-day prune. `planned` is now excluded from that
+loop entirely: it is never activity, and can never move, refresh, or
+resurrect a Done or any other real card.
+
+---
+
+## 5. Permanent promotion (closes F1)
+
+Once any `task`/`review-request` exists anywhere in the log for a
+`work_item`, that item **never shows as Planned again** - including
+after its Done card ages off the board's 7-day window. "Promoted" is a
+property of the reducer's full history
+(`work_board.reduce(...)["items"]`/`"known"`), never of what is
+currently *displayed* - display expiry is not a new planning decision.
+To plan the same conceptual work again, use a fresh `work_item`.
+`board plan add` enforces this directly: it refuses, naming the existing
+work, when the given `work_item` already has any real opener in history -
+so the lead learns the rule at the moment they would have broken it, not
+by reading this document.
+
+**Coverage caveat:** `add`'s refusal check, and promotion generally, can
+only be as complete as the reducer's own view of history. When archive or
+coverage history is incomplete, "no opener exists for this `work_item`"
+is never asserted - the item is Unknown, the same honest treatment the
+rest of the board already gives incomplete coverage.
+
+---
+
+## 6. Budget and wire shape (closes F5)
+
+`bounded()` (`work_board_feed.py:40`) applies one 100-card/256-KiB limit
+to `feed["items"]` - real board cards only. Planned cards are a
+**separate wire field**, `feed["planned"]`, never appended to `items` and
+never competing for its budget. Its own limit: **20 cards, named**,
+computed before `bounded()` runs; past 20, an **overflow count** (an
+integer, lane chrome - never a fake `work_item` card). `bounded()` gains
+one new trimming step, run *before* its existing items-trimming loop: if
+the whole response is over `byte_limit`, drop planned cards (then
+diagnostics) one at a time until under budget or `planned` is empty -
+**`feed["items"]` is never touched until `planned` already is.** Planned
+diagnostics (§4) share this same small allowance, bounded in count and
+bytes before they ever reach the trimmer - not appended to the unbounded
+`errors` list.
+
+`bounded()` is the one function both the fresh-build path and
+`SnapshotService.board()`'s last-known/stale re-bounding call
+(`envelope_snapshot.py:344`) already share; teaching `bounded()` about
+`planned` covers both call sites with no separate change at the
+last-known path.
+
+---
+
+## 7. Mixed versions: an honest, undetected limit (closes F6)
+
+Only the lead ever receives a `planned` record (§1), so there is no
+*recipient* whose version could be behind - `task`'s roster-health check
+(`_recipients_behind_kind`) does not apply, and `--force` is never needed
+to publish. The real risk is an **old board reader**: any `agenttalk
+board` run or `agenttalk serve` process built before this feature. It has
+no per-process version advertisement this codebase can inspect
+(`_recipients_behind_kind` reads *agent* health, not a *board server's*
+capability) - **this cannot be detected automatically, and this document
+says so rather than promising a check that doesn't exist.** The rollout
+is a release-floor statement, not a runtime gate: upgrade every board
+reader before relying on the Planned lane. An old reader that scans a
+`planned` record it cannot parse rejects the envelope, degrading
+`selected_closure` to `status="incomplete"` and marking every item
+`unknown` - already true of adding any new kind, not specific to this
+one, which is why the floor is a release note, not an afterthought.
+
+---
+
+## 8. Reuse
+
+**Port:** the PLANNED label from `console2.js`. **New, not a port** (the
+first review correctly flagged this): the board model and card renderer
+must learn `withdrawn`'s absence-means-active shape and the `planned`/
+`overflow_count` wire fields (§6) - v1 has no owner/phase/starts-when to
+map, since those are deferred (§3).
+
+**Do not port:** anything that reads a plan file - the Markdown parser,
+every JSON-sidecar reader/validator from #274's three revisions,
+`_write_section`'s merge extension, `_planned_build`, `retire_plan`, and
+revision 1 of this document's order-dependent "planned minus dispatched"
+merge (superseded by §2's `replaces` links and §5's permanent
+promotion).
+
+---
+
+## 9. Acceptance cases
+
+1. Add, change (via `replaces`), withdraw - each produces the right
+   Planned-lane state, in order.
+2. Promotion: a `task` for a planned `work_item` removes it from Planned,
+   permanently - including after its Done card later ages off (§5).
+3. Shuffled input: a store whose scan order differs run-to-run (archive
+   compaction, concurrent publication) produces the identical Planned
+   result - nothing depends on list position (§2).
+4. Competing replaces: two records both naming the same `replaces`
+   target make that item Unknown, with the named reason.
+5. A malformed *current* record: one bounded diagnostic, the item
+   Unknown in Planned, no fallback to its prior valid record, every other
+   item unaffected.
+6. A busy board: 100 real cards plus 25 planned - 20 planned cards show,
+   a `5` overflow count, and all 100 real cards are untouched.
+7. Oversized diagnostics: enough malformed planned records to threaten
+   the byte budget still leave `feed["items"]` intact (§6).
+8. Incomplete archives/coverage: `add`'s promotion-refusal check and the
+   Planned lane both report Unknown, never a false "nothing real exists
+   for this item."
+9. The `SnapshotService.board()` last-known/stale path renders `planned`
+   and its overflow count identically to a fresh build.
+10. An old-reader rollout: a build predating this feature scans a log
+    containing a `planned` record, rejects the envelope, and (today's
+    existing, unchanged behavior) shows `status="incomplete"`/items
+    `unknown` - asserted as the documented, known limit (§7), not a
+    surprise.
+
+---
+
+## 10. Open questions
+
+1. **Should `replaces` require the exact message id, or also accept a
+   short form** (e.g., "the current record for this `work_item`",
+   resolved by the CLI) for a lead typing the command by hand?
+   Recommendation: the CLI resolves and fills `replaces` automatically
+   (§3) - a human never types a message id; the stored record always
+   carries the exact id.
+2. **Does a withdrawn item's `work_item` ever become reusable for a
+   fresh, unrelated plan** (never dispatched, only ever withdrawn), or
+   does §5's "promoted work_items are permanent" also apply to a
+   withdrawn-but-never-dispatched one? Recommendation: no - `work_item`
+   identity is permanent once used for *any* planned or real record, to
+   keep one rule ("a `work_item` means one thing, forever") instead of
+   two.
 
 ## Technical details
 
-- Supersedes #266 and the parked `feat/wb-planned-lane` branch (PR #264)
-  and PR #274 (revisions 1-3, parked - see its park note for what each
-  revision learned).
-- Driven by issue #279.
-- Code cited: `src/agenttalk/store.py` (`KNOWN_KINDS`, `KIND_SUPPORT_FLOOR`,
-  `OPENER_KINDS`), `src/agenttalk/work_tags.py` (`FIELDS`, `STAGES`,
-  `OPENERS`, `value`, `normalize`), `src/agenttalk/work_board.py`
-  (`reduce`, `_reduce`), `src/agenttalk/work_board_feed.py` (`build`),
-  `src/agenttalk/envelope_snapshot.py` (`validate_scanned_rows`,
-  `selected_closure`), `src/agenttalk/cli.py` (`cmd_task`,
-  `_recipients_behind_kind`) - all read at `origin/master`,
-  `4e8cf71c`.
+- Supersedes revision 1 of this document, #266, and the parked PR #264 /
+  PR #274.
+- Driven by issue #279 and a first design review
+  (codex-agenttalk-developer-4, `tk-86567e72cad1`): RESHAPE, 7 P2 + 2 P3,
+  no P1, no inline GitHub comments on the reviewed head. No connector
+  comments to answer this round.
+- Code cited: `src/agenttalk/store.py` (`KNOWN_KINDS`, `send`,
+  `current_epoch`), `src/agenttalk/work_tags.py` (`FIELDS`, `value`,
+  `OPENERS`), `src/agenttalk/work_board.py` (`_audit`, `_audit_one`),
+  `src/agenttalk/work_board_feed.py` (`build`, `bounded`),
+  `src/agenttalk/envelope_snapshot.py` (`SnapshotService.board`,
+  `selected_closure`), `src/agenttalk/cli.py` (`cmd_send`, `cmd_task`,
+  `_recipients_behind_kind`) - all read at `origin/master`, `4e8cf71c`.
