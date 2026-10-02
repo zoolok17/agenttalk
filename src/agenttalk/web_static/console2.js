@@ -622,7 +622,17 @@
     ev.appendChild(el('span', 'c2-label', 'EVIDENCE'));
     ev.appendChild(el('span', card.evidenceMissing ? 'c2-evidence-text is-missing' : 'c2-evidence-text', card.evidenceText));
     box.appendChild(ev);
-    if (card.evidenceNote) box.appendChild(el('div', 'c2-note', card.evidenceNote));
+    // F5 (still open in v2, fix round 2): a group/overflow card's member
+    // previews and CLI command lines each get their OWN c2-note element -
+    // one joined sentence read fine in the model but was not actually
+    // inspectable/renderable as five distinct previews in the DOM.
+    if (card.group && Array.isArray(card.evidenceLines) && card.evidenceLines.length) {
+      card.evidenceLines.forEach(function (line) {
+        if (line) box.appendChild(el('div', 'c2-note', line));
+      });
+    } else if (card.evidenceNote) {
+      box.appendChild(el('div', 'c2-note', card.evidenceNote));
+    }
     var actions = el('div', 'c2-actions');
     card.options.forEach(function (o) { actions.appendChild(optionButton(o, team, card)); });
     if (!card.group) {

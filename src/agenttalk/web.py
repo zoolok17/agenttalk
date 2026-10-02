@@ -2571,27 +2571,34 @@ _DEAD_LETTER_GROUP_DISPLAY_CAP = 20          # agent groups shown before an over
 _DEAD_LETTER_GROUP_PREVIEW_CAP = 5           # member ids previewed per shown group
 
 
-def _dead_letter_group_cli_instructions(agent: str) -> list[str]:
+def _dead_letter_group_cli_instructions(agent: str, root: str) -> list[str]:
     """Exact, complete command lines to reach every member of one agent's
     dead-letter group, including anything past the preview cap. Each line is
     its own complete, copy-pasteable command - never joined into one prose
-    paragraph that could need an ellipsis mid-syntax (finding F6)."""
+    paragraph that could need an ellipsis mid-syntax (finding F6). Every line
+    carries a quoted global `--root <path>` for the displayed descriptor's own
+    root (fix round 2, F10) - without it, a command run from an operator's
+    shell applies to the SHELL's current project, not the one the dashboard
+    is showing, and can silently act on (or report "none" for) the wrong root."""
     agent_arg = shlex.quote(agent)
+    root_arg = shlex.quote(root)
     return [
-        f"agenttalk dead-letter list --agent {agent_arg}",
-        f"agenttalk dead-letter show --agent {agent_arg} --id <message_id>",
-        f"agenttalk dead-letter resolve --agent {agent_arg} --id <message_id> "
+        f"agenttalk --root {root_arg} dead-letter list --agent {agent_arg}",
+        f"agenttalk --root {root_arg} dead-letter show --agent {agent_arg} --id <message_id>",
+        f"agenttalk --root {root_arg} dead-letter resolve --agent {agent_arg} --id <message_id> "
         "--reason <reason> --from <actor>",
-        "agenttalk attention defer --item <item_id> --reason <reason> --until <iso> "
-        "--from <actor>",
+        f"agenttalk --root {root_arg} attention defer --item <item_id> --reason <reason> "
+        "--until <iso> --from <actor>",
     ]
 
 
-def _dead_letter_overflow_cli_instructions() -> list[str]:
-    """Exact command lines to reach every agent collapsed into the overflow row."""
+def _dead_letter_overflow_cli_instructions(root: str) -> list[str]:
+    """Exact command lines to reach every agent collapsed into the overflow
+    row - same `--root` rationale as the group instructions above."""
+    root_arg = shlex.quote(root)
     return [
-        "agenttalk dead-letter list",
-        "agenttalk attention --source dead_letter --all",
+        f"agenttalk --root {root_arg} dead-letter list",
+        f"agenttalk --root {root_arg} attention --source dead_letter --all",
     ]
 
 
@@ -2606,7 +2613,7 @@ def _cli_lines(lines: list[str]) -> list[str]:
     return [line if len(line) <= _CLI_LINE_MAX else line[:_CLI_LINE_MAX] for line in lines]
 
 
-def _group_dead_letters_for_display(wire: list[dict]) -> list[dict]:
+def _group_dead_letters_for_display(wire: list[dict], *, root: str) -> list[dict]:
     """Group old (>=7d), known-age dead-letter WIRE entries by agent, display
     only (#273 fix round 1). Every entry already carries its final disposition
     state (dispositions were applied before this function ever sees the list);
@@ -2651,39 +2658,20 @@ def _group_dead_letters_for_display(wire: list[dict]) -> list[dict]:
     # ALSO has a qualifying group must pass through untouched - only the
     # entries actually collected into by_agent (age-qualifying) are grouped.
     qualifying_entry_ids = {id(e) for members in by_agent.values() for e in members}
-    out: list[dict] = []
 
-    for entry in wire:
-        agent = entry.get("agent")
-        is_qualifying = id(entry) in qualifying_entry_ids
-        if is_qualifying and agent in overflow_agent_set:
-            continue  # every member folds into the one overflow row below, none shown
-        if is_qualifying and agent in shown_agents:
-            members = by_agent[agent]
-            rep = members[0]  # already in rank order - deterministic, stable
-            if entry is not rep:
-                continue  # a non-representative member is folded into the group, not shown
-            preview = members[:_DEAD_LETTER_GROUP_PREVIEW_CAP]
-            more_count = len(members) - len(preview)  # computed from exactly what is rendered
-            entry["group"] = {
-                "kind": "dead_letter_group",
-                "agent": agent,
-                "member_count": len(members),
-                "members": [
-                    {"item_id": m.get("id", ""), "message_id": m.get("_dl_message_id", "")}
-                    for m in preview
-                ],
-                "more_count": more_count,
-                "cli_instructions": _cli_lines(_dead_letter_group_cli_instructions(agent)),
-            }
-        out.append(entry)
-
+    # F11 (fix round 2): build the overflow row FIRST and insert it at the
+    # position of the first (highest-ranked) collapsed member, not appended
+    # after the whole list - `wire` already arrives in rank order, so
+    # appending unconditionally put a med-severity overflow row below a
+    # lower-ranked (e.g. low-severity) item that happened to come later in
+    # the source list, not later in rank.
+    overflow_row: dict | None = None
     if overflow_agents:
         overflow_member_total = sum(len(by_agent[a]) for a in overflow_agents)
         agents_hash = hashlib.sha256(
             "|".join(sorted(overflow_agents)).encode("utf-8", errors="surrogatepass")
         ).hexdigest()[:16]
-        out.append({
+        overflow_row = {
             "id": f"dead_letter_overflow:{agents_hash}",
             "source": "deadletter",
             "source_label": "DEAD LETTER",
@@ -2700,9 +2688,39 @@ def _group_dead_letters_for_display(wire: list[dict]) -> list[dict]:
                 "kind": "dead_letter_overflow",
                 "agent_count": len(overflow_agents),
                 "member_count": overflow_member_total,
-                "cli_instructions": _cli_lines(_dead_letter_overflow_cli_instructions()),
+                "cli_instructions": _cli_lines(_dead_letter_overflow_cli_instructions(root)),
             },
-        })
+        }
+
+    out: list[dict] = []
+    overflow_inserted = False
+    for entry in wire:
+        agent = entry.get("agent")
+        is_qualifying = id(entry) in qualifying_entry_ids
+        if is_qualifying and agent in overflow_agent_set:
+            if not overflow_inserted:
+                out.append(overflow_row)
+                overflow_inserted = True
+            continue  # every member folds into the one overflow row, none shown individually
+        if is_qualifying and agent in shown_agents:
+            members = by_agent[agent]
+            rep = members[0]  # already in rank order - deterministic, stable
+            if entry is not rep:
+                continue  # a non-representative member is folded into the group, not shown
+            preview = members[:_DEAD_LETTER_GROUP_PREVIEW_CAP]
+            more_count = len(members) - len(preview)  # computed from exactly what is rendered
+            entry["group"] = {
+                "kind": "dead_letter_group",
+                "agent": agent,
+                "member_count": len(members),
+                "members": [
+                    {"item_id": m.get("id", ""), "message_id": m.get("_dl_message_id", "")}
+                    for m in preview
+                ],
+                "more_count": more_count,
+                "cli_instructions": _cli_lines(_dead_letter_group_cli_instructions(agent, root)),
+            }
+        out.append(entry)
 
     for entry in out:
         entry.pop("_dl_message_id", None)
@@ -3132,7 +3150,7 @@ def build_attention(desc: RootDescriptor,
         # serialized) via an explicit typed `group` marker - never a change to
         # the shared attention.py projector/dedupe_key, which stays exactly as
         # on master (so the CLI and /api/risk-register are ungrouped).
-        wire = _group_dead_letters_for_display(wire)
+        wire = _group_dead_letters_for_display(wire, root=str(store.root))
         return {
             "root": desc.label,
             "root_path": str(store.root),

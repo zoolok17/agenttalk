@@ -13,6 +13,7 @@ import http.client
 import inspect
 import json
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -7647,7 +7648,7 @@ def _wire_dl(item_id: str, agent: str, message_id: str, *, age_seconds: float,
 
 def test_group_dead_letters_lone_qualifying_letter_is_not_annotated() -> None:
     wire = [_wire_dl("dead_letter:beta:m1", "beta", "m1", age_seconds=700000)]
-    out = web._group_dead_letters_for_display(wire)
+    out = web._group_dead_letters_for_display(wire, root="D:/proj-a")
     assert len(out) == 1
     assert "group" not in out[0]
     assert "_dl_message_id" not in out[0]
@@ -7658,7 +7659,7 @@ def test_group_dead_letters_twenty_from_one_agent_collapse_to_one_group() -> Non
         _wire_dl(f"dead_letter:beta:m{i}", "beta", f"m{i}", age_seconds=700000)
         for i in range(20)
     ]
-    out = web._group_dead_letters_for_display(wire)
+    out = web._group_dead_letters_for_display(wire, root="D:/proj-a")
     assert len(out) == 1
     group = out[0]["group"]
     assert group["kind"] == "dead_letter_group"
@@ -7681,7 +7682,7 @@ def test_group_dead_letters_recent_missing_future_ages_never_group() -> None:
         _wire_dl("dead_letter:beta:old1", "beta", "old1", age_seconds=700000),
         _wire_dl("dead_letter:beta:old2", "beta", "old2", age_seconds=700000),
     ]
-    out = web._group_dead_letters_for_display(wire)
+    out = web._group_dead_letters_for_display(wire, root="D:/proj-a")
     by_id = {it["id"]: it for it in out}
     assert "group" not in by_id["dead_letter:beta:recent"]
     assert "group" not in by_id["dead_letter:beta:unknown"]
@@ -7696,7 +7697,7 @@ def test_group_dead_letters_overflow_row_carries_true_totals_and_full_cli_lines(
             _wire_dl(f"dead_letter:{agent}:m1", agent, "m1", age_seconds=700000),
             _wire_dl(f"dead_letter:{agent}:m2", agent, "m2", age_seconds=700000),
         ]
-    out = web._group_dead_letters_for_display(wire)
+    out = web._group_dead_letters_for_display(wire, root="D:/proj-a")
     groups = [it for it in out if it.get("group", {}).get("kind") == "dead_letter_group"]
     overflow = [it for it in out if it.get("group", {}).get("kind") == "dead_letter_overflow"]
     assert len(groups) == web._DEAD_LETTER_GROUP_DISPLAY_CAP
@@ -7711,19 +7712,71 @@ def test_group_dead_letters_overflow_row_carries_true_totals_and_full_cli_lines(
         assert "…" not in line and len(line) <= web._CLI_LINE_MAX
 
 
-def test_group_dead_letters_f6_sixty_four_char_agent_name_never_truncates() -> None:
+def test_group_dead_letters_f11_overflow_row_ranks_before_a_lower_severity_item() -> None:
+    # F11: the overflow row must land at the first collapsed member's ranked
+    # position, not be appended after the whole list - a med-severity
+    # overflow row must still outrank a low-severity item that happens to
+    # sort after it in the raw source order.
+    wire = []
+    for a in range(21):
+        agent = f"agent{a:02d}"
+        wire += [
+            _wire_dl(f"dead_letter:{agent}:m1", agent, "m1", age_seconds=700000),
+            _wire_dl(f"dead_letter:{agent}:m2", agent, "m2", age_seconds=700000),
+        ]
+    low_item = {
+        "id": "lead_unarmed:gamma", "source": "supervisor", "source_label": "SUPERVISOR",
+        "severity": "low", "title": "lead-loop unarmed: gamma", "agent": "gamma",
+        "detail": "no lead loop", "age_seconds": 10.0, "age_unknown": False,
+        "human_can_unblock_now": True,
+    }
+    wire.append(low_item)
+    out = web._group_dead_letters_for_display(wire, root="D:/proj-a")
+    kinds = [it.get("group", {}).get("kind") for it in out]
+    overflow_index = kinds.index("dead_letter_overflow")
+    low_index = next(i for i, it in enumerate(out) if it["id"] == "lead_unarmed:gamma")
+    assert overflow_index < low_index, "the overflow row must rank before the low-severity item"
+
+
+def test_group_dead_letters_f6_sixty_four_char_agent_name_and_long_root_never_truncate() -> None:
     long_agent = "a" * 64
+    # F10 (fix round 2): extend this with a long root path too - the --root
+    # argument now added to every command must not push a line over its bound.
+    long_root = "D:/Projects/Claude/" + "/".join(["a-long-nested-directory-segment"] * 4)
     wire = [
         _wire_dl(f"dead_letter:{long_agent}:m1", long_agent, "m1", age_seconds=700000),
         _wire_dl(f"dead_letter:{long_agent}:m2", long_agent, "m2", age_seconds=700000),
     ]
-    out = web._group_dead_letters_for_display(wire)
+    out = web._group_dead_letters_for_display(wire, root=long_root)
     group = out[0]["group"]
     for line in group["cli_instructions"]:
         assert "…" not in line
         assert len(line) <= web._CLI_LINE_MAX
     assert any(long_agent in line for line in group["cli_instructions"]), (
         "at least the per-agent list/show/resolve commands name the agent")
+    assert all("--root" in line for line in group["cli_instructions"]), (
+        "F10: every command carries the displayed descriptor's own --root")
+    assert any(long_root in line for line in group["cli_instructions"])
+
+
+def test_group_dead_letters_f10_root_is_quoted_and_on_every_command_including_overflow() -> None:
+    # F10: a command run without --root applies to the SHELL's current
+    # project, not the one the dashboard displays - every generated command
+    # (group and overflow alike) must carry the displayed root, quoted.
+    root_with_space = "D:/Projects/Claude/a path with spaces"
+    wire = []
+    for a in range(25):
+        agent = f"agent{a:02d}"
+        wire += [
+            _wire_dl(f"dead_letter:{agent}:m1", agent, "m1", age_seconds=700000),
+            _wire_dl(f"dead_letter:{agent}:m2", agent, "m2", age_seconds=700000),
+        ]
+    out = web._group_dead_letters_for_display(wire, root=root_with_space)
+    group_row = next(it for it in out if it.get("group", {}).get("kind") == "dead_letter_group")
+    overflow_row = next(it for it in out if it.get("group", {}).get("kind") == "dead_letter_overflow")
+    for line in group_row["group"]["cli_instructions"] + overflow_row["group"]["cli_instructions"]:
+        assert "--root" in line
+        assert shlex.split(line)[shlex.split(line).index("--root") + 1] == root_with_space
 
 
 def test_group_dead_letters_f1_representative_keeps_its_own_real_item_id() -> None:
@@ -7733,7 +7786,7 @@ def test_group_dead_letters_f1_representative_keeps_its_own_real_item_id() -> No
         _wire_dl("dead_letter:beta:m1", "beta", "m1", age_seconds=800000),
         _wire_dl("dead_letter:beta:m2", "beta", "m2", age_seconds=700000),
     ]
-    out = web._group_dead_letters_for_display(wire)
+    out = web._group_dead_letters_for_display(wire, root="D:/proj-a")
     assert len(out) == 1
     assert out[0]["id"] == "dead_letter:beta:m1"  # the older, higher-ranked member
 
@@ -7747,7 +7800,7 @@ def test_group_dead_letters_agent_literally_named_group_does_not_collide() -> No
         _wire_dl("dead_letter:group:m1", "group", "m1", age_seconds=700000),
         _wire_dl("dead_letter:group:m2", "group", "m2", age_seconds=700000),
     ]
-    out = web._group_dead_letters_for_display(wire)
+    out = web._group_dead_letters_for_display(wire, root="D:/proj-a")
     assert len(out) == 1
     assert out[0]["group"]["agent"] == "group"
     assert out[0]["group"]["member_count"] == 2

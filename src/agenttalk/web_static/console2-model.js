@@ -695,9 +695,21 @@
     if (group && group.kind === 'dead_letter_group') {
       var memberCount = typeof group.member_count === 'number' ? group.member_count : 0;
       var moreCount = typeof group.more_count === 'number' ? group.more_count : 0;
-      notes.push(
-        memberCount + ' old failed messages from ' + (str(group.agent, 80) || 'this agent') +
-        (moreCount ? ' (' + moreCount + ' more not shown)' : ''));
+      notes.push(memberCount + ' old failed messages from ' + (str(group.agent, 80) || 'this agent'));
+      // F5 (still open in v2, fix round 2): render the bounded member preview
+      // itself - BOTH the attention item_id (what a defer targets) and the
+      // raw dead-letter message_id (what dead-letter show/resolve targets) -
+      // before the remainder count, so "N more not shown" is never the only
+      // thing a person sees of a group that has a preview to show.
+      (Array.isArray(group.members) ? group.members : []).forEach(function (m) {
+        if (!isObj(m)) return;
+        var itemId = str(m.item_id, 200);
+        var messageId = str(m.message_id, 200);
+        if (itemId || messageId) {
+          notes.push('item_id: ' + itemId + ' · message_id: ' + messageId);
+        }
+      });
+      if (moreCount) notes.push(moreCount + ' more not shown');
       (Array.isArray(group.cli_instructions) ? group.cli_instructions : []).forEach(function (line) {
         var l = str(line, 500);
         if (l) notes.push(l);
@@ -720,6 +732,12 @@
       title: str(item.title, 300) || 'Attention needed',
       evidence: evidence, evidenceText: evidence || 'No evidence recorded', evidenceMissing: !evidence,
       evidenceNote: notes.join(' · '),
+      // F5 (still open in v2, fix round 2): the SAME notes, unjoined, so the
+      // renderer can show each one (a member's item_id/message_id, each CLI
+      // line) as its own line - a single joined sentence read fine in the
+      // model but rendered as one blob in the DOM, which is what "renders
+      // none of the five previews" was really about.
+      evidenceLines: notes,
       agent: agent, ageSeconds: age,
       ageLabel: age === null ? 'age unknown' : 'no deadline · waiting ' + fmtAge(age),
       options: group ? [] : cardOptions(item, ctx.canAct === true),
@@ -1128,7 +1146,14 @@
     var serverStuckCount = attentionItems.filter(function (it) {
       return isObj(it) && it.source === 'stuck';
     }).length;
-    var clientStuckCount = cards.filter(function (c) { return c.kind === 'LOOKS STUCK'; }).length;
+    // F9 (build round #273, fix round 2): count every derived stuck incident,
+    // snoozed ones included - `cards` already excludes a snoozed stuck card
+    // (it goes to view.needs.snoozed instead), so filtering `cards` only
+    // counted what survived local presentation. Snoozing ("Wait 10 min")
+    // changes what is SHOWN, never what is COUNTED - derive this straight
+    // from `rows` (every agent this console flagged stuck), before any
+    // snooze/Later filtering is applied.
+    var clientStuckCount = rows.filter(function (r) { return r.stuck; }).length;
     view.chip.needsCount = (att && view.needs.available && typeof att.active_count === 'number')
       ? att.active_count - serverStuckCount + clientStuckCount
       : null;

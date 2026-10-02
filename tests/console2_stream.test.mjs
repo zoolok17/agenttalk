@@ -52,6 +52,34 @@ test('GATE HOLD, an unknown supervisor kind and OTHER are cards in the warn tone
   assert.ok(all(stream(dom)).includes('Three things need you.'));
 });
 
+test('F5 (still open in v2, fix round 2): an eight-letter group renders all five '
+  + 'previews, each with both the item_id and the message_id, before the remainder count', async () => {
+  const members = Array.from({ length: 5 }, (_, i) => ({
+    item_id: `dead_letter:beta:m${i}`, message_id: `m${i}`,
+  }));
+  const { dom } = await boot(server({ roots: calm, ...att([
+    {
+      ...ATT_ITEM({ id: 'dead_letter:beta:m0', source: 'deadletter', source_label: 'DEAD LETTER', severity: 'med' }),
+      group: {
+        kind: 'dead_letter_group', agent: 'beta', member_count: 8, more_count: 3,
+        members, cli_instructions: ['agenttalk --root /proj dead-letter list --agent beta'],
+      },
+    },
+  ]) }));
+  const [card] = cards(dom);
+  const notes = classOf(card, 'c2-note').map((n) => n.textContent);
+  // Every one of the 5 previews actually renders, each naming BOTH ids.
+  members.forEach((m) => {
+    assert.ok(notes.some((n) => n.includes(m.item_id) && n.includes(m.message_id)),
+      `preview for ${m.item_id} did not render`);
+  });
+  // The remainder count and the CLI line are present too, each its own line.
+  assert.ok(notes.some((n) => n.includes('3 more not shown')));
+  assert.ok(notes.some((n) => n.includes('agenttalk --root /proj dead-letter list --agent beta')));
+  // No Later button on an aggregate card (F1, still true here).
+  assert.equal(btns(card).filter((b) => b.className.includes('c2-later')).length, 0);
+});
+
 test('LOOKS STUCK: bad tone, fallback evidence, Wait first and live, Restart locked, weaker-evidence note', async () => {
   const { dom } = await boot(server());
   const stuck = cards(dom).find((c) => classOf(c, 'c2-kind')[0].textContent === 'LOOKS STUCK');
@@ -192,17 +220,24 @@ test('Wait 10 min hides the stuck card, lists it as waiting, and the card return
     agents: busyAgents().map((a) => ({ ...a, last_seen: new Date(NOW + srv.clock.perf - 20e3).toISOString() })) })] });
   const { dom, clock, fire, store } = await boot(srv);
   const stuck = () => cards(dom).find((c) => classOf(c, 'c2-kind')[0].textContent === 'LOOKS STUCK');
+  // F9 (fix round 2): snoozing ("Wait 10 min") changes what is SHOWN, never
+  // what is COUNTED - the badge must read the same before and after.
+  const badge = () => chips(dom)[0].children[2].textContent;
+  const before = badge();
   byText(stuck(), /^Wait 10 min$/)[0].click();
   assert.equal(stuck(), undefined);
   assert.ok(all(stream(dom)).includes('dev-4 \u00b7 waiting'));
   assert.ok(/Snoozed until \d\d:\d\d/.test(all(stream(dom))));
   assert.deepEqual(Object.keys(JSON.parse(store.get(LATER)).snoozed['proj-a']), ['stuck:codex-agenttalk-developer-4']);
+  assert.equal(badge(), before, 'the snoozed stuck incident is still counted, not just still shown');
   clock.perf += 9 * 60e3;
   await fire((ms) => ms < 5000);
   assert.equal(stuck(), undefined, 'still waiting after 9 minutes');
+  assert.equal(badge(), before, 'still counted while waiting');
   clock.perf += 2 * 60e3;
   await fire((ms) => ms < 5000);
   assert.ok(stuck(), 'back after 11 minutes');
+  assert.equal(badge(), before, 'and still counted once it is back');
 });
 
 // ------------------------------------------------------------ lead message and chat
