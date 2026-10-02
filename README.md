@@ -82,8 +82,8 @@ a team or runs unattended:
 
 The bus itself makes no network calls: messages are files on disk. Your
 agent CLIs (Claude Code, Codex) keep talking to their own model providers,
-as they would without agenttalk. Here is every place agenttalk itself can
-connect to, and when:
+as they would without agenttalk. These are agenttalk's built-in network
+integrations, and when they connect:
 
 - **DEFAULT: none.** The bus, the dashboard and the supervisor open no
   outbound connections.
@@ -91,9 +91,10 @@ connect to, and when:
   installed and running, it sends gateway-backed agents' model calls to
   OVH AI Endpoints at `https://oai.endpoints.kepler.ai.cloud.ovh.net/v1`.
 - **OPT-IN, the contributor check `agenttalk dev-gate`** (this project's
-  CI runs it too): when you run it, it installs the package and its test
-  tools from the Python package index (`https://pypi.org/simple`),
-  downloads the live Semgrep rule sets `p/python` and `p/security-audit`
+  CI runs it too): when you run it, it installs the package it built
+  locally, fetching that package's dependencies and the test tools from
+  the Python package index (`https://pypi.org/simple`), downloads the live
+  Semgrep rule sets `p/python` and `p/security-audit`
   from the Semgrep registry, and checks dependencies against the PyPI
   advisory database through `pip-audit`.
 - **OPT-IN, the assurance tool** (`python -m agenttalk.assurance`): the
@@ -101,8 +102,14 @@ connect to, and when:
   database (through `pip-audit`) and remote Semgrep configurations are all
   off by default; each runs only when the scan profile's `network_allowed`
   setting lists that tool. A `release`-profile scan also builds the
-  package with `python -m build`, which downloads the project's build
-  backend from the Python package index.
+  package with `python -m build`. That build is not gated by
+  `network_allowed`: it can download the project's build backend from the
+  Python package index even when `network_allowed` allows nothing.
+
+Commands you configure yourself, such as the assurance tool's test,
+coverage and tool commands or a project's build backend, can reach
+anything, and `network_allowed` is not an operating-system network
+sandbox.
 
 The bundled dashboard binds to loopback only (it listens only on this
 computer) and has no flag to expose it — reach it from another machine
@@ -112,8 +119,7 @@ over an SSH tunnel if you need to, not by opening the port.
 
 The coordination store (messages, the roster, cursors, thread state and
 archives) is in the project's `.agenttalk/` folder. A few things live
-outside it, in per-user folders, so backing up or deleting the project
-folder alone does not cover them:
+outside it, in per-user folders. By default they are:
 
 - **signing keys**, if you turned on message signing with
   `agenttalk hmac-init`: `%LOCALAPPDATA%\agenttalk\keys\` on Windows,
@@ -124,17 +130,24 @@ folder alone does not cover them:
 - **the supervisor's wrapper logs**: `%LOCALAPPDATA%\agenttalk\wrapper-logs\`
   on Windows, `$XDG_STATE_HOME/agenttalk/wrapper-logs/` (default
   `~/.local/state`) elsewhere;
-- **the managed gateway's secrets** (its API key and tokens) **and spend
-  ledger**, if you use the gateway: `agenttalk-ovh\` and
-  `agenttalk-ovh-spend\` under `%LOCALAPPDATA%` on Windows (or
-  `~/.local/share` elsewhere);
+- **the managed gateway's secrets** (its API key and tokens), **its
+  `install.json` and its spend ledger**, if you use the gateway:
+  `agenttalk-ovh\` and `agenttalk-ovh-spend\` under `LOCALAPPDATA` when that
+  variable is set, otherwise under `~/.local/share`, on every system;
 - **Codex settings**: `agenttalk codex-config --enable` adds a block for
   this project to `~/.codex/config.toml`.
 
-`agenttalk backup` copies the store only. To back up a project fully, also
-keep a copy of its signing key (and the gateway's ledger, if you use the
-gateway). To remove a project completely, delete those per-user entries
-too.
+To move them: `AGENTTALK_HMAC_KEY_FILE` sets the signing key file,
+`AGENTTALK_RECOVERY_DIR` sets the backup folder, and
+`agenttalk codex-config --config-path` uses a different Codex settings
+file.
+
+`agenttalk backup` copies only the coordination store; none of the
+per-user items above are in it. Restoring the gateway needs its whole
+per-user folders: the secrets (API key, front token, internal token),
+`install.json` and the spend ledger, because the gateway checks the front
+token against the ledger when it starts. Deleting the project folder does
+not remove the per-user items above.
 
 ### What agenttalk is not
 
@@ -149,9 +162,9 @@ too.
   agenttalk is a CLI-level bus: it works with whatever terminal or
   editor-embedded terminal you already run your agent CLIs in.
 - **Not a hosted service.** No account, no server to sign up for, no
-  cloud component. Everything stays on your own machine: the coordination
-  store in your project's `.agenttalk/` directory, and the few per-user
-  files listed under "Where agenttalk keeps files".
+  cloud component. agenttalk's own files stay on your own machine: the
+  coordination store in your project's `.agenttalk/` directory, and the
+  per-user files listed under "Where agenttalk keeps files".
 - **Not a task queue.** There's no central scheduler deciding what
   runs next; agents decide what to do and message each other about it.
   If you want an explicit "what's next" driver, pair agenttalk with a

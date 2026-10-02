@@ -26,10 +26,10 @@ records (messages, the roster, thread state) are files in the project's
 `.agenttalk/` folder. A few things live in per-user folders outside the
 project: signing keys, backups, the supervisor's wrapper logs, and the
 optional model gateway's secrets and spend ledger; the README's "Where
-agenttalk keeps files" lists them and what to back up or delete. agenttalk
-lets separate agent windows talk to each other directly, keeps track of who
-owes the next move, sends decisions that need a person through one agent (the
-liaison), and records the evidence behind reviews and releases.
+agenttalk keeps files" lists them and what `agenttalk backup` leaves out.
+agenttalk lets separate agent windows talk to each other directly, keeps track
+of who owes the next move, sends decisions that need a person through one agent
+(the liaison), and records the evidence behind reviews and releases.
 
 agenttalk is not a sandbox, a defense against a malicious agent on the team, a
 company sign-in and permissions system, or a project manager that runs on its
@@ -295,11 +295,17 @@ asks `codex` a question, `codex` reads it and answers on the same request, and
 `claude` then catches up on what happened.
 
 1. Start one terminal per agent in the project root.
-2. Confirm that each terminal knows which agent it is:
+2. In each terminal, set the agent name, then check that the terminal knows
+   which agent it is:
 
    ```powershell
-   agenttalk whoami --for claude
-   agenttalk whoami --for codex
+   # first terminal
+   $env:AGENTTALK_SELF = 'claude'
+   agenttalk whoami
+
+   # second terminal
+   $env:AGENTTALK_SELF = 'codex'
+   agenttalk whoami
    ```
 
 3. Send a tracked question. The `request_id` is the label the answer will

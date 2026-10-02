@@ -64,17 +64,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     current baseline; it now pins v0.95.0, like the README, and says honestly
     which chapters were checked against it;
   - the README said agenttalk makes no network calls ("no egress"). The bus
-    still makes none, but some optional tools do. The README now lists every
-    destination, each marked default or opt-in: the managed model gateway's
-    OVH endpoint; `dev-gate`'s package installs from PyPI, its live Semgrep
-    rule sets and the PyPI advisory database; and the assurance tool's OSV,
-    pip-audit, remote Semgrep and release-build downloads, which its scan
-    profile must allow;
+    still makes none, but some optional tools do. The README now lists its
+    built-in network integrations, each marked default or opt-in: the
+    managed model gateway's OVH endpoint; `dev-gate`'s dependency and
+    test-tool installs from PyPI, its live Semgrep rule sets and the PyPI
+    advisory database; and the assurance tool's OSV, pip-audit and remote
+    Semgrep, which its scan profile must allow. The assurance tool's
+    release-profile build is not gated by `network_allowed`: it can
+    download its build backend even when `network_allowed` allows nothing;
   - the README and the manual said everything agenttalk records is in the
     project. The coordination store is, but signing keys, backups, the
     supervisor's wrapper logs, the gateway's secrets and spend ledger, and a
-    Codex settings block live in per-user folders. The README now lists them
-    and says what to back up or delete;
+    Codex settings block live in per-user folders by default. The README
+    now lists them and says that `agenttalk backup` does not include them;
   - the README described the gateway as reaching "the provider you
     configure" and called it a "multi-agent process gateway". It is the
     managed model gateway, pinned in code to OVH AI Endpoints with the

@@ -56,13 +56,20 @@ def _section(text: str, heading: str) -> str:
     return text.split(f"\n### {heading}\n", 1)[1].split("\n### ", 1)[0]
 
 
-def test_readme_lists_every_outbound_destination() -> None:
-    """Readers use this list for firewall and privacy decisions, so each destination is
-    read from the code or the gate manifest, not retyped."""
+def test_readme_lists_the_built_in_network_integrations() -> None:
+    """The gateway address, the package index and the Semgrep rule sets named here are
+    compared with the values in the code and the gate manifest. This does not prove the
+    list is complete; it only catches drift in the values it names."""
     from agenttalk import ovh_gateway, ovh_gateway_service
 
     network = " ".join(_section(README.read_text(encoding="utf-8"),
                                 "Local-first: what reaches the network").split())
+    assert ("off by default; each runs only when the scan profile's `network_allowed` setting "
+            "lists that tool") in network
+    assert ("That build is not gated by `network_allowed`: it can download the project's build "
+            "backend from the Python package index even when `network_allowed` allows nothing") in network
+    changelog = " ".join((REPO / "CHANGELOG.md").read_text(encoding="utf-8").split("\n## [0.95.0]", 1)[0].split())
+    assert "release-profile build is not gated by `network_allowed`" in changelog
     assert "**DEFAULT: none.**" in network
     assert ovh_gateway_service.DEFAULT_API_BASE in network
     manifest = json.loads((REPO / "dev-gate.json").read_text(encoding="utf-8"))
@@ -86,7 +93,10 @@ def test_readme_names_the_files_kept_outside_the_project() -> None:
                   r"agenttalk\wrapper-logs" "\\", ovh_gateway.DEFAULT_LOCAL_DIRNAME + "\\",
                   ovh_gateway.DEFAULT_SPEND_DIRNAME + "\\", "~/.codex/config.toml"):
         assert where in files, where
-    assert "`agenttalk backup` copies the store only." in files
+    assert "`$XDG_STATE_HOME/agenttalk/wrapper-logs/`" in files
+    assert "`agenttalk codex-config --enable` adds a block" in files
+    assert "`agenttalk backup` copies only the coordination store" in files
+    assert "full backup" not in files and "fully" not in files
     manual = " ".join(MANUAL.read_text(encoding="utf-8").split())
     assert "Everything it records is kept in files inside your project" not in manual
     assert "A few things live in per-user folders outside the project" in manual
