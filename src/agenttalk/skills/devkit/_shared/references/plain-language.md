@@ -44,9 +44,11 @@ between agents are not covered; see "Out of scope" at the end.
   Moving it to a technical section does not make it safe. This rule never forces a choice
   between saying what to do next and keeping something private: say what to do with what
   the reader is allowed to see.
-- Put technical detail last. Where a kind has no closing technical section (code comments,
-  interface text), keep only the detail the reader needs and leave the rest to the commit
-  message or the pull request.
+- Where technical detail goes depends on the kind of text. In release notes and similar texts
+  (kind A), put technical detail last, in a closing Technical details section. Documentation
+  keeps exact names, flags, commands and fields in place, each explained the first time
+  (kind B). Code comments and interface text keep only the detail the reader needs and leave
+  the rest to the commit message or the pull request (kinds C and D).
 - Never let one plain phrase stand for two different facts. Two pairs that are often mixed
   up:
   - **Released and deployed.** "Released" means a new version can be installed; it does not
@@ -74,7 +76,8 @@ between agents are not covered; see "Out of scope" at the end.
 - Structure: every document opens with an **"In plain words"** summary: what it is, who it is
   for and what you can do with it. For a specification or a design document, also say what it
   decides and what it leaves open. Then the body, in the shape its type needs (a tutorial's
-  steps, a reference's tables).
+  steps, a reference's tables). In a tutorial, how-to or quickstart, the first thing after
+  the summary is the runnable example.
 - Length: the summary is about 3 to 6 sentences. The body is as long as the reader's task
   needs.
 - Precision first in reference material: exact names, flags, commands, fields and values stay
