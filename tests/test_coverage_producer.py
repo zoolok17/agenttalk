@@ -2128,19 +2128,13 @@ def test_older_noncoverage_scan_cannot_invalidate_newer_coverage_attestation(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    # Windows CI flake (2026-10-01, run 36889968462): `release_older.wait(timeout=5.0)`
-    # raced against the MAIN thread's own work (starting `newer_thread`, joining it,
-    # then computing `_coverage_gate` - all real file I/O) before it calls
-    # `release_older.set()` in the `finally` block below. That main-thread work is not
-    # bounded by anything this test controls except `newer_thread.join`'s own timeout,
-    # so the "older" thread's patience must comfortably outlast everything the main
-    # thread might legitimately take on a loaded CI host - a longer guess at the SAME
-    # race is not a fix, so every wait in this test that sits on that same critical
-    # path is forced to this ONE named, generous bound instead.
-    _RELEASE_WAIT_SECONDS = 60.0
+    # The older scan stays paused until explicitly released, even when the newer
+    # scan takes time. All main-thread waits share one outer deadline; no worker
+    # timeout can release the older scan before we inspect the newer attestation.
     revision = _ci_revision(tmp_path, monkeypatch)
     older_entered = threading.Event()
     release_older = threading.Event()
+    newer_finished = threading.Event()
     results: dict[str, assurance.ScanResult] = {}
     errors: list[BaseException] = []
 
@@ -2171,8 +2165,7 @@ def test_older_noncoverage_scan_cannot_invalidate_newer_coverage_attestation(
         stdout = ""
         if spec["tool_id"] == "slow-quality":
             older_entered.set()
-            if not release_older.wait(timeout=_RELEASE_WAIT_SECONDS):
-                raise RuntimeError("older scan was not released")
+            release_older.wait()
         else:
             stdout = "TOTAL 100 9 91%"
         run = assurance._run_record(
@@ -2191,34 +2184,41 @@ def test_older_noncoverage_scan_cannot_invalidate_newer_coverage_attestation(
             results[name] = assurance.run_plan(plan)
         except BaseException as exc:  # pragma: no cover - asserted below
             errors.append(exc)
+        finally:
+            if name == "newer":
+                newer_finished.set()
 
     older_thread = threading.Thread(
         target=execute,
         args=("older", older),
         name="older-noncoverage-scan",
+        daemon=True,
     )
     newer_thread = threading.Thread(
         target=execute,
         args=("newer", newer),
         name="newer-coverage-scan",
+        daemon=True,
     )
     intermediate: dict | None = None
+    deadline = time.monotonic() + 60.0
     try:
         older_thread.start()
-        assert older_entered.wait(timeout=_RELEASE_WAIT_SECONDS)
+        assert older_entered.wait(timeout=max(0.0, deadline - time.monotonic()))
         newer_thread.start()
-        newer_thread.join(timeout=_RELEASE_WAIT_SECONDS)
-        assert not newer_thread.is_alive()
+        assert newer_finished.wait(timeout=max(0.0, deadline - time.monotonic()))
         intermediate = json.loads(json.dumps(_coverage_gate(tmp_path, "change")))
         assert intermediate["status"] == "green"
         assert intermediate["evidence"][-1]["coverage_percent"] == pytest.approx(91.0)
     finally:
         release_older.set()
-        older_thread.join(timeout=_RELEASE_WAIT_SECONDS)
-        newer_thread.join(timeout=_RELEASE_WAIT_SECONDS)
+        for thread in (older_thread, newer_thread):
+            if thread.ident is not None:
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
     assert not older_thread.is_alive()
     assert not newer_thread.is_alive()
+    assert time.monotonic() < deadline, "overlapping scans exceeded the outer deadline"
     assert errors == []
     assert set(results) == {"older", "newer"}
     assert intermediate is not None

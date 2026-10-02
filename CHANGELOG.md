@@ -171,46 +171,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Windows CI going red on four unrelated tests, each a different one each
-  time (since 2026-10-01).** A loaded Windows CI runner can take longer than
-  a couple of seconds just to START the `git` process (process creation,
-  antivirus scanning the binary, OS scheduler contention under a fleet-wide
-  parallel test run) - nothing to do with the repository itself. Several
-  places timed out a real `git` subprocess at 2.0s and treated a timeout
-  exactly like any other untrustworthy answer (correctly, by design - the
-  comprehension plane's privacy preflight is deliberately fail-closed), so a
-  timeout that was merely a touch too tight for a busy CI host surfaced as a
-  spurious refusal instead of a correctness bug. A fifth, unrelated failure
-  was a test's own internal synchronization bound racing against its main
-  thread's own (legitimately slower under load) work, nothing to do with
-  git at all.
-  - `agenttalk.comprehension.privacy.GIT_TIMEOUT_SECONDS`,
-    `agenttalk.comprehension.discovery._GIT_CONFIG_TIMEOUT_SECONDS` and
-    `agenttalk.work_board_facts.PROBE_TIMEOUT_SECONDS` raised from 2.0s to
-    15s - long enough to absorb realistic CI scheduler contention, short
-    enough that a genuinely hung/broken git is still caught well within a
-    single test's own timeout budget. The fail-closed guarantee is
-    unchanged; only how patient it is before concluding "untrustworthy".
-  - `agenttalk.checkpoint.BUS_DEADLINE_SECONDS` raised from 2.0s to 15s for
-    the same reason (a real, non-mocked bus-state scan exercised by
-    `tests/test_checkpoint.py`); `agenttalk.checkpoint.GIT_TIMEOUT_SECONDS`
-    and `HOOK_STDIN_TIMEOUT_SECONDS` were checked and left unchanged - no
-    test exercises the real subprocess path for the former, and the latter
-    is exercised only with already-available in-memory data, bounded by its
-    own generous outer test timeout.
-  - `tests/test_coverage_producer.py`'s own `release_older.wait(timeout=
-    5.0)` (and its sibling waits in the same test) raced the main thread's
-    own real file I/O instead of a subprocess; forced to one named, generous
-    bound (60s) instead of a longer but still-arbitrary guess.
-  - No retries were added anywhere; a genuine failure (a real, broken git
-    repo, or a real hang past the new, generous bound) still refuses or
-    fails exactly as before.
-  - Added `tests/test_comprehension_privacy.py::
-    test_a_forced_git_timeout_still_refuses_fail_closed`: forces every git
-    call to raise `TimeoutExpired` against a repo that would otherwise
-    genuinely prove ignored, and confirms the preflight still refuses,
-    fail-closed, with no plane output written - raising the timeout bound
-    must never turn a GENUINE timeout into a silent pass.
+- **More room for slow Windows CI checks, and a discovery timeout no longer
+  crashes the scan (#282, #283).** The former two-second Git privacy timeout
+  is a likely cause of the intermittent refusals seen since 2026-10-01;
+  the logs do not prove it. Privacy checks now allow 15 seconds. The matching
+  increases for discovery, work-board Git probes and checkpoint bus scans
+  are preventive. Privacy checks still refuse untrustworthy results, without
+  retries.
+  - If Git times out while discovery reads `.gitmodules`, the scan now reports
+    `parse_failed` and an incomplete fingerprint instead of crashing while
+    formatting the exception. Its diagnostic omits local paths and command
+    details. A regression test exercises a real subprocess timeout.
+  - The privacy timeout test checks that the bound is passed and only one Git
+    call occurs. The CLI integrity test checks scan success before opening
+    its index, including stderr when setup fails.
+  - The overlapping coverage-scan test waits for an explicit completion signal
+    before releasing the older scan. Its waits share one checked 60-second
+    outer deadline, replacing competing release and completion timeouts.
 
 - **The "what needs you" panel no longer flashes an error when the server is
   briefly busy (#267).** A server under heavy load can answer a request for

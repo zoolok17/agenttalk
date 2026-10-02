@@ -590,13 +590,15 @@ def test_validate_human_output_names_an_unverified_integrity_state(
     looks. valid stays true (the boolean is right); the output must now
     name the unverified state."""
     monkeypatch.setattr(scan_pipeline.publish, "_INDEX_RUNS_MAX", 1)
-    _run(["comprehension", "scan", "--json"], java_repo)
-    capsys.readouterr()
+    scan_exit_code = _run(["comprehension", "scan", "--json"], java_repo)
+    scan_output = capsys.readouterr()
+    assert scan_exit_code == 0, scan_output.err
     index_path = scan_pipeline.paths.index_path(
         scan_pipeline.paths.comprehension_dir(java_repo / ".agenttalk"))
     aged_out_scan_id = json.loads(index_path.read_text(encoding="utf-8"))["latest_scan_id"]
-    _run(["comprehension", "scan", "--json"], java_repo)
-    capsys.readouterr()
+    scan_exit_code = _run(["comprehension", "scan", "--json"], java_repo)
+    scan_output = capsys.readouterr()
+    assert scan_exit_code == 0, scan_output.err
 
     exit_code = _run(["comprehension", "validate", "--run", aged_out_scan_id], java_repo)
     assert exit_code == 0

@@ -116,15 +116,20 @@ def test_a_forced_git_timeout_still_refuses_fail_closed(
     # unrelated setup mistake.
     assert privacy.run_privacy_preflight(tmp_path).vcs_privacy == "ignored"
 
+    git_calls = []
+
     def _always_times_out(*args, **kwargs):
+        git_calls.append(args[0])
+        assert kwargs["timeout"] == privacy.GIT_TIMEOUT_SECONDS
         raise subprocess.TimeoutExpired(
-            cmd=args[0] if args else ["git"], timeout=kwargs.get("timeout") or 0)
+            cmd=args[0], timeout=kwargs["timeout"])
 
     monkeypatch.setattr(privacy.subprocess, "run", _always_times_out)
     with pytest.raises(VcsPrivacyRefused) as exc_info:
         privacy.run_privacy_preflight(tmp_path)
     message = str(exc_info.value)
     assert "could not be trusted" in message or "not inside a Git worktree" in message
+    assert len(git_calls) == 1
     assert not (tmp_path / ".agenttalk").exists()
 
 

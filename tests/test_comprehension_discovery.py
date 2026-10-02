@@ -1633,6 +1633,44 @@ def test_gitmodules_a_trailing_inline_comment_still_excludes_the_real_directory(
     assert not any(f.relative_path.startswith("libs/foo/") for f in result.files)
 
 
+def test_gitmodules_real_subprocess_timeout_degrades_without_leaking_paths(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    (tmp_path / ".gitmodules").write_text(
+        '[submodule "foo"]\n\tpath = libs/foo\n', encoding="utf-8",
+    )
+    real_run = subprocess.run
+    timeouts = []
+    monkeypatch.setattr(discovery, "_GIT_CONFIG_TIMEOUT_SECONDS", 0.1)
+
+    def sleeping_git(command, **kwargs):
+        assert command[:2] == ["git", "config"]
+        assert kwargs["timeout"] == 0.1
+        # Substitute only the executable: subprocess.run must really time out,
+        # kill and reap this child, rather than raising a fabricated exception.
+        try:
+            return real_run(
+                [sys.executable, "-c", "import time; time.sleep(60)"], **kwargs,
+            )
+        except subprocess.TimeoutExpired as exc:
+            timeouts.append(exc)
+            raise
+
+    monkeypatch.setattr(discovery.subprocess, "run", sleeping_git)
+    result = discovery.enumerate_scope(tmp_path, _comprehension_dir(tmp_path))
+    assert len(timeouts) == 1
+    assert result.degraded is True
+    assert result.fingerprint_complete is False
+    assert result.whole_scope_fingerprint is None
+    problem, = result.problems
+    assert problem["reason_code"] == "parse_failed"
+    assert problem["path"] == ".gitmodules"
+    assert "submodule boundaries are unknown" in problem["detail"]
+    assert tmp_path.name not in problem["detail"]
+    assert sys.executable not in problem["detail"]
+    assert "time.sleep" not in problem["detail"]
+
+
 def test_gitmodules_an_ordinary_unquoted_path_is_unaffected(tmp_path: Path) -> None:
     """FIX ROUND 47 (B1 BLOCKER control, .cr41-gmnorm): the ordinary,
     dominant real-world shape (a bare, unquoted path, no trailing slash
