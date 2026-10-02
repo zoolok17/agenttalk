@@ -1094,8 +1094,15 @@
     // board - overflow, degraded coverage or a read failure with nothing retained get their own,
     // honestly different wording instead of the same contradictory empty claim.
     if (!summary.cards.length) {
+      // F2 (FIX round 1): "No work in progress" used to claim more than this feed actually
+      // knows - it's a count of TRACKED cards only, and legacy/untagged work (shown separately,
+      // right below) can be genuinely open at the very same moment. Scoped to "tracked" so the
+      // two lines never read as contradicting each other.
       out.appendChild(el('p', 'c2-sub', summary.knownEmpty
-        ? 'No active or recently done work items.' : 'No cards can currently be shown.'));
+        ? (summary.windowDays !== null
+            ? 'No tracked work in progress, and nothing finished in the last ' + summary.windowDays + ' days.'
+            : 'No tracked work in progress, and nothing finished recently.')
+        : 'Cards can’t be shown right now; the board keeps trying.'));
     }
     summary.cards.forEach(function (c) { out.appendChild(boardCardNode(c, boardNav.selectedKey === c.key)); });
     if (summary.legacyOpenCount !== null || summary.legacyLowerBound > 0) {
@@ -1105,8 +1112,11 @@
       out.appendChild(el('p', 'c2-board-legacy', 'Legacy / untagged work: ' + legacyText));
     }
     if (summary.truncated) {
-      out.appendChild(el('p', 'c2-board-note',
-        'Board truncated' + (summary.omittedCount !== null ? ' (' + summary.omittedCount + ' omitted)' : '') + '.'));
+      // P2-a (FIX round 2): "1 are not shown" is wrong English - singular/plural agreement,
+      // same as plural() elsewhere in this file's own model.
+      out.appendChild(el('p', 'c2-board-note', summary.omittedCount !== null
+        ? 'Not all cards fit: ' + summary.omittedCount + (summary.omittedCount === 1 ? ' is' : ' are') + ' not shown.'
+        : 'Not all cards fit; some are not shown.'));
     }
     return out;
   }
@@ -1319,7 +1329,15 @@
 
   // A bounded GET. The timeout also covers a request that never settles at all, and
   // one that ignores its abort signal, so a hung feed can never hold the page up.
-  function getJson(url) {
+  //
+  // `opts.readErrorBody` (#267, FIX round 1 finding N1; narrowed further in round 2's P2-b):
+  // reading a FAILED response's body is opt-in, not automatic for every caller, AND even for
+  // the one caller that opts in, only a 503 is ever read - a body is a second read that can
+  // itself hang (a 500 whose body never arrives), and only a 503 can ever be the busy shape
+  // the attention fetch is looking for. Any other failed status (opts.readErrorBody or not)
+  // fails the instant the status line itself says not-ok, with no way to be held up by a
+  // slow or hanging error body.
+  function getJson(url, opts) {
     return new Promise(function (resolve, reject) {
       var ctl = typeof AbortController === 'function' ? new AbortController() : null;
       var settled = false;
@@ -1338,8 +1356,23 @@
       var init = { cache: 'no-store' };
       if (ctl) init.signal = ctl.signal;
       fetch(url, init).then(function (r) {
-        if (!r.ok) throw new Error('http ' + r.status);
-        return r.json();
+        if (r.ok) return r.json();
+        // P2-b (FIX round 2): check the STATUS first - only a 503 can ever be the busy shape,
+        // so only a 503 is worth a second read at all. Reading the body of every other failed
+        // status (opts.readErrorBody's original shape) meant a 500 with a stalled body kept
+        // last tick's healthy panel on screen until the 5 s request timeout, instead of
+        // failing the instant the status line itself said not-ok.
+        if (!(opts && opts.readErrorBody) || r.status !== 503) throw new Error('http ' + r.status);
+        // #267: a failed response's body can carry a machine-readable reason (a 503 busy
+        // reply's retry_after) - read it on a best-effort basis so a caller can tell "ask
+        // again shortly" apart from a genuine failure. A body that is missing or not JSON
+        // still rejects, just without that extra detail.
+        return r.json().catch(function () { return null; }).then(function (body) {
+          var err = new Error('http ' + r.status);
+          err.status = r.status;
+          err.body = body;
+          throw err;
+        });
       }).then(function (value) { finish(resolve, value); }, function (err) { finish(reject, err); });
     });
   }
@@ -1416,13 +1449,61 @@
     });
   }
 
+  // #267: a busy scan bound (503 {"error":"busy","retry_after":N}) is the server saying "ask
+  // again shortly", not a failure - a single one must not flip the panel to the "can't read
+  // what needs you" error state. project_id -> { untilPerf, retries }, cleared on any
+  // non-busy outcome (success or a genuine failure).
+  var ATTENTION_BUSY_MAX_RETRIES = 3;
+  // FIX round 1 (reviewer finding F1): retry_after is SERVER-supplied and must never be
+  // trusted as-is. `1e308` is a technically-finite, technically-positive number, so it used to
+  // pass straight through - the wait-gate deadline became functionally Infinity, every later
+  // poll tick skipped the request entirely, and the retry cap above was never reached (the
+  // reviewer's probe showed exactly ONE request after advancing the clock more than a day).
+  // Clamping every delay to this ceiling, combined with the retry cap, keeps the TOTAL time
+  // this panel can ever sit quietly waiting bounded too: at most
+  // ATTENTION_BUSY_MAX_RETRIES * ATTENTION_BUSY_MAX_DELAY_SECONDS (90 s here) before the real
+  // failure shows, no matter what the server sends. 30 s is long enough to ride out ordinary
+  // load, short enough that 90 s total is still "the panel went quiet for a bit", not "forever".
+  var ATTENTION_BUSY_MAX_DELAY_SECONDS = 30;
+  var attentionBusy = Object.create(null);
+
+  // Null unless `err` is exactly a busy reply with a usable retry_after - a positive, finite
+  // number of seconds, clamped to the ceiling above. A 503 with no such body, any other status,
+  // or a retry_after that is not a positive finite number (zero, negative, NaN, or an actual
+  // Infinity) is NOT treated as busy at all - it falls straight through to the real-error path,
+  // the same as any other malformed busy body.
+  function busyRetryAfterSeconds(err) {
+    var body = err && err.body;
+    if (!err || err.status !== 503 || !body || typeof body !== 'object' || body.error !== 'busy') return null;
+    var n = body.retry_after;
+    if (typeof n !== 'number' || !isFinite(n) || n <= 0) return null;
+    return Math.min(n, ATTENTION_BUSY_MAX_DELAY_SECONDS);
+  }
+
   function fetchAttention(id) {
     return guarded('att:' + id, function () {
-      return getJson(rootUrl('/api/attention', id)).then(function (payload) {
+      var busy = attentionBusy[id];
+      if (busy && perfNow() < busy.untilPerf) {
+        // Still waiting out the server's requested delay: no request this tick. Nothing in
+        // `data.attention[id]` changed, so this render is a no-op today, but it keeps this
+        // path's contract the same as every other outcome below (always ends in a render).
+        return Promise.resolve().then(renderAll);
+      }
+      return getJson(rootUrl('/api/attention', id), { readErrorBody: true }).then(function (payload) {
+        delete attentionBusy[id];
         var bad = !answersFor(payload, id) || (Array.isArray(payload.errors) && payload.errors.length > 0);
         if (bad) attentionFailed(id);
         else data.attention[id] = { ok: true, asOfMs: nowMs(), items: Array.isArray(payload.items) ? payload.items : [] };
-      }, function () {
+      }, function (err) {
+        var retryAfter = busyRetryAfterSeconds(err);
+        if (retryAfter !== null) {
+          var retries = (busy ? busy.retries : 0) + 1;
+          if (retries <= ATTENTION_BUSY_MAX_RETRIES) {
+            attentionBusy[id] = { untilPerf: perfNow() + retryAfter * 1000, retries: retries };
+            return;   // calm: keep whatever was last known (or still "loading"); ask again after the delay
+          }
+        }
+        delete attentionBusy[id];
         attentionFailed(id);
       }).then(renderAll);
     });
