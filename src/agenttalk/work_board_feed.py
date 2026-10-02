@@ -98,7 +98,11 @@ def build(snapshot, *, project, lead, gate_state, now=None, integrated=None, int
             anchor = cursor.meta.get("in_reply_to")
             cursor = by_id.get(anchor) if isinstance(anchor, str) else None
         when = _time(m.ts)
-        if isinstance(slug, str) and when:
+        # issue #279: a planned record is never activity - it must not
+        # refresh last_work_event_at and keep a Done item out of the
+        # 7-day prune below (it is also never in OPENERS, so it already
+        # could not reach `dispatched`).
+        if isinstance(slug, str) and when and m.kind != "planned":
             activity[slug].append(when)
             if m.kind in ("task", "review-request"):
                 dispatched[slug].append(when)

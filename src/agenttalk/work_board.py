@@ -192,6 +192,14 @@ def _audit(messages, openers):
 
 
 def _audit_one(m, by_id, parent, openers, responses, flag):
+    if m.kind == "planned":
+        # issue #279: a planned record is invisible to the reducer's
+        # request/reply attribution entirely - it is never flagged, never
+        # attributed via owners() to any item (which would otherwise read
+        # its own work_item tag, e.g. via a stray in_reply_to on a
+        # malformed one), and never contributes to any real item's
+        # issues. It has its own read-side validator, planned_state().
+        return
     meta = m.meta
     rid, anchor_id = meta.get("request_id"), meta.get("in_reply_to")
     if (not (rid is None or isinstance(rid, str)) or not (anchor_id is None or isinstance(anchor_id, str))
@@ -639,3 +647,113 @@ def _policy(slug, valid, cur, current, facts):
             result["problem"] = ("required checks not satisfied" if passed is False
                                  else "required check evidence unavailable", evidence)
     return result
+
+
+# ----------------------------------------------------- planned lane (issue #279)
+
+def planned_state(messages, real_items):
+    """Per-``work_item`` Planned-lane state, replayed PURELY from the full
+    validated log - never raises, never mutates its input.
+
+    ``real_items``: the set of work_items the reducer found ANY evidence for
+    (``{i["work_item"] for i in reduce(...)["items"]}`` - "any real opener
+    anywhere in history", design doc §5). Promotion is checked FIRST and
+    wins unconditionally: once a work_item is in ``real_items`` its state is
+    ``"promoted"`` regardless of what its planned chain looks like, even a
+    malformed or cyclic one - a real dispatch makes the plan's own validity
+    moot.
+
+    For a work_item NOT in ``real_items``, exactly one rooted, acyclic chain
+    of same-item ``replaces`` links, built only from STRUCTURALLY valid
+    ``kind="planned"`` records (``work_tags.validate_planned`` - replay
+    applies the identical check publication does; see that function's
+    docstring), must resolve to one tip (a record nothing replaces):
+    - zero planned records at all -> absent (not a key in the result);
+    - a malformed record anywhere for this work_item (fails
+      ``validate_planned``), a self-edge, a ``replaces`` naming a missing/
+      cross-item/non-planned id, a cycle, or more than one tip -> unknown;
+    - the chain's one tip has ``withdrawn: true`` -> withdrawn;
+    - otherwise -> active, carrying the tip's ``work_title``.
+
+    Returns ``{work_item: {"state", "title", "reason", "current_id"}}``.
+    ``title``/``current_id`` are the active/withdrawn tip's; both are
+    ``None`` for ``promoted`` (this function does not re-derive a real
+    item's own title) and for ``unknown`` (no single tip exists to name).
+    ``reason`` is set only for ``unknown``.
+    """
+    raw = [m for m in messages if getattr(m, "kind", None) == "planned"]
+    by_item = {}
+    for m in raw:
+        item = m.meta.get("work_item") if isinstance(m.meta, dict) else None
+        if not isinstance(item, str) or not item:
+            continue  # unattributable: no work_item to blame this record on
+        by_item.setdefault(item, []).append(m)
+
+    out = {}
+    for item, group in by_item.items():
+        valid = {}  # id -> clean meta
+        malformed = False
+        for m in group:
+            try:
+                valid[m.id] = work_tags.validate_planned(m.meta)
+            except (TypeError, ValueError):
+                malformed = True
+        if malformed:
+            out[item] = {"state": "unknown", "title": None, "current_id": None,
+                        "reason": "a planned record for this work_item is malformed"}
+            continue
+        ids = set(valid)
+        replaced_ids = set()
+        broken = None
+        for mid, clean in valid.items():
+            target = clean.get("replaces")
+            if target is None:
+                continue
+            if target == mid:
+                broken = "a planned record names itself in replaces"
+            elif target not in ids:
+                # Missing entirely from the log, present but a different
+                # kind, or present as `planned` for a DIFFERENT work_item -
+                # `ids` is scoped to THIS item's own valid planned records,
+                # so all three collapse to the same "doesn't resolve here".
+                broken = "a planned record's replaces does not resolve to an earlier record of the same work_item"
+            else:
+                replaced_ids.add(target)
+        if broken is None and _cyclic_replaces(valid):
+            broken = "the planned records for this work_item form a replaces cycle"
+        if broken:
+            out[item] = {"state": "unknown", "title": None, "current_id": None, "reason": broken}
+            continue
+        tips = sorted(ids - replaced_ids)
+        if len(tips) != 1:
+            out[item] = {
+                "state": "unknown", "title": None, "current_id": None,
+                "reason": "competing planned records for this work_item (no single current record)",
+            }
+            continue
+        tip_id = tips[0]
+        tip = valid[tip_id]
+        if tip.get("withdrawn") is True:
+            out[item] = {"state": "withdrawn", "title": None, "current_id": tip_id, "reason": None}
+        else:
+            out[item] = {"state": "active", "title": tip["work_title"], "current_id": tip_id, "reason": None}
+
+    for item in real_items:
+        out[item] = {"state": "promoted", "title": None, "current_id": None, "reason": None}
+    return out
+
+
+def _cyclic_replaces(valid):
+    """True if following `replaces` from any id in `valid` revisits a node -
+    identical shape to `_cyclic` above, over the planned-only `replaces`
+    edge instead of `in_reply_to`."""
+    for start in valid:
+        seen, node = set(), valid[start].get("replaces")
+        while node is not None and node in valid:
+            if node == start:
+                return True
+            if node in seen:
+                break  # a cycle elsewhere in the graph; that start already reports it
+            seen.add(node)
+            node = valid[node].get("replaces")
+    return False

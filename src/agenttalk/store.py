@@ -638,6 +638,11 @@ KNOWN_KINDS = frozenset({
     # below; a version bump of this repo alone must change nothing.
     "task",
     "task-response",
+    # issue #279: the work board's Planned lane. A lead-published,
+    # self-addressed record (sender == recipient) naming a work_item that
+    # is planned but not yet dispatched. No reply kind - see CONTROL_KINDS
+    # below for why it is never delivered as a turn.
+    "planned",
 })
 
 # The first (major, minor) that understands each gated kind. A recipient
@@ -658,7 +663,15 @@ KIND_SUPPORT_FLOOR = {
 # (threads.py's question-opener rule closes a thread on ANY non-control
 # response) — a progress note addressed back to a question's asker must
 # never be misread as the terminal answer.
-CONTROL_KINDS = frozenset({"composing", "progress"})
+# issue #279: `planned` joins this set too - not flow control, but the
+# SAME delivery contract it exists to give composing/progress: persisted
+# for audit, but `agenttalk recv`'s default view, `last_received_for`'s
+# default reply anchor, and (because the wrapper's own turn-trigger path
+# is `recv_api.records()`, which already filters this set) a wrapped
+# agent's own automatic turns never see it. A planned record is
+# self-addressed (lead to itself) specifically so there is no OTHER
+# seat's inbox this could ever reach in the first place.
+CONTROL_KINDS = frozenset({"composing", "progress", "planned"})
 
 # Kinds that OPEN a trackable request/reply thread. Single source of
 # truth shared by thread derivation (threads.py) and rescind validation
