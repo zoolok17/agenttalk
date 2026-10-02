@@ -1147,6 +1147,9 @@ Common cases:
   It uses the existing correlated answer message; it does not label the notice
   superseded. Repeating a completed resolution makes no further changes; if a
   notice answer could not be sent, repeating the command retries that answer.
+  Every notice answer uses the recorded resolver, reason, and evidence, including
+  retries by a new liaison and purge preflight. If the recorded decision is
+  unavailable, notices stay open and the command explains why on stderr.
   Use `agenttalk dead-letter purge --resolved --from <liaison>` to archive old
   resolved payloads out of the live sink; archived rows are no longer requeueable
   by the live `dead-letter requeue` command unless restored.
