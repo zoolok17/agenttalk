@@ -10,7 +10,8 @@ import {
   ATT_ITEM, NOW, agent, busyAgents, busyRecent, env, iso, root,
 } from './console2_fixtures.mjs';
 import {
-  BUSY, HOSTILE, JSON_HANG, LEAD, PENDING, all, app, boot, chips, classOf, header, rail, server, stream, timeouts, under,
+  BUSY, HOSTILE, JSON_HANG, JSON_HANG_STATUS, LEAD, PENDING, all, app, boot, chips, classOf, header, rail, server, stream,
+  timeouts, under,
 } from './console2_app.mjs';
 import { texts, walk } from './console2_harness.mjs';
 
@@ -511,6 +512,33 @@ test('#267: a non-busy error shows the real error immediately, not a calm wait',
   await fire();
   assert.ok(all(stream(dom)).includes('Can’t read what needs you.'), 'a real error shows immediately, no grace period');
   assert.equal(app(dom).className, 'is-stale');
+});
+
+test('P2-b (FIX round 2): a non-503 error with a hanging body fails fast, no 5s wait', async () => {
+  // A 500 is never the busy shape, so its body is never worth reading - checking the status
+  // FIRST (before ever touching the body) means a hanging body can no longer hold the old,
+  // healthy panel on screen until the 5 s request timeout.
+  const srv = server({ attention: () => JSON_HANG_STATUS(500) });
+  const { dom, fire } = await boot(srv);
+  await fire(under);   // only the 2 s poll timer, well short of the 5 s request timeout
+  assert.ok(all(stream(dom)).includes('Can’t read what needs you.'),
+    'already failed before the 5 s timeout - the body was never read at all');
+  assert.equal(app(dom).className, 'is-stale');
+});
+
+test('P2-b (FIX round 2): a 503 busy reply still retries as before (the status check does not break it)', async () => {
+  const srv = server({ attention: () => ({ target_root_project_id: 'proj-a', items: [ATT_ITEM({ id: 'a', title: 'Only question' })] }) });
+  const { dom, clock, fire } = await boot(srv);
+  const attentionCalls = () => srv.calls.filter((u) => u.startsWith('/api/attention')).length;
+  const callsAfterBoot = attentionCalls();
+  srv.attention = () => BUSY(4);
+  await fire();
+  assert.equal(app(dom).className, '', 'a 503 busy reply is still calm, not a failure');
+  clock.perf += 4000;
+  srv.attention = () => ({ target_root_project_id: 'proj-a', items: [ATT_ITEM({ id: 'a', title: 'Only question' })] });
+  await fire();
+  assert.equal(attentionCalls(), callsAfterBoot + 2, 'retries on schedule, exactly as before this round');
+  assert.equal(app(dom).className, '', 'recovers calmly');
 });
 
 test('#267: a 503 with no usable retry_after shows the real error immediately', async () => {

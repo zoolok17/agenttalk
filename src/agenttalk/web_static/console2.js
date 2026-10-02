@@ -1112,8 +1112,10 @@
       out.appendChild(el('p', 'c2-board-legacy', 'Legacy / untagged work: ' + legacyText));
     }
     if (summary.truncated) {
+      // P2-a (FIX round 2): "1 are not shown" is wrong English - singular/plural agreement,
+      // same as plural() elsewhere in this file's own model.
       out.appendChild(el('p', 'c2-board-note', summary.omittedCount !== null
-        ? 'Not all cards fit: ' + summary.omittedCount + ' are not shown.'
+        ? 'Not all cards fit: ' + summary.omittedCount + (summary.omittedCount === 1 ? ' is' : ' are') + ' not shown.'
         : 'Not all cards fit; some are not shown.'));
     }
     return out;
@@ -1328,12 +1330,13 @@
   // A bounded GET. The timeout also covers a request that never settles at all, and
   // one that ignores its abort signal, so a hung feed can never hold the page up.
   //
-  // `opts.readErrorBody` (#267, FIX round 1 finding N1): reading a FAILED response's body is
-  // opt-in, not automatic for every caller. A body is a second read that can itself hang (a
-  // 500 whose body never arrives) - only the one caller that actually needs the body (the
-  // attention busy/retry_after check) asks for it; every other feed keeps the original,
-  // immediate "fail the instant the status line says not-ok" behavior, with no new way to be
-  // held up by a slow or hanging error body.
+  // `opts.readErrorBody` (#267, FIX round 1 finding N1; narrowed further in round 2's P2-b):
+  // reading a FAILED response's body is opt-in, not automatic for every caller, AND even for
+  // the one caller that opts in, only a 503 is ever read - a body is a second read that can
+  // itself hang (a 500 whose body never arrives), and only a 503 can ever be the busy shape
+  // the attention fetch is looking for. Any other failed status (opts.readErrorBody or not)
+  // fails the instant the status line itself says not-ok, with no way to be held up by a
+  // slow or hanging error body.
   function getJson(url, opts) {
     return new Promise(function (resolve, reject) {
       var ctl = typeof AbortController === 'function' ? new AbortController() : null;
@@ -1354,7 +1357,12 @@
       if (ctl) init.signal = ctl.signal;
       fetch(url, init).then(function (r) {
         if (r.ok) return r.json();
-        if (!(opts && opts.readErrorBody)) throw new Error('http ' + r.status);
+        // P2-b (FIX round 2): check the STATUS first - only a 503 can ever be the busy shape,
+        // so only a 503 is worth a second read at all. Reading the body of every other failed
+        // status (opts.readErrorBody's original shape) meant a 500 with a stalled body kept
+        // last tick's healthy panel on screen until the 5 s request timeout, instead of
+        // failing the instant the status line itself said not-ok.
+        if (!(opts && opts.readErrorBody) || r.status !== 503) throw new Error('http ' + r.status);
         // #267: a failed response's body can carry a machine-readable reason (a 503 busy
         // reply's retry_after) - read it on a best-effort basis so a caller can tell "ask
         // again shortly" apart from a genuine failure. A body that is missing or not JSON

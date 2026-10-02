@@ -10,6 +10,8 @@ export const HOSTILE = '<img src=x onerror=alert(1)>';
 export const LEAD = 'claude-agenttalk-lead';
 export const PENDING = { __pending: true };
 export const JSON_HANG = { __jsonHang: true };
+// P2-b (FIX round 2): a FAILED response whose body never arrives, e.g. JSON_HANG_STATUS(500).
+export const JSON_HANG_STATUS = (status) => ({ __jsonHang: true, __status: status });
 // #267: the server's busy-scan-bound reply, with a usable retry_after by default.
 export const BUSY = (retryAfter = 2) => ({ __status: 503, __body: { error: 'busy', retry_after: retryAfter } });
 export const under = (ms) => ms < 5000;   // every timer except the 5 s request timeouts
@@ -50,7 +52,14 @@ export function server(o = {}) {
       else if (u.pathname === '/api/work-board') payload = s.board(id);
       else return jsonResponse({}, 404);
       if (payload && payload.__pending) return new Promise(() => {});                       // never settles
-      if (payload && payload.__jsonHang) return Promise.resolve({ ok: true, status: 200, json: () => new Promise(() => {}) });
+      if (payload && payload.__jsonHang) {
+        // P2-b (FIX round 2): an OPTIONAL __status lets this simulate a FAILED response whose
+        // body never arrives (a 500 that hangs), distinct from JSON_HANG's own 200-that-hangs -
+        // only a caller that actually reads error bodies (the attention fetch, 503 only) can
+        // ever be held up by this one.
+        const status = payload.__status || 200;
+        return Promise.resolve({ ok: status >= 200 && status < 300, status, json: () => new Promise(() => {}) });
+      }
       if (payload && payload.__status) return jsonResponse(payload.__body || {}, payload.__status);
       return jsonResponse(payload);
     },

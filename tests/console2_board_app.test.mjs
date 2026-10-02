@@ -140,7 +140,19 @@ test('F5: an overflow that omits the only item is never claimed as "no work item
   const b = all(board(dom));
   assert.ok(!b.includes('No tracked work in progress, and nothing finished in the last 7 days.'), b);
   assert.ok(b.includes('Cards can’t be shown right now; the board keeps trying.'), b);
-  assert.ok(b.includes('Not all cards fit: 1 are not shown.'), b);
+  assert.ok(b.includes('Not all cards fit: 1 is not shown.'), b);
+});
+
+test('P2-a (FIX round 2): the truncated-board note agrees singular/plural with the omitted count', async () => {
+  const one = server({ roots: oneRoot, board: () => BOARD_FEED({ truncated: true, omittedCount: 1 }) });
+  const { dom: oneDom, fire: oneFire } = await boot(one, { hash: '#board' });
+  await oneFire(under);
+  assert.ok(all(board(oneDom)).includes('Not all cards fit: 1 is not shown.'));
+
+  const many = server({ roots: oneRoot, board: () => BOARD_FEED({ truncated: true, omittedCount: 3 }) });
+  const { dom: manyDom, fire: manyFire } = await boot(many, { hash: '#board' });
+  await manyFire(under);
+  assert.ok(all(board(manyDom)).includes('Not all cards fit: 3 are not shown.'));
 });
 
 // ------------------------------------------------------------------------------------------- F6
