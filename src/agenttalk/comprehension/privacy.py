@@ -65,7 +65,22 @@ from .envelope import path_is_reparse_point_or_symlink
 from .errors import VcsPrivacyRefused
 from .paths import INDEX_FILENAME, RELATIVE_COMPREHENSION_DIR, RUNS_DIRNAME, STAGING_DIRNAME
 
-GIT_TIMEOUT_SECONDS = 2.0
+#: Windows CI flakes (2026-10-01, four master runs): a loaded Windows runner
+#: can take longer than a couple of seconds just to START the `git` process
+#: (process creation, antivirus scanning the binary, OS scheduler
+#: contention under a fleet-wide parallel test run) - nothing to do with
+#: the repository itself. `subprocess.run(..., timeout=...)` cannot tell
+#: "git is slow to start" apart from "git is genuinely hung", and this
+#: preflight is deliberately fail-closed (a timeout is treated exactly like
+#: any other untrustworthy answer - see `_run_git`), so a timeout that is
+#: merely a touch too tight for a busy CI host manifests as a spurious
+#: `VcsPrivacyRefused`, not a correctness bug. Raised from 2.0s to 15s: long
+#: enough to absorb realistic CI scheduler contention (observed Windows
+#: pytest runs: 1h17m-1h39m under heavy fleet-wide parallel load), short
+#: enough that a GENUINELY hung/broken git is still caught well within a
+#: single test's own timeout budget, so the fail-closed guarantee itself is
+#: unchanged - only how patient it is before concluding "untrustworthy".
+GIT_TIMEOUT_SECONDS = 15.0
 
 #: FIX ROUND 32 (twenty-eighth cold read, F1 BLOCKER, privacy boundary): a
 #: single probe at one synthetic, writer-never-uses-it depth (the old

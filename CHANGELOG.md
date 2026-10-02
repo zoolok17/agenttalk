@@ -53,7 +53,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   routing index gains a row for interface text. `write-for-humans`' trigger is
   unchanged. Tests in `tests/test_install_skills.py`.
 
+- **The lead skills now teach a regular check-in and a handover note (#276).**
+  A lead on a long run had no written routine: what to look at and how often,
+  what to write down so that a reset lead can carry on, and what to tell the
+  person in charge. Each lead made up its own, and a reset could lose track of
+  work in flight.
+
+  Now both lead skills have a "Lead routine" section:
+  - a check-in, for example every 30 minutes: read new messages, see which
+    seats are alive or stuck, look at open threads, go through reviews and pull
+    requests (merge only with a review that covers the exact head commit),
+    check each seat's model budget and context with `agenttalk capacity` and
+    the machine's free memory with the operating system's own check, curate
+    knowledge, and check spend if the team has a paid model route. A step the
+    team does not have is skipped;
+  - a handover, for example every two hours and before any reset:
+    `agenttalk checkpoint save` keeps what agenttalk can see, and a separate
+    note of a few lines in the lead's own notes keeps the rest, under about 20
+    lines in all. The checkpoint does not store that note;
+  - ways to put both on a timer: a scheduled prompt in Claude Code, or an
+    operating-system scheduled task for the Codex terminal CLI. The supervised
+    lead loop is a separate safety sweep, not a timer for this routine;
+  - what to report to the person in charge: only decisions and actions that
+    need them, and money alarms.
+
+  The task example in each lead skill now also shows the reply to ask for: a
+  task response with `--meta status=done` next to its verdict. Without a
+  closing status the task stays listed as open (part of #277).
+
+  What you will notice: a lead that loads the updated skill keeps a steady
+  check-in and leaves a handover note. The manual's "Lead-led team" section
+  points to the routine.
+
+  What you need to do: on an existing install, a plain
+  `agenttalk install-skills` leaves a changed skill file alone. Preview with
+  `agenttalk install-skills --dry-run --force`, back up any local edits you
+  want to keep, then run `agenttalk install-skills --force`.
+
+  Technical details: `src/agenttalk/skills/claude/agenttalk.lead.md` and
+  `src/agenttalk/skills/codex/agenttalk-lead/SKILL.md` carry the same text,
+  each in its own agent's command style; `docs/AGENTTALK-NEW-USER-MANUAL.md`.
+  Tests in `tests/test_install_skills.py` keep the two copies in step and check
+  that every task-response example in the lead skills asks for a closing
+  status.
+
 ### Changed
+
+- **The README and the new-user manual now open in plain words.** Both start
+  with a short "In plain words" summary of what agenttalk is, who it is for
+  and how to begin, and their first steps (what it is, how to install, the
+  first commands) are rewritten in everyday language. Every command, flag and
+  version stays exact. A few statements that were no longer true are corrected:
+  - the manual told new users to install v0.74.0 and called v0.74.0 its
+    current baseline; it now pins v0.95.0, like the README, and says honestly
+    which chapters were checked against it;
+  - the README said agenttalk makes no network calls ("no egress"). The bus
+    still makes none, but some optional tools do. The README now lists its
+    built-in network integrations, each marked default or opt-in: the
+    managed model gateway's OVH endpoint; `dev-gate`'s dependency and
+    test-tool installs from PyPI, its live Semgrep rule sets and the PyPI
+    advisory database; and the assurance tool's OSV, pip-audit and remote
+    Semgrep, which its scan profile must allow. The assurance tool's
+    release-profile build is not gated by `network_allowed`: it can
+    download its build backend even when `network_allowed` allows nothing;
+  - the README and the manual said everything agenttalk records is in the
+    project. The coordination store is, but signing keys, backups, the
+    supervisor's wrapper logs, the gateway's secrets and spend ledger, and a
+    Codex settings block live in per-user folders by default. The README
+    now lists them and says that `agenttalk backup` does not include them;
+  - the README described the gateway as reaching "the provider you
+    configure" and called it a "multi-agent process gateway". It is the
+    managed model gateway, pinned in code to OVH AI Endpoints with the
+    Qwen3.8-27B model, and it refuses any other address or model;
+  - the README said `--claude-only` and `--codex-only` install "just one
+    side". They choose only which side gets the bus commands; the devkit
+    still goes to both sides unless you add `--no-devkit`.
+
+  The install steps also now say how to upgrade an existing install. What
+  you need to do: nothing.
+
+  Technical details: `README.md` and `docs/AGENTTALK-NEW-USER-MANUAL.md`
+  (opening, chapter 3 and chapter 6); tests in `tests/test_docs_plain_voice.py`.
+
+### Removed
+
+- **The PDF copy of the new-user manual (#260).** It was made once, for
+  version 0.74.0, and could not be rebuilt, so it had fallen about twenty
+  versions behind the Markdown manual without saying so. It is no longer in
+  the repository or in the source package. Read
+  `docs/AGENTTALK-NEW-USER-MANUAL.md` instead.
+
+  Technical details: removed from the `pyproject.toml` sdist include list. The
+  `dev-gate` package check (`dev-gate.json` and `src/agenttalk/dev_gate.py`,
+  `required_sdist_paths`) now requires the Markdown manual in the source
+  package instead of the PDF.
 
 - **The v2 console's on-screen text is now in plain words.** A copy pass
   applied the new plain-language guide (kind D) to every label, button,
@@ -77,6 +170,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in `tests/console2_board_app.test.mjs`.
 
 ### Fixed
+
+- **Windows CI going red on four unrelated tests, each a different one each
+  time (since 2026-10-01).** A loaded Windows CI runner can take longer than
+  a couple of seconds just to START the `git` process (process creation,
+  antivirus scanning the binary, OS scheduler contention under a fleet-wide
+  parallel test run) - nothing to do with the repository itself. Several
+  places timed out a real `git` subprocess at 2.0s and treated a timeout
+  exactly like any other untrustworthy answer (correctly, by design - the
+  comprehension plane's privacy preflight is deliberately fail-closed), so a
+  timeout that was merely a touch too tight for a busy CI host surfaced as a
+  spurious refusal instead of a correctness bug. A fifth, unrelated failure
+  was a test's own internal synchronization bound racing against its main
+  thread's own (legitimately slower under load) work, nothing to do with
+  git at all.
+  - `agenttalk.comprehension.privacy.GIT_TIMEOUT_SECONDS`,
+    `agenttalk.comprehension.discovery._GIT_CONFIG_TIMEOUT_SECONDS` and
+    `agenttalk.work_board_facts.PROBE_TIMEOUT_SECONDS` raised from 2.0s to
+    15s - long enough to absorb realistic CI scheduler contention, short
+    enough that a genuinely hung/broken git is still caught well within a
+    single test's own timeout budget. The fail-closed guarantee is
+    unchanged; only how patient it is before concluding "untrustworthy".
+  - `agenttalk.checkpoint.BUS_DEADLINE_SECONDS` raised from 2.0s to 15s for
+    the same reason (a real, non-mocked bus-state scan exercised by
+    `tests/test_checkpoint.py`); `agenttalk.checkpoint.GIT_TIMEOUT_SECONDS`
+    and `HOOK_STDIN_TIMEOUT_SECONDS` were checked and left unchanged - no
+    test exercises the real subprocess path for the former, and the latter
+    is exercised only with already-available in-memory data, bounded by its
+    own generous outer test timeout.
+  - `tests/test_coverage_producer.py`'s own `release_older.wait(timeout=
+    5.0)` (and its sibling waits in the same test) raced the main thread's
+    own real file I/O instead of a subprocess; forced to one named, generous
+    bound (60s) instead of a longer but still-arbitrary guess.
+  - No retries were added anywhere; a genuine failure (a real, broken git
+    repo, or a real hang past the new, generous bound) still refuses or
+    fails exactly as before.
+  - Added `tests/test_comprehension_privacy.py::
+    test_a_forced_git_timeout_still_refuses_fail_closed`: forces every git
+    call to raise `TimeoutExpired` against a repo that would otherwise
+    genuinely prove ignored, and confirms the preflight still refuses,
+    fail-closed, with no plane output written - raising the timeout bound
+    must never turn a GENUINE timeout into a silent pass.
 
 - **The "what needs you" panel no longer flashes an error when the server is
   briefly busy (#267).** A server under heavy load can answer a request for

@@ -94,6 +94,40 @@ def test_no_plane_output_is_written_on_refusal(tmp_path: Path) -> None:
     assert not (tmp_path / ".agenttalk").exists()
 
 
+def test_a_forced_git_timeout_still_refuses_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows CI flakes (2026-10-01, four master runs): a loaded CI host
+    can make a real `git` subprocess take longer than GIT_TIMEOUT_SECONDS
+    to even START - indistinguishable, from here, from git genuinely
+    hanging. Force EXACTLY that (every `subprocess.run` call this module
+    makes raises `TimeoutExpired`, the real exception a real timeout
+    raises) against a repo that would otherwise genuinely prove ignored,
+    and confirm the preflight still refuses, fail-closed, with no plane
+    output written - raising the timeout bound (this round's actual fix)
+    must never turn a GENUINE timeout into a silent pass; it only widens
+    how long a real git is given before one is called at all.
+    """
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(".agenttalk/\n", encoding="utf-8")
+    _commit_all(tmp_path, "base")
+    # Confirm this repo would otherwise genuinely prove ignored, so the
+    # refusal below is provably caused by the forced timeout, not an
+    # unrelated setup mistake.
+    assert privacy.run_privacy_preflight(tmp_path).vcs_privacy == "ignored"
+
+    def _always_times_out(*args, **kwargs):
+        raise subprocess.TimeoutExpired(
+            cmd=args[0] if args else ["git"], timeout=kwargs.get("timeout") or 0)
+
+    monkeypatch.setattr(privacy.subprocess, "run", _always_times_out)
+    with pytest.raises(VcsPrivacyRefused) as exc_info:
+        privacy.run_privacy_preflight(tmp_path)
+    message = str(exc_info.value)
+    assert "could not be trusted" in message or "not inside a Git worktree" in message
+    assert not (tmp_path / ".agenttalk").exists()
+
+
 # --------------------- FIX ROUND 32 (twenty-eighth cold read, F1 BLOCKER):
 # a single probe at one synthetic depth generalizes its one answer to the
 # whole store - these prove the multi-probe rewrite closes both measured
