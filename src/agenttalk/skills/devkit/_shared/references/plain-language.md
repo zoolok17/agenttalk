@@ -26,8 +26,12 @@ between agents are not covered; see "Out of scope" at the end.
 - Explain every technical term the first time it appears, or avoid it.
 - Never invent a number, a name or a place that the source does not give.
 - Keep every fact. The one exception is anything sensitive:
-  - secrets (passwords, keys, tokens) and private or customer data are removed from every
-    text, whoever reads it;
+  - secrets (passwords, keys, tokens) are removed from every text, whoever reads it, and so
+    is anyone else's private data;
+  - real private or customer records pasted into prose, examples, logs or public pages are
+    removed or summarised safely;
+  - product data shown on purpose to the signed-in person it belongs to stays: a screen that
+    says `Your delivery address is {customer.address}` is correct;
   - internal-only paths, hostnames and addresses are removed from anything a public or
     unauthorized audience sees (release notes, a public page, an error sent to a remote
     caller). Local diagnostics and private run guides keep the path, or another safe
@@ -75,8 +79,9 @@ between agents are not covered; see "Out of scope" at the end.
   first time it appears.
 - Proposals: a specification or a design document may describe what is not built yet, when its
   status is labelled (a `Status: proposed` line, and "will" / "proposed" wording). Never
-  present an unimplemented proposal as something the software already does. Documentation of
-  the current product describes only what has shipped.
+  present an unimplemented proposal as something the software already does. An example of
+  proposed behavior is marked "proposed, not runnable yet" and checked against the proposal,
+  not run. Documentation of the current product describes only what has shipped.
 - Scope: apply this to documents you write or change. Do not rewrite untouched documents only
   to change their voice.
 
@@ -100,7 +105,8 @@ between agents are not covered; see "Out of scope" at the end.
 - Words: use the same name for the same thing everywhere in the interface and the
   documentation.
 - Privacy: never show a secret (a password, a key, a token), anywhere, including in error
-  details. Hide internal paths and hostnames only from people who should not see them: a
+  details. Show a person their own data where that is the screen's purpose, never someone
+  else's. Hide internal paths and hostnames only from people who should not see them: a
   public page, or an error sent to a remote caller. A local diagnostic keeps the path, for
   example `cannot save the order: /var/lib/shop/orders.db is read-only`, because it is what
   lets the person fix the problem.

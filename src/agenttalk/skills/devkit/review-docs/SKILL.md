@@ -27,12 +27,19 @@ approve on "looks fine".
       anything not built yet is clearly labelled (a `Status: proposed` line, "will" /
       "proposed" wording) and that what it says about today's behavior matches the
       code. An unimplemented proposal presented as existing behavior is **BLOCKING**.
-- [ ] **Run every example / command / snippet** (or confirm CI runs them) and confirm
-      the documented result. Reject illustrative-but-unrun examples that "should work".
+- [ ] **Run every example / command / snippet of existing behavior** (or confirm CI runs
+      them) and confirm the documented result. Reject illustrative-but-unrun examples
+      that "should work".
+- [ ] In a `Status: proposed` design or specification, an example of a proposed command,
+      API or setting cannot run yet: check it against the proposed contract instead, and
+      check that it is visibly marked (for example "proposed, not runnable yet"). Never
+      require an implementation just to approve a design.
 
 ## FIT & COMPLETENESS
 - [ ] **Mode check** — the page is a single clean Diataxis mode (tutorial / how-to /
-      reference / explanation), not a hybrid that half-teaches and half-references.
+      reference / explanation), not a hybrid that half-teaches and half-references. A
+      design or specification document counts as explanation mode and may hold
+      requirements and alternatives.
 - [ ] **Audience & goal** — clear and consistent; the content serves that reader.
 - [ ] **Completeness for the stated task** — no missing step, prerequisite, edge case,
       or error path a real user would hit.

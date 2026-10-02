@@ -2,8 +2,9 @@
 name: craft-code
 description: >-
   Write the smallest, simplest, most readable correct change that matches the
-  surrounding codebase. Use when implementing a feature, fixing a bug, or
-  refactoring production code. Do NOT use for writing tests (use test-coverage),
+  surrounding codebase. Use when implementing a feature, fixing a bug,
+  refactoring production code, or writing interface text (labels, buttons, empty
+  states, error messages, tooltips). Do NOT use for writing tests (use test-coverage),
   reviewing an existing diff (use review-code), or documentation (use write-docs).
 reviewed-against: "0.43"
 category: production
@@ -55,7 +56,8 @@ Work the checklist top to bottom; don't skip the AFTER gate.
       kind C).
 - [ ] Interface text (labels, buttons, empty states, error messages, tooltips): as
       short as possible, say what the person can do next, never blame the reader, and
-      never show a secret. Hide internal paths only from public or unauthorized readers
+      never show a secret or someone else's data (a person's own data on their own
+      screen is fine). Hide internal paths only from public or unauthorized readers
       (a public page, a remote error response); a local diagnostic keeps the path when it
       helps the person fix the problem (../_shared/references/plain-language.md, kind D).
 - [ ] Handle errors **by expectedness**: fail fast on programmer bugs; exceptions for

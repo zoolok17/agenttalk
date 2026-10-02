@@ -36,8 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   What you will notice: new and changed documents start with a plain summary,
   and new comments and on-screen text read more plainly. Existing documents
-  are not rewritten just to change their voice. Nothing to do: the guide is
-  installed with the other skills by `agenttalk install-skills`.
+  are not rewritten just to change their voice.
+
+  What you need to do: on a fresh install, `agenttalk install-skills` installs
+  the guide with the other skills. On an existing install, a plain
+  `agenttalk install-skills` is not enough: it leaves alone every skill file
+  that differs from the new version, so the updated writing skills would not
+  arrive. Preview with `agenttalk install-skills --dry-run --force`, back up
+  any local edits you want to keep, then run `agenttalk install-skills --force`.
 
   Technical details: `src/agenttalk/skills/devkit/_shared/references/plain-language.md`
   (kinds A to D plus an out-of-scope rule for agent text). `write-docs` now

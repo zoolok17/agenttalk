@@ -2,15 +2,17 @@
 name: write-docs
 description: >-
   Write or update documentation as a first-class artifact — one Diataxis mode per
-  page, audience named, examples runnable, zero drift from the code, in the shared
-  plain-language voice. Use when writing or updating a README, guide, reference,
-  manual, specification, design document, or any user-facing doc, or when a code
-  change alters how users build/configure/call the software. Do NOT use for inline
-  code comments (use craft-code) or for reviewing existing docs (use review-docs).
+  page, audience named, examples of current behavior runnable, zero drift from the
+  code, in the shared plain-language voice. Use when writing or updating a README,
+  guide, reference, manual, specification, design document, or any user-facing doc,
+  or when a code change alters how users build/configure/call the software.
+  Do NOT use for inline code comments (use craft-code) or for reviewing existing
+  docs (use review-docs).
 reviewed-against: "0.43"
 category: production
 evidence-profile:
   - production-handoff
+  - planning-artifact
 ---
 
 # write-docs
@@ -31,6 +33,9 @@ write-for-humans instead.
       - **How-to guide** — a recipe to achieve one goal for a competent user.
       - **Reference** — neutral, exhaustive facts that mirror the code's structure.
       - **Explanation** — the why: concepts, trade-offs, background.
+      A design or specification document counts as explanation mode: it may hold
+      requirements, alternatives and trade-offs without becoming a tutorial or
+      reference hybrid.
 - [ ] Name the **audience** (user / integrator / contributor / operator) and their
       single goal at the top. Include only what serves that reader.
 
@@ -70,7 +75,10 @@ write-for-humans instead.
       clearly (a `Status: proposed` line near the top, and "will" / "proposed"
       wording), and never present an unimplemented proposal as existing behavior.
       What it says about how the software works today must still match the code.
-- [ ] Run / confirm the examples produce the documented output.
+- [ ] Run / confirm the examples of existing behavior produce the documented output. In
+      a proposed design or specification, mark each example of proposed behavior
+      "proposed, not runnable yet" and keep it consistent with the proposal; it is not
+      run until the proposal is built.
 - [ ] Pass the local docs-as-code gates if present (markdownlint, a prose/terminology
       linter like Vale, a link checker) before declaring done.
 
@@ -89,3 +97,9 @@ Required fields:
 - `residual_risk`
 - `required_review_lenses`
 - `evidence`
+
+For a proposed design or specification (`Status: proposed`, with nothing implemented in
+the same change), emit the planning-artifact profile instead: artifact_type, scope,
+decision or proposal, assumptions, alternatives, risks, required_reviews, open_questions
+and evidence (same reference). It never carries status=approved. The production-handoff
+profile above stays for documentation that ships with an implementation.

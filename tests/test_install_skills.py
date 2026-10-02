@@ -738,7 +738,7 @@ def test_internal_paths_are_hidden_by_audience_and_secrets_everywhere() -> None:
     """Secrets are never shown; internal paths are hidden only from public or unauthorized
     readers, so a local diagnostic keeps the detail that lets the person fix the problem."""
     core = _flat(_voice().split("\n## Core rules", 1)[1].split("\n## ", 1)[0])
-    assert "secrets (passwords, keys, tokens) and private or customer data are removed from every text" in core
+    assert "secrets (passwords, keys, tokens) are removed from every text, whoever reads it" in core
     assert "removed from anything a public or unauthorized audience sees" in core
     assert "Local diagnostics and private run guides keep the path" in core
     assert "never forces a choice between saying what to do next and keeping something private" in core
@@ -750,3 +750,72 @@ def test_internal_paths_are_hidden_by_audience_and_secrets_everywhere() -> None:
     craft = _flat((SKILLS_ROOT / "devkit" / "craft-code" / "SKILL.md").read_text(encoding="utf-8"))
     assert "Hide internal paths only from public or unauthorized readers" in craft
     assert "a local diagnostic keeps the path" in craft
+
+
+def _devkit(skill: str) -> str:
+    return (SKILLS_ROOT / "devkit" / skill / "SKILL.md").read_text(encoding="utf-8")
+
+
+def test_proposed_examples_are_checked_against_the_proposal_not_run() -> None:
+    """A design must be approvable before anything is built, so only examples of existing
+    behavior must run; a proposed example is marked and checked against the proposal."""
+    review = _flat(_devkit("review-docs"))
+    assert "**Run every example / command / snippet of existing behavior**" in review
+    assert "check it against the proposed contract instead" in review
+    assert '"proposed, not runnable yet"' in review
+    assert "Never require an implementation just to approve a design." in review
+    docs = _flat(_devkit("write-docs"))
+    assert "Run / confirm the examples of existing behavior produce the documented output." in docs
+    assert '"proposed, not runnable yet"' in docs
+    assert 'An example of proposed behavior is marked "proposed, not runnable yet"' in _flat(_kind("B"))
+
+
+def test_own_data_stays_but_pasted_records_and_others_data_never() -> None:
+    core = _flat(_voice().split("\n## Core rules", 1)[1].split("\n## ", 1)[0])
+    assert "and so is anyone else's private data" in core
+    assert "real private or customer records pasted into prose, examples, logs or public pages" in core
+    assert "product data shown on purpose to the signed-in person it belongs to stays" in core
+    assert "`Your delivery address is {customer.address}` is correct" in core
+    assert "Show a person their own data where that is the screen's purpose, never someone else's." in _flat(
+        _kind("D"))
+    assert "never show a secret or someone else's data" in _flat(_devkit("craft-code"))
+
+
+def test_changelog_tells_existing_installs_to_force_refresh() -> None:
+    """A plain install-skills skips changed skill files on an existing install, so the entry
+    must give the dry-run, back-up and --force steps."""
+    repo = Path(__file__).resolve().parents[1]
+    unreleased = (repo / "CHANGELOG.md").read_text(encoding="utf-8").split("## [Unreleased]", 1)[1]
+    entry = _flat(unreleased.split("\n## [", 1)[0].split("- **One plain-language voice", 1)[1].split("\n- **", 1)[0])
+    assert "On an existing install, a plain `agenttalk install-skills` is not enough" in entry
+    assert "Preview with `agenttalk install-skills --dry-run --force`" in entry
+    assert "back up any local edits you want to keep" in entry
+    assert "then run `agenttalk install-skills --force`" in entry
+    assert "Nothing to do: the guide is installed" not in entry
+
+
+def test_write_docs_emits_planning_evidence_for_proposed_designs() -> None:
+    from agenttalk.skill_currency import _frontmatter_profiles, _parse_skill_stub
+
+    text = _devkit("write-docs")
+    assert _frontmatter_profiles(text) == ["production-handoff", "planning-artifact"]
+    assert _parse_skill_stub(text)[0] == "production-handoff"
+    evidence = _flat(text.split("\n## Evidence", 1)[1])
+    assert "emit the planning-artifact profile instead" in evidence
+    for field in ("assumptions", "alternatives", "open_questions", "required_reviews"):
+        assert field in evidence
+    assert "stays for documentation that ships with an implementation" in evidence
+
+
+def test_design_documents_count_as_explanation_mode() -> None:
+    assert ("A design or specification document counts as explanation mode: it may hold requirements, "
+            "alternatives and trade-offs without becoming a tutorial or reference hybrid.") in _flat(
+                _devkit("write-docs"))
+    assert "A design or specification document counts as explanation mode" in _flat(_devkit("review-docs"))
+
+
+def test_craft_code_triggers_on_interface_text() -> None:
+    """The routing index is not loaded first, so craft-code's own description must name
+    interface-copy work for kind D to be found."""
+    description = _flat(_devkit("craft-code").split("description: >-", 1)[1].split("\nreviewed-against:", 1)[0])
+    assert "or writing interface text (labels, buttons, empty states, error messages, tooltips)" in description
