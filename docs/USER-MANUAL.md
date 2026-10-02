@@ -279,8 +279,18 @@ Typed response status is strict:
   requester.
 - `proposal-response`: `accepted`, `rejected`, or `countered`; all three are
   terminal for that proposal.
+- `task-response`: `done` or `declined` closes the task; `accepted` keeps it
+  open. When the `status` key is absent, a non-empty `verdict` also closes it,
+  including `GO` and `FIX`. An explicit status always takes precedence.
 
-A missing status remains readable in old history but does not close a thread.
+A task closing means it was answered, not that the work passed review or its
+gates. Unread replies still appear as `reply-waiting`, and a new task on the
+same request ID reopens the conversation. This rule applies to old messages too.
+`reply --kind task-response` with neither status nor verdict warns on stderr
+that the task stays open; use `--meta status=done` to mark completion.
+
+For the other typed responses, a missing status remains readable in old history
+but does not close a thread.
 An invalid present status is rejected on send/reply and skipped if encountered
 in persisted input.
 
@@ -1133,6 +1143,13 @@ Common cases:
   `agenttalk dead-letter show --agent <agent> --id <id>`. Requeue only when the cause is fixed, or
   mark handled with `dead-letter resolve`. Resolve also closes matching wrapper
   dead-letter notice escalations so they do not remain as phantom current work.
+  This includes warnings raised before the message entered the dead-letter sink.
+  It uses the existing correlated answer message; it does not label the notice
+  superseded. Repeating a completed resolution makes no further changes; if a
+  notice answer could not be sent, repeating the command retries that answer.
+  Every notice answer uses the recorded resolver, reason, and evidence, including
+  retries by a new liaison and purge preflight. If the recorded decision is
+  unavailable, notices stay open and the command explains why on stderr.
   Use `agenttalk dead-letter purge --resolved --from <liaison>` to archive old
   resolved payloads out of the live sink; archived rows are no longer requeueable
   by the live `dead-letter requeue` command unless restored.

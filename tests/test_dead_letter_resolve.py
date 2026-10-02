@@ -11,7 +11,11 @@ that reopens it). Resolution state survives reset (dispositions live under atten
 
 from __future__ import annotations
 
+import json
+import inspect
 from pathlib import Path
+
+import pytest
 
 from agenttalk import cli, doctor
 from agenttalk.store import Store
@@ -39,6 +43,28 @@ def _run(root: Path, *argv: str) -> int:
     return cli.main(["--root", str(root), *argv])
 
 
+@pytest.mark.parametrize("disposed", [False, True])
+def test_resolve_closes_notice_and_repeat_changes_nothing(tmp_path, disposed):
+    from agenttalk import threads
+    s = _store(tmp_path)
+    mid = _dead_letter(s)
+    emit = cli._dead_letter_notifier(s, "beta")
+    assert emit({"msg_id": mid, "agent": "beta", "from": "claude", "kind": "message",
+                 "attempts": 3, "failure_class": "poison_eligible"}, disposed=disposed)
+    notice = next(m for m in s.valid_messages() if m.kind == "question")
+    rid = notice.meta["request_id"]
+    command = ("dead-letter", "resolve", "--from", "claude", "--agent", "beta", "--id", mid,
+               "--reason", "handled out of band")
+    assert _run(tmp_path, *command) == 0
+    rows = threads.derive_threads(s.valid_messages(), agent="claude", cursor="")
+    assert next(t for t in rows if t.request_id == rid).operator_state == "answered"
+    # Include sidecars, the audit log, bus, and cursor state in the no-op check.
+    before = {p.relative_to(s.dir): p.read_bytes() for p in s.dir.rglob("*") if p.is_file()}
+    assert _run(tmp_path, *command) == 0
+    after = {p.relative_to(s.dir): p.read_bytes() for p in s.dir.rglob("*") if p.is_file()}
+    assert before == after
+
+
 def test_resolve_requires_liaison_authority(tmp_path: Path) -> None:
     s = _store(tmp_path)
     mid = _dead_letter(s)
@@ -47,6 +73,43 @@ def test_resolve_requires_liaison_authority(tmp_path: Path) -> None:
               "--agent", "beta", "--id", mid, "--reason", "not authorized")
     assert rc == 2
     assert cli._dead_letter_resolution_state(s).get(("beta", mid)) is None
+
+
+def test_resolve_retries_only_pending_notices_without_rewriting_decision(tmp_path, monkeypatch):
+    from agenttalk import attention, threads
+    s = _store(tmp_path)
+    mid = _dead_letter(s)
+    emit = cli._dead_letter_notifier(s, "beta")
+    info = {"msg_id": mid, "agent": "beta", "from": "claude", "kind": "message",
+            "attempts": 3, "failure_class": "poison_eligible"}
+    assert emit(info, disposed=False)
+    assert emit(info, disposed=True)
+    assert emit(dict(info, msg_id="unrelated"), disposed=False)
+    pending = [m for m in s.valid_messages() if m.kind == "question" and m.meta["dl_msg_id"] == mid]
+    assert len(pending) == 2
+    command = ("dead-letter", "resolve", "--from", "claude", "--agent", "beta", "--id", mid,
+               "--reason", "handled")
+    real_send = Store.send
+
+    def interrupted_send(store, **kwargs):
+        if kwargs.get("meta", {}).get("request_id") == pending[1].meta["request_id"]:
+            raise OSError("notice publication interrupted")
+        return real_send(store, **kwargs)
+
+    monkeypatch.setattr(Store, "send", interrupted_send)
+    assert _run(tmp_path, *command) == 0
+    decisions = attention.read_dispositions(s)
+    sidecar = (s.dead_letter_dir / "beta" / f"{mid}.resolved.json").read_bytes()
+    monkeypatch.setattr(Store, "send", real_send)
+    assert _run(tmp_path, *command) == 0
+    assert attention.read_dispositions(s) == decisions
+    assert (s.dead_letter_dir / "beta" / f"{mid}.resolved.json").read_bytes() == sidecar
+    answers = [m for m in s.valid_messages() if m.meta.get("dead_letter_resolved") == "true"]
+    assert len(answers) == 2
+    assert {m.meta["request_id"] for m in answers} == {m.meta["request_id"] for m in pending}
+    rows = threads.derive_threads(s.valid_messages(), agent="claude", cursor="")
+    assert sum(t.operator_state == "answered" for t in rows) == 2
+    assert sum(t.operator_state == "pending" for t in rows) == 1
 
 
 def test_resolve_requires_reason(tmp_path: Path) -> None:
@@ -58,6 +121,216 @@ def test_resolve_requires_reason(tmp_path: Path) -> None:
               "--agent", "beta", "--id", mid, "--reason", "   ")
     assert rc == 2
     assert cli._dead_letter_resolution_state(s).get(("beta", mid)) is None
+
+
+@pytest.mark.parametrize("operation", ["resolve", "purge"])
+@pytest.mark.parametrize("notice_target", ["claude", "liaison-b"])
+def test_notice_closure_preserves_recorded_actor_across_callers(tmp_path, monkeypatch, operation, notice_target):
+    from agenttalk import attention as A, threads
+    s = Store(tmp_path)
+    s.init(["claude", "beta", "liaison-b"])
+    s.set_operator_facing(notice_target)
+    mid = _dead_letter(s)
+    assert cli._dead_letter_notifier(s, "beta")({
+        "msg_id": mid, "agent": "beta", "from": "claude", "kind": "message",
+        "attempts": 3, "failure_class": "poison_eligible",
+    }, disposed=False)
+    s.set_operator_facing("claude")
+    real_send = Store.send
+
+    def interrupted_send(store, **kwargs):
+        if kwargs.get("meta", {}).get("dead_letter_resolved") == "true":
+            raise OSError("notice send failed")
+        return real_send(store, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Store, "send", interrupted_send)
+        assert _run(tmp_path, "dead-letter", "resolve", "--from", "claude", "--agent", "beta", "--id", mid,
+                    "--reason", "original decision", "--evidence", "original evidence") == 0
+    before = A.dispositions_path(s).read_bytes()
+    s.set_operator_facing("liaison-b")
+    if operation == "resolve":
+        assert _run(tmp_path, "dead-letter", "resolve", "--from", "liaison-b", "--agent", "beta", "--id", mid,
+                    "--reason", "original decision", "--evidence", "original evidence") == 0
+    else:
+        assert _run(tmp_path, "dead-letter", "purge", "--resolved", "--from", "liaison-b") == 0
+    answers = [m for m in s.valid_messages() if m.meta.get("dead_letter_resolved") == "true"]
+    assert len(answers) == 1
+    answer = answers[0]
+    assert answer.sender == notice_target  # answer the original question's thread
+    assert answer.meta["operator_origin"] == "claude"
+    assert answer.meta["dead_letter_evidence"] == "original evidence"
+    assert answer.body == f"Dead-letter beta/{mid} was resolved by claude: original decision"
+    assert A.dispositions_path(s).read_bytes() == before
+    rows = threads.derive_threads(s.valid_messages(), agent=notice_target, cursor="")
+    assert next(t for t in rows if t.opener_kind == "question").operator_state == "answered"
+
+
+def test_notice_closure_without_recorded_resolution_does_nothing(tmp_path, capsys):
+    s = _store(tmp_path)
+    mid = _dead_letter(s)
+    assert cli._dead_letter_notifier(s, "beta")({
+        "msg_id": mid, "agent": "beta", "from": "claude", "kind": "message",
+        "attempts": 3, "failure_class": "poison_eligible",
+    }, disposed=False)
+    before = s.valid_messages()
+    # A sidecar alone cannot supply attribution; only the central decision counts.
+    (s.dead_letter_dir / "beta" / f"{mid}.resolved.json").write_text(
+        json.dumps({"actor": "claude", "reason": "sidecar only"}), encoding="utf-8",
+    )
+    recorded = cli._recorded_dead_letter_resolution(s, agent="beta", msg_id=mid)
+    assert recorded is None
+    assert cli._close_dead_letter_notice_threads(s, agent="beta", msg_id=mid, resolution=recorded) == 0
+    assert s.valid_messages() == before
+    assert "no recorded resolution" in capsys.readouterr().err
+
+
+def test_notice_closure_signature_cannot_accept_call_site_attribution():
+    parameters = inspect.signature(cli._close_dead_letter_notice_threads).parameters
+    assert set(parameters) == {"store", "agent", "msg_id", "resolution"}
+    assert not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+
+
+def test_resolve_then_purge_notice_to_retired_liaison(tmp_path, monkeypatch, capsys):
+    from agenttalk import threads
+    s = Store(tmp_path)
+    s.init(["claude", "beta", "liaison-b"])
+    s.set_operator_facing("liaison-b")
+    mid = _dead_letter(s)
+    assert cli._dead_letter_notifier(s, "beta")({
+        "msg_id": mid, "agent": "beta", "from": "claude", "kind": "message",
+        "attempts": 3, "failure_class": "poison_eligible",
+    }, disposed=False)
+    notice = next(m for m in s.valid_messages() if m.kind == "question")
+    s.set_operator_facing("claude")
+    s.retire_agent("liaison-b", reason="handoff")
+    real_send = Store.send
+
+    def no_retired_send(store, **kwargs):
+        assert kwargs.get("sender") != "liaison-b", "must not try a retired sender"
+        return real_send(store, **kwargs)
+
+    monkeypatch.setattr(Store, "send", no_retired_send)
+    capsys.readouterr()
+    assert _run(tmp_path, "dead-letter", "resolve", "--from", "claude", "--agent", "beta", "--id", mid,
+                "--reason", "handled") == 0
+    diagnostic = f"notice {notice.id} was addressed to retired liaison-b; nothing to close"
+    output = capsys.readouterr()
+    assert len(output.err.splitlines()) == 1 and diagnostic in output.err
+    assert _run(tmp_path, "dead-letter", "purge", "--resolved", "--from", "claude") == 0
+    output = capsys.readouterr()
+    assert len(output.err.splitlines()) == 1 and diagnostic in output.err
+    assert s.list_dead_letters("beta") == []
+    assert not any(m.meta.get("dead_letter_resolved") for m in s.valid_messages())
+    # Report-only observation requested by the lead: general thread derivation
+    # still leaves this point-to-point operator question open for its sender.
+    rows = threads.derive_threads(s.valid_messages(), agent="beta", cursor=notice.id,
+                                  retired=set(s.retired_agents()))
+    row = next(t for t in rows if t.request_id == notice.meta["request_id"])
+    assert row.state == "open-outbound"
+
+
+@pytest.mark.parametrize("failure", [OSError("disk unavailable\ntry later"), ValueError("send rejected")])
+def test_notice_send_failure_reports_notice_and_error(tmp_path, monkeypatch, capsys, failure):
+    s = _store(tmp_path)
+    mid = _dead_letter(s)
+    assert cli._dead_letter_notifier(s, "beta")({
+        "msg_id": mid, "agent": "beta", "from": "claude", "kind": "message",
+        "attempts": 3, "failure_class": "poison_eligible",
+    }, disposed=False)
+    notice = next(m for m in s.valid_messages() if m.kind == "question")
+
+    def fail_send(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(Store, "send", fail_send)
+    capsys.readouterr()
+    assert _run(tmp_path, "dead-letter", "resolve", "--from", "claude", "--agent", "beta", "--id", mid,
+                "--reason", "handled") == 0
+    output = capsys.readouterr()
+    assert len(output.err.splitlines()) == 1
+    assert notice.id in output.err and " ".join(str(failure).splitlines()) in output.err
+    assert not any(m.meta.get("dead_letter_resolved") for m in s.valid_messages())
+
+
+def test_purge_refuses_when_recorded_resolution_is_unavailable(tmp_path, monkeypatch, capsys):
+    s = _store(tmp_path)
+    mid = _dead_letter(s)
+    assert _run(tmp_path, "dead-letter", "resolve", "--from", "claude", "--agent", "beta", "--id", mid,
+                "--reason", "handled") == 0
+    before = s.valid_messages()
+    monkeypatch.setattr(cli, "_recorded_dead_letter_resolution", lambda *args, **kwargs: None)
+    assert _run(tmp_path, "dead-letter", "purge", "--resolved", "--from", "claude") == 2
+    assert "no recorded resolution" in capsys.readouterr().err
+    assert s.read_dead_letter_payload("beta", mid) is not None
+    assert s.valid_messages() == before
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["interrupted-send", "old-resolution"])
+@pytest.mark.parametrize("retry_reason,retry_evidence,warns", [
+    ("transient network blip", "original-log", False),
+    ("confirmed fixed upstream", "new-log", True),
+    ("transient network blip", "new-log", True),
+])
+def test_resolve_retry_uses_recorded_resolution(
+    tmp_path, monkeypatch, capsys, legacy, retry_reason, retry_evidence, warns,
+):
+    from agenttalk import attention as A, threads
+    s = _store(tmp_path)
+    mid = _dead_letter(s)
+    assert cli._dead_letter_notifier(s, "beta")({
+        "msg_id": mid, "agent": "beta", "from": "claude", "kind": "message",
+        "attempts": 3, "failure_class": "poison_eligible",
+    }, disposed=False)
+    side = s.dead_letter_dir / "beta" / f"{mid}.resolved.json"
+    command = ("dead-letter", "resolve", "--from", "claude", "--agent", "beta", "--id", mid)
+    if legacy:
+        # On-disk shape written by the resolver before #277: a durable decision
+        # and sidecar, with the early (dl_disposed=false) notice still unanswered.
+        entry = next(m for m in s.list_dead_letters("beta") if m["message_id"] == mid)
+        source_hash = A.dead_letter_entry_source_hash(entry)
+        resolution = {
+            "event_id": "att-old-resolution", "actor": "claude",
+            "reason": "transient network blip", "evidence": "original-log",
+            "at": "2026-10-01T00:00:00Z",
+        }
+        A.append_disposition(s, {
+            **resolution, "schema_version": A.SCHEMA_VERSION,
+            "item_id": A.item_id(A.SOURCE_DEAD_LETTER, "beta", mid),
+            "source": A.SOURCE_DEAD_LETTER, "action": A.ACTION_RESOLVE_DEAD_LETTER,
+            "source_snapshot": {"source_hash": source_hash,
+                                "refs": [{"kind": "dead_letter", "agent": "beta", "message_id": mid}]},
+        })
+        side.write_text(json.dumps(dict(resolution, source_hash=source_hash)), encoding="utf-8")
+    else:
+        real_send = Store.send
+
+        def interrupted_send(store, **kwargs):
+            if kwargs.get("meta", {}).get("dead_letter_resolved") == "true":
+                raise OSError("notice publication interrupted")
+            return real_send(store, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Store, "send", interrupted_send)
+            assert _run(tmp_path, *command, "--reason", "transient network blip",
+                        "--evidence", "original-log") == 0
+    assert not any(m.meta.get("dead_letter_resolved") for m in s.valid_messages())
+    before = A.dispositions_path(s).read_bytes(), side.read_bytes()
+    capsys.readouterr()
+    assert _run(tmp_path, *command, "--reason", retry_reason, "--evidence", retry_evidence) == 0
+    output = capsys.readouterr()
+    answers = [m for m in s.valid_messages() if m.meta.get("dead_letter_resolved") == "true"]
+    assert len(answers) == 1
+    assert answers[0].body.endswith(": transient network blip")
+    assert answers[0].meta["dead_letter_evidence"] == "original-log"
+    if warns:
+        assert len(output.err.splitlines()) == 1
+        assert "recorded reason/evidence" in output.err
+    else:
+        assert output.err == ""
+    assert (A.dispositions_path(s).read_bytes(), side.read_bytes()) == before
+    rows = threads.derive_threads(s.valid_messages(), agent="claude", cursor="")
+    assert next(t for t in rows if t.opener_kind == "question").operator_state == "answered"
 
 
 def test_resolve_hides_from_default_list_and_doctor(tmp_path: Path) -> None:

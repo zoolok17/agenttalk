@@ -133,6 +133,25 @@ def test_row4_unresolved_fix_or_active_fix_task_is_fix_round():
     assert card(bus)["reason"] == "fix accepted"
 
 
+def test_verdict_only_completion_does_not_turn_fix_into_ready():
+    bus = Bus()
+    build = bus.task("tk-build", BUILDER, "build", **POLICY)
+    bus.add(BUILDER, LEAD, "task-response", {
+        "in_reply_to": build.id, "request_id": "tk-build", "verdict": "done",
+    })
+    read = bus.task("tk-read", REVIEWER, "read", work_head=HEAD)
+    bus.add(REVIEWER, LEAD, "task-response", {
+        "in_reply_to": read.id, "request_id": "tk-read", "verdict": "FIX",
+    })
+    assert card(bus)["workflow_column"] == "fix_round"
+    reread = bus.task("tk-reread", REVIEWER, "delta", work_head=HEAD2, supersedes="tk-read")
+    bus.add(REVIEWER, LEAD, "task-response", {
+        "in_reply_to": reread.id, "request_id": "tk-reread", "verdict": "GO",
+    })
+    assert card(bus)["workflow_column"] == "ready"
+    assert card(bus, integrated={(ITEM, HEAD2): True})["workflow_column"] == "done"
+
+
 def test_row5_accepted_or_running_build_is_building():
     bus = Bus()
     build = bus.task("tk-build", BUILDER, "build", **POLICY)
@@ -1094,7 +1113,8 @@ def test_property_never_raises_and_rejected_history_never_certifies():
                     if item["work_item"] in affected:
                         assert not (item["workflow_column"] == "ready" or clean_done(item)), (
                             item["work_item"], item["reason"])
-    assert (total, rejected, equivalent) == (5700, 3654, 715)  # 715 clean Done == integrated Ready pairs
+    # Removing status from 36 otherwise-valid verdict replies now still completes them (#277).
+    assert (total, rejected, equivalent) == (5700, 3654, 751)
 
 
 def test_replayed_opener_invariants_reach_the_original_item():

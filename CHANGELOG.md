@@ -171,6 +171,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Answered tasks stop looking unfinished.** Previously, replies that gave a
+  verdict without a separate completion status left conversations open. They
+  now count as answers, including older replies; an explicit in-progress status
+  still keeps the task open. A reply with neither field warns how to close it.
+  Resolving a dead letter also answers its earlier warning notices, and repeating
+  a completed resolution makes no further changes. No cleanup command is needed
+  for answered tasks. Technical details: #277; warnings go to stderr only.
+
 - **Windows CI going red on four unrelated tests, each a different one each
   time (since 2026-10-01).** A loaded Windows CI runner can take longer than
   a couple of seconds just to START the `git` process (process creation,

@@ -58,7 +58,8 @@ from agenttalk.store import (
 #                                       ping-pong, not a single response)
 #   proposal       -> proposal-response (accepted/rejected/countered all close)
 #   question       -> message/note      (the first answer closes it)
-#   task           -> task-response     (declined/done close; accepted keeps
+#   task           -> task-response     (declined/done or verdict without status close;
+#                                        accepted keeps
 #                                        the ball on the assignee - they still
 #                                        owe the actual completion)
 ACTIONABLE_STATES = ("reply-waiting", "owed-inbound", "open-outbound")
@@ -103,6 +104,8 @@ def _classify_event(opener_kind: str, m: Message, requester: str, responder: str
                 return ("ball", responder)   # acked, still on the hook to finish
             if meta.get("status") in TERMINAL_RESPONSE_STATUSES["task-response"]:
                 return ("terminal", None)    # declined / done
+            if "status" not in meta and isinstance(meta.get("verdict"), str) and meta["verdict"].strip():
+                return ("terminal", None)    # answered, including FIX; not necessarily successful
         return None
     if opener_kind == "question":
         # A question is open-ended: ANY non-control response from the asked
