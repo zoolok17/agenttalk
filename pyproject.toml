@@ -69,7 +69,6 @@ include = [
     "/SECURITY.md",
     "/docs/AGENT-MANUAL.md",
     "/docs/AGENTTALK-NEW-USER-MANUAL.md",
-    "/docs/AGENTTALK-NEW-USER-MANUAL.pdf",
     "/docs/ASSURANCE.md",
     "/docs/DASHBOARD-CONTROL-PLANE-DESIGN-HISTORY.md",
     "/docs/DESIGN.md",

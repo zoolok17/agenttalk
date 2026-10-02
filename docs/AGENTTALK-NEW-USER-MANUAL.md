@@ -1,5 +1,14 @@
 # agenttalk new-user manual
 
+**In plain words:** this manual explains how agenttalk works and how to run it
+day to day. It is for the people who set up and look after AI coding agents
+working together, whether that is one pair or a larger team. It starts with the
+ideas you need first, then walks through installing, the first two-agent
+workflow, and the tools for teams: the dashboard, supervision, ownership,
+review evidence and recovery. Read chapters 1 to 6 in order to get started, and
+use the rest as a reference. This Markdown file is the manual; the old PDF copy
+was out of date and is no longer shipped.
+
 Audience: new operators and technical leads adopting agenttalk for a local
 coding-agent pair or team.
 
@@ -7,17 +16,22 @@ Goal: understand the system first, then operate it safely: messaging,
 thread states, dashboard views, skills, workflows, supervision, lanes,
 knowledge, gates, close records, and recovery.
 
-Last updated: 2026-07-12. Current release baseline: v0.74.0.
+Last updated: 2026-10-02, when the opening and the first steps (chapters 3 and
+6) were checked against v0.95.0. The other chapters were last reviewed as a
+whole for v0.74.0 and have been updated piece by piece since.
 
-agenttalk is a local, file-backed coordination platform for coding-agent CLIs
-such as Claude Code and Codex. It lets separate agent windows talk directly,
-track who owes the next move, route human decisions through one liaison, and
-record evidence for reviews and releases.
+agenttalk is a local coordination tool for coding agents that run as
+command-line tools (CLIs), such as Claude Code and Codex. Everything it records
+is kept in files inside your project. It lets separate agent windows talk to
+each other directly, keeps track of who owes the next move, sends decisions
+that need a person through one agent (the liaison), and records the evidence
+behind reviews and releases.
 
-agenttalk is not a sandbox, a malicious-peer defense, an enterprise auth
-system, or an autonomous project manager. It makes disciplined teamwork visible
-and auditable. Git, the OS, CI, and the human operator remain the real authority
-boundaries.
+agenttalk is not a sandbox, a defense against a malicious agent on the team, a
+company sign-in and permissions system, or a project manager that runs on its
+own. It makes disciplined teamwork visible and checkable afterwards. Git, the
+operating system, the automatic checks (CI) and the human operator remain the
+real authority boundaries.
 
 ## 1. Read this first
 
@@ -90,15 +104,27 @@ Keep these rules in mind before learning commands.
 
 ## 3. Install and initialize
 
-Install from a pinned release:
+Install from a pinned release. The first line installs agenttalk, the second
+shows which version you have, and the third installs the skills: the
+instructions each agent CLI reads to use agenttalk.
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.74.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.95.0"
 agenttalk --version
 agenttalk install-skills
 ```
 
-Initialize a project from the repository root:
+Pin a released tag (`@v0.95.0` here, or whatever the current release is)
+rather than a branch, so every agent in a project runs the same version.
+
+When you upgrade an existing install, a plain `agenttalk install-skills`
+leaves alone every skill file that differs from the new version, so updated
+skills would not arrive. Preview with
+`agenttalk install-skills --dry-run --force`, back up any local edits you want
+to keep, then run `agenttalk install-skills --force`.
+
+Set up a project once, from its top folder (the repository root). `status` and
+`doctor` then confirm the setup:
 
 ```powershell
 agenttalk init --here --agents claude,codex
@@ -260,21 +286,26 @@ Exit `0` means current. Exit `3` means superseded. Exit `4` means unknown.
 
 ## 6. First workflow: two agents
 
+This short exercise checks that two agents can reach each other: `claude`
+asks `codex` a question, `codex` reads it and answers on the same request, and
+`claude` then catches up on what happened.
+
 1. Start one terminal per agent in the project root.
-2. Confirm identity:
+2. Confirm that each terminal knows which agent it is:
 
    ```powershell
    agenttalk whoami --for claude
    agenttalk whoami --for codex
    ```
 
-3. Send a tracked question:
+3. Send a tracked question. The `request_id` is the label the answer will
+   point back to:
 
    ```powershell
    agenttalk send --from claude --to codex --kind question --subject first-check --meta request_id=q-first-check -m "Can you see this?"
    ```
 
-4. Consume it:
+4. Read it as `codex`. `drain` marks the message as read for that agent:
 
    ```powershell
    agenttalk drain --for codex
@@ -286,7 +317,8 @@ Exit `0` means current. Exit `3` means superseded. Exit `4` means unknown.
    agenttalk reply --from codex --to-request q-first-check -m "Yes."
    ```
 
-6. Rejoin after any restart:
+6. Catch up after any restart. `sync` and `threads` only read; they show
+   what happened and who owes the next move:
 
    ```powershell
    agenttalk sync --for claude

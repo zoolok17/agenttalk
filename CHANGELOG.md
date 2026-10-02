@@ -53,6 +53,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   routing index gains a row for interface text. `write-for-humans`' trigger is
   unchanged. Tests in `tests/test_install_skills.py`.
 
+### Changed
+
+- **The README and the new-user manual now open in plain words.** Both start
+  with a short "In plain words" summary of what agenttalk is, who it is for
+  and how to begin, and their first steps (what it is, how to install, the
+  first commands) are rewritten in everyday language. Every command, flag and
+  version stays exact. A few statements that were no longer true are corrected:
+  - the manual told new users to install v0.74.0 and called v0.74.0 its
+    current baseline; it now pins v0.95.0, like the README, and says honestly
+    which chapters were checked against it;
+  - the README said agenttalk makes no network calls. The bus still makes
+    none, but the optional model gateway relays agents' model calls, and the
+    `dev-gate` check installs and audits packages from PyPI; it now says so;
+  - the README's command table called `gateway` a "multi-agent process
+    gateway"; it is the managed model gateway.
+
+  The install steps also now say where the devkit goes and how to upgrade an
+  existing install. What you need to do: nothing.
+
+  Technical details: `README.md` and `docs/AGENTTALK-NEW-USER-MANUAL.md`
+  (opening, chapter 3 and chapter 6); tests in `tests/test_docs_plain_voice.py`.
+
+### Removed
+
+- **The PDF copy of the new-user manual (#260).** It was made once, for
+  version 0.74.0, and could not be rebuilt, so it had fallen about twenty
+  versions behind the Markdown manual without saying so. It is no longer in
+  the repository or in the source package. Read
+  `docs/AGENTTALK-NEW-USER-MANUAL.md` instead.
+
+  Technical details: removed from the `pyproject.toml` sdist include list. The
+  `dev-gate` package check (`dev-gate.json` and `src/agenttalk/dev_gate.py`,
+  `required_sdist_paths`) now requires the Markdown manual in the source
+  package instead of the PDF.
+
 ### Fixed
 
 - **Work orders no longer stall after an upgrade (#185, #201).**
