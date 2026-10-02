@@ -55,6 +55,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The README and the new-user manual now open in plain words.** Both start
+  with a short "In plain words" summary of what agenttalk is, who it is for
+  and how to begin, and their first steps (what it is, how to install, the
+  first commands) are rewritten in everyday language. Every command, flag and
+  version stays exact. A few statements that were no longer true are corrected:
+  - the manual told new users to install v0.74.0 and called v0.74.0 its
+    current baseline; it now pins v0.95.0, like the README, and says honestly
+    which chapters were checked against it;
+  - the README said agenttalk makes no network calls ("no egress"). The bus
+    still makes none, but some optional tools do. The README now lists its
+    built-in network integrations, each marked default or opt-in: the
+    managed model gateway's OVH endpoint; `dev-gate`'s dependency and
+    test-tool installs from PyPI, its live Semgrep rule sets and the PyPI
+    advisory database; and the assurance tool's OSV, pip-audit and remote
+    Semgrep, which its scan profile must allow. The assurance tool's
+    release-profile build is not gated by `network_allowed`: it can
+    download its build backend even when `network_allowed` allows nothing;
+  - the README and the manual said everything agenttalk records is in the
+    project. The coordination store is, but signing keys, backups, the
+    supervisor's wrapper logs, the gateway's secrets and spend ledger, and a
+    Codex settings block live in per-user folders by default. The README
+    now lists them and says that `agenttalk backup` does not include them;
+  - the README described the gateway as reaching "the provider you
+    configure" and called it a "multi-agent process gateway". It is the
+    managed model gateway, pinned in code to OVH AI Endpoints with the
+    Qwen3.8-27B model, and it refuses any other address or model;
+  - the README said `--claude-only` and `--codex-only` install "just one
+    side". They choose only which side gets the bus commands; the devkit
+    still goes to both sides unless you add `--no-devkit`.
+
+  The install steps also now say how to upgrade an existing install. What
+  you need to do: nothing.
+
+  Technical details: `README.md` and `docs/AGENTTALK-NEW-USER-MANUAL.md`
+  (opening, chapter 3 and chapter 6); tests in `tests/test_docs_plain_voice.py`.
+
+### Removed
+
+- **The PDF copy of the new-user manual (#260).** It was made once, for
+  version 0.74.0, and could not be rebuilt, so it had fallen about twenty
+  versions behind the Markdown manual without saying so. It is no longer in
+  the repository or in the source package. Read
+  `docs/AGENTTALK-NEW-USER-MANUAL.md` instead.
+
+  Technical details: removed from the `pyproject.toml` sdist include list. The
+  `dev-gate` package check (`dev-gate.json` and `src/agenttalk/dev_gate.py`,
+  `required_sdist_paths`) now requires the Markdown manual in the source
+  package instead of the PDF.
+
 - **The v2 console's on-screen text is now in plain words.** A copy pass
   applied the new plain-language guide (kind D) to every label, button,
   heading, empty state, error message and tooltip in the v2 console. A few
