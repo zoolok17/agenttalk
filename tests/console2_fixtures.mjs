@@ -73,7 +73,15 @@ export const ATT_ITEM = (o = {}) => ({
   } : {})),
 });
 
-export const attention = (items, o = {}) => ({ ok: o.ok !== false, asOfMs: o.asOfMs === undefined ? NOW : o.asOfMs, items });
+// active_count (build round #273, fix round 1): the server's pre-grouping
+// active total - defaults to items.length (the realistic value when nothing
+// is deferred/grouped/excluded); a test exercising a scenario where that
+// would differ from reality (grouping, a server stuck count distinct from
+// the client's own) passes an explicit override via o.active_count.
+export const attention = (items, o = {}) => ({
+  ok: o.ok !== false, asOfMs: o.asOfMs === undefined ? NOW : o.asOfMs, items,
+  active_count: o.active_count === undefined ? items.length : o.active_count,
+});
 
 export const chat = (messages, o = {}) => ({
   ok: true, asOfMs: NOW,

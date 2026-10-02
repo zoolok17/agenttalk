@@ -1057,7 +1057,10 @@ test('deferrals and snoozes are per team: uiFor gives each team its own', () => 
     nowMs: NOW, generatedMs: NOW, conn: CONN_OK, ui: {}, tz: TZ,
     uiFor: (id) => (id === 'a' ? { deferred: { 'same-id': NOW } } : {}),
   });
-  assert.deepEqual(shell.teams.map((t) => [t.label, t.needsCount]), [['agenttalk', 0], ['second', 1]]);
+  // F1 (build round #273, fix round 1): a LOCAL defer puts a card on the
+  // deferred line, but the server's active_count (what this badge shows)
+  // never reflects a per-browser Later - the item is still genuinely active.
+  assert.deepEqual(shell.teams.map((t) => [t.label, t.needsCount]), [['agenttalk', 1], ['second', 1]]);
   assert.equal(shell.teams[0].view.needs.deferredCount, 1);
 });
 

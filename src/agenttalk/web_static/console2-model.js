@@ -676,29 +676,43 @@
     var age = typeof item.age_seconds === 'number' && !item.age_unknown
       ? item.age_seconds + Math.max(0, (ctx.nowMs - ctx.attentionAsOfMs) / 1000) : null;
     var agent = typeof item.agent === 'string' && item.agent ? shortName(item.agent, ctx.project, ctx.teamIds, ctx.known) : '';
-    // Build round (#273): supervisor state is a CONTEXT label only - never a
-    // reason a HOLD was moved, demoted, or uncounted (it never is). Grouping
-    // compresses the DISPLAY only; every member past the preview stays
-    // reachable via the CLI line, not a new browser action. The overflow row
-    // stands for many agents at once and is never itself actionable.
-    var actionableAsGroup = item.actionable_as_group !== false;
+    // Build round (#273) fix round 1: supervisor state is a CONTEXT label
+    // only - never a reason a HOLD was moved, demoted, or uncounted (it
+    // never is). Dead-letter grouping is WEB-DISPLAY-ONLY (attention.py and
+    // the CLI/risk-register are ungrouped) and arrives as an explicit typed
+    // `group` object - never a string prefix sharing the id/dedupe_key
+    // namespace. A group/overflow card gets NO options (F1: a local
+    // defer/Later on an aggregate card would act as a disposition of every
+    // member it stands for, not just the one id it carries - see
+    // needsCard()/deferSelected() in console2.js, and the isDeferred/
+    // isAnswered bypass in buildTeamView below for a STALE per-letter Later
+    // that must not carry over once that letter becomes a representative).
+    var group = isObj(item.group) ? item.group : null;
     var notes = [];
     if (typeof item.supervisor_state === 'string' && item.supervisor_state) {
       notes.push(item.supervisor_state);
     }
-    var groupWeight = 1;
-    if (typeof item.group_member_count === 'number' && item.group_member_count > 0) {
-      groupWeight = item.group_member_count;
+    if (group && group.kind === 'dead_letter_group') {
+      var memberCount = typeof group.member_count === 'number' ? group.member_count : 0;
+      var moreCount = typeof group.more_count === 'number' ? group.more_count : 0;
       notes.push(
-        item.group_member_count + ' old failed messages from ' + (item.group_agent || 'this agent') +
-        (item.group_more_count ? ' (' + item.group_more_count + ' more not shown)' : ''));
-      var cliNote = str(item.group_cli_instructions, 600);
-      if (cliNote) notes.push(cliNote);
-    } else if (!actionableAsGroup && typeof item.overflow_member_total === 'number') {
-      groupWeight = item.overflow_member_total;
+        memberCount + ' old failed messages from ' + (str(group.agent, 80) || 'this agent') +
+        (moreCount ? ' (' + moreCount + ' more not shown)' : ''));
+      (Array.isArray(group.cli_instructions) ? group.cli_instructions : []).forEach(function (line) {
+        var l = str(line, 500);
+        if (l) notes.push(l);
+      });
+    } else if (group && group.kind === 'dead_letter_overflow') {
+      // F7: the full CLI recovery instruction, not just a descriptive sentence.
+      var agentCount = typeof group.agent_count === 'number' ? group.agent_count : 0;
+      var totalCount = typeof group.member_count === 'number' ? group.member_count : 0;
       notes.push(
-        item.overflow_member_total + ' old failed messages across ' + item.overflow_agent_count +
+        totalCount + ' old failed messages across ' + agentCount +
         ' more agents, active and counted but not shown as individual groups');
+      (Array.isArray(group.cli_instructions) ? group.cli_instructions : []).forEach(function (line) {
+        var l = str(line, 500);
+        if (l) notes.push(l);
+      });
     }
     return {
       id: str(item.id, 200) || (src + ':' + str(item.title, 60)),
@@ -708,8 +722,8 @@
       evidenceNote: notes.join(' · '),
       agent: agent, ageSeconds: age,
       ageLabel: age === null ? 'age unknown' : 'no deadline · waiting ' + fmtAge(age),
-      options: actionableAsGroup ? cardOptions(item, ctx.canAct === true) : [],
-      answerable: item.answerable === true, state: 'open', groupWeight: groupWeight
+      options: group ? [] : cardOptions(item, ctx.canAct === true),
+      answerable: item.answerable === true, state: 'open', group: group
     };
   }
 
@@ -1074,26 +1088,50 @@
     // Card ids come from a feed: only OWN keys count ("__proto__" is an id, not an inherited flag).
     var deferred = ui.deferred || {};
     var answered = ui.answered || {};
+    // F1 (build round #273, fix round 1): an aggregate card (group/overflow)
+    // is IMMUNE to local deferred/answered state. Grouping is recomputed
+    // fresh every poll, so the SAME id that was an ordinary card's own
+    // Later/answer yesterday can become a group's representative today - a
+    // stale per-letter entry must never carry over and suppress the whole
+    // group it now stands for (the reviewer's two-poll, seven-day-boundary
+    // regression this guards against).
     function isDeferred(c) {
+      if (c.group) return false;
       if (!hasOwn(deferred, c.id) || !deferred[c.id]) return false;
       return typeof deferred[c.id] === 'number' ? appliesTo(c, deferred[c.id]) : true;
     }
-    function isAnswered(id) { return hasOwn(answered, id) && !!answered[id]; }
+    function isAnswered(id, c) {
+      if (c && c.group) return false;
+      return hasOwn(answered, id) && !!answered[id];
+    }
     cards.forEach(function (c) {
-      if (isAnswered(c.id)) { c.state = 'answered'; view.needs.answered.push(c); }
+      if (isAnswered(c.id, c)) { c.state = 'answered'; view.needs.answered.push(c); }
       else if (isDeferred(c)) { view.needs.deferredCount += 1; }
       else view.needs.open.push(c);
     });
-    view.needs.deferredCards = cards.filter(function (c) { return isDeferred(c) && !isAnswered(c.id); });
-    // Build round (#273): one CARD can stand for several raw active items
-    // once dead-letter grouping compresses the display (groupWeight carries
-    // that count - 1 for every ordinary card). The visible card array stays
-    // exactly what's rendered; only this numeric "N needs you" tally must
-    // reflect the true active total, never the number of displayed cards.
-    var openCount = view.needs.open.reduce(function (sum, c) {
-      return sum + (typeof c.groupWeight === 'number' && c.groupWeight > 0 ? c.groupWeight : 1);
-    }, 0);
-    view.chip.needsCount = att && view.needs.available ? openCount : null;
+    view.needs.deferredCards = cards.filter(function (c) { return isDeferred(c) && !isAnswered(c.id, c); });
+    // F1: the loader keeps payload.active_count and uses it as the
+    // authoritative "needs you" total - deferred, overflow and low-severity
+    // members all stay counted there even though they are not all rendered
+    // as their own open card. Qualified on availability exactly like the
+    // card list itself (null, never a guessed number, on a failed/stale read).
+    //
+    // active_count already includes the SERVER's own stuck-item count
+    // (web.py's build_attention adds it on top of the attention queue's
+    // active total) - but this console ignores server "stuck" items
+    // entirely and derives its OWN, richer stuck cards from /api/state
+    // health evidence (see the "server's own stuck items are not shown as
+    // cards" rule above). Swap the server's stuck count for the client's
+    // own, so the badge reflects what this console actually decided is
+    // stuck, not a count it never renders.
+    var attentionItems = att && Array.isArray(att.items) ? att.items : [];
+    var serverStuckCount = attentionItems.filter(function (it) {
+      return isObj(it) && it.source === 'stuck';
+    }).length;
+    var clientStuckCount = cards.filter(function (c) { return c.kind === 'LOOKS STUCK'; }).length;
+    view.chip.needsCount = (att && view.needs.available && typeof att.active_count === 'number')
+      ? att.active_count - serverStuckCount + clientStuckCount
+      : null;
 
     // --- lead's latest message ---------------------------------------------------
     // The newest message stays visible, but what the chat feed is doing to it is said next
@@ -1183,9 +1221,14 @@
     } else if (!att) {
       view.mode = 'loading';
       view.greeting = greetingFor('loading', {});
-    } else if (openCount > 0) {
+    } else if (view.needs.open.length > 0) {
+      // F1: "busy" is gated on there being an OPEN card to show (unrelated to
+      // the badge's total) - a day where EVERY card is locally deferred still
+      // falls through to the 'deferred' greeting below, even though the
+      // authoritative active_count (what the badge displays while busy) never
+      // drops just because this browser put something off.
       view.mode = 'busy';
-      view.greeting = greetingFor('busy', { n: openCount });
+      view.greeting = greetingFor('busy', { n: view.chip.needsCount });
     } else if (view.needs.answered.length > 0) {
       view.mode = 'answered';
       view.greeting = greetingFor('answered', {});

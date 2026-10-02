@@ -43,6 +43,50 @@ with nothing about its urgency softened, its count, or its individual actionabil
 - This feature adds no new suppression or clearance; existing validated dispositions
   and supervisor/reset lifecycles stay authoritative.
 
+**Fix round 1 (binding — supersedes any conflicting mechanism text in §3–§7
+below; a cross-vendor cold read of the build PR, 1 P1 + 7 P2, all with
+executed repros):**
+- **Grouping is WEB-DISPLAY-ONLY.** §4's description of reusing
+  `build_queue()`'s dedupe_key for dead-letter grouping is superseded:
+  `attention.py`'s `dead_letter_items()` and its dedupe_key go back to exactly
+  master's (ungrouped) behaviour. `agenttalk attention` (CLI, list and show)
+  and `/api/risk-register` read that SAME, fully ungrouped projector — they
+  never group. Only the `/api/attention` web response groups, as one more
+  pass applied AFTER dispositions, over already-serialized wire entries.
+- **An explicit typed `group` marker, never a string sharing the id/
+  dedupe_key namespace.** The original string-prefix scheme
+  (`dead_letter:group:<agent>`) could collide with an ordinary per-message
+  key when an agent is literally named `group` — a real, confirmed bug
+  (finding 2). A wire entry instead carries a separate `group` object:
+  `{kind: "dead_letter_group", agent, member_count, members: [{item_id,
+  message_id}, ...], more_count, cli_instructions: [...]}` for a group, or
+  `{kind: "dead_letter_overflow", agent_count, member_count,
+  cli_instructions: [...]}` for the overflow row. `members`/
+  `cli_instructions` are both bounded lists, never a joined paragraph.
+- **F1 [P1]: a representative's local defer must never act as a disposition
+  of its members.** Both consoles withhold the Later/defer affordance (no
+  button, no keyboard shortcut) for any card carrying a `group` marker —
+  aggregate cards are CLI-instructions-only, full stop. A stale per-letter
+  Later/answered state recorded before a letter became a group's
+  representative must not carry over and suppress the group it now
+  represents (the console's local disposition check is bypassed entirely for
+  a `group`-marked card). The loader uses the server's `active_count`
+  directly as the authoritative "needs you" total — never a client-computed
+  weighted sum over displayed cards — so deferred, overflowed and
+  low-severity members all stay counted even when they are not all
+  individually displayed.
+- **F5/F6: full ids, complete commands, no truncation.** A group's member
+  preview carries both the attention `item_id` (what a defer targets) and
+  the raw dead-letter `message_id` (what `dead-letter show`/`resolve`
+  targets) — never conflated. `cli_instructions` is a list of complete,
+  individually-bounded command lines (not one run-on sentence that could
+  need a mid-syntax ellipsis); verified against the longest legal (64-char)
+  agent name through the API and both renderers.
+- **F7/F8.** The v2 console's overflow card renders its full CLI recovery
+  instruction (not just a descriptive sentence). The legacy console's
+  unknown-age rendering uses the same riskCard-style branch as every other
+  age-unknown item, both at first render and on the 1 Hz clock ticker.
+
 What you need to do: nothing yet — docs only. This is the contract later
 implementation PRs must satisfy and be reviewed against.
 

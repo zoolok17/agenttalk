@@ -254,53 +254,80 @@ test('buildTeamView: a failed, stale chat read never presents its pending decisi
 // --------------------------------------- build round (#273): grouping/supervisor-state
 
 test('attentionCard: a supervisor-state label is context only, never an action change', () => {
-  const v = view({ attention: attention([
+  const v = view({ attention: { ...attention([
     { ...ATT_ITEM({ id: 'hold-1', source: 'supervisor', source_label: 'SUPERVISOR HOLD' }),
       supervisor_state: 'Supervisor not running' },
-  ]) });
+  ]), active_count: 1 } });
   const card = v.needs.open.find((c) => c.id === 'hold-1');
   assert.ok(card, 'the HOLD stays active/open');
   assert.ok(card.evidenceNote.includes('Supervisor not running'),
     'the label surfaces as context, not a reason to hide/demote the card');
-  assert.equal(card.groupWeight, 1, 'a HOLD is not a dead-letter group - weight is ordinary');
+  assert.equal(card.group, null, 'a HOLD carries no group marker - it is not a dead-letter group');
 });
 
-test('a capped dead-letter group counts every member, not just the displayed card', () => {
-  const v = view({ attention: attention([
+test('a capped dead-letter group counts every member via active_count, not just the displayed card', () => {
+  const v = view({ attention: { ...attention([
     { ...ATT_ITEM({ id: 'dl-beta', source: 'deadletter', source_label: 'DEAD LETTER', severity: 'med' }),
-      group_member_count: 8, group_more_count: 3, group_agent: 'beta',
-      group_cli_instructions: 'Run `agenttalk dead-letter list --agent beta` ...' },
-  ]) });
+      group: {
+        kind: 'dead_letter_group', agent: 'beta', member_count: 8, more_count: 3,
+        members: [{ item_id: 'dead_letter:beta:m1', message_id: 'm1' }],
+        cli_instructions: ['agenttalk dead-letter list --agent beta'],
+      } },
+  ]), active_count: 8 } });
   const card = v.needs.open.find((c) => c.id === 'dl-beta');
-  assert.equal(card.groupWeight, 8, 'the card stands for all 8 raw members, not just itself');
+  assert.ok(card.group, 'carries the typed group marker (never a string-prefixed id)');
   assert.ok(card.evidenceNote.includes('8 old failed messages from beta'));
   assert.ok(card.evidenceNote.includes('3 more not shown'));
-  assert.ok(card.evidenceNote.includes('agenttalk dead-letter list'), 'CLI instructions reach ungrouped members');
-  assert.ok(card.options.length > 0, 'a real, single-agent group still offers its ordinary actions');
-  // The badge count reflects the true active total (8), never the 1 displayed card.
+  assert.ok(card.evidenceNote.includes('agenttalk dead-letter list --agent beta'),
+    'F5/F6: the full, untruncated command line reaches ungrouped members');
+  assert.deepEqual(card.options, [], 'F1: an aggregate card gets no options - CLI instructions only');
+  // The badge count reflects the server's authoritative active_count (8), never the 1 displayed card.
   assert.equal(v.chip.needsCount, 8);
 });
 
-test('the dead-letter overflow row is active, counted, and never actionable as a group', () => {
-  const v = view({ attention: attention([
+test('F7: the dead-letter overflow row renders its full CLI recovery instruction and is never actionable', () => {
+  const v = view({ attention: { ...attention([
     { ...ATT_ITEM({ id: 'dl-overflow', source: 'deadletter', source_label: 'DEAD LETTER', severity: 'med' }),
-      actionable_as_group: false, overflow_agent_count: 5, overflow_member_total: 10 },
-  ]) });
+      group: {
+        kind: 'dead_letter_overflow', agent_count: 5, member_count: 10,
+        cli_instructions: ['agenttalk dead-letter list', 'agenttalk attention --source dead_letter --all'],
+      } },
+  ]), active_count: 10 } });
   const card = v.needs.open.find((c) => c.id === 'dl-overflow');
   assert.ok(card, 'the overflow row is active and visible, never silently absent');
   assert.deepEqual(card.options, [], 'never itself actionable as a group - no action maps to "all of these at once"');
-  assert.equal(card.groupWeight, 10, 'counts every raw member it stands for');
   assert.ok(card.evidenceNote.includes('10 old failed messages across 5 more agents'));
+  assert.ok(card.evidenceNote.includes('agenttalk dead-letter list'), 'F7: the full command, not just a sentence');
   assert.equal(v.chip.needsCount, 10, 'the badge reflects the true total, not the single summary row');
 });
 
-test('needsCount sums groupWeight across every open card, mixing ordinary and grouped rows', () => {
-  const v = view({ attention: attention([
+test('F1: needsCount reads the server authoritative active_count, not a count of displayed cards', () => {
+  const v = view({ attention: { ...attention([
     ATT_ITEM({ id: 'esc-1', source: 'escalation' }),
-    { ...ATT_ITEM({ id: 'dl-beta', source: 'deadletter', severity: 'med' }), group_member_count: 5 },
-  ]) });
+    { ...ATT_ITEM({ id: 'dl-beta', source: 'deadletter', severity: 'med' }),
+      group: { kind: 'dead_letter_group', agent: 'beta', member_count: 5, more_count: 0,
+               members: [], cli_instructions: [] } },
+  ]), active_count: 6 } });
   assert.equal(v.needs.open.length, 2, 'two displayed cards');
-  assert.equal(v.chip.needsCount, 1 + 5, 'the tally is the sum of raw weights, not the card count');
+  assert.equal(v.chip.needsCount, 6, 'the tally comes straight from the server, not a card/weight count');
+});
+
+test('F1 regression (two-poll, seven-day-boundary): a stale per-letter Later does not carry over '
+  + 'once that letter becomes a group representative', () => {
+  // Poll 1 (implicit): dl-beta was an ordinary card and the operator clicked Later on it.
+  const ui = { deferred: { 'dl-beta': true } };
+  // Poll 2, seven days later: dl-beta is now the representative of a dead-letter GROUP, same id.
+  const v = view({
+    attention: { ...attention([
+      { ...ATT_ITEM({ id: 'dl-beta', source: 'deadletter', severity: 'med' }),
+        group: { kind: 'dead_letter_group', agent: 'beta', member_count: 3, more_count: 0,
+                 members: [], cli_instructions: [] } },
+    ]), active_count: 3 },
+    ui,
+  });
+  const card = v.needs.open.find((c) => c.id === 'dl-beta');
+  assert.ok(card, 'the stale per-letter Later must not suppress the group it now represents');
+  assert.equal(v.needs.deferredCount, 0, 'never silently counted as deferred either');
 });
 
 run();

@@ -2164,7 +2164,13 @@
     tagRow.appendChild(titled(el('span', 'tc-src src-' + item.source, item.source_label || (item.source || '').toUpperCase()), SRC_DESC[item.source]));
     tagRow.appendChild(titled(el('span', 'tc-chip sev-' + item.severity, SEV_LABEL[item.severity] || (item.severity || '').toUpperCase()), SEV_DESC[item.severity]));
     tagRow.appendChild(el('span', 'tc-spacer'));
-    tagRow.appendChild(ageEl('tc-attn-age', item, { suffix: ' ago' }));
+    // F8 (build round #273, fix round 1): the same riskCard-style branch -
+    // an item flagged age_unknown must read as "age unknown", both at first
+    // render AND on the 1 Hz ticker (ageEl's noHb sets a DOM attribute
+    // updateAges() re-checks every tick, so this holds up over time too).
+    tagRow.appendChild(item.age_unknown
+      ? ageEl('tc-attn-age', item, { noHb: true, nullText: 'age unknown' })
+      : ageEl('tc-attn-age', item, { suffix: ' ago' }));
     body.appendChild(tagRow);
     body.appendChild(el('div', 'tc-attn-title', item.title || ''));
     var detailRow = el('div', 'tc-attn-detailrow');
@@ -2177,23 +2183,31 @@
     if (item.supervisor_state) {
       body.appendChild(el('div', 'tc-attn-detail tc-attn-supervisor-state', item.supervisor_state));
     }
-    // A capped per-agent dead-letter GROUP: still active, counted, and
-    // full-severity - grouping only compresses the display (§4). Every
-    // member past the preview stays reachable via the CLI line below, not a
-    // new browser action.
-    if (item.group_member_count) {
-      var groupNote = item.group_member_count + ' old failed messages from ' +
-        (item.group_agent || 'this agent') +
-        (item.group_more_count ? ' (' + item.group_more_count + ' more not shown)' : '');
+    // Dead-letter grouping is WEB-DISPLAY-ONLY (build round #273, fix round
+    // 1): an explicit typed `group` marker, never a string sharing the id/
+    // dedupe_key namespace. Still active, counted, full-severity - grouping
+    // only compresses the display. F5/F6: each member/command line renders
+    // on its own, full ids and complete commands, never joined/truncated.
+    var group = item.group;
+    if (group && group.kind === 'dead_letter_group') {
+      var groupNote = group.member_count + ' old failed messages from ' +
+        (group.agent || 'this agent') +
+        (group.more_count ? ' (' + group.more_count + ' more not shown)' : '');
       body.appendChild(el('div', 'tc-attn-detail tc-attn-group', groupNote));
-      if (item.group_cli_instructions) {
-        body.appendChild(el('div', 'tc-attn-detail tc-attn-cli', item.group_cli_instructions));
-      }
-    }
-    if (item.actionable_as_group === false && typeof item.overflow_agent_count === 'number') {
+      (Array.isArray(group.members) ? group.members : []).forEach(function (m) {
+        body.appendChild(el('code', 'tc-attn-detail tc-attn-cli',
+          'item_id: ' + m.item_id + ' · message_id: ' + m.message_id));
+      });
+      (Array.isArray(group.cli_instructions) ? group.cli_instructions : []).forEach(function (line) {
+        body.appendChild(el('code', 'tc-attn-detail tc-attn-cli', line));
+      });
+    } else if (group && group.kind === 'dead_letter_overflow') {
       body.appendChild(el('div', 'tc-attn-detail tc-attn-group',
-        item.overflow_member_total + ' old failed messages across ' +
-        item.overflow_agent_count + ' more agents, active and counted but not shown as individual groups'));
+        group.member_count + ' old failed messages across ' +
+        group.agent_count + ' more agents, active and counted but not shown as individual groups'));
+      (Array.isArray(group.cli_instructions) ? group.cli_instructions : []).forEach(function (line) {
+        body.appendChild(el('code', 'tc-attn-detail tc-attn-cli', line));
+      });
     }
     if (item.recommendation && !(actionSession.enabled && item.answerable)) {
       body.appendChild(el('div', 'tc-attn-detail', item.recommendation));
@@ -2334,10 +2348,11 @@
 
   // Action set per source (read-only release: disposition actions disabled).
   function attentionActions(item) {
-    // Build round (#273): the dead-letter overflow row stands in for many
-    // agents at once - it is active and counted, but never itself
-    // actionable as a group (no action maps to "all of these at once").
-    if (item.actionable_as_group === false) return [];
+    // F1 (build round #273, fix round 1): an aggregate card (a dead-letter
+    // group or the overflow row) stands for several raw items at once - a
+    // local defer/Later here would act as a disposition of every member it
+    // represents, not just the one id it carries. CLI instructions only.
+    if (item.group) return [];
     switch (item.source) {
       case 'escalation':
         return [{ label: 'Answer', primary: true }, { label: 'Reassign' }, { label: 'Defer' }];

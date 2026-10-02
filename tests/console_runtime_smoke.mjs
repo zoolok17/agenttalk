@@ -194,12 +194,18 @@ const poison = api.stateInfo('errored_poison');
 assert.ok(!/keeps? failing/i.test(poison.desc), 'poison desc must not assert repeated failure');
 assert.ok(/set aside/i.test(poison.desc), 'poison desc keeps the dead-letter (set aside) explanation');
 
-// --- 13) build round (#273): the dead-letter overflow row stands for many
-//         agents at once and must never itself be actionable as a group -
-//         every other card keeps its normal, source-specific action set. ---
-const overflowActions = api.attentionActions({ source: 'deadletter', actionable_as_group: false });
-assert.deepEqual(overflowActions, [], 'a non-actionable-as-group row offers no action buttons');
-const groupedDeadLetterActions = api.attentionActions({ source: 'deadletter' });
-assert.ok(groupedDeadLetterActions.length > 0, 'an ordinary (or grouped) dead-letter card keeps its actions');
+// --- 13) F1 (build round #273, fix round 1): an aggregate card (a
+//         dead-letter group or the overflow row) must never itself be
+//         actionable - every ordinary card keeps its normal action set. ---
+const overflowActions = api.attentionActions({
+  source: 'deadletter', group: { kind: 'dead_letter_overflow', agent_count: 5, member_count: 10 },
+});
+assert.deepEqual(overflowActions, [], 'the overflow row offers no action buttons');
+const groupActions = api.attentionActions({
+  source: 'deadletter', group: { kind: 'dead_letter_group', agent: 'beta', member_count: 8 },
+});
+assert.deepEqual(groupActions, [], 'a dead-letter group card offers no action buttons either (F1)');
+const ordinaryDeadLetterActions = api.attentionActions({ source: 'deadletter' });
+assert.ok(ordinaryDeadLetterActions.length > 0, 'an ordinary (ungrouped) dead-letter card keeps its actions');
 
 console.log('console runtime render smoke: PASS');

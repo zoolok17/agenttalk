@@ -104,6 +104,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import hashlib
 import html
 import hmac
 import ipaddress
@@ -111,6 +112,7 @@ import json
 import math
 import re
 import secrets
+import shlex
 import socket
 import threading
 import time
@@ -2517,10 +2519,6 @@ _ATTENTION_SOURCE_MAP: dict[str, tuple[str, str, str]] = {
     _attention.SOURCE_GATE_HOLD: ("gate", "GATE HOLD", "high"),
     _attention.SOURCE_CLOSE_HOLD: ("gate", "GATE HOLD", "high"),
     _attention.SOURCE_DEAD_LETTER: ("deadletter", "DEAD LETTER", "med"),
-    # Build round (#273): same wire category/severity as an ordinary dead
-    # letter - "full-severity ... counted the same as everything else"
-    # (design §4). Consoles distinguish it via `actionable_as_group: false`.
-    _attention.SOURCE_DEAD_LETTER_OVERFLOW: ("deadletter", "DEAD LETTER", "med"),
     _attention.SOURCE_COORDINATION_STALL: (
         "coordination_stall", "TEAM STALL", "high"),
     _attention.SOURCE_LEAD_UNARMED: ("supervisor", "SUPERVISOR", "low"),
@@ -2543,6 +2541,172 @@ def _attention_agent(item: dict) -> str | None:
         if isinstance(ref, dict) and isinstance(ref.get("agent"), str):
             return ref["agent"]
     return None
+
+
+def _dead_letter_message_id(item: dict) -> str | None:
+    """The raw dead-letter message id (distinct from the attention item_id -
+    F5, fix round 1) from the item's own envelope source_refs."""
+    for ref in item.get("source_refs") or []:
+        if (
+            isinstance(ref, dict)
+            and ref.get("kind") == "dead_letter"
+            and isinstance(ref.get("message_id"), str)
+        ):
+            return ref["message_id"]
+    return None
+
+
+# --------------------------------------------------- dead-letter grouping (#273, web-only)
+#
+# Fix round 1 (cross-vendor review tk-c4edf09aead3): grouping is WEB-DISPLAY-ONLY. The
+# shared source projector (attention.py) and its dedupe_key stay exactly as on master, so
+# `agenttalk attention` (CLI) and /api/risk-register are UNGROUPED, exactly like every other
+# source. This function groups already-disposition-filtered, already-serialized WIRE entries
+# for /api/attention alone, using an explicit TYPED `group` marker - never a string prefix
+# sharing the dedupe_key/item_id namespace (finding 2: an agent can be literally named
+# "group", which made a prefix scheme ambiguous with an ordinary per-message key).
+
+_DEAD_LETTER_GROUP_AGE_THRESHOLD_SECONDS = 604800  # 7 days
+_DEAD_LETTER_GROUP_DISPLAY_CAP = 20          # agent groups shown before an overflow row
+_DEAD_LETTER_GROUP_PREVIEW_CAP = 5           # member ids previewed per shown group
+
+
+def _dead_letter_group_cli_instructions(agent: str) -> list[str]:
+    """Exact, complete command lines to reach every member of one agent's
+    dead-letter group, including anything past the preview cap. Each line is
+    its own complete, copy-pasteable command - never joined into one prose
+    paragraph that could need an ellipsis mid-syntax (finding F6)."""
+    agent_arg = shlex.quote(agent)
+    return [
+        f"agenttalk dead-letter list --agent {agent_arg}",
+        f"agenttalk dead-letter show --agent {agent_arg} --id <message_id>",
+        f"agenttalk dead-letter resolve --agent {agent_arg} --id <message_id> "
+        "--reason <reason> --from <actor>",
+        "agenttalk attention defer --item <item_id> --reason <reason> --until <iso> "
+        "--from <actor>",
+    ]
+
+
+def _dead_letter_overflow_cli_instructions() -> list[str]:
+    """Exact command lines to reach every agent collapsed into the overflow row."""
+    return [
+        "agenttalk dead-letter list",
+        "agenttalk attention --source dead_letter --all",
+    ]
+
+
+# A line built only from fixed literal text plus a single agent name (<=64
+# chars, enforced at the roster level) never approaches this - it is a
+# defensive backstop, not a budget any real command is expected to use
+# (finding F6: no prose ellipsis is ever applied to executable syntax).
+_CLI_LINE_MAX = 400
+
+
+def _cli_lines(lines: list[str]) -> list[str]:
+    return [line if len(line) <= _CLI_LINE_MAX else line[:_CLI_LINE_MAX] for line in lines]
+
+
+def _group_dead_letters_for_display(wire: list[dict]) -> list[dict]:
+    """Group old (>=7d), known-age dead-letter WIRE entries by agent, display
+    only (#273 fix round 1). Every entry already carries its final disposition
+    state (dispositions were applied before this function ever sees the list);
+    grouping never changes `active_count`, which is computed separately from
+    the pre-grouping queue summary.
+
+    A representative keeps its OWN real `id` (the attention item_id a defer
+    targets) - F1: a representative's local defer/Later must act on it ALONE,
+    never on its group, so the console must never offer a Later/defer
+    affordance for a `group`-marked card at all (enforced client-side; see
+    console.js/console2-model.js). Only agents with MORE THAN ONE qualifying
+    letter get a `group` marker - a lone old letter has nothing to compress
+    and renders as an ordinary row.
+    """
+    by_agent: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for entry in wire:
+        if entry.get("source") != "deadletter" or entry.get("_dl_message_id") is None:
+            continue
+        if entry.get("age_unknown") or not isinstance(entry.get("age_seconds"), (int, float)):
+            continue
+        if entry["age_seconds"] < _DEAD_LETTER_GROUP_AGE_THRESHOLD_SECONDS:
+            continue
+        agent = entry.get("agent")
+        if not isinstance(agent, str) or not agent:
+            continue
+        by_agent.setdefault(agent, [])
+        if agent not in order:
+            order.append(agent)
+        by_agent[agent].append(entry)
+
+    qualifying_agents = [a for a in order if len(by_agent[a]) > 1]
+    if not qualifying_agents:
+        for entry in wire:
+            entry.pop("_dl_message_id", None)
+        return wire
+
+    shown_agents = set(qualifying_agents[:_DEAD_LETTER_GROUP_DISPLAY_CAP])
+    overflow_agents = qualifying_agents[_DEAD_LETTER_GROUP_DISPLAY_CAP:]
+    overflow_agent_set = set(overflow_agents)
+    # Identity, not just agent: a RECENT/unknown-age letter from an agent that
+    # ALSO has a qualifying group must pass through untouched - only the
+    # entries actually collected into by_agent (age-qualifying) are grouped.
+    qualifying_entry_ids = {id(e) for members in by_agent.values() for e in members}
+    out: list[dict] = []
+
+    for entry in wire:
+        agent = entry.get("agent")
+        is_qualifying = id(entry) in qualifying_entry_ids
+        if is_qualifying and agent in overflow_agent_set:
+            continue  # every member folds into the one overflow row below, none shown
+        if is_qualifying and agent in shown_agents:
+            members = by_agent[agent]
+            rep = members[0]  # already in rank order - deterministic, stable
+            if entry is not rep:
+                continue  # a non-representative member is folded into the group, not shown
+            preview = members[:_DEAD_LETTER_GROUP_PREVIEW_CAP]
+            more_count = len(members) - len(preview)  # computed from exactly what is rendered
+            entry["group"] = {
+                "kind": "dead_letter_group",
+                "agent": agent,
+                "member_count": len(members),
+                "members": [
+                    {"item_id": m.get("id", ""), "message_id": m.get("_dl_message_id", "")}
+                    for m in preview
+                ],
+                "more_count": more_count,
+                "cli_instructions": _cli_lines(_dead_letter_group_cli_instructions(agent)),
+            }
+        out.append(entry)
+
+    if overflow_agents:
+        overflow_member_total = sum(len(by_agent[a]) for a in overflow_agents)
+        agents_hash = hashlib.sha256(
+            "|".join(sorted(overflow_agents)).encode("utf-8", errors="surrogatepass")
+        ).hexdigest()[:16]
+        out.append({
+            "id": f"dead_letter_overflow:{agents_hash}",
+            "source": "deadletter",
+            "source_label": "DEAD LETTER",
+            "severity": "med",
+            "title": _envelope_str(f"{len(overflow_agents)} more agents have old failed messages"),
+            "agent": None,
+            "detail": _envelope_str(
+                "Old failed messages from these agents are active and counted, "
+                "just not individually displayed."),
+            "age_seconds": 0.0,
+            "age_unknown": True,
+            "human_can_unblock_now": True,
+            "group": {
+                "kind": "dead_letter_overflow",
+                "agent_count": len(overflow_agents),
+                "member_count": overflow_member_total,
+                "cli_instructions": _cli_lines(_dead_letter_overflow_cli_instructions()),
+            },
+        })
+
+    for entry in out:
+        entry.pop("_dl_message_id", None)
+    return out
 
 
 def _collect_web_attention_items(store: Store, roster: list[str],
@@ -2816,11 +2980,6 @@ def build_attention(desc: RootDescriptor,
         disps, _problems = _attention.read_dispositions(store)
         queue = _attention.build_queue(items, disps,
                                        now_iso=now.isoformat().replace("+00:00", "Z"))
-        # Build round (#273): cap dead-letter GROUPS for display only - never
-        # changes queue["summary"]["active_count"] below, which stays the raw,
-        # pre-grouping count of every active item (gate: "no double-counting
-        # of preview rows").
-        queue = _attention.cap_dead_letter_groups(queue)
         wire: list[dict] = []
         for it in queue.get("items", []):
             src = it.get("source", "")
@@ -2851,29 +3010,12 @@ def build_attention(desc: RootDescriptor,
                 # Context label only (design §1/§2) - never a reason to move,
                 # demote, or uncount this HOLD; see docs/DESIGN-attention-history.md.
                 entry["supervisor_state"] = _envelope_str(it["supervisor_state"])
-            if src == _attention.SOURCE_DEAD_LETTER and it.get("group_member_count"):
-                # A capped per-agent dead-letter GROUP (design §4, build round):
-                # active, counted, full-severity - grouping only compresses
-                # the DISPLAY, never the count (see active_count on the
-                # top-level payload).
-                entry["group_member_count"] = int(it["group_member_count"])
-                entry["group_more_count"] = int(it.get("group_more_count") or 0)
-                entry["group_agent"] = it.get("group_agent") or ""
-                entry["group_preview"] = [
-                    _envelope_str(d.get("item_id", ""))
-                    for d in (it.get("duplicates") or [])
-                    if isinstance(d, dict)
-                ]
-                entry["group_cli_instructions"] = _envelope_str(
-                    it.get("group_cli_instructions") or "")
-            if src == _attention.SOURCE_DEAD_LETTER_OVERFLOW:
-                entry["overflow_agent_count"] = int(it.get("overflow_agent_count") or 0)
-                entry["overflow_agent_preview"] = [
-                    _envelope_str(a) for a in (it.get("overflow_agent_preview") or [])
-                ]
-                entry["overflow_member_total"] = int(it.get("overflow_member_total") or 0)
-                entry["actionable_as_group"] = False
-                entry["recommendation"] = _envelope_str(it.get("recommendation") or "")
+            if src == _attention.SOURCE_DEAD_LETTER:
+                # Transient, stripped before the response is returned -
+                # _group_dead_letters_for_display() (web-display-only, #273
+                # fix round 1) needs the RAW message id (distinct from the
+                # item_id above - F5) to build its member preview.
+                entry["_dl_message_id"] = _dead_letter_message_id(it)
             if src == _attention.SOURCE_NEEDS_OPERATOR:
                 from agenttalk import work_tags
                 entry["source_refs"] = [
@@ -2985,6 +3127,12 @@ def build_attention(desc: RootDescriptor,
                 agents = []
         stuck_items = _derive_stuck_items(agents, now=now)
         wire.extend(stuck_items)
+        # Build round (#273), fix round 1: grouping is WEB-DISPLAY-ONLY, applied
+        # here (after dispositions and after every other field is already
+        # serialized) via an explicit typed `group` marker - never a change to
+        # the shared attention.py projector/dedupe_key, which stays exactly as
+        # on master (so the CLI and /api/risk-register are ungrouped).
+        wire = _group_dead_letters_for_display(wire)
         return {
             "root": desc.label,
             "root_path": str(store.root),
@@ -3423,9 +3571,6 @@ def build_risk_register(desc: RootDescriptor) -> dict:
                 f"dispositions: {len(disposition_problems)} unreadable record(s)"))
         queue = _attention.build_queue(items, disps,
                                        now_iso=now.isoformat().replace("+00:00", "Z"))
-        # Build round (#273): same display-only cap as /api/attention - never
-        # changes queue["summary"]["active_count"] used for active_count below.
-        queue = _attention.cap_dead_letter_groups(queue)
         risks: list[dict] = []
         for it in queue.get("items", []):
             src = it.get("source", "")
@@ -3467,23 +3612,7 @@ def build_risk_register(desc: RootDescriptor) -> dict:
             }
             if src == _attention.SOURCE_PROCESS_TREE_HOLD and it.get("supervisor_state"):
                 risk_entry["supervisor_state"] = _envelope_str(it["supervisor_state"])
-            if src == _attention.SOURCE_DEAD_LETTER and it.get("group_member_count"):
-                risk_entry["group_member_count"] = int(it["group_member_count"])
-                risk_entry["group_more_count"] = int(it.get("group_more_count") or 0)
-                risk_entry["group_agent"] = it.get("group_agent") or ""
-                risk_entry["group_cli_instructions"] = _envelope_str(
-                    it.get("group_cli_instructions") or "")
-            if src == _attention.SOURCE_DEAD_LETTER_OVERFLOW:
-                risk_entry["overflow_agent_count"] = int(it.get("overflow_agent_count") or 0)
-                risk_entry["overflow_member_total"] = int(it.get("overflow_member_total") or 0)
-                risk_entry["actionable_as_group"] = False
             risks.append(risk_entry)
-        # Build round (#273): the pre-grouping active count across every
-        # source this register draws from - queue["summary"]["active_count"]
-        # covers everything routed through attention.py's build_queue;
-        # stuck/onboarding rows below never go through that grouping, so they
-        # count 1:1 the same way len(risks) already would.
-        active_count = queue.get("summary", {}).get("active_count", 0)
         try:
             agents = _agent_entries(store, cfg, _validated_for_state(store, cfg)[0],
                                     for_agent)
@@ -3491,9 +3620,7 @@ def build_risk_register(desc: RootDescriptor) -> dict:
             _reraise_busy(e)  # #246 final round: a busy bound is 503, not a degraded row
             agents = []
             degraded.append(_envelope_str(f"stuck_agents: {e}"))
-        stuck_list = _derive_stuck_items(agents, now=now)
-        active_count += len(stuck_list)
-        for stuck in stuck_list:
+        for stuck in _derive_stuck_items(agents, now=now):
             stuck_age = float(stuck.get("age_seconds") or 0)
             # PR #129 connector round-5 (web.py:3166): this hardcoded
             # age_unknown=False regardless of what _derive_stuck_items
@@ -3555,7 +3682,6 @@ def build_risk_register(desc: RootDescriptor) -> dict:
                             age = None
                         blocking = bool(rec.get("blocking"))
                         owner = rec.get("owner") or rec.get("actor") or None
-                        active_count += 1
                         risks.append({
                             "id": f"onboarding:{run_id}:{kind}:"
                                   f"{_onboarding_short(rec.get('key'), limit=128)}",
@@ -3601,12 +3727,6 @@ def build_risk_register(desc: RootDescriptor) -> dict:
             "target_root_project_id": store.project_id(),
             "items": risks,
             "count": len(risks),
-            # Build round (#273): true total across every risk this register
-            # covers, before display grouping/truncation - "truncated" above
-            # already reports the display cap; this is the "no
-            # double-counting a group's members against its preview rows"
-            # figure the design asks for.
-            "active_count": active_count,
             "truncated": truncated,
             "partial": bool(degraded),
             "degraded_sources": degraded,
@@ -3623,7 +3743,6 @@ def build_risk_register(desc: RootDescriptor) -> dict:
             "target_root_project_id": store.project_id(),
             "items": [],
             "count": 0,
-            "active_count": 0,
             "truncated": 0,
             "partial": True,
             "degraded_sources": degraded[:_RISK_DEGRADED_MAX],

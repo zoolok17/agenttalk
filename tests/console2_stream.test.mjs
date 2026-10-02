@@ -140,11 +140,15 @@ test('deferring in one team does not defer the same id in another', async () => 
   assert.equal(cards(dom).length, 1, 'the second team still shows its card');
 });
 
-test('the needs badge counts open cards only; deferred ones are on the deferred line', async () => {
+test('the needs badge reflects the server active_count; a Later does not lower it', async () => {
+  // F1 (build round #273, fix round 1): a LOCAL defer is "put this off in this
+  // browser" - the item is still genuinely active, so the badge (sourced from
+  // the server's active_count) must not drop just because one browser put it
+  // off. The deferred line is the separate, LOCAL presentation of that choice.
   const { dom } = await boot(server({ roots: calm, ...att([ATT_ITEM({ id: 'a', age: 900 }), ATT_ITEM({ id: 'b', age: 800 })]) }));
   assert.equal(chips(dom)[0].children[2].textContent, '2');
   classOf(cards(dom)[0], 'c2-later')[0].click();
-  assert.equal(chips(dom)[0].children[2].textContent, '1');
+  assert.equal(chips(dom)[0].children[2].textContent, '2');
   assert.equal(deferredLine(dom).textContent, '1 deferred \u00b7 still open, not dismissed \u00b7 show');
 });
 
