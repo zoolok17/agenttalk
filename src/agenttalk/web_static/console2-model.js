@@ -867,14 +867,14 @@
   function greetingFor(mode, x) {
     switch (mode) {
       case 'loading': return { text: '', sub: 'Waiting for the first snapshot.' };
-      case 'error': return { text: 'Can’t read this team.', sub: 'Its store could not be read, so nothing is shown for it.' };
+      case 'error': return { text: 'Can’t read this team.', sub: 'Its data could not be read, so nothing is shown for it.' };
       case 'offline':
         return { text: 'Can’t see the team.',
           sub: x.kind === 'unreachable'
             ? 'Everything below is greyed and stamped as of ' + x.asOf + '. Nothing is live, and nothing you press can reach the lead until the console server is back.'
             : 'Everything below is greyed and stamped as of ' + x.asOf + '. Nothing is live until an agent writes again.' };
       case 'needs-unavailable':
-        return { text: 'Can’t read what needs you.', sub: 'The attention feed failed. The roster below is still live.' };
+        return { text: 'Can’t read what needs you.', sub: 'The list of what needs you could not be read. The roster below is still live.' };
       case 'busy':
         return { text: needsWord(x.n) + (x.n === 1 ? ' thing needs you.' : ' things need you.'),
           sub: 'Stuck agents first, then oldest. A deadline only shows if someone set one.' };
@@ -1174,8 +1174,8 @@
     if (att && view.needs.stale && (view.mode === 'quiet' || view.mode === 'calm' || view.mode === 'deferred')) {
       var attentionAge = Math.max(0, (nowMs - attentionAsOf) / 1000);
       var qualifiedText = view.mode === 'quiet' ? 'Can’t confirm nothing needs you.' : 'Can’t confirm nothing new needs you.';
-      var staleNote = 'The attention read has not refreshed for ' + fmtAge(attentionAge) +
-        '; showing the last known result, not confirmed current.';
+      var staleNote = 'The list of what needs you hasn’t refreshed for ' + fmtAge(attentionAge) +
+        '; showing what was last known, not confirmed current.';
       view.greeting = { text: qualifiedText, sub: view.greeting.sub ? view.greeting.sub + ' ' + staleNote : staleNote };
       view.mode = 'needs-stale';
     }
