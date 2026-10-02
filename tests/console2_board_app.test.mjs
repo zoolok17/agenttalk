@@ -47,7 +47,7 @@ function BOARD_FEED(o = {}) {
     schema_version: 1, target_root_project_id: 'proj-a', generated_at: o.generatedAt || iso(0),
     coverage: o.coverage === undefined ? { status: 'complete', valid_until: iso(15000) } : o.coverage,
     items: o.items === undefined ? [BOARD_ITEM()] : o.items,
-    legacy: { open_request_count: 0, known_lower_bound: 0 }, unassigned: { count: 0 },
+    legacy: o.legacy === undefined ? { open_request_count: 0, known_lower_bound: 0 } : o.legacy, unassigned: { count: 0 },
     total_count: o.totalCount === undefined ? (o.items ? o.items.length : 1) : o.totalCount,
     truncated: o.truncated === true, omitted_count: o.omittedCount === undefined ? 0 : o.omittedCount,
     errors: o.errors === undefined ? [] : o.errors, window_days: 7,
@@ -112,7 +112,22 @@ test('F5: a genuinely complete, empty, non-truncated board says so plainly', asy
   const srv = server({ roots: oneRoot, board: () => BOARD_FEED({ items: [], totalCount: 0 }) });
   const { dom, fire } = await boot(srv, { hash: '#board' });
   await fire(under);
-  assert.ok(all(board(dom)).includes('No active or recently done work items.'));
+  assert.ok(all(board(dom)).includes('No tracked work in progress, and nothing finished in the last 7 days.'));
+});
+
+test('#267 FIX round 1 (F2): "no tracked work" never reads as "no work at all" when legacy work is open', async () => {
+  // A cold read (codex-agenttalk-reviewer-1) found the old "No work in progress..." sentence
+  // sitting directly above "Legacy / untagged work: 3 untagged open request(s)" - two lines on
+  // the same screen contradicting each other. Scoped to TRACKED work so they never do.
+  const srv = server({
+    roots: oneRoot,
+    board: () => BOARD_FEED({ items: [], totalCount: 0, legacy: { open_request_count: 3, known_lower_bound: 3 } }),
+  });
+  const { dom, fire } = await boot(srv, { hash: '#board' });
+  await fire(under);
+  const b = all(board(dom));
+  assert.ok(b.includes('No tracked work in progress, and nothing finished in the last 7 days.'), b);
+  assert.ok(b.includes('Legacy / untagged work: 3 untagged open request(s)'), b);
 });
 
 test('F5: an overflow that omits the only item is never claimed as "no work items"', async () => {
@@ -123,9 +138,21 @@ test('F5: an overflow that omits the only item is never claimed as "no work item
   const { dom, fire } = await boot(srv, { hash: '#board' });
   await fire(under);
   const b = all(board(dom));
-  assert.ok(!b.includes('No active or recently done work items.'), b);
-  assert.ok(b.includes('No cards can currently be shown.'), b);
-  assert.ok(b.includes('Board truncated') && b.includes('1 omitted'), b);
+  assert.ok(!b.includes('No tracked work in progress, and nothing finished in the last 7 days.'), b);
+  assert.ok(b.includes('Cards can’t be shown right now; the board keeps trying.'), b);
+  assert.ok(b.includes('Not all cards fit: 1 is not shown.'), b);
+});
+
+test('P2-a (FIX round 2): the truncated-board note agrees singular/plural with the omitted count', async () => {
+  const one = server({ roots: oneRoot, board: () => BOARD_FEED({ truncated: true, omittedCount: 1 }) });
+  const { dom: oneDom, fire: oneFire } = await boot(one, { hash: '#board' });
+  await oneFire(under);
+  assert.ok(all(board(oneDom)).includes('Not all cards fit: 1 is not shown.'));
+
+  const many = server({ roots: oneRoot, board: () => BOARD_FEED({ truncated: true, omittedCount: 3 }) });
+  const { dom: manyDom, fire: manyFire } = await boot(many, { hash: '#board' });
+  await manyFire(under);
+  assert.ok(all(board(manyDom)).includes('Not all cards fit: 3 are not shown.'));
 });
 
 // ------------------------------------------------------------------------------------------- F6
