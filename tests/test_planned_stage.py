@@ -265,72 +265,138 @@ def test_planned_state_unattributable_record_is_silently_ignored() -> None:
 
 # ----------------------------------------------------------- _audit isolation (F4/F7a)
 
-def test_audit_one_never_attributes_a_planned_record_to_real_work() -> None:
-    from test_work_board_reducer import BUILDER, ITEM, LEAD, Bus
-    bus = Bus()
-    build = bus.task("tk-1", BUILDER, "build")
-    bus.reply(build, verdict="done")
-    reduced_before = work_board.reduce(bus.messages, lead=LEAD)
-    # A planned record with a FORBIDDEN in_reply_to (the replay validator
-    # already refuses this as unsupported metadata) must not reach _audit's
-    # attribution machinery via owners() at all - added RAW (bypassing
-    # normalize(), the same way a hand-edited/legacy log entry would).
-    bus.add(LEAD, LEAD, "planned", {"work_item": ITEM, "in_reply_to": "nonexistent-id"}, raw=True)
-    reduced_after = work_board.reduce(bus.messages, lead=LEAD)
-    assert reduced_after["items"] == reduced_before["items"]
-    assert reduced_after["unassigned"] == reduced_before["unassigned"]
+# -------------------------------------- fix round 3: partition at the entry (F12-F14)
 
-
-def test_work_board_feed_activity_excludes_planned_records() -> None:
-    from test_work_board_feed import project
-    from test_work_board_reducer import BUILDER, ITEM, LEAD, Bus
-    bus = Bus()
-    build = bus.task("tk-1", BUILDER, "build")
-    bus.reply(build, verdict="done")
-    before = project(bus)
-    before_event = next(i for i in before["items"] if i["work_item"] == ITEM)["last_work_event_at"]
-    bus.add(LEAD, LEAD, "planned", {"work_item": ITEM, "work_title": "Still planned?"})
-    after = project(bus)
-    after_event = next(i for i in after["items"] if i["work_item"] == ITEM)["last_work_event_at"]
-    assert after_event == before_event
-
-
-# -------------------------------------- F3: planned records are invisible to real closures
-
-def test_planned_record_does_not_consume_the_real_closure_budget() -> None:
-    """issue #279 F3(a): a valid plan for an EXISTING real work_item must not
-    be pulled into the real item's dependency closure and spend its
-    envelope budget - the full feed (coverage + the real card) must be
-    byte-identical with and without the plan present."""
+def test_reduce_and_feed_are_byte_identical_with_any_number_of_planned_records() -> None:
+    """issue #279 fix round 3: work_board.reduce() and work_board_feed.build()
+    each partition `real`/`planned` ONCE at their own entry - every real-work
+    path (audit, by_id/parent, ancestry, closure, activity, attribution,
+    coverage) sees ONLY `real`. This is the one structural regression test
+    the lead asked fix round 3 to add in place of the per-site isolation
+    tests it overlaps with: a rich mix of planned records - a valid
+    add/change/withdraw chain, a malformed one (a forbidden field, added raw
+    the way a hand-edited log entry would be), and one a real, unrelated
+    message replies to via in_reply_to - must leave BOTH reduce()'s items
+    and the full feed byte-identical to the same fixture with no planned
+    records at all."""
     import json
+    from dataclasses import replace
     from test_work_board_feed import project
+    from test_work_board_reducer import BUILDER, HEAD, ITEM, LEAD, reviewed, Bus
+
+    # The same note (anchored on an unresolved id either way) is present in
+    # BOTH fixtures, so the only variable between them is the planned
+    # records themselves - "before" anchors it on an ordinary nonexistent
+    # id (master's own baseline for an unresolved anchor); "after" anchors
+    # the identical note on a planned record's id instead. Both must
+    # produce the identical "missing required correlation history" fate.
+    def real_fixture(note_anchor):
+        bus = Bus()
+        reviewed(bus)
+        bus.task("tk-other", BUILDER, "build", item="other-item")
+        bus.add(LEAD, LEAD, "note", {"in_reply_to": note_anchor}, raw=True)
+        return bus
+
+    bus = real_fixture("nonexistent-id")
+    before_reduce = work_board.reduce(bus.messages, lead=LEAD)
+    before_feed = project(bus, integrated={(ITEM, HEAD): True})
+
+    bad_plan_id = "20260926-222511-000099-qPLN"
+    bus = real_fixture(bad_plan_id)
+    m1 = bus.add(LEAD, LEAD, "planned", {"work_item": "demo-a", "work_title": "A"})
+    bus.add(LEAD, LEAD, "planned", {"work_item": "demo-a", "work_title": "A2", "replaces": m1.id})
+    m3 = bus.add(LEAD, LEAD, "planned", {"work_item": "demo-b", "work_title": "B"})
+    bus.add(LEAD, LEAD, "planned", {"work_item": "demo-b", "withdrawn": True, "replaces": m3.id})
+    bad_plan = replace(bus.add(LEAD, LEAD, "planned", {"work_item": "demo-c"}, raw=True), id=bad_plan_id)
+    bus.messages[-1] = bad_plan
+    after_reduce = work_board.reduce(bus.messages, lead=LEAD)
+    after_feed = project(bus, integrated={(ITEM, HEAD): True})
+
+    assert json.dumps(after_reduce["items"], sort_keys=True) == json.dumps(before_reduce["items"], sort_keys=True)
+    assert json.dumps(after_reduce["unassigned"], sort_keys=True) == \
+        json.dumps(before_reduce["unassigned"], sort_keys=True)
+    assert json.dumps(after_feed["items"], sort_keys=True) == json.dumps(before_feed["items"], sort_keys=True)
+    assert json.dumps(after_feed["coverage"], sort_keys=True) == json.dumps(before_feed["coverage"], sort_keys=True)
+
+
+def test_f12_conflicting_duplicate_planned_id_is_unknown_not_last_write_wins() -> None:
+    """issue #279 F12 (replay): the same planned id can legitimately appear
+    twice (once in active storage, once in compacted) - an identical copy
+    dedupes silently, but a CONFLICTING payload under the same id must make
+    the item Unknown, never "whichever is scanned last"."""
+    from dataclasses import replace
+    from test_work_board_reducer import LEAD, Bus
+    bus = Bus()
+    m = bus.add(LEAD, LEAD, "planned", {"work_item": "demo", "work_title": "A"})
+    conflicting = replace(m, meta={"work_item": "demo", "work_title": "B"})
+    state = work_board.planned_state([m, conflicting], set())["demo"]
+    assert state["state"] == "unknown"
+    assert "conflicting" in state["reason"]
+    identical = replace(m)
+    state2 = work_board.planned_state([m, identical], set())["demo"]
+    assert state2["state"] == "active"  # an identical duplicate is not a conflict
+
+
+def test_f12_cli_refuses_a_conflicting_duplicate_id_across_partitions(store: Store, store_root, capsys) -> None:
+    """issue #279 F12 (publish): board plan reads active AND compacted
+    storage; a conflicting duplicate id across the two partitions must
+    refuse before publication, naming the id - never silently accepted as
+    complete history. Asserts read_history()'s OWN message (not just the
+    exit code), which would otherwise also be produced, for a different
+    reason, by planned_state()'s independent replay-side conflict check."""
+    import json
+    store.set_role("alpha", "lead")
+    assert _run(["board", "plan", "add", "--from", "alpha", "--work-item", "demo",
+                "--work-title", "T"], store_root) == 0
+    m = store.valid_messages()[0]
+    store.compacted_dir.mkdir(parents=True, exist_ok=True)
+    conflicting = dict(m.to_dict())
+    conflicting["meta"] = {**conflicting["meta"], "work_title": "Conflicting"}
+    (store.compacted_dir / f"{m.id}.json").write_text(json.dumps(conflicting), encoding="utf-8")
+    try:
+        rc = cli.main(["--root", str(store_root), "board", "plan", "change", "--from", "alpha",
+                      "--work-item", "demo", "--work-title", "T2"])
+    except SystemExit as e:
+        rc = e.code
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert m.id in err and "conflicting payloads across active/compacted storage" in err
+
+
+def test_f13_plan_anchored_note_does_not_revive_a_pruned_done_card() -> None:
+    """issue #279 F13: an ordinary note with in_reply_to=<plan id> must not
+    revive a pruned Done card - the activity walker's by_id must never
+    resolve a planned record as an ancestry anchor."""
+    from dataclasses import replace
+    from datetime import timedelta
+    from test_work_board_feed import project, NOW
+    from test_work_board_reducer import HEAD, ITEM, LEAD, reviewed, Bus
+    bus = Bus()
+    reviewed(bus)
+    old = [replace(m, ts=(NOW - timedelta(days=8)).isoformat()) for m in bus.messages]
+    plan = replace(Bus.add(bus, LEAD, LEAD, "planned", {"work_item": ITEM, "work_title": "Demo"}),
+                   ts=(NOW - timedelta(days=8)).isoformat())
+    note = replace(Bus.add(bus, LEAD, LEAD, "note", {"in_reply_to": plan.id}, raw=True), ts=NOW.isoformat())
+    bus.messages = [*old, plan, note]
+    feed = project(bus, integrated={(ITEM, HEAD): True})
+    assert not any(i["work_item"] == ITEM for i in feed["items"])
+
+
+def test_f14_reply_anchored_only_on_a_plan_does_not_complete_the_real_task() -> None:
+    """issue #279 F14: a stored plan carrying a forbidden request_id (a hand
+    edit/pre-fix log entry, bypassing validate_planned's own refusal of that
+    field) must not let a task-response anchored on it via in_reply_to
+    resolve to, and complete, the REAL task sharing that request_id."""
     from test_work_board_reducer import BUILDER, ITEM, LEAD, Bus
     bus = Bus()
     bus.task("tk-real", BUILDER, "build")
-    before = project(bus, envelope_limit=1)
-    bus.add(LEAD, LEAD, "planned", {"work_item": ITEM, "work_title": "Plan"})
-    after = project(bus, envelope_limit=1)
-    assert before["coverage"]["status"] == "complete"
-    assert json.dumps(after["coverage"], sort_keys=True) == json.dumps(before["coverage"], sort_keys=True)
-    assert json.dumps(after["items"], sort_keys=True) == json.dumps(before["items"], sort_keys=True)
-
-
-def test_malformed_planned_record_does_not_poison_the_real_feed() -> None:
-    """issue #279 F3(b): a malformed planned record (a forbidden in_reply_to,
-    added raw so it bypasses normalize() like a hand-edited log entry would)
-    must not turn the real work_item's feed row Unknown nor its coverage
-    incomplete - the real feed is byte-identical with and without it."""
-    import json
-    from test_work_board_feed import project
-    from test_work_board_reducer import BUILDER, ITEM, LEAD, Bus
-    bus = Bus()
-    bus.task("tk-real", BUILDER, "build")
-    before = project(bus)
-    bus.add(LEAD, LEAD, "planned", {"work_item": ITEM, "in_reply_to": "nonexistent"}, raw=True)
-    after = project(bus)
-    assert before["coverage"]["status"] == "complete"
-    assert json.dumps(after["coverage"], sort_keys=True) == json.dumps(before["coverage"], sort_keys=True)
-    assert json.dumps(after["items"], sort_keys=True) == json.dumps(before["items"], sort_keys=True)
+    raw_plan = bus.add(LEAD, LEAD, "planned",
+                       {"work_item": ITEM, "work_title": "Demo", "request_id": "tk-real"}, raw=True)
+    bus.add(BUILDER, LEAD, "task-response",
+           {"in_reply_to": raw_plan.id, "status": "done", "verdict": "done"}, raw=True)
+    result = work_board.reduce(bus.messages, lead=LEAD)
+    item = next(i for i in result["items"] if i["work_item"] == ITEM)
+    assert item["obligations"][0]["state"] == "outstanding"
 
 
 def test_raw_planned_record_sharing_request_id_does_not_attribute_a_real_card() -> None:

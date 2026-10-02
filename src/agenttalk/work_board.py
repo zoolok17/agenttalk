@@ -192,14 +192,9 @@ def _audit(messages, openers):
 
 
 def _audit_one(m, by_id, parent, openers, responses, flag):
-    if m.kind == "planned":
-        # issue #279: a planned record is invisible to the reducer's
-        # request/reply attribution entirely - it is never flagged, never
-        # attributed via owners() to any item (which would otherwise read
-        # its own work_item tag, e.g. via a stray in_reply_to on a
-        # malformed one), and never contributes to any real item's
-        # issues. It has its own read-side validator, planned_state().
-        return
+    # issue #279: a `planned` record never reaches here - `_reduce` already
+    # partitions it out of `messages` at the entry (fix round 3), so
+    # `by_id`/`parent`/`openers` never contain one either.
     meta = m.meta
     rid, anchor_id = meta.get("request_id"), meta.get("in_reply_to")
     if (not (rid is None or isinstance(rid, str)) or not (anchor_id is None or isinstance(anchor_id, str))
@@ -271,7 +266,16 @@ def _well_formed(m):
 
 
 def _reduce(messages, lead, incidents, integrated, running, checks):
-    messages = list(messages)
+    # issue #279 fix round 3 (F12-F14): partition ONCE at the entry - every
+    # real-work path below (audit, by_id/parent, ancestry, closure
+    # attribution, legacy/detached linking) sees ONLY `real`. A planned
+    # record never enters any of this machinery, so it cannot be an
+    # anchor/request/supersedes target for anything real (closes F14's
+    # class: a malformed planned record can no longer forge an anchor a
+    # real reply resolves through). This replaces the scattered
+    # `m.kind != "planned"` / `if m.kind == "planned": return` guards that
+    # used to be needed call site by call site.
+    messages = [m for m in messages if getattr(m, "kind", None) != "planned"]
     broken = [m for m in messages if not _well_formed(m)]
     messages = [m for m in messages if _well_formed(m)]
     openers = {}
@@ -311,9 +315,9 @@ def _reduce(messages, lead, incidents, integrated, running, checks):
         ids = {c.id for c in copies}
         target = copies[0].meta.get("supersedes")
         links = {item_of.get(target)} if isinstance(target, str) else set()
-        links |= {_slug(m.meta) for m in messages if m.kind != "planned"
-                  and (m.meta.get("request_id") == req["request_id"]
-                       or (isinstance(m.meta.get("in_reply_to"), str) and m.meta["in_reply_to"] in ids))}
+        links |= {_slug(m.meta) for m in messages
+                  if m.meta.get("request_id") == req["request_id"]
+                  or (isinstance(m.meta.get("in_reply_to"), str) and m.meta["in_reply_to"] in ids)}
         links.discard(None)
         if len(links) == 1:
             grouped.setdefault(links.pop(), []).append(req)  # its malformed-metadata issue makes that item Unknown
@@ -720,6 +724,23 @@ def planned_state(messages, real_items):
 
     out = {}
     for item, group in by_item.items():
+        # issue #279 F12: the same id can legitimately appear twice (once
+        # in active storage, once in compacted) - an identical copy
+        # dedupes silently; a CONFLICTING payload under the same id makes
+        # this item Unknown outright (there is no principled way to pick
+        # one over the other on replay).
+        by_mid, conflicting = {}, False
+        for m in group:
+            prior = by_mid.get(m.id)
+            if prior is not None and (prior.meta, prior.sender, prior.recipient) != (
+                    m.meta, m.sender, m.recipient):
+                conflicting = True
+            by_mid[m.id] = m
+        if conflicting:
+            out[item] = {"state": "unknown", "title": None, "current_id": None,
+                        "reason": "a planned record id appears more than once with conflicting payloads"}
+            continue
+        group = list(by_mid.values())
         valid = {}  # id -> clean meta
         malformed = False
         for m in group:

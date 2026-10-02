@@ -17,16 +17,13 @@ def _time(text):
 
 
 def _closure(messages, slugs):
-    """All cycles plus connected request, reply and replacement dependencies."""
+    """All cycles plus connected request, reply and replacement dependencies.
+
+    issue #279: `messages` here is always the `real` partition `build()`
+    computes at its entry - a planned record never reaches this function at
+    all, so it can never seed or link into the real dependency closure."""
     links, seeds = defaultdict(set), set()
     for m in messages:
-        if m.kind == "planned":
-            # issue #279 F3: a planned record must never seed or link into
-            # the real dependency closure - it would otherwise consume the
-            # real closure's envelope/byte budget (a valid plan for an
-            # existing work_item) or poison it via a stray correlation
-            # field on a malformed one.
-            continue
         node = ("id", m.id)
         if isinstance(m.meta.get("work_item"), str) and m.meta["work_item"] in slugs:
             seeds.add(node)
@@ -73,7 +70,17 @@ def build(snapshot, *, project, lead, gate_state, now=None, integrated=None, int
     # Identical active/compacted copies count once. Conflicts are rejected by closure coverage.
     found = {e.id: e for e in (*snapshot.archives, *snapshot.envelopes)}
     messages = [Message.from_dict(e.fields) for e in found.values()]
-    preliminary = work_board.reduce(messages, lead=lead, integrated=integrated)
+    # issue #279 fix round 3 (F13): partition ONCE at the entry, same as
+    # work_board.reduce() - every real-work path below (request_items,
+    # by_id/ancestry walking, closure) sees ONLY `real`. A planned record
+    # can therefore never be resolved to as an ancestry anchor (an
+    # ordinary message's `in_reply_to` pointing at one is anchored to
+    # nothing, exactly as master treats a reply to any other unknown id),
+    # and never seeds/links into the dependency closure (F3, carried
+    # forward). part 2 (not this PR) will read `planned` for the actual
+    # Planned-lane projection; it is unused here.
+    real = [m for m in messages if m.kind != "planned"]
+    preliminary = work_board.reduce(real, lead=lead, integrated=integrated)
     notes, warnings = {}, list((integration or {}).get("warnings", []))
     if integration is not None:
         try:  # facts bind to each item's current repository binding from this reduction
@@ -84,15 +91,15 @@ def build(snapshot, *, project, lead, gate_state, now=None, integrated=None, int
     checks = {(i["work_item"], i["cycle"]): gates.check_board(
         None, project=project, item=i["work_item"], cycle=i["cycle"], revision=i["candidate"],
         keys=i.get("check_keys"), state=gate_state) for i in preliminary["items"]}
-    reduced = work_board.reduce(messages, lead=lead, integrated=integrated, checks=checks)
+    reduced = work_board.reduce(real, lead=lead, integrated=integrated, checks=checks)
     selected = []
     global_gates = gates.check_gates(None, state=gate_state)
     # Correlated untagged replies contribute to approximate activity dates too.
-    request_items = {m.meta.get("request_id"): m.meta.get("work_item") for m in messages
+    request_items = {m.meta.get("request_id"): m.meta.get("work_item") for m in real
                      if m.kind in ("task", "review-request") and isinstance(m.meta.get("request_id"), str)}
-    by_id, assigned = {m.id: m for m in messages}, {}
+    by_id, assigned = {m.id: m for m in real}, {}
     activity, dispatched = defaultdict(list), defaultdict(list)
-    for m in messages:
+    for m in real:
         trail, cursor, slug = set(), m, None
         while cursor and cursor.id not in trail:
             trail.add(cursor.id)
@@ -105,11 +112,7 @@ def build(snapshot, *, project, lead, gate_state, now=None, integrated=None, int
             anchor = cursor.meta.get("in_reply_to")
             cursor = by_id.get(anchor) if isinstance(anchor, str) else None
         when = _time(m.ts)
-        # issue #279: a planned record is never activity - it must not
-        # refresh last_work_event_at and keep a Done item out of the
-        # 7-day prune below (it is also never in OPENERS, so it already
-        # could not reach `dispatched`).
-        if isinstance(slug, str) and when and m.kind != "planned":
+        if isinstance(slug, str) and when:
             activity[slug].append(when)
             if m.kind in ("task", "review-request"):
                 dispatched[slug].append(when)
@@ -133,7 +136,7 @@ def build(snapshot, *, project, lead, gate_state, now=None, integrated=None, int
                     last_work_event_at=last.isoformat() if last else None,
                     global_gates={"verdict": global_gates["verdict"], "blockers": global_gates["blockers"]})
         selected.append(item)
-    closure = selected_closure(snapshot, _closure(messages, {i["work_item"] for i in selected}),
+    closure = selected_closure(snapshot, _closure(real, {i["work_item"] for i in selected}),
                                envelope_limit=envelope_limit, byte_limit=source_byte_limit)
     closure.pop("items")
     if reduced.get("error") and closure["status"] == "complete":

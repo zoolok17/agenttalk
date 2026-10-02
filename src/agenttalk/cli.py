@@ -8205,7 +8205,24 @@ def _cmd_board_plan(args: argparse.Namespace) -> int:
                 "evaluated (invalid or unreadable envelopes present); refusing rather "
                 "than risk a wrong promotion check. Nothing was published."
             )
-        return [m for m, _ in (*active, *archive)]
+        # issue #279 F12: the active and compacted partitions are supposed
+        # to be disjoint (archiving MOVES a file), but two envelopes that
+        # validated independently can still share an id - an identical
+        # copy (harmless, dedupe silently) or a conflicting payload (never
+        # guess which is authoritative; refuse before anything is read as
+        # history, naming the id).
+        by_id = {}
+        for m, _ in (*active, *archive):
+            prior = by_id.get(m.id)
+            if prior is not None and (prior.meta, prior.sender, prior.recipient, prior.kind) != (
+                    m.meta, m.sender, m.recipient, m.kind):
+                raise ValueError(
+                    f"agenttalk board plan {sub}: envelope id {m.id!r} has conflicting "
+                    "payloads across active/compacted storage; refusing rather than guess "
+                    "which is authoritative. Nothing was published."
+                )
+            by_id[m.id] = m
+        return list(by_id.values())
 
     def resolve(messages):
         """F6: promotion means a REAL opener (task/review-request) in
