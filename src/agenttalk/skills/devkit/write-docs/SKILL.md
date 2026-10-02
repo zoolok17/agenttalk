@@ -47,8 +47,9 @@ write-for-humans instead.
       Write the body in plain words that are true for this case, never invent a
       number, name or place, and in reference material keep exact names, flags,
       commands and fields in place, each explained the first time.
-- [ ] For tutorials, how-tos, quickstarts, and any example meant to be executed: lead
-      with a **minimal runnable** snippet — copy-paste runnable, versions pinned where
+- [ ] For tutorials, how-tos, quickstarts, and any example meant to be executed: the
+      opening order is the "In plain words" summary first, then a **minimal runnable**
+      snippet as the first thing after it — copy-paste runnable, versions pinned where
       output depends on them, expected output shown. Reference/explanation pages may
       lead with concepts or neutral facts; partial snippets (signatures, config
       fragments, diffs) are fine but must be clearly labeled non-runnable and accurate.

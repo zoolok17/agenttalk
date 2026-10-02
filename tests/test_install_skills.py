@@ -704,6 +704,8 @@ def test_plain_language_leaves_agent_messages_compact() -> None:
     "ask what your plain version now claims that the original did not: where, which branch "
     "or version, who, how many, how long, in what order.",
     "Never invent a number, a name or a place that the source does not give.",
+    "In release notes and similar texts (kind A), put technical detail last, in a closing "
+    "Technical details section.",
     '"Released" means a new version can be installed; it does not mean anyone is using it yet.',
     "paths, hostnames and addresses are removed from anything a public or unauthorized audience "
     "sees (release notes, a public page, an error sent to a remote caller). Local diagnostics and "
@@ -831,4 +833,39 @@ def test_craft_code_triggers_on_interface_text() -> None:
     """The routing index is not loaded first, so craft-code's own description must name
     interface-copy work for kind D to be found."""
     description = _flat(_devkit("craft-code").split("description: >-", 1)[1].split("\nreviewed-against:", 1)[0])
-    assert "or writing interface text (labels, buttons, empty states, error messages, tooltips)" in description
+    assert "writing interface text (labels, buttons, empty states, error messages, tooltips)" in description
+
+
+def test_craft_code_finds_comment_only_edits() -> None:
+    """A task that only touches comments must find kind C from craft-code's own description,
+    and the routing index names it so it is not routed to refactor-code."""
+    description = _flat(_devkit("craft-code").split("description: >-", 1)[1].split("\nreviewed-against:", 1)[0])
+    assert "or adding, fixing or rewording only code comments" in description
+    routing = (SKILLS_ROOT / "devkit" / "_shared" / "references" / "routing.md").read_text(encoding="utf-8")
+    assert ("| Comment-only edits (adding, fixing or rewording code comments) | craft-code, in the "
+            "plain-language voice (plain-language.md, kind C)") in routing
+
+
+def test_tutorials_have_one_opening_order() -> None:
+    """The summary and the runnable example cannot both come first; the summary does."""
+    docs = _flat(_devkit("write-docs"))
+    assert ('the opening order is the "In plain words" summary first, then a **minimal runnable** '
+            "snippet as the first thing after it") in docs
+    assert "lead with a **minimal runnable** snippet" not in docs
+    assert ("In a tutorial, how-to or quickstart, the first thing after the summary is the runnable "
+            "example.") in _flat(_kind("B"))
+
+
+def test_review_docs_flags_voice_only_in_new_or_changed_documents() -> None:
+    review = _flat(_devkit("review-docs"))
+    assert ("Raise a missing summary or unexplained jargon (a minor finding) only for a document "
+            "that is new or changed in the work under review") in review
+    assert "A plain paraphrase that changes a fact is an accuracy finding (blocking) in any document." in review
+    assert "A missing summary or unexplained jargon is a minor finding;" not in review
+
+
+def test_technical_detail_last_is_scoped_to_kind_a() -> None:
+    core = _flat(_voice().split("\n## Core rules", 1)[1].split("\n## ", 1)[0])
+    assert "Where technical detail goes depends on the kind of text." in core
+    assert "Documentation keeps exact names, flags, commands and fields in place" in core
+    assert "- Put technical detail last." not in core
