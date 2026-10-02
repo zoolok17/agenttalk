@@ -78,34 +78,80 @@ a team or runs unattended:
   `agenttalk dashboard`) for watching roster, threads, and obligations
   without joining the bus yourself.
 
-### Local-first, no egress
+### Local-first: what reaches the network
 
-The bus itself makes no network calls: it is files on disk. Normally the
-only network traffic is what each agent CLI (Claude Code, Codex) already
-sends to its own model provider. Two optional tools are the exception:
+The bus itself makes no network calls: messages are files on disk. Your
+agent CLIs (Claude Code, Codex) keep talking to their own model providers,
+as they would without agenttalk. Here is every place agenttalk itself can
+connect to, and when:
 
-- the managed model gateway (`agenttalk gateway`) relays the model calls
-  of gateway-backed agents to the provider you configure;
-- the contributor check `agenttalk dev-gate` installs and audits
-  dependencies from the Python package index (`https://pypi.org/simple`).
+- **DEFAULT: none.** The bus, the dashboard and the supervisor open no
+  outbound connections.
+- **OPT-IN, the managed model gateway** (`agenttalk gateway`): while it is
+  installed and running, it sends gateway-backed agents' model calls to
+  OVH AI Endpoints at `https://oai.endpoints.kepler.ai.cloud.ovh.net/v1`.
+- **OPT-IN, the contributor check `agenttalk dev-gate`** (this project's
+  CI runs it too): when you run it, it installs the package and its test
+  tools from the Python package index (`https://pypi.org/simple`),
+  downloads the live Semgrep rule sets `p/python` and `p/security-audit`
+  from the Semgrep registry, and checks dependencies against the PyPI
+  advisory database through `pip-audit`.
+- **OPT-IN, the assurance tool** (`python -m agenttalk.assurance`): the
+  OSV vulnerability database (through `osv-scanner`), the PyPI advisory
+  database (through `pip-audit`) and remote Semgrep configurations are all
+  off by default; each runs only when the scan profile's `network_allowed`
+  setting lists that tool. A `release`-profile scan also builds the
+  package with `python -m build`, which downloads the project's build
+  backend from the Python package index.
 
 The bundled dashboard binds to loopback only (it listens only on this
 computer) and has no flag to expose it — reach it from another machine
 over an SSH tunnel if you need to, not by opening the port.
 
+### Where agenttalk keeps files
+
+The coordination store (messages, the roster, cursors, thread state and
+archives) is in the project's `.agenttalk/` folder. A few things live
+outside it, in per-user folders, so backing up or deleting the project
+folder alone does not cover them:
+
+- **signing keys**, if you turned on message signing with
+  `agenttalk hmac-init`: `%LOCALAPPDATA%\agenttalk\keys\` on Windows,
+  `$XDG_CONFIG_HOME/agenttalk/keys/` (default `~/.config`) elsewhere.
+  Without the key, signed messages cannot be verified;
+- **backups** made with `agenttalk backup`: `agenttalk\recovery\` in the
+  same per-user folder, unless `AGENTTALK_RECOVERY_DIR` points elsewhere;
+- **the supervisor's wrapper logs**: `%LOCALAPPDATA%\agenttalk\wrapper-logs\`
+  on Windows, `$XDG_STATE_HOME/agenttalk/wrapper-logs/` (default
+  `~/.local/state`) elsewhere;
+- **the managed gateway's secrets** (its API key and tokens) **and spend
+  ledger**, if you use the gateway: `agenttalk-ovh\` and
+  `agenttalk-ovh-spend\` under `%LOCALAPPDATA%` on Windows (or
+  `~/.local/share` elsewhere);
+- **Codex settings**: `agenttalk codex-config --enable` adds a block for
+  this project to `~/.codex/config.toml`.
+
+`agenttalk backup` copies the store only. To back up a project fully, also
+keep a copy of its signing key (and the gateway's ledger, if you use the
+gateway). To remove a project completely, delete those per-user entries
+too.
+
 ### What agenttalk is not
 
-- **Not a model.** agenttalk doesn't choose or run a model and has no
+- **Not a model.** The bus doesn't choose or run a model and has no
   opinion on which model a CLI uses — it moves messages between whatever
-  agent CLIs you start, and the optional model gateway only relays a
-  gateway-backed agent's own model calls. The intelligence is entirely
-  in the agents; the bus just lets them talk.
+  agent CLIs you start. The intelligence is entirely in the agents; the
+  bus just lets them talk. The one model-specific part is the optional
+  managed gateway, which supports a single route, pinned in code: OVH AI
+  Endpoints with the Qwen3.8-27B model. It refuses any other address or
+  model.
 - **Not an IDE plugin.** There's no editor integration to install.
   agenttalk is a CLI-level bus: it works with whatever terminal or
   editor-embedded terminal you already run your agent CLIs in.
 - **Not a hosted service.** No account, no server to sign up for, no
-  cloud component. Everything lives in your project's `.agenttalk/`
-  directory on your own machine.
+  cloud component. Everything stays on your own machine: the coordination
+  store in your project's `.agenttalk/` directory, and the few per-user
+  files listed under "Where agenttalk keeps files".
 - **Not a task queue.** There's no central scheduler deciding what
   runs next; agents decide what to do and message each other about it.
   If you want an explicit "what's next" driver, pair agenttalk with a
@@ -139,9 +185,11 @@ The second line installs the skills, the instructions each agent CLI
 reads to use agenttalk. It writes Claude Code's bus commands under
 `~/.claude/commands` and Codex's under `~/.codex/skills`, and the
 dev-discipline pack (the devkit) under both `~/.claude/skills` and
-`~/.codex/skills`. Pass `--claude-only` or `--codex-only` to install
-just one side, `--no-devkit` to skip the devkit, or `--dry-run` to
-preview without writing.
+`~/.codex/skills`. `--claude-only` and `--codex-only` choose which
+side gets the bus commands; the devkit still goes to both sides unless
+you add `--no-devkit`, so `--claude-only --no-devkit` installs Claude
+Code's bus commands and nothing else. `--devkit-only` installs only the
+devkit, and `--dry-run` previews without writing.
 
 When you upgrade an existing install, a plain `agenttalk install-skills`
 leaves alone every skill file that differs from the new version, so
@@ -830,7 +878,7 @@ typed-evidence shape at the milestone level.
 | `install-skills` | Install bus skills (and the dev-discipline devkit) for Claude and/or Codex. |
 | `hmac-init` | Provision HMAC signing material. |
 | `backup` | (#156) Write a verified out-of-tree snapshot of the store, keyed by project identity; `--json`. See [docs/BACKUP.md](docs/BACKUP.md). |
-| `gateway` | `{init,task-install,start,stop,status,...,run}` — lifecycle of the optional managed model gateway, which relays gateway-backed seats' model calls to a configured provider. |
+| `gateway` | `{init,task-install,start,stop,status,...}` — lifecycle of the optional managed model gateway, the supported route for gateway-backed seats: OVH AI Endpoints with the Qwen3.8-27B model, pinned in code. Start it through the managed task; `gateway run` is the internal service entry that task launches, not a supported way to start it by hand. |
 
 **Dashboards**
 

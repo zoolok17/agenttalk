@@ -63,14 +63,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - the manual told new users to install v0.74.0 and called v0.74.0 its
     current baseline; it now pins v0.95.0, like the README, and says honestly
     which chapters were checked against it;
-  - the README said agenttalk makes no network calls. The bus still makes
-    none, but the optional model gateway relays agents' model calls, and the
-    `dev-gate` check installs and audits packages from PyPI; it now says so;
-  - the README's command table called `gateway` a "multi-agent process
-    gateway"; it is the managed model gateway.
+  - the README said agenttalk makes no network calls ("no egress"). The bus
+    still makes none, but some optional tools do. The README now lists every
+    destination, each marked default or opt-in: the managed model gateway's
+    OVH endpoint; `dev-gate`'s package installs from PyPI, its live Semgrep
+    rule sets and the PyPI advisory database; and the assurance tool's OSV,
+    pip-audit, remote Semgrep and release-build downloads, which its scan
+    profile must allow;
+  - the README and the manual said everything agenttalk records is in the
+    project. The coordination store is, but signing keys, backups, the
+    supervisor's wrapper logs, the gateway's secrets and spend ledger, and a
+    Codex settings block live in per-user folders. The README now lists them
+    and says what to back up or delete;
+  - the README described the gateway as reaching "the provider you
+    configure" and called it a "multi-agent process gateway". It is the
+    managed model gateway, pinned in code to OVH AI Endpoints with the
+    Qwen3.8-27B model, and it refuses any other address or model;
+  - the README said `--claude-only` and `--codex-only` install "just one
+    side". They choose only which side gets the bus commands; the devkit
+    still goes to both sides unless you add `--no-devkit`.
 
-  The install steps also now say where the devkit goes and how to upgrade an
-  existing install. What you need to do: nothing.
+  The install steps also now say how to upgrade an existing install. What
+  you need to do: nothing.
 
   Technical details: `README.md` and `docs/AGENTTALK-NEW-USER-MANUAL.md`
   (opening, chapter 3 and chapter 6); tests in `tests/test_docs_plain_voice.py`.

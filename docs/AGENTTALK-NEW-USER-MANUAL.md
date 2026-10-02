@@ -21,11 +21,15 @@ Last updated: 2026-10-02, when the opening and the first steps (chapters 3 and
 whole for v0.74.0 and have been updated piece by piece since.
 
 agenttalk is a local coordination tool for coding agents that run as
-command-line tools (CLIs), such as Claude Code and Codex. Everything it records
-is kept in files inside your project. It lets separate agent windows talk to
-each other directly, keeps track of who owes the next move, sends decisions
-that need a person through one agent (the liaison), and records the evidence
-behind reviews and releases.
+command-line tools (CLIs), such as Claude Code and Codex. Its coordination
+records (messages, the roster, thread state) are files in the project's
+`.agenttalk/` folder. A few things live in per-user folders outside the
+project: signing keys, backups, the supervisor's wrapper logs, and the
+optional model gateway's secrets and spend ledger; the README's "Where
+agenttalk keeps files" lists them and what to back up or delete. agenttalk
+lets separate agent windows talk to each other directly, keeps track of who
+owes the next move, sends decisions that need a person through one agent (the
+liaison), and records the evidence behind reviews and releases.
 
 agenttalk is not a sandbox, a defense against a malicious agent on the team, a
 company sign-in and permissions system, or a project manager that runs on its
