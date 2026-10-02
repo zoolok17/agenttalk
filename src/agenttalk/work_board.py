@@ -714,33 +714,46 @@ def planned_state(messages, real_items):
     item's own title) and for ``unknown`` (no single tip exists to name).
     ``reason`` is set only for ``unknown``.
     """
+    # issue #279 F12 residual/F17: an id must denote exactly ONE canonical
+    # envelope everywhere in history - detected across the FULL input,
+    # BEFORE filtering to `planned` or grouping by work_item. Detecting it
+    # only after both (the fix round 3 shape) missed two cases: two
+    # `planned` copies sharing an id but tagged to DIFFERENT work_items
+    # never met inside either item's own group, and a conflicting
+    # NON-planned copy under the same id was filtered out before ever
+    # being compared. The comparison itself is full-envelope equality
+    # (every field) - the same canonical notion `board plan`'s
+    # `read_history()` uses, and conceptually what the snapshot's own
+    # envelope digest is for: identical copies dedupe, anything else
+    # conflicts.
+    seen_by_id = {}
+    conflicting_ids = set()
+    for m in messages:
+        prior = seen_by_id.get(m.id)
+        if prior is not None and prior != m:
+            conflicting_ids.add(m.id)
+        seen_by_id[m.id] = m
+
     raw = [m for m in messages if getattr(m, "kind", None) == "planned"]
-    by_item = {}
+    by_item, conflicted_items = {}, set()
     for m in raw:
         item = m.meta.get("work_item") if isinstance(m.meta, dict) else None
         if not isinstance(item, str) or not item:
             continue  # unattributable: no work_item to blame this record on
         by_item.setdefault(item, []).append(m)
+        if m.id in conflicting_ids:
+            conflicted_items.add(item)
 
     out = {}
     for item, group in by_item.items():
-        # issue #279 F12: the same id can legitimately appear twice (once
-        # in active storage, once in compacted) - an identical copy
-        # dedupes silently; a CONFLICTING payload under the same id makes
-        # this item Unknown outright (there is no principled way to pick
-        # one over the other on replay).
-        by_mid, conflicting = {}, False
-        for m in group:
-            prior = by_mid.get(m.id)
-            if prior is not None and (prior.meta, prior.sender, prior.recipient) != (
-                    m.meta, m.sender, m.recipient):
-                conflicting = True
-            by_mid[m.id] = m
-        if conflicting:
+        if item in conflicted_items:
             out[item] = {"state": "unknown", "title": None, "current_id": None,
                         "reason": "a planned record id appears more than once with conflicting payloads"}
             continue
-        group = list(by_mid.values())
+        # Every copy sharing an id within a non-conflicted item is, by the
+        # full-input check above, identical - deduping by id is therefore
+        # always safe here.
+        group = list({m.id: m for m in group}.values())
         valid = {}  # id -> clean meta
         malformed = False
         for m in group:

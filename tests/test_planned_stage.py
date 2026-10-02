@@ -276,9 +276,10 @@ def test_reduce_and_feed_are_byte_identical_with_any_number_of_planned_records()
     tests it overlaps with: a rich mix of planned records - a valid
     add/change/withdraw chain, a malformed one (a forbidden field, added raw
     the way a hand-edited log entry would be), and one a real, unrelated
-    message replies to via in_reply_to - must leave BOTH reduce()'s items
-    and the full feed byte-identical to the same fixture with no planned
-    records at all."""
+    message replies to via in_reply_to - must leave reduce()'s output and
+    the ENTIRE feed output (fix round 4, F18: not only the real cards -
+    every key, including coverage) byte-identical to the same fixture with
+    no planned records at all."""
     import json
     from dataclasses import replace
     from test_work_board_feed import project
@@ -315,8 +316,79 @@ def test_reduce_and_feed_are_byte_identical_with_any_number_of_planned_records()
     assert json.dumps(after_reduce["items"], sort_keys=True) == json.dumps(before_reduce["items"], sort_keys=True)
     assert json.dumps(after_reduce["unassigned"], sort_keys=True) == \
         json.dumps(before_reduce["unassigned"], sort_keys=True)
-    assert json.dumps(after_feed["items"], sort_keys=True) == json.dumps(before_feed["items"], sort_keys=True)
-    assert json.dumps(after_feed["coverage"], sort_keys=True) == json.dumps(before_feed["coverage"], sort_keys=True)
+    # F18: the ENTIRE feed, not only "items"/"coverage" picked out by hand -
+    # a mutation that leaked a planned envelope into some OTHER feed key
+    # (legacy, unassigned, errors, total_count...) would otherwise pass.
+    assert json.dumps(after_feed, sort_keys=True) == json.dumps(before_feed, sort_keys=True)
+
+
+def test_planned_record_does_not_consume_the_real_closure_budget() -> None:
+    """issue #279 F18: restores the round-1 F3(a) capacity boundary the
+    structural test's own fixture doesn't exercise (its planned records are
+    all for OTHER work_items). A valid plan for the SAME, single real
+    work_item, under an envelope_limit of exactly 1 (the real item's own
+    envelope), must not be pulled into the closure and spend that budget -
+    the full feed is byte-identical with and without the plan present."""
+    import json
+    from test_work_board_feed import project
+    from test_work_board_reducer import BUILDER, ITEM, LEAD, Bus
+    bus = Bus()
+    bus.task("tk-real", BUILDER, "build")
+    before = project(bus, envelope_limit=1)
+    bus.add(LEAD, LEAD, "planned", {"work_item": ITEM, "work_title": "Plan"})
+    after = project(bus, envelope_limit=1)
+    assert before["coverage"]["status"] == "complete"
+    assert json.dumps(after, sort_keys=True) == json.dumps(before, sort_keys=True)
+
+
+def test_malformed_planned_record_does_not_poison_the_real_feed() -> None:
+    """issue #279 F18: restores the round-1 F3(b) malformed-correlation
+    variant for the SAME real work_item (the structural test's malformed
+    plan is for an unrelated item). A malformed planned record (a
+    forbidden in_reply_to, added raw so it bypasses normalize() like a
+    hand-edited log entry would) for the item that ALSO has real work must
+    not turn that item's feed row Unknown nor its coverage incomplete."""
+    import json
+    from test_work_board_feed import project
+    from test_work_board_reducer import BUILDER, ITEM, LEAD, Bus
+    bus = Bus()
+    bus.task("tk-real", BUILDER, "build")
+    before = project(bus)
+    bus.add(LEAD, LEAD, "planned", {"work_item": ITEM, "in_reply_to": "nonexistent"}, raw=True)
+    after = project(bus)
+    assert before["coverage"]["status"] == "complete"
+    assert json.dumps(after, sort_keys=True) == json.dumps(before, sort_keys=True)
+
+
+def test_f16_plan_anchored_dependency_does_not_affect_real_coverage() -> None:
+    """issue #279 F16: `selected_closure`'s dependency resolution and
+    budgeting must use a real-only envelope view. A real, tagged note
+    whose `in_reply_to` NAMES a plan's id (`work_board_feed._closure` has
+    no way to know what kind an id it merely references belongs to) must
+    never resolve to that planned envelope - the real coverage result
+    (status AND selected_envelopes/budget) is identical whether that id
+    resolves to nothing at all or to an actual plan, including the
+    envelope_limit=2 boundary the reviewer's own repro used."""
+    import json
+    from dataclasses import replace
+    from test_work_board_feed import project
+    from test_work_board_reducer import BUILDER, ITEM, LEAD, Bus
+
+    plan_id = "20260926-222511-000099-qPLN"
+
+    def fixture():
+        bus = Bus()
+        bus.task("tk-real", BUILDER, "build")
+        bus.add(LEAD, LEAD, "note", {"work_item": ITEM, "in_reply_to": plan_id}, raw=True)
+        return bus
+
+    before = project(fixture(), envelope_limit=2)
+    bus = fixture()
+    plan = replace(bus.add(LEAD, LEAD, "planned", {"work_item": "other-item", "work_title": "Plan"}),
+                   id=plan_id)
+    bus.messages[-1] = plan
+    after = project(bus, envelope_limit=2)
+    assert json.dumps(after["coverage"], sort_keys=True) == json.dumps(before["coverage"], sort_keys=True)
 
 
 def test_f12_conflicting_duplicate_planned_id_is_unknown_not_last_write_wins() -> None:
@@ -361,6 +433,50 @@ def test_f12_cli_refuses_a_conflicting_duplicate_id_across_partitions(store: Sto
     assert rc == 2
     err = capsys.readouterr().err
     assert m.id in err and "conflicting payloads across active/compacted storage" in err
+
+
+def test_f12_residual_conflicting_duplicate_with_different_work_items_is_unknown() -> None:
+    """issue #279 F12 residual: round 3's conflict check ran AFTER grouping
+    by work_item, so two copies sharing an id but tagged to DIFFERENT
+    work_items never met inside either item's own group - each replayed as
+    a clean, unconflicted "active". Detecting it across the FULL input,
+    before grouping, must mark BOTH affected items Unknown."""
+    from dataclasses import replace
+    from test_work_board_reducer import LEAD, Bus
+    bus = Bus()
+    m = bus.add(LEAD, LEAD, "planned", {"work_item": "demo-a", "work_title": "A"})
+    dup = replace(m, meta={"work_item": "demo-b", "work_title": "B"})
+    state = work_board.planned_state([m, dup], set())
+    assert state["demo-a"]["state"] == "unknown"
+    assert state["demo-b"]["state"] == "unknown"
+
+
+def test_f12_residual_conflicting_non_planned_copy_is_not_ignored() -> None:
+    """issue #279 F12 residual: round 3's conflict check filtered to
+    `kind == "planned"` BEFORE comparing, so a conflicting copy under the
+    same id but a DIFFERENT kind was silently excluded from the comparison
+    entirely. Detecting conflicts across the full, unfiltered input must
+    still mark the planned copy's item Unknown."""
+    from dataclasses import replace
+    from test_work_board_reducer import LEAD, Bus
+    bus = Bus()
+    m = bus.add(LEAD, LEAD, "planned", {"work_item": "demo", "work_title": "A"})
+    non_planned_dup = replace(m, kind="note", meta={"work_item": "demo"})
+    state = work_board.planned_state([m, non_planned_dup], set())
+    assert state["demo"]["state"] == "unknown"
+
+
+def test_f12_residual_full_envelope_comparison_catches_a_body_only_difference() -> None:
+    """issue #279 F17 (folded into F12): the comparison is canonical
+    full-envelope equality (every Message field), not a bespoke subset -
+    two copies differing ONLY in body must still conflict."""
+    from dataclasses import replace
+    from test_work_board_reducer import LEAD, Bus
+    bus = Bus()
+    m = bus.add(LEAD, LEAD, "planned", {"work_item": "demo", "work_title": "A"})
+    body_dup = replace(m, body="different body")
+    state = work_board.planned_state([m, body_dup], set())
+    assert state["demo"]["state"] == "unknown"
 
 
 def test_f13_plan_anchored_note_does_not_revive_a_pruned_done_card() -> None:

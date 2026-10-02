@@ -8205,17 +8205,19 @@ def _cmd_board_plan(args: argparse.Namespace) -> int:
                 "evaluated (invalid or unreadable envelopes present); refusing rather "
                 "than risk a wrong promotion check. Nothing was published."
             )
-        # issue #279 F12: the active and compacted partitions are supposed
-        # to be disjoint (archiving MOVES a file), but two envelopes that
-        # validated independently can still share an id - an identical
-        # copy (harmless, dedupe silently) or a conflicting payload (never
-        # guess which is authoritative; refuse before anything is read as
-        # history, naming the id).
+        # issue #279 F12/F17: the active and compacted partitions are
+        # supposed to be disjoint (archiving MOVES a file), but two
+        # envelopes that validated independently can still share an id -
+        # an identical copy (harmless, dedupe silently) or a conflicting
+        # payload (never guess which is authoritative; refuse before
+        # anything is read as history, naming the id). The comparison is
+        # full-envelope equality (every Message field) - the SAME
+        # canonical notion `work_board.planned_state`'s replay-side check
+        # uses, not a bespoke subset of fields compared independently here.
         by_id = {}
         for m, _ in (*active, *archive):
             prior = by_id.get(m.id)
-            if prior is not None and (prior.meta, prior.sender, prior.recipient, prior.kind) != (
-                    m.meta, m.sender, m.recipient, m.kind):
+            if prior is not None and prior != m:
                 raise ValueError(
                     f"agenttalk board plan {sub}: envelope id {m.id!r} has conflicting "
                     "payloads across active/compacted storage; refusing rather than guess "
