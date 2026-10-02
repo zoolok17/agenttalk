@@ -48,10 +48,12 @@ approve on "looks fine".
 - [ ] **Voice** (../_shared/references/plain-language.md, kind B) — the document opens
       with an "In plain words" summary and its plain words are true for this case;
       reference material keeps exact names, flags and fields, explained the first time.
-      Raise a missing summary or unexplained jargon (a minor finding) only for a
-      document that is new or changed in the work under review; untouched documents
-      are not rewritten just for voice. A plain paraphrase that changes a fact is an
-      accuracy finding (blocking) in any document.
+      Voice findings (a missing summary or unexplained jargon, each minor): raise them
+      for a document that is new or changed in the work under review, and for any
+      document when someone asks for a voice, prose or audience review of it. Skip
+      them only for a document you meet incidentally while reviewing an unrelated
+      change; untouched documents are not rewritten just for voice. A plain paraphrase
+      that changes a fact is an accuracy finding (blocking) in any document.
 
 ## DRIFT GUARDS
 - [ ] No stale screenshots, paths, env-var names, command flags, or output blocks.

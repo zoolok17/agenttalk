@@ -62,14 +62,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     summary and a runnable example. Now the summary comes first, then the
     example;
   - a documentation review could flag a missing summary on an old document
-    that nobody changed. Now that finding is raised only for new or changed
-    documents;
+    that nobody changed. Now that finding is raised for new or changed
+    documents, and whenever someone asks for a review of a document's voice,
+    prose or audience, but not for a document met only in passing;
   - "technical detail last" read as a rule for every kind of text. It now
     applies to release notes and similar texts; documentation keeps exact
     details in place, and comments and on-screen text keep only what the
     reader needs;
   - a task that only changes code comments might not have found the comment
-    rules. The coding skill and the routing index now name comment-only edits.
+    rules. The coding skill now names comment-only edits, and the routing
+    index tells code comments apart from issue, PR and review comments.
 
   What you need to do: on an existing install, preview with
   `agenttalk install-skills --dry-run --force`, back up any local edits you

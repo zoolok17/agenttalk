@@ -842,8 +842,24 @@ def test_craft_code_finds_comment_only_edits() -> None:
     description = _flat(_devkit("craft-code").split("description: >-", 1)[1].split("\nreviewed-against:", 1)[0])
     assert "or adding, fixing or rewording only code comments" in description
     routing = (SKILLS_ROOT / "devkit" / "_shared" / "references" / "routing.md").read_text(encoding="utf-8")
-    assert ("| Comment-only edits (adding, fixing or rewording code comments) | craft-code, in the "
+    assert ("| Code comments (comment-only edits in source files) | craft-code, in the "
             "plain-language voice (plain-language.md, kind C)") in routing
+
+
+def test_routing_tells_code_comments_from_review_comments() -> None:
+    """Two rows that both say just "comments" give a comment-only task two answers, so each
+    row names its own kind of comment."""
+    routing = (SKILLS_ROOT / "devkit" / "_shared" / "references" / "routing.md").read_text(encoding="utf-8")
+    rows = [ln for ln in routing.splitlines() if ln.startswith("| ") and "comment" in ln.lower()]
+    wfh = [r for r in rows if r.rstrip().endswith("| write-for-humans |")]
+    assert wfh == ["| Release notes, changelog entries, PR descriptions, issue, PR and review comments, "
+                   "status reports a person will read | write-for-humans |"]
+    for row in rows:
+        task = row.split("|")[1]
+        assert re.search(r"(issue, PR and review|code|Code) comments", task), row
+    intro = _flat(_devkit("write-docs").split("\n## ", 1)[0].split("\n# write-docs", 1)[1])
+    assert ("issue, PR and review comments, and status reports, use write-for-humans instead; for "
+            "code comments, use craft-code.") in intro
 
 
 def test_tutorials_have_one_opening_order() -> None:
@@ -857,10 +873,15 @@ def test_tutorials_have_one_opening_order() -> None:
 
 
 def test_review_docs_flags_voice_only_in_new_or_changed_documents() -> None:
+    """Voice findings are skipped only for a document met incidentally; a requested voice,
+    prose or audience review of an existing document still raises them."""
     review = _flat(_devkit("review-docs"))
-    assert ("Raise a missing summary or unexplained jargon (a minor finding) only for a document "
-            "that is new or changed in the work under review") in review
+    assert ("raise them for a document that is new or changed in the work under review, and for any "
+            "document when someone asks for a voice, prose or audience review of it") in review
+    assert ("Skip them only for a document you meet incidentally while reviewing an unrelated "
+            "change") in review
     assert "A plain paraphrase that changes a fact is an accuracy finding (blocking) in any document." in review
+    assert "only for a document that is new or changed in the work under review" not in review
     assert "A missing summary or unexplained jargon is a minor finding;" not in review
 
 

@@ -23,8 +23,8 @@ that actually run.
 
 This skill covers documentation: READMEs, guides, tutorials, reference pages,
 manuals, specifications and design documents. For release notes, changelog
-entries, pull request descriptions, comments and status reports, use
-write-for-humans instead.
+entries, pull request descriptions, issue, PR and review comments, and status
+reports, use write-for-humans instead; for code comments, use craft-code.
 
 ## CLASSIFY — before writing
 - [ ] Pick exactly **one Diataxis mode** for the page and don't mix them — split and
