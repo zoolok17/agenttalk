@@ -63,12 +63,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - a check-in, for example every 30 minutes: read new messages, see which
     seats are alive or stuck, look at open threads, go through reviews and pull
     requests (merge only with a review that covers the exact head commit),
-    check capacity and free memory, curate knowledge, and check spend if the
-    team has a paid model route. A step the team does not have is skipped;
-  - a handover note, for example every two hours and before any reset:
-    `agenttalk checkpoint save` keeps what agenttalk can see, and a few lines
-    in the lead's own notes keep the rest, under about 20 lines in all;
-  - ways to put both on a timer in Claude Code and in Codex;
+    check each seat's model budget and context with `agenttalk capacity` and
+    the machine's free memory with the operating system's own check, curate
+    knowledge, and check spend if the team has a paid model route. A step the
+    team does not have is skipped;
+  - a handover, for example every two hours and before any reset:
+    `agenttalk checkpoint save` keeps what agenttalk can see, and a separate
+    note of a few lines in the lead's own notes keeps the rest, under about 20
+    lines in all. The checkpoint does not store that note;
+  - ways to put both on a timer: a scheduled prompt in Claude Code, or an
+    operating-system scheduled task for the Codex terminal CLI. The supervised
+    lead loop is a separate safety sweep, not a timer for this routine;
   - what to report to the person in charge: only decisions and actions that
     need them, and money alarms.
 

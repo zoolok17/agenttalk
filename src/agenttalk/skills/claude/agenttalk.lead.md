@@ -437,8 +437,9 @@ inventing one.
 
 ### Check-in (for example every 30 minutes)
 
-1. **Read new messages and act on every reply.** In a supervised lead loop
-   the wrapper delivers them for you; then skip this step.
+1. **Read new messages and act on every reply.** If you run wrapped, for
+   example as a supervised lead loop, the wrapper delivers them for you and its
+   rules forbid `drain`, `recv` and `threads`; then skip this step and step 3.
    ```powershell
    agenttalk drain --for $SELF
    ```
@@ -460,16 +461,25 @@ inventing one.
    findings" above). Merge only with a GO that covers the exact head commit
    (`work_head`); a GO on an earlier head does not count. If the project uses
    the work board, run `agenttalk board verify-merges` after each merge.
-5. **Capacity, before handing out more work.** Check that the machine has
-   enough free memory for another agent or build, and steer long work away
-   from a seat near its context limit.
+5. **Capacity, before handing out more work.**
+   - Model budgets and context: `agenttalk capacity` shows the budgets and
+     context use that each seat has published. Steer long work away from a
+     seat near a limit.
+     ```powershell
+     agenttalk capacity
+     ```
+   - Free memory: agenttalk does not check the machine's memory. Before you
+     start another agent or build, use your operating system's own check, for
+     example Task Manager on Windows, `free -h` on Linux, or Activity Monitor
+     on macOS.
+6. **Knowledge.** Pull the notes and lessons, including the uncurated ones, as
+   JSON with a `--limit` above your number of lessons: by default a pull shows
+   only 5 lessons, and curated ones can push uncurated ones out of view. If the
+   output's `truncation` still counts lessons left out, raise the limit. The
+   uncurated rows have `"view": "proposal"`; verify or retract each one (a
+   retract needs `--reason`).
    ```powershell
-   agenttalk capacity
-   ```
-6. **Knowledge.** List notes and lessons including the uncurated ones, then
-   verify or retract each uncurated one (a retract needs `--reason`).
-   ```powershell
-   agenttalk knowledge pull --include-uncurated
+   agenttalk knowledge pull --include-uncurated --json --limit 1000
    agenttalk knowledge curate verify --domain <domain> --key <key>
    ```
 7. **Spend, if the team has a paid model route.** Compare it with the agreed
@@ -478,15 +488,16 @@ inventing one.
 
 ### Handover note (for example every two hours, and before any reset)
 
-1. Save what agenttalk can see: your open threads, the capacity signal, and
-   your checkout's branch and commit. After a reset, `checkpoint resume`
-   shows it again.
+1. Save a checkpoint of what agenttalk can see: your open threads, the
+   capacity signal, and the branch and commit of the folder that holds the
+   agenttalk store. It holds no notes of your own. After a reset,
+   `checkpoint resume` shows it again.
    ```powershell
    agenttalk checkpoint save --for $SELF
    agenttalk checkpoint resume --for $SELF
    ```
-2. Add what it cannot see, in a few lines in your own notes (your memory, if
-   you have one):
+2. Write a separate handover note with what the checkpoint cannot see, in a
+   few lines in your own notes (your memory, if you have one):
    - what is running: each seat, its task id, and its branch and commit;
    - what waits on whom;
    - open decisions for the person in charge;
@@ -497,15 +508,20 @@ Keep the whole note under about 20 lines.
 
 ### Switching the timers on
 
-For example:
-- **Claude Code:** a scheduled prompt in the lead's own session, such as
-  `/loop 30m` with the check-in as its prompt, or a session cron. A session
-  timer dies with the session, so set it again after every restart.
-- **Codex:** there is no built-in timer. Run the lead as a supervised lead loop
-  (`agenttalk wrap --loop --lead-loop`; see "Lead-loop, relay, and review modes"
-  above), which runs proactive ticks on a quiet bus at its configured cadence,
-  or use an operating-system scheduled task that nudges the lead, for example
-  with a short message.
+Use two timers: one for the check-in, and a slower one for the handover note.
+A timer only reminds you; you still run the steps yourself. For example:
+- **Claude Code:** a scheduled prompt in your own session, such as `/loop 30m`
+  with the check-in as its prompt, and `/loop 2h` with the handover note as its
+  prompt. After a restart, first list the scheduled tasks you still have (ask
+  "what scheduled tasks do I have?"), then recreate only the ones that are
+  missing or expired, so that you do not run two copies of the same timer.
+- **Codex (the terminal CLI):** the CLI has no built-in timer for this. Use an
+  operating-system scheduled task that nudges you to run the routine.
+
+The supervised lead loop (see "Lead-loop, relay, and review modes" above) is
+not a timer for this routine. It is a separate safety sweep: on a quiet bus it
+starts a turn only for overdue reminders, dead letters and unrouted
+escalations, and it does not run the check-in or the handover note.
 
 ### What to report to the person in charge
 

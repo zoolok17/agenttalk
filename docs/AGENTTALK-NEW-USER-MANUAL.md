@@ -352,9 +352,11 @@ agenttalk broadcast --from codex-lead --to-group reviewers --kind question --sub
 On a long run, the lead skill (`agenttalk.lead` for Claude Code, `agenttalk-lead`
 for Codex) has a "Lead routine" section. It gives a regular check-in (messages,
 seat health, open threads, reviews, capacity, knowledge and, if the team has a
-paid model route, spend), a short handover note saved with
-`agenttalk checkpoint save` so a reset lead can carry on, and ways to put both on
-a timer. Skip any step your team does not have.
+paid model route, spend) and a handover step, so a reset lead can carry on. The
+handover step has two parts: `agenttalk checkpoint save` records what agenttalk
+can see, and a separate short note, kept in the lead's own notes, records the
+rest. The checkpoint does not store that note. The section also shows ways to
+put both on a timer. Skip any step your team does not have.
 
 ### Escalation and operator answers
 
