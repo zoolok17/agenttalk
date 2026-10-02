@@ -45,6 +45,23 @@ The board finds it by scanning the validated log (`store.valid_messages()`
 / the snapshot `work_board_feed.build` already reads), the same way it
 finds every other message, not through anyone's inbox.
 
+**Known limitation: counted in unread, same as `composing`/`progress`
+today (tracked by #289).** A self-addressed `planned` record is still a
+message in the lead's own inbox, and `CONTROL_KINDS` membership (which
+keeps it out of a wrapped agent's default recv view and automatic turn
+handling, see "one publishing route" below) does not advance the cursor
+past it - this is EXISTING behaviour the lead's own `composing`/`progress`
+records already have today, not a new mechanism this design introduces.
+A fix round 1 attempt at a general hidden-control-tail cursor consumer
+(`recv_api.consume_hidden_tail`) was CUT in fix round 2: it surfaced two
+new correctness problems (a real task staged before `Store.send()`'s
+publication lock could land with an id below a cursor the consumer had
+already advanced past and never be delivered; the consumer advanced the
+cursor without the lead-loop's ownership/lease guard). A safe version
+needs publication-ordered delivery, judged too deep for this PR. #289 is
+redirected to a read-only fix instead: surface actionable unread
+separately in status reporting, with no cursor movement.
+
 **One publishing route (closes F3).** Only `agenttalk board plan
 add|change|withdraw` may send `kind=planned`, the only caller of one
 shared planned validator (§3). `send`/`broadcast` refuse `--kind planned`
