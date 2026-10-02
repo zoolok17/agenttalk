@@ -704,6 +704,8 @@ def test_plain_language_leaves_agent_messages_compact() -> None:
     "ask what your plain version now claims that the original did not: where, which branch "
     "or version, who, how many, how long, in what order.",
     "Never invent a number, a name or a place that the source does not give.",
+    "In release notes and similar texts (kind A), put technical detail last, in a closing "
+    "Technical details section.",
     '"Released" means a new version can be installed; it does not mean anyone is using it yet.',
     "paths, hostnames and addresses are removed from anything a public or unauthorized audience "
     "sees (release notes, a public page, an error sent to a remote caller). Local diagnostics and "
@@ -831,4 +833,60 @@ def test_craft_code_triggers_on_interface_text() -> None:
     """The routing index is not loaded first, so craft-code's own description must name
     interface-copy work for kind D to be found."""
     description = _flat(_devkit("craft-code").split("description: >-", 1)[1].split("\nreviewed-against:", 1)[0])
-    assert "or writing interface text (labels, buttons, empty states, error messages, tooltips)" in description
+    assert "writing interface text (labels, buttons, empty states, error messages, tooltips)" in description
+
+
+def test_craft_code_finds_comment_only_edits() -> None:
+    """A task that only touches comments must find kind C from craft-code's own description,
+    and the routing index names it so it is not routed to refactor-code."""
+    description = _flat(_devkit("craft-code").split("description: >-", 1)[1].split("\nreviewed-against:", 1)[0])
+    assert "or adding, fixing or rewording only code comments" in description
+    routing = (SKILLS_ROOT / "devkit" / "_shared" / "references" / "routing.md").read_text(encoding="utf-8")
+    assert ("| Code comments (comment-only edits in source files) | craft-code, in the "
+            "plain-language voice (plain-language.md, kind C)") in routing
+
+
+def test_routing_tells_code_comments_from_review_comments() -> None:
+    """Two rows that both say just "comments" give a comment-only task two answers, so each
+    row names its own kind of comment."""
+    routing = (SKILLS_ROOT / "devkit" / "_shared" / "references" / "routing.md").read_text(encoding="utf-8")
+    rows = [ln for ln in routing.splitlines() if ln.startswith("| ") and "comment" in ln.lower()]
+    wfh = [r for r in rows if r.rstrip().endswith("| write-for-humans |")]
+    assert wfh == ["| Release notes, changelog entries, PR descriptions, issue, PR and review comments, "
+                   "status reports a person will read | write-for-humans |"]
+    for row in rows:
+        task = row.split("|")[1]
+        assert re.search(r"(issue, PR and review|code|Code) comments", task), row
+    intro = _flat(_devkit("write-docs").split("\n## ", 1)[0].split("\n# write-docs", 1)[1])
+    assert ("issue, PR and review comments, and status reports, use write-for-humans instead; for "
+            "code comments, use craft-code.") in intro
+
+
+def test_tutorials_have_one_opening_order() -> None:
+    """The summary and the runnable example cannot both come first; the summary does."""
+    docs = _flat(_devkit("write-docs"))
+    assert ('the opening order is the "In plain words" summary first, then a **minimal runnable** '
+            "snippet as the first thing after it") in docs
+    assert "lead with a **minimal runnable** snippet" not in docs
+    assert ("In a tutorial, how-to or quickstart, the first thing after the summary is the runnable "
+            "example.") in _flat(_kind("B"))
+
+
+def test_review_docs_flags_voice_only_in_new_or_changed_documents() -> None:
+    """Voice findings are skipped only for a document met incidentally; a requested voice,
+    prose or audience review of an existing document still raises them."""
+    review = _flat(_devkit("review-docs"))
+    assert ("raise them for a document that is new or changed in the work under review, and for any "
+            "document when someone asks for a voice, prose or audience review of it") in review
+    assert ("Skip them only for a document you meet incidentally while reviewing an unrelated "
+            "change") in review
+    assert "A plain paraphrase that changes a fact is an accuracy finding (blocking) in any document." in review
+    assert "only for a document that is new or changed in the work under review" not in review
+    assert "A missing summary or unexplained jargon is a minor finding;" not in review
+
+
+def test_technical_detail_last_is_scoped_to_kind_a() -> None:
+    core = _flat(_voice().split("\n## Core rules", 1)[1].split("\n## ", 1)[0])
+    assert "Where technical detail goes depends on the kind of text." in core
+    assert "Documentation keeps exact names, flags, commands and fields in place" in core
+    assert "- Put technical detail last." not in core

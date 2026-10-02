@@ -25,8 +25,9 @@ unique evidence).
 | Executable security tests / abuse cases | test-security |
 | Integrated diff review | review-code |
 | Documentation | write-docs |
-| Release notes, changelog entries, PR descriptions, comments, status reports a person will read | write-for-humans |
+| Release notes, changelog entries, PR descriptions, issue, PR and review comments, status reports a person will read | write-for-humans |
 | Interface text (labels, buttons, empty states, error messages, tooltips) | craft-code, in the plain-language voice (plain-language.md, kind D) |
+| Code comments (comment-only edits in source files) | craft-code, in the plain-language voice (plain-language.md, kind C); refactor-code only when code is restructured too |
 | Executable documentation checks | test-docs |
 | Documentation accuracy / audience / prose review | review-docs |
 | Failure-path / contract-drift / release-readiness assurance | review-failure-injection / review-contract-drift / review-release-readiness |

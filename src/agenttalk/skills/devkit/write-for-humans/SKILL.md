@@ -54,7 +54,10 @@ templates below, without a "before" and a "now".
 3. **What you will notice.** Use the pattern "Before this, X happened. Now, Y
    happens." Be concrete: what appears, disappears, gets faster or stops failing.
 4. **What you need to do.** An action, or say plainly "Nothing to do."
-5. **Technical details** (last, for developers and reviewers).
+5. **Technical details** (last, for developers and reviewers). In release notes and
+   similar texts (kind A), put technical detail last, in a closing Technical
+   details section. Documentation, code comments and interface text place it
+   differently (see the shared guide).
 
 ## WORDS: plain and short
 - [ ] Use simple words and short sentences, one idea per sentence. Say who does

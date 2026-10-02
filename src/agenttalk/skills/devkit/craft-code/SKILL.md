@@ -3,8 +3,9 @@ name: craft-code
 description: >-
   Write the smallest, simplest, most readable correct change that matches the
   surrounding codebase. Use when implementing a feature, fixing a bug,
-  refactoring production code, or writing interface text (labels, buttons, empty
-  states, error messages, tooltips). Do NOT use for writing tests (use test-coverage),
+  refactoring production code, writing interface text (labels, buttons, empty
+  states, error messages, tooltips), or adding, fixing or rewording only code
+  comments. Do NOT use for writing tests (use test-coverage),
   reviewing an existing diff (use review-code), or documentation (use write-docs).
 reviewed-against: "0.43"
 category: production

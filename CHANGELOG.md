@@ -92,6 +92,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `src/agenttalk/web_static/console2.js` (`fetchAttention`, `getJson`,
   `busyRetryAfterSeconds`). Tests: `tests/console2_data.test.mjs`.
 
+- **Four rules in the new plain-language guide no longer pull in different
+  directions (#269).** The shared guide added above left a few rules that
+  contradicted each other or created needless review findings:
+  - tutorials, how-tos and quickstarts were told to open with both the plain
+    summary and a runnable example. Now the summary comes first, then the
+    example;
+  - a documentation review could flag a missing summary on an old document
+    that nobody changed. Now that finding is raised for new or changed
+    documents, and whenever someone asks for a review of a document's voice,
+    prose or audience, but not for a document met only in passing;
+  - "technical detail last" read as a rule for every kind of text. It now
+    applies to release notes and similar texts; documentation keeps exact
+    details in place, and comments and on-screen text keep only what the
+    reader needs;
+  - a task that only changes code comments might not have found the comment
+    rules. The coding skill now names comment-only edits, and the routing
+    index tells code comments apart from issue, PR and review comments.
+
+  What you need to do: on an existing install, preview with
+  `agenttalk install-skills --dry-run --force`, back up any local edits you
+  want to keep, then run `agenttalk install-skills --force`. A fresh install
+  needs only `agenttalk install-skills`.
+
+  Technical details: `write-docs`, `review-docs`, `craft-code` and
+  `write-for-humans` skills, and `_shared/references/plain-language.md` and
+  `routing.md`; tests in `tests/test_install_skills.py`.
+
 - **Work orders no longer stall after an upgrade (#185, #201).**
   Before, `agenttalk task` refused to send a work order as long as ANY
   other seat in the roster was running an older build than the sender -
