@@ -26,16 +26,26 @@ class PlannedRefused(ValueError):
     what counts as a valid planned record."""
 
 
-def validate_planned(meta):
+def validate_planned(meta, *, sender=None, recipient=None):
     """The ONE structural validator for `planned` metadata (design
     docs/DESIGN-planned-stage.md §3-4): exactly the allowed keys, a valid
-    work_item, and the add/change vs. withdraw shape. Never inspects
-    `replaces` for WHICH record it names or whether that record exists -
-    that is a graph question `work_board.planned_state` answers over the
-    whole log, not a per-record shape question. Returns a clean dict
-    (never echoes an input key this function didn't explicitly validate)."""
+    work_item, the add/change vs. withdraw shape, and - when ``sender``
+    is given (both publish-time ``normalize`` and replay-time
+    ``work_board.planned_state`` pass it; a caller that only has ``meta``,
+    e.g. a unit test checking shape alone, may omit it) - that the record
+    is self-addressed. Self-addressing is checked HERE, structurally
+    (sender == recipient is a shape property of the envelope, never a
+    role/roster lookup), not just at publish time (#279 F9): a stored
+    record from one agent to a DIFFERENT one is invalid on replay too,
+    the same as any other malformed record. Never inspects `replaces` for
+    WHICH record it names or whether that record exists - that is a graph
+    question `work_board.planned_state` answers over the whole log, not a
+    per-record shape question. Returns a clean dict (never echoes an
+    input key this function didn't explicitly validate)."""
     if not isinstance(meta, dict):
         raise PlannedRefused("planned metadata must be an object")
+    if sender is not None and sender != recipient:
+        raise PlannedRefused("a planned record must be self-addressed (sender == recipient)")
     extra = set(meta) - PLANNED_FIELDS
     if extra:
         raise PlannedRefused(
@@ -51,6 +61,12 @@ def validate_planned(meta):
     if withdrawn is True:
         if "work_title" in meta:
             raise PlannedRefused("a withdrawal record must not carry work_title")
+        if "replaces" not in meta:
+            # #279 F4: a withdrawal with nothing to withdraw is not a
+            # terminal state for anything - it would otherwise be
+            # accepted as a rootless "withdrawn" record that permanently
+            # blocks `add` for a work_item that was never even planned.
+            raise PlannedRefused("a withdrawal record requires replaces")
         clean["withdrawn"] = True
     else:
         if "work_title" not in meta:
@@ -291,7 +307,7 @@ def normalize(store, sender, recipient, kind, meta):
         # checks below - none of them apply to it, and routing it through
         # them would validate fields (stage, supersedes, ...) this record
         # must never carry in the first place (design doc §3).
-        return validate_planned(meta)
+        return validate_planned(meta, sender=sender, recipient=recipient)
     result = dict(meta)
     for key in FIELDS:
         if key == "supersedes" and kind == "rescind":

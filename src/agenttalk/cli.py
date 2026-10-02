@@ -8163,7 +8163,7 @@ def _cmd_board_plan(args: argparse.Namespace) -> int:
     if sub not in ("add", "change", "withdraw"):
         sys.stderr.write("agenttalk board plan: the only actions are `add`, `change` and `withdraw`.\n")
         return 2
-    from agenttalk import work_board, work_tags
+    from agenttalk import envelope_snapshot, work_board, work_tags
     store = _get_store(args)
     cfg = store.load_config()
     roster = cfg.get("agents") or []
@@ -8179,20 +8179,45 @@ def _cmd_board_plan(args: argparse.Namespace) -> int:
             f"only they may publish a planned record. See `agenttalk roster`.\n")
         return 2
     work_item = work_tags.value("work_item", args.work_item)
-    messages = store.valid_messages()
-    reduced = work_board.reduce(messages, lead=sole_lead)
-    if reduced.get("error"):
-        # F2/§5: history completeness could not be established - never
-        # guess that nothing real exists for this work_item. Append
-        # nothing (the refusal below raises before any store.send call).
-        raise ValueError(
-            f"agenttalk board plan {sub}: the board's history could not be fully "
-            f"evaluated ({reduced['error']}); refusing rather than risk a wrong "
-            "promotion check. Nothing was published."
-        )
-    real_items = {i["work_item"] for i in reduced["items"]}
-    current = work_board.planned_state(messages, real_items).get(work_item)
-    state = current["state"] if current else "absent"
+
+    def read_history():
+        """issue #279 F1: an archive-aware, coverage-checked read - never
+        `store.valid_messages()` alone, which omits compacted/archived
+        history entirely and silently drops invalid active envelopes.
+        Reuses the same scan/validate machinery the snapshot service's
+        `archives_complete`/`invalid_count` coverage concept is built from
+        (`store._scan_messages_with_paths` + `envelope_snapshot.
+        validate_scanned_rows`), as a direct one-shot read rather than that
+        service's throttled, incremental machinery. Raises rather than
+        returning a possibly-incomplete view."""
+        active_rows, active_scan_invalid = store._scan_messages_with_paths()
+        active, active_rejects = envelope_snapshot.validate_scanned_rows(
+            store, cfg, active_rows, len(active_scan_invalid))
+        archive_dir = store.compacted_dir
+        archive_paths = sorted(archive_dir.iterdir()) if archive_dir.exists() else []
+        archive_rows, archive_scan_invalid = store._scan_messages_with_paths(
+            paths=archive_paths, compacted=True)
+        archive, archive_rejects = envelope_snapshot.validate_scanned_rows(
+            store, cfg, archive_rows, len(archive_scan_invalid))
+        if active_rejects or archive_rejects:
+            raise ValueError(
+                f"agenttalk board plan {sub}: the board's history could not be fully "
+                "evaluated (invalid or unreadable envelopes present); refusing rather "
+                "than risk a wrong promotion check. Nothing was published."
+            )
+        return [m for m, _ in (*active, *archive)]
+
+    def resolve(messages):
+        """F6: promotion means a REAL opener (task/review-request) in
+        complete history, never `work_board.reduce(...)["items"]`'s wider
+        slug set (which also includes a work_item an audit merely flagged
+        evidence against)."""
+        real_items = work_board.real_openers(messages)
+        current = work_board.planned_state(messages, real_items).get(work_item)
+        return current, (current["state"] if current else "absent")
+
+    messages = read_history()
+    current, state = resolve(messages)
 
     def refuse(why: str) -> None:
         raise ValueError(f"agenttalk board plan {sub}: {work_item!r} is {state} ({why}); nothing was published")
@@ -8216,8 +8241,34 @@ def _cmd_board_plan(args: argparse.Namespace) -> int:
                       or "not currently planned; use `add`")
             refuse(reason)
         meta = {"work_item": work_item, "withdrawn": True, "replaces": current["current_id"]}
+
+    def precheck() -> None:
+        # issue #279 F2: the check above and the append below are not one
+        # atomic transition on their own - two concurrent commands can both
+        # read "absent"/the same tip and both publish. Re-run the FULL
+        # precondition check (history + promotion + replaces resolution)
+        # here, INSIDE Store.send's own publication lock, atomic with the
+        # write; whichever caller's precheck runs second sees the first
+        # caller's write and refuses.
+        current2, state2 = resolve(read_history())
+        if sub == "add":
+            if state2 != "absent":
+                reason = _PLAN_TERMINAL_REASON.get(
+                    state2, current2.get("reason") or "already planned; use `change`")
+                raise ValueError(
+                    f"agenttalk board plan {sub}: {work_item!r} is {state2} ({reason}); "
+                    "a concurrent command published first; nothing was published")
+        else:
+            if state2 != "active" or current2["current_id"] != meta["replaces"]:
+                reason = (_PLAN_TERMINAL_REASON.get(state2)
+                          or (current2.get("reason") if current2 else None)
+                          or "not currently planned; use `add`")
+                raise ValueError(
+                    f"agenttalk board plan {sub}: {work_item!r} is {state2} ({reason}); "
+                    "a concurrent command published first; nothing was published")
+
     msg = store.send(sender=sender, recipient=sender, kind="planned",
-                     subject=f"planned: {work_item}", body="", meta=meta)
+                     subject=f"planned: {work_item}", body="", meta=meta, _precheck=precheck)
     if getattr(args, "json", False):
         print(json.dumps({"id": msg.id, "work_item": work_item, "action": sub}, indent=2))
     else:

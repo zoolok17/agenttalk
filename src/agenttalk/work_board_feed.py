@@ -20,6 +20,13 @@ def _closure(messages, slugs):
     """All cycles plus connected request, reply and replacement dependencies."""
     links, seeds = defaultdict(set), set()
     for m in messages:
+        if m.kind == "planned":
+            # issue #279 F3: a planned record must never seed or link into
+            # the real dependency closure - it would otherwise consume the
+            # real closure's envelope/byte budget (a valid plan for an
+            # existing work_item) or poison it via a stray correlation
+            # field on a malformed one.
+            continue
         node = ("id", m.id)
         if isinstance(m.meta.get("work_item"), str) and m.meta["work_item"] in slugs:
             seeds.add(node)

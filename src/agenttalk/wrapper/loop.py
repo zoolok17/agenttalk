@@ -1316,6 +1316,12 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             LOCK_CONTENTION_PHASE_ADMISSION, recv_api.next_record, store, agent)
         now = clock()
         if record is None:
+            # issue #279 F5: nothing visible is pending, but a trailing hidden
+            # control record (e.g. the lead's own self-addressed `planned`
+            # record) may still be sitting above the cursor with nothing to
+            # `commit` against - clear it now, a safe no-child-turn cursor
+            # nudge that never advances past a visible message.
+            _await_lock(LOCK_CONTENTION_PHASE_ADMISSION, recv_api.consume_hidden_tail, store, agent)
             # IDLE. First consult the proactive CADENCE hook (WP3): it gates due-ness
             # itself and, when due, drives at most ONE synthetic sweep turn - WITHOUT
             # ever advancing the cursor / recording an attempt / dead-lettering (this

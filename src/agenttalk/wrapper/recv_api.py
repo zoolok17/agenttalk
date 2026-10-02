@@ -207,3 +207,37 @@ def commit(store, agent: str, record: dict) -> None:
         store.mark_thread_seen(agent, record["scoped"]["request_id"], record["id"])
     else:
         store.advance_cursor(agent, record["id"])
+
+
+def consume_hidden_tail(store, agent: str) -> bool:
+    """GLOBAL only: advance ``agent``'s cursor past a LEADING run of purely
+    hidden (``CONTROL_KINDS``) messages immediately above the current
+    cursor, stopping at - and never consuming - the first VISIBLE message.
+
+    issue #279 F5: ``records()`` filters control kinds (now including
+    ``planned``) out of what it returns, so a poll that finds nothing
+    visible never has a record to ``commit`` - the cursor stays put and
+    ``unread_for`` stays permanently nonzero for a trailing hidden backlog
+    (a lead's own self-addressed planned record, polled forever, never
+    consumed). This is the wrapper's own safe, no-child-turn cursor nudge
+    for exactly that idle case - distinct from ``records()``/``poll()``,
+    which stay strictly non-consuming (a peek, not a commit) so this is
+    opt-in for a caller's own idle point, never a hidden side effect of
+    reading. It only ever advances up to the first visible message (never
+    past it), so a visible message anywhere behind or after a hidden run is
+    never skipped - only the leading hidden run right above the cursor is
+    ever eligible.
+
+    Returns True if the cursor moved.
+    """
+    cursor = store.cursor(agent)
+    msgs = store.messages_for(agent, since_id=cursor or None)
+    hidden_tail = None
+    for m in msgs:
+        if m.kind not in CONTROL_KINDS:
+            break
+        hidden_tail = m.id
+    if hidden_tail is None:
+        return False
+    store.advance_cursor(agent, hidden_tail)
+    return True

@@ -311,8 +311,9 @@ def _reduce(messages, lead, incidents, integrated, running, checks):
         ids = {c.id for c in copies}
         target = copies[0].meta.get("supersedes")
         links = {item_of.get(target)} if isinstance(target, str) else set()
-        links |= {_slug(m.meta) for m in messages if m.meta.get("request_id") == req["request_id"]
-                  or (isinstance(m.meta.get("in_reply_to"), str) and m.meta["in_reply_to"] in ids)}
+        links |= {_slug(m.meta) for m in messages if m.kind != "planned"
+                  and (m.meta.get("request_id") == req["request_id"]
+                       or (isinstance(m.meta.get("in_reply_to"), str) and m.meta["in_reply_to"] in ids))}
         links.discard(None)
         if len(links) == 1:
             grouped.setdefault(links.pop(), []).append(req)  # its malformed-metadata issue makes that item Unknown
@@ -651,14 +652,42 @@ def _policy(slug, valid, cur, current, facts):
 
 # ----------------------------------------------------- planned lane (issue #279)
 
+def real_openers(messages):
+    """The work_items with at least one REAL opener (``task`` or
+    ``review-request``) anywhere in ``messages`` - promotion's exact
+    definition (design doc §5). Deliberately narrower than
+    ``reduce(...)["items"]``'s own slug set: that list also contains a
+    work_item the AUDIT merely flagged evidence against (e.g. a plain
+    ``note`` with a dangling ``in_reply_to`` and a ``work_item`` tag,
+    which ``_audit_one`` attributes via ``owners()`` even though it opens
+    nothing) - counting that as promotion would let an ordinary orphaned
+    message permanently block `add` for a work_item nothing real was ever
+    dispatched for. An opener missing a well-formed ``request_id`` is
+    itself malformed (``_audit_one`` already flags it) and is not counted
+    either - the same admission bar ``reduce()``'s own ``openers`` dict
+    uses."""
+    out = set()
+    for m in messages:
+        if m.kind not in work_tags.OPENERS:
+            continue
+        rid = m.meta.get("request_id")
+        if not isinstance(rid, str) or not rid:
+            continue
+        slug = _slug(m.meta)
+        if slug:
+            out.add(slug)
+    return out
+
+
 def planned_state(messages, real_items):
     """Per-``work_item`` Planned-lane state, replayed PURELY from the full
     validated log - never raises, never mutates its input.
 
-    ``real_items``: the set of work_items the reducer found ANY evidence for
-    (``{i["work_item"] for i in reduce(...)["items"]}`` - "any real opener
-    anywhere in history", design doc §5). Promotion is checked FIRST and
-    wins unconditionally: once a work_item is in ``real_items`` its state is
+    ``real_items``: the set of work_items with a REAL opener anywhere in
+    history - ``real_openers(messages)``, not ``reduce(...)["items"]``'s
+    own slug set (see ``real_openers``'s docstring for why; design doc
+    §5). Promotion is checked FIRST and wins unconditionally: once a
+    work_item is in ``real_items`` its state is
     ``"promoted"`` regardless of what its planned chain looks like, even a
     malformed or cyclic one - a real dispatch makes the plan's own validity
     moot.
@@ -695,7 +724,8 @@ def planned_state(messages, real_items):
         malformed = False
         for m in group:
             try:
-                valid[m.id] = work_tags.validate_planned(m.meta)
+                valid[m.id] = work_tags.validate_planned(
+                    m.meta, sender=m.sender, recipient=m.recipient)
             except (TypeError, ValueError):
                 malformed = True
         if malformed:
@@ -704,25 +734,32 @@ def planned_state(messages, real_items):
             continue
         ids = set(valid)
         replaced_ids = set()
-        broken = None
-        for mid, clean in valid.items():
-            target = clean.get("replaces")
+        # issue #279 F8: collect EVERY structural fault found rather than
+        # overwriting one `broken` variable in iteration order (which made
+        # the reported reason depend on message order, not the fault
+        # itself) - a stable priority then picks ONE reason regardless of
+        # which order the faulty records were scanned in.
+        faults = []
+        for mid in sorted(valid):  # sorted for determinism; priority alone already guarantees it
+            target = valid[mid].get("replaces")
             if target is None:
                 continue
             if target == mid:
-                broken = "a planned record names itself in replaces"
+                faults.append((0, "a planned record names itself in replaces"))
             elif target not in ids:
                 # Missing entirely from the log, present but a different
                 # kind, or present as `planned` for a DIFFERENT work_item -
                 # `ids` is scoped to THIS item's own valid planned records,
                 # so all three collapse to the same "doesn't resolve here".
-                broken = "a planned record's replaces does not resolve to an earlier record of the same work_item"
+                faults.append((1, "a planned record's replaces does not "
+                                 "resolve to an earlier record of the same work_item"))
             else:
                 replaced_ids.add(target)
-        if broken is None and _cyclic_replaces(valid):
-            broken = "the planned records for this work_item form a replaces cycle"
-        if broken:
-            out[item] = {"state": "unknown", "title": None, "current_id": None, "reason": broken}
+        if _cyclic_replaces(valid):
+            faults.append((2, "the planned records for this work_item form a replaces cycle"))
+        if faults:
+            out[item] = {"state": "unknown", "title": None, "current_id": None,
+                        "reason": min(faults)[1]}
             continue
         tips = sorted(ids - replaced_ids)
         if len(tips) != 1:

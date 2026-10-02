@@ -3458,6 +3458,7 @@ class Store:
         _allow_reserved_sender: bool = False,
         _config_locked: bool = False,
         _dispatch_vendors: dict | None = None,
+        _precheck=None,
     ) -> Message:
         if not self.initialized():
             raise FileNotFoundError("agenttalk not initialized; run `agenttalk init`.")
@@ -3479,6 +3480,7 @@ class Store:
                     _allow_reserved_sender=_allow_reserved_sender,
                     _config_locked=True,
                     _dispatch_vendors=_dispatch_vendors,
+                    _precheck=_precheck,
                 )
         config_before = os.stat(self.config_path)
         cfg = self.load_config()
@@ -3619,6 +3621,16 @@ class Store:
                     )
                 if meta.get("external_deliverable") is True and kind in work_tags.OPENERS:
                     work_tags._external_opener(self, sender, kind, meta)
+                if _precheck is not None:
+                    # issue #279 F2: a caller that needs "check a
+                    # precondition against CURRENT history, then publish"
+                    # to be one atomic transition (never a separate
+                    # check-then-send race) re-validates it HERE, inside
+                    # the SAME publication lock the write below uses -
+                    # never a second, nested lock acquisition. Raising
+                    # aborts before anything is written; the `finally`
+                    # below still cleans up the pending temp file.
+                    _precheck()
                 self._reserve_message_publication_sequence(
                     msg.id,
                     self.valid_messages(),

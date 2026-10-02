@@ -45,6 +45,14 @@ def test_message_validate_accepts_well_formed(store: Store) -> None:
 
 @pytest.mark.parametrize("kind", sorted(KNOWN_KINDS))
 def test_message_validate_accepts_all_known_kinds(store: Store, kind: str) -> None:
+    if kind == "planned":
+        # issue #279 F7: `planned` is self-addressed and carries its own
+        # required shape (work_item/work_title) - it cannot take the
+        # generic alpha-to-beta/empty-meta shape every other kind accepts.
+        m = store.send(sender="alpha", recipient="alpha", body="ok", kind=kind,
+                       meta={"work_item": "demo-item", "work_title": "Demo"})
+        m.validate(["alpha", "beta"])
+        return
     m = store.send(sender="alpha", recipient="beta", body="ok", kind=kind)
     m.validate(["alpha", "beta"])
 
@@ -220,6 +228,12 @@ def test_send_rejects_unknown_kind(store: Store) -> None:
 
 @pytest.mark.parametrize("kind", sorted(KNOWN_KINDS))
 def test_send_accepts_every_known_kind(store: Store, kind: str) -> None:
+    if kind == "planned":
+        # issue #279 F7: see test_message_validate_accepts_all_known_kinds.
+        msg = store.send(sender="alpha", recipient="alpha", body="x", kind=kind,
+                         meta={"work_item": "demo-item", "work_title": "Demo"})
+        assert msg.kind == kind
+        return
     msg = store.send(sender="alpha", recipient="beta", body="x", kind=kind)
     assert msg.kind == kind
 

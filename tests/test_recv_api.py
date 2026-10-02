@@ -144,6 +144,59 @@ def test_records_since_and_include_control_knobs(tmp_path) -> None:
     assert all(r["kind"] != "composing" for r in recv_api.records(s, "beta"))
 
 
+# ------------------------------------------------- consume_hidden_tail (F5)
+
+def test_consume_hidden_tail_clears_a_plan_only_tail(tmp_path) -> None:
+    # issue #279 F5: a hidden `planned` record with nothing visible after it
+    # used to leave the cursor stuck forever (poll finds nothing to commit
+    # against) and `unread_for` permanently nonzero.
+    s = _store(tmp_path)
+    s.send(sender="alpha", recipient="alpha", kind="planned", body="",
+          meta={"work_item": "demo", "work_title": "Plan"})
+    for _ in range(3):
+        assert recv_api.poll(s, "alpha")["record"] is None
+    assert s.cursor("alpha") == ""
+    assert len(s.unread_for("alpha")) == 1
+    assert recv_api.consume_hidden_tail(s, "alpha") is True
+    assert s.cursor("alpha") != ""
+    assert s.unread_for("alpha") == []
+    # idempotent: nothing left to consume.
+    assert recv_api.consume_hidden_tail(s, "alpha") is False
+
+
+def test_consume_hidden_tail_does_not_skip_a_visible_message_after_the_plan(tmp_path) -> None:
+    # issue #279 F5 repro "plan before an unread visible message": the
+    # leading hidden run is cleared, but the visible message right after it
+    # must remain unread, never silently consumed.
+    s = _store(tmp_path)
+    s.send(sender="alpha", recipient="alpha", kind="planned", body="",
+          meta={"work_item": "demo", "work_title": "Plan"})
+    visible = s.send(sender="beta", recipient="alpha", body="real work")
+    assert recv_api.consume_hidden_tail(s, "alpha") is True
+    assert [r["id"] for r in recv_api.records(s, "alpha")] == [visible.id]
+    env = recv_api.poll(s, "alpha")
+    assert env["record"]["id"] == visible.id
+
+
+def test_consume_hidden_tail_does_not_skip_an_earlier_unread_visible_message(tmp_path) -> None:
+    # issue #279 F5 repro "plan between two visible messages": an EARLIER
+    # unread visible message must never be skipped by this cursor nudge -
+    # only a LEADING run of hidden records right above the cursor is
+    # eligible, and the first visible message always stops the scan.
+    s = _store(tmp_path)
+    earlier = s.send(sender="beta", recipient="alpha", body="first")
+    s.send(sender="alpha", recipient="alpha", kind="planned", body="",
+          meta={"work_item": "demo", "work_title": "Plan"})
+    later = s.send(sender="beta", recipient="alpha", body="second")
+    assert recv_api.consume_hidden_tail(s, "alpha") is False
+    assert [r["id"] for r in recv_api.records(s, "alpha")] == [earlier.id, later.id]
+    # once the wrapper delivers+commits the earlier visible message in the
+    # normal way, the plan is now a leading hidden run again and clears.
+    recv_api.commit(s, "alpha", recv_api.next_record(s, "alpha"))
+    assert recv_api.consume_hidden_tail(s, "alpha") is True
+    assert [r["id"] for r in recv_api.records(s, "alpha")] == [later.id]
+
+
 # --------------------------------------------------- recv --json CLI mirror
 
 

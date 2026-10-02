@@ -58,6 +58,7 @@ def test_validate_planned_accepts_add_and_change_and_withdraw_shapes() -> None:
     ({"work_item": "demo", "withdrawn": False}, "withdrawn must be true"),
     ({"work_item": "demo", "withdrawn": "true"}, "withdrawn must be true"),
     ({"work_item": "demo", "withdrawn": True, "work_title": "x"}, "must not carry work_title"),
+    ({"work_item": "demo", "withdrawn": True}, "requires replaces"),
     ({"work_item": "demo", "work_title": "x", "replaces": ""}, "nonblank message id"),
     ({"work_item": "demo", "work_title": "x", "replaces": 5}, "nonblank message id"),
     ({"work_item": "demo", "work_title": "x", "attention": {}}, "unsupported metadata"),
@@ -182,6 +183,38 @@ def test_planned_state_competing_tips_is_unknown(store: Store) -> None:
     assert "competing" in state["demo"]["reason"]
 
 
+def test_planned_state_broken_chain_reason_is_order_independent() -> None:
+    # issue #279 F8: a self-edge fault and a missing-predecessor fault on two
+    # DIFFERENT records for the same work_item must report the SAME reason
+    # regardless of which record is scanned first - a stable priority, not
+    # iteration order, decides.
+    from dataclasses import replace
+    from test_work_board_reducer import LEAD, Bus
+    bus = Bus()
+    m = bus.add(LEAD, LEAD, "planned", {"work_item": "demo", "work_title": "Seed"})
+    a = replace(m, id="a", meta={"work_item": "demo", "work_title": "A", "replaces": "a"})
+    b = replace(m, id="b", meta={"work_item": "demo", "work_title": "B", "replaces": "missing"})
+    forward = work_board.planned_state([a, b], set())
+    reverse = work_board.planned_state([b, a], set())
+    assert forward == reverse
+    assert "names itself" in forward["demo"]["reason"]
+
+
+def test_planned_state_refuses_a_non_self_addressed_record_on_replay() -> None:
+    # issue #279 F9: self-addressing is a structural shape property, checked
+    # on replay too, not just at publish time - a stored record from lead to
+    # dev (e.g. a pre-F9 log entry, or a hand edit) must not be accepted as
+    # an active plan.
+    from dataclasses import replace
+    from test_work_board_reducer import LEAD, Bus
+    bus = Bus()
+    m = bus.add(LEAD, LEAD, "planned", {"work_item": "demo", "work_title": "Plan"})
+    nonself = replace(m, recipient="dev")
+    state = work_board.planned_state([nonself], set())
+    assert state["demo"]["state"] == "unknown"
+    assert "malformed" in state["demo"]["reason"]
+
+
 def test_planned_state_malformed_record_in_chain_is_unknown() -> None:
     # A malformed planned record can only ever exist via a path that
     # bypasses today's publish-time validator (a hand edit, or a future
@@ -204,6 +237,20 @@ def test_planned_state_promotion_wins_over_a_broken_chain(store: Store) -> None:
     _planned(store, work_item="demo", title="Branch B", replaces=m1.id)  # competing tips
     state = work_board.planned_state(store.valid_messages(), {"demo"})
     assert state["demo"] == {"state": "promoted", "title": None, "current_id": None, "reason": None}
+
+
+def test_planned_state_withdrawal_without_replaces_is_not_accepted_as_terminal() -> None:
+    # issue #279 F4: a withdrawal with nothing to withdraw must never be
+    # accepted as a rootless terminal state - store.send itself now refuses
+    # this at publish time (tested above), so this simulates a record that
+    # bypassed that validator (a hand edit, or a pre-F4 log entry) the same
+    # way test_planned_state_malformed_record_in_chain_is_unknown does.
+    from test_work_board_reducer import LEAD, Bus
+    bus = Bus()
+    bus.add(LEAD, LEAD, "planned", {"work_item": "demo", "withdrawn": True}, raw=True)
+    state = work_board.planned_state(bus.messages, set())
+    assert state["demo"]["state"] == "unknown"
+    assert "malformed" in state["demo"]["reason"]
 
 
 def test_planned_state_unattributable_record_is_silently_ignored() -> None:
@@ -248,6 +295,63 @@ def test_work_board_feed_activity_excludes_planned_records() -> None:
     assert after_event == before_event
 
 
+# -------------------------------------- F3: planned records are invisible to real closures
+
+def test_planned_record_does_not_consume_the_real_closure_budget() -> None:
+    """issue #279 F3(a): a valid plan for an EXISTING real work_item must not
+    be pulled into the real item's dependency closure and spend its
+    envelope budget - the full feed (coverage + the real card) must be
+    byte-identical with and without the plan present."""
+    import json
+    from test_work_board_feed import project
+    from test_work_board_reducer import BUILDER, ITEM, LEAD, Bus
+    bus = Bus()
+    bus.task("tk-real", BUILDER, "build")
+    before = project(bus, envelope_limit=1)
+    bus.add(LEAD, LEAD, "planned", {"work_item": ITEM, "work_title": "Plan"})
+    after = project(bus, envelope_limit=1)
+    assert before["coverage"]["status"] == "complete"
+    assert json.dumps(after["coverage"], sort_keys=True) == json.dumps(before["coverage"], sort_keys=True)
+    assert json.dumps(after["items"], sort_keys=True) == json.dumps(before["items"], sort_keys=True)
+
+
+def test_malformed_planned_record_does_not_poison_the_real_feed() -> None:
+    """issue #279 F3(b): a malformed planned record (a forbidden in_reply_to,
+    added raw so it bypasses normalize() like a hand-edited log entry would)
+    must not turn the real work_item's feed row Unknown nor its coverage
+    incomplete - the real feed is byte-identical with and without it."""
+    import json
+    from test_work_board_feed import project
+    from test_work_board_reducer import BUILDER, ITEM, LEAD, Bus
+    bus = Bus()
+    bus.task("tk-real", BUILDER, "build")
+    before = project(bus)
+    bus.add(LEAD, LEAD, "planned", {"work_item": ITEM, "in_reply_to": "nonexistent"}, raw=True)
+    after = project(bus)
+    assert before["coverage"]["status"] == "complete"
+    assert json.dumps(after["coverage"], sort_keys=True) == json.dumps(before["coverage"], sort_keys=True)
+    assert json.dumps(after["items"], sort_keys=True) == json.dumps(before["items"], sort_keys=True)
+
+
+def test_raw_planned_record_sharing_request_id_does_not_attribute_a_real_card() -> None:
+    """issue #279 F3(c): a raw planned record that happens to share a
+    request_id with a malformed/detached real opener must not be used to
+    attribute (or thereby fabricate) a real card for the planned record's
+    own work_item - the detached opener's own "ambiguous/malformed" fate is
+    unchanged by the planned record's presence."""
+    from dataclasses import replace
+    from test_work_board_reducer import BUILDER, ITEM, LEAD, Bus
+    bus = Bus()
+    m = bus.task("tk-bad", BUILDER, "build")
+    bad_task = replace(m, id="task", kind="task", recipient="dev",
+                        meta={"request_id": "tk-bad", "work_item": "BAD SLUG", "stage": "build"})
+    raw_plan = replace(m, id="plan", kind="planned", sender=LEAD, recipient=LEAD,
+                        meta={"work_item": ITEM, "work_title": "Demo", "request_id": "tk-bad"})
+    before = work_board.reduce([bad_task], lead=LEAD)
+    after = work_board.reduce([bad_task, raw_plan], lead=LEAD)
+    assert before["items"] == after["items"] == []
+
+
 # ----------------------------------------------------------- CLI: transition table (F2)
 
 def test_cli_plan_add_then_add_again_refuses(store: Store, store_root) -> None:
@@ -256,6 +360,87 @@ def test_cli_plan_add_then_add_again_refuses(store: Store, store_root) -> None:
                 "--work-title", "T"], store_root) == 0
     _run_expect_exit(["board", "plan", "add", "--from", "alpha", "--work-item", "demo",
                      "--work-title", "T2"], store_root, 2)
+
+
+# ----------------------------------------------------------- F1: archive-aware, coverage-checked history
+
+def test_cli_plan_add_refuses_when_an_active_plan_was_archived(store: Store, store_root) -> None:
+    # issue #279 F1: `store.valid_messages()` alone omits compacted/archived
+    # history, so after the original plan is archived a second `add` used to
+    # see "absent" and wrongly succeed, leaving two competing roots. The
+    # archive-aware read must still see it and refuse.
+    store.set_role("alpha", "lead")
+    assert _run(["board", "plan", "add", "--from", "alpha", "--work-item", "demo",
+                "--work-title", "T"], store_root) == 0
+    assert store.archive_messages_below("z")
+    _run_expect_exit(["board", "plan", "add", "--from", "alpha", "--work-item", "demo",
+                     "--work-title", "T2"], store_root, 2)
+
+
+def test_cli_plan_add_refuses_against_an_archived_real_opener(store: Store, store_root) -> None:
+    # issue #279 F1+F6: a real dispatch that has since been archived must
+    # still count toward promotion - an invisible real opener must never
+    # let `add` through.
+    store.set_role("alpha", "lead")
+    store.send(sender="alpha", recipient="beta", kind="task", body="work",
+              meta={"work_item": "demo", "request_id": "tk-demo", "stage": "build"})
+    assert store.archive_messages_below("z")
+    _run_expect_exit(["board", "plan", "add", "--from", "alpha", "--work-item", "demo",
+                     "--work-title", "T"], store_root, 2)
+
+
+def test_cli_plan_add_refuses_when_an_active_envelope_is_corrupt(store: Store, store_root) -> None:
+    # issue #279 F1: a corrupt/unreadable active envelope used to be
+    # silently dropped by `store.valid_messages()`, letting `add` through
+    # despite history completeness being impossible to establish.
+    store.set_role("alpha", "lead")
+    (store.messages_dir / "bad.json").write_text("{broken", encoding="utf-8")
+    _run_expect_exit(["board", "plan", "add", "--from", "alpha", "--work-item", "demo",
+                     "--work-title", "T"], store_root, 2)
+
+
+# ----------------------------------------------------------- F2: atomic check-then-publish
+
+def test_cli_plan_concurrent_adds_exactly_one_wins(store: Store, store_root, monkeypatch) -> None:
+    # issue #279 F2: deterministic interleave at the pre-send boundary (the
+    # reviewer's own technique) - a second, fully independent `add` command
+    # completes AFTER the first has decided "absent" but BEFORE the first's
+    # own write lands. The precheck re-validates atomically with the append:
+    # exactly one command succeeds, the other refuses, and the replayed
+    # state is a clean "active" (never two competing roots/"unknown").
+    from agenttalk.store import Store as StoreClass
+    store.set_role("alpha", "lead")
+    original_send = StoreClass.send
+    entered = {"value": False}
+
+    def interleaved_send(self, **kwargs):
+        if kwargs.get("kind") == "planned" and not entered["value"]:
+            entered["value"] = True
+            inner_rc = _run(["board", "plan", "add", "--from", "alpha", "--work-item", "demo",
+                            "--work-title", "Inner"], store_root)
+            assert inner_rc == 0
+        return original_send(self, **kwargs)
+
+    monkeypatch.setattr(StoreClass, "send", interleaved_send)
+    outer_rc = _run(["board", "plan", "add", "--from", "alpha", "--work-item", "demo",
+                    "--work-title", "Outer"], store_root)
+    assert outer_rc == 2
+    state = work_board.planned_state(store.valid_messages(), set())["demo"]
+    assert state["state"] == "active"
+    assert state["title"] == "Inner"
+
+
+# ----------------------------------------------------------- F6: promotion is a real opener only
+
+def test_cli_plan_add_not_blocked_by_an_orphan_note(store: Store, store_root) -> None:
+    # issue #279 F6: an ordinary note with a dangling in_reply_to and a
+    # matching work_item tag is NOT a real opener - it must not permanently
+    # block `add` for a work_item nothing real was ever dispatched for.
+    store.set_role("alpha", "lead")
+    store.send(sender="alpha", recipient="alpha", kind="note", body="",
+              meta={"work_item": "demo", "in_reply_to": "missing"})
+    assert _run(["board", "plan", "add", "--from", "alpha", "--work-item", "demo",
+                "--work-title", "T"], store_root) == 0
 
 
 def test_cli_plan_change_without_existing_refuses(store: Store, store_root) -> None:

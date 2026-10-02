@@ -69,6 +69,16 @@ policy, stated once, implemented by `work_tags.validate_planned` /
 `work_board.planned_state` never reading `m.sender` for anything beyond
 identifying the self-addressed pair.
 
+**Self-addressing IS checked structurally at replay too (fix round 1,
+F9).** This is not a role-authority re-check - it is the record's own
+*shape*: `sender == recipient` is as much a part of a well-formed
+`planned` record as `work_item`/`work_title` are, so
+`work_tags.validate_planned(meta, sender=..., recipient=...)` runs this
+check on every replay the same way it runs at publish, and a stored
+record from the lead to a second agent (a pre-fix log entry, or a hand
+edit) is treated as malformed - the item is Unknown, never silently
+accepted as active.
+
 ---
 
 ## 2. Identity: `replaces`, not order - the state machine (closes F2)
@@ -199,21 +209,36 @@ resurrect a Done or any other real card.
 Once any `task`/`review-request` exists anywhere in the log for a
 `work_item`, that item **never shows as Planned again** - including
 after its Done card ages off the board's 7-day window. "Promoted" is a
-property of the reducer's full history
-(`{i["work_item"] for i in work_board.reduce(...)["items"]}`, fed
-straight into `planned_state`'s `real_items` argument, §2), never of what
-is currently *displayed* - display expiry is not a new planning decision.
-To plan the same conceptual work again, use a fresh `work_item`.
-`board plan add` enforces this directly: it refuses, naming the existing
-work, when the given `work_item` already has any real opener in history -
-so the lead learns the rule at the moment they would have broken it, not
-by reading this document.
+property of the log's full history, computed by `work_board.real_openers`
+and fed straight into `planned_state`'s `real_items` argument (§2), never
+of what is currently *displayed* - display expiry is not a new planning
+decision. **Promotion means an actual real opener in complete history -
+not `work_board.reduce(...)["items"]`'s wider slug set.** That reducer
+output also contains a `work_item` the audit merely *flagged evidence
+against* (e.g. an ordinary `note` with a dangling `in_reply_to` and a
+matching `work_item` tag, which `_audit_one` attributes via `owners()`
+even though it opens nothing); counting that as promotion would let an
+ordinary orphaned message permanently block `add` for a `work_item`
+nothing real was ever dispatched for (fix round 1, F6). `real_openers`
+only counts a `task`/`review-request` with a well-formed `request_id` -
+the same admission bar `reduce()`'s own `openers` dict uses. To plan the
+same conceptual work again, use a fresh `work_item`. `board plan add`
+enforces this directly: it refuses, naming the existing work, when the
+given `work_item` already has any real opener in history - so the lead
+learns the rule at the moment they would have broken it, not by reading
+this document.
 
 **Coverage caveat:** `add`'s refusal check, and promotion generally, can
-only be as complete as the reducer's own view of history. When archive or
-coverage history is incomplete, "no opener exists for this `work_item`"
-is never asserted - the item is Unknown, the same honest treatment the
-rest of the board already gives incomplete coverage.
+only be as complete as its view of history. `board plan` reads an
+archive-aware, coverage-checked history (fix round 1, F1): both active
+and compacted/archived envelopes, validated fresh against the current
+roster/signing context, reusing `store._scan_messages_with_paths` +
+`envelope_snapshot.validate_scanned_rows` rather than `reduce()`'s own
+(non-coverage-checked) `error` field. Any invalid or unreadable envelope,
+active or archived, makes completeness impossible to establish - `add`/
+`change`/`withdraw` all REFUSE outright rather than asserting "no opener
+exists for this `work_item`" on a possibly-incomplete view, the same
+honest treatment the rest of the board already gives incomplete coverage.
 
 ---
 
