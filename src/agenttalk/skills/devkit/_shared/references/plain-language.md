@@ -26,12 +26,15 @@ between agents are not covered; see "Out of scope" at the end.
 - Explain every technical term the first time it appears, or avoid it.
 - Never invent a number, a name or a place that the source does not give.
 - Keep every fact. The one exception is anything sensitive:
-  - secrets (passwords, keys, tokens) are removed from every text, whoever reads it, and so
-    is anyone else's private data;
-  - real private or customer records pasted into prose, examples, logs or public pages are
-    removed or summarised safely;
-  - product data shown on purpose to the signed-in person it belongs to stays: a screen that
-    says `Your delivery address is {customer.address}` is correct;
+  - secrets (passwords, keys, tokens) are removed from every text, whoever reads it;
+  - private data is shown only to a reader who is authorized to see it for this purpose:
+    their own data, or data the product's access rules let them see. A screen that shows
+    `Your delivery address is {customer.address}` to that customer is correct, and so is a
+    fulfilment screen that shows the address to the staff member handling the order;
+  - private data is never shown to anyone who is not authorized to see it, and real private
+    or customer records are never pasted into examples, prose, logs or public pages: remove
+    them, or summarise them safely;
+  - this is a writing rule: it never replaces or invents the product's own access checks;
   - internal-only paths, hostnames and addresses are removed from anything a public or
     unauthorized audience sees (release notes, a public page, an error sent to a remote
     caller). Local diagnostics and private run guides keep the path, or another safe
@@ -105,8 +108,9 @@ between agents are not covered; see "Out of scope" at the end.
 - Words: use the same name for the same thing everywhere in the interface and the
   documentation.
 - Privacy: never show a secret (a password, a key, a token), anywhere, including in error
-  details. Show a person their own data where that is the screen's purpose, never someone
-  else's. Hide internal paths and hostnames only from people who should not see them: a
+  details. Show private data only to a reader the product authorizes to see it (their own
+  data, or data their role lets them see), never to anyone else; the text never replaces the
+  product's access checks. Hide internal paths and hostnames only from people who should not see them: a
   public page, or an error sent to a remote caller. A local diagnostic keeps the path, for
   example `cannot save the order: /var/lib/shop/orders.db is read-only`, because it is what
   lets the person fix the problem.

@@ -56,8 +56,9 @@ Work the checklist top to bottom; don't skip the AFTER gate.
       kind C).
 - [ ] Interface text (labels, buttons, empty states, error messages, tooltips): as
       short as possible, say what the person can do next, never blame the reader, and
-      never show a secret or someone else's data (a person's own data on their own
-      screen is fine). Hide internal paths only from public or unauthorized readers
+      never show a secret. Show private data only to a reader the product authorizes
+      to see it (their own data, or what their role allows); the text never replaces
+      the access checks. Hide internal paths only from public or unauthorized readers
       (a public page, a remote error response); a local diagnostic keeps the path when it
       helps the person fix the problem (../_shared/references/plain-language.md, kind D).
 - [ ] Handle errors **by expectedness**: fail fast on programmer bugs; exceptions for

@@ -705,6 +705,10 @@ def test_plain_language_leaves_agent_messages_compact() -> None:
     "or version, who, how many, how long, in what order.",
     "Never invent a number, a name or a place that the source does not give.",
     '"Released" means a new version can be installed; it does not mean anyone is using it yet.',
+    "paths, hostnames and addresses are removed from anything a public or unauthorized audience "
+    "sees (release notes, a public page, an error sent to a remote caller). Local diagnostics and "
+    "private run guides keep the path, or another safe identifier, when it is what lets the "
+    "person fix the problem.",
     "Wherever the language or the data format tells them apart, they are different facts, so "
     "say which one it is: the field is left out entirely (absent); the field is there but set "
     'to "no value" (null); the field is there but holds "undefined" (in JavaScript, '
@@ -770,15 +774,24 @@ def test_proposed_examples_are_checked_against_the_proposal_not_run() -> None:
     assert 'An example of proposed behavior is marked "proposed, not runnable yet"' in _flat(_kind("B"))
 
 
-def test_own_data_stays_but_pasted_records_and_others_data_never() -> None:
+def test_private_data_follows_authorization_not_ownership() -> None:
+    """Staff may be authorized to see a customer's data, so the rule is who may see it,
+    not whose it is; and it is a writing rule, never an access check."""
     core = _flat(_voice().split("\n## Core rules", 1)[1].split("\n## ", 1)[0])
-    assert "and so is anyone else's private data" in core
-    assert "real private or customer records pasted into prose, examples, logs or public pages" in core
-    assert "product data shown on purpose to the signed-in person it belongs to stays" in core
-    assert "`Your delivery address is {customer.address}` is correct" in core
-    assert "Show a person their own data where that is the screen's purpose, never someone else's." in _flat(
-        _kind("D"))
-    assert "never show a secret or someone else's data" in _flat(_devkit("craft-code"))
+    assert "private data is shown only to a reader who is authorized to see it for this purpose" in core
+    assert "or data the product's access rules let them see" in core
+    assert "a fulfilment screen that shows the address to the staff member handling the order" in core
+    assert "private data is never shown to anyone who is not authorized to see it" in core
+    assert "real private or customer records are never pasted into examples, prose, logs or public pages" in core
+    assert "this is a writing rule: it never replaces or invents the product's own access checks" in core
+    kind_d = _flat(_kind("D"))
+    assert "Show private data only to a reader the product authorizes to see it" in kind_d
+    craft = _flat(_devkit("craft-code"))
+    assert "Show private data only to a reader the product authorizes to see it" in craft
+    for text in (core, kind_d, craft):
+        assert "someone else's" not in text
+        assert "anyone else's private data" not in text
+        assert "the signed-in person it belongs to" not in text
 
 
 def test_changelog_tells_existing_installs_to_force_refresh() -> None:
