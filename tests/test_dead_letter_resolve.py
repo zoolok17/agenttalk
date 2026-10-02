@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from agenttalk import cli, doctor
 from agenttalk.store import Store
 from agenttalk.wrapper import recv_api
@@ -39,6 +41,28 @@ def _run(root: Path, *argv: str) -> int:
     return cli.main(["--root", str(root), *argv])
 
 
+@pytest.mark.parametrize("disposed", [False, True])
+def test_resolve_closes_notice_and_repeat_changes_nothing(tmp_path, disposed):
+    from agenttalk import threads
+    s = _store(tmp_path)
+    mid = _dead_letter(s)
+    emit = cli._dead_letter_notifier(s, "beta")
+    assert emit({"msg_id": mid, "agent": "beta", "from": "claude", "kind": "message",
+                 "attempts": 3, "failure_class": "poison_eligible"}, disposed=disposed)
+    notice = next(m for m in s.valid_messages() if m.kind == "question")
+    rid = notice.meta["request_id"]
+    command = ("dead-letter", "resolve", "--from", "claude", "--agent", "beta", "--id", mid,
+               "--reason", "handled out of band")
+    assert _run(tmp_path, *command) == 0
+    rows = threads.derive_threads(s.valid_messages(), agent="claude", cursor="")
+    assert next(t for t in rows if t.request_id == rid).operator_state == "answered"
+    # Include sidecars, the audit log, bus, and cursor state in the no-op check.
+    before = {p.relative_to(s.dir): p.read_bytes() for p in s.dir.rglob("*") if p.is_file()}
+    assert _run(tmp_path, *command) == 0
+    after = {p.relative_to(s.dir): p.read_bytes() for p in s.dir.rglob("*") if p.is_file()}
+    assert before == after
+
+
 def test_resolve_requires_liaison_authority(tmp_path: Path) -> None:
     s = _store(tmp_path)
     mid = _dead_letter(s)
@@ -47,6 +71,43 @@ def test_resolve_requires_liaison_authority(tmp_path: Path) -> None:
               "--agent", "beta", "--id", mid, "--reason", "not authorized")
     assert rc == 2
     assert cli._dead_letter_resolution_state(s).get(("beta", mid)) is None
+
+
+def test_resolve_retries_only_pending_notices_without_rewriting_decision(tmp_path, monkeypatch):
+    from agenttalk import attention, threads
+    s = _store(tmp_path)
+    mid = _dead_letter(s)
+    emit = cli._dead_letter_notifier(s, "beta")
+    info = {"msg_id": mid, "agent": "beta", "from": "claude", "kind": "message",
+            "attempts": 3, "failure_class": "poison_eligible"}
+    assert emit(info, disposed=False)
+    assert emit(info, disposed=True)
+    assert emit(dict(info, msg_id="unrelated"), disposed=False)
+    pending = [m for m in s.valid_messages() if m.kind == "question" and m.meta["dl_msg_id"] == mid]
+    assert len(pending) == 2
+    command = ("dead-letter", "resolve", "--from", "claude", "--agent", "beta", "--id", mid,
+               "--reason", "handled")
+    real_send = Store.send
+
+    def interrupted_send(store, **kwargs):
+        if kwargs.get("meta", {}).get("request_id") == pending[1].meta["request_id"]:
+            raise OSError("notice publication interrupted")
+        return real_send(store, **kwargs)
+
+    monkeypatch.setattr(Store, "send", interrupted_send)
+    assert _run(tmp_path, *command) == 0
+    decisions = attention.read_dispositions(s)
+    sidecar = (s.dead_letter_dir / "beta" / f"{mid}.resolved.json").read_bytes()
+    monkeypatch.setattr(Store, "send", real_send)
+    assert _run(tmp_path, *command) == 0
+    assert attention.read_dispositions(s) == decisions
+    assert (s.dead_letter_dir / "beta" / f"{mid}.resolved.json").read_bytes() == sidecar
+    answers = [m for m in s.valid_messages() if m.meta.get("dead_letter_resolved") == "true"]
+    assert len(answers) == 2
+    assert {m.meta["request_id"] for m in answers} == {m.meta["request_id"] for m in pending}
+    rows = threads.derive_threads(s.valid_messages(), agent="claude", cursor="")
+    assert sum(t.operator_state == "answered" for t in rows) == 2
+    assert sum(t.operator_state == "pending" for t in rows) == 1
 
 
 def test_resolve_requires_reason(tmp_path: Path) -> None:

@@ -10333,6 +10333,10 @@ def cmd_reply(args: argparse.Namespace) -> int:
         if not args.quiet:
             print(f"(reply operation already recorded: id={msg.id})")
         return 0
+    if kind == "task-response" and "status" not in meta and not str(meta.get("verdict") or "").strip():
+        sys.stderr.write(
+            "agenttalk reply: warning: this task will stay open; close it with --meta status=done.\n"
+        )
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: REPLY  {msg.sender} -> {msg.recipient}"))
     _register_await_reply(store, await_record, quiet=args.quiet)
@@ -12757,8 +12761,6 @@ def _pending_dead_letter_notice_request_ids(
             continue
         if str(meta.get("dead_letter", "")).lower() != "true":
             continue
-        if str(meta.get("dl_disposed", "")).lower() != "true":
-            continue
         if str(meta.get("dl_msg_id") or "") != msg_id:
             continue
         row = rows.get(rid)
@@ -12843,6 +12845,15 @@ def _cmd_dead_letter_resolve(store: Store, args: argparse.Namespace) -> int:
                          f"{args.agent}/{args.id}.\n")
         return 2
     src_hash = A.dead_letter_entry_source_hash(entry)
+    if _dead_letter_resolution_state(store).get((args.agent, args.id)) == "resolved":
+        # Retry any notice left pending by an interrupted resolution, without
+        # recording the same operator decision or rewriting its sidecar again.
+        _close_dead_letter_notice_threads(
+            store, actor=actor, agent=args.agent, msg_id=args.id,
+            reason=reason.strip(), evidence=getattr(args, "evidence", None),
+        )
+        print(f"dead-letter {args.agent}/{args.id} already resolved")
+        return 0
     event_id = "att-" + uuid.uuid4().hex[:12]
     A.append_disposition(store, {
         "schema_version": A.SCHEMA_VERSION, "event_id": event_id,
