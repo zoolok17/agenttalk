@@ -11,6 +11,7 @@ that reopens it). Resolution state survives reset (dispositions live under atten
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -119,6 +120,73 @@ def test_resolve_requires_reason(tmp_path: Path) -> None:
               "--agent", "beta", "--id", mid, "--reason", "   ")
     assert rc == 2
     assert cli._dead_letter_resolution_state(s).get(("beta", mid)) is None
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["interrupted-send", "old-resolution"])
+@pytest.mark.parametrize("retry_reason,retry_evidence,warns", [
+    ("transient network blip", "original-log", False),
+    ("confirmed fixed upstream", "new-log", True),
+    ("transient network blip", "new-log", True),
+])
+def test_resolve_retry_uses_recorded_resolution(
+    tmp_path, monkeypatch, capsys, legacy, retry_reason, retry_evidence, warns,
+):
+    from agenttalk import attention as A, threads
+    s = _store(tmp_path)
+    mid = _dead_letter(s)
+    assert cli._dead_letter_notifier(s, "beta")({
+        "msg_id": mid, "agent": "beta", "from": "claude", "kind": "message",
+        "attempts": 3, "failure_class": "poison_eligible",
+    }, disposed=False)
+    side = s.dead_letter_dir / "beta" / f"{mid}.resolved.json"
+    command = ("dead-letter", "resolve", "--from", "claude", "--agent", "beta", "--id", mid)
+    if legacy:
+        # On-disk shape written by the resolver before #277: a durable decision
+        # and sidecar, with the early (dl_disposed=false) notice still unanswered.
+        entry = next(m for m in s.list_dead_letters("beta") if m["message_id"] == mid)
+        source_hash = A.dead_letter_entry_source_hash(entry)
+        resolution = {
+            "event_id": "att-old-resolution", "actor": "claude",
+            "reason": "transient network blip", "evidence": "original-log",
+            "at": "2026-10-01T00:00:00Z",
+        }
+        A.append_disposition(s, {
+            **resolution, "schema_version": A.SCHEMA_VERSION,
+            "item_id": A.item_id(A.SOURCE_DEAD_LETTER, "beta", mid),
+            "source": A.SOURCE_DEAD_LETTER, "action": A.ACTION_RESOLVE_DEAD_LETTER,
+            "source_snapshot": {"source_hash": source_hash,
+                                "refs": [{"kind": "dead_letter", "agent": "beta", "message_id": mid}]},
+        })
+        side.write_text(json.dumps(dict(resolution, source_hash=source_hash)), encoding="utf-8")
+    else:
+        real_send = Store.send
+
+        def interrupted_send(store, **kwargs):
+            if kwargs.get("meta", {}).get("dead_letter_resolved") == "true":
+                raise OSError("notice publication interrupted")
+            return real_send(store, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Store, "send", interrupted_send)
+            assert _run(tmp_path, *command, "--reason", "transient network blip",
+                        "--evidence", "original-log") == 0
+    assert not any(m.meta.get("dead_letter_resolved") for m in s.valid_messages())
+    before = A.dispositions_path(s).read_bytes(), side.read_bytes()
+    capsys.readouterr()
+    assert _run(tmp_path, *command, "--reason", retry_reason, "--evidence", retry_evidence) == 0
+    output = capsys.readouterr()
+    answers = [m for m in s.valid_messages() if m.meta.get("dead_letter_resolved") == "true"]
+    assert len(answers) == 1
+    assert answers[0].body.endswith(": transient network blip")
+    assert answers[0].meta["dead_letter_evidence"] == "original-log"
+    if warns:
+        assert len(output.err.splitlines()) == 1
+        assert "recorded reason/evidence" in output.err
+    else:
+        assert output.err == ""
+    assert (A.dispositions_path(s).read_bytes(), side.read_bytes()) == before
+    rows = threads.derive_threads(s.valid_messages(), agent="claude", cursor="")
+    assert next(t for t in rows if t.opener_kind == "question").operator_state == "answered"
 
 
 def test_resolve_hides_from_default_list_and_doctor(tmp_path: Path) -> None:

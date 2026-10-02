@@ -12845,12 +12845,23 @@ def _cmd_dead_letter_resolve(store: Store, args: argparse.Namespace) -> int:
                          f"{args.agent}/{args.id}.\n")
         return 2
     src_hash = A.dead_letter_entry_source_hash(entry)
-    if _dead_letter_resolution_state(store).get((args.agent, args.id)) == "resolved":
+    events, _ = A.read_dispositions(store)
+    recorded = A.fold_dispositions(events).get(
+        A.item_id(A.SOURCE_DEAD_LETTER, args.agent, args.id), {},
+    ).get("dead_letter_resolution")
+    if (recorded and recorded["action"] == A.ACTION_RESOLVE_DEAD_LETTER
+            and recorded["source_snapshot"]["source_hash"] == src_hash):
         # Retry any notice left pending by an interrupted resolution, without
         # recording the same operator decision or rewriting its sidecar again.
+        if (reason.strip() != recorded["reason"].strip()
+                or getattr(args, "evidence", None) != recorded.get("evidence")):
+            sys.stderr.write(
+                "agenttalk dead-letter resolve: retry arguments differ; "
+                "using the recorded reason/evidence.\n"
+            )
         _close_dead_letter_notice_threads(
             store, actor=actor, agent=args.agent, msg_id=args.id,
-            reason=reason.strip(), evidence=getattr(args, "evidence", None),
+            reason=recorded["reason"].strip(), evidence=recorded.get("evidence"),
         )
         print(f"dead-letter {args.agent}/{args.id} already resolved")
         return 0
