@@ -4,206 +4,228 @@
 
 The console's "what needs you" panel should show only what really needs a person.
 Today it can also show warnings left behind by a supervisor that already stopped, and
-old failed messages that pile up without end. An earlier attempt (PR #272) tried to
-filter these out on the server; a review found that most of that filtering could hide
-a real safety warning, which on this panel is the worst thing that can happen. This is
-the contract for doing it safely: a warning may move to a lower-priority "history"
-section with its age shown, but it is never silently removed, and whenever the system
-is not sure, it shows the warning at full severity instead of guessing it away.
+old failed messages that pile up without end. Two earlier attempts to tame this
+(PR #272, and round 1 of this document) both tried to make some of that information
+less prominent — and both times, a review found the exact way that happened could hide
+a real, current safety problem. This round removes every mechanism that could lower or
+uncount a warning, keeping only mechanisms that compress how something is *shown*
+without ever changing whether it's active, counted, and at full severity.
 
-What you will notice once this ships: the panel is exactly as alarming as today for
-anything still a real problem. A supervisor provably not running anymore moves its
-warnings to a quieter history section instead of sitting at the top forever; old
-failed messages that are still unresolved group into one row you can still act on
-individually; nothing that could still be real ever disappears.
+**The one rule, applied without exception this time:** nothing is ever moved, demoted,
+or left out of the count because a supervisor died, an agent retired, or time passed.
+A process-tree HOLD clears only when the existing reset command says so, with its own
+independent checks. Supervisor state becomes a *label*, never a reason to lower
+anything. Old failed messages may be *grouped* for a shorter display, but a group is
+active, counted, full-severity, and every message inside it stays resolvable on its own.
 
-What you need to do: nothing yet — this document has no code. It is the contract later
+What you'll notice: the panel looks almost the same as today, except a process-tree
+hold now says *why* it's still open ("supervisor not running since ...") and a pile of
+old failed messages from one agent collapses into one readable row instead of twenty,
+with nothing about its urgency softened.
+
+What you need to do: nothing yet — docs only. This is the contract later
 implementation PRs must satisfy and be reviewed against.
 
 ---
 
-## 1. Supervisor state: running / not running / unknown
+## 1. Supervisor state: a label, never a gate
 
-Before a supervisor warning can move to history, the system must be SURE the
-supervisor is gone. Any doubt keeps it active.
+**Why this changed:** round 1 planned to use "supervisor not running" as proof a HOLD
+could be shown less prominently. A review found the flaw: a dead supervisor is not
+proof its held processes stopped too — they can keep running, unattended, which is
+exactly when a human is needed most. So this state is now **only ever shown as
+context text on the hold** ("supervisor not running since 14:02"), never used to move,
+demote, or uncount anything (see §2).
 
+**The three states**, computed fresh on every read:
 - **running** — a valid marker names a process, confirmed alive and confirmed to be
-  the same process that wrote the marker (not a different process reusing its PID).
-- **not running** — a valid marker names a process confirmed dead, or confirmed to
-  now be a different process (PID reused). Never reached just because the marker is
-  old; checked fresh every read, so a restarted supervisor is "running" on the very
-  next check.
-- **unknown** — an unreadable/invalid marker, or an inconclusive process check (e.g.
-  access denied). Fail-safe default; shown at full severity, same as "running".
+  the SAME process that wrote the marker (not a different process reusing its PID).
+- **not running** — a valid marker names a process confirmed dead, or confirmed to now
+  be a different process (PID reused).
+- **unknown** — an unreadable/invalid marker, an inconclusive liveness probe, or the
+  marker is missing a usable `pid_start` — the label says "supervisor state unknown",
+  never guesses "not running".
 
 **Technical detail.** Read `supervisor.instance.lock` with
 `Store.read_supervisor_instance_strict()` (`absent`/`valid`/`invalid`) — never
 `read_supervisor_instance()`, which collapses `invalid` into the same `None` as
-`absent` (a damaged marker from a LIVE supervisor would then read as "not running" —
-the review's P2). Both `absent` and `invalid` map to **unknown**; only `valid` is
-eligible for "not running". For a `valid` marker, use
-`Store._probe_owner_identity(pid, pid_start)`: it checks raw liveness
-(`_process_liveness()`), and for an alive PID compares the process's creation time
-(`_process_start_token()`) against the marker's recorded one — a different creation
-time for the same PID number means the original process is gone. Map its outcomes:
-`ALIVE` → running; `DEAD`/`PID_REUSED` → not running; `UNKNOWN`/`START_UNMATCHABLE` →
-unknown. This reuses existing, already-tested lease-steal machinery; nothing new.
+`absent`. Both map to **unknown**. For a `valid` marker, call the module-level function
+`store._probe_owner_identity(pid, pid_start)` (**F6**: it is a module function in
+`store.py`, not a `Store` method — round 1 cited it wrong). It checks raw liveness,
+then for an alive PID compares the process's creation time against the marker's
+recorded one; a mismatch means the original process is gone. Map its outcomes:
+`ALIVE` → running; `DEAD`/`PID_REUSED` → not running; anything else (including a
+missing/invalid `pid_start`, invalid UTF-8 in the marker file, or any raised
+exception) → unknown. Read the marker and probe the PID in two separately-guarded
+steps — a failure in one must never be conflated with, or silently swallow, the other.
 
-## 2. History vs. active
+## 2. There is no "history" for process-tree HOLDs
 
-Only the supervisor-state check above may move a process-tree hold to history.
-Nothing else (age, repeat count) may. Every other item kind (escalations, config/gate
-holds, coordination stalls) stays active unconditionally.
+A HOLD is never moved, demoted, or uncounted for any reason — not supervisor death,
+not retirement, not age. It stays in the active list, at its original severity,
+counted, for as long as it exists. The supervisor-state label from §1 rides alongside
+it as context, nothing more. **The only way a HOLD clears is the existing
+`agenttalk supervise --reset-process-tree-ownership` command**, which has its own,
+independent evidence requirements (stopped-identity proof, admission checks) completely
+unrelated to this panel's display logic — this design does not touch, weaken, or
+duplicate those checks. `process_tree_hold_items()` and every caller of it
+(`cli.py:13710` included) are unaffected: the projector already returns every current
+hold to every caller today, and continues to.
 
-`process_tree_hold_items()` keeps returning every current hold, unfiltered, to every
-caller, stamped with the new tri-state (`supervisor_state`). **The active/history
-split happens only in the `/api/attention`/`/api/risk-register` wire layer, never
-inside the projector.** This matters concretely: `agenttalk supervise
---reset-process-tree-ownership` (`cli.py:13710`) calls the projector directly and
-requires exactly one matching hold; if the split happened there, a hold correctly
-demoted to history would vanish from that list and the command — whose whole job is
-clearing holds for stopped supervisors — would wrongly refuse. Keeping the projector
-whole means that caller needs zero changes. A history item keeps its full evidence and
-severity field; only its queue state and where the console shows it change. A
-degraded read (unreadable config/roster) is never evidence of "not running" — it
-already fails toward active today and this design does not weaken that.
+This directly closes three review findings at once: a dead supervisor's HOLD is never
+hidden because its descendants might still be running; a retired agent's HOLD is never
+hidden because retirement alone is no more proof of a stopped process than supervisor
+death is; and a HOLD whose instance marker is merely unreadable was never a candidate
+for hiding in the first place, since nothing here ever hides a HOLD.
 
-## 3. Defer must not hide a warning that becomes real again
+## 3. One fingerprint, shared, never ticking (F4)
 
-A disposition only applies while the live item's `source_hash` still matches the
-snapshot it was recorded against (`apply_disposition()`, gate 1, already general).
-Fix: **fold the active/history state into the content `source_hash` is computed over**
-for process-tree holds, before `_mk_item()` hashes it. A defer recorded against the
-history-state hash then cannot match once the item recomputes as active (a different
-hash), so it resurfaces, unsuppressed. This fixes the review's P1: today the liveness
-downgrade is applied *after* the hash is computed, so active and history hash
-identically and an old defer silently survives the transition.
+Round 1 proposed folding active/history state into the defer fingerprint so a stale
+disposition couldn't survive a transition that, as of §2, no longer exists for HOLDs.
+What's still needed, re-examined under D1: **one canonical identity fingerprint for a
+process-tree hold, computed the same way everywhere it's compared** — by the web
+collector building the attention wire, by CLI disposition capture (`agenttalk attention
+defer`), and by the reset command's own admission check that it is still looking at the
+same problem it was told about. All three must agree on what "the same hold" means, or
+a defer recorded through one path could silently fail to match a read through another.
+
+The fingerprint is built from the hold's stable identity content — agent, the
+structural reason/status fields — and **must never include a ticking value** (`age`,
+`refreshed_at`, any clock-derived field): a hash that changes every poll can never stay
+matched long enough for a defer to apply at all, which would make deferring a hold
+look broken rather than working as designed.
 
 ## 4. Grouping old failed (dead-letter) messages
 
-**Recommendation: group, reusing the existing `dedupe_key` display-grouping in
-`build_queue()` — not a new mechanism.** `build_queue()` already applies dispositions
-per item, filters by state, then groups the visible items by `dedupe_key` into one
-representative plus a `duplicates` list; `compute_stats()` counts every item BEFORE
-that grouping. Three of four requirements come free, provided each dead letter keeps
-its own unique `item_id`:
-- **Resolving every member clears the group** — free: once no member's state is in
-  the visible set, none reach grouping.
-- **The group keeps every member's id** — `duplicates` already carries every member's
-  `item_id`/`source_refs`; the gap is the web wire only serializes these for
-  escalations today (the review's P2) — must forward them for grouped rows too.
-- **Raw statistics keep counting each message** — already true (`compute_stats` runs
-  pre-group).
-- **The group shows every owner, not just the first** — the one real gap:
-  `_attention_agent()` reads only the representative's own refs. The web wire layer
-  must compute an explicit, de-duplicated owners list from representative +
-  duplicates (fixes the review's other P2).
+**Grouping compresses display; it never hides, demotes, or uncounts.** Every group
+(and every message inside it) is active and full-severity for as long as it exists.
 
-**What actually changes:** nothing in `build_queue()`. Only `dead_letter_items()`
-changes: an entry older than the threshold (§7) gets a *shared* `dedupe_key` (e.g. one
-per agent) instead of a unique one — its `item_id` is untouched. **Invariant that must
-never break:** `doctor.py:1167`'s `_drop_resolved_dead_letters()` parses a dead-letter
-`item_id` as `dead_letter:<agent>:<message_id>` to match resolutions — a shared group
-identity must replace only `dedupe_key`, never `item_id`. A plain capped list (no
-grouping) was considered and rejected: it does worse on all four requirements for no
-less code, once `dedupe_key` is reused rather than reinvented.
+- **Group per agent.** One group per agent, never a group spanning agents — this
+  removes the "whose fault is this" ambiguity a shared group used to create, by
+  construction, rather than by picking a representative owner.
+- **Only letters with a known, finite age at or beyond a named threshold** (recommend
+  keeping the review's own seven days, §9) are eligible for grouping. A letter with a
+  recent, missing, invalid, or future-dated age keeps its own full row, always — age
+  uncertainty is never read as "old enough to group".
+- **A group shows:** its total member count; a bounded preview of members (enough to
+  act on without opening anything else); the one owning agent; and an exact "N more"
+  count for anything past the preview. Nothing in a group is ever left unaccounted.
+- **Overflow of groups themselves:** if there are more per-agent groups than the panel
+  can show, the excess collapses into exactly one further active row — "N more agents
+  have old failed messages" with the true total count across them. This row is never
+  empty and never silently absent; it is the one place "nothing drops to zero" is
+  guaranteed even at the extreme.
+- **Resolve and defer are never group-wide.** Both apply to one original `item_id` and
+  its own source snapshot, exactly as today — grouping is a read/display projection
+  only, with no bulk action implied. **Raw statistics (`compute_stats`) count every
+  letter**, grouped or not, unchanged from today.
+- **Response-byte budget:** the member preview and any owner/diagnostic text reuse the
+  existing `_CAP_*` byte-cap discipline (`attention.py:46`) rather than introducing new
+  unbounded strings; see §7 for the exact caps.
 
-## 5. Ages: unknown is never 0; first-seen is stable
+## 5. Ages: durable evidence, or "unknown" — never a silent guess
 
-An unknown age must say "unknown" — 0 reads as "just happened", a false signal either
-way. A warning rebuilt fresh every poll must still remember when it was FIRST seen.
+An age is shown from the item's own durable evidence when that evidence is valid (a
+dead letter's recorded `deadlettered_at`; a hold's own recorded timestamps). When
+there is no valid durable evidence, the age is **"unknown"**, never `0` — `0` reads as
+"just happened", which is a false signal in exactly the wrong direction.
 
-**Unknown, never 0.** `dead_letter_items()` already does this correctly
-(`_age_seconds_from_iso()`, stamping `age_unknown`). Process-tree holds must adopt the
-same convention instead of `_mk_item()`'s ad-hoc `age_seconds=0.0` default. The web
-wire layer must forward `age_unknown` for process-tree items exactly as it already
-must for the risk register — today `/api/attention` drops it for this source (the
-review's P2), so the console reads a bare number as a known, fresh age.
+**No new durable ledger (F2, reversing round 1).** A first-seen *file* was round 1's
+proposal to fix a hold whose evidence resets every poll; it added a new persisted
+reader/writer for one display field, which is more machinery than the problem needs.
+Instead: if the only thing known is when *this running console* first noticed the
+exact identity, it may say **"observed since &lt;time&gt;"**, kept in memory only, for
+the life of the current server process — explicitly labeled as a **lower bound**, not
+a claim about the true age, since the problem could predate this console's own
+observation. Nothing is written to disk; there is no new reader.
 
-**Stable first-seen.** `_invalid_owned_process_tree_record()` is rebuilt from scratch
-every poll with `refreshed_at = now`; nothing persists when a hold was first observed
-(why the review found a persistent hold's age stuck near zero forever). Introduce a
-small durable **first-seen ledger**: one entry per hold's stable `item_id`, written
-once on first observation, read (never overwritten) on every later poll to compute
-`age_seconds = now - first_seen_at`. Dropped when the identity resolves; a different
-identity (new reason code, new agent) gets its own entry, so this never inherits
-another problem's age. Size capped (§7).
+**Ranking unknown ages (F7).** An item whose age is unknown is never sorted as if it
+were young: give it an explicit, conservative rank — sort it as the OLDEST in its tier,
+matching the existing `age_unknown` → sort-as-infinite convention already used
+elsewhere in this codebase (`web.py`'s risk register), not a new convention.
 
 ## 6. Reader audit
 
 | Reader | Reads today | Changes |
 |---|---|---|
-| Legacy console `humanQueueCount()` (`console.js:1013`) | wire `count`, unfiltered | **None, if `count` stays active-only.** History items go under a separate wire key (e.g. `history_items`) rather than the counted set — fixes the review's P1 (a lone history row reading as "1 needs a human"). |
-| `supervise --reset-process-tree-ownership` (`cli.py:13710`) | projector's raw output, filtered to one match | **None** — per §2 the projector is unchanged. |
-| `doctor.py:1167` (`_drop_resolved_dead_letters`) | `item_id` as `dead_letter:<agent>:<msg_id>` | **None**, provided §4's invariant holds (only `dedupe_key` is shared). |
-| `attention.py` (`build_queue`, `compute_stats`) | every source's items uniformly | No signature change; new fields (`supervisor_state`, `age_unknown`, shared `dedupe_key`) are handled by existing generic logic. |
-| `web.py` (`build_attention`, `build_risk_register`) | full queue, serialized | **Does the real work**: split active/history into separate wire sections, forward `age_unknown`, forward grouped `duplicates`/owners. |
-| v2 console (`console2.js`/model, #267/#271) | `/api/attention` items | **New, additive**: render a history section from the new key. The "needs you" open count is already built per-item, not from a count field, so it is naturally active-only; verify explicitly in review. |
+| Legacy console `humanQueueCount()` (`console.js:1013`) | wire `count`, unfiltered | **None.** Since §2/§4 mean nothing is ever excluded from active/counted, the existing `count = len(wire)` meaning is unchanged. |
+| `supervise --reset-process-tree-ownership` (`cli.py:13710`) | projector's raw output, filtered to one match | **None** — §2 leaves the projector, and every one of its callers, untouched. |
+| `doctor.py:1167` (`_drop_resolved_dead_letters`) | `item_id` as `dead_letter:<agent>:<msg_id>` | **None** — grouping (§4) shares only a display key, never `item_id`. |
+| `attention.py` (`build_queue`, `compute_stats`) | every source's items uniformly | Gains a supervisor-state label field and a per-agent grouping key; no signature change, no new filtering logic (nothing is newly excluded). |
+| `web.py` (`build_attention`, `build_risk_register`) | full queue, serialized | Forwards the supervisor-state context label, `age_unknown`, and grouped member previews/owner/"N more" for dead letters (**F5**). |
+| Both consoles (legacy and v2) | `/api/attention` items | **Must render the grouping** (F5): the v2 console with per-member actions (expand a group to defer/resolve one message); the legacy console with exact CLI instructions where a rich per-member UI doesn't exist. **Action permissions are unchanged**: a HOLD still allows `defer` only (`_ALWAYS_BLOCKING`); dead letters still allow `defer` and `resolve`, never `dismiss` — grouping changes no permission. |
 
-**#280** (dead-letter resolve now also closes prior notices) shrinks the backlog this
-design groups in the first place — a letter resolved under #280 closes before it ever
-reaches §4's age threshold, through the same resolution-fold path `doctor.py:1167`
-uses. No conflict.
+**#280** (dead-letter resolve now also closes prior notices) still shrinks the backlog
+this design groups, upstream of §4's threshold — no conflict. **#251** (attention from
+the cached snapshot) is still orthogonal: nothing here adds a per-poll disk scan.
 
-**#251** (attention from the cached snapshot) is orthogonal: the active/history split
-and the first-seen ledger read supervisor state and a small sidecar, not the message
-store, so neither adds a per-poll scan. Either can land first.
+**One atomic response (F7).** The supervisor-state labels and the dead-letter grouping
+are computed from the same underlying read that builds the rest of the `/api/attention`
+payload — never two reads that could disagree with each other inside one response.
 
 ## 7. Budget
 
-- **History items shown per root:** capped (e.g. 20); beyond it, an explicit "+N more
-  in history" note — never a silent truncation, never a reason to cap the active
-  section (which this design never caps).
-- **Dead-letter groups:** capped per agent-cohort the same way; raw statistics (§4) are
-  never subject to this cap.
-- **First-seen ledger size** (§5): capped (e.g. a few thousand entries), oldest-entry
-  eviction; eviction only resets a stale identity's displayed age, never its
-  visibility or severity.
-- Owners lists and the "+N more" note reuse the existing `_CAP_*` byte-cap discipline
-  (`attention.py:46`) rather than introducing new unbounded strings.
+- **Dead-letter groups:** capped per agent the same way other lists in this payload
+  are; raw statistics (§4) are never subject to this cap.
+- **Member preview per group:** a small, fixed cap (e.g. 5 ids); the exact "N more"
+  count always makes up the difference, never an approximation.
+- **Text bytes:** owner names, preview ids, and the overflow summary line all reuse
+  the existing `_CAP_*` caps (`attention.py:46`); no new unbounded string is
+  introduced anywhere in this design.
+- Process-tree HOLDs are never capped — §2 already forbids excluding one from the
+  active list for any reason, and a cap would be exactly that.
 
 ## 8. Acceptance cases
 
-1. An `absent`/`invalid`/unreadable marker shows full severity (unknown ⇒ active),
-   never demoted.
-2. A `valid` marker whose process is confirmed dead moves to history, age shown.
-3. The same hold, if the supervisor restarts, is active again on the very next read.
-4. A reused PID is treated as "not running" for the original hold, never as "still
-   running".
-5. A hold deferred while in history, whose supervisor then restarts, reappears
-   unsuppressed at full severity on the next read.
-6. Every dead letter past the age threshold still has its own entry in `agenttalk
-   attention --stats`'s raw counts, even while grouped for display.
-7. Resolving every member of a dead-letter group removes the group; resolving some
-   keeps it visible with those gone from `duplicates`.
-8. A dead-letter group spanning two agents shows both as owners, not just one.
-9. A hold with an unparseable/future `refreshed_at` shows `age_unknown: true` and is
-   never sorted as younger than a hold with a known age.
-10. A hold persisting across many polls keeps the SAME first-seen age, never resetting.
-11. The legacy console's count never includes a history-state item.
-12. The v2 console's active list never includes a history-state item.
-13. **An unknown supervisor state shows full severity** — the fail-safe default for
-    every code path in §1, not only case 1 above.
-14. **An active item is never hidden by any history rule** — the only item this design
-    ever demotes is a process-tree hold with a confirmed-dead supervisor; every other
-    item, and every hold whose state is running or unknown, is untouched throughout.
+1. **A dead supervisor with live descendants keeps its hold active at full
+   severity** — a HOLD whose supervisor is confirmed dead stays active, counted,
+   labeled "supervisor not running since ...", never moved or demoted.
+2. A HOLD for a retired agent stays active exactly the same way — retirement is no
+   more proof of a stopped process than supervisor death is.
+3. A HOLD whose marker is `absent`/`invalid`/unreadable, missing `pid_start`, or
+   containing invalid UTF-8, is labeled "supervisor state unknown" (from an isolated,
+   independent failure path) and stays active, same as every other HOLD.
+4. The only way a HOLD leaves the active list is a successful
+   `--reset-process-tree-ownership`; nothing in this panel's own logic clears one.
+5. A defer recorded against a hold's fingerprint keeps applying only while that exact
+   fingerprint (agent + reason/status content, no ticking field) still matches.
+6. A dead letter with a recent, missing, invalid, or future-dated age is never swept
+   into a group — it keeps its own full row.
+7. A dead letter past the age threshold joins its agent's (and only its agent's)
+   group, active, full severity, counted; a group never spans two agents.
+8. Resolving every member of a group removes it from view; resolving some members
+   keeps it visible with an accurate remaining count and preview.
+9. A dead-letter group names its member ids (bounded preview) and an exact "N more" —
+   a person can act on an unlisted member via that count and the CLI.
+10. More per-agent groups than the panel cap collapse into one "N more agents" row
+    carrying the true total — never an empty or missing summary.
+11. `agenttalk attention --stats` counts every dead letter individually, grouped or
+    not.
+12. An item with an unknown age is ranked as the oldest in its tier, never as if it
+    were new; a hold with no durable age evidence, newly observed by this console, is
+    labeled "observed since &lt;time&gt;" — not a bare "unknown", not a persisted file.
+13. Both consoles render dead-letter grouping; the legacy console's count and the v2
+    console's active list are unaffected by grouping or supervisor-state labeling.
+14. Defer remains the only action available on a process-tree HOLD; resolve and
+    defer on a dead letter stay scoped to one original item, never group-wide.
 
 ## 9. Not guaranteed, and open questions
 
-**Not guaranteed:** history changes display urgency, never whether the underlying
-condition (a truncated/invalid process tree) still needs a human eventually. The
-first-seen ledger is a best-effort anchor, not an audit trail; eviction (§7) can reset
-a displayed age, never visibility or severity. Grouping bounds the groups SHOWN, not
-the number of distinct agents that could have old dead letters.
+**Not guaranteed:** this design never promises a HOLD resolves itself — only the
+reset command's own checks do that, unchanged. A console's "observed since" label is a
+lower bound, not the true age, and resets whenever that console process restarts. The
+per-agent group cap bounds groups *shown*, not how many agents could have old letters.
 
 **Open questions:**
-1. *Age threshold for "old" (§4)?* Recommend keeping the review's own seven days — a
-   full week to act, already referenced throughout the findings, no evidence it needs
-   to change.
-2. *Does history need its own disposition actions?* Recommend reusing the existing
-   defer/dismiss/resolve actions unchanged — a second vocabulary has no described need,
-   and §3 already makes the existing ones safe across the transition.
-3. *Does history poll on the same 2s cadence as active?* Recommend a slower, separate
-   cadence (e.g. every 5th active poll, matching `console2.js`'s existing
-   `OTHER_ATTENTION_EVERY`) — history changes slowly by definition, and this avoids
-   adding request volume to a panel #251 is already working to make cheaper.
+1. *Age threshold for "old" (§4)?* Recommend keeping seven days, as before — no new
+   evidence it needs to change, and operators already expect it from the review
+   findings.
+2. *Exact wording of the supervisor-state context label?* Recommend "supervisor not
+   running since `<time>`" / "supervisor running" / "supervisor state unknown" —
+   plain, factual, no urgency language of its own (the HOLD's own severity already
+   carries that).
+3. *Does the reset command's own admission hash need to literally share code with
+   §3's fingerprint, or just agree on content?* Recommend agreeing on content only
+   (same fields, independently computed) rather than a forced shared function —
+   the reset command's checks are intentionally independent of this panel's display
+   logic, and a shared *function* would blur that boundary for no described benefit.
