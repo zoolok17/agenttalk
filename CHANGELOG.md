@@ -97,6 +97,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that every task-response example in the lead skills asks for a closing
   status.
 
+- **The "what needs you" panel now says why a supervisor warning is still open,
+  and folds a pile of old failed messages from one agent into one row (#273).**
+  A process-tree hold used to show no context about the supervisor that
+  raised it; a long-running project could also build up dozens of old,
+  individually-listed failed messages from the same agent, crowding out
+  anything newer. Neither case is ever hidden, moved, or left uncounted —
+  only shown differently.
+
+  What you will notice: a process-tree hold now also says "Supervisor
+  running", "Supervisor not running", or "Supervisor state unknown" — a plain
+  fact, never a reason the warning is less urgent. A dead supervisor is never
+  treated as proof its processes also stopped. Old failed messages (7+ days)
+  from one agent collapse into a single row naming the exact count and the
+  `agenttalk dead-letter`/`agenttalk attention defer` commands to reach any of
+  them; an exact "N more" always makes up the difference. If there are more
+  agents with old messages than the panel can list, the rest collapse into one
+  further row with the true total — never dropped, never an empty summary.
+  The "N open" count at the top of the panel now always reflects every active
+  item, never just the number of rows shown.
+
+  What you need to do: nothing. No new disposition, suppression, or clearance
+  is added — a process-tree hold still clears only via the existing
+  `agenttalk supervise --reset-process-tree-ownership`, and a dead letter
+  still clears only via its own `resolve`/`defer`, one at a time.
+
+  Technical details: `attention.py`'s `source_hash` and `cli.py`'s reset
+  admission comparison are byte-for-byte unchanged (no new fingerprint).
+  `dead_letter_items()` shares a per-agent display `dedupe_key` for letters
+  with a known age ≥ 604800s, reusing `build_queue()`'s existing grouping;
+  `cap_dead_letter_groups()` bounds the member preview (5) and the number of
+  agent groups shown (20, then one overflow row). `process_tree_hold_items()`
+  gains an optional `supervisor_state` context parameter (never a
+  `source_hash`/ident_content input) computed by the new
+  `supervisor_state_label()` helper. `web.py` exposes a new `active_count`
+  field (pre-grouping) on `/api/attention` and `/api/risk-register`; both
+  consoles use it instead of the displayed row count. See
+  `docs/DESIGN-attention-history.md` for the full contract. Tests in
+  `tests/test_attention.py`, `tests/test_web.py`, `tests/test_supervisor.py`
+  and the `console2_needs_you`/`console_runtime_smoke` Node suites.
+
 ### Changed
 
 - **The README and the new-user manual now open in plain words.** Both start
