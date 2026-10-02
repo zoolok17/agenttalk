@@ -41,8 +41,22 @@ HOOK_STDIN_TIMEOUT_SECONDS = 1.0
 CHECKPOINT_READ_LIMIT = 4 * 1024 * 1024
 CHECKPOINT_CONFIG_READ_LIMIT = 1024 * 1024
 SIGNING_KEY_READ_LIMIT = 4096
+# Checked for the Windows CI flakes (2026-10-01) and left as-is: no test
+# exercises the real `_git_output`/`collect_git_state` subprocess path
+# (tests/test_checkpoint.py's only reference monkeypatches `collect_git_
+# state` outright), so this constant cannot make CI flake - unlike
+# BUS_DEADLINE_SECONDS below, which real (non-mocked) tests do exercise.
 GIT_TIMEOUT_SECONDS = 2.0
-BUS_DEADLINE_SECONDS = 2.0
+#
+# BUS_DEADLINE_SECONDS: same pattern, different mechanism - a thread-join
+# wall-clock bound around real file I/O (`_collect_bus_state`'s own store
+# scan), not a subprocess launch, but the SAME "tight bound races against a
+# loaded Windows CI host" shape, and `tests/test_checkpoint.py` exercises
+# it with a real, non-mocked store. Raised from 2.0s to 15s for the same
+# reason and to the same value as the git-subprocess timeouts, so a slow
+# CI host gets a real chance to finish the scan instead of silently
+# degrading to a truncated bus snapshot.
+BUS_DEADLINE_SECONDS = 15.0
 BUS_MAX_FILES = 512
 BUS_MAX_TOTAL_BYTES = 8 * 1024 * 1024
 BUS_MAX_MESSAGE_BYTES = 512 * 1024

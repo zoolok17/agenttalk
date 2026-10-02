@@ -2128,6 +2128,16 @@ def test_older_noncoverage_scan_cannot_invalidate_newer_coverage_attestation(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    # Windows CI flake (2026-10-01, run 36889968462): `release_older.wait(timeout=5.0)`
+    # raced against the MAIN thread's own work (starting `newer_thread`, joining it,
+    # then computing `_coverage_gate` - all real file I/O) before it calls
+    # `release_older.set()` in the `finally` block below. That main-thread work is not
+    # bounded by anything this test controls except `newer_thread.join`'s own timeout,
+    # so the "older" thread's patience must comfortably outlast everything the main
+    # thread might legitimately take on a loaded CI host - a longer guess at the SAME
+    # race is not a fix, so every wait in this test that sits on that same critical
+    # path is forced to this ONE named, generous bound instead.
+    _RELEASE_WAIT_SECONDS = 60.0
     revision = _ci_revision(tmp_path, monkeypatch)
     older_entered = threading.Event()
     release_older = threading.Event()
@@ -2161,7 +2171,7 @@ def test_older_noncoverage_scan_cannot_invalidate_newer_coverage_attestation(
         stdout = ""
         if spec["tool_id"] == "slow-quality":
             older_entered.set()
-            if not release_older.wait(timeout=5.0):
+            if not release_older.wait(timeout=_RELEASE_WAIT_SECONDS):
                 raise RuntimeError("older scan was not released")
         else:
             stdout = "TOTAL 100 9 91%"
@@ -2195,17 +2205,17 @@ def test_older_noncoverage_scan_cannot_invalidate_newer_coverage_attestation(
     intermediate: dict | None = None
     try:
         older_thread.start()
-        assert older_entered.wait(timeout=5.0)
+        assert older_entered.wait(timeout=_RELEASE_WAIT_SECONDS)
         newer_thread.start()
-        newer_thread.join(timeout=10.0)
+        newer_thread.join(timeout=_RELEASE_WAIT_SECONDS)
         assert not newer_thread.is_alive()
         intermediate = json.loads(json.dumps(_coverage_gate(tmp_path, "change")))
         assert intermediate["status"] == "green"
         assert intermediate["evidence"][-1]["coverage_percent"] == pytest.approx(91.0)
     finally:
         release_older.set()
-        older_thread.join(timeout=10.0)
-        newer_thread.join(timeout=10.0)
+        older_thread.join(timeout=_RELEASE_WAIT_SECONDS)
+        newer_thread.join(timeout=_RELEASE_WAIT_SECONDS)
 
     assert not older_thread.is_alive()
     assert not newer_thread.is_alive()
