@@ -251,4 +251,56 @@ test('buildTeamView: a failed, stale chat read never presents its pending decisi
   assert.equal(v.needs.incidents[0].linked, false, 'pending_decisions carries no work_item/work_cycle - never guessed');
 });
 
+// --------------------------------------- build round (#273): grouping/supervisor-state
+
+test('attentionCard: a supervisor-state label is context only, never an action change', () => {
+  const v = view({ attention: attention([
+    { ...ATT_ITEM({ id: 'hold-1', source: 'supervisor', source_label: 'SUPERVISOR HOLD' }),
+      supervisor_state: 'Supervisor not running' },
+  ]) });
+  const card = v.needs.open.find((c) => c.id === 'hold-1');
+  assert.ok(card, 'the HOLD stays active/open');
+  assert.ok(card.evidenceNote.includes('Supervisor not running'),
+    'the label surfaces as context, not a reason to hide/demote the card');
+  assert.equal(card.groupWeight, 1, 'a HOLD is not a dead-letter group - weight is ordinary');
+});
+
+test('a capped dead-letter group counts every member, not just the displayed card', () => {
+  const v = view({ attention: attention([
+    { ...ATT_ITEM({ id: 'dl-beta', source: 'deadletter', source_label: 'DEAD LETTER', severity: 'med' }),
+      group_member_count: 8, group_more_count: 3, group_agent: 'beta',
+      group_cli_instructions: 'Run `agenttalk dead-letter list --agent beta` ...' },
+  ]) });
+  const card = v.needs.open.find((c) => c.id === 'dl-beta');
+  assert.equal(card.groupWeight, 8, 'the card stands for all 8 raw members, not just itself');
+  assert.ok(card.evidenceNote.includes('8 old failed messages from beta'));
+  assert.ok(card.evidenceNote.includes('3 more not shown'));
+  assert.ok(card.evidenceNote.includes('agenttalk dead-letter list'), 'CLI instructions reach ungrouped members');
+  assert.ok(card.options.length > 0, 'a real, single-agent group still offers its ordinary actions');
+  // The badge count reflects the true active total (8), never the 1 displayed card.
+  assert.equal(v.chip.needsCount, 8);
+});
+
+test('the dead-letter overflow row is active, counted, and never actionable as a group', () => {
+  const v = view({ attention: attention([
+    { ...ATT_ITEM({ id: 'dl-overflow', source: 'deadletter', source_label: 'DEAD LETTER', severity: 'med' }),
+      actionable_as_group: false, overflow_agent_count: 5, overflow_member_total: 10 },
+  ]) });
+  const card = v.needs.open.find((c) => c.id === 'dl-overflow');
+  assert.ok(card, 'the overflow row is active and visible, never silently absent');
+  assert.deepEqual(card.options, [], 'never itself actionable as a group - no action maps to "all of these at once"');
+  assert.equal(card.groupWeight, 10, 'counts every raw member it stands for');
+  assert.ok(card.evidenceNote.includes('10 old failed messages across 5 more agents'));
+  assert.equal(v.chip.needsCount, 10, 'the badge reflects the true total, not the single summary row');
+});
+
+test('needsCount sums groupWeight across every open card, mixing ordinary and grouped rows', () => {
+  const v = view({ attention: attention([
+    ATT_ITEM({ id: 'esc-1', source: 'escalation' }),
+    { ...ATT_ITEM({ id: 'dl-beta', source: 'deadletter', severity: 'med' }), group_member_count: 5 },
+  ]) });
+  assert.equal(v.needs.open.length, 2, 'two displayed cards');
+  assert.equal(v.chip.needsCount, 1 + 5, 'the tally is the sum of raw weights, not the card count');
+});
+
 run();

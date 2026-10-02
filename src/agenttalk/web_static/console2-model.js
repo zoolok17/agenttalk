@@ -676,15 +676,40 @@
     var age = typeof item.age_seconds === 'number' && !item.age_unknown
       ? item.age_seconds + Math.max(0, (ctx.nowMs - ctx.attentionAsOfMs) / 1000) : null;
     var agent = typeof item.agent === 'string' && item.agent ? shortName(item.agent, ctx.project, ctx.teamIds, ctx.known) : '';
+    // Build round (#273): supervisor state is a CONTEXT label only - never a
+    // reason a HOLD was moved, demoted, or uncounted (it never is). Grouping
+    // compresses the DISPLAY only; every member past the preview stays
+    // reachable via the CLI line, not a new browser action. The overflow row
+    // stands for many agents at once and is never itself actionable.
+    var actionableAsGroup = item.actionable_as_group !== false;
+    var notes = [];
+    if (typeof item.supervisor_state === 'string' && item.supervisor_state) {
+      notes.push(item.supervisor_state);
+    }
+    var groupWeight = 1;
+    if (typeof item.group_member_count === 'number' && item.group_member_count > 0) {
+      groupWeight = item.group_member_count;
+      notes.push(
+        item.group_member_count + ' old failed messages from ' + (item.group_agent || 'this agent') +
+        (item.group_more_count ? ' (' + item.group_more_count + ' more not shown)' : ''));
+      var cliNote = str(item.group_cli_instructions, 600);
+      if (cliNote) notes.push(cliNote);
+    } else if (!actionableAsGroup && typeof item.overflow_member_total === 'number') {
+      groupWeight = item.overflow_member_total;
+      notes.push(
+        item.overflow_member_total + ' old failed messages across ' + item.overflow_agent_count +
+        ' more agents, active and counted but not shown as individual groups');
+    }
     return {
       id: str(item.id, 200) || (src + ':' + str(item.title, 60)),
       source: src, kind: kind, tone: tone, severity: typeof item.severity === 'string' ? item.severity : '',
       title: str(item.title, 300) || 'Attention needed',
       evidence: evidence, evidenceText: evidence || 'No evidence recorded', evidenceMissing: !evidence,
-      evidenceNote: '',
+      evidenceNote: notes.join(' · '),
       agent: agent, ageSeconds: age,
       ageLabel: age === null ? 'age unknown' : 'no deadline · waiting ' + fmtAge(age),
-      options: cardOptions(item, ctx.canAct === true), answerable: item.answerable === true, state: 'open'
+      options: actionableAsGroup ? cardOptions(item, ctx.canAct === true) : [],
+      answerable: item.answerable === true, state: 'open', groupWeight: groupWeight
     };
   }
 
@@ -1060,7 +1085,14 @@
       else view.needs.open.push(c);
     });
     view.needs.deferredCards = cards.filter(function (c) { return isDeferred(c) && !isAnswered(c.id); });
-    var openCount = view.needs.open.length;
+    // Build round (#273): one CARD can stand for several raw active items
+    // once dead-letter grouping compresses the display (groupWeight carries
+    // that count - 1 for every ordinary card). The visible card array stays
+    // exactly what's rendered; only this numeric "N needs you" tally must
+    // reflect the true active total, never the number of displayed cards.
+    var openCount = view.needs.open.reduce(function (sum, c) {
+      return sum + (typeof c.groupWeight === 'number' && c.groupWeight > 0 ? c.groupWeight : 1);
+    }, 0);
     view.chip.needsCount = att && view.needs.available ? openCount : null;
 
     // --- lead's latest message ---------------------------------------------------

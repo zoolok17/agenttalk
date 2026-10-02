@@ -31,7 +31,7 @@ function extract(name) {
 const combined = [
   extract('el'), extract('titled'), extract('stateInfo'),
   extract('teamHealthVerdictFrom'), extract('attentionKnownFrom'),
-  extract('supRow'), extract('supRuntimeRows'),
+  extract('supRow'), extract('supRuntimeRows'), extract('attentionActions'),
 ].join('\n');
 
 const document = {
@@ -58,7 +58,8 @@ const factory = new Function('document',
   + combined + '\nreturn { el: el, titled: titled, stateInfo: stateInfo,'
   + ' teamHealthVerdictFrom: teamHealthVerdictFrom,'
   + ' attentionKnownFrom: attentionKnownFrom,'
-  + ' supRow: supRow, supRuntimeRows: supRuntimeRows };');
+  + ' supRow: supRow, supRuntimeRows: supRuntimeRows,'
+  + ' attentionActions: attentionActions };');
 const api = factory(document);
 
 // --- 1) XSS-safe: an attacker-controlled model renders inert via textContent ---
@@ -192,5 +193,13 @@ assert.ok(/unavailable/i.test(degradedButQueue.text), 'degraded surfaced as a ca
 const poison = api.stateInfo('errored_poison');
 assert.ok(!/keeps? failing/i.test(poison.desc), 'poison desc must not assert repeated failure');
 assert.ok(/set aside/i.test(poison.desc), 'poison desc keeps the dead-letter (set aside) explanation');
+
+// --- 13) build round (#273): the dead-letter overflow row stands for many
+//         agents at once and must never itself be actionable as a group -
+//         every other card keeps its normal, source-specific action set. ---
+const overflowActions = api.attentionActions({ source: 'deadletter', actionable_as_group: false });
+assert.deepEqual(overflowActions, [], 'a non-actionable-as-group row offers no action buttons');
+const groupedDeadLetterActions = api.attentionActions({ source: 'deadletter' });
+assert.ok(groupedDeadLetterActions.length > 0, 'an ordinary (or grouped) dead-letter card keeps its actions');
 
 console.log('console runtime render smoke: PASS');

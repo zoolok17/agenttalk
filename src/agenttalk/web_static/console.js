@@ -1011,6 +1011,14 @@
     return grp === 'attn' ? 0 : grp === 'unknown' ? 1 : grp === 'work' ? 2 : 3;
   }
   function humanQueueCount() {
+    // Build round (#273): active_count is the pre-grouping active total -
+    // once dead-letter grouping collapses several old messages into one
+    // displayed row, items.length (and the legacy `count` field, which is
+    // just the number of displayed rows) both undercount. Fall back to
+    // `count`/items.length only against an older server that never sent it.
+    if (attentionData && typeof attentionData.active_count === 'number') {
+      return attentionData.active_count;
+    }
     return attentionData && typeof attentionData.count === 'number'
       ? attentionData.count
       : (attentionData && attentionData.items ? attentionData.items.length : 0);
@@ -2106,7 +2114,12 @@
     var errs = (attentionData && isArray(attentionData.errors)) ? attentionData.errors : [];
     var fresh = attentionFresh();   // false when null, error-as-data, or aged-out stale
     var stale = !!attentionData && !errs.length && !fresh;   // aged-out last-known, no errors
-    var count = attentionData && typeof attentionData.count === 'number' ? attentionData.count : items.length;
+    // Build round (#273): active_count (pre-grouping) is the true "N open"
+    // figure - the displayed row count (`count`/items.length) undercounts
+    // once dead-letter grouping collapses several old messages into one row.
+    var count = attentionData && typeof attentionData.active_count === 'number'
+      ? attentionData.active_count
+      : (attentionData && typeof attentionData.count === 'number' ? attentionData.count : items.length);
     // Never assert a current "N open" from an untrustworthy payload: error-as-data is
     // "status unknown"; a STALE payload is qualified — "status stale" when empty, or
     // "N open · stale" when we're showing last-known cards. Only a FRESH payload claims
@@ -2158,6 +2171,30 @@
     if (item.agent) detailRow.appendChild(el('span', 'tc-attn-agent', item.agent));
     detailRow.appendChild(el('span', 'tc-attn-detail', item.detail || ''));
     body.appendChild(detailRow);
+    // Build round (#273): a CONTEXT label only - never a reason this HOLD was
+    // moved, demoted, or uncounted (it never is). See docs/DESIGN-attention-
+    // history.md §1/§2.
+    if (item.supervisor_state) {
+      body.appendChild(el('div', 'tc-attn-detail tc-attn-supervisor-state', item.supervisor_state));
+    }
+    // A capped per-agent dead-letter GROUP: still active, counted, and
+    // full-severity - grouping only compresses the display (§4). Every
+    // member past the preview stays reachable via the CLI line below, not a
+    // new browser action.
+    if (item.group_member_count) {
+      var groupNote = item.group_member_count + ' old failed messages from ' +
+        (item.group_agent || 'this agent') +
+        (item.group_more_count ? ' (' + item.group_more_count + ' more not shown)' : '');
+      body.appendChild(el('div', 'tc-attn-detail tc-attn-group', groupNote));
+      if (item.group_cli_instructions) {
+        body.appendChild(el('div', 'tc-attn-detail tc-attn-cli', item.group_cli_instructions));
+      }
+    }
+    if (item.actionable_as_group === false && typeof item.overflow_agent_count === 'number') {
+      body.appendChild(el('div', 'tc-attn-detail tc-attn-group',
+        item.overflow_member_total + ' old failed messages across ' +
+        item.overflow_agent_count + ' more agents, active and counted but not shown as individual groups'));
+    }
     if (item.recommendation && !(actionSession.enabled && item.answerable)) {
       body.appendChild(el('div', 'tc-attn-detail', item.recommendation));
     }
@@ -2297,6 +2334,10 @@
 
   // Action set per source (read-only release: disposition actions disabled).
   function attentionActions(item) {
+    // Build round (#273): the dead-letter overflow row stands in for many
+    // agents at once - it is active and counted, but never itself
+    // actionable as a group (no action maps to "all of these at once").
+    if (item.actionable_as_group === false) return [];
     switch (item.source) {
       case 'escalation':
         return [{ label: 'Answer', primary: true }, { label: 'Reassign' }, { label: 'Defer' }];

@@ -2517,6 +2517,10 @@ _ATTENTION_SOURCE_MAP: dict[str, tuple[str, str, str]] = {
     _attention.SOURCE_GATE_HOLD: ("gate", "GATE HOLD", "high"),
     _attention.SOURCE_CLOSE_HOLD: ("gate", "GATE HOLD", "high"),
     _attention.SOURCE_DEAD_LETTER: ("deadletter", "DEAD LETTER", "med"),
+    # Build round (#273): same wire category/severity as an ordinary dead
+    # letter - "full-severity ... counted the same as everything else"
+    # (design §4). Consoles distinguish it via `actionable_as_group: false`.
+    _attention.SOURCE_DEAD_LETTER_OVERFLOW: ("deadletter", "DEAD LETTER", "med"),
     _attention.SOURCE_COORDINATION_STALL: (
         "coordination_stall", "TEAM STALL", "high"),
     _attention.SOURCE_LEAD_UNARMED: ("supervisor", "SUPERVISOR", "low"),
