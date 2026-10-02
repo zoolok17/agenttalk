@@ -197,6 +197,23 @@ def test_consume_hidden_tail_does_not_skip_an_earlier_unread_visible_message(tmp
     assert [r["id"] for r in recv_api.records(s, "alpha")] == [later.id]
 
 
+def test_consume_hidden_tail_is_generic_across_every_control_kind(tmp_path) -> None:
+    # issue #289: the SAME mechanism, hit live with kind=progress (a nudger
+    # skipped ticks while 2 progress notes sat unread). consume_hidden_tail
+    # checks CONTROL_KINDS membership, not a specific kind, so it clears a
+    # progress/composing tail identically to a planned one - this closes
+    # #289 too, not just #279 F5.
+    for kind, meta in (("progress", {"request_id": "rq-1"}), ("composing", {"request_id": "rq-1"})):
+        s = _store(tmp_path / kind)
+        s.send(sender="alpha", recipient="beta", kind=kind, body="", meta=meta)
+        s.send(sender="alpha", recipient="beta", kind=kind, body="", meta=meta)
+        for _ in range(3):
+            assert recv_api.poll(s, "beta")["record"] is None
+        assert len(s.unread_for("beta")) == 2
+        assert recv_api.consume_hidden_tail(s, "beta") is True
+        assert s.unread_for("beta") == []
+
+
 # --------------------------------------------------- recv --json CLI mirror
 
 
