@@ -15607,6 +15607,21 @@ def test_out_of_range_filetime_is_preserved_when_reset_handler_refuses(
     assert state_path.read_bytes() == before
 
 
+def test_h2_stale_reset_hold_source_hash_refuses(tmp_path: Path) -> None:
+    """Build round #273, finding H2: the reset command's own admission
+    comparison (cli.py ~13743) was explicitly left byte-for-byte untouched
+    this round - a stale/wrong --hold-source-hash must still refuse, never
+    apply a reset against a hold it was never actually shown."""
+    store = _team(tmp_path)
+    state, source_hash = _write_attended_process_tree_reset_fixture(store)
+    state_path = store.dir / "supervisor-state.json"
+    before = state_path.read_bytes()
+    stale_hash = ("0" if source_hash[0] == "f" else "f") + source_hash[1:]
+
+    assert _run(_attended_process_tree_reset_args(stale_hash), tmp_path) == 3
+    assert state_path.read_bytes() == before
+
+
 def test_attended_process_tree_reset_is_audited_and_rearms_new_generation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

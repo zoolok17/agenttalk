@@ -2603,6 +2603,10 @@ def _collect_web_attention_items(store: Store, roster: list[str],
             launch_requests,
         )
         lane_workspaces = _supervisor.active_ephemeral_lane_workspaces(store)
+        # Build round (#273): a precomputed, caller-side CONTEXT label only -
+        # supervisor_state_label() never raises (every failure path inside it
+        # degrades to "unknown"), so this can't itself blank the HOLD source.
+        supervisor_state = A.supervisor_state_label(store)
         items += A.process_tree_hold_items(
             state,
             supervisor_config=supervisor_config,
@@ -2614,6 +2618,7 @@ def _collect_web_attention_items(store: Store, roster: list[str],
             lane_workspaces=lane_workspaces,
             reset_admissions=reset_admissions,
             now_epoch=time.time(),
+            supervisor_state=supervisor_state,
         )
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("process_tree_hold", str(e)))
@@ -2807,6 +2812,11 @@ def build_attention(desc: RootDescriptor,
         disps, _problems = _attention.read_dispositions(store)
         queue = _attention.build_queue(items, disps,
                                        now_iso=now.isoformat().replace("+00:00", "Z"))
+        # Build round (#273): cap dead-letter GROUPS for display only - never
+        # changes queue["summary"]["active_count"] below, which stays the raw,
+        # pre-grouping count of every active item (gate: "no double-counting
+        # of preview rows").
+        queue = _attention.cap_dead_letter_groups(queue)
         wire: list[dict] = []
         for it in queue.get("items", []):
             src = it.get("source", "")
@@ -2827,8 +2837,39 @@ def build_attention(desc: RootDescriptor,
                 "agent": _attention_agent(it),
                 "detail": _envelope_str(detail),
                 "age_seconds": float(it.get("age_seconds") or 0),
+                # Build round (#273), finding 6: never let a HOLD's age read as
+                # "just happened" - every consumer must check this flag, same
+                # convention the risk register already uses.
+                "age_unknown": bool(it.get("age_unknown")),
                 "human_can_unblock_now": bool(it.get("human_can_unblock_now")),
             }
+            if src == _attention.SOURCE_PROCESS_TREE_HOLD and it.get("supervisor_state"):
+                # Context label only (design §1/§2) - never a reason to move,
+                # demote, or uncount this HOLD; see docs/DESIGN-attention-history.md.
+                entry["supervisor_state"] = _envelope_str(it["supervisor_state"])
+            if src == _attention.SOURCE_DEAD_LETTER and it.get("group_member_count"):
+                # A capped per-agent dead-letter GROUP (design §4, build round):
+                # active, counted, full-severity - grouping only compresses
+                # the DISPLAY, never the count (see active_count on the
+                # top-level payload).
+                entry["group_member_count"] = int(it["group_member_count"])
+                entry["group_more_count"] = int(it.get("group_more_count") or 0)
+                entry["group_agent"] = it.get("group_agent") or ""
+                entry["group_preview"] = [
+                    _envelope_str(d.get("item_id", ""))
+                    for d in (it.get("duplicates") or [])
+                    if isinstance(d, dict)
+                ]
+                entry["group_cli_instructions"] = _envelope_str(
+                    it.get("group_cli_instructions") or "")
+            if src == _attention.SOURCE_DEAD_LETTER_OVERFLOW:
+                entry["overflow_agent_count"] = int(it.get("overflow_agent_count") or 0)
+                entry["overflow_agent_preview"] = [
+                    _envelope_str(a) for a in (it.get("overflow_agent_preview") or [])
+                ]
+                entry["overflow_member_total"] = int(it.get("overflow_member_total") or 0)
+                entry["actionable_as_group"] = False
+                entry["recommendation"] = _envelope_str(it.get("recommendation") or "")
             if src == _attention.SOURCE_NEEDS_OPERATOR:
                 from agenttalk import work_tags
                 entry["source_refs"] = [
@@ -2938,14 +2979,24 @@ def build_attention(desc: RootDescriptor,
                 # answers 503 instead of a confidently-empty attention queue.
                 _reraise_busy(e)
                 agents = []
-        wire.extend(_derive_stuck_items(agents, now=now))
+        stuck_items = _derive_stuck_items(agents, now=now)
+        wire.extend(stuck_items)
         return {
             "root": desc.label,
             "root_path": str(store.root),
             "root_info": _root_info(desc),
             "target_root_project_id": store.project_id(),
             "items": wire,
+            # Build round (#273): the PRE-GROUPING active count, never
+            # len(wire) - once dead-letter grouping collapses display rows,
+            # len(wire) undercounts. Both consoles must use this field (not
+            # the number of rows/groups shown) for the "needs a person" tally.
+            # Stuck items never go through attention.py's build_queue (no
+            # grouping applied to them), so they count 1:1 same as len(wire).
             "count": len(wire),
+            "active_count": (
+                queue.get("summary", {}).get("active_count", 0) + len(stuck_items)
+            ),
         }
     except Exception as e:  # noqa: BLE001 — errors-as-data, never a 500 (B1)
         # #246: re-raise (via _reraise_busy) past this route's own
@@ -3368,6 +3419,9 @@ def build_risk_register(desc: RootDescriptor) -> dict:
                 f"dispositions: {len(disposition_problems)} unreadable record(s)"))
         queue = _attention.build_queue(items, disps,
                                        now_iso=now.isoformat().replace("+00:00", "Z"))
+        # Build round (#273): same display-only cap as /api/attention - never
+        # changes queue["summary"]["active_count"] used for active_count below.
+        queue = _attention.cap_dead_letter_groups(queue)
         risks: list[dict] = []
         for it in queue.get("items", []):
             src = it.get("source", "")
@@ -3388,7 +3442,7 @@ def build_risk_register(desc: RootDescriptor) -> dict:
             # every other source leaves it absent, i.e. known.
             age_unknown = bool(it.get("age_unknown"))
             age_seconds = float(it.get("age_seconds") or 0)
-            risks.append({
+            risk_entry = {
                 "id": it.get("item_id", ""),
                 "category": wire_source,
                 "category_label": _RISK_CATEGORY_LABELS.get(wire_source, "Other"),
@@ -3406,7 +3460,26 @@ def build_risk_register(desc: RootDescriptor) -> dict:
                 "age_unknown": age_unknown,
                 "human_can_unblock_now": bool(it.get("human_can_unblock_now")),
                 "_sort_age": float("inf") if age_unknown else age_seconds,
-            })
+            }
+            if src == _attention.SOURCE_PROCESS_TREE_HOLD and it.get("supervisor_state"):
+                risk_entry["supervisor_state"] = _envelope_str(it["supervisor_state"])
+            if src == _attention.SOURCE_DEAD_LETTER and it.get("group_member_count"):
+                risk_entry["group_member_count"] = int(it["group_member_count"])
+                risk_entry["group_more_count"] = int(it.get("group_more_count") or 0)
+                risk_entry["group_agent"] = it.get("group_agent") or ""
+                risk_entry["group_cli_instructions"] = _envelope_str(
+                    it.get("group_cli_instructions") or "")
+            if src == _attention.SOURCE_DEAD_LETTER_OVERFLOW:
+                risk_entry["overflow_agent_count"] = int(it.get("overflow_agent_count") or 0)
+                risk_entry["overflow_member_total"] = int(it.get("overflow_member_total") or 0)
+                risk_entry["actionable_as_group"] = False
+            risks.append(risk_entry)
+        # Build round (#273): the pre-grouping active count across every
+        # source this register draws from - queue["summary"]["active_count"]
+        # covers everything routed through attention.py's build_queue;
+        # stuck/onboarding rows below never go through that grouping, so they
+        # count 1:1 the same way len(risks) already would.
+        active_count = queue.get("summary", {}).get("active_count", 0)
         try:
             agents = _agent_entries(store, cfg, _validated_for_state(store, cfg)[0],
                                     for_agent)
@@ -3414,7 +3487,9 @@ def build_risk_register(desc: RootDescriptor) -> dict:
             _reraise_busy(e)  # #246 final round: a busy bound is 503, not a degraded row
             agents = []
             degraded.append(_envelope_str(f"stuck_agents: {e}"))
-        for stuck in _derive_stuck_items(agents, now=now):
+        stuck_list = _derive_stuck_items(agents, now=now)
+        active_count += len(stuck_list)
+        for stuck in stuck_list:
             stuck_age = float(stuck.get("age_seconds") or 0)
             # PR #129 connector round-5 (web.py:3166): this hardcoded
             # age_unknown=False regardless of what _derive_stuck_items
@@ -3476,6 +3551,7 @@ def build_risk_register(desc: RootDescriptor) -> dict:
                             age = None
                         blocking = bool(rec.get("blocking"))
                         owner = rec.get("owner") or rec.get("actor") or None
+                        active_count += 1
                         risks.append({
                             "id": f"onboarding:{run_id}:{kind}:"
                                   f"{_onboarding_short(rec.get('key'), limit=128)}",
@@ -3521,6 +3597,12 @@ def build_risk_register(desc: RootDescriptor) -> dict:
             "target_root_project_id": store.project_id(),
             "items": risks,
             "count": len(risks),
+            # Build round (#273): true total across every risk this register
+            # covers, before display grouping/truncation - "truncated" above
+            # already reports the display cap; this is the "no
+            # double-counting a group's members against its preview rows"
+            # figure the design asks for.
+            "active_count": active_count,
             "truncated": truncated,
             "partial": bool(degraded),
             "degraded_sources": degraded,
@@ -3537,6 +3619,7 @@ def build_risk_register(desc: RootDescriptor) -> dict:
             "target_root_project_id": store.project_id(),
             "items": [],
             "count": 0,
+            "active_count": 0,
             "truncated": 0,
             "partial": True,
             "degraded_sources": degraded[:_RISK_DEGRADED_MAX],

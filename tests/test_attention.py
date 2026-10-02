@@ -591,6 +591,124 @@ def test_process_tree_hold_hash_binds_exact_tree_and_legacy_evidence() -> None:
     assert att.process_tree_hold_items(state)[0]["source_hash"] != changed_tree
 
 
+def test_h1_stale_defer_does_not_hide_a_new_hold_with_different_evidence() -> None:
+    """Build round #273, finding H1: the design's F1 explicitly CUT any new
+    shared fingerprint and left source_hash (attention.py ~1163) byte-for-byte
+    unchanged - this locks in why that was safe to do. A defer recorded
+    against an OLD hold's snapshot hash must never suppress a NEW, DISTINCT
+    hold under the same identity once its launch/generation evidence has
+    genuinely changed."""
+    state_v1 = _process_tree_state(status="invalid", reason_code="duplicate_pid")
+    item_v1 = att.process_tree_hold_items(state_v1)[0]
+
+    state_v2 = _process_tree_state(status="invalid", reason_code="duplicate_pid")
+    state_v2["agents"]["worker"]["runtime_wrapper_generation"] = "wrapper-2"
+    state_v2["agents"]["worker"]["owned_process_tree"]["wrapper_generation"] = "wrapper-2"
+    item_v2 = att.process_tree_hold_items(state_v2)[0]
+
+    assert item_v1["item_id"] == item_v2["item_id"]
+    assert item_v1["source_hash"] != item_v2["source_hash"]
+
+    folded = att.fold_dispositions([_disp(
+        item_v1["item_id"], att.SOURCE_PROCESS_TREE_HOLD, att.ACTION_DEFER,
+        item_v1["source_hash"], until="2099-01-01T00:00:00Z",
+    )])
+    r = att.apply_disposition(item_v2, folded, now_iso="2026-06-01T00:00:00Z")
+    assert r["state"] == "active"
+    assert "prior_disposition_stale" in r["warnings"]
+
+
+class _FakeMarkerStore:
+    """Minimal stand-in exposing only what supervisor_state_label reads."""
+
+    def __init__(self, strict_result):
+        self._strict_result = strict_result
+
+    def read_supervisor_instance_strict(self):
+        if isinstance(self._strict_result, Exception):
+            raise self._strict_result
+        return self._strict_result
+
+
+def test_supervisor_state_label_absent_marker_is_unknown() -> None:
+    assert att.supervisor_state_label(
+        _FakeMarkerStore(("absent", None, None))
+    ) == att.SUPERVISOR_STATE_UNKNOWN
+
+
+def test_supervisor_state_label_invalid_marker_is_unknown() -> None:
+    assert att.supervisor_state_label(
+        _FakeMarkerStore(("invalid", None, "malformed marker JSON"))
+    ) == att.SUPERVISOR_STATE_UNKNOWN
+
+
+def test_supervisor_state_label_marker_read_exception_is_unknown() -> None:
+    # A failure reading the marker must never be conflated with a PID-probe
+    # failure (F6) - either one alone yields unknown, never "not running".
+    assert att.supervisor_state_label(
+        _FakeMarkerStore(OSError("disk error"))
+    ) == att.SUPERVISOR_STATE_UNKNOWN
+
+
+def test_supervisor_state_label_alive_pid_is_running(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agenttalk import store as store_mod
+    monkeypatch.setattr(
+        store_mod, "_probe_owner_identity",
+        lambda pid, pid_start: store_mod.OWNER_IDENTITY_ALIVE,
+    )
+    valid = ("valid", {"pid": 4242, "pid_start": "linux:abc:1"}, None)
+    assert att.supervisor_state_label(
+        _FakeMarkerStore(valid)
+    ) == att.SUPERVISOR_STATE_RUNNING
+
+
+@pytest.mark.parametrize("outcome_attr", ["OWNER_IDENTITY_DEAD", "OWNER_IDENTITY_PID_REUSED"])
+def test_supervisor_state_label_dead_or_reused_pid_is_not_running(
+    monkeypatch: pytest.MonkeyPatch, outcome_attr: str,
+) -> None:
+    from agenttalk import store as store_mod
+    outcome = getattr(store_mod, outcome_attr)
+    monkeypatch.setattr(
+        store_mod, "_probe_owner_identity", lambda pid, pid_start: outcome)
+    valid = ("valid", {"pid": 4242, "pid_start": "linux:abc:1"}, None)
+    assert att.supervisor_state_label(
+        _FakeMarkerStore(valid)
+    ) == att.SUPERVISOR_STATE_NOT_RUNNING
+
+
+def test_supervisor_state_label_probe_exception_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agenttalk import store as store_mod
+
+    def _raise(pid, pid_start):
+        raise RuntimeError("probe failed")
+
+    monkeypatch.setattr(store_mod, "_probe_owner_identity", _raise)
+    valid = ("valid", {"pid": 4242, "pid_start": "linux:abc:1"}, None)
+    assert att.supervisor_state_label(
+        _FakeMarkerStore(valid)
+    ) == att.SUPERVISOR_STATE_UNKNOWN
+
+
+def test_process_tree_hold_items_threads_supervisor_state_as_context_only() -> None:
+    # The label rides alongside the HOLD (never a hash input - source_hash is
+    # identical with/without it) and defaults to unknown when omitted.
+    state = _process_tree_state(status="invalid", reason_code="duplicate_pid")
+    plain = att.process_tree_hold_items(state)[0]
+    labeled = att.process_tree_hold_items(
+        state, supervisor_state=att.SUPERVISOR_STATE_NOT_RUNNING)[0]
+    assert plain["supervisor_state"] == att.SUPERVISOR_STATE_UNKNOWN
+    assert labeled["supervisor_state"] == att.SUPERVISOR_STATE_NOT_RUNNING
+    assert plain["source_hash"] == labeled["source_hash"]
+
+
+def test_process_tree_hold_items_age_always_unknown() -> None:
+    state = _process_tree_state(status="invalid", reason_code="duplicate_pid")
+    item = att.process_tree_hold_items(state)[0]
+    assert item["age_unknown"] is True
+
+
 def test_process_tree_hold_never_emits_malformed_persisted_unicode() -> None:
     state = _process_tree_state(
         status="truncated",
@@ -3275,3 +3393,123 @@ def test_build_queue_resolved_dead_letter_hidden_by_default() -> None:
     assert not [i for i in q["items"] if i["source"] == att.SOURCE_DEAD_LETTER]  # resolved -> hidden
     q2 = att.build_queue([dl], [disp], now_iso=_now(), include_resolved=True)
     assert [i for i in q2["items"] if i["source"] == att.SOURCE_DEAD_LETTER]     # --resolved shows it
+
+
+# --------------------------------------------- dead-letter grouping (build round, #273)
+
+def _dl_entries(agent: str, message_ids: list[str], *, deadlettered_at: str | None) -> list[dict]:
+    return [
+        {"agent": agent, "message_id": mid, "deadlettered_at": deadlettered_at}
+        for mid in message_ids
+    ]
+
+
+def test_dead_letter_items_group_only_old_known_finite_ages() -> None:
+    from datetime import datetime, timezone
+    now_epoch = datetime(2026, 7, 10, tzinfo=timezone.utc).timestamp()
+    old_entries = _dl_entries("beta", ["m1", "m2"], deadlettered_at="2026-07-01T00:00:00Z")  # 9d old
+    recent_entry = _dl_entries("beta", ["m3"], deadlettered_at="2026-07-09T12:00:00Z")  # 12h old
+    missing_age_entry = _dl_entries("beta", ["m4"], deadlettered_at=None)  # unknown
+    future_entry = _dl_entries("beta", ["m5"], deadlettered_at="2026-07-11T00:00:00Z")  # future
+    items = att.dead_letter_items(
+        old_entries + recent_entry + missing_age_entry + future_entry,
+        now_epoch=now_epoch,
+    )
+    by_mid = {it["message_id"]: it for it in items}
+    group_key = att.dedupe_key(att.SOURCE_DEAD_LETTER, identity="group:beta")
+    assert by_mid["m1"]["dedupe_key"] == group_key
+    assert by_mid["m2"]["dedupe_key"] == group_key
+    # Recent/missing/future ages never share the group key - each keeps its
+    # own full row (age uncertainty is never read as "old enough to group").
+    assert by_mid["m3"]["dedupe_key"] != group_key
+    assert by_mid["m4"]["dedupe_key"] != group_key
+    assert by_mid["m5"]["dedupe_key"] != group_key
+
+
+def test_build_queue_twenty_old_letters_collapse_to_one_group_count_stays_twenty() -> None:
+    # Design acceptance case: "20 letters becoming 1 group, count stays 20".
+    from datetime import datetime, timezone
+    now_epoch = datetime(2026, 7, 10, tzinfo=timezone.utc).timestamp()
+    entries = _dl_entries(
+        "beta", [f"m{i}" for i in range(20)], deadlettered_at="2026-07-01T00:00:00Z")
+    items = att.dead_letter_items(entries, now_epoch=now_epoch)
+    q = att.build_queue(items, [], now_iso=_now())
+    dl_reps = [it for it in q["items"] if it["source"] == att.SOURCE_DEAD_LETTER]
+    assert len(dl_reps) == 1
+    assert len(dl_reps[0]["duplicates"]) == 19
+    assert q["summary"]["active_count"] == 20
+
+
+def test_cap_dead_letter_groups_previews_five_and_computes_exact_more_count() -> None:
+    from datetime import datetime, timezone
+    now_epoch = datetime(2026, 7, 10, tzinfo=timezone.utc).timestamp()
+    entries = _dl_entries(
+        "beta", [f"m{i}" for i in range(8)], deadlettered_at="2026-07-01T00:00:00Z")
+    items = att.dead_letter_items(entries, now_epoch=now_epoch)
+    q = att.build_queue(items, [], now_iso=_now())
+    capped = att.cap_dead_letter_groups(q)
+    rep = next(it for it in capped["items"] if it["source"] == att.SOURCE_DEAD_LETTER)
+    assert rep["group_member_count"] == 8
+    assert len(rep["duplicates"]) == att.DEAD_LETTER_GROUP_PREVIEW_CAP
+    assert rep["group_more_count"] == 8 - 1 - att.DEAD_LETTER_GROUP_PREVIEW_CAP
+    assert rep["group_agent"] == "beta"
+    assert "agenttalk dead-letter list --agent beta" in rep["group_cli_instructions"]
+    # active_count (raw, pre-grouping) is untouched by the display cap.
+    assert q["summary"]["active_count"] == 8
+
+
+def test_cap_dead_letter_groups_lone_qualifying_letter_is_not_annotated() -> None:
+    # One old letter alone has nothing to compress - it must render as an
+    # ordinary single row, not a "group of one".
+    from datetime import datetime, timezone
+    now_epoch = datetime(2026, 7, 10, tzinfo=timezone.utc).timestamp()
+    items = att.dead_letter_items(
+        _dl_entries("beta", ["m1"], deadlettered_at="2026-07-01T00:00:00Z"),
+        now_epoch=now_epoch,
+    )
+    q = att.build_queue(items, [], now_iso=_now())
+    capped = att.cap_dead_letter_groups(q)
+    rep = next(it for it in capped["items"] if it["source"] == att.SOURCE_DEAD_LETTER)
+    assert "group_member_count" not in rep
+
+
+def test_cap_dead_letter_groups_overflow_row_carries_true_totals() -> None:
+    # Design acceptance case: a multi-agent overflow with explicit totals -
+    # 25 agents each with 2 old letters (50 raw dead letters); the cap shows
+    # 20 groups + 1 overflow row; active_count stays the true raw total.
+    from datetime import datetime, timezone
+    now_epoch = datetime(2026, 7, 10, tzinfo=timezone.utc).timestamp()
+    entries = []
+    for a in range(25):
+        agent = f"agent{a:02d}"
+        entries += _dl_entries(agent, [f"{agent}-m1", f"{agent}-m2"],
+                               deadlettered_at="2026-07-01T00:00:00Z")
+    items = att.dead_letter_items(entries, now_epoch=now_epoch)
+    q = att.build_queue(items, [], now_iso=_now())
+    assert q["summary"]["active_count"] == 50
+    capped = att.cap_dead_letter_groups(q)
+    dl_and_overflow = [
+        it for it in capped["items"]
+        if it["source"] in (att.SOURCE_DEAD_LETTER, att.SOURCE_DEAD_LETTER_OVERFLOW)
+    ]
+    groups = [it for it in dl_and_overflow if it["source"] == att.SOURCE_DEAD_LETTER]
+    overflow = [it for it in dl_and_overflow if it["source"] == att.SOURCE_DEAD_LETTER_OVERFLOW]
+    assert len(groups) == att.DEAD_LETTER_GROUP_CAP
+    assert len(overflow) == 1
+    row = overflow[0]
+    assert row["overflow_agent_count"] == 25 - att.DEAD_LETTER_GROUP_CAP
+    assert row["overflow_member_total"] == (25 - att.DEAD_LETTER_GROUP_CAP) * 2
+    assert row["actionable_as_group"] is False
+    assert row["human_can_unblock_now"] is True
+    # Never empty, never silently absent, and active_count is UNCHANGED by
+    # the display cap/overflow collapse.
+    assert q["summary"]["active_count"] == 50
+
+
+def test_rank_key_unknown_age_sorts_as_oldest_in_tier() -> None:
+    known_recent = {"state": "active", "priority": "high", "age_seconds": 10.0}
+    unknown = {"state": "active", "priority": "high", "age_unknown": True, "age_seconds": 0.0}
+    ordered = att.sort_items([known_recent | {"item_id": "a"}, unknown | {"item_id": "b"}])
+    # HIGHER rank_key sorts first; an unknown age must rank as the OLDEST in
+    # its tier (build round, finding 7), never as if it were new.
+    assert ordered[0]["item_id"] == "b"

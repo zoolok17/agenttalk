@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shlex
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -53,6 +54,16 @@ _MAX_OPTIONS = 10
 _CAP_AFFECTED = 200
 _MAX_AFFECTED = 20
 
+# --- dead-letter grouping (build round, #273): per-agent only, old letters only ---
+DEAD_LETTER_GROUP_AGE_THRESHOLD_SECONDS = 604800  # 7 days
+DEAD_LETTER_GROUP_CAP = 20          # agent groups shown before an overflow row
+DEAD_LETTER_GROUP_PREVIEW_CAP = 5   # member ids previewed per shown group
+
+# --- supervisor-state context label (§1): exact wording, never "since" ---
+SUPERVISOR_STATE_RUNNING = "Supervisor running"
+SUPERVISOR_STATE_NOT_RUNNING = "Supervisor not running"
+SUPERVISOR_STATE_UNKNOWN = "Supervisor state unknown"
+
 # --- sources ---
 SOURCE_NEEDS_OPERATOR = "needs_operator"
 SOURCE_CONFIG_BLOCKED = "config_blocked"
@@ -64,6 +75,12 @@ SOURCE_LEAD_UNARMED = "lead_unarmed"
 SOURCE_CAPACITY = "capacity"
 SOURCE_COORDINATION_STALL = "coordination_stall"
 SOURCE_ERROR = "source_error"
+# Synthetic, display-only (build round #273): one row standing in for the
+# per-agent dead-letter groups past DEAD_LETTER_GROUP_CAP. Deliberately NOT
+# added to _ALWAYS_BLOCKING/_ADVISORY_CAPABLE below - it is never dispositioned
+# (it is not a real item_id the CLI's own, ungrouped queue ever constructs),
+# full-severity and active, but not itself actionable as a group (design §4).
+SOURCE_DEAD_LETTER_OVERFLOW = "dead_letter_overflow"
 
 # rank weight per source (higher = more urgent to a human)
 _SOURCE_WEIGHT = {
@@ -567,7 +584,12 @@ def rank_key(item: dict) -> tuple:
     risk = {"high": 3, "medium": 2, "low": 1}.get(item.get("risk_severity"), 0)
     src = _SOURCE_WEIGHT.get(item.get("source"), 0)
     needed = _needed_by_weight(item.get("needed_by"))
-    age_bucket = min(int(item.get("age_seconds", 0) // 3600), 72)
+    # An unknown age is ranked conservatively as the OLDEST in its tier (never as
+    # if it were new) - the same sort-as-infinite convention web.py's risk
+    # register already uses for age_unknown (build round, finding 7).
+    age_bucket = (
+        72 if item.get("age_unknown") else min(int(item.get("age_seconds", 0) // 3600), 72)
+    )
     return (
         1 if active else 0,
         1 if item.get("human_can_unblock_now") else 0,
@@ -808,6 +830,34 @@ def _process_tree_identity_warning(tree: dict) -> str | None:
     return warning or None
 
 
+def supervisor_state_label(store) -> str:
+    """Compute the supervisor-state CONTEXT label (design §1) - never a gate, never
+    "since". Caller passes the one result into :func:`process_tree_hold_items`; the
+    projector itself never reads the marker or probes a PID (keeps
+    ``cli.py``'s ``--reset-process-tree-ownership``, which calls the projector
+    directly, completely unaffected).
+
+    Two independently-guarded steps, per F6: a failure reading the marker must
+    never be conflated with, or silently swallow, a failure probing the PID -
+    either one alone yields "unknown", never a guessed "not running"."""
+    from agenttalk import store as store_mod
+    try:
+        status, data, _detail = store.read_supervisor_instance_strict()
+    except Exception:  # noqa: BLE001 - an unreadable marker is unknown, not "not running"
+        return SUPERVISOR_STATE_UNKNOWN
+    if status != "valid" or not isinstance(data, dict):
+        return SUPERVISOR_STATE_UNKNOWN
+    try:
+        outcome = store_mod._probe_owner_identity(data.get("pid"), data.get("pid_start"))
+    except Exception:  # noqa: BLE001 - a failed probe is unknown, not "not running"
+        return SUPERVISOR_STATE_UNKNOWN
+    if outcome == store_mod.OWNER_IDENTITY_ALIVE:
+        return SUPERVISOR_STATE_RUNNING
+    if outcome in (store_mod.OWNER_IDENTITY_DEAD, store_mod.OWNER_IDENTITY_PID_REUSED):
+        return SUPERVISOR_STATE_NOT_RUNNING
+    return SUPERVISOR_STATE_UNKNOWN
+
+
 def process_tree_hold_items(
     state: dict,
     *,
@@ -820,6 +870,7 @@ def process_tree_hold_items(
     lane_workspaces: dict[str, str] | None = None,
     reset_admissions: dict | None = None,
     now_epoch: float | None = None,
+    supervisor_state: str | None = None,
 ) -> list[dict]:
     """Project strict supervisor process-tree HOLDs into global human attention.
 
@@ -830,6 +881,13 @@ def process_tree_hold_items(
     is absent this projector names no scripted command and makes no claim that
     none exists.  The configured detached argv remains recovery information,
     never launch authority.
+
+    ``supervisor_state`` (optional, build round #273): a PRECOMPUTED context
+    label (see :func:`supervisor_state_label`) - this projector never reads the
+    supervisor marker or probes a PID itself, and the label is never a reason
+    to move, demote, or uncount a HOLD (design §2). Omitted by every existing
+    caller (including ``cli.py``'s ``--reset-process-tree-ownership``, which is
+    unaffected), defaulting each item's label to "unknown".
     """
     from agenttalk import supervisor as supervisor_mod
 
@@ -1223,6 +1281,11 @@ def process_tree_hold_items(
                 "risk_severity": "high",
                 "confidence": "high",
                 "affected": [agent],
+                # Build round, finding 6: never present refreshed_at or a
+                # lock's startup time as incident age. No durable age is
+                # tracked for a process-tree HOLD, so this is always unknown
+                # (ranked conservatively as the oldest in its tier - F7).
+                "age_unknown": True,
             },
             source_refs=[{
                 "kind": "supervisor_state",
@@ -1295,6 +1358,9 @@ def process_tree_hold_items(
             SOURCE_PROCESS_TREE_HOLD,
             identity=identity,
         )
+        # Context only (design §1/§2): assigned OUTSIDE _mk_item's ident_content,
+        # exactly like dedupe_key above, so it can never affect source_hash.
+        it["supervisor_state"] = supervisor_state or SUPERVISOR_STATE_UNKNOWN
         out.append(it)
 
     if isinstance(agents, dict):
@@ -1389,9 +1455,19 @@ def dead_letter_items(entries: list[dict], *, now_epoch: float | None = None) ->
                       human_can_unblock_now=True,
                       age_seconds=age_seconds,
                       fields={"why_it_matters": "a required message could not be delivered",
-                              "priority": "high", "age_unknown": age_unknown},
+                              "priority": "high", "age_unknown": age_unknown,
+                              "agent": ag, "message_id": mid},
                       source_refs=[{"kind": "dead_letter", "agent": ag, "message_id": mid}])
-        it["dedupe_key"] = dedupe_key(SOURCE_DEAD_LETTER, identity=f"{ag}:{mid}")
+        # Grouping (design §4, build round): only a letter with a KNOWN, finite
+        # age at/past the 7-day threshold shares its agent's group key. A
+        # recent/missing/invalid/future-dated age always keeps its own full
+        # row - age uncertainty is never read as "old enough to group". This
+        # is a DISPLAY key only (build_queue's existing dedupe-by-key); the
+        # permanent item_id doctor.py parses is untouched.
+        if not age_unknown and age_seconds >= DEAD_LETTER_GROUP_AGE_THRESHOLD_SECONDS:
+            it["dedupe_key"] = dedupe_key(SOURCE_DEAD_LETTER, identity=f"group:{ag}")
+        else:
+            it["dedupe_key"] = dedupe_key(SOURCE_DEAD_LETTER, identity=f"{ag}:{mid}")
         out.append(it)
     return out
 
@@ -1569,6 +1645,117 @@ def build_queue(items: list[dict], dispositions: list[dict], *, now_iso: str,
             default=None),
     }
     return {"schema_version": SCHEMA_VERSION, "items": ordered, "summary": summary}
+
+
+def _dead_letter_group_cli_instructions(agent: str) -> str:
+    """Exact commands to reach every member of one agent's dead-letter group,
+    including anything past the preview cap - ids are never truncated, only
+    the preview is (design §4)."""
+    agent_arg = shlex.quote(agent)
+    return (
+        f"Run `agenttalk dead-letter list --agent {agent_arg}` to see every "
+        f"member (full ids), `agenttalk dead-letter show --agent {agent_arg} "
+        "--id <id>` to read one, `agenttalk dead-letter resolve --agent "
+        f"{agent_arg} --id <id> --reason <reason> --from <actor>` to resolve "
+        "one, or `agenttalk attention defer --item <item_id> --reason <reason> "
+        "--until <iso> --from <actor>` to defer one."
+    )
+
+
+def _dead_letter_overflow_cli_instructions() -> str:
+    """Exact command to reach every agent collapsed into the overflow row."""
+    return (
+        "Run `agenttalk dead-letter list` to see every agent's dead letters, "
+        "or `agenttalk attention --source dead_letter --all` for the full "
+        "per-item attention queue."
+    )
+
+
+def cap_dead_letter_groups(queue: dict) -> dict:
+    """Cap dead-letter GROUPS for DISPLAY only (build round, #273). Bounds a
+    member preview per group (``DEAD_LETTER_GROUP_PREVIEW_CAP``, exact "N
+    more" computed BEFORE truncation, full ids never truncated) and the
+    number of groups shown (``DEAD_LETTER_GROUP_CAP``); any excess collapses
+    into exactly one further row - full-severity, active, counted, but NOT
+    itself actionable as a group (it carries no disposable item_id the CLI's
+    own, ungrouped queue would ever recognize).
+
+    Every other source, and every dead letter that did not qualify for
+    grouping (§4: recent/missing/invalid/future-dated age), passes through
+    completely untouched. This only reshapes ``queue["items"]`` for display;
+    ``queue["summary"]`` (notably ``active_count``) is left exactly as
+    :func:`build_queue` computed it - grouping never changes how many items
+    are active.
+    """
+    group_prefix = f"{SOURCE_DEAD_LETTER}:group:"
+    items = queue.get("items", [])
+    groups = [it for it in items if str(it.get("dedupe_key", "")).startswith(group_prefix)]
+    if not groups:
+        return queue
+    others = [it for it in items if not str(it.get("dedupe_key", "")).startswith(group_prefix)]
+
+    ranked_groups = sort_items(groups)  # same deterministic ranking as everywhere else
+    shown, overflowed = (
+        ranked_groups[:DEAD_LETTER_GROUP_CAP],
+        ranked_groups[DEAD_LETTER_GROUP_CAP:],
+    )
+
+    capped = []
+    for rep in shown:
+        rep = dict(rep)
+        members = list(rep.get("duplicates") or [])
+        if not members:
+            # Only this one letter from this agent qualified for grouping -
+            # nothing is actually compressed, so it displays as an ordinary
+            # single dead-letter row (no group_* noise for a "group of one").
+            capped.append(rep)
+            continue
+        more_count = max(0, len(members) - DEAD_LETTER_GROUP_PREVIEW_CAP)  # before truncation
+        rep["duplicates"] = members[:DEAD_LETTER_GROUP_PREVIEW_CAP]
+        rep["group_member_count"] = 1 + len(members)
+        rep["group_more_count"] = more_count
+        agent = rep.get("agent") or ""
+        rep["group_agent"] = agent
+        rep["group_cli_instructions"] = _dead_letter_group_cli_instructions(agent)
+        capped.append(rep)
+
+    out_items = others + capped
+    if overflowed:
+        overflow_agents = sorted({str(it.get("agent") or "") for it in overflowed} - {""})
+        overflow_member_total = sum(
+            1 + len(it.get("duplicates") or []) for it in overflowed
+        )
+        preview_agents = overflow_agents[:DEAD_LETTER_GROUP_PREVIEW_CAP]
+        agents_hash = hashlib.sha256(
+            "|".join(overflow_agents).encode("utf-8", errors="surrogatepass")
+        ).hexdigest()[:16]
+        overflow_row = _mk_item(
+            SOURCE_DEAD_LETTER_OVERFLOW,
+            item_id(SOURCE_DEAD_LETTER_OVERFLOW, agents_hash),
+            title=f"{len(overflow_agents)} more agents have old failed messages",
+            ident_content={"agents": overflow_agents, "member_total": overflow_member_total},
+            human_can_unblock_now=True,
+            age_seconds=0.0,
+            fields={
+                "why_it_matters": (
+                    "Old failed messages from these agents are active and counted, "
+                    "just not individually displayed."
+                ),
+                "recommendation": _dead_letter_overflow_cli_instructions(),
+                "priority": "high",
+                "risk_severity": "high",
+                "age_unknown": True,
+                "affected": preview_agents,
+                "overflow_agent_count": len(overflow_agents),
+                "overflow_agent_preview": preview_agents,
+                "overflow_member_total": overflow_member_total,
+                "actionable_as_group": False,
+            },
+        )
+        out_items.append(overflow_row)
+    new_queue = dict(queue)
+    new_queue["items"] = sort_items(out_items)
+    return new_queue
 
 
 def compute_stats(items: list[dict], dispositions: list[dict], *, now_iso: str) -> dict:

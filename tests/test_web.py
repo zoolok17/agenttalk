@@ -7488,6 +7488,8 @@ def test_api_attention_surfaces_process_tree_hold_without_liaison(
         "configured_launch": internal["configured_launch"],
         "restart_request": internal["restart_request"],
         "age_seconds": 0.0,
+        "age_unknown": True,
+        "supervisor_state": "Supervisor state unknown",
         "human_can_unblock_now": True,
     }
     assert wire["restart_request"] == {
@@ -7644,6 +7646,7 @@ def test_api_attention_shape_and_gate_hold(tmp_path: Path) -> None:
             "target_root_project_id",
             "items",
             "count",
+            "active_count",
         }
         assert payload["target_root_project_id"] == s.project_id()
         assert payload["root_info"] == {
@@ -7689,7 +7692,8 @@ def test_api_attention_actions_off_escalation_shape_is_legacy_fixture(
         item = next(it for it in payload["items"] if it["source"] == "escalation")
         assert set(item) == {
             "id", "source", "source_label", "severity", "title", "agent",
-            "detail", "age_seconds", "human_can_unblock_now", "source_refs",
+            "detail", "age_seconds", "age_unknown", "human_can_unblock_now",
+            "source_refs",
         }
         assert item["source_refs"] == [{"kind": "message", "request_id": "esc-help"}]
         assert item["title"] == "Choose release path"
@@ -8598,7 +8602,8 @@ def test_api_risk_register_shape_and_sorted_by_severity_then_age(
         payload = _risk_register(base)
         assert set(payload) == {
             "root", "root_path", "root_info", "target_root_project_id",
-            "items", "count", "truncated", "partial", "degraded_sources",
+            "items", "count", "active_count", "truncated", "partial",
+            "degraded_sources",
         }
         assert payload["count"] == len(payload["items"])
         assert payload["partial"] is False
