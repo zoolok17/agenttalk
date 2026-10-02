@@ -808,6 +808,33 @@ def _process_tree_identity_warning(tree: dict) -> str | None:
     return warning or None
 
 
+def supervisor_appears_running(store) -> bool:
+    """Issue #267: is there a reasonable basis to say the supervisor that
+    recorded a hold is still running?
+
+    FAILS TOWARD TRUE (running): the question "is the supervisor running"
+    is only even meaningful for a project that has set up supervision in the
+    first place - the same ``supervisor_scaffolded`` precondition
+    ``web.py``'s ``build_preflight`` already checks (both ``supervisor.ps1``
+    and ``supervisor.json`` present, web.py:483-490). Absent that, there is
+    no "the supervisor" for a hold to have been recorded by - a bare
+    instance-lock miss there (every unit test that writes
+    ``supervisor-state.json`` directly, never spinning up a real supervisor
+    process at all) is NOT evidence of anything, and must never be read as
+    "not running". Only when supervision IS scaffolded and
+    ``store.read_supervisor_instance()`` (the same singleton-lock liveness
+    check ``build_preflight`` uses, web.py:488) finds no live instance lock
+    is non-liveness actually provable.
+    """
+    scaffolded = (
+        (store.dir / "supervisor.ps1").exists()
+        and (store.dir / "supervisor.json").exists()
+    )
+    if not scaffolded:
+        return True
+    return store.read_supervisor_instance() is not None
+
+
 def process_tree_hold_items(
     state: dict,
     *,

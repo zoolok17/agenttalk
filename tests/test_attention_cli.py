@@ -1187,6 +1187,13 @@ def test_attention_hold_is_history_not_needs_you_without_live_supervisor(
 ) -> None:
     from agenttalk import attention as A
     s = _team(tmp_path)
+    # issue #267 FIX round 1: "no supervisor running" is only provable when
+    # supervision is scaffolded in the first place (A.supervisor_appears_running
+    # fails toward True otherwise) - write the same two files
+    # build_preflight checks (web.py:483-490) so this test's "nobody claimed
+    # the lock" genuinely means "configured, but not currently running".
+    (s.dir / "supervisor.ps1").write_text("# scaffold", encoding="utf-8")
+    (s.dir / "supervisor.json").write_text(json.dumps({"agents": {}}), encoding="utf-8")
     supervisor_mod.save_supervisor_state(
         s.dir / "supervisor-state.json",
         _held_supervisor_state("beta"),
@@ -1218,3 +1225,32 @@ def test_attention_hold_is_history_not_needs_you_without_live_supervisor(
     )
     assert live_hold["state"] == "active"
     assert live_hold["priority"] == live_hold["risk_severity"] == "high"
+
+
+def test_attention_hold_keeps_severity_when_supervision_was_never_scaffolded(
+    tmp_path: Path,
+) -> None:
+    # FIX round 1 (CI regression on PR #272): a project with no
+    # supervisor.ps1/supervisor.json at all has no "the supervisor" for a
+    # hold to have been recorded by - liveness cannot be established, so the
+    # original severity/escalation must be kept (fail toward showing, not
+    # hiding). This is exactly test_supervisor.py's
+    # test_owned_process_tree_bound_holds_and_escalates_when_truncated shape:
+    # supervisor-state.json written directly, no scaffold, no lock.
+    from agenttalk import attention as A
+    s = _team(tmp_path)
+    assert not (s.dir / "supervisor.ps1").exists()
+    assert not (s.dir / "supervisor.json").exists()
+    supervisor_mod.save_supervisor_state(
+        s.dir / "supervisor-state.json",
+        _held_supervisor_state("beta"),
+    )
+    roster = s.load_config().get("agents") or []
+
+    for items in (
+        cli._collect_attention_items(s, for_agent="claude", roster=roster),  # noqa: SLF001
+        web_mod._collect_web_attention_items(s, roster, "claude"),  # noqa: SLF001
+    ):
+        hold = next(i for i in items if i["source"] == A.SOURCE_PROCESS_TREE_HOLD)
+        assert hold["state"] == "active"
+        assert hold["priority"] == hold["risk_severity"] == "high"

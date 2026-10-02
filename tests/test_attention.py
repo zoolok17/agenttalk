@@ -3313,6 +3313,31 @@ def test_process_tree_hold_age_unknown_without_refreshed_at() -> None:
     assert item["age_unknown"] is True
 
 
+def test_supervisor_appears_running_fails_toward_true_when_not_scaffolded(
+    tmp_path: Path,
+) -> None:
+    # FIX round 1 (CI regression on PR #272): no supervisor.ps1/supervisor.json
+    # at all means there is no "the supervisor" for a hold to have been
+    # recorded by - liveness is not established, so this must read True
+    # (fail toward showing), never False from a bare missing instance lock.
+    s = Store(tmp_path)
+    s.init(["worker"])
+    assert not (s.dir / "supervisor.ps1").exists()
+    assert att.supervisor_appears_running(s) is True
+
+
+def test_supervisor_appears_running_false_only_when_scaffolded_and_unclaimed(
+    tmp_path: Path,
+) -> None:
+    s = Store(tmp_path)
+    s.init(["worker"])
+    (s.dir / "supervisor.ps1").write_text("# scaffold", encoding="utf-8")
+    (s.dir / "supervisor.json").write_text("{}", encoding="utf-8")
+    assert att.supervisor_appears_running(s) is False
+    assert s.claim_supervisor_instance(pid=4321) is not None
+    assert att.supervisor_appears_running(s) is True
+
+
 def test_process_tree_hold_hides_agent_outside_visible_set() -> None:
     state = _process_tree_state(status="truncated", reason_code="process_tree_truncated")
     visible = att.process_tree_hold_items(

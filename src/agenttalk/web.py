@@ -2617,12 +2617,12 @@ def _collect_web_attention_items(store: Store, roster: list[str],
             # issue #267: `roster` is already the live (non-retired) agent
             # list this function was called with; a hold for anyone else
             # (retired, or a stale key with no current config entry at all)
-            # is dropped rather than shown. Liveness mirrors build_preflight's
-            # own "supervisor_running" check (store.read_supervisor_instance()
-            # is None <=> no live instance lock, web.py:488-490) - the same
-            # singleton-lock test, not a new one.
+            # is dropped rather than shown. Liveness fails toward TRUE
+            # (A.supervisor_appears_running: not scaffolded at all, or
+            # genuinely no live instance lock while scaffolded, same
+            # build_preflight signal, web.py:483-490).
             visible_agents=frozenset(roster),
-            supervisor_running=store.read_supervisor_instance() is not None,
+            supervisor_running=A.supervisor_appears_running(store),
         )
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("process_tree_hold", str(e)))
