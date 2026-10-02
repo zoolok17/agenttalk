@@ -453,6 +453,40 @@ test('#267: a single busy attention reply is calm, not a failure, and retries af
   assert.equal(app(dom).className, '', 'recovers calmly - never flagged as a failure in the first place');
 });
 
+test('#267 FIX round 1 (F1): an overflow retry_after is clamped to a sane ceiling, not left effectively infinite', async () => {
+  // A probe (codex-agenttalk-reviewer-1) found retry_after=1e308 - a technically finite,
+  // technically positive number - made the wait-gate deadline functionally Infinity: every
+  // later poll tick skipped the request, and the retry cap was never reached (one request
+  // after advancing the clock over a day). Clamping the delay means the SERVER'S number never
+  // controls how long this panel can sit quietly: the clamp ceiling does, always.
+  const srv = server({ attention: () => BUSY(1e308) });
+  const { dom, clock, fire } = await boot(srv);
+  const attentionCalls = () => srv.calls.filter((u) => u.startsWith('/api/attention')).length;
+  const callsAfterBoot = attentionCalls();   // the one busy reply received during boot
+
+  srv.attention = () => ({ target_root_project_id: 'proj-a', items: [] });
+  clock.perf += 29000;   // just under the clamp ceiling
+  await fire(under);
+  assert.equal(attentionCalls(), callsAfterBoot, 'still gated just before the clamp ceiling - the absurd value is NOT honoured');
+
+  clock.perf += 2000;    // now just over the clamp ceiling since the busy reply
+  await fire(under);
+  assert.equal(attentionCalls(), callsAfterBoot + 1,
+    'the clamp ceiling bounds the wait regardless of what the server sent - not stuck at one request forever');
+  assert.equal(app(dom).className, '', 'recovers calmly on the very next retry, exactly like an ordinary busy reply');
+});
+
+test('#267 FIX round 1 (F1): the clamp boundary - exactly the ceiling is enough to retry', async () => {
+  const srv = server({ attention: () => BUSY(1e308) });
+  const { dom, clock, fire } = await boot(srv);
+  const attentionCalls = () => srv.calls.filter((u) => u.startsWith('/api/attention')).length;
+  const callsAfterBoot = attentionCalls();
+  srv.attention = () => ({ target_root_project_id: 'proj-a', items: [] });
+  clock.perf += 30000;   // exactly the clamp ceiling (ATTENTION_BUSY_MAX_DELAY_SECONDS)
+  await fire(under);
+  assert.equal(attentionCalls(), callsAfterBoot + 1, 'elapsed exactly equal to the ceiling is enough, not "strictly more than"');
+});
+
 test('#267: busy retries are capped, then the real error shows', async () => {
   const srv = server({ attention: () => ({ target_root_project_id: 'proj-a', items: [ATT_ITEM({ id: 'a', title: 'Only question' })] }) });
   const { dom, clock, fire } = await boot(srv);
@@ -487,6 +521,17 @@ test('#267: a 503 with no usable retry_after shows the real error immediately', 
   assert.ok(all(stream(dom)).includes('Can’t read what needs you.'),
     'a 503 with no usable retry_after is a real error, not a calm wait');
   assert.equal(app(dom).className, 'is-stale');
+});
+
+test('#267 FIX round 1 (F1): a non-finite or non-positive retry_after is a real error, never a calm wait', async () => {
+  for (const bad of [Infinity, NaN, 0, -5, 'soon']) {
+    const srv = server({ attention: () => ({ __status: 503, __body: { error: 'busy', retry_after: bad } }) });
+    const { dom, fire } = await boot(srv);
+    await fire();
+    assert.ok(all(stream(dom)).includes('Can’t read what needs you.'),
+      `retry_after=${bad}: a genuinely unusable value is a real error, not treated as busy`);
+    assert.equal(app(dom).className, 'is-stale');
+  }
 });
 
 test('#246: no second attention fetch starts while the busy scan bound has not answered yet', async () => {
@@ -740,6 +785,28 @@ test('a hung state read later on greys the page with the last data kept', async 
   assert.equal(app(dom).className, 'is-stale');
   assert.ok(all(stream(dom)).includes('CAN’T REACH THE CONSOLE SERVER'));
   assert.ok(all(rail(dom)).includes('TEAM · 9'));
+});
+
+test('#267 FIX round 1 (N1): a 500 with a hanging body fails /api/state immediately, not at the 5s timeout', async () => {
+  // getJson's error-body read (added for the attention busy check) is opt-in per caller, not
+  // automatic for every feed - otherwise a FAILED /api/state response whose body never arrives
+  // would be held up reading that body until the 5 s request timeout, instead of failing the
+  // instant the status line itself says not-ok (/api/state does not opt in).
+  const srv = server();
+  const originalFetch = srv.fetch.bind(srv);
+  let fail = false;
+  srv.fetch = (url, init) => {
+    if (fail && url === '/api/state') {
+      return Promise.resolve({ ok: false, status: 500, json: () => new Promise(() => {}) });
+    }
+    return originalFetch(url, init);
+  };
+  const { dom, fire } = await boot(srv);
+  fail = true;
+  await fire(under);   // only the 2 s poll timer, well short of the 5 s request timeout
+  assert.ok(all(stream(dom)).includes('CAN’T REACH THE CONSOLE SERVER'),
+    'already failed before the 5 s timeout - not stuck waiting on a hanging error body');
+  assert.equal(app(dom).className, 'is-stale');
 });
 
 test('a response that arrives in time clears its timeout (no leftover timers)', async () => {

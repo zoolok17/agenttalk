@@ -65,8 +65,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reason to know about. Agent names, ids and numbers are unchanged; where a
   message was unclear only because the underlying state itself is unclear,
   it was left as is (listed in the pull request) rather than guessed at.
-  What you will notice: the empty board now says, for example, "No work in
-  progress, and nothing finished in the last 7 days"; a board that cannot
+  What you will notice: the empty board now says, for example, "No tracked
+  work in progress, and nothing finished in the last 7 days"; a board that cannot
   load fully says "Cards can't be shown right now; the board keeps trying";
   a truncated board says "Not all cards fit: 12 are not shown"; and the
   "what needs you" panel's failure and stale-read text no longer name the

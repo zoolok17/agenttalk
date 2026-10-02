@@ -1094,10 +1094,14 @@
     // board - overflow, degraded coverage or a read failure with nothing retained get their own,
     // honestly different wording instead of the same contradictory empty claim.
     if (!summary.cards.length) {
+      // F2 (FIX round 1): "No work in progress" used to claim more than this feed actually
+      // knows - it's a count of TRACKED cards only, and legacy/untagged work (shown separately,
+      // right below) can be genuinely open at the very same moment. Scoped to "tracked" so the
+      // two lines never read as contradicting each other.
       out.appendChild(el('p', 'c2-sub', summary.knownEmpty
         ? (summary.windowDays !== null
-            ? 'No work in progress, and nothing finished in the last ' + summary.windowDays + ' days.'
-            : 'No work in progress, and nothing finished recently.')
+            ? 'No tracked work in progress, and nothing finished in the last ' + summary.windowDays + ' days.'
+            : 'No tracked work in progress, and nothing finished recently.')
         : 'Cards can’t be shown right now; the board keeps trying.'));
     }
     summary.cards.forEach(function (c) { out.appendChild(boardCardNode(c, boardNav.selectedKey === c.key)); });
@@ -1323,7 +1327,14 @@
 
   // A bounded GET. The timeout also covers a request that never settles at all, and
   // one that ignores its abort signal, so a hung feed can never hold the page up.
-  function getJson(url) {
+  //
+  // `opts.readErrorBody` (#267, FIX round 1 finding N1): reading a FAILED response's body is
+  // opt-in, not automatic for every caller. A body is a second read that can itself hang (a
+  // 500 whose body never arrives) - only the one caller that actually needs the body (the
+  // attention busy/retry_after check) asks for it; every other feed keeps the original,
+  // immediate "fail the instant the status line says not-ok" behavior, with no new way to be
+  // held up by a slow or hanging error body.
+  function getJson(url, opts) {
     return new Promise(function (resolve, reject) {
       var ctl = typeof AbortController === 'function' ? new AbortController() : null;
       var settled = false;
@@ -1343,6 +1354,7 @@
       if (ctl) init.signal = ctl.signal;
       fetch(url, init).then(function (r) {
         if (r.ok) return r.json();
+        if (!(opts && opts.readErrorBody)) throw new Error('http ' + r.status);
         // #267: a failed response's body can carry a machine-readable reason (a 503 busy
         // reply's retry_after) - read it on a best-effort basis so a caller can tell "ask
         // again shortly" apart from a genuine failure. A body that is missing or not JSON
@@ -1434,15 +1446,30 @@
   // what needs you" error state. project_id -> { untilPerf, retries }, cleared on any
   // non-busy outcome (success or a genuine failure).
   var ATTENTION_BUSY_MAX_RETRIES = 3;
+  // FIX round 1 (reviewer finding F1): retry_after is SERVER-supplied and must never be
+  // trusted as-is. `1e308` is a technically-finite, technically-positive number, so it used to
+  // pass straight through - the wait-gate deadline became functionally Infinity, every later
+  // poll tick skipped the request entirely, and the retry cap above was never reached (the
+  // reviewer's probe showed exactly ONE request after advancing the clock more than a day).
+  // Clamping every delay to this ceiling, combined with the retry cap, keeps the TOTAL time
+  // this panel can ever sit quietly waiting bounded too: at most
+  // ATTENTION_BUSY_MAX_RETRIES * ATTENTION_BUSY_MAX_DELAY_SECONDS (90 s here) before the real
+  // failure shows, no matter what the server sends. 30 s is long enough to ride out ordinary
+  // load, short enough that 90 s total is still "the panel went quiet for a bit", not "forever".
+  var ATTENTION_BUSY_MAX_DELAY_SECONDS = 30;
   var attentionBusy = Object.create(null);
 
-  // Null unless `err` is exactly a busy reply with a usable retry_after (a positive, finite
-  // number of seconds) - a 503 with no such body, or any other status, is a genuine failure.
+  // Null unless `err` is exactly a busy reply with a usable retry_after - a positive, finite
+  // number of seconds, clamped to the ceiling above. A 503 with no such body, any other status,
+  // or a retry_after that is not a positive finite number (zero, negative, NaN, or an actual
+  // Infinity) is NOT treated as busy at all - it falls straight through to the real-error path,
+  // the same as any other malformed busy body.
   function busyRetryAfterSeconds(err) {
     var body = err && err.body;
     if (!err || err.status !== 503 || !body || typeof body !== 'object' || body.error !== 'busy') return null;
     var n = body.retry_after;
-    return typeof n === 'number' && isFinite(n) && n > 0 ? n : null;
+    if (typeof n !== 'number' || !isFinite(n) || n <= 0) return null;
+    return Math.min(n, ATTENTION_BUSY_MAX_DELAY_SECONDS);
   }
 
   function fetchAttention(id) {
@@ -1454,7 +1481,7 @@
         // path's contract the same as every other outcome below (always ends in a render).
         return Promise.resolve().then(renderAll);
       }
-      return getJson(rootUrl('/api/attention', id)).then(function (payload) {
+      return getJson(rootUrl('/api/attention', id), { readErrorBody: true }).then(function (payload) {
         delete attentionBusy[id];
         var bad = !answersFor(payload, id) || (Array.isArray(payload.errors) && payload.errors.length > 0);
         if (bad) attentionFailed(id);
