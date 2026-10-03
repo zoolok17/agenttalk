@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A small, neutral program runner for asking an outside program whether a
+  paid turn may run (build 6a-2a of "quota lease binding" for the paid
+  gateway).** An operator running the paid gateway will be able to plug in
+  their own local program - the "turn admission program" - that decides
+  whether a paid turn may start and under what limits, instead of agenttalk
+  always using the gateway's fixed defaults. This patch is the runner that
+  talks to that program; it does not yet change how or when the wrapper asks
+  it, which is separate, later work.
+
+  What you will notice: nothing yet. This patch adds the runner and its
+  configuration shape (documented in the README); nothing calls it until a
+  later patch wires it into the wrapper's own turn handling.
+
+  What you need to do: nothing. An operator who wants to try the feature
+  once it is fully wired will configure a `turn_admission` section in
+  `supervisor.json` (see the README) - there is no change to make today.
+
+  Technical details: `src/agenttalk/turn_admission.py` runs the configured
+  executable with `shell=False`, an absolute path, fixed arguments, a fixed
+  working directory, and a minimal environment built only from the
+  operator's own fixed name/value pairs (nothing else is inherited, so no
+  token reaches the program). One overall deadline covers writing the
+  request, reading the answer, the program's exit, and cleanup; on a
+  timeout, an oversized answer, or an abandoned call, the whole process
+  tree is terminated and reaped by exact process id - a process group on
+  POSIX, a Job Object on Windows (reusing `powershell_host`'s existing,
+  pywin32-free Job Object implementation) - never by image name. Standard
+  error is discarded without ever being accumulated or logged. Both the
+  request this module sends and the answer it reads are strict, closed-key
+  JSON (no booleans or floats where an integer is required, no duplicate
+  keys, no `NaN`/`Infinity`, no trailing data), with a size cap enforced
+  while reading so a legal answer is never cut off and an oversized one
+  never gets the chance to look valid. Every failure - the program not
+  starting, a pin mismatch, the timeout, a non-zero exit, invalid JSON, a
+  wrong key/type/bound, an oversized answer - is reported to the caller as
+  one of eight closed words, never the program's own text. Configuration
+  (the executable path, arguments, optional SHA-256 pin, working directory,
+  environment list and timeout) comes only from the operator's own local
+  wrapper configuration; a test proves a bus message, an agent, task text,
+  or an agent-settable environment variable can never change what runs.
+  Tests: `tests/test_turn_admission.py`, including a real child process that
+  starts a real grandchild and hangs, confirmed killed by its exact process
+  id.
+
 ### Fixed
 
 - **The new console no longer hides a stalled seat the server already saw

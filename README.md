@@ -921,6 +921,51 @@ typed-evidence shape at the milestone level.
   directory on one machine (or a directory synced by a mechanism you
   already trust) — there's no server process bridging machines.
 
+### Turn admission for the paid gateway
+
+For an operator running the paid gateway, agenttalk can ask an outside
+program whether a paid turn may run, and under what limits, before the
+turn starts. This section documents the program's configuration; the
+runner that calls it is built, but nothing wires it into the wrapper's
+own turn loop yet - that is separate, later work.
+
+The configuration is a `turn_admission` object in `supervisor.json`,
+read only from that local, operator-owned file - never from a bus
+message, an agent, or an environment variable an agent can set:
+
+```json
+{
+  "turn_admission": {
+    "command": "/absolute/path/to/the/program",
+    "args": [],
+    "cwd": "/absolute/path/it/should/run/from",
+    "env": {"SOME_FIXED_NAME": "some fixed value"},
+    "timeout_seconds": 25,
+    "sha256": "<64 lowercase hex characters, optional>"
+  }
+}
+```
+
+- `command` must be an absolute path - it is never looked up on `PATH`.
+- `args` is a fixed list; nothing about a specific turn or message is
+  ever added to it.
+- `env` lists only the fixed name/value pairs the program needs. Nothing
+  else from the wrapper's own environment reaches the program.
+- `timeout_seconds` bounds the whole call - writing the request, reading
+  the answer, the program's exit, and cleanup - not just the final wait.
+  Default 25, at most 30.
+- `sha256` is an optional pin of the executable file. **When the
+  program is an interpreter** (for example a Python or Node
+  installation), **the pin covers only that interpreter file, not the
+  script it runs** - pinning `python` does not pin which script you
+  pointed it at with `args`. `agenttalk doctor` reports only whether a
+  pin is set (`pinned` or `not pinned`), never the hash itself.
+
+A failed or slow call never raises an error message from the program
+itself: every failure is reported as one of a fixed, closed set of
+words (never the program's own text), so nothing the program prints can
+leak into logs, status, or the journal.
+
 ### Windows notes
 
 - The supervisor requires **PowerShell Core 7+** (7.4+ recommended;
