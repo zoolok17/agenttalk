@@ -567,6 +567,32 @@ def _last_progress_note_for(agent_msgs: list[Message], health: dict) -> dict | N
     }
 
 
+def _turn_journal_label(store: Store, agent: str, health: object) -> str | None:
+    """The agent's turn-journal label for `status`, or None when this project has
+    never used the journal (so `status` reads exactly as it did). Live facts only."""
+    try:
+        from . import turn_events as _te
+        from . import wrapper_runtime as _wr
+
+        if not _te.journal_in_use(store.root):
+            return None
+        marker = store.read_health_raw(agent)
+        mode = marker.get("mode") if isinstance(marker, dict) else None
+        if not isinstance(mode, str):
+            return None  # not a wrapped agent: nothing to say about its journal
+        runtime = _wr.read_runtime(store.state_dir, agent)
+        record = runtime.get("record") if runtime.get("status") == _wr.STATUS_VALID else None
+        return _te.status_label(
+            store.root,
+            agent,
+            health_mode=mode,
+            runtime_record=record,
+            health_warnings=marker.get("warnings") if isinstance(marker.get("warnings"), list) else None,
+        )
+    except Exception:  # noqa: BLE001 - status never fails over an advisory label
+        return None
+
+
 def _gather_status(store: Store) -> dict:
     """Build the structured status payload shared by both output modes."""
     cfg = store.load_config()
@@ -661,6 +687,9 @@ def _gather_status(store: Store) -> dict:
         }
         if last_progress_note is not None:
             row["last_progress_note"] = last_progress_note
+        journal_label = _turn_journal_label(store, a, health)
+        if journal_label is not None:  # additive: absent unless this project uses the journal
+            row["turn_events"] = journal_label
         sup_row = supervisor_rows.get(a)
         if isinstance(sup_row, dict):
             decision = sup_row.get("decision")
@@ -1461,6 +1490,8 @@ def cmd_status(args: argparse.Namespace) -> int:
             age = lpn.get("age_seconds")
             age_str = _format_age(age) if isinstance(age, (int, float)) else "unknown age"
             seen += f' progress="{text}" ({age_str})'
+        if isinstance(a.get("turn_events"), str):
+            seen += f" turn_events={a['turn_events']}"
         role = f" role={a['role']}" if a.get("role") else ""
         of = " [operator-facing]" if a.get("operator_facing") else ""
         print(f"  {a['name']:<10}{role}{of} cursor={cursor:<32} unread={a['unread']:<3} {seen}")
@@ -11616,7 +11647,8 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                     profile_env: dict[str, str] | None = None,
                     supervisor_launch_nonce: str | None = None,
                     lifecycle_log: object | None = None,
-                    reply_shell: str = "powershell") -> int:
+                    reply_shell: str = "powershell",
+                    turn_events: bool = False) -> int:
     """The long-running supervised wrapper loop (design C): own the idle bus-wait +
     heartbeat, drive the CLI ONE turn per inbound message in structured-stream mode
     (session continuity owned here), then return to the wait. Runs until killed -
@@ -11741,6 +11773,10 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
         wrapper_generation,
         on_transition=lifecycle_log.runtime_transition,
     )
+    # The optional turn journal: built here (no I/O), started just before the loop.
+    journal = None
+    if turn_events and one_shot_request_id is None:
+        journal = _build_turn_journal(store, agent, lead_loop=lead_loop)
     try:
         drive = wrapper_run.make_drive(
             store, agent, cli, state, base_argv, sender=sender,
@@ -11763,6 +11799,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             # #202 D4: tell the child it was interrupted - built here in the cli
             # wiring (review finding 7), reading the persisted attempt ledger.
             rejoin_for=_interruption_rejoin_for(store, agent, k_interrupted),
+            turn_events=journal,
         )
     except ValueError as e:
         _release()
@@ -11920,6 +11957,16 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             agent, record, backend_profile=backend_profile, profile_env=profile_env,
         )
 
+    def _on_message_disposed(record: dict, disposition: str, facts: dict) -> None:
+        sent_at = record.get("ts")
+        journal.emit(
+            "message_disposed",
+            message_id=record.get("id"),
+            disposition=disposition,
+            message_at=sent_at if isinstance(sent_at, str) and sent_at else None,
+            **facts,
+        )
+
     try:
         from .wrapper.obligations import DetectionCommitGate
 
@@ -11928,6 +11975,22 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             agent,
             fence=wrapper_generation,
         )
+        if journal is not None:
+            # The loop handles its first message only after the stream is registered
+            # (or the start bound passes); on failure it simply runs without the journal.
+            # Nothing is logged here or by the writer: a journal that is off shows only in
+            # its own status record, `agenttalk status` and `doctor`.
+            if not journal.start():
+                # Carried by the health record the wrapper writes anyway: no new I/O here.
+                from .turn_events import start_failure_warning
+
+                # The word names its owner (this wrapper's pid and start token, already known
+                # to the runtime writer), so a replacement wrapper never shows it as its own.
+                warning = start_failure_warning(
+                    journal.off_reason, runtime_writer.wrapper_pid, runtime_writer.wrapper_start
+                )
+                if warning is not None:
+                    health_writer.standing_warnings = (warning,)
         turns = wloop.run_loop(
             store, agent, drive,
             max_turns=1 if one_shot_request_id else None,
@@ -11968,6 +12031,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             capacity_refresh=capacity_refresh,
             wrapper_generation=wrapper_generation,
             commit_gate=commit_gate,
+            on_message_disposed=_on_message_disposed if journal is not None else None,
         )
     except _LeadLoopLeaseLost:
         # LOST the lease mid-run (stolen / torn / force-released): the ownership gate /
@@ -11988,6 +12052,9 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
         # exit marker is written -> the supervisor relaunches + the relaunch re-acquires.
         _release()
         raise
+    finally:
+        if journal is not None:
+            journal.close()  # bounded by one deadline; never raises
     if one_shot_request_id and turns < 1:
         # Distinguish a dead thread from a never-arriving request for the diagnostic
         # (read-only scoped poll; either way it is a nonzero one-shot exit).
@@ -12013,6 +12080,32 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             "managed_lead_loop_stood_down",
         )
     return _wrapper_exit(0, "loop_returned")
+
+
+def _turn_events_wanted(args: argparse.Namespace) -> bool:
+    from .turn_events import turn_events_requested
+
+    return turn_events_requested(getattr(args, "turn_events", False))
+
+
+def _build_turn_journal(store, agent: str, *, lead_loop: bool):
+    """The turn-journal sink for this wrapper, or None if it cannot even be built.
+
+    Building does no I/O, not even finding the folder (that touches the file system):
+    the sink calls the folder function on its writer thread, inside the bound of
+    ``start()`` (called once before the first message)."""
+    try:
+        from .turn_events import TurnEventSink, default_turn_events_root
+
+        project_root = store.root
+        return TurnEventSink(
+            lambda: default_turn_events_root(project_root),
+            agent,
+            agent_version=__version__,
+            unmanaged=("cadence",) if lead_loop else (),
+        )
+    except Exception:  # noqa: BLE001 - the journal is optional; the wrapper runs without it
+        return None
 
 
 def _resolves_to_cmd_wrap(argv: list[str]) -> bool:
@@ -12575,6 +12668,7 @@ def _cmd_wrap_with_logging(args: argparse.Namespace) -> int:
                 None,
             ),
             reply_shell=reply_shell,
+            turn_events=_turn_events_wanted(args),
         )
     try:
         return wrapper_run.run_wrapper(
