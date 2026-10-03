@@ -274,7 +274,7 @@ def _check_stream_started(obj: dict[str, Any]) -> None:
         _bad()
     if any(item != "cadence" for item in obj["unmanaged"]):
         _bad()
-    if not isinstance(obj["agent_version"], str) or _VERSION.match(obj["agent_version"]) is None:
+    if not isinstance(obj["agent_version"], str) or _VERSION.fullmatch(obj["agent_version"]) is None:
         _bad()
 
 
@@ -679,7 +679,7 @@ class TurnEventSink:
             mode == "loop"
             and unmanaged_ok
             and isinstance(agent_version, str)
-            and _VERSION.match(agent_version) is not None
+            and _VERSION.fullmatch(agent_version) is not None
         )
         self._agent_version = agent_version if self._startup_ok else "unknown"
         self._mode = "loop" if self._startup_ok else "invalid"

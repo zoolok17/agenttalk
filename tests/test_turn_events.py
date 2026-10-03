@@ -334,7 +334,13 @@ def test_a_closing_records_dropped_total_cannot_pass_its_last_seq():
 
 @pytest.mark.parametrize(
     "agent_version",
-    ["", "../etc/passwd", "a/b", "a b", "x" * 41, "-leading-dash", "étag"],
+    [
+        "", "../etc/passwd", "a/b", "a b", "x" * 41, "-leading-dash", "étag",
+        # Fix round 1 (#310): re.match's trailing "$" can match just before a final
+        # newline, so a version one character over any allowed length - a short one or
+        # the exact 40-character boundary - with a newline appended must still be refused.
+        "x\n", "x" * 40 + "\n",
+    ],
 )
 def test_a_malformed_agent_version_is_refused(agent_version):
     with pytest.raises(te.TurnEventError):
@@ -1352,6 +1358,12 @@ def test_f4_a_mutable_or_odd_value_is_refused_not_kept_by_reference(tmp_path):
         {"agent_version": "SENTINEL/private/path"},
         {"agent_version": "x" * 41},
         {"agent_version": "café"},
+        # Fix round 1 (#310): the same end-anchor bug applied to the writer's own
+        # startup check (_VERSION.match), not only the reader - a version one
+        # character over the allowed length, with a trailing newline, must still
+        # fail here too.
+        {"agent_version": "x\n"},
+        {"agent_version": "x" * 40 + "\n"},
     ],
 )
 def test_f5_an_invalid_startup_value_is_never_written_anywhere(tmp_path, kw):
