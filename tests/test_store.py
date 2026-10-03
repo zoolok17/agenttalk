@@ -468,8 +468,11 @@ def test_control_kinds_unchanged() -> None:
     # Literal assertion on purpose - any addition to the control plane
     # must consciously update this test. #164 added `progress` (an interim
     # status update must never open/derive a thread or count as a reply,
-    # for the exact same structural reason `composing` doesn't).
-    assert CONTROL_KINDS == frozenset({"composing", "progress"})
+    # for the exact same structural reason `composing` doesn't). #279 added
+    # `planned` - a lead's self-addressed Planned-lane record must never
+    # trigger a wrapped turn, attempt ledger or dead letter for the SAME
+    # structural reason, even though it isn't flow control.
+    assert CONTROL_KINDS == frozenset({"composing", "progress", "planned"})
 
 
 def test_opener_kinds_single_source() -> None:

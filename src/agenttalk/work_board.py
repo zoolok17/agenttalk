@@ -192,6 +192,9 @@ def _audit(messages, openers):
 
 
 def _audit_one(m, by_id, parent, openers, responses, flag):
+    # issue #279: a `planned` record never reaches here - `_reduce` already
+    # partitions it out of `messages` at the entry (fix round 3), so
+    # `by_id`/`parent`/`openers` never contain one either.
     meta = m.meta
     rid, anchor_id = meta.get("request_id"), meta.get("in_reply_to")
     if (not (rid is None or isinstance(rid, str)) or not (anchor_id is None or isinstance(anchor_id, str))
@@ -263,7 +266,16 @@ def _well_formed(m):
 
 
 def _reduce(messages, lead, incidents, integrated, running, checks):
-    messages = list(messages)
+    # issue #279 fix round 3 (F12-F14): partition ONCE at the entry - every
+    # real-work path below (audit, by_id/parent, ancestry, closure
+    # attribution, legacy/detached linking) sees ONLY `real`. A planned
+    # record never enters any of this machinery, so it cannot be an
+    # anchor/request/supersedes target for anything real (closes F14's
+    # class: a malformed planned record can no longer forge an anchor a
+    # real reply resolves through). This replaces the scattered
+    # `m.kind != "planned"` / `if m.kind == "planned": return` guards that
+    # used to be needed call site by call site.
+    messages = [m for m in messages if getattr(m, "kind", None) != "planned"]
     broken = [m for m in messages if not _well_formed(m)]
     messages = [m for m in messages if _well_formed(m)]
     openers = {}
@@ -303,7 +315,8 @@ def _reduce(messages, lead, incidents, integrated, running, checks):
         ids = {c.id for c in copies}
         target = copies[0].meta.get("supersedes")
         links = {item_of.get(target)} if isinstance(target, str) else set()
-        links |= {_slug(m.meta) for m in messages if m.meta.get("request_id") == req["request_id"]
+        links |= {_slug(m.meta) for m in messages
+                  if m.meta.get("request_id") == req["request_id"]
                   or (isinstance(m.meta.get("in_reply_to"), str) and m.meta["in_reply_to"] in ids)}
         links.discard(None)
         if len(links) == 1:
@@ -639,3 +652,179 @@ def _policy(slug, valid, cur, current, facts):
             result["problem"] = ("required checks not satisfied" if passed is False
                                  else "required check evidence unavailable", evidence)
     return result
+
+
+# ----------------------------------------------------- planned lane (issue #279)
+
+def real_openers(messages):
+    """The work_items with at least one REAL opener (``task`` or
+    ``review-request``) anywhere in ``messages`` - promotion's exact
+    definition (design doc §5). Deliberately narrower than
+    ``reduce(...)["items"]``'s own slug set: that list also contains a
+    work_item the AUDIT merely flagged evidence against (e.g. a plain
+    ``note`` with a dangling ``in_reply_to`` and a ``work_item`` tag,
+    which ``_audit_one`` attributes via ``owners()`` even though it opens
+    nothing) - counting that as promotion would let an ordinary orphaned
+    message permanently block `add` for a work_item nothing real was ever
+    dispatched for. An opener missing a well-formed ``request_id`` is
+    itself malformed (``_audit_one`` already flags it) and is not counted
+    either - the same admission bar ``reduce()``'s own ``openers`` dict
+    uses."""
+    out = set()
+    for m in messages:
+        if m.kind not in work_tags.OPENERS:
+            continue
+        rid = m.meta.get("request_id")
+        if not isinstance(rid, str) or not rid:
+            continue
+        slug = _slug(m.meta)
+        if slug:
+            out.add(slug)
+    return out
+
+
+def planned_state(messages, real_items):
+    """Per-``work_item`` Planned-lane state, replayed PURELY from the full
+    validated log - never raises, never mutates its input.
+
+    ``real_items``: the set of work_items with a REAL opener anywhere in
+    history - ``real_openers(messages)``, not ``reduce(...)["items"]``'s
+    own slug set (see ``real_openers``'s docstring for why; design doc
+    §5). Promotion is checked FIRST and wins unconditionally: once a
+    work_item is in ``real_items`` its state is
+    ``"promoted"`` regardless of what its planned chain looks like, even a
+    malformed or cyclic one - a real dispatch makes the plan's own validity
+    moot.
+
+    For a work_item NOT in ``real_items``, exactly one rooted, acyclic chain
+    of same-item ``replaces`` links, built only from STRUCTURALLY valid
+    ``kind="planned"`` records (``work_tags.validate_planned`` - replay
+    applies the identical check publication does; see that function's
+    docstring), must resolve to one tip (a record nothing replaces):
+    - zero planned records at all -> absent (not a key in the result);
+    - a malformed record anywhere for this work_item (fails
+      ``validate_planned``), a self-edge, a ``replaces`` naming a missing/
+      cross-item/non-planned id, a cycle, or more than one tip -> unknown;
+    - the chain's one tip has ``withdrawn: true`` -> withdrawn;
+    - otherwise -> active, carrying the tip's ``work_title``.
+
+    Returns ``{work_item: {"state", "title", "reason", "current_id"}}``.
+    ``title``/``current_id`` are the active/withdrawn tip's; both are
+    ``None`` for ``promoted`` (this function does not re-derive a real
+    item's own title) and for ``unknown`` (no single tip exists to name).
+    ``reason`` is set only for ``unknown``.
+    """
+    # issue #279 F12 residual/F17: an id must denote exactly ONE canonical
+    # envelope everywhere in history - detected across the FULL input,
+    # BEFORE filtering to `planned` or grouping by work_item. Detecting it
+    # only after both (the fix round 3 shape) missed two cases: two
+    # `planned` copies sharing an id but tagged to DIFFERENT work_items
+    # never met inside either item's own group, and a conflicting
+    # NON-planned copy under the same id was filtered out before ever
+    # being compared. The comparison itself is full-envelope equality
+    # (every field) - the same canonical notion `board plan`'s
+    # `read_history()` uses, and conceptually what the snapshot's own
+    # envelope digest is for: identical copies dedupe, anything else
+    # conflicts.
+    seen_by_id = {}
+    conflicting_ids = set()
+    for m in messages:
+        prior = seen_by_id.get(m.id)
+        if prior is not None and prior != m:
+            conflicting_ids.add(m.id)
+        seen_by_id[m.id] = m
+
+    raw = [m for m in messages if getattr(m, "kind", None) == "planned"]
+    by_item, conflicted_items = {}, set()
+    for m in raw:
+        item = m.meta.get("work_item") if isinstance(m.meta, dict) else None
+        if not isinstance(item, str) or not item:
+            continue  # unattributable: no work_item to blame this record on
+        by_item.setdefault(item, []).append(m)
+        if m.id in conflicting_ids:
+            conflicted_items.add(item)
+
+    out = {}
+    for item, group in by_item.items():
+        if item in conflicted_items:
+            out[item] = {"state": "unknown", "title": None, "current_id": None,
+                        "reason": "a planned record id appears more than once with conflicting payloads"}
+            continue
+        # Every copy sharing an id within a non-conflicted item is, by the
+        # full-input check above, identical - deduping by id is therefore
+        # always safe here.
+        group = list({m.id: m for m in group}.values())
+        valid = {}  # id -> clean meta
+        malformed = False
+        for m in group:
+            try:
+                valid[m.id] = work_tags.validate_planned(
+                    m.meta, sender=m.sender, recipient=m.recipient)
+            except (TypeError, ValueError):
+                malformed = True
+        if malformed:
+            out[item] = {"state": "unknown", "title": None, "current_id": None,
+                        "reason": "a planned record for this work_item is malformed"}
+            continue
+        ids = set(valid)
+        replaced_ids = set()
+        # issue #279 F8: collect EVERY structural fault found rather than
+        # overwriting one `broken` variable in iteration order (which made
+        # the reported reason depend on message order, not the fault
+        # itself) - a stable priority then picks ONE reason regardless of
+        # which order the faulty records were scanned in.
+        faults = []
+        for mid in sorted(valid):  # sorted for determinism; priority alone already guarantees it
+            target = valid[mid].get("replaces")
+            if target is None:
+                continue
+            if target == mid:
+                faults.append((0, "a planned record names itself in replaces"))
+            elif target not in ids:
+                # Missing entirely from the log, present but a different
+                # kind, or present as `planned` for a DIFFERENT work_item -
+                # `ids` is scoped to THIS item's own valid planned records,
+                # so all three collapse to the same "doesn't resolve here".
+                faults.append((1, "a planned record's replaces does not "
+                                 "resolve to an earlier record of the same work_item"))
+            else:
+                replaced_ids.add(target)
+        if _cyclic_replaces(valid):
+            faults.append((2, "the planned records for this work_item form a replaces cycle"))
+        if faults:
+            out[item] = {"state": "unknown", "title": None, "current_id": None,
+                        "reason": min(faults)[1]}
+            continue
+        tips = sorted(ids - replaced_ids)
+        if len(tips) != 1:
+            out[item] = {
+                "state": "unknown", "title": None, "current_id": None,
+                "reason": "competing planned records for this work_item (no single current record)",
+            }
+            continue
+        tip_id = tips[0]
+        tip = valid[tip_id]
+        if tip.get("withdrawn") is True:
+            out[item] = {"state": "withdrawn", "title": None, "current_id": tip_id, "reason": None}
+        else:
+            out[item] = {"state": "active", "title": tip["work_title"], "current_id": tip_id, "reason": None}
+
+    for item in real_items:
+        out[item] = {"state": "promoted", "title": None, "current_id": None, "reason": None}
+    return out
+
+
+def _cyclic_replaces(valid):
+    """True if following `replaces` from any id in `valid` revisits a node -
+    identical shape to `_cyclic` above, over the planned-only `replaces`
+    edge instead of `in_reply_to`."""
+    for start in valid:
+        seen, node = set(), valid[start].get("replaces")
+        while node is not None and node in valid:
+            if node == start:
+                return True
+            if node in seen:
+                break  # a cycle elsewhere in the graph; that start already reports it
+            seen.add(node)
+            node = valid[node].get("replaces")
+    return False
