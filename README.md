@@ -1001,13 +1001,15 @@ Old files are removed oldest first once the folder passes its size cap.
   change of a machine's clock can defeat any time-based check.
 - A crash can lose the last events that were still waiting to be written.
 - When a full file is closed, the journal forces it to disk. If that fails, the
-  fault is counted and shown in the status record, and nothing tries again: that
+  fault is counted and recorded in the journal's status record, and nothing tries again: that
   file's durability is unproven. Its readable events are not counted as lost,
   because "complete" only ever means "no loss the journal can see".
-- Once the journal has been switched off (a timeout or a writer error), no new
-  file operation of any kind starts. The only record still written is the
-  status record that says why a start failed or timed out, and not even that
-  once the close deadline has passed.
+- Once the journal is cancelled (a start timeout or failure, or close's
+  deadline), the writer begins no new step. A step it has already begun (one
+  helper: an append, an atomic status write, a sync, a registration read with its
+  read-only process-identity lookup) may finish on the writer's own thread. No
+  caller ever waits for it. After close has timed out, not even the startup
+  status note is written.
 - `status` and `doctor` add journal labels only once the project has a journal
   folder. A first-ever start failure that creates no folder is therefore not shown
   there, even though the wrapper's health record carries the warning.
@@ -1020,7 +1022,9 @@ Old files are removed oldest first once the folder passes its size cap.
   attempt-ledger cleanup, and skipping one heartbeat stamp): known coverage limits.
 - The journal writes nothing to the wrapper's own log. A journal that did not
   start, or a fault while writing, shows only in the journal's own status
-  record, in `agenttalk status` and in `agenttalk doctor`.
+  record. `agenttalk status` and `agenttalk doctor` show the journal's state label
+  (for example `off (start_failed)` or `writer not responding`); the fault counts
+  and the last fault live in the journal's status record.
 
 **Not recorded.** Plain `wrap` (without `--loop`), `--one-shot` reviewers and the
 proactive sweeps of a `--lead-loop` wrapper are not journaled, and `status` says

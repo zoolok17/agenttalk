@@ -506,12 +506,15 @@ class JournalFiles:
 class _GatedFiles:
     """The only way the writer thread reaches a ``JournalFiles``.
 
-    Every operation that STARTS I/O first asks the sink whether cancellation is latched
+    Every helper that STARTS I/O first asks the sink whether cancellation is latched
     (a timeout, a close deadline, a writer error) and, if so, raises ``_Cancelled``
-    without calling the seam. So "nothing new after cancellation" holds by construction,
-    whatever a call site remembered to check. ``close`` only lets go of a handle and is
-    never refused. The one exception is the status write after a start timeout, which the
-    sink allows only until close's own deadline has passed (see ``_status_permitted``).
+    without calling the seam: once cancelled, the writer begins no new step. The gate
+    checks each helper ONCE, at its entry, so a step already begun (an append, the atomic
+    status write, a sync, a registration read with its read-only process-identity lookup)
+    may finish on the writer's own thread; no caller ever waits for it. ``close`` only lets
+    go of a handle and is never refused. The one exception is the status note after a start
+    that failed or timed out, which the sink allows only until close's own deadline has
+    passed: after close has timed out not even that is written (see ``_status_permitted``).
     """
 
     def __init__(self, files: JournalFiles, sink: "TurnEventSink") -> None:
@@ -715,7 +718,10 @@ class TurnEventSink:
         The caller waits at most ``start_seconds``, once, before its first
         message. On failure or timeout observation is switched off for good
         (a late success never turns it back on) and the reason is a closed
-        word in :attr:`off_reason` and in the status record.
+        word in :attr:`off_reason` and in the status record. After a timeout the
+        writer begins no new step; a step already begun (an append, a registration
+        read with its process-identity lookup) may finish on the writer's own
+        thread, and the caller never waits for it.
         """
         try:
             with self._lock:
@@ -763,8 +769,9 @@ class TurnEventSink:
     def close(self, timeout: float | None = None) -> None:
         """Stop within one deadline: drain, write the closing record, join.
 
-        If the deadline passes first nothing more is written (the stream then
-        counts as unclean to a reader) and ``close`` returns anyway. Never raises.
+        If the deadline passes first the writer begins no new step (the stream then counts
+        as unclean to a reader; a step already begun may finish on the writer's own thread)
+        and ``close`` returns anyway. Never raises.
         """
         try:
             with self._lock:
@@ -818,9 +825,9 @@ class TurnEventSink:
         return self._deadline is None or time.monotonic() < self._deadline
 
     def _check(self) -> None:
-        """Called after every operation that can block, before the next write, sync or
-        removal: once cancelled or past the deadline, nothing new may start. An operation
-        that was already running may have finished; that is all."""
+        """Called after every operation that can block, before the next step: once cancelled
+        or past the deadline, the writer begins no new step. A step that was already begun may
+        have finished on this thread; that is all, and no caller waits for it."""
         if not self._may_write():
             raise _Cancelled
 
