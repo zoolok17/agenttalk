@@ -1495,12 +1495,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         # to not-confirmed-healthy rather than falling through here - that
         # verdict MUST be the primary `health=` indicator, never the
         # self-report; the self-report is demoted to a parenthetical.
-        if isinstance(dec_state, str) and not sup.cli_child_verdict_is_healthy(dec_state):
-            seen += f" health={dec_state} (wrapper self-reports {h_state})"
-        else:
-            seen += f" health={h_state}"
-            if isinstance(h_age, (int, float)):
-                seen += f"/{_format_age(h_age)}"
+        seen += " " + _health_column(dec_state, h_state,
+                                     _format_age(h_age) if isinstance(h_age, (int, float)) else None)
         if dec:
             seen += f" supervisor={dec.get('state', '?')}/{dec.get('action', '?')}"
         lpn = a.get("last_progress_note")
@@ -1520,6 +1516,15 @@ def cmd_status(args: argparse.Namespace) -> int:
     for w in payload.get("warnings", []):
         print(f"WARN:       {w}")
     return 0
+
+
+def _health_column(decision_state: object, wrapper_state: str, age_text: str | None = None) -> str:
+    """The ``health=`` text of ``status`` and ``supervisor``: ONE rule for both. A supervisor verdict
+    that does not confirm the seat healthy (anything outside the allowlist) is the primary health, and
+    the wrapper's own report is only a labelled aside. Otherwise the wrapper's report, as before."""
+    if isinstance(decision_state, str) and not sup.cli_child_verdict_is_healthy(decision_state):
+        return f"health={decision_state} (wrapper self-reports {wrapper_state})"
+    return f"health={wrapper_state}" + (f"/{age_text}" if age_text else "")
 
 
 def cmd_supervisor(args: argparse.Namespace) -> int:
@@ -1611,9 +1616,11 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
         for warning in plan_warnings:
             if isinstance(warning, str):
                 flags.append(f"plan_health={warning}")
+        wrapper_state = str(health.get("effective_state", health.get("state", "unknown")))
+        health_text = _health_column(decision.get("state") if decision else None, wrapper_state)
         print(
             f"  {item.get('name', '?'):<10} {plan:<32} "
-            f"health={health.get('effective_state', health.get('state', 'unknown'))} "
+            f"{health_text} "
             f"heartbeat={hb}{hb_age} {reason}"
         )
         if flags:
