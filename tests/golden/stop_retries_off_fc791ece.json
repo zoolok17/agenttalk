@@ -1,12 +1,8 @@
 {
  "e5_exception": {
   "files": {
-   ".agenttalk/..acceptance-write.lock.generation": "\u0000",
-   ".agenttalk/.message-publication.generation": "\u0000",
-   ".agenttalk/.retirement.generation": "\u0000",
    ".agenttalk/config.json": "{\n  \"agents\": [\n    \"alpha\",\n    \"beta\"\n  ],\n  \"created_at\": \"<TS>\",\n  \"session_id\": \"<SESSION>\",\n  \"operator_identity\": \"operator\",\n  \"deadman\": {\n    \"mail_age_slo_seconds\": 900,\n    \"alarm_unread_response\": false\n  }\n}",
    ".agenttalk/messages/<MSG1>.json": "{\n  \"id\": \"<MSG1>\",\n  \"ts\": \"<TS>\",\n  \"kind\": \"message\",\n  \"subject\": \"\",\n  \"body\": \"one\",\n  \"meta\": {},\n  \"from\": \"alpha\",\n  \"to\": \"beta\"\n}",
-   ".agenttalk/state/.beta.waiting.lock.generation": "\u0000",
    ".agenttalk/state/alpha.cursor": "",
    ".agenttalk/state/beta.cursor": "",
    ".agenttalk/state/beta.health.json": "{\n  \"schema_version\": 1,\n  \"agent\": \"beta\",\n  \"cli\": \"claude\",\n  \"mode\": \"wrapper-loop\",\n  \"state\": \"working_silent\",\n  \"updated_at\": \"<TS>\",\n  \"since\": \"<TS>\",\n  \"last_progress_at\": null,\n  \"reason_code\": \"turn_spawned\",\n  \"source\": \"wrapper\",\n  \"warnings\": [],\n  \"msg_id\": \"<MSG1>\",\n  \"agenttalk_version\": \"0.95.0\"\n}",
@@ -24,12 +20,8 @@
  },
  "failure_then_success": {
   "files": {
-   ".agenttalk/..acceptance-write.lock.generation": "\u0000",
-   ".agenttalk/.message-publication.generation": "\u0000",
-   ".agenttalk/.retirement.generation": "\u0000",
    ".agenttalk/config.json": "{\n  \"agents\": [\n    \"alpha\",\n    \"beta\"\n  ],\n  \"created_at\": \"<TS>\",\n  \"session_id\": \"<SESSION>\",\n  \"operator_identity\": \"operator\",\n  \"deadman\": {\n    \"mail_age_slo_seconds\": 900,\n    \"alarm_unread_response\": false\n  }\n}",
    ".agenttalk/messages/<MSG1>.json": "{\n  \"id\": \"<MSG1>\",\n  \"ts\": \"<TS>\",\n  \"kind\": \"message\",\n  \"subject\": \"\",\n  \"body\": \"one\",\n  \"meta\": {},\n  \"from\": \"alpha\",\n  \"to\": \"beta\"\n}",
-   ".agenttalk/state/.beta.waiting.lock.generation": "\u0000",
    ".agenttalk/state/alpha.cursor": "",
    ".agenttalk/state/beta.cursor": "<MSG1>",
    ".agenttalk/state/beta.health.json": "{\n  \"schema_version\": 1,\n  \"agent\": \"beta\",\n  \"cli\": \"claude\",\n  \"mode\": \"wrapper-loop\",\n  \"state\": \"idle_waiting\",\n  \"updated_at\": \"<TS>\",\n  \"since\": \"<TS>\",\n  \"last_progress_at\": \"<TS>\",\n  \"reason_code\": \"turn_completed\",\n  \"source\": \"wrapper\",\n  \"warnings\": [],\n  \"agenttalk_version\": \"0.95.0\"\n}",
@@ -49,12 +41,8 @@
  },
  "gateway_hold": {
   "files": {
-   ".agenttalk/..acceptance-write.lock.generation": "\u0000",
-   ".agenttalk/.message-publication.generation": "\u0000",
-   ".agenttalk/.retirement.generation": "\u0000",
    ".agenttalk/config.json": "{\n  \"agents\": [\n    \"alpha\",\n    \"beta\"\n  ],\n  \"created_at\": \"<TS>\",\n  \"session_id\": \"<SESSION>\",\n  \"operator_identity\": \"operator\",\n  \"deadman\": {\n    \"mail_age_slo_seconds\": 900,\n    \"alarm_unread_response\": false\n  }\n}",
    ".agenttalk/messages/<MSG1>.json": "{\n  \"id\": \"<MSG1>\",\n  \"ts\": \"<TS>\",\n  \"kind\": \"message\",\n  \"subject\": \"\",\n  \"body\": \"one\",\n  \"meta\": {},\n  \"from\": \"alpha\",\n  \"to\": \"beta\"\n}",
-   ".agenttalk/state/.beta.waiting.lock.generation": "\u0000",
    ".agenttalk/state/alpha.cursor": "",
    ".agenttalk/state/beta.cursor": "<MSG1>",
    ".agenttalk/state/beta.health.json": "{\n  \"schema_version\": 1,\n  \"agent\": \"beta\",\n  \"cli\": \"claude\",\n  \"mode\": \"wrapper-loop\",\n  \"state\": \"idle_waiting\",\n  \"updated_at\": \"<TS>\",\n  \"since\": \"<TS>\",\n  \"last_progress_at\": \"<TS>\",\n  \"reason_code\": \"turn_completed\",\n  \"source\": \"wrapper\",\n  \"warnings\": [],\n  \"agenttalk_version\": \"0.95.0\"\n}",
@@ -74,12 +62,8 @@
  },
  "limit_then_success": {
   "files": {
-   ".agenttalk/..acceptance-write.lock.generation": "\u0000",
-   ".agenttalk/.message-publication.generation": "\u0000",
-   ".agenttalk/.retirement.generation": "\u0000",
    ".agenttalk/config.json": "{\n  \"agents\": [\n    \"alpha\",\n    \"beta\"\n  ],\n  \"created_at\": \"<TS>\",\n  \"session_id\": \"<SESSION>\",\n  \"operator_identity\": \"operator\",\n  \"deadman\": {\n    \"mail_age_slo_seconds\": 900,\n    \"alarm_unread_response\": false\n  }\n}",
    ".agenttalk/messages/<MSG1>.json": "{\n  \"id\": \"<MSG1>\",\n  \"ts\": \"<TS>\",\n  \"kind\": \"message\",\n  \"subject\": \"\",\n  \"body\": \"one\",\n  \"meta\": {},\n  \"from\": \"alpha\",\n  \"to\": \"beta\"\n}",
-   ".agenttalk/state/.beta.waiting.lock.generation": "\u0000",
    ".agenttalk/state/alpha.cursor": "",
    ".agenttalk/state/beta.cursor": "<MSG1>",
    ".agenttalk/state/beta.health.json": "{\n  \"schema_version\": 1,\n  \"agent\": \"beta\",\n  \"cli\": \"claude\",\n  \"mode\": \"wrapper-loop\",\n  \"state\": \"idle_waiting\",\n  \"updated_at\": \"<TS>\",\n  \"since\": \"<TS>\",\n  \"last_progress_at\": \"<TS>\",\n  \"reason_code\": \"turn_completed\",\n  \"source\": \"wrapper\",\n  \"warnings\": [],\n  \"agenttalk_version\": \"0.95.0\"\n}",
@@ -100,13 +84,9 @@
  },
  "old_ambiguous_history_backstop": {
   "files": {
-   ".agenttalk/..acceptance-write.lock.generation": "\u0000",
-   ".agenttalk/.message-publication.generation": "\u0000",
-   ".agenttalk/.retirement.generation": "\u0000",
    ".agenttalk/config.json": "{\n  \"agents\": [\n    \"alpha\",\n    \"beta\"\n  ],\n  \"created_at\": \"<TS>\",\n  \"session_id\": \"<SESSION>\",\n  \"operator_identity\": \"operator\",\n  \"deadman\": {\n    \"mail_age_slo_seconds\": 900,\n    \"alarm_unread_response\": false\n  }\n}",
-   ".agenttalk/dead-letter/beta/<MSG1>.deadletter.json": "{\n  \"schema_version\": 1,\n  \"message_id\": \"<MSG1>\",\n  \"agent\": \"beta\",\n  \"from\": \"alpha\",\n  \"to\": \"beta\",\n  \"subject\": \"\",\n  \"kind\": \"message\",\n  \"request_id\": null,\n  \"broadcast_id\": null,\n  \"attempts\": 20,\n  \"class\": \"ambiguous_or_unknown\",\n  \"last_reason\": \"terminal failure, unrecognized cause: boom\",\n  \"size_bytes\": 193,\n  \"sha256\": \"<HASH>\",\n  \"first_at\": \"<TS>\",\n  \"last_at\": \"<TS>\",\n  \"deadlettered_at\": \"<TS>\",\n  \"cursor_at_deadletter\": \"\",\n  \"payload_path\": \"<ROOT>\\\\.agenttalk\\\\dead-letter\\\\beta\\\\<MSG1>.json\",\n  \"child_output_tail\": {\n    \"schema_version\": 1,\n    \"max_bytes\": 4096,\n    \"max_lines\": 64,\n    \"truncated\": false,\n    \"lines\": [\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"stream_event\\\", \\\"event\\\": {\\\"type\\\": \\\"message_start\\\", \\\"message\\\": {\\\"role\\\": \\\"assistant\\\"}}}\"\n      },\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"assistant\\\", \\\"message\\\": {\\\"content\\\": [{\\\"type\\\": \\\"text\\\", \\\"text\\\": \\\"done\\\"}]}}\"\n      },\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"stream_event\\\", \\\"event\\\": {\\\"type\\\": \\\"message_stop\\\"}}\"\n      },\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"result\\\", \\\"is_error\\\": true, \\\"result\\\": \\\"boom\\\", \\\"num_turns\\\": 1, \\\"usage\\\": {\\\"input_tokens\\\": 3, \\\"output_tokens\\\": 2, \\\"cache_read_input_tokens\\\": 0}}\"\n      }\n    ],\n    \"bytes\": 424\n  }\n}",
+   ".agenttalk/dead-letter/beta/<MSG1>.deadletter.json": "{\n  \"schema_version\": 1,\n  \"message_id\": \"<MSG1>\",\n  \"agent\": \"beta\",\n  \"from\": \"alpha\",\n  \"to\": \"beta\",\n  \"subject\": \"\",\n  \"kind\": \"message\",\n  \"request_id\": null,\n  \"broadcast_id\": null,\n  \"attempts\": 20,\n  \"class\": \"ambiguous_or_unknown\",\n  \"last_reason\": \"terminal failure, unrecognized cause: boom\",\n  \"size_bytes\": 0,\n  \"sha256\": \"<HASH>\",\n  \"first_at\": \"<TS>\",\n  \"last_at\": \"<TS>\",\n  \"deadlettered_at\": \"<TS>\",\n  \"cursor_at_deadletter\": \"\",\n  \"payload_path\": \"<ROOT>/.agenttalk/dead-letter/beta/<MSG1>.json\",\n  \"child_output_tail\": {\n    \"schema_version\": 1,\n    \"max_bytes\": 4096,\n    \"max_lines\": 64,\n    \"truncated\": false,\n    \"lines\": [\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"stream_event\\\", \\\"event\\\": {\\\"type\\\": \\\"message_start\\\", \\\"message\\\": {\\\"role\\\": \\\"assistant\\\"}}}\"\n      },\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"assistant\\\", \\\"message\\\": {\\\"content\\\": [{\\\"type\\\": \\\"text\\\", \\\"text\\\": \\\"done\\\"}]}}\"\n      },\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"stream_event\\\", \\\"event\\\": {\\\"type\\\": \\\"message_stop\\\"}}\"\n      },\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"result\\\", \\\"is_error\\\": true, \\\"result\\\": \\\"boom\\\", \\\"num_turns\\\": 1, \\\"usage\\\": {\\\"input_tokens\\\": 3, \\\"output_tokens\\\": 2, \\\"cache_read_input_tokens\\\": 0}}\"\n      }\n    ],\n    \"bytes\": 424\n  }\n}",
    ".agenttalk/dead-letter/beta/<MSG1>.json": "{\n  \"id\": \"<MSG1>\",\n  \"ts\": \"<TS>\",\n  \"kind\": \"message\",\n  \"subject\": \"\",\n  \"body\": \"one\",\n  \"meta\": {},\n  \"from\": \"alpha\",\n  \"to\": \"beta\"\n}",
-   ".agenttalk/state/.beta.waiting.lock.generation": "\u0000",
    ".agenttalk/state/alpha.cursor": "",
    ".agenttalk/state/beta.cursor": "<MSG1>",
    ".agenttalk/state/beta.health.json": "{\n  \"schema_version\": 1,\n  \"agent\": \"beta\",\n  \"cli\": \"claude\",\n  \"mode\": \"wrapper-loop\",\n  \"state\": \"errored_ambiguous\",\n  \"updated_at\": \"<TS>\",\n  \"since\": \"<TS>\",\n  \"last_progress_at\": \"<TS>\",\n  \"reason_code\": \"ambiguous_failure\",\n  \"source\": \"wrapper\",\n  \"warnings\": [],\n  \"msg_id\": \"<MSG1>\",\n  \"agenttalk_version\": \"0.95.0\"\n}",
@@ -134,13 +114,9 @@
  },
  "old_infra_history_exhausts": {
   "files": {
-   ".agenttalk/..acceptance-write.lock.generation": "\u0000",
-   ".agenttalk/.message-publication.generation": "\u0000",
-   ".agenttalk/.retirement.generation": "\u0000",
    ".agenttalk/config.json": "{\n  \"agents\": [\n    \"alpha\",\n    \"beta\"\n  ],\n  \"created_at\": \"<TS>\",\n  \"session_id\": \"<SESSION>\",\n  \"operator_identity\": \"operator\",\n  \"deadman\": {\n    \"mail_age_slo_seconds\": 900,\n    \"alarm_unread_response\": false\n  }\n}",
-   ".agenttalk/dead-letter/beta/<MSG1>.deadletter.json": "{\n  \"schema_version\": 1,\n  \"message_id\": \"<MSG1>\",\n  \"agent\": \"beta\",\n  \"from\": \"alpha\",\n  \"to\": \"beta\",\n  \"subject\": \"\",\n  \"kind\": \"message\",\n  \"request_id\": null,\n  \"broadcast_id\": null,\n  \"attempts\": 100,\n  \"class\": \"infra_retry_exhausted\",\n  \"last_reason\": \"structured retryable rate_limit_event; status=rejected; rateLimitType=five_hour\",\n  \"size_bytes\": 193,\n  \"sha256\": \"<HASH>\",\n  \"first_at\": \"<TS>\",\n  \"last_at\": \"<TS>\",\n  \"deadlettered_at\": \"<TS>\",\n  \"cursor_at_deadletter\": \"\",\n  \"payload_path\": \"<ROOT>\\\\.agenttalk\\\\dead-letter\\\\beta\\\\<MSG1>.json\",\n  \"child_output_tail\": {\n    \"schema_version\": 1,\n    \"max_bytes\": 4096,\n    \"max_lines\": 64,\n    \"truncated\": false,\n    \"lines\": [\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"system\\\", \\\"subtype\\\": \\\"status\\\", \\\"status\\\": \\\"requesting\\\"}\"\n      },\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"rate_limit_event\\\", \\\"rate_limit_info\\\": {\\\"status\\\": \\\"rejected\\\", \\\"resetsAt\\\": 1788948000, \\\"rateLimitType\\\": \\\"five_hour\\\", \\\"overageStatus\\\": \\\"rejected\\\", \\\"overageDisabledReason\\\": \\\"out_of_credits\\\", \\\"isUsingOverage\\\": false, \\\"unifiedWindows\\\": {\\\"five_hour\\\": {\\\"utilization\\\": 1.03, \\\"resetsAt\\\": 1788948000}, \\\"seven_day\\\": {\\\"utilization\\\": 0.86, \\\"resetsAt\\\": 1789160400}}}}\"\n      },\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"assistant\\\", \\\"error\\\": \\\"rate_limit\\\", \\\"is_api_error_message\\\": true, \\\"message\\\": {\\\"model\\\": \\\"<synthetic>\\\", \\\"content\\\": [{\\\"type\\\": \\\"text\\\", \\\"text\\\": \\\"You've hit your session limit \\\\u00b7 resets 12pm (<timezone>)\\\"}]}}\"\n      },\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"result\\\", \\\"subtype\\\": \\\"success\\\", \\\"is_error\\\": true, \\\"terminal_reason\\\": \\\"api_error\\\", \\\"api_error_status\\\": 429, \\\"stop_reason\\\": \\\"stop_sequence\\\", \\\"result\\\": \\\"You've hit your session limit \\\\u00b7 resets 12pm (<timezone>)\\\"}\"\n      }\n    ],\n    \"bytes\": 902\n  }\n}",
+   ".agenttalk/dead-letter/beta/<MSG1>.deadletter.json": "{\n  \"schema_version\": 1,\n  \"message_id\": \"<MSG1>\",\n  \"agent\": \"beta\",\n  \"from\": \"alpha\",\n  \"to\": \"beta\",\n  \"subject\": \"\",\n  \"kind\": \"message\",\n  \"request_id\": null,\n  \"broadcast_id\": null,\n  \"attempts\": 100,\n  \"class\": \"infra_retry_exhausted\",\n  \"last_reason\": \"structured retryable rate_limit_event; status=rejected; rateLimitType=five_hour\",\n  \"size_bytes\": 0,\n  \"sha256\": \"<HASH>\",\n  \"first_at\": \"<TS>\",\n  \"last_at\": \"<TS>\",\n  \"deadlettered_at\": \"<TS>\",\n  \"cursor_at_deadletter\": \"\",\n  \"payload_path\": \"<ROOT>/.agenttalk/dead-letter/beta/<MSG1>.json\",\n  \"child_output_tail\": {\n    \"schema_version\": 1,\n    \"max_bytes\": 4096,\n    \"max_lines\": 64,\n    \"truncated\": false,\n    \"lines\": [\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"system\\\", \\\"subtype\\\": \\\"status\\\", \\\"status\\\": \\\"requesting\\\"}\"\n      },\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"rate_limit_event\\\", \\\"rate_limit_info\\\": {\\\"status\\\": \\\"rejected\\\", \\\"resetsAt\\\": 1788948000, \\\"rateLimitType\\\": \\\"five_hour\\\", \\\"overageStatus\\\": \\\"rejected\\\", \\\"overageDisabledReason\\\": \\\"out_of_credits\\\", \\\"isUsingOverage\\\": false, \\\"unifiedWindows\\\": {\\\"five_hour\\\": {\\\"utilization\\\": 1.03, \\\"resetsAt\\\": 1788948000}, \\\"seven_day\\\": {\\\"utilization\\\": 0.86, \\\"resetsAt\\\": 1789160400}}}}\"\n      },\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"assistant\\\", \\\"error\\\": \\\"rate_limit\\\", \\\"is_api_error_message\\\": true, \\\"message\\\": {\\\"model\\\": \\\"<synthetic>\\\", \\\"content\\\": [{\\\"type\\\": \\\"text\\\", \\\"text\\\": \\\"You've hit your session limit \\\\u00b7 resets 12pm (<timezone>)\\\"}]}}\"\n      },\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"result\\\", \\\"subtype\\\": \\\"success\\\", \\\"is_error\\\": true, \\\"terminal_reason\\\": \\\"api_error\\\", \\\"api_error_status\\\": 429, \\\"stop_reason\\\": \\\"stop_sequence\\\", \\\"result\\\": \\\"You've hit your session limit \\\\u00b7 resets 12pm (<timezone>)\\\"}\"\n      }\n    ],\n    \"bytes\": 902\n  }\n}",
    ".agenttalk/dead-letter/beta/<MSG1>.json": "{\n  \"id\": \"<MSG1>\",\n  \"ts\": \"<TS>\",\n  \"kind\": \"message\",\n  \"subject\": \"\",\n  \"body\": \"one\",\n  \"meta\": {},\n  \"from\": \"alpha\",\n  \"to\": \"beta\"\n}",
-   ".agenttalk/state/.beta.waiting.lock.generation": "\u0000",
    ".agenttalk/state/alpha.cursor": "",
    ".agenttalk/state/beta.cursor": "<MSG1>",
    ".agenttalk/state/beta.health.json": "{\n  \"schema_version\": 1,\n  \"agent\": \"beta\",\n  \"cli\": \"claude\",\n  \"mode\": \"wrapper-loop\",\n  \"state\": \"rate_limited_or_outage\",\n  \"updated_at\": \"<TS>\",\n  \"since\": \"<TS>\",\n  \"last_progress_at\": \"<TS>\",\n  \"reason_code\": \"retryable_transport_error\",\n  \"source\": \"wrapper\",\n  \"warnings\": [],\n  \"msg_id\": \"<MSG1>\",\n  \"agenttalk_version\": \"0.95.0\"\n}",
@@ -168,12 +144,8 @@
  },
  "real_five_hour_retries": {
   "files": {
-   ".agenttalk/..acceptance-write.lock.generation": "\u0000",
-   ".agenttalk/.message-publication.generation": "\u0000",
-   ".agenttalk/.retirement.generation": "\u0000",
    ".agenttalk/config.json": "{\n  \"agents\": [\n    \"alpha\",\n    \"beta\"\n  ],\n  \"created_at\": \"<TS>\",\n  \"session_id\": \"<SESSION>\",\n  \"operator_identity\": \"operator\",\n  \"deadman\": {\n    \"mail_age_slo_seconds\": 900,\n    \"alarm_unread_response\": false\n  }\n}",
    ".agenttalk/messages/<MSG1>.json": "{\n  \"id\": \"<MSG1>\",\n  \"ts\": \"<TS>\",\n  \"kind\": \"message\",\n  \"subject\": \"\",\n  \"body\": \"one\",\n  \"meta\": {},\n  \"from\": \"alpha\",\n  \"to\": \"beta\"\n}",
-   ".agenttalk/state/.beta.waiting.lock.generation": "\u0000",
    ".agenttalk/state/alpha.cursor": "",
    ".agenttalk/state/beta.cursor": "",
    ".agenttalk/state/beta.health.json": "{\n  \"schema_version\": 1,\n  \"agent\": \"beta\",\n  \"cli\": \"claude\",\n  \"mode\": \"wrapper-loop\",\n  \"state\": \"rate_limited_or_outage\",\n  \"updated_at\": \"<TS>\",\n  \"since\": \"<TS>\",\n  \"last_progress_at\": \"<TS>\",\n  \"reason_code\": \"retryable_transport_error\",\n  \"source\": \"wrapper\",\n  \"warnings\": [],\n  \"msg_id\": \"<MSG1>\",\n  \"agenttalk_version\": \"0.95.0\"\n}",
@@ -222,12 +194,8 @@
  },
  "real_seven_day_retries": {
   "files": {
-   ".agenttalk/..acceptance-write.lock.generation": "\u0000",
-   ".agenttalk/.message-publication.generation": "\u0000",
-   ".agenttalk/.retirement.generation": "\u0000",
    ".agenttalk/config.json": "{\n  \"agents\": [\n    \"alpha\",\n    \"beta\"\n  ],\n  \"created_at\": \"<TS>\",\n  \"session_id\": \"<SESSION>\",\n  \"operator_identity\": \"operator\",\n  \"deadman\": {\n    \"mail_age_slo_seconds\": 900,\n    \"alarm_unread_response\": false\n  }\n}",
    ".agenttalk/messages/<MSG1>.json": "{\n  \"id\": \"<MSG1>\",\n  \"ts\": \"<TS>\",\n  \"kind\": \"message\",\n  \"subject\": \"\",\n  \"body\": \"one\",\n  \"meta\": {},\n  \"from\": \"alpha\",\n  \"to\": \"beta\"\n}",
-   ".agenttalk/state/.beta.waiting.lock.generation": "\u0000",
    ".agenttalk/state/alpha.cursor": "",
    ".agenttalk/state/beta.cursor": "",
    ".agenttalk/state/beta.health.json": "{\n  \"schema_version\": 1,\n  \"agent\": \"beta\",\n  \"cli\": \"claude\",\n  \"mode\": \"wrapper-loop\",\n  \"state\": \"rate_limited_or_outage\",\n  \"updated_at\": \"<TS>\",\n  \"since\": \"<TS>\",\n  \"last_progress_at\": \"<TS>\",\n  \"reason_code\": \"retryable_transport_error\",\n  \"source\": \"wrapper\",\n  \"warnings\": [],\n  \"msg_id\": \"<MSG1>\",\n  \"agenttalk_version\": \"0.95.0\"\n}",
@@ -276,12 +244,8 @@
  },
  "rejected_event_then_success": {
   "files": {
-   ".agenttalk/..acceptance-write.lock.generation": "\u0000",
-   ".agenttalk/.message-publication.generation": "\u0000",
-   ".agenttalk/.retirement.generation": "\u0000",
    ".agenttalk/config.json": "{\n  \"agents\": [\n    \"alpha\",\n    \"beta\"\n  ],\n  \"created_at\": \"<TS>\",\n  \"session_id\": \"<SESSION>\",\n  \"operator_identity\": \"operator\",\n  \"deadman\": {\n    \"mail_age_slo_seconds\": 900,\n    \"alarm_unread_response\": false\n  }\n}",
    ".agenttalk/messages/<MSG1>.json": "{\n  \"id\": \"<MSG1>\",\n  \"ts\": \"<TS>\",\n  \"kind\": \"message\",\n  \"subject\": \"\",\n  \"body\": \"one\",\n  \"meta\": {},\n  \"from\": \"alpha\",\n  \"to\": \"beta\"\n}",
-   ".agenttalk/state/.beta.waiting.lock.generation": "\u0000",
    ".agenttalk/state/alpha.cursor": "",
    ".agenttalk/state/beta.cursor": "<MSG1>",
    ".agenttalk/state/beta.health.json": "{\n  \"schema_version\": 1,\n  \"agent\": \"beta\",\n  \"cli\": \"claude\",\n  \"mode\": \"wrapper-loop\",\n  \"state\": \"idle_waiting\",\n  \"updated_at\": \"<TS>\",\n  \"since\": \"<TS>\",\n  \"last_progress_at\": \"<TS>\",\n  \"reason_code\": \"turn_completed\",\n  \"source\": \"wrapper\",\n  \"warnings\": [],\n  \"agenttalk_version\": \"0.95.0\"\n}",
@@ -299,13 +263,9 @@
  },
  "repeated_failure": {
   "files": {
-   ".agenttalk/..acceptance-write.lock.generation": "\u0000",
-   ".agenttalk/.message-publication.generation": "\u0000",
-   ".agenttalk/.retirement.generation": "\u0000",
    ".agenttalk/config.json": "{\n  \"agents\": [\n    \"alpha\",\n    \"beta\"\n  ],\n  \"created_at\": \"<TS>\",\n  \"session_id\": \"<SESSION>\",\n  \"operator_identity\": \"operator\",\n  \"deadman\": {\n    \"mail_age_slo_seconds\": 900,\n    \"alarm_unread_response\": false\n  }\n}",
-   ".agenttalk/dead-letter/beta/<MSG1>.deadletter.json": "{\n  \"schema_version\": 1,\n  \"message_id\": \"<MSG1>\",\n  \"agent\": \"beta\",\n  \"from\": \"alpha\",\n  \"to\": \"beta\",\n  \"subject\": \"\",\n  \"kind\": \"message\",\n  \"request_id\": null,\n  \"broadcast_id\": null,\n  \"attempts\": 20,\n  \"class\": \"ambiguous_or_unknown\",\n  \"last_reason\": \"terminal failure, unrecognized cause: boom\",\n  \"size_bytes\": 193,\n  \"sha256\": \"<HASH>\",\n  \"first_at\": \"<TS>\",\n  \"last_at\": \"<TS>\",\n  \"deadlettered_at\": \"<TS>\",\n  \"cursor_at_deadletter\": \"\",\n  \"payload_path\": \"<ROOT>\\\\.agenttalk\\\\dead-letter\\\\beta\\\\<MSG1>.json\",\n  \"child_output_tail\": {\n    \"schema_version\": 1,\n    \"max_bytes\": 4096,\n    \"max_lines\": 64,\n    \"truncated\": false,\n    \"lines\": [\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"stream_event\\\", \\\"event\\\": {\\\"type\\\": \\\"message_start\\\", \\\"message\\\": {\\\"role\\\": \\\"assistant\\\"}}}\"\n      },\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"assistant\\\", \\\"message\\\": {\\\"content\\\": [{\\\"type\\\": \\\"text\\\", \\\"text\\\": \\\"done\\\"}]}}\"\n      },\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"stream_event\\\", \\\"event\\\": {\\\"type\\\": \\\"message_stop\\\"}}\"\n      },\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"result\\\", \\\"is_error\\\": true, \\\"result\\\": \\\"boom\\\", \\\"num_turns\\\": 1, \\\"usage\\\": {\\\"input_tokens\\\": 3, \\\"output_tokens\\\": 2, \\\"cache_read_input_tokens\\\": 0}}\"\n      }\n    ],\n    \"bytes\": 424\n  }\n}",
+   ".agenttalk/dead-letter/beta/<MSG1>.deadletter.json": "{\n  \"schema_version\": 1,\n  \"message_id\": \"<MSG1>\",\n  \"agent\": \"beta\",\n  \"from\": \"alpha\",\n  \"to\": \"beta\",\n  \"subject\": \"\",\n  \"kind\": \"message\",\n  \"request_id\": null,\n  \"broadcast_id\": null,\n  \"attempts\": 20,\n  \"class\": \"ambiguous_or_unknown\",\n  \"last_reason\": \"terminal failure, unrecognized cause: boom\",\n  \"size_bytes\": 0,\n  \"sha256\": \"<HASH>\",\n  \"first_at\": \"<TS>\",\n  \"last_at\": \"<TS>\",\n  \"deadlettered_at\": \"<TS>\",\n  \"cursor_at_deadletter\": \"\",\n  \"payload_path\": \"<ROOT>/.agenttalk/dead-letter/beta/<MSG1>.json\",\n  \"child_output_tail\": {\n    \"schema_version\": 1,\n    \"max_bytes\": 4096,\n    \"max_lines\": 64,\n    \"truncated\": false,\n    \"lines\": [\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"stream_event\\\", \\\"event\\\": {\\\"type\\\": \\\"message_start\\\", \\\"message\\\": {\\\"role\\\": \\\"assistant\\\"}}}\"\n      },\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"assistant\\\", \\\"message\\\": {\\\"content\\\": [{\\\"type\\\": \\\"text\\\", \\\"text\\\": \\\"done\\\"}]}}\"\n      },\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"stream_event\\\", \\\"event\\\": {\\\"type\\\": \\\"message_stop\\\"}}\"\n      },\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"result\\\", \\\"is_error\\\": true, \\\"result\\\": \\\"boom\\\", \\\"num_turns\\\": 1, \\\"usage\\\": {\\\"input_tokens\\\": 3, \\\"output_tokens\\\": 2, \\\"cache_read_input_tokens\\\": 0}}\"\n      }\n    ],\n    \"bytes\": 424\n  }\n}",
    ".agenttalk/dead-letter/beta/<MSG1>.json": "{\n  \"id\": \"<MSG1>\",\n  \"ts\": \"<TS>\",\n  \"kind\": \"message\",\n  \"subject\": \"\",\n  \"body\": \"one\",\n  \"meta\": {},\n  \"from\": \"alpha\",\n  \"to\": \"beta\"\n}",
-   ".agenttalk/state/.beta.waiting.lock.generation": "\u0000",
    ".agenttalk/state/alpha.cursor": "",
    ".agenttalk/state/beta.cursor": "<MSG1>",
    ".agenttalk/state/beta.health.json": "{\n  \"schema_version\": 1,\n  \"agent\": \"beta\",\n  \"cli\": \"claude\",\n  \"mode\": \"wrapper-loop\",\n  \"state\": \"errored_ambiguous\",\n  \"updated_at\": \"<TS>\",\n  \"since\": \"<TS>\",\n  \"last_progress_at\": \"<TS>\",\n  \"reason_code\": \"ambiguous_failure\",\n  \"source\": \"wrapper\",\n  \"warnings\": [],\n  \"msg_id\": \"<MSG1>\",\n  \"agenttalk_version\": \"0.95.0\"\n}",
@@ -383,12 +343,8 @@
  },
  "success": {
   "files": {
-   ".agenttalk/..acceptance-write.lock.generation": "\u0000",
-   ".agenttalk/.message-publication.generation": "\u0000",
-   ".agenttalk/.retirement.generation": "\u0000",
    ".agenttalk/config.json": "{\n  \"agents\": [\n    \"alpha\",\n    \"beta\"\n  ],\n  \"created_at\": \"<TS>\",\n  \"session_id\": \"<SESSION>\",\n  \"operator_identity\": \"operator\",\n  \"deadman\": {\n    \"mail_age_slo_seconds\": 900,\n    \"alarm_unread_response\": false\n  }\n}",
    ".agenttalk/messages/<MSG1>.json": "{\n  \"id\": \"<MSG1>\",\n  \"ts\": \"<TS>\",\n  \"kind\": \"message\",\n  \"subject\": \"\",\n  \"body\": \"one\",\n  \"meta\": {},\n  \"from\": \"alpha\",\n  \"to\": \"beta\"\n}",
-   ".agenttalk/state/.beta.waiting.lock.generation": "\u0000",
    ".agenttalk/state/alpha.cursor": "",
    ".agenttalk/state/beta.cursor": "<MSG1>",
    ".agenttalk/state/beta.health.json": "{\n  \"schema_version\": 1,\n  \"agent\": \"beta\",\n  \"cli\": \"claude\",\n  \"mode\": \"wrapper-loop\",\n  \"state\": \"idle_waiting\",\n  \"updated_at\": \"<TS>\",\n  \"since\": \"<TS>\",\n  \"last_progress_at\": \"<TS>\",\n  \"reason_code\": \"turn_completed\",\n  \"source\": \"wrapper\",\n  \"warnings\": [],\n  \"agenttalk_version\": \"0.95.0\"\n}",
@@ -406,14 +362,10 @@
  },
  "success_then_dead_letter": {
   "files": {
-   ".agenttalk/..acceptance-write.lock.generation": "\u0000",
-   ".agenttalk/.message-publication.generation": "\u0000",
-   ".agenttalk/.retirement.generation": "\u0000",
    ".agenttalk/config.json": "{\n  \"agents\": [\n    \"alpha\",\n    \"beta\"\n  ],\n  \"created_at\": \"<TS>\",\n  \"session_id\": \"<SESSION>\",\n  \"operator_identity\": \"operator\",\n  \"deadman\": {\n    \"mail_age_slo_seconds\": 900,\n    \"alarm_unread_response\": false\n  }\n}",
-   ".agenttalk/dead-letter/beta/<MSG2>.deadletter.json": "{\n  \"schema_version\": 1,\n  \"message_id\": \"<MSG2>\",\n  \"agent\": \"beta\",\n  \"from\": \"alpha\",\n  \"to\": \"beta\",\n  \"subject\": \"\",\n  \"kind\": \"message\",\n  \"request_id\": null,\n  \"broadcast_id\": null,\n  \"attempts\": 20,\n  \"class\": \"ambiguous_or_unknown\",\n  \"last_reason\": \"terminal failure, unrecognized cause: boom\",\n  \"size_bytes\": 193,\n  \"sha256\": \"<HASH>\",\n  \"first_at\": \"<TS>\",\n  \"last_at\": \"<TS>\",\n  \"deadlettered_at\": \"<TS>\",\n  \"cursor_at_deadletter\": \"<MSG1>\",\n  \"payload_path\": \"<ROOT>\\\\.agenttalk\\\\dead-letter\\\\beta\\\\<MSG2>.json\",\n  \"child_output_tail\": {\n    \"schema_version\": 1,\n    \"max_bytes\": 4096,\n    \"max_lines\": 64,\n    \"truncated\": false,\n    \"lines\": [\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"stream_event\\\", \\\"event\\\": {\\\"type\\\": \\\"message_start\\\", \\\"message\\\": {\\\"role\\\": \\\"assistant\\\"}}}\"\n      },\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"assistant\\\", \\\"message\\\": {\\\"content\\\": [{\\\"type\\\": \\\"text\\\", \\\"text\\\": \\\"done\\\"}]}}\"\n      },\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"stream_event\\\", \\\"event\\\": {\\\"type\\\": \\\"message_stop\\\"}}\"\n      },\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"result\\\", \\\"is_error\\\": true, \\\"result\\\": \\\"boom\\\", \\\"num_turns\\\": 1, \\\"usage\\\": {\\\"input_tokens\\\": 3, \\\"output_tokens\\\": 2, \\\"cache_read_input_tokens\\\": 0}}\"\n      }\n    ],\n    \"bytes\": 424\n  }\n}",
+   ".agenttalk/dead-letter/beta/<MSG2>.deadletter.json": "{\n  \"schema_version\": 1,\n  \"message_id\": \"<MSG2>\",\n  \"agent\": \"beta\",\n  \"from\": \"alpha\",\n  \"to\": \"beta\",\n  \"subject\": \"\",\n  \"kind\": \"message\",\n  \"request_id\": null,\n  \"broadcast_id\": null,\n  \"attempts\": 20,\n  \"class\": \"ambiguous_or_unknown\",\n  \"last_reason\": \"terminal failure, unrecognized cause: boom\",\n  \"size_bytes\": 0,\n  \"sha256\": \"<HASH>\",\n  \"first_at\": \"<TS>\",\n  \"last_at\": \"<TS>\",\n  \"deadlettered_at\": \"<TS>\",\n  \"cursor_at_deadletter\": \"<MSG1>\",\n  \"payload_path\": \"<ROOT>/.agenttalk/dead-letter/beta/<MSG2>.json\",\n  \"child_output_tail\": {\n    \"schema_version\": 1,\n    \"max_bytes\": 4096,\n    \"max_lines\": 64,\n    \"truncated\": false,\n    \"lines\": [\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"stream_event\\\", \\\"event\\\": {\\\"type\\\": \\\"message_start\\\", \\\"message\\\": {\\\"role\\\": \\\"assistant\\\"}}}\"\n      },\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"assistant\\\", \\\"message\\\": {\\\"content\\\": [{\\\"type\\\": \\\"text\\\", \\\"text\\\": \\\"done\\\"}]}}\"\n      },\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"stream_event\\\", \\\"event\\\": {\\\"type\\\": \\\"message_stop\\\"}}\"\n      },\n      {\n        \"stream\": \"stdout\",\n        \"text\": \"{\\\"type\\\": \\\"result\\\", \\\"is_error\\\": true, \\\"result\\\": \\\"boom\\\", \\\"num_turns\\\": 1, \\\"usage\\\": {\\\"input_tokens\\\": 3, \\\"output_tokens\\\": 2, \\\"cache_read_input_tokens\\\": 0}}\"\n      }\n    ],\n    \"bytes\": 424\n  }\n}",
    ".agenttalk/dead-letter/beta/<MSG2>.json": "{\n  \"id\": \"<MSG2>\",\n  \"ts\": \"<TS>\",\n  \"kind\": \"message\",\n  \"subject\": \"\",\n  \"body\": \"two\",\n  \"meta\": {},\n  \"from\": \"alpha\",\n  \"to\": \"beta\"\n}",
    ".agenttalk/messages/<MSG1>.json": "{\n  \"id\": \"<MSG1>\",\n  \"ts\": \"<TS>\",\n  \"kind\": \"message\",\n  \"subject\": \"\",\n  \"body\": \"one\",\n  \"meta\": {},\n  \"from\": \"alpha\",\n  \"to\": \"beta\"\n}",
-   ".agenttalk/state/.beta.waiting.lock.generation": "\u0000",
    ".agenttalk/state/alpha.cursor": "",
    ".agenttalk/state/beta.cursor": "<MSG2>",
    ".agenttalk/state/beta.health.json": "{\n  \"schema_version\": 1,\n  \"agent\": \"beta\",\n  \"cli\": \"claude\",\n  \"mode\": \"wrapper-loop\",\n  \"state\": \"errored_ambiguous\",\n  \"updated_at\": \"<TS>\",\n  \"since\": \"<TS>\",\n  \"last_progress_at\": \"<TS>\",\n  \"reason_code\": \"ambiguous_failure\",\n  \"source\": \"wrapper\",\n  \"warnings\": [],\n  \"msg_id\": \"<MSG2>\",\n  \"agenttalk_version\": \"0.95.0\"\n}",

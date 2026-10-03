@@ -47,6 +47,15 @@ _HEX32 = re.compile(r"[0-9a-f]{32}")
 _HEX12 = re.compile(r"(?<![0-9a-f])(?=[0-9]*[a-f])[0-9a-f]{12}(?![0-9a-f])")
 _PID = re.compile(r'("(?:[a-z_]*pid)":\s*)\d+')
 _EPOCH = re.compile(r'("(?:[a-z_]*(?:epoch|monotonic|nonce|token|start))":\s*)(?:"[^"]*"|[\d.]+)')
+# A byte count of a stored file depends on the platform (Windows writes "\r\n" line ends).
+_SIZE = re.compile(r'("size_bytes":\s*)\d+')
+# A path below the replaced root. Windows joins its parts with "\" (and "\\" inside JSON text);
+# the golden file is compared on every platform, so the parts are always joined with "/".
+# In JSON text only "\\" is a separator, so a JSON escape such as "\n" right after a path is
+# never swallowed as if it were the start of another path part.
+_PART = r"[A-Za-z0-9._-]+"
+_BELOW_ROOT_JSON = re.compile(r"<ROOT>(?:(?:\\\\|/)" + _PART + ")*")
+_BELOW_ROOT_RAW = re.compile(r"<ROOT>(?:(?:\\|/)" + _PART + ")*")
 
 
 def claude_turn(*, error: bool = False) -> list[str]:
@@ -164,9 +173,15 @@ SCENARIOS = {
                    "first_started_hours_ago": 0.5}},
 }
 
-def normalise(text: str, root: Path, ids: list[str]) -> str:
+def _posix_below_root(match: re.Match) -> str:
+    return match.group(0).replace("\\\\", "/").replace("\\", "/")
+
+
+def normalise(text: str, root: Path, ids: list[str], *, json_text: bool = False) -> str:
     for form in (str(root), str(root).replace("\\", "/"), str(root).replace("\\", "\\\\")):
         text = text.replace(form, "<ROOT>")
+    text = (_BELOW_ROOT_JSON if json_text else _BELOW_ROOT_RAW).sub(_posix_below_root, text)
+    text = _SIZE.sub(r"\g<1>0", text)
     for found in _MSG.findall(text):
         if found not in ids:
             ids.append(found)
@@ -254,9 +269,12 @@ def capture(name: str, root: Path) -> dict:
     store_root = Path(got.pop("store").root)
     ids: list[str] = []
     files = {}
-    for path in sorted(p for p in store_root.rglob("*") if p.is_file()):
+    # Lock files and their generation guards are how a platform locks, not what the loop did.
+    for path in sorted(p for p in store_root.rglob("*")
+                       if p.is_file() and not p.name.endswith((".lock", ".generation"))):
         relative = path.relative_to(store_root).as_posix()
-        files[relative] = normalise(path.read_text(encoding="utf-8", errors="replace"), store_root, ids)
+        files[relative] = normalise(path.read_text(encoding="utf-8", errors="replace"), store_root, ids,
+                                    json_text=relative.endswith(".json"))
     text = {key: normalise(got[key], store_root, ids) if isinstance(got[key], str) else got[key]
             for key in ("stdout", "stderr", "log", "raised")}
     record = {"turns": got["turns"], "sleeps": got["sleeps"], "stamps": got["stamps"],

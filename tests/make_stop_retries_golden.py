@@ -27,5 +27,7 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as tmp:
         record = scenarios.capture_all(Path(tmp))
     GOLDEN.parent.mkdir(exist_ok=True)
-    GOLDEN.write_text(json.dumps(record, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    # newline="" keeps "\n" as it is: the file must be byte-identical on every platform
+    with GOLDEN.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(json.dumps(record, indent=1, sort_keys=True) + "\n")
     print("wrote", GOLDEN)
