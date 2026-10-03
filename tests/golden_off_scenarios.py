@@ -36,6 +36,7 @@ from agenttalk.wrapper_logs import WrapperLifecycleLog
 
 _TS = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z?")
 _MSG = re.compile(r"\d{8}-\d{6}-\d{6}-[A-Za-z0-9]{4}")
+_BELOW_ROOT = re.compile(r"<ROOT>[^\"'\s]*")  # a path below the replaced root, up to a quote or space
 _SESSION = re.compile(r"\d{8}T\d{6}-[A-Za-z0-9]+")
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -89,9 +90,16 @@ SCENARIOS = {
 }
 
 
+def _posix_below_root(match: re.Match) -> str:
+    # Windows writes "\" (or "\\" inside JSON text) between the parts of a path; the
+    # golden file is compared on every platform, so the parts are always joined by "/".
+    return match.group(0).replace("\\\\", "/").replace("\\", "/")
+
+
 def normalise(text: str, root: Path, ids: list[str]) -> str:
     for form in (str(root), str(root).replace("\\", "/"), str(root).replace("\\", "\\\\")):
         text = text.replace(form, "<ROOT>")
+    text = _BELOW_ROOT.sub(_posix_below_root, text)
     for found in _MSG.findall(text):
         if found not in ids:
             ids.append(found)

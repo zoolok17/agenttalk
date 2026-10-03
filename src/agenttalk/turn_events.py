@@ -791,7 +791,7 @@ class TurnEventSink:
             except queue.Full:
                 with self._lock:
                     self._queue_full += 1
-        except Exception:  # noqa: S110 - the journal must never disturb a turn
+        except Exception:  # noqa: S110 - the journal must never disturb a turn  # nosec B110
             pass
 
     def close(self, timeout: float | None = None) -> None:
@@ -823,7 +823,7 @@ class TurnEventSink:
                 with self._lock:
                     if self._state == "on":
                         self._state = "closed"
-        except Exception:  # noqa: S110
+        except Exception:  # noqa: S110 - close must never raise into the wrapper  # nosec B110
             pass
 
     def _latch(self, reason: str) -> None:
@@ -1274,7 +1274,7 @@ class TurnEventSink:
                     return
                 with contextlib.suppress(OSError):
                     self._files.remove(path)
-        except Exception:  # noqa: S110
+        except Exception:  # noqa: S110 - pruning old status files is best effort  # nosec B110
             pass
 
 

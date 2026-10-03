@@ -100,3 +100,14 @@ def test_the_comparison_fails_when_the_loop_waits_differently(tmp_path, monkeypa
     monkeypatch.setattr(loop, "run_loop", slower)
     got = scenarios.capture("failure_then_success", tmp_path / "x")
     assert "sleeps" in _differences(_golden()["failure_then_success"], got)
+
+
+def test_a_path_below_the_root_reads_the_same_on_every_platform(tmp_path):
+    # The golden file is made on one platform and compared on all of them: Windows joins
+    # the parts of a path with a backslash (doubled inside JSON text), Linux and macOS with "/".
+    root = tmp_path / "store"
+    raw = str(root) + "\\.agenttalk\\x.json"
+    json_text = str(root).replace("\\", "\\\\") + "\\\\.agenttalk\\\\x.json"
+    posix = str(root).replace("\\", "/") + "/.agenttalk/x.json"
+    for text in (raw, json_text, posix):
+        assert scenarios.normalise(text, root, []) == "<ROOT>/.agenttalk/x.json", text
