@@ -1010,7 +1010,7 @@ that is not parked has no file.
 | `reset_epoch` | integer or null | When the provider says the allowance comes back: whole seconds since 1970, UTC. See "Reset and window" below. `null` when no reset time is known. |
 | `wake_epoch` | integer or null | When the wrapper will try again by itself, in the same unit (the reset plus 30 seconds). `null` when it will not: no reset known, or that try was already used. |
 | `message_id` | text | The message the seat is holding. |
-| `parked_at` | text or null | When this message **first** parked: the moment the wrapper saw the provider's refusal, as an ISO 8601 UTC time. It does not change when the file is refreshed or when a later try is refused again. |
+| `parked_at` | text or null | When the **current** park began: the moment the wrapper saw the provider's refusal, as an ISO 8601 UTC time that may carry fractional seconds. It does not change when the file is refreshed or when a later try is refused for a usage limit again. If a try fails for another reason, that park ends; a later limit refusal of the same message starts a new park with a new time. |
 | `wrapper_generation` | text or null | Identifies the wrapper run that wrote the file. |
 | `updated_at_epoch` | integer | When the wrapper last refreshed the file: whole seconds since 1970, UTC. It shows that the wrapper is alive. It is **not** a new observation from the provider. |
 
@@ -1027,8 +1027,10 @@ changed.
 **Is it current?** Judge it from `updated_at_epoch`, never from the file's modified time. The
 wrapper refreshes the file about once a minute. If it has not been refreshed for 300 seconds
 (`MARKER_STALE_SECONDS`), the wrapper is not responding: the seat may still be parked, but nothing
-confirms it. Every time in the file is rounded **down** to whole seconds, so an age is right only to
-within one second. **Only a fresh file means a live parked seat; a stale one may be a leftover.**
+confirms it. The two `_epoch` times are rounded **down** to whole seconds, so an age is right only to
+within one second; `parked_at` keeps the precision it was recorded with. **A fresh file is a sign of a
+live parked seat, not proof:** a wrapper stopped abruptly leaves a file that still looks fresh for up
+to 300 seconds. A stale file may be a leftover.
 
 **Reading it safely.** Several things can go wrong while the file is written or read. Each one means
 "read again a little later": never "no parked seat", and never "parked".
@@ -1045,7 +1047,8 @@ message is delivered, skipped or otherwise gone; when the wrapper starts (it wri
 if the seat is still parked); and when a try after the reset begins (it writes it again if that try
 is refused). If the wrapper is stopped abruptly, the file stays behind. agenttalk's own readers also
 ignore a file whose message the seat has already moved past, or whose wrapper has since been
-replaced; another program cannot check either, which is why only a fresh file counts.
+replaced; another program cannot check either, which is why a stale file must not be trusted and a
+fresh one is only a sign.
 
 **What it never holds.** No message text and no text from the provider: only the words and numbers
 above.

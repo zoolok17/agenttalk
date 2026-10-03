@@ -109,7 +109,27 @@ def test_what_the_readme_says_about_a_later_refusal_is_what_the_code_does(store)
     assert rec["reset_epoch"] == T0 + 3600
     refuse(rec, at="2026-09-09T06:00:00Z", window="seven_day", reset=T0 + 7200)     # strictly later
     assert rec["reset_epoch"] == T0 + 7200
-    assert rec["parked_at"] == "2026-09-09T03:00:00Z"                                # first refusal, never moved
+    assert rec["parked_at"] == "2026-09-09T03:00:00Z"                                # this park's start, never moved
+
+
+def test_a_park_closed_by_another_failure_starts_a_new_park_with_a_new_time_on_the_next_refusal():
+    rec: dict = {}
+    refuse(rec, at="2026-09-09T03:00:00Z", window="five_hour", reset=T0 + 3600)
+    assert rec["parked_at"] == "2026-09-09T03:00:00Z"
+    park.apply_park_close(rec, at_epoch=None)                       # a try failed for another reason: the park ends
+    assert "parked_at" not in rec
+    refuse(rec, at="2026-09-09T05:30:00.250000Z", window="five_hour", reset=T0 + 7200)
+    assert rec["parked_at"] == "2026-09-09T05:30:00.250000Z"        # a new park, a new time
+    assert rec["park_count"] == 2
+
+
+def test_a_fractional_parked_at_is_written_unchanged(store):
+    publish(store, parked_at="2026-09-09T03:00:01.123456Z")
+    assert raw(store)["parked_at"] == "2026-09-09T03:00:01.123456Z"
+    assert store.read_usage_limit_park(AGENT, now_epoch=T0)["parked_at"] == "2026-09-09T03:00:01.123456Z"
+    publish(store, parked_at="2026-09-09T03:00:01.123456Z", now_epoch=T0 + 90)       # a refresh keeps it too
+    assert raw(store)["parked_at"] == "2026-09-09T03:00:01.123456Z"
+    assert isinstance(raw(store)["updated_at_epoch"], int)                           # the epoch time IS floored
 
 
 def test_a_refresh_changes_the_update_time_but_not_the_park_time(store):
@@ -144,7 +164,11 @@ def test_the_readme_states_the_rules_a_reader_needs():
     for needle in ("refuse a file whose `schema_version` it does not know", "updated_at_epoch",
                    "never from the file's modified time", "MARKER_STALE_SECONDS", "read again a little later",
                    "No message text and no text from the provider", "**strictly later** reset",
-                   "**first** parked", "writing the file **in place**", "Only a fresh file means a live parked seat",
+                   "**current** park began", "may carry fractional seconds",
+                   "a later limit refusal of the same message starts a new park with a new time",
+                   "writing the file **in place**",
+                   "A fresh file is a sign of a live parked seat, not proof", "up to 300 seconds",
+                   "`parked_at` keeps the precision it was recorded with", "A stale file may be a leftover",
                    "not** a new observation from the provider", "can miss a short park"):
         assert needle in squeezed, needle
     assert str(int(park.MARKER_STALE_SECONDS)) in squeezed
