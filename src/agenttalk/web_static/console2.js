@@ -435,14 +435,7 @@
   var LATER_MAX = 500;
   var LATER_KEEP_MS = 30 * 24 * 3600e3;
   var SNOOZE_MS = M.LIMITS.SNOOZE_MS;
-  // #298 fix round 2: `stuckOrigin` is a SEPARATE, parallel map (never folded into
-  // the timestamp maps above) recording which evidence established the incident a
-  // stuck:<agent> choice was made against - 'server' or 'client'. A choice without
-  // an entry here (e.g. saved by an older build, before this field existed) is
-  // ORIGIN-UNKNOWN and is judged conservatively by BOTH sides' evidence (see
-  // pruneRecovered), never silently dropped for lack of a tag.
-  var later = { deferred: Object.create(null), snoozed: Object.create(null),
-                stuckOrigin: { deferred: Object.create(null), snoozed: Object.create(null) } };
+  var later = { deferred: Object.create(null), snoozed: Object.create(null) };
 
   function teamMap(table, key) {
     if (!table[key]) table[key] = Object.create(null);
@@ -466,32 +459,12 @@
     return out;
   }
 
-  // Keeps only an origin entry whose id SURVIVED cleanTable's own cutoff above (an
-  // orphaned tag for an id that aged out is worthless and never written back).
-  function cleanOrigin(raw, survivors) {
-    var out = Object.create(null);
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
-    Object.keys(raw).forEach(function (team) {
-      var inner = raw[team];
-      var kept = survivors[team];
-      if (!inner || typeof inner !== 'object' || Array.isArray(inner) || !kept) return;
-      Object.keys(inner).forEach(function (id) {
-        var v = inner[id];
-        if ((v === 'server' || v === 'client') && hasOwn(kept, id)) teamMap(out, team)[id] = v;
-      });
-    });
-    return out;
-  }
-
   function loadLater() {
     var parsed = null;
     try { parsed = JSON.parse(window.localStorage.getItem(LATER_KEY) || 'null'); } catch (e) { parsed = null; }
     var now = Date.now();
     later.deferred = cleanTable(parsed && parsed.deferred, now - LATER_KEEP_MS);
     later.snoozed = cleanTable(parsed && parsed.snoozed, now - LATER_KEEP_MS);
-    var origin = (parsed && typeof parsed.stuckOrigin === 'object' && parsed.stuckOrigin) || {};
-    later.stuckOrigin = { deferred: cleanOrigin(origin.deferred, later.deferred),
-                          snoozed: cleanOrigin(origin.snoozed, later.snoozed) };
   }
 
   function saveLater() {
@@ -503,16 +476,14 @@
              answered: {}, lastVisitMs: ui.lastVisitMs };
   }
 
-  function deferCard(team, id, stuckOrigin) {
+  function deferCard(team, id) {
     teamMap(later.deferred, team)[id] = nowMs();
-    if (stuckOrigin === 'server' || stuckOrigin === 'client') teamMap(later.stuckOrigin.deferred, team)[id] = stuckOrigin;
     saveLater();
     renderAll();
   }
 
-  function waitOnCard(team, id, stuckOrigin) {
+  function waitOnCard(team, id) {
     teamMap(later.snoozed, team)[id] = nowMs() + SNOOZE_MS;
-    if (stuckOrigin === 'server' || stuckOrigin === 'client') teamMap(later.stuckOrigin.snoozed, team)[id] = stuckOrigin;
     saveLater();
     renderAll();
   }
@@ -618,7 +589,7 @@
       btn.setAttribute('aria-disabled', 'true');
       btn.setAttribute('title', 'Not available here: ' + option.locked);
     } else if (option.action === 'wait') {
-      on(btn, 'click', function () { waitOnCard(team, card.id, card.stuckOrigin); });
+      on(btn, 'click', function () { waitOnCard(team, card.id); });
     } else {
       btn.disabled = true;   // an unlocked option without a local action is not something this slice does
       btn.setAttribute('aria-disabled', 'true');
@@ -642,10 +613,10 @@
     // represents, not just the one id it carries. No Later button, no
     // keyboard deferral; the data attribute lets deferSelected() refuse too.
     if (card.group) box.setAttribute('data-c2-group', '1');
-    // #298 fix round 2: carried on the DOM node too, so the keyboard path
-    // (deferSelected, which only has the rendered node) can record the same
-    // origin a mouse click on the Later button would.
-    if (card.stuckOrigin) box.setAttribute('data-c2-stuck-origin', card.stuckOrigin);
+    // #298 scope cut: a server-only stalled card is read-only for the same reason
+    // a group is - no Later button renders below, and this attribute lets
+    // deferSelected() refuse the keyboard path too.
+    if (card.serverOnly) box.setAttribute('data-c2-server-only', '1');
     var head = el('div', 'c2-card-head');
     head.appendChild(el('span', 'c2-kind', card.kind));
     head.appendChild(el('span', 'c2-age', card.ageLabel));
@@ -668,12 +639,12 @@
     }
     var actions = el('div', 'c2-actions');
     card.options.forEach(function (o) { actions.appendChild(optionButton(o, team, card)); });
-    if (!card.group) {
+    if (!card.group && !card.serverOnly) {
       var laterBtn = el('button', 'c2-later', 'Later');
       laterBtn.setAttribute('type', 'button');
       laterBtn.setAttribute('data-c2-focus', team + '|' + card.id + '|later');
       laterBtn.setAttribute('title', 'Put this off in this browser. It stays open and counted.');
-      on(laterBtn, 'click', function () { deferCard(team, card.id, card.stuckOrigin); });
+      on(laterBtn, 'click', function () { deferCard(team, card.id); });
       actions.appendChild(laterBtn);
     }
     box.appendChild(actions);
@@ -1272,53 +1243,27 @@
   }
 
   // A deferral or snooze of a stuck card is about one incident. When the agent has verifiably
-  // recovered, the incident is over and the local Later/Wait for it is dropped, so the next
-  // stall of that agent raises its own card. Not judged while the team is offline or unreadable.
+  // recovered (it is now in any state other than stuck or unknown, which keep the incident open),
+  // the incident is over and the local Later/Wait for it is dropped, so the next stall of that
+  // agent raises its own card. Not judged while the team is offline or unreadable.
   //
-  // #298 fix round 2: a choice belongs to the incident evidence that was on screen when it was
-  // made - recorded at that moment as stuckOrigin ('server' or 'client'; see deferCard/waitOnCard).
-  // That origin, not a blend of both sides' CURRENT state, decides how recovery is judged:
-  //   - 'server': the server's own item is the only evidence that matters. It is retired ONLY on
-  //     a fresh SUCCESSFUL attention read (loaded, available, not stale) that no longer reports
-  //     the agent in serverStuckAgentNames. An unreadable or not-yet-answered feed proves nothing,
-  //     so a server-origin choice is left exactly as it is until a read actually succeeds - the
-  //     round-1 OR with the client's row let a stale client "unknown" keep an old, already-server-
-  //     resolved deferral alive, which then silently absorbed a brand-new incident for the same
-  //     agent (the bug this round fixes).
-  //   - 'client': unchanged from the original, pre-#295 behaviour - judged solely by the browser's
-  //     own roster row, never by the server feed.
-  //   - untagged (saved before this field existed): judged conservatively by EITHER side, the
-  //     round-1 behaviour, so an older saved choice is never dropped out from under the operator
-  //     just because it predates this fix.
+  // #298 scope cut: this is exactly master's function again. A server-only stalled card can no
+  // longer have a Later/Wait choice made against it at all (no button renders - needsCard), and
+  // is immune to one anyway even if an older build's storage still carries its id (console2-
+  // model.js's isDeferred/isAnswered treat it like a group) - so this cleanup never needs to know
+  // about the server's evidence, only the browser's own roster row, same as always.
   function pruneRecovered(v) {
     if (!v || v.banner || v.mode === 'error' || v.mode === 'loading') return false;
     var changed = false;
-    var serverStuck = (v.needs && typeof v.needs.serverStuckAgentNames === 'object' && v.needs.serverStuckAgentNames)
-      || {};
-    var freshRead = !!(v.needs && v.needs.loaded && v.needs.available && !v.needs.stale);
-    [{ table: later.deferred, origins: later.stuckOrigin.deferred },
-     { table: later.snoozed, origins: later.stuckOrigin.snoozed }].forEach(function (pair) {
-      var map = pair.table[v.key];
+    [later.deferred, later.snoozed].forEach(function (table) {
+      var map = table[v.key];
       if (!map) return;
-      var originMap = pair.origins[v.key] || {};
       Object.keys(map).forEach(function (id) {
         if (id.indexOf('stuck:') !== 0) return;
         var name = id.slice('stuck:'.length);
         var row = v.roster.rows.filter(function (r) { return r.name === name; })[0];
-        var clientSaysOpen = !!row && (row.state === 'stuck' || row.state === 'unknown');
-        var serverSaysOpen = hasOwn(serverStuck, name) && !!serverStuck[name];
-        var origin = originMap[id];
-        var retire;
-        if (origin === 'server') {
-          retire = freshRead && !serverSaysOpen;
-        } else if (origin === 'client') {
-          retire = !clientSaysOpen;
-        } else {
-          retire = !clientSaysOpen && !serverSaysOpen;
-        }
-        if (retire) {
+        if (!row || (row.state !== 'stuck' && row.state !== 'unknown')) {
           delete map[id];
-          delete originMap[id];
           changed = true;
         }
       });
@@ -1784,12 +1729,13 @@
   // whichever card now sits where it did (the next one, else the previous, else none left).
   // F1: an aggregate card (data-c2-group) has no Later button to click, so 'l' must be
   // just as inert for it - never a keyboard-only back door to the same disposition risk.
+  // #298 scope cut: the same is now true of a server-only stalled card (data-c2-server-only).
   function deferSelected() {
     if (nav.selectedId === null || nav.selectedTeam === null) return;
     var main = document.getElementById('c2-stream');
     var selectedCard = main && findCard(main, nav.selectedId);
-    if (selectedCard && selectedCard.getAttribute('data-c2-group') === '1') return;
-    var origin = selectedCard ? selectedCard.getAttribute('data-c2-stuck-origin') : null;
+    if (selectedCard && (selectedCard.getAttribute('data-c2-group') === '1'
+      || selectedCard.getAttribute('data-c2-server-only') === '1')) return;
     var ids = streamCardIds;
     var idx = ids.indexOf(nav.selectedId);
     var team = nav.selectedTeam;
@@ -1797,7 +1743,7 @@
     nav.selectedId = idx >= 0
       ? (ids[idx + 1] !== undefined ? ids[idx + 1] : (ids[idx - 1] !== undefined ? ids[idx - 1] : null))
       : null;
-    deferCard(team, id, origin);
+    deferCard(team, id);
     renderAll();
   }
 

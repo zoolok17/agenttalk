@@ -314,73 +314,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sides still shows once, not twice.
 
   What you will notice: the panel can no longer show "All quiet" while a
-  seat the server flagged is actually down. Clicking "Later" on that
-  warning now actually defers it (it used to reappear immediately, with no
-  deferred row, because the console judged it "recovered" from the wrong
-  evidence) and it no longer also shows up under "also happening, not for
-  you" while it is still open in the main panel.
+  seat the server flagged is actually down. A warning kept this way cannot
+  be put aside with "Later" or "Wait" in this version, and offers no
+  "Answer" either - it has nothing behind it to answer. It simply stays on
+  screen, at its own severity and counted, until the server itself stops
+  reporting the problem. It also never shows up a second time under
+  "also happening, not for you" while it is open in the main panel.
+
+  Two earlier attempts let this same warning be put aside like any other
+  card, then tried to make that choice remember which side's evidence it
+  was about so a later recovery would clear it correctly. Both ran into the
+  same wall: a choice saved by an older build (before either attempt
+  existed) carried none of that memory, so it could still silently swallow
+  a brand-new, unrelated problem on the same seat, or vanish on a reload
+  during an outage before anything had actually been confirmed recovered.
+  Rather than patch the patch again, this warning is simply made
+  un-dismissable instead - a choice can never hide something it was never
+  allowed to be made about, old storage included.
 
   What you need to do: nothing.
 
-  Technical details: `console2-model.js`'s `buildTeamView` now matches a
-  server `source: "stuck"` item to a client-derived incident by the raw
-  agent name only - the same identifier both sides already compute their
-  own `"stuck:" + name` id from, so no new key was needed. An unmatched
-  server item renders through the ordinary `attentionCard()` path instead
-  of being dropped. The "needs you" badge counts every server item once,
-  plus every client-derived incident, minus the ones matched on both
-  sides, so an overlapping seat is never counted twice. The view now also
-  exposes exactly which agents the server currently reports stuck, so
-  `console2.js`'s local Later/Wait cleanup (`pruneRecovered`) can judge a
-  server-kept card's recovery from the server's own evidence (the item no
-  longer being reported) instead of only the browser's health class - and
-  the "also happening" sidebar excludes any seat already shown as an open
-  warning in the main panel. Tests in `tests/console2_view.test.mjs` and
-  `tests/console2_stream.test.mjs` (the latter through the real click-and-
-  redraw app path, not only the pure model).
-
-  A second look found that evidence from the two sides can drift apart over
-  time, not just at the moment of the click: once the browser's own read of
-  a seat went stale ("unknown"), the earlier fix kept an already-resolved
-  server warning's "Later" choice alive indefinitely - and a brand-new,
-  unrelated problem on that same seat then silently inherited the old,
-  stale deferral instead of opening fresh. Reloading the page while the
-  panel's feed could not be read also erased a saved "Later" choice before
-  the page had any real evidence either way.
-
-  Now a "Later" or "Wait" choice remembers which side's warning it was made
-  against. A choice made against the server's own warning is cleared only
-  once a read that actually succeeded says that warning is gone - a reload
-  during a failed read, or before the panel has answered at all, leaves the
-  choice exactly as it was; an unreadable panel is never treated as proof
-  of recovery. A choice made against the browser's own warning keeps
-  exactly its original behaviour. Separately, "stuck agents first" now
-  genuinely sorts a server-only stalled warning ahead of older items, as
-  the panel already says it does - it had been sorting by a label unique to
-  the browser's own warnings and missing the server's.
-
-  What you will notice: dismissing a resolved seat's warning with "Later"
-  no longer risks silently burying a fresh, unrelated problem on that same
-  seat later on; reloading the page mid-outage no longer loses a saved
-  "Later" choice.
-
-  What you need to do: nothing.
-
-  Technical details: `attentionCard()` and `stuckCard()` (`console2-
-  model.js`) now tag every stuck card with `stuckOrigin` ('server' or
-  'client'); `console2.js` threads it through every Later/Wait call site
-  into a new, separate `later.stuckOrigin` map (parallel to the existing
-  timestamp maps, so their own strict validation is untouched) persisted
-  alongside them. `pruneRecovered` now branches on that tag: a 'server'
-  choice is retired only when `view.needs.loaded && view.needs.available
-  && !view.needs.stale` is true and the agent is absent from
-  `serverStuckAgentNames`; a 'client' choice keeps the pre-#295 roster-row
-  check; a choice saved before this field existed (no tag) falls back to
-  the prior round's either-side check. `compareCards` now sorts on the
-  shared `source === 'stuck'` field instead of the client-only `kind ===
-  'LOOKS STUCK'` label. Tests in `tests/console2_stream.test.mjs` cover all
-  three through the real app boot/click/redraw path, including a reload
-  with pre-seeded storage against a failing then recovering feed.
+  Technical details: `console2-model.js`'s `buildTeamView` matches a server
+  `source: "stuck"` item to a client-derived incident by the raw agent name
+  only - the same identifier both sides already compute their own
+  `"stuck:" + name` id from, so no new key was needed. An unmatched server
+  item renders through the ordinary `attentionCard()` path instead of being
+  dropped, but with `options: []` (no "Answer") and a `serverOnly: true`
+  marker; `console2.js`'s `needsCard` renders no Later button for it, and
+  `isDeferred`/`isAnswered` treat `serverOnly` as immune to local
+  disposition exactly as they already treat an aggregate `group` card - so
+  an id collision with any saved choice, in any storage format, can never
+  suppress it. The "needs you" badge counts every server item once, plus
+  every client-derived incident, minus the ones matched on both sides, so
+  an overlapping seat is never counted twice, and the "also happening"
+  sidebar excludes any seat already shown as an open warning in the main
+  panel. `compareCards` sorts on the shared `source === 'stuck'` field
+  (not the client-only `kind === 'LOOKS STUCK'` label), so a server-only
+  stalled card sorts with the stuck cards as the panel's own "stuck agents
+  first" text promises. `console2.js`'s own save/load/prune/apply code for
+  Later/Wait (`later`, `cleanTable`, `loadLater`, `saveLater`, `uiFor`,
+  `deferCard`, `waitOnCard`, `pruneRecovered`) is otherwise identical to
+  its pre-#295 form. Tests in `tests/console2_view.test.mjs` and
+  `tests/console2_stream.test.mjs`, the latter through the real app boot/
+  click/keyboard/redraw path - including previous-format saved storage
+  (no new fields at all) against a feed that fails, then recovers.
 
 ## [0.95.0] - 2026-10-01
 

@@ -748,14 +748,17 @@
       evidenceLines: notes,
       agent: agent, ageSeconds: age,
       ageLabel: age === null ? 'age unknown' : 'no deadline · waiting ' + fmtAge(age),
-      options: group ? [] : cardOptions(item, ctx.canAct === true),
+      // #298 scope cut: a kept server-only stalled item (source "stuck", no client-
+      // side counterpart - see buildTeamView) is READ-ONLY. cardOptions' fallback
+      // otherwise offers a locked "Answer" with nothing behind it to answer; here
+      // there is deliberately nothing to click at all.
+      options: (group || src === 'stuck') ? [] : cardOptions(item, ctx.canAct === true),
       answerable: item.answerable === true, state: 'open', group: group,
-      // #298 fix round 2: which EVIDENCE established this incident - 'server' for a
-      // kept source=stuck item, null for every other source. A Later/Wait choice
-      // records this at the moment it is made (console2.js) so its own later
-      // recovery decision never has to re-derive (and can never conflate) which
-      // side's evidence it must be judged against.
-      stuckOrigin: src === 'stuck' ? 'server' : null
+      // #298 scope cut: marks this card IMMUNE to any saved Later/Wait choice, old
+      // or new storage format alike (isDeferred/isAnswered below) - exactly the
+      // same immunity `group` already has, for the same reason: a disposition
+      // saved under this id must never be able to make this warning disappear.
+      serverOnly: src === 'stuck'
     };
   }
 
@@ -769,7 +772,7 @@
       options: [{ label: 'Wait 10 min', primary: true, locked: null, action: 'wait' },
                 { label: 'Restart with context', primary: false, locked: 'CLI only' }],
       incident: { turnStartMs: v.stuck.turnStartMs },
-      answerable: false, state: 'open', stuckOrigin: 'client'
+      answerable: false, state: 'open'
     };
   }
 
@@ -1161,13 +1164,20 @@
     // stale per-letter entry must never carry over and suppress the whole
     // group it now stands for (the reviewer's two-poll, seven-day-boundary
     // regression this guards against).
+    //
+    // #298 scope cut: a server-only stalled card (serverOnly) is immune for the
+    // same reason and the same way - no saved choice, in ANY storage format past
+    // or present, may ever make it disappear. There is no control that can create
+    // one for it (attentionCard gives it no options and no Later button renders -
+    // console2.js), but an id can still collide with one saved by an OLDER build,
+    // before this card existed as its own entry, or by coincidence.
     function isDeferred(c) {
-      if (c.group) return false;
+      if (c.group || c.serverOnly) return false;
       if (!hasOwn(deferred, c.id) || !deferred[c.id]) return false;
       return typeof deferred[c.id] === 'number' ? appliesTo(c, deferred[c.id]) : true;
     }
     function isAnswered(id, c) {
-      if (c && c.group) return false;
+      if (c && (c.group || c.serverOnly)) return false;
       return hasOwn(answered, id) && !!answered[id];
     }
     cards.forEach(function (c) {
