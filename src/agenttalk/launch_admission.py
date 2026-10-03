@@ -367,6 +367,15 @@ def _add_remaining_wrap_arguments(parser: argparse.ArgumentParser) -> None:
         help="With --loop, exit after one successful turn.",
     )
     parser.add_argument(
+        "--turn-events",
+        dest="turn_events",
+        action=_TrackedStoreTrueAction,
+        help="(--loop) Journal what each turn did (dispatch, launch, end with token "
+        "usage, final disposition of a message) to a per-user folder, for anything "
+        "that counts turns or usage afterwards. Off by default; "
+        "AGENTTALK_TURN_EVENTS=1 does the same.",
+    )
+    parser.add_argument(
         "--to-request",
         dest="to_request",
         action=_TrackedStoreAction,

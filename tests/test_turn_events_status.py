@@ -1,0 +1,301 @@
+"""What `agenttalk status` and `doctor` say about the turn journal.
+
+The label is computed from live facts (the process, its start token, how recent
+the record is, and the wrapper's own health and runtime records), never from the
+newest file alone. With the journal never used, `status` and `doctor` read
+exactly as they did before.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import time
+from pathlib import Path
+
+import pytest
+
+from agenttalk import cli, doctor
+from agenttalk import turn_events as te
+from agenttalk import wrapper_runtime as wr
+from agenttalk.store import Store
+from agenttalk.wrapper.health import WrapperHealthWriter
+
+ME = os.getpid()
+TOKENS = {ME: "tok-me", 4242: "tok-other"}
+
+
+def _tok(pid: int) -> str | None:
+    return TOKENS.get(pid)
+
+
+@pytest.fixture(autouse=True)
+def _journal_root_in_tmp(tmp_path, monkeypatch):
+    monkeypatch.setenv(te.ENV_TURN_EVENTS_DIR, str(tmp_path / "journal-root"))
+
+
+def _store(tmp_path: Path) -> Store:
+    store = Store(tmp_path / "project")
+    store.init(["alpha", "beta"])
+    return store
+
+
+def _runtime(pid: int = ME, start: str | None = "tok-me") -> dict:
+    return {"wrapper_pid": pid, "wrapper_start": start}
+
+
+def _real_runtime() -> dict:
+    """This process as the real wrapper runtime record describes it."""
+    return {"wrapper_pid": ME, "wrapper_start": wr.process_start_token(ME)}
+
+
+def _label(store, mode, runtime=None, *, now=None, tokens=None):
+    """`tokens=None` uses the real process start token; a function fakes other processes."""
+    return te.status_label(
+        store.root,
+        "beta",
+        health_mode=mode,
+        runtime_record=runtime,
+        now_epoch=now,
+        start_token=tokens,
+    )
+
+
+def _live_sink(store, **kw) -> te.TurnEventSink:
+    sink = te.TurnEventSink(te.default_turn_events_root(store.root), "beta", **kw)
+    assert sink.start() is True
+    return sink
+
+
+def _write_status(store, name="status-g-old.json", **over):
+    directory = te.default_turn_events_root(store.root) / "beta"
+    directory.mkdir(parents=True, exist_ok=True)
+    data = {
+        "schema_version": 1,
+        "agent": "beta",
+        "stream": "beta.g-old",
+        "mode": "loop",
+        "unmanaged": [],
+        "pid": 4242,
+        "process_start_token": "tok-other",
+        "started_at": "2026-10-03T00:00:00.000Z",
+        "updated_at": te.format_time(int(time.time() * 1000)),
+        "state": "on",
+        "off_reason": None,
+        "last_fault": None,
+        "counts": {},
+        "faults": {},
+    }
+    data.update(over)
+    (directory / name).write_text(json.dumps(data), encoding="ascii")
+
+
+# --- the labels ---------------------------------------------------------------------
+
+
+def test_a_live_loop_writer_is_on(tmp_path):
+    store = _store(tmp_path)
+    sink = _live_sink(store)
+    try:
+        assert _label(store, "wrapper-loop", _real_runtime()) == "on (loop)"
+    finally:
+        sink.close()
+
+
+def test_a_lead_loop_says_its_cadence_turns_are_unmanaged(tmp_path):
+    store = _store(tmp_path)
+    sink = _live_sink(store, unmanaged=("cadence",))
+    try:
+        assert _label(store, "lead-loop", _real_runtime()) == "on (loop); cadence turns unmanaged"
+        assert _label(store, "wrapper-loop", _real_runtime()) == "on (loop); cadence turns unmanaged"
+    finally:
+        sink.close()
+
+
+def test_a_closed_stream_is_ended_not_on(tmp_path):
+    store = _store(tmp_path)
+    sink = _live_sink(store)
+    sink.close()
+    assert _label(store, "wrapper-loop", _real_runtime()) == "ended"
+
+
+def test_a_live_process_whose_record_stopped_updating_is_not_responding(tmp_path):
+    store = _store(tmp_path)
+    sink = _live_sink(store)
+    try:
+        later = time.time() + te.TURN_EVENTS_STATUS_STALE_SECONDS + 5
+        assert _label(store, "wrapper-loop", _real_runtime(), now=later) == "writer not responding"
+        soon = time.time() + 1
+        assert _label(store, "wrapper-loop", _real_runtime(), now=soon) == "on (loop)"
+    finally:
+        sink.close()
+
+
+def test_a_run_whose_start_failed_shows_off_with_its_reason(tmp_path):
+    store = _store(tmp_path)
+
+    class Failing(te.JournalFiles):
+        def append_line(self, path, data):
+            raise OSError("no")
+
+    sink = te.TurnEventSink(te.default_turn_events_root(store.root), "beta", files=Failing())
+    assert sink.start() is False
+    assert _label(store, "wrapper-loop", _real_runtime()) == "off (start_failed)"
+    sink.close()
+
+
+def test_a_start_that_timed_out_shows_its_own_reason(tmp_path):
+    import threading
+
+    store = _store(tmp_path)
+    unblock = threading.Event()
+
+    class Slow(te.JournalFiles):
+        def append_line(self, path, data):
+            unblock.wait(10)
+            super().append_line(path, data)
+
+    sink = te.TurnEventSink(te.default_turn_events_root(store.root), "beta", files=Slow(), start_seconds=0.2)
+    assert sink.start() is False
+    unblock.set()
+    sink._thread.join(5)  # noqa: SLF001
+    assert _label(store, "wrapper-loop", _real_runtime()) == "off (start_timeout)"
+    sink.close()
+
+
+def test_no_record_at_all_is_off(tmp_path):
+    store = _store(tmp_path)
+    assert _label(store, "wrapper-loop", _runtime()) == "off"
+
+
+def test_an_old_record_from_an_earlier_run_never_says_on(tmp_path):
+    store = _store(tmp_path)
+    _write_status(store, pid=4242, process_start_token="tok-other", state="on")
+    # this wrapper (a different, live process) is running without a journal
+    assert _label(store, "wrapper-loop", _runtime(pid=ME, start="tok-me"), tokens=_tok) == "off"
+    # no wrapper is known to be running: the old stream's process is not there either
+    assert _label(store, "wrapper-loop", None, tokens=lambda pid: None) in {"ended", "on (loop)"}
+    gone = _label(store, "wrapper-loop", None, now=time.time() + 600, tokens=lambda pid: None)
+    assert gone == "ended"
+
+
+def test_a_pid_reused_by_another_process_is_not_the_old_writer(tmp_path):
+    store = _store(tmp_path)
+    _write_status(store, pid=4242, process_start_token="tok-old-run", state="on")
+    assert _label(store, "wrapper-loop", None, tokens=_tok) == "ended"  # pid 4242 now has another start token
+
+
+def test_an_old_off_record_keeps_its_reason_visible_but_never_becomes_on(tmp_path):
+    store = _store(tmp_path)
+    _write_status(store, state="off", off_reason="close_timeout")
+    assert _label(store, "wrapper-loop", None, tokens=_tok) == "off (close_timeout)"
+    _write_status(store, state="off", off_reason="free text from a bad file")
+    assert _label(store, "wrapper-loop", None, tokens=_tok) == "off"
+
+
+def test_garbage_in_a_status_file_is_ignored(tmp_path):
+    store = _store(tmp_path)
+    directory = te.default_turn_events_root(store.root) / "beta"
+    directory.mkdir(parents=True)
+    (directory / "status-x.json").write_text("{not json", encoding="ascii")
+    (directory / "status-y.json").write_text(json.dumps({"schema_version": 9}), encoding="ascii")
+    assert _label(store, "wrapper-loop", _runtime()) == "off"
+
+
+def test_a_one_shot_loop_wrapper_and_a_plain_wrapper_are_unmanaged_and_say_so(tmp_path):
+    store = _store(tmp_path)
+    assert _label(store, "wrapper-one-shot", _runtime(), tokens=_tok) == "unmanaged (one_shot)"
+    assert _label(store, "wrapper-one-shot", None, tokens=_tok) == "unmanaged (plain)"
+    # a runtime record of a process that is gone does not make a plain wrapper a one-shot
+    assert _label(store, "wrapper-one-shot", _runtime(pid=4242, start="tok-old"), tokens=_tok) == "unmanaged (plain)"
+
+
+def test_an_unknown_or_missing_mode_is_off(tmp_path):
+    store = _store(tmp_path)
+    sink = _live_sink(store)
+    try:
+        assert _label(store, None, _real_runtime()) == "off"
+        assert _label(store, "something-else", _real_runtime()) == "off"
+    finally:
+        sink.close()
+
+
+# --- status and doctor ------------------------------------------------------------------
+
+
+def _wrapper_state(store, mode="wrapper-loop") -> None:
+    WrapperHealthWriter(store, "beta", "claude", mode=mode, min_interval=0.0).idle()
+    wr.WrapperRuntimeWriter(store.state_dir, "beta", "gen-1").idle()
+
+
+def _row(store) -> dict:
+    return next(a for a in cli._gather_status(store)["agents"] if a["name"] == "beta")
+
+
+def test_status_reads_exactly_as_before_when_the_journal_was_never_used(tmp_path):
+    store = _store(tmp_path)
+    _wrapper_state(store)
+    assert all("turn_events" not in a for a in cli._gather_status(store)["agents"])
+    assert doctor._check_turn_journal(store) is None
+
+
+def test_status_json_and_text_show_the_label_once_the_journal_exists(tmp_path, capsys):
+    store = _store(tmp_path)
+    _wrapper_state(store)
+    sink = _live_sink(store)
+    try:
+        assert _row(store)["turn_events"] == "on (loop)"
+        assert cli.cmd_status(argparse.Namespace(root=str(store.root), json=False)) == 0
+        out = capsys.readouterr().out
+        beta = next(line for line in out.splitlines() if line.strip().startswith("beta"))
+        assert "turn_events=on (loop)" in beta
+        assert next(line for line in out.splitlines() if line.strip().startswith("alpha")).count("turn_events") == 0
+        assert cli.cmd_status(argparse.Namespace(root=str(store.root), json=True)) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert next(a for a in payload["agents"] if a["name"] == "beta")["turn_events"] == "on (loop)"
+    finally:
+        sink.close()
+
+
+def test_status_shows_a_stopped_journal_as_ended_and_a_plain_wrapper_as_unmanaged(tmp_path):
+    store = _store(tmp_path)
+    _wrapper_state(store)
+    sink = _live_sink(store)
+    sink.close()
+    assert _row(store)["turn_events"] == "ended"
+    _wrapper_state(store, mode="wrapper-one-shot")
+    assert _row(store)["turn_events"] == "unmanaged (one_shot)"
+
+
+def test_doctor_says_ok_for_a_live_writer_and_warns_for_one_that_stopped_responding(tmp_path):
+    store = _store(tmp_path)
+    _wrapper_state(store)
+    sink = _live_sink(store)
+    try:
+        check = doctor._check_turn_journal(store)
+        assert check.status == "ok" and "beta: on (loop)" in check.details
+        stale = te.default_turn_events_root(store.root) / "beta" / os.path.basename(sink.status_path)
+        data = json.loads(stale.read_text(encoding="ascii"))
+        data["updated_at"] = te.format_time(int((time.time() - 600) * 1000))
+        stale.write_text(json.dumps(data), encoding="ascii")
+        check = doctor._check_turn_journal(store)
+        assert check.status == "warn" and "writer not responding" in check.details
+        assert check.data == {"agents": {"beta": "writer not responding"}}
+    finally:
+        sink.close()
+
+
+def test_doctor_warns_when_a_start_failed(tmp_path):
+    store = _store(tmp_path)
+    _wrapper_state(store)
+
+    class Failing(te.JournalFiles):
+        def append_line(self, path, data):
+            raise OSError("no")
+
+    sink = te.TurnEventSink(te.default_turn_events_root(store.root), "beta", files=Failing())
+    sink.start()
+    check = doctor._check_turn_journal(store)
+    assert check.status == "warn" and "off (start_failed)" in check.details and check.fix
+    sink.close()

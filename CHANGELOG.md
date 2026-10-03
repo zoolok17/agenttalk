@@ -11,28 +11,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **A turn journal writer (not connected to the wrapper yet).** agenttalk can
-  now write a small, append-only journal of what an agent's turns did: when a
-  turn was dispatched, when a model process was launched, how the turn ended
-  and how many tokens it used, and when a message was finally dealt with. It
-  is meant for anyone who wants to count turns, runs or token usage
-  afterwards, and it is off unless someone turns it on.
+- **An optional turn journal.** A wrapped agent can now keep a small,
+  append-only journal of what its turns did: when a turn was dispatched, when a
+  model process was launched, how the turn ended and how many tokens it used,
+  and how each message was finally dealt with. It is meant for anyone who wants
+  to count turns, runs or token usage afterwards. It is off unless you turn it
+  on, with `agenttalk wrap --loop --turn-events` or `AGENTTALK_TURN_EVENTS=1`,
+  and with it off nothing changes.
 
-  What this change adds is the writer. The wrapper does not use it yet and
-  there is no switch to turn it on yet; both come next.
+  A turn never waits for the journal: an event is only dropped into a small
+  in-memory queue and a separate thread does all the file work. If the queue is
+  full or the disk is full, slow or broken, events are dropped and counted, and
+  the journal says so instead of pretending to be complete (numbered events, a
+  count of what was lost, a record of every stream that was started, and a
+  closing record on a clean stop). A message's ending follows the wrapper's own
+  definition of a completed turn, and the raw terminal facts are recorded next
+  to it. `agenttalk status` and `agenttalk doctor` show whether the journal is
+  on, not responding, ended or off, and which modes are not journaled.
 
-  The writer is built so that a turn never waits for it: an event is only
-  dropped into a small in-memory queue, and a separate thread does all the
-  file work. If the queue is full or the disk is full, slow or broken,
-  events are dropped and counted, and the journal says so instead of
-  pretending to be complete (numbered events, a count of what was lost, a
-  record of every stream that was started, and a closing record on a clean
-  stop). Files go in a per-user folder beside the wrapper logs, which
-  `AGENTTALK_TURN_EVENTS_DIR` can move.
+  The files are in a per-user folder beside the wrapper logs, which
+  `AGENTTALK_TURN_EVENTS_DIR` can move. For developers: `agenttalk.turn_events`
+  has the writer, the closed record format with its checker, and a reader for
+  the files.
 
-  For developers: `agenttalk.turn_events` has the writer
-  (`TurnEventSink`), the closed record format with its validator, and a
-  reader for the files.
 - **One plain-language voice for everything a person reads, not only release
   notes.** The write-for-humans skill taught agents to explain changes in plain
   words, but only in release notes, pull request descriptions, comments and

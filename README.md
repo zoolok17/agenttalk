@@ -871,7 +871,7 @@ typed-evidence shape at the milestone level.
 
 | Command | What it does |
 | --- | --- |
-| `wrap` | Structured-stream adapter around a CLI child: visibility, working-turn heartbeat, degraded-output detection. `--loop` for supervised long-running mode, `--one-shot` for a single turn. |
+| `wrap` | Structured-stream adapter around a CLI child: visibility, working-turn heartbeat, degraded-output detection. `--loop` for supervised long-running mode, `--one-shot` for a single turn, `--turn-events` for the optional turn journal. |
 | `supervisor` | Read-only status over the supervisor's own state file. |
 | `supervise` | Scaffold (`--init`), preflight (`--bootstrap-check`), and script-refresh (`--refresh-scripts`) operations for the external monitor. |
 | `dead-letter {list,show,requeue,resolve,purge}` | Messages that exhausted automatic retry. |
@@ -926,6 +926,92 @@ typed-evidence shape at the milestone level.
 - **No transport.** Both agents are expected to share one project
   directory on one machine (or a directory synced by a mechanism you
   already trust) — there's no server process bridging machines.
+
+### The turn journal (optional)
+
+**In plain words.** A wrapped agent can keep a small journal of what its turns
+did: when a turn was dispatched, whether a model process was really launched,
+how it ended and how many tokens it used, and how each message was finally
+dealt with. It is for anything that wants to count turns, runs or token usage
+afterwards. It is **off unless you turn it on**, it only watches, and if it
+cannot write, the wrapper carries on exactly as before: a turn never waits for
+the journal.
+
+**Turn it on** for a supervised wrapper with `agenttalk wrap --loop --turn-events`,
+or by setting `AGENTTALK_TURN_EVENTS=1`. It applies to `--loop` and `--lead-loop`
+wrappers; there is no configuration-file setting. The files are kept in a
+per-user folder beside the wrapper logs (see "Where agenttalk keeps files"),
+one subfolder per agent; `AGENTTALK_TURN_EVENTS_DIR` moves the whole folder.
+
+**What is recorded.** One JSON line per record, in files that only grow:
+
+- `dispatch_started`: a turn was dispatched (the message, the turn, which
+  CLI, a fresh or resumed session, and the message's own send time);
+- `dispatch_ended`: how that dispatch ended: whether a process was launched,
+  `success`, `failed` or `not_launched`, how it exited (`normal`,
+  `spawn_error`, `exception`), a closed failure class, the duration, and token
+  `usage` (input, output, cache read, cache write). A count that is not known is
+  `null`, never 0; Codex turns carry no usage in this version;
+- `message_disposed`: the message was durably consumed as work, with its
+  `disposition` and five raw facts.
+
+A dispatch is one call of the turn runner. A **launch** is a model process that
+really started (counted from the moment it exists, even if setting it up fails
+afterwards). A turn held back by a gateway hold or refused by a pre-launch check
+is a dispatch that did not launch.
+
+**The disposition follows the wrapper's own definition of a completed turn.**
+`completed` appears only where the wrapper itself counts a completed turn, and
+on the commit-gate path that means the message was consumed **and** its reply
+landed. The words are:
+
+- `completed`: as above;
+- `dead_lettered`: the message was moved to the dead-letter area;
+- `delivery_failed`: the commit gate recorded a terminal failure;
+- `outcome_unknown`: everything else, for example compliance success without
+  landed evidence, a message that ended as not owed, or a message consumed
+  without any dispatch.
+
+The raw facts are recorded as well, so a reader can apply its own policy and a
+later change in how agenttalk words a disposition never makes an old line
+wrong: `consumed`, `landed`, `compliance_success`, `dead_lettered` and
+`terminal_failure`. Each is `true`, `false`, or `null` where that path has no
+such fact. The loop's own stand-down messages are control records, not work, and are not recorded.
+
+**It says when it may be incomplete.** Every event carries a number (`seq`) given
+when it is queued, so an event lost to a full queue or a failing disk leaves a
+visible gap; `dropped_total` counts what was lost before it. Each file starts
+with a `stream_started` record (no number); a clean stop writes `stream_closed`
+with the last number used, so a lost end shows. `streams.jsonl` lists every
+stream ever started, so a stream whose files were deleted can still be seen.
+Old files are removed oldest first once the folder passes its size cap.
+
+**Limits to know.**
+
+- "Complete" means "no loss the journal can see". It is not a guarantee.
+- A run whose journal failed to start (or timed out starting, after at most
+  2 seconds) is **not observed**: the wrapper simply runs without it, and
+  `status` shows `off (start_failed)` or `off (start_timeout)`.
+- A message's time is the **sender's** clock. A consumer comparing it with the
+  journal's own times should allow for skew between machines, and an undetected
+  change of a machine's clock can defeat any time-based check.
+- A crash can lose the last events that were still waiting to be written.
+
+**Not recorded.** Plain `wrap` (without `--loop`), `--one-shot` reviewers and the
+proactive sweeps of a `--lead-loop` wrapper are not journaled, and `status` says
+so. The journal never holds prompt or reply text, file paths, command lines,
+environment values, secrets, model names or error text.
+
+**What `status` and `doctor` show** (only once the project has a journal folder;
+otherwise their output is unchanged), computed from live facts, never from the
+newest file alone: `on (loop)`, `on (loop); cadence turns unmanaged`,
+`writer not responding`, `off`, `off (start_failed)`, `off (start_timeout)`,
+`ended`, `unmanaged (one_shot)` and `unmanaged (plain)`. A file left by an
+earlier run never changes the label of a running wrapper.
+
+**Reading it.** `agenttalk.turn_events` has the reader (`read_streams`,
+`list_segments`, `read_segment`, `iter_records`) and the closed record checker
+(`validate_event`). The schema version is 1; a reader refuses another version.
 
 ### Windows notes
 
