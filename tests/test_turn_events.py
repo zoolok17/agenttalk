@@ -153,19 +153,25 @@ def run_clean(tmp_path: Path, **kw: Any) -> TurnEventSink:
 
 class _AckCountedFrom(threading.Event):
     """The writer's acknowledgement, whose wait in start() begins only once `ready` is set: the
-    start bound then passes with the writer provably inside the blocked step."""
+    start bound then passes with the writer provably inside the blocked step. Getting there has
+    its own generous limit; `bound_began` is when the real wait began, so a test that times
+    the caller measures only the bound, never the writer's way to its start position."""
 
     def __init__(self, ready: threading.Event) -> None:
         super().__init__()
         self._ready = ready
+        self.bound_began: float | None = None
 
     def wait(self, timeout: float | None = None) -> bool:
         assert self._ready.wait(10)
+        self.bound_began = time.monotonic()
         return super().wait(timeout)
 
 
-def start_bound_counted_from(sink: TurnEventSink, ready: threading.Event) -> None:
-    sink._ack = _AckCountedFrom(ready)  # noqa: SLF001
+def start_bound_counted_from(sink: TurnEventSink, ready: threading.Event) -> _AckCountedFrom:
+    ack = _AckCountedFrom(ready)
+    sink._ack = ack  # noqa: SLF001
+    return ack
 
 
 class _JoinedFrom:
@@ -788,10 +794,10 @@ def test_a_registration_held_past_the_bound_latches_off_and_writes_no_event(tmp_
 
     files.hooks["append_line"] = hook  # the streams record: first step of registration
     sink = make(tmp_path, files=files, start_seconds=0.2)
-    start_bound_counted_from(sink, entered)
-    begin = time.monotonic()
+    ack = start_bound_counted_from(sink, entered)
     assert sink.start() is False
-    assert time.monotonic() - begin < 2.0
+    # once the writer is in place, the caller is let go within its bound (timed from then on)
+    assert ack.bound_began is not None and time.monotonic() - ack.bound_began < 2.0
     assert entered.is_set()
     assert sink.state == "off" and sink.off_reason == te.OFF_START_TIMEOUT
     unblock.set()  # the blocked write may finish, but nothing new starts
