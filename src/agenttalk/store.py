@@ -4284,10 +4284,15 @@ class Store:
         return rec if isinstance(rec, dict) else None
 
     def record_attempt_start(self, agent: str, record: dict, *, attempt_id: str,
-                             at: str) -> dict:
+                             at: str, usage_probe: dict | None = None) -> dict:
         """WRITE-AHEAD: increment ``attempts_started`` + mark ``in_progress`` BEFORE
         ``drive()``. A hard crash mid-turn still leaves a durable started attempt the
-        next run reads (-> crash_mid_turn). EXACTLY one call per drive() = one attempt."""
+        next run reads (-> crash_mid_turn). EXACTLY one call per drive() = one attempt.
+
+        ``usage_probe`` (``{"generation", "consumed_wake"}``) marks this attempt as the one
+        probe a parked head is allowed (see ``wrapper.usage_park``): in the SAME write the
+        attempt is excluded from disposal, the probe marker is set and a due wake is
+        consumed, so a crash during the probe is reconciled as a re-park."""
         data = self.dead_letter_attempts(agent)
         mid = record.get("id")
         rec = data["messages"].get(mid)
@@ -4307,6 +4312,12 @@ class Store:
         rec["last_started_at"] = at
         rec["last_attempt_id"] = attempt_id
         rec["in_progress"] = True
+        if usage_probe is not None:
+            from agenttalk.wrapper import usage_park
+
+            usage_park.apply_probe_start(
+                rec, generation=str(usage_probe.get("generation") or ""),
+                consumed_wake=usage_probe.get("consumed_wake"))
         data["messages"][mid] = rec
         self._write_attempts(agent, data)
         return rec
@@ -4317,7 +4328,8 @@ class Store:
                               interruption_kind: str | None = None,
                               never_started_first_at: str | None = None,
                               never_started_consecutive: int = 0,
-                              promoted_by_generation: str | None = None) -> dict | None:
+                              promoted_by_generation: str | None = None,
+                              usage_limit: dict | None = None) -> dict | None:
         """After a FAILED drive: clear ``in_progress``, bump the per-class failure
         counter, record the last class/summary. (Success calls clear_attempt.)
 
@@ -4340,11 +4352,19 @@ class Store:
         #205 cold-review P1-A: ``promoted_by_generation`` is written only when the
         caller is PROMOTING this result to CLASS_CONFIG_BLOCKED (non-None); it names
         the wrapper generation active at promotion time so the entry-check park can
-        allow exactly one re-probe drive after a restart (operator intervention)."""
+        allow exactly one re-probe drive after a restart (operator intervention).
+
+        ``usage_limit`` (``{"generation", "window", "reset_epoch"}``, with failure_class
+        ``usage_limit``) PARKS the head (``wrapper.usage_park``): no failure counter moves.
+        A result of ANOTHER class that ends a probe moves no counter either (the attempt was
+        excluded when it started) and closes the park."""
+        from agenttalk.wrapper import usage_park
+
         data = self.dead_letter_attempts(agent)
         rec = data["messages"].get(msg_id)
         if not isinstance(rec, dict):
             return None
+        was_probe = bool(rec.get("probe_marker"))
         rec["in_progress"] = False
         rec["last_failure_class"] = failure_class
         rec["last_failure_summary"] = (summary or "")[:500]
@@ -4355,7 +4375,9 @@ class Store:
         rec["never_started_consecutive"] = _safe_int(never_started_consecutive)
         if promoted_by_generation is not None:
             rec["promoted_by_generation"] = promoted_by_generation
-        if interrupted:
+        if was_probe:
+            pass                    # an excluded attempt moves no counter, interruption counters included
+        elif interrupted:
             rec["interrupted_consecutive"] = _safe_int(
                 rec.get("interrupted_consecutive")) + 1
             if interruption_kind == "turn_watchdog":
@@ -4364,6 +4386,20 @@ class Store:
         else:
             rec["interrupted_consecutive"] = 0
             rec["interrupted_watchdog_consecutive"] = 0
+        if failure_class == usage_park.CLASS_USAGE_LIMIT and usage_limit is not None:
+            usage_park.apply_limit_result(
+                rec, at=at, generation=str(usage_limit.get("generation") or ""),
+                window=str(usage_limit.get("window") or ""),
+                reset_epoch=usage_limit.get("reset_epoch"))
+            data["messages"][msg_id] = rec
+            self._write_attempts(agent, data)
+            return rec
+        if was_probe or rec.get("park_state") in usage_park.PARK_STATES:
+            usage_park.apply_park_close(rec, at_epoch=usage_park.iso_epoch(at))
+        if was_probe:
+            data["messages"][msg_id] = rec
+            self._write_attempts(agent, data)
+            return rec
         key = {"poison_eligible": "poison_eligible_failures",
                "known_global_infra": "infra_failures"}.get(
                    failure_class, "ambiguous_failures")
@@ -4392,6 +4428,15 @@ class Store:
         rec = data["messages"].get(msg_id)
         if not isinstance(rec, dict) or not rec.get("in_progress"):
             return False
+        if rec.get("probe_marker"):
+            # A crash during a usage-limit probe: park again, never "ambiguous" (the probe
+            # was already counted as excluded when it started).
+            from agenttalk.wrapper import usage_park
+
+            usage_park.apply_crash_reconcile(rec)
+            data["messages"][msg_id] = rec
+            self._write_attempts(agent, data)
+            return True
         rec["in_progress"] = False
         rec["ambiguous_failures"] = _safe_int(rec.get("ambiguous_failures")) + 1
         rec["poison_eligible_failures"] = 0   # a crash (ambiguous) breaks the consecutive poison run
@@ -4428,6 +4473,36 @@ class Store:
             rec["escalation_routed"] = bool(routed)
             data["messages"][msg_id] = rec
             self._write_attempts(agent, data)
+
+    def mark_usage_notice(self, agent: str, msg_id: str, *, routed: bool,
+                          next_at_epoch: float | None) -> None:
+        """Record one try of the usage-limit park notice for the current park transition:
+        whether it ROUTED, how many tries so far, and when an unrouted one may be tried
+        again. Its own fields, so an earlier high-attempt escalation never silences it."""
+        data = self.dead_letter_attempts(agent)
+        rec = data["messages"].get(msg_id)
+        if isinstance(rec, dict) and rec.get("notice_key"):
+            rec["notice_routed"] = bool(routed)
+            rec["notice_tries"] = _safe_int(rec.get("notice_tries")) + 1
+            rec["notice_next_at"] = next_at_epoch
+            data["messages"][msg_id] = rec
+            self._write_attempts(agent, data)
+
+    def close_usage_park(self, agent: str, msg_id: str, *, at: str) -> bool:
+        """End a head's usage-limit park without a result (the switch is off and the head
+        is driven): add the parked time to the total and drop the park fields. Returns
+        True if there was a park to close."""
+        from agenttalk.wrapper import usage_park
+
+        data = self.dead_letter_attempts(agent)
+        rec = data["messages"].get(msg_id)
+        if not isinstance(rec, dict) or rec.get("park_state") not in usage_park.PARK_STATES:
+            return False
+        usage_park.apply_park_close(rec, at_epoch=usage_park.iso_epoch(at))
+        rec["probe_marker"] = False
+        data["messages"][msg_id] = rec
+        self._write_attempts(agent, data)
+        return True
 
     def list_unrouted_escalations(self) -> list[dict]:
         """Every attempt record that hit the escalation backstop but whose operator notice
@@ -5582,6 +5657,81 @@ class Store:
                 self.config_blocked_hold_path(agent).unlink()
             except (FileNotFoundError, OSError):
                 pass
+
+    # ----------------------------------------- usage-limit park marker
+    #
+    # The attempt record is the truth about a parked head; this small per-agent file is
+    # a VIEW of it for the readers of seat health (status, doctor, attention, consoles),
+    # so none of them has to read the attempt ledger. It carries only closed words,
+    # numbers and times - never message or provider text. A marker the wrapper stopped
+    # refreshing is NOT dropped: it reads back with ``fresh`` False, so a reader can say
+    # "parked, wrapper not responding" instead of showing a healthy seat.
+
+    def usage_limit_park_path(self, agent: str) -> Path:
+        return self.state_dir / "usage-limit-park" / f"{validate_agent_name(agent)}.json"
+
+    def write_usage_limit_park(self, agent: str, *, window: str | None, reset_epoch: int | None,
+                               wake_epoch: int | None, message_id: str, parked_at: str | None,
+                               wrapper_generation: str | None = None,
+                               now_epoch: float | None = None) -> None:
+        """Atomically publish (or refresh) the park marker for ``agent``."""
+        payload = {
+            "agent": validate_agent_name(agent),
+            "state": "usage_limit_parked",
+            "window": window,
+            "reset_epoch": reset_epoch,
+            "wake_epoch": wake_epoch,
+            "message_id": message_id,
+            "parked_at": parked_at,
+            "wrapper_generation": wrapper_generation,
+            "updated_at_epoch": time.time() if now_epoch is None else now_epoch,
+        }
+        p = self.usage_limit_park_path(agent)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(p, json.dumps(payload, ensure_ascii=False, indent=2))
+
+    def read_usage_limit_park(self, agent: str, *, now_epoch: float | None = None) -> dict | None:
+        """The validated park marker, or None when there is none or it is not valid.
+        Never raises. ``fresh`` is False once the wrapper has not refreshed it for
+        ``usage_park.MARKER_STALE_SECONDS``; a stale marker is still returned."""
+        from agenttalk.wrapper import usage_park
+
+        expected = validate_agent_name(agent)
+        p = self.usage_limit_park_path(agent)
+        try:
+            data = json.loads(p.read_text(encoding="utf-8").strip() or "null")
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict) or data.get("agent") != expected \
+                or data.get("state") != "usage_limit_parked":
+            return None
+        updated = usage_park.whole_seconds(data.get("updated_at_epoch"))
+        message_id = data.get("message_id")
+        window = data.get("window")
+        if updated is None or not isinstance(message_id, str) or not message_id \
+                or window not in (*usage_park.KNOWN_WINDOWS, None):
+            return None
+        now = time.time() if now_epoch is None else now_epoch
+        parked_at = data.get("parked_at")
+        generation = data.get("wrapper_generation")
+        return {
+            "agent": expected,
+            "state": "usage_limit_parked",
+            "window": window,
+            "reset_epoch": usage_park.whole_seconds(data.get("reset_epoch")),
+            "wake_epoch": usage_park.whole_seconds(data.get("wake_epoch")),
+            "message_id": message_id,
+            "parked_at": parked_at if isinstance(parked_at, str) else None,
+            "wrapper_generation": generation if isinstance(generation, str) else None,
+            "updated_at_epoch": updated,
+            "age_seconds": max(0.0, now - updated),
+            "fresh": (now - updated) <= usage_park.MARKER_STALE_SECONDS,
+        }
+
+    def clear_usage_limit_park(self, agent: str) -> None:
+        """Remove the park marker (best-effort; never raises)."""
+        with contextlib.suppress(OSError):
+            self.usage_limit_park_path(agent).unlink()
 
     # ----------------------------------------- managed lead-loop (Slice 1)
     #
