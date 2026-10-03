@@ -399,6 +399,10 @@
     return { text: 'Rate limited or provider outage', reset: reset };
   }
 
+  function VERDICT_WORD(state) {
+    return state === 'STUCK_OR_DEAD' ? 'stuck or dead' : state.toLowerCase().replace(/_/g, ' ');
+  }
+
   // One roster row plus the facts the needs and "also happening" blocks reuse.
   // ctx: { nowMs, generatedMs, recent, teamIds, project, known, tz }
   function agentView(agent, ctx) {
@@ -481,7 +485,10 @@
       && (agent.usage_limit_park.state === 'parked' || agent.usage_limit_park.state === 'stale')
       && !adverseVerdict && !currentWork
       ? agent.usage_limit_park : null;
-    if (park) {
+    if (adverseVerdict) {
+      // The supervisor's own verdict is the winner: shown as down, never as idle or parked.
+      setState('down', 'Supervisor: ' + VERDICT_WORD(verdictNow));
+    } else if (park) {
       var parkWhen = park.wake_epoch ? parkTimeLabel(park.reset_epoch) : '';
       if (park.state === 'stale') setState('parked', 'Parked on a usage limit \u00b7 wrapper not responding');
       else setState('parked', 'Parked on a usage limit \u00b7 ' + (parkWhen ? 'until ' + parkWhen : 'until it is started again'));
@@ -699,7 +706,9 @@
     var evidence = str(item.detail, 600);
     // A parked seat's card carries the two ways to act (restart it, or skip the message) as CLI steps.
     if (src === 'usage_limit_park' && typeof item.recommendation === 'string' && item.recommendation) {
-      evidence = (evidence ? evidence + ' ' : '') + str(item.recommendation, 400);
+      // The whole remedy, up to the server's own 1,000-character bound: its last words are the
+      // warnings (no dead-letter record; refused for a managed lead-loop agent).
+      evidence = (evidence ? evidence + ' ' : '') + str(item.recommendation, 1000);
     }
     var age = typeof item.age_seconds === 'number' && !item.age_unknown
       ? item.age_seconds + Math.max(0, (ctx.nowMs - ctx.attentionAsOfMs) / 1000) : null;

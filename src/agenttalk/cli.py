@@ -7059,11 +7059,14 @@ def _needs_operator_items(store: Store, for_agent: str, now) -> list[dict]:
 
 def _usage_limit_park_views(store: Store, roster: list[str]) -> list[dict]:
     """The park view of every roster agent that has one, each tagged with its agent."""
+    from .wrapper import usage_park as wrapper_usage_park
+
     now_epoch = time.time()
     views = []
     for name in roster:
         health = store.read_health(name, now_epoch=now_epoch, heartbeat=store.read_heartbeat(name))
-        view = store.usage_limit_park_view(name, health=health, now_epoch=now_epoch)
+        view = wrapper_usage_park.mark_not_consulted(
+            store.usage_limit_park_view(name, health=health, now_epoch=now_epoch))
         if view is not None:
             views.append({"agent": name, **view})
     return views

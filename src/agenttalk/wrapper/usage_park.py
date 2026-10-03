@@ -347,6 +347,32 @@ def recovery_text(agent: str, message_id: str) -> str:
 # evidence (for example STUCK_OR_DEAD) and wins over a park.
 _HEALTHY_VERDICTS = ("HEALTHY_IDLE", "HEALTHY_WORKING")
 
+NOT_CONSULTED_NOTE = "supervisor not consulted"
+
+
+def verdict_is_adverse(verdict_state: object) -> bool:
+    """True for a supervisor verdict that says the seat is not healthy."""
+    return isinstance(verdict_state, str) and bool(verdict_state) and verdict_state not in _HEALTHY_VERDICTS
+
+
+def apply_verdict(view: dict | None, verdict_state: object) -> dict | None:
+    """The one rule for a surface that already holds a park view and later learns the verdict
+    (the final supervisor assessment): an adverse verdict removes the park."""
+    return None if verdict_is_adverse(verdict_state) else view
+
+
+def mark_not_consulted(view: dict | None) -> dict | None:
+    """Label a view built where no supervisor verdict is available (attention queue, doctor):
+    a limited observation, shown as such."""
+    return None if view is None else {**view, "supervisor_consulted": False}
+
+
+def _stale_work_history(health: object) -> bool:
+    """Stale health whose own state, or last known state, was working or stuck."""
+    return (isinstance(health, dict) and bool(health.get("stale"))
+            and (health.get("state") in _CURRENT_WORK_STATES
+                 or health.get("last_known_state") in _CURRENT_WORK_STATES))
+
 
 def park_view(marker: dict | None, health: dict | None = None, *, verdict_state: object = None,
               heartbeat_age: object = None) -> dict | None:
@@ -357,17 +383,20 @@ def park_view(marker: dict | None, health: dict | None = None, *, verdict_state:
       2. CURRENT (not stale) working or stuck health wins over any park, fresh or stale: no park;
       3. a fresh marker beats historical (stale) working health: ``parked``;
       4. a stale marker, or a fresh one whose seat has not stamped its heartbeat for as long,
-         shows as ``stale`` ("wrapper not responding"), never as healthy;
+         is ranked BELOW stale working history (no park: the old work is shown); with nothing
+         stronger it shows as ``stale`` ("wrapper not responding"), never as healthy;
       5. no marker: nothing (today's display).
     Closed words, numbers and times only."""
     if not isinstance(marker, dict):
         return None
-    if isinstance(verdict_state, str) and verdict_state and verdict_state not in _HEALTHY_VERDICTS:
+    if verdict_is_adverse(verdict_state):
         return None
     if isinstance(health, dict) and not health.get("stale") and health.get("state") in _CURRENT_WORK_STATES:
         return None
     beat = _number(heartbeat_age)
     fresh = bool(marker.get("fresh")) and not (beat is not None and beat > MARKER_STALE_SECONDS)
+    if not fresh and _stale_work_history(health):
+        return None
     return {
         "present": True,
         "state": VIEW_PARKED if fresh else VIEW_STALE,
@@ -386,6 +415,10 @@ def park_text(view: dict | None) -> str | None:
     if not isinstance(view, dict) or not view.get("present"):
         return None
     if view.get("state") == VIEW_STALE:
-        return "parked on a usage limit, wrapper not responding"
-    when = format_epoch(view.get("reset_epoch")) if view.get("wake_epoch") else None
-    return f"parked on a usage limit until {when}" if when else "parked on a usage limit until restarted"
+        text = "parked on a usage limit, wrapper not responding"
+    else:
+        when = format_epoch(view.get("reset_epoch")) if view.get("wake_epoch") else None
+        text = f"parked on a usage limit until {when}" if when else "parked on a usage limit until restarted"
+    if view.get("supervisor_consulted") is False:
+        text += f" ({NOT_CONSULTED_NOTE})"
+    return text

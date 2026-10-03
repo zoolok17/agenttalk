@@ -923,6 +923,11 @@ stays alive and says so. This is on by default.
 - `agenttalk attention`, `agenttalk doctor` and both web consoles show it too, as **PARKED**
   ("parked on a usage limit until ..."). A parked seat needs a look, but it is never shown as
   down, never as "config blocked", and never as "not for you".
+- When several facts disagree, the order is: the supervisor's verdict that the seat is stuck or dead,
+  then current working evidence, then a fresh park, then old working history, then an old park. So a
+  seat the supervisor calls stuck or dead is shown that way on every screen that has the verdict
+  (never "parked", never "idle"). `agenttalk attention` and `agenttalk doctor` do not consult the
+  supervisor, so their text says "(supervisor not consulted)".
 - The liaison gets one notice per park, in plain words, with the two ways to act.
 
 **What the seat does by itself**

@@ -51,9 +51,15 @@ def test_a_fresh_park_wins_over_historical_stale_working_health(tmp_path):
 def test_a_stale_park_with_nothing_stronger_is_wrapper_not_responding(tmp_path):
     store = rd.make_store(tmp_path)
     rd.park_beta(store, age=park.MARKER_STALE_SECONDS + 60, health=False)
-    for health in (None, work("idle_waiting"), work("rate_limited_or_outage"), work("working_turn", stale=True)):
+    for health in (None, work("idle_waiting"), work("rate_limited_or_outage")):
         view = store.usage_limit_park_view("beta", health=health, now_epoch=NOW)
         assert view is not None and view["state"] == "stale", health
+
+
+def test_stale_working_history_outranks_a_stale_park_alone(tmp_path):
+    store = rd.make_store(tmp_path)
+    rd.park_beta(store, age=park.MARKER_STALE_SECONDS + 60, health=False)
+    assert store.usage_limit_park_view("beta", health=work("working_turn", stale=True), now_epoch=NOW) is None
 
 
 def test_a_fresh_marker_with_a_stopped_heartbeat_reads_as_not_responding(tmp_path):

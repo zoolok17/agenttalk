@@ -2554,7 +2554,8 @@ def _check_usage_limit_parks(store: Store, *, now_epoch: float | None = None) ->
     for agent in cfg.get("agents", []) or []:
         try:
             health = store.read_health(str(agent), now_epoch=now, heartbeat=store.read_heartbeat(str(agent)))
-            view = store.usage_limit_park_view(str(agent), health=health, now_epoch=now)
+            view = usage_park.mark_not_consulted(
+                store.usage_limit_park_view(str(agent), health=health, now_epoch=now))
         except Exception:  # noqa: BLE001 - doctor never crashes on state files
             view = None
         if view is None:

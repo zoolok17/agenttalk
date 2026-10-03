@@ -2779,9 +2779,13 @@ def _collect_web_attention_items(store: Store, roster: list[str],
     try:
         now_epoch = time.time()
         views = []
+        verdicts = _cli_child_verdicts(store, now_epoch)     # the same verdicts the agent rows use
         for name in roster:
             health = store.read_health(name, now_epoch=now_epoch, heartbeat=store.read_heartbeat(name))
-            view = store.usage_limit_park_view(name, health=health, now_epoch=now_epoch)
+            verdict = verdicts.get(name)
+            view = store.usage_limit_park_view(
+                name, health=health, now_epoch=now_epoch,
+                verdict_state=verdict.get("state") if isinstance(verdict, dict) else None)
             if view is not None:
                 views.append({"agent": name, **view})
         items += A.usage_limit_park_items(views)

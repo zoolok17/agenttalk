@@ -147,14 +147,14 @@ def test_the_attention_item_says_parked_until_the_time_never_config_blocked(tmp_
 def test_the_attention_item_without_a_time_says_until_restarted(tmp_path):
     store = make_store(tmp_path)
     park_beta(store, reset=None, wake=None)
-    assert item_for(store)["title"] == "beta: parked on a usage limit until restarted"
+    assert item_for(store)["title"] == "beta: parked on a usage limit until restarted (supervisor not consulted)"
 
 
 def test_the_attention_item_for_a_stale_marker_says_wrapper_not_responding(tmp_path):
     store = make_store(tmp_path)
     park_beta(store, age=park.MARKER_STALE_SECONDS + 60)
     item = item_for(store)
-    assert item["title"] == "beta: parked on a usage limit, wrapper not responding"
+    assert item["title"] == "beta: parked on a usage limit, wrapper not responding (supervisor not consulted)"
     assert "has not refreshed" in item["why_it_matters"]
 
 
@@ -271,7 +271,8 @@ def test_the_supervisor_report_row_and_flag(tmp_path):
     row = report["agents"]["beta"]["usage_limit_park"]
     assert row["state"] == "parked"
     assert sup.supervisor_agent_assessment("beta", report["agents"]["beta"], None)["usage_limit_park"] == {
-        "present": True, "state": "parked", "window": "five_hour", "reset_epoch": RESET, "wake_epoch": WAKE}
+        "present": True, "state": "parked", "window": "five_hour", "reset_epoch": RESET, "wake_epoch": WAKE,
+            "supervisor_consulted": False}
     assert sup.supervisor_agent_assessment("alpha", report["agents"]["alpha"], None)["usage_limit_park"] == {
         "present": False}
 
