@@ -1092,16 +1092,31 @@ message, an agent, or an environment variable an agent can set:
 ```
 
 - `command` must be an absolute path - it is never looked up on `PATH`,
-  and on Windows it may not end in `.bat` or `.cmd`: Windows can still
-  hand those to a shell even with `shell=False`, so only a native
-  executable is accepted.
+  and may not contain a NUL character. On Windows it may not end in
+  `.bat` or `.cmd` (checked against the NORMALIZED path - Windows itself
+  strips trailing dots and spaces before deciding what runs, so a
+  trailing space or dot cannot smuggle a refused suffix past this check):
+  Windows can still hand a batch file to a shell even with `shell=False`,
+  so only a native executable is accepted.
 - `args` is a fixed list; nothing about a specific turn or message is
-  ever added to it.
-- `env` lists only the fixed name/value pairs the program needs. Nothing
-  else from the wrapper's own environment reaches the program, except
-  the handful of system defaults the operating system itself adds to
-  every process it starts (for example `SystemRoot` on Windows); those
-  are not something this runner chooses to pass through.
+  ever added to it; no entry may contain a NUL character.
+- `cwd` must also be an absolute path with no NUL character.
+- `env` lists only the fixed name/value pairs the program needs (no `=`
+  or NUL in a name, no NUL in a value). Nothing else from the wrapper's
+  own environment reaches the program, except that THIS RUNNER ITSELF
+  passes through a small, fixed set of its own system defaults a program
+  needs just to start - on Windows, its own `SystemRoot` value (read
+  from the wrapper's own parent environment) if the operator's `env`
+  does not already set it. This is something the runner deliberately
+  does, not something the operating system adds automatically; it is
+  separate from whatever a child RUNTIME (for example Python's own
+  locale handling) may add to its own environment after the program has
+  already started, which this module has no part in. On Windows,
+  environment names are matched case-insensitively against this
+  default, and two operator-supplied names that differ only by case
+  (for example `SYSTEMROOT` and `SystemRoot`) are refused at
+  configuration time as ambiguous, rather than both silently reaching
+  the program.
 - `timeout_seconds` bounds the whole call - writing the request, reading
   the answer, the program's exit, and cleanup - not just the final wait.
   Default 25, at most 30.
@@ -1125,12 +1140,13 @@ not yet report on it. `doctor_line` in this module is a tested
 formatter with no caller yet - wiring a pin/health line into `agenttalk
 doctor`'s own output is separate, later work (build 6a-2b).
 
-On POSIX, the runner waits for the program's own exit but relies on its
-process group being reaped by whatever started this wrapper (an init
-that reaps background processes, such as `docker run --init`); without
-that, a program that spawns its own background children before being
-killed can leave zombies behind even though the turn itself already
-failed cleanly.
+On POSIX, the runner closes the program's whole process group on EVERY
+outcome, not only a failed one - a program that spawns its own
+background children and then exits successfully does not leave them
+running either. Reaping still relies on whatever started this wrapper
+(an init that reaps background processes, such as `docker run --init`);
+without that, a grandchild already signaled to stop can still linger as
+a zombie until something adopts and waits on it.
 
 ### Windows notes
 

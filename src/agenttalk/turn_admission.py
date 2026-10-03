@@ -62,14 +62,6 @@ PROTOCOL_VERSION = 1
 _DEFAULT_TIMEOUT_SECONDS = 25.0
 _MAX_TIMEOUT_SECONDS = 30.0
 
-#: A single small, fixed allowance reserved for cleanup (terminate + reap +
-#: join the I/O threads) once an operation is abandoned - NOT a fresh grant
-#: per step. Fix round 1, finding 4: cleanup used to open several
-#: independent 5-second waits (process wait, two thread joins), so a
-#: 1-second configured deadline could take 6+ seconds in total. All of
-#: cleanup's waits now share ONE deadline built from this constant.
-_TERMINATION_SLACK_SECONDS = 2.0
-
 #: Per-operation answer size cap, enforced WHILE READING (spec 4.3) - not a
 #: single universal cap: `pending`'s answer can legitimately hold many
 #: entries, so it gets its own, much larger, proven bound.
@@ -126,6 +118,18 @@ def _is_robust_absolute_path(path: str) -> bool:
     return os.path.isabs(path)
 
 
+def _windows_execution_target(path: str) -> str:
+    """Windows itself strips trailing dots and spaces from the final path
+    segment before deciding which file actually runs (a `CreateProcess`
+    behavior, not something this module invents) - fix round 2, finding 5.
+    A raw suffix check on the operator's literal string disagrees with
+    what the OS executes: `"helper.cmd "` and `"helper.cmd."` both still
+    run `helper.cmd`. Check the suffix of THIS normalized form, never the
+    literal configured string, so a trailing space or dot cannot smuggle a
+    refused suffix past the native-executable rule."""
+    return path.rstrip(" .")
+
+
 def _is_valid_env_entry(name: str, value: str) -> bool:
     """A name/value pair `subprocess.Popen` can actually place in a child's
     environment block without raising (fix round 1, finding 6): no '=' or
@@ -171,12 +175,17 @@ class TurnAdmissionConfig:
         command = raw.get("command")
         if not isinstance(command, str) or not command:
             raise ValueError("turn admission 'command' must be a non-empty string")
+        if "\x00" in command:
+            raise ValueError("turn admission 'command' must not contain a NUL character")
         if not _is_robust_absolute_path(command):
             raise ValueError(
                 "turn admission 'command' must be an absolute path (a drive letter or UNC "
                 "root on Windows), never searched on PATH"
             )
-        if os.name == "nt" and command.casefold().endswith(_WINDOWS_SHELL_SUFFIXES):
+        # Fix round 2, finding 5: check the NORMALIZED execution target (the
+        # suffix Windows itself will see after stripping trailing dots and
+        # spaces), never the operator's literal string.
+        if os.name == "nt" and _windows_execution_target(command).casefold().endswith(_WINDOWS_SHELL_SUFFIXES):
             raise ValueError(
                 "turn admission 'command' must be a native executable - "
                 "Windows can run .bat/.cmd through a shell even with shell=False"
@@ -184,8 +193,16 @@ class TurnAdmissionConfig:
         args_raw = raw.get("args", [])
         if not isinstance(args_raw, list) or not all(isinstance(a, str) for a in args_raw):
             raise ValueError("turn admission 'args' must be a list of strings")
+        if any("\x00" in a for a in args_raw):
+            raise ValueError("turn admission 'args' must not contain a NUL character")
         cwd = raw.get("cwd")
-        if not isinstance(cwd, str) or not cwd or not _is_robust_absolute_path(cwd):
+        if not isinstance(cwd, str) or not cwd:
+            raise ValueError(
+                "turn admission 'cwd' must be an absolute path (a drive letter or UNC root on Windows)"
+            )
+        if "\x00" in cwd:
+            raise ValueError("turn admission 'cwd' must not contain a NUL character")
+        if not _is_robust_absolute_path(cwd):
             raise ValueError(
                 "turn admission 'cwd' must be an absolute path (a drive letter or UNC root on Windows)"
             )
@@ -198,6 +215,18 @@ class TurnAdmissionConfig:
                 "turn admission 'env' has an invalid entry (a name must be non-empty, "
                 "contain no '=', and neither a name nor a value may contain a NUL)"
             )
+        if os.name == "nt":
+            # Fix round 2, finding 7: Windows environment names are
+            # case-insensitive, but a Python dict key is not - two names
+            # that collide under Windows' own rules (e.g. "SYSTEMROOT" and
+            # "SystemRoot") would both reach Popen as distinct keys,
+            # leaving it ambiguous which value actually wins.
+            casefolded_names = [name.casefold() for name in env_raw]
+            if len(casefolded_names) != len(set(casefolded_names)):
+                raise ValueError(
+                    "turn admission 'env' has two names that differ only by case "
+                    "(Windows environment names are case-insensitive)"
+                )
         timeout_raw = raw.get("timeout_seconds", _DEFAULT_TIMEOUT_SECONDS)
         if isinstance(timeout_raw, bool) or not isinstance(timeout_raw, (int, float)):
             raise ValueError("turn admission 'timeout_seconds' must be a number")
@@ -219,8 +248,15 @@ class TurnAdmissionConfig:
 
 def _build_child_env(config: TurnAdmissionConfig) -> dict[str, str]:
     env = dict(config.env)
+    # Fix round 2, finding 7: compare case-insensitively - an operator env
+    # entry that already names a system default under a different case
+    # (Windows environment names are case-insensitive; `from_mapping`
+    # already rejects two OPERATOR names colliding this way) must still be
+    # recognized here, or this function would add a second, differently
+    # cased key for the same conceptual variable.
+    existing_casefolded = {name.casefold() for name in env}
     for name, default in _SYSTEM_ENV_DEFAULTS.items():
-        if name not in env:
+        if name.casefold() not in existing_casefolded:
             env[name] = os.environ.get(name, default)
     return env
 
@@ -521,18 +557,26 @@ def _spawn(config: TurnAdmissionConfig) -> subprocess.Popen:
         return subprocess.Popen(  # nosec B603 - shell=False; command is an operator-configured absolute path, args are a fixed operator list, no task data
             [config.command, *config.args], **popen_kwargs
         )
-    except OSError:
+    except (OSError, ValueError):
+        # Fix round 2, finding 4: configuration-time validation rejects NULs
+        # in every string that reaches here, but this is defense in depth -
+        # `subprocess.Popen` itself raises a bare `ValueError` (not
+        # `OSError`) for some malformed launch strings (e.g. "embedded null
+        # character"), which must never reach a caller with its own text.
         raise TurnAdmissionFailure("not_started") from None
 
 
 def _kill_tree(proc: subprocess.Popen, close_job, cleanup_deadline: float) -> None:
     """Terminate and reap the WHOLE process tree by exact process id - a
     process group on POSIX, the Job Object on Windows (spec 4.4). Never by
-    image name. Bounded by `cleanup_deadline` (an absolute `time.monotonic()`
-    value the caller already built from the single, small, shared
-    termination slice - fix round 1, finding 4), never a fresh wait of its
-    own. Best-effort beyond this point: a process that has already exited
-    must never turn a clean failure into a crash here.
+    image name. Bounded by `cleanup_deadline` (the SAME absolute
+    `time.monotonic()` end time `_call` computed once at its own start -
+    fix round 2's structural fix - never a fresh "now plus a constant"
+    budget of its own; fix round 1, finding 4 first tried a shared budget
+    but still created it anew after each failure, which a fake clock
+    showed could still add a full extra allowance past the configured
+    timeout). Best-effort beyond this point: a process that has already
+    exited must never turn a clean failure into a crash here.
 
     POSIX container precondition (item 11): reaping an orphaned grandchild
     after its own parent is killed requires PID 1 (or another designated
@@ -553,51 +597,61 @@ def _kill_tree(proc: subprocess.Popen, close_job, cleanup_deadline: float) -> No
         proc.wait(timeout=max(0.0, cleanup_deadline - time.monotonic()))
 
 
-def _terminate_unresumed(proc: subprocess.Popen, cleanup_deadline: float) -> None:
-    """A Windows process created suspended that must never run: containment
-    (job assignment or resume) itself failed. It has executed no
-    instruction, so there is no job/group to close - a direct kill is the
-    whole of cleanup."""
-    with contextlib.suppress(OSError):
-        proc.kill()
-    with contextlib.suppress(subprocess.TimeoutExpired, OSError):
-        proc.wait(timeout=max(0.0, cleanup_deadline - time.monotonic()))
-
-
-def _call(config: TurnAdmissionConfig, op: str, request: dict) -> dict:
+def _call(config: TurnAdmissionConfig, op: str, request: dict, validate) -> dict:
     """Run one operation end to end (spec 4.4): verify the pin, spawn,
-    write the request, read the answer under its cap, apply one overall
-    deadline to all of pin verification / writing / reading / exit /
-    cleanup, and reap the whole process tree by exact pid on any failure or
-    abandonment - including cancellation, a thread that fails to start, and
-    an I/O error that would otherwise let a stray answer look successful
-    (fix round 1, findings 2 and 3: cleanup is now owned by one try/finally
-    spanning process creation through answer validation, not just the
-    timeout/overflow branches)."""
+    write the request, read the answer under its cap, validate its
+    operation-specific shape, apply one overall deadline to all of pin
+    verification / writing / reading / exit / cleanup, and reap the whole
+    process tree by exact pid on any failure or abandonment.
+
+    Fix round 2's structural fix: ONE absolute end time (`deadline`) is
+    computed here, once, before the pin check and before spawning - never
+    recomputed, and never replaced by a fresh "now plus a constant" budget
+    after a failure. Cleanup (terminate + reap + join the I/O threads)
+    draws from whatever is LEFT of this SAME `deadline`, never a budget of
+    its own - so the total of a failed call, cleanup included, can never
+    exceed the configured timeout (a fake clock proved the previous round's
+    "shared" budget still added a full fresh allowance after the operation
+    already gave up: a 0.1-second call took 2.1 seconds. Reusing one
+    deadline throughout makes that structurally impossible: whatever time
+    the operation spent is time cleanup no longer has).
+
+    `proc = _spawn(config)` is the very FIRST statement inside the owning
+    try/finally (fix round 2, finding 1): an interruption on literally the
+    next line still reaches the finally block and reaps the process,
+    where the previous round's `proc = _spawn(config)` sat BEFORE its own
+    try, leaving a window where cancellation right after spawn escaped
+    cleanup entirely. `validate` (the operation-specific answer-shape
+    check) is also called INSIDE this same try, before `success` is ever
+    set - success is decided by the full validated shape, not merely that
+    the bytes read were valid JSON, so an otherwise-well-formed answer
+    with an unexpected field still tears down the process tree."""
     if op not in OPERATIONS:
         raise ValueError(f"not a turn admission operation: {op!r}")
     deadline = time.monotonic() + config.timeout_seconds
+
     _verify_pin(config, deadline)
     payload = _dumps_compact(request)
     cap = _ANSWER_CAPS[op]
 
-    proc = _spawn(config)
     close_job = lambda: None  # noqa: E731
     writer_thread: threading.Thread | None = None
     reader_thread: threading.Thread | None = None
     success = False
+    proc: subprocess.Popen | None = None
     try:
+        proc = _spawn(config)
         if os.name == "nt":
             try:
                 _, close_job = _attach_kill_on_close_job(proc)
                 _resume_suspended_process(proc)
             except OSError:
-                _terminate_unresumed(proc, time.monotonic() + _TERMINATION_SLACK_SECONDS)
                 raise TurnAdmissionFailure("not_started") from None
 
         write_done = threading.Event()
         write_ok = threading.Event()
         read_done = threading.Event()
+        read_ok = threading.Event()
         read_overflow = threading.Event()
         output = bytearray()
 
@@ -617,6 +671,7 @@ def _call(config: TurnAdmissionConfig, op: str, request: dict) -> dict:
                 while remaining > 0:
                     chunk = proc.stdout.read(min(4096, remaining))
                     if not chunk:
+                        read_ok.set()
                         break
                     output.extend(chunk)
                     remaining -= len(chunk)
@@ -625,6 +680,11 @@ def _call(config: TurnAdmissionConfig, op: str, request: dict) -> dict:
                 if len(output) > cap:
                     read_overflow.set()
             except (OSError, ValueError):
+                # Fix round 2, finding 2: a read error at ANY point - even
+                # after a complete, legal answer already arrived - must
+                # never be silently discarded. `read_ok` is only ever set
+                # on a clean EOF above; it stays unset here, so the answer
+                # is vetoed below exactly like a failed write.
                 pass
             finally:
                 read_done.set()
@@ -663,33 +723,43 @@ def _call(config: TurnAdmissionConfig, op: str, request: dict) -> dict:
             raise TurnAdmissionFailure("timeout")
         if read_overflow.is_set():
             raise TurnAdmissionFailure("too_large")
-        # Fix round 1, finding 3: a failed write (the request was never
-        # delivered) must veto success even if the program still produced a
-        # valid-looking answer and exited zero - mapped to `not_started`
-        # ("the program did not start" generalizes to "the program never
-        # actually received a call" better than any of the other seven
-        # words; flagged in the PR for the lead to confirm or redirect).
+        # Fix round 1, finding 3 (write) and fix round 2, finding 2 (read):
+        # either half of the exchange failing must veto success even if
+        # the program still produced a valid-looking answer and exited
+        # zero - mapped to `not_started` ("the program did not start"
+        # generalizes to "the program never actually completed a call").
         if not write_ok.is_set():
+            raise TurnAdmissionFailure("not_started")
+        if not read_ok.is_set():
             raise TurnAdmissionFailure("not_started")
         if returncode != 0:
             raise TurnAdmissionFailure("exit_code")
 
         answer = _strict_loads(bytes(output))
+        validated = validate(answer)
         success = True
-        return answer
+        return validated
     finally:
-        cleanup_deadline = time.monotonic() + _TERMINATION_SLACK_SECONDS
-        if success:
-            with contextlib.suppress(OSError):
-                close_job()
-        else:
-            _kill_tree(proc, close_job, cleanup_deadline)
-        if writer_thread is not None:
-            with contextlib.suppress(RuntimeError):
-                writer_thread.join(timeout=max(0.0, cleanup_deadline - time.monotonic()))
-        if reader_thread is not None:
-            with contextlib.suppress(RuntimeError):
-                reader_thread.join(timeout=max(0.0, cleanup_deadline - time.monotonic()))
+        if proc is not None:
+            if success:
+                with contextlib.suppress(OSError):
+                    close_job()
+                if os.name != "nt":
+                    # Fix round 2 (the connector's successful-call point):
+                    # a successful call can still leave descendants behind
+                    # on POSIX, since only the root was waited on - close
+                    # the group the same way Windows closes its job, on
+                    # every outcome, not only a failed one.
+                    with contextlib.suppress(ProcessLookupError, OSError):
+                        os.killpg(proc.pid, getattr(signal, "SIGKILL", 9))
+            else:
+                _kill_tree(proc, close_job, deadline)
+            if writer_thread is not None:
+                with contextlib.suppress(RuntimeError):
+                    writer_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            if reader_thread is not None:
+                with contextlib.suppress(RuntimeError):
+                    reader_thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
 
 # --------------------------------------------------------------- public API
@@ -715,8 +785,7 @@ def admit(
         "message_id": message_id, "op": "admit", "parent_request_id": parent_request_id,
         "profile": profile, "v": PROTOCOL_VERSION,
     }
-    answer = _call(config, "admit", request)
-    return _validate_admit_answer(answer)
+    return _call(config, "admit", request, _validate_admit_answer)
 
 
 def recall(config: TurnAdmissionConfig, *, agent: str, message_id: str) -> dict:
@@ -724,8 +793,7 @@ def recall(config: TurnAdmissionConfig, *, agent: str, message_id: str) -> dict:
     agent = _validate_agent(agent)
     message_id = _validate_message_id(message_id)
     request = {"agent": agent, "message_id": message_id, "op": "recall", "v": PROTOCOL_VERSION}
-    answer = _call(config, "recall", request)
-    return _validate_recall_answer(answer)
+    return _call(config, "recall", request, _validate_recall_answer)
 
 
 def pending(config: TurnAdmissionConfig, *, agent: str, limit: int) -> dict:
@@ -734,8 +802,7 @@ def pending(config: TurnAdmissionConfig, *, agent: str, limit: int) -> dict:
     agent = _validate_agent(agent)
     limit = _validate_limit(limit)
     request = {"agent": agent, "limit": limit, "op": "pending", "v": PROTOCOL_VERSION}
-    answer = _call(config, "pending", request)
-    return _validate_pending_answer(answer, limit=limit)
+    return _call(config, "pending", request, lambda answer: _validate_pending_answer(answer, limit=limit))
 
 
 def closed(config: TurnAdmissionConfig, *, agent: str, message_id: str) -> dict:
@@ -743,8 +810,7 @@ def closed(config: TurnAdmissionConfig, *, agent: str, message_id: str) -> dict:
     agent = _validate_agent(agent)
     message_id = _validate_message_id(message_id)
     request = {"agent": agent, "message_id": message_id, "op": "closed", "v": PROTOCOL_VERSION}
-    answer = _call(config, "closed", request)
-    return _validate_closed_answer(answer)
+    return _call(config, "closed", request, _validate_closed_answer)
 
 
 def doctor_line(config: TurnAdmissionConfig | None) -> str:

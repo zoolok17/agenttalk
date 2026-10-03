@@ -20,6 +20,7 @@ deadline-tests-fix-the-order-not-the-timing).
 
 from __future__ import annotations
 
+import inspect
 import io
 import json
 import os
@@ -781,18 +782,20 @@ def test_cleanup_runs_on_cancellation_not_only_on_a_normal_failure(tmp_path):
     assert kills, "cancellation did not trigger process-group cleanup"
 
 
-def test_cleanup_wait_is_bounded_by_the_shared_slack_not_a_fresh_five_second_grant(tmp_path):
+def test_cleanup_wait_is_bounded_by_the_caller_supplied_deadline_not_a_fresh_five_second_grant(tmp_path):
     """Finding 4: `_kill_tree` used to open its own fresh 5-second
     `proc.wait()`, stacked on top of two more 5-second thread joins in the
     caller - a 1-second configured deadline could take 6+ seconds in total.
-    Every cleanup wait now shares ONE small deadline built from
-    `_TERMINATION_SLACK_SECONDS`."""
+    `_kill_tree` takes whatever absolute deadline its caller supplies and
+    never grants itself anything beyond it (fix round 2: `_call` always
+    passes its OWN single original deadline, never a fresh budget - see
+    the fake-clock test above for the end-to-end proof)."""
     waits = []
     fake = SimpleNamespace(pid=424242, kill=lambda: None, wait=lambda timeout: waits.append(timeout))
-    cleanup_deadline = time.monotonic() + ta._TERMINATION_SLACK_SECONDS
+    cleanup_deadline = time.monotonic() + 0.25
     ta._kill_tree(fake, lambda: None, cleanup_deadline)
     assert waits
-    assert waits[0] <= ta._TERMINATION_SLACK_SECONDS + 0.05
+    assert waits[0] <= 0.25 + 0.05
     assert waits[0] < 5.0
 
 
@@ -876,3 +879,312 @@ def test_failed_job_assignment_terminates_the_suspended_process(fake_program, tm
     assert exc.value.word == "not_started"
     time.sleep(0.3)
     assert not marker.exists(), "the process ran despite failed job assignment"
+
+
+# --------------------------------------------------------------- fix round 2 regressions
+
+def test_cancellation_immediately_after_spawn_still_reaps_the_process(fake_program, tmp_path):
+    """Finding 1 (fix round 2): cleanup ownership must begin with the very
+    FIRST statement inside the owning try/finally - `proc = _spawn(config)`
+    itself - not a line that ran before the try was even entered. The
+    previous round's `_call` assigned `proc` BEFORE its own try started, so
+    an interruption on the very next source line left an already-spawned
+    process alive forever, because `_call` had not yet taken ownership of
+    it. Located dynamically (not by a hardcoded line number) so this stays
+    correct if the function is edited again."""
+    source_lines, start_line = inspect.getsourcelines(ta._call)
+    target_line = None
+    for i, line in enumerate(source_lines):
+        if line.strip() == "proc = _spawn(config)":
+            target_line = start_line + i + 1
+            break
+    assert target_line is not None, "could not locate 'proc = _spawn(config)' - test needs updating"
+
+    roots = []
+    real_spawn = ta._spawn
+
+    def observing_spawn(cfg):
+        proc = real_spawn(cfg)
+        roots.append(proc)
+        return proc
+
+    fired = {"value": False}
+
+    def trace(frame, event, arg):  # noqa: ARG001
+        if (event == "line" and frame.f_code is ta._call.__code__
+                and frame.f_lineno == target_line and not fired["value"]):
+            fired["value"] = True
+            raise KeyboardInterrupt()
+        return trace
+
+    config = _config(fake_program, tmp_path, "stall_before_read", timeout_seconds=5.0)
+    try:
+        with patch.object(ta, "_spawn", observing_spawn):
+            sys.settrace(trace)
+            try:
+                with pytest.raises(KeyboardInterrupt):
+                    _admit(config)
+            finally:
+                sys.settrace(None)
+        assert fired["value"], "the trace hook never fired - test needs updating"
+        assert roots, "no process was spawned"
+        time.sleep(0.3)
+        assert roots[0].poll() is not None, (
+            "the process was left alive after cancellation immediately following spawn"
+        )
+    finally:
+        for p in roots:
+            if p.poll() is None:
+                p.kill()
+            p.wait(timeout=2)
+
+
+def test_bad_shape_answer_still_triggers_process_group_cleanup(tmp_path):
+    """Finding 1 (fix round 2): success used to be decided as soon as the
+    bytes read parsed as JSON, before the operation-specific shape check
+    ran - a syntactically valid answer with an unexpected extra field
+    raised bad_shape from the PUBLIC wrapper function, by which point
+    `_call` had already released the process group as if the call had
+    succeeded. The operation's own `validate` callback now runs INSIDE
+    `_call`'s try, before `success` is ever set."""
+    kills_count = []
+
+    class FakeProc:
+        pid = 424242
+        stdin = io.BytesIO()
+        stdout = io.BytesIO(b'{"status":"ok","v":1,"extra":true}')
+
+        def kill(self):
+            # A SUCCESSFUL call's cleanup never calls this (the root already
+            # exited and was reaped); only the FAILURE path's `_kill_tree`
+            # does. Both branches now close the POSIX process group on this
+            # host, so `kill()` is the one signal that distinguishes which
+            # branch actually ran.
+            kills_count.append(1)
+
+        def wait(self, timeout=None):
+            return 0
+
+    group_kills = []
+    fake_os = SimpleNamespace(name="posix", killpg=lambda *a: group_kills.append(a), environ=os.environ)
+    with patch.object(ta, "os", fake_os), patch.object(ta, "_spawn", return_value=FakeProc()):
+        with pytest.raises(ta.TurnAdmissionFailure) as exc:
+            ta.closed(ta.TurnAdmissionConfig(sys.executable, (), str(tmp_path), {}, 1.0),
+                     agent=AGENT, message_id=MESSAGE_ID)
+    assert exc.value.word == "bad_shape"
+    assert group_kills, "a syntactically valid but operation-invalid answer did not trigger cleanup"
+    assert kills_count, (
+        "cleanup took the SUCCESS branch (group-killed but never called proc.kill()) "
+        "for an answer that failed its own operation-specific shape check"
+    )
+
+
+def test_read_error_after_a_complete_answer_vetoes_success(tmp_path):
+    """Finding 2: the reader thread used to discard OSError/ValueError
+    silently once ANY bytes had been read - a read failure arriving right
+    after a complete, legal answer had already been buffered still
+    returned success. Read success and read failure are now tracked
+    independently, exactly like write success/failure: any read error
+    vetoes the call with not_started, even though everything read up to
+    that point was perfectly valid."""
+    entries = [{"message_id": "m" * 32, "reference": "r" * 64} for _ in range(32)]
+    entries[0]["reference"] = "r"
+    entries[1]["reference"] = "r" * 61
+    payload = json.dumps({"messages": entries, "status": "ok", "v": 1},
+                          sort_keys=True, separators=(",", ":")).encode("ascii")
+    assert len(payload) == 4096, f"probe payload drifted to {len(payload)} bytes - fix the entry sizes above"
+
+    class PrefixThenError:
+        def __init__(self):
+            self._served = False
+
+        def read(self, n):  # noqa: ARG002
+            if not self._served:
+                self._served = True
+                return payload
+            raise OSError("injected read failure after a complete legal answer")
+
+    class FakeProc:
+        pid = 424242
+        stdin = io.BytesIO()
+        stdout = PrefixThenError()
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    kills = []
+    fake_os = SimpleNamespace(name="posix", killpg=lambda *a: kills.append(a), environ=os.environ)
+    with patch.object(ta, "os", fake_os), patch.object(ta, "_spawn", return_value=FakeProc()):
+        with pytest.raises(ta.TurnAdmissionFailure) as exc:
+            ta.pending(ta.TurnAdmissionConfig(sys.executable, (), str(tmp_path), {}, 1.0),
+                      agent=AGENT, limit=64)
+    assert exc.value.word == "not_started"
+    assert kills, "a vetoed read did not trigger process-group cleanup"
+
+
+def test_a_failed_calls_total_time_including_cleanup_never_exceeds_the_configured_timeout(tmp_path):
+    """Finding 3: fix round 1's "shared" cleanup budget was still built as
+    now-plus-a-constant AFTER the operation's own deadline had already
+    passed - a fake clock proved a 0.1-second configured call could take
+    2.1 seconds in total (the operation's own 0.1-second wait, THEN a
+    fresh 2.0-second cleanup wait on top). Cleanup must draw only from
+    what is LEFT of the one original deadline, so the worst-case total can
+    never exceed the configured timeout."""
+    clock = SimpleNamespace(now=0.0)
+    waits = []
+
+    class ExpiringProc:
+        pid = 424242
+        stdin = io.BytesIO()
+        stdout = io.BytesIO(b'{"status":"ok","v":1}')
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            clock.now += timeout
+            if len(waits) == 1:
+                raise subprocess.TimeoutExpired("probe", timeout)
+            return 0
+
+    fake_time = SimpleNamespace(monotonic=lambda: clock.now)
+    fake_os = SimpleNamespace(name="posix", killpg=lambda *a: None, environ=os.environ)
+    config = ta.TurnAdmissionConfig(sys.executable, (), str(tmp_path), {}, 0.1)
+    with patch.object(ta, "time", fake_time), patch.object(ta, "os", fake_os), \
+         patch.object(ta, "_spawn", return_value=ExpiringProc()):
+        with pytest.raises(ta.TurnAdmissionFailure) as exc:
+            ta.closed(config, agent=AGENT, message_id=MESSAGE_ID)
+    assert exc.value.word == "timeout"
+    assert clock.now <= 0.1 + 1e-9, (
+        f"total elapsed (fake clock) was {clock.now}s for a 0.1s configured timeout - "
+        "cleanup granted itself extra time beyond the original deadline"
+    )
+
+
+def test_nul_in_command_is_refused_at_configuration_time(tmp_path):
+    """Finding 4: a NUL in the command path used to pass `from_mapping`
+    unchecked and raise a bare `ValueError: embedded null character` from
+    `subprocess.Popen` at launch time."""
+    with pytest.raises(ValueError, match="NUL"):
+        ta.TurnAdmissionConfig.from_mapping({
+            "command": sys.executable + "\x00", "args": [], "cwd": str(tmp_path),
+            "env": {}, "timeout_seconds": 5,
+        })
+
+
+def test_nul_in_an_argument_is_refused_at_configuration_time(tmp_path):
+    """Finding 4: the two original examples (held-reason, environment
+    entries) were fixed, but a NUL in an ordinary argument still reached
+    `subprocess.Popen` unchecked."""
+    with pytest.raises(ValueError, match="NUL"):
+        ta.TurnAdmissionConfig.from_mapping({
+            "command": sys.executable, "args": ["a\x00b"], "cwd": str(tmp_path),
+            "env": {}, "timeout_seconds": 5,
+        })
+
+
+def test_nul_in_cwd_is_refused_at_configuration_time(tmp_path):
+    """Finding 4: a NUL in the working directory string had the same gap."""
+    with pytest.raises(ValueError, match="NUL"):
+        ta.TurnAdmissionConfig.from_mapping({
+            "command": sys.executable, "args": [], "cwd": str(tmp_path) + "\x00",
+            "env": {}, "timeout_seconds": 5,
+        })
+
+
+def test_spawn_normalizes_an_unanticipated_bare_valueerror_too(fake_program, tmp_path):
+    """Finding 4, defense in depth: configuration-time validation rejects
+    every NUL this module anticipated, but `subprocess.Popen` itself can
+    still raise a bare `ValueError` for some malformed launch string (this
+    is exactly how the NUL bug first escaped: Popen's own `ValueError:
+    embedded null character`, not an `OSError`). `_spawn` must normalize
+    ANY such failure to the closed vocabulary, not just `OSError`."""
+    config = _config(fake_program, tmp_path, "admitted")
+    with patch.object(subprocess, "Popen", side_effect=ValueError("embedded null character")):
+        with pytest.raises(ta.TurnAdmissionFailure) as exc:
+            _admit(config)
+    assert exc.value.word == "not_started"
+
+
+def test_windows_execution_target_strips_trailing_dots_and_spaces():
+    """Finding 5: Windows itself strips trailing dots and spaces from the
+    final path segment before deciding which file actually runs - the
+    normalization this module's refusal check must match."""
+    assert ta._windows_execution_target("foo.cmd") == "foo.cmd"
+    assert ta._windows_execution_target("foo.cmd ") == "foo.cmd"
+    assert ta._windows_execution_target("foo.cmd.") == "foo.cmd"
+    assert ta._windows_execution_target("foo.cmd . . ") == "foo.cmd"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="trailing-space/dot normalization (finding 5) is Windows-specific")
+@pytest.mark.parametrize("trailing", [" ", "."])
+def test_windows_batch_refusal_survives_a_trailing_space_or_dot(tmp_path, trailing):
+    """Finding 5: a raw suffix check on the operator's literal string
+    disagreed with the path Windows actually executes - a real `.cmd` file
+    named with one trailing space passed configuration and then actually
+    ran. Check the suffix of the NORMALIZED execution target instead."""
+    batch = tmp_path / "program.cmd"
+    batch.write_text('@echo off\necho {"v":1,"status":"ok"}\n', encoding="ascii")
+    with pytest.raises(ValueError, match="native executable"):
+        ta.TurnAdmissionConfig.from_mapping({
+            "command": str(batch) + trailing, "args": [], "cwd": str(tmp_path),
+            "env": {}, "timeout_seconds": 5,
+        })
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows environment names are case-insensitive")
+def test_build_child_env_recognizes_a_differently_cased_system_default(tmp_path):
+    """Finding 7: Windows environment names are case-insensitive, but a
+    Python dict key comparison is not - an operator env entry already
+    naming a system default under different case (e.g. "SYSTEMROOT" vs
+    this module's own "SystemRoot") must not cause BOTH to reach the
+    child; only the operator's own entry should survive."""
+    config = ta.TurnAdmissionConfig(
+        command=sys.executable, args=(), cwd=str(tmp_path),
+        env={"SYSTEMROOT": "C:\\CustomWindows"}, timeout_seconds=5.0,
+    )
+    env = ta._build_child_env(config)
+    matches = [name for name in env if name.casefold() == "systemroot"]
+    assert matches == ["SYSTEMROOT"], env
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows environment names are case-insensitive")
+def test_conflicting_env_aliases_are_refused_at_configuration_time(tmp_path):
+    """Finding 7: two operator env names that collide only by case (e.g.
+    "FOO" and "foo") are ambiguous on Windows and must be refused at
+    configuration time, not left for the child to interpret arbitrarily."""
+    with pytest.raises(ValueError, match="case"):
+        ta.TurnAdmissionConfig.from_mapping({
+            "command": sys.executable, "args": [], "cwd": str(tmp_path),
+            "env": {"FOO": "1", "foo": "2"}, "timeout_seconds": 5,
+        })
+
+
+def test_successful_call_also_closes_the_process_group_on_posix(tmp_path):
+    """The connector's decision on the successful-call point: a successful
+    call used to only close the Windows job - nothing closed the POSIX
+    process group after success, so a program that left descendants
+    behind on a clean exit could leak them. Both platforms now close out
+    descendants on every outcome, not only a failed one."""
+    class FakeProc:
+        pid = 424242
+        stdin = io.BytesIO()
+        stdout = io.BytesIO(b'{"status":"ok","v":1}')
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    kills = []
+    fake_os = SimpleNamespace(name="posix", killpg=lambda *a: kills.append(a), environ=os.environ)
+    with patch.object(ta, "os", fake_os), patch.object(ta, "_spawn", return_value=FakeProc()):
+        result = ta.closed(ta.TurnAdmissionConfig(sys.executable, (), str(tmp_path), {}, 1.0),
+                           agent=AGENT, message_id=MESSAGE_ID)
+    assert result == {"status": "ok", "v": 1}
+    assert kills, "a successful call did not close the process group on POSIX"
