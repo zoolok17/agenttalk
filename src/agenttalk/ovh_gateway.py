@@ -48,12 +48,33 @@ TRIAL_CUTOFF_MICRO_EUR = 95_000_000
 SOFT_STOP_MICRO_EUR = 90_000_000
 EXTERNAL_CEILING_MICRO_EUR = 100_000_000
 CANARY_TOLERANCE_BPS = 1_000
-LEDGER_SCHEMA_VERSION = 2
+LEDGER_SCHEMA_VERSION = 3
+# A child-cap schema-3 ledger keeps ledger schema 2. Every writer from before quota
+# lease binding requires ledger schema 2 in both the install marker and the database
+# on each connection, so moving both to 3 fences every one of them out.
+LEDGER_LEGACY_SCHEMA_VERSION = 2
 INSTALL_MARKER_SCHEMA_VERSION = 1
-CHILD_CAP_SCHEMA_VERSION = 3
+CHILD_CAP_SCHEMA_VERSION = 4
+# Schema 3 is the child-cap schema before quota lease binding. It is still served
+# exactly as before; only the explicit install_child_cap_binding moves a ledger to 4.
+CHILD_CAP_LEGACY_SCHEMA_VERSION = 3
+# The one child-cap schema each ledger schema may hold.
+_CHILD_CAP_SCHEMA_FOR_LEDGER = {
+    LEDGER_LEGACY_SCHEMA_VERSION: CHILD_CAP_LEGACY_SCHEMA_VERSION,
+    LEDGER_SCHEMA_VERSION: CHILD_CAP_SCHEMA_VERSION,
+}
 CHILD_TURN_MAX_CALLS = 100_000
 CHILD_TURN_MAX_MICRO_EUR = 95_000_000
 CHILD_TURN_MAX_SECONDS = 86_400
+QUOTA_LEASE_BINDING = "quota_lease_v1"
+CHILD_STATES = ("open", "capped", "expired", "fenced")
+CHILD_OUTCOMES = ("completed", "cancelled", "failed", "provider_limit")
+CHILD_RECEIPT_REPORT_VERSION = 1
+RECEIPT_ENVELOPE_VERSION = 1
+RECEIPT_PAGE_MAX_LIMIT = 1_000
+RECEIPT_MAX_SEQ = 2**63 - 1
+RECEIPT_MAX_CALLS = 1_000_000
+RECEIPT_MAX_AMOUNT = 10**12
 BACKEND_PROFILE = "ovh-qwen"
 EXTERNAL_WORKER = "external-worker"
 PUBLIC_HOST = "127.0.0.1"
@@ -78,6 +99,55 @@ _CHILD_CAP_TABLES = (
     "child_capabilities",
     "child_attempts",
 )
+# Schema 4 adds the receipts (also named child_*) and the pending notes.
+_CHILD_CAP_TABLES_V4 = _CHILD_CAP_TABLES + ("child_receipts",)
+_RECEIPT_TABLES = ("child_receipts", "receipt_pending")
+_QUOTA_LEASE_REF_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_SHA256_HEX_RE = re.compile(r"^[a-f0-9]{64}$")
+_LEDGER_TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
+_CHILD_CAP_GUARDS = (
+    "child_turns_ending_frozen",
+    "child_turns_binding_immutable",
+    "child_turns_no_replace",
+    "child_turns_bound_no_delete",
+    "child_receipts_no_delete",
+    "child_receipts_no_update",
+    "child_receipts_no_replace",
+    "receipt_pending_no_delete",
+    "receipt_pending_resolve_only",
+    "receipt_pending_no_replace",
+)
+_CHILD_TURN_COLUMNS_V3 = (
+    "agent",
+    "message_id",
+    "request_id",
+    "state",
+    "max_calls",
+    "max_micro_eur",
+    "opened_at",
+    "expires_at",
+    "updated_at",
+    "reason",
+)
+_CHILD_TURN_COLUMNS_V4 = _CHILD_TURN_COLUMNS_V3 + (
+    "quota_lease_ref_sha256",
+    "terminal_outcome",
+    "terminal_at",
+    "terminal_source",
+)
+_RECEIPT_COLUMNS = (
+    "seq",
+    "agent",
+    "message_id",
+    "quota_lease_ref_sha256",
+    "outcome",
+    "calls",
+    "input_tokens",
+    "output_tokens",
+    "actual_micro_eur",
+    "closed_at",
+)
+_RECEIPT_PENDING_COLUMNS = ("agent", "message_id", "created_at", "resolved_at")
 
 
 class GatewayError(RuntimeError):
@@ -110,6 +180,24 @@ class ChildTurnCapBlocked(LedgerBlocked):
 
 class ChildTurnCapExceeded(ChildTurnCapBlocked):
     """A durable child-turn budget has reached a hard gateway ceiling."""
+
+
+class QuotaLeaseReferenceMismatch(ChildTurnCapBlocked):
+    """A bound child turn was closed with a different quota lease reference.
+
+    Permanent: the message names no reference, only the closed word."""
+
+
+class QuotaLeaseBindingRequired(LedgerHold):
+    """The binding flag is on and an open came without a quota lease reference.
+
+    A hold, not a block: the caller waits until the operator turns the flag off or
+    the open brings its admission."""
+
+
+class ReceiptPageRefused(LedgerBlocked):
+    """The receipt page cannot be given exactly: a gap, damage or a value that does
+    not fit the page's bounds. Nothing is rounded or dropped to make it fit."""
 
 
 def _ceil_cost(tokens: int, rate_micro_eur: int) -> int:
@@ -198,33 +286,56 @@ def price_policy_hash(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def child_cap_policy(*, child_turn_max_micro_eur: int = CHILD_TURN_MAX_MICRO_EUR) -> dict:
+def child_cap_policy(
+    *,
+    child_turn_max_micro_eur: int = CHILD_TURN_MAX_MICRO_EUR,
+    schema_version: int = CHILD_CAP_SCHEMA_VERSION,
+) -> dict:
     """Canonical separately-versioned child-turn admission policy.
 
     ``child_turn_max_micro_eur`` is a parameter for the same reason the three
     ``price_policy`` envelope figures are: it is chosen once per ledger (by
     default, equal to that ledger's own trial cutoff) and read back from
     metadata thereafter, never from the module default below.
+    ``schema_version`` 3 gives the policy of a ledger not yet migrated to quota
+    lease binding, unchanged, so its stored hash still verifies.
     """
-    return {
-        "schema_version": CHILD_CAP_SCHEMA_VERSION,
+    policy: dict = {
+        "schema_version": schema_version,
         "max_calls": CHILD_TURN_MAX_CALLS,
         "max_micro_eur": child_turn_max_micro_eur,
         "max_seconds": CHILD_TURN_MAX_SECONDS,
         "reservation_micro_eur": reservation_cost_micro_eur(),
     }
+    if schema_version >= 4:
+        policy["binding"] = QUOTA_LEASE_BINDING
+        policy["child_states"] = list(CHILD_STATES)
+    return policy
 
 
 def child_cap_policy_hash(
-    *, child_turn_max_micro_eur: int = CHILD_TURN_MAX_MICRO_EUR
+    *,
+    child_turn_max_micro_eur: int = CHILD_TURN_MAX_MICRO_EUR,
+    schema_version: int = CHILD_CAP_SCHEMA_VERSION,
 ) -> str:
     encoded = json.dumps(
-        child_cap_policy(child_turn_max_micro_eur=child_turn_max_micro_eur),
+        child_cap_policy(
+            child_turn_max_micro_eur=child_turn_max_micro_eur,
+            schema_version=schema_version,
+        ),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def quota_lease_ref_sha256(reference: object) -> str:
+    """The stored identity of a quota lease reference: the SHA-256 of its ASCII bytes,
+    as lowercase hex. The reference itself is never stored, logged or echoed."""
+    if not isinstance(reference, str) or not _QUOTA_LEASE_REF_RE.fullmatch(reference):
+        raise ChildTurnCapBlocked("quota lease reference is malformed")
+    return hashlib.sha256(reference.encode("ascii")).hexdigest()
 
 
 def _local_appdata() -> Path:
@@ -384,6 +495,12 @@ def _strict_json_object(path: Path) -> dict:
     if not isinstance(value, dict):
         raise LedgerBlocked(f"{path.name} must contain a JSON object")
     return value
+
+
+def _binding_migration_checkpoint(conn: sqlite3.Connection, step: str) -> None:
+    """Called after each step of the schema 3 to 4 migration (begin, copied, renamed,
+    guards, metadata, foreign_keys_on). It does nothing; tests replace it to inject
+    a fault after a step and prove the ledger stays whole."""
 
 
 @dataclass(frozen=True)
@@ -595,6 +712,8 @@ class SpendLedger:
                     ),
                     "child_turn_max_micro_eur": str(child_turn_max_micro_eur),
                     "child_cap_issuer_sha256": issuer_hash,
+                    # off until the operator's explicit binding-required --on
+                    "quota_lease_binding_required": "0",
                 }
                 conn.execute("BEGIN IMMEDIATE")
                 conn.executemany(
@@ -686,23 +805,219 @@ class SpendLedger:
         SpendLedger._create_child_cap_schema(conn)
 
     @staticmethod
-    def _create_child_cap_schema(conn: sqlite3.Connection) -> None:
-        statements = (
-            """CREATE TABLE child_turns (
+    def _create_child_turns_table(conn: sqlite3.Connection, name: str) -> None:
+        """The schema-4 child_turns table, under ``name`` (the migration builds it
+        beside the old one, then renames it)."""
+        conn.execute(
+            f"""CREATE TABLE {name} (
                 agent TEXT NOT NULL,
                 message_id TEXT NOT NULL,
                 request_id TEXT NOT NULL,
                 state TEXT NOT NULL CHECK (
-                    state IN ('open', 'capped', 'expired')
+                    state IN ('open', 'capped', 'expired', 'fenced')
                 ),
-                max_calls INTEGER NOT NULL CHECK (max_calls > 0),
-                max_micro_eur INTEGER NOT NULL CHECK (max_micro_eur > 0),
+                max_calls INTEGER NOT NULL,
+                max_micro_eur INTEGER NOT NULL,
                 opened_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 reason TEXT NOT NULL DEFAULT '',
+                quota_lease_ref_sha256 TEXT CHECK (
+                    quota_lease_ref_sha256 IS NULL OR (
+                        length(quota_lease_ref_sha256) = 64
+                        AND quota_lease_ref_sha256 NOT GLOB '*[^0-9a-f]*'
+                    )
+                ),
+                terminal_outcome TEXT CHECK (
+                    terminal_outcome IS NULL OR terminal_outcome IN (
+                        'completed', 'cancelled', 'failed', 'provider_limit'
+                    )
+                ),
+                terminal_at TEXT,
+                terminal_source TEXT CHECK (
+                    terminal_source IS NULL
+                    OR terminal_source IN ('recorded', 'legacy_fallback')
+                ),
+                CHECK (
+                    (terminal_outcome IS NULL) = (terminal_at IS NULL)
+                    AND (terminal_at IS NULL) = (terminal_source IS NULL)
+                ),
+                CHECK ((state = 'open') = (terminal_outcome IS NULL)),
+                CHECK (
+                    (
+                        state = 'fenced'
+                        AND max_calls = 0
+                        AND max_micro_eur = 0
+                        AND expires_at = opened_at
+                        AND quota_lease_ref_sha256 IS NOT NULL
+                    )
+                    OR (
+                        state != 'fenced'
+                        AND max_calls > 0
+                        AND max_micro_eur > 0
+                        AND expires_at > opened_at
+                    )
+                ),
                 PRIMARY KEY(agent, message_id)
+            ) WITHOUT ROWID"""
+        )
+
+    @staticmethod
+    def _create_child_turn_guards(conn: sqlite3.Connection) -> None:
+        """The database guards of child_turns (schema 4): an ending is written once,
+        and the binding and caps never change after open. The one exception is the
+        repair of a referenced row that has a terminal state but no recorded ending
+        (from a restored backup or a hand edit): empty to filled, with the fallback
+        source, and the state and reason left as they are."""
+        conn.execute(
+            """CREATE UNIQUE INDEX child_turns_quota_lease_ref
+            ON child_turns(quota_lease_ref_sha256)
+            WHERE quota_lease_ref_sha256 IS NOT NULL"""
+        )
+        conn.execute(
+            """CREATE TRIGGER child_turns_ending_frozen
+            BEFORE UPDATE OF state, reason, terminal_outcome, terminal_at, terminal_source
+            ON child_turns
+            WHEN OLD.state != 'open' AND NOT (
+                OLD.terminal_outcome IS NULL
+                AND OLD.terminal_at IS NULL
+                AND OLD.terminal_source IS NULL
+                AND NEW.terminal_source = 'legacy_fallback'
+                AND NEW.state = OLD.state
+                AND NEW.reason = OLD.reason
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'child turn ending is frozen');
+            END"""
+        )
+        conn.execute(
+            """CREATE TRIGGER child_turns_binding_immutable
+            BEFORE UPDATE OF agent, message_id, request_id, max_calls, max_micro_eur,
+                opened_at, expires_at, quota_lease_ref_sha256
+            ON child_turns
+            BEGIN
+                SELECT RAISE(ABORT, 'child turn binding is immutable');
+            END"""
+        )
+        # INSERT OR REPLACE deletes the conflicting row without firing a delete
+        # trigger (recursive triggers are off) and is no UPDATE, so a conflicting
+        # insert is refused before it can replace a row.
+        conn.execute(
+            """CREATE TRIGGER child_turns_no_replace
+            BEFORE INSERT ON child_turns
+            WHEN EXISTS (
+                SELECT 1 FROM child_turns
+                WHERE agent = NEW.agent AND message_id = NEW.message_id
+            ) OR (
+                NEW.quota_lease_ref_sha256 IS NOT NULL AND EXISTS (
+                    SELECT 1 FROM child_turns
+                    WHERE quota_lease_ref_sha256 = NEW.quota_lease_ref_sha256
+                )
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'a child turn is never replaced');
+            END"""
+        )
+        conn.execute(
+            """CREATE TRIGGER child_turns_bound_no_delete
+            BEFORE DELETE ON child_turns
+            WHEN OLD.quota_lease_ref_sha256 IS NOT NULL
+            BEGIN
+                SELECT RAISE(ABORT, 'a bound child turn is never deleted');
+            END"""
+        )
+
+    @staticmethod
+    def _create_receipt_tables(conn: sqlite3.Connection) -> None:
+        """Receipts and pending notes: written once, kept for the life of the ledger.
+        Nothing deletes or compacts them; a pending note only gets its resolved time."""
+        statements = (
+            """CREATE TABLE child_receipts (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                quota_lease_ref_sha256 TEXT NOT NULL CHECK (
+                    length(quota_lease_ref_sha256) = 64
+                    AND quota_lease_ref_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                outcome TEXT NOT NULL CHECK (
+                    outcome IN ('completed', 'cancelled', 'failed', 'provider_limit')
+                ),
+                calls INTEGER NOT NULL CHECK (calls >= 0),
+                input_tokens INTEGER CHECK (input_tokens IS NULL OR input_tokens >= 0),
+                output_tokens INTEGER CHECK (output_tokens IS NULL OR output_tokens >= 0),
+                actual_micro_eur INTEGER NOT NULL CHECK (actual_micro_eur >= 0),
+                closed_at TEXT NOT NULL,
+                UNIQUE(agent, message_id),
+                FOREIGN KEY(agent, message_id)
+                    REFERENCES child_turns(agent, message_id)
             )""",
+            """CREATE TABLE receipt_pending (
+                agent TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                resolved_at TEXT,
+                PRIMARY KEY(agent, message_id),
+                FOREIGN KEY(agent, message_id)
+                    REFERENCES child_turns(agent, message_id)
+            ) WITHOUT ROWID""",
+            """CREATE TRIGGER child_receipts_no_delete
+            BEFORE DELETE ON child_receipts
+            BEGIN
+                SELECT RAISE(ABORT, 'receipts are permanent');
+            END""",
+            """CREATE TRIGGER child_receipts_no_update
+            BEFORE UPDATE ON child_receipts
+            BEGIN
+                SELECT RAISE(ABORT, 'receipts are permanent');
+            END""",
+            # A replacing insert (same number or same child) is refused too: see
+            # child_turns_no_replace.
+            """CREATE TRIGGER child_receipts_no_replace
+            BEFORE INSERT ON child_receipts
+            WHEN EXISTS (
+                SELECT 1 FROM child_receipts
+                WHERE seq = NEW.seq
+                   OR (agent = NEW.agent AND message_id = NEW.message_id)
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'receipts are permanent');
+            END""",
+            """CREATE TRIGGER receipt_pending_no_delete
+            BEFORE DELETE ON receipt_pending
+            BEGIN
+                SELECT RAISE(ABORT, 'pending receipt notes are permanent');
+            END""",
+            """CREATE TRIGGER receipt_pending_resolve_only
+            BEFORE UPDATE ON receipt_pending
+            WHEN NOT (
+                OLD.resolved_at IS NULL
+                AND NEW.resolved_at IS NOT NULL
+                AND NEW.agent = OLD.agent
+                AND NEW.message_id = OLD.message_id
+                AND NEW.created_at = OLD.created_at
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'a pending receipt note only gets its resolved time');
+            END""",
+            """CREATE TRIGGER receipt_pending_no_replace
+            BEFORE INSERT ON receipt_pending
+            WHEN EXISTS (
+                SELECT 1 FROM receipt_pending
+                WHERE agent = NEW.agent AND message_id = NEW.message_id
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'pending receipt notes are permanent');
+            END""",
+        )
+        for statement in statements:
+            conn.execute(statement)
+
+    @staticmethod
+    def _create_child_cap_schema(conn: sqlite3.Connection) -> None:
+        SpendLedger._create_child_turns_table(conn, "child_turns")
+        SpendLedger._create_child_turn_guards(conn)
+        statements = (
             """CREATE TABLE child_capabilities (
                 token_sha256 TEXT PRIMARY KEY,
                 agent TEXT NOT NULL,
@@ -723,6 +1038,7 @@ class SpendLedger:
         )
         for statement in statements:
             conn.execute(statement)
+        SpendLedger._create_receipt_tables(conn)
 
     def _marker(self, *, ledger_schema_version: int | None = None) -> dict:
         state = self.installation_state()
@@ -731,17 +1047,22 @@ class SpendLedger:
         if state == "partial":
             raise LedgerBlocked("ledger installation is partial; explicit recovery is required")
         marker = _strict_json_object(self.marker_path)
-        expected = {
-            "schema_version": INSTALL_MARKER_SCHEMA_VERSION,
-            "ledger_schema_version": (
-                LEDGER_SCHEMA_VERSION
-                if ledger_schema_version is None
-                else ledger_schema_version
-            ),
-        }
-        for key, value in expected.items():
-            if marker.get(key) != value:
-                raise LedgerBlocked(f"ledger install marker {key} mismatch")
+        if marker.get("schema_version") != INSTALL_MARKER_SCHEMA_VERSION:
+            raise LedgerBlocked("ledger install marker schema_version mismatch")
+        # Without an explicit version, either supported ledger schema: 2 (child-cap
+        # schema 3, served as before) or 3 (child-cap schema 4).
+        accepted = (
+            (LEDGER_LEGACY_SCHEMA_VERSION, LEDGER_SCHEMA_VERSION)
+            if ledger_schema_version is None
+            else (ledger_schema_version,)
+        )
+        marker_ledger_version = marker.get("ledger_schema_version")
+        if (
+            not isinstance(marker_ledger_version, int)
+            or isinstance(marker_ledger_version, bool)
+            or marker_ledger_version not in accepted
+        ):
+            raise LedgerBlocked("ledger install marker ledger_schema_version mismatch")
         # price_policy_hash depends on this ledger's own chosen envelope,
         # which is not known yet at this point (the database metadata - the
         # envelope's authority - has not been opened). Validate shape here;
@@ -813,18 +1134,24 @@ class SpendLedger:
         if not integrity or integrity[0] != "ok":
             raise LedgerBlocked("ledger integrity check is not ok")
         metadata = self._metadata(conn)
+        if ledger_schema_version is None:
+            ledger_schema_version = marker["ledger_schema_version"]
         expected = {
-            "schema_version": str(
-                LEDGER_SCHEMA_VERSION
-                if ledger_schema_version is None
-                else ledger_schema_version
-            ),
+            "schema_version": str(ledger_schema_version),
             "generation": marker["generation"],
             "currency": POLICY_CURRENCY,
         }
         for key, value in expected.items():
             if metadata.get(key) != value:
                 raise LedgerBlocked(f"ledger metadata {key} mismatch")
+        paired = _CHILD_CAP_SCHEMA_FOR_LEDGER.get(ledger_schema_version)
+        child_cap_version = metadata.get("child_cap_schema_version")
+        if paired is not None and child_cap_version != str(paired) and not (
+            # as before binding: a ledger-schema-2 ledger may lack the child caps
+            ledger_schema_version == LEDGER_LEGACY_SCHEMA_VERSION
+            and child_cap_version is None
+        ):
+            raise LedgerBlocked("ledger schema and child cap schema versions do not match")
         # The envelope (trial cutoff / soft-stop / external ceiling) is
         # chosen once at init and stored here - never compared against the
         # current module defaults, which would wrongly reject a deliberately
@@ -961,15 +1288,20 @@ class SpendLedger:
         policy_value = metadata.get("child_cap_policy_hash")
         issuer_value = metadata.get("child_cap_issuer_sha256")
         tables = self._child_cap_table_names(conn)
-        expected_tables = set(_CHILD_CAP_TABLES)
+        all_child_tables = set(_CHILD_CAP_TABLES_V4)
         if (
             schema_value is None
             and policy_value is None
             and issuer_value is None
-            and not (tables & expected_tables)
+            and not (tables & all_child_tables)
+            and not self._receipt_pending_exists(conn)
         ):
             return "absent"
-        if schema_value != str(CHILD_CAP_SCHEMA_VERSION):
+        if schema_value == str(CHILD_CAP_SCHEMA_VERSION):
+            version = CHILD_CAP_SCHEMA_VERSION
+        elif schema_value == str(CHILD_CAP_LEGACY_SCHEMA_VERSION):
+            version = CHILD_CAP_LEGACY_SCHEMA_VERSION
+        else:
             raise LedgerBlocked("child cap schema version is missing or mismatched")
         # child_turn_max_micro_eur is this ledger's own pinned envelope value
         # (default: equal to its trial cutoff) - never the live module
@@ -979,28 +1311,124 @@ class SpendLedger:
             metadata, "child_turn_max_micro_eur"
         )
         if policy_value != child_cap_policy_hash(
-            child_turn_max_micro_eur=child_turn_max_micro_eur
+            child_turn_max_micro_eur=child_turn_max_micro_eur,
+            schema_version=version,
         ):
             raise LedgerBlocked("child cap policy hash is missing or mismatched")
         if not isinstance(issuer_value, str) or not re.fullmatch(
             r"[a-f0-9]{64}", issuer_value
         ):
             raise LedgerBlocked("child cap issuer authority is missing or invalid")
-        if not expected_tables <= tables:
+        if version == CHILD_CAP_LEGACY_SCHEMA_VERSION:
+            # Exactly the schema-3 checks; receipt tables on a schema-3 ledger are
+            # a half-done migration, never a valid shape.
+            if not set(_CHILD_CAP_TABLES) <= tables:
+                raise LedgerBlocked("child cap schema is partial")
+            if "child_receipts" in tables or self._receipt_pending_exists(conn):
+                raise LedgerBlocked("child cap schema is partial")
+            self._check_child_cap_v3_rows(conn, child_turn_max_micro_eur)
+            return "ready"
+        if not all_child_tables <= tables or not self._receipt_pending_exists(conn):
             raise LedgerBlocked("child cap schema is partial")
+        self._check_child_cap_v4(conn, metadata, child_turn_max_micro_eur)
+        return "ready"
+
+    @staticmethod
+    def _receipt_pending_exists(conn: sqlite3.Connection) -> bool:
+        return conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='receipt_pending'"
+        ).fetchone() is not None
+
+    @staticmethod
+    def _child_cap_version(metadata: Mapping[str, str]) -> int:
+        """3 or 4, for a ledger whose child-cap feature state is ``ready``."""
+        if metadata.get("child_cap_schema_version") == str(CHILD_CAP_SCHEMA_VERSION):
+            return CHILD_CAP_SCHEMA_VERSION
+        return CHILD_CAP_LEGACY_SCHEMA_VERSION
+
+    @staticmethod
+    def _table_columns(conn: sqlite3.Connection, table: str) -> tuple[str, ...]:
+        return tuple(str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})"))
+
+    @staticmethod
+    def _binding_required_flag(metadata: Mapping[str, str]) -> bool:
+        """The stored binding flag. Anything but "0" or "1" is malformed, never off."""
+        value = metadata.get("quota_lease_binding_required")
+        if value == "0":
+            return False
+        if value == "1":
+            return True
+        raise LedgerBlocked("quota lease binding flag is missing or malformed")
+
+    def _check_child_cap_v4(
+        self,
+        conn: sqlite3.Connection,
+        metadata: Mapping[str, str],
+        child_turn_max_micro_eur: int,
+    ) -> None:
+        """Schema 4: the new columns, the guards, the flag, and per-row caps that
+        are never above the ledger ceilings (zero only for a fenced row)."""
+        self._binding_required_flag(metadata)
         expected_columns = {
-            "child_turns": (
-                "agent",
-                "message_id",
-                "request_id",
-                "state",
-                "max_calls",
-                "max_micro_eur",
-                "opened_at",
-                "expires_at",
-                "updated_at",
-                "reason",
-            ),
+            "child_turns": _CHILD_TURN_COLUMNS_V4,
+            "child_capabilities": ("token_sha256", "agent", "message_id", "issued_at"),
+            "child_attempts": ("attempt_id", "agent", "message_id", "ordinal"),
+            "child_receipts": _RECEIPT_COLUMNS,
+            "receipt_pending": _RECEIPT_PENDING_COLUMNS,
+        }
+        for table, expected in expected_columns.items():
+            if self._table_columns(conn, table) != expected:
+                raise LedgerBlocked(f"child cap table {table} has an unexpected shape")
+        guards = {
+            str(row[0])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'")
+        }
+        indexes = {
+            str(row[0])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
+        }
+        if not set(_CHILD_CAP_GUARDS) <= guards or "child_turns_quota_lease_ref" not in indexes:
+            raise LedgerBlocked("child cap guards are missing")
+        invalid_turn = conn.execute(
+            """
+            SELECT 1 FROM child_turns
+            WHERE state NOT IN ('open', 'capped', 'expired', 'fenced')
+               OR (state = 'fenced' AND (max_calls != 0 OR max_micro_eur != 0))
+               OR (state != 'fenced' AND (
+                    max_calls <= 0 OR max_calls > ?
+                    OR max_micro_eur <= 0 OR max_micro_eur > ?
+               ))
+            LIMIT 1
+            """,
+            (CHILD_TURN_MAX_CALLS, child_turn_max_micro_eur),
+        ).fetchone()
+        if invalid_turn is not None:
+            raise LedgerBlocked("child cap turn policy binding is invalid")
+        for row in conn.execute(
+            "SELECT state, opened_at, expires_at, updated_at, terminal_at FROM child_turns"
+        ):
+            opened = _parse_utc(row["opened_at"])
+            expires = _parse_utc(row["expires_at"])
+            _parse_utc(row["updated_at"])
+            if row["terminal_at"] is not None:
+                _parse_utc(row["terminal_at"])
+            window = expires - opened
+            if row["state"] == "fenced":
+                if window != timedelta(0):
+                    raise LedgerBlocked("child cap turn expiry binding is invalid")
+            elif not timedelta(0) < window <= timedelta(seconds=CHILD_TURN_MAX_SECONDS):
+                raise LedgerBlocked("child cap turn expiry binding is invalid")
+        for row in conn.execute("SELECT token_sha256, issued_at FROM child_capabilities"):
+            if not _SHA256_HEX_RE.fullmatch(str(row["token_sha256"])):
+                raise LedgerBlocked("child cap capability hash is invalid")
+            _parse_utc(row["issued_at"])
+
+    def _check_child_cap_v3_rows(
+        self, conn: sqlite3.Connection, child_turn_max_micro_eur: int
+    ) -> None:
+        """Schema 3, unchanged: fixed caps and exactly 24 hours per row."""
+        expected_columns = {
+            "child_turns": _CHILD_TURN_COLUMNS_V3,
             "child_capabilities": (
                 "token_sha256",
                 "agent",
@@ -1045,7 +1473,6 @@ class SpendLedger:
             if not re.fullmatch(r"[a-f0-9]{64}", str(row["token_sha256"])):
                 raise LedgerBlocked("child cap capability hash is invalid")
             _parse_utc(row["issued_at"])
-        return "ready"
 
     def install_child_caps(self, *, issuer_token: str | None = None) -> dict:
         """Migrate a v1 ledger to the downgrade-fenced child-cap schema."""
@@ -1056,7 +1483,7 @@ class SpendLedger:
             )
         raw_marker = _strict_json_object(self.marker_path)
         marker_version = raw_marker.get("ledger_schema_version")
-        if marker_version == LEDGER_SCHEMA_VERSION:
+        if marker_version in (LEDGER_LEGACY_SCHEMA_VERSION, LEDGER_SCHEMA_VERSION):
             with self._connect() as conn:
                 metadata = self._verify_metadata(conn, self._marker())
                 if self._child_cap_feature_state(conn, metadata) != "ready":
@@ -1071,7 +1498,7 @@ class SpendLedger:
                     )
             return {
                 "installed": False,
-                "schema_version": CHILD_CAP_SCHEMA_VERSION,
+                "schema_version": self._child_cap_version(metadata),
                 "policy_hash": metadata["child_cap_policy_hash"],
             }
         if marker_version != 1:
@@ -1091,6 +1518,8 @@ class SpendLedger:
         except sqlite3.Error as exc:
             raise LedgerBlocked("ledger database cannot be opened") from exc
         conn.row_factory = sqlite3.Row
+        # The ledger schema the marker is moved to once the database is committed.
+        target_version = LEDGER_SCHEMA_VERSION
         try:
             self._configure(conn)
             conn.execute(
@@ -1146,6 +1575,7 @@ class SpendLedger:
                                 ),
                             ),
                             ("child_cap_issuer_sha256", issuer_hash),
+                            ("quota_lease_binding_required", "0"),
                         ]
                         if existing_child_turn_max is None:
                             metadata_rows.append((
@@ -1181,6 +1611,23 @@ class SpendLedger:
                         raise ChildTurnCapBlocked(
                             "child turn issuer credential is invalid"
                         )
+                elif database_version == str(LEDGER_LEGACY_SCHEMA_VERSION):
+                    # The same pair left by the code before binding: finish its
+                    # marker projection exactly as that code would.
+                    metadata = self._verify_metadata(
+                        conn, marker, ledger_schema_version=LEDGER_LEGACY_SCHEMA_VERSION
+                    )
+                    if self._child_cap_feature_state(conn, metadata) != "ready":
+                        raise LedgerBlocked(
+                            "migrated ledger is missing the child cap feature"
+                        )
+                    if not hmac.compare_digest(
+                        metadata["child_cap_issuer_sha256"], issuer_hash
+                    ):
+                        raise ChildTurnCapBlocked(
+                            "child turn issuer credential is invalid"
+                        )
+                    target_version = LEDGER_LEGACY_SCHEMA_VERSION
                 else:
                     raise LedgerBlocked(
                         "ledger schema cannot be migrated to the child cap feature"
@@ -1195,7 +1642,7 @@ class SpendLedger:
             conn.close()
 
         migrated_marker = dict(marker)
-        migrated_marker["ledger_schema_version"] = LEDGER_SCHEMA_VERSION
+        migrated_marker["ledger_schema_version"] = target_version
         _durable_write_json(self.marker_path, migrated_marker)
         # Re-verify fresh rather than reusing the in-memory `metadata` snapshot
         # above: in the "absent" branch that snapshot predates the very INSERT
@@ -1204,9 +1651,183 @@ class SpendLedger:
             final_metadata = self._verify_metadata(conn, self._marker())
         return {
             "installed": True,
-            "schema_version": CHILD_CAP_SCHEMA_VERSION,
+            "schema_version": self._child_cap_version(final_metadata),
             "policy_hash": final_metadata["child_cap_policy_hash"],
         }
+
+    def install_child_cap_binding(
+        self,
+        *,
+        issuer_token: str | None = None,
+        now: datetime | None = None,
+    ) -> dict:
+        """Migrate a child-cap schema-3 ledger to schema 4 (quota lease binding).
+
+        Explicit only: the operator's ``gateway binding-install`` is its one caller.
+        Everything is checked before anything changes, and all of it happens in one
+        transaction, so any refusal or fault leaves schema 3 exactly as it was. It
+        refuses while any provider attempt is unresolved and after a clock rollback.
+        History is kept: every row, cap, reason and time is copied; an open row
+        keeps empty endings, and an expired or capped row gets the stated fallback
+        ending. The binding flag starts off. A second run changes nothing.
+        """
+        issuer_hash = self._child_cap_issuer_hash(issuer_token)
+        current = (now or self.now()).astimezone(timezone.utc)
+        marker = self._marker()
+        installed = False
+        if marker["ledger_schema_version"] == LEDGER_LEGACY_SCHEMA_VERSION:
+            # The database commits first; the install marker follows. In between,
+            # code from before binding sees database schema 3 and this code sees
+            # marker schema 2, so both refuse; a second run finishes the marker.
+            installed = self._install_child_cap_binding_database(marker, issuer_hash, current)
+            migrated_marker = dict(marker)
+            migrated_marker["ledger_schema_version"] = LEDGER_SCHEMA_VERSION
+            _durable_write_json(self.marker_path, migrated_marker)
+        with self._connect() as conn:
+            final = self._verify_metadata(conn, self._marker())
+            self._check_child_cap_issuer(final, issuer_hash)
+            if (
+                self._child_cap_feature_state(conn, final) != "ready"
+                or self._child_cap_version(final) != CHILD_CAP_SCHEMA_VERSION
+            ):
+                raise LedgerBlocked("binding install did not reach child cap schema 4")
+            required = self._binding_required_flag(final)
+        return {
+            "installed": installed,
+            "schema_version": CHILD_CAP_SCHEMA_VERSION,
+            "policy_hash": final["child_cap_policy_hash"],
+            "quota_lease_binding_required": required,
+        }
+
+    def _install_child_cap_binding_database(
+        self, marker: dict, issuer_hash: str, current: datetime
+    ) -> bool:
+        """The database half of install_child_cap_binding, in one transaction.
+        Returns True when it migrated, or when it found the database already
+        migrated by a run whose marker projection did not finish."""
+        try:
+            conn = sqlite3.connect(
+                f"{self.db_path.as_uri()}?mode=rw",
+                uri=True,
+                timeout=self.busy_timeout_seconds,
+            )
+        except sqlite3.Error as exc:
+            raise LedgerBlocked("ledger database cannot be opened") from exc
+        conn.row_factory = sqlite3.Row
+        try:
+            self._configure(conn)
+            conn.execute(f"PRAGMA busy_timeout={int(self.busy_timeout_seconds * 1000)}")
+            # PRAGMA foreign_keys has no effect inside a transaction: off before BEGIN.
+            conn.execute("PRAGMA foreign_keys=OFF")
+            self._begin(conn)
+            try:
+                _binding_migration_checkpoint(conn, "begin")
+                database_version = self._metadata(conn).get("schema_version")
+                if database_version == str(LEDGER_LEGACY_SCHEMA_VERSION):
+                    metadata = self._verify_metadata(conn, marker)
+                    if self._child_cap_feature_state(conn, metadata) != "ready":
+                        raise LedgerBlocked("child cap feature is not installed")
+                    self._check_child_cap_issuer(metadata, issuer_hash)
+                    if self._unresolved(conn):
+                        raise LedgerHold(
+                            "binding install requires all provider attempts resolved"
+                        )
+                    self._validate_ledger_clock_rollback(metadata, current)
+                    self._validate_child_cap_clock(conn, current)
+                    self._migrate_child_cap_v3_to_v4(conn, metadata)
+                    self._commit(conn)
+                elif database_version == str(LEDGER_SCHEMA_VERSION):
+                    metadata = self._verify_metadata(
+                        conn, marker, ledger_schema_version=LEDGER_SCHEMA_VERSION
+                    )
+                    if self._child_cap_feature_state(conn, metadata) != "ready":
+                        raise LedgerBlocked("child cap feature is not installed")
+                    self._check_child_cap_issuer(metadata, issuer_hash)
+                    self._rollback(conn)
+                else:
+                    raise LedgerBlocked("ledger schema cannot be migrated to quota lease binding")
+            except Exception:
+                self._rollback(conn)
+                raise
+            conn.execute("PRAGMA foreign_keys=ON")
+            _binding_migration_checkpoint(conn, "foreign_keys_on")
+        except sqlite3.Error as exc:
+            raise LedgerBlocked("ledger database operation failed") from exc
+        finally:
+            conn.close()
+        return True
+
+    @staticmethod
+    def _check_child_cap_issuer(metadata: Mapping[str, str], issuer_hash: str) -> None:
+        if not hmac.compare_digest(metadata["child_cap_issuer_sha256"], issuer_hash):
+            raise ChildTurnCapBlocked("child turn issuer credential is invalid")
+
+    @staticmethod
+    def _validate_ledger_clock_rollback(metadata: Mapping[str, str], current: datetime) -> None:
+        """Refuse a clock behind the ledger's own accounting clock: its
+        initialization and its last accepted admission. The child rows alone are not
+        enough, because a ledger can have none."""
+        for key in ("initialized_at", "last_accepted_utc"):
+            if current < _parse_utc(metadata[key]):
+                raise LedgerHold("clock rollback detected; explicit reconciliation is required")
+
+    def _migrate_child_cap_v3_to_v4(
+        self, conn: sqlite3.Connection, metadata: Mapping[str, str]
+    ) -> None:
+        """Rebuild child_turns in SQLite's documented order (new table, copy, drop,
+        rename, then indexes and triggers), add the receipt tables, check every
+        foreign key, then write the new version and policy hash. Foreign keys are
+        off for the whole transaction (set by the caller before BEGIN)."""
+        self._create_child_turns_table(conn, "child_turns_v4")
+        conn.execute(
+            """
+            INSERT INTO child_turns_v4(
+                agent, message_id, request_id, state, max_calls, max_micro_eur,
+                opened_at, expires_at, updated_at, reason, quota_lease_ref_sha256,
+                terminal_outcome, terminal_at, terminal_source
+            )
+            SELECT agent, message_id, request_id, state, max_calls, max_micro_eur,
+                   opened_at, expires_at, updated_at, reason, NULL,
+                   CASE state WHEN 'expired' THEN 'cancelled'
+                              WHEN 'capped' THEN 'failed' END,
+                   CASE WHEN state = 'open' THEN NULL ELSE updated_at END,
+                   CASE WHEN state = 'open' THEN NULL ELSE 'legacy_fallback' END
+            FROM child_turns
+            """
+        )
+        old_count = conn.execute("SELECT COUNT(*) FROM child_turns").fetchone()[0]
+        new_count = conn.execute("SELECT COUNT(*) FROM child_turns_v4").fetchone()[0]
+        if old_count != new_count:
+            raise LedgerBlocked("binding install could not copy every child turn")
+        _binding_migration_checkpoint(conn, "copied")
+        conn.execute("DROP TABLE child_turns")
+        conn.execute("ALTER TABLE child_turns_v4 RENAME TO child_turns")
+        _binding_migration_checkpoint(conn, "renamed")
+        self._create_child_turn_guards(conn)
+        self._create_receipt_tables(conn)
+        _binding_migration_checkpoint(conn, "guards")
+        if conn.execute("PRAGMA foreign_key_check").fetchall():
+            raise LedgerBlocked("binding install found a broken foreign key")
+        child_turn_max_micro_eur = self._parse_envelope_int(
+            metadata, "child_turn_max_micro_eur"
+        )
+        conn.execute(
+            "UPDATE metadata SET value=? WHERE key='child_cap_schema_version'",
+            (str(CHILD_CAP_SCHEMA_VERSION),),
+        )
+        conn.execute(
+            "UPDATE metadata SET value=? WHERE key='child_cap_policy_hash'",
+            (child_cap_policy_hash(child_turn_max_micro_eur=child_turn_max_micro_eur),),
+        )
+        conn.execute(
+            "INSERT INTO metadata(key, value) VALUES ('quota_lease_binding_required', '0')"
+        )
+        # The fence: every writer from before binding requires ledger schema 2.
+        conn.execute(
+            "UPDATE metadata SET value=? WHERE key='schema_version'",
+            (str(LEDGER_SCHEMA_VERSION),),
+        )
+        _binding_migration_checkpoint(conn, "metadata")
 
     @staticmethod
     def _begin(conn: sqlite3.Connection) -> None:
@@ -1280,6 +1901,198 @@ class SpendLedger:
                 (timestamp, child["agent"], child["message_id"]),
             )
 
+    # --- schema 4: every child-turn ending goes through one path ---------------------
+
+    @staticmethod
+    def _freeze_terminal(
+        conn: sqlite3.Connection,
+        agent: str,
+        message_id: str,
+        *,
+        state: str,
+        reason: str,
+        outcome: str,
+        at: str,
+        updated_at: str,
+    ) -> bool:
+        """(a) Keep the first ending. An open row gets its terminal state, reason and
+        the three ending columns (source ``recorded``); a row that already ended gets
+        nothing at all. True when this call wrote the ending."""
+        if outcome not in CHILD_OUTCOMES:
+            raise ValueError("child turn outcome is not a closed word")
+        cursor = conn.execute(
+            """
+            UPDATE child_turns
+            SET state=?, reason=?, updated_at=?, terminal_outcome=?, terminal_at=?,
+                terminal_source='recorded'
+            WHERE agent=? AND message_id=? AND state='open'
+            """,
+            (state, reason, updated_at, outcome, at, agent, message_id),
+        )
+        return cursor.rowcount == 1
+
+    def _ensure_custody(
+        self, conn: sqlite3.Connection, agent: str, message_id: str, *, at: str
+    ) -> str:
+        """(b) Make sure an ended, referenced child turn has its receipt or a pending
+        note. Idempotent; runs even when (a) wrote nothing. Returns one word:
+        ``unbound`` or ``open`` (nothing to do), ``receipt_exists``, ``pending``
+        (an attempt of this child is still unresolved; it keeps its liability), or
+        ``receipt_written`` (the receipt and the resolved note, in this transaction)."""
+        row = conn.execute(
+            """
+            SELECT state, reason, quota_lease_ref_sha256, terminal_outcome, terminal_at
+            FROM child_turns WHERE agent=? AND message_id=?
+            """,
+            (agent, message_id),
+        ).fetchone()
+        if row is None or row["quota_lease_ref_sha256"] is None:
+            return "unbound"
+        if row["state"] == "open":
+            return "open"
+        if conn.execute(
+            "SELECT 1 FROM child_receipts WHERE agent=? AND message_id=?",
+            (agent, message_id),
+        ).fetchone() is not None:
+            return "receipt_exists"
+        if row["terminal_outcome"] is None:
+            row = self._repair_missing_ending(conn, agent, message_id)
+        totals = self._child_receipt_totals(conn, agent, message_id)
+        if totals is None:
+            if conn.execute(
+                "SELECT 1 FROM receipt_pending WHERE agent=? AND message_id=?",
+                (agent, message_id),
+            ).fetchone() is None:
+                conn.execute(
+                    "INSERT INTO receipt_pending(agent, message_id, created_at) VALUES (?, ?, ?)",
+                    (agent, message_id, at),
+                )
+            return "pending"
+        calls, input_tokens, output_tokens, actual_micro_eur = totals
+        # The next number is taken under the writer lock: no gap, no reuse.
+        seq = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM child_receipts").fetchone()[0]
+        conn.execute(
+            """
+            INSERT INTO child_receipts(
+                seq, agent, message_id, quota_lease_ref_sha256, outcome, calls,
+                input_tokens, output_tokens, actual_micro_eur, closed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                seq,
+                agent,
+                message_id,
+                row["quota_lease_ref_sha256"],
+                row["terminal_outcome"],
+                calls,
+                input_tokens,
+                output_tokens,
+                actual_micro_eur,
+                row["terminal_at"],
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE receipt_pending SET resolved_at=?
+            WHERE agent=? AND message_id=? AND resolved_at IS NULL
+            """,
+            (at, agent, message_id),
+        )
+        return "receipt_written"
+
+    @staticmethod
+    def _repair_missing_ending(
+        conn: sqlite3.Connection, agent: str, message_id: str
+    ) -> sqlite3.Row:
+        """A referenced row that ended without a recorded ending (only a restored
+        backup or a hand edit makes one) gets the stated fallback: ``expired`` means
+        cancelled, ``capped`` means failed, at the row's own last update, with the
+        source ``legacy_fallback``. State and reason stay; a recorded value is never
+        changed (the database guard allows only empty to filled here)."""
+        conn.execute(
+            """
+            UPDATE child_turns
+            SET terminal_outcome = CASE state WHEN 'capped' THEN 'failed' ELSE 'cancelled' END,
+                terminal_at = updated_at,
+                terminal_source = 'legacy_fallback'
+            WHERE agent=? AND message_id=? AND state != 'open'
+              AND terminal_outcome IS NULL AND terminal_at IS NULL AND terminal_source IS NULL
+            """,
+            (agent, message_id),
+        )
+        return conn.execute(
+            """
+            SELECT state, reason, quota_lease_ref_sha256, terminal_outcome, terminal_at
+            FROM child_turns WHERE agent=? AND message_id=?
+            """,
+            (agent, message_id),
+        ).fetchone()
+
+    @staticmethod
+    def _child_receipt_totals(
+        conn: sqlite3.Connection, agent: str, message_id: str
+    ) -> tuple[int, int | None, int | None, int] | None:
+        """The receipt's totals over this child's attempts, or None while any attempt
+        is unresolved. An attempt reconciled ``no-send`` is not a call and adds
+        nothing. A token total is None when any counted attempt never recorded its
+        usage; the money is always known once every attempt is resolved."""
+        rows = list(
+            conn.execute(
+                """
+                SELECT attempt.state, attempt.input_tokens, attempt.output_tokens,
+                       attempt.actual_micro_eur,
+                       (SELECT outcome FROM reconciliations AS rec
+                        WHERE rec.attempt_id = attempt.attempt_id
+                        ORDER BY rec.id DESC LIMIT 1) AS reconcile_outcome
+                FROM child_attempts AS child
+                JOIN attempts AS attempt ON attempt.attempt_id = child.attempt_id
+                WHERE child.agent=? AND child.message_id=?
+                ORDER BY child.ordinal
+                """,
+                (agent, message_id),
+            )
+        )
+        if any(row["state"] in _UNRESOLVED_ATTEMPT_STATES for row in rows):
+            return None
+        calls = 0
+        actual_micro_eur = 0
+        inputs: list[int | None] = []
+        outputs: list[int | None] = []
+        for row in rows:
+            if row["state"] == "reconciled":
+                if row["reconcile_outcome"] not in ("no-send", "charge-reserve"):
+                    raise LedgerBlocked("a reconciled child attempt has no reconciliation record")
+                if row["reconcile_outcome"] == "no-send":
+                    continue
+            elif row["state"] != "settled":
+                raise LedgerBlocked("a child attempt has an unknown state")
+            if row["actual_micro_eur"] is None:
+                raise LedgerBlocked("a resolved child attempt has no recorded charge")
+            calls += 1
+            actual_micro_eur += int(row["actual_micro_eur"])
+            inputs.append(row["input_tokens"])
+            outputs.append(row["output_tokens"])
+        input_tokens = None if any(v is None for v in inputs) else sum(int(v) for v in inputs)
+        output_tokens = None if any(v is None for v in outputs) else sum(int(v) for v in outputs)
+        return calls, input_tokens, output_tokens, actual_micro_eur
+
+    def _custody_for_attempt(
+        self, conn: sqlite3.Connection, attempt_id: str, *, at: str
+    ) -> None:
+        """The resolving step after settle and reconcile: (b) for the child that owns
+        the attempt, on a schema-4 ledger."""
+        version = conn.execute(
+            "SELECT value FROM metadata WHERE key='child_cap_schema_version'"
+        ).fetchone()
+        if version is None or version[0] != str(CHILD_CAP_SCHEMA_VERSION):
+            return
+        child = conn.execute(
+            "SELECT agent, message_id FROM child_attempts WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        if child is not None:
+            self._ensure_custody(conn, child["agent"], child["message_id"], at=at)
+
     @staticmethod
     def _validate_attempt_id(attempt_id: str) -> None:
         if not isinstance(attempt_id, str) or not _ATTEMPT_ID_RE.fullmatch(attempt_id):
@@ -1326,6 +2139,94 @@ class SpendLedger:
                     "front token does not match the child turn issuer authority"
                 )
 
+    @staticmethod
+    def _binding_request(
+        quota_lease_ref: object,
+        max_calls: object,
+        max_micro_eur: object,
+        ttl_seconds: object,
+    ) -> dict | None:
+        """The binding keywords of an open, checked for shape (the ceilings need the
+        ledger), or None when none was given: then the open is today's call."""
+        if (
+            quota_lease_ref is None
+            and max_calls is None
+            and max_micro_eur is None
+            and ttl_seconds is None
+        ):
+            return None
+        if quota_lease_ref is None:
+            raise ChildTurnCapBlocked("per-row caps need a quota lease reference")
+        ref_sha256 = quota_lease_ref_sha256(quota_lease_ref)
+        for name, value in (
+            ("max_calls", max_calls),
+            ("max_micro_eur", max_micro_eur),
+            ("ttl_seconds", ttl_seconds),
+        ):
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            ):
+                raise ChildTurnCapBlocked(f"{name} must be a positive integer")
+        return {
+            "ref_sha256": ref_sha256,
+            "max_calls": max_calls,
+            "max_micro_eur": max_micro_eur,
+            "ttl_seconds": ttl_seconds,
+        }
+
+    @staticmethod
+    def _effective_binding(binding: dict, child_turn_max_micro_eur: int) -> dict:
+        """The caps a binding stores. A null cap means the ledger ceiling and a
+        missing ttl 24 hours; a value above a ceiling is refused, never lowered."""
+        max_calls = CHILD_TURN_MAX_CALLS if binding["max_calls"] is None else binding["max_calls"]
+        max_micro_eur = (
+            child_turn_max_micro_eur
+            if binding["max_micro_eur"] is None
+            else binding["max_micro_eur"]
+        )
+        ttl_seconds = (
+            CHILD_TURN_MAX_SECONDS if binding["ttl_seconds"] is None else binding["ttl_seconds"]
+        )
+        if max_calls > CHILD_TURN_MAX_CALLS:
+            raise ChildTurnCapBlocked("max_calls is above the ledger ceiling")
+        if max_micro_eur > child_turn_max_micro_eur:
+            raise ChildTurnCapBlocked("max_micro_eur is above the ledger ceiling")
+        if ttl_seconds > CHILD_TURN_MAX_SECONDS:
+            raise ChildTurnCapBlocked("ttl_seconds is above the ledger ceiling")
+        return {
+            "ref_sha256": binding["ref_sha256"],
+            "max_calls": max_calls,
+            "max_micro_eur": max_micro_eur,
+            "ttl_seconds": ttl_seconds,
+        }
+
+    @staticmethod
+    def _check_retry_binding(row: sqlite3.Row, effective: dict | None) -> None:
+        """A retry brings exactly the binding its row was opened with: a bound row
+        refuses an open without it (never a quiet fall back to the defaults), and an
+        unbound row refuses a reference (a row is never rebound)."""
+        bound = row["quota_lease_ref_sha256"]
+        if bound is None:
+            if effective is not None:
+                raise ChildTurnCapBlocked(
+                    "a quota lease reference cannot bind an already opened unbound child turn"
+                )
+            return
+        if effective is None:
+            raise ChildTurnCapBlocked(
+                "a bound child turn must present its quota lease binding on every open"
+            )
+        window = _parse_utc(row["expires_at"]) - _parse_utc(row["opened_at"])
+        if not (
+            hmac.compare_digest(bound, effective["ref_sha256"])
+            and int(row["max_calls"]) == effective["max_calls"]
+            and int(row["max_micro_eur"]) == effective["max_micro_eur"]
+            and window == timedelta(seconds=effective["ttl_seconds"])
+        ):
+            raise ChildTurnCapBlocked(
+                "child turn quota lease binding changed for an immutable message"
+            )
+
     def open_child_turn(
         self,
         *,
@@ -1334,8 +2235,20 @@ class SpendLedger:
         request_id: str = "",
         issuer_token: str | None = None,
         now: datetime | None = None,
+        quota_lease_ref: str | None = None,
+        max_calls: int | None = None,
+        max_micro_eur: int | None = None,
+        ttl_seconds: int | None = None,
     ) -> ChildTurnCredential:
-        """Issue an opaque capability bound to one durable wrapper message."""
+        """Issue an opaque capability bound to one durable wrapper message.
+
+        Without the binding keywords this is exactly the call it has always been: no
+        quota lease reference, the ledger's caps and 24 hours. On a child-cap schema-4
+        ledger, ``quota_lease_ref`` binds the turn to one turn admission with per-row
+        caps (a null cap means the ledger ceiling, a missing ``ttl_seconds`` 24 hours).
+        A cap above a ceiling is refused, a retry must bring the same binding, and
+        the binding flag, rechecked here under the writer lock, refuses an unbound
+        open while it is on."""
         agent = self._validate_child_scope(agent, name="agent", limit=128)
         message_id = self._validate_child_scope(
             message_id, name="message_id", limit=256
@@ -1346,6 +2259,7 @@ class SpendLedger:
             )
         elif not isinstance(request_id, str):
             raise ValueError("request_id must be a string")
+        binding = self._binding_request(quota_lease_ref, max_calls, max_micro_eur, ttl_seconds)
         current = (now or self.now()).astimezone(timezone.utc)
         issuer_hash = self._child_cap_issuer_hash(issuer_token)
         timestamp = _iso_utc(current)
@@ -1363,6 +2277,11 @@ class SpendLedger:
                     metadata["child_cap_issuer_sha256"], issuer_hash
                 ):
                     raise ChildTurnCapBlocked("child turn issuer credential is invalid")
+                version = self._child_cap_version(metadata)
+                if binding is not None and version != CHILD_CAP_SCHEMA_VERSION:
+                    raise ChildTurnCapBlocked(
+                        "quota lease binding is not installed on this ledger"
+                    )
                 self._validate_child_cap_clock(conn, current)
                 self._validate_clock(metadata, current)
                 # Refuse to MINT a turn while transport is held (durable accounting hold, or
@@ -1384,11 +2303,33 @@ class SpendLedger:
                 child_turn_max_micro_eur = self._parse_envelope_int(
                     metadata, "child_turn_max_micro_eur"
                 )
+                effective = (
+                    None
+                    if binding is None
+                    else self._effective_binding(binding, child_turn_max_micro_eur)
+                )
                 row = conn.execute(
                     "SELECT * FROM child_turns WHERE agent=? AND message_id=?",
                     (agent, message_id),
                 ).fetchone()
-                if row is None:
+                if version == CHILD_CAP_SCHEMA_VERSION:
+                    binding_required = self._binding_required_flag(metadata)
+                    if row is not None:
+                        if row["state"] == "fenced":
+                            raise ChildTurnCapExceeded("child turn binding is fenced")
+                        if row["request_id"] != request_id:
+                            raise ChildTurnCapBlocked(
+                                "child turn request binding changed for an immutable message"
+                            )
+                        self._check_retry_binding(row, effective)
+                        bound = row["quota_lease_ref_sha256"] is not None
+                    else:
+                        bound = effective is not None
+                    if binding_required and not bound:
+                        raise QuotaLeaseBindingRequired(
+                            "quota lease binding is required; this child turn has no reference"
+                        )
+                if row is None and effective is None:
                     conn.execute(
                         """
                         INSERT INTO child_turns(
@@ -1407,6 +2348,35 @@ class SpendLedger:
                             timestamp,
                         ),
                     )
+                elif row is None:
+                    expires_at = _iso_utc(
+                        current + timedelta(seconds=effective["ttl_seconds"])
+                    )
+                    try:
+                        conn.execute(
+                            """
+                            INSERT INTO child_turns(
+                                agent, message_id, request_id, state, max_calls,
+                                max_micro_eur, opened_at, expires_at, updated_at,
+                                quota_lease_ref_sha256
+                            ) VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                agent,
+                                message_id,
+                                request_id,
+                                effective["max_calls"],
+                                effective["max_micro_eur"],
+                                timestamp,
+                                expires_at,
+                                timestamp,
+                                effective["ref_sha256"],
+                            ),
+                        )
+                    except sqlite3.IntegrityError as exc:
+                        raise ChildTurnCapBlocked(
+                            "quota lease reference already binds another child turn"
+                        ) from exc
                 else:
                     if row["request_id"] != request_id:
                         raise ChildTurnCapBlocked(
@@ -1420,7 +2390,20 @@ class SpendLedger:
                         )
                     expiry = _parse_utc(row["expires_at"])
                     if row["state"] != "open" or current >= expiry:
-                        if row["state"] == "open":
+                        if version == CHILD_CAP_SCHEMA_VERSION:
+                            self._freeze_terminal(
+                                conn,
+                                agent,
+                                message_id,
+                                state="expired",
+                                reason="wall-time ceiling exceeded",
+                                outcome="cancelled",
+                                at=row["expires_at"],
+                                updated_at=timestamp,
+                            )
+                            self._ensure_custody(conn, agent, message_id, at=timestamp)
+                            self._commit(conn)
+                        elif row["state"] == "open":
                             conn.execute(
                                 """
                                 UPDATE child_turns
@@ -1467,7 +2450,9 @@ class SpendLedger:
         reason: str,
         issuer_token: str | None = None,
         now: datetime | None = None,
-    ) -> None:
+        outcome: str | None = None,
+        quota_lease_ref: str | None = None,
+    ) -> str | None:
         """Close (expire) an OPEN child turn immediately, instead of leaving it to run
         out its own CHILD_TURN_MAX_SECONDS wall clock. Call this only when the caller
         is DONE driving a durable message and will not retry the SAME (agent,
@@ -1479,13 +2464,29 @@ class SpendLedger:
         'open' - closing an already-capped/expired turn, or one that was never opened,
         does nothing (mirrors the lazy terminal transitions in open_child_turn /
         reserve_for_child; this just makes the SAME transition eager instead of lazy
-        rather than inventing a new state outside the schema's CHECK constraint)."""
+        rather than inventing a new state outside the schema's CHECK constraint).
+
+        On a child-cap schema-4 ledger the ending is also recorded (outcome and time;
+        ``cancelled`` when a legacy call names none). A bound child turn (opened with a
+        quota lease reference) closes only with its own reference and an explicit
+        outcome, even when it already ended; a different reference is the permanent
+        ``reference_mismatch``. A close with a reference for a key that never opened
+        writes a fenced row and its zero receipt in this one transaction, so that
+        binding can never spend later. A reference given for an unbound row is
+        ignored and writes no receipt. A legacy call (no ``outcome``, no reference)
+        returns None, as before; a call with either returns one closed word:
+        ``closed``, ``already_terminal``, ``fenced``, ``reference_ignored`` or
+        ``not_opened``."""
         agent = self._validate_child_scope(agent, name="agent", limit=128)
         message_id = self._validate_child_scope(
             message_id, name="message_id", limit=256
         )
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("a close reason is required")
+        if outcome is not None and outcome not in CHILD_OUTCOMES:
+            raise ValueError("close outcome is not a closed word")
+        ref_sha256 = None if quota_lease_ref is None else quota_lease_ref_sha256(quota_lease_ref)
+        legacy = outcome is None and quota_lease_ref is None
         current = (now or self.now()).astimezone(timezone.utc)
         issuer_hash = self._child_cap_issuer_hash(issuer_token)
         timestamp = _iso_utc(current)
@@ -1501,22 +2502,129 @@ class SpendLedger:
                 ):
                     raise ChildTurnCapBlocked("child turn issuer credential is invalid")
                 self._validate_child_cap_clock(conn, current)
-                row = conn.execute(
-                    "SELECT state FROM child_turns WHERE agent=? AND message_id=?",
-                    (agent, message_id),
-                ).fetchone()
-                if row is not None and row["state"] == "open":
-                    conn.execute(
-                        """
-                        UPDATE child_turns SET state='expired', reason=?, updated_at=?
-                        WHERE agent=? AND message_id=?
-                        """,
-                        (reason, timestamp, agent, message_id),
+                if self._child_cap_version(metadata) != CHILD_CAP_SCHEMA_VERSION:
+                    if ref_sha256 is not None:
+                        raise ChildTurnCapBlocked(
+                            "quota lease binding is not installed on this ledger"
+                        )
+                    row = conn.execute(
+                        "SELECT state FROM child_turns WHERE agent=? AND message_id=?",
+                        (agent, message_id),
+                    ).fetchone()
+                    wrote = False
+                    if row is not None and row["state"] == "open":
+                        conn.execute(
+                            """
+                            UPDATE child_turns SET state='expired', reason=?, updated_at=?
+                            WHERE agent=? AND message_id=?
+                            """,
+                            (reason, timestamp, agent, message_id),
+                        )
+                        wrote = True
+                    self._commit(conn)
+                    if row is None:
+                        result = "not_opened"
+                    else:
+                        result = "closed" if wrote else "already_terminal"
+                else:
+                    result = self._close_child_turn_v4(
+                        conn,
+                        agent,
+                        message_id,
+                        reason=reason,
+                        outcome=outcome,
+                        ref_sha256=ref_sha256,
+                        timestamp=timestamp,
                     )
-                self._commit(conn)
+                    self._commit(conn)
             except Exception:
                 self._rollback(conn)
                 raise
+        return None if legacy else result
+
+    def _close_child_turn_v4(
+        self,
+        conn: sqlite3.Connection,
+        agent: str,
+        message_id: str,
+        *,
+        reason: str,
+        outcome: str | None,
+        ref_sha256: str | None,
+        timestamp: str,
+    ) -> str:
+        row = conn.execute(
+            "SELECT state, quota_lease_ref_sha256 FROM child_turns WHERE agent=? AND message_id=?",
+            (agent, message_id),
+        ).fetchone()
+        if row is None:
+            if ref_sha256 is None:
+                return "not_opened"
+            if outcome is None:
+                raise ChildTurnCapBlocked(
+                    "a close with a quota lease reference needs an explicit outcome"
+                )
+            # The tombstone: a binding that never opened can never spend later.
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO child_turns(
+                        agent, message_id, request_id, state, max_calls, max_micro_eur,
+                        opened_at, expires_at, updated_at, reason, quota_lease_ref_sha256,
+                        terminal_outcome, terminal_at, terminal_source
+                    ) VALUES (?, ?, '', 'fenced', 0, 0, ?, ?, ?, ?, ?, ?, ?, 'recorded')
+                    """,
+                    (
+                        agent,
+                        message_id,
+                        timestamp,
+                        timestamp,
+                        timestamp,
+                        reason,
+                        ref_sha256,
+                        outcome,
+                        timestamp,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ChildTurnCapBlocked(
+                    "quota lease reference already binds another child turn"
+                ) from exc
+            self._ensure_custody(conn, agent, message_id, at=timestamp)
+            return "fenced"
+        bound = row["quota_lease_ref_sha256"]
+        if bound is not None:
+            if ref_sha256 is None or outcome is None:
+                raise ChildTurnCapBlocked(
+                    "a bound child turn closes only with its quota lease reference and an outcome"
+                )
+            if not hmac.compare_digest(bound, ref_sha256):
+                raise QuotaLeaseReferenceMismatch("reference_mismatch")
+            wrote = self._freeze_terminal(
+                conn,
+                agent,
+                message_id,
+                state="expired",
+                reason=reason,
+                outcome=outcome,
+                at=timestamp,
+                updated_at=timestamp,
+            )
+            self._ensure_custody(conn, agent, message_id, at=timestamp)
+            return "closed" if wrote else "already_terminal"
+        wrote = self._freeze_terminal(
+            conn,
+            agent,
+            message_id,
+            state="expired",
+            reason=reason,
+            outcome=outcome or "cancelled",
+            at=timestamp,
+            updated_at=timestamp,
+        )
+        if ref_sha256 is not None:
+            return "reference_ignored"
+        return "closed" if wrote else "already_terminal"
 
     def _advance_period_if_valid(
         self,
@@ -1740,14 +2848,30 @@ class SpendLedger:
                     denial = "child turn cost ceiling exceeded"
                 if denial is not None:
                     state = "expired" if current >= expiry else "capped"
-                    conn.execute(
-                        """
-                        UPDATE child_turns
-                        SET state=?, reason=?, updated_at=?
-                        WHERE agent=? AND message_id=?
-                        """,
-                        (state, denial, timestamp, row["agent"], row["message_id"]),
-                    )
+                    if self._child_cap_version(metadata) == CHILD_CAP_SCHEMA_VERSION:
+                        # The first ending stays: an already ended row is not rewritten.
+                        self._freeze_terminal(
+                            conn,
+                            str(row["agent"]),
+                            str(row["message_id"]),
+                            state=state,
+                            reason=denial,
+                            outcome="cancelled" if current >= expiry else "failed",
+                            at=row["expires_at"] if current >= expiry else timestamp,
+                            updated_at=timestamp,
+                        )
+                        self._ensure_custody(
+                            conn, str(row["agent"]), str(row["message_id"]), at=timestamp
+                        )
+                    else:
+                        conn.execute(
+                            """
+                            UPDATE child_turns
+                            SET state=?, reason=?, updated_at=?
+                            WHERE agent=? AND message_id=?
+                            """,
+                            (state, denial, timestamp, row["agent"], row["message_id"]),
+                        )
                     self._commit(conn)
                 else:
                     conn.execute(
@@ -1885,6 +3009,7 @@ class SpendLedger:
                         "UPDATE metadata SET value=? WHERE key='service_hold'",
                         (f"attempt {attempt_id} exceeded the reserved policy",),
                     )
+                self._custody_for_attempt(conn, attempt_id, at=timestamp)
                 self._commit(conn)
                 return {
                     "attempt_id": attempt_id,
@@ -1973,6 +3098,7 @@ class SpendLedger:
                     )
                 ):
                     conn.execute("UPDATE metadata SET value='' WHERE key='service_hold'")
+                self._custody_for_attempt(conn, attempt_id, at=timestamp)
                 self._commit(conn)
                 return {
                     "attempt_id": attempt_id,
@@ -2133,127 +3259,385 @@ class SpendLedger:
                 ),
             }
 
+    def _verified_child_cap(
+        self, conn: sqlite3.Connection, issuer_hash: str
+    ) -> dict[str, str]:
+        metadata = self._verify_metadata(conn, self._marker())
+        if self._child_cap_feature_state(conn, metadata) != "ready":
+            raise ChildTurnCapBlocked("child turn cap feature is not installed")
+        if not hmac.compare_digest(metadata["child_cap_issuer_sha256"], issuer_hash):
+            raise ChildTurnCapBlocked("child turn issuer credential is invalid")
+        return metadata
+
+    def quota_lease_binding_state(self, *, issuer_token: str | None = None) -> dict:
+        """Whether quota lease binding is installed and whether the flag is on.
+
+        An authenticated read that writes nothing. A malformed flag raises; it is
+        never read as off. On a schema-3 ledger binding is not installed, so no open
+        can carry a reference and the flag cannot be on."""
+        issuer_hash = self._child_cap_issuer_hash(issuer_token)
+        with self._connect() as conn:
+            metadata = self._verified_child_cap(conn, issuer_hash)
+            installed = self._child_cap_version(metadata) == CHILD_CAP_SCHEMA_VERSION
+            return {
+                "binding_installed": installed,
+                "quota_lease_binding_required": (
+                    self._binding_required_flag(metadata) if installed else False
+                ),
+            }
+
+    def set_quota_lease_binding_required(
+        self, *, required: bool, issuer_token: str | None = None
+    ) -> dict:
+        """The operator's explicit flag switch (``gateway binding-required``). Nothing
+        else changes the flag. It decides only whether an unbound open is allowed: it
+        never removes a binding and never turns the caps off."""
+        if not isinstance(required, bool):
+            raise ValueError("required must be a boolean")
+        issuer_hash = self._child_cap_issuer_hash(issuer_token)
+        with self._connect() as conn:
+            self._begin(conn)
+            try:
+                metadata = self._verified_child_cap(conn, issuer_hash)
+                if self._child_cap_version(metadata) != CHILD_CAP_SCHEMA_VERSION:
+                    raise ChildTurnCapBlocked(
+                        "quota lease binding is not installed on this ledger"
+                    )
+                before = self._binding_required_flag(metadata)
+                conn.execute(
+                    "UPDATE metadata SET value=? WHERE key='quota_lease_binding_required'",
+                    ("1" if required else "0",),
+                )
+                self._commit(conn)
+            except Exception:
+                self._rollback(conn)
+                raise
+        return {"quota_lease_binding_required": required, "changed": before != required}
+
+    # The operator commands call these: the ledger reads the operator's credential (the
+    # front token, from its usual file) itself, so the command never holds it.
+
+    def install_child_cap_binding_as_operator(self, *, now: datetime | None = None) -> dict:
+        return self.install_child_cap_binding(issuer_token=_operator_credential(), now=now)
+
+    def set_quota_lease_binding_required_as_operator(self, *, required: bool) -> dict:
+        return self.set_quota_lease_binding_required(
+            required=required, issuer_token=_operator_credential()
+        )
+
+    def child_receipts_page_as_operator(self, *, after_seq: int = 0, limit: int = 100) -> dict:
+        return self.child_receipts_page(
+            after_seq=after_seq, limit=limit, issuer_token=_operator_credential()
+        )
+
+    def sweep_child_receipts(
+        self, *, issuer_token: str | None = None, now: datetime | None = None
+    ) -> dict:
+        """The start-up sweep, through the one ending path: end every open referenced
+        child turn past its expiry (``cancelled`` at its expiry time), then make sure
+        every ended referenced child turn has its receipt or a pending note, which
+        completes notes whose attempts are now resolved and repairs a missing
+        ending with the stated fallback. Counts only; no reference leaves it."""
+        issuer_hash = self._child_cap_issuer_hash(issuer_token)
+        current = (now or self.now()).astimezone(timezone.utc)
+        timestamp = _iso_utc(current)
+        with self._connect() as conn:
+            self._begin(conn)
+            try:
+                metadata = self._verified_child_cap(conn, issuer_hash)
+                if self._child_cap_version(metadata) != CHILD_CAP_SCHEMA_VERSION:
+                    self._rollback(conn)
+                    return {
+                        "binding_installed": False,
+                        "ended": 0,
+                        "receipts_written": 0,
+                        "pending": 0,
+                        "fallback": 0,
+                    }
+                self._validate_child_cap_clock(conn, current)
+                ended = 0
+                for row in conn.execute(
+                    """
+                    SELECT agent, message_id, expires_at FROM child_turns
+                    WHERE state='open' AND quota_lease_ref_sha256 IS NOT NULL
+                    ORDER BY expires_at, agent, message_id
+                    """
+                ).fetchall():
+                    if current >= _parse_utc(row["expires_at"]) and self._freeze_terminal(
+                        conn,
+                        row["agent"],
+                        row["message_id"],
+                        state="expired",
+                        reason="wall-time ceiling exceeded",
+                        outcome="cancelled",
+                        at=row["expires_at"],
+                        updated_at=timestamp,
+                    ):
+                        ended += 1
+                written = 0
+                for row in conn.execute(
+                    """
+                    SELECT agent, message_id FROM child_turns
+                    WHERE state != 'open' AND quota_lease_ref_sha256 IS NOT NULL
+                    ORDER BY terminal_at, agent, message_id
+                    """
+                ).fetchall():
+                    result = self._ensure_custody(
+                        conn, row["agent"], row["message_id"], at=timestamp
+                    )
+                    written += result == "receipt_written"
+                report = self._receipt_report(conn)
+                self._commit(conn)
+            except Exception:
+                self._rollback(conn)
+                raise
+        return {
+            "binding_installed": True,
+            "ended": ended,
+            "receipts_written": written,
+            "pending": report["child_receipts_pending"],
+            "fallback": report["child_receipts_fallback"],
+        }
+
+    def child_receipts_page(
+        self,
+        *,
+        after_seq: int = 0,
+        limit: int = 100,
+        issuer_token: str | None = None,
+    ) -> dict:
+        """One page of receipts, oldest first, as closed JSON-safe data. A read only:
+        it writes nothing and never sweeps. The page names the ledger generation even
+        when it is empty. A gap or a value outside the page's bounds refuses the page
+        (``ReceiptPageRefused``); nothing is rounded or dropped to make it fit."""
+        if (
+            not isinstance(after_seq, int)
+            or isinstance(after_seq, bool)
+            or not 0 <= after_seq <= RECEIPT_MAX_SEQ
+        ):
+            raise ValueError("after_seq is out of range")
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= RECEIPT_PAGE_MAX_LIMIT
+        ):
+            raise ValueError("limit is out of range")
+        issuer_hash = self._child_cap_issuer_hash(issuer_token)
+        with self._connect() as conn:
+            conn.execute("BEGIN")
+            try:
+                metadata = self._verified_child_cap(conn, issuer_hash)
+                if self._child_cap_version(metadata) != CHILD_CAP_SCHEMA_VERSION:
+                    raise ChildTurnCapBlocked(
+                        "quota lease binding is not installed on this ledger"
+                    )
+                count, highest = conn.execute(
+                    "SELECT COUNT(*), COALESCE(MAX(seq), 0) FROM child_receipts"
+                ).fetchone()
+                if count != highest:
+                    raise ReceiptPageRefused("receipt sequence has a gap")
+                rows = conn.execute(
+                    """
+                    SELECT seq, quota_lease_ref_sha256, outcome, calls, input_tokens,
+                           output_tokens, actual_micro_eur, closed_at
+                    FROM child_receipts WHERE seq > ? ORDER BY seq LIMIT ?
+                    """,
+                    (after_seq, limit + 1),
+                ).fetchall()
+                generation = metadata["generation"]
+            finally:
+                self._rollback(conn)
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        receipts = []
+        for index, row in enumerate(rows):
+            if row["seq"] != after_seq + 1 + index:
+                raise ReceiptPageRefused("receipt sequence has a gap")
+            receipts.append(
+                {
+                    "actual_micro_eur": row["actual_micro_eur"],
+                    "calls": row["calls"],
+                    "closed_at": row["closed_at"],
+                    "input_tokens": row["input_tokens"],
+                    "outcome": row["outcome"],
+                    "output_tokens": row["output_tokens"],
+                    "quota_lease_ref_sha256": row["quota_lease_ref_sha256"],
+                    "seq": row["seq"],
+                }
+            )
+        page = {
+            "after_seq": after_seq,
+            "envelope_version": RECEIPT_ENVELOPE_VERSION,
+            "generation": generation,
+            "has_more": has_more,
+            "next_seq": receipts[-1]["seq"] if receipts else after_seq,
+            "receipts": receipts,
+        }
+        check_receipt_page(page, after_seq=after_seq, limit=limit)
+        return page
+
     def status(self) -> dict:
         with self._connect() as conn:
-            marker = self._marker()
-            metadata = self._verify_metadata(conn, marker)
-            current = self.now().astimezone(timezone.utc)
-            self._validate_clock(metadata, current)
-            child_cap_state = self._child_cap_feature_state(conn, metadata)
-            if child_cap_state == "ready":
-                self._validate_child_cap_clock(conn, current)
-            periods = [dict(row) for row in conn.execute("SELECT * FROM periods ORDER BY period")]
-            unresolved = [dict(row) for row in self._unresolved(conn)]
-            current_period = metadata["last_accepted_period"]
-            current = next(
-                (row for row in periods if row["period"] == current_period),
-                {"committed_micro_eur": 0},
-            )
-            opening_micro_eur = int(metadata["opening_micro_eur"])
-            current_opening = (
-                opening_micro_eur if current_period == metadata["opening_period"] else 0
-            )
-            dashboard_canary = (
-                {
-                    "attempt_id": metadata["canary_attempt_id"],
-                    "checked_at": metadata["canary_checked_at"],
-                    "expected_micro_eur": int(metadata["canary_expected_micro_eur"]),
-                    "observed_delta_micro_eur": int(
-                        metadata["canary_observed_micro_eur"]
-                    ),
-                    "tolerance_micro_eur": int(
-                        metadata["canary_tolerance_micro_eur"]
-                    ),
-                    "status": metadata["canary_status"],
-                }
-                if metadata.get("canary_attempt_id")
-                else None
-            )
-            accounting_ready = not unresolved and not metadata.get("service_hold")
-            worker_spend_errors: list[str] = []
-            if not accounting_ready:
-                worker_spend_errors.append("ledger_not_ready")
-            if dashboard_canary is None:
-                worker_spend_errors.append("dashboard_canary_absent")
-            elif dashboard_canary["status"] != "accepted":
-                worker_spend_errors.append("dashboard_canary_mismatch")
-            if child_cap_state != "ready":
-                worker_spend_errors.append("child_cap_unavailable")
-            active_child_turns = []
-            if child_cap_state == "ready":
-                active_child_turns = [
-                    dict(row)
-                    for row in conn.execute(
-                        """
-                        SELECT turn.agent, turn.message_id, turn.request_id,
-                               turn.state, turn.opened_at, turn.expires_at,
-                               turn.reason,
-                               COUNT(child.attempt_id) AS attempt_count,
-                               COALESCE(SUM(
-                                   CASE
-                                       WHEN attempt.actual_micro_eur IS NOT NULL
-                                       THEN attempt.actual_micro_eur
-                                       ELSE attempt.reserved_micro_eur
-                                   END
-                               ), 0) AS exposure_micro_eur
-                        FROM child_turns AS turn
-                        LEFT JOIN child_attempts AS child
-                          ON child.agent=turn.agent
-                         AND child.message_id=turn.message_id
-                        LEFT JOIN attempts AS attempt
-                          ON attempt.attempt_id=child.attempt_id
-                        GROUP BY turn.agent, turn.message_id
-                        ORDER BY turn.opened_at, turn.agent, turn.message_id
-                        """
-                    )
-                ]
-            return {
-                "schema_version": LEDGER_SCHEMA_VERSION,
-                "generation": metadata["generation"],
-                "policy_hash": metadata["price_policy_hash"],
-                "currency": metadata["currency"],
-                "trial_cutoff_micro_eur": self._parse_envelope_int(
-                    metadata, "trial_cutoff_micro_eur"
+            # One snapshot: the metadata, the generation, the period totals and the
+            # receipt coverage below all come from this one read transaction, so a
+            # report can never claim a receipt whose cost is missing from the totals.
+            conn.execute("BEGIN")
+            try:
+                return self._status_snapshot(conn)
+            finally:
+                self._rollback(conn)
+
+    @staticmethod
+    def _receipt_report(conn: sqlite3.Connection) -> dict:
+        """The five schema-4 status keys, read inside the status snapshot."""
+        count, through_seq = conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(seq), 0) FROM child_receipts"
+        ).fetchone()
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM receipt_pending WHERE resolved_at IS NULL"
+        ).fetchone()[0]
+        fallback = conn.execute(
+            """
+            SELECT COUNT(*) FROM child_turns
+            WHERE terminal_source='legacy_fallback' AND quota_lease_ref_sha256 IS NOT NULL
+            """
+        ).fetchone()[0]
+        return {
+            "child_receipt_report_version": CHILD_RECEIPT_REPORT_VERSION,
+            "child_receipts": int(count),
+            "child_receipts_pending": int(pending),
+            "child_receipts_fallback": int(fallback),
+            "child_receipts_through_seq": int(through_seq),
+        }
+
+    def _status_snapshot(self, conn: sqlite3.Connection) -> dict:
+        marker = self._marker()
+        metadata = self._verify_metadata(conn, marker)
+        current = self.now().astimezone(timezone.utc)
+        self._validate_clock(metadata, current)
+        child_cap_state = self._child_cap_feature_state(conn, metadata)
+        if child_cap_state == "ready":
+            self._validate_child_cap_clock(conn, current)
+        periods = [dict(row) for row in conn.execute("SELECT * FROM periods ORDER BY period")]
+        unresolved = [dict(row) for row in self._unresolved(conn)]
+        current_period = metadata["last_accepted_period"]
+        current = next(
+            (row for row in periods if row["period"] == current_period),
+            {"committed_micro_eur": 0},
+        )
+        opening_micro_eur = int(metadata["opening_micro_eur"])
+        current_opening = (
+            opening_micro_eur if current_period == metadata["opening_period"] else 0
+        )
+        dashboard_canary = (
+            {
+                "attempt_id": metadata["canary_attempt_id"],
+                "checked_at": metadata["canary_checked_at"],
+                "expected_micro_eur": int(metadata["canary_expected_micro_eur"]),
+                "observed_delta_micro_eur": int(
+                    metadata["canary_observed_micro_eur"]
                 ),
-                "soft_stop_micro_eur": self._parse_envelope_int(
-                    metadata, "soft_stop_micro_eur"
+                "tolerance_micro_eur": int(
+                    metadata["canary_tolerance_micro_eur"]
                 ),
-                "external_ceiling_micro_eur": self._parse_envelope_int(
-                    metadata, "external_ceiling_micro_eur"
-                ),
-                "opening_micro_eur": opening_micro_eur,
-                "opening_evidence": metadata["opening_evidence"],
-                "opening_observed_at": metadata["opening_observed_at"],
-                "opening_period": metadata["opening_period"],
-                "current_period": current_period,
-                "current_committed_micro_eur": int(current["committed_micro_eur"]),
-                "current_trial_committed_micro_eur": max(
-                    0,
-                    int(current["committed_micro_eur"]) - current_opening,
-                ),
-                "periods": periods,
-                "unresolved": unresolved,
-                "service_hold": metadata.get("service_hold") or None,
-                "dashboard_canary": dashboard_canary,
-                "child_cap_ready": child_cap_state == "ready",
-                "child_cap_schema_version": (
-                    CHILD_CAP_SCHEMA_VERSION if child_cap_state == "ready" else None
-                ),
-                "child_cap_policy_hash": (
-                    metadata["child_cap_policy_hash"] if child_cap_state == "ready" else None
-                ),
-                "child_turn_max_calls": CHILD_TURN_MAX_CALLS,
-                "child_turn_max_micro_eur": (
-                    self._parse_envelope_int(metadata, "child_turn_max_micro_eur")
-                    if child_cap_state == "ready"
-                    else None
-                ),
-                "child_turn_max_seconds": CHILD_TURN_MAX_SECONDS,
-                "active_child_turns": active_child_turns,
-                "ready": accounting_ready,
-                "worker_spend_ready": not worker_spend_errors,
-                "worker_spend_errors": worker_spend_errors,
+                "status": metadata["canary_status"],
             }
+            if metadata.get("canary_attempt_id")
+            else None
+        )
+        accounting_ready = not unresolved and not metadata.get("service_hold")
+        worker_spend_errors: list[str] = []
+        if not accounting_ready:
+            worker_spend_errors.append("ledger_not_ready")
+        if dashboard_canary is None:
+            worker_spend_errors.append("dashboard_canary_absent")
+        elif dashboard_canary["status"] != "accepted":
+            worker_spend_errors.append("dashboard_canary_mismatch")
+        if child_cap_state != "ready":
+            worker_spend_errors.append("child_cap_unavailable")
+        active_child_turns = []
+        if child_cap_state == "ready":
+            active_child_turns = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT turn.agent, turn.message_id, turn.request_id,
+                           turn.state, turn.opened_at, turn.expires_at,
+                           turn.reason,
+                           COUNT(child.attempt_id) AS attempt_count,
+                           COALESCE(SUM(
+                               CASE
+                                   WHEN attempt.actual_micro_eur IS NOT NULL
+                                   THEN attempt.actual_micro_eur
+                                   ELSE attempt.reserved_micro_eur
+                               END
+                           ), 0) AS exposure_micro_eur
+                    FROM child_turns AS turn
+                    LEFT JOIN child_attempts AS child
+                      ON child.agent=turn.agent
+                     AND child.message_id=turn.message_id
+                    LEFT JOIN attempts AS attempt
+                      ON attempt.attempt_id=child.attempt_id
+                    WHERE turn.state != 'fenced'
+                    GROUP BY turn.agent, turn.message_id
+                    ORDER BY turn.opened_at, turn.agent, turn.message_id
+                    """
+                )
+            ]
+        child_cap_version = (
+            self._child_cap_version(metadata) if child_cap_state == "ready" else None
+        )
+        receipt_report = (
+            self._receipt_report(conn)
+            if child_cap_version == CHILD_CAP_SCHEMA_VERSION
+            else {}
+        )
+        return {
+            "schema_version": int(metadata["schema_version"]),
+            "generation": metadata["generation"],
+            "policy_hash": metadata["price_policy_hash"],
+            "currency": metadata["currency"],
+            "trial_cutoff_micro_eur": self._parse_envelope_int(
+                metadata, "trial_cutoff_micro_eur"
+            ),
+            "soft_stop_micro_eur": self._parse_envelope_int(
+                metadata, "soft_stop_micro_eur"
+            ),
+            "external_ceiling_micro_eur": self._parse_envelope_int(
+                metadata, "external_ceiling_micro_eur"
+            ),
+            "opening_micro_eur": opening_micro_eur,
+            "opening_evidence": metadata["opening_evidence"],
+            "opening_observed_at": metadata["opening_observed_at"],
+            "opening_period": metadata["opening_period"],
+            "current_period": current_period,
+            "current_committed_micro_eur": int(current["committed_micro_eur"]),
+            "current_trial_committed_micro_eur": max(
+                0,
+                int(current["committed_micro_eur"]) - current_opening,
+            ),
+            "periods": periods,
+            "unresolved": unresolved,
+            "service_hold": metadata.get("service_hold") or None,
+            "dashboard_canary": dashboard_canary,
+            "child_cap_ready": child_cap_state == "ready",
+            "child_cap_schema_version": child_cap_version,
+            "child_cap_policy_hash": (
+                metadata["child_cap_policy_hash"] if child_cap_state == "ready" else None
+            ),
+            "child_turn_max_calls": CHILD_TURN_MAX_CALLS,
+            "child_turn_max_micro_eur": (
+                self._parse_envelope_int(metadata, "child_turn_max_micro_eur")
+                if child_cap_state == "ready"
+                else None
+            ),
+            "child_turn_max_seconds": CHILD_TURN_MAX_SECONDS,
+            "active_child_turns": active_child_turns,
+            "ready": accounting_ready,
+            "worker_spend_ready": not worker_spend_errors,
+            "worker_spend_errors": worker_spend_errors,
+            **receipt_report,
+        }
 
 
 def generate_token() -> str:
@@ -2274,6 +3658,11 @@ def write_secret_file(path: Path, value: str) -> None:
     finally:
         os.close(fd)
     _flush_parent(path)
+
+
+def _operator_credential() -> str:
+    """The operator's child-cap issuer credential: the front token, from its usual file."""
+    return read_secret_file(default_front_token_path())
 
 
 def read_secret_file(path: Path) -> str:
@@ -2355,3 +3744,116 @@ def policy_summary() -> dict:
         **price_policy(),
         "price_policy_hash": price_policy_hash(),
     }
+
+
+_RECEIPT_PAGE_KEYS = frozenset(
+    {"after_seq", "envelope_version", "generation", "has_more", "next_seq", "receipts"}
+)
+_RECEIPT_KEYS = frozenset(
+    {
+        "actual_micro_eur",
+        "calls",
+        "closed_at",
+        "input_tokens",
+        "outcome",
+        "output_tokens",
+        "quota_lease_ref_sha256",
+        "seq",
+    }
+)
+
+
+def _whole_number(value: object, low: int, high: int) -> bool:
+    """An integer in [low, high]; a boolean or a float is never an integer here."""
+    return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
+
+
+def _ledger_timestamp(value: object) -> bool:
+    if not isinstance(value, str) or not _LEDGER_TIME_RE.fullmatch(value):
+        return False
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
+
+
+def check_receipt_page(page: object, *, after_seq: int, limit: int) -> None:
+    """Refuse (``ReceiptPageRefused``) any receipt page that breaks the version-1
+    rules: the closed keys at both levels, the integer types and bounds, the
+    generation and hash formats, real timestamps, the zero-call rule, no gap and no
+    repeat, the requested ``after_seq``, and no more rows than the limit."""
+    if not isinstance(page, dict) or set(page) != _RECEIPT_PAGE_KEYS:
+        raise ReceiptPageRefused("receipt page keys are not the closed set")
+    if not _whole_number(page["envelope_version"], 1, 1):
+        raise ReceiptPageRefused("receipt page version is not 1")
+    if not _whole_number(page["after_seq"], 0, RECEIPT_MAX_SEQ) or page["after_seq"] != after_seq:
+        raise ReceiptPageRefused("receipt page after_seq is not the one asked for")
+    generation = page["generation"]
+    if not isinstance(generation, str) or not _ATTEMPT_ID_RE.fullmatch(generation):
+        raise ReceiptPageRefused("receipt page generation is malformed")
+    receipts = page["receipts"]
+    if not isinstance(receipts, list) or len(receipts) > min(limit, RECEIPT_PAGE_MAX_LIMIT):
+        raise ReceiptPageRefused("receipt page has more rows than its limit")
+    if not isinstance(page["has_more"], bool):
+        raise ReceiptPageRefused("receipt page has_more is not a boolean")
+    if not receipts and page["has_more"]:
+        raise ReceiptPageRefused("an empty receipt page cannot have more")
+    for index, receipt in enumerate(receipts):
+        if not isinstance(receipt, dict) or set(receipt) != _RECEIPT_KEYS:
+            raise ReceiptPageRefused("receipt keys are not the closed set")
+        if not _whole_number(receipt["seq"], 1, RECEIPT_MAX_SEQ) or (
+            receipt["seq"] != after_seq + 1 + index
+        ):
+            raise ReceiptPageRefused("receipt sequence has a gap or a repeat")
+        if not _whole_number(receipt["calls"], 0, RECEIPT_MAX_CALLS):
+            raise ReceiptPageRefused("receipt calls are out of bounds")
+        if not _whole_number(receipt["actual_micro_eur"], 0, RECEIPT_MAX_AMOUNT):
+            raise ReceiptPageRefused("receipt money is out of bounds")
+        for key in ("input_tokens", "output_tokens"):
+            value = receipt[key]
+            if value is not None and not _whole_number(value, 0, RECEIPT_MAX_AMOUNT):
+                raise ReceiptPageRefused("receipt token count is out of bounds")
+        if receipt["calls"] == 0 and not (
+            receipt["input_tokens"] == 0
+            and receipt["output_tokens"] == 0
+            and receipt["actual_micro_eur"] == 0
+        ):
+            raise ReceiptPageRefused("a receipt with no calls must be all zero")
+        if receipt["outcome"] not in CHILD_OUTCOMES:
+            raise ReceiptPageRefused("receipt outcome is not a closed word")
+        if not isinstance(receipt["quota_lease_ref_sha256"], str) or not _SHA256_HEX_RE.fullmatch(
+            receipt["quota_lease_ref_sha256"]
+        ):
+            raise ReceiptPageRefused("receipt reference hash is malformed")
+        if not _ledger_timestamp(receipt["closed_at"]):
+            raise ReceiptPageRefused("receipt close time is not a ledger timestamp")
+    expected_next = receipts[-1]["seq"] if receipts else after_seq
+    if not _whole_number(page["next_seq"], 0, RECEIPT_MAX_SEQ) or page["next_seq"] != expected_next:
+        raise ReceiptPageRefused("receipt page next_seq is wrong")
+
+
+def _refuse_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    keys = [key for key, _value in pairs]
+    if len(keys) != len(set(keys)):
+        raise ReceiptPageRefused("receipt page has a duplicate key")
+    return dict(pairs)
+
+
+def _refuse_constant(_name: str) -> object:
+    raise ReceiptPageRefused("receipt page has a non-finite number")
+
+
+def parse_receipt_page(text: str, *, after_seq: int, limit: int) -> dict:
+    """Read a receipt page's JSON text as a reader must: duplicate keys and
+    non-finite numbers are refused, then every rule of ``check_receipt_page``."""
+    try:
+        page = json.loads(
+            text,
+            object_pairs_hook=_refuse_duplicate_keys,
+            parse_constant=_refuse_constant,
+        )
+    except ValueError as exc:
+        raise ReceiptPageRefused("receipt page is not JSON") from exc
+    check_receipt_page(page, after_seq=after_seq, limit=limit)
+    return page

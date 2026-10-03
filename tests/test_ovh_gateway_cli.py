@@ -432,15 +432,18 @@ def test_gateway_cli_atomically_installs_child_caps_on_existing_ledger(
         child_cap_issuer_token=TEST_CHILD_CAP_ISSUER,
     )
     with sqlite3.connect(ledger.db_path) as conn:
+        conn.execute("DROP TABLE receipt_pending")
+        conn.execute("DROP TABLE child_receipts")
         conn.execute("DROP TABLE child_attempts")
         conn.execute("DROP TABLE child_capabilities")
         conn.execute("DROP TABLE child_turns")
         conn.execute(
-            "DELETE FROM metadata WHERE key IN (?, ?, ?)",
+            "DELETE FROM metadata WHERE key IN (?, ?, ?, ?)",
             (
                 "child_cap_schema_version",
                 "child_cap_policy_hash",
                 "child_cap_issuer_sha256",
+                "quota_lease_binding_required",
             ),
         )
         conn.execute("UPDATE metadata SET value='1' WHERE key='schema_version'")

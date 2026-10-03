@@ -1,0 +1,304 @@
+[
+ [
+  "open a",
+  "returned",
+  {
+   "agent": "qwen-dev-1",
+   "expires_at": "2026-10-04T10:00:00.000000Z",
+   "message_id": "msg-a"
+  }
+ ],
+ [
+  "reserve a1",
+  "returned",
+  {
+   "admitted_at": "2026-10-03T10:00:00.000000Z",
+   "attempt_id": "11111111111111111111111111111111",
+   "period": "2026-10",
+   "reserved_micro_eur": 231999
+  }
+ ],
+ [
+  "settle a1",
+  "returned",
+  {
+   "actual_micro_eur": 670,
+   "attempt_id": "11111111111111111111111111111111",
+   "held": false,
+   "period": "2026-10",
+   "state": "settled"
+  }
+ ],
+ [
+  "reserve a2",
+  "returned",
+  {
+   "admitted_at": "2026-10-03T10:00:00.000000Z",
+   "attempt_id": "22222222222222222222222222222222",
+   "period": "2026-10",
+   "reserved_micro_eur": 231999
+  }
+ ],
+ [
+  "uncertain a2",
+  "returned",
+  null
+ ],
+ [
+  "reconcile a2",
+  "returned",
+  {
+   "attempt_id": "22222222222222222222222222222222",
+   "charged_micro_eur": 231999,
+   "outcome": "charge-reserve",
+   "state": "reconciled",
+   "total_actual_micro_eur": 231999
+  }
+ ],
+ [
+  "reserve a3 over the call ceiling",
+  "raised",
+  "ChildTurnCapExceeded",
+  "child turn call ceiling exceeded"
+ ],
+ [
+  "reopen a after it was capped",
+  "raised",
+  "ChildTurnCapExceeded",
+  "child turn call ceiling exceeded"
+ ],
+ [
+  "reopen a with another request",
+  "raised",
+  "ChildTurnCapBlocked",
+  "child turn request binding changed for an immutable message"
+ ],
+ [
+  "open b",
+  "returned",
+  {
+   "agent": "qwen-dev-1",
+   "expires_at": "2026-10-04T10:00:00.000000Z",
+   "message_id": "msg-b"
+  }
+ ],
+ [
+  "close b",
+  "returned",
+  null
+ ],
+ [
+  "close b again",
+  "returned",
+  null
+ ],
+ [
+  "reopen b after its close",
+  "raised",
+  "ChildTurnCapExceeded",
+  "dead_letter"
+ ],
+ [
+  "close a never opened key",
+  "returned",
+  null
+ ],
+ [
+  "open c",
+  "returned",
+  {
+   "agent": "qwen-dev-1",
+   "expires_at": "2026-10-04T10:00:00.000000Z",
+   "message_id": "msg-c"
+  }
+ ],
+ [
+  "reserve c1",
+  "returned",
+  {
+   "admitted_at": "2026-10-03T10:00:00.000000Z",
+   "attempt_id": "44444444444444444444444444444444",
+   "period": "2026-10",
+   "reserved_micro_eur": 231999
+  }
+ ],
+ [
+  "no-send c1",
+  "returned",
+  {
+   "attempt_id": "44444444444444444444444444444444",
+   "charged_micro_eur": 0,
+   "outcome": "no-send",
+   "state": "reconciled",
+   "total_actual_micro_eur": 0
+  }
+ ],
+ [
+  "status before expiry",
+  "returned",
+  {
+   "active_child_turns": [
+    {
+     "agent": "qwen-dev-1",
+     "attempt_count": 2,
+     "expires_at": "2026-10-04T10:00:00.000000Z",
+     "exposure_micro_eur": 232669,
+     "message_id": "msg-a",
+     "opened_at": "2026-10-03T10:00:00.000000Z",
+     "reason": "child turn call ceiling exceeded",
+     "request_id": "q-a",
+     "state": "capped"
+    },
+    {
+     "agent": "qwen-dev-1",
+     "attempt_count": 0,
+     "expires_at": "2026-10-04T10:00:00.000000Z",
+     "exposure_micro_eur": 0,
+     "message_id": "msg-b",
+     "opened_at": "2026-10-03T10:00:00.000000Z",
+     "reason": "dead_letter",
+     "request_id": "",
+     "state": "expired"
+    },
+    {
+     "agent": "qwen-dev-1",
+     "attempt_count": 1,
+     "expires_at": "2026-10-04T10:00:00.000000Z",
+     "exposure_micro_eur": 0,
+     "message_id": "msg-c",
+     "opened_at": "2026-10-03T10:00:00.000000Z",
+     "reason": "",
+     "request_id": "",
+     "state": "open"
+    }
+   ],
+   "child_cap_policy_hash": "02665705e85d39718fefaa21fd940da0198b669d6a76730aaac5bd3d105d21e5",
+   "child_cap_ready": true,
+   "child_cap_schema_version": 3,
+   "child_turn_max_calls": 2,
+   "child_turn_max_micro_eur": 95000000,
+   "child_turn_max_seconds": 86400,
+   "currency": "EUR",
+   "current_committed_micro_eur": 232669,
+   "current_period": "2026-10",
+   "current_trial_committed_micro_eur": 232669,
+   "dashboard_canary": null,
+   "external_ceiling_micro_eur": 100000000,
+   "generation": "0123456789abcdef0123456789abcdef",
+   "opening_evidence": "test dashboard, observed 2026-10-03T09:00:00Z",
+   "opening_micro_eur": 0,
+   "opening_observed_at": "2026-10-03T10:00:00.000000Z",
+   "opening_period": "2026-10",
+   "periods": [
+    {
+     "committed_micro_eur": 232669,
+     "period": "2026-10"
+    }
+   ],
+   "policy_hash": "6df40ecdf2c22a9d06a73c2b2d7090b40d722d590e04237b19c903cb034dd5c2",
+   "ready": true,
+   "schema_version": 2,
+   "service_hold": null,
+   "soft_stop_micro_eur": 90000000,
+   "trial_cutoff_micro_eur": 95000000,
+   "unresolved": [],
+   "worker_spend_errors": [
+    "dashboard_canary_absent"
+   ],
+   "worker_spend_ready": false
+  }
+ ],
+ [
+  "reserve a after expiry",
+  "raised",
+  "ChildTurnCapExceeded",
+  "child turn call ceiling exceeded"
+ ],
+ [
+  "reserve c after expiry",
+  "raised",
+  "ChildTurnCapExceeded",
+  "child turn wall-time ceiling exceeded"
+ ],
+ [
+  "reopen c after expiry",
+  "raised",
+  "ChildTurnCapExceeded",
+  "child turn wall-time ceiling exceeded"
+ ],
+ [
+  "status after expiry",
+  "returned",
+  {
+   "active_child_turns": [
+    {
+     "agent": "qwen-dev-1",
+     "attempt_count": 2,
+     "expires_at": "2026-10-04T10:00:00.000000Z",
+     "exposure_micro_eur": 232669,
+     "message_id": "msg-a",
+     "opened_at": "2026-10-03T10:00:00.000000Z",
+     "reason": "child turn call ceiling exceeded",
+     "request_id": "q-a",
+     "state": "expired"
+    },
+    {
+     "agent": "qwen-dev-1",
+     "attempt_count": 0,
+     "expires_at": "2026-10-04T10:00:00.000000Z",
+     "exposure_micro_eur": 0,
+     "message_id": "msg-b",
+     "opened_at": "2026-10-03T10:00:00.000000Z",
+     "reason": "dead_letter",
+     "request_id": "",
+     "state": "expired"
+    },
+    {
+     "agent": "qwen-dev-1",
+     "attempt_count": 1,
+     "expires_at": "2026-10-04T10:00:00.000000Z",
+     "exposure_micro_eur": 0,
+     "message_id": "msg-c",
+     "opened_at": "2026-10-03T10:00:00.000000Z",
+     "reason": "child turn wall-time ceiling exceeded",
+     "request_id": "",
+     "state": "expired"
+    }
+   ],
+   "child_cap_policy_hash": "02665705e85d39718fefaa21fd940da0198b669d6a76730aaac5bd3d105d21e5",
+   "child_cap_ready": true,
+   "child_cap_schema_version": 3,
+   "child_turn_max_calls": 2,
+   "child_turn_max_micro_eur": 95000000,
+   "child_turn_max_seconds": 86400,
+   "currency": "EUR",
+   "current_committed_micro_eur": 232669,
+   "current_period": "2026-10",
+   "current_trial_committed_micro_eur": 232669,
+   "dashboard_canary": null,
+   "external_ceiling_micro_eur": 100000000,
+   "generation": "0123456789abcdef0123456789abcdef",
+   "opening_evidence": "test dashboard, observed 2026-10-03T09:00:00Z",
+   "opening_micro_eur": 0,
+   "opening_observed_at": "2026-10-03T10:00:00.000000Z",
+   "opening_period": "2026-10",
+   "periods": [
+    {
+     "committed_micro_eur": 232669,
+     "period": "2026-10"
+    }
+   ],
+   "policy_hash": "6df40ecdf2c22a9d06a73c2b2d7090b40d722d590e04237b19c903cb034dd5c2",
+   "ready": true,
+   "schema_version": 2,
+   "service_hold": null,
+   "soft_stop_micro_eur": 90000000,
+   "trial_cutoff_micro_eur": 95000000,
+   "unresolved": [],
+   "worker_spend_errors": [
+    "dashboard_canary_absent"
+   ],
+   "worker_spend_ready": false
+  }
+ ]
+]

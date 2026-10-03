@@ -549,6 +549,235 @@ Clearing a manual hold is refused while any attempt remains unresolved. Clearing
 a dashboard mismatch hold does not admit a worker while the persisted canary is
 still absent or mismatched; a fresh accepted canary is required.
 
+## Quota lease binding (child-cap schema 4)
+
+In plain words: the gateway can now tie a paid child turn to a reference from an
+outside quota program, called a quota lease reference. Such a turn can carry its
+own smaller caps. When it ends, the ledger keeps a permanent receipt of what it
+spent. Nothing changes until you choose: an existing ledger works exactly as
+before until you migrate it, and after that the gateway still accepts turns
+without a reference until you turn the binding flag on. This version adds the
+gateway side only; the wrapper does not send references yet, so every child turn
+it opens stays unbound.
+
+A turn with a reference can set three caps: the number of calls, the money in
+micro-euro, and how long it may stay open. A cap that is left out means the
+ledger's own ceiling for calls and money, and **24 hours** for how long it may
+stay open. No cap can be above the ledger's ceiling, and 24 hours is also the
+longest a turn may stay open. Caps without a reference are refused.
+
+What you will notice:
+
+- A fresh `agenttalk gateway init` creates the new ledger shape, child-cap
+  schema 4 on ledger schema 3, with the binding flag off. Older agenttalk
+  versions refuse such a ledger completely.
+- An existing ledger stays on schema 3 and behaves as before. Calls that use a
+  reference are refused there until you migrate.
+- After the migration, `agenttalk gateway status` shows five new counts under
+  `ledger` (doctor's JSON shows the same, because it carries that output).
+- After the migration, a running gateway reports `runtime_marker_invalid` until
+  you start it again, because the child-cap policy hash changed. The steps
+  below keep the gateway stopped for the whole upgrade, so you only see this if
+  you skip that.
+- On schema 4, a child turn that has ended keeps its first ending. Older code
+  could change a turn stopped by its call ceiling to `expired` once its time
+  also ran out.
+
+### Upgrade an existing ledger
+
+The migration is one transaction: it either completes or leaves the ledger
+exactly as it was. It also moves the ledger schema from 2 to 3, and older
+agenttalk code refuses every operation on a ledger at schema 3: not only its
+status, but every reservation, settlement, reconciliation, hold and child turn.
+So **upgrade the gateway's runtime before you migrate**. An older gateway left
+running would stop working against the migrated ledger.
+
+1. Stop the gateway and keep it stopped until step 7:
+
+   ```powershell
+   agenttalk gateway stop --timeout 30
+   ```
+
+2. Back up the ledger: copy the whole `%LOCALAPPDATA%\agenttalk-ovh-spend`
+   folder (the ledger and its install marker) somewhere safe.
+3. Install this agenttalk version everywhere the gateway runs from, including
+   the runtime its scheduled task starts.
+4. Resolve every open provider attempt. The migration refuses while any
+   attempt is unresolved. `agenttalk gateway status` lists them under
+   `ledger.unresolved`; reconcile each one from provider evidence:
+
+   ```powershell
+   agenttalk gateway reconcile ATTEMPT_ID --outcome no-send --reason "provider confirms no request"
+   agenttalk gateway reconcile ATTEMPT_ID --outcome charge-reserve --reason "charge remains uncertain"
+   ```
+
+5. Migrate. The command reads the front token from its usual file; you never
+   type a token:
+
+   ```powershell
+   agenttalk gateway binding-install
+   ```
+
+   It prints `"installed": true`, `"schema_version": 4`, the new
+   `policy_hash` and `"quota_lease_binding_required": false`. A second run
+   prints `"installed": false` and changes nothing. If it stops with an error
+   after the database changed (for example, the install marker could not be
+   written), every agenttalk version refuses the ledger until you run
+   `binding-install` again; that run finishes the job.
+6. Check the result: in `agenttalk gateway status`, `ledger.schema_version` is
+   `3`, `ledger.child_cap_schema_version` is `4` and
+   `ledger.child_receipt_report_version` is `1`. The command exits non-zero
+   while the gateway is stopped; that is expected here.
+7. Start the gateway. Start records the new policy hash:
+
+   ```powershell
+   agenttalk gateway start
+   ```
+
+To roll back before any new activity, keep the gateway stopped, restore the
+folder you copied in step 2 and reinstall the older version. Restoring that
+backup is allowed only while nothing new has been recorded since it was made:
+no provider activity, no new binding and no receipt.
+
+Once new activity exists, do not restore the older ledger in place, and do not
+start older code against the updated ledger (it refuses it anyway). Keep the
+updated ledger, and use a
+forward repair or an explicitly reviewed recovery plan that keeps every
+liability and the receipt history.
+
+### The binding flag
+
+To require a reference for every new child turn:
+
+```powershell
+agenttalk gateway binding-required --on
+```
+
+`--off` turns it off again. The command prints the new value as
+`quota_lease_binding_required`, and `changed` says whether it was different
+before. It reads the front token from its usual file, like `binding-install`,
+and is refused on a schema-3 ledger.
+
+What the flag does: while it is on, the gateway refuses to open a child turn
+that has no reference. The wrapper treats that refusal as a hold, so the
+message waits and is retried; it is not dead-lettered. **This version's wrapper
+sends no references, so turning the flag on pauses every paid Qwen turn until
+you turn it off.**
+
+What the flag does not do:
+
+- It gives admission control only. It is not a per-attempt authority check and
+  not a sized reservation.
+- It never removes an existing binding and never switches off a cap. The caps of
+  a bound turn apply with the flag on or off, and can only be equal to or lower
+  than the ledger's own ceilings.
+- Installing this version, or turning the flag on, is not activation of complete
+  paid-quota enforcement. Live activation and the gateway upgrade stay separate
+  operator decisions, each with its own tested prerequisites.
+- In this version, live use keeps the ledger's existing money ceiling. Smaller
+  per-turn money caps are exercised in tests only, until a later sized
+  reservation is approved.
+
+### Receipts
+
+When a child turn with a reference ends, the ledger writes one permanent
+receipt. It holds the SHA-256 of the reference (never the reference itself), the
+outcome (`completed`, `cancelled`, `failed` or `provider_limit`), the number of
+calls, the tokens, the cost in micro-euro and the close time. A receipt is
+written only after every provider attempt of that turn is resolved. Until then a
+pending note waits, and the attempts keep their full reservation.
+
+To read the receipts, ask for the ones after a number you already have:
+
+```powershell
+agenttalk gateway receipts --after 0 --json
+```
+
+Example output (from a test ledger):
+
+```json
+{"after_seq":0,"envelope_version":1,"generation":"0123456789abcdef0123456789abcdef","has_more":false,"next_seq":1,"receipts":[{"actual_micro_eur":1290,"calls":1,"closed_at":"2026-10-03T15:08:10.204596Z","input_tokens":1200,"outcome":"completed","output_tokens":300,"quota_lease_ref_sha256":"2a01c30f7e61add4768006062dd7eb38c2942c1822c2122b2d49fd2a3154c19f","seq":1}]}
+```
+
+- `--json` is required. `--limit` takes 1 to 1000 (default 100); `has_more`
+  says the limit cut the page, and `next_seq` is the number to pass as `--after`
+  next time.
+- Receipt numbers start at 1 and have no gaps. A reader treats a gap as damage.
+- On an error, the command prints nothing on standard output, one word on
+  standard error (`bad_request`, `receipt_page_refused` or
+  `receipts_unavailable`), and exits with code 2.
+
+`agenttalk gateway status` shows, under `ledger`:
+
+- `child_receipt_report_version`: `1`;
+- `child_receipts`: the number of receipts;
+- `child_receipts_pending`: pending notes still waiting for an attempt;
+- `child_receipts_fallback`: ended turns whose ending had to be filled in with
+  the fallback rule (see the limits below);
+- `child_receipts_through_seq`: the highest receipt number this status covers,
+  `0` if none. It is read in the same snapshot as the money totals, so it never
+  counts a receipt whose cost is missing from them. The number only means
+  something together with the ledger's `generation`.
+
+### Limits of this version
+
+- **No bounded receipt time.** Nothing in this version runs the start-up sweep
+  that ends expired turns; a later open or reserve of the same turn notices the
+  expiry instead. Until then there is no receipt. A missing receipt is never a
+  zero.
+- **Unbound turns have no receipt.** That includes a turn that was opened
+  without a reference and then closed with one.
+- **"closed" is only an acknowledgement.** It never proves that a receipt exists
+  or that the cost is zero.
+- **No per-period coverage.** A receipt is not split between months, so
+  `child_receipts_through_seq` cannot be used to take a cross-month receipt out
+  of one month's total.
+- **No compaction.** Receipts and pending notes are kept for the life of the
+  ledger. A rebuilt ledger cannot recreate the receipts of the old one.
+- **A hand-edited ending stops the ledger.** An ended, referenced turn with no
+  recorded ending can only come from a hand edit or a damaged backup. The
+  ledger's integrity check then refuses the whole ledger. The fallback rule
+  (`expired` becomes `cancelled`, a call or cost refusal becomes `failed`) only
+  fills in endings for turns copied by the migration.
+
+Technical details:
+
+- Schema 4 adds the `child_turns` columns `quota_lease_ref_sha256`,
+  `terminal_outcome`, `terminal_at` and `terminal_source`, the tables
+  `child_receipts` and `receipt_pending`, and the metadata key
+  `quota_lease_binding_required` (`0` or `1`; any other value blocks the
+  ledger, it is never read as off). Database triggers keep an ending, a
+  binding, a receipt and a pending note from ever changing, including through
+  `INSERT OR REPLACE` (which skips update and delete triggers), and keep a
+  bound child turn from being deleted. A partial unique index lets one
+  reference bind at most one child turn.
+- Child-cap schema 4 always sits on ledger schema 3, in the database and in the
+  install marker; schema 3 sits on ledger schema 2. Every writer from before
+  quota lease binding checks for ledger schema 2 on each connection, so it
+  refuses the whole ledger. The migration also refuses a clock behind the
+  ledger's own initialization or last accepted admission, not only one behind
+  the child turns.
+- A reference must match `^[A-Za-z0-9._:-]{1,128}$`. Only its SHA-256 is
+  stored; no error, status or receipt shows the reference.
+- `SpendLedger.open_child_turn` takes the optional keywords `quota_lease_ref`,
+  `max_calls`, `max_micro_eur` and `ttl_seconds`. With a reference, a null
+  cap means the ledger ceiling and a missing `ttl_seconds` means 24 hours
+  (86 400 seconds); caps or `ttl_seconds` without a reference are refused. A
+  retry must bring the same values. `close_child_turn` takes the optional
+  `outcome` and `quota_lease_ref`; closing a bound turn needs both. Called with
+  either of them, it returns one word: `closed`, `already_terminal`, `fenced`,
+  `reference_ignored` or `not_opened`; a call without them returns `None`, as
+  before. A close with a reference
+  for a key that never opened writes a `fenced` turn and a zero receipt, so that
+  reference can never open later.
+- The read methods are `SpendLedger.child_receipts_page`,
+  `quota_lease_binding_state` and `status`; none of them writes. The start-up
+  sweep is `SpendLedger.sweep_child_receipts`.
+- The three commands call `install_child_cap_binding_as_operator`,
+  `set_quota_lease_binding_required_as_operator` and
+  `child_receipts_page_as_operator`. These read the front token from its usual
+  file inside the ledger code, so the command itself never holds it.
+
 ## Stop and Recovery
 
 ```powershell
