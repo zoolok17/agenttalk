@@ -788,10 +788,11 @@ def test_a_poisoned_run_leaves_no_prompt_path_environment_or_exception_text(tmp_
         terminal_failure=None,
     )
     sink.close()
-    blob = b""
-    for base, _dirs, names in os.walk(root):
-        for name in names:
-            blob += (Path(base) / name).read_bytes()
+    # Each file is read and parsed on its own: joining files in os.walk order (which
+    # differs between platforms) can run one file's last line into the next file's first.
+    contents = [path.read_bytes() for path in sorted(
+        Path(base) / name for base, _dirs, names in os.walk(root) for name in names)]
+    blob = b"\n".join(contents)  # for the scan for private text only
     assert blob
     for secret in (
         b"SENTINEL-ENV-VALUE",
@@ -804,7 +805,8 @@ def test_a_poisoned_run_leaves_no_prompt_path_environment_or_exception_text(tmp_
         b"SENTINEL/path",
     ):
         assert secret not in blob
-    kinds = [json.loads(line)["kind"] for line in blob.splitlines() if line.startswith(b"{") and b'"kind"' in line]
+    kinds = [json.loads(line)["kind"] for content in contents for line in content.splitlines()
+             if line.startswith(b"{") and b'"kind"' in line]
     assert kinds.count("dispatch_started") == 3 and kinds.count("dispatch_ended") == 3
 
 

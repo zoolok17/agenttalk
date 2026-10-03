@@ -104,10 +104,63 @@ def test_the_comparison_fails_when_the_loop_waits_differently(tmp_path, monkeypa
 
 def test_a_path_below_the_root_reads_the_same_on_every_platform(tmp_path):
     # The golden file is made on one platform and compared on all of them: Windows joins
-    # the parts of a path with a backslash (doubled inside JSON text), Linux and macOS with "/".
+    # the parts of a path with a backslash, Linux and macOS with "/".
     root = tmp_path / "store"
-    raw = str(root) + "\\.agenttalk\\x.json"
-    json_text = str(root).replace("\\", "\\\\") + "\\\\.agenttalk\\\\x.json"
+    windows = str(root) + "\\.agenttalk\\x.json"
     posix = str(root).replace("\\", "/") + "/.agenttalk/x.json"
-    for text in (raw, json_text, posix):
+    for text in (windows, posix):  # plain text, for example a log line
         assert scenarios.normalise(text, root, []) == "<ROOT>/.agenttalk/x.json", text
+    stored = {scenarios.normalise_file(json.dumps({"payload_path": path}), root, []) for path in (windows, posix)}
+    assert stored == {json.dumps({"payload_path": "<ROOT>/.agenttalk/x.json"}, indent=2)}
+
+
+def test_a_changed_file_name_below_the_root_stays_visible(tmp_path):
+    root = tmp_path / "store"
+    first, second = (json.dumps({"payload_path": str(root) + "/.agenttalk/dead-letter/beta/%s.json" % name})
+                     for name in ("first", "second"))
+    assert scenarios.normalise_file(first, root, []) != scenarios.normalise_file(second, root, [])
+
+
+def test_a_control_character_in_a_stored_path_is_not_hidden(tmp_path, monkeypatch):
+    # The review's case: the separator before "beta" turned into a backspace escape
+    # ("\b" + "eta"). Rewriting backslashes in serialized JSON would read it as a valid
+    # path; decoding first keeps the control character, so the comparison must fail.
+    original = Store.dead_letter
+    corrupted = []
+
+    def corrupt_payload_path(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        for stored in Path(self.root).rglob("*.deadletter.json"):
+            data = json.loads(stored.read_text(encoding="utf-8"))
+            good = data["payload_path"]
+            bad = good.replace("\\beta", "\beta").replace("/beta", "\beta")
+            assert good != bad
+            data["payload_path"] = bad
+            stored.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            corrupted.append(stored.name)
+        return result
+
+    monkeypatch.setattr(Store, "dead_letter", corrupt_payload_path)
+    got = scenarios.capture("success_then_dead_letter", tmp_path / "store")
+    assert corrupted
+    assert any(item.endswith(".deadletter.json") for item in
+               _differences(_golden()["success_then_dead_letter"], got))
+
+
+def test_a_new_agenttalk_version_does_not_change_the_comparison(tmp_path, monkeypatch):
+    from agenttalk.wrapper import health
+
+    monkeypatch.setattr(health, "__version__", "99.98.97")
+    got = scenarios.capture("success", tmp_path / "x")
+    assert "99.98.97" not in json.dumps(got)
+    assert _differences(_golden()["success"], got) == []
+
+
+def test_any_other_change_to_the_health_record_does_change_the_comparison(tmp_path):
+    got = scenarios.capture("success", tmp_path / "x")
+    name = ".agenttalk/state/beta.health.json"
+    health = json.loads(got["files"][name])
+    assert health["agenttalk_version"] == "<VERSION>"
+    health["reason_code"] = "something_else"
+    got["files"][name] = json.dumps(health, indent=2)
+    assert _differences(_golden()["success"], got) == ["file " + name]

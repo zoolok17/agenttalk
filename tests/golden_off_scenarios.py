@@ -90,16 +90,74 @@ SCENARIOS = {
 }
 
 
+# Values that depend on the release or the platform, not on what the loop did: the
+# agenttalk version, and a payload's size on disk (Windows writes CRLF line endings).
+_RELEASE_KEYS = frozenset({"agenttalk_version"})
+_PLATFORM_SIZE_KEYS = frozenset({"size_bytes"})
+
+
 def _posix_below_root(match: re.Match) -> str:
-    # Windows writes "\" (or "\\" inside JSON text) between the parts of a path; the
-    # golden file is compared on every platform, so the parts are always joined by "/".
-    return match.group(0).replace("\\\\", "/").replace("\\", "/")
+    # In a decoded string or in plain text a backslash is a real separator (Windows);
+    # the golden file is compared on every platform, so the parts are joined by "/".
+    return match.group(0).replace("\\", "/")
 
 
-def normalise(text: str, root: Path, ids: list[str]) -> str:
-    for form in (str(root), str(root).replace("\\", "/"), str(root).replace("\\", "\\\\")):
+def _root_free(text: str, root: Path) -> str:
+    for form in (str(root), str(root).replace("\\", "/")):
         text = text.replace(form, "<ROOT>")
-    text = _BELOW_ROOT.sub(_posix_below_root, text)
+    return _BELOW_ROOT.sub(_posix_below_root, text)
+
+
+def _decoded(value, root: Path):
+    """A decoded JSON value made comparable across platforms and releases.
+
+    Paths are rewritten here, on DECODED strings, never on serialized JSON text: there
+    a backslash can also start an escape, so a corrupted path (a control character
+    where a separator was) could be rewritten into a valid one and hidden."""
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            name = _root_free(key, root) if isinstance(key, str) else key
+            if key in _RELEASE_KEYS and isinstance(item, str):
+                out[name] = "<VERSION>"
+            elif key in _PLATFORM_SIZE_KEYS and type(item) is int:
+                out[name] = 0
+            else:
+                out[name] = _decoded(item, root)
+        return out
+    if isinstance(value, list):
+        return [_decoded(item, root) for item in value]
+    if isinstance(value, str):
+        return _root_free(value, root)
+    return value
+
+
+def normalise_file(text: str, root: Path, ids: list[str]) -> str:
+    """One file's content. A JSON document, or a file of JSON lines, is decoded, made
+    comparable value by value and written back in one fixed form; anything else is
+    plain text (see ``normalise``)."""
+    try:
+        document = json.loads(text)
+    except ValueError:
+        document = None
+    if isinstance(document, (dict, list)):
+        return normalise(json.dumps(_decoded(document, root), indent=2), root, ids, paths=False)
+    try:
+        lines = [json.loads(line) for line in text.splitlines() if line.strip()]
+    except ValueError:
+        lines = []
+    if lines and all(isinstance(line, (dict, list)) for line in lines):
+        body = "\n".join(json.dumps(_decoded(line, root)) for line in lines)
+        return normalise(body, root, ids, paths=False)
+    return normalise(text, root, ids)
+
+
+def normalise(text: str, root: Path, ids: list[str], *, paths: bool = True) -> str:
+    """Plain text (output, log lines, non-JSON files). ``paths=False`` for JSON text whose
+    paths ``_decoded`` already handled: rewriting backslashes in JSON text would treat
+    an escape as a separator."""
+    if paths:
+        text = _root_free(text, root)
     for found in _MSG.findall(text):
         if found not in ids:
             ids.append(found)
@@ -164,7 +222,7 @@ def capture(name: str, root: Path) -> dict:
     files = {}
     for path in sorted(p for p in store_root.rglob("*") if p.is_file()):
         relative = path.relative_to(store_root).as_posix()
-        files[relative] = normalise(path.read_text(encoding="utf-8", errors="replace"), store_root, ids)
+        files[relative] = normalise_file(path.read_text(encoding="utf-8", errors="replace"), store_root, ids)
     text = {key: normalise(got[key], store_root, ids) if isinstance(got[key], str) else got[key]
             for key in ("stdout", "stderr", "log", "raised")}
     record = {"turns": got["turns"], "sleeps": got["sleeps"], "stamps": got["stamps"],
