@@ -956,7 +956,7 @@
   // -------------------------------------------------------------- board (B8)
 
   var COLUMN_LABEL = {
-    needs_you: 'NEEDS YOU', queued: 'QUEUED', building: 'BUILDING', fix_round: 'FIX ROUND',
+    needs_you: 'NEEDS YOU', planned: 'PLANNED', queued: 'QUEUED', building: 'BUILDING', fix_round: 'FIX ROUND',
     independent_review: 'INDEPENDENT REVIEW', ready: 'READY', done: 'DONE', unknown: 'UNKNOWN'
   };
 

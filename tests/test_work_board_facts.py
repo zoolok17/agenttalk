@@ -491,7 +491,7 @@ def test_second_run_is_refused_and_the_next_run_invalidates(tmp_path, repo, monk
     publish(store, {"item-merged": merged})
     publish_now, refused = F._write_section, []
 
-    def interleave(store_arg, name, section):
+    def interleave(store_arg, name, section, **kwargs):
         if not refused:  # A has probed and is about to publish
             git(path, "update-ref", *(["-d", "refs/heads/master"] if change == "delete"
                                       else ["refs/heads/master", git(path, "rev-parse", merged + "^")]))
@@ -499,7 +499,7 @@ def test_second_run_is_refused_and_the_next_run_invalidates(tmp_path, repo, monk
                 F.verify_merges(store)
             assert cli.main(["--root", str(store.root), "board", "verify-merges"]) == 2
             refused.append(capsys.readouterr().err)
-        return publish_now(store_arg, name, section)
+        return publish_now(store_arg, name, section, **kwargs)
     monkeypatch.setattr(F, "_write_section", interleave)
     assert cli.main(["--root", str(store.root), "board", "verify-merges"]) == 0
     assert "another verify-merges run is in progress" in refused[0]
@@ -534,13 +534,13 @@ def test_run_refuses_to_publish_after_a_store_reset(tmp_path, repo, monkeypatch)
     publish(store, {"item-merged": merged})
     publish_now = F._write_section
 
-    def interleave(store_arg, name, section):
+    def interleave(store_arg, name, section, **kwargs):
         # A reset by another process while this run probes: a thread keeps its own lock order.
         worker = threading.Thread(target=store.reset)
         worker.start()
         worker.join()
         publish(store, {"item-merged": merged})
-        return publish_now(store_arg, name, section)
+        return publish_now(store_arg, name, section, **kwargs)
     monkeypatch.setattr(F, "_write_section", interleave)
     with pytest.raises(F.VerifyRefused, match="store session changed during this run"):
         F.verify_merges(store)

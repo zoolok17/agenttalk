@@ -252,13 +252,15 @@ class SnapshotService:
             from agenttalk import gates, work_board_facts, work_board_feed
             board_error = None
             try:
-                # Integration facts come from the lead-run verify-merges file: no Git here.
+                # Integration and planned facts come from the lead-run verify-merges/import-plan
+                # file: no Git here, and import-plan never runs inside the server either.
                 now = datetime.now(timezone.utc)
                 evidence = work_board_facts.load_integration(self.store, cfg, now=now)
+                plans = work_board_facts.load_planned(self.store, cfg, now=now)
                 board = work_board_feed.build(value, project=self.store.project_id(),
                                               lead=self.store.sole_lead(), now=now,
                                               gate_state=gates.load_gate_state(self.store.root),
-                                              integration=evidence)
+                                              integration=evidence, planned=plans)
                 if board["coverage"]["status"] != "complete" and self._board:
                     board["items"] = copy.deepcopy(self._board["items"])
                     board["last_known"] = True
