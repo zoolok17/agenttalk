@@ -703,10 +703,13 @@ def _gather_status(store: Store) -> dict:
         journal_label = _turn_journal_label(store, a, health)
         if journal_label is not None:  # additive: absent unless this project uses the journal
             row["turn_events"] = journal_label
-        park_view = store.usage_limit_park_view(a, health=health, now_epoch=now.timestamp())
+        sup_row = supervisor_rows.get(a)
+        sup_decision = sup_row.get("decision") if isinstance(sup_row, dict) else None
+        park_view = store.usage_limit_park_view(
+            a, health=health, now_epoch=now.timestamp(),
+            verdict_state=sup_decision.get("state") if isinstance(sup_decision, dict) else None)
         if park_view is not None:
             row["usage_limit_park"] = park_view
-        sup_row = supervisor_rows.get(a)
         if isinstance(sup_row, dict):
             decision = sup_row.get("decision")
             if isinstance(decision, dict):
@@ -11220,8 +11223,10 @@ def _usage_limit_notice_body(info: dict) -> str:
     window = {"five_hour": "5-hour", "seven_day": "weekly"}.get(facts.get("window"), "usage")
     wake = facts.get("wake_epoch")
     head = "still limited: " if facts.get("again") else ""
-    if isinstance(wake, int) and not isinstance(wake, bool):
-        reset = datetime.fromtimestamp(wake - 30, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    from agenttalk.wrapper import usage_park
+
+    reset = usage_park.format_epoch(wake - 30) if isinstance(wake, int) and not isinstance(wake, bool) else None
+    if reset:
         state = (f"its Claude {window} allowance is used up until {reset}. It tries once more 30 "
                  "seconds after that time, and once each time it is started again.")
     else:
@@ -11229,11 +11234,7 @@ def _usage_limit_notice_body(info: dict) -> str:
                  "It tries once more each time it is started again.")
     return (
         f"[usage-limit-parked] {head}Seat {ag} is parked: {state} Message {mid} from "
-        f"{info.get('from')} was NOT lost and was NOT dead-lettered. To start the seat again now: "
-        f"agenttalk request-restart --for {ag} (a protected seat also needs --force-protected and "
-        f"--acknowledge-live-protected-kill). To skip this message instead: agenttalk ack --for {ag} "
-        f"--id {mid} (it skips the message and leaves no dead-letter record; it is refused for a "
-        "managed lead-loop agent)."
+        f"{info.get('from')} was NOT lost and was NOT dead-lettered. " + usage_park.recovery_text(ag, mid)
     )
 
 

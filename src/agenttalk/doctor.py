@@ -2583,10 +2583,9 @@ def _check_usage_limit_parks(store: Store, *, now_epoch: float | None = None) ->
         name="usage_limit_park",
         status="warn",
         details="; ".join(lines),
-        fix=("It tries again by itself at the stated reset time and each time it is started. To start it "
-             "now: `agenttalk request-restart --for <agent>`; to skip the parked message: `agenttalk ack "
-             "--for <agent> --id <message id>`. If a notice never routed, set a liaison "
-             "(`agenttalk roster --set-operator-facing <agent>`)."),
+        fix=("It tries again by itself at the stated reset time and each time it is started. "
+             + usage_park.recovery_text("<agent>", "<message id>")
+             + " If a notice never routed, set a liaison (`agenttalk roster --set-operator-facing <agent>`)."),
         data={"parked": parked, "unrouted_notices": unrouted},
     )
 

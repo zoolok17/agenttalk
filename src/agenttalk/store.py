@@ -4507,7 +4507,10 @@ class Store:
             return []
         out: list[dict] = []
         for p in sorted(d.glob("*.json")):
+            cursor = self.cursor(p.stem)
             for mid, rec in (self.dead_letter_attempts(p.stem).get("messages") or {}).items():
+                if cursor and mid <= cursor:
+                    continue                    # the message was consumed: no active park to fix
                 if (isinstance(rec, dict) and rec.get("park_state") in usage_park.PARK_STATES
                         and rec.get("notice_key") and not rec.get("notice_routed")):
                     out.append({"agent": p.stem, "message_id": mid,
@@ -5765,6 +5768,7 @@ class Store:
         }
 
     def usage_limit_park_view(self, agent: str, *, health: dict | None = None,
+                              verdict_state: object = None,
                               now_epoch: float | None = None) -> dict | None:
         """What a reader shows for a parked seat (``usage_park.park_view``), or None.
 
@@ -5784,7 +5788,10 @@ class Store:
             theirs = marker.get("wrapper_generation")
             if live and theirs and live != theirs:
                 return None
-            return usage_park.park_view(marker, health)
+            beat = self.read_heartbeat(agent)
+            now = time.time() if now_epoch is None else now_epoch
+            age = None if beat is None else now - beat.timestamp()
+            return usage_park.park_view(marker, health, verdict_state=verdict_state, heartbeat_age=age)
         except Exception:  # noqa: BLE001 - a reader must never break on a view
             return None
 

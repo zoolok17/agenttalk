@@ -312,29 +312,57 @@ VIEW_STALE = "stale"
 
 
 def format_epoch(epoch: object) -> str | None:
-    """A time for people, in UTC ("2026-09-09 10:00 UTC"), or None for a bad value."""
-    seconds = whole_seconds(epoch)
-    if seconds is None:
+    """A time for people, in UTC ("2026-09-09 10:00 UTC"), or None for a bad value.
+
+    Display only: any finite positive time is accepted and rounded down to the second (a
+    park time carries fractions). The strict whole-second rule stays for the provider's
+    reset proof (``whole_seconds``)."""
+    number = _number(epoch)
+    if number is None or number <= 0:
         return None
     try:
-        return datetime.fromtimestamp(seconds, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        return datetime.fromtimestamp(int(number), timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     except (OverflowError, OSError, ValueError):
         return None
 
 
-def park_view(marker: dict | None, health: dict | None = None) -> dict | None:
+def recovery_text(agent: str, message_id: str) -> str:
+    """THE one text that tells a person how to get a parked seat moving again. Attention,
+    doctor and the notice all use it, and the README says the same."""
+    return (
+        f"To start it again now: agenttalk request-restart --for {agent} (it needs a running "
+        "supervisor; without one, stop the wrapper and start it again). A protected seat (the "
+        "operator-facing liaison or a lead) also needs --force-protected and, because a parked "
+        "seat is alive, --acknowledge-live-protected-kill. To skip the parked message instead: "
+        f"agenttalk ack --for {agent} --id {message_id} (it skips the message and leaves no "
+        "dead-letter record; it is refused for a managed lead-loop agent).")
+
+
+# Supervisor verdicts that confirm the seat healthy; any other verdict is independent adverse
+# evidence (for example STUCK_OR_DEAD) and wins over a park.
+_HEALTHY_VERDICTS = ("HEALTHY_IDLE", "HEALTHY_WORKING")
+
+
+def park_view(marker: dict | None, health: dict | None = None, *, verdict_state: object = None,
+              heartbeat_age: object = None) -> dict | None:
     """What every reader of seat health shows for a parked seat, from the published marker.
 
-    None when there is no marker, or when the health file is CURRENT evidence of a turn
-    running or stuck (the marker never overrides that). A marker the wrapper stopped
-    refreshing is NOT dropped: it reads as ``stale`` ("wrapper not responding"), so a dead
-    parked seat never looks healthy. Closed words, numbers and times only."""
+    THE one precedence, decided here and shipped in the payload (no reader decides its own):
+      1. an independent adverse supervisor verdict (anything but healthy) wins: no park;
+      2. CURRENT (not stale) working or stuck health wins over any park, fresh or stale: no park;
+      3. a fresh marker beats historical (stale) working health: ``parked``;
+      4. a stale marker, or a fresh one whose seat has not stamped its heartbeat for as long,
+         shows as ``stale`` ("wrapper not responding"), never as healthy;
+      5. no marker: nothing (today's display).
+    Closed words, numbers and times only."""
     if not isinstance(marker, dict):
         return None
-    fresh = bool(marker.get("fresh"))
-    if (fresh and isinstance(health, dict) and not health.get("stale")
-            and health.get("state") in _CURRENT_WORK_STATES):
+    if isinstance(verdict_state, str) and verdict_state and verdict_state not in _HEALTHY_VERDICTS:
         return None
+    if isinstance(health, dict) and not health.get("stale") and health.get("state") in _CURRENT_WORK_STATES:
+        return None
+    beat = _number(heartbeat_age)
+    fresh = bool(marker.get("fresh")) and not (beat is not None and beat > MARKER_STALE_SECONDS)
     return {
         "present": True,
         "state": VIEW_PARKED if fresh else VIEW_STALE,

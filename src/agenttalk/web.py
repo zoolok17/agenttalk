@@ -1666,9 +1666,6 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
         e["health"] = health
         # A seat parked on a provider usage limit (absent-not-null): the consoles show it as
         # waiting and needing attention - never down, never "not for you".
-        park_view = store.usage_limit_park_view(a, health=health, now_epoch=now_epoch)
-        if park_view is not None:
-            e["usage_limit_park"] = park_view
         # #105: the raw health above is the wrapper's own self-report - it
         # cannot notice its own CLI child dying. When the supervisor has an
         # independently-verified strict verdict for this agent, attach it so
@@ -1677,6 +1674,14 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
         verdict = cli_child_verdicts.get(a)
         if isinstance(verdict, dict):
             e["cli_child_verdict"] = verdict
+        # A seat parked on a provider usage limit (absent-not-null). THE precedence against the
+        # supervisor verdict and the health evidence is decided here (usage_park.park_view); the
+        # consoles render what they are given and never decide on their own.
+        park_view = store.usage_limit_park_view(
+            a, health=health, now_epoch=now_epoch,
+            verdict_state=verdict.get("state") if isinstance(verdict, dict) else None)
+        if park_view is not None:
+            e["usage_limit_park"] = park_view
         e["unread"] = _unread_count(msgs, a, store.cursor(a))
         e["sent"] = sent_counts.get(a, 0)
         e["received"] = recv_counts.get(a, 0)
@@ -3063,7 +3068,9 @@ def build_attention(desc: RootDescriptor,
             if src == _attention.SOURCE_USAGE_LIMIT_PARK and it.get("recommendation"):
                 # The two ways to act (restart it, or skip the parked message) travel on the
                 # ordinary card: this park has no mutation action in the dashboard.
-                entry["recommendation"] = _envelope_str(it.get("recommendation"))
+                # (the complete shared text, bounded like an operator command: it is a closed
+                # instruction, and cutting it at the short envelope limit loses the flags)
+                entry["recommendation"] = _operator_command_str(it.get("recommendation"))
             if src == _attention.SOURCE_DEAD_LETTER:
                 # Transient, stripped before the response is returned -
                 # _group_dead_letters_for_display() (web-display-only, #273

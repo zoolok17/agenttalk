@@ -732,10 +732,7 @@ def usage_limit_park_items(views: list[dict]) -> list[dict]:
             why = (f"{ag} stopped retrying because its {window} AI allowance is used up and no "
                    "reset time was stated. It tries once more each time it is started. The "
                    "message it holds is kept, and the messages behind it wait.")
-        recommendation = (
-            f"Start it again now: agenttalk request-restart --for {ag} (a protected seat also needs "
-            f"--force-protected). To skip the parked message instead: agenttalk ack --for {ag} "
-            f"--id {v.get('message_id')} (no dead-letter record).")
+        recommendation = usage_park.recovery_text(ag, v.get("message_id"))
         it = _mk_item(SOURCE_USAGE_LIMIT_PARK, item_id(SOURCE_USAGE_LIMIT_PARK, ag),
                       title=f"{ag}: {text}",
                       ident_content={"agent": ag, "window": v.get("window"),
