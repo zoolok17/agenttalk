@@ -40,6 +40,7 @@ time.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import datetime as _dt
 import errno
 import json
@@ -1318,11 +1319,31 @@ HEALTH_WARNING_PREFIX = "turn_journal_"
 _START_WARNINGS = {"turn_journal_start_failed": "start_failed", "turn_journal_start_timeout": "start_timeout"}
 
 
-def start_failure_warning(off_reason: object) -> str | None:
-    """The health-record word for a journal that never ran, or None."""
+def owner_tag(pid: object, token: object) -> str:
+    """Who wrote a warning: the writing process's pid and a short digest of its start token
+    ("none" when it has no token). Safe characters only, so it fits a health warning word."""
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16] if isinstance(token, str) and token else "none"
+    return "%s:%s" % (pid, digest)
+
+
+def start_failure_warning(off_reason: object, pid: object = None, token: object = None) -> str | None:
+    """The health-record word for a journal that never ran, or None. It carries its owner
+    (``word:pid:digest``), so a later wrapper never shows a previous wrapper's failure."""
     for word, reason in _START_WARNINGS.items():
         if reason == off_reason:
-            return word
+            return "%s:%s" % (word, owner_tag(pid, token))
+    return None
+
+
+def _owned_start_failure(warnings: Sequence[object] | None, pid: object, token: object) -> str | None:
+    """The start-failure reason whose owner is exactly this process, else None."""
+    mine = owner_tag(pid, token)
+    for word in warnings or ():
+        if not isinstance(word, str):
+            continue
+        head, _sep, owner = word.partition(":")
+        if head in _START_WARNINGS and owner == mine:
+            return _START_WARNINGS[head]
     return None
 
 
@@ -1336,12 +1357,14 @@ def status_label(
     environ: Mapping[str, str] | None = None,
     start_token: Callable[[int], str | None] | None = None,
     health_warnings: Sequence[object] | None = None,
+    process_running: Callable[[int], bool] | None = None,
 ) -> str:
     """What `status` shows about an agent's turn journal, from LIVE facts.
 
     Liveness is proven, never assumed: a process counts as running only when it is
-    alive AND its start token equals the one in the record; a token that cannot be read
-    is no evidence. Among the records of the agent, those of the current wrapper (when
+    still running (an affirmative answer; on Windows an exited child whose parent holds its
+    handle still has a readable start time, so identity alone is not enough) AND its start
+    token equals the one in the record. An unknown or unreadable answer is "not running". Among the records of the agent, those of the current wrapper (when
     its runtime record proves it alive) are chosen first, then the newest. ``health_mode``
     is the wrapper's own health mode, ``runtime_record`` its runtime record and
     ``health_warnings`` the warning words of its health record.
@@ -1349,10 +1372,21 @@ def status_label(
     if start_token is None:
         from agenttalk.wrapper_runtime import process_start_token as start_token
 
+        if process_running is None:
+            from agenttalk.store import _process_alive as process_running
+    elif process_running is None:
+        # A fake process table (tests): a pid is running when it has a start token.
+        table = start_token
+
+        def process_running(pid: int) -> bool:
+            return table(pid) is not None
+
     def proven_alive(pid: object, token: object) -> bool:
         if type(pid) is not int or pid <= 0 or not isinstance(token, str):
             return False
         try:
+            if process_running(pid) is not True:
+                return False
             current = start_token(pid)
         except Exception:  # noqa: BLE001
             return False
@@ -1384,10 +1418,10 @@ def status_label(
         if found is None:
             # The writer never ran for this wrapper: its start failure, if any, is in the
             # wrapper's own health record.
-            for word in health_warnings or ():
-                if word in _START_WARNINGS:
-                    return LABEL_OFF + " (%s)" % _START_WARNINGS[word]
-            return LABEL_OFF
+            reason = _owned_start_failure(
+                health_warnings, current_pid, runtime_record.get("wrapper_start") if runtime_record else None
+            )
+            return LABEL_OFF + (" (%s)" % reason if reason else "")
     else:
         # No proven current wrapper: prefer a record whose writer is provably running.
         running = [r for r in records if proven_alive(r["pid"], r["token"])]

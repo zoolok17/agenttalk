@@ -31,8 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to it. Where the wrapper cannot prove a message's reply landed, the journal
   records "outcome unknown" rather than guess. `agenttalk status` and
   `agenttalk doctor` show whether the journal is on, not responding, ended or
-  off (a writer counts as running only when its process is alive and matches
-  the record), and which modes are not journaled.
+  off (a writer counts as running only when its process is still running and
+  matches the record), and which modes are not journaled. A first-ever start
+  failure that creates no journal folder is not shown there. The "off behaves as
+  before" proof covers the listed legacy-loop scenarios, not every path.
 
   Once the journal is off, no new file operation starts, and a failed sync of
   a full file is counted and shown in `agenttalk status` rather than retried

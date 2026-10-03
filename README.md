@@ -1008,6 +1008,16 @@ Old files are removed oldest first once the folder passes its size cap.
   file operation of any kind starts. The only record still written is the
   status record that says why a start failed or timed out, and not even that
   once the close deadline has passed.
+- `status` and `doctor` add journal labels only once the project has a journal
+  folder. A first-ever start failure that creates no folder is therefore not shown
+  there, even though the wrapper's health record carries the warning.
+- The "journal off behaves as before" proof compares the loop with golden files made
+  from the code before the journal existed (`tests/golden/`). It covers the
+  legacy-loop scenarios listed in `tests/golden_off_scenarios.py` (no commit gate):
+  final files, log lines, exceptions, waits and heartbeat counts after the volatile
+  values are normalised. It is not exhaustive byte equality for every path, and
+  two deliberate breaks at rarely used sites survived it (skipping one
+  attempt-ledger cleanup, and skipping one heartbeat stamp): known coverage limits.
 - The journal writes nothing to the wrapper's own log. A journal that did not
   start, or a fault while writing, shows only in the journal's own status
   record, in `agenttalk status` and in `agenttalk doctor`.
@@ -1019,16 +1029,20 @@ environment values, secrets, model names or error text.
 
 **What `status` and `doctor` show** (only once the project has a journal folder;
 otherwise their output is unchanged), computed from live facts, never from the
-newest file alone: a writer counts as running only when its process is alive
-**and** its start token matches the record (a token that cannot be read is no
-evidence), and among several records the current wrapper's own come first:
+newest file alone: a writer counts as running only when its process is
+still running (an affirmative answer from the system; an exited child whose parent
+still holds its handle does not count) **and** its start token matches the record
+(an unknown or unreadable answer is "not running"), and among several records the current wrapper's own come first:
 `on (loop)`, `on (loop); cadence turns unmanaged`,
 `writer not responding`, `off`, `off (start_failed)`, `off (start_timeout)`,
 `ended`, `unmanaged (one_shot)` and `unmanaged (plain)`. A file left by an
 earlier run never changes the label of a running wrapper. A journal that never
 started at all (for example because its thread could not be created) is shown
 as `off (start_failed)` or `off (start_timeout)` through the wrapper's own
-health record, so it needs no extra file write.
+health record, so it needs no extra file write. That warning names the wrapper
+that wrote it (its process id and a digest of its start token), and is shown only
+while that same wrapper is the live one; a replacement wrapper never shows its
+predecessor's failure.
 
 **Reading it.** `agenttalk.turn_events` has the reader (`read_streams`,
 `list_segments`, `read_segment`, `iter_records`) and the closed record checker

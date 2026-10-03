@@ -23,6 +23,7 @@ import pytest
 
 from agenttalk import cli
 from agenttalk import turn_events as te
+from agenttalk import wrapper_runtime as wr_module
 from agenttalk.store import Store
 from agenttalk.wrapper import loop, run, session
 from agenttalk.wrapper_logs import WrapperLifecycleLog
@@ -925,7 +926,9 @@ def test_a_failed_start_is_carried_by_the_wrappers_own_health_record(tmp_path, m
         lifecycle_log=WrapperLifecycleLog("beta", stream=lifecycle_stream, enabled=True),
         lead_loop=False,
     )
-    assert rc == 0 and seen["warnings"] == ["turn_journal_start_failed"]
+    me = os.getpid()
+    owner = te.start_failure_warning("start_failed", me, wr_module.process_start_token(me))
+    assert rc == 0 and seen["warnings"] == [owner]  # the word names this wrapper as its owner
     assert not list(_journal_dir(store).glob("status-*.json"))
     assert cli._turn_journal_label(store, "beta", None) == "off (start_failed)"
     assert "turn_journal" not in lifecycle_stream.getvalue()

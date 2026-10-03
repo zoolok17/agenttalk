@@ -11984,7 +11984,11 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                 # Carried by the health record the wrapper writes anyway: no new I/O here.
                 from .turn_events import start_failure_warning
 
-                warning = start_failure_warning(journal.off_reason)
+                # The word names its owner (this wrapper's pid and start token, already known
+                # to the runtime writer), so a replacement wrapper never shows it as its own.
+                warning = start_failure_warning(
+                    journal.off_reason, runtime_writer.wrapper_pid, runtime_writer.wrapper_start
+                )
                 if warning is not None:
                     health_writer.standing_warnings = (warning,)
         turns = wloop.run_loop(

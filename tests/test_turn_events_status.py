@@ -369,11 +369,17 @@ def test_a_start_failure_reaches_status_through_the_health_record_only(tmp_path)
     store = _store(tmp_path)
     te.default_turn_events_root(store.root).mkdir(parents=True)  # the journal folder exists
     runtime = _real_runtime()
-    for word, label in (("turn_journal_start_failed", "off (start_failed)"), ("turn_journal_start_timeout", "off (start_timeout)")):
-        assert _label_w(store, runtime, [word]) == label
+    token = runtime["wrapper_start"]
+    for reason, label in (("start_failed", "off (start_failed)"), ("start_timeout", "off (start_timeout)")):
+        assert _label_w(store, runtime, [te.start_failure_warning(reason, ME, token)]) == label
     # unrelated or malformed warnings change nothing; with no live owner they are not believed
+    mine = te.start_failure_warning("start_failed", ME, token)
     assert _label_w(store, runtime, ["lock_contention_admission", 5, None]) == "off"
-    assert _label_w(store, None, ["turn_journal_start_failed"]) == "off"
+    assert _label_w(store, None, [mine]) == "off"
+    # a word without an owner (or with another owner) is not this wrapper's
+    assert _label_w(store, runtime, ["turn_journal_start_failed"]) == "off"
+    assert _label_w(store, runtime, [te.start_failure_warning("start_failed", ME + 1, token)]) == "off"
+    assert _label_w(store, runtime, [te.start_failure_warning("start_failed", ME, "another-token")]) == "off"
 
 
 def _label_w(store, runtime, warnings):
@@ -387,10 +393,12 @@ def test_the_health_writer_carries_the_start_failure_in_the_write_it_already_mak
     writer = WrapperHealthWriter(store, "beta", "claude", mode="wrapper-loop", min_interval=0.0)
     writer.idle()
     assert store.read_health_raw("beta")["warnings"] == []
-    writer.standing_warnings = (te.start_failure_warning("start_failed"),)
+    word = te.start_failure_warning("start_failed", ME, "tok-me")
+    writer.standing_warnings = (word,)
     writer.idle()
-    assert store.read_health_raw("beta")["warnings"] == ["turn_journal_start_failed"]
-    assert te.start_failure_warning("writer_error") is None
+    assert store.read_health_raw("beta")["warnings"] == [word]
+    assert word.startswith("turn_journal_start_failed:%d:" % ME) and "tok-me" not in word
+    assert te.start_failure_warning("writer_error", ME, "tok-me") is None
 
 
 def test_a_thread_that_cannot_start_shows_off_start_failed_without_any_status_write(tmp_path, monkeypatch):
@@ -404,14 +412,150 @@ def test_a_thread_that_cannot_start_shows_off_start_failed_without_any_status_wr
     def refuse(self):
         raise RuntimeError("cannot start a thread")
 
-    real_start = threading.Thread.start
-    monkeypatch.setattr(threading.Thread, "start", refuse)
-    assert sink.start() is False and sink.off_reason == "start_failed"
-    monkeypatch.setattr(threading.Thread, "start", real_start)  # (not undo(): that would drop the journal folder setting)
+    # Only the thread fault is scoped: a plain undo() would also drop the autouse journal-folder setting.
+    with monkeypatch.context() as scoped:
+        scoped.setattr(threading.Thread, "start", refuse)
+        assert sink.start() is False and sink.off_reason == "start_failed"
+    assert os.environ[te.ENV_TURN_EVENTS_DIR].startswith(str(tmp_path))
+    runtime = _real_runtime()
     writer = WrapperHealthWriter(store, "beta", "claude", mode="wrapper-loop", min_interval=0.0)
-    writer.standing_warnings = (te.start_failure_warning(sink.off_reason),)
+    writer.standing_warnings = (te.start_failure_warning(sink.off_reason, runtime["wrapper_pid"], runtime["wrapper_start"]),)
     writer.idle()
     assert not os.path.exists(sink.status_path)
     assert _row(store)["turn_events"] == "off (start_failed)"
     check = doctor._check_turn_journal(store)
     assert check.status == "warn" and "off (start_failed)" in check.details
+
+
+# --- fix round 2: proof of life, and a start-failure warning that belongs to its wrapper -----
+
+
+def _exited_child_holding_its_handle():
+    """A real child that has exited while this parent still holds its process handle."""
+    import subprocess
+    import sys
+
+    child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE)
+    token = wr.process_start_token(child.pid)
+    assert token
+    child.communicate(timeout=10)
+    assert child.returncode == 0
+    return child, token
+
+
+def _close(child):
+    if os.name == "nt":
+        child._handle.Close()  # noqa: SLF001
+
+
+def test_f3_an_exited_child_whose_parent_holds_its_handle_is_ended(tmp_path):
+    store = _store(tmp_path)
+    child, token = _exited_child_holding_its_handle()
+    try:
+        # the identity still reads back (that is the trap) ...
+        assert wr.process_start_token(child.pid) == token or os.name != "nt"
+        _write_status(store, pid=child.pid, process_start_token=token)
+        # ... but it is not running
+        assert te.status_label(store.root, "beta", health_mode="wrapper-loop") == "ended"
+    finally:
+        _close(child)
+
+
+def test_f3_the_same_case_for_the_one_shot_classification(tmp_path):
+    store = _store(tmp_path)
+    child, token = _exited_child_holding_its_handle()
+    try:
+        record = {"wrapper_pid": child.pid, "wrapper_start": token}
+        label = te.status_label(store.root, "beta", health_mode="wrapper-one-shot", runtime_record=record)
+        assert label == "unmanaged (plain)"
+    finally:
+        _close(child)
+
+
+def test_f3_a_running_process_with_a_matching_token_is_still_alive(tmp_path):
+    store = _store(tmp_path)
+    sink = _live_sink(store)
+    try:
+        assert te.status_label(store.root, "beta", health_mode="wrapper-loop", runtime_record=_real_runtime()) == "on (loop)"
+    finally:
+        sink.close()
+
+
+def test_f3_an_unknown_running_answer_is_not_alive(tmp_path):
+    store = _store(tmp_path)
+    sink = _live_sink(store)
+    try:
+        real = wr.process_start_token
+
+        def label(running):
+            return te.status_label(
+                store.root, "beta", health_mode="wrapper-loop", runtime_record=_real_runtime(),
+                start_token=real, process_running=running,
+            )
+
+        assert label(lambda pid: True) == "on (loop)"
+        for unknown in (lambda pid: False, lambda pid: None, lambda pid: "yes"):
+            assert label(unknown) == "ended"
+
+        def boom(pid):
+            raise OSError("no")
+
+        assert label(boom) == "ended"
+    finally:
+        sink.close()
+
+
+def _health_written_by_another_process(store, warning_owner_pid=None):
+    """A separate process writes a start-failure health record, then exits."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys; sys.path.insert(0, sys.argv[1]); "
+        "from agenttalk import turn_events as te, wrapper_runtime as wr; "
+        "from agenttalk.store import Store; "
+        "from agenttalk.wrapper.health import WrapperHealthWriter; "
+        "import os; "
+        "w=WrapperHealthWriter(Store(sys.argv[2]), 'beta', 'claude', mode='wrapper-loop', min_interval=0); "
+        "w.standing_warnings=(te.start_failure_warning('start_failed', os.getpid(), wr.process_start_token(os.getpid())),); "
+        "w.idle()"
+    )
+    subprocess.run([sys.executable, "-c", code, str(Path(te.__file__).parents[1]), str(store.root)], check=True)
+
+
+def test_f5_a_previous_wrappers_start_failure_is_not_shown_for_its_replacement(tmp_path):
+    from agenttalk import cli
+
+    store = _store(tmp_path)
+    te.default_turn_events_root(store.root).mkdir(parents=True)
+    _health_written_by_another_process(store)
+    assert store.read_health_raw("beta")["warnings"]  # the old bytes are really there
+    # a replacement wrapper has published its runtime; its own health write has not happened yet
+    wr.WrapperRuntimeWriter(store.state_dir, "beta", "new-generation").idle()
+    assert cli._turn_journal_label(store, "beta", None) == "off"  # noqa: SLF001
+    check = doctor._check_turn_journal(store)
+    assert check is None or "start_failed" not in check.details
+
+
+def test_f5_the_control_the_wrappers_own_warning_is_still_shown(tmp_path):
+    from agenttalk import cli
+
+    store = _store(tmp_path)
+    te.default_turn_events_root(store.root).mkdir(parents=True)
+    _wrapper_state(store)
+    runtime = _real_runtime()
+    writer = WrapperHealthWriter(store, "beta", "claude", mode="wrapper-loop", min_interval=0.0)
+    writer.standing_warnings = (te.start_failure_warning("start_timeout", runtime["wrapper_pid"], runtime["wrapper_start"]),)
+    writer.idle()
+    assert cli._turn_journal_label(store, "beta", None) == "off (start_timeout)"  # noqa: SLF001
+    check = doctor._check_turn_journal(store)
+    assert check.status == "warn" and "off (start_timeout)" in check.details
+
+
+def test_f5_a_current_journal_overrides_an_old_warning(tmp_path):
+    store = _store(tmp_path)
+    _wrapper_state(store)
+    _write_status(store, pid=ME, process_start_token=wr.process_start_token(ME))
+    runtime = _real_runtime()
+    word = te.start_failure_warning("start_failed", ME, runtime["wrapper_start"])
+    assert _label_w(store, runtime, [word]) == "on (loop)"
