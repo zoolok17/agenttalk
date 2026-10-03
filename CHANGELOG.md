@@ -46,10 +46,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   journal's status record rather than retried (that file's durability is then
   unproven).
 
+  A message's time is recorded only when it is a real time; anything else (a
+  path, a name) is recorded as empty, so no private text can reach the journal
+  that way. Finding the journal's folder counts against its 2-second start-up
+  limit and happens off the wrapper's own thread, so a slow disk cannot hold up
+  the wrapper.
+
   The files are in a per-user folder beside the wrapper logs, which
   `AGENTTALK_TURN_EVENTS_DIR` can move. For developers: `agenttalk.turn_events`
   has the writer, the closed record format with its checker, and a reader for
-  the files.
+  the files. The reader's cursor moves past a record only when the record is
+  handed over, so a reader that stops early resumes where it stopped.
 
 - **One plain-language voice for everything a person reads, not only release
   notes.** The write-for-humans skill taught agents to explain changes in plain

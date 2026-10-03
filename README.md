@@ -995,8 +995,12 @@ Old files are removed oldest first once the folder passes its size cap.
 - "Complete" means "no loss the journal can see". It is not a guarantee.
 - A run whose journal failed to start (or timed out starting, after at most
   2 seconds) is **not observed**: the wrapper simply runs without it, and
-  `status` shows `off (start_failed)` or `off (start_timeout)`.
-- A message's time is the **sender's** clock. A consumer comparing it with the
+  `status` shows `off (start_failed)` or `off (start_timeout)`. Finding the
+  journal's folder counts against those 2 seconds: it happens on the writer's
+  own thread, so a slow or unavailable disk cannot hold up the wrapper's start.
+- A message's time is the **sender's** clock, recorded only when it is a real
+  time (a value that is not, such as a path or a name, is recorded as `null`).
+  A consumer comparing it with the
   journal's own times should allow for skew between machines, and an undetected
   change of a machine's clock can defeat any time-based check.
 - A crash can lose the last events that were still waiting to be written.
@@ -1051,6 +1055,9 @@ predecessor's failure.
 **Reading it.** `agenttalk.turn_events` has the reader (`read_streams`,
 `list_segments`, `read_segment`, `iter_records`) and the closed record checker
 (`validate_event`). The schema version is 1; a reader refuses another version.
+`iter_records` moves its cursor past a record only when it hands that record
+over, so a reader that stops early (or reads in batches) resumes at the first
+record it has not received.
 
 ### Windows notes
 

@@ -187,6 +187,17 @@ def parse_time(text: object) -> int | None:
     return (delta.days * 86_400 + delta.seconds) * 1000 + delta.microseconds // 1000
 
 
+def _is_message_time(value: object) -> bool:
+    """True for a message time the journal may keep: ASCII text that is a real time.
+
+    The bus checks only that a message's ``ts`` is text, so anything else (a path, a
+    name) must stop here and never reach a file."""
+    try:
+        return type(value) is str and value.isascii() and parse_time(value) is not None
+    except Exception:  # noqa: BLE001 - an odd value is simply not a time
+        return False
+
+
 # --- the closed schema ---------------------------------------------------
 
 
@@ -233,7 +244,7 @@ def validate_event(obj: object) -> dict[str, Any]:
             _bad()
         if kind != KIND_DISPATCH_ENDED:
             at = obj["message_at"]
-            if at is not None and (not isinstance(at, str) or len(at) > 40 or not at.isascii()):
+            if at is not None and not _is_message_time(at):
                 _bad()
         if kind == KIND_DISPATCH_STARTED:
             if not (_name_ok(obj["turn_id"]) and obj["cli"] in CLIS and obj["cli_session"] in SESSIONS):
@@ -341,6 +352,7 @@ class SegmentRead:
     def __init__(self) -> None:
         self.records: list[dict[str, Any]] = []
         self.end_offset = 0  # just after the last complete line
+        self.record_ends: list[int] = []  # for each record, the offset just after its line
         self.torn = False  # bytes follow the last newline (a half-written line)
         self.damaged = 0  # complete lines that did not fit the schema
 
@@ -358,13 +370,18 @@ def read_segment(path: str | os.PathLike[str], offset: int = 0) -> SegmentRead:
         return result
     result.end_offset = offset + cut + 1
     result.torn = len(data) > cut + 1
+    position = offset
     for line in data[:cut].split(b"\n"):
+        position += len(line) + 1
         try:
-            result.records.append(parse_line(line))
+            record = parse_line(line)
         except UnsupportedSchemaVersion:
             raise
         except Exception:  # any unreadable line is damage, never a stall
             result.damaged += 1
+            continue
+        result.records.append(record)
+        result.record_ends.append(position)
     return result
 
 
@@ -431,19 +448,23 @@ def iter_records(
 ) -> Iterator[tuple[str, int, dict[str, Any]]]:
     """Yield ``(generation, segment, record)`` for every complete record after ``cursor``.
 
-    ``cursor`` maps ``(generation, segment)`` to a byte offset and is updated
-    in place to the new end of each segment read, so calling again continues
-    where the last call stopped. A half-written last line is left for later.
+    ``cursor`` maps ``(generation, segment)`` to a byte offset and is updated in
+    place as each record is handed over: it moves past a record only when that
+    record is yielded (and past a segment's damaged lines once the segment is
+    done). A reader that stops early therefore resumes at the first record it
+    has not received. A half-written last line is left for later.
     """
     cursor = {} if cursor is None else cursor
     for generation, number, path in list_segments(agent_dir):
+        key = (generation, number)
         try:
-            read = read_segment(path, cursor.get((generation, number), 0))
+            read = read_segment(path, cursor.get(key, 0))
         except FileNotFoundError:
             continue
-        cursor[(generation, number)] = read.end_offset
-        for record in read.records:
+        for record, end in zip(read.records, read.record_ends, strict=True):
+            cursor[key] = end
             yield generation, number, record
+        cursor[key] = read.end_offset
 
 
 # --- the files seam (tests replace it to block or fail operations) ----------
@@ -595,6 +616,8 @@ def _snapshot(kind: object, fields: object) -> dict[str, Any] | None:
                     return None
                 counts[name] = count
             out[key] = counts
+        elif key == "message_at":
+            out[key] = value if _is_message_time(value) else None
         elif type(value) in (str, int, bool, type(None)):
             out[key] = value
         else:
@@ -614,7 +637,7 @@ class TurnEventSink:
 
     def __init__(
         self,
-        directory: str | os.PathLike[str],
+        directory: str | os.PathLike[str] | Callable[[], str | os.PathLike[str]],
         agent: str,
         *,
         agent_version: str = "unknown",
@@ -631,8 +654,12 @@ class TurnEventSink:
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.agent = agent
-        self.directory = str(directory)
-        self._agent_dir = os.path.join(self.directory, agent)
+        # A function is called on the writer thread, inside start's deadline: finding the
+        # default folder touches the file system, and a slow or unavailable disk must count
+        # against that deadline, never against the caller. A path is used as given.
+        self._directory_source = directory if callable(directory) else None
+        self.directory = "" if callable(directory) else str(directory)
+        self._agent_dir = os.path.join(self.directory, agent) if self.directory else ""
         self.generation = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-%d-%s" % (
             os.getpid(),
             secrets.token_hex(2),
@@ -697,7 +724,7 @@ class TurnEventSink:
         self._token: str | None = None
         self._previous: str | None = None
         self._closed_cleanly = False
-        self._status_path = os.path.join(self._agent_dir, "status-%s.json" % self.generation)
+        self._status_path = os.path.join(self._agent_dir, "status-%s.json" % self.generation) if self._agent_dir else ""
 
     # -- the caller's side ---------------------------------------------------
 
@@ -853,9 +880,23 @@ class TurnEventSink:
         finally:
             self._finish()
 
+    def _resolve_directory(self) -> None:
+        """Find the folder when it was given as a function (see ``__init__``)."""
+        source = self._directory_source
+        if source is None:
+            return
+        directory = str(source())
+        agent_dir = os.path.join(directory, self.agent)
+        self._status_path = os.path.join(agent_dir, "status-%s.json" % self.generation)
+        self._agent_dir = agent_dir
+        self.directory = directory
+        self._directory_source = None
+
     def _register(self) -> bool:
-        """Create the folder, list the stream, open segment 1. Sets the ack."""
+        """Find the folder, create it, list the stream, open segment 1. Sets the ack."""
         try:
+            self._check()
+            self._resolve_directory()
             self._check()
             self._files.makedirs(self._agent_dir)
             self._check()
@@ -1179,6 +1220,8 @@ class TurnEventSink:
         self._abandon_segment()
 
     def _write_status(self, final: bool = False) -> None:
+        if not self._status_path:
+            return  # the folder was never found: there is nowhere to write
         self._last_status = time.monotonic()
         state = self._state
         if final and state == "on":

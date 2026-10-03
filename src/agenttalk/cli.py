@@ -12091,12 +12091,15 @@ def _turn_events_wanted(args: argparse.Namespace) -> bool:
 def _build_turn_journal(store, agent: str, *, lead_loop: bool):
     """The turn-journal sink for this wrapper, or None if it cannot even be built.
 
-    Building does no I/O; ``start()`` (called once before the first message) does."""
+    Building does no I/O, not even finding the folder (that touches the file system):
+    the sink calls the folder function on its writer thread, inside the bound of
+    ``start()`` (called once before the first message)."""
     try:
         from .turn_events import TurnEventSink, default_turn_events_root
 
+        project_root = store.root
         return TurnEventSink(
-            default_turn_events_root(store.root),
+            lambda: default_turn_events_root(project_root),
             agent,
             agent_version=__version__,
             unmanaged=("cadence",) if lead_loop else (),
