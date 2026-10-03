@@ -11,6 +11,114 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A small, neutral program runner for asking an outside program whether a
+  paid turn may run (build 6a-2a of "quota lease binding" for the paid
+  gateway).** An operator running the paid gateway will be able to plug in
+  their own local program - the "turn admission program" - that decides
+  whether a paid turn may start and under what limits, instead of agenttalk
+  always using the gateway's fixed defaults. This patch is the runner that
+  talks to that program; it does not yet change how or when the wrapper asks
+  it, which is separate, later work.
+
+  What you will notice: nothing yet. This patch adds the runner and its
+  configuration shape (documented in the README); nothing calls it until a
+  later patch wires it into the wrapper's own turn handling.
+
+  What you need to do: nothing. An operator who wants to try the feature
+  once it is fully wired will configure a `turn_admission` section in
+  `supervisor.json` (see the README) - there is no change to make today.
+
+  Technical details: `src/agenttalk/turn_admission.py` runs the configured
+  executable with `shell=False`, an absolute path, fixed arguments, a fixed
+  working directory, and a minimal environment built only from the
+  operator's own fixed name/value pairs (nothing else is inherited, so no
+  token reaches the program; none of `command`, `args`, `cwd`, or `env` may
+  contain a NUL character; `.bat`/`.cmd` commands are refused on Windows,
+  checked against the NORMALIZED execution target - Windows itself strips
+  trailing dots and spaces before deciding what runs, so a trailing space or
+  dot cannot smuggle a refused suffix past this check; Windows environment
+  names are matched case-insensitively, so an operator name that collides
+  with this runner's own default, or with another operator name, only by
+  case is refused at configuration time rather than silently duplicated).
+  On Windows, the program is created suspended, assigned to the
+  kill-on-close Job Object, and only then resumed, so a child it spawns in
+  its first instant can never escape containment; on POSIX the new
+  session/process group is already in place before the program's own code
+  runs, so no equivalent step is needed there. Each call follows one call
+  lifecycle (stated as numbered promises in PR #308 and the README's "How a
+  call ends"). One deadline is computed once; the operation window (pin
+  check, writing the request, reading the answer, the program's own exit)
+  ends one cleanup slice before it (a quarter of the timeout, at most one
+  second), and teardown runs in that slice, never past the deadline.
+  Teardown runs on every path, success and cancellation included, from the
+  line that creates the process: the whole tree is terminated by exact
+  process id (a Job Object on Windows, reusing `powershell_host`'s
+  pywin32-free implementation; the process group on POSIX), never by image
+  name; its end is observed (Windows: the program's handle and the handle
+  of every process the job lists are signaled and the job is empty; POSIX:
+  the program, the direct child, is reaped - only after its group was
+  signalled, because the group's id is the program's id and a reaped id can
+  be reused: the exit is watched without reaping, with `os.waitid(WNOWAIT)`
+  or, on macOS before Python 3.13, `kqueue`, and a program something else
+  collected first fails as `exit_code` with its group left unsignalled);
+  and the reading and writing threads are joined. Success is decided once,
+  last: the answer is returned
+  only if it was fully written and read without an error, passed its
+  operation's full shape check, the program exited by itself with code 0,
+  all of that was seen inside the operation window (checked once the I/O is
+  complete, after the exit and after validation, so a late answer cannot eat
+  the cleanup slice), teardown observed the end, and the deadline has not
+  passed at that moment - an answer completed after the window never counts.
+  If the end
+  cannot be observed by the deadline, the call fails with the new closed
+  word `cleanup_unconfirmed`, ahead of any other word. Output is read
+  incrementally in bounded chunks, so an oversized
+  answer is caught the moment enough bytes arrive rather than waiting for
+  the program to close its output or for the deadline to pass. Standard
+  error is discarded without ever being accumulated or logged. Both the
+  request this module sends and the answer it reads are strict, closed-key
+  JSON (no booleans or floats where an integer is required, no duplicate
+  keys, no `NaN`/`Infinity`, nothing but JSON whitespace - space, tab, CR,
+  LF - before or after the value, no nesting deeper than 32
+  arrays or objects - deeper input is `not_json` on every supported Python
+  version, where Python 3.10's decoder would otherwise raise RecursionError
+  under the byte cap), with a size cap enforced
+  while reading so a legal answer is never cut off and an oversized one
+  never gets the chance to look valid. Every failure - the program not
+  starting (including a failed write or read, which are treated the same
+  as the program never having completed a call), a pin mismatch, the
+  timeout, a non-zero exit, invalid JSON, a wrong key/type/bound, an
+  oversized answer - is reported to the caller as one of nine closed words
+  (the eight of the spec plus `cleanup_unconfirmed`), never the program's
+  own text. Configuration (the
+  executable path, arguments, optional SHA-256 pin, working directory,
+  environment list and timeout) comes only from the operator's own local
+  wrapper configuration; a test proves a bus message, an agent, task text,
+  or an agent-settable environment variable can never change what runs. A
+  key outside the six documented settings is refused (a misspelled pin is
+  never silently ignored), and `timeout_seconds` is range-checked before it
+  is converted, so every bad number is a `ValueError`. An
+  optional SHA-256 pin is checked once before each launch - it catches an
+  accidentally wrong or stale program, not a concurrent replacement of the
+  file between the check and the launch; keep the program in an
+  operator-only-writable folder if that distinction matters.
+  Tests: `tests/test_turn_admission.py`, including a real child process that
+  starts a real grandchild and hangs, confirmed killed by its exact process
+  id; (Windows-only) a test proving a program cannot run before containment
+  is attached, and another proving an interruption immediately after
+  spawning still reaps the process; a fake-clock test proving a failed
+  call's total time, cleanup included, never exceeds its configured
+  timeout and that the operation's own wait ends a cleanup slice early;
+  the reviewer's delayed-observer probe as a test (a real program that
+  answers after its limit is refused as `timeout`, for `closed` and
+  `admit`); real-process tests, also on the POSIX CI legs, that a
+  timeout, a failure and a success each end the program's tree and
+  observe its end; and tests that an unobserved end or an unjoinable
+  thread is `cleanup_unconfirmed`. Limits stated in the README: the pin
+  read cannot be interrupted, scheduling can delay the return (both only
+  delay a failure), and on POSIX a descendant that leaves the process
+  group is outside the group kill.
+
 - **An optional turn journal.** A wrapped agent can now keep a small,
   append-only journal of what its turns did: when a turn was dispatched, when a
   model process was launched, how the turn ended and how many tokens it used,
