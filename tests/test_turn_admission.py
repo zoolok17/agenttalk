@@ -511,6 +511,12 @@ def _pid_alive(pid: int) -> bool:
 #: child's own self-report, never in the exact-launch-environment check.
 _POSIX_RUNTIME_ADDED_ENV_NAMES = {"LC_CTYPE"}
 
+#: Fix round 1 (macOS CI leg): CoreFoundation adds __CF_USER_TEXT_ENCODING to
+#: every process it starts, the same way Python's own locale coercion adds
+#: LC_CTYPE above - also not something this module adds, so also narrowly
+#: allowed in the child's own self-report, macOS only.
+_MACOS_RUNTIME_ADDED_ENV_NAMES = {"__CF_USER_TEXT_ENCODING"}
+
 
 def test_build_child_env_is_exactly_the_operator_env_plus_system_defaults(tmp_path):
     """The EXACT mapping handed to `subprocess.Popen`, asserted directly -
@@ -547,6 +553,8 @@ def test_environment_carries_nothing_beyond_the_allowlist(fake_program, tmp_path
     allowed_extra = {name.casefold() for name in ta._SYSTEM_ENV_DEFAULTS}
     if os.name != "nt":
         allowed_extra |= {name.casefold() for name in _POSIX_RUNTIME_ADDED_ENV_NAMES}
+    if sys.platform == "darwin":
+        allowed_extra |= {name.casefold() for name in _MACOS_RUNTIME_ADDED_ENV_NAMES}
     assert {name.casefold() for name in env} <= {"fixed_name"} | allowed_extra
 
 
