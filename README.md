@@ -1008,8 +1008,8 @@ Old files are removed oldest first once the folder passes its size cap.
   deadline), the writer begins no new step. A step it has already begun (one
   helper: an append, an atomic status write, a sync, a registration read with its
   read-only process-identity lookup) may finish on the writer's own thread. No
-  caller ever waits for it. After close has timed out, not even the startup
-  status note is written.
+  caller ever waits for it. After close times out, no new startup status write
+  begins; a status write already started may finish on the writer's own thread.
 - `status` and `doctor` add journal labels only once the project has a journal
   folder. A first-ever start failure that creates no folder is therefore not shown
   there, even though the wrapper's health record carries the warning.

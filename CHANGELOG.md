@@ -40,8 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deadline), the writer begins no new step. A step it has already begun (one
   helper: an append, an atomic status write, a sync, a registration read with its
   read-only process-identity lookup) may finish on the writer's own thread. No
-  caller ever waits for it. After close has timed out, not even the startup
-  status note is written. A failed sync of a full file is counted and recorded in the
+  caller ever waits for it. After close times out, no new startup status write
+  begins; a status write already started may finish on the writer's own thread.
+  A failed sync of a full file is counted and recorded in the
   journal's status record rather than retried (that file's durability is then
   unproven).
 

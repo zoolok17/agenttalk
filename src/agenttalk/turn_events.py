@@ -514,7 +514,8 @@ class _GatedFiles:
     may finish on the writer's own thread; no caller ever waits for it. ``close`` only lets
     go of a handle and is never refused. The one exception is the status note after a start
     that failed or timed out, which the sink allows only until close's own deadline has
-    passed: after close has timed out not even that is written (see ``_status_permitted``).
+    passed: after close times out, no new startup status write begins; a status write
+    already started may finish on the writer's own thread (see ``_status_permitted``).
     """
 
     def __init__(self, files: JournalFiles, sink: "TurnEventSink") -> None:
@@ -1371,8 +1372,9 @@ def status_label(
     Liveness is proven, never assumed: a process counts as running only when it is
     still running (an affirmative answer; on Windows an exited child whose parent holds its
     handle still has a readable start time, so identity alone is not enough) AND its start
-    token equals the one in the record. An unknown or unreadable answer is "not running". Among the records of the agent, those of the current wrapper (when
-    its runtime record proves it alive) are chosen first, then the newest. ``health_mode``
+    token equals the one in the record. An unknown or unreadable answer is "not running".
+    Among the records of the agent, those of the current wrapper (when its runtime record
+    proves it alive) are chosen first, then the newest. ``health_mode``
     is the wrapper's own health mode, ``runtime_record`` its runtime record and
     ``health_warnings`` the warning words of its health record.
     """
