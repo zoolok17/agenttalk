@@ -937,9 +937,9 @@ stays alive and says so. This is on by default.
 
 | You want to | Run |
 | --- | --- |
-| Start the seat again now (one try) | `agenttalk request-restart --for <agent>`. A protected seat (the operator-facing liaison or a lead) also needs `--force-protected`, and, because a parked seat is alive, `--acknowledge-live-protected-kill`. `--clear-restart-budget` alone does not relaunch. Without a supervisor, stop the wrapper and start it again. |
+| Start the seat again now (one try) | `agenttalk request-restart --for <agent>`. It needs a running supervisor; without one, stop the wrapper and start it again. A protected seat (the operator-facing liaison or a lead) also needs `--force-protected` and, because a parked seat is alive, `--acknowledge-live-protected-kill`. `--clear-restart-budget` alone does not relaunch. |
 | Skip the parked message | `agenttalk ack --for <agent> --id <message id>`. It moves the seat past the message **without processing it and without a dead-letter record**, so it cannot be requeued from the dead-letter sink. It is refused for a managed lead-loop agent. |
-| Get the old behaviour back | Set `AGENTTALK_STOP_RETRIES_AT_LIMIT=0` in the wrapper's environment. It is read once when the wrapper starts. Anything else, or leaving it unset, keeps the park on. |
+| Get the old behaviour back | Set `AGENTTALK_STOP_RETRIES_AT_LIMIT` to `0`, `false`, `off` or `no` (any capitals, spaces around it are ignored) in the wrapper's environment. It is read once when the wrapper starts. Any other value, or leaving it unset, keeps the park on. A message that already carries a park when you switch it off is driven as before, but the attempts and the time it spent parked stay out of its disposal counts. |
 
 `agenttalk doctor` warns about a seat parked for more than 24 hours (set
 `AGENTTALK_USAGE_PARK_WARN_AFTER_HOURS` to change it) and lists a park notice that never reached
@@ -947,8 +947,10 @@ anyone.
 
 **What counts as a usage limit.** Only proof from the seat's own output counts: Claude reported a
 rejected usage event for a known window (`five_hour` or `seven_day`), and its final result is an
-error. A final result that is not an error (`is_error` false), a missing final result, a
-non-zero exit, a watchdog kill, a bus fault or an unknown window keeps today's behaviour. Message
+error. A final result that is not an error (`is_error` false), a missing final result, a watchdog
+kill, a bus fault or an unknown window keeps today's behaviour. A non-zero exit **alone** is not
+proof and local causes keep their own handling, but a non-zero exit after a proven provider error
+still parks. Message
 text never decides anything: a weekly-limit message that Claude words as "prompt too long" is still
 a usage limit and is never counted as a bad message.
 

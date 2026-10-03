@@ -30,8 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `agenttalk request-restart --for <agent>` (a protected seat also needs `--force-protected` and
   `--acknowledge-live-protected-kill`), or skip the message with
   `agenttalk ack --for <agent> --id <message id>` (no dead-letter record). To get the old behaviour
-  back, set `AGENTTALK_STOP_RETRIES_AT_LIMIT=0` in the wrapper's environment; it gives exactly the
-  previous behaviour.
+  back, set `AGENTTALK_STOP_RETRIES_AT_LIMIT=0` (or `false`, `off`, `no`) in the wrapper's
+  environment; it gives the previous behaviour. One qualification: a message that already carries
+  a park when you switch it off is driven as before, but the attempts and the time it spent parked
+  stay out of its disposal counts.
 
   Technical detail: a new `usage_limit` failure word, new fields in the message's attempt record
   (`park_state`, `parked_at`, `parked_generation`, `park_count`, `probe_marker`,
