@@ -987,7 +987,9 @@ a usage limit and is never counted as a bad message.
 **In plain words.** While a seat is parked, its wrapper keeps one small file up to date that says
 so. Other programs may read that file, for example to show or react to a parked seat. It holds
 only words and numbers, never message text, and it carries a version so a reader can tell when the
-format has changed.
+format has changed. It is a **view** of the park, not the park itself: a program that looks at it
+only now and then can miss a short park entirely, and a file can be left behind (see "How long it
+lasts").
 
 **Where it is.** `state/usage-limit-park/<agent>.json` under the bus root, one file per seat. A seat
 that is not parked has no file.
@@ -1000,13 +1002,19 @@ that is not parked has no file.
 | `agent` | text | The seat's name; the same as the file name. |
 | `state` | text | Always `usage_limit_parked`. |
 | `provider` | text | Whose allowance ran out. Today only `claude`. It comes from the proof the wrapper holds, never from the seat's name. |
-| `window` | text or null | Which allowance: `five_hour` or `seven_day`. |
-| `reset_epoch` | integer or null | When the provider says the allowance comes back: whole seconds since 1970, UTC. `null` when no reset time is known. |
-| `wake_epoch` | integer or null | When the wrapper will try again by itself, in the same unit. `null` when it will not (no reset known, or that try was already used). |
+| `window` | text or null | Which allowance the **latest** refusal named: `five_hour` or `seven_day`. |
+| `reset_epoch` | integer or null | When the provider says the allowance comes back: whole seconds since 1970, UTC. See "Reset and window" below. `null` when no reset time is known. |
+| `wake_epoch` | integer or null | When the wrapper will try again by itself, in the same unit (the reset plus 30 seconds). `null` when it will not: no reset known, or that try was already used. |
 | `message_id` | text | The message the seat is holding. |
-| `parked_at` | text or null | When the park began, as an ISO 8601 UTC time. |
+| `parked_at` | text or null | When this message **first** parked: the moment the wrapper saw the provider's refusal, as an ISO 8601 UTC time. It does not change when the file is refreshed or when a later try is refused again. |
 | `wrapper_generation` | text or null | Identifies the wrapper run that wrote the file. |
-| `updated_at_epoch` | integer | When the wrapper last refreshed the file: whole seconds since 1970, UTC. |
+| `updated_at_epoch` | integer | When the wrapper last refreshed the file: whole seconds since 1970, UTC. It shows that the wrapper is alive. It is **not** a new observation from the provider. |
+
+**Reset and window.** The first refusal sets both. After a later refusal of the same message (for
+example a try that was refused again): the window is the latest refusal's; the reset is replaced
+only by a **strictly later** reset. A later refusal that states no reset, or the same or an earlier
+one, keeps the reset already held. So `reset_epoch` is the latest reset seen, and the file can say
+`seven_day` beside a reset that came from an earlier `five_hour` refusal.
 
 **The version rule.** A reader must refuse a file whose `schema_version` it does not know (and a
 `provider` it does not know), and must not guess what it means. A new version means the format
@@ -1016,17 +1024,24 @@ changed.
 wrapper refreshes the file about once a minute. If it has not been refreshed for 300 seconds
 (`MARKER_STALE_SECONDS`), the wrapper is not responding: the seat may still be parked, but nothing
 confirms it. Every time in the file is rounded **down** to whole seconds, so an age is right only to
-within one second.
+within one second. **Only a fresh file means a live parked seat; a stale one may be a leftover.**
 
-**Reading it safely.** The wrapper replaces the file in one step, so a reader never sees half a
-file. The file can still disappear between listing the folder and opening it. On Windows a read can
-fail for a moment while the file is being replaced: read again a little later; that failure does
-not mean "not parked".
+**Reading it safely.** Several things can go wrong while the file is written or read. Each one means
+"read again a little later": never "no parked seat", and never "parked".
+- Normally the wrapper replaces the file in one step, so a reader sees the old version or the new
+  one, never half of each.
+- The file can disappear between listing the folder and opening it.
+- On Windows a read can fail for a moment while the file is being replaced.
+- On Windows, when replacing keeps failing (some sandboxes forbid it), agenttalk falls back to
+  writing the file **in place**. A reader can then see a partly written file. Treat a file that
+  does not parse, or lacks a field, as "read again later".
 
-**How long it lasts.** The wrapper removes the file when the park ends: the message is delivered or
-skipped. If the wrapper is stopped abruptly the file can stay behind. A file whose message the
-seat's read position has already passed is out of date, and agenttalk's own readers ignore it; so
-should others.
+**How long it lasts.** The wrapper removes the file when the park ends or changes: when the held
+message is delivered, skipped or otherwise gone; when the wrapper starts (it writes the file again
+if the seat is still parked); and when a try after the reset begins (it writes it again if that try
+is refused). If the wrapper is stopped abruptly, the file stays behind. agenttalk's own readers also
+ignore a file whose message the seat has already moved past, or whose wrapper has since been
+replaced; another program cannot check either, which is why only a fresh file counts.
 
 **What it never holds.** No message text and no text from the provider: only the words and numbers
 above.

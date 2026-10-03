@@ -95,6 +95,32 @@ def test_the_attempt_path_names_claude_for_a_proven_claude_limit():
     assert "limit_provider" not in rec
 
 
+def refuse(rec, *, at, window, reset):
+    park.apply_limit_result(rec, at=at, generation="g1", window=window, reset_epoch=reset,
+                            provider=park.PROVIDER_CLAUDE)
+
+
+def test_what_the_readme_says_about_a_later_refusal_is_what_the_code_does(store):
+    rec: dict = {}
+    refuse(rec, at="2026-09-09T03:00:00Z", window="five_hour", reset=T0 + 3600)
+    refuse(rec, at="2026-09-09T04:00:00Z", window="seven_day", reset=None)         # unknown reset
+    assert rec["limit_window"] == "seven_day" and rec["reset_epoch"] == T0 + 3600   # latest window, kept reset
+    refuse(rec, at="2026-09-09T05:00:00Z", window="seven_day", reset=T0 + 1800)     # earlier reset
+    assert rec["reset_epoch"] == T0 + 3600
+    refuse(rec, at="2026-09-09T06:00:00Z", window="seven_day", reset=T0 + 7200)     # strictly later
+    assert rec["reset_epoch"] == T0 + 7200
+    assert rec["parked_at"] == "2026-09-09T03:00:00Z"                                # first refusal, never moved
+
+
+def test_a_refresh_changes_the_update_time_but_not_the_park_time(store):
+    publish(store, now_epoch=T0)
+    first = raw(store)
+    publish(store, now_epoch=T0 + 90)
+    second = raw(store)
+    assert second["updated_at_epoch"] == T0 + 90 and first["updated_at_epoch"] == T0
+    assert second["parked_at"] == first["parked_at"]
+
+
 # ----------------------------------------------------------------- the README tells the truth
 
 
@@ -117,7 +143,9 @@ def test_the_readme_states_the_rules_a_reader_needs():
     squeezed = " ".join(section.split())
     for needle in ("refuse a file whose `schema_version` it does not know", "updated_at_epoch",
                    "never from the file's modified time", "MARKER_STALE_SECONDS", "read again a little later",
-                   "No message text and no text from the provider"):
+                   "No message text and no text from the provider", "**strictly later** reset",
+                   "**first** parked", "writing the file **in place**", "Only a fresh file means a live parked seat",
+                   "not** a new observation from the provider", "can miss a short park"):
         assert needle in squeezed, needle
     assert str(int(park.MARKER_STALE_SECONDS)) in squeezed
 
