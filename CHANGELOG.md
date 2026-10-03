@@ -107,6 +107,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `quota_lease_binding_required`; `install_child_cap_binding`,
   `set_quota_lease_binding_required`, `quota_lease_binding_state`,
   `child_receipts_page`, `sweep_child_receipts`, `check_receipt_page`,
+  the `*_as_operator` helpers the commands call (the ledger reads the front
+  token itself, so the command never holds it),
   `parse_receipt_page`; new keywords on `open_child_turn` and
   `close_child_turn`; `status()` reads in one snapshot and adds
   `child_receipt_report_version`, `child_receipts`, `child_receipts_pending`,

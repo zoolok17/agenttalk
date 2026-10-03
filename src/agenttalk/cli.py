@@ -9771,19 +9771,11 @@ def cmd_gateway(args: argparse.Namespace) -> int:
                 issuer_token=issuer_token
             )
         elif action == "binding-install":
-            issuer_token = gateway.read_secret_file(
-                gateway.default_front_token_path()
-            )
-            result = gateway.SpendLedger().install_child_cap_binding(
-                issuer_token=issuer_token
-            )
+            # The ledger reads the operator credential itself; this command never holds it.
+            result = gateway.SpendLedger().install_child_cap_binding_as_operator()
         elif action == "binding-required":
-            issuer_token = gateway.read_secret_file(
-                gateway.default_front_token_path()
-            )
-            result = gateway.SpendLedger().set_quota_lease_binding_required(
-                required=bool(args.binding_on),
-                issuer_token=issuer_token,
+            result = gateway.SpendLedger().set_quota_lease_binding_required_as_operator(
+                required=bool(args.binding_on)
             )
         elif action == "canary-verify":
             result = gateway.SpendLedger().verify_dashboard_canary(
@@ -9839,9 +9831,8 @@ def _cmd_gateway_receipts(args: argparse.Namespace) -> int:
     if not 0 <= after_seq <= gateway.RECEIPT_MAX_SEQ or not 1 <= limit <= gateway.RECEIPT_PAGE_MAX_LIMIT:
         return refuse("bad_request")
     try:
-        issuer_token = gateway.read_secret_file(gateway.default_front_token_path())
-        page = gateway.SpendLedger().child_receipts_page(
-            after_seq=after_seq, limit=limit, issuer_token=issuer_token
+        page = gateway.SpendLedger().child_receipts_page_as_operator(
+            after_seq=after_seq, limit=limit
         )
         text = json.dumps(page, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         gateway.parse_receipt_page(text, after_seq=after_seq, limit=limit)

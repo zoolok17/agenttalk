@@ -773,6 +773,10 @@ Technical details:
 - The read methods are `SpendLedger.child_receipts_page`,
   `quota_lease_binding_state` and `status`; none of them writes. The start-up
   sweep is `SpendLedger.sweep_child_receipts`.
+- The three commands call `install_child_cap_binding_as_operator`,
+  `set_quota_lease_binding_required_as_operator` and
+  `child_receipts_page_as_operator`. These read the front token from its usual
+  file inside the ledger code, so the command itself never holds it.
 
 ## Stop and Recovery
 

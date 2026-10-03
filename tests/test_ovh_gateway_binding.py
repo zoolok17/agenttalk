@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 from datetime import timedelta
 from pathlib import Path
 
@@ -1327,6 +1328,31 @@ def test_the_command_parser_needs_one_flag_word_and_takes_no_token(tmp_path, cap
     with pytest.raises(SystemExit) as refused:
         cli.main(["--root", str(tmp_path), "gateway", *argv])
     assert refused.value.code == 2
+
+
+@pytest.mark.parametrize("argv", [
+    ["binding-install"],
+    ["binding-required", "--on"],
+    ["receipts", "--after", "0", "--json"],
+])
+def test_the_commands_never_hold_the_front_token(tmp_path, capsys, monkeypatch, argv):
+    # The ledger reads the operator credential itself; the command only prints its
+    # result. Every read of the secret file is recorded with the module that made it.
+    root, ledger = _default_ledger(tmp_path, schema3=argv[0] == "binding-install")
+    if argv[0] == "receipts":
+        fx.close_bound(ledger, "msg-a", outcome="cancelled")
+    real_read = gateway.read_secret_file
+    readers = []
+
+    def recording_read(path):
+        readers.append(sys._getframe(1).f_globals["__name__"])
+        return real_read(path)
+
+    monkeypatch.setattr(gateway, "read_secret_file", recording_read)
+    assert cli.main(["--root", str(root), "gateway", *argv]) == 0
+    assert readers == ["agenttalk.ovh_gateway"]  # once, by the ledger, never by the CLI
+    captured = capsys.readouterr()
+    assert fx.ISSUER not in captured.out + captured.err
 
 
 def test_receipts_command_prints_exactly_the_page(tmp_path, capsys):

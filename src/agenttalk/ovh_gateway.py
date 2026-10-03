@@ -3314,6 +3314,22 @@ class SpendLedger:
                 raise
         return {"quota_lease_binding_required": required, "changed": before != required}
 
+    # The operator commands call these: the ledger reads the operator's credential (the
+    # front token, from its usual file) itself, so the command never holds it.
+
+    def install_child_cap_binding_as_operator(self, *, now: datetime | None = None) -> dict:
+        return self.install_child_cap_binding(issuer_token=_operator_credential(), now=now)
+
+    def set_quota_lease_binding_required_as_operator(self, *, required: bool) -> dict:
+        return self.set_quota_lease_binding_required(
+            required=required, issuer_token=_operator_credential()
+        )
+
+    def child_receipts_page_as_operator(self, *, after_seq: int = 0, limit: int = 100) -> dict:
+        return self.child_receipts_page(
+            after_seq=after_seq, limit=limit, issuer_token=_operator_credential()
+        )
+
     def sweep_child_receipts(
         self, *, issuer_token: str | None = None, now: datetime | None = None
     ) -> dict:
@@ -3642,6 +3658,11 @@ def write_secret_file(path: Path, value: str) -> None:
     finally:
         os.close(fd)
     _flush_parent(path)
+
+
+def _operator_credential() -> str:
+    """The operator's child-cap issuer credential: the front token, from its usual file."""
+    return read_secret_file(default_front_token_path())
 
 
 def read_secret_file(path: Path) -> str:
