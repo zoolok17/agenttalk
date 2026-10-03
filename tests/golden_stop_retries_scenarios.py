@@ -47,15 +47,11 @@ _HEX32 = re.compile(r"[0-9a-f]{32}")
 _HEX12 = re.compile(r"(?<![0-9a-f])(?=[0-9]*[a-f])[0-9a-f]{12}(?![0-9a-f])")
 _PID = re.compile(r'("(?:[a-z_]*pid)":\s*)\d+')
 _EPOCH = re.compile(r'("(?:[a-z_]*(?:epoch|monotonic|nonce|token|start))":\s*)(?:"[^"]*"|[\d.]+)')
-# A byte count of a stored file depends on the platform (Windows writes "\r\n" line ends).
-_SIZE = re.compile(r'("size_bytes":\s*)\d+')
-# A path below the replaced root. Windows joins its parts with "\" (and "\\" inside JSON text);
-# the golden file is compared on every platform, so the parts are always joined with "/".
-# In JSON text only "\\" is a separator, so a JSON escape such as "\n" right after a path is
-# never swallowed as if it were the start of another path part.
-_PART = r"[A-Za-z0-9._-]+"
-_BELOW_ROOT_JSON = re.compile(r"<ROOT>(?:(?:\\\\|/)" + _PART + ")*")
-_BELOW_ROOT_RAW = re.compile(r"<ROOT>(?:(?:\\|/)" + _PART + ")*")
+_BELOW_ROOT = re.compile(r"<ROOT>[^\"'\s]*")  # a path below the replaced root, up to a quote or space
+# Values that depend on the platform or the release, never on what the loop did: the stored
+# byte count (Windows writes "\r\n" line ends) and the release number a health record carries.
+_RELEASE_KEYS = frozenset({"agenttalk_version"})
+_PLATFORM_SIZE_KEYS = frozenset({"size_bytes"})
 
 
 def claude_turn(*, error: bool = False) -> list[str]:
@@ -174,14 +170,67 @@ SCENARIOS = {
 }
 
 def _posix_below_root(match: re.Match) -> str:
-    return match.group(0).replace("\\\\", "/").replace("\\", "/")
+    # In a decoded string or in plain text a backslash is a real separator (Windows); the
+    # golden file is compared on every platform, so the parts are joined by "/".
+    return match.group(0).replace("\\", "/")
 
 
-def normalise(text: str, root: Path, ids: list[str], *, json_text: bool = False) -> str:
-    for form in (str(root), str(root).replace("\\", "/"), str(root).replace("\\", "\\\\")):
+def _root_free(text: str, root: Path) -> str:
+    for form in (str(root), str(root).replace("\\", "/")):
         text = text.replace(form, "<ROOT>")
-    text = (_BELOW_ROOT_JSON if json_text else _BELOW_ROOT_RAW).sub(_posix_below_root, text)
-    text = _SIZE.sub(r"\g<1>0", text)
+    return _BELOW_ROOT.sub(_posix_below_root, text)
+
+
+def _decoded(value, root: Path):
+    """A decoded JSON value made comparable across platforms and releases.
+
+    Paths are rewritten here, on DECODED strings, never on serialized JSON text: there a
+    backslash can also start an escape, so a corrupted path (a control character where a
+    separator was) could be rewritten into a valid one and hidden."""
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            name = _root_free(key, root) if isinstance(key, str) else key
+            if key in _RELEASE_KEYS and isinstance(item, str):
+                out[name] = "<VERSION>"
+            elif key in _PLATFORM_SIZE_KEYS and type(item) is int:
+                out[name] = 0
+            else:
+                out[name] = _decoded(item, root)
+        return out
+    if isinstance(value, list):
+        return [_decoded(item, root) for item in value]
+    if isinstance(value, str):
+        return _root_free(value, root)
+    return value
+
+
+def normalise_file(text: str, root: Path, ids: list[str]) -> str:
+    """One file's content. A JSON document, or a file of JSON lines, is decoded, made
+    comparable value by value and written back in one fixed form; anything else is plain
+    text (see ``normalise``)."""
+    try:
+        document = json.loads(text)
+    except ValueError:
+        document = None
+    if isinstance(document, (dict, list)):
+        return normalise(json.dumps(_decoded(document, root), indent=2), root, ids, paths=False)
+    try:
+        lines = [json.loads(line) for line in text.splitlines() if line.strip()]
+    except ValueError:
+        lines = []
+    if lines and all(isinstance(line, (dict, list)) for line in lines):
+        body = "\n".join(json.dumps(_decoded(line, root)) for line in lines)
+        return normalise(body, root, ids, paths=False)
+    return normalise(text, root, ids)
+
+
+def normalise(text: str, root: Path, ids: list[str], *, paths: bool = True) -> str:
+    """Plain text (output, log lines, non-JSON files). ``paths=False`` for JSON text whose
+    paths ``_decoded`` already handled: rewriting backslashes in JSON text would treat an
+    escape as a separator."""
+    if paths:
+        text = _root_free(text, root)
     for found in _MSG.findall(text):
         if found not in ids:
             ids.append(found)
@@ -273,8 +322,7 @@ def capture(name: str, root: Path) -> dict:
     for path in sorted(p for p in store_root.rglob("*")
                        if p.is_file() and not p.name.endswith((".lock", ".generation"))):
         relative = path.relative_to(store_root).as_posix()
-        files[relative] = normalise(path.read_text(encoding="utf-8", errors="replace"), store_root, ids,
-                                    json_text=relative.endswith(".json"))
+        files[relative] = normalise_file(path.read_text(encoding="utf-8", errors="replace"), store_root, ids)
     text = {key: normalise(got[key], store_root, ids) if isinstance(got[key], str) else got[key]
             for key in ("stdout", "stderr", "log", "raised")}
     record = {"turns": got["turns"], "sleeps": got["sleeps"], "stamps": got["stamps"],

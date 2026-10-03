@@ -670,7 +670,7 @@ def _normalised(store, clock, seen, spawns, raised=None):
         if relative.startswith(".agenttalk/state/usage-limit-park"):
             files[relative] = "<USAGE-MARKER>"
             continue
-        files[relative] = g.normalise(path.read_text(encoding="utf-8", errors="replace"), root, ids)
+        files[relative] = g.normalise_file(path.read_text(encoding="utf-8", errors="replace"), root, ids)
     numbered = {found: "<MSG%d>" % (index + 1) for index, found in enumerate(sorted(ids))}
 
     def renumber(text):
