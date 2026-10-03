@@ -1017,6 +1017,11 @@ Old files are removed oldest first once the folder passes its size cap.
 - `status` and `doctor` add journal labels only once the project has a journal
   folder. A first-ever start failure that creates no folder is therefore not shown
   there, even though the wrapper's health record carries the warning.
+- On macOS, where agenttalk cannot read a process's identity (its start token),
+  `status` and `doctor` say the journal's state is unknown:
+  `unknown (no process identity on this platform)`. There they cannot tell you
+  that the writer stopped, stopped responding or failed to start. A record that
+  carries no start token is shown the same way on any system.
 - The "journal off behaves as before" proof compares the loop with golden files made
   from the code before the journal existed (`tests/golden/`). It covers the
   legacy-loop scenarios listed in `tests/golden_off_scenarios.py` (no commit gate):
@@ -1043,7 +1048,9 @@ still holds its handle does not count) **and** its start token matches the recor
 (an unknown or unreadable answer is "not running"), and among several records the current wrapper's own come first:
 `on (loop)`, `on (loop); cadence turns unmanaged`,
 `writer not responding`, `off`, `off (start_failed)`, `off (start_timeout)`,
-`ended`, `unmanaged (one_shot)` and `unmanaged (plain)`. A file left by an
+`ended`, `unmanaged (one_shot)` and `unmanaged (plain)`; where no start token can
+be read (see the limits above), `unknown (no process identity on this platform)`
+instead of any label that would need one. A file left by an
 earlier run never changes the label of a running wrapper. A journal that never
 started at all (for example because its thread could not be created) is shown
 as `off (start_failed)` or `off (start_timeout)` through the wrapper's own

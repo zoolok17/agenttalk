@@ -1302,6 +1302,9 @@ LABEL_OFF = "off"
 LABEL_ENDED = "ended"
 LABEL_UNMANAGED_ONE_SHOT = "unmanaged (one_shot)"
 LABEL_UNMANAGED_PLAIN = "unmanaged (plain)"
+#: Where no process start token can be read (macOS today), or a record carries none,
+#: whether the writer runs cannot be proven either way.
+LABEL_UNKNOWN = "unknown (no process identity on this platform)"
 
 
 def turn_events_requested(flag: bool, environ: Mapping[str, str] | None = None) -> bool:
@@ -1416,6 +1419,9 @@ def status_label(
     still running (an affirmative answer; on Windows an exited child whose parent holds its
     handle still has a readable start time, so identity alone is not enough) AND its start
     token equals the one in the record. An unknown or unreadable answer is "not running".
+    Where this process cannot read its own start token (no process identity on this
+    platform), or a record carries no token, liveness cannot be proven either way: the
+    label is then ``LABEL_UNKNOWN``, never "on", "ended" or "off" on that basis.
     Among the records of the agent, those of the current wrapper (when its runtime record
     proves it alive) are chosen first, then the newest. ``health_mode``
     is the wrapper's own health mode, ``runtime_record`` its runtime record and
@@ -1433,9 +1439,17 @@ def status_label(
         def process_running(pid: int) -> bool:
             return table(pid) is not None
 
-    def proven_alive(pid: object, token: object) -> bool:
-        if type(pid) is not int or pid <= 0 or not isinstance(token, str):
+    try:
+        identity = isinstance(start_token(os.getpid()), str)
+    except Exception:  # noqa: BLE001
+        identity = False
+
+    def proven_alive(pid: object, token: object) -> bool | None:
+        """True or False when proven; None when no start token can be compared."""
+        if type(pid) is not int or pid <= 0:
             return False
+        if not identity or not isinstance(token, str):
+            return None
         try:
             if process_running(pid) is not True:
                 return False
@@ -1447,7 +1461,10 @@ def status_label(
     current_pid = None
     if runtime_record:
         pid = runtime_record.get("wrapper_pid")
-        if proven_alive(pid, runtime_record.get("wrapper_start")):
+        owner_alive = proven_alive(pid, runtime_record.get("wrapper_start"))
+        if owner_alive is None and health_mode in ("wrapper-one-shot", "wrapper-loop", "lead-loop"):
+            return LABEL_UNKNOWN  # whether this wrapper runs, and which records are its, cannot be told
+        if owner_alive:
             current_pid = pid
     if health_mode == "wrapper-one-shot":
         # Plain `wrap` and `wrap --loop --one-shot` both report this mode; only the
@@ -1476,13 +1493,16 @@ def status_label(
             return LABEL_OFF + (" (%s)" % reason if reason else "")
     else:
         # No proven current wrapper: prefer a record whose writer is provably running.
-        running = [r for r in records if proven_alive(r["pid"], r["token"])]
+        running = [r for r in records if proven_alive(r["pid"], r["token"]) is True]
         found = max(running or records, key=lambda r: r["updated_ms"], default=None)
         if found is None:
             return LABEL_OFF
     if found["state"] == "off":
         return LABEL_OFF + (" (%s)" % found["off_reason"] if found["off_reason"] else "")
-    if found["state"] == "closed" or not proven_alive(found["pid"], found["token"]):
+    alive = False if found["state"] == "closed" else proven_alive(found["pid"], found["token"])
+    if alive is None:
+        return LABEL_UNKNOWN
+    if not alive:
         return LABEL_ENDED
     now_ms = int((time.time() if now_epoch is None else now_epoch) * 1000)
     age = max(0.0, (now_ms - found["updated_ms"]) / 1000.0)

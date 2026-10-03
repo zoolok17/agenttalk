@@ -932,5 +932,7 @@ def test_a_failed_start_is_carried_by_the_wrappers_own_health_record(tmp_path, m
     owner = te.start_failure_warning("start_failed", me, wr_module.process_start_token(me))
     assert rc == 0 and seen["warnings"] == [owner]  # the word names this wrapper as its owner
     assert not list(_journal_dir(store).glob("status-*.json"))
-    assert cli._turn_journal_label(store, "beta", None) == "off (start_failed)"
+    # where no process start token can be read (macOS today), whose start failed cannot be proven
+    expected = "off (start_failed)" if wr_module.process_start_token(me) else te.LABEL_UNKNOWN
+    assert cli._turn_journal_label(store, "beta", None) == expected
     assert "turn_journal" not in lifecycle_stream.getvalue()

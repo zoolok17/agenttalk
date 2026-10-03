@@ -32,7 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   records "outcome unknown" rather than guess. `agenttalk status` and
   `agenttalk doctor` show whether the journal is on, not responding, ended or
   off (a writer counts as running only when its process is still running and
-  matches the record), and which modes are not journaled. A first-ever start
+  matches the record), and which modes are not journaled. On macOS, where
+  agenttalk cannot read a process's identity, they say the journal's state is
+  unknown, so there they cannot tell you that it stopped or failed to start.
+  A first-ever start
   failure that creates no journal folder is not shown there. The "off behaves as
   before" proof covers the listed legacy-loop scenarios, not every path.
 

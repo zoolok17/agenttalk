@@ -30,6 +30,16 @@ def _tok(pid: int) -> str | None:
     return TOKENS.get(pid)
 
 
+# Where this process cannot read its own start token (macOS today), no writer's liveness can
+# be proven either way. Tests that prove the Windows and Linux labels with real tokens run only
+# where a token exists; the no-identity labels are tested on every platform (see the end).
+needs_identity = pytest.mark.skipif(
+    wr.process_start_token(ME) is None,
+    reason="this platform cannot read a process start token (macOS today); "
+           "the no-identity labels are tested with the token forced to None",
+)
+
+
 @pytest.fixture(autouse=True)
 def _journal_root_in_tmp(tmp_path, monkeypatch):
     monkeypatch.setenv(te.ENV_TURN_EVENTS_DIR, str(tmp_path / "journal-root"))
@@ -103,6 +113,7 @@ def _write_status(store, name="status-g-old.json", **over):
 # --- the labels ---------------------------------------------------------------------
 
 
+@needs_identity
 def test_a_live_loop_writer_is_on(tmp_path):
     store = _store(tmp_path)
     sink = _live_sink(store)
@@ -112,6 +123,7 @@ def test_a_live_loop_writer_is_on(tmp_path):
         sink.close()
 
 
+@needs_identity
 def test_a_lead_loop_says_its_cadence_turns_are_unmanaged(tmp_path):
     store = _store(tmp_path)
     sink = _live_sink(store, unmanaged=("cadence",))
@@ -122,6 +134,7 @@ def test_a_lead_loop_says_its_cadence_turns_are_unmanaged(tmp_path):
         sink.close()
 
 
+@needs_identity
 def test_a_closed_stream_is_ended_not_on(tmp_path):
     store = _store(tmp_path)
     sink = _live_sink(store)
@@ -129,6 +142,7 @@ def test_a_closed_stream_is_ended_not_on(tmp_path):
     assert _label(store, "wrapper-loop", _real_runtime()) == "ended"
 
 
+@needs_identity
 def test_a_live_process_whose_record_stopped_updating_is_not_responding(tmp_path):
     store = _store(tmp_path)
     sink = _live_sink(store)
@@ -141,6 +155,7 @@ def test_a_live_process_whose_record_stopped_updating_is_not_responding(tmp_path
         sink.close()
 
 
+@needs_identity
 def test_a_run_whose_start_failed_shows_off_with_its_reason(tmp_path):
     store = _store(tmp_path)
 
@@ -154,6 +169,7 @@ def test_a_run_whose_start_failed_shows_off_with_its_reason(tmp_path):
     sink.close()
 
 
+@needs_identity
 def test_a_start_that_timed_out_shows_its_own_reason(tmp_path):
     import threading
 
@@ -173,6 +189,7 @@ def test_a_start_that_timed_out_shows_its_own_reason(tmp_path):
     sink.close()
 
 
+@needs_identity
 def test_no_record_at_all_is_off(tmp_path):
     store = _store(tmp_path)
     assert _label(store, "wrapper-loop", _runtime()) == "off"
@@ -183,11 +200,10 @@ def test_an_old_record_from_an_earlier_run_never_says_on(tmp_path):
     _write_status(store, pid=4242, process_start_token="tok-other", state="on")
     # this wrapper (a different, live process) is running without a journal
     assert _label(store, "wrapper-loop", _runtime(pid=ME, start="tok-me"), tokens=_tok) == "off"
-    # no wrapper is known to be running: the old stream's process is not there either
-    # a token that cannot be read is no evidence of a running writer
-    assert _label(store, "wrapper-loop", None, tokens=lambda pid: None) == "ended"
+    # where no start token can be read at all, nothing proves the old stream runs, or that it ended
+    assert _label(store, "wrapper-loop", None, tokens=lambda pid: None) == te.LABEL_UNKNOWN
     gone = _label(store, "wrapper-loop", None, now=time.time() + 600, tokens=lambda pid: None)
-    assert gone == "ended"
+    assert gone == te.LABEL_UNKNOWN
 
 
 def test_a_pid_reused_by_another_process_is_not_the_old_writer(tmp_path):
@@ -204,6 +220,7 @@ def test_an_old_off_record_keeps_its_reason_visible_but_never_becomes_on(tmp_pat
     assert _label(store, "wrapper-loop", None, tokens=_tok) == "off"
 
 
+@needs_identity
 def test_garbage_in_a_status_file_is_ignored(tmp_path):
     store = _store(tmp_path)
     directory = te.default_turn_events_root(store.root) / "beta"
@@ -250,6 +267,7 @@ def test_status_reads_exactly_as_before_when_the_journal_was_never_used(tmp_path
     assert doctor._check_turn_journal(store) is None
 
 
+@needs_identity
 def test_status_json_and_text_show_the_label_once_the_journal_exists(tmp_path, capsys):
     store = _store(tmp_path)
     _wrapper_state(store)
@@ -268,6 +286,7 @@ def test_status_json_and_text_show_the_label_once_the_journal_exists(tmp_path, c
         sink.close()
 
 
+@needs_identity
 def test_status_shows_a_stopped_journal_as_ended_and_a_plain_wrapper_as_unmanaged(tmp_path):
     store = _store(tmp_path)
     _wrapper_state(store)
@@ -278,6 +297,7 @@ def test_status_shows_a_stopped_journal_as_ended_and_a_plain_wrapper_as_unmanage
     assert _row(store)["turn_events"] == "unmanaged (one_shot)"
 
 
+@needs_identity
 def test_doctor_says_ok_for_a_live_writer_and_warns_for_one_that_stopped_responding(tmp_path):
     store = _store(tmp_path)
     _wrapper_state(store)
@@ -296,6 +316,7 @@ def test_doctor_says_ok_for_a_live_writer_and_warns_for_one_that_stopped_respond
         sink.close()
 
 
+@needs_identity
 def test_doctor_warns_when_a_start_failed(tmp_path):
     store = _store(tmp_path)
     _wrapper_state(store)
@@ -321,31 +342,34 @@ def _exited_child_pid() -> int:
     return int(subprocess.check_output([sys.executable, "-c", "import os; print(os.getpid())"]))
 
 
+@needs_identity
 def test_a_writer_whose_process_already_exited_is_ended_even_with_a_fresh_record(tmp_path):
     store = _store(tmp_path)
     pid = _exited_child_pid()
     _write_status(store, pid=pid, process_start_token="old-token")  # updated_at is "now"
     assert _label(store, "wrapper-loop", None) == "ended"
-    # the same through a process table that cannot name the pid's start token
-    assert _label(store, "wrapper-loop", None, tokens=lambda p: None) == "ended"
+    # a process table that cannot name any start token proves neither: the label says so
+    assert _label(store, "wrapper-loop", None, tokens=lambda p: None) == te.LABEL_UNKNOWN
 
 
 def test_an_unreadable_start_token_never_proves_a_running_writer(tmp_path):
     store = _store(tmp_path)
     sink = _live_sink(store)
     try:
-        assert _label(store, "wrapper-loop", _real_runtime(), tokens=lambda p: None) == "ended"
+        assert _label(store, "wrapper-loop", _real_runtime(), tokens=lambda p: None) == te.LABEL_UNKNOWN
     finally:
         sink.close()
 
 
+@needs_identity
 def test_an_unreadable_token_does_not_make_a_runtime_record_prove_a_live_one_shot_loop(tmp_path):
     store = _store(tmp_path)
-    assert _label(store, "wrapper-one-shot", _runtime(), tokens=lambda p: None) == "unmanaged (plain)"
+    assert _label(store, "wrapper-one-shot", _runtime(), tokens=lambda p: None) == te.LABEL_UNKNOWN
     dead = {"wrapper_pid": _exited_child_pid(), "wrapper_start": "gone"}
     assert _label(store, "wrapper-one-shot", dead) == "unmanaged (plain)"
 
 
+@needs_identity
 def test_an_old_generation_stamped_ahead_does_not_hide_the_current_writer(tmp_path):
     store = _store(tmp_path)
     sink = _live_sink(store)
@@ -360,12 +384,14 @@ def test_an_old_generation_stamped_ahead_does_not_hide_the_current_writer(tmp_pa
         sink.close()
 
 
+@needs_identity
 def test_a_record_of_another_run_with_the_same_pid_but_another_token_is_not_the_owners(tmp_path):
     store = _store(tmp_path)
     _write_status(store, pid=ME, process_start_token="some-earlier-process")
     assert _label(store, "wrapper-loop", _real_runtime()) == "off"
 
 
+@needs_identity
 def test_a_start_failure_reaches_status_through_the_health_record_only(tmp_path):
     store = _store(tmp_path)
     te.default_turn_events_root(store.root).mkdir(parents=True)  # the journal folder exists
@@ -402,6 +428,7 @@ def test_the_health_writer_carries_the_start_failure_in_the_write_it_already_mak
     assert te.start_failure_warning("writer_error", ME, "tok-me") is None
 
 
+@needs_identity
 def test_a_thread_that_cannot_start_shows_off_start_failed_without_any_status_write(tmp_path, monkeypatch):
     import threading
 
@@ -450,6 +477,7 @@ def _close(child):
         child._handle.Close()  # noqa: SLF001
 
 
+@needs_identity
 def test_f3_an_exited_child_whose_parent_holds_its_handle_is_ended(tmp_path):
     store = _store(tmp_path)
     child, token = _exited_child_holding_its_handle()
@@ -463,6 +491,7 @@ def test_f3_an_exited_child_whose_parent_holds_its_handle_is_ended(tmp_path):
         _close(child)
 
 
+@needs_identity
 def test_f3_the_same_case_for_the_one_shot_classification(tmp_path):
     store = _store(tmp_path)
     child, token = _exited_child_holding_its_handle()
@@ -474,6 +503,7 @@ def test_f3_the_same_case_for_the_one_shot_classification(tmp_path):
         _close(child)
 
 
+@needs_identity
 def test_f3_a_running_process_with_a_matching_token_is_still_alive(tmp_path):
     store = _store(tmp_path)
     sink = _live_sink(store)
@@ -484,6 +514,7 @@ def test_f3_a_running_process_with_a_matching_token_is_still_alive(tmp_path):
         sink.close()
 
 
+@needs_identity
 def test_f3_an_unknown_running_answer_is_not_alive(tmp_path):
     store = _store(tmp_path)
     sink = _live_sink(store)
@@ -527,6 +558,7 @@ def _health_written_by_another_process(store, warning_owner_pid=None):
     subprocess.run([sys.executable, "-c", code, str(Path(te.__file__).parents[1]), str(store.root)], check=True)
 
 
+@needs_identity
 def test_f5_a_previous_wrappers_start_failure_is_not_shown_for_its_replacement(tmp_path):
     from agenttalk import cli
 
@@ -541,6 +573,7 @@ def test_f5_a_previous_wrappers_start_failure_is_not_shown_for_its_replacement(t
     assert check is None or "start_failed" not in check.details
 
 
+@needs_identity
 def test_f5_the_control_the_wrappers_own_warning_is_still_shown(tmp_path):
     from agenttalk import cli
 
@@ -557,6 +590,7 @@ def test_f5_the_control_the_wrappers_own_warning_is_still_shown(tmp_path):
     assert check.status == "warn" and "off (start_timeout)" in check.details
 
 
+@needs_identity
 def test_f5_a_current_journal_overrides_an_old_warning(tmp_path):
     store = _store(tmp_path)
     _wrapper_state(store)
@@ -564,3 +598,107 @@ def test_f5_a_current_journal_overrides_an_old_warning(tmp_path):
     runtime = _real_runtime()
     word = te.start_failure_warning("start_failed", ME, runtime["wrapper_start"])
     assert _label_w(store, runtime, [word]) == "on (loop)"
+
+
+# --- no process identity on this platform (macOS today), on every platform -----------------
+
+
+@pytest.fixture
+def no_identity(monkeypatch):
+    """The one start-token reader answers None, as it does on macOS today: the writer, the
+    wrapper's runtime record and the status label all see no process identity."""
+    from agenttalk import store as store_module
+
+    monkeypatch.setattr(store_module, "_process_start_token", lambda pid: None)
+    assert wr.process_start_token(ME) is None
+
+
+def _status_label_both_ways(store, capsys) -> tuple[str, str]:
+    """The beta line of `status`, and beta's label in `status --json`."""
+    assert cli.cmd_status(argparse.Namespace(root=str(store.root), json=False)) == 0
+    line = next(text for text in capsys.readouterr().out.splitlines() if text.strip().startswith("beta"))
+    assert cli.cmd_status(argparse.Namespace(root=str(store.root), json=True)) == 0
+    payload = json.loads(capsys.readouterr().out)
+    return line, next(a for a in payload["agents"] if a["name"] == "beta")["turn_events"]
+
+
+def test_without_a_process_identity_a_live_writer_is_unknown_never_on(tmp_path, capsys, no_identity):
+    store = _store(tmp_path)
+    _wrapper_state(store)
+    sink = _live_sink(store)
+    try:
+        line, label = _status_label_both_ways(store, capsys)
+        assert "turn_events=" + te.LABEL_UNKNOWN in line and label == te.LABEL_UNKNOWN
+        check = doctor._check_turn_journal(store)
+        # a note: the label is shown, and nothing warns about a stopped writer
+        assert (check.status, check.details, check.fix) == ("ok", "beta: " + te.LABEL_UNKNOWN, "")
+        # a record that stopped updating is not "writer not responding" without proof the writer runs
+        stale = te.default_turn_events_root(store.root) / "beta" / os.path.basename(sink.status_path)
+        data = json.loads(stale.read_text(encoding="ascii"))
+        data["updated_at"] = te.format_time(int((time.time() - 600) * 1000))
+        stale.write_text(json.dumps(data), encoding="ascii")
+        assert _row(store)["turn_events"] == te.LABEL_UNKNOWN
+        assert doctor._check_turn_journal(store).status == "ok"
+    finally:
+        sink.close()
+
+
+def test_without_a_process_identity_a_stopped_writer_is_unknown_not_ended(tmp_path, capsys, no_identity):
+    store = _store(tmp_path)
+    _wrapper_state(store)
+    sink = _live_sink(store)
+    sink.close()
+    line, label = _status_label_both_ways(store, capsys)
+    assert "turn_events=" + te.LABEL_UNKNOWN in line and label == te.LABEL_UNKNOWN
+    check = doctor._check_turn_journal(store)
+    assert (check.status, check.details, check.fix) == ("ok", "beta: " + te.LABEL_UNKNOWN, "")
+    _wrapper_state(store, mode="wrapper-one-shot")  # one_shot or plain cannot be told either
+    assert _row(store)["turn_events"] == te.LABEL_UNKNOWN
+
+
+def test_without_a_process_identity_a_failed_start_is_unknown_and_doctor_does_not_warn(tmp_path, no_identity):
+    # A stated limit (README): where no identity can be read, a failed start cannot be shown.
+    store = _store(tmp_path)
+    _wrapper_state(store)
+    te.default_turn_events_root(store.root).mkdir(parents=True)
+    runtime = _real_runtime()
+    writer = WrapperHealthWriter(store, "beta", "claude", mode="wrapper-loop", min_interval=0.0)
+    writer.standing_warnings = (
+        te.start_failure_warning("start_failed", runtime["wrapper_pid"], runtime["wrapper_start"]),)
+    writer.idle()
+    assert _row(store)["turn_events"] == te.LABEL_UNKNOWN
+    check = doctor._check_turn_journal(store)
+    assert check.status == "ok" and "start_failed" not in check.details
+
+
+def test_without_a_process_identity_only_facts_that_need_none_are_shown(tmp_path, no_identity):
+    store = _store(tmp_path)
+    _write_status(store, pid=ME, process_start_token=None, state="on")
+    assert _label(store, "wrapper-loop", None) == te.LABEL_UNKNOWN  # running or not: not provable
+    later = time.time() + te.TURN_EVENTS_STATUS_STALE_SECONDS + 5
+    assert _label(store, "wrapper-loop", None, now=later) == te.LABEL_UNKNOWN
+    # the writer's own record of its clean end, or of being off, needs no identity
+    ahead = te.format_time(int((time.time() + 5) * 1000))
+    _write_status(store, name="status-g-new.json", pid=ME, process_start_token=None, state="closed", updated_at=ahead)
+    assert _label(store, "wrapper-loop", None) == "ended"
+    _write_status(store, name="status-g-new.json", pid=ME, process_start_token=None, state="off",
+                  off_reason="close_timeout", updated_at=ahead)
+    assert _label(store, "wrapper-loop", None) == "off (close_timeout)"
+    assert _label(store, "something-else", _real_runtime()) == "off"  # not a journaled mode
+
+
+def test_a_record_without_a_start_token_is_unknown_where_tokens_can_be_read(tmp_path):
+    store = _store(tmp_path)  # the fake process table names this process and pid 4242
+    _write_status(store, pid=4242, process_start_token=None, state="on")
+    assert _label(store, "wrapper-loop", None, tokens=_tok) == te.LABEL_UNKNOWN
+    assert _label(store, "wrapper-loop", _runtime(start=None), tokens=_tok) == te.LABEL_UNKNOWN
+    assert _label(store, "wrapper-one-shot", _runtime(start=None), tokens=_tok) == te.LABEL_UNKNOWN
+    # the control: the same record with its token is the running writer
+    _write_status(store, pid=4242, process_start_token="tok-other", state="on")
+    assert _label(store, "wrapper-loop", None, tokens=_tok) == "on (loop)"
+
+    def broken(pid):
+        raise OSError("no")
+
+    # a token reader that fails reads no identity at all: unknown, not "ended"
+    assert _label(store, "wrapper-loop", None, tokens=broken) == te.LABEL_UNKNOWN
