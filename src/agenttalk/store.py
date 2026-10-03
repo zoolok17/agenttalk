@@ -5692,7 +5692,10 @@ class Store:
                                wake_epoch: int | None, message_id: str, parked_at: str | None,
                                wrapper_generation: str | None = None,
                                now_epoch: float | None = None) -> None:
-        """Atomically publish (or refresh) the park marker for ``agent``."""
+        """Atomically publish (or refresh) the park marker for ``agent``. The update time is
+        stored in whole seconds, floored (see ``usage_park.marker_time``)."""
+        from agenttalk.wrapper import usage_park
+
         payload = {
             "agent": validate_agent_name(agent),
             "state": "usage_limit_parked",
@@ -5702,7 +5705,7 @@ class Store:
             "message_id": message_id,
             "parked_at": parked_at,
             "wrapper_generation": wrapper_generation,
-            "updated_at_epoch": time.time() if now_epoch is None else now_epoch,
+            "updated_at_epoch": usage_park.marker_time(now_epoch),
         }
         p = self.usage_limit_park_path(agent)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -5730,13 +5733,13 @@ class Store:
         if not isinstance(data, dict) or data.get("agent") != expected \
                 or data.get("state") != "usage_limit_parked":
             return None
-        updated = usage_park.positive_number(data.get("updated_at_epoch"))
+        updated = usage_park.whole_seconds(data.get("updated_at_epoch"))
         message_id = data.get("message_id")
         window = data.get("window")
         if updated is None or not isinstance(message_id, str) or not message_id \
                 or window not in (*usage_park.KNOWN_WINDOWS, None):
             return None
-        now = time.time() if now_epoch is None else now_epoch
+        now = usage_park.marker_time(now_epoch)
         parked_at = data.get("parked_at")
         generation = data.get("wrapper_generation")
         return {
