@@ -145,5 +145,7 @@ def dump(ledger: SpendLedger) -> dict:
         )]
         return {
             "schema": schema,
-            **{name: sorted(tuple(r) for r in conn.execute(f"SELECT * FROM {name}")) for name in tables},
+            # the table names come from sqlite_master, never from a caller
+            **{name: sorted(tuple(r) for r in conn.execute(f"SELECT * FROM {name}"))  # noqa: S608
+               for name in tables},
         }
