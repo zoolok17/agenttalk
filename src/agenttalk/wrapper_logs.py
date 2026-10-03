@@ -790,11 +790,6 @@ class WrapperLifecycleLog:
         except (OSError, ValueError):
             pass
 
-    def turn_journal(self, what: str, counts: dict | None = None) -> None:
-        """A closed word (and counts) about the optional turn journal: why it is off,
-        or which kind of fault it counted. Never text from an error."""
-        self._emit("turn_journal", what=what, counts=dict(counts or {}))
-
     def runtime_transition(self, transition: str, record: dict) -> None:
         self._runtime = dict(record)
         event = _TRANSITION_EVENTS.get(transition)

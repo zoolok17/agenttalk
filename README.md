@@ -935,7 +935,7 @@ how it ended and how many tokens it used, and how each message was finally
 dealt with. It is for anything that wants to count turns, runs or token usage
 afterwards. It is **off unless you turn it on**, it only watches, and if it
 cannot write, the wrapper carries on exactly as before: a turn never waits for
-the journal.
+the journal, and the journal adds no file reading and no logging to a turn.
 
 **Turn it on** for a supervised wrapper with `agenttalk wrap --loop --turn-events`,
 or by setting `AGENTTALK_TURN_EVENTS=1`. It applies to `--loop` and `--lead-loop`
@@ -970,7 +970,11 @@ landed. The words are:
 - `delivery_failed`: the commit gate recorded a terminal failure;
 - `outcome_unknown`: everything else, for example compliance success without
   landed evidence, a message that ended as not owed, or a message consumed
-  without any dispatch.
+  without any dispatch. The journal never reads the wrapper's ledger to look
+  for more proof, so a message whose finished work the loop was only
+  completing after an interruption is recorded as `outcome_unknown` as well,
+  with the raw facts that are known (the rest `null`). That is the honest
+  limit of this version.
 
 The raw facts are recorded as well, so a reader can apply its own policy and a
 later change in how agenttalk words a disposition never makes an old line
@@ -996,6 +1000,9 @@ Old files are removed oldest first once the folder passes its size cap.
   journal's own times should allow for skew between machines, and an undetected
   change of a machine's clock can defeat any time-based check.
 - A crash can lose the last events that were still waiting to be written.
+- The journal writes nothing to the wrapper's own log. A journal that did not
+  start, or a fault while writing, shows only in the journal's own status
+  record, in `agenttalk status` and in `agenttalk doctor`.
 
 **Not recorded.** Plain `wrap` (without `--loop`), `--one-shot` reviewers and the
 proactive sweeps of a `--lead-loop` wrapper are not journaled, and `status` says
@@ -1004,10 +1011,16 @@ environment values, secrets, model names or error text.
 
 **What `status` and `doctor` show** (only once the project has a journal folder;
 otherwise their output is unchanged), computed from live facts, never from the
-newest file alone: `on (loop)`, `on (loop); cadence turns unmanaged`,
+newest file alone: a writer counts as running only when its process is alive
+**and** its start token matches the record (a token that cannot be read is no
+evidence), and among several records the current wrapper's own come first:
+`on (loop)`, `on (loop); cadence turns unmanaged`,
 `writer not responding`, `off`, `off (start_failed)`, `off (start_timeout)`,
 `ended`, `unmanaged (one_shot)` and `unmanaged (plain)`. A file left by an
-earlier run never changes the label of a running wrapper.
+earlier run never changes the label of a running wrapper. A journal that never
+started at all (for example because its thread could not be created) is shown
+as `off (start_failed)` or `off (start_timeout)` through the wrapper's own
+health record, so it needs no extra file write.
 
 **Reading it.** `agenttalk.turn_events` has the reader (`read_streams`,
 `list_segments`, `read_segment`, `iter_records`) and the closed record checker

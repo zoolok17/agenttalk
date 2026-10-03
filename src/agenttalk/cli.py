@@ -582,7 +582,13 @@ def _turn_journal_label(store: Store, agent: str, health: object) -> str | None:
             return None  # not a wrapped agent: nothing to say about its journal
         runtime = _wr.read_runtime(store.state_dir, agent)
         record = runtime.get("record") if runtime.get("status") == _wr.STATUS_VALID else None
-        return _te.status_label(store.root, agent, health_mode=mode, runtime_record=record)
+        return _te.status_label(
+            store.root,
+            agent,
+            health_mode=mode,
+            runtime_record=record,
+            health_warnings=marker.get("warnings") if isinstance(marker.get("warnings"), list) else None,
+        )
     except Exception:  # noqa: BLE001 - status never fails over an advisory label
         return None
 
@@ -11770,7 +11776,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
     # The optional turn journal: built here (no I/O), started just before the loop.
     journal = None
     if turn_events and one_shot_request_id is None:
-        journal = _build_turn_journal(store, agent, lead_loop=lead_loop, lifecycle_log=lifecycle_log)
+        journal = _build_turn_journal(store, agent, lead_loop=lead_loop)
     try:
         drive = wrapper_run.make_drive(
             store, agent, cli, state, base_argv, sender=sender,
@@ -11972,8 +11978,15 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
         if journal is not None:
             # The loop handles its first message only after the stream is registered
             # (or the start bound passes); on failure it simply runs without the journal.
+            # Nothing is logged here or by the writer: a journal that is off shows only in
+            # its own status record, `agenttalk status` and `doctor`.
             if not journal.start():
-                lifecycle_log.turn_journal(journal.off_reason or "start_failed")
+                # Carried by the health record the wrapper writes anyway: no new I/O here.
+                from .turn_events import start_failure_warning
+
+                warning = start_failure_warning(journal.off_reason)
+                if warning is not None:
+                    health_writer.standing_warnings = (warning,)
         turns = wloop.run_loop(
             store, agent, drive,
             max_turns=1 if one_shot_request_id else None,
@@ -12071,7 +12084,7 @@ def _turn_events_wanted(args: argparse.Namespace) -> bool:
     return turn_events_requested(getattr(args, "turn_events", False))
 
 
-def _build_turn_journal(store, agent: str, *, lead_loop: bool, lifecycle_log):
+def _build_turn_journal(store, agent: str, *, lead_loop: bool):
     """The turn-journal sink for this wrapper, or None if it cannot even be built.
 
     Building does no I/O; ``start()`` (called once before the first message) does."""
@@ -12083,7 +12096,6 @@ def _build_turn_journal(store, agent: str, *, lead_loop: bool, lifecycle_log):
             agent,
             agent_version=__version__,
             unmanaged=("cadence",) if lead_loop else (),
-            log=lifecycle_log.turn_journal,
         )
     except Exception:  # noqa: BLE001 - the journal is optional; the wrapper runs without it
         return None

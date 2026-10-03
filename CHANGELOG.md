@@ -20,14 +20,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and with it off nothing changes.
 
   A turn never waits for the journal: an event is only dropped into a small
-  in-memory queue and a separate thread does all the file work. If the queue is
+  in-memory queue and a separate thread does all the file work. The journal
+  adds no file reading and no logging to a turn, and never writes to the
+  wrapper's own log. If the queue is
   full or the disk is full, slow or broken, events are dropped and counted, and
   the journal says so instead of pretending to be complete (numbered events, a
   count of what was lost, a record of every stream that was started, and a
   closing record on a clean stop). A message's ending follows the wrapper's own
   definition of a completed turn, and the raw terminal facts are recorded next
-  to it. `agenttalk status` and `agenttalk doctor` show whether the journal is
-  on, not responding, ended or off, and which modes are not journaled.
+  to it. Where the wrapper cannot prove a message's reply landed, the journal
+  records "outcome unknown" rather than guess. `agenttalk status` and
+  `agenttalk doctor` show whether the journal is on, not responding, ended or
+  off (a writer counts as running only when its process is alive and matches
+  the record), and which modes are not journaled.
 
   The files are in a per-user folder beside the wrapper logs, which
   `AGENTTALK_TURN_EVENTS_DIR` can move. For developers: `agenttalk.turn_events`

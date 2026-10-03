@@ -877,20 +877,23 @@ def test_a_failing_status_write_is_counted_and_harmless(tmp_path):
     assert status_of(sink)["faults"]["status_failed"] == 1
 
 
-def test_the_fault_log_gets_closed_words_and_counts_only(tmp_path):
+def test_the_writer_has_no_log_hook_and_a_fault_only_reaches_its_status_record(tmp_path, capsys):
+    with pytest.raises(TypeError):
+        te.TurnEventSink(tmp_path, "alpha", log=lambda word, counts: None)  # type: ignore[call-arg]
     files = Hooked()
-    logged: list[tuple[str, dict]] = []
 
     def fail(_handle, data):
         if is_event(data):
             raise OSError("SENTINEL-EXC-LOG")
 
     files.hooks["write"] = fail
-    sink = run_clean(tmp_path, files=files, log=lambda word, counts: logged.append((word, counts)))
+    sink = run_clean(tmp_path, files=files)
     started(sink)
     sink.close()
-    assert logged and logged[0][0] in te.FAULTS and all(isinstance(v, int) for v in logged[0][1].values())
-    assert "SENTINEL" not in repr(logged)
+    shown = capsys.readouterr()
+    assert shown.out == "" and shown.err == ""
+    assert status_of(sink)["faults"]["write_failed"] >= 1
+    assert "SENTINEL" not in repr(status_of(sink))
 
 
 # --- the status record -----------------------------------------------------------------------

@@ -50,7 +50,7 @@ import secrets
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -72,8 +72,6 @@ TURN_EVENTS_CLOSE_SECONDS = 2.0
 TURN_EVENTS_STATUS_SECONDS = 5.0
 #: Written events are forced to disk at least this often (and at every disposition).
 TURN_EVENTS_SYNC_SECONDS = 2.0
-#: The writer logs a fault summary at most this often.
-TURN_EVENTS_LOG_SECONDS = 60.0
 MAX_LINE_BYTES = 4096
 INT64_MAX = 2**63 - 1
 
@@ -559,7 +557,6 @@ class TurnEventSink:
         sync_seconds: float = TURN_EVENTS_SYNC_SECONDS,
         files: JournalFiles | None = None,
         clock: Callable[[], float] = time.time,
-        log: Callable[[str, dict[str, int]], None] | None = None,
     ) -> None:
         self.agent = agent
         self.directory = str(directory)
@@ -592,7 +589,6 @@ class TurnEventSink:
         self._sync_seconds = sync_seconds
         self._files = files or JournalFiles()
         self._clock = clock
-        self._log = log
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=max(1, int(queue_max)))
         # Guards only the two integers below; no I/O is ever done while held.
         self._lock = threading.Lock()
@@ -625,7 +621,6 @@ class TurnEventSink:
         self._unsynced = False
         self._last_sync = 0.0
         self._last_status = 0.0
-        self._last_log = 0.0
         self._started_at = 0
         self._token: str | None = None
         self._previous: str | None = None
@@ -753,11 +748,8 @@ class TurnEventSink:
     def _fault(self, word: str) -> None:
         self._faults[word] = self._faults.get(word, 0) + 1
         self._last_fault = word
-        now = time.monotonic()
-        if self._log is not None and now - self._last_log >= TURN_EVENTS_LOG_SECONDS:
-            self._last_log = now
-            with contextlib.suppress(Exception):
-                self._log(word, dict(self._faults))
+        # Counted for the status record only: the journal never logs through the wrapper's
+        # own logging, whose streams the turn path needs.
 
     def _fault_for(self, exc: BaseException, default: str) -> str:
         return "disk_full" if getattr(exc, "errno", None) == errno.ENOSPC else default
@@ -1207,19 +1199,24 @@ def _read_status_file(path: Path) -> dict[str, Any] | None:
     }
 
 
-def newest_status(agent_dir: str | os.PathLike[str]) -> dict[str, Any] | None:
-    """The most recently updated well-formed status record of an agent, or None."""
+def status_records(agent_dir: str | os.PathLike[str]) -> list[dict[str, Any]]:
+    """Every well-formed status record of an agent, in no particular order."""
     try:
         names = os.listdir(agent_dir)
     except OSError:
-        return None
-    best = None
+        return []
+    found = []
     for name in names:
         if name.startswith("status-") and name.endswith(".json"):
-            found = _read_status_file(Path(agent_dir) / name)
-            if found is not None and (best is None or found["updated_ms"] > best["updated_ms"]):
-                best = found
-    return best
+            record = _read_status_file(Path(agent_dir) / name)
+            if record is not None:
+                found.append(record)
+    return found
+
+
+def newest_status(agent_dir: str | os.PathLike[str]) -> dict[str, Any] | None:
+    """The most recently updated well-formed status record of an agent, or None."""
+    return max(status_records(agent_dir), key=lambda r: r["updated_ms"], default=None)
 
 
 def journal_in_use(project_root: str | os.PathLike[str], environ: Mapping[str, str] | None = None) -> bool:
@@ -1228,6 +1225,21 @@ def journal_in_use(project_root: str | os.PathLike[str], environ: Mapping[str, s
         return default_turn_events_root(project_root, environ=environ).is_dir()
     except Exception:  # noqa: BLE001
         return False
+
+
+#: The wrapper's own health record carries this word when the writer never ran
+#: (the thread could not start, or the start bound passed): a closed fact in a write
+#: the wrapper already makes, so a failed start is visible without any new I/O.
+HEALTH_WARNING_PREFIX = "turn_journal_"
+_START_WARNINGS = {"turn_journal_start_failed": "start_failed", "turn_journal_start_timeout": "start_timeout"}
+
+
+def start_failure_warning(off_reason: object) -> str | None:
+    """The health-record word for a journal that never ran, or None."""
+    for word, reason in _START_WARNINGS.items():
+        if reason == off_reason:
+            return word
+    return None
 
 
 def status_label(
@@ -1239,33 +1251,33 @@ def status_label(
     now_epoch: float | None = None,
     environ: Mapping[str, str] | None = None,
     start_token: Callable[[int], str | None] | None = None,
+    health_warnings: Sequence[object] | None = None,
 ) -> str:
     """What `status` shows about an agent's turn journal, from LIVE facts.
 
-    Never from the newest file alone: a record is believed only while its
-    process is alive (pid and start token) and, if the agent's current wrapper
-    is known, only if it is that wrapper's record. ``health_mode`` is the
-    wrapper's own health mode; ``runtime_record`` is its runtime record, if any.
+    Liveness is proven, never assumed: a process counts as running only when it is
+    alive AND its start token equals the one in the record; a token that cannot be read
+    is no evidence. Among the records of the agent, those of the current wrapper (when
+    its runtime record proves it alive) are chosen first, then the newest. ``health_mode``
+    is the wrapper's own health mode, ``runtime_record`` its runtime record and
+    ``health_warnings`` the warning words of its health record.
     """
     if start_token is None:
         from agenttalk.wrapper_runtime import process_start_token as start_token
 
-    def alive(pid: object, token: object) -> bool | None:
-        if type(pid) is not int or pid <= 0:
+    def proven_alive(pid: object, token: object) -> bool:
+        if type(pid) is not int or pid <= 0 or not isinstance(token, str):
             return False
         try:
             current = start_token(pid)
         except Exception:  # noqa: BLE001
-            return None
-        if current is None:
-            return None  # cannot tell
-        return (current == token) if isinstance(token, str) else None
+            return False
+        return isinstance(current, str) and current == token
 
     current_pid = None
     if runtime_record:
         pid = runtime_record.get("wrapper_pid")
-        token = runtime_record.get("wrapper_start")
-        if alive(pid, token) is not False:  # alive, or cannot be told apart from alive
+        if proven_alive(pid, runtime_record.get("wrapper_start")):
             current_pid = pid
     if health_mode == "wrapper-one-shot":
         # Plain `wrap` and `wrap --loop --one-shot` both report this mode; only the
@@ -1277,22 +1289,33 @@ def status_label(
         directory = default_turn_events_root(project_root, environ=environ) / agent
     except Exception:  # noqa: BLE001
         return LABEL_OFF
-    found = newest_status(directory)
-    if found is None:
-        return LABEL_OFF
-    if current_pid is not None and found["pid"] != current_pid:
-        return LABEL_OFF  # a record from an earlier run of this agent
-    now_ms = int((time.time() if now_epoch is None else now_epoch) * 1000)
-    live = alive(found["pid"], found["token"])
-    age = max(0.0, (now_ms - found["updated_ms"]) / 1000.0)
-    if live is None:
-        live = age <= TURN_EVENTS_STATUS_STALE_SECONDS  # no token to compare: trust a fresh record
+    records = status_records(directory)
+    if current_pid is not None:
+        # The owner first: a record from another run, whatever its timestamp, is not
+        # this wrapper's.
+        owned = [r for r in records if r["pid"] == current_pid]
+        if runtime_record and isinstance(runtime_record.get("wrapper_start"), str):
+            owned = [r for r in owned if r["token"] == runtime_record["wrapper_start"]]
+        found = max(owned, key=lambda r: r["updated_ms"], default=None)
+        if found is None:
+            # The writer never ran for this wrapper: its start failure, if any, is in the
+            # wrapper's own health record.
+            for word in health_warnings or ():
+                if word in _START_WARNINGS:
+                    return LABEL_OFF + " (%s)" % _START_WARNINGS[word]
+            return LABEL_OFF
+    else:
+        # No proven current wrapper: prefer a record whose writer is provably running.
+        running = [r for r in records if proven_alive(r["pid"], r["token"])]
+        found = max(running or records, key=lambda r: r["updated_ms"], default=None)
+        if found is None:
+            return LABEL_OFF
     if found["state"] == "off":
         return LABEL_OFF + (" (%s)" % found["off_reason"] if found["off_reason"] else "")
-    if not live:
+    if found["state"] == "closed" or not proven_alive(found["pid"], found["token"]):
         return LABEL_ENDED
-    if found["state"] == "closed":
-        return LABEL_ENDED
+    now_ms = int((time.time() if now_epoch is None else now_epoch) * 1000)
+    age = max(0.0, (now_ms - found["updated_ms"]) / 1000.0)
     if age > TURN_EVENTS_STATUS_STALE_SECONDS:
         return LABEL_NOT_RESPONDING
     cadence = health_mode == "lead-loop" or bool(found["unmanaged"])
@@ -1321,7 +1344,10 @@ __all__ = [
     "TurnEventSink",
     "UnsupportedSchemaVersion",
     "journal_in_use",
+    "HEALTH_WARNING_PREFIX",
     "newest_status",
+    "start_failure_warning",
+    "status_records",
     "status_label",
     "turn_events_requested",
     "default_turn_events_root",

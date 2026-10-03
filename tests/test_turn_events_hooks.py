@@ -544,7 +544,7 @@ def test_the_wired_wrapper_journals_a_turn_end_to_end(tmp_path, monkeypatch):
 
 def test_a_lead_loop_stream_says_cadence_turns_are_unmanaged(tmp_path, monkeypatch):
     store = _store(tmp_path)
-    journal = cli._build_turn_journal(store, "beta", lead_loop=True, lifecycle_log=WrapperLifecycleLog("beta"))
+    journal = cli._build_turn_journal(store, "beta", lead_loop=True)
     assert journal is not None and journal._unmanaged == ["cadence"]  # noqa: SLF001
 
 
@@ -598,8 +598,8 @@ def test_d3d_a_failed_start_runs_the_first_message_on_time_and_says_start_failed
     status = next(Path(_journal_dir(store)).glob("status-*.json"))
     data = json.loads(status.read_text(encoding="ascii"))
     assert data["state"] == "off" and data["off_reason"] == "start_failed"
-    logged = [json.loads(line) for line in lifecycle_stream.getvalue().splitlines() if '"turn_journal"' in line]
-    assert any(row["what"] == "start_failed" for row in logged)
+    # nothing about the journal goes through the wrapper's own logging
+    assert "turn_journal" not in lifecycle_stream.getvalue()
     assert "SENTINEL-EXC-REGISTER" not in lifecycle_stream.getvalue() + status.read_text(encoding="ascii")
 
 
@@ -812,3 +812,120 @@ def test_a_child_process_is_the_only_thing_the_launch_tests_start():
     # interpreter only, never a model CLI.
     out = subprocess.run([sys.executable, "-c", "print(1)"], capture_output=True, text=True, check=True)  # noqa: S603
     assert out.stdout.strip() == "1"
+
+
+# --- the journal never logs through the wrapper's own logging (fix round 1, F2) ---------------
+
+
+def test_a_blocked_lifecycle_log_cannot_delay_a_failed_start_into_the_loop(tmp_path, monkeypatch):
+    entered, unblock, handled = threading.Event(), threading.Event(), threading.Event()
+    errors: list[BaseException] = []
+
+    class Stream(io.StringIO):
+        def write(self, text):
+            if '"event":"turn_journal"' in text:
+                entered.set()
+                unblock.wait(5)
+            return super().write(text)
+
+    class Sink:
+        off_reason = "start_failed"
+
+        def start(self):
+            return False
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(cli, "_build_turn_journal", lambda *a, **kw: Sink())
+    lifecycle = WrapperLifecycleLog("beta", stream=Stream(), enabled=True)
+
+    def work():
+        try:
+            _wrap(tmp_path, monkeypatch, turn_events=True, lifecycle=lifecycle,
+                  run_loop=lambda *a, **kw: handled.set() or 0)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    thread = threading.Thread(target=work)
+    thread.start()
+    try:
+        assert handled.wait(3), errors
+        assert not entered.is_set(), "a failed journal start wrote to the wrapper's log"
+    finally:
+        unblock.set()
+        thread.join(5)
+    assert not errors
+
+
+def test_a_journal_fault_never_touches_the_wrapper_log_streams(tmp_path, monkeypatch):
+    touched = threading.Event()
+
+    class Stream(io.StringIO):
+        def write(self, text):
+            touched.set()
+            return super().write(text)
+
+    stream = Stream()
+    lifecycle = WrapperLifecycleLog("beta", stream=stream, enabled=True)
+    store = _store(tmp_path / "project")
+    sink = cli._build_turn_journal(store, "beta", lead_loop=False)
+    sink._fault("write_failed")  # noqa: SLF001 - what a failing write calls
+    sink._fault("disk_full")  # noqa: SLF001
+    assert not touched.is_set() and stream.getvalue() == ""
+    # and an ordinary lifecycle log is not held up by anything the journal did
+    done = threading.Event()
+
+    def ordinary():
+        lifecycle.child_exited(123, None, 0)
+        done.set()
+
+    threading.Thread(target=ordinary).start()
+    assert done.wait(2)
+
+
+def test_the_wrapper_logging_module_is_unchanged_by_the_journal():
+    source = Path(cli.__file__).with_name("wrapper_logs.py").read_text(encoding="utf-8")
+    assert "turn_journal" not in source
+
+
+def test_a_failed_start_is_carried_by_the_wrappers_own_health_record(tmp_path, monkeypatch):
+    class Sink:
+        off_reason = "start_failed"
+
+        def start(self):
+            return False
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(cli, "_build_turn_journal", lambda *a, **kw: Sink())
+    seen: dict[str, Any] = {}
+
+    def fake_run_loop(store, agent, drive, **kw):
+        # the write the wrapper already makes on its normal path
+        kw["on_runtime_idle"]()
+        kw["on_health_idle"]()
+        seen["warnings"] = store.read_health_raw(agent)["warnings"]
+        return 0
+
+    lifecycle_stream = io.StringIO()
+    store = _store(tmp_path)
+    te.default_turn_events_root(store.root).mkdir(parents=True)  # the journal folder exists, no status file
+    monkeypatch.setattr(loop, "run_loop", fake_run_loop)
+    rc = cli._wrap_loop_mode(
+        store,
+        "beta",
+        cli="claude",
+        base_argv=["claude"],
+        sender="beta",
+        min_interval=0.0,
+        render=False,
+        turn_events=True,
+        lifecycle_log=WrapperLifecycleLog("beta", stream=lifecycle_stream, enabled=True),
+        lead_loop=False,
+    )
+    assert rc == 0 and seen["warnings"] == ["turn_journal_start_failed"]
+    assert not list(_journal_dir(store).glob("status-*.json"))
+    assert cli._turn_journal_label(store, "beta", None) == "off (start_failed)"
+    assert "turn_journal" not in lifecycle_stream.getvalue()

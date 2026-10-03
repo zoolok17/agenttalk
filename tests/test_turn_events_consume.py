@@ -219,9 +219,19 @@ def test_a_reply_published_by_the_drive_is_found_and_committed(tmp_path, monkeyp
     assert seen.sites == ["landed_commit"] and seen.dispositions() == ["completed"]
 
 
-def test_no_admission_pending_a_retained_success_is_proved_by_its_claim(tmp_path, monkeypatch):
+def test_no_admission_pending_a_retained_success_with_no_landed_proof_in_hand_is_unknown(tmp_path, monkeypatch):
+    # The loop holds no landed proof here and reads nothing more from disk for the
+    # observer: the honest record is "outcome unknown" with the raw facts it has.
     seen = _scenario(OWED, "test_no_admission_disposition_crash_replays_without_redriving_model", tmp_path, monkeypatch)
-    assert seen.sites == ["no_admission_pending"] and seen.dispositions() == ["completed"]
+    assert seen.sites == ["no_admission_pending"] and seen.dispositions() == ["outcome_unknown"]
+    assert seen.events[0][2]["consumed"] is True and seen.events[0][2]["landed"] is not True
+
+
+def test_the_observer_adds_no_ledger_read_to_the_gate():
+    from agenttalk.wrapper.obligations import DetectionCommitGate
+
+    assert not hasattr(DetectionCommitGate, "no_admission_work_proof")
+    assert "no_admission_work_proof" not in Path(loop.__file__).read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize(
@@ -703,9 +713,6 @@ def test_off_the_loop_calls_no_observer_and_reads_no_ledger(tmp_path):
         def fail_delivery_or_block(self, record, key, *, reason, expected_revision):
             self._consume(record)
             return _terminal(ResolverState.DELIVERY_EXHAUSTED, landed=False)
-
-        def no_admission_work_proof(self, record):
-            raise AssertionError("the ledger must not be read when nobody observes")
 
     store = Store(tmp_path)
     store.init(["alpha", "beta"])

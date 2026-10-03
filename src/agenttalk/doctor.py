@@ -1107,7 +1107,13 @@ def _check_turn_journal(store) -> Check | None:
                 continue
             runtime = _wr.read_runtime(store.state_dir, agent)
             record = runtime.get("record") if runtime.get("status") == _wr.STATUS_VALID else None
-            label = _te.status_label(store.root, agent, health_mode=mode, runtime_record=record)
+            label = _te.status_label(
+                store.root,
+                agent,
+                health_mode=mode,
+                runtime_record=record,
+                health_warnings=marker.get("warnings") if isinstance(marker.get("warnings"), list) else None,
+            )
             if label != _te.LABEL_OFF or _te.newest_status(
                 _te.default_turn_events_root(store.root) / agent
             ):
@@ -1122,7 +1128,7 @@ def _check_turn_journal(store) -> Check | None:
     return Check(name="turn_journal", status="warn" if worrying else "ok",
                  details="; ".join(f"{a}: {v}" for a, v in sorted(labels.items())),
                  fix=("a journal that did not start means turns were not observed; "
-                      "see the wrapper log, then restart the wrapper") if worrying else "",
+                      "see `agenttalk status`, then restart the wrapper") if worrying else "",
                  data={"agents": labels})
 
 

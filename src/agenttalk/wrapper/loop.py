@@ -954,19 +954,6 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
     # Bounded per-run guard: a message id reaches the observer at most once.
     disposed_ids: dict[str, None] = {}
 
-    def _no_admission_work_proof(record: dict) -> bool | None:
-        """Ask the gate (read-only, lock-free) whether a no-admission claim proves
-        work was done; None when unknown or when nobody is observing."""
-        if on_message_disposed is None or commit_gate is None:
-            return None
-        probe = getattr(commit_gate, "no_admission_work_proof", None)
-        if not callable(probe):
-            return None
-        try:
-            return probe(record)
-        except Exception:  # noqa: BLE001 - observer only
-            return None
-
     def _disposed(record: dict, **report) -> None:
         """Tell the observer (if any) that ``record`` was durably consumed.
 
@@ -1874,7 +1861,6 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 "no_admission_disposition_pending",
             }
         ):
-            work_proof = _no_admission_work_proof(record)
             _guard_advance()
             retained_finalized = _await_lock(
                 LOCK_CONTENTION_PHASE_FINALIZATION,
@@ -1889,7 +1875,6 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                     site="no_admission_pending",
                     resolution=legacy_gate_resolution,
                     finalized=retained_finalized,
-                    counted_turn=work_proof is True,
                 )
                 store.clear_attempt(agent, record.get("id"))
                 store.gc_attempts_below(agent, store.cursor(agent))
